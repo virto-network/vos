@@ -97,8 +97,6 @@ pub const CTX_HOST_RESUME_PC: i32 = -CTX_OFFSET + offset_of!(JitContext, host_re
 pub const CTX_DISPATCH_LEN: i32 = -CTX_OFFSET + offset_of!(JitContext, dispatch_len) as i32;
 pub const CTX_EXIT_REASON: i32 = -CTX_OFFSET + offset_of!(JitContext, exit_reason) as i32;
 pub const CTX_EXIT_ARG: i32 = -CTX_OFFSET + offset_of!(JitContext, exit_arg) as i32;
-pub const CTX_HEAP_BASE: i32 = -CTX_OFFSET + offset_of!(JitContext, heap_base) as i32;
-pub const CTX_HEAP_TOP: i32 = -CTX_OFFSET + offset_of!(JitContext, heap_top) as i32;
 pub const CTX_JT_PTR: i32 = -CTX_OFFSET + offset_of!(JitContext, jt_ptr) as i32;
 pub const CTX_JT_LEN: i32 = -CTX_OFFSET + offset_of!(JitContext, jt_len) as i32;
 pub const CTX_BB_STARTS: i32 = -CTX_OFFSET + offset_of!(JitContext, bb_starts) as i32;
@@ -109,10 +107,6 @@ pub const CTX_DISPATCH_TABLE: i32 = -CTX_OFFSET + offset_of!(JitContext, dispatc
 pub const CTX_CODE_BASE: i32 = -CTX_OFFSET + offset_of!(JitContext, code_base) as i32;
 pub const CTX_FLAT_PERMS: i32 = -CTX_OFFSET + offset_of!(JitContext, flat_perms) as i32;
 pub const CTX_FAST_REENTRY: i32 = -CTX_OFFSET + offset_of!(JitContext, fast_reentry) as i32;
-pub const CTX_BITMAP: i32 = -CTX_OFFSET + offset_of!(JitContext, original_bitmap) as i32;
-
-/// Ecalli gas cost charged inline on the fast path (matches kernel's ecalli_gas).
-const ECALLI_GAS_COST: i32 = 10;
 
 /// Exit reason codes (matching ExitReason enum).
 pub const EXIT_HALT: u32 = 0;
@@ -120,8 +114,6 @@ pub const EXIT_PANIC: u32 = 1;
 pub const EXIT_OOG: u32 = 2;
 pub const EXIT_PAGE_FAULT: u32 = 3;
 pub const EXIT_HOST_CALL: u32 = 4;
-pub const EXIT_ECALL: u32 = 6;
-pub const EXIT_TRAP: u32 = 7;
 
 /// Result of compilation.
 pub struct CompileResult {
@@ -153,22 +145,6 @@ pub struct HelperFns {
     pub mem_write_u16: u64,
     pub mem_write_u32: u64,
     pub mem_write_u64: u64,
-}
-
-/// Tracks what a PVM register was last set to, for peephole optimization.
-#[derive(Clone, Copy, Debug)]
-enum RegDef {
-    /// Unknown or complex value.
-    Unknown,
-    /// Known compile-time constant (32-bit address or immediate).
-    Const(u32),
-    /// reg = src << shift (shift 1..=3, i.e. *2, *4, *8).
-    /// Built from: add D,A,A → Shifted{src:A, shift:1}
-    ///             add D,D,D where D=Shifted{src,s} → Shifted{src, shift:s+1}
-    Shifted { src: usize, shift: u8 },
-    /// reg = base + (idx << shift) (shift 0..=3, i.e. *1, *2, *4, *8).
-    /// Built from: add D,BASE,S where S=Shifted{src,s} → ScaledAdd{base:BASE, idx:src, shift:s}
-    ScaledAdd { base: usize, idx: usize, shift: u8 },
 }
 
 /// PVM-to-x86-64 compiler.
@@ -207,22 +183,8 @@ pub struct Compiler {
     /// byte position. Branch/djump targets must land on these (GP A.17/A.18).
     block_starts_ptr: *const u8,
     block_starts_len: usize,
-    /// ISA profile: Conformance rejects opcode 3 (Ecall) at execution.
-    isa_mode: crate::IsaMode,
-    /// Peephole: tracks how each PVM register was last defined.
-    reg_defs: [RegDef; 13],
-    /// Bitmask of registers that have non-Unknown reg_defs (for fast invalidation).
-    reg_defs_active: u16,
-    /// Carry flag fusion: after an `add64 D, A, B`, CF = overflow(A+B).
-    /// Stores (D, A, B) so that a subsequent `setLtU C, D, A` or `setLtU C, D, B`
-    /// can use CF directly instead of emitting a redundant `cmp`.
-    /// Cleared by any instruction that clobbers flags (i.e., everything except the
-    /// immediately following setLtU).
-    last_add_cf: Option<(usize, usize, usize)>,
     /// Trap table for signal-based bounds checking: (native_offset, pvm_pc).
     trap_entries: Vec<(u32, u32)>,
-    /// Memory tier load/store cycles for gas simulation.
-    mem_cycles: u8,
 }
 
 impl Compiler {
@@ -232,8 +194,6 @@ impl Compiler {
         helpers: HelperFns,
         code_len: usize,
         use_mmap: bool,
-        mem_cycles: u8,
-        isa_mode: crate::IsaMode,
     ) -> Self {
         // Estimate native code size: ~3x PVM code provides safety margin for
         // direct-write emission (no per-byte capacity checks in hot loop).
@@ -271,15 +231,10 @@ impl Compiler {
             panic_label,
             oog_pc_label,
             oog_stubs: Vec::with_capacity(1024),
-            reg_defs: [RegDef::Unknown; 13],
-            reg_defs_active: 0,
-            last_add_cf: None,
             helpers,
             block_starts_ptr: block_starts.as_ptr(),
             block_starts_len: block_starts.len(),
             trap_entries: Vec::with_capacity(2048),
-            mem_cycles,
-            isa_mode,
         }
     }
 
@@ -307,7 +262,7 @@ impl Compiler {
         // No pre-scan: gas block starts (ϖ) are discovered
         // inline — PC=0 is always a gas block start, and after every terminator
         // instruction the next PC becomes a gas block start.
-        let mut gas_sim = GasSimulator::new_for_mode(self.isa_mode);
+        let mut gas_sim = GasSimulator::new();
         let mut pending_gas: Option<(Label, u32, usize)> = None;
         // Tracks whether the next instruction starts a new gas block.
         // True initially for PC=0.
@@ -382,14 +337,11 @@ impl Compiler {
                     is_move_reg: false,
                 });
                 self.asm.mov_store32_imm(CTX, CTX_GAS_CHARGED, 0);
-                // In standard v0.8 opcode 1 is `sjump(next)`, not an
-                // unchecked sequential advance. A final fallthrough (or one
-                // whose skip lands outside varpi) panics at this instruction.
-                // Keep the transitional JAR profile's existing behavior.
+                // Opcode 1 is `sjump(next)`, not an unchecked sequential
+                // advance. A final fallthrough (or one whose skip lands
+                // outside varpi) panics at this instruction.
                 let next_pc = (pc + 1 + skip) as u32;
-                if self.isa_mode == crate::IsaMode::Conformance
-                    && !self.is_basic_block_start(next_pc)
-                {
+                if !self.is_basic_block_start(next_pc) {
                     self.asm.mov_store32_imm(CTX, CTX_PC, pc as i32);
                     self.emit_exit(EXIT_PANIC, 0);
                 }
@@ -399,10 +351,7 @@ impl Compiler {
             }
 
             // Combined opcode validation + category lookup in a single array access.
-            let decoded = match self.isa_mode {
-                crate::IsaMode::Jar => crate::instruction::decode_runtime_opcode_fast(raw_byte),
-                crate::IsaMode::Conformance => crate::instruction::decode_opcode_fast(raw_byte),
-            };
+            let decoded = crate::instruction::decode_opcode_fast(raw_byte);
             let (opcode, category) = match decoded {
                 Some(oc) => oc,
                 None => {
@@ -445,11 +394,8 @@ impl Compiler {
             };
             let raw_ra = reg_byte1 & 0x0F;
             let raw_rb = reg_byte1 >> 4;
-            let raw_rd_for_gas = match self.isa_mode {
-                // A.5.13 clamps the complete encoded rD byte.
-                crate::IsaMode::Conformance => reg_byte2,
-                crate::IsaMode::Jar => reg_byte2 & 0x0f,
-            };
+            // A.5.13 clamps the complete encoded rD byte.
+            let raw_rd_for_gas = reg_byte2;
 
             let decoded_args = match category {
                 crate::instruction::InstructionCategory::ThreeReg => Args::ThreeReg {
@@ -577,10 +523,7 @@ impl Compiler {
             self.bind_fault_resume(pc as u32);
 
             let is_terminator = {
-                let gas_opcode = match (self.isa_mode, raw_byte) {
-                    (crate::IsaMode::Jar, 101) => 254,
-                    _ => opcode as u8,
-                };
+                let gas_opcode = opcode as u8;
                 // Fast path: feed gas simulator directly from register bytes,
                 // skipping FastCost struct construction and bitmask iteration.
                 let (term, needs_full) = crate::gas_cost::feed_gas_direct(
@@ -589,8 +532,6 @@ impl Compiler {
                     raw_rb,
                     raw_rd_for_gas,
                     &mut gas_sim,
-                    self.mem_cycles,
-                    self.isa_mode,
                 );
                 if needs_full {
                     // Slow path for branches/overlap/move: use full FastCost
@@ -603,8 +544,6 @@ impl Compiler {
                         raw_ra,
                         raw_rb,
                         raw_rd_for_gas,
-                        self.mem_cycles,
-                        self.isa_mode,
                     );
                     gas_sim.feed(&fc);
                     fc.is_terminator
@@ -613,85 +552,19 @@ impl Compiler {
                 }
             };
 
-            // Cross-instruction fusions are intentionally disabled. Every
-            // decoded Standard PC is a legal fresh entry, and Jar faults must
-            // also preserve the effects and retry label of each instruction.
+            // Cross-instruction fusions are intentionally disabled: every
+            // decoded PC is a legal fresh entry.
             let fused: Option<usize> = None;
 
             if let Some(advance) = fused {
-                self.last_add_cf = None; // fused instruction clobbers flags
                 pc += advance;
                 continue;
-            }
-
-            // Clear carry flag tracking for all opcodes except Add64 (which sets it)
-            // and SetLtU (which consumes it inside compile_instruction).
-            if !matches!(opcode, Opcode::Add64 | Opcode::SetLtU) {
-                self.last_add_cf = None;
             }
 
             if is_terminator {
                 self.asm.mov_store32_imm(CTX, CTX_GAS_CHARGED, 0);
             }
             self.compile_instruction(opcode, &decoded_args, pc as u32, next_pc);
-
-            // Standard instructions must be self-contained because Ψ may
-            // start freshly at any decoded PC. Do not carry constants,
-            // addresses, or flags across an instruction boundary. Jar keeps
-            // its single-instruction address peepholes (the unsafe multi-op
-            // fusion above remains disabled).
-            if self.isa_mode == crate::IsaMode::Conformance {
-                self.invalidate_all_regs();
-                self.last_add_cf = None;
-            } else {
-                // Fast reg_defs update: for special-case opcodes that produce
-                // trackable patterns (Add64→Shifted, LoadImm→Const, etc.), call
-                // the full update_reg_defs. For all other opcodes, just invalidate
-                // the destination register directly from the decoded args. This
-                // avoids the opcode match + Args re-destructuring for ~95% of
-                // instructions.
-                match opcode {
-                    Opcode::Add64
-                    | Opcode::LoadImm
-                    | Opcode::LoadImm64
-                    | Opcode::ShloLImm64
-                    | Opcode::MoveReg => {
-                        self.update_reg_defs(opcode, &decoded_args);
-                    }
-                    _ => {
-                        // Fast path: invalidate dest register based on category.
-                        // The destination is the first register field for most categories.
-                        match category {
-                            crate::instruction::InstructionCategory::ThreeReg => {
-                                if let Args::ThreeReg { rd, .. } = decoded_args {
-                                    self.invalidate_reg(rd);
-                                }
-                            }
-                            crate::instruction::InstructionCategory::TwoReg => {
-                                if let Args::TwoReg { rd, .. } = decoded_args {
-                                    self.invalidate_reg(rd);
-                                }
-                            }
-                            crate::instruction::InstructionCategory::TwoRegOneImm
-                            | crate::instruction::InstructionCategory::OneRegOneImm
-                            | crate::instruction::InstructionCategory::OneRegExtImm
-                            | crate::instruction::InstructionCategory::OneRegTwoImm
-                            | crate::instruction::InstructionCategory::OneRegImmOffset => {
-                                // Destination = first register (ra in raw byte low nibble)
-                                self.invalidate_reg(raw_ra.min(12) as usize);
-                            }
-                            _ => {
-                                // NoArgs, OneImm, OneOffset, TwoRegOneOffset, TwoRegTwoImm:
-                                // These either don't write to a register or are terminators
-                                // (which invalidate_all_regs at the next gas block boundary).
-                                if is_terminator {
-                                    self.invalidate_all_regs();
-                                }
-                            }
-                        }
-                    }
-                }
-            }
 
             // After a terminator, the next instruction starts a new gas block.
             if is_terminator {
@@ -706,7 +579,7 @@ impl Compiler {
 
         // Finalize last gas block
         if let Some((stub_label, block_pc, cost_patch)) = pending_gas.take() {
-            if self.isa_mode == crate::IsaMode::Conformance && !next_is_gas_start {
+            if !next_is_gas_start {
                 // Standard instruction data is zero-extended. When the last
                 // explicit instruction is not in T, the implicit opcode-0
                 // panic is ingested into that same open basic block.
@@ -726,10 +599,9 @@ impl Compiler {
             self.oog_stubs.push((stub_label, block_pc, cost));
         }
 
-        // Implicit trailing opcode 0. Standard v0.8 charges it here only when
-        // the preceding instruction was in T; otherwise the zero-extended
-        // panic was already included in the open block above. JAR retains its
-        // frozen 1-gas sentinel behavior.
+        // Implicit trailing opcode 0. It is charged here only when the
+        // preceding instruction was in T; otherwise the zero-extended panic
+        // was already included in the open block above.
         let end_label = self.label_for_pc(code_len as u32);
         if next_is_gas_start {
             current_gas_block = code_len as u32;
@@ -738,11 +610,7 @@ impl Compiler {
         self.asm.bind_label(end_label);
         self.gas_block_pcs.push(code_len as u32);
         self.asm.mov_store32_imm(CTX, CTX_PC, code_len as i32);
-        let sentinel_cost = match self.isa_mode {
-            crate::IsaMode::Jar => 1,
-            crate::IsaMode::Conformance if next_is_gas_start => 2,
-            crate::IsaMode::Conformance => 0,
-        };
+        let sentinel_cost = if next_is_gas_start { 2 } else { 0 };
         if sentinel_cost != 0 {
             let sentinel_oog = self.asm.new_label();
             self.asm.cmp_mem64_imm32(CTX, CTX_GAS, sentinel_cost);
@@ -758,13 +626,7 @@ impl Compiler {
         self.fault_resume_labels
             .push((code_len as u32, sentinel_body));
         self.asm.mov_store32_imm(CTX, CTX_GAS_CHARGED, 0);
-        self.emit_exit(
-            match self.isa_mode {
-                crate::IsaMode::Jar => EXIT_TRAP,
-                crate::IsaMode::Conformance => EXIT_PANIC,
-            },
-            0,
-        );
+        self.emit_exit(EXIT_PANIC, 0);
 
         // Emit epilogue and exit sequences
         self.emit_exit_sequences();
@@ -971,15 +833,7 @@ impl Compiler {
 
         // Feed instructions 2-4 to gas sim (using decoded args, no redundant decode)
         for &(opc, a, p) in &[(op2, &args2, pc2), (op3, &args3, pc3), (op4, &args4, pc4)] {
-            let fc = crate::gas_cost::fast_cost_from_decoded(
-                opc as u8,
-                a,
-                p as u32,
-                code,
-                bitmask,
-                self.mem_cycles,
-                self.isa_mode,
-            );
+            let fc = crate::gas_cost::fast_cost_from_decoded(opc as u8, a, p as u32, code, bitmask);
             gas_sim.feed(&fc);
         }
 
@@ -999,7 +853,6 @@ impl Compiler {
             let fn_addr = self.write_fn_for(op4);
             self.emit_mem_write(true, ra_reg, fn_addr, pc4 as u32);
         }
-        self.invalidate_all_regs();
         Some(pc4 + 1 + skip4 - pc)
     }
 
@@ -1050,15 +903,8 @@ impl Compiler {
         }
 
         // Feed instruction 2 to gas sim (using decoded args, no redundant decode)
-        let fc = crate::gas_cost::fast_cost_from_decoded(
-            op2 as u8,
-            &args2,
-            pc2 as u32,
-            code,
-            bitmask,
-            self.mem_cycles,
-            self.isa_mode,
-        );
+        let fc =
+            crate::gas_cost::fast_cost_from_decoded(op2 as u8, &args2, pc2 as u32, code, bitmask);
         gas_sim.feed(&fc);
 
         // Bind labels
@@ -1088,7 +934,6 @@ impl Compiler {
         self.asm.mov_load64(rd_lo, Reg::RSP, 0);
         self.asm.mov_load64(rd_hi, Reg::RSP, 8);
         self.asm.add_ri(Reg::RSP, 32);
-        self.invalidate_all_regs();
         Some(pc2 + 1 + skip2 - pc)
     }
 
@@ -1228,22 +1073,8 @@ impl Compiler {
         }
     }
 
-    /// Compute a memory address into SCRATCH, using peephole optimizations when available.
+    /// Compute a memory address into SCRATCH.
     fn emit_addr_to_scratch(&mut self, rb: usize, imm: i32) {
-        // Peephole: fold known constant address (no register load needed)
-        if let RegDef::Const(addr) = self.reg_defs[rb] {
-            let effective = addr.wrapping_add(imm as u32);
-            self.asm.mov_ri32(SCRATCH, effective);
-            return;
-        }
-        // Peephole: use SIB addressing for scaled-index patterns
-        if imm == 0
-            && let RegDef::ScaledAdd { base, idx, shift } = self.reg_defs[rb]
-        {
-            self.asm
-                .lea_sib_scaled_32(SCRATCH, REG_MAP[base], REG_MAP[idx], shift);
-            return;
-        }
         let rb_reg = REG_MAP[rb];
         if imm != 0 {
             // lea r32, [base + disp]: combines truncation to 32-bit and offset
@@ -1260,20 +1091,17 @@ impl Compiler {
     /// Standard low-zone accesses panic. A wide access that crosses 2^32
     /// must first inspect the high tail in raw-address order: an inaccessible
     /// final page faults there, while an accessible tail reaches the wrapped
-    /// low zone and panics. JAR keeps the interpreter's frozen observable
-    /// behavior (`PageFault(0)` after an accessible high tail), but takes the
-    /// same slow path so no native load/store can escape the 4 GiB mapping.
+    /// low zone and panics. No native load/store can escape the 4 GiB
+    /// mapping.
     fn emit_memory_access_guard(&mut self, width: u32, write: bool, pvm_pc: u32) {
         debug_assert!(matches!(width, 1 | 2 | 4 | 8));
 
-        if self.isa_mode == crate::IsaMode::Conformance {
-            let accessible_zone = self.asm.new_label();
-            self.asm.cmp_ri(SCRATCH, crate::PVM_ZONE_SIZE as i32);
-            self.asm.jcc_label(Cc::AE, accessible_zone);
-            self.asm.mov_store32_imm(CTX, CTX_PC, pvm_pc as i32);
-            self.emit_exit(EXIT_PANIC, 0);
-            self.asm.bind_label(accessible_zone);
-        }
+        let accessible_zone = self.asm.new_label();
+        self.asm.cmp_ri(SCRATCH, crate::PVM_ZONE_SIZE as i32);
+        self.asm.jcc_label(Cc::AE, accessible_zone);
+        self.asm.mov_store32_imm(CTX, CTX_PC, pvm_pc as i32);
+        self.emit_exit(EXIT_PANIC, 0);
+        self.asm.bind_label(accessible_zone);
 
         if width == 1 {
             return;
@@ -1302,13 +1130,7 @@ impl Compiler {
         self.asm.jcc_label(Cc::B, high_fault);
 
         self.asm.mov_store32_imm(CTX, CTX_PC, pvm_pc as i32);
-        self.emit_exit(
-            match self.isa_mode {
-                crate::IsaMode::Conformance => EXIT_PANIC,
-                crate::IsaMode::Jar => EXIT_PAGE_FAULT,
-            },
-            0,
-        );
+        self.emit_exit(EXIT_PANIC, 0);
 
         self.asm.bind_label(high_fault);
         self.asm.mov_store32_imm(CTX, CTX_PC, pvm_pc as i32);
@@ -1318,41 +1140,6 @@ impl Compiler {
         );
 
         self.asm.bind_label(native_safe);
-    }
-
-    /// Invalidate any reg_defs that depend on `reg`, but NOT reg itself.
-    #[inline]
-    fn invalidate_dependents(&mut self, reg: usize) {
-        // Only iterate registers that have active (non-Unknown) defs
-        let mut active = self.reg_defs_active & !(1u16 << reg);
-        while active != 0 {
-            let i = active.trailing_zeros() as usize;
-            active &= active - 1;
-            let depends = match self.reg_defs[i] {
-                RegDef::Shifted { src, .. } => src == reg,
-                RegDef::ScaledAdd { base, idx, .. } => base == reg || idx == reg,
-                _ => false,
-            };
-            if depends {
-                self.reg_defs[i] = RegDef::Unknown;
-                self.reg_defs_active &= !(1u16 << i);
-            }
-        }
-    }
-
-    /// Invalidate a register's tracked definition and any dependents.
-    #[inline]
-    fn invalidate_reg(&mut self, reg: usize) {
-        self.reg_defs[reg] = RegDef::Unknown;
-        self.reg_defs_active &= !(1u16 << reg);
-        self.invalidate_dependents(reg);
-    }
-
-    /// Invalidate all register definitions (on block boundaries, calls, etc.)
-    #[inline]
-    fn invalidate_all_regs(&mut self) {
-        self.reg_defs = [RegDef::Unknown; 13];
-        self.reg_defs_active = 0;
     }
 
     /// Emit gas block boundary: bind label, flush previous block cost, emit new gas check.
@@ -1370,8 +1157,6 @@ impl Compiler {
         let label = Label(self.label_base + pc as u32);
         self.asm.bind_label(label);
         self.gas_block_pcs.push(pc as u32);
-        self.invalidate_all_regs();
-        self.last_add_cf = None; // gas check clobbers flags
 
         if let Some((stub_label, block_pc, cost_patch)) = pending_gas.take() {
             let cost = gas_sim.flush_and_get_cost();
@@ -1399,9 +1184,6 @@ impl Compiler {
     fn emit_resume_start(&mut self, pc: usize) {
         self.asm.bind_label(self.label_for_pc(pc as u32));
         self.resume_pcs.push(pc as u32);
-        // Host handling may replace register values before resumption.
-        self.invalidate_all_regs();
-        self.last_add_cf = None;
     }
 
     /// Bind the native retry entry for a valid standard instruction after
@@ -1411,136 +1193,6 @@ impl Compiler {
         let label = self.asm.new_label();
         self.asm.bind_label(label);
         self.fault_resume_labels.push((pc, label));
-    }
-
-    /// Update reg_defs after compiling an instruction.
-    /// Opcodes that produce trackable patterns update positively;
-    /// all others invalidate the destination register.
-    fn update_reg_defs(&mut self, opcode: Opcode, args: &Args) {
-        match opcode {
-            Opcode::Add64 => {
-                if let Args::ThreeReg { ra, rb, rd } = args {
-                    if *ra == *rb && *ra == *rd {
-                        // add64 D, D, D — doubles again. Shifted{src,s} → Shifted{src,s+1}.
-                        if let RegDef::Shifted { src, shift } = self.reg_defs[*rd] {
-                            if shift < 3 {
-                                self.reg_defs[*rd] = RegDef::Shifted {
-                                    src,
-                                    shift: shift + 1,
-                                };
-                                self.reg_defs_active |= 1u16 << *rd;
-                            } else {
-                                self.reg_defs[*rd] = RegDef::Unknown;
-                                self.reg_defs_active &= !(1u16 << *rd);
-                            }
-                        } else {
-                            self.reg_defs[*rd] = RegDef::Unknown;
-                            self.reg_defs_active &= !(1u16 << *rd);
-                        }
-                    } else if *ra == *rb {
-                        // add64 D, A, A — D = A * 2 = A << 1
-                        // Only track as Shifted when rd != ra; in-place doubling
-                        // (rd == ra) overwrites the original value, making the
-                        // Shifted{src} self-referential — ScaledAdd would then
-                        // double-shift at emit time.
-                        if *rd != *ra {
-                            self.reg_defs[*rd] = RegDef::Shifted { src: *ra, shift: 1 };
-                            self.reg_defs_active |= 1u16 << *rd;
-                        } else {
-                            self.reg_defs[*rd] = RegDef::Unknown;
-                            self.reg_defs_active &= !(1u16 << *rd);
-                        }
-                    } else {
-                        // add64 D, A, B — check if one operand is Shifted
-                        let def = if let RegDef::Shifted { src, shift } = self.reg_defs[*rb] {
-                            Some((*ra, src, shift))
-                        } else if let RegDef::Shifted { src, shift } = self.reg_defs[*ra] {
-                            Some((*rb, src, shift))
-                        } else {
-                            None
-                        };
-                        // Bail out when rd aliases base or idx: the host
-                        // register for that operand has been overwritten
-                        // by the add we just emitted, so the ScaledAdd
-                        // peephole would re-add at emit time and produce
-                        // a doubled offset. The same self-reference
-                        // problem the add64 D,D,D and D,A,A branches
-                        // above already guard against.
-                        if let Some((base, idx, shift)) = def
-                            && *rd != base
-                            && *rd != idx
-                        {
-                            self.reg_defs[*rd] = RegDef::ScaledAdd { base, idx, shift };
-                            self.reg_defs_active |= 1u16 << *rd;
-                        } else {
-                            self.reg_defs[*rd] = RegDef::Unknown;
-                            self.reg_defs_active &= !(1u16 << *rd);
-                        }
-                    }
-                    self.invalidate_dependents(*rd);
-                }
-            }
-            Opcode::LoadImm => {
-                if let Args::RegImm { ra, imm } = args {
-                    self.reg_defs[*ra] = RegDef::Const(*imm as u32);
-                    self.reg_defs_active |= 1u16 << *ra;
-                    self.invalidate_dependents(*ra);
-                }
-            }
-            Opcode::LoadImm64 => {
-                if let Args::RegExtImm { ra, imm } = args {
-                    self.reg_defs[*ra] = RegDef::Const(*imm as u32);
-                    self.reg_defs_active |= 1u16 << *ra;
-                    self.invalidate_dependents(*ra);
-                }
-            }
-            // Track shift-left-immediate as Shifted for LEA-based scaled indexing.
-            // sll_imm_64 rd, rb, shift → Shifted{src:rb, shift} if shift ∈ 1..=3.
-            // This enables the peephole: sll + add + load → LEA + load with SIB scaling.
-            Opcode::ShloLImm64 => {
-                if let Args::TwoRegImm { ra, rb, imm } = args {
-                    let shift = (*imm as u32 % 64) as u8;
-                    // Only track as Shifted when ra != rb; in-place shifts
-                    // overwrite the original value, making the Shifted{src}
-                    // self-referential — ScaledAdd would double-shift at emit.
-                    if (1..=3).contains(&shift) && ra != rb {
-                        self.reg_defs[*ra] = RegDef::Shifted { src: *rb, shift };
-                        self.reg_defs_active |= 1u16 << *ra;
-                    } else {
-                        self.reg_defs[*ra] = RegDef::Unknown;
-                        self.reg_defs_active &= !(1u16 << *ra);
-                    }
-                    self.invalidate_dependents(*ra);
-                }
-            }
-            Opcode::MoveReg => {
-                if let Args::TwoReg { rd, ra } = args
-                    && *rd != *ra
-                {
-                    // Propagate the source's definition to the destination.
-                    self.reg_defs[*rd] = self.reg_defs[*ra];
-                    if matches!(self.reg_defs[*rd], RegDef::Unknown) {
-                        self.reg_defs_active &= !(1u16 << *rd);
-                    } else {
-                        self.reg_defs_active |= 1u16 << *rd;
-                    }
-                    self.invalidate_dependents(*rd);
-                }
-            }
-            _ => {
-                match args {
-                    Args::ThreeReg { rd, .. } => self.invalidate_reg(*rd),
-                    Args::TwoReg { rd, .. } => self.invalidate_reg(*rd),
-                    Args::TwoRegImm { ra, .. } => self.invalidate_reg(*ra),
-                    Args::RegImm { ra, .. } => self.invalidate_reg(*ra),
-                    Args::RegExtImm { ra, .. } => self.invalidate_reg(*ra),
-                    _ => {}
-                }
-                if opcode.is_terminator() {
-                    self.invalidate_all_regs();
-                }
-            }
-        }
     }
 
     /// Compile a single PVM instruction.
@@ -1558,87 +1210,26 @@ impl Compiler {
             // === A.5.1: No arguments ===
             Opcode::Trap => {
                 self.asm.mov_store32_imm(CTX, CTX_PC, pc as i32);
-                self.emit_exit(
-                    match self.isa_mode {
-                        crate::IsaMode::Jar => EXIT_TRAP,
-                        crate::IsaMode::Conformance => EXIT_PANIC,
-                    },
-                    0,
-                );
+                self.emit_exit(EXIT_PANIC, 0);
             }
             Opcode::Fallthrough | Opcode::Unlikely => {
                 // Just fall through to next instruction.
                 // Note: gas is already charged at basic block start above.
             }
 
-            // === A.5.1b: Ecall (management ops, no immediate) ===
-            // Jar extension — under GP conformance opcode 3 is not a valid
-            // instruction and panics when executed.
-            Opcode::Ecall => {
-                if self.isa_mode == crate::IsaMode::Conformance {
-                    self.asm.mov_store32_imm(CTX, CTX_PC, pc as i32);
-                    self.emit_exit(EXIT_PANIC, 0);
-                } else {
-                    self.asm.mov_store32_imm(CTX, CTX_PC, next_pc as i32);
-                    self.emit_exit(EXIT_ECALL, 0);
-                }
-            }
-
             // === A.5.2: One immediate ===
             Opcode::Ecalli => {
                 if let Args::Imm { imm } = args {
-                    let host_id = match self.isa_mode {
-                        crate::IsaMode::Conformance => *imm,
-                        crate::IsaMode::Jar => u64::from(*imm as u32),
-                    };
-                    // GAS protocol cap (slot 1): inline when original bitmap bit is set.
-                    if host_id == 1 && self.isa_mode == crate::IsaMode::Jar {
-                        let slow_path = self.asm.new_label();
-                        let oog_path = self.asm.new_label();
-
-                        // Check original_bitmap bit 1: test byte [CTX + bitmap_byte0], 0x02
-                        self.asm.test_byte_mem_disp32(CTX, CTX_BITMAP, 1 << 1);
-                        self.asm.jcc_label(Cc::E, slow_path); // ZF=1 → bit clear → slow path
-
-                        // Fast path: unsigned compare-before-subtract over the
-                        // complete gas domain.
-                        self.asm.cmp_mem64_imm32(CTX, CTX_GAS, ECALLI_GAS_COST);
-                        self.asm.jcc_label(Cc::B, oog_path);
-                        self.asm.sub_mem64_imm32(CTX, CTX_GAS, ECALLI_GAS_COST);
-
-                        // GAS: φ[7] = remaining gas
-                        self.asm.mov_load64(REG_MAP[7], CTX, CTX_GAS);
-
-                        // Resume after the host call without charging again:
-                        // ecalli is not in the Gray Paper terminator set T.
-                        let next_label = self.label_for_pc(next_pc);
-                        self.asm.jmp_label(next_label);
-
-                        // OOG stub: save PC and exit
-                        self.asm.bind_label(oog_path);
-                        self.asm.mov_store32_imm(CTX, CTX_PC, pc as i32);
-                        self.asm.jmp_label(self.oog_label);
-
-                        // Slow path: cap was modified, fall through to kernel exit
-                        self.asm.bind_label(slow_path);
-                    }
-                    // Slow path (always emitted): exit to kernel for full dispatch
+                    let host_id = *imm;
                     // `pc` is the externally visible GP exit counter, while
                     // `entry_pc` is the host-selected continuation used only
-                    // when execution is resumed. JAR historically exposes
-                    // the already-advanced counter; keep that profile frozen.
-                    let exit_pc = match self.isa_mode {
-                        crate::IsaMode::Conformance => {
-                            self.asm.mov_store32_imm(CTX, CTX_HOST_PENDING, 1);
-                            self.asm
-                                .mov_store32_imm(CTX, CTX_HOST_RESUME_PC, next_pc as i32);
-                            self.asm.mov_store32_imm(CTX, CTX_ENTRY_PC, pc as i32);
-                            pc
-                        }
-                        crate::IsaMode::Jar => {
-                            self.asm.mov_store32_imm(CTX, CTX_ENTRY_PC, next_pc as i32);
-                            next_pc
-                        }
+                    // when execution is resumed.
+                    let exit_pc = {
+                        self.asm.mov_store32_imm(CTX, CTX_HOST_PENDING, 1);
+                        self.asm
+                            .mov_store32_imm(CTX, CTX_HOST_RESUME_PC, next_pc as i32);
+                        self.asm.mov_store32_imm(CTX, CTX_ENTRY_PC, pc as i32);
+                        pc
                     };
                     self.asm.mov_store32_imm(CTX, CTX_PC, exit_pc as i32);
                     self.emit_exit(EXIT_HOST_CALL, host_id);
@@ -2351,14 +1942,6 @@ impl Compiler {
                 self.emit_alu3_64_comm(args, true, |a, d, s| {
                     a.add_rr(d, s);
                 });
-                // Track CF: after add64 D, A, B, CF = overflow(A+B).
-                // A subsequent setLtU C, D, A (or D, B) can use CF directly.
-                if self.isa_mode == crate::IsaMode::Jar
-                    && let Args::ThreeReg { ra, rb, rd } = args
-                {
-                    self.last_add_cf = Some((*rd, *ra, *rb));
-                }
-                // reg_defs tracking handled by update_reg_defs() in main loop
             }
             Opcode::Sub64 => {
                 if let Args::ThreeReg { ra, rb, rd } = args {
@@ -2533,37 +2116,7 @@ impl Compiler {
             // Set comparisons (three-register)
             Opcode::SetLtU => {
                 if let Args::ThreeReg { ra, rb, rd } = args {
-                    // Carry flag fusion: if the previous instruction was add64 D, A, B,
-                    // and this is setLtU where rd = (ra < rb), CF already holds the carry.
-                    // Pattern: ra == D (the sum), rb == A or B (one of the addends).
-                    // Result goes to rd (the carry register).
-                    let fused = if let Some((add_d, add_a, add_b)) = self.last_add_cf {
-                        // Carry flag fusion: ra must be the sum register (add_d),
-                        // and rb must be an UNMODIFIED original addend (not add_d,
-                        // which now holds the sum). If rb == add_d, both sides of
-                        // the comparison would be the sum, giving 0 always, but CF
-                        // might be 1.
-                        if *ra == add_d
-                            && *rb != add_d
-                            && (*rb == add_a || *rb == add_b)
-                            && *rd != *rb
-                        {
-                            let d = REG_MAP[*rd];
-                            // CF is valid from the add — use setb directly (no cmp needed).
-                            // Cannot use xor to clear upper bits (it would clobber CF).
-                            // Instead: setb + movzx (2 insns vs xor+cmp+setb = 3 insns).
-                            self.asm.setcc(Cc::B, d);
-                            self.asm.movzx_8_64(d, d);
-                            true
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    };
-                    if !fused {
-                        self.emit_setcc_3reg(*ra, *rb, *rd, Cc::B);
-                    }
+                    self.emit_setcc_3reg(*ra, *rb, *rd, Cc::B);
                 }
             }
             Opcode::SetLtS => {
@@ -2899,9 +2452,7 @@ impl Compiler {
         fallthrough: u32,
         pc: u32,
     ) {
-        if self.isa_mode == crate::IsaMode::Conformance
-            && (!self.is_basic_block_start(target) || !self.is_basic_block_start(fallthrough))
-        {
+        if !self.is_basic_block_start(target) || !self.is_basic_block_start(fallthrough) {
             // v0.8 validates both possible successors before evaluating the
             // condition, so either invalid leg is an unconditional panic.
             self.asm.mov_store32_imm(CTX, CTX_PC, pc as i32);
@@ -2923,9 +2474,7 @@ impl Compiler {
 
     /// Emit a branch comparing two registers.
     fn emit_branch_reg(&mut self, a: Reg, b: Reg, cc: Cc, target: u32, fallthrough: u32, pc: u32) {
-        if self.isa_mode == crate::IsaMode::Conformance
-            && (!self.is_basic_block_start(target) || !self.is_basic_block_start(fallthrough))
-        {
+        if !self.is_basic_block_start(target) || !self.is_basic_block_start(fallthrough) {
             // v0.8 validates both possible successors before evaluating the
             // condition, so either invalid leg is an unconditional panic.
             self.asm.mov_store32_imm(CTX, CTX_PC, pc as i32);
@@ -3093,12 +2642,11 @@ impl Compiler {
             // Division by zero: quotient = 2^64-1, remainder = dividend
             if remainder {
                 self.asm.mov_rr(d_reg, a_reg);
-                if is_32bit && self.isa_mode == crate::IsaMode::Conformance {
+                if is_32bit {
                     // The GP 32-bit family first truncates the dividend and
-                    // then sign-extends the architectural result. Do this on
-                    // the Standard zero-divisor shortcut as well as the
-                    // hardware-div path below. Frozen JAR/JIT execution
-                    // retains its historical full-register copy here.
+                    // then sign-extends the architectural result, on the
+                    // zero-divisor shortcut as well as the hardware-div path
+                    // below.
                     self.asm.movsxd(d_reg, d_reg);
                 }
             } else {
@@ -3357,8 +2905,7 @@ impl Compiler {
 
     /// Emit an exit sequence that sets exit_reason and exit_arg.
     fn emit_exit(&mut self, reason: u32, arg: u64) {
-        if self.isa_mode == crate::IsaMode::Conformance && matches!(reason, EXIT_HALT | EXIT_PANIC)
-        {
+        if matches!(reason, EXIT_HALT | EXIT_PANIC) {
             // Full Ψ returns instruction counter zero on final success or
             // panic. Fault/OOG/host exits retain their causing counter.
             self.asm.mov_store32_imm(CTX, CTX_PC, 0);
@@ -3465,11 +3012,9 @@ impl Compiler {
 
         // Panic exit
         self.asm.bind_label(self.panic_label);
-        if self.isa_mode == crate::IsaMode::Conformance {
-            self.asm.mov_store32_imm(CTX, CTX_PC, 0);
-            // Dynamic-jump validation also exits from a funded instruction.
-            self.asm.mov_store32_imm(CTX, CTX_GAS_CHARGED, 1);
-        }
+        self.asm.mov_store32_imm(CTX, CTX_PC, 0);
+        // Dynamic-jump validation also exits from a funded instruction.
+        self.asm.mov_store32_imm(CTX, CTX_GAS_CHARGED, 1);
         self.asm
             .mov_store32_imm(CTX, CTX_EXIT_REASON, EXIT_PANIC as i32);
         // fall through to exit_label

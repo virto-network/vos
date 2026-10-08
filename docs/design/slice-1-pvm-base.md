@@ -75,6 +75,8 @@ core, in the build step named (core model section 16), or is replaced.
 | `tests/fixtures/extensions/*` | extension test fixtures | with the extension host |
 | `clerk-witness`, `actors/clerk-*`, `tests/fixtures/provable/clerk-apply`, `tests/acceptance/clerk` | Clerk ledger, bridge, settlement, fixtures and acceptance tests | step 5, on the compressed format |
 | `tests/fixtures/actors/crdt-counter` | CRDT fixture | step 6 |
+| `pvm/proof/fixtures/fibonacci` | actor fixture built on master's `vos` framework | step 2, with the actor framework |
+| `pvm/proof/fixtures/{clerk-refine-bench,voucher-check}`, `pvm/proof/tests/to-port/voucher_check_smoke.rs` | Clerk prover workloads built on master's `vos` framework; the voucher-check smoke test | step 5, re-pinned there |
 | `tests/fixtures/wasm` | WASM fixtures | only if a WASM path returns |
 | `actors/space-authority`, `actors/space-registry` | space governance and registry | step 2 or 3, as the catalog |
 | `services/vos-service`, `examples/` | v2 examples | rewritten for the new framework when it lands |
@@ -243,7 +245,7 @@ The proof format is not re-pinned here; step 1.4 does it once.
   - the state-commitment fields;
   - the permission encoding.
 
-  The voucher-check fixture's pinned image roots are updated with it.
+  The voucher-check fixture returns in step 5 and is pinned there.
 - **Gates:**
   - creating a small actor's machine costs ≤ 50 µs on both backends;
   - a fresh JIT machine's first resume no longer costs about 0.5 ms;

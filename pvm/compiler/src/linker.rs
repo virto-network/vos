@@ -12,8 +12,7 @@
 //!    AUIPC+LO12 pairs with direct load_imm of the final PVM address
 
 use crate::TranspileError;
-use crate::emitter;
-use crate::riscv::{OpcodeEncoding, TranslationContext, decode_b_imm, decode_j_imm};
+use crate::riscv::{TranslationContext, decode_b_imm, decode_j_imm};
 use std::collections::{HashMap, HashSet};
 
 /// RISC-V relocation types we care about.
@@ -103,14 +102,10 @@ struct LinkedElf {
     accumulate_vaddr: Option<u64>,
 }
 
-/// The container-independent result of transpiling an ELF: the code in GP
-/// instruction encoding (plus bitmask and jump table) and the memory-section
-/// blobs at their linked base addresses. Both containers — the `JAR\x02`
-/// capability manifest ([`link_elf`]) and the GP standard program
-/// ([`link_elf_spi`]) — are serializations of exactly these fields.
+/// The result of transpiling an ELF: the code in GP instruction encoding
+/// (plus bitmask and jump table) and the memory-section blobs at their linked
+/// base addresses. [`link_elf_spi`] serializes exactly these fields.
 struct TranspiledElf {
-    #[cfg(test)]
-    address_map: HashMap<u64, u32>,
     code: Vec<u8>,
     bitmask: Vec<u8>,
     jump_table: Vec<u32>,
@@ -129,39 +124,6 @@ struct TranspiledElf {
     heap_pages: u32,
 }
 
-/// Transpile an rv64em ELF into a JAR capability manifest PVM blob.
-pub fn link_elf(elf_data: &[u8]) -> Result<Vec<u8>, TranspileError> {
-    link_elf_with_argument_pages(elf_data, 1)
-}
-
-/// Transpile an ELF with an explicitly sized ordinary slot-0 argument DATA
-/// capability. The default [`link_elf`] remains one page.
-pub fn link_elf_with_argument_pages(
-    elf_data: &[u8],
-    argument_pages: u32,
-) -> Result<Vec<u8>, TranspileError> {
-    if argument_pages == 0 {
-        return Err(TranspileError::InvalidSection(
-            "argument DATA capability must contain at least one page".into(),
-        ));
-    }
-    // The capability-manifest container is an already-pinned production
-    // format. Keep its historical read-only code-pointer rewrite so changes
-    // needed by standard programs cannot silently repin existing services.
-    let t = transpile_elf(elf_data, false, OpcodeEncoding::CapabilityManifest)?;
-    Ok(emitter::build_service_program_with_args_pages(
-        &t.code,
-        &t.bitmask,
-        &t.jump_table,
-        &t.ro_data,
-        &t.rw_data,
-        t.stack_size / 4096,
-        t.heap_pages,
-        t.heap_pages,
-        argument_pages,
-    ))
-}
-
 /// `Z_Z` — the GP initialization zone size (2¹⁶).
 const Z_Z: u64 = vos_pvm::PVM_ZONE_SIZE as u64;
 
@@ -172,24 +134,19 @@ fn zone_round(x: u64) -> u64 {
 
 /// Transpile an rv64em ELF into a **GP standard-program (SPI) blob** — the
 /// format `vos_pvm::spi::parse_standard_program` consumes and
-/// `vos_pvm::refine::execute_with` runs. It shares instruction translation
-/// with [`link_elf`], adds standard-program read-write code-pointer rewriting,
-/// and uses the entry prologue IC 0 = refine, IC 5 = accumulate-or-trap.
+/// `vos_pvm::refine::execute_with` runs. The entry prologue places refine at
+/// IC 0 and accumulate (or a trap) at IC 5.
 ///
-/// Header-field derivation (manifest ↔ SPI mapping):
+/// Header-field derivation:
 ///
-/// - **`s` (stack size, `E₃`)** = the linker's `stack_size` = the manifest's
-///   `stack_pages × 4096` (the page-floored lowest ro section vaddr, minimum
-///   16 KiB). The byte capacity is identical in both containers; only the
-///   placement differs — the manifest maps the stack at `[0, s)` with
-///   `φ1 = s`, while `StandardProgram::layout` maps `page_round(s)` bytes
-///   just below the argument zone with `φ1 = 0xFEFE_0000`. `φ1` is
-///   host-installed in both, so SP-relative guest code is placement-blind.
-/// - **`z` (heap pages, `E₂`)** includes the manifest's explicit heap and
-///   every trailing all-zero read-write page (normally `.bss`). Standard
-///   programs distinguish initialized bytes from zero pages directly, so
-///   encoding those pages in `w` would only inflate the artifact. The total
-///   mapped read-write span remains identical page-for-page.
+/// - **`s` (stack size, `E₃`)** = the page-floored lowest ro section vaddr,
+///   minimum 16 KiB. `StandardProgram::layout` maps `page_round(s)` bytes
+///   just below the argument zone with `φ1 = 0xFEFE_0000`; guest code is
+///   SP-relative, so placement needs no linker cooperation.
+/// - **`z` (heap pages, `E₂`)** includes every trailing all-zero read-write
+///   page (normally `.bss`). Standard programs distinguish initialized bytes
+///   from zero pages directly, so encoding those pages in `w` would only
+///   inflate the artifact.
 /// - **`o` (read-only data)** = the ro blob **re-based to the GP ro base
 ///   `Z_Z` = `0x1_0000`**: zero-prefix padding covers `[Z_Z, ro_base)`. An
 ///   ELF whose ro sections are linked below `Z_Z` is rejected — its embedded
@@ -207,7 +164,7 @@ fn zone_round(x: u64) -> u64 {
 /// placement need no linker cooperation (code addresses are translated;
 /// the stack is SP-relative).
 pub fn link_elf_spi(elf_data: &[u8]) -> Result<Vec<u8>, TranspileError> {
-    let t = transpile_elf(elf_data, true, OpcodeEncoding::Standard)?;
+    let t = transpile_elf(elf_data)?;
 
     // Re-base the ro blob from its linked base to the GP ro base Z_Z.
     let ro_data = if t.ro_data.is_empty() {
@@ -304,14 +261,10 @@ pub fn link_elf_spi(elf_data: &[u8]) -> Result<Vec<u8>, TranspileError> {
     Ok(blob)
 }
 
-/// The shared ELF → GP-encoded-program translation both containers build on.
-fn transpile_elf(
-    elf_data: &[u8],
-    rewrite_read_write_code_pointers: bool,
-    opcode_encoding: OpcodeEncoding,
-) -> Result<TranspiledElf, TranspileError> {
+/// Translate an ELF into a GP-encoded program and its data sections.
+fn transpile_elf(elf_data: &[u8]) -> Result<TranspiledElf, TranspileError> {
     let elf = parse_linked_elf(elf_data)?;
-    let mut ctx = TranslationContext::with_opcode_encoding(elf.is_64bit, opcode_encoding);
+    let mut ctx = TranslationContext::new(elf.is_64bit);
     ctx.code_ranges = elf.code_ranges.clone();
 
     // Emit the two-slot GP entry prologue. ICs are byte offsets into the code,
@@ -347,38 +300,18 @@ fn transpile_elf(
 
     let mut ro_data = elf.ro_data.clone();
     let mut rw_data = elf.rw_data.clone();
-    rewrite_data_code_ptrs(
-        &elf,
-        &mut ctx,
-        &mut ro_data,
-        &mut rw_data,
-        rewrite_read_write_code_pointers,
-    );
+    rewrite_data_code_ptrs(&elf, &mut ctx, &mut ro_data, &mut rw_data);
 
     crate::peephole_fuse_load_imm_alu(&mut ctx.code, &mut ctx.bitmask, &ctx.jump_table);
     crate::peephole_fuse_load_imm_memory(&mut ctx.code, &mut ctx.bitmask, &ctx.jump_table);
     crate::peephole_eliminate_dead_load_imm(&mut ctx.code, &mut ctx.bitmask, &ctx.jump_table);
-    #[cfg(not(test))]
     crate::ensure_branch_targets_are_block_starts(
         &mut ctx.code,
         &mut ctx.bitmask,
         &mut ctx.jump_table,
     );
-    #[cfg(test)]
-    crate::ensure_branch_targets_with_pc_map(
-        &mut ctx.code,
-        &mut ctx.bitmask,
-        &mut ctx.jump_table,
-        |offsets| {
-            for pc in ctx.address_map.values_mut() {
-                *pc = offsets[*pc as usize];
-            }
-        },
-    );
 
     Ok(TranspiledElf {
-        #[cfg(test)]
-        address_map: ctx.address_map,
         code: ctx.code,
         bitmask: ctx.bitmask,
         jump_table: ctx.jump_table,
@@ -917,14 +850,8 @@ fn rewrite_data_code_ptrs(
     ctx: &mut TranslationContext,
     ro_data: &mut [u8],
     rw_data: &mut [u8],
-    rewrite_read_write: bool,
 ) {
-    let ro_base = if rewrite_read_write {
-        elf.ro_base
-    } else {
-        // Preserve the established manifest-container translation exactly.
-        elf.stack_size as u64
-    };
+    let ro_base = elf.ro_base;
     let rw_base = elf.rw_base;
     let is_code_addr = |addr: u64| -> bool {
         elf.code_ranges
@@ -969,9 +896,6 @@ fn rewrite_data_code_ptrs(
             None
         }
         .or_else(|| {
-            if !rewrite_read_write {
-                return None;
-            }
             let off = data_vaddr.checked_sub(rw_base)? as usize;
             rw_data.get(off..off + 4)
         });
@@ -993,10 +917,7 @@ fn rewrite_data_code_ptrs(
     // addresses. Relocations normally cover these; the scan also supports
     // stripped-but-still-linked inputs.
     let initialized_regions = [(ro_base, &*ro_data), (rw_base, &*rw_data)];
-    for (base, data) in initialized_regions
-        .into_iter()
-        .take(if rewrite_read_write { 2 } else { 1 })
-    {
+    for (base, data) in initialized_regions {
         let mut off = 0;
         while off + 8 <= data.len() {
             if overlaps_data_relocation(&elf.data_relocation_ranges, base + off as u64, 8) {
@@ -1054,12 +975,11 @@ fn rewrite_data_code_ptrs(
             .filter(|off| off.saturating_add(size) <= ro_data.len())
         {
             ro_data[off..off + size].copy_from_slice(&replacement);
-        } else if rewrite_read_write
-            && let Some(off) = entry
-                .data_vaddr
-                .checked_sub(rw_base)
-                .and_then(|off| usize::try_from(off).ok())
-                .filter(|off| off.saturating_add(size) <= rw_data.len())
+        } else if let Some(off) = entry
+            .data_vaddr
+            .checked_sub(rw_base)
+            .and_then(|off| usize::try_from(off).ok())
+            .filter(|off| off.saturating_add(size) <= rw_data.len())
         {
             rw_data[off..off + size].copy_from_slice(&replacement);
         }
@@ -1280,50 +1200,6 @@ mod tests {
         assert!(!overlaps_data_relocation(&[], 4, 8));
     }
 
-    /// Translate a preserved ELF and resolve observed PVM PCs without changing
-    /// the production linker API or emitted program. Use only with exact-byte
-    /// equality to the observed standard program.
-    #[test]
-    #[ignore = "diagnostic requires VOS_PROFILE_ELF, VOS_PROFILE_PVM and VOS_PROFILE_PCS"]
-    fn resolve_observed_standard_program_pcs() {
-        let elf = std::fs::read(std::env::var_os("VOS_PROFILE_ELF").unwrap()).unwrap();
-        let expected = std::fs::read(std::env::var_os("VOS_PROFILE_PVM").unwrap()).unwrap();
-        assert!(
-            link_elf_spi(&elf).unwrap() == expected,
-            "ELF does not reproduce the observed program"
-        );
-        let translated = transpile_elf(&elf, true, OpcodeEncoding::Standard).unwrap();
-        let mut pcs: Vec<u32> = std::env::var("VOS_PROFILE_PCS")
-            .unwrap()
-            .split(',')
-            .map(|value| value.parse().unwrap())
-            .collect();
-        if let Ok(returns) = std::env::var("VOS_PROFILE_RETURN_ADDRESSES") {
-            for value in returns.split(',') {
-                let address: usize = value.parse().unwrap();
-                assert!(
-                    address != 0 && address % 2 == 0,
-                    "invalid indirect return address"
-                );
-                let pc = translated.jump_table[address / 2 - 1];
-                eprintln!("return_address address={address} pc={pc}");
-                pcs.push(pc);
-            }
-        }
-        let mut addresses: Vec<_> = translated.address_map.into_iter().collect();
-        addresses.sort_unstable_by_key(|&(rv, pc)| (pc, rv));
-        for pc in pcs {
-            assert!((pc as usize) < translated.code.len());
-            assert_eq!(translated.bitmask[pc as usize], 1);
-            let &(rv, mapped_pc) = addresses
-                .iter()
-                .rev()
-                .find(|&&(_, mapped)| mapped <= pc)
-                .unwrap();
-            eprintln!("observed_pc pc={pc} mapped_pc={mapped_pc} riscv={rv:#x}");
-        }
-    }
-
     const TEXT_VADDR: u64 = 0x40_0000;
     const RA: u32 = 1;
     const SP: u32 = 2;
@@ -1404,7 +1280,7 @@ mod tests {
             accumulate_vaddr: None,
         };
 
-        let mut ctx = TranslationContext::with_opcode_encoding(true, OpcodeEncoding::Standard);
+        let mut ctx = TranslationContext::new(true);
         ctx.code_ranges = elf.code_ranges.clone();
         ctx.emit_jump(elf.entry_vaddr);
         ctx.emit_inst(0); // unused accumulate entry

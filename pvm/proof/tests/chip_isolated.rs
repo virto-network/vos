@@ -274,9 +274,8 @@ fn harness_cpuchip_isolated_add64() {
         regs,
         vec![0u8; 4 * 1024 * 1024],
         10_000,
-        25,
     );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
     assert_eq!(exit, vos_pvm::ExitReason::Panic);
     let steps = tracing.into_trace();
@@ -369,9 +368,8 @@ fn harness_ristretto_isolated() {
         regs,
         flat_mem,
         10_000,
-        25,
     );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let mut tracing = TracingPvm::new(pvm);
     let _exit = tracing.run_with_precompiles();
     assert_eq!(tracing.ristretto_records.len(), 1);
     // Confirm the ECALL detector classified the non-basepoint correctly —
@@ -690,9 +688,8 @@ fn fixed_base_real_side_note(scalars: &[curve25519_dalek::scalar::Scalar]) -> Si
         regs,
         flat_mem,
         1_000_000,
-        25,
     );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let mut tracing = TracingPvm::new(pvm);
     let _ = tracing.run_with_precompiles();
     assert_eq!(
         tracing.ristretto_records.len(),
@@ -1256,16 +1253,11 @@ fn harness_ristretto_identity_output_forgery_rejected() {
     }
 }
 
-/// CpuChip-isolated debug runner using Stwo's `AssertEvaluator`.
-/// Pinpoints the failing constraint by row + constraint-#.  Requires the
-/// `debug-internals` feature; run with:
-///
-///   cargo test -p vos-pvm-proof --features debug-internals --test chip_isolated \
-///       harness_cpuchip_debug_add64 -- --ignored --nocapture
+/// An honest `add64` row satisfies every CpuChip constraint, checked with
+/// Stwo's `AssertEvaluator`, which names the failing row and constraint.
 #[cfg(feature = "debug-internals")]
 #[test]
-#[ignore = "debug-only — pinpoints failing constraint when prove fails"]
-fn harness_cpuchip_debug_add64() {
+fn cpuchip_constraints_hold_for_add64() {
     use vos_pvm::PVM_REGISTER_COUNT;
     use vos_pvm::instruction::Opcode;
     use vos_pvm::interpreter::Interpreter;
@@ -1282,9 +1274,8 @@ fn harness_cpuchip_debug_add64() {
         regs,
         vec![0u8; 4 * 1024 * 1024],
         10_000,
-        25,
     );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
     assert_eq!(exit, vos_pvm::ExitReason::Panic);
     let steps = tracing.into_trace();

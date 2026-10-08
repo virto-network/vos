@@ -55,16 +55,8 @@ fn prove_chain_verifies_as_canonical_chain() {
     let mut memory = Memory::sparse(1u64 << 32);
     memory.init_copy(u32::MAX - 31, b"sparse-chain-high-page");
     let initial_memory = memory.nonzero_page_image().into();
-    let pvm = Interpreter::with_memory(
-        code.clone(),
-        bitmask.clone(),
-        vec![],
-        regs,
-        memory,
-        10_000,
-        25,
-    );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let pvm = Interpreter::with_memory(code.clone(), bitmask.clone(), vec![], regs, memory, 10_000);
+    let mut tracing = TracingPvm::new(pvm);
     assert_eq!(tracing.run(), vos_pvm::ExitReason::Panic);
     let all_steps = tracing.into_trace();
     assert_eq!(all_steps.len(), 7);

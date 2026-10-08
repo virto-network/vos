@@ -31,14 +31,13 @@ full verify; it is the on-chain finish-line gate.
 just build-settle      # from the vos repo root
 ```
 
-This produces `target/riscv64em-vos/release/settle.elf`, which gates two vos-pvm-proof
-tests (both SKIP, not fail, if the ELF is absent):
+This produces `target/riscv64em-vos/release/settle.elf`, which two vos-pvm-proof
+tests use (both fail if the ELF is absent):
 
-- `cargo test -p vos-pvm-proof --test settle_transpile` — the ELF transpiles to JAM PVM
-  bytecode (`grey_transpiler::link_elf`).
-- `cargo test -p vos-pvm-proof --test settle_run` — the transpiled blob executes on the
-  tracing PVM and ACCEPTS the honest fixture (`a0 = 0xACCE`), reporting the
-  on-chain cycle count.
+- `cargo test -p vos-pvm-proof --test settle_transpile`: the ELF links as a Gray Paper
+  standard program (`vos_pvm_compiler::link_elf_spi`).
+- `cargo test -p vos-pvm-proof --test settle_run`: the program runs and ACCEPTS the
+  honest fixture (`a0 = 0xACCE`), reporting its instruction count and gas.
 
 The ELF is intentionally NOT committed (it would go stale whenever the verifier
 source changes); rebuild it with `just build-settle` after any change here.

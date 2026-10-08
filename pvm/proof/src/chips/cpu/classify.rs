@@ -775,7 +775,7 @@ pub(crate) fn classify_opcode(op: Opcode) -> OpcodeFlags {
             f.is_load_imm_jump_ind = true;
         }
         // Ecalli: host call (execution exits, no ALU constraint)
-        Opcode::Ecalli | Opcode::Ecall => {
+        Opcode::Ecalli => {
             f.is_exit = true;
         }
         // Trap: causes panic exit

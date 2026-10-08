@@ -22,7 +22,6 @@ const DEFAULT_FLAT_MEM: usize = 4 * 1024 * 1024;
 /// Default gas + max-steps that programs run with.  Generous because tests
 /// typically have ≤ 50 steps.
 const DEFAULT_GAS: u64 = 10_000;
-const DEFAULT_MAX_STEPS: u8 = 25;
 
 /// Encode a TwoReg instruction at `code[0..2]`: opcode byte then a packed
 /// register byte where `rd` lands in the low 4 bits and `ra` in the high 4.
@@ -57,9 +56,8 @@ pub fn trace_until_opcode_zero(
         regs,
         vec![0u8; DEFAULT_FLAT_MEM],
         DEFAULT_GAS,
-        DEFAULT_MAX_STEPS,
     );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
     assert_eq!(
         exit,

@@ -3,22 +3,14 @@ use std::collections::HashMap;
 
 use crate::core::step::{CompactStep, NUM_REGS, PvmStep, expand_steps};
 
-/// Canonical proof-visible ISA tag. Keep standard v0.8 at zero so the tag is
-/// an explicit protocol discriminator rather than a Rust enum-layout detail.
-pub(crate) const fn isa_profile_tag(mode: vos_pvm::IsaMode) -> u8 {
-    match mode {
-        vos_pvm::IsaMode::Conformance => 0,
-        vos_pvm::IsaMode::Jar => 1,
-    }
-}
+/// The ISA-profile tag committed by the ProgramMemory and CPU chips. Only
+/// the Gray Paper profile (tag zero) exists.
+pub(crate) const ISA_PROFILE_TAG: u8 = 0;
 
 /// Prover's side note used for tracking additional data for trace generation.
 pub struct SideNote {
     /// The execution trace steps.
     pub steps: Vec<PvmStep>,
-    /// ISA profile used to decode and execute `code`. ProgramMemoryChip
-    /// commits this tag and authenticates it on every fetched instruction.
-    pub isa_mode: vos_pvm::IsaMode,
     /// Program bytecode.
     pub code: Arc<[u8]>,
     /// Bitmask for instruction validation.
@@ -211,8 +203,6 @@ pub struct CompactTrace {
     /// Register file entering `steps[0]` (the interpreter's seeded file) —
     /// the base the per-step [`crate::core::step::RegWrite`]s thread from.
     pub initial_regs: [u64; NUM_REGS],
-    /// ISA profile used by the traced execution.
-    pub isa_mode: vos_pvm::IsaMode,
     /// Program bytecode.
     pub code: Vec<u8>,
     /// Bitmask for instruction validation.
@@ -240,17 +230,15 @@ impl CompactTrace {
         self.steps.len()
     }
 
-    /// Expand into the full `SideNote` the single-proof paths hold —
-    /// field-for-field what [`crate::actor::trace_blob`] has always
-    /// returned: steps with snapshots rebuilt from `initial_regs`, the
-    /// streams moved over, and the ristretto boundary ingested. Note
+    /// Expand into the full `SideNote` the single-proof paths hold: steps
+    /// with snapshots rebuilt from `initial_regs`, the streams moved over,
+    /// and the ristretto boundary ingested. Note
     /// `SideNote::initial_regs` stays at its all-zero default (as on the
     /// historical assembly path); `prove` seeds it from
     /// `steps[0].regs_before`.
     pub fn into_side_note(self) -> SideNote {
         let steps = expand_steps(&self.steps, self.initial_regs);
         let mut sn = SideNote::new(steps, self.code, self.bitmask)
-            .with_isa_mode(self.isa_mode)
             .with_memory(self.initial_memory)
             .with_jump_table(self.jump_table);
         sn.blake2b_calls = self.blake2b_calls;
@@ -453,7 +441,6 @@ impl SideNote {
     pub(crate) fn new_shared(steps: Vec<PvmStep>, code: Arc<[u8]>, bitmask: Arc<[u8]>) -> Self {
         Self {
             steps,
-            isa_mode: vos_pvm::IsaMode::Conformance,
             code,
             bitmask,
             range256_counts: vec![0u32; 256],
@@ -495,12 +482,6 @@ impl SideNote {
             #[cfg(feature = "prover")]
             memory_pages: None,
         }
-    }
-
-    /// Bind this proof witness to the execution profile used by the tracer.
-    pub fn with_isa_mode(mut self, isa_mode: vos_pvm::IsaMode) -> Self {
-        self.isa_mode = isa_mode;
-        self
     }
 
     /// Build the memory-page Merkle boundary payload for this segment

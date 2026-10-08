@@ -1,0 +1,19 @@
+[workspace]
+
+[package]
+name = "bench-diverse"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "bench-diverse"
+path = "src/main.rs"
+test = false
+bench = false
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"
+codegen-units = 1

@@ -810,8 +810,13 @@ linked as a standard program and run on the interpreter, accepts the
 honest fixture:
 
 - 10,677,000 instructions;
-- 102,671,695 gas under the 0.8.0 block-gas model, about 9.6 gas per
+- 28,882,195 gas under the 0.8.0 block-gas model, about 2.7 gas per
   instruction.
+
+A first measurement read 102,671,695 gas because the refine harness still
+charged JAR's 1,500 gas per mapped page at initialization (49,193 pages for
+the verifier's 192 MiB heap). Gray Paper 0.8.0 has no such charge; slice 1
+removed it.
 
 The earlier figure of about 10.7M cycles was measured under JAR. One segment
 fits a refine's gas budget comfortably; a settlement window of many segments

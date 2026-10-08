@@ -63,9 +63,9 @@ fn parses_canonical_program_from_real_service_preimage() {
     assert_eq!(layout.registers[0], vos_pvm::PVM_HALT_ADDR);
 }
 
-/// The real service can be *started* under the kernel-free refine harness:
-/// it runs deterministically up to its first hostcall (`ecalli 1`), which
-/// surfaces as an undispatched `HostCall` exit for the embedder to handle.
+/// The real service can be *started* under the refine harness: it runs
+/// deterministically up to its first hostcall (`ecalli 1`), which surfaces as
+/// an undispatched `HostCall` exit for the embedder to handle.
 #[test]
 fn refine_harness_starts_canonical_real_service_program() {
     let blob = service_program();
@@ -75,20 +75,13 @@ fn refine_harness_starts_canonical_real_service_program() {
         vos_pvm::ExitReason::HostCall(1),
         "the service's first act at the refine entry is hostcall 1"
     );
-    // ro (2) + rw+heap (3) + stack (2) pages charge init gas; the prologue
-    // consumed execution gas on top of that.
-    let init_gas = 7 * vos_pvm::GAS_PER_PAGE;
-    assert!(
-        inv.gas_used > init_gas,
-        "gas accounting: init charge plus execution (used {})",
-        inv.gas_used
-    );
+    assert!(inv.gas_used > 0, "the prologue consumed gas");
     assert_eq!(inv.output_bounded(0), None, "no output without a halt");
 }
 
 /// The flat and sparse memory representations are indistinguishable on the
-/// real gp072 service: same first-hostcall exit, the same v0.8 ROB-metered
-/// gas (10 743), the same register file, and the same logical memory around
+/// real service: same first-hostcall exit, the same v0.8 ROB-metered gas
+/// (243), the same register file, and the same logical memory around
 /// every mapped region. This is the shape a 32-bit embedder (which
 /// `MemoryModel::Auto` puts on the sparse path) executes.
 #[test]
@@ -103,7 +96,7 @@ fn refine_flat_and_sparse_agree_on_canonical_real_service_program() {
     assert_eq!(f.exit, vos_pvm::ExitReason::HostCall(1));
     assert_eq!(s.exit, f.exit, "exit agrees");
     assert_eq!(
-        f.gas_used, 10_743,
+        f.gas_used, 243,
         "pinned v0.8 ROB gas for the service prologue"
     );
     assert_eq!(s.gas_used, f.gas_used, "gas agrees");

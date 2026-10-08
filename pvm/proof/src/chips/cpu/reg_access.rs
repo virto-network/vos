@@ -108,10 +108,7 @@ pub(crate) fn step_reg_accesses(step: &crate::core::step::PvmStep) -> StepRegAcc
     //   blake2b: φ[7,8,9,10] (h_ptr/m_ptr/t_low/f_flag).
     //   ristretto scalar_mult/point_add/scalar_binop: φ[7,8,9].
     //   ristretto reduce_wide (112): φ[7,8] only.
-    let is_ecall = matches!(
-        step.opcode,
-        crate::core::opcode::Opcode::Ecalli | crate::core::opcode::Opcode::Ecall
-    );
+    let is_ecall = matches!(step.opcode, crate::core::opcode::Opcode::Ecalli);
     let imm = step.imm;
     let is_blake_ecall = is_ecall && imm == ECALL_BLAKE2B_COMPRESS as u64;
     let is_ristretto_reduce = is_ecall && imm == ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE as u64;

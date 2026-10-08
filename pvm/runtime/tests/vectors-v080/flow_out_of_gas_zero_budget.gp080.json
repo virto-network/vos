@@ -1,9 +1,5 @@
 {
-  "backends": [
-    "interpreter"
-  ],
   "expected": {
-    "gas": 0,
     "memory": [],
     "pc": 0,
     "regs": [

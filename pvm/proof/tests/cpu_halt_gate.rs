@@ -80,9 +80,8 @@ fn one_step_jump_ind() -> SideNote {
         regs,
         vec![0; 4 * 1024 * 1024],
         10_000,
-        25,
     );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let mut tracing = TracingPvm::new(pvm);
     let _ = tracing.run();
     let first = tracing.into_trace().remove(0);
     assert_eq!(first.opcode, Opcode::JumpInd);
@@ -102,9 +101,8 @@ fn one_step_load_imm_jump_ind() -> SideNote {
         regs,
         vec![0; 4 * 1024 * 1024],
         10_000,
-        25,
     );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let mut tracing = TracingPvm::new(pvm);
     let _ = tracing.run();
     let first = tracing.into_trace().remove(0);
     assert_eq!(first.opcode, Opcode::LoadImmJumpInd);

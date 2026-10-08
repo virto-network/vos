@@ -88,7 +88,7 @@ the reference laptop (Core Ultra 7 155H). Other work ran at the same time
 These are the numbers steps 1.4–1.6 must move: machine creation ≤ 50 µs,
 pooled acquire plus reset ≤ 5 µs, and refine fixed cost ≤ 50 µs.
 
-## Step 1.2: remove JAR (in progress)
+## Step 1.2: remove JAR (stages 1–3 done; stage 4 next)
 
 **Stage 1, flip the defaults.** The `IsaMode` default, `Interpreter::with_memory`,
 `GasSimulator::new` and the JIT's constructor now select the Gray Paper
@@ -110,7 +110,7 @@ profile. Everything that broke:
 Every other prover suite passes, including all eight soundness gates and
 the conformance vectors.
 
-**Stage 2, port what must survive (in progress):**
+**Stage 2, port what must survive:**
 
 - **The settlement verifier now builds, runs and accepts** as a standard
   program. Its program had not compiled since a package rename (it called
@@ -121,5 +121,77 @@ the conformance vectors.
     which a 192 MiB heap arena overlapped;
   - the GOT and relocated read-only data go with the read-write data, where
     `lld` had placed the orphan `.got` below the read-write base.
-- **Re-measured under 0.8.0:** 10,677,000 instructions and 102,671,695 gas
-  per settlement verify.
+- **Gray Paper versions of the JAR-only proof gates,** written before their
+  JAR versions were deleted:
+  - an unhandled host call cannot claim the advanced PC
+    (`unhandled_host_call_rejects_forged_resume_pc`);
+  - an honest low-zone store is not provable: the CPU AIR rejects the row
+    and `prove` refuses the trace (`standard_low_zone_access_is_not_provable`);
+  - the acknowledged-host-call gates use a real precompile, since the
+    lifecycle stubs they used are gone.
+- **A compiled guest proves end to end.** The only `hash-bench` workload with
+  source moved to `pvm/bench/guests/diverse`. `tests/diverse_proof.rs` checks
+  its output against the same computation done natively, then proves and
+  verifies the run on the refine path (about 12 s). The old `prove_diverse`
+  passed even when proving failed.
+
+**Stage 3, delete.** Everything in the plan's appendix is gone, and
+`just jar-check` finds no remnant:
+
+- runtime: the capability kernel, `cap.rs`, `vm_pool.rs`, the JAR snapshot
+  and program formats, `IsaMode`, `GasModel` (with the GP 0.7.2
+  per-instruction model), the `Trap` and `Ecall` exits, opcode 3 and the
+  shifted unary numbering, the memory-latency tiers, the heap fields, the
+  JIT's capability bitmap, and the JIT's register-definition peephole (it
+  never fired under the Gray Paper profile, which clears it after every
+  instruction);
+- compiler: the JAR blob emitter, `link_elf`, the capability-manifest
+  opcode encoding and the `0x800` dynamic-ecall marker (CSR `0x800` is now an
+  unknown CSR and traps, like any other);
+- prover: `actor.rs`, the lifecycle stubs and `ECALL_VOS_*` ids, the
+  capability-manifest tracer, `benches/actors.rs`, the JAR blobs; the ISA
+  profile no longer threads through side notes and segments, and its
+  column is filled with the Gray Paper tag 0 until stage 4 removes it;
+- guest shim: the capability slot and padding loaded on every precompile
+  call;
+- tests and fixtures built on master's `vos` framework (`fibonacci`,
+  `clerk-refine-bench`, `voucher-check`, `voucher_check_smoke`), listed in
+  the plan's return table for steps 2 and 5;
+- the GP 0.7.2 vector corpus (124 files).
+
+**Findings while deleting:**
+
+- **The refine harness charged a JAR initialization fee.** It charged 1,500
+  gas per mapped page before running, which Gray Paper 0.8.0's Ψ_M does not.
+  For the settlement verifier, with its 192 MiB heap, that was 73,789,500 of
+  the 102,671,695 gas first recorded in `spikes.md`. Without it the verify
+  takes 10,677,000 instructions and 28,882,195 gas; `spikes.md` and the core
+  model are corrected.
+- **The v0.8.0 instruction corpus recorded per-instruction gas.** Its
+  `expected.gas` was GP 0.7.2's flat model, and three cases depended on it.
+  The column and those three cases are gone; every remaining case now runs
+  on both backends with exact interpreter-JIT gas agreement, and the 16
+  independently derived block-gas vectors pin the gas model. Every other
+  expected value in the corpus is unchanged.
+- **Invalid opcodes never execute under Ψ.** The interpreter charged invalid
+  byte 3 as JAR's `ecall` (100 cycles, ending the block) and other invalid
+  bytes at 1 cycle, while the JIT charges them nothing. This cannot matter:
+  Gray Paper 0.8.0's `deblob` rejects any program with an invalid opcode at
+  an instruction start, so the parity check rightly skips such programs.
+- **The prover proves only runs whose memory instructions complete.** A
+  run ending in a memory exception (a page fault, or a low-zone access,
+  which panics) has no proof; proving refuses it before building the trace.
+  This is the existing design, which the deleted JAR gate never exercised.
+  It does not limit attestable methods, whose proofs are of completed
+  calls, but the privacy track should state it.
+- **Proof format.** The refine bundle format is now version 3: the slice-exit
+  tags are renumbered without `Trap` and `Ecall`, and the machine-state
+  commitment no longer hashes the ISA profile, the gas model, the heap
+  fields or the memory tier (domain tags `refine-execution-transcript/v2`,
+  `refine-machine-state/v3`). The proof's allowed host calls are now exactly
+  the precompiles, so ProgramMemory commitments change only for programs
+  that contained a lifecycle stub.
+- **For step 1.3:** the Ristretto and scalar precompile ids (110–114) are
+  still outside the VOS range `0x400..=0x4ff`, and the plan's remark that
+  the JIT charges 10 gas inline per `ecalli` no longer holds: that charge
+  was JAR's inline `GAS` capability and is gone.

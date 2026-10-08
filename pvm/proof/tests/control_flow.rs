@@ -72,9 +72,8 @@ fn prove_unconditional_jump() {
         regs,
         vec![0u8; 4 * 1024 * 1024],
         10000,
-        25,
     );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
     assert_eq!(exit, vos_pvm::ExitReason::Panic); // Trap
 
@@ -115,9 +114,8 @@ fn prove_fallthrough() {
         regs,
         vec![0u8; 4 * 1024 * 1024],
         10000,
-        25,
     );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
     assert_eq!(exit, vos_pvm::ExitReason::Panic);
 
@@ -157,9 +155,8 @@ fn fallthrough_forged_next_pc_rejected() {
         regs,
         vec![0u8; 4 * 1024 * 1024],
         10000,
-        25,
     );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let mut tracing = TracingPvm::new(pvm);
     let _ = tracing.run();
     let mut steps = tracing.into_trace();
 
@@ -196,9 +193,8 @@ fn prove_unlikely() {
         regs,
         vec![0u8; 4 * 1024 * 1024],
         10000,
-        25,
     );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
     assert_eq!(exit, vos_pvm::ExitReason::Panic);
 
@@ -246,9 +242,8 @@ fn load_imm_jump_ind_positive_smoke() {
         regs,
         vec![0u8; 4 * 1024 * 1024],
         10000,
-        25,
     );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let mut tracing = TracingPvm::new(pvm);
     let _ = tracing.run();
     let steps = tracing.into_trace();
     assert_eq!(steps[0].opcode, Opcode::LoadImmJumpInd);
@@ -283,9 +278,8 @@ fn load_imm_jump_ind_forged_target_rejected() {
         regs,
         vec![0u8; 4 * 1024 * 1024],
         10000,
-        25,
     );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let mut tracing = TracingPvm::new(pvm);
     let _ = tracing.run();
     let mut steps = tracing.into_trace();
     assert_eq!(steps[0].next_pc, 3);
@@ -322,9 +316,8 @@ fn jump_ind_positive_smoke() {
         regs,
         vec![0u8; 4 * 1024 * 1024],
         10000,
-        25,
     );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let mut tracing = TracingPvm::new(pvm);
     let _ = tracing.run();
     let steps = tracing.into_trace();
     assert_eq!(steps[0].opcode, Opcode::JumpInd);
@@ -359,9 +352,8 @@ fn jump_ind_forged_target_rejected() {
         regs,
         vec![0u8; 4 * 1024 * 1024],
         10000,
-        25,
     );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let mut tracing = TracingPvm::new(pvm);
     let _ = tracing.run();
     let mut steps = tracing.into_trace();
     assert_eq!(steps[0].next_pc, 3);
@@ -417,9 +409,8 @@ fn jump_forged_branch_target_rejected_by_prog_mem_lookup() {
         regs,
         vec![0u8; 4 * 1024 * 1024],
         10000,
-        25,
     );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let mut tracing = TracingPvm::new(pvm);
     let _ = tracing.run();
     let mut steps = tracing.into_trace();
     assert_eq!(steps.len(), 2); // Jump → Trap@4
@@ -467,9 +458,8 @@ fn trap_followed_by_trap_clone_rejected_by_terminal_constraint() {
         regs,
         vec![0u8; 4 * 1024 * 1024],
         10000,
-        25,
     );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let mut tracing = TracingPvm::new(pvm);
     let _ = tracing.run();
     let mut steps = tracing.into_trace();
     assert_eq!(steps.len(), 3);
@@ -514,9 +504,8 @@ fn trap_mid_trace_rejected() {
         regs,
         vec![0u8; 4 * 1024 * 1024],
         10000,
-        25,
     );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let mut tracing = TracingPvm::new(pvm);
     let _ = tracing.run();
     let mut steps = tracing.into_trace();
     assert_eq!(steps.len(), 3);
@@ -557,9 +546,8 @@ fn unlikely_forged_next_pc_rejected() {
         regs,
         vec![0u8; 4 * 1024 * 1024],
         10000,
-        25,
     );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let mut tracing = TracingPvm::new(pvm);
     let _ = tracing.run();
     let mut steps = tracing.into_trace();
 
@@ -597,9 +585,8 @@ fn prove_branch_eq_taken() {
         regs,
         vec![0u8; 4 * 1024 * 1024],
         10000,
-        25,
     );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
     assert_eq!(exit, vos_pvm::ExitReason::Panic);
 
@@ -639,9 +626,8 @@ fn prove_branch_eq_not_taken() {
         regs,
         vec![0u8; 4 * 1024 * 1024],
         10000,
-        25,
     );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
     assert_eq!(exit, vos_pvm::ExitReason::Panic);
 
@@ -708,9 +694,8 @@ fn prove_loop_add() {
         regs,
         vec![0u8; 4 * 1024 * 1024],
         10000,
-        25,
     );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
     assert_eq!(exit, vos_pvm::ExitReason::Panic);
 

@@ -65,8 +65,6 @@ pub struct TranslationContext {
     pub jump_table: Vec<u32>,
     /// Whether translating 64-bit RISC-V.
     pub is_64bit: bool,
-    /// Wire opcode profile selected by the output container.
-    opcode_encoding: OpcodeEncoding,
     /// Map from RISC-V address to PVM code offset.
     pub address_map: std::collections::HashMap<u64, u32>,
     /// Pending branch fixups: (pvm_imm_offset, target_rv_address, fixup_size)
@@ -86,37 +84,21 @@ pub struct TranslationContext {
     pub(crate) pending_load_imm: Option<(u8, i64, usize)>,
     /// Last immediate loaded into t0 (x5) — used for ecalli cap slot.
     last_t0_imm: Option<i32>,
-    /// CSR marker for ecall/ecalli distinction.
-    /// 0x800 = next ecall → legacy-manifest PVM ecall, 0x801 = next ecall →
-    /// standard PVM ecalli. The standard profile rejects 0x800 rather than
-    /// emitting the retired dynamic-capability opcode.
-    ecall_marker: Option<u32>,
+    /// Set by the CSR marker 0x801: the next ecall becomes a PVM `ecalli`
+    /// whose id was loaded into t0.
+    ecalli_marked: bool,
     /// RISC-V code address ranges (lo, hi) — used to detect function pointers
     /// loaded via auipc+addi that need jump table entries.
     pub code_ranges: Vec<(u64, u64)>,
 }
 
-/// The standard program follows the current Gray Paper opcode table. Frozen
-/// capability manifests retain their private pre-v0.8 unary numbering so
-/// rebuilding one cannot silently change its program identity.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum OpcodeEncoding {
-    Standard,
-    CapabilityManifest,
-}
-
 impl TranslationContext {
     pub fn new(is_64bit: bool) -> Self {
-        Self::with_opcode_encoding(is_64bit, OpcodeEncoding::Standard)
-    }
-
-    pub(crate) fn with_opcode_encoding(is_64bit: bool, opcode_encoding: OpcodeEncoding) -> Self {
         Self {
             code: Vec::new(),
             bitmask: Vec::new(),
             jump_table: Vec::new(),
             is_64bit,
-            opcode_encoding,
             address_map: std::collections::HashMap::new(),
             fixups: Vec::new(),
             fixup_pcs: std::collections::HashMap::new(),
@@ -125,7 +107,7 @@ impl TranslationContext {
             pending_lui: None,
             pending_load_imm: None,
             last_t0_imm: None,
-            ecall_marker: None,
+            ecalli_marked: false,
             code_ranges: Vec::new(),
         }
     }
@@ -301,31 +283,14 @@ impl TranslationContext {
                         let csr = (inst >> 20) & 0xFFF;
                         match csr {
                             0 => {
-                                // ECALL — dispatch based on CSR marker
-                                match self.ecall_marker.take() {
-                                    Some(0x800)
-                                        if self.opcode_encoding
-                                            == OpcodeEncoding::CapabilityManifest =>
-                                    {
-                                        // Legacy JAR services retain dynamic
-                                        // capability management until their
-                                        // daemon path is removed.
-                                        self.emit_ecall();
-                                    }
-                                    Some(0x800) => {
-                                        return Err(TranspileError::UnsupportedInstruction {
-                                            offset: _addr as usize,
-                                            detail: "dynamic ecall is not part of the standard PVM profile"
-                                                .into(),
-                                        });
-                                    }
-                                    Some(0x801) => {
-                                        // CSR 0x801 → PVM ecalli (CALL a cap)
-                                        let id = self.last_t0_imm.unwrap_or(0) as u32;
-                                        self.emit_ecalli(id);
-                                        self.last_t0_imm = None;
-                                    }
-                                    _ => self.emit_inst(0), // unmarked ECALL → trap
+                                // ECALL: a marked one becomes `ecalli`; an
+                                // unmarked one traps.
+                                if std::mem::take(&mut self.ecalli_marked) {
+                                    let id = self.last_t0_imm.unwrap_or(0) as u32;
+                                    self.emit_ecalli(id);
+                                    self.last_t0_imm = None;
+                                } else {
+                                    self.emit_inst(0);
                                 }
                             }
                             1 => self.emit_inst(0), // EBREAK → trap
@@ -333,15 +298,13 @@ impl TranslationContext {
                         }
                     }
                     1 => {
-                        // CSRRW: check for custom markers 0x800, 0x801
+                        // CSRRW: CSR 0x801 marks the next ecall as `ecalli`
+                        // and emits no PVM instruction itself.
                         let csr = (inst >> 20) & 0xFFF;
-                        match csr {
-                            0x800 | 0x801 => {
-                                // Custom CSR marker for ecall/ecalli distinction
-                                self.ecall_marker = Some(csr);
-                                // Don't emit any PVM instruction — marker consumed on next ecall
-                            }
-                            _ => self.emit_inst(0), // unknown CSR → trap
+                        if csr == 0x801 {
+                            self.ecalli_marked = true;
+                        } else {
+                            self.emit_inst(0); // unknown CSR → trap
                         }
                     }
                     _ => self.emit_inst(0), // other CSR ops → trap
@@ -1725,12 +1688,6 @@ impl TranslationContext {
     }
 
     pub(crate) fn emit_inst(&mut self, opcode: u8) {
-        let opcode = match (self.opcode_encoding, opcode) {
-            // The frozen manifest profile encoded the removed sbrk at 101,
-            // shifting the standard unary instructions up by one byte.
-            (OpcodeEncoding::CapabilityManifest, 101..=110) => opcode + 1,
-            _ => opcode,
-        };
         self.code.push(opcode);
         self.bitmask.push(1);
     }
@@ -1862,13 +1819,6 @@ impl TranslationContext {
     pub(crate) fn emit_ecalli(&mut self, id: u32) {
         self.emit_inst(10);
         self.emit_var_imm(id as i32);
-    }
-
-    /// Emit the legacy-manifest PVM ecall (opcode 3, NoArgs).
-    /// Management ops + dynamic CALL; never emitted for standard programs.
-    /// φ[11]=op, φ[12]=subject|object — all operands in registers.
-    pub(crate) fn emit_ecall(&mut self) {
-        self.emit_inst(3);
     }
 
     /// Emit a OneRegImmOffset instruction (used by branch_*_imm opcodes).
@@ -2020,7 +1970,6 @@ fn decode_s_imm(inst: u32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vos_pvm::instruction::Opcode;
 
     #[test]
     fn test_register_mapping() {
@@ -2311,42 +2260,5 @@ mod tests {
         ctx.translate_instruction(&0x0000_0073_u32.to_le_bytes(), 0, 0)
             .unwrap();
         assert_eq!(ctx.code, [0], "unmarked ECALL must compile to trap");
-    }
-
-    #[test]
-    fn marked_dynamic_ecall_is_legacy_manifest_only() {
-        // csrw 0x800, zero; ecall
-        let marker = 0x8000_1073_u32;
-        let ecall = 0x0000_0073_u32;
-
-        let mut standard = TranslationContext::new(true);
-        standard.translate_one(marker, 0).unwrap();
-        assert!(matches!(
-            standard.translate_one(ecall, 4),
-            Err(TranspileError::UnsupportedInstruction { offset: 4, detail })
-                if detail.contains("dynamic ecall")
-        ));
-        assert!(standard.code.is_empty());
-
-        let mut legacy =
-            TranslationContext::with_opcode_encoding(true, OpcodeEncoding::CapabilityManifest);
-        legacy.translate_one(marker, 0).unwrap();
-        legacy.translate_one(ecall, 4).unwrap();
-        assert_eq!(legacy.code, [3]);
-        assert_eq!(legacy.bitmask, [1]);
-    }
-
-    #[test]
-    fn opcode_profiles_separate_standard_and_frozen_manifest_unaries() {
-        let mut standard = TranslationContext::new(true);
-        standard.emit_inst(Opcode::CountSetBits64 as u8);
-        standard.emit_inst(Opcode::ReverseBytes as u8);
-        assert_eq!(standard.code, [101, 110]);
-
-        let mut manifest =
-            TranslationContext::with_opcode_encoding(true, OpcodeEncoding::CapabilityManifest);
-        manifest.emit_inst(Opcode::CountSetBits64 as u8);
-        manifest.emit_inst(Opcode::ReverseBytes as u8);
-        assert_eq!(manifest.code, [102, 111]);
     }
 }

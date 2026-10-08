@@ -41,8 +41,6 @@ pub struct InterpreterProgram {
     pub bitmask: Vec<u8>,
     /// Dynamic jump table.
     pub jump_table: Vec<u32>,
-    /// Memory tier cycles.
-    pub mem_cycles: u8,
 }
 
 /// Compiled PVM program — either interpreter or recompiler backend.
@@ -119,31 +117,20 @@ pub fn compile(
     code: &[u8],
     bitmask: &[u8],
     jump_table: &[u32],
-    mem_cycles: u8,
     backend: PvmBackend,
-    isa_mode: crate::IsaMode,
 ) -> Result<CompiledProgram, alloc::string::String> {
-    let mem_cycles = crate::mem_cycles_for_mode(mem_cycles, isa_mode);
     match resolve_backend(backend)? {
-        ResolvedBackend::Interpreter => {
-            // Bind the decoder and block boundaries to the selected ISA at
-            // compile time; execution still carries the same mode so opcode
-            // dispatch cannot cross the standard/runtime boundary.
-            let prog = crate::interpreter::Interpreter::predecode(
-                code, bitmask, jump_table, mem_cycles, isa_mode,
-            );
-            Ok(CompiledProgram::Interpreter(prog))
-        }
+        ResolvedBackend::Interpreter => Ok(CompiledProgram::Interpreter(
+            crate::interpreter::Interpreter::predecode(code, bitmask, jump_table),
+        )),
         #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
-        ResolvedBackend::Recompiler => {
-            let compiled =
-                crate::recompiler::compile_code(code, bitmask, jump_table, mem_cycles, isa_mode)?;
-            Ok(CompiledProgram::Recompiler(compiled))
-        }
+        ResolvedBackend::Recompiler => Ok(CompiledProgram::Recompiler(
+            crate::recompiler::compile_code(code, bitmask, jump_table)?,
+        )),
     }
 }
 
-/// Immutable, profile-bound preparation shared by standard outer and inner
+/// Immutable preparation shared by standard outer and inner
 /// execution. It owns no invocation memory and introduces no global cache.
 #[derive(Clone)]
 pub(crate) struct PreparedExecution {
@@ -159,14 +146,7 @@ impl PreparedExecution {
         jump_table: &[u32],
         backend: PvmBackend,
     ) -> Result<Self, String> {
-        let compiled = compile(
-            code,
-            bitmask,
-            jump_table,
-            crate::STANDARD_MEM_CYCLES,
-            backend,
-            crate::IsaMode::Conformance,
-        )?;
+        let compiled = compile(code, bitmask, jump_table, backend)?;
         Ok(match compiled {
             CompiledProgram::Interpreter(interpreter) => Self {
                 interpreter: Arc::new(interpreter),
@@ -175,13 +155,7 @@ impl PreparedExecution {
             },
             #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
             CompiledProgram::Recompiler(native) => Self {
-                interpreter: Arc::new(crate::Interpreter::predecode(
-                    code,
-                    bitmask,
-                    jump_table,
-                    crate::STANDARD_MEM_CYCLES,
-                    crate::IsaMode::Conformance,
-                )),
+                interpreter: Arc::new(crate::Interpreter::predecode(code, bitmask, jump_table)),
                 native: Some(Arc::new(native)),
             },
         })

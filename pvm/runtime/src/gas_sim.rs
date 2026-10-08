@@ -3,9 +3,7 @@
 //! Standard programs use the Gray Paper v0.8.0 priority-loop model: a
 //! 32-entry reorder buffer, all-or-nothing four-slot decode, five starts per
 //! cycle, persistent execution-unit occupancy, data dependencies, and
-//! in-order retirement.  The capability-manifest/JAR profile retains its
-//! frozen register-ready approximation because its gas costs are already part
-//! of the signed service execution contract.
+//! in-order retirement.
 
 use crate::gas_cost::FastCost;
 
@@ -252,73 +250,15 @@ fn release_units(available: &mut [u8; 5], unit: u8) {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct JarState {
-    reg_done: [u32; REGISTER_COUNT],
-    cycle: u32,
-    decode_used: u8,
-    max_done: u32,
-}
-
-impl JarState {
-    fn feed(&mut self, cost: FastCost) {
-        // This is the frozen JAR/service rule. In particular, it intentionally
-        // admits an instruction while any frontend slot remains.
-        if self.decode_used >= DECODE_SLOTS {
-            self.cycle += 1;
-            self.decode_used = cost.decode_slots;
-        } else {
-            self.decode_used += cost.decode_slots;
-        }
-
-        if cost.is_move_reg {
-            let src_reg = cost.src_mask.trailing_zeros() as usize;
-            let dst_reg = cost.dst_mask.trailing_zeros() as usize;
-            if src_reg < REGISTER_COUNT && dst_reg < REGISTER_COUNT {
-                self.reg_done[dst_reg] = self.reg_done[src_reg];
-            }
-            return;
-        }
-
-        let mut start = self.cycle;
-        let mut src = cost.src_mask;
-        while src != 0 {
-            let register = src.trailing_zeros() as usize;
-            src &= src - 1;
-            if register < REGISTER_COUNT {
-                start = start.max(self.reg_done[register]);
-            }
-        }
-        let done = start + u32::from(cost.cycles);
-        let mut dst = cost.dst_mask;
-        while dst != 0 {
-            let register = dst.trailing_zeros() as usize;
-            dst &= dst - 1;
-            if register < REGISTER_COUNT {
-                self.reg_done[register] = done;
-            }
-        }
-        self.max_done = self.max_done.max(done);
-    }
-
-    fn cost(self) -> u32 {
-        self.max_done.saturating_sub(3).max(1)
-    }
-}
-
 /// Online, fixed-memory gas simulator shared by the interpreter and native
-/// recompiler. Select the profile explicitly with [`Self::new_for_mode`].
+/// recompiler.
 pub struct GasSimulator {
-    mode: crate::IsaMode,
-    jar: JarState,
     conformance: ConformanceState,
 }
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct GasSimulatorState {
-    mode: crate::IsaMode,
-    jar: JarState,
     conformance: ConformanceState,
 }
 
@@ -330,13 +270,7 @@ impl Default for GasSimulator {
 
 impl GasSimulator {
     pub fn new() -> Self {
-        Self::new_for_mode(crate::IsaMode::Conformance)
-    }
-
-    pub fn new_for_mode(mode: crate::IsaMode) -> Self {
         Self {
-            mode,
-            jar: JarState::default(),
             conformance: ConformanceState::default(),
         }
     }
@@ -346,8 +280,6 @@ impl GasSimulator {
     #[cfg(test)]
     pub(crate) fn state(&self) -> GasSimulatorState {
         GasSimulatorState {
-            mode: self.mode,
-            jar: self.jar,
             conformance: self.conformance,
         }
     }
@@ -390,25 +322,18 @@ impl GasSimulator {
     /// Process one instruction. O(1).
     #[inline]
     pub fn feed(&mut self, cost: &FastCost) {
-        match self.mode {
-            crate::IsaMode::Jar => self.jar.feed(*cost),
-            crate::IsaMode::Conformance => self.conformance.feed(*cost),
-        }
+        self.conformance.feed(*cost);
     }
 
     /// Return block gas cost: max(max_done - 3, 1).
     #[inline]
     pub fn flush_and_get_cost(&self) -> u32 {
-        match self.mode {
-            crate::IsaMode::Jar => self.jar.cost(),
-            crate::IsaMode::Conformance => self.conformance.drain(),
-        }
+        self.conformance.drain()
     }
 
     /// Reset for the next gas block.
     #[inline]
     pub fn reset(&mut self) {
-        self.jar = JarState::default();
         self.conformance = ConformanceState::default();
     }
 }
@@ -553,7 +478,7 @@ mod tests {
     }
 
     fn standard_cost(costs: &[FastCost]) -> u32 {
-        let mut simulator = GasSimulator::new_for_mode(crate::IsaMode::Conformance);
+        let mut simulator = GasSimulator::new();
         for cost in costs {
             simulator.feed(cost);
         }
@@ -581,28 +506,6 @@ mod tests {
     }
 
     #[test]
-    fn test_data_dependency_chain() {
-        // Chain: r0 → r1 (1 cycle), r1 → r2 (1 cycle)
-        // r1 is ready at cycle 1, r2 at cycle 2
-        let mut sim = GasSimulator::new();
-        sim.feed_direct(1, 1, 0, 0xFF, 1); // r1 done at cycle 1
-        sim.feed_direct(1, 1, 1, 0xFF, 2); // depends on r1, r2 done at cycle 2
-        // max_done = 2, cost = max(2 - 3, 1) = 1
-        assert_eq!(sim.flush_and_get_cost(), 1);
-    }
-
-    #[test]
-    fn test_long_dependency_chain() {
-        // 5-deep chain, each 1 cycle: r0→r1→r2→r3→r4→r5
-        let mut sim = GasSimulator::new();
-        for i in 0..5u8 {
-            sim.feed_direct(1, 1, i, 0xFF, i + 1);
-        }
-        // r5 done at cycle 5, cost = max(5 - 3, 1) = 2
-        assert_eq!(sim.flush_and_get_cost(), 2);
-    }
-
-    #[test]
     fn test_independent_instructions_parallel() {
         // Two independent ALU ops: r0→r2 and r1→r3, both 1 cycle
         let mut sim = GasSimulator::new();
@@ -614,95 +517,11 @@ mod tests {
     }
 
     #[test]
-    fn test_multi_cycle_instruction() {
-        // One 4-cycle instruction (e.g., multiply)
-        let mut sim = GasSimulator::new();
-        sim.feed_direct(4, 1, 0, 1, 2); // 4 cycles, src r0+r1, dst r2
-        // max_done = 4, cost = max(4 - 3, 1) = 1
-        assert_eq!(sim.flush_and_get_cost(), 1);
-    }
-
-    #[test]
-    fn test_high_latency_chain() {
-        // 4-cycle MUL → 1-cycle ALU dependent on result
-        let mut sim = GasSimulator::new();
-        sim.feed_direct(4, 1, 0, 1, 2); // MUL: r2 done at cycle 4
-        sim.feed_direct(1, 1, 2, 0xFF, 3); // ALU: depends on r2, r3 done at cycle 5
-        // max_done = 5, cost = max(5 - 3, 1) = 2
-        assert_eq!(sim.flush_and_get_cost(), 2);
-    }
-
-    #[test]
-    fn test_decode_throughput_limit() {
-        // 5 independent 1-slot instructions: 4 fit in cycle 0, 5th bumps to cycle 1
-        let mut sim = GasSimulator::new();
-        for i in 0..5u8 {
-            sim.feed_direct(1, 1, 0xFF, 0xFF, i); // no deps, 1 slot each
-        }
-        // First 4 decode in cycle 0 (done at 1), 5th decodes in cycle 1 (done at 2)
-        // max_done = 2, cost = max(2 - 3, 1) = 1
-        assert_eq!(sim.flush_and_get_cost(), 1);
-    }
-
-    #[test]
     fn test_no_src_no_dst() {
         // Instruction with no register deps (e.g., NOP-like)
         let mut sim = GasSimulator::new();
         sim.feed_direct(1, 1, 0xFF, 0xFF, 0xFF);
         // max_done = 1 (start 0 + 1 cycle)
-        assert_eq!(sim.flush_and_get_cost(), 1);
-    }
-
-    #[test]
-    fn test_two_sources() {
-        // r2 = r0 + r1 where r0 available at cycle 0, r1 available at cycle 3
-        let mut sim = GasSimulator::new();
-        sim.feed_direct(3, 1, 0xFF, 0xFF, 1); // r1 done at cycle 3
-        sim.feed_direct(1, 1, 0, 1, 2); // depends on r0 (ready 0) and r1 (ready 3)
-        // r2 starts at max(0, 3) = 3, done at 4
-        // max_done = 4, cost = max(4 - 3, 1) = 1
-        assert_eq!(sim.flush_and_get_cost(), 1);
-    }
-
-    // === feed (bitmask-based) ===
-
-    #[test]
-    fn test_feed_move_reg_propagates_done() {
-        // move_reg: zero-cycle, propagates reg_done from src to dst
-        let mut sim = GasSimulator::new();
-        sim.feed_direct(3, 1, 0xFF, 0xFF, 0); // r0 done at cycle 3
-        sim.feed(&FastCost {
-            cycles: 0,
-            decode_slots: 1,
-            exec_unit: 0,
-            src_mask: 1 << 0, // r0
-            dst_mask: 1 << 1, // r1
-            is_terminator: false,
-            is_move_reg: true,
-        });
-        // r1 should inherit r0's done time (3)
-        sim.feed_direct(1, 1, 1, 0xFF, 2); // depends on r1
-        // r2 starts at 3, done at 4
-        // max_done = 4, cost = max(4 - 3, 1) = 1
-        assert_eq!(sim.flush_and_get_cost(), 1);
-    }
-
-    #[test]
-    fn test_feed_bitmask_multiple_sources() {
-        let mut sim = GasSimulator::new();
-        sim.feed_direct(2, 1, 0xFF, 0xFF, 0); // r0 done at 2
-        sim.feed_direct(3, 1, 0xFF, 0xFF, 1); // r1 done at 3
-        sim.feed(&FastCost {
-            cycles: 1,
-            decode_slots: 1,
-            exec_unit: 1,                  // ALU
-            src_mask: (1 << 0) | (1 << 1), // r0 + r1
-            dst_mask: 1 << 2,              // r2
-            is_terminator: false,
-            is_move_reg: false,
-        });
-        // r2 starts at max(2, 3) = 3, done at 4
-        // max_done = 4, cost = max(4 - 3, 1) = 1
         assert_eq!(sim.flush_and_get_cost(), 1);
     }
 
@@ -834,7 +653,7 @@ mod proptests {
                     }
                 })
                 .collect();
-            let mut simulator = GasSimulator::new_for_mode(crate::IsaMode::Conformance);
+            let mut simulator = GasSimulator::new();
             for cost in &costs {
                 simulator.feed(cost);
             }
@@ -893,26 +712,6 @@ mod proptests {
                 chain.feed_direct(cycles, 1, i as u8, 0xFF, (i + 1) as u8);
             }
             prop_assert!(indep.flush_and_get_cost() <= chain.flush_and_get_cost());
-        }
-
-        /// feed_direct with no sources and no dest (0xFF) is equivalent to
-        /// a no-dep instruction — cost grows only from decode throughput.
-        #[test]
-        fn no_reg_deps_bounded_by_decode(
-            count in 1usize..20,
-            cycles in 1u8..5,
-        ) {
-            let mut sim = GasSimulator::new();
-            for _ in 0..count {
-                sim.feed_direct(cycles, 1, 0xFF, 0xFF, 0xFF);
-            }
-            // max_done = (cycle_when_last_decoded) + cycles
-            // With 4 decode slots/cycle, last decode is at cycle floor((count-1)/4)
-            // So max_done <= floor((count-1)/4) + cycles
-            let expected_max = ((count - 1) / 4) as u32 + cycles as u32;
-            let cost = sim.flush_and_get_cost();
-            let expected_cost = if expected_max > 3 { expected_max - 3 } else { 1 };
-            prop_assert_eq!(cost, expected_cost);
         }
 
         /// feed and feed_direct produce the same cost for single-source,

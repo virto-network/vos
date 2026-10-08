@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::Proof;
 
 /// Wire shape of the boundary bundle itself.
-pub const REFINE_BUNDLE_FORMAT_VERSION: u32 = 2;
+pub const REFINE_BUNDLE_FORMAT_VERSION: u32 = 3;
 /// Post-decode protocol ceiling for independently proven machine slices.
 pub const MAX_REFINE_PROOF_SLICES: usize = 1_024;
 /// A handled outer host call can contribute at most one boundary per slice.
@@ -85,8 +85,6 @@ impl RefineMachineId {
 pub enum RefineSliceExit {
     Halt,
     Panic,
-    Trap,
-    Ecall,
     OutOfGas,
     PageFault(u32),
     HostCall(u64),
@@ -340,7 +338,7 @@ fn refine_execution_commitment(
     host_boundaries: &[RefineHostBoundary],
 ) -> [u8; 32] {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"vos/pvm/refine-execution-transcript/v1\0");
+    bytes.extend_from_slice(b"vos/pvm/refine-execution-transcript/v2\0");
     bytes.extend_from_slice(&outer_program.0);
     bytes.extend_from_slice(&arguments_commitment);
     put_u64(&mut bytes, gas_limit);
@@ -405,15 +403,13 @@ fn put_exit(bytes: &mut Vec<u8>, exit: RefineSliceExit) {
     match exit {
         RefineSliceExit::Halt => bytes.push(0),
         RefineSliceExit::Panic => bytes.push(1),
-        RefineSliceExit::Trap => bytes.push(2),
-        RefineSliceExit::Ecall => bytes.push(3),
-        RefineSliceExit::OutOfGas => bytes.push(4),
+        RefineSliceExit::OutOfGas => bytes.push(2),
         RefineSliceExit::PageFault(address) => {
-            bytes.push(5);
+            bytes.push(3);
             put_u32(bytes, address);
         }
         RefineSliceExit::HostCall(call) => {
-            bytes.push(6);
+            bytes.push(4);
             put_u64(bytes, call);
         }
     }
@@ -1017,7 +1013,6 @@ mod prover {
                     self.timestamps.insert(identity, active.next_timestamp);
                     let mut side_note =
                         SideNote::new_shared(active.steps, active.code, active.bitmask)
-                            .with_isa_mode(vos_pvm::IsaMode::Conformance)
                             .with_shared_jump_table(active.jump_table)
                             .with_initial_regs(active.initial_regs)
                             .with_sparse_memory(active.initial_memory);
@@ -1415,11 +1410,8 @@ mod prover {
         let machine = observation.machine_after;
         if !active.program_location.matches(machine)
             || observation.registers_before != active.last_regs
-            || machine.isa_mode() != vos_pvm::IsaMode::Conformance
         {
-            return Err(
-                "instruction observation changed static program/profile or continuity".to_string(),
-            );
+            return Err("instruction observation changed static program or continuity".to_string());
         }
         let opcode_byte = active
             .code
@@ -1429,8 +1421,7 @@ mod prover {
         if opcode_byte != observation.opcode_byte {
             return Err("instruction observation opcode differs from program".to_string());
         }
-        let opcode = Opcode::from_byte_in_mode(opcode_byte, vos_pvm::IsaMode::Conformance)
-            .unwrap_or(Opcode::Trap);
+        let opcode = Opcode::from_byte(opcode_byte).unwrap_or(Opcode::Trap);
         let skip_len = compute_skip(&active.bitmask, observation.pc_before as usize);
         let decoded = args::decode_args(
             &active.code,
@@ -1513,29 +1504,17 @@ mod prover {
         permission_commitment: [u8; 32],
     ) -> [u8; 32] {
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"vos/pvm/refine-machine-state/v2\0");
+        bytes.extend_from_slice(b"vos/pvm/refine-machine-state/v3\0");
         // Collector hashes each exact canonical program blob once per
         // installed identity. The ID transitively binds decoded code,
         // bitmask, and jump table without re-hashing MiB-scale static bytes at
         // every native host boundary.
         bytes.extend_from_slice(&program.0);
-        bytes.push(match machine.isa_mode() {
-            vos_pvm::IsaMode::Conformance => 0,
-            vos_pvm::IsaMode::Jar => 1,
-        });
-        bytes.push(match machine.gas_model() {
-            vos_pvm::GasModel::BlockPipeline => 0,
-            vos_pvm::GasModel::PerInstruction => 1,
-        });
         put_u32(&mut bytes, machine.pc);
         put_u64(&mut bytes, machine.gas);
         for &register in &machine.registers {
             put_u64(&mut bytes, register);
         }
-        put_u32(&mut bytes, machine.heap_base);
-        put_u32(&mut bytes, machine.heap_top);
-        put_u32(&mut bytes, machine.max_heap_pages);
-        bytes.push(machine.mem_cycles);
         bytes.push(machine.gas_charged as u8);
         bytes.push(machine.need_gas_charge as u8);
         match machine.pending_host_call() {
@@ -1556,8 +1535,6 @@ mod prover {
         match exit {
             ExitReason::Halt => RefineSliceExit::Halt,
             ExitReason::Panic => RefineSliceExit::Panic,
-            ExitReason::Trap => RefineSliceExit::Trap,
-            ExitReason::Ecall => RefineSliceExit::Ecall,
             ExitReason::OutOfGas => RefineSliceExit::OutOfGas,
             ExitReason::PageFault(address) => RefineSliceExit::PageFault(*address),
             ExitReason::HostCall(call) => RefineSliceExit::HostCall(*call),
@@ -1577,7 +1554,6 @@ mod prover {
                 [0; PVM_REGISTER_COUNT],
                 Memory::sparse(vos_pvm::PVM_PAGE_SIZE as u64),
                 10_000,
-                25,
             )
         }
 

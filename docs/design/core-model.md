@@ -840,7 +840,7 @@ outbox sequence numbers, which receivers deduplicate.
     claims, and a batch never stalls on a verification that takes seconds.
   - On JAM, an on-chain agent's refine runs the verifier program itself,
     and its accumulate applies the public output. The settlement verifier
-    takes 10.68M instructions and about 103M gas under Gray Paper 0.8.0 for
+    takes 10.68M instructions and about 29M gas under Gray Paper 0.8.0 for
     one segment (slice 1). A whole window needs aggregation (section 11.4).
 
 ### 11.2 Precompiles [decided direction; prototyped in S5b]

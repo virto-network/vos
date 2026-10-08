@@ -92,9 +92,8 @@ fn measure() {
         regs,
         initial_memory.clone(),
         gas,
-        25,
     );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let mut tracing = TracingPvm::new(pvm);
     assert_eq!(
         tracing.run(),
         vos_pvm::ExitReason::Panic,

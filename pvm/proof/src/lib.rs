@@ -154,8 +154,6 @@ pub mod page_merkle;
 pub mod side_note;
 
 #[cfg(feature = "prover")]
-pub mod actor;
-#[cfg(feature = "prover")]
 pub mod bench_helpers;
 #[cfg(feature = "prover")]
 mod program_id;
@@ -379,9 +377,7 @@ fn activity_from_steps(side_note: &side_note::SideNote) -> ChipActivity {
     for step in &side_note.steps {
         // Blake2b ECALL detection via opcode + imm match (mirrors
         // trace_fill.rs's IsBlakeEcall fill at ~line 1075).
-        if matches!(step.opcode, Opcode::Ecalli | Opcode::Ecall)
-            && step.imm == ECALL_BLAKE2B_COMPRESS as u64
-        {
+        if matches!(step.opcode, Opcode::Ecalli) && step.imm == ECALL_BLAKE2B_COMPRESS as u64 {
             a.blake2b = true;
         }
         // Ristretto scalar-mult ECALL gates RistrettoEcallChip. Whether
@@ -393,15 +389,13 @@ fn activity_from_steps(side_note: &side_note::SideNote) -> ChipActivity {
         // so activate RistrettoChip only via the `ristretto_field_rows`
         // post-ingest check; this avoids activating an empty chip when
         // every scalar mult in the trace was FixedBase.
-        if matches!(step.opcode, Opcode::Ecalli | Opcode::Ecall)
-            && step.imm == ECALL_RISTRETTO_SCALAR_MULT as u64
-        {
+        if matches!(step.opcode, Opcode::Ecalli) && step.imm == ECALL_RISTRETTO_SCALAR_MULT as u64 {
             a.ristretto_ecall = true;
         }
         // The point-add and scalar-reduce-wide ECALLs
         // activate the RistrettoEcallChip but not RistrettoChip
         // (those don't fire field-op rows).
-        if matches!(step.opcode, Opcode::Ecalli | Opcode::Ecall)
+        if matches!(step.opcode, Opcode::Ecalli)
             && (step.imm == ECALL_RISTRETTO_POINT_ADD as u64
                 || step.imm == ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE as u64
                 || step.imm == ECALL_SCALAR_MUL_MOD_L as u64
@@ -597,14 +591,6 @@ pub use prove::{
     natural_log_sizes_for, prepare_side_note_for_verification, production_pcs_config,
     production_pcs_config_mobile, prove_profiled, prove_profiled_with_config,
     prove_with_explicit_components,
-};
-// ── Trace a PVM blob into a SideNote / CompactTrace ───────────────────
-// The ergonomic entry points: `trace_blob` (whole trace, single proof),
-// `trace_blob_compact` / `trace_stream` (chain / streaming paths).
-#[cfg(feature = "prover")]
-pub use actor::{
-    interpreter_from_blob, trace_blob, trace_blob_compact, trace_blob_compact_with_patches,
-    trace_blob_with_patches, trace_stream, trace_stream_with_patches,
 };
 #[cfg(feature = "debug-internals")]
 pub use prove::{

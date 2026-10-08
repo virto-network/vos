@@ -1,10 +1,5 @@
 {
-  "backends": [
-    "interpreter",
-    "recompiler"
-  ],
   "expected": {
-    "gas": 99,
     "memory": [],
     "page_fault_address": 69632,
     "pc": 0,

@@ -61,9 +61,8 @@ fn standalone_verify_add64() {
         registers,
         vec![0u8; 4 * 1024 * 1024],
         1000,
-        25,
     );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let mut tracing = TracingPvm::new(pvm);
     tracing.run();
     let steps = tracing.into_trace();
 
@@ -323,9 +322,8 @@ fn standalone_verify_rejects_wrong_commitment() {
         registers,
         vec![0u8; 4 * 1024 * 1024],
         1000,
-        25,
     );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let mut tracing = TracingPvm::new(pvm);
     tracing.run();
     let steps = tracing.into_trace();
 
@@ -359,9 +357,8 @@ fn standalone_verify_rejects_format_version_mismatch() {
         registers,
         vec![0u8; 4 * 1024 * 1024],
         1000,
-        25,
     );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let mut tracing = TracingPvm::new(pvm);
     tracing.run();
     let steps = tracing.into_trace();
 
@@ -427,9 +424,8 @@ fn standalone_verify_rejects_weak_pcs_config() {
         registers,
         vec![0u8; 4 * 1024 * 1024],
         1000,
-        25,
     );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let mut tracing = TracingPvm::new(pvm);
     tracing.run();
     let steps = tracing.into_trace();
 
@@ -469,9 +465,8 @@ fn standalone_verify_accepts_weak_pcs_config_with_relaxed_policy() {
         registers,
         vec![0u8; 4 * 1024 * 1024],
         1000,
-        25,
     );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let mut tracing = TracingPvm::new(pvm);
     tracing.run();
     let steps = tracing.into_trace();
 
@@ -515,9 +510,8 @@ fn standalone_verify_rejects_oversized_log_size() {
         registers,
         vec![0u8; 4 * 1024 * 1024],
         1000,
-        25,
     );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let mut tracing = TracingPvm::new(pvm);
     tracing.run();
     let steps = tracing.into_trace();
 
@@ -552,9 +546,8 @@ fn standalone_verify_rejects_zero_format_version() {
         registers,
         vec![0u8; 4 * 1024 * 1024],
         1000,
-        25,
     );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let mut tracing = TracingPvm::new(pvm);
     tracing.run();
     let steps = tracing.into_trace();
 

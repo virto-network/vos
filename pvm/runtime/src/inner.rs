@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 use crate::backend::{PreparedExecution, PvmBackend};
 use crate::interpreter::{Interpreter, PERM_NONE, PERM_RO, PERM_RW};
 use crate::spi::deblob;
-use crate::{ExitReason, Gas, IsaMode, PVM_PAGE_SIZE, PVM_REGISTER_COUNT};
+use crate::{ExitReason, Gas, PVM_PAGE_SIZE, PVM_REGISTER_COUNT};
 
 /// Maximum live inner machines in one Refine invocation.
 pub const MAX_INNER_MACHINES: usize = 63;
@@ -43,7 +43,7 @@ std::thread_local! {
 
 fn prepare_inner_program(
     program_blob: &[u8],
-    program: &crate::program::ParsedCodeBlob,
+    program: &vos_pvm_program::CodeBlob,
     backend: PvmBackend,
 ) -> Result<PreparedExecution, InnerError> {
     let prepare = || {
@@ -256,8 +256,6 @@ impl InnerMachine {
                 [0; PVM_REGISTER_COUNT],
                 memory,
                 0,
-                crate::STANDARD_MEM_CYCLES,
-                IsaMode::Conformance,
             );
             vm.set_pc(self.initial_pc);
             self.vm = Some(vm);
@@ -526,7 +524,7 @@ impl InnerMachines {
                 vm.pc = 0;
                 InnerExit::Halt
             }
-            ExitReason::Trap | ExitReason::Panic | ExitReason::Ecall => {
+            ExitReason::Panic => {
                 vm.pc = 0;
                 InnerExit::Panic
             }

@@ -95,9 +95,8 @@ fn fixed_base_real_side_note(scalar: curve25519_dalek::scalar::Scalar) -> SideNo
         regs,
         flat_mem,
         1_000_000,
-        25,
     );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let mut tracing = TracingPvm::new(pvm);
     let _ = tracing.run_with_precompiles();
     assert_eq!(
         tracing.ristretto_records.len(),

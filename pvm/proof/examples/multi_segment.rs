@@ -85,9 +85,8 @@ fn main() {
         regs,
         initial_memory.clone(),
         10_000,
-        25,
     );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
     assert_eq!(exit, ExitReason::Panic, "expected standard Panic exit");
     let all_steps = tracing.into_trace();

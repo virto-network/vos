@@ -37,8 +37,7 @@ impl NativeMemory {
         let allocation_span = span.max(4096);
         let backing = BackingStore::new((allocation_span / 4096) as u32)
             .ok_or("failed to allocate native memory backing")?;
-        let window = CodeWindow::new((span / 4096) as u32)
-            .ok_or("failed to reserve native memory window")?;
+        let window = CodeWindow::new().ok_or("failed to reserve native memory window")?;
         // SAFETY: the fd covers `allocation_span` bytes; both mmap failures are
         // checked. MAP_FIXED replaces only this owner's reserved guest window.
         let guest = unsafe {

@@ -329,15 +329,13 @@ fn encode_exit(encoder: &mut Encoder, exit: RefineSliceExit) -> Result<(), Refin
     match exit {
         RefineSliceExit::Halt => encoder.u8(0),
         RefineSliceExit::Panic => encoder.u8(1),
-        RefineSliceExit::Trap => encoder.u8(2),
-        RefineSliceExit::Ecall => encoder.u8(3),
-        RefineSliceExit::OutOfGas => encoder.u8(4),
+        RefineSliceExit::OutOfGas => encoder.u8(2),
         RefineSliceExit::PageFault(address) => {
-            encoder.u8(5)?;
+            encoder.u8(3)?;
             encoder.u32(address)
         }
         RefineSliceExit::HostCall(call) => {
-            encoder.u8(6)?;
+            encoder.u8(4)?;
             encoder.u64(call)
         }
     }
@@ -347,11 +345,9 @@ fn decode_exit(decoder: &mut Decoder<'_>) -> Result<RefineSliceExit, RefineProof
     match decoder.u8()? {
         0 => Ok(RefineSliceExit::Halt),
         1 => Ok(RefineSliceExit::Panic),
-        2 => Ok(RefineSliceExit::Trap),
-        3 => Ok(RefineSliceExit::Ecall),
-        4 => Ok(RefineSliceExit::OutOfGas),
-        5 => Ok(RefineSliceExit::PageFault(decoder.u32()?)),
-        6 => Ok(RefineSliceExit::HostCall(decoder.u64()?)),
+        2 => Ok(RefineSliceExit::OutOfGas),
+        3 => Ok(RefineSliceExit::PageFault(decoder.u32()?)),
+        4 => Ok(RefineSliceExit::HostCall(decoder.u64()?)),
         _ => Err(RefineProofCodecError::InvalidTag),
     }
 }

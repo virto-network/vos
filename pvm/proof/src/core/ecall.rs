@@ -1,15 +1,11 @@
-//! ECALL identifiers shared between the always-compiled chip surface and the
-//! prover-only tracer.  Hostcall IDs are pure data — no execution semantics
-//! live here — so a no_std verifier can still classify them without pulling
-//! in `core::tracing`.
+//! Precompile host-call identifiers shared between the always-compiled chip
+//! surface and the prover-only tracer. Identifiers are pure data — no
+//! execution semantics live here — so a no_std verifier can classify them
+//! without pulling in `core::tracing`.
 //!
-//! **Slot range**: vos_pvm's `dispatch_ecalli` rejects `imm > 127` with a fault,
-//! so every precompile ID must fit in `0..=127`. The original layout used
-//! "categories by hundreds" (1xx hash, 2xx asymmetric crypto) but that
-//! exceeded the imm budget; everything is now packed into the contiguous
-//! `100..=114` block within vos_pvm's program-cap range (slots 64..=127). The
-//! categorisation is recoverable in comments — the wire ID is the only thing
-//! that matters for the chip surface.
+//! The wire identifier is what a program's `ecalli` names; the CPU chip
+//! selects each precompile relation by a separate internal dispatch code
+//! ([`proof_precompile_dispatch_id`]).
 
 /// Hostcall ID for blake2b_compress precompile: the VOS precompile id,
 /// outside every id JAM assigns (`vos_pvm::precompile::BLAKE2B_COMPRESS`).
@@ -85,37 +81,25 @@ pub const ECALL_SCALAR_MUL_MOD_L: u32 = 113;
 /// `Scalar + Scalar` public API.  Same convention as MUL above.
 pub const ECALL_SCALAR_ADD_MOD_L: u32 = 114;
 
-/// VOS scheduler-supplied guest allocator capability. This is deliberately
-/// outside JAM's reserved protocol range 10..=14.
-pub const ECALL_VOS_GROW_HEAP: u32 = 117;
-/// VOS scheduler-supplied diagnostic output capability.
-pub const ECALL_VOS_DEBUG_WRITE: u32 = 118;
-/// VOS scheduler-supplied nested actor invocation capability.
-pub const ECALL_VOS_INVOKE: u32 = 119;
-
-/// Whether the proof runtime has a deterministic handler for this Standard
-/// `ecalli` identifier. This is the union of the cryptographic precompiles
-/// and the lifecycle stubs exposed by [`crate::core::tracing::TracingPvm`].
+/// Whether the proof runtime has a deterministic handler for this `ecalli`
+/// identifier: exactly the cryptographic precompiles handled by
+/// [`crate::core::tracing::TracingPvm`].
 ///
 /// The result is committed into ProgramMemory so an untrusted prover cannot
 /// mark an unknown call as acknowledged and continue execution past it.
 pub(crate) const fn is_proof_host_call_allowed(id: u64) -> bool {
-    matches!(id, 1 | 2 | 4 | 5 | 6 | 26)
-        || id == ECALL_BLAKE2B_COMPRESS as u64
+    id == ECALL_BLAKE2B_COMPRESS as u64
         || id == ECALL_RISTRETTO_SCALAR_MULT as u64
         || id == ECALL_RISTRETTO_POINT_ADD as u64
         || id == ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE as u64
         || id == ECALL_SCALAR_MUL_MOD_L as u64
         || id == ECALL_SCALAR_ADD_MOD_L as u64
-        || id == ECALL_VOS_DEBUG_WRITE as u64
 }
 
-/// Exact proof-chip dispatch identifier for a cryptographic precompile.
-///
-/// Lifecycle/VOS stubs deliberately return zero: they may acknowledge and
-/// continue without emitting a cryptographic call relation. A non-zero value
-/// is committed by ProgramMemory and binds a continued host-call row to the
-/// matching CPU selector (and therefore to that selector's call relation).
+/// Exact proof-chip dispatch identifier for a cryptographic precompile, or
+/// zero for any other identifier. A non-zero value is committed by
+/// ProgramMemory and binds a continued host-call row to the matching CPU
+/// selector (and therefore to that selector's call relation).
 pub const fn proof_precompile_dispatch_id(id: u64) -> u8 {
     match id {
         id if id == ECALL_BLAKE2B_COMPRESS as u64 => DISPATCH_BLAKE2B_COMPRESS,

@@ -13,7 +13,7 @@
 //! = ["blake2b"]`.
 
 #[cfg(target_arch = "riscv64")]
-use crate::ecalls::{ECALL_BLAKE2B_COMPRESS, VOS_OBJECT_CAP};
+use crate::ecalls::ECALL_BLAKE2B_COMPRESS;
 
 const BLAKE2B_IV: [u64; 8] = [
     0x6A09E667F3BCC908,
@@ -56,9 +56,6 @@ fn compress_pvm(h: &mut [u8; 64], m: &[u8; 128], t: u128, f: bool) {
             in("a1") m_ptr,
             in("a2") t_low,
             in("a3") f_flag,
-            in("t2") f_flag, // φ[7] convention for f flag
-            in("a4") 0u64,
-            in("a5") VOS_OBJECT_CAP,
             options(nostack),
         );
     }

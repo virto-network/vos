@@ -50,16 +50,8 @@ fn trace_store_load(value: u8, addr_offset: u32) -> (Vec<u8>, Vec<u8>, Vec<PvmSt
     regs[1] = u64::from(test_address(addr_offset));
     let memory = vec![0u8; 4 * 1024 * 1024];
     let (code, bitmask) = store_load_program();
-    let pvm = Interpreter::new(
-        code.clone(),
-        bitmask.clone(),
-        vec![],
-        regs,
-        memory,
-        10_000,
-        25,
-    );
-    let mut tr = TracingPvm::new_conformance(pvm);
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, memory, 10_000);
+    let mut tr = TracingPvm::new(pvm);
     let exit = tr.run();
     assert_eq!(exit, vos_pvm::ExitReason::Panic);
     let steps = tr.into_trace();
@@ -185,16 +177,8 @@ fn trace_store_load_u64(value: u64, addr_offset: u32) -> (Vec<u8>, Vec<u8>, Vec<
     regs[1] = u64::from(test_address(addr_offset));
     let memory = vec![0u8; 4 * 1024 * 1024];
     let (code, bitmask) = store_load_u64_program();
-    let pvm = Interpreter::new(
-        code.clone(),
-        bitmask.clone(),
-        vec![],
-        regs,
-        memory,
-        10_000,
-        25,
-    );
-    let mut tr = TracingPvm::new_conformance(pvm);
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, memory, 10_000);
+    let mut tr = TracingPvm::new(pvm);
     let exit = tr.run();
     assert_eq!(exit, vos_pvm::ExitReason::Panic);
     let steps = tr.into_trace();
@@ -333,9 +317,8 @@ fn faulting_memory_step_is_rejected_before_proof_construction() {
         regs,
         initial_memory.clone(),
         10_000,
-        25,
     );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let mut tracing = TracingPvm::new(pvm);
     assert_eq!(
         tracing.run(),
         vos_pvm::ExitReason::PageFault(2 * vos_pvm::PVM_ZONE_SIZE)

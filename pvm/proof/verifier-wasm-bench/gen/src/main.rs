@@ -232,9 +232,8 @@ fn binding_fixture(dir: &std::path::Path, io_hash_hex: &str) {
         regs,
         vec![0u8; 64 * 1024],
         1_000_000,
-        16,
     );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let mut tracing = TracingPvm::new(pvm);
     let _exit = tracing.run();
     let steps = tracing.into_trace();
     let mut side_note = SideNote::new(steps, code, bitmask);

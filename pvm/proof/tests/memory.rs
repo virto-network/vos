@@ -48,16 +48,8 @@ fn prove_store_only() {
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 0, 1];
 
-    let pvm = Interpreter::new(
-        code.clone(),
-        bitmask.clone(),
-        vec![],
-        regs,
-        memory,
-        10000,
-        25,
-    );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, memory, 10000);
+    let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
     assert_eq!(exit, vos_pvm::ExitReason::Panic);
     let steps = tracing.into_trace();
@@ -99,16 +91,8 @@ fn prove_store_and_load_u8() {
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1];
 
-    let pvm = Interpreter::new(
-        code.clone(),
-        bitmask.clone(),
-        vec![],
-        regs,
-        memory,
-        10000,
-        25,
-    );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, memory, 10000);
+    let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
     assert_eq!(exit, vos_pvm::ExitReason::Panic);
 
@@ -159,16 +143,8 @@ fn prove_store_and_load_u64() {
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1];
 
-    let pvm = Interpreter::new(
-        code.clone(),
-        bitmask.clone(),
-        vec![],
-        regs,
-        memory,
-        10000,
-        25,
-    );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, memory, 10000);
+    let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
     assert_eq!(exit, vos_pvm::ExitReason::Panic);
 
@@ -215,16 +191,8 @@ fn prove_store_load_u64_crossing_page_boundaries() {
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1];
 
-    let pvm = Interpreter::new(
-        code.clone(),
-        bitmask.clone(),
-        vec![],
-        regs,
-        memory,
-        10000,
-        25,
-    );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, memory, 10000);
+    let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
     assert_eq!(exit, vos_pvm::ExitReason::Panic);
 
@@ -272,16 +240,8 @@ fn prove_multiple_stores_same_addr() {
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1];
 
-    let pvm = Interpreter::new(
-        code.clone(),
-        bitmask.clone(),
-        vec![],
-        regs,
-        memory,
-        10000,
-        25,
-    );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, memory, 10000);
+    let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
     eprintln!("exit: {exit:?}");
 
@@ -341,16 +301,8 @@ fn prove_store_imm_u8_then_load() {
     //          instruction 2 is 1 byte.
     let bitmask = vec![1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1];
 
-    let pvm = Interpreter::new(
-        code.clone(),
-        bitmask.clone(),
-        vec![],
-        regs,
-        memory,
-        10_000,
-        25,
-    );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, memory, 10_000);
+    let mut tracing = TracingPvm::new(pvm);
     assert_eq!(tracing.run(), vos_pvm::ExitReason::Panic);
     let steps = tracing.into_trace();
 
@@ -391,16 +343,8 @@ fn prove_store_load_with_alu() {
     ];
     let bitmask = vec![1, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1];
 
-    let pvm = Interpreter::new(
-        code.clone(),
-        bitmask.clone(),
-        vec![],
-        regs,
-        memory,
-        10000,
-        25,
-    );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, memory, 10000);
+    let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
     assert_eq!(exit, vos_pvm::ExitReason::Panic);
 

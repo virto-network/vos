@@ -11,7 +11,6 @@ use curve25519_dalek::scalar::Scalar as DalekScalar;
 #[cfg(target_arch = "riscv64")]
 use crate::ecalls::{
     ECALL_SCALAR_ADD_MOD_L, ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE, ECALL_SCALAR_MUL_MOD_L,
-    VOS_OBJECT_CAP,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -144,8 +143,6 @@ fn scalar_mul_mod_l_pvm(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
             in("a0") a_ptr,
             in("a1") b_ptr,
             in("a2") output_ptr,
-            in("a3") 0u64, in("a4") 0u64,
-            in("a5") VOS_OBJECT_CAP,
             options(nostack),
         );
     }
@@ -188,8 +185,6 @@ fn scalar_add_mod_l_pvm(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
             in("a0") a_ptr,
             in("a1") b_ptr,
             in("a2") output_ptr,
-            in("a3") 0u64, in("a4") 0u64,
-            in("a5") VOS_OBJECT_CAP,
             options(nostack),
         );
     }
@@ -236,8 +231,6 @@ fn scalar_from_bytes_mod_order_wide_pvm(wide: &[u8; 64]) -> [u8; 32] {
             in("a1") output_ptr,
             in("a2") 0u64,
             in("a3") 0u64,
-            in("a4") 0u64,
-            in("a5") VOS_OBJECT_CAP,
             options(nostack),
         );
     }

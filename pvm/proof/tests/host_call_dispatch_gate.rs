@@ -2,7 +2,7 @@
 
 //! AIR regressions for authenticated precompile dispatch.
 //!
-//! A continued Standard precompile row must expose the exact CPU selector
+//! A continued precompile row must expose the exact CPU selector
 //! whose lookup emits the matching handler record. A from-scratch prover must
 //! not be able to acknowledge a cryptographic Ecalli, clear or swap its exact
 //! selector, and omit the handler-chip row while retaining the sequential
@@ -12,7 +12,7 @@ use stwo::core::channel::Blake2sChannel;
 use stwo::core::fields::m31::BaseField;
 use vos_pvm::instruction::Opcode;
 use vos_pvm::interpreter::Interpreter;
-use vos_pvm::{ExitReason, IsaMode, PVM_REGISTER_COUNT, PVM_ZONE_SIZE};
+use vos_pvm::{ExitReason, PVM_REGISTER_COUNT, PVM_ZONE_SIZE};
 use vos_pvm_proof::chips::CpuChip;
 use vos_pvm_proof::chips::cpu::Column;
 use vos_pvm_proof::core::ecall::proof_precompile_dispatch_id;
@@ -39,7 +39,7 @@ const PRECOMPILE_SELECTORS: [(u32, Column); 6] = [
     (ECALL_SCALAR_ADD_MOD_L, Column::Is114Ecall),
 ];
 
-fn traced_side_note(id: u32, isa_mode: IsaMode, precompile: bool) -> SideNote {
+fn traced_side_note(id: u32) -> SideNote {
     // The host-call id as a four-byte little-endian immediate.
     let mut code = vec![Opcode::Ecalli as u8];
     code.extend_from_slice(&id.to_le_bytes());
@@ -58,24 +58,10 @@ fn traced_side_note(id: u32, isa_mode: IsaMode, precompile: bool) -> SideNote {
         regs,
         memory.clone(),
         10_000,
-        25,
     );
-    let mut tracing = TracingPvm::new_with_isa_mode(pvm, isa_mode);
-    let exit = if precompile {
-        tracing.run_with_precompiles()
-    } else {
-        tracing.run_with_vos_stubs()
-    };
-    assert_eq!(
-        exit,
-        match isa_mode {
-            IsaMode::Conformance => ExitReason::Panic,
-            IsaMode::Jar => ExitReason::Trap,
-        }
-    );
-    SideNote::new(tracing.into_trace(), code, bitmask)
-        .with_isa_mode(isa_mode)
-        .with_memory(memory)
+    let mut tracing = TracingPvm::new(pvm);
+    assert_eq!(tracing.run_with_precompiles(), ExitReason::Panic);
+    SideNote::new(tracing.into_trace(), code, bitmask).with_memory(memory)
 }
 
 fn blake_side_note() -> SideNote {
@@ -87,8 +73,8 @@ fn blake_side_note() -> SideNote {
     regs[8] = ARG1_ADDR;
     regs[10] = 1;
     let memory = vec![0u8; PVM_ZONE_SIZE as usize + 0x2000];
-    let pvm = Interpreter::new(code, bitmask, vec![], regs, memory.clone(), 10_000, 25);
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let pvm = Interpreter::new(code, bitmask, vec![], regs, memory.clone(), 10_000);
+    let mut tracing = TracingPvm::new(pvm);
     assert_eq!(tracing.run_with_precompiles(), ExitReason::Panic);
     assert_eq!(tracing.blake2b_records.len(), 1);
     let side_note = tracing.into_side_note().with_memory(memory);
@@ -118,7 +104,7 @@ fn assert_cpu(chip: &CpuChip, trace: &ComponentTrace, side_note: &SideNote) -> R
 #[test]
 fn acknowledged_precompile_cannot_clear_or_swap_exact_dispatch_selector() {
     for (selector_index, &(id, selector_column)) in PRECOMPILE_SELECTORS.iter().enumerate() {
-        let mut side_note = traced_side_note(id, IsaMode::Conformance, true);
+        let mut side_note = traced_side_note(id);
         let chip = CpuChip;
         let trace = chip.generate_component_trace(&mut side_note);
         assert_cpu(&chip, &trace, &side_note)
@@ -163,63 +149,6 @@ fn acknowledged_precompile_cannot_clear_or_swap_exact_dispatch_selector() {
             "SOUNDNESS GAP: acknowledged Ecalli {id} accepted with a wrong selector"
         );
     }
-}
-
-#[test]
-fn standard_stub_continues_without_a_precompile_selector() {
-    let mut side_note = traced_side_note(1, IsaMode::Conformance, false);
-    let chip = CpuChip;
-    let trace = chip.generate_component_trace(&mut side_note);
-    assert_cpu(&chip, &trace, &side_note)
-        .expect("acknowledged lifecycle stub must satisfy CPU AIR");
-
-    let rows = trace.original_trace[0].as_slice().len();
-    let row = (0..rows)
-        .find(|&row| {
-            trace.original_trace[Column::HostCallAcknowledged.offset()].as_slice()[row]
-                == BaseField::from(1u32)
-        })
-        .expect("acknowledged lifecycle-stub row");
-    assert_eq!(
-        trace.original_trace[Column::HostCallPrecompileDispatch.offset()].as_slice()[row],
-        BaseField::from(0u32)
-    );
-    for &(_, selector) in &PRECOMPILE_SELECTORS {
-        assert_eq!(
-            trace.original_trace[selector.offset()].as_slice()[row],
-            BaseField::from(0u32)
-        );
-    }
-}
-
-#[test]
-fn jar_precompile_preserves_frozen_continuation_and_exact_selector() {
-    let mut side_note = traced_side_note(ECALL_BLAKE2B_COMPRESS, IsaMode::Jar, true);
-    let chip = CpuChip;
-    let trace = chip.generate_component_trace(&mut side_note);
-    assert_cpu(&chip, &trace, &side_note).expect("frozen Jar precompile must satisfy CPU AIR");
-
-    let rows = trace.original_trace[0].as_slice().len();
-    let row = (0..rows)
-        .find(|&row| {
-            trace.original_trace[Column::HostCallPrecompileDispatch.offset()].as_slice()[row]
-                == BaseField::from(u32::from(proof_precompile_dispatch_id(u64::from(
-                    ECALL_BLAKE2B_COMPRESS,
-                ))))
-        })
-        .expect("Jar Blake2b row");
-    assert_eq!(
-        trace.original_trace[Column::HostCallAcknowledged.offset()].as_slice()[row],
-        BaseField::from(0u32)
-    );
-    assert_eq!(
-        trace.original_trace[Column::HostCallContinuesH.offset()].as_slice()[row],
-        BaseField::from(1u32)
-    );
-    assert_eq!(
-        trace.original_trace[Column::IsBlakeEcall.offset()].as_slice()[row],
-        BaseField::from(1u32)
-    );
 }
 
 #[test]

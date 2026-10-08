@@ -12,10 +12,6 @@ pub enum Opcode {
     Trap = 0,
     Fallthrough = 1,
     Unlikely = 2,
-    /// VOS capability-runtime extension for management ops and dynamic CALL.
-    /// This discriminant is deliberately excluded from the Gray Paper opcode
-    /// set decoded by [`Opcode::from_byte`].
-    Ecall = 3,
 
     // A.5.2: One immediate
     Ecalli = 10,
@@ -219,54 +215,11 @@ impl Opcode {
         }
     }
 
-    /// Decode the frozen VOS capability-runtime ISA.
-    ///
-    /// In addition to opcode 3, capability-manifest artifacts predate the
-    /// v0.8 removal of `sbrk` and the resulting unary-opcode renumbering.
-    /// Keep that translation here, never in the standard decoder used by SPI
-    /// programs or Refine inner machines.
-    #[inline(always)]
-    pub(crate) fn from_runtime_byte(byte: u8) -> Option<Self> {
-        match byte {
-            3 => Some(Self::Ecall),
-            // The removed private `sbrk` instruction always trapped. Decode
-            // it to the runtime's synthetic panic operation without exposing
-            // `sbrk` as part of the public standard opcode enum.
-            101 => Some(Self::Invalid),
-            102 => Some(Self::CountSetBits64),
-            103 => Some(Self::CountSetBits32),
-            104 => Some(Self::LeadingZeroBits64),
-            105 => Some(Self::LeadingZeroBits32),
-            106 => Some(Self::TrailingZeroBits64),
-            107 => Some(Self::TrailingZeroBits32),
-            108 => Some(Self::SignExtend8),
-            109 => Some(Self::SignExtend16),
-            110 => Some(Self::ZeroExtend16),
-            111 => Some(Self::ReverseBytes),
-            _ => Self::from_byte(byte),
-        }
-    }
-
-    /// Decode an encoded opcode under the selected execution profile.
-    ///
-    /// Capability-manifest programs retain the frozen pre-v0.8 unary
-    /// numbering, while standard programs use the exact Gray Paper v0.8
-    /// table. Proof tooling uses this entry point so trace construction and
-    /// program-memory commitments cannot silently reinterpret a program
-    /// under a different profile than the live executor.
-    #[inline(always)]
-    pub fn from_byte_in_mode(byte: u8, isa_mode: crate::IsaMode) -> Option<Self> {
-        match isa_mode {
-            crate::IsaMode::Jar => Self::from_runtime_byte(byte),
-            crate::IsaMode::Conformance => Self::from_byte(byte),
-        }
-    }
-
     /// Instruction category determining the argument format.
     pub fn category(self) -> InstructionCategory {
         let b = self as u8;
         match b {
-            0..=3 => InstructionCategory::NoArgs,
+            0..=2 => InstructionCategory::NoArgs,
             10 => InstructionCategory::OneImm,
             20 => InstructionCategory::OneRegExtImm,
             30..=33 => InstructionCategory::TwoImm,
@@ -316,15 +269,6 @@ impl Opcode {
                 | Opcode::BranchGtUImm
                 | Opcode::BranchGtSImm
         )
-    }
-
-    /// Capability-runtime block boundary predicate.
-    ///
-    /// Opcode 3 exits to that runtime and must therefore provide a resumable
-    /// post-instruction entry. The standard Gray Paper set remains available
-    /// through [`Self::is_terminator`].
-    pub(crate) fn is_runtime_terminator(self) -> bool {
-        self.is_terminator() || self == Self::Ecall
     }
 }
 
@@ -461,12 +405,6 @@ pub fn decode_opcode_fast(b: u8) -> Option<(Opcode, InstructionCategory)> {
     }
 }
 
-/// [`decode_opcode_fast`] plus the capability-runtime opcode 3 extension.
-#[inline(always)]
-pub(crate) fn decode_runtime_opcode_fast(b: u8) -> Option<(Opcode, InstructionCategory)> {
-    Opcode::from_runtime_byte(b).map(|opcode| (opcode, opcode.category()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,7 +426,6 @@ mod tests {
     fn test_invalid_opcodes() {
         assert_eq!(Opcode::from_byte(2), Some(Opcode::Unlikely));
         assert_eq!(Opcode::from_byte(3), None);
-        assert_eq!(Opcode::from_runtime_byte(3), Some(Opcode::Ecall));
         assert_eq!(Opcode::from_byte(111), None);
         assert_eq!(Opcode::from_byte(254), None);
         assert_eq!(Opcode::from_byte(15), None);
@@ -496,21 +433,12 @@ mod tests {
     }
 
     #[test]
-    fn capability_runtime_renumbering_is_private() {
-        assert_eq!(Opcode::from_runtime_byte(101), Some(Opcode::Invalid));
-        assert_eq!(Opcode::from_runtime_byte(102), Some(Opcode::CountSetBits64));
-        assert_eq!(Opcode::from_runtime_byte(111), Some(Opcode::ReverseBytes));
-    }
-
-    #[test]
     fn graypaper_terminator_set_excludes_markers_and_host_calls() {
         assert!(!Opcode::Unlikely.is_terminator());
         assert!(!Opcode::Ecalli.is_terminator());
-        assert!(!Opcode::Ecall.is_terminator());
         assert!(Opcode::Trap.is_terminator());
         assert!(Opcode::Fallthrough.is_terminator());
         assert!(Opcode::Jump.is_terminator());
-        assert!(Opcode::Ecall.is_runtime_terminator());
     }
 
     #[test]

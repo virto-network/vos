@@ -1,8 +1,7 @@
 //! `link_elf_spi` end-to-end: transpile hand-assembled rv64em ELFs into GP
 //! standard-program (SPI) blobs and validate them against vos_pvm — the parser
 //! (`spi::parse_standard_program`), the GP layout (`StandardProgram::layout`),
-//! and the kernel-free Refine harness (`vos_pvm::refine`). The retired
-//! JAR/capability-kernel profile is deliberately not an oracle or fallback.
+//! and the Refine harness (`vos_pvm::refine`).
 //!
 //! The guests follow the zero-hostcall refine convention, which is
 //! backend-portable: arguments arrive as `φ7 = ptr` / `φ8 = len`, output is
@@ -483,7 +482,7 @@ fn ro_linked_above_base_gets_leading_padding() {
 /// `.data` is re-based to the GP rw base `2·Z_Z + zone_round(|o|)`: the
 /// linker's inter-section padding is stripped, the section keeps its vaddr,
 /// and the region is writable. This test pins the standard-program zone
-/// placement independently of the retired capability-manifest layout.
+/// placement.
 #[test]
 fn rw_data_lands_at_linked_vaddr_under_spi() {
     let rw_vaddr = 3 * PVM_ZONE_SIZE as u64; // 0x3_0000 (|o| = 8 → one ro zone)

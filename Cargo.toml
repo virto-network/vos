@@ -17,8 +17,6 @@ members = [
 exclude = [
     # Built with `cargo fuzz` (nightly flags, panic = abort).
     "pvm/proof/fuzz",
-    # Standalone no_std guest workloads with their own workspaces.
-    "pvm/proof/fixtures/*",
     "pvm/bench/guests",
     # The on-chain settlement verifier pins stwo without default features in
     # its own workspace, so prover features never co-resolve into it.

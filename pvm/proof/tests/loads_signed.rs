@@ -46,16 +46,8 @@ fn load_i8_negative_sign_extends() {
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1];
 
-    let pvm = Interpreter::new(
-        code.clone(),
-        bitmask.clone(),
-        vec![],
-        regs,
-        memory,
-        10_000,
-        25,
-    );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, memory, 10_000);
+    let mut tracing = TracingPvm::new(pvm);
     assert_eq!(tracing.run(), ExitReason::Panic);
     let steps = tracing.into_trace();
 
@@ -88,16 +80,8 @@ fn load_i16_negative_sign_extends() {
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1];
 
-    let pvm = Interpreter::new(
-        code.clone(),
-        bitmask.clone(),
-        vec![],
-        regs,
-        memory,
-        10_000,
-        25,
-    );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, memory, 10_000);
+    let mut tracing = TracingPvm::new(pvm);
     assert_eq!(tracing.run(), ExitReason::Panic);
     let steps = tracing.into_trace();
 
@@ -129,16 +113,8 @@ fn load_i32_negative_sign_extends() {
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1];
 
-    let pvm = Interpreter::new(
-        code.clone(),
-        bitmask.clone(),
-        vec![],
-        regs,
-        memory,
-        10_000,
-        25,
-    );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, memory, 10_000);
+    let mut tracing = TracingPvm::new(pvm);
     assert_eq!(tracing.run(), ExitReason::Panic);
     let steps = tracing.into_trace();
 
@@ -171,16 +147,8 @@ fn load_i8_positive_zero_extends() {
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1];
 
-    let pvm = Interpreter::new(
-        code.clone(),
-        bitmask.clone(),
-        vec![],
-        regs,
-        memory,
-        10_000,
-        25,
-    );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, memory, 10_000);
+    let mut tracing = TracingPvm::new(pvm);
     assert_eq!(tracing.run(), ExitReason::Panic);
     let steps = tracing.into_trace();
 
@@ -216,16 +184,8 @@ fn load_i8_negative_forged_high_byte_rejected() {
     ];
     let bitmask = vec![1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1];
 
-    let pvm = Interpreter::new(
-        code.clone(),
-        bitmask.clone(),
-        vec![],
-        regs,
-        memory,
-        10_000,
-        25,
-    );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let pvm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, memory, 10_000);
+    let mut tracing = TracingPvm::new(pvm);
     assert_eq!(tracing.run(), ExitReason::Panic);
     let mut steps = tracing.into_trace();
 

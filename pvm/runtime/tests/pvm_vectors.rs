@@ -1,36 +1,26 @@
-//! PVM instruction-level conformance vectors.
+//! Gray Paper v0.8.0 PVM conformance vectors.
 //!
-//! Two deliberately separate corpora are checked in:
+//! Two checked-in corpora:
 //!
-//! - `tests/vectors/*.gp072.json` preserves the historical GP 0.7.2/Jar
-//!   fixtures. Its unary family uses the frozen capability-manifest opcode
-//!   numbering and is never presented as current conformance coverage.
-//! - `tests/vectors-v080/*.gp080.json` pins the Gray Paper v0.8.0 standard
-//!   machine. Every case runs in [`IsaMode::Conformance`]. It covers every
-//!   instruction family, control-flow and gas boundaries, memory widths and
-//!   faults, arithmetic edge cases, and the complete renumbered unary family.
+//! - `tests/vectors-v080/*.gp080.json` pins instruction semantics: every
+//!   instruction family, control flow, memory widths and faults, arithmetic
+//!   edge cases, and the renumbered unary family. Each case records the pre
+//!   and post register file, memory effects, exit status and exit counter.
+//! - `tests/vectors-v080-gas/*.gp080.json` pins block gas: block boundaries,
+//!   block costs, exit precedence and remaining gas.
 //!
-//! Both corpora pin instruction semantics case-by-case: pre/post register file,
-//! memory effects, page-fault classification (page-base addresses), the
-//! basic-block strictness of branches/djumps, and gas under the
-//! per-instruction model (`GasModel::PerInstruction` — a flat 1 gas per
-//! instruction, the model the gp072 Lean variants pin).
-//!
-//! Provenance: the v0.8 opcode/category/terminator manifest below is a frozen
+//! Provenance: the opcode/category/terminator manifest below is a frozen
 //! transcription of Appendix A.5 and equations A.19/A.20 of the official
-//! `gavofyork/graypaper` v0.8.0 release. Every executable case is synthesized
-//! by the hand-written tables in this file — code bytes, bitmask, and
-//! *expected outcomes* are hand-derived from that specification, never
-//! recorded from an implementation run. No third-party vector data is copied
-//! (the canonical `w3f/jamtestvectors` repository has no PVM instruction
-//! corpus). The cross-check is differential: every vector
-//! must satisfy the interpreter under per-instruction gas, AND (on
-//! linux-x86_64) the JIT recompiler, AND the interpreter under block gas —
-//! with block-gas consumption asserted equal between interpreter and
-//! recompiler (the deterministic slice of the fuzz harness's parity
-//! contract).
+//! `gavofyork/graypaper` v0.8.0 release. Every case is synthesized by the
+//! hand-written tables in this file; code bytes, bitmask and expected
+//! outcomes are hand-derived from the specification, never recorded from an
+//! implementation run. No third-party vector data is copied (the canonical
+//! `w3f/jamtestvectors` repository has no PVM instruction corpus).
 //!
-//! Schema (one self-contained JSON file per case):
+//! Every instruction case runs on the interpreter and (on linux-x86_64) the
+//! JIT recompiler, and their gas consumption must agree exactly.
+//!
+//! Instruction-vector schema (one self-contained JSON file per case):
 //! ```json
 //! {
 //!   "name": "alu64_add_64",
@@ -42,39 +32,30 @@
 //!     "memory":   [{ "address": 65536, "contents": "0x8182…" }]
 //!   },
 //!   "expected": {
-//!     "status": "trap", "pc": 3, "gas": 98, "regs": ["0x0", …13],
+//!     "status": "panic", "pc": 0, "regs": ["0x0", …13],
 //!     "memory": [{ "address": …, "contents": "0x…" }],
 //!     "page_fault_address": 4096,   // iff status == "page_fault"
 //!     "host_call": 7                // iff status == "host_call"
 //!   },
-//!   "backends": ["interpreter", "recompiler"]
+//!   "spec": "gray-paper-0.8.0"
 //! }
 //! ```
 //! - `bitmask` is packed 1 bit per code byte, LSB-first (deblob packing).
 //! - `regs` are 13 `0x…` hex strings (φ0..φ12); addresses/gas are numbers.
-//! - `status` ∈ halt | trap | panic | out_of_gas | page_fault | host_call.
-//!   `trap` is the transitional JAR profile's deliberate-opcode-0 exit;
-//!   standard v0.8 vectors require the exact panic ☇ result. Vectors whose
-//!   outcome depends on the gas
-//!   model (out-of-gas cases) list only the interpreter backend.
-//! - `expected.gas` is the REMAINING gas under the per-instruction model.
-//! - `expected.pc` is checked on the interpreter and, for every valid
-//!   standard-profile program, on the recompiler. Full v0.8 Ψ normalizes
-//!   halt/panic to zero and retains the causing counter for host/fault/OOG.
-//!   Standard registers, counters and every mapped memory byte are compared
-//!   corpus-wide at all exits, including panic, fault and out-of-gas.
+//! - `status` ∈ halt | panic | out_of_gas | page_fault | host_call.
+//! - `expected.pc` follows full Ψ: halt and panic return zero, while
+//!   host-call, page-fault and out-of-gas return their causing counter.
 //!
-//! Re-bless (regenerates the corpus from the table below):
+//! Re-bless (regenerates the corpora from the tables below):
 //! ```bash
 //! VOS_PVM_BLESS_VECTORS=1 cargo test -p vos-pvm --test pvm_vectors
 //! ```
 
 use serde_json::{Value, json};
 use std::path::PathBuf;
-use vos_pvm::gas_cost::DEFAULT_MEM_CYCLES;
 use vos_pvm::instruction::{InstructionCategory, Opcode};
 use vos_pvm::interpreter::{Interpreter, Memory, PERM_NONE, PERM_RO, PERM_RW};
-use vos_pvm::{ExitReason, GasModel, IsaMode, PVM_HALT_ADDR};
+use vos_pvm::{ExitReason, PVM_HALT_ADDR};
 
 /// Base of the read-only page every memory case maps.
 const RO_BASE: u32 = 0x10000;
@@ -85,9 +66,7 @@ const PAGE: u32 = 4096;
 /// Default gas budget for funded cases.
 const GAS: u64 = 100;
 /// Reviewed cardinality of the complete v0.8 semantic transition corpus.
-const V080_CASE_COUNT: usize = 173;
-/// The three per-instruction OOG cases intentionally do not run on the JIT.
-const V080_RECOMPILER_CASE_COUNT: usize = 170;
+const V080_CASE_COUNT: usize = 170;
 /// Reviewed cardinality of the independently derived block-gas oracle.
 const V080_BLOCK_GAS_CASE_COUNT: usize = 16;
 
@@ -97,8 +76,8 @@ fn ro_seed() -> Vec<u8> {
     (0..16).map(|i| 0x81 + i).collect()
 }
 
-/// One synthesized conformance case. `exp_gas` is the remaining gas under
-/// the per-instruction model; `exp_regs` is the full post register file.
+/// One synthesized conformance case. `exp_regs` is the full post register
+/// file.
 struct Case {
     name: String,
     family: &'static str,
@@ -114,13 +93,9 @@ struct Case {
     memory: Vec<(u32, Vec<u8>)>,
     exp_status: ExitReason,
     exp_pc: u32,
-    exp_gas: u64,
     exp_regs: [u64; 13],
     /// (address, bytes) asserted after execution.
     exp_memory: Vec<(u32, Vec<u8>)>,
-    /// Whether the recompiler leg runs this case (false for gas-model-
-    /// specific outcomes, i.e. out-of-gas under per-instruction charging).
-    recompiler: bool,
 }
 
 /// Assemble instructions into (code, unpacked bitmask).
@@ -149,12 +124,10 @@ fn base(family: &'static str, name: &str, program: (Vec<u8>, Vec<u8>)) -> Case {
         gas: GAS,
         page_map: vec![],
         memory: vec![],
-        exp_status: ExitReason::Trap,
+        exp_status: ExitReason::Panic,
         exp_pc: 0,
-        exp_gas: GAS,
         exp_regs: [0; 13],
         exp_memory: vec![],
-        recompiler: true,
     }
 }
 
@@ -167,7 +140,6 @@ fn alu3(family: &'static str, name: &str, op: u8, a: u64, b: u64, want: u64) -> 
     c.exp_regs = c.regs;
     c.exp_regs[4] = want;
     c.exp_pc = 3;
-    c.exp_gas = GAS - 2;
     c
 }
 
@@ -188,7 +160,6 @@ fn alu_imm(family: &'static str, name: &str, op: u8, b: u64, imm: u8, want: u64)
     c.exp_regs = c.regs;
     c.exp_regs[2] = want;
     c.exp_pc = 3;
-    c.exp_gas = GAS - 2;
     c
 }
 
@@ -199,7 +170,6 @@ fn unary(family: &'static str, name: &str, op: u8, src: u64, want: u64) -> Case 
     c.exp_regs = c.regs;
     c.exp_regs[4] = want;
     c.exp_pc = 2;
-    c.exp_gas = GAS - 2;
     c
 }
 
@@ -221,7 +191,6 @@ fn abs_load(family: &'static str, name: &str, op: u8, off: u32, want: u64) -> Ca
     );
     c.exp_regs[2] = want;
     c.exp_pc = 5;
-    c.exp_gas = GAS - 2;
     with_memory(c)
 }
 
@@ -231,7 +200,6 @@ fn abs_store_imm(name: &str, op: u8, immediate: &[u8], want: &[u8]) -> Case {
     instruction.extend_from_slice(immediate);
     let mut c = base("store", name, asm(&[&instruction, &[0]]));
     c.exp_pc = instruction.len() as u32;
-    c.exp_gas = GAS - 2;
     c.exp_memory = vec![(RW_BASE, want.to_vec())];
     with_memory(c)
 }
@@ -243,7 +211,6 @@ fn abs_store_reg(name: &str, op: u8, value: u64, want: &[u8]) -> Case {
     c.regs[2] = value;
     c.exp_regs = c.regs;
     c.exp_pc = instruction.len() as u32;
-    c.exp_gas = GAS - 2;
     c.exp_memory = vec![(RW_BASE, want.to_vec())];
     with_memory(c)
 }
@@ -256,7 +223,6 @@ fn store_imm_ind(name: &str, op: u8, immediate: &[u8], want: &[u8]) -> Case {
     c.regs[2] = RW_BASE as u64;
     c.exp_regs = c.regs;
     c.exp_pc = instruction.len() as u32;
-    c.exp_gas = GAS - 2;
     c.exp_memory = vec![(RW_BASE + 0x20, want.to_vec())];
     with_memory(c)
 }
@@ -269,7 +235,6 @@ fn store_ind(name: &str, op: u8, value: u64, want: &[u8]) -> Case {
     c.regs[3] = value;
     c.exp_regs = c.regs;
     c.exp_pc = instruction.len() as u32;
-    c.exp_gas = GAS - 2;
     c.exp_memory = vec![(RW_BASE + 0x10, want.to_vec())];
     with_memory(c)
 }
@@ -282,7 +247,6 @@ fn load_ind(name: &str, op: u8, want: u64) -> Case {
     c.exp_regs = c.regs;
     c.exp_regs[2] = want;
     c.exp_pc = instruction.len() as u32;
-    c.exp_gas = GAS - 2;
     with_memory(c)
 }
 
@@ -291,7 +255,6 @@ fn load_ind(name: &str, op: u8, want: u64) -> Case {
 fn faulting(mut c: Case, fault_page: u32) -> Case {
     c.exp_status = ExitReason::PageFault(fault_page);
     c.exp_pc = 0;
-    c.exp_gas = GAS - 1;
     c.exp_regs = c.regs;
     with_memory(c)
 }
@@ -311,10 +274,8 @@ fn branch_imm(family: &'static str, name: &str, op: u8, a: u64, imm: u8, taken: 
     if taken {
         c.exp_regs[5] = 1;
         c.exp_pc = 9;
-        c.exp_gas = GAS - 3;
     } else {
         c.exp_pc = 4;
-        c.exp_gas = GAS - 2;
     }
     c
 }
@@ -334,10 +295,8 @@ fn branch_reg(family: &'static str, name: &str, op: u8, a: u64, b: u64, taken: b
     if taken {
         c.exp_regs[5] = 1;
         c.exp_pc = 9;
-        c.exp_gas = GAS - 3;
     } else {
         c.exp_pc = 3;
-        c.exp_gas = GAS - 2;
     }
     c
 }
@@ -350,7 +309,6 @@ fn jump_ind_panic(name: &str, a: u64, jump_table: Vec<u32>) -> Case {
     c.exp_regs = c.regs;
     c.exp_status = ExitReason::Panic;
     c.exp_pc = 0;
-    c.exp_gas = GAS - 1;
     c
 }
 
@@ -358,82 +316,45 @@ fn jump_ind_panic(name: &str, a: u64, jump_table: Vec<u32>) -> Case {
 /// from the graypaper / Lean oracle semantics by hand — see the case
 /// comments for the judgement each one pins.
 #[allow(clippy::vec_init_then_push)]
-fn corpus() -> Vec<Case> {
+fn shared_cases() -> Vec<Case> {
     let mut v: Vec<Case> = Vec::new();
 
     // --- flow: termination, host calls, invalid opcodes, gas edges ---
     {
-        let mut c = base("flow", "trap", asm(&[&[0]]));
-        c.exp_gas = GAS - 1;
-        v.push(c);
+        v.push(base("flow", "trap", asm(&[&[0]])));
 
         let mut c = base("flow", "fallthrough", asm(&[&[1], &[0]]));
         c.exp_pc = 1;
-        c.exp_gas = GAS - 2;
         v.push(c);
 
         let mut c = base("flow", "unlikely", asm(&[&[2], &[0]]));
         c.exp_pc = 1;
-        c.exp_gas = GAS - 2;
         v.push(c);
 
-        // The historical per-instruction/JAR adapter exposes its already-
-        // advanced host-call PC; the v0.8 corpus below rewrites this to the
-        // causing instruction counter required by full Ψ.
         let mut c = base("flow", "ecalli", asm(&[&[10, 7]]));
         c.exp_status = ExitReason::HostCall(7);
         c.exp_pc = 2;
-        c.exp_gas = GAS - 1;
-        v.push(c);
-
-        // Opcode 3 (jar's Ecall) is not a GP instruction: panic under the
-        // conformance ISA profile.
-        let mut c = base("flow", "ecall_panics_under_conformance", asm(&[&[3]]));
-        c.exp_status = ExitReason::Panic;
-        c.exp_gas = GAS - 1;
         v.push(c);
 
         // 77 is not in the opcode table: executing it panics (charged).
         let mut c = base("flow", "invalid_opcode_panics", asm(&[&[77]]));
         c.exp_status = ExitReason::Panic;
-        c.exp_gas = GAS - 1;
         v.push(c);
 
         // GP: the bitmask beyond the code is all-set and ζ zero-extends, so
         // sequential flow past the end executes opcode 0 = trap (charged).
         let mut c = base("flow", "fall_off_end_traps", asm(&[&[1]]));
         c.exp_pc = 1;
-        c.exp_gas = GAS - 2;
         v.push(c);
 
         // Degenerate: an empty program immediately hits the implicit trap.
-        let mut c = base("flow", "empty_program_traps", (vec![], vec![]));
-        c.exp_gas = GAS - 1;
-        v.push(c);
+        v.push(base("flow", "empty_program_traps", (vec![], vec![])));
 
-        // Per-instruction OOG: budget 5 executes exactly 5 fallthroughs;
-        // the 6th (pc 5) is never executed and remaining gas is 0.
-        // Gas-model-specific ⇒ interpreter only.
-        let mut c = base(
-            "flow",
-            "out_of_gas_straight_line",
-            (vec![1; 10], vec![1; 10]),
-        );
-        c.gas = 5;
-        c.exp_status = ExitReason::OutOfGas;
-        c.exp_pc = 5;
-        c.exp_gas = 0;
-        c.recompiler = false;
-        v.push(c);
-
-        // A zero budget is out of gas before executing anything — the gas
-        // check precedes even opcode validation.
+        // A zero budget cannot fund the first block, whatever its cost.
         let mut c = base("flow", "out_of_gas_zero_budget", asm(&[&[0]]));
         c.gas = 0;
         c.exp_status = ExitReason::OutOfGas;
         c.exp_pc = 0;
-        c.exp_gas = 0;
-        c.recompiler = false;
         v.push(c);
     }
 
@@ -442,7 +363,6 @@ fn corpus() -> Vec<Case> {
         let mut c = base("load_imm", "load_imm", asm(&[&[51, 2, 42], &[0]]));
         c.exp_regs[2] = 42;
         c.exp_pc = 3;
-        c.exp_gas = GAS - 2;
         v.push(c);
 
         // 1-byte immediates sign-extend (X₁): 0xFF ⇒ 2⁶⁴−1.
@@ -453,7 +373,6 @@ fn corpus() -> Vec<Case> {
         );
         c.exp_regs[2] = u64::MAX;
         c.exp_pc = 3;
-        c.exp_gas = GAS - 2;
         v.push(c);
 
         // load_imm_64 takes a raw 8-byte LE immediate, no extension.
@@ -463,7 +382,6 @@ fn corpus() -> Vec<Case> {
         let mut c = base("load_imm", "load_imm_64", asm(&[&inst, &[0]]));
         c.exp_regs[2] = 0x123456789ABCDEF0;
         c.exp_pc = 10;
-        c.exp_gas = GAS - 2;
         v.push(c);
     }
 
@@ -680,51 +598,6 @@ fn corpus() -> Vec<Case> {
         v.push(alu3("muldiv", "rem_u_32_by_zero", 195, 0x1_0000_0007, 0, 7));
     }
 
-    // --- unary (two-register forms) ---
-    {
-        v.push(unary("unary", "move_reg", 100, 0xDEAD_BEEF, 0xDEAD_BEEF));
-        v.push(unary("unary", "count_set_bits_64", 102, 0xF0F0, 8));
-        v.push(unary("unary", "leading_zero_bits_64", 104, 1, 63));
-        v.push(unary("unary", "leading_zero_bits_32", 105, 1, 31));
-        v.push(unary(
-            "unary",
-            "trailing_zero_bits_64",
-            106,
-            0x8000_0000_0000_0000,
-            63,
-        ));
-        // The 32-bit view of 2³² is 0: ctz of zero is the full width.
-        v.push(unary(
-            "unary",
-            "trailing_zero_bits_32_of_zero",
-            107,
-            1 << 32,
-            32,
-        ));
-        v.push(unary(
-            "unary",
-            "sign_extend_8",
-            108,
-            0x1F80,
-            0xFFFF_FFFF_FFFF_FF80,
-        ));
-        v.push(unary(
-            "unary",
-            "sign_extend_16",
-            109,
-            0x1_8000,
-            0xFFFF_FFFF_FFFF_8000,
-        ));
-        v.push(unary("unary", "zero_extend_16", 110, 0xFFFF_8000, 0x8000));
-        v.push(unary(
-            "unary",
-            "reverse_bytes",
-            111,
-            0x0102_0304_0506_0708,
-            0x0807_0605_0403_0201,
-        ));
-    }
-
     // --- load: widths, extensions, indirect addressing, faults ---
     {
         v.push(abs_load("load", "load_u8", 52, 0, 0x81));
@@ -741,7 +614,6 @@ fn corpus() -> Vec<Case> {
         c.exp_regs = c.regs;
         c.exp_regs[2] = 0x8887_8685;
         c.exp_pc = 3;
-        c.exp_gas = GAS - 2;
         v.push(with_memory(c));
 
         // Negative indirect offset with i16 sign-extension of the value.
@@ -754,7 +626,6 @@ fn corpus() -> Vec<Case> {
         c.exp_regs = c.regs;
         c.exp_regs[2] = 0xFFFF_FFFF_FFFF_8887; // mem[RO_BASE+6..8] = 87 88
         c.exp_pc = 3;
-        c.exp_gas = GAS - 2;
         v.push(with_memory(c));
 
         // Faults classify with the page base of the first failing page.
@@ -787,7 +658,6 @@ fn corpus() -> Vec<Case> {
             asm(&[&[30, 3, 0x00, 0x00, 0x02, 0xAB], &[0]]),
         );
         c.exp_pc = 6;
-        c.exp_gas = GAS - 2;
         c.exp_memory = vec![(RW_BASE, vec![0xAB])];
         v.push(with_memory(c));
 
@@ -800,7 +670,6 @@ fn corpus() -> Vec<Case> {
         c.regs[2] = 0x1122_3344_5566_7788;
         c.exp_regs = c.regs;
         c.exp_pc = 5;
-        c.exp_gas = GAS - 2;
         c.exp_memory = vec![(
             RW_BASE,
             vec![0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11],
@@ -813,7 +682,6 @@ fn corpus() -> Vec<Case> {
         c.regs[3] = 0xCD;
         c.exp_regs = c.regs;
         c.exp_pc = 3;
-        c.exp_gas = GAS - 2;
         c.exp_memory = vec![(RW_BASE + 0x10, vec![0xCD])];
         v.push(with_memory(c));
 
@@ -826,7 +694,6 @@ fn corpus() -> Vec<Case> {
         c.regs[2] = RW_BASE as u64;
         c.exp_regs = c.regs;
         c.exp_pc = 7;
-        c.exp_gas = GAS - 2;
         c.exp_memory = vec![(RW_BASE + 0x20, vec![0xEF, 0xBE, 0xAD, 0xDE])];
         v.push(with_memory(c));
 
@@ -949,14 +816,12 @@ fn corpus() -> Vec<Case> {
         c.exp_regs = c.regs;
         c.exp_status = ExitReason::Panic;
         c.exp_pc = 0;
-        c.exp_gas = GAS - 1;
         v.push(c);
 
         // Unconditional jump to a block start.
         let mut c = base("branch", "jump", asm(&[&[40, 3], &[0], &[51, 5, 1], &[0]]));
         c.exp_regs[5] = 1;
         c.exp_pc = 6;
-        c.exp_gas = GAS - 3;
         v.push(c);
 
         // Unconditional jump into the middle of an instruction panics.
@@ -967,7 +832,6 @@ fn corpus() -> Vec<Case> {
         );
         c.exp_status = ExitReason::Panic;
         c.exp_pc = 0;
-        c.exp_gas = GAS - 1;
         v.push(c);
 
         // A backward loop: φ2 counts 3 → 0; 9 instructions execute.
@@ -978,19 +842,6 @@ fn corpus() -> Vec<Case> {
         let mut c = base("branch", "loop_countdown", loop_prog.clone());
         c.exp_regs[2] = 0;
         c.exp_pc = 10;
-        c.exp_gas = GAS - 9;
-        v.push(c);
-
-        // The same loop with budget 5 runs out mid-loop (per-instruction
-        // charging): 5 instructions execute, φ2 has reached 1, and the
-        // unfunded branch at pc 7 never runs. Interpreter only.
-        let mut c = base("branch", "loop_out_of_gas", loop_prog);
-        c.gas = 5;
-        c.exp_status = ExitReason::OutOfGas;
-        c.exp_regs[2] = 1;
-        c.exp_pc = 7;
-        c.exp_gas = 0;
-        c.recompiler = false;
         v.push(c);
     }
 
@@ -1002,7 +853,6 @@ fn corpus() -> Vec<Case> {
         c.exp_regs = c.regs;
         c.exp_status = ExitReason::Halt;
         c.exp_pc = 0;
-        c.exp_gas = GAS - 1;
         v.push(c);
 
         // The djump address is (φ + imm) mod 2³².
@@ -1011,7 +861,6 @@ fn corpus() -> Vec<Case> {
         c.exp_regs = c.regs;
         c.exp_status = ExitReason::Halt;
         c.exp_pc = 0;
-        c.exp_gas = GAS - 1;
         v.push(c);
 
         // a = 2 ⇒ jump-table entry 0 ⇒ pc 5 (a block start): dispatches.
@@ -1025,7 +874,6 @@ fn corpus() -> Vec<Case> {
         c.exp_regs = c.regs;
         c.exp_regs[5] = 1;
         c.exp_pc = 8;
-        c.exp_gas = GAS - 3;
         v.push(c);
 
         // GP eq A.18 panic set: a = 0; a misaligned (Z_A = 2); a beyond the
@@ -1045,7 +893,6 @@ fn corpus() -> Vec<Case> {
             c.exp_regs = c.regs;
             c.exp_status = ExitReason::Panic;
             c.exp_pc = 0;
-            c.exp_gas = GAS - 1;
             v.push(c);
         }
     }
@@ -1061,7 +908,6 @@ fn corpus() -> Vec<Case> {
         c.exp_regs[2] = 99;
         c.exp_regs[5] = 1;
         c.exp_pc = 9;
-        c.exp_gas = GAS - 3;
         v.push(c);
 
         // GP A.5.12: the djump address uses the PRE-state base register.
@@ -1077,7 +923,6 @@ fn corpus() -> Vec<Case> {
         c.exp_regs[2] = 7;
         c.exp_status = ExitReason::Halt;
         c.exp_pc = 0;
-        c.exp_gas = GAS - 1;
         v.push(c);
 
         // load_imm_jump_ind through the table: φ2 ← 55, djump(φ3 = 2) ⇒
@@ -1093,7 +938,6 @@ fn corpus() -> Vec<Case> {
         c.exp_regs[2] = 55;
         c.exp_regs[5] = 1;
         c.exp_pc = 8;
-        c.exp_gas = GAS - 3;
         v.push(c);
     }
 
@@ -1108,17 +952,12 @@ fn corpus() -> Vec<Case> {
 /// Unlike the historical loader, the v0.8.0 runner forces *every* case through
 /// the standard conformance decoder.
 fn v080_corpus() -> Vec<Case> {
-    let mut v: Vec<Case> = corpus()
-        .into_iter()
-        .filter(|case| case.family != "unary")
-        .collect();
+    let mut v: Vec<Case> = shared_cases();
 
     // A.5.2 decodes an immediate as a signed machine register. The single
-    // byte 0xff therefore crosses the host boundary as 2^64-1, rather than
-    // being narrowed to the historical JAR u32 host-slot representation.
+    // byte 0xff therefore crosses the host boundary as 2^64-1.
     let mut wide_host = base("flow", "ecalli_negative_one_is_u64", asm(&[&[10, 0xff]]));
     wide_host.exp_status = ExitReason::HostCall(u64::MAX);
-    wide_host.exp_gas = GAS - 1;
     v.push(wide_host);
 
     // Appendix A.5.9 after v0.8.0 removed sbrk: the unary operations occupy
@@ -1374,33 +1213,18 @@ fn v080_corpus() -> Vec<Case> {
         0xffff_ffff_8000_0000,
     ));
 
-    // The shared historical constructors terminate ordinary cases with
-    // opcode 0 and therefore record the transitional JAR `Trap` result.
-    // Gray Paper v0.8 classifies the same instruction as panic (☇); keep
-    // that distinction explicit in the standard corpus instead of folding
-    // backend results in the runner.
+    // Full Ψ normalizes final counters.
     for case in &mut v {
         match case.name.as_str() {
             "flow_trap" => case.name = "flow_opcode_zero_panics".into(),
-            "flow_fall_off_end_traps" => {
-                case.name = "flow_fall_off_end_panics".into();
-                // v0.8 defines opcode 1 as sjump(next). End-of-code is not
-                // in varpi, so it panics at pc 0 after one instruction charge.
-                case.exp_pc = 0;
-                case.exp_gas = GAS - 1;
-            }
+            // Opcode 1 is sjump(next). End-of-code is not in varpi, so it
+            // panics.
+            "flow_fall_off_end_traps" => case.name = "flow_fall_off_end_panics".into(),
             "flow_empty_program_traps" => case.name = "flow_empty_program_panics".into(),
-            // Standard A.15 classifies every address below 2^16 as panic
-            // before consulting page accessibility. The historical JAR
-            // corpus intentionally retains its PageFault(0) behavior.
-            "load_load_fault_unmapped_low" => {
-                case.exp_status = ExitReason::Panic;
-                case.exp_pc = 0;
-            }
+            // A.15 classifies every address below 2^16 as panic before
+            // consulting page accessibility.
+            "load_load_fault_unmapped_low" => case.exp_status = ExitReason::Panic,
             _ => {}
-        }
-        if case.exp_status == ExitReason::Trap {
-            case.exp_status = ExitReason::Panic;
         }
         match case.exp_status {
             // Full Ψ normalizes final counters to zero.
@@ -1705,12 +1529,10 @@ fn unpack_bitmask(packed: &[u8], code_len: usize) -> Vec<u8> {
 fn status_str(exit: &ExitReason) -> &'static str {
     match exit {
         ExitReason::Halt => "halt",
-        ExitReason::Trap => "trap",
         ExitReason::Panic => "panic",
         ExitReason::OutOfGas => "out_of_gas",
         ExitReason::PageFault(_) => "page_fault",
         ExitReason::HostCall(_) => "host_call",
-        ExitReason::Ecall => unreachable!("no vector expects the jar ecall exit"),
     }
 }
 
@@ -1762,7 +1584,6 @@ fn to_json(c: &Case) -> Value {
     let mut expected = serde_json::Map::new();
     expected.insert("status".into(), json!(status_str(&c.exp_status)));
     expected.insert("pc".into(), json!(c.exp_pc));
-    expected.insert("gas".into(), json!(c.exp_gas));
     expected.insert("regs".into(), regs_json(&c.exp_regs));
     expected.insert("memory".into(), memory_json(&c.exp_memory));
     if let ExitReason::PageFault(addr) = c.exp_status {
@@ -1771,11 +1592,6 @@ fn to_json(c: &Case) -> Value {
     if let ExitReason::HostCall(id) = c.exp_status {
         expected.insert("host_call".into(), json!(id));
     }
-    let backends: Vec<&str> = if c.recompiler {
-        vec!["interpreter", "recompiler"]
-    } else {
-        vec!["interpreter"]
-    };
     json!({
         "name": c.name,
         "family": c.family,
@@ -1794,17 +1610,8 @@ fn to_json(c: &Case) -> Value {
             "memory": memory_json(&c.memory),
         },
         "expected": Value::Object(expected),
-        "backends": backends,
+        "spec": "gray-paper-0.8.0",
     })
-}
-
-fn to_v080_json(c: &Case) -> Value {
-    let mut value = to_json(c);
-    value
-        .as_object_mut()
-        .expect("vector JSON is an object")
-        .insert("spec".into(), json!("gray-paper-0.8.0"));
-    value
 }
 
 fn exit_json(exit: &ExitReason, remaining_gas: u64) -> Value {
@@ -1858,10 +1665,8 @@ struct Vector {
     memory: Vec<(u32, Vec<u8>)>,
     exp_status: ExitReason,
     exp_pc: u32,
-    exp_gas: u64,
     exp_regs: [u64; 13],
     exp_memory: Vec<(u32, Vec<u8>)>,
-    recompiler: bool,
 }
 
 fn from_json(v: &Value) -> Vector {
@@ -1873,7 +1678,6 @@ fn from_json(v: &Value) -> Vector {
     let exp = &v["expected"];
     let exp_status = match exp["status"].as_str().expect("status") {
         "halt" => ExitReason::Halt,
-        "trap" => ExitReason::Trap,
         "panic" => ExitReason::Panic,
         "out_of_gas" => ExitReason::OutOfGas,
         "page_fault" => {
@@ -1915,21 +1719,14 @@ fn from_json(v: &Value) -> Vector {
         memory: memory_from_json(&v["initial"]["memory"]),
         exp_status,
         exp_pc: exp["pc"].as_u64().expect("pc") as u32,
-        exp_gas: exp["gas"].as_u64().expect("gas"),
         exp_regs: regs_from_json(&exp["regs"]),
         exp_memory: memory_from_json(&exp["memory"]),
-        recompiler: v["backends"]
-            .as_array()
-            .expect("backends")
-            .iter()
-            .any(|b| b.as_str() == Some("recompiler")),
     }
 }
 
 fn exit_from_json(value: &Value) -> ExitReason {
     match value["status"].as_str().expect("status") {
         "halt" => ExitReason::Halt,
-        "trap" => ExitReason::Trap,
         "panic" => ExitReason::Panic,
         "out_of_gas" => ExitReason::OutOfGas,
         "page_fault" => ExitReason::PageFault(
@@ -1943,10 +1740,6 @@ fn exit_from_json(value: &Value) -> ExitReason {
 }
 
 // --- corpus location + discovery ---
-
-fn vectors_dir() -> PathBuf {
-    PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/vectors"))
-}
 
 fn v080_vectors_dir() -> PathBuf {
     PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/vectors-v080"))
@@ -1995,10 +1788,6 @@ fn discover_in(dir: PathBuf, suffix: &str, required_spec: Option<&str>) -> Vec<(
         .collect()
 }
 
-fn discover() -> Vec<(String, Vector)> {
-    discover_in(vectors_dir(), "gp072", None)
-}
-
 fn discover_v080() -> Vec<(String, Vector)> {
     discover_in(v080_vectors_dir(), "gp080", Some("gray-paper-0.8.0"))
 }
@@ -2022,21 +1811,9 @@ fn perms_of(v: &Vector) -> Vec<u8> {
     perms
 }
 
-fn isa_mode_for_vector(v: &Vector) -> IsaMode {
-    // The gp072 corpus is retained through the transitional JAR adapter.
-    // Its one explicit private-opcode exclusion case intentionally selects
-    // the strict decoder; the independently versioned v0.8 corpus below is
-    // always run in Conformance mode.
-    if v.name == "flow_ecall_panics_under_conformance" {
-        IsaMode::Conformance
-    } else {
-        IsaMode::Jar
-    }
-}
-
-/// Run `v` on the interpreter under the given gas model. Returns the exit
-/// and the machine for post-state inspection.
-fn run_interpreter(v: &Vector, model: GasModel, isa_mode: IsaMode) -> (ExitReason, Interpreter) {
+/// Run `v` on the interpreter. Returns the exit and the machine for
+/// post-state inspection.
+fn run_interpreter(v: &Vector) -> (ExitReason, Interpreter) {
     let span = span_of(&v.page_map) as usize;
     let mut flat = vec![0u8; span];
     for (addr, bytes) in &v.memory {
@@ -2049,21 +1826,17 @@ fn run_interpreter(v: &Vector, model: GasModel, isa_mode: IsaMode) -> (ExitReaso
         v.regs,
         flat,
         v.gas,
-        DEFAULT_MEM_CYCLES,
     );
-    vm.set_isa_mode(isa_mode);
-    vm.set_gas_model(model);
     vm.set_page_perms(perms_of(v));
     vm.set_pc(v.initial_pc);
     let (exit, _gas_used) = vm.run();
     (exit, vm)
 }
 
-fn check_interpreter(name: &str, v: &Vector, isa_mode: IsaMode) {
-    let (exit, vm) = run_interpreter(v, GasModel::PerInstruction, isa_mode);
+fn check_interpreter(name: &str, v: &Vector) {
+    let (exit, vm) = run_interpreter(v);
     assert_eq!(exit, v.exp_status, "{name}: exit status");
     assert_eq!(vm.pc, v.exp_pc, "{name}: post pc");
-    assert_eq!(vm.gas, v.exp_gas, "{name}: remaining gas (per-instruction)");
     assert_eq!(vm.registers, v.exp_regs, "{name}: post register file");
     for (addr, want) in &v.exp_memory {
         let mut got = vec![0u8; want.len()];
@@ -2073,11 +1846,11 @@ fn check_interpreter(name: &str, v: &Vector, isa_mode: IsaMode) {
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn check_recompiler(name: &str, v: &Vector, isa_mode: IsaMode) {
+fn check_recompiler(name: &str, v: &Vector) {
     use vos_pvm::recompiler::{DataLayout, RecompiledPvm};
 
     let span = span_of(&v.page_map);
-    let mut jit = RecompiledPvm::new_with_mode(
+    let mut jit = RecompiledPvm::new(
         &v.code,
         v.bitmask.clone(),
         v.jump_table.clone(),
@@ -2092,8 +1865,6 @@ fn check_recompiler(name: &str, v: &Vector, isa_mode: IsaMode) {
             rw_start: 0,
             rw_data: vec![],
         }),
-        DEFAULT_MEM_CYCLES,
-        isa_mode,
     )
     .unwrap_or_else(|e| panic!("{name}: recompile failed: {e}"));
     for (addr, bytes) in &v.memory {
@@ -2111,22 +1882,23 @@ fn check_recompiler(name: &str, v: &Vector, isa_mode: IsaMode) {
         assert_eq!(&got, want, "{name}: recompiler memory at {addr:#x}");
     }
 
-    // Differential gas anchor: under the block model the interpreter and
-    // the recompiler must charge identically at every terminal boundary.
-    // In particular, panic and page-fault exits are part of standard v0.8
-    // metering and must not be masked by exit-only parity.
-    let (block_exit, block_vm) = run_interpreter(v, GasModel::BlockPipeline, isa_mode);
+    // Differential gas anchor: the interpreter and the recompiler must
+    // charge identically at every terminal boundary, including panic and
+    // page-fault exits.
+    let (block_exit, block_vm) = run_interpreter(v);
     assert_eq!(
         block_exit, exit,
         "{name}: block-gas interpreter and recompiler classify identically"
     );
-    let has_only_profile_opcodes = v
+    // Programs with an invalid opcode never execute under full Ψ (deblob
+    // rejects them), so their gas is unspecified.
+    let has_only_valid_opcodes = v
         .code
         .iter()
         .enumerate()
         .filter(|(pc, _)| v.bitmask.get(*pc) == Some(&1))
-        .all(|(_, byte)| Opcode::from_byte_in_mode(*byte, isa_mode).is_some());
-    if isa_mode == IsaMode::Conformance && has_only_profile_opcodes {
+        .all(|(_, byte)| Opcode::from_byte(*byte).is_some());
+    if has_only_valid_opcodes {
         assert_eq!(jit.pc(), v.exp_pc, "{name}: standard recompiler exit pc");
         assert_eq!(
             *jit.registers(),
@@ -2162,7 +1934,7 @@ fn check_recompiler(name: &str, v: &Vector, isa_mode: IsaMode) {
             }
         }
     }
-    if has_only_profile_opcodes {
+    if has_only_valid_opcodes {
         assert_eq!(
             jit.gas(),
             block_vm.gas,
@@ -2177,20 +1949,15 @@ fn exact_state_interpreter(
     registers: [u64; 13],
     memory: Vec<u8>,
     gas: u64,
-    isa_mode: IsaMode,
 ) -> Interpreter {
-    let mut vm = Interpreter::new(
+    Interpreter::new(
         code.to_vec(),
         bitmask.to_vec(),
         vec![],
         registers,
         memory,
         gas,
-        DEFAULT_MEM_CYCLES,
-    );
-    vm.set_isa_mode(isa_mode);
-    vm.set_gas_model(GasModel::BlockPipeline);
-    vm
+    )
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -2200,11 +1967,10 @@ fn exact_state_recompiler(
     registers: [u64; 13],
     memory_span: u32,
     gas: u64,
-    isa_mode: IsaMode,
 ) -> vos_pvm::recompiler::RecompiledPvm {
     use vos_pvm::recompiler::{DataLayout, RecompiledPvm};
 
-    RecompiledPvm::new_with_mode(
+    RecompiledPvm::new(
         code,
         bitmask.to_vec(),
         vec![],
@@ -2219,8 +1985,6 @@ fn exact_state_recompiler(
             rw_start: 0,
             rw_data: vec![],
         }),
-        DEFAULT_MEM_CYCLES,
-        isa_mode,
     )
     .expect("compile exact-state regression")
 }
@@ -2232,20 +1996,15 @@ fn cyclic_sparse_interpreter(
     bitmask: &[u8],
     registers: [u64; 13],
     gas: u64,
-    isa_mode: IsaMode,
 ) -> Interpreter {
-    let mut vm = Interpreter::with_memory(
+    Interpreter::with_memory(
         code.to_vec(),
         bitmask.to_vec(),
         vec![],
         registers,
         Memory::sparse(1u64 << 32),
         gas,
-        DEFAULT_MEM_CYCLES,
-    );
-    vm.set_isa_mode(isa_mode);
-    vm.set_gas_model(GasModel::BlockPipeline);
-    vm
+    )
 }
 
 fn cyclic_permissions(high: u8) -> Vec<u8> {
@@ -2263,9 +2022,8 @@ fn cyclic_recompiler(
     bitmask: &[u8],
     registers: [u64; 13],
     gas: u64,
-    isa_mode: IsaMode,
 ) -> vos_pvm::recompiler::RecompiledPvm {
-    exact_state_recompiler(code, bitmask, registers, u32::MAX, gas, isa_mode)
+    exact_state_recompiler(code, bitmask, registers, u32::MAX, gas)
 }
 
 // --- tests ---
@@ -2316,7 +2074,7 @@ const V080_CATEGORIES: &[(InstructionCategory, &[u8])] = &[
 ];
 
 /// Appendix A.20 set T in v0.8.0. In particular, `unlikely` and `ecalli`
-/// are not block terminators, and private opcode 3 is not an instruction.
+/// are not block terminators.
 const V080_TERMINATORS: &[u8] = &[
     0, 1, 40, 50, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 170, 171, 172, 173, 174, 175, 180,
 ];
@@ -2374,56 +2132,6 @@ fn graypaper_v080_executable_opcode_coverage_is_exact() {
     );
 }
 
-/// The checked-in corpus is byte-identical to what the generator table
-/// produces. Set `VOS_PVM_BLESS_VECTORS=1` to (re)write the files; stale
-/// files (not produced by the table) fail the check and are removed by a
-/// bless run.
-#[test]
-fn corpus_matches_the_generator_table() {
-    let bless = std::env::var("VOS_PVM_BLESS_VECTORS").is_ok();
-    let dir = vectors_dir();
-    if bless {
-        std::fs::create_dir_all(&dir).expect("create vectors dir");
-    }
-
-    let cases = corpus();
-    let mut expected_files = Vec::new();
-    for case in &cases {
-        let file = format!("{}.gp072.json", case.name);
-        let path = dir.join(&file);
-        let rendered = serde_json::to_string_pretty(&to_json(case)).expect("render") + "\n";
-        if bless {
-            std::fs::write(&path, &rendered).expect("write vector");
-        } else {
-            let on_disk = std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("{file}: {e} (re-bless the corpus)"));
-            assert_eq!(on_disk, rendered, "{file} is stale — re-bless the corpus");
-        }
-        expected_files.push(file);
-    }
-
-    // No orphans: the corpus is exactly the table.
-    for entry in std::fs::read_dir(&dir).expect("read vectors dir") {
-        let path = entry.expect("dir entry").path();
-        if path.extension().is_some_and(|e| e == "json") {
-            let file = path.file_name().unwrap().to_string_lossy().into_owned();
-            if !expected_files.contains(&file) {
-                if bless {
-                    std::fs::remove_file(&path).expect("remove stale vector");
-                } else {
-                    panic!("stale vector file {file} — re-bless the corpus");
-                }
-            }
-        }
-    }
-
-    // Names are unique (files map 1:1 onto cases).
-    let mut names: Vec<_> = cases.iter().map(|c| c.name.clone()).collect();
-    names.sort();
-    names.dedup();
-    assert_eq!(names.len(), cases.len(), "duplicate case names");
-}
-
 /// The v0.8.0 corpus is a separately checked-in, explicitly identified
 /// contract. A bless run regenerates it only from [`v080_corpus`].
 #[test]
@@ -2439,7 +2147,7 @@ fn graypaper_v080_corpus_matches_the_generator_table() {
     for case in &cases {
         let file = format!("{}.gp080.json", case.name);
         let path = dir.join(&file);
-        let rendered = serde_json::to_string_pretty(&to_v080_json(case)).expect("render") + "\n";
+        let rendered = serde_json::to_string_pretty(&to_json(case)).expect("render") + "\n";
         if bless {
             std::fs::write(&path, &rendered).expect("write v0.8 vector");
         } else {
@@ -2471,9 +2179,7 @@ fn graypaper_v080_corpus_matches_the_generator_table() {
     assert_eq!(cases.len(), V080_CASE_COUNT, "reviewed v0.8 case count");
 }
 
-/// The small, auditable gas oracle is also checked in. It is intentionally a
-/// separate schema so historical per-instruction vectors cannot silently
-/// acquire v0.8 block-gas meaning.
+/// The small, auditable gas oracle is also checked in, under its own schema.
 #[test]
 fn graypaper_v080_block_gas_corpus_matches_the_oracle_table() {
     let bless = std::env::var("VOS_PVM_BLESS_VECTORS").is_ok();
@@ -2522,26 +2228,12 @@ fn graypaper_v080_block_gas_corpus_matches_the_oracle_table() {
     );
 }
 
-/// Every checked-in vector holds on the interpreter under the GP 0.7.2
-/// per-instruction gas model.
-#[test]
-fn interpreter_satisfies_every_vector() {
-    let vectors = discover();
-    for (file, v) in &vectors {
-        check_interpreter(file, v, isa_mode_for_vector(v));
-    }
-    // Guard against silently running an emptied corpus.
-    assert!(vectors.len() >= 100, "corpus shrank: {}", vectors.len());
-}
-
-/// The complete current corpus executes only under the strict v0.8.0
-/// profile. This is the release conformance gate; the gp072 test above is a
-/// historical compatibility check.
+/// The complete corpus holds on the interpreter.
 #[test]
 fn graypaper_v080_interpreter_satisfies_every_vector() {
     let vectors = discover_v080();
     for (file, vector) in &vectors {
-        check_interpreter(file, vector, IsaMode::Conformance);
+        check_interpreter(file, vector);
     }
     assert_eq!(
         vectors.len(),
@@ -2609,17 +2301,7 @@ fn graypaper_v080_block_gas_matches_checked_in_oracle() {
             })
             .collect();
 
-        let mut vm = Interpreter::new(
-            code.clone(),
-            bitmask.clone(),
-            vec![],
-            regs,
-            vec![],
-            gas,
-            DEFAULT_MEM_CYCLES,
-        );
-        vm.set_isa_mode(IsaMode::Conformance);
-        vm.set_gas_model(GasModel::BlockPipeline);
+        let mut vm = Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, vec![], gas);
 
         for pc in 0..code.len() {
             let expected = blocks.iter().find(|(start, _)| *start as usize == pc);
@@ -2666,7 +2348,7 @@ fn graypaper_v080_block_gas_matches_checked_in_oracle() {
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         {
             let memory_span = 0x40000u32;
-            let mut jit = RecompiledPvm::new_with_mode(
+            let mut jit = RecompiledPvm::new(
                 &code,
                 bitmask,
                 vec![],
@@ -2681,8 +2363,6 @@ fn graypaper_v080_block_gas_matches_checked_in_oracle() {
                     rw_start: 0,
                     rw_data: vec![],
                 }),
-                DEFAULT_MEM_CYCLES,
-                IsaMode::Conformance,
             )
             .unwrap_or_else(|error| panic!("{file}: recompile oracle: {error}"));
             jit.set_page_perms(&vec![PERM_NONE; (memory_span / PAGE) as usize]);
@@ -2713,83 +2393,6 @@ fn graypaper_v080_block_gas_matches_checked_in_oracle() {
     }
 }
 
-/// A program declaring more than 2,048 pages selects the 50-cycle VOS page
-/// tier. That tier must remain observable under the capability/JAR profile,
-/// while standard v0.8 execution stays at its fixed 25-cycle memory latency.
-#[test]
-fn high_page_memory_latency_is_profile_scoped() {
-    let high_page_tier = vos_pvm::compute_mem_cycles(2_049);
-    assert_eq!(
-        high_page_tier, 50,
-        "regression must cross the first VOS tier"
-    );
-    let (code, bitmask) = asm(&[&[58, 2, 0, 0, 3], &[0]]);
-
-    let make_vm = |isa_mode, mem_cycles| {
-        let mut vm = Interpreter::new(
-            code.clone(),
-            bitmask.clone(),
-            vec![],
-            [0; 13],
-            vec![0; 0x40000],
-            100,
-            mem_cycles,
-        );
-        vm.set_isa_mode(isa_mode);
-        vm.set_gas_model(GasModel::BlockPipeline);
-        vm.set_page_perms(vec![PERM_NONE; 0x40000 / PAGE as usize]);
-        vm
-    };
-
-    let standard_baseline = make_vm(IsaMode::Conformance, DEFAULT_MEM_CYCLES);
-    let mut standard_high_pages = make_vm(IsaMode::Conformance, high_page_tier);
-    let jar_baseline = make_vm(IsaMode::Jar, DEFAULT_MEM_CYCLES);
-    let jar_high_pages = make_vm(IsaMode::Jar, high_page_tier);
-
-    assert_eq!(standard_high_pages.mem_cycles, DEFAULT_MEM_CYCLES);
-    assert_eq!(standard_high_pages.block_gas_costs[0], 25);
-    assert_eq!(
-        standard_high_pages.block_gas_costs, standard_baseline.block_gas_costs,
-        "declared page count cannot change standard v0.8 gas"
-    );
-    assert_ne!(
-        jar_high_pages.block_gas_costs, jar_baseline.block_gas_costs,
-        "the VOS service profile retains its page-tier gas contract"
-    );
-
-    let (exit, _) = standard_high_pages.run();
-    assert_eq!(exit, ExitReason::PageFault(0x30000));
-    assert_eq!(standard_high_pages.gas, 75, "standard load block costs 25");
-
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    {
-        use vos_pvm::recompiler::{DataLayout, RecompiledPvm};
-
-        let mut jit = RecompiledPvm::new_with_mode(
-            &code,
-            bitmask,
-            vec![],
-            [0; 13],
-            100,
-            Some(DataLayout {
-                mem_size: 0x40000,
-                arg_start: 0,
-                arg_data: vec![],
-                ro_start: 0,
-                ro_data: vec![],
-                rw_start: 0,
-                rw_data: vec![],
-            }),
-            high_page_tier,
-            IsaMode::Conformance,
-        )
-        .expect("compile high-page standard regression");
-        jit.set_page_perms(&vec![PERM_NONE; 0x40000 / PAGE as usize]);
-        assert_eq!(jit.run(), exit);
-        assert_eq!(jit.gas(), standard_high_pages.gas);
-    }
-}
-
 /// Full standard Ψ exposes the causing counter for retryable exits, but
 /// normalizes successful halt and panic to zero. Host continuation is an
 /// explicit transition and does not fund the surrounding block twice.
@@ -2798,52 +2401,24 @@ fn v080_external_exit_counters_and_host_resume_are_exact() {
     // A posterior register write is retained even though the following
     // nonzero opcode-0 instruction panics and normalizes the final PC.
     let (panic_code, panic_bits) = asm(&[&[51, 2, 9], &[0]]);
-    let mut interpreter = exact_state_interpreter(
-        &panic_code,
-        &panic_bits,
-        [0; 13],
-        vec![],
-        100,
-        IsaMode::Conformance,
-    );
+    let mut interpreter = exact_state_interpreter(&panic_code, &panic_bits, [0; 13], vec![], 100);
     assert_eq!(interpreter.run().0, ExitReason::Panic);
     assert_eq!(interpreter.pc, 0);
     assert_eq!(interpreter.registers[2], 9);
-
-    // The transitional profile remains distinct: opcode zero is Trap and
-    // retains its causing PC.
-    let mut jar =
-        exact_state_interpreter(&panic_code, &panic_bits, [0; 13], vec![], 100, IsaMode::Jar);
-    assert_eq!(jar.run().0, ExitReason::Trap);
-    assert_eq!(jar.pc, 3);
 
     // A jump-indirect at a nonzero PC exits successfully through the halt
     // sentinel. Full standard Ψ still returns PC zero.
     let (halt_code, halt_bits) = asm(&[&[1], &[50, 2]]);
     let mut halt_regs = [0; 13];
     halt_regs[2] = PVM_HALT_ADDR;
-    let mut interpreter = exact_state_interpreter(
-        &halt_code,
-        &halt_bits,
-        halt_regs,
-        vec![],
-        100,
-        IsaMode::Conformance,
-    );
+    let mut interpreter = exact_state_interpreter(&halt_code, &halt_bits, halt_regs, vec![], 100);
     assert_eq!(interpreter.run().0, ExitReason::Halt);
     assert_eq!(interpreter.pc, 0);
 
     // ecalli is at PC 3. The external host boundary exposes 3, then the
     // explicit resume enters PC 5 without charging the prepaid block again.
     let (host_code, host_bits) = asm(&[&[51, 2, 9], &[10, 7], &[0]]);
-    let mut interpreter = exact_state_interpreter(
-        &host_code,
-        &host_bits,
-        [0; 13],
-        vec![],
-        200,
-        IsaMode::Conformance,
-    );
+    let mut interpreter = exact_state_interpreter(&host_code, &host_bits, [0; 13], vec![], 200);
     assert_eq!(interpreter.run().0, ExitReason::HostCall(7));
     assert_eq!(interpreter.pc, 3);
     assert_eq!(interpreter.registers[2], 9);
@@ -2853,24 +2428,12 @@ fn v080_external_exit_counters_and_host_resume_are_exact() {
     assert_eq!(interpreter.pc, 0);
     assert_eq!(interpreter.gas, host_gas);
 
-    let mut jar =
-        exact_state_interpreter(&host_code, &host_bits, [0; 13], vec![], 200, IsaMode::Jar);
-    assert_eq!(jar.run().0, ExitReason::HostCall(7));
-    assert_eq!(jar.pc, 5, "JAR retains its advanced host-call counter");
-
     // The first fallthrough block is funded, but the block beginning at PC
     // 1 is not. OOG exposes that cause and preserves pre-instruction state.
     let (oog_code, oog_bits) = asm(&[&[1], &[51, 2, 9], &[0]]);
     let mut oog_regs = [0; 13];
     oog_regs[2] = 77;
-    let mut interpreter = exact_state_interpreter(
-        &oog_code,
-        &oog_bits,
-        oog_regs,
-        vec![],
-        2,
-        IsaMode::Conformance,
-    );
+    let mut interpreter = exact_state_interpreter(&oog_code, &oog_bits, oog_regs, vec![], 2);
     assert_eq!(interpreter.run().0, ExitReason::OutOfGas);
     assert_eq!(interpreter.pc, 1);
     assert_eq!(interpreter.gas, 0);
@@ -2878,37 +2441,16 @@ fn v080_external_exit_counters_and_host_resume_are_exact() {
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
-        let mut jit = exact_state_recompiler(
-            &panic_code,
-            &panic_bits,
-            [0; 13],
-            PAGE,
-            100,
-            IsaMode::Conformance,
-        );
+        let mut jit = exact_state_recompiler(&panic_code, &panic_bits, [0; 13], PAGE, 100);
         assert_eq!(jit.run(), ExitReason::Panic);
         assert_eq!(jit.pc(), 0);
         assert_eq!(jit.registers()[2], 9);
 
-        let mut jit = exact_state_recompiler(
-            &halt_code,
-            &halt_bits,
-            halt_regs,
-            PAGE,
-            100,
-            IsaMode::Conformance,
-        );
+        let mut jit = exact_state_recompiler(&halt_code, &halt_bits, halt_regs, PAGE, 100);
         assert_eq!(jit.run(), ExitReason::Halt);
         assert_eq!(jit.pc(), 0);
 
-        let mut jit = exact_state_recompiler(
-            &host_code,
-            &host_bits,
-            [0; 13],
-            PAGE,
-            200,
-            IsaMode::Conformance,
-        );
+        let mut jit = exact_state_recompiler(&host_code, &host_bits, [0; 13], PAGE, 200);
         assert_eq!(jit.run(), ExitReason::HostCall(7));
         assert_eq!(jit.pc(), 3);
         assert_eq!(jit.registers()[2], 9);
@@ -2920,14 +2462,7 @@ fn v080_external_exit_counters_and_host_resume_are_exact() {
         assert_eq!(jit.pc(), 0);
         assert_eq!(jit.gas(), host_gas);
 
-        let mut jit = exact_state_recompiler(
-            &oog_code,
-            &oog_bits,
-            oog_regs,
-            PAGE,
-            2,
-            IsaMode::Conformance,
-        );
+        let mut jit = exact_state_recompiler(&oog_code, &oog_bits, oog_regs, PAGE, 2);
         assert_eq!(jit.run(), ExitReason::OutOfGas);
         assert_eq!(jit.pc(), 1);
         assert_eq!(jit.gas(), 0);
@@ -2935,24 +2470,18 @@ fn v080_external_exit_counters_and_host_resume_are_exact() {
     }
 }
 
-/// The standard machine exposes the complete sign-extended immediate as the
-/// host identifier. The transitional JAR profile deliberately retains its
-/// frozen zero-extended-u32 projection so existing Service traces and
-/// capability dispatch remain byte-for-byte compatible.
+/// The machine exposes the complete sign-extended immediate as the host
+/// identifier.
 #[test]
-fn ecalli_identifier_width_is_profile_scoped() {
-    let cases: &[(&[u8], u64, u64)] = &[
-        (&[0xff], u64::MAX, u64::from(u32::MAX)),
-        (
-            &[0x00, 0x00, 0x00, 0x80],
-            0xffff_ffff_8000_0000,
-            0x8000_0000,
-        ),
-        (&[0xff, 0xff, 0xff, 0x7f], 0x7fff_ffff, 0x7fff_ffff),
+fn ecalli_identifier_is_sign_extended() {
+    let cases: &[(&[u8], u64)] = &[
+        (&[0xff], u64::MAX),
+        (&[0x00, 0x00, 0x00, 0x80], 0xffff_ffff_8000_0000),
+        (&[0xff, 0xff, 0xff, 0x7f], 0x7fff_ffff),
     ];
     let registers = core::array::from_fn(|index| 0x5a00 + index as u64);
 
-    for (immediate, standard_id, jar_id) in cases {
+    for (immediate, standard_id) in cases {
         let mut code = vec![10];
         code.extend_from_slice(immediate);
         code.push(0);
@@ -2960,55 +2489,26 @@ fn ecalli_identifier_width_is_profile_scoped() {
         bitmask.extend(core::iter::repeat_n(0, immediate.len()));
         bitmask.push(1);
 
-        let mut standard = exact_state_interpreter(
-            &code,
-            &bitmask,
-            registers,
-            vec![0xa5; PAGE as usize],
-            1_000,
-            IsaMode::Conformance,
-        );
+        let mut standard =
+            exact_state_interpreter(&code, &bitmask, registers, vec![0xa5; PAGE as usize], 1_000);
         assert_eq!(standard.run().0, ExitReason::HostCall(*standard_id));
         assert_eq!(standard.registers, registers);
         let mut actual = vec![0; PAGE as usize];
         standard.memory().read_bytes(0, &mut actual);
         assert_eq!(actual, vec![0xa5; PAGE as usize]);
 
-        let mut jar = exact_state_interpreter(
-            &code,
-            &bitmask,
-            registers,
-            vec![0xa5; PAGE as usize],
-            1_000,
-            IsaMode::Jar,
-        );
-        assert_eq!(jar.run().0, ExitReason::HostCall(*jar_id));
-        assert_eq!(jar.registers, registers);
-
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         {
-            let mut standard = exact_state_recompiler(
-                &code,
-                &bitmask,
-                registers,
-                PAGE,
-                1_000,
-                IsaMode::Conformance,
-            );
+            let mut standard = exact_state_recompiler(&code, &bitmask, registers, PAGE, 1_000);
             assert_eq!(standard.run(), ExitReason::HostCall(*standard_id));
             assert_eq!(*standard.registers(), registers);
-
-            let mut jar =
-                exact_state_recompiler(&code, &bitmask, registers, PAGE, 1_000, IsaMode::Jar);
-            assert_eq!(jar.run(), ExitReason::HostCall(*jar_id));
-            assert_eq!(*jar.registers(), registers);
         }
     }
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
-fn rem_u32_zero_divisor_jit_result_is_profile_scoped() {
+fn rem_u32_zero_divisor_jit_result_is_sign_extended() {
     let (code, bitmask) = asm(&[&[Opcode::RemU32 as u8, 0x32, 4], &[0]]);
     let cases = [(0x1_0000_0007, 7), (0x8000_0000, 0xffff_ffff_8000_0000)];
 
@@ -3016,41 +2516,18 @@ fn rem_u32_zero_divisor_jit_result_is_profile_scoped() {
         let mut registers = [0; 13];
         registers[2] = dividend;
 
-        let mut interpreter = exact_state_interpreter(
-            &code,
-            &bitmask,
-            registers,
-            vec![],
-            1_000,
-            IsaMode::Conformance,
-        );
+        let mut interpreter = exact_state_interpreter(&code, &bitmask, registers, vec![], 1_000);
         assert_eq!(interpreter.run().0, ExitReason::Panic);
         assert_eq!(interpreter.registers[4], standard_result);
 
-        let mut standard = exact_state_recompiler(
-            &code,
-            &bitmask,
-            registers,
-            PAGE,
-            1_000,
-            IsaMode::Conformance,
-        );
+        let mut standard = exact_state_recompiler(&code, &bitmask, registers, PAGE, 1_000);
         assert_eq!(standard.run(), ExitReason::Panic);
         assert_eq!(standard.registers()[4], standard_result);
-
-        let mut jar = exact_state_recompiler(&code, &bitmask, registers, PAGE, 1_000, IsaMode::Jar);
-        assert_eq!(jar.run(), ExitReason::Trap);
-        assert_eq!(
-            jar.registers()[4],
-            dividend,
-            "frozen JAR/JIT copies the complete dividend on zero divisor"
-        );
     }
 }
 
 /// Standard addresses below 2^16 panic before consulting page permissions,
-/// even if the embedder maps those bytes. JAR retains its legacy mapped-low
-/// memory behavior.
+/// even if the embedder maps those bytes.
 #[test]
 fn v080_low_zone_panics_before_a_mapped_memory_access() {
     let (code, bitmask) = asm(&[&[58, 3, 0, 0, 0], &[0]]);
@@ -3059,39 +2536,20 @@ fn v080_low_zone_panics_before_a_mapped_memory_access() {
     let mut memory = vec![0; PAGE as usize];
     memory[0] = 0xab;
 
-    let mut interpreter = exact_state_interpreter(
-        &code,
-        &bitmask,
-        registers,
-        memory.clone(),
-        100,
-        IsaMode::Conformance,
-    );
+    let mut interpreter = exact_state_interpreter(&code, &bitmask, registers, memory.clone(), 100);
     interpreter.set_page_perms(vec![PERM_RW]);
     assert_eq!(interpreter.run().0, ExitReason::Panic);
     assert_eq!(interpreter.pc, 0);
     assert_eq!(interpreter.registers[3], 77);
 
-    let mut jar = exact_state_interpreter(&code, &bitmask, registers, memory, 100, IsaMode::Jar);
-    jar.set_page_perms(vec![PERM_RW]);
-    assert_eq!(jar.run().0, ExitReason::Trap);
-    assert_eq!(jar.registers[3], 0xab);
-
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
-        let mut jit =
-            exact_state_recompiler(&code, &bitmask, registers, PAGE, 100, IsaMode::Conformance);
+        let mut jit = exact_state_recompiler(&code, &bitmask, registers, PAGE, 100);
         assert!(jit.write_bytes(0, &[0xab]));
         jit.set_page_perms(&[PERM_RW]);
         assert_eq!(jit.run(), ExitReason::Panic);
         assert_eq!(jit.pc(), 0);
         assert_eq!(jit.registers()[3], 77);
-
-        let mut jit = exact_state_recompiler(&code, &bitmask, registers, PAGE, 100, IsaMode::Jar);
-        assert!(jit.write_bytes(0, &[0xab]));
-        jit.set_page_perms(&[PERM_RW]);
-        assert_eq!(jit.run(), ExitReason::Trap);
-        assert_eq!(jit.registers()[3], 0xab);
     }
 }
 
@@ -3114,8 +2572,7 @@ fn v080_cyclic_wide_access_orders_high_tail_before_low_zone() {
         (PERM_NONE, ExitReason::PageFault(0xffff_f000)),
     ] {
         let permissions = cyclic_permissions(high_perm);
-        let mut interpreter =
-            cyclic_sparse_interpreter(&code, &bitmask, registers, 100, IsaMode::Conformance);
+        let mut interpreter = cyclic_sparse_interpreter(&code, &bitmask, registers, 100);
         interpreter.set_page_perms(permissions.clone());
         assert_eq!(
             interpreter.run().0,
@@ -3126,31 +2583,11 @@ fn v080_cyclic_wide_access_orders_high_tail_before_low_zone() {
 
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         {
-            let mut jit = cyclic_recompiler(&code, &bitmask, registers, 100, IsaMode::Conformance);
+            let mut jit = cyclic_recompiler(&code, &bitmask, registers, 100);
             jit.set_page_perms(&permissions);
             assert_eq!(jit.run(), expected, "JIT perm={high_perm}");
             assert_eq!(jit.registers()[2], SENTINEL);
             assert_eq!(jit.gas(), interpreter.gas);
-        }
-    }
-
-    // The transitional profile remains safe and backend-identical without
-    // changing its old overflowing-range classification.
-    for (high_perm, expected) in [
-        (PERM_RW, ExitReason::PageFault(0)),
-        (PERM_NONE, ExitReason::PageFault(0xffff_f000)),
-    ] {
-        let permissions = cyclic_permissions(high_perm);
-        let mut interpreter =
-            cyclic_sparse_interpreter(&code, &bitmask, registers, 100, IsaMode::Jar);
-        interpreter.set_page_perms(permissions.clone());
-        assert_eq!(interpreter.run().0, expected);
-
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-        {
-            let mut jit = cyclic_recompiler(&code, &bitmask, registers, 100, IsaMode::Jar);
-            jit.set_page_perms(&permissions);
-            assert_eq!(jit.run(), expected);
         }
     }
 }
@@ -3175,8 +2612,7 @@ fn v080_cyclic_store_is_atomic_and_retry_does_not_recharge() {
         bytes
     };
 
-    let mut interpreter =
-        cyclic_sparse_interpreter(&code, &bitmask, registers, 100, IsaMode::Conformance);
+    let mut interpreter = cyclic_sparse_interpreter(&code, &bitmask, registers, 100);
     interpreter.memory_mut().init_copy(ADDRESS, &OLD[..4]);
     interpreter.memory_mut().init_copy(0, &OLD[4..]);
     interpreter.set_page_perms(cyclic_permissions(PERM_NONE));
@@ -3199,7 +2635,7 @@ fn v080_cyclic_store_is_atomic_and_retry_does_not_recharge() {
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
-        let mut jit = cyclic_recompiler(&code, &bitmask, registers, 100, IsaMode::Conformance);
+        let mut jit = cyclic_recompiler(&code, &bitmask, registers, 100);
         assert!(jit.write_bytes(ADDRESS, &OLD));
         jit.set_page_perms(&cyclic_permissions(PERM_NONE));
         assert_eq!(jit.run(), ExitReason::PageFault(0xffff_f000));
@@ -3215,28 +2651,16 @@ fn v080_cyclic_store_is_atomic_and_retry_does_not_recharge() {
     }
 
     // Gas funding precedes memory validation and is itself atomic on OOG.
-    let probe = cyclic_sparse_interpreter(&code, &bitmask, registers, 100, IsaMode::Conformance);
+    let probe = cyclic_sparse_interpreter(&code, &bitmask, registers, 100);
     let insufficient = u64::from(probe.block_gas_costs[0]) - 1;
-    let mut interpreter = cyclic_sparse_interpreter(
-        &code,
-        &bitmask,
-        registers,
-        insufficient,
-        IsaMode::Conformance,
-    );
+    let mut interpreter = cyclic_sparse_interpreter(&code, &bitmask, registers, insufficient);
     interpreter.set_page_perms(cyclic_permissions(PERM_NONE));
     assert_eq!(interpreter.run().0, ExitReason::OutOfGas);
     assert_eq!(interpreter.gas, insufficient);
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
-        let mut jit = cyclic_recompiler(
-            &code,
-            &bitmask,
-            registers,
-            insufficient,
-            IsaMode::Conformance,
-        );
+        let mut jit = cyclic_recompiler(&code, &bitmask, registers, insufficient);
         jit.set_page_perms(&cyclic_permissions(PERM_NONE));
         assert_eq!(jit.run(), ExitReason::OutOfGas);
         assert_eq!(jit.gas(), insufficient);
@@ -3256,8 +2680,7 @@ fn v080_cyclic_load_width_boundaries_are_exact() {
         registers[2] = SENTINEL;
         registers[3] = u64::from(safe_addr);
 
-        let mut interpreter =
-            cyclic_sparse_interpreter(&code, &bitmask, registers, 100, IsaMode::Conformance);
+        let mut interpreter = cyclic_sparse_interpreter(&code, &bitmask, registers, 100);
         interpreter.memory_mut().init_copy(u32::MAX - 7, &HIGH);
         interpreter.set_page_perms(cyclic_permissions(PERM_RO));
         assert_eq!(interpreter.run().0, ExitReason::Panic);
@@ -3268,7 +2691,7 @@ fn v080_cyclic_load_width_boundaries_are_exact() {
 
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         {
-            let mut jit = cyclic_recompiler(&code, &bitmask, registers, 100, IsaMode::Conformance);
+            let mut jit = cyclic_recompiler(&code, &bitmask, registers, 100);
             assert!(jit.write_bytes(u32::MAX - 7, &HIGH));
             jit.set_page_perms(&cyclic_permissions(PERM_RO));
             assert_eq!(jit.run(), ExitReason::Panic);
@@ -3277,16 +2700,14 @@ fn v080_cyclic_load_width_boundaries_are_exact() {
 
         if width > 1 {
             registers[3] = u64::from(safe_addr + 1);
-            let mut interpreter =
-                cyclic_sparse_interpreter(&code, &bitmask, registers, 100, IsaMode::Conformance);
+            let mut interpreter = cyclic_sparse_interpreter(&code, &bitmask, registers, 100);
             interpreter.set_page_perms(cyclic_permissions(PERM_RO));
             assert_eq!(interpreter.run().0, ExitReason::Panic);
             assert_eq!(interpreter.registers[2], SENTINEL, "wrapped width {width}");
 
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             {
-                let mut jit =
-                    cyclic_recompiler(&code, &bitmask, registers, 100, IsaMode::Conformance);
+                let mut jit = cyclic_recompiler(&code, &bitmask, registers, 100);
                 jit.set_page_perms(&cyclic_permissions(PERM_RO));
                 assert_eq!(jit.run(), ExitReason::Panic);
                 assert_eq!(jit.registers()[2], SENTINEL, "JIT wrapped width {width}");
@@ -3337,8 +2758,7 @@ fn v080_cyclic_jit_memory_families_stay_inside_native_window() {
     let mapped_permissions = cyclic_permissions(PERM_RW);
 
     for (family, (code, bitmask)) in programs.into_iter().enumerate() {
-        let mut interpreter =
-            cyclic_sparse_interpreter(&code, &bitmask, registers, 100, IsaMode::Conformance);
+        let mut interpreter = cyclic_sparse_interpreter(&code, &bitmask, registers, 100);
         interpreter.set_page_perms(fault_permissions.clone());
         assert_eq!(
             interpreter.run().0,
@@ -3346,7 +2766,7 @@ fn v080_cyclic_jit_memory_families_stay_inside_native_window() {
             "interpreter family {family}"
         );
 
-        let mut jit = cyclic_recompiler(&code, &bitmask, registers, 100, IsaMode::Conformance);
+        let mut jit = cyclic_recompiler(&code, &bitmask, registers, 100);
         jit.set_page_perms(&fault_permissions);
         assert_eq!(
             jit.run(),
@@ -3358,8 +2778,7 @@ fn v080_cyclic_jit_memory_families_stay_inside_native_window() {
         // With the high tail accessible, all six emitters must classify the
         // subsequently wrapped low-zone byte as Panic before executing the
         // load/store. Register and memory state therefore remain unchanged.
-        let mut interpreter =
-            cyclic_sparse_interpreter(&code, &bitmask, registers, 100, IsaMode::Conformance);
+        let mut interpreter = cyclic_sparse_interpreter(&code, &bitmask, registers, 100);
         interpreter.memory_mut().init_copy(ADDRESS, &OLD[..2]);
         interpreter.memory_mut().init_copy(0, &OLD[2..]);
         interpreter.set_page_perms(mapped_permissions.clone());
@@ -3381,7 +2800,7 @@ fn v080_cyclic_jit_memory_families_stay_inside_native_window() {
             .read_bytes(0, &mut interpreter_bytes[2..]);
         assert_eq!(interpreter_bytes, OLD, "family {family} memory");
 
-        let mut jit = cyclic_recompiler(&code, &bitmask, registers, 100, IsaMode::Conformance);
+        let mut jit = cyclic_recompiler(&code, &bitmask, registers, 100);
         assert!(jit.write_bytes(ADDRESS, &OLD));
         jit.set_page_perms(&mapped_permissions);
         assert_eq!(jit.run(), ExitReason::Panic, "mapped JIT family {family}");
@@ -3418,14 +2837,7 @@ fn v080_page_fault_retry_preserves_state_and_does_not_recharge() {
     let mut repaired_perms = fault_perms.clone();
     repaired_perms[(STORE_ADDR / PAGE + 1) as usize] = PERM_RW;
 
-    let mut interpreter = exact_state_interpreter(
-        &code,
-        &bitmask,
-        registers,
-        memory,
-        100,
-        IsaMode::Conformance,
-    );
+    let mut interpreter = exact_state_interpreter(&code, &bitmask, registers, memory, 100);
     interpreter.set_page_perms(fault_perms.clone());
     assert_eq!(interpreter.run().0, ExitReason::PageFault(0x31000));
     assert_eq!(interpreter.pc, 1);
@@ -3443,14 +2855,7 @@ fn v080_page_fault_retry_preserves_state_and_does_not_recharge() {
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
-        let mut jit = exact_state_recompiler(
-            &code,
-            &bitmask,
-            registers,
-            MEMORY_SPAN,
-            100,
-            IsaMode::Conformance,
-        );
+        let mut jit = exact_state_recompiler(&code, &bitmask, registers, MEMORY_SPAN, 100);
         assert!(jit.write_bytes(STORE_ADDR, &old));
         jit.set_page_perms(&fault_perms);
         assert_eq!(jit.run(), ExitReason::PageFault(0x31000));
@@ -3467,35 +2872,18 @@ fn v080_page_fault_retry_preserves_state_and_does_not_recharge() {
     }
 }
 
-/// Every recompiler-applicable vector holds on the JIT, and its block-gas
-/// consumption matches the interpreter's exactly.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-#[test]
-fn recompiler_satisfies_every_vector() {
-    let mut ran = 0;
-    for (file, v) in discover() {
-        if v.recompiler {
-            check_recompiler(&file, &v, isa_mode_for_vector(&v));
-            ran += 1;
-        }
-    }
-    assert!(ran >= 100, "recompiler corpus shrank: {ran}");
-}
-
-/// Every recompiler-applicable v0.8.0 vector agrees with the interpreter,
-/// including block-gas classification and consumption.
+/// Every vector holds on the JIT and agrees with the interpreter, including
+/// block-gas classification and consumption.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn graypaper_v080_recompiler_satisfies_every_vector() {
-    let mut ran = 0;
-    for (file, vector) in discover_v080() {
-        if vector.recompiler {
-            check_recompiler(&file, &vector, IsaMode::Conformance);
-            ran += 1;
-        }
+    let vectors = discover_v080();
+    for (file, vector) in &vectors {
+        check_recompiler(file, vector);
     }
     assert_eq!(
-        ran, V080_RECOMPILER_CASE_COUNT,
-        "complete v0.8 recompiler corpus cardinality",
+        vectors.len(),
+        V080_CASE_COUNT,
+        "complete v0.8 corpus cardinality",
     );
 }

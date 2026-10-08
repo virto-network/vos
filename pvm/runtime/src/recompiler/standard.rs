@@ -2,7 +2,7 @@
 //! state and the same memory pages; only the boundary register state is copied.
 
 use super::{CompiledCode, JitContext, prepare_external_entry, signal};
-use crate::{ExitReason, Interpreter, IsaMode, PendingHostCall};
+use crate::{ExitReason, Interpreter, PendingHostCall};
 
 pub(crate) fn run_standard(
     compiled: &CompiledCode,
@@ -22,8 +22,6 @@ pub(crate) fn run_standard(
         dispatch_len: compiled.dispatch_table.len() as u32,
         exit_reason: 0,
         exit_arg: pending.map_or(0, |call| call.id),
-        heap_base: vm.heap_base,
-        heap_top: vm.heap_top,
         jt_ptr: vm.jump_table.as_ptr(),
         jt_len: vm.jump_table.len() as u32,
         _pad0: 0,
@@ -37,10 +35,6 @@ pub(crate) fn run_standard(
         flat_buf,
         flat_perms,
         fast_reentry: 0,
-        _pad2: 0,
-        max_heap_pages: vm.max_heap_pages,
-        _pad3: 0,
-        original_bitmap: [0; 32],
     };
     // SAFETY: native_window reserves an aligned, writable context page; the
     // guest alias excludes it. All metadata pointers remain owned throughout
@@ -54,7 +48,6 @@ pub(crate) fn run_standard(
         &compiled.fault_resume_offsets,
         &compiled.gas_block_start_by_pc,
         &compiled.block_gas_costs,
-        IsaMode::Conformance,
     )
     .is_none()
     {
@@ -82,8 +75,6 @@ pub(crate) fn run_standard(
     vm.registers = context.regs;
     vm.gas = context.gas;
     vm.pc = context.pc;
-    vm.heap_base = context.heap_base;
-    vm.heap_top = context.heap_top;
     vm.restore_boundary_state(
         context.gas_charged != 0,
         (context.host_pending != 0).then_some(PendingHostCall {
@@ -101,8 +92,6 @@ pub(crate) fn run_standard(
                 .expect("native page-fault argument is a 32-bit address"),
         ),
         4 => ExitReason::HostCall(context.exit_arg),
-        6 => ExitReason::Ecall,
-        7 => ExitReason::Trap,
         _ => return Err("invalid native exit reason".into()),
     })
 }

@@ -106,7 +106,6 @@ mod prover {
     /// budgeted cutters, and the segment assembly take this view, so a
     /// window built from either holder flows through identical code.
     struct ChainParts<'a> {
-        isa_mode: vos_pvm::IsaMode,
         code: &'a [u8],
         bitmask: &'a [u8],
         jump_table: &'a [u32],
@@ -125,7 +124,6 @@ mod prover {
     impl<'a> From<&'a SideNote> for ChainParts<'a> {
         fn from(full: &'a SideNote) -> Self {
             Self {
-                isa_mode: full.isa_mode,
                 code: &full.code,
                 bitmask: &full.bitmask,
                 jump_table: &full.jump_table,
@@ -146,7 +144,6 @@ mod prover {
     impl<'a> From<&'a CompactTrace> for ChainParts<'a> {
         fn from(full: &'a CompactTrace) -> Self {
             Self {
-                isa_mode: full.isa_mode,
                 code: &full.code,
                 bitmask: &full.bitmask,
                 jump_table: &full.jump_table,
@@ -504,7 +501,6 @@ mod prover {
         let in_window = move |ts: u64| ts >= ts_lo && ts < ts_hi;
 
         let sn = SideNote::new(steps, parts.code.to_vec(), parts.bitmask.to_vec())
-            .with_isa_mode(parts.isa_mode)
             .with_jump_table(parts.jump_table.to_vec())
             .with_initial_regs(initial_regs);
         let mut sn = match mem {
@@ -1049,8 +1045,8 @@ mod prover {
     }
 
     /// The live [`StepSource`]: pumps a [`TracingPvm`] one
-    /// [`TracingPvm::step_with_vos_stubs`] iteration per arrival —
-    /// identical execution to `run_with_vos_stubs` (the loop over the same
+    /// [`TracingPvm::step_with_precompiles`] iteration per arrival —
+    /// identical execution to `run_with_precompiles` (the loop over the same
     /// method) — draining the recorded step and its precompile records out
     /// of the tracer as they land, so the tracer holds no trace at all:
     /// the windower's current window is the only step storage anywhere.
@@ -1082,7 +1078,7 @@ mod prover {
             if self.done {
                 return None;
             }
-            if self.tracer.step_with_vos_stubs().is_some() {
+            if self.tracer.step_with_precompiles().is_some() {
                 self.done = true;
             }
             let step = self
@@ -1169,13 +1165,11 @@ mod prover {
         /// passes each one, in the same (step) order.
         fn parts<'a>(
             &'a self,
-            isa_mode: vos_pvm::IsaMode,
             code: &'a [u8],
             bitmask: &'a [u8],
             jump_table: &'a [u32],
         ) -> ChainParts<'a> {
             ChainParts {
-                isa_mode,
                 code,
                 bitmask,
                 jump_table,
@@ -1251,7 +1245,6 @@ mod prover {
     /// economy.
     pub struct TraceStream<S: StepSource> {
         source: S,
-        isa_mode: vos_pvm::IsaMode,
         code: Vec<u8>,
         bitmask: Vec<u8>,
         jump_table: Vec<u32>,
@@ -1287,7 +1280,6 @@ mod prover {
         /// program-static fields every window shares.
         pub fn new(
             source: S,
-            isa_mode: vos_pvm::IsaMode,
             code: Vec<u8>,
             bitmask: Vec<u8>,
             jump_table: Vec<u32>,
@@ -1302,7 +1294,6 @@ mod prover {
             };
             Self {
                 source,
-                isa_mode,
                 code,
                 bitmask,
                 jump_table,
@@ -1383,8 +1374,7 @@ mod prover {
                 .expect("no current window: call next_window first");
             let steps = expand_steps(&w.buf.steps, self.regs);
             assemble_segment(
-                &w.buf
-                    .parts(self.isa_mode, &self.code, &self.bitmask, &self.jump_table),
+                &w.buf.parts(&self.code, &self.bitmask, &self.jump_table),
                 steps,
                 self.regs,
                 SegmentMemory::Dense(self.mem.clone()),
@@ -1768,7 +1758,6 @@ mod tests {
     /// everything `ingest_ristretto_boundary` derives (comb calls + counts,
     /// plus the Variable path's range256 bumps).
     fn assert_windows_equal(via_cursor: &SideNote, via_slice: &SideNote) {
-        assert_eq!(via_cursor.isa_mode, via_slice.isa_mode);
         assert_eq!(via_cursor.steps, via_slice.steps);
         assert_eq!(via_cursor.code, via_slice.code);
         assert_eq!(via_cursor.bitmask, via_slice.bitmask);
@@ -1913,7 +1902,6 @@ mod tests {
         crate::side_note::CompactTrace {
             steps: full.steps.iter().map(|s| s.to_compact()).collect(),
             initial_regs: full.steps[0].regs_before,
-            isa_mode: full.isa_mode,
             code: full.code.to_vec(),
             bitmask: full.bitmask.to_vec(),
             initial_memory: full.initial_memory.clone(),
@@ -2087,7 +2075,6 @@ mod tests {
     ) -> crate::segment::TraceStream<ReplaySource> {
         crate::segment::TraceStream::new(
             ReplaySource::from_side_note(full),
-            full.isa_mode,
             full.code.to_vec(),
             full.bitmask.to_vec(),
             full.jump_table.to_vec(),
@@ -2233,13 +2220,12 @@ mod tests {
                 regs,
                 flat_mem.clone(),
                 10_000,
-                25,
             )
         };
 
         // Offline: run to completion, hold the compact chain form.
-        let mut tracing = TracingPvm::new_conformance(interp());
-        let _ = tracing.run_with_vos_stubs();
+        let mut tracing = TracingPvm::new(interp());
+        let _ = tracing.run_with_precompiles();
         let blake2b_calls = tracing
             .blake2b_calls()
             .iter()
@@ -2256,7 +2242,6 @@ mod tests {
         let compact = crate::side_note::CompactTrace {
             steps,
             initial_regs,
-            isa_mode: vos_pvm::IsaMode::Conformance,
             code: code.clone(),
             bitmask: bitmask.clone(),
             initial_memory: flat_mem.clone(),
@@ -2281,8 +2266,7 @@ mod tests {
             };
             let mut cursor = crate::segment::CompactSegmentCursor::new(&compact);
             let mut stream = crate::segment::TraceStream::new(
-                crate::segment::TracingSource::new(TracingPvm::new_conformance(interp())),
-                vos_pvm::IsaMode::Conformance,
+                crate::segment::TracingSource::new(TracingPvm::new(interp())),
                 code.clone(),
                 bitmask.clone(),
                 vec![],

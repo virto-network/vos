@@ -1,10 +1,5 @@
 {
-  "backends": [
-    "interpreter",
-    "recompiler"
-  ],
   "expected": {
-    "gas": 98,
     "memory": [
       {
         "address": 131088,

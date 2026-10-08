@@ -16,7 +16,7 @@ use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint as DalekRi
 use curve25519_dalek::scalar::Scalar as DalekScalar;
 
 #[cfg(target_arch = "riscv64")]
-use crate::ecalls::{ECALL_RISTRETTO_POINT_ADD, ECALL_RISTRETTO_SCALAR_MULT, VOS_OBJECT_CAP};
+use crate::ecalls::{ECALL_RISTRETTO_POINT_ADD, ECALL_RISTRETTO_SCALAR_MULT};
 use crate::scalar::Scalar;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -161,8 +161,6 @@ fn ristretto_scalar_mult_pvm(scalar: &[u8; 32], point: &[u8; 32]) -> [u8; 32] {
             in("a1") point_ptr,
             in("a2") output_ptr,
             in("a3") 0u64,
-            in("a4") 0u64,
-            in("a5") VOS_OBJECT_CAP,
             options(nostack),
         );
     }
@@ -214,8 +212,6 @@ fn ristretto_point_add_pvm(p: &[u8; 32], q: &[u8; 32]) -> [u8; 32] {
             in("a1") q_ptr,
             in("a2") output_ptr,
             in("a3") 0u64,
-            in("a4") 0u64,
-            in("a5") VOS_OBJECT_CAP,
             options(nostack),
         );
     }

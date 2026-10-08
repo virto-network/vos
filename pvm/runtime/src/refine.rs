@@ -2,9 +2,8 @@
 //!
 //! [`execute`] loads a GP standard-program blob directly into the plain
 //! standard machine with the specification-defined memory image, page
-//! permissions, register file, standard memory latency, and per-page init-gas
-//! charge. It has no capability microkernel or hostcall dispatch. The whole
-//! path is `no_std`, so an
+//! permissions, register file and standard memory latency. It has no
+//! hostcall dispatch. The whole path is `no_std`, so an
 //! embedder (e.g. a wasm32 runtime) can perform pure refine invocations:
 //! any `ecalli` surfaces as [`ExitReason::HostCall`] in the returned
 //! [`Invocation`] for the embedder to reject or handle itself. Execution
@@ -24,17 +23,9 @@
 //! - Registers (GP eq A.43): φ0 = the halt address, φ1 = stack top,
 //!   φ7/φ8 = argument base/length; entry is at instruction counter 0 (the
 //!   refine / is-authorized entry point).
-//! - ISA: [`crate::IsaMode::Conformance`]. Opcode 3 (`Ecall`, the retired JAR
-//!   capability surface) is rejected by the standard-program decoder.
-//! - Standard load/store latency is the fixed 25 cycles specified by Gray
-//!   Paper v0.8.0, independently of declared page count. Page-tier latency is
-//!   confined to the capability/JAR service profile. The init charge still
-//!   derives from *declared* mapped pages, never from allocated bytes, so it
-//!   is independent of the memory representation.
-//! - Gas: [`GAS_PER_PAGE`] is charged per mapped page up front (the
-//!   standard initialization charge); a budget below that charge fails with
-//!   [`RefineError::OutOfGas`] before executing anything. `gas_used`
-//!   includes the init charge, so `budget - gas_used` equals the
+//! - Load/store latency is the fixed 25 cycles specified by Gray Paper
+//!   v0.8.0, independently of declared page count.
+//! - Gas: as in Ψ_M, initialization is free; `budget - gas_used` equals the
 //!   interpreter's remaining gas.
 //!
 //! 32-bit embedders: the flat image of a real SPI program spans ~4 GiB
@@ -52,10 +43,7 @@ use alloc::vec::Vec;
 use crate::backend::{PreparedExecution, PvmBackend};
 use crate::interpreter::{Interpreter, Memory, PERM_NONE, PERM_RO, PERM_RW};
 use crate::spi::{deblob, parse_standard_program};
-use crate::{
-    ExitReason, GAS_PER_PAGE, Gas, IsaMode, PVM_INIT_INPUT_SIZE, PVM_PAGE_SIZE, PVM_REGISTER_COUNT,
-    STANDARD_MEM_CYCLES,
-};
+use crate::{ExitReason, Gas, PVM_INIT_INPUT_SIZE, PVM_PAGE_SIZE, PVM_REGISTER_COUNT};
 
 /// Why [`execute`] could not run the program at all. Exits of a program
 /// that did run (including `OutOfGas` *during* execution) are reported via
@@ -69,8 +57,6 @@ pub enum RefineError {
     /// guard), the arguments exceed the `Z_I` input zone, or a flat image
     /// was requested that cannot exist in the host address space.
     LayoutOverflow,
-    /// The gas budget is below the per-page memory-init charge.
-    OutOfGas,
     /// The requested backend is unavailable, cannot be prepared, or its host
     /// memory setup failed. This is not a guest exit or an interpreter retry.
     Backend,
@@ -81,7 +67,6 @@ impl core::fmt::Display for RefineError {
         match self {
             Self::InvalidBlob => f.write_str("blob is not a GP standard program"),
             Self::LayoutOverflow => f.write_str("memory layout exceeds the address space"),
-            Self::OutOfGas => f.write_str("gas budget below the memory-init charge"),
             Self::Backend => f.write_str("standard execution backend failed"),
         }
     }
@@ -140,11 +125,11 @@ impl PreparedProgram {
 /// The result of a completed refine-style invocation.
 #[derive(Debug, Clone)]
 pub struct Invocation {
-    /// How execution stopped. `HostCall`/`Ecall` are returned untouched —
-    /// this harness dispatches nothing.
+    /// How execution stopped. `HostCall` is returned untouched — this
+    /// harness dispatches nothing.
     pub exit: ExitReason,
-    /// Total gas consumed: the per-page init charge plus execution gas.
-    /// The budget minus this equals the interpreter's remaining gas.
+    /// Total gas consumed. The budget minus this equals the interpreter's
+    /// remaining gas.
     pub gas_used: Gas,
     /// The register file φ at exit.
     pub registers: [u64; PVM_REGISTER_COUNT],
@@ -199,7 +184,7 @@ impl Machine {
                 // machine an ordinary Interpreter owner for the unchanged
                 // register/RAM state without attempting to predecode the
                 // attacker-controlled blob.
-                crate::program::ParsedCodeBlob {
+                vos_pvm_program::CodeBlob {
                     jump_table: Vec::new(),
                     code: vec![0],
                     bitmask: vec![1],
@@ -208,15 +193,13 @@ impl Machine {
                 Some(ExitReason::Panic),
             ),
         };
-        let mut interp = Interpreter::with_memory_and_mode(
+        let mut interp = Interpreter::with_memory(
             program.code,
             program.bitmask,
             program.jump_table,
             registers,
             memory,
             gas,
-            STANDARD_MEM_CYCLES,
-            IsaMode::Conformance,
         );
         interp.set_pc(pc);
         interp.restore_boundary_state(gas_charged, None);
@@ -291,12 +274,6 @@ impl Machine {
         let registers = layout.registers;
 
         let page = PVM_PAGE_SIZE as u64;
-        let total_pages: u64 = regions.iter().map(|r| r.size / page).sum();
-        let mem_cycles = STANDARD_MEM_CYCLES;
-        let init_gas = total_pages * GAS_PER_PAGE;
-        if gas < init_gas {
-            return Err(RefineError::OutOfGas);
-        }
 
         let max_addr: u64 = regions
             .iter()
@@ -335,9 +312,7 @@ impl Machine {
             prepared.interpreter_program().clone(),
             registers,
             mem,
-            gas - init_gas,
-            mem_cycles,
-            IsaMode::Conformance,
+            gas,
         );
         interp.set_page_perms(page_perms);
 
@@ -676,8 +651,6 @@ mod tests {
     }
 
     const ARGS: [u8; 6] = [0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02];
-    /// rw (1 heap page) + stack (1 page) + args (1 page) = 3 mapped pages.
-    const INIT_GAS: u64 = 3 * GAS_PER_PAGE;
 
     /// Compare the logical memory image of two invocations over
     /// `[start, end)` via reads (never the representation).
@@ -825,7 +798,7 @@ mod tests {
             Some(&ARGS[..4]),
             "output reflects the args"
         );
-        assert!(inv.gas_used > INIT_GAS, "execution consumed gas");
+        assert!(inv.gas_used > 0, "execution consumed gas");
         assert_eq!(
             inv.registers[2],
             u32::from_le_bytes(ARGS[..4].try_into().unwrap()) as u64
@@ -835,16 +808,8 @@ mod tests {
     }
 
     #[test]
-    fn gas_below_init_charge_is_an_error() {
-        assert_eq!(
-            execute(&round_trip_blob(), &ARGS, INIT_GAS - 1).unwrap_err(),
-            RefineError::OutOfGas
-        );
-    }
-
-    #[test]
     fn tiny_budget_exits_out_of_gas() {
-        let inv = execute(&round_trip_blob(), &ARGS, INIT_GAS + 1).expect("init charge covered");
+        let inv = execute(&round_trip_blob(), &ARGS, 1).expect("executes");
         assert_eq!(inv.exit, ExitReason::OutOfGas);
         assert_eq!(inv.output_bounded(0), None);
     }
@@ -988,10 +953,8 @@ mod tests {
                 let cold = execute_with(&blob, &args, 1_000_000, model).unwrap();
                 assert_eq!(invocation.gas_used, cold.gas_used);
             }
-            assert!(matches!(
-                Machine::load_prepared(&prepared, &ARGS, 0, model),
-                Err(RefineError::OutOfGas)
-            ));
+            let mut starved = Machine::load_prepared(&prepared, &ARGS, 0, model).unwrap();
+            assert_eq!(starved.resume(), ExitReason::OutOfGas);
             let oversized = vec![0; PVM_INIT_INPUT_SIZE as usize + 1];
             assert!(matches!(
                 Machine::load_prepared(&prepared, &oversized, 1_000_000, model),
@@ -1156,52 +1119,6 @@ mod tests {
         }
     }
 
-    /// Load-only measurement, not an execution or end-to-end latency gate.
-    #[cfg(feature = "std")]
-    #[test]
-    #[ignore = "requires VOS_PVM_PREPARE_BENCH_PROGRAM; run with --release --nocapture"]
-    fn prepared_program_load_measurement() {
-        use std::{hint::black_box, time::Instant};
-        let path = std::env::var("VOS_PVM_PREPARE_BENCH_PROGRAM").unwrap();
-        let blob = std::fs::read(path).unwrap();
-        let started = Instant::now();
-        let prepared = PreparedProgram::new(&blob).unwrap();
-        let preparation = started.elapsed();
-        // Representative input size from the recorded Authority query; these
-        // bytes are not a valid work request and are deliberately never run.
-        let args = vec![0; 790_499];
-        let mut cold_time = std::time::Duration::ZERO;
-        let mut reused_time = std::time::Duration::ZERO;
-        for i in 0..20 {
-            // Alternate ordering to avoid always timing one path first.
-            for reuse in [i % 2 == 0, i % 2 != 0] {
-                let started = Instant::now();
-                let machine = if reuse {
-                    Machine::load_prepared(&prepared, &args, 6_000_000_000, MemoryModel::Auto)
-                } else {
-                    Machine::load(&blob, &args, 6_000_000_000)
-                }
-                .unwrap();
-                let elapsed = started.elapsed();
-                if reuse {
-                    reused_time += elapsed;
-                } else {
-                    cold_time += elapsed;
-                }
-                black_box(&machine);
-                drop(machine);
-            }
-        }
-        std::eprintln!(
-            "program_bytes={} input_bytes={} samples_per_path=20 preparation_us={} cold_load_mean_us={} prepared_load_mean_us={}",
-            blob.len(),
-            args.len(),
-            preparation.as_micros(),
-            cold_time.as_micros() / 20,
-            reused_time.as_micros() / 20
-        );
-    }
-
     #[test]
     fn full_psi_deblob_failures_panic_without_changing_state() {
         let valid = build_pvm_blob(&[10, 7, 0], &[1, 0, 1]);
@@ -1308,7 +1225,7 @@ mod tests {
             1_000_000,
         );
         assert_flat_sparse_parity(&round_trip_blob(), &ARGS, 1_000_000);
-        assert_flat_sparse_parity(&round_trip_blob(), &ARGS, INIT_GAS + 1);
+        assert_flat_sparse_parity(&round_trip_blob(), &ARGS, 1);
         assert_flat_sparse_parity(
             &build_standard_program(&[], &[], 0, 4096, &[0], &[1]),
             &[],

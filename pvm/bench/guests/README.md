@@ -10,3 +10,5 @@ in `pvm/guest`: `just build-bench-guests`.
 - `hash-software`: BLAKE2b computed inside the PVM (S4, S5).
 - `hash-precompile`: BLAKE2b through the VOS precompile, falling back to
   software when the host answers `WHAT` (S5b).
+- `diverse`: a small mixed workload proven end to end by
+  `tests/diverse_proof.rs`.

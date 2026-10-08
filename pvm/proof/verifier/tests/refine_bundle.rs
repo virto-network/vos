@@ -489,7 +489,7 @@ fn nested_bundle_verifies_only_with_replay_and_rejects_hostile_edits() {
     );
 
     let mut wrong_result = bundle.clone();
-    wrong_result.result = RefineSliceExit::Trap;
+    wrong_result.result = RefineSliceExit::OutOfGas;
     reseal(&mut wrong_result);
     assert!(
         verify_refine_bundle_authenticated(

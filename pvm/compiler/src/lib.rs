@@ -1,12 +1,11 @@
 //! RISC-V ELF to JAM PVM transpiler.
 //!
-//! Converts RISC-V rv64em ELF binaries into PVM program blobs
-//! suitable for execution by the Grey PVM (Appendix A).
+//! Converts RISC-V rv64em ELF binaries into Gray Paper standard programs
+//! (Appendix A).
 //!
 //! Also provides utilities to hand-assemble PVM programs directly.
 
 pub mod assembler;
-pub mod emitter;
 pub mod linker;
 pub mod riscv;
 pub mod spi;
@@ -46,21 +45,6 @@ pub enum TranspileError {
     CodeTooLarge(usize),
     #[error("invalid section: {0}")]
     InvalidSection(String),
-}
-
-/// Link a RISC-V rv64em ELF binary into a JAR capability manifest PVM blob.
-/// Single entrypoint (PC=0). Works for both standard and service programs.
-pub fn link_elf(elf_data: &[u8]) -> Result<Vec<u8>, TranspileError> {
-    linker::link_elf(elf_data)
-}
-
-/// Link an ELF with an explicitly sized standard slot-0 argument DATA
-/// capability. No protocol capability or non-JAR execution path is added.
-pub fn link_elf_with_argument_pages(
-    elf_data: &[u8],
-    argument_pages: u32,
-) -> Result<Vec<u8>, TranspileError> {
-    linker::link_elf_with_argument_pages(elf_data, argument_pages)
 }
 
 /// Link a RISC-V rv64em ELF binary into a GP standard-program (SPI) blob —

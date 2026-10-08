@@ -74,9 +74,8 @@ fn main() {
         regs,
         vec![0u8; 64 * 1024],
         gas,
-        16,
     );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let mut tracing = TracingPvm::new(pvm);
     let _exit = tracing.run();
     let steps = tracing.into_trace();
     assert!(steps.len() >= n_steps, "trace shorter than fixture");

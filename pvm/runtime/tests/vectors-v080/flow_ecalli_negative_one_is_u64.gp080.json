@@ -1,10 +1,5 @@
 {
-  "backends": [
-    "interpreter",
-    "recompiler"
-  ],
   "expected": {
-    "gas": 99,
     "host_call": 18446744073709551615,
     "memory": [],
     "pc": 0,

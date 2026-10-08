@@ -2,17 +2,15 @@
 
 //! AIR gates for standard-v0.8 scalar-memory address validity.
 //!
-//! A standard load/store may complete only when every touched cyclic address
-//! is outside the protected initialization zone.  For the scalar widths this
-//! is equivalent to requiring an above-zone base and no wrap through 2^32.
-//! Jar keeps its frozen memory behavior and is deliberately not subject to
-//! this profile-scoped CPU constraint.
+//! A load/store may complete only when every touched cyclic address is
+//! outside the protected initialization zone.  For the scalar widths this is
+//! equivalent to requiring an above-zone base and no wrap through 2^32.
 
 use stwo::core::channel::Blake2sChannel;
 use stwo::core::fields::m31::BaseField;
 use vos_pvm::instruction::Opcode;
 use vos_pvm::interpreter::Interpreter;
-use vos_pvm::{IsaMode, PVM_REGISTER_COUNT, PVM_ZONE_SIZE};
+use vos_pvm::{PVM_REGISTER_COUNT, PVM_ZONE_SIZE};
 use vos_pvm_proof::chips::CpuChip;
 use vos_pvm_proof::chips::cpu::Column;
 use vos_pvm_proof::core::step::NUM_REGS;
@@ -40,7 +38,7 @@ fn assert_chip(chip: &CpuChip, trace: &ComponentTrace, side_note: &SideNote) -> 
     })
 }
 
-fn store_load_u64_side_note(address: u32, isa_mode: IsaMode) -> SideNote {
+fn store_load_u64_side_note(address: u32) -> SideNote {
     let code = vec![
         Opcode::StoreIndU64 as u8,
         0x10,
@@ -67,17 +65,16 @@ fn store_load_u64_side_note(address: u32, isa_mode: IsaMode) -> SideNote {
         regs,
         vec![0; 4 * 1024 * 1024],
         10_000,
-        25,
     );
-    let mut tracing = TracingPvm::new_with_isa_mode(pvm, isa_mode);
+    let mut tracing = TracingPvm::new(pvm);
     let _ = tracing.run();
     let steps = tracing.into_trace();
-    assert_eq!(steps.len(), 3, "store, load and terminal instruction");
+    let last = steps.len() - 1;
 
-    let mut side_note = SideNote::new(steps, code, bitmask).with_isa_mode(isa_mode);
+    let mut side_note = SideNote::new(steps, code, bitmask);
     for index in 0..NUM_REGS {
         side_note.initial_regs[index] = side_note.steps[0].regs_before[index];
-        side_note.final_regs[index] = side_note.steps[2].regs_after[index];
+        side_note.final_regs[index] = side_note.steps[last].regs_after[index];
     }
     side_note
 }
@@ -102,9 +99,8 @@ fn load_u8_offset_one_side_note() -> SideNote {
         regs,
         vec![0; 4 * 1024 * 1024],
         10_000,
-        25,
     );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let mut tracing = TracingPvm::new(pvm);
     let _ = tracing.run();
     let steps = tracing.into_trace();
     assert_eq!(steps.len(), 2, "load and terminal instruction");
@@ -142,7 +138,7 @@ fn forge_completed_address(side_note: &mut SideNote, address: u32) {
 
 #[test]
 fn standard_exact_zone_boundary_satisfies_cpu_air() {
-    let mut side_note = store_load_u64_side_note(PVM_ZONE_SIZE, IsaMode::Conformance);
+    let mut side_note = store_load_u64_side_note(PVM_ZONE_SIZE);
     let chip = CpuChip;
     let trace = chip.generate_component_trace(&mut side_note);
     assert_chip(&chip, &trace, &side_note)
@@ -151,7 +147,7 @@ fn standard_exact_zone_boundary_satisfies_cpu_air() {
 
 #[test]
 fn standard_forged_completed_low_zone_access_is_rejected() {
-    let mut side_note = store_load_u64_side_note(PVM_ZONE_SIZE, IsaMode::Conformance);
+    let mut side_note = store_load_u64_side_note(PVM_ZONE_SIZE);
     forge_completed_address(&mut side_note, PVM_ZONE_SIZE - 8);
     let chip = CpuChip;
     let trace = chip.generate_component_trace(&mut side_note);
@@ -231,7 +227,7 @@ fn standard_indirect_address_cannot_hide_low_zone_in_noncanonical_limbs() {
 
 #[test]
 fn standard_forged_completed_wrapping_access_is_rejected() {
-    let mut side_note = store_load_u64_side_note(PVM_ZONE_SIZE, IsaMode::Conformance);
+    let mut side_note = store_load_u64_side_note(PVM_ZONE_SIZE);
     forge_completed_address(&mut side_note, u32::MAX - 3);
     let chip = CpuChip;
     let trace = chip.generate_component_trace(&mut side_note);
@@ -243,7 +239,7 @@ fn standard_forged_completed_wrapping_access_is_rejected() {
 
 #[test]
 fn standard_nonwrapping_lower_24_bit_carry_satisfies_cpu_air() {
-    let mut side_note = store_load_u64_side_note(PVM_ZONE_SIZE, IsaMode::Conformance);
+    let mut side_note = store_load_u64_side_note(PVM_ZONE_SIZE);
     // Adding width - 1 carries from address byte 2 into byte 3, but does not
     // wrap the u32 address space. This distinguishes MemByteAddrCarry3 from
     // the final carry out of byte 3.
@@ -254,11 +250,21 @@ fn standard_nonwrapping_lower_24_bit_carry_satisfies_cpu_air() {
         .expect("a lower-24-bit carry without u32 wrap must remain valid");
 }
 
+/// An honest low-zone store panics without completing. The prover proves
+/// only runs whose memory instructions complete, so the CPU AIR rejects the
+/// row and proving refuses the trace, as for a page fault
+/// (`memory_negative::faulting_memory_step_is_rejected_before_proof_construction`).
 #[test]
-fn jar_low_zone_access_preserves_frozen_cpu_air_behavior() {
-    let mut side_note = store_load_u64_side_note(0x2000, IsaMode::Jar);
+fn standard_low_zone_access_is_not_provable() {
+    let mut side_note = store_load_u64_side_note(0x2000);
+    assert_eq!(side_note.steps.len(), 1, "the store panics");
+    assert!(side_note.steps[0].mem_write.is_none());
     let chip = CpuChip;
     let trace = chip.generate_component_trace(&mut side_note);
-    assert_chip(&chip, &trace, &side_note)
-        .expect("the Standard-only zone guard must not change frozen Jar memory semantics");
+    assert!(
+        assert_chip(&chip, &trace, &side_note).is_err(),
+        "the CPU AIR accepted a low-zone store"
+    );
+    let mut side_note = store_load_u64_side_note(0x2000);
+    assert!(vos_pvm_proof::prove(&mut side_note).is_err());
 }

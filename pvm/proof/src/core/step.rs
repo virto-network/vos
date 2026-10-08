@@ -65,9 +65,8 @@ pub struct PvmStep {
     pub gas_charged: u64,
     /// Program counter after execution.
     pub next_pc: u32,
-    /// Whether the embedder successfully handled and acknowledged this
-    /// Standard-profile host call. False for non-host instructions,
-    /// unhandled Standard calls, and every frozen JAR-profile instruction.
+    /// Whether the embedder successfully handled and acknowledged this host
+    /// call. False for non-host instructions and unhandled calls.
     pub host_call_acknowledged: bool,
     /// Whether this step caused an exit.
     pub exit: bool,

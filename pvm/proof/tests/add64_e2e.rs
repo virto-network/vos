@@ -30,10 +30,9 @@ fn prove_verify_add64() {
         registers,
         vec![0u8; 4 * 1024 * 1024],
         1000u64,
-        25,
     );
 
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
     assert_eq!(exit, vos_pvm::ExitReason::Panic); // standard opcode 0 => Panic
 

@@ -11,7 +11,7 @@ test:
 
 # Bench guests, built with the guest toolchain in `pvm/guest`.
 build-bench-guests:
-    for guest in [workflows actor agent hash-software hash-precompile] { do { cd $"pvm/bench/guests/($guest)"; cargo build --release --target ../../../guest/riscv64em-vos.json } }
+    for guest in [workflows actor agent hash-software hash-precompile diverse] { do { cd $"pvm/bench/guests/($guest)"; cargo build --release --target ../../../guest/riscv64em-vos.json } }
 
 # Cross-host checks that need the bench guests.
 test-bench: build-bench-guests
@@ -32,15 +32,11 @@ test-proof: build-guests
     cargo test -p vos-pvm-proof --features debug-internals --tests -- --test-threads=2
 
 # Guest programs the prover suites run.
-build-guests: build-settle build-voucher-check
+build-guests: build-settle
 
 # The settlement verifier as a PVM program.
 build-settle:
     cd pvm/proof/settlement-verifier; cargo build --release --target riscv64em-vos.json -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem --features pvm-settle --bin settle
-
-# The voucher-check guest.
-build-voucher-check:
-    cd pvm/proof/fixtures/voucher-check; cargo build --release
 
 fmt-check:
     cargo fmt --all -- --check
@@ -51,7 +47,7 @@ clippy:
 # Fails while any JAR remnant is left in the PVM crates. Joins `ci` once
 # slice 1 step 1.2 is complete.
 jar-check:
-    let hits = (rg -n --glob '!**/target/**' --glob '!**/tests/to-port/**' 'IsaMode::Jar|CapabilityManifest|\blink_elf\b|link_elf_with_argument_pages|run_with_vos_stubs|ECALL_VOS_|VOS_OBJECT_CAP|Opcode::Ecall\b|ExitReason::Ecall|kernel::|vm_pool|JAR\\x02|gp072' pvm | complete); if ($hits.exit_code == 0) { print $hits.stdout; error make { msg: "JAR remnants found" } } else { print "no JAR remnants" }
+    let hits = (rg -n --glob '!**/target/**' 'IsaMode::Jar|CapabilityManifest|\blink_elf\b|link_elf_with_argument_pages|run_with_vos_stubs|ECALL_VOS_|VOS_OBJECT_CAP|Opcode::Ecall\b|ExitReason::Ecall|kernel::|vm_pool|JAR\\x02|\.gp072\.json' pvm | complete); if ($hits.exit_code == 0) { print $hits.stdout; error make { msg: "JAR remnants found" } } else { print "no JAR remnants" }
 
 # Checks before pushing.
 ci: fmt-check clippy test vectors test-bench

@@ -37,9 +37,8 @@ fn trace_branch_eq(
         regs,
         vec![0u8; 4 * 1024 * 1024],
         10_000,
-        25,
     );
-    let mut tr = TracingPvm::new_conformance(pvm);
+    let mut tr = TracingPvm::new(pvm);
     let _ = tr.run();
     (code, bitmask, tr.into_trace())
 }
@@ -80,9 +79,8 @@ fn trace_branch(
         regs,
         vec![0u8; 4 * 1024 * 1024],
         10_000,
-        25,
     );
-    let mut tr = TracingPvm::new_conformance(pvm);
+    let mut tr = TracingPvm::new(pvm);
     let _ = tr.run();
     (code, bitmask, tr.into_trace())
 }

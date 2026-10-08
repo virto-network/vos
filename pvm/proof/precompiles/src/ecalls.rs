@@ -1,15 +1,9 @@
-//! Hostcall ID constants — wire ABI between guest precompile shims
+//! Host-call identifiers — the wire ABI between guest precompile shims
 //! and the prover's `RistrettoChip` / `Blake2bChip` / `RistrettoEcallChip`.
 //!
 //! Always-on (no feature gate): these are tiny integer constants and
 //! both the `ristretto` and `blake2b` modules reference them.  Mirrors
 //! the corresponding constants in `vos_pvm_proof::core::ecall`.
-//!
-//! **Slot range**: vos_pvm's `dispatch_ecalli` rejects `imm > 127` with a
-//! fault, so every precompile ID fits in `0..=127` — packed into the
-//! contiguous `100..=114` block within vos_pvm's program-cap range
-//! (slots 64..=127). The original categorisation by hundreds
-//! (1xx hash, 2xx asymmetric crypto) didn't survive the imm budget.
 
 /// Ristretto255 scalar-mult precompile.
 /// Mirrors `vos_pvm_proof::core::ecall::ECALL_RISTRETTO_SCALAR_MULT`.
@@ -31,13 +25,6 @@ pub const ECALL_SCALAR_ADD_MOD_L: u32 = 114;
 
 /// One blake2b compression per call.
 /// Mirrors `vos_pvm_proof::core::ecall::ECALL_BLAKE2B_COMPRESS`.
-/// Convention: φ[10]=h_ptr (64B in/out), φ[11]=m_ptr (128B in),
-/// φ[12]=t_low (counter low 64 bits), φ[7]=f (finalize flag).
+/// Convention: φ[7]=h_ptr (64B in/out), φ[8]=m_ptr (128B in),
+/// φ[9]=t_low (counter low 64 bits), φ[10]=f (finalize flag).
 pub const ECALL_BLAKE2B_COMPRESS: u32 = 0x400;
-
-/// VOS object capability slot used by the inline-asm ECALL dispatch.
-/// Set into `a5` on every call.  Only referenced from
-/// `cfg(target_arch = "riscv64")` blocks — on host builds it's
-/// unreachable but kept defined for symmetry.
-#[cfg(target_arch = "riscv64")]
-pub(crate) const VOS_OBJECT_CAP: u64 = 65;

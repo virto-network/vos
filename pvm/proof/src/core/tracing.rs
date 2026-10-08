@@ -9,7 +9,6 @@ use crate::core::step::{CompactStep, MemAccess, PvmStep, RegWrite, expand_steps}
 pub use crate::core::ecall::{
     ECALL_BLAKE2B_COMPRESS, ECALL_RISTRETTO_POINT_ADD, ECALL_RISTRETTO_SCALAR_MULT,
     ECALL_SCALAR_ADD_MOD_L, ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE, ECALL_SCALAR_MUL_MOD_L,
-    ECALL_VOS_DEBUG_WRITE,
 };
 
 /// A recorded blake2b call for the precompile chip.
@@ -191,10 +190,6 @@ pub struct RistrettoMemOp {
 
 pub struct TracingPvm {
     pub pvm: Interpreter,
-    /// Instruction profile used both by the interpreter and by witness
-    /// decoding. This is carried into the proof side note so the public
-    /// program commitment binds the same semantics.
-    isa_mode: vos_pvm::IsaMode,
     /// Recorded steps in compact form — the register-file snapshots are
     /// reconstructible from `initial_regs` + the per-step [`RegWrite`]s
     /// (see [`CompactStep`]), so a multi-million-step trace holds ~2.6×
@@ -225,39 +220,10 @@ pub struct TracingPvm {
 }
 
 impl TracingPvm {
-    /// Trace an initialized interpreter without changing its ISA profile.
-    ///
-    /// This preservation is security-critical for interpreters returned by
-    /// container adapters: feeding a capability-manifest interpreter through
-    /// this general constructor must not silently switch it to standard v0.8.
+    /// Trace an initialized interpreter.
     pub fn new(pvm: Interpreter) -> Self {
-        let isa_mode = pvm.isa_mode();
-        Self::new_with_isa_mode(pvm, isa_mode)
-    }
-
-    /// Trace a canonical standard PVM program under the Gray Paper v0.8 ISA.
-    pub fn new_conformance(pvm: Interpreter) -> Self {
-        Self::new_with_isa_mode(pvm, vos_pvm::IsaMode::Conformance)
-    }
-
-    /// Trace a transitional capability-manifest program under its frozen
-    /// execution profile. Prefer this named constructor at container
-    /// boundaries so callers do not need to manufacture a profile tag.
-    pub fn new_capability_manifest(pvm: Interpreter) -> Self {
-        Self::new_with_isa_mode(pvm, vos_pvm::IsaMode::Jar)
-    }
-
-    /// Trace under an explicitly selected ISA profile.
-    ///
-    /// Capability-manifest Tasks must use [`vos_pvm::IsaMode::Jar`]; their
-    /// frozen unary numbering differs from the standard v0.8 table. Blob
-    /// entry points select this from the authenticated container rather than
-    /// accepting a caller-provided guess.
-    pub fn new_with_isa_mode(mut pvm: Interpreter, isa_mode: vos_pvm::IsaMode) -> Self {
-        pvm.set_isa_mode(isa_mode);
         Self {
             pvm,
-            isa_mode,
             steps: Vec::new(),
             initial_regs: None,
             last_regs: [0u64; PVM_REGISTER_COUNT],
@@ -273,11 +239,6 @@ impl TracingPvm {
             scalar_binop_mem_ops: Vec::new(),
             timestamp: 1, // 0 is reserved for initial memory entries
         }
-    }
-
-    /// The profile whose semantics this trace records.
-    pub fn isa_mode(&self) -> vos_pvm::IsaMode {
-        self.isa_mode
     }
 
     /// Execute a single step, recording the witness.
@@ -309,7 +270,7 @@ impl TracingPvm {
         } else {
             0
         };
-        let opcode = Opcode::from_byte_in_mode(opcode_byte, self.isa_mode).unwrap_or(Opcode::Trap);
+        let opcode = Opcode::from_byte(opcode_byte).unwrap_or(Opcode::Trap);
         let skip_len = compute_skip(&self.pvm.bitmask, pc_before as usize);
         let category = opcode.category();
         let decoded_args = args::decode_args(
@@ -409,140 +370,56 @@ impl TracingPvm {
         }
     }
 
-    /// Run with precompile support. Blake2b ecalls are intercepted,
-    /// executed natively, and recorded for the Blake2bChip.
-    /// Ristretto255 scalar-mult ecalls are similarly intercepted and
-    /// recorded for the (in-progress) RistrettoChip.
+    /// Run with precompile support: precompile calls are intercepted,
+    /// executed natively, recorded for their chips and acknowledged. Any
+    /// other exit, including an unknown host call, is returned.
     pub fn run_with_precompiles(&mut self) -> ExitReason {
         loop {
-            if let Some(exit) = self.step() {
-                match exit {
-                    ExitReason::HostCall(id) if id == u64::from(ECALL_BLAKE2B_COMPRESS) => {
-                        self.handle_blake2b_ecall();
-                        self.acknowledge_handled_host_call();
-                    }
-                    ExitReason::HostCall(id) if id == u64::from(ECALL_RISTRETTO_SCALAR_MULT) => {
-                        self.handle_ristretto_scalar_mult_ecall();
-                        self.acknowledge_handled_host_call();
-                    }
-                    ExitReason::HostCall(id) if id == u64::from(ECALL_RISTRETTO_POINT_ADD) => {
-                        self.handle_ristretto_point_add_ecall();
-                        self.acknowledge_handled_host_call();
-                    }
-                    ExitReason::HostCall(id)
-                        if id == u64::from(ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE) =>
-                    {
-                        self.handle_scalar_reduce_wide_ecall();
-                        self.acknowledge_handled_host_call();
-                    }
-                    ExitReason::HostCall(id) if id == u64::from(ECALL_SCALAR_MUL_MOD_L) => {
-                        self.handle_scalar_binop_ecall(ECALL_SCALAR_MUL_MOD_L);
-                        self.acknowledge_handled_host_call();
-                    }
-                    ExitReason::HostCall(id) if id == u64::from(ECALL_SCALAR_ADD_MOD_L) => {
-                        self.handle_scalar_binop_ecall(ECALL_SCALAR_ADD_MOD_L);
-                        self.acknowledge_handled_host_call();
-                    }
-                    other => return other,
-                }
-            }
-        }
-    }
-
-    /// Run with stub handlers for the JAM/VOS lifecycle hostcalls so a
-    /// vos-style actor can be driven cold-start by a bare interpreter.
-    /// Stubbed: `INFO=6`, `STORAGE_R=4`, `FETCH=2`, `OUTPUT=26`,
-    /// `DEBUG_WRITE=118`, `STORAGE_W=5`, `GAS=1` — all return 0 in φ[7].
-    /// Blake2b ecalls are still intercepted and executed natively. Unknown
-    /// hostcall IDs propagate as-is.
-    pub fn run_with_vos_stubs(&mut self) -> ExitReason {
-        loop {
-            if let Some(exit) = self.step_with_vos_stubs() {
+            if let Some(exit) = self.step_with_precompiles() {
                 return exit;
             }
         }
     }
 
-    /// One iteration of [`Self::run_with_vos_stubs`]: execute exactly one
-    /// recorded step, intercept + natively execute the precompile ECALLs,
-    /// swallow the stubbed lifecycle hostcalls, and return `Some(exit)`
-    /// only when the run TERMINATES (with exactly the `ExitReason`
-    /// `run_with_vos_stubs` would return). Lets a streaming driver
-    /// ([`crate::segment::TracingSource`]) pump the tracer step by step —
-    /// draining each recorded step as it lands — while the run-to-
-    /// completion path stays a loop over this, so the two cannot diverge.
-    pub fn step_with_vos_stubs(&mut self) -> Option<ExitReason> {
+    /// One iteration of [`Self::run_with_precompiles`]: execute exactly one
+    /// recorded step, execute and acknowledge a precompile call, and return
+    /// `Some(exit)` only when the run terminates. Lets a streaming driver
+    /// ([`crate::segment::TracingSource`]) pump the tracer step by step while
+    /// the run-to-completion path stays a loop over this, so the two cannot
+    /// diverge.
+    pub fn step_with_precompiles(&mut self) -> Option<ExitReason> {
         let exit = self.step()?;
         match exit {
             ExitReason::HostCall(id) if id == u64::from(ECALL_BLAKE2B_COMPRESS) => {
                 self.handle_blake2b_ecall();
-                self.acknowledge_handled_host_call();
-                None
             }
             ExitReason::HostCall(id) if id == u64::from(ECALL_RISTRETTO_SCALAR_MULT) => {
                 self.handle_ristretto_scalar_mult_ecall();
-                self.acknowledge_handled_host_call();
-                None
             }
             ExitReason::HostCall(id) if id == u64::from(ECALL_RISTRETTO_POINT_ADD) => {
                 self.handle_ristretto_point_add_ecall();
-                self.acknowledge_handled_host_call();
-                None
             }
             ExitReason::HostCall(id) if id == u64::from(ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE) => {
                 self.handle_scalar_reduce_wide_ecall();
-                self.acknowledge_handled_host_call();
-                None
             }
             ExitReason::HostCall(id) if id == u64::from(ECALL_SCALAR_MUL_MOD_L) => {
                 self.handle_scalar_binop_ecall(ECALL_SCALAR_MUL_MOD_L);
-                self.acknowledge_handled_host_call();
-                None
             }
             ExitReason::HostCall(id) if id == u64::from(ECALL_SCALAR_ADD_MOD_L) => {
                 self.handle_scalar_binop_ecall(ECALL_SCALAR_ADD_MOD_L);
-                self.acknowledge_handled_host_call();
-                None
             }
-            ExitReason::HostCall(id) => match id {
-                // Slot 0 is nested CALL/REPLY, never root termination. Match
-                // the JAVM kernel: a root REPLY has no caller and panics.
-                0 => Some(ExitReason::Panic),
-                // GAS, FETCH, STORAGE_R, STORAGE_W, INFO,
-                // DEBUG_WRITE, OUTPUT — leave registers
-                // untouched so the RegisterMemoryChip ledger
-                // stays balanced.  The actor reads whatever is
-                // already in φ[7], which for these "lucky"
-                // hostcalls (zeroed at PVM cold start) means
-                // it sees 0 — i.e. no service_id, no persisted
-                // state, no fetched message.  Same effect as a
-                // proper stub but without disturbing the
-                // register ledger.
-                1 | 2 | 4 | 5 | 6 | 26 => {
-                    self.acknowledge_handled_host_call();
-                    None
-                }
-                value if value == u64::from(ECALL_VOS_DEBUG_WRITE) => {
-                    self.acknowledge_handled_host_call();
-                    None
-                }
-                _ => Some(ExitReason::HostCall(id)),
-            },
-            // Opcode-3 Ecall is outside the GP conformance ISA. Old VOS blobs
-            // used it as another halt shortcut; current canonical actors halt
-            // only by dynamically jumping to the GP halt address.
-            ExitReason::Ecall => Some(ExitReason::Panic),
-            other => Some(other),
+            other => return Some(other),
         }
+        self.acknowledge_handled_host_call();
+        None
     }
 
     /// Commit the continuation of a host call that this tracer handled.
     ///
-    /// Standard `ecalli` deliberately leaves the interpreter at its cause PC
-    /// until the embedder acknowledges the call. Capability/JAR execution is
-    /// frozen with its historical already-advanced PC, so acknowledgment is a
-    /// no-op there. Keeping this after the handler prevents failed or unknown
-    /// host calls from being consumed accidentally.
+    /// `ecalli` deliberately leaves the interpreter at its cause PC until the
+    /// embedder acknowledges the call. Keeping this after the handler
+    /// prevents failed or unknown host calls from being consumed
+    /// accidentally.
     fn acknowledge_handled_host_call(&mut self) {
         let pending = self.pvm.pending_host_call();
         if let Some(call) = pending {
@@ -552,15 +429,9 @@ impl TracingPvm {
                 call.id,
             );
         }
-        let resumed = self.pvm.resume_after_host_call();
-        assert_eq!(
-            resumed,
-            self.isa_mode == vos_pvm::IsaMode::Conformance,
-            "handled host-call continuation disagrees with the tracer ISA profile",
-        );
-
-        if resumed {
-            let call = pending.expect("a resumed standard host call must have pending evidence");
+        let call = pending.expect("a handled host call must be pending");
+        assert!(self.pvm.resume_after_host_call());
+        {
             let step = self
                 .steps
                 .last_mut()
@@ -722,9 +593,8 @@ impl TracingPvm {
     fn handle_scalar_binop_ecall(&mut self, op_id: u32) {
         // PVM A0/A1/A2 = φ[7/8/9] per grey-transpiler's mapping.  The
         // shim's `in("a0") a_ptr, in("a1") b_ptr, in("a2") output_ptr`
-        // routes pointers to those PVM registers — not a3/a4/a5
-        // (φ[10/11/12]), which the shim pads with `0, 0, VOS_OBJECT_CAP`.
-        // No CpuChip-side binding tuple, so this is handler-only.
+        // routes pointers to those PVM registers. No CpuChip-side binding
+        // tuple, so this is handler-only.
         let a_ptr_u = self.pvm.registers[7] as usize;
         let b_ptr_u = self.pvm.registers[8] as usize;
         let output_ptr_u = self.pvm.registers[9] as usize;
@@ -884,7 +754,7 @@ impl TracingPvm {
 
     /// Drain the OLDEST retained recorded step — the streaming drivers'
     /// keep-the-tracer-empty primitive: a driver that pumps
-    /// [`Self::step_with_vos_stubs`] takes each step out as it lands, so
+    /// [`Self::step_with_precompiles`] takes each step out as it lands, so
     /// the tracer never accumulates the trace it is producing. Draining
     /// removes the step from [`Self::trace`]/[`Self::into_trace`]'s view;
     /// mixing drained and run-to-completion consumption of one tracer is
@@ -913,33 +783,27 @@ impl TracingPvm {
     /// Consume and return the recorded trace as full steps.
     ///
     /// This is an analysis-level escape hatch: the returned steps do not carry
-    /// the interpreter's ISA profile or precompile records. Proof-building
-    /// callers should use [`Self::into_side_note`] so a capability-manifest
-    /// trace cannot silently fall back to the standard profile.
+    /// the precompile records. Proof-building callers should use
+    /// [`Self::into_side_note`].
     pub fn into_trace(self) -> Vec<PvmStep> {
         let regs = self.initial_regs();
         expand_steps(&self.steps, regs)
     }
 
-    /// Consume this trace into a proof [`crate::SideNote`], preserving the
-    /// interpreter's ISA profile and every recorded precompile boundary.
+    /// Consume this trace into a proof [`crate::SideNote`], preserving every
+    /// recorded precompile boundary.
     ///
-    /// Program bytes, instruction starts, jump table, and profile come from the
+    /// Program bytes, instruction starts and jump table come from the
     /// interpreter itself, so a caller cannot accidentally pair the recorded
     /// steps with a different static program view. Initial memory remains
     /// explicit because the interpreter contains the post-execution image;
     /// attach the saved entering image with `SideNote::with_memory`.
-    /// Keeping profile transfer inside this consuming operation prevents the
-    /// unsafe `into_trace()` followed by profile-defaulting `SideNote::new()`
-    /// pattern at capability-container boundaries.
     pub fn into_side_note(self) -> crate::SideNote {
         let code = self.pvm.code.clone();
         let bitmask = self.pvm.bitmask.clone();
         let jump_table = self.pvm.jump_table.clone();
         let steps = self.trace();
-        let mut side_note = crate::SideNote::new(steps, code, bitmask)
-            .with_isa_mode(self.isa_mode)
-            .with_jump_table(jump_table);
+        let mut side_note = crate::SideNote::new(steps, code, bitmask).with_jump_table(jump_table);
         side_note.blake2b_calls = self
             .blake2b_records
             .into_iter()
@@ -1550,9 +1414,8 @@ mod tests {
             registers,
             vec![0; vos_pvm::PVM_ZONE_SIZE as usize],
             10_000,
-            25,
         );
-        let mut tracing = TracingPvm::new_conformance(pvm);
+        let mut tracing = TracingPvm::new(pvm);
         let exit = tracing.step().expect("memory instruction must be rejected");
         let mut steps = tracing.into_trace();
         assert_eq!(steps.len(), 1);
@@ -1616,9 +1479,8 @@ mod tests {
                 [0; PVM_REGISTER_COUNT],
                 vec![0; vos_pvm::PVM_ZONE_SIZE as usize],
                 10_000,
-                25,
             );
-            let mut tracing = TracingPvm::new_conformance(pvm);
+            let mut tracing = TracingPvm::new(pvm);
             assert_eq!(tracing.run(), ExitReason::HostCall(*expected));
             let trace = tracing.into_trace();
             assert_eq!(trace.len(), 1);
@@ -1626,33 +1488,13 @@ mod tests {
         }
     }
 
-    fn vos_stub_program(call: u32) -> TracingPvm {
-        use vos_pvm_compiler::assembler::{Assembler, Reg};
-
-        let mut assembler = Assembler::new();
-        assembler
-            .ecalli(call)
-            .load_imm_64(Reg::T0, vos_pvm::PVM_HALT_ADDR)
-            .jump_ind(Reg::T0, 0);
-        let blob = assembler.build();
-        let (interpreter, _) = crate::actor::interpreter_from_blob(&blob, 1_000_000)
-            .expect("assembler program is a valid PVM blob");
-        TracingPvm::new(interpreter)
-    }
-
     #[test]
-    fn vos_stub_accepts_supplied_debug_capability_but_not_reserved_slot() {
-        let mut current = vos_stub_program(ECALL_VOS_DEBUG_WRITE);
-        assert_eq!(current.run_with_vos_stubs(), ExitReason::Halt);
-
-        let mut reserved = vos_stub_program(11);
-        assert_eq!(reserved.run_with_vos_stubs(), ExitReason::HostCall(11));
-        assert_eq!(reserved.num_steps(), 1);
-    }
-
-    #[test]
-    fn vos_stub_acknowledges_standard_host_call_before_continuing() {
-        let code = vec![Opcode::Ecalli as u8, 1, Opcode::Trap as u8];
+    fn precompile_call_is_acknowledged_before_continuing() {
+        let code = vec![
+            Opcode::Ecalli as u8,
+            ECALL_SCALAR_ADD_MOD_L as u8,
+            Opcode::Trap as u8,
+        ];
         let bitmask = vec![1, 0, 1];
         let pvm = Interpreter::new(
             code,
@@ -1661,11 +1503,10 @@ mod tests {
             [0; PVM_REGISTER_COUNT],
             vec![0; vos_pvm::PVM_ZONE_SIZE as usize],
             10_000,
-            25,
         );
-        let mut tracing = TracingPvm::new_conformance(pvm);
+        let mut tracing = TracingPvm::new(pvm);
 
-        assert_eq!(tracing.step_with_vos_stubs(), None);
+        assert_eq!(tracing.step_with_precompiles(), None);
         assert_eq!(tracing.pvm.pc, 2, "handled call must advance exactly once");
         assert!(tracing.pvm.pending_host_call().is_none());
         assert_eq!(
@@ -1677,7 +1518,7 @@ mod tests {
             tracing.trace()[0].host_call_acknowledged,
             "acknowledgment disposition must survive compact expansion",
         );
-        assert_eq!(tracing.step_with_vos_stubs(), Some(ExitReason::Panic));
+        assert_eq!(tracing.step_with_precompiles(), Some(ExitReason::Panic));
         assert_eq!(tracing.num_steps(), 2, "execution must not replay ecalli");
     }
 
@@ -1692,11 +1533,10 @@ mod tests {
             [0; PVM_REGISTER_COUNT],
             vec![0; vos_pvm::PVM_ZONE_SIZE as usize],
             10_000,
-            25,
         );
-        let mut tracing = TracingPvm::new_conformance(pvm);
+        let mut tracing = TracingPvm::new(pvm);
 
-        assert_eq!(tracing.run_with_vos_stubs(), ExitReason::HostCall(11));
+        assert_eq!(tracing.run_with_precompiles(), ExitReason::HostCall(11));
         assert_eq!(tracing.pvm.pc, 0, "unhandled call must remain pending");
         assert_eq!(
             tracing.pvm.pending_host_call(),
@@ -1712,12 +1552,6 @@ mod tests {
             trace[0].next_pc, 0,
             "unhandled row must expose the cause PC",
         );
-    }
-
-    #[test]
-    fn vos_stub_rejects_retired_root_reply_termination() {
-        let mut tracing = vos_stub_program(0);
-        assert_eq!(tracing.run_with_vos_stubs(), ExitReason::Panic);
     }
 
     #[test]

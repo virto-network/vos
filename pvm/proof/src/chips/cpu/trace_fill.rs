@@ -55,35 +55,28 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         trace.fill_columns(row, step.timestamp, Column::Timestamp);
         trace.fill_columns_bytes(row, &step.pc.to_le_bytes(), Column::Pc);
         trace.fill_columns_bytes(row, &step.next_pc.to_le_bytes(), Column::NextPc);
-        // Commit the exact encoded byte, not the semantic enum. Jar unaries
-        // deliberately use shifted bytes, and invalid bytes must not alias
-        // canonical Trap in the public program commitment.
+        // Commit the exact encoded byte, not the semantic enum: invalid
+        // bytes must not alias canonical Trap in the public program
+        // commitment.
         let encoded_opcode = side_note
             .code
             .get(step.pc as usize)
             .copied()
             .unwrap_or_default();
         trace.fill_columns(row, encoded_opcode, Column::Opcode);
-        trace.fill_columns(
-            row,
-            crate::side_note::isa_profile_tag(side_note.isa_mode),
-            Column::IsaProfile,
-        );
+        trace.fill_columns(row, crate::side_note::ISA_PROFILE_TAG, Column::IsaProfile);
         trace.fill_columns(row, step.skip_len as u8, Column::SkipLen);
         // 8-byte immediate witness for the ProgramMemory lookup.
         trace.fill_columns_bytes(row, &step.imm.to_le_bytes(), Column::ImmBytes);
-        let host_call_allowed = side_note.isa_mode == vos_pvm::IsaMode::Conformance
-            && step.opcode == crate::core::opcode::Opcode::Ecalli
+        let host_call_allowed = step.opcode == crate::core::opcode::Opcode::Ecalli
             && crate::core::ecall::is_proof_host_call_allowed(step.imm);
         trace.fill_columns(row, host_call_allowed, Column::HostCallAllowed);
-        let host_call_precompile_dispatch = if matches!(
-            step.opcode,
-            crate::core::opcode::Opcode::Ecalli | crate::core::opcode::Opcode::Ecall
-        ) {
-            crate::core::ecall::proof_precompile_dispatch_id(step.imm)
-        } else {
-            0
-        };
+        let host_call_precompile_dispatch =
+            if matches!(step.opcode, crate::core::opcode::Opcode::Ecalli) {
+                crate::core::ecall::proof_precompile_dispatch_id(step.imm)
+            } else {
+                0
+            };
         trace.fill_columns(
             row,
             host_call_precompile_dispatch,
@@ -1264,8 +1257,7 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         // the carry for the authenticated opcode width, so derive the same
         // final-byte offset from classification rather than trusting
         // `MemAccess::size` here.
-        let is_standard_mem = side_note.isa_mode == vos_pvm::IsaMode::Conformance
-            && (flags.is_load || flags.is_store);
+        let is_standard_mem = flags.is_load || flags.is_store;
         trace.fill_columns(row, is_standard_mem, Column::IsStandardMemH);
         let address = mem.map(|m| m.address).unwrap_or(0);
         let last_offset = if flags.is_mem_size_1 {
@@ -1324,23 +1316,16 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         // semantics) to avoid renaming across files, at the cost of a
         // little local confusion (the column comments below carry the
         // slot's actual semantic meaning).
-        let precompile_continues =
-            side_note.isa_mode == vos_pvm::IsaMode::Jar || step.host_call_acknowledged;
+        let precompile_continues = step.host_call_acknowledged;
         let is_blake_ecall = precompile_continues
-            && matches!(
-                step.opcode,
-                crate::core::opcode::Opcode::Ecalli | crate::core::opcode::Opcode::Ecall
-            )
+            && matches!(step.opcode, crate::core::opcode::Opcode::Ecalli)
             && step.imm == ECALL_BLAKE2B_COMPRESS as u64;
         trace.fill_columns(row, is_blake_ecall, Column::IsBlakeEcall);
         // Ristretto ECALL gates: one boolean per id.
         // Same imm-match shape as IsBlakeEcall; the operand pointers reuse the
         // Phi10/Phi11/Phi12 slots (= regs_before[7,8,9]) filled below.
-        let is_ecall = precompile_continues
-            && matches!(
-                step.opcode,
-                crate::core::opcode::Opcode::Ecalli | crate::core::opcode::Opcode::Ecall
-            );
+        let is_ecall =
+            precompile_continues && matches!(step.opcode, crate::core::opcode::Opcode::Ecalli);
         trace.fill_columns(
             row,
             is_ecall && step.imm == ECALL_RISTRETTO_SCALAR_MULT as u64,
@@ -1889,24 +1874,16 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             Column::IsShiftCNotRotrH,
         );
 
-        // ── Soft host-call disposition ──
-        // Standard ECALLI retains its cause PC until the proof runtime
-        // handles it; JAR Ecall/Ecalli keep the frozen already-advanced PC.
-        // The AIR authenticates the opcode class/profile and the static
-        // HostCallAllowed policy bit before accepting this acknowledgment.
-        let soft_host_exit =
-            flags.is_exit && !flags.is_trap && !flags.is_jump_ind && !flags.is_load_imm_jump_ind;
+        // ── Host-call disposition ──
+        // ECALLI retains its cause PC until the proof runtime handles it. The
+        // AIR authenticates the opcode class and the static HostCallAllowed
+        // policy bit before accepting this acknowledgment.
         trace.fill_columns(
             row,
             step.host_call_acknowledged,
             Column::HostCallAcknowledged,
         );
-        trace.fill_columns(
-            row,
-            side_note.isa_mode == vos_pvm::IsaMode::Jar && soft_host_exit
-                || step.host_call_acknowledged,
-            Column::HostCallContinuesH,
-        );
+        trace.fill_columns(row, step.host_call_acknowledged, Column::HostCallContinuesH);
     }
 
     for &b in &range_bytes {

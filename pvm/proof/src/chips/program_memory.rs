@@ -80,7 +80,7 @@ pub enum PreprocessedColumn {
     /// raw byte prevents invalid encodings from aliasing canonical Trap.
     #[size = 1]
     Opcode,
-    /// 0 = standard Gray Paper v0.8, 1 = frozen capability-manifest ISA.
+    /// ISA profile tag: always 0, the Gray Paper v0.8 profile.
     #[size = 1]
     IsaProfile,
     /// Skip length ℓ — distance to the next basic-block start (0 for
@@ -237,10 +237,10 @@ impl BuiltInProverComponent for ProgramMemoryChip {
             let bbs = (row < side_note.code.len())
                 && side_note.bitmask.get(row).copied().unwrap_or(0) == 1;
             if bbs {
-                let d = decode_at(&side_note.code, &side_note.bitmask, row, side_note.isa_mode);
+                let d = decode_at(&side_note.code, &side_note.bitmask, row);
                 trace.fill_columns(
                     row,
-                    crate::side_note::isa_profile_tag(side_note.isa_mode),
+                    crate::side_note::ISA_PROFILE_TAG,
                     PreprocessedColumn::IsaProfile,
                 );
                 trace.fill_columns(row, d.opcode, PreprocessedColumn::Opcode);
@@ -432,12 +432,12 @@ pub(crate) fn pack_flags(flags: &[u8; 48]) -> [u8; 6] {
 /// table 1:1 reproduces what CpuChip's main columns hold for the matching
 /// step.  Used only at preprocessed-trace generation, hence prover-only.
 #[cfg(feature = "prover")]
-fn decode_at(code: &[u8], bitmask: &[u8], pc: usize, isa_mode: vos_pvm::IsaMode) -> Decoded {
+fn decode_at(code: &[u8], bitmask: &[u8], pc: usize) -> Decoded {
     use vos_pvm::args;
     use vos_pvm::instruction::Opcode;
 
     let opcode_byte = code[pc];
-    let opcode = Opcode::from_byte_in_mode(opcode_byte, isa_mode).unwrap_or(Opcode::Trap);
+    let opcode = Opcode::from_byte(opcode_byte).unwrap_or(Opcode::Trap);
     let category = opcode.category();
     let skip_len = crate::core::tracing::compute_skip(bitmask, pc);
     let decoded_args = args::decode_args(code, pc, skip_len as usize, category);
@@ -446,10 +446,9 @@ fn decode_at(code: &[u8], bitmask: &[u8], pc: usize, isa_mode: vos_pvm::IsaMode)
     let imm_y = crate::core::tracing::decode_imm_y(&decoded_args);
     let branch_target_canon = crate::core::tracing::decode_branch_target(&decoded_args);
     let f = crate::chips::cpu::classify_opcode_for_program_memory(opcode);
-    let host_call_allowed = isa_mode == vos_pvm::IsaMode::Conformance
-        && opcode == Opcode::Ecalli
-        && crate::core::ecall::is_proof_host_call_allowed(imm);
-    let host_call_precompile_dispatch = if matches!(opcode, Opcode::Ecalli | Opcode::Ecall) {
+    let host_call_allowed =
+        opcode == Opcode::Ecalli && crate::core::ecall::is_proof_host_call_allowed(imm);
+    let host_call_precompile_dispatch = if matches!(opcode, Opcode::Ecalli) {
         crate::core::ecall::proof_precompile_dispatch_id(imm)
     } else {
         0

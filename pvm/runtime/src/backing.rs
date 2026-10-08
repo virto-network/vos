@@ -1,45 +1,28 @@
-//! Physical memory pool for the capability-based JAVM.
+//! Native guest memory for the JIT.
 //!
-//! On Linux x86-64 a `memfd_create` file descriptor backs the pool:
-//! - MAP: `mmap(MAP_SHARED|MAP_FIXED)` pages into a CODE cap's 4GB window
-//! - UNMAP: replace mapped region with `PROT_NONE` anonymous pages
-//!
-//! On other platforms (e.g. macOS ARM64) the pool uses a heap-allocated
-//! `Vec<u8>`. MAP/UNMAP copy data in/out rather than remapping shared
-//! physical pages. Zero-copy grant/revoke is not available, but all
-//! interpreter-based tests pass correctly.
-//!
-//! All VMs in an invocation share the same backing store. DATA caps
-//! reference offsets into this store.
-
-use alloc::{vec, vec::Vec};
+//! A `memfd_create` file descriptor backs a guest's memory so that the same
+//! pages can be mapped twice: once into the JIT's protected 4 GiB window and
+//! once as an unprotected host alias (see `recompiler::memory`).
 
 use crate::PVM_PAGE_SIZE;
-use crate::cap::Access;
 
-/// 4GB virtual address space per CODE cap window.
+/// 4GB virtual address space per JIT window.
 pub const CODE_WINDOW_SIZE: usize = 1 << 32;
 /// One permission byte per 4 KiB guest page.
 pub const CODE_WINDOW_PERMS_SIZE: usize = CODE_WINDOW_SIZE / PVM_PAGE_SIZE as usize;
 /// Writable page containing the native JIT context immediately before RAM.
 pub const CODE_WINDOW_CTX_SIZE: usize = 4096;
-/// Metadata prefix shared by standalone and kernel JIT windows.
+/// Metadata prefix before guest memory.
 pub const CODE_WINDOW_HEADER_SIZE: usize = CODE_WINDOW_PERMS_SIZE + CODE_WINDOW_CTX_SIZE;
 /// Inaccessible native page after the 32-bit guest address space.
 pub const CODE_WINDOW_GUARD_SIZE: usize = 4096;
 
-// ─── Linux x86-64: memfd + mmap ───────────────────────────────────────────
-
-/// A memfd-backed physical memory pool.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+/// A memfd-backed pool of guest pages.
 pub struct BackingStore {
     /// File descriptor from `memfd_create`.
     fd: i32,
-    /// Total pages in the pool.
-    total_pages: u32,
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 impl BackingStore {
     /// Create a new backing store with `total_pages` of capacity.
     ///
@@ -63,198 +46,15 @@ impl BackingStore {
             unsafe { libc::close(fd) };
             return None;
         }
-        Some(Self { fd, total_pages })
-    }
-
-    /// Total pages in the pool.
-    pub fn total_pages(&self) -> u32 {
-        self.total_pages
+        Some(Self { fd })
     }
 
     /// The raw file descriptor (for mmap calls).
     pub fn fd(&self) -> i32 {
         self.fd
     }
-
-    /// Copy one physical page out of the backing store.
-    pub fn read_page(&self, page_index: u32) -> Option<Vec<u8>> {
-        if page_index >= self.total_pages {
-            return None;
-        }
-        let len = PVM_PAGE_SIZE as usize;
-        let offset = page_index as libc::off_t * PVM_PAGE_SIZE as libc::off_t;
-        // SAFETY: the memfd was truncated to `total_pages * PVM_PAGE_SIZE`.
-        let ptr = unsafe {
-            libc::mmap(
-                core::ptr::null_mut(),
-                len,
-                libc::PROT_READ,
-                libc::MAP_SHARED,
-                self.fd,
-                offset,
-            )
-        };
-        if ptr == libc::MAP_FAILED {
-            return None;
-        }
-        let mut bytes = vec![0u8; len];
-        // SAFETY: both regions are valid for exactly one page and do not overlap.
-        unsafe {
-            core::ptr::copy_nonoverlapping(ptr.cast::<u8>(), bytes.as_mut_ptr(), len);
-            libc::munmap(ptr, len);
-        }
-        Some(bytes)
-    }
-
-    /// Replace one physical page in the backing store.
-    pub fn write_page(&mut self, page_index: u32, bytes: &[u8]) -> bool {
-        page_index < self.total_pages
-            && bytes.len() == PVM_PAGE_SIZE as usize
-            && self.write_init_data(page_index, bytes)
-    }
-
-    /// Map pages from the backing store into a CODE cap's window.
-    ///
-    /// # Safety
-    /// `window_base` must point to a valid 4GB mmap region.
-    pub unsafe fn map_pages(
-        &self,
-        window_base: *mut u8,
-        base_page: u32,
-        backing_offset: u32,
-        page_count: u32,
-        access: Access,
-    ) -> bool {
-        let Some(end_page) = base_page.checked_add(page_count) else {
-            return false;
-        };
-        let Some(end_backing) = backing_offset.checked_add(page_count) else {
-            return false;
-        };
-        if end_page as usize > CODE_WINDOW_PERMS_SIZE || end_backing > self.total_pages {
-            return false;
-        }
-        if page_count == 0 {
-            return true;
-        }
-        // SAFETY: caller guarantees window_base is a valid 4GB mmap region.
-        unsafe {
-            let addr = window_base.add(base_page as usize * PVM_PAGE_SIZE as usize);
-            let len = page_count as usize * PVM_PAGE_SIZE as usize;
-            let prot = match access {
-                Access::RO => libc::PROT_READ,
-                Access::RW => libc::PROT_READ | libc::PROT_WRITE,
-            };
-            let offset = backing_offset as libc::off_t * PVM_PAGE_SIZE as libc::off_t;
-
-            let result = libc::mmap(
-                addr as *mut libc::c_void,
-                len,
-                prot,
-                libc::MAP_SHARED | libc::MAP_FIXED,
-                self.fd,
-                offset,
-            );
-            if result == libc::MAP_FAILED {
-                return false;
-            }
-
-            // The permission table is part of the same CodeWindow mapping,
-            // immediately before its JIT context. Updating it only after the
-            // guest mmap succeeds keeps generated software preflights in
-            // lockstep with the hardware page protections.
-            let perms = window_base.sub(CODE_WINDOW_HEADER_SIZE);
-            let encoded = match access {
-                Access::RO => 1,
-                Access::RW => 2,
-            };
-            core::ptr::write_bytes(perms.add(base_page as usize), encoded, page_count as usize);
-            true
-        }
-    }
-
-    /// Unmap pages from a CODE cap's window (replace with PROT_NONE).
-    ///
-    /// # Safety
-    /// `window_base` must point to a valid 4GB mmap region.
-    pub unsafe fn unmap_pages(window_base: *mut u8, base_page: u32, page_count: u32) -> bool {
-        let Some(end_page) = base_page.checked_add(page_count) else {
-            return false;
-        };
-        if end_page as usize > CODE_WINDOW_PERMS_SIZE {
-            return false;
-        }
-        if page_count == 0 {
-            return true;
-        }
-        // SAFETY: caller guarantees window_base is a valid 4GB mmap region.
-        unsafe {
-            let addr = window_base.add(base_page as usize * PVM_PAGE_SIZE as usize);
-            let len = page_count as usize * PVM_PAGE_SIZE as usize;
-
-            let result = libc::mmap(
-                addr as *mut libc::c_void,
-                len,
-                libc::PROT_NONE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED | libc::MAP_NORESERVE,
-                -1,
-                0,
-            );
-            if result == libc::MAP_FAILED {
-                return false;
-            }
-            let perms = window_base.sub(CODE_WINDOW_HEADER_SIZE);
-            core::ptr::write_bytes(perms.add(base_page as usize), 0, page_count as usize);
-            true
-        }
-    }
-
-    /// Write initial data into the backing store at a given page offset.
-    ///
-    /// This writes directly to the memfd via a temporary mmap, then unmaps.
-    /// Used during program init to load DATA cap contents from the blob.
-    pub fn write_init_data(&self, backing_offset: u32, data: &[u8]) -> bool {
-        if data.is_empty() {
-            return true;
-        }
-        let Some(start) = (backing_offset as usize).checked_mul(PVM_PAGE_SIZE as usize) else {
-            return false;
-        };
-        let Some(end) = start.checked_add(data.len()) else {
-            return false;
-        };
-        let Some(capacity) = (self.total_pages as usize).checked_mul(PVM_PAGE_SIZE as usize) else {
-            return false;
-        };
-        if end > capacity {
-            return false;
-        }
-        let offset = backing_offset as libc::off_t * PVM_PAGE_SIZE as libc::off_t;
-        let len = data.len();
-        // SAFETY: fd is valid, offset is within ftruncate'd range (caller ensures).
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                self.fd,
-                offset,
-            )
-        };
-        if ptr == libc::MAP_FAILED {
-            return false;
-        }
-        // SAFETY: ptr is a valid mmap'd region of `len` bytes; data.len() == len.
-        unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut u8, len);
-            libc::munmap(ptr, len);
-        }
-        true
-    }
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 impl Drop for BackingStore {
     fn drop(&mut self) {
         // SAFETY: fd is valid from memfd_create in new().
@@ -262,134 +62,19 @@ impl Drop for BackingStore {
     }
 }
 
-// ─── Non-Linux: heap-backed fallback ──────────────────────────────────────
-
-/// On non-Linux platforms the pool lives in a `Vec<u8>`.
-/// MAP copies pages from the pool into the `CodeWindow` buffer;
-/// UNMAP zeroes them out. No shared-physical-page trick available,
-/// but the interpreter path works correctly.
-#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-pub struct BackingStore {
-    data: Vec<u8>,
-    total_pages: u32,
-}
-
-#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-impl BackingStore {
-    pub fn new(total_pages: u32) -> Option<Self> {
-        let size = total_pages as usize * PVM_PAGE_SIZE as usize;
-        Some(Self {
-            data: vec![0u8; size],
-            total_pages,
-        })
-    }
-
-    pub fn total_pages(&self) -> u32 {
-        self.total_pages
-    }
-
-    /// Copy one physical page out of the backing store.
-    pub fn read_page(&self, page_index: u32) -> Option<Vec<u8>> {
-        if page_index >= self.total_pages {
-            return None;
-        }
-        Some(self.read_page_slice(page_index, 1).to_vec())
-    }
-
-    /// Replace one physical page in the backing store.
-    pub fn write_page(&mut self, page_index: u32, bytes: &[u8]) -> bool {
-        if page_index >= self.total_pages || bytes.len() != PVM_PAGE_SIZE as usize {
-            return false;
-        }
-        self.write_page_slice(page_index, bytes);
-        true
-    }
-
-    /// No-op on non-Linux: the window is not used by the interpreter.
-    /// The interpreter reads backing pages directly via `read_page_slice`.
-    ///
-    /// # Safety
-    /// No preconditions on non-Linux (function is a no-op).
-    pub unsafe fn map_pages(
-        &self,
-        _window_base: *mut u8,
-        _base_page: u32,
-        _backing_offset: u32,
-        _page_count: u32,
-        _access: Access,
-    ) -> bool {
-        true
-    }
-
-    /// No-op on non-Linux: the window is not used by the interpreter.
-    ///
-    /// # Safety
-    /// No preconditions on non-Linux (function is a no-op).
-    pub unsafe fn unmap_pages(_window_base: *mut u8, _base_page: u32, _page_count: u32) -> bool {
-        true
-    }
-
-    /// Write initial data directly into the pool.
-    pub fn write_init_data(&mut self, backing_offset: u32, data: &[u8]) -> bool {
-        if data.is_empty() {
-            return true;
-        }
-        let start = backing_offset as usize * PVM_PAGE_SIZE as usize;
-        if start + data.len() > self.data.len() {
-            return false;
-        }
-        self.data[start..start + data.len()].copy_from_slice(data);
-        true
-    }
-
-    /// Return a slice of backing pages (used by interpreter copy-in).
-    pub fn read_page_slice(&self, backing_offset: u32, page_count: u32) -> &[u8] {
-        let start = backing_offset as usize * PVM_PAGE_SIZE as usize;
-        let len = page_count as usize * PVM_PAGE_SIZE as usize;
-        &self.data[start..start + len]
-    }
-
-    /// Write a slice into backing pages (used by interpreter write-back).
-    pub fn write_page_slice(&mut self, backing_offset: u32, src: &[u8]) {
-        let start = backing_offset as usize * PVM_PAGE_SIZE as usize;
-        self.data[start..start + src.len()].copy_from_slice(src);
-    }
-
-    /// Read bytes from the backing store at a raw byte offset.
-    /// Used by `read_data_cap_window` on non-Linux.
-    pub fn read_bytes_at(&self, byte_offset: usize, len: usize) -> Option<&[u8]> {
-        if byte_offset + len <= self.data.len() {
-            Some(&self.data[byte_offset..byte_offset + len])
-        } else {
-            None
-        }
-    }
-
-    /// Write bytes at a raw byte offset. Returns false if out of bounds.
-    pub fn write_bytes_at(&mut self, byte_offset: usize, data: &[u8]) -> bool {
-        if byte_offset + data.len() > self.data.len() {
-            return false;
-        }
-        self.data[byte_offset..byte_offset + data.len()].copy_from_slice(data);
-        true
-    }
-}
-
 // ─── CodeWindow ───────────────────────────────────────────────────────────
 
-/// A virtual address space window for a CODE cap.
+/// The JIT's virtual address space window.
 ///
-/// On Linux x86-64: a full 4GB mmap region with a permission-table and CTX
-/// prefix plus an inaccessible trailing guard page.
-/// On other platforms: a heap-allocated buffer sized to `total_pages`.
+/// A full 4GB mmap region with a permission-table and CTX prefix plus an
+/// inaccessible trailing guard page.
 ///
-/// Layout (both platforms):
+/// Layout:
 /// ```text
 /// [permissions (1MiB)] [CTX (4KiB)] [guest memory] [guard]
 /// ^                     ^           ^
 /// perms()               ctx_ptr()   base()  ← R15 in JIT code
 /// ```
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub struct CodeWindow {
     /// Base of the entire mmap'd region (CTX page).
     region: *mut u8,
@@ -399,10 +84,9 @@ pub struct CodeWindow {
     base: *mut u8,
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 impl CodeWindow {
     /// Allocate a new 4GB window with CTX page.
-    pub fn new(_total_pages: u32) -> Option<Self> {
+    pub fn new() -> Option<Self> {
         let region_size = CODE_WINDOW_HEADER_SIZE + CODE_WINDOW_SIZE + CODE_WINDOW_GUARD_SIZE;
         // SAFETY: MAP_ANONYMOUS | MAP_NORESERVE allocates virtual address space only.
         let region = unsafe {
@@ -421,7 +105,7 @@ impl CodeWindow {
         let region = region as *mut u8;
 
         // Make the permission table and CTX page writable. Guest RAM and the
-        // trailing guard remain PROT_NONE until BackingStore maps pages.
+        // trailing guard remain PROT_NONE until guest memory is mapped.
         // SAFETY: the header lies wholly within the fresh mapping.
         unsafe {
             if libc::mprotect(
@@ -462,7 +146,6 @@ impl CodeWindow {
     }
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 impl Drop for CodeWindow {
     fn drop(&mut self) {
         // SAFETY: region/region_size from mmap in new().
@@ -470,51 +153,7 @@ impl Drop for CodeWindow {
     }
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 unsafe impl Send for CodeWindow {}
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-unsafe impl Sync for CodeWindow {}
-
-/// Heap-backed window for non-Linux platforms.
-#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-pub struct CodeWindow {
-    buf: Vec<u8>,
-}
-
-#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-impl CodeWindow {
-    /// Allocate a buffer large enough for `total_pages` guest pages
-    /// plus the shared metadata prefix and trailing guard.
-    pub fn new(total_pages: u32) -> Option<Self> {
-        let size = CODE_WINDOW_HEADER_SIZE
-            + total_pages as usize * PVM_PAGE_SIZE as usize
-            + CODE_WINDOW_GUARD_SIZE;
-        Some(Self {
-            buf: vec![0u8; size],
-        })
-    }
-
-    /// Guest memory base pointer (after the metadata prefix).
-    pub fn base(&self) -> *mut u8 {
-        // SAFETY: buf has at least CODE_WINDOW_HEADER_SIZE bytes.
-        unsafe { self.buf.as_ptr().add(CODE_WINDOW_HEADER_SIZE) as *mut u8 }
-    }
-
-    /// Pointer to the CTX page (base - CTX_PAGE).
-    pub fn ctx_ptr(&self) -> *mut u8 {
-        // SAFETY: the CTX is the final page of the metadata prefix.
-        unsafe { self.buf.as_ptr().add(CODE_WINDOW_PERMS_SIZE).cast_mut() }
-    }
-
-    /// Pointer to the page-permission table.
-    pub fn perms(&self) -> *mut u8 {
-        self.buf.as_ptr().cast_mut()
-    }
-}
-
-#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-unsafe impl Send for CodeWindow {}
-#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 unsafe impl Sync for CodeWindow {}
 
 // ─── Tests ────────────────────────────────────────────────────────────────
@@ -523,13 +162,6 @@ unsafe impl Sync for CodeWindow {}
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_backing_store_create() {
-        let store = BackingStore::new(10).expect("BackingStore::new failed");
-        assert_eq!(store.total_pages(), 10);
-    }
-
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn backing_descriptor_is_close_on_exec_before_it_can_escape() {
         let store = BackingStore::new(1).unwrap();
@@ -545,133 +177,7 @@ mod tests {
 
     #[test]
     fn test_code_window_create() {
-        let window = CodeWindow::new(16).expect("CodeWindow::new failed");
+        let window = CodeWindow::new().expect("CodeWindow::new failed");
         assert!(!window.base().is_null());
-    }
-
-    #[test]
-    fn test_map_write_read() {
-        let store = BackingStore::new(4).expect("BackingStore::new failed");
-        let window = CodeWindow::new(4).expect("CodeWindow::new failed");
-
-        unsafe { assert!(store.map_pages(window.base(), 0, 0, 2, Access::RW)) };
-
-        let data = [0xDE, 0xAD, 0xBE, 0xEF];
-        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), window.base(), 4) };
-
-        let mut buf = [0u8; 4];
-        unsafe { std::ptr::copy_nonoverlapping(window.base(), buf.as_mut_ptr(), 4) };
-        assert_eq!(buf, [0xDE, 0xAD, 0xBE, 0xEF]);
-
-        unsafe { assert!(BackingStore::unmap_pages(window.base(), 0, 2)) };
-    }
-
-    #[test]
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    fn code_window_permissions_follow_high_page_mapping_lifecycle() {
-        let store = BackingStore::new(1).expect("BackingStore::new failed");
-        let window = CodeWindow::new(1).expect("CodeWindow::new failed");
-        let high_page = (CODE_WINDOW_PERMS_SIZE - 1) as u32;
-
-        // SAFETY: `perms()` covers exactly one byte per 32-bit guest page.
-        let permission = || unsafe { *window.perms().add(high_page as usize) };
-        assert_eq!(permission(), 0);
-
-        // SAFETY: the final guest page is within the CodeWindow and backing
-        // page zero exists for the complete lifetime of these mappings.
-        unsafe {
-            assert!(store.map_pages(window.base(), high_page, 0, 1, Access::RO));
-        }
-        assert_eq!(permission(), 1);
-
-        unsafe {
-            assert!(store.map_pages(window.base(), high_page, 0, 1, Access::RW));
-        }
-        assert_eq!(permission(), 2);
-
-        unsafe {
-            assert!(BackingStore::unmap_pages(window.base(), high_page, 1));
-        }
-        assert_eq!(permission(), 0);
-    }
-
-    #[test]
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    fn test_write_init_data() {
-        let store = BackingStore::new(2).expect("BackingStore::new failed");
-        let window = CodeWindow::new(2).expect("CodeWindow::new failed");
-
-        let init_data = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
-        assert!(store.write_init_data(0, &init_data));
-
-        unsafe {
-            assert!(store.map_pages(window.base(), 0, 0, 1, Access::RO));
-            let mut buf = [0u8; 8];
-            std::ptr::copy_nonoverlapping(window.base(), buf.as_mut_ptr(), 8);
-            assert_eq!(buf, [1, 2, 3, 4, 5, 6, 7, 8]);
-            assert!(BackingStore::unmap_pages(window.base(), 0, 1));
-        }
-    }
-
-    #[test]
-    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-    fn test_write_init_data() {
-        let mut store = BackingStore::new(2).expect("BackingStore::new failed");
-        let init_data = [1u8, 2, 3, 4, 5, 6, 7, 8];
-        assert!(store.write_init_data(0, &init_data));
-        assert_eq!(&store.read_page_slice(0, 1)[..8], &init_data);
-    }
-
-    #[test]
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    fn test_map_remap_different_address() {
-        let store = BackingStore::new(4).expect("BackingStore::new failed");
-        let window = CodeWindow::new(4).expect("CodeWindow::new failed");
-
-        unsafe {
-            assert!(store.map_pages(window.base(), 0, 0, 1, Access::RW));
-            let ptr = window.base();
-            *ptr = 0x42;
-        }
-
-        unsafe { assert!(BackingStore::unmap_pages(window.base(), 0, 1)) };
-
-        unsafe {
-            assert!(store.map_pages(window.base(), 5, 0, 1, Access::RW));
-            let ptr = window.base().add(5 * PVM_PAGE_SIZE as usize);
-            assert_eq!(*ptr, 0x42); // Same physical data via shared memfd pages.
-        }
-
-        unsafe { assert!(BackingStore::unmap_pages(window.base(), 5, 1)) };
-    }
-
-    #[test]
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    fn test_two_windows_same_backing() {
-        let store = BackingStore::new(2).expect("BackingStore::new failed");
-        let win_a = CodeWindow::new(2).expect("CodeWindow::new failed");
-        let win_b = CodeWindow::new(2).expect("CodeWindow::new failed");
-
-        unsafe {
-            assert!(store.map_pages(win_a.base(), 0, 0, 1, Access::RW));
-            assert!(store.map_pages(win_b.base(), 3, 0, 1, Access::RW));
-
-            *win_a.base() = 0xAB;
-
-            // Same physical page via shared memfd — visible in win_b.
-            let val = *win_b.base().add(3 * PVM_PAGE_SIZE as usize);
-            assert_eq!(val, 0xAB);
-
-            assert!(BackingStore::unmap_pages(win_a.base(), 0, 1));
-            assert!(BackingStore::unmap_pages(win_b.base(), 3, 1));
-        }
-    }
-
-    #[test]
-    fn test_write_init_data_rejects_backing_overflow() {
-        #[allow(unused_mut)]
-        let mut store = BackingStore::new(2).expect("BackingStore::new failed");
-        let oversized = vec![0xA5; PVM_PAGE_SIZE as usize + 1];
-        assert!(!store.write_init_data(1, &oversized));
     }
 }

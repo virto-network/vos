@@ -3,23 +3,22 @@
 //! Portable byte parsing and memory layout live in `vos-pvm-program`, shared
 //! with the compiler and guest agent runtimes. This module adds executor
 //! opcode validation and exact static host-call admission for standard outer
-//! runtimes. Standard programs are never projected through the legacy
-//! capability-manifest kernel in production.
+//! runtimes.
 
 use alloc::vec::Vec;
 
 use crate::args::{Args, decode_args};
 use crate::instruction::Opcode;
-use crate::program::ParsedCodeBlob;
 
-pub use vos_pvm_program::{Region as SpiRegion, StandardLayout, StandardProgram, read_nat};
+pub use vos_pvm_program::{
+    CodeBlob, Region as SpiRegion, StandardLayout, StandardProgram, parse_compact_code_blob,
+    read_nat,
+};
 
 /// The complete host-call surface implemented by [`crate::refine_host`].
 ///
 /// Runtime package admission uses this exact set to reject even unreachable
-/// calls outside the standard inner-machine interface. Keeping the policy
-/// next to the standard-program decoder prevents a caller from accidentally
-/// inspecting a retired capability manifest under these rules.
+/// calls outside the standard inner-machine interface.
 pub const REFINE_HOST_CALL_ALLOWLIST: [u64; 6] = [9, 10, 11, 12, 13, 14];
 
 /// Failure while inspecting a standard program's complete static host-call
@@ -33,22 +32,11 @@ pub enum HostCallInspectionError {
     UnsupportedHostCall(u64),
 }
 
-/// Decode the canonical compact code blob used by the standard `machine`
-/// host call.
-pub fn parse_compact_code_blob(data: &[u8]) -> Option<ParsedCodeBlob> {
-    let code = vos_pvm_program::parse_compact_code_blob(data)?;
-    Some(ParsedCodeBlob {
-        jump_table: code.jump_table,
-        code: code.code,
-        bitmask: code.bitmask,
-    })
-}
-
 /// Validate an executable code blob and its initial instruction counter.
 ///
 /// The external counter is a full PVM register. Values outside the host's
 /// index domain are invalid rather than truncated.
-pub fn validate_code_blob(program: &ParsedCodeBlob, initial_pc: u64) -> bool {
+pub fn validate_code_blob(program: &CodeBlob, initial_pc: u64) -> bool {
     let code = &program.code;
     let bitmask = &program.bitmask;
     // Runtime counters are u32 even on a 64-bit host. Establish that domain
@@ -95,7 +83,7 @@ pub fn validate_code_blob(program: &ParsedCodeBlob, initial_pc: u64) -> bool {
 /// initial-instruction validation. Callers implementing full Ψ must turn a
 /// `None` result into a no-charge panic over the unchanged input state;
 /// callers implementing Ω_M retain its specified `HUH` mapping.
-pub fn deblob(data: &[u8], initial_pc: u64) -> Option<ParsedCodeBlob> {
+pub fn deblob(data: &[u8], initial_pc: u64) -> Option<CodeBlob> {
     let program = parse_compact_code_blob(data)?;
     validate_code_blob(&program, initial_pc).then_some(program)
 }
@@ -103,20 +91,14 @@ pub fn deblob(data: &[u8], initial_pc: u64) -> Option<ParsedCodeBlob> {
 /// Parse and executor-validate a standard program.
 pub fn parse_standard_program(blob: &[u8]) -> Option<StandardProgram> {
     let program = vos_pvm_program::parse_standard_program(blob)?;
-    let executable = ParsedCodeBlob {
-        jump_table: program.code.jump_table.clone(),
-        code: program.code.code.clone(),
-        bitmask: program.code.bitmask.clone(),
-    };
-    validate_code_blob(&executable, 0).then_some(program)
+    validate_code_blob(&program.code, 0).then_some(program)
 }
 
 /// Return every statically present `ecalli` immediate in instruction order.
 ///
 /// The scan covers unreachable blocks as well as the entry-reachable graph:
 /// package admission must not let a later data-dependent branch expose a call
-/// which was skipped by a representative run. Dynamic `ecall` cannot appear
-/// because [`parse_standard_program`] rejects that non-standard opcode first.
+/// which was skipped by a representative run.
 pub fn inspect_standard_program_host_calls(
     blob: &[u8],
 ) -> Result<Vec<u64>, HostCallInspectionError> {
@@ -291,7 +273,7 @@ mod tests {
 
     #[test]
     fn validator_rejects_a_counter_outside_the_runtime_pc_domain() {
-        let executable = ParsedCodeBlob {
+        let executable = CodeBlob {
             jump_table: Vec::new(),
             code: vec![0],
             bitmask: vec![1],
