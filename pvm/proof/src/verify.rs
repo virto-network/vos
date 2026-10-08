@@ -126,6 +126,13 @@ fn verify_with_shape(
     max_log_size: u32,
     policy: Option<&crate::proof::PcsPolicy>,
 ) -> Result<(), VerificationError> {
+    let expected_component_mask = super::active_component_mask(side_note);
+    if proof.component_mask != expected_component_mask {
+        return Err(VerificationError::InvalidStructure(format!(
+            "proof component mask {:#x} differs from SideNote-derived mask {expected_component_mask:#x}",
+            proof.component_mask,
+        )));
+    }
     // Select active components from side_note (same predicate
     // the prover used).  See `active_components_verifier` doc-comment.
     let components_owned = super::active_components_verifier(side_note);
@@ -186,7 +193,7 @@ pub fn verify_with_explicit_components(
 }
 
 fn verify_with_options_explicit_components(
-    proof: Proof,
+    mut proof: Proof,
     side_note: &SideNote,
     max_log_size: u32,
     policy: Option<&crate::proof::PcsPolicy>,
@@ -194,6 +201,8 @@ fn verify_with_options_explicit_components(
     prover_components: &[&dyn crate::framework::MachineProverComponent],
     boundary_positions: Option<crate::boundary_binding::BoundaryChipPositions>,
 ) -> Result<(), VerificationError> {
+    crate::proof::preflight_proof_structure(&mut proof, max_log_size)
+        .map_err(VerificationError::InvalidStructure)?;
     // Reject proofs from a different AIR shape early, before
     // any cryptographic work.  `format_version` is bumped whenever the
     // chip list / column counts / lookup-tuple shape changes in a way
@@ -223,6 +232,52 @@ fn verify_with_options_explicit_components(
     if let Err(msg) = shape_check {
         return Err(VerificationError::InvalidStructure(msg));
     }
+    if proof.pcs_config.fri_config.log_blowup_factor > crate::proof::MAX_RECOMMIT_LOG_BLOWUP {
+        return Err(VerificationError::InvalidStructure(format!(
+            "proof-side recommitment rejects FRI log blowup above {}",
+            crate::proof::MAX_RECOMMIT_LOG_BLOWUP,
+        )));
+    }
+    if proof.claimed_sums.len() != components.len() || proof.log_sizes.len() != components.len() {
+        return Err(VerificationError::InvalidStructure(
+            "proof component dimensions differ from selected AIR components".to_string(),
+        ));
+    }
+    let sizes: Vec<TreeVec<Vec<u32>>> = components
+        .iter()
+        .zip(&proof.log_sizes)
+        .map(|(component, &log_size)| component.trace_sizes(log_size))
+        .collect();
+    let mut expected_log_sizes = TreeVec::concat_cols(sizes.into_iter());
+    expected_log_sizes[PREPROCESSED_TRACE_IDX] = components
+        .iter()
+        .zip(&proof.log_sizes)
+        .flat_map(|(component, &log_size)| component.preprocessed_trace_sizes(log_size))
+        .collect();
+    let mut dummy_lookup = AllLookupElements::default();
+    let mut dummy_channel = ProverChannel::default();
+    components.iter().for_each(|component| {
+        component.draw_lookup_elements(&mut dummy_lookup, &mut dummy_channel)
+    });
+    let dummy_allocator = &mut TraceLocationAllocator::default();
+    let shape_components: Vec<Box<dyn Component>> = components
+        .iter()
+        .zip(&proof.claimed_sums)
+        .zip(&proof.log_sizes)
+        .map(|((component, claimed_sum), &log_size)| {
+            component.to_component(dummy_allocator, &dummy_lookup, log_size, *claimed_sum)
+        })
+        .collect();
+    let shape_component_refs: Vec<&dyn Component> = shape_components
+        .iter()
+        .map(|component| &**component)
+        .collect();
+    let protocol_shape = crate::framework_access::preflight_component_dimensions(
+        &proof,
+        &shape_component_refs,
+        &expected_log_sizes,
+    )
+    .map_err(VerificationError::InvalidStructure)?;
     let Proof {
         stark_proof: proof,
         claimed_sums,
@@ -233,17 +288,12 @@ fn verify_with_options_explicit_components(
         ..
     } = proof;
 
-    if claimed_sums.len() != components.len() {
-        return Err(VerificationError::InvalidStructure(
-            "claimed sums len mismatch".to_string(),
-        ));
-    }
-    if claimed_log_sizes.len() != components.len() {
-        return Err(VerificationError::InvalidStructure(
-            "log sizes len mismatch".to_string(),
-        ));
-    }
     let verifier_channel = &mut ProverChannel::default();
+    crate::proof::mix_proof_fs_domain(
+        verifier_channel,
+        crate::proof::PROOF_FORMAT_VERSION,
+        &config,
+    );
     claimed_log_sizes.iter().for_each(|log_size| {
         verifier_channel.mix_u64(*log_size as u64);
     });
@@ -259,17 +309,7 @@ fn verify_with_options_explicit_components(
     )?;
 
     let commitment_scheme = &mut CommitmentSchemeVerifier::<ProverMerkleChannel>::new(config);
-    let sizes: Vec<TreeVec<Vec<u32>>> = components
-        .iter()
-        .zip(&claimed_log_sizes)
-        .map(|(c, &log_size)| c.trace_sizes(log_size))
-        .collect();
-    let mut log_sizes = TreeVec::concat_cols(sizes.into_iter());
-    log_sizes[PREPROCESSED_TRACE_IDX] = components
-        .iter()
-        .zip(&claimed_log_sizes)
-        .flat_map(|(c, &log_size)| c.preprocessed_trace_sizes(log_size))
-        .collect();
+    let log_sizes = expected_log_sizes;
 
     for idx in [PREPROCESSED_TRACE_IDX, ORIGINAL_TRACE_IDX] {
         commitment_scheme.commit(proof.commitments[idx], &log_sizes[idx], verifier_channel);
@@ -358,6 +398,20 @@ fn verify_with_options_explicit_components(
         &log_sizes[INTERACTION_TRACE_IDX],
         verifier_channel,
     );
+
+    let sampled_queries = crate::proof::expected_fiat_shamir_query_count(
+        verifier_channel,
+        &proof,
+        &config,
+        protocol_shape,
+        &log_sizes,
+    )
+    .map_err(VerificationError::InvalidStructure)?;
+    if sampled_queries != protocol_shape.query_count {
+        return Err(VerificationError::InvalidStructure(
+            "queried-value rows differ from Fiat-Shamir query positions".to_string(),
+        ));
+    }
 
     stwo::core::verifier::verify(&components_ref, verifier_channel, commitment_scheme, proof)
 }
@@ -505,6 +559,7 @@ pub fn reconstruct_oods_for_recursion(proof: &Proof, side_note: &SideNote) -> Oo
 
     // ── Replay the FS transcript (channel-affecting steps only) ─────────────
     let verifier_channel = &mut ProverChannel::default();
+    crate::proof::mix_proof_fs_domain(verifier_channel, proof.format_version, &config);
     claimed_log_sizes
         .iter()
         .for_each(|ls| verifier_channel.mix_u64(*ls as u64));
@@ -685,6 +740,8 @@ fn recursion_verify_prefix(
     let sp = &proof.stark_proof;
     let claimed_log_sizes = &proof.log_sizes;
     let claimed_sums = &proof.claimed_sums;
+
+    crate::proof::mix_proof_fs_domain(channel, proof.format_version, &proof.pcs_config);
 
     let n_active = (proof.component_mask).count_ones() as usize;
     assert_eq!(

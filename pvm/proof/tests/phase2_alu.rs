@@ -29,9 +29,9 @@ fn run_three_reg(
         10000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let exit = tracing.run();
-    assert_eq!(exit, vos_pvm::ExitReason::Trap);
+    assert_eq!(exit, vos_pvm::ExitReason::Panic);
     tracing.into_trace()
 }
 
@@ -62,9 +62,9 @@ fn run_two_reg_imm(
         10000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let exit = tracing.run();
-    assert_eq!(exit, vos_pvm::ExitReason::Trap);
+    assert_eq!(exit, vos_pvm::ExitReason::Panic);
     tracing.into_trace()
 }
 
@@ -187,9 +187,9 @@ fn prove_move_reg() {
         10000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let exit = tracing.run();
-    assert_eq!(exit, vos_pvm::ExitReason::Trap);
+    assert_eq!(exit, vos_pvm::ExitReason::Panic);
     let steps = tracing.into_trace();
     assert_eq!(steps[0].regs_after[2], 42);
     prove_and_verify(steps, &code, &bitmask);
@@ -216,9 +216,9 @@ fn prove_load_imm() {
         10000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let exit = tracing.run();
-    assert_eq!(exit, vos_pvm::ExitReason::Trap);
+    assert_eq!(exit, vos_pvm::ExitReason::Panic);
     let steps = tracing.into_trace();
     // LoadImm with 4-byte positive immediate should give us sign-extended value
     // imm = 12345 (positive, fits in 4 bytes) => sign_extend(12345, 4) = 12345
@@ -270,9 +270,9 @@ fn prove_multi_op_program() {
         10000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let exit = tracing.run();
-    assert_eq!(exit, vos_pvm::ExitReason::Trap);
+    assert_eq!(exit, vos_pvm::ExitReason::Panic);
     let steps = tracing.into_trace();
 
     assert_eq!(steps.len(), 5); // Add64 + Sub64 + And + MoveReg + Trap
@@ -305,7 +305,7 @@ fn prove_add_imm64() {
         10000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     tracing.run();
     let steps = tracing.into_trace();
     assert_eq!(steps[0].regs_after[0], 150);
@@ -331,7 +331,7 @@ fn prove_neg_add_imm64() {
         10000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     tracing.run();
     let steps = tracing.into_trace();
     assert_eq!(steps[0].regs_after[0], 70); // 100 - 30
@@ -484,9 +484,9 @@ fn prove_reverse_bytes() {
         10000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let exit = tracing.run();
-    assert_eq!(exit, vos_pvm::ExitReason::Trap);
+    assert_eq!(exit, vos_pvm::ExitReason::Panic);
     let steps = tracing.into_trace();
     assert_eq!(steps[0].regs_after[1], 0x0807060504030201);
     let mut side_note = vos_pvm_proof::SideNote::new(steps, code, bitmask);
@@ -511,8 +511,8 @@ fn prove_count_set_bits_64_smoke() {
         10000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
-    assert_eq!(tracing.run(), vos_pvm::ExitReason::Trap);
+    let mut tracing = TracingPvm::new_conformance(pvm);
+    assert_eq!(tracing.run(), vos_pvm::ExitReason::Panic);
     let steps = tracing.into_trace();
     assert_eq!(steps[0].regs_after[1], 32);
     let mut side_note = vos_pvm_proof::SideNote::new(steps, code, bitmask);
@@ -535,7 +535,7 @@ fn prove_count_set_bits_64_full() {
         10000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     tracing.run();
     let steps = tracing.into_trace();
     assert_eq!(steps[0].regs_after[1], 64);
@@ -559,7 +559,7 @@ fn prove_count_set_bits_64_zero() {
         10000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     tracing.run();
     let steps = tracing.into_trace();
     assert_eq!(steps[0].regs_after[1], 0);
@@ -584,7 +584,7 @@ fn prove_count_set_bits_32_smoke() {
         10000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     tracing.run();
     let steps = tracing.into_trace();
     assert_eq!(steps[0].regs_after[1], 8);
@@ -609,8 +609,8 @@ fn prove_leading_zero_bits_64_smoke() {
         10000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
-    assert_eq!(tracing.run(), vos_pvm::ExitReason::Trap);
+    let mut tracing = TracingPvm::new_conformance(pvm);
+    assert_eq!(tracing.run(), vos_pvm::ExitReason::Panic);
     let steps = tracing.into_trace();
     assert_eq!(steps[0].regs_after[1], 47);
     let mut side_note = vos_pvm_proof::SideNote::new(steps, code, bitmask);
@@ -633,7 +633,7 @@ fn prove_leading_zero_bits_64_zero() {
         10000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     tracing.run();
     let steps = tracing.into_trace();
     assert_eq!(steps[0].regs_after[1], 64);
@@ -657,7 +657,7 @@ fn prove_leading_zero_bits_64_msb() {
         10000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     tracing.run();
     let steps = tracing.into_trace();
     assert_eq!(steps[0].regs_after[1], 0);
@@ -682,7 +682,7 @@ fn prove_leading_zero_bits_32_smoke() {
         10000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     tracing.run();
     let steps = tracing.into_trace();
     assert_eq!(steps[0].regs_after[1], 31);
@@ -707,7 +707,7 @@ fn prove_leading_zero_bits_32_zero_low() {
         10000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     tracing.run();
     let steps = tracing.into_trace();
     assert_eq!(steps[0].regs_after[1], 32);
@@ -731,7 +731,7 @@ fn prove_trailing_zero_bits_64_smoke() {
         10000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     tracing.run();
     let steps = tracing.into_trace();
     assert_eq!(steps[0].regs_after[1], 20);
@@ -755,7 +755,7 @@ fn prove_trailing_zero_bits_64_zero() {
         10000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     tracing.run();
     let steps = tracing.into_trace();
     assert_eq!(steps[0].regs_after[1], 64);
@@ -779,7 +779,7 @@ fn prove_trailing_zero_bits_64_lsb() {
         10000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     tracing.run();
     let steps = tracing.into_trace();
     assert_eq!(steps[0].regs_after[1], 0);
@@ -804,7 +804,7 @@ fn prove_trailing_zero_bits_32_zero_low() {
         10000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     tracing.run();
     let steps = tracing.into_trace();
     assert_eq!(steps[0].regs_after[1], 32);
@@ -828,7 +828,7 @@ fn prove_sign_extend_8() {
         10000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     tracing.run();
     let steps = tracing.into_trace();
     assert_eq!(steps[0].regs_after[1], 0xFFFFFFFFFFFFFF80); // sign-extended

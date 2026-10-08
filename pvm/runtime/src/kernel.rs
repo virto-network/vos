@@ -140,8 +140,9 @@ use crate::cap::{
 use crate::program::{self, CapEntryType, CapManifestEntry, ParsedBlob};
 use crate::snapshot::{
     CallFrameSnapshot, CapabilitySlotSnapshot, CapabilitySnapshot, KERNEL_SNAPSHOT_VERSION,
-    KernelSnapshot, MemoryBlock, MemoryPageRef, PendingProtocolCall, SnapshotAccess, SnapshotError,
-    SnapshotIsaMode, SnapshotVmState, VmArenaSnapshot, VmSlotSnapshot, VmSnapshot,
+    KernelSnapshot, MemoryBlock, MemoryPageRef, PendingHostCallSnapshot, PendingPageFault,
+    PendingProtocolCall, SnapshotAccess, SnapshotError, SnapshotIsaMode, SnapshotVmState,
+    VmArenaSnapshot, VmSlotSnapshot, VmSnapshot,
 };
 #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
 use crate::vm_pool::WindowPool;
@@ -220,11 +221,16 @@ pub struct InvocationKernel {
     /// Backend selection for CODE cap compilation.
     pub backend: crate::backend::PvmBackend,
     /// ISA profile for CODE cap compilation and execution.
-    pub isa_mode: crate::IsaMode,
+    // Every production constructor is capability-manifest/JAR-only. Keeping
+    // the profile private prevents callers from mutating a legacy kernel into
+    // a substitute standard outer executor.
+    isa_mode: crate::IsaMode,
     /// Commitment to the canonical invocation program/layout inputs.
     invocation_layout_hash: [u8; 32],
     /// Protocol call whose result has not yet been injected.
     pending_protocol_call: Option<PendingProtocolCall>,
+    /// Root page fault suspended at an exact retry boundary.
+    pending_page_fault: Option<PendingPageFault>,
     /// CODE cap ID for fast recompiler resume after ProtocolCall.
     /// When set, the next `run()` call uses `run_recompiler_resume()` instead
     /// of `run_recompiler_segment()`, avoiding a full JitContext rebuild.
@@ -279,20 +285,6 @@ impl InvocationKernel {
         Self::new_inner(blob, _args, gas, backend, crate::IsaMode::Jar, &[], None)
     }
 
-    /// Create a new kernel with a specific backend and ISA profile.
-    ///
-    /// `IsaMode::Conformance` executes under the graypaper-strict ISA:
-    /// opcode 3 (`Ecall`, the jar capability-kernel surface) panics.
-    pub fn new_with_backend_and_mode(
-        blob: &[u8],
-        args: &[u8],
-        gas: u64,
-        backend: crate::backend::PvmBackend,
-        isa_mode: crate::IsaMode,
-    ) -> Result<Self, KernelError> {
-        Self::new_inner(blob, args, gas, backend, isa_mode, &[], None)
-    }
-
     /// Create an invocation with canonical programs preinstalled as idle VMs.
     ///
     /// This is invocation setup, not a host-call extension. Each imported VM
@@ -315,44 +307,6 @@ impl InvocationKernel {
             programs,
             None,
         )
-    }
-
-    /// Create a kernel from a GP **standard program** blob (the graypaper
-    /// v0.7.2 format the `gp072_*` vectors use), the parallel init path to the
-    /// native `JAR\x02` manifest.
-    ///
-    /// The blob is parsed by [`crate::spi`], translated to an equivalent
-    /// manifest, and loaded through [`Self::new_inner`] under the
-    /// graypaper-strict ISA ([`crate::IsaMode::Conformance`]): host calls are
-    /// `ecalli`, and the JAR capability surface (`Ecall`) is rejected. The GP
-    /// argument registers `φ[7]`/`φ[8]` are then installed unconditionally, per
-    /// GP eq A.43 (the manifest args convention only sets them for non-empty
-    /// arguments).
-    pub fn new_standard(
-        blob: &[u8],
-        args: &[u8],
-        gas: u64,
-        backend: crate::backend::PvmBackend,
-    ) -> Result<Self, KernelError> {
-        let prog = crate::spi::parse_standard_program(blob).ok_or(KernelError::InvalidBlob)?;
-        let layout = prog.layout(args).ok_or(KernelError::InvalidBlob)?;
-        let manifest = crate::spi::to_manifest_blob(&prog, args).ok_or(KernelError::InvalidBlob)?;
-        // The args bytes are carried as the manifest's argument DATA cap, so
-        // pass no IPC args to `new_inner` (it would otherwise re-derive φ[7]).
-        let mut kernel = Self::new_inner(
-            &manifest,
-            &[],
-            gas,
-            backend,
-            crate::IsaMode::Conformance,
-            &[],
-            None,
-        )?;
-        let vm = kernel.vm_arena.vm_mut(0);
-        vm.set_reg(1, layout.registers[1]); // φ[1] = SP (stack top)
-        vm.set_reg(7, layout.registers[7]); // φ[7] = argument base
-        vm.set_reg(8, layout.registers[8]); // φ[8] = argument length
-        Ok(kernel)
     }
 
     fn new_inner(
@@ -400,7 +354,8 @@ impl InvocationKernel {
 
         let backing = BackingStore::new(memory_pages).ok_or(KernelError::MemoryError)?;
 
-        let mem_cycles = crate::compute_mem_cycles(memory_pages);
+        let mem_cycles =
+            crate::mem_cycles_for_mode(crate::compute_mem_cycles(memory_pages), isa_mode);
         let untyped = Arc::new(UntypedCap::new(memory_pages));
 
         #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
@@ -420,6 +375,7 @@ impl InvocationKernel {
             isa_mode,
             invocation_layout_hash: invocation_layout_hash(blob, dormant_programs),
             pending_protocol_call: None,
+            pending_page_fault: None,
             recompiler_resume_cap: None,
             #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
             live_ctx: None,
@@ -511,11 +467,9 @@ impl InvocationKernel {
             }
         }
 
-        // Create VM 0. GP standard program initialization: the host owns SP,
-        // so the kernel installs φ[1]=stack_top here (the blob carries no SP
-        // preamble). Arguments follow the GP register ABI: φ[7]=args address,
-        // φ[8]=args length. Entry dispatch is by instruction counter (IC 0 =
-        // refine, IC 5 = accumulate) via `set_entry_ic`, not a φ[7] selector.
+        // Create legacy manifest VM 0. The host installs the manifest-owned
+        // stack and argument registers; standard outer programs use
+        // `RefineContext` instead and never enter this kernel.
         let mut vm0 = VmInstance::new(
             invoke_code_id,
             0, // entry_index (set by caller via CALL)
@@ -727,16 +681,12 @@ impl InvocationKernel {
         Ok(kernel)
     }
 
-    /// Capture the complete invocation at a flushed protocol-call boundary.
+    /// Capture the complete invocation at a flushed host or retry boundary.
     ///
     /// Native code and virtual-memory windows are deliberately excluded. A
     /// restore recompiles the canonical blob and verifies every CODE sub-blob
     /// hash before installing this machine state.
     pub fn snapshot(&mut self) -> Result<KernelSnapshot, SnapshotError> {
-        let pending_call = self
-            .pending_protocol_call
-            .ok_or(SnapshotError::NotAtProtocolBoundary)?;
-
         #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
         {
             self.flush_live_ctx();
@@ -744,18 +694,12 @@ impl InvocationKernel {
             crate::recompiler::signal::SIGNAL_STATE.with(|cell| cell.set(core::ptr::null_mut()));
         }
 
-        let active_vm = self
-            .vm_arena
-            .snapshot_slots()
-            .nth(self.active_vm as usize)
-            .and_then(|(_, vm)| vm)
-            .ok_or(SnapshotError::InvalidScheduler)?;
-        if pending_call.vm_index != self.active_vm
-            || pending_call.resume_pc != active_vm.pc
-            || pending_call.result_registers != [7, 8]
-        {
-            return Err(SnapshotError::InvalidScheduler);
+        let pending_call = self.pending_protocol_call;
+        let pending_fault = self.pending_page_fault;
+        if pending_call.is_some() == pending_fault.is_some() {
+            return Err(SnapshotError::NotAtProtocolBoundary);
         }
+        self.validate_suspension_boundary(pending_call, pending_fault)?;
 
         let slots = self
             .vm_arena
@@ -814,6 +758,7 @@ impl InvocationKernel {
             memory,
             blocks,
             pending_call,
+            pending_fault,
         })
     }
 
@@ -824,6 +769,9 @@ impl InvocationKernel {
         backend: crate::backend::PvmBackend,
         cache: Option<&mut CodeCache>,
     ) -> Result<Self, SnapshotError> {
+        if snapshot.isa_mode != SnapshotIsaMode::Jar {
+            return Err(SnapshotError::ProgramMismatch);
+        }
         Self::restore_inner(blob, &[], snapshot, backend, cache)
     }
 
@@ -835,6 +783,9 @@ impl InvocationKernel {
         snapshot: &KernelSnapshot,
         backend: crate::backend::PvmBackend,
     ) -> Result<Self, SnapshotError> {
+        if snapshot.isa_mode != SnapshotIsaMode::Jar {
+            return Err(SnapshotError::ProgramMismatch);
+        }
         Self::restore_inner(blob, programs, snapshot, backend, None)
     }
 
@@ -897,17 +848,17 @@ impl InvocationKernel {
             .iter()
             .map(restore_call_frame)
             .collect::<Result<Vec<_>, _>>()?;
-        kernel.pending_protocol_call = Some(snapshot.pending_call);
+        kernel.pending_protocol_call = snapshot.pending_call;
+        kernel.pending_page_fault = snapshot.pending_fault;
         kernel.recompiler_resume_cap = None;
 
         let active_vm = kernel.vm_arena.vm(kernel.active_vm);
         if active_vm.state != VmState::Running
-            || snapshot.pending_call.vm_index != kernel.active_vm
-            || snapshot.pending_call.resume_pc != active_vm.pc
-            || snapshot.pending_call.result_registers != [7, 8]
+            || snapshot.pending_call.is_some() == snapshot.pending_fault.is_some()
         {
             return Err(SnapshotError::InvalidScheduler);
         }
+        kernel.validate_suspension_boundary(snapshot.pending_call, snapshot.pending_fault)?;
         validate_call_stack(&kernel)?;
 
         #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
@@ -920,6 +871,273 @@ impl InvocationKernel {
         }
 
         Ok(kernel)
+    }
+
+    /// Validate that the portable suspension record and the per-VM retry
+    /// markers describe one and the same execution boundary.  In particular,
+    /// no inactive VM may smuggle a latent host/fault continuation into a
+    /// snapshot, and strict-v0.8 continuations are always inside an already
+    /// funded block.
+    fn validate_suspension_boundary(
+        &self,
+        pending_call: Option<PendingProtocolCall>,
+        pending_fault: Option<PendingPageFault>,
+    ) -> Result<(), SnapshotError> {
+        if pending_call.is_some() == pending_fault.is_some() {
+            return Err(SnapshotError::InvalidScheduler);
+        }
+
+        let active_vm = self
+            .vm_arena
+            .snapshot_slots()
+            .nth(self.active_vm as usize)
+            .and_then(|(_, vm)| vm)
+            .ok_or(SnapshotError::InvalidScheduler)?;
+        if active_vm.state != VmState::Running {
+            return Err(SnapshotError::InvalidScheduler);
+        }
+
+        let total_gas = self
+            .vm_arena
+            .snapshot_slots()
+            .try_fold(0u64, |total, (_, vm)| {
+                vm.map_or(Some(total), |vm| total.checked_add(vm.gas()))
+            })
+            .ok_or(SnapshotError::InvalidScheduler)?;
+        let _ = total_gas;
+
+        for (index, (_, vm)) in self.vm_arena.snapshot_slots().enumerate() {
+            let Some(vm) = vm else { continue };
+            if index != self.active_vm as usize {
+                if vm.pending_page_fault().is_some() {
+                    return Err(SnapshotError::InvalidScheduler);
+                }
+                if let Some(call) = vm.pending_host_call()
+                    && (self.isa_mode != crate::IsaMode::Conformance
+                        || vm.state != VmState::Faulted
+                        || vm.gas() != 0
+                        || !vm.gas_charged()
+                        || !self.pending_host_call_matches_vm(vm, call))
+                {
+                    return Err(SnapshotError::InvalidScheduler);
+                }
+            }
+        }
+
+        match (pending_call, pending_fault) {
+            (Some(call), None) => {
+                if call.vm_index != self.active_vm
+                    || call.cause_pc != active_vm.pc
+                    || call.gas_charged != active_vm.gas_charged()
+                    || call.result_registers != [7, 8]
+                    || active_vm.pending_page_fault().is_some()
+                {
+                    return Err(SnapshotError::InvalidScheduler);
+                }
+
+                let expected_host_call = crate::PendingHostCall {
+                    id: call.host_call_id,
+                    cause_pc: call.cause_pc,
+                    resume_pc: call.resume_pc,
+                };
+                match self.isa_mode {
+                    crate::IsaMode::Conformance
+                        if !call.gas_charged
+                            || active_vm.pending_host_call() != Some(expected_host_call)
+                            || !self
+                                .pending_host_call_matches_vm(active_vm, expected_host_call)
+                            || u8::try_from(call.host_call_id).ok().is_none_or(|slot| {
+                                !matches!(
+                                    active_vm.cap_table.get(slot),
+                                    Some(Cap::Protocol(protocol)) if protocol.id == call.slot
+                                )
+                            }) =>
+                    {
+                        return Err(SnapshotError::InvalidScheduler);
+                    }
+                    crate::IsaMode::Jar if active_vm.pending_host_call().is_some() => {
+                        return Err(SnapshotError::InvalidScheduler);
+                    }
+                    _ => {}
+                }
+            }
+            (None, Some(fault)) => {
+                if fault.vm_index != self.active_vm
+                    || fault.cause_pc != active_vm.pc
+                    || fault.gas_charged != active_vm.gas_charged()
+                    || active_vm.pending_host_call().is_some()
+                    || active_vm.pending_page_fault() != Some(fault.address)
+                    || (self.isa_mode == crate::IsaMode::Conformance && !fault.gas_charged)
+                    || (self.isa_mode == crate::IsaMode::Conformance
+                        && !self.pending_page_fault_matches_vm(active_vm, fault))
+                {
+                    return Err(SnapshotError::InvalidScheduler);
+                }
+            }
+            _ => return Err(SnapshotError::InvalidScheduler),
+        }
+        Ok(())
+    }
+
+    fn pending_host_call_matches_vm(&self, vm: &VmInstance, call: crate::PendingHostCall) -> bool {
+        let Some(code_cap) = self.code_caps.get(vm.code_cap_id as usize) else {
+            return false;
+        };
+        let pc = call.cause_pc as usize;
+        if code_cap.bitmask.get(pc) != Some(&1)
+            || code_cap.code.get(pc) != Some(&(crate::instruction::Opcode::Ecalli as u8))
+        {
+            return false;
+        }
+        let skip = crate::interpreter::skip_for_bitmask(&code_cap.bitmask, pc);
+        let Some(resume_pc) = call
+            .cause_pc
+            .checked_add(1)
+            .and_then(|next| next.checked_add(skip as u32))
+        else {
+            return false;
+        };
+        matches!(
+            crate::args::decode_args(
+                &code_cap.code,
+                pc,
+                skip,
+                crate::instruction::Opcode::Ecalli.category(),
+            ),
+            crate::args::Args::Imm { imm }
+                if imm == call.id && resume_pc == call.resume_pc
+        )
+    }
+
+    fn pending_page_fault_matches_vm(&self, vm: &VmInstance, fault: PendingPageFault) -> bool {
+        if fault.address % crate::PVM_PAGE_SIZE != 0 {
+            return false;
+        }
+        let Some(code_cap) = self.code_caps.get(vm.code_cap_id as usize) else {
+            return false;
+        };
+        let pc = fault.cause_pc as usize;
+        if code_cap.bitmask.get(pc) != Some(&1) {
+            return false;
+        }
+        let Some(opcode) = code_cap
+            .code
+            .get(pc)
+            .and_then(|byte| crate::instruction::Opcode::from_byte_in_mode(*byte, self.isa_mode))
+        else {
+            return false;
+        };
+        let skip = crate::interpreter::skip_for_bitmask(&code_cap.bitmask, pc);
+        let args = crate::args::decode_args(&code_cap.code, pc, skip, opcode.category());
+        use crate::args::Args;
+        use crate::instruction::Opcode;
+        let (address, width, write) = match (opcode, args) {
+            (Opcode::StoreImmU8, Args::TwoImm { imm_x, .. }) => (imm_x as u32, 1, true),
+            (Opcode::StoreImmU16, Args::TwoImm { imm_x, .. }) => (imm_x as u32, 2, true),
+            (Opcode::StoreImmU32, Args::TwoImm { imm_x, .. }) => (imm_x as u32, 4, true),
+            (Opcode::StoreImmU64, Args::TwoImm { imm_x, .. }) => (imm_x as u32, 8, true),
+            (Opcode::LoadU8 | Opcode::LoadI8, Args::RegImm { imm, .. }) => (imm as u32, 1, false),
+            (Opcode::LoadU16 | Opcode::LoadI16, Args::RegImm { imm, .. }) => (imm as u32, 2, false),
+            (Opcode::LoadU32 | Opcode::LoadI32, Args::RegImm { imm, .. }) => (imm as u32, 4, false),
+            (Opcode::LoadU64, Args::RegImm { imm, .. }) => (imm as u32, 8, false),
+            (Opcode::StoreU8, Args::RegImm { imm, .. }) => (imm as u32, 1, true),
+            (Opcode::StoreU16, Args::RegImm { imm, .. }) => (imm as u32, 2, true),
+            (Opcode::StoreU32, Args::RegImm { imm, .. }) => (imm as u32, 4, true),
+            (Opcode::StoreU64, Args::RegImm { imm, .. }) => (imm as u32, 8, true),
+            (Opcode::StoreImmIndU8, Args::RegTwoImm { ra, imm_x, .. }) => {
+                (vm.reg(ra).wrapping_add(imm_x) as u32, 1, true)
+            }
+            (Opcode::StoreImmIndU16, Args::RegTwoImm { ra, imm_x, .. }) => {
+                (vm.reg(ra).wrapping_add(imm_x) as u32, 2, true)
+            }
+            (Opcode::StoreImmIndU32, Args::RegTwoImm { ra, imm_x, .. }) => {
+                (vm.reg(ra).wrapping_add(imm_x) as u32, 4, true)
+            }
+            (Opcode::StoreImmIndU64, Args::RegTwoImm { ra, imm_x, .. }) => {
+                (vm.reg(ra).wrapping_add(imm_x) as u32, 8, true)
+            }
+            (Opcode::StoreIndU8, Args::TwoRegImm { rb, imm, .. }) => {
+                (vm.reg(rb).wrapping_add(imm) as u32, 1, true)
+            }
+            (Opcode::StoreIndU16, Args::TwoRegImm { rb, imm, .. }) => {
+                (vm.reg(rb).wrapping_add(imm) as u32, 2, true)
+            }
+            (Opcode::StoreIndU32, Args::TwoRegImm { rb, imm, .. }) => {
+                (vm.reg(rb).wrapping_add(imm) as u32, 4, true)
+            }
+            (Opcode::StoreIndU64, Args::TwoRegImm { rb, imm, .. }) => {
+                (vm.reg(rb).wrapping_add(imm) as u32, 8, true)
+            }
+            (Opcode::LoadIndU8 | Opcode::LoadIndI8, Args::TwoRegImm { rb, imm, .. }) => {
+                (vm.reg(rb).wrapping_add(imm) as u32, 1, false)
+            }
+            (Opcode::LoadIndU16 | Opcode::LoadIndI16, Args::TwoRegImm { rb, imm, .. }) => {
+                (vm.reg(rb).wrapping_add(imm) as u32, 2, false)
+            }
+            (Opcode::LoadIndU32 | Opcode::LoadIndI32, Args::TwoRegImm { rb, imm, .. }) => {
+                (vm.reg(rb).wrapping_add(imm) as u32, 4, false)
+            }
+            (Opcode::LoadIndU64, Args::TwoRegImm { rb, imm, .. }) => {
+                (vm.reg(rb).wrapping_add(imm) as u32, 8, false)
+            }
+            _ => return false,
+        };
+        let permission_at = |page: u32| {
+            let mut permission = None;
+            for slot in 0..=255u8 {
+                if let Some(Cap::Data(data)) = vm.cap_table.get(slot)
+                    && let (Some(base), Some(access)) = (data.base_offset, data.access)
+                    && page >= base
+                    && page < base + data.page_count
+                    && data.is_page_mapped(page - base)
+                {
+                    // Runtime mapping loops are slot ordered; the later
+                    // overlapping mapping is authoritative.
+                    permission = Some(access);
+                }
+            }
+            permission
+        };
+        let page_ok = |page| match permission_at(page) {
+            Some(Access::RW) => true,
+            Some(Access::RO) => !write,
+            None => false,
+        };
+
+        // The transitional JAR profile retains its historical non-cyclic
+        // range classification: after an accessible high tail, the raw
+        // one-past address faults as page zero. Standard continuations use
+        // the exact cyclic exception walk below.
+        if self.isa_mode == crate::IsaMode::Jar {
+            let first_page = address / crate::PVM_PAGE_SIZE;
+            let last_page = ((u64::from(address) + u64::from(width) - 1)
+                / u64::from(crate::PVM_PAGE_SIZE)) as u32;
+            let expected_fault_page = if !page_ok(first_page) {
+                first_page
+            } else if !page_ok(last_page) {
+                last_page
+            } else {
+                return false;
+            };
+            return (u64::from(expected_fault_page) * u64::from(crate::PVM_PAGE_SIZE)) as u32
+                == fault.address;
+        }
+
+        // Reconstruct the standard memory exception in raw required-index
+        // order, reducing each inspected byte modulo 2^32. In particular, an
+        // access with an accessible high tail reaches the wrapped low zone
+        // and panics; it can never produce a forged PageFault(0) retry marker.
+        for offset in 0..width {
+            let byte_address = address.wrapping_add(offset);
+            if self.isa_mode == crate::IsaMode::Conformance && byte_address < crate::PVM_ZONE_SIZE {
+                return false;
+            }
+            let page = byte_address / crate::PVM_PAGE_SIZE;
+            if !page_ok(page) {
+                return page * crate::PVM_PAGE_SIZE == fault.address;
+            }
+        }
+        false
     }
 
     fn snapshot_vm(&self, vm: &VmInstance) -> Result<VmSnapshot, SnapshotError> {
@@ -947,6 +1165,13 @@ impl InvocationKernel {
             caller: vm.caller,
             entry_index: vm.entry_index,
             gas: vm.gas(),
+            gas_charged: vm.gas_charged(),
+            pending_host_call: vm.pending_host_call().map(|call| PendingHostCallSnapshot {
+                id: call.id,
+                cause_pc: call.cause_pc,
+                resume_pc: call.resume_pc,
+            }),
+            pending_page_fault: vm.pending_page_fault(),
             heap_base: vm.heap_base(),
             heap_top: vm.heap_top(),
         })
@@ -998,6 +1223,7 @@ impl InvocationKernel {
                     id,
                     program_hash: cache_key.0,
                     compiled,
+                    code: code_blob.code,
                     jump_table: code_blob.jump_table,
                     bitmask: code_blob.bitmask,
                 });
@@ -1037,7 +1263,7 @@ impl InvocationKernel {
     ///
     /// Returns a `DispatchResult` indicating what the kernel should do next.
     #[inline(always)]
-    pub fn dispatch_ecalli(&mut self, imm: u32) -> DispatchResult {
+    pub fn dispatch_ecalli(&mut self, imm: u64) -> DispatchResult {
         // Range check: ecalli only valid for 0-127. ≥128 panics the VM.
         // Route through handle_vm_fault so it terminates uniformly: a root VM
         // becomes RootPanic, a nested VM is delivered to its caller as a
@@ -1047,10 +1273,8 @@ impl InvocationKernel {
         // so the next full-segment rebuild lost it and diverged from the
         // interpreter.)
         if imm > 127 {
-            self.set_active_reg(7, imm as u64);
-            #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
-            self.flush_live_ctx();
-            return self.handle_vm_fault(FaultType::Panic);
+            self.set_active_reg(7, imm);
+            return DispatchResult::Fault(FaultType::Panic);
         }
         // Charge ecalli gas cost (10) — matches GP host call gas charge
         let ecalli_gas: u64 = 10;
@@ -1063,7 +1287,7 @@ impl InvocationKernel {
         if let Some(ctx) = self.live_ctx {
             // SAFETY: live_ctx is non-null only during JIT execution on this thread;
             // ctx points to the JitContext in the active CodeWindow's CTX page.
-            unsafe { (*ctx).gas -= ecalli_gas as i64 };
+            unsafe { (*ctx).gas -= ecalli_gas };
         } else {
             let g = self.vm_arena.vm(self.active_vm).gas();
             self.vm_arena.vm_mut(self.active_vm).set_gas(g - ecalli_gas);
@@ -1074,7 +1298,7 @@ impl InvocationKernel {
             self.vm_arena.vm_mut(self.active_vm).set_gas(g - ecalli_gas);
         }
 
-        let cap_idx = imm as u8;
+        let cap_idx = u8::try_from(imm).expect("the capability slot range was checked above");
         if cap_idx == IPC_SLOT {
             #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
             self.flush_live_ctx();
@@ -1303,15 +1527,22 @@ impl InvocationKernel {
             // Take cap from caller, auto-unmap if DATA
             if let Some(mut cap) = self.vm_arena.vm_mut(caller_id).cap_table.take(ipc_cap_slot) {
                 if let Cap::Data(ref mut d) = cap {
-                    ipc_was_mapped = d.unmap();
+                    let mapped_bitmap = d.mapped_bitmap.clone();
+                    let mapped_runs = d.mapped_runs();
+                    ipc_was_mapped = d
+                        .unmap()
+                        .map(|(base_page, access)| (base_page, access, mapped_bitmap));
                     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-                    if let Some((base_page, _)) = ipc_was_mapped
+                    if let Some((base_page, _, _)) = ipc_was_mapped.as_ref()
                         && let Some(wb) = self.vm_window_base(caller_id)
                     {
-                        // SAFETY: wb is the caller's assigned 4GB CODE
-                        // window and the DATA cap owned this exact range.
-                        unsafe {
-                            BackingStore::unmap_pages(wb, base_page, d.page_count);
+                        for (page_offset, page_count) in mapped_runs {
+                            // SAFETY: wb is the caller's assigned 4GB CODE
+                            // window and each run came from this DATA cap's
+                            // canonical mapped-page bitmap.
+                            unsafe {
+                                BackingStore::unmap_pages(wb, *base_page + page_offset, page_count);
+                            }
                         }
                     }
                 }
@@ -1373,7 +1604,11 @@ impl InvocationKernel {
         // Return unused gas to caller
         let unused_gas = self.vm_arena.vm(callee_id).gas();
         let cg = self.vm_arena.vm(caller_id).gas();
-        self.vm_arena.vm_mut(caller_id).set_gas(cg + unused_gas);
+        let Some(returned_gas) = cg.checked_add(unused_gas) else {
+            self.vm_arena.vm_mut(callee_id).set_gas(0);
+            return DispatchResult::RootPanic;
+        };
+        self.vm_arena.vm_mut(caller_id).set_gas(returned_gas);
         self.vm_arena.vm_mut(callee_id).set_gas(0);
 
         // Return IPC cap. Moving a DATA cap out of the callee must revoke the
@@ -1389,19 +1624,30 @@ impl InvocationKernel {
             {
                 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
                 if let Some(wb) = self.vm_window_base(callee_id) {
-                    // SAFETY: wb is the callee's assigned 4GB CODE window and
-                    // the DATA capability describes this exact mapped range.
-                    unsafe {
-                        BackingStore::unmap_pages(wb, callee_base_page, d.page_count);
+                    for (page_offset, page_count) in d.mapped_runs() {
+                        // SAFETY: wb is the callee's assigned 4GB CODE window
+                        // and each run came from this DATA cap's canonical
+                        // mapped-page bitmap.
+                        unsafe {
+                            BackingStore::unmap_pages(
+                                wb,
+                                callee_base_page + page_offset,
+                                page_count,
+                            );
+                        }
                     }
                 }
                 d.unmap_all();
             }
-            // Auto-remap DATA cap at caller's original base_page
-            if let Some((base_page, access)) = frame.ipc_was_mapped
-                && let Cap::Data(d) = &mut cap
-            {
-                d.map(base_page, access);
+            // Restore the caller's exact sparse mapping, never the DATA
+            // cap's complete owned range.
+            if let Some((base_page, access, mapped_bitmap)) = frame.ipc_was_mapped {
+                let Cap::Data(d) = &mut cap else {
+                    return DispatchResult::RootPanic;
+                };
+                if !d.restore_mapping(base_page, access, mapped_bitmap) {
+                    return DispatchResult::RootPanic;
+                }
             }
             self.vm_arena
                 .vm_mut(caller_id)
@@ -1418,11 +1664,18 @@ impl InvocationKernel {
                 && let (Some(base_page), Some(access)) = (d.base_offset, d.access)
                 && let Some(wb) = self.vm_window_base(caller_id)
             {
-                // SAFETY: wb is the caller's assigned 4GB CODE window and the
-                // returned DATA cap owns this exact backing range.
-                unsafe {
-                    self.backing
-                        .map_pages(wb, base_page, d.backing_offset, d.page_count, access);
+                for (page_offset, page_count) in d.mapped_runs() {
+                    // SAFETY: wb is the caller's assigned 4GB CODE window and
+                    // the returned DATA cap owns this exact backing run.
+                    unsafe {
+                        self.backing.map_pages(
+                            wb,
+                            base_page + page_offset,
+                            d.backing_offset + page_offset,
+                            page_count,
+                            access,
+                        );
+                    }
                 }
             }
         }
@@ -1917,8 +2170,14 @@ impl InvocationKernel {
             let ctx = unsafe { &*ctx };
             let vm = &mut self.vm_arena.vm_mut(self.active_vm);
             vm.set_regs(ctx.regs);
-            vm.set_gas(ctx.gas.max(0) as u64);
+            vm.set_gas(ctx.gas);
             vm.pc = ctx.pc;
+            vm.set_gas_charged(ctx.gas_charged != 0);
+            vm.set_pending_host_call((ctx.host_pending != 0).then_some(crate::PendingHostCall {
+                id: ctx.exit_arg,
+                cause_pc: ctx.pc,
+                resume_pc: ctx.host_resume_pc,
+            }));
             vm.set_heap_base(ctx.heap_base);
             vm.set_heap_top(ctx.heap_top);
         }
@@ -1950,9 +2209,32 @@ impl InvocationKernel {
         #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
         if let Some(ctx) = self.live_ctx {
             // SAFETY: live_ctx is valid JitContext pointer (see flush_live_ctx).
-            return unsafe { (*ctx).gas.max(0) as u64 };
+            return unsafe { (*ctx).gas };
         }
         self.vm_arena.vm(self.active_vm).gas()
+    }
+
+    fn acknowledge_vm_host_call(&mut self, vm_index: u16) -> bool {
+        let pending = self.vm_arena.vm(vm_index).pending_host_call();
+        let Some(call) = pending else {
+            return false;
+        };
+        let acknowledged = self.vm_arena.vm_mut(vm_index).acknowledge_host_call();
+        debug_assert!(acknowledged);
+        #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+        if vm_index == self.active_vm
+            && let Some(ctx) = self.live_ctx
+        {
+            // SAFETY: live_ctx is the active VM's context page.
+            unsafe {
+                (*ctx).host_pending = 0;
+                (*ctx).entry_pc = call.resume_pc;
+                (*ctx).pc = call.resume_pc;
+                (*ctx).gas_charged = 1;
+                (*ctx).fast_reentry = 0;
+            }
+        }
+        true
     }
 
     /// Resume after a protocol call was handled by the host.
@@ -1967,8 +2249,16 @@ impl InvocationKernel {
             .take()
             .ok_or(SnapshotError::NotAtProtocolBoundary)?;
         let vm = self.vm_arena.vm(self.active_vm);
+        let host_call = vm.pending_host_call();
         if pending.vm_index != self.active_vm
-            || pending.resume_pc != vm.pc
+            || pending.cause_pc != vm.pc
+            || (self.isa_mode == crate::IsaMode::Conformance
+                && host_call.is_none_or(|call| {
+                    call.cause_pc != pending.cause_pc
+                        || call.resume_pc != pending.resume_pc
+                        || call.id != pending.host_call_id
+                }))
+            || pending.gas_charged != vm.gas_charged()
             || pending.result_registers != [7, 8]
         {
             self.pending_protocol_call = Some(pending);
@@ -1976,6 +2266,11 @@ impl InvocationKernel {
         }
         self.set_active_reg(7, result0);
         self.set_active_reg(8, result1);
+        if self.isa_mode == crate::IsaMode::Conformance
+            && !self.acknowledge_vm_host_call(self.active_vm)
+        {
+            return Err(SnapshotError::InvalidScheduler);
+        }
         Ok(())
     }
 
@@ -1985,10 +2280,14 @@ impl InvocationKernel {
             "protocol call must be resumed before another call can suspend"
         );
         let vm = self.vm_arena.vm(self.active_vm);
+        let host_call = vm.pending_host_call();
         self.pending_protocol_call = Some(PendingProtocolCall {
             slot,
+            host_call_id: host_call.map_or(u64::from(slot), |call| call.id),
             vm_index: self.active_vm,
-            resume_pc: vm.pc,
+            cause_pc: host_call.map_or(vm.pc, |call| call.cause_pc),
+            resume_pc: host_call.map_or(vm.pc, |call| call.resume_pc),
+            gas_charged: vm.gas_charged(),
             result_registers: [7, 8],
         });
         KernelResult::ProtocolCall { slot }
@@ -2006,6 +2305,12 @@ impl InvocationKernel {
     #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
     fn active_window_ctx_ptr(&self) -> *mut u8 {
         self.window_pool.window(self.active_window).ctx_ptr()
+    }
+
+    /// Permission table paired with the active 32-bit guest window.
+    #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+    fn active_window_perms(&self) -> *mut u8 {
+        self.window_pool.window(self.active_window).perms()
     }
 
     /// Get window base for a specific VM, if it has an assigned window.
@@ -2076,10 +2381,18 @@ impl InvocationKernel {
                 && let Some(base_offset) = d.base_offset
             {
                 let access = d.access.unwrap_or(Access::RO);
-                // SAFETY: wb is from window_pool (valid 4GB window).
-                unsafe {
-                    self.backing
-                        .map_pages(wb, base_offset, d.backing_offset, d.page_count, access);
+                for (page_offset, page_count) in d.mapped_runs() {
+                    // SAFETY: wb is from window_pool (valid 4GB window), and
+                    // the run is an exact subset of this DATA cap.
+                    unsafe {
+                        self.backing.map_pages(
+                            wb,
+                            base_offset + page_offset,
+                            d.backing_offset + page_offset,
+                            page_count,
+                            access,
+                        );
+                    }
                 }
             }
         }
@@ -2090,28 +2403,35 @@ impl InvocationKernel {
     /// For ecalli (exit_reason=4): keep live_ctx for fast resume, sync only pc.
     /// For all other exits: full register/gas sync, clear live_ctx and signal state.
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    fn sync_after_jit(&mut self, ctx_raw: *mut crate::recompiler::JitContext) -> (u32, u32) {
+    fn sync_after_jit(&mut self, ctx_raw: *mut crate::recompiler::JitContext) -> (u32, u64) {
         // SAFETY: ctx_raw is still valid after JIT execution returns — it points
         // to the JitContext page in the active CodeWindow's mmap region.
         let ctx = unsafe { &*ctx_raw };
         let exit_reason = ctx.exit_reason;
         let exit_arg = ctx.exit_arg;
 
-        if exit_reason == 4 {
-            // ecalli: keep live_ctx so dispatch reads JitContext directly.
-            // Sync only pc to VmInstance (needed for ProtocolCall metadata).
-            self.vm_arena.vm_mut(self.active_vm).pc = ctx.pc;
-            self.live_ctx = Some(ctx_raw);
-        } else {
-            // Non-ecalli: full sync to VmInstance, clear live_ctx.
+        {
             let vm = &mut self.vm_arena.vm_mut(self.active_vm);
             vm.set_regs(ctx.regs);
-            vm.set_gas(ctx.gas.max(0) as u64);
+            vm.set_gas(ctx.gas);
             vm.pc = ctx.pc;
+            vm.set_gas_charged(ctx.gas_charged != 0);
+            vm.set_pending_host_call((ctx.host_pending != 0).then_some(crate::PendingHostCall {
+                id: ctx.exit_arg,
+                cause_pc: ctx.pc,
+                resume_pc: ctx.host_resume_pc,
+            }));
             vm.set_heap_base(ctx.heap_base);
             vm.set_heap_top(ctx.heap_top);
+        }
+
+        if exit_reason == 4 {
+            // ecalli: keep live_ctx so dispatch reads JitContext directly.
+            // Standard execution exposes the causing PC in `ctx.pc`; kernel
+            // dispatch has handled the call and resumes from `entry_pc`.
+            self.live_ctx = Some(ctx_raw);
+        } else {
             self.live_ctx = None;
-            crate::recompiler::signal::SIGNAL_STATE.with(|cell| cell.set(std::ptr::null_mut()));
         }
 
         (exit_reason, exit_arg)
@@ -2126,7 +2446,7 @@ impl InvocationKernel {
     /// VmInstance. To minimize the rebuild cost, `run()` uses `run_recompiler_resume()`
     /// which only updates registers + gas + entry_pc instead of rebuilding all fields.
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    fn run_recompiler_segment(&mut self, code_cap_id: usize) -> (u32, u32) {
+    fn run_recompiler_segment(&mut self, code_cap_id: usize) -> (u32, u64) {
         use crate::recompiler::JitContext;
 
         let code_cap = &self.code_caps[code_cap_id];
@@ -2140,9 +2460,16 @@ impl InvocationKernel {
         unsafe {
             ctx_raw.write(JitContext {
                 regs: *vm.regs(),
-                gas: vm.gas() as i64,
+                gas: vm.gas(),
+                gas_charged: u32::from(vm.gas_charged()),
+                host_pending: u32::from(vm.pending_host_call().is_some()),
+                host_resume_pc: vm.pending_host_call().map_or(0, |call| call.resume_pc),
+                dispatch_len: compiled.dispatch_table.len() as u32,
                 exit_reason: 0,
-                exit_arg: 0,
+                // A full rebuild can resume a Faulted VM whose host dispatch
+                // previously failed. Preserve the original immediate so the
+                // explicit pending-host boundary re-surfaces identically.
+                exit_arg: vm.pending_host_call().map_or(0, |call| call.id),
                 heap_base: vm.heap_base(),
                 heap_top: vm.heap_top(),
                 jt_ptr: code_cap.jump_table.as_ptr(),
@@ -2159,7 +2486,7 @@ impl InvocationKernel {
                 dispatch_table: compiled.dispatch_table.as_ptr(),
                 code_base: compiled.native_code.ptr as u64,
                 flat_buf: self.active_window_base(),
-                flat_perms: std::ptr::null(),
+                flat_perms: self.active_window_perms(),
                 fast_reentry: 0,
                 _pad2: 0,
                 max_heap_pages: 0,
@@ -2176,7 +2503,7 @@ impl InvocationKernel {
     /// re-enter native code. No full register sync needed.
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[inline(always)]
-    fn run_recompiler_resume(&mut self, code_cap_id: usize) -> (u32, u32) {
+    fn run_recompiler_resume(&mut self, code_cap_id: usize) -> (u32, u64) {
         use crate::recompiler::JitContext;
 
         let code_cap = &self.code_caps[code_cap_id];
@@ -2195,6 +2522,18 @@ impl InvocationKernel {
         ctx.exit_reason = 0;
         ctx.exit_arg = 0;
 
+        if let Some(exit) = crate::recompiler::prepare_external_entry(
+            ctx,
+            &compiled.fault_resume_offsets,
+            &compiled.gas_block_start_by_pc,
+            &compiled.block_gas_costs,
+            self.isa_mode,
+        ) {
+            let synced = self.sync_after_jit(ctx_raw);
+            debug_assert_eq!(synced, exit);
+            return exit;
+        }
+
         // Re-install the SIGSEGV state on THIS frame's stack. The state
         // installed by the original `run_recompiler_inner` lived in that
         // (now-returned) frame — re-entering native code with a guest page
@@ -2209,6 +2548,8 @@ impl InvocationKernel {
             ctx_ptr: ctx_raw,
             trap_table_ptr: compiled.trap_table.as_ptr(),
             trap_table_len: compiled.trap_table.len(),
+            fault_resume_offsets_ptr: compiled.fault_resume_offsets.as_ptr(),
+            fault_resume_offsets_len: compiled.fault_resume_offsets.len(),
         };
         signal::SIGNAL_STATE.with(|cell| cell.set(&mut signal_state as *mut _));
 
@@ -2217,6 +2558,7 @@ impl InvocationKernel {
         unsafe {
             entry(ctx_raw);
         }
+        signal::SIGNAL_STATE.with(|cell| cell.set(std::ptr::null_mut()));
 
         self.sync_after_jit(ctx_raw)
     }
@@ -2228,7 +2570,7 @@ impl InvocationKernel {
         &mut self,
         code_cap_id: usize,
         ctx_raw: *mut crate::recompiler::JitContext,
-    ) -> (u32, u32) {
+    ) -> (u32, u64) {
         use crate::recompiler::signal;
 
         let code_cap = &self.code_caps[code_cap_id];
@@ -2236,6 +2578,20 @@ impl InvocationKernel {
             crate::backend::CompiledProgram::Recompiler(c) => c,
             _ => unreachable!(),
         };
+
+        // SAFETY: `ctx_raw` points to the active window's initialized context.
+        let ctx = unsafe { &mut *ctx_raw };
+        if let Some(exit) = crate::recompiler::prepare_external_entry(
+            ctx,
+            &compiled.fault_resume_offsets,
+            &compiled.gas_block_start_by_pc,
+            &compiled.block_gas_costs,
+            self.isa_mode,
+        ) {
+            let synced = self.sync_after_jit(ctx_raw);
+            debug_assert_eq!(synced, exit);
+            return exit;
+        }
 
         signal::ensure_installed();
         let mut signal_state = signal::SignalState {
@@ -2246,6 +2602,8 @@ impl InvocationKernel {
             ctx_ptr: ctx_raw,
             trap_table_ptr: compiled.trap_table.as_ptr(),
             trap_table_len: compiled.trap_table.len(),
+            fault_resume_offsets_ptr: compiled.fault_resume_offsets.as_ptr(),
+            fault_resume_offsets_len: compiled.fault_resume_offsets.len(),
         };
         signal::SIGNAL_STATE.with(|cell| cell.set(&mut signal_state as *mut _));
 
@@ -2254,6 +2612,7 @@ impl InvocationKernel {
         unsafe {
             entry(ctx_raw);
         }
+        signal::SIGNAL_STATE.with(|cell| cell.set(std::ptr::null_mut()));
 
         self.sync_after_jit(ctx_raw)
     }
@@ -2268,7 +2627,7 @@ impl InvocationKernel {
         &mut self,
         code_cap_id: usize,
         observer: Option<&mut dyn for<'a> FnMut(KernelInstructionObservation<'a>)>,
-    ) -> (u32, u32) {
+    ) -> (u32, u64) {
         let code_cap = &self.code_caps[code_cap_id];
         let active_vm = self.active_vm;
         let program_hash = code_cap.program_hash;
@@ -2356,7 +2715,8 @@ impl InvocationKernel {
         interp.pc = vm.pc;
         interp.heap_base = vm.heap_base();
         interp.heap_top = vm.heap_top();
-        interp.isa_mode = self.isa_mode;
+        interp.set_isa_mode(self.isa_mode);
+        interp.restore_boundary_state(vm.gas_charged(), vm.pending_host_call());
         interp.set_page_perms(page_perms);
 
         let (exit, _gas_used) = match observer {
@@ -2449,7 +2809,9 @@ impl InvocationKernel {
         let vm = &mut self.vm_arena.vm_mut(self.active_vm);
         vm.set_regs(interp.registers);
         vm.set_gas(interp.gas);
-        vm.pc = interp.pc;
+        vm.pc = interp.continuation_pc();
+        vm.set_gas_charged(interp.gas_charged);
+        vm.set_pending_host_call(interp.pending_host_call());
         vm.set_heap_base(interp.heap_base);
         vm.set_heap_top(interp.heap_top);
 
@@ -2458,7 +2820,7 @@ impl InvocationKernel {
             crate::ExitReason::Trap => (7, 0), // deliberate trap
             crate::ExitReason::Panic => (1, 0),
             crate::ExitReason::OutOfGas => (2, 0),
-            crate::ExitReason::PageFault(addr) => (3, addr),
+            crate::ExitReason::PageFault(addr) => (3, u64::from(addr)),
             crate::ExitReason::HostCall(id) => (4, id),
             crate::ExitReason::Ecall => (6, 0),
         }
@@ -2469,7 +2831,7 @@ impl InvocationKernel {
         &mut self,
         code_cap_id: usize,
         observer: Option<&mut dyn for<'a> FnMut(KernelInstructionObservation<'a>)>,
-    ) -> (u32, u32) {
+    ) -> (u32, u64) {
         match &self.code_caps[code_cap_id].compiled {
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             crate::backend::CompiledProgram::Recompiler(_) => {
@@ -2485,6 +2847,38 @@ impl InvocationKernel {
     /// Run the kernel until it needs host interaction or terminates.
     pub fn run(&mut self) -> KernelResult {
         self.run_inner(None)
+    }
+
+    /// Acknowledge a previously surfaced root page fault after the host has
+    /// repaired the VM's mapping. Execution retries the causing instruction
+    /// with its containing gas block still funded.
+    pub fn resume_page_fault(&mut self) -> Result<(), SnapshotError> {
+        let pending = self
+            .pending_page_fault
+            .take()
+            .ok_or(SnapshotError::NotAtProtocolBoundary)?;
+        let vm = self.vm_arena.vm(self.active_vm);
+        if pending.vm_index != self.active_vm
+            || pending.cause_pc != vm.pc
+            || pending.gas_charged != vm.gas_charged()
+            || vm.pending_page_fault() != Some(pending.address)
+        {
+            self.pending_page_fault = Some(pending);
+            return Err(SnapshotError::InvalidScheduler);
+        }
+        self.vm_arena
+            .vm_mut(self.active_vm)
+            .set_pending_page_fault(None);
+        #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+        {
+            self.live_ctx = None;
+            self.recompiler_resume_cap = None;
+            if self.window_pool.window_owner(self.active_window) == Some(self.active_vm) {
+                self.unmap_vm_data_caps(self.active_vm, self.active_window);
+                self.map_vm_data_caps(self.active_vm, self.active_window);
+            }
+        }
+        Ok(())
     }
 
     /// Run the complete nested invocation while observing canonical PVM steps.
@@ -2515,8 +2909,8 @@ impl InvocationKernel {
         mut observer: Option<&mut dyn for<'a> FnMut(KernelInstructionObservation<'a>)>,
     ) -> KernelResult {
         assert!(
-            self.pending_protocol_call.is_none(),
-            "resume_protocol_call must inject the pending result before run"
+            self.pending_protocol_call.is_none() && self.pending_page_fault.is_none(),
+            "a pending protocol call or page fault must be resumed before run"
         );
         loop {
             // Ensure active VM has a window assigned (handles eviction + DATA cap mapping).
@@ -2536,7 +2930,18 @@ impl InvocationKernel {
                 // Only updates regs/gas/pc in the existing JitContext.
                 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
                 {
-                    self.run_recompiler_resume(ccid)
+                    if ccid == code_cap_id
+                        && self.live_ctx.is_some()
+                        && self.window_pool.window_owner(self.active_window) == Some(self.active_vm)
+                    {
+                        self.run_recompiler_resume(ccid)
+                    } else {
+                        // A host handler that needed authoritative VmInstance
+                        // state may have flushed the context before committing
+                        // its result.  Rebuild in that case: the old CTX page
+                        // is no longer the source of truth.
+                        self.run_one_segment(code_cap_id, None)
+                    }
                 }
                 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
                 {
@@ -2551,10 +2956,14 @@ impl InvocationKernel {
             match exit_reason {
                 4 => {
                     // HostCall(imm) — ecalli (pc already synced by backend)
-                    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
                     let prev_vm = self.active_vm;
                     match self.dispatch_ecalli(exit_arg) {
                         DispatchResult::Continue => {
+                            // The host operation is now committed. Until this
+                            // point the issuer remains suspended at the
+                            // causing `ecalli`, so an OOG/fault in dispatch
+                            // cannot accidentally advance it.
+                            self.acknowledge_vm_host_call(prev_vm);
                             // Internal dispatch (RETYPE, CREATE, CALL VM, management ops).
                             // Use resume only if BOTH code cap AND active VM are unchanged.
                             // VM switches (CALL handle, REPLY) change registers/gas — stale
@@ -2565,6 +2974,9 @@ impl InvocationKernel {
                                     self.vm_arena.vm(self.active_vm).code_cap_id as usize;
                                 if self.active_vm == prev_vm
                                     && new_code_cap_id == code_cap_id
+                                    && self.live_ctx.is_some()
+                                    && self.window_pool.window_owner(self.active_window)
+                                        == Some(self.active_vm)
                                     && matches!(
                                         self.code_caps[code_cap_id].compiled,
                                         crate::backend::CompiledProgram::Recompiler(_)
@@ -2576,13 +2988,17 @@ impl InvocationKernel {
                             continue;
                         }
                         DispatchResult::ProtocolCall { slot } => {
-                            // Mark for fast resume on next run() call.
-                            // Leave signal state installed for the resume path.
+                            // Mark the still-live context for a cheap resume;
+                            // signal TLS itself was cleared immediately after
+                            // native code returned.
                             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
                             if matches!(
                                 self.code_caps[code_cap_id].compiled,
                                 crate::backend::CompiledProgram::Recompiler(_)
-                            ) {
+                            ) && self.live_ctx.is_some()
+                                && self.window_pool.window_owner(self.active_window)
+                                    == Some(self.active_vm)
+                            {
                                 self.recompiler_resume_cap = Some(code_cap_id);
                             }
                             return self.suspend_protocol_call(slot);
@@ -2591,7 +3007,26 @@ impl InvocationKernel {
                         DispatchResult::RootPanic => return KernelResult::Panic,
                         DispatchResult::RootOutOfGas => return KernelResult::OutOfGas,
                         DispatchResult::RootPageFault(a) => return KernelResult::PageFault(a),
-                        DispatchResult::Fault(_) => continue, // non-root fault handled
+                        DispatchResult::Fault(fault) => {
+                            #[cfg(all(
+                                feature = "std",
+                                target_os = "linux",
+                                target_arch = "x86_64"
+                            ))]
+                            self.flush_live_ctx();
+                            match self.handle_vm_fault(fault) {
+                                DispatchResult::Continue => continue,
+                                DispatchResult::RootHalt => return KernelResult::Halt,
+                                DispatchResult::RootPanic => return KernelResult::Panic,
+                                DispatchResult::RootOutOfGas => return KernelResult::OutOfGas,
+                                DispatchResult::RootPageFault(a) => {
+                                    return KernelResult::PageFault(a);
+                                }
+                                DispatchResult::ProtocolCall { .. } | DispatchResult::Fault(_) => {
+                                    return KernelResult::Panic;
+                                }
+                            }
+                        }
                     }
                 }
                 0 => {
@@ -2628,7 +3063,23 @@ impl InvocationKernel {
                 }
                 3 => {
                     // Page fault
-                    match self.handle_vm_fault(FaultType::PageFault(exit_arg)) {
+                    let Ok(page_address) = u32::try_from(exit_arg) else {
+                        return KernelResult::Panic;
+                    };
+                    if self.call_stack.is_empty() {
+                        #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+                        self.flush_live_ctx();
+                        let vm = self.vm_arena.vm_mut(self.active_vm);
+                        vm.set_pending_page_fault(Some(page_address));
+                        self.pending_page_fault = Some(PendingPageFault {
+                            vm_index: self.active_vm,
+                            address: page_address,
+                            cause_pc: vm.pc,
+                            gas_charged: vm.gas_charged(),
+                        });
+                        return KernelResult::PageFault(page_address);
+                    }
+                    match self.handle_vm_fault(FaultType::PageFault(page_address)) {
                         DispatchResult::RootPageFault(a) => return KernelResult::PageFault(a),
                         DispatchResult::Continue => continue,
                         _ => return KernelResult::Panic,
@@ -2649,7 +3100,18 @@ impl InvocationKernel {
                         DispatchResult::RootPanic => return KernelResult::Panic,
                         DispatchResult::RootOutOfGas => return KernelResult::OutOfGas,
                         DispatchResult::RootPageFault(a) => return KernelResult::PageFault(a),
-                        DispatchResult::Fault(_) => continue,
+                        DispatchResult::Fault(fault) => match self.handle_vm_fault(fault) {
+                            DispatchResult::Continue => continue,
+                            DispatchResult::RootHalt => return KernelResult::Halt,
+                            DispatchResult::RootPanic => return KernelResult::Panic,
+                            DispatchResult::RootOutOfGas => return KernelResult::OutOfGas,
+                            DispatchResult::RootPageFault(a) => {
+                                return KernelResult::PageFault(a);
+                            }
+                            DispatchResult::ProtocolCall { .. } | DispatchResult::Fault(_) => {
+                                return KernelResult::Panic;
+                            }
+                        },
                     }
                 }
                 _ => return KernelResult::Panic,
@@ -2950,7 +3412,13 @@ impl InvocationKernel {
                 // Return unused gas
                 let unused_gas = self.vm_arena.vm(callee_id).gas();
                 let cg = self.vm_arena.vm(caller_id).gas();
-                self.vm_arena.vm_mut(caller_id).set_gas(cg + unused_gas);
+                let Some(returned_gas) = cg.checked_add(unused_gas) else {
+                    // Fail closed without duplicating the invalid balance.
+                    self.vm_arena.vm_mut(callee_id).set_gas(0);
+                    return DispatchResult::RootPanic;
+                };
+                self.vm_arena.vm_mut(caller_id).set_gas(returned_gas);
+                self.vm_arena.vm_mut(callee_id).set_gas(0);
 
                 // Set φ[7]=aux_value, φ[8]=status
                 self.vm_arena.vm_mut(caller_id).set_reg(7, aux_value);
@@ -3101,6 +3569,17 @@ fn restore_vm(
         .map_err(|_| SnapshotError::InvalidArena)?;
     vm.set_entry_regs(entry_registers);
     vm.pc = snapshot.pc;
+    vm.set_gas_charged(snapshot.gas_charged);
+    vm.set_pending_host_call(
+        snapshot
+            .pending_host_call
+            .map(|call| crate::PendingHostCall {
+                id: call.id,
+                cause_pc: call.cause_pc,
+                resume_pc: call.resume_pc,
+            }),
+    );
+    vm.set_pending_page_fault(snapshot.pending_page_fault);
     vm.caller = snapshot.caller;
     vm.set_heap_base(snapshot.heap_base);
     vm.set_heap_top(snapshot.heap_top);
@@ -3187,22 +3666,35 @@ fn restore_capability(
 }
 
 fn snapshot_call_frame(frame: &CallFrame) -> CallFrameSnapshot {
-    let (ipc_base_page, ipc_access) = match frame.ipc_was_mapped {
-        Some((base_page, access)) => (Some(base_page), Some(snapshot_access(access))),
-        None => (None, None),
+    let (ipc_base_page, ipc_access, ipc_mapped_bitmap) = match &frame.ipc_was_mapped {
+        Some((base_page, access, mapped_bitmap)) => (
+            Some(*base_page),
+            Some(snapshot_access(*access)),
+            Some(mapped_bitmap.clone()),
+        ),
+        None => (None, None, None),
     };
     CallFrameSnapshot {
         caller_vm_id: frame.caller_vm_id,
         ipc_cap_idx: frame.ipc_cap_idx,
         ipc_base_page,
         ipc_access,
+        ipc_mapped_bitmap,
     }
 }
 
 fn restore_call_frame(frame: &CallFrameSnapshot) -> Result<CallFrame, SnapshotError> {
-    let ipc_was_mapped = match (frame.ipc_base_page, frame.ipc_access) {
-        (None, None) => None,
-        (Some(base_page), Some(access)) => Some((base_page, restore_access(access))),
+    let ipc_was_mapped = match (
+        frame.ipc_base_page,
+        frame.ipc_access,
+        &frame.ipc_mapped_bitmap,
+    ) {
+        (None, None, None) => None,
+        (Some(base_page), Some(access), Some(mapped_bitmap))
+            if mapped_bitmap.iter().any(|byte| *byte != 0) =>
+        {
+            Some((base_page, restore_access(access), mapped_bitmap.clone()))
+        }
         _ => return Err(SnapshotError::InvalidScheduler),
     };
     if frame.ipc_cap_idx.is_none() && ipc_was_mapped.is_some() {
@@ -3258,6 +3750,26 @@ fn restore_memory(
 
 fn validate_call_stack(kernel: &InvocationKernel) -> Result<(), SnapshotError> {
     let mut callers = BTreeSet::new();
+    let mut waiting = BTreeSet::new();
+    let mut running = None;
+    for (index, (_, vm)) in kernel.vm_arena.snapshot_slots().enumerate() {
+        let Some(vm) = vm else { continue };
+        let index = u16::try_from(index).map_err(|_| SnapshotError::InvalidScheduler)?;
+        match vm.state {
+            VmState::Running if running.replace(index).is_some() => {
+                return Err(SnapshotError::InvalidScheduler);
+            }
+            VmState::WaitingForReply => {
+                waiting.insert(index);
+            }
+            _ => {}
+        }
+    }
+    if running != Some(kernel.active_vm) {
+        return Err(SnapshotError::InvalidScheduler);
+    }
+
+    let mut parent = None;
     for frame in &kernel.call_stack {
         if !callers.insert(frame.caller_vm_id) {
             return Err(SnapshotError::InvalidScheduler);
@@ -3267,15 +3779,19 @@ fn validate_call_stack(kernel: &InvocationKernel) -> Result<(), SnapshotError> {
             .vm_arena
             .get(VmId::new(frame.caller_vm_id, generation))
             .ok_or(SnapshotError::InvalidScheduler)?;
-        if caller.state != VmState::WaitingForReply {
+        if caller.state != VmState::WaitingForReply || caller.caller != parent {
             return Err(SnapshotError::InvalidScheduler);
         }
+        parent = Some(frame.caller_vm_id);
+    }
+    if callers != waiting {
+        return Err(SnapshotError::InvalidScheduler);
     }
     let active = kernel.vm_arena.vm(kernel.active_vm);
-    match kernel.call_stack.last() {
-        Some(frame) if active.caller == Some(frame.caller_vm_id) => Ok(()),
-        None if active.caller.is_none() => Ok(()),
-        _ => Err(SnapshotError::InvalidScheduler),
+    if active.caller == parent {
+        Ok(())
+    } else {
+        Err(SnapshotError::InvalidScheduler)
     }
 }
 
@@ -3504,11 +4020,10 @@ mod tests {
     }
 
     #[test]
-    fn test_ecall_isa_modes() {
+    fn jar_kernel_dispatches_its_private_dynamic_ecall() {
         // LoadImm64 φ[12] = empty-slot subject, then Ecall, then Trap.
-        // Jar mode dispatches the ecall (unresolvable subject → WHAT,
-        // continue) and panics at the Trap (pc 11); Conformance mode panics
-        // at the Ecall opcode itself (pc 10).
+        // The remaining legacy kernel dispatches the ecall (unresolvable
+        // subject → WHAT, continue) and panics at the Trap (pc 11).
         let mut code = vec![20, 12]; // LoadImm64 φ[12]
         code.extend_from_slice(&(200u64 << 32).to_le_bytes()); // subject = slot 200 (empty)
         code.push(3); // PC 10: Ecall
@@ -3527,23 +4042,6 @@ mod tests {
             kernel.vm_arena.vm(kernel.active_vm).pc,
             11,
             "Jar mode dispatches the ecall and panics at the following Trap"
-        );
-
-        let mut kernel = InvocationKernel::new_with_backend_and_mode(
-            &blob,
-            &[],
-            100_000,
-            crate::backend::PvmBackend::Default,
-            crate::IsaMode::Conformance,
-        )
-        .unwrap();
-        let _ = kernel.vm_arena.vm_mut(0).transition(VmState::Running);
-        let result = kernel.run();
-        assert!(matches!(result, KernelResult::Panic));
-        assert_eq!(
-            kernel.vm_arena.vm(kernel.active_vm).pc,
-            10,
-            "Conformance mode panics at the Ecall opcode itself"
         );
     }
 
@@ -3795,7 +4293,7 @@ mod tests {
         kernel.set_active_reg(7, 0); // no caps to copy
         kernel.set_active_reg(12, 66); // HANDLE at slot 66 (64=CODE, 65=DATA)
 
-        let result = kernel.dispatch_ecalli(code_slot as u32);
+        let result = kernel.dispatch_ecalli(code_slot as u64);
         assert!(matches!(result, DispatchResult::Continue));
 
         // Should have created VM 1
@@ -3828,7 +4326,7 @@ mod tests {
         kernel.set_active_reg(8, 99);
         kernel.set_active_reg(12, 0);
 
-        let result = kernel.dispatch_ecalli(handle_idx as u32);
+        let result = kernel.dispatch_ecalli(handle_idx as u64);
         assert!(matches!(result, DispatchResult::Continue));
 
         // Active VM should now be the child (VM 1)
@@ -3845,7 +4343,7 @@ mod tests {
         kernel.vm_arena.vm_mut(1).set_reg(1, 1234);
         kernel.set_active_reg(7, 100);
         kernel.set_active_reg(8, 200);
-        let result = kernel.dispatch_ecalli(IPC_SLOT as u32); // REPLY
+        let result = kernel.dispatch_ecalli(u64::from(IPC_SLOT)); // REPLY
         assert!(matches!(result, DispatchResult::Continue));
 
         // Back to VM 0
@@ -3864,7 +4362,7 @@ mod tests {
         kernel.set_active_reg(8, 8);
         kernel.set_active_reg(12, 0);
         assert!(matches!(
-            kernel.dispatch_ecalli(handle_idx as u32),
+            kernel.dispatch_ecalli(handle_idx as u64),
             DispatchResult::Continue
         ));
         assert_eq!(kernel.active_vm, 1);
@@ -3886,14 +4384,16 @@ mod tests {
         kernel.dispatch_ecalli(64);
         let handle = kernel.active_reg(7) as u8;
 
-        let backing_offset = kernel.untyped.retype(1).unwrap();
+        let backing_offset = kernel.untyped.retype(4).unwrap();
         kernel
             .vm_arena
             .vm_mut(0)
             .cap_table
-            .set(67, Cap::Data(DataCap::new(backing_offset, 1)));
+            .set(67, Cap::Data(DataCap::new(backing_offset, 4)));
+        // Map only offsets 1 and 3. Native window reconstruction and the
+        // IPC round trip must preserve these holes exactly.
         kernel.set_active_reg(7, 20);
-        kernel.set_active_reg(8, 0);
+        kernel.set_active_reg(8, 1);
         kernel.set_active_reg(9, 1);
         kernel.set_active_reg(10, 1);
         kernel.set_active_reg(12, (67u64) << 32);
@@ -3901,12 +4401,48 @@ mod tests {
             kernel.dispatch_ecall(0x02),
             DispatchResult::Continue
         ));
+        kernel.set_active_reg(7, 20);
+        kernel.set_active_reg(8, 3);
+        kernel.set_active_reg(9, 1);
+        kernel.set_active_reg(10, 1);
+        kernel.set_active_reg(12, (67u64) << 32);
+        assert!(matches!(
+            kernel.dispatch_ecall(0x02),
+            DispatchResult::Continue
+        ));
+        assert!(matches!(
+            kernel.vm_arena.vm(0).cap_table.get(67),
+            Some(Cap::Data(data))
+                if data.mapped_runs() == vec![(1, 1), (3, 1)]
+        ));
+
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            let perms = kernel.active_window_perms();
+            // SAFETY: the active CodeWindow owns one permission byte per
+            // guest page; pages 20..24 are within that table.
+            let actual = unsafe { core::slice::from_raw_parts(perms.add(20), 4) };
+            assert_eq!(actual, &[0, 2, 0, 2]);
+
+            // Reconstruct the complete VM window from capability metadata.
+            // Only bitmap runs may become mapped again.
+            unsafe {
+                assert!(BackingStore::unmap_pages(
+                    kernel.active_window_base(),
+                    20,
+                    4,
+                ));
+            }
+            kernel.map_vm_data_caps(0, kernel.active_window);
+            let actual = unsafe { core::slice::from_raw_parts(perms.add(20), 4) };
+            assert_eq!(actual, &[0, 2, 0, 2]);
+        }
 
         // CALL moves the cap into child IPC slot 0 and revokes the caller
         // mapping. The child may then map the same capability into its CNode.
         kernel.set_active_reg(12, 67);
         assert!(matches!(
-            kernel.dispatch_ecalli(handle as u32),
+            kernel.dispatch_ecalli(handle as u64),
             DispatchResult::Continue
         ));
         assert!(kernel.vm_arena.vm(0).cap_table.get(67).is_none());
@@ -3915,6 +4451,17 @@ mod tests {
             Some(Cap::Data(data)) if !data.has_any_mapped()
         ));
 
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            let caller_window = kernel.vm_window_base(0).unwrap();
+            // SAFETY: the permission table is the CodeWindow metadata prefix.
+            let perms = unsafe { caller_window.sub(crate::backing::CODE_WINDOW_HEADER_SIZE) };
+            let actual = unsafe { core::slice::from_raw_parts(perms.add(20), 4) };
+            assert_eq!(actual, &[0, 0, 0, 0]);
+        }
+
+        // The callee chooses a different sparse mapping while it owns the
+        // cap. REPLY must revoke that view and restore the caller's bitmap.
         kernel.set_active_reg(7, 20);
         kernel.set_active_reg(8, 0);
         kernel.set_active_reg(9, 1);
@@ -3924,27 +4471,52 @@ mod tests {
             kernel.dispatch_ecall(0x02),
             DispatchResult::Continue
         ));
+        kernel.set_active_reg(7, 20);
+        kernel.set_active_reg(8, 2);
+        kernel.set_active_reg(9, 1);
+        kernel.set_active_reg(10, 1);
+        kernel.set_active_reg(12, 0);
+        assert!(matches!(
+            kernel.dispatch_ecall(0x02),
+            DispatchResult::Continue
+        ));
         assert!(matches!(
             kernel.vm_arena.vm(1).cap_table.get(IPC_SLOT),
-            Some(Cap::Data(data)) if data.mapped_page_count() == 1
+            Some(Cap::Data(data)) if data.mapped_runs() == vec![(0, 1), (2, 1)]
         ));
 
         // REPLY moves ownership back, revokes the child mapping, and restores
         // the caller's original mapping.
         assert!(matches!(
-            kernel.dispatch_ecalli(IPC_SLOT as u32),
+            kernel.dispatch_ecalli(u64::from(IPC_SLOT)),
             DispatchResult::Continue
         ));
         assert!(kernel.vm_arena.vm(1).cap_table.get(IPC_SLOT).is_none());
         assert!(matches!(
             kernel.vm_arena.vm(0).cap_table.get(67),
             Some(Cap::Data(data))
-                if data.base_offset == Some(20) && data.mapped_page_count() == 1
+                if data.base_offset == Some(20)
+                    && data.mapped_runs() == vec![(1, 1), (3, 1)]
         ));
-        assert!(kernel.backing.write_init_data(backing_offset, b"ipc"));
+
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            let perms = kernel.active_window_perms();
+            // SAFETY: the active CodeWindow owns one permission byte per
+            // guest page; pages 20..24 are within that table.
+            let actual = unsafe { core::slice::from_raw_parts(perms.add(20), 4) };
+            assert_eq!(actual, &[0, 2, 0, 2]);
+        }
+
+        assert!(kernel.backing.write_init_data(backing_offset + 1, b"ipc"));
         assert_eq!(
-            kernel.read_data_cap_window(20 * crate::PVM_PAGE_SIZE, 3),
+            kernel.read_data_cap_window(21 * crate::PVM_PAGE_SIZE, 3),
             Some(b"ipc".to_vec())
+        );
+        assert_eq!(
+            kernel.read_data_cap_window(20 * crate::PVM_PAGE_SIZE, 1),
+            None,
+            "the caller's bitmap hole must stay unmapped"
         );
     }
 
@@ -3968,7 +4540,7 @@ mod tests {
         // VM 0 calls VM 1
         kernel.set_active_reg(7, 0);
         kernel.set_active_reg(12, 0); // no IPC cap (slot 0 = IPC itself)
-        kernel.dispatch_ecalli(handle1 as u32);
+        kernel.dispatch_ecalli(handle1 as u64);
         assert_eq!(kernel.active_vm, 1);
 
         // Copy handle1 to VM 1 — but VM 0 is WaitingForReply,
@@ -4004,7 +4576,7 @@ mod tests {
         let parent_gas_before = kernel.vm_arena.vm(0).gas();
         kernel.set_active_reg(7, 0);
         kernel.set_active_reg(12, 0); // no IPC cap (slot 0 = IPC itself)
-        kernel.dispatch_ecalli(handle_idx as u32);
+        kernel.dispatch_ecalli(handle_idx as u64);
 
         assert_eq!(kernel.active_vm, 1);
         assert_eq!(kernel.vm_arena.vm(1).gas(), 5000);
@@ -4157,7 +4729,7 @@ mod tests {
         kernel.set_active_reg(9, 0); // zero gas
         kernel.set_active_reg(12, 0);
 
-        let result = kernel.dispatch_ecalli(handle_idx as u32);
+        let result = kernel.dispatch_ecalli(handle_idx as u64);
         assert!(matches!(result, DispatchResult::Continue));
 
         // Child should be running but with very little gas
@@ -4183,7 +4755,7 @@ mod tests {
         kernel.set_active_reg(7, 10);
         kernel.set_active_reg(8, 0);
         kernel.set_active_reg(12, 0);
-        kernel.dispatch_ecalli(h1 as u32);
+        kernel.dispatch_ecalli(h1 as u64);
         assert_eq!(kernel.active_vm, 1);
         assert_eq!(kernel.active_reg(7), 10);
 
@@ -4196,7 +4768,7 @@ mod tests {
         if kernel.vm_arena.len() < 3 {
             // CODE cap wasn't propagated — skip nested part, just test reply chain
             kernel.set_active_reg(7, 77);
-            kernel.dispatch_ecalli(IPC_SLOT as u32);
+            kernel.dispatch_ecalli(u64::from(IPC_SLOT));
             assert_eq!(kernel.active_vm, 0);
             assert_eq!(kernel.active_reg(7), 77);
             return;
@@ -4207,19 +4779,19 @@ mod tests {
         kernel.set_active_reg(7, 20);
         kernel.set_active_reg(8, 0);
         kernel.set_active_reg(12, 0);
-        kernel.dispatch_ecalli(h2 as u32);
+        kernel.dispatch_ecalli(h2 as u64);
         assert_eq!(kernel.active_vm, 2);
         assert_eq!(kernel.active_reg(7), 20);
 
         // VM 2 replies with 99
         kernel.set_active_reg(7, 99);
-        kernel.dispatch_ecalli(IPC_SLOT as u32);
+        kernel.dispatch_ecalli(u64::from(IPC_SLOT));
         assert_eq!(kernel.active_vm, 1);
         assert_eq!(kernel.active_reg(7), 99);
 
         // VM 1 replies with 77
         kernel.set_active_reg(7, 77);
-        kernel.dispatch_ecalli(IPC_SLOT as u32);
+        kernel.dispatch_ecalli(u64::from(IPC_SLOT));
         assert_eq!(kernel.active_vm, 0);
         assert_eq!(kernel.active_reg(7), 77);
     }
@@ -4701,12 +5273,40 @@ mod tests {
         let snapshot =
             snapshot_root_at_protocol_call(&blob, crate::backend::PvmBackend::ForceInterpreter);
 
+        let mut retired_v4 = snapshot.clone();
+        retired_v4.version = 4;
+        assert_eq!(
+            KernelSnapshot::from_bytes(&retired_v4.to_bytes()),
+            Err(SnapshotError::UnsupportedVersion(4))
+        );
+        assert!(matches!(
+            InvocationKernel::restore(
+                &blob,
+                &retired_v4,
+                crate::backend::PvmBackend::ForceInterpreter,
+                None,
+            ),
+            Err(SnapshotError::UnsupportedVersion(4))
+        ));
+
         let mut wrong_program = snapshot.clone();
         wrong_program.code_hashes[0][0] ^= 1;
         assert!(matches!(
             InvocationKernel::restore(
                 &blob,
                 &wrong_program,
+                crate::backend::PvmBackend::ForceInterpreter,
+                None,
+            ),
+            Err(SnapshotError::ProgramMismatch)
+        ));
+
+        let mut retired_standard_profile = snapshot.clone();
+        retired_standard_profile.isa_mode = SnapshotIsaMode::Conformance;
+        assert!(matches!(
+            InvocationKernel::restore(
+                &blob,
+                &retired_standard_profile,
                 crate::backend::PvmBackend::ForceInterpreter,
                 None,
             ),
@@ -4762,11 +5362,21 @@ mod tests {
             .cap_table
             .set(7, Cap::Protocol(ProtocolCap { id: 7 }));
 
+        let backing_offset = kernel.untyped.retype(4).unwrap();
+        let mut ipc_data = DataCap::new(backing_offset, 4);
+        assert!(ipc_data.map_pages(20, Access::RW, 1, 1));
+        assert!(ipc_data.map_pages(20, Access::RW, 3, 1));
+        kernel
+            .vm_arena
+            .vm_mut(0)
+            .cap_table
+            .set(67, Cap::Data(ipc_data));
+
         kernel.set_active_reg(6, 0xfeed_cafe);
         kernel.set_active_reg(7, 10);
-        kernel.set_active_reg(12, 0);
+        kernel.set_active_reg(12, 67);
         assert!(matches!(
-            kernel.dispatch_ecalli(child_handle as u32),
+            kernel.dispatch_ecalli(child_handle as u64),
             DispatchResult::Continue
         ));
         assert_eq!(kernel.active_vm, 1);
@@ -4777,6 +5387,37 @@ mod tests {
         let snapshot = kernel.snapshot().unwrap();
         assert_eq!(snapshot.call_stack.len(), 1);
         assert_eq!(snapshot.active_vm, 1);
+        assert_eq!(
+            snapshot.call_stack[0].ipc_mapped_bitmap.as_deref(),
+            Some(&[0b0000_1010][..])
+        );
+
+        let encoded = snapshot.to_bytes();
+        assert_eq!(KernelSnapshot::from_bytes(&encoded).unwrap(), snapshot);
+
+        let mut duplicate_running = snapshot.clone();
+        duplicate_running.arena.slots[0].vm.as_mut().unwrap().state = SnapshotVmState::Running;
+        assert!(matches!(
+            InvocationKernel::restore(
+                &blob,
+                &duplicate_running,
+                crate::backend::PvmBackend::ForceInterpreter,
+                None,
+            ),
+            Err(SnapshotError::InvalidScheduler)
+        ));
+
+        let mut broken_chain = snapshot.clone();
+        broken_chain.arena.slots[1].vm.as_mut().unwrap().caller = None;
+        assert!(matches!(
+            InvocationKernel::restore(
+                &blob,
+                &broken_chain,
+                crate::backend::PvmBackend::ForceInterpreter,
+                None,
+            ),
+            Err(SnapshotError::InvalidScheduler)
+        ));
 
         for backend in [
             crate::backend::PvmBackend::ForceInterpreter,
@@ -4797,122 +5438,10 @@ mod tests {
             assert_eq!(restored.vm_arena.vm(1).state, VmState::Idle);
             assert_eq!(restored.active_reg(6), 0xfeed_cafe);
             assert_eq!(restored.active_reg(7), 42);
-        }
-    }
-
-    // === GP standard-program (SPI) init path =================================
-
-    /// Wrap raw code + a memory profile in a bare GP standard-program blob
-    /// (no metadata prefix). Sizes are kept small so every length nat is a
-    /// single byte; `ro`/`rw` are placed verbatim.
-    fn build_standard_program(
-        ro: &[u8],
-        rw: &[u8],
-        heap_pages: u16,
-        stack_size: u32,
-        code: &[u8],
-        bitmask: &[u8],
-    ) -> Vec<u8> {
-        assert!(code.len() < 128, "test code must fit a 1-byte nat");
-        // Code sub-blob, compact deblob: E(|j|=0) ‖ z=1 ‖ E(|c|) ‖ code ‖ bitmask.
-        let mut cb = vec![0u8, 1u8, code.len() as u8];
-        cb.extend_from_slice(code);
-        let mut packed = vec![0u8; code.len().div_ceil(8)];
-        for (i, &b) in bitmask.iter().enumerate() {
-            if b != 0 {
-                packed[i / 8] |= 1 << (i % 8);
-            }
-        }
-        cb.extend_from_slice(&packed);
-
-        let mut blob = Vec::new();
-        blob.extend_from_slice(&(ro.len() as u32).to_le_bytes()[..3]); // E₃(|o|)
-        blob.extend_from_slice(&(rw.len() as u32).to_le_bytes()[..3]); // E₃(|w|)
-        blob.extend_from_slice(&heap_pages.to_le_bytes()); // E₂(z)
-        blob.extend_from_slice(&stack_size.to_le_bytes()[..3]); // E₃(s)
-        blob.extend_from_slice(ro);
-        blob.extend_from_slice(rw);
-        blob.extend_from_slice(&(cb.len() as u32).to_le_bytes()); // E₄(|c|)
-        blob.extend_from_slice(&cb);
-        blob
-    }
-
-    fn run_standard(blob: &[u8], args: &[u8], backend: crate::backend::PvmBackend) -> KernelResult {
-        let mut kernel = InvocationKernel::new_standard(blob, args, 1_000_000, backend).unwrap();
-        let _ = kernel.vm_arena.vm_mut(0).transition(VmState::Running);
-        kernel.run()
-    }
-
-    const SPI_BACKENDS: [crate::backend::PvmBackend; 2] = [
-        crate::backend::PvmBackend::ForceInterpreter,
-        crate::backend::PvmBackend::ForceRecompiler,
-    ];
-
-    // Standard-program memory landmarks for stack_size == one page.
-    const SPI_STACK_TOP: u64 = (1u64 << 32) - 2 * (1 << 16) - (1 << 24);
-    const SPI_ARG_BASE: u64 = (1u64 << 32) - (1 << 16) - (1 << 24);
-    const SPI_RO_BASE: u64 = 1 << 16;
-
-    #[test]
-    fn spi_standard_program_halts() {
-        // JumpInd RA, 0 → φ[0] (halt address) → halt.
-        let code = [50u8, 0, 0, 0, 0, 0];
-        let bitmask = [1u8, 0, 0, 0, 0, 0];
-        let blob = build_standard_program(&[], &[], 0, 4096, &code, &bitmask);
-        for be in SPI_BACKENDS {
-            assert!(
-                matches!(run_standard(&blob, &[], be), KernelResult::Halt),
-                "a trivial standard program must load and halt on {be:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn spi_standard_sets_gp_registers() {
-        let code = [50u8, 0, 0, 0, 0, 0];
-        let bitmask = [1u8, 0, 0, 0, 0, 0];
-        let blob = build_standard_program(&[], &[], 0, 4096, &code, &bitmask);
-        let args = [0xABu8; 5];
-        let kernel = InvocationKernel::new_standard(
-            &blob,
-            &args,
-            1_000_000,
-            crate::backend::PvmBackend::ForceInterpreter,
-        )
-        .unwrap();
-        let vm = kernel.vm_arena.vm(0);
-        assert_eq!(vm.reg(0), crate::PVM_HALT_ADDR, "φ[0] = RA (halt)");
-        assert_eq!(vm.reg(1), SPI_STACK_TOP, "φ[1] = SP (stack top)");
-        assert_eq!(vm.reg(7), SPI_ARG_BASE, "φ[7] = argument base");
-        assert_eq!(vm.reg(8), args.len() as u64, "φ[8] = argument length");
-    }
-
-    #[test]
-    fn spi_standard_maps_stack_writable() {
-        // Store into the base of the stack page; a correctly mapped writable
-        // stack halts, an unmapped/read-only one faults.
-        let stack_bottom = (SPI_STACK_TOP - 4096) as u32;
-        let (code, bitmask) = store_at_program(stack_bottom);
-        let blob = build_standard_program(&[], &[], 0, 4096, &code, &bitmask);
-        for be in SPI_BACKENDS {
-            assert!(
-                matches!(run_standard(&blob, &[], be), KernelResult::Halt),
-                "the stack region must be mapped writable at its GP address on {be:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn spi_standard_maps_ro_readable() {
-        // Load from the read-only region; a correct mapping halts.
-        let ro = [0x11u8, 0x22, 0x33, 0x44];
-        let (code, bitmask) = load_at_program(SPI_RO_BASE as u32);
-        let blob = build_standard_program(&ro, &[], 0, 4096, &code, &bitmask);
-        for be in SPI_BACKENDS {
-            assert!(
-                matches!(run_standard(&blob, &[], be), KernelResult::Halt),
-                "the read-only region must be mapped readable at Z_Z on {be:?}"
-            );
+            assert!(matches!(
+                restored.vm_arena.vm(0).cap_table.get(67),
+                Some(Cap::Data(data)) if data.mapped_runs() == vec![(1, 1), (3, 1)]
+            ));
         }
     }
 }

@@ -1,8 +1,8 @@
 //! `link_elf_spi` end-to-end: transpile hand-assembled rv64em ELFs into GP
 //! standard-program (SPI) blobs and validate them against vos_pvm — the parser
 //! (`spi::parse_standard_program`), the GP layout (`StandardProgram::layout`),
-//! the kernel-free refine harness (`vos_pvm::refine`), and, differentially, the
-//! `JAR\x02` manifest path (`link_elf` + `InvocationKernel`).
+//! and the kernel-free Refine harness (`vos_pvm::refine`). The retired
+//! JAR/capability-kernel profile is deliberately not an oracle or fallback.
 //!
 //! The guests follow the zero-hostcall refine convention, which is
 //! backend-portable: arguments arrive as `φ7 = ptr` / `φ8 = len`, output is
@@ -12,7 +12,7 @@
 use vos_pvm::refine::{self, MemoryModel};
 use vos_pvm::spi::parse_standard_program;
 use vos_pvm::{ExitReason, PVM_HALT_ADDR, PVM_INIT_INPUT_SIZE, PVM_ZONE_SIZE};
-use vos_pvm_compiler::{TranspileError, link_elf, link_elf_spi};
+use vos_pvm_compiler::{TranspileError, link_elf_spi};
 
 const GAS: u64 = 10_000_000;
 
@@ -121,6 +121,32 @@ fn lbu(rd: u32, rs1: u32, imm: i32) -> u32 {
 fn add(rd: u32, rs1: u32, rs2: u32) -> u32 {
     (rs2 << 20) | (rs1 << 15) | (rd << 7) | 0x33
 }
+fn beq(rs1: u32, rs2: u32, imm: i32) -> u32 {
+    let i = imm as u32;
+    (((i >> 12) & 1) << 31)
+        | (((i >> 5) & 0x3f) << 25)
+        | (rs2 << 20)
+        | (rs1 << 15)
+        | (((i >> 1) & 0xf) << 8)
+        | (((i >> 11) & 1) << 7)
+        | 0x63
+}
+fn jal(rd: u32, imm: i32) -> u32 {
+    let i = imm as u32;
+    (((i >> 20) & 1) << 31)
+        | (((i >> 1) & 0x3ff) << 21)
+        | (((i >> 11) & 1) << 20)
+        | (((i >> 12) & 0xff) << 12)
+        | (rd << 7)
+        | 0x6f
+}
+fn jalr(rd: u32, rs1: u32, imm: i32) -> u32 {
+    ((imm as u32 & 0xfff) << 20) | (rs1 << 15) | (rd << 7) | 0x67
+}
+fn sb(rs2: u32, rs1: u32, imm: i32) -> u32 {
+    let i = imm as u32 & 0xfff;
+    ((i >> 5) << 25) | (rs2 << 20) | (rs1 << 15) | ((i & 0x1f) << 7) | 0x23
+}
 fn sd(rs2: u32, rs1: u32, imm: i32) -> u32 {
     let i = imm as u32 & 0xFFF;
     ((i >> 5) << 25) | (rs2 << 20) | (rs1 << 15) | (3 << 12) | ((i & 0x1F) << 7) | 0x23
@@ -132,6 +158,77 @@ fn ret() -> u32 {
 
 fn assemble(insts: &[u32]) -> Vec<u8> {
     insts.iter().flat_map(|i| i.to_le_bytes()).collect()
+}
+
+#[test]
+fn relocated_relative_table_value_is_not_a_raw_call_interior_pointer() {
+    const TEXT: u64 = 0x40_0000;
+    const TABLE: u64 = 0x1_0000;
+    const CALLEE: u64 = TEXT + TABLE + 4;
+    // target - table_base numerically equals the second instruction of a call.
+    // It is a relocated four-byte offset, not an eight-byte absolute pointer.
+    let mut instructions = vec![addi(0, 0, 0); ((CALLEE - TEXT) / 4 + 1) as usize];
+    instructions[0] = (RA << 7) | 0x17;
+    instructions[1] = jalr(RA, RA, 0);
+    instructions[2] = jalr(0, RA, 0);
+    *instructions.last_mut().unwrap() = jalr(0, RA, 0);
+    let text = assemble(&instructions);
+    let table = (CALLEE - TABLE).to_le_bytes();
+    let mut symbols = vec![0; 3 * 24];
+    symbols[24 + 8..24 + 16].copy_from_slice(&CALLEE.to_le_bytes());
+    symbols[48 + 8..48 + 16].copy_from_slice(&TABLE.to_le_bytes());
+    let relocation = |address: u64, symbol: u64, kind: u64| {
+        [
+            address.to_le_bytes(),
+            ((symbol << 32) | kind).to_le_bytes(),
+            0u64.to_le_bytes(),
+        ]
+        .concat()
+    };
+    let mut relocations = relocation(TEXT, 1, 19); // CALL_PLT
+    let build = |relocations: &[u8]| {
+        build_elf(
+            TEXT,
+            &[
+                (".text", 1, 6, TEXT, &text),
+                (".rodata", 1, 2, TABLE, &table),
+                (".symtab", 2, 0, 0, &symbols),
+                (".rela.text", 4, 0, 0, relocations),
+            ],
+        )
+    };
+    // Without data relocations this really is a claimed raw interior pointer;
+    // do not weaken the existing fusion-safety rejection to fix the false hit.
+    assert!(matches!(
+        link_elf_spi(&build(&relocations)),
+        Err(TranspileError::InvalidSection(_))
+    ));
+    relocations.extend(relocation(TABLE, 1, 35)); // ADD32 target
+    relocations.extend(relocation(TABLE, 2, 39)); // SUB32 table base
+    let blob = link_elf_spi(&build(&relocations)).expect("relative table must not split call pair");
+    let parsed = parse_standard_program(&blob).expect("valid standard program");
+    assert_eq!(
+        &parsed.ro_data[4..8],
+        &[0; 4],
+        "four-byte relocation must not overwrite its neighbor"
+    );
+    assert_ne!(
+        &parsed.ro_data[..4],
+        &table[..4],
+        "relative target must still be rewritten"
+    );
+
+    // A relocation covering only the high half also excludes the whole raw
+    // eight-byte candidate, even when its symbolic target is not executable.
+    // Both target discovery and pointer rewriting must honor that ownership.
+    let mut high_half = relocation(TEXT, 1, 19);
+    high_half.extend(relocation(TABLE + 4, 0, 1)); // ABS32 to null
+    let blob = link_elf_spi(&build(&high_half)).expect("overlapping relocation excludes heuristic");
+    let parsed = parse_standard_program(&blob).unwrap();
+    assert_eq!(
+        parsed.ro_data, table,
+        "heuristic must not rewrite relocated scalar bytes"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -172,6 +269,100 @@ fn checksum_guest_elf() -> Vec<u8> {
     )
 }
 
+/// Two predecessors carry different stack offsets into one shared ADD. The
+/// linear predecessor's load-immediate must never fuse into the targeted ADD:
+/// doing so overwrites the other predecessor's live register value.
+fn shared_consumer_diamond_elf() -> Vec<u8> {
+    let text = assemble(&[
+        lbu(T0, A0, 0),       //  0: select a predecessor
+        beq(T0, 0, 16),       //  4: zero -> alternate at 20
+        lui(A2, 0),           //  8: fallthrough offset producer
+        addi(A2, A2, -0x1e0), // 12
+        jal(0, 12),           // 16: join at 28 with a2 = -0x1e0
+        lui(A2, 0),           // 20: alternate offset producer
+        addi(A2, A2, -0x2d0), // 24
+        add(A0, SP, A2),      // 28: shared, directly targeted consumer
+        addi(T1, 0, 0x5a),    // 32
+        sb(T1, A0, 0),        // 36: make the selected byte readable
+        addi(A1, 0, 1),       // 40: one-byte output
+        ret(),                // 44
+    ]);
+    build_elf(TEXT_VADDR, &[(".text", 1, 0x6, TEXT_VADDR, &text)])
+}
+
+/// A stripped direct call represented only by a raw AUIPC+JALR pair. Its
+/// callee entry is also the consumer after an unrelated linear predecessor.
+fn raw_direct_call_elf() -> Vec<u8> {
+    let text = assemble(&[
+        addi(T2, RA, 0),      //  0: preserve the host return address
+        addi(A2, 0, -0x1e0),  //  4: caller's live stack offset
+        0x0000_0297,          //  8: auipc t0, 0
+        jalr(RA, T0, 24),     // 12: call target 32, return to 16
+        addi(RA, T2, 0),      // 16: restore host return address
+        ret(),                // 20
+        lui(A2, 0),           // 24: unrelated linear predecessor
+        addi(A2, A2, -0x2d0), // 28
+        add(A0, SP, A2),      // 32: raw-pair-only callee entry
+        addi(T1, 0, 0x5a),    // 36
+        sb(T1, A0, 0),        // 40
+        addi(A1, 0, 1),       // 44
+        ret(),                // 48
+    ]);
+    build_elf(TEXT_VADDR, &[(".text", 1, 0x6, TEXT_VADDR, &text)])
+}
+
+/// A stripped code pointer materialized by raw AUIPC+ADDI before an indirect
+/// call. The linker accepts this form without relocation metadata as well.
+fn raw_materialized_pointer_call_elf() -> Vec<u8> {
+    let text = assemble(&[
+        addi(T2, RA, 0),      //  0: preserve the host return address
+        addi(A2, 0, -0x1e0),  //  4: caller's live stack offset
+        0x0000_0297,          //  8: auipc t0, 0
+        addi(T0, T0, 28),     // 12: materialize callee entry 36
+        jalr(RA, T0, 0),      // 16: indirect call, return to 20
+        addi(RA, T2, 0),      // 20: restore host return address
+        ret(),                // 24
+        lui(A2, 0),           // 28: unrelated linear predecessor
+        addi(A2, A2, -0x2d0), // 32
+        add(A0, SP, A2),      // 36: materialized-pointer-only callee entry
+        addi(T1, 0, 0x5a),    // 40
+        sb(T1, A0, 0),        // 44
+        addi(A1, 0, 1),       // 48
+        ret(),                // 52
+    ]);
+    build_elf(TEXT_VADDR, &[(".text", 1, 0x6, TEXT_VADDR, &text)])
+}
+
+/// A stripped indirect call whose callee is discoverable only through a raw
+/// initialized-data code pointer accepted by the linker's pointer rewriter.
+fn raw_data_pointer_call_elf() -> Vec<u8> {
+    let callee = TEXT_VADDR + 36;
+    let pointer = callee.to_le_bytes();
+    let text = assemble(&[
+        addi(T2, RA, 0),      //  0: preserve the host return address
+        lui(T0, 0x10),        //  4: raw pointer at 0x1_0000
+        ld(T0, T0, 0),        //  8
+        addi(A2, 0, -0x1e0),  // 12: caller's live stack offset
+        jalr(RA, T0, 0),      // 16: indirect call, return to 20
+        addi(RA, T2, 0),      // 20: restore host return address
+        ret(),                // 24
+        lui(A2, 0),           // 28: unrelated linear predecessor
+        addi(A2, A2, -0x2d0), // 32
+        add(A0, SP, A2),      // 36: raw-pointer-only callee entry
+        addi(T1, 0, 0x5a),    // 40
+        sb(T1, A0, 0),        // 44
+        addi(A1, 0, 1),       // 48
+        ret(),                // 52
+    ]);
+    build_elf(
+        TEXT_VADDR,
+        &[
+            (".rodata", 1, 0x2, RO_VADDR, &pointer),
+            (".text", 1, 0x6, TEXT_VADDR, &text),
+        ],
+    )
+}
+
 // ---------------------------------------------------------------------------
 // (a) Round-trip: the emitted blob parses and lays out the intended zones.
 // ---------------------------------------------------------------------------
@@ -186,8 +377,8 @@ fn spi_blob_round_trips_and_lays_out_per_gp() {
 
     // Sections and header fields carry the linker's values (§ the mapping
     // documented on `link_elf_spi`): ro linked exactly at Z_Z needs no
-    // padding; the stack byte capacity equals the manifest's stack_pages
-    // worth; the heap page count is the linker's default 16.
+    // padding; the stack byte capacity equals the standard program's declared
+    // stack size; the heap page count is the linker's default 16.
     assert_eq!(prog.ro_data, RO_CONST.to_le_bytes());
     assert!(prog.rw_data.is_empty());
     assert_eq!(prog.stack_size as u64, z_z);
@@ -216,6 +407,41 @@ fn spi_blob_round_trips_and_lays_out_per_gp() {
     assert_eq!(l.registers[1], stack_top);
     assert_eq!(l.registers[7], l.args.base);
     assert_eq!(l.registers[8], ARGS.len() as u64);
+}
+
+#[test]
+fn branch_target_preserves_each_predecessors_live_immediate() {
+    let blob = link_elf_spi(&shared_consumer_diamond_elf()).expect("diamond links");
+
+    for (argument, offset) in [(1u8, 0x1e0u64), (0, 0x2d0)] {
+        let invocation = refine::execute(&blob, &[argument], GAS).expect("diamond executes");
+        assert_eq!(invocation.exit, ExitReason::Halt);
+        assert_eq!(invocation.output_bounded(1).as_deref(), Some(&[0x5a][..]));
+        assert_eq!(
+            invocation.registers[7],
+            invocation.registers[1] - offset,
+            "the shared ADD must consume the offset from its actual predecessor"
+        );
+    }
+}
+
+#[test]
+fn stripped_direct_and_data_pointer_entries_preserve_live_inputs() {
+    for elf in [
+        raw_direct_call_elf(),
+        raw_materialized_pointer_call_elf(),
+        raw_data_pointer_call_elf(),
+    ] {
+        let blob = link_elf_spi(&elf).expect("stripped call links");
+        let invocation = refine::execute(&blob, &[], GAS).expect("stripped call executes");
+        assert_eq!(invocation.exit, ExitReason::Halt);
+        assert_eq!(invocation.output_bounded(1).as_deref(), Some(&[0x5a][..]));
+        assert_eq!(
+            invocation.registers[7],
+            invocation.registers[1] - 0x1e0,
+            "callee must consume the caller's live offset"
+        );
+    }
 }
 
 /// `.rodata` linked above the GP base gets leading zero padding so it still
@@ -248,14 +474,16 @@ fn ro_linked_above_base_gets_leading_padding() {
 
     let inv = refine::execute(&blob, &[], GAS).expect("executes");
     assert_eq!(inv.exit, ExitReason::Halt);
-    assert_eq!(inv.output().as_deref(), Some(&RO_CONST.to_le_bytes()[..]));
+    assert_eq!(
+        inv.output_bounded(core::mem::size_of::<u64>()).as_deref(),
+        Some(&RO_CONST.to_le_bytes()[..])
+    );
 }
 
 /// `.data` is re-based to the GP rw base `2·Z_Z + zone_round(|o|)`: the
 /// linker's inter-section padding is stripped, the section keeps its vaddr,
-/// and the region is writable. (This zone placement exists only in the SPI
-/// container — the manifest maps rw right after ro — which is why data-in-rw
-/// guests are exercised SPI-only.)
+/// and the region is writable. This test pins the standard-program zone
+/// placement independently of the retired capability-manifest layout.
 #[test]
 fn rw_data_lands_at_linked_vaddr_under_spi() {
     let rw_vaddr = 3 * PVM_ZONE_SIZE as u64; // 0x3_0000 (|o| = 8 → one ro zone)
@@ -285,7 +513,35 @@ fn rw_data_lands_at_linked_vaddr_under_spi() {
 
     let inv = refine::execute(&blob, &[], GAS).expect("executes");
     assert_eq!(inv.exit, ExitReason::Halt);
-    assert_eq!(inv.output().as_deref(), Some(&rw_const.to_le_bytes()[..]));
+    assert_eq!(
+        inv.output_bounded(core::mem::size_of::<u64>()).as_deref(),
+        Some(&rw_const.to_le_bytes()[..])
+    );
+}
+
+#[test]
+fn trailing_bss_is_encoded_as_zero_pages_not_artifact_bytes() {
+    let rw_vaddr = 3 * PVM_ZONE_SIZE as u64;
+    let data = 0xCAFE_BABEu64.to_le_bytes();
+    let bss = [0u8; 2 * 4096];
+    let text = assemble(&[ret()]);
+    let elf = build_elf(
+        TEXT_VADDR,
+        &[
+            (".text", 1, 0x6, TEXT_VADDR, &text),
+            (".rodata", 1, 0x2, RO_VADDR, &RO_CONST.to_le_bytes()),
+            (".data", 1, 0x3, rw_vaddr, &data),
+            (".bss", 8, 0x3, rw_vaddr + 4096, &bss),
+        ],
+    );
+
+    let blob = link_elf_spi(&elf).expect("links");
+    let program = parse_standard_program(&blob).expect("parses");
+    assert_eq!(program.rw_data, &data[..4]);
+    assert_eq!(program.heap_pages, 18, "two BSS pages plus base heap");
+    let layout = program.layout(&[]).expect("lays out");
+    assert_eq!(layout.rw.base, rw_vaddr);
+    assert_eq!(layout.rw.size, 19 * 4096);
 }
 
 /// Guests linked below the GP bases cannot resolve their absolute data
@@ -306,8 +562,6 @@ fn data_linked_below_gp_bases_is_rejected() {
         matches!(&err, TranspileError::InvalidSection(m) if m.contains("read-only")),
         "unexpected error: {err:?}"
     );
-    link_elf(&ro_low).expect("the manifest container still accepts it");
-
     let rw_low = build_elf(
         TEXT_VADDR,
         &[
@@ -325,57 +579,7 @@ fn data_linked_below_gp_bases_is_rejected() {
 }
 
 // ---------------------------------------------------------------------------
-// (b) Differential: the same ELF through both containers behaves the same.
-// ---------------------------------------------------------------------------
-
-/// The same hostcall-free ELF built as a `JAR\x02` manifest (run under the
-/// capability kernel) and as an SPI blob (run under `vos_pvm::refine`) reaches
-/// the same halt with the same register file — except the two host-owned,
-/// layout-determined registers: φ1 (SP: manifest stack top vs GP stack top)
-/// and φ7 (derived SP-relative output pointer). Both are asserted to hold
-/// the *same SP-relative value*, and the designated output bytes are
-/// asserted byte-equal.
-#[test]
-fn manifest_and_spi_executions_agree() {
-    let elf = checksum_guest_elf();
-    let spi_blob = link_elf_spi(&elf).expect("SPI links");
-    let manifest_blob = link_elf(&elf).expect("manifest links");
-
-    // SPI path: the kernel-free refine harness (interpreter-only).
-    let inv = refine::execute_with(&spi_blob, &ARGS, GAS, MemoryModel::Auto).expect("SPI executes");
-    assert_eq!(inv.exit, ExitReason::Halt);
-
-    // Manifest path: the capability kernel.
-    let mut kernel =
-        vos_pvm::kernel::InvocationKernel::new(&manifest_blob, &ARGS, GAS).expect("kernel loads");
-    assert!(
-        matches!(kernel.run(), vos_pvm::kernel::KernelResult::Halt),
-        "kernel run halts"
-    );
-    let kregs = *kernel.vm_arena.vm(0).regs();
-
-    // Register files agree except the layout-determined φ1/φ7.
-    for (i, (s, k)) in inv.registers.iter().zip(kregs.iter()).enumerate() {
-        if i == 1 || i == 7 {
-            continue;
-        }
-        assert_eq!(s, k, "φ{i} diverges between SPI and manifest");
-    }
-    assert_eq!(inv.registers[7], inv.registers[1] - 8, "SPI output at SP-8");
-    assert_eq!(kregs[7], kregs[1] - 8, "manifest output at SP-8");
-    assert_eq!(inv.registers[9], SUM, "φ9 holds the checksum");
-
-    // Output bytes agree: refine's φ7/φ8 accessor vs the kernel's memory.
-    let spi_out = inv.output().expect("SPI output readable");
-    let (kmem, _, _) = kernel.extract_flat_mem();
-    let kptr = kregs[7] as usize;
-    let kout = &kmem[kptr..kptr + kregs[8] as usize];
-    assert_eq!(spi_out, kout, "output bytes agree");
-    assert_eq!(spi_out, SUM.to_le_bytes());
-}
-
-// ---------------------------------------------------------------------------
-// (c) Refine-convention smoke under the refine harness, both memory models.
+// Refine-convention smoke under the standard harness, both memory models.
 // ---------------------------------------------------------------------------
 
 /// The refine-convention contract end-to-end on the SPI backend: args in via
@@ -390,7 +594,7 @@ fn refine_convention_guest_round_trips_args() {
         let inv = refine::execute_with(&blob, &ARGS, GAS, model).expect("executes");
         assert_eq!(inv.exit, ExitReason::Halt, "{model:?}");
         assert_eq!(
-            inv.output().as_deref(),
+            inv.output_bounded(core::mem::size_of::<u64>()).as_deref(),
             Some(&SUM.to_le_bytes()[..]),
             "{model:?}: output is RO_CONST + args[0]"
         );
@@ -404,5 +608,8 @@ fn refine_convention_guest_round_trips_args() {
     // garbage registers. (This guest reads args[0], so give it one byte.)
     let inv = refine::execute(&blob, &[0], GAS).expect("executes");
     assert_eq!(inv.exit, ExitReason::Halt);
-    assert_eq!(inv.output().as_deref(), Some(&RO_CONST.to_le_bytes()[..]));
+    assert_eq!(
+        inv.output_bounded(core::mem::size_of::<u64>()).as_deref(),
+        Some(&RO_CONST.to_le_bytes()[..])
+    );
 }

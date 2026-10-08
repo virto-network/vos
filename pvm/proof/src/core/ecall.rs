@@ -11,10 +11,15 @@
 //! categorisation is recoverable in comments — the wire ID is the only thing
 //! that matters for the chip surface.
 
-/// Hostcall ID for blake2b_compress precompile.
+/// Hostcall ID for blake2b_compress precompile: the VOS precompile id,
+/// outside every id JAM assigns (`vos_pvm::precompile::BLAKE2B_COMPRESS`).
+/// The CPU chip selects the BLAKE2b relation by the internal dispatch code
+/// [`DISPATCH_BLAKE2B_COMPRESS`], not by this wire id.
 /// Convention: φ[10]=ptr_h, φ[11]=ptr_m, φ[12]=t_low (counter bytes in message).
 /// h is read (64 bytes), m is read (128 bytes). Result overwrites h.
-pub const ECALL_BLAKE2B_COMPRESS: u32 = 100;
+pub const ECALL_BLAKE2B_COMPRESS: u32 = 0x400;
+/// CPU-chip dispatch code for the BLAKE2b relation.
+pub(crate) const DISPATCH_BLAKE2B_COMPRESS: u8 = 100;
 
 /// Hostcall ID for Ristretto255 scalar multiplication precompile.
 ///
@@ -87,3 +92,40 @@ pub const ECALL_VOS_GROW_HEAP: u32 = 117;
 pub const ECALL_VOS_DEBUG_WRITE: u32 = 118;
 /// VOS scheduler-supplied nested actor invocation capability.
 pub const ECALL_VOS_INVOKE: u32 = 119;
+
+/// Whether the proof runtime has a deterministic handler for this Standard
+/// `ecalli` identifier. This is the union of the cryptographic precompiles
+/// and the lifecycle stubs exposed by [`crate::core::tracing::TracingPvm`].
+///
+/// The result is committed into ProgramMemory so an untrusted prover cannot
+/// mark an unknown call as acknowledged and continue execution past it.
+pub(crate) const fn is_proof_host_call_allowed(id: u64) -> bool {
+    matches!(id, 1 | 2 | 4 | 5 | 6 | 26)
+        || id == ECALL_BLAKE2B_COMPRESS as u64
+        || id == ECALL_RISTRETTO_SCALAR_MULT as u64
+        || id == ECALL_RISTRETTO_POINT_ADD as u64
+        || id == ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE as u64
+        || id == ECALL_SCALAR_MUL_MOD_L as u64
+        || id == ECALL_SCALAR_ADD_MOD_L as u64
+        || id == ECALL_VOS_DEBUG_WRITE as u64
+}
+
+/// Exact proof-chip dispatch identifier for a cryptographic precompile.
+///
+/// Lifecycle/VOS stubs deliberately return zero: they may acknowledge and
+/// continue without emitting a cryptographic call relation. A non-zero value
+/// is committed by ProgramMemory and binds a continued host-call row to the
+/// matching CPU selector (and therefore to that selector's call relation).
+pub const fn proof_precompile_dispatch_id(id: u64) -> u8 {
+    match id {
+        id if id == ECALL_BLAKE2B_COMPRESS as u64 => DISPATCH_BLAKE2B_COMPRESS,
+        id if id == ECALL_RISTRETTO_SCALAR_MULT as u64 => ECALL_RISTRETTO_SCALAR_MULT as u8,
+        id if id == ECALL_RISTRETTO_POINT_ADD as u64 => ECALL_RISTRETTO_POINT_ADD as u8,
+        id if id == ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE as u64 => {
+            ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE as u8
+        }
+        id if id == ECALL_SCALAR_MUL_MOD_L as u64 => ECALL_SCALAR_MUL_MOD_L as u8,
+        id if id == ECALL_SCALAR_ADD_MOD_L as u64 => ECALL_SCALAR_ADD_MOD_L as u8,
+        _ => 0,
+    }
+}

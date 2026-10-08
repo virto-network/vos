@@ -32,6 +32,126 @@ use crate::PVM_PAGE_SIZE;
 
 const PAGE: usize = PVM_PAGE_SIZE as usize;
 
+/// One non-zero page in a canonical sparse memory image.
+///
+/// Images are ordered by `page_index` and never contain an all-zero page.
+/// Keeping this representation at the interpreter boundary lets proof
+/// tracers snapshot a 32-bit guest address space without materialising its
+/// mostly-zero, nearly 4 GiB logical byte image.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NonZeroPage {
+    pub page_index: u32,
+    pub bytes: [u8; PAGE],
+}
+
+/// Deterministic sparse value image of guest memory.
+///
+/// Permissions are intentionally not part of the value image. Callers that
+/// commit complete architectural state must bind [`Memory::page_perms`]
+/// separately.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SparseMemoryImage {
+    span: u64,
+    pages: Vec<NonZeroPage>,
+}
+
+impl SparseMemoryImage {
+    /// Construct a canonical image. Returns `None` for an invalid span,
+    /// unordered/duplicate/out-of-range pages, or an all-zero listed page.
+    pub fn new(span: u64, pages: Vec<NonZeroPage>) -> Option<Self> {
+        if span > 1u64 << 32 || !span.is_multiple_of(PAGE as u64) {
+            return None;
+        }
+        let page_count = span / PAGE as u64;
+        let mut previous = None;
+        for page in &pages {
+            if u64::from(page.page_index) >= page_count
+                || previous.is_some_and(|p| p >= page.page_index)
+                || page.bytes.iter().all(|&byte| byte == 0)
+            {
+                return None;
+            }
+            previous = Some(page.page_index);
+        }
+        Some(Self { span, pages })
+    }
+
+    pub fn span(&self) -> u64 {
+        self.span
+    }
+
+    pub fn pages(&self) -> &[NonZeroPage] {
+        &self.pages
+    }
+
+    /// Return a page by index, or an all-zero page when it is absent.
+    pub fn page(&self, page_index: u32) -> [u8; PAGE] {
+        self.pages
+            .binary_search_by_key(&page_index, |page| page.page_index)
+            .ok()
+            .map_or([0; PAGE], |index| self.pages[index].bytes)
+    }
+
+    /// Read one logical byte. Out-of-span addresses read as zero, matching
+    /// [`Memory::read_bytes`].
+    pub fn byte(&self, address: u32) -> u8 {
+        if u64::from(address) >= self.span {
+            return 0;
+        }
+        let page_index = address / PVM_PAGE_SIZE;
+        let offset = (address % PVM_PAGE_SIZE) as usize;
+        self.pages
+            .binary_search_by_key(&page_index, |page| page.page_index)
+            .ok()
+            .map_or(0, |index| self.pages[index].bytes[offset])
+    }
+
+    /// Apply bytes to the logical image while preserving canonical ordering
+    /// and dropping pages that become all-zero.
+    pub fn write(&mut self, address: u32, mut bytes: &[u8]) -> bool {
+        let Some(end) = u64::from(address).checked_add(bytes.len() as u64) else {
+            return false;
+        };
+        if end > self.span {
+            return false;
+        }
+        let mut cursor = u64::from(address);
+        while !bytes.is_empty() {
+            let page_index = (cursor / PAGE as u64) as u32;
+            let offset = (cursor % PAGE as u64) as usize;
+            let len = (PAGE - offset).min(bytes.len());
+            let search = self
+                .pages
+                .binary_search_by_key(&page_index, |page| page.page_index);
+            let index = match search {
+                Ok(index) => index,
+                Err(index) => {
+                    if bytes[..len].iter().all(|&byte| byte == 0) {
+                        cursor += len as u64;
+                        bytes = &bytes[len..];
+                        continue;
+                    }
+                    self.pages.insert(
+                        index,
+                        NonZeroPage {
+                            page_index,
+                            bytes: [0; PAGE],
+                        },
+                    );
+                    index
+                }
+            };
+            self.pages[index].bytes[offset..offset + len].copy_from_slice(&bytes[..len]);
+            if self.pages[index].bytes.iter().all(|&byte| byte == 0) {
+                self.pages.remove(index);
+            }
+            cursor += len as u64;
+            bytes = &bytes[len..];
+        }
+        true
+    }
+}
+
 /// Per-page access map shared by both memory representations.
 ///
 /// Mirrors the recompiler's hardware page protection (PROT_NONE /
@@ -51,6 +171,10 @@ pub struct PagePerms {
     /// accessors skip the per-page table load — the flat-buffer fast path
     /// for programs with no read-only or unmapped pages.
     uniform_rw: bool,
+    /// Monotonic mutation counter used by proof observers to cache the
+    /// canonical permission commitment without rescanning the page table at
+    /// every host boundary.
+    revision: u64,
 }
 
 impl PagePerms {
@@ -58,12 +182,20 @@ impl PagePerms {
         Self {
             perms: vec![PERM_RW; pages],
             uniform_rw: true,
+            revision: 0,
         }
     }
 
     fn install(&mut self, perms: Vec<u8>) {
+        if self.perms == perms {
+            return;
+        }
         self.uniform_rw = perms.iter().all(|&p| p == PERM_RW);
         self.perms = perms;
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .expect("permission revision cannot wrap in one invocation");
     }
 
     #[inline(always)]
@@ -74,6 +206,45 @@ impl PagePerms {
     #[inline(always)]
     fn as_slice(&self) -> &[u8] {
         &self.perms
+    }
+
+    #[inline(always)]
+    fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    fn set_range(&mut self, first: usize, count: usize, permission: u8) {
+        if self.perms[first..first + count]
+            .iter()
+            .all(|&existing| existing == permission)
+        {
+            return;
+        }
+        self.perms[first..first + count].fill(permission);
+        self.uniform_rw = self.perms.iter().all(|&p| p == PERM_RW);
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .expect("permission revision cannot wrap in one invocation");
+    }
+
+    // Native scalar loads/stores reach this through standard exception
+    // classification. Inlining exposes their constant width/permission;
+    // keep the portable guest compilation unchanged.
+    #[cfg_attr(feature = "std", inline(always))]
+    fn range_has_at_least(&self, addr: u32, len: usize, permission: u8) -> bool {
+        if len == 0 {
+            return true;
+        }
+        let Some(end) = (addr as u64).checked_add(len as u64) else {
+            return false;
+        };
+        if end > self.perms.len() as u64 * PAGE as u64 {
+            return false;
+        }
+        let first = (addr as usize) / PAGE;
+        let last = ((end - 1) as usize) / PAGE;
+        self.perms[first..=last].iter().all(|&p| p >= permission)
     }
 
     /// True when the last byte of `[addr, addr+n)` is on a mapped page
@@ -162,8 +333,74 @@ impl PagePerms {
 /// check doubles as the byte-range check.
 #[derive(Clone, Debug, Default)]
 pub struct FlatMem {
-    bytes: Vec<u8>,
+    bytes: FlatBytes,
     perms: PagePerms,
+    value_revision: u64,
+}
+
+/// Keep the established checked memory API while allowing native execution to
+/// address the same bytes through its separately protected mapping.
+#[derive(Debug)]
+enum FlatBytes {
+    Owned(Vec<u8>),
+    #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+    Native(crate::recompiler::memory::NativeMemory),
+}
+
+impl Default for FlatBytes {
+    fn default() -> Self {
+        Self::Owned(Vec::new())
+    }
+}
+
+impl Clone for FlatBytes {
+    fn clone(&self) -> Self {
+        Self::Owned(self.to_vec())
+    }
+}
+
+impl core::ops::Deref for FlatBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Owned(bytes) => bytes,
+            #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+            Self::Native(bytes) => bytes,
+        }
+    }
+}
+
+impl core::ops::DerefMut for FlatBytes {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        match self {
+            Self::Owned(bytes) => bytes,
+            #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+            Self::Native(bytes) => bytes,
+        }
+    }
+}
+
+impl FlatBytes {
+    fn clear_pages(&mut self, first: usize, count: usize) -> bool {
+        match self {
+            Self::Owned(bytes) => {
+                bytes[first * PAGE..(first + count) * PAGE].fill(0);
+                true
+            }
+            #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+            Self::Native(bytes) => bytes.clear_pages(first, count),
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        match self {
+            Self::Owned(bytes) => bytes.capacity(),
+            // As with the old lazily zeroed flat Vec, report reserved capacity,
+            // not physical RSS; this is intentionally not an RSS estimator.
+            #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+            Self::Native(bytes) => bytes.len(),
+        }
+    }
 }
 
 impl FlatMem {
@@ -174,8 +411,9 @@ impl FlatMem {
         let pages = bytes.len().div_ceil(PAGE);
         bytes.resize(pages * PAGE, 0);
         Self {
-            bytes,
+            bytes: FlatBytes::Owned(bytes),
             perms: PagePerms::new_rw(pages),
+            value_revision: 0,
         }
     }
 
@@ -210,6 +448,10 @@ impl FlatMem {
                     val,
                 );
             }
+            self.value_revision = self
+                .value_revision
+                .checked_add(1)
+                .expect("memory revision cannot wrap in one invocation");
             Ok(())
         } else {
             Err(self.perms.fault_page(addr, N, true))
@@ -230,7 +472,12 @@ pub struct SparseMem {
     table: Vec<u32>,
     /// Frame arena: frame `i` occupies `[i * 4096, (i + 1) * 4096)`.
     frames: Vec<u8>,
+    /// Frame index → guest page. This inverse index makes canonical sparse
+    /// snapshots proportional to allocated frames rather than the complete
+    /// million-entry 32-bit page table.
+    frame_pages: Vec<u32>,
     perms: PagePerms,
+    value_revision: u64,
 }
 
 impl SparseMem {
@@ -242,7 +489,9 @@ impl SparseMem {
         Self {
             table: vec![NO_FRAME; pages],
             frames: Vec::new(),
+            frame_pages: Vec::new(),
             perms: PagePerms::new_rw(pages),
+            value_revision: 0,
         }
     }
 
@@ -255,6 +504,7 @@ impl SparseMem {
         }
         let idx = self.frames.len() / PAGE;
         self.frames.resize(self.frames.len() + PAGE, 0);
+        self.frame_pages.push(page as u32);
         self.table[page] = idx as u32;
         idx * PAGE
     }
@@ -325,6 +575,10 @@ impl SparseMem {
         } else {
             self.write_straddle(addr, &val);
         }
+        self.value_revision = self
+            .value_revision
+            .checked_add(1)
+            .expect("memory revision cannot wrap in one invocation");
         Ok(())
     }
 
@@ -358,6 +612,36 @@ macro_rules! dispatch {
 }
 
 impl Memory {
+    #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+    pub(crate) fn native(span: u64) -> Result<Self, alloc::string::String> {
+        let bytes = crate::recompiler::memory::NativeMemory::new(span as usize)?;
+        Ok(Self::Flat(FlatMem {
+            bytes: FlatBytes::Native(bytes),
+            perms: PagePerms::new_rw(span as usize / PAGE),
+            value_revision: 0,
+        }))
+    }
+
+    #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+    pub(crate) fn native_window(
+        &mut self,
+    ) -> Result<&crate::backing::CodeWindow, alloc::string::String> {
+        let Self::Flat(memory) = self else {
+            return Err("native execution requires native memory".into());
+        };
+        let FlatBytes::Native(bytes) = &mut memory.bytes else {
+            return Err("native execution requires native memory".into());
+        };
+        bytes.sync_permissions(memory.perms.as_slice(), memory.perms.revision())?;
+        // Native stores bypass checked host writes. Invalidate cached value
+        // commitments at every execution boundary, including fault boundaries.
+        memory.value_revision = memory
+            .value_revision
+            .checked_add(1)
+            .expect("memory revision cannot wrap in one invocation");
+        Ok(bytes.window())
+    }
+
     /// Flat memory over `bytes` (zero-padded to whole pages), all pages RW.
     pub fn flat(bytes: Vec<u8>) -> Self {
         Self::Flat(FlatMem::new(bytes))
@@ -384,6 +668,18 @@ impl Memory {
         dispatch!(self, m => m.perms.as_slice())
     }
 
+    /// Monotonic identity of the logical value image. Equal revisions for
+    /// one memory object guarantee that no successful write/clear/init has
+    /// occurred between observations.
+    pub fn value_revision(&self) -> u64 {
+        dispatch!(self, m => m.value_revision)
+    }
+
+    /// Monotonic identity of the page-permission map.
+    pub fn permissions_revision(&self) -> u64 {
+        dispatch!(self, m => m.perms.revision())
+    }
+
     /// Install the per-page permission map. `perms` must have exactly one
     /// entry per 4 KiB page of the span — the accessors rely on the page
     /// bounds check doubling as the byte-range check.
@@ -394,6 +690,98 @@ impl Memory {
             "page_perms must cover guest memory exactly"
         );
         dispatch!(self, m => m.perms.install(perms));
+    }
+
+    /// Change the access mode of a page range without replacing the rest of
+    /// the page table.
+    ///
+    /// The range must lie within the logical memory span. This is the
+    /// primitive used by the standard inner-machine `pages` host call.
+    pub fn set_page_range(&mut self, first: usize, count: usize, permission: u8) -> bool {
+        let Some(end) = first.checked_add(count) else {
+            return false;
+        };
+        if end > self.pages() {
+            return false;
+        }
+        dispatch!(self, m => m.perms.set_range(first, count, permission));
+        true
+    }
+
+    /// Reset complete pages to zero without allocating untouched sparse
+    /// frames. Existing sparse frames are retained and cleared, so repeatedly
+    /// recycling one page range cannot grow host memory.
+    /// Native shared mappings discard backing pages instead of eagerly
+    /// writing a zero-filled heap. Returns `false` for an invalid range or a
+    /// failed native discard; callers must not continue execution on failure.
+    pub fn clear_pages(&mut self, first: usize, count: usize) -> bool {
+        let Some(end) = first.checked_add(count) else {
+            return false;
+        };
+        if end > self.pages() {
+            return false;
+        }
+        match self {
+            Memory::Flat(m) => {
+                if !m.bytes.clear_pages(first, count) {
+                    return false;
+                }
+                if count != 0 {
+                    m.value_revision = m
+                        .value_revision
+                        .checked_add(1)
+                        .expect("memory revision cannot wrap in one invocation");
+                }
+            }
+            Memory::Sparse(m) => {
+                for page in first..end {
+                    let frame = m.table[page];
+                    if frame != NO_FRAME {
+                        let base = frame as usize * PAGE;
+                        m.frames[base..base + PAGE].fill(0);
+                    }
+                }
+                if count != 0 {
+                    m.value_revision = m
+                        .value_revision
+                        .checked_add(1)
+                        .expect("memory revision cannot wrap in one invocation");
+                }
+            }
+        }
+        true
+    }
+
+    /// Whether the whole byte range is readable under the installed page
+    /// map. Zero-length ranges are always accessible.
+    #[cfg_attr(feature = "std", inline(always))]
+    pub fn is_readable(&self, addr: u32, len: usize) -> bool {
+        dispatch!(self, m => m.perms.range_has_at_least(addr, len, super::PERM_RO))
+    }
+
+    /// Whether the whole byte range is writable under the installed page
+    /// map. Zero-length ranges are always accessible.
+    #[cfg_attr(feature = "std", inline(always))]
+    pub fn is_writable(&self, addr: u32, len: usize) -> bool {
+        dispatch!(self, m => m.perms.range_has_at_least(addr, len, PERM_RW))
+    }
+
+    /// Copy a readable range into host memory.
+    pub fn read_bytes_checked(&self, addr: u32, out: &mut [u8]) -> bool {
+        if !self.is_readable(addr, out.len()) {
+            return false;
+        }
+        self.read_bytes(addr, out);
+        true
+    }
+
+    /// Copy host bytes into a writable range.
+    pub fn write_bytes_checked(&mut self, addr: u32, data: &[u8]) -> bool {
+        if !self.is_writable(addr, data.len()) {
+            return false;
+        }
+        self.init_copy(addr, data);
+        true
     }
 
     /// Read a byte; `Err` carries the faulting page base.
@@ -488,9 +876,16 @@ impl Memory {
             addr as u64 + data.len() as u64 <= self.span(),
             "init_copy range exceeds guest span"
         );
+        let has_data = !data.is_empty();
         match self {
             Memory::Flat(m) => {
                 m.bytes[addr as usize..addr as usize + data.len()].copy_from_slice(data);
+                if has_data {
+                    m.value_revision = m
+                        .value_revision
+                        .checked_add(1)
+                        .expect("memory revision cannot wrap in one invocation");
+                }
             }
             Memory::Sparse(m) => {
                 let mut a = addr as u64;
@@ -502,6 +897,12 @@ impl Memory {
                     m.frames[base..base + n].copy_from_slice(&data[..n]);
                     a += n as u64;
                     data = &data[n..];
+                }
+                if has_data {
+                    m.value_revision = m
+                        .value_revision
+                        .checked_add(1)
+                        .expect("memory revision cannot wrap in one invocation");
                 }
             }
         }
@@ -517,8 +918,56 @@ impl Memory {
             Memory::Sparse(m) => {
                 m.table.capacity() * core::mem::size_of::<u32>()
                     + m.frames.capacity()
+                    + m.frame_pages.capacity() * core::mem::size_of::<u32>()
                     + m.perms.allocated_bytes()
             }
+        }
+    }
+
+    /// Whether this memory uses the sparse representation.
+    pub fn is_sparse(&self) -> bool {
+        matches!(self, Self::Sparse(_))
+    }
+
+    /// Snapshot the logical value image as sorted non-zero pages.
+    ///
+    /// The result is representation-independent: equal flat and sparse
+    /// memories produce byte-identical page sequences. Runtime proof tracing
+    /// forces sparse execution, so this remains O(touched pages) rather than
+    /// scanning or allocating the full 32-bit address space.
+    pub fn nonzero_page_image(&self) -> SparseMemoryImage {
+        let mut pages = Vec::new();
+        match self {
+            Memory::Flat(memory) => {
+                for (page_index, chunk) in memory.bytes.chunks(PAGE).enumerate() {
+                    if chunk.iter().all(|&byte| byte == 0) {
+                        continue;
+                    }
+                    let mut bytes = [0; PAGE];
+                    bytes[..chunk.len()].copy_from_slice(chunk);
+                    pages.push(NonZeroPage {
+                        page_index: page_index as u32,
+                        bytes,
+                    });
+                }
+            }
+            Memory::Sparse(memory) => {
+                for (frame, &page_index) in memory.frame_pages.iter().enumerate() {
+                    let base = frame * PAGE;
+                    let frame = &memory.frames[base..base + PAGE];
+                    if frame.iter().all(|&byte| byte == 0) {
+                        continue;
+                    }
+                    let mut bytes = [0; PAGE];
+                    bytes.copy_from_slice(frame);
+                    pages.push(NonZeroPage { page_index, bytes });
+                }
+                pages.sort_unstable_by_key(|page| page.page_index);
+            }
+        }
+        SparseMemoryImage {
+            span: self.span(),
+            pages,
         }
     }
 }
@@ -557,6 +1006,73 @@ mod tests {
             assert_eq!(flat.read_u64_le(addr), Ok(0), "flat @{addr:#x}");
             assert_eq!(sparse.read_u64_le(addr), Ok(0), "sparse @{addr:#x}");
         }
+    }
+
+    #[test]
+    fn mutation_revisions_change_only_the_relevant_state_class() {
+        for mut memory in [Memory::flat(vec![0; PAGE]), Memory::sparse(PAGE as u64)] {
+            let values = memory.value_revision();
+            let permissions = memory.permissions_revision();
+            memory.write_u8(0, 7).unwrap();
+            assert_eq!(memory.value_revision(), values + 1);
+            assert_eq!(memory.permissions_revision(), permissions);
+
+            let values = memory.value_revision();
+            assert!(memory.set_page_range(0, 1, PERM_RO));
+            assert_eq!(memory.value_revision(), values);
+            assert_eq!(memory.permissions_revision(), permissions + 1);
+
+            // Idempotent permission installs do not invalidate a cached hash.
+            assert!(memory.set_page_range(0, 1, PERM_RO));
+            assert_eq!(memory.permissions_revision(), permissions + 1);
+        }
+    }
+
+    #[test]
+    fn nonzero_page_image_is_canonical_and_handles_high_addresses() {
+        let mut memory = Memory::sparse(1u64 << 32);
+        let address = u32::MAX - 31;
+        // Allocate out of guest-page order: snapshots must still canonicalize.
+        memory.init_copy(address, b"high-page");
+        memory.init_copy(2 * PVM_PAGE_SIZE, b"low-page");
+        let image = memory.nonzero_page_image();
+
+        assert_eq!(image.span(), 1u64 << 32);
+        assert_eq!(image.pages().len(), 2);
+        assert_eq!(image.pages()[0].page_index, 2);
+        assert_eq!(image.pages()[1].page_index, address / PVM_PAGE_SIZE);
+        assert_eq!(image.byte(address), b'h');
+        assert_eq!(image.byte(address + 8), b'e');
+        assert!(memory.allocated_bytes() < 16 << 20);
+
+        let cloned = memory.clone();
+        assert_eq!(cloned.nonzero_page_image(), image);
+        let Memory::Sparse(sparse) = &memory else {
+            unreachable!()
+        };
+        assert_eq!(sparse.frame_pages, [address / PVM_PAGE_SIZE, 2]);
+        assert_eq!(sparse.frames.len(), 2 * PAGE);
+        for (frame, &page) in sparse.frame_pages.iter().enumerate() {
+            assert_eq!(sparse.table[page as usize], frame as u32);
+        }
+        assert_eq!(
+            memory.allocated_bytes(),
+            sparse.table.capacity() * core::mem::size_of::<u32>()
+                + sparse.frames.capacity()
+                + sparse.frame_pages.capacity() * core::mem::size_of::<u32>()
+                + sparse.perms.allocated_bytes()
+        );
+        let empty = SparseMem::default();
+        assert!(empty.table.is_empty());
+        assert!(empty.frames.is_empty());
+        assert!(empty.frame_pages.is_empty());
+
+        let mut updated = image.clone();
+        assert!(updated.write(address, &[0; 9]));
+        assert_eq!(updated.pages().len(), 1, "zero pages are removed");
+        assert!(!updated.write(u32::MAX - 3, &[1; 5]));
+        assert!(SparseMemoryImage::new(1u64 << 32, image.pages().to_vec()).is_some());
+        assert!(SparseMemoryImage::new(1u64 << 32, vec![image.pages()[0].clone(); 2]).is_none());
     }
 
     #[test]

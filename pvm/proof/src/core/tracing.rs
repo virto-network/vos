@@ -191,6 +191,10 @@ pub struct RistrettoMemOp {
 
 pub struct TracingPvm {
     pub pvm: Interpreter,
+    /// Instruction profile used both by the interpreter and by witness
+    /// decoding. This is carried into the proof side note so the public
+    /// program commitment binds the same semantics.
+    isa_mode: vos_pvm::IsaMode,
     /// Recorded steps in compact form — the register-file snapshots are
     /// reconstructible from `initial_regs` + the per-step [`RegWrite`]s
     /// (see [`CompactStep`]), so a multi-million-step trace holds ~2.6×
@@ -221,9 +225,39 @@ pub struct TracingPvm {
 }
 
 impl TracingPvm {
+    /// Trace an initialized interpreter without changing its ISA profile.
+    ///
+    /// This preservation is security-critical for interpreters returned by
+    /// container adapters: feeding a capability-manifest interpreter through
+    /// this general constructor must not silently switch it to standard v0.8.
     pub fn new(pvm: Interpreter) -> Self {
+        let isa_mode = pvm.isa_mode();
+        Self::new_with_isa_mode(pvm, isa_mode)
+    }
+
+    /// Trace a canonical standard PVM program under the Gray Paper v0.8 ISA.
+    pub fn new_conformance(pvm: Interpreter) -> Self {
+        Self::new_with_isa_mode(pvm, vos_pvm::IsaMode::Conformance)
+    }
+
+    /// Trace a transitional capability-manifest program under its frozen
+    /// execution profile. Prefer this named constructor at container
+    /// boundaries so callers do not need to manufacture a profile tag.
+    pub fn new_capability_manifest(pvm: Interpreter) -> Self {
+        Self::new_with_isa_mode(pvm, vos_pvm::IsaMode::Jar)
+    }
+
+    /// Trace under an explicitly selected ISA profile.
+    ///
+    /// Capability-manifest Tasks must use [`vos_pvm::IsaMode::Jar`]; their
+    /// frozen unary numbering differs from the standard v0.8 table. Blob
+    /// entry points select this from the authenticated container rather than
+    /// accepting a caller-provided guess.
+    pub fn new_with_isa_mode(mut pvm: Interpreter, isa_mode: vos_pvm::IsaMode) -> Self {
+        pvm.set_isa_mode(isa_mode);
         Self {
             pvm,
+            isa_mode,
             steps: Vec::new(),
             initial_regs: None,
             last_regs: [0u64; PVM_REGISTER_COUNT],
@@ -239,6 +273,11 @@ impl TracingPvm {
             scalar_binop_mem_ops: Vec::new(),
             timestamp: 1, // 0 is reserved for initial memory entries
         }
+    }
+
+    /// The profile whose semantics this trace records.
+    pub fn isa_mode(&self) -> vos_pvm::IsaMode {
+        self.isa_mode
     }
 
     /// Execute a single step, recording the witness.
@@ -270,7 +309,7 @@ impl TracingPvm {
         } else {
             0
         };
-        let opcode = Opcode::from_byte(opcode_byte).unwrap_or(Opcode::Trap);
+        let opcode = Opcode::from_byte_in_mode(opcode_byte, self.isa_mode).unwrap_or(Opcode::Trap);
         let skip_len = compute_skip(&self.pvm.bitmask, pc_before as usize);
         let category = opcode.category();
         let decoded_args = args::decode_args(
@@ -297,7 +336,7 @@ impl TracingPvm {
 
         let reg_write = (0..PVM_REGISTER_COUNT).find(|&i| regs_before[i] != regs_after[i]);
         // One interpreter step writes at most one register (every opcode
-        // arm is a single assignment; Sbrk panics) — the invariant that
+        // arm is a single assignment) — the invariant that
         // makes `RegWrite` the whole register-file delta. Verify rather
         // than assume: a second changed index would be silently lost.
         if let Some(i) = reg_write {
@@ -322,9 +361,15 @@ impl TracingPvm {
         let exit = result.is_some();
         let branch_taken = !exit && next_pc != sequential_next_pc;
 
-        // Reconstruct memory accesses from opcode + args + register state
-        let (mem_read, mem_write) =
-            decode_mem_access(opcode, &decoded_args, &regs_before, &regs_after);
+        // Reconstruct memory accesses only after the instruction completed.
+        // A page fault, low-zone exception, out-of-gas exit, or any other
+        // panic leaves memory untouched and must not manufacture a memory
+        // ledger row for the rejected access.
+        let (mem_read, mem_write) = if result.is_none() {
+            decode_mem_access(opcode, &decoded_args, &regs_before, &regs_after)
+        } else {
+            (None, None)
+        };
 
         self.steps.push(CompactStep {
             timestamp: self.timestamp,
@@ -347,6 +392,7 @@ impl TracingPvm {
             gas_after,
             gas_charged,
             next_pc,
+            host_call_acknowledged: false,
             exit,
         });
 
@@ -371,23 +417,31 @@ impl TracingPvm {
         loop {
             if let Some(exit) = self.step() {
                 match exit {
-                    ExitReason::HostCall(id) if id == ECALL_BLAKE2B_COMPRESS => {
+                    ExitReason::HostCall(id) if id == u64::from(ECALL_BLAKE2B_COMPRESS) => {
                         self.handle_blake2b_ecall();
+                        self.acknowledge_handled_host_call();
                     }
-                    ExitReason::HostCall(id) if id == ECALL_RISTRETTO_SCALAR_MULT => {
+                    ExitReason::HostCall(id) if id == u64::from(ECALL_RISTRETTO_SCALAR_MULT) => {
                         self.handle_ristretto_scalar_mult_ecall();
+                        self.acknowledge_handled_host_call();
                     }
-                    ExitReason::HostCall(id) if id == ECALL_RISTRETTO_POINT_ADD => {
+                    ExitReason::HostCall(id) if id == u64::from(ECALL_RISTRETTO_POINT_ADD) => {
                         self.handle_ristretto_point_add_ecall();
+                        self.acknowledge_handled_host_call();
                     }
-                    ExitReason::HostCall(id) if id == ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE => {
+                    ExitReason::HostCall(id)
+                        if id == u64::from(ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE) =>
+                    {
                         self.handle_scalar_reduce_wide_ecall();
+                        self.acknowledge_handled_host_call();
                     }
-                    ExitReason::HostCall(id) if id == ECALL_SCALAR_MUL_MOD_L => {
+                    ExitReason::HostCall(id) if id == u64::from(ECALL_SCALAR_MUL_MOD_L) => {
                         self.handle_scalar_binop_ecall(ECALL_SCALAR_MUL_MOD_L);
+                        self.acknowledge_handled_host_call();
                     }
-                    ExitReason::HostCall(id) if id == ECALL_SCALAR_ADD_MOD_L => {
+                    ExitReason::HostCall(id) if id == u64::from(ECALL_SCALAR_ADD_MOD_L) => {
                         self.handle_scalar_binop_ecall(ECALL_SCALAR_ADD_MOD_L);
+                        self.acknowledge_handled_host_call();
                     }
                     other => return other,
                 }
@@ -420,28 +474,34 @@ impl TracingPvm {
     pub fn step_with_vos_stubs(&mut self) -> Option<ExitReason> {
         let exit = self.step()?;
         match exit {
-            ExitReason::HostCall(id) if id == ECALL_BLAKE2B_COMPRESS => {
+            ExitReason::HostCall(id) if id == u64::from(ECALL_BLAKE2B_COMPRESS) => {
                 self.handle_blake2b_ecall();
+                self.acknowledge_handled_host_call();
                 None
             }
-            ExitReason::HostCall(id) if id == ECALL_RISTRETTO_SCALAR_MULT => {
+            ExitReason::HostCall(id) if id == u64::from(ECALL_RISTRETTO_SCALAR_MULT) => {
                 self.handle_ristretto_scalar_mult_ecall();
+                self.acknowledge_handled_host_call();
                 None
             }
-            ExitReason::HostCall(id) if id == ECALL_RISTRETTO_POINT_ADD => {
+            ExitReason::HostCall(id) if id == u64::from(ECALL_RISTRETTO_POINT_ADD) => {
                 self.handle_ristretto_point_add_ecall();
+                self.acknowledge_handled_host_call();
                 None
             }
-            ExitReason::HostCall(id) if id == ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE => {
+            ExitReason::HostCall(id) if id == u64::from(ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE) => {
                 self.handle_scalar_reduce_wide_ecall();
+                self.acknowledge_handled_host_call();
                 None
             }
-            ExitReason::HostCall(id) if id == ECALL_SCALAR_MUL_MOD_L => {
+            ExitReason::HostCall(id) if id == u64::from(ECALL_SCALAR_MUL_MOD_L) => {
                 self.handle_scalar_binop_ecall(ECALL_SCALAR_MUL_MOD_L);
+                self.acknowledge_handled_host_call();
                 None
             }
-            ExitReason::HostCall(id) if id == ECALL_SCALAR_ADD_MOD_L => {
+            ExitReason::HostCall(id) if id == u64::from(ECALL_SCALAR_ADD_MOD_L) => {
                 self.handle_scalar_binop_ecall(ECALL_SCALAR_ADD_MOD_L);
+                self.acknowledge_handled_host_call();
                 None
             }
             ExitReason::HostCall(id) => match id {
@@ -458,7 +518,14 @@ impl TracingPvm {
                 // state, no fetched message.  Same effect as a
                 // proper stub but without disturbing the
                 // register ledger.
-                1 | 2 | 4 | 5 | 6 | ECALL_VOS_DEBUG_WRITE | 26 => None,
+                1 | 2 | 4 | 5 | 6 | 26 => {
+                    self.acknowledge_handled_host_call();
+                    None
+                }
+                value if value == u64::from(ECALL_VOS_DEBUG_WRITE) => {
+                    self.acknowledge_handled_host_call();
+                    None
+                }
                 _ => Some(ExitReason::HostCall(id)),
             },
             // Opcode-3 Ecall is outside the GP conformance ISA. Old VOS blobs
@@ -466,6 +533,56 @@ impl TracingPvm {
             // only by dynamically jumping to the GP halt address.
             ExitReason::Ecall => Some(ExitReason::Panic),
             other => Some(other),
+        }
+    }
+
+    /// Commit the continuation of a host call that this tracer handled.
+    ///
+    /// Standard `ecalli` deliberately leaves the interpreter at its cause PC
+    /// until the embedder acknowledges the call. Capability/JAR execution is
+    /// frozen with its historical already-advanced PC, so acknowledgment is a
+    /// no-op there. Keeping this after the handler prevents failed or unknown
+    /// host calls from being consumed accidentally.
+    fn acknowledge_handled_host_call(&mut self) {
+        let pending = self.pvm.pending_host_call();
+        if let Some(call) = pending {
+            assert!(
+                crate::core::ecall::is_proof_host_call_allowed(call.id),
+                "proof tracer attempted to acknowledge unsupported host call {}",
+                call.id,
+            );
+        }
+        let resumed = self.pvm.resume_after_host_call();
+        assert_eq!(
+            resumed,
+            self.isa_mode == vos_pvm::IsaMode::Conformance,
+            "handled host-call continuation disagrees with the tracer ISA profile",
+        );
+
+        if resumed {
+            let call = pending.expect("a resumed standard host call must have pending evidence");
+            let step = self
+                .steps
+                .last_mut()
+                .expect("a handled host call must have a recorded instruction");
+            assert_eq!(
+                (step.pc, step.next_pc),
+                (call.cause_pc, call.cause_pc),
+                "standard host-call row does not expose its unacknowledged cause PC",
+            );
+            assert_eq!(
+                self.pvm.pc, call.resume_pc,
+                "standard host-call acknowledgment selected the wrong resume PC",
+            );
+
+            // `step()` records the architectural state at the host boundary,
+            // where standard ECALLI deliberately retains the cause PC. Once
+            // this embedder handles and acknowledges the call, the proof row
+            // must instead produce the committed continuation consumed by the
+            // following row. Calls that are propagated never reach this path
+            // and therefore keep the cause PC as their observable boundary.
+            step.next_pc = call.resume_pc;
+            step.host_call_acknowledged = true;
         }
     }
 
@@ -794,9 +911,56 @@ impl TracingPvm {
     }
 
     /// Consume and return the recorded trace as full steps.
+    ///
+    /// This is an analysis-level escape hatch: the returned steps do not carry
+    /// the interpreter's ISA profile or precompile records. Proof-building
+    /// callers should use [`Self::into_side_note`] so a capability-manifest
+    /// trace cannot silently fall back to the standard profile.
     pub fn into_trace(self) -> Vec<PvmStep> {
         let regs = self.initial_regs();
         expand_steps(&self.steps, regs)
+    }
+
+    /// Consume this trace into a proof [`crate::SideNote`], preserving the
+    /// interpreter's ISA profile and every recorded precompile boundary.
+    ///
+    /// Program bytes, instruction starts, jump table, and profile come from the
+    /// interpreter itself, so a caller cannot accidentally pair the recorded
+    /// steps with a different static program view. Initial memory remains
+    /// explicit because the interpreter contains the post-execution image;
+    /// attach the saved entering image with `SideNote::with_memory`.
+    /// Keeping profile transfer inside this consuming operation prevents the
+    /// unsafe `into_trace()` followed by profile-defaulting `SideNote::new()`
+    /// pattern at capability-container boundaries.
+    pub fn into_side_note(self) -> crate::SideNote {
+        let code = self.pvm.code.clone();
+        let bitmask = self.pvm.bitmask.clone();
+        let jump_table = self.pvm.jump_table.clone();
+        let steps = self.trace();
+        let mut side_note = crate::SideNote::new(steps, code, bitmask)
+            .with_isa_mode(self.isa_mode)
+            .with_jump_table(jump_table);
+        side_note.blake2b_calls = self
+            .blake2b_records
+            .into_iter()
+            .map(|record| crate::chips::blake2b::Blake2bCall {
+                h: record.h,
+                m: record.m,
+                t: record.t,
+                f: record.f,
+            })
+            .collect();
+        side_note.blake2b_mem_ops = self.blake2b_mem_ops;
+        side_note.ristretto_calls = self.ristretto_records;
+        side_note.ristretto_mem_ops = self.ristretto_mem_ops;
+        side_note.ristretto_add_calls = self.ristretto_add_records;
+        side_note.ristretto_add_mem_ops = self.ristretto_add_mem_ops;
+        side_note.scalar_reduce_wide_calls = self.scalar_reduce_wide_records;
+        side_note.scalar_reduce_wide_mem_ops = self.scalar_reduce_wide_mem_ops;
+        side_note.scalar_binop_calls = self.scalar_binop_records;
+        side_note.scalar_binop_mem_ops = self.scalar_binop_mem_ops;
+        side_note.ingest_ristretto_boundary();
+        side_note
     }
 
     /// Consume and return the compact trace: the recorded steps plus the
@@ -1005,7 +1169,15 @@ pub(crate) fn decode_branch_target(decoded_args: &args::Args) -> u32 {
 
 /// Reconstruct memory access from opcode, args, and register state.
 /// Returns (mem_read, mem_write).
-fn decode_mem_access(
+#[inline]
+fn wrapping_effective_address(base: u64, offset: u64) -> u32 {
+    // PVM addresses are cyclic N_2^32 values. Truncate each decoded operand
+    // to that domain before addition so the witness calculation states the
+    // same modulo-2^32 rule as execution, independently of host word width.
+    (base as u32).wrapping_add(offset as u32)
+}
+
+pub(crate) fn decode_mem_access(
     opcode: Opcode,
     decoded_args: &args::Args,
     regs_before: &[u64; PVM_REGISTER_COUNT],
@@ -1129,7 +1301,7 @@ fn decode_mem_access(
         // Indirect loads (A.5.10): addr = φ[rb] + imm, result in ra
         Opcode::LoadIndU8 | Opcode::LoadIndI8 => {
             if let args::Args::TwoRegImm { ra, rb, imm } = decoded_args {
-                let addr = regs_before[*rb].wrapping_add(*imm) as u32;
+                let addr = wrapping_effective_address(regs_before[*rb], *imm);
                 let value = regs_after[*ra];
                 return (
                     Some(MemAccess {
@@ -1143,7 +1315,7 @@ fn decode_mem_access(
         }
         Opcode::LoadIndU16 | Opcode::LoadIndI16 => {
             if let args::Args::TwoRegImm { ra, rb, imm } = decoded_args {
-                let addr = regs_before[*rb].wrapping_add(*imm) as u32;
+                let addr = wrapping_effective_address(regs_before[*rb], *imm);
                 let value = regs_after[*ra];
                 return (
                     Some(MemAccess {
@@ -1157,7 +1329,7 @@ fn decode_mem_access(
         }
         Opcode::LoadIndU32 | Opcode::LoadIndI32 => {
             if let args::Args::TwoRegImm { ra, rb, imm } = decoded_args {
-                let addr = regs_before[*rb].wrapping_add(*imm) as u32;
+                let addr = wrapping_effective_address(regs_before[*rb], *imm);
                 let value = regs_after[*ra];
                 return (
                     Some(MemAccess {
@@ -1171,7 +1343,7 @@ fn decode_mem_access(
         }
         Opcode::LoadIndU64 => {
             if let args::Args::TwoRegImm { ra, rb, imm } = decoded_args {
-                let addr = regs_before[*rb].wrapping_add(*imm) as u32;
+                let addr = wrapping_effective_address(regs_before[*rb], *imm);
                 let value = regs_after[*ra];
                 return (
                     Some(MemAccess {
@@ -1186,7 +1358,7 @@ fn decode_mem_access(
         // Indirect stores (A.5.10): addr = φ[rb] + imm, value from ra
         Opcode::StoreIndU8 => {
             if let args::Args::TwoRegImm { ra, rb, imm } = decoded_args {
-                let addr = regs_before[*rb].wrapping_add(*imm) as u32;
+                let addr = wrapping_effective_address(regs_before[*rb], *imm);
                 let value = regs_before[*ra] & 0xFF;
                 return (
                     None,
@@ -1200,7 +1372,7 @@ fn decode_mem_access(
         }
         Opcode::StoreIndU16 => {
             if let args::Args::TwoRegImm { ra, rb, imm } = decoded_args {
-                let addr = regs_before[*rb].wrapping_add(*imm) as u32;
+                let addr = wrapping_effective_address(regs_before[*rb], *imm);
                 let value = regs_before[*ra] & 0xFFFF;
                 return (
                     None,
@@ -1214,7 +1386,7 @@ fn decode_mem_access(
         }
         Opcode::StoreIndU32 => {
             if let args::Args::TwoRegImm { ra, rb, imm } = decoded_args {
-                let addr = regs_before[*rb].wrapping_add(*imm) as u32;
+                let addr = wrapping_effective_address(regs_before[*rb], *imm);
                 let value = regs_before[*ra] & 0xFFFF_FFFF;
                 return (
                     None,
@@ -1228,7 +1400,7 @@ fn decode_mem_access(
         }
         Opcode::StoreIndU64 => {
             if let args::Args::TwoRegImm { ra, rb, imm } = decoded_args {
-                let addr = regs_before[*rb].wrapping_add(*imm) as u32;
+                let addr = wrapping_effective_address(regs_before[*rb], *imm);
                 let value = regs_before[*ra];
                 return (
                     None,
@@ -1300,7 +1472,7 @@ fn decode_mem_access(
         // Store immediate indirect (A.5.7): addr = φ[ra] + imm_x, value = imm_y
         Opcode::StoreImmIndU8 => {
             if let args::Args::RegTwoImm { ra, imm_x, imm_y } = decoded_args {
-                let addr = regs_before[*ra].wrapping_add(*imm_x) as u32;
+                let addr = wrapping_effective_address(regs_before[*ra], *imm_x);
                 let value = *imm_y & 0xFF;
                 return (
                     None,
@@ -1314,7 +1486,7 @@ fn decode_mem_access(
         }
         Opcode::StoreImmIndU16 => {
             if let args::Args::RegTwoImm { ra, imm_x, imm_y } = decoded_args {
-                let addr = regs_before[*ra].wrapping_add(*imm_x) as u32;
+                let addr = wrapping_effective_address(regs_before[*ra], *imm_x);
                 let value = *imm_y & 0xFFFF;
                 return (
                     None,
@@ -1328,7 +1500,7 @@ fn decode_mem_access(
         }
         Opcode::StoreImmIndU32 => {
             if let args::Args::RegTwoImm { ra, imm_x, imm_y } = decoded_args {
-                let addr = regs_before[*ra].wrapping_add(*imm_x) as u32;
+                let addr = wrapping_effective_address(regs_before[*ra], *imm_x);
                 let value = *imm_y & 0xFFFF_FFFF;
                 return (
                     None,
@@ -1342,7 +1514,7 @@ fn decode_mem_access(
         }
         Opcode::StoreImmIndU64 => {
             if let args::Args::RegTwoImm { ra, imm_x, imm_y } = decoded_args {
-                let addr = regs_before[*ra].wrapping_add(*imm_x) as u32;
+                let addr = wrapping_effective_address(regs_before[*ra], *imm_x);
                 let value = *imm_y;
                 return (
                     None,
@@ -1362,6 +1534,97 @@ fn decode_mem_access(
 #[cfg(all(test, feature = "prover"))]
 mod tests {
     use super::*;
+
+    fn rejected_memory_step(opcode: Opcode, address: u64) -> (ExitReason, PvmStep) {
+        let mut registers = [0u64; PVM_REGISTER_COUNT];
+        registers[0] = 0x8877_6655_4433_2211;
+        registers[1] = address;
+        // All indirect load/store opcodes use TwoRegImm. ra=0, rb=1 and a
+        // zero immediate make the requested register value the exact address.
+        let code = vec![opcode as u8, 0x10, 0, 0, 0, 0];
+        let bitmask = vec![1, 0, 0, 0, 0, 0];
+        let pvm = Interpreter::new(
+            code,
+            bitmask,
+            vec![],
+            registers,
+            vec![0; vos_pvm::PVM_ZONE_SIZE as usize],
+            10_000,
+            25,
+        );
+        let mut tracing = TracingPvm::new_conformance(pvm);
+        let exit = tracing.step().expect("memory instruction must be rejected");
+        let mut steps = tracing.into_trace();
+        assert_eq!(steps.len(), 1);
+        (exit, steps.remove(0))
+    }
+
+    #[test]
+    fn rejected_memory_instructions_emit_no_access() {
+        for opcode in [Opcode::LoadIndU64, Opcode::StoreIndU64] {
+            let (exit, low_zone) = rejected_memory_step(opcode, 0x100);
+            assert_eq!(exit, ExitReason::Panic, "{opcode:?} low-zone result");
+            assert!(low_zone.mem_read.is_none(), "{opcode:?} false read");
+            assert!(low_zone.mem_write.is_none(), "{opcode:?} false write");
+
+            let (exit, unmapped) = rejected_memory_step(opcode, 2 * vos_pvm::PVM_ZONE_SIZE as u64);
+            assert_eq!(
+                exit,
+                ExitReason::PageFault(2 * vos_pvm::PVM_ZONE_SIZE),
+                "{opcode:?} unmapped result"
+            );
+            assert!(unmapped.mem_read.is_none(), "{opcode:?} false read");
+            assert!(unmapped.mem_write.is_none(), "{opcode:?} false write");
+        }
+    }
+
+    #[test]
+    fn indirect_trace_address_is_cyclic_u32() {
+        let mut before = [0u64; PVM_REGISTER_COUNT];
+        let mut after = before;
+        before[1] = 0x1234_5678_ffff_fffe;
+        after[2] = 0xa5;
+        let args = args::Args::TwoRegImm {
+            ra: 2,
+            rb: 1,
+            imm: 4,
+        };
+
+        let (read, write) = decode_mem_access(Opcode::LoadIndU8, &args, &before, &after);
+        assert!(write.is_none());
+        assert_eq!(read.expect("load access").address, 2);
+    }
+
+    #[test]
+    fn conformance_trace_retains_the_full_ecalli_identifier() {
+        let cases: &[(&[u8], u64)] = &[
+            (&[0xff], u64::MAX),
+            (&[0x00, 0x00, 0x00, 0x80], 0xffff_ffff_8000_0000),
+        ];
+
+        for (immediate, expected) in cases {
+            let mut code = vec![Opcode::Ecalli as u8];
+            code.extend_from_slice(immediate);
+            code.push(Opcode::Trap as u8);
+            let mut bitmask = vec![1];
+            bitmask.extend(core::iter::repeat_n(0, immediate.len()));
+            bitmask.push(1);
+            let pvm = Interpreter::new(
+                code,
+                bitmask,
+                vec![],
+                [0; PVM_REGISTER_COUNT],
+                vec![0; vos_pvm::PVM_ZONE_SIZE as usize],
+                10_000,
+                25,
+            );
+            let mut tracing = TracingPvm::new_conformance(pvm);
+            assert_eq!(tracing.run(), ExitReason::HostCall(*expected));
+            let trace = tracing.into_trace();
+            assert_eq!(trace.len(), 1);
+            assert_eq!(trace[0].imm, *expected, "witness immediate");
+        }
+    }
 
     fn vos_stub_program(call: u32) -> TracingPvm {
         use vos_pvm_compiler::assembler::{Assembler, Reg};
@@ -1384,6 +1647,71 @@ mod tests {
 
         let mut reserved = vos_stub_program(11);
         assert_eq!(reserved.run_with_vos_stubs(), ExitReason::HostCall(11));
+        assert_eq!(reserved.num_steps(), 1);
+    }
+
+    #[test]
+    fn vos_stub_acknowledges_standard_host_call_before_continuing() {
+        let code = vec![Opcode::Ecalli as u8, 1, Opcode::Trap as u8];
+        let bitmask = vec![1, 0, 1];
+        let pvm = Interpreter::new(
+            code,
+            bitmask,
+            vec![],
+            [0; PVM_REGISTER_COUNT],
+            vec![0; vos_pvm::PVM_ZONE_SIZE as usize],
+            10_000,
+            25,
+        );
+        let mut tracing = TracingPvm::new_conformance(pvm);
+
+        assert_eq!(tracing.step_with_vos_stubs(), None);
+        assert_eq!(tracing.pvm.pc, 2, "handled call must advance exactly once");
+        assert!(tracing.pvm.pending_host_call().is_none());
+        assert_eq!(
+            tracing.trace()[0].next_pc,
+            2,
+            "acknowledged row must produce the continuation PC",
+        );
+        assert!(
+            tracing.trace()[0].host_call_acknowledged,
+            "acknowledgment disposition must survive compact expansion",
+        );
+        assert_eq!(tracing.step_with_vos_stubs(), Some(ExitReason::Panic));
+        assert_eq!(tracing.num_steps(), 2, "execution must not replay ecalli");
+    }
+
+    #[test]
+    fn unknown_standard_host_call_retains_cause_pc_in_trace() {
+        let code = vec![Opcode::Ecalli as u8, 11, Opcode::Trap as u8];
+        let bitmask = vec![1, 0, 1];
+        let pvm = Interpreter::new(
+            code,
+            bitmask,
+            vec![],
+            [0; PVM_REGISTER_COUNT],
+            vec![0; vos_pvm::PVM_ZONE_SIZE as usize],
+            10_000,
+            25,
+        );
+        let mut tracing = TracingPvm::new_conformance(pvm);
+
+        assert_eq!(tracing.run_with_vos_stubs(), ExitReason::HostCall(11));
+        assert_eq!(tracing.pvm.pc, 0, "unhandled call must remain pending");
+        assert_eq!(
+            tracing.pvm.pending_host_call(),
+            Some(vos_pvm::PendingHostCall {
+                id: 11,
+                cause_pc: 0,
+                resume_pc: 2,
+            }),
+        );
+        let trace = tracing.into_trace();
+        assert_eq!(trace.len(), 1);
+        assert_eq!(
+            trace[0].next_pc, 0,
+            "unhandled row must expose the cause PC",
+        );
     }
 
     #[test]

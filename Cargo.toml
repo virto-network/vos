@@ -1,53 +1,30 @@
 [workspace]
 resolver = "3"
 members = [
-    "vos",
-    "vos/vos-macros",
-    "vosx",
     "support/vos-raft",
     "support/merkle-crdt",
     "pvm/runtime",
     "pvm/compiler",
+    "pvm/program",
     "pvm/codec",
     "pvm/codec-derive",
     "pvm/proof",
     "pvm/proof/precompiles",
     "pvm/proof/derive",
     "pvm/proof/verifier",
-    "extensions/prover",
-    "extensions/substrate",
-    "clerk-witness",
-    "tests/fixtures/extensions/*",
+    "pvm/bench",
 ]
 exclude = [
-    "tests/fixtures/wasm/*",
-    # Built-in PVM actors (riscv64em-vos target) live alongside
-    # the workspace crates but build with their own toolchain.
-    # Listing the directory itself keeps it from being picked
-    # up as a workspace member.
-    "actors",
-    # Protocol infrastructure PVMs are independently locked no_std guests.
-    "services/vos-service",
-    # Every actor crate, incl. those path-dep'd by host members as dev-deps
-    # (Cargo would otherwise promote a member's path dep to a member).
-    "actors/*",
-    # vos-pvm-proof-fuzz uses libfuzzer-sys + panic=abort + nightly-only
-    # rustc flags via `cargo fuzz`.  Excluding it from the main
-    # workspace keeps `cargo build --workspace` working on stable.
+    # Built with `cargo fuzz` (nightly flags, panic = abort).
     "pvm/proof/fuzz",
-    # `extensions` is a parent directory holding extension
-    # plugins; each sub-crate is listed in `members` explicitly.
-    "extensions",
-    # Canonical no_std actor PVMs used only by service integration gates.
-    "vos/tests/fixtures/*",
-    # Standalone proof workloads carry their own no_std workspaces.
+    # Standalone no_std guest workloads with their own workspaces.
     "pvm/proof/fixtures/*",
-    # The on-chain settlement verifier: a verify-only Poseidon2-M31 stwo
-    # verifier with its OWN `[workspace]`, pinning stwo with
-    # `default-features = false`.  Excluded so its feature resolution never
-    # co-resolves with the prover workspace (which would drag blst/rayon) — that
-    # isolation is what makes it buildable for wasm32/PVM.
+    "pvm/bench/guests",
+    # The on-chain settlement verifier pins stwo without default features in
+    # its own workspace, so prover features never co-resolve into it.
     "pvm/proof/settlement-verifier",
+    # Throwaway measurement code from the design runs.
+    "spikes",
 ]
 
 [workspace.package]
@@ -59,79 +36,52 @@ homepage = "https://github.com/virto-network/vos"
 authors = ["Daniel Olano <daniel@olanod.com>"]
 readme = "README.md"
 
-# Release profile: fat LTO + single codegen unit for maximum cross-crate
-# inlining of stwo's hot SIMD paths.  Measured at log14 MOBILE on
-# the reference Intel Core Ultra 7 155H (median of 5 trials):
-#
-#   | Profile         | Prove   | Build time |
-#   |-----------------|---------|------------|
-#   | no LTO, codegen-units default | 1.50 s | ~20 s |
-#   | thin LTO        | 1.39 s  | ~3.5 min   |
-#   | fat LTO         | 1.31 s  | ~3.5 min   |  ← keep
-#
-# Build time is much slower; for fast iteration, override with
-# `cargo build --release --config 'profile.release.lto="off"'` or
-# work in dev profile.
 [profile.release]
 lto = "fat"
 codegen-units = 1
 
-# `cargo test` builds Stwo's SIMD prover and the vos-pvm-proof trace/constraint
-# code at opt-level 0, where the prover runs several times slower and holds
-# its multi-GB FRI working set for longer. Optimize just the proving-hot
-# crates (leaving the rest of the workspace at opt-level 0 for fast
-# incremental compiles); these crates rarely recompile, so the cost is paid
-# once. debug-assertions stay on so vos-pvm-proof's internal invariant checks still
-# fire in tests. Measured on the reference box: a log14-padded prove drops
-# ~4.4s → ~3.5s; turning debug-assertions off on these crates would reach
-# ~2.6s (near the ~2.3s fat-LTO release) at the cost of those checks.
-# Set under both test (`cargo test`) and dev (`cargo run`/demos) profiles.
-[profile.test.package.stwo]
+[profile.dev.package.vos-pvm]
 opt-level = 3
-[profile.test.package.stwo-constraint-framework]
-opt-level = 3
-[profile.test.package.vos-pvm-proof]
-opt-level = 3
-[profile.test.package.vos-pvm-proof-verifier]
+[profile.test.package.vos-pvm]
 opt-level = 3
 
 [profile.dev.package.stwo]
 opt-level = 3
+[profile.test.package.stwo]
+opt-level = 3
 [profile.dev.package.stwo-constraint-framework]
+opt-level = 3
+[profile.test.package.stwo-constraint-framework]
 opt-level = 3
 [profile.dev.package.vos-pvm-proof]
 opt-level = 3
+[profile.test.package.vos-pvm-proof]
+opt-level = 3
 [profile.dev.package.vos-pvm-proof-verifier]
+opt-level = 3
+[profile.test.package.vos-pvm-proof-verifier]
 opt-level = 3
 
 [workspace.dependencies]
-# Internal crates
 vos-pvm-proof = { path = "pvm/proof" }
 vos-pvm-proof-derive = { path = "pvm/proof/derive" }
 vos-pvm-proof-verifier = { path = "pvm/proof/verifier" }
 vos-pvm-precompiles = { path = "pvm/proof/precompiles" }
 vos-pvm = { path = "pvm/runtime" }
 vos-pvm-compiler = { path = "pvm/compiler" }
+vos-pvm-program = { path = "pvm/program" }
 vos-pvm-codec = { path = "pvm/codec", default-features = false }
 vos-pvm-codec-derive = { path = "pvm/codec-derive" }
 
-# Stwo pinned to upstream rev `e1286720` (post.2.0 perf cluster:
-# parallel FFT/quotients/OOD #1304-1306, BaseColumnPool #1342,
-# subdomain quotients #1372/#1373, FRI fold parallelization
-# #1389/#1392/#1393). Lifted-protocol degree-≥2 block stands at this
-# rev — see pvm/proof/STWO_2.2.0_MIGRATION.md.
-#
-# Declared with NO features here (workspace-inherited features are
-# additive — a member can add but never remove them).  Prover-side
-# builds get `std,prover,parallel` via vos-pvm-proof's `prover` feature
-# (`stwo/std` etc. in pvm/proof/Cargo.toml); the verifier-only path
-# (`vos-pvm-proof-verifier` for wasm32) stays feature-less so no rayon/std
-# machinery leaks into a verify-only build.
+# Stwo pinned to upstream rev `e1286720`. Declared without features:
+# workspace features are additive, and the verifier-only build must stay
+# free of std and rayon. The prover adds `std,prover,parallel` through
+# vos-pvm-proof's `prover` feature.
 stwo = { git = "https://github.com/starkware-libs/stwo", rev = "e1286720", default-features = false }
 stwo-constraint-framework = { git = "https://github.com/starkware-libs/stwo", rev = "e1286720", default-features = false }
 
-# Common deps
 num-traits = "0.2"
 serde = { version = "1", features = ["derive"] }
 rayon = "1.10"
 impl-trait-for-tuples = "0.2.2"
+subtle = { version = "2.6", default-features = false }

@@ -1,10 +1,9 @@
-version = 1
-
 [[program]]
 name = "voucher-check"
-version = 2
+id = "1211f4dbca7dbe9cd0ba2fb4727bbae9367839bdee9068436db075556c6610b1"
+blob_hash = "5866fc11e48309aa97d87ce6c6c8469088a88c484a4f7fb9691c7c82fc50dd55"
 commitments = [
-    "c49b587a2e8aa4dcf79c9b5c856f7733a86fa6514f7d465ece8135eeb95363d8",
+    "da3aa6bf01a3ddf438ae135522dc2e6800437110af6a6db0d7636dfc57acb494",
 ]
 canonical_profile = [
     15,
@@ -42,5 +41,5 @@ canonical_profile = [
 ]
 seg_steps = 32000
 page_budget = 8
-witness_addr = 742432
-unpatched_image_root = "70ecb5f5658773ab579964511e405bf3e006e2a3d599254748d16979750197fd"
+witness_addr = 699776
+unpatched_image_root = "1ca7b5f557e618131b2c71840c0c95fe6115621de864011269393d5096185ec1"

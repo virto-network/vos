@@ -1,17 +1,18 @@
 //! Kernel-free refine-style execution of GP standard programs (SPI).
 //!
-//! [`execute`] loads a GP standard-program blob exactly the way
-//! `InvocationKernel::new_standard` does — same memory image, page
-//! permissions, register file, `mem_cycles` tier, and per-page init-gas
-//! charge — but runs it on the plain [`Interpreter`] with no capability
-//! microkernel and no hostcall dispatch. The whole path is `no_std`, so an
+//! [`execute`] loads a GP standard-program blob directly into the plain
+//! standard machine with the specification-defined memory image, page
+//! permissions, register file, standard memory latency, and per-page init-gas
+//! charge. It has no capability microkernel or hostcall dispatch. The whole
+//! path is `no_std`, so an
 //! embedder (e.g. a wasm32 runtime) can perform pure refine invocations:
 //! any `ecalli` surfaces as [`ExitReason::HostCall`] in the returned
 //! [`Invocation`] for the embedder to reject or handle itself. Execution
-//! always uses the interpreter — never the kernel or the recompiler — on
-//! every target, which is the cross-machine determinism guarantee.
+//! uses the interpreter by default. Explicit backend constructors can select
+//! the existing Linux x86-64 recompiler, with identical standard semantics;
+//! observed/proof execution remains the interpreter reference path.
 //!
-//! Semantic-identity notes (pinned by unit tests against the kernel path):
+//! Standard-program semantic notes (pinned by the direct-execution tests):
 //! - Memory image (GP eq A.42): read-only data at `Z_Z`, read-write data
 //!   plus zeroed heap pages after a zone gap, a zeroed stack just below the
 //!   argument zone, and the argument bytes in the top input zone. Pages in
@@ -19,24 +20,22 @@
 //! - Page permissions: the read-only and argument regions are mapped
 //!   read-only; the read-write+heap and stack regions are read-write. This
 //!   is a 1:1 map of [`crate::spi::SpiRegion::writable`], matching the
-//!   `init_access` the kernel derives in `spi::to_manifest_blob`.
+//!   standard-program region permissions.
 //! - Registers (GP eq A.43): φ0 = the halt address, φ1 = stack top,
 //!   φ7/φ8 = argument base/length; entry is at instruction counter 0 (the
 //!   refine / is-authorized entry point).
-//! - ISA: [`crate::IsaMode::Conformance`], like the kernel's SPI path —
-//!   opcode 3 (`Ecall`, the jar capability surface) panics.
-//! - `mem_cycles` (the load/store gas tier) derives from the total mapped
-//!   page count via [`compute_mem_cycles`], exactly like the kernel's
-//!   `compute_mem_cycles(header.memory_pages)`. Block gas costs — and
-//!   therefore gas consumption — depend on it, so the tier is part of the
-//!   semantic contract. Both it and the init charge derive from *declared*
-//!   pages, never from allocated bytes, so they are independent of the
-//!   memory representation.
+//! - ISA: [`crate::IsaMode::Conformance`]. Opcode 3 (`Ecall`, the retired JAR
+//!   capability surface) is rejected by the standard-program decoder.
+//! - Standard load/store latency is the fixed 25 cycles specified by Gray
+//!   Paper v0.8.0, independently of declared page count. Page-tier latency is
+//!   confined to the capability/JAR service profile. The init charge still
+//!   derives from *declared* mapped pages, never from allocated bytes, so it
+//!   is independent of the memory representation.
 //! - Gas: [`GAS_PER_PAGE`] is charged per mapped page up front (the
-//!   kernel's init charge); a budget below that charge fails with
+//!   standard initialization charge); a budget below that charge fails with
 //!   [`RefineError::OutOfGas`] before executing anything. `gas_used`
-//!   includes the init charge, so `budget - gas_used` equals the kernel
-//!   VM's remaining gas.
+//!   includes the init charge, so `budget - gas_used` equals the
+//!   interpreter's remaining gas.
 //!
 //! 32-bit embedders: the flat image of a real SPI program spans ~4 GiB
 //! (GP maps the stack and argument regions just below 2³²), which cannot
@@ -50,11 +49,12 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
+use crate::backend::{PreparedExecution, PvmBackend};
 use crate::interpreter::{Interpreter, Memory, PERM_NONE, PERM_RO, PERM_RW};
-use crate::spi::parse_standard_program;
+use crate::spi::{deblob, parse_standard_program};
 use crate::{
     ExitReason, GAS_PER_PAGE, Gas, IsaMode, PVM_INIT_INPUT_SIZE, PVM_PAGE_SIZE, PVM_REGISTER_COUNT,
-    compute_mem_cycles,
+    STANDARD_MEM_CYCLES,
 };
 
 /// Why [`execute`] could not run the program at all. Exits of a program
@@ -71,6 +71,9 @@ pub enum RefineError {
     LayoutOverflow,
     /// The gas budget is below the per-page memory-init charge.
     OutOfGas,
+    /// The requested backend is unavailable, cannot be prepared, or its host
+    /// memory setup failed. This is not a guest exit or an interpreter retry.
+    Backend,
 }
 
 impl core::fmt::Display for RefineError {
@@ -79,6 +82,7 @@ impl core::fmt::Display for RefineError {
             Self::InvalidBlob => f.write_str("blob is not a GP standard program"),
             Self::LayoutOverflow => f.write_str("memory layout exceeds the address space"),
             Self::OutOfGas => f.write_str("gas budget below the memory-init charge"),
+            Self::Backend => f.write_str("standard execution backend failed"),
         }
     }
 }
@@ -103,6 +107,36 @@ pub enum MemoryModel {
     Sparse,
 }
 
+/// Executor-validated standard program and immutable backend preparation.
+///
+/// Private fields prevent callers from supplying forged gas tables. Preparing
+/// binds the tables to the standard ISA and memory latency; loading still
+/// checks each invocation's layout and gas and creates independent state.
+pub struct PreparedProgram {
+    program: crate::spi::StandardProgram,
+    execution: PreparedExecution,
+}
+
+impl PreparedProgram {
+    pub fn new(blob: &[u8]) -> Result<Self, RefineError> {
+        Self::new_with_backend(blob, PvmBackend::ForceInterpreter)
+    }
+
+    /// Prepare immutable code for one explicitly selected backend. Invocation
+    /// memory and registers are never shared between loads of this value.
+    pub fn new_with_backend(blob: &[u8], backend: PvmBackend) -> Result<Self, RefineError> {
+        let program = parse_standard_program(blob).ok_or(RefineError::InvalidBlob)?;
+        let execution = PreparedExecution::new_standard(
+            &program.code.code,
+            &program.code.bitmask,
+            &program.code.jump_table,
+            backend,
+        )
+        .map_err(|_| RefineError::Backend)?;
+        Ok(Self { program, execution })
+    }
+}
+
 /// The result of a completed refine-style invocation.
 #[derive(Debug, Clone)]
 pub struct Invocation {
@@ -110,32 +144,377 @@ pub struct Invocation {
     /// this harness dispatches nothing.
     pub exit: ExitReason,
     /// Total gas consumed: the per-page init charge plus execution gas.
-    /// The budget minus this equals the kernel VM's remaining gas for the
-    /// same blob/args/budget.
+    /// The budget minus this equals the interpreter's remaining gas.
     pub gas_used: Gas,
     /// The register file φ at exit.
     pub registers: [u64; PVM_REGISTER_COUNT],
+    /// Instruction counter at the exit boundary. Useful for deterministic
+    /// diagnostics without exposing the interpreter itself.
+    pub pc: u32,
     mem: Memory,
+}
+
+/// A loaded, resumable standard PVM invocation.
+///
+/// [`execute`] is the convenient one-shot API. Embedders that implement
+/// standard host calls use this type to resume after each
+/// [`ExitReason::HostCall`].
+pub struct Machine {
+    initial_gas: Gas,
+    interp: Interpreter,
+    terminal_exit: Option<ExitReason>,
+    execution: Option<PreparedExecution>,
+}
+
+/// Read-only entry and instruction events for one standard machine slice.
+pub enum MachineObservation<'a> {
+    Enter(&'a Interpreter),
+    Instruction(crate::interpreter::InstructionObservation<'a>),
+}
+
+impl Machine {
+    /// Construct the full Gray Paper Ψ boundary from a canonical compact PVM
+    /// blob and an explicit architectural state.
+    ///
+    /// A failed `deblob(blob, initial_pc)` is represented as an immediate
+    /// [`ExitReason::Panic`]. It charges no gas, preserves the gas-funded flag,
+    /// all registers, memory bytes and permissions, and normalizes only the
+    /// final instruction counter to zero as full Ψ requires.
+    pub fn from_pvm_blob(
+        pvm_blob: &[u8],
+        initial_pc: u64,
+        gas: Gas,
+        gas_charged: bool,
+        registers: [u64; PVM_REGISTER_COUNT],
+        memory: Memory,
+    ) -> Self {
+        let (program, pc, terminal_exit) = match deblob(pvm_blob, initial_pc) {
+            Some(program) => (
+                program,
+                u32::try_from(initial_pc).expect("deblob accepted a 32-bit code index"),
+                None,
+            ),
+            None => (
+                // This executable is never entered. It gives the rejected
+                // machine an ordinary Interpreter owner for the unchanged
+                // register/RAM state without attempting to predecode the
+                // attacker-controlled blob.
+                crate::program::ParsedCodeBlob {
+                    jump_table: Vec::new(),
+                    code: vec![0],
+                    bitmask: vec![1],
+                },
+                0,
+                Some(ExitReason::Panic),
+            ),
+        };
+        let mut interp = Interpreter::with_memory_and_mode(
+            program.code,
+            program.bitmask,
+            program.jump_table,
+            registers,
+            memory,
+            gas,
+            STANDARD_MEM_CYCLES,
+            IsaMode::Conformance,
+        );
+        interp.set_pc(pc);
+        interp.restore_boundary_state(gas_charged, None);
+        Self {
+            initial_gas: gas,
+            interp,
+            terminal_exit,
+            execution: None,
+        }
+    }
+
+    /// Load a standard program using the automatically selected memory
+    /// representation.
+    pub fn load(spi_blob: &[u8], args: &[u8], gas: Gas) -> Result<Self, RefineError> {
+        Self::load_with(spi_blob, args, gas, MemoryModel::Auto)
+    }
+
+    /// Load a standard program with an explicit memory representation.
+    pub fn load_with(
+        spi_blob: &[u8],
+        args: &[u8],
+        gas: Gas,
+        model: MemoryModel,
+    ) -> Result<Self, RefineError> {
+        Self::load_with_backend(spi_blob, args, gas, model, PvmBackend::ForceInterpreter)
+    }
+
+    pub fn load_with_backend(
+        spi_blob: &[u8],
+        args: &[u8],
+        gas: Gas,
+        model: MemoryModel,
+        backend: PvmBackend,
+    ) -> Result<Self, RefineError> {
+        Self::load_prepared(
+            &PreparedProgram::new_with_backend(spi_blob, backend)?,
+            args,
+            gas,
+            model,
+        )
+    }
+
+    /// The resolved backend, independent of later environment changes.
+    pub fn backend(&self) -> PvmBackend {
+        self.execution
+            .as_ref()
+            .map_or(PvmBackend::ForceInterpreter, PreparedExecution::backend)
+    }
+
+    /// Instantiate fresh execution state from validated immutable preparation.
+    pub fn load_prepared(
+        prepared: &PreparedProgram,
+        args: &[u8],
+        gas: Gas,
+        model: MemoryModel,
+    ) -> Result<Self, RefineError> {
+        Self::load_program(&prepared.program, &prepared.execution, args, gas, model)
+    }
+
+    fn load_program(
+        prog: &crate::spi::StandardProgram,
+        prepared: &PreparedExecution,
+        args: &[u8],
+        gas: Gas,
+        model: MemoryModel,
+    ) -> Result<Self, RefineError> {
+        if args.len() as u64 > PVM_INIT_INPUT_SIZE as u64 {
+            return Err(RefineError::LayoutOverflow);
+        }
+        let layout = prog.layout(args).ok_or(RefineError::LayoutOverflow)?;
+        let regions = [layout.ro, layout.rw, layout.stack, layout.args];
+        let registers = layout.registers;
+
+        let page = PVM_PAGE_SIZE as u64;
+        let total_pages: u64 = regions.iter().map(|r| r.size / page).sum();
+        let mem_cycles = STANDARD_MEM_CYCLES;
+        let init_gas = total_pages * GAS_PER_PAGE;
+        if gas < init_gas {
+            return Err(RefineError::OutOfGas);
+        }
+
+        let max_addr: u64 = regions
+            .iter()
+            .filter(|r| r.size > 0)
+            .map(|r| r.base + r.size)
+            .max()
+            .unwrap_or(0);
+        let use_sparse = match model {
+            MemoryModel::Auto => cfg!(target_pointer_width = "32"),
+            MemoryModel::Flat => false,
+            MemoryModel::Sparse => true,
+        };
+        if !use_sparse && max_addr > isize::MAX as u64 {
+            return Err(RefineError::LayoutOverflow);
+        }
+        let mut mem = prepared
+            .allocate_memory(max_addr, use_sparse)
+            .map_err(|_| RefineError::Backend)?;
+        let mut page_perms = vec![PERM_NONE; (max_addr / page) as usize];
+        for r in regions.iter().filter(|r| r.size > 0) {
+            let perm = if r.writable { PERM_RW } else { PERM_RO };
+            let first = (r.base / page) as usize;
+            page_perms[first..first + (r.size / page) as usize].fill(perm);
+        }
+        for (base, data) in [
+            (layout.ro.base, layout.ro_data),
+            (layout.rw.base, layout.rw_data),
+            (layout.args.base, layout.args_data),
+        ] {
+            if !data.is_empty() {
+                mem.init_copy(base as u32, data);
+            }
+        }
+
+        let mut interp = Interpreter::from_predecoded(
+            prepared.interpreter_program().clone(),
+            registers,
+            mem,
+            gas - init_gas,
+            mem_cycles,
+            IsaMode::Conformance,
+        );
+        interp.set_page_perms(page_perms);
+
+        Ok(Self {
+            initial_gas: gas,
+            interp,
+            terminal_exit: None,
+            // The interpreter already owns its decoded invocation state;
+            // retaining cold preparation here would duplicate those tables.
+            execution: (prepared.backend() != PvmBackend::ForceInterpreter)
+                .then(|| prepared.clone()),
+        })
+    }
+
+    /// Run until the next PVM exit.
+    ///
+    /// For explicitly selected backends use [`Self::try_resume`] to handle
+    /// host backend errors without panicking. Interpreter loads cannot produce
+    /// those errors.
+    pub fn resume(&mut self) -> ExitReason {
+        self.try_resume().expect(
+            "standard execution backend failed; use try_resume for explicitly selected backends",
+        )
+    }
+
+    /// Run one slice, reporting backend failures separately from guest exits.
+    /// No error or guest fault is retried through another backend.
+    pub fn try_resume(&mut self) -> Result<ExitReason, RefineError> {
+        if let Some(exit) = &self.terminal_exit {
+            return Ok(exit.clone());
+        }
+        // Resuming is the host's explicit advancement past a previously
+        // surfaced ecalli. The first call is a no-op here.
+        self.interp.resume_after_host_call();
+        match &self.execution {
+            Some(prepared) => prepared
+                .run(&mut self.interp)
+                .map_err(|_| RefineError::Backend),
+            None => Ok(self.interp.run().0),
+        }
+    }
+
+    /// Run until the next PVM exit while observing every instruction.
+    ///
+    /// This is the proof/diagnostic twin of [`Self::resume`]. It performs
+    /// the same pending-host-call acknowledgement before entering the
+    /// interpreter and delegates execution to
+    /// [`Interpreter::run_observed`], whose callback receives immutable
+    /// post-step state. Installing an observer therefore cannot perturb the
+    /// standard machine's semantics.
+    ///
+    /// Observation uses interpreter instructions even if this machine was
+    /// prepared for the recompiler, but retains that machine's native memory
+    /// backing. Proof/snapshot callers should load `ForceInterpreter` with
+    /// [`MemoryModel::Sparse`] explicitly: inspecting a native or ordinary
+    /// flat value image can scan the complete logical address space.
+    pub fn resume_observed(
+        &mut self,
+        mut observer: impl for<'a> FnMut(MachineObservation<'a>),
+    ) -> ExitReason {
+        self.interp.resume_after_host_call();
+        observer(MachineObservation::Enter(&self.interp));
+        if let Some(exit) = &self.terminal_exit {
+            return exit.clone();
+        }
+        self.interp
+            .run_observed(|instruction| {
+                observer(MachineObservation::Instruction(instruction));
+            })
+            .0
+    }
+
+    /// Continue after a host call the embedder served in place, observing
+    /// instructions without starting a new slice.
+    pub fn continue_observed(
+        &mut self,
+        observer: impl for<'a> FnMut(crate::interpreter::InstructionObservation<'a>),
+    ) -> ExitReason {
+        self.interp.resume_after_host_call();
+        if let Some(exit) = &self.terminal_exit {
+            return exit.clone();
+        }
+        self.interp.run_observed(observer).0
+    }
+
+    /// Exact interpreter image owned by this standard machine.
+    ///
+    /// The returned reference is read-only so trace assemblers can capture
+    /// the code, register, and sparse-memory boundary without acquiring a
+    /// second execution implementation.
+    pub fn interpreter(&self) -> &Interpreter {
+        &self.interp
+    }
+
+    pub fn gas_remaining(&self) -> Gas {
+        self.interp.gas
+    }
+
+    /// Whether the block containing the current counter is already funded.
+    pub fn gas_charged(&self) -> bool {
+        self.interp.gas_charged
+    }
+
+    /// Charge host-call gas. Returns `false` without wrapping when the
+    /// invocation has insufficient gas.
+    pub fn charge(&mut self, gas: Gas) -> bool {
+        if self.interp.gas < gas {
+            self.interp.gas = 0;
+            false
+        } else {
+            self.interp.gas -= gas;
+            true
+        }
+    }
+
+    /// Return unused gas reserved for an inner invocation.
+    pub fn credit(&mut self, gas: Gas) {
+        self.interp.gas = self.interp.gas.saturating_add(gas);
+    }
+
+    pub fn registers(&self) -> &[u64; PVM_REGISTER_COUNT] {
+        &self.interp.registers
+    }
+
+    pub fn registers_mut(&mut self) -> &mut [u64; PVM_REGISTER_COUNT] {
+        &mut self.interp.registers
+    }
+
+    pub fn memory(&self) -> &Memory {
+        self.interp.memory()
+    }
+
+    pub fn memory_mut(&mut self) -> &mut Memory {
+        self.interp.memory_mut()
+    }
+
+    /// Consume the machine and retain its final state for inspection.
+    pub fn finish(mut self, exit: ExitReason) -> Invocation {
+        // Machine-produced Halt/Panic exits have already applied full Ψ's
+        // PC-zero normalization. Do not normalize a host-owner-generated
+        // failure here: failed/unknown dispatch retains the causing ecalli
+        // counter because no successful continuation occurred.
+        Invocation {
+            exit,
+            gas_used: self.initial_gas.saturating_sub(self.interp.gas),
+            registers: self.interp.registers,
+            pc: self.interp.pc,
+            mem: self.interp.take_memory(),
+        }
+    }
 }
 
 impl Invocation {
     /// The output bytes designated by φ7/φ8 at a normal halt, per GP:
     /// `o = μ[φ7 .. φ7+φ8]`.
     ///
+    /// Read the designated output only when its guest-controlled length is at
+    /// most `maximum`. The bound is checked before reserving output memory;
+    /// allocation failure is reported as `None` rather than aborting a host.
     /// Returns `None` unless the exit is [`ExitReason::Halt`] and the whole
-    /// range lies on readable pages (GP treats an unreadable output range
-    /// at halt as a panic ☇ — that judgement is the embedder's). A
-    /// zero-length range is trivially readable.
-    pub fn output(&self) -> Option<Vec<u8>> {
+    /// range lies on readable pages (GP treats an unreadable output range at
+    /// halt as a panic ☇ — that judgement is the embedder's). A zero-length
+    /// range is trivially readable.
+    pub fn output_bounded(&self, maximum: usize) -> Option<Vec<u8>> {
         if self.exit != ExitReason::Halt {
             return None;
         }
         let ptr = u32::try_from(self.registers[7]).ok()? as u64;
         let len = u32::try_from(self.registers[8]).ok()? as u64;
+        let len = usize::try_from(len).ok()?;
+        if len > maximum {
+            return None;
+        }
         if len == 0 {
             return Some(Vec::new());
         }
-        let end = ptr + len;
+        let end = ptr + len as u64;
         if end > self.mem.span() {
             return None;
         }
@@ -144,7 +523,9 @@ impl Invocation {
         if self.mem.page_perms()[first..=last].contains(&PERM_NONE) {
             return None;
         }
-        let mut out = vec![0u8; len as usize];
+        let mut out = Vec::new();
+        out.try_reserve_exact(len).ok()?;
+        out.resize(len, 0);
         self.mem.read_bytes(ptr as u32, &mut out);
         Some(out)
     }
@@ -161,11 +542,11 @@ impl Invocation {
 /// selecting the memory representation automatically
 /// ([`MemoryModel::Auto`]).
 ///
-/// Parses `spi_blob` (stripping any metadata prefix), builds the GP memory
-/// image and register file for `args`, charges the kernel's per-page init
-/// gas, and runs the interpreter from instruction counter 0 (the refine
-/// entry) until it exits. No hostcalls are handled: an `ecalli` ends the
-/// invocation with [`ExitReason::HostCall`].
+/// Parses the canonical bare `spi_blob`, builds the GP memory image and
+/// register file for `args`, charges the standard per-page init gas, and runs
+/// the interpreter from instruction counter 0 (the refine entry) until it
+/// exits. Metadata-prefixed predecessor blobs are rejected. No hostcalls are
+/// handled: an `ecalli` ends the invocation with [`ExitReason::HostCall`].
 pub fn execute(spi_blob: &[u8], args: &[u8], gas: Gas) -> Result<Invocation, RefineError> {
     execute_with(spi_blob, args, gas, MemoryModel::Auto)
 }
@@ -177,90 +558,9 @@ pub fn execute_with(
     gas: Gas,
     model: MemoryModel,
 ) -> Result<Invocation, RefineError> {
-    let prog = parse_standard_program(spi_blob).ok_or(RefineError::InvalidBlob)?;
-
-    // GP bounds the argument data by the Z_I input zone. `layout` does not
-    // re-check it (the zone is a fixed term of its total-size guard), and
-    // an oversized args region would overflow the 32-bit address space.
-    if args.len() as u64 > PVM_INIT_INPUT_SIZE as u64 {
-        return Err(RefineError::LayoutOverflow);
-    }
-    let layout = prog.layout(args).ok_or(RefineError::LayoutOverflow)?;
-    let regions = [layout.ro, layout.rw, layout.stack, layout.args];
-    let registers = layout.registers;
-
-    // The kernel derives both the init-gas charge and the mem_cycles tier
-    // from the total mapped page count (the manifest's `memory_pages`) —
-    // declared pages, independent of the memory representation.
-    let page = PVM_PAGE_SIZE as u64;
-    let total_pages: u64 = regions.iter().map(|r| r.size / page).sum();
-    let mem_cycles = compute_mem_cycles(total_pages as u32);
-    let init_gas = total_pages * GAS_PER_PAGE;
-    if gas < init_gas {
-        return Err(RefineError::OutOfGas);
-    }
-
-    // Memory image + per-page permissions: regions at their GP addresses,
-    // everything else unmapped.
-    let max_addr: u64 = regions
-        .iter()
-        .filter(|r| r.size > 0)
-        .map(|r| r.base + r.size)
-        .max()
-        .unwrap_or(0);
-    let use_sparse = match model {
-        MemoryModel::Auto => cfg!(target_pointer_width = "32"),
-        MemoryModel::Flat => false,
-        MemoryModel::Sparse => true,
-    };
-    // A flat buffer must be allocatable on the host (Rust caps single
-    // allocations at isize::MAX): on 32-bit hosts a real SPI span is not.
-    if !use_sparse && max_addr > isize::MAX as u64 {
-        return Err(RefineError::LayoutOverflow);
-    }
-    let mut mem = if use_sparse {
-        Memory::sparse(max_addr)
-    } else {
-        Memory::flat(vec![0u8; max_addr as usize])
-    };
-    let mut page_perms = vec![PERM_NONE; (max_addr / page) as usize];
-    for r in regions.iter().filter(|r| r.size > 0) {
-        let perm = if r.writable { PERM_RW } else { PERM_RO };
-        let first = (r.base / page) as usize;
-        page_perms[first..first + (r.size / page) as usize].fill(perm);
-    }
-    for (base, data) in [
-        (layout.ro.base, layout.ro_data),
-        (layout.rw.base, layout.rw_data),
-        (layout.args.base, layout.args_data),
-    ] {
-        if !data.is_empty() {
-            mem.init_copy(base as u32, data);
-        }
-    }
-
-    // `layout` (which borrows `prog`) is done, so the code can move.
-    let code = prog.code;
-
-    let mut interp = Interpreter::with_memory(
-        code.code,
-        code.bitmask,
-        code.jump_table,
-        registers,
-        mem,
-        gas - init_gas,
-        mem_cycles,
-    );
-    interp.isa_mode = IsaMode::Conformance;
-    interp.set_page_perms(page_perms);
-
-    let (exit, exec_gas) = interp.run();
-    Ok(Invocation {
-        exit,
-        gas_used: init_gas + exec_gas,
-        registers: interp.registers,
-        mem: interp.take_memory(),
-    })
+    let mut machine = Machine::load_with(spi_blob, args, gas, model)?;
+    let exit = machine.resume();
+    Ok(machine.finish(exit))
 }
 
 #[cfg(test)]
@@ -269,8 +569,8 @@ mod tests {
     use crate::PVM_ZONE_SIZE;
 
     /// Wrap raw code + a memory profile in a bare GP standard-program blob
-    /// (no metadata prefix). Mirrors the kernel tests' builder; sizes stay
-    /// small so every length nat is a single byte.
+    /// (no metadata prefix). Sizes stay small so every length nat is a
+    /// single byte.
     fn build_standard_program(
         ro: &[u8],
         rw: &[u8],
@@ -279,17 +579,7 @@ mod tests {
         code: &[u8],
         bitmask: &[u8],
     ) -> Vec<u8> {
-        assert!(code.len() < 128, "test code must fit a 1-byte nat");
-        // Code sub-blob, compact deblob: E(|j|=0) ‖ z=1 ‖ E(|c|) ‖ code ‖ bitmask.
-        let mut cb = vec![0u8, 1u8, code.len() as u8];
-        cb.extend_from_slice(code);
-        let mut packed = vec![0u8; code.len().div_ceil(8)];
-        for (i, &b) in bitmask.iter().enumerate() {
-            if b != 0 {
-                packed[i / 8] |= 1 << (i % 8);
-            }
-        }
-        cb.extend_from_slice(&packed);
+        let cb = build_pvm_blob(code, bitmask);
 
         let mut blob = Vec::new();
         blob.extend_from_slice(&(ro.len() as u32).to_le_bytes()[..3]); // E₃(|o|)
@@ -300,6 +590,22 @@ mod tests {
         blob.extend_from_slice(rw);
         blob.extend_from_slice(&(cb.len() as u32).to_le_bytes()); // E₄(|c|)
         blob.extend_from_slice(&cb);
+        blob
+    }
+
+    fn build_pvm_blob(code: &[u8], bitmask: &[u8]) -> Vec<u8> {
+        assert!(code.len() < 128, "test code must fit a 1-byte nat");
+        assert_eq!(code.len(), bitmask.len());
+        // E(|j|=0) ‖ z=1 ‖ E(|c|) ‖ code ‖ packed bitmask.
+        let mut blob = vec![0u8, 1u8, code.len() as u8];
+        blob.extend_from_slice(code);
+        let mut packed = vec![0u8; code.len().div_ceil(8)];
+        for (i, &b) in bitmask.iter().enumerate() {
+            if b != 0 {
+                packed[i / 8] |= 1 << (i % 8);
+            }
+        }
+        blob.extend_from_slice(&packed);
         blob
     }
 
@@ -329,11 +635,11 @@ mod tests {
         build_standard_program(&[], &[], 1, 4096, &code, &bits)
     }
 
-    /// A program that trips a page fault in the unmapped low gap:
-    /// `φ3 ← 0x1000; φ4 ← u64[φ3]` — page 1 sits below the ro zone.
+    /// A program that trips a page fault in the first unmapped page at or
+    /// above the standard 64 KiB access boundary.
     fn fault_gap_blob() -> Vec<u8> {
         let (mut code, mut bits) = (Vec::new(), Vec::new());
-        asm(&mut code, &mut bits, &[51, 3, 0x00, 0x10]); // load_imm φ3 = 0x1000
+        asm(&mut code, &mut bits, &[51, 3, 0x00, 0x00, 0x01]); // φ3 = 0x10000
         asm(&mut code, &mut bits, &[130, 4 + 16 * 3]); // load_ind_u64 φ4, [φ3+0]
         asm(&mut code, &mut bits, &[0]); // trap (unreached)
         build_standard_program(&[], &[], 1, 4096, &code, &bits)
@@ -402,12 +708,88 @@ mod tests {
     ) -> Option<(Invocation, Invocation)> {
         let f = execute_with(blob, args, gas, MemoryModel::Flat);
         let s = execute_with(blob, args, gas, MemoryModel::Sparse);
+        let prepared = PreparedProgram::new(blob);
+        for (model, cold) in [(MemoryModel::Flat, &f), (MemoryModel::Sparse, &s)] {
+            let reused = prepared.as_ref().map_err(|e| *e).and_then(|program| {
+                let mut machine = Machine::load_prepared(program, args, gas, model)?;
+                let exit = machine.resume();
+                Ok(machine.finish(exit))
+            });
+            match (cold, reused) {
+                (Ok(cold), Ok(reused)) => {
+                    assert_eq!(cold.exit, reused.exit);
+                    assert_eq!(cold.gas_used, reused.gas_used);
+                    assert_eq!(cold.registers, reused.registers);
+                    assert_eq!(cold.pc, reused.pc);
+                    assert_eq!(cold.output_bounded(4096), reused.output_bounded(4096));
+                    assert_eq!(cold.memory().span(), reused.memory().span());
+                    assert_eq!(cold.memory().page_perms(), reused.memory().page_perms());
+                    let prog = parse_standard_program(blob).unwrap();
+                    let layout = prog.layout(args).unwrap();
+                    for region in [layout.ro, layout.rw, layout.stack, layout.args] {
+                        assert_image_range_eq(
+                            cold,
+                            &reused,
+                            region.base,
+                            region.base + region.size,
+                        );
+                    }
+                }
+                (Err(cold), Err(reused)) => assert_eq!(*cold, reused),
+                (cold, reused) => panic!("cold/prepared mismatch: {cold:?} / {reused:?}"),
+            }
+        }
+        #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+        {
+            let native = Machine::load_with_backend(
+                blob,
+                args,
+                gas,
+                MemoryModel::Auto,
+                PvmBackend::ForceRecompiler,
+            )
+            .and_then(|mut machine| {
+                let exit = machine.try_resume()?;
+                Ok(machine.finish(exit))
+            });
+            match (&f, native) {
+                (Ok(reference), Ok(native)) => {
+                    assert_eq!(reference.exit, native.exit, "native exit");
+                    assert_eq!(reference.gas_used, native.gas_used, "native gas");
+                    assert_eq!(reference.registers, native.registers, "native registers");
+                    assert_eq!(reference.pc, native.pc, "native pc");
+                    assert_eq!(reference.output_bounded(4096), native.output_bounded(4096));
+                    assert_eq!(
+                        reference.memory().page_perms(),
+                        native.memory().page_perms()
+                    );
+                    let program = parse_standard_program(blob).unwrap();
+                    let layout = program.layout(args).unwrap();
+                    for region in [layout.ro, layout.rw, layout.stack, layout.args] {
+                        assert_image_range_eq(
+                            reference,
+                            &native,
+                            region.base,
+                            region.base + region.size,
+                        );
+                    }
+                }
+                (Err(reference), Err(native)) => assert_eq!(*reference, native),
+                (reference, native) => {
+                    panic!("reference/native mismatch: {reference:?} / {native:?}")
+                }
+            }
+        }
         match (f, s) {
             (Ok(f), Ok(s)) => {
                 assert_eq!(f.exit, s.exit, "exit reasons agree");
                 assert_eq!(f.gas_used, s.gas_used, "gas agrees");
                 assert_eq!(f.registers, s.registers, "registers agree");
-                assert_eq!(f.output(), s.output(), "outputs agree");
+                assert_eq!(
+                    f.output_bounded(PVM_PAGE_SIZE as usize),
+                    s.output_bounded(PVM_PAGE_SIZE as usize),
+                    "outputs agree"
+                );
                 assert_eq!(f.memory().span(), s.memory().span(), "spans agree");
                 let span = f.memory().span();
                 let page = PVM_PAGE_SIZE as u64;
@@ -439,7 +821,7 @@ mod tests {
         let inv = execute(&round_trip_blob(), &ARGS, 1_000_000).expect("executes");
         assert_eq!(inv.exit, ExitReason::Halt);
         assert_eq!(
-            inv.output().as_deref(),
+            inv.output_bounded(ARGS.len()).as_deref(),
             Some(&ARGS[..4]),
             "output reflects the args"
         );
@@ -464,36 +846,67 @@ mod tests {
     fn tiny_budget_exits_out_of_gas() {
         let inv = execute(&round_trip_blob(), &ARGS, INIT_GAS + 1).expect("init charge covered");
         assert_eq!(inv.exit, ExitReason::OutOfGas);
-        assert_eq!(inv.output(), None);
+        assert_eq!(inv.output_bounded(0), None);
     }
 
     #[test]
-    fn trap_surfaces_as_trap() {
+    fn opcode_zero_surfaces_as_standard_panic() {
         let blob = build_standard_program(&[], &[], 0, 4096, &[0], &[1]);
         let inv = execute(&blob, &[], 1_000_000).expect("executes");
-        assert_eq!(inv.exit, ExitReason::Trap);
-        assert_eq!(inv.output(), None);
+        assert_eq!(inv.exit, ExitReason::Panic);
+        assert_eq!(inv.output_bounded(0), None);
     }
 
     #[test]
-    fn ecall_panics_under_conformance() {
-        // Opcode 3 (Ecall) is the jar capability surface; the SPI path runs
-        // graypaper-strict, so it must panic rather than exit Ecall.
+    fn ecall_is_rejected_by_the_standard_program_decoder() {
+        // Opcode 3 is the VOS capability-runtime extension and is not in the
+        // Gray Paper v0.8.0 opcode set U.
         let blob = build_standard_program(&[], &[], 0, 4096, &[3], &[1]);
-        let inv = execute(&blob, &[], 1_000_000).expect("executes");
-        assert_eq!(inv.exit, ExitReason::Panic);
+        assert!(matches!(
+            execute(&blob, &[], 1_000_000),
+            Err(RefineError::InvalidBlob)
+        ));
     }
 
     #[test]
     fn ecalli_surfaces_as_hostcall_untouched() {
-        let blob = build_standard_program(&[], &[], 0, 4096, &[10, 42], &[1, 0]);
+        // A standard program still needs a terminating instruction after the
+        // host-call continuation.
+        let blob = build_standard_program(&[], &[], 0, 4096, &[10, 42, 0], &[1, 0, 1]);
         let inv = execute(&blob, &ARGS, 1_000_000).expect("executes");
         assert_eq!(inv.exit, ExitReason::HostCall(42));
         // No dispatch happened: the GP argument registers are untouched.
         let arg_base = (1u64 << 32) - (1 << 16) - PVM_INIT_INPUT_SIZE as u64;
         assert_eq!(inv.registers[7], arg_base);
         assert_eq!(inv.registers[8], ARGS.len() as u64);
-        assert_eq!(inv.output(), None, "no output without a halt");
+        assert_eq!(
+            inv.output_bounded(ARGS.len()),
+            None,
+            "no output without a halt"
+        );
+    }
+
+    #[test]
+    fn nonzero_host_exit_retains_cause_and_resumes_at_successor() {
+        let (mut code, mut bits) = (Vec::new(), Vec::new());
+        asm(&mut code, &mut bits, &[51, 2, 9]); // prior posterior state
+        asm(&mut code, &mut bits, &[10, 42]); // host at pc 3
+        asm(&mut code, &mut bits, &[0]); // resumed standard panic
+        let blob = build_standard_program(&[], &[], 0, 4096, &code, &bits);
+
+        let first = execute(&blob, &[], 1_000_000).expect("executes to host boundary");
+        assert_eq!(first.exit, ExitReason::HostCall(42));
+        assert_eq!(first.pc, 3);
+        assert_eq!(first.registers[2], 9);
+
+        let mut machine = Machine::load(&blob, &[], 1_000_000).expect("loads resumable machine");
+        assert_eq!(machine.resume(), ExitReason::HostCall(42));
+        let after_host = machine.gas_remaining();
+        assert_eq!(machine.resume(), ExitReason::Panic);
+        assert_eq!(machine.gas_remaining(), after_host);
+        let final_state = machine.finish(ExitReason::Panic);
+        assert_eq!(final_state.pc, 0);
+        assert_eq!(final_state.registers[2], 9);
     }
 
     #[test]
@@ -507,7 +920,30 @@ mod tests {
         let blob = build_standard_program(&[], &[], 1, 4096, &code, &bits);
         let inv = execute(&blob, &[], 1_000_000).expect("executes");
         assert_eq!(inv.exit, ExitReason::Halt);
-        assert_eq!(inv.output(), None, "unreadable output range");
+        assert_eq!(
+            inv.output_bounded(PVM_PAGE_SIZE as usize),
+            None,
+            "unreadable output range"
+        );
+    }
+
+    #[test]
+    fn guest_output_length_is_bounded_before_allocation() {
+        let (mut code, mut bits) = (Vec::new(), Vec::new());
+        let [b0, b1, b2, _] = RW_BASE.to_le_bytes();
+        asm(&mut code, &mut bits, &[51, 7, b0, b1, b2]); // φ7 = RW_BASE
+        asm(&mut code, &mut bits, &[51, 8, 0, 0x10]); // φ8 = one 4 KiB page
+        asm(&mut code, &mut bits, &[50, 0]); // halt
+        let blob = build_standard_program(&[], &[], 1, 4096, &code, &bits);
+        let inv = execute_with(&blob, &[], 1_000_000, MemoryModel::Sparse).expect("executes");
+
+        assert_eq!(inv.exit, ExitReason::Halt);
+        assert_eq!(inv.output_bounded(64), None);
+        assert_eq!(
+            inv.output_bounded(PVM_PAGE_SIZE as usize),
+            Some(vec![0; PVM_PAGE_SIZE as usize]),
+            "the same readable output remains available under an exact bound",
+        );
     }
 
     #[test]
@@ -517,7 +953,7 @@ mod tests {
         let blob = build_standard_program(&[], &[], 0, 4096, &[50, 0], &[1, 0]);
         let inv = execute(&blob, &[], 1_000_000).expect("executes");
         assert_eq!(inv.exit, ExitReason::Halt);
-        assert_eq!(inv.output(), Some(Vec::new()));
+        assert_eq!(inv.output_bounded(0), Some(Vec::new()));
     }
 
     #[test]
@@ -526,6 +962,329 @@ mod tests {
             execute(&[0xFF; 4], &[], 1_000_000).unwrap_err(),
             RefineError::InvalidBlob
         );
+        assert!(matches!(
+            PreparedProgram::new(&[0xFF; 4]),
+            Err(RefineError::InvalidBlob)
+        ));
+    }
+
+    #[test]
+    fn prepared_program_keeps_invocations_independent() {
+        let blob = round_trip_blob();
+        let prepared = PreparedProgram::new(&blob).unwrap();
+        for model in [MemoryModel::Flat, MemoryModel::Sparse] {
+            for args in [[1, 2, 3, 4], [9, 8, 7, 6], [1, 2, 3, 4]] {
+                let mut machine =
+                    Machine::load_prepared(&prepared, &args, 1_000_000, model).unwrap();
+                let mut initial = [0; 4];
+                machine.memory().read_bytes(RW_BASE, &mut initial);
+                assert_eq!(initial, [0; 4]);
+                assert_eq!(machine.interpreter().pc, 0);
+                assert!(!machine.gas_charged());
+                let exit = machine.resume();
+                let invocation = machine.finish(exit);
+                assert_eq!(invocation.exit, ExitReason::Halt);
+                assert_eq!(invocation.output_bounded(4).unwrap(), args);
+                let cold = execute_with(&blob, &args, 1_000_000, model).unwrap();
+                assert_eq!(invocation.gas_used, cold.gas_used);
+            }
+            assert!(matches!(
+                Machine::load_prepared(&prepared, &ARGS, 0, model),
+                Err(RefineError::OutOfGas)
+            ));
+            let oversized = vec![0; PVM_INIT_INPUT_SIZE as usize + 1];
+            assert!(matches!(
+                Machine::load_prepared(&prepared, &oversized, 1_000_000, model),
+                Err(RefineError::LayoutOverflow)
+            ));
+        }
+    }
+
+    #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn native_preparation_is_shared_but_memory_and_host_continuations_are_independent() {
+        let mut code = Vec::new();
+        let mut bits = Vec::new();
+        asm(&mut code, &mut bits, &[10, 42]);
+        asm(&mut code, &mut bits, &[128, 2 + 16 * 7]);
+        asm(&mut code, &mut bits, &[50, 0]);
+        let blob = build_standard_program(&[], &[], 1, 4096, &code, &bits);
+        let prepared =
+            PreparedProgram::new_with_backend(&blob, PvmBackend::ForceRecompiler).unwrap();
+        for args in [vec![1, 2, 3, 4], vec![5, 6, 7, 8]] {
+            let mut native =
+                Machine::load_prepared(&prepared, &args, 1_000_000, MemoryModel::Auto).unwrap();
+            let mut reference = Machine::load(&blob, &args, 1_000_000).unwrap();
+            assert_eq!(native.backend(), PvmBackend::ForceRecompiler);
+            for machine in [&mut native, &mut reference] {
+                assert_eq!(machine.try_resume().unwrap(), ExitReason::HostCall(42));
+                assert_eq!(machine.interpreter().pc, 0);
+                assert!(machine.gas_charged());
+                assert!(machine.charge(7));
+                machine.credit(3);
+                // Host initialization can edit a guest read-only page without
+                // changing its permissions, through the checked host alias.
+                let address = machine.registers()[7] as u32;
+                machine.memory_mut().init_copy(address, &[9, 8, 7, 6]);
+                assert_eq!(machine.try_resume().unwrap(), ExitReason::Halt);
+            }
+            assert_eq!(native.registers(), reference.registers());
+            assert_eq!(native.gas_remaining(), reference.gas_remaining());
+            assert_eq!(native.interpreter().pc, reference.interpreter().pc);
+            assert_eq!(
+                native.registers()[2],
+                u64::from(u32::from_le_bytes([9, 8, 7, 6]))
+            );
+        }
+        assert!(matches!(
+            Machine::load_prepared(&prepared, &[], 1_000_000, MemoryModel::Sparse),
+            Err(RefineError::Backend)
+        ));
+    }
+
+    #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn native_fault_retry_preserves_funded_block_and_permission_changes() {
+        let blob = fault_gap_blob();
+        let mut native = Machine::load_with_backend(
+            &blob,
+            &[],
+            1_000_000,
+            MemoryModel::Auto,
+            PvmBackend::ForceRecompiler,
+        )
+        .unwrap();
+        let mut reference = Machine::load(&blob, &[], 1_000_000).unwrap();
+        for machine in [&mut native, &mut reference] {
+            assert_eq!(
+                machine.try_resume().unwrap(),
+                ExitReason::PageFault(0x10000)
+            );
+            let funded_gas = machine.gas_remaining();
+            assert!(machine.memory_mut().set_page_range(16, 1, PERM_RW));
+            assert!(
+                machine
+                    .memory_mut()
+                    .write_bytes_checked(0x10000, &[1, 2, 3, 4, 5, 6, 7, 8])
+            );
+            assert_eq!(machine.try_resume().unwrap(), ExitReason::Panic);
+            assert_eq!(
+                machine.gas_remaining(),
+                funded_gas,
+                "retry must not fund the block again"
+            );
+        }
+        assert_eq!(native.registers(), reference.registers());
+        assert_eq!(native.gas_remaining(), reference.gas_remaining());
+        assert_eq!(native.interpreter().pc, reference.interpreter().pc);
+    }
+
+    #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn native_unacknowledged_host_boundary_is_stable() {
+        let blob = build_standard_program(
+            &[],
+            &[],
+            0,
+            4096,
+            &[51, 2, 9, 10, 42, 0],
+            &[1, 0, 0, 1, 0, 1],
+        );
+        let mut machine = Machine::load_with_backend(
+            &blob,
+            &[],
+            1_000_000,
+            MemoryModel::Auto,
+            PvmBackend::ForceRecompiler,
+        )
+        .unwrap();
+        let prepared = machine.execution.clone().unwrap();
+        assert_eq!(
+            prepared.run(&mut machine.interp).unwrap(),
+            ExitReason::HostCall(42)
+        );
+        let registers = *machine.registers();
+        let gas = machine.gas_remaining();
+        for _ in 0..2 {
+            assert_eq!(
+                prepared.run(&mut machine.interp).unwrap(),
+                ExitReason::HostCall(42)
+            );
+            assert_eq!(machine.interp.pc, 3);
+            assert_eq!(machine.gas_remaining(), gas);
+            assert_eq!(machine.registers(), &registers);
+            assert_eq!(
+                machine.interp.pending_host_call(),
+                Some(crate::PendingHostCall {
+                    id: 42,
+                    cause_pc: 3,
+                    resume_pc: 5,
+                })
+            );
+        }
+        assert_eq!(machine.try_resume().unwrap(), ExitReason::Panic);
+        assert_eq!(machine.interp.pc, 0);
+        assert_eq!(machine.gas_remaining(), gas);
+    }
+
+    #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn native_preparation_supports_concurrent_independent_invocations() {
+        let prepared = std::sync::Arc::new(
+            PreparedProgram::new_with_backend(&round_trip_blob(), PvmBackend::ForceRecompiler)
+                .unwrap(),
+        );
+        let workers: Vec<_> = (1u32..=4)
+            .map(|worker| {
+                let prepared = prepared.clone();
+                std::thread::spawn(move || {
+                    for iteration in 0..8 {
+                        let args = (worker * 100 + iteration).to_le_bytes();
+                        let mut machine =
+                            Machine::load_prepared(&prepared, &args, 1_000_000, MemoryModel::Auto)
+                                .unwrap();
+                        let exit = machine.try_resume().unwrap();
+                        let invocation = machine.finish(exit);
+                        assert_eq!(invocation.exit, ExitReason::Halt);
+                        assert_eq!(invocation.output_bounded(4), Some(args.to_vec()));
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    }
+
+    /// Load-only measurement, not an execution or end-to-end latency gate.
+    #[cfg(feature = "std")]
+    #[test]
+    #[ignore = "requires VOS_PVM_PREPARE_BENCH_PROGRAM; run with --release --nocapture"]
+    fn prepared_program_load_measurement() {
+        use std::{hint::black_box, time::Instant};
+        let path = std::env::var("VOS_PVM_PREPARE_BENCH_PROGRAM").unwrap();
+        let blob = std::fs::read(path).unwrap();
+        let started = Instant::now();
+        let prepared = PreparedProgram::new(&blob).unwrap();
+        let preparation = started.elapsed();
+        // Representative input size from the recorded Authority query; these
+        // bytes are not a valid work request and are deliberately never run.
+        let args = vec![0; 790_499];
+        let mut cold_time = std::time::Duration::ZERO;
+        let mut reused_time = std::time::Duration::ZERO;
+        for i in 0..20 {
+            // Alternate ordering to avoid always timing one path first.
+            for reuse in [i % 2 == 0, i % 2 != 0] {
+                let started = Instant::now();
+                let machine = if reuse {
+                    Machine::load_prepared(&prepared, &args, 6_000_000_000, MemoryModel::Auto)
+                } else {
+                    Machine::load(&blob, &args, 6_000_000_000)
+                }
+                .unwrap();
+                let elapsed = started.elapsed();
+                if reuse {
+                    reused_time += elapsed;
+                } else {
+                    cold_time += elapsed;
+                }
+                black_box(&machine);
+                drop(machine);
+            }
+        }
+        std::eprintln!(
+            "program_bytes={} input_bytes={} samples_per_path=20 preparation_us={} cold_load_mean_us={} prepared_load_mean_us={}",
+            blob.len(),
+            args.len(),
+            preparation.as_micros(),
+            cold_time.as_micros() / 20,
+            reused_time.as_micros() / 20
+        );
+    }
+
+    #[test]
+    fn full_psi_deblob_failures_panic_without_changing_state() {
+        let valid = build_pvm_blob(&[10, 7, 0], &[1, 0, 1]);
+        let mut unused_high_bit = valid.clone();
+        *unused_high_bit.last_mut().unwrap() |= 0x80;
+        let cases = [
+            ("truncated", vec![0xff, 0]),
+            ("unused bitmask high bit", unused_high_bit),
+            ("initial bit unset", build_pvm_blob(&[0], &[0])),
+            ("trailing non-terminator", build_pvm_blob(&[2], &[1])),
+        ];
+        let registers =
+            core::array::from_fn(|index| 0x1111_0000_0000_0000u64.wrapping_add(index as u64));
+        let bytes: Vec<u8> = (0..2 * PVM_PAGE_SIZE as usize)
+            .map(|index| (index as u8).wrapping_mul(17).wrapping_add(3))
+            .collect();
+        let permissions = vec![PERM_RO, PERM_RW];
+
+        for gas_charged in [false, true] {
+            for (name, blob, pc) in cases
+                .iter()
+                .map(|(name, blob)| (*name, blob.as_slice(), 0u64))
+                .chain([
+                    ("operand entry", valid.as_slice(), 1),
+                    ("end entry", valid.as_slice(), 3),
+                    ("wide entry", valid.as_slice(), u64::from(u32::MAX) + 1),
+                ])
+            {
+                let mut memory = Memory::flat(bytes.clone());
+                memory.set_page_perms(permissions.clone());
+                let mut machine =
+                    Machine::from_pvm_blob(blob, pc, 0xfeed_beef, gas_charged, registers, memory);
+
+                assert_eq!(machine.gas_remaining(), 0xfeed_beef, "{name}: gas");
+                assert_eq!(machine.gas_charged(), gas_charged, "{name}: funded flag");
+                assert_eq!(*machine.registers(), registers, "{name}: registers");
+                assert_eq!(
+                    machine.memory().page_perms(),
+                    permissions,
+                    "{name}: permissions"
+                );
+                let mut actual = vec![0; bytes.len()];
+                machine.memory().read_bytes(0, &mut actual);
+                assert_eq!(actual, bytes, "{name}: memory before exit");
+
+                let exit = machine.resume();
+                assert_eq!(exit, ExitReason::Panic, "{name}: full Ψ exit");
+                let invocation = machine.finish(exit);
+                assert_eq!(invocation.pc, 0, "{name}: final counter");
+                assert_eq!(invocation.gas_used, 0, "{name}: no charge");
+                assert_eq!(invocation.registers, registers, "{name}: final registers");
+                assert_eq!(invocation.memory().page_perms(), permissions);
+                let mut actual = vec![0; bytes.len()];
+                invocation.memory().read_bytes(0, &mut actual);
+                assert_eq!(actual, bytes, "{name}: final memory");
+            }
+        }
+    }
+
+    #[test]
+    fn standard_ecalli_identifier_is_full_sign_extended_register() {
+        let cases: &[(&[u8], u64)] = &[
+            (&[0xff], u64::MAX),
+            (&[0x00, 0x00, 0x00, 0x80], 0xffff_ffff_8000_0000),
+            (&[0xff, 0xff, 0xff, 0x7f], 0x7fff_ffff),
+        ];
+        let registers = core::array::from_fn(|index| 0xa500 + index as u64);
+        for (immediate, expected) in cases {
+            let mut code = vec![10];
+            code.extend_from_slice(immediate);
+            code.push(0);
+            let mut bitmask = vec![1];
+            bitmask.extend(core::iter::repeat_n(0, immediate.len()));
+            bitmask.push(1);
+            let blob = build_pvm_blob(&code, &bitmask);
+            let memory = Memory::flat(vec![0x5a; PVM_PAGE_SIZE as usize]);
+            let mut machine = Machine::from_pvm_blob(&blob, 0, 1_000, false, registers, memory);
+            assert_eq!(machine.resume(), ExitReason::HostCall(*expected));
+            assert_eq!(*machine.registers(), registers);
+            let mut actual = vec![0; PVM_PAGE_SIZE as usize];
+            machine.memory().read_bytes(0, &mut actual);
+            assert_eq!(actual, vec![0x5a; PVM_PAGE_SIZE as usize]);
+        }
     }
 
     #[test]
@@ -543,6 +1302,11 @@ mod tests {
     /// two-cluster stack program.
     #[test]
     fn flat_and_sparse_agree_across_corpus() {
+        assert_flat_sparse_parity(
+            &build_standard_program(&[], &[], 0, 0, &[50, 0], &[1, 0]),
+            &[],
+            1_000_000,
+        );
         assert_flat_sparse_parity(&round_trip_blob(), &ARGS, 1_000_000);
         assert_flat_sparse_parity(&round_trip_blob(), &ARGS, INIT_GAS + 1);
         assert_flat_sparse_parity(
@@ -595,8 +1359,8 @@ mod tests {
     #[test]
     fn page_fault_page_base_agrees() {
         let (f, s) = assert_flat_sparse_parity(&fault_gap_blob(), &[], 1_000_000).unwrap();
-        assert_eq!(f.exit, ExitReason::PageFault(0x1000));
-        assert_eq!(s.exit, ExitReason::PageFault(0x1000));
+        assert_eq!(f.exit, ExitReason::PageFault(0x10000));
+        assert_eq!(s.exit, ExitReason::PageFault(0x10000));
     }
 
     /// A write to the read-only argument region faults with the argument
@@ -621,7 +1385,7 @@ mod tests {
         assert_eq!(inv.registers[3], 0x11223344, "stack round-trip");
         assert_eq!(inv.registers[5], 0x11223344, "rw round-trip");
         assert_eq!(
-            inv.output(),
+            inv.output_bounded(core::mem::size_of::<u64>()),
             Some(0x11223344u64.to_le_bytes().to_vec()),
             "output reads back through the stack region"
         );
@@ -632,46 +1396,5 @@ mod tests {
             allocated < 16 << 20,
             "sparse allocation stays bounded ({allocated} bytes)"
         );
-    }
-
-    /// Semantic-identity anchor: the same blob/args/budget through
-    /// `InvocationKernel::new_standard` (std, interpreter backend) reaches
-    /// the same exit, register file, remaining gas, and memory image.
-    /// Together with the flat↔sparse differentials above this anchors the
-    /// sparse representation to the kernel too.
-    #[cfg(feature = "std")]
-    #[test]
-    fn matches_kernel_execution() {
-        use crate::kernel::{InvocationKernel, KernelResult};
-        use crate::vm_pool::VmState;
-
-        let blob = round_trip_blob();
-        let budget = 1_000_000u64;
-
-        let inv =
-            execute_with(&blob, &ARGS, budget, MemoryModel::Flat).expect("refine harness executes");
-        assert_eq!(inv.exit, ExitReason::Halt);
-
-        let mut kernel = InvocationKernel::new_standard(
-            &blob,
-            &ARGS,
-            budget,
-            crate::backend::PvmBackend::ForceInterpreter,
-        )
-        .expect("kernel loads the same blob");
-        kernel
-            .vm_arena
-            .vm_mut(0)
-            .transition(VmState::Running)
-            .unwrap();
-        assert!(matches!(kernel.run(), KernelResult::Halt));
-
-        let vm = kernel.vm_arena.vm(0);
-        assert_eq!(&inv.registers, vm.regs(), "register files agree");
-        assert_eq!(budget - inv.gas_used, vm.gas(), "gas accounting agrees");
-        let (kernel_mem, _, _) = kernel.extract_flat_mem();
-        let flat = inv.memory().as_flat().expect("flat was requested");
-        assert_eq!(flat, &kernel_mem[..], "memory images agree");
-        assert_eq!(inv.output().as_deref(), Some(&ARGS[..4]));
     }
 }

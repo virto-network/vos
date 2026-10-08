@@ -20,13 +20,15 @@ soundness reasoning.
 | `proof.claimed_sums`                             | NO       | Constrained: per-component logup must sum to 0. |
 | `proof.log_sizes`                                | NO       | Capped by `DEFAULT_MAX_LOG_SIZE` (overridable). |
 | `proof.initial_state` / `proof.final_state`      | partial  | registers/pc/timestamp bound to the committed boundary columns (boundary-binding check, v5) AND to the trace (pc/timestamp via CpuChip chaining; registers via the v6 register-ledger read-consistency); `memory_commitment` UNBOUND. Deployer must publish what *should* match. |
-| `proof.pcs_config`                               | partial  | Used as-is; affects security level.  See "Proof shape" below. |
+| `proof.pcs_config`                               | NO       | Structurally/policy checked and fully Fiat–Shamir-bound, including the lifting `Option` discriminant. See "Proof shape" below. |
 | `hash` (preprocessed commitment)                 | YES      | Caller-supplied: this IS the program identity. |
 
 The verifier accepts the proof iff:
 
-1. `format_version` matches.
-2. No `log_size` exceeds the cap.
+1. `format_version` matches and that version plus the complete `pcs_config`
+   are bound into the Fiat–Shamir prefix.
+2. Nested proof vectors, canonical M31 encodings, component/tree dimensions,
+   FRI shape, and `log_size` caps pass hostile-input preflight.
 3. `claimed_sums` length matches the verifier's component count.
 4. The proof's `commitments[0]` (preprocessed Merkle root) equals
    the caller-supplied `hash`.
@@ -39,6 +41,44 @@ The verifier accepts the proof iff:
    the committed columns; empty-trace proofs are rejected.
 8. (v5, standalone) `component_mask` contains the three boundary-binding
    chips and its popcount equals `num_components`.
+
+### Nested Refine bundles (formats 20/21, bundle v2)
+
+`RefineProofBundle` is an ordered closure of single-program child STARKs.
+Its transcript binds the exact outer artifact hash and invocation
+arguments/gas, every inner `(slot, generation, program-hash)` identity, child
+proof format/shape/commitments, sparse state/page commitments, calls 9 through
+14 with their before/after registers and state hashes, and the final exit.
+
+`RefineProofBundle` derives Serde for in-memory interchange only. Production
+artifacts use `encode_refine_proof_bundle` / `decode_refine_proof_bundle`. The
+decoder rejects bytes above the authenticated runtime proof-material ceiling
+before parsing and charges every recursively declared Stwo vector against a
+derived generation-capped allocation budget before reserve. Serde, bincode,
+and postcard are not production proof-bundle decoders. The 1024-slice and
+boundary/component limits are also enforced while lengths are read, followed
+by the existing structural proof preflight. Each child retains its checked
+16 MiB nested-vector payload ceiling and the child closure its 512 MiB
+aggregate post-decode ceiling before any child clone, transcript hash,
+resolver callback, or cryptographic verification.
+
+`verify_refine_bundle_authenticated` also requires a trusted external mapping
+from every exact machine/program identity, proof format, component shape, and
+complete `PcsConfig` (including explicit lifting) to its preprocessed-trace
+commitment. This prevents a valid proof for arbitrary code or another PCS
+profile from being relabelled with a signed program hash. The verifier checks those
+child STARKs and canonical slice/boundary coverage, but deliberately returns
+`ReplayRequired`; transcript authentication alone does not bind the separately
+recorded native machine-state hashes or exit reasons to the child STARK
+statements, nor does it prove the native state mutation performed by calls 9
+through 14. It must never be treated as end-to-end Refine validity. A
+prover-enabled host obtains that stronger result only from
+`verify_refine_bundle_replayed`, which reruns the standard `RefineContext` from
+the exact committed program, arguments, and gas, compares every machine
+identity/slice/boundary, regenerates each directly observed witness's exact
+preprocessed and main-trace roots plus public segment state, and then verifies
+the child STARK interaction/composition/FRI suffix against those roots. This
+replay API is the only end-to-end Refine acceptance result.
 
 ## What a verified proof guarantees
 
@@ -63,7 +103,7 @@ A proof verified against `hash = H(P)` for program `P` proves that:
 
 - **Per-step semantics**: each ALU / branch / load / store / shift
   / rotate / bitmanip / divrem / mul / compare / cmov / move /
-  jump / ECALL / Trap / Sbrk row satisfies the AIR's per-opcode
+  jump / ECALL / Trap row satisfies the AIR's per-opcode
   constraints.  See `docs/status.md` for the per-opcode breakdown of
   *which* semantic property is bound.
 
@@ -91,7 +131,7 @@ A proof verified against `hash = H(P)` for program `P` proves that:
 - **Control-flow continuity**: step n+1's `pc` equals step n's
   `next_pc`; static branch / jump targets equal `pc + sign-
   extend(offset)`; indirect jumps land in the program's
-  `jump_table`; Trap / Sbrk admit no successor row.
+  `jump_table`; Trap admits no successor row.
 
 - **Blake2b precompiles**: every `Blake2b` ECALL row's `(h, m, t,
   f)` block is correctly compressed for 12 rounds — bound by the

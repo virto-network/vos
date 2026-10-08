@@ -13,8 +13,8 @@
 
 use crate::TranspileError;
 use crate::emitter;
-use crate::riscv::TranslationContext;
-use std::collections::HashMap;
+use crate::riscv::{OpcodeEncoding, TranslationContext, decode_b_imm, decode_j_imm};
+use std::collections::{HashMap, HashSet};
 
 /// RISC-V relocation types we care about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,8 +87,14 @@ struct LinkedElf {
     /// For LLVM relative jump tables: entry = target - subtracted_addr.
     /// Combined with the resolved entry value, we can recover the target.
     sub32_relocs: Vec<(u64, u64)>,
+    /// Bytes whose data-pointer interpretation is already defined by a
+    /// relocation, including non-code targets. Never rescan as raw pointers.
+    data_relocation_ranges: Vec<(u64, u64)>,
     /// Code section address ranges for detecting code pointers.
     code_ranges: Vec<(u64, u64)>,
+    /// Every statically reachable RISC-V instruction address. Translation-time
+    /// predecessor fusion must stop at these boundaries.
+    control_flow_targets: HashSet<u64>,
     /// ELF entry point (e_entry) — the RISC-V vaddr of _start (refine entry).
     entry_vaddr: u64,
     /// RISC-V vaddr of the exported `accumulate` symbol, if the service
@@ -103,6 +109,8 @@ struct LinkedElf {
 /// capability manifest ([`link_elf`]) and the GP standard program
 /// ([`link_elf_spi`]) — are serializations of exactly these fields.
 struct TranspiledElf {
+    #[cfg(test)]
+    address_map: HashMap<u64, u32>,
     code: Vec<u8>,
     bitmask: Vec<u8>,
     jump_table: Vec<u32>,
@@ -137,7 +145,10 @@ pub fn link_elf_with_argument_pages(
             "argument DATA capability must contain at least one page".into(),
         ));
     }
-    let t = transpile_elf(elf_data)?;
+    // The capability-manifest container is an already-pinned production
+    // format. Keep its historical read-only code-pointer rewrite so changes
+    // needed by standard programs cannot silently repin existing services.
+    let t = transpile_elf(elf_data, false, OpcodeEncoding::CapabilityManifest)?;
     Ok(emitter::build_service_program_with_args_pages(
         &t.code,
         &t.bitmask,
@@ -161,9 +172,9 @@ fn zone_round(x: u64) -> u64 {
 
 /// Transpile an rv64em ELF into a **GP standard-program (SPI) blob** — the
 /// format `vos_pvm::spi::parse_standard_program` consumes and
-/// `vos_pvm::refine::execute_with` runs. Same translation as [`link_elf`]
-/// (identical code, bitmask, and jump table; entry prologue at IC 0 =
-/// refine, IC 5 = accumulate-or-trap), re-containered per GP Appendix A.
+/// `vos_pvm::refine::execute_with` runs. It shares instruction translation
+/// with [`link_elf`], adds standard-program read-write code-pointer rewriting,
+/// and uses the entry prologue IC 0 = refine, IC 5 = accumulate-or-trap.
 ///
 /// Header-field derivation (manifest ↔ SPI mapping):
 ///
@@ -174,9 +185,11 @@ fn zone_round(x: u64) -> u64 {
 ///   `φ1 = s`, while `StandardProgram::layout` maps `page_round(s)` bytes
 ///   just below the argument zone with `φ1 = 0xFEFE_0000`. `φ1` is
 ///   host-installed in both, so SP-relative guest code is placement-blind.
-/// - **`z` (heap pages, `E₂`)** = the manifest's `heap_pages`. The layout
-///   maps `page_round(|w| + z·4096)` read-write bytes, which equals the
-///   manifest's separate rw + heap caps page-for-page.
+/// - **`z` (heap pages, `E₂`)** includes the manifest's explicit heap and
+///   every trailing all-zero read-write page (normally `.bss`). Standard
+///   programs distinguish initialized bytes from zero pages directly, so
+///   encoding those pages in `w` would only inflate the artifact. The total
+///   mapped read-write span remains identical page-for-page.
 /// - **`o` (read-only data)** = the ro blob **re-based to the GP ro base
 ///   `Z_Z` = `0x1_0000`**: zero-prefix padding covers `[Z_Z, ro_base)`. An
 ///   ELF whose ro sections are linked below `Z_Z` is rejected — its embedded
@@ -194,7 +207,7 @@ fn zone_round(x: u64) -> u64 {
 /// placement need no linker cooperation (code addresses are translated;
 /// the stack is SP-relative).
 pub fn link_elf_spi(elf_data: &[u8]) -> Result<Vec<u8>, TranspileError> {
-    let t = transpile_elf(elf_data)?;
+    let t = transpile_elf(elf_data, true, OpcodeEncoding::Standard)?;
 
     // Re-base the ro blob from its linked base to the GP ro base Z_Z.
     let ro_data = if t.ro_data.is_empty() {
@@ -212,7 +225,7 @@ pub fn link_elf_spi(elf_data: &[u8]) -> Result<Vec<u8>, TranspileError> {
 
     // Re-base the rw blob to the GP rw base 2·Z_Z + zone_round(|o|).
     let rw_spi_base = 2 * Z_Z + zone_round(ro_data.len() as u64);
-    let rw_data = if t.rw_data.is_empty() {
+    let mut rw_data = if t.rw_data.is_empty() {
         Vec::new()
     } else if t.rw_min < rw_spi_base {
         return Err(TranspileError::InvalidSection(format!(
@@ -230,6 +243,23 @@ pub fn link_elf_spi(elf_data: &[u8]) -> Result<Vec<u8>, TranspileError> {
         t.rw_data[(rw_spi_base - t.rw_base) as usize..].to_vec()
     };
 
+    // Standard programs encode zero-initialized memory as heap pages. Fold
+    // the read-write blob's trailing zero pages (principally ELF NOBITS
+    // `.bss`) into `z` while preserving the exact total mapped page count.
+    let page_size = vos_pvm::PVM_PAGE_SIZE as usize;
+    let original_rw_pages = rw_data.len().div_ceil(page_size);
+    let compact_len = rw_data
+        .iter()
+        .rposition(|byte| *byte != 0)
+        .map_or(0, |index| index + 1);
+    rw_data.truncate(compact_len);
+    let compact_rw_pages = compact_len.div_ceil(page_size);
+    let reclaimed_zero_pages = original_rw_pages - compact_rw_pages;
+    let heap_pages = t
+        .heap_pages
+        .checked_add(reclaimed_zero_pages as u32)
+        .ok_or_else(|| TranspileError::InvalidSection("SPI: heap page count overflow".into()))?;
+
     // Wire-width guards: |o|, |w|, s are E₃-encoded; z is E₂-encoded.
     for (what, len) in [("read-only", ro_data.len()), ("read-write", rw_data.len())] {
         if len >= 1 << 24 {
@@ -244,10 +274,9 @@ pub fn link_elf_spi(elf_data: &[u8]) -> Result<Vec<u8>, TranspileError> {
             t.stack_size,
         )));
     }
-    let heap_pages = u16::try_from(t.heap_pages).map_err(|_| {
+    let heap_pages = u16::try_from(heap_pages).map_err(|_| {
         TranspileError::InvalidSection(format!(
-            "SPI: heap page count {} exceeds the E2 field width",
-            t.heap_pages,
+            "SPI: heap page count {heap_pages} exceeds the E2 field width",
         ))
     })?;
 
@@ -276,9 +305,13 @@ pub fn link_elf_spi(elf_data: &[u8]) -> Result<Vec<u8>, TranspileError> {
 }
 
 /// The shared ELF → GP-encoded-program translation both containers build on.
-fn transpile_elf(elf_data: &[u8]) -> Result<TranspiledElf, TranspileError> {
+fn transpile_elf(
+    elf_data: &[u8],
+    rewrite_read_write_code_pointers: bool,
+    opcode_encoding: OpcodeEncoding,
+) -> Result<TranspiledElf, TranspileError> {
     let elf = parse_linked_elf(elf_data)?;
-    let mut ctx = TranslationContext::new(elf.is_64bit);
+    let mut ctx = TranslationContext::with_opcode_encoding(elf.is_64bit, opcode_encoding);
     ctx.code_ranges = elf.code_ranges.clone();
 
     // Emit the two-slot GP entry prologue. ICs are byte offsets into the code,
@@ -314,18 +347,38 @@ fn transpile_elf(elf_data: &[u8]) -> Result<TranspiledElf, TranspileError> {
 
     let mut ro_data = elf.ro_data.clone();
     let mut rw_data = elf.rw_data.clone();
-    rewrite_data_code_ptrs(&elf, &mut ctx, &mut ro_data, &mut rw_data);
+    rewrite_data_code_ptrs(
+        &elf,
+        &mut ctx,
+        &mut ro_data,
+        &mut rw_data,
+        rewrite_read_write_code_pointers,
+    );
 
     crate::peephole_fuse_load_imm_alu(&mut ctx.code, &mut ctx.bitmask, &ctx.jump_table);
     crate::peephole_fuse_load_imm_memory(&mut ctx.code, &mut ctx.bitmask, &ctx.jump_table);
     crate::peephole_eliminate_dead_load_imm(&mut ctx.code, &mut ctx.bitmask, &ctx.jump_table);
+    #[cfg(not(test))]
     crate::ensure_branch_targets_are_block_starts(
         &mut ctx.code,
         &mut ctx.bitmask,
         &mut ctx.jump_table,
     );
+    #[cfg(test)]
+    crate::ensure_branch_targets_with_pc_map(
+        &mut ctx.code,
+        &mut ctx.bitmask,
+        &mut ctx.jump_table,
+        |offsets| {
+            for pc in ctx.address_map.values_mut() {
+                *pc = offsets[*pc as usize];
+            }
+        },
+    );
 
     Ok(TranspiledElf {
+        #[cfg(test)]
+        address_map: ctx.address_map,
         code: ctx.code,
         bitmask: ctx.bitmask,
         jump_table: ctx.jump_table,
@@ -580,6 +633,7 @@ fn parse_linked_elf(data: &[u8]) -> Result<LinkedElf, TranspileError> {
     let mut lo12_entries: Vec<(u64, u64)> = Vec::new(); // (lo12_addr, hi20_addr)
     let mut abs64_relocs: Vec<(u64, u64, u8)> = Vec::new(); // (offset, target, entry_size)
     let mut sub32_relocs: Vec<(u64, u64)> = Vec::new();
+    let mut data_relocation_ranges = Vec::new();
     // Code address ranges for detecting code pointers
     let code_ranges: Vec<(u64, u64)> = code_sections
         .iter()
@@ -612,6 +666,16 @@ fn parse_linked_elf(data: &[u8]) -> Result<LinkedElf, TranspileError> {
             };
 
             let target_addr = (sym_value as i64 + r_addend) as u64;
+
+            match rtype {
+                RelocType::Abs32 | RelocType::Add32 | RelocType::Sub32 => {
+                    data_relocation_ranges.push((r_offset, r_offset.saturating_add(4)));
+                }
+                RelocType::Abs64 => {
+                    data_relocation_ranges.push((r_offset, r_offset.saturating_add(8)))
+                }
+                _ => {}
+            }
 
             match rtype {
                 RelocType::Abs32 => {
@@ -658,10 +722,136 @@ fn parse_linked_elf(data: &[u8]) -> Result<LinkedElf, TranspileError> {
         }
     }
 
+    let data_relocation_ranges = merge_relocation_ranges(data_relocation_ranges);
+
     // Pass 2: resolve LO12 targets by looking up paired HI20
     for (lo12_addr, hi20_addr) in lo12_entries {
         if let Some(&data_addr) = hi20_targets.get(&hi20_addr) {
             lo12_targets.insert(lo12_addr, data_addr);
+        }
+    }
+
+    let mut control_flow_targets = HashSet::new();
+    control_flow_targets.insert(e_entry);
+    control_flow_targets.extend(accumulate_vaddr);
+    control_flow_targets.extend(
+        symbols_by_idx
+            .iter()
+            .map(|(_, value)| *value)
+            .filter(|value| code_ranges.iter().any(|(lo, hi)| value >= lo && value < hi)),
+    );
+    for (&call_site, &target) in &call_targets {
+        control_flow_targets.insert(target);
+        // CALL_PLT occupies AUIPC+JALR; execution resumes after both.
+        control_flow_targets.insert(call_site + 8);
+    }
+    control_flow_targets.extend(abs64_relocs.iter().map(|(_, target, _)| *target));
+    control_flow_targets.extend(hi20_targets.values().copied().filter(|target| {
+        code_ranges
+            .iter()
+            .any(|(lo, hi)| target >= lo && target < hi)
+    }));
+    let is_code_target = |target: u64| {
+        code_ranges
+            .iter()
+            .any(|(lo, hi)| target >= *lo && target < *hi)
+    };
+
+    // The data-pointer rewriter below accepts stripped linked ELFs whose only
+    // reference to a function entry is a raw pointer or an orphan SUB32 table
+    // value. Collect those exact accepted targets before translating code so
+    // they receive the same predecessor-fusion barrier as symbolic entries.
+    for &(data_vaddr, base_addr) in &sub32_relocs {
+        if abs64_relocs
+            .iter()
+            .any(|(absolute_vaddr, _, _)| *absolute_vaddr == data_vaddr)
+        {
+            continue;
+        }
+        let bytes = data_vaddr
+            .checked_sub(stack_size)
+            .and_then(|offset| usize::try_from(offset).ok())
+            .and_then(|offset| offset.checked_add(4).map(|end| (offset, end)))
+            .and_then(|(offset, end)| ro_data.get(offset..end))
+            .or_else(|| {
+                let offset = usize::try_from(data_vaddr.checked_sub(rw_base)?).ok()?;
+                let end = offset.checked_add(4)?;
+                rw_data.get(offset..end)
+            });
+        if let Some(bytes) = bytes {
+            let relative = i32::from_le_bytes(bytes.try_into().expect("four-byte slice"));
+            let target = (base_addr as i64 + i64::from(relative)) as u64;
+            if is_code_target(target) {
+                control_flow_targets.insert(target);
+            }
+        }
+    }
+    for (base, data) in [(stack_size, &ro_data), (rw_base, &rw_data)] {
+        for (index, bytes) in data.chunks_exact(8).enumerate() {
+            if overlaps_data_relocation(&data_relocation_ranges, base + index as u64 * 8, 8) {
+                continue;
+            }
+            let target = u64::from_le_bytes(bytes.try_into().expect("eight-byte chunk"));
+            if is_code_target(target) {
+                control_flow_targets.insert(target);
+            }
+        }
+    }
+
+    for (_, base, code) in &code_sections {
+        for (index, bytes) in code.chunks_exact(4).enumerate() {
+            let address = *base + (index * 4) as u64;
+            let instruction = u32::from_le_bytes(bytes.try_into().expect("four-byte chunk"));
+            if instruction & 0x7f == 0x17
+                && let Some(next_bytes) = code.get(index * 4 + 4..index * 4 + 8)
+            {
+                let next = u32::from_le_bytes(
+                    next_bytes
+                        .try_into()
+                        .expect("adjacent four-byte instruction"),
+                );
+                let auipc_rd = (instruction >> 7) & 0x1f;
+                let jalr_rs1 = (next >> 15) & 0x1f;
+                if next & 0x7f == 0x67 && (next >> 12) & 0x7 == 0 && auipc_rd == jalr_rs1 {
+                    let upper = (instruction & 0xffff_f000) as i32;
+                    let lower = (next as i32) >> 20;
+                    let target = (address as i64 + i64::from(upper) + i64::from(lower)) as u64;
+                    if is_code_target(target) {
+                        control_flow_targets.insert(target);
+                    }
+                }
+                let addi_rd = (next >> 7) & 0x1f;
+                if next & 0x7f == 0x13
+                    && (next >> 12) & 0x7 == 0
+                    && auipc_rd != 0
+                    && addi_rd == auipc_rd
+                    && jalr_rs1 == auipc_rd
+                {
+                    let upper = (instruction & 0xffff_f000) as i32;
+                    let lower = (next as i32) >> 20;
+                    let target = (address as i64 + i64::from(upper) + i64::from(lower)) as u64;
+                    if is_code_target(target) {
+                        control_flow_targets.insert(target);
+                    }
+                }
+            }
+            match instruction & 0x7f {
+                0x6f => {
+                    control_flow_targets
+                        .insert((address as i64 + i64::from(decode_j_imm(instruction))) as u64);
+                    if (instruction >> 7) & 0x1f != 0 {
+                        control_flow_targets.insert(address + 4);
+                    }
+                }
+                0x63 => {
+                    control_flow_targets
+                        .insert((address as i64 + i64::from(decode_b_imm(instruction))) as u64);
+                }
+                0x67 if (instruction >> 7) & 0x1f != 0 => {
+                    control_flow_targets.insert(address + 4);
+                }
+                _ => {}
+            }
         }
     }
 
@@ -682,19 +872,43 @@ fn parse_linked_elf(data: &[u8]) -> Result<LinkedElf, TranspileError> {
         call_targets,
         abs_code_ptrs: abs64_relocs,
         sub32_relocs,
+        data_relocation_ranges,
         code_ranges,
+        control_flow_targets,
         entry_vaddr: e_entry,
         accumulate_vaddr,
     })
 }
 
-/// Translate a code section with relocation awareness.
+/// Relocation metadata owns every byte it covers, including the other half of
+/// an eight-byte heuristic candidate and relocations to non-code addresses.
+fn merge_relocation_ranges(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    ranges.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        if let Some(last) = merged.last_mut()
+            && start <= last.1
+        {
+            last.1 = last.1.max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    merged
+}
+
+fn overlaps_data_relocation(ranges: &[(u64, u64)], address: u64, size: u8) -> bool {
+    let end = address.saturating_add(u64::from(size));
+    let index = ranges.partition_point(|&(start, _)| start < end);
+    index != 0 && ranges[index - 1].1 > address
+}
+
 /// Rewrite code pointers in data sections (LLVM switch/jump tables, vtables).
 ///
 /// Detects code pointers via:
 /// 1. R_RISCV_32/64 absolute relocations targeting code sections
 /// 2. R_RISCV_SUB32 relocations (relative jump table entries: value = target - table_base)
-/// 3. Heuristic scan for 8-byte values in rodata that match code addresses
+/// 3. Heuristic scan for 8-byte values in initialized data that match code addresses
 ///
 /// Creates PVM jump table entries for each target and rewrites the data
 /// so that the loaded values are valid PVM djump addresses.
@@ -702,9 +916,16 @@ fn rewrite_data_code_ptrs(
     elf: &LinkedElf,
     ctx: &mut TranslationContext,
     ro_data: &mut [u8],
-    _rw_data: &mut [u8],
+    rw_data: &mut [u8],
+    rewrite_read_write: bool,
 ) {
-    let ro_base = elf.stack_size as u64;
+    let ro_base = if rewrite_read_write {
+        elf.ro_base
+    } else {
+        // Preserve the established manifest-container translation exactly.
+        elf.stack_size as u64
+    };
+    let rw_base = elf.rw_base;
     let is_code_addr = |addr: u64| -> bool {
         elf.code_ranges
             .iter()
@@ -741,30 +962,50 @@ fn rewrite_data_code_ptrs(
         if entries.iter().any(|e| e.data_vaddr == data_vaddr) {
             continue; // Already handled via ADD32 pairing above
         }
-        if data_vaddr >= ro_base {
+        let bytes = if data_vaddr >= ro_base {
             let off = (data_vaddr - ro_base) as usize;
-            if off + 4 <= ro_data.len() {
-                let val = i32::from_le_bytes(ro_data[off..off + 4].try_into().unwrap());
-                let target = (base_addr as i64 + val as i64) as u64;
-                if is_code_addr(target) {
-                    entries.push(Entry {
-                        data_vaddr,
-                        rv_target: target,
-                        size: 4,
-                        table_base_rv: Some(base_addr),
-                    });
-                }
+            ro_data.get(off..off + 4)
+        } else {
+            None
+        }
+        .or_else(|| {
+            if !rewrite_read_write {
+                return None;
+            }
+            let off = data_vaddr.checked_sub(rw_base)? as usize;
+            rw_data.get(off..off + 4)
+        });
+        if let Some(bytes) = bytes {
+            let val = i32::from_le_bytes(bytes.try_into().unwrap());
+            let target = (base_addr as i64 + val as i64) as u64;
+            if is_code_addr(target) {
+                entries.push(Entry {
+                    data_vaddr,
+                    rv_target: target,
+                    size: 4,
+                    table_base_rv: Some(base_addr),
+                });
             }
         }
     }
 
-    // Heuristic: 8-byte values in rodata that are code addresses
+    // Heuristic: 8-byte values in either initialized region that are code
+    // addresses. Relocations normally cover these; the scan also supports
+    // stripped-but-still-linked inputs.
+    let initialized_regions = [(ro_base, &*ro_data), (rw_base, &*rw_data)];
+    for (base, data) in initialized_regions
+        .into_iter()
+        .take(if rewrite_read_write { 2 } else { 1 })
     {
         let mut off = 0;
-        while off + 8 <= ro_data.len() {
-            let val = u64::from_le_bytes(ro_data[off..off + 8].try_into().unwrap());
+        while off + 8 <= data.len() {
+            if overlaps_data_relocation(&elf.data_relocation_ranges, base + off as u64, 8) {
+                off += 8;
+                continue;
+            }
+            let val = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
             if is_code_addr(val) {
-                let vaddr = ro_base + off as u64;
+                let vaddr = base + off as u64;
                 if !entries.iter().any(|e| e.data_vaddr == vaddr) {
                     entries.push(Entry {
                         data_vaddr: vaddr,
@@ -786,32 +1027,41 @@ fn rewrite_data_code_ptrs(
     let rv_to_jt = ctx.build_function_pointer_map(&targets);
 
     for entry in &entries {
-        if let Some(&jt_addr) = rv_to_jt.get(&entry.rv_target)
-            && entry.data_vaddr >= ro_base
-            && (entry.data_vaddr - ro_base) as usize + entry.size as usize <= ro_data.len()
-        {
-            let off = (entry.data_vaddr - ro_base) as usize;
-            match (entry.size, entry.table_base_rv) {
-                (8, _) => {
-                    ro_data[off..off + 8].copy_from_slice(&(jt_addr as u64).to_le_bytes());
-                }
-                (4, None) => {
-                    ro_data[off..off + 4].copy_from_slice(&jt_addr.to_le_bytes());
-                }
-                (4, Some(rv_base)) => {
-                    // Relative entry: code does `lw off, table(idx); add target, off, base; jr target`.
-                    // base register holds the PVM mapping of rv_base (from load_imm).
-                    // new_val + pvm_base = jt_addr → new_val = jt_addr - pvm_base.
-                    let pvm_base = ctx
-                        .address_map
-                        .get(&rv_base)
-                        .copied()
-                        .unwrap_or(rv_base as u32);
-                    let new_val = (jt_addr as i64 - pvm_base as i64) as i32;
-                    ro_data[off..off + 4].copy_from_slice(&new_val.to_le_bytes());
-                }
-                _ => {}
+        let Some(&jt_addr) = rv_to_jt.get(&entry.rv_target) else {
+            continue;
+        };
+        let replacement = match (entry.size, entry.table_base_rv) {
+            (8, _) => (jt_addr as u64).to_le_bytes().to_vec(),
+            (4, None) => jt_addr.to_le_bytes().to_vec(),
+            (4, Some(rv_base)) => {
+                // Relative entry: code does `lw off, table(idx); add target,
+                // off, base; jr target`.
+                let pvm_base = ctx
+                    .address_map
+                    .get(&rv_base)
+                    .copied()
+                    .unwrap_or(rv_base as u32);
+                let value = (jt_addr as i64 - pvm_base as i64) as i32;
+                value.to_le_bytes().to_vec()
             }
+            _ => continue,
+        };
+        let size = replacement.len();
+        if let Some(off) = entry
+            .data_vaddr
+            .checked_sub(ro_base)
+            .and_then(|off| usize::try_from(off).ok())
+            .filter(|off| off.saturating_add(size) <= ro_data.len())
+        {
+            ro_data[off..off + size].copy_from_slice(&replacement);
+        } else if rewrite_read_write
+            && let Some(off) = entry
+                .data_vaddr
+                .checked_sub(rw_base)
+                .and_then(|off| usize::try_from(off).ok())
+                .filter(|off| off.saturating_add(size) <= rw_data.len())
+        {
+            rw_data[off..off + size].copy_from_slice(&replacement);
         }
     }
 }
@@ -825,7 +1075,7 @@ fn translate_section_linked(
     let mut offset = 0;
     while offset < data.len() {
         let rv_addr = base_addr + offset as u64;
-        ctx.address_map.insert(rv_addr, ctx.code.len() as u32);
+        ctx.begin_instruction(rv_addr, elf.control_flow_targets.contains(&rv_addr))?;
 
         if offset + 4 > data.len() {
             break;
@@ -858,6 +1108,12 @@ fn translate_section_linked(
                 // CALL_PLT: AUIPC+JALR pair for function call
                 // Peek at JALR to get link register
                 if offset + 8 <= data.len() {
+                    if elf.control_flow_targets.contains(&(rv_addr + 4)) {
+                        return Err(TranspileError::InvalidSection(format!(
+                            "control-flow target {:#x} splits a relocated AUIPC+JALR call pair at {rv_addr:#x}",
+                            rv_addr + 4
+                        )));
+                    }
                     let jalr = u32::from_le_bytes([
                         data[offset + 4],
                         data[offset + 5],
@@ -867,18 +1123,12 @@ fn translate_section_linked(
                     let jalr_rd = ((jalr >> 7) & 0x1f) as u8;
                     let ret_addr = rv_addr + 8;
 
-                    // A call is not a load_imm-fusing instruction. `translate_one`
-                    // clears a stale `pending_load_imm` for any opcode that can't
-                    // consume it, but this CALL_PLT path bypasses `translate_one`.
-                    // Clearing it here is essential: otherwise a `pending_load_imm`
-                    // left by a preceding PCREL (AUIPC+ADDI) survives across the
-                    // emitted call, and the next fusable instruction (branch, load,
-                    // store, ALU) "undoes" the fusion back to the load_imm's
-                    // position — truncating the call's bytes and desyncing every
-                    // address_map entry past it (a branch target then lands
-                    // mid-instruction → a PVM trap). The load_imm is already
-                    // emitted, so dropping the tracking simply forgoes fusion.
-                    ctx.pending_load_imm = None;
+                    // This relocation override bypasses `translate_one`, so flush
+                    // any LUI/AUIPC buffered by the linear predecessor before the
+                    // call can transfer control. This also clears load-immediate
+                    // fusion state: a later consumer must not fuse backwards across
+                    // the emitted call and truncate its bytes.
+                    ctx.flush_pending()?;
                     // Fused load_imm_jump: set return address and jump in one instruction
                     ctx.emit_call(jalr_rd, ret_addr, target_addr)?;
                     // Map the JALR address too
@@ -897,6 +1147,11 @@ fn translate_section_linked(
                 if offset + 8 <= data.len()
                     && let Some(&_) = elf.lo12_targets.get(&next_addr)
                 {
+                    if elf.control_flow_targets.contains(&next_addr) {
+                        return Err(TranspileError::InvalidSection(
+                            "control-flow target splits a relocated HI20+LO12 pair".into(),
+                        ));
+                    }
                     let next_inst = u32::from_le_bytes([
                         data[offset + 4],
                         data[offset + 5],
@@ -1002,4 +1257,187 @@ fn translate_section_linked(
     ctx.flush_pending()?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vos_pvm::{ExitReason, refine};
+
+    #[test]
+    fn relocation_interval_index_matches_byte_overlap() {
+        let original = vec![(20, 24), (4, 8), (6, 14), (24, 28), (4, 8), (40, 48)];
+        let merged = merge_relocation_ranges(original.clone());
+        assert_eq!(merged, vec![(4, 14), (20, 28), (40, 48)]);
+        for address in 0..56 {
+            for size in 1..=8u8 {
+                let expected = original
+                    .iter()
+                    .any(|&(start, end)| address < end && start < address + u64::from(size));
+                assert_eq!(overlaps_data_relocation(&merged, address, size), expected);
+            }
+        }
+        assert!(!overlaps_data_relocation(&[], 4, 8));
+    }
+
+    /// Translate a preserved ELF and resolve observed PVM PCs without changing
+    /// the production linker API or emitted program. Use only with exact-byte
+    /// equality to the observed standard program.
+    #[test]
+    #[ignore = "diagnostic requires VOS_PROFILE_ELF, VOS_PROFILE_PVM and VOS_PROFILE_PCS"]
+    fn resolve_observed_standard_program_pcs() {
+        let elf = std::fs::read(std::env::var_os("VOS_PROFILE_ELF").unwrap()).unwrap();
+        let expected = std::fs::read(std::env::var_os("VOS_PROFILE_PVM").unwrap()).unwrap();
+        assert!(
+            link_elf_spi(&elf).unwrap() == expected,
+            "ELF does not reproduce the observed program"
+        );
+        let translated = transpile_elf(&elf, true, OpcodeEncoding::Standard).unwrap();
+        let mut pcs: Vec<u32> = std::env::var("VOS_PROFILE_PCS")
+            .unwrap()
+            .split(',')
+            .map(|value| value.parse().unwrap())
+            .collect();
+        if let Ok(returns) = std::env::var("VOS_PROFILE_RETURN_ADDRESSES") {
+            for value in returns.split(',') {
+                let address: usize = value.parse().unwrap();
+                assert!(
+                    address != 0 && address % 2 == 0,
+                    "invalid indirect return address"
+                );
+                let pc = translated.jump_table[address / 2 - 1];
+                eprintln!("return_address address={address} pc={pc}");
+                pcs.push(pc);
+            }
+        }
+        let mut addresses: Vec<_> = translated.address_map.into_iter().collect();
+        addresses.sort_unstable_by_key(|&(rv, pc)| (pc, rv));
+        for pc in pcs {
+            assert!((pc as usize) < translated.code.len());
+            assert_eq!(translated.bitmask[pc as usize], 1);
+            let &(rv, mapped_pc) = addresses
+                .iter()
+                .rev()
+                .find(|&&(_, mapped)| mapped <= pc)
+                .unwrap();
+            eprintln!("observed_pc pc={pc} mapped_pc={mapped_pc} riscv={rv:#x}");
+        }
+    }
+
+    const TEXT_VADDR: u64 = 0x40_0000;
+    const RA: u32 = 1;
+    const SP: u32 = 2;
+    const T0: u32 = 5;
+    const T2: u32 = 7;
+    const A0: u32 = 10;
+    const A1: u32 = 11;
+    const A2: u32 = 12;
+
+    fn lui(rd: u32, imm20: u32) -> u32 {
+        (imm20 << 12) | (rd << 7) | 0x37
+    }
+
+    fn addi(rd: u32, rs1: u32, imm: i32) -> u32 {
+        ((imm as u32 & 0xfff) << 20) | (rs1 << 15) | (rd << 7) | 0x13
+    }
+
+    fn auipc(rd: u32) -> u32 {
+        (rd << 7) | 0x17
+    }
+
+    fn jalr(rd: u32, rs1: u32) -> u32 {
+        (rs1 << 15) | (rd << 7) | 0x67
+    }
+
+    fn sd(rs2: u32, rs1: u32, imm: i32) -> u32 {
+        let imm = imm as u32 & 0xfff;
+        ((imm >> 5) << 25) | (rs2 << 20) | (rs1 << 15) | (3 << 12) | ((imm & 0x1f) << 7) | 0x23
+    }
+
+    fn assemble(insts: &[u32]) -> Vec<u8> {
+        insts.iter().flat_map(|inst| inst.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn relocated_call_flushes_pending_lui_before_transfer() {
+        const LIMIT: u64 = 8192;
+        const CALL_SITE: u64 = TEXT_VADDR + 8;
+        const RETURN_ADDR: u64 = TEXT_VADDR + 16;
+        const CALLEE: u64 = TEXT_VADDR + 32;
+
+        // The LUI is deliberately adjacent to the relocated AUIPC+JALR pair.
+        // The callee snapshots A2 before the caller can execute another normal
+        // instruction. If CALL_PLT bypasses the buffered-LUI flush, it observes
+        // zero instead of LIMIT (the agent-runtime bytes_bounded failure mode).
+        let text = assemble(&[
+            addi(T2, RA, 0),  // preserve the host return address
+            lui(A2, 2),       // buffered A2 = 8192
+            auipc(T0),        // R_RISCV_CALL_PLT relocation lives here
+            jalr(RA, T0),     // relocation override consumes this instruction
+            addi(RA, T2, 0),  // restore the host return address
+            addi(A0, SP, -8), // designate the callee's snapshot as output
+            addi(A1, 0, 8),
+            jalr(0, RA), // return to the host
+            sd(A2, SP, -8),
+            jalr(0, RA), // callee return
+        ]);
+
+        let elf = LinkedElf {
+            is_64bit: true,
+            code_sections: vec![(0, TEXT_VADDR, text.clone())],
+            ro_data: Vec::new(),
+            ro_base: 0x1_0000,
+            rw_data: Vec::new(),
+            rw_base: 0x2_0000,
+            rw_min: 0x2_0000,
+            stack_size: 0x1_0000,
+            heap_pages: 0,
+            hi20_targets: HashMap::new(),
+            lo12_targets: HashMap::new(),
+            call_targets: HashMap::from([(CALL_SITE, CALLEE)]),
+            abs_code_ptrs: Vec::new(),
+            sub32_relocs: Vec::new(),
+            data_relocation_ranges: Vec::new(),
+            code_ranges: vec![(TEXT_VADDR, TEXT_VADDR + text.len() as u64)],
+            control_flow_targets: HashSet::from([TEXT_VADDR, RETURN_ADDR, CALLEE]),
+            entry_vaddr: TEXT_VADDR,
+            accumulate_vaddr: None,
+        };
+
+        let mut ctx = TranslationContext::with_opcode_encoding(true, OpcodeEncoding::Standard);
+        ctx.code_ranges = elf.code_ranges.clone();
+        ctx.emit_jump(elf.entry_vaddr);
+        ctx.emit_inst(0); // unused accumulate entry
+        translate_section_linked(&mut ctx, &text, TEXT_VADDR, &elf).expect("translates");
+        ctx.apply_fixups();
+
+        crate::peephole_fuse_load_imm_alu(&mut ctx.code, &mut ctx.bitmask, &ctx.jump_table);
+        crate::peephole_fuse_load_imm_memory(&mut ctx.code, &mut ctx.bitmask, &ctx.jump_table);
+        crate::peephole_eliminate_dead_load_imm(&mut ctx.code, &mut ctx.bitmask, &ctx.jump_table);
+        crate::ensure_branch_targets_are_block_starts(
+            &mut ctx.code,
+            &mut ctx.bitmask,
+            &mut ctx.jump_table,
+        );
+
+        let blob = crate::spi::build_spi_blob(
+            &[],
+            &[],
+            elf.heap_pages as u16,
+            elf.stack_size,
+            &ctx.code,
+            &ctx.bitmask,
+            &ctx.jump_table,
+        );
+        let invocation = refine::execute(&blob, &[], 10_000_000).expect("executes");
+
+        assert_eq!(invocation.exit, ExitReason::Halt);
+        assert_eq!(
+            invocation
+                .output_bounded(core::mem::size_of::<u64>())
+                .as_deref(),
+            Some(&LIMIT.to_le_bytes()[..]),
+            "the callee must observe the LUI value before control transfers"
+        );
+    }
 }

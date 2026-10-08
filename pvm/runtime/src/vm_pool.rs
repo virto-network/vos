@@ -48,6 +48,12 @@ pub struct VmInstance {
     pub entry_index: u32,
     /// Gas remaining for this VM. Use gas()/set_gas() for access.
     gas: u64,
+    /// Whether the block containing `pc` has already been funded.
+    gas_charged: bool,
+    /// Standard host call awaiting an explicit scheduler acknowledgement.
+    pending_host_call: Option<crate::PendingHostCall>,
+    /// Root page fault currently suspended for an exact retry.
+    pending_page_fault: Option<u32>,
     /// Guest heap base address (tracked for continuation snapshots).
     heap_base: u32,
     /// Guest heap top address (tracked for continuation snapshots).
@@ -68,6 +74,9 @@ impl VmInstance {
             caller: None,
             entry_index,
             gas,
+            gas_charged: false,
+            pending_host_call: None,
+            pending_page_fault: None,
             heap_base: 0,
             heap_top: 0,
         }
@@ -117,6 +126,9 @@ impl VmInstance {
         self.caller = None;
         self.heap_base = 0;
         self.heap_top = 0;
+        self.gas_charged = false;
+        self.pending_host_call = None;
+        self.pending_page_fault = None;
     }
 
     /// Get gas (cold path).
@@ -127,6 +139,40 @@ impl VmInstance {
     /// Set gas (cold path).
     pub fn set_gas(&mut self, gas: u64) {
         self.gas = gas;
+    }
+
+    pub(crate) fn gas_charged(&self) -> bool {
+        self.gas_charged
+    }
+
+    pub(crate) fn set_gas_charged(&mut self, value: bool) {
+        self.gas_charged = value;
+    }
+
+    pub(crate) fn pending_host_call(&self) -> Option<crate::PendingHostCall> {
+        self.pending_host_call
+    }
+
+    pub(crate) fn set_pending_host_call(&mut self, value: Option<crate::PendingHostCall>) {
+        self.pending_host_call = value;
+    }
+
+    pub(crate) fn pending_page_fault(&self) -> Option<u32> {
+        self.pending_page_fault
+    }
+
+    pub(crate) fn set_pending_page_fault(&mut self, value: Option<u32>) {
+        self.pending_page_fault = value;
+    }
+
+    /// Commit the successor of an acknowledged standard host call.
+    pub(crate) fn acknowledge_host_call(&mut self) -> bool {
+        let Some(call) = self.pending_host_call.take() else {
+            return false;
+        };
+        self.pc = call.resume_pc;
+        self.gas_charged = true;
+        true
     }
 
     /// Get heap base (for continuation snapshots).
@@ -185,8 +231,10 @@ pub struct CallFrame {
     pub caller_vm_id: u16,
     /// Cap slot in the caller that held the IPC DATA cap (for auto-return on REPLY).
     pub ipc_cap_idx: Option<u8>,
-    /// If the IPC DATA cap was mapped, its original mapping state (for auto-remap on REPLY).
-    pub ipc_was_mapped: Option<(u32, crate::cap::Access)>,
+    /// If the IPC DATA cap was mapped, its exact original mapping state for
+    /// auto-remap on REPLY. The bitmap is required because a DATA cap may
+    /// expose only sparse page runs within its owned backing range.
+    pub ipc_was_mapped: Option<(u32, crate::cap::Access, Vec<u8>)>,
 }
 
 /// Errors from VM state transitions.

@@ -19,3 +19,12 @@ host and application framework.
 VOS-specific evolution starts from the imported commit. This directory is the
 only place in the repository where upstream JAM/JAR terminology and
 conformance notes belong.
+
+## Standard conformance
+
+The current standard profile is pinned to the official Gray Paper v0.8.0
+release. Its checked-in instruction and block-gas corpus, provenance, and
+regeneration command are documented in
+[`runtime/tests/VECTORS.md`](runtime/tests/VECTORS.md). The older GP 0.7.2/Jar
+fixtures remain explicitly separate and exercise only the temporary private
+adapter.

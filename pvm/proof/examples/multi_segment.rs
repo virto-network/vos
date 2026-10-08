@@ -87,9 +87,9 @@ fn main() {
         10_000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let exit = tracing.run();
-    assert_eq!(exit, ExitReason::Trap, "expected Trap exit");
+    assert_eq!(exit, ExitReason::Panic, "expected standard Panic exit");
     let all_steps = tracing.into_trace();
     println!("Traced {} steps total", all_steps.len());
     assert_eq!(all_steps.len(), 7);

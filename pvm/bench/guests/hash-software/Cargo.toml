@@ -1,0 +1,22 @@
+[workspace]
+
+[package]
+name = "bench-hash-software"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "bench-hash-software"
+path = "src/main.rs"
+test = false
+bench = false
+
+[profile.release]
+opt-level = 3
+lto = true
+panic = "abort"
+codegen-units = 1
+
+[dependencies]
+blake2b_simd = { version = "1", default-features = false }

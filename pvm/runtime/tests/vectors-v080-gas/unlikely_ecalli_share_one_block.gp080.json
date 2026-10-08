@@ -1,0 +1,44 @@
+{
+  "expected": {
+    "blocks": [
+      {
+        "gas": 101,
+        "pc": 0
+      }
+    ],
+    "first": {
+      "host_call": 7,
+      "remaining_gas": 99,
+      "status": "host_call"
+    },
+    "resume": {
+      "remaining_gas": 99,
+      "status": "panic"
+    }
+  },
+  "initial": {
+    "gas": 200,
+    "regs": [
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0"
+    ]
+  },
+  "name": "unlikely_ecalli_share_one_block",
+  "program": {
+    "bitmask": "0x0b",
+    "code": "0x020a0700"
+  },
+  "rule": "gray-paper-v0.8-rob-block-gas",
+  "spec": "gray-paper-0.8.0"
+}

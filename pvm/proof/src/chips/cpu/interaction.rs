@@ -555,16 +555,19 @@ pub(super) fn generate_interaction_trace(
         );
     }
 
-    // ── ProgramMemory consumer (prover-side, 2 paired, 31 limbs) ──
+    // ── ProgramMemory consumer (prover-side, 2 paired, 34 limbs) ──
     {
         let prog_mem: &ProgramMemoryLookupElements = lookup_elements.as_ref();
         let pc = crate::trace::original_base_column!(component_trace, Column::Pc);
+        let isa_profile = crate::trace::original_base_column!(component_trace, Column::IsaProfile);
         let opcode = crate::trace::original_base_column!(component_trace, Column::Opcode);
         let skip_len = crate::trace::original_base_column!(component_trace, Column::SkipLen);
         let reg_a = crate::trace::original_base_column!(component_trace, Column::RegA);
         let reg_b = crate::trace::original_base_column!(component_trace, Column::RegB);
         let reg_d = crate::trace::original_base_column!(component_trace, Column::RegD);
         let imm_bytes = crate::trace::original_base_column!(component_trace, Column::ImmBytes);
+        let host_call_allowed =
+            crate::trace::original_base_column!(component_trace, Column::HostCallAllowed);
         let fb0 = crate::trace::original_base_column!(component_trace, Column::FlagByte0);
         let fb1 = crate::trace::original_base_column!(component_trace, Column::FlagByte1);
         let fb2 = crate::trace::original_base_column!(component_trace, Column::FlagByte2);
@@ -575,15 +578,21 @@ pub(super) fn generate_interaction_trace(
             crate::trace::original_base_column!(component_trace, Column::ImmYBytes);
         let branch_target_for_lookup =
             crate::trace::original_base_column!(component_trace, Column::BranchTarget);
+        let host_call_precompile_dispatch = crate::trace::original_base_column!(
+            component_trace,
+            Column::HostCallPrecompileDispatch
+        );
         let is_pad_col = crate::trace::original_base_column!(component_trace, Column::IsPadding);
 
         let mut tuple: Vec<_> = pc.to_vec();
+        tuple.push(isa_profile[0].clone());
         tuple.push(opcode[0].clone());
         tuple.push(skip_len[0].clone());
         tuple.push(reg_a[0].clone());
         tuple.push(reg_b[0].clone());
         tuple.push(reg_d[0].clone());
         tuple.extend_from_slice(&imm_bytes);
+        tuple.push(host_call_allowed[0].clone());
         tuple.push(fb0[0].clone());
         tuple.push(fb1[0].clone());
         tuple.push(fb2[0].clone());
@@ -592,6 +601,7 @@ pub(super) fn generate_interaction_trace(
         tuple.push(fb5[0].clone());
         tuple.extend_from_slice(&imm_y_for_lookup);
         tuple.extend_from_slice(&branch_target_for_lookup);
+        tuple.push(host_call_precompile_dispatch[0].clone());
 
         // Two paired emissions, multiplicity = is_real = 1 - is_padding.
         for _ in 0..2 {

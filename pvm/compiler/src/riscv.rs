@@ -65,6 +65,8 @@ pub struct TranslationContext {
     pub jump_table: Vec<u32>,
     /// Whether translating 64-bit RISC-V.
     pub is_64bit: bool,
+    /// Wire opcode profile selected by the output container.
+    opcode_encoding: OpcodeEncoding,
     /// Map from RISC-V address to PVM code offset.
     pub address_map: std::collections::HashMap<u64, u32>,
     /// Pending branch fixups: (pvm_imm_offset, target_rv_address, fixup_size)
@@ -85,20 +87,36 @@ pub struct TranslationContext {
     /// Last immediate loaded into t0 (x5) — used for ecalli cap slot.
     last_t0_imm: Option<i32>,
     /// CSR marker for ecall/ecalli distinction.
-    /// 0x800 = next ecall → PVM ecall, 0x801 = next ecall → PVM ecalli.
+    /// 0x800 = next ecall → legacy-manifest PVM ecall, 0x801 = next ecall →
+    /// standard PVM ecalli. The standard profile rejects 0x800 rather than
+    /// emitting the retired dynamic-capability opcode.
     ecall_marker: Option<u32>,
     /// RISC-V code address ranges (lo, hi) — used to detect function pointers
     /// loaded via auipc+addi that need jump table entries.
     pub code_ranges: Vec<(u64, u64)>,
 }
 
+/// The standard program follows the current Gray Paper opcode table. Frozen
+/// capability manifests retain their private pre-v0.8 unary numbering so
+/// rebuilding one cannot silently change its program identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OpcodeEncoding {
+    Standard,
+    CapabilityManifest,
+}
+
 impl TranslationContext {
     pub fn new(is_64bit: bool) -> Self {
+        Self::with_opcode_encoding(is_64bit, OpcodeEncoding::Standard)
+    }
+
+    pub(crate) fn with_opcode_encoding(is_64bit: bool, opcode_encoding: OpcodeEncoding) -> Self {
         Self {
             code: Vec::new(),
             bitmask: Vec::new(),
             jump_table: Vec::new(),
             is_64bit,
+            opcode_encoding,
             address_map: std::collections::HashMap::new(),
             fixups: Vec::new(),
             fixup_pcs: std::collections::HashMap::new(),
@@ -124,6 +142,25 @@ impl TranslationContext {
         if self.pending_load_imm.is_some() {
             self.pending_load_imm = None;
         }
+        Ok(())
+    }
+
+    /// Begin translating one RISC-V instruction at an address whose PVM
+    /// location may be referenced by another control-flow edge.
+    ///
+    /// Pending LUI/AUIPC state belongs exclusively to the linear predecessor,
+    /// and `pending_load_imm` fusion may remove that predecessor. Flush all of
+    /// it before recording a branch target so an incoming edge lands on the
+    /// consumer with its own register state intact.
+    pub(crate) fn begin_instruction(
+        &mut self,
+        address: u64,
+        is_control_flow_target: bool,
+    ) -> Result<(), TranspileError> {
+        if is_control_flow_target {
+            self.flush_pending()?;
+        }
+        self.address_map.insert(address, self.code.len() as u32);
         Ok(())
     }
 
@@ -266,9 +303,21 @@ impl TranslationContext {
                             0 => {
                                 // ECALL — dispatch based on CSR marker
                                 match self.ecall_marker.take() {
-                                    Some(0x800) => {
-                                        // CSR 0x800 → PVM ecall (management ops)
+                                    Some(0x800)
+                                        if self.opcode_encoding
+                                            == OpcodeEncoding::CapabilityManifest =>
+                                    {
+                                        // Legacy JAR services retain dynamic
+                                        // capability management until their
+                                        // daemon path is removed.
                                         self.emit_ecall();
+                                    }
+                                    Some(0x800) => {
+                                        return Err(TranspileError::UnsupportedInstruction {
+                                            offset: _addr as usize,
+                                            detail: "dynamic ecall is not part of the standard PVM profile"
+                                                .into(),
+                                        });
                                     }
                                     Some(0x801) => {
                                         // CSR 0x801 → PVM ecalli (CALL a cap)
@@ -823,27 +872,27 @@ impl TranslationContext {
                     let opc = match rs2 {
                         0 => {
                             if self.is_64bit {
-                                104
+                                103
                             } else {
-                                105
+                                104
                             }
                         }
                         1 => {
                             if self.is_64bit {
-                                106
+                                105
                             } else {
-                                107
+                                106
                             }
                         }
                         2 => {
                             if self.is_64bit {
-                                102
+                                101
                             } else {
-                                103
+                                102
                             }
                         }
-                        4 => 108,
-                        5 => 109,
+                        4 => 107,
+                        5 => 108,
                         _ => {
                             return Err(TranspileError::UnsupportedInstruction {
                                 offset: 0,
@@ -868,7 +917,7 @@ impl TranslationContext {
             5 => {
                 if (funct7 == 0x35 || funct7 == 0x34) && (imm & 0x1F) == 0x18 {
                     // Zbb rev8 (RV64: 0x35, RV32: 0x34)
-                    self.emit_inst(111);
+                    self.emit_inst(110);
                     self.emit_data(pvm_rd | (pvm_rs1 << 4));
                     return Ok(());
                 }
@@ -1398,9 +1447,9 @@ impl TranslationContext {
                     // Zbb: clzw(rs2=0), ctzw(rs2=1), cpopw(rs2=2)
                     let rs2 = (imm & 0x1F) as u8;
                     let opc = match rs2 {
-                        0 => 105,
-                        1 => 107,
-                        2 => 103,
+                        0 => 104,
+                        1 => 106,
+                        2 => 102,
                         _ => {
                             return Err(TranspileError::UnsupportedInstruction {
                                 offset: 0,
@@ -1636,7 +1685,7 @@ impl TranslationContext {
             return Ok(());
         } else if funct7 == 0x04 && funct3 == 4 {
             // Zbb zext.h
-            self.emit_inst(110);
+            self.emit_inst(109);
             self.emit_data(pvm_rd | (pvm_rs1 << 4));
             return Ok(());
         } else if funct7 == 0 {
@@ -1676,6 +1725,12 @@ impl TranslationContext {
     }
 
     pub(crate) fn emit_inst(&mut self, opcode: u8) {
+        let opcode = match (self.opcode_encoding, opcode) {
+            // The frozen manifest profile encoded the removed sbrk at 101,
+            // shifting the standard unary instructions up by one byte.
+            (OpcodeEncoding::CapabilityManifest, 101..=110) => opcode + 1,
+            _ => opcode,
+        };
         self.code.push(opcode);
         self.bitmask.push(1);
     }
@@ -1809,7 +1864,8 @@ impl TranslationContext {
         self.emit_var_imm(id as i32);
     }
 
-    /// Emit PVM ecall (opcode 3, NoArgs). Management ops + dynamic CALL.
+    /// Emit the legacy-manifest PVM ecall (opcode 3, NoArgs).
+    /// Management ops + dynamic CALL; never emitted for standard programs.
     /// φ[11]=op, φ[12]=subject|object — all operands in registers.
     pub(crate) fn emit_ecall(&mut self) {
         self.emit_inst(3);
@@ -1900,25 +1956,30 @@ impl TranslationContext {
             }
         }
 
-        // Resolve return address fixups in the jump table
-        let mut unresolved = 0usize;
+        // Resolve return address fixups in the jump table. A call whose
+        // return address has no translated instruction (a call to a function
+        // that never returns, at the end of a section) gets a trap as its
+        // return target. Left at 0, the entry would name the refine entry
+        // point, which is a valid jump target: returning would restart the
+        // program instead of failing.
+        let mut trap = None;
         for (jt_idx, rv_addr) in self.return_fixups.drain(..).collect::<Vec<_>>() {
-            if let Some(&pvm_target) = self.address_map.get(&rv_addr) {
-                self.jump_table[jt_idx] = pvm_target;
-            } else {
-                unresolved += 1;
-                eprintln!("grey: unresolved return_fixup jt_idx={jt_idx} rv_addr={rv_addr:#x}");
-            }
-        }
-        if unresolved > 0 {
-            eprintln!("grey: {unresolved} unresolved return_fixups (will panic on jump)");
+            let target = match self.address_map.get(&rv_addr) {
+                Some(&pvm_target) => pvm_target,
+                None => *trap.get_or_insert_with(|| {
+                    let at = self.code.len() as u32;
+                    self.emit_inst(0);
+                    at
+                }),
+            };
+            self.jump_table[jt_idx] = target;
         }
     }
 }
 
 // ===== RISC-V immediate decoders =====
 
-fn decode_j_imm(inst: u32) -> i32 {
+pub(crate) fn decode_j_imm(inst: u32) -> i32 {
     let imm20 = (inst >> 31) & 1;
     let imm10_1 = (inst >> 21) & 0x3FF;
     let imm11 = (inst >> 20) & 1;
@@ -1932,7 +1993,7 @@ fn decode_j_imm(inst: u32) -> i32 {
     }
 }
 
-fn decode_b_imm(inst: u32) -> i32 {
+pub(crate) fn decode_b_imm(inst: u32) -> i32 {
     let imm12 = (inst >> 31) & 1;
     let imm10_5 = (inst >> 25) & 0x3F;
     let imm4_1 = (inst >> 8) & 0xF;
@@ -1959,6 +2020,7 @@ fn decode_s_imm(inst: u32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vos_pvm::instruction::Opcode;
 
     #[test]
     fn test_register_mapping() {
@@ -2185,6 +2247,41 @@ mod tests {
     }
 
     #[test]
+    fn control_flow_target_keeps_fallthrough_immediate_out_of_shared_consumer() {
+        // Fallthrough computes a stack offset in a0, while another arm jumps
+        // directly to the shared ADD with its own a0. Fusing the fallthrough
+        // load into the targeted ADD would overwrite the incoming arm's value.
+        let mut ctx = TranslationContext::new(true);
+        let lui_a0_0x4000 = 0x0000_4537_u32;
+        let addi_a0_a0_0x1e0 = (0x1e0_u32 << 20) | (10 << 15) | (10 << 7) | 0x13;
+        let add_a0_sp_a0 = (10_u32 << 20) | (2 << 15) | (10 << 7) | 0x33;
+
+        ctx.begin_instruction(0, false).unwrap();
+        ctx.translate_instruction(&lui_a0_0x4000.to_le_bytes(), 0, 0)
+            .unwrap();
+        ctx.begin_instruction(4, false).unwrap();
+        ctx.translate_instruction(&addi_a0_a0_0x1e0.to_le_bytes(), 0, 4)
+            .unwrap();
+        let load_len = ctx.code.len();
+        assert_eq!(ctx.code[0], 51, "fallthrough materializes load_imm");
+
+        ctx.begin_instruction(8, true).unwrap();
+        let target = ctx.address_map[&8] as usize;
+        assert_eq!(
+            target, load_len,
+            "the target starts after the predecessor load"
+        );
+        ctx.translate_instruction(&add_a0_sp_a0.to_le_bytes(), 0, 8)
+            .unwrap();
+
+        assert_eq!(ctx.code[0], 51, "targeted fusion must not remove load_imm");
+        assert_eq!(
+            ctx.code[target], 200,
+            "shared consumer remains register ADD64"
+        );
+    }
+
+    #[test]
     fn store_preserves_a_constant_base_for_later_memory_operations() {
         let mut ctx = TranslationContext::new(true);
         let undo = ctx.code.len();
@@ -2214,5 +2311,42 @@ mod tests {
         ctx.translate_instruction(&0x0000_0073_u32.to_le_bytes(), 0, 0)
             .unwrap();
         assert_eq!(ctx.code, [0], "unmarked ECALL must compile to trap");
+    }
+
+    #[test]
+    fn marked_dynamic_ecall_is_legacy_manifest_only() {
+        // csrw 0x800, zero; ecall
+        let marker = 0x8000_1073_u32;
+        let ecall = 0x0000_0073_u32;
+
+        let mut standard = TranslationContext::new(true);
+        standard.translate_one(marker, 0).unwrap();
+        assert!(matches!(
+            standard.translate_one(ecall, 4),
+            Err(TranspileError::UnsupportedInstruction { offset: 4, detail })
+                if detail.contains("dynamic ecall")
+        ));
+        assert!(standard.code.is_empty());
+
+        let mut legacy =
+            TranslationContext::with_opcode_encoding(true, OpcodeEncoding::CapabilityManifest);
+        legacy.translate_one(marker, 0).unwrap();
+        legacy.translate_one(ecall, 4).unwrap();
+        assert_eq!(legacy.code, [3]);
+        assert_eq!(legacy.bitmask, [1]);
+    }
+
+    #[test]
+    fn opcode_profiles_separate_standard_and_frozen_manifest_unaries() {
+        let mut standard = TranslationContext::new(true);
+        standard.emit_inst(Opcode::CountSetBits64 as u8);
+        standard.emit_inst(Opcode::ReverseBytes as u8);
+        assert_eq!(standard.code, [101, 110]);
+
+        let mut manifest =
+            TranslationContext::with_opcode_encoding(true, OpcodeEncoding::CapabilityManifest);
+        manifest.emit_inst(Opcode::CountSetBits64 as u8);
+        manifest.emit_inst(Opcode::ReverseBytes as u8);
+        assert_eq!(manifest.code, [102, 111]);
     }
 }

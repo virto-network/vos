@@ -145,7 +145,11 @@ fn decompose_access(
     let bytes = value.to_le_bytes();
     (0..size as usize)
         .map(|i| MemEntry {
-            address: address + i as u32,
+            // PVM memory is cyclic over 32-bit addresses. A successful wide
+            // access is decomposed with the same modulo-2^32 arithmetic as
+            // execution rather than relying on profile-dependent overflow
+            // checks or debug/release integer behavior.
+            address: address.wrapping_add(i as u32),
             value: bytes[i],
             timestamp,
             is_write,
@@ -311,6 +315,25 @@ impl BuiltInComponent for MemoryChip {
         ));
 
         eval.finalize_logup();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wide_access_decomposition_wraps_in_u32_domain() {
+        let entries = decompose_access(u32::MAX - 2, 0x0807_0605_0403_0201, 7, false, 8);
+        let addresses: Vec<_> = entries.iter().map(|entry| entry.address).collect();
+        assert_eq!(
+            addresses,
+            [u32::MAX - 2, u32::MAX - 1, u32::MAX, 0, 1, 2, 3, 4]
+        );
+        assert_eq!(
+            entries.iter().map(|entry| entry.value).collect::<Vec<_>>(),
+            [1, 2, 3, 4, 5, 6, 7, 8]
+        );
     }
 }
 
@@ -502,18 +525,16 @@ pub fn analyze_dedup(side_note: &crate::side_note::SideNote) -> MemoryDedupRepor
         }
     }
 
-    if !side_note.initial_memory.is_empty() {
+    if side_note.has_initial_memory() {
         let mut first_access: BTreeMap<u32, bool> = BTreeMap::new();
         for e in &entries {
             first_access.entry(e.address).or_insert(e.is_write);
         }
-        let flat_mem = &side_note.initial_memory;
         for (&addr, &first_is_write) in &first_access {
             if first_is_write {
                 continue;
             }
-            let a = addr as usize;
-            let value = if a < flat_mem.len() { flat_mem[a] } else { 0 };
+            let value = side_note.initial_memory_byte(addr);
             entries.push(MemEntry {
                 address: addr,
                 value,

@@ -133,7 +133,10 @@ mod framework;
 pub mod framework_access;
 mod lookups;
 pub mod proof;
+pub mod refine;
+pub mod refine_codec;
 pub mod segment;
+pub mod sparse_memory;
 pub mod trace;
 
 // Native-recursion Stage-0: the Poseidon2-M31 PCS primitives + the per-build
@@ -544,6 +547,26 @@ pub(crate) fn active_components_verifier(
 }
 
 pub use proof::{PROOF_FORMAT_VERSION, PcsPolicy, Proof, SegmentState};
+pub use refine::{
+    MAX_REFINE_CHILD_COMPONENTS, MAX_REFINE_HOST_BOUNDARIES, MAX_REFINE_PROOF_SLICES,
+    REFINE_BUNDLE_FORMAT_VERSION, REFINE_CHILD_COMMITMENT_COUNT, RefineBundleVerification,
+    RefineHostBoundary, RefineMachineId, RefineProgramId, RefineProofBundle, RefineProofSlice,
+    RefineSliceExit, refine_arguments_commitment, refine_bundle_cardinality_is_valid,
+    refine_bundle_commitment, refine_bundle_execution_commitment, refine_bundle_terminal_public_io,
+    refine_program_id,
+};
+#[cfg(feature = "prover")]
+pub use refine::{
+    RefineObservedRun, RefineTraceBundle, RefineTraceError, RefineTraceSlice, prove_refine,
+    refine_trace_execution_commitment, trace_refine, trace_refine_observed,
+    trace_refine_with_output, verify_refine_bundle_replayed,
+};
+pub use refine_codec::{
+    MAX_REFINE_PROOF_BUNDLE_ALLOCATION_BYTES, MAX_REFINE_PROOF_BUNDLE_WIRE_BYTES,
+    REFINE_PROOF_BUNDLE_CODEC_VERSION, RefineProofCodecError, decode_refine_proof_bundle,
+    encode_refine_proof_bundle,
+};
+pub use sparse_memory::{SPARSE_MEMORY_PAGE_SIZE, SparseMemoryImage, SparseMemoryPage};
 // The per-policy FRI floor constants + the policy checker: used by callers
 // that assemble a custom `PcsPolicy`; hidden from the top-level page.
 #[doc(hidden)]
@@ -553,15 +576,15 @@ pub use proof::{
 };
 #[doc(hidden)]
 #[cfg(feature = "prover")]
-pub use prove::prove_with_boundary_override;
+pub use prove::{prove_pre_config_relabel_for_test, prove_with_boundary_override};
 // ── Prove: the stable surface ────────────────────────────────────────
 // Single proof: `prove` / `prove_mobile` / `prove_with_config`.
 // Segment chain: `canonical_profile_for` (or `_for_bounds`) derives the
 // forcing profile, `prove_canonical` proves each window to one shape.
 #[cfg(feature = "prover")]
 pub use prove::{
-    canonical_profile_for, canonical_profile_for_bounds, prove, prove_canonical, prove_chain,
-    prove_mobile, prove_with_config,
+    canonical_profile_for, canonical_profile_for_bounds, program_commitment_for_profile, prove,
+    prove_canonical, prove_chain, prove_mobile, prove_with_config,
 };
 // Advanced / internal prove surface: the compact-trace floor variant, the
 // profiling variants, the thread-pool installer, and the explicit-component

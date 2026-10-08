@@ -1,80 +1,20 @@
-# VOS
+# VOS core
 
-VOS runs signed actors across a group of operator-owned nodes. Actors are
-small Rust programs with durable state, typed messages, explicit authority,
-and a chosen consistency model.
+The new VOS core, under construction on branch `vos-core`. Its design is in
+[`docs/design/core-model.md`](docs/design/core-model.md); the measurements
+behind it are in [`docs/design/spikes.md`](docs/design/spikes.md).
 
-```mermaid
-flowchart LR
-    C[Client] --> N[Node]
-    N --> R[Root service]
-    H[HTTP / SSH] --> N
-    R --> A[Actor tree]
-    R --> S[(Durable state)]
-    N <--> P[Peer nodes]
-    R --> Q[Proof producer]
-```
+This tree holds what the core is built on so far:
 
-The repository contains one application model:
+- `pvm/`: the Gray Paper 0.8.0 PVM: runtime (interpreter and JIT), RISC-V
+  compiler, standard-program format, codec, and the STARK prover and
+  verifier. `pvm/guest/` holds the guest toolchain.
+- `support/vos-raft`: the `no_std` Raft core.
+- `support/merkle-crdt`: the Merkle-CRDT DAG and sync.
 
-- `#[actor]` defines an actor.
-- `vosx build` creates a signed `.vos` package.
-- `vosx space publish` records that exact package by content hash.
-- `vosx space install` creates a root service from it.
-- Local, Raft, and CRDT roots share the same actor and package APIs.
+The current build step is planned in
+[`docs/design/slice-1-pvm-base.md`](docs/design/slice-1-pvm-base.md), which
+also lists the parts of master that left this branch and where each returns.
 
-## Start here
-
-```bash
-cargo run -p vosx -- new hello
-cargo run -p vosx -- build hello --name hello
-cargo run -p vosx -- space new demo
-cargo run -p vosx -- space up demo \
-  --service-pvm services/vos-service/vos-service.pvm \
-  --allow-conformance
-```
-
-In another terminal:
-
-```bash
-cargo run -p vosx -- space publish demo hello dist/hello.vos
-cargo run -p vosx -- space install demo hello --consistency local
-cargo run -p vosx -- hello value --space demo
-```
-
-See [Getting started](docs/getting-started.md),
-[Architecture](docs/architecture.md), and
-[Operations](docs/operations.md).
-
-## Repository map
-
-| Path | Purpose |
-| --- | --- |
-| `vos/` | Actor SDK, service runtime, replication, networking |
-| `vosx/` | Build, space, and operator CLI |
-| `pvm/` | Bytecode runtime, compiler, codec, and proof system |
-| `services/` | Generic service guest |
-| `actors/` | Platform actors |
-| `examples/` | Small supported applications |
-| `extensions/` | Trusted request/response host workers |
-
-HTTP and SSH are built-in ingress adapters. HTTP exposes package schemas and
-actor methods; SSH serves a semantic terminal for members to discover and
-manage the space. Native extensions remain request/response workers called by
-actors and never own public listeners.
-
-## Development
-
-```bash
-just build-test-artifacts
-cargo test --workspace
-```
-
-Artifacts committed under `services/` and `vosx/blobs/` are protocol
-identities. Rebuild them only through the checked release recipes.
-
-## License
-
-VOS-owned code is licensed under the GNU Affero General Public License,
-version 3 or later. The imported PVM crates retain their Apache-2.0 license;
-their provenance and license are documented in [`pvm/`](pvm/README.md).
+`just` lists the checks: `just test`, `just vectors`, `just test-proof` and
+`just ci`.

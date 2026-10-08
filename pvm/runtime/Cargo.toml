@@ -15,6 +15,7 @@ blake2 = { version = "0.10", default-features = false, optional = true }
 libc = { version = "0.2", optional = true }
 memoffset = { version = "0.9", optional = true }
 scale = { package = "vos-pvm-codec", path = "../codec", default-features = false }
+vos-pvm-program = { path = "../program" }
 # Non-workspace dep lines: the workspace pins enable default features (std),
 # and workspace-inherited features are additive. vos_pvm's always-compiled
 # modules must stay no_std-clean (thiserror 2 derives core::error::Error

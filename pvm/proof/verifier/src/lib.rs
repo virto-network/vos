@@ -16,7 +16,7 @@
 
 extern crate alloc;
 
-use alloc::{boxed::Box, format, string::ToString, vec::Vec};
+use alloc::{boxed::Box, collections::BTreeMap, format, string::ToString, vec::Vec};
 use num_traits::Zero;
 use stwo::core::{
     air::Component,
@@ -35,6 +35,13 @@ use vos_pvm_proof::recursion_pcs::{ProverChannel, ProverMerkleChannel};
 // was compiled against.  Callers can compare against
 // `proof.format_version` themselves for early rejection at the network
 // boundary, or just rely on `verify_standalone`'s built-in check.
+pub use vos_pvm_proof::refine::{
+    MAX_REFINE_CHILD_COMPONENTS, MAX_REFINE_HOST_BOUNDARIES, MAX_REFINE_PROOF_SLICES,
+    REFINE_BUNDLE_FORMAT_VERSION, REFINE_CHILD_COMMITMENT_COUNT, RefineBundleVerification,
+    RefineMachineId, RefineProgramId, RefineProofBundle, RefineSliceExit,
+    refine_arguments_commitment, refine_bundle_cardinality_is_valid, refine_bundle_commitment,
+    refine_bundle_execution_commitment, refine_bundle_terminal_public_io, refine_program_id,
+};
 pub use vos_pvm_proof::{PROOF_FORMAT_VERSION, Proof};
 // PcsPolicy floor — see SECURITY.md "Proof shape". `check_min_security` /
 // `conjectured_security_bits` / `MIN_CONJECTURED_SECURITY_BITS` are the
@@ -67,6 +74,269 @@ pub use vos_pvm_proof::recursion_pcs::ProverMerkleHash as CommitmentHash;
 /// proving over very long executions) should call
 /// `verify_standalone_with_max_log_size` with an explicit bound.
 pub const DEFAULT_MAX_LOG_SIZE: u32 = 24;
+
+/// Trusted mapping from an exact Refine machine/program identity and proof
+/// shape to its preprocessed-trace commitment.
+///
+/// The mapping must come from an authenticated program catalog or equivalent
+/// admission record, never from the presented bundle itself. A PVM program's
+/// preprocessed commitment also depends on its selected component/log-size
+/// profile and exact PCS configuration, so the complete shape (including an
+/// explicit lifting choice) is part of the lookup key.
+pub trait RefineProgramCommitmentResolver {
+    fn resolve_preprocessed_commitment(
+        &self,
+        identity: RefineMachineId,
+        proof_format_version: u32,
+        component_mask: u32,
+        log_sizes: &[u32],
+        pcs_config: &stwo::core::pcs::PcsConfig,
+    ) -> Option<CommitmentHash>;
+}
+
+impl<F> RefineProgramCommitmentResolver for F
+where
+    F: Fn(RefineMachineId, u32, u32, &[u32], &stwo::core::pcs::PcsConfig) -> Option<CommitmentHash>,
+{
+    fn resolve_preprocessed_commitment(
+        &self,
+        identity: RefineMachineId,
+        proof_format_version: u32,
+        component_mask: u32,
+        log_sizes: &[u32],
+        pcs_config: &stwo::core::pcs::PcsConfig,
+    ) -> Option<CommitmentHash> {
+        self(
+            identity,
+            proof_format_version,
+            component_mask,
+            log_sizes,
+            pcs_config,
+        )
+    }
+}
+
+/// Verify every child STARK and the canonical Refine boundary transcript.
+///
+/// This deliberately returns [`RefineBundleVerification::ReplayRequired`]
+/// rather than `()` or `true`: a proof-only verifier cannot bind the bundle's
+/// native machine-state hashes and exit reasons to the child proof statements,
+/// or establish the native semantics of host calls 9..=14. Prover-enabled
+/// hosts close those boundaries with
+/// `vos_pvm_proof::verify_refine_bundle_replayed`, using exact outer
+/// program/argument bytes and gas. `program_commitments` must be a trusted
+/// external mapping; requiring it prevents a valid proof for an arbitrary
+/// program from being relabelled with a different
+/// [`RefineMachineId::program`](RefineMachineId::program).
+pub fn verify_refine_bundle_authenticated<R: RefineProgramCommitmentResolver + ?Sized>(
+    bundle: &RefineProofBundle,
+    expected_outer_program: RefineProgramId,
+    expected_arguments_commitment: [u8; 32],
+    expected_gas_limit: u64,
+    program_commitments: &R,
+) -> Result<RefineBundleVerification, VerificationError> {
+    // Must precede transcript construction, resolver callbacks, proof clones,
+    // and cryptographic work. Every collection length encoded as u32 in the
+    // transcript is bounded here.
+    if !refine_bundle_cardinality_is_valid(bundle) {
+        return Err(VerificationError::InvalidStructure(
+            "Refine bundle cardinality is noncanonical".to_string(),
+        ));
+    }
+    if bundle.format_version != REFINE_BUNDLE_FORMAT_VERSION {
+        return Err(VerificationError::InvalidStructure(
+            "Refine bundle format version mismatch".to_string(),
+        ));
+    }
+    if bundle.outer_program != expected_outer_program
+        || bundle.arguments_commitment != expected_arguments_commitment
+        || bundle.gas_limit != expected_gas_limit
+    {
+        return Err(VerificationError::InvalidStructure(
+            "Refine invocation identity/arguments/gas mismatch".to_string(),
+        ));
+    }
+    if bundle.transcript_commitment != refine_bundle_commitment(bundle) {
+        return Err(VerificationError::InvalidStructure(
+            "Refine transcript commitment mismatch".to_string(),
+        ));
+    }
+    let mut identities = BTreeMap::<(u32, u64), RefineProgramId>::new();
+    for (index, slice) in bundle.slices.iter().enumerate() {
+        if slice.order != index as u32 {
+            return Err(VerificationError::InvalidStructure(
+                "Refine machine slices are reordered".to_string(),
+            ));
+        }
+        match slice.identity {
+            RefineMachineId::Outer { program } if program == bundle.outer_program => {}
+            RefineMachineId::Outer { .. } => {
+                return Err(VerificationError::InvalidStructure(
+                    "Refine outer slice has the wrong program identity".to_string(),
+                ));
+            }
+            RefineMachineId::Inner {
+                slot,
+                generation,
+                program,
+            } => {
+                if identities
+                    .insert((slot, generation), program)
+                    .is_some_and(|previous| previous != program)
+                {
+                    return Err(VerificationError::InvalidStructure(
+                        "Refine inner slot/generation aliases two programs".to_string(),
+                    ));
+                }
+            }
+        }
+        let Some(actual_program_commitment) = slice.proof.stark_proof.commitments.first().copied()
+        else {
+            return Err(VerificationError::InvalidStructure(
+                "Refine child proof has no preprocessed commitment".to_string(),
+            ));
+        };
+        let Some(expected_program_commitment) = program_commitments
+            .resolve_preprocessed_commitment(
+                slice.identity,
+                slice.proof.format_version,
+                slice.proof.component_mask,
+                &slice.proof.log_sizes,
+                &slice.proof.pcs_config,
+            )
+        else {
+            return Err(VerificationError::InvalidStructure(
+                "Refine machine/program proof shape has no trusted commitment".to_string(),
+            ));
+        };
+        if actual_program_commitment != expected_program_commitment {
+            return Err(VerificationError::InvalidStructure(
+                "Refine child proof does not match its trusted program commitment".to_string(),
+            ));
+        }
+    }
+
+    if !matches!(bundle.slices[0].identity, RefineMachineId::Outer { .. }) {
+        return Err(VerificationError::InvalidStructure(
+            "Refine closure must start in the outer runtime".to_string(),
+        ));
+    }
+    // Walk the closure in execution order. This proves structural coverage,
+    // not host semantics: every handled outer host exit has exactly one
+    // boundary, only INVOKE may enclose one inner slice, and every other
+    // slice is the next outer continuation. A final handled host call can
+    // end in Panic/OutOfGas during native dispatch without another machine
+    // slice; replay is what proves that terminal transition.
+    let mut slice_index = 0usize;
+    let mut boundary_index = 0usize;
+    while slice_index < bundle.slices.len() {
+        let outer = &bundle.slices[slice_index];
+        if !matches!(outer.identity, RefineMachineId::Outer { .. }) {
+            return Err(VerificationError::InvalidStructure(
+                "Refine inner slice is outside an INVOKE boundary".to_string(),
+            ));
+        }
+        let RefineSliceExit::HostCall(call) = outer.exit else {
+            if slice_index + 1 != bundle.slices.len()
+                || outer.exit != bundle.result
+                || boundary_index != bundle.host_boundaries.len()
+            {
+                return Err(VerificationError::InvalidStructure(
+                    "Refine terminal result or slice coverage is noncanonical".to_string(),
+                ));
+            }
+            slice_index += 1;
+            continue;
+        };
+        let Ok(call) = u8::try_from(call) else {
+            return Err(VerificationError::InvalidStructure(
+                "Refine outer host call is outside the standard call range".to_string(),
+            ));
+        };
+        if !(9..=14).contains(&call) {
+            return Err(VerificationError::InvalidStructure(
+                "Refine outer host call is outside the standard call range".to_string(),
+            ));
+        }
+        let Some(boundary) = bundle.host_boundaries.get(boundary_index) else {
+            return Err(VerificationError::InvalidStructure(
+                "Refine outer host call has no matching boundary".to_string(),
+            ));
+        };
+        let expected_before = slice_index + 1;
+        if boundary.call != call || boundary.slices_before as usize != expected_before {
+            return Err(VerificationError::InvalidStructure(
+                "Refine host boundary does not match its outer call".to_string(),
+            ));
+        }
+        if boundary.registers_before != outer.proof.final_state.registers {
+            return Err(VerificationError::InvalidStructure(
+                "Refine host boundary input registers differ from the child proof exit".to_string(),
+            ));
+        }
+        let expected_after = if call == 13 {
+            match bundle.slices.get(expected_before) {
+                Some(slice) if matches!(slice.identity, RefineMachineId::Inner { .. }) => {
+                    expected_before + 1
+                }
+                _ => expected_before,
+            }
+        } else {
+            expected_before
+        };
+        if boundary.slices_after as usize != expected_after {
+            return Err(VerificationError::InvalidStructure(
+                "Refine host boundary encloses a noncanonical slice range".to_string(),
+            ));
+        }
+        if let Some(next_outer) = bundle.slices.get(expected_after) {
+            if !matches!(next_outer.identity, RefineMachineId::Outer { .. })
+                || boundary.registers_after != next_outer.proof.initial_state.registers
+            {
+                return Err(VerificationError::InvalidStructure(
+                    "Refine host boundary output registers differ from the next outer proof entry"
+                        .to_string(),
+                ));
+            }
+        }
+        boundary_index += 1;
+        slice_index = expected_after;
+
+        if slice_index == bundle.slices.len()
+            && (expected_after != expected_before
+                || !matches!(
+                    bundle.result,
+                    RefineSliceExit::Panic | RefineSliceExit::OutOfGas
+                )
+                || boundary_index != bundle.host_boundaries.len())
+        {
+            return Err(VerificationError::InvalidStructure(
+                "Refine final host transition/result is noncanonical".to_string(),
+            ));
+        }
+    }
+    if boundary_index != bundle.host_boundaries.len() {
+        return Err(VerificationError::InvalidStructure(
+            "Refine bundle has an extra host boundary".to_string(),
+        ));
+    }
+
+    // Perform expensive cryptographic verification only after all bounded
+    // structural checks. The checked access above makes an empty commitment
+    // vector a normal hostile-input error rather than a panic.
+    for slice in &bundle.slices {
+        let Some(program_commitment) = slice.proof.stark_proof.commitments.first().copied() else {
+            return Err(VerificationError::InvalidStructure(
+                "Refine child proof has no preprocessed commitment".to_string(),
+            ));
+        };
+        verify_standalone(slice.proof.clone(), program_commitment)?;
+    }
+
+    Ok(RefineBundleVerification::ReplayRequired {
+        transcript_commitment: bundle.transcript_commitment,
+    })
+}
 
 /// Verify a PVM execution proof.
 ///
@@ -144,11 +414,13 @@ pub fn verify_standalone_with_options(
 /// MOBILE), `Some(p)` = an exact `PcsPolicy` pin (the strict `*_with_pcs_policy`
 /// path). All four public `verify_standalone*` entry points funnel here.
 fn verify_standalone_shaped(
-    proof: Proof,
+    mut proof: Proof,
     preprocessed_commitment: CommitmentHash,
     max_log_size: u32,
     policy: Option<&PcsPolicy>,
 ) -> Result<(), VerificationError> {
+    vos_pvm_proof::proof::preflight_proof_structure(&mut proof, max_log_size)
+        .map_err(VerificationError::InvalidStructure)?;
     // Reject proofs from a different AIR shape early, before
     // any cryptographic work.  Done first because every subsequent
     // length check assumes the AIR shape this verifier was compiled
@@ -178,6 +450,14 @@ fn verify_standalone_shaped(
                 .to_string(),
         ));
     }
+    let supported_mask = 1u32
+        .checked_shl(vos_pvm_proof::chip_idx::COUNT as u32)
+        .map_or(u32::MAX, |end| end - 1);
+    if proof.component_mask & !supported_mask != 0 {
+        return Err(VerificationError::InvalidStructure(
+            "component_mask selects a component outside this AIR generation".to_string(),
+        ));
+    }
     // Cap log_sizes so a malicious prover can't force the
     // verifier into arbitrarily large Merkle commitments.  We check
     // each component's log_size individually against the cap; the
@@ -202,6 +482,44 @@ fn verify_standalone_shaped(
     if let Err(msg) = shape_check {
         return Err(VerificationError::InvalidStructure(msg));
     }
+    if proof.component_mask.count_ones() as usize != proof.num_components {
+        return Err(VerificationError::InvalidStructure(
+            "component_mask popcount does not match num_components".to_string(),
+        ));
+    }
+    let (trace_sizes, preprocessed_sizes) =
+        create_verifier_components::trace_and_preprocessed_sizes(
+            &proof.log_sizes,
+            proof.component_mask,
+        );
+    let mut expected_log_sizes = TreeVec::concat_cols(trace_sizes.into_iter());
+    if expected_log_sizes.len() != 3 {
+        return Err(VerificationError::InvalidStructure(
+            "selected AIR has a noncanonical trace-tree count".to_string(),
+        ));
+    }
+    expected_log_sizes[0] = preprocessed_sizes;
+    let mut dummy_lookup = AllLookupElements::default();
+    let mut dummy_channel = ProverChannel::default();
+    draw_all_lookup_elements(&mut dummy_lookup, &mut dummy_channel, proof.component_mask);
+    let dummy_allocator = &mut TraceLocationAllocator::default();
+    let shape_components = create_verifier_components::components(
+        dummy_allocator,
+        &dummy_lookup,
+        &proof.log_sizes,
+        &proof.claimed_sums,
+        proof.component_mask,
+    );
+    let shape_component_refs: Vec<&dyn Component> = shape_components
+        .iter()
+        .map(|component| &**component)
+        .collect();
+    let protocol_shape = vos_pvm_proof::framework_access::preflight_component_dimensions(
+        &proof,
+        &shape_component_refs,
+        &expected_log_sizes,
+    )
+    .map_err(VerificationError::InvalidStructure)?;
     let Proof {
         stark_proof,
         claimed_sums,
@@ -224,14 +542,6 @@ fn verify_standalone_shaped(
             "log sizes len mismatch".to_string(),
         ));
     }
-    // The active-component reconstruction zips mask-selected chips with
-    // the claimed sums/log sizes; require the counts to agree so a
-    // mask/num_components mismatch can't silently truncate either side.
-    if component_mask.count_ones() as usize != num_components {
-        return Err(VerificationError::InvalidStructure(
-            "component_mask popcount does not match num_components".to_string(),
-        ));
-    }
     // v7: reject `initial_state.timestamp < 1` per segment (the
     // production consumer verifies single proofs here, not only the chain
     // wrapper).  Step timestamps start at 1, so `initial_ts ≥ 1` excludes the
@@ -250,6 +560,7 @@ fn verify_standalone_shaped(
     // (Merkle::WitnessTooLong).  The proof carries its config; trust it.
     let config = pcs_config;
     let verifier_channel = &mut ProverChannel::default();
+    vos_pvm_proof::proof::mix_proof_fs_domain(verifier_channel, PROOF_FORMAT_VERSION, &config);
     claimed_log_sizes.iter().for_each(|log_size| {
         verifier_channel.mix_u64(*log_size as u64);
     });
@@ -265,13 +576,7 @@ fn verify_standalone_shaped(
     let commitment_scheme = &mut CommitmentSchemeVerifier::<ProverMerkleChannel>::new(config);
 
     // Commit preprocessed and original traces
-    let (trace_sizes, preprocessed_sizes) =
-        create_verifier_components::trace_and_preprocessed_sizes(
-            &claimed_log_sizes,
-            component_mask,
-        );
-    let mut log_sizes = TreeVec::concat_cols(trace_sizes.into_iter());
-    log_sizes[0] = preprocessed_sizes; // PREPROCESSED_TRACE_IDX
+    let log_sizes = expected_log_sizes;
 
     for idx in [0, 1] {
         // PREPROCESSED_TRACE_IDX, ORIGINAL_TRACE_IDX
@@ -373,6 +678,20 @@ fn verify_standalone_shaped(
         &log_sizes[2],
         verifier_channel,
     );
+
+    let sampled_queries = vos_pvm_proof::proof::expected_fiat_shamir_query_count(
+        verifier_channel,
+        &stark_proof,
+        &pcs_config,
+        protocol_shape,
+        &log_sizes,
+    )
+    .map_err(VerificationError::InvalidStructure)?;
+    if sampled_queries != protocol_shape.query_count {
+        return Err(VerificationError::InvalidStructure(
+            "queried-value rows differ from Fiat-Shamir query positions".to_string(),
+        ));
+    }
 
     stwo::core::verifier::verify(
         &components_ref,

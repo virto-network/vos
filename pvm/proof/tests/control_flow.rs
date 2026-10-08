@@ -74,9 +74,9 @@ fn prove_unconditional_jump() {
         10000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let exit = tracing.run();
-    assert_eq!(exit, vos_pvm::ExitReason::Trap); // Trap
+    assert_eq!(exit, vos_pvm::ExitReason::Panic); // Trap
 
     let steps = tracing.into_trace();
     // Should be: Jump(pc=0→3), Add64(pc=3), Trap(pc=6)
@@ -117,9 +117,9 @@ fn prove_fallthrough() {
         10000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let exit = tracing.run();
-    assert_eq!(exit, vos_pvm::ExitReason::Trap);
+    assert_eq!(exit, vos_pvm::ExitReason::Panic);
 
     let steps = tracing.into_trace();
     assert_eq!(steps.len(), 3); // Fallthrough, Add64, Trap
@@ -159,7 +159,7 @@ fn fallthrough_forged_next_pc_rejected() {
         10000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let _ = tracing.run();
     let mut steps = tracing.into_trace();
 
@@ -198,9 +198,9 @@ fn prove_unlikely() {
         10000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let exit = tracing.run();
-    assert_eq!(exit, vos_pvm::ExitReason::Trap);
+    assert_eq!(exit, vos_pvm::ExitReason::Panic);
 
     let steps = tracing.into_trace();
     assert_eq!(steps[0].opcode, Opcode::Unlikely);
@@ -248,7 +248,7 @@ fn load_imm_jump_ind_positive_smoke() {
         10000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let _ = tracing.run();
     let steps = tracing.into_trace();
     assert_eq!(steps[0].opcode, Opcode::LoadImmJumpInd);
@@ -285,7 +285,7 @@ fn load_imm_jump_ind_forged_target_rejected() {
         10000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let _ = tracing.run();
     let mut steps = tracing.into_trace();
     assert_eq!(steps[0].next_pc, 3);
@@ -324,7 +324,7 @@ fn jump_ind_positive_smoke() {
         10000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let _ = tracing.run();
     let steps = tracing.into_trace();
     assert_eq!(steps[0].opcode, Opcode::JumpInd);
@@ -361,7 +361,7 @@ fn jump_ind_forged_target_rejected() {
         10000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let _ = tracing.run();
     let mut steps = tracing.into_trace();
     assert_eq!(steps[0].next_pc, 3);
@@ -419,7 +419,7 @@ fn jump_forged_branch_target_rejected_by_prog_mem_lookup() {
         10000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let _ = tracing.run();
     let mut steps = tracing.into_trace();
     assert_eq!(steps.len(), 2); // Jump → Trap@4
@@ -469,7 +469,7 @@ fn trap_followed_by_trap_clone_rejected_by_terminal_constraint() {
         10000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let _ = tracing.run();
     let mut steps = tracing.into_trace();
     assert_eq!(steps.len(), 3);
@@ -516,7 +516,7 @@ fn trap_mid_trace_rejected() {
         10000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let _ = tracing.run();
     let mut steps = tracing.into_trace();
     assert_eq!(steps.len(), 3);
@@ -559,7 +559,7 @@ fn unlikely_forged_next_pc_rejected() {
         10000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let _ = tracing.run();
     let mut steps = tracing.into_trace();
 
@@ -599,9 +599,9 @@ fn prove_branch_eq_taken() {
         10000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let exit = tracing.run();
-    assert_eq!(exit, vos_pvm::ExitReason::Trap);
+    assert_eq!(exit, vos_pvm::ExitReason::Panic);
 
     let steps = tracing.into_trace();
     assert_eq!(steps.len(), 2); // BranchEq → Trap
@@ -617,17 +617,20 @@ fn prove_branch_eq_not_taken() {
     regs[0] = 42;
     regs[1] = 99; // not equal → fall through
 
-    // BranchEq at pc=0, falls through to pc=5 (sequential)
-    // Sequential next_pc = pc + 1 + skip = 0 + 1 + 4 = 5
+    // BranchEq at pc=0, falls through to pc=5 (sequential).
+    // Standard v0.8 validates both successors before choosing one, so keep
+    // the untaken target at the separate valid instruction start pc=6.
+    // Sequential next_pc = pc + 1 + skip = 0 + 1 + 4 = 5.
     let code = vec![
         Opcode::BranchEq as u8, // offset 0
         0x10,                   // ra=0, rb=1
-        10,
+        6,
         0,
-        0,                  // offset (irrelevant since not taken)
-        Opcode::Trap as u8, // offset 5
+        0,                  // signed_offset = 6 (valid alternate target pc=6)
+        Opcode::Trap as u8, // fallthrough at pc=5
+        Opcode::Trap as u8, // alternate target at pc=6
     ];
-    let bitmask = vec![1, 0, 0, 0, 0, 1];
+    let bitmask = vec![1, 0, 0, 0, 0, 1, 1];
 
     let pvm = Interpreter::new(
         code.clone(),
@@ -638,9 +641,9 @@ fn prove_branch_eq_not_taken() {
         10000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let exit = tracing.run();
-    assert_eq!(exit, vos_pvm::ExitReason::Trap);
+    assert_eq!(exit, vos_pvm::ExitReason::Panic);
 
     let steps = tracing.into_trace();
     assert_eq!(steps.len(), 2); // BranchEq (not taken) → Trap
@@ -707,9 +710,9 @@ fn prove_loop_add() {
         10000,
         25,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new_conformance(pvm);
     let exit = tracing.run();
-    assert_eq!(exit, vos_pvm::ExitReason::Trap);
+    assert_eq!(exit, vos_pvm::ExitReason::Panic);
 
     let steps = tracing.into_trace();
     // 3 iterations × 3 instructions + Trap = 10 steps
@@ -730,65 +733,5 @@ fn prove_loop_add() {
     assert_eq!(steps[7].regs_after[1], 0); // counter after 3rd Sub
     assert!(!steps[8].branch_taken); // last branch not taken (counter=0)
 
-    prove_and_verify(steps, &code, &bitmask);
-}
-
-// ── Sbrk as terminal opcode ────────────────────────────────────────────────
-// Sbrk panics on execution (JAR v0.8.0 removed it from the ISA in favour of
-// the grow_heap hostcall).  Sbrk is marked is_exit + is_trap so the
-// terminal-row constraint forbids any successor real row, matching the
-// interpreter's panic-and-stop semantics.
-
-#[test]
-fn prove_sbrk_terminal() {
-    let regs = [0u64; PVM_REGISTER_COUNT];
-    let code = vec![Opcode::Sbrk as u8];
-    let bitmask = vec![1];
-    let pvm = Interpreter::new(
-        code.clone(),
-        bitmask.clone(),
-        vec![],
-        regs,
-        vec![0u8; 4 * 1024 * 1024],
-        10000,
-        25,
-    );
-    let mut tracing = TracingPvm::new(pvm);
-    let exit = tracing.run();
-    assert_eq!(exit, vos_pvm::ExitReason::Panic);
-    let steps = tracing.into_trace();
-    assert_eq!(steps.len(), 1);
-    assert_eq!(steps[0].opcode, Opcode::Sbrk);
-    prove_and_verify(steps, &code, &bitmask);
-}
-
-#[test]
-#[should_panic(expected = "failed")]
-fn sbrk_followed_by_clone_rejected_by_terminal_constraint() {
-    // Same shape as `trap_followed_by_trap_clone_rejected_by_terminal_constraint`
-    // but for Sbrk: synthesize a "second Sbrk" step after the real one with
-    // all continuity fields plausibly consistent.  Sbrk's IsTrap flag drives
-    // the terminal-row constraint
-    // (`is_real · is_trap · (1 - is_padding_next) = 0`) → splice rejected.
-    let regs = [0u64; PVM_REGISTER_COUNT];
-    let code = vec![Opcode::Sbrk as u8];
-    let bitmask = vec![1];
-    let pvm = Interpreter::new(
-        code.clone(),
-        bitmask.clone(),
-        vec![],
-        regs,
-        vec![0u8; 4 * 1024 * 1024],
-        10000,
-        25,
-    );
-    let mut tracing = TracingPvm::new(pvm);
-    let _ = tracing.run();
-    let mut steps = tracing.into_trace();
-    assert_eq!(steps.len(), 1);
-    let prev = steps[0].clone();
-    let mut clone = prev.clone();
-    clone.timestamp = prev.timestamp + 1;
-    steps.push(clone);
     prove_and_verify(steps, &code, &bitmask);
 }

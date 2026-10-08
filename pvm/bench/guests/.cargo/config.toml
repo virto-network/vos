@@ -1,0 +1,12 @@
+# Shared by every bench guest. Paths are relative to each guest crate's root,
+# where cargo runs rustc and the linker.
+[target.riscv64em-vos]
+rustflags = [
+    "-Zunstable-options",
+    "-Clink-arg=-T../../../guest/pvm.ld",
+]
+
+[unstable]
+json-target-spec = true
+build-std = ["core", "alloc", "compiler_builtins"]
+build-std-features = ["compiler-builtins-mem"]

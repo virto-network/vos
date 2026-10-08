@@ -10,7 +10,7 @@ use alloc::{vec, vec::Vec};
 use crate::args::{self, Args};
 use crate::instruction::Opcode;
 use crate::{ExitReason, Gas, PVM_REGISTER_COUNT};
-pub use memory::Memory;
+pub use memory::{Memory, NonZeroPage, SparseMemoryImage};
 
 /// Pre-decoded instruction for the fast interpreter path.
 ///
@@ -52,6 +52,36 @@ pub const PERM_NONE: u8 = 0;
 pub const PERM_RO: u8 = 1;
 pub const PERM_RW: u8 = 2;
 
+/// Width of one scalar guest-memory instruction. Keeping this mapping next
+/// to the access macros makes the standard preflight impossible to omit when
+/// a typed accessor is used by either interpreter loop.
+macro_rules! memory_access_width {
+    (read_u8) => {
+        1usize
+    };
+    (read_u16_le) => {
+        2usize
+    };
+    (read_u32_le) => {
+        4usize
+    };
+    (read_u64_le) => {
+        8usize
+    };
+    (write_u8) => {
+        1usize
+    };
+    (write_u16_le) => {
+        2usize
+    };
+    (write_u32_le) => {
+        4usize
+    };
+    (write_u64_le) => {
+        8usize
+    };
+}
+
 #[derive(Clone, Debug)]
 pub struct Interpreter {
     /// ϱ: Gas counter (remaining gas).
@@ -71,20 +101,26 @@ pub struct Interpreter {
     pub bitmask: Vec<u8>,
     /// j: Dynamic jump table (indices into code).
     pub jump_table: Vec<u32>,
-    /// Heap base address (h) for sbrk.
+    /// Heap base address (h) for the grow-heap host operation.
     pub heap_base: u32,
-    /// Current heap top pointer for sbrk (heap_base + total_allocated).
+    /// Current heap top pointer (heap_base + total_allocated).
     pub heap_top: u32,
     /// Maximum heap pages (grow_heap refuses beyond this).
     pub max_heap_pages: u32,
-    /// Memory tier load/store cycles (25, 50, 75, or 100).
+    /// Effective profile-bound load/store cycles. Standard v0.8.0 is always
+    /// 25; the capability/JAR profile may use a 25/50/75/100 page tier.
     pub mem_cycles: u8,
+    /// Caller-provided capability/JAR tier retained across ISA profile
+    /// transitions. Standard execution never consumes this value directly.
+    configured_mem_cycles: u8,
+    /// A standard `ecalli` that has been surfaced but not acknowledged.
+    pending_host_call: Option<crate::PendingHostCall>,
     /// GP basic-block starts: {PC=0} ∪ {post-terminator PCs}. Branch and
     /// djump targets must land on one of these or the instruction panics
     /// (GP eq A.17/A.18). Gas blocks share the same boundaries.
     pub(crate) basic_block_starts: Vec<bool>,
     /// ISA profile: Conformance rejects opcode 3 (Ecall) at execution.
-    pub isa_mode: crate::IsaMode,
+    isa_mode: crate::IsaMode,
     /// Gas model the VM charges under. Private because the pre-decoded
     /// stream caches per-instruction gas labels derived from it — install
     /// via [`Self::set_gas_model`], which re-derives them.
@@ -93,6 +129,13 @@ pub struct Interpreter {
     /// Only entries at gas block starts are meaningful. Gas blocks are
     /// {PC=0} ∪ {post-terminator PCs}, NOT branch targets.
     pub block_gas_costs: Vec<u32>,
+    /// Containing gas-block start for every externally enterable PC.
+    gas_block_start_by_pc: Vec<u32>,
+    /// Whether the block containing the current PC has already been funded.
+    /// This is consensus-visible continuation state: host and page-fault
+    /// retries must not charge the same block twice, while a fresh arbitrary
+    /// mid-block entry must charge the complete containing block.
+    pub gas_charged: bool,
     /// JAR v0.8.0: true when the next instruction should be charged block gas.
     /// Set at initialization and after every terminator instruction.
     pub need_gas_charge: bool,
@@ -158,18 +201,91 @@ impl Interpreter {
         gas: Gas,
         mem_cycles: u8,
     ) -> Self {
+        Self::with_memory_and_mode(
+            code,
+            bitmask,
+            jump_table,
+            registers,
+            mem,
+            gas,
+            mem_cycles,
+            crate::IsaMode::Jar,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_memory_and_mode(
+        code: Vec<u8>,
+        bitmask: Vec<u8>,
+        jump_table: Vec<u32>,
+        registers: [u64; PVM_REGISTER_COUNT],
+        mem: Memory,
+        gas: Gas,
+        mem_cycles: u8,
+        isa_mode: crate::IsaMode,
+    ) -> Self {
+        let configured_mem_cycles = mem_cycles;
+        let mem_cycles = crate::mem_cycles_for_mode(mem_cycles, isa_mode);
         // Basic blocks and gas blocks share the same boundaries:
         // {0} ∪ post-terminator.
-        let basic_block_starts = compute_basic_block_starts(&code, &bitmask);
+        let basic_block_starts = match isa_mode {
+            crate::IsaMode::Jar => compute_runtime_basic_block_starts(&code, &bitmask),
+            crate::IsaMode::Conformance => compute_basic_block_starts(&code, &bitmask),
+        };
         let block_gas_costs =
-            compute_block_gas_costs(&code, &bitmask, &basic_block_starts, mem_cycles);
+            compute_block_gas_costs(&code, &bitmask, &basic_block_starts, mem_cycles, isa_mode);
         let (decoded_insts, pc_to_idx) = predecode_instructions(
             &code,
             &bitmask,
             &basic_block_starts,
             &basic_block_starts,
             &block_gas_costs,
+            isa_mode,
         );
+        let gas_block_start_by_pc =
+            compute_gas_block_start_by_pc(&code, &bitmask, &basic_block_starts, isa_mode);
+        Self::from_predecoded(
+            crate::backend::InterpreterProgram {
+                decoded_insts,
+                pc_to_idx,
+                basic_block_starts,
+                block_gas_costs,
+                gas_block_start_by_pc,
+                code,
+                bitmask,
+                jump_table,
+                mem_cycles,
+            },
+            registers,
+            mem,
+            gas,
+            configured_mem_cycles,
+            isa_mode,
+        )
+    }
+
+    // Crate-private: public InterpreterProgram fields are not a trusted source
+    // of gas tables. Callers here must supply tables derived by this interpreter
+    // for exactly the supplied ISA and memory-cycle configuration.
+    pub(crate) fn from_predecoded(
+        program: crate::backend::InterpreterProgram,
+        registers: [u64; PVM_REGISTER_COUNT],
+        mem: Memory,
+        gas: Gas,
+        configured_mem_cycles: u8,
+        isa_mode: crate::IsaMode,
+    ) -> Self {
+        let crate::backend::InterpreterProgram {
+            decoded_insts,
+            pc_to_idx,
+            basic_block_starts,
+            block_gas_costs,
+            gas_block_start_by_pc,
+            code,
+            bitmask,
+            jump_table,
+            mem_cycles,
+        } = program;
         Self {
             gas,
             registers,
@@ -182,10 +298,14 @@ impl Interpreter {
             heap_top: 0,
             max_heap_pages: 0,
             mem_cycles,
+            configured_mem_cycles,
+            pending_host_call: None,
             basic_block_starts,
-            isa_mode: crate::IsaMode::default(),
+            isa_mode,
             gas_model: crate::GasModel::default(),
             block_gas_costs,
+            gas_block_start_by_pc,
+            gas_charged: false,
             need_gas_charge: true,
             tracing_enabled: false,
             pc_trace: Vec::new(),
@@ -202,24 +322,33 @@ impl Interpreter {
         bitmask: &[u8],
         jump_table: &[u32],
         mem_cycles: u8,
+        isa_mode: crate::IsaMode,
     ) -> crate::backend::InterpreterProgram {
+        let mem_cycles = crate::mem_cycles_for_mode(mem_cycles, isa_mode);
         // Basic blocks and gas blocks share the same boundaries:
         // {0} ∪ post-terminator.
-        let basic_block_starts = compute_basic_block_starts(code, bitmask);
+        let basic_block_starts = match isa_mode {
+            crate::IsaMode::Jar => compute_runtime_basic_block_starts(code, bitmask),
+            crate::IsaMode::Conformance => compute_basic_block_starts(code, bitmask),
+        };
         let block_gas_costs =
-            compute_block_gas_costs(code, bitmask, &basic_block_starts, mem_cycles);
+            compute_block_gas_costs(code, bitmask, &basic_block_starts, mem_cycles, isa_mode);
         let (decoded_insts, pc_to_idx) = predecode_instructions(
             code,
             bitmask,
             &basic_block_starts,
             &basic_block_starts,
             &block_gas_costs,
+            isa_mode,
         );
+        let gas_block_start_by_pc =
+            compute_gas_block_start_by_pc(code, bitmask, &basic_block_starts, isa_mode);
         crate::backend::InterpreterProgram {
             decoded_insts,
             pc_to_idx,
             basic_block_starts,
             block_gas_costs,
+            gas_block_start_by_pc,
             code: code.to_vec(),
             bitmask: bitmask.to_vec(),
             jump_table: jump_table.to_vec(),
@@ -231,6 +360,48 @@ impl Interpreter {
     /// Used by service blobs to select refine (PC=0) or accumulate (PC=5) entry points.
     pub fn set_pc(&mut self, pc: u32) {
         self.pc = pc;
+        self.pending_host_call = None;
+        self.gas_charged = false;
+        self.need_gas_charge = true;
+    }
+
+    /// Advance a standard host-call exit to its continuation instruction.
+    ///
+    /// Returns `true` only when the preceding [`Self::run`] stopped on a
+    /// Conformance-profile `ecalli`. JAR/service execution retains its
+    /// historical already-advanced program counter and returns `false`.
+    pub fn resume_after_host_call(&mut self) -> bool {
+        let Some(call) = self.pending_host_call.take() else {
+            return false;
+        };
+        self.pc = call.resume_pc;
+        // `ecalli` is not in the standard termination set, so its successor
+        // remains in the already-funded block.
+        self.gas_charged = true;
+        self.need_gas_charge = false;
+        true
+    }
+
+    /// The unacknowledged standard host call, if any.
+    pub fn pending_host_call(&self) -> Option<crate::PendingHostCall> {
+        self.pending_host_call
+    }
+
+    /// Restore execution-boundary state owned by an embedding scheduler.
+    pub(crate) fn restore_boundary_state(
+        &mut self,
+        gas_charged: bool,
+        pending_host_call: Option<crate::PendingHostCall>,
+    ) {
+        self.gas_charged = gas_charged;
+        self.need_gas_charge = !gas_charged;
+        self.pending_host_call = pending_host_call;
+    }
+
+    /// Internal continuation cursor used by the capability kernel after it
+    /// has handled a standard host call.
+    pub(crate) fn continuation_pc(&self) -> u32 {
+        self.pc
     }
 
     /// Install the gas model, re-deriving the cached per-instruction gas
@@ -242,20 +413,34 @@ impl Interpreter {
     /// 1, so the fast loop's existing charge-then-execute step reproduces
     /// the Lean oracle (`Jar.JAVM.run`): out-of-gas is checked before the
     /// instruction runs, and the exiting instruction is itself charged.
-    /// Under [`crate::GasModel::BlockSinglePass`] the labels revert to the
+    /// Under [`crate::GasModel::BlockPipeline`] the labels revert to the
     /// block costs at gas-block starts (0 elsewhere).
     pub fn set_gas_model(&mut self, model: crate::GasModel) {
         self.gas_model = model;
+        let standard_sentinel_starts_block = self
+            .decoded_insts
+            .iter()
+            .rev()
+            .find(|inst| (inst.pc as usize) < self.code.len())
+            .is_none_or(|inst| is_terminator_for_mode(inst.opcode, self.isa_mode));
         for inst in &mut self.decoded_insts {
             inst.bb_gas_cost = match model {
                 crate::GasModel::PerInstruction => 1,
-                crate::GasModel::BlockSinglePass => {
+                crate::GasModel::BlockPipeline => {
                     let pc = inst.pc as usize;
                     if pc < self.basic_block_starts.len() && self.basic_block_starts[pc] {
                         self.block_gas_costs[pc]
                     } else if pc >= self.code.len() {
-                        // The end-of-code sentinel trap charges 1.
-                        1
+                        match self.isa_mode {
+                            // Frozen capability-runtime behavior.
+                            crate::IsaMode::Jar => 1,
+                            // In v0.8 the zero-extended trap is part of an
+                            // open final block. It is separately charged only
+                            // when a preceding T instruction ended that block.
+                            crate::IsaMode::Conformance => {
+                                u32::from(standard_sentinel_starts_block) * 2
+                            }
+                        }
                     } else {
                         0
                     }
@@ -267,6 +452,57 @@ impl Interpreter {
     /// The gas model the VM charges under.
     pub fn gas_model(&self) -> crate::GasModel {
         self.gas_model
+    }
+
+    /// The instruction-set profile installed in this interpreter.
+    ///
+    /// Proof adapters use this to preserve authenticated container semantics
+    /// when an initialized interpreter crosses the tracing API boundary.
+    pub fn isa_mode(&self) -> crate::IsaMode {
+        self.isa_mode
+    }
+
+    /// Select the instruction-set profile and rebuild all decoded state that
+    /// depends on opcode validity, block boundaries, or opcode gas costs.
+    ///
+    /// Embedders should normally choose the profile at construction. This
+    /// transition exists for proof tooling that receives an initialized
+    /// interpreter and must bind it to the standard ISA before any step runs.
+    pub fn set_isa_mode(&mut self, isa_mode: crate::IsaMode) {
+        if self.isa_mode == isa_mode {
+            return;
+        }
+        self.isa_mode = isa_mode;
+        self.pending_host_call = None;
+        self.gas_charged = false;
+        self.need_gas_charge = true;
+        self.mem_cycles = crate::mem_cycles_for_mode(self.configured_mem_cycles, isa_mode);
+        self.basic_block_starts = match isa_mode {
+            crate::IsaMode::Jar => compute_runtime_basic_block_starts(&self.code, &self.bitmask),
+            crate::IsaMode::Conformance => compute_basic_block_starts(&self.code, &self.bitmask),
+        };
+        self.block_gas_costs = compute_block_gas_costs(
+            &self.code,
+            &self.bitmask,
+            &self.basic_block_starts,
+            self.mem_cycles,
+            isa_mode,
+        );
+        self.gas_block_start_by_pc = compute_gas_block_start_by_pc(
+            &self.code,
+            &self.bitmask,
+            &self.basic_block_starts,
+            isa_mode,
+        );
+        (self.decoded_insts, self.pc_to_idx) = predecode_instructions(
+            &self.code,
+            &self.bitmask,
+            &self.basic_block_starts,
+            &self.basic_block_starts,
+            &self.block_gas_costs,
+            isa_mode,
+        );
+        self.set_gas_model(self.gas_model);
     }
 
     /// Create a simple PVM for testing (code only, trivial bitmask).
@@ -300,6 +536,15 @@ impl Interpreter {
     /// The guest memory.
     pub fn memory(&self) -> &Memory {
         &self.mem
+    }
+
+    /// The guest memory, mutably.
+    ///
+    /// This is intentionally lower-level than the instruction accessors: a
+    /// standard Refine embedder needs to implement the `pages`, `peek`, and
+    /// `poke` host calls between invocations of an inner machine.
+    pub fn memory_mut(&mut self) -> &mut Memory {
+        &mut self.mem
     }
 
     /// Take ownership of the guest memory, leaving an empty flat buffer.
@@ -367,6 +612,63 @@ impl Interpreter {
         self.mem.write_u64_le(addr, val)
     }
 
+    /// Classify a standard scalar memory access before it can mutate state.
+    ///
+    /// Gray Paper v0.8 orders the *raw* required indices, reducing each one
+    /// modulo 2^32 only when it is inspected. Consequently an access that
+    /// starts at the top of the address space checks its high tail first and
+    /// only then reaches the wrapped initialization zone. For example, an
+    /// eight-byte access at `0xffff_fffc` faults at `0xffff_f000` when that
+    /// page is inaccessible, but panics when the high tail is accessible and
+    /// the next required byte wraps to address zero.
+    ///
+    /// The scan is at most eight bytes. Performing it before the existing
+    /// typed read/write also makes a failing store atomic across page and
+    /// address-space boundaries.
+    #[inline(always)]
+    fn standard_memory_exception(
+        &self,
+        addr: u32,
+        width: usize,
+        write: bool,
+    ) -> Option<ExitReason> {
+        debug_assert!(matches!(width, 1 | 2 | 4 | 8));
+        if addr < crate::PVM_ZONE_SIZE {
+            return Some(ExitReason::Panic);
+        }
+        let last = addr.wrapping_add(width as u32 - 1);
+        if addr / crate::PVM_PAGE_SIZE == last / crate::PVM_PAGE_SIZE {
+            // Permissions are page-granular. Ordinary scalar accesses stay
+            // on one page, so one range check proves all their bytes. Keep
+            // the ordered byte walk below for page crossings and u32 wrap:
+            // the first fault (including the low-zone panic) must not change.
+            let accessible = if write {
+                self.mem.is_writable(addr, width)
+            } else {
+                self.mem.is_readable(addr, width)
+            };
+            return (!accessible)
+                .then_some(ExitReason::PageFault(addr & !(crate::PVM_PAGE_SIZE - 1)));
+        }
+        for offset in 0..width {
+            let byte_addr = addr.wrapping_add(offset as u32);
+            if byte_addr < crate::PVM_ZONE_SIZE {
+                return Some(ExitReason::Panic);
+            }
+            let accessible = if write {
+                self.mem.is_writable(byte_addr, 1)
+            } else {
+                self.mem.is_readable(byte_addr, 1)
+            };
+            if !accessible {
+                return Some(ExitReason::PageFault(
+                    byte_addr & !(crate::PVM_PAGE_SIZE - 1),
+                ));
+            }
+        }
+        None
+    }
+
     /// Compute skip(i) — distance to next instruction minus one (eq A.3).
     fn skip(&self, i: usize) -> usize {
         // skip(i) = min(24, first j where (k ++ [1,1,...])_{i+1+j} = 1)
@@ -399,15 +701,49 @@ impl Interpreter {
         }
     }
 
-    /// Handle static branch (eq A.17).
+    fn containing_block_cost(&self, pc: u32) -> Option<u64> {
+        let start = *self.gas_block_start_by_pc.get(pc as usize)?;
+        if start == u32::MAX {
+            return None;
+        }
+        if start as usize == self.code.len() {
+            return Some(match self.isa_mode {
+                crate::IsaMode::Jar => 1,
+                crate::IsaMode::Conformance => 2,
+            });
+        }
+        self.block_gas_costs
+            .get(start as usize)
+            .copied()
+            .map(u64::from)
+    }
+
+    /// Handle an unconditional static jump (eq A.17's `sjump`).
     /// Returns (exit_reason, new_pc) where exit_reason is None for continue.
-    fn branch(&self, target: u64, condition: bool, next_pc: u32) -> (Option<ExitReason>, u32) {
-        if !condition {
-            (None, next_pc)
-        } else if !self.is_basic_block_start(target) {
+    fn sjump(&self, target: u64) -> (Option<ExitReason>, u32) {
+        if !self.is_basic_block_start(target) {
             (Some(ExitReason::Panic), self.pc)
         } else {
             (None, target as u32)
+        }
+    }
+
+    /// Handle a conditional static branch (eq A.17's `branch`).
+    ///
+    /// Standard v0.8 validates both possible successors before selecting one.
+    /// The transitional JAR profile keeps its frozen behavior and validates
+    /// only a selected explicit target.
+    fn branch(&self, target: u64, condition: bool, next_pc: u32) -> (Option<ExitReason>, u32) {
+        if self.isa_mode == crate::IsaMode::Conformance
+            && (!self.is_basic_block_start(target)
+                || !self.is_basic_block_start(u64::from(next_pc)))
+        {
+            return (Some(ExitReason::Panic), self.pc);
+        }
+        if !condition {
+            (None, next_pc)
+        } else {
+            self.sjump(target)
         }
     }
 
@@ -440,7 +776,14 @@ impl Interpreter {
         // macros expand to the same code as the hand-written variants.
         macro_rules! step_store {
             ($self:expr, $addr:expr, $write_fn:ident, $val:expr, $next_pc:expr) => {{
-                match $self.$write_fn($addr, $val) {
+                let addr = $addr;
+                if $self.isa_mode == crate::IsaMode::Conformance
+                    && let Some(reason) =
+                        $self.standard_memory_exception(addr, memory_access_width!($write_fn), true)
+                {
+                    return Some(reason);
+                }
+                match $self.$write_fn(addr, $val) {
                     Ok(()) => $self.pc = $next_pc,
                     Err(page) => return Some(ExitReason::PageFault(page)),
                 }
@@ -448,7 +791,14 @@ impl Interpreter {
         }
         macro_rules! step_load {
             ($self:expr, $dst:expr, $addr:expr, $read_fn:ident, |$v:ident| $conv:expr, $next_pc:expr) => {{
-                match $self.$read_fn($addr) {
+                let addr = $addr;
+                if $self.isa_mode == crate::IsaMode::Conformance
+                    && let Some(reason) =
+                        $self.standard_memory_exception(addr, memory_access_width!($read_fn), false)
+                {
+                    return Some(reason);
+                }
+                match $self.$read_fn(addr) {
                     Ok($v) => {
                         $self.registers[$dst] = $conv;
                         $self.pc = $next_pc;
@@ -475,10 +825,14 @@ impl Interpreter {
 
         // Fetch and validate opcode (eq A.19)
         let opcode_byte = self.zeta(pc);
-        let bitmask_valid = pc < self.bitmask.len() && self.bitmask[pc] == 1;
+        // The predecoded/JIT paths both materialize one synthetic opcode-0
+        // instruction exactly at end-of-code. Preserve the same sentinel in
+        // the stepping path; positions beyond it remain invalid.
+        let is_end_sentinel = pc == self.code.len();
+        let bitmask_valid = is_end_sentinel || (pc < self.bitmask.len() && self.bitmask[pc] == 1);
 
         let opcode = if bitmask_valid {
-            Opcode::from_byte(opcode_byte)
+            opcode_for_mode(opcode_byte, self.isa_mode)
         } else {
             None
         };
@@ -494,12 +848,18 @@ impl Interpreter {
         // Gas is charged at gas block entries: initial entry (PC=0) and after
         // terminators. Branch/jump targets are NOT gas block starts per spec
         // (Lean Interpreter.lean:130, GP PR #508).
-        if self.gas_model == crate::GasModel::BlockSinglePass && self.need_gas_charge {
-            let block_cost = self.block_gas_costs[pc] as u64;
+        let charges_jar_sentinel = is_end_sentinel && self.isa_mode == crate::IsaMode::Jar;
+        if self.gas_model == crate::GasModel::BlockPipeline
+            && (!self.gas_charged || charges_jar_sentinel)
+        {
+            let Some(block_cost) = self.containing_block_cost(self.pc) else {
+                return Some(ExitReason::Panic);
+            };
             if self.gas < block_cost {
                 return Some(ExitReason::OutOfGas);
             }
             self.gas -= block_cost;
+            self.gas_charged = true;
             self.need_gas_charge = false;
         }
 
@@ -528,8 +888,24 @@ impl Interpreter {
             Opcode::Invalid => return Some(ExitReason::Panic),
 
             // === A.5.1: No arguments ===
-            Opcode::Trap => return Some(ExitReason::Trap),
-            Opcode::Fallthrough | Opcode::Unlikely => {
+            Opcode::Trap => {
+                return Some(match self.isa_mode {
+                    crate::IsaMode::Jar => ExitReason::Trap,
+                    crate::IsaMode::Conformance => ExitReason::Panic,
+                });
+            }
+            Opcode::Fallthrough => {
+                if self.isa_mode == crate::IsaMode::Conformance {
+                    let (exit, new_pc) = self.sjump(u64::from(next_pc));
+                    if let Some(exit) = exit {
+                        return Some(exit);
+                    }
+                    self.pc = new_pc;
+                } else {
+                    self.pc = next_pc;
+                }
+            }
+            Opcode::Unlikely => {
                 self.pc = next_pc;
             }
 
@@ -542,6 +918,11 @@ impl Interpreter {
                 }
                 // Advance PC to next instruction before returning
                 self.pc = next_pc;
+                // Runtime Ecall is a JAR gas-block terminator.  The early
+                // return must carry the same unfunded-successor boundary that
+                // ordinary terminators install below.
+                self.gas_charged = false;
+                self.need_gas_charge = true;
                 // Exit with special ecall marker. Kernel reads φ[11]=op, φ[12]=subject|object.
                 return Some(ExitReason::Ecall);
             }
@@ -549,9 +930,22 @@ impl Interpreter {
             // === A.5.2: One immediate ===
             Opcode::Ecalli => {
                 if let Args::Imm { imm } = args {
+                    let host_id = match self.isa_mode {
+                        crate::IsaMode::Conformance => imm,
+                        // Preserve the frozen capability/JAR projection.
+                        crate::IsaMode::Jar => u64::from(imm as u32),
+                    };
                     // Advance PC to next instruction before returning (eq A.9)
                     self.pc = next_pc;
-                    return Some(ExitReason::HostCall(imm as u32));
+                    if self.isa_mode == crate::IsaMode::Conformance {
+                        self.pending_host_call = Some(crate::PendingHostCall {
+                            id: host_id,
+                            cause_pc: pc as u32,
+                            resume_pc: next_pc,
+                        });
+                        self.pc = pc as u32;
+                    }
+                    return Some(ExitReason::HostCall(host_id));
                 }
             }
 
@@ -588,7 +982,7 @@ impl Interpreter {
             // === A.5.5: One offset (jump) ===
             Opcode::Jump => {
                 if let Args::Offset { offset } = args {
-                    let (exit, new_pc) = self.branch(offset, true, next_pc);
+                    let (exit, new_pc) = self.sjump(offset);
                     if let Some(e) = exit {
                         return Some(e);
                     }
@@ -758,7 +1152,7 @@ impl Interpreter {
             Opcode::LoadImmJump => {
                 if let Args::RegImmOffset { ra, imm, offset } = args {
                     self.registers[ra] = imm;
-                    let (exit, new_pc) = self.branch(offset, true, next_pc);
+                    let (exit, new_pc) = self.sjump(offset);
                     if let Some(e) = exit {
                         return Some(e);
                     }
@@ -804,10 +1198,6 @@ impl Interpreter {
                     self.registers[rd] = self.registers[ra];
                     self.pc = next_pc;
                 }
-            }
-            Opcode::Sbrk => {
-                // JAR v0.8.0: sbrk removed from ISA, replaced by grow_heap hostcall
-                return Some(ExitReason::Panic);
             }
             Opcode::CountSetBits64 => {
                 if let Args::TwoReg { rd, ra } = args {
@@ -1606,7 +1996,8 @@ impl Interpreter {
 
         // After execution: if this instruction is a terminator, the next
         // instruction starts a new basic block and needs gas charging.
-        if opcode.is_terminator() {
+        if is_terminator_for_mode(opcode, self.isa_mode) {
+            self.gas_charged = false;
             self.need_gas_charge = true;
         }
 
@@ -1618,35 +2009,67 @@ impl Interpreter {
     /// Uses pre-decoded instructions for speed (avoids per-instruction
     /// decode overhead). Gas charges come from the pre-derived
     /// `DecodedInst::bb_gas_cost` labels: block costs at gas-block entries
-    /// under [`crate::GasModel::BlockSinglePass`], a flat 1 on every
+    /// under [`crate::GasModel::BlockPipeline`], a flat 1 on every
     /// instruction under [`crate::GasModel::PerInstruction`] (see
     /// [`Self::set_gas_model`]).
     /// Returns (exit_reason, gas_used).
     pub fn run(&mut self) -> (ExitReason, Gas) {
+        let result = self.run_inner();
+        if self.isa_mode == crate::IsaMode::Conformance
+            && matches!(result.0, ExitReason::Halt | ExitReason::Panic)
+        {
+            self.pc = 0;
+            self.pending_host_call = None;
+        }
+        result
+    }
+
+    fn run_inner(&mut self) -> (ExitReason, Gas) {
         // Macros for repetitive load/store dispatch arms. Each macro
         // expands to the same code as the hand-written variants, so there is
         // zero runtime overhead.
         macro_rules! do_store {
             ($self:expr, $exit:ident, $addr:expr, $write_fn:ident, $val:expr) => {{
-                if let Err(page) = $self.$write_fn($addr, $val) {
+                let addr = $addr;
+                if $self.isa_mode == crate::IsaMode::Conformance
+                    && let Some(reason) =
+                        $self.standard_memory_exception(addr, memory_access_width!($write_fn), true)
+                {
+                    $exit = Some(reason);
+                } else if let Err(page) = $self.$write_fn(addr, $val) {
                     $exit = Some(ExitReason::PageFault(page));
                 }
             }};
         }
         macro_rules! do_load {
             ($self:expr, $exit:ident, $dst:expr, $addr:expr, $read_fn:ident, |$v:ident| $conv:expr) => {{
-                match $self.$read_fn($addr) {
-                    Ok($v) => {
-                        $self.registers[$dst] = $conv;
-                    }
-                    Err(page) => {
-                        $exit = Some(ExitReason::PageFault(page));
+                let addr = $addr;
+                if $self.isa_mode == crate::IsaMode::Conformance
+                    && let Some(reason) =
+                        $self.standard_memory_exception(addr, memory_access_width!($read_fn), false)
+                {
+                    $exit = Some(reason);
+                } else {
+                    match $self.$read_fn(addr) {
+                        Ok($v) => {
+                            $self.registers[$dst] = $conv;
+                        }
+                        Err(page) => {
+                            $exit = Some(ExitReason::PageFault(page));
+                        }
                     }
                 }
             }};
         }
 
         let initial_gas = self.gas;
+
+        if self.isa_mode == crate::IsaMode::Conformance
+            && let Some(call) = self.pending_host_call
+        {
+            self.pc = call.cause_pc;
+            return (ExitReason::HostCall(call.id), 0);
+        }
 
         // If tracing is enabled, fall back to the slow step-by-step path
         if self.tracing_enabled {
@@ -1668,7 +2091,9 @@ impl Interpreter {
             if self.gas_model == crate::GasModel::PerInstruction && self.gas == 0 {
                 return (ExitReason::OutOfGas, 0);
             }
-            self.gas = self.gas.saturating_sub(1);
+            if self.isa_mode == crate::IsaMode::Jar {
+                self.gas = self.gas.saturating_sub(1);
+            }
             return (ExitReason::Panic, initial_gas - self.gas);
         }
 
@@ -1681,12 +2106,30 @@ impl Interpreter {
             // Gas charge from the pre-derived label: block cost at gas-block
             // entries (JAR v0.8.0), or a flat 1 on every instruction under
             // GasModel::PerInstruction (GP 0.7.2) — see set_gas_model().
-            if inst.bb_gas_cost > 0 {
-                if self.gas < inst.bb_gas_cost as u64 {
+            let charge = match self.gas_model {
+                crate::GasModel::PerInstruction => u64::from(inst.bb_gas_cost),
+                crate::GasModel::BlockPipeline if !self.gas_charged => match self.isa_mode {
+                    crate::IsaMode::Conformance => {
+                        let Some(cost) = self.containing_block_cost(inst.pc) else {
+                            self.pc = inst.pc;
+                            return (ExitReason::Panic, initial_gas - self.gas);
+                        };
+                        cost
+                    }
+                    crate::IsaMode::Jar => u64::from(inst.bb_gas_cost),
+                },
+                crate::GasModel::BlockPipeline => 0,
+            };
+            if charge > 0 {
+                if self.gas < charge {
                     self.pc = inst.pc;
                     return (ExitReason::OutOfGas, initial_gas - self.gas);
                 }
-                self.gas -= inst.bb_gas_cost as u64;
+                self.gas -= charge;
+            }
+            if self.gas_model == crate::GasModel::BlockPipeline {
+                self.gas_charged = true;
+                self.need_gas_charge = false;
             }
 
             // Fast-path execution using flat operands (no Args enum matching).
@@ -1704,9 +2147,19 @@ impl Interpreter {
             match inst.opcode {
                 // === No arguments ===
                 Opcode::Trap => {
-                    exit = Some(ExitReason::Trap);
+                    exit = Some(match self.isa_mode {
+                        crate::IsaMode::Jar => ExitReason::Trap,
+                        crate::IsaMode::Conformance => ExitReason::Panic,
+                    });
                 }
-                Opcode::Fallthrough | Opcode::Unlikely => {}
+                Opcode::Fallthrough => {
+                    if self.isa_mode == crate::IsaMode::Conformance
+                        && !self.is_basic_block_start(u64::from(next_pc))
+                    {
+                        exit = Some(ExitReason::Panic);
+                    }
+                }
+                Opcode::Unlikely => {}
                 Opcode::Invalid => {
                     exit = Some(ExitReason::Panic);
                 }
@@ -1717,13 +2170,31 @@ impl Interpreter {
                         return (ExitReason::Panic, initial_gas - self.gas);
                     }
                     self.pc = next_pc;
+                    // Runtime Ecall is a JAR gas-block terminator.  This arm
+                    // returns before the shared terminator bookkeeping below,
+                    // so install the successor boundary explicitly.
+                    self.gas_charged = false;
+                    self.need_gas_charge = true;
                     return (ExitReason::Ecall, initial_gas - self.gas);
                 }
 
                 // === One immediate ===
                 Opcode::Ecalli => {
-                    self.pc = next_pc;
-                    return (ExitReason::HostCall(imm1 as u32), initial_gas - self.gas);
+                    let host_id = match self.isa_mode {
+                        crate::IsaMode::Conformance => imm1,
+                        crate::IsaMode::Jar => u64::from(imm1 as u32),
+                    };
+                    if self.isa_mode == crate::IsaMode::Conformance {
+                        self.pc = inst.pc;
+                        self.pending_host_call = Some(crate::PendingHostCall {
+                            id: host_id,
+                            cause_pc: inst.pc,
+                            resume_pc: next_pc,
+                        });
+                    } else {
+                        self.pc = next_pc;
+                    }
+                    return (ExitReason::HostCall(host_id), initial_gas - self.gas);
                 }
 
                 // === One register + extended immediate ===
@@ -1767,10 +2238,6 @@ impl Interpreter {
                 // === Two registers ===
                 Opcode::MoveReg => {
                     self.registers[rd] = self.registers[ra];
-                }
-                Opcode::Sbrk => {
-                    // JAR v0.8.0: sbrk removed
-                    exit = Some(ExitReason::Panic);
                 }
                 Opcode::CountSetBits64 => {
                     self.registers[rd] = self.registers[ra].count_ones() as u64;
@@ -1951,7 +2418,14 @@ impl Interpreter {
                         Opcode::BranchGeS => (a as i64) >= (b as i64),
                         _ => unreachable!(),
                     };
-                    if cond {
+                    if self.isa_mode == crate::IsaMode::Conformance
+                        && (inst.target_idx == u32::MAX
+                            || !self.is_basic_block_start(u64::from(next_pc)))
+                    {
+                        // v0.8 validates both the explicit target and the
+                        // sequential successor before selecting either leg.
+                        exit = Some(ExitReason::Panic);
+                    } else if cond {
                         if inst.target_idx != u32::MAX {
                             branch_idx = inst.target_idx;
                         } else {
@@ -2380,7 +2854,14 @@ impl Interpreter {
                         Opcode::BranchGtSImm => (a as i64) > (b as i64),
                         _ => unreachable!(),
                     };
-                    if cond {
+                    if self.isa_mode == crate::IsaMode::Conformance
+                        && (inst.target_idx == u32::MAX
+                            || !self.is_basic_block_start(u64::from(next_pc)))
+                    {
+                        // v0.8 validates both the explicit target and the
+                        // sequential successor before selecting either leg.
+                        exit = Some(ExitReason::Panic);
+                    } else if cond {
                         if inst.target_idx != u32::MAX {
                             branch_idx = inst.target_idx;
                         } else {
@@ -2417,6 +2898,11 @@ impl Interpreter {
             if let Some(reason) = exit {
                 self.pc = inst.pc;
                 return (reason, initial_gas - self.gas);
+            }
+
+            if is_terminator_for_mode(inst.opcode, self.isa_mode) {
+                self.gas_charged = false;
+                self.need_gas_charge = true;
             }
 
             if branch_idx == u32::MAX {
@@ -2456,6 +2942,13 @@ impl Interpreter {
                 machine_after: self,
             });
             if let Some(exit) = exit {
+                if self.isa_mode == crate::IsaMode::Conformance {
+                    match exit {
+                        ExitReason::HostCall(_) => debug_assert_eq!(self.pc, pc_before),
+                        ExitReason::Halt | ExitReason::Panic => self.pc = 0,
+                        _ => {}
+                    }
+                }
                 return (exit, initial_gas.saturating_sub(self.gas));
             }
         }
@@ -2464,8 +2957,16 @@ impl Interpreter {
     /// Slow run path for tracing/stepping mode — uses step() with per-instruction gas.
     fn run_stepping(&mut self, initial_gas: Gas) -> (ExitReason, Gas) {
         loop {
+            let pc_before = self.pc;
             match self.step() {
                 Some(exit) => {
+                    if self.isa_mode == crate::IsaMode::Conformance {
+                        match exit {
+                            ExitReason::HostCall(_) => debug_assert_eq!(self.pc, pc_before),
+                            ExitReason::Halt | ExitReason::Panic => self.pc = 0,
+                            _ => {}
+                        }
+                    }
                     let gas_used = initial_gas - self.gas;
                     return (exit, gas_used);
                 }
@@ -2614,12 +3115,16 @@ pub fn skip_for_bitmask(bitmask: &[u8], pc: usize) -> usize {
 /// must land on one of these (validated at execution); gas blocks use the
 /// same boundaries (GP PR #508, grey PR #154).
 pub fn compute_basic_block_starts_with_skips(code: &[u8], bitmask: &[u8]) -> (Vec<bool>, Vec<u8>) {
-    let (starts, skip_table) = compute_bb_starts_inner(code, bitmask);
+    let (starts, skip_table) = compute_bb_starts_inner(code, bitmask, crate::IsaMode::Conformance);
     (starts, skip_table)
 }
 
 pub fn compute_basic_block_starts(code: &[u8], bitmask: &[u8]) -> Vec<bool> {
-    compute_bb_starts_inner(code, bitmask).0
+    compute_bb_starts_inner(code, bitmask, crate::IsaMode::Conformance).0
+}
+
+pub(crate) fn compute_runtime_basic_block_starts(code: &[u8], bitmask: &[u8]) -> Vec<bool> {
+    compute_bb_starts_inner(code, bitmask, crate::IsaMode::Jar).0
 }
 
 /// Compute gas block starts: {PC=0} ∪ {post-terminator PCs}.
@@ -2629,7 +3134,50 @@ pub fn compute_gas_block_starts(code: &[u8], bitmask: &[u8]) -> Vec<bool> {
     compute_basic_block_starts(code, bitmask)
 }
 
-fn compute_bb_starts_inner(code: &[u8], bitmask: &[u8]) -> (Vec<bool>, Vec<u8>) {
+/// Map each externally enterable instruction counter to the gas block that
+/// contains it. Argument-byte positions remain `u32::MAX`. The synthetic
+/// end-of-code opcode-zero position is included at `code.len()`.
+pub(crate) fn compute_gas_block_start_by_pc(
+    code: &[u8],
+    bitmask: &[u8],
+    basic_block_starts: &[bool],
+    isa_mode: crate::IsaMode,
+) -> Vec<u32> {
+    let mut result = vec![u32::MAX; code.len() + 1];
+    let mut current = None;
+    let mut last_terminates = true;
+    let mut pc = 0usize;
+
+    while pc < code.len() {
+        if pc >= bitmask.len() || bitmask[pc] != 1 {
+            pc += 1;
+            continue;
+        }
+        if current.is_none() || basic_block_starts.get(pc).copied().unwrap_or(false) {
+            current = Some(pc as u32);
+        }
+        if let Some(start) = current {
+            result[pc] = start;
+        }
+        let opcode = opcode_for_mode(code[pc], isa_mode);
+        last_terminates = opcode.is_some_and(|opcode| is_terminator_for_mode(opcode, isa_mode));
+        pc += 1 + skip_for_bitmask(bitmask, pc);
+    }
+
+    let sentinel_start = if current.is_none() || last_terminates {
+        code.len() as u32
+    } else {
+        current.unwrap_or(code.len() as u32)
+    };
+    result[code.len()] = sentinel_start;
+    result
+}
+
+fn compute_bb_starts_inner(
+    code: &[u8],
+    bitmask: &[u8],
+    isa_mode: crate::IsaMode,
+) -> (Vec<bool>, Vec<u8>) {
     let len = code.len();
     if len == 0 {
         return (vec![], vec![]);
@@ -2639,7 +3187,7 @@ fn compute_bb_starts_inner(code: &[u8], bitmask: &[u8]) -> (Vec<bool>, Vec<u8>) 
     let mut skip_table = vec![0u8; len];
 
     // Index 0 is always a basic block start if it's a valid instruction
-    if !bitmask.is_empty() && bitmask[0] == 1 && Opcode::from_byte(code[0]).is_some() {
+    if !bitmask.is_empty() && bitmask[0] == 1 && opcode_for_mode(code[0], isa_mode).is_some() {
         starts[0] = true;
     }
 
@@ -2650,7 +3198,7 @@ fn compute_bb_starts_inner(code: &[u8], bitmask: &[u8]) -> (Vec<bool>, Vec<u8>) 
             i += 1;
             continue;
         }
-        let Some(op) = Opcode::from_byte(code[i]) else {
+        let Some(op) = opcode_for_mode(code[i], isa_mode) else {
             i += 1;
             continue;
         };
@@ -2670,7 +3218,7 @@ fn compute_bb_starts_inner(code: &[u8], bitmask: &[u8]) -> (Vec<bool>, Vec<u8>) 
         };
         skip_table[i] = skip as u8;
 
-        if op.is_terminator() {
+        if is_terminator_for_mode(op, isa_mode) {
             // The instruction after a terminator starts a new block
             let next = i + 1 + skip;
             if next < len && next < bitmask.len() && bitmask[next] == 1 {
@@ -2688,7 +3236,20 @@ fn compute_bb_starts_inner(code: &[u8], bitmask: &[u8]) -> (Vec<bool>, Vec<u8>) 
     (starts, skip_table)
 }
 
-/// Compute the gas cost for each basic block using single-pass gas model (JAR v0.8.0).
+#[inline(always)]
+fn opcode_for_mode(byte: u8, isa_mode: crate::IsaMode) -> Option<Opcode> {
+    Opcode::from_byte_in_mode(byte, isa_mode)
+}
+
+#[inline(always)]
+fn is_terminator_for_mode(opcode: Opcode, isa_mode: crate::IsaMode) -> bool {
+    match isa_mode {
+        crate::IsaMode::Jar => opcode.is_runtime_terminator(),
+        crate::IsaMode::Conformance => opcode.is_terminator(),
+    }
+}
+
+/// Compute each basic block's profile-selected pipeline gas cost.
 ///
 /// Uses the same GasSimulator as the recompiler — single code path.
 /// Gas is charged per basic block at block entry: max(max_done - 3, 1).
@@ -2697,15 +3258,17 @@ fn compute_block_gas_costs(
     bitmask: &[u8],
     basic_block_starts: &[bool],
     mem_cycles: u8,
+    isa_mode: crate::IsaMode,
 ) -> Vec<u32> {
     use crate::gas_cost::{fast_cost_from_raw, skip_distance};
     use crate::gas_sim::GasSimulator;
 
     let len = code.len();
     let mut costs = vec![0u32; len];
-    let mut sim = GasSimulator::new();
+    let mut sim = GasSimulator::new_for_mode(isa_mode);
     let mut block_start: usize = 0;
     let mut in_block = false;
+    let mut last_was_terminator = true;
 
     let mut pc = 0;
     while pc < len {
@@ -2730,14 +3293,31 @@ fn compute_block_gas_costs(
         // gas model sees the same register operands that execution does.
         // (0xFF here would clamp to register 12 via reg_bit, a spurious
         // dependency that diverges from the recompiler.)
-        let opcode_byte = code[pc];
+        let raw_opcode = code[pc];
+        let opcode_byte = match (isa_mode, raw_opcode) {
+            // Keep the retired manifest-only sbrk cost out of the standard
+            // opcode table. It always traps after its containing block is
+            // charged.
+            (crate::IsaMode::Jar, 101) => 254,
+            _ => opcode_for_mode(raw_opcode, isa_mode)
+                .map(|opcode| opcode as u8)
+                .unwrap_or(raw_opcode),
+        };
         let raw_ra = if pc + 1 < len { code[pc + 1] & 0x0F } else { 0 };
         let raw_rb = if pc + 1 < len {
             (code[pc + 1] >> 4) & 0x0F
         } else {
             0
         };
-        let raw_rd = if pc + 2 < len { code[pc + 2] & 0x0F } else { 0 };
+        let raw_rd = if pc + 2 < len {
+            match isa_mode {
+                // A.5.13 clamps the complete encoded rD byte.
+                crate::IsaMode::Conformance => code[pc + 2],
+                crate::IsaMode::Jar => code[pc + 2] & 0x0f,
+            }
+        } else {
+            0
+        };
 
         let fc = fast_cost_from_raw(
             opcode_byte,
@@ -2748,8 +3328,10 @@ fn compute_block_gas_costs(
             code,
             bitmask,
             mem_cycles,
+            isa_mode,
         );
         sim.feed(&fc);
+        last_was_terminator = fc.is_terminator;
 
         // Advance to next instruction
         let skip = skip_distance(bitmask, pc);
@@ -2758,6 +3340,19 @@ fn compute_block_gas_costs(
 
     // Finalize last block
     if in_block {
+        if isa_mode == crate::IsaMode::Conformance && !last_was_terminator {
+            // ζ is zero-extended, so falling off an unterminated program
+            // decodes opcode 0 in the same basic block.
+            sim.feed(&crate::gas_cost::FastCost {
+                cycles: 2,
+                decode_slots: 1,
+                exec_unit: 0,
+                src_mask: 0,
+                dst_mask: 0,
+                is_terminator: true,
+                is_move_reg: false,
+            });
+        }
         costs[block_start] = sim.flush_and_get_cost();
     }
 
@@ -2799,6 +3394,7 @@ fn predecode_instructions(
     basic_block_starts: &[bool],
     gas_block_starts: &[bool],
     block_gas_costs: &[u32],
+    isa_mode: crate::IsaMode,
 ) -> (Vec<DecodedInst>, Vec<u32>) {
     let len = code.len();
     let mut insts = Vec::new();
@@ -2819,7 +3415,7 @@ fn predecode_instructions(
     while pc < len {
         #[allow(clippy::collapsible_if)] // let-chain requires Rust 2024
         if pc < bitmask.len() && bitmask[pc] == 1 {
-            if Opcode::from_byte(code[pc]).is_none() {
+            if opcode_for_mode(code[pc], isa_mode).is_none() {
                 // Invalid opcode at an instruction start: emit a synthetic
                 // panic instruction. Sequential advance in the fast loop must
                 // execute (and panic at) this position — silently skipping it
@@ -2847,7 +3443,7 @@ fn predecode_instructions(
                 pc += 1;
                 continue;
             }
-            if let Some(opcode) = Opcode::from_byte(code[pc]) {
+            if let Some(opcode) = opcode_for_mode(code[pc], isa_mode) {
                 let skip = skip_at(pc);
                 let next_pc = (pc + 1 + skip) as u32;
                 let category = opcode.category();
@@ -2927,7 +3523,15 @@ fn predecode_instructions(
         next_pc: len as u32 + 1,
         next_idx: sentinel_idx, // self-loop (will trap anyway)
         target_idx: u32::MAX,
-        bb_gas_cost: 1, // charge 1 gas for the trap
+        bb_gas_cost: match isa_mode {
+            crate::IsaMode::Jar => 1,
+            crate::IsaMode::Conformance => {
+                let starts_block = insts
+                    .last()
+                    .is_none_or(|inst| is_terminator_for_mode(inst.opcode, isa_mode));
+                u32::from(starts_block) * 2
+            }
+        },
     });
 
     // Second pass: resolve next_idx and target_idx for all instructions.
@@ -3005,6 +3609,72 @@ fn predecode_instructions(
 mod tests {
     use super::*;
 
+    #[test]
+    fn standard_scalar_permission_fast_path_matches_ordered_byte_walk() {
+        fn reference(vm: &Interpreter, addr: u32, width: usize, write: bool) -> Option<ExitReason> {
+            for offset in 0..width {
+                let byte = addr.wrapping_add(offset as u32);
+                if byte < crate::PVM_ZONE_SIZE {
+                    return Some(ExitReason::Panic);
+                }
+                let accessible = if write {
+                    vm.mem.is_writable(byte, 1)
+                } else {
+                    vm.mem.is_readable(byte, 1)
+                };
+                if !accessible {
+                    return Some(ExitReason::PageFault(byte & !(crate::PVM_PAGE_SIZE - 1)));
+                }
+            }
+            None
+        }
+        let page = crate::PVM_PAGE_SIZE;
+        let zone = crate::PVM_ZONE_SIZE;
+        let span = zone + 3 * page;
+        for memory in [
+            Memory::flat(vec![0; span as usize]),
+            Memory::sparse(1u64 << 32),
+        ] {
+            let mut vm = Interpreter::with_memory(
+                vec![],
+                vec![],
+                vec![],
+                [0; 13],
+                memory,
+                100,
+                crate::gas_cost::DEFAULT_MEM_CYCLES,
+            );
+            let pages = vm.mem.page_perms().len();
+            for a in [PERM_NONE, PERM_RO, PERM_RW] {
+                for b in [PERM_NONE, PERM_RO, PERM_RW] {
+                    for c in [PERM_NONE, PERM_RO, PERM_RW] {
+                        let mut perms = vec![PERM_NONE; pages];
+                        perms[(zone / page) as usize..(zone / page) as usize + 3]
+                            .copy_from_slice(&[a, b, c]);
+                        if pages > (span / page) as usize {
+                            perms[pages - 2..].copy_from_slice(&[a, b]);
+                        }
+                        vm.set_page_perms(perms);
+                        for boundary in [0, zone, zone + page, zone + 2 * page, span, u32::MAX] {
+                            for delta in -8i32..=8 {
+                                let addr = boundary.wrapping_add_signed(delta);
+                                for width in [1, 2, 4, 8] {
+                                    for write in [false, true] {
+                                        assert_eq!(
+                                            vm.standard_memory_exception(addr, width, write),
+                                            reference(&vm, addr, width, write),
+                                            "addr={addr:#x} width={width} write={write} perms={a},{b},{c}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Helper to create a VM with simple bitmask (every byte is instruction start).
     fn simple_vm(code: Vec<u8>, gas: Gas) -> Interpreter {
         Interpreter::new_simple(code, [0; 13], Vec::new(), gas)
@@ -3015,6 +3685,82 @@ mod tests {
         let mut vm = simple_vm(vec![0], 100); // trap = opcode 0
         let (exit, _) = vm.run();
         assert_eq!(exit, ExitReason::Trap);
+    }
+
+    #[test]
+    fn opcode_zero_exit_is_profile_specific_on_fast_and_stepping_paths() {
+        for tracing in [false, true] {
+            let mut jar = simple_vm(vec![0], 100);
+            jar.tracing_enabled = tracing;
+            assert_eq!(jar.run().0, ExitReason::Trap, "JAR tracing={tracing}");
+
+            let mut standard = simple_vm(vec![0], 100);
+            standard.set_isa_mode(crate::IsaMode::Conformance);
+            standard.tracing_enabled = tracing;
+            assert_eq!(
+                standard.run().0,
+                ExitReason::Panic,
+                "v0.8 tracing={tracing}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_opcode_panics_in_both_profiles() {
+        for isa_mode in [crate::IsaMode::Jar, crate::IsaMode::Conformance] {
+            let mut vm = simple_vm(vec![u8::MAX], 100);
+            vm.set_isa_mode(isa_mode);
+            assert_eq!(vm.run().0, ExitReason::Panic, "{isa_mode:?}");
+        }
+    }
+
+    #[test]
+    fn private_ecall_exit_is_profile_specific() {
+        let mut jar = simple_vm(vec![Opcode::Ecall as u8], 100);
+        assert_eq!(jar.run().0, ExitReason::Ecall);
+
+        let mut standard = simple_vm(vec![Opcode::Ecall as u8], 100);
+        standard.set_isa_mode(crate::IsaMode::Conformance);
+        assert_eq!(standard.run().0, ExitReason::Panic);
+    }
+
+    #[test]
+    fn private_ecall_resume_opens_a_fresh_jar_gas_block() {
+        // Ecall is a private JAR terminator.  Its successor therefore starts
+        // a separately funded block even though execution first returns to
+        // the capability kernel at the Ecall boundary.
+        let code = vec![
+            Opcode::Ecall as u8,
+            Opcode::Unlikely as u8,
+            Opcode::Trap as u8,
+        ];
+        let bitmask = vec![1, 1, 1];
+
+        // Exercise both the predecoded fast loop and the step-driven tracing
+        // loop: both have an early Ecall return before common terminator
+        // bookkeeping.
+        for tracing in [false, true] {
+            let mut vm = Interpreter::new(
+                code.clone(),
+                bitmask.clone(),
+                vec![],
+                [0; 13],
+                vec![],
+                1_000,
+                crate::gas_cost::DEFAULT_MEM_CYCLES,
+            );
+            vm.tracing_enabled = tracing;
+            let first_cost = u64::from(vm.block_gas_costs[0]);
+            let successor_cost = u64::from(vm.block_gas_costs[1]);
+
+            assert_eq!(vm.run(), (ExitReason::Ecall, first_cost));
+            assert_eq!(vm.pc, 1);
+            assert!(!vm.gas_charged, "tracing={tracing}");
+            assert!(vm.need_gas_charge, "tracing={tracing}");
+
+            assert_eq!(vm.run(), (ExitReason::Trap, successor_cost));
+            assert_eq!(vm.gas, 1_000 - first_cost - successor_cost);
+        }
     }
 
     #[test]
@@ -3037,12 +3783,22 @@ mod tests {
 
     #[test]
     fn test_empty_program() {
-        let mut vm = simple_vm(vec![], 100);
-        // PC=0 is already the end of code: the implicit trailing trap fires
-        // (GP: code beyond the end reads as opcode 0 = trap). Both backends
-        // agree — the JIT emits the same trailing trap block.
-        let (exit, _) = vm.run();
-        assert_eq!(exit, ExitReason::Trap);
+        // PC=0 is already the end of code. The synthetic opcode 0 has the
+        // same profile-specific classification on both interpreter paths.
+        for tracing in [false, true] {
+            let mut jar = simple_vm(vec![], 100);
+            jar.tracing_enabled = tracing;
+            assert_eq!(jar.run().0, ExitReason::Trap, "JAR tracing={tracing}");
+
+            let mut standard = simple_vm(vec![], 100);
+            standard.set_isa_mode(crate::IsaMode::Conformance);
+            standard.tracing_enabled = tracing;
+            assert_eq!(
+                standard.run().0,
+                ExitReason::Panic,
+                "v0.8 tracing={tracing}"
+            );
+        }
     }
 
     #[test]
@@ -3263,6 +4019,7 @@ mod tests {
 
     #[test]
     fn test_reverse_bytes() {
+        // Capability manifests retain the frozen pre-v0.8 opcode 111.
         let code = vec![111, 0x10, 0]; // reverse_bytes rD=0, rA=1
         let bitmask = vec![1, 0, 1];
         let mut regs = [0u64; 13];
@@ -3278,6 +4035,31 @@ mod tests {
         );
         vm.step();
         assert_eq!(vm.registers[0], 0xEFCDAB8967452301);
+    }
+
+    #[test]
+    fn standard_unary_opcodes_use_the_v080_table() {
+        let run = |opcode, value| {
+            let code = vec![opcode, 0x10, 0];
+            let bitmask = vec![1, 0, 1];
+            let mut regs = [0u64; 13];
+            regs[1] = value;
+            let mut vm = Interpreter::with_memory_and_mode(
+                code,
+                bitmask,
+                vec![],
+                regs,
+                Memory::flat(Vec::new()),
+                100,
+                crate::gas_cost::DEFAULT_MEM_CYCLES,
+                crate::IsaMode::Conformance,
+            );
+            vm.step();
+            vm.registers[0]
+        };
+
+        assert_eq!(run(101, 0xff), 8);
+        assert_eq!(run(110, 0x0123_4567_89ab_cdef), 0xefcd_ab89_6745_2301);
     }
 
     // ========================================================================
@@ -3355,6 +4137,35 @@ mod tests {
     }
 
     #[test]
+    fn graypaper_markers_and_host_calls_do_not_split_basic_blocks() {
+        // unlikely; ecalli(7); load_imm r0, 1; trap
+        let code = vec![2, 10, 7, 51, 0, 1, 0];
+        let bitmask = vec![1, 1, 0, 1, 0, 0, 1];
+        let starts = compute_basic_block_starts(&code, &bitmask);
+
+        assert!(starts[0]);
+        assert!(!starts[1], "unlikely is not in Gray Paper set T");
+        assert!(!starts[3], "ecalli is not in Gray Paper set T");
+        assert!(
+            !starts[6],
+            "the trap itself ends, rather than starts, a block"
+        );
+    }
+
+    #[test]
+    fn runtime_opcode_three_keeps_its_private_resume_boundary() {
+        let code = vec![Opcode::Ecall as u8, Opcode::Trap as u8];
+        let bitmask = vec![1, 1];
+
+        let standard = compute_basic_block_starts(&code, &bitmask);
+        assert!(!standard[0], "opcode 3 is outside standard opcode set U");
+
+        let runtime = compute_runtime_basic_block_starts(&code, &bitmask);
+        assert!(runtime[0]);
+        assert!(runtime[1], "runtime ecall requires a resumable boundary");
+    }
+
+    #[test]
     fn test_block_gas_costs_only_at_gas_block_starts() {
         let (code, bitmask) = branch_target_mid_block_program();
         let gas_starts = compute_gas_block_starts(&code, &bitmask);
@@ -3363,6 +4174,7 @@ mod tests {
             &bitmask,
             &gas_starts,
             crate::gas_cost::DEFAULT_MEM_CYCLES,
+            crate::IsaMode::Conformance,
         );
 
         // Gas costs should be nonzero only at gas block starts
@@ -3721,7 +4533,7 @@ mod tests {
         );
         toggled.set_gas_model(crate::GasModel::PerInstruction);
         assert_eq!(toggled.gas_model(), crate::GasModel::PerInstruction);
-        toggled.set_gas_model(crate::GasModel::BlockSinglePass);
+        toggled.set_gas_model(crate::GasModel::BlockPipeline);
         let (toggle_exit, toggle_gas) = toggled.run();
 
         assert_eq!(block_exit, toggle_exit);

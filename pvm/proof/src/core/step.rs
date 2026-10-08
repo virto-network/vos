@@ -65,6 +65,10 @@ pub struct PvmStep {
     pub gas_charged: u64,
     /// Program counter after execution.
     pub next_pc: u32,
+    /// Whether the embedder successfully handled and acknowledged this
+    /// Standard-profile host call. False for non-host instructions,
+    /// unhandled Standard calls, and every frozen JAR-profile instruction.
+    pub host_call_acknowledged: bool,
     /// Whether this step caused an exit.
     pub exit: bool,
 }
@@ -132,6 +136,9 @@ pub struct CompactStep {
     pub gas_charged: u64,
     /// Program counter after execution.
     pub next_pc: u32,
+    /// Whether the embedder successfully handled and acknowledged this
+    /// Standard-profile host call (see [`PvmStep::host_call_acknowledged`]).
+    pub host_call_acknowledged: bool,
     /// Whether this step caused an exit.
     pub exit: bool,
 }
@@ -166,6 +173,7 @@ impl CompactStep {
             gas_after: self.gas_after,
             gas_charged: self.gas_charged,
             next_pc: self.next_pc,
+            host_call_acknowledged: self.host_call_acknowledged,
             exit: self.exit,
         }
     }
@@ -210,6 +218,7 @@ impl PvmStep {
             gas_after: self.gas_after,
             gas_charged: self.gas_charged,
             next_pc: self.next_pc,
+            host_call_acknowledged: self.host_call_acknowledged,
             exit: self.exit,
         }
     }
@@ -271,6 +280,7 @@ mod tests {
             gas_after: 1000 - ts,
             gas_charged: u64::from(ts == 1),
             next_pc: ts as u32 * 3 + 4,
+            host_call_acknowledged: ts == 2,
             exit: false,
         }
     }

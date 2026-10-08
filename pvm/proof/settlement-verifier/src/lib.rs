@@ -610,7 +610,7 @@ pub fn verify_segment(
 // constraint count is irrelevant to verify COST (FRI verify + Poseidon2 Merkle
 // decommit + OODS dominate, independent of the AIR), so it is a representative
 // stand-in for measuring on-chain settlement-verify cycles without carrying the
-// full 31-chip segment AIR. MUST stay identical to the prover-side `BoolEval`
+// full canonical segment AIR. MUST stay identical to the prover-side `BoolEval`
 // in `pvm/proof/tests/settle_fixture.rs` (same `FIXTURE_LOG`, same constraint), or
 // the verifier replays a different AIR and rejects the honest proof.
 

@@ -1,15 +1,28 @@
+use alloc::sync::Arc;
 use std::collections::HashMap;
 
 use crate::core::step::{CompactStep, NUM_REGS, PvmStep, expand_steps};
+
+/// Canonical proof-visible ISA tag. Keep standard v0.8 at zero so the tag is
+/// an explicit protocol discriminator rather than a Rust enum-layout detail.
+pub(crate) const fn isa_profile_tag(mode: vos_pvm::IsaMode) -> u8 {
+    match mode {
+        vos_pvm::IsaMode::Conformance => 0,
+        vos_pvm::IsaMode::Jar => 1,
+    }
+}
 
 /// Prover's side note used for tracking additional data for trace generation.
 pub struct SideNote {
     /// The execution trace steps.
     pub steps: Vec<PvmStep>,
+    /// ISA profile used to decode and execute `code`. ProgramMemoryChip
+    /// commits this tag and authenticates it on every fetched instruction.
+    pub isa_mode: vos_pvm::IsaMode,
     /// Program bytecode.
-    pub code: Vec<u8>,
+    pub code: Arc<[u8]>,
     /// Bitmask for instruction validation.
-    pub bitmask: Vec<u8>,
+    pub bitmask: Arc<[u8]>,
     /// Range check accumulator: counts of each byte value 0..255.
     pub range256_counts: Vec<u32>,
     /// Bitwise AND nibble lookup counts: (a, b) → multiplicity, for the
@@ -25,6 +38,11 @@ pub struct SideNote {
     /// The MemoryChip injects synthetic writes at timestamp 0 for addresses
     /// that are read without a prior write.
     pub initial_memory: Vec<u8>,
+    /// Canonical sorted non-zero pages for a sparse 32-bit memory image.
+    /// Mutually exclusive with `initial_memory`; Refine proof tracing uses
+    /// this form so the high stack/input pages never imply a dense 4 GiB
+    /// allocation.
+    pub sparse_initial_memory: Option<crate::SparseMemoryImage>,
     /// Number of initial memory entries injected (set by MemoryChip).
     pub num_initial_mem_entries: usize,
     /// Power-of-two lookup counts: shift_amount → multiplicity (set by CpuChip).
@@ -131,7 +149,7 @@ pub struct SideNote {
     /// commits to it via its preprocessed Addr/Target columns; CpuChip's
     /// JumpInd consumer demands `(addr=val_b+imm, target=next_pc)`
     /// against that table, balancing dispatch-by-runtime-index.
-    pub jump_table: Vec<u32>,
+    pub jump_table: Arc<[u32]>,
     /// Per-jump-table-index count of JumpInd dispatches.  Indexed
     /// by `addr/2 - 1` where `addr = (regs[reg_a] + imm) mod 2^32`; entry N
     /// = number of times the program dispatched through `jump_table[N]`.
@@ -193,6 +211,8 @@ pub struct CompactTrace {
     /// Register file entering `steps[0]` (the interpreter's seeded file) —
     /// the base the per-step [`crate::core::step::RegWrite`]s thread from.
     pub initial_regs: [u64; NUM_REGS],
+    /// ISA profile used by the traced execution.
+    pub isa_mode: vos_pvm::IsaMode,
     /// Program bytecode.
     pub code: Vec<u8>,
     /// Bitmask for instruction validation.
@@ -230,6 +250,7 @@ impl CompactTrace {
     pub fn into_side_note(self) -> SideNote {
         let steps = expand_steps(&self.steps, self.initial_regs);
         let mut sn = SideNote::new(steps, self.code, self.bitmask)
+            .with_isa_mode(self.isa_mode)
             .with_memory(self.initial_memory)
             .with_jump_table(self.jump_table);
         sn.blake2b_calls = self.blake2b_calls;
@@ -423,14 +444,23 @@ pub struct RistrettoCombCall {
 
 impl SideNote {
     pub fn new(steps: Vec<PvmStep>, code: Vec<u8>, bitmask: Vec<u8>) -> Self {
+        Self::new_shared(steps, code.into(), bitmask.into())
+    }
+
+    /// Construct a side note while sharing immutable program artifacts.
+    /// Refine uses this across machine slices so repeated boundaries retain
+    /// one program allocation rather than one copy per child proof.
+    pub(crate) fn new_shared(steps: Vec<PvmStep>, code: Arc<[u8]>, bitmask: Arc<[u8]>) -> Self {
         Self {
             steps,
+            isa_mode: vos_pvm::IsaMode::Conformance,
             code,
             bitmask,
             range256_counts: vec![0u32; 256],
             bitwise_and_counts: HashMap::new(),
             bitwise_and_byte_counts: vec![0u32; 1 << 16],
             initial_memory: Vec::new(),
+            sparse_initial_memory: None,
             num_initial_mem_entries: 0,
             power_of_two_counts: vec![0u32; 64],
             popcount_counts: vec![0u32; 256],
@@ -454,7 +484,7 @@ impl SideNote {
             final_regs: [0u64; NUM_REGS],
             closing_chip_active: false,
             program_memory_counts: HashMap::new(),
-            jump_table: Vec::new(),
+            jump_table: Arc::from([]),
             jump_table_counts: Vec::new(),
             mul_entries: Vec::new(),
             bitwise_entries: Vec::new(),
@@ -465,6 +495,12 @@ impl SideNote {
             #[cfg(feature = "prover")]
             memory_pages: None,
         }
+    }
+
+    /// Bind this proof witness to the execution profile used by the tracer.
+    pub fn with_isa_mode(mut self, isa_mode: vos_pvm::IsaMode) -> Self {
+        self.isa_mode = isa_mode;
+        self
     }
 
     /// Build the memory-page Merkle boundary payload for this segment
@@ -480,22 +516,54 @@ impl SideNote {
         use crate::page_merkle;
         let mut touched = page_merkle::touched_pages(self);
         touched.insert(0); // never-empty page set (design §0)
-        let exiting = crate::segment::replay_writes(self, None);
-        let mp = page_merkle::build_multiproof(&self.initial_memory, &exiting, &touched);
+        let sparse_exiting = self
+            .sparse_initial_memory
+            .as_ref()
+            .map(|_| crate::segment::replay_sparse_writes(self, None));
+        let dense_exiting = sparse_exiting
+            .is_none()
+            .then(|| crate::segment::replay_writes(self, None));
+        let mp = match (&self.sparse_initial_memory, &sparse_exiting) {
+            (Some(entering), Some(exiting)) => {
+                page_merkle::build_sparse_multiproof(entering, exiting, &touched)
+            }
+            _ => page_merkle::build_multiproof(
+                &self.initial_memory,
+                dense_exiting.as_deref().unwrap_or_default(),
+                &touched,
+            ),
+        };
         // Unique compressions with per-consumption multiplicities: the
         // page/merge chips emit −1 per consumption, the boundary chip
         // produces +EmitMult per unique compression — same balance design
         // §4's one-block-per-consumption scheme held, at far fewer rows.
-        let (calls, mults) =
-            page_merkle::boundary_blake2b_calls(&mp, &self.initial_memory, &exiting);
+        let (calls, mults) = match (&self.sparse_initial_memory, &sparse_exiting) {
+            (Some(entering), Some(exiting)) => {
+                page_merkle::sparse_boundary_blake2b_calls(&mp, entering, exiting)
+            }
+            _ => page_merkle::boundary_blake2b_calls(
+                &mp,
+                &self.initial_memory,
+                dense_exiting.as_deref().unwrap_or_default(),
+            ),
+        };
         self.merkle_blake2b_calls = calls;
         self.merkle_blake2b_mults = mults;
         let pages = touched
             .iter()
-            .map(|&p| MemoryPageImage {
-                page_idx: p,
-                before: page_merkle::page_bytes(&self.initial_memory, p).to_vec(),
-                after: page_merkle::page_bytes(&exiting, p).to_vec(),
+            .map(|&p| {
+                let (before, after) = match (&self.sparse_initial_memory, &sparse_exiting) {
+                    (Some(entering), Some(exiting)) => (entering.page(p), exiting.page(p)),
+                    _ => (
+                        page_merkle::page_bytes(&self.initial_memory, p),
+                        page_merkle::page_bytes(dense_exiting.as_deref().unwrap_or_default(), p),
+                    ),
+                };
+                MemoryPageImage {
+                    page_idx: p,
+                    before: before.to_vec(),
+                    after: after.to_vec(),
+                }
             })
             .collect();
         self.memory_pages = Some(MemoryPagePayload {
@@ -509,6 +577,11 @@ impl SideNote {
     /// table.  No-op for programs that don't use JumpInd / LoadImmJumpInd
     /// (the chip then has zero-multiplicity rows).
     pub fn with_jump_table(mut self, jump_table: Vec<u32>) -> Self {
+        self = self.with_shared_jump_table(jump_table.into());
+        self
+    }
+
+    pub(crate) fn with_shared_jump_table(mut self, jump_table: Arc<[u32]>) -> Self {
         self.jump_table_counts = vec![0u32; jump_table.len()];
         self.jump_table = jump_table;
         self
@@ -516,7 +589,31 @@ impl SideNote {
 
     pub fn with_memory(mut self, flat_mem: Vec<u8>) -> Self {
         self.initial_memory = flat_mem;
+        self.sparse_initial_memory = None;
         self
+    }
+
+    /// Attach a canonical sparse entering-memory image.
+    pub fn with_sparse_memory(mut self, image: crate::SparseMemoryImage) -> Self {
+        self.initial_memory.clear();
+        self.sparse_initial_memory = Some(image);
+        self
+    }
+
+    pub(crate) fn has_initial_memory(&self) -> bool {
+        !self.initial_memory.is_empty() || self.sparse_initial_memory.is_some()
+    }
+
+    pub(crate) fn initial_memory_byte(&self, address: u32) -> u8 {
+        self.sparse_initial_memory.as_ref().map_or_else(
+            || {
+                self.initial_memory
+                    .get(address as usize)
+                    .copied()
+                    .unwrap_or(0)
+            },
+            |image| image.byte(address),
+        )
     }
 
     pub fn with_initial_regs(mut self, regs: [u64; NUM_REGS]) -> Self {

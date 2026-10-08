@@ -33,7 +33,7 @@ pub const ECALL_SCALAR_ADD_MOD_L: u32 = 114;
 /// Mirrors `vos_pvm_proof::core::ecall::ECALL_BLAKE2B_COMPRESS`.
 /// Convention: φ[10]=h_ptr (64B in/out), φ[11]=m_ptr (128B in),
 /// φ[12]=t_low (counter low 64 bits), φ[7]=f (finalize flag).
-pub const ECALL_BLAKE2B_COMPRESS: u32 = 100;
+pub const ECALL_BLAKE2B_COMPRESS: u32 = 0x400;
 
 /// VOS object capability slot used by the inline-asm ECALL dispatch.
 /// Set into `a5` on every call.  Only referenced from

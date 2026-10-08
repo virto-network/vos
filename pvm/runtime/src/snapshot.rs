@@ -7,7 +7,7 @@
 use alloc::vec::Vec;
 
 /// Current portable kernel snapshot wire version.
-pub const KERNEL_SNAPSHOT_VERSION: u16 = 3;
+pub const KERNEL_SNAPSHOT_VERSION: u16 = 5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, scale::Encode, scale::Decode)]
 pub enum SnapshotIsaMode {
@@ -76,8 +76,18 @@ pub struct VmSnapshot {
     pub caller: Option<u16>,
     pub entry_index: u32,
     pub gas: u64,
+    pub gas_charged: bool,
+    pub pending_host_call: Option<PendingHostCallSnapshot>,
+    pub pending_page_fault: Option<u32>,
     pub heap_base: u32,
     pub heap_top: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, scale::Encode, scale::Decode)]
+pub struct PendingHostCallSnapshot {
+    pub id: u64,
+    pub cause_pc: u32,
+    pub resume_pc: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, scale::Encode, scale::Decode)]
@@ -99,15 +109,31 @@ pub struct CallFrameSnapshot {
     pub ipc_cap_idx: Option<u8>,
     pub ipc_base_page: Option<u32>,
     pub ipc_access: Option<SnapshotAccess>,
+    /// Exact sparse mapping to restore when the IPC DATA cap returns.
+    pub ipc_mapped_bitmap: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, scale::Encode, scale::Decode)]
 pub struct PendingProtocolCall {
     pub slot: u8,
+    /// Immediate/capability slot encoded by the causing `ecalli`.
+    pub host_call_id: u64,
     pub vm_index: u16,
+    /// Architectural PC of the causing `ecalli` while it is suspended.
+    pub cause_pc: u32,
     /// PC immediately after the protocol-call instruction.
     pub resume_pc: u32,
+    /// The containing block was funded before the host exit.
+    pub gas_charged: bool,
     pub result_registers: [u8; 2],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, scale::Encode, scale::Decode)]
+pub struct PendingPageFault {
+    pub vm_index: u16,
+    pub address: u32,
+    pub cause_pc: u32,
+    pub gas_charged: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, scale::Encode, scale::Decode)]
@@ -144,7 +170,8 @@ pub struct KernelSnapshot {
     /// Deduplicated page contents. Blocks may be stored independently by a
     /// content-addressed continuation store.
     pub blocks: Vec<MemoryBlock>,
-    pub pending_call: PendingProtocolCall,
+    pub pending_call: Option<PendingProtocolCall>,
+    pub pending_fault: Option<PendingPageFault>,
 }
 
 impl KernelSnapshot {

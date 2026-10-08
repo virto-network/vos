@@ -40,7 +40,7 @@ fn trace_cmov_imm(
     let mut regs = [0u64; vos_pvm::PVM_REGISTER_COUNT];
     regs[0] = 99; // old destination value
     regs[1] = cond;
-    let steps = trace_until_trap(code.clone(), bitmask.clone(), regs);
+    let steps = trace_until_opcode_zero(code.clone(), bitmask.clone(), regs);
     (steps, code, bitmask)
 }
 
@@ -762,7 +762,7 @@ fn load_imm_forged_result_rejected() {
         10_000,
         25,
     );
-    let mut tr = TracingPvm::new(pvm);
+    let mut tr = TracingPvm::new_conformance(pvm);
     let _ = tr.run();
     let mut steps = tr.into_trace();
     assert_eq!(steps[0].regs_after[2], 12345);

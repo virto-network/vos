@@ -1,0 +1,40 @@
+{
+  "expected": {
+    "blocks": [
+      {
+        "gas": 120,
+        "pc": 0
+      }
+    ],
+    "first": {
+      "remaining_gas": 80,
+      "status": "panic"
+    },
+    "resume": null
+  },
+  "initial": {
+    "gas": 200,
+    "regs": [
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0"
+    ]
+  },
+  "name": "independent_divisions_serialize_on_div_unit",
+  "program": {
+    "bitmask": "0x49",
+    "code": "0xcb1002cb540600"
+  },
+  "rule": "gray-paper-v0.8-rob-block-gas",
+  "spec": "gray-paper-0.8.0"
+}
