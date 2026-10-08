@@ -856,7 +856,7 @@ outbox sequence numbers, which receivers deduplicate.
   same slice. The STARK alone rejects a tampered call input (S5b).
 - **On JAM,** the unknown id returns `WHAT` and the guest computes in
   software, with identical results for runs that complete.
-- **Gas** [proposed]:
+- **Gas** [decided; delegated by the owner]:
   - Results are promised identical only for runs that complete. Whether a
     run exhausts its gas depends on the environment: a hash costs about 66
     steps on VOS and about 4,760 on the JAM fallback, and the `gas` call is
@@ -1239,3 +1239,11 @@ knowledge and aggregation are the longest work and gate goal 8.
 17. The JAM agents' designs: the per-space aggregate-balance agent (how a
     space's net positions settle, and what a mixer-like space reveals by
     its flows), and collectives that vote.
+18. **The node host and native extensions** (to design in slice 2's
+    planning run):
+    - the node process and its scheduler across agents;
+    - storage and networking ownership;
+    - ingress;
+    - how native extensions attach: the HTTP and SSH transports, the
+      prover, the Substrate light client. On master they are small
+      capability adapters behind an extension host.

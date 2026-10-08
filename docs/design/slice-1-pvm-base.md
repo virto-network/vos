@@ -33,7 +33,7 @@ Out of scope:
 - JIT host-call exit tuning (item 6, after slice 2);
 - the privacy track, which starts in parallel (last section).
 
-## Workspace [proposed]
+## Workspace [decided]
 
 `vos-core` becomes the new core's tree. Its workspace keeps:
 
@@ -52,6 +52,31 @@ the JAR runtime's APIs. Keeping them would mean two PVMs in one workspace
 under renamed crates, which is exactly the duplication the redesign
 removes. A clean tree also makes the eventual merge to master a deliberate
 replacement, after the heavy cleanup the owner requires.
+
+### What leaves, and where it returns
+
+Nothing here is forgotten. Each piece returns, redesigned against the new
+core, in the build step named (core model section 16), or is replaced.
+
+| Leaves the branch | What it is | Returns |
+|---|---|---|
+| `vos/src/node.rs` (20k lines), `runtime.rs`, `extension.rs` | the node host: process, scheduling, the native-extension host | step 2, redesigned. The node host and extensions are designed in slice 2's planning run. |
+| `vos/src/ingress`, `ssh_ingress.rs` | HTTP and SSH client ingress | step 2: HTTP ingress with client sessions; SSH later |
+| `vos/src/network` (8.8k lines) | libp2p networking | step 3, as the replication transport |
+| `vos/src/raft` (5.4k lines) | master's Raft integration | replaced in step 3 by the node log writer and the new driver |
+| `vos/src/actors` (11k lines) | actor storage handles, `CommittedMap`, codec | step 2 (tables); step 4 (`CommittedMap` on the compressed format) |
+| `vos/vos-macros` | `#[actor]` and `#[messages]` | step 2, keeping the same shape |
+| `vos/src/zk`, `crypto`, `provable.rs`, `attestation.rs` | proof plumbing | step 5 and the privacy track |
+| `vos/src/crdt.rs`, `commit.rs` | CRDT commit | step 6 |
+| `vos/src/service` (42k lines), `registry.rs`, `jobs.rs`, `effects.rs` | the v2 service layer | replaced by agents; does not return |
+| `vosx` (27k lines) | CLI and daemon | step 2: a minimal CLI to run one node; the rest later |
+| `extensions/prover` | host-side prover | step 5 and the privacy track |
+| `extensions/substrate` | Substrate (Kreivo) light client | with the extension host, after step 2 |
+| `tests/fixtures/extensions/*` | extension test fixtures | with the extension host |
+| `clerk-witness`, `actors/clerk-*` | Clerk ledger, bridge, settlement | step 5, on the compressed format |
+| `actors/space-authority`, `actors/space-registry` | space governance and registry | step 2 or 3, as the catalog |
+| `services/vos-service`, `examples/` | v2 examples | rewritten for the new framework when it lands |
+| `docs/` (the book) | documentation | rewritten as the core lands |
 
 ## Starting point
 
@@ -105,7 +130,7 @@ branch is gone.
 - **The guest shim** (`pvm/proof/precompiles`) uses the id and falls back to
   software on `WHAT`. Every precompile takes a pointer in φ[7] and leaves
   registers unchanged.
-- **Gas** [proposed]:
+- **Gas** [decided; delegated by the owner]:
   - a precompile call costs a fixed amount in VOS gas, set from its native
     cost;
   - results are identical across hosts only for runs that complete;
