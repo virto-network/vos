@@ -80,6 +80,14 @@ not ported; section 17 lists what is reused.
   A compressed root format would cut a committed write from 100–280
   hashes to 8–25, at the cost of Clerk root compatibility (sections 9.3
   and 9.5).
+- **Merge apply (S6):** the current merkle-crdt sync grows with history
+  (8.7 s per synced operation at 1M). Incremental apply holds about 2 µs
+  per operation from 1k to 1M (section 9.4).
+- **Attestable (S5):**
+  - hashing dominates proving cost;
+  - today's hash precompile uses the JAR `ecall` opcode, which panics
+    under Gray Paper 0.8.0, so it is redefined as an `ecalli` host call;
+  - proofs run as chained segments of at most 2^16 steps (section 11).
 
 ## 1. Goals
 
