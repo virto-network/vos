@@ -85,9 +85,10 @@ not ported; section 17 lists what is reused.
   per operation from 1k to 1M (section 9.4).
 - **Attestable (S5):**
   - hashing dominates proving cost;
-  - the existing precompiles are `ecalli` host calls, but only the legacy
-    tracer proves them. BLAKE2b's id (100) is JAM's `log`. They move to
-    VOS-owned ids on the refine path;
+  - precompiles move to VOS-owned `ecalli` ids on the refine path, with a
+    software fallback when a JAM node answers `WHAT`. A prototype (S5b)
+    proves BLAKE2b this way, about 10× cheaper per hash than hashing in
+    the PVM;
   - proofs run as chained segments of at most 2^16 steps (section 11).
 
 ## 1. Goals
@@ -628,12 +629,18 @@ fn apply_batch(w: Witness<LedgerSlice>, batch: Batch) -> Transition { /* ... */ 
   about 0.2–0.5M steps when hashing in the PVM; under today's fixed-depth
   format, about 5M.
 - **Required** (S5):
-  - precompiles on the Gray Paper refine path, backed by the existing
-    BLAKE2b and Ristretto chips. They are `ecalli` host calls with
-    VOS-owned ids, answered natively on VOS nodes and in the prover. On a
-    JAM node an unknown id returns `WHAT`, and the guest falls back to
-    software with identical results. Today only the legacy tracer proves
-    them, and BLAKE2b's id (100) collides with JAM's `log`;
+  - **precompiles on the Gray Paper refine path** [decided direction;
+    prototyped in S5b]:
+    - they are `ecalli` host calls with VOS-owned ids (`0x400..=0x4ff`),
+      backed by the existing BLAKE2b and Ristretto chips;
+    - VOS nodes and the prover serve them in place, inside the machine
+      slice;
+    - a JAM node answers the unknown id with `WHAT`, and the guest falls
+      back to software with identical results;
+    - the S5b prototype proves BLAKE2b at 66 steps plus about 35 ms and
+      50 MiB of prover memory per compression, against about 4,760 steps,
+      0.4 s and 800 MiB when hashing in the PVM;
+    - JAR leftovers in the compiler, prover and allow-list are removed;
   - chained segments in the refine prover.
 - **Proposed size guideline:** kernels prove a whole settlement window at
   once, never one proof per item, in segments of at most 2^16 steps.

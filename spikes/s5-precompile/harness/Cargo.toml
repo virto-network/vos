@@ -1,0 +1,15 @@
+[workspace]
+
+[package]
+name = "s5-precompile"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+vos-pvm = { path = "../../../../gp-precompiles/pvm/runtime" }
+vos-pvm-proof = { path = "../../../../gp-precompiles/pvm/proof" }
+vos-pvm-compiler = { path = "../../../../gp-precompiles/pvm/compiler" }
+
+[profile.release]
+debug = 1

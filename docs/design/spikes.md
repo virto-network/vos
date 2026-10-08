@@ -700,3 +700,103 @@ for the root after, with hash counts from S4 at 10M keys:
   hash counts, not from a proved transfer kernel.
 - Measured on the saga's prover. Its memory profile may differ from the
   prover line on master.
+
+## S5b — Precompiles on the JAM refine path
+
+**Question** (owner, after S5). Can the zkVM keep its precompiles while
+guests use only JAM refine host calls?
+
+**Prototype.** Branch `exp/gp-precompiles` (`6659ddea`, from the saga
+commit), with the spike in `spikes/s5-precompile`. 11 files changed,
++359/−40:
+
+- **Id:** BLAKE2b compression is `ecalli 0x400`. VOS precompiles take
+  `0x400..=0x4ff`, outside every id JAM assigns (the Gray Paper calls and
+  JIP-1 `log` at 100). The CPU chip keeps its internal dispatch code, so
+  the AIR is unchanged.
+- **Runtime:** the refine host serves the call in place, for the outer
+  machine and for inner machines, on the interpreter and the JIT. Execution
+  continues in the same slice, and each call is reported as a `Precompile`
+  observation (`pvm/runtime/src/precompile.rs`).
+- **Prover:** the refine collector acknowledges the `ecalli` row, as the
+  legacy tracer did, and attaches the BLAKE2b chip call and its memory
+  operations to the slice.
+- **Guest:** calls the precompile. If φ[7] comes back as `WHAT`, it
+  compresses in software. That is what a JAM node answers for an id it
+  does not assign; the precompile itself leaves every register unchanged.
+
+**Result: agreement and steps** (the same 76-byte node hash chain as S4).
+
+| Hashes | Outputs | Steps on VOS (precompile) | Steps on a JAM-like host (fallback) |
+|---|---|---|---|
+| 1 | VOS = JAM fallback = S4 software | 176 | 4,869 |
+| 100 | all agree | 6,710 | 476,010 |
+| 1,000 | all agree | 66,110 | 4,759,110 |
+
+The precompile costs about 66 steps per hash; the fallback costs about
+4,760.
+
+**Result: proving** (one slice, 24 GiB cap).
+
+| Hashes | Steps | Prove | Peak RSS | Proof | Verify |
+|---|---|---|---|---|---|
+| 1 | 176 | 2.02 s | 4.0 GiB | 855 KiB | 0.9 s |
+| 10 | 770 | 2.08 s | 4.2 GiB | 855 KiB | 1.0 s |
+| 100 | 6,710 | 3.94 s | 8.4 GiB | 870 KiB | 1.9 s |
+| 200 | 13,310 | 6.49 s | 13.5 GiB | 882 KiB | 3.0 s |
+| 400 | 26,510 | 15.65 s | 23.8 GiB | 889 KiB | 7.2 s |
+
+A compression costs about 25–45 ms of proving and about 50 MiB of prover
+memory. Hashing inside the PVM costs about 0.4 s and 800 MiB per hash, so
+the precompile is about 10× faster and 16× smaller. One 24 GiB slice holds
+about 400 compressions.
+
+**Result: soundness checks.**
+
+| Tampering | Outcome |
+|---|---|
+| Change a recorded compression input | Proving succeeds, but the STARK alone rejects it ("claimed logup sum is not zero"); replay verification rejects it too |
+| Change the output bytes in the memory ledger | Proving fails (constraints not satisfied) |
+| Drop a chip record | Proving fails (constraints not satisfied) |
+
+**Result: tests.**
+
+- Runtime: 276 pass.
+- Prover library: 120 pass; one legacy test was re-encoded for the two-byte
+  id.
+- `prove_vos_actor`: 30 pass. The 5 failures also fail on the unmodified
+  saga commit; they load JAR-format actor blobs.
+
+**Derived: a transfer kernel.**
+
+- About 45–100 compressions per transfer: about 2–4 s of proving, and about
+  0.5–1.2 prover-hours for a 1,000-transfer window.
+- The chip's memory per call becomes the limit, so segments must be cut by
+  chip rows as well as by steps.
+
+**Findings.**
+
+- **Precompiles work over JAM host calls.** The same program runs on a
+  VOS node (precompile) and on a JAM node (software fallback) with
+  identical outputs. Only gas differs.
+- **The change is small and leaves the AIR alone:** a new id, in-place
+  service in the refine host, and chip records in the refine collector.
+- **The BLAKE2b chip's memory, about 50 MiB per compression, is the next
+  prover cost to cut.**
+
+**Remaining work:**
+
+- Move Ristretto and the scalar precompiles (110–114) into the VOS range
+  the same way, and give the guest shims the `WHAT` fallback.
+- Remove the JAR leftovers:
+  - lifecycle stubs in the proof allow-list (ids 1, 2, 4, 5, 6, 26) and
+    the VOS capability calls (117–119);
+  - the capability-manifest encoding and the `ecall` opcode paths in the
+    compiler and the AIR;
+  - `run_with_vos_stubs`;
+  - the JAR blob tests.
+- Price precompiles in VOS gas. Today a call costs only its instruction's
+  block gas, while the JAM fallback pays the full software cost.
+- Cut segments by chip rows as well as by steps.
+- Investigate the linker warning "unresolved return_fixup", printed while
+  linking this guest.
