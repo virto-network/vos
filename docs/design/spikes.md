@@ -661,11 +661,16 @@ for the root after, with hash counts from S4 at 10M keys:
 
 **Decision.**
 
-- **Proposed size guideline:** an attestable call proves in chained
-  segments of at most 2^16 steps (about 7 s and 15 GiB each on the
-  reference machine). Kernels should keep below about 1M steps per window
-  item batch, so a settlement window proves in minutes. A window covers
-  many items: never one proof per item.
+- **Proposed size guideline:**
+  - an attestable call proves in chained segments of at most 2^16 steps
+    (about 7 s and 15 GiB each on the reference machine);
+  - a whole settlement window targets about 1M steps (about 2 minutes of
+    proving);
+  - a window covers many items, never one proof per item.
+
+  The 1M-step target assumes the hash precompile: without one, a single
+  transfer already costs 0.2–0.5M steps. It is checked once the
+  precompile exists.
 - Required work:
   - a Gray Paper 0.8.0 hash precompile (`ecalli`) backed by the BLAKE2b
     chip, and the same for Ristretto;
