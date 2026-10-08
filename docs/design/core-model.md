@@ -615,8 +615,12 @@ The Local (replica-only) lane is deferred until a use case needs it.
   - the empty map has a defined root;
   - verifiers check that split levels strictly increase along a path and
     fit the key width;
-  - **salted leaves** [proposed]: each row stores a random salt of 16
-    bytes, so a root or a path never lets anyone guess low-entropy values.
+  - **salted leaves** [proposed]: each row stores a salt of 16 bytes, so a
+    root or a path never lets anyone guess low-entropy values. The salt
+    is deterministic for every replica: it comes from the work result, or
+    from a keyed function of a space secret and the key. A local random
+    source would give each replica a different root (section 9.5,
+    invariant 5).
     Keys and the tree's shape remain visible in any path that is shared,
     so paths stay private witnesses.
 
@@ -1005,6 +1009,8 @@ These form a prover track that runs alongside the core slices (section 16).
   and the proof verifier.
 - **`std` adapters at the edges:** the LSM engine, libp2p, the JIT and
   ingress.
+- **Nodes may require Linux ≥ 6.7** [decided], for userfaultfd-based
+  dirty-page tracking, if slice 1's measurement picks it.
 - A future bare-metal light client runs Merge replicas and proof
   verification on the interpreter.
 - The shared-executor Raft driver keeps vos-raft's core free of threads.
