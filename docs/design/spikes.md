@@ -226,10 +226,11 @@ process, so per-node figures are a third of these.
   2× more for large or batched ones.
 - Many active agents need one log writer per node with group commit across
   agents:
-  - separate stores pay one fsync per agent per round;
-  - fsyncs run on executor threads and starve heartbeats, so leaders are
-    lost from 64 active agents up;
-  - one shared redb with commits in the task serializes the writers.
+  - separate stores pay one fsync per agent per round. With fsyncs on
+    executor threads starving heartbeats, they lost leaders from 256
+    active agents up (p99 0.15–0.34 s already at 64);
+  - one shared redb with commits in the task serializes the writers and
+    lost leaders from 64 active agents up.
 - At 1,000 active agents the node writer still loses leaders. A follower
   answers a heartbeat only after its store write completes, so liveness
   waits on the disk. Heartbeats must not wait for log I/O.
@@ -490,8 +491,9 @@ interpreter (175×) and 4.7 µs on the JIT (28×).
   and 60–70 µs for a single-row commit. A copy-on-write B-tree rewrites a
   leaf page per random row. Reclaiming space needs durable commits, which
   conflicts with not fsyncing applied state (S3).
-- **fjall meets the write budget** (1.3–2.1 µs) at both sizes. Its reads are
-  at the budget: 2.8 µs at 1M rows and 5.2–5.6 µs at 10M. Misses stay
+- **fjall meets the write budget** (1.3–2.1 µs) at both sizes. Its reads
+  miss it slightly at 10M rows (5.2–5.6 µs, warm cache) and pass at 1M
+  (2.8 µs). Misses stay
   cheap (1.6–2.3 µs). Its durable log appends are 1.5–2.1× faster than
   redb's, close to S3's raw append.
 - **The current root math dominates committed writes:** 100–280 hashes per
