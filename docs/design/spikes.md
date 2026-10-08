@@ -273,3 +273,139 @@ Large entries include witnesses and snapshot pages.
 
 **Open.** Find the cause of the slow 64 KiB entries before witnesses ride
 the log.
+
+## S2 — Nesting
+
+**Setup.** `spikes/s2-nesting`. Two guests built with the saga's 0.8.0
+compiler, run on the saga's `vos-pvm` runtime:
+
+- **actor** (788 bytes): a ledger handler with no allocator. A transfer
+  makes two `GET`s and two `PUT`s and returns a 24-byte reply; a query
+  makes one `GET`. A machine that halts can be invoked again from its
+  entry.
+- **agent** (3.5 KB): a refine loop. It takes inputs from the node, builds
+  the actor as a JAM inner machine and serves the actor's calls:
+  - the machine is built with `machine` plus `pages` and `poke`, the
+    loader SJ calls for;
+  - reads go through an overlay of the agent's own writes to the node's
+    `STATE_GET`;
+  - writes are buffered and emitted in the work result;
+  - an accumulate entry applies the result through `STATE_PUT`.
+
+Paths compared, on the interpreter and the JIT:
+
+- **nested:** the agent hosts the actor (the decided design);
+- **native:** the node drives the same inner machines itself and serves the
+  actor's calls (the candidate node-side fast path);
+- each with a machine built per request (**fresh**) or reused across a
+  batch (**warm**). **warm + reset** also restores the actor's writable
+  memory (84 KiB) to the image after every request, as a pool would.
+
+Both paths produce identical writes, replies and accumulated state on
+both backends. Workload: 1,000 transfers or queries over 10,000 accounts.
+State reads come from an in-memory map; storage cost is S4's subject.
+Fixed and per-request costs are derived from batches of 1 and 1,000
+requests; each figure is the median of 7 runs.
+
+**Result: primitives.**
+
+| | Interpreter | JIT |
+|---|---|---|
+| Node host call from the agent | 0.11 µs | 0.12 µs |
+| Actor call round trip, nested (exit to the agent and invoke again) | 0.17 µs | 0.15 µs |
+| Actor call round trip, native | 0.04 µs | 0.05 µs |
+| Prepare a program, uncached (decode; compile on the JIT) | 227 µs for 3.5 KB | 502 µs for 3.5 KB |
+
+**Result: machine setup.**
+
+| | Interpreter | JIT |
+|---|---|---|
+| Agent machine per refine | 129 µs, up to 800 µs while other machines are live | 52 µs, plus 340–400 µs on its first resume |
+| Actor `machine` (program preparation cached) | 1.0 µs | 1.6 µs |
+| Actor memory and layout (`pages`, `poke`) | 126 µs | 47 µs |
+| Actor first call | 0.8 µs | 336 µs |
+| Actor second call | 0.4 µs | 0.3 µs |
+
+**Result: per request** (fixed cost per batch / marginal cost per
+request).
+
+| Path | Interpreter | JIT |
+|---|---|---|
+| Transfer, nested, warm | 1,574 µs / 4.6 µs | 817 µs / 2.9 µs |
+| Transfer, native, warm | 132 µs / 1.0 µs | 396 µs / 0.5 µs |
+| Transfer, native, warm + reset | 135 µs / 2.5 µs | 409 µs / 1.9 µs |
+| Transfer, nested, fresh | — / 136 µs | — / 421 µs |
+| Transfer, native, fresh | — / 130 µs | — / 413 µs |
+| Query, nested, warm | 1,598 µs / 2.3 µs | 821 µs / 1.5 µs |
+| Query, native, warm | 131 µs / 0.4 µs | 391 µs / 0.2 µs |
+| Accumulate, per transfer (two writes) | 0.44 µs | 0.68 µs |
+
+**Result: where the fixed cost goes.** A one-transfer refine, timed from the
+node at the agent's host calls (steady state):
+
+| Phase | Interpreter | JIT |
+|---|---|---|
+| Load the agent machine | 796 µs | 219 µs |
+| Agent's first resume | — | 407 µs |
+| Build the actor and run it to its first `GET` | 1,071 µs | 654 µs |
+| The transfer itself | 4.7 µs | 6.5 µs |
+| Drop the machines | 215 µs | 65 µs |
+
+perf attributes these costs to address-space-sized structures:
+
+- **JIT:** `NativeMemory::sync_permissions` takes 70–82% of the samples. It
+  walks the permission table of the whole 4 GiB space.
+- **Interpreter:** libc fills and frees fresh pages. Every sparse memory
+  allocates a million-entry page table (4 MiB) plus permission arrays, and
+  an inner machine sets a second million-entry permission table.
+
+**Findings.**
+
+- **Warm machines meet the invocation budget about 10× over.** A nested
+  transfer costs 2.9–4.6 µs, and its accumulate 0.4–0.7 µs. A query costs
+  1.5–2.3 µs.
+- **Nesting adds about 2.4–3.6 µs per transfer** over the native fast path.
+  That is about 20 agent host calls at 0.11–0.12 µs each (exit, peek, read,
+  poke, invoke), plus the agent's own code. The native path is 5–9×
+  faster, but the absolute gain is small against the budget. Fewer, larger
+  peeks would recover part of it.
+- **A machine per invocation misses the budget by 3–8×** (130–420 µs).
+  Almost none of that is execution; it is setup sized to the 4 GiB address
+  space. The same setup makes up the 0.8–1.6 ms fixed cost of every
+  refine, which is 25–50% of a 1–5 ms batch window.
+- **Isolation between requests is affordable.** Resetting a reused
+  machine's whole writable image costs about 1.4 µs for this actor.
+  Dirty-page tracking (S1) makes the reset proportional to touched pages.
+- **The JIT barely helps short handlers:** about 1.6× per request, since the
+  cost is host calls, and its first resume costs 340–400 µs. It pays off
+  on computation (S1's compute workload: 11×).
+- **Preparation is too slow to repeat:** 64–140 µs per KB of program, so a
+  500 KB actor takes tens of milliseconds. The runtime caches only one
+  inner program per thread.
+
+**Decision.**
+
+- **Invocation budget:** passes with warm machines; fails with a machine per
+  invocation.
+- **No node-side fast path in v1.** The nested path is well within budget;
+  revisit only if profiles show the agent layer.
+- Required runtime work:
+  - memory structures proportional to mapped pages: a two-level or hashed
+    page table and permissions in the interpreter, and a JIT permission
+    sync limited to changed ranges (also required by S1);
+  - a machine pool on the node, keyed by program hash, for actors and for
+    agent programs. A machine is reused across requests and refines, and
+    its writable memory is reset to the image (dirty pages) between uses.
+    It is exposed to agents as `instantiate(code_hash)`; on JAM the
+    loader path (`machine`, `pages`, `poke`) remains;
+  - prepared programs (decoded and compiled) cached by hash, not one per
+    thread.
+- **Proposed gate for that work:** acquiring and resetting a pooled machine
+  ≤ 5 µs for a small actor, and building a new machine ≤ 50 µs.
+
+**Caveats.**
+
+- The actor is tiny. Real actors have more code and data pages: after the
+  fixes, setup scales with touched pages and execution with code.
+- The query budget (≤ 100 µs on a follower) also includes storage reads,
+  measured in S4.

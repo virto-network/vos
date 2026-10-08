@@ -1,7 +1,7 @@
 # VOS core model
 
-Draft 2, planning run 2 (2026-10-08), updated with the first batch of run 3
-spikes (SJ, S1, S3; results in `spikes.md`). Draft 1 was reviewed by the
+Draft 2, planning run 2 (2026-10-08), updated with the run 3 spikes done so
+far (SJ, S1, S3, S2; results in `spikes.md`). Draft 1 was reviewed by the
 project owner and by a second-opinion architecture review; the adopted
 changes are listed below. Tags: **[decided]** confirmed by the project
 owner, or settled by a spike the owner delegated the choice to;
@@ -42,7 +42,7 @@ not ported; section 17 lists what is reused.
 - Machines are created from a pool of prepared program images. A node-side
   fast path for simple actor calls waits for spike S2's numbers.
 
-## Changes from the first spike batch
+## Changes from the run 3 spikes
 
 - **PVM version (SJ):** Gray Paper 0.8.0 for the runtime, compiler, prover
   and agents. A Rust service built with our toolchain ran unchanged on a
@@ -63,6 +63,15 @@ not ported; section 17 lists what is reused.
 - **Storage (S3):** one log writer per node commits every agent's pending
   log writes with one fsync. Applied state is not fsynced per log entry
   (section 9.5).
+- **Machines (S2):** warm machines meet the invocation budget about 10×
+  over. A machine per invocation misses it, because setup is sized to the
+  4 GiB address space. Required:
+  - memory structures proportional to mapped pages;
+  - a node-side machine pool, keyed by program hash and reset between
+    uses, for actors and for agent programs;
+  - prepared programs cached by hash.
+
+  No node-side fast path in v1 (sections 6.1 and 6.4).
 
 ## 1. Goals
 
@@ -148,9 +157,17 @@ A Gray Paper standard program with two entries: refine (IC 0) and accumulate
   extensions, each with a JAM fallback:
   - `state_read`: the agent's state at the refine base. On JAM it is served
     from a witness carried in the work package.
-  - `instantiate(code_hash)`: a machine created from a node-side pool of
-    prepared copy-on-write program images. On JAM: `machine` plus `pages`
-    and `poke`.
+  - `instantiate(code_hash)`: a machine from the node's pool, keyed by
+    program hash. A pooled machine is reused across requests and refines,
+    and its writable memory is reset to the program image (dirty pages)
+    between uses. The node pools agent programs' machines the same way.
+    Prepared programs (decoded and JIT-compiled) are cached by hash;
+    preparing one costs 64–140 µs per KB (S2). On JAM, the agent's loader
+    uses `machine`, then `pages` and `poke`.
+  - Machine memory structures are proportional to mapped pages, never to
+    the 4 GiB address space. In S2, address-space-sized page tables and
+    permission syncs cost 0.1–1 ms per machine, while a transfer took
+    3–5 µs.
   - snapshot page access and dirty-page capture. On JAM: imports, exports,
     and peek-and-hash.
 - **Accumulate** uses JAM's accumulate host calls (read, write, transfer,
@@ -217,9 +234,13 @@ agent program, which serves them. The default ABI:
 | `attest` (section 11) | yes | yes |
 
 An actor cannot touch another instance's state; everything else is a call or
-a message. Custom agents can add operations. A fast path in which the node
-serves simple calls directly, governed by a descriptor the agent writes, is
-deferred until spike S2 measures the plain path.
+a message. Custom agents can add operations.
+
+**No node-side fast path in v1** [decided by S2]. Serving actor calls
+through the agent program costs about 2.4–3.6 µs more per transfer than the
+node serving them directly. That is about 20 agent host calls at about
+0.12 µs each, and the nested path stays about 10× within the invocation
+budget.
 
 ## 7. Execution [decided]
 
@@ -612,11 +633,11 @@ vos-raft's core free of threads.
 
 | Path | Budget | Run 3 |
 |---|---|---|
-| Actor invocation, refine and accumulate, one node | ≤ 50 µs | S2 |
+| Actor invocation, refine and accumulate, one node | ≤ 50 µs | S2: passes with warm machines (3–5 µs per transfer); a machine per invocation takes 130–420 µs |
 | Replicated agent on 3 LAN nodes, simple mutations | ≥ 20k per second per agent; p99 commit ≤ 10 ms at half load | S3: passes with the new driver (about 25k/s at p99 8 ms); fails with the current one |
 | Workflow snapshot capture plus restore, up to 50 KB | ≤ 1 ms | S1: passes with dirty tracking and pooled images |
 | Table point read or write at 10M rows (host cost) | ≤ 5 µs | S4 |
-| Query on a follower | ≤ 100 µs | S2 |
+| Query on a follower | ≤ 100 µs | S2: 1.5–2.3 µs of execution with warm machines; storage reads in S4 |
 | Merge apply, cost per operation at 1M operations | ≤ 2× the cost at 1k | S6 |
 | 1,000 mostly idle Raft groups per node | no thread per group; idle CPU ≤ 5% of one core | S3: passes on a shared executor at a 500 ms heartbeat (about 1.6%) |
 
@@ -689,9 +710,9 @@ lane of channels they belong to.
 
 ## 16. Spikes (run 3)
 
-The first batch (SJ, S1, S3) is done; results are in `spikes.md`. SJ part b,
-a workflow suspended across work packages, moved to the first JAM
-milestone. Next: S2, then S4, S6 and S5.
+SJ, S1, S3 and S2 are done; results are in `spikes.md`. SJ part b, a
+workflow suspended across work packages, moved to the first JAM milestone.
+Next: S4, then S6 and S5.
 
 | Spike | Measures | Gate |
 |---|---|---|
@@ -710,6 +731,8 @@ milestone. Next: S2, then S4, S6 and S5.
   which is self-contained. Inner-machine creation must move to a pool of
   prepared images: the saga's version copies the program and allocates a
   2^32-byte address space and a million-entry permission table per machine.
+  The JIT also syncs permissions across the whole span on first resume
+  (S1, S2).
 - `pvm/proof`: prover, chain segments, verifier, settlement verifier.
 - `support/merkle-crdt`: DAG and sync format; the apply path is rewritten.
 - `support/vos-raft`: the consensus core. Its `std` driver is replaced

@@ -1,0 +1,14 @@
+[workspace]
+
+[package]
+name = "s2-harness"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+vos-pvm = { path = "../../../../saga-pvm-ref/pvm/runtime" }
+vos-pvm-compiler = { path = "../../../../saga-pvm-ref/pvm/compiler" }
+
+[profile.release]
+debug = 1
