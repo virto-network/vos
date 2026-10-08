@@ -1,0 +1,19 @@
+[workspace]
+
+[package]
+name = "sj-echo"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "sj-echo"
+path = "src/main.rs"
+test = false
+bench = false
+
+[profile.release]
+opt-level = 3
+lto = true
+panic = "abort"
+codegen-units = 1

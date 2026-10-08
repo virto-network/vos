@@ -1,0 +1,23 @@
+[package]
+name = "vos-raft-eager"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+default = ["std"]
+std = ["dep:futures-channel", "dep:futures-util", "dep:futures-executor"]
+tokio = ["std", "dep:tokio"]
+
+[dependencies]
+futures-channel = { version = "0.3", optional = true, default-features = false, features = ["alloc", "std"] }
+futures-util = { version = "0.3", optional = true, default-features = false, features = ["alloc", "async-await-macro", "std"] }
+futures-executor = { version = "0.3", optional = true, default-features = false, features = ["std"] }
+tokio = { version = "1", optional = true, default-features = false, features = ["time", "rt"] }
+
+[dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std", "bit-set"] }
+futures-executor = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "sync"] }
+futures-channel = "0.3"
+futures-util = "0.3"

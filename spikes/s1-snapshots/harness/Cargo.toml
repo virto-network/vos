@@ -1,0 +1,16 @@
+[workspace]
+
+[package]
+name = "s1-harness"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+vos-pvm = { path = "../../../../saga-pvm-ref/pvm/runtime" }
+vos-pvm-compiler = { path = "../../../../saga-pvm-ref/pvm/compiler" }
+blake2 = "0.10"
+lz4_flex = "0.11"
+
+[profile.release]
+debug = 1

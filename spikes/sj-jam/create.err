@@ -1,0 +1,6 @@
+Waiting for two non-genesis blocks to be finalized...
+Packed 1 instruction(s) into 1 package(s)
+Submitted 2 instruction(s) to "jam-bootstrap-service" in package 0xad9b7ddc15747ddd... with anchor at #9287099
+Code identifies as vos-sj-echo v0.1.0 by VOS spike
+Packed 1 instruction(s) into 1 package(s)
+Submitted 1 instruction(s) to "jam-bootstrap-service" in package 0x255af97b99113a23... with anchor at #9287103

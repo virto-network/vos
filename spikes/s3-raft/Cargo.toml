@@ -1,0 +1,23 @@
+[workspace]
+
+[package]
+name = "s3-raft"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+# Prototype driver: group commit of queued proposals and replicate-on-propose.
+eager = ["dep:vos-raft-eager"]
+
+[dependencies]
+vos-raft = { path = "../../support/vos-raft", features = ["tokio"] }
+vos-raft-eager = { path = "vos-raft-eager", features = ["tokio"], optional = true }
+futures-channel = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros"] }
+redb = "2"
+# Reference implementation for the log benchmarks (src/bin/openraft_ref.rs).
+openraft = { version = "0.9.25", features = ["storage-v2"] }
+
+[profile.release]
+debug = 1
