@@ -409,3 +409,123 @@ perf attributes these costs to address-space-sized structures:
   fixes, setup scales with touched pages and execution with code.
 - The query budget (≤ 100 µs on a follower) also includes storage reads,
   measured in S4.
+
+## S4 — Tables
+
+**Setup.** `spikes/s4-tables`. Three parts, on the real disk with a warm
+page cache (62 GB of RAM; every dataset fits):
+
+- **Tables:** point reads, updates, inserts and 1,000-row scans on tables of
+  u64 keys and 64-byte values, at 1M and 10M rows. Writes are committed
+  without fsync, as section 9.5 proposes, unless noted. Engines:
+  - redb (1 GiB default cache);
+  - fjall 3.1, a pure-Rust LSM tree, with a 1 GiB block cache and the bulk
+    load compacted before reading.
+- **Committed roots:** an in-memory binary radix tree that stores only
+  branching nodes, as the row-backed `CommittedMap` does, hashed two ways:
+  - fixed-depth, the current math: every key bit is a level, so children
+    are lifted through empty-sibling spines, and both children are lifted
+    whenever a parent is rehashed;
+  - compressed: a leaf hash commits its full key, and a branch hash commits
+    its split level and both children.
+
+  Both formats run on the same tree. Fixed-depth sibling hashes are
+  placeholders, which leaves the hashing work per update exact.
+- **Hashing:** BLAKE2b-256 of a 76-byte node input (a 12-byte domain and two
+  children), natively and inside the PVM (`blake2b_simd`, portable code).
+
+**Result: tables** (µs per row).
+
+| | redb 1M | redb 10M | fjall 1M | fjall 10M |
+|---|---|---|---|---|
+| Bulk load | 2.2 | 11.3 | 0.9 | 1.7 |
+| Size after load | 515 MiB | 24.6 GiB | 143 MiB | 928 MiB |
+| Read, hit | 0.52 | 1.57 | 2.78 | 5.56 (5.24 after the update runs) |
+| Read, miss | 0.51 | 1.23 | 1.56 | 2.26 |
+| Update, one-row transaction | 61.5 | 70.1 | 1.51 | 1.77 |
+| Update, 1,000-row transaction | 9.3 | 17.7 | 1.26 | 1.54 |
+| Update, 1,000 rows with fsync | 28.6¹ | 254¹ | 1.88 | 2.07 |
+| Insert new key, 1,000-row transaction | 9.2 | 17.1 | 1.28 | 1.47 |
+| Scan | 0.13 | 0.15 | 0.36 | 0.25 |
+
+¹ Inflated: the first durable commit flushes the pages of every earlier
+non-durable one. With a durable commit every 10th transaction (1M rows),
+updates cost 10.2 µs, or 11.7 µs with fsync, and the file stays at
+515 MiB.
+
+redb cannot reuse pages freed by non-durable commits until a durable
+commit. The 10M-row load (0.7 GB of data, all non-durable) therefore grew
+to 24.6 GiB.
+
+**Result: durable log appends** (S3's node log writer; 1 KiB entries keyed
+by (agent, index)).
+
+| Entries per commit | redb | fjall |
+|---|---|---|
+| 1 | 380 µs | 261 µs |
+| 64 | 1,104 µs (58k entries/s) | 609 µs (105k entries/s) |
+| 1,024 | 6,067 µs (169k entries/s) | 2,839 µs (361k entries/s) |
+
+**Result: committed roots** (hashes per update, then µs per update
+including the tree walk; batches from 1 to 10,000 updates).
+
+| Keys | Key bits | Fixed-depth | Compressed |
+|---|---|---|---|
+| 1M | 64 | 122 → 107; 25.7 → 21.9 µs | 21 → 7.9; 6.3 → 4.3 µs |
+| 1M | 128 | 283 → 268; 48.5 → 37.6 µs | 21 → 8.1; 5.7 → 3.4 µs |
+| 10M | 64 | 112 → 99; 18.8 → 18.0 µs | 24 → 11; 7.2 → 6.4 µs |
+| 10M | 128 | 280 → 266; 42.9 → 42.0 µs | 25 → 11; 8.3 → 6.6 µs |
+
+- Branch-node rows rewritten per update are the same in both formats: 20–24
+  for single updates, 7–10 in batches of 10,000.
+- A full compressed root from scratch takes 0.5 s at 1M keys and 5 s at
+  10M (20M hashes).
+
+**Result: hashing.** Native BLAKE2b: 0.17 µs. In the PVM: 29.7 µs on the
+interpreter (175×) and 4.7 µs on the JIT (28×).
+
+**Findings.**
+
+- **redb misses the write budget at both sizes:** 9–18 µs per row in batches,
+  and 60–70 µs for a single-row commit. A copy-on-write B-tree rewrites a
+  leaf page per random row. Reclaiming space needs durable commits, which
+  conflicts with not fsyncing applied state (S3).
+- **fjall meets the write budget** (1.3–2.1 µs) at both sizes. Its reads are
+  at the budget: 2.8 µs at 1M rows and 5.2–5.6 µs at 10M. Misses stay
+  cheap (1.6–2.3 µs). Its durable log appends are 1.5–2.1× faster than
+  redb's, close to S3's raw append.
+- **The current root math dominates committed writes:** 100–280 hashes per
+  update (18–49 µs) whatever the batch size, because spines through empty
+  levels are rehashed. The compressed format needs 8–25 hashes per update
+  (3.4–8.3 µs). Node-row rewrites are the same in both formats. At
+  about 1.5 µs per LSM row, they favor large sorted batches at attest
+  boundaries.
+- **Hashing must be a host call.** In-PVM BLAKE2b is 28–175× slower than
+  native.
+
+**Caveats.**
+
+- Reads hit a warm page cache. Cold random reads from this NVMe would add
+  about 0.1 ms for either engine.
+- fjall's compaction runs on background threads; that CPU is not counted.
+- Steady-state LSM read cost under continuous writes depends on compaction
+  tuning.
+
+**Decision.**
+
+- **Table budget:** reads pass on both engines; writes pass only on the LSM.
+- **Proposed for section 9.5:** one LSM engine per node (fjall first) for
+  state tables, Merge state, the page store, system tables and the node
+  log. redb is dropped.
+  - Agents share a few LSM trees (one per data class) under agent key
+    prefixes, rather than a tree per agent, to bound memtables and
+    background work.
+  - A Raft snapshot exports an agent's prefix as a range and installs by
+    range delete and ingestion.
+- **Proposed for section 9.3:** adopt the compressed root format. This
+  breaks root compatibility with cipher-clerk and the current
+  `vos::zk::state` math, which would have to move together; that is the
+  owner's call.
+- Roots and node rows are updated only at attest or settlement boundaries,
+  in sorted batches.
+- The native hash host call is required for tree math inside the PVM.

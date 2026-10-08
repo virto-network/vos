@@ -1,0 +1,17 @@
+[workspace]
+
+[package]
+name = "s4-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+redb = "2"
+fjall = "3.1.12"
+blake2b_simd = "1"
+vos-pvm = { path = "../../../../saga-pvm-ref/pvm/runtime" }
+vos-pvm-compiler = { path = "../../../../saga-pvm-ref/pvm/compiler" }
+
+[profile.release]
+debug = 1

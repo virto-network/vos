@@ -1,7 +1,7 @@
 # VOS core model
 
 Draft 2, planning run 2 (2026-10-08), updated with the run 3 spikes done so
-far (SJ, S1, S3, S2; results in `spikes.md`). Draft 1 was reviewed by the
+far (SJ, S1, S3, S2, S4; results in `spikes.md`). Draft 1 was reviewed by the
 project owner and by a second-opinion architecture review; the adopted
 changes are listed below. Tags: **[decided]** confirmed by the project
 owner, or settled by a spike the owner delegated the choice to;
@@ -72,6 +72,14 @@ not ported; section 17 lists what is reused.
   - prepared programs cached by hash.
 
   No node-side fast path in v1 (sections 6.1 and 6.4).
+- **Storage engine (S4), proposed:** an LSM (fjall) replaces redb:
+  - random updates at 10M rows: 1.5 µs per row, against redb's 18 µs;
+  - durable log appends: 1.5–2× faster;
+  - reads: about 5 µs at 10M rows.
+
+  A compressed root format would cut a committed write from 100–280
+  hashes to 8–25, at the cost of Clerk root compatibility (sections 9.3
+  and 9.5).
 
 ## 1. Goals
 
@@ -451,12 +459,21 @@ The macros generate a view per mode, so forbidden access fails to compile.
   agent's keyspace: point reads and writes, ordered scans with cursors.
   Memory use follows touched rows, not table size.
 - `CommittedMap<K, V>` also yields a sparse Merkle root and multiproofs
-  (`BatchProof`) for attestable functions and JAM witnesses. The current
-  format hashes once per key bit on every write (128–256 hashes), so roots
-  are computed only at attest or settlement boundaries, as sorted batch
-  updates, and in-PVM hashing goes through a native hash host call. Whether
-  to adopt a path-compressed format, which breaks Clerk root compatibility,
-  is decided after spike S4.
+  (`BatchProof`) for attestable functions and JAM witnesses. Roots and node
+  rows are computed only at attest or settlement boundaries, as sorted batch
+  updates.
+- In-PVM hashing goes through a native hash host call. In-PVM BLAKE2b is
+  28× (JIT) to 175× (interpreter) slower than native (S4).
+- **Proposed: a path-compressed root format** [awaiting owner decision].
+  - The current fixed-depth math rehashes empty spines: 100–280 hashes per
+    update (18–49 µs at 1M–10M keys), however large the batch.
+  - The compressed format, where a leaf commits its full key and a branch
+    its split level, needs 8–25 hashes (3–8 µs).
+  - Branch-node rows rewritten per update are the same in both: 20–24
+    alone, 7–10 in batches of 10,000.
+  - The cost: roots stop matching cipher-clerk and the current
+    `vos::zk::state` math. Clerk, the witness math and the attestable
+    kernels would move to the new format together.
 - No global state root on VOS. Agents deployed on JAM keep one.
 
 ### 9.4 Merge lane
@@ -499,9 +516,20 @@ The macros generate a view per mode, so forbidden access fails to compile.
 
 ### 9.5 Storage engine [proposed]
 
-One embedded key-value store per node (redb first), with per-agent keyspaces:
-Linear state; Merge state and DAG; the page store; and system tables (dedup
-and high-water marks, outbox, workflows, timers).
+One embedded LSM key-value store per node (fjall first). It holds Linear
+state, Merge state and DAG, the page store, system tables (dedup and
+high-water marks, outbox, workflows, timers) and the node log.
+
+- Agents share one LSM tree per data class under agent key prefixes. A
+  tree per agent would multiply memtables and background work.
+- A Raft snapshot exports an agent's prefix as a range and installs by
+  range delete and ingestion.
+- Why not redb: in S4, random updates at 10M rows cost about 18 µs per
+  row on redb against 1.5 µs on fjall. redb also reclaims space only
+  after durable commits: a 0.7 GB table loaded without them grew to
+  24.6 GiB. fjall's durable log appends were 1.5–2× faster.
+- Reads cost about 5 µs at 10M rows with a 1 GiB cache (redb: 1.6 µs).
+  Compaction and cache tuning are part of the first storage slice.
 
 An fsync costs 0.35–0.5 ms on a consumer NVMe, so batching outweighs every
 other storage cost (S3).
@@ -521,10 +549,9 @@ other storage cost (S3).
   re-applies the log from that index. Accumulate is deterministic, so
   replies sent after a non-durable apply stay correct. Otherwise every
   applied entry would pay a full fsync.
-- redb is within 2× of a raw append for batched and large writes. A raw
-  append-only segment log replaces it for the log if large entries make
-  that difference matter; witnesses and snapshot pages are the likely
-  cases.
+- If large entries make the engine's overhead matter, a raw append-only
+  segment log takes over the node log; witnesses and snapshot pages are
+  the likely cases. In S3, redb cost up to 2× a raw append.
 
 ## 10. Replication and placement [decided: one log per agent]
 
@@ -636,7 +663,7 @@ vos-raft's core free of threads.
 | Actor invocation, refine and accumulate, one node | ≤ 50 µs | S2: passes with warm machines (3–5 µs per transfer); a machine per invocation takes 130–420 µs |
 | Replicated agent on 3 LAN nodes, simple mutations | ≥ 20k per second per agent; p99 commit ≤ 10 ms at half load | S3: passes with the new driver (about 25k/s at p99 8 ms); fails with the current one |
 | Workflow snapshot capture plus restore, up to 50 KB | ≤ 1 ms | S1: passes with dirty tracking and pooled images |
-| Table point read or write at 10M rows (host cost) | ≤ 5 µs | S4 |
+| Table point read or write at 10M rows (host cost) | ≤ 5 µs | S4: writes pass on an LSM (1.5 µs) but not on redb (18 µs); reads about 5 µs on the LSM, 1.6 µs on redb |
 | Query on a follower | ≤ 100 µs | S2: 1.5–2.3 µs of execution with warm machines; storage reads in S4 |
 | Merge apply, cost per operation at 1M operations | ≤ 2× the cost at 1k | S6 |
 | 1,000 mostly idle Raft groups per node | no thread per group; idle CPU ≤ 5% of one core | S3: passes on a shared executor at a 500 ms heartbeat (about 1.6%) |
@@ -710,9 +737,9 @@ lane of channels they belong to.
 
 ## 16. Spikes (run 3)
 
-SJ, S1, S3 and S2 are done; results are in `spikes.md`. SJ part b, a
+SJ, S1, S3, S2 and S4 are done; results are in `spikes.md`. SJ part b, a
 workflow suspended across work packages, moved to the first JAM milestone.
-Next: S4, then S6 and S5.
+Next: S6, then S5.
 
 | Spike | Measures | Gate |
 |---|---|---|
