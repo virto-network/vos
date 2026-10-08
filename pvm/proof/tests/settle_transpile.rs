@@ -1,32 +1,23 @@
-//! Does the settlement verifier ELF survive grey-transpilation to JAM PVM
-//! bytecode? The transpiler rejects RISC-V instructions JAVM cannot execute
-//! (e.g. atomic instructions, compressed insts, out-of-range registers), so a
-//! clean `link_elf` is the bytecode-level proof that `settlement-verifier`'s
-//! `settle.elf` is genuinely PVM-runnable — not just ELF-linkable.
+//! The settlement verifier links into a Gray Paper 0.8.0 standard program.
+//! The compiler rejects RISC-V instructions the PVM cannot execute (atomics,
+//! compressed instructions, out-of-range registers), so a clean link proves
+//! `settle.elf` is PVM-runnable, not just ELF-linkable.
 //!
-//! The ELF is built out-of-band (separate workspace + custom target) via
-//! `just build-settle`. Skips (does not fail) if the ELF is absent, matching the
-//! other ELF fixtures.
+//! The ELF is built by `just build-settle`; the test fails without it.
 
 #[test]
-fn settle_elf_transpiles_to_pvm() {
+fn settle_elf_links_to_a_standard_program() {
     let elf_path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/settlement-verifier/target/riscv64em-vos/release/settle.elf"
     );
-    let elf = match std::fs::read(elf_path) {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            eprintln!("settle.elf absent ({elf_path}); run `just build-settle` first — skipping");
-            return;
-        }
-    };
-
-    let blob = vos_pvm_compiler::link_elf(&elf).expect("grey-transpile settle.elf to PVM bytecode");
-    assert!(!blob.is_empty(), "transpiled PVM blob is empty");
+    let elf = std::fs::read(elf_path)
+        .unwrap_or_else(|error| panic!("settle.elf missing ({error}); run `just build-settle`"));
+    let program = vos_pvm_compiler::link_elf_spi(&elf).expect("link settle.elf");
+    assert!(!program.is_empty(), "linked program is empty");
     eprintln!(
-        "settle.elf transpiled OK: {} ELF bytes -> {} PVM-blob bytes",
+        "settle.elf linked: {} ELF bytes -> {} program bytes",
         elf.len(),
-        blob.len()
+        program.len()
     );
 }

@@ -98,10 +98,10 @@ pub const PVM_HALT_ADDR: u64 = (1 << 32) - (1 << 16);
 pub enum IsaMode {
     /// Full jar surface: opcode 3 (`Ecall`) dispatches capability-kernel
     /// management ops / dynamic CALL.
-    #[default]
     Jar,
     /// Graypaper-strict: opcode 3 is not a valid instruction and panics
     /// when executed (GP conformance; the cap kernel is a jar extension).
+    #[default]
     Conformance,
 }
 

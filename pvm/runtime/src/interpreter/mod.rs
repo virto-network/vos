@@ -209,7 +209,7 @@ impl Interpreter {
             mem,
             gas,
             mem_cycles,
-            crate::IsaMode::Jar,
+            crate::IsaMode::Conformance,
         )
     }
 

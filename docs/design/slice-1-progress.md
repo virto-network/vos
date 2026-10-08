@@ -87,3 +87,39 @@ the reference laptop (Core Ultra 7 155H). Other work ran at the same time
 
 These are the numbers steps 1.4–1.6 must move: machine creation ≤ 50 µs,
 pooled acquire plus reset ≤ 5 µs, and refine fixed cost ≤ 50 µs.
+
+## Step 1.2: remove JAR (in progress)
+
+**Stage 1, flip the defaults.** The `IsaMode` default, `Interpreter::with_memory`,
+`GasSimulator::new` and the JIT's constructor now select the Gray Paper
+profile. Everything that broke:
+
+- 30 runtime unit tests, of two kinds:
+  - JAR-only behaviour: the JAR gas simulator, the GP 0.7.2 per-instruction
+    gas model, the private `ecall`. These are deleted in stage 3.
+  - Generic instruction tests that hard-code JAR opcode numbers (reverse
+    bytes is 111 in JAR, 110 in the Gray Paper) or JAR exits (trap as
+    `Trap`). These are ported.
+- One prover library test, in `actor.rs` (JAR blob tracing), deleted in
+  stage 3.
+- `prove_vos_actor`: the same 5 failures as before, on the checked-in JAR
+  `.pvm` blobs of `hash-bench`. Several of its other "passing" tests skip
+  silently because their fixtures (built on master's `vos` framework) are
+  never built.
+
+Every other prover suite passes, including all eight soundness gates and
+the conformance vectors.
+
+**Stage 2, port what must survive (in progress):**
+
+- **The settlement verifier now builds, runs and accepts** as a standard
+  program. Its program had not compiled since a package rename (it called
+  the old crate name), which the skipping tests hid. Its tests now fail
+  rather than skip when `just build-settle` has not run.
+- **`pvm/guest/pvm.ld` fixes,** from linking it:
+  - `.text` follows the data instead of sitting at a fixed `0x900000`,
+    which a 192 MiB heap arena overlapped;
+  - the GOT and relocated read-only data go with the read-write data, where
+    `lld` had placed the orphan `.got` below the read-write base.
+- **Re-measured under 0.8.0:** 10,677,000 instructions and 102,671,695 gas
+  per settlement verify.

@@ -26,3 +26,9 @@
 # (build-std would force a slow std rebuild on every host `cargo build`).  The
 # pinned nightly accepts the `.json` target path directly; pass build-std on the
 # command line as shown above.  This file is documentation-only.
+
+# The Gray Paper standard-program layout (`pvm/guest/pvm.ld`), so the ELF
+# links with `vos_pvm_compiler::link_elf_spi`. Scoped to the PVM target; host
+# and wasm32 builds are unaffected.
+[target.riscv64em-vos]
+rustflags = ["-Clink-arg=-T../../guest/pvm.ld"]

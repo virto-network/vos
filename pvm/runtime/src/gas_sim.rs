@@ -330,7 +330,7 @@ impl Default for GasSimulator {
 
 impl GasSimulator {
     pub fn new() -> Self {
-        Self::new_for_mode(crate::IsaMode::Jar)
+        Self::new_for_mode(crate::IsaMode::Conformance)
     }
 
     pub fn new_for_mode(mode: crate::IsaMode) -> Self {

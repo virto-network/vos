@@ -802,3 +802,17 @@ about 400 compressions.
 - Cut segments by chip rows as well as by steps.
 - Investigate the linker warning "unresolved return_fixup", printed while
   linking this guest.
+
+## Note — Settlement verifier under Gray Paper 0.8.0 (slice 1)
+
+The Poseidon2-M31 settlement verifier (`pvm/proof/settlement-verifier`),
+linked as a standard program and run on the interpreter, accepts the
+honest fixture:
+
+- 10,677,000 instructions;
+- 102,671,695 gas under the 0.8.0 block-gas model, about 9.6 gas per
+  instruction.
+
+The earlier figure of about 10.7M cycles was measured under JAR. One segment
+fits a refine's gas budget comfortably; a settlement window of many segments
+needs aggregation (core model section 11.4).

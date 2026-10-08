@@ -751,7 +751,7 @@ impl RecompiledPvm {
             gas,
             data_layout,
             mem_cycles,
-            crate::IsaMode::Jar,
+            crate::IsaMode::Conformance,
         )
     }
 
