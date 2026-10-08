@@ -1,9 +1,9 @@
 # VOS core model
 
-Draft 4 (2026-10-08). Draft 3 was reviewed by a second-opinion architecture
-review, and the owner decided the questions it raised. Measurements come
-from the run 3 spikes in `spikes.md`, cited by name: S1–S6, S5b and SJ.
-Tags:
+Draft 5 (2026-10-08). Drafts 3 and 4 were each reviewed by a second-opinion
+architecture review, and the owner decided the questions they raised.
+Measurements come from the run 3 spikes in `spikes.md`, cited by name:
+S1–S6, S5b and SJ. Tags:
 
 - **[decided]**: confirmed by the project owner, or settled by a spike the
   owner delegated the choice to;
@@ -14,38 +14,32 @@ This is the model for a new core built on branch `vos-core` (from master
 `d2378274`). The v2 service layer on master, the saga's agent layer and
 everything specific to JAR are not ported; section 17 lists what is reused.
 
-## Changes from draft 3
+## Changes from draft 4
 
-- **Correctness gaps closed** (review):
-  - a workflow preempted by gas commits as an implicit checkpoint; handlers
-    are never preempted (section 8.3);
-  - an input whose handler fails is still consumed, with an error reply
-    (section 8.1);
-  - non-durable apply has explicit invariants, and the periodic checkpoint
-    is gone (section 9.5);
-  - pooled machines reset to exactly a fresh machine (section 6.6).
-- **`.await` stays in the API** [decided]. v1 runs one dispatch at a time;
-  interleaving later needs no change to actor code (section 6.3).
-- **The actor framework keeps its shape** [decided]: an `#[actor]` struct
-  and an impl block of methods taking `self` and a context (section 6.2).
-- **Privacy is the top priority** [decided]:
-  - attestable arguments and actor state are private inputs, and return
-    values are public;
-  - today's prover is not hiding, so zero-knowledge proving becomes a
-    requirement (section 11.4).
-- **The JIT is the default backend** [decided]. Its small lead on short
-  handlers is treated as optimization headroom, not a reason to defer it
-  (section 6.6).
-- **One sync scope per Merge DAG** instead of one DAG per agent; the
-  authorization rule names authors precisely (section 9.4).
-- **Client sessions** replace unbounded idempotency-key retention
-  (section 8.4).
-- **New budgets** for many active agents per node and for fixed cost per
-  refine (section 14).
-- **Evidence restated where draft 3 over-claimed:**
-  - table reads at 10M rows miss their budget;
-  - invocation cost includes storage;
-  - snapshot restore from pooled images is not yet measured.
+- **Agents on JAM are public** [decided]. They hold global data that spaces
+  agree on, such as one agent per space holding the space's aggregate
+  balance, or a collective in which each space's agent votes. They verify
+  proofs but produce none. Privacy lives inside VOS spaces (sections 1, 12).
+- **Attestable methods are restricted, and the macro enforces it**
+  [decided]. They read only their arguments and committed fields, use no
+  context, and return their writes privately to the enclosing command
+  (section 11.1).
+- **Gas is nested** [proposed]. A callee draws from its caller's
+  remaining gas, and a step is dispatched only if the refine can cover its
+  limit, so outcomes never depend on batch packing (section 8.1).
+- **Preemption keeps steps atomic** [proposed]. An effect-free workflow
+  step stays live across refines. Once a step has effects, it runs under a
+  fixed limit to the end of the step (section 8.3).
+- **Sessions keep a window of replies,** use server-assigned ids that are
+  never reused, and refuse expired sessions (section 8.4).
+- **Committed roots are built in the background** from dirty keys, off the
+  apply path (section 9.3).
+- **Leaves are salted,** and published proofs carry nothing beyond the
+  public output and a fixed shape class (sections 9.3, 11.4).
+- **Proofs are verified at ingress,** before a claim enters the log
+  (section 11.1).
+- **Merge authors are chains per (key, principal),** with fresh keys after
+  a crash or restore (section 9.4).
 
 ## 1. Goals
 
@@ -65,8 +59,12 @@ everything specific to JAR are not ported; section 17 lists what is reused.
 7. Performance and flexibility across very different workloads: sustained
    transaction throughput, heavy computation and storage, real-time
    collaboration. The agent is the unit of isolation and scaling.
-8. Early JAM integration: agents deploy on JAM, and on-chain agents verify
-   proofs from spaces (value transfer, governance, subscriptions).
+8. Early JAM integration. Agents on JAM hold public, global data that
+   spaces agree on, and verify proofs from spaces. For example:
+   - one agent per space holds the space's aggregate balance, so value
+     moves between spaces while accounts inside each space stay private;
+   - a collective in which each space's agent votes;
+   - subscriptions.
 9. Simplicity and performance are the deciding criteria.
 
 ## 2. Non-goals for v1
@@ -78,6 +76,7 @@ everything specific to JAR are not ported; section 17 lists what is reused.
 - Replay-based durable execution.
 - Encrypted private agents with key rotation.
 - JAR compatibility.
+- Privacy for agents on JAM: their state is public by design.
 - A node-side fast path for actor calls.
 - Concurrent execution of dispatches inside one refine.
 - The Merge lane on JAM.
@@ -139,6 +138,8 @@ everything specific to JAR are not ported; section 17 lists what is reused.
   authenticated origin to the agent. No signed evidence inside guests.
 - Proofs exist for parties outside the space. They reveal only the
   attestable method's return value (section 11.4).
+- Agents on JAM are public. Spaces trust their state as far as JAM's
+  consensus goes, and never put private data there.
 
 ## 6. Agents and actors
 
@@ -159,8 +160,9 @@ accumulate (IC 5).
     and peek-and-hash.
   - precompiles (section 11.2). On JAM, the unknown id returns `WHAT` and
     the guest computes in software.
-  - proof verification (section 11.1). On JAM, the agent runs the verifier
-    program itself.
+- Proofs from other spaces are verified at ingress on VOS, before refine
+  sees them. On JAM, the agent runs the verifier program in refine (section
+  11.1).
 - **Accumulate** uses JAM's accumulate host calls (read, write, transfer,
   provide, solicit, checkpoint, log) plus VOS extensions for page storage,
   Merge emission, external replies and timers.
@@ -194,9 +196,10 @@ impl Ledger {
         /* ... */
     }
 
-    /// Proven: arguments and state read are private, the return value public.
+    /// Proven: reads its arguments and committed fields only, no context.
+    /// Arguments and state stay private; the return value is public.
     #[attestable]
-    async fn settle(&mut self, window: Window, ctx: &mut Context<Self>) -> Settlement { /* ... */ }
+    fn settle(&mut self, window: Window) -> Settlement { /* ... */ }
 
     /// Merge: any replica or device, no log.
     #[msg(merge)]
@@ -211,9 +214,12 @@ impl Ledger {
 - This is the shape on master today (`#[actor]`, `#[messages]`, `async fn`
   handlers with a `Context`). Roles stay as on master.
 - **The context is the actor's whole ABI:** calls, sends, workflow starts,
-  `now`, `random`, `attest`, the caller's identity and logging (section
-  6.5). The context type differs by handler kind, so a query cannot reach
-  a mutating operation.
+  `now`, `random`, the caller's identity and logging (section 6.5). The
+  context type differs by handler kind, so a query cannot reach a mutating
+  operation.
+- **Attestable methods take no context.** The macro rejects any use of
+  fields that are not committed maps, and any call outside the method
+  (section 11.1).
 - The full API is designed in the next planning run [open].
 
 ### 6.3 Execution order and `.await` [decided]
@@ -264,13 +270,15 @@ agent program, which serves them. Precompiles are the one exception
 | `send` to any agent; `start` a workflow | yes | no | no | yes |
 | await another agent, a timer, `checkpoint` | no | no | no | yes |
 | `now`, `random` (fixed per work result) | yes | yes | yes | yes |
-| `attest` (section 11) | yes | no | no | yes |
+| call an `#[attestable]` method (section 11.1) | yes | no | no | yes |
 
 - **The agent enforces this table per invocation at run time.** A raw host
   call outside the invocation's kind fails the invocation.
 - **Unknown ids:** the agent answers any id it does not serve with `WHAT`,
   as a JAM node does. That includes a precompile id an inner machine
   raises on JAM.
+- **Inside an attestable method,** the agent serves no ABI at all. Only
+  precompiles run (section 11.1).
 - An actor cannot touch another instance's state; everything else is a call
   or a message. Custom agents can add operations.
 
@@ -423,8 +431,16 @@ all state (section 12), so it has two paths: VOS and JAM.
   calls B calls A) fails.
 - It may send messages to other agents and start workflows, but may not
   wait for them.
-- Each invocation has a gas limit, fixed per call and independent of how
-  the batch was packed. Exceeding it fails the invocation.
+- **Gas is nested** [proposed]:
+  - Each step has a fixed gas limit, declared per handler with an agent
+    default.
+  - A nested call draws its gas from its caller's remaining gas, so a
+    step's total never exceeds its limit.
+  - The agent dispatches a step only if the refine's remaining gas covers
+    the step's limit; otherwise the step waits for the next refine.
+
+  Exceeding the limit fails the step, the same way however the batch was
+  packed.
 - **A failed step still consumes its input** [decided]:
   - its effects are discarded;
   - the session or pair high-water mark advances;
@@ -457,7 +473,8 @@ Why handlers run to completion:
 - A workflow is started by a message in a session or pair sequence. Its
   result is sent to whoever started it.
 - Long computations run as workflows, preferably in their own agent so their
-  gas does not delay a latency-sensitive agent's batches.
+  gas does not delay a latency-sensitive agent's batches. They call
+  `checkpoint()` explicitly around their effects (section 8.3).
 
 ### 8.3 Snapshots and preemption [decided: snapshots are the only continuation mechanism]
 
@@ -465,13 +482,19 @@ Why handlers run to completion:
   table (page index → page). Pages are 4 KiB. Zero pages and pages
   unchanged from the program image are not stored.
 - On VOS, a snapshot is taken when a workflow step ends.
-- **Preemption** [decided]:
-  - A workflow that exhausts its refine's gas share ends its step there as
-    an implicit checkpoint: effects so far and a snapshot commit together,
-    and it continues in a later refine.
-  - Preemption never happens inside a nested call. A nested call runs to
-    completion under its own fixed gas limit, so no uncommitted writes are
-    ever held across refines.
+- **Preemption** [proposed]. A step's atomicity never depends on gas:
+  - **Effect-free:** a step has no effects until its first call, send or
+    workflow start. Until then it may be preempted when its refine's gas
+    share runs out. The machine stays live, no snapshot is taken, and the
+    step continues in the next refine. After failover it re-runs from the
+    last snapshot, which is safe because nothing escaped.
+  - **Effectful:** before the first effect, the agent checks that the
+    refine's remaining gas covers the step's fixed limit for that phase;
+    otherwise it preempts the still effect-free step there. From the first
+    effect on, the step runs to its end within that limit and is never
+    preempted. Exceeding the limit fails the step.
+  - No uncommitted writes are ever held across refines. A long computation
+    that must make effects calls `checkpoint()` before and after them.
 - After failover, a workflow resumes from its last committed snapshot.
 - On JAM, machines do not survive a refine, so every work package ends with
   a snapshot (the CoreVM model).
@@ -503,12 +526,22 @@ Why handlers run to completion:
   - The receiver processes each sequence in order and keeps its high-water
     mark. A duplicate at or below the mark is dropped; a gap is rejected so
     the sender resends.
-  - For a client session, the receiver also keeps the last reply, to answer
-    a retry.
-- **Client sessions.** Ingress opens a session per client connection or
-  device. Its state is the high-water mark and the last reply, kept until
-  the session expires after inactivity. State is O(active clients), not
-  O(requests), so a busy agent never holds billions of keys.
+  - For a client session, the receiver also keeps the replies of the last
+    W sequence numbers, so a client that pipelines requests can recover
+    any lost reply. A request more than W ahead of the oldest kept reply is
+    refused until the client catches up.
+- **Client sessions:**
+  - **Ids:** the server assigns session ids and never reuses one. Ingress
+    opens a session per client connection or device.
+  - **Sequences** are kept per (session, receiver agent), so requests to
+    different agents never leave gaps in each other's sequence.
+  - **State:** the high-water mark and the window of replies, kept until
+    the session expires after inactivity. Expiry is computed from
+    work-result time, never a local clock. State is O(active clients), not
+    O(requests).
+  - **Expiry:** a request in an unknown or expired session is refused with
+    "session expired" and never executed. The client opens a new session
+    and decides itself whether to resend.
 - **Between agents:**
   - The sender's accumulate assigns sequence numbers, and its outbox resends
     until acknowledged.
@@ -556,7 +589,7 @@ The Local (replica-only) lane is deferred until a use case needs it.
 | `#[msg] fn f(&self)` (query) | any replica (`linearizable`: after a read index) | nothing | applied Linear and Merge state |
 | `#[msg(merge)]` | any replica or device, no log | Merge | Merge |
 | `#[workflow]` | leader, through the log | nothing directly (calls and messages) | its own memory |
-| `#[attestable]` | inside a command or workflow step | as a command | as a command, through witnesses |
+| `#[attestable]` | inside a command or workflow step | committed fields only, returned privately and applied by the caller | its arguments and committed fields, through witnesses |
 
 - The macros generate a view per mode, so misuse fails to compile.
 - The agent also enforces the modes at run time (section 6.5).
@@ -573,14 +606,19 @@ The Local (replica-only) lane is deferred until a use case needs it.
   (`BatchProof`) for attestable methods and JAM witnesses. Only branching
   nodes are stored: about log₂(n) rows per key path.
 - **Compressed root format** [decided]:
-  - a leaf hash commits a domain tag, the fixed-width key and H(value);
+  - a leaf hash commits a domain tag, the fixed-width key, the leaf's salt
+    and H(value);
   - a branch hash commits a different domain tag, its split level and both
     children;
   - spines through empty levels are never hashed;
   - variable-length keys are hashed to a fixed width first;
   - the empty map has a defined root;
   - verifiers check that split levels strictly increase along a path and
-    fit the key width.
+    fit the key width;
+  - **salted leaves** [proposed]: each row stores a random salt of 16
+    bytes, so a root or a path never lets anyone guess low-entropy values.
+    Keys and the tree's shape remain visible in any path that is shared,
+    so paths stay private witnesses.
 
   Non-inclusion of a key k is shown by the leaf for a different key k′
   that k's path reaches. An update costs 8–25 hashes (3–8 µs at 1M–10M
@@ -589,12 +627,19 @@ The Local (replica-only) lane is deferred until a use case needs it.
   math, the attestable kernels and cipher-clerk (`merkle.rs`,
   `state_root.rs`, `succinct.rs`, `snapshot.rs`), which the owner cleared
   to change.
-- **Root maintenance** [proposed]: replicas maintain node rows
-  incrementally in accumulate, as each entry's committed writes apply. That
-  is 8–25 hashes per committed write, within the invocation budget. A
-  settlement boundary then needs no batch recomputation that would stall
-  accumulate (a 10,000-update batch took about 64 ms in S4, including the
-  tree walk).
+- **Root maintenance** [proposed]:
+  - Accumulate only records each committed write's key as dirty, one row
+    each, so the apply path stays at table cost.
+  - A deterministic background task builds node rows in sorted batches
+    from a storage snapshot at an exact applied index, off the apply
+    thread. Batches of 10,000 rewrite 7–10 node rows per update; single
+    updates rewrite 20–24 (S4).
+  - An attest waits for the root at its window's applied index.
+
+  Maintaining node rows inside accumulate would cost about 35–45 µs per
+  committed write (8–25 hashes plus 20–24 row writes at about 1.5 µs).
+  That would cap a ledger at about 12k transfers per second per agent,
+  below the replication budget.
 - Hashing inside the PVM uses the hash precompile (section 11.2).
 - No global state root on VOS. Agents deployed on JAM keep one.
 
@@ -626,15 +671,22 @@ The Local (replica-only) lane is deferred until a use case needs it.
   - Their cited parents may arrive later.
   - The chain head is signed once per commit. Devices accept such nodes
     only as ancestors of a signed head.
-- **Authors.** An author is a device key or a node key, never a principal.
-  The scope's membership maps principals to their authors. A thin client's
-  `#[msg(merge)]` operation is authored by the node that ran it, on the
-  principal's behalf.
+- **Authors** [proposed]:
+  - An author is a chain of signed nodes under one key for one principal:
+    (device key, principal) or (node key, principal). A thin client's
+    `#[msg(merge)]` operation goes on the chain of the node that ran it,
+    for that principal. Removing a user never cuts off other users of the
+    same node.
+  - A node takes a fresh author key on every start, and a device on every
+    install or restore. A crash or a backup therefore never reuses a
+    sequence number under an old key.
+  - The scope's membership maps principals to their author chains.
 - **Authorization rule** (starting design, to be property-tested):
   1. A membership change is a Linear step that emits an epoch node E_n.
      E_n cites the Merge heads the leader had applied at that point.
-  2. Removing an author A records cutoff_A: A's latest node among those
-     heads, identified by its CID.
+  2. Removing a principal records, for each of its author chains A,
+     cutoff_A: A's latest node among those heads, identified by its CID.
+     Removals are Linear steps issued by a member whose role allows it.
   3. Every author node is signed, carries the author's sequence number (the
      previous node's plus one, linked to it) and has an epoch node in its
      causal past.
@@ -642,17 +694,22 @@ The Local (replica-only) lane is deferred until a use case needs it.
      the node is an ancestor of or equal to cutoff_A for every later epoch
      that removed A. Re-admission at epoch r requires E_r in the node's
      causal past.
-  5. Two nodes by one author with the same sequence number are an
-     equivocation. Both are rejected, and the author is removed.
+  5. Two nodes on one author chain with the same sequence number are an
+     equivocation. Both stay in the DAG, because other authors' nodes may
+     cite them, but their operations are filtered when read, and the
+     chain's key is removed.
   6. Operations invalidated by a later epoch are filtered when read, by
-     (author, position relative to the cutoff), not unapplied. Lists and
-     sets need nothing else; LWW maps keep their top two values per key.
+     (author chain, position relative to the cutoff), not unapplied. Lists
+     and sets need nothing else. An LWW map keeps the latest write per
+     (key, author chain), and a read takes the latest among unfiltered
+     chains.
 
   The decision depends only on the log and the DAG, so every replica
   agrees. It costs O(1) per operation with per-author epoch intervals.
 - **Merge-only agents** have no log only if they have no Linear state, no
-  workflows and no outbox. `#[msg(merge)]` handlers cannot send messages or
-  start workflows.
+  workflows, no outbox and no membership. Any scope with members needs a
+  log, because epochs and removals are Linear steps. `#[msg(merge)]`
+  handlers cannot send messages or start workflows.
 
 ### 9.5 Storage engine [decided: LSM; layout and durability proposed]
 
@@ -692,7 +749,7 @@ node-level log, keyed by (agent, index):
 - writes that only move the commit index are not fsynced.
 
 **Applied state without fsync** [proposed]. Accumulate writes each entry as
-one atomic batch without fsync. This is safe under six invariants:
+one atomic batch without fsync. This is safe under seven invariants:
 
 1. The batch includes the new applied index.
 2. State and log share the one journal, so after a crash the store
@@ -700,11 +757,13 @@ one atomic batch without fsync. This is safe under six invariants:
    the log write before it.
 3. Only entries committed by quorum are applied, never the leader's
    pending overlay.
-4. Log truncation and Raft snapshots stay at or below the durable applied
-   index.
+4. Local log truncation stays at or below the durable applied index. An
+   exported Raft snapshot may come from any consistent applied index.
 5. Accumulate reads no local clock or other node-local input.
 6. Snapshot ingestion is fsynced before the applied index that depends on
    it is recorded.
+7. A blob that an entry references (snapshot pages, witnesses) is durable,
+   or in the same journal, before the entry is proposed.
 
 Every node-log fsync then also makes all earlier apply batches durable, so
 no separate checkpoint mechanism exists. After a crash, the node re-applies
@@ -743,29 +802,38 @@ outbox sequence numbers, which receivers deduplicate.
   8 KiB per replica (S3).
 - **Many active agents per node** are not yet within budget. With S3's
   prototype node writer, p99 was 16–56 ms at 16 active agents and up to
-  191 ms at 64, and leaders were lost at 1,000 (section 14).
+  191 ms at 64, and leaders were lost at 1,000 (section 14; work item 16).
 - Rebalancing uses membership changes (joint consensus exists in vos-raft).
 
 ## 11. `#[attestable]` [decided intent and direction; sizes proposed]
 
-### 11.1 Mechanism
+### 11.1 Mechanism [decided: restricted methods; details proposed]
 
 - An `#[attestable]` method is compiled into its own small program and
-  shipped in the package.
-  - Its private inputs are its arguments and the actor state it reads,
-    delivered as witnesses: rows plus a `BatchProof` against
-    `CommittedMap` roots.
-  - Its return value is public, together with the roots before and after
-    and the program hash.
+  shipped in the package. It is pure: it uses no context and makes no calls,
+  sends, `now` or `random`; only precompiles run inside it. The macro
+  enforces this.
+- **Inputs** (private): its arguments, plus the committed fields it reads,
+  delivered as witnesses (rows plus a `BatchProof` against `CommittedMap`
+  roots). Plain fields and tables have no root, so the macro rejects any
+  use of them.
+- **Outputs:**
+  - **public:** the return value, the roots before and after, and the
+    program hash;
+  - **private:** its writes to committed fields, bound by the root after.
+    The enclosing command applies them as ordinary writes.
 - A live call runs that same program as an inner machine, so what runs is
-  what gets proven. The call records the program hash, a hiding commitment
-  to its inputs, and the output.
-- The witness and the record are stored with the agent's replicated state,
-  so losing the producing node cannot make a settlement window unprovable.
-- Proving is asynchronous (prover service). Proofs are content-addressed and
-  attached to messages for other spaces or JAM.
-- **Verification**:
-  - On VOS, a VOS extension call served by the node.
+  what gets proven. The agent records the program hash, the witness and the
+  output with the agent's replicated state. The record is internal to the
+  space, so losing the producing node cannot make a settlement window
+  unprovable.
+- Proving is asynchronous, by a prover inside the space's trust domain
+  (section 11.4). Proofs are content-addressed and attached to messages
+  for other spaces or JAM.
+- **Verification** [proposed]:
+  - On VOS, the receiving node verifies a proof at ingress, where trust
+    changes, before the message enters the log. Refine sees only verified
+    claims, and a batch never stalls on a verification that takes seconds.
   - On JAM, an on-chain agent's refine runs the verifier program itself,
     and its accumulate applies the public output. Earlier work measured the
     settlement verifier at about 10.7M PVM cycles for one segment; a whole
@@ -804,8 +872,9 @@ outbox sequence numbers, which receivers deduplicate.
 
 ### 11.3 Cost and size guideline [proposed]
 
-- **Prover memory per segment** ≈ 4.6 GiB + 170 KiB × steps + 50 MiB ×
-  compressions (S5, S5b). Segments are sized to the prover's memory, not to
+- **Prover memory per segment** ≈ 4.6 GiB + 170 KiB × steps + 39 MiB ×
+  compressions (S5, S5b). Steps include the 66 a compression takes, so a
+  compression costs about 50 MiB in all. Segments are sized to the prover's memory, not to
   steps alone. On a 24 GiB prover that means about 2^16 steps with about
   200 compressions; a 2^16-step segment of hash-heavy code (about 1,000
   compressions) would need about 50 GiB.
@@ -845,20 +914,45 @@ Requirements before any proof leaves a space:
 1. **Zero-knowledge proving:** hiding trace commitments and openings in the
    prover and its chips.
 2. **Witness-free verification of attestable programs:** everything an
-   attestable run depends on is proven in the AIR. Its precompile calls are
-   already in-AIR (S5b), and it has no other host-call boundaries.
-3. **A hiding commitment, or none:** no plain hash of private arguments in
-   anything published.
-4. **Public outputs only:** the return value, the roots and the program
-   hash.
-5. **Window aggregation** for on-chain verification. A window is many
+   attestable run depends on is proven in the AIR. Attestable methods are
+   pure (section 11.1), so their only host calls are precompiles, which
+   are already in-AIR (S5b).
+3. **No plain hash of private inputs** in anything published.
+4. **A minimal published format.** A published proof carries only:
+   - the public output: the return value, the roots and the program hash;
+   - a fixed shape class.
+
+   Today's bundle also carries the gas limit, host boundaries and
+   per-slice machine states, which must stay out.
+5. **Fixed shape classes:** segment counts and trace sizes are padded to a
+   few canonical shapes (the existing canonical-shape work), so a proof
+   does not reveal how busy a window was.
+6. **Window aggregation** for on-chain verification. A window is many
    segments, and it must fit a JAM work package and the on-chain verifier's
    gas.
+
+Around the proof:
+
+- **The prover runs inside the space's trust domain.** It sees every
+  witness, so proving is never outsourced to a party outside the space.
+- **Leaves are salted** (section 9.3), so published roots do not let anyone
+  guess low-entropy values.
+- **Agents on JAM are public by design** (section 12). Private data stays in
+  VOS spaces; only proofs and their public outputs reach JAM.
 
 These form a prover track that runs alongside the core slices (section 16).
 
 ## 12. JAM integration [decided: early]
 
+- **What runs on JAM** [decided]: public agents holding global data that
+  spaces agree on. They verify proofs from spaces and never produce any.
+  For example:
+  - **Cross-space value transfer:** one agent per space holds the space's
+    aggregate balance. A space proves a settlement window, and its agent
+    moves the net amounts between space agents. Inside each space,
+    accounts stay private, so the space works like a mixer to the outside.
+  - **Collectives:** each space joins through an on-chain agent that
+    represents it and votes.
 - Agent programs are valid JAM services from the first slice. A JAM
   host-call CI harness runs them from slice 2.
 - **One PVM version for everything: Gray Paper 0.8.0** [decided by SJ]:
@@ -901,8 +995,8 @@ These form a prover track that runs alongside the core slices (section 16).
     programs (`machine` with bare code, then `pages` and `poke`);
   - snapshot pages carried through export and import segments;
   - witnessed state reads on the compressed root format.
-- **Next:** an on-chain verifier agent that accepts proofs from a space
-  (Clerk settlement), once the privacy track's aggregation exists.
+- **Next:** the per-space aggregate-balance agent that accepts settlement
+  proofs (Clerk settlement), once the privacy track's aggregation exists.
 
 ## 13. Portability [decided direction]
 
@@ -919,10 +1013,11 @@ These form a prover track that runs alongside the core slices (section 16).
 
 | Path | Budget | Measured | Status |
 |---|---|---|---|
-| Actor invocation, refine and accumulate, one node | ≤ 50 µs | 3.6–5.0 µs marginal on an in-memory store (S2); about 15–20 µs with storage and pool reset | passes with section 16 work |
+| Actor invocation, refine and accumulate, one node | ≤ 50 µs | 3.6–5.0 µs marginal on an in-memory store (S2); estimated 15–20 µs with storage and pool reset | passes with section 16 work |
+| Committed-map write on the apply path [proposed] | ≤ 5 µs; background root building keeps up with apply | not yet measured; node rows in accumulate would cost 35–45 µs (S4) | needs background roots |
 | Fixed cost per refine [proposed] | ≤ 50 µs; pooled acquire and reset ≤ 5 µs; a new machine ≤ 50 µs | 0.8–1.6 ms today (S2) | needs the pool |
 | Replicated agent on 3 LAN nodes, simple mutations | ≥ 20k per second per agent; p99 commit ≤ 10 ms at half load | about 25k/s at p99 8 ms with the prototype driver, on redb, one process, one disk (S3) | passes with section 16 work; repeat on fjall and a network |
-| Many active agents per node [proposed] | 64 active agents: ≥ 40k commits per second in total, p99 ≤ 20 ms | 6.3–26k/s at p99 31–191 ms (S3) | fails |
+| Many active agents per node [proposed] | 64 active agents: ≥ 40k commits per second in total, p99 ≤ 20 ms | 6.3–26k/s at p99 31–191 ms (S3) | fails; work item 16 |
 | Workflow snapshot capture plus restore, up to 50 KB | ≤ 1 ms | about 16 µs estimated capture (S1); restore 0.1 ms fresh JIT, plus about 0.5 ms first resume today | passes with section 16 work; pooled restore not yet measured |
 | Table point read or write at 10M rows (host cost) | ≤ 5 µs | write 1.5 µs; read 5.2–5.6 µs warm, about 0.1 ms cold (S4) | writes pass; reads fail narrowly |
 | Query on a follower | ≤ 100 µs | 1.5–2.3 µs of execution plus reads (S2, S4) | passes warm |
@@ -975,16 +1070,21 @@ With a risk check:
 Settlement proof:
 
 1. For each settlement window, a command calls `ledger.settle(window)`, an
-   `#[attestable]` method. Its program runs live, hashing through the
-   precompile. The witness and a record with a hiding commitment to the
-   inputs are replicated with the agent.
-2. The prover service proves the window asynchronously, in segments sized
+   `#[attestable]` method. Its program runs live on witnessed committed
+   rows, hashing through the precompile, and returns the `Settlement` plus
+   its private writes, which the command applies. The witness and record
+   are replicated with the agent.
+2. The space's prover proves the window asynchronously, in segments sized
    to its memory, aggregates them and publishes the proof. Only the
-   `Settlement` return value, the roots and the program hash are public.
-3. A bridge instance sends the claim and proof to bank B's space, whose
-   agent verifies it and credits the account.
-4. On JAM, a verifier agent checks both banks' window claims in refine and
-   records net positions in accumulate.
+   `Settlement` return value, the roots and the program hash are public,
+   in a fixed shape class.
+3. A bridge instance sends the claim and proof to bank B's space. B's
+   ingress verifies it before it enters B's log, and B's agent credits the
+   account.
+4. On JAM, each bank's space has an agent holding the space's aggregate
+   balance. It verifies the window proof in refine and moves the net
+   amounts between space agents in accumulate. Individual accounts never
+   appear on JAM.
 
 ### 15.2 Community channel
 
@@ -1006,7 +1106,7 @@ channels they belong to.
    reaches the same result.
 4. Feed reads use local Merge state on the device or any node.
 
-## 16. Work the spikes and review require
+## 16. Work the spikes and reviews require
 
 Each item is required for the budget, decision or finding it names;
 prototypes exist where noted.
@@ -1020,60 +1120,68 @@ prototypes exist where noted.
 3. The machine pool and the prepared-program cache, keyed by program hash,
    gated by the pooled-against-fresh differential test (S2).
 4. Precompiles on the refine path, BLAKE2b first (S5b; prototype on branch
-   `exp/gp-precompiles`). Precompile gas (section 11.2) is decided before
-   this lands.
+   `exp/gp-precompiles`), priced in VOS gas (section 11.2).
 5. Remove every JAR leftover (section 12).
 6. JIT host-call exit cost, the main lever on short handlers (section
-   6.6).
+   6.6). Tuned once a real agent exists to profile (build step 2).
 
 **Prover and privacy track** (alongside the core slices)
 
 7. Chained segments on the refine path, sized by prover memory (S5, S5b).
 8. Reduce the BLAKE2b chip's memory per compression (S5b).
 9. Zero-knowledge proving (section 11.4, requirement 1).
-10. Witness-free verification of attestable programs, and a hiding input
-    commitment (section 11.4, requirements 2 and 3).
-11. Window aggregation for on-chain verification (section 11.4,
-    requirement 5).
-12. Move Ristretto and the scalar operations (ids 110–114) into the VOS
+10. Witness-free verification of attestable programs, with no plain hash of
+    private inputs (requirements 2 and 3).
+11. The minimal published proof format and fixed shape classes
+    (requirements 4 and 5).
+12. Window aggregation for on-chain verification (requirement 6).
+13. Move Ristretto and the scalar operations (ids 110–114) into the VOS
     range, with the `WHAT` fallback in the guest crypto wrappers.
 
 **Storage**
 
-13. The LSM engine: one keyspace, partitions per data class, agent prefixes,
+14. The LSM engine: one keyspace, partitions per data class, agent prefixes,
     and reads within budget (S4).
-14. The node log writer with capped flushes, non-durable apply under
+15. The node log writer with capped flushes, non-durable apply under
     section 9.5's invariants, and Raft snapshot export and ingestion
     (S3, S4).
-15. The compressed root format across `CommittedMap`, `BatchProof`, the
-    witness math and cipher-clerk, with incremental root maintenance (S4).
-16. A path for large entries (open question 3), settled before item 14.
+16. Many active agents per node within budget: writer batching, liveness
+    and executor scheduling under load, with a test of 64 or more active
+    agents (S3, section 14).
+17. The compressed root format with salted leaves, across `CommittedMap`,
+    `BatchProof`, the witness math and cipher-clerk; dirty-key recording
+    in accumulate and background root building (S4, section 9.3).
+18. A path for large entries (open question 3), settled before item 15.
 
 **Replication and merge**
 
-17. The vos-raft driver (S3; prototype in `spikes/s3-raft/vos-raft-eager`):
+19. The vos-raft driver (S3; prototype in `spikes/s3-raft/vos-raft-eager`):
     - group commit and replicate-on-propose;
     - eager commit notification;
     - one shared executor;
     - heartbeats that never wait on log I/O, combined per node pair, with
       quiescence for idle groups.
-18. Incremental merkle-crdt apply per sync scope, with local operations in
-    place, storage-backed CRDT types and read-time filtering (S6).
-19. LZ4-compressed snapshot pages (S1).
+20. Incremental merkle-crdt apply per sync scope, with author chains, local
+    operations in place, storage-backed CRDT types and read-time filtering
+    (S6, section 9.4).
+21. LZ4-compressed snapshot pages (S1).
 
 **Build order** [proposed]:
 
-1. PVM base: items 1–6, BLAKE2b precompile only.
-2. One node: the actor framework, the default agent, the actor ABI with
-   run-time enforcement, the LSM engine (item 13), client sessions, and the
-   JAM host-call CI harness.
-3. Large entries (item 16), then replication: items 14 and 17.
-4. The compressed root format and witnessed state reads (item 15),
-   workflows and snapshots (item 19), then the first JAM milestone.
-5. Attestable methods and Clerk on the prover track's results (items 7–12).
-6. The Merge lane (item 18).
+1. **PVM base:** items 1–5, BLAKE2b precompile only.
+2. **One node:** the actor framework with restricted attestable methods,
+   the default agent, the actor ABI with run-time enforcement and nested
+   gas, the LSM engine (item 14), client sessions, and the JAM host-call
+   CI harness. Then item 6, profiled on this agent.
+3. **Replication:** large entries (item 18) first, then items 15, 16 and
+   19.
+4. **JAM:** the compressed root format and witnessed state reads (item
+   17), workflows and snapshots (item 21), then the first JAM milestone.
+5. **Attestable methods and Clerk,** on the prover track's results (items
+   7–13).
+6. **The Merge lane** (item 20).
 
-The prover and privacy track (items 7–12) starts with step 1, because zero
+The prover and privacy track (items 7–13) starts with step 1, because zero
 knowledge and aggregation are the longest work and gate goal 8.
 
 ## 17. Reused from earlier code
@@ -1124,6 +1232,10 @@ knowledge and aggregation are the longest work and gate goal 8.
 12. JAM witness format; DA retention for long-waiting workflows.
 13. Devices running merge handlers locally (local-first) versus thin
     clients.
-14. Workflow deadline defaults and timer precision; session expiry
-    defaults.
+14. Workflow deadline defaults and timer precision; session expiry and the
+    reply window W.
 15. Whether workflows need external signals beyond replies and timers.
+16. Default gas limits per handler kind, and how an agent declares them.
+17. The JAM agents' designs: the per-space aggregate-balance agent (how a
+    space's net positions settle, and what a mixer-like space reveals by
+    its flows), and collectives that vote.
