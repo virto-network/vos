@@ -1,0 +1,14 @@
+[workspace]
+
+[package]
+name = "s6-merge"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+merkle-crdt = { path = "../../support/merkle-crdt" }
+blake2b_simd = "1"
+
+[profile.release]
+debug = 1

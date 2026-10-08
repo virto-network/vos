@@ -1,7 +1,7 @@
 # VOS core model
 
 Draft 2, planning run 2 (2026-10-08), updated with the run 3 spikes done so
-far (SJ, S1, S3, S2, S4; results in `spikes.md`). Draft 1 was reviewed by the
+far (SJ, S1, S3, S2, S4, S6; results in `spikes.md`). Draft 1 was reviewed by the
 project owner and by a second-opinion architecture review; the adopted
 changes are listed below. Tags: **[decided]** confirmed by the project
 owner, or settled by a spike the owner delegated the choice to;
@@ -486,8 +486,13 @@ The macros generate a view per mode, so forbidden access fails to compile.
   - validate only new nodes;
   - derive which heads are subsumed from the fetch frontier.
   
-  No whole-DAG rebuild at runtime. Gate: cost per operation at 1M
-  operations within 2× of the cost at 1k.
+  No whole-DAG rebuild at runtime. Local operations apply in place, with
+  no state clone. Gate: cost per operation at 1M operations within 2× of
+  the cost at 1k. S6 measured it:
+  - the current library: syncing one operation takes 2.3 ms at 1k
+    operations of history and 8.7 s at 1M;
+  - a 40-line incremental prototype on the library's `fetch_missing`:
+    1.1–1.9 µs per operation, 1.5–1.8× from 1k to 1M.
 - CRDT types are storage-backed. The v2 `List` rebuilds its whole order on
   every call and never drops tombstones, so it is replaced.
 - **Linear-emitted chain.** Linear handlers may emit Merge operations, for
@@ -665,7 +670,7 @@ vos-raft's core free of threads.
 | Workflow snapshot capture plus restore, up to 50 KB | ≤ 1 ms | S1: passes with dirty tracking and pooled images |
 | Table point read or write at 10M rows (host cost) | ≤ 5 µs | S4: writes pass on an LSM (1.5 µs) but not on redb (18 µs); reads about 5 µs on the LSM, 1.6 µs on redb |
 | Query on a follower | ≤ 100 µs | S2: 1.5–2.3 µs of execution with warm machines; storage reads in S4 |
-| Merge apply, cost per operation at 1M operations | ≤ 2× the cost at 1k | S6 |
+| Merge apply, cost per operation at 1M operations | ≤ 2× the cost at 1k | S6: passes with incremental apply (1.5–1.8×, about 1.9 µs); the current library fails (3,700×) |
 | 1,000 mostly idle Raft groups per node | no thread per group; idle CPU ≤ 5% of one core | S3: passes on a shared executor at a 500 ms heartbeat (about 1.6%) |
 
 No hot path may grow with history length.
@@ -737,9 +742,9 @@ lane of channels they belong to.
 
 ## 16. Spikes (run 3)
 
-SJ, S1, S3, S2 and S4 are done; results are in `spikes.md`. SJ part b, a
-workflow suspended across work packages, moved to the first JAM milestone.
-Next: S6, then S5.
+SJ, S1, S3, S2, S4 and S6 are done; results are in `spikes.md`. SJ part b,
+a workflow suspended across work packages, moved to the first JAM
+milestone. Next: S5.
 
 | Spike | Measures | Gate |
 |---|---|---|

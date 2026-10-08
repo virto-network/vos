@@ -529,3 +529,64 @@ interpreter (175×) and 4.7 µs on the JIT (28×).
 - Roots and node rows are updated only at attest or settlement boundaries,
   in sorted batches.
 - The native hash host call is required for tree math inside the PVM.
+
+## S6 — Merge apply
+
+**Setup.** `spikes/s6-merge`, using `support/merkle-crdt` with an in-memory
+store and BLAKE2b CIDs. The workload is a last-writer-wins map over 100,000
+keys. A replica holds a history of H operations: a chain with a concurrent
+branch merged every 64 operations. A peer adds 1 or 100 operations on top,
+and the replica syncs them.
+
+Two replicas are compared:
+
+- **current:** the library's `MerkleCrdt`. Each sync re-validates the whole
+  reachable DAG (`ancestry_is_valid`, which re-hashes every node), then
+  rebuilds state from every node (`materialize`). Each local operation
+  clones the whole state first.
+- **incremental:** a 40-line prototype on the library's own
+  `fetch_missing`. It applies only the fetched nodes, which arrive
+  topologically sorted with their CIDs checked, onto the current state.
+  The new roots follow from the fetched set: local roots that a fetched
+  node points to are dropped, and the remote root is added. After the
+  runs, its state equals a full rebuild.
+
+**Result** (median time per synced operation).
+
+| History | Current: sync 1 | Current: sync 100 (per op) | Current: local op | Incremental: sync 1 | Incremental: sync 100 (per op) |
+|---|---|---|---|---|---|
+| 1k | 2.3 ms | 25 µs | 17 µs | 1.06 µs | 1.17 µs |
+| 10k | 25 ms | 196 µs | 26 µs | 1.03 µs | 1.02 µs |
+| 100k | 441 ms | 3.7 ms | 339 µs | 1.44 µs | 1.33 µs |
+| 1M | 8.7 s | 72 ms | 478 µs | 1.87 µs | 1.77 µs |
+
+**Findings.**
+
+- **The current library fails the merge budget by more than three orders of
+  magnitude.** Sync cost grows linearly with history: 3,700× from 1k to 1M.
+  The local operation grows with state size, because of the clone.
+- **Incremental apply meets the gate:** 1.5–1.8× from 1k to 1M, the residue
+  being the in-memory store's ordered map. The rewrite is small: the
+  library's fetch and topological sort are reused as they are.
+
+**Caveats.**
+
+- With the node's LSM store, each fetched node adds a store lookup and
+  write, about 1.5–3 µs (S4).
+- Author signature checks (accept-all here) add their own cost per node.
+  They still scale with the fetched nodes, not with history.
+- Sequence CRDTs such as lists have their own per-operation costs. The v2
+  `List` that rebuilds its order on every call is already marked for
+  replacement (section 9.4).
+- The epoch authorization rule is not measured.
+
+**Decision.**
+
+- **Merge budget:** passes with incremental apply; fails with the current
+  library.
+- The apply path is rewritten as section 9.4 specifies:
+  - validate and apply only the fetched nodes;
+  - derive the heads from the fetch frontier;
+  - apply local operations in place, with no state clone.
+
+  Full validation and rebuild remain only for recovery and audits.
