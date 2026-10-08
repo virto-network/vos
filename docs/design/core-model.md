@@ -1,8 +1,10 @@
 # VOS core model
 
-Draft 2, planning run 2 (2026-10-08). Draft 1 was reviewed by the project
-owner and by a second-opinion architecture review; the adopted changes are
-listed below. Tags: **[decided]** confirmed by the project owner;
+Draft 2, planning run 2 (2026-10-08), updated with the first batch of run 3
+spikes (SJ, S1, S3; results in `spikes.md`). Draft 1 was reviewed by the
+project owner and by a second-opinion architecture review; the adopted
+changes are listed below. Tags: **[decided]** confirmed by the project
+owner, or settled by a spike the owner delegated the choice to;
 **[proposed]** recommendation awaiting review; **[open]** left for a later
 run.
 
@@ -39,6 +41,28 @@ not ported; section 17 lists what is reused.
   lane is deferred until something needs it.
 - Machines are created from a pool of prepared program images. A node-side
   fast path for simple actor calls waits for spike S2's numbers.
+
+## Changes from the first spike batch
+
+- **PVM version (SJ):** Gray Paper 0.8.0 for the runtime, compiler, prover
+  and agents. A Rust service built with our toolchain ran unchanged on a
+  PolkaJam testnet. Master's JAR profile and its block gas model are
+  dropped (section 12).
+- **Snapshot runtime work (S1):** the snapshot gate passes, but only with
+  native dirty-page tracking, a copy-on-write image pool, no full-span
+  permission sync, and LZ4 for shipped pages (section 8.3).
+- **Raft driver (S3):** vos-raft's protocol core is kept; openraft is not
+  faster. Its driver is rewritten:
+  - group commit;
+  - replicate on propose;
+  - no fsync for commit-index-only writes;
+  - a shared executor;
+  - liveness that never waits on log I/O.
+
+  Commit latency no longer depends on the heartbeat (section 10).
+- **Storage (S3):** one log writer per node commits every agent's pending
+  log writes with one fsync. Applied state is not fsynced per log entry
+  (section 9.5).
 
 ## 1. Goals
 
@@ -331,10 +355,19 @@ async fn transfer(wf: &mut Workflow, req: TransferReq) -> Result<Receipt, Error>
   next refine. After failover, the step re-runs from the last snapshot; its
   effects were never committed. On JAM, machines do not survive a refine, so
   every work package ends with a snapshot (the CoreVM model).
-- Changed pages are always shipped in full in the work result. They are
-  never referenced by hash alone, because garbage collection could remove a
-  matching page first. Later: XOR deltas against the previous version, with
-  LZ4.
+- Changed pages are always shipped in full in the work result, compressed
+  with LZ4. They are never referenced by hash alone, because garbage
+  collection could remove a matching page first. Later: XOR deltas against
+  the previous version.
+- Runtime requirements measured in S1:
+  - native dirty-page tracking on the interpreter and the JIT: about
+    16 µs per capture, versus about 1 ms to scan an 8 MiB heap;
+  - machines restored from a copy-on-write image pool: a JIT restore takes
+    about 0.1 ms, but the interpreter clones fixed tables for 2.3 ms;
+  - no full-span permission sync, which costs about 0.5 ms on a fresh JIT
+    machine's first resume.
+
+  A typical suspension changes 3 pages, which compress to under 1 KiB.
 - A Merkle root over the page table is computed only for JAM and for
   attestable runs.
 - The leader caches live machines keyed by (workflow, last committed
@@ -446,10 +479,31 @@ The macros generate a view per mode, so forbidden access fails to compile.
 ### 9.5 Storage engine [proposed]
 
 One embedded key-value store per node (redb first), with per-agent keyspaces:
-Linear state; Merge state and DAG; the page store; system tables (dedup and
-high-water marks, outbox, workflows, timers); and the agent's Raft log. One
-transaction per applied log entry. Layout and group commit across agents are
-settled by benchmark.
+Linear state; Merge state and DAG; the page store; and system tables (dedup
+and high-water marks, outbox, workflows, timers).
+
+An fsync costs 0.35–0.5 ms on a consumer NVMe, so batching outweighs every
+other storage cost (S3).
+
+- **One log writer per node.** Every agent's Raft log goes to one node-level
+  log. Its writer drains the pending writes of all agents, commits them in
+  one transaction with one fsync, then acknowledges each.
+  - The log is one table keyed by (agent, index).
+  - Storage I/O never runs on executor threads.
+  - Writes that only move the commit index are not fsynced.
+
+  In S3, separate stores per agent lost leaders from 64 active agents up,
+  and one shared store committed from each task serialized its writers.
+- **Applied state is not fsynced per entry.** The log is durable, so
+  accumulate commits without fsync and makes the state durable
+  periodically, recording the applied index. After a crash, the node
+  re-applies the log from that index. Accumulate is deterministic, so
+  replies sent after a non-durable apply stay correct. Otherwise every
+  applied entry would pay a full fsync.
+- redb is within 2× of a raw append for batched and large writes. A raw
+  append-only segment log replaces it for the log if large entries make
+  that difference matter; witnesses and snapshot pages are the likely
+  cases.
 
 ## 10. Replication and placement [decided: one log per agent]
 
@@ -459,10 +513,24 @@ settled by benchmark.
 - Raft snapshots of agent state bound log size. Installing one costs
   O(state), never O(history).
 - Agents with only Merge state have no log.
-- **Many groups per node.** vos-raft's `std` driver spends an OS thread per
-  group and one per sleep. It is replaced by a shared executor; heartbeats
-  are combined per node pair, idle groups go quiet and fsyncs are batched.
-  Gate in spike S3: 1,000 mostly idle groups per node.
+- **The vos-raft driver is rewritten; the protocol core stays.** In S3, the
+  existing driver committed only on the next heartbeat and fsynced once per
+  proposal and again per commit advance: about 1.2k commits/s at p99
+  58 ms. A 165-line prototype passed all of vos-raft's tests and met the
+  budget: about 25k/s at p99 8 ms, peaking at 44k/s. openraft managed
+  2.5k/s on the same store. The new driver:
+  - appends all queued proposals in one batch (group commit);
+  - sends new entries to followers at once, with one append in flight per
+    peer;
+  - runs every group on one shared executor; the thread-per-group `Worker`
+    is dropped;
+  - keeps liveness independent of log I/O. Followers answer heartbeats
+    without waiting for the store, and heartbeats are combined per node
+    pair. In S3, waiting on the store lost leaders at 1,000 active agents.
+- **The heartbeat sets failure detection only.** Commits no longer wait for
+  it, so idle groups heartbeat slowly or quiesce. In S3, 1,000 idle groups
+  at a 500 ms heartbeat cost about 1.6% of a core per node, 5 threads and
+  about 8 KiB per replica.
 - Rebalancing uses membership changes (joint consensus exists in vos-raft).
 
 ## 11. `#[attestable]` [decided intent, proposed mechanism]
@@ -513,12 +581,21 @@ fn apply_batch(w: Witness<LedgerSlice>, batch: Batch) -> Transition { /* ... */ 
     slot.
 - Refine witnesses are built by simulating refine off-chain, as CoreVM's
   builder does. Actor and workflow programs are preimages.
-- One PVM version and gas model for everything (runtime, compiler, prover,
-  agents). Today they disagree: master defaults to JAR v0.8 block gas (the
-  only model the JIT implements), the saga targets Gray Paper v0.8.0, and the
-  jar entry-point work was pinned to Gray Paper 0.7.2. Spike SJ chooses.
+- **One PVM version for everything: Gray Paper 0.8.0** [decided by SJ]. It
+  covers the runtime, compiler, prover and agents, and the saga's 0.8.0
+  PVM layer is the base. Master's JAR capability-kernel profile and its
+  block gas model are dropped. The saga's interpreter and JIT both charge
+  the exact 0.8.0 block gas model in conformance mode.
+  In SJ, a Rust service linked with our toolchain ran unchanged on a
+  PolkaJam 0.1.29 testnet: refine on the guarantors and accumulate on all
+  seven validators.
+- Deployment tooling waits until the code preimage is available at the
+  package's lookup anchor. A submission made earlier refines to `BAD`.
 - First milestone: the default agent and one actor deployed on a JAM node,
   with a workflow suspended in one work package and resumed in a later one.
+  It needs the agent framework's loader, which builds inner machines from
+  standard programs (`machine` with bare code, then `pages` and `poke`) and
+  carries snapshot pages through export and import segments.
 - Next: an on-chain verifier agent that accepts proofs from a space (Clerk
   settlement).
 
@@ -533,15 +610,15 @@ vos-raft's core free of threads.
 
 ## 14. Performance budgets [decided; numbers validated in run 3]
 
-| Path | Budget |
-|---|---|
-| Actor invocation, refine and accumulate, one node | ≤ 50 µs |
-| Replicated agent on 3 LAN nodes, simple mutations | ≥ 20k per second per agent; p99 commit ≤ 10 ms at half load |
-| Workflow snapshot capture plus restore, up to 50 KB | ≤ 1 ms |
-| Table point read or write at 10M rows (host cost) | ≤ 5 µs |
-| Query on a follower | ≤ 100 µs |
-| Merge apply, cost per operation at 1M operations | ≤ 2× the cost at 1k |
-| 1,000 mostly idle Raft groups per node | no thread per group; idle CPU ≤ 5% of one core |
+| Path | Budget | Run 3 |
+|---|---|---|
+| Actor invocation, refine and accumulate, one node | ≤ 50 µs | S2 |
+| Replicated agent on 3 LAN nodes, simple mutations | ≥ 20k per second per agent; p99 commit ≤ 10 ms at half load | S3: passes with the new driver (about 25k/s at p99 8 ms); fails with the current one |
+| Workflow snapshot capture plus restore, up to 50 KB | ≤ 1 ms | S1: passes with dirty tracking and pooled images |
+| Table point read or write at 10M rows (host cost) | ≤ 5 µs | S4 |
+| Query on a follower | ≤ 100 µs | S2 |
+| Merge apply, cost per operation at 1M operations | ≤ 2× the cost at 1k | S6 |
+| 1,000 mostly idle Raft groups per node | no thread per group; idle CPU ≤ 5% of one core | S3: passes on a shared executor at a 500 ms heartbeat (about 1.6%) |
 
 No hot path may grow with history length.
 
@@ -612,7 +689,9 @@ lane of channels they belong to.
 
 ## 16. Spikes (run 3)
 
-First batch: SJ, S1, S3.
+The first batch (SJ, S1, S3) is done; results are in `spikes.md`. SJ part b,
+a workflow suspended across work packages, moved to the first JAM
+milestone. Next: S2, then S4, S6 and S5.
 
 | Spike | Measures | Gate |
 |---|---|---|
@@ -633,8 +712,8 @@ First batch: SJ, S1, S3.
   2^32-byte address space and a million-entry permission table per machine.
 - `pvm/proof`: prover, chain segments, verifier, settlement verifier.
 - `support/merkle-crdt`: DAG and sync format; the apply path is rewritten.
-- `support/vos-raft`: the consensus core; the `std` driver is replaced by a
-  shared executor.
+- `support/vos-raft`: the consensus core. Its `std` driver is replaced
+  (section 10); `spikes/s3-raft/vos-raft-eager` is the prototype.
 - Storage handles, `CommittedMap` and `BatchProof` (`vos::storage`,
   `vos::zk::state`), with batched root computation.
 - The v2 CRDT field types' API, reimplemented storage-backed.
@@ -648,7 +727,9 @@ First batch: SJ, S1, S3.
 1. Masking in CRDT types for operations invalidated by a removal; property
    tests for the authorization rule.
 2. Storage-backed CRDT type design.
-3. Storage layout, group commit, Raft snapshot format.
+3. Raft snapshot format. Whether large entries need a raw segment log
+   instead of redb: in S3, 64 KiB entries managed only 613 commits/s, and
+   the cause is not yet known.
 4. Refining on any replica with read-set validation: when it becomes
    necessary.
 5. Licensing model, metering, bytecode visibility.
