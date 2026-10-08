@@ -1,7 +1,7 @@
 # VOS core model
 
 Draft 2, planning run 2 (2026-10-08), updated with the run 3 spikes done so
-far (SJ, S1, S3, S2, S4, S6; results in `spikes.md`). Draft 1 was reviewed by the
+far (SJ, S1, S3, S2, S4, S6, S5; results in `spikes.md`). Draft 1 was reviewed by the
 project owner and by a second-opinion architecture review; the adopted
 changes are listed below. Tags: **[decided]** confirmed by the project
 owner, or settled by a spike the owner delegated the choice to;
@@ -610,10 +610,21 @@ fn apply_batch(w: Witness<LedgerSlice>, batch: Batch) -> Transition { /* ... */ 
 - Verification is a host call on VOS nodes. On JAM, an on-chain agent's
   refine runs the PVM settlement verifier (about 10M cycles), and its
   accumulate applies the public output.
-- Cost: a 32k-step window proves in about 4 s on the reference machine.
-  Kernels should prove a whole settlement window at once; per-transfer
-  proofs do not scale (10k transfers at 100k steps each would take about
-  35 prover-hours).
+- Cost (S5, the saga's Gray Paper 0.8.0 prover): 34k steps prove in 4.9 s
+  at 9 GiB, and 67k steps in 7.4 s at 15 GiB. Memory grows about 170 KiB
+  per step, so proofs run as chained segments of at most 2^16 steps.
+- Hashing dominates. In-PVM BLAKE2b costs 4,790 steps per node hash, about
+  0.4 s of proving. A transfer under the compressed root format costs
+  about 0.2–0.5M steps when hashing in the PVM; under today's fixed-depth
+  format, about 5M.
+- **Required** (S5):
+  - a Gray Paper 0.8.0 hash precompile, invoked with `ecalli` and backed
+    by the existing BLAKE2b chip. Today's precompiles use the JAR `ecall`
+    opcode, which panics under conformance. The same applies to the
+    Ristretto chips;
+  - chained segments in the refine prover.
+- **Proposed size guideline:** kernels prove a whole settlement window at
+  once, never one proof per item, in segments of at most 2^16 steps.
 
 ## 12. JAM integration [decided: early]
 
@@ -742,9 +753,9 @@ lane of channels they belong to.
 
 ## 16. Spikes (run 3)
 
-SJ, S1, S3, S2, S4 and S6 are done; results are in `spikes.md`. SJ part b,
-a workflow suspended across work packages, moved to the first JAM
-milestone. Next: S5.
+All run 3 spikes are done (SJ, S1, S3, S2, S4, S6, S5); results are in
+`spikes.md`. SJ part b, a workflow suspended across work packages, moved to
+the first JAM milestone.
 
 | Spike | Measures | Gate |
 |---|---|---|

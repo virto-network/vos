@@ -590,3 +590,92 @@ Two replicas are compared:
   - apply local operations in place, with no state clone.
 
   Full validation and rebuild remain only for recovery and audits.
+
+## S5 — Attestable
+
+**Setup.** `spikes/s5-attestable`, on the saga's Gray Paper 0.8.0 prover
+(`trace_refine`, `prove_refine`, `verify_refine_bundle_replayed`, production
+PCS configuration). The proved program is S4's guest, which runs BLAKE2b
+inside the PVM. Hashing is the work an attestable root update does without
+a hash precompile.
+
+Each proof runs in its own process under a 24 GiB memory cap. Sizes stop at
+2^16 steps, which peaked at 15 GiB, and larger windows are extrapolated
+rather than risked.
+
+**Finding before measuring.** Guests reach the existing BLAKE2b (and
+Ristretto) precompiles through the JAR `ecall` opcode, which panics under
+Gray Paper 0.8.0 conformance. A conformant attestable program therefore
+has no provable hash precompile today and must hash inside the PVM.
+
+**Result: steps.** One BLAKE2b of a 76-byte node input costs 4,790 PVM
+steps in the guest (portable `blake2b_simd`). The program's fixed cost is
+117 steps.
+
+**Result: proving** (one slice each).
+
+| Steps | Prove | Throughput | Peak RSS | Proof | Verify (replay + STARK) |
+|---|---|---|---|---|---|
+| 4,933 | 2.25 s | 2.2k steps/s | 4.6 GiB | 556 KiB | 1.1 s |
+| 14,509 | 2.96 s | 4.9k steps/s | 6.1 GiB | 565 KiB | 1.4 s |
+| 33,661 | 4.90 s | 6.9k steps/s | 9.2 GiB | 571 KiB | 2.9 s |
+| 67,177 | 7.38 s | 9.1k steps/s | 15.0 GiB | 582 KiB | 4.0 s |
+
+Roughly 2 s plus 80 µs per step to prove, and 4.6 GiB plus about 170 KiB
+per step of memory. `prove_refine` proves each machine slice as one STARK,
+so one slice tops out near 2^17 steps on a 64 GB machine. The prover
+already supports chained segments (`prove_chain`), but the refine path
+does not use them.
+
+**Derived: a transfer kernel.** A transfer touches two leaves. Proving it
+means checking each leaf's path against the root before and recomputing it
+for the root after, with hash counts from S4 at 10M keys:
+
+| Root format | Hashes per transfer | Steps, hashing in the PVM | Proving per transfer | 1,000-transfer window |
+|---|---|---|---|---|
+| Compressed, batched window | about 45 | about 0.2M | about 25 s | about 6 prover-hours |
+| Compressed, alone | about 100 | about 0.5M | about 55 s | — |
+| Fixed-depth, 128-bit keys | about 1,080 | about 5.2M | about 10 min | about 160 prover-hours |
+
+- With a hash precompile, a transfer becomes about 45–100 compressions
+  plus a few thousand steps of kernel logic. The cost then depends on the
+  chip's rows per compression, which is not measured here.
+- Signature checks inside the kernel would add to all of these.
+- Witness size: about 1.6 KB per transfer with independent paths at 10M
+  keys (two leaves and about 23 siblings each). A 1,000-transfer window
+  shares upper levels, which brings it to about 0.9 KB per transfer.
+
+**Findings.**
+
+- **Hashing dominates attestable cost.** Without a precompile, every hash
+  costs about 0.4 s of proving. The current fixed-depth root math makes a
+  single transfer cost minutes.
+- **The hash precompile has to be redefined for Gray Paper 0.8.0** as an
+  `ecalli` host call, keeping the existing BLAKE2b chip. The same applies
+  to the Ristretto chips used for signatures.
+- **Memory, not time, limits a proof.** About 170 KiB per step; slices
+  beyond about 2^16–2^17 steps must be chained.
+- **Per-item proofs do not scale; window proofs do.** Sharing upper tree
+  levels halves the hashing per transfer, and a window pays the fixed
+  proof cost once.
+
+**Decision.**
+
+- **Proposed size guideline:** an attestable call proves in chained
+  segments of at most 2^16 steps (about 7 s and 15 GiB each on the
+  reference machine). Kernels should keep below about 1M steps per window
+  item batch, so a settlement window proves in minutes. A window covers
+  many items: never one proof per item.
+- Required work:
+  - a Gray Paper 0.8.0 hash precompile (`ecalli`) backed by the BLAKE2b
+    chip, and the same for Ristretto;
+  - chained segments in the refine prover;
+  - the compressed root format (S4) for every committed map that
+    attestable code reads.
+
+**Caveats.**
+
+- One measured program (hashing); the kernel figures are derived from S4's
+  hash counts, not from a proved transfer kernel.
+- Measured on the saga's prover. Its memory profile may differ from the
+  prover line on master.
