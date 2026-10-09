@@ -4,9 +4,9 @@ default:
     @just --list
 
 # Fast suites: runtime, compiler, program format, codec, support crates,
-# precompile shim, verifier, prover library.
+# precompile shim, verifier, prover library, wire types.
 test:
-    cargo test -p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-proof-verifier
+    cargo test -p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-proof-verifier -p vos-wire
     cargo test -p vos-pvm-proof --lib
 
 # Bench guests, built with the guest toolchain in `pvm/guest`.

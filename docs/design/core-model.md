@@ -430,8 +430,13 @@ all state (section 12), so it has two paths: VOS and JAM.
   are never preempted.
 - It may call instances of the same agent; the callee runs nested and
   completes before the caller continues. The whole call tree commits or
-  aborts as one step: if any part traps, nothing commits. A call cycle (A
-  calls B calls A) fails.
+  aborts as one step: if any part traps, runs out of gas or forms a cycle
+  (A calls B calls A), nothing commits. Two outcomes return to the caller
+  instead: a callee's own error (`fail`), whose writes are discarded while
+  the caller's survive, and a refusal because the caller lacks the
+  callee's role, in which the callee never runs. A nested callee sees the
+  calling instance as its caller, not the original client, so an instance
+  is never a confused deputy; an instance holds roles only where granted.
 - It may send messages to other agents and start workflows, but may not
   wait for them.
 - **Gas is nested** [proposed]:
@@ -1144,7 +1149,9 @@ prototypes exist where noted.
 
 7. Chained segments on the refine path, sized by prover memory (S5, S5b).
 8. Reduce the BLAKE2b chip's memory per compression (S5b).
-9. Zero-knowledge proving (section 11.4, requirement 1).
+9. Zero-knowledge proving (section 11.4, requirement 1). It needs a newer
+   Stwo, and moving Stwo also frees the workspace toolchain: the pinned
+   revision builds only on nightlies up to mid-2025.
 10. Witness-free verification of attestable programs, with no plain hash of
     private inputs (requirements 2 and 3).
 11. The minimal published proof format and fixed shape classes

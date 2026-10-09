@@ -77,7 +77,7 @@ The agent uses Gray Paper calls wherever JAM has one, and VOS extensions
 
 | Call | Entry | Id | On VOS | On JAM |
 |---|---|---|---|---|
-| `fetch` | refine, accumulate | 2 | the batch of inputs, as the work item's payload; accumulate's operands | the same |
+| `fetch` | accumulate | 2 | accumulate's inputs: operands and transfers | the same |
 | `gas`, `log` | both | Gray Paper; `log` is 100 | served | served |
 | `machine` … `expunge` | refine | 9–14 | served | served |
 | `instantiate` | refine | `0x480` | from the node's pool | `WHAT`: the agent's loader builds the machine |
@@ -88,7 +88,9 @@ The agent uses Gray Paper calls wherever JAM has one, and VOS extensions
 - Ids marked "Gray Paper" are pinned in step 2.1 against the 0.8.0
   specification, with a test as for 9–14; SJ confirmed `fetch` (2),
   `write` (5) and `log` (100) on PolkaJam.
-- Refine returns the encoded work result. Accumulate receives it through
+- Refine reads the batch from its arguments, `E(c, i, s, ↕payload, H(p))`
+  with the batch as the work item's payload (SJ), so it needs no `fetch`.
+  Refine returns the encoded work result. Accumulate receives it through
   `fetch`, as JAM delivers work results to accumulate.
 - **Accumulate is pure Gray Paper calls** [owner decision 2]. Replies and
   outgoing messages are `write`s to well-known system keys: the session's
@@ -109,19 +111,23 @@ does not serve with `WHAT`.
 
 | Operation | Id | Command | Query | Attestable |
 |---|---|---|---|---|
-| `input(buf, cap) -> len` | `0x500` | yes | yes | no |
-| `reply(buf, len)`, `fail(code, buf, len)` | `0x501`, `0x502` | yes | yes | no |
+| `input(out, offset, cap) -> len` | `0x500` | yes | yes | no |
+| `reply(buf, len)`, `fail(buf, len)` | `0x501`, `0x502` | yes | yes | no |
 | `log(level, buf, len)` | `0x503` | yes | yes | no |
-| `caller(buf) -> len` | `0x504` | yes | yes | no |
+| `caller(out, cap) -> len` | `0x504` | yes | yes | no |
 | `now() -> u64`, `random(buf)` | `0x505`, `0x506` | yes | yes | no |
-| `get(key, out, cap) -> len \| NONE` | `0x510` | yes | yes | no |
+| `get(key, out, offset, cap) -> len \| NONE` | `0x510` | yes | yes | no |
 | `put(key, value)`, `delete(key)` | `0x511`, `0x512` | yes | no | no |
 | `scan(prefix, cursor, out, cap) -> len` | `0x513` | yes | yes | no |
 | `call(instance, method, args, out, cap) -> len` | `0x520` | yes | queries only | no |
 | `send(agent, instance, method, args)` | `0x521` | yes | no | no |
-| `attest(program, args, out, cap) -> len` | `0x522` | yes | no | no |
-| `self_id(buf) -> len` (instance and agent ids) | `0x523` | yes | yes | no |
+| `attest(method, args, out, cap) -> len` | `0x522` | yes | no | no |
+| `self_id() -> (instance, agent)` | `0x523` | yes | yes | no |
 
+- **Registers:** `vos_wire::abi` fixes which register holds each
+  argument and result, so the SDK and the agent cannot drift. Outputs
+  copy at most the capacity and return the whole length, as the Gray
+  Paper's `read`.
 - **Requests reach the actor through `input`:** the agent copies the
   request into the actor's own buffer. No request page is mapped per call,
   which closes slice 1's JIT pooled-cycle miss.
@@ -224,13 +230,16 @@ enum CallError { GasExhausted, Cycle, UnknownInstance, KindMismatch, Full, Faile
 per-agent membership table in the `system` partition maps principals to
 roles, set by the CLI. The agent reads it with `state_read` and checks the
 handler's role before invoking. The space catalog of step 2 or 3 replaces
-the CLI as its writer.
+the CLI as its writer. A role is a byte in the wire format; a package's
+schema names its roles, and `#[msg(role)]` refers to one by name. In a
+nested call the caller is the calling instance, which holds only the roles
+granted to it, none by default.
 
 ## The default agent [proposed]
 
 **Refine,** per batch:
 
-1. Read the batch with `fetch`. Inputs are client requests, in their
+1. Read the batch from refine's arguments. Inputs are client requests, in their
    sessions, and messages from other agents, in their pair sequences.
 2. Dispatch inputs one at a time, in order (section 6.3). Each is one step.
 3. **Load the instance:** `instantiate(program hash)`, or on `WHAT` the
@@ -247,13 +256,23 @@ the CLI as its writer.
    to the step overlay. Without the batch overlay, two transfers on one
    account in one batch would both read the base balance.
 5. **Nested calls:** a `call` invokes the callee as its own inner machine,
-   with gas drawn from the caller's remaining gas. An instance already on
-   the call stack fails the call (cycle).
+   with gas drawn from the caller's remaining gas, and with the calling
+   instance as its caller (`Principal::Instance`). The callee's own error
+   (`fail`) returns to the caller and discards the callee's writes, so each
+   call level keeps its own overlay above the step's; so does a refusal
+   for a role the calling instance lacks. A trap, running out of gas, a
+   cycle (an instance already on the call stack) or a missing machine
+   fails the whole step (core model section 8.1).
 6. **Finish the step:** on success the step overlay folds into the batch
    overlay, and its writes, outgoing messages and reply join the work
    result as that step's lists, in step order. On any trap the step's
    effects are discarded and an error reply is recorded. The input is
    consumed either way (section 8.1).
+   **Refusals** are the exception: a request out of its session's order
+   or in an expired session, or a message out of its pair's order, is
+   recorded as `Refused` and not consumed, so no mark moves past a gap.
+   The leader batches only in-order inputs of live sessions; refine
+   checks again, since on JAM the builder is not trusted.
 7. A step is dispatched only if the refine's remaining gas covers its
    limit; otherwise it waits for the next batch.
 
@@ -368,6 +387,66 @@ this slice. Signatures, licensing and upgrades come later.
   actor that calls another, and an attestable method.
 - Compile-fail tests for the restrictions.
 
+**Implementation decisions** [reviewed]:
+
+1. **Handlers are `async fn`,** with `.await` on `call` (core model
+   section 6.3), so a later concurrent scheduler needs no change to actor
+   code. In this slice `call` returns an already-ready future, since the
+   agent runs the callee while the caller's machine waits at its
+   `ecalli`, and the entry point drives a handler with a no-op waker.
+2. **The program entry.** An actor program is a standard program. The
+   agent invokes it at instruction 0 with φ7 the method id, φ8 the kind (0
+   command, 1 query, 2 attestable) and φ9 the arguments' length; arguments
+   come through `input`, the outcome through `reply` or `fail`, and the
+   program halts. φ8 is a hint: the agent enforces the kind regardless.
+3. **Method ids and table tags** are the first four bytes, big-endian, of
+   BLAKE2b-256 over a domain and a name (`vos/method/<name>`,
+   `vos/table/<name>`): stable when items are reordered, and the same in
+   any language. A table's name defaults to its field's and can be set
+   with `#[table(name = "…")]`, so renaming a field need not orphan its
+   rows. The macros reject an id of 0 (reserved) or a collision within an
+   actor; the fix is an explicit name.
+4. **The schema is static data in the program:** a `.vos_schema` section,
+   which the linker script places first in read-only data, holds `"VOSS" ∥
+   E4(len) ∥ SCALE(schema)`: methods with their id, kind, role name and
+   requested gas limit. The agent reads it with `peek` after loading the
+   program, the same on VOS and JAM, and the node and the CLI parse it
+   from the blob without running anything. Installing validates it:
+   unique ids, valid kinds, sizes under the caps. Gas limits are requests,
+   capped by the agent's policy. Role names come from the schema; the
+   operator maps them to role bytes at install (`Admin::Install`), since
+   role bytes belong to the agent and two packages in it must agree on
+   them.
+5. **State.** The struct lives at the instance-relative key `0x00`; a
+   command loads it (or `new()` when absent), runs, and writes it back if
+   its encoding changed; a query only loads it. Table rows live at `0x01 ∥
+   tag ∥ key`, so every key is non-empty by construction. Table keys use an
+   order-preserving `TableKey` encoding (big-endian integers, raw fixed
+   arrays, a raw byte string only as the last component), so scans run in
+   key order; values are SCALE.
+6. **Crates.** `vos-sdk` (`no_std`): the ABI client (inline `ecalli` on
+   the guest target; elsewhere a native host function, `vos_sdk::host::Host`,
+   installed with `set_host`), contexts, `Table`, and the guest runtime
+   (allocator, panic as trap). `vos-sdk-macros`: `#[actor]`, `#[messages]`,
+   `#[msg]`, `#[attestable]`.
+7. **A native test host** (`agent/testkit`, `std`) runs actor programs in
+   `vos_pvm` and serves the actor ABI against an in-memory state with the
+   step and per-call overlays. 2.3's tests run the test actors on it, and
+   2.4's differential test uses it as the reference model. It implements
+   the semantics from this plan and the core model and shares no overlay,
+   dispatch or enforcement code with the default agent; the two crates do
+   not depend on each other.
+8. **`attest` names an attestable method, not a program.** A package is an
+   actor program, its attestable programs and the schema (core model
+   section 6.4); installing binds each attestable method id to its
+   program's hash, and refuses a package whose attestable programs are
+   missing. `ATTEST` takes the method id, and the agent resolves it
+   through the instance's package, so neither an actor nor a client can
+   substitute another program. An attestable program is a standard program
+   with no host calls at all, precompiles aside: its arguments arrive in
+   the standard argument window, and it returns its output by the halt
+   convention (address and length in φ7 and φ8).
+
 ### 2.4 The default agent
 
 - Refine and accumulate as above, as a standard program built with the
@@ -411,7 +490,10 @@ The JAM-only host exists from 2.1 and the agent's tests run on it from
 2.4. This step adds:
 
 - a static check that the agent and actor programs call only JAM calls and
-  VOS extensions with a documented fallback;
+  VOS extensions with a documented fallback. The VOS refine allow-list
+  omits `fetch`, `historical_lookup` and `export`, which a JAM refine may
+  use; the check decides whether the node answers them (`NONE`) rather
+  than refuse such a package;
 - the dynamic comparison of work results between VOS and the JAM-only host
   in `ci`. Stateful refines follow with step 4's witnesses.
 

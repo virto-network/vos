@@ -1,0 +1,14 @@
+[package]
+name = "vos-wire"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Wire types shared by the VOS node, the default agent program and the actor SDK."
+
+[dependencies]
+scale = { package = "vos-pvm-codec", path = "../../pvm/codec", default-features = false }
+vos-pvm-program = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"
+vos-pvm = { workspace = true }

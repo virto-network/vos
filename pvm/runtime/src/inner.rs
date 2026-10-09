@@ -57,6 +57,28 @@ pub mod host_call {
     /// `WHAT` and the guest lays the machine out itself with `machine`, then
     /// `pages` and `poke`.
     pub const INSTANTIATE: u32 = 0x480;
+    /// VOS extension: read the agent's applied state by key, served when the
+    /// node supplies a state reader. φ7/φ8 hold the key, φ9 the output, φ10
+    /// the offset into the value and φ11 the output length; φ7 becomes the
+    /// value's length, or `NONE`. On JAM the call answers `WHAT` and state
+    /// comes from witnesses in the work package.
+    pub const STATE_READ: u32 = 0x481;
+}
+
+/// Gray Paper 0.8.0 general and refine host calls the node serves besides
+/// the inner-machine calls. `fetch` (2), `write` (5) and `log` (100) were
+/// confirmed on PolkaJam 0.1.29 (spike SJ); the rest follow the same
+/// numbering, which places `machine` at 9.
+pub mod gp_call {
+    pub const GAS: u32 = 0;
+    pub const FETCH: u32 = 2;
+    pub const LOOKUP: u32 = 3;
+    pub const READ: u32 = 4;
+    pub const WRITE: u32 = 5;
+    pub const INFO: u32 = 6;
+    pub const HISTORICAL_LOOKUP: u32 = 7;
+    pub const EXPORT: u32 = 8;
+    pub const LOG: u32 = 100;
 }
 
 /// v0.8.0 host-call gas constants.
@@ -1191,6 +1213,25 @@ mod tests {
                 host_call::EXPUNGE,
             ],
             [9, 10, 11, 12, 13, 14]
+        );
+        assert_eq!(
+            [
+                gp_call::GAS,
+                gp_call::FETCH,
+                gp_call::LOOKUP,
+                gp_call::READ,
+                gp_call::WRITE,
+                gp_call::INFO,
+                gp_call::HISTORICAL_LOOKUP,
+                gp_call::EXPORT,
+                gp_call::LOG,
+            ],
+            [0, 2, 3, 4, 5, 6, 7, 8, 100]
+        );
+        assert_eq!(
+            [host_call::INSTANTIATE, host_call::STATE_READ],
+            [0x480, 0x481],
+            "VOS extensions sit in the node block, past the precompiles"
         );
         assert_eq!(gas::memory(112, 0), 0);
         assert_eq!(gas::memory(112, 1), 1);

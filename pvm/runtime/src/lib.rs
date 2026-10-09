@@ -9,6 +9,7 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 extern crate alloc;
 
+pub mod accumulate_host;
 pub mod args;
 pub mod backend;
 #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]

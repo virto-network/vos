@@ -249,6 +249,20 @@ impl Machine {
             .map_or(PvmBackend::ForceInterpreter, PreparedExecution::backend)
     }
 
+    /// Instantiate fresh execution state starting at instruction counter
+    /// `entry`: 0 is refine, 5 accumulate (the Gray Paper entry points).
+    pub fn load_prepared_at(
+        prepared: &PreparedProgram,
+        entry: u32,
+        args: &[u8],
+        gas: Gas,
+        model: MemoryModel,
+    ) -> Result<Self, RefineError> {
+        let mut machine = Self::load_prepared(prepared, args, gas, model)?;
+        machine.interp.set_pc(entry);
+        Ok(machine)
+    }
+
     /// Instantiate fresh execution state from validated immutable preparation.
     pub fn load_prepared(
         prepared: &PreparedProgram,

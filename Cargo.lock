@@ -1604,6 +1604,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "vos-wire"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "vos-pvm",
+ "vos-pvm-codec",
+ "vos-pvm-program",
+]
+
+[[package]]
 name = "wait-timeout"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

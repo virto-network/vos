@@ -12,6 +12,8 @@ use crate::{ExitReason, Gas, PVM_REGISTER_COUNT, PvmBackend};
 /// Standard host result constants used by the inner-machine calls.
 pub mod result {
     pub const OK: u64 = 0;
+    pub const NONE: u64 = u64::MAX;
+    pub const WHAT: u64 = u64::MAX - 1;
     pub const OOB: u64 = u64::MAX - 2;
     pub const WHO: u64 = u64::MAX - 3;
     pub const FULL: u64 = u64::MAX - 4;
@@ -98,10 +100,21 @@ pub enum RefineObservation<'a> {
     },
 }
 
+/// The agent's applied state, as the node reads it for `state_read`.
+pub trait StateReader: Send + Sync {
+    fn read(&self, key: &[u8]) -> Option<Vec<u8>>;
+}
+
+/// Gas for a host call the Gray Paper prices at its base cost.
+const BASE_CALL_GAS: Gas = 10;
+/// `state_read`'s price per byte copied, on top of the base price.
+pub const STATE_READ_BYTE_GAS: Gas = 1;
+
 /// A standard outer PVM plus its per-invocation inner-machine dictionary.
 pub struct RefineContext {
     outer: Machine,
     inner: InnerMachines,
+    state: Option<alloc::sync::Arc<dyn StateReader>>,
 }
 
 impl RefineContext {
@@ -118,6 +131,7 @@ impl RefineContext {
         Ok(Self {
             outer: Machine::load_with(program, args, gas, model)?,
             inner: InnerMachines::new(),
+            state: None,
         })
     }
 
@@ -134,7 +148,20 @@ impl RefineContext {
     ) -> Result<Self, RefineError> {
         let outer = Machine::load_with_backend(program, args, gas, model, backend)?;
         let inner = InnerMachines::with_backend(outer.backend());
-        Ok(Self { outer, inner })
+        Ok(Self {
+            outer,
+            inner,
+            state: None,
+        })
+    }
+
+    /// Serve `state_read` from the agent's applied state. Without a reader
+    /// the call reaches the embedder, as on JAM. Observed runs refuse a
+    /// reader, as they refuse a pool: replaying them has no state until
+    /// witnesses exist.
+    pub fn with_state(mut self, reader: alloc::sync::Arc<dyn StateReader>) -> Self {
+        self.state = Some(reader);
+        self
     }
 
     /// Serve `instantiate` from the node's pool. Inner machines it lends
@@ -157,7 +184,21 @@ impl RefineContext {
     ) -> Result<Self, RefineError> {
         let outer = Machine::load_prepared(program, args, gas, model)?;
         let inner = InnerMachines::with_backend(outer.backend());
-        Ok(Self { outer, inner })
+        Ok(Self {
+            outer,
+            inner,
+            state: None,
+        })
+    }
+
+    /// Run as a JAM node would: every call this host does not serve,
+    /// including every VOS extension when no pool or state reader is set,
+    /// answers `WHAT` and execution continues.
+    pub fn try_run_jam(self) -> Result<Invocation, RefineError> {
+        self.try_run_with_host(|_, machine| {
+            machine.registers_mut()[7] = result::WHAT;
+            Ok(())
+        })
     }
 
     /// Run the outer program, transparently servicing host calls 9 through
@@ -261,11 +302,15 @@ impl RefineContext {
         observer: &mut dyn for<'a> FnMut(RefineObservation<'a>),
     ) -> Invocation {
         // A traced run must execute exactly like a live one, and tracing
-        // cannot follow a pooled machine yet.
+        // cannot follow a pooled machine or the node's state yet.
         #[cfg(feature = "std")]
         assert!(
             self.inner.pool().is_none(),
             "observed Refine execution does not serve `instantiate` from a pool"
+        );
+        assert!(
+            self.state.is_none(),
+            "observed Refine execution does not serve `state_read`"
         );
         loop {
             let mut exit = self.outer.resume_observed(|event| match event {
@@ -368,8 +413,89 @@ impl RefineContext {
             value if value == u64::from(host_call::INSTANTIATE) && self.inner.pool().is_some() => {
                 self.instantiate()
             }
+            value if value == u64::from(host_call::STATE_READ) && self.state.is_some() => {
+                self.state_read()
+            }
+            value if value == u64::from(crate::inner::gp_call::GAS) => self.gas(),
+            value if value == u64::from(crate::inner::gp_call::LOG) => self.log(),
             _ => Dispatch::Exit(ExitReason::HostCall(id)),
         }
+    }
+
+    /// `gas`: φ7 becomes the gas left after this call's own cost.
+    fn gas(&mut self) -> Dispatch {
+        if let Err(exit) = self.charge(BASE_CALL_GAS) {
+            return exit;
+        }
+        let left = self.outer.gas_remaining();
+        self.outer.registers_mut()[7] = left;
+        Dispatch::Continue
+    }
+
+    /// `log` (JIP-1): φ7 level, φ8/φ9 target, φ10/φ11 message. The node
+    /// records it; the guest's registers are unchanged.
+    fn log(&mut self) -> Dispatch {
+        if let Err(exit) = self.charge(BASE_CALL_GAS) {
+            return exit;
+        }
+        #[cfg(feature = "std")]
+        {
+            let registers = *self.outer.registers();
+            let text = |address: u64, len: u64| {
+                self.read_outer(address, len.min(4096), false)
+                    .map(|bytes| alloc::string::String::from_utf8_lossy(&bytes).into_owned())
+                    .unwrap_or_default()
+            };
+            tracing::debug!(
+                level = registers[7],
+                target = %text(registers[8], registers[9]),
+                message = %text(registers[10], registers[11]),
+                "guest log"
+            );
+        }
+        Dispatch::Continue
+    }
+
+    /// `state_read`: copy part of the value under the key at φ7/φ8 to φ9,
+    /// from offset φ10, at most φ11 bytes; φ7 becomes the value's whole
+    /// length, or `NONE` when the key has no value. Costs the base price
+    /// and [`STATE_READ_BYTE_GAS`] per byte copied, so a refine's gas also
+    /// bounds the node's copying.
+    fn state_read(&mut self) -> Dispatch {
+        if let Err(exit) = self.charge(BASE_CALL_GAS) {
+            return exit;
+        }
+        let registers = *self.outer.registers();
+        let Some(key) = self.read_outer(registers[7], registers[8], false) else {
+            return Dispatch::Exit(ExitReason::Panic);
+        };
+        let reader = self.state.as_ref().expect("dispatched only with a reader");
+        let Some(value) = reader.read(&key) else {
+            self.outer.registers_mut()[7] = result::NONE;
+            return Dispatch::Continue;
+        };
+        let offset = usize::try_from(registers[10])
+            .unwrap_or(usize::MAX)
+            .min(value.len());
+        let len = usize::try_from(registers[11])
+            .unwrap_or(usize::MAX)
+            .min(value.len() - offset);
+        let Some((address, len)) = self.outer_range(registers[9], len as u64, true) else {
+            return Dispatch::Exit(ExitReason::Panic);
+        };
+        if let Err(exit) = self.charge(len as u64 * STATE_READ_BYTE_GAS) {
+            return exit;
+        }
+        if len > 0
+            && !self
+                .outer
+                .memory_mut()
+                .write_bytes_checked(address, &value[offset..offset + len])
+        {
+            return Dispatch::Exit(ExitReason::Panic);
+        }
+        self.outer.registers_mut()[7] = value.len() as u64;
+        Dispatch::Continue
     }
 
     fn dispatch_observed(
@@ -384,6 +510,8 @@ impl RefineContext {
             value if value == u64::from(host_call::PAGES) => self.pages(),
             value if value == u64::from(host_call::INVOKE) => self.invoke(Some(observer)),
             value if value == u64::from(host_call::EXPUNGE) => self.expunge(),
+            value if value == u64::from(crate::inner::gp_call::GAS) => self.gas(),
+            value if value == u64::from(crate::inner::gp_call::LOG) => self.log(),
             _ => Dispatch::Exit(ExitReason::HostCall(id)),
         }
     }
@@ -1148,6 +1276,16 @@ mod tests {
             reached.exit,
             ExitReason::HostCall(u64::from(crate::inner::host_call::INSTANTIATE))
         );
+        let jam = RefineContext::load(&instantiating_program(hash.0), &[], 1_000_000)
+            .unwrap()
+            .try_run_jam()
+            .unwrap();
+        assert_eq!(jam.exit, ExitReason::Halt);
+        assert_eq!(
+            jam.registers[7],
+            result::WHAT,
+            "the guest's loader takes over"
+        );
 
         // The pool is shared by every refine on a node.
         let shared = alloc::sync::Arc::clone(&pool);
@@ -1160,6 +1298,92 @@ mod tests {
         .join()
         .unwrap();
         assert_eq!(pool.idle(), 1);
+    }
+
+    /// Reads the value under "abc" into 0x2_0010 with `state_read`, then
+    /// halts with φ7 holding the call's result.
+    fn state_reading_program() -> Vec<u8> {
+        let [lo, hi] = (crate::inner::host_call::STATE_READ as u16).to_le_bytes();
+        #[rustfmt::skip]
+        let code = [
+            51, 7, 0x00, 0x00, 0x02,      // load_imm φ7, 0x2_0000 (key)
+            51, 8, 3,                     // load_imm φ8, 3
+            51, 9, 0x10, 0x00, 0x02,      // load_imm φ9, 0x2_0010 (output)
+            51, 10, 1,                    // load_imm φ10, 1 (offset)
+            51, 11, 64,                   // load_imm φ11, 64
+            10, lo, hi,                   // ecalli state_read
+            50, 0,                        // jump_ind φ0 (halt)
+        ];
+        let mut rw = b"abc".to_vec();
+        rw.resize(0x60, 0);
+        standard_program_with_rw(&code, &[0, 5, 8, 13, 16, 19, 22], &rw)
+    }
+
+    struct Fixed;
+    impl StateReader for Fixed {
+        fn read(&self, key: &[u8]) -> Option<Vec<u8>> {
+            (key == b"abc").then(|| b"value".to_vec())
+        }
+    }
+
+    #[test]
+    fn state_read_serves_the_nodes_state_and_falls_back_to_what() {
+        let program = state_reading_program();
+        let served = RefineContext::load(&program, &[], 1_000_000)
+            .unwrap()
+            .with_state(alloc::sync::Arc::new(Fixed))
+            .run();
+        assert_eq!(served.exit, ExitReason::Halt);
+        assert_eq!(served.registers[7], 5, "the value's whole length");
+        let mut out = [0u8; 5];
+        served.memory().read_bytes(0x2_0010, &mut out);
+        assert_eq!(&out, b"alue\0", "copied from the offset");
+
+        struct Long;
+        impl StateReader for Long {
+            fn read(&self, _: &[u8]) -> Option<Vec<u8>> {
+                Some(vec![7; 1000])
+            }
+        }
+        let long = RefineContext::load(&program, &[], 1_000_000)
+            .unwrap()
+            .with_state(alloc::sync::Arc::new(Long))
+            .run();
+        assert_eq!(long.registers[7], 1000);
+        assert_eq!(
+            long.gas_used - served.gas_used,
+            (64 - 4) * STATE_READ_BYTE_GAS,
+            "64 bytes copied against 4"
+        );
+
+        // Without a reader the call reaches the embedder, and a JAM-only
+        // run answers it with `WHAT`.
+        let reached = RefineContext::load(&program, &[], 1_000_000).unwrap().run();
+        assert_eq!(
+            reached.exit,
+            ExitReason::HostCall(u64::from(crate::inner::host_call::STATE_READ))
+        );
+        let jam = RefineContext::load(&program, &[], 1_000_000)
+            .unwrap()
+            .try_run_jam()
+            .unwrap();
+        assert_eq!(jam.exit, ExitReason::Halt);
+        assert_eq!(jam.registers[7], result::WHAT);
+    }
+
+    #[test]
+    fn gas_reports_what_is_left() {
+        #[rustfmt::skip]
+        let code = [
+            10, 0,                        // ecalli gas
+            50, 0,                        // jump_ind φ0 (halt)
+        ];
+        let program = standard_program_with_rw(&code, &[0, 2], &[]);
+        let invocation = RefineContext::load(&program, &[], 1_000_000).unwrap().run();
+        assert_eq!(invocation.exit, ExitReason::Halt);
+        let left = invocation.registers[7];
+        // The block gas and the call's own 10 are spent before φ7 is set.
+        assert!(left < 1_000_000 - 10 && left > 1_000_000 - 1_000, "{left}");
     }
 
     #[cfg(feature = "std")]

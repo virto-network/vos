@@ -16,20 +16,23 @@ pub use vos_pvm_program::{
 };
 
 /// The complete host-call surface implemented by [`crate::refine_host`]:
-/// the standard inner-machine calls, the BLAKE2b precompile and
-/// `instantiate`.
+/// `gas`, the standard inner-machine calls, `log`, the BLAKE2b precompile,
+/// `instantiate` and `state_read`.
 ///
 /// Runtime package admission uses this exact set to reject even unreachable
 /// calls outside it.
-pub const REFINE_HOST_CALL_ALLOWLIST: [u64; 8] = [
+pub const REFINE_HOST_CALL_ALLOWLIST: [u64; 11] = [
+    0,
     9,
     10,
     11,
     12,
     13,
     14,
+    100,
     crate::precompile::BLAKE2B_COMPRESS,
     crate::inner::host_call::INSTANTIATE as u64,
+    crate::inner::host_call::STATE_READ as u64,
 ];
 
 /// Failure while inspecting a standard program's complete static host-call
@@ -228,14 +231,17 @@ mod tests {
         assert_eq!(
             REFINE_HOST_CALL_ALLOWLIST,
             [
+                crate::inner::gp_call::GAS as u64,
                 crate::inner::host_call::MACHINE as u64,
                 crate::inner::host_call::PEEK as u64,
                 crate::inner::host_call::POKE as u64,
                 crate::inner::host_call::PAGES as u64,
                 crate::inner::host_call::INVOKE as u64,
                 crate::inner::host_call::EXPUNGE as u64,
+                crate::inner::gp_call::LOG as u64,
                 crate::precompile::BLAKE2B_COMPRESS,
                 crate::inner::host_call::INSTANTIATE as u64,
+                crate::inner::host_call::STATE_READ as u64,
             ]
         );
         let blob = host_call_program(&[14, 9, 0x400, 0x480, 14]);

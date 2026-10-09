@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "agent/wire",
     "support/vos-raft",
     "support/merkle-crdt",
     "pvm/runtime",
@@ -70,6 +71,7 @@ vos-pvm-compiler = { path = "pvm/compiler" }
 vos-pvm-program = { path = "pvm/program" }
 vos-pvm-codec = { path = "pvm/codec", default-features = false }
 vos-pvm-codec-derive = { path = "pvm/codec-derive" }
+vos-wire = { path = "agent/wire" }
 
 # Stwo pinned to upstream rev `e1286720`. Declared without features:
 # workspace features are additive, and the verifier-only build must stay
