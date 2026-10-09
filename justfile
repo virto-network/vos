@@ -32,7 +32,8 @@ vectors:
     cargo test -p vos-pvm --test pvm_vectors
 
 # Prover integration suites, including the soundness gates behind
-# `debug-internals`. Memory-heavy: two threads.
+# `debug-internals`. Memory-heavy: two threads fit under a 24 GiB limit, e.g.
+# `systemd-run --user --scope -p MemoryMax=24G -p MemorySwapMax=0 just test-proof`.
 test-proof: build-guests
     cargo test -p vos-pvm-proof --features debug-internals --tests -- --test-threads=2
 

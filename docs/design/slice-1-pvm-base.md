@@ -80,6 +80,13 @@ core, in the build step named (core model section 16), or is replaced.
 | `tests/fixtures/wasm` | WASM fixtures | only if a WASM path returns |
 | `actors/space-authority`, `actors/space-registry` | space governance and registry | step 2 or 3, as the catalog |
 | `services/vos-service`, `examples/` | v2 examples | rewritten for the new framework when it lands |
+
+**Carried to step 5:**
+
+- Move the Ristretto and scalar ids 110–114 into the VOS range, price
+  them and serve them on the refine host. Then delete the exception in
+  `pvm/proof/src/core/ecall.rs`'s tracer allow-set test, so the tracer and
+  the refine host serve exactly the same calls.
 | `docs/` (the book), `book.toml` | documentation | rewritten as the core lands |
 | `scripts/`, `justfile`, `deny.toml` | tooling | rebuilt for the new tree in step 1.1 |
 
