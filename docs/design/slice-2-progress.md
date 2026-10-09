@@ -93,3 +93,79 @@ The settlement verifier accepts again, in 10,683,638 instructions (qemu:
 The pin is held between two constraints that will diverge: fjall wants a
 newer rustc, the pinned stwo an older one. Moving stwo, which the privacy
 work needs anyway for zero-knowledge masking, unblocks the toolchain.
+
+## Step 2.2: storage
+
+**Done:**
+
+- **`vos-node`** (`node/host`) starts with its store: fjall behind a `Store`
+  trait, one keyspace with four partitions:
+  - `state`: instance rows, keyed by the agent (big-endian) and the
+    agent-relative key;
+  - `system`: system keys (first byte `0x00`), and after a `0xff` byte no
+    agent key uses, the node's applied index per agent;
+  - `log`: work results by (agent, index), with their term;
+  - `programs`: program blobs by hash.
+- **Two write operations,** `append` (log entries) and `apply` (a work
+  result's writes and the applied index), grouped in one `Batch` that the
+  storage thread commits for several agents at once, buffered or synced.
+- **Reads** through snapshots: point reads and ordered prefix scans with a
+  cursor, which never leave their agent or partition.
+- **A crash test** (`node/host/tests/crash.rs`) runs a writer in a child
+  process, kills it at random moments over 12 rounds, and checks each time
+  that the applied index, the log and the state recover as one prefix of
+  the work results applied, and that every commit reported before the kill
+  survived. Its last six rounds also tear the journal's tail, truncating it
+  or zeroing its last bytes as a power loss could, and recovery loses at
+  most the batch the tear reached.
+- **Store tests** also pin that a snapshot sees the applied index (in
+  `system`) and the rows (in `state`) as of one commit while another
+  thread commits, and that a later write to a key wins within a batch.
+
+**Recovery findings:**
+
+- fjall discards an incomplete last batch, but a complete batch whose
+  checksum fails, as after a flipped bit, makes it refuse to open: a loud
+  failure, not an inconsistent store, but one a node cannot recover from
+  by itself. A store test pins the refusal. Whether the node log needs a journal format the node controls
+  is open question 3's to settle in slice 3.
+- fjall's journal decoder `debug_assert`s on a torn item header that its
+  release build recovers from as an incomplete tail. The workspace builds
+  fjall without debug assertions so tests recover as the node does; the
+  assertion on data read from disk is worth reporting upstream.
+
+**Notes for later steps:**
+
+- An agent writes any system key in its own namespace, so a custom agent
+  can forge its own outbox rows and session replies. That stays inside its
+  trust boundary, but the node must never take another agent's effects
+  from this partition on the strength of the key alone.
+- The store's error type is fjall's, and the trait has no range delete or
+  prefix export yet; slice 3's Raft snapshot install needs both.
+
+**Benchmark** (`store-bench`, 64-byte values under one agent's table,
+1,000 reads per snapshot, µs per row):
+
+| | 1M rows | 10M rows | 10M, last-level filters kept |
+|---|---|---|---|
+| Bulk load | 1.68 | 3.09 | 3.12 |
+| Read, hit, compacted | 1.56 | 2.54 | 3.43 |
+| Read, hit, after 620k updates | 3.48 | 5.16 (4.98 in a second run) | 6.04 |
+| Read, miss | 1.43 | 2.44 | 0.73 |
+| Update, 1-row batch | 1.60 | 2.22 | 2.69 |
+| Update, 1,000-row batch | 2.02 | 2.64 | 2.67 |
+| Update, 1,000-row batch, synced | 2.39 | 2.86 | 2.84 |
+| Scan | 0.38 | 0.28 | 0.29 |
+
+- The **read gate passes** (≤ 5 µs warm): 2.5 µs at 10M rows, against S4's
+  5.2–5.6 µs. The gain is skipping the filters of the last level, where
+  most rows live, for the `state` partition: reads of actor state mostly
+  hit, and a filter there only adds a lookup. Misses cost more (2.4 µs
+  against 0.7), so the `system` partition, where sessions and replies are
+  often absent, keeps its filters.
+- **Behind fresh writes** reads meet the gate only just: 5.0–5.2 µs while
+  620k updated rows sit in the memtable and level 0. Steady-state read cost
+  under continuous writes depends on compaction, which slice 3's
+  replicated apply path measures.
+- A 2 GiB cache gave nothing (the data is 679 MiB); an in-block hash index
+  and pinned filter and index blocks gave nothing measurable.

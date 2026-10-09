@@ -607,9 +607,10 @@ The Local (replica-only) lane is deferred until a use case needs it.
 
 - `Table<K, V>` (with map, set and vector variants) stores rows in the
   agent's keyspace: point reads and writes, ordered scans with cursors.
-  Memory use follows touched rows, not table size. At 10M rows (S4, warm
-  cache), writes cost about 1.5 µs and reads 5.2–5.6 µs, slightly over the
-  5 µs budget.
+  Memory use follows touched rows, not table size. At 10M rows (slice 2,
+  warm cache), writes cost 2.2–2.9 µs and compacted reads 2.5 µs, within
+  the 5 µs budget; reads behind fresh writes in the memtable and level 0
+  cost 5.0–5.2 µs.
 - `CommittedMap<K, V>` also yields a Merkle root and multiproofs
   (`BatchProof`) for attestable methods and JAM witnesses. Only branching
   nodes are stored: about log₂(n) rows per key path.
@@ -741,9 +742,11 @@ with one journal and a partition per data class. It holds:
 - redb reclaims space only after durable commits: a 0.7 GB table loaded
   without them grew to 24.6 GiB.
 
-Reads cost 5.2–5.6 µs at 10M rows with a 1 GiB warm cache (redb: 1.6 µs),
-and about 0.1 ms cold. Bringing reads within budget is part of the first
-storage slice: key layout per data class, filters and cache sizing.
+S4 measured reads at 5.2–5.6 µs at 10M rows with a 1 GiB warm cache (redb:
+1.6 µs), and about 0.1 ms cold. Slice 2 brought compacted reads to 2.5 µs
+by skipping last-level filters where reads mostly hit (step 2.2); reads
+behind fresh writes stay at 5.0–5.2 µs, and steady-state read cost under
+continuous writes is slice 3's measurement.
 
 **Layout** [proposed]: agents share each partition under agent key
 prefixes; a tree per agent would multiply memtables and background work. A
@@ -1039,7 +1042,7 @@ These form a prover track that runs alongside the core slices (section 16).
 | Replicated agent on 3 LAN nodes, simple mutations | ≥ 20k per second per agent; p99 commit ≤ 10 ms at half load | about 25k/s at p99 8 ms with the prototype driver, on redb, one process, one disk (S3) | passes with section 16 work; repeat on fjall and a network |
 | Many active agents per node [proposed] | 64 active agents: ≥ 40k commits per second in total, p99 ≤ 20 ms | 6.3–26k/s at p99 31–191 ms (S3) | fails; work item 16 |
 | Workflow snapshot capture plus restore, up to 50 KB | ≤ 1 ms | 3-page suspensions: capture 0.2–0.6 µs (interpreter) and 8–12 µs (JIT, quiet machine; 6–19 µs under load), copying and hashing the pages 10–15 µs, writing them into a pooled machine 0.3 µs (excluding its reset on return, 2.4–3.5 µs, and loading registers, gas and counter); a 2 MiB suspension takes 150–190 µs and about 400 µs to write (slice 1, S1) | passes |
-| Table point read or write at 10M rows (host cost) | ≤ 5 µs | write 1.5 µs; read 5.2–5.6 µs warm, about 0.1 ms cold (S4) | writes pass; reads fail narrowly |
+| Table point read or write at 10M rows (host cost) | ≤ 5 µs | write 2.2–2.9 µs; read 2.5 µs compacted, 5.0–5.2 µs with 620k fresh updates in the memtable and level 0, about 0.1 ms cold (slice 2) | pass compacted; at the edge behind fresh writes |
 | Query on a follower | ≤ 100 µs | 1.5–2.3 µs of execution plus reads (S2, S4) | passes warm |
 | Merge apply, cost per operation at 1M operations | ≤ 2× the cost at 1k | 1.5–1.8× with incremental apply on LWW maps, in memory (S6) | passes with section 16 work |
 | 1,000 mostly idle Raft groups per node | no thread per group; idle CPU ≤ 5% of one core | about 1.6% at a 500 ms heartbeat (S3) | passes |

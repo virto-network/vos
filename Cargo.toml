@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "agent/wire",
+    "node/host",
     "support/vos-raft",
     "support/merkle-crdt",
     "pvm/runtime",
@@ -38,6 +39,14 @@ readme = "README.md"
 [profile.release]
 lto = "fat"
 codegen-units = 1
+
+# fjall's journal decoder debug-asserts on a torn item header, which its
+# release build recovers from as an incomplete tail: test recovery as the
+# node runs it.
+[profile.dev.package.fjall]
+debug-assertions = false
+[profile.test.package.fjall]
+debug-assertions = false
 
 [profile.dev.package.vos-pvm]
 opt-level = 3
