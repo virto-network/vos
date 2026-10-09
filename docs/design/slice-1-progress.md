@@ -626,21 +626,39 @@ section 14 of the core model carries the budget rows.
   | Soundness of the constraint change | negative gates; second reviewer | pass; Fable signed off |
   | Machine creation | ≤ 50 µs, both backends | 7–10 µs interpreter, about 35 µs JIT |
   | Interpreter speed | ≤ about 10% slower on S1 compute | within noise after step 1.4; +2.8% after tracking |
-  | Pooled acquire plus reset | ≤ 5 µs, small actor, including use | 2.4 µs interpreter, 3.5 µs JIT, after a use |
+  | Pooled acquire plus reset, after a use | ≤ 5 µs, small actor | 2.4 µs interpreter, 3.5 µs JIT: pass |
+  | Pooled acquire, use and reset | ≤ 5 µs, small actor, "including use" | about 3 µs interpreter: pass; about 7.6 µs JIT: **miss** |
   | Refine fixed cost | ≤ 50 µs | 6.0–6.3 µs interpreter, 16–18 µs JIT |
-  | Dirty capture | ≤ 20 µs for 3 pages; ≤ 5% on compute | 0.2–0.6 µs and 6–19 µs; +2.8% and within noise |
+  | Dirty capture | ≤ 20 µs for 3 pages; ≤ 5% on compute | interpreter 0.2–0.6 µs; JIT 8–12 µs on a quiet machine (step 1.5), 6–19 µs under load here; +2.8% and within noise |
   | Pool isolation | differential test passes | passes on both backends |
   | JAR | the grep check finds nothing | clean, and part of `ci` |
 
-- **Reading of the pooled gate.** On the JIT, the use itself costs about
-  4 µs: the actor maps a request page every time, and its first writes
-  fault into tracking. Counted in, a full acquire, use and reset takes
-  about 7.6 µs. A request region the actor framework keeps mapped would
-  remove most of it; slice 2 designs that framework.
+- **The JIT miss.** The plan words the pooled gate as "including use", and
+  the JIT's full cycle misses it at about 7.6 µs. The pool and its reset
+  are not the cause: acquire plus reset takes 3.5 µs. About 3 µs of the
+  4 µs use is the harness's per-request `pages` call to map a fresh
+  request page (a hole punch, a protection change and starting write
+  tracking), plus the first writes faulting into tracking.
+  - How a request reaches an actor is the actor ABI's choice, made in
+    slice 2. A request page kept mapped, or an argument page in the pool's
+    image, removes most of this cost.
+  - The budget this cycle serves, actor invocation at ≤ 50 µs, passes
+    with margin: 12.7 µs nested on the JIT.
+  - **For the owner:** accept the miss as a slice 2 item tied to the actor
+    ABI (recommended), or amend the gate to a JIT full cycle of ≤ 10 µs
+    until slice 2.
 - **Carried forward,** as logged in the plan:
   - the Ristretto and scalar ids, and the legacy tracer's allow-set, go to
     step 5;
   - proving refines that call `instantiate` goes to step 5;
-  - `state_read` writes join the pool's property test in slice 2.
+  - attestable kernels hash tree nodes with the compress-level call, not
+    the streaming `blake2b_hash`; that goes to step 5;
+  - `state_read` writes join the pool's property test in slice 2;
+  - request delivery that keeps the per-request cost off the JIT's pooled
+    cycle goes to slice 2, with the actor ABI.
+- **Review.** Fable accepted closing slice 1 once three documentation
+  corrections were made: the pooled gate split into two rows with the JIT
+  miss stated, the step-count consequence for kernels drawn, and the
+  capture figures given with their conditions. All are in.
 
 **Slice 1 is done.**

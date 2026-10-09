@@ -839,10 +839,15 @@ writable pages stays as the before-picture and as a check.
 | Compute, 34 changed pages | 0.8–1.7 ms | 0.9–2.8 µs | 10–37 µs | 440–500 µs | 150–190 / about 400 µs |
 
 Copying and hashing the pages to ship them costs 10–15 µs for three pages
-and about 120 µs for 34. A pooled restore acquires a machine and writes
-the snapshot's pages, which for the compute workload is all 514 dirty
-pages. On the JIT that is mostly faulting those pages back in, since the
-last reset discarded them.
+and about 120 µs for 34. A pooled restore, as timed here, acquires a
+machine and writes the snapshot's pages, which for the compute workload is
+all 514 dirty pages. On the JIT that is mostly faulting those pages back
+in, since the last reset discarded them. It excludes the machine's reset
+when it returns to the pool (2.4–3.5 µs) and loading registers, gas and
+the counter, which a real restore also does. The JIT captures ran under
+load; on a quiet machine step 1.5 measured 8–12 µs. The decision to use
+snapshots with no replay journal rests on the original S1 figures above,
+which still stand.
 
 **S2, invocation** (per request, transfer):
 
@@ -869,7 +874,13 @@ machine per refine costs 6.0 µs (interpreter) and 17.8 µs (JIT), against
 | 100 | 32,645 | 5.64 s | 10.5 GiB | 866 KiB | 2.9 s |
 
 The guest now hashes through the shim crate's streaming `blake2b_hash`,
-which handles the domain and parts, so it takes about 325 steps per hash
-where the spike's hand-written loop took 66. The compressions themselves
-cost the same; proving 100 hashes is slower than in S5b because of those
-steps.
+which handles the parameter block, padding and parts, so it takes about
+325 steps per hash where the spike's hand-written loop took 66. The
+proving time added is consistent with those extra steps at about 80 µs
+each, so the compressions themselves appear to cost the same.
+
+The consequence: core model section 11.3's target of about 1M steps per
+window assumed 66 steps per compression. At 325, a 1,000-transfer window
+(45k–100k compressions) would take 15–33M steps. Attestable kernels must
+therefore hash tree nodes with the compress-level call (one block for a
+76-byte node), never the streaming API.

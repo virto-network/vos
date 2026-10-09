@@ -87,6 +87,9 @@ core, in the build step named (core model section 16), or is replaced.
   them and serve them on the refine host. Then delete the exception in
   `pvm/proof/src/core/ecall.rs`'s tracer allow-set test, so the tracer and
   the refine host serve exactly the same calls.
+- Attestable kernels hash tree nodes with the compress-level call
+  (`blake2b_compress`, one block per 76-byte node), never the shim's
+  streaming `blake2b_hash`, which costs five times the steps.
 - Prove refines that call `instantiate`. Proof tracing runs without a
   pool, so the call reaches the embedder there, as on JAM. Proving it
   means the bundle commits to the pool's programs by code hash, and the
