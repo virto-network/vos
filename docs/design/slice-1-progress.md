@@ -334,3 +334,110 @@ changes the format again anyway:
   `NativeMemory` window, so it was left alone.
 
 **Step 1.4 is done.**
+
+## Step 1.5: dirty-page tracking
+
+- **One capture API.** `Memory::take_dirty_pages` returns the pages written
+  since the last capture, by the guest or the host, as sorted page ranges,
+  and starts a new period. It covers every page whose contents changed; a
+  page a write left unchanged may also appear. Loading a machine starts the
+  first period after layout.
+- **Interpreter.** Sparse memory keeps a dirty flag per allocated frame
+  and a list of written pages, so a store pays one load and a predictable
+  branch. Flat memory keeps a two-level bitmap of 1,024-page slots. A range
+  covering whole slots marks each slot in one step, so clearing a 4 GiB
+  range costs one entry per slot.
+- **Host writes,** on both backends: `poke`, `fetch` and `state_read`
+  results, precompile output and `write_bytes_checked` all reach guest
+  memory through `init_copy`, which marks. `clear_pages` marks too, but on
+  sparse memory only pages that hold a frame, since the rest already read
+  as zero. The raw `DerefMut` on `NativeMemory` is gone: native memory is
+  written only through the marking paths.
+- **JIT: three options measured** (`dirty` in `pvm/bench`, on a 4 GiB
+  memfd window like the JIT's):
+
+  | Option | Per page written | 3-page capture | Notes |
+  |---|---|---|---|
+  | (a) `mprotect` + SIGSEGV | 1.4–2.0 µs | 0.7 µs | splits mappings |
+  | (b) store barrier | — | — | +13% on S1 compute |
+  | (c) userfaultfd + `PAGEMAP_SCAN` | 0.35–0.5 µs | 1.7 µs | no per-store cost |
+
+  Option (b) was measured with a probe that added only the barrier's fast
+  path to every store (load the page's byte, compare, branch, with RDX
+  saved around it, since no register is free). Even that cost 13% on the
+  JIT's compute workload (18.4 ms → 20.8 ms), against a 5% budget. Option
+  (c) wins. A fresh page's first write costs the same with it as without,
+  and tracking survives `mprotect`, hole punching and host-alias writes.
+- **What shaped the design.** Three findings from measuring (c):
+  - A page that was never write-protected scans as written, so a capture
+    must cover exactly the protected pages.
+  - Scanning costs about 0.46 µs per MiB of protected range, written or
+    not: 3.9 µs for 8 MiB, 29 µs for 64 MiB and 238 µs for 512 MiB.
+    Protecting a fresh 4 MiB costs about 3 µs. Protecting every writable
+    page up front would let the inner `pages` call, at constant gas, cost
+    milliseconds and megabytes of page tables.
+  - Scanning only present pages would avoid that, but a written page that
+    is reclaimed to swap loses its page-table entry and would be missed.
+- **Design.** Tracking starts per 1,024-page slot.
+  - A slot with at most 64 writable pages, such as a small actor's stack or
+    heap, starts tracking as soon as the pages are mapped.
+  - A larger slot's writable pages are mapped read-only. The guest's first
+    write into the slot faults, and the fault handler starts tracking it: it
+    write-protects the slot's writable runs, makes them writable and retries
+    the store. The handler reads the fault's write bit and the page's PVM
+    permission byte, so a guest's real fault is never taken for a first
+    write. If tracking cannot start, execution stops with a backend error,
+    never a guest fault.
+  - Pages that become writable in a tracking slot are protected before the
+    guest runs again. Pages that stop being writable are scanned first, and
+    what the guest wrote to them goes into the next capture.
+  - Captures scan only tracking slots' writable runs, so their cost follows
+    the slots the guest writes, never how much it maps.
+  - If tracking ever fails, or a tracking slot faults on a writable page,
+    every later capture reports the whole span. A machine whose backend
+    failed must be dropped, never reused.
+  - Both aliases opt out of transparent huge pages, which would track
+    2 MiB at a time.
+  - The alternate signal stack is now installed on every executor thread.
+    Uniform permission changes to adjacent slots share one `mprotect`.
+  - **Kernel requirement.** On kernels without asynchronous userfaultfd
+    write-protect (before Linux 6.7), the default backend falls back to the
+    interpreter and logs a warning once. An explicit request for the
+    recompiler fails when its memory is created.
+- **Tests.**
+  - A proptest checks, on flat and sparse memory, that every changed or
+    written page is captured.
+  - Native-memory tests cover: captures across permission changes; a large
+    slot tracking from its first write; a write after a host clear; a
+    failure making every later capture report the whole span; fresh
+    windows; and host-alias writes.
+  - A precompile's output page is captured on the interpreter (flat and
+    sparse) and the JIT.
+  - `tests/dirty_pages.rs` runs S1's workflows on the interpreter (sparse
+    and flat) and the JIT in lockstep. Their captures must be identical at
+    every host call and cover every changed page. Disabling the JIT's
+    protection makes it fail.
+- **Gates:**
+
+  | | Result | Gate |
+  |---|---|---|
+  | 3-page capture, interpreter | 0.2–0.5 µs | ≤ 20 µs |
+  | 3-page capture, JIT (S1, 8 MiB arena) | 8–12 µs | ≤ 20 µs |
+  | S1 compute, interpreter | +2.8% (186.9 → 192.2 ms) | ≤ 5% |
+  | S1 compute, JIT | within noise (±3%) | ≤ 5% |
+  | New JIT machine (create + first resume) | about 35 µs | ≤ 50 µs |
+
+  Copying and hashing the three pages for shipping adds 9–15 µs. The first
+  resume of a fresh JIT machine costs about 6 µs more than in step 1.4,
+  since its small slots start tracking at once; a pooled machine pays that
+  once. The pool gate's acquire, use and reset of S2's actor are measured
+  in step 1.6, once the pool exists.
+- **Review.** Fable found no blocking issues. Its should-fix items are in:
+  - after any failure, captures report the whole span;
+  - a fault on a writable page of a tracking slot fails tracking instead of
+    surfacing as a guest page fault, which the interpreter would not
+    produce;
+  - both aliases opt out of transparent huge pages.
+
+  It also asked for the clear-then-write and precompile tests above, the
+  errno save in the fault handler, and the backend warning.

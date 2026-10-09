@@ -189,6 +189,9 @@ pub struct PagePerms {
     /// accessors skip the table walk — the flat-buffer fast path for
     /// programs with no read-only or unmapped pages.
     uniform_rw: bool,
+    /// Slots that are not uniformly [`PERM_RW`]; `uniform_rw` holds when
+    /// there are none.
+    not_rw: usize,
     /// Monotonic mutation counter used by proof observers to cache the
     /// canonical permission commitment without rescanning the page table at
     /// every host boundary.
@@ -205,6 +208,7 @@ impl Clone for PagePerms {
             pages: self.pages,
             slots: self.slots.clone(),
             uniform_rw: self.uniform_rw,
+            not_rw: self.not_rw,
             revision: self.revision,
             changed: vec![u64::MAX; self.changed.len()],
         }
@@ -218,6 +222,7 @@ impl PagePerms {
             pages,
             slots: vec![PermSlot::Uniform(permission); slots],
             uniform_rw: permission == PERM_RW,
+            not_rw: if permission == PERM_RW { 0 } else { slots },
             revision: 0,
             changed: vec![u64::MAX; slots.div_ceil(64)],
         }
@@ -307,6 +312,7 @@ impl PagePerms {
         if unchanged {
             return false;
         }
+        let was_rw = matches!(self.slots[slot], PermSlot::Uniform(PERM_RW));
         if lo == 0 && hi == len && all_same {
             self.slots[slot] = PermSlot::Uniform(first);
         } else {
@@ -323,15 +329,20 @@ impl PagePerms {
                 self.slots[slot] = PermSlot::Uniform(leaf[0]);
             }
         }
+        match (
+            was_rw,
+            matches!(self.slots[slot], PermSlot::Uniform(PERM_RW)),
+        ) {
+            (true, false) => self.not_rw += 1,
+            (false, true) => self.not_rw -= 1,
+            _ => {}
+        }
         self.changed[slot / 64] |= 1 << (slot % 64);
         true
     }
 
     fn after_change(&mut self) {
-        self.uniform_rw = self
-            .slots
-            .iter()
-            .all(|slot| matches!(slot, PermSlot::Uniform(PERM_RW)));
+        self.uniform_rw = self.not_rw == 0;
         self.revision = self
             .revision
             .checked_add(1)
@@ -524,6 +535,144 @@ pub(crate) enum SlotPerms<'a> {
     Mixed(&'a [u8]),
 }
 
+/// One slot of [`DirtyPages`].
+#[derive(Clone, Debug, Default)]
+enum DirtySlot {
+    #[default]
+    Clean,
+    /// One bit per page of the slot written since the last capture.
+    Pages(alloc::boxed::Box<[u64; SLOT_PAGES / 64]>),
+    /// Every page of the slot counts as written.
+    Full,
+}
+
+/// Pages written since the last capture, by the guest or the host.
+///
+/// A two-level bitmap of 1,024-page slots, allocated on a slot's first
+/// write. A range covering whole slots marks them in one step, so clearing
+/// a large range costs one entry per slot, never one per page.
+#[derive(Clone, Debug, Default)]
+struct DirtyPages {
+    pages: usize,
+    slots: Vec<DirtySlot>,
+    /// Slots that are not clean, in first-write order.
+    touched: Vec<u32>,
+    /// One past the page marked last (zero: none), so repeated stores to
+    /// one page skip the walk.
+    last: usize,
+}
+
+impl DirtyPages {
+    fn new(pages: usize) -> Self {
+        Self {
+            pages,
+            slots: vec![DirtySlot::Clean; pages.div_ceil(SLOT_PAGES)],
+            touched: Vec::new(),
+            last: 0,
+        }
+    }
+
+    /// Mark page `page`, which must be inside the span.
+    #[inline(always)]
+    fn mark(&mut self, page: usize) {
+        if page + 1 == self.last {
+            return;
+        }
+        self.last = page + 1;
+        let slot = page / SLOT_PAGES;
+        let bit = page % SLOT_PAGES;
+        match &mut self.slots[slot] {
+            DirtySlot::Pages(bits) => bits[bit / 64] |= 1 << (bit % 64),
+            DirtySlot::Full => {}
+            clean @ DirtySlot::Clean => {
+                let mut bits = alloc::boxed::Box::new([0; SLOT_PAGES / 64]);
+                bits[bit / 64] = 1 << (bit % 64);
+                *clean = DirtySlot::Pages(bits);
+                self.touched.push(slot as u32);
+            }
+        }
+    }
+
+    /// Mark the pages holding `[addr, addr + len)`, which must be inside
+    /// the span. An access is at most 8 bytes, so it spans one or two pages.
+    #[inline(always)]
+    fn mark_access(&mut self, addr: u32, len: usize) {
+        let page = (addr >> 12) as usize;
+        self.mark(page);
+        if (addr as usize & 0xFFF) + len > PAGE {
+            self.mark(page + 1);
+        }
+    }
+
+    /// Mark `count` pages from `first`, which must lie inside the span.
+    fn mark_range(&mut self, first: usize, count: usize) {
+        let end = first + count;
+        let mut page = first;
+        while page < end {
+            let slot = page / SLOT_PAGES;
+            let base = slot * SLOT_PAGES;
+            let slot_end = (base + SLOT_PAGES).min(self.pages);
+            let hi = end.min(slot_end);
+            if page == base && hi == slot_end {
+                if matches!(self.slots[slot], DirtySlot::Clean) {
+                    self.touched.push(slot as u32);
+                }
+                self.slots[slot] = DirtySlot::Full;
+            } else {
+                for page in page..hi {
+                    self.mark(page);
+                }
+            }
+            page = hi;
+        }
+    }
+
+    /// The marked pages as sorted, coalesced ranges, clearing the marks.
+    fn take(&mut self) -> Vec<core::ops::Range<u32>> {
+        self.last = 0;
+        let mut touched = core::mem::take(&mut self.touched);
+        touched.sort_unstable();
+        let mut ranges: Vec<core::ops::Range<u32>> = Vec::new();
+        let mut push = |page: usize, count: usize| {
+            let (first, end) = (page as u32, (page + count) as u32);
+            match ranges.last_mut() {
+                Some(last) if last.end == first => last.end = end,
+                _ => ranges.push(first..end),
+            }
+        };
+        for slot in touched {
+            let slot = slot as usize;
+            let base = slot * SLOT_PAGES;
+            match core::mem::take(&mut self.slots[slot]) {
+                DirtySlot::Clean => {}
+                DirtySlot::Full => push(base, (base + SLOT_PAGES).min(self.pages) - base),
+                DirtySlot::Pages(bits) => {
+                    for (index, &word) in bits.iter().enumerate() {
+                        let mut word = word;
+                        while word != 0 {
+                            push(base + index * 64 + word.trailing_zeros() as usize, 1);
+                            word &= word - 1;
+                        }
+                    }
+                }
+            }
+        }
+        ranges
+    }
+
+    fn allocated_bytes(&self) -> usize {
+        self.slots.capacity() * core::mem::size_of::<DirtySlot>()
+            + self
+                .slots
+                .iter()
+                .filter(|slot| matches!(slot, DirtySlot::Pages(_)))
+                .count()
+                * SLOT_PAGES
+                / 8
+            + self.touched.capacity() * core::mem::size_of::<u32>()
+    }
+}
+
 /// Dense guest memory: one buffer spanning address 0 to the end of the
 /// highest mapped page. Always a whole number of 4 KiB pages; the
 /// permission map has exactly one entry per page, so the page-index bounds
@@ -532,6 +681,7 @@ pub(crate) enum SlotPerms<'a> {
 pub struct FlatMem {
     bytes: FlatBytes,
     perms: PagePerms,
+    dirty: DirtyPages,
     value_revision: u64,
 }
 
@@ -567,17 +717,18 @@ impl core::ops::Deref for FlatBytes {
     }
 }
 
-impl core::ops::DerefMut for FlatBytes {
-    fn deref_mut(&mut self) -> &mut [u8] {
+impl FlatBytes {
+    /// Base of the writable bytes. Every write through it must mark the
+    /// written pages in the owning [`FlatMem`]'s dirty set.
+    #[inline(always)]
+    fn as_mut_ptr(&mut self) -> *mut u8 {
         match self {
-            Self::Owned(bytes) => bytes,
+            Self::Owned(bytes) => bytes.as_mut_ptr(),
             #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
-            Self::Native(bytes) => bytes,
+            Self::Native(bytes) => bytes.host_ptr(),
         }
     }
-}
 
-impl FlatBytes {
     fn clear_pages(&mut self, first: usize, count: usize) -> bool {
         match self {
             Self::Owned(bytes) => {
@@ -610,6 +761,7 @@ impl FlatMem {
         Self {
             bytes: FlatBytes::Owned(bytes),
             perms: PagePerms::new_rw(pages),
+            dirty: DirtyPages::new(pages),
             value_revision: 0,
         }
     }
@@ -645,6 +797,7 @@ impl FlatMem {
                     val,
                 );
             }
+            self.dirty.mark_access(addr, N);
             self.value_revision = self
                 .value_revision
                 .checked_add(1)
@@ -723,6 +876,11 @@ pub struct SparseMem {
     /// table.
     frame_pages: Vec<u32>,
     perms: PagePerms,
+    /// Per frame: written since the last capture. Only allocated frames can
+    /// change, so this is the sparse form of the dirty set.
+    frame_dirty: Vec<bool>,
+    /// Pages written since the last capture, in first-write order.
+    dirty: Vec<u32>,
     value_revision: u64,
 }
 
@@ -737,8 +895,43 @@ impl SparseMem {
             frames: Vec::new(),
             frame_pages: Vec::new(),
             perms: PagePerms::new_rw(pages),
+            frame_dirty: Vec::new(),
+            dirty: Vec::new(),
             value_revision: 0,
         }
+    }
+
+    /// Arena offset of the page's frame for a write: allocates the frame on
+    /// first touch and marks it dirty.
+    #[inline(always)]
+    fn write_frame(&mut self, page: usize) -> usize {
+        let base = self.ensure_frame(page);
+        let frame = base / PAGE;
+        // SAFETY: `frame_dirty` has one entry per allocated frame.
+        let dirty = unsafe { self.frame_dirty.get_unchecked_mut(frame) };
+        if !*dirty {
+            *dirty = true;
+            self.dirty.push(page as u32);
+        }
+        base
+    }
+
+    /// The pages written since the last capture, as sorted, coalesced page
+    /// ranges, clearing the marks.
+    fn take_dirty(&mut self) -> Vec<core::ops::Range<u32>> {
+        let mut pages = core::mem::take(&mut self.dirty);
+        for &page in &pages {
+            self.frame_dirty[self.table.get(page as usize) as usize] = false;
+        }
+        pages.sort_unstable();
+        let mut ranges: Vec<core::ops::Range<u32>> = Vec::new();
+        for page in pages {
+            match ranges.last_mut() {
+                Some(last) if last.end == page => last.end += 1,
+                _ => ranges.push(page..page + 1),
+            }
+        }
+        ranges
     }
 
     /// Arena offset of the page's frame, allocating a zeroed frame on
@@ -751,6 +944,7 @@ impl SparseMem {
         let idx = self.frames.len() / PAGE;
         self.frames.resize(self.frames.len() + PAGE, 0);
         self.frame_pages.push(page as u32);
+        self.frame_dirty.push(false);
         self.table.set(page, idx as u32);
         idx * PAGE
     }
@@ -809,7 +1003,7 @@ impl SparseMem {
         }
         let off = addr as usize & 0xFFF;
         if off + N <= PAGE {
-            let base = self.ensure_frame((addr >> 12) as usize) + off;
+            let base = self.write_frame((addr >> 12) as usize) + off;
             // SAFETY: frames are whole pages, so base + N is within the
             // arena; write_unaligned handles unaligned addresses.
             unsafe {
@@ -833,7 +1027,7 @@ impl SparseMem {
     fn write_straddle(&mut self, addr: u32, val: &[u8]) {
         for (i, &b) in val.iter().enumerate() {
             let a = addr + i as u32;
-            let base = self.ensure_frame((a >> 12) as usize) + (a as usize & 0xFFF);
+            let base = self.write_frame((a >> 12) as usize) + (a as usize & 0xFFF);
             self.frames[base] = b;
         }
     }
@@ -864,6 +1058,7 @@ impl Memory {
         Ok(Self::Flat(FlatMem {
             bytes: FlatBytes::Native(bytes),
             perms: PagePerms::new_rw(span as usize / PAGE),
+            dirty: DirtyPages::new(span as usize / PAGE),
             value_revision: 0,
         }))
     }
@@ -871,7 +1066,13 @@ impl Memory {
     #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
     pub(crate) fn native_window(
         &mut self,
-    ) -> Result<&crate::backing::CodeWindow, alloc::string::String> {
+    ) -> Result<
+        (
+            &crate::backing::CodeWindow,
+            *const crate::recompiler::memory::Activation,
+        ),
+        alloc::string::String,
+    > {
         let Self::Flat(memory) = self else {
             return Err("native execution requires native memory".into());
         };
@@ -885,7 +1086,7 @@ impl Memory {
             .value_revision
             .checked_add(1)
             .expect("memory revision cannot wrap in one invocation");
-        Ok(bytes.window())
+        Ok((bytes.window(), bytes.activation()))
     }
 
     /// Flat memory over `bytes` (zero-padded to whole pages), all pages RW.
@@ -928,6 +1129,35 @@ impl Memory {
     /// proportional to its permission changes rather than the span.
     pub fn permission_runs(&self) -> Vec<(usize, usize, u8)> {
         dispatch!(self, m => m.perms.runs())
+    }
+
+    /// The pages written since the last capture, by the guest or the host,
+    /// as sorted, coalesced page ranges; the capture starts a new period.
+    /// Every page whose contents changed is included. A page may also be
+    /// included when a write left its contents unchanged.
+    pub fn take_dirty_pages(&mut self) -> Vec<core::ops::Range<u32>> {
+        #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+        if let Memory::Flat(FlatMem {
+            bytes: FlatBytes::Native(bytes),
+            dirty,
+            ..
+        }) = self
+        {
+            // Guest stores through the native window. Once tracking has
+            // failed, every page counts as written; a machine whose backend
+            // failed must be dropped, never reused.
+            if bytes
+                .take_written(|first, count| dirty.mark_range(first, count))
+                .is_err()
+            {
+                let (first, count) = bytes.span_pages();
+                dirty.mark_range(first, count);
+            }
+        }
+        match self {
+            Memory::Flat(m) => m.dirty.take(),
+            Memory::Sparse(m) => m.take_dirty(),
+        }
     }
 
     /// Monotonic identity of the logical value image. Equal revisions for
@@ -988,6 +1218,7 @@ impl Memory {
                 if !m.bytes.clear_pages(first, count) {
                     return false;
                 }
+                m.dirty.mark_range(first, count);
                 if count != 0 {
                     m.value_revision = m
                         .value_revision
@@ -996,12 +1227,22 @@ impl Memory {
                 }
             }
             Memory::Sparse(m) => {
-                for page in first..end {
-                    let frame = m.table.get(page);
-                    if frame != NO_FRAME {
-                        let base = frame as usize * PAGE;
-                        m.frames[base..base + PAGE].fill(0);
+                // A page without a frame already reads as zero. Slots
+                // without a leaf hold no frames and are skipped whole.
+                let mut page = first;
+                while page < end {
+                    let slot_end = ((page / SLOT_PAGES + 1) * SLOT_PAGES).min(end);
+                    if m.table.leaves[page / SLOT_PAGES].is_none() {
+                        page = slot_end;
+                        continue;
                     }
+                    for page in page..slot_end {
+                        if m.table.get(page) != NO_FRAME {
+                            let base = m.write_frame(page);
+                            m.frames[base..base + PAGE].fill(0);
+                        }
+                    }
+                    page = slot_end;
                 }
                 if count != 0 {
                     m.value_revision = m
@@ -1141,8 +1382,19 @@ impl Memory {
         let has_data = !data.is_empty();
         match self {
             Memory::Flat(m) => {
-                m.bytes[addr as usize..addr as usize + data.len()].copy_from_slice(data);
+                // SAFETY: the assertion above bounds the range by the span,
+                // which `bytes` covers; host data never aliases guest memory.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        data.as_ptr(),
+                        m.bytes.as_mut_ptr().add(addr as usize),
+                        data.len(),
+                    );
+                }
                 if has_data {
+                    let first = addr as usize / PAGE;
+                    let last = (addr as usize + data.len() - 1) / PAGE;
+                    m.dirty.mark_range(first, last - first + 1);
                     m.value_revision = m
                         .value_revision
                         .checked_add(1)
@@ -1155,7 +1407,7 @@ impl Memory {
                 while !data.is_empty() {
                     let off = (a % PAGE as u64) as usize;
                     let n = (PAGE - off).min(data.len());
-                    let base = m.ensure_frame((a / PAGE as u64) as usize) + off;
+                    let base = m.write_frame((a / PAGE as u64) as usize) + off;
                     m.frames[base..base + n].copy_from_slice(&data[..n]);
                     a += n as u64;
                     data = &data[n..];
@@ -1176,12 +1428,16 @@ impl Memory {
     /// — the property that makes 4 GiB layouts viable on 32-bit hosts.
     pub fn allocated_bytes(&self) -> usize {
         match self {
-            Memory::Flat(m) => m.bytes.capacity() + m.perms.allocated_bytes(),
+            Memory::Flat(m) => {
+                m.bytes.capacity() + m.perms.allocated_bytes() + m.dirty.allocated_bytes()
+            }
             Memory::Sparse(m) => {
                 m.table.allocated_bytes()
                     + m.frames.capacity()
                     + m.frame_pages.capacity() * core::mem::size_of::<u32>()
                     + m.perms.allocated_bytes()
+                    + m.frame_dirty.capacity()
+                    + m.dirty.capacity() * core::mem::size_of::<u32>()
             }
         }
     }
@@ -1323,6 +1579,8 @@ mod tests {
                 + sparse.frames.capacity()
                 + sparse.frame_pages.capacity() * core::mem::size_of::<u32>()
                 + sparse.perms.allocated_bytes()
+                + sparse.frame_dirty.capacity()
+                + sparse.dirty.capacity() * core::mem::size_of::<u32>()
         );
         let empty = SparseMem::default();
         assert!(empty.table.leaves.is_empty());
@@ -1455,6 +1713,55 @@ mod tests {
         assert_eq!(memory.page_perm(pages), None);
     }
 
+    fn pages_of(ranges: &[core::ops::Range<u32>]) -> Vec<u32> {
+        ranges.iter().cloned().flatten().collect()
+    }
+
+    #[test]
+    fn dirty_pages_cover_guest_and_host_writes() {
+        let (mut flat, mut sparse) = pair();
+        for memory in [&mut flat, &mut sparse] {
+            assert_eq!(pages_of(&memory.take_dirty_pages()), [3], "layout copy");
+            assert!(memory.take_dirty_pages().is_empty(), "capture clears");
+            memory.write_u8(5, 1).unwrap();
+            memory.write_u64_le(2 * PAGE as u32 - 4, 7).unwrap_err();
+            memory.write_u64_le(PAGE as u32 - 4, 7).unwrap();
+            assert!(memory.write_bytes_checked(4 * PAGE as u32 + 9, &[1; 4096]));
+            assert_eq!(memory.take_dirty_pages(), [0..2, 4..6]);
+            // A failed write marks nothing.
+            assert!(!memory.write_bytes_checked(3 * PAGE as u32, &[1]));
+            assert!(memory.take_dirty_pages().is_empty());
+        }
+    }
+
+    #[test]
+    fn clearing_marks_only_what_can_change() {
+        let pages = 3 * SLOT_PAGES + 5;
+        let mut flat = Memory::flat(vec![0; pages * PAGE]);
+        let mut sparse = Memory::sparse((pages * PAGE) as u64);
+        for memory in [&mut flat, &mut sparse] {
+            memory
+                .write_u8((SLOT_PAGES as u32 + 7) * PAGE as u32, 1)
+                .unwrap();
+            memory.take_dirty_pages();
+            assert!(memory.clear_pages(1, pages - 1));
+        }
+        // Flat memory marks the whole range, whole slots in one step; sparse
+        // memory marks only pages that hold a frame.
+        assert_eq!(
+            pages_of(&flat.take_dirty_pages()),
+            (1..pages as u32).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            pages_of(&sparse.take_dirty_pages()),
+            [SLOT_PAGES as u32 + 7]
+        );
+        let Memory::Flat(flat) = &flat else {
+            unreachable!()
+        };
+        assert!(flat.dirty.allocated_bytes() < 64 << 10);
+    }
+
     fn permission() -> impl Strategy<Value = u8> {
         prop_oneof![Just(PERM_NONE), Just(PERM_RO), Just(PERM_RW)]
     }
@@ -1506,6 +1813,61 @@ mod tests {
                 if len > 0 {
                     prop_assert_eq!(perms.readable(addr, len), covered(PERM_RO));
                     prop_assert_eq!(perms.writable(addr, len), covered(PERM_RW));
+                }
+            }
+        }
+
+        /// Every page whose contents changed since the last capture is in
+        /// the next capture, and so is every page a write succeeded on.
+        #[test]
+        fn dirty_pages_cover_every_change(
+            rounds in proptest::collection::vec(
+                proptest::collection::vec(
+                    (0u32..7 * PAGE as u32, 0u8..6, any::<u64>(), 0usize..3 * PAGE),
+                    1..24,
+                ),
+                1..4,
+            )
+        ) {
+            let (mut flat, mut sparse) = pair();
+            for memory in [&mut flat, &mut sparse] {
+                memory.take_dirty_pages();
+                let image = |memory: &Memory| {
+                    let mut bytes = vec![0u8; 6 * PAGE];
+                    memory.read_bytes(0, &mut bytes);
+                    bytes
+                };
+                for ops in &rounds {
+                    let before = image(memory);
+                    let mut written = alloc::collections::BTreeSet::new();
+                    for &(addr, op, value, len) in ops {
+                        let touched = |addr: u32, len: usize| {
+                            (addr / PAGE as u32..=(addr + len as u32 - 1) / PAGE as u32)
+                                .collect::<Vec<_>>()
+                        };
+                        let ok = match op {
+                            0 => memory.write_u8(addr, value as u8).is_ok(),
+                            1 => memory.write_u64_le(addr, value).is_ok(),
+                            2 => memory.write_bytes_checked(addr, &vec![value as u8; len.max(1)]),
+                            3 => memory.clear_pages(addr as usize / PAGE, len / PAGE),
+                            _ => {
+                                memory.set_page_range(addr as usize / PAGE % 6, 1, value as u8 % 3);
+                                false
+                            }
+                        };
+                        if ok && op < 3 {
+                            let width = [1, 8, len.max(1)][op as usize];
+                            written.extend(touched(addr, width));
+                        }
+                    }
+                    let after = image(memory);
+                    let dirty = pages_of(&memory.take_dirty_pages());
+                    for page in 0..6u32 {
+                        let range = page as usize * PAGE..(page as usize + 1) * PAGE;
+                        if before[range.clone()] != after[range] || written.contains(&page) {
+                            prop_assert!(dirty.contains(&page), "page {} missed", page);
+                        }
+                    }
                 }
             }
         }

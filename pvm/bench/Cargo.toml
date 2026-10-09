@@ -12,3 +12,4 @@ vos-pvm-compiler = { workspace = true }
 vos-pvm-proof = { workspace = true }
 blake2 = "0.10"
 lz4_flex = "0.11"
+libc = "0.2"

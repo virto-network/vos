@@ -1498,6 +1498,7 @@ name = "vos-pvm-bench"
 version = "0.1.0"
 dependencies = [
  "blake2",
+ "libc",
  "lz4_flex",
  "vos-pvm",
  "vos-pvm-compiler",

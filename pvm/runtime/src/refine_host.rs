@@ -966,6 +966,58 @@ mod tests {
     }
 
     #[test]
+    fn precompile_output_is_a_dirty_page_on_every_path() {
+        let program = compression_program(crate::precompile::BLAKE2B_COMPRESS as u16);
+        // The program stores nothing itself: the only write is the
+        // compression output at 0x2_0000, written in place by the host.
+        let h_page = 0x2_0000 / crate::PVM_PAGE_SIZE;
+        let check = |mut invocation: Invocation, path: &str| {
+            assert_eq!(invocation.exit, ExitReason::Halt, "{path}");
+            assert_eq!(
+                invocation.memory_mut().take_dirty_pages(),
+                vec![h_page..h_page + 1],
+                "{path}: precompile output"
+            );
+        };
+        for (model, observed) in [
+            (crate::refine::MemoryModel::Auto, false),
+            (crate::refine::MemoryModel::Sparse, true),
+        ] {
+            let context = RefineContext::load_with_backend(
+                &program,
+                &[],
+                1_000_000,
+                model,
+                PvmBackend::ForceInterpreter,
+            )
+            .unwrap();
+            let invocation = if observed {
+                context.run_observed(|_| {})
+            } else {
+                context.run()
+            };
+            check(
+                invocation,
+                if observed { "observed" } else { "interpreter" },
+            );
+        }
+        #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+        check(
+            RefineContext::load_with_backend(
+                &program,
+                &[],
+                1_000_000,
+                crate::refine::MemoryModel::Auto,
+                PvmBackend::ForceRecompiler,
+            )
+            .unwrap()
+            .try_run()
+            .unwrap(),
+            "recompiler",
+        );
+    }
+
+    #[test]
     fn unpayable_precompile_stops_out_of_gas_unserved() {
         let program = compression_program(crate::precompile::BLAKE2B_COMPRESS as u16);
         let full = RefineContext::load(&program, &[], 1_000_000).unwrap().run();

@@ -97,9 +97,21 @@ fn resolve_backend(backend: PvmBackend) -> Result<ResolvedBackend, String> {
                     }
                 }
             }
-            // Platform default: recompiler if available
+            // Platform default: the recompiler where the host can track its
+            // guest writes, otherwise the interpreter.
             #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
-            return Ok(ResolvedBackend::Recompiler);
+            return Ok(if crate::recompiler::write_tracking::available() {
+                ResolvedBackend::Recompiler
+            } else {
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    tracing::warn!(
+                        "the recompiler needs userfaultfd write-protect (Linux 6.7 or later); \
+                         using the interpreter"
+                    )
+                });
+                ResolvedBackend::Interpreter
+            });
             #[cfg(not(all(feature = "std", target_os = "linux", target_arch = "x86_64")))]
             return Ok(ResolvedBackend::Interpreter);
         }

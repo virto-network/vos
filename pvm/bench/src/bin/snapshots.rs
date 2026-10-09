@@ -6,6 +6,10 @@
 //! restoring a fresh machine from a snapshot at every suspension. It reports
 //! changed pages, capture and restore costs, and the work a replay journal
 //! would redo instead.
+//!
+//! Captures use dirty-page tracking on the interpreter and on a JIT machine
+//! run in lockstep; a full scan of the writable pages is kept as the cost
+//! without tracking and as a check that the capture covers every change.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -134,9 +138,12 @@ struct Snapshot {
 struct Row {
     dirty_pages: usize,
     delta_pages: usize,
+    captured_pages: usize,
     delta_lz4: usize,
     scan_us: f64,
-    tracked_us: f64,
+    capture_interp_us: f64,
+    capture_jit_us: f64,
+    ship_us: f64,
     restore_interp_us: f64,
     restore_jit_us: f64,
     prefix_us: f64,
@@ -157,11 +164,17 @@ fn snapshot_run(spi: &[u8], args: &[u8], prefixes: &[Duration]) -> (String, Vec<
     let image_pages: BTreeMap<u32, Page> = rw.iter().map(|i| (*i, read_page(&image, *i))).collect();
 
     let mut machine = Machine::load_prepared(&interp, args, GAS, MemoryModel::Sparse).unwrap();
+    let mut native = Machine::load_prepared(&jit, args, GAS, MemoryModel::Auto).unwrap();
     let mut previous: BTreeMap<u32, Page> = BTreeMap::new();
     let mut rows = Vec::new();
     let mut ordinal = 0;
     loop {
         let exit = machine.try_resume().unwrap();
+        assert_eq!(
+            native.try_resume().unwrap(),
+            exit,
+            "interpreter and JIT exits"
+        );
         let call = match exit {
             ExitReason::HostCall(call) => call,
             ExitReason::Halt => return (output(&machine), rows),
@@ -169,9 +182,21 @@ fn snapshot_run(spi: &[u8], args: &[u8], prefixes: &[Duration]) -> (String, Vec<
         };
         if call == CALL_LOCAL {
             serve(&mut machine, call, ordinal);
+            serve(&mut native, call, ordinal);
             ordinal += 1;
             continue;
         }
+
+        // Tracked capture on both backends: the pages written since the
+        // previous capture, replies included.
+        let started = Instant::now();
+        let captured = machine.memory_mut().take_dirty_pages();
+        let capture_interp_us = started.elapsed().as_secs_f64() * 1e6;
+        let started = Instant::now();
+        let native_captured = native.memory_mut().take_dirty_pages();
+        let capture_jit_us = started.elapsed().as_secs_f64() * 1e6;
+        assert_eq!(captured, native_captured, "interpreter and JIT captures");
+        let captured: Vec<u32> = captured.into_iter().flatten().collect();
 
         // Capture at the suspension point, before any reply exists.
         let pending = machine
@@ -193,16 +218,22 @@ fn snapshot_run(spi: &[u8], args: &[u8], prefixes: &[Duration]) -> (String, Vec<
             .map(|(index, _)| *index)
             .collect();
         let scan_us = scan_started.elapsed().as_secs_f64() * 1e6;
-
-        // Cost with native dirty tracking: copy and hash only changed pages.
-        let tracked_started = Instant::now();
-        let mut shipped = Vec::with_capacity(delta.len() * PAGE);
         for index in &delta {
+            assert!(
+                captured.contains(index),
+                "page {index} changed but was not captured"
+            );
+        }
+
+        // Ship the captured pages: copy and hash each.
+        let ship_started = Instant::now();
+        let mut shipped = Vec::with_capacity(captured.len() * PAGE);
+        for index in &captured {
             let page = read_page(memory, *index);
             let _hash = Blake2b512::digest(&page[..]);
             shipped.extend_from_slice(&page[..]);
         }
-        let tracked_us = tracked_started.elapsed().as_secs_f64() * 1e6;
+        let ship_us = ship_started.elapsed().as_secs_f64() * 1e6;
         let delta_lz4 = lz4_flex::compress_prepend_size(&shipped).len();
 
         let snapshot = Snapshot {
@@ -249,9 +280,12 @@ fn snapshot_run(spi: &[u8], args: &[u8], prefixes: &[Duration]) -> (String, Vec<
         rows.push(Row {
             dirty_pages: snapshot.pages.len(),
             delta_pages: delta.len(),
+            captured_pages: captured.len(),
             delta_lz4,
             scan_us,
-            tracked_us,
+            capture_interp_us,
+            capture_jit_us,
+            ship_us,
             restore_interp_us: median(restore_interp),
             restore_jit_us: median(restore_jit),
             prefix_us: prefixes
@@ -260,8 +294,11 @@ fn snapshot_run(spi: &[u8], args: &[u8], prefixes: &[Duration]) -> (String, Vec<
         });
         previous = snapshot.pages;
 
-        // Continue in the restored machine and deliver the reply there.
+        // Continue in the restored machine and deliver the reply there. The
+        // restore starts a new capture period.
         machine = restored.unwrap();
+        machine.memory_mut().take_dirty_pages();
+        serve(&mut native, call, ordinal);
         // `from_pvm_blob` resumes at `resume_pc`; deliver the reply first.
         serve(&mut machine, call, ordinal);
         ordinal += 1;
@@ -299,14 +336,16 @@ fn main() {
             },
         );
         println!(
-            "   {:>3} {:>6} {:>6} {:>9} {:>9} {:>9} {:>10} {:>10} {:>10} {:>10}",
+            "   {:>3} {:>6} {:>6} {:>5} {:>8} {:>8} {:>8} {:>8} {:>8} {:>10} {:>10} {:>10}",
             "#",
             "dirty",
             "delta",
-            "delta KiB",
+            "capt",
             "lz4 KiB",
             "scan µs",
-            "track µs",
+            "cap-int",
+            "cap-jit",
+            "ship µs",
             "rst-int µs",
             "rst-jit µs",
             "replay µs"
@@ -316,14 +355,16 @@ fn main() {
                 .get(index)
                 .map_or(0.0, |d| d.as_secs_f64() * 1e6);
             println!(
-                "   {:>3} {:>6} {:>6} {:>9.1} {:>9.1} {:>9.0} {:>10.0} {:>10.0} {:>10.0} {:>4.0}/{:<5.0}",
+                "   {:>3} {:>6} {:>6} {:>5} {:>8.1} {:>8.0} {:>8.1} {:>8.1} {:>8.1} {:>10.0} {:>10.0} {:>4.0}/{:<5.0}",
                 index,
                 row.dirty_pages,
                 row.delta_pages,
-                row.delta_pages as f64 * 4.0,
+                row.captured_pages,
                 row.delta_lz4 as f64 / 1024.0,
                 row.scan_us,
-                row.tracked_us,
+                row.capture_interp_us,
+                row.capture_jit_us,
+                row.ship_us,
                 row.restore_interp_us,
                 row.restore_jit_us,
                 row.prefix_us,

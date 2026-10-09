@@ -307,6 +307,8 @@ impl Machine {
                 mem.init_copy(base as u32, data);
             }
         }
+        // Dirty pages count from the loaded image.
+        mem.take_dirty_pages();
 
         let interp = Interpreter::from_predecoded(
             prepared.interpreter_program().clone(),
@@ -509,6 +511,11 @@ impl Invocation {
     /// via [`Memory::read_bytes`], which is representation-independent.
     pub fn memory(&self) -> &Memory {
         &self.mem
+    }
+
+    /// The guest memory at exit, for capturing its dirty pages.
+    pub fn memory_mut(&mut self) -> &mut Memory {
+        &mut self.mem
     }
 }
 

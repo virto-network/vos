@@ -37,6 +37,7 @@ pub mod codegen;
 pub(crate) mod memory;
 pub mod signal;
 mod standard;
+pub(crate) mod write_tracking;
 pub(crate) use standard::run_standard;
 
 use crate::ExitReason;
@@ -815,6 +816,7 @@ impl RecompiledPvm {
                 trap_table_len: trap_table.len(),
                 fault_resume_offsets_ptr: fault_resume_offsets.as_ptr(),
                 fault_resume_offsets_len: fault_resume_offsets.len(),
+                activation: std::ptr::null(),
             });
             Some(ss)
         };

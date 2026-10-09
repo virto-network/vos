@@ -114,6 +114,9 @@ pub const EXIT_PANIC: u32 = 1;
 pub const EXIT_OOG: u32 = 2;
 pub const EXIT_PAGE_FAULT: u32 = 3;
 pub const EXIT_HOST_CALL: u32 = 4;
+/// Set by the fault handler when write tracking could not start for a
+/// slot; never produced by generated code.
+pub const EXIT_TRACKING_FAILED: u32 = 5;
 
 /// Result of compilation.
 pub struct CompileResult {

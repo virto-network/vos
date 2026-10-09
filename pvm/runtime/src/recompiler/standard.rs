@@ -8,7 +8,7 @@ pub(crate) fn run_standard(
     compiled: &CompiledCode,
     vm: &mut Interpreter,
 ) -> Result<ExitReason, String> {
-    let window = vm.memory_mut().native_window()?;
+    let (window, activation) = vm.memory_mut().native_window()?;
     let context_pointer = window.ctx_ptr().cast::<JitContext>();
     let flat_buf = window.base();
     let flat_perms = window.perms();
@@ -62,6 +62,7 @@ pub(crate) fn run_standard(
             trap_table_len: compiled.trap_table.len(),
             fault_resume_offsets_ptr: compiled.fault_resume_offsets.as_ptr(),
             fault_resume_offsets_len: compiled.fault_resume_offsets.len(),
+            activation,
         };
         // Preserve a prior owner even when embedders nest native execution.
         let previous = signal::SIGNAL_STATE.with(|cell| cell.replace(&mut state));
@@ -92,6 +93,9 @@ pub(crate) fn run_standard(
                 .expect("native page-fault argument is a 32-bit address"),
         ),
         4 => ExitReason::HostCall(context.exit_arg),
+        super::codegen::EXIT_TRACKING_FAILED => {
+            return Err("native write tracking failed".into());
+        }
         _ => return Err("invalid native exit reason".into()),
     })
 }

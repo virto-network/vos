@@ -4,13 +4,18 @@
 //! software bounds checks. Instead, guard pages (PROT_NONE) beyond heap_top
 //! trigger SIGSEGV, which this handler intercepts and redirects to the
 //! existing exit sequence via ucontext modification (no longjmp).
+//!
+//! A write to a guest-writable page of a slot that does not track writes
+//! yet is not a guest fault: the handler starts tracking the slot and
+//! returns, so the store retries ([`Activation`]).
 
 use std::cell::Cell;
 use std::ptr::null_mut;
 use std::sync::Once;
 
 use super::JitContext;
-use super::codegen::EXIT_PAGE_FAULT;
+use super::codegen::{EXIT_PAGE_FAULT, EXIT_TRACKING_FAILED};
+use super::memory::{Activated, Activation};
 
 /// Per-thread state accessible from the signal handler.
 #[repr(C)]
@@ -31,6 +36,9 @@ pub struct SignalState {
     /// fault retry is valid at that byte position.
     pub fault_resume_offsets_ptr: *const i32,
     pub fault_resume_offsets_len: usize,
+    /// Write-tracking activation for the guest window, or null when the
+    /// window does not track writes.
+    pub(crate) activation: *const Activation,
 }
 
 // SAFETY: SignalState is only accessed by the owning thread (set before JIT call,
@@ -42,20 +50,26 @@ thread_local! {
 }
 
 static INIT: Once = Once::new();
+
+thread_local! {
+    static ALTERNATE_STACK: Cell<bool> = const { Cell::new(false) };
+}
 // SAFETY: sigaction is a POD struct — zero-initialized is a valid (SIG_DFL) state.
 // Accessed only inside Once::call_once (write) and from the signal handler (read)
 // after initialization is complete.
 static mut PREV_SIGSEGV: libc::sigaction = unsafe { std::mem::zeroed() };
 
-/// Ensure the SIGSEGV handler is installed (once per process).
+/// Ensure the SIGSEGV handler is installed (once per process) and this
+/// thread has an alternate signal stack (once per thread).
 pub fn ensure_installed() {
-    // SAFETY: Both install functions use OS APIs (sigaction, sigaltstack, mmap)
-    // which are safe to call once at startup. Once::call_once guarantees this
-    // runs exactly once across all threads.
-    INIT.call_once(|| unsafe {
-        install_sigaltstack();
-        install_handler();
-    });
+    if !ALTERNATE_STACK.with(Cell::get) {
+        // SAFETY: sigaltstack and mmap configure only the calling thread.
+        unsafe { install_sigaltstack() };
+        ALTERNATE_STACK.with(|installed| installed.set(true));
+    }
+    // SAFETY: sigaction is a process-wide OS API; Once::call_once runs it
+    // exactly once across all threads.
+    INIT.call_once(|| unsafe { install_handler() });
 }
 
 unsafe fn install_handler() {
@@ -155,6 +169,32 @@ unsafe extern "C" fn sigsegv_handler(
             return;
         }
 
+        // A write may be the first into a slot that does not track writes
+        // yet. The x86 page-fault error code's bit 1 marks a write.
+        let ctx = &mut *state.ctx_ptr;
+        let fault_host = (*_siginfo).si_addr() as usize;
+        let fault_offset = fault_host.wrapping_sub(ctx.flat_buf as usize);
+        let write = cx.uc_mcontext.gregs[libc::REG_ERR as usize] & 2 != 0;
+        if write && !state.activation.is_null() && fault_offset < 1 << 32 {
+            // Starting tracking makes system calls; keep the interrupted
+            // code's errno.
+            let errno = *libc::__errno_location();
+            let activated = (*state.activation).activate(fault_offset / 4096);
+            *libc::__errno_location() = errno;
+            match activated {
+                Activated::Started => return,
+                Activated::Failed => {
+                    // A backend failure, not a guest exit: the invocation
+                    // aborts, and the context's pc is not meaningful.
+                    ctx.exit_reason = EXIT_TRACKING_FAILED;
+                    ctx.fast_reentry = 0;
+                    cx.uc_mcontext.gregs[libc::REG_RIP as usize] = state.exit_label_addr as i64;
+                    return;
+                }
+                Activated::NotTracking => {}
+            }
+        }
+
         // Binary search the trap table for this native offset.
         // If the faulting PC is in JIT code, always handle it as a guest fault —
         // never delegate to the previous handler (which would crash the host process).
@@ -176,9 +216,7 @@ unsafe extern "C" fn sigsegv_handler(
         // which points at the previous page when an unaligned access
         // straddles into a protected page. Page-granular fault addresses
         // match the interpreter and the Lean oracle.
-        let ctx = &mut *state.ctx_ptr;
-        let fault_host = (*_siginfo).si_addr() as usize;
-        let guest_addr = (fault_host.wrapping_sub(ctx.flat_buf as usize) as u32) & !0xFFF;
+        let guest_addr = (fault_offset as u32) & !0xFFF;
 
         // Write trap info into JitContext.
         ctx.exit_reason = EXIT_PAGE_FAULT;
