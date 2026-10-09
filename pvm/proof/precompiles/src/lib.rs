@@ -5,18 +5,20 @@
 //! plus a streaming `blake2b_hash` (under the `blake2b` feature) so
 //! consumer code reads identically to plain dalek/blake2:
 //!
-//! ```ignore
-//! use vos_pvm_precompiles::{Scalar, RistrettoPoint, RISTRETTO_BASEPOINT_TABLE};
-//! let v: Scalar = ...;
+//! ```
+//! use vos_pvm_precompiles::{RISTRETTO_BASEPOINT_TABLE, RistrettoPoint, Scalar};
+//! let v = Scalar::from(7u64);
+//! let b = Scalar::from(3u64);
 //! let g = &RISTRETTO_BASEPOINT_TABLE;
-//! let h: RistrettoPoint = ...;
+//! let h: RistrettoPoint = &Scalar::from(5u64) * g;
 //! let p = &v * g + b * &h;
+//! assert_eq!(p, &Scalar::from(22u64) * g);
 //! ```
 //!
-//! On `target_arch = "riscv64"` (the vos-pvm-proof guest target), the
-//! `Mul` / `Add` impls dispatch to inline-asm `ecall` that the
-//! prover's chips intercept and accelerate.  On non-riscv64 targets
-//! they fall through to dalek's / a bundled software reference.
+//! On `target_arch = "riscv64"` (the guest target), the `Mul` / `Add`
+//! impls make precompile host calls, which the prover's chips record, and
+//! compute in software when the host answers `WHAT`. On other targets they
+//! run dalek or a bundled software reference.
 //!
 //! ## Features
 //!

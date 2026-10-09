@@ -70,7 +70,7 @@ the reference laptop (Core Ultra 7 155H). Other work ran at the same time
   `vos` crate. Step 1.2 ports it back.
 - **`#[ignore]`d tests:** two in the runtime, one in the compiler and one in
   the prover (`chip_isolated`). All are diagnostics or perf smokes. Step 1.2
-  turns them into benches or deletes them.
+  deleted them; none remain.
 
 **Benches on this tree** (match the spikes; medians):
 
@@ -443,3 +443,47 @@ changes the format again anyway:
 
   It also asked for the clear-then-write and precompile tests above, the
   errno save in the fault handler, and the backend warning.
+
+## Reviews of steps 1.1 to 1.3
+
+Fable reviewed the three steps it had not seen, after step 1.5, and
+signed off on all three.
+
+- **Step 1.3.** The price is charged from one table on every serving path,
+  with the same semantics everywhere.
+  - The CPU AIR has no gas column. The proof binds gas only through the
+    replayed refine boundary: the machine-state commitment hashes the gas
+    at every boundary, and the replay charges through the same
+    `vos_pvm::precompile::charge`. So a prover can neither claim a served
+    call while skipping the charge nor charge without serving.
+  - For the privacy track: a witness-free verifier has no gas in its
+    statement, so a slice's exit kind must be bound by the closing chip or
+    the public output. The AIR alone cannot tell "stopped, unable to pay"
+    from "stopped at a host boundary".
+  - Fixed: the BLAKE2b shim passed only a counter's low 64 bits to the
+    precompile, so a counter of 2^64 or more would have differed from the
+    software result. Such counters now compute in software.
+  - Pinned: the legacy prover tracer serves the Ristretto and scalar ids
+    110–114, which the refine host answers with `WHAT`, so a program using
+    them traces differently there than it runs on VOS. Gating the tracer
+    on the runtime's set would leave six chip test suites without input
+    until step 5. A test now pins the difference instead, and step 5
+    closes it by serving those ids on the refine host.
+- **Steps 1.2, stages 1–3.** Nothing JAR-specific survives. The behaviour
+  changes beyond removal (the init fee, invalid-opcode gas, the gas
+  column) are correct for Gray Paper 0.8.0.
+  - `jar-check` now also catches JAR's ISA and gas modes, `mem_cycles`, its
+    trap exit, `sbrk` calls and CSR `0x800`.
+  - The conformance corpus remains self-made. No public 0.8.0 PVM
+    instruction corpus exists:
+    - `w3f/jamtestvectors` targets 0.7.1 and has no PVM directory;
+    - `JAMdotTech/jam-conformance` keeps PVM traces for 0.6.5–0.6.7 only.
+- **Step 1.1.** The compiler fix and the 64 MiB bundle bound are correct.
+  The review found holes in the gates:
+  - `ci`, run before every push, now includes `jar-check`.
+  - The two bench tests that prove (`diverse_proof`, `precompile_tamper`)
+    no longer run in it. They sit behind the bench crate's `prove` feature
+    and run in `just test-bench-proof`.
+  - `just ci-full` is the gate before merging: `ci`, the prover suites and
+    soundness gates (`test-proof`), and the proving bench tests. It is
+    meant to run under a memory limit.

@@ -31,15 +31,18 @@ const BLAKE2B_IV: [u64; 8] = [
 /// LE) by mixing in the message block `m` (128 bytes = 16 u64 LE)
 /// with byte counter `t` and finalize flag `f`. On the PVM it calls
 /// ECALL_BLAKE2B_COMPRESS and computes in software when the host does not
-/// serve it; off-target it runs the software reference.
+/// serve it; off-target it runs the software reference. The call carries
+/// the counter's low 64 bits, so a larger counter is computed in software.
 pub fn blake2b_compress(h: &mut [u8; 64], m: &[u8; 128], t: u128, f: bool) {
     #[cfg(target_arch = "riscv64")]
-    if crate::ecalls::call::<ECALL_BLAKE2B_COMPRESS>(
-        h.as_mut_ptr() as u64,
-        m.as_ptr() as u64,
-        t as u64,
-        f as u64,
-    ) {
+    if t >> 64 == 0
+        && crate::ecalls::call::<ECALL_BLAKE2B_COMPRESS>(
+            h.as_mut_ptr() as u64,
+            m.as_ptr() as u64,
+            t as u64,
+            f as u64,
+        )
+    {
         return;
     }
     compress_software(h, m, t, f);

@@ -800,8 +800,9 @@ about 400 compressions.
 - Price precompiles in VOS gas. Today a call costs only its instruction's
   block gas, while the JAM fallback pays the full software cost.
 - Cut segments by chip rows as well as by steps.
-- Investigate the linker warning "unresolved return_fixup", printed while
-  linking this guest.
+- ~~Investigate the linker warning "unresolved return_fixup", printed while
+  linking this guest.~~ Fixed in slice 1, step 1.1: such a return now
+  targets a trap, where it used to name the entry point.
 
 ## Note — Settlement verifier under Gray Paper 0.8.0 (slice 1)
 

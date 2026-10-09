@@ -13,3 +13,16 @@ vos-pvm-proof = { workspace = true }
 blake2 = "0.10"
 lz4_flex = "0.11"
 libc = "0.2"
+
+[features]
+# Bench tests that prove: memory-heavy, so they run with the prover suites
+# (`just test-bench-proof`), never in the pre-push checks.
+prove = []
+
+[[test]]
+name = "diverse_proof"
+required-features = ["prove"]
+
+[[test]]
+name = "precompile_tamper"
+required-features = ["prove"]

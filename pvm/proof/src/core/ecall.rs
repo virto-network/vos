@@ -86,6 +86,12 @@ pub const ECALL_SCALAR_ADD_MOD_L: u32 = 114;
 /// identifier: exactly the cryptographic precompiles handled by
 /// [`crate::core::tracing::TracingPvm`].
 ///
+/// This is the runtime's precompile set plus the Ristretto and scalar ids
+/// 110–114, which only this tracer serves: the refine host answers them with
+/// `WHAT`, and the guest computes in software. A program using them
+/// therefore traces differently here than it runs on VOS. Step 5 moves these
+/// ids into the VOS range and serves them on the refine host as well.
+///
 /// ProgramMemory commits the dispatch identifier, which is non-zero exactly
 /// for these calls, so an untrusted prover cannot mark an unknown call as
 /// acknowledged and continue execution past it.
@@ -108,5 +114,25 @@ pub const fn proof_precompile_dispatch_id(id: u64) -> u8 {
         id if id == ECALL_SCALAR_MUL_MOD_L as u64 => ECALL_SCALAR_MUL_MOD_L as u8,
         id if id == ECALL_SCALAR_ADD_MOD_L as u64 => ECALL_SCALAR_ADD_MOD_L as u8,
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The tracer serves exactly the refine host's precompiles plus the
+    /// Ristretto and scalar ids 110–114. When step 5 serves those on the
+    /// refine host, this becomes plain equality.
+    #[test]
+    fn tracer_serves_the_runtime_precompiles_plus_the_ristretto_ids() {
+        for id in 0..0x1000u64 {
+            let ristretto = (110..=114).contains(&id);
+            assert_eq!(
+                is_proof_host_call_allowed(id),
+                vos_pvm::precompile::is_precompile(id) || ristretto,
+                "id {id:#x}"
+            );
+        }
     }
 }

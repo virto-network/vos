@@ -13,9 +13,14 @@ test:
 build-bench-guests:
     for guest in [workflows actor agent hash-software hash-precompile diverse] { do { cd $"pvm/bench/guests/($guest)"; cargo build --release --target ../../../guest/riscv64em-vos.json } }
 
-# Cross-host checks that need the bench guests.
+# Cross-host checks that need the bench guests. The bench tests that prove
+# run in `test-bench-proof`.
 test-bench: build-bench-guests
     cargo test -p vos-pvm-bench
+
+# Bench tests that prove end to end, one at a time. Memory-heavy.
+test-bench-proof: build-bench-guests
+    cargo test -p vos-pvm-bench --features prove --test diverse_proof --test precompile_tamper -- --test-threads=1
 
 # Spike benches against this tree: S1 snapshots, S2 nesting.
 bench: build-bench-guests
@@ -43,14 +48,19 @@ fmt-check:
 
 clippy:
     cargo clippy --workspace --all-targets --quiet -- -D warnings
+    cargo clippy -p vos-pvm-bench --features prove --all-targets --quiet -- -D warnings
 
-# Fails while any JAR remnant is left in the PVM crates. Joins `ci` once
-# slice 1 step 1.2 is complete.
+# Fails on any JAR remnant in the PVM crates: its ISA and gas modes, opcodes,
+# exits, capability surface, linker entry points and fixtures.
 jar-check:
-    let hits = (rg -n --glob '!**/target/**' 'IsaMode::Jar|CapabilityManifest|\blink_elf\b|link_elf_with_argument_pages|run_with_vos_stubs|ECALL_VOS_|VOS_OBJECT_CAP|Opcode::Ecall\b|ExitReason::Ecall|kernel::|vm_pool|JAR\\x02|\.gp072\.json' pvm | complete); if ($hits.exit_code == 0) { print $hits.stdout; error make { msg: "JAR remnants found" } } else { print "no JAR remnants" }
+    let hits = (rg -n --glob '!**/target/**' 'IsaMode|CapabilityManifest|\blink_elf\b|link_elf_with_argument_pages|run_with_vos_stubs|ECALL_VOS_|VOS_OBJECT_CAP|Opcode::Ecall\b|ExitReason::Ecall|ExitReason::Trap\b|kernel::|vm_pool|JAR\\x02|\.gp072\.json|\bGasModel\b|\bPerInstruction\b|\bmem_cycles\b|Opcode::Sbrk|\bsbrk\(|\b0x800\b' pvm | complete); if ($hits.exit_code == 0) { print $hits.stdout; error make { msg: "JAR remnants found" } } else { print "no JAR remnants" }
 
-# Checks before pushing.
-ci: fmt-check clippy test vectors test-bench
+# Checks before pushing: everything except proving.
+ci: fmt-check clippy jar-check test vectors test-bench
+
+# The gate before merging: `ci` plus the prover suites, the soundness gates
+# and the bench tests that prove. Run it under a memory limit.
+ci-full: ci test-proof test-bench-proof
 
 # Use the repository's hooks: fmt and clippy before commits, `just ci`
 # before pushes.
