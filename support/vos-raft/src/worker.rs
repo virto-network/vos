@@ -490,7 +490,7 @@ impl<N: NodeId> Worker<N> {
     /// dropped — host-side logging captures the underlying
     /// cause).
     ///
-    /// ```ignore
+    /// ```text
     /// let worker = Worker::spawn(storage, transport, cfg, None);
     /// worker.wait_init().expect("raft init failed");
     /// // ...the worker is now serving...

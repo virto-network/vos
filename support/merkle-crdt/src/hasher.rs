@@ -8,7 +8,7 @@ use core::fmt::Debug;
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
 /// use sha2::{Sha256, Digest};
 ///
 /// struct Sha256Hasher;

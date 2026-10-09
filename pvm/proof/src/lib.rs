@@ -13,15 +13,18 @@
 //!
 //! ## Quick start
 //!
-//! Trace a PVM program, prove its execution, verify the proof:
+//! Trace a standard program's refine run, prove it, verify the proof:
 //!
-//! ```ignore
-//! use vos_pvm_proof::{trace_blob, prove_mobile, verify};
+//! ```no_run
+//! use vos_pvm_proof::{prove_refine, trace_refine_with_output, verify_refine_bundle_replayed};
 //!
-//! // `pvm_blob` is a transpiled PVM program; `gas` bounds tracing.
-//! let mut sn = trace_blob(&pvm_blob, gas).expect("trace");
-//! let proof = prove_mobile(&mut sn).expect("prove");   // MOBILE = low latency
-//! verify(proof, &sn).expect("verify");                 // accepts any ≥96-bit proof
+//! # fn example(program: &[u8], arguments: &[u8]) {
+//! // `gas` bounds the run; the output is read back, up to 32 bytes.
+//! let gas = 1_000_000_000;
+//! let (trace, _output) = trace_refine_with_output(program, arguments, gas, 32).expect("trace");
+//! let bundle = prove_refine(trace).expect("prove");
+//! verify_refine_bundle_replayed(&bundle, program, arguments, gas).expect("verify");
+//! # }
 //! ```
 //!
 //! A *deployed* verifier sees only the proof + the program commitment

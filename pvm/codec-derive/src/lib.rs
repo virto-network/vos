@@ -1,7 +1,7 @@
 //! Derive macros for SCALE Encode/Decode traits.
 //!
 //! # Struct example
-//! ```ignore
+//! ```text
 //! #[derive(Encode, Decode)]
 //! struct MyStruct {
 //!     field_a: u32,
@@ -12,7 +12,7 @@
 //! ```
 //!
 //! # Enum example
-//! ```ignore
+//! ```text
 //! #[derive(Encode, Decode)]
 //! enum MyEnum {
 //!     #[codec(index = 0)]

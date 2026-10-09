@@ -45,11 +45,13 @@ pub type ProgramCommitment = crate::recursion_pcs::ProverMerkleHash;
 /// named API so callers don't reach into the StarkProof internals.
 ///
 /// Use this once at program-deploy time:
-///   ```ignore
-///   let proof = vos_pvm_proof::prove(&mut side_note)?;
+///   ```no_run
+///   # fn deploy(side_note: &mut vos_pvm_proof::SideNote) {
+///   let proof = vos_pvm_proof::prove(side_note).expect("prove");
 ///   let id_hash = vos_pvm_proof::program_commitment_of_proof(&proof);
 ///   let id_log_sizes = proof.log_sizes.clone();
 ///   // publish (id_hash, id_log_sizes) on-chain or alongside the program.
+///   # }
 ///   ```
 pub fn program_commitment_of_proof(proof: &Proof) -> ProgramCommitment {
     proof.stark_proof.commitments[0]

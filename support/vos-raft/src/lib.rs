@@ -62,7 +62,7 @@
 //! their own primitives (Embassy timers, SPI flash, etc.) and
 //! drive the worker future themselves:
 //!
-//! ```ignore
+//! ```text
 //! // On Embassy or any other no_std executor:
 //! let (inbox_tx, inbox_rx) = my_channel::unbounded();
 //! let role = alloc::sync::Arc::new(core::sync::atomic::AtomicU8::new(0));
