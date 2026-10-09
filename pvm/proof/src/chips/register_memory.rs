@@ -1060,7 +1060,7 @@ mod tests {
                 let reg = (next() % n_regs as u64) as u8;
                 let value = next() % n_values;
                 let timestamp = next() % 256;
-                let is_write = next() % 4 == 0; // ~25% writes, 75% reads
+                let is_write = next().is_multiple_of(4); // ~25% writes, 75% reads
                 entries.push(RegEntry {
                     reg_addr: reg,
                     value,

@@ -439,12 +439,12 @@ pub fn preflight_proof_structure_readonly(
             "extended trace log size {max_extended_log} exceeds {MAX_EXTENDED_LOG_SIZE}"
         ));
     }
-    if let Some(lifting) = config.lifting_log_size {
-        if lifting < max_extended_log || lifting > MAX_EXTENDED_LOG_SIZE {
-            return Err(format!(
-                "PCS lifting log size {lifting} does not cover {max_extended_log} within the protocol bound"
-            ));
-        }
+    if let Some(lifting) = config.lifting_log_size
+        && (lifting < max_extended_log || lifting > MAX_EXTENDED_LOG_SIZE)
+    {
+        return Err(format!(
+            "PCS lifting log size {lifting} does not cover {max_extended_log} within the protocol bound"
+        ));
     }
 
     let stark = &proof.stark_proof;

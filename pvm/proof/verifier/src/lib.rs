@@ -289,15 +289,14 @@ pub fn verify_refine_bundle_authenticated<R: RefineProgramCommitmentResolver + ?
                 "Refine host boundary encloses a noncanonical slice range".to_string(),
             ));
         }
-        if let Some(next_outer) = bundle.slices.get(expected_after) {
-            if !matches!(next_outer.identity, RefineMachineId::Outer { .. })
-                || boundary.registers_after != next_outer.proof.initial_state.registers
-            {
-                return Err(VerificationError::InvalidStructure(
-                    "Refine host boundary output registers differ from the next outer proof entry"
-                        .to_string(),
-                ));
-            }
+        if let Some(next_outer) = bundle.slices.get(expected_after)
+            && (!matches!(next_outer.identity, RefineMachineId::Outer { .. })
+                || boundary.registers_after != next_outer.proof.initial_state.registers)
+        {
+            return Err(VerificationError::InvalidStructure(
+                "Refine host boundary output registers differ from the next outer proof entry"
+                    .to_string(),
+            ));
         }
         boundary_index += 1;
         slice_index = expected_after;

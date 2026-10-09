@@ -57,7 +57,7 @@ pub(super) fn generate_interaction_trace(
                 use stwo::prover::backend::simd::m31::PackedBaseField;
                 (PackedBaseField::one() - pad).into()
             },
-            &[col.clone()],
+            std::slice::from_ref(col),
         );
     }
 

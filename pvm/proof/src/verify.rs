@@ -368,17 +368,17 @@ fn verify_with_options_explicit_components(
     // positions = the chip-isolated explicit-components path, which has
     // no stable component order and is not a trust boundary; the
     // production path always supplies `Some`.
-    if side_note.closing_chip_active {
-        if let Some(positions) = &boundary_positions {
-            crate::boundary_binding::check_boundary_claimed_sums(
-                &initial_state,
-                &final_state,
-                &lookup_elements,
-                &claimed_sums,
-                positions,
-            )
-            .map_err(|msg| VerificationError::InvalidStructure(msg.to_string()))?;
-        }
+    if side_note.closing_chip_active
+        && let Some(positions) = &boundary_positions
+    {
+        crate::boundary_binding::check_boundary_claimed_sums(
+            &initial_state,
+            &final_state,
+            &lookup_elements,
+            &claimed_sums,
+            positions,
+        )
+        .map_err(|msg| VerificationError::InvalidStructure(msg.to_string()))?;
     }
 
     let tree_span_provider = &mut TraceLocationAllocator::default();

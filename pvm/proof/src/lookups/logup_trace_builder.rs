@@ -219,7 +219,7 @@ mod tests {
                 h,
                 m,
                 t: (k as u128) * 128,
-                f: k % 2 == 0,
+                f: k.is_multiple_of(2),
             });
             sn.merkle_blake2b_mults.push((k as u32) + 1);
         }

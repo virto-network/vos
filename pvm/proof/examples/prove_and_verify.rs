@@ -93,7 +93,7 @@ fn main() {
     // segment's final_state matches the next's initial_state.  With
     // one segment there's nothing to chain, but the API is the same
     // as a multi-segment deployment would use.
-    verify_chain(&[proof.clone()], &[&side_note]).expect("verify_chain() failed");
+    verify_chain(std::slice::from_ref(&proof), &[&side_note]).expect("verify_chain() failed");
     println!("verify_chain ([1 segment]): ok");
 
     // ── Bonus: serialize + deserialize round-trip ─────────────────

@@ -300,16 +300,15 @@ impl TracingPvm {
         // arm is a single assignment) — the invariant that
         // makes `RegWrite` the whole register-file delta. Verify rather
         // than assume: a second changed index would be silently lost.
-        if let Some(i) = reg_write {
-            if let Some(j) =
+        if let Some(i) = reg_write
+            && let Some(j) =
                 ((i + 1)..PVM_REGISTER_COUNT).find(|&j| regs_before[j] != regs_after[j])
-            {
-                panic!(
-                    "step at ts {} changed registers {i} and {j}: a compact \
+        {
+            panic!(
+                "step at ts {} changed registers {i} and {j}: a compact \
                      step records exactly one register write",
-                    self.timestamp,
-                );
-            }
+                self.timestamp,
+            );
         }
         self.last_regs = regs_after;
 

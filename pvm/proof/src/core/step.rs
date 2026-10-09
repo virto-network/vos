@@ -265,8 +265,8 @@ mod tests {
             imm: 7,
             imm_y: 9,
             branch_target: 0x40,
-            branch_taken: ts % 2 == 0,
-            mem_read: (ts % 3 == 0).then_some(MemAccess {
+            branch_taken: ts.is_multiple_of(2),
+            mem_read: ts.is_multiple_of(3).then_some(MemAccess {
                 address: 0x100,
                 value: 5,
                 size: 4,

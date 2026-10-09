@@ -225,7 +225,7 @@ impl BuiltInProverComponent for CompareChip {
                 range256,
                 [is_padding[0].clone()],
                 |[pad]| (PackedBaseField::one() - pad).into(),
-                &[col.clone()],
+                std::slice::from_ref(col),
             );
         }
 

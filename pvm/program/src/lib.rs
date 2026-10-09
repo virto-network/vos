@@ -258,7 +258,7 @@ pub fn parse_compact_code_blob(data: &[u8]) -> Option<CodeBlob> {
     offset = code_end;
     let packed = data.get(offset..)?;
     if let Some(last) = packed.last()
-        && code_len % 8 != 0
+        && !code_len.is_multiple_of(8)
         && last & !((1u8 << (code_len % 8)) - 1) != 0
     {
         return None;

@@ -1,2 +1,4 @@
 [toolchain]
-channel = "nightly-2025-05-09"
+channel = "nightly-2025-07-14"
+# The settlement verifier builds the standard library for its PVM target.
+components = ["rust-src"]

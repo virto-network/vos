@@ -176,7 +176,7 @@ impl MerkleHasherLifted for P2MerkleHasher {
     }
     fn finalize(mut self) -> P2Hash {
         self.buffer.push(BaseField::one());
-        while self.buffer.len() % RATE != 0 {
+        while !self.buffer.len().is_multiple_of(RATE) {
             self.buffer.push(BaseField::zero());
         }
         let mut i = 0;

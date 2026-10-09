@@ -828,7 +828,7 @@ impl BuiltInProverComponent for DivRemChip {
                 range256,
                 [is_padding[0].clone()],
                 |[pad]| (PackedBaseField::one() - pad).into(),
-                &[col.clone()],
+                std::slice::from_ref(col),
             );
         }
         // Range256 emissions for AbsCmpDiff bytes (8 per row, gated by is_real).
@@ -837,7 +837,7 @@ impl BuiltInProverComponent for DivRemChip {
                 range256,
                 [is_padding[0].clone()],
                 |[pad]| (PackedBaseField::one() - pad).into(),
-                &[col.clone()],
+                std::slice::from_ref(col),
             );
         }
 

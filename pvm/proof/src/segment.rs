@@ -591,10 +591,10 @@ mod prover {
         let keep = |ts: u64| ts_upper.is_none_or(|t| ts < t);
         let mut writes = Vec::new();
         for step in &side_note.steps {
-            if keep(step.timestamp) {
-                if let Some(write) = write_of_step(step) {
-                    writes.push(write);
-                }
+            if keep(step.timestamp)
+                && let Some(write) = write_of_step(step)
+            {
+                writes.push(write);
             }
         }
         for op in &side_note.blake2b_mem_ops {
