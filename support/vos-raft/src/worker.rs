@@ -73,8 +73,8 @@ pub enum ProposeError {
 /// Reasons a [`WorkerHandle::read_index`] can fail.
 ///
 /// `read_index` is the leader's linearizable-read primitive: it
-/// returns the leader's `commit_index` once a quorum of
-/// followers has confirmed leadership at the current term. The
+/// returns the leader's `commit_index` once a quorum has confirmed
+/// leadership at the current term after the request arrived. The
 /// caller then waits for its own apply progress to reach that
 /// index before serving the read.
 #[derive(Debug)]
@@ -597,10 +597,12 @@ impl<N: NodeId> WorkerHandle<N> {
     ///
     /// Protocol (Ongaro thesis §6.4):
     /// 1. Worker captures `R = commit_index` at request entry.
-    /// 2. Worker triggers a heartbeat round. Once a quorum of
-    ///    followers ACKs at the current term — observable as
-    ///    `match_index_majority_floor >= R` — the worker
-    ///    resolves the request with `Ok(R)`.
+    /// 2. Worker triggers a heartbeat round. Once a quorum has
+    ///    answered, at the current term, that round or a later one,
+    ///    and `match_index_majority_floor >= R`, the worker resolves
+    ///    the request with `Ok(R)`. Answers to rounds sent before the
+    ///    request do not count: they confirm leadership only as of
+    ///    an earlier time.
     /// 3. If the worker steps down to Follower before quorum
     ///    confirms, resolves with `Err(LeaderStepped)`.
     /// 4. If the leader's pending-reads queue is at
@@ -816,6 +818,14 @@ struct LeaderState<N: NodeId> {
     /// a new one). The `offset` field is the byte position of
     /// the next chunk to send.
     snapshot_send: BTreeMap<N, SnapshotSendState>,
+    /// Heartbeat rounds sent at this term, numbered from 1. Every
+    /// AppendEntries and InstallSnapshot carries the round that sent it.
+    round: u64,
+    /// The latest round each peer has answered at this term. A read
+    /// barrier confirms leadership only through answers to rounds sent
+    /// after it was queued: an answer to an earlier round proves nothing
+    /// about the time since.
+    acked_round: BTreeMap<N, u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -954,6 +964,8 @@ impl<N: NodeId> LeaderState<N> {
             next_index,
             match_index,
             snapshot_send: BTreeMap::new(),
+            round: 0,
+            acked_round: BTreeMap::new(),
         }
     }
 }
@@ -969,6 +981,7 @@ enum RpcOutcome<N: NodeId> {
         /// response. A retired peer has learned finality only after
         /// acknowledging a request at or beyond its final config index.
         leader_commit: u64,
+        round: u64,
     },
     Vote {
         from: N,
@@ -993,6 +1006,7 @@ enum RpcOutcome<N: NodeId> {
         /// bumps `match_index` to `last_included_index`) when
         /// `was_final = true`.
         was_final: bool,
+        round: u64,
     },
 }
 
@@ -1002,6 +1016,8 @@ type RpcFut<N> = Pin<Box<dyn Future<Output = RpcOutcome<N>> + Send>>;
 
 struct PendingReadIndex<I> {
     required_index: u64,
+    /// The first heartbeat round sent after the request was queued.
+    round: u64,
     deadline: Option<I>,
     reply: oneshot::Sender<Result<u64, ReadIndexError>>,
 }
@@ -1031,11 +1047,10 @@ where
     votes_received: BTreeSet<N>,
     leader: Option<LeaderState<N>>,
     /// In-flight `read_index` requests waiting for a quorum
-    /// confirmation. The index becomes resolvable once
-    /// `match_index_majority_floor >= read_index_at_request`
-    /// (a quorum has acked at the current term, and that ack
-    /// landed at or after the request was queued). Bounded requests carry a
-    /// worker-clock deadline and are removed when it expires.
+    /// confirmation. A request resolves once a quorum has answered, at
+    /// the current term, a heartbeat round sent after it was queued, and
+    /// `match_index_majority_floor >= required_index`. Bounded requests
+    /// carry a worker-clock deadline and are removed when it expires.
     pending_read_index: Vec<PendingReadIndex<C::Instant>>,
     /// Follower-side accumulator for an in-flight chunked
     /// `InstallSnapshot`. `None` between snapshot streams; `Some`
@@ -1809,8 +1824,9 @@ async fn handle_rpc_outcome<N, S, T, C, R, A>(
             from,
             result: Some(resp),
             leader_commit,
+            round,
         } => {
-            let _ = handle_append_response(state, from, resp, leader_commit).await;
+            let _ = handle_append_response(state, from, resp, leader_commit, round).await;
         }
         RpcOutcome::Vote {
             from,
@@ -1832,6 +1848,7 @@ async fn handle_rpc_outcome<N, S, T, C, R, A>(
             last_included_term,
             chunk_end_offset,
             was_final,
+            round,
         } => {
             let _ = handle_install_snapshot_response(
                 state,
@@ -1841,6 +1858,7 @@ async fn handle_rpc_outcome<N, S, T, C, R, A>(
                 last_included_term,
                 chunk_end_offset,
                 was_final,
+                round,
             )
             .await;
         }
@@ -2617,6 +2635,7 @@ async fn handle_append_response<N, S, T, C, R, A>(
     from: N,
     resp: AppendEntriesResp,
     sent_leader_commit: u64,
+    round: u64,
 ) -> Result<(), S::Error>
 where
     N: NodeId,
@@ -2638,6 +2657,10 @@ where
         Some(l) => l,
         None => return Ok(()),
     };
+    // An answer at the current term confirms leadership as of `round`,
+    // whether or not the logs matched.
+    let acked = leader.acked_round.entry(from).or_insert(0);
+    *acked = (*acked).max(round);
     if resp.success {
         // Raft §5.3: match_index is "the highest log entry known
         // to be replicated" — strictly monotonic per peer. With
@@ -2671,6 +2694,7 @@ where
         let cur = leader.next_index.get(&from).copied().unwrap_or(1);
         let new_next = cur.saturating_sub(1).max(1);
         leader.next_index.insert(from, new_next);
+        try_resolve_pending_reads(state).await;
     }
     Ok(())
 }
@@ -2684,6 +2708,7 @@ async fn handle_install_snapshot_response<N, S, T, C, R, A>(
     last_included_term: u64,
     chunk_end_offset: u64,
     was_final: bool,
+    round: u64,
 ) -> Result<(), S::Error>
 where
     N: NodeId,
@@ -2704,6 +2729,8 @@ where
     let Some(leader) = state.leader.as_mut() else {
         return Ok(());
     };
+    let acked = leader.acked_round.entry(from).or_insert(0);
+    *acked = (*acked).max(round);
 
     // Update the per-peer chunk cursor. The follower's
     // `bytes_received` is authoritative — if it tells us it
@@ -2742,6 +2769,7 @@ where
         leader.next_index.insert(from, last_included_index + 1);
         leader.snapshot_send.remove(&from);
     }
+    try_resolve_pending_reads(state).await;
     Ok(())
 }
 
@@ -2982,6 +3010,7 @@ where
     leader.next_index.retain(|m, _| members.contains(m));
     leader.match_index.retain(|m, _| members.contains(m));
     leader.snapshot_send.retain(|m, _| members.contains(m));
+    leader.acked_round.retain(|m, _| members.contains(m));
 }
 
 /// Handle a `RaftMsg::ReadIndex` request. Captures the leader's
@@ -3034,22 +3063,30 @@ async fn handle_read_index<N, S, T, C, R, A>(
     {
         r = noop_idx;
     }
+    let Some(leader) = state.leader.as_ref() else {
+        let _ = reply.send(Err(ReadIndexError::NotLeader));
+        return;
+    };
     let deadline = timeout.map(|timeout| state.clock.add(state.clock.now(), timeout));
     state.pending_read_index.push(PendingReadIndex {
         required_index: r,
+        round: leader.round + 1,
         deadline,
         reply,
     });
-    // Trigger a fresh heartbeat round. The round's quorum-success
-    // confirms we're still leader at the current term; the
-    // resulting match_index advance fires
-    // `try_resolve_pending_reads` which drains the queue.
+    // Trigger a fresh heartbeat round. A quorum's answers to it, or to
+    // any later round, confirm we're still leader at the current term
+    // and fire `try_resolve_pending_reads`, which drains the queue.
     let _ = send_heartbeats(state, pending).await;
 }
 
-/// Drain `pending_read_index` entries whose captured commit
-/// index is now ≤ `match_index_majority_floor`. Each drained
-/// entry is replied with `Ok(R)`.
+/// Drain `pending_read_index` entries whose round a quorum has
+/// answered and whose captured commit index is now ≤
+/// `match_index_majority_floor`. Each drained entry is replied with
+/// `Ok(R)`. The round shows leadership after the request; the floor
+/// shows the current term's no-op, which `R` includes, replicated to a
+/// quorum, without which no read at this term may be served (Ongaro
+/// §6.4).
 async fn try_resolve_pending_reads<N, S, T, C, R, A>(state: &mut WorkerState<N, S, T, C, R, A>)
 where
     N: NodeId,
@@ -3065,13 +3102,28 @@ where
     let Some(mf) = state.match_index_majority_floor().await else {
         return;
     };
+    let queued = core::mem::take(&mut state.pending_read_index);
+    let Some(leader) = state.leader.as_ref() else {
+        state.pending_read_index = queued;
+        return;
+    };
+    let me = state.cfg.me;
+    let confirmed = |round: u64| {
+        state.quorum_holds(|m| {
+            m == me
+                || leader
+                    .acked_round
+                    .get(&m)
+                    .is_some_and(|acked| *acked >= round)
+        })
+    };
     let now = state.clock.now();
     // Partition pending into resolvable + still-waiting.
     let mut still_waiting = Vec::new();
-    for pending in core::mem::take(&mut state.pending_read_index) {
+    for pending in queued {
         if pending.deadline.is_some_and(|deadline| deadline <= now) {
             let _ = pending.reply.send(Err(ReadIndexError::TimedOut));
-        } else if pending.required_index <= mf {
+        } else if pending.required_index <= mf && confirmed(pending.round) {
             let _ = pending.reply.send(Ok(pending.required_index));
         } else {
             still_waiting.push(pending);
@@ -3510,10 +3562,14 @@ where
     let snap_idx = state.storage.snap_last_index();
     let snap_term = state.storage.snap_last_term();
 
-    let leader = match state.leader.as_ref() {
-        Some(l) => l.clone(),
+    let leader = match state.leader.as_mut() {
+        Some(l) => {
+            l.round += 1;
+            l.clone()
+        }
         None => return Ok(()),
     };
+    let round = leader.round;
 
     // Heartbeat to every member of the active configuration. Joint mode
     // includes both sets for quorum. Recently retired voters are transport-
@@ -3604,6 +3660,7 @@ where
                     last_included_term: snap_term,
                     chunk_end_offset,
                     was_final,
+                    round,
                 }
             });
             pending.push(fut);
@@ -3632,6 +3689,7 @@ where
                 from: peer,
                 result,
                 leader_commit,
+                round,
             }
         });
         pending.push(fut);

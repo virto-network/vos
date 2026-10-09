@@ -59,6 +59,12 @@ struct MockTransport {
     /// `RequestVote` should not grant a second vote, a duplicate
     /// `InstallSnapshot` should be a no-op.
     duplicated_edges: Mutex<std::collections::BTreeSet<(u16, u16)>>,
+    /// While `Some`, every AppendEntries is delivered at once but its
+    /// answer is held, in send order, until released: the answers are in
+    /// flight back to the leader.
+    held_answers: Mutex<Option<Vec<futures_channel::oneshot::Sender<()>>>>,
+    /// AppendEntries sent and not yet answered.
+    appends_in_flight: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Debug, Clone)]
@@ -89,6 +95,45 @@ impl MockTransport {
             log: Mutex::new(Vec::new()),
             dropped_edges: Mutex::new(std::collections::BTreeSet::new()),
             duplicated_edges: Mutex::new(std::collections::BTreeSet::new()),
+            held_answers: Mutex::new(None),
+            appends_in_flight: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Hold every AppendEntries answer from now on.
+    fn hold_answers(&self) {
+        self.held_answers
+            .lock()
+            .unwrap()
+            .get_or_insert_with(Vec::new);
+    }
+
+    fn appends_in_flight(&self) -> usize {
+        self.appends_in_flight
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn held_answers(&self) -> usize {
+        self.held_answers
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(0, Vec::len)
+    }
+
+    /// Deliver the first `count` held answers, in send order.
+    fn release_answers(&self, count: usize) {
+        let mut held = self.held_answers.lock().unwrap();
+        let held = held.as_mut().expect("answers are held");
+        for release in held.drain(..count) {
+            let _ = release.send(());
+        }
+    }
+
+    /// Deliver every held answer and stop holding.
+    fn stop_holding_answers(&self) {
+        for release in self.held_answers.lock().unwrap().take().unwrap_or_default() {
+            let _ = release.send(());
         }
     }
 
@@ -155,6 +200,8 @@ impl Transport<u16> for MockTransport {
         if self.is_dropped(req.leader, peer) {
             return Err(MockError);
         }
+        self.appends_in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.log.lock().unwrap().push(RpcRecord::Append {
             from: req.leader,
             to: peer,
@@ -178,6 +225,16 @@ impl Transport<u16> for MockTransport {
         if let (Some(h), Some(dup_req)) = (handle, dup_req) {
             let _ = h.handle_inbound_append(from, dup_req).await;
         }
+        let held = self.held_answers.lock().unwrap().as_mut().map(|held| {
+            let (release, wait) = futures_channel::oneshot::channel();
+            held.push(release);
+            wait
+        });
+        if let Some(wait) = held {
+            let _ = wait.await;
+        }
+        self.appends_in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         result
     }
 
@@ -1355,6 +1412,98 @@ fn bounded_read_index_cancels_on_partition_and_shutdown_remains_joinable() {
         shutdown_started.elapsed() < Duration::from_secs(2),
         "expired barriers must not prevent worker shutdown"
     );
+}
+
+/// A read barrier is confirmed only by answers to heartbeats sent after it
+/// was queued. An answer already in flight when it arrived proves leadership
+/// only as of an earlier time, after which a new leader may have been elected
+/// and committed writes the read would miss.
+#[test]
+fn read_index_ignores_answers_to_heartbeats_sent_before_it() {
+    use vos_raft::ReadIndexError;
+
+    let routes: Routes = Arc::new(Mutex::new(BTreeMap::new()));
+    let transport = Arc::new(MockTransport::new(routes.clone()));
+    let members = vec![1u16, 2, 3];
+    let mut workers: BTreeMap<u16, Worker<u16>> = BTreeMap::new();
+    for me in members.iter().copied() {
+        // Node 1 campaigns at once and then sends heartbeats only when a read
+        // asks for them; the others never campaign within the test. Every
+        // heartbeat round is then one the test caused.
+        let mut config = cfg(me, members.clone());
+        config.heartbeat_interval_ms = 30_000;
+        config.election_timeout_ms = if me == 1 { (30, 30) } else { (60_000, 60_000) };
+        let worker = Worker::spawn_with(
+            MemStorage::<u16>::new(),
+            transport.clone(),
+            config,
+            (),
+            StdClock,
+            StdRng::from_entropy(),
+        );
+        routes.lock().unwrap().insert(me, worker.handler());
+        workers.insert(me, worker);
+    }
+    wait_until(
+        || workers[&1].role() == Role::Leader,
+        Duration::from_secs(3),
+        "node 1 leads",
+    );
+    let leader = workers[&1].handler();
+    let committed = block_on(leader.read_index_with_timeout(Duration::from_secs(2)))
+        .expect("a read resolves while answers flow");
+    // The read resolved on one answer; let the other land before holding.
+    wait_until(
+        || transport.appends_in_flight() == 0,
+        Duration::from_secs(2),
+        "the earlier round is answered",
+    );
+
+    // Read A's round goes out and both answers are held in flight.
+    transport.hold_answers();
+    let first = {
+        let leader = leader.clone();
+        std::thread::spawn(move || block_on(leader.read_index_with_timeout(Duration::from_secs(5))))
+    };
+    wait_until(
+        || transport.held_answers() == 2,
+        Duration::from_secs(2),
+        "read A's round is in flight",
+    );
+    // Read B is queued once its own round is in flight too.
+    let second = {
+        let leader = leader.clone();
+        std::thread::spawn(move || {
+            block_on(leader.read_index_with_timeout(Duration::from_millis(300)))
+        })
+    };
+    wait_until(
+        || transport.held_answers() == 4,
+        Duration::from_secs(2),
+        "read B's round is in flight",
+    );
+    // A's answers land after B was queued: they confirm A and not B.
+    transport.release_answers(2);
+    let first = first.join().expect("read A joined");
+    assert!(
+        matches!(first, Ok(index) if index >= committed),
+        "answers to read A's round confirm it, got {first:?}"
+    );
+    let second = second.join().expect("read B joined");
+    assert!(
+        matches!(second, Err(ReadIndexError::TimedOut)),
+        "answers to a round sent before read B must not confirm it, got {second:?}"
+    );
+
+    transport.stop_holding_answers();
+    let index = block_on(leader.read_index_with_timeout(Duration::from_secs(2)))
+        .expect("a read resolves once answers flow again");
+    assert!(index >= committed, "reads stay monotonic");
+
+    routes.lock().unwrap().clear();
+    for worker in workers.into_values() {
+        worker.shutdown();
+    }
 }
 
 /// `read_index` returns `Backpressure` when the leader's
