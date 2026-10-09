@@ -15,7 +15,9 @@ pub mod ids;
 pub mod jam;
 pub mod keys;
 pub mod result;
+pub mod schema;
 
+pub use scale;
 pub use scale::{Decode, DecodeError, Encode};
 
 /// Defaults the owner set for slice 2. Each is a constant, cheap to change.

@@ -1,0 +1,16 @@
+[package]
+name = "vos-sdk-macros"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The VOS actor SDK's macros: #[actor] and #[messages]."
+
+[lib]
+proc-macro = true
+
+[dependencies]
+blake2 = "0.10"
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }
+vos-wire = { workspace = true }

@@ -72,6 +72,53 @@ impl Encode for bool {
     }
 }
 
+/// Fixed-width little-endian integers beyond the unsigned ones above.
+macro_rules! fixed_width {
+    ($($ty:ty),*) => {$(
+        impl Encode for $ty {
+            fn encode_to(&self, buf: &mut Vec<u8>) {
+                buf.extend_from_slice(&self.to_le_bytes());
+            }
+        }
+
+        impl Decode for $ty {
+            fn decode(data: &[u8]) -> Result<(Self, usize), DecodeError> {
+                const WIDTH: usize = core::mem::size_of::<$ty>();
+                let bytes = data.get(..WIDTH).ok_or(DecodeError::UnexpectedEof)?;
+                Ok((<$ty>::from_le_bytes(bytes.try_into().unwrap()), WIDTH))
+            }
+        }
+    )*};
+}
+
+fixed_width!(i8, i16, i32, i64, u128, i128);
+
+/// The unit type encodes to nothing: a handler with no reply.
+impl Encode for () {
+    fn encode_to(&self, _: &mut Vec<u8>) {}
+}
+
+impl Decode for () {
+    fn decode(_: &[u8]) -> Result<(Self, usize), DecodeError> {
+        Ok(((), 0))
+    }
+}
+
+/// A string encodes as its UTF-8 bytes.
+impl Encode for alloc::string::String {
+    fn encode_to(&self, buf: &mut Vec<u8>) {
+        self.as_bytes().encode_to(buf);
+    }
+}
+
+impl Decode for alloc::string::String {
+    fn decode(data: &[u8]) -> Result<(Self, usize), DecodeError> {
+        let (bytes, used) = Vec::<u8>::decode(data)?;
+        let string = alloc::string::String::from_utf8(bytes).map_err(|_| DecodeError::NotUtf8)?;
+        Ok((string, used))
+    }
+}
+
 // ============================================================================
 // Primitive Decode impls — fixed-width LE
 // ============================================================================
@@ -279,6 +326,23 @@ impl<A: Decode, B: Decode> Decode for (A, B) {
         let (a, c1) = A::decode(data)?;
         let (b, c2) = B::decode(&data[c1..])?;
         Ok(((a, b), c1 + c2))
+    }
+}
+
+impl<A: Encode, B: Encode, C: Encode> Encode for (A, B, C) {
+    fn encode_to(&self, buf: &mut Vec<u8>) {
+        self.0.encode_to(buf);
+        self.1.encode_to(buf);
+        self.2.encode_to(buf);
+    }
+}
+
+impl<A: Decode, B: Decode, C: Decode> Decode for (A, B, C) {
+    fn decode(data: &[u8]) -> Result<(Self, usize), DecodeError> {
+        let (a, c1) = A::decode(data)?;
+        let (b, c2) = B::decode(&data[c1..])?;
+        let (c, c3) = C::decode(&data[c1 + c2..])?;
+        Ok(((a, b, c), c1 + c2 + c3))
     }
 }
 

@@ -1,0 +1,5 @@
+error: a #[msg] handler takes `&self` (a query) or `&mut self` (a command)
+  --> tests/compile_fail/handler_without_receiver.rs:15:9
+   |
+15 |     pub async fn free(by: u64) -> u64 {
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

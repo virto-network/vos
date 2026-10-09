@@ -185,28 +185,31 @@ mutating operation:
 
 ```rust
 impl Query<A> {        // &self handlers
-    fn caller(&self) -> &Principal;
+    fn caller(&self) -> Option<Principal>;
     fn me(&self) -> (AgentId, InstanceId);
-    fn now(&self) -> Timestamp;
+    fn now(&self) -> u64;
     fn random(&self) -> [u8; 32];
     fn log(&self, level: Level, message: &str);
-    async fn call<R: ActorRef>(&self, to: R, msg: R::Query) -> Result<R::Reply, CallError>;
+    async fn call<M: QueryMethod>(&self, to: Ref<M::Actor>, msg: M) -> Result<M::Reply, CallError<M::Error>>;
 }
 
 impl Command<A> {      // &mut self handlers; everything a query has, plus:
-    async fn call<R: ActorRef>(&mut self, to: R, msg: R::Message) -> Result<R::Reply, CallError>;
-    fn send<R: ActorRef>(&mut self, agent: AgentId, to: R, msg: R::Message);
-    fn attest<P: Attestable>(&mut self, args: P::Args) -> Result<P::Output, CallError>;
+    async fn call<M: Method>(&mut self, to: Ref<M::Actor>, msg: M) -> Result<M::Reply, CallError<M::Error>>;
+    fn send<M: Method>(&mut self, agent: AgentId, to: Ref<M::Actor>, msg: M);
+    async fn attest<M: AttestableMethod<Actor = A>>(&mut self, args: M) -> Result<M::Output, CallError<Never>>;
 }
 
-enum CallError { GasExhausted, Cycle, UnknownInstance, KindMismatch, Full, Failed(Error) }
+enum CallError<E> { Failed(E), Forbidden, Undecodable }
 ```
 
 - `call` reaches an instance of the same agent, nested and synchronous
   (section 8.1). `send` queues a message for any agent, delivered after
-  the step commits.
-- Typed references (`LedgerRef`) are generated from the schema, as on
-  master.
+  the step commits. A callee's own error and a role refusal return to the
+  caller; any other callee failure fails the whole step, so the caller
+  never sees it.
+- `#[messages]` generates a module named after the actor holding a type
+  per handler, its arguments as fields: `ledger::Transfer { from, to,
+  amount }`, sent to a `Ref<Ledger>`.
 - Tables are fields, used directly: `self.accounts.get(&id)`,
   `self.accounts.insert(id, account)`. The agent serves them through
   `get`, `put` and `scan`.
@@ -428,7 +431,12 @@ this slice. Signatures, licensing and upgrades come later.
    the guest target; elsewhere a native host function, `vos_sdk::host::Host`,
    installed with `set_host`), contexts, `Table`, and the guest runtime
    (allocator, panic as trap). `vos-sdk-macros`: `#[actor]`, `#[messages]`,
-   `#[msg]`, `#[attestable]`.
+   `#[msg]`, `#[attestable]`. An actor is a library, which other actors
+   use for its message types, and a program crate of one line,
+   `actor_program!(ledger::ledger)`, which places the schema and defines
+   the entry point; an attestable method's program is likewise
+   `attestable_program!(ledger::Ledger::__vos_attest_checksum)`. The
+   library carries no entry, so a program links only its own.
 7. **A native test host** (`agent/testkit`, `std`) runs actor programs in
    `vos_pvm` and serves the actor ABI against an in-memory state with the
    step and per-call overlays. 2.3's tests run the test actors on it, and

@@ -1,0 +1,13 @@
+[package]
+name = "vos-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The VOS actor SDK: contexts, tables and the actor side of the ABI."
+
+[dependencies]
+vos-sdk-macros = { workspace = true }
+vos-wire = { workspace = true }
+
+[dev-dependencies]
+trybuild = "1"

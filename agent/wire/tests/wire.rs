@@ -391,3 +391,50 @@ fn captured_inputs_decode_and_reencode() {
     };
     assert_eq!(starved.result, Err(WorkError::OutOfGas));
 }
+
+#[test]
+fn schemas_read_back_from_their_section_and_validate() {
+    use vos_wire::schema::{MAGIC, MethodSchema, Schema, SchemaError};
+    let method = |id: u32, kind| MethodSchema {
+        id: MethodId(id),
+        name: b"transfer".to_vec(),
+        kind,
+        role: Some(b"minter".to_vec()),
+        gas: Some(1_000_000),
+    };
+    let schema = Schema {
+        methods: vec![method(7, Kind::Command), method(9, Kind::Query)],
+    };
+    let mut ro_data = schema.section();
+    ro_data.extend_from_slice(b"the rest of the read-only data");
+    assert_eq!(Schema::read(&ro_data), Ok(schema.clone()));
+    assert_eq!(&ro_data[..4], &MAGIC);
+
+    assert_eq!(Schema::read(b"no schema here"), Err(SchemaError::Missing));
+    let section = schema.section();
+    assert_eq!(
+        Schema::read(&section[..section.len() - 1]),
+        Err(SchemaError::Size)
+    );
+    let duplicate = Schema {
+        methods: vec![method(7, Kind::Command), method(7, Kind::Query)],
+    };
+    assert_eq!(
+        Schema::read(&duplicate.section()),
+        Err(SchemaError::Duplicate(MethodId(7)))
+    );
+    let reserved = Schema {
+        methods: vec![method(0, Kind::Command)],
+    };
+    assert_eq!(
+        Schema::read(&reserved.section()),
+        Err(SchemaError::ReservedId)
+    );
+}
+
+#[test]
+fn kinds_encode_as_the_index_the_agent_passes() {
+    assert_eq!(Kind::Command.encode(), [0]);
+    assert_eq!(Kind::Query.encode(), [1]);
+    assert_eq!(Kind::Attestable.encode(), [2]);
+}

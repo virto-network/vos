@@ -2,6 +2,9 @@
 resolver = "3"
 members = [
     "agent/wire",
+    "agent/sdk",
+    "agent/sdk-macros",
+    "agent/testkit",
     "node/host",
     "support/vos-raft",
     "support/merkle-crdt",
@@ -20,6 +23,7 @@ exclude = [
     # Built with `cargo fuzz` (nightly flags, panic = abort).
     "pvm/proof/fuzz",
     "pvm/bench/guests",
+    "agent/test-actors",
     # The on-chain settlement verifier pins stwo without default features in
     # its own workspace, so prover features never co-resolve into it.
     "pvm/proof/settlement-verifier",
@@ -81,6 +85,8 @@ vos-pvm-program = { path = "pvm/program" }
 vos-pvm-codec = { path = "pvm/codec", default-features = false }
 vos-pvm-codec-derive = { path = "pvm/codec-derive" }
 vos-wire = { path = "agent/wire" }
+vos-sdk = { path = "agent/sdk" }
+vos-sdk-macros = { path = "agent/sdk-macros" }
 
 # Stwo pinned to upstream rev `e1286720`. Declared without features:
 # workspace features are additive, and the verifier-only build must stay

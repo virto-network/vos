@@ -1,0 +1,5 @@
+error: #[messages] needs `fn new() -> Self`, the state of a new instance
+ --> tests/compile_fail/missing_new.rs:9:6
+  |
+9 | impl Counter {
+  |      ^^^^^^^

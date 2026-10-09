@@ -241,3 +241,32 @@ fn test_generic_struct() {
     let (decoded, _) = GenericStruct::<u64>::decode(&encoded).unwrap();
     assert_eq!(decoded, val);
 }
+
+#[test]
+fn signed_wide_unit_string_and_triples_round_trip() {
+    fn round_trip<T: Encode + Decode + PartialEq + core::fmt::Debug>(value: T, width: usize) {
+        let bytes = value.encode();
+        assert_eq!(bytes.len(), width, "{value:?}");
+        let (decoded, used) = T::decode(&bytes).unwrap();
+        assert_eq!(decoded, value);
+        assert_eq!(used, width);
+    }
+    round_trip(-5i8, 1);
+    round_trip(-300i16, 2);
+    round_trip(i32::MIN, 4);
+    round_trip(-1i64, 8);
+    round_trip(u128::MAX, 16);
+    round_trip(i128::MIN, 16);
+    round_trip((), 0);
+    round_trip(String::from("héllo"), 4 + "héllo".len());
+    round_trip((1u8, -2i32, String::from("x")), 1 + 4 + 5);
+    assert_eq!(
+        i32::decode(&[1, 2, 3]).unwrap_err().to_string(),
+        "unexpected end of input"
+    );
+    let not_utf8 = [2u8, 0, 0, 0, 0xff, 0xfe];
+    assert!(matches!(
+        String::decode(&not_utf8),
+        Err(scale::DecodeError::NotUtf8)
+    ));
+}

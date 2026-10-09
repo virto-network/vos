@@ -19,18 +19,31 @@
 //!   every byte copied either way, charged from the actor's frame before
 //!   it is served.
 //! - An id the agent does not serve, including every Gray Paper id and node
-//!   extension, answers [`code::WHAT`] and execution continues. A served
-//!   operation outside the invocation's [`Kind`] fails the invocation.
+//!   extension, costs [`price::OPERATION`], answers [`code::WHAT`] and
+//!   execution continues. Precompiles are served as on every machine. A
+//!   served operation outside the invocation's [`Kind`] fails the
+//!   invocation.
 //! - Exceeding a [`cap`] fails the invocation.
+//! - A nested callee that fails or is refused leaves no effects: its
+//!   writes, sends and attests, and its share of the step's write cap, are
+//!   discarded. `RANDOM` draws keep counting.
+//! - Roles match exactly: a handler that names a role admits the
+//!   principals holding that role byte, and a principal holds one role.
+
+use alloc::vec::Vec;
 
 /// The kind of an invocation, which decides the operations it may use.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Its index is the kind the agent passes in φ8.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, scale::Encode, scale::Decode)]
 pub enum Kind {
     /// A `&mut self` handler, through the log.
+    #[codec(index = 0)]
     Command,
     /// A `&self` handler, on applied state, outside the log.
+    #[codec(index = 1)]
     Query,
     /// An `#[attestable]` method: no operations at all.
+    #[codec(index = 2)]
     Attestable,
 }
 
@@ -53,8 +66,9 @@ pub mod op {
     pub const CALLER: u64 = 0x504;
     /// → φ7 the batch time, milliseconds since the Unix epoch.
     pub const NOW: u64 = 0x505;
-    /// φ7 output: 32 bytes, derived from the batch seed, the step and how
-    /// many the step drew before.
+    /// φ7 output: 32 bytes, BLAKE2b-256 of `vos/random`, the batch seed,
+    /// the step's index in the batch (four bytes, little-endian) and how
+    /// many the step drew before (eight bytes, little-endian).
     pub const RANDOM: u64 = 0x506;
     /// φ7/φ8 key, φ9 output, φ10 offset, φ11 capacity → φ7 the value's
     /// length, or [`super::code::NONE`].
@@ -151,7 +165,9 @@ pub mod cap {
     pub const KEY: usize = 1 << 10;
     pub const VALUE: usize = 64 << 10;
     pub const STEP_WRITES: usize = 256 << 10;
-    pub const SCAN: usize = 64 << 10;
+    /// One scan's output: room for a row at the key and value caps with
+    /// both length prefixes.
+    pub const SCAN: usize = KEY + VALUE + 16;
     pub const MESSAGES: usize = 16;
     pub const MESSAGE: usize = 64 << 10;
     pub const WORK_RESULT: usize = 4 << 20;

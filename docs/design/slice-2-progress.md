@@ -169,3 +169,69 @@ work needs anyway for zero-knowledge masking, unblocks the toolchain.
   replicated apply path measures.
 - A 2 GiB cache gave nothing (the data is 679 MiB); an in-block hash index
   and pinned filter and index blocks gave nothing measurable.
+
+## Step 2.3: the actor SDK
+
+**Done:**
+
+- **`vos-sdk`** (`agent/sdk`, `no_std`):
+  - the ABI client, one function per operation, following `vos_wire::abi`'s
+    register conventions: `ecalli` on the guest target, a native host
+    function elsewhere;
+  - contexts: `Query` reads, `Command` adds writes, `send` and `attest`;
+    nested `call` is `async` and ready when polled, since the agent runs
+    the callee while the caller waits at its `ecalli`; a query may call
+    only queries, which the types enforce;
+  - `Table<K, V>` with an order-preserving `TableKey` encoding and scans
+    that fetch rows a buffer at a time;
+  - state load and save (the struct at `0x00`, written back only if its
+    encoding changed);
+  - the guest runtime: a bump allocator, panic as a trap, and the
+    `actor_program!` and `attestable_program!` entry points.
+- **`vos-sdk-macros`:** `#[actor]` gives each table field a tag from its
+  name or `#[table(name = "…")]`; `#[messages]` generates a module per
+  actor with a message type per handler, the dispatcher, and the schema
+  bytes. Ids derive from names with BLAKE2b; 0 and collisions are compile
+  errors.
+- **Schema** (`vos_wire::schema`): `"VOSS" ∥ E4(len) ∥ SCALE(schema)`,
+  first in the program's read-only data (the guest linker script keeps
+  `.vos_schema` first), read and validated at install.
+- **`vos-testkit`** (`agent/testkit`): the reference host. It runs actor
+  programs on the interpreter and serves the ABI against in-memory state
+  with a step overlay and one overlay per nested call, kind enforcement,
+  prices, caps, roles with the calling instance as principal, cycle and
+  depth limits, and attestable programs run with no host calls. It
+  records instances in the order they first ran, each with the gas its
+  own code used.
+- **Test actors** (`agent/test-actors`, built with the guest toolchain by
+  `just build-test-actors`): a counter, a ledger (a table, a role-gated
+  mint, a failing transfer, scans, an attestable checksum), an actor that
+  calls the ledger, and the checksum's program. Nine testkit tests run
+  them: state, failure without effects, batch time and randomness, roles,
+  tables and scans, attestation, install checks, nested calls with their
+  principal, and a cycle.
+- **Compile-fail tests** (`trybuild`): a query calling a command, a query
+  handler with a command context, an attestable method with `self`, a
+  handler without a receiver, and a missing `new()`.
+- The codec gained signed integers, `u128`/`i128`, `()`, `String` and
+  triples; its `thiserror` no longer pulls in `std` on the guest.
+
+**Review fixes** (the testkit is 2.4's oracle):
+
+- A nested callee that fails or is refused leaves no effects: its writes,
+  sends, attests and share of the write cap are discarded; random draws
+  keep counting. `vos_wire::abi` states it, with the price of an unserved
+  id (an operation's, then `WHAT`) and exact role matching.
+- The testkit serves precompiles as the node's machines do, and runs an
+  attestable program on a bare machine that serves precompiles and
+  refuses every other host call.
+- `cap::SCAN` holds a row at the key and value caps, and the SDK's rows
+  grow their reused buffer only up to it; a nested call's reply lands in
+  one static buffer on the guest, so calls do not exhaust the 2 MiB heap,
+  which allocates without freeing within an invocation.
+- An undecodable table row or caller traps rather than vanishing.
+- `#[messages(module = "…")]` names the generated module; the default
+  keeps acronyms together (`HTTPServer` → `http_server`).
+
+The heap size is fixed at 2 MiB for now; making it a program's choice
+waits for an actor that needs more.

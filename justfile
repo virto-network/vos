@@ -56,8 +56,16 @@ clippy:
 jar-check:
     let hits = (rg -n --glob '!**/target/**' 'IsaMode|CapabilityManifest|\blink_elf\b|link_elf_with_argument_pages|run_with_vos_stubs|ECALL_VOS_|VOS_OBJECT_CAP|Opcode::Ecall\b|ExitReason::Ecall|ExitReason::Trap\b|kernel::|vm_pool|JAR\\x02|\.gp072\.json|\bGasModel\b|\bPerInstruction\b|\bmem_cycles\b|Opcode::Sbrk|\bsbrk\(|\b0x800\b' pvm | complete); if ($hits.exit_code == 0) { print $hits.stdout; error make { msg: "JAR remnants found" } } else { print "no JAR remnants" }
 
+# The SDK's test actors, built with the guest toolchain in `pvm/guest`.
+build-test-actors:
+    cd agent/test-actors; cargo build --release --target ../../pvm/guest/riscv64em-vos.json
+
+# The SDK, its macros' restrictions, and the test actors on the testkit.
+test-agent: build-test-actors
+    cargo test -p vos-sdk -p vos-sdk-macros -p vos-testkit
+
 # Checks before pushing: everything except proving.
-ci: fmt-check clippy jar-check test vectors test-bench
+ci: fmt-check clippy jar-check test vectors test-bench test-agent
 
 # The gate before merging: `ci` plus the prover suites, the soundness gates
 # and the bench tests that prove. Run it under a memory limit.

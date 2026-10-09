@@ -7,10 +7,10 @@ description = "SCALE codec without compact encoding. Fixed-width LE integers, u3
 
 [features]
 default = ["std"]
-std = []
+std = ["thiserror/std"]
 
 [dependencies]
-thiserror = "2"
+thiserror = { version = "2", default-features = false }
 scale-derive = { package = "vos-pvm-codec-derive", path = "../codec-derive" }
 
 [dev-dependencies]

@@ -12,4 +12,7 @@ pub enum DecodeError {
 
     #[error("set elements not in strictly ascending order")]
     NotSorted,
+
+    #[error("string is not UTF-8")]
+    NotUtf8,
 }
