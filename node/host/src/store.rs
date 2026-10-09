@@ -18,7 +18,7 @@ use std::ops::Bound;
 use std::path::Path;
 
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode, Readable};
-use vos_wire::ids::{AgentId, ProgramHash};
+use vos_wire::ids::{AgentId, ProgramHash, SessionId};
 use vos_wire::result::Write;
 
 pub use fjall::Error;
@@ -62,6 +62,18 @@ pub trait Store: Send + Sync {
 
     /// The agents this node runs, each with its agent program.
     fn agents(&self) -> Result<Vec<(AgentId, ProgramHash)>>;
+
+    /// The node's identity, once made.
+    fn node_id(&self) -> Result<Option<[u8; 32]>>;
+
+    /// The sessions the node knows, each with its client's key.
+    fn sessions(&self) -> Result<Vec<(SessionId, [u8; 32])>>;
+
+    /// The id the next session gets: ids are never reused.
+    fn next_session(&self) -> Result<u64>;
+
+    /// When `key` last opened a session, by its own clock.
+    fn key_opened(&self, key: &[u8; 32]) -> Result<Option<u64>>;
 }
 
 /// A read-only view of applied state. Keys are relative to the agent.
@@ -100,6 +112,14 @@ pub trait Batch {
     /// Record that this node runs `agent` with the agent program `program`.
     fn agent(&mut self, agent: AgentId, program: &ProgramHash);
 
+    fn node_id(&mut self, id: &[u8; 32]);
+
+    /// Record session `id` for `key`, opened at `time`, and that the next
+    /// session gets `id + 1`.
+    fn session(&mut self, id: SessionId, key: &[u8; 32], time: u64);
+
+    fn forget_session(&mut self, id: SessionId);
+
     fn commit(self, durability: Durability) -> Result<()>;
 }
 
@@ -110,6 +130,10 @@ const SYSTEM: u8 = 0x00;
 const NODE: u8 = 0xff;
 const APPLIED: u8 = 0x00;
 const AGENT: u8 = 0x01;
+const NODE_ID: u8 = 0x02;
+const SESSION: u8 = 0x03;
+const NEXT_SESSION: u8 = 0x04;
+const KEY_OPENED: u8 = 0x05;
 /// The id no agent gets: node-wide records live under its node keys.
 pub const NODE_AGENT: AgentId = AgentId(u32::MAX);
 
@@ -123,6 +147,15 @@ fn applied_key(agent: AgentId) -> Vec<u8> {
 
 fn registry_prefix() -> Vec<u8> {
     agent_key(NODE_AGENT, &[NODE, AGENT])
+}
+
+/// A node-wide record: under the node's reserved agent id.
+fn node_record(kind: u8, rest: &[u8]) -> Vec<u8> {
+    agent_key(NODE_AGENT, &[&[NODE, kind][..], rest].concat())
+}
+
+fn be_u64(bytes: &[u8]) -> Option<u64> {
+    Some(u64::from_be_bytes(bytes.try_into().ok()?))
 }
 
 fn log_key(agent: AgentId, index: u64) -> Vec<u8> {
@@ -274,6 +307,45 @@ impl Store for Fjall {
             .collect()
     }
 
+    fn node_id(&self) -> Result<Option<[u8; 32]>> {
+        Ok(self
+            .system
+            .get(node_record(NODE_ID, &[]))?
+            .and_then(|id| id[..].try_into().ok()))
+    }
+
+    fn sessions(&self) -> Result<Vec<(SessionId, [u8; 32])>> {
+        let prefix = node_record(SESSION, &[]);
+        self.system
+            .prefix(&prefix)
+            .filter_map(|row| {
+                let (key, value) = match row.into_inner() {
+                    Ok(row) => row,
+                    Err(error) => return Some(Err(error)),
+                };
+                // A record this node did not write is skipped, not trusted.
+                let id = be_u64(&key[prefix.len()..])?;
+                let client = value.get(..32)?.try_into().ok()?;
+                Some(Ok((SessionId(id), client)))
+            })
+            .collect()
+    }
+
+    fn next_session(&self) -> Result<u64> {
+        Ok(self
+            .system
+            .get(node_record(NEXT_SESSION, &[]))?
+            .and_then(|next| be_u64(&next))
+            .unwrap_or(1))
+    }
+
+    fn key_opened(&self, key: &[u8; 32]) -> Result<Option<u64>> {
+        Ok(self
+            .system
+            .get(node_record(KEY_OPENED, key))?
+            .and_then(|time| be_u64(&time)))
+    }
+
     fn agents(&self) -> Result<Vec<(AgentId, ProgramHash)>> {
         let prefix = registry_prefix();
         self.system
@@ -373,6 +445,32 @@ impl Batch for FjallBatch {
     fn agent(&mut self, agent: AgentId, program: &ProgramHash) {
         let key = [registry_prefix(), agent.0.to_be_bytes().to_vec()].concat();
         self.batch.insert(&self.store.system, key, program.0);
+    }
+
+    fn node_id(&mut self, id: &[u8; 32]) {
+        self.batch
+            .insert(&self.store.system, node_record(NODE_ID, &[]), id);
+    }
+
+    fn session(&mut self, id: SessionId, key: &[u8; 32], time: u64) {
+        let system = &self.store.system;
+        let value = [&key[..], &time.to_be_bytes()].concat();
+        self.batch
+            .insert(system, node_record(SESSION, &id.0.to_be_bytes()), value);
+        self.batch.insert(
+            system,
+            node_record(NEXT_SESSION, &[]),
+            (id.0 + 1).to_be_bytes(),
+        );
+        self.batch
+            .insert(system, node_record(KEY_OPENED, key), time.to_be_bytes());
+    }
+
+    fn forget_session(&mut self, id: SessionId) {
+        self.batch.remove(
+            &self.store.system,
+            node_record(SESSION, &id.0.to_be_bytes()),
+        );
     }
 
     fn commit(self, durability: Durability) -> Result<()> {

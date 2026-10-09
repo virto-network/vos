@@ -9,9 +9,13 @@ description = "The VOS node host: storage, the leader loops and ingress."
 # Exact: the workspace nightly is a 1.90 pre-release, which a later fjall
 # release may outgrow.
 fjall = "=3.1.12"
+ed25519-dalek = "2"
 getrandom = "0.2"
+httparse = "1"
 smol = "2"
+subtle = { workspace = true }
 tracing = "0.1"
+ureq = "3"
 vos-pvm = { workspace = true }
 vos-wire = { workspace = true }
 

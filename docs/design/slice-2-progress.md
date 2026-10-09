@@ -466,3 +466,66 @@ The suite passed 10 sequential runs and 16 runs at 8-way concurrency.
   operator's `Admin::ResetPair`;
 - messages are not capped at their target: each sender's outbox bounds
   what it sends, not what a target receives (slice 3's per-pair window).
+
+## Step 2.6: sessions, ingress and the CLI
+
+**Done:**
+
+- **Clients are ed25519 keys** (`Principal::Client(key)`). Every signed
+  message (`vos_wire::ingress`) starts with a domain tag and the node's id,
+  made at its first open: a session open signs its key and time, which
+  must be near the node's clock and later than the key's last open; a
+  call signs agent, session, sequence, instance, method and arguments; a
+  query signs a `not_after` instead of a sequence.
+- **Sessions** are the node's: ids count up and are never reused, a key
+  holds 16 at most, and each open commits before it answers.
+- **Ingress** (`node/host/src/ingress.rs`) sequences each (session, agent)
+  against the agent's applied mark and what it queued: a duplicate is
+  answered from the reply window (`too old` below it), one in flight
+  waits for its original's answer, the next is queued, a gap and a
+  request more than W past the mark are refused. A request not consumed
+  leaves the mark, so the client resends it. Answers are one SCALE
+  `Answer`, ingress's own refusals apart from the agent's codes.
+- **Operator commands** (create an agent, install, roles) need the admin
+  token the node writes to its data directory (mode 0600), compared in
+  constant time. Any client may read an installed schema, to call methods
+  by name.
+- **HTTP** (`http.rs`): HTTP/1.1 on the node's async thread, with a 16 KiB
+  head, a body cap by route checked before reading (`413`, said before
+  closing), no chunked bodies (`411`), `100 Continue` when asked, 30 s
+  idle per read and 60 s per request, 1,024 connections, and `127.0.0.1`
+  by default. An install is decoded and its programs prepared on
+  executors, off the thread every leader shares.
+- **A client** (`vos_node::client`): a key's session, signed calls and
+  queries, the operator's commands; the tests and the CLI share it.
+- **`vos`** (`node/cli`): `node`, `key new`, `agent create`, `install`,
+  `role`, `call` and `query`; arguments are SCALE in hex. Calls keep one
+  session next to the key file and open another when it is gone.
+- A store fault answers `Unavailable` (try again), apart from `NotConsumed`
+  (the agent program failed on the request; resend it).
+- The node takes a clock (`Config::clock`) for work-result time and
+  ingress's checks, so tests move time.
+
+**Tests:**
+
+- `node/host/tests/ingress.rs`, over HTTP: a duplicate answered from the
+  window and applied once, a gap, a request past the window, the oldest
+  reply kept and one past it too old, and another session's own
+  sequence; a tampered call, an unknown session, a call signed for
+  another agent, a malformed body, a replayed open, an open off the
+  clock, and stale queries; an expired session refused and a new one
+  going on; pipelined requests on one connection whose replies are never
+  read, then recovered from the window; a duplicate in flight waiting for
+  its original; a request the agent program fails alone, answered not
+  consumed, the requests behind it refused, and it resent while they are
+  still in flight; a body past its cap and a chunked one refused with a
+  reason; operator commands without the token.
+- `node/cli/tests/cli.rs`: a node, an operator and a client as separate
+  `vos` processes: create, install, call twice and query, in one kept
+  session.
+
+**Open** (from the review): session state is never collected (agents
+keep marks and reply windows of expired sessions, and a session with no
+mark at an agent never expires there); the signature is not in the log;
+section 8.4's window wording; signature checks move to executors if they
+show.

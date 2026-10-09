@@ -1,13 +1,17 @@
 //! The VOS node host: its storage and, on one process, every agent it
 //! runs (`Node`).
 
+pub mod client;
 mod executor;
+pub mod http;
+mod ingress;
 mod node;
 mod pvm;
 mod storage;
 pub mod store;
 
-pub use node::{CallError, Config, Error, Node, Reply};
+pub use ingress::SESSIONS_PER_KEY;
+pub use node::{ADMIN_TOKEN, CallError, Config, Error, Node, Reply, wall_clock};
 
 use vos_wire::batch::Batch;
 use vos_wire::ids::AgentId;

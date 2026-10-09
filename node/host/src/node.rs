@@ -7,8 +7,9 @@
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::future::Future;
+use std::net::SocketAddr;
 use std::panic::AssertUnwindSafe;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -20,6 +21,7 @@ use vos_pvm::refine::PreparedProgram;
 use vos_wire::abi::refusal;
 use vos_wire::batch::{Admin, Batch, Input, Message, Query, Request, Work};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash};
+use vos_wire::ingress::NodeId;
 use vos_wire::records::unstored;
 use vos_wire::result::{Outcome, Outgoing, Step, WorkResult};
 use vos_wire::{Decode, defaults, keys};
@@ -28,7 +30,9 @@ use crate::Hooks;
 use crate::executor::Executors;
 use crate::pvm::{self, Fault};
 use crate::storage::{Change, StorageThread};
-use crate::store::{Fjall, FjallSnapshot, LogEntry, NODE_AGENT, Store, View};
+use crate::store::{
+    Batch as _, Durability, Fjall, FjallSnapshot, LogEntry, NODE_AGENT, Store, View,
+};
 
 /// How a node runs.
 pub struct Config {
@@ -47,6 +51,9 @@ pub struct Config {
     pub refine_gas: u64,
     pub accumulate_gas: u64,
     pub hooks: Arc<dyn Hooks>,
+    /// Milliseconds since the Unix epoch: work-result time, and ingress's
+    /// freshness checks. A test moves it.
+    pub clock: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 
 impl Config {
@@ -62,6 +69,7 @@ impl Config {
             refine_gas: defaults::REFINE_GAS,
             accumulate_gas: defaults::REFINE_GAS,
             hooks: Arc::new(crate::NoHooks),
+            clock: Arc::new(wall_clock),
         }
     }
 }
@@ -100,6 +108,8 @@ pub enum Error {
     Gas,
     /// A stored value the node cannot read.
     Unreadable(String),
+    /// The data directory, or the ingress's listener, failed.
+    Data(String),
     /// An agent's applied index and its state version disagree.
     Inconsistent {
         agent: AgentId,
@@ -189,8 +199,8 @@ impl Agent {
     }
 }
 
-struct Inner {
-    store: Fjall,
+pub(crate) struct Inner {
+    pub(crate) store: Fjall,
     storage: StorageThread,
     executors: Executors,
     pool: Arc<MachinePool>,
@@ -203,8 +213,12 @@ struct Inner {
     refine_gas: u64,
     accumulate_gas: u64,
     hooks: Arc<dyn Hooks>,
+    pub(crate) clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+    pub(crate) node_id: NodeId,
     agents: Mutex<HashMap<AgentId, Arc<Agent>>>,
-    runtime: Arc<smol::Executor<'static>>,
+    leaders: Mutex<Vec<smol::Task<()>>>,
+    next_agent: smol::lock::Mutex<u32>,
+    pub(crate) runtime: Arc<smol::Executor<'static>>,
 }
 
 impl Inner {
@@ -309,7 +323,8 @@ fn ran<T>(answer: Result<Result<T, Fault>, crate::executor::Panicked>) -> Result
 const BACKOFF: Duration = Duration::from_millis(50);
 const MAX_BACKOFF: Duration = Duration::from_secs(5);
 
-fn now() -> u64 {
+/// Milliseconds since the Unix epoch, by the system clock.
+pub fn wall_clock() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| since.as_millis() as u64)
@@ -487,7 +502,7 @@ impl Leader {
         }
         let batch = Batch {
             version: self.version,
-            time: now().max(self.time),
+            time: (inner.clock)().max(self.time),
             seed: seed(),
             inputs: pending.iter().map(Pending::input).collect(),
         };
@@ -806,25 +821,192 @@ fn raise(acks: &mut HashMap<AgentId, u64>, from: AgentId, sequence: u64) {
     *ack = (*ack).max(sequence);
 }
 
+impl Inner {
+    /// Create an agent running the node's agent program, once its registry
+    /// entry is durable.
+    pub(crate) async fn create_agent(self: &Arc<Self>) -> Result<AgentId, CallError> {
+        let mut next = self.next_agent.lock().await;
+        let agent = AgentId(*next);
+        assert_ne!(agent, NODE_AGENT, "agent ids are exhausted");
+        let change = Change::Agent {
+            agent,
+            program: self.program_hash,
+        };
+        self.storage
+            .commit(vec![change])
+            .await
+            .map_err(CallError::Failed)?;
+        *next += 1;
+        let leader = self.start(agent);
+        self.leaders.lock().expect("the leaders").push(leader);
+        Ok(agent)
+    }
+
+    /// Store and pool a package's programs, then queue its install. Pooling
+    /// prepares each program, so it runs on an executor.
+    pub(crate) async fn install(
+        &self,
+        agent: AgentId,
+        instance: InstanceId,
+        program: Vec<u8>,
+        attestables: Vec<(MethodId, Vec<u8>)>,
+        roles: Vec<(Vec<u8>, u8)>,
+    ) -> Result<Reply, CallError> {
+        if self.agent(agent).is_none() {
+            return Err(CallError::NoAgent);
+        }
+        let pool = Arc::clone(&self.pool);
+        let pooled = self
+            .executors
+            .run(move || {
+                let mut changes = Vec::new();
+                let mut pooled = |blob: Vec<u8>| -> Result<ProgramHash, CallError> {
+                    let hash = pool
+                        .install(&blob)
+                        .map_err(|error| CallError::Failed(format!("{error:?}")))?;
+                    let hash = ProgramHash(hash.0);
+                    changes.push(Change::Program { hash, blob });
+                    Ok(hash)
+                };
+                let program = pooled(program)?;
+                let attestables = attestables
+                    .into_iter()
+                    .map(|(method, blob)| Ok((method, pooled(blob)?)))
+                    .collect::<Result<Vec<_>, CallError>>()?;
+                Ok((program, attestables, changes))
+            })
+            .await
+            .map_err(|panicked| CallError::Failed(panicked.0))?;
+        let (program, attestables, changes) = pooled?;
+        self.storage
+            .commit(changes)
+            .await
+            .map_err(CallError::Failed)?;
+        let admin = Admin::Install {
+            instance,
+            program,
+            attestables,
+            roles,
+        };
+        self.admin(agent, admin).await
+    }
+
+    /// Run `work` on an executor, off the thread every leader shares.
+    pub(crate) async fn offload<T: Send + 'static>(
+        &self,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> Option<T> {
+        self.executors.run(work).await.ok()
+    }
+
+    pub(crate) async fn admin(&self, agent: AgentId, admin: Admin) -> Result<Reply, CallError> {
+        let (answer, reply) = smol::channel::bounded(1);
+        self.push(agent, Pending::Admin(admin, answer))?;
+        reply.recv().await.map_err(|_| CallError::Stopped)
+    }
+
+    pub(crate) fn call(
+        &self,
+        agent: AgentId,
+        request: Request,
+    ) -> impl Future<Output = Result<Reply, CallError>> + use<> {
+        let (answer, reply) = smol::channel::bounded(1);
+        let queued = self.push(agent, Pending::Request(request, answer));
+        async move {
+            queued?;
+            reply.recv().await.map_err(|_| CallError::Stopped)
+        }
+    }
+
+    pub(crate) async fn query(
+        self: &Arc<Self>,
+        agent: AgentId,
+        caller: Principal,
+        instance: InstanceId,
+        method: MethodId,
+        arguments: Vec<u8>,
+    ) -> Result<Outcome, CallError> {
+        if self.agent(agent).is_none() {
+            return Err(CallError::NoAgent);
+        }
+        let snapshot = Arc::new(self.store.snapshot());
+        let applied = snapshot
+            .applied(agent)
+            .map_err(|error| CallError::Failed(error.to_string()))?
+            .unwrap_or(0);
+        let (time, seed) = match self
+            .store
+            .log_entry(agent, applied)
+            .map_err(|error| CallError::Failed(error.to_string()))?
+        {
+            Some(entry) => pvm::decode::<WorkResult>(&entry.entry)
+                .map(|result| (result.time, result.seed))
+                .unwrap_or((0, [0; 32])),
+            None => (0, [0; 32]),
+        };
+        let work = Work::Query(Query {
+            time,
+            seed,
+            caller,
+            instance,
+            method,
+            arguments,
+        });
+        let program = Arc::clone(&self.program);
+        let pool = Arc::clone(&self.pool);
+        let store = self.store.clone();
+        let gas = self.refine_gas;
+        let failed = |fault: Fault| CallError::Failed(fault.message().to_string());
+        let output = ran(self
+            .executors
+            .run(move || pvm::refine(&program, &pool, &store, snapshot, agent, &work, gas))
+            .await)
+        .map_err(failed)?;
+        pvm::decode::<Outcome>(&output).map_err(failed)
+    }
+
+    /// Commit changes to the node's own records.
+    pub(crate) async fn commit(&self, changes: Vec<Change>) -> Result<(), String> {
+        self.storage.commit(changes).await
+    }
+}
+
 /// A VOS node on one process.
 pub struct Node {
     inner: Arc<Inner>,
-    leaders: Mutex<Vec<smol::Task<()>>>,
-    next_agent: Mutex<u32>,
+    data: PathBuf,
+    ingress: Mutex<Option<smol::Task<()>>>,
     stop: Option<smol::channel::Sender<()>>,
     runtime: Option<JoinHandle<()>>,
 }
 
+/// The node's data directory: its store, and the operator's token.
+const STORE: &str = "store";
+pub const ADMIN_TOKEN: &str = "admin.token";
+
 impl Node {
-    /// Open the node's storage at `path` and start every agent it runs.
-    pub fn open(path: impl AsRef<Path>, config: Config) -> Result<Self, Error> {
+    /// Open the node's data directory `data` (its store and admin token)
+    /// and start every agent it runs.
+    pub fn open(data: impl AsRef<Path>, config: Config) -> Result<Self, Error> {
         let largest = defaults::MAX_HANDLER_GAS
             + defaults::STEP_RESERVE.max(defaults::INSTALL_RESERVE)
             + defaults::FINISH_RESERVE;
         if config.refine_gas < largest {
             return Err(Error::Gas);
         }
-        let store = Fjall::open(path)?;
+        let data = data.as_ref().to_path_buf();
+        std::fs::create_dir_all(&data).map_err(|error| Error::Data(error.to_string()))?;
+        let store = Fjall::open(data.join(STORE))?;
+        let node_id = match store.node_id()? {
+            Some(id) => NodeId(id),
+            None => {
+                let id = seed();
+                let mut batch = store.batch();
+                batch.node_id(&id);
+                batch.commit(Durability::Synced)?;
+                NodeId(id)
+            }
+        };
         let pool = Arc::new(MachinePool::new());
         for (_, blob) in store.programs()? {
             pool.install(&blob)
@@ -858,6 +1040,11 @@ impl Node {
                 .spawn(move || smol::block_on(runtime.run(stopped.recv())).unwrap_or(()))
                 .expect("the node's thread starts")
         };
+        let next = agents
+            .iter()
+            .map(|(agent, _)| agent.0 + 1)
+            .max()
+            .unwrap_or(1);
         let inner = Arc::new(Inner {
             storage: StorageThread::spawn(store.clone(), Arc::clone(&config.hooks)),
             store,
@@ -872,47 +1059,41 @@ impl Node {
             refine_gas: config.refine_gas,
             accumulate_gas: config.accumulate_gas,
             hooks: config.hooks,
+            clock: config.clock,
+            node_id,
             agents: Mutex::new(HashMap::new()),
+            leaders: Mutex::new(Vec::new()),
+            next_agent: smol::lock::Mutex::new(next),
             runtime,
         });
-        let next = agents
-            .iter()
-            .map(|(agent, _)| agent.0 + 1)
-            .max()
-            .unwrap_or(1);
-        let leaders = agents
+        let leaders: Vec<_> = agents
             .iter()
             .map(|(agent, _)| inner.start(*agent))
             .collect();
+        inner.leaders.lock().expect("the leaders").extend(leaders);
         Ok(Self {
             inner,
-            leaders: Mutex::new(leaders),
-            next_agent: Mutex::new(next),
+            data,
+            ingress: Mutex::new(None),
             stop: Some(stop),
             runtime: Some(thread),
         })
     }
 
+    /// The node's identity, which every client signature names.
+    pub fn id(&self) -> NodeId {
+        self.inner.node_id
+    }
+
     /// Create an agent running the node's agent program. Blocks until its
     /// registry entry is durable.
     pub fn create_agent(&self) -> Result<AgentId, CallError> {
-        let mut next = self.next_agent.lock().expect("the next agent");
-        let agent = AgentId(*next);
-        assert_ne!(agent, NODE_AGENT, "agent ids are exhausted");
-        let change = Change::Agent {
-            agent,
-            program: self.inner.program_hash,
-        };
-        smol::block_on(self.inner.storage.commit(vec![change])).map_err(CallError::Failed)?;
-        *next += 1;
-        let leader = self.inner.start(agent);
-        self.leaders.lock().expect("the leaders").push(leader);
-        Ok(agent)
+        smol::block_on(self.inner.create_agent())
     }
 
     /// Install a package as `instance` of `agent`: its actor program, the
-    /// program of each attestable method, and its roles' bytes. Blocks until
-    /// the blobs are durable and pooled, then queues the install.
+    /// program of each attestable method, and its roles' bytes. The blobs
+    /// are stored and pooled, then the install is queued and answered.
     pub fn install(
         &self,
         agent: AgentId,
@@ -921,36 +1102,17 @@ impl Node {
         attestables: &[(MethodId, &[u8])],
         roles: Vec<(Vec<u8>, u8)>,
     ) -> impl Future<Output = Result<Reply, CallError>> + use<> {
-        let stored = (|| {
-            let mut changes = Vec::new();
-            let mut hash = |blob: &[u8]| -> Result<ProgramHash, CallError> {
-                let hash = self
-                    .inner
-                    .pool
-                    .install(blob)
-                    .map_err(|error| CallError::Failed(format!("{error:?}")))?;
-                let hash = ProgramHash(hash.0);
-                changes.push(Change::Program {
-                    hash,
-                    blob: blob.to_vec(),
-                });
-                Ok(hash)
-            };
-            let program = hash(program)?;
-            let attestables = attestables
-                .iter()
-                .map(|(method, blob)| Ok((*method, hash(blob)?)))
-                .collect::<Result<Vec<_>, CallError>>()?;
-            smol::block_on(self.inner.storage.commit(changes)).map_err(CallError::Failed)?;
-            Ok(Admin::Install {
-                instance,
-                program,
-                attestables,
-                roles,
-            })
-        })();
-        let queued = stored.and_then(|admin| self.admin(agent, admin));
-        async move { queued?.recv().await.map_err(|_| CallError::Stopped) }
+        let inner = Arc::clone(&self.inner);
+        let program = program.to_vec();
+        let attestables: Vec<(MethodId, Vec<u8>)> = attestables
+            .iter()
+            .map(|(method, blob)| (*method, blob.to_vec()))
+            .collect();
+        async move {
+            inner
+                .install(agent, instance, program, attestables, roles)
+                .await
+        }
     }
 
     /// Grant `principal` a role in `agent`, or (`None`) revoke it.
@@ -960,18 +1122,8 @@ impl Node {
         principal: Principal,
         role: Option<u8>,
     ) -> impl Future<Output = Result<Reply, CallError>> + use<> {
-        let queued = self.admin(agent, Admin::SetRole { principal, role });
-        async move { queued?.recv().await.map_err(|_| CallError::Stopped) }
-    }
-
-    fn admin(
-        &self,
-        agent: AgentId,
-        admin: Admin,
-    ) -> Result<smol::channel::Receiver<Reply>, CallError> {
-        let (answer, reply) = smol::channel::bounded(1);
-        self.inner.push(agent, Pending::Admin(admin, answer))?;
-        Ok(reply)
+        let inner = Arc::clone(&self.inner);
+        async move { inner.admin(agent, Admin::SetRole { principal, role }).await }
     }
 
     /// A client request to `agent`, answered once its step is durable.
@@ -980,12 +1132,7 @@ impl Node {
         agent: AgentId,
         request: Request,
     ) -> impl Future<Output = Result<Reply, CallError>> + use<> {
-        let (answer, reply) = smol::channel::bounded(1);
-        let queued = self.inner.push(agent, Pending::Request(request, answer));
-        async move {
-            queued?;
-            reply.recv().await.map_err(|_| CallError::Stopped)
-        }
+        self.inner.call(agent, request)
     }
 
     /// Run a query handler on `agent`'s applied state. It never enters the
@@ -999,45 +1146,10 @@ impl Node {
         arguments: Vec<u8>,
     ) -> impl Future<Output = Result<Outcome, CallError>> + use<> {
         let inner = Arc::clone(&self.inner);
-        let known = inner.agent(agent).is_some();
         async move {
-            if !known {
-                return Err(CallError::NoAgent);
-            }
-            let snapshot = Arc::new(inner.store.snapshot());
-            let applied = snapshot
-                .applied(agent)
-                .map_err(|error| CallError::Failed(error.to_string()))?
-                .unwrap_or(0);
-            let (time, seed) = match inner
-                .store
-                .log_entry(agent, applied)
-                .map_err(|error| CallError::Failed(error.to_string()))?
-            {
-                Some(entry) => pvm::decode::<WorkResult>(&entry.entry)
-                    .map(|result| (result.time, result.seed))
-                    .unwrap_or((0, [0; 32])),
-                None => (0, [0; 32]),
-            };
-            let work = Work::Query(Query {
-                time,
-                seed,
-                caller,
-                instance,
-                method,
-                arguments,
-            });
-            let program = Arc::clone(&inner.program);
-            let pool = Arc::clone(&inner.pool);
-            let store = inner.store.clone();
-            let gas = inner.refine_gas;
-            let failed = |fault: Fault| CallError::Failed(fault.message().to_string());
-            let output = ran(inner
-                .executors
-                .run(move || pvm::refine(&program, &pool, &store, snapshot, agent, &work, gas))
-                .await)
-            .map_err(failed)?;
-            pvm::decode::<Outcome>(&output).map_err(failed)
+            inner
+                .query(agent, caller, instance, method, arguments)
+                .await
         }
     }
 
@@ -1053,6 +1165,25 @@ impl Node {
         &self.inner.store
     }
 
+    /// Serve the HTTP ingress on `address` (`127.0.0.1:0` picks a port):
+    /// the address it listens on. The operator's token goes to the data
+    /// directory, readable by its owner only.
+    pub fn serve(&self, address: SocketAddr) -> Result<SocketAddr, Error> {
+        let token = seed();
+        write_token(&self.data.join(ADMIN_TOKEN), &token)
+            .map_err(|error| Error::Data(error.to_string()))?;
+        let listener = smol::block_on(smol::net::TcpListener::bind(address))
+            .map_err(|error| Error::Data(error.to_string()))?;
+        let local = listener
+            .local_addr()
+            .map_err(|error| Error::Data(error.to_string()))?;
+        let ingress = crate::ingress::Ingress::open(Arc::clone(&self.inner), token)
+            .map_err(|error| Error::Data(error.to_string()))?;
+        let task = self.inner.runtime.spawn(ingress.serve(listener));
+        *self.ingress.lock().expect("the ingress") = Some(task);
+        Ok(local)
+    }
+
     /// Stop every leader after its batch in flight, then the threads.
     /// Requests queued but not yet in a batch are not durable: their callers
     /// see `Stopped` and resend.
@@ -1061,6 +1192,7 @@ impl Node {
     }
 
     fn stop_all(&mut self) {
+        drop(self.ingress.lock().expect("the ingress").take());
         let agents: Vec<Arc<Agent>> = self
             .inner
             .agents
@@ -1072,7 +1204,7 @@ impl Node {
         for agent in agents {
             agent.stop();
         }
-        let leaders = std::mem::take(&mut *self.leaders.lock().expect("the leaders"));
+        let leaders = std::mem::take(&mut *self.inner.leaders.lock().expect("the leaders"));
         smol::block_on(async {
             for leader in leaders {
                 leader.await;
@@ -1091,4 +1223,19 @@ impl Drop for Node {
     fn drop(&mut self) {
         self.stop_all();
     }
+}
+
+/// Write the operator's token, in hex, readable by its owner only.
+fn write_token(path: &Path, token: &[u8; 32]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let hex: String = token.iter().map(|byte| format!("{byte:02x}")).collect();
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(hex.as_bytes())?;
+    file.sync_all()
 }

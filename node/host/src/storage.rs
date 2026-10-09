@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 
-use vos_wire::ids::{AgentId, ProgramHash};
+use vos_wire::ids::{AgentId, ProgramHash, SessionId};
 use vos_wire::result::Write;
 
 use crate::Hooks;
@@ -30,6 +30,13 @@ pub(crate) enum Change {
         agent: AgentId,
         program: ProgramHash,
     },
+    /// A client session opened for `key` at its `time`.
+    Session {
+        id: SessionId,
+        key: [u8; 32],
+        time: u64,
+    },
+    ForgetSession(SessionId),
 }
 
 struct Commit {
@@ -67,6 +74,8 @@ impl StorageThread {
                                 }
                                 Change::Program { hash, blob } => batch.program(hash, blob),
                                 Change::Agent { agent, program } => batch.agent(*agent, program),
+                                Change::Session { id, key, time } => batch.session(*id, key, *time),
+                                Change::ForgetSession(id) => batch.forget_session(*id),
                             }
                         }
                     }

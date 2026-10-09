@@ -623,6 +623,109 @@ rest. Exactly once, each case followed by a restart:
 - **Tests:** duplicate and gapped sequences, expired sessions, pipelined
   requests that lose their replies.
 
+#### Design [reviewed; owner decisions taken as defaults]
+
+**Clients are keys.** A client is an ed25519 key; its principal is
+`Principal::Client(key)`. Every signed message starts with a domain tag
+and the node's id (32 random bytes made when the node is first opened),
+so a signature made for one node or one kind of message is good for no
+other:
+
+- opening a session signs `vos/session/1 ∥ node ∥ key ∥ time`; the time
+  must be within a minute of the node's clock and later than the key's
+  last open, so a captured open cannot be replayed;
+- a call signs `vos/call/1 ∥ node ∥ agent ∥ session ∥ sequence ∥
+  instance ∥ method ∥ arguments`; a replay is a duplicate;
+- a query signs `vos/query/1 ∥ node ∥ agent ∥ session ∥ not_after ∥
+  instance ∥ method ∥ arguments`, and is refused past `not_after` (the
+  node's clock), which may lie at most five minutes ahead.
+
+Ingress holds no secret. The agent trusts the caller ingress names; the
+signature is not in the log [open: a history that proves client intent
+would carry it in `Request`]. [Owner decisions, taken as the reviewer's
+recommended defaults: per-request signatures; a signed open with a cap
+per key; server-assigned session ids, as section 8.4 decides; the
+alternative, client-named sessions scoped by key, would drop the
+registry.]
+
+**Sessions** are the node's: `POST /sessions` returns a new id, recorded
+with its key in the node's keys of `system` and committed before it is
+returned. Ids count up and are never reused. A key holds at most 16
+sessions: opening another forgets its oldest. A request in a session the
+node does not know is refused (`unknown session`). The agent keeps each
+session's mark and reply window and refuses an expired session
+(`EXPIRED`, by work-result time), as in 2.4.
+
+**A request**, `POST /agents/{agent}/calls`, carries `{session, sequence,
+instance, method, arguments, signature}` in SCALE. Sequences start at 1
+per (session, agent). Ingress checks the signature, then, per (session,
+agent), against the agent's applied mark and the requests it has queued:
+
+- at or below the mark: a duplicate, answered from the reply window, or
+  `too old` below it;
+- in flight: it waits for that request's answer;
+- next after those queued: queued;
+- past that: `gap`, refused;
+- more than W past the mark: `ahead`, refused until replies arrive. W in
+  flight is what lets a pipelining client recover any lost reply [the
+  owner may reword section 8.4's "W ahead of the oldest kept reply" to
+  "W ahead of the applied mark"].
+
+Order holds within one connection only, so a pipelining client sends in
+order on one keep-alive connection. A request answered not consumed
+(`Failed`) or refused leaves the mark where it was: the requests
+pipelined behind it are refused as gaps, and the client resends from
+it.
+
+**Answers** are one SCALE `Answer`: the step's outcome; the agent's
+refusal code; ingress's own refusals (`unknown session`, `bad
+signature`, `too old`, `gap`, `ahead`, `stale query`), in a space apart
+from the agent's; not consumed; busy; no such agent; unavailable (the
+node failed to read or write, before anything was done). HTTP statuses
+match.
+
+**Operator commands** (`POST /agents`, `.../install`, `.../roles`) need
+the node's admin token, written to its data directory (mode 0600) at
+start and compared in constant time; the CLI reads it there, so it runs
+on the node's host in this slice. `GET /agents/{agent}/instances/{instance}/schema`
+returns an installed schema to anyone, so clients call methods by name;
+it tells which packages an agent runs.
+
+**HTTP** is a small HTTP/1.1 server on the node's async thread (smol and
+`httparse`): `Content-Length` bodies, keep-alive, no TLS, so the node
+listens on `127.0.0.1` by default. Limits: a 16 KiB head; a body of at
+most a request's cap plus its envelope, or 64 MiB for an install,
+refused by its `Content-Length` before it is read (`413`, said before
+closing); no chunked bodies (`411`); `100 Continue` when asked; 30 s idle
+per read and 60 s per request; 1,024 connections. An install's decoding
+and its programs' preparation run on executors. Signature checks (about
+50 µs) run on the async thread; they are the first thing to move to
+executors if they show.
+
+**The CLI** (`node/cli`, binary `vos`): `vos node --data DIR [--listen
+ADDR] --agent ELF`; `vos agent create`, `vos install --agent A
+--instance I --program ELF [--attestable METHOD=ELF] [--role NAME=BYTE]`
+and `vos role` read the admin token from the data directory; `vos key
+new`; `vos call` and `vos query --agent A --instance I --method NAME
+--args HEX --key FILE` keep one session next to the key file (its node,
+id, open time and next sequence per agent), open another when the node
+forgot it or it expired, resolve the method through the schema and print
+the answer. An open signs the later of the clock and the last open plus
+one. Arguments are SCALE in hex in this slice.
+
+**Tests** (`node/host/tests/ingress.rs` over HTTP, and the CLI end to
+end): a duplicate answered from the window and applied once; a gap and a
+request past the window refused; a bad signature, an unknown session, a
+replayed open and a stale query refused; an expired session refused (a
+test clock moves work-result time); pipelined requests whose replies are
+dropped, then recovered from the window; operator commands without the
+token refused.
+
+**Open:** session state is never collected: the node's registry is
+bounded per key, but agents keep marks and reply windows of expired
+sessions, and a session with no mark at an agent never expires there
+(an `Admin::ExpireSessions` or a sweep on `EXPIRED` are the two shapes).
+
 ### 2.7 The JAM host-call CI harness
 
 The JAM-only host exists from 2.1 and the agent's tests run on it from

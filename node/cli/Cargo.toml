@@ -1,0 +1,23 @@
+[package]
+name = "vos-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The `vos` command: run a node, operate it, and call its agents."
+
+[[bin]]
+name = "vos"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+ed25519-dalek = "2"
+getrandom = "0.2"
+hex = "0.4"
+vos-node = { path = "../host" }
+vos-pvm = { workspace = true }
+vos-pvm-compiler = { workspace = true }
+vos-wire = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

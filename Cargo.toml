@@ -6,6 +6,7 @@ members = [
     "agent/sdk-macros",
     "agent/testkit",
     "node/host",
+    "node/cli",
     "support/vos-raft",
     "support/merkle-crdt",
     "pvm/runtime",
