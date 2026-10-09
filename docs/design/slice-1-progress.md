@@ -229,3 +229,38 @@ changes the format again anyway:
 
 **Step 1.2 is done.**
 
+## Step 1.3: precompiles
+
+- **Price.** A BLAKE2b compression costs 600 gas on top of its `ecalli`'s
+  block gas. Serving one natively takes 173 ns, about 520 time-stamp-counter
+  cycles, on the reference laptop (`precompile native` in `pvm/bench`); the
+  0.8.0 block-gas model counts cycles, and the price rounds that up. The same
+  hash in software inside the guest costs 15,874 gas.
+- **One charge, every path.** `vos_pvm::precompile::{price, charge}` is the
+  single price table. The refine host charges it before serving, for the
+  outer machine and inner machines, observed and not, on the interpreter
+  and the JIT; the prover's tracer charges the same. An unpayable call is not
+  served: the machine stops out of gas on the call's own counter, as for any
+  host call. Tests pin the price on the interpreter, the JIT and the observed
+  path; for inner machines; and for the tracer against the host.
+- **Guest shim.** Every shim (BLAKE2b, both Ristretto calls, the three
+  scalar calls) now falls back to software when the host answers `WHAT`.
+  The call loads its id with `li` inside the asm block, so the transpiler
+  always sees it, and no longer passes JAR's capability slot. The
+  `hash-precompile` bench guest is now built on the shim, so the agreement
+  test exercises the shim on VOS, on a JAM-like host and in software. That
+  host now charges Gray Paper's 10 gas per unknown call.
+- **Register convention.** Docs that placed the pointers in φ[10..12] are
+  corrected to φ[7..10], and a test checks the tracer and the refine host
+  read the same registers and write the same bytes.
+- **Tampering.** S5b's checks are now a test: on a one-hash run, a corrupted
+  compression input, corrupted output bytes or a dropped call are rejected;
+  the honest run proves.
+- **Deferred to step 5.** The Ristretto and scalar ids (110–114) stay
+  outside the VOS range for now. The refine host does not serve them yet, so
+  on VOS they answer `WHAT` and run in software, and inside the prover the
+  wire ids double as relation tags. Clerk brings serving, prices and the id
+  move together in step 5.
+- **Step 1.5** adds the remaining check: a precompile write marks its page
+  dirty.
+

@@ -6,6 +6,10 @@
 //! recorded call; proving or verification must reject it.
 //! `precompile tamper-stark <n>`: corrupt a call input and verify each child
 //! STARK alone, without replay.
+//! `precompile native`: the native cost of serving one compression, in
+//! nanoseconds and time-stamp-counter cycles, and the gas the guest pays
+//! for one compression in software on a JAM host. The VOS price is set from
+//! these.
 //!
 //! Cross-host agreement is a test: `tests/precompile_agreement.rs`.
 
@@ -113,6 +117,49 @@ fn main() {
                 }
             }
         }
-        _ => panic!("usage: precompile prove <n> | tamper <n> <what> | tamper-stark <n>"),
+        "native" => native(),
+        _ => panic!("usage: precompile prove <n> | tamper <n> <what> | tamper-stark <n> | native"),
     }
+}
+
+/// Native cost of serving one compression, and the guest's software cost.
+fn native() {
+    use vos_pvm::interpreter::{Memory, PERM_RW};
+    use vos_pvm::precompile::{BLAKE2B_COMPRESS, execute};
+
+    const CALLS: u64 = 1_000_000;
+    let mut memory = Memory::flat(vec![0x5a; 0x2000]);
+    memory.set_page_perms(vec![PERM_RW; 2]);
+    let mut registers = [0u64; vos_pvm::PVM_REGISTER_COUNT];
+    registers[7] = 0x0;
+    registers[8] = 0x1000;
+    registers[9] = 128;
+    registers[10] = 1;
+    for _ in 0..10_000 {
+        std::hint::black_box(execute(BLAKE2B_COMPRESS, &registers, &mut memory));
+    }
+    let started = Instant::now();
+    // SAFETY: reading the time-stamp counter has no side effects.
+    let tsc_start = unsafe { core::arch::x86_64::_rdtsc() };
+    for _ in 0..CALLS {
+        std::hint::black_box(execute(BLAKE2B_COMPRESS, &registers, &mut memory));
+    }
+    // SAFETY: as above.
+    let tsc = unsafe { core::arch::x86_64::_rdtsc() } - tsc_start;
+    let elapsed = started.elapsed();
+
+    let software = vos_pvm_bench::guest_program("hash-software");
+    let gas_for = |n: u64| {
+        let invocation =
+            vos_pvm::refine_host::RefineContext::load(&software, &n.to_le_bytes(), GAS)
+                .expect("load")
+                .run();
+        invocation.gas_used
+    };
+    let per_hash = (gas_for(101) - gas_for(1)) / 100;
+    println!(
+        "served compression: {:.0} ns, {:.0} TSC cycles; software hash in the guest: {per_hash} gas",
+        elapsed.as_nanos() as f64 / CALLS as f64,
+        tsc as f64 / CALLS as f64,
+    );
 }

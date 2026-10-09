@@ -42,6 +42,7 @@
 // `-D warnings` gate doesn't reject this verbatim port.
 #![allow(clippy::needless_range_loop, clippy::needless_lifetimes)]
 
+#[cfg(test)]
 extern crate alloc;
 
 pub mod ecalls;

@@ -11,8 +11,9 @@
 /// outside every id JAM assigns (`vos_pvm::precompile::BLAKE2B_COMPRESS`).
 /// The CPU chip selects the BLAKE2b relation by the internal dispatch code
 /// [`DISPATCH_BLAKE2B_COMPRESS`], not by this wire id.
-/// Convention: φ[10]=ptr_h, φ[11]=ptr_m, φ[12]=t_low (counter bytes in message).
-/// h is read (64 bytes), m is read (128 bytes). Result overwrites h.
+/// Convention: φ[7] = h pointer, φ[8] = m pointer, φ[9] = counter low 64
+/// bits, φ[10] = finalize flag. h is read (64 bytes), m is read (128 bytes).
+/// The result overwrites h.
 pub const ECALL_BLAKE2B_COMPRESS: u32 = 0x400;
 /// CPU-chip dispatch code for the BLAKE2b relation.
 pub(crate) const DISPATCH_BLAKE2B_COMPRESS: u8 = 100;
@@ -20,9 +21,9 @@ pub(crate) const DISPATCH_BLAKE2B_COMPRESS: u8 = 100;
 /// Hostcall ID for Ristretto255 scalar multiplication precompile.
 ///
 /// Convention:
-///   φ[10] = scalar_ptr  (32 canonical bytes, scalar mod ℓ)
-///   φ[11] = point_ptr   (32 bytes, compressed Ristretto encoding)
-///   φ[12] = output_ptr  (32 bytes, compressed Ristretto, written by the call)
+///   φ[7] = scalar_ptr  (32 canonical bytes, scalar mod ℓ)
+///   φ[8] = point_ptr   (32 bytes, compressed Ristretto encoding)
+///   φ[9] = output_ptr  (32 bytes, compressed Ristretto, written by the call)
 ///
 /// scalar_ptr (32B read) and point_ptr (32B read) are inputs;
 /// output_ptr (32B write) receives the compressed encoding of `k * P`.
@@ -41,9 +42,9 @@ pub const ECALL_RISTRETTO_SCALAR_MULT: u32 = 110;
 /// Hostcall ID for Ristretto255 compressed-point addition precompile.
 ///
 /// Convention:
-///   φ[10] = p_ptr      (32 bytes, compressed Ristretto)
-///   φ[11] = q_ptr      (32 bytes, compressed Ristretto)
-///   φ[12] = output_ptr (32 bytes, compressed Ristretto, written by call)
+///   φ[7] = p_ptr      (32 bytes, compressed Ristretto)
+///   φ[8] = q_ptr      (32 bytes, compressed Ristretto)
+///   φ[9] = output_ptr (32 bytes, compressed Ristretto, written by call)
 ///
 /// Decompresses both operands, adds them as Ristretto group elements,
 /// recompresses, and writes the result.  On non-canonical or invalid
@@ -57,8 +58,8 @@ pub const ECALL_RISTRETTO_POINT_ADD: u32 = 111;
 /// Hostcall ID for the Ristretto255 wide-scalar reduction precompile.
 ///
 /// Convention:
-///   φ[10] = wide_ptr   (64 bytes input — the uniform-random source)
-///   φ[11] = output_ptr (32 bytes — canonical scalar mod ℓ, written)
+///   φ[7] = wide_ptr   (64 bytes input — the uniform-random source)
+///   φ[8] = output_ptr (32 bytes — canonical scalar mod ℓ, written)
 ///
 /// Replaces dalek's `Scalar::from_bytes_mod_order_wide` (which on
 /// PVM expands into ~60% of an `Amount::commit` trace via the
@@ -72,9 +73,9 @@ pub const ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE: u32 = 112;
 /// scalar field).  Mirrors dalek's `Scalar * Scalar` public API.
 ///
 /// Convention:
-///   φ[10] = a_ptr      (32 canonical bytes — Scalar mod ℓ)
-///   φ[11] = b_ptr      (32 canonical bytes)
-///   φ[12] = output_ptr (32 bytes — `(a * b) mod ℓ`, written)
+///   φ[7] = a_ptr      (32 canonical bytes — Scalar mod ℓ)
+///   φ[8] = b_ptr      (32 canonical bytes)
+///   φ[9] = output_ptr (32 bytes — `(a * b) mod ℓ`, written)
 pub const ECALL_SCALAR_MUL_MOD_L: u32 = 113;
 
 /// Hostcall ID for scalar addition mod ℓ.  Mirrors dalek's

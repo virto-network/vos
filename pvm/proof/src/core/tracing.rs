@@ -27,9 +27,9 @@ pub struct Blake2bRecord {
 /// MemoryChip insertion order keeps reads before writes at tie-break.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Blake2bMemOp {
-    /// Pointer register φ[10] — base of h and also base of the output write.
+    /// Pointer register φ[7] — base of h and also base of the output write.
     pub h_ptr: u32,
-    /// Pointer register φ[11] — base of m.
+    /// Pointer register φ[8] — base of m.
     pub m_ptr: u32,
     /// Timestamp of the ECALL step that triggered the precompile.
     pub ts: u64,
@@ -164,11 +164,11 @@ pub struct RistrettoRecord {
 /// keeps reads before writes at tie-break.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RistrettoMemOp {
-    /// Pointer register φ[10] — base of the 32-byte scalar buffer.
+    /// Pointer register φ[7] — base of the 32-byte scalar buffer.
     pub scalar_ptr: u32,
-    /// Pointer register φ[11] — base of the 32-byte input compressed point.
+    /// Pointer register φ[8] — base of the 32-byte input compressed point.
     pub point_ptr: u32,
-    /// Pointer register φ[12] — base of the 32-byte output compressed point.
+    /// Pointer register φ[9] — base of the 32-byte output compressed point.
     pub output_ptr: u32,
     /// Timestamp of the ECALL step that triggered the precompile.
     pub ts: u64,
@@ -389,6 +389,14 @@ impl TracingPvm {
     /// diverge.
     pub fn step_with_precompiles(&mut self) -> Option<ExitReason> {
         let exit = self.step()?;
+        // A served call pays its VOS price first, exactly as on the refine
+        // host; an unpayable call stops out of gas, unserved.
+        if let ExitReason::HostCall(id) = exit
+            && crate::core::ecall::is_proof_host_call_allowed(id)
+            && !vos_pvm::precompile::charge(id, &mut self.pvm.gas)
+        {
+            return Some(ExitReason::OutOfGas);
+        }
         match exit {
             ExitReason::HostCall(id) if id == u64::from(ECALL_BLAKE2B_COMPRESS) => {
                 self.handle_blake2b_ecall();

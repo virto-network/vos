@@ -1773,3 +1773,68 @@ fn prove_ristretto_chip_scalar_mult_chained_small() {
     );
     eprintln!("RistrettoChip scalar-mult chained: PROVED + VERIFIED");
 }
+
+/// The refine host and the proof tracer serve BLAKE2b from the same
+/// registers: φ[7] = h, φ[8] = m, φ[9] = counter, φ[10] = finalize flag.
+/// Distinct values in each register make any disagreement visible, and the
+/// tracer charges the same price as the host.
+#[test]
+fn tracer_and_refine_host_read_the_same_compression_registers() {
+    use vos_pvm::interpreter::{Memory, PERM_RW};
+    use vos_pvm::precompile::{BLAKE2B_COMPRESS, BLAKE2B_COMPRESS_GAS, execute};
+
+    let h_addr = TEST_GUEST_BASE;
+    let m_addr = TEST_GUEST_BASE + 0x100;
+    let mut memory = vec![0u8; TEST_GUEST_MEMORY_LEN];
+    for (i, byte) in memory[h_addr as usize..h_addr as usize + 64]
+        .iter_mut()
+        .enumerate()
+    {
+        *byte = i as u8;
+    }
+    for (i, byte) in memory[m_addr as usize..m_addr as usize + 128]
+        .iter_mut()
+        .enumerate()
+    {
+        *byte = 0x80 ^ i as u8;
+    }
+    let mut registers = [0u64; vos_pvm::PVM_REGISTER_COUNT];
+    registers[7] = h_addr;
+    registers[8] = m_addr;
+    registers[9] = 0x1234;
+    registers[10] = 1;
+
+    let mut host_memory = Memory::flat(memory.clone());
+    host_memory.set_page_perms(vec![PERM_RW; TEST_GUEST_MEMORY_LEN / 4096]);
+    execute(BLAKE2B_COMPRESS, &registers, &mut host_memory).expect("served by the host");
+    let mut host_h = [0u8; 64];
+    host_memory.read_bytes(h_addr as u32, &mut host_h);
+
+    let [b0, b1, b2, b3] = (BLAKE2B_COMPRESS as u32).to_le_bytes();
+    let code = vec![
+        vos_pvm::instruction::Opcode::Ecalli as u8,
+        b0,
+        b1,
+        b2,
+        b3,
+        vos_pvm::instruction::Opcode::Trap as u8,
+    ];
+    let pvm = Interpreter::new(
+        code,
+        vec![1, 0, 0, 0, 0, 1],
+        vec![],
+        registers,
+        memory,
+        10_000,
+    );
+    let mut tracing = TracingPvm::new(pvm);
+    assert_eq!(tracing.run_with_precompiles(), vos_pvm::ExitReason::Panic);
+    assert_eq!(tracing.blake2b_records.len(), 1);
+    let traced_h = &tracing.pvm.flat_mem()[h_addr as usize..h_addr as usize + 64];
+    assert_eq!(traced_h, &host_h[..], "same registers, same compression");
+    assert_eq!(
+        10_000 - tracing.pvm.gas,
+        u64::from(tracing.pvm.block_gas_costs[0]) + BLAKE2B_COMPRESS_GAS,
+        "the tracer charges the host's price"
+    );
+}

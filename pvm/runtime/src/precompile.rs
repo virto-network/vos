@@ -17,9 +17,39 @@
 /// φ[10] = finalize flag (non-zero = last block).
 pub const BLAKE2B_COMPRESS: u64 = 0x400;
 
+/// Gas for one BLAKE2b compression, on top of its `ecalli`'s block gas.
+///
+/// Serving one natively takes about 520 time-stamp-counter cycles on the
+/// reference machine (`precompile native` in `pvm/bench`), and the 0.8.0
+/// block-gas model counts cycles; the price rounds that up. Computing the
+/// same hash in software inside the guest costs about 15,900 gas.
+pub const BLAKE2B_COMPRESS_GAS: crate::Gas = 600;
+
 /// Whether `id` names a precompile the refine host serves in place.
 pub const fn is_precompile(id: u64) -> bool {
     id == BLAKE2B_COMPRESS
+}
+
+/// The gas a call to precompile `id` costs, or `None` if `id` names none.
+pub const fn price(id: u64) -> Option<crate::Gas> {
+    match id {
+        BLAKE2B_COMPRESS => Some(BLAKE2B_COMPRESS_GAS),
+        _ => None,
+    }
+}
+
+/// Charge precompile `id`'s price from `gas` before serving it. When the
+/// price cannot be paid, `gas` is emptied and the call is not served: the
+/// machine stops out of gas on the call's own counter, as for any host call.
+pub fn charge(id: u64, gas: &mut crate::Gas) -> bool {
+    let price = price(id).unwrap_or(0);
+    if *gas < price {
+        *gas = 0;
+        false
+    } else {
+        *gas -= price;
+        true
+    }
 }
 
 /// The inputs and output of one served precompile call.

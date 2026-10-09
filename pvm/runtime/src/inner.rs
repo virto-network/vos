@@ -489,6 +489,9 @@ impl InnerMachines {
                         .0;
                     match exit {
                         ExitReason::HostCall(call) if crate::precompile::is_precompile(call) => {
+                            if !crate::precompile::charge(call, &mut vm.gas) {
+                                break ExitReason::OutOfGas;
+                            }
                             let registers = vm.registers;
                             let Some(served) =
                                 crate::precompile::execute(call, &registers, vm.memory_mut())
@@ -509,6 +512,9 @@ impl InnerMachines {
                 let exit = execution.run(vm).map_err(|_| InnerError::Backend)?;
                 match exit {
                     ExitReason::HostCall(call) if crate::precompile::is_precompile(call) => {
+                        if !crate::precompile::charge(call, &mut vm.gas) {
+                            break ExitReason::OutOfGas;
+                        }
                         let registers = vm.registers;
                         if crate::precompile::execute(call, &registers, vm.memory_mut()).is_none() {
                             break ExitReason::Panic;

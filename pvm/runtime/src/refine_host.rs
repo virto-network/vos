@@ -269,6 +269,10 @@ impl RefineContext {
                 if !crate::precompile::is_precompile(id) {
                     break;
                 }
+                if !self.outer.charge(crate::precompile::price(id).unwrap_or(0)) {
+                    exit = ExitReason::OutOfGas;
+                    break;
+                }
                 let registers = *self.outer.registers();
                 let Some(call) =
                     crate::precompile::execute(id, &registers, self.outer.memory_mut())
@@ -323,6 +327,9 @@ impl RefineContext {
     }
 
     fn precompile(&mut self, id: u64) -> Dispatch {
+        if let Err(exit) = self.charge(crate::precompile::price(id).unwrap_or(0)) {
+            return exit;
+        }
         let registers = *self.outer.registers();
         match crate::precompile::execute(id, &registers, self.outer.memory_mut()) {
             Some(_) => Dispatch::Continue,
@@ -871,6 +878,171 @@ mod tests {
 
         assert_eq!(invocation.exit, ExitReason::Halt);
         assert_eq!(invocation.registers[7], result::HUH);
+    }
+
+    /// φ7 ← the rw base (h), φ8 ← rw base + 64 (m), `ecalli id`, halt.
+    fn compression_program(id: u16) -> Vec<u8> {
+        let [id_lo, id_hi] = id.to_le_bytes();
+        let code = [
+            51, 7, 0x00, 0x00, 0x02, // load_imm φ7, 0x2_0000
+            51, 8, 0x40, 0x00, 0x02, // load_imm φ8, 0x2_0040
+            10, id_lo, id_hi, // ecalli id
+            50, 0, // jump_ind φ0 (the halt address)
+        ];
+        standard_program_with_rw(&code, &[0, 5, 10, 13], &[0x5a; 192])
+    }
+
+    fn compressed_h() -> [u8; 64] {
+        let word = u64::from_le_bytes([0x5a; 8]);
+        let h = [word; 8];
+        let m = [word; 16];
+        let out = crate::precompile::compress(&h, &m, 0, false);
+        let mut bytes = [0u8; 64];
+        for (i, value) in out.iter().enumerate() {
+            bytes[i * 8..i * 8 + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn precompile_price_is_charged_identically_on_every_path() {
+        let program = compression_program(crate::precompile::BLAKE2B_COMPRESS as u16);
+        let check = |invocation: &Invocation, path: &str| {
+            assert_eq!(invocation.exit, ExitReason::Halt, "{path}");
+            let mut h = [0u8; 64];
+            invocation.memory().read_bytes(0x2_0000, &mut h);
+            assert_eq!(h, compressed_h(), "{path}: served in place");
+            invocation.gas_used
+        };
+
+        let interpreted = RefineContext::load_with_backend(
+            &program,
+            &[],
+            1_000_000,
+            crate::refine::MemoryModel::Auto,
+            PvmBackend::ForceInterpreter,
+        )
+        .unwrap()
+        .run();
+        let gas = check(&interpreted, "interpreter");
+        let observed = RefineContext::load_with_backend(
+            &program,
+            &[],
+            1_000_000,
+            crate::refine::MemoryModel::Sparse,
+            PvmBackend::ForceInterpreter,
+        )
+        .unwrap()
+        .run_observed(|_| {});
+        assert_eq!(check(&observed, "observed"), gas);
+        #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+        {
+            let native = RefineContext::load_with_backend(
+                &program,
+                &[],
+                1_000_000,
+                crate::refine::MemoryModel::Auto,
+                PvmBackend::ForceRecompiler,
+            )
+            .unwrap()
+            .try_run()
+            .unwrap();
+            assert_eq!(check(&native, "recompiler"), gas);
+        }
+
+        // The same program naming an id no host serves, resumed for free by
+        // the embedder: identical instructions and blocks, minus the price.
+        let unpriced = RefineContext::load(&compression_program(0x4ff), &[], 1_000_000)
+            .unwrap()
+            .run_with_host(|id, _| {
+                assert_eq!(id, 0x4ff);
+                Ok(())
+            });
+        assert_eq!(unpriced.exit, ExitReason::Halt);
+        assert_eq!(
+            gas,
+            unpriced.gas_used + crate::precompile::BLAKE2B_COMPRESS_GAS
+        );
+    }
+
+    #[test]
+    fn unpayable_precompile_stops_out_of_gas_unserved() {
+        let program = compression_program(crate::precompile::BLAKE2B_COMPRESS as u16);
+        let full = RefineContext::load(&program, &[], 1_000_000).unwrap().run();
+        assert_eq!(full.exit, ExitReason::Halt);
+        // Funds every block but not the price.
+        let budget = full.gas_used - crate::precompile::BLAKE2B_COMPRESS_GAS;
+        for observed in [false, true] {
+            let context = RefineContext::load_with_backend(
+                &program,
+                &[],
+                budget,
+                crate::refine::MemoryModel::Sparse,
+                PvmBackend::ForceInterpreter,
+            )
+            .unwrap();
+            let invocation = if observed {
+                context.run_observed(|_| {})
+            } else {
+                context.run()
+            };
+            assert_eq!(invocation.exit, ExitReason::OutOfGas, "observed={observed}");
+            assert_eq!(invocation.pc, 10, "stops on the call's own counter");
+            assert_eq!(invocation.gas_used, budget);
+            let mut h = [0u8; 64];
+            invocation.memory().read_bytes(0x2_0000, &mut h);
+            assert_eq!(h, [0x5a; 64], "the call was not served");
+        }
+    }
+
+    /// Run an inner machine whose program is `ecalli id; trap` with `gas` in
+    /// its invocation frame. Returns the outcome code in φ7 and the gas left
+    /// in the frame.
+    fn invoke_inner_call(id: u16, gas: u64) -> (u64, u64) {
+        const RW_BASE: u32 = 2 * crate::PVM_ZONE_SIZE;
+        let mut frame = [0u8; 112];
+        frame[..8].copy_from_slice(&gas.to_le_bytes());
+        let [b0, b1, b2, _] = RW_BASE.to_le_bytes();
+        // machine(args), r8 <- RW_BASE, invoke(machine 0, frame), halt.
+        let code = [10, 9, 51, 8, b0, b1, b2, 10, 13, 50, 0];
+        let outer = standard_program_with_rw(&code, &[0, 2, 7, 9], &frame);
+        let [id_lo, id_hi] = id.to_le_bytes();
+        // ecalli id; trap. The inner machine maps no pages, so a served
+        // compression faults on its pointers after paying.
+        let inner = vec![0, 1, 4, 10, id_lo, id_hi, 0, 0b0000_1001];
+        let invocation = RefineContext::load_with(&outer, &inner, 1_000_000, MemoryModel::Sparse)
+            .unwrap()
+            .run();
+        assert_eq!(invocation.exit, ExitReason::Halt);
+        let mut left = [0u8; 8];
+        invocation.memory().read_bytes(RW_BASE, &mut left);
+        (invocation.registers[7], u64::from_le_bytes(left))
+    }
+
+    #[test]
+    fn inner_machine_precompile_pays_the_same_price() {
+        const PANIC: u64 = 1;
+        const HOST: u64 = 3;
+        const OUT_OF_GAS: u64 = 4;
+        let (outcome, unpriced_left) = invoke_inner_call(0x4ff, 100_000);
+        assert_eq!(outcome, HOST, "an unknown id returns to the outer machine");
+        let (outcome, priced_left) =
+            invoke_inner_call(crate::precompile::BLAKE2B_COMPRESS as u16, 100_000);
+        assert_eq!(
+            outcome, PANIC,
+            "the served call faults on unmapped pointers"
+        );
+        assert_eq!(
+            unpriced_left - priced_left,
+            crate::precompile::BLAKE2B_COMPRESS_GAS
+        );
+
+        // Funds the block but not the price.
+        let blocks = 100_000 - unpriced_left;
+        let budget = blocks + crate::precompile::BLAKE2B_COMPRESS_GAS - 1;
+        let (outcome, left) = invoke_inner_call(crate::precompile::BLAKE2B_COMPRESS as u16, budget);
+        assert_eq!(outcome, OUT_OF_GAS);
+        assert_eq!(left, 0);
     }
 
     #[test]

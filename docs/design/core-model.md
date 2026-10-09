@@ -868,7 +868,8 @@ outbox sequence numbers, which receivers deduplicate.
   - JAM tooling budgets gas at fallback cost, from per-call counts recorded
     on VOS.
   - VOS prices each precompile, and the prover binds that price wherever a
-    proof binds final gas.
+    proof binds final gas. A BLAKE2b compression costs 600 gas, from its
+    native serving cost (slice 1).
 - **Cost per BLAKE2b compression** (S5b): 66 steps plus about 35 ms and
   50 MiB of proving. Hashing in the PVM costs about 4,760 steps, 0.4 s and
   800 MiB per hash. The marginal cost rises near a slice's memory cap:

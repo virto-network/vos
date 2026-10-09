@@ -5,3 +5,10 @@ version = 4
 [[package]]
 name = "bench-hash-precompile"
 version = "0.1.0"
+dependencies = [
+ "vos-pvm-precompiles",
+]
+
+[[package]]
+name = "vos-pvm-precompiles"
+version = "0.1.0"

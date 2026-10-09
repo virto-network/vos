@@ -37,8 +37,12 @@ pub fn run_vos(program: &[u8], args: &[u8]) -> Vec<u8> {
     invocation.output_bounded(1 << 20).expect("output")
 }
 
-/// Run on a JAM-like host: every host call is unknown and answers `WHAT`.
-/// Returns the output and the number of instructions executed.
+/// Gas Gray Paper charges for a host call the host does not know.
+pub const UNKNOWN_CALL_GAS: u64 = 10;
+
+/// Run on a JAM-like host: every host call is unknown, costs
+/// [`UNKNOWN_CALL_GAS`] and answers `WHAT`. Returns the output and the number
+/// of instructions executed.
 pub fn run_jam(program: &[u8], args: &[u8]) -> (Vec<u8>, u64) {
     let mut machine = Machine::load(program, args, GAS).expect("load");
     let mut steps = 0u64;
@@ -49,7 +53,10 @@ pub fn run_jam(program: &[u8], args: &[u8]) -> (Vec<u8>, u64) {
             }
         });
         match exit {
-            ExitReason::HostCall(_) => machine.registers_mut()[7] = WHAT,
+            ExitReason::HostCall(_) => {
+                assert!(machine.charge(UNKNOWN_CALL_GAS), "guest ran out of gas");
+                machine.registers_mut()[7] = WHAT;
+            }
             other => {
                 let invocation = machine.finish(other);
                 assert_eq!(invocation.exit, ExitReason::Halt, "guest did not halt");

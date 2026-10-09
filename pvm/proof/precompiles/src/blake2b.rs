@@ -1,8 +1,9 @@
 //! Blake2b precompile — guest shim for `ECALL_BLAKE2B_COMPRESS`.
 //!
-//! `blake2b_compress`: one compression per call.  On riscv64 dispatches
-//! to the ECALL; off-target falls through to the bundled software
-//! reference (matches `vos_pvm_proof::chips::blake2b::compress` byte-for-byte).
+//! `blake2b_compress`: one compression per call.  On riscv64 it calls the
+//! precompile and falls back to the bundled software reference when the
+//! host answers `WHAT`; off-target it runs the reference (which matches
+//! `vos_pvm_proof::chips::blake2b::compress` byte-for-byte).
 //!
 //! `blake2b_hash::<N>(domain, parts)`: streaming hash producing an
 //! N-byte digest (1..=64).  Matches the `blake2` crate's
@@ -28,41 +29,23 @@ const BLAKE2B_IV: [u64; 8] = [
 
 /// One blake2b compression: in-place update of `h` (64 bytes = 8 u64
 /// LE) by mixing in the message block `m` (128 bytes = 16 u64 LE)
-/// with byte counter `t` and finalize flag `f`.  On PVM dispatches
-/// to ECALL_BLAKE2B_COMPRESS; on host runs the reference.
+/// with byte counter `t` and finalize flag `f`. On the PVM it calls
+/// ECALL_BLAKE2B_COMPRESS and computes in software when the host does not
+/// serve it; off-target it runs the software reference.
 pub fn blake2b_compress(h: &mut [u8; 64], m: &[u8; 128], t: u128, f: bool) {
     #[cfg(target_arch = "riscv64")]
-    {
-        compress_pvm(h, m, t, f);
+    if crate::ecalls::call::<ECALL_BLAKE2B_COMPRESS>(
+        h.as_mut_ptr() as u64,
+        m.as_ptr() as u64,
+        t as u64,
+        f as u64,
+    ) {
+        return;
     }
-    #[cfg(not(target_arch = "riscv64"))]
-    {
-        compress_host(h, m, t, f);
-    }
+    compress_software(h, m, t, f);
 }
 
-#[cfg(target_arch = "riscv64")]
-fn compress_pvm(h: &mut [u8; 64], m: &[u8; 128], t: u128, f: bool) {
-    let h_ptr = h.as_mut_ptr() as u64;
-    let m_ptr = m.as_ptr() as u64;
-    let t_low = t as u64;
-    let f_flag: u64 = if f { 1 } else { 0 };
-    unsafe {
-        core::arch::asm!(
-            "csrw 0x801, zero",
-            "ecall",
-            in("t0") ECALL_BLAKE2B_COMPRESS as u64,
-            in("a0") h_ptr,
-            in("a1") m_ptr,
-            in("a2") t_low,
-            in("a3") f_flag,
-            options(nostack),
-        );
-    }
-}
-
-#[cfg(not(target_arch = "riscv64"))]
-fn compress_host(h: &mut [u8; 64], m: &[u8; 128], t: u128, f: bool) {
+fn compress_software(h: &mut [u8; 64], m: &[u8; 128], t: u128, f: bool) {
     let mut h_words = [0u64; 8];
     for i in 0..8 {
         h_words[i] = u64::from_le_bytes(h[i * 8..i * 8 + 8].try_into().unwrap());
@@ -77,7 +60,6 @@ fn compress_host(h: &mut [u8; 64], m: &[u8; 128], t: u128, f: bool) {
     }
 }
 
-#[cfg(not(target_arch = "riscv64"))]
 fn compress_inner(h: &[u64; 8], m: &[u64; 16], t: u128, f: bool) -> [u64; 8] {
     const SIGMA: [[usize; 16]; 12] = [
         [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],

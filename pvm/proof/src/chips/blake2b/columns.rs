@@ -241,7 +241,7 @@ pub enum Column {
     #[size = 64]
     OutAnd2,
     // ── ECALL memory binding ──────────────────────────
-    // HPtr / MPtr are the register values φ[10]/φ[11] at the ECALL step,
+    // HPtr / MPtr are the register values φ[7]/φ[8] at the ECALL step,
     // CallTs is its timestamp.  Inter-row equality keeps them constant
     // within a compression so the 256 byte-level memory lookups emitted
     // at IsFirstOfCompression reference well-defined values.

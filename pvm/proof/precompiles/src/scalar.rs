@@ -121,36 +121,20 @@ impl core::ops::Add<Scalar> for Scalar {
 pub fn scalar_mul_mod_l(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
     #[cfg(target_arch = "riscv64")]
     {
-        scalar_mul_mod_l_pvm(a, b)
+        let mut output = [0u8; 32];
+        if crate::ecalls::call::<ECALL_SCALAR_MUL_MOD_L>(
+            a.as_ptr() as u64,
+            b.as_ptr() as u64,
+            output.as_mut_ptr() as u64,
+            0,
+        ) {
+            return output;
+        }
     }
-    #[cfg(not(target_arch = "riscv64"))]
-    {
-        scalar_mul_mod_l_host(a, b)
-    }
+    scalar_mul_mod_l_software(a, b)
 }
 
-#[cfg(target_arch = "riscv64")]
-fn scalar_mul_mod_l_pvm(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
-    let mut output = [0u8; 32];
-    let a_ptr = a.as_ptr() as u64;
-    let b_ptr = b.as_ptr() as u64;
-    let output_ptr = output.as_mut_ptr() as u64;
-    unsafe {
-        core::arch::asm!(
-            "csrw 0x801, zero",
-            "ecall",
-            in("t0") ECALL_SCALAR_MUL_MOD_L as u64,
-            in("a0") a_ptr,
-            in("a1") b_ptr,
-            in("a2") output_ptr,
-            options(nostack),
-        );
-    }
-    output
-}
-
-#[cfg(not(target_arch = "riscv64"))]
-fn scalar_mul_mod_l_host(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
+fn scalar_mul_mod_l_software(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
     let sa = DalekScalar::from_canonical_bytes(*a).into_option();
     let sb = DalekScalar::from_canonical_bytes(*b).into_option();
     match (sa, sb) {
@@ -163,36 +147,20 @@ fn scalar_mul_mod_l_host(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
 pub fn scalar_add_mod_l(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
     #[cfg(target_arch = "riscv64")]
     {
-        scalar_add_mod_l_pvm(a, b)
+        let mut output = [0u8; 32];
+        if crate::ecalls::call::<ECALL_SCALAR_ADD_MOD_L>(
+            a.as_ptr() as u64,
+            b.as_ptr() as u64,
+            output.as_mut_ptr() as u64,
+            0,
+        ) {
+            return output;
+        }
     }
-    #[cfg(not(target_arch = "riscv64"))]
-    {
-        scalar_add_mod_l_host(a, b)
-    }
+    scalar_add_mod_l_software(a, b)
 }
 
-#[cfg(target_arch = "riscv64")]
-fn scalar_add_mod_l_pvm(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
-    let mut output = [0u8; 32];
-    let a_ptr = a.as_ptr() as u64;
-    let b_ptr = b.as_ptr() as u64;
-    let output_ptr = output.as_mut_ptr() as u64;
-    unsafe {
-        core::arch::asm!(
-            "csrw 0x801, zero",
-            "ecall",
-            in("t0") ECALL_SCALAR_ADD_MOD_L as u64,
-            in("a0") a_ptr,
-            in("a1") b_ptr,
-            in("a2") output_ptr,
-            options(nostack),
-        );
-    }
-    output
-}
-
-#[cfg(not(target_arch = "riscv64"))]
-fn scalar_add_mod_l_host(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
+fn scalar_add_mod_l_software(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
     let sa = DalekScalar::from_canonical_bytes(*a).into_option();
     let sb = DalekScalar::from_canonical_bytes(*b).into_option();
     match (sa, sb) {
@@ -204,41 +172,26 @@ fn scalar_add_mod_l_host(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
 /// Reduce 64 uniform-random bytes to a canonical scalar mod ℓ.
 /// Returns the canonical 32-byte little-endian encoding.  On a
 /// host build this delegates to `curve25519-dalek`'s
-/// `Scalar::from_bytes_mod_order_wide`; on a PVM build it issues
-/// `ecall ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE`.
+/// `Scalar::from_bytes_mod_order_wide`; on a PVM build it calls
+/// ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE and falls back to dalek when the
+/// host does not serve it.
 pub fn scalar_from_bytes_mod_order_wide(wide: &[u8; 64]) -> [u8; 32] {
     #[cfg(target_arch = "riscv64")]
     {
-        scalar_from_bytes_mod_order_wide_pvm(wide)
+        let mut output = [0u8; 32];
+        if crate::ecalls::call::<ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE>(
+            wide.as_ptr() as u64,
+            output.as_mut_ptr() as u64,
+            0,
+            0,
+        ) {
+            return output;
+        }
     }
-    #[cfg(not(target_arch = "riscv64"))]
-    {
-        scalar_from_bytes_mod_order_wide_host(wide)
-    }
+    scalar_from_bytes_mod_order_wide_software(wide)
 }
 
-#[cfg(target_arch = "riscv64")]
-fn scalar_from_bytes_mod_order_wide_pvm(wide: &[u8; 64]) -> [u8; 32] {
-    let mut output = [0u8; 32];
-    let wide_ptr = wide.as_ptr() as u64;
-    let output_ptr = output.as_mut_ptr() as u64;
-    unsafe {
-        core::arch::asm!(
-            "csrw 0x801, zero",
-            "ecall",
-            in("t0") ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE as u64,
-            in("a0") wide_ptr,
-            in("a1") output_ptr,
-            in("a2") 0u64,
-            in("a3") 0u64,
-            options(nostack),
-        );
-    }
-    output
-}
-
-#[cfg(not(target_arch = "riscv64"))]
-fn scalar_from_bytes_mod_order_wide_host(wide: &[u8; 64]) -> [u8; 32] {
+fn scalar_from_bytes_mod_order_wide_software(wide: &[u8; 64]) -> [u8; 32] {
     DalekScalar::from_bytes_mod_order_wide(wide).to_bytes()
 }
 

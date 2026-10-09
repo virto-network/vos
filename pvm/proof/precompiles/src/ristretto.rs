@@ -12,7 +12,6 @@
 
 use core::ops::Mul;
 use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint as DalekRistrettoPoint};
-#[cfg(not(target_arch = "riscv64"))]
 use curve25519_dalek::scalar::Scalar as DalekScalar;
 
 #[cfg(target_arch = "riscv64")]
@@ -138,37 +137,20 @@ fn basepoint_compressed_bytes() -> [u8; 32] {
 pub fn ristretto_scalar_mult(scalar: &[u8; 32], point: &[u8; 32]) -> [u8; 32] {
     #[cfg(target_arch = "riscv64")]
     {
-        ristretto_scalar_mult_pvm(scalar, point)
+        let mut output = [0u8; 32];
+        if crate::ecalls::call::<ECALL_RISTRETTO_SCALAR_MULT>(
+            scalar.as_ptr() as u64,
+            point.as_ptr() as u64,
+            output.as_mut_ptr() as u64,
+            0,
+        ) {
+            return output;
+        }
     }
-    #[cfg(not(target_arch = "riscv64"))]
-    {
-        ristretto_scalar_mult_host(scalar, point)
-    }
+    ristretto_scalar_mult_software(scalar, point)
 }
 
-#[cfg(target_arch = "riscv64")]
-fn ristretto_scalar_mult_pvm(scalar: &[u8; 32], point: &[u8; 32]) -> [u8; 32] {
-    let mut output = [0u8; 32];
-    let scalar_ptr = scalar.as_ptr() as u64;
-    let point_ptr = point.as_ptr() as u64;
-    let output_ptr = output.as_mut_ptr() as u64;
-    unsafe {
-        core::arch::asm!(
-            "csrw 0x801, zero",
-            "ecall",
-            in("t0") ECALL_RISTRETTO_SCALAR_MULT as u64,
-            in("a0") scalar_ptr,
-            in("a1") point_ptr,
-            in("a2") output_ptr,
-            in("a3") 0u64,
-            options(nostack),
-        );
-    }
-    output
-}
-
-#[cfg(not(target_arch = "riscv64"))]
-fn ristretto_scalar_mult_host(scalar: &[u8; 32], point: &[u8; 32]) -> [u8; 32] {
+fn ristretto_scalar_mult_software(scalar: &[u8; 32], point: &[u8; 32]) -> [u8; 32] {
     let s = match DalekScalar::from_canonical_bytes(*scalar).into_option() {
         Some(s) => s,
         None => return [0u8; 32],
@@ -189,37 +171,20 @@ fn ristretto_scalar_mult_host(scalar: &[u8; 32], point: &[u8; 32]) -> [u8; 32] {
 pub fn ristretto_point_add(p: &[u8; 32], q: &[u8; 32]) -> [u8; 32] {
     #[cfg(target_arch = "riscv64")]
     {
-        ristretto_point_add_pvm(p, q)
+        let mut output = [0u8; 32];
+        if crate::ecalls::call::<ECALL_RISTRETTO_POINT_ADD>(
+            p.as_ptr() as u64,
+            q.as_ptr() as u64,
+            output.as_mut_ptr() as u64,
+            0,
+        ) {
+            return output;
+        }
     }
-    #[cfg(not(target_arch = "riscv64"))]
-    {
-        ristretto_point_add_host(p, q)
-    }
+    ristretto_point_add_software(p, q)
 }
 
-#[cfg(target_arch = "riscv64")]
-fn ristretto_point_add_pvm(p: &[u8; 32], q: &[u8; 32]) -> [u8; 32] {
-    let mut output = [0u8; 32];
-    let p_ptr = p.as_ptr() as u64;
-    let q_ptr = q.as_ptr() as u64;
-    let output_ptr = output.as_mut_ptr() as u64;
-    unsafe {
-        core::arch::asm!(
-            "csrw 0x801, zero",
-            "ecall",
-            in("t0") ECALL_RISTRETTO_POINT_ADD as u64,
-            in("a0") p_ptr,
-            in("a1") q_ptr,
-            in("a2") output_ptr,
-            in("a3") 0u64,
-            options(nostack),
-        );
-    }
-    output
-}
-
-#[cfg(not(target_arch = "riscv64"))]
-fn ristretto_point_add_host(p: &[u8; 32], q: &[u8; 32]) -> [u8; 32] {
+fn ristretto_point_add_software(p: &[u8; 32], q: &[u8; 32]) -> [u8; 32] {
     let pp = match CompressedRistretto::from_slice(p)
         .ok()
         .and_then(|c| c.decompress())
