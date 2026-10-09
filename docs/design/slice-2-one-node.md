@@ -1,7 +1,9 @@
 # Slice 2: One node
 
-Plan v1 for build step 2 of `core-model.md` (section 16), on the slice 1
-PVM base. Tags as in the core model. This planning run also designs the
+Plan v2 for build step 2 of `core-model.md` (section 16), on the slice 1
+PVM base. v1 was reviewed by the second-opinion reviewer; v2 folds in its
+findings, and the decisions it leaves to the owner are listed at the end.
+Tags as in the core model. This planning run also designs the
 two items the core model left to it: the node host and native extensions
 (open question 18), and the actor framework's context API (open question
 5).
@@ -64,7 +66,7 @@ Out of scope:
 
 Wire types use the workspace's SCALE codec (`pvm/codec`), the encoding JAM
 uses, rather than master's rkyv: the agent's work result and accumulate
-operands are also what a JAM node carries.
+operands are also what a JAM node carries [owner decision 7].
 
 ## Host calls
 
@@ -80,9 +82,7 @@ The agent uses Gray Paper calls wherever JAM has one, and VOS extensions
 | `machine` … `expunge` | refine | 9–14 | served | served |
 | `instantiate` | refine | `0x480` | from the node's pool | `WHAT`: the agent's loader builds the machine |
 | `state_read` | refine | `0x481` | the agent's applied state, by key | `WHAT` until step 4's witnesses |
-| `read`, `write` | accumulate | Gray Paper; `write` is 5 | the agent's state in the LSM store | service storage |
-| `reply` | accumulate | `0x482` | queued for the client session, sent after the batch is durable | `WHAT`; a JAM client reads results from state |
-| `emit` | accumulate | `0x483` | a message into the receiver's inbox, with its pair sequence | `WHAT` until step 4 maps messages to transfers |
+| `read`, `write` | accumulate | Gray Paper; `write` is 5 | the agent's state in the LSM store, including its system keys | service storage |
 
 - Precompiles keep `0x400..=0x47f`.
 - Ids marked "Gray Paper" are pinned in step 2.1 against the 0.8.0
@@ -90,9 +90,15 @@ The agent uses Gray Paper calls wherever JAM has one, and VOS extensions
   `write` (5) and `log` (100) on PolkaJam.
 - Refine returns the encoded work result. Accumulate receives it through
   `fetch`, as JAM delivers work results to accumulate.
+- **Accumulate is pure Gray Paper calls** [owner decision 2]. Replies and
+  outgoing messages are `write`s to well-known system keys: the session's
+  reply window, and the outbox with its pair sequences. After the applied
+  batch is durable, the node sends what it contains. That gives "apply,
+  then send" by construction, identical code on JAM (where step 4 maps the
+  outbox to `transfer`), and no extension surface in accumulate.
 - On VOS, accumulate's `write` calls for one work result form one atomic
-  batch, together with the result itself, the session and pair marks, and
-  the applied index (section 9.5).
+  batch, together with the session and pair marks and the applied index
+  (section 9.5).
 
 ### Actor ABI: actor and agent [proposed]
 
@@ -113,6 +119,8 @@ does not serve with `WHAT`.
 | `scan(prefix, cursor, out, cap) -> len` | `0x513` | yes | yes | no |
 | `call(instance, method, args, out, cap) -> len` | `0x520` | yes | queries only | no |
 | `send(agent, instance, method, args)` | `0x521` | yes | no | no |
+| `attest(program, args, out, cap) -> len` | `0x522` | yes | no | no |
+| `self_id(buf) -> len` (instance and agent ids) | `0x523` | yes | yes | no |
 
 - **Requests reach the actor through `input`:** the agent copies the
   request into the actor's own buffer. No request page is mapped per call,
@@ -121,7 +129,26 @@ does not serve with `WHAT`.
   checks every call against this table. A call outside it fails the
   invocation, and with it the step.
 - **Attestable methods** get no ABI at all. Only precompiles run (section
-  11.1).
+  11.1). `attest` runs one as its own inner machine, unproven in this slice
+  and with its arguments only, until step 4's committed maps and step 5's
+  proofs [owner decision 3]. The call is recorded in the work result for
+  step 5.
+- **Every operation is priced** in the actor's gas, charged from its frame
+  before it is served, as precompiles are: a fixed price per operation
+  plus a price per byte copied. A step's gas limit then bounds the agent's
+  work too, not only the actor's. Prices are set from the measured serving
+  cost in 2.4 [proposed: 500 gas per operation, 1 gas per byte, until
+  measured].
+- **Per-step caps** [owner decision 5; proposed numbers]: request and
+  reply 64 KiB each; one value 64 KiB; a step's writes 256 KiB; one scan
+  64 KiB; 16 outgoing messages of 64 KiB each; a work result 4 MiB. They
+  are declared in `vos-wire`; an operation that would exceed one fails
+  the invocation.
+- **Raw ids:** an actor raising a JAM id (2, 9–14) or a node extension id
+  (`0x480`, `0x481`) gets `WHAT` from the agent, like any id it does not
+  serve, so the table is complete for raw calls.
+- **Call depth** is bounded by the 63 inner machines: a `call` that cannot
+  get a machine (`FULL`) fails.
 
 ## The actor SDK [proposed]
 
@@ -137,10 +164,12 @@ generated code targets the v2 service guest.
 - **Linear only** in this slice. An instance's struct is its state, stored
   encoded under one key and loaded per invocation. A command writes it
   back if it changed.
-- **`Table<K, V>`** keeps rows under the instance's prefix and a table
-  tag: point reads and writes, ordered scans with cursors. Memory follows
-  the touched rows. Large collections belong in tables, not in the struct,
-  whose whole encoding is read on every invocation.
+- **`Table<K, V>`** keeps rows under the instance's prefix and a tag
+  derived from the field's name, which survives reordering fields: point
+  reads and writes, ordered scans with cursors. Memory follows the touched
+  rows. A `Table` field is a handle, not data: the macro skips it when
+  encoding the struct. Large collections belong in tables, not in the
+  struct, whose whole encoding is read on every invocation.
 - `CommittedMap` waits for step 4's compressed root format.
 
 ### Contexts: the API [proposed; the owner decides]
@@ -151,15 +180,20 @@ mutating operation:
 ```rust
 impl Query<A> {        // &self handlers
     fn caller(&self) -> &Principal;
+    fn me(&self) -> (AgentId, InstanceId);
     fn now(&self) -> Timestamp;
     fn random(&self) -> [u8; 32];
+    fn log(&self, level: Level, message: &str);
     async fn call<R: ActorRef>(&self, to: R, msg: R::Query) -> Result<R::Reply, CallError>;
 }
 
 impl Command<A> {      // &mut self handlers; everything a query has, plus:
     async fn call<R: ActorRef>(&mut self, to: R, msg: R::Message) -> Result<R::Reply, CallError>;
     fn send<R: ActorRef>(&mut self, agent: AgentId, to: R, msg: R::Message);
+    fn attest<P: Attestable>(&mut self, args: P::Args) -> Result<P::Output, CallError>;
 }
+
+enum CallError { GasExhausted, Cycle, UnknownInstance, KindMismatch, Full, Failed(Error) }
 ```
 
 - `call` reaches an instance of the same agent, nested and synchronous
@@ -172,13 +206,25 @@ impl Command<A> {      // &mut self handlers; everything a query has, plus:
   `get`, `put` and `scan`.
 - Workflows (`Workflow`) and Merge handlers (`MergeContext`) arrive with
   their steps.
+- **Queries see the latest applied work result's time and seed,** so a
+  query's `now` and `random` are deterministic for the state version it
+  reads.
 
 ### Restrictions checked by the macros
 
 - An `#[attestable]` method takes no context, and touches only fields
   whose type is a committed map. Until step 4 brings `CommittedMap`, an
-  attestable method may touch only its arguments.
+  attestable method may touch only its arguments, and it compiles as its
+  own program, which `attest` runs.
 - A query handler (`&self`) cannot name a `Command`.
+
+### Roles [owner decision 6]
+
+`#[msg(role = …)]` needs the caller's role before dispatch. In this slice a
+per-agent membership table in the `system` partition maps principals to
+roles, set by the CLI. The agent reads it with `state_read` and checks the
+handler's role before invoking. The space catalog of step 2 or 3 replaces
+the CLI as its writer.
 
 ## The default agent [proposed]
 
@@ -188,28 +234,37 @@ impl Command<A> {      // &mut self handlers; everything a query has, plus:
    sessions, and messages from other agents, in their pair sequences.
 2. Dispatch inputs one at a time, in order (section 6.3). Each is one step.
 3. **Load the instance:** `instantiate(program hash)`, or on `WHAT` the
-   loader (`machine`, then `pages` and `poke`). Read its struct with
-   `state_read`.
-4. **Invoke** with the step's gas limit. Serve its ABI calls against the
-   step's overlay: reads check the overlay, then `state_read`; writes go
-   to the overlay.
+   loader (`machine`, then `pages` and `poke`). Read its struct through
+   the read chain below.
+4. **Invoke** with the step's gas limit. Serve its ABI calls against two
+   overlays:
+   - the **step overlay**, the current step's writes, discarded if the
+     step fails;
+   - the **batch overlay**, the writes of the steps already committed in
+     this refine, in order.
+
+   Reads go step overlay, then batch overlay, then `state_read`. Writes go
+   to the step overlay. Without the batch overlay, two transfers on one
+   account in one batch would both read the base balance.
 5. **Nested calls:** a `call` invokes the callee as its own inner machine,
    with gas drawn from the caller's remaining gas. An instance already on
    the call stack fails the call (cycle).
-6. **Finish the step:** on success the overlay, outgoing messages and
-   reply join the work result; on any trap the step's effects are
-   discarded and an error reply is recorded. The input is consumed either
-   way (section 8.1).
+6. **Finish the step:** on success the step overlay folds into the batch
+   overlay, and its writes, outgoing messages and reply join the work
+   result as that step's lists, in step order. On any trap the step's
+   effects are discarded and an error reply is recorded. The input is
+   consumed either way (section 8.1).
 7. A step is dispatched only if the refine's remaining gas covers its
    limit; otherwise it waits for the next batch.
 
-**Accumulate,** per work result: `write` each step's writes, advance the
-session and pair marks, record the replies in the session windows, and
-`emit` outgoing messages.
+**Accumulate,** per work result: `write` each step's writes in step order,
+advance the session and pair marks, and write the replies into the session
+windows and the outgoing messages into the outbox.
 
-**The version check** (section 7.5) is trivial on one node: a result is
-applied before the next refine starts. Pipelining refines needs the
-leader's overlay and arrives with slice 3.
+**The version check** (section 7.5) never fails on one node, since a result
+is applied before the next refine starts. The work result still carries
+the version it read from 2.1 on, so slice 3's check has a field to test.
+Pipelining refines needs the leader's overlay and arrives with slice 3.
 
 ## The node host [proposed]
 
@@ -224,12 +279,28 @@ This answers open question 18 for one node.
      node's inbox;
   2. close a batch by count, bytes or 1–5 ms;
   3. refine on an executor thread, with the node's machine pool;
-  4. hand the work result and accumulate's writes to the storage thread
-     as one batch, with the agent's log entry;
+  4. hand the agent's log entry and accumulate's apply batch to the
+     storage thread;
   5. after the storage thread reports it durable, send the replies and
-     deliver emitted messages.
+     deliver the outbox's messages from the applied batch.
 
   The storage thread groups batches from all agents into one fsync.
+- **The store API has two operations from the start:** `append(log
+  entries)` and `apply(batch with applied index)`. One node commits them
+  together; slice 3 commits the log entry by quorum before applying, and
+  applies without fsync (section 9.5). The `log` partition is keyed by
+  (agent, index) with a term field.
+- **Inter-agent messages** always go through the sender's outbox, with
+  pair sequences and acknowledgements, even on one node, so slice 3 only
+  changes the transport.
+- **Admission control** (section 7.1): a cap on queued inputs per agent,
+  with "busy" beyond it, and a gas budget per refine.
+- **Fairness:** an agent holds at most one executor at a time, and its
+  refine's gas budget bounds how long. A long computation therefore delays
+  only its own agent.
+- **Reads** (`state_read`, queries) run on executor threads against fjall
+  snapshots, which are thread-safe. The storage thread owns writes and
+  fsyncs only.
 - **Storage** (item 14): one fjall keyspace; partitions `state` (Linear
   rows under agent prefixes), `system` (sessions, pair marks, outbox),
   `log` (agent, index → work result), `programs` (package blobs by hash).
@@ -253,6 +324,10 @@ This answers open question 18 for one node.
   ahead of the oldest kept reply waits. Expiry follows work-result time.
 - Bodies are SCALE bytes in this slice. JSON, through the package schema,
   is for the CLI and later clients [open].
+- **Defaults** [owner decision 4; proposed]: a reply window W of 64 per
+  (session, agent); sessions expire after one hour of work-result time
+  without a request; a handler's gas limit is 10M by default, declared per
+  handler in the schema; a refine's budget is 1G gas.
 
 ## Packages [proposed, minimal]
 
@@ -267,10 +342,15 @@ this slice. Signatures, licensing and upgrades come later.
 
 - `vos-wire`: ids, inputs, the work result, accumulate operands, ABI
   numbers, errors, all SCALE-coded, with round-trip property tests.
-- The refine host calls `state_read` and the accumulate calls `reply` and
-  `emit` in `vos_pvm`'s refine host, with their JAM fallbacks.
+- The refine host call `state_read`, with its JAM fallback, in `vos_pvm`'s
+  refine host; the Gray Paper ids pinned by test.
 - An accumulate host (`vos_pvm::accumulate_host`) with `fetch`, `read`,
-  `write`, `gas`, `log`, `reply`, `emit`.
+  `write`, `gas` and `log`.
+- **The JAM-only host:** the same refine and accumulate hosts with every
+  VOS extension answering `WHAT`. The default agent runs against it from
+  2.4 on.
+- The work result's fields, including the version read, per-step lists and
+  the `attest` record; the per-step caps; the ABI prices.
 
 ### 2.2 Storage (item 14)
 
@@ -292,11 +372,22 @@ this slice. Signatures, licensing and upgrades come later.
 
 - Refine and accumulate as above, as a standard program built with the
   slice 1 toolchain.
-- **Tests:** a failed step consumes its input and discards its effects; a
-  nested call draws its caller's gas; a cycle fails; an ABI call outside
-  the invocation's kind fails it; an unknown id answers `WHAT`.
+- **Tests:**
+  - a failed step consumes its input and discards its effects;
+  - a later step in a batch sees an earlier step's writes;
+  - a nested call draws its caller's gas, and every ABI operation is
+    charged;
+  - a cycle fails, and so does a call that cannot get a machine;
+  - an ABI call outside the invocation's kind fails it, and an unknown id
+    answers `WHAT`;
+  - each per-step cap fails the invocation when exceeded;
+  - a handler whose role the caller lacks is refused before invocation.
 - **A differential test** against a reference model of the agent's
-  semantics over random batches: reply, state and consumed inputs agree.
+  semantics over random batches: replies, state and consumed inputs
+  agree. The model encodes the two-level overlay, the one property it most
+  needs to check.
+- **On the JAM-only host,** the same tests run through the loader and with
+  no `state_read`, for the batches that need no prior state.
 
 ### 2.5 The node host
 
@@ -304,7 +395,8 @@ this slice. Signatures, licensing and upgrades come later.
 - One node, many agents: messages between them through the inbox, with
   pair sequences and acknowledgements.
 - **Tests:** apply-then-send (no reply before durability); crash and
-  restart recover the applied index and resend nothing twice.
+  restart recover the applied index and resend nothing twice; "busy"
+  beyond the queued-input cap.
 
 ### 2.6 Sessions, ingress and the CLI
 
@@ -315,16 +407,13 @@ this slice. Signatures, licensing and upgrades come later.
 
 ### 2.7 The JAM host-call CI harness
 
-- A JAM-only host: Gray Paper refine and accumulate calls; every VOS
-  extension answers `WHAT`.
-- **Checks:**
-  - the agent and actor programs call only JAM calls and VOS extensions
-    with a documented fallback (static);
-  - a batch that needs no prior state gives the same work result on the
-    JAM-only host as on VOS, through the loader and software precompiles
-    (dynamic);
-  - stateful refines follow with step 4's witnesses.
-- Runs in `ci`.
+The JAM-only host exists from 2.1 and the agent's tests run on it from
+2.4. This step adds:
+
+- a static check that the agent and actor programs call only JAM calls and
+  VOS extensions with a documented fallback;
+- the dynamic comparison of work results between VOS and the JAM-only host
+  in `ci`. Stateful refines follow with step 4's witnesses.
 
 ### 2.8 JIT host-call exit cost (item 6)
 
@@ -342,6 +431,7 @@ Measure against section 14, on one node with storage:
 | Pooled actor acquire, use and reset (slice 1's carried gate) | ≤ 5 µs, JIT included |
 | Table point read or write at 10M rows | ≤ 5 µs |
 | Query | ≤ 100 µs |
+| Per-step caps, admission ("busy"), reply window and expiry | each enforced, in tests |
 
 ## Gates
 
@@ -367,9 +457,33 @@ Measure against section 14, on one node with storage:
 - **Run-time enforcement and nested gas** sit in the agent program, which
   is guest code: a bug there is a bug in every agent. The differential
   test and the enforcement tests are the guard.
+- **ABI prices** are placeholders until 2.4 measures the serving cost; set
+  too low, a step's limit stops bounding the agent's work.
 
 ## Carried in from slice 1
 
 - Request delivery that keeps the JIT's pooled cycle within 5 µs: `input`
   copies requests, so no page is mapped per call.
 - `state_read` writes join the pool's property test.
+
+## Decisions for the owner
+
+The reviewer and I recommend the first option of each.
+
+1. **The context API** in "Contexts" as proposed, or changes to it.
+2. **Replies and messages in accumulate:** `write`s to system keys, with
+   accumulate on pure Gray Paper calls; or dedicated `reply` and `emit`
+   host calls.
+3. **`attest` in this slice,** unproven and with arguments only; or no
+   call to attestable methods until step 5.
+4. **Defaults:** reply window 64, session expiry one hour, handler gas 10M,
+   refine budget 1G (open questions 14 and 16).
+5. **Per-step caps:** the numbers under "Actor ABI".
+6. **Roles:** a per-agent membership table in `system`, set by the CLI,
+   until the space catalog.
+7. **SCALE** (the JAM encoding) for wire types, instead of master's rkyv.
+
+Technical choices the review accepted as they are: the private ABI id
+block, `input` copying requests, Gray Paper calls wherever JAM has them,
+the thread model, extensions as message-addressed services, the fjall
+partitions, queries in query mode, and the crate split.
