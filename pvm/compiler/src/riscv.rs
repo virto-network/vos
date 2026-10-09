@@ -246,7 +246,7 @@ impl TranslationContext {
                 // Branch
                 let imm = decode_b_imm(inst);
                 let target = (_addr as i64 + imm as i64) as u64;
-                self.translate_branch(funct3, rs1, rs2, target)?;
+                self.translate_branch(funct3, rs1, rs2, target, _addr)?;
             }
             0x03 => {
                 // Load
@@ -256,7 +256,7 @@ impl TranslationContext {
             0x23 => {
                 // Store
                 let imm = decode_s_imm(inst);
-                self.translate_store(funct3, rs1, rs2, imm)?;
+                self.translate_store(funct3, rs1, rs2, imm, _addr)?;
             }
             0x13 => {
                 // OP-IMM (add_i, xor_i, etc.)
@@ -274,7 +274,7 @@ impl TranslationContext {
             }
             0x3B => {
                 // OP-32 (addw, subw, etc.) — RV64 only
-                self.translate_op_32(funct3, funct7, rd, rs1, rs2)?;
+                self.translate_op_32(funct3, funct7, rd, rs1, rs2, _addr)?;
             }
             0x73 => {
                 // SYSTEM
@@ -415,6 +415,24 @@ impl TranslationContext {
             }
         }
 
+        // Base x0: the absolute address `imm`. A 12-bit address is code only
+        // if a section was linked there; otherwise the jump traps.
+        if rs1 == 0 {
+            let target = i64::from(imm) as u64;
+            let is_code = self
+                .code_ranges
+                .iter()
+                .any(|&(lo, hi)| target >= lo && target < hi);
+            if !is_code {
+                self.emit_inst(0); // trap
+            } else if rd == 0 {
+                self.emit_jump(target);
+            } else {
+                self.emit_call(rd, addr + 4, target)?;
+            }
+            return Ok(());
+        }
+
         // Plain JALR (no preceding auipc, or auipc was for different reg)
         if rd == 0 {
             // Tail call or return: jump_ind without saving return address.
@@ -451,6 +469,7 @@ impl TranslationContext {
         rs1: u8,
         rs2: u8,
         target: u64,
+        addr: u64,
     ) -> Result<(), TranspileError> {
         // Fuse load_imm + branch: if one operand was just loaded via load_imm,
         // use the immediate branch form instead of a two-register branch.
@@ -498,6 +517,23 @@ impl TranslationContext {
             }
         }
         // Couldn't fuse — load_imm was already emitted, just clear tracking
+
+        // Both operands x0: the outcome is static. BEQ, BGE and BGEU always
+        // branch and become a jump; BNE, BLT and BLTU never do and emit
+        // nothing. Neither may read PVM register 0, which holds RA.
+        if rs1 == 0 && rs2 == 0 {
+            match funct3 {
+                0 | 5 | 7 => self.emit_jump(target),
+                1 | 4 | 6 => {}
+                _ => {
+                    return Err(TranspileError::UnsupportedInstruction {
+                        offset: addr as usize,
+                        detail: format!("branch funct3={funct3}"),
+                    });
+                }
+            }
+            return Ok(());
+        }
 
         // When one operand is x0 (zero register), use immediate branch variants
         // since PVM register 0 = RA, not zero.
@@ -630,6 +666,30 @@ impl TranslationContext {
         }
         // Couldn't fuse — load_imm already emitted, just proceed
 
+        // Base x0: a load from the absolute address `imm`.
+        if rs1 == 0 {
+            let opcode = match funct3 {
+                0 => 53, // LB → load_i8
+                1 => 55, // LH → load_i16
+                2 => 57, // LW → load_i32
+                3 => 58, // LD → load_u64
+                4 => 52, // LBU → load_u8
+                5 => 54, // LHU → load_u16
+                6 => 56, // LWU → load_u32
+                _ => {
+                    return Err(TranspileError::UnsupportedInstruction {
+                        offset: addr as usize,
+                        detail: format!("load funct3={funct3}"),
+                    });
+                }
+            };
+            let pvm_rd = self.require_reg(rd)?;
+            self.emit_inst(opcode);
+            self.emit_data(pvm_rd);
+            self.emit_var_imm(imm);
+            return Ok(());
+        }
+
         let pvm_rd = self.require_reg(rd)?;
         let pvm_rs1 = self.require_reg(rs1)?;
 
@@ -663,12 +723,51 @@ impl TranslationContext {
         rs1: u8,
         rs2: u8,
         imm: i32,
+        addr: u64,
     ) -> Result<(), TranspileError> {
         // A store does not overwrite its base register. Removing a preceding
         // `load_imm base, address` is therefore unsound without whole-block
         // liveness: a later load/store may reuse `base`. Keep the already
         // emitted address load and only clear the adjacent-fusion candidate.
         self.pending_load_imm = None;
+
+        // Base x0: a store to the absolute address `imm`.
+        if rs1 == 0 {
+            let unsupported = || TranspileError::UnsupportedInstruction {
+                offset: addr as usize,
+                detail: format!("store funct3={funct3}"),
+            };
+            if rs2 == 0 {
+                // store_imm_u* [imm], 0: TwoImm, the address first.
+                let opcode = match funct3 {
+                    0 => 30,
+                    1 => 31,
+                    2 => 32,
+                    3 => 33,
+                    _ => return Err(unsupported()),
+                };
+                let (lx, address) = encode_var_imm(imm);
+                self.emit_inst(opcode);
+                self.emit_data(lx);
+                for byte in address {
+                    self.emit_data(byte);
+                }
+            } else {
+                // store_u* [imm], rs2
+                let opcode = match funct3 {
+                    0 => 59,
+                    1 => 60,
+                    2 => 61,
+                    3 => 62,
+                    _ => return Err(unsupported()),
+                };
+                let pvm_rs2 = self.require_reg(rs2)?;
+                self.emit_inst(opcode);
+                self.emit_data(pvm_rs2);
+                self.emit_var_imm(imm);
+            }
+            return Ok(());
+        }
 
         // x0 (zero register) has no PVM equivalent — PVM reg 0 is RA, not zero.
         // Use store_imm_ind_* to store a literal zero instead.
@@ -924,6 +1023,112 @@ impl TranslationContext {
         Ok(())
     }
 
+    /// An OP whose source is x0: fold it to a constant, a move or a
+    /// one-register form, as RISC-V defines it (division by zero gives all
+    /// ones, remainder by zero the dividend).
+    fn translate_op_with_zero(
+        &mut self,
+        funct3: u32,
+        funct7: u32,
+        rd: u8,
+        rs1: u8,
+        rs2: u8,
+        addr: u64,
+    ) -> Result<(), TranspileError> {
+        let unhandled = || TranspileError::UnsupportedInstruction {
+            offset: addr as usize,
+            detail: format!("unhandled x0 op: funct7={funct7:#x} funct3={funct3}"),
+        };
+        let pvm_rd = self.require_reg(rd)?;
+        let mov = |this: &mut Self, from: u8| -> Result<(), TranspileError> {
+            let pvm_from = this.require_reg(from)?;
+            this.emit_inst(100); // move_reg
+            this.emit_data(pvm_rd | (pvm_from << 4));
+            Ok(())
+        };
+        if rs1 == 0 && rs2 == 0 {
+            let value = match (funct7, funct3) {
+                (1, 4) | (1, 5) => -1, // DIV/DIVU by zero
+                (0, _) | (0x20, 0) | (0x20, 5) | (1, _) => 0,
+                _ => return Err(unhandled()),
+            };
+            return self.emit_load_imm(rd, value);
+        }
+        if rs1 == 0 {
+            let pvm_rs2 = self.require_reg(rs2)?;
+            match (funct7, funct3) {
+                // ADD/XOR/OR rd, x0, rs2 → rs2
+                (0, 0) | (0, 4) | (0, 6) => mov(self, rs2)?,
+                // SUB rd, x0, rs2 → 0 - rs2
+                (0x20, 0) => {
+                    let neg_op = if self.is_64bit { 154 } else { 141 }; // neg_add_imm
+                    self.emit_inst(neg_op);
+                    self.emit_data(pvm_rd | (pvm_rs2 << 4));
+                    self.emit_var_imm(0);
+                }
+                // Shifts of zero, AND with zero, products and remainders of
+                // zero are zero.
+                (0, 1) | (0, 5) | (0x20, 5) | (0, 7) | (1, 0..=3) | (1, 6) | (1, 7) => {
+                    self.emit_load_imm(rd, 0)?;
+                }
+                // SLT rd, x0, rs2 → rs2 > 0 (signed)
+                (0, 2) => {
+                    self.emit_inst(143); // set_gt_s_imm
+                    self.emit_data(pvm_rd | (pvm_rs2 << 4));
+                    self.emit_var_imm(0);
+                }
+                // SLTU rd, x0, rs2 → rs2 != 0
+                (0, 3) => {
+                    if pvm_rd != pvm_rs2 {
+                        self.emit_load_imm(rd, 0)?;
+                    }
+                    self.emit_inst(148); // cmov_nz_imm: if rs2 != 0 then rd = imm
+                    self.emit_data(pvm_rd | (pvm_rs2 << 4));
+                    self.emit_var_imm(1);
+                }
+                // DIV/DIVU rd, x0, rs2 → all ones when rs2 is zero, else 0:
+                // rd = 0 - (rs2 <u 1).
+                (1, 4) | (1, 5) => {
+                    self.emit_inst(136); // set_lt_u_imm
+                    self.emit_data(pvm_rd | (pvm_rs2 << 4));
+                    self.emit_var_imm(1);
+                    let neg_op = if self.is_64bit { 154 } else { 141 }; // neg_add_imm
+                    self.emit_inst(neg_op);
+                    self.emit_data(pvm_rd | (pvm_rd << 4));
+                    self.emit_var_imm(0);
+                }
+                _ => return Err(unhandled()),
+            }
+            return Ok(());
+        }
+        let pvm_rs1 = self.require_reg(rs1)?;
+        match (funct7, funct3) {
+            // ADD/SUB/XOR/OR and shifts by zero, remainders by zero → rs1
+            (0, 0)
+            | (0x20, 0)
+            | (0, 4)
+            | (0, 6)
+            | (0, 1)
+            | (0, 5)
+            | (0x20, 5)
+            | (1, 6)
+            | (1, 7) => {
+                mov(self, rs1)?;
+            }
+            // SLT rd, rs1, x0 → rs1 < 0 (signed); SLTU is always 0.
+            (0, 2) => {
+                self.emit_inst(137); // set_lt_s_imm
+                self.emit_data(pvm_rd | (pvm_rs1 << 4));
+                self.emit_var_imm(0);
+            }
+            (0, 3) | (0, 7) | (1, 0..=3) => self.emit_load_imm(rd, 0)?,
+            // DIV/DIVU by zero → all ones
+            (1, 4) | (1, 5) => self.emit_load_imm(rd, -1)?,
+            _ => return Err(unhandled()),
+        }
+        Ok(())
+    }
+
     fn translate_op(
         &mut self,
         funct3: u32,
@@ -1055,130 +1260,10 @@ impl TranslationContext {
         }
         // Couldn't fuse — load_imm is already emitted, just proceed normally
 
-        // Handle x0 as source: PVM reg 0 = RA, not zero.
-        if rs1 == 0 && funct7 == 0 && funct3 == 0 {
-            // add rd, x0, rs2 → mv rd, rs2
-            let pvm_rd = self.require_reg(rd)?;
-            let pvm_rs2 = self.require_reg(rs2)?;
-            self.emit_inst(100); // move_reg
-            self.emit_data(pvm_rd | (pvm_rs2 << 4));
-            return Ok(());
-        }
-        if rs2 == 0 && funct7 == 0 && funct3 == 0 {
-            // add rd, rs1, x0 → mv rd, rs1
-            let pvm_rd = self.require_reg(rd)?;
-            let pvm_rs1 = self.require_reg(rs1)?;
-            self.emit_inst(100); // move_reg
-            self.emit_data(pvm_rd | (pvm_rs1 << 4));
-            return Ok(());
-        }
-        // SUB rd, x0, rs2 → neg rd, rs2
-        if rs1 == 0 && funct7 == 0x20 && funct3 == 0 {
-            let pvm_rd = self.require_reg(rd)?;
-            let pvm_rs2 = self.require_reg(rs2)?;
-            let neg_op = if self.is_64bit { 154 } else { 141 }; // neg_add_imm_64/32
-            self.emit_inst(neg_op);
-            self.emit_data(pvm_rd | (pvm_rs2 << 4));
-            self.emit_var_imm(0);
-            return Ok(());
-        }
-        // Handle remaining x0 source cases
-        if rs1 == 0 {
-            let pvm_rd = self.require_reg(rd)?;
-            let pvm_rs2 = self.require_reg(rs2)?;
-            match (funct7, funct3) {
-                (0, 1) | (0, 5) | (0x20, 5) => {
-                    // SLL/SRL/SRA rd, x0, rs2 → shift 0 by rs2 = 0
-                    return self.emit_load_imm(rd, 0);
-                }
-                (0, 4) | (0, 6) => {
-                    // XOR/OR rd, x0, rs2 → rs2
-                    self.emit_inst(100); // move_reg
-                    self.emit_data(pvm_rd | (pvm_rs2 << 4));
-                    return Ok(());
-                }
-                (0, 7) => {
-                    // AND rd, x0, rs2 → 0
-                    return self.emit_load_imm(rd, 0);
-                }
-                (0, 2) => {
-                    // SLT rd, x0, rs2 → sgtz rd, rs2 (signed)
-                    // rd = 1 if 0 < rs2 signed, else 0.
-                    // PVM `set_gt_s_imm rd, reg, imm` encodes
-                    // "rd = (reg > imm) signed"; with imm=0 this
-                    // is "rd = (rs2 > 0) signed" = SLT rd, x0, rs2.
-                    self.emit_inst(143); // set_gt_s_imm
-                    self.emit_data(pvm_rd | (pvm_rs2 << 4));
-                    self.emit_var_imm(0);
-                    return Ok(());
-                }
-                (0, 3) => {
-                    // SLTU rd, x0, rs2 → snez rd, rs2
-                    // When rd == rs2, skip the load_imm to avoid clobbering
-                    // the value before the conditional check.
-                    if pvm_rd != pvm_rs2 {
-                        self.emit_load_imm(rd, 0)?;
-                    }
-                    self.emit_inst(148); // cmov_nz_imm: if rs2 != 0 then rd = imm
-                    self.emit_data(pvm_rd | (pvm_rs2 << 4));
-                    self.emit_var_imm(1);
-                    return Ok(());
-                }
-                (1, _) => {
-                    // M extension with x0 → result is 0
-                    return self.emit_load_imm(rd, 0);
-                }
-                _ => {
-                    return Err(TranspileError::UnsupportedInstruction {
-                        offset: addr as usize,
-                        detail: format!(
-                            "unhandled x0-as-rs1 op: funct7={funct7:#x} funct3={funct3}"
-                        ),
-                    });
-                }
-            }
-        }
-        if rs2 == 0 {
-            let pvm_rd = self.require_reg(rd)?;
-            let pvm_rs1 = self.require_reg(rs1)?;
-            match (funct7, funct3) {
-                (0, 2) | (0, 3) => {
-                    // slt(u) rd, rs1, x0 → set_lt_(s|u)_imm rd, rs1, 0
-                    let pvm_opcode = if funct3 == 2 { 137 } else { 136 };
-                    self.emit_inst(pvm_opcode);
-                    self.emit_data(pvm_rd | (pvm_rs1 << 4));
-                    self.emit_var_imm(0);
-                    return Ok(());
-                }
-                (0x20, 0) | (0, 4) | (0, 6) => {
-                    // SUB/XOR/OR rd, rs1, x0 → rs1 op 0 = rs1 → move
-                    self.emit_inst(100); // move_reg
-                    self.emit_data(pvm_rd | (pvm_rs1 << 4));
-                    return Ok(());
-                }
-                (0, 7) => {
-                    // AND rd, rs1, x0 → 0
-                    return self.emit_load_imm(rd, 0);
-                }
-                (0, 1) | (0, 5) | (0x20, 5) => {
-                    // SLL/SRL/SRA rd, rs1, x0 → shift by 0 = rs1 → move
-                    self.emit_inst(100); // move_reg
-                    self.emit_data(pvm_rd | (pvm_rs1 << 4));
-                    return Ok(());
-                }
-                (1, _) => {
-                    // M extension: mul rd, rs1, 0 = 0; div/rem by 0 is undefined
-                    return self.emit_load_imm(rd, 0);
-                }
-                _ => {
-                    return Err(TranspileError::UnsupportedInstruction {
-                        offset: addr as usize,
-                        detail: format!(
-                            "unhandled x0-as-rs2 op: funct7={funct7:#x} funct3={funct3}"
-                        ),
-                    });
-                }
-            }
+        // An x0 source reads zero, but PVM register 0 holds RA: no operand
+        // below may name it.
+        if rs1 == 0 || rs2 == 0 {
+            return self.translate_op_with_zero(funct3, funct7, rd, rs1, rs2, addr);
         }
 
         let pvm_rd = self.require_reg(rd)?;
@@ -1462,6 +1547,84 @@ impl TranslationContext {
         Ok(())
     }
 
+    /// An OP-32 whose source is x0, as [`Self::translate_op_with_zero`]:
+    /// results are the low 32 bits, sign-extended.
+    fn translate_op_32_with_zero(
+        &mut self,
+        funct3: u32,
+        funct7: u32,
+        rd: u8,
+        rs1: u8,
+        rs2: u8,
+        addr: u64,
+    ) -> Result<(), TranspileError> {
+        let unhandled = || TranspileError::UnsupportedInstruction {
+            offset: addr as usize,
+            detail: format!("unhandled x0 OP-32: funct7={funct7:#x} funct3={funct3}"),
+        };
+        let pvm_rd = self.require_reg(rd)?;
+        // rd = sign-extended low 32 bits of `from`.
+        let sext = |this: &mut Self, from: u8| -> Result<(), TranspileError> {
+            let pvm_from = this.require_reg(from)?;
+            this.emit_inst(131); // add_imm_32
+            this.emit_data(pvm_rd | (pvm_from << 4));
+            this.emit_var_imm(0);
+            Ok(())
+        };
+        if rs1 == 0 && rs2 == 0 {
+            let value = match (funct7, funct3) {
+                (1, 4) | (1, 5) => -1, // DIVW/DIVUW by zero
+                (0, 0) | (0x20, 0) | (0, 1) | (0, 5) | (0x20, 5) | (1, 0) | (1, 6) | (1, 7) => 0,
+                (0x04, 4) => 0, // PACKW of zeros
+                _ => return Err(unhandled()),
+            };
+            return self.emit_load_imm(rd, value);
+        }
+        if rs1 == 0 {
+            let pvm_rs2 = self.require_reg(rs2)?;
+            match (funct7, funct3) {
+                (0, 0) => sext(self, rs2)?, // ADDW rd, x0, rs2
+                (0x20, 0) => {
+                    // SUBW rd, x0, rs2 → negw
+                    self.emit_inst(141); // neg_add_imm_32
+                    self.emit_data(pvm_rd | (pvm_rs2 << 4));
+                    self.emit_var_imm(0);
+                }
+                (0, 1) | (0, 5) | (0x20, 5) | (1, 0) | (1, 6) | (1, 7) => {
+                    self.emit_load_imm(rd, 0)?;
+                }
+                // DIVW/DIVUW rd, x0, rs2 → all ones when rs2's low word is
+                // zero, else 0.
+                (1, 4) | (1, 5) => {
+                    sext(self, rs2)?;
+                    self.emit_inst(136); // set_lt_u_imm
+                    self.emit_data(pvm_rd | (pvm_rd << 4));
+                    self.emit_var_imm(1);
+                    self.emit_inst(154); // neg_add_imm_64
+                    self.emit_data(pvm_rd | (pvm_rd << 4));
+                    self.emit_var_imm(0);
+                }
+                _ => return Err(unhandled()),
+            }
+            return Ok(());
+        }
+        let pvm_rs1 = self.require_reg(rs1)?;
+        match (funct7, funct3) {
+            // ADDW/SUBW, shifts by zero and remainders by zero → sext(rs1)
+            (0, 0) | (0x20, 0) | (0, 1) | (0, 5) | (0x20, 5) | (1, 6) | (1, 7) => sext(self, rs1)?,
+            (1, 0) => self.emit_load_imm(rd, 0)?,
+            (1, 4) | (1, 5) => self.emit_load_imm(rd, -1)?,
+            (0x04, 4) => {
+                // PACKW rd, rs1, x0 = ZEXT.H rd, rs1 (Zbb)
+                self.emit_inst(132); // and_imm
+                self.emit_data(pvm_rd | (pvm_rs1 << 4));
+                self.emit_var_imm(0xFFFF);
+            }
+            _ => return Err(unhandled()),
+        }
+        Ok(())
+    }
+
     fn translate_op_32(
         &mut self,
         funct3: u32,
@@ -1469,6 +1632,7 @@ impl TranslationContext {
         rd: u8,
         rs1: u8,
         rs2: u8,
+        addr: u64,
     ) -> Result<(), TranspileError> {
         if rd == 0 {
             return Ok(());
@@ -1539,66 +1703,10 @@ impl TranslationContext {
         }
         // Couldn't fuse
 
-        // Handle x0 as source: PVM reg 0 = RA, not zero.
-        if rs1 == 0 {
-            let pvm_rd = self.require_reg(rd)?;
-            let pvm_rs2 = self.require_reg(rs2)?;
-            match (funct7, funct3) {
-                (0, 0) => {
-                    // ADDW rd, x0, rs2 → sext.w rd, rs2 (sign-extend lower 32 bits)
-                    self.emit_inst(131); // add_imm_32
-                    self.emit_data(pvm_rd | (pvm_rs2 << 4));
-                    self.emit_var_imm(0);
-                    return Ok(());
-                }
-                (0x20, 0) => {
-                    // SUBW rd, x0, rs2 → negw rd, rs2
-                    self.emit_inst(141); // neg_add_imm_32
-                    self.emit_data(pvm_rd | (pvm_rs2 << 4));
-                    self.emit_var_imm(0);
-                    return Ok(());
-                }
-                _ => {
-                    return Err(TranspileError::UnsupportedInstruction {
-                        offset: 0,
-                        detail: format!("OP-32 x0-as-rs1: funct7={funct7:#x} funct3={funct3}"),
-                    });
-                }
-            }
-        }
-        if rs2 == 0 {
-            let pvm_rd = self.require_reg(rd)?;
-            let pvm_rs1 = self.require_reg(rs1)?;
-            match (funct7, funct3) {
-                (0, 0) => {
-                    // ADDW rd, rs1, x0 → sext.w rd, rs1
-                    self.emit_inst(131); // add_imm_32
-                    self.emit_data(pvm_rd | (pvm_rs1 << 4));
-                    self.emit_var_imm(0);
-                    return Ok(());
-                }
-                (0x20, 0) => {
-                    // SUBW rd, rs1, x0 → sext.w rd, rs1 (subtract zero)
-                    self.emit_inst(131); // add_imm_32
-                    self.emit_data(pvm_rd | (pvm_rs1 << 4));
-                    self.emit_var_imm(0);
-                    return Ok(());
-                }
-                (0x04, 4) => {
-                    // PACKW rd, rs1, x0 = ZEXT.H rd, rs1 (Zbb: zero-extend halfword)
-                    // rd = rs1 & 0xFFFF
-                    self.emit_inst(70); // and_imm
-                    self.emit_data(pvm_rd | (pvm_rs1 << 4));
-                    self.emit_var_imm(0xFFFF);
-                    return Ok(());
-                }
-                _ => {
-                    return Err(TranspileError::UnsupportedInstruction {
-                        offset: 0,
-                        detail: format!("OP-32 x0-as-rs2: funct7={funct7:#x} funct3={funct3}"),
-                    });
-                }
-            }
+        // An x0 source reads zero, but PVM register 0 holds RA: no operand
+        // below may name it.
+        if rs1 == 0 || rs2 == 0 {
+            return self.translate_op_32_with_zero(funct3, funct7, rd, rs1, rs2, addr);
         }
 
         let pvm_rd = self.require_reg(rd)?;
@@ -1680,11 +1788,11 @@ impl TranslationContext {
 
     // ===== Helpers =====
 
+    /// The PVM register for a RISC-V register other than x0. x0 has none:
+    /// PVM register 0 holds the return address, so every caller handles x0
+    /// itself, as a zero source or a discarded result.
     pub(crate) fn require_reg(&self, rv_reg: u8) -> Result<u8, TranspileError> {
-        match map_register(rv_reg)? {
-            Some(r) => Ok(r),
-            None => Ok(0), // x0 → use reg 0 and ignore writes
-        }
+        map_register(rv_reg)?.ok_or(TranspileError::RegisterMapping(rv_reg))
     }
 
     pub(crate) fn emit_inst(&mut self, opcode: u8) {
@@ -2242,7 +2350,7 @@ mod tests {
             3,  /* SD */
             10, /* base: a0 */
             11, /* value: a1 */
-            0,
+            0, 0,
         )
         .unwrap();
 

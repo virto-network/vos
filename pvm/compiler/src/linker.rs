@@ -164,8 +164,11 @@ fn zone_round(x: u64) -> u64 {
 /// placement need no linker cooperation (code addresses are translated;
 /// the stack is SP-relative).
 pub fn link_elf_spi(elf_data: &[u8]) -> Result<Vec<u8>, TranspileError> {
-    let t = transpile_elf(elf_data)?;
+    spi_blob(transpile_elf(elf_data)?)
+}
 
+/// Lay translated code and data out as a standard program.
+fn spi_blob(t: TranspiledElf) -> Result<Vec<u8>, TranspileError> {
     // Re-base the ro blob from its linked base to the GP ro base Z_Z.
     let ro_data = if t.ro_data.is_empty() {
         Vec::new()
@@ -263,7 +266,12 @@ pub fn link_elf_spi(elf_data: &[u8]) -> Result<Vec<u8>, TranspileError> {
 
 /// Translate an ELF into a GP-encoded program and its data sections.
 fn transpile_elf(elf_data: &[u8]) -> Result<TranspiledElf, TranspileError> {
-    let elf = parse_linked_elf(elf_data)?;
+    transpile_linked(&parse_linked_elf(elf_data)?)
+}
+
+/// Translate a parsed ELF's code into PVM code with the GP entry prologue,
+/// and rewrite its data's code pointers.
+fn transpile_linked(elf: &LinkedElf) -> Result<TranspiledElf, TranspileError> {
     let mut ctx = TranslationContext::new(elf.is_64bit);
     ctx.code_ranges = elf.code_ranges.clone();
 
@@ -293,18 +301,22 @@ fn transpile_elf(elf_data: &[u8]) -> Result<TranspiledElf, TranspileError> {
         }
     }
 
+    let targets: HashSet<u64> = elf
+        .control_flow_targets
+        .union(&direct_targets(elf))
+        .copied()
+        .collect();
     for (_file_off, vaddr, data) in &elf.code_sections {
-        translate_section_linked(&mut ctx, data, *vaddr, &elf)?;
+        translate_section_linked(&mut ctx, data, *vaddr, elf, &targets)?;
     }
     ctx.apply_fixups();
 
     let mut ro_data = elf.ro_data.clone();
     let mut rw_data = elf.rw_data.clone();
-    rewrite_data_code_ptrs(&elf, &mut ctx, &mut ro_data, &mut rw_data);
+    rewrite_data_code_ptrs(elf, &mut ctx, &mut ro_data, &mut rw_data);
 
     crate::peephole_fuse_load_imm_alu(&mut ctx.code, &mut ctx.bitmask, &ctx.jump_table);
     crate::peephole_fuse_load_imm_memory(&mut ctx.code, &mut ctx.bitmask, &ctx.jump_table);
-    crate::peephole_eliminate_dead_load_imm(&mut ctx.code, &mut ctx.bitmask, &ctx.jump_table);
     crate::ensure_branch_targets_are_block_starts(
         &mut ctx.code,
         &mut ctx.bitmask,
@@ -986,16 +998,38 @@ fn rewrite_data_code_ptrs(
     }
 }
 
+/// Addresses that direct branches and jumps reach. Translation must not
+/// carry fusion state into them: an incoming edge brings its own registers.
+fn direct_targets(elf: &LinkedElf) -> HashSet<u64> {
+    let mut targets = HashSet::new();
+    for (_, base, data) in &elf.code_sections {
+        for (index, word) in data.chunks_exact(4).enumerate() {
+            let inst = u32::from_le_bytes(word.try_into().expect("four-byte chunk"));
+            let offset = match inst & 0x7f {
+                0x63 => crate::riscv::decode_b_imm(inst),
+                0x6f => crate::riscv::decode_j_imm(inst),
+                _ => continue,
+            };
+            let address = base + 4 * index as u64;
+            targets.insert(address.wrapping_add_signed(i64::from(offset)));
+        }
+    }
+    targets
+}
+
+/// Translate one code section. `targets` holds every address another
+/// control-flow edge may enter.
 fn translate_section_linked(
     ctx: &mut TranslationContext,
     data: &[u8],
     base_addr: u64,
     elf: &LinkedElf,
+    targets: &HashSet<u64>,
 ) -> Result<(), TranspileError> {
     let mut offset = 0;
     while offset < data.len() {
         let rv_addr = base_addr + offset as u64;
-        ctx.begin_instruction(rv_addr, elf.control_flow_targets.contains(&rv_addr))?;
+        ctx.begin_instruction(rv_addr, targets.contains(&rv_addr))?;
 
         if offset + 4 > data.len() {
             break;
@@ -1028,7 +1062,7 @@ fn translate_section_linked(
                 // CALL_PLT: AUIPC+JALR pair for function call
                 // Peek at JALR to get link register
                 if offset + 8 <= data.len() {
-                    if elf.control_flow_targets.contains(&(rv_addr + 4)) {
+                    if targets.contains(&(rv_addr + 4)) {
                         return Err(TranspileError::InvalidSection(format!(
                             "control-flow target {:#x} splits a relocated AUIPC+JALR call pair at {rv_addr:#x}",
                             rv_addr + 4
@@ -1161,7 +1195,7 @@ fn translate_section_linked(
             } else if opcode == 0x23 {
                 // STORE rs2, lo12(rs1) → route through translate_store with imm=0.
                 let rs2 = ((inst >> 20) & 0x1f) as u8;
-                ctx.translate_store(funct3, rs1, rs2, 0)?;
+                ctx.translate_store(funct3, rs1, rs2, 0, rv_addr)?;
                 offset += 4;
                 continue;
             }
@@ -1284,12 +1318,12 @@ mod tests {
         ctx.code_ranges = elf.code_ranges.clone();
         ctx.emit_jump(elf.entry_vaddr);
         ctx.emit_inst(0); // unused accumulate entry
-        translate_section_linked(&mut ctx, &text, TEXT_VADDR, &elf).expect("translates");
+        translate_section_linked(&mut ctx, &text, TEXT_VADDR, &elf, &elf.control_flow_targets)
+            .expect("translates");
         ctx.apply_fixups();
 
         crate::peephole_fuse_load_imm_alu(&mut ctx.code, &mut ctx.bitmask, &ctx.jump_table);
         crate::peephole_fuse_load_imm_memory(&mut ctx.code, &mut ctx.bitmask, &ctx.jump_table);
-        crate::peephole_eliminate_dead_load_imm(&mut ctx.code, &mut ctx.bitmask, &ctx.jump_table);
         crate::ensure_branch_targets_are_block_starts(
             &mut ctx.code,
             &mut ctx.bitmask,
@@ -1317,3 +1351,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "linker_differential.rs"]
+mod differential;

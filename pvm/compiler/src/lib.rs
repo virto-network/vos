@@ -4,6 +4,18 @@
 //! (Appendix A).
 //!
 //! Also provides utilities to hand-assemble PVM programs directly.
+//!
+//! Two invariants keep translation sound:
+//!
+//! - **x0 is never a PVM register.** PVM register 0 holds the return
+//!   address, so `TranslationContext::require_reg` refuses x0 and every
+//!   translation handles an x0 source or destination itself.
+//! - **A pass never clears the bitmask of an instruction start.** A PVM
+//!   immediate's length follows from the instruction's length, so folding
+//!   bytes into the previous instruction changes what it decodes to. A
+//!   fusion writes its result where the first instruction of the pair
+//!   started, with a full four-byte immediate that trailing continuation
+//!   bytes cannot change.
 
 pub mod assembler;
 pub mod linker;
@@ -428,29 +440,24 @@ pub fn peephole_fuse_load_imm_memory(
                         let fits_u32 = combined >= 0 && combined <= u32::MAX as i64;
                         let end_of_pair = next_i + 1 + mem_s;
 
-                        if safe && fits_u32 && end_of_pair >= next_i + 6 {
-                            // Rewrite memory op in-place as direct form
-                            code[next_i] = dir_op;
-                            // Direct form: [dir_op, rd, imm0-3] (OneRegOneImm)
-                            // rd is the dest (load) or value (store) register
-                            code[next_i + 1] = mem_rd;
+                        if safe && fits_u32 && end_of_pair >= i + 6 {
+                            // The direct form [dir_op, rd, imm0-3] replaces the
+                            // pair from the load_imm's position, and the rest
+                            // of the pair continues it: its full four-byte
+                            // immediate decodes the same whatever follows.
+                            // Folding the load_imm's bytes into the instruction
+                            // before it instead would change that
+                            // instruction's immediate length. Entering at the
+                            // load_imm runs the fused load, which leaves the
+                            // registers as the pair did.
                             let addr_bytes = (combined as u32).to_le_bytes();
-                            code[next_i + 2] = addr_bytes[0];
-                            code[next_i + 3] = addr_bytes[1];
-                            code[next_i + 4] = addr_bytes[2];
-                            code[next_i + 5] = addr_bytes[3];
-                            // Zero remaining bytes
-                            for k in 6..(end_of_pair - next_i) {
-                                code[next_i + k] = 0;
+                            code[i] = dir_op;
+                            code[i + 1] = mem_rd;
+                            code[i + 2..i + 6].copy_from_slice(&addr_bytes);
+                            for byte in &mut code[i + 6..end_of_pair] {
+                                *byte = 0;
                             }
-                            // Clear continuation bitmask for memory op
-                            for b in &mut bitmask[(next_i + 1)..end_of_pair] {
-                                *b = 0;
-                            }
-
-                            // NOP the load_imm by clearing its bitmask
-                            bitmask[i] = 0;
-                            for b in code[i..next_i].iter_mut() {
+                            for b in &mut bitmask[(i + 1)..end_of_pair] {
                                 *b = 0;
                             }
 
@@ -465,86 +472,6 @@ pub fn peephole_fuse_load_imm_memory(
         i += 1 + s;
     }
     fused
-}
-
-/// Peephole pass: eliminate dead `load_imm` instructions.
-///
-/// When a `load_imm` (opcode 51) or `load_imm_64` (opcode 20) writes to register R,
-/// and the immediately following instruction also writes to R without reading it
-/// (another load_imm/load_imm_64, or move_reg with R as destination), the first
-/// instruction is dead and can be replaced with a no-op (bitmask cleared).
-///
-/// The second instruction must not be a branch target (otherwise the first
-/// load_imm could be reached independently via a different path).
-pub fn peephole_eliminate_dead_load_imm(
-    code: &mut [u8],
-    bitmask: &mut [u8],
-    jump_table: &[u32],
-) -> usize {
-    let len = code.len();
-    if len < 4 {
-        return 0;
-    }
-
-    let targets = collect_branch_targets(code, bitmask, jump_table);
-
-    /// Extract the destination register from a load_imm (51) or load_imm_64 (20).
-    /// Returns None if the instruction doesn't write to a register or is malformed.
-    fn load_dest_reg(code: &[u8], pc: usize) -> Option<u8> {
-        let op = code[pc];
-        if (op == 51 || op == 20) && pc + 1 < code.len() {
-            Some(code[pc + 1] & 0x0F)
-        } else {
-            None
-        }
-    }
-
-    /// Check if an instruction at `pc` unconditionally writes to register `rd`
-    /// without reading it first. Covers: load_imm(51), load_imm_64(20), move_reg(100).
-    fn writes_without_reading(code: &[u8], pc: usize, rd: u8) -> bool {
-        if pc >= code.len() {
-            return false;
-        }
-        let op = code[pc];
-        match op {
-            // load_imm / load_imm_64: dest is bits 0-3 of reg_byte
-            51 | 20 => pc + 1 < code.len() && (code[pc + 1] & 0x0F) == rd,
-            // move_reg: [100, rd|(rs<<4)] — writes rd, reads rs
-            // Safe only if rd != rs (otherwise it reads rd too, but move to self is still dead)
-            100 => pc + 1 < code.len() && (code[pc + 1] & 0x0F) == rd,
-            _ => false,
-        }
-    }
-
-    let mut eliminated = 0;
-    let mut i = 0;
-    while i < len {
-        if i >= bitmask.len() || bitmask[i] != 1 {
-            i += 1;
-            continue;
-        }
-        let s = skip_for(bitmask, i);
-        let next_i = i + 1 + s;
-
-        if let Some(rd) = load_dest_reg(code, i)
-            && next_i < len
-            && bitmask[next_i] == 1
-            && !targets.contains(&next_i)
-            && writes_without_reading(code, next_i, rd)
-        {
-            // First load_imm is dead — NOP it by clearing its bitmask
-            bitmask[i] = 0;
-            // Zero out the instruction bytes
-            for b in code[i..next_i].iter_mut() {
-                *b = 0;
-            }
-            eliminated += 1;
-            i = next_i;
-            continue;
-        }
-        i += 1 + s;
-    }
-    eliminated
 }
 
 /// Post-pass: ensure all PVM branch targets are basic block starts (ϖ).
@@ -976,60 +903,12 @@ mod tests {
         assert_eq!(imm, -5);
     }
 
-    // === peephole_eliminate_dead_load_imm tests ===
-
-    #[test]
-    fn test_eliminate_dead_load_imm() {
-        // load_imm φ[2], 99 (dead — immediately overwritten)
-        // load_imm φ[2], 42
-        let mut code = vec![
-            51, 2, 99, // dead load_imm rd=2
-            51, 2, 42, // overwrites rd=2
-        ];
-        let mut bitmask = vec![1, 0, 0, 1, 0, 0];
-
-        let eliminated = peephole_eliminate_dead_load_imm(&mut code, &mut bitmask, &[]);
-        assert_eq!(eliminated, 1);
-        assert_eq!(bitmask[0], 0, "dead instruction bitmask cleared");
-        assert_eq!(code[0], 0, "dead instruction bytes zeroed");
-        assert_eq!(code[3], 51, "second load_imm preserved");
-    }
-
-    #[test]
-    fn test_eliminate_dead_load_imm_branch_target() {
-        // load_imm φ[2], 99; load_imm φ[2], 42
-        // BUT second is a branch target → should NOT eliminate
-        let mut code = vec![
-            51, 2, 99, 51, 2, 42, 40, 253, 255, 255, 255, // jump -3 (targets offset 3)
-        ];
-        let mut bitmask = vec![1, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0];
-
-        let eliminated = peephole_eliminate_dead_load_imm(&mut code, &mut bitmask, &[]);
-        assert_eq!(
-            eliminated, 0,
-            "should not eliminate when next is branch target"
-        );
-    }
-
-    #[test]
-    fn test_eliminate_dead_load_imm_different_reg() {
-        // load_imm φ[2], 99; load_imm φ[3], 42 → NOT dead (different registers)
-        let mut code = vec![
-            51, 2, 99, // rd=2
-            51, 3, 42, // rd=3
-        ];
-        let mut bitmask = vec![1, 0, 0, 1, 0, 0];
-
-        let eliminated = peephole_eliminate_dead_load_imm(&mut code, &mut bitmask, &[]);
-        assert_eq!(eliminated, 0);
-    }
-
     // === peephole_fuse_load_imm_memory tests ===
 
     #[test]
     fn test_fuse_load_imm_load_ind() {
         // load_imm φ[3], 0x100; load_ind_u32 φ[3], φ[3], 4
-        // → NOP; load_u32 φ[3], 0x104. The load overwrites its base.
+        // → load_u32 φ[3], 0x104. The load overwrites its base.
         // load_ind_u32 format: [128, rd|(ra<<4), offset_bytes]
         // rd=3 (dest), ra=3 (base). reg byte = 3 | (3<<4) = 0x33.
         let mut code = vec![
@@ -1040,12 +919,13 @@ mod tests {
 
         let fused = peephole_fuse_load_imm_memory(&mut code, &mut bitmask, &[]);
         assert_eq!(fused, 1);
-        // load_imm is NOP'd (bitmask[0]=0), memory op rewritten in-place
-        assert_eq!(bitmask[0], 0, "load_imm should be NOP'd");
-        assert_eq!(code[4], 56, "load_ind_u32(128) → load_u32(56)");
-        assert_eq!(code[5], 3, "dest register preserved");
+        // The direct form takes the load_imm's place and the rest of the
+        // pair continues it.
+        assert_eq!(bitmask, [1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(code[0], 56, "load_ind_u32(128) → load_u32(56)");
+        assert_eq!(code[1], 3, "dest register preserved");
         // Combined address: 0x100 + 4 = 0x104
-        let addr = u32::from_le_bytes([code[6], code[7], code[8], code[9]]);
+        let addr = u32::from_le_bytes([code[2], code[3], code[4], code[5]]);
         assert_eq!(addr, 0x104);
     }
 
@@ -1152,28 +1032,12 @@ mod tests {
                 prop_assert_eq!(&b1, &b2);
             }
 
-            /// Dead load_imm elimination is idempotent.
-            #[test]
-            fn dead_load_imm_idempotent((code, bitmask) in random_pvm_program()) {
-                let mut c1 = code.clone();
-                let mut b1 = bitmask.clone();
-                peephole_eliminate_dead_load_imm(&mut c1, &mut b1, &[]);
-
-                let mut c2 = c1.clone();
-                let mut b2 = b1.clone();
-                peephole_eliminate_dead_load_imm(&mut c2, &mut b2, &[]);
-
-                prop_assert_eq!(&c1, &c2);
-                prop_assert_eq!(&b1, &b2);
-            }
-
             /// Full peephole pipeline is idempotent.
             #[test]
             fn full_pipeline_idempotent((code, bitmask) in random_pvm_program()) {
                 let apply = |c: &mut Vec<u8>, b: &mut Vec<u8>| {
                     peephole_fuse_load_imm_alu(c, b, &[]);
                     peephole_fuse_load_imm_memory(c, b, &[]);
-                    peephole_eliminate_dead_load_imm(c, b, &[]);
                 };
 
                 let mut c1 = code.clone();
@@ -1196,7 +1060,6 @@ mod tests {
                 let mut b = bitmask;
                 peephole_fuse_load_imm_alu(&mut c, &mut b, &[]);
                 peephole_fuse_load_imm_memory(&mut c, &mut b, &[]);
-                peephole_eliminate_dead_load_imm(&mut c, &mut b, &[]);
                 prop_assert_eq!(c.len(), orig_len, "code length should not change");
                 prop_assert_eq!(b.len(), orig_len, "bitmask length should not change");
             }
