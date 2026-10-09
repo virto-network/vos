@@ -2,8 +2,8 @@
 
 Plan v2 for build step 2 of `core-model.md` (section 16), on the slice 1
 PVM base. v1 was reviewed by the second-opinion reviewer; v2 folds in its
-findings, and the decisions it leaves to the owner are listed at the end.
-Tags as in the core model. This planning run also designs the
+findings, and the owner decided the items it left open (listed at the
+end). Tags as in the core model. This planning run also designs the
 two items the core model left to it: the node host and native extensions
 (open question 18), and the actor framework's context API (open question
 5).
@@ -466,18 +466,15 @@ Measure against section 14, on one node with storage:
   copies requests, so no page is mapped per call.
 - `state_read` writes join the pool's property test.
 
-## Decisions for the owner
+## Decisions [decided by the owner]
 
-The reviewer and I recommend the first option of each.
-
-1. **The context API** in "Contexts" as proposed, or changes to it.
-2. **Replies and messages in accumulate:** `write`s to system keys, with
-   accumulate on pure Gray Paper calls; or dedicated `reply` and `emit`
-   host calls.
-3. **`attest` in this slice,** unproven and with arguments only; or no
-   call to attestable methods until step 5.
+1. **The context API** as in "Contexts".
+2. **Replies and messages in accumulate** are `write`s to system keys;
+   accumulate uses Gray Paper calls only.
+3. **`attest` is in this slice,** unproven and with arguments only.
 4. **Defaults:** reply window 64, session expiry one hour, handler gas 10M,
-   refine budget 1G (open questions 14 and 16).
+   refine budget 1G (open questions 14 and 16), as constants that are
+   cheap to change.
 5. **Per-step caps:** the numbers under "Actor ABI".
 6. **Roles:** a per-agent membership table in `system`, set by the CLI,
    until the space catalog.

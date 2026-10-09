@@ -222,7 +222,7 @@ impl Ledger {
 - **Attestable methods take no context.** The macro rejects any use of
   fields that are not committed maps, and any call outside the method
   (section 11.1).
-- The full API is designed in the next planning run [open].
+- The v1 API is decided in `slice-2-one-node.md` ("Contexts").
 
 ### 6.3 Execution order and `.await` [decided]
 
@@ -1235,7 +1235,8 @@ knowledge and aggregation are the longest work and gate goal 8.
      with the entry that references them.
 4. LSM tuning: compaction under sustained writes, cache sizing per node,
    cold reads.
-5. The context API of the actor framework (section 6.2).
+5. ~~The context API of the actor framework (section 6.2).~~ Decided for
+   v1 in `slice-2-one-node.md`.
 6. Zero-knowledge proving: the approach in the prover and its chips, and
    its cost.
 7. Window aggregation: recursion or another scheme, and its on-chain gas.
@@ -1254,8 +1255,9 @@ knowledge and aggregation are the longest work and gate goal 8.
 17. The JAM agents' designs: the per-space aggregate-balance agent (how a
     space's net positions settle, and what a mixer-like space reveals by
     its flows), and collectives that vote.
-18. **The node host and native extensions** (to design in slice 2's
-    planning run):
+18. **The node host and native extensions:** designed for one node in
+    `slice-2-one-node.md`; what remains open is the extension host itself
+    and its multi-node form:
     - the node process and its scheduler across agents;
     - storage and networking ownership;
     - ingress;
