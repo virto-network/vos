@@ -3,10 +3,6 @@ use std::collections::HashMap;
 
 use crate::core::step::{CompactStep, NUM_REGS, PvmStep, expand_steps};
 
-/// The ISA-profile tag committed by the ProgramMemory and CPU chips. Only
-/// the Gray Paper profile (tag zero) exists.
-pub(crate) const ISA_PROFILE_TAG: u8 = 0;
-
 /// Prover's side note used for tracking additional data for trace generation.
 pub struct SideNote {
     /// The execution trace steps.

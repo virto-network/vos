@@ -88,7 +88,7 @@ the reference laptop (Core Ultra 7 155H). Other work ran at the same time
 These are the numbers steps 1.4–1.6 must move: machine creation ≤ 50 µs,
 pooled acquire plus reset ≤ 5 µs, and refine fixed cost ≤ 50 µs.
 
-## Step 1.2: remove JAR (stages 1–3 done; stage 4 next)
+## Step 1.2: remove JAR (done)
 
 **Stage 1, flip the defaults.** The `IsaMode` default, `Interpreter::with_memory`,
 `GasSimulator::new` and the JIT's constructor now select the Gray Paper
@@ -195,3 +195,37 @@ the conformance vectors.
   still outside the VOS range `0x400..=0x4ff`, and the plan's remark that
   the JIT charges 10 gas inline per `ecalli` no longer holds: that charge
   was JAR's inline `GAS` capability and is gone.
+
+**Stage 4, remove the ISA-profile column.** After stage 3 the column was
+always 0, pinned through the ProgramMemory lookup. It now leaves both chips
+and the program-memory tuple (34 → 33 limbs), with 0 substituted into the
+three constraints that read it:
+
+- `IsStandardMemH = IsLoad + IsStore`;
+- `HostCallContinuesH = HostCallAcknowledged`;
+- the acknowledgment-forbids-JAR constraint disappears.
+
+A continued host call must now select exactly one precompile relation
+(`precompile_selector_sum = continues`, which replaces the at-most-one
+constraint). With the existing `selected_dispatch = continues · dispatch`, a
+continued call's committed dispatch is never zero, which covers the plan's
+"allowed ⇒ dispatch ≠ 0" without an inverse column. A new gate clears both
+the selector and the dispatch on an acknowledged row; it fails under the old
+constraint and passes under the new one. A second gate forges a complete,
+consistent precompile continuation on a trap row; the AIR rejects it. Proof
+format 22 (Poseidon2 variant 23).
+
+Fable signed off on the constraint diff, with no blocking findings: the
+substitutions are exact, the new constraint is strictly stronger, and
+nothing else read the column. Follow-ups for the step 1.4 re-pin, which
+changes the format again anyway:
+
+- `HostCallContinuesH` is now an alias of `HostCallAcknowledged`, and
+  `HostCallAllowed` is implied by a non-zero dispatch; both columns can go.
+- The memory-exception boundary rests on one condition: a slice's committed
+  exit kind stays bound to its final row, so a prover cannot drop a
+  faulting step and present the prefix as a complete run. That binding is
+  in the slice commitment, unchanged here.
+
+**Step 1.2 is done.**
+

@@ -251,7 +251,7 @@ impl TracingPvm {
         // Compact recording drops the per-step register snapshots, so the
         // trace is only faithful if the file really is continuous across
         // steps. Nothing in this crate mutates registers between steps
-        // (precompile handlers and the vos stubs touch memory only), but a
+        // (precompile handlers touch memory only), but a
         // silent violation would corrupt every later reconstructed
         // snapshot — fail loudly instead.
         match self.initial_regs {

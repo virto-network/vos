@@ -1883,10 +1883,10 @@ mod tests {
     #[test]
     fn proof_generation_numbers_reject_previous_formats() {
         #[cfg(not(feature = "poseidon2-channel"))]
-        assert_eq!(crate::PROOF_FORMAT_VERSION, 20);
+        assert_eq!(crate::PROOF_FORMAT_VERSION, 22);
         #[cfg(feature = "poseidon2-channel")]
-        assert_eq!(crate::PROOF_FORMAT_VERSION, 21);
-        for previous in 16..=19 {
+        assert_eq!(crate::PROOF_FORMAT_VERSION, 23);
+        for previous in 16..=21 {
             assert_ne!(crate::PROOF_FORMAT_VERSION, previous);
         }
     }

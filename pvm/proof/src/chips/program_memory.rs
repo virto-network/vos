@@ -1,5 +1,5 @@
 //! ProgramMemoryChip — a preprocessed table mapping each basic-block-starting
-//! PC of `code` to its decoded instruction tuple `(isa_profile, opcode, skip_len, reg_a,
+//! PC of `code` to its decoded instruction tuple `(opcode, skip_len, reg_a,
 //! reg_b, reg_d, imm, host_call_allowed, flag_bytes[6], imm_y_canon,
 //! branch_target_canon, host_call_precompile_dispatch)`.
 //!
@@ -9,7 +9,7 @@
 //! preprocessed table and CpuChip's main trace.  CpuChip emits 6
 //! byte-to-bits lookups per row to bind each individual flag column
 //! (or its sum-of-sub-flags expression for the 5 folded category
-//! slots) back to its packed byte.  The prog_mem tuple is 34 limbs.
+//! slots) back to its packed byte.  The prog_mem tuple is 33 limbs.
 //!
 //! Soundness chain:
 //!   - The preprocessed columns commit, via the Merkle root the verifier
@@ -76,13 +76,10 @@ pub enum PreprocessedColumn {
     #[size = 4]
     Pc,
     /// Exact encoded opcode byte at PC (0 if non-basic-block-start or
-    /// padding). `IsaProfile` selects its semantic decoding; retaining the
-    /// raw byte prevents invalid encodings from aliasing canonical Trap.
+    /// padding). Retaining the raw byte prevents invalid encodings from
+    /// aliasing canonical Trap.
     #[size = 1]
     Opcode,
-    /// ISA profile tag: always 0, the Gray Paper v0.8 profile.
-    #[size = 1]
-    IsaProfile,
     /// Skip length ℓ — distance to the next basic-block start (0 for
     /// non-BBS / padding).
     #[size = 1]
@@ -157,8 +154,6 @@ impl BuiltInComponent for ProgramMemoryChip {
     ) {
         let pc = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::Pc);
         let opcode = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::Opcode);
-        let isa_profile =
-            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsaProfile);
         let skip_len =
             crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::SkipLen);
         let reg_a = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::RegA);
@@ -185,11 +180,10 @@ impl BuiltInComponent for ProgramMemoryChip {
         );
         let mult = crate::trace::trace_eval!(trace_eval, Column::Multiplicity);
 
-        // Tuple: pc[4] + isa_profile + opcode + skip_len + reg_a + reg_b + reg_d + imm[8]
+        // Tuple: pc[4] + opcode + skip_len + reg_a + reg_b + reg_d + imm[8]
         //        + host_call_allowed + 6 packed flag bytes + imm_y_canon[4]
-        //        + branch_target_canon[4] + host_call_precompile_dispatch = 34 limbs.
+        //        + branch_target_canon[4] + host_call_precompile_dispatch = 33 limbs.
         let mut tuple: Vec<E::F> = pc.to_vec();
-        tuple.push(isa_profile[0].clone());
         tuple.push(opcode[0].clone());
         tuple.push(skip_len[0].clone());
         tuple.push(reg_a[0].clone());
@@ -238,11 +232,6 @@ impl BuiltInProverComponent for ProgramMemoryChip {
                 && side_note.bitmask.get(row).copied().unwrap_or(0) == 1;
             if bbs {
                 let d = decode_at(&side_note.code, &side_note.bitmask, row);
-                trace.fill_columns(
-                    row,
-                    crate::side_note::ISA_PROFILE_TAG,
-                    PreprocessedColumn::IsaProfile,
-                );
                 trace.fill_columns(row, d.opcode, PreprocessedColumn::Opcode);
                 trace.fill_columns(row, d.skip_len, PreprocessedColumn::SkipLen);
                 trace.fill_columns(row, d.ra, PreprocessedColumn::RegA);
@@ -357,13 +346,8 @@ impl BuiltInProverComponent for ProgramMemoryChip {
         );
         let mult = crate::trace::original_base_column!(component_trace, Column::Multiplicity);
 
-        // Build the 34-limb tuple from preprocessed columns.
+        // Build the 33-limb tuple from preprocessed columns.
         let mut tuple: Vec<_> = pc.to_vec();
-        let isa_profile = crate::trace::preprocessed_base_column!(
-            component_trace,
-            PreprocessedColumn::IsaProfile
-        );
-        tuple.push(isa_profile[0].clone());
         tuple.push(opcode[0].clone());
         tuple.push(skip_len[0].clone());
         tuple.push(reg_a[0].clone());

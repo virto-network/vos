@@ -165,14 +165,20 @@ use crate::recursion_pcs::ProverMerkleHasher;
 ///        `Option` discriminant; proof-side verification also uses the exact
 ///        AIR-derived lifted shape.
 ///   21 — Poseidon2-M31 PCS variant of format 20.
+///   22 — Single ISA profile. The ISA-profile limb leaves CpuChip and the
+///        ProgramMemory preprocessed table (the program-memory tuple drops
+///        from 34 to 33 limbs), so program commitments change. A continued
+///        host call must select exactly one precompile relation; lifecycle
+///        stubs no longer continue. Older proofs reject.
+///   23 — Poseidon2-M31 PCS variant of format 22.
 #[cfg(not(feature = "poseidon2-channel"))]
-pub const PROOF_FORMAT_VERSION: u32 = 20;
+pub const PROOF_FORMAT_VERSION: u32 = 22;
 /// Native recursion: the PCS commit hash + Fiat-Shamir
 /// transcript move from Blake2s to Poseidon2-M31, so `stark_proof.commitments`
 /// become `P2Hash` digests — a different wire format. A Blake2s verifier
-/// (v20) and a Poseidon2-M31 verifier (v21) therefore reject each other's proofs.
+/// (v22) and a Poseidon2-M31 verifier (v23) therefore reject each other's proofs.
 #[cfg(feature = "poseidon2-channel")]
-pub const PROOF_FORMAT_VERSION: u32 = 21;
+pub const PROOF_FORMAT_VERSION: u32 = 23;
 
 /// Exact number of commitment trees in this generation of the Stwo proof:
 /// preprocessed, main, interaction, and split composition.

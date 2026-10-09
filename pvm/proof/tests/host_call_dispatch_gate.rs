@@ -141,14 +141,65 @@ fn acknowledged_precompile_cannot_clear_or_swap_exact_dispatch_selector() {
             [(selector_index + 1) % PRECOMPILE_SELECTORS.len()]
         .1
         .offset();
-        let mut swapped = trace;
+        let mut swapped = trace.clone();
         swapped.original_trace[selector].as_mut_slice()[row] = BaseField::from(0u32);
         swapped.original_trace[wrong_selector].as_mut_slice()[row] = BaseField::from(1u32);
         assert!(
             assert_cpu(&chip, &swapped, &side_note).is_err(),
             "SOUNDNESS GAP: acknowledged Ecalli {id} accepted with a wrong selector"
         );
+
+        // A continued call must select a precompile relation even when the
+        // dispatch it claims is zero: no continued call is relation-free.
+        let mut relation_free = trace;
+        relation_free.original_trace[selector].as_mut_slice()[row] = BaseField::from(0u32);
+        relation_free.original_trace[dispatch].as_mut_slice()[row] = BaseField::from(0u32);
+        assert!(
+            assert_cpu(&chip, &relation_free, &side_note).is_err(),
+            "SOUNDNESS GAP: acknowledged Ecalli {id} continued without any precompile relation"
+        );
     }
+}
+
+/// Only an ECALLI row can be acknowledged. Forge a complete, internally
+/// consistent precompile continuation on the terminal trap row: policy bit,
+/// exact selector and dispatch all agree, yet the CPU AIR must reject it.
+#[test]
+fn non_ecalli_row_cannot_be_acknowledged() {
+    let mut side_note = traced_side_note(ECALL_SCALAR_ADD_MOD_L);
+    let chip = CpuChip;
+    let trace = chip.generate_component_trace(&mut side_note);
+    assert_cpu(&chip, &trace, &side_note).expect("honest trace");
+
+    let opcode = Column::Opcode.offset();
+    let rows = trace.original_trace[0].as_slice().len();
+    let trap_row = (0..rows)
+        .find(|&row| {
+            trace.original_trace[Column::IsTrap.offset()].as_slice()[row] == BaseField::from(1u32)
+                && trace.original_trace[opcode].as_slice()[row]
+                    == BaseField::from(u32::from(Opcode::Trap as u8))
+        })
+        .expect("terminal trap row");
+
+    let mut forged = trace;
+    for (column, value) in [
+        (Column::HostCallAcknowledged, 1u32),
+        (Column::HostCallContinuesH, 1),
+        (Column::HostCallAllowed, 1),
+        (Column::Is114Ecall, 1),
+        (
+            Column::HostCallPrecompileDispatch,
+            u32::from(proof_precompile_dispatch_id(u64::from(
+                ECALL_SCALAR_ADD_MOD_L,
+            ))),
+        ),
+    ] {
+        forged.original_trace[column.offset()].as_mut_slice()[trap_row] = BaseField::from(value);
+    }
+    assert!(
+        assert_cpu(&chip, &forged, &side_note).is_err(),
+        "SOUNDNESS GAP: a trap row was accepted as an acknowledged precompile call"
+    );
 }
 
 #[test]

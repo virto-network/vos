@@ -64,7 +64,6 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             .copied()
             .unwrap_or_default();
         trace.fill_columns(row, encoded_opcode, Column::Opcode);
-        trace.fill_columns(row, crate::side_note::ISA_PROFILE_TAG, Column::IsaProfile);
         trace.fill_columns(row, step.skip_len as u8, Column::SkipLen);
         // 8-byte immediate witness for the ProgramMemory lookup.
         trace.fill_columns_bytes(row, &step.imm.to_le_bytes(), Column::ImmBytes);

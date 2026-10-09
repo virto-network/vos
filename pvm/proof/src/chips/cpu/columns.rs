@@ -20,13 +20,9 @@ pub enum Column {
     #[size = 4]
     NextPc,
     /// Exact encoded opcode byte. Its semantic decoding is authenticated by
-    /// the adjacent ISA profile and ProgramMemory-derived flag bytes.
+    /// the ProgramMemory-derived flag bytes.
     #[size = 1]
     Opcode,
-    /// 0 = standard Gray Paper v0.8, 1 = frozen capability-manifest ISA.
-    /// Authenticated by the ProgramMemory lookup on every real row.
-    #[size = 1]
-    IsaProfile,
     #[size = 1]
     SkipLen,
     /// Carry chain for sequential PC addition: next_pc = pc + 1 + skip_len
@@ -1096,25 +1092,22 @@ pub enum Column {
     #[size = 1]
     IsShiftCNotRotrH,
 
-    /// Boolean disposition of a soft host-call row. One only when a
-    /// Standard-profile ECALLI was handled and acknowledged by the embedder;
-    /// zero for unhandled Standard calls and all frozen JAR host exits.
+    /// Boolean disposition of a host-call row. One only when an ECALLI was
+    /// handled and acknowledged by the embedder; zero for unhandled calls.
     #[size = 1]
     HostCallAcknowledged,
-    /// ProgramMemory-authenticated policy bit: one only for a Standard
-    /// ECALLI identifier implemented by the proof runtime's precompile or
-    /// VOS-stub handlers. An acknowledged row must have this bit set.
+    /// ProgramMemory-authenticated policy bit: one only for an ECALLI
+    /// identifier implemented by the proof runtime's precompile handlers. An
+    /// acknowledged row must have this bit set.
     #[size = 1]
     HostCallAllowed,
-    /// `IsaProfile · SoftHostExit + HostCallAcknowledged`. One for every
-    /// frozen JAR soft host exit and for acknowledged Standard ECALLI rows;
-    /// zero for unhandled Standard calls and non-host instructions. This
-    /// helper keeps the host-call PC constraints at degree two.
+    /// Equal to `HostCallAcknowledged`: one for acknowledged ECALLI rows,
+    /// zero for unhandled calls and non-host instructions.
     #[size = 1]
     HostCallContinuesH,
 
-    /// `(1 - IsaProfile) · (IsLoad + IsStore)`: completed scalar-memory
-    /// instructions subject to the Standard v0.8 protected-zone rule.
+    /// `IsLoad + IsStore`: scalar-memory instructions, all subject to the
+    /// protected-zone rule.
     #[size = 1]
     IsStandardMemH,
     /// Carry into the most-significant address byte for the final active byte:
@@ -1136,9 +1129,9 @@ pub enum Column {
     MemRangeTimesInvH,
 
     /// ProgramMemory-authenticated exact cryptographic precompile dispatch
-    /// identifier (100 or 110..=114), or zero for lifecycle/VOS stubs and
-    /// non-precompile instructions. A continued host-call row must select
-    /// exactly the matching precompile call relation.
+    /// identifier (100 or 110..=114), or zero for any other instruction. A
+    /// continued host-call row must select exactly the matching precompile
+    /// call relation.
     #[size = 1]
     HostCallPrecompileDispatch,
 }
