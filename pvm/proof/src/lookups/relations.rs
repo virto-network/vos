@@ -37,8 +37,8 @@ const REL_REG_MEMORY_LOOKUP_SIZE: usize = 1 + WORD_SIZE + TS_SIZE + 1;
 stwo_constraint_framework::relation!(RegisterMemoryLookupElements, REL_REG_MEMORY_LOOKUP_SIZE);
 
 // (pc[4], opcode, skip_len, reg_a, reg_b, reg_d, imm[8],
-//  host_call_allowed, flag_bytes[N_FLAG_BYTES], imm_y_canon[4],
-//  branch_target_canon[4], host_call_precompile_dispatch)
+//  flag_bytes[N_FLAG_BYTES], imm_y_canon[4], branch_target_canon[4],
+//  host_call_precompile_dispatch)
 //
 // Authenticates instruction-fetch tuples: every CpuChip step emits this
 // tuple, and ProgramMemoryChip's preprocessed table holds the canonical
@@ -51,7 +51,7 @@ stwo_constraint_framework::relation!(RegisterMemoryLookupElements, REL_REG_MEMOR
 // the lookup.  CpuChip emits 6 byte-to-bits lookups per row to bind
 // each individual flag column (or its sum-of-sub-flags expression for
 // the 5 folded category slots) back to its packed byte.  The prog_mem
-// tuple is 33 limbs.
+// tuple is 32 limbs.
 //
 // Flag layout per byte (0-indexed within byte; little-endian bits):
 //   byte 0: is_add, is_sub, is_mul, is_mul_upper, is_bitwise, is_shift,
@@ -76,10 +76,10 @@ stwo_constraint_framework::relation!(RegisterMemoryLookupElements, REL_REG_MEMOR
 pub const PROG_MEMORY_N_FLAGS: usize = 48;
 pub const PROG_MEMORY_N_FLAG_BYTES: usize = PROG_MEMORY_N_FLAGS / 8;
 // Tuple shape: pc[4] + opcode + skip_len + reg_a + reg_b + reg_d + imm[8]
-//   + host_call_allowed + 6 packed flag bytes + imm_y_canon[4]
-//   + branch_target_canon[4] + host_call_precompile_dispatch = 33 limbs.
+//   + 6 packed flag bytes + imm_y_canon[4] + branch_target_canon[4]
+//   + host_call_precompile_dispatch = 32 limbs.
 const REL_PROG_MEMORY_LOOKUP_SIZE: usize =
-    PC_SIZE + 1 + 1 + 1 + 1 + 1 + WORD_SIZE + 1 + PROG_MEMORY_N_FLAG_BYTES + PC_SIZE + PC_SIZE + 1;
+    PC_SIZE + 1 + 1 + 1 + 1 + 1 + WORD_SIZE + PROG_MEMORY_N_FLAG_BYTES + PC_SIZE + PC_SIZE + 1;
 stwo_constraint_framework::relation!(ProgramMemoryLookupElements, REL_PROG_MEMORY_LOOKUP_SIZE);
 
 // JumpTableChip lookup. Tuple: (addr[4], target[4]) — 8 limbs.

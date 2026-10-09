@@ -86,15 +86,11 @@ pub const ECALL_SCALAR_ADD_MOD_L: u32 = 114;
 /// identifier: exactly the cryptographic precompiles handled by
 /// [`crate::core::tracing::TracingPvm`].
 ///
-/// The result is committed into ProgramMemory so an untrusted prover cannot
-/// mark an unknown call as acknowledged and continue execution past it.
+/// ProgramMemory commits the dispatch identifier, which is non-zero exactly
+/// for these calls, so an untrusted prover cannot mark an unknown call as
+/// acknowledged and continue execution past it.
 pub(crate) const fn is_proof_host_call_allowed(id: u64) -> bool {
-    id == ECALL_BLAKE2B_COMPRESS as u64
-        || id == ECALL_RISTRETTO_SCALAR_MULT as u64
-        || id == ECALL_RISTRETTO_POINT_ADD as u64
-        || id == ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE as u64
-        || id == ECALL_SCALAR_MUL_MOD_L as u64
-        || id == ECALL_SCALAR_ADD_MOD_L as u64
+    proof_precompile_dispatch_id(id) != 0
 }
 
 /// Exact proof-chip dispatch identifier for a cryptographic precompile, or

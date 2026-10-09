@@ -65,3 +65,97 @@ pub fn run_jam(program: &[u8], args: &[u8]) -> (Vec<u8>, u64) {
         }
     }
 }
+
+// ── Standard programs as inner machines ─────────────────────
+
+const ZONE: u64 = 0x1_0000;
+const PAGE: u64 = 4096;
+const INPUT: u64 = 1 << 24;
+
+/// The parts of a standard program an agent needs to host it as an inner
+/// machine.
+pub struct Spi {
+    pub ro: Vec<u8>,
+    pub rw: Vec<u8>,
+    pub heap_pages: u64,
+    pub stack: u64,
+    /// The compact code blob.
+    pub code: Vec<u8>,
+}
+
+/// A little-endian unsigned integer of up to eight bytes.
+pub fn le(bytes: &[u8]) -> u64 {
+    bytes
+        .iter()
+        .rev()
+        .fold(0, |acc, b| acc << 8 | u64::from(*b))
+}
+
+/// Split a standard program into its regions and code blob.
+pub fn parse_standard_program(spi: &[u8]) -> Spi {
+    let ro_len = le(&spi[0..3]) as usize;
+    let rw_len = le(&spi[3..6]) as usize;
+    let at = 11 + ro_len + rw_len;
+    let code_len = le(&spi[at..at + 4]) as usize;
+    Spi {
+        ro: spi[11..11 + ro_len].to_vec(),
+        rw: spi[11 + ro_len..at].to_vec(),
+        heap_pages: le(&spi[6..8]),
+        stack: le(&spi[8..11]),
+        code: spi[at + 4..at + 4 + code_len].to_vec(),
+    }
+}
+
+/// A standard program created and laid out as an inner machine.
+pub struct LoadedActor {
+    pub id: u32,
+    pub stack_top: u64,
+    pub args_base: u64,
+    /// Writable regions (base, size): what a pooled machine must reset.
+    pub writable: Vec<(u64, u64)>,
+}
+
+/// Create `spi` as an inner machine and lay out its memory as standard
+/// program initialization would: read-only data, read-write data and heap,
+/// stack, and one argument page.
+pub fn load_actor(inner: &mut vos_pvm::inner::InnerMachines, spi: &Spi) -> LoadedActor {
+    use vos_pvm::inner::PageMode;
+
+    let id = inner.create(&spi.code, 0).expect("create");
+    let pages = |inner: &mut vos_pvm::inner::InnerMachines, base: u64, size: u64, mode| {
+        inner
+            .pages(id, (base / PAGE) as u32, (size / PAGE) as u32, mode)
+            .expect("pages");
+    };
+    let ro_size = spi.ro.len() as u64;
+    let ro_size = ro_size.div_ceil(PAGE) * PAGE;
+    if ro_size > 0 {
+        pages(inner, ZONE, ro_size, PageMode::AllocateReadWrite);
+        inner.poke(id, ZONE as u32, &spi.ro).expect("poke ro");
+        pages(inner, ZONE, ro_size, PageMode::SetReadOnly);
+    }
+    let rw_base = 2 * ZONE + (spi.ro.len() as u64).div_ceil(ZONE) * ZONE;
+    let rw_size = (spi.rw.len() as u64 + spi.heap_pages * PAGE).div_ceil(PAGE) * PAGE;
+    if rw_size > 0 {
+        pages(inner, rw_base, rw_size, PageMode::AllocateReadWrite);
+        if !spi.rw.is_empty() {
+            inner.poke(id, rw_base as u32, &spi.rw).expect("poke rw");
+        }
+    }
+    let stack_top = (1 << 32) - 2 * ZONE - INPUT;
+    let stack_size = spi.stack.div_ceil(PAGE) * PAGE;
+    pages(
+        inner,
+        stack_top - stack_size,
+        stack_size,
+        PageMode::AllocateReadWrite,
+    );
+    let args_base = (1 << 32) - ZONE - INPUT;
+    pages(inner, args_base, PAGE, PageMode::AllocateReadWrite);
+    LoadedActor {
+        id,
+        stack_top,
+        args_base,
+        writable: vec![(rw_base, rw_size), (stack_top - stack_size, stack_size)],
+    }
+}

@@ -565,8 +565,6 @@ pub(super) fn generate_interaction_trace(
         let reg_b = crate::trace::original_base_column!(component_trace, Column::RegB);
         let reg_d = crate::trace::original_base_column!(component_trace, Column::RegD);
         let imm_bytes = crate::trace::original_base_column!(component_trace, Column::ImmBytes);
-        let host_call_allowed =
-            crate::trace::original_base_column!(component_trace, Column::HostCallAllowed);
         let fb0 = crate::trace::original_base_column!(component_trace, Column::FlagByte0);
         let fb1 = crate::trace::original_base_column!(component_trace, Column::FlagByte1);
         let fb2 = crate::trace::original_base_column!(component_trace, Column::FlagByte2);
@@ -590,7 +588,6 @@ pub(super) fn generate_interaction_trace(
         tuple.push(reg_b[0].clone());
         tuple.push(reg_d[0].clone());
         tuple.extend_from_slice(&imm_bytes);
-        tuple.push(host_call_allowed[0].clone());
         tuple.push(fb0[0].clone());
         tuple.push(fb1[0].clone());
         tuple.push(fb2[0].clone());

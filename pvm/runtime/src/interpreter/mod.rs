@@ -3212,7 +3212,7 @@ mod tests {
             Memory::sparse(1u64 << 32),
         ] {
             let mut vm = Interpreter::with_memory(vec![], vec![], vec![], [0; 13], memory, 100);
-            let pages = vm.mem.page_perms().len();
+            let pages = vm.mem.pages();
             for a in [PERM_NONE, PERM_RO, PERM_RW] {
                 for b in [PERM_NONE, PERM_RO, PERM_RW] {
                     for c in [PERM_NONE, PERM_RO, PERM_RW] {

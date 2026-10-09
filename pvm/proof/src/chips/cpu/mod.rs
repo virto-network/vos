@@ -1703,8 +1703,7 @@ impl BuiltInComponent for CpuChip {
         // IsExit also covers Trap and dynamic jumps. Subtracting their
         // authenticated per-opcode flags leaves exactly Ecalli. A host call
         // either remains at its cause PC and terminates the trace, or carries
-        // an explicit, policy-authorized acknowledgment and advances
-        // sequentially. HostCallContinuesH equals the acknowledgment.
+        // an explicit acknowledgment and advances sequentially.
         {
             let is_exit = crate::trace::trace_eval!(trace_eval, Column::IsExit);
             let is_trap = crate::trace::trace_eval!(trace_eval, Column::IsTrap);
@@ -1712,8 +1711,6 @@ impl BuiltInComponent for CpuChip {
             let is_load_imm_jump_ind =
                 crate::trace::trace_eval!(trace_eval, Column::IsLoadImmJumpInd);
             let acknowledged = crate::trace::trace_eval!(trace_eval, Column::HostCallAcknowledged);
-            let allowed = crate::trace::trace_eval!(trace_eval, Column::HostCallAllowed);
-            let continues = crate::trace::trace_eval!(trace_eval, Column::HostCallContinuesH);
             let precompile_dispatch =
                 crate::trace::trace_eval!(trace_eval, Column::HostCallPrecompileDispatch);
             let is_blake = crate::trace::trace_eval!(trace_eval, Column::IsBlakeEcall);
@@ -1733,25 +1730,21 @@ impl BuiltInComponent for CpuChip {
                 - is_load_imm_jump_ind[0].clone();
 
             eval.add_constraint(acknowledged[0].clone() * (E::F::one() - acknowledged[0].clone()));
-            eval.add_constraint(continues[0].clone() * (E::F::one() - continues[0].clone()));
-            // The ProgramMemory-authenticated policy bit implies a supported
-            // ECALLI identifier.
-            eval.add_constraint(acknowledged[0].clone() * (E::F::one() - allowed[0].clone()));
             eval.add_constraint(acknowledged[0].clone() * (E::F::one() - soft_host.clone()));
-            eval.add_constraint(continues[0].clone() - acknowledged[0].clone());
 
-            // ProgramMemory commits the exact cryptographic dispatch ID. A
-            // continued host call selects exactly one precompile relation, and
-            // its weighted selector must equal that authenticated ID, so a
-            // continued call's dispatch is never zero. A call that is not
-            // continued selects no relation.
+            // ProgramMemory commits the exact cryptographic dispatch ID, which
+            // is non-zero only for an ECALLI identifier the proof runtime
+            // handles. An acknowledged call selects exactly one precompile
+            // relation, and its weighted selector must equal that
+            // authenticated ID, so only a supported call can be acknowledged.
+            // A call that is not acknowledged selects no relation.
             let precompile_selector_sum = is_blake[0].clone()
                 + is_110[0].clone()
                 + is_111[0].clone()
                 + is_112[0].clone()
                 + is_113[0].clone()
                 + is_114[0].clone();
-            eval.add_constraint(precompile_selector_sum - continues[0].clone());
+            eval.add_constraint(precompile_selector_sum - acknowledged[0].clone());
             let selected_dispatch = is_blake[0].clone() * E::F::from(BaseField::from(100u32))
                 + is_110[0].clone() * E::F::from(BaseField::from(110u32))
                 + is_111[0].clone() * E::F::from(BaseField::from(111u32))
@@ -1759,7 +1752,7 @@ impl BuiltInComponent for CpuChip {
                 + is_113[0].clone() * E::F::from(BaseField::from(113u32))
                 + is_114[0].clone() * E::F::from(BaseField::from(114u32));
             eval.add_constraint(
-                selected_dispatch - continues[0].clone() * precompile_dispatch[0].clone(),
+                selected_dispatch - acknowledged[0].clone() * precompile_dispatch[0].clone(),
             );
 
             let seq_pc = [
@@ -1772,7 +1765,7 @@ impl BuiltInComponent for CpuChip {
             for i in 0..4 {
                 eval.add_constraint(
                     soft_host.clone() * (next_pc[i].clone() - pc[i].clone())
-                        - continues[0].clone() * (seq_pc[i].clone() - pc[i].clone()),
+                        - acknowledged[0].clone() * (seq_pc[i].clone() - pc[i].clone()),
                 );
             }
 
@@ -1781,7 +1774,7 @@ impl BuiltInComponent for CpuChip {
             // real row. Acknowledged rows may end a segment at resume_pc.
             let is_padding_next = crate::trace::trace_eval_next_row!(trace_eval, Column::IsPadding);
             eval.add_constraint(
-                (soft_host - continues[0].clone()) * (E::F::one() - is_padding_next[0].clone()),
+                (soft_host - acknowledged[0].clone()) * (E::F::one() - is_padding_next[0].clone()),
             );
         }
 
@@ -2446,7 +2439,6 @@ impl BuiltInComponent for CpuChip {
             let reg_b = crate::trace::trace_eval!(trace_eval, Column::RegB);
             let reg_d = crate::trace::trace_eval!(trace_eval, Column::RegD);
             let imm = crate::trace::trace_eval!(trace_eval, Column::ImmBytes);
-            let host_call_allowed = crate::trace::trace_eval!(trace_eval, Column::HostCallAllowed);
             let fb0 = crate::trace::trace_eval!(trace_eval, Column::FlagByte0);
             let fb1 = crate::trace::trace_eval!(trace_eval, Column::FlagByte1);
             let fb2 = crate::trace::trace_eval!(trace_eval, Column::FlagByte2);
@@ -2466,7 +2458,6 @@ impl BuiltInComponent for CpuChip {
             tuple.push(reg_b[0].clone());
             tuple.push(reg_d[0].clone());
             tuple.extend_from_slice(&imm);
-            tuple.push(host_call_allowed[0].clone());
             tuple.push(fb0[0].clone());
             tuple.push(fb1[0].clone());
             tuple.push(fb2[0].clone());

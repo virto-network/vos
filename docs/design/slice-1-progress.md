@@ -264,3 +264,73 @@ changes the format again anyway:
 - **Step 1.5** adds the remaining check: a precompile write marks its page
   dirty.
 
+
+## Step 1.4: page-proportional memory
+
+- **Permissions.** `PagePerms` is a two-level table of 1,024-page slots.
+  Each slot is uniform (one permission) or mixed (one byte per page); a
+  write that leaves a slot uniform collapses it back. Laying out or
+  unmapping a 4 GiB space therefore costs one entry per slot. The access
+  checks, revisions and page-granular fault classification are unchanged,
+  and a proptest compares every check, and the canonical runs, against a
+  flat one-byte-per-page model.
+- **Frames.** `SparseMem`'s page → frame table is a second two-level table,
+  with leaves allocated on a slot's first frame. Two touched pages in a
+  4 GiB span now cost under 64 KiB, down from a 4 MiB table and a 1 MiB
+  permission vector.
+- **Deviation from the plan.** The plan put a page's frame and permission
+  in one leaf behind a last-page cache. Separate tables keep a uniform
+  permission slot from allocating a frame leaf. They cost nothing
+  measurable, so the cache was not needed. Five alternating S1 runs put the
+  interpreter's compute workload at a median of 186 ms, against 195 ms
+  for the step 1.3 build, which is within noise.
+- **Layout.** Inner machines and refine layout unmap the space with one
+  range and then map each region, instead of building a million-entry
+  vector.
+- **JIT.** The permission map records changed slots in a bitmap.
+  `NativeMemory::sync_permissions` visits only those, keeping a per-slot
+  mirror of what it installed, so a slot that ends uniform and already
+  matches costs neither a table write nor an `mprotect`. The window's
+  per-page table is still what compiled code reads. A window's first sync
+  applies every slot, and a cloned map starts with every slot changed. So
+  a map attached to a pooled or fresh window always installs in full;
+  step 1.6 relies on this.
+- **Prover.** The refine collector commits permissions as the map's
+  maximal runs (`refine-memory-permissions/v2`: page count, run count, then
+  each run's length and permission), which is canonical and proportional
+  to the map's changes. Value commitments already scan only allocated
+  frames. Refine bundle format 4.
+- **Re-pin.** The step 1.2 follow-ups land here. `HostCallContinuesH` was
+  an alias of the acknowledgment and is gone. `HostCallAllowed` leaves the
+  CPU and ProgramMemory chips (the program-memory tuple drops from 33 to 32
+  limbs): an acknowledged row must select exactly one precompile relation
+  whose weighted id equals the committed dispatch, so the dispatch is
+  non-zero, which holds only for the calls the proof runtime handles. The
+  runtime's allow-list is now defined as "dispatch is non-zero", so the two
+  cannot drift. The JAR fields had already left the state commitment in
+  step 1.2. Proof format 24 (Poseidon2 variant 25). No program commitment
+  is pinned in-tree until the voucher-check fixture returns in step 5.
+- **Gates** (`machines` in `pvm/bench`, medians of 201 fresh machines):
+
+  | | Before | After |
+  |---|---|---|
+  | Create + lay out the actor machine, interpreter | 143.2 µs | 5.3 µs |
+  | Create + lay out the actor machine, JIT | 52.8 µs | 13.1 µs |
+  | First resume of a fresh JIT machine | 368.7 µs | 12.0 µs |
+  | S1 compute on the interpreter | 195 ms | 186 ms |
+
+  The JIT's straight runs of S1's small workloads drop from about 400 µs
+  to about 60 µs, since every run paid the full permission diff before.
+  S2's `nesting` agrees. The agent machine per refine drops from 147 µs to
+  6.0 µs on the interpreter and from 55 µs to 15.1 µs on the JIT, and the
+  JIT actor's first call drops from 358 µs to 17.1 µs.
+- **Review.** Fable found no blocking issues: the column removal is sound,
+  and the run encoding is canonical and uniquely decodable. On its advice a
+  fresh window syncs in full and a cloned map is marked changed, with a
+  test. Before, a drained map attached to a new window would have left it
+  inaccessible. It also flagged `RecompiledPvm::set_page_perms` as a second
+  writer of the window's table. That function belongs to the standalone
+  JIT used by the conformance vectors and writes its own mapping, never a
+  `NativeMemory` window, so it was left alone.
+
+**Step 1.4 is done.**

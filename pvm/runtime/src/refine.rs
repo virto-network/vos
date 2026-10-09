@@ -292,11 +292,11 @@ impl Machine {
         let mut mem = prepared
             .allocate_memory(max_addr, use_sparse)
             .map_err(|_| RefineError::Backend)?;
-        let mut page_perms = vec![PERM_NONE; (max_addr / page) as usize];
+        let pages = mem.pages();
+        mem.set_page_range(0, pages, PERM_NONE);
         for r in regions.iter().filter(|r| r.size > 0) {
             let perm = if r.writable { PERM_RW } else { PERM_RO };
-            let first = (r.base / page) as usize;
-            page_perms[first..first + (r.size / page) as usize].fill(perm);
+            mem.set_page_range((r.base / page) as usize, (r.size / page) as usize, perm);
         }
         for (base, data) in [
             (layout.ro.base, layout.ro_data),
@@ -308,13 +308,12 @@ impl Machine {
             }
         }
 
-        let mut interp = Interpreter::from_predecoded(
+        let interp = Interpreter::from_predecoded(
             prepared.interpreter_program().clone(),
             registers,
             mem,
             gas,
         );
-        interp.set_page_perms(page_perms);
 
         Ok(Self {
             initial_gas: gas,
@@ -495,7 +494,7 @@ impl Invocation {
         }
         let first = (ptr / PVM_PAGE_SIZE as u64) as usize;
         let last = ((end - 1) / PVM_PAGE_SIZE as u64) as usize;
-        if self.mem.page_perms()[first..=last].contains(&PERM_NONE) {
+        if !self.mem.pages_mapped(first, last - first + 1) {
             return None;
         }
         let mut out = Vec::new();
@@ -696,7 +695,10 @@ mod tests {
                     assert_eq!(cold.pc, reused.pc);
                     assert_eq!(cold.output_bounded(4096), reused.output_bounded(4096));
                     assert_eq!(cold.memory().span(), reused.memory().span());
-                    assert_eq!(cold.memory().page_perms(), reused.memory().page_perms());
+                    assert_eq!(
+                        cold.memory().permission_runs(),
+                        reused.memory().permission_runs()
+                    );
                     let prog = parse_standard_program(blob).unwrap();
                     let layout = prog.layout(args).unwrap();
                     for region in [layout.ro, layout.rw, layout.stack, layout.args] {
@@ -733,8 +735,8 @@ mod tests {
                     assert_eq!(reference.pc, native.pc, "native pc");
                     assert_eq!(reference.output_bounded(4096), native.output_bounded(4096));
                     assert_eq!(
-                        reference.memory().page_perms(),
-                        native.memory().page_perms()
+                        reference.memory().permission_runs(),
+                        native.memory().permission_runs()
                     );
                     let program = parse_standard_program(blob).unwrap();
                     let layout = program.layout(args).unwrap();
@@ -1136,6 +1138,7 @@ mod tests {
             .map(|index| (index as u8).wrapping_mul(17).wrapping_add(3))
             .collect();
         let permissions = vec![PERM_RO, PERM_RW];
+        let runs = vec![(0, 1, PERM_RO), (1, 1, PERM_RW)];
 
         for gas_charged in [false, true] {
             for (name, blob, pc) in cases
@@ -1156,8 +1159,8 @@ mod tests {
                 assert_eq!(machine.gas_charged(), gas_charged, "{name}: funded flag");
                 assert_eq!(*machine.registers(), registers, "{name}: registers");
                 assert_eq!(
-                    machine.memory().page_perms(),
-                    permissions,
+                    machine.memory().permission_runs(),
+                    runs,
                     "{name}: permissions"
                 );
                 let mut actual = vec![0; bytes.len()];
@@ -1170,7 +1173,7 @@ mod tests {
                 assert_eq!(invocation.pc, 0, "{name}: final counter");
                 assert_eq!(invocation.gas_used, 0, "{name}: no charge");
                 assert_eq!(invocation.registers, registers, "{name}: final registers");
-                assert_eq!(invocation.memory().page_perms(), permissions);
+                assert_eq!(invocation.memory().permission_runs(), runs);
                 let mut actual = vec![0; bytes.len()];
                 invocation.memory().read_bytes(0, &mut actual);
                 assert_eq!(actual, bytes, "{name}: final memory");

@@ -21,8 +21,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::Proof;
 
-/// Wire shape of the boundary bundle itself.
-pub const REFINE_BUNDLE_FORMAT_VERSION: u32 = 3;
+/// Wire shape of the boundary bundle itself and the encoding of the machine
+/// states its boundaries commit to.
+///
+/// 4 — machine-state permission commitments hash the map's maximal runs
+///     instead of one byte per page.
+pub const REFINE_BUNDLE_FORMAT_VERSION: u32 = 4;
 /// Post-decode protocol ceiling for independently proven machine slices.
 pub const MAX_REFINE_PROOF_SLICES: usize = 1_024;
 /// A handled outer host call can contribute at most one boundary per slice.
@@ -756,7 +760,7 @@ mod prover {
                         cache.value_image = image;
                     }
                     None => {
-                        let permission_commitment = permission_commitment(memory.page_perms());
+                        let permission_commitment = permission_commitment(memory);
                         #[cfg(test)]
                         {
                             self.full_permission_scans += 1;
@@ -777,7 +781,7 @@ mod prover {
             }
 
             if permissions_changed {
-                let commitment = permission_commitment(memory.page_perms());
+                let commitment = permission_commitment(memory);
                 #[cfg(test)]
                 {
                     self.full_permission_scans += 1;
@@ -1489,11 +1493,18 @@ mod prover {
         crate::page_merkle::blake2b256(&bytes)
     }
 
-    fn permission_commitment(permissions: &[u8]) -> [u8; 32] {
+    /// Commits the permission map through its canonical maximal runs, so the
+    /// cost follows the map's permission changes rather than its span.
+    fn permission_commitment(memory: &vos_pvm::interpreter::Memory) -> [u8; 32] {
+        let runs = memory.permission_runs();
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"vos/pvm/refine-memory-permissions/v1\0");
-        put_u64(&mut bytes, permissions.len() as u64);
-        bytes.extend_from_slice(permissions);
+        bytes.extend_from_slice(b"vos/pvm/refine-memory-permissions/v2\0");
+        put_u64(&mut bytes, memory.pages() as u64);
+        put_u64(&mut bytes, runs.len() as u64);
+        for (_, count, permission) in runs {
+            put_u64(&mut bytes, count as u64);
+            bytes.push(permission);
+        }
         crate::page_merkle::blake2b256(&bytes)
     }
 
@@ -1883,10 +1894,10 @@ mod tests {
     #[test]
     fn proof_generation_numbers_reject_previous_formats() {
         #[cfg(not(feature = "poseidon2-channel"))]
-        assert_eq!(crate::PROOF_FORMAT_VERSION, 22);
+        assert_eq!(crate::PROOF_FORMAT_VERSION, 24);
         #[cfg(feature = "poseidon2-channel")]
-        assert_eq!(crate::PROOF_FORMAT_VERSION, 23);
-        for previous in 16..=21 {
+        assert_eq!(crate::PROOF_FORMAT_VERSION, 25);
+        for previous in 16..=23 {
             assert_ne!(crate::PROOF_FORMAT_VERSION, previous);
         }
     }

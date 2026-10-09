@@ -1096,15 +1096,6 @@ pub enum Column {
     /// handled and acknowledged by the embedder; zero for unhandled calls.
     #[size = 1]
     HostCallAcknowledged,
-    /// ProgramMemory-authenticated policy bit: one only for an ECALLI
-    /// identifier implemented by the proof runtime's precompile handlers. An
-    /// acknowledged row must have this bit set.
-    #[size = 1]
-    HostCallAllowed,
-    /// Equal to `HostCallAcknowledged`: one for acknowledged ECALLI rows,
-    /// zero for unhandled calls and non-host instructions.
-    #[size = 1]
-    HostCallContinuesH,
 
     /// `IsLoad + IsStore`: scalar-memory instructions, all subject to the
     /// protected-zone rule.

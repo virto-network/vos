@@ -6,12 +6,19 @@
 //! allocation or a live file descriptor after construction.
 
 use crate::backing::{BackingStore, CodeWindow};
+use crate::interpreter::memory::{PagePerms, SLOT_PAGES, SlotPerms};
 
 pub(crate) struct NativeMemory {
     host: *mut u8,
     span: usize,
     window: CodeWindow,
-    permissions_revision: Option<u64>,
+    /// Per permission slot: the permission installed on every page of the
+    /// slot, or `None` when the window's table holds mixed entries. Lets a
+    /// changed slot that is uniform again skip its table and mprotect.
+    applied: Vec<Option<u8>>,
+    /// Whether a permission map has been applied to this window. The first
+    /// sync applies every slot, whatever the map's changed bits say.
+    synced: bool,
 }
 
 impl core::fmt::Debug for NativeMemory {
@@ -71,7 +78,10 @@ impl NativeMemory {
             host: host.cast(),
             span,
             window,
-            permissions_revision: None,
+            // The window maps guest pages PROT_NONE and its permission
+            // table starts zeroed.
+            applied: vec![Some(0); (span / 4096).div_ceil(SLOT_PAGES)],
+            synced: false,
         })
     }
 
@@ -105,48 +115,75 @@ impl NativeMemory {
         }
     }
 
-    pub(crate) fn sync_permissions(&mut self, perms: &[u8], revision: u64) -> Result<(), String> {
-        if self.permissions_revision == Some(revision) {
-            return Ok(());
-        }
-        if perms.len() != self.span / 4096 {
+    /// Bring the window's protection and permission table in line with
+    /// `perms`, visiting only the slots changed since the last sync.
+    pub(crate) fn sync_permissions(&mut self, perms: &mut PagePerms) -> Result<(), String> {
+        if perms.pages() != self.span / 4096 {
             return Err("invalid native memory permissions".into());
         }
-        // SAFETY: CodeWindow allocates a permission byte for every guest page.
-        let old = unsafe { core::slice::from_raw_parts_mut(self.window.perms(), perms.len()) };
-        let mut first = 0;
-        while first < perms.len() {
-            if old[first] == perms[first] {
-                first += 1;
-                continue;
-            }
-            let permission = perms[first];
-            let mut end = first + 1;
-            while end < perms.len() && perms[end] == permission && old[end] != permission {
-                end += 1;
-            }
-            let protection = match permission {
-                0 => libc::PROT_NONE,
-                1 => libc::PROT_READ,
-                _ => libc::PROT_READ | libc::PROT_WRITE,
-            };
-            // SAFETY: the page-aligned range belongs to this native alias.
-            if unsafe {
-                libc::mprotect(
-                    self.window.base().add(first * 4096).cast(),
-                    (end - first) * 4096,
-                    protection,
-                )
-            } != 0
-            {
-                return Err("failed to install native memory permissions".into());
-            }
-            old[first..end].fill(permission);
-            first = end;
+        if !self.synced {
+            perms.mark_all_changed();
         }
-        self.permissions_revision = Some(revision);
+        let window = &self.window;
+        let applied = &mut self.applied;
+        perms.drain_changed(|first, len, contents| {
+            let slot = first / SLOT_PAGES;
+            // SAFETY: CodeWindow allocates a permission byte for every guest
+            // page, and the slot lies within the span.
+            let old = unsafe { core::slice::from_raw_parts_mut(window.perms().add(first), len) };
+            match contents {
+                SlotPerms::Uniform(permission) => {
+                    if applied[slot] != Some(permission) {
+                        protect(window, first, len, permission)?;
+                        old.fill(permission);
+                        applied[slot] = Some(permission);
+                    }
+                }
+                SlotPerms::Mixed(new) => {
+                    let mut page = 0;
+                    while page < len {
+                        if old[page] == new[page] {
+                            page += 1;
+                            continue;
+                        }
+                        let permission = new[page];
+                        let mut end = page + 1;
+                        while end < len && new[end] == permission && old[end] != permission {
+                            end += 1;
+                        }
+                        protect(window, first + page, end - page, permission)?;
+                        old[page..end].fill(permission);
+                        page = end;
+                    }
+                    applied[slot] = None;
+                }
+            }
+            Ok(())
+        })?;
+        self.synced = true;
         Ok(())
     }
+}
+
+/// Protect `count` guest pages from `first` in the window.
+fn protect(window: &CodeWindow, first: usize, count: usize, permission: u8) -> Result<(), String> {
+    let protection = match permission {
+        0 => libc::PROT_NONE,
+        1 => libc::PROT_READ,
+        _ => libc::PROT_READ | libc::PROT_WRITE,
+    };
+    // SAFETY: the page-aligned range belongs to this native alias.
+    if unsafe {
+        libc::mprotect(
+            window.base().add(first * 4096).cast(),
+            count * 4096,
+            protection,
+        )
+    } != 0
+    {
+        return Err("failed to install native memory permissions".into());
+    }
+    Ok(())
 }
 
 impl core::ops::Deref for NativeMemory {
@@ -180,8 +217,13 @@ mod tests {
     #[test]
     fn aliases_share_values_and_permissions_never_restrict_host_initialization() {
         let mut memory = NativeMemory::new(3 * 4096).unwrap();
+        let mut perms = PagePerms::new_rw(3);
+        let mut install = |memory: &mut NativeMemory, map: &[u8]| {
+            perms.install(map.to_vec());
+            memory.sync_permissions(&mut perms)
+        };
         memory[4096] = 17;
-        memory.sync_permissions(&[0, 1, 2], 1).unwrap();
+        install(&mut memory, &[0, 1, 2]).unwrap();
         // SAFETY: the guest's middle page was made readable above.
         assert_eq!(unsafe { *memory.window().base().add(4096) }, 17);
         memory[4096] = 23;
@@ -191,14 +233,14 @@ mod tests {
             *memory.window().base().add(8192) = 31;
         }
         assert_eq!(memory[8192], 31);
-        memory.sync_permissions(&[0, 0, 0], 2).unwrap();
+        install(&mut memory, &[0, 0, 0]).unwrap();
         assert_eq!(memory[4096], 23, "unmapping does not erase logical values");
         assert!(memory.clear_pages(1, 2));
         assert_eq!(
             memory[8192], 0,
             "clear removes data even while the native alias is inaccessible"
         );
-        memory.sync_permissions(&[0, 1, 0], 3).unwrap();
+        install(&mut memory, &[0, 1, 0]).unwrap();
         assert_eq!(unsafe { *memory.window().base().add(4096) }, 0);
         let permissions = unsafe { core::slice::from_raw_parts(memory.window().perms(), 4) };
         assert_eq!(
@@ -213,7 +255,7 @@ mod tests {
             0,
             "clearing also zeroes a currently read-only native alias"
         );
-        memory.sync_permissions(&[0, 2, 0], 4).unwrap();
+        install(&mut memory, &[0, 2, 0]).unwrap();
         unsafe {
             *memory.window().base().add(4096) = 77;
         }
@@ -221,14 +263,43 @@ mod tests {
     }
 
     #[test]
+    fn a_map_applies_fully_to_any_new_window() {
+        let window_table = |memory: &NativeMemory| {
+            // SAFETY: the window holds a permission byte per guest page.
+            unsafe { core::slice::from_raw_parts(memory.window().perms(), 3) }.to_vec()
+        };
+        let mut perms = PagePerms::new_rw(3);
+        perms.install(vec![0, 1, 2]);
+        let mut first = NativeMemory::new(3 * 4096).unwrap();
+        first.sync_permissions(&mut perms).unwrap();
+        assert_eq!(window_table(&first), [0, 1, 2]);
+
+        // The drained map, and a clone of it, still install fully on a
+        // window that has never seen them.
+        let mut fresh = NativeMemory::new(3 * 4096).unwrap();
+        fresh.sync_permissions(&mut perms).unwrap();
+        assert_eq!(window_table(&fresh), [0, 1, 2]);
+        let mut clone = perms.clone();
+        clone.install(vec![2, 2, 2]);
+        let mut other = NativeMemory::new(3 * 4096).unwrap();
+        other.sync_permissions(&mut perms.clone()).unwrap();
+        assert_eq!(window_table(&other), [0, 1, 2]);
+        first.sync_permissions(&mut clone).unwrap();
+        assert_eq!(window_table(&first), [2, 2, 2]);
+        // SAFETY: every page of the first window is now writable.
+        unsafe { *first.window().base().add(2 * 4096) = 9 };
+        assert_eq!(first[2 * 4096], 9);
+    }
+
+    #[test]
     fn zero_span_is_empty_and_bad_permission_maps_fail_explicitly() {
         let mut memory = NativeMemory::new(0).unwrap();
         assert!(memory.is_empty());
-        memory.sync_permissions(&[], 1).unwrap();
+        memory.sync_permissions(&mut PagePerms::new_rw(0)).unwrap();
         assert!(memory.clear_pages(0, 0));
         assert!(!memory.clear_pages(0, 1));
         assert!(!memory.clear_pages(usize::MAX, 1));
-        assert!(memory.sync_permissions(&[2], 2).is_err());
+        assert!(memory.sync_permissions(&mut PagePerms::new_rw(1)).is_err());
         assert!(NativeMemory::new(1).is_err());
         assert!(NativeMemory::new((1usize << 32) + 4096).is_err());
     }

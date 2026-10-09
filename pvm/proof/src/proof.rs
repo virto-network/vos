@@ -171,14 +171,20 @@ use crate::recursion_pcs::ProverMerkleHasher;
 ///        host call must select exactly one precompile relation; lifecycle
 ///        stubs no longer continue. Older proofs reject.
 ///   23 — Poseidon2-M31 PCS variant of format 22.
+///   24 — Dispatch-committed host-call policy. CpuChip drops the
+///        acknowledgment alias and the policy bit, which the committed
+///        precompile dispatch already implies; ProgramMemory drops the policy
+///        column (the program-memory tuple drops from 33 to 32 limbs), so
+///        program commitments change. Older proofs reject.
+///   25 — Poseidon2-M31 PCS variant of format 24.
 #[cfg(not(feature = "poseidon2-channel"))]
-pub const PROOF_FORMAT_VERSION: u32 = 22;
+pub const PROOF_FORMAT_VERSION: u32 = 24;
 /// Native recursion: the PCS commit hash + Fiat-Shamir
 /// transcript move from Blake2s to Poseidon2-M31, so `stark_proof.commitments`
 /// become `P2Hash` digests — a different wire format. A Blake2s verifier
-/// (v22) and a Poseidon2-M31 verifier (v23) therefore reject each other's proofs.
+/// (v24) and a Poseidon2-M31 verifier (v25) therefore reject each other's proofs.
 #[cfg(feature = "poseidon2-channel")]
-pub const PROOF_FORMAT_VERSION: u32 = 23;
+pub const PROOF_FORMAT_VERSION: u32 = 25;
 
 /// Exact number of commitment trees in this generation of the Stwo proof:
 /// preprocessed, main, interaction, and split composition.

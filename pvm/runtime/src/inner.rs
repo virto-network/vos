@@ -250,7 +250,8 @@ impl InnerMachine {
                     self.execution.backend() != PvmBackend::ForceRecompiler,
                 )
                 .map_err(|_| InnerError::Backend)?;
-            memory.set_page_perms(vec![PERM_NONE; INNER_ADDRESS_PAGES]);
+            let pages = memory.pages();
+            memory.set_page_range(0, pages, PERM_NONE);
             let mut vm = Interpreter::from_predecoded(
                 self.execution.interpreter_program().clone(),
                 [0; PVM_REGISTER_COUNT],
@@ -406,7 +407,7 @@ impl InnerMachines {
         let first = first as usize;
         let count = count as usize;
         if matches!(mode, PageMode::SetReadOnly | PageMode::SetReadWrite)
-            && memory.page_perms()[first..first + count].contains(&PERM_NONE)
+            && !memory.pages_mapped(first, count)
         {
             return Err(InnerError::Invalid);
         }

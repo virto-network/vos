@@ -47,11 +47,10 @@ fn read_page(memory: &Memory, index: u32) -> Page {
 
 fn writable_pages(memory: &Memory) -> Vec<u32> {
     memory
-        .page_perms()
-        .iter()
-        .enumerate()
-        .filter(|(_, perm)| **perm == PERM_RW)
-        .map(|(index, _)| index as u32)
+        .permission_runs()
+        .into_iter()
+        .filter(|&(_, _, perm)| perm == PERM_RW)
+        .flat_map(|(first, count, _)| first as u32..(first + count) as u32)
         .collect()
 }
 

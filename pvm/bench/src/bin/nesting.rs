@@ -6,10 +6,11 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use vos_pvm::inner::{InnerExit, InnerMachines, InvokeState, PageMode};
+use vos_pvm::inner::{InnerExit, InnerMachines, InvokeState};
 use vos_pvm::refine::{Invocation, Machine, MemoryModel, PreparedProgram};
 use vos_pvm::refine_host::RefineContext;
 use vos_pvm::{ExitReason, PvmBackend};
+use vos_pvm_bench::{LoadedActor, Spi, le, load_actor, parse_standard_program};
 
 const INPUT_NEXT: u64 = 0x100;
 const STATE_GET: u64 = 0x101;
@@ -19,9 +20,6 @@ const ACTOR_GET: u64 = 0x200;
 const ACTOR_PUT: u64 = 0x201;
 const ACTOR_YIELD: u64 = 0x2ff;
 
-const ZONE: u64 = 0x1_0000;
-const PAGE: u64 = 4096;
-const INPUT: u64 = 1 << 24;
 const HALT: u64 = (1 << 32) - (1 << 16);
 const AGENT_GAS: u64 = 1 << 50;
 const ACTOR_GAS: u64 = 1_000_000_000;
@@ -34,91 +32,10 @@ static ROUND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0
 static PHASES_PRINTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 type State = HashMap<u64, u64>;
 
-// ── Standard program pieces ─────────────────────────────────
-
-struct Spi {
-    ro: Vec<u8>,
-    rw: Vec<u8>,
-    heap_pages: u64,
-    stack: u64,
-    code: Vec<u8>,
-}
-
-fn le(bytes: &[u8]) -> u64 {
-    bytes
-        .iter()
-        .rev()
-        .fold(0, |acc, b| acc << 8 | u64::from(*b))
-}
-
-fn parse_spi(spi: &[u8]) -> Spi {
-    let ro_len = le(&spi[0..3]) as usize;
-    let rw_len = le(&spi[3..6]) as usize;
-    let at = 11 + ro_len + rw_len;
-    let code_len = le(&spi[at..at + 4]) as usize;
-    Spi {
-        ro: spi[11..11 + ro_len].to_vec(),
-        rw: spi[11 + ro_len..at].to_vec(),
-        heap_pages: le(&spi[6..8]),
-        stack: le(&spi[8..11]),
-        code: spi[at + 4..at + 4 + code_len].to_vec(),
-    }
-}
-
-// ── Native host: the node drives the actor itself ───────────
-
-struct NativeActor {
-    id: u32,
-    stack_top: u64,
-    args_base: u64,
-    /// Writable regions (base, size): what a pooled machine must reset.
-    writable: Vec<(u64, u64)>,
-}
-
-fn native_load(inner: &mut InnerMachines, spi: &Spi) -> NativeActor {
-    let id = inner.create(&spi.code, 0).expect("create");
-    let pages = |inner: &mut InnerMachines, base: u64, size: u64, mode| {
-        inner
-            .pages(id, (base / PAGE) as u32, (size / PAGE) as u32, mode)
-            .expect("pages");
-    };
-    let ro_size = spi.ro.len() as u64;
-    let ro_size = ro_size.div_ceil(PAGE) * PAGE;
-    if ro_size > 0 {
-        pages(inner, ZONE, ro_size, PageMode::AllocateReadWrite);
-        inner.poke(id, ZONE as u32, &spi.ro).expect("poke ro");
-        pages(inner, ZONE, ro_size, PageMode::SetReadOnly);
-    }
-    let rw_base = 2 * ZONE + (spi.ro.len() as u64).div_ceil(ZONE) * ZONE;
-    let rw_size = (spi.rw.len() as u64 + spi.heap_pages * PAGE).div_ceil(PAGE) * PAGE;
-    if rw_size > 0 {
-        pages(inner, rw_base, rw_size, PageMode::AllocateReadWrite);
-        if !spi.rw.is_empty() {
-            inner.poke(id, rw_base as u32, &spi.rw).expect("poke rw");
-        }
-    }
-    let stack_top = (1 << 32) - 2 * ZONE - INPUT;
-    let stack_size = spi.stack.div_ceil(PAGE) * PAGE;
-    pages(
-        inner,
-        stack_top - stack_size,
-        stack_size,
-        PageMode::AllocateReadWrite,
-    );
-    let args_base = (1 << 32) - ZONE - INPUT;
-    pages(inner, args_base, PAGE, PageMode::AllocateReadWrite);
-    NativeActor {
-        id,
-        stack_top,
-        args_base,
-        writable: vec![(rw_base, rw_size), (stack_top - stack_size, stack_size)],
-    }
-}
-
 /// Restore a used machine's writable memory to the program image (zeros
 /// here, as the actor has no initialized data), as a pool would without
 /// dirty-page tracking.
-fn native_reset(inner: &mut InnerMachines, actor: &NativeActor) {
+fn native_reset(inner: &mut InnerMachines, actor: &LoadedActor) {
     static ZEROS: [u8; 1 << 20] = [0; 1 << 20];
     for (base, size) in &actor.writable {
         inner
@@ -147,7 +64,7 @@ struct Batch {
 
 fn native_call(
     inner: &mut InnerMachines,
-    actor: &NativeActor,
+    actor: &LoadedActor,
     request: &[u8],
     state: &State,
     batch: &mut Batch,
@@ -222,13 +139,13 @@ fn native_batch(
     let mut cached = None;
     for request in requests {
         if reuse != Reuse::Fresh {
-            let actor = cached.get_or_insert_with(|| native_load(&mut inner, spi));
+            let actor = cached.get_or_insert_with(|| load_actor(&mut inner, spi));
             native_call(&mut inner, actor, request, state, &mut batch);
             if reuse == Reuse::Reset {
                 native_reset(&mut inner, actor);
             }
         } else {
-            let actor = native_load(&mut inner, spi);
+            let actor = load_actor(&mut inner, spi);
             native_call(&mut inner, &actor, request, state, &mut batch);
             inner.expunge(actor.id).expect("expunge");
         }
@@ -405,7 +322,7 @@ fn backends() -> [(&'static str, PvmBackend, MemoryModel); 2] {
 fn main() {
     let agent_spi = vos_pvm_bench::guest_program("agent");
     let actor_spi = vos_pvm_bench::guest_program("actor");
-    let actor = parse_spi(&actor_spi);
+    let actor = parse_standard_program(&actor_spi);
     println!(
         "agent {} bytes; actor {} bytes (code {}, ro {}, rw {}, heap pages {}, stack {})",
         agent_spi.len(),
@@ -598,7 +515,7 @@ fn main() {
         let per_yield = (us(yields(count)) - us(yields(1))) / (count - 1) as f64;
         let native_yield = {
             let mut inner = InnerMachines::with_backend(backend);
-            let a = native_load(&mut inner, &actor);
+            let a = load_actor(&mut inner, &actor);
             inner.poke(a.id, a.args_base as u32, b"Y").unwrap();
             let mut registers = [0u64; 13];
             registers[0] = HALT;
@@ -671,7 +588,7 @@ fn main() {
             create.push(started.elapsed());
             inner.expunge(id).unwrap();
             let started = Instant::now();
-            let a = native_load(&mut inner, &actor);
+            let a = load_actor(&mut inner, &actor);
             layout.push(started.elapsed());
             let mut batch = Batch::default();
             let started = Instant::now();

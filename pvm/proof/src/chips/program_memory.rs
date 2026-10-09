@@ -1,7 +1,7 @@
 //! ProgramMemoryChip — a preprocessed table mapping each basic-block-starting
 //! PC of `code` to its decoded instruction tuple `(opcode, skip_len, reg_a,
-//! reg_b, reg_d, imm, host_call_allowed, flag_bytes[6], imm_y_canon,
-//! branch_target_canon, host_call_precompile_dispatch)`.
+//! reg_b, reg_d, imm, flag_bytes[6], imm_y_canon, branch_target_canon,
+//! host_call_precompile_dispatch)`.
 //!
 //! The tuple's flag bag carries per-opcode category/sub-category flags
 //! so a prover can't clear flags to skip per-op constraints.  The 48
@@ -9,7 +9,7 @@
 //! preprocessed table and CpuChip's main trace.  CpuChip emits 6
 //! byte-to-bits lookups per row to bind each individual flag column
 //! (or its sum-of-sub-flags expression for the 5 folded category
-//! slots) back to its packed byte.  The prog_mem tuple is 33 limbs.
+//! slots) back to its packed byte.  The prog_mem tuple is 32 limbs.
 //!
 //! Soundness chain:
 //!   - The preprocessed columns commit, via the Merkle root the verifier
@@ -97,10 +97,6 @@ pub enum PreprocessedColumn {
     /// padding).
     #[size = 8]
     Imm,
-    /// One only for a Standard ECALLI identifier handled by the proof
-    /// runtime. Commits the host-dispatch policy with the instruction.
-    #[size = 1]
-    HostCallAllowed,
     /// 6 packed flag bytes.  Each byte holds 8 of the 48
     /// canonical category/sub-category flags as bits 0..7.  Layout per
     /// byte is documented in `lookups/relations.rs` next to
@@ -134,9 +130,10 @@ pub enum PreprocessedColumn {
     /// tuple lookup, so a prover can't forge a static-jump destination.
     #[size = 4]
     BranchTargetCanon,
-    /// Exact cryptographic precompile dispatch identifier for an Ecalli/Ecall
-    /// instruction (100 or 110..=114), or zero for stubs/non-precompiles.
-    /// Appended so prior preprocessed-column offsets remain stable.
+    /// Exact cryptographic precompile dispatch identifier for an ECALLI
+    /// instruction (100 or 110..=114), or zero for any other instruction or
+    /// identifier. Non-zero exactly for the calls the proof runtime handles,
+    /// so it also commits the host-dispatch policy.
     #[size = 1]
     HostCallPrecompileDispatch,
 }
@@ -160,8 +157,6 @@ impl BuiltInComponent for ProgramMemoryChip {
         let reg_b = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::RegB);
         let reg_d = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::RegD);
         let imm = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::Imm);
-        let host_call_allowed =
-            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::HostCallAllowed);
         let fb0 = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::FlagByte0);
         let fb1 = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::FlagByte1);
         let fb2 = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::FlagByte2);
@@ -181,8 +176,8 @@ impl BuiltInComponent for ProgramMemoryChip {
         let mult = crate::trace::trace_eval!(trace_eval, Column::Multiplicity);
 
         // Tuple: pc[4] + opcode + skip_len + reg_a + reg_b + reg_d + imm[8]
-        //        + host_call_allowed + 6 packed flag bytes + imm_y_canon[4]
-        //        + branch_target_canon[4] + host_call_precompile_dispatch = 33 limbs.
+        //        + 6 packed flag bytes + imm_y_canon[4] + branch_target_canon[4]
+        //        + host_call_precompile_dispatch = 32 limbs.
         let mut tuple: Vec<E::F> = pc.to_vec();
         tuple.push(opcode[0].clone());
         tuple.push(skip_len[0].clone());
@@ -190,7 +185,6 @@ impl BuiltInComponent for ProgramMemoryChip {
         tuple.push(reg_b[0].clone());
         tuple.push(reg_d[0].clone());
         tuple.extend_from_slice(&imm);
-        tuple.push(host_call_allowed[0].clone());
         tuple.push(fb0[0].clone());
         tuple.push(fb1[0].clone());
         tuple.push(fb2[0].clone());
@@ -238,11 +232,6 @@ impl BuiltInProverComponent for ProgramMemoryChip {
                 trace.fill_columns(row, d.rb, PreprocessedColumn::RegB);
                 trace.fill_columns(row, d.rd, PreprocessedColumn::RegD);
                 trace.fill_columns(row, d.imm, PreprocessedColumn::Imm);
-                trace.fill_columns(
-                    row,
-                    d.host_call_allowed,
-                    PreprocessedColumn::HostCallAllowed,
-                );
                 trace.fill_columns_bytes(
                     row,
                     &d.branch_target_canon.to_le_bytes(),
@@ -318,10 +307,6 @@ impl BuiltInProverComponent for ProgramMemoryChip {
         let reg_d =
             crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::RegD);
         let imm = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::Imm);
-        let host_call_allowed = crate::trace::preprocessed_base_column!(
-            component_trace,
-            PreprocessedColumn::HostCallAllowed
-        );
         let fb0 =
             crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::FlagByte0);
         let fb1 =
@@ -346,7 +331,7 @@ impl BuiltInProverComponent for ProgramMemoryChip {
         );
         let mult = crate::trace::original_base_column!(component_trace, Column::Multiplicity);
 
-        // Build the 33-limb tuple from preprocessed columns.
+        // Build the 32-limb tuple from preprocessed columns.
         let mut tuple: Vec<_> = pc.to_vec();
         tuple.push(opcode[0].clone());
         tuple.push(skip_len[0].clone());
@@ -354,7 +339,6 @@ impl BuiltInProverComponent for ProgramMemoryChip {
         tuple.push(reg_b[0].clone());
         tuple.push(reg_d[0].clone());
         tuple.extend_from_slice(&imm);
-        tuple.push(host_call_allowed[0].clone());
         tuple.push(fb0[0].clone());
         tuple.push(fb1[0].clone());
         tuple.push(fb2[0].clone());
@@ -391,7 +375,6 @@ struct Decoded {
     rb: u8,
     rd: u8,
     imm: u64,
-    host_call_allowed: bool,
     host_call_precompile_dispatch: u8,
     flags: [u8; 48],
     branch_target_canon: u32,
@@ -430,8 +413,6 @@ fn decode_at(code: &[u8], bitmask: &[u8], pc: usize) -> Decoded {
     let imm_y = crate::core::tracing::decode_imm_y(&decoded_args);
     let branch_target_canon = crate::core::tracing::decode_branch_target(&decoded_args);
     let f = crate::chips::cpu::classify_opcode_for_program_memory(opcode);
-    let host_call_allowed =
-        opcode == Opcode::Ecalli && crate::core::ecall::is_proof_host_call_allowed(imm);
     let host_call_precompile_dispatch = if matches!(opcode, Opcode::Ecalli) {
         crate::core::ecall::proof_precompile_dispatch_id(imm)
     } else {
@@ -444,7 +425,6 @@ fn decode_at(code: &[u8], bitmask: &[u8], pc: usize) -> Decoded {
         rb: rb as u8,
         rd: rd as u8,
         imm,
-        host_call_allowed,
         host_call_precompile_dispatch,
         flags: f,
         branch_target_canon,

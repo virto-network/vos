@@ -67,9 +67,6 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         trace.fill_columns(row, step.skip_len as u8, Column::SkipLen);
         // 8-byte immediate witness for the ProgramMemory lookup.
         trace.fill_columns_bytes(row, &step.imm.to_le_bytes(), Column::ImmBytes);
-        let host_call_allowed = step.opcode == crate::core::opcode::Opcode::Ecalli
-            && crate::core::ecall::is_proof_host_call_allowed(step.imm);
-        trace.fill_columns(row, host_call_allowed, Column::HostCallAllowed);
         let host_call_precompile_dispatch =
             if matches!(step.opcode, crate::core::opcode::Opcode::Ecalli) {
                 crate::core::ecall::proof_precompile_dispatch_id(step.imm)
@@ -1875,14 +1872,13 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
 
         // ── Host-call disposition ──
         // ECALLI retains its cause PC until the proof runtime handles it. The
-        // AIR authenticates the opcode class and the static HostCallAllowed
-        // policy bit before accepting this acknowledgment.
+        // AIR authenticates the opcode class and the committed precompile
+        // dispatch before accepting this acknowledgment.
         trace.fill_columns(
             row,
             step.host_call_acknowledged,
             Column::HostCallAcknowledged,
         );
-        trace.fill_columns(row, step.host_call_acknowledged, Column::HostCallContinuesH);
     }
 
     for &b in &range_bytes {

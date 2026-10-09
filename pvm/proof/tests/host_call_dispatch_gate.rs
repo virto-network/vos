@@ -162,8 +162,8 @@ fn acknowledged_precompile_cannot_clear_or_swap_exact_dispatch_selector() {
 }
 
 /// Only an ECALLI row can be acknowledged. Forge a complete, internally
-/// consistent precompile continuation on the terminal trap row: policy bit,
-/// exact selector and dispatch all agree, yet the CPU AIR must reject it.
+/// consistent precompile continuation on the terminal trap row: the
+/// selector and dispatch agree, yet the CPU AIR must reject it.
 #[test]
 fn non_ecalli_row_cannot_be_acknowledged() {
     let mut side_note = traced_side_note(ECALL_SCALAR_ADD_MOD_L);
@@ -184,8 +184,6 @@ fn non_ecalli_row_cannot_be_acknowledged() {
     let mut forged = trace;
     for (column, value) in [
         (Column::HostCallAcknowledged, 1u32),
-        (Column::HostCallContinuesH, 1),
-        (Column::HostCallAllowed, 1),
         (Column::Is114Ecall, 1),
         (
             Column::HostCallPrecompileDispatch,
