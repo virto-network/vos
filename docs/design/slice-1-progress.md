@@ -644,9 +644,8 @@ section 14 of the core model carries the budget rows.
     image, removes most of this cost.
   - The budget this cycle serves, actor invocation at ≤ 50 µs, passes
     with margin: 12.7 µs nested on the JIT.
-  - **For the owner:** accept the miss as a slice 2 item tied to the actor
-    ABI (recommended), or amend the gate to a JIT full cycle of ≤ 10 µs
-    until slice 2.
+  - **Decided by the owner:** the miss is a slice 2 item, closed with the
+    actor ABI's request delivery.
 - **Carried forward,** as logged in the plan:
   - the Ristretto and scalar ids, and the legacy tracer's allow-set, go to
     step 5;
