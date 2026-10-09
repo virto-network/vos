@@ -1,12 +1,15 @@
 //! Invocation overhead (spike S2): the ledger actor hosted by the agent program as a
 //! JAM inner machine (nested path) versus driven by the node directly
 //! (fast path), on the interpreter and the JIT, with a machine built per
-//! request (fresh) or reused across a batch (warm).
+//! request (fresh), lent from the machine pool per request (pooled), or
+//! reused across a batch (warm).
 
 use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use vos_pvm::inner::{InnerExit, InnerMachines, InvokeState};
+use vos_pvm::inner::{InnerExit, InnerMachines, InvokeState, PageMode};
+use vos_pvm::pool::{MachinePool, PoolProgram};
 use vos_pvm::refine::{Invocation, Machine, MemoryModel, PreparedProgram};
 use vos_pvm::refine_host::RefineContext;
 use vos_pvm::{ExitReason, PvmBackend};
@@ -19,6 +22,7 @@ const PROGRAM: u64 = 0x103;
 const ACTOR_GET: u64 = 0x200;
 const ACTOR_PUT: u64 = 0x201;
 const ACTOR_YIELD: u64 = 0x2ff;
+const INSTANTIATE: u64 = 0x480;
 
 const HALT: u64 = (1 << 32) - (1 << 16);
 const AGENT_GAS: u64 = 1 << 50;
@@ -118,9 +122,37 @@ fn native_call(
     }
 }
 
+/// The node's pool, with the actor installed.
+static ACTOR_POOL: OnceLock<(Arc<MachinePool>, Arc<PoolProgram>)> = OnceLock::new();
+
+/// Lend the actor from the pool, with a page mapped for its request at the
+/// standard argument address.
+fn pooled_actor(inner: &mut InnerMachines, program: &Arc<PoolProgram>) -> LoadedActor {
+    const ZONE: u64 = 0x1_0000;
+    const INPUT: u64 = 1 << 24;
+    let id = inner.instantiate(program).expect("instantiate");
+    let args_base = (1 << 32) - ZONE - INPUT;
+    inner
+        .pages(
+            id,
+            (args_base / 4096) as u32,
+            1,
+            PageMode::AllocateReadWrite,
+        )
+        .expect("request page");
+    LoadedActor {
+        id,
+        stack_top: (1 << 32) - 2 * ZONE - INPUT,
+        args_base,
+        writable: Vec::new(),
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Reuse {
     Fresh,
+    /// A machine lent from the pool per request, reset when expunged.
+    Pooled,
     Warm,
     /// Warm, with writable memory reset to the image after every request.
     Reset,
@@ -135,10 +167,18 @@ fn native_batch(
 ) -> (Batch, Duration) {
     let started = Instant::now();
     let mut inner = InnerMachines::with_backend(backend);
+    let (pool, program) = ACTOR_POOL.get().expect("actor pool");
+    if reuse == Reuse::Pooled {
+        inner.set_pool(Arc::clone(pool));
+    }
     let mut batch = Batch::default();
     let mut cached = None;
     for request in requests {
-        if reuse != Reuse::Fresh {
+        if reuse == Reuse::Pooled {
+            let actor = pooled_actor(&mut inner, program);
+            native_call(&mut inner, &actor, request, state, &mut batch);
+            inner.expunge(actor.id).expect("expunge");
+        } else if reuse != Reuse::Fresh {
             let actor = cached.get_or_insert_with(|| load_actor(&mut inner, spi));
             native_call(&mut inner, actor, request, state, &mut batch);
             if reuse == Reuse::Reset {
@@ -165,15 +205,31 @@ fn run_agent(
     prepared: &PreparedProgram,
     model: MemoryModel,
     args: &[u8],
+    pooled: bool,
     host: impl FnMut(u64, &mut Machine) -> Result<(), ExitReason>,
 ) -> (Invocation, Duration) {
     let started = Instant::now();
-    let context =
+    let mut context =
         RefineContext::load_prepared(prepared, args, AGENT_GAS, model).expect("load agent");
+    if pooled {
+        context = context.with_pool(Arc::clone(&ACTOR_POOL.get().expect("actor pool").0));
+    }
     let invocation = context.try_run_with_host(host).expect("backend");
     let elapsed = started.elapsed();
     assert_eq!(invocation.exit, ExitReason::Halt, "agent did not halt");
     (invocation, elapsed)
+}
+
+/// How the agent hosts the actor across a batch.
+#[derive(Clone, Copy, PartialEq)]
+enum Hosting {
+    /// Built with `machine`, `pages` and `poke` per request.
+    Fresh,
+    /// Built once and reused.
+    Warm,
+    /// Lent from the pool with `instantiate` per request. Without a pool
+    /// the host answers `WHAT` and the agent builds the actor itself.
+    Pooled { pool: bool },
 }
 
 fn nested_batch(
@@ -182,10 +238,20 @@ fn nested_batch(
     actor_spi: &[u8],
     requests: &[Request],
     state: &State,
-    warm: bool,
+    hosting: Hosting,
 ) -> (Vec<u8>, Duration) {
     let mut next = 0;
-    let (invocation, elapsed) = run_agent(prepared, model, &[b'N', warm as u8], |id, machine| {
+    let mut args = vec![b'N'];
+    match hosting {
+        Hosting::Fresh => args.push(0),
+        Hosting::Warm => args.push(1),
+        Hosting::Pooled { .. } => {
+            args.push(2);
+            args.extend_from_slice(&vos_pvm::pool::CodeHash::of(actor_spi).0);
+        }
+    }
+    let pooled = matches!(hosting, Hosting::Pooled { pool: true });
+    let (invocation, elapsed) = run_agent(prepared, model, &args, pooled, |id, machine| {
         let registers = *machine.registers();
         let result = match id {
             INPUT_NEXT => match requests.get(next) {
@@ -219,6 +285,8 @@ fn nested_batch(
                 );
                 actor_spi.len() as u64
             }
+            // A host without a pool answers `instantiate` as JAM does.
+            INSTANTIATE => u64::MAX - 1,
             _ => return Err(ExitReason::Panic),
         };
         machine.registers_mut()[7] = result;
@@ -238,7 +306,7 @@ fn nested_accumulate(
 ) -> Duration {
     let mut args = vec![b'A'];
     args.extend_from_slice(result);
-    run_agent(prepared, model, &args, |id, machine| {
+    run_agent(prepared, model, &args, false, |id, machine| {
         if id != STATE_PUT {
             return Err(ExitReason::Panic);
         }
@@ -323,6 +391,11 @@ fn main() {
     let agent_spi = vos_pvm_bench::guest_program("agent");
     let actor_spi = vos_pvm_bench::guest_program("actor");
     let actor = parse_standard_program(&actor_spi);
+    let pool = Arc::new(MachinePool::new());
+    let program = pool
+        .program(&pool.install(&actor_spi).expect("install"))
+        .unwrap();
+    let _ = ACTOR_POOL.set((pool, program));
     println!(
         "agent {} bytes; actor {} bytes (code {}, ro {}, rw {}, heap pages {}, stack {})",
         agent_spi.len(),
@@ -359,7 +432,7 @@ fn main() {
                     &actor_spi,
                     &transfers[..1],
                     &state,
-                    true,
+                    Hosting::Warm,
                 )),
                 "fresh" => drop(native_batch(
                     backend,
@@ -367,6 +440,13 @@ fn main() {
                     &transfers[..1],
                     &state,
                     Reuse::Fresh,
+                )),
+                "pooled" => drop(native_batch(
+                    backend,
+                    &actor,
+                    &transfers[..1],
+                    &state,
+                    Reuse::Pooled,
                 )),
                 "agent" => drop(
                     RefineContext::load_prepared(&agent, &[b'N', 1], AGENT_GAS, model).unwrap(),
@@ -457,7 +537,8 @@ fn main() {
         let agent = PreparedProgram::new_with_backend(&agent_spi, backend).unwrap();
 
         // Correctness: nested and native agree on writes, replies and state.
-        let (result, _) = nested_batch(&agent, model, &actor_spi, &transfers, &state, true);
+        let (result, _) =
+            nested_batch(&agent, model, &actor_spi, &transfers, &state, Hosting::Warm);
         let (writes, replies, checksum) = decode_result(&result);
         let (native, _) = native_batch(backend, &actor, &transfers, &state, Reuse::Warm);
         assert_eq!(writes, native.writes, "writes differ");
@@ -466,8 +547,14 @@ fn main() {
             (native.replies, native.checksum),
             "replies differ"
         );
-        let (fresh_result, _) = nested_batch(&agent, model, &actor_spi, &transfers, &state, false);
-        assert_eq!(fresh_result, result, "fresh and warm nested runs differ");
+        for hosting in [
+            Hosting::Fresh,
+            Hosting::Pooled { pool: true },
+            Hosting::Pooled { pool: false },
+        ] {
+            let (other, _) = nested_batch(&agent, model, &actor_spi, &transfers, &state, hosting);
+            assert_eq!(other, result, "nested hostings differ");
+        }
         let mut applied = state.clone();
         nested_accumulate(&agent, model, &result, &mut applied);
         let mut expected = state.clone();
@@ -486,7 +573,7 @@ fn main() {
             args.extend_from_slice(&k.to_le_bytes());
             median(
                 (0..REPEATS)
-                    .map(|_| run_agent(&agent, model, &args, |_, _| Ok(())).1)
+                    .map(|_| run_agent(&agent, model, &args, false, |_, _| Ok(())).1)
                     .collect(),
             )
         };
@@ -497,7 +584,7 @@ fn main() {
             median(
                 (0..REPEATS)
                     .map(|_| {
-                        run_agent(&agent, model, &args, |id, machine| {
+                        run_agent(&agent, model, &args, false, |id, machine| {
                             if id == PROGRAM {
                                 let at = machine.registers()[7] as u32;
                                 assert!(machine.memory_mut().write_bytes_checked(at, &actor_spi));
@@ -622,33 +709,42 @@ fn main() {
                 if label == "query" && !warm {
                     continue;
                 }
-                let mode = if warm { "warm" } else { "fresh" };
-                let nested = |k: usize| {
-                    median(
-                        (0..REPEATS)
-                            .map(|_| {
-                                nested_batch(
-                                    &agent,
-                                    model,
-                                    &actor_spi,
-                                    &op_requests[..k],
-                                    &state,
-                                    warm,
-                                )
-                                .1
-                            })
-                            .collect(),
-                    )
+                let hostings: &[(Hosting, &str)] = if warm {
+                    &[(Hosting::Warm, "warm")]
+                } else {
+                    &[
+                        (Hosting::Fresh, "fresh"),
+                        (Hosting::Pooled { pool: true }, "pooled"),
+                    ]
                 };
-                let (fixed, marginal) = split(nested(1), nested(n), n);
-                println!(
-                    "   {:<28} {fixed:>14.1} {marginal:>16.2}",
-                    format!("nested {label} {mode}")
-                );
+                for &(hosting, mode) in hostings {
+                    let nested = |k: usize| {
+                        median(
+                            (0..REPEATS)
+                                .map(|_| {
+                                    nested_batch(
+                                        &agent,
+                                        model,
+                                        &actor_spi,
+                                        &op_requests[..k],
+                                        &state,
+                                        hosting,
+                                    )
+                                    .1
+                                })
+                                .collect(),
+                        )
+                    };
+                    let (fixed, marginal) = split(nested(1), nested(n), n);
+                    println!(
+                        "   {:<28} {fixed:>14.1} {marginal:>16.2}",
+                        format!("nested {label} {mode}")
+                    );
+                }
                 let reuses: &[(Reuse, &str)] = match (label, warm) {
                     ("transfer", true) => &[(Reuse::Warm, "warm"), (Reuse::Reset, "warm + reset")],
                     (_, true) => &[(Reuse::Warm, "warm")],
-                    _ => &[(Reuse::Fresh, "fresh")],
+                    _ => &[(Reuse::Fresh, "fresh"), (Reuse::Pooled, "pooled")],
                 };
                 for (reuse, mode) in reuses {
                     let native = |k: usize| {

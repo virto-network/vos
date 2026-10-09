@@ -602,3 +602,45 @@ signed off on all three.
   - the code hash and initial counter are documented.
 
 **Step 1.6 is done.**
+
+## Step 1.7: acceptance
+
+The S1, S2 and S5b harnesses ran against the finished base. The full
+numbers are in `spikes.md` ("S1, S2 and S5b on the slice 1 base"), and
+section 14 of the core model carries the budget rows.
+
+- **Harness changes.**
+  - S1 measures a restore onto a pooled machine: acquire it and write
+    the snapshot's pages.
+  - S2's fast path has a pooled mode: per request, `instantiate`, map a
+    request page, call, `expunge`.
+  - S2's agent guest has a pooled mode too: it calls `instantiate` with
+    the actor's code hash, and builds the actor itself when the host
+    answers `WHAT`. Both give the same work result as building it fresh.
+- **Results against the plan's gates:**
+
+  | Gate | Threshold | Result |
+  |---|---|---|
+  | Conformance | all v0.8.0 vectors, both backends, every step | pass |
+  | Prover | library, settlement verifier, S5b agreement and tampering | pass (`just ci-full`) |
+  | Soundness of the constraint change | negative gates; second reviewer | pass; Fable signed off |
+  | Machine creation | ≤ 50 µs, both backends | 7–10 µs interpreter, about 35 µs JIT |
+  | Interpreter speed | ≤ about 10% slower on S1 compute | within noise after step 1.4; +2.8% after tracking |
+  | Pooled acquire plus reset | ≤ 5 µs, small actor, including use | 2.4 µs interpreter, 3.5 µs JIT, after a use |
+  | Refine fixed cost | ≤ 50 µs | 6.0–6.3 µs interpreter, 16–18 µs JIT |
+  | Dirty capture | ≤ 20 µs for 3 pages; ≤ 5% on compute | 0.2–0.6 µs and 6–19 µs; +2.8% and within noise |
+  | Pool isolation | differential test passes | passes on both backends |
+  | JAR | the grep check finds nothing | clean, and part of `ci` |
+
+- **Reading of the pooled gate.** On the JIT, the use itself costs about
+  4 µs: the actor maps a request page every time, and its first writes
+  fault into tracking. Counted in, a full acquire, use and reset takes
+  about 7.6 µs. A request region the actor framework keeps mapped would
+  remove most of it; slice 2 designs that framework.
+- **Carried forward,** as logged in the plan:
+  - the Ristretto and scalar ids, and the legacy tracer's allow-set, go to
+    step 5;
+  - proving refines that call `instantiate` goes to step 5;
+  - `state_read` writes join the pool's property test in slice 2.
+
+**Slice 1 is done.**

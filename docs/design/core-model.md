@@ -1020,16 +1020,16 @@ These form a prover track that runs alongside the core slices (section 16).
   verification on the interpreter.
 - The shared-executor Raft driver keeps vos-raft's core free of threads.
 
-## 14. Performance budgets [decided; measured in run 3]
+## 14. Performance budgets [decided; measured in run 3 and slice 1]
 
 | Path | Budget | Measured | Status |
 |---|---|---|---|
-| Actor invocation, refine and accumulate, one node | ≤ 50 µs | 3.6–5.0 µs marginal on an in-memory store (S2); estimated 15–20 µs with storage and pool reset | passes with section 16 work |
+| Actor invocation, refine and accumulate, one node | ≤ 50 µs | with a pooled actor machine per request, on an in-memory store: 7.1 µs nested in the agent on the interpreter, 12.7 µs on the JIT; 3.5 and 9.3 µs driven by the node (slice 1, S2) | passes; storage arrives in slice 2 |
 | Committed-map write on the apply path [proposed] | ≤ 5 µs; background root building keeps up with apply | not yet measured; node rows in accumulate would cost 35–45 µs (S4) | needs background roots |
-| Fixed cost per refine [proposed] | ≤ 50 µs; pooled acquire and reset ≤ 5 µs; a new machine ≤ 50 µs | 0.8–1.6 ms today (S2) | needs the pool |
+| Fixed cost per refine [proposed] | ≤ 50 µs; pooled acquire and reset ≤ 5 µs; a new machine ≤ 50 µs | agent machine per refine 6.3 µs (interpreter) and 16.3 µs (JIT); pooled acquire plus reset after a use 2.4 and 3.5 µs; a new machine 7–10 and about 35 µs (slice 1) | passes |
 | Replicated agent on 3 LAN nodes, simple mutations | ≥ 20k per second per agent; p99 commit ≤ 10 ms at half load | about 25k/s at p99 8 ms with the prototype driver, on redb, one process, one disk (S3) | passes with section 16 work; repeat on fjall and a network |
 | Many active agents per node [proposed] | 64 active agents: ≥ 40k commits per second in total, p99 ≤ 20 ms | 6.3–26k/s at p99 31–191 ms (S3) | fails; work item 16 |
-| Workflow snapshot capture plus restore, up to 50 KB | ≤ 1 ms | about 16 µs estimated capture (S1); restore 0.1 ms fresh JIT, plus about 0.5 ms first resume today | passes with section 16 work; pooled restore not yet measured |
+| Workflow snapshot capture plus restore, up to 50 KB | ≤ 1 ms | 3-page suspensions: capture 0.2–0.5 µs (interpreter) and 8–12 µs (JIT), copying and hashing the pages 10–15 µs, restore onto a pooled machine 0.3 µs; a 2 MiB suspension restores in 150–190 µs and about 400 µs (slice 1, S1) | passes |
 | Table point read or write at 10M rows (host cost) | ≤ 5 µs | write 1.5 µs; read 5.2–5.6 µs warm, about 0.1 ms cold (S4) | writes pass; reads fail narrowly |
 | Query on a follower | ≤ 100 µs | 1.5–2.3 µs of execution plus reads (S2, S4) | passes warm |
 | Merge apply, cost per operation at 1M operations | ≤ 2× the cost at 1k | 1.5–1.8× with incremental apply on LWW maps, in memory (S6) | passes with section 16 work |

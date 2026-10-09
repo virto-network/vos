@@ -822,3 +822,54 @@ removed it.
 The earlier figure of about 10.7M cycles was measured under JAR. One segment
 fits a refine's gas budget comfortably; a settlement window of many segments
 needs aggregation (core model section 11.4).
+
+## Note — S1, S2 and S5b on the slice 1 base
+
+Slice 1's step 1.7 reran the in-tree S1 (`snapshots`), S2 (`nesting`) and
+S5b (`precompile`) harnesses against the finished PVM base: Gray Paper
+0.8.0 only, page-proportional memory, dirty-page tracking and the machine
+pool. Same laptop, other work running (load average 3–5).
+
+**S1, snapshots.** Captures use dirty-page tracking; a full scan of the
+writable pages stays as the before-picture and as a check.
+
+| Suspension | Scan | Capture, interpreter | Capture, JIT | Restore, fresh JIT | Restore, pooled (interpreter / JIT) |
+|---|---|---|---|---|---|
+| Transfer and saga, 3 pages | 350–630 µs | 0.2–0.6 µs | 6–19 µs | 28–34 µs | 0.3 / 0.2–0.3 µs |
+| Compute, 34 changed pages | 0.8–1.7 ms | 0.9–2.8 µs | 10–37 µs | 440–500 µs | 150–190 / about 400 µs |
+
+Copying and hashing the pages to ship them costs 10–15 µs for three pages
+and about 120 µs for 34. A pooled restore acquires a machine and writes
+the snapshot's pages, which for the compute workload is all 514 dirty
+pages. On the JIT that is mostly faulting those pages back in, since the
+last reset discarded them.
+
+**S2, invocation** (per request, transfer):
+
+| Path | Interpreter | JIT |
+|---|---|---|
+| Nested in the agent, fresh actor (`machine`, `pages`, `poke`) | 12.0 µs | 59.1 µs |
+| Nested in the agent, pooled actor (`instantiate`) | 7.1 µs | 12.7 µs |
+| Nested in the agent, actor kept warm | 4.0 µs | 3.0 µs |
+| Driven by the node, fresh actor | 7.9 µs | 54.8 µs |
+| Driven by the node, pooled actor | 3.5 µs | 9.3 µs |
+| Driven by the node, actor kept warm | 0.9 µs | 0.6 µs |
+
+The agent's pooled path falls back to building the actor itself when the
+host answers `WHAT`, as JAM does; both give the same work result. An agent
+machine per refine costs 6.0 µs (interpreter) and 17.8 µs (JIT), against
+0.8–1.6 ms in S2.
+
+**S5b, precompile proving** (one slice, 24 GiB cap):
+
+| Hashes | Steps | Prove | Peak RSS | Proof | Verify |
+|---|---|---|---|---|---|
+| 1 | 470 | 2.11 s | 4.0 GiB | 856 KiB | 1.1 s |
+| 10 | 3,395 | 2.53 s | 4.4 GiB | 856 KiB | 1.2 s |
+| 100 | 32,645 | 5.64 s | 10.5 GiB | 866 KiB | 2.9 s |
+
+The guest now hashes through the shim crate's streaming `blake2b_hash`,
+which handles the domain and parts, so it takes about 325 steps per hash
+where the spike's hand-written loop took 66. The compressions themselves
+cost the same; proving 100 hashes is slower than in S5b because of those
+steps.

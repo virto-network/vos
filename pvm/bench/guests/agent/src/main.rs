@@ -37,6 +37,11 @@ const PAGES: u64 = 12;
 const INVOKE: u64 = 13;
 const EXPUNGE: u64 = 14;
 
+// VOS refine extension: an inner machine from the node's pool. A host
+// without it answers `WHAT`.
+const INSTANTIATE: u64 = 0x480;
+const WHAT: u64 = u64::MAX - 1;
+
 // Node calls (VOS extensions in this spike).
 const INPUT_NEXT: u64 = 0x100;
 const STATE_GET: u64 = 0x101;
@@ -276,7 +281,31 @@ fn call_actor(actor: &Actor, request: &[u8], batch: &mut Batch) {
     }
 }
 
-fn refine(warm: bool) -> &'static [u8] {
+/// The actor as an inner machine: from the node's pool when `hash` is given
+/// and the host serves `instantiate`, else built here. Either way a page is
+/// mapped for requests at the standard argument address.
+fn acquire_actor(spi: &[u8], hash: Option<&[u8]>) -> Actor {
+    if let Some(hash) = hash {
+        let (id, _) = hostcall!(INSTANTIATE, hash.as_ptr(), 0u64, 0u64, 0u64);
+        if id != WHAT {
+            assert!(id < 64);
+            let args_base = (1 << 32) - ZONE - INPUT;
+            let (status, _) = hostcall!(PAGES, id, args_base / PAGE, 1u64, 2u64);
+            assert!(status == 0);
+            return Actor {
+                id,
+                stack_top: (1 << 32) - 2 * ZONE - INPUT,
+                args_base,
+            };
+        }
+    }
+    load_actor(spi)
+}
+
+/// Serve a batch. `mode` 0 builds the actor per request, 1 reuses one
+/// actor, 2 takes the actor from the pool per request; `hash` names the
+/// actor for the pool.
+fn refine(mode: u8, hash: Option<&[u8]>) -> &'static [u8] {
     let program = PROGRAM_BUF.get();
     let (len, _) = hostcall!(PROGRAM, program.as_mut_ptr(), program.len(), 0u64, 0u64);
     let spi = &program[..len as usize];
@@ -293,11 +322,11 @@ fn refine(warm: bool) -> &'static [u8] {
             break;
         }
         let request = &input[..len as usize];
-        if warm {
+        if mode == 1 {
             let actor = cached.get_or_insert_with(|| load_actor(spi));
             call_actor(actor, request, &mut batch);
         } else {
-            let actor = load_actor(spi);
+            let actor = acquire_actor(spi, if mode == 2 { hash } else { None });
             call_actor(&actor, request, &mut batch);
             hostcall!(EXPUNGE, actor.id, 0u64, 0u64, 0u64);
         }
@@ -357,7 +386,10 @@ extern "C" fn agent_main(arguments: *const u8, len: u64) -> Output {
     // SAFETY: the host maps the argument window read-only at (a0, a1).
     let arguments = unsafe { core::slice::from_raw_parts(arguments, len as usize) };
     let output: &[u8] = match arguments.first() {
-        Some(b'N') => refine(arguments.get(1) == Some(&1)),
+        Some(b'N') => refine(
+            arguments.get(1).copied().unwrap_or(0),
+            arguments.get(2..34),
+        ),
         Some(b'A') => {
             accumulate(&arguments[1..]);
             &[]

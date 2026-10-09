@@ -12,10 +12,13 @@
 //! without tracking and as a check that the capture covers every change.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use blake2::{Blake2b512, Digest};
+use vos_pvm::inner::InnerMachines;
 use vos_pvm::interpreter::{Memory, PERM_RW};
+use vos_pvm::pool::MachinePool;
 use vos_pvm::refine::{Machine, MemoryModel, PreparedProgram};
 use vos_pvm::{ExitReason, PvmBackend};
 
@@ -146,6 +149,8 @@ struct Row {
     ship_us: f64,
     restore_interp_us: f64,
     restore_jit_us: f64,
+    pooled_interp_us: f64,
+    pooled_jit_us: f64,
     prefix_us: f64,
 }
 
@@ -155,6 +160,8 @@ fn median(mut values: Vec<f64>) -> f64 {
 }
 
 fn snapshot_run(spi: &[u8], args: &[u8], prefixes: &[Duration]) -> (String, Vec<Row>) {
+    let pool = Arc::new(MachinePool::new());
+    let program = pool.program(&pool.install(spi).unwrap()).unwrap();
     let code = code_blob(spi);
     let interp = PreparedProgram::new_with_backend(spi, PvmBackend::ForceInterpreter).unwrap();
     let jit = PreparedProgram::new_with_backend(spi, PvmBackend::ForceRecompiler).unwrap();
@@ -277,6 +284,27 @@ fn snapshot_run(spi: &[u8], args: &[u8], prefixes: &[Duration]) -> (String, Vec<
             restore_jit.push(started.elapsed().as_secs_f64() * 1e6);
         }
 
+        // Restore onto a machine lent from the pool: acquire it and write the
+        // snapshot pages. The reset when it returns is not part of the
+        // restore.
+        let pooled = |backend: PvmBackend| {
+            let mut samples = Vec::new();
+            for _ in 0..5 {
+                let mut inner = InnerMachines::with_backend(backend);
+                inner.set_pool(Arc::clone(&pool));
+                let started = Instant::now();
+                let id = inner.instantiate(&program).unwrap();
+                for (index, page) in &snapshot.pages {
+                    inner.poke(id, index * PAGE as u32, &page[..]).unwrap();
+                }
+                samples.push(started.elapsed().as_secs_f64() * 1e6);
+                inner.expunge(id).unwrap();
+            }
+            median(samples)
+        };
+        let pooled_interp_us = pooled(PvmBackend::ForceInterpreter);
+        let pooled_jit_us = pooled(PvmBackend::ForceRecompiler);
+
         rows.push(Row {
             dirty_pages: snapshot.pages.len(),
             delta_pages: delta.len(),
@@ -288,6 +316,8 @@ fn snapshot_run(spi: &[u8], args: &[u8], prefixes: &[Duration]) -> (String, Vec<
             ship_us,
             restore_interp_us: median(restore_interp),
             restore_jit_us: median(restore_jit),
+            pooled_interp_us,
+            pooled_jit_us,
             prefix_us: prefixes
                 .get(rows.len())
                 .map_or(0.0, |d| d.as_secs_f64() * 1e6),
@@ -336,7 +366,7 @@ fn main() {
             },
         );
         println!(
-            "   {:>3} {:>6} {:>6} {:>5} {:>8} {:>8} {:>8} {:>8} {:>8} {:>10} {:>10} {:>10}",
+            "   {:>3} {:>6} {:>6} {:>5} {:>8} {:>8} {:>8} {:>8} {:>8} {:>10} {:>10} {:>9} {:>9} {:>10}",
             "#",
             "dirty",
             "delta",
@@ -348,6 +378,8 @@ fn main() {
             "ship µs",
             "rst-int µs",
             "rst-jit µs",
+            "pool-int",
+            "pool-jit",
             "replay µs"
         );
         for (index, row) in rows.iter().enumerate() {
@@ -355,7 +387,7 @@ fn main() {
                 .get(index)
                 .map_or(0.0, |d| d.as_secs_f64() * 1e6);
             println!(
-                "   {:>3} {:>6} {:>6} {:>5} {:>8.1} {:>8.0} {:>8.1} {:>8.1} {:>8.1} {:>10.0} {:>10.0} {:>4.0}/{:<5.0}",
+                "   {:>3} {:>6} {:>6} {:>5} {:>8.1} {:>8.0} {:>8.1} {:>8.1} {:>8.1} {:>10.0} {:>10.0} {:>9.1} {:>9.1} {:>4.0}/{:<5.0}",
                 index,
                 row.dirty_pages,
                 row.delta_pages,
@@ -367,6 +399,8 @@ fn main() {
                 row.ship_us,
                 row.restore_interp_us,
                 row.restore_jit_us,
+                row.pooled_interp_us,
+                row.pooled_jit_us,
                 row.prefix_us,
                 jit_prefix,
             );
