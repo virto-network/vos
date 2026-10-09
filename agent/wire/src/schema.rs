@@ -89,7 +89,7 @@ impl Schema {
         if self.methods.len() > MAX_METHODS {
             return Err(SchemaError::Limits);
         }
-        let mut ids: Vec<MethodId> = Vec::with_capacity(self.methods.len());
+        let mut ids: Vec<u32> = Vec::with_capacity(self.methods.len());
         for method in &self.methods {
             if method.name.len() > MAX_NAME
                 || method
@@ -102,12 +102,15 @@ impl Schema {
             if method.id.0 == 0 {
                 return Err(SchemaError::ReservedId);
             }
-            if ids.contains(&method.id) {
-                return Err(SchemaError::Duplicate(method.id));
-            }
-            ids.push(method.id);
+            ids.push(method.id.0);
         }
-        Ok(())
+        // Sorted, a duplicate sits next to its twin: a refine validates a
+        // schema of a thousand methods without comparing every pair.
+        ids.sort_unstable();
+        match ids.windows(2).find(|pair| pair[0] == pair[1]) {
+            Some(pair) => Err(SchemaError::Duplicate(MethodId(pair[0]))),
+            None => Ok(()),
+        }
     }
 
     pub fn method(&self, id: MethodId) -> Option<&MethodSchema> {

@@ -5,7 +5,7 @@ use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, Sessi
 use vos_wire::jam::{AccumulateInput, Operand, RefineArgs, Transfer, WorkError};
 use vos_wire::keys;
 use vos_wire::result::{
-    Attest, InputRef, InstanceGas, Outcome, Outgoing, Run, Step, WorkResult, Write,
+    Attest, InputRef, InstanceGas, Outcome, Outgoing, ResultWriter, Run, Step, WorkResult, Write,
 };
 use vos_wire::{Decode, Encode};
 
@@ -437,4 +437,89 @@ fn kinds_encode_as_the_index_the_agent_passes() {
     assert_eq!(Kind::Command.encode(), [0]);
     assert_eq!(Kind::Query.encode(), [1]);
     assert_eq!(Kind::Attestable.encode(), [2]);
+}
+
+#[test]
+fn a_result_written_step_by_step_is_the_work_result_encoding() {
+    let step = |sequence| Step::Refused {
+        input: InputRef::Request {
+            session: SessionId(1),
+            sequence,
+        },
+        code: 1,
+    };
+    let mut writer = ResultWriter::new(3, 4, [5; 32]);
+    assert!(writer.push(&step(1)));
+    assert!(writer.push(&step(2)));
+    let result = WorkResult {
+        version: 3,
+        time: 4,
+        seed: [5; 32],
+        steps: vec![step(1), step(2)],
+    };
+    assert_eq!(writer.finish(), result.encode());
+
+    let big = Step::Ran(Run {
+        input: InputRef::Admin,
+        outcome: Outcome::Done(vec![0; abi::cap::WORK_RESULT / 3]),
+        instances: vec![],
+        writes: vec![],
+        messages: vec![],
+        attests: vec![],
+        gas_used: 0,
+    });
+    let mut writer = ResultWriter::new(0, 0, [0; 32]);
+    assert!(writer.push(&big));
+    assert!(writer.push(&big));
+    assert!(!writer.push(&big), "a third would pass the cap");
+    let (decoded, _) = WorkResult::decode(&writer.finish()).unwrap();
+    assert_eq!(decoded.steps.len(), 2);
+}
+
+/// A step at every cap, with as many writes and instances as its gas pays
+/// for, stays within `STEP_RESULT`.
+#[test]
+fn the_largest_step_fits_its_bound() {
+    use abi::cap;
+    use vos_wire::defaults::MAX_HANDLER_GAS;
+    let writes = (MAX_HANDLER_GAS / abi::price::PUT) as usize;
+    let mut write_bytes = vec![0usize; writes];
+    write_bytes[0] = cap::STEP_WRITES - writes;
+    let step = Step::Ran(Run {
+        input: InputRef::Request {
+            session: SessionId(u64::MAX),
+            sequence: u64::MAX,
+        },
+        outcome: Outcome::Done(vec![0; cap::REPLY]),
+        instances: (0..=MAX_HANDLER_GAS / abi::price::MACHINE)
+            .map(|instance| InstanceGas {
+                instance: InstanceId(instance as u32),
+                gas: 0,
+            })
+            .collect(),
+        writes: write_bytes
+            .into_iter()
+            .map(|len| Write {
+                key: vec![0],
+                value: Some(vec![0; len]),
+            })
+            .collect(),
+        messages: (0..cap::MESSAGES)
+            .map(|_| Outgoing {
+                to: AgentId(0),
+                instance: InstanceId(0),
+                method: MethodId(0),
+                arguments: vec![0; cap::MESSAGE],
+            })
+            .collect(),
+        attests: (0..cap::ATTESTS)
+            .map(|_| Attest {
+                program: ProgramHash([0; 32]),
+                arguments: vec![0; cap::REQUEST],
+                output: vec![0; cap::REPLY],
+            })
+            .collect(),
+        gas_used: u64::MAX,
+    });
+    assert!(step.encode().len() <= cap::STEP_RESULT);
 }

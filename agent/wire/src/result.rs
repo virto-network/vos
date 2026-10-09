@@ -3,11 +3,13 @@
 use alloc::vec::Vec;
 use scale::{Decode, Encode};
 
+use crate::abi::cap;
 use crate::ids::{AgentId, InstanceId, MethodId, ProgramHash, SessionId};
 
 /// What one refine produced. Steps are in dispatch order; accumulate applies
 /// their writes in that order. Inputs not covered by a step were not
-/// dispatched (the refine's gas ran short) and wait for the next batch.
+/// dispatched (the refine's gas ran short, or the next step would not fit
+/// [`cap::WORK_RESULT`]) and wait for the next batch.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct WorkResult {
     /// The state version the refine read; accumulate applies the result
@@ -16,6 +18,48 @@ pub struct WorkResult {
     pub time: u64,
     pub seed: [u8; 32],
     pub steps: Vec<Step>,
+}
+
+/// A [`WorkResult`]'s encoding, built a step at a time: each step's size
+/// is known as it is added, and finishing re-encodes nothing.
+pub struct ResultWriter {
+    bytes: Vec<u8>,
+    count: u32,
+    count_at: usize,
+}
+
+impl ResultWriter {
+    pub fn new(version: u64, time: u64, seed: [u8; 32]) -> Self {
+        let mut bytes = Vec::new();
+        version.encode_to(&mut bytes);
+        time.encode_to(&mut bytes);
+        seed.encode_to(&mut bytes);
+        let count_at = bytes.len();
+        0u32.encode_to(&mut bytes);
+        Self {
+            bytes,
+            count: 0,
+            count_at,
+        }
+    }
+
+    /// Add `step` if the result stays within [`cap::WORK_RESULT`]; false,
+    /// with nothing added, if it would not.
+    pub fn push(&mut self, step: &Step) -> bool {
+        let before = self.bytes.len();
+        step.encode_to(&mut self.bytes);
+        if self.bytes.len() > cap::WORK_RESULT {
+            self.bytes.truncate(before);
+            return false;
+        }
+        self.count += 1;
+        true
+    }
+
+    pub fn finish(mut self) -> Vec<u8> {
+        self.bytes[self.count_at..self.count_at + 4].copy_from_slice(&self.count.to_le_bytes());
+        self.bytes
+    }
 }
 
 /// One input's step.

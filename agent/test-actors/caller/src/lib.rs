@@ -75,6 +75,60 @@ impl Caller {
         .is_err()
     }
 
+    /// Call instance `next`, which hops on to `next + 1`, `remaining`
+    /// times: past the inner machines, the step fails.
+    #[msg]
+    pub async fn hop(&mut self, ctx: &mut Command<Self>, next: u32, remaining: u32) -> u32 {
+        if remaining == 0 {
+            return 0;
+        }
+        ctx.call(
+            Ref::<Caller>::new(InstanceId(next)),
+            caller::Hop {
+                next: next + 1,
+                remaining: remaining - 1,
+            },
+        )
+        .await
+        .unwrap_or(0)
+            + 1
+    }
+
+    /// Hop down `remaining` instances as `hop` does, then at the bottom make
+    /// `count` gets of absent keys (`kind` 0) or 64-byte scans (`kind` 1):
+    /// what an operation costs through every call frame.
+    #[msg(gas = 100_000_000)]
+    pub async fn dive(
+        &mut self,
+        ctx: &mut Command<Self>,
+        next: u32,
+        remaining: u32,
+        kind: u8,
+        count: u32,
+    ) -> u64 {
+        if remaining > 0 {
+            let call = caller::Dive {
+                next: next + 1,
+                remaining: remaining - 1,
+                kind,
+                count,
+            };
+            return ctx
+                .call(Ref::<Caller>::new(InstanceId(next)), call)
+                .await
+                .unwrap_or(0);
+        }
+        let mut rows = [0u8; 64];
+        let mut total = 0;
+        for index in 0..count {
+            total += match kind {
+                0 => u64::from(vos_sdk::host::get(&index.to_be_bytes()).is_some()),
+                _ => vos_sdk::host::scan(&[3], &[], &mut rows),
+            };
+        }
+        total
+    }
+
     /// Call this very instance: a cycle, which fails the step.
     #[msg]
     pub async fn recurse(&mut self, ctx: &mut Command<Self>) -> u64 {

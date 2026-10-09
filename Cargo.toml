@@ -24,6 +24,7 @@ exclude = [
     "pvm/proof/fuzz",
     "pvm/bench/guests",
     "agent/test-actors",
+    "agent/default",
     # The on-chain settlement verifier pins stwo without default features in
     # its own workspace, so prover features never co-resolve into it.
     "pvm/proof/settlement-verifier",

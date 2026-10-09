@@ -24,6 +24,17 @@ pub trait Encode {
     /// Encode self, appending to `buf`.
     fn encode_to(&self, buf: &mut Vec<u8>);
 
+    /// Encode a sequence's items, appending to `buf`: one by one, or in a
+    /// single copy for bytes.
+    fn encode_items(items: &[Self], buf: &mut Vec<u8>)
+    where
+        Self: Sized,
+    {
+        for item in items {
+            item.encode_to(buf);
+        }
+    }
+
     /// Encode self into a new Vec.
     fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::new();
@@ -36,6 +47,19 @@ pub trait Encode {
 pub trait Decode: Sized {
     /// Decode from `data`, returning `(value, bytes_consumed)`.
     fn decode(data: &[u8]) -> Result<(Self, usize), DecodeError>;
+
+    /// Decode `count` items from `data`: one by one, or in a single copy
+    /// for bytes.
+    fn decode_items(data: &[u8], count: usize) -> Result<(Vec<Self>, usize), DecodeError> {
+        let mut items = Vec::with_capacity(count);
+        let mut off = 0;
+        for _ in 0..count {
+            let (item, used) = Self::decode(&data[off..])?;
+            off += used;
+            items.push(item);
+        }
+        Ok((items, off))
+    }
 }
 
 // ============================================================================
@@ -45,6 +69,10 @@ pub trait Decode: Sized {
 impl Encode for u8 {
     fn encode_to(&self, buf: &mut Vec<u8>) {
         buf.push(*self);
+    }
+
+    fn encode_items(items: &[Self], buf: &mut Vec<u8>) {
+        buf.extend_from_slice(items);
     }
 }
 
@@ -130,6 +158,11 @@ impl Decode for u8 {
         }
         Ok((data[0], 1))
     }
+
+    fn decode_items(data: &[u8], count: usize) -> Result<(Vec<Self>, usize), DecodeError> {
+        let bytes = data.get(..count).ok_or(DecodeError::UnexpectedEof)?;
+        Ok((bytes.to_vec(), count))
+    }
 }
 
 impl Decode for u16 {
@@ -178,9 +211,7 @@ impl Decode for bool {
 
 impl<T: Encode, const N: usize> Encode for [T; N] {
     fn encode_to(&self, buf: &mut Vec<u8>) {
-        for item in self {
-            item.encode_to(buf);
-        }
+        T::encode_items(self, buf);
     }
 }
 
@@ -206,9 +237,7 @@ impl<const N: usize> Decode for [u8; N] {
 impl<T: Encode> Encode for [T] {
     fn encode_to(&self, buf: &mut Vec<u8>) {
         (self.len() as u32).encode_to(buf);
-        for item in self {
-            item.encode_to(buf);
-        }
+        T::encode_items(self, buf);
     }
 }
 
@@ -229,12 +258,8 @@ impl<T: Decode> Decode for Vec<T> {
                 remaining: data.len() as u32,
             });
         }
-        let mut items = Vec::with_capacity(count);
-        for _ in 0..count {
-            let (item, c) = T::decode(&data[off..])?;
-            off += c;
-            items.push(item);
-        }
+        let (items, used) = T::decode_items(&data[off..], count)?;
+        off += used;
         Ok((items, off))
     }
 }

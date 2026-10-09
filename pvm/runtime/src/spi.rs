@@ -21,7 +21,7 @@ pub use vos_pvm_program::{
 ///
 /// Runtime package admission uses this exact set to reject even unreachable
 /// calls outside it.
-pub const REFINE_HOST_CALL_ALLOWLIST: [u64; 11] = [
+pub const REFINE_HOST_CALL_ALLOWLIST: [u64; 12] = [
     0,
     9,
     10,
@@ -33,6 +33,7 @@ pub const REFINE_HOST_CALL_ALLOWLIST: [u64; 11] = [
     crate::precompile::BLAKE2B_COMPRESS,
     crate::inner::host_call::INSTANTIATE as u64,
     crate::inner::host_call::STATE_READ as u64,
+    crate::inner::host_call::STATE_SCAN as u64,
 ];
 
 /// Failure while inspecting a standard program's complete static host-call
@@ -242,6 +243,7 @@ mod tests {
                 crate::precompile::BLAKE2B_COMPRESS,
                 crate::inner::host_call::INSTANTIATE as u64,
                 crate::inner::host_call::STATE_READ as u64,
+                crate::inner::host_call::STATE_SCAN as u64,
             ]
         );
         let blob = host_call_program(&[14, 9, 0x400, 0x480, 14]);

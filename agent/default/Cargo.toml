@@ -1,0 +1,27 @@
+# The default agent program, built for the PVM with the guest toolchain:
+# `just build-agent`.
+[workspace]
+
+[package]
+name = "vos-agent"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "vos-agent"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+vos-pvm-program = { path = "../../pvm/program" }
+vos-pvm-precompiles = { path = "../../pvm/proof/precompiles", default-features = false, features = ["blake2b"] }
+vos-sdk = { path = "../sdk" }
+vos-wire = { path = "../wire" }
+
+[profile.release]
+opt-level = 3
+lto = true
+panic = "abort"
+codegen-units = 1

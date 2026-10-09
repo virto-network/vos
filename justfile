@@ -60,8 +60,13 @@ jar-check:
 build-test-actors:
     cd agent/test-actors; cargo build --release --target ../../pvm/guest/riscv64em-vos.json
 
-# The SDK, its macros' restrictions, and the test actors on the testkit.
-test-agent: build-test-actors
+# The default agent program, built with the guest toolchain in `pvm/guest`.
+build-agent:
+    cd agent/default; cargo build --release --target ../../pvm/guest/riscv64em-vos.json
+
+# The SDK, its macros' restrictions, the test actors on the testkit, and
+# the default agent against it.
+test-agent: build-test-actors build-agent
     cargo test -p vos-sdk -p vos-sdk-macros -p vos-testkit
 
 # Checks before pushing: everything except proving.

@@ -5,6 +5,31 @@ use scale::{Decode, Encode};
 
 use crate::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, SessionId};
 
+/// A refine's work item payload: a batch through the log, or a query on
+/// applied state.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum Work {
+    /// Refine returns the encoded [`crate::result::WorkResult`].
+    #[codec(index = 0)]
+    Batch(Batch),
+    /// Refine returns the encoded [`crate::result::Outcome`] and nothing
+    /// else: a query never writes.
+    #[codec(index = 1)]
+    Query(Query),
+}
+
+/// A `&self` handler on applied state, outside the log. Its time and seed
+/// are the last applied work result's.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct Query {
+    pub time: u64,
+    pub seed: [u8; 32],
+    pub caller: Principal,
+    pub instance: InstanceId,
+    pub method: MethodId,
+    pub arguments: Vec<u8>,
+}
+
 /// One refine's batch: the state version it builds on, the leader's time
 /// and seed for it, and the inputs in order.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]

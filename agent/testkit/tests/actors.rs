@@ -85,7 +85,21 @@ fn programs_carry_their_schema_first_in_read_only_data() {
         .iter()
         .map(|method| String::from_utf8(method.name.clone()).unwrap())
         .collect();
-    assert_eq!(names, ["increment", "value", "stamp"]);
+    assert_eq!(
+        names,
+        [
+            "increment",
+            "value",
+            "put_and_scan",
+            "echo",
+            "sneaky",
+            "unserved",
+            "fill",
+            "spam",
+            "ops",
+            "stamp"
+        ]
+    );
 
     let ledger = program("ledger");
     let parsed = vos_pvm::spi::parse_standard_program(&ledger).unwrap();

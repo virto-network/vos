@@ -1,0 +1,187 @@
+//! A program's heap: power-of-two size classes over an arena in `.bss`,
+//! each with a free list, so short-lived allocations cost a few
+//! instructions and freed memory is reused. Blocks past the largest class
+//! go on one first-fit list. Pages a program never touches cost nothing to
+//! run, but the pool prices a machine by its mapped pages, so the arena is
+//! sized per program: [`crate::program_runtime!`] takes it.
+
+use core::alloc::{GlobalAlloc, Layout};
+use core::cell::UnsafeCell;
+
+/// Classes 16 B ..= 128 KiB.
+const SMALLEST: u32 = 4;
+const CLASSES: usize = 14;
+const LARGEST: usize = 1 << (SMALLEST as usize + CLASSES - 1);
+const PAGE: usize = 4096;
+
+struct State {
+    /// The next untouched byte of the arena.
+    next: usize,
+    /// Free blocks per class: each holds the next one's address, or 0.
+    free: [usize; CLASSES],
+    /// Free blocks past the largest class, each starting with the next
+    /// one's address and its own size.
+    large: usize,
+}
+
+/// A heap of `ARENA` bytes.
+#[repr(C, align(4096))]
+pub struct Heap<const ARENA: usize> {
+    arena: UnsafeCell<[u8; ARENA]>,
+    state: UnsafeCell<State>,
+}
+
+// SAFETY: a program runs on one thread.
+unsafe impl<const ARENA: usize> Sync for Heap<ARENA> {}
+
+impl<const ARENA: usize> Default for Heap<ARENA> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A block's class, from its size and alignment; `None` past the largest.
+fn class(layout: &Layout) -> Option<usize> {
+    let size = layout.size().max(layout.align()).max(1 << SMALLEST);
+    (size <= LARGEST).then(|| (size.next_power_of_two().trailing_zeros() - SMALLEST) as usize)
+}
+
+impl<const ARENA: usize> Heap<ARENA> {
+    pub const fn new() -> Self {
+        Self {
+            arena: UnsafeCell::new([0; ARENA]),
+            state: UnsafeCell::new(State {
+                next: 0,
+                free: [0; CLASSES],
+                large: 0,
+            }),
+        }
+    }
+
+    /// Fresh arena bytes, aligned as asked; null when exhausted.
+    fn bump(&self, size: usize, align: usize) -> *mut u8 {
+        // SAFETY: single-threaded.
+        let state = unsafe { &mut *self.state.get() };
+        let base = self.arena.get() as usize;
+        let start = (base + state.next).next_multiple_of(align) - base;
+        match start.checked_add(size) {
+            Some(end) if end <= ARENA => {
+                state.next = end;
+                (base + start) as *mut u8
+            }
+            _ => core::ptr::null_mut(),
+        }
+    }
+}
+
+unsafe impl<const ARENA: usize> GlobalAlloc for Heap<ARENA> {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: single-threaded.
+        let state = unsafe { &mut *self.state.get() };
+        match class(&layout) {
+            Some(class) => {
+                let head = state.free[class];
+                if head != 0 {
+                    // SAFETY: a free block's first word links the next one.
+                    state.free[class] = unsafe { *(head as *const usize) };
+                    return head as *mut u8;
+                }
+                let size = 1usize << (class as u32 + SMALLEST);
+                self.bump(size, size.min(PAGE))
+            }
+            None => {
+                let size = layout.size().next_multiple_of(PAGE);
+                let mut previous: *mut usize = &mut state.large;
+                // SAFETY: the list links blocks this heap freed, each
+                // starting with its next link and its size.
+                unsafe {
+                    while *previous != 0 {
+                        let block = *previous as *mut usize;
+                        if *block.add(1) >= size {
+                            *previous = *block;
+                            return block.cast();
+                        }
+                        previous = block;
+                    }
+                }
+                self.bump(size, PAGE)
+            }
+        }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: single-threaded; `ptr` came from `alloc` with `layout`.
+        let state = unsafe { &mut *self.state.get() };
+        match class(&layout) {
+            Some(class) => {
+                // SAFETY: the block holds at least 16 bytes and is free.
+                unsafe { *(ptr as *mut usize) = state.free[class] };
+                state.free[class] = ptr as usize;
+            }
+            None => {
+                let block = ptr as *mut usize;
+                // SAFETY: as above, with room for the two-word header.
+                unsafe {
+                    *block = state.large;
+                    *block.add(1) = layout.size().next_multiple_of(PAGE);
+                }
+                state.large = ptr as usize;
+            }
+        }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        // SAFETY: the new layout keeps the old alignment.
+        let grown = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
+        // A block of the same class already fits.
+        if class(&layout).is_some() && class(&layout) == class(&grown) {
+            return ptr;
+        }
+        // SAFETY: GlobalAlloc's contract.
+        let new = unsafe { self.alloc(grown) };
+        if !new.is_null() {
+            // SAFETY: both blocks hold at least the smaller size.
+            unsafe {
+                core::ptr::copy_nonoverlapping(ptr, new, layout.size().min(new_size));
+                self.dealloc(ptr, layout);
+            }
+        }
+        new
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static HEAP: Heap<{ 1 << 20 }> = Heap::new();
+
+    #[test]
+    fn freed_blocks_are_reused_by_class_and_large_blocks_by_fit() {
+        let heap = &HEAP;
+        let small = Layout::from_size_align(24, 8).unwrap();
+        // SAFETY: allocations of nonzero size, freed with their layouts.
+        unsafe {
+            let a = heap.alloc(small);
+            let b = heap.alloc(small);
+            assert_ne!(a, b);
+            assert_eq!(a as usize % 32, 0, "a block aligns to its class");
+            heap.dealloc(a, small);
+            assert_eq!(heap.alloc(small), a, "the class's free list");
+
+            let large = Layout::from_size_align(200 << 10, 8).unwrap();
+            let c = heap.alloc(large);
+            heap.dealloc(c, large);
+            let smaller = Layout::from_size_align(150 << 10, 8).unwrap();
+            assert_eq!(heap.alloc(smaller), c, "first fit");
+
+            let grown = heap.realloc(b, small, 30);
+            assert_eq!(grown, b, "the same class grows in place");
+            let moved = heap.realloc(b, Layout::from_size_align(30, 8).unwrap(), 100);
+            assert_ne!(moved, b);
+
+            let huge = Layout::from_size_align(2 << 20, 8).unwrap();
+            assert!(heap.alloc(huge).is_null(), "past the arena");
+        }
+    }
+}

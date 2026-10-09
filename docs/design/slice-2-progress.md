@@ -235,3 +235,154 @@ work needs anyway for zero-knowledge masking, unblocks the toolchain.
 
 The heap size is fixed at 2 MiB for now; making it a program's choice
 waits for an actor that needs more.
+
+## Step 2.4: the default agent
+
+**Done:**
+
+- **`vos-agent`** (`agent/default`, a standard program built with the
+  guest toolchain by `just build-agent`):
+  - **refine** decodes `E(c, i, s, ↕payload, H(p))` and its `Work`: a
+    batch, run input by input, or a query, which returns its outcome
+    alone. Requests and messages are checked against their session or
+    pair marks, as advanced earlier in the batch, and expiry; out of order
+    or expired, they are refused. Admin inputs install packages (the agent
+    reads the schema from the program's machine and checks every
+    attestable method and role is bound; an install's record is under the
+    step write cap) and set roles. Install runs unmetered: only the
+    operator submits it. A step dispatches only while the refine's gas
+    left (`gas`) covers its handler's limit and the agent's reserves
+    (`defaults::STEP_RESERVE`, `INSTALL_RESERVE`, `FINISH_RESERVE`), and
+    joins the result only if the result stays within its cap; otherwise
+    it and every later input wait for the next batch. The result is
+    written a step at a time (`ResultWriter`), so its size is known as it
+    grows and finishing re-encodes nothing; every step fits an empty
+    result (`cap::STEP_RESULT`), so a batch always makes progress;
+  - each step runs its actor in an inner machine from the pool
+    (`instantiate`), or on a JAM node from the loader (`historical_lookup`,
+    then `machine`, `pages` and `poke`), and serves the actor ABI against a
+    step overlay with one overlay per nested call, above the batch's
+    committed writes and applied state (`state_read`, and `state_scan`
+    for scans). A scan walks those sources in key order and stops when
+    the actor's buffer is full; a cursor below the prefix starts at the
+    prefix, as the node's applied rows do;
+  - a refine whose host serves no applied state (`WHAT`, a JAM node until
+    witnesses) traps rather than compute on empty state. A stored value
+    the agent cannot read fails only the step that reads it (`TRAPPED`),
+    and a session or pair mark it cannot read refuses the input with
+    `UNREADABLE`, which no resend can fix, so one bad row cannot stop the
+    agent;
+  - attestable programs see their arguments read-only, as the testkit
+    and the prover do;
+  - **accumulate** fetches each input, applies each step's writes, the
+    session mark and reply window, the pair mark and the outbox with pair
+    sequences, and the state version, and skips a result built on another
+    version.
+- **`state_scan`** (`0x482`), a refine extension: applied rows under a
+  prefix after a cursor, in the actor ABI's row format; `WHAT` on JAM.
+- Stored values carry a format byte (`records::STORED`), since Gray Paper
+  storage deletes a key written empty.
+- **One heap for every program:** the SDK's size-class allocator, sized
+  per program by `program_runtime!`; actors and attestable programs get
+  512 KiB, since the pool prices a machine by its mapped pages, and the
+  agent 64 MiB.
+- The codec encodes and decodes byte sequences, and byte arrays, in one
+  copy rather than byte by byte: storing 300 KB had cost an actor
+  millions of instructions.
+- Every program compares bytes a word at a time (`vos_sdk::mem`, exported
+  as `memcmp` and `bcmp` by `program_runtime!`): compiler_builtins' byte
+  loop cost about 50 gas a byte under the Gray Paper's pipeline gas
+  model, and the agent compares keys on every lookup.
+- A step holds at most 16 attests (`cap::ATTESTS`), as it holds 16
+  messages: uncapped, one step's attests could outgrow a work result.
+- A schema's duplicate ids are found by sorting, not by comparing every
+  pair: installing a program with a 64 KiB schema cost the agent 38.7M
+  gas, now 6.3M. Its first read costs 3.2M; the reserves are set from
+  these (`the_step_reserve_covers_the_largest_install`).
+
+**Tests** (`agent/testkit/tests/agent.rs`, on the node's refine and
+accumulate hosts):
+
+- a failed step consumes its input and discards its effects, and a later
+  step sees an earlier one's writes;
+- sessions refuse gaps, duplicates and expired sessions, and keep a reply
+  window;
+- a query that writes traps, an unserved id answers `WHAT`, and a query
+  cannot run a command;
+- the write and message caps fail their steps, and messages reach the
+  outbox with their pair sequences;
+- roles, nested calls with the calling instance's gas and principal,
+  cycles, attests, and a failed callee's discarded send;
+- a call that cannot get a machine (a chain of 70 instances) fails with
+  `DEPTH`, as in the testkit;
+- without a pool, the loader builds the machines from preimages, across
+  batches;
+- a refine on a host that serves no state traps, batch after batch;
+- a corrupt row fails the get or scan that reads it, a corrupt session
+  mark refuses its request as unreadable, and other rows still read;
+- a scan sees the step's own writes from any cursor: below, at, inside
+  and above the prefix, as the testkit does;
+- an attestable program that writes its arguments traps on both hosts;
+- swept from below a handler's limit upward, every refine's gas yields a
+  valid prefix of the batch, longer as the gas grows;
+- a batch of large replies stops before its result outgrows the cap, and
+  the rest run in the next batch;
+- **a differential test** of random multi-batch workloads against the
+  testkit: every step's outcome, writes, messages, attests, per-instance
+  gas and gas used, and the final state, agree (24 cases in `ci`; 150
+  passed once).
+
+**Prices.** The cost test (`every_operation_pays_for_its_serving`)
+measures what serving each operation costs the agent, at a handler's
+limit and after the writes that make the overlays largest (a step's own,
+and eight steps' worth committed before it in the batch) or through 61
+call frames. It fails unless every charge leaves a fifth spare. The measured costs are recorded beside
+the prices in `abi.rs`.
+
+| Operation | Agent's cost (gas) | Price |
+|---|---|---|
+| unserved id, register operations | 1,170–1,530 | 2,000 |
+| `random` (32 bytes) | 4,400 | 6,000 + bytes |
+| `caller` | 5,050 | 6,000 + bytes |
+| `log` | 2,740 | 4,000 + bytes |
+| `send` | 3,070 | 4,000 |
+| `get` | 7,500–14,300 | 20,000 |
+| `scan` | 40,000–44,100 | 60,000 |
+| `put`, `delete` | 12,000–44,450 | 64,000 |
+| `call`, `attest` (a machine from the pool) | 27,500–39,400 | 60,000 |
+| per byte copied | about 18 | 24 |
+
+Measuring at the cap found what measuring on near-empty overlays had
+hidden:
+
+- a scan merged every overlay row in its range before emitting any:
+  after 2,000 writes one scan cost the agent 44.7M gas against its 16,000
+  charge, enough for one handler to exhaust a refine. It now costs what
+  it returns;
+- `memcmp` as a byte loop made a 1 KiB key cost 72 gas a byte;
+- a handler declaring 100M gas ran with 203,256: the translator dropped
+  the constant a `min` compared against and then read (fixed and pinned
+  in the compiler's differential test).
+
+Earlier, measuring found three costs the agent did not need: zero-filling
+a 66 KiB buffer per applied-state scan, decoding an instance's installed
+record on every nested call, and a 2 MiB actor heap that the pool priced
+at 62,000 gas per machine. The generic map and vector work of the
+overlays still dominates `put`; making them cheaper is open work, as is
+the heap's large-block list, which neither splits nor coalesces.
+
+Also open:
+
+- a method's schema entry is found by a linear search, three times a
+  step: about 150,000 gas for a program of a thousand methods, within the
+  step reserve but unpriced;
+- the agent decodes each applied page whole before merging it; at 4 KiB
+  pages that is cheap, and a larger page should decode lazily;
+- an unreadable pair mark wedges that pair, since its sender cannot open
+  a new one: the node's admin surface needs a way to reset a pair's mark
+  (`Admin::ResetPair`).
+
+At these prices the default handler gas (10M) buys about 150 writes or
+500 reads, and a transfer (two gets, two puts) about 170,000 gas in
+charges: about 60 transfers per default handler, before the actor's own
+code.

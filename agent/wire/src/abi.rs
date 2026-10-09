@@ -15,9 +15,9 @@
 //! - Keys are relative to the actor's instance; the agent prefixes them
 //!   with [`crate::keys::instance_prefix`], so an actor reaches only its own
 //!   state. Keys are not empty.
-//! - Each operation costs [`price::OPERATION`] plus [`price::PER_BYTE`] for
-//!   every byte copied either way, charged from the actor's frame before
-//!   it is served.
+//! - Each operation costs its price ([`price::of`]) plus
+//!   [`price::PER_BYTE`] for every byte copied either way, charged from the
+//!   actor's frame before it is served.
 //! - An id the agent does not serve, including every Gray Paper id and node
 //!   extension, costs [`price::OPERATION`], answers [`code::WHAT`] and
 //!   execution continues. Precompiles are served as on every machine. A
@@ -151,15 +151,73 @@ pub const fn allowed(kind: Kind, op: u64) -> bool {
     }
 }
 
-/// Gas an operation costs the actor. Placeholders until 2.4 measures the
-/// serving cost.
+/// Gas an operation costs the actor, charged before it is served: the
+/// operation's price, then [`price::PER_BYTE`] for every byte copied either
+/// way. Each covers what the default agent measurably spends serving it,
+/// so a handler's gas limit bounds the agent's work too.
+///
+/// The agent's cost per operation at a handler's limit, after the writes
+/// that make its overlays largest or through the deepest call frames
+/// (measured by the testkit's `every_operation_pays_for_its_serving`,
+/// which requires a fifth of each charge spare). Measured with the
+/// translator as of this table: a change to the translator, the codec or
+/// the overlays re-runs it.
+///
+/// | operation | charge | cost |
+/// |---|---|---|
+/// | unserved id, `now`, `self_id`, `input` | 2,000 | 1,170–1,530 |
+/// | `random` | 6,768 | 4,400 |
+/// | `caller` | 6,792 | 5,050 |
+/// | `log` of 9 bytes | 4,216 | 2,740 |
+/// | `send` | 4,000 | 3,070 |
+/// | `get` after 1,000 writes | 20,120 | 14,340 |
+/// | `get` of a 1 KiB key | 44,600 | 29,270 |
+/// | `put` after 500 writes | 64,120 | 45,140 |
+/// | `put` of 4 KiB | 162,400 | 105,590 |
+/// | `put` of a 1 KiB key | 88,600 | 63,130 |
+/// | `get` through 61 call frames | 20,096 | 12,950 |
+/// | `scan` after a batch of writes | 60,024 | 41,040 |
+/// | `scan` through 61 call frames | 60,024 | 44,120 |
+/// | `call` | 60,000 | 27,530 |
+/// | `attest` | 60,000 | 39,360 |
 pub mod price {
-    pub const OPERATION: u64 = 500;
-    pub const PER_BYTE: u64 = 1;
+    use super::op;
+
+    /// An id the agent does not serve, and the operations that only read
+    /// or set registers.
+    pub const OPERATION: u64 = 2_000;
+    pub const RANDOM: u64 = 6_000;
+    pub const CALLER: u64 = 6_000;
+    pub const LOG: u64 = 4_000;
+    pub const SEND: u64 = 4_000;
+    pub const GET: u64 = 20_000;
+    pub const SCAN: u64 = 60_000;
+    pub const PUT: u64 = 64_000;
+    /// A nested call or attest acquires a machine.
+    pub const MACHINE: u64 = 60_000;
+    pub const PER_BYTE: u64 = 24;
+
+    /// An operation's price, before its bytes.
+    pub const fn of(id: u64) -> u64 {
+        match id {
+            op::GET => GET,
+            op::PUT | op::DELETE => PUT,
+            op::SCAN => SCAN,
+            op::SEND => SEND,
+            op::CALL | op::ATTEST => MACHINE,
+            op::RANDOM => RANDOM,
+            op::CALLER => CALLER,
+            op::LOG => LOG,
+            _ => OPERATION,
+        }
+    }
 }
 
 /// Per-step limits.
 pub mod cap {
+    use super::price;
+    use crate::defaults::MAX_HANDLER_GAS;
+
     pub const REQUEST: usize = 64 << 10;
     pub const REPLY: usize = 64 << 10;
     pub const KEY: usize = 1 << 10;
@@ -170,7 +228,23 @@ pub mod cap {
     pub const SCAN: usize = KEY + VALUE + 16;
     pub const MESSAGES: usize = 16;
     pub const MESSAGE: usize = 64 << 10;
+    pub const ATTESTS: usize = 16;
     pub const WORK_RESULT: usize = 4 << 20;
+
+    /// The most one step adds to a work result: its reply, writes, messages
+    /// and attests at their caps, with the framing of as many writes and
+    /// instances as its gas can pay for. An install's record is under
+    /// [`STEP_WRITES`] too.
+    pub const STEP_RESULT: usize = 64
+        + REPLY
+        + STEP_WRITES
+        + (MAX_HANDLER_GAS / price::PUT) as usize * 9
+        + (1 + (MAX_HANDLER_GAS / price::MACHINE) as usize) * 12
+        + MESSAGES * (MESSAGE + 16)
+        + ATTESTS * (REQUEST + REPLY + 40);
+
+    // Every step fits an empty result, so a batch always makes progress.
+    const _: () = assert!(STEP_RESULT + 64 <= WORK_RESULT);
 }
 
 /// Results in φ7: the Gray Paper's host-call results.
@@ -213,4 +287,7 @@ pub mod refusal {
     pub const SEQUENCE: u32 = 1;
     /// Its session expired.
     pub const EXPIRED: u32 = 2;
+    /// Its session's or pair's mark is state the agent cannot read: an
+    /// operator must look, and resending cannot help.
+    pub const UNREADABLE: u32 = 3;
 }

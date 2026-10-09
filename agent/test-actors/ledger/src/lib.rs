@@ -95,6 +95,19 @@ impl Ledger {
         ctx.attest(ledger::Checksum { values }).await.unwrap_or(0)
     }
 
+    /// Attest `count` empty checksums, to measure what serving them costs.
+    #[msg(gas = 100_000_000)]
+    pub async fn audits(&mut self, ctx: &mut Command<Self>, count: u32) -> u64 {
+        let mut total = 0;
+        for _ in 0..count {
+            total += ctx
+                .attest(ledger::Checksum { values: Vec::new() })
+                .await
+                .unwrap_or(0);
+        }
+        total
+    }
+
     #[attestable]
     pub fn checksum(values: Vec<u64>) -> u64 {
         values.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, value| {

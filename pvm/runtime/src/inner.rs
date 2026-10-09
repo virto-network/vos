@@ -63,6 +63,10 @@ pub mod host_call {
     /// value's length, or `NONE`. On JAM the call answers `WHAT` and state
     /// comes from witnesses in the work package.
     pub const STATE_READ: u32 = 0x481;
+    /// VOS extension: rows of the agent's applied state under a prefix, in
+    /// key order, served when the node supplies a state reader; `WHAT` on
+    /// JAM, as `state_read`.
+    pub const STATE_SCAN: u32 = 0x482;
 }
 
 /// Gray Paper 0.8.0 general and refine host calls the node serves besides
@@ -1229,8 +1233,12 @@ mod tests {
             [0, 2, 3, 4, 5, 6, 7, 8, 100]
         );
         assert_eq!(
-            [host_call::INSTANTIATE, host_call::STATE_READ],
-            [0x480, 0x481],
+            [
+                host_call::INSTANTIATE,
+                host_call::STATE_READ,
+                host_call::STATE_SCAN
+            ],
+            [0x480, 0x481, 0x482],
             "VOS extensions sit in the node block, past the precompiles"
         );
         assert_eq!(gas::memory(112, 0), 0);

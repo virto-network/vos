@@ -265,7 +265,11 @@ proposer count that reaches about half of peak throughput.
     I/O never on executor threads;
   - a liveness path independent of log I/O: combined heartbeats per node
     pair, and slow heartbeats or quiescence for idle groups;
-  - one shared executor; the thread-per-group `Worker` is dropped.
+  - one shared executor; the thread-per-group `Worker` is dropped;
+  - every outbound AppendEntries carries the heartbeat round it was sent
+    in, including replicate-on-propose sends: a read barrier counts only
+    answers to rounds sent after it was queued (a round of 0 never
+    counts).
 
 **Proposed for section 9.5.** All Raft logs on a node go to one node-level
 log: a redb table keyed by (agent, index) first, then a raw append-only
@@ -274,6 +278,17 @@ Large entries include witnesses and snapshot pages.
 
 **Open.** Find the cause of the slow 64 KiB entries before witnesses ride
 the log.
+
+## Note — Byte loops under the 0.8.0 gas model (slice 2)
+
+The block-gas model charges a load 25 cycles and a branch whose outcome is
+not obvious 20. compiler_builtins' `memcmp` compares a byte per iteration,
+about 50 gas a byte: the default agent spent 72 gas per byte of a 1 KiB key
+on a `get`. Comparing a word at a time where both sides share an alignment
+cut that `get` from 91,000 to 29,000 gas. Every guest gets that `memcmp`
+and `bcmp` from `vos_sdk::program_runtime!`, which is where to replace any
+other builtin a guest leans on (`memcpy`, `memset`) once a measurement
+shows it hot.
 
 ## S2 — Nesting
 

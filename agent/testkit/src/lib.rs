@@ -77,7 +77,7 @@ impl Testkit {
             time: 0,
             seed: [0; 32],
             default_gas: vos_wire::defaults::HANDLER_GAS,
-            max_gas: vos_wire::defaults::HANDLER_GAS * 10,
+            max_gas: vos_wire::defaults::MAX_HANDLER_GAS,
             instances: BTreeMap::new(),
             members: BTreeMap::new(),
             state: BTreeMap::new(),
@@ -127,6 +127,13 @@ impl Testkit {
         Ok(())
     }
 
+    /// Start a batch: its time and seed, and step indices from 0.
+    pub fn batch(&mut self, time: u64, seed: [u8; 32]) {
+        self.time = time;
+        self.seed = seed;
+        self.steps = 0;
+    }
+
     pub fn set_role(&mut self, principal: Principal, role: Option<u8>) {
         match role {
             Some(role) => self.members.insert(principal, role),
@@ -143,6 +150,14 @@ impl Testkit {
             .iter()
             .find(|method| method.name == name.as_bytes())
             .map(|method| method.id)
+    }
+
+    /// Every row of the agent's applied state, in key order.
+    pub fn rows(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+        self.state
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
     }
 
     /// A value of the agent's applied state, by agent-relative key.
@@ -295,7 +310,13 @@ impl<'a> Run<'a> {
             .gas
             .unwrap_or(self.kit.default_gas)
             .min(self.kit.max_gas);
-        let (ended, used) = self.invoke(caller, instance, method, arguments, gas)?;
+        let (ended, used) = self
+            .invoke(caller, instance, method, arguments, gas)
+            .map_err(|(code, used)| {
+                // A failed step still used its gas.
+                self.gas_used = used;
+                code
+            })?;
         self.gas_used = used;
         Ok(match ended {
             Ended::Replied(reply) => Outcome::Done(reply),
@@ -310,8 +331,8 @@ impl<'a> Run<'a> {
         })
     }
 
-    /// Run one invocation with `gas`; its gas used, or a code that fails
-    /// the step.
+    /// Run one invocation with `gas`: how it ended and the gas it used, or
+    /// a code that fails the step with the gas used.
     fn invoke(
         &mut self,
         caller: Principal,
@@ -319,9 +340,16 @@ impl<'a> Run<'a> {
         method: MethodId,
         arguments: &[u8],
         gas: u64,
-    ) -> Result<(Ended, u64), u32> {
-        let installed = self.kit.instances.get(&instance).ok_or(failure::UNKNOWN)?;
-        let schema = installed.schema.method(method).ok_or(failure::UNKNOWN)?;
+    ) -> Result<(Ended, u64), (u32, u64)> {
+        let installed = self
+            .kit
+            .instances
+            .get(&instance)
+            .ok_or((failure::UNKNOWN, 0))?;
+        let schema = installed
+            .schema
+            .method(method)
+            .ok_or((failure::UNKNOWN, 0))?;
         if let Some(role) = &schema.role {
             let required = installed.roles[role];
             if self.kit.members.get(&caller) != Some(&required) {
@@ -329,14 +357,14 @@ impl<'a> Run<'a> {
             }
         }
         if self.stack.contains(&instance) {
-            return Err(failure::CYCLE);
+            return Err((failure::CYCLE, 0));
         }
         if self.stack.len() >= MAX_DEPTH {
-            return Err(failure::DEPTH);
+            return Err((failure::DEPTH, 0));
         }
         let kind = schema.kind;
         let mut machine =
-            Machine::load(&installed.program, &[], gas).map_err(|_| failure::TRAPPED)?;
+            Machine::load(&installed.program, &[], gas).map_err(|_| (failure::TRAPPED, 0))?;
         let registers = machine.registers_mut();
         registers[7] = u64::from(method.0);
         registers[8] = kind.encode()[0].into();
@@ -360,7 +388,10 @@ impl<'a> Run<'a> {
             .find(|entry| entry.instance == instance)
             .expect("recorded when it started");
         entry.gas += used - nested;
-        Ok((ended?, used))
+        match ended {
+            Ok(ended) => Ok((ended, used)),
+            Err(code) => Err((code, used)),
+        }
     }
 
     fn serve(
@@ -394,7 +425,7 @@ impl<'a> Run<'a> {
                     if !abi::allowed(kind, id) {
                         return Err(failure::TRAPPED);
                     }
-                    if !machine.charge(price::OPERATION) {
+                    if !machine.charge(price::of(id)) {
                         return Err(failure::OUT_OF_GAS);
                     }
                     self.operation(machine, id, caller, instance, kind, arguments, &mut outcome)?;
@@ -518,13 +549,15 @@ impl<'a> Run<'a> {
                 // keep counting.
                 let effects = (self.messages.len(), self.attests.len(), self.written);
                 let gas = machine.gas_remaining();
-                let (ended, used) = self.invoke(
-                    Principal::Instance(instance),
-                    callee,
-                    method,
-                    &call_arguments,
-                    gas,
-                )?;
+                let (ended, used) = self
+                    .invoke(
+                        Principal::Instance(instance),
+                        callee,
+                        method,
+                        &call_arguments,
+                        gas,
+                    )
+                    .map_err(|(code, _)| code)?;
                 let frame = self.frames.pop().expect("the call's frame");
                 *self.nested.last_mut().expect("the caller's entry") += used;
                 if !machine.charge(used) {
@@ -565,6 +598,9 @@ impl<'a> Run<'a> {
             op::ATTEST => {
                 let method = MethodId(r[7] as u32);
                 let call_arguments = read(machine, r[8], r[9], cap::REQUEST)?;
+                if self.attests.len() == cap::ATTESTS {
+                    return Err(failure::CAP);
+                }
                 let program = self
                     .kit
                     .instances

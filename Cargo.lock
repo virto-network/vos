@@ -1861,6 +1861,7 @@ name = "vos-testkit"
 version = "0.1.0"
 dependencies = [
  "blake2",
+ "proptest",
  "vos-pvm",
  "vos-pvm-compiler",
  "vos-pvm-program",

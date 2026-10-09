@@ -82,6 +82,8 @@ The agent uses Gray Paper calls wherever JAM has one, and VOS extensions
 | `machine` … `expunge` | refine | 9–14 | served | served |
 | `instantiate` | refine | `0x480` | from the node's pool | `WHAT`: the agent's loader builds the machine |
 | `state_read` | refine | `0x481` | the agent's applied state, by key | `WHAT` until step 4's witnesses |
+| `state_scan` | refine | `0x482` | the agent's applied rows under a prefix, in key order, for the actor ABI's `scan` | `WHAT` until step 4's witnesses |
+| `historical_lookup` | refine | 7 | program blobs by hash, for the loader when `instantiate` has no pool | the service's preimages |
 | `read`, `write` | accumulate | Gray Paper; `write` is 5 | the agent's state in the LSM store, including its system keys | service storage |
 
 - Precompiles keep `0x400..=0x47f`.
@@ -101,6 +103,12 @@ The agent uses Gray Paper calls wherever JAM has one, and VOS extensions
 - On VOS, accumulate's `write` calls for one work result form one atomic
   batch, together with the session and pair marks and the applied index
   (section 9.5).
+- Every value the agent stores starts with a format byte
+  (`vos_wire::records::STORED`): Gray Paper storage deletes a key written
+  with an empty value, and the byte keeps empty values, which the actor
+  ABI allows, present. Work results carry the values themselves.
+- A refine's payload is a `Work`: a batch, or a query, for which refine
+  returns the outcome alone and writes nothing.
 
 ### Actor ABI: actor and agent [proposed]
 

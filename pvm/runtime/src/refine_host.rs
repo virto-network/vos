@@ -103,6 +103,14 @@ pub enum RefineObservation<'a> {
 /// The agent's applied state, as the node reads it for `state_read`.
 pub trait StateReader: Send + Sync {
     fn read(&self, key: &[u8]) -> Option<Vec<u8>>;
+
+    /// Rows whose key starts with `prefix`, in key order, after `after`
+    /// when given.
+    fn rows<'a>(
+        &'a self,
+        prefix: &'a [u8],
+        after: Option<&'a [u8]>,
+    ) -> alloc::boxed::Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + 'a>;
 }
 
 /// Gas for a host call the Gray Paper prices at its base cost.
@@ -416,6 +424,9 @@ impl RefineContext {
             value if value == u64::from(host_call::STATE_READ) && self.state.is_some() => {
                 self.state_read()
             }
+            value if value == u64::from(host_call::STATE_SCAN) && self.state.is_some() => {
+                self.state_scan()
+            }
             value if value == u64::from(crate::inner::gp_call::GAS) => self.gas(),
             value if value == u64::from(crate::inner::gp_call::LOG) => self.log(),
             _ => Dispatch::Exit(ExitReason::HostCall(id)),
@@ -495,6 +506,53 @@ impl RefineContext {
             return Dispatch::Exit(ExitReason::Panic);
         }
         self.outer.registers_mut()[7] = value.len() as u64;
+        Dispatch::Continue
+    }
+
+    /// `state_scan`: rows whose key starts with the prefix at φ7/φ8, after
+    /// the key at φ9/φ10 (empty: from the prefix), into φ11, at most φ12
+    /// bytes, as whole rows of a four-byte little-endian key length, the
+    /// key, a four-byte value length and the value; φ7 becomes the bytes
+    /// written, 0 when no rows remain, or `FULL` when the next row alone
+    /// exceeds φ12. Costs the base price and [`STATE_READ_BYTE_GAS`] per
+    /// byte written.
+    fn state_scan(&mut self) -> Dispatch {
+        if let Err(exit) = self.charge(BASE_CALL_GAS) {
+            return exit;
+        }
+        let registers = *self.outer.registers();
+        let Some(prefix) = self.read_outer(registers[7], registers[8], false) else {
+            return Dispatch::Exit(ExitReason::Panic);
+        };
+        let Some(cursor) = self.read_outer(registers[9], registers[10], false) else {
+            return Dispatch::Exit(ExitReason::Panic);
+        };
+        let capacity = usize::try_from(registers[12]).unwrap_or(usize::MAX);
+        let reader = self.state.as_ref().expect("dispatched only with a reader");
+        let after = (!cursor.is_empty()).then_some(cursor.as_slice());
+        let mut out = Vec::new();
+        let mut full = false;
+        for (key, value) in reader.rows(&prefix, after) {
+            let row = 8 + key.len() + value.len();
+            if out.len() + row > capacity {
+                full = out.is_empty();
+                break;
+            }
+            out.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            out.extend_from_slice(&key);
+            out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            out.extend_from_slice(&value);
+        }
+        let Some((address, len)) = self.outer_range(registers[11], out.len() as u64, true) else {
+            return Dispatch::Exit(ExitReason::Panic);
+        };
+        if let Err(exit) = self.charge(len as u64 * STATE_READ_BYTE_GAS) {
+            return exit;
+        }
+        if len > 0 && !self.outer.memory_mut().write_bytes_checked(address, &out) {
+            return Dispatch::Exit(ExitReason::Panic);
+        }
+        self.outer.registers_mut()[7] = if full { result::FULL } else { len as u64 };
         Dispatch::Continue
     }
 
@@ -1324,6 +1382,14 @@ mod tests {
         fn read(&self, key: &[u8]) -> Option<Vec<u8>> {
             (key == b"abc").then(|| b"value".to_vec())
         }
+
+        fn rows<'a>(
+            &'a self,
+            _: &'a [u8],
+            _: Option<&'a [u8]>,
+        ) -> alloc::boxed::Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + 'a> {
+            alloc::boxed::Box::new(core::iter::empty())
+        }
     }
 
     #[test]
@@ -1343,6 +1409,14 @@ mod tests {
         impl StateReader for Long {
             fn read(&self, _: &[u8]) -> Option<Vec<u8>> {
                 Some(vec![7; 1000])
+            }
+
+            fn rows<'a>(
+                &'a self,
+                _: &'a [u8],
+                _: Option<&'a [u8]>,
+            ) -> alloc::boxed::Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + 'a> {
+                alloc::boxed::Box::new(core::iter::empty())
             }
         }
         let long = RefineContext::load(&program, &[], 1_000_000)

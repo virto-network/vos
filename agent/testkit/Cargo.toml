@@ -11,5 +11,6 @@ vos-pvm = { workspace = true }
 vos-wire = { workspace = true }
 
 [dev-dependencies]
+proptest = "1"
 vos-pvm-compiler = { workspace = true }
 vos-pvm-program = { workspace = true }

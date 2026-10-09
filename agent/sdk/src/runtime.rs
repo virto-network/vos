@@ -1,6 +1,6 @@
 //! What an actor program needs around its handlers: driving an `async`
-//! handler and, on the guest target, the entry point, the allocator and
-//! the panic handler.
+//! handler and, as macros a program crate invokes, the entry point, the
+//! allocator and the panic handler.
 
 use core::future::Future;
 use core::pin::pin;
@@ -24,6 +24,43 @@ pub fn arguments<T: crate::Decode>() -> T {
     }
 }
 
+/// A program's global allocator, an [`crate::heap::Heap`] of `$arena`
+/// bytes, and its panic handler, a trap. The entry macros include it.
+#[macro_export]
+macro_rules! program_runtime {
+    ($arena:expr) => {
+        #[cfg(target_arch = "riscv64")]
+        #[global_allocator]
+        static VOS_HEAP: $crate::heap::Heap<{ $arena }> = $crate::heap::Heap::new();
+
+        #[cfg(target_arch = "riscv64")]
+        #[panic_handler]
+        fn vos_panic(_: &::core::panic::PanicInfo<'_>) -> ! {
+            // SAFETY: `unimp` lowers to a PVM trap, which fails the step.
+            unsafe { ::core::arch::asm!("unimp", options(noreturn)) }
+        }
+
+        // These replace compiler_builtins' weak byte loops.
+        #[cfg(target_arch = "riscv64")]
+        #[unsafe(no_mangle)]
+        unsafe extern "C" fn memcmp(a: *const u8, b: *const u8, len: usize) -> i32 {
+            // SAFETY: memcmp's contract.
+            unsafe { $crate::mem::compare(a, b, len) }
+        }
+
+        #[cfg(target_arch = "riscv64")]
+        #[unsafe(no_mangle)]
+        unsafe extern "C" fn bcmp(a: *const u8, b: *const u8, len: usize) -> i32 {
+            // SAFETY: bcmp's contract.
+            unsafe { $crate::mem::compare(a, b, len) }
+        }
+    };
+}
+
+/// An actor's or attestable program's heap by default: the pool prices a
+/// machine by its mapped pages, so a larger arena costs every call.
+pub const PROGRAM_HEAP: usize = 512 << 10;
+
 /// An actor program: `actor_program!(crate_name::module)`, naming the
 /// module `#[messages]` generates. It places the schema first in the
 /// program's read-only data, and defines the entry point: instruction 0
@@ -33,6 +70,11 @@ pub fn arguments<T: crate::Decode>() -> T {
 #[macro_export]
 macro_rules! actor_program {
     ($($module:ident)::+) => {
+        $crate::actor_program!($($module)::+, heap = $crate::runtime::PROGRAM_HEAP);
+    };
+    ($($module:ident)::+, heap = $heap:expr) => {
+        $crate::program_runtime!($heap);
+
         #[used]
         #[unsafe(link_section = ".vos_schema")]
         static VOS_SCHEMA: [u8; $($module)::+::SCHEMA.len()] = $($module)::+::SCHEMA;
@@ -64,6 +106,8 @@ macro_rules! actor_program {
 #[macro_export]
 macro_rules! attestable_program {
     ($run:path) => {
+        $crate::program_runtime!($crate::runtime::PROGRAM_HEAP);
+
         #[cfg(target_arch = "riscv64")]
         ::core::arch::global_asm!(
             ".global _start",
@@ -107,56 +151,5 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
     match pin!(future).poll(&mut context) {
         Poll::Ready(output) => output,
         Poll::Pending => panic!("a handler awaited something that is not ready"),
-    }
-}
-
-#[cfg(target_arch = "riscv64")]
-mod guest {
-    use core::alloc::{GlobalAlloc, Layout};
-    use core::cell::UnsafeCell;
-
-    /// The heap: a 2 MiB arena in `.bss`. Allocations are never freed; a
-    /// machine's memory is reset between invocations, so one invocation
-    /// may allocate 2 MiB in all, and an allocation beyond it traps. Pages
-    /// the invocation never touches cost nothing.
-    const HEAP: usize = 2 << 20;
-
-    struct Bump {
-        arena: UnsafeCell<[u8; HEAP]>,
-        next: UnsafeCell<usize>,
-    }
-
-    // SAFETY: a PVM invocation runs on one thread.
-    unsafe impl Sync for Bump {}
-
-    unsafe impl GlobalAlloc for Bump {
-        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            // SAFETY: single-threaded; see `Sync`.
-            let next = unsafe { &mut *self.next.get() };
-            let base = self.arena.get() as usize;
-            let start = (base + *next).next_multiple_of(layout.align()) - base;
-            let Some(end) = start.checked_add(layout.size()) else {
-                return core::ptr::null_mut();
-            };
-            if end > HEAP {
-                return core::ptr::null_mut();
-            }
-            *next = end;
-            (base + start) as *mut u8
-        }
-
-        unsafe fn dealloc(&self, _: *mut u8, _: Layout) {}
-    }
-
-    #[global_allocator]
-    static ALLOCATOR: Bump = Bump {
-        arena: UnsafeCell::new([0; HEAP]),
-        next: UnsafeCell::new(0),
-    };
-
-    #[panic_handler]
-    fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
-        // SAFETY: `unimp` lowers to a PVM trap, which fails the step.
-        unsafe { core::arch::asm!("unimp", options(noreturn)) }
     }
 }
