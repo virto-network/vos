@@ -471,52 +471,11 @@ impl TranslationContext {
         target: u64,
         addr: u64,
     ) -> Result<(), TranspileError> {
-        // Fuse load_imm + branch: if one operand was just loaded via load_imm,
-        // use the immediate branch form instead of a two-register branch.
-        // Saves one PVM instruction (the load_imm) per fused branch.
-        if let Some((load_rd, load_val, undo_pos)) = self.pending_load_imm.take()
-            && load_val >= i32::MIN as i64
-            && load_val <= i32::MAX as i64
-        {
-            let imm = load_val as i32;
-            // Check if rs2 is the loaded register: branch_*_imm rs1, imm, target
-            if rs2 == load_rd && rs1 != load_rd {
-                let pvm_rs1 = self.require_reg(rs1)?;
-                let pvm_opcode = match funct3 {
-                    0 => Some(81), // BEQ → branch_eq_imm
-                    1 => Some(82), // BNE → branch_ne_imm
-                    4 => Some(87), // BLT → branch_lt_s_imm
-                    5 => Some(89), // BGE → branch_ge_s_imm
-                    6 => Some(83), // BLTU → branch_lt_u_imm
-                    7 => Some(85), // BGEU → branch_ge_u_imm
-                    _ => None,
-                };
-                if let Some(opc) = pvm_opcode {
-                    self.code.truncate(undo_pos);
-                    self.bitmask.truncate(undo_pos);
-                    self.emit_branch_imm(opc, pvm_rs1, imm, target);
-                    return Ok(());
-                }
-            }
-            // Check if rs1 is the loaded register: flip the comparison
-            // BEQ/BNE are symmetric. BLT(rs1,rs2) with rs1=imm → BGE(rs2,imm+1) etc.
-            // Only handle symmetric cases (EQ, NE) to avoid off-by-one complexity.
-            if rs1 == load_rd && rs2 != load_rd {
-                let pvm_rs2 = self.require_reg(rs2)?;
-                let pvm_opcode = match funct3 {
-                    0 => Some(81), // BEQ is symmetric → branch_eq_imm rs2, imm
-                    1 => Some(82), // BNE is symmetric → branch_ne_imm rs2, imm
-                    _ => None,     // Inequalities need careful flipping, skip for now
-                };
-                if let Some(opc) = pvm_opcode {
-                    self.code.truncate(undo_pos);
-                    self.bitmask.truncate(undo_pos);
-                    self.emit_branch_imm(opc, pvm_rs2, imm, target);
-                    return Ok(());
-                }
-            }
-        }
-        // Couldn't fuse — load_imm was already emitted, just clear tracking
+        // A branch writes no register, so a constant just loaded into an
+        // operand may be read on either path after it: keep the load and
+        // compare registers. Fusing it needs liveness at both successors,
+        // which a second pass over translated blocks could provide.
+        self.pending_load_imm = None;
 
         // Both operands x0: the outcome is static. BEQ, BGE and BGEU always
         // branch and become a jump; BNE, BLT and BLTU never do and emit
@@ -653,9 +612,7 @@ impl TranslationContext {
                     // entry to the fused load, else a branch targeting this load
                     // resolves past the removed load_imm — into the middle of an
                     // instruction (cf. translate_op, which does the same).
-                    self.code.truncate(undo_pos);
-                    self.bitmask.truncate(undo_pos);
-                    self.address_map.insert(addr, undo_pos as u32);
+                    self.drop_dead_load(rd, load_rd, undo_pos, addr);
                     let pvm_rd = self.require_reg(rd)?;
                     self.emit_inst(opc);
                     self.emit_data(pvm_rd);
@@ -1143,9 +1100,12 @@ impl TranslationContext {
         } // Write to x0 is a no-op in RISC-V
 
         // Fuse load_imm + ALU op: if one operand was just loaded via load_imm
-        // and the value fits in i32, undo the load_imm and emit the immediate
-        // form instead (saves one instruction).
+        // and the value fits in i32, emit the immediate form instead; the
+        // load goes too when this overwrites it (`drop_dead_load`). An x0
+        // operand has no PVM register to fuse with: the zero path takes it.
         if let Some((load_rd, load_val, undo_pos)) = self.pending_load_imm.take()
+            && rs1 != 0
+            && rs2 != 0
             && load_val >= i32::MIN as i64
             && load_val <= i32::MAX as i64
         {
@@ -1183,16 +1143,9 @@ impl TranslationContext {
                 };
 
                 if let Some(pvm_opcode) = pvm_imm_opcode {
-                    // Only truncate the load_imm if the loaded register IS the
-                    // destination (rd == load_rd). If it's just an operand,
-                    // keep the load_imm so the register retains its value for
-                    // future use (e.g., switch table: add idx, base, idx; lw off, 0(idx);
-                    // add target, off, base; jr target — base is used twice).
-                    if rd == load_rd {
-                        self.code.truncate(undo_pos);
-                        self.bitmask.truncate(undo_pos);
-                        self.address_map.insert(addr, undo_pos as u32);
-                    }
+                    // A switch table reads its base twice: add idx, base, idx;
+                    // lw off, 0(idx); add target, off, base; jr target.
+                    self.drop_dead_load(rd, load_rd, undo_pos, addr);
                     let pvm_rd = self.require_reg(rd)?;
                     let pvm_base = self.require_reg(base)?;
                     self.emit_inst(pvm_opcode);
@@ -1204,7 +1157,12 @@ impl TranslationContext {
 
             // Special case: shifts with loaded shift count → shift immediate forms.
             // SLL/SRL/SRA rd, rs1, load_rd → shlo_l/shlo_r/shar_r_imm rd, rs1, imm
-            if rs2 == load_rd && matches!((funct7, funct3), (0, 1) | (0, 5) | (0x20, 5)) {
+            // The shifted register must not be the constant's own, which
+            // the fusion may drop.
+            if rs2 == load_rd
+                && rs1 != load_rd
+                && matches!((funct7, funct3), (0, 1) | (0, 5) | (0x20, 5))
+            {
                 let pvm_imm_opcode = match (funct7, funct3) {
                     (0, 1) => {
                         if self.is_64bit {
@@ -1229,9 +1187,7 @@ impl TranslationContext {
                     } // SRA → shar_r_imm
                     _ => unreachable!(),
                 };
-                self.code.truncate(undo_pos);
-                self.bitmask.truncate(undo_pos);
-                self.address_map.insert(addr, undo_pos as u32);
+                self.drop_dead_load(rd, load_rd, undo_pos, addr);
                 let pvm_rd = self.require_reg(rd)?;
                 let pvm_rs1 = self.require_reg(rs1)?;
                 self.emit_inst(pvm_imm_opcode);
@@ -1247,9 +1203,7 @@ impl TranslationContext {
                 let neg_imm = (-(load_val as i32) as i64) as i32;
                 // Use add_imm with negated immediate (avoids neg_add_imm)
                 let pvm_opcode = if self.is_64bit { 149 } else { 131 }; // add_imm
-                self.code.truncate(undo_pos);
-                self.bitmask.truncate(undo_pos);
-                self.address_map.insert(addr, undo_pos as u32);
+                self.drop_dead_load(rd, load_rd, undo_pos, addr);
                 let pvm_rd = self.require_reg(rd)?;
                 let pvm_rs1 = self.require_reg(rs1)?;
                 self.emit_inst(pvm_opcode);
@@ -1638,8 +1592,11 @@ impl TranslationContext {
             return Ok(());
         }
 
-        // Fuse load_imm + 32-bit ALU op: ADDW, MULW, SUB as negated ADD.
+        // Fuse load_imm + 32-bit ALU op: ADDW, MULW, SUB as negated ADD. An x0
+        // operand goes to the zero path unfused.
         if let Some((load_rd, load_val, undo_pos)) = self.pending_load_imm.take()
+            && rs1 != 0
+            && rs2 != 0
             && load_val >= i32::MIN as i64
             && load_val <= i32::MAX as i64
         {
@@ -1659,8 +1616,7 @@ impl TranslationContext {
                     _ => None,
                 };
                 if let Some(pvm_opcode) = pvm_imm_opcode {
-                    self.code.truncate(undo_pos);
-                    self.bitmask.truncate(undo_pos);
+                    self.drop_dead_load(rd, load_rd, undo_pos, addr);
                     let pvm_rd = self.require_reg(rd)?;
                     let pvm_base = self.require_reg(base)?;
                     self.emit_inst(pvm_opcode);
@@ -1671,15 +1627,19 @@ impl TranslationContext {
             }
             // 32-bit shifts with loaded shift count → shift immediate forms.
             // SLLW/SRLW/SRAW rd, rs1, load_rd → shlo_l/shlo_r/shar_r_imm_32
-            if rs2 == load_rd && matches!((funct7, funct3), (0, 1) | (0, 5) | (0x20, 5)) {
+            // The shifted register must not be the constant's own, which
+            // the fusion may drop.
+            if rs2 == load_rd
+                && rs1 != load_rd
+                && matches!((funct7, funct3), (0, 1) | (0, 5) | (0x20, 5))
+            {
                 let pvm_imm_opcode = match (funct7, funct3) {
                     (0, 1) => 138,    // SLLW → shlo_l_imm_32
                     (0, 5) => 139,    // SRLW → shlo_r_imm_32
                     (0x20, 5) => 140, // SRAW → shar_r_imm_32
                     _ => unreachable!(),
                 };
-                self.code.truncate(undo_pos);
-                self.bitmask.truncate(undo_pos);
+                self.drop_dead_load(rd, load_rd, undo_pos, addr);
                 let pvm_rd = self.require_reg(rd)?;
                 let pvm_rs1 = self.require_reg(rs1)?;
                 self.emit_inst(pvm_imm_opcode);
@@ -1691,8 +1651,7 @@ impl TranslationContext {
             // SUB with loaded rs2: SUBW rd, rs1, load_rd → add_imm_32 rd, rs1, -imm
             if (funct7, funct3) == (0x20, 0) && rs2 == load_rd && rs1 != load_rd {
                 let neg_imm = (-(load_val as i32) as i64) as i32;
-                self.code.truncate(undo_pos);
-                self.bitmask.truncate(undo_pos);
+                self.drop_dead_load(rd, load_rd, undo_pos, addr);
                 let pvm_rd = self.require_reg(rd)?;
                 let pvm_rs1 = self.require_reg(rs1)?;
                 self.emit_inst(131); // add_imm_32
@@ -1791,6 +1750,25 @@ impl TranslationContext {
     /// The PVM register for a RISC-V register other than x0. x0 has none:
     /// PVM register 0 holds the return address, so every caller handles x0
     /// itself, as a zero source or a discarded result.
+    /// Remove the pending `load_imm` an instruction fuses as its immediate,
+    /// when the instruction writes the loaded register: only then is the
+    /// constant dead. Any other instruction leaves the register holding it
+    /// for later reads, which nothing here can rule out. A fused form must
+    /// therefore never read the loaded register as an operand: the
+    /// immediate is its value, and this may remove it.
+    ///
+    /// The fused instruction then starts where the load did. No edge can
+    /// land between them: `begin_instruction` flushes pending state at every
+    /// control-flow target, so a target is never fused into its
+    /// predecessor's load.
+    fn drop_dead_load(&mut self, rd: u8, load_rd: u8, undo_pos: usize, addr: u64) {
+        if rd == load_rd {
+            self.code.truncate(undo_pos);
+            self.bitmask.truncate(undo_pos);
+            self.address_map.insert(addr, undo_pos as u32);
+        }
+    }
+
     pub(crate) fn require_reg(&self, rv_reg: u8) -> Result<u8, TranspileError> {
         map_register(rv_reg)?.ok_or(TranspileError::RegisterMapping(rv_reg))
     }

@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 21c3f4e4002b657bd49f58d622923319b3be8683bcc037d28e7e4b5f013f16c0 # shrinks to items = [Constant { rd: 5, value: 0, reader: Op { f3: 4, f7: 0, rd: 5, rs1: 0, rs2: 5 } }], registers = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+cc ac3b0f3b304078efa7633ea3d3da5e434d9e1986825259c015e0a9febe9828b3 # shrinks to items = [Constant { rd: 5, value: 0, reader: Op32 { f3: 1, f7: 0, rd: 5, rs1: 5, rs2: 5 } }], registers = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]

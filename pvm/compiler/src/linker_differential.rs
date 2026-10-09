@@ -86,12 +86,32 @@ enum Inst {
     },
 }
 
-/// A generated item: an instruction, or a loop that runs its body `count`
-/// times with x15 as the counter, which the body never writes.
+/// A generated item: an instruction; a constant loaded by `lui` and `addi`
+/// and an instruction right after that reads it, as the translation fuses
+/// them; or a loop that runs its body `count` times with x15 as the
+/// counter, which the body never writes.
 #[derive(Clone, Debug)]
 enum Item {
     Plain(Inst),
+    Constant { rd: u8, value: i32, reader: Inst },
     Loop { count: i32, body: Vec<Inst> },
+}
+
+/// `lui` and `addi` loading `value` into `rd`.
+fn constant(rd: u8, value: i32) -> [Inst; 2] {
+    let low = (value << 20) >> 20;
+    [
+        Inst::Lui {
+            rd,
+            imm: value.wrapping_sub(low),
+        },
+        Inst::OpImm {
+            f3: 0,
+            rd,
+            rs1: rd,
+            imm: low,
+        },
+    ]
 }
 
 const COUNTER: u8 = 15;
@@ -106,6 +126,7 @@ fn flatten(items: &[Item]) -> Vec<Inst> {
         starts.push(end);
         end += match item {
             Item::Plain(_) => 1,
+            Item::Constant { .. } => 3,
             Item::Loop { body, .. } => body.len() + 3,
         };
     }
@@ -124,6 +145,12 @@ fn flatten(items: &[Item]) -> Vec<Inst> {
         match item {
             Item::Plain(inst) => {
                 flat.push(resolve(inst, &|skip| {
+                    starts.get(index + 1 + skip).copied().unwrap_or(end)
+                }));
+            }
+            Item::Constant { rd, value, reader } => {
+                flat.extend(constant(*rd, *value));
+                flat.push(resolve(reader, &|skip| {
                     starts.get(index + 1 + skip).copied().unwrap_or(end)
                 }));
             }
@@ -664,9 +691,45 @@ fn spare_counter(inst: Inst) -> Inst {
     }
 }
 
+/// A constant and an instruction that reads it as either operand: a branch,
+/// or a 64- or 32-bit operation writing any register.
+fn constant_item() -> impl Strategy<Value = Item> {
+    let rd = prop::sample::select(&REGS[..]);
+    let value = prop_oneof![any::<i32>(), Just(100_000_000), -4096i32..4096];
+    let reader = (instruction(), any::<bool>(), register());
+    (rd, value, reader).prop_map(|(rd, value, (inst, left, other))| {
+        let (rs1, rs2) = if left { (rd, other) } else { (other, rd) };
+        let reader = match inst {
+            Inst::Op { f3, f7, rd, .. } => Inst::Op {
+                f3,
+                f7,
+                rd,
+                rs1,
+                rs2,
+            },
+            Inst::Op32 { f3, f7, rd, .. } => Inst::Op32 {
+                f3,
+                f7,
+                rd,
+                rs1,
+                rs2,
+            },
+            Inst::Branch { f3, to, .. } => Inst::Branch { f3, rs1, rs2, to },
+            _ => Inst::Branch {
+                f3: 6,
+                rs1,
+                rs2,
+                to: 0,
+            },
+        };
+        Item::Constant { rd, value, reader }
+    })
+}
+
 fn item() -> impl Strategy<Value = Item> {
     prop_oneof![
         8 => instruction().prop_map(Item::Plain),
+        2 => constant_item(),
         1 => (1i32..4, prop::collection::vec(instruction().prop_map(spare_counter), 1..6))
             .prop_map(|(count, body)| Item::Loop { count, body }),
     ]
@@ -725,6 +788,96 @@ proptest! {
         ]),
     ) {
         check(&items, &registers)?;
+    }
+}
+
+/// A constant loaded for one instruction stays in its register: lowering the
+/// instruction to an immediate form may drop the load only when the
+/// instruction overwrites the register. Code that compares a value with a
+/// cap and then takes the cap (`x.min(cap)`) reads it again.
+#[test]
+fn a_fused_constant_stays_in_its_register() {
+    let op = |f7, f3| Inst::Op {
+        f3,
+        f7,
+        rd: 11,
+        rs1: 12,
+        rs2: 10,
+    };
+    let op32 = |f7, f3| Inst::Op32 {
+        f3,
+        f7,
+        rd: 11,
+        rs1: 12,
+        rs2: 10,
+    };
+    let branch = |f3| Inst::Branch {
+        f3,
+        rs1: 6,
+        rs2: 10,
+        to: 0,
+    };
+    let readers = [
+        branch(0),
+        branch(1),
+        branch(4),
+        branch(5),
+        branch(6),
+        branch(7),
+        op(0, 0),
+        op(0x20, 0),
+        op(0, 1),
+        op(0, 5),
+        op(0x20, 5),
+        op(1, 0),
+        op32(0, 0),
+        op32(0x20, 0),
+        op32(0, 1),
+        op32(0, 5),
+        op32(0x20, 5),
+        op32(1, 0),
+    ];
+    // The same readers with the constant as both operands and destination.
+    let both = readers.clone().map(|reader| match reader {
+        Inst::Op { f3, f7, .. } => Inst::Op {
+            f3,
+            f7,
+            rd: 10,
+            rs1: 10,
+            rs2: 10,
+        },
+        Inst::Op32 { f3, f7, .. } => Inst::Op32 {
+            f3,
+            f7,
+            rd: 10,
+            rs1: 10,
+            rs2: 10,
+        },
+        Inst::Branch { f3, to, .. } => Inst::Branch {
+            f3,
+            rs1: 10,
+            rs2: 10,
+            to,
+        },
+        other => other,
+    });
+    for reader in readers.into_iter().chain(both) {
+        let items = [
+            Item::Constant {
+                rd: 10,
+                value: 100_000_000,
+                reader: reader.clone(),
+            },
+            // mv t1, a0
+            Item::Plain(Inst::OpImm {
+                f3: 0,
+                rd: 6,
+                rs1: 10,
+                imm: 0,
+            }),
+        ];
+        check(&items, &[0x5555_5555_5555_5555; 11])
+            .unwrap_or_else(|error| panic!("{reader:?}: {error}"));
     }
 }
 
