@@ -374,8 +374,10 @@ changes the format again anyway:
   - Scanning costs about 0.46 µs per MiB of protected range, written or
     not: 3.9 µs for 8 MiB, 29 µs for 64 MiB and 238 µs for 512 MiB.
     Protecting a fresh 4 MiB costs about 3 µs. Protecting every writable
-    page up front would let the inner `pages` call, at constant gas, cost
-    milliseconds and megabytes of page tables.
+    page up front would make every capture rescan all mapped memory. Gas
+    pays for mapping a page once (the inner `pages` call charges per page),
+    but a machine is captured again and again: 238 µs per capture for a
+    512 MiB heap, however little the guest writes.
   - Scanning only present pages would avoid that, but a written page that
     is reclaimed to swap loses its page-table entry and would be missed.
 - **Design.** Tracking starts per 1,024-page slot.
