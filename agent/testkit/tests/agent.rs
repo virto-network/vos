@@ -565,6 +565,44 @@ fn per_step_caps_fail_the_step_and_messages_reach_the_outbox() {
 }
 
 #[test]
+fn an_ack_clears_the_outbox_through_its_sequence() {
+    let (programs, mut node, _, mut sessions) = setup();
+    let spam = programs.method(COUNTER, "spam");
+    node.batch(
+        1,
+        [0; 32],
+        vec![sessions.request(ALICE, COUNTER, spam, 3u32)],
+    );
+    let to = AgentId(5);
+    let pending = |node: &Node| -> Vec<u64> {
+        (1..=3)
+            .filter(|sequence| node.get(&keys::outbox(to, *sequence)).is_some())
+            .collect()
+    };
+    let acked = |node: &Node| -> u64 { decode(&node.get(&keys::acked(to)).unwrap()).unwrap() };
+    assert_eq!(pending(&node), [1, 2, 3]);
+    let result = node.batch(
+        2,
+        [0; 32],
+        vec![
+            Input::Ack { to, sequence: 2 },
+            Input::Ack { to, sequence: 1 },
+        ],
+    );
+    for step in &result.steps {
+        assert!(
+            matches!(ran(step).outcome, Outcome::Done(_)),
+            "an ack is never refused"
+        );
+    }
+    assert_eq!(pending(&node), [3]);
+    assert_eq!(acked(&node), 2, "a stale ack changes nothing");
+    node.batch(3, [0; 32], vec![Input::Ack { to, sequence: 99 }]);
+    assert!(pending(&node).is_empty());
+    assert_eq!(acked(&node), 3, "an ack stops at what was sent");
+}
+
+#[test]
 fn roles_nested_calls_cycles_and_attests() {
     let (programs, mut node, _, mut sessions) = setup();
     let result = node.batch(

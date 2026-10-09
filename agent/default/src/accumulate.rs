@@ -2,8 +2,9 @@
 //!
 //! Each step that ran writes its writes, advances its session or pair mark,
 //! keeps its reply in the session's window and queues its messages in the
-//! outbox with their pair sequences. A refused step applies nothing. A
-//! work result built on another state version applies nothing either.
+//! outbox with their pair sequences; an acknowledgement clears the outbox
+//! through its sequence. A refused step applies nothing. A work result
+//! built on another state version applies nothing either.
 
 use vos_wire::jam::AccumulateInput;
 use vos_wire::records::{SessionMark, stored, unstored};
@@ -77,6 +78,22 @@ fn apply(result: &WorkResult) {
                 put(&keys::pair_in(from), &sequence.encode());
             }
             InputRef::Admin => {}
+            InputRef::Ack { to, sequence } => {
+                // Monotonic and idempotent: a stale ack does nothing, one past
+                // what was sent stops there, and one ack clears at most
+                // `ACK_LIMIT` entries; the node acks again for the rest.
+                let acked = get::<u64>(&keys::acked(to)).unwrap_or(0);
+                let sent = get::<u64>(&keys::pair_out(to)).unwrap_or(0);
+                let through = sequence
+                    .min(sent)
+                    .min(acked.saturating_add(defaults::ACK_LIMIT));
+                for cleared in acked + 1..=through {
+                    delete(&keys::outbox(to, cleared));
+                }
+                if through > acked {
+                    put(&keys::acked(to), &through.encode());
+                }
+            }
         }
         for message in &run.messages {
             let next = get::<u64>(&keys::pair_out(message.to)).unwrap_or(0) + 1;

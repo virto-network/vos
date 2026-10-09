@@ -352,6 +352,10 @@ This answers open question 18 for one node.
 - Sequences are per (session, agent). Duplicates at or below the mark are
   answered from the reply window; gaps are refused; a request more than W
   ahead of the oldest kept reply waits. Expiry follows work-result time.
+- A `Failed` reply means the agent program failed on that request alone:
+  it was not consumed and its session's mark did not move, so the client
+  resends the same sequence or opens a new session. The reply window
+  never holds a `Failed`.
 - Bodies are SCALE bytes in this slice. JSON, through the package schema,
   is for the CLI and later clients [open].
 - **Defaults** [owner decision 4; proposed]: a reply window W of 64 per
@@ -492,6 +496,125 @@ this slice. Signatures, licensing and upgrades come later.
 - **Tests:** apply-then-send (no reply before durability); crash and
   restart recover the applied index and resend nothing twice; "busy"
   beyond the queued-input cap.
+
+#### Design [reviewed]
+
+**Threads.** One async thread (smol) runs every agent's leader loop and
+message delivery. A fixed pool of executor threads runs PVM work (refine,
+accumulate, queries); each job reads a fresh store snapshot. One storage
+thread owns commits: it takes every commit queued, writes them in one
+fjall batch, syncs once, and reports each commit durable.
+
+**A batch, per agent, strictly in order:**
+
+1. The leader takes queued inputs, up to 256 inputs or 1 MiB of
+   arguments. Inputs queue while a batch is in flight, so the next batch
+   starts as soon as the previous commit is durable; only when the queue
+   was empty does the leader linger, up to 2 ms after the first input.
+2. Refine on an executor: `Work::Batch { version, time, seed, inputs }`,
+   with the node's machine pool and a `StateReader` over the snapshot.
+   `time` is wall-clock milliseconds, never below the agent's last; `seed`
+   comes from the operating system. Both are in the work result, so the
+   log replays deterministically.
+3. Accumulate on an executor, over the snapshot with the writes it makes
+   recorded in order and read back by its later reads (the pair and
+   version counters it updates): these are the apply batch.
+4. The storage thread appends the work result as log entry `applied + 1`
+   (term 0, so slice 3's entries have the same shape) and applies the
+   writes, in one commit. The node's applied index and the agent's
+   `version` advance in that commit; recovery checks they agree. A leader
+   waits on its commit, which is the node's backpressure, alongside the
+   queue cap.
+5. Only once that commit is durable: each request's step answers its
+   caller; inputs past the last step return to the front of the queue;
+   the agent's new outbox entries are delivered; each applied message is
+   acknowledged to its sender.
+
+A batch that fails commits nothing, and who failed decides what follows.
+When the agent program fails it (a trap, out of gas, an output that does
+not decode), the batch returns to the queue at half its length, and so
+on until one passes, which isolates the input that breaks it: a request
+alone answers `Failed`; a message or ack alone is dropped and reported,
+which leaves its pair for an operator. When the node fails it (a read, a
+backend, a panic on an executor), no input is to blame: the batch
+returns to the queue whole and the leader waits, from 50 ms doubling to
+5 s, before trying again. A failed commit is not retried: fjall then
+refuses every later commit, so the node stops every agent and needs a
+restart. An accumulate that skips the result means the agent's state is
+not at its leader's version; that agent stops. A panic in a leader stops
+that agent only.
+
+**Shutdown** lets each leader finish its batch in flight. Queued inputs
+are dropped and their callers see `Stopped`; storage loses nothing, since
+only durable batches were ever answered.
+
+The node's refine gas covers `REFINE_GAS`, and checks at start that the
+largest handler limit with the agent's reserves fits it, so every input
+can be dispatched.
+
+**Acknowledgements are agent inputs.** Only an agent's accumulate writes
+its state, so the outbox is cleared by a new input, `Input::Ack { to,
+sequence }`: agent `to` has applied this agent's messages through
+`sequence`. It is unsequenced and never refused; refine passes it through
+as a step that runs no actor. Accumulate applies it monotonically: it
+clears the outbox from the `acked(to)` mark through `sequence`, stopping
+at what was sent and after `ACK_LIMIT` entries, and advances the mark; a
+stale ack does nothing. The node sends an ack when a target applies a
+message, when it drops a duplicate, and again while the mark trails what
+it acknowledged.
+
+**Delivery and recovery.** A message reaches its target's queue unless
+its sequence is at or below the target's pair mark; then it is a
+duplicate, dropped and acknowledged with the mark. A message refine
+refuses with `SEQUENCE` is a duplicate if its sequence is at or below the
+mark, acknowledged so; above the mark it is a gap, dropped without an ack
+for the sender's next delivery. In-process queues are reliable, so a
+message is delivered once per process and redelivered only from the
+outbox at start: there is no resend timer. Slice 3 adds resend timers and
+a per-pair window of messages in flight. On start, the node
+reads its agent registry (`system`, node keys), restores each agent's
+version and applied index from storage, and delivers every agent's
+outbox entries above its `acked` mark. One node commits the log entry and
+the apply together, so there is nothing to replay. A crash after a commit
+loses that batch's replies, which the reply window serves in 2.6, and its
+deliveries and acks, which recovery redoes. Duplicates are dropped by
+the pair marks, so no message applies twice.
+
+**Admission.** Client requests are capped per agent (1,024 queued by
+default); beyond the cap a call answers busy at once. Messages and acks
+are not capped, to drop none: each sender's outbox bounds what it sends,
+but not what a target receives from many senders [open: slice 3's
+per-pair window].
+
+**Queries** run on an executor with the machine pool and a fresh snapshot,
+and never enter the leader's queue or the log.
+
+**Programs.** Installing commits the blobs to `programs` and installs
+them in the machine pool, then queues the install. On start, the node
+installs every stored program in the pool. Refine also answers
+`historical_lookup` from `programs`. A crash before the install's own
+commit loses only the queued install, which the client sends again.
+
+**API (`vos_node::Node`).** `open(path, config)`; `create_agent`;
+`install(agent, instance, blob, attestables, roles)`; `set_role`;
+`call(agent, request)`, answering the step or busy; `query(agent,
+query)`; `shutdown`. The agent program is a configured blob, the default
+agent linked as a standard program. Tests inject faults through a hook:
+hold a commit, stop a leader after a commit and before it sends, make a
+refine fail, or deliver a message out of order.
+
+**Tests** (`node/host/tests/node.rs`): calls and state across a restart; no
+reply while a commit is held; busy at the cap; two agents exchanging
+messages, outboxes cleared by acks; queries see applied state and leave
+the log unchanged; a failing refine isolates its input and requeues the
+rest. Exactly once, each case followed by a restart:
+
+- a stop after the sender's commit, before delivery: recovery delivers;
+- a stop after the target's commit, before its ack: recovery redelivers,
+  the target drops the duplicate and acks;
+- redelivery while the sender sends more: the target applies each once,
+  in order;
+- a gap (3 before 2): refused, not acked; then 2 and 3 apply.
 
 ### 2.6 Sessions, ingress and the CLI
 

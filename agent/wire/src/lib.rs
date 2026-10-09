@@ -51,4 +51,9 @@ pub mod defaults {
     pub const INSTALL_RESERVE: u64 = 8_000_000;
     /// Gas a refine keeps to finish its result once its steps are written.
     pub const FINISH_RESERVE: u64 = 100_000;
+    /// The most outbox entries one acknowledgement clears, bounding an ack
+    /// step's accumulate work; the node acks again for the rest. Clearing
+    /// them is a thousand storage deletions, far inside an accumulate's
+    /// gas (`REFINE_GAS` on a node).
+    pub const ACK_LIMIT: u64 = 1024;
 }

@@ -90,6 +90,7 @@ fn programs_carry_their_schema_first_in_read_only_data() {
         [
             "increment",
             "value",
+            "forward",
             "put_and_scan",
             "echo",
             "sneaky",

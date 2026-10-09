@@ -102,6 +102,8 @@ pub enum InputRef {
     Message { from: AgentId, sequence: u64 },
     #[codec(index = 2)]
     Admin,
+    #[codec(index = 3)]
+    Ack { to: AgentId, sequence: u64 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]

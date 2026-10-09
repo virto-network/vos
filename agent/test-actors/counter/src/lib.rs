@@ -63,6 +63,23 @@ impl Counter {
         self.value
     }
 
+    /// Add `by` to the counter at `instance` of agent `agent`, by message.
+    #[msg]
+    pub async fn forward(
+        &mut self,
+        ctx: &mut Command<Self>,
+        agent: u32,
+        instance: u32,
+        by: u64,
+    ) -> u64 {
+        ctx.send(
+            AgentId(agent),
+            Ref::<Counter>::new(InstanceId(instance)),
+            counter::Increment { by },
+        );
+        by
+    }
+
     /// Write `keys`, then scan under `prefix` from `cursor`, any bytes the
     /// raw ABI allows, and return what the scan wrote.
     #[msg]

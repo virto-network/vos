@@ -56,6 +56,12 @@ pub trait Store: Send + Sync {
     fn log_entry(&self, agent: AgentId, index: u64) -> Result<Option<LogEntry>>;
 
     fn program(&self, hash: &ProgramHash) -> Result<Option<Vec<u8>>>;
+
+    /// Every stored program, for the machine pool at start.
+    fn programs(&self) -> Result<Vec<(ProgramHash, Vec<u8>)>>;
+
+    /// The agents this node runs, each with its agent program.
+    fn agents(&self) -> Result<Vec<(AgentId, ProgramHash)>>;
 }
 
 /// A read-only view of applied state. Keys are relative to the agent.
@@ -91,6 +97,9 @@ pub trait Batch {
 
     fn program(&mut self, hash: &ProgramHash, blob: &[u8]);
 
+    /// Record that this node runs `agent` with the agent program `program`.
+    fn agent(&mut self, agent: AgentId, program: &ProgramHash);
+
     fn commit(self, durability: Durability) -> Result<()>;
 }
 
@@ -100,6 +109,9 @@ const SYSTEM: u8 = 0x00;
 /// agent key reaches them: only keys starting with [`SYSTEM`] go there.
 const NODE: u8 = 0xff;
 const APPLIED: u8 = 0x00;
+const AGENT: u8 = 0x01;
+/// The id no agent gets: node-wide records live under its node keys.
+pub const NODE_AGENT: AgentId = AgentId(u32::MAX);
 
 fn agent_key(agent: AgentId, key: &[u8]) -> Vec<u8> {
     [&agent.0.to_be_bytes()[..], key].concat()
@@ -107,6 +119,10 @@ fn agent_key(agent: AgentId, key: &[u8]) -> Vec<u8> {
 
 fn applied_key(agent: AgentId) -> Vec<u8> {
     agent_key(agent, &[NODE, APPLIED])
+}
+
+fn registry_prefix() -> Vec<u8> {
+    agent_key(NODE_AGENT, &[NODE, AGENT])
 }
 
 fn log_key(agent: AgentId, index: u64) -> Vec<u8> {
@@ -246,6 +262,30 @@ impl Store for Fjall {
     fn program(&self, hash: &ProgramHash) -> Result<Option<Vec<u8>>> {
         Ok(self.programs.get(hash.0)?.map(|blob| blob.to_vec()))
     }
+
+    fn programs(&self) -> Result<Vec<(ProgramHash, Vec<u8>)>> {
+        self.programs
+            .iter()
+            .map(|row| {
+                let (hash, blob) = row.into_inner()?;
+                let hash = hash[..].try_into().expect("a 32-byte program hash");
+                Ok((ProgramHash(hash), blob.to_vec()))
+            })
+            .collect()
+    }
+
+    fn agents(&self) -> Result<Vec<(AgentId, ProgramHash)>> {
+        let prefix = registry_prefix();
+        self.system
+            .prefix(&prefix)
+            .map(|row| {
+                let (key, program) = row.into_inner()?;
+                let agent = key[prefix.len()..].try_into().expect("an agent id");
+                let program = program[..].try_into().expect("a program hash");
+                Ok((AgentId(u32::from_be_bytes(agent)), ProgramHash(program)))
+            })
+            .collect()
+    }
 }
 
 pub struct FjallSnapshot {
@@ -328,6 +368,11 @@ impl Batch for FjallBatch {
 
     fn program(&mut self, hash: &ProgramHash, blob: &[u8]) {
         self.batch.insert(&self.store.programs, hash.0, blob);
+    }
+
+    fn agent(&mut self, agent: AgentId, program: &ProgramHash) {
+        let key = [registry_prefix(), agent.0.to_be_bytes().to_vec()].concat();
+        self.batch.insert(&self.store.system, key, program.0);
     }
 
     fn commit(self, durability: Durability) -> Result<()> {

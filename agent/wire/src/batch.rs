@@ -36,8 +36,11 @@ pub struct Query {
 pub struct Batch {
     /// Applied, non-skipped work results before this one (section 7.5).
     pub version: u64,
-    /// Milliseconds since the Unix epoch, monotonic across leaders.
+    /// Milliseconds since the Unix epoch by the leader's wall clock,
+    /// monotonic across leaders.
     pub time: u64,
+    /// From the leader's operating system. The work result carries both,
+    /// so a replay reads them and never draws them again.
     pub seed: [u8; 32],
     pub inputs: Vec<Input>,
 }
@@ -50,6 +53,10 @@ pub enum Input {
     Message(Message),
     #[codec(index = 2)]
     Admin(Admin),
+    /// Agent `to` has applied this agent's messages to it through
+    /// `sequence`: their outbox entries can go. The node sends it.
+    #[codec(index = 3)]
+    Ack { to: AgentId, sequence: u64 },
 }
 
 /// A client request, in its session's sequence for this agent.

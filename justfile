@@ -4,9 +4,10 @@ default:
     @just --list
 
 # Fast suites: runtime, compiler, program format, codec, support crates,
-# precompile shim, verifier, prover library, wire types, node.
+# precompile shim, verifier, prover library, wire types. The node runs the
+# agent, so it is tested with it.
 test:
-    cargo test -p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-proof-verifier -p vos-wire -p vos-node
+    cargo test -p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-proof-verifier -p vos-wire
     cargo test -p vos-pvm-proof --lib
 
 # Bench guests, built with the guest toolchain in `pvm/guest`.
@@ -64,10 +65,10 @@ build-test-actors:
 build-agent:
     cd agent/default; cargo build --release --target ../../pvm/guest/riscv64em-vos.json
 
-# The SDK, its macros' restrictions, the test actors on the testkit, and
-# the default agent against it.
+# The SDK, its macros' restrictions, the test actors on the testkit, the
+# default agent against it, and the node running the agent.
 test-agent: build-test-actors build-agent
-    cargo test -p vos-sdk -p vos-sdk-macros -p vos-testkit
+    cargo test -p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-node
 
 # Checks before pushing: everything except proving.
 ci: fmt-check clippy jar-check test vectors test-bench test-agent

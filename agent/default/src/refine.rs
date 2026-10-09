@@ -178,7 +178,7 @@ fn run_batch(agent: AgentId, batch: Batch) -> Vec<u8> {
         let limit = match &input {
             Input::Request(request) => limit(&base, request.instance, request.method),
             Input::Message(message) => limit(&base, message.instance, message.method),
-            Input::Admin(_) => 0,
+            Input::Admin(_) | Input::Ack { .. } => 0,
         };
         if gas() < limit + reserve {
             break;
@@ -257,6 +257,7 @@ fn run_batch(agent: AgentId, batch: Batch) -> Vec<u8> {
                 }
             }
             Input::Admin(admin) => (self::admin(admin), None),
+            Input::Ack { to, sequence } => (acknowledge(to, sequence), None),
         };
         // A step the result cannot hold waits, with every later input, for
         // the next batch; one alone always fits (`cap::STEP_RESULT`).
@@ -359,6 +360,20 @@ fn run_query(agent: AgentId, query: Query) -> Outcome {
     };
     let mut invocation = Invocation::new(&base, 0, Kind::Query);
     invocation.top(query.caller, query.instance, query.method, &query.arguments)
+}
+
+/// An acknowledgement from agent `to`: unsequenced, never refused, and
+/// it runs no actor. Accumulate clears the outbox through `sequence`.
+fn acknowledge(to: AgentId, sequence: u64) -> Step {
+    Step::Ran(Run {
+        input: InputRef::Ack { to, sequence },
+        outcome: Outcome::Done(Vec::new()),
+        instances: Vec::new(),
+        writes: Vec::new(),
+        messages: Vec::new(),
+        attests: Vec::new(),
+        gas_used: 0,
+    })
 }
 
 /// An operator command: install a package or set a role. Its writes are

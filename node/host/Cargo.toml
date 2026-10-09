@@ -3,17 +3,22 @@ name = "vos-node"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "The VOS node host: storage, the leader loop and ingress."
+description = "The VOS node host: storage, the leader loops and ingress."
 
 [dependencies]
 # Exact: the workspace nightly is a 1.90 pre-release, which a later fjall
 # release may outgrow.
 fjall = "=3.1.12"
+getrandom = "0.2"
+smol = "2"
+tracing = "0.1"
+vos-pvm = { workspace = true }
 vos-wire = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
+vos-pvm-compiler = { workspace = true }
 
 [[test]]
 name = "crash"

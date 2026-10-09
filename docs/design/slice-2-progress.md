@@ -386,3 +386,83 @@ At these prices the default handler gas (10M) buys about 150 writes or
 500 reads, and a transfer (two gets, two puts) about 170,000 gas in
 charges: about 60 transfers per default handler, before the actor's own
 code.
+
+## Step 2.5: the node host
+
+**Done:**
+
+- **`vos_node::Node`** (`node/host/src/node.rs`) runs every agent on one
+  process: each agent's leader loop on one async thread (smol), PVM work
+  on a fixed pool of executor threads (`executor.rs`), and commits on one
+  storage thread (`storage.rs`), which writes everything queued in one
+  batch and syncs once.
+- **A batch, per agent, in order:** the leader takes queued inputs (256,
+  or 1 MiB of arguments, lingering 2 ms only when it found the queue
+  empty); refine and accumulate run on executors against one snapshot
+  (`pvm.rs`), accumulate reading back its own writes; one commit appends
+  the work result as log entry `applied + 1` and applies the writes; only
+  then does the leader answer requests, requeue what the result did not
+  cover, deliver the outbox and acknowledge applied messages.
+- **Acknowledgements are agent inputs**, `Input::Ack { to, sequence }`,
+  so only accumulate writes agent state: unsequenced, never refused, and
+  applied monotonically, clamped to what was sent and to `ACK_LIMIT`
+  entries a step; the node acks again while the mark trails.
+- **Exactly once:** a message at or below its pair mark is a duplicate,
+  dropped and acknowledged with the mark, before batching or when refine
+  refuses it; above the mark a refusal is a gap, dropped unacknowledged.
+  On start, each agent's outbox is delivered above its ack mark, and the
+  node checks each agent's applied index against its state version.
+- **A failing batch** commits nothing. If the agent program failed it, the
+  batch returns to the queue at half its length until it passes or one
+  input fails alone: a request answers `Failed` (not consumed: the client
+  resends the same sequence), a message or ack is reported and dropped.
+  If the node failed it (a read, a backend, an executor's panic, which the
+  executor catches), the batch returns whole and the leader backs off. A
+  failed commit stops the node, since fjall then refuses every commit; an
+  accumulate that skips the result (the agent's version is not its
+  leader's) stops that agent; a leader that panics stops its agent only.
+  A stopped agent drops its queue, whose callers see `Stopped`.
+- **Admission:** 1,024 queued client requests per agent, then busy;
+  messages and acks are not capped.
+- **Queries** run on an executor with the pool and a fresh snapshot, with
+  the last applied batch's time and seed, and never enter the log.
+- **Programs** are committed to `programs` and pooled before an install
+  is queued; the pool is refilled from `programs` on start, and refine's
+  `historical_lookup` reads them.
+- The store gained the node's agent registry (under an id no agent gets)
+  and a listing of programs.
+- Test hooks (`vos_node::Hooks`): hold commits, fail a commit, stop a
+  leader between its commit and its sends, fail a refine or panic in its
+  executor job.
+
+**Tests** (`node/host/tests/node.rs`, on the default agent and the
+counter actor):
+
+- calls apply and survive a restart; a query sees applied state and
+  leaves the log unchanged; an unknown agent is refused;
+- no reply while its commit is held; a full queue answers busy;
+- a failing refine isolates its input, which fails alone while the rest
+  apply (the dropped request leaves its session a gap);
+- a panic on an executor retries the batch whole, as one batch, and drops
+  nothing;
+- a failed commit stops the node: every call answers `Stopped`, nothing of
+  the batch applies, and a restart goes on;
+- two agents exchange messages, and acks clear the sender's outbox;
+- exactly once, each across a stop and a restart: a stop before delivery
+  (recovery delivers), a stop before the target's ack (redelivery is a
+  duplicate, acknowledged, applied once), redelivery interleaved with new
+  sends (each applied once, in order), and a gap (refused, unacknowledged,
+  applied once filled).
+
+The suite passed 10 sequential runs and 16 runs at 8-way concurrency.
+
+**Open:**
+
+- a target unknown or stopped when a sender recovers is skipped until the
+  sender next sends to it or the node restarts; slice 3's resend timer
+  closes this;
+- a message that fails the agent program alone is dropped, so every later
+  message on its pair is a gap: like an unreadable mark, it needs an
+  operator's `Admin::ResetPair`;
+- messages are not capped at their target: each sender's outbox bounds
+  what it sends, not what a target receives (slice 3's per-pair window).
