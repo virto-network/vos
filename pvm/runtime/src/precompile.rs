@@ -52,6 +52,36 @@ pub fn charge(id: u64, gas: &mut crate::Gas) -> bool {
     }
 }
 
+/// BLAKE2b-256 of `data`, unkeyed: the hash JAM names code by.
+pub fn blake2b_256(data: &[u8]) -> [u8; 32] {
+    let mut h = IV;
+    // Parameter block: 32-byte digest, no key, fanout and depth 1.
+    h[0] ^= 0x0101_0000 ^ 32;
+    let mut counter = 0u128;
+    let mut rest = data;
+    loop {
+        let last = rest.len() <= 128;
+        let take = rest.len().min(128);
+        let mut block = [0u8; 128];
+        block[..take].copy_from_slice(&rest[..take]);
+        counter += take as u128;
+        let mut m = [0u64; 16];
+        for (i, word) in m.iter_mut().enumerate() {
+            *word = u64::from_le_bytes(block[i * 8..i * 8 + 8].try_into().unwrap());
+        }
+        h = compress(&h, &m, counter, last);
+        rest = &rest[take..];
+        if last {
+            break;
+        }
+    }
+    let mut out = [0u8; 32];
+    for (i, word) in h[..4].iter().enumerate() {
+        out[i * 8..i * 8 + 8].copy_from_slice(&word.to_le_bytes());
+    }
+    out
+}
+
 /// The inputs and output of one served precompile call.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PrecompileCall {
@@ -188,4 +218,27 @@ fn g(v: &mut [u64; 16], a: usize, b: usize, c: usize, d: usize, x: u64, y: u64) 
     v[d] = (v[d] ^ v[a]).rotate_right(16);
     v[c] = v[c].wrapping_add(v[d]);
     v[b] = (v[b] ^ v[c]).rotate_right(63);
+}
+
+#[cfg(test)]
+mod hash_tests {
+    #[test]
+    fn blake2b_256_matches_reference_digests() {
+        let hex = |digest: [u8; 32]| {
+            digest
+                .iter()
+                .map(|byte| alloc::format!("{byte:02x}"))
+                .collect::<alloc::string::String>()
+        };
+        assert_eq!(
+            hex(super::blake2b_256(b"")),
+            "0e5751c026e543b2e8ab2eb06099daa1d1e5df47778f7787faab45cdf12fe3a8"
+        );
+        assert_eq!(
+            hex(super::blake2b_256(b"abc")),
+            "bddd813c634239723171ef3fee98579b94964e3bb1cb3e427262c8c068d52319"
+        );
+        // Exactly one block, and one block plus one byte.
+        assert_ne!(super::blake2b_256(&[7; 128]), super::blake2b_256(&[7; 129]));
+    }
 }

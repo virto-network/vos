@@ -18,6 +18,8 @@ pub mod gas_sim;
 pub mod inner;
 pub mod instruction;
 pub mod interpreter;
+#[cfg(feature = "std")]
+pub mod pool;
 pub mod precompile;
 pub mod refine;
 pub mod refine_host;

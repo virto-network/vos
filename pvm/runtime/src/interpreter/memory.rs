@@ -200,6 +200,9 @@ pub struct PagePerms {
     /// slot. The bits describe this map's own window only: a clone starts
     /// with every slot changed, and a fresh window applies every slot.
     changed: Vec<u64>,
+    /// Slots changed since the last [`Self::take_touched_slots`], one bit
+    /// per slot, for resetting a pooled machine's permissions.
+    touched: Vec<u64>,
 }
 
 impl Clone for PagePerms {
@@ -211,6 +214,7 @@ impl Clone for PagePerms {
             not_rw: self.not_rw,
             revision: self.revision,
             changed: vec![u64::MAX; self.changed.len()],
+            touched: self.touched.clone(),
         }
     }
 }
@@ -225,6 +229,7 @@ impl PagePerms {
             not_rw: if permission == PERM_RW { 0 } else { slots },
             revision: 0,
             changed: vec![u64::MAX; slots.div_ceil(64)],
+            touched: vec![0; slots.div_ceil(64)],
         }
     }
 
@@ -338,6 +343,7 @@ impl PagePerms {
             _ => {}
         }
         self.changed[slot / 64] |= 1 << (slot % 64);
+        self.touched[slot / 64] |= 1 << (slot % 64);
         true
     }
 
@@ -347,6 +353,36 @@ impl PagePerms {
             .revision
             .checked_add(1)
             .expect("permission revision cannot wrap in one invocation");
+    }
+
+    /// The slots changed since the last call, in order.
+    pub(crate) fn take_touched_slots(&mut self) -> Vec<usize> {
+        let mut slots = Vec::new();
+        for (word, bits) in self.touched.iter_mut().enumerate() {
+            while *bits != 0 {
+                slots.push(word * 64 + bits.trailing_zeros() as usize);
+                *bits &= *bits - 1;
+            }
+        }
+        slots
+    }
+
+    /// Maximal runs `(first page, count, permission)` of one slot's pages.
+    pub(crate) fn slot_runs(&self, slot: usize) -> Vec<(usize, usize, u8)> {
+        let base = slot * SLOT_PAGES;
+        match &self.slots[slot] {
+            PermSlot::Uniform(permission) => alloc::vec![(base, self.slot_len(slot), *permission)],
+            PermSlot::Mixed(leaf) => {
+                let mut runs: Vec<(usize, usize, u8)> = Vec::new();
+                for (offset, &permission) in leaf[..self.slot_len(slot)].iter().enumerate() {
+                    match runs.last_mut() {
+                        Some((_, len, last)) if *last == permission => *len += 1,
+                        _ => runs.push((base + offset, 1, permission)),
+                    }
+                }
+                runs
+            }
+        }
     }
 
     /// Maximal runs `(first page, count, permission)` covering the span in
@@ -682,6 +718,8 @@ pub struct FlatMem {
     bytes: FlatBytes,
     perms: PagePerms,
     dirty: DirtyPages,
+    /// Every capture since the last reset ([`Memory::take_pages_since_reset`]).
+    captured: Vec<core::ops::Range<u32>>,
     value_revision: u64,
 }
 
@@ -762,6 +800,7 @@ impl FlatMem {
             bytes: FlatBytes::Owned(bytes),
             perms: PagePerms::new_rw(pages),
             dirty: DirtyPages::new(pages),
+            captured: Vec::new(),
             value_revision: 0,
         }
     }
@@ -881,6 +920,8 @@ pub struct SparseMem {
     frame_dirty: Vec<bool>,
     /// Pages written since the last capture, in first-write order.
     dirty: Vec<u32>,
+    /// Every capture since the last reset ([`Memory::take_pages_since_reset`]).
+    captured: Vec<core::ops::Range<u32>>,
     value_revision: u64,
 }
 
@@ -897,6 +938,7 @@ impl SparseMem {
             perms: PagePerms::new_rw(pages),
             frame_dirty: Vec::new(),
             dirty: Vec::new(),
+            captured: Vec::new(),
             value_revision: 0,
         }
     }
@@ -1033,6 +1075,19 @@ impl SparseMem {
     }
 }
 
+/// Sort page ranges and merge those that overlap or touch.
+fn coalesce(mut ranges: Vec<core::ops::Range<u32>>) -> Vec<core::ops::Range<u32>> {
+    ranges.sort_unstable_by_key(|range| range.start);
+    let mut merged: Vec<core::ops::Range<u32>> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        match merged.last_mut() {
+            Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+            _ => merged.push(range),
+        }
+    }
+    merged
+}
+
 /// The interpreter's guest memory: flat (dense) or sparse (page table).
 /// Constructor-selected; the representation never changes during a run.
 #[derive(Clone, Debug)]
@@ -1059,6 +1114,7 @@ impl Memory {
             bytes: FlatBytes::Native(bytes),
             perms: PagePerms::new_rw(span as usize / PAGE),
             dirty: DirtyPages::new(span as usize / PAGE),
+            captured: Vec::new(),
             value_revision: 0,
         }))
     }
@@ -1154,10 +1210,101 @@ impl Memory {
                 dirty.mark_range(first, count);
             }
         }
-        match self {
-            Memory::Flat(m) => m.dirty.take(),
-            Memory::Sparse(m) => m.take_dirty(),
+        let (pages, captured) = match self {
+            Memory::Flat(m) => (m.dirty.take(), &mut m.captured),
+            Memory::Sparse(m) => (m.take_dirty(), &mut m.captured),
+        };
+        captured.extend(pages.iter().cloned());
+        if captured.len() > 4096 {
+            *captured = coalesce(core::mem::take(captured));
         }
+        pages
+    }
+
+    /// Every page written since the last call, whether or not a capture
+    /// ([`Self::take_dirty_pages`]) has reported it since: what a pooled
+    /// machine must restore. Starts a new capture period as well.
+    pub(crate) fn take_pages_since_reset(&mut self) -> Vec<core::ops::Range<u32>> {
+        self.take_dirty_pages();
+        let captured = match self {
+            Memory::Flat(m) => &mut m.captured,
+            Memory::Sparse(m) => &mut m.captured,
+        };
+        coalesce(core::mem::take(captured))
+    }
+
+    /// The permission slots changed since the last call, with each slot's
+    /// permission runs, for resetting a pooled machine.
+    pub(crate) fn take_changed_permissions(&mut self) -> Vec<(usize, usize, u8)> {
+        dispatch!(self, m => {
+            let slots = m.perms.take_touched_slots();
+            slots.into_iter().flat_map(|slot| m.perms.slot_runs(slot)).collect()
+        })
+    }
+
+    /// Forget host writes made since the last capture, without asking the
+    /// native window for guest writes: for a caller that wrote the memory
+    /// itself, with no guest running since that capture.
+    pub(crate) fn forget_host_writes(&mut self) {
+        match self {
+            Memory::Flat(m) => {
+                m.dirty.take();
+                m.captured.clear();
+            }
+            Memory::Sparse(m) => {
+                m.take_dirty();
+                m.captured.clear();
+            }
+        }
+    }
+
+    /// Set complete pages to zero by writing them, keeping their host
+    /// memory: cheaper than [`Self::clear_pages`] for a few pages.
+    pub(crate) fn zero_pages(&mut self, first: usize, count: usize) {
+        assert!(
+            first + count <= self.pages(),
+            "zeroed pages exceed the span"
+        );
+        match self {
+            Memory::Flat(m) => {
+                // SAFETY: the assertion bounds the pages by the span, which
+                // `bytes` covers.
+                unsafe {
+                    core::ptr::write_bytes(m.bytes.as_mut_ptr().add(first * PAGE), 0, count * PAGE);
+                }
+                m.dirty.mark_range(first, count);
+            }
+            Memory::Sparse(m) => {
+                for page in first..first + count {
+                    if m.table.get(page) != NO_FRAME {
+                        let base = m.write_frame(page);
+                        m.frames[base..base + PAGE].fill(0);
+                    }
+                }
+            }
+        }
+        if count != 0 {
+            dispatch!(self, m => {
+                m.value_revision = m
+                    .value_revision
+                    .checked_add(1)
+                    .expect("memory revision cannot wrap in one invocation");
+            });
+        }
+    }
+
+    /// Whether native write tracking has failed: the memory reports every
+    /// page from then on, and must not be reused.
+    pub(crate) fn tracking_failed(&self) -> bool {
+        #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+        if let Memory::Flat(FlatMem {
+            bytes: FlatBytes::Native(bytes),
+            ..
+        }) = self
+        {
+            return bytes.tracking_failed();
+        }
+        false
     }
 
     /// Monotonic identity of the logical value image. Equal revisions for

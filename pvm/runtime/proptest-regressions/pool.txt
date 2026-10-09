@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc d6a44aa435256ba1c3d4e206e7c0cfe5c94c966ebb91079902b821fc925772ea # shrinks to ops = [Invoke(102, [65536, 196608, 204799, 65536, 65536], 36028797018963968)]

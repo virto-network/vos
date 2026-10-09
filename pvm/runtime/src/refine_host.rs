@@ -137,6 +137,17 @@ impl RefineContext {
         Ok(Self { outer, inner })
     }
 
+    /// Serve `instantiate` from the node's pool. Inner machines it lends
+    /// return to the pool when expunged or when this context is dropped.
+    /// Observed runs, which proof tracing uses, do not serve it yet: running
+    /// one with a pool is refused, and without a pool `instantiate` reaches
+    /// the embedder, as an unknown call reaches a JAM host.
+    #[cfg(feature = "std")]
+    pub fn with_pool(mut self, pool: alloc::sync::Arc<crate::pool::MachinePool>) -> Self {
+        self.inner.set_pool(pool);
+        self
+    }
+
     /// Reuse validated program preparation, never per-invocation machines.
     pub fn load_prepared(
         program: &crate::refine::PreparedProgram,
@@ -249,6 +260,13 @@ impl RefineContext {
         mut self,
         observer: &mut dyn for<'a> FnMut(RefineObservation<'a>),
     ) -> Invocation {
+        // A traced run must execute exactly like a live one, and tracing
+        // cannot follow a pooled machine yet.
+        #[cfg(feature = "std")]
+        assert!(
+            self.inner.pool().is_none(),
+            "observed Refine execution does not serve `instantiate` from a pool"
+        );
         loop {
             let mut exit = self.outer.resume_observed(|event| match event {
                 MachineObservation::Enter(machine) => {
@@ -346,6 +364,10 @@ impl RefineContext {
             value if value == u64::from(host_call::PAGES) => self.pages(),
             value if value == u64::from(host_call::INVOKE) => self.invoke(None),
             value if value == u64::from(host_call::EXPUNGE) => self.expunge(),
+            #[cfg(feature = "std")]
+            value if value == u64::from(host_call::INSTANTIATE) && self.inner.pool().is_some() => {
+                self.instantiate()
+            }
             _ => Dispatch::Exit(ExitReason::HostCall(id)),
         }
     }
@@ -400,6 +422,45 @@ impl RefineContext {
                 Err(_) => result::HUH,
             },
             Err(_) => result::HUH,
+        };
+        self.outer.registers_mut()[7] = result;
+        Dispatch::Continue
+    }
+
+    /// `instantiate`: φ7 points at a 32-byte code hash. φ7 becomes the new
+    /// machine's index, `WHO` for a program the pool does not hold, or
+    /// `FULL` at the machine limit. The call costs `machine`'s base, as a
+    /// failed `machine` does; an installed program then costs the rest of
+    /// its price, what laying it out costs a loader in host calls (never
+    /// less than the base). The machine starts at instruction counter 0.
+    #[cfg(feature = "std")]
+    fn instantiate(&mut self) -> Dispatch {
+        if let Err(exit) = self.charge(gas::MACHINE_BASE) {
+            return exit;
+        }
+        if self.inner.len() >= MAX_INNER_MACHINES {
+            self.outer.registers_mut()[7] = result::FULL;
+            return Dispatch::Continue;
+        }
+        let address = self.outer.registers()[7];
+        let Some(hash) = self.read_outer(address, 32, false) else {
+            return Dispatch::Exit(ExitReason::Panic);
+        };
+        let hash = crate::pool::CodeHash(hash.try_into().expect("32 bytes read"));
+        let program = self.inner.pool().and_then(|pool| pool.program(&hash));
+        let result = match program {
+            None => result::WHO,
+            Some(program) => {
+                if let Err(exit) = self.charge(program.price() - gas::MACHINE_BASE) {
+                    return exit;
+                }
+                match self.inner.instantiate(&program) {
+                    Ok(id) => u64::from(id),
+                    Err(InnerError::Full) => result::FULL,
+                    Err(InnerError::Backend) => return Dispatch::Backend,
+                    Err(_) => result::HUH,
+                }
+            }
         };
         self.outer.registers_mut()[7] = result;
         Dispatch::Continue
@@ -1015,6 +1076,101 @@ mod tests {
             .unwrap(),
             "recompiler",
         );
+    }
+
+    /// An outer program that calls `instantiate` with the code hash in its
+    /// read-write data, then halts.
+    #[cfg(feature = "std")]
+    fn instantiating_program(hash: [u8; 32]) -> Vec<u8> {
+        let [lo, hi] = (crate::inner::host_call::INSTANTIATE as u16).to_le_bytes();
+        let code = [
+            51, 7, 0x00, 0x00, 0x02, // load_imm φ7, 0x2_0000
+            10, lo, hi, // ecalli instantiate
+            50, 0, // jump_ind φ0 (the halt address)
+        ];
+        standard_program_with_rw(&code, &[0, 5, 8], &hash)
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn instantiate_lends_pooled_machines_and_takes_them_back() {
+        use crate::pool::{CodeHash, MachinePool};
+        let installed = compression_program(crate::precompile::BLAKE2B_COMPRESS as u16);
+        let pool = alloc::sync::Arc::new(MachinePool::new());
+        let hash = pool.install(&installed).unwrap();
+        let price = pool.program(&hash).unwrap().price();
+
+        let mut backends = vec![PvmBackend::ForceInterpreter];
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        backends.push(PvmBackend::ForceRecompiler);
+        for backend in backends {
+            let run = |hash: CodeHash| {
+                RefineContext::load_with_backend(
+                    &instantiating_program(hash.0),
+                    &[],
+                    1_000_000,
+                    crate::refine::MemoryModel::Auto,
+                    backend,
+                )
+                .unwrap()
+                .with_pool(alloc::sync::Arc::clone(&pool))
+                .try_run()
+                .unwrap()
+            };
+            let lent = run(hash);
+            assert_eq!(lent.exit, ExitReason::Halt, "{backend:?}");
+            assert_eq!(lent.registers[7], 0, "{backend:?}: the first machine index");
+            assert_eq!(
+                pool.idle(),
+                1,
+                "{backend:?}: returned when the context dropped"
+            );
+
+            let unknown = run(CodeHash([0xee; 32]));
+            assert_eq!(unknown.registers[7], result::WHO, "{backend:?}");
+            assert_eq!(
+                lent.gas_used - unknown.gas_used,
+                price - gas::MACHINE_BASE,
+                "{backend:?}: an installed program costs its price"
+            );
+            assert_eq!(pool.idle(), 1, "{backend:?}: the idle machine was reused");
+            // Each backend keeps its own idle machines.
+            let _ = pool
+                .acquire(&pool.program(&hash).unwrap(), backend)
+                .unwrap();
+        }
+
+        // Without a pool the call reaches the embedder, as on a JAM host.
+        let reached = RefineContext::load(&instantiating_program(hash.0), &[], 1_000_000)
+            .unwrap()
+            .run();
+        assert_eq!(
+            reached.exit,
+            ExitReason::HostCall(u64::from(crate::inner::host_call::INSTANTIATE))
+        );
+
+        // The pool is shared by every refine on a node.
+        let shared = alloc::sync::Arc::clone(&pool);
+        std::thread::spawn(move || {
+            let program = shared.program(&hash).unwrap();
+            let mut machines = crate::inner::InnerMachines::new();
+            machines.set_pool(alloc::sync::Arc::clone(&shared));
+            machines.instantiate(&program).unwrap();
+        })
+        .join()
+        .unwrap();
+        assert_eq!(pool.idle(), 1);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    #[should_panic(expected = "does not serve `instantiate` from a pool")]
+    fn observed_runs_refuse_a_pool() {
+        let program = compression_program(crate::precompile::BLAKE2B_COMPRESS as u16);
+        RefineContext::load(&program, &[], 1_000_000)
+            .unwrap()
+            .with_pool(alloc::sync::Arc::new(crate::pool::MachinePool::new()))
+            .run_observed(|_| {});
     }
 
     #[test]

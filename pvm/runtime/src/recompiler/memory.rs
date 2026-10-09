@@ -512,6 +512,11 @@ impl NativeMemory {
         &*self.activation
     }
 
+    /// Whether write tracking has failed for good.
+    pub(crate) fn tracking_failed(&self) -> bool {
+        self.activation.failed.load(Ordering::Relaxed)
+    }
+
     /// The whole span as one run, for captures once tracking has failed:
     /// reporting every page keeps the dirty set a superset of the writes.
     pub(crate) fn span_pages(&self) -> (usize, usize) {

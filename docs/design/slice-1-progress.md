@@ -487,3 +487,118 @@ signed off on all three.
   - `just ci-full` is the gate before merging: `ci`, the prover suites and
     soundness gates (`test-proof`), and the proving bench tests. It is
     meant to run under a memory limit.
+
+## Step 1.6: machine pool and prepared programs
+
+- **Prepared programs.** `vos_pvm::pool::MachinePool` installs standard
+  programs by code hash: BLAKE2b-256 of the program blob, the hash JAM
+  names code by. Each is prepared once per backend, on first use. Programs
+  that `machine` creates go through a process-wide cache, replacing the
+  per-thread one. That cache is keyed by the exact code bytes and backend,
+  which costs less than hashing, and is bounded at 2 MiB per program and
+  64 MiB in total.
+- **`instantiate`.** A VOS refine extension at `0x480`, the first id of
+  the extension half (`0x480..=0x4ff`) of the VOS block; precompiles keep
+  `0x400..=0x47f`.
+  - φ7 points at a 32-byte code hash. φ7 becomes the new machine's index,
+    `WHO` for a hash the pool does not hold, or `FULL` at the machine
+    limit.
+  - The machine is laid out as the standard layout with no arguments: what
+    a loader builds with `machine`, then `pages` (read-only data is mapped
+    writable, poked, then made read-only) and `poke`.
+  - It costs `machine`'s base, plus, for an installed program, exactly what
+    that loader pays in host calls.
+  - A refine without a pool, which includes proof tracing, passes the call
+    to its embedder, as a JAM host answers an unknown id. Proving refines
+    that instantiate is carried to step 5: the bundle must commit to the
+    pool's programs.
+  - The refine host-call allow-list now names the BLAKE2b precompile and
+    `instantiate` too.
+- **Pool.** An expunged machine, or one still lent when its refine ends,
+  returns to the pool, which keeps at most 4,096 idle machines by default.
+  A reset returns it to exactly a fresh build's state:
+  - every page written since the last reset is restored from the program's
+    image or zeroed;
+  - only the permission slots that changed are compared with the image and
+    restored;
+  - registers, gas, the counter, the pending host call and the
+    gas-charging flags return to their initial values.
+
+  A capture for a snapshot does not hide pages from a reset: memory keeps
+  every capture since the last reset. A machine whose write tracking
+  failed, or whose interpreter memory grew 4 MiB beyond a fresh build, is
+  dropped instead.
+- **Deviations from the plan.**
+  - The plan had interpreter frames point at shared image pages, with a
+    reset that drops the owned frames. Instead, a build copies the image's
+    few non-zero pages, and a reset restores dirty pages, the same way on
+    both backends. Interpreter reset meets the gate at 2.4 µs.
+  - Memory revision counters keep counting across resets rather than
+    being reset. Caches keyed by them therefore never mistake a reused
+    machine for its earlier self. The plan allowed either.
+- **Tests.**
+  - The parity test checks that an `instantiate`d machine equals one a
+    loader builds, before and after a run, on both backends, and that its
+    price equals the loader's host-call gas.
+  - The differential proptest runs adversarial sequences on a pooled
+    machine on both backends: guest stores, straddling stores that fault,
+    precompile output, `poke` and `pages` changes, stopping at a host
+    call, and running out of gas. It releases the machine, takes it back,
+    and requires it to equal a fresh loader-built machine, compared through
+    raw dumps of registers, continuation state, permissions and pages, and
+    then the result of running a probe on both. Skipping the page
+    restores, the permission restore or the register reset each makes it
+    fail. `state_read` writes join when slice 2 adds `state_read`.
+  - A refine-host test covers the host call: with a pool, an unknown hash,
+    no pool, and the pool shared across threads.
+- **Gates** (`machines` in `pvm/bench`; S2's actor, medians of 201):
+
+  | | Interpreter | JIT | Gate |
+  |---|---|---|---|
+  | New machine (create + first resume) | 7–10 µs | about 35 µs | ≤ 50 µs |
+  | Pooled acquire + reset, after a use | 2.4 µs | 3.5 µs | ≤ 5 µs |
+  | The use itself (map a request page, poke, run to the first exit) | 0.5 µs | 4.1 µs | |
+  | Refine fixed cost (S2's agent machine per refine) | 6.3 µs | 16.3 µs | ≤ 50 µs |
+
+  On the JIT, a full acquire, use and reset takes about 7.6 µs, mostly the
+  guest mapping a request page each time: one `pages` call, its
+  protection, and the first writes to tracked pages. A request region the
+  actor framework keeps mapped would remove that; slice 2 designs the
+  framework.
+- **Reset costs found along the way.**
+  - Restoring permissions by unmapping everything and remapping the
+    layout marked every region slot changed, so the next native sync
+    redid protection and write tracking for all of them. The reset now
+    compares only changed slots.
+  - Clearing a few dirty pages with `MADV_REMOVE` cost a system call each.
+    Short runs are now zeroed through the host alias.
+  - The second capture after restoring rescanned the window although no
+    guest had run; the reset now forgets its own host writes instead.
+
+  Together these took the JIT reset from 7.5 µs to 3.4 µs.
+- **Review.** Fable found no blocking issues and no way for a page,
+  permission or state change to survive a reset. Its should-fix items are
+  in:
+  - **Resident memory.** A native machine counts the pages it zeroed in
+    place. Past 256, its reset discards every page and reinstalls the
+    image, so an idle machine never keeps a past tenant's footprint
+    resident.
+  - **Backend errors.** A machine whose backend failed on any call is
+    dropped on release, never reset and reused.
+  - **Observed runs.** An observed run with a pool is refused, so a traced
+    run cannot quietly differ from a live one.
+  - **Shared cache.** It resolves the default backend once, instead of
+    bypassing the cache for it. Fixing that exposed a race: two threads
+    preparing the same program could each keep their own copy. Every caller
+    now gets the one cached entry.
+
+  Also from the review:
+  - `uninstall` drops a program's idle machines, and machines lent from it
+    are dropped when they return;
+  - a per-program cap (512 by default) keeps one busy program from filling
+    the pool;
+  - the pool's locks survive a panic elsewhere, so releasing machines
+    while unwinding cannot abort;
+  - the code hash and initial counter are documented.
+
+**Step 1.6 is done.**

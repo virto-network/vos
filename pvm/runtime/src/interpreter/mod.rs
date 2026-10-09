@@ -256,6 +256,17 @@ impl Interpreter {
         self.need_gas_charge = true;
     }
 
+    /// Return every per-run field to a freshly built machine's values, at
+    /// instruction counter `pc`: registers, gas, the pending host call, the
+    /// gas-charging flags and any instruction trace. Memory is the caller's.
+    pub(crate) fn reset_state(&mut self, pc: u32) {
+        self.registers = [0; PVM_REGISTER_COUNT];
+        self.gas = 0;
+        self.set_pc(pc);
+        self.tracing_enabled = false;
+        self.pc_trace = Vec::new();
+    }
+
     /// Advance a standard host-call exit to its continuation instruction.
     ///
     /// Returns `true` only when the preceding [`Self::run`] stopped on an

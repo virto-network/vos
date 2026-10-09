@@ -15,11 +15,22 @@ pub use vos_pvm_program::{
     read_nat,
 };
 
-/// The complete host-call surface implemented by [`crate::refine_host`].
+/// The complete host-call surface implemented by [`crate::refine_host`]:
+/// the standard inner-machine calls, the BLAKE2b precompile and
+/// `instantiate`.
 ///
 /// Runtime package admission uses this exact set to reject even unreachable
-/// calls outside the standard inner-machine interface.
-pub const REFINE_HOST_CALL_ALLOWLIST: [u64; 6] = [9, 10, 11, 12, 13, 14];
+/// calls outside it.
+pub const REFINE_HOST_CALL_ALLOWLIST: [u64; 8] = [
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    crate::precompile::BLAKE2B_COMPRESS,
+    crate::inner::host_call::INSTANTIATE as u64,
+];
 
 /// Failure while inspecting a standard program's complete static host-call
 /// surface.
@@ -223,12 +234,14 @@ mod tests {
                 crate::inner::host_call::PAGES as u64,
                 crate::inner::host_call::INVOKE as u64,
                 crate::inner::host_call::EXPUNGE as u64,
+                crate::precompile::BLAKE2B_COMPRESS,
+                crate::inner::host_call::INSTANTIATE as u64,
             ]
         );
-        let blob = host_call_program(&[14, 9, 14]);
+        let blob = host_call_program(&[14, 9, 0x400, 0x480, 14]);
         assert_eq!(
             inspect_standard_program_host_calls(&blob),
-            Ok(vec![14, 9, 14])
+            Ok(vec![14, 9, 0x400, 0x480, 14])
         );
         assert_eq!(validate_refine_host_calls(&blob), Ok(()));
     }

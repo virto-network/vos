@@ -87,6 +87,10 @@ core, in the build step named (core model section 16), or is replaced.
   them and serve them on the refine host. Then delete the exception in
   `pvm/proof/src/core/ecall.rs`'s tracer allow-set test, so the tracer and
   the refine host serve exactly the same calls.
+- Prove refines that call `instantiate`. Proof tracing runs without a
+  pool, so the call reaches the embedder there, as on JAM. Proving it
+  means the bundle commits to the pool's programs by code hash, and the
+  collector learns each instantiated machine's program from that hash.
 | `docs/` (the book), `book.toml` | documentation | rewritten as the core lands |
 | `scripts/`, `justfile`, `deny.toml` | tooling | rebuilt for the new tree in step 1.1 |
 

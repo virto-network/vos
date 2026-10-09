@@ -6,7 +6,7 @@
 use alloc::{string::String, sync::Arc, vec, vec::Vec};
 
 /// Backend selection for PVM execution.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PvmBackend {
     /// Use recompiler if available (x86-64 Linux), else interpreter.
     /// Reads `GREY_PVM` env var: "interpreter" forces interpreter,
@@ -116,6 +116,16 @@ fn resolve_backend(backend: PvmBackend) -> Result<ResolvedBackend, String> {
             return Ok(ResolvedBackend::Interpreter);
         }
     }
+}
+
+/// The concrete backend a selection resolves to on this host:
+/// `ForceInterpreter` or `ForceRecompiler`.
+pub(crate) fn resolve(backend: PvmBackend) -> Result<PvmBackend, String> {
+    Ok(match resolve_backend(backend)? {
+        ResolvedBackend::Interpreter => PvmBackend::ForceInterpreter,
+        #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+        ResolvedBackend::Recompiler => PvmBackend::ForceRecompiler,
+    })
 }
 
 enum ResolvedBackend {

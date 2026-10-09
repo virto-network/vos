@@ -153,9 +153,11 @@ accumulate (IC 5).
   extensions, each with a JAM fallback:
   - `state_read`: the agent's state at the refine base. On JAM, served from
     a witness carried in the work package.
-  - `instantiate(code_hash)`: a machine from the node's pool (section 6.6).
-    On JAM, the agent's loader builds it with `machine`, then `pages` and
-    `poke`, into the same layout.
+  - `instantiate(code_hash)` (id `0x480`): a machine from the node's pool
+    (section 6.6), laid out as the standard layout with no arguments. It
+    costs what laying the machine out costs in `machine`, `pages` and
+    `poke` calls. On JAM, the unknown id returns `WHAT`, and the agent's
+    loader builds the machine with those calls into the same layout.
   - snapshot page access and dirty-page capture. On JAM: imports, exports,
     and peek-and-hash.
   - precompiles (section 11.2). On JAM, the unknown id returns `WHAT` and
@@ -313,8 +315,9 @@ agent program, which serves them. Precompiles are the one exception
     gates the pool.
   - `instantiate` produces the same layout as the JAM loader, bit for bit.
   - S2 measured a full reset of a small actor's writable image at
-    about 1.4 µs. A dirty-page reset should cost less but is not yet
-    measured.
+    about 1.4 µs. Slice 1's pool resets only the pages written since the
+    last reset: acquire plus reset after a use costs 2.4 µs on the
+    interpreter and 3.5 µs on the JIT for S2's actor.
 - **Prepared programs** (decoded, and JIT-compiled) are cached by hash.
   Preparing one costs 64–140 µs per KB (S2), so it happens at install or
   first use, never per invocation.
@@ -846,10 +849,11 @@ outbox sequence numbers, which receivers deduplicate.
 ### 11.2 Precompiles [decided direction; prototyped in S5b]
 
 - A precompile is an `ecalli` host call with a VOS-owned id in
-  `0x400..=0x4ff`, outside every id JAM assigns (the Gray Paper calls, and
-  JIP-1 `log` at 100). BLAKE2b compression is `0x400`. The range should be
-  reserved through a JIP, because a future Gray Paper id in it would
-  silently break the fallback.
+  `0x400..=0x47f`, outside every id JAM assigns (the Gray Paper calls, and
+  JIP-1 `log` at 100). BLAKE2b compression is `0x400`. VOS extension calls
+  take `0x480..=0x4ff` (`instantiate` is `0x480`). The whole block
+  `0x400..=0x4ff` should be reserved through a JIP, because a future Gray
+  Paper id in it would silently break the fallback.
 - VOS nodes serve precompiles in place, inside the machine slice, for agent
   programs and inner machines alike. It is the one call that bypasses the
   agent: a pure memory transform with no state.

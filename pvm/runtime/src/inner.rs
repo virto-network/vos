@@ -5,6 +5,7 @@
 //! capability-kernel dependency and is available in `no_std` builds.
 
 use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -22,64 +23,24 @@ pub const INNER_ADDRESS_PAGES: usize = (1u64 << 32) as usize / PVM_PAGE_SIZE as 
 /// The first page an inner machine may map.
 pub const INNER_FIRST_MAPPABLE_PAGE: u32 = 16;
 
-/// Only immutable preparation is retained between invocations: one exact
-/// compact program per worker thread, with a bounded admission size. This is
-/// not a program limit; larger programs continue through uncached preparation.
-#[cfg(feature = "std")]
-const MAX_CACHED_INNER_PROGRAM_BYTES: usize = 2 << 20;
-
-#[cfg(feature = "std")]
-struct CachedInnerPreparation {
-    program: Vec<u8>,
-    backend: PvmBackend,
-    execution: PreparedExecution,
-}
-
-#[cfg(feature = "std")]
-std::thread_local! {
-    static INNER_PREPARATION: core::cell::RefCell<Option<CachedInnerPreparation>> =
-        const { core::cell::RefCell::new(None) };
-}
-
 fn prepare_inner_program(
     program_blob: &[u8],
     program: &vos_pvm_program::CodeBlob,
     backend: PvmBackend,
 ) -> Result<PreparedExecution, InnerError> {
-    let prepare = || {
+    #[cfg(feature = "std")]
+    let prepared = crate::pool::prepared_code(program_blob, program, backend);
+    #[cfg(not(feature = "std"))]
+    let prepared = {
+        let _ = program_blob;
         PreparedExecution::new_standard(
             &program.code,
             &program.bitmask,
             &program.jump_table,
             backend,
         )
-        .map_err(|_| InnerError::Backend)
     };
-    #[cfg(feature = "std")]
-    if program_blob.len() <= MAX_CACHED_INNER_PROGRAM_BYTES
-        // Do not cache the environment-dependent Default selection. Refine
-        // contexts pass their already resolved outer backend to this layer.
-        && backend != PvmBackend::Default
-    {
-        return INNER_PREPARATION.with(|cached| {
-            if let Some(entry) = cached.borrow().as_ref()
-                && entry.backend == backend
-                && entry.program == program_blob
-            {
-                return Ok(entry.execution.clone());
-            }
-            let execution = prepare()?;
-            *cached.borrow_mut() = Some(CachedInnerPreparation {
-                program: program_blob.to_vec(),
-                backend,
-                execution: execution.clone(),
-            });
-            Ok(execution)
-        });
-    }
-    #[cfg(not(feature = "std"))]
-    let _ = program_blob;
-    prepare()
+    prepared.map_err(|_| InnerError::Backend)
 }
 
 /// Stable host-call identifiers for the standard inner-machine surface.
@@ -90,6 +51,12 @@ pub mod host_call {
     pub const PAGES: u32 = 12;
     pub const INVOKE: u32 = 13;
     pub const EXPUNGE: u32 = 14;
+    /// VOS extension: an inner machine from the node's pool, laid out as the
+    /// installed standard program whose code hash φ7 points at, at
+    /// instruction counter 0. On a host without it (JAM), the call answers
+    /// `WHAT` and the guest lays the machine out itself with `machine`, then
+    /// `pages` and `poke`.
+    pub const INSTANTIATE: u32 = 0x480;
 }
 
 /// v0.8.0 host-call gas constants.
@@ -234,10 +201,16 @@ pub enum InnerMachineObservation<'a> {
 
 struct InnerMachine {
     generation: u64,
-    program_blob: Vec<u8>,
+    program_blob: Arc<[u8]>,
     execution: PreparedExecution,
     initial_pc: u32,
     vm: Option<Interpreter>,
+    /// Set for a machine `instantiate` lent from the pool; it returns there.
+    #[cfg(feature = "std")]
+    pooled: Option<crate::pool::PoolTicket>,
+    /// Set when the execution backend failed on this machine. Its host
+    /// state is no longer trusted, so it never returns to the pool.
+    backend_failed: bool,
 }
 
 impl InnerMachine {
@@ -267,6 +240,21 @@ impl InnerMachine {
     fn pc(&self) -> u32 {
         self.vm.as_ref().map_or(self.initial_pc, |vm| vm.pc)
     }
+
+    /// Return a lent machine to its pool; drop any other.
+    #[cfg(feature = "std")]
+    fn release(self, pool: Option<&crate::pool::MachinePool>) {
+        if self.backend_failed {
+            return;
+        }
+        if let (Some(pool), Some(ticket), Some(vm)) = (pool, self.pooled, self.vm) {
+            pool.release(crate::pool::PooledMachine::from_parts(
+                vm,
+                self.execution,
+                ticket,
+            ));
+        }
+    }
 }
 
 /// Per-Refine dictionary of standard inner machines.
@@ -274,6 +262,9 @@ pub struct InnerMachines {
     machines: BTreeMap<u32, InnerMachine>,
     next_generation: u64,
     backend: PvmBackend,
+    /// The node's pool, which serves `instantiate`.
+    #[cfg(feature = "std")]
+    pool: Option<Arc<crate::pool::MachinePool>>,
 }
 
 impl Default for InnerMachines {
@@ -294,7 +285,21 @@ impl InnerMachines {
             machines: BTreeMap::new(),
             next_generation: 0,
             backend,
+            #[cfg(feature = "std")]
+            pool: None,
         }
+    }
+
+    /// Serve `instantiate` from `pool`, and return its machines there.
+    #[cfg(feature = "std")]
+    pub fn set_pool(&mut self, pool: Arc<crate::pool::MachinePool>) {
+        self.pool = Some(pool);
+    }
+
+    /// The pool serving `instantiate`, if any.
+    #[cfg(feature = "std")]
+    pub fn pool(&self) -> Option<&Arc<crate::pool::MachinePool>> {
+        self.pool.as_ref()
     }
 
     pub fn len(&self) -> usize {
@@ -327,7 +332,7 @@ impl InnerMachines {
                     slot,
                     generation: machine.generation,
                 },
-                program: &machine.program_blob,
+                program: &machine.program_blob[..],
                 initial_pc: machine.initial_pc,
                 machine: machine.vm.as_ref(),
             })
@@ -356,10 +361,52 @@ impl InnerMachines {
             id,
             InnerMachine {
                 generation,
-                program_blob: program_blob.to_vec(),
+                program_blob: program_blob.into(),
                 execution,
                 initial_pc,
                 vm: None,
+                #[cfg(feature = "std")]
+                pooled: None,
+                backend_failed: false,
+            },
+        );
+        Ok(id)
+    }
+
+    /// Lend a machine of an installed `program` from the pool, laid out as
+    /// the standard layout with no arguments. The lowest unused index is
+    /// returned, as for [`Self::create`].
+    #[cfg(feature = "std")]
+    pub fn instantiate(
+        &mut self,
+        program: &Arc<crate::pool::PoolProgram>,
+    ) -> Result<u32, InnerError> {
+        if self.machines.len() >= MAX_INNER_MACHINES {
+            return Err(InnerError::Full);
+        }
+        let pool = self.pool.as_ref().ok_or(InnerError::Unknown)?;
+        let (vm, execution, ticket) = pool
+            .acquire(program, self.backend)
+            .map_err(|_| InnerError::Backend)?
+            .into_parts();
+        let id = (0..MAX_INNER_MACHINES as u32)
+            .find(|id| !self.machines.contains_key(id))
+            .expect("a free ID exists below the machine limit");
+        let generation = self.next_generation;
+        self.next_generation = self
+            .next_generation
+            .checked_add(1)
+            .expect("an invocation cannot create 2^64 inner machines");
+        self.machines.insert(
+            id,
+            InnerMachine {
+                generation,
+                program_blob: Arc::clone(program.code_blob()),
+                execution,
+                initial_pc: 0,
+                vm: Some(vm),
+                pooled: Some(ticket),
+                backend_failed: false,
             },
         );
         Ok(id)
@@ -425,6 +472,7 @@ impl InnerMachines {
             // this guest range is valid. Keep it distinct from guest HUH and
             // never continue execution with uncleared bytes.
             if !memory.clear_pages(first, count) {
+                machine.backend_failed = true;
                 return Err(InnerError::Backend);
             }
         }
@@ -471,6 +519,7 @@ impl InnerMachines {
         vm.gas = state.gas;
         vm.registers = state.registers;
         let mut observer = observer;
+        let mut backend_failed = false;
         // Precompiles are served in place and execution continues; every
         // other exit returns to the outer machine.
         let exit = match observer.as_deref_mut() {
@@ -510,7 +559,13 @@ impl InnerMachines {
                 }
             }
             None => loop {
-                let exit = execution.run(vm).map_err(|_| InnerError::Backend)?;
+                let exit = match execution.run(vm) {
+                    Ok(exit) => exit,
+                    Err(_) => {
+                        backend_failed = true;
+                        break ExitReason::Panic;
+                    }
+                };
                 match exit {
                     ExitReason::HostCall(call) if crate::precompile::is_precompile(call) => {
                         if !crate::precompile::charge(call, &mut vm.gas) {
@@ -526,6 +581,10 @@ impl InnerMachines {
                 }
             },
         };
+        if backend_failed {
+            machine.backend_failed = true;
+            return Err(InnerError::Backend);
+        }
         let exit = match exit {
             ExitReason::Halt => {
                 vm.pc = 0;
@@ -560,12 +619,31 @@ impl InnerMachines {
         })
     }
 
-    /// Remove a machine and return its current instruction counter.
+    /// Mark a machine as if its backend had failed.
+    #[cfg(test)]
+    pub(crate) fn fail_backend_for_test(&mut self, id: u32) {
+        self.machines.get_mut(&id).unwrap().backend_failed = true;
+    }
+
+    /// Remove a machine and return its current instruction counter. A
+    /// machine lent from the pool returns there.
     pub fn expunge(&mut self, id: u32) -> Result<u32, InnerError> {
-        self.machines
-            .remove(&id)
-            .map(|machine| machine.pc())
-            .ok_or(InnerError::Unknown)
+        let machine = self.machines.remove(&id).ok_or(InnerError::Unknown)?;
+        let pc = machine.pc();
+        #[cfg(feature = "std")]
+        machine.release(self.pool.as_deref());
+        Ok(pc)
+    }
+}
+
+/// Machines still lent from the pool when the invocation ends return there.
+#[cfg(feature = "std")]
+impl Drop for InnerMachines {
+    fn drop(&mut self) {
+        let pool = self.pool.take();
+        for (_, machine) in core::mem::take(&mut self.machines) {
+            machine.release(pool.as_deref());
+        }
     }
 }
 
@@ -591,8 +669,7 @@ mod tests {
 
     #[cfg(feature = "std")]
     #[test]
-    fn preparation_cache_is_exact_worker_local_and_revalidates_each_entry() {
-        INNER_PREPARATION.with(|entry| *entry.borrow_mut() = None);
+    fn preparation_cache_is_exact_process_wide_and_revalidates_each_entry() {
         let blob = host_then_trap();
         let mut machines = InnerMachines::new();
         let first = machines.create(&blob, 0).unwrap();
@@ -618,16 +695,6 @@ mod tests {
                 .execution
                 .interpreter_program()
         ));
-        INNER_PREPARATION.with(|entry| {
-            let entry = entry.borrow();
-            assert_eq!(entry.as_ref().unwrap().program, different_blob);
-        });
-        let replaced = machines.create(&blob, 0).unwrap();
-        let replaced = machines.machines[&replaced].execution.clone();
-        assert!(
-            !core::ptr::eq(first.interpreter_program(), replaced.interpreter_program()),
-            "the cache retains only its latest admitted program"
-        );
         let worker = std::thread::spawn(move || {
             let mut machines = InnerMachines::new();
             let id = machines.create(&blob, 0).unwrap();
@@ -636,22 +703,21 @@ mod tests {
         .join()
         .unwrap();
         assert!(
-            !core::ptr::eq(worker.interpreter_program(), replaced.interpreter_program()),
-            "another worker does not share a mutable/global cache"
+            core::ptr::eq(worker.interpreter_program(), first.interpreter_program()),
+            "every worker shares one preparation per program"
         );
     }
 
     #[cfg(feature = "std")]
     #[test]
     fn preparation_cache_cap_and_default_bypass_do_not_change_admission() {
-        INNER_PREPARATION.with(|entry| *entry.borrow_mut() = None);
         let blob = host_then_trap();
         let mut machines = InnerMachines::new();
         let warm = machines.create(&blob, 0).unwrap();
         let warm = machines.machines[&warm].execution.clone();
         // A canonical program larger than the cache ceiling still creates
         // and executes. Sparse instruction starts keep this fixture modest.
-        let code = vec![0; MAX_CACHED_INNER_PROGRAM_BYTES];
+        let code = vec![0; crate::pool::PREPARED_ADMISSION_BYTES];
         let mut bitmask = vec![0; code.len()];
         for start in (0..code.len()).step_by(25) {
             bitmask[start] = 1;
@@ -662,7 +728,7 @@ mod tests {
             jump_table: Vec::new(),
         })
         .unwrap();
-        assert!(oversized.len() > MAX_CACHED_INNER_PROGRAM_BYTES);
+        assert!(oversized.len() > crate::pool::PREPARED_ADMISSION_BYTES);
         let large = machines.create(&oversized, 0).unwrap();
         assert_eq!(
             machines
@@ -677,34 +743,32 @@ mod tests {
                 .exit,
             InnerExit::Panic
         );
+        // The default selection is resolved once and shares the resolved
+        // backend's entry.
         let mut default = InnerMachines::with_backend(PvmBackend::Default);
         let id = default.create(&blob, 0).unwrap();
+        let resolved = crate::backend::resolve(PvmBackend::Default).unwrap();
+        let mut explicit = InnerMachines::with_backend(resolved);
+        let explicit_id = explicit.create(&blob, 0).unwrap();
+        assert!(core::ptr::eq(
+            explicit.machines[&explicit_id]
+                .execution
+                .interpreter_program(),
+            default.machines[&id].execution.interpreter_program()
+        ));
+        let again = machines.create(&blob, 0).unwrap();
         assert!(
-            !core::ptr::eq(
-                warm.interpreter_program(),
-                default.machines[&id].execution.interpreter_program()
+            core::ptr::eq(
+                machines.machines[&again].execution.interpreter_program(),
+                warm.interpreter_program()
             ),
-            "environment-dependent backend selection must not hit the cache"
+            "bypassed programs must not evict the admitted entry"
         );
-        INNER_PREPARATION.with(|entry| {
-            let entry = entry.borrow();
-            let entry = entry.as_ref().unwrap();
-            assert_eq!(entry.program, blob);
-            assert_eq!(entry.backend, PvmBackend::ForceInterpreter);
-            assert!(
-                core::ptr::eq(
-                    entry.execution.interpreter_program(),
-                    warm.interpreter_program()
-                ),
-                "bypassed programs must not evict the admitted entry"
-            );
-        });
     }
 
     #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn preparation_cache_binds_backend_and_never_retains_invocation_state() {
-        INNER_PREPARATION.with(|entry| *entry.borrow_mut() = None);
         let blob = compact_blob(&[130, 2 + 16 * 3, 10, 42, 0], &[0, 2, 4]);
         let mut reference = InnerMachines::new();
         let reference_id = reference.create(&blob, 0).unwrap();
