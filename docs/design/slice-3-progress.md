@@ -3288,3 +3288,85 @@ Left for later:
   at once (fast retransmit);
 - fan-in past the receiver's cap (more than four full windows into one
   agent), for 3.8.
+
+#### 3.5d2 Built
+
+**`node/cli/tests/three_processes.rs`:**
+- **The space:**
+  - three nodes, each first run alone to make its key;
+  - then a space file of their keys and fresh ports;
+  - three `vos node run --space` processes, QUIC between them, plain
+    HTTP on loopback for the clients.
+  - When a node cannot take its ports, the attempt starts over with new
+    ones, five times at most.
+- **The test:**
+  - the operator creates two agents on all three nodes and installs the
+    counter twice in each, at whichever node takes the command;
+  - a client calls the first agent through the client library, starting
+    at node 1. Every fourth request forwards an amount to the second
+    agent's inbox; the rest increment, and each is answered with the
+    running total;
+  - **two kills,** each with SIGKILL, never overlapping, so a quorum
+    stays:
+    - the first agent's leader at request 21, right after a forward was
+      answered and its message may still be unacknowledged, starting
+      again at 31;
+    - the second agent's leader at 41, starting again at 51.
+    - A leader is found as the node that takes an operator's no-op, a
+      revoke of a role no one holds. The client goes on through the
+      others.
+  - **At the end:**
+    - a linearizable read at every node, posted to that node alone (a
+      failover would hide one that never caught up), holds the total of
+      the increments and the sum of the forwards;
+    - then the nodes stop, and every replica's pair marks on disk hold
+      each forward once: the receiver's `pair_in` and the sender's
+      `pair_out`.
+- **The children:**
+  - they are killed when the test ends, however it ends;
+  - their stdout is read to the end, against a deadline at start;
+  - their stderr goes to a log that a failed start prints.
+- Seven runs passed in 21–26 s each, with no process left behind.
+
+The checker stays the place for faults and mutations. This test is its
+smoke test at the real boundary: the binary, QUIC, and a crash restart.
+
+**Review** (Opus): go, once the end check read every node itself and the
+kills caught messages in flight. Both are folded in above, with the
+pair marks on disk, the bounded start, the drained stdout and the logs.
+
+Left:
+- the children are not tied to the test process with `PR_SET_PDEATHSIG`,
+  so a test killed by CI can leave them running;
+- a port from the ephemeral range could be taken by a client's
+  connection before a restart.
+
+**3.5 is done.** Carried forward, so nothing is lost:
+- **3.6:**
+  - session collection, the expiry index, the sweep and the caps (state
+    grows with every session until then);
+  - the checker: `StaleSession` under failures, with a clock beyond the
+    skew (it panics on it today, and 3.5c1's B1 lived there);
+  - the checker: two clients on one agent (`Known` and `New` in one
+    batch), and replay after collection;
+  - optionally, a TLS run with pinned clients.
+- **3.7:**
+  - compaction and snapshots, which must carry the `LastResult` row;
+  - creation records resent only by their creator;
+  - membership changes;
+  - a replica refusing the agent's program still acknowledges its
+    record, counts toward the creation's majority, and is listed in
+    `Elsewhere`.
+- **3.8:**
+  - combined heartbeats and quiescence;
+  - a restart re-announcing every record to every node;
+  - message batching across agents, and fan-in past a receiver's cap;
+  - one heartbeat round per linearizable read;
+  - the O(tasks) `retain` in the node's `spawn`.
+- **3.9:**
+  - `Forward` carrying the term (vos-net holds frames across redials);
+  - the process test growing into the fault suite;
+  - optionally, fast retransmit on a dropped gap.
+- **Step 5:** `#[msg(linearizable)]`.
+- **Unscheduled:** seq 0 taking a read index.
+

@@ -679,7 +679,7 @@ The network layer and its messages (SCALE), with authorization in the
 group driver. The in-process implementation is step 3.2's simulator;
 then QUIC. Then TLS on client ingress.
 
-### 3.5 Replicated agents
+### 3.5 Replicated agents [done]
 
 Split in four, with 3.6's sessions moved ahead of forwarding: the
 replicated group (3.5a), sessions in the agent (3.5b), any replica
