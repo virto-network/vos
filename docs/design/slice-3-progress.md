@@ -467,3 +467,268 @@ response worker, and some pinned what the contract now replaces.
   included. The suite ran 10 times in a row without a failure before the
   last two deterministic core tests.
 - clippy and rustdoc are clean, with and without features.
+
+## Step 3.3: node storage for Raft
+
+### Design
+
+Step 3.3 gives the node's store what a replicated agent needs. The node
+itself stays on slice 2's single-replica path until step 3.5, which runs
+it through Raft; this step builds and tests the storage, the writer and
+an adapter between them and vos-raft's core, and keeps the single-node
+path working on the new layout.
+
+It lands in three parts, each with its own review and commit:
+
+1. **Layout, Raft rows and the writer** (3.3a).
+2. **The blob store** (3.3b).
+3. **Snapshots: export, staging and the switch** (3.3c).
+
+#### 3.3a Layout, Raft rows and the writer
+
+**Keys.** One keyspace, as in slice 2, with an epoch byte after the
+agent id, fixed at 0 until 3.3c installs snapshots, so the layout, slice
+2's tests and its bench change once:
+
+| Partition | Key | Value |
+|---|---|---|
+| `state` | agent (4) ∥ epoch (1) ∥ agent key | row |
+| `system` | agent (4) ∥ epoch (1) ∥ agent system key (`0x00` …) | row |
+| `system` | agent (4) ∥ `0xff` ∥ kind | the node's rows for the agent |
+| `log` | agent (4) ∥ index (8) | term (8) ∥ kind (1) ∥ blobs ∥ body |
+
+Epochs are `0..=0xfe`; `0xff` is the node's own rows, so no agent row
+reaches them.
+
+- **Every log row names the blobs it depends on:** a count, then each
+  blob's hash and length, readable without decoding the work result. A
+  work result too large to inline is a row with an empty body naming its
+  blob; an install names its program. The writer (invariant 7) and the
+  collector (3.3b) read these, and nothing else.
+- **Log entry kinds** (`#[repr(u8)]`): a no-op, a work result, and a
+  configuration. The Raft payload of a data entry is the kind byte, the
+  blob list and the body; an empty payload is the no-op, as vos-raft
+  writes it.
+
+**The node's rows for an agent** (`agent ∥ 0xff ∥ kind`):
+
+- **applied:** the last log index applied, in the same batch as the
+  apply (invariant 1), as in slice 2;
+- **hard state:** term, vote and commit index;
+- **log start:** the index and term the log was compacted to, or a
+  snapshot installed at. It has its own row, so no other write touches
+  it (vos-raft's `Write::meta` carries a snapshot pointer the host must
+  not take);
+- **membership:** the active configuration record;
+- the registry row (the agent's program) stays a node-wide record.
+
+The agent's version stays in its own state (`keys::version()`); the
+applied index counts log entries and the version counts applied work
+results, so the two part. `Node::open`'s check that they are equal goes
+with step 3.5, when no-ops reach the log.
+
+**The node log writer** (slice 2's storage thread):
+
+- **Per-change durability.** A change says whether it must be synced:
+  appends, truncation, a term or vote, membership and the snapshot switch
+  are; a commit-index move, applies, compaction and staged rows are not.
+  A group of commits syncs if any change in it must. vos-raft's
+  `Write::sync` maps onto it.
+- **Reports.** Each commit is answered once its batch is written, or once
+  synced if it asked to be. vos-raft's `durable(seq)` follows that
+  answer.
+- **The durably applied index**, per agent: every synced flush makes all
+  earlier batches durable, so the writer records, per synced flush, the
+  highest applied index of every agent up to it. That, never the applied
+  index in memory, is what the agent reports to its core as durably
+  applied, and so bounds compaction (invariant 4).
+- **Group commit across agents,** with the 8 MiB flush cap as a guard.
+- **Stalls.** The writer knows the age of its oldest pending commit; past
+  a bound (configurable, 1 s by default) it reports itself stalled, and
+  recovered once it drains. The node passes that to every core it runs
+  (`writer_health`), which hands leadership over (step 3.2).
+- **Truncation** removes the log's rows after an index, row by row (fjall
+  has no range tombstones). Usually short, but a deposed leader that kept
+  appending can leave tens of thousands of rows.
+- **Compaction** removes the log's rows through an index, row by row,
+  and writes the log-start row. It is buffered: losing it is harmless.
+  The writer refuses one beyond the agent's durably applied index.
+
+**Recovery.** `Store::raft(agent)` reads the hard state, log start,
+membership, applied index and the log after the log start: everything
+vos-raft's `Recovered` needs. The node then re-applies from the applied
+index up to the commit index (step 3.5 drives it).
+
+**The adapter** (`node/host/src/raft.rs`) maps the core's actions onto
+the writer for one agent: a `Write` to changes (entries to appends,
+`truncate_after`, the hard state without the snapshot pointer, the
+membership record), `LoadEntries` to a log range read within its
+`max_bytes`, `CompactBound` to a compaction, and the store's rows to
+`Recovered`. Node numbers are `u8`
+(the plan's 8-bit node part of an agent id).
+
+**Tests:**
+
+- unit tests of the rows, truncation and compaction;
+- **three cores over three real stores**, in one process with a
+  deterministic network, through the adapter and writer: proposals,
+  leader changes, restarts that reopen each store, compaction; committed
+  entries agree and survive;
+- **crash tests**, in slice 2's harness (a child killed at random, then
+  torn journal tails):
+  - invariants 1 and 2: the store recovers an applied index and state
+    that are one prefix, and the log holds every entry through it;
+  - invariant 4: the log start never passes the applied index, and the
+    log is contiguous after it;
+  - a hard state reported synced survives.
+
+#### 3.3b The blob store
+
+**How blob files become durable** (the plan left it to this step). Four
+layouts through `log-bench` (`BLOB_LAYOUT`), one node, interleaved over
+three rounds after the drive idled; commits per second, 16 proposers (4
+at 4 MiB):
+
+| Blob | Append to one file | A file per blob | A file per group | A second fjall |
+|---|---|---|---|---|
+| 64 KiB | 3,136–8,570 | 1,016–1,165 | 2,752–8,567 | 1,680–5,036 |
+| 256 KiB | 823–3,491 | 1,144–1,271 | 673–1,028 | 326–524 (p99 0.4–0.6 s) |
+| 4 MiB | 56–155 | 70–182 | 45–58 | 28–59 (p99 0.6 s) |
+
+- **A second fjall database** (its own journal and writer, key-value
+  separation) writes every blob twice and stalls on flushes: its p99 is
+  0.4–0.6 s from 256 KiB up. Out.
+- **A file per blob** (write, sync, rename, then one directory sync per
+  group) is the simplest to collect, but costs about 1 ms of syncs per
+  blob whatever its size: the node tops out near 1k blobs a second, a
+  third to an eighth of appending at 64 KiB.
+- **Appending, or a file per group,** share one sync per group, and lead
+  at 64 KiB. The drive moved results by up to 4× between rounds (it is
+  86% full, after a day of benchmarks), so only the 64 KiB gap is clear.
+- The ranking is structural rather than numeric: a file per blob pays
+  metadata syncs per blob, a second fjall writes each blob twice and
+  stalls on flushes, and appending pays one sync per group. Step 3.10
+  re-measures on an emptier drive.
+
+**Decided: append-only segments.**
+
+- Blobs are appended to the current segment file (`blobs/<n>`), a group
+  at a time, with one `fdatasync` per group, then each is reported
+  durable. A segment is closed at 256 MiB; a new one is created with a
+  directory sync, once per segment.
+- A record is a header (magic, length, hash) and the bytes.
+- **The index** (hash → segment, offset, length) is a `blobs` partition
+  of the node's keyspace, written without a sync after the segment's. On
+  open, the writer reads each segment past its last indexed record,
+  rehashes those records, indexes the whole ones, and truncates at the
+  first torn one. The journal recovers a prefix and the writer indexes
+  in order, so only a segment's tail can be unindexed.
+- **Collection** by segment: a segment whose blobs are all dead is
+  deleted; one less than half live is compacted by copying its live
+  blobs to the current segment, syncing their new index rows, then
+  deleting it. Blobs mostly die in the order they were written (log
+  compaction), so most segments go whole.
+
+- **Content-addressed:** BLAKE2b-256, as program hashes are. A blob is
+  durable only once verified against its hash; the reference's length
+  bounds a receive.
+- **Its own writer thread,** with group commit, off the log writer and
+  off executors; hashing runs on executors before a blob is handed over.
+- **Invariant 7 in the log writer**, with a change to vos-raft's core:
+  - **The core learns entry durability apart from the rest.**
+    `durable(seq)` is cumulative, so if it waited for a blob, nothing
+    after it could be reported either: not a term, a vote or a
+    truncation. A follower holding an entry whose blob never came (its
+    leader died) could then never count its own vote, and a group of
+    three could lose its election with one node down. So `durable(seq)`
+    credits the hard state and truncations only, and the host reports
+    entries with `entries_durable(index, term)`: the highest index
+    through which every entry, and every blob each names, is durable.
+    The core takes it only if it still holds that entry at that term,
+    as it already checks.
+  - The writer writes an append at once, and reports its entries once
+    their blobs are durable too, in order per agent. A truncation drops
+    the wait on the entries it removes.
+  - A host without blobs (the driver, the simulator) reports both
+    together.
+- **Recovery cuts the log at the first entry missing a blob.** Every
+  agent shares the one journal, so an append whose blob never synced can
+  still survive a crash, made durable by another agent's synced flush.
+  On open, each agent's log is cut at the first entry naming a blob that
+  is not present and verified. Such an entry was never reported, so no
+  replica counted it.
+- **Programs become pinned blobs:** the `programs` partition goes; a pin
+  row per (program, agent) keeps a program's blob.
+- **Liveness:** a blob lives while a log row names it, a pin holds it,
+  or it was put within a horizon (its append may still be in flight:
+  blobs sent ahead by a leader that died, and blobs of a truncated
+  suffix, become such orphans).
+  - A put of a blob already stored refreshes its age, so a second agent
+    installing the same program, or a re-sent blob, is never collected
+    under it.
+  - Collection reads only durable liveness: compaction and unpinning are
+    buffered, and a crash could bring a reference back. It runs against
+    what the last synced flush made durable, and re-checks references
+    after a fence before it deletes.
+  - Dead blobs' index rows are removed, synced, before their segment
+    goes, so a later put never mistakes a deleted blob for present.
+- **Crash test for invariant 7:** after a kill, every append reported
+  durable has its blob and the blob verifies, and no surviving log entry
+  is missing a blob.
+- Fetching a missing blob from a peer is the network's (3.4, 3.7).
+
+#### 3.3c Snapshots
+
+- **Epochs.** The agent's current epoch becomes a node row (3.3a fixed
+  it at 0).
+- **Reads go through the pointer:** a store snapshot reads each agent's
+  epoch row once, from the same snapshot, and caches it. A reader never
+  mixes epochs and never sees a half-installed state.
+- **Export:** from one store snapshot, an agent's rows in both
+  partitions under its current epoch, in key order, in chunks of about
+  1 MiB. The export is labelled with its own applied index and the term
+  there, and the membership record, not the core's compaction point:
+  the core takes a snapshot above its own (step 3.2's review). The
+  membership record goes with it only if its index is at or below the
+  export's applied index; otherwise the export carries none, as the core
+  does.
+- **Staging:** an install writes the chunks under a new epoch, buffered,
+  through the writer and so the journal (fjall's bulk ingestion would
+  bypass the journal, and the synced switch would no longer cover the
+  staged rows). A new staging epoch first removes any rows an aborted
+  install left in it, and is never one still being removed.
+- **Applies carry their epoch.** An accumulate already running when a
+  switch is queued could otherwise write after it, into a dead epoch, and
+  move the applied index back below the snapshot. The writer refuses an
+  apply at or below the agent's applied index, or for an epoch that is
+  no longer current.
+- **The switch:** one synced batch moves the epoch pointer and writes
+  the applied index, the log start (the snapshot's index and term), the
+  hard state and membership from vos-raft's `SnapshotSwitch`, removes the
+  log through the snapshot, and the suffix if `truncate_after` says so.
+  The staged rows share the journal, so the synced switch makes them
+  durable too: invariant 6 becomes "a snapshot and the index that depends
+  on it are one durable batch".
+- **The old epoch** is removed row by row afterwards, in the background,
+  in bounded chunks so it never stalls the writer. A crash before that
+  leaves rows no pointer names; startup removes them.
+- **Crash test for invariant 6:** a child installs snapshots of known
+  content in a loop; after a kill the agent's rows are exactly one
+  installed snapshot, at the applied index recorded with it.
+- Pinned blobs in a snapshot's manifest, and streaming between nodes,
+  are step 3.7's.
+
+#### What the single-node path changes
+
+The node keeps committing an append and an apply together, synced, now
+through the new layout: log kinds in its entries (3.3a), programs as
+pinned blobs (3.3b), epochs in its keys (3.3c). Its tests and the
+slice 2 acceptance bench must not move.
+
+**Review** (Opus): go for 3.3a; 3.3b only with invariant 7's two gaps
+designed (both above: entry durability reported apart from the rest, and
+recovery cutting at a missing blob); 3.3c with its apply guard. Folded
+in: rows name their blobs, the writer reports stalls, the epoch byte
+from 3.3a, the collection races, the export's membership rule, staging
+through the journal, bounded removal. For step 3.7: dropping an agent's
+replica (log, epochs, node rows, pins) with its tombstone.

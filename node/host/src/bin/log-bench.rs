@@ -9,9 +9,19 @@
 //! - `log-bench mixed <large bytes> [cap]`: 15 agents of 1 KiB entries
 //!   beside one agent of large entries: the small entries' p50 and p99.
 //!
-//! `BLOBS=<bytes>` writes entries at least that large to a blob file per
-//! node, with its own writer and sync, and logs a 40-byte reference once
-//! the blob is durable. `ONLY=<KiB>` runs one size of `sizes`.
+//! `BLOBS=<bytes>` writes entries at least that large to the node's blob
+//! writer, with its own syncs, and logs a 40-byte reference once the blob
+//! is durable. `BLOB_LAYOUT` chooses how blob files are made durable:
+//!
+//! - `append` (default): appended to one file created beforehand, one sync
+//!   per group, as a preallocated segment would be;
+//! - `file`: a new file per blob, written, synced and renamed into place,
+//!   then one directory sync per group;
+//! - `group`: one new file per group of blobs, synced, then the directory;
+//! - `fjall`: a second fjall database for blobs alone, with its own journal
+//!   and key-value separation, one synced batch per group.
+//!
+//! `ONLY=<KiB>` runs one size of `sizes`.
 //!
 //! Data goes under `target/`: on the reference laptop `/tmp` is tmpfs.
 
@@ -74,20 +84,84 @@ fn writer(store: Fjall, appends: Receiver<Append>, cap: usize) {
     }
 }
 
-/// A node's blob writer: append queued blobs to one file with one sync,
+#[derive(Clone, Copy)]
+enum Layout {
+    Append,
+    File,
+    Group,
+    Fjall,
+}
+
+/// A node's blob writer: make the queued blobs durable as `layout` says,
 /// then hand each blob's reference to the log writer.
-fn blob_writer(path: std::path::PathBuf, blobs: Receiver<Append>, log: Sender<Append>) {
+fn blob_writer(
+    dir: std::path::PathBuf,
+    layout: Layout,
+    blobs: Receiver<Append>,
+    log: Sender<Append>,
+) {
+    use std::fs::File;
     use std::io::Write;
-    let mut file = std::fs::File::create(path).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    let sync_dir = || File::open(&dir).unwrap().sync_all().unwrap();
+    let mut segment = File::create(dir.join("segment")).unwrap();
+    sync_dir();
+    let blobs_db = matches!(layout, Layout::Fjall).then(|| {
+        let db = fjall::Database::builder(dir.join("db")).open().unwrap();
+        let keyspace = db
+            .keyspace("blobs", || {
+                fjall::KeyspaceCreateOptions::default()
+                    .with_kv_separation(Some(fjall::KvSeparationOptions::default()))
+            })
+            .unwrap();
+        (db, keyspace)
+    });
+    let mut next = 0u64;
     while let Ok(first) = blobs.recv() {
         let mut taken = vec![first];
         while let Ok(append) = blobs.try_recv() {
             taken.push(append);
         }
-        for append in &taken {
-            file.write_all(&append.entry).unwrap();
+        match layout {
+            Layout::Append => {
+                for append in &taken {
+                    segment.write_all(&append.entry).unwrap();
+                }
+                segment.sync_data().unwrap();
+            }
+            Layout::File => {
+                for append in &taken {
+                    next += 1;
+                    let staged = dir.join(format!("{next}.tmp"));
+                    let mut file = File::create(&staged).unwrap();
+                    file.write_all(&append.entry).unwrap();
+                    file.sync_data().unwrap();
+                    std::fs::rename(&staged, dir.join(format!("{next}"))).unwrap();
+                }
+                sync_dir();
+            }
+            Layout::Fjall => {
+                let (db, keyspace) = blobs_db.as_ref().expect("opened for this layout");
+                let mut batch = db.batch();
+                for append in &taken {
+                    next += 1;
+                    batch.insert(keyspace, next.to_be_bytes(), append.entry.as_slice());
+                }
+                batch
+                    .durability(Some(fjall::PersistMode::SyncAll))
+                    .commit()
+                    .unwrap();
+            }
+            Layout::Group => {
+                next += 1;
+                let mut file = File::create(dir.join(format!("{next}"))).unwrap();
+                for append in &taken {
+                    file.write_all(&append.entry).unwrap();
+                }
+                file.sync_data().unwrap();
+                sync_dir();
+            }
         }
-        file.sync_data().unwrap();
         for append in taken {
             let _ = log.send(Append {
                 entry: Arc::new(vec![0x5a; 40]),
@@ -116,13 +190,21 @@ impl Cluster {
         let blob_threshold = std::env::var("BLOBS").ok().map_or(usize::MAX, |bytes| {
             bytes.parse().expect("a threshold in bytes")
         });
+        let layout = match std::env::var("BLOB_LAYOUT").as_deref() {
+            Ok("file") => Layout::File,
+            Ok("group") => Layout::Group,
+            Ok("fjall") => Layout::Fjall,
+            _ => Layout::Append,
+        };
         for node in 0..nodes {
             let store = Fjall::open(dir.join(format!("node{node}"))).unwrap();
             let (tx, rx) = channel();
             let (blob_tx, blob_rx) = channel();
             let log = tx.clone();
             let path = dir.join(format!("node{node}")).join("blobs");
-            threads.push(std::thread::spawn(move || blob_writer(path, blob_rx, log)));
+            threads.push(std::thread::spawn(move || {
+                blob_writer(path, layout, blob_rx, log)
+            }));
             writers.push(tx);
             blobs.push(blob_tx);
             threads.push(std::thread::spawn(move || writer(store, rx, cap)));
