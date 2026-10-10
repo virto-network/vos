@@ -69,7 +69,7 @@ fn writer(dir: &str) {
             index,
             &LogEntry::result(1, index.to_be_bytes().to_vec()),
         );
-        batch.apply(AGENT, index, &writes(index));
+        batch.apply(AGENT, 0, index, &writes(index));
         let durability = if index.is_multiple_of(2) {
             Durability::Synced
         } else {

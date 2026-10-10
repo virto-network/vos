@@ -350,6 +350,8 @@ struct Leader {
     id: AgentId,
     version: u64,
     applied: u64,
+    /// The epoch its rows are under.
+    epoch: u8,
     time: u64,
     /// Each sender's pair mark, as applied.
     marks: HashMap<AgentId, u64>,
@@ -366,6 +368,7 @@ impl Leader {
         let infrastructure = |error: fjall::Error| Fault::Infrastructure(error.to_string());
         let snapshot = inner.store.snapshot();
         let applied = snapshot.applied(id).map_err(infrastructure)?.unwrap_or(0);
+        let epoch = snapshot.epoch(id).map_err(infrastructure)?;
         let time = match inner.store.log_entry(id, applied).map_err(infrastructure)? {
             Some(entry) => pvm::decode::<WorkResult>(&entry.body)
                 .map(|result| result.time)
@@ -376,6 +379,7 @@ impl Leader {
             id,
             version: applied,
             applied,
+            epoch,
             time,
             marks: HashMap::new(),
             delivered: HashMap::new(),
@@ -593,6 +597,7 @@ impl Leader {
             },
             Change::Apply {
                 agent: id,
+                epoch: self.epoch,
                 index,
                 writes,
             },

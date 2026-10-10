@@ -665,7 +665,7 @@ alone and beside other agents' small entries; found the cause of S3's
   - check-quorum, leadership transfer and the stalled writer;
   - snapshots and compaction moved out to the node.
 
-### 3.3 Node storage for Raft
+### 3.3 Node storage for Raft [done]
 
 The blob store and its writer, log kinds, meta rows, truncation,
 compaction below the durably applied index, the applied index apart from

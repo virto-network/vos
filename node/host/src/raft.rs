@@ -7,7 +7,7 @@
 //! the host's: the log start moves only by compaction and a snapshot
 //! switch, in their own row.
 
-use vos_raft::core::{Load, Recovered, Write};
+use vos_raft::core::{Load, Recovered, SnapshotSwitch, Write};
 use vos_raft::{ActiveConfigRecord, EntryKind as RaftKind, LogEntry as RaftEntry, Meta};
 use vos_wire::ids::AgentId;
 
@@ -16,8 +16,7 @@ use std::collections::VecDeque;
 use crate::blobs::Blobs;
 use crate::storage::Change;
 use crate::store::{
-    self, Batch as _, Durability, EntryKind, Fjall, HardState, LogEntry, Membership, NodeNumber,
-    RaftRows, Store,
+    self, EntryKind, Fjall, HardState, LogEntry, Membership, NodeNumber, RaftRows, Store, Switch,
 };
 
 /// The store's entry for a Raft entry.
@@ -140,28 +139,113 @@ fn record(membership: Membership) -> ActiveConfigRecord<NodeNumber> {
     }
 }
 
-/// Cut `agent`'s log at its first entry naming a blob the store does not
-/// hold: the index cut from, if any. Such an entry was never reported
+/// The writer's switch to a snapshot staged under `epoch`, at `index` and
+/// `term`, with the rows vos-raft's core computed for it: one synced batch.
+pub fn switch_change(
+    agent: AgentId,
+    epoch: u8,
+    index: u64,
+    term: u64,
+    switch: &SnapshotSwitch<NodeNumber>,
+) -> Change {
+    Change::Switch {
+        agent,
+        switch: Switch {
+            epoch,
+            index,
+            term,
+            hard: HardState {
+                term: switch.meta.current_term,
+                vote: switch.meta.voted_for,
+                commit: switch.meta.commit_index,
+            },
+            membership: membership(&switch.active_config),
+            log_start_membership: switch.log_start_config.as_ref().map(membership),
+            truncate_after: switch.truncate_after,
+        },
+    }
+}
+
+/// What recovery must do to `agent`'s log for invariant 7, before its
+/// core is recovered: the changes, for the node log writer (after it was
+/// told the agent's recovered applied index), and the index the log is cut
+/// from, if any.
+///
+/// An entry naming a blob the store does not hold was never reported
 /// durable, so no replica counted it (section 9.5, invariant 7); every
 /// agent shares one journal, so its row can survive a crash its blob did
-/// not. Run on open, before recovering the core.
-pub fn cut_missing_blobs(
-    store: &Fjall,
-    blobs: &Blobs,
-    agent: AgentId,
-) -> store::Result<Option<u64>> {
+/// not. The log is cut at the first such entry.
+///
+/// An entry at or below the applied index whose blob is gone (a disk that
+/// lost what it said it wrote) is committed, and the state holds its
+/// effect: the log is compacted through the applied index instead, with
+/// the membership in effect there, so no entry is left without its blob
+/// and the log never ends below it.
+pub fn recovery_cut(store: &Fjall, blobs: &Blobs, agent: AgentId) -> store::Result<Cut> {
     let rows = store.raft(agent)?;
-    for (index, entry) in &rows.log {
+    let missing = |entry: &LogEntry| -> store::Result<bool> {
         for blob in &entry.blobs {
             if !blobs.contains(&blob.hash)? {
-                let mut batch = store.batch();
-                batch.truncate(agent, index - 1);
-                batch.commit(Durability::Synced)?;
-                return Ok(Some(*index));
+                return Ok(true);
             }
         }
+        Ok(false)
+    };
+    let mut cut = Cut::default();
+    let mut applied_lost = false;
+    for (index, entry) in &rows.log {
+        if !missing(entry)? {
+            continue;
+        }
+        if *index <= rows.applied {
+            applied_lost = true;
+            continue;
+        }
+        cut.changes.push(Change::Truncate {
+            agent,
+            after: index - 1,
+        });
+        cut.from = Some(*index);
+        break;
     }
-    Ok(None)
+    if applied_lost
+        && let Some((_, at_applied)) = rows.log.iter().find(|(index, _)| *index == rows.applied)
+    {
+        let membership = rows
+            .log
+            .iter()
+            .rev()
+            .filter(|(index, entry)| {
+                *index <= rows.applied && entry.kind == EntryKind::Configuration
+            })
+            .find_map(|(index, entry)| {
+                let (members, joint_old) = store::decode_configuration(&entry.body)?;
+                Some(Membership {
+                    index: Some(*index),
+                    members,
+                    joint_old,
+                })
+            })
+            .or(rows.log_start_membership.clone());
+        cut.changes.insert(
+            0,
+            Change::Compact {
+                agent,
+                through: rows.applied,
+                term: at_applied.term,
+                membership,
+            },
+        );
+    }
+    Ok(cut)
+}
+
+/// Recovery's changes to one agent's log ([`recovery_cut`]).
+#[derive(Default)]
+pub struct Cut {
+    pub changes: Vec<Change>,
+    /// The index the log is cut from, if it is.
+    pub from: Option<u64>,
 }
 
 /// The entry reports one replica owes its core: its writes in order, each
@@ -275,14 +359,14 @@ mod tests {
     use std::collections::{BTreeMap, VecDeque};
     use std::sync::Arc;
 
-    use vos_raft::core::{Action, Answer, Core};
+    use vos_raft::core::{Action, Answer, Core, SnapshotConfiguration};
     use vos_raft::{Config, Message, Role};
     use vos_wire::result::Write as StateWrite;
 
     use super::*;
     use crate::NoHooks;
     use crate::storage::StorageThread;
-    use crate::store::{BlobRef, Fjall, View};
+    use crate::store::{Batch as _, BlobRef, Fjall, View};
 
     const AGENT: AgentId = AgentId(7);
     const NODES: [NodeNumber; 3] = [1, 2, 3];
@@ -410,7 +494,10 @@ mod tests {
         batch.append(AGENT, 3, &naming(lost));
         batch.append(AGENT, 4, &LogEntry::result(1, vec![4]));
         batch.commit(crate::store::Durability::Synced).unwrap();
-        assert_eq!(cut_missing_blobs(&store, &blobs, AGENT).unwrap(), Some(3));
+        let writer = StorageThread::spawn(store.clone(), Arc::new(NoHooks));
+        let cut = recovery_cut(&store, &blobs, AGENT).unwrap();
+        assert_eq!(cut.from, Some(3));
+        smol::block_on(writer.commit(cut.changes)).unwrap();
         let held_indices: Vec<u64> = store
             .raft(AGENT)
             .unwrap()
@@ -419,7 +506,60 @@ mod tests {
             .map(|(index, _)| *index)
             .collect();
         assert_eq!(held_indices, vec![1, 2]);
-        assert_eq!(cut_missing_blobs(&store, &blobs, AGENT).unwrap(), None);
+        assert!(
+            recovery_cut(&store, &blobs, AGENT)
+                .unwrap()
+                .changes
+                .is_empty()
+        );
+    }
+
+    /// An applied entry whose blob is gone compacts the log through the
+    /// applied index, keeping the configuration in effect there.
+    #[test]
+    fn recovery_compacts_past_an_applied_entry_missing_its_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Fjall::open(dir.path().join("store")).unwrap();
+        let blobs = Blobs::open(dir.path().join("blobs"), &store).unwrap();
+        let lost = LogEntry {
+            blobs: vec![BlobRef {
+                hash: [9; 32],
+                len: 100,
+            }],
+            ..LogEntry::result(1, Vec::new())
+        };
+        let configuration = LogEntry {
+            term: 1,
+            kind: EntryKind::Configuration,
+            blobs: Vec::new(),
+            body: store::encode_configuration(&[1, 2, 4], None),
+        };
+        let mut batch = store.batch();
+        batch.append(AGENT, 1, &LogEntry::result(1, vec![1]));
+        batch.append(AGENT, 2, &configuration);
+        batch.append(AGENT, 3, &lost);
+        batch.append(AGENT, 4, &LogEntry::result(1, vec![4]));
+        batch.apply(AGENT, 0, 3, &[]);
+        batch.commit(crate::store::Durability::Synced).unwrap();
+        let writer = StorageThread::spawn(store.clone(), Arc::new(NoHooks));
+        writer.recovered(AGENT, 3);
+        let cut = recovery_cut(&store, &blobs, AGENT).unwrap();
+        assert_eq!(cut.from, None);
+        smol::block_on(writer.commit(cut.changes)).unwrap();
+        let rows = store.raft(AGENT).unwrap();
+        assert_eq!(rows.log_start, (3, 1));
+        assert_eq!(
+            rows.log_start_membership,
+            Some(Membership {
+                index: Some(2),
+                members: vec![1, 2, 4],
+                joint_old: None,
+            })
+        );
+        assert_eq!(
+            rows.log.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+            vec![4]
+        );
     }
 
     /// The key the test's state machine counts applied entries under.
@@ -436,10 +576,23 @@ mod tests {
         applied: u64,
     }
 
+    /// A snapshot in flight: from, to, its index and term, the
+    /// configuration in effect there, and its rows.
+    type Shipped = (
+        NodeNumber,
+        NodeNumber,
+        u64,
+        u64,
+        Option<SnapshotConfiguration<NodeNumber>>,
+        Vec<(Vec<u8>, Vec<u8>)>,
+    );
+
     struct Group {
         compact_hysteresis: u64,
         replicas: BTreeMap<NodeNumber, Replica>,
         network: VecDeque<(NodeNumber, NodeNumber, Message<NodeNumber>)>,
+        snapshots: VecDeque<Shipped>,
+        installs: u64,
         now: u64,
         seed: u64,
         /// Every entry any replica applied, by index: they must agree.
@@ -462,6 +615,8 @@ mod tests {
             let mut group = Self {
                 compact_hysteresis,
                 replicas: BTreeMap::new(),
+                snapshots: VecDeque::new(),
+                installs: 0,
                 network: VecDeque::new(),
                 now: 0,
                 seed: 1,
@@ -553,6 +708,7 @@ mod tests {
                                 }];
                                 smol::block_on(writer.commit(vec![Change::Apply {
                                     agent: AGENT,
+                                    epoch: store.snapshot().epoch(AGENT).unwrap(),
                                     index: at,
                                     writes,
                                 }]))
@@ -578,7 +734,30 @@ mod tests {
                                 core.compacted(through);
                             }
                         }
-                        Action::SendSnapshot { to, .. } => core.snapshot_failed(to),
+                        Action::SendSnapshot { to, .. } => {
+                            // Exported at the leader's own applied index,
+                            // with the configuration in effect there.
+                            let mut export = store.export(AGENT).unwrap();
+                            let configuration = core.config_at(export.applied).map(|record| {
+                                SnapshotConfiguration {
+                                    members: record.current,
+                                    joint_old: record.joint_old,
+                                    index: record.log_index.unwrap_or(0),
+                                }
+                            });
+                            let mut rows = Vec::new();
+                            while let Some(chunk) = export.next_chunk(1 << 12).unwrap() {
+                                rows.extend(chunk);
+                            }
+                            self.snapshots.push_back((
+                                node,
+                                to,
+                                export.applied,
+                                export.term,
+                                configuration,
+                                rows,
+                            ));
+                        }
                         Action::Answer(Answer::Propose { .. })
                         | Action::Answer(_)
                         | Action::Changed { .. } => {}
@@ -587,10 +766,55 @@ mod tests {
             }
         }
 
+        /// `to` installs a snapshot from `from`: staged under its next
+        /// epoch, switched to in one synced batch, the old epoch dropped.
+        fn install(&mut self, shipped: Shipped) {
+            let (from, to, index, term, configuration, rows) = shipped;
+            let replica = self.replicas.get_mut(&to).unwrap();
+            let Some(core) = replica.core.as_mut() else {
+                return;
+            };
+            if core.role() != Role::Follower
+                || core.status().leader_hint != Some(from)
+                || index <= replica.applied
+            {
+                return;
+            }
+            let store = replica.store.as_ref().unwrap();
+            let writer = replica.writer.as_ref().unwrap();
+            let old = store.snapshot().epoch(AGENT).unwrap();
+            let epoch = crate::store::next_epoch(old);
+            let drop = |epoch| Change::DropEpoch {
+                agent: AGENT,
+                epoch,
+                limit: usize::MAX,
+            };
+            smol::block_on(writer.commit(vec![drop(epoch)])).unwrap();
+            smol::block_on(writer.commit(vec![Change::Stage {
+                agent: AGENT,
+                epoch,
+                first: true,
+                rows,
+            }]))
+            .unwrap();
+            let switch = core.snapshot_switch(index, term, configuration.as_ref());
+            smol::block_on(writer.commit(vec![switch_change(AGENT, epoch, index, term, &switch)]))
+                .unwrap();
+            core.snapshot_installed(index, term, configuration);
+            replica.applied = index;
+            smol::block_on(writer.commit(vec![drop(old)])).unwrap();
+            assert!(store.stale_epochs(AGENT).unwrap().is_empty());
+            self.installs += 1;
+            self.process(to);
+        }
+
         fn run(&mut self, millis: u64) {
             let until = self.now + millis;
             while self.now < until {
                 self.now += 1;
+                while let Some(shipped) = self.snapshots.pop_front() {
+                    self.install(shipped);
+                }
                 while let Some((from, to, message)) = self.network.pop_front() {
                     if let Some(core) = self.replicas.get_mut(&to).unwrap().core.as_mut() {
                         core.tick(self.now);
@@ -655,12 +879,12 @@ mod tests {
             .count() as u64
     }
 
-    /// Without compaction past a stopped replica (it would need a
-    /// snapshot), every replica recovers its log, hard state and applied
-    /// index from its store across restarts, the leader's included.
+    /// Every replica recovers its log, hard state and applied index from
+    /// its store across restarts, the leader's included. Logs compact as
+    /// they go, so a replica down meanwhile catches up by a snapshot.
     #[test]
     fn a_group_over_real_stores_keeps_its_log_across_restarts() {
-        let mut group = Group::new(u64::MAX);
+        let mut group = Group::new(4);
         let mut proposed = 0;
         for round in 0..12u64 {
             group.run(400);
@@ -685,6 +909,9 @@ mod tests {
         group.propose(leader, 0);
         group.run(1_000);
         agreed(&group);
+        assert!(group.installs > 0, "no replica needed a snapshot");
+        // Entries a replica installed by snapshot it never applied one by
+        // one; the group as a whole applied every result.
         assert!(results(&group) > proposed, "{} results", results(&group));
     }
 

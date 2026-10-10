@@ -20,7 +20,7 @@ use vos_wire::ids::{AgentId, ProgramHash, SessionId};
 use vos_wire::result::Write;
 
 use crate::Hooks;
-use crate::store::{Batch, Durability, Fjall, HardState, LogEntry, Membership, Store};
+use crate::store::{Batch, Durability, Fjall, HardState, LogEntry, Membership, Row, Store, Switch};
 
 /// How long the oldest pending commit may wait before the writer counts as
 /// stalled.
@@ -61,11 +61,34 @@ pub enum Change {
         agent: AgentId,
         membership: Membership,
     },
-    /// A work result's writes applied at `index`.
+    /// A work result's writes applied at `index`, to the agent's rows
+    /// under `epoch`: refused if that is no longer its epoch, or `index` is
+    /// not past its applied index (an apply that raced a snapshot switch).
     Apply {
         agent: AgentId,
+        epoch: u8,
         index: u64,
         writes: Vec<Write>,
+    },
+    /// A snapshot's rows written under `epoch`, beside the current one.
+    /// The first chunk of an install says so, and is refused if the epoch
+    /// still holds rows: an earlier install's, not yet cleared.
+    Stage {
+        agent: AgentId,
+        epoch: u8,
+        first: bool,
+        rows: Vec<Row>,
+    },
+    /// Up to `limit` of the agent's rows under an old `epoch` removed.
+    DropEpoch {
+        agent: AgentId,
+        epoch: u8,
+        limit: usize,
+    },
+    /// The agent switched to the snapshot staged under `switch.epoch`.
+    Switch {
+        agent: AgentId,
+        switch: Switch,
     },
     /// `agent` keeps the blob `hash`, a program it runs.
     Pin {
@@ -96,7 +119,10 @@ impl Change {
     /// Whether the change must be on the disk before its commit is answered.
     fn synced(&self) -> bool {
         match self {
-            Self::Apply { .. } | Self::Compact { .. } => false,
+            Self::Apply { .. }
+            | Self::Compact { .. }
+            | Self::Stage { .. }
+            | Self::DropEpoch { .. } => false,
             Self::Hard { sync, .. } => *sync,
             _ => true,
         }
@@ -108,6 +134,10 @@ impl Change {
             Self::Apply { writes, .. } => writes
                 .iter()
                 .map(|write| write.key.len() + write.value.as_ref().map_or(0, Vec::len))
+                .sum(),
+            Self::Stage { rows, .. } => rows
+                .iter()
+                .map(|(key, value)| key.len() + value.len())
                 .sum(),
             _ => 64,
         }
@@ -144,25 +174,142 @@ struct Writer {
     shared: Arc<Shared>,
     /// Applies written since the last synced flush, per agent.
     unsynced_applied: HashMap<AgentId, u64>,
+    /// What the writer knows of each agent's rows: read once from the
+    /// store, then kept in step with what it commits.
+    agents: HashMap<AgentId, AgentState>,
+}
+
+/// An agent's epoch, applied index and log start, as committed.
+#[derive(Clone, Copy, Debug)]
+struct AgentState {
+    epoch: u8,
+    applied: u64,
+    log_start: u64,
 }
 
 impl Writer {
-    /// Why a commit must be refused, before any of it is written. Only a
-    /// compaction is refused, and with it its whole commit: keep
-    /// compactions in commits of their own.
-    fn refusal(&self, commit: &Commit) -> Option<String> {
-        let durable = self.shared.durably_applied.lock().expect("unpoisoned");
-        commit.changes.iter().find_map(|change| match change {
-            Change::Compact { agent, through, .. }
-                if *through > durable.get(agent).copied().unwrap_or(0) =>
-            {
-                Some(format!(
-                    "compaction of agent {} through {through} passes its durably applied index",
-                    agent.0
-                ))
+    /// `agent`'s state as `pending` (this group so far) or the store has it.
+    fn state(
+        &mut self,
+        pending: &HashMap<AgentId, AgentState>,
+        agent: AgentId,
+    ) -> Result<AgentState, String> {
+        if let Some(&state) = pending.get(&agent).or_else(|| self.agents.get(&agent)) {
+            return Ok(state);
+        }
+        let read = self
+            .store
+            .agent_rows(agent)
+            .map_err(|error| error.to_string())?;
+        let state = AgentState {
+            epoch: read.epoch,
+            applied: read.applied,
+            log_start: read.log_start,
+        };
+        self.agents.insert(agent, state);
+        Ok(state)
+    }
+
+    /// Why a commit must be refused, before any of it is written, or what
+    /// it leaves each agent's state at. A refused commit writes nothing.
+    fn check(
+        &mut self,
+        commit: &Commit,
+        pending: &mut HashMap<AgentId, AgentState>,
+    ) -> Result<(), String> {
+        let mut after = pending.clone();
+        for change in &commit.changes {
+            match change {
+                Change::Compact { agent, through, .. } => {
+                    let durable = self
+                        .shared
+                        .durably_applied
+                        .lock()
+                        .expect("unpoisoned")
+                        .get(agent)
+                        .copied()
+                        .unwrap_or(0);
+                    let mut state = self.state(&after, *agent)?;
+                    if *through > durable {
+                        return Err(format!(
+                            "compaction of agent {} through {through} passes its durably applied index",
+                            agent.0
+                        ));
+                    }
+                    if *through <= state.log_start {
+                        return Err(format!(
+                            "compaction of agent {} through {through} is at or below its log start",
+                            agent.0
+                        ));
+                    }
+                    state.log_start = *through;
+                    after.insert(*agent, state);
+                }
+                Change::Apply {
+                    agent,
+                    epoch,
+                    index,
+                    ..
+                } => {
+                    let mut state = self.state(&after, *agent)?;
+                    // Applies come one index at a time.
+                    if *epoch != state.epoch || *index != state.applied + 1 {
+                        return Err(format!(
+                            "an apply of agent {} at {index} in epoch {epoch} is stale: it is at {} in epoch {}",
+                            agent.0, state.applied, state.epoch
+                        ));
+                    }
+                    state.applied = *index;
+                    after.insert(*agent, state);
+                }
+                Change::Stage { agent, epoch, .. } | Change::DropEpoch { agent, epoch, .. } => {
+                    if *epoch == self.state(&after, *agent)?.epoch {
+                        return Err(format!(
+                            "agent {}'s current epoch {epoch} is not staged into or dropped",
+                            agent.0
+                        ));
+                    }
+                    if let Change::Stage { first: true, .. } = change
+                        && self
+                            .store
+                            .epoch_holds_rows(*agent, *epoch)
+                            .map_err(|error| error.to_string())?
+                    {
+                        return Err(format!(
+                            "agent {}'s epoch {epoch} still holds rows: clear it before an install",
+                            agent.0
+                        ));
+                    }
+                }
+                Change::Truncate { agent, after: cut } => {
+                    let state = self.state(&after, *agent)?;
+                    if *cut < state.applied {
+                        return Err(format!(
+                            "a truncation of agent {} after {cut} is below its applied index {}",
+                            agent.0, state.applied
+                        ));
+                    }
+                }
+                Change::Switch { agent, switch } => {
+                    let mut state = self.state(&after, *agent)?;
+                    if switch.epoch == state.epoch || switch.index <= state.applied {
+                        return Err(format!(
+                            "a switch of agent {} to {} in epoch {} does not move past {} in epoch {}",
+                            agent.0, switch.index, switch.epoch, state.applied, state.epoch
+                        ));
+                    }
+                    state = AgentState {
+                        epoch: switch.epoch,
+                        applied: switch.index,
+                        log_start: switch.index,
+                    };
+                    after.insert(*agent, state);
+                }
+                _ => {}
             }
-            _ => None,
-        })
+        }
+        *pending = after;
+        Ok(())
     }
 
     fn write(&mut self, group: Vec<Commit>) {
@@ -174,8 +321,9 @@ impl Writer {
         // Commits in order, each with its refusal if it has one; a refused
         // commit writes nothing, and is answered in its turn.
         let mut taken = Vec::with_capacity(group.len());
+        let mut pending: HashMap<AgentId, AgentState> = HashMap::new();
         for commit in group {
-            if let Some(refusal) = self.refusal(&commit) {
+            if let Err(refusal) = self.check(&commit, &mut pending) {
                 taken.push((commit, Some(refusal)));
                 continue;
             }
@@ -200,12 +348,26 @@ impl Writer {
                     }
                     Change::Apply {
                         agent,
+                        epoch,
                         index,
                         writes,
                     } => {
-                        batch.apply(*agent, *index, writes);
+                        batch.apply(*agent, *epoch, *index, writes);
                         let entry = applied.entry(*agent).or_insert(*index);
                         *entry = (*entry).max(*index);
+                    }
+                    Change::Stage {
+                        agent, epoch, rows, ..
+                    } => batch.stage(*agent, *epoch, rows),
+                    Change::DropEpoch {
+                        agent,
+                        epoch,
+                        limit,
+                    } => batch.drop_epoch(*agent, *epoch, *limit),
+                    Change::Switch { agent, switch } => {
+                        batch.switch(*agent, switch);
+                        let entry = applied.entry(*agent).or_insert(switch.index);
+                        *entry = (*entry).max(switch.index);
                     }
                     Change::Pin { hash, agent } => batch.pin(hash, *agent),
                     Change::Unpin { hash, agent } => batch.unpin(hash, *agent),
@@ -228,6 +390,7 @@ impl Writer {
             batch.commit(durability).map_err(|error| error.to_string())
         };
         if result.is_ok() {
+            self.agents.extend(pending);
             for (agent, index) in applied {
                 let entry = self.unsynced_applied.entry(agent).or_insert(index);
                 *entry = (*entry).max(index);
@@ -274,6 +437,7 @@ impl StorageThread {
             hooks,
             shared: Arc::clone(&shared),
             unsynced_applied: HashMap::new(),
+            agents: HashMap::new(),
         };
         let thread = std::thread::Builder::new()
             .name("vos-storage".into())
@@ -396,6 +560,7 @@ mod tests {
     fn apply(index: u64) -> Change {
         Change::Apply {
             agent: A,
+            epoch: 0,
             index,
             writes: Vec::new(),
         }
@@ -417,7 +582,7 @@ mod tests {
     fn the_durably_applied_index_moves_only_with_a_synced_flush() {
         let dir = tempfile::tempdir().unwrap();
         let writer = writer(dir.path());
-        smol::block_on(writer.commit(vec![apply(5)])).unwrap();
+        smol::block_on(writer.commit((1..=5).map(apply).collect())).unwrap();
         smol::block_on(writer.commit(vec![hard(1, false)])).unwrap();
         assert_eq!(
             writer.durably_applied(A),
@@ -466,11 +631,97 @@ mod tests {
             term: 1,
             membership: None,
         };
-        smol::block_on(writer.commit(vec![apply(5)])).unwrap();
+        smol::block_on(writer.commit((1..=5).map(apply).collect())).unwrap();
         assert!(smol::block_on(writer.commit(vec![compact(3)])).is_err());
         smol::block_on(writer.commit(vec![hard(1, true)])).unwrap();
         smol::block_on(writer.commit(vec![compact(3)])).unwrap();
         assert!(smol::block_on(writer.commit(vec![compact(6)])).is_err());
+    }
+
+    #[test]
+    fn stale_applies_stagings_and_switches_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = writer(dir.path());
+        let commit = |change| smol::block_on(writer.commit(vec![change]));
+        let apply_at = |epoch, index| Change::Apply {
+            agent: A,
+            epoch,
+            index,
+            writes: Vec::new(),
+        };
+        let switch = |epoch, index| Change::Switch {
+            agent: A,
+            switch: Switch {
+                epoch,
+                index,
+                term: 1,
+                hard: HardState::default(),
+                membership: Membership::default(),
+                log_start_membership: None,
+                truncate_after: None,
+            },
+        };
+        commit(apply_at(0, 1)).unwrap();
+        assert!(
+            commit(apply_at(0, 1)).is_err(),
+            "not past the applied index"
+        );
+        assert!(commit(apply_at(0, 3)).is_err(), "not the next index");
+        let stage = |epoch| Change::Stage {
+            agent: A,
+            epoch,
+            first: true,
+            rows: Vec::new(),
+        };
+        assert!(commit(stage(0)).is_err(), "the current epoch");
+        commit(stage(1)).unwrap();
+        assert!(commit(switch(0, 5)).is_err(), "no move to a new epoch");
+        assert!(commit(switch(1, 1)).is_err(), "not past the applied index");
+        commit(switch(1, 5)).unwrap();
+        assert!(
+            commit(apply_at(0, 6)).is_err(),
+            "an apply that raced the switch"
+        );
+        commit(apply_at(1, 6)).unwrap();
+        let truncate = |after| Change::Truncate { agent: A, after };
+        assert!(commit(truncate(5)).is_err(), "below the applied index");
+        commit(truncate(6)).unwrap();
+        // An install's first chunk into an epoch still holding rows.
+        let rows = |key: u8| vec![(vec![1, key], vec![key])];
+        commit(Change::Stage {
+            agent: A,
+            epoch: 2,
+            first: true,
+            rows: rows(1),
+        })
+        .unwrap();
+        commit(Change::Stage {
+            agent: A,
+            epoch: 2,
+            first: false,
+            rows: rows(2),
+        })
+        .unwrap();
+        assert!(
+            commit(Change::Stage {
+                agent: A,
+                epoch: 2,
+                first: true,
+                rows: rows(3),
+            })
+            .is_err(),
+            "not cleared"
+        );
+        let compact = |through| Change::Compact {
+            agent: A,
+            through,
+            term: 1,
+            membership: None,
+        };
+        assert!(
+            commit(compact(5)).is_err(),
+            "at the log start the switch set"
+        );
     }
 
     /// Holds every commit until released.

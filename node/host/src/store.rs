@@ -9,8 +9,8 @@
 //! - `blobs`: the blob store's index and pins ([`crate::blobs`]).
 //!
 //! An agent's rows live under an epoch, so that a snapshot can be installed
-//! beside the current state and switched to at once; every agent is at
-//! epoch 0 until snapshots arrive.
+//! beside the current state and switched to at once: one synced batch moves
+//! the agent's epoch pointer, and reads go through it.
 //!
 //! Writes go through a [`Batch`]; the storage thread groups several agents'
 //! batches into one commit. A replicated agent appends with a sync before
@@ -19,6 +19,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::Bound;
 use std::path::Path;
+use std::sync::Mutex;
 
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode, Readable};
 use vos_wire::ids::{AgentId, ProgramHash, SessionId};
@@ -122,6 +123,9 @@ impl LogEntry {
     }
 }
 
+/// One of an agent's rows: its agent-relative key and its value.
+pub type Row = (Vec<u8>, Vec<u8>);
+
 /// A replica's term, vote and commit index.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HardState {
@@ -137,6 +141,25 @@ pub struct Membership {
     pub index: Option<u64>,
     pub members: Vec<NodeNumber>,
     pub joint_old: Option<Vec<NodeNumber>>,
+}
+
+/// An agent's epoch, applied index and log start.
+pub(crate) struct AgentRows {
+    pub(crate) epoch: u8,
+    pub(crate) applied: u64,
+    pub(crate) log_start: u64,
+}
+
+/// A snapshot switch's rows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Switch {
+    pub epoch: u8,
+    pub index: u64,
+    pub term: u64,
+    pub hard: HardState,
+    pub membership: Membership,
+    pub log_start_membership: Option<Membership>,
+    pub truncate_after: Option<u64>,
 }
 
 /// What a replica recovers of its agent's Raft state.
@@ -190,6 +213,12 @@ pub trait Store: Send + Sync {
     /// The agent's Raft state, for recovery.
     fn raft(&self, agent: AgentId) -> Result<RaftRows>;
 
+    /// An export of the agent's applied state, from one store snapshot.
+    fn export(&self, agent: AgentId) -> Result<Export>;
+
+    /// Epochs other than the agent's current one that still hold rows.
+    fn stale_epochs(&self, agent: AgentId) -> Result<Vec<u8>>;
+
     /// The agents this node runs, each with its agent program.
     fn agents(&self) -> Result<Vec<(AgentId, ProgramHash)>>;
 
@@ -222,6 +251,9 @@ pub trait View: Send + Sync {
 
     /// The last log index applied to the agent's state.
     fn applied(&self, agent: AgentId) -> Result<Option<u64>>;
+
+    /// The epoch the agent's rows are under.
+    fn epoch(&self, agent: AgentId) -> Result<u8>;
 }
 
 /// An atomic group of writes: all of them or none survive a crash.
@@ -241,14 +273,29 @@ pub trait Batch {
 
     fn membership(&mut self, agent: AgentId, membership: &Membership);
 
-    /// Apply a work result's writes, in order, and record `index` as the
-    /// agent's applied index.
+    /// Apply a work result's writes, in order, to the agent's rows under
+    /// `epoch`, and record `index` as its applied index.
     fn apply<'a>(
         &mut self,
         agent: AgentId,
+        epoch: u8,
         index: u64,
         writes: impl IntoIterator<Item = &'a Write>,
     );
+
+    /// Write a snapshot's rows (agent-relative keys) under `epoch`, beside
+    /// the current one.
+    fn stage(&mut self, agent: AgentId, epoch: u8, rows: &[Row]);
+
+    /// Remove up to `limit` of the agent's rows under `epoch`.
+    fn drop_epoch(&mut self, agent: AgentId, epoch: u8, limit: usize);
+
+    /// Switch the agent to the snapshot staged under `epoch`, at `index`
+    /// and `term`: its epoch pointer, applied index, log start (with the
+    /// replica set in effect there), hard state and membership, and its
+    /// log, compacted through `index` and cut after it if `truncate_after`
+    /// says so.
+    fn switch(&mut self, agent: AgentId, switch: &Switch);
 
     /// `agent` keeps the blob `hash`: a program it runs.
     fn pin(&mut self, hash: &[u8; 32], agent: AgentId);
@@ -271,11 +318,14 @@ pub trait Batch {
 
 /// The first byte of an agent-relative system key ([`vos_wire::keys`]).
 const SYSTEM: u8 = 0x00;
-/// The epoch every agent's rows are under, until snapshots switch epochs.
-const EPOCH: u8 = 0x00;
 /// After an agent id, the node's own rows for the agent: above every
-/// epoch, so no agent row reaches them.
+/// epoch (`0..=0xfe`), so no agent row reaches them.
 const NODE: u8 = 0xff;
+
+/// The epoch after `epoch`, in the cycle `0..=0xfe`.
+pub fn next_epoch(epoch: u8) -> u8 {
+    if epoch >= NODE - 1 { 0 } else { epoch + 1 }
+}
 /// The id no agent gets: node-wide records live under its node rows.
 pub const NODE_AGENT: AgentId = AgentId(u32::MAX);
 
@@ -292,10 +342,11 @@ enum NodeRow {
     Hard = 0x06,
     LogStart = 0x07,
     Membership = 0x08,
+    Epoch = 0x09,
 }
 
-fn agent_key(agent: AgentId, key: &[u8]) -> Vec<u8> {
-    [&agent.0.to_be_bytes()[..], &[EPOCH], key].concat()
+fn agent_key(agent: AgentId, epoch: u8, key: &[u8]) -> Vec<u8> {
+    [&agent.0.to_be_bytes()[..], &[epoch], key].concat()
 }
 
 /// The bytes before an agent's relative keys.
@@ -580,6 +631,34 @@ impl Fjall {
         self.db.disk_space()
     }
 
+    /// Whether the agent has rows under `epoch`.
+    pub(crate) fn epoch_holds_rows(&self, agent: AgentId, epoch: u8) -> Result<bool> {
+        let prefix = agent_key(agent, epoch, &[]);
+        for partition in [&self.system, &self.state] {
+            if let Some(row) = partition.prefix(&prefix).next() {
+                row.key()?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// An agent's epoch, applied index and log start, as stored.
+    pub(crate) fn agent_rows(&self, agent: AgentId) -> Result<AgentRows> {
+        let row = |kind| self.system.get(node_row(agent, kind, &[]));
+        Ok(AgentRows {
+            epoch: row(NodeRow::Epoch)?
+                .and_then(|bytes| bytes.first().copied())
+                .unwrap_or(0),
+            applied: row(NodeRow::Applied)?
+                .and_then(|bytes| be_u64(&bytes))
+                .unwrap_or(0),
+            log_start: row(NodeRow::LogStart)?
+                .and_then(|bytes| be_u64(bytes.get(..8)?))
+                .unwrap_or(0),
+        })
+    }
+
     pub(crate) fn database(&self) -> &Database {
         &self.db
     }
@@ -613,6 +692,7 @@ impl Store for Fjall {
         FjallSnapshot {
             snapshot: self.db.snapshot(),
             store: self.clone(),
+            epochs: Mutex::new(HashMap::new()),
         }
     }
 
@@ -730,6 +810,64 @@ impl Store for Fjall {
             .and_then(|time| be_u64(&time)))
     }
 
+    fn export(&self, agent: AgentId) -> Result<Export> {
+        let snapshot = self.db.snapshot();
+        let row = |kind| snapshot.get(&self.system, node_row(agent, kind, &[]));
+        let epoch = row(NodeRow::Epoch)?
+            .and_then(|bytes| bytes.first().copied())
+            .unwrap_or(0);
+        let applied = row(NodeRow::Applied)?
+            .and_then(|bytes| be_u64(&bytes))
+            .unwrap_or(0);
+        let log_start = row(NodeRow::LogStart)?
+            .and_then(|bytes| Some((be_u64(bytes.get(..8)?)?, be_u64(bytes.get(8..16)?)?)))
+            .unwrap_or((0, 0));
+        let term = if applied <= log_start.0 {
+            log_start.1
+        } else {
+            snapshot
+                .get(&self.log, log_key(agent, applied))?
+                .and_then(|bytes| decode_entry(&bytes))
+                .map(|entry| entry.term)
+                .ok_or_else(|| {
+                    Error::Io(std::io::Error::other(format!(
+                        "agent {}'s log lacks its applied entry {applied}",
+                        agent.0
+                    )))
+                })?
+        };
+        Ok(Export {
+            snapshot,
+            store: self.clone(),
+            agent,
+            epoch,
+            applied,
+            term,
+            cursor: Some((true, None)),
+        })
+    }
+
+    fn stale_epochs(&self, agent: AgentId) -> Result<Vec<u8>> {
+        let current = self
+            .system
+            .get(node_row(agent, NodeRow::Epoch, &[]))?
+            .and_then(|bytes| bytes.first().copied())
+            .unwrap_or(0);
+        let mut stale = Vec::new();
+        for epoch in 0..NODE {
+            if epoch == current {
+                continue;
+            }
+            let prefix = agent_key(agent, epoch, &[]);
+            if self.system.prefix(&prefix).next().is_some()
+                || self.state.prefix(&prefix).next().is_some()
+            {
+                stale.push(epoch);
+            }
+        }
+        Ok(stale)
+    }
+
     fn agents(&self) -> Result<Vec<(AgentId, ProgramHash)>> {
         let prefix = registry_prefix();
         self.system
@@ -744,16 +882,92 @@ impl Store for Fjall {
     }
 }
 
+/// An agent's applied state, exported from one store snapshot: labelled
+/// with its own applied index and the term there, and read in chunks of
+/// rows (agent-relative keys, in key order, the system keys first).
+pub struct Export {
+    snapshot: fjall::Snapshot,
+    store: Fjall,
+    agent: AgentId,
+    epoch: u8,
+    pub applied: u64,
+    pub term: u64,
+    /// The partition read next (system, then state), and the last key read.
+    cursor: Option<(bool, Option<Vec<u8>>)>,
+}
+
+impl Export {
+    /// The next chunk of about `bytes` (at least one row), if any rows are
+    /// left.
+    pub fn next_chunk(&mut self, bytes: usize) -> Result<Option<Vec<Row>>> {
+        let mut chunk = Vec::new();
+        let mut size = 0;
+        let prefix = agent_key(self.agent, self.epoch, &[]);
+        while let Some((system, after)) = self.cursor.clone() {
+            let partition = if system {
+                &self.store.system
+            } else {
+                &self.store.state
+            };
+            let start = match &after {
+                Some(after) => Bound::Excluded(after.clone()),
+                None => Bound::Included(prefix.clone()),
+            };
+            let mut last = None;
+            let mut done = true;
+            for row in self.snapshot.range(partition, (start, Bound::Unbounded)) {
+                let (key, value) = row.into_inner()?;
+                if !key.starts_with(&prefix) {
+                    break;
+                }
+                if !chunk.is_empty() && size + key.len() + value.len() > bytes {
+                    done = false;
+                    break;
+                }
+                size += key.len() + value.len();
+                chunk.push((key[AGENT_KEY_PREFIX..].to_vec(), value.to_vec()));
+                last = Some(key.to_vec());
+            }
+            if done {
+                self.cursor = system.then_some((false, None));
+            } else {
+                self.cursor = Some((system, last.or(after)));
+                break;
+            }
+        }
+        Ok((!chunk.is_empty()).then_some(chunk))
+    }
+}
+
 pub struct FjallSnapshot {
     snapshot: fjall::Snapshot,
     store: Fjall,
+    /// Each agent's epoch, read once from this snapshot: a reader never
+    /// mixes epochs, nor sees a half-installed snapshot.
+    epochs: Mutex<HashMap<AgentId, u8>>,
+}
+
+impl FjallSnapshot {
+    fn read_epoch(&self, agent: AgentId) -> Result<u8> {
+        if let Some(&epoch) = self.epochs.lock().expect("unpoisoned").get(&agent) {
+            return Ok(epoch);
+        }
+        let epoch = self
+            .snapshot
+            .get(&self.store.system, node_row(agent, NodeRow::Epoch, &[]))?
+            .and_then(|bytes| bytes.first().copied())
+            .unwrap_or(0);
+        self.epochs.lock().expect("unpoisoned").insert(agent, epoch);
+        Ok(epoch)
+    }
 }
 
 impl View for FjallSnapshot {
     fn get(&self, agent: AgentId, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let epoch = self.read_epoch(agent)?;
         Ok(self
             .snapshot
-            .get(self.store.partition(key), agent_key(agent, key))?
+            .get(self.store.partition(key), agent_key(agent, epoch, key))?
             .map(|value| value.to_vec()))
     }
 
@@ -764,25 +978,37 @@ impl View for FjallSnapshot {
         after: Option<&[u8]>,
     ) -> impl Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> {
         assert!(!prefix.is_empty(), "a scan names its partition");
-        let start = match after {
-            Some(after) if after >= prefix => Bound::Excluded(agent_key(agent, after)),
-            _ => Bound::Included(agent_key(agent, prefix)),
+        // An unreadable epoch row is the scan's first, and only, item: never
+        // another epoch's rows.
+        let (epoch, failed) = match self.read_epoch(agent) {
+            Ok(epoch) => (epoch, None),
+            Err(error) => (0, Some(error)),
         };
-        let prefix = agent_key(agent, prefix);
-        self.snapshot
+        let broken = failed.is_some();
+        let start = match after {
+            Some(after) if after >= prefix => Bound::Excluded(agent_key(agent, epoch, after)),
+            _ => Bound::Included(agent_key(agent, epoch, prefix)),
+        };
+        let prefix = agent_key(agent, epoch, prefix);
+        let rows = self
+            .snapshot
             .range(
                 self.store.partition(&prefix[AGENT_KEY_PREFIX..]),
                 (start, Bound::Unbounded),
             )
             .map(|row| row.into_inner())
-            .take_while(move |row| match row {
-                Ok((key, _)) => key.starts_with(&prefix),
-                Err(_) => true,
+            .take_while(move |row| {
+                !broken
+                    && match row {
+                        Ok((key, _)) => key.starts_with(&prefix),
+                        Err(_) => true,
+                    }
             })
             .map(|row| {
                 let (key, value) = row?;
                 Ok((key[AGENT_KEY_PREFIX..].to_vec(), value.to_vec()))
-            })
+            });
+        failed.map(Err).into_iter().chain(rows)
     }
 
     fn applied(&self, agent: AgentId) -> Result<Option<u64>> {
@@ -790,6 +1016,10 @@ impl View for FjallSnapshot {
             .snapshot
             .get(&self.store.system, node_row(agent, NodeRow::Applied, &[]))?
             .and_then(|bytes| be_u64(&bytes)))
+    }
+
+    fn epoch(&self, agent: AgentId) -> Result<u8> {
+        self.read_epoch(agent)
     }
 }
 
@@ -882,12 +1112,13 @@ impl Batch for FjallBatch {
     fn apply<'a>(
         &mut self,
         agent: AgentId,
+        epoch: u8,
         index: u64,
         writes: impl IntoIterator<Item = &'a Write>,
     ) {
         for write in writes {
             let partition = self.store.partition(&write.key);
-            let key = agent_key(agent, &write.key);
+            let key = agent_key(agent, epoch, &write.key);
             match &write.value {
                 Some(value) => self.batch.insert(partition, key, value.as_slice()),
                 None => self.batch.remove(partition, key),
@@ -898,6 +1129,55 @@ impl Batch for FjallBatch {
             node_row(agent, NodeRow::Applied, &[]),
             index.to_be_bytes(),
         );
+    }
+
+    fn stage(&mut self, agent: AgentId, epoch: u8, rows: &[Row]) {
+        for (key, value) in rows {
+            let partition = self.store.partition(key);
+            self.batch
+                .insert(partition, agent_key(agent, epoch, key), value.as_slice());
+        }
+    }
+
+    fn drop_epoch(&mut self, agent: AgentId, epoch: u8, limit: usize) {
+        let prefix = agent_key(agent, epoch, &[]);
+        let mut left = limit;
+        for partition in [&self.store.system, &self.store.state] {
+            for row in partition.prefix(&prefix).take(left) {
+                match row.key() {
+                    Ok(key) => {
+                        self.batch.remove(partition, key);
+                        left -= 1;
+                    }
+                    Err(error) => {
+                        self.error.get_or_insert(error);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    fn switch(&mut self, agent: AgentId, switch: &Switch) {
+        if let Some(after) = switch.truncate_after {
+            self.truncate(agent, after);
+        }
+        self.compact(
+            agent,
+            switch.index,
+            switch.term,
+            switch.log_start_membership.as_ref(),
+        );
+        self.hard_state(agent, &switch.hard);
+        self.membership(agent, &switch.membership);
+        let system = &self.store.system;
+        self.batch.insert(
+            system,
+            node_row(agent, NodeRow::Applied, &[]),
+            switch.index.to_be_bytes(),
+        );
+        self.batch
+            .insert(system, node_row(agent, NodeRow::Epoch, &[]), [switch.epoch]);
     }
 
     fn pin(&mut self, hash: &[u8; 32], agent: AgentId) {
@@ -1005,10 +1285,11 @@ mod tests {
         let mut batch = store.batch();
         batch.apply(
             A,
+            0,
             1,
             &[put(row(0, 1), b"one"), put(session.clone(), b"mark")],
         );
-        batch.apply(B, 4, &[put(row(0, 1), b"other")]);
+        batch.apply(B, 0, 4, &[put(row(0, 1), b"other")]);
         batch.commit(Durability::Synced).unwrap();
 
         let view = store.snapshot();
@@ -1032,6 +1313,7 @@ mod tests {
         let mut batch = store.batch();
         batch.apply(
             A,
+            0,
             2,
             &[Write {
                 key: row(0, 1),
@@ -1059,9 +1341,9 @@ mod tests {
             .collect();
         let mut writes = writes;
         writes.push(put(keys::session(SessionId(1)), b"mark"));
-        batch.apply(A, 1, &writes);
-        batch.apply(AgentId(0x0100_0000), 1, &[put(row(1, 9), b"v")]);
-        batch.apply(B, 1, &[put(row(1, 9), b"v")]);
+        batch.apply(A, 0, 1, &writes);
+        batch.apply(AgentId(0x0100_0000), 0, 1, &[put(row(1, 9), b"v")]);
+        batch.apply(B, 0, 1, &[put(row(1, 9), b"v")]);
         batch.commit(Durability::Synced).unwrap();
 
         let view = store.snapshot();
@@ -1098,6 +1380,7 @@ mod tests {
         let mut batch = store.batch();
         batch.apply(
             A,
+            0,
             1,
             &[
                 put(row(0, 1), b"first"),
@@ -1145,7 +1428,7 @@ mod tests {
             scope.spawn(|| {
                 for index in 1..=RESULTS {
                     let mut batch = store.batch();
-                    batch.apply(A, index, &writes(index));
+                    batch.apply(A, 0, index, &writes(index));
                     batch.commit(Durability::Buffered).unwrap();
                 }
             });
@@ -1184,7 +1467,7 @@ mod tests {
         {
             let store = Fjall::open(dir.path()).unwrap();
             let mut batch = store.batch();
-            batch.apply(A, 1, &[put(row(0, 1), &value)]);
+            batch.apply(A, 0, 1, &[put(row(0, 1), &value)]);
             batch.commit(Durability::Synced).unwrap();
         }
         let mut pending = vec![dir.path().to_path_buf()];
@@ -1252,7 +1535,7 @@ mod tests {
         }
         batch.hard_state(A, &hard);
         batch.membership(A, &membership);
-        batch.apply(A, 3, &[]);
+        batch.apply(A, 0, 3, &[]);
         batch.commit(Durability::Synced).unwrap();
         let at_start = Membership {
             index: Some(1),
@@ -1328,6 +1611,96 @@ mod tests {
         assert_eq!(range(250), vec![2, 3]);
         assert_eq!(range(usize::MAX), vec![2, 3, 4]);
         assert!(store.log_range(A, 5, 9, usize::MAX).unwrap().is_empty());
+    }
+
+    fn switch_to(epoch: u8, index: u64) -> Switch {
+        Switch {
+            epoch,
+            index,
+            term: 2,
+            hard: HardState {
+                term: 2,
+                vote: None,
+                commit: index,
+            },
+            membership: Membership::default(),
+            log_start_membership: None,
+            truncate_after: None,
+        }
+    }
+
+    /// An export of one agent, staged under a new epoch of another and
+    /// switched to, gives the second the first's state; a snapshot taken
+    /// before the switch keeps reading the old epoch; the old epoch's rows
+    /// stay until dropped.
+    #[test]
+    fn a_staged_export_switches_in_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Fjall::open(dir.path()).unwrap();
+        let session = keys::session(SessionId(4));
+        let mut batch = store.batch();
+        let writes: Vec<Write> = (0..50)
+            .map(|index| put(row(0, index), &index.to_be_bytes()))
+            .chain([put(session.clone(), b"mark")])
+            .collect();
+        batch.apply(A, 0, 7, &writes);
+        batch.append(A, 7, &LogEntry::result(2, vec![7]));
+        batch.apply(B, 0, 3, &[put(row(0, 99), b"old")]);
+        batch.commit(Durability::Synced).unwrap();
+
+        let mut export = store.export(A).unwrap();
+        assert_eq!((export.applied, export.term), (7, 2));
+        let mut rows = Vec::new();
+        let mut chunks = 0;
+        while let Some(chunk) = export.next_chunk(200).unwrap() {
+            chunks += 1;
+            rows.extend(chunk);
+        }
+        assert!(chunks > 1, "read in chunks");
+        assert_eq!(rows.len(), 51);
+        assert_eq!(rows[0].0, session, "system keys first");
+
+        let before = store.snapshot();
+        let mut batch = store.batch();
+        batch.stage(B, 1, &rows);
+        batch.commit(Durability::Buffered).unwrap();
+        assert_eq!(
+            store.snapshot().get(B, &row(0, 1)).unwrap(),
+            None,
+            "staged, not live"
+        );
+        let mut batch = store.batch();
+        batch.switch(B, &switch_to(1, 7));
+        batch.commit(Durability::Synced).unwrap();
+
+        let after = store.snapshot();
+        assert_eq!(after.epoch(B).unwrap(), 1);
+        assert_eq!(after.applied(B).unwrap(), Some(7));
+        assert_eq!(
+            after.get(B, &row(0, 1)).unwrap().as_deref(),
+            Some(&1u64.to_be_bytes()[..])
+        );
+        assert_eq!(after.get(B, &row(0, 99)).unwrap(), None);
+        assert_eq!(
+            after.get(B, &session).unwrap().as_deref(),
+            Some(&b"mark"[..])
+        );
+        // The earlier snapshot still reads the old epoch whole.
+        assert_eq!(
+            before.get(B, &row(0, 99)).unwrap().as_deref(),
+            Some(&b"old"[..])
+        );
+        assert_eq!(before.get(B, &row(0, 1)).unwrap(), None);
+        let raft = store.raft(B).unwrap();
+        assert_eq!(raft.log_start, (7, 2));
+        assert_eq!(raft.applied, 7);
+
+        assert_eq!(store.stale_epochs(B).unwrap(), vec![0]);
+        let mut batch = store.batch();
+        batch.drop_epoch(B, 0, usize::MAX);
+        batch.commit(Durability::Buffered).unwrap();
+        assert!(store.stale_epochs(B).unwrap().is_empty());
+        assert!(store.stale_epochs(A).unwrap().is_empty());
     }
 
     #[test]

@@ -104,7 +104,7 @@ fn run(rows: u64, variant: &str) {
             .collect();
         index += 1;
         let mut batch = store.batch();
-        batch.apply(AGENT, index, &writes);
+        batch.apply(AGENT, 0, index, &writes);
         batch.commit(Durability::Buffered).unwrap();
     }
     let load = started.elapsed();
@@ -129,7 +129,7 @@ fn run(rows: u64, variant: &str) {
                 .collect();
             index += 1;
             let mut batch = store.batch();
-            batch.apply(AGENT, index, &writes);
+            batch.apply(AGENT, 0, index, &writes);
             batch.commit(durability).unwrap();
         }
         us(started.elapsed(), size * rounds)

@@ -37,6 +37,10 @@ harness = false
 name = "blob_crash"
 harness = false
 
+[[test]]
+name = "snapshot_crash"
+harness = false
+
 [[bench]]
 name = "acceptance"
 harness = false

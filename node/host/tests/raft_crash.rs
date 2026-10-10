@@ -93,6 +93,7 @@ fn writer(dir: &str) {
     for at in applied + 1..=last {
         commit(vec![Change::Apply {
             agent: AGENT,
+            epoch: 0,
             index: at,
             writes: writes(at),
         }]);
@@ -120,6 +121,7 @@ fn writer(dir: &str) {
         println!("appended {index}");
         commit(vec![Change::Apply {
             agent: AGENT,
+            epoch: 0,
             index,
             writes: writes(index),
         }]);

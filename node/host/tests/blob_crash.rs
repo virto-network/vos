@@ -27,7 +27,7 @@ use std::time::{Duration, SystemTime};
 
 use vos_node::NoHooks;
 use vos_node::blobs::{Blobs, blob_ref};
-use vos_node::raft::cut_missing_blobs;
+use vos_node::raft::recovery_cut;
 use vos_node::storage::{Change, StorageThread};
 use vos_node::store::{Fjall, LogEntry, Store};
 use vos_wire::ids::AgentId;
@@ -68,10 +68,11 @@ fn open(dir: &std::path::Path) -> (Fjall, Blobs) {
 fn writer(dir: &str) {
     let dir = std::path::Path::new(dir);
     let (store, blobs) = open(dir);
-    cut_missing_blobs(&store, &blobs, AGENT).unwrap();
-    let rows = store.raft(AGENT).unwrap();
     let writer = StorageThread::spawn(store.clone(), Arc::new(NoHooks));
-    writer.recovered(AGENT, rows.applied);
+    writer.recovered(AGENT, store.raft(AGENT).unwrap().applied);
+    let cut = recovery_cut(&store, &blobs, AGENT).unwrap();
+    smol::block_on(writer.commit(cut.changes)).unwrap();
+    let rows = store.raft(AGENT).unwrap();
     let mut log_start = rows.log_start.0;
     let mut index = rows.log.last().map_or(log_start, |(index, _)| *index);
     let commit = |changes| smol::block_on(writer.commit(changes)).unwrap();
@@ -79,6 +80,7 @@ fn writer(dir: &str) {
     for at in rows.applied + 1..=index {
         commit(vec![Change::Apply {
             agent: AGENT,
+            epoch: 0,
             index: at,
             writes: Vec::new(),
         }]);
@@ -107,6 +109,7 @@ fn writer(dir: &str) {
         println!("appended {index}");
         commit(vec![Change::Apply {
             agent: AGENT,
+            epoch: 0,
             index,
             writes: Vec::new(),
         }]);
@@ -182,7 +185,12 @@ fn main() {
         }
 
         let (store, blobs) = open(dir.path());
-        let cut = cut_missing_blobs(&store, &blobs, AGENT).unwrap();
+        let writer = StorageThread::spawn(store.clone(), Arc::new(NoHooks));
+        writer.recovered(AGENT, store.raft(AGENT).unwrap().applied);
+        let recovery = recovery_cut(&store, &blobs, AGENT).unwrap();
+        smol::block_on(writer.commit(recovery.changes)).unwrap();
+        drop(writer);
+        let cut = recovery.from;
         let rows = store.raft(AGENT).unwrap();
         let start = rows.log_start.0;
         let held: Vec<u64> = rows.log.iter().map(|(index, _)| *index).collect();

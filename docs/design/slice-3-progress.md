@@ -1021,3 +1021,93 @@ commit. Also done before it:
   It passed 100 runs in a row.
 - vos-node has 28 unit tests, with touch against removal and the new
   `EntryReports` hooks.
+
+### 3.3c: snapshots
+
+**Built:**
+
+- **Epochs** (`store.rs`):
+  - an agent's rows sit under `agent ∥ epoch ∥ key`, and an epoch row
+    names the current one;
+  - a store snapshot reads each agent's epoch once and caches it, so a
+    reader never mixes epochs and never sees a half-installed snapshot;
+  - `View::epoch` exposes it;
+  - epochs cycle through `0..=0xfe` (`next_epoch`).
+- **Export:** `Store::export(agent)` reads one store snapshot. It is
+  labelled with the agent's own applied index and the term there (from
+  its log, or its log start), and is read in chunks of rows, system keys
+  first. The membership to send with it is the core's `config_at` the
+  applied index.
+- **Staging:** `Change::Stage` writes rows under an epoch beside the
+  current one, through the writer and so the journal, without a sync.
+  `Change::DropEpoch` removes up to a limit of an old epoch's rows.
+  `Store::stale_epochs` lists epochs holding rows other than the current
+  one, for the startup sweep.
+- **The switch:** `Change::Switch` is one synced batch. It moves the
+  epoch pointer, records the applied index, the log start (with the
+  membership in effect there), the hard state and the membership, and
+  compacts the log through the snapshot (cutting it after, if told). The
+  staged rows share the journal, so the switch makes them durable too:
+  invariant 6. `raft::switch_change` maps vos-raft's `SnapshotSwitch`
+  onto it.
+- **The writer's guards**, from what it knows of each agent's epoch,
+  applied index and log start (read once, then kept in step with what it
+  commits). It refuses:
+  - an apply not in the current epoch, or not past the applied index (an
+    accumulate that raced a switch);
+  - staging into, or dropping, the current epoch;
+  - a switch that does not move to a new epoch past the applied index;
+  - a compaction at or below the log start (a switch moves it).
+- **The node** applies under its agent's epoch.
+- **The recovery cut, revisited:** an entry at or below the applied
+  index whose blob is gone (a tear of synced data) is committed and
+  applied, so the log is compacted through the applied index rather than
+  cut below it. Found by `blob_crash`, whose next apply the new guard
+  refused.
+
+**Tests:**
+
+- unit tests:
+  - a staged export switching in at once, with a snapshot taken before
+    the switch still reading the old epoch whole;
+  - the old epoch kept until dropped;
+  - the writer's refusals.
+- **Three vos-raft cores over three real stores:** the restart test now
+  runs with compaction on. A replica stopped while the others compact
+  catches up by a snapshot: exported by its leader at its applied index,
+  staged under the next epoch, switched in, the old epoch dropped.
+- **`snapshot_crash`:** a child installs snapshots of known content in a
+  loop: it clears the next epoch, stages in chunks, switches, applies a
+  few entries, then drops the old epoch, and sweeps stale epochs on
+  start. Twelve rounds of kills (mid-staging, mid-apply, mid-drop), the
+  last six tearing the journal. The rows are always exactly one snapshot
+  with the applies after it, at the applied index, and every install
+  reported survives, but for a tear's reach.
+- Every suite passes: four crash tests, the node's, slice 2's. The
+  acceptance bench: 28.7–30.3 µs per request, query median 50–57 µs,
+  as before.
+
+**Review** (Opus): go. Also done before the commit:
+
+- **The recovery cut goes through the writer.** `recovery_cut` returns
+  its changes for the node log writer, once told the agent's recovered
+  applied index, so the writer's knowledge of the log start never goes
+  stale.
+- **Its compaction keeps the membership** in effect at the applied index:
+  the latest configuration entry at or below it, else the old log
+  start's.
+- **A failed read of the epoch row** is a scan's first and only item,
+  never another epoch's rows.
+- **An install's first chunk is refused** while its epoch still holds
+  rows (`Stage { first }`). `snapshot_crash` moves each snapshot's key
+  window, so a leaked row, left staged or not dropped, would show.
+- Applies come one index at a time; a truncation below the applied index
+  is refused; an export whose applied entry is missing from its log is an
+  error, not term 0.
+
+**Left to later steps:**
+
+- **The node's driver (3.5):** recovery runs each agent's `recovery_cut`
+  and its stale-epoch sweep before the agent's first commit; applies
+  under the current epoch after a switch; `EntryReports::switched`.
+- **Streaming between nodes, and the manifest of pinned blobs (3.7).**
