@@ -3872,11 +3872,19 @@ it supersedes, `term` the term of the leader that announced it, and
   a replica's checks, `Elsewhere`, `agent_info`) come from it.
 - During a joint configuration, the placement lists both sets: either
   may send, and messages may go to either.
+- **Routing uses the greatest placement,** committed or not: a joint one
+  is a superset, and a message to a would-be replica fails over or is
+  sent again. **Checks of who may send** accept, while the greatest
+  placement is uncommitted, the nodes of `before` too: under an
+  uncommitted final placement the replica it leaves out may still lead.
 
 **Who says so:** the agent's leader, whenever a configuration entry is
 appended or committed, sends `Placement` to every node in the space
-until each acknowledges it; a new leader does so for its latest
-configuration. The record travels with it, so a node that missed the
+until each acknowledges it. A new leader announces its latest
+configuration, and announces it again, committed, once its commit index
+passes that entry: retirement waits for a committed final placement.
+3.8's batching should cover the burst of placements a wave of elections
+sends. The record travels with it, so a node that missed the
 creation learns the agent too, and records are no longer sent only by
 their creator. A placement is taken from a node named in it or in the
 configuration it supersedes (a leader removing itself), or from the
@@ -3886,8 +3894,9 @@ record's creator at index 0.
 --add Y` (`POST /agents/{id}/replicas`, with the operator's token) at the
 agent's leader (a redirect otherwise):
 - checks: X a member, Y not, Y in the space, no change in progress, and
-  **Y runs the agent:** the leader first sends Y the current placement,
-  and Y's acknowledgement says whether it runs the agent's program;
+  **Y can run the agent:** the leader first sends Y the current
+  placement, and Y's acknowledgement says whether it could run the
+  agent's program (its own is the record's), since it runs no group yet;
   otherwise the replacement is refused before anything is proposed;
 - `core.change_membership` with X replaced by Y: the joint
   configuration is appended, and the core finalizes it once it commits;
@@ -3899,16 +3908,25 @@ agent's leader (a redirect otherwise):
   member of the configuration *before* the change (`before`), so its
   core is no voter and never campaigns (vos-raft's pre-vote, election
   and `TimeoutNow` paths all check membership);
-- a later placement that no longer names it (a phantom superseded)
-  stops the group and retires the agent;
+- **until it has held a committed placement naming it,** a later
+  placement that no longer names it (a phantom superseded) stops the
+  group and retires the agent. Its data is uncommitted, or held by a
+  majority of the old configuration: had the joint entry committed, the
+  superseding leader could not have been elected without it. If the old
+  leader returns and the joint configuration becomes real again, its
+  placement starts the replica again, from its tombstone's term and vote;
 - the leader replicates to it: by entries while they last, else a
   snapshot (3.7a), which brings the configuration naming it;
 - refuses to start if it runs another agent program (as today), and its
   acknowledgement says so.
 
 **The removed replica:**
-- once it hears of a **committed, final** placement without it, and is
-  not leading, stops its group and **retires** the agent. A removed
+- **a member that held a committed placement naming it** retires only
+  once it hears of a **committed, final** placement without it, and is
+  not leading: under an uncommitted final, a candidate whose log lacks
+  the final entry is still elected under the joint rules, and may need
+  this replica's vote. It then stops its group and **retires** the
+  agent. A removed
   leader announces the final placement before it commits; it retires
   once its core steps down, which it does when the final configuration
   commits. Retiring is a writer change: the log, commit index,
@@ -3967,3 +3985,9 @@ before the change, the term and vote kept in the tombstone; compaction
 held back by a stream in flight and recording the configuration at its
 own point; streams named by (term, A), one per follower kept by the
 host; and the tests.
+
+**Re-review** (Opus): go for 3.7b. Made explicit above: sender checks
+accept `before` while the greatest placement is uncommitted; a new
+leader announces again once its configuration commits; the phantom and
+committed-final retirement rules apply to different replicas; the
+pre-check asks whether Y could run the program.
