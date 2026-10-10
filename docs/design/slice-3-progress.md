@@ -3007,3 +3007,176 @@ Folded in:
 - **The checker:** a linearizable read is never below what an earlier
   read by the same client showed.
 - **One `within`,** shared.
+
+### 3.5d: messages across nodes
+
+#### Design
+
+An agent's message reaches an agent led on another node, and its
+acknowledgement comes back, exactly once through failures. Then the
+nodes run as three processes. Two commits:
+- **3.5d1:** delivery across nodes, in process.
+- **3.5d2:** three processes.
+
+**Today** the leader pushes an outbox entry, and the receiver's leader
+its acknowledgement, into the other agent's queue only when that agent
+is led on the same node. Otherwise the entry waits in the outbox.
+
+**The wire:**
+- `PeerMessage::Deliver { to, message, relayed }`: a `batch::Message`
+  (`from`, `sequence`, instance, method, arguments) for agent `to`, on
+  Requests, on `to`'s stream;
+- `PeerMessage::Acknowledge { sender, receiver, sequence, relayed }`:
+  agent `receiver` holds `sender`'s messages through `sequence`, on
+  `sender`'s stream. The names say which way it goes: in the sender's
+  queue it becomes `Pending::Ack { to: receiver }`.
+
+**Routing a message or acknowledgement to an agent:**
+- **this node leads it:** into its queue, as today;
+- **this node replicates it** without leading: to the leader its group
+  follows;
+- **otherwise:** to one of its replicas from the directory, a different
+  one each time it goes again.
+
+A replica that does not lead relays what it receives to its leader,
+once (`relayed`), never to itself. A node whose group names it leader
+before its leader loop takes inputs drops it. Anything else it cannot
+place is dropped: the sender sends again.
+
+**Checks,** by hop:
+- **a direct hop** comes from a node replicating the origin:
+  `message.from` for a `Deliver`, `receiver` for an `Acknowledge`;
+- **a relayed hop** comes from a node replicating the destination: `to`
+  for a `Deliver`, `sender` for an `Acknowledge`.
+
+Replicas are trusted as Raft members are:
+- a direct hop could be forged only by a node that could also forge the
+  origin's log;
+- a relayed hop, only by one trusted with the destination's inputs.
+
+**The sender's leader keeps a window per target** (go-back-N):
+- **The window:** it sends what its outbox holds above the target's
+  acknowledgement, in order, at most 256 entries and 1 MiB beyond the
+  highest acknowledgement it has taken. That bound holds for every send:
+  after each batch, when its leadership starts, and on a round.
+  - A burst never floods the 4 MiB Requests queue, which other agents'
+    `Forward` and `ReadIndex` frames share.
+- **An acknowledgement taken from the queue** (not only once applied)
+  opens the window, and the window goes on: acknowledgements drive
+  delivery, so a backlog drains.
+- **A round:** while the outbox holds entries above the target's
+  acknowledgement and none has come for 1 s, it goes back to the
+  acknowledgement and sends one window again.
+  - A round that brings nothing doubles the target's wait, up to 16 s,
+    and progress resets it. A target refusing its messages for good
+    (`UNREADABLE`) is not tried every second.
+  - The leader loop wakes for rounds only while some target has entries
+    above its acknowledgement.
+- **It never relies on whether the network took a frame:** a refused one
+  is sent again by the round.
+- **An `Acknowledge` reaching its replica** goes into its queue as
+  `Pending::Ack`, as a local one does. The batch clears the outbox; the
+  acknowledgement is monotone and bounded by `ACK_LIMIT`, as today.
+
+**The receiver's leader:**
+- a message at or below its pair mark is a duplicate, acknowledged
+  with the mark, as today;
+- **a gap is now dropped before the batch:** it keeps only the next
+  expected sequence per sender, in queue order. Compaction is off, and
+  a refusal-only batch would cost a log entry;
+- the next runs, and is acknowledged once applied;
+- **messages and acknowledgements count against the queue's cap,**
+  which other nodes now fill. Past it they are dropped, and the sender
+  sends them again.
+
+Its acknowledgements are routed as above. A deposed leader that has not
+heard so acknowledges only marks it read from committed state. Messages
+it took never commit, and are delivered again.
+
+**Exactly once,** as in slice 2: messages are idempotent by their pair's
+sequence, acknowledgements are monotone, and every retry is safe.
+
+**The checker** (3.5d1):
+- every agent gets the counter at a second instance, its inbox,
+  installed before the first `forward`;
+- every fifth request a client sends is `forward`, which sends its
+  amount to the next client's agent's inbox;
+- increments' running totals and the reads count increments only. A
+  forward repeats a total, so reads compare totals: a read is at least
+  the answered prefix's total;
+- `forward` answers its amount;
+- **at the end:**
+  - every replica's inbox holds exactly the amounts forwarded to its
+    agent;
+  - the receiver's pair mark, and the sender's acknowledgement and last
+    sequence sent for that pair, all equal the number of forwards;
+  - every outbox is empty.
+- **mid-run,** reads of an inbox are prefix sums of the amounts
+  forwarded to it: each pair is FIFO.
+- **Deliveries that crossed nodes are counted,** and a run must have
+  some. Agents are led on different nodes as elections fall, and faults
+  hit both ends.
+
+**Tests (3.5d1):**
+- a message to an agent led on another node arrives once and is
+  acknowledged, and the sender's outbox empties;
+- **four nodes, the sender on {1, 2, 3} and the target on {2, 3, 4}:**
+  routing through the directory, relaying, and the checks by hop;
+- a backlog larger than a window drains, driven by acknowledgements;
+- **a receiver's leader stops** with messages queued: the sender
+  delivers them to the next one;
+- **a sender's leader stops** with its outbox unacknowledged: the next
+  sender leader delivers them;
+- a `Deliver` from a node that does not replicate the sender is
+  dropped.
+
+**3.5d2, three processes:**
+- **a test spawns three `vos node run --space` processes,** QUIC between
+  them, and creates an agent on all three with the operator's command;
+- **it drives calls and queries** with the client library, and messages
+  between two agents through `forward`;
+- **it kills the agents' leader with SIGKILL while forwards are in
+  flight, and starts it again,** and calls go on through the other two;
+- **at the end,** every replica's counters, inboxes and outboxes agree,
+  holding every answered call once and every forwarded amount once;
+- the children are killed when the test ends, failed or not, and their
+  ports are chosen with retries.
+
+The checker stays in process, where faults are cheap and seeded. The
+process test is its smoke test at the real boundary: real binaries,
+QUIC, crash restarts.
+
+**Not in 3.5d:**
+- `Forward` carrying the term (3.5c1's note);
+- message batching across agents, which belongs to 3.8's work on many
+  agents.
+
+**Review** (Opus): go, once five should-fixes were in the design. They
+now are:
+1. `Deliver` names its target;
+2. checks by hop, so relays from the destination's replicas pass, and
+   `Acknowledge` relays too;
+3. the per-target window, driven by acknowledgements, with rounds and
+   backoff, so an outbox always drains;
+4. the checker compares totals, which forwards repeat;
+5. deliveries across nodes are counted, plus the four-node test for the
+   directory route and relays.
+
+Answers:
+- **(a)** relaying once is sound and enough. A negative answer is never
+  acted on, so hidden copies and drops are harmless, and `relayed` stops
+  loops.
+- **(b)** the leader loop owns the rounds. They are bounded by bytes as
+  well as entries, back off, and run only while something trails.
+- **(c)** a stale or deposed receiver leader acknowledges only committed
+  marks, which the sender treats as monotone and bounds by what it sent;
+  it cannot clear an outbox wrongly.
+- **(d)** the checker's end state catches a double delivery and a loss;
+  pair marks and mid-run inbox prefixes make it stronger.
+
+Folded nits:
+- messages and acknowledgements under the queue's cap;
+- gaps dropped before the batch;
+- the `Acknowledge` field names;
+- the process test's details.
+
