@@ -529,3 +529,54 @@ keep marks and reply windows of expired sessions, and a session with no
 mark at an agent never expires there); the signature is not in the log;
 section 8.4's window wording; signature checks move to executors if they
 show.
+
+## Step 2.7: the JAM host-call harness
+
+**Done:**
+
+- **One table of host-call surfaces** (`vos_wire::abi::surface`), by kind
+  of program, with what a JAM node does with each call:
+  - an agent program's calls (refine and accumulate share its code): the
+    Gray Paper's `gas`, `fetch`, `read`, `write`, `historical_lookup`,
+    `machine` to `expunge` and `log`, served; `instantiate`, answered
+    `WHAT` there, so the agent's loader builds the machine from
+    `historical_lookup`; the precompiles, computed in software;
+    `state_read` and `state_scan`, which a JAM node cannot serve until
+    witnesses, so the refine traps rather than compute on empty state;
+  - an actor program's: the actor ABI (`0x500..=0x5ff`) and the
+    precompiles;
+  - an attestable program's: the precompiles only.
+- **The node's refine host** answers `historical_lookup` from its
+  programs; `fetch` and `export` answer `WHAT`, like any call it does not
+  serve. The default agent's refine calls neither.
+
+**Tests** (`agent/testkit/tests/agent.rs`, in `ci`):
+
+- `every_program_calls_only_its_surface` lists every `ecalli`, reachable
+  or not, in the default agent (today `gas`, `fetch`, `read`, `write`,
+  `historical_lookup`, `machine` to `expunge`, BLAKE2b, `instantiate`,
+  `state_read`, `state_scan`), the three test actors and the attestable
+  program, and fails on any call outside its surface.
+- `vos_and_jam_hosts_agree_on_batches_that_read_no_state`: installs with
+  attestables and roles, role grants and an acknowledgement refine on a
+  VOS host (the pool, applied state) and a JAM host (no pool, no state,
+  no precompiles, programs from preimages) to the same work result, byte
+  for byte, and accumulate to the same storage. Batches that read state
+  join the comparison with step 4's witnesses.
+- The refine host can compute no precompile, as a JAM node
+  (`RefineContext::without_precompiles`): the outer machine's calls reach
+  the embedder, and inner machines' return to the outer machine; the
+  JAM host above uses it.
+
+**Open, a prerequisite of step 4's comparison:** a precompile an actor
+calls is priced differently on the two hosts. On a VOS node the runtime
+computes it in place at its fixed price; on a JAM node it returns to the
+agent, which answers `WHAT`, and the actor's shim computes it in software
+with its own gas. The step's gas, and so the work result, would differ.
+The agent should serve its inner machines' precompiles itself, on every
+host, at the fixed price (computing them with its own call, in place on
+VOS and in software on JAM, which moves only its own gas), with the
+runtime's in-place service an optimisation that charges the same. The
+agent's own precompile use moves only its own gas, so only where the
+live-gas rule ends a batch: a JAM work item's gas and a VOS refine's
+must be the same number for the same steps to come out.

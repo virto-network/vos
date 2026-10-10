@@ -190,6 +190,10 @@ impl Node {
         if self.serves_state {
             context = context.with_state(Arc::new(Snapshot(self.state.clone())));
         }
+        if self.pool.is_none() && !self.serves_state {
+            // A JAM node: no pool, no state, and no precompile computed.
+            context = context.without_precompiles();
+        }
         context
             .try_run_with_host(|id, machine| {
                 serve(id, machine, &self.programs);
@@ -889,6 +893,111 @@ fn the_step_reserve_covers_the_largest_install() {
         reading <= defaults::STEP_RESERVE * 4 / 5,
         "first read: {reading}"
     );
+}
+
+/// Every program calls only what a JAM node serves, or what has a
+/// fallback there (`abi::surface`): the default agent, the test actors and
+/// the attestable program, every `ecalli` in them, reachable or not.
+#[test]
+fn every_program_calls_only_its_surface() {
+    use vos_wire::abi::surface;
+    let calls = |blob: &[u8]| vos_pvm::spi::inspect_standard_program_host_calls(blob).unwrap();
+    let agent = elf("default/target/riscv64em-vos/release/vos-agent.elf");
+    let mut seen: Vec<u64> = calls(&agent);
+    seen.sort_unstable();
+    seen.dedup();
+    for call in &seen {
+        assert!(surface::agent(*call).is_some(), "the agent calls {call:#x}");
+    }
+    assert!(
+        seen.iter()
+            .any(|call| surface::agent(*call) == Some(surface::OnJam::Loader)),
+        "the agent instantiates: the check sees its calls"
+    );
+    let programs = Programs::load();
+    for (name, blob) in [
+        ("counter", &programs.counter),
+        ("ledger", &programs.ledger),
+        ("caller", &programs.caller),
+    ] {
+        for call in calls(blob) {
+            assert!(surface::actor(call), "{name} calls {call:#x}");
+        }
+    }
+    for call in calls(&programs.checksum) {
+        assert!(surface::attestable(call), "checksum calls {call:#x}");
+    }
+}
+
+/// Batches that read no state refine on a VOS host (the pool, applied
+/// state) and on a JAM host (no pool, no state, no precompiles, programs
+/// from preimages) to the same work result, which both accumulate to the
+/// same storage. No request or message appears: their session and pair
+/// marks are applied state, which this host cannot read.
+#[test]
+fn vos_and_jam_hosts_agree_on_batches_that_read_no_state() {
+    let programs = Programs::load();
+    let mut vos = Node::new();
+    let mut jam = Node::with(false, false);
+    let mut add = |blob: &[u8]| {
+        let hash = vos.add(blob);
+        assert_eq!(jam.add(blob), hash);
+        hash
+    };
+    let counter = add(&programs.counter);
+    let ledger = add(&programs.ledger);
+    let checksum = add(&programs.checksum);
+    let audit = method(&programs.ledger, "checksum");
+    let batches = vec![
+        vec![
+            Input::Admin(Admin::Install {
+                instance: COUNTER,
+                program: counter,
+                attestables: vec![],
+                roles: vec![],
+            }),
+            Input::Admin(Admin::Install {
+                instance: LEDGER,
+                program: ledger,
+                attestables: vec![(audit, checksum)],
+                roles: vec![(b"minter".to_vec(), MINTER)],
+            }),
+            Input::Admin(Admin::SetRole {
+                principal: ALICE,
+                role: Some(MINTER),
+            }),
+        ],
+        vec![
+            Input::Ack {
+                to: AgentId(5),
+                sequence: 1,
+            },
+            Input::Admin(Admin::SetRole {
+                principal: ALICE,
+                role: None,
+            }),
+            Input::Admin(Admin::SetRole {
+                principal: BOB,
+                role: Some(MINTER),
+            }),
+        ],
+    ];
+    for (time, inputs) in batches.into_iter().enumerate() {
+        let work = Work::Batch(Batch {
+            version: vos.version,
+            time: time as u64 + 1,
+            seed: [time as u8; 32],
+            inputs,
+        });
+        let on_vos = vos.refine(&work);
+        let on_jam = jam.refine(&work);
+        assert_eq!(on_vos, on_jam, "batch {time}");
+        vos.accumulate(&on_vos);
+        jam.accumulate(&on_jam);
+        vos.version += 1;
+        jam.version += 1;
+        assert_eq!(vos.state, jam.state, "storage after batch {time}");
+    }
 }
 
 #[test]

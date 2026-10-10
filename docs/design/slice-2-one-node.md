@@ -739,6 +739,46 @@ The JAM-only host exists from 2.1 and the agent's tests run on it from
 - the dynamic comparison of work results between VOS and the JAM-only host
   in `ci`. Stateful refines follow with step 4's witnesses.
 
+#### Design [proposed]
+
+**One table of host-call surfaces** (`vos_wire::abi::surface`), by kind of
+program, with what a JAM node does with each call:
+
+- **Agent programs** (refine and accumulate share their code, so one
+  table covers both): the Gray Paper calls `gas`, `fetch`, `read`, `write`,
+  `historical_lookup`, `machine` through `expunge` and `log`, which a JAM
+  node serves; and VOS's, each with its fallback on JAM: `instantiate`
+  (the loader builds the machine from `historical_lookup`), the
+  precompiles (the software implementation), `state_read` and
+  `state_scan` (none until step 4's witnesses: the refine traps, so no
+  result is computed on empty state).
+- **Actor programs** run in machines the agent serves: the actor ABI
+  (`0x500..=0x5ff`, unserved ids answer `WHAT`) and the precompiles, which
+  the agent answers `WHAT` on JAM and the shims compute in software.
+- **Attestable programs**: the precompiles only, as the prover needs.
+
+**The node's refine host** answers `historical_lookup` from its programs
+(2.5). `fetch` and `export`, which a JAM refine may call, answer `WHAT`
+like any call a VOS node does not serve: the default agent's refine
+calls neither, and the static check fails if it starts to. An agent
+program that needs them waits for a later slice.
+
+**The static check** (CI, in the agent's tests) lists every `ecalli` in
+the default agent, every test actor and attestable program, and fails
+on any call outside its surface.
+
+**The dynamic comparison** (CI): batches that read no state (installs
+with attestables and roles, role grants, acknowledgements) refine on a
+VOS host (the pool, applied state) and on a JAM host (no pool, no state,
+no precompiles, `historical_lookup` from preimages) to the same work
+result, byte for byte, and both accumulate it to the same storage.
+
+**Before step 4 compares batches that run actors:** the agent must serve
+its inner machines' precompiles itself, at the fixed price, on every
+host. Today a JAM node returns them to the agent, which answers `WHAT`,
+and the actor's software fallback spends different gas, so the work
+result would differ (slice-2-progress, step 2.7).
+
 ### 2.8 JIT host-call exit cost (item 6)
 
 Profile a real batch on this agent, then cut the cost of an inner

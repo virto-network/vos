@@ -140,7 +140,8 @@ pub fn historical_lookup(hash: &[u8; 32]) -> Option<Vec<u8>> {
     })
 }
 
-/// One accumulate input, by index (`fetch` kind 15).
+/// One accumulate input, by index (`fetch` kind 15). Accumulate's only: a
+/// VOS node's refine host does not serve `fetch`.
 pub fn fetch_input(index: u64) -> Option<Vec<u8>> {
     whole(|out, offset, capacity| ecalli!(FETCH, [out as u64, offset, capacity, 15, index, 0]).0)
 }

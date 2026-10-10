@@ -291,3 +291,61 @@ pub mod refusal {
     /// operator must look, and resending cannot help.
     pub const UNREADABLE: u32 = 3;
 }
+
+/// The host calls each kind of program may make, and what a JAM node does
+/// with each. CI lists every `ecalli` in the default agent and the test
+/// programs and checks them against these.
+///
+/// A VOS node serves every call here, with one exception: its refine host
+/// answers `fetch` with `WHAT`, so only an agent's accumulate may call it.
+/// The table cannot tell refine from accumulate, which share their code.
+pub mod surface {
+    use core::ops::RangeInclusive;
+
+    /// Precompiles: the node computes them in place; elsewhere they answer
+    /// `WHAT` and the shims compute in software.
+    pub const PRECOMPILES: RangeInclusive<u64> = 0x400..=0x47f;
+    /// The actor ABI, which an agent serves; ids it does not serve answer
+    /// `WHAT`.
+    pub const ACTOR_ABI: RangeInclusive<u64> = 0x500..=0x5ff;
+
+    /// What a JAM node does with an agent program's call.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum OnJam {
+        /// A Gray Paper call, which a JAM node serves (`log` it may ignore).
+        Served,
+        /// A VOS extension, which a JAM node answers `WHAT`; the agent then
+        /// builds the machine itself from `historical_lookup`.
+        Loader,
+        /// A precompile: the software implementation.
+        Software,
+        /// Applied state, which a JAM node cannot give until witnesses: the
+        /// refine traps, so no result is computed on empty state.
+        NoResult,
+    }
+
+    /// An agent program's call (refine and accumulate share its code):
+    /// `None` when it is outside the surface.
+    pub fn agent(id: u64) -> Option<OnJam> {
+        match id {
+            // gas, fetch, read, write, historical_lookup, machine..expunge,
+            // log.
+            0 | 2 | 4 | 5 | 7 | 9..=14 | 100 => Some(OnJam::Served),
+            0x480 => Some(OnJam::Loader),
+            0x481 | 0x482 => Some(OnJam::NoResult),
+            _ if PRECOMPILES.contains(&id) => Some(OnJam::Software),
+            _ => None,
+        }
+    }
+
+    /// An actor program's call: the actor ABI or a precompile.
+    pub fn actor(id: u64) -> bool {
+        ACTOR_ABI.contains(&id) || PRECOMPILES.contains(&id)
+    }
+
+    /// An attestable program's call: a precompile only, as the prover
+    /// needs.
+    pub fn attestable(id: u64) -> bool {
+        PRECOMPILES.contains(&id)
+    }
+}

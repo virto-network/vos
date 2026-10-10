@@ -123,6 +123,9 @@ pub struct RefineContext {
     outer: Machine,
     inner: InnerMachines,
     state: Option<alloc::sync::Arc<dyn StateReader>>,
+    /// Whether precompiles are computed in place, here and in inner
+    /// machines.
+    precompiles: bool,
 }
 
 impl RefineContext {
@@ -140,6 +143,7 @@ impl RefineContext {
             outer: Machine::load_with(program, args, gas, model)?,
             inner: InnerMachines::new(),
             state: None,
+            precompiles: true,
         })
     }
 
@@ -160,7 +164,17 @@ impl RefineContext {
             outer,
             inner,
             state: None,
+            precompiles: true,
         })
+    }
+
+    /// Compute no precompile, as a JAM node does: the outer machine's
+    /// reach the embedder, and inner machines' return to the outer machine
+    /// as host calls.
+    pub fn without_precompiles(mut self) -> Self {
+        self.precompiles = false;
+        self.inner.without_precompiles();
+        self
     }
 
     /// Serve `state_read` from the agent's applied state. Without a reader
@@ -196,6 +210,7 @@ impl RefineContext {
             outer,
             inner,
             state: None,
+            precompiles: true,
         })
     }
 
@@ -337,7 +352,7 @@ impl RefineContext {
             });
             // Precompiles are served in place; the slice continues.
             while let ExitReason::HostCall(id) = exit {
-                if !crate::precompile::is_precompile(id) {
+                if !self.precompiles || !crate::precompile::is_precompile(id) {
                     break;
                 }
                 if !self.outer.charge(crate::precompile::price(id).unwrap_or(0)) {
@@ -410,7 +425,9 @@ impl RefineContext {
 
     fn dispatch(&mut self, id: u64) -> Dispatch {
         match id {
-            value if crate::precompile::is_precompile(value) => self.precompile(value),
+            value if self.precompiles && crate::precompile::is_precompile(value) => {
+                self.precompile(value)
+            }
             value if value == u64::from(host_call::MACHINE) => self.machine(),
             value if value == u64::from(host_call::PEEK) => self.peek(),
             value if value == u64::from(host_call::POKE) => self.poke(),
@@ -1505,6 +1522,10 @@ mod tests {
     /// its invocation frame. Returns the outcome code in φ7 and the gas left
     /// in the frame.
     fn invoke_inner_call(id: u16, gas: u64) -> (u64, u64) {
+        invoke_inner_call_on(id, gas, true)
+    }
+
+    fn invoke_inner_call_on(id: u16, gas: u64, precompiles: bool) -> (u64, u64) {
         const RW_BASE: u32 = 2 * crate::PVM_ZONE_SIZE;
         let mut frame = [0u8; 112];
         frame[..8].copy_from_slice(&gas.to_le_bytes());
@@ -1516,9 +1537,12 @@ mod tests {
         // ecalli id; trap. The inner machine maps no pages, so a served
         // compression faults on its pointers after paying.
         let inner = vec![0, 1, 4, 10, id_lo, id_hi, 0, 0b0000_1001];
-        let invocation = RefineContext::load_with(&outer, &inner, 1_000_000, MemoryModel::Sparse)
-            .unwrap()
-            .run();
+        let mut context =
+            RefineContext::load_with(&outer, &inner, 1_000_000, MemoryModel::Sparse).unwrap();
+        if !precompiles {
+            context = context.without_precompiles();
+        }
+        let invocation = context.run();
         assert_eq!(invocation.exit, ExitReason::Halt);
         let mut left = [0u8; 8];
         invocation.memory().read_bytes(RW_BASE, &mut left);
@@ -1549,6 +1573,32 @@ mod tests {
         let (outcome, left) = invoke_inner_call(crate::precompile::BLAKE2B_COMPRESS as u16, budget);
         assert_eq!(outcome, OUT_OF_GAS);
         assert_eq!(left, 0);
+    }
+
+    /// Without precompiles, as on a JAM node, an inner machine's call
+    /// returns to the outer machine unpriced, and the outer machine's own
+    /// reaches the embedder.
+    #[test]
+    fn without_precompiles_they_reach_the_caller() {
+        const HOST: u64 = 3;
+        let id = crate::precompile::BLAKE2B_COMPRESS as u16;
+        let (outcome, left) = invoke_inner_call_on(id, 100_000, false);
+        assert_eq!(outcome, HOST);
+        assert_eq!(left, invoke_inner_call(0x4ff, 100_000).1, "unpriced");
+
+        let [id_lo, id_hi] = id.to_le_bytes();
+        let outer = standard_program(&[10, id_lo, id_hi, 50, 0], &[0, 3]);
+        let mut seen = Vec::new();
+        let invocation = RefineContext::load(&outer, &[], 1_000_000)
+            .unwrap()
+            .without_precompiles()
+            .run_with_host(|call, machine| {
+                seen.push(call);
+                machine.registers_mut()[7] = result::WHAT;
+                Ok(())
+            });
+        assert_eq!(seen, [u64::from(id)]);
+        assert_eq!(invocation.exit, ExitReason::Halt);
     }
 
     #[test]
