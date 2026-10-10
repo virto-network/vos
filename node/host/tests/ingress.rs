@@ -9,16 +9,19 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
-use vos_node::client::{Client, Operator, Target};
+use std::collections::HashMap;
+
+use vos_node::client::{self, Client, ClientError, Operator, Target};
+use vos_node::store::{Store, View};
 use vos_node::{ADMIN_TOKEN, Config, Hooks, Node};
 use vos_wire::abi::refusal;
 use vos_wire::batch::{Batch, Input};
-use vos_wire::defaults;
-use vos_wire::ids::{AgentId, InstanceId, MethodId};
+use vos_wire::ids::{AgentId, InstanceId, MethodId, Session};
 use vos_wire::ingress::{Answer, Call, Install, Rejection};
 use vos_wire::result::Outcome;
 use vos_wire::schema::Schema;
 use vos_wire::{Decode, Encode};
+use vos_wire::{defaults, expiry, keys};
 
 const COUNTER: InstanceId = InstanceId(1);
 
@@ -143,9 +146,34 @@ impl Served {
 
     fn value(&self, client: &Client) -> u64 {
         let answer = client
-            .query(self.agent, COUNTER, self.value, &[], self.now() + 10_000)
+            .query(
+                self.agent,
+                COUNTER,
+                self.value,
+                &[],
+                vos_node::wall_clock() + 10_000,
+            )
             .unwrap();
         done(answer)
+    }
+
+    /// Whether the agent holds `session`.
+    fn holds(&self, session: &Session) -> bool {
+        self.node
+            .store()
+            .snapshot()
+            .get(self.agent, &keys::session_index(session))
+            .unwrap()
+            .is_some()
+    }
+
+    /// Move the node's clock to the start of a bucket of the expiry
+    /// index, so a session last active then expires a bucket before its
+    /// row is due.
+    fn at_bucket_start(&self) -> u64 {
+        let start = (self.now() / defaults::SESSION_BUCKET_MS + 1) * defaults::SESSION_BUCKET_MS;
+        self.clock.store(start, Ordering::SeqCst);
+        start
     }
 
     fn post(&self, path: &str, body: &[u8]) -> Answer {
@@ -296,18 +324,28 @@ fn signatures_sessions_and_staleness_are_checked() {
     }
     assert_eq!(done(stale(now - defaults::SESSION_SKEW_MS + 1_000)), 1);
 
+    // A query's `not_after` is by the client's clock, moved to the node's
+    // time as the client last learned it, and again once refused.
     let now = served.now();
     let query = |not_after| {
         client
             .query(agent, COUNTER, served.value, &[], not_after)
             .unwrap()
     };
-    assert_eq!(query(now - 1), Answer::Rejected(Rejection::StaleQuery));
+    let wall = vos_node::wall_clock();
     assert_eq!(
-        query(now + 600_000),
-        Answer::Rejected(Rejection::StaleQuery)
+        query(wall - 3_600_000),
+        Answer::Rejected(Rejection::StaleQuery { now })
     );
-    assert_eq!(done(query(now + 1_000)), 1);
+    assert_eq!(
+        query(vos_node::wall_clock() + 600_000),
+        Answer::Rejected(Rejection::StaleQuery { now })
+    );
+    assert_eq!(done(query(vos_node::wall_clock() + 1_000)), 1);
+    // The node's clock ten minutes ahead: refused once, the query goes
+    // again at its time.
+    served.clock.store(now + 600_000, Ordering::SeqCst);
+    assert_eq!(done(query(vos_node::wall_clock() + 60_000)), 1);
 }
 
 /// An expired session is refused for good: the client starts another,
@@ -334,6 +372,107 @@ fn an_expired_session_is_refused_and_the_client_starts_another() {
         "started at the agent's time"
     );
     assert_eq!(client.sessions()[&served.agent].next, 2);
+}
+
+/// A call whose answer was lost goes again with its sequence, answered
+/// from the window while the agent holds its session, expired or not.
+/// Once the session is collected nothing can say whether it ran: the
+/// client says so, and never runs it again. A first call in a session
+/// never created goes again in a new session once no leader can create
+/// the old one, and is lost past the time the old one could have been
+/// collected.
+#[test]
+fn a_call_whose_answer_was_lost_is_answered_once_or_lost() {
+    let served = Served::start(Arc::new(vos_node::NoHooks));
+    let start = served.at_bucket_start();
+    let mut client = served.client(1);
+    assert_eq!(done(served.call(&mut client, 1)), 1);
+    // The second call runs, and its answer is lost.
+    let before = client.sessions();
+    assert_eq!(done(served.call(&mut client, 2)), 3);
+    let kept = before[&served.agent];
+    let session = Session {
+        key: SigningKey::from_bytes(&[1; 32]).verifying_key().to_bytes(),
+        name: kept.name,
+        t0: kept.t0,
+    };
+    let again = |kept: client::Kept| {
+        let sessions = HashMap::from([(served.agent, kept)]);
+        let mut client = Client::resume(
+            &served.target,
+            SigningKey::from_bytes(&[1; 32]),
+            sessions,
+            HashMap::new(),
+        );
+        client.repeats_unknown(served.agent);
+        client.call(served.agent, COUNTER, served.increment, &2u64.encode())
+    };
+
+    served
+        .clock
+        .store(start + defaults::SESSION_EXPIRY_MS + 1, Ordering::SeqCst);
+    assert!(served.now() < expiry::due(expiry::bucket(start)));
+    assert_eq!(done(again(kept).unwrap()), 3, "from the window");
+    assert_eq!(served.value(&client), 3);
+
+    served
+        .clock
+        .store(expiry::due(expiry::bucket(start)), Ordering::SeqCst);
+    wait_until("the idle leader collects the session", || {
+        !served.holds(&session)
+    });
+    assert!(matches!(again(kept), Err(ClientError::Lost)));
+    assert_eq!(served.value(&client), 3, "and it did not run again");
+
+    // A session whose first call reached no leader.
+    let now = served.now();
+    let never = client::Kept {
+        name: [7; 16],
+        t0: now,
+        next: 1,
+    };
+    served
+        .clock
+        .store(now + 2 * defaults::SESSION_SKEW_MS, Ordering::SeqCst);
+    assert_eq!(
+        again(never).unwrap(),
+        Answer::TimedOut,
+        "a leader could still create it"
+    );
+    served
+        .clock
+        .store(now + 2 * defaults::SESSION_SKEW_MS + 1, Ordering::SeqCst);
+    assert_eq!(done(again(never).unwrap()), 5, "in a new session, once");
+    let old = client::Kept {
+        name: [8; 16],
+        t0: served.now() - defaults::SESSION_EXPIRY_MS,
+        next: 1,
+    };
+    assert!(matches!(again(old), Err(ClientError::Lost)));
+    assert_eq!(served.value(&client), 5);
+}
+
+/// A batch whose time makes the first expiry row due sweeps first: an
+/// expired session is gone once the next call is answered.
+#[test]
+fn a_busy_leader_sweeps_in_its_batches() {
+    let served = Served::start(Arc::new(vos_node::NoHooks));
+    let start = served.at_bucket_start();
+    let mut first = served.client(1);
+    let mut second = served.client(2);
+    assert_eq!(done(served.call(&mut first, 1)), 1);
+    assert_eq!(done(served.call(&mut second, 1)), 2);
+    let held = first.session(served.agent);
+    served
+        .clock
+        .store(expiry::due(expiry::bucket(start)) - 1, Ordering::SeqCst);
+    assert_eq!(done(served.call(&mut second, 1)), 3);
+    assert!(served.holds(&held), "not due yet");
+    served
+        .clock
+        .store(expiry::due(expiry::bucket(start)), Ordering::SeqCst);
+    assert_eq!(done(served.call(&mut second, 1)), 4);
+    assert!(!served.holds(&held));
 }
 
 #[test]

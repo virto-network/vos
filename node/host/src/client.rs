@@ -16,7 +16,7 @@ use vos_wire::ingress::{
     Rejection, call_message, query_message,
 };
 use vos_wire::schema::Schema;
-use vos_wire::{Decode, Encode};
+use vos_wire::{Decode, Encode, defaults};
 
 use crate::tls::{self, Trust};
 
@@ -31,6 +31,10 @@ pub enum ClientError {
     OtherAgent,
     /// The node names itself by a key other than the one its TLS showed.
     NotTheNode,
+    /// A call whose fate was unknown met its session gone: it may have
+    /// run, and nothing can say. Its session was collected, or may have
+    /// been.
+    Lost,
 }
 
 /// A node's ingress, and how this client trusts it.
@@ -438,6 +442,17 @@ pub struct Kept {
     pub next: u64,
 }
 
+/// What became of a call whose fate was unknown, once its session was
+/// refused.
+enum Fate {
+    /// Copies of it may still run.
+    InTransit,
+    /// It never ran, and never can: it may go again in a new session.
+    NeverRan,
+    /// It may have run, and nothing can say.
+    Lost,
+}
+
 /// Redirects a call follows before it answers what the last node said.
 const REDIRECTS: usize = 4;
 /// Times a call goes to another replica, after a failure, before it
@@ -457,7 +472,9 @@ const RENEWALS: usize = 2;
 /// started too far from the agent's time): only then does the client start
 /// another. After an error the call may have run or not: call again with
 /// the same request, which goes with the same sequence, and the agent runs
-/// it once.
+/// it once. A process that calls again later, as the CLI does, says so
+/// with [`Client::repeats_unknown`]; once the agent has collected the
+/// session, such a call ends [`ClientError::Lost`].
 pub struct Client {
     http: Http,
     key: SigningKey,
@@ -511,9 +528,10 @@ impl Client {
     }
 
     /// Say that the next call to `agent` repeats one whose fate is unknown,
-    /// made lately, as a process that kept it pending can: a refusal saying
-    /// it never ran then proves nothing, while copies of the earlier one
-    /// may still be on their way.
+    /// as a process that kept it pending can, however long ago: a refusal
+    /// of its session then proves nothing while copies of the earlier one
+    /// may be on their way, and once the session may be collected, the
+    /// call ends [`ClientError::Lost`].
     pub fn repeats_unknown(&self, agent: AgentId) {
         self.unknown
             .lock()
@@ -699,24 +717,48 @@ impl Client {
                     redirects += 1;
                     self.follow(&replicas[(redirects - 1) % replicas.len()])?;
                 }
-                // An earlier attempt may still run in this session, at a
-                // replica forwarding it: a new session could run it twice.
-                Answer::Rejected(Rejection::StaleSession { .. }) if inconclusive => {
-                    return Ok(Answer::TimedOut);
+                // An earlier attempt may have run, or may yet.
+                Answer::Rejected(Rejection::StaleSession { now }) if inconclusive => {
+                    match self.unknown_fate(agent, *now) {
+                        Fate::Lost => {
+                            self.renew(agent);
+                            return Err(ClientError::Lost);
+                        }
+                        Fate::InTransit => return Ok(Answer::TimedOut),
+                        Fate::NeverRan if renewals < RENEWALS => {
+                            renewals += 1;
+                            inconclusive = false;
+                            self.learn_time(*now);
+                            self.renew(agent);
+                        }
+                        Fate::NeverRan => return Ok(answer),
+                    }
                 }
                 // Not consumed: the same request goes again in a new session.
                 Answer::Rejected(Rejection::StaleSession { now }) if renewals < RENEWALS => {
                     renewals += 1;
-                    let offset = i128::from(*now) - i128::from(crate::wall_clock());
-                    *self.offset.lock().expect("the offset") =
-                        offset.clamp(i64::MIN.into(), i64::MAX.into()) as i64;
+                    self.learn_time(*now);
                     self.renew(agent);
                 }
+                // Timed by refine, past the lane: the next attempt meets the
+                // lane's refusal, with the agent's time.
+                Answer::Refused(refusal::STALE_SESSION) if inconclusive => {
+                    return Ok(Answer::TimedOut);
+                }
+                // An expired session's calls that ran are answered from its
+                // window: refused, this one never ran, and never will.
                 Answer::Refused(refusal::EXPIRED | refusal::STALE_SESSION)
                     if renewals < RENEWALS =>
                 {
                     renewals += 1;
+                    inconclusive = false;
                     self.renew(agent);
+                }
+                // The earlier attempt may still create the session.
+                Answer::Refused(refusal::SESSIONS_FULL | refusal::KEY_SESSIONS_FULL)
+                    if inconclusive =>
+                {
+                    return Ok(Answer::TimedOut);
                 }
                 Answer::Stopped
                 | Answer::Unavailable
@@ -742,6 +784,45 @@ impl Client {
                 _ => return Ok(answer),
             }
         }
+    }
+
+    /// What a call whose fate is unknown can be, its session refused as one
+    /// the agent does not hold at the agent's time `now`.
+    fn unknown_fate(&self, agent: AgentId, now: u64) -> Fate {
+        let Some(kept) = self
+            .sessions
+            .lock()
+            .expect("the sessions")
+            .get(&agent)
+            .copied()
+        else {
+            return Fate::InTransit;
+        };
+        // Answered in, the session was created, and is gone.
+        if kept.next > 1 {
+            return Fate::Lost;
+        }
+        let skew = defaults::SESSION_SKEW_MS;
+        // A leader may still create it, or will once time reaches a t0
+        // ahead.
+        if now <= kept.t0.saturating_add(2 * skew) {
+            return Fate::InTransit;
+        }
+        // Never created: collecting it would need the agent's time past
+        // its t0 less the skew plus the expiry. And no leader's clock is
+        // now near enough its t0 to create it.
+        if now <= kept.t0.saturating_add(defaults::SESSION_EXPIRY_MS) - skew {
+            return Fate::NeverRan;
+        }
+        Fate::Lost
+    }
+
+    /// Take the agent's time `now`, as a node reported it, as the offset
+    /// from this client's clock.
+    fn learn_time(&self, now: u64) {
+        let offset = i128::from(now) - i128::from(crate::wall_clock());
+        *self.offset.lock().expect("the offset") =
+            offset.clamp(i64::MIN.into(), i64::MAX.into()) as i64;
     }
 
     /// Call the node `contact` names from now on, trusted as this client
@@ -820,7 +901,9 @@ impl Client {
         self.query_with(agent, instance, method, arguments, not_after, consistency)
     }
 
-    /// Run a query on the state `consistency` asks for.
+    /// Run a query on the state `consistency` asks for. `not_after` is by
+    /// this client's clock: it goes moved to the agents' time, as a node
+    /// last reported it, and once more after a node says it is stale.
     pub fn query_with(
         &self,
         agent: AgentId,
@@ -831,9 +914,40 @@ impl Client {
         consistency: Consistency,
     ) -> Result<Answer, ClientError> {
         let identity = self.identity(agent)?;
+        let offset = || *self.offset.lock().expect("the offset");
+        let used = offset();
+        let answer = self.query_until(
+            agent,
+            &identity,
+            (instance, method, arguments),
+            not_after.saturating_add_signed(used),
+            consistency,
+        )?;
+        let Answer::Rejected(Rejection::StaleQuery { now }) = answer else {
+            return Ok(answer);
+        };
+        self.learn_time(now);
+        self.query_until(
+            agent,
+            &identity,
+            (instance, method, arguments),
+            not_after.saturating_add_signed(offset()),
+            consistency,
+        )
+    }
+
+    /// A query good until `not_after`, by the agents' time.
+    fn query_until(
+        &self,
+        agent: AgentId,
+        identity: &[u8; 32],
+        (instance, method, arguments): (InstanceId, MethodId, &[u8]),
+        not_after: u64,
+        consistency: Consistency,
+    ) -> Result<Answer, ClientError> {
         let key = self.key.verifying_key().to_bytes();
         let message = query_message(
-            &identity,
+            identity,
             &key,
             not_after,
             consistency,

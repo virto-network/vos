@@ -180,6 +180,8 @@ pub(crate) enum Pending {
         to: AgentId,
         sequence: u64,
     },
+    /// The leader's sweep of expired sessions.
+    Sweep,
 }
 
 impl Pending {
@@ -192,6 +194,7 @@ impl Pending {
                 to: *to,
                 sequence: *sequence,
             },
+            Pending::Sweep => Input::Sweep,
         }
     }
 
@@ -199,7 +202,7 @@ impl Pending {
         match self {
             Pending::Request(request, _) => request.arguments.len(),
             Pending::Message(message) => message.arguments.len(),
-            Pending::Admin(..) | Pending::Ack { .. } => 0,
+            Pending::Admin(..) | Pending::Ack { .. } | Pending::Sweep => 0,
         }
     }
 
@@ -1056,6 +1059,8 @@ pub(crate) fn reply(step: &Step) -> Reply {
     match step {
         Step::Ran(run) => Reply::Ran(run.outcome.clone()),
         Step::Refused { code, .. } => Reply::Refused(*code),
+        // Not a request's step: the agent paired them wrongly.
+        Step::Swept { .. } => Reply::Failed,
     }
 }
 

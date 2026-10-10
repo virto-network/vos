@@ -293,6 +293,11 @@ pub mod refusal {
     /// A new session whose creation time is too far from the agent's:
     /// start one with a time near it.
     pub const STALE_SESSION: u32 = 4;
+    /// A new session, while the agent holds as many as it may: none is
+    /// created until some are collected.
+    pub const SESSIONS_FULL: u32 = 5;
+    /// A new session, while its key holds as many as it may at the agent.
+    pub const KEY_SESSIONS_FULL: u32 = 6;
 }
 
 /// The host calls each kind of program may make, and what a JAM node does

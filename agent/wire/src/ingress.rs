@@ -105,9 +105,10 @@ pub enum Rejection {
     /// first.
     #[codec(index = 3)]
     Ahead,
-    /// A query past its `not_after`, or one too far ahead.
+    /// A query past its `not_after`, or one too far ahead of `now`, the
+    /// node's time: sign it again with a `not_after` near it.
     #[codec(index = 4)]
-    StaleQuery,
+    StaleQuery { now: u64 },
     /// A new session whose creation time is too far from the agent's time,
     /// `now`: start one with a time near it.
     #[codec(index = 5)]

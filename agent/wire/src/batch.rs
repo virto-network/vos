@@ -57,6 +57,10 @@ pub enum Input {
     /// `sequence`: their outbox entries can go. The node sends it.
     #[codec(index = 3)]
     Ack { to: AgentId, sequence: u64 },
+    /// Collect the sessions whose expiry rows are due at the batch's time.
+    /// The node puts it first in a batch.
+    #[codec(index = 4)]
+    Sweep,
 }
 
 /// A client request, in its session's sequence for this agent.

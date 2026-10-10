@@ -17,7 +17,7 @@ use vos_wire::result::{
     Attest, InputRef, InstanceGas, Outcome, Outgoing, ResultWriter, Run, Step, Write,
 };
 use vos_wire::schema::Schema;
-use vos_wire::{Decode, Encode, defaults, keys};
+use vos_wire::{Decode, Encode, defaults, expiry, keys};
 
 use crate::host::{STATE_SCAN, ecalli, gas, ptr, state_read, state_read_into, unserved};
 use crate::machines::{ARGUMENTS, Exit, Machine, Unavailable};
@@ -80,6 +80,14 @@ fn record<T: Decode>(key: &[u8]) -> Result<Option<T>, Corrupt> {
 
 /// Applied rows under `prefix` after `after`, a page at a time.
 fn applied_rows(prefix: &[u8], after: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Corrupt> {
+    scan_page(prefix, after)
+        .into_iter()
+        .map(|(key, value)| Ok((key, unstored(&value).ok_or(Corrupt)?.to_vec())))
+        .collect()
+}
+
+/// A page of rows under `prefix` after `after`, their values as stored.
+fn scan_page(prefix: &[u8], after: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut capacity = SCAN_PAGE;
     let out = loop {
         let mut out: Vec<u8> = Vec::with_capacity(capacity);
@@ -113,11 +121,11 @@ fn applied_rows(prefix: &[u8], after: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, 
     while at < out.len() {
         // A row the node framed wrongly is the node's bug, not state the
         // agent did not write: it traps the refine.
-        let ((key, value), used) = <(Vec<u8>, Vec<u8>)>::decode(&out[at..]).expect("a row");
+        let (row, used) = <(Vec<u8>, Vec<u8>)>::decode(&out[at..]).expect("a row");
         at += used;
-        rows.push((key, unstored(&value).ok_or(Corrupt)?.to_vec()));
+        rows.push(row);
     }
-    Ok(rows)
+    rows
 }
 
 /// What one refine has committed so far, above applied state.
@@ -187,6 +195,45 @@ impl Ord for ByName {
     }
 }
 
+/// The sessions the agent holds, in all and per key, as this refine has
+/// created them so far: the applied counts, each read once, and the
+/// batch's.
+#[derive(Default)]
+struct Counts {
+    live: Option<u64>,
+    keys: BTreeMap<[u8; 32], u64>,
+}
+
+impl Counts {
+    /// The cap a new session of `key` would pass, if any.
+    fn full(&mut self, key: &[u8; 32]) -> Result<Option<u32>, Corrupt> {
+        let live = match self.live {
+            Some(live) => live,
+            None => *self
+                .live
+                .insert(record::<u64>(&keys::live_sessions())?.unwrap_or(0)),
+        };
+        if live >= defaults::MAX_SESSIONS {
+            return Ok(Some(refusal::SESSIONS_FULL));
+        }
+        let held = match self.keys.get(key) {
+            Some(held) => *held,
+            None => {
+                let held = record::<u64>(&keys::key_sessions(key))?.unwrap_or(0);
+                self.keys.insert(*key, held);
+                held
+            }
+        };
+        Ok((held >= defaults::MAX_KEY_SESSIONS).then_some(refusal::KEY_SESSIONS_FULL))
+    }
+
+    /// A new session of `key`, which [`Counts::full`] let through.
+    fn add(&mut self, key: &[u8; 32]) {
+        *self.live.as_mut().expect("the live count") += 1;
+        *self.keys.get_mut(key).expect("the key's count") += 1;
+    }
+}
+
 /// A session as applied state holds it.
 fn held(session: &Session) -> Result<Held, Corrupt> {
     match record::<SessionId>(&keys::session_index_key(session))? {
@@ -208,6 +255,7 @@ fn run_batch(agent: AgentId, batch: Batch) -> Vec<u8> {
     };
     let mut sessions: BTreeMap<ByName, Held> = BTreeMap::new();
     let mut pairs: BTreeMap<AgentId, u64> = BTreeMap::new();
+    let mut counts = Counts::default();
     let mut result = ResultWriter::new(batch.version, batch.time, batch.seed);
     for (index, input) in batch.inputs.into_iter().enumerate() {
         let index = index as u32;
@@ -223,12 +271,14 @@ fn run_batch(agent: AgentId, batch: Batch) -> Vec<u8> {
         let limit = match &input {
             Input::Request(request) => limit(&base, request.instance, request.method),
             Input::Message(message) => limit(&base, message.instance, message.method),
-            Input::Admin(_) | Input::Ack { .. } => 0,
+            Input::Admin(_) | Input::Ack { .. } | Input::Sweep => 0,
         };
         if gas() < limit + reserve {
             break;
         }
         let admin = matches!(input, Input::Admin(_));
+        // The key of a session this step creates.
+        let mut creates = None;
         let (step, mark) = match input {
             Input::Request(request) => {
                 let held = match sessions.get(&ByName(request.session)) {
@@ -246,6 +296,11 @@ fn run_batch(agent: AgentId, batch: Batch) -> Vec<u8> {
                 };
                 let refusal = match held {
                     Err(Corrupt) => Some(refusal::UNREADABLE),
+                    // A duplicate first, even in an expired session: the
+                    // leader answers it from the window.
+                    Ok((_, Some(mark))) if request.sequence <= mark.sequence => {
+                        Some(refusal::SEQUENCE)
+                    }
                     Ok((_, Some(mark)))
                         if base.time > mark.time.saturating_add(defaults::SESSION_EXPIRY_MS) =>
                     {
@@ -261,6 +316,16 @@ fn run_batch(agent: AgentId, batch: Batch) -> Vec<u8> {
                     {
                         Some(refusal::SEQUENCE)
                     }
+                    // Neither held nor created by an earlier step: this one
+                    // creates it, within the caps.
+                    Ok((_, None)) => match counts.full(&request.session.key) {
+                        Ok(None) => {
+                            creates = Some(request.session.key);
+                            None
+                        }
+                        Ok(Some(code)) => Some(code),
+                        Err(Corrupt) => Some(refusal::UNREADABLE),
+                    },
                     Ok(_) => None,
                 };
                 if let Some(code) = refusal {
@@ -316,11 +381,15 @@ fn run_batch(agent: AgentId, batch: Batch) -> Vec<u8> {
             }
             Input::Admin(admin) => (self::admin(admin), None),
             Input::Ack { to, sequence } => (acknowledge(to, sequence), None),
+            Input::Sweep => (sweep(base.time), None),
         };
         // A step the result cannot hold waits, with every later input, for
         // the next batch; one alone always fits (`cap::STEP_RESULT`).
         if !result.push(&step) {
             break;
+        }
+        if let Some(key) = creates {
+            counts.add(&key);
         }
         if let Step::Ran(run) = &step {
             for write in &run.writes {
@@ -432,6 +501,35 @@ fn acknowledge(to: AgentId, sequence: u64) -> Step {
         attests: Vec::new(),
         gas_used: 0,
     })
+}
+
+/// The expiry rows due at `time`, oldest first, at most
+/// [`defaults::SWEEP_LIMIT`]. Accumulate reads the sessions and decides;
+/// a row whose key is not an expiry key is passed over.
+fn sweep(time: u64) -> Step {
+    let prefix = keys::expiry_prefix();
+    let mut due = Vec::new();
+    let mut after = Vec::new();
+    'pages: loop {
+        let rows = scan_page(&prefix, &after);
+        let Some((last, _)) = rows.last() else {
+            break;
+        };
+        after = last.clone();
+        for (key, _) in &rows {
+            let Some((bucket, session)) = keys::expiry_entry(key) else {
+                continue;
+            };
+            if expiry::due(bucket) > time {
+                break 'pages;
+            }
+            due.push((bucket, session));
+            if due.len() == defaults::SWEEP_LIMIT {
+                break 'pages;
+            }
+        }
+    }
+    Step::Swept { due }
 }
 
 /// An operator command: install a package or set a role. Its writes are

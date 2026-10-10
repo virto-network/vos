@@ -20,6 +20,24 @@ pub mod records;
 pub mod result;
 pub mod schema;
 
+/// The expiry index's buckets.
+pub mod expiry {
+    use crate::defaults::{SESSION_BUCKET_MS, SESSION_EXPIRY_MS};
+
+    /// The bucket a time falls in.
+    pub const fn bucket(time: u64) -> u64 {
+        time / SESSION_BUCKET_MS
+    }
+
+    /// The batch time from which every session whose mark lies in
+    /// `bucket` has expired.
+    pub const fn due(bucket: u64) -> u64 {
+        (bucket + 1)
+            .saturating_mul(SESSION_BUCKET_MS)
+            .saturating_add(SESSION_EXPIRY_MS)
+    }
+}
+
 pub use scale;
 pub use scale::{Decode, DecodeError, Encode};
 
@@ -34,6 +52,22 @@ pub mod defaults {
     /// A new session's creation time must be this close to the work
     /// result's time, in milliseconds.
     pub const SESSION_SKEW_MS: u64 = 60 * 1000;
+    /// The expiry index files sessions by their time divided by this, in
+    /// milliseconds: a session is collected at most this long after it
+    /// expires.
+    pub const SESSION_BUCKET_MS: u64 = 5 * 60 * 1000;
+    /// The most expiry rows one sweep lists.
+    pub const SWEEP_LIMIT: usize = 32;
+    /// The most sessions an agent holds: more are refused until some are
+    /// collected.
+    pub const MAX_SESSIONS: u64 = 1 << 16;
+    /// The most sessions one key holds at an agent.
+    pub const MAX_KEY_SESSIONS: u64 = 64;
+
+    // An expired session's batch time is past its t0 plus the skew: it was
+    // created within the skew of t0, so a collected session can never be
+    // created again.
+    const _: () = assert!(SESSION_EXPIRY_MS >= 2 * SESSION_SKEW_MS);
     /// A handler's gas limit when its schema declares none: about 500
     /// gets, 150 puts or 5,000 register-only operations, or about 16,000
     /// BLAKE2b compressions.

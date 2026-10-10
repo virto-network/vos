@@ -8,10 +8,11 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use ed25519_dalek::SigningKey;
-use vos_node::client::{self, Client, Operator, Target};
+use vos_node::client::{self, Client, ClientError, Operator, Target};
 use vos_node::tls::{IngressTls, Trust};
 use vos_node::{ADMIN_TOKEN, Config, NODE_KEY, Node, Space};
 use vos_wire::Encode;
+use vos_wire::abi::refusal;
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal};
 use vos_wire::ingress::{Answer, Consistency, Install};
 use vos_wire::result::Outcome;
@@ -447,12 +448,9 @@ struct Kept {
     sessions: HashMap<AgentId, client::Kept>,
     identities: HashMap<AgentId, [u8; 32]>,
     floors: HashMap<AgentId, u64>,
-    pending: HashMap<AgentId, ([u8; 32], u64)>,
+    /// Each agent's call left unanswered, by its digest.
+    pending: HashMap<AgentId, [u8; 32]>,
 }
-
-/// How long a call left unanswered may still be on its way to a leader:
-/// a replica forwards it for 30 s.
-const IN_TRANSIT_MS: u64 = 60_000;
 
 impl Kept {
     fn path(key: &Path) -> PathBuf {
@@ -461,45 +459,62 @@ impl Kept {
         PathBuf::from(path)
     }
 
-    /// What the key kept; nothing when there is no file, or one this
-    /// command did not write.
-    fn load(key: &Path) -> Self {
-        let Ok(text) = std::fs::read_to_string(Self::path(key)) else {
-            return Self::default();
+    /// What the key kept; nothing when there is no file. A file with a
+    /// line this command cannot read is refused, not dropped: it may hold
+    /// a call whose fate is unknown.
+    fn load(key: &Path) -> Result<Self, String> {
+        let path = Self::path(key);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(error) => return Err(format!("{}: {error}", path.display())),
         };
-        Self::parse(&text).unwrap_or_default()
+        Self::parse(&text).map_err(|line| {
+            format!(
+                "{}: a line this command cannot read ({line:?}); fix or remove it",
+                path.display()
+            )
+        })
     }
 
-    fn parse(text: &str) -> Option<Self> {
+    /// The kept file's contents, or the first line that does not read.
+    fn parse(text: &str) -> Result<Self, String> {
         let mut kept = Self::default();
         let agent = |text: &str| text.parse().ok().map(AgentId);
         for line in text.lines() {
             let fields: Vec<&str> = line.split_whitespace().collect();
-            match fields.as_slice() {
-                ["session", id, name, t0, next] => {
-                    let name = hex::decode(name).ok()?.try_into().ok()?;
-                    let session = client::Kept {
-                        name,
-                        t0: t0.parse().ok()?,
-                        next: next.parse().ok()?,
-                    };
-                    kept.sessions.insert(agent(id)?, session);
+            let mut read = || -> Option<()> {
+                match fields.as_slice() {
+                    [] => {}
+                    ["session", id, name, t0, next] => {
+                        let name = hex::decode(name).ok()?.try_into().ok()?;
+                        let session = client::Kept {
+                            name,
+                            t0: t0.parse().ok()?,
+                            next: next.parse().ok()?,
+                        };
+                        kept.sessions.insert(agent(id)?, session);
+                    }
+                    ["identity", id, identity] => {
+                        kept.identities
+                            .insert(agent(id)?, key_bytes(identity).ok()?);
+                    }
+                    ["at", id, at] => {
+                        kept.floors.insert(agent(id)?, at.parse().ok()?);
+                    }
+                    // Earlier versions kept the time it was left too.
+                    ["pending", id, digest] | ["pending", id, digest, _] => {
+                        kept.pending.insert(agent(id)?, key_bytes(digest).ok()?);
+                    }
+                    _ => return None,
                 }
-                ["identity", id, identity] => {
-                    kept.identities
-                        .insert(agent(id)?, key_bytes(identity).ok()?);
-                }
-                ["at", id, at] => {
-                    kept.floors.insert(agent(id)?, at.parse().ok()?);
-                }
-                ["pending", id, digest, time] => {
-                    kept.pending
-                        .insert(agent(id)?, (key_bytes(digest).ok()?, time.parse().ok()?));
-                }
-                _ => return None,
-            }
+                Some(())
+            };
+            read().ok_or_else(|| line.to_string())?;
         }
-        Some(kept)
+        Ok(kept)
     }
 
     fn save(&self, key: &Path) -> Result<(), String> {
@@ -519,12 +534,8 @@ impl Kept {
         for (agent, at) in &self.floors {
             text.push_str(&format!("at {} {at}\n", agent.0));
         }
-        for (agent, (digest, time)) in &self.pending {
-            text.push_str(&format!(
-                "pending {} {} {time}\n",
-                agent.0,
-                hex::encode(digest)
-            ));
+        for (agent, digest) in &self.pending {
+            text.push_str(&format!("pending {} {}\n", agent.0, hex::encode(digest)));
         }
         // Replaced whole: a write cut short must not lose a pending call.
         let path = Self::path(key);
@@ -545,7 +556,7 @@ fn invoke(call: &CallArgs, query: Option<bool>) -> Result<(), String> {
     let agent = AgentId(call.agent);
     let instance = InstanceId(call.instance);
     let target = call.node.target()?;
-    let mut kept = Kept::load(&call.key);
+    let mut kept = Kept::load(&call.key)?;
     let mut client = Client::resume(&target, key, kept.sessions.clone(), kept.identities.clone());
     for (agent, at) in &kept.floors {
         client.raise_floor(*agent, *at);
@@ -572,25 +583,31 @@ fn invoke(call: &CallArgs, query: Option<bool>) -> Result<(), String> {
         let digest =
             vos_pvm::precompile::blake2b_256(&(instance, method, arguments.clone()).encode());
         match kept.pending.remove(&agent) {
-            Some((pending, _)) if pending != digest => client.renew(agent),
-            // Sent again soon after: copies of the first may be on their
-            // way still, so a refusal now does not prove it never ran.
-            Some((_, time)) if vos_node::wall_clock() < time + IN_TRANSIT_MS => {
-                client.repeats_unknown(agent);
+            Some(pending) if pending != digest => {
+                eprintln!(
+                    "an earlier call to agent {} was never answered: whether it ran stays unknown",
+                    agent.0
+                );
+                client.renew(agent);
             }
-            _ => {}
+            // A refusal of its session proves nothing of the first: copies
+            // may be on their way, or its session collected.
+            Some(_) => client.repeats_unknown(agent),
+            None => {}
         }
         let answer = client.call(agent, instance, method, &arguments);
-        // Unanswered: the call may have run, or may yet.
-        if matches!(
-            answer,
-            Err(_)
-                | Ok(Answer::Stopped
-                    | Answer::NotLeader { .. }
-                    | Answer::Unavailable
-                    | Answer::TimedOut)
-        ) {
-            kept.pending.insert(agent, (digest, vos_node::wall_clock()));
+        // Unanswered: the call may have run, or may yet. A lost one can be
+        // answered no more.
+        let unanswered = match &answer {
+            Err(ClientError::Lost) => false,
+            Err(_) => true,
+            Ok(answer) => matches!(
+                answer,
+                Answer::Stopped | Answer::NotLeader { .. } | Answer::Unavailable | Answer::TimedOut
+            ),
+        };
+        if unanswered {
+            kept.pending.insert(agent, digest);
         }
         answer
     };
@@ -600,6 +617,9 @@ fn invoke(call: &CallArgs, query: Option<bool>) -> Result<(), String> {
     kept.save(&call.key)?;
     match answer {
         Ok(answer) => print_answer(&answer),
+        Err(ClientError::Lost) => Err(
+            "the call may have run, and its session is gone: its answer is lost for good".into(),
+        ),
         Err(error) if query.is_none() => Err(format!(
             "{}; the call may have run: run it again to learn its answer",
             failed(error)
@@ -620,7 +640,15 @@ fn describe(answer: &Answer) -> String {
         } => {
             format!("failed {code} {}", hex::encode(detail))
         }
-        Answer::Refused(code) => format!("refused {code}"),
+        Answer::Refused(code) => match *code {
+            refusal::SESSIONS_FULL => {
+                "refused: the agent holds as many sessions as it may; try again later".into()
+            }
+            refusal::KEY_SESSIONS_FULL => {
+                "refused: this key holds as many sessions at the agent as it may".into()
+            }
+            code => format!("refused {code}"),
+        },
         other => format!("{other:?}"),
     }
 }

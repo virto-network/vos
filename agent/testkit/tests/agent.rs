@@ -9,7 +9,7 @@ use proptest::prelude::*;
 use vos_pvm::ExitReason;
 use vos_pvm::accumulate_host::{AccumulateContext, ServiceStorage};
 use vos_pvm::pool::MachinePool;
-use vos_pvm::refine::{Machine, PreparedProgram};
+use vos_pvm::refine::{Machine, MemoryModel, PreparedProgram};
 use vos_pvm::refine_host::{RefineContext, StateReader};
 use vos_testkit::{Testkit, decode, program_hash};
 use vos_wire::abi::{cap, code, failure, refusal};
@@ -18,10 +18,10 @@ use vos_wire::ids::{
     AgentId, InstanceId, MethodId, Principal, ProgramHash, Session, SessionId, SessionRef,
 };
 use vos_wire::jam::{AccumulateInput, Operand, RefineArgs};
-use vos_wire::records::{SessionMark, unstored};
+use vos_wire::records::{SessionMark, stored, unstored};
 use vos_wire::result::{InputRef, Outcome, Run, Step, WorkResult, Write};
 use vos_wire::schema::Schema;
-use vos_wire::{Decode, Encode, defaults, keys};
+use vos_wire::{Decode, Encode, defaults, expiry, keys};
 
 const AGENT: AgentId = AgentId(7);
 const COUNTER: InstanceId = InstanceId(1);
@@ -127,8 +127,8 @@ fn serve(id: u64, machine: &mut Machine, programs: &HashMap<[u8; 32], Vec<u8>>) 
 /// A node's view of one agent: its program, the pool, programs by hash and
 /// the agent's storage.
 struct Node {
-    agent: Vec<u8>,
-    accumulate: PreparedProgram,
+    /// The agent, prepared once for every refine and accumulate.
+    program: Arc<PreparedProgram>,
     /// `None` leaves the loader to build every machine, as on a JAM node.
     pool: Option<Arc<MachinePool>>,
     /// Whether refine may read applied state; a JAM node cannot until
@@ -145,10 +145,14 @@ impl Node {
     }
 
     fn with(pool: bool, serves_state: bool) -> Self {
-        let agent = elf("default/target/riscv64em-vos/release/vos-agent.elf");
+        // Preparing the agent takes most of a test's setup: once a run.
+        static AGENT: std::sync::OnceLock<Arc<PreparedProgram>> = std::sync::OnceLock::new();
+        let program = AGENT.get_or_init(|| {
+            let agent = elf("default/target/riscv64em-vos/release/vos-agent.elf");
+            Arc::new(PreparedProgram::new(&agent).unwrap())
+        });
         Self {
-            accumulate: PreparedProgram::new(&agent).unwrap(),
-            agent,
+            program: Arc::clone(program),
             pool: pool.then(|| Arc::new(MachinePool::new())),
             serves_state,
             programs: HashMap::new(),
@@ -185,7 +189,9 @@ impl Node {
             package_hash: [0; 32],
         }
         .encode();
-        let mut context = RefineContext::load(&self.agent, &arguments, gas).unwrap();
+        let mut context =
+            RefineContext::load_prepared(&self.program, &arguments, gas, MemoryModel::Auto)
+                .unwrap();
         if let Some(pool) = &self.pool {
             context = context.with_pool(Arc::clone(pool));
         }
@@ -217,7 +223,7 @@ impl Node {
         .encode();
         let inputs = [input];
         let invocation = AccumulateContext::load(
-            &self.accumulate,
+            &self.program,
             0,
             u64::from(AGENT.0),
             &inputs,
@@ -426,7 +432,7 @@ fn setup() -> (Programs, Node, Testkit, Sessions) {
 fn ran(step: &Step) -> &Run {
     match step {
         Step::Ran(run) => run,
-        Step::Refused { .. } => panic!("refused: {step:?}"),
+        other => panic!("did not run: {other:?}"),
     }
 }
 
@@ -590,7 +596,7 @@ fn sessions_are_named_by_their_client_and_created_by_accumulate() {
     };
     let code = |step: &Step| match step {
         Step::Refused { code, .. } => *code,
-        Step::Ran(_) => panic!("ran"),
+        other => panic!("not refused: {other:?}"),
     };
     assert_eq!(named(&result.steps[0]), SessionRef::New(Box::new(first)));
     assert_eq!(named(&result.steps[2]), SessionRef::New(Box::new(first)));
@@ -704,6 +710,641 @@ fn accumulate_skips_stale_sessions_and_results_from_the_past() {
     assert_eq!(node.get(&[0x01, 4]), None);
     assert_eq!(node.value::<u64>(&keys::version()), Some(version + 1));
     assert_eq!(node.value::<u64>(&keys::batch_time()), Some(now));
+}
+
+/// A request incrementing the counter by one, in `session` at `sequence`.
+fn increment_in(programs: &Programs, session: Session, sequence: u64) -> Input {
+    Input::Request(Request {
+        session,
+        sequence,
+        caller: Principal::Client(session.key),
+        instance: COUNTER,
+        method: programs.method(COUNTER, "increment"),
+        arguments: 1u64.encode(),
+    })
+}
+
+fn refused(step: &Step) -> u32 {
+    match step {
+        Step::Refused { code, .. } => *code,
+        other => panic!("not refused: {other:?}"),
+    }
+}
+
+fn swept(step: &Step) -> Vec<(u64, SessionId)> {
+    match step {
+        Step::Swept { due } => due.clone(),
+        other => panic!("not a sweep: {other:?}"),
+    }
+}
+
+/// A session leaves whole once it has expired and its expiry row is due:
+/// its index, whole, mark, kept replies, row and counts. A session active
+/// since has its row moved instead. Before collection an expired session
+/// is refused `EXPIRED`, a duplicate of it `SEQUENCE` (the leader answers
+/// it from the window); after, its requests name a stale t0 and never run.
+#[test]
+fn sessions_are_collected_once_expired_and_moved_while_active() {
+    let (programs, mut node, _, _) = setup();
+    let now = 100 * defaults::SESSION_BUCKET_MS;
+    let bucket = expiry::bucket(now);
+    let session = |name: u8, t0: u64| Session {
+        key: [3; 32],
+        name: [name; 16],
+        t0,
+    };
+    let (idle, active) = (session(1, now), session(2, now));
+    node.batch(
+        now,
+        [0; 32],
+        vec![
+            increment_in(&programs, idle, 1),
+            increment_in(&programs, idle, 2),
+            increment_in(&programs, active, 1),
+        ],
+    );
+    let (idle_id, _) = node.session(&idle).unwrap();
+    let (active_id, _) = node.session(&active).unwrap();
+    for id in [idle_id, active_id] {
+        assert_eq!(node.get(&keys::expiry(bucket, id)), Some(Vec::new()));
+    }
+    assert_eq!(node.value::<u64>(&keys::key_sessions(&[3; 32])), Some(2));
+
+    let later = now + defaults::SESSION_EXPIRY_MS / 2;
+    node.batch(later, [0; 32], vec![increment_in(&programs, active, 2)]);
+    assert_eq!(
+        node.get(&keys::expiry(bucket, active_id)),
+        Some(Vec::new()),
+        "a request does not move its row"
+    );
+
+    let due = expiry::due(bucket);
+    let result = node.batch(due - 1, [0; 32], vec![Input::Sweep]);
+    assert_eq!(swept(&result.steps[0]), Vec::new(), "not due yet");
+    let result = node.batch(
+        due - 1,
+        [0; 32],
+        vec![
+            increment_in(&programs, idle, 3),
+            increment_in(&programs, idle, 2),
+        ],
+    );
+    assert_eq!(refused(&result.steps[0]), refusal::EXPIRED);
+    assert_eq!(refused(&result.steps[1]), refusal::SEQUENCE);
+
+    let result = node.batch(due, [0; 32], vec![Input::Sweep]);
+    assert_eq!(
+        swept(&result.steps[0]),
+        vec![(bucket, idle_id), (bucket, active_id)]
+    );
+    assert_eq!(node.session(&idle), None);
+    assert_eq!(node.get(&keys::session_of(idle_id)), None);
+    assert_eq!(node.get(&keys::session(idle_id)), None);
+    for sequence in 1..=2 {
+        assert_eq!(node.get(&keys::reply(idle_id, sequence)), None);
+    }
+    assert_eq!(node.get(&keys::expiry(bucket, idle_id)), None);
+    assert_eq!(node.get(&keys::expiry(bucket, active_id)), None);
+    assert_eq!(
+        node.get(&keys::expiry(expiry::bucket(later), active_id)),
+        Some(Vec::new()),
+        "moved to its mark's bucket"
+    );
+    assert!(node.session(&active).is_some());
+    assert_eq!(node.value::<u64>(&keys::live_sessions()), Some(1));
+    assert_eq!(node.value::<u64>(&keys::key_sessions(&[3; 32])), Some(1));
+
+    let result = node.batch(
+        due + 1,
+        [0; 32],
+        vec![
+            increment_in(&programs, idle, 3),
+            increment_in(&programs, idle, 1),
+            increment_in(&programs, session(3, due), 1),
+        ],
+    );
+    assert_eq!(refused(&result.steps[0]), refusal::STALE_SESSION);
+    assert_eq!(refused(&result.steps[1]), refusal::STALE_SESSION);
+    assert_eq!(done::<u64>(&result.steps[2]), 5, "the collected ran 2");
+    assert_eq!(
+        node.session(&session(3, due)).unwrap().0,
+        SessionId(2),
+        "ids are never reused"
+    );
+
+    // The moved row comes due in its turn, and the active session goes.
+    let due = expiry::due(expiry::bucket(later));
+    let result = node.batch(due, [0; 32], vec![Input::Sweep]);
+    assert_eq!(
+        swept(&result.steps[0]),
+        vec![(expiry::bucket(later), active_id)]
+    );
+    assert_eq!(node.session(&active), None);
+    assert_eq!(node.value::<u64>(&keys::live_sessions()), Some(1));
+}
+
+/// The caps refuse a new session, never evict one, counting the sessions
+/// a batch creates; collection makes room again, a sweep at a time.
+#[test]
+fn session_caps_refuse_new_sessions_until_some_are_collected() {
+    let (programs, mut node, _, _) = setup();
+    let now = 100 * defaults::SESSION_BUCKET_MS;
+    let one_key = |name: u64| Session {
+        key: [4; 32],
+        name: u128::from(name).to_le_bytes(),
+        t0: now,
+    };
+    let other = Session {
+        key: [5; 32],
+        name: [0; 16],
+        t0: now,
+    };
+    let mut inputs: Vec<Input> = (0..=defaults::MAX_KEY_SESSIONS)
+        .map(|name| increment_in(&programs, one_key(name), 1))
+        .collect();
+    inputs.push(increment_in(&programs, other, 1));
+    let result = node.batch(now, [0; 32], inputs);
+    let cap = defaults::MAX_KEY_SESSIONS as usize;
+    for step in &result.steps[..cap] {
+        ran(step);
+    }
+    assert_eq!(refused(&result.steps[cap]), refusal::KEY_SESSIONS_FULL);
+    ran(&result.steps[cap + 1]);
+    assert_eq!(
+        node.value::<u64>(&keys::key_sessions(&[4; 32])),
+        Some(defaults::MAX_KEY_SESSIONS)
+    );
+    let result = node.batch(
+        now + 1,
+        [0; 32],
+        vec![increment_in(&programs, one_key(999), 1)],
+    );
+    assert_eq!(refused(&result.steps[0]), refusal::KEY_SESSIONS_FULL);
+
+    // The agent's cap, at one session from it.
+    let live = cap as u64 + 1;
+    node.state.insert(
+        keys::live_sessions(),
+        stored(&(defaults::MAX_SESSIONS - 1).encode()),
+    );
+    let fresh = |key: u8| Session {
+        key: [key; 32],
+        name: [0; 16],
+        t0: now,
+    };
+    let result = node.batch(
+        now + 2,
+        [0; 32],
+        vec![
+            increment_in(&programs, fresh(6), 1),
+            increment_in(&programs, fresh(7), 1),
+            increment_in(&programs, fresh(6), 2),
+        ],
+    );
+    ran(&result.steps[0]);
+    assert_eq!(refused(&result.steps[1]), refusal::SESSIONS_FULL);
+    ran(&result.steps[2]);
+    node.state
+        .insert(keys::live_sessions(), stored(&(live + 1).encode()));
+
+    // Past expiry, a sweep at a time, at most `SWEEP_LIMIT` each.
+    let due = expiry::due(expiry::bucket(now));
+    let mut sweeps = 0;
+    loop {
+        let result = node.batch(due, [0; 32], vec![Input::Sweep]);
+        let listed = swept(&result.steps[0]).len();
+        assert!(listed <= defaults::SWEEP_LIMIT);
+        if listed == 0 {
+            break;
+        }
+        sweeps += 1;
+    }
+    assert_eq!(sweeps, (live as usize + 1).div_ceil(defaults::SWEEP_LIMIT));
+    assert_eq!(node.value::<u64>(&keys::live_sessions()), Some(0));
+    assert_eq!(node.get(&keys::key_sessions(&[4; 32])), None);
+    let result = node.batch(
+        due + 1,
+        [0; 32],
+        vec![increment_in(
+            &programs,
+            Session {
+                t0: due,
+                ..one_key(999)
+            },
+            1,
+        )],
+    );
+    ran(&result.steps[0]);
+}
+
+/// Accumulate checks the caps itself, counting each new session once, and
+/// takes every row a sweep lists out of the due range, whatever the state
+/// holds of its session.
+#[test]
+fn accumulate_holds_the_caps_and_clears_the_rows_a_sweep_lists() {
+    let (_, mut node, _, _) = setup();
+    let now = 100 * defaults::SESSION_BUCKET_MS;
+    let session = |name: u8| Session {
+        key: [6; 32],
+        name: [name; 16],
+        t0: now,
+    };
+    let step = |session: SessionRef, sequence: u64| {
+        Step::Ran(Run {
+            input: InputRef::Request { session, sequence },
+            outcome: Outcome::Done(Vec::new()),
+            instances: Vec::new(),
+            writes: Vec::new(),
+            messages: Vec::new(),
+            attests: Vec::new(),
+            gas_used: 0,
+        })
+    };
+    let version = |node: &Node| node.value::<u64>(&keys::version()).unwrap_or(0);
+    node.state.insert(
+        keys::live_sessions(),
+        stored(&(defaults::MAX_SESSIONS - 1).encode()),
+    );
+    let two = WorkResult {
+        version: version(&node),
+        time: now,
+        seed: [0; 32],
+        steps: vec![
+            step(SessionRef::New(Box::new(session(1))), 1),
+            step(SessionRef::New(Box::new(session(2))), 1),
+        ],
+    };
+    let before = version(&node);
+    node.accumulate(&two.encode());
+    assert_eq!(version(&node), before, "past the agent's cap: nothing");
+    assert_eq!(node.session(&session(1)), None);
+    let one = WorkResult {
+        steps: vec![
+            step(SessionRef::New(Box::new(session(1))), 1),
+            step(SessionRef::New(Box::new(session(1))), 2),
+        ],
+        ..two.clone()
+    };
+    node.accumulate(&one.encode());
+    assert_eq!(version(&node), before + 1, "one session, named twice");
+    assert_eq!(node.session(&session(1)).unwrap().1.sequence, 2);
+    assert_eq!(
+        node.value::<u64>(&keys::live_sessions()),
+        Some(defaults::MAX_SESSIONS)
+    );
+
+    // A row listed early stays; a row without a session goes; a session
+    // without its whole loses all the triple does not name.
+    let (id, _) = node.session(&session(1)).unwrap();
+    let bucket = expiry::bucket(now);
+    let orphan = (bucket, SessionId(99));
+    node.state
+        .insert(keys::expiry(orphan.0, orphan.1), stored(&[]));
+    let sweep = |time: u64, version: u64| WorkResult {
+        version,
+        time,
+        seed: [0; 32],
+        steps: vec![Step::Swept {
+            due: vec![orphan, (bucket, id)],
+        }],
+    };
+    node.accumulate(&sweep(now + 1, version(&node)).encode());
+    assert_eq!(node.get(&keys::expiry(orphan.0, orphan.1)), None);
+    assert_eq!(node.get(&keys::expiry(bucket, id)), Some(Vec::new()));
+    node.state.remove(&keys::session_of(id));
+    let due = expiry::due(bucket);
+    node.accumulate(&sweep(due, version(&node)).encode());
+    assert_eq!(node.get(&keys::session(id)), None);
+    assert_eq!(node.get(&keys::reply(id, 1)), None);
+    assert_eq!(node.get(&keys::reply(id, 2)), None);
+    assert_eq!(node.get(&keys::expiry(bucket, id)), None);
+    assert!(
+        node.get(&keys::session_index(&session(1))).is_some(),
+        "the index needs the triple"
+    );
+    assert_eq!(
+        node.value::<u64>(&keys::live_sessions()),
+        Some(defaults::MAX_SESSIONS - 1)
+    );
+}
+
+/// Refine lists due rows by their keys alone: a key under the index that
+/// is not an expiry key is passed over, and a row whose value was not
+/// stored is listed like any.
+#[test]
+fn refine_lists_due_rows_by_their_keys() {
+    let (programs, mut node, _, _) = setup();
+    let now = 100 * defaults::SESSION_BUCKET_MS;
+    let session = Session {
+        key: [8; 32],
+        name: [8; 16],
+        t0: now,
+    };
+    node.batch(now, [0; 32], vec![increment_in(&programs, session, 1)]);
+    let (id, _) = node.session(&session).unwrap();
+    let mut malformed = keys::expiry_prefix();
+    malformed.extend_from_slice(&[0; 3]);
+    node.state.insert(malformed.clone(), stored(&[]));
+    node.state
+        .insert(keys::expiry(expiry::bucket(now), id), vec![0xff]);
+    let due = expiry::due(expiry::bucket(now));
+    let result = node.batch(due, [0; 32], vec![Input::Sweep]);
+    assert_eq!(swept(&result.steps[0]), vec![(expiry::bucket(now), id)]);
+    assert_eq!(node.session(&session), None);
+    assert!(node.state.contains_key(&malformed));
+}
+
+/// A node with the counter alone installed.
+fn counter_only() -> (Programs, Node) {
+    let programs = Programs::load();
+    let mut node = Node::new();
+    let program = node.add(&programs.counter);
+    let result = node.batch(
+        0,
+        [0; 32],
+        vec![Input::Admin(Admin::Install {
+            instance: COUNTER,
+            program,
+            attestables: vec![],
+            roles: vec![],
+        })],
+    );
+    ran(&result.steps[0]);
+    (programs, node)
+}
+
+/// The agent's session state, every row of it.
+fn session_rows(node: &Node) -> BTreeMap<Vec<u8>, Vec<u8>> {
+    let any = Session {
+        key: [0; 32],
+        name: [0; 16],
+        t0: 0,
+    };
+    let tags: Vec<Vec<u8>> = [
+        keys::session(SessionId(0)),
+        keys::reply(SessionId(0), 0),
+        keys::session_index(&any),
+        keys::session_of(SessionId(0)),
+        keys::expiry_prefix(),
+        keys::key_sessions(&[0; 32]),
+        keys::live_sessions(),
+        keys::next_session(),
+    ]
+    .iter()
+    .map(|key| key[..2].to_vec())
+    .collect();
+    node.state
+        .iter()
+        .filter(|(key, _)| tags.iter().any(|tag| key.starts_with(tag)))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+/// A session as the model holds it.
+#[derive(Clone, Debug)]
+struct Modelled {
+    id: SessionId,
+    sequence: u64,
+    time: u64,
+    /// The replies kept, by sequence.
+    replies: BTreeMap<u64, u64>,
+}
+
+/// The agent's sessions as the plan defines them, step by step.
+#[derive(Clone, Default)]
+struct SessionModel {
+    sessions: BTreeMap<Session, Modelled>,
+    rows: std::collections::BTreeSet<(u64, SessionId)>,
+    next: u64,
+    created: bool,
+    total: u64,
+}
+
+impl SessionModel {
+    fn live(&self) -> u64 {
+        self.sessions.len() as u64
+    }
+
+    fn of_key(&self, key: &[u8; 32]) -> u64 {
+        self.sessions
+            .keys()
+            .filter(|session| session.key == *key)
+            .count() as u64
+    }
+
+    /// What the sweep lists at `time`, and what it does.
+    fn sweep(&mut self, time: u64) -> Vec<(u64, SessionId)> {
+        let due: Vec<(u64, SessionId)> = self
+            .rows
+            .iter()
+            .take_while(|(bucket, _)| expiry::due(*bucket) <= time)
+            .take(defaults::SWEEP_LIMIT)
+            .copied()
+            .collect();
+        for &(bucket, id) in &due {
+            self.rows.remove(&(bucket, id));
+            let (session, modelled) = self
+                .sessions
+                .iter()
+                .find(|(_, modelled)| modelled.id == id)
+                .map(|(session, modelled)| (*session, modelled.clone()))
+                .expect("a row's session");
+            let creatable = session.t0 + defaults::SESSION_SKEW_MS;
+            if time > modelled.time + defaults::SESSION_EXPIRY_MS && time > creatable {
+                self.sessions.remove(&session);
+            } else {
+                self.rows
+                    .insert((expiry::bucket(modelled.time.max(creatable)), id));
+            }
+        }
+        due
+    }
+
+    /// A request's step in a batch at `time`, as refine decides it: run,
+    /// or refused with a code.
+    fn refine(&mut self, session: Session, sequence: u64, time: u64) -> Result<(), u32> {
+        match self.sessions.get(&session) {
+            Some(held) if sequence <= held.sequence => return Err(refusal::SEQUENCE),
+            Some(held) if time > held.time + defaults::SESSION_EXPIRY_MS => {
+                return Err(refusal::EXPIRED);
+            }
+            Some(held) if sequence != held.sequence + 1 => return Err(refusal::SEQUENCE),
+            Some(_) => {}
+            None if session.t0.abs_diff(time) > defaults::SESSION_SKEW_MS => {
+                return Err(refusal::STALE_SESSION);
+            }
+            None if sequence != 1 => return Err(refusal::SEQUENCE),
+            None if self.live() >= defaults::MAX_SESSIONS => {
+                return Err(refusal::SESSIONS_FULL);
+            }
+            None if self.of_key(&session.key) >= defaults::MAX_KEY_SESSIONS => {
+                return Err(refusal::KEY_SESSIONS_FULL);
+            }
+            None => {}
+        }
+        self.apply(session, sequence, time);
+        Ok(())
+    }
+
+    /// A request that ran, as accumulate applies it: its session created
+    /// if the state does not hold it, its mark and reply.
+    fn apply(&mut self, session: Session, sequence: u64, time: u64) {
+        self.total += 1;
+        let total = self.total;
+        let modelled = match self.sessions.get_mut(&session) {
+            Some(modelled) => modelled,
+            None => {
+                let id = SessionId(self.next);
+                self.next += 1;
+                self.created = true;
+                self.rows.insert((expiry::bucket(time), id));
+                self.sessions.entry(session).or_insert(Modelled {
+                    id,
+                    sequence: 0,
+                    time,
+                    replies: BTreeMap::new(),
+                })
+            }
+        };
+        modelled.sequence = sequence;
+        modelled.time = time;
+        modelled.replies.insert(sequence, total);
+        if let Some(old) = sequence.checked_sub(defaults::REPLY_WINDOW) {
+            modelled.replies.remove(&old);
+        }
+    }
+
+    /// The rows the agent should hold.
+    fn rows(&self) -> BTreeMap<Vec<u8>, Vec<u8>> {
+        let mut rows = BTreeMap::new();
+        let mut keys_held: BTreeMap<[u8; 32], u64> = BTreeMap::new();
+        for (session, modelled) in &self.sessions {
+            let id = modelled.id;
+            rows.insert(keys::session_index(session), stored(&id.encode()));
+            rows.insert(keys::session_of(id), stored(&session.encode()));
+            let mark = SessionMark {
+                sequence: modelled.sequence,
+                time: modelled.time,
+            };
+            rows.insert(keys::session(id), stored(&mark.encode()));
+            for (sequence, total) in &modelled.replies {
+                rows.insert(
+                    keys::reply(id, *sequence),
+                    stored(&Outcome::Done(total.encode()).encode()),
+                );
+            }
+            *keys_held.entry(session.key).or_default() += 1;
+        }
+        for (bucket, id) in &self.rows {
+            rows.insert(keys::expiry(*bucket, *id), stored(&[]));
+        }
+        for (key, count) in keys_held {
+            rows.insert(keys::key_sessions(&key), stored(&count.encode()));
+        }
+        if self.created {
+            rows.insert(keys::live_sessions(), stored(&self.live().encode()));
+            rows.insert(keys::next_session(), stored(&self.next.encode()));
+        }
+        rows
+    }
+}
+
+/// A request's choices in a life-cycle batch: key, name, t0, sequence.
+type LifeRequest = (u8, u8, u8, u8);
+
+/// One batch of the session life cycle: how far time moves, whether it
+/// sweeps, and its requests.
+type LifeBatch = (u8, bool, Vec<LifeRequest>);
+
+fn life_batch() -> impl Strategy<Value = LifeBatch> {
+    (
+        0u8..6,
+        any::<bool>(),
+        proptest::collection::vec((0u8..2, 0u8..2, 0u8..6, 0u8..5), 0..5),
+    )
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// Sessions live, expire, move and are collected as the model says,
+    /// and every session row and count the agent holds is the model's
+    /// after every batch.
+    #[test]
+    fn the_session_life_cycle_matches_the_model(
+        batches in proptest::collection::vec(life_batch(), 1..14)
+    ) {
+        let (programs, mut node) = counter_only();
+        let mut model = SessionModel::default();
+        let mut time = 100 * defaults::SESSION_BUCKET_MS;
+        // The t0 each (key, name) first went with, to send it again.
+        let mut first: BTreeMap<(u8, u8), u64> = BTreeMap::new();
+        for (advance, sweep, requests) in batches {
+            time += match advance {
+                0 => 1_000,
+                1 => defaults::SESSION_SKEW_MS * 3 / 2,
+                2 => defaults::SESSION_BUCKET_MS,
+                3 => defaults::SESSION_EXPIRY_MS / 2 + defaults::SESSION_BUCKET_MS,
+                _ => defaults::SESSION_EXPIRY_MS + defaults::SESSION_BUCKET_MS,
+            };
+            let mut inputs = Vec::new();
+            if sweep {
+                inputs.push(Input::Sweep);
+            }
+            let mut requested = Vec::new();
+            for (key, name, t0, sequence) in requests {
+                // Mostly a session sent before, so sessions live on.
+                let t0 = match t0 {
+                    0 => time,
+                    1 => time - defaults::SESSION_SKEW_MS / 2,
+                    2 => time - 2 * defaults::SESSION_SKEW_MS,
+                    _ => *first.get(&(key, name)).unwrap_or(&time),
+                };
+                first.entry((key, name)).or_insert(t0);
+                let session = Session {
+                    key: [10 + key; 32],
+                    name: [name; 16],
+                    t0,
+                };
+                let mark = model.sessions.get(&session).map_or(0, |held| held.sequence);
+                let sequence = match sequence {
+                    0 | 1 => mark + 1,
+                    2 => mark.max(1),
+                    3 => mark + 2,
+                    _ => 1,
+                };
+                requested.push((session, sequence));
+                inputs.push(increment_in(&programs, session, sequence));
+            }
+            // Refine decides every step on the state before the batch;
+            // accumulate sweeps first, then applies the steps that ran.
+            let mut refined = model.clone();
+            let expected: Vec<Result<(), u32>> = requested
+                .iter()
+                .map(|(session, sequence)| refined.refine(*session, *sequence, time))
+                .collect();
+            let listed = sweep.then(|| model.sweep(time));
+            for ((session, sequence), expected) in requested.iter().zip(&expected) {
+                if expected.is_ok() {
+                    model.apply(*session, *sequence, time);
+                }
+            }
+            let result = node.batch(time, [0; 32], inputs);
+            let mut steps = result.steps.iter();
+            if let Some(listed) = &listed {
+                prop_assert_eq!(&swept(steps.next().unwrap()), listed);
+            }
+            for (step, expected) in steps.zip(&expected) {
+                match expected {
+                    Ok(()) => {
+                        ran(step);
+                    }
+                    Err(code) => prop_assert_eq!(refused(step), *code),
+                }
+            }
+            prop_assert_eq!(session_rows(&node), model.rows());
+        }
+    }
 }
 
 #[test]

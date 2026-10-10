@@ -1,12 +1,16 @@
 //! Exactly once, over HTTP, through failures: clients increment counters
-//! on three nodes, each request resent with its sequence until answered,
-//! in sessions they start every few dozen requests, while the nodes stop
-//! and start, a leader stops between its apply and its answer, a node is
-//! cut off, the network loses and delays frames, and a node's clock jumps.
+//! on three nodes, two at each agent, each request resent with its
+//! sequence until answered, in sessions they start every few dozen
+//! requests, while the nodes stop and start, a leader stops between its
+//! apply and its answer, a node is cut off, the network loses and delays
+//! frames, a node's clock jumps, and every clock jumps past the skew.
+//! Once a run every session expires and is collected while a leader
+//! stops, and requests captured before, run or not, are sent again.
 //!
-//! Every answer must be its session's running total: no request applied
+//! Every answer must be its client's running total: no request applied
 //! twice, none skipped. A node must hold a request applied before it
-//! answers it, and at the end every replica holds every request once.
+//! answers it, a captured request never runs, and at the end every
+//! replica holds every request once.
 //!
 //! The seed is printed; `EXACTLY_ONCE_SEED` runs one again.
 
@@ -21,6 +25,7 @@ use vos_net::memory::Hub;
 use vos_node::client::Target;
 use vos_node::store::{Store, View};
 use vos_node::{Config, Hooks, Node, Peers, Space, SpaceNode};
+use vos_wire::abi::refusal;
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session, SessionId};
 use vos_wire::ingress::{
     Answer, Call, Consistency, QueryCall, Rejection, call_message, query_message,
@@ -29,11 +34,19 @@ use vos_wire::peer::NodeNumber;
 use vos_wire::records::{SessionMark, unstored};
 use vos_wire::result::Outcome;
 use vos_wire::schema::Schema;
-use vos_wire::{Decode, Encode, keys};
+use vos_wire::{Decode, Encode, defaults, keys};
 
 const COUNTER: InstanceId = InstanceId(1);
 /// The counter instance an agent's messages increment.
 const INBOX: InstanceId = InstanceId(2);
+/// The counter instance a second client at each agent increments.
+const SECOND: InstanceId = InstanceId(3);
+/// How far one node's clock jumps, either way.
+const NODE_JUMP: i64 = 15_000;
+/// How far every clock jumps ahead, once a run: past the skew and both
+/// ways of a node's jump, with 30 s to spare.
+const CLUSTER_JUMP: i64 = 120_000;
+const _: () = assert!(CLUSTER_JUMP >= defaults::SESSION_SKEW_MS as i64 + 2 * NODE_JUMP + 30_000);
 const NODES: NodeNumber = 3;
 /// How long one attempt waits for its answer before trying another node.
 const ATTEMPT: Duration = Duration::from_secs(2);
@@ -178,6 +191,11 @@ struct Cluster {
     seen: Mutex<std::collections::BTreeMap<&'static str, u64>>,
     /// The latest events, for a failure to show what led to it.
     events: Mutex<std::collections::VecDeque<String>>,
+    /// How far every node's clock is ahead of the wall's, on top of its
+    /// own offset; clients time their sessions and queries by it.
+    offset: Arc<AtomicI64>,
+    /// Clients stop at their next request while it is set.
+    paused: AtomicBool,
 }
 
 impl Cluster {
@@ -191,11 +209,17 @@ impl Cluster {
             let node = Node::open(dir.path(), Config::new(agent.clone())).unwrap();
             let key = node.id().0;
             node.shutdown();
-            let free = || {
-                TcpListener::bind("127.0.0.1:0")
-                    .unwrap()
-                    .local_addr()
-                    .unwrap()
+            // Below the ephemeral range, so no client's connection takes
+            // one while its node is down.
+            let free = || loop {
+                use std::hash::{BuildHasher, Hasher};
+                let random = std::collections::hash_map::RandomState::new()
+                    .build_hasher()
+                    .finish();
+                let port = 20_000 + (random % 12_000) as u16;
+                if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) {
+                    break listener.local_addr().unwrap();
+                }
             };
             let ingress = free();
             nodes.push(SpaceNode {
@@ -221,6 +245,8 @@ impl Cluster {
             slots,
             seen: Mutex::new(std::collections::BTreeMap::new()),
             events: Mutex::new(std::collections::VecDeque::new()),
+            offset: Arc::new(AtomicI64::new(0)),
+            paused: AtomicBool::new(false),
         };
         for number in 1..=NODES {
             cluster.start(number);
@@ -262,9 +288,11 @@ impl Cluster {
         config.peers = Peers::Hub(self.hub.clone());
         config.election_timeout_ms = (40, 80);
         config.heartbeat_ms = 10;
-        let offset = Arc::clone(&slot.offset);
+        let (offset, everyone) = (Arc::clone(&slot.offset), Arc::clone(&self.offset));
         config.clock = Arc::new(move || {
-            vos_node::wall_clock().saturating_add_signed(offset.load(Ordering::SeqCst))
+            vos_node::wall_clock().saturating_add_signed(
+                everyone.load(Ordering::SeqCst) + offset.load(Ordering::SeqCst),
+            )
         });
         let node = Node::open(slot.dir.path(), config).unwrap();
         // The address the last run served is let go of with it.
@@ -304,6 +332,16 @@ impl Cluster {
     /// The running node leading `agent`, if one does.
     fn leader(&self, agent: AgentId) -> Option<NodeNumber> {
         (1..=NODES).find(|number| self.node(*number).is_some_and(|node| node.leads(agent)))
+    }
+
+    /// The cluster's clock offset.
+    fn offset(&self) -> i64 {
+        self.offset.load(Ordering::SeqCst)
+    }
+
+    /// The cluster's time, as clients take it.
+    fn time(&self) -> u64 {
+        vos_node::wall_clock().saturating_add_signed(self.offset())
     }
 
     fn number_at(&self, address: &str) -> Option<NodeNumber> {
@@ -357,20 +395,28 @@ enum Mode {
     Pipelined,
 }
 
-/// One client at its own agent, whose counter only it increments, so each
-/// answer is the running total of its amounts. It starts a new session
-/// every so many requests, so new sessions meet the failures too.
+/// One client at an agent, whose counter instance only it increments, so
+/// each answer is the running total of its amounts. It starts a new
+/// session every so many requests, so new sessions meet the failures too.
 struct Client {
     number: u8,
     agent: AgentId,
     key: SigningKey,
     identity: [u8; 32],
     increment: MethodId,
+    /// The counter it increments.
+    instance: InstanceId,
+    /// Whether every fifth request forwards to the next agent's inbox.
+    forwarding: bool,
     /// Requests in each session: a multiple of four, so a pipelined window
     /// stays in one.
     rotate: u64,
-    /// Its sessions, each started when the client reaches it.
-    sessions: Mutex<Vec<Session>>,
+    /// Its sessions, each started when the client reaches it, in order.
+    sessions: Mutex<Vec<Timed>>,
+    /// Sessions named so far.
+    names: AtomicU64,
+    /// It stopped for a pause.
+    idle: AtomicBool,
     /// The node it calls, until it fails.
     calling: Mutex<NodeNumber>,
     value: MethodId,
@@ -381,6 +427,16 @@ struct Client {
     sent: AtomicU64,
     /// The requests answered: through a prefix, and those above it.
     acked: Mutex<Acked>,
+}
+
+/// A session from its first request on, timed with the cluster's clock
+/// offset when it started, and the secret of its key.
+#[derive(Clone, Copy)]
+struct Timed {
+    first: u64,
+    session: Session,
+    offset: i64,
+    secret: [u8; 32],
 }
 
 /// The requests a client has had answered.
@@ -410,15 +466,15 @@ impl Client {
     }
 
     /// Whether request `request` forwards its amount to the next agent's
-    /// inbox, rather than incrementing this agent's counter.
-    fn forwards(request: u64) -> bool {
-        request.is_multiple_of(5)
+    /// inbox, rather than incrementing this client's counter.
+    fn forwards(&self, request: u64) -> bool {
+        self.forwarding && request.is_multiple_of(5)
     }
 
     /// The counter after requests 1 through `request`.
     fn total(&self, request: u64) -> u64 {
         (1..=request)
-            .filter(|request| !Self::forwards(*request))
+            .filter(|request| !self.forwards(*request))
             .map(|request| self.amount(request))
             .sum()
     }
@@ -427,32 +483,80 @@ impl Client {
     /// `request` applied there.
     fn forwarded(&self, request: u64) -> u64 {
         (1..=request)
-            .filter(|request| Self::forwards(*request))
+            .filter(|request| self.forwards(*request))
             .map(|request| self.amount(request))
             .sum()
     }
 
-    /// The session request number `request` goes in, and its sequence
-    /// there.
-    fn session(&self, cluster: &Cluster, request: u64) -> (Session, u64) {
-        let index = (request - 1) / self.rotate;
-        let mut sessions = self.sessions.lock().unwrap();
-        while sessions.len() as u64 <= index {
-            let mut name = [0u8; 16];
-            name[0] = self.number;
-            name[8..].copy_from_slice(&(sessions.len() as u64).to_be_bytes());
-            sessions.push(Session {
-                key: self.key.verifying_key().to_bytes(),
-                name,
-                t0: vos_node::wall_clock(),
-            });
-            cluster.saw("session started");
+    /// A new session from request `first` on, timed by the cluster's clock.
+    /// A client that starts them often takes a fresh key for each, as
+    /// one without an identity may: one key's sessions are capped.
+    fn start(&self, cluster: &Cluster, first: u64) -> Timed {
+        let count = self.names.fetch_add(1, Ordering::SeqCst).to_be_bytes();
+        let mut name = [0u8; 16];
+        name[0] = self.number;
+        name[8..].copy_from_slice(&count);
+        let mut secret = self.key.to_bytes();
+        if !self.forwarding {
+            secret[1..9].copy_from_slice(&count);
         }
-        (sessions[index as usize], request - index * self.rotate)
+        let offset = cluster.offset();
+        cluster.saw("session started");
+        Timed {
+            first,
+            session: Session {
+                key: SigningKey::from_bytes(&secret).verifying_key().to_bytes(),
+                name,
+                t0: vos_node::wall_clock().saturating_add_signed(offset),
+            },
+            offset,
+            secret,
+        }
     }
 
-    fn body(&self, session: &Session, sequence: u64, request: u64) -> Vec<u8> {
-        let (method, arguments) = if Self::forwards(request) {
+    /// The session request number `request` goes in, and its sequence
+    /// there. The client times the next session ahead, while it uses one,
+    /// so a clock jumping meets sessions timed before it.
+    fn session(&self, cluster: &Cluster, request: u64) -> (Timed, u64) {
+        let mut sessions = self.sessions.lock().unwrap();
+        loop {
+            let next = sessions.last().map_or(1, |last| last.first + self.rotate);
+            if !sessions.is_empty() && request + self.rotate < next {
+                break;
+            }
+            sessions.push(self.start(cluster, next));
+        }
+        let timed = *sessions
+            .iter()
+            .rev()
+            .find(|timed| timed.first <= request)
+            .expect("a session");
+        (timed, request - timed.first + 1)
+    }
+
+    /// Start a new session at request `first`, in place of any timed
+    /// ahead.
+    fn rotate_at(&self, cluster: &Cluster, first: u64) {
+        let timed = self.start(cluster, first);
+        let mut sessions = self.sessions.lock().unwrap();
+        sessions.retain(|ahead| ahead.first < first);
+        sessions.push(timed);
+    }
+
+    /// Time `stale` again, as a new session from the same request: false
+    /// when another of its requests already did.
+    fn retime(&self, cluster: &Cluster, stale: &Session) -> bool {
+        let mut sessions = self.sessions.lock().unwrap();
+        let Some(at) = sessions.iter().position(|timed| timed.session == *stale) else {
+            return false;
+        };
+        sessions[at] = self.start(cluster, sessions[at].first);
+        true
+    }
+
+    fn body(&self, timed: &Timed, sequence: u64, request: u64) -> Vec<u8> {
+        let session = &timed.session;
+        let (method, arguments) = if self.forwards(request) {
             let next = self.next.get().expect("the next agent");
             (
                 self.forward,
@@ -465,17 +569,19 @@ impl Client {
             &self.identity,
             session,
             sequence,
-            COUNTER,
+            self.instance,
             method,
             &arguments,
         );
         Call {
             session: *session,
             sequence,
-            instance: COUNTER,
+            instance: self.instance,
             method,
             arguments,
-            signature: self.key.sign(&message).to_bytes(),
+            signature: SigningKey::from_bytes(&timed.secret)
+                .sign(&message)
+                .to_bytes(),
         }
         .encode()
     }
@@ -483,8 +589,6 @@ impl Client {
     /// Send request `request` until it is answered, following redirects
     /// and moving on from a node that fails; check its answer.
     fn send(&self, cluster: &Cluster, mode: Mode, request: u64) {
-        let (session, sequence) = self.session(cluster, request);
-        let body = self.body(&session, sequence, request);
         let path = format!("/agents/{}/calls", self.agent.0);
         let until = Instant::now() + ANSWERED;
         self.sent.fetch_max(request, Ordering::SeqCst);
@@ -498,11 +602,16 @@ impl Client {
                 "client {}: request {request} was never answered",
                 self.number
             );
+            // Its session may have been timed again since the last try.
+            let (timed, sequence) = self.session(cluster, request);
+            let session = timed.session;
+            let body = self.body(&timed, sequence, request);
             let at = *self.calling.lock().unwrap();
             let starts = cluster.slot(at).starts.load(Ordering::SeqCst);
             let next = |client: &Self| {
                 *client.calling.lock().unwrap() = at % NODES + 1;
             };
+            let offset = cluster.offset();
             match post(cluster.slot(at).ingress, &path, &body) {
                 Ok(Answer::Ran {
                     outcome: Outcome::Done(reply),
@@ -510,7 +619,7 @@ impl Client {
                 }) => {
                     let total = u64::decode(&reply).unwrap().0;
                     // A forward answers its amount, an increment the total.
-                    let expected = if Self::forwards(request) {
+                    let expected = if self.forwards(request) {
                         self.amount(request)
                     } else {
                         self.total(request)
@@ -562,6 +671,30 @@ impl Client {
                 {
                     cluster.saw("gap");
                     std::thread::sleep(Duration::from_millis(5));
+                }
+                // Timed before every clock jumped, and sent after: no
+                // leader can create it now, so none of its copies runs.
+                // Its first request times it again; the others follow.
+                Ok(
+                    stale @ (Answer::Rejected(Rejection::StaleSession { .. })
+                    | Answer::Refused(refusal::STALE_SESSION)),
+                ) if timed.offset < offset => {
+                    cluster.event(format!(
+                        "client {} request {request} (sequence {sequence}) at {at}: {stale:?}",
+                        self.number
+                    ));
+                    if sequence == 1 && self.retime(cluster, &session) {
+                        cluster.saw("session timed again");
+                    } else {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+                // Sent before the clocks jumped: again, unchanged.
+                Ok(
+                    Answer::Rejected(Rejection::StaleSession { .. })
+                    | Answer::Refused(refusal::STALE_SESSION),
+                ) if cluster.offset() > offset => {
+                    cluster.saw("stale session across the jump");
                 }
                 Ok(other) => panic!(
                     "client {}: request {request} (sequence {sequence}) at node {at}: {other:?}; agent {} applied at each node {:?}, leader {:?}\n{}",
@@ -651,7 +784,7 @@ impl Client {
                 let answer = post(
                     cluster.slot(at).ingress,
                     &path,
-                    &self.query(INBOX, Consistency::Applied { at: floor }),
+                    &self.query(cluster, INBOX, Consistency::Applied { at: floor }),
                 );
                 let sent = previous.sent.load(Ordering::SeqCst);
                 if let Ok(Answer::Ran {
@@ -681,7 +814,7 @@ impl Client {
             let answer = post(
                 cluster.slot(at).ingress,
                 &path,
-                &self.query(COUNTER, consistency),
+                &self.query(cluster, COUNTER, consistency),
             );
             let sent = self.sent.load(Ordering::SeqCst);
             let (value, answered_at) = match answer {
@@ -689,8 +822,9 @@ impl Client {
                     outcome: Outcome::Done(bytes),
                     at,
                 }) => (u64::decode(&bytes).unwrap().0, at),
+                // Signed before every clock jumped, a query may be stale.
                 Ok(
-                    Answer::Rejected(Rejection::Behind)
+                    Answer::Rejected(Rejection::Behind | Rejection::StaleQuery { .. })
                     | Answer::TimedOut
                     | Answer::Stopped
                     | Answer::Unavailable
@@ -746,8 +880,8 @@ impl Client {
     }
 
     /// A signed query of a counter's value.
-    fn query(&self, instance: InstanceId, consistency: Consistency) -> Vec<u8> {
-        let not_after = vos_node::wall_clock() + 60_000;
+    fn query(&self, cluster: &Cluster, instance: InstanceId, consistency: Consistency) -> Vec<u8> {
+        let not_after = cluster.time() + 60_000;
         let key = self.key.verifying_key().to_bytes();
         let message = query_message(
             &self.identity,
@@ -774,6 +908,16 @@ impl Client {
     fn run(&self, cluster: &Cluster, mode: Mode, done: &AtomicBool) -> u64 {
         let mut sent = 0;
         while !done.load(Ordering::SeqCst) {
+            // Paused with every request answered; then a new session.
+            if cluster.paused.load(Ordering::SeqCst) {
+                self.idle.store(true, Ordering::SeqCst);
+                while cluster.paused.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                self.idle.store(false, Ordering::SeqCst);
+                self.rotate_at(cluster, sent + 1);
+                continue;
+            }
             match mode {
                 Mode::OneAtATime => {
                     sent += 1;
@@ -794,13 +938,36 @@ impl Client {
     }
 }
 
-/// [`FAULTS`] failures, one at a time.
-fn faults(cluster: &Cluster, agents: &[AgentId], random: &mut Random) {
+/// [`FAULTS`] failures, one at a time: among them every clock jumping
+/// past the skew under load, and every session expiring.
+fn faults(cluster: &Cluster, clients: &[Client], random: &mut Random) {
     let pause = |random: &mut Random| {
         std::thread::sleep(Duration::from_millis(100 + random.below(400)));
     };
-    for _ in 0..FAULTS {
+    let agents: Vec<AgentId> = clients
+        .iter()
+        .map(|client| client.agent)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    for fault in 0..FAULTS {
         pause(random);
+        if fault == FAULTS / 4 {
+            // Batches timed before the jump refine after it, while their
+            // callers, unanswered, send them again.
+            cluster.saw("fault: every clock jumps past the skew");
+            let held: Vec<_> = (1..=NODES)
+                .map(|number| cluster.slot(number).trip.refines.close())
+                .collect();
+            cluster.offset.fetch_add(CLUSTER_JUMP, Ordering::SeqCst);
+            std::thread::sleep(ATTEMPT + Duration::from_millis(500));
+            drop(held);
+            continue;
+        }
+        if fault == FAULTS / 2 {
+            expire_every_session(cluster, clients, random);
+            continue;
+        }
         let agent = agents[random.below(agents.len() as u64) as usize];
         let any = 1 + random.below(u64::from(NODES)) as NodeNumber;
         match random.below(6) {
@@ -865,9 +1032,9 @@ fn faults(cluster: &Cluster, agents: &[AgentId], random: &mut Random) {
                 // others trailing its time.
                 cluster.saw("fault: clock jump");
                 let jump = if random.below(2) == 0 {
-                    15_000
+                    NODE_JUMP
                 } else {
-                    -15_000
+                    -NODE_JUMP
                 };
                 let offset = &cluster.slot(any).offset;
                 offset.store(jump, Ordering::SeqCst);
@@ -876,6 +1043,139 @@ fn faults(cluster: &Cluster, agents: &[AgentId], random: &mut Random) {
                 offset.store(0, Ordering::SeqCst);
             }
         }
+    }
+}
+
+/// Whether `node` holds any of `agent`'s session state.
+fn holds_sessions(node: &Node, agent: AgentId) -> bool {
+    let snapshot = node.store().snapshot();
+    let any = Session {
+        key: [0; 32],
+        name: [0; 16],
+        t0: 0,
+    };
+    let live = snapshot
+        .get(agent, &keys::live_sessions())
+        .unwrap()
+        .map(|bytes| u64::decode(unstored(&bytes).unwrap()).unwrap().0);
+    [
+        keys::session_index(&any),
+        keys::session_of(SessionId(0)),
+        keys::session(SessionId(0)),
+        keys::reply(SessionId(0), 0),
+        keys::expiry_prefix(),
+        keys::key_sessions(&[0; 32]),
+    ]
+    .iter()
+    .any(|key| snapshot.scan(agent, &key[..2], None).next().is_some())
+        || live.is_some_and(|live| live > 0)
+}
+
+/// A counter's value at `node`, on its applied state.
+fn counted(node: &Node, agent: AgentId, instance: InstanceId, value: MethodId) -> Answer {
+    match smol::block_on(node.query(
+        agent,
+        Principal::Client([0; 32]),
+        instance,
+        value,
+        Vec::new(),
+    )) {
+        Ok(outcome) => Answer::Ran { outcome, at: 0 },
+        Err(_) => Answer::Unavailable,
+    }
+}
+
+/// Clients pause with every request answered, each keeping one it ran and
+/// one signed but never sent; every clock moves past the expiry, and every
+/// replica collects every session while a leader stops. Sent again to
+/// every node, neither captured request runs, and every counter stays.
+fn expire_every_session(cluster: &Cluster, clients: &[Client], random: &mut Random) {
+    cluster.saw("fault: every session expires");
+    cluster.paused.store(true, Ordering::SeqCst);
+    wait_until("the clients pause", ANSWERED, || {
+        clients
+            .iter()
+            .all(|client| client.idle.load(Ordering::SeqCst))
+    });
+    let mut captured = Vec::new();
+    for client in clients {
+        let sent = client.sent.load(Ordering::SeqCst);
+        if sent == 0 {
+            continue;
+        }
+        let (timed, sequence) = client.session(cluster, sent);
+        captured.push((client, client.body(&timed, sequence, sent)));
+        captured.push((client, client.body(&timed, sequence + 1, sent + 1)));
+    }
+    cluster.offset.fetch_add(
+        (defaults::SESSION_EXPIRY_MS + defaults::SESSION_BUCKET_MS + 60_000) as i64,
+        Ordering::SeqCst,
+    );
+    let agent = clients[random.below(clients.len() as u64) as usize].agent;
+    if let Some(leader) = cluster.leader(agent) {
+        cluster.stop(leader);
+        std::thread::sleep(Duration::from_millis(100 + random.below(400)));
+        cluster.start(leader);
+    }
+    wait_until("every replica collects every session", ANSWERED, || {
+        (1..=NODES).all(|number| {
+            cluster.node(number).is_some_and(|node| {
+                clients
+                    .iter()
+                    .all(|client| !holds_sessions(&node, client.agent))
+            })
+        })
+    });
+    for (client, body) in &captured {
+        let path = format!("/agents/{}/calls", client.agent.0);
+        for number in 1..=NODES {
+            let until = Instant::now() + ANSWERED;
+            loop {
+                assert!(Instant::now() < until, "a replay was never answered");
+                match post(cluster.slot(number).ingress, &path, body) {
+                    Ok(Answer::Rejected(Rejection::StaleSession { .. }) | Answer::TimedOut) => {
+                        break;
+                    }
+                    Ok(
+                        Answer::Stopped
+                        | Answer::Unavailable
+                        | Answer::Busy
+                        | Answer::NotLeader { .. },
+                    )
+                    | Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                    Ok(other) => panic!(
+                        "client {}: a captured request at node {number}: {other:?}",
+                        client.number
+                    ),
+                }
+            }
+        }
+    }
+    cluster.saw("captured requests refused");
+    for client in clients {
+        let total = client.total(client.sent.load(Ordering::SeqCst));
+        for number in 1..=NODES {
+            let node = cluster.node(number).unwrap();
+            wait_until("every counter as it was", ANSWERED, || {
+                counted(&node, client.agent, client.instance, client.value)
+                    == Answer::Ran {
+                        outcome: Outcome::Done(total.encode()),
+                        at: 0,
+                    }
+            });
+        }
+    }
+    cluster.paused.store(false, Ordering::SeqCst);
+}
+
+/// Ends the clients and readers when the faults are over, or have failed:
+/// they stop pausing, and stop.
+struct Ending<'a>(&'a AtomicBool, &'a Cluster);
+
+impl Drop for Ending<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+        self.1.paused.store(false, Ordering::SeqCst);
     }
 }
 
@@ -890,7 +1190,7 @@ fn exactly_once(mode: Mode, default_seed: u64) {
     let counter = elf("test-actors/target/riscv64em-vos/release/counter.elf");
     let increment = method(&counter, "increment");
     let value = method(&counter, "value");
-    let clients: Vec<Client> = (1..=3u8)
+    let agents: Vec<(AgentId, [u8; 32])> = (1..=3u8)
         .map(|number| {
             let creator = cluster.node(number).unwrap();
             let agent = creator.create_replicated(vec![1, 2, 3]).unwrap();
@@ -899,7 +1199,7 @@ fn exactly_once(mode: Mode, default_seed: u64) {
             });
             let leader = cluster.node(cluster.leader(agent).unwrap()).unwrap();
             // The inbox first: no message reaches an instance not there yet.
-            for instance in [INBOX, COUNTER] {
+            for instance in [INBOX, COUNTER, SECOND] {
                 let installed =
                     smol::block_on(leader.install(agent, instance, &counter, &[], vec![]));
                 assert!(
@@ -913,15 +1213,35 @@ fn exactly_once(mode: Mode, default_seed: u64) {
                 .unwrap()
                 .expect("the agent's record")
                 .record;
+            (agent, vos_node::identity(&record))
+        })
+        .collect();
+    // At each agent, one client forwarding to the next agent's inbox and a
+    // second incrementing a counter of its own: batches mix their
+    // sessions, new and held.
+    let clients: Vec<Client> = (1..=6u8)
+        .map(|number| {
+            let (agent, identity) = agents[usize::from(number - 1) % agents.len()];
+            let forwarding = number <= 3;
             Client {
                 number,
                 agent,
                 key: SigningKey::from_bytes(&[number; 32]),
-                identity: vos_node::identity(&record),
+                identity,
                 increment,
-                rotate: 32 + 4 * random.below(8),
+                instance: if forwarding { COUNTER } else { SECOND },
+                forwarding,
+                // The second clients start sessions often: first requests
+                // meet every fault.
+                rotate: if forwarding {
+                    32 + 4 * random.below(8)
+                } else {
+                    4 + 4 * random.below(2)
+                },
                 sessions: Mutex::new(Vec::new()),
-                calling: Mutex::new(number),
+                names: AtomicU64::new(0),
+                idle: AtomicBool::new(false),
+                calling: Mutex::new(1 + (number - 1) % NODES),
                 value,
                 forward: method(&counter, "forward"),
                 next: std::sync::OnceLock::new(),
@@ -930,24 +1250,25 @@ fn exactly_once(mode: Mode, default_seed: u64) {
             }
         })
         .collect();
-    for (at, client) in clients.iter().enumerate() {
-        let next = &clients[(at + 1) % clients.len()];
+    let forwarding = &clients[..agents.len()];
+    for (at, client) in forwarding.iter().enumerate() {
+        let next = &forwarding[(at + 1) % forwarding.len()];
         client.next.set(next.agent).unwrap();
     }
-    let agents: Vec<AgentId> = clients.iter().map(|client| client.agent).collect();
     let done = AtomicBool::new(false);
     let sent: Vec<u64> = std::thread::scope(|scope| {
         let running: Vec<_> = clients
             .iter()
             .map(|client| scope.spawn(|| client.run(&cluster, mode, &done)))
             .collect();
-        for (at, client) in clients.iter().enumerate() {
-            let previous = &clients[(at + clients.len() - 1) % clients.len()];
+        for (at, client) in forwarding.iter().enumerate() {
+            let previous = &forwarding[(at + forwarding.len() - 1) % forwarding.len()];
             let (cluster, done) = (&cluster, &done);
             scope.spawn(move || client.read(cluster, done, previous));
         }
-        faults(&cluster, &agents, &mut random);
-        done.store(true, Ordering::SeqCst);
+        let ending = Ending(&done, &cluster);
+        faults(&cluster, &clients, &mut random);
+        drop(ending);
         running
             .into_iter()
             .map(|client| {
@@ -959,6 +1280,14 @@ fn exactly_once(mode: Mode, default_seed: u64) {
     });
     println!("requests answered: {sent:?}");
     println!("{:?}", cluster.seen.lock().unwrap());
+    assert!(
+        cluster
+            .seen
+            .lock()
+            .unwrap()
+            .contains_key("session timed again"),
+        "no session met the clocks' jump"
+    );
     // Healed, every replica holds every request once.
     cluster.hub.heal();
     for number in 1..=NODES {
@@ -966,14 +1295,11 @@ fn exactly_once(mode: Mode, default_seed: u64) {
             cluster.start(number);
         }
     }
-    let counted = |node: &Node, agent: AgentId, instance: InstanceId| {
-        smol::block_on(node.query(
-            agent,
-            Principal::Client([0; 32]),
-            instance,
-            value,
-            Vec::new(),
-        ))
+    let counted = |node: &Node, agent: AgentId, instance: InstanceId| match counted(
+        node, agent, instance, value,
+    ) {
+        Answer::Ran { outcome, .. } => Ok(outcome),
+        other => Err(other),
     };
     let mark = |node: &Node, agent: AgentId, key: &[u8]| {
         node.store()
@@ -983,11 +1309,20 @@ fn exactly_once(mode: Mode, default_seed: u64) {
             .map(|bytes| u64::decode(unstored(&bytes).unwrap()).unwrap().0)
             .unwrap_or(0)
     };
-    for (at, client) in clients.iter().enumerate() {
+    for (at, client) in clients.iter().enumerate().skip(forwarding.len()) {
+        let total = client.total(sent[at]);
+        for number in 1..=NODES {
+            let node = cluster.node(number).unwrap();
+            wait_until("every replica converges", Duration::from_secs(60), || {
+                counted(&node, client.agent, client.instance) == Ok(Outcome::Done(total.encode()))
+            });
+        }
+    }
+    for (at, client) in forwarding.iter().enumerate() {
         let sent = sent[at];
         let total = client.total(sent);
         let (next, next_agent) = (
-            &clients[(at + 1) % clients.len()],
+            &forwarding[(at + 1) % forwarding.len()],
             client.next.get().unwrap(),
         );
         let forwards = sent / 5;

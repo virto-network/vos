@@ -233,3 +233,172 @@ fn an_operator_reaches_a_tls_node_by_its_key() {
     vos_fails(&["node", "info", "--node", &url]);
     vos_fails(&["node", "info", "--node", &format!("http://{address}")]);
 }
+
+/// Stops the leader loop once, after the commit it is armed for and before
+/// its answers, and says so: that call ran, and the node stopping then
+/// loses its answer.
+#[derive(Default)]
+struct LoseAnswer {
+    armed: std::sync::atomic::AtomicBool,
+    tripped: std::sync::atomic::AtomicBool,
+}
+
+impl vos_node::Hooks for LoseAnswer {
+    fn after_commit(&self, _: vos_wire::ids::AgentId, _: u64) -> bool {
+        use std::sync::atomic::Ordering;
+        if self.armed.swap(false, Ordering::SeqCst) {
+            self.tripped.store(true, Ordering::SeqCst);
+            return false;
+        }
+        true
+    }
+}
+
+/// A call left unanswered stays pending however long it waits. Called
+/// again once the agent has collected its session, nothing can say whether
+/// it ran: `vos` says so, forgets it, and never runs it again.
+#[test]
+fn a_pending_call_whose_session_was_collected_is_lost() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use vos_node::store::{Store, View};
+    use vos_wire::{Decode, defaults, expiry, keys};
+
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("node");
+    let bucket = defaults::SESSION_BUCKET_MS;
+    let start = (vos_node::wall_clock() / bucket + 1) * bucket;
+    let clock = Arc::new(AtomicU64::new(start));
+    let lose = Arc::new(LoseAnswer::default());
+    let open = || {
+        let elf =
+            std::fs::read(guest("default/target/riscv64em-vos/release/vos-agent.elf")).unwrap();
+        let agent = vos_pvm_compiler::link_elf_spi(&elf).expect("links");
+        let mut config = vos_node::Config::new(agent);
+        config.hooks = lose.clone();
+        config.clock = {
+            let clock = Arc::clone(&clock);
+            Arc::new(move || clock.load(Ordering::SeqCst))
+        };
+        let node = vos_node::Node::open(&data, config).unwrap();
+        let address = node.serve("127.0.0.1:0".parse().unwrap()).unwrap();
+        (node, format!("http://{address}"))
+    };
+    let (node, url) = open();
+    let data = data.to_str().unwrap();
+    let key = dir.path().join("client.key");
+    vos(&["key", "new", "--out", key.to_str().unwrap()]);
+    let agent = vos(&["agent", "create", "--node", &url, "--data", data]);
+    let counter = guest("test-actors/target/riscv64em-vos/release/counter.elf");
+    let installed = vos(&[
+        "install",
+        "--node",
+        &url,
+        "--data",
+        data,
+        "--agent",
+        &agent,
+        "--instance",
+        "1",
+        "--program",
+        counter.to_str().unwrap(),
+    ]);
+    assert!(installed.starts_with("done"), "{installed}");
+    let client = |url: &str, command: &str, method: &str, args: &str| {
+        [
+            command,
+            "--node",
+            url,
+            "--key",
+            key.to_str().unwrap(),
+            "--agent",
+            &agent,
+            "--instance",
+            "1",
+            "--method",
+            method,
+            "--args",
+            args,
+        ]
+        .map(str::to_string)
+    };
+    let run = |args: [String; 13]| vos(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    let fails =
+        |args: [String; 13]| vos_fails(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(
+        run(client(&url, "call", "increment", "0100000000000000")),
+        "done 0100000000000000"
+    );
+    lose.armed.store(true, Ordering::SeqCst);
+    let unanswered = std::thread::scope(|scope| {
+        let call = scope.spawn(|| fails(client(&url, "call", "increment", "0200000000000000")));
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !lose.tripped.load(Ordering::SeqCst) {
+            assert!(std::time::Instant::now() < until, "never committed");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        node.shutdown();
+        call.join().unwrap()
+    });
+    assert!(unanswered.contains("may have run"), "{unanswered}");
+    let session_file = dir.path().join("client.key.session");
+    assert!(
+        std::fs::read_to_string(&session_file)
+            .unwrap()
+            .contains(&format!("pending {agent} ")),
+        "kept pending"
+    );
+    // As an earlier version kept it, with the time it was left: still read.
+    let kept = std::fs::read_to_string(&session_file).unwrap();
+    let old: String = kept
+        .lines()
+        .map(|line| match line.starts_with("pending ") {
+            true => format!("{line} 1\n"),
+            false => format!("{line}\n"),
+        })
+        .collect();
+    // A line no version wrote: the file is refused, and kept as it is.
+    std::fs::write(&session_file, format!("{old}something else\n")).unwrap();
+    let refused = fails(client(&url, "call", "increment", "0200000000000000"));
+    assert!(refused.contains("cannot read"), "{refused}");
+    assert!(
+        std::fs::read_to_string(&session_file)
+            .unwrap()
+            .contains("something else")
+    );
+    std::fs::write(&session_file, &old).unwrap();
+
+    // Back after its session's row came due: the idle leader collects it.
+    clock.store(expiry::due(expiry::bucket(start)), Ordering::SeqCst);
+    let (node, url) = open();
+    let id = vos_wire::ids::AgentId(agent.parse().unwrap());
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let live = node
+            .store()
+            .snapshot()
+            .get(id, &keys::live_sessions())
+            .unwrap()
+            .and_then(|bytes| u64::decode(vos_wire::records::unstored(&bytes)?).ok())
+            .map(|(live, _)| live);
+        if live == Some(0) {
+            break;
+        }
+        assert!(std::time::Instant::now() < until, "never collected");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let lost = fails(client(&url, "call", "increment", "0200000000000000"));
+    assert!(lost.contains("lost"), "{lost}");
+    assert!(
+        !std::fs::read_to_string(&session_file)
+            .unwrap()
+            .contains("pending"),
+        "forgotten"
+    );
+    assert_eq!(
+        run(client(&url, "query", "value", "")),
+        "done 0300000000000000",
+        "the lost call ran once"
+    );
+    node.shutdown();
+}

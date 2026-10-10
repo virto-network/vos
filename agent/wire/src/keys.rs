@@ -28,6 +28,8 @@ const NEXT_SESSION: u8 = 0x0b;
 const LIVE_SESSIONS: u8 = 0x0c;
 const BATCH_TIME: u8 = 0x0d;
 const SESSION_OF: u8 = 0x0e;
+const EXPIRY: u8 = 0x0f;
+const KEY_SESSIONS: u8 = 0x10;
 
 fn key(parts: &[&[u8]]) -> Vec<u8> {
     parts.concat()
@@ -97,6 +99,42 @@ pub fn session_index_key(session: &Session) -> [u8; SESSION_INDEX_LEN] {
 /// accumulate creates it.
 pub fn session_of(session: SessionId) -> Vec<u8> {
     key(&[&[SYSTEM, SESSION_OF], &session.0.to_be_bytes()])
+}
+
+/// A session's row in the expiry index: its bucket (a time divided by
+/// [`crate::defaults::SESSION_BUCKET_MS`]), then its id, big-endian, so
+/// a scan meets the oldest first. A session's row lies at or before its
+/// mark's bucket.
+pub fn expiry(bucket: u64, session: SessionId) -> Vec<u8> {
+    key(&[
+        &[SYSTEM, EXPIRY],
+        &bucket.to_be_bytes(),
+        &session.0.to_be_bytes(),
+    ])
+}
+
+/// The length of an [`expiry`] key.
+pub const EXPIRY_LEN: usize = 2 + 8 + 8;
+
+/// The prefix of the expiry index.
+pub fn expiry_prefix() -> Vec<u8> {
+    key(&[&[SYSTEM, EXPIRY]])
+}
+
+/// The bucket and session an [`expiry`] key names; `None` for any other
+/// key.
+pub fn expiry_entry(key: &[u8]) -> Option<(u64, SessionId)> {
+    if key.len() != EXPIRY_LEN || key[..2] != [SYSTEM, EXPIRY] {
+        return None;
+    }
+    let bucket = u64::from_be_bytes(key[2..10].try_into().ok()?);
+    let session = u64::from_be_bytes(key[10..].try_into().ok()?);
+    Some((bucket, SessionId(session)))
+}
+
+/// How many sessions a key holds at this agent.
+pub fn key_sessions(client: &[u8; 32]) -> Vec<u8> {
+    key(&[&[SYSTEM, KEY_SESSIONS], client])
 }
 
 /// The id the next session gets: ids are never reused.

@@ -3599,3 +3599,148 @@ discarded old stores; counts only in logs; the stored empty row; and
 the checker's totals after the replays. Re-review: go, with the renewal
 bound one-sided (a t0 ahead of the agent's time waits) and refine's
 duplicate check before expiry, both folded above.
+
+#### Built
+
+- **The wire** (`vos-wire`):
+  - `expiry(bucket, id)`, `expiry_prefix`, `expiry_entry` and
+    `key_sessions(key)` under `SYSTEM`; `vos_wire::expiry::{bucket, due}`;
+  - `defaults`: `SESSION_BUCKET_MS` (5 min), `SWEEP_LIMIT` (32),
+    `MAX_SESSIONS` (65,536), `MAX_KEY_SESSIONS` (64), and the assertion
+    that the expiry is at least twice the skew;
+  - `Input::Sweep`, `Step::Swept { due }`, `refusal::SESSIONS_FULL` and
+    `KEY_SESSIONS_FULL`, `Rejection::StaleQuery { now }`.
+- **The default agent:**
+  - refine checks a duplicate before expiry, then the skew, the
+    sequence and the caps (`Counts`: the applied counts read once a
+    batch, plus the batch's creations);
+  - refine's sweep lists due rows by key alone, page by page, passing
+    over keys that are not expiry keys; values are not read, so it never
+    traps;
+  - accumulate counts a result's distinct new triples against the caps
+    before it applies anything, creates a session with its expiry row and
+    key count, and per listed row deletes it (no mark), collects the
+    session (expired, past t0 plus the skew) or moves the row to the
+    bucket of the later of its mark and t0 plus the skew.
+- **The node:**
+  - `Pending::Sweep`; the leader reads the first expiry row with the
+    batch's state and puts a sweep first in a batch it is due for;
+  - idle, it sweeps alone once due by its effective time, and looks
+    again at most every 5 s while a row exists;
+  - a sweep that applied, or failed alone, leaving the first due row in
+    place pauses sweeps for a minute, said once in the log (counts
+    only); a read error when idle means looking again in 5 s;
+  - a duplicate refined `SEQUENCE` whose session the batch's sweep
+    collected is answered from the state the batch refined on;
+  - ingress answers 503 for `SESSIONS_FULL`, 429 for
+    `KEY_SESSIONS_FULL`, and a stale query with the node's time.
+- **The client:**
+  - `ClientError::Lost`, and `Fate::{InTransit, NeverRan, Lost}` for a
+    call whose fate is unknown that meets `StaleSession`;
+  - `EXPIRED` renews and clears the doubt; `Refused(STALE_SESSION)` and a
+    cap refusal answer `TimedOut` when in doubt;
+  - a query's `not_after` is by the client's clock, moved by the offset
+    it learned, and signed again once on `StaleQuery { now }`.
+- **The CLI:** a pending call is kept by its digest alone, always sent
+  again as a repeat of an unknown one; `Lost` clears it and says the call
+  may have run; refusals of the caps are named. A kept file with a line
+  it cannot read is refused, not dropped, as it may hold a pending call;
+  the earlier pending line, with its time, still reads. A new call says
+  when it leaves an unanswered one unknown.
+
+**Found while testing, and fixed:** an idle leader whose sweeps paused
+looked again every millisecond for the minute of the pause; it now waits
+out the pause. And an idle sweep yields to the node's other tasks first:
+were the leader's two reads of the first row to disagree (a clock
+stepped back between them), it would otherwise spin without yielding.
+Both showed as hangs under mutations.
+
+**Tests:**
+- **Agent** (`tests/agent.rs`):
+  - collection and moves: a session's whole state goes once its row is
+    due, a session active since moves, `EXPIRED` and a duplicate's
+    `SEQUENCE` before collection, `STALE_SESSION` after, ids never
+    reused, and the moved row collected in its turn;
+  - the caps at their edges within one batch, the agent's from a seeded
+    count, and collection making room again, at most `SWEEP_LIMIT` a
+    sweep;
+  - accumulate on hand-built results: past a cap nothing applies, one
+    session named twice counts once, a row listed early stays, a row
+    without its session goes, a session without its whole loses the
+    rest;
+  - refine passing over a key that is not an expiry key;
+  - **the life cycle against a model** (64 cases): after every batch,
+    every session row and count equals the model's.
+  - The test node prepares the agent once a run: the suite went from
+    53 s to 11 s with these tests in it.
+- **Node** (`tests/ingress.rs`): a lost answer answered from the window
+  past expiry, then `Lost` past collection, the call run once; a first
+  call in a session never created: `TimedOut` within twice the skew, run
+  once in a new session after; `Lost` past the expiry less the skew; a
+  busy leader's batch collecting an expired session; queries signed
+  again at a node's time ten minutes ahead.
+- **CLI** (`tests/cli.rs`): a node in the test process with the test's
+  clock; a call whose answer is lost as the node stops stays pending;
+  back past its session's collection, `vos` says it is lost, forgets it,
+  and the counter shows it ran once.
+- **The checker** (`tests/exactly_once.rs`):
+  - one clock offset for the cluster; six clients, a second at each
+    agent on its own counter; each client times its next session ahead;
+  - every clock 120 s ahead under load: every run times sessions again
+    (asserted), and some attempts sent before the jump go again;
+  - every session expiring, with a leader stopped while the sweeps run:
+    every replica holds no session row, captured requests run nowhere,
+    and every counter is unchanged;
+  - the second clients start a session every 4 or 8 requests, each
+    with a fresh key: under one key they met its cap of 64 within a run,
+    as they should;
+  - a failing check ends the clients and readers rather than leaving
+    them paused; ingress ports lie below the ephemeral range, so no
+    client's connection takes one while its node is down;
+  - 24 seeds (101–112, 201–212) pass in both modes, about 20–25 s each.
+- **Mutations, each caught:**
+  - agent: rows never moved; the key count never decremented; creation
+    without the skew check (the resend after collection runs); expiry
+    checked before a duplicate (the property test, and the collection
+    test);
+  - node: no idle sweep; no sweep in a busy batch (the ingress and CLI
+    tests);
+  - client: a lost call sent again in a new session (it runs twice);
+  - CLI: a pending call not marked unknown (it runs twice);
+  - checker: no skew check anywhere (a captured request runs, caught at
+    once); a stale session refused while its first call is queued (the
+    B1 bug of 3.5c1: a client's total off in 2 of 4 seeds, and always
+    by its focused test).
+
+**Cost** (acceptance bench on a space of one, alternating with the 3.5d2
+tree on the same disk; each bench session now has its own key, as one
+key's 256 sessions would pass its cap):
+- under load: 31.4–36.2 µs per request against 32.7–35.0, execution
+  24.7–26.9 against 25.7–27.3 µs, commits about 1 ms both;
+- one request alone: a 2.9 ms median both; queries 50–60 µs both.
+- The agent program grew from 274 to 324 KiB.
+- A first comparison showed commits twice as slow: the earlier tree was
+  under `/tmp`, a tmpfs, where a sync costs nothing.
+
+**Review** (Opus): go, with no path found that runs a call twice.
+Folded in before the commit:
+- the CLI refused to drop a kept file it cannot read: dropping it wiped
+  the pending call with the session, and the call could then run twice;
+- the sweep pause starts once a sweep applied, or failed alone, not when
+  one is added: an agent fault elsewhere in its batch, or a skipped
+  result, delayed collection by a minute;
+- an idle leader's read error looks again in 5 s instead of waiting for
+  an input;
+- a duplicate in the batch that collects its session is answered from
+  the window it was refined on;
+- a missing key count is not deleted;
+- a new call says when it leaves an unanswered one unknown.
+
+**Left for later:**
+- the checker catches the B1 mutation in about half its seeds; its
+  focused test always does;
+- caps and expiry per agent, a TLS run of the checker (3.9), and rate
+  limits without identity, as the design says.
+
+**3.6 is done.** What 3.7–3.10 carry stands in the list at the end of
+3.5.

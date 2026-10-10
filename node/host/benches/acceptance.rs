@@ -50,16 +50,19 @@ fn method(program: &[u8], name: &str) -> MethodId {
 }
 
 fn increment(session: u64, sequence: u64, method: MethodId) -> Request {
-    // Every session starts when the bench does.
+    // Every session starts when the bench does, each with a key of its
+    // own: one key's sessions are capped.
     static START: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let mut key = [1; 32];
+    key[..8].copy_from_slice(&session.to_be_bytes());
     Request {
         session: Session {
-            key: [1; 32],
+            key,
             name: u128::from(session).to_be_bytes(),
             t0: *START.get_or_init(vos_node::wall_clock),
         },
         sequence,
-        caller: ALICE,
+        caller: Principal::Client(key),
         instance: COUNTER,
         method,
         arguments: 1u64.encode(),

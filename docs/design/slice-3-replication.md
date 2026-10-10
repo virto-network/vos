@@ -709,7 +709,7 @@ the in-process cluster:
 
 Steps 3.6–3.8 extend it.
 
-### 3.6 Sessions
+### 3.6 Sessions [done]
 
 Client-named sessions in the agent, with t0, caps that refuse, and
 collection with the expiry index and the sweep. The checker gains expiry

@@ -38,12 +38,15 @@ fn status(answer: &Answer) -> u16 {
         Answer::Unconfirmed(_) => 202,
         // The session is done with: the client starts another.
         Answer::Refused(refusal::EXPIRED | refusal::STALE_SESSION) => 410,
+        // No new session until some are collected.
+        Answer::Refused(refusal::SESSIONS_FULL) => 503,
+        Answer::Refused(refusal::KEY_SESSIONS_FULL) => 429,
         Answer::Refused(_) => 409,
         Answer::Rejected(rejection) => match rejection {
             Rejection::TooOld | Rejection::StaleSession { .. } => 410,
             Rejection::BadSignature | Rejection::Unauthorized => 401,
             Rejection::Gap { .. } | Rejection::Ahead => 409,
-            Rejection::StaleQuery | Rejection::Malformed => 400,
+            Rejection::StaleQuery { .. } | Rejection::Malformed => 400,
             // Another replica may be further along.
             Rejection::Behind => 503,
         },
@@ -271,7 +274,7 @@ impl Ingress {
         }
         let now = (self.inner.clock)();
         if query.not_after < now || query.not_after > now + QUERY_HORIZON_MS {
-            return Answer::Rejected(Rejection::StaleQuery);
+            return Answer::Rejected(Rejection::StaleQuery { now });
         }
         self.inner
             .client_query(

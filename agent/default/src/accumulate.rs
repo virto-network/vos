@@ -3,17 +3,22 @@
 //! Each step that ran writes its writes, advances its session or pair mark,
 //! keeps its reply in the session's window and queues its messages in the
 //! outbox with their pair sequences; an acknowledgement clears the outbox
-//! through its sequence. A step's new session is created first. A refused
-//! step applies nothing. A work result built on another state version,
-//! timed before the agent's latest, or holding a new session whose creation
-//! time is far from its own, applies nothing at all: refine refuses such a
-//! session, so the result was not refined on this state as it says.
+//! through its sequence. A step's new session is created first, with its
+//! row in the expiry index. A refused step applies nothing. A sweep
+//! collects the sessions it lists that have expired, and moves the rows of
+//! those active since. A work result built on another state version, timed
+//! before the agent's latest, or holding a new session whose creation time
+//! is far from its own or past a cap, applies nothing at all: refine
+//! refuses such a session, so the result was not refined on this state as
+//! it says.
 
-use vos_wire::ids::{SessionId, SessionRef};
+use alloc::collections::{BTreeMap, BTreeSet};
+
+use vos_wire::ids::{Session, SessionId, SessionRef};
 use vos_wire::jam::AccumulateInput;
 use vos_wire::records::{SessionMark, stored, unstored};
 use vos_wire::result::{InputRef, Run, Step, WorkResult};
-use vos_wire::{Decode, Encode, defaults, keys};
+use vos_wire::{Decode, Encode, defaults, expiry, keys};
 
 use crate::host::{fetch_input, read, write};
 
@@ -51,8 +56,8 @@ fn delete(key: &[u8]) {
     write(key, &[]);
 }
 
-/// A step's session, created when the step is its first.
-fn session(named: &SessionRef) -> SessionId {
+/// A step's session, created when the step is its first, at `time`.
+fn session(named: &SessionRef, time: u64) -> SessionId {
     let session = match named {
         SessionRef::Known(id) => return *id,
         SessionRef::New(session) => session,
@@ -65,9 +70,55 @@ fn session(named: &SessionRef) -> SessionId {
     put(&keys::next_session(), &(id.0 + 1).encode());
     put(&keys::session_index(&session), &id.encode());
     put(&keys::session_of(id), &session.encode());
+    put(&keys::expiry(expiry::bucket(time), id), &[]);
     let live = get::<u64>(&keys::live_sessions()).unwrap_or(0);
     put(&keys::live_sessions(), &(live + 1).encode());
+    let held = keys::key_sessions(&session.key);
+    let count = get::<u64>(&held).unwrap_or(0);
+    put(&held, &(count + 1).encode());
     id
+}
+
+/// The sessions `result` creates: those its ran steps name whole, each
+/// once.
+fn created(result: &WorkResult) -> BTreeSet<Session> {
+    result
+        .steps
+        .iter()
+        .filter_map(|step| match step {
+            Step::Ran(Run {
+                input:
+                    InputRef::Request {
+                        session: SessionRef::New(session),
+                        ..
+                    },
+                ..
+            }) => Some(**session),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether the sessions `result` creates fit the caps.
+fn within_caps(result: &WorkResult) -> bool {
+    let created = created(result);
+    if created.is_empty() {
+        return true;
+    }
+    let live = get::<u64>(&keys::live_sessions()).unwrap_or(0);
+    if live.saturating_add(created.len() as u64) > defaults::MAX_SESSIONS {
+        return false;
+    }
+    let mut per_key: BTreeMap<[u8; 32], u64> = BTreeMap::new();
+    for session in &created {
+        *per_key.entry(session.key).or_default() += 1;
+    }
+    per_key.iter().all(|(key, new)| {
+        get::<u64>(&keys::key_sessions(key))
+            .unwrap_or(0)
+            .saturating_add(*new)
+            <= defaults::MAX_KEY_SESSIONS
+    })
 }
 
 /// Whether a step of `result` creates a session far from its time.
@@ -91,23 +142,85 @@ fn apply(result: &WorkResult) {
         return;
     }
     let latest: u64 = get(&keys::batch_time()).unwrap_or(0);
-    if result.time < latest || stale(result) {
+    if result.time < latest || stale(result) || !within_caps(result) {
         return;
     }
     if result.time > latest {
         put(&keys::batch_time(), &result.time.encode());
     }
     for step in &result.steps {
-        if let Step::Ran(run) = step {
-            apply_run(run, result.time);
+        match step {
+            Step::Ran(run) => apply_run(run, result.time),
+            Step::Swept { due } => sweep(due, result.time),
+            Step::Refused { .. } => {}
         }
     }
     put(&keys::version(), &(version + 1).encode());
 }
 
+/// Take each listed expiry row out of the due range: collect its session
+/// once it has expired and `time` is past its t0 plus the skew, else move
+/// the row to where it is next due.
+fn sweep(due: &[(u64, SessionId)], time: u64) {
+    let before = get::<u64>(&keys::live_sessions()).unwrap_or(0);
+    let mut live = before;
+    for &(bucket, id) in due {
+        let row = keys::expiry(bucket, id);
+        let Some(mark) = get::<SessionMark>(&keys::session(id)) else {
+            delete(&row);
+            continue;
+        };
+        let whole = get::<Session>(&keys::session_of(id));
+        // The latest time its t0 still lets it be created.
+        let creatable = whole.map_or(0, |whole| {
+            whole.t0.saturating_add(defaults::SESSION_SKEW_MS)
+        });
+        if time > mark.time.saturating_add(defaults::SESSION_EXPIRY_MS) && time > creatable {
+            collect(id, mark, whole);
+            delete(&row);
+            live = live.saturating_sub(1);
+        } else {
+            let next = expiry::bucket(mark.time.max(creatable));
+            if next != bucket {
+                delete(&row);
+                put(&keys::expiry(next, id), &[]);
+            }
+        }
+    }
+    if live != before {
+        put(&keys::live_sessions(), &live.encode());
+    }
+}
+
+/// Remove a session: its index row, whole, mark, kept replies and key
+/// count. Without its whole, its index row and key count cannot be found,
+/// and stay.
+fn collect(id: SessionId, mark: SessionMark, whole: Option<Session>) {
+    if let Some(whole) = whole {
+        delete(&keys::session_index(&whole));
+        delete(&keys::session_of(id));
+        let held = keys::key_sessions(&whole.key);
+        match get::<u64>(&held).unwrap_or(0) {
+            0 => {}
+            1 => delete(&held),
+            count => put(&held, &(count - 1).encode()),
+        }
+    }
+    delete(&keys::session(id));
+    // The window: every sequence through the mark ran and kept its reply,
+    // and the last `REPLY_WINDOW` are kept.
+    let first = mark
+        .sequence
+        .saturating_sub(defaults::REPLY_WINDOW - 1)
+        .max(1);
+    for sequence in first..=mark.sequence {
+        delete(&keys::reply(id, sequence));
+    }
+}
+
 fn apply_run(run: &Run, time: u64) {
     let session = match &run.input {
-        InputRef::Request { session: named, .. } => Some(session(named)),
+        InputRef::Request { session: named, .. } => Some(session(named, time)),
         _ => None,
     };
     for item in &run.writes {

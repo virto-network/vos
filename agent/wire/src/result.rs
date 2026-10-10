@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use scale::{Decode, Encode};
 
 use crate::abi::cap;
-use crate::ids::{AgentId, InstanceId, MethodId, ProgramHash, SessionRef};
+use crate::ids::{AgentId, InstanceId, MethodId, ProgramHash, SessionId, SessionRef};
 
 /// What one refine produced. Steps are in dispatch order; accumulate applies
 /// their writes in that order. Inputs not covered by a step were not
@@ -76,6 +76,11 @@ pub enum Step {
     /// node answers the sender.
     #[codec(index = 1)]
     Refused { input: InputRef, code: u32 },
+    /// The sweep: the expiry rows refine found due, each a bucket and a
+    /// session. Accumulate collects each session that has expired and
+    /// moves the row of one active since.
+    #[codec(index = 2)]
+    Swept { due: Vec<(u64, SessionId)> },
 }
 
 /// A dispatched step: how it ended and its effects. A failed step has no
