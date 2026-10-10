@@ -1111,3 +1111,208 @@ commit. Also done before it:
   and its stale-epoch sweep before the agent's first commit; applies
   under the current epoch after a switch; `EntryReports::switched`.
 - **Streaming between nodes, and the manifest of pinned blobs (3.7).**
+
+## Step 3.4: the network
+
+### Design
+
+A network layer that knows nothing of Raft (owner decision 2), its
+messages, and TLS on client ingress. Three parts, each reviewed and
+committed on its own:
+
+1. **3.4a, the layer (`node/net`, crate `vos-net`):** the interface, an
+   in-process implementation for tests, and QUIC.
+2. **3.4b, the node's messages and their authorization:** SCALE
+   encodings of what nodes send each other, and the group driver's
+   checks, as pure functions with tests. Step 3.5 wires them in.
+3. **3.4c, TLS on client ingress.**
+
+#### 3.4a The layer
+
+**Identity.** A node is its ed25519 key.
+- **A fresh secret seed**, generated once and kept in its own node
+  record, is never served. Slice 2's node id is public (ingress serves
+  it, clients sign over it), so it cannot be the seed.
+- **The node's public identity is its public key:** `GET /` and
+  `vos node info` serve it, and clients sign over it where they signed
+  over the old id.
+- A node's configuration lists its peers: a number (stable, never
+  reused, the 8 bits of agent ids), a key and an address.
+- Another signature by the node key is domain-separated from TLS's.
+
+**The interface:**
+
+```rust
+pub enum Class { Liveness, Consensus, Requests, Bulk }
+
+pub struct Incoming { pub from: NodeNumber, pub stream: u64, pub frame: Vec<u8> }
+
+pub trait Network: Send + Sync + 'static {
+    /// Queue `frame` for `to` on stream `stream` of `class`. Never blocks:
+    /// it refuses with a reason (full, unknown peer, closed), and the
+    /// caller decides (Raft drops; a forward or a bulk transfer retries).
+    fn send(&self, to: NodeNumber, class: Class, stream: u64, frame: Vec<u8>) -> Result<(), Refused>;
+    /// Resolves once `to` can take more of `class` (bulk senders wait on
+    /// it rather than spin).
+    fn ready(&self, to: NodeNumber, class: Class) -> impl Future<Output = ()>;
+    /// Send to every peer; a gossip implementation may do better.
+    fn send_to_all(&self, class: Class, stream: u64, frame: Vec<u8>) { /* loops */ }
+    /// Replace the peer table without a restart.
+    fn set_peers(&self, peers: Vec<Peer>);
+}
+```
+
+- **Arrivals queue per class,** each frame with its authenticated
+  sender, and the consumer always drains Liveness and Consensus first. A
+  single queue would undo the head-of-line protection: bulk ahead of
+  heartbeats.
+- **`from` is the authenticated channel peer.** A relaying transport
+  would later need an origin signed at the message layer; 3.4b's checks
+  assume direct delivery.
+- **Order holds within one (peer, class, stream), on one connection.** A
+  redial can reorder across the old and the new connection. A frame is
+  delivered at most once.
+- **Streams:**
+  - Liveness and Consensus streams are long-lived, one per group
+    (stream = agent id), so one agent's large append never delays
+    another's;
+  - Requests too, one per agent, so a session's pipelined forwards keep
+    their order (out of order, the leader's lane would refuse them as
+    gaps);
+  - Bulk opens a stream per frame, so a 4 MiB blob never sits ahead of
+    anything.
+
+**QUIC** (`quinn`, `runtime-smol`, `rustls-ring`; no tokio):
+
+- **TLS 1.3 bound to node keys, both ways** (a spike confirmed it with
+  quinn 0.11, rustls 0.23 and rcgen 0.13):
+  - each node presents a self-signed certificate (`rcgen`) for its
+    ed25519 key;
+  - **the dialing side pins the peer it dialed:** a client
+    configuration per dial whose verifier holds that peer's key. A wrong
+    address, or a path through another node, fails rather than reaching
+    the wrong peer;
+  - **the accepting side** accepts any configured peer's key, and takes
+    the peer's number from it;
+  - the handshake signature is checked against the certificate's own
+    key, and client authentication is mandatory;
+  - TLS 1.3 and Ed25519 only; certificate validity times are ignored,
+    since keys are pinned;
+  - ALPN `vos/1`; no 0-RTT.
+- **Connections:**
+  - each node dials every peer it sends to and sends only on its own
+    connection, so sends never wait for the other side to dial;
+  - the accepting side never sends on an accepted connection;
+  - that is two connections per pair, fine at 256 nodes or fewer;
+  - it redials with backoff, and frames wait in a bounded queue per peer
+    meanwhile.
+- **Restarts:** the endpoint's stateless-reset key derives from the
+  node's secret. A restarted peer then resets the connections it no
+  longer knows at once, instead of leaving them silent until the idle
+  timeout. A peer dialing in anew also closes this node's outgoing
+  connection to it, which then redials.
+- **Streams:** unidirectional. A stream opens with its class and id; a
+  frame is a length (u32) and its bytes.
+- **Priorities** (`SendStream::set_priority`): Liveness above Consensus,
+  above Requests, above Bulk.
+- **Flow control:**
+  - the connection window stays unlimited (quinn's default), so a few
+    unread bulk streams cannot fill it and stall everything;
+  - memory is bounded by per-stream windows and a cap on concurrent bulk
+    streams;
+  - `max_concurrent_uni_streams` is raised above slice 3's groups times
+    classes.
+- **Frames are bounded on receipt, per class,** and read incrementally:
+  - consensus at the 1 MiB append cap;
+  - bulk at the largest blob plus its header;
+  - requests at the request cap plus their envelope.
+  A length prefix never sizes an allocation by itself.
+- No transport keepalives as liveness: the node's own liveness messages
+  carry that (plan). An idle timeout of 30 s closes dead connections, and
+  the next send redials.
+
+**In-process:** a hub connecting endpoints through channels, with
+partitions, drops and delays to set. Step 3.5's tests run replicated
+agents on it.
+
+**Tests:**
+
+- three nodes on localhost exchange frames on every class;
+- order within a stream;
+- a peer with an unknown key, or a key that is not the one configured
+  for its number, fails the handshake;
+- redial after a peer restarts;
+- **head of line:** small consensus frames' latency, alone and beside
+  4 MiB bulk frames to the same peer. The bulk must not move the small
+  frames' p99 by more than a few milliseconds. This measures what the
+  stream design is for.
+- the dialing side refuses a peer with the wrong key at the right
+  address;
+- a restarted peer is reachable again at once;
+- an oversized frame is refused, not allocated.
+
+#### 3.4b Messages and authorization
+
+**The node's messages,** SCALE-encoded in a `vos-wire` module:
+
+- a Raft message for an agent's group: vos-raft's `Message<u8>`, with
+  its entries in the store's payload form;
+- snapshot chunks and their acknowledgements;
+- blob requests and blobs (by hash; the receiver verifies);
+- directory updates (step 3.5 defines their content);
+- liveness.
+
+Requests and inter-agent messages come with step 3.5.
+
+**Authorization**, as pure functions the group driver (3.5) calls on
+each arrival, with tests:
+
+- a Raft message comes from a node configured in the space;
+- an append comes from the leader it names, and a vote request from the
+  candidate it names;
+- votes and acknowledgements count only from members, which vos-raft
+  checks already;
+- the tests include stale membership: a replica that has not yet seen a
+  replacement still accepts the new member's messages, since the check
+  is "configured in the space", while its votes and acknowledgements
+  count only once it is a member;
+- a snapshot chunk comes from the leader the replica follows;
+- anything else is dropped and counted.
+
+#### 3.4c TLS on client ingress
+
+- The HTTP ingress (slice 2: `http.rs`, smol) serves TLS 1.3
+  (`futures-rustls`). Its certificate is either configured (PEM files)
+  or self-signed for the node's key.
+- The `vos` CLI (`ureq` with rustls) pins one of: the node's key (from
+  `vos node info`, kept with the profile), or a CA. From step 3.5 it
+  pins the keys of all the agent's replicas, so failing over to another
+  replica passes the check.
+- Plain HTTP stays only on loopback, for tests and local use. A
+  non-loopback ingress requires TLS, and `0.0.0.0` and `::` are not
+  loopback.
+
+#### What 3.4 does not do
+
+- The multi-group driver: combined heartbeats, quiescence, pair
+  liveness (step 3.8).
+- The directory's content and broadcast, and requests and forwarding
+  (step 3.5).
+- Snapshot streaming end to end (step 3.7).
+
+**Review** (Opus): no-go until the node's key stops being its public id.
+Done above: a secret seed of its own, and the public key as identity.
+Also folded in:
+- the dialing side pins the peer it dialed;
+- stateless resets keyed by the node's secret;
+- incoming queues per class;
+- an unlimited connection window, with per-stream bounds and stream
+  caps;
+- frames bounded per class;
+- requests on a stream per agent;
+- the interface additions (refusal reasons, readiness, send to all, a
+  peer table update);
+- the stale-membership authorization tests;
+- the CLI pinning every replica's key.
+
+Then go for 3.4a.
