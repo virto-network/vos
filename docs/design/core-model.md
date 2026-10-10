@@ -539,17 +539,24 @@ Why handlers run to completion:
     any lost reply. A request more than W ahead of the oldest kept reply is
     refused until the client catches up.
 - **Client sessions:**
-  - **Ids:** the server assigns session ids and never reuses one. Ingress
-    opens a session per client connection or device.
+  - **Ids:** a client names its session: its key, a random 128-bit name
+    and a creation time t0, in every signed request (slice 3, owner's
+    decision). The triple is the session's identity. The agent creates a session only if t0 is within a skew of
+    the batch time, and collects one only once it has expired and the
+    batch time is past t0 plus the skew, so a collected session is never
+    created again. Caps on live sessions refuse new ones and never evict.
+    This relies on batch time never going backwards: the agent keeps a
+    replicated high-water mark that refine never goes below.
   - **Sequences** are kept per (session, receiver agent), so requests to
     different agents never leave gaps in each other's sequence.
   - **State:** the high-water mark and the window of replies, kept until
     the session expires after inactivity. Expiry is computed from
     work-result time, never a local clock. State is O(active clients), not
     O(requests).
-  - **Expiry:** a request in an unknown or expired session is refused with
-    "session expired" and never executed. The client opens a new session
-    and decides itself whether to resend.
+  - **Expiry:** a request in an expired session, or naming an absent one
+    whose t0 is stale, is refused with "session expired" and never
+    executed. The client starts a new session and decides itself whether
+    to resend.
 - **Between agents:**
   - The sender's accumulate assigns sequence numbers, and its outbox resends
     until acknowledged.
@@ -777,8 +784,10 @@ one atomic batch without fsync. This is safe under seven invariants:
 5. Accumulate reads no local clock or other node-local input.
 6. Snapshot ingestion is fsynced before the applied index that depends on
    it is recorded.
-7. A blob that an entry references (snapshot pages, witnesses) is durable,
-   or in the same journal, before the entry is proposed.
+7. A blob that an entry references (large work results, programs,
+   snapshot pages, witnesses) is durable on a replica, verified against
+   its hash, before that replica counts the entry durable, the leader
+   included.
 
 Every node-log fsync then also makes all earlier apply batches durable, so
 no separate checkpoint mechanism exists. After a crash, the node re-applies
