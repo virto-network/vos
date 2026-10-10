@@ -78,6 +78,9 @@ struct Cluster {
     agent_programs: Vec<Option<Vec<u8>>>,
     /// Alice's session, for the calls the test makes.
     session: Session,
+    /// Compaction every so many entries, keeping a tail, and snapshot
+    /// chunks of about so many bytes, when not the defaults.
+    compaction: Option<(u64, u64, usize)>,
 }
 
 impl Cluster {
@@ -123,7 +126,17 @@ impl Cluster {
                 name: [1; 16],
                 t0: vos_node::wall_clock(),
             },
+            compaction: None,
         };
+        cluster.grow(count);
+        cluster
+    }
+
+    /// Nodes that compact their logs every few entries, and send
+    /// snapshots in small chunks.
+    fn compacting(count: u8) -> Self {
+        let mut cluster = Self::build(0, Arc::new(vos_node::NoHooks), Vec::new(), false);
+        cluster.compaction = Some((8, 2, 64));
         cluster.grow(count);
         cluster
     }
@@ -183,6 +196,11 @@ impl Cluster {
         };
         config.election_timeout_ms = (40, 80);
         config.heartbeat_ms = 10;
+        if let Some((every, tail, chunk)) = self.compaction {
+            config.compact_every = every;
+            config.compact_tail = tail;
+            config.snapshot_chunk = chunk;
+        }
         // Each node's own clock, a few milliseconds apart.
         let skew = u64::from(number) * 7;
         config.clock = Arc::new(move || vos_node::wall_clock() + skew);
@@ -320,6 +338,12 @@ fn rows(node: &Node, agent: AgentId) -> Vec<(Vec<u8>, Vec<u8>)> {
                 .collect::<Vec<_>>()
         })
         .collect()
+}
+
+/// Where `agent`'s log on `node` starts: the index it was compacted
+/// through, or a snapshot installed at.
+fn log_start(node: &Node, agent: AgentId) -> u64 {
+    node.store().raft(agent).unwrap().log_start.0
 }
 
 fn done(reply: Result<Reply, CallError>) -> u64 {
@@ -886,5 +910,209 @@ fn a_follower_relays_a_message_to_its_leader() {
     assert!(
         cluster.node(3).messages_relayed() > 0,
         "node 3 relayed nothing"
+    );
+}
+
+#[test]
+fn every_replica_compacts_its_log_as_it_applies() {
+    let cluster = Cluster::compacting(3);
+    let agent = cluster.node(1).create_replicated(vec![1, 2, 3]).unwrap();
+    cluster.install(agent);
+    let leader = cluster.leader(agent);
+    let mut total = 0;
+    for sequence in 1..=40 {
+        total += sequence;
+        assert_eq!(
+            done(cluster.increment(leader, agent, sequence, sequence)),
+            total
+        );
+    }
+    cluster.converged(agent);
+    wait_until("every replica compacts", || {
+        cluster.running().all(|(_, node)| {
+            let rows = node.store().raft(agent).unwrap();
+            rows.log_start.0 > 20 && rows.log.len() < 20
+        })
+    });
+}
+
+/// A follower down while the log is compacted past it catches up by a
+/// snapshot, under load: the same state, last result and pins, the
+/// program it missed fetched before the switch, and its queries answer
+/// the same.
+#[test]
+fn a_follower_behind_the_log_catches_up_by_a_snapshot() {
+    let mut cluster = Cluster::compacting(3);
+    let agent = cluster.node(1).create_replicated(vec![1, 2, 3]).unwrap();
+    let leader = cluster.leader(agent);
+    let follower = (1..=3).find(|number| *number != leader).unwrap();
+    wait_until("the follower runs the group", || {
+        cluster.node(follower).applied(agent).is_some()
+    });
+    cluster.stop(follower);
+    cluster.install(agent);
+    let mut total = 0;
+    for sequence in 1..=30 {
+        total += sequence;
+        assert_eq!(
+            done(cluster.increment(leader, agent, sequence, sequence)),
+            total
+        );
+    }
+    wait_until("the leader compacts", || {
+        log_start(cluster.node(leader), agent) > 20
+    });
+    cluster.start(follower);
+    // Calls go on while it catches up.
+    std::thread::scope(|scope| {
+        let cluster = &cluster;
+        scope.spawn(move || {
+            let mut total = total;
+            for sequence in 31..=60 {
+                total += sequence;
+                assert_eq!(
+                    done(cluster.increment(leader, agent, sequence, sequence)),
+                    total
+                );
+            }
+        });
+    });
+    cluster.converged(agent);
+    let caught_up = cluster.node(follower);
+    assert!(log_start(caught_up, agent) > 20, "installed a snapshot");
+    assert_eq!(caught_up.pinned(), cluster.node(leader).pinned());
+    assert!(!caught_up.pinned().is_empty(), "the program it missed");
+    let last = |node: &Node| node.store().snapshot().last_result(agent).unwrap();
+    assert_eq!(last(caught_up), last(cluster.node(leader)));
+    assert_eq!(cluster.value(follower, agent), (1..=60).sum::<u64>());
+    assert!(
+        caught_up.store().stale_epochs(agent).unwrap().is_empty(),
+        "the old epoch is dropped"
+    );
+}
+
+/// A replica that caught up by a snapshot holds the sessions with it: once
+/// it leads, a call it never ran is answered from the window.
+#[test]
+fn a_replica_caught_up_by_a_snapshot_answers_from_its_window_when_it_leads() {
+    let mut cluster = Cluster::compacting(3);
+    let agent = cluster.node(1).create_replicated(vec![1, 2, 3]).unwrap();
+    cluster.install(agent);
+    let leader = cluster.leader(agent);
+    let follower = (1..=3).find(|number| *number != leader).unwrap();
+    cluster.stop(follower);
+    let mut total = 0;
+    for sequence in 1..=30 {
+        total += sequence;
+        assert_eq!(
+            done(cluster.increment(leader, agent, sequence, sequence)),
+            total
+        );
+    }
+    wait_until("the leader compacts", || {
+        log_start(cluster.node(leader), agent) > 20
+    });
+    cluster.start(follower);
+    cluster.converged(agent);
+    assert!(log_start(cluster.node(follower), agent) > 20);
+    // Leadership moves until it reaches the replica that caught up.
+    let until = Instant::now() + Duration::from_secs(20);
+    while cluster.leader(agent) != follower {
+        assert!(Instant::now() < until, "it never led");
+        let current = cluster.leader(agent);
+        cluster.stop(current);
+        wait_until("another leader", || {
+            cluster
+                .running()
+                .any(|(number, node)| number != current && node.leads(agent))
+        });
+        cluster.start(current);
+        cluster.converged(agent);
+    }
+    assert_eq!(done(cluster.increment(follower, agent, 30, 30)), total);
+    assert_eq!(cluster.value(follower, agent), total);
+}
+
+/// A snapshot cut short, by its follower stopping or its leader stopping,
+/// still ends in one: the follower holds the same state, and no staged
+/// rows are left behind.
+#[test]
+fn a_snapshot_cut_short_is_sent_again() {
+    let mut cluster = Cluster::compacting(3);
+    let agent = cluster.node(1).create_replicated(vec![1, 2, 3]).unwrap();
+    cluster.install(agent);
+    let leader = cluster.leader(agent);
+    let follower = (1..=3).find(|number| *number != leader).unwrap();
+    cluster.stop(follower);
+    // Enough rows for many chunks.
+    for sequence in 1..=60 {
+        done(cluster.increment(leader, agent, sequence, sequence));
+    }
+    wait_until("the leader compacts", || {
+        log_start(cluster.node(leader), agent) > 40
+    });
+    // Its follower stops while it stages.
+    cluster.start(follower);
+    std::thread::sleep(Duration::from_millis(15));
+    cluster.stop(follower);
+    cluster.start(follower);
+    // Its leader stops while it streams.
+    std::thread::sleep(Duration::from_millis(15));
+    cluster.stop(leader);
+    cluster.start(leader);
+    cluster.converged(agent);
+    assert_eq!(cluster.value(follower, agent), (1..=60).sum::<u64>());
+    wait_until("no staged rows are left", || {
+        cluster
+            .running()
+            .all(|(_, node)| node.store().stale_epochs(agent).unwrap().is_empty())
+    });
+}
+
+/// A snapshot switches only once the programs it names are here: while
+/// every node withholds them, the follower stays behind.
+#[test]
+fn a_snapshot_waits_for_the_programs_it_names() {
+    let withheld = Arc::new(WithholdBlobs(std::sync::atomic::AtomicBool::new(false)));
+    let mut cluster = Cluster::build(0, withheld.clone(), Vec::new(), false);
+    cluster.compaction = Some((8, 2, 64));
+    cluster.grow(3);
+    let agent = cluster.node(1).create_replicated(vec![1, 2, 3]).unwrap();
+    let leader = cluster.leader(agent);
+    let follower = (1..=3).find(|number| *number != leader).unwrap();
+    wait_until("the follower runs the group", || {
+        cluster.node(follower).applied(agent).is_some()
+    });
+    cluster.stop(follower);
+    cluster.install(agent);
+    for sequence in 1..=30 {
+        done(cluster.increment(leader, agent, sequence, sequence));
+    }
+    wait_until("the leader compacts", || {
+        log_start(cluster.node(leader), agent) > 20
+    });
+    withheld.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    cluster.start(follower);
+    wait_until("the follower stages the snapshot", || {
+        !cluster
+            .node(follower)
+            .store()
+            .stale_epochs(agent)
+            .unwrap()
+            .is_empty()
+    });
+    // Time for every chunk to arrive.
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        log_start(cluster.node(follower), agent),
+        0,
+        "switched without the program"
+    );
+    assert!(cluster.node(follower).pinned().is_empty());
+    withheld.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    cluster.converged(agent);
+    assert_eq!(
+        cluster.node(follower).pinned(),
+        cluster.node(leader).pinned()
     );
 }

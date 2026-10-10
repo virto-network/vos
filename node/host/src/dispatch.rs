@@ -94,6 +94,17 @@ impl Inner {
         }
     }
 
+    /// Give `agent`'s group `input`: dropped, and counted, when no group
+    /// here runs it or its inbox is full; the sender sends again.
+    fn to_group(&self, agent: AgentId, input: Input) {
+        let routed = self
+            .run(agent)
+            .is_some_and(|run| run.inbox.try_send(input).is_ok());
+        if !routed {
+            self.drops.count(peer::Refusal::Unrouted);
+        }
+    }
+
     /// The leader `agent`'s replica here follows, and its term.
     fn followed(&self, agent: AgentId) -> Option<(NodeNumber, u64)> {
         let state = self.run(agent)?.shared.state();
@@ -205,11 +216,16 @@ impl Inner {
             PeerMessage::Blob { .. } | PeerMessage::Directory(_) => {
                 unreachable!("blobs and records are handled in tasks")
             }
-            // Snapshots stream in step 3.7, and pair liveness comes in 3.8.
-            PeerMessage::SnapshotChunk(_)
-            | PeerMessage::SnapshotAck(_)
-            | PeerMessage::Liveness { .. }
-            | PeerMessage::LivenessAnswer { .. } => {}
+            PeerMessage::SnapshotChunk(chunk) => {
+                let agent = chunk.agent;
+                self.to_group(agent, Input::Chunk { from, chunk });
+            }
+            PeerMessage::SnapshotAck(ack) => {
+                let agent = ack.agent;
+                self.to_group(agent, Input::ChunkAck { from, ack });
+            }
+            // Pair liveness comes in 3.8.
+            PeerMessage::Liveness { .. } | PeerMessage::LivenessAnswer { .. } => {}
         }
     }
 

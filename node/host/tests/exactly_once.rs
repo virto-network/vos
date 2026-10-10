@@ -174,6 +174,8 @@ struct Slot {
     starts: AtomicU64,
     /// Messages its earlier runs sent across nodes.
     sent_across: AtomicU64,
+    /// Snapshots its earlier runs switched to.
+    installed: AtomicU64,
     trip: Arc<Trip>,
     offset: Arc<AtomicI64>,
     dir: tempfile::TempDir,
@@ -232,6 +234,7 @@ impl Cluster {
                 node: Mutex::new(None),
                 starts: AtomicU64::new(0),
                 sent_across: AtomicU64::new(0),
+                installed: AtomicU64::new(0),
                 trip: Arc::new(Trip::default()),
                 offset: Arc::new(AtomicI64::new(0)),
                 dir,
@@ -288,6 +291,11 @@ impl Cluster {
         config.peers = Peers::Hub(self.hub.clone());
         config.election_timeout_ms = (40, 80);
         config.heartbeat_ms = 10;
+        // Logs compacted every few dozen entries: a node that comes back
+        // catches up by a snapshot.
+        config.compact_every = 64;
+        config.compact_tail = 16;
+        config.snapshot_chunk = 4096;
         let (offset, everyone) = (Arc::clone(&slot.offset), Arc::clone(&self.offset));
         config.clock = Arc::new(move || {
             vos_node::wall_clock().saturating_add_signed(
@@ -322,6 +330,9 @@ impl Cluster {
         self.slot(number)
             .sent_across
             .fetch_add(node.messages_sent_across(), Ordering::SeqCst);
+        self.slot(number)
+            .installed
+            .fetch_add(node.snapshots_installed(), Ordering::SeqCst);
         node.shutdown();
     }
 
@@ -1358,6 +1369,14 @@ fn exactly_once(mode: Mode, default_seed: u64) {
         })
         .sum();
     println!("messages sent across nodes: {across}");
+    let installed: u64 = (1..=NODES)
+        .map(|number| {
+            cluster.slot(number).installed.load(Ordering::SeqCst)
+                + cluster.node(number).unwrap().snapshots_installed()
+        })
+        .sum();
+    println!("snapshots installed: {installed}");
+    assert!(installed > 0, "no node caught up by a snapshot");
     assert!(across > 0, "no message crossed nodes");
 }
 

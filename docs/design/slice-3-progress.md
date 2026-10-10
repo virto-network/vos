@@ -3991,3 +3991,84 @@ accept `before` while the greatest placement is uncommitted; a new
 leader announces again once its configuration commits; the phantom and
 committed-final retirement rules apply to different replicas; the
 pre-check asks whether Y could run the program.
+
+### 3.7a: compaction and snapshots
+
+#### Built
+
+- **The wire:** a snapshot stream is named by the leader's term and the
+  snapshot's index; its first chunk carries a `Manifest` (the
+  configuration in effect there and the last result's time and seed);
+  `SnapshotAck` names the next chunk the follower wants.
+- **The store's export** reads `LastResult` from the same store snapshot
+  as the rows.
+- **The node** (`Config`): `compact_every` (1,024 entries), `compact_tail`
+  (256) and `snapshot_chunk` (1 MiB), which tests lower.
+- **The group driver:**
+  - reports the writer's durably applied index to its core every round:
+    the core's compaction bound never moved before, as nothing told it;
+  - compacts to the bound less the tail, never past a snapshot it
+    streams, recording the configuration in effect at that point;
+  - **streams** a snapshot (a task per follower, at most one): exported at
+    its applied index, chunks read on an executor, four ahead of the
+    follower's acknowledgement; an acknowledgement that does not move
+    sends the chunk it names again, at most once in 2 s (reordered
+    duplicates would otherwise multiply), and 2 s with none sends the
+    window again; given up after 10 s of silence or with the leadership;
+    a stream ends with a chunk of no rows;
+  - a stream whose chunks are all staged is **held** until the follower's
+    match reaches its index (`Core::match_index`, new) or 60 s pass: it
+    keeps compaction from passing the snapshot, and the core asking
+    again is not heard, so no newer stream displaces one being switched
+    to;
+  - **stages** the chunks of the newest stream it hears, in order, under
+    an epoch past the current one that holds no rows (one an earlier
+    stream left is dropped in the background, in chunks of 4,096 rows,
+    never in one batch on the shared writer), acknowledging each; noting
+    the programs the staged instances name (from the rows, not the
+    leader's word); a snapshot staged whole is switched to, or dropped
+    once idle for 30 s, before any newer stream; anything staged is
+    dropped once it leads;
+  - **switches** once every chunk is staged and those programs are here
+    (asked for like an entry's blobs): the core's rows, the epoch, the
+    applied index, `LastResult` and the pins (`Pin`/`Unpin` against the
+    state before) in one synced commit, under the applier's lock; then
+    the core, the entry reports, the shared state, and the old epoch
+    dropped in the background.
+- **The applier** holds that lock while it applies, and looks again at
+  the applied index once it has it: a switch never meets an apply, which
+  the writer would refuse, halting the node.
+- `Node::snapshots_installed` counts switches, for tests.
+
+**Tests** (`tests/cluster.rs`, nodes compacting every 8 entries, keeping
+2, with chunks of 64 bytes):
+- every replica compacts its log as it applies;
+- a follower down while the log is compacted past it catches up by a
+  snapshot under load: the same rows, last result and pins, the program
+  it missed, queries that answer the same, no epoch left behind;
+- such a replica, once it leads, answers a call from its window;
+- a snapshot cut short by its follower stopping, then by its leader
+  stopping, is sent again and installs;
+- a snapshot waits for the programs it names: while every node withholds
+  blobs, the follower stages but does not switch.
+- **The checker** compacts every 64 entries (keeping 16, chunks of 4 KiB):
+  14–18 snapshots install per run under its faults, and a run asserts at
+  least one.
+- **Mutations, each caught:** no snapshot sent; no last result in the
+  switch; no pins; the durably applied index not reported (nothing
+  compacts); a switch that does not wait for its programs (only by the
+  test that withholds them: otherwise they arrive a moment later).
+- 24 checker seeds (101–103, 301–312 and others) pass in both modes.
+
+**Cost:** the acceptance bench is where 3.6 left it (33.1–33.6 µs per
+request, commits about 1 ms, a lone request 2.9 ms); it never reaches a
+compaction, at 1,024 entries.
+
+**Not tested:** a stream outlasting the core's own snapshot deadline
+(60 s); a snapshot holding a joint configuration, which 3.7b's tests
+bring.
+
+**Review** (Opus): go. Folded in before the commit: a stuck
+acknowledgement sends one chunk again, not the window; a stream held
+until its follower switches; staged rows dropped in the background, a
+new stream staging into an empty epoch instead.

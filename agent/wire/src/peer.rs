@@ -209,29 +209,43 @@ pub struct Configuration {
     pub index: u64,
 }
 
-/// One chunk of the snapshot a leader streams to a replica of `agent`.
+/// One chunk of the snapshot a leader streams to a replica of `agent`. A
+/// stream is named by the leader's term and the snapshot's index.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct SnapshotChunk {
     pub agent: AgentId,
     /// The leader's term: a replica takes chunks only from the leader it
     /// follows, in that leader's term.
     pub term: u64,
-    /// The index and term the snapshot is through.
+    /// The index and term the snapshot is through: the leader's applied
+    /// index when it exported its state.
     pub index: u64,
     pub snapshot_term: u64,
-    pub configuration: Option<Configuration>,
     /// The chunk's place in the stream, from 0.
     pub sequence: u64,
+    /// What the snapshot carries besides its rows, in its first chunk.
+    pub manifest: Option<Manifest>,
     /// The agent's rows, by agent-relative key.
     pub rows: Vec<(Vec<u8>, Vec<u8>)>,
     pub last: bool,
 }
 
-/// A replica holds the snapshot through `index` up to chunk `sequence`.
+/// What a snapshot carries besides the agent's rows.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct Manifest {
+    /// The configuration in effect at the snapshot's index, when known.
+    pub configuration: Option<Configuration>,
+    /// The time and seed of the last work result the state applied, which
+    /// times queries on it.
+    pub last_result: Option<(u64, [u8; 32])>,
+}
+
+/// A replica holds the snapshot stream named by `term` and `index`
+/// through the chunk before `next`, the one it wants next.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct SnapshotAck {
     pub agent: AgentId,
     pub term: u64,
     pub index: u64,
-    pub sequence: u64,
+    pub next: u64,
 }

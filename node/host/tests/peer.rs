@@ -10,7 +10,9 @@ use vos_raft::{AppendResult, Config, LogEntry, Message, Role};
 use vos_wire::Encode;
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Session};
 use vos_wire::ingress::{Answer, Call};
-use vos_wire::peer::{Configuration, NodeNumber, PeerMessage, Raft, SnapshotAck, SnapshotChunk};
+use vos_wire::peer::{
+    Configuration, Manifest, NodeNumber, PeerMessage, Raft, SnapshotAck, SnapshotChunk,
+};
 use vos_wire::result::Outcome;
 
 const AGENT: AgentId = AgentId(7);
@@ -136,12 +138,15 @@ fn chunk(term: u64) -> SnapshotChunk {
         term,
         index: 40,
         snapshot_term: 3,
-        configuration: Some(Configuration {
-            members: vec![1, 2, 3],
-            joint_old: Some(vec![1, 2]),
-            index: 12,
+        sequence: 0,
+        manifest: Some(Manifest {
+            configuration: Some(Configuration {
+                members: vec![1, 2, 3],
+                joint_old: Some(vec![1, 2]),
+                index: 12,
+            }),
+            last_result: Some((1_000, [7; 32])),
         }),
-        sequence: 2,
         rows: vec![(b"key".to_vec(), b"value".to_vec())],
         last: false,
     }
@@ -156,7 +161,7 @@ fn every_other_message_survives_the_wire() {
             agent: AGENT,
             term: 5,
             index: 40,
-            sequence: 2,
+            next: 2,
         }),
         PeerMessage::BlobRequest {
             agent: AGENT,

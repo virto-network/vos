@@ -1031,6 +1031,12 @@ impl<N: NodeId> Core<N> {
         self.role
     }
 
+    /// The highest index `peer` is known to hold, while this replica
+    /// leads.
+    pub fn match_index(&self, peer: N) -> Option<u64> {
+        self.leader.as_ref()?.match_index.get(&peer).copied()
+    }
+
     pub fn status(&self) -> Status<N> {
         Status {
             role: self.role,

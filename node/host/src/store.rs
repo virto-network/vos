@@ -787,6 +787,11 @@ impl Store for Fjall {
         let log_start = row(NodeRow::LogStart)?
             .and_then(|bytes| Some((be_u64(bytes.get(..8)?)?, be_u64(bytes.get(8..16)?)?)))
             .unwrap_or((0, 0));
+        let last_result = row(NodeRow::LastResult)?.and_then(|bytes| {
+            let time = be_u64(bytes.get(..8)?)?;
+            let seed = bytes.get(8..40)?.try_into().ok()?;
+            Some((time, seed))
+        });
         let term = if applied <= log_start.0 {
             log_start.1
         } else {
@@ -808,6 +813,7 @@ impl Store for Fjall {
             epoch,
             applied,
             term,
+            last_result,
             cursor: Some((true, None)),
         })
     }
@@ -860,6 +866,9 @@ pub struct Export {
     epoch: u8,
     pub applied: u64,
     pub term: u64,
+    /// The time and seed of the last work result applied, as of the same
+    /// store snapshot.
+    pub last_result: Option<(u64, [u8; 32])>,
     /// The partition read next (system, then state), and the last key read.
     cursor: Option<(bool, Option<Vec<u8>>)>,
 }

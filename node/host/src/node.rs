@@ -82,6 +82,13 @@ pub struct Config {
     /// leader's heartbeat, in milliseconds.
     pub election_timeout_ms: (u64, u64),
     pub heartbeat_ms: u64,
+    /// A group's log is compacted once this many entries past its start
+    /// are applied durably, and keeps this many below the point it could
+    /// compact to, for a follower a little behind.
+    pub compact_every: u64,
+    pub compact_tail: u64,
+    /// About how many bytes of rows one snapshot chunk carries.
+    pub snapshot_chunk: usize,
 }
 
 impl Config {
@@ -103,6 +110,9 @@ impl Config {
             peers: Peers::Quic,
             election_timeout_ms: (1500, 3000),
             heartbeat_ms: 500,
+            compact_every: 1024,
+            compact_tail: 256,
+            snapshot_chunk: 1 << 20,
         }
     }
 }
@@ -368,6 +378,9 @@ pub(crate) struct Inner {
     pub(crate) network: Option<Arc<dyn Wire>>,
     pub(crate) election_timeout_ms: (u64, u64),
     pub(crate) heartbeat_ms: u64,
+    pub(crate) compact_every: u64,
+    pub(crate) compact_tail: u64,
+    pub(crate) snapshot_chunk: usize,
     /// Every agent this node knows of.
     pub(crate) directory: Mutex<HashMap<AgentId, CreationRecord>>,
     /// For each agent this node created, the nodes yet to hold its record.
@@ -391,6 +404,8 @@ pub(crate) struct Inner {
     pub(crate) turn: std::sync::atomic::AtomicU64,
     /// Messages sent toward other nodes.
     pub(crate) sent_across: std::sync::atomic::AtomicU64,
+    /// Snapshots this node's groups switched to.
+    pub(crate) installed: std::sync::atomic::AtomicU64,
     /// Messages relayed to their agent's leader.
     pub(crate) relayed: std::sync::atomic::AtomicU64,
     /// Clients' calls: their lanes, and the calls forwarded both ways.
@@ -1199,6 +1214,9 @@ impl Node {
             network,
             election_timeout_ms: config.election_timeout_ms,
             heartbeat_ms: config.heartbeat_ms,
+            compact_every: config.compact_every,
+            compact_tail: config.compact_tail,
+            snapshot_chunk: config.snapshot_chunk,
             directory: Mutex::new(HashMap::new()),
             unacknowledged: Mutex::new(HashMap::new()),
             acknowledged: event_listener::Event::new(),
@@ -1214,6 +1232,7 @@ impl Node {
             reads: crate::queries::Reads::default(),
             turn: std::sync::atomic::AtomicU64::new(0),
             sent_across: std::sync::atomic::AtomicU64::new(0),
+            installed: std::sync::atomic::AtomicU64::new(0),
             relayed: std::sync::atomic::AtomicU64::new(0),
         });
         for record in records {
@@ -1241,6 +1260,13 @@ impl Node {
     /// The node's identity, its public key, which its TLS presents.
     pub fn id(&self) -> NodeId {
         self.inner.node_id
+    }
+
+    /// Snapshots this node's groups switched to.
+    pub fn snapshots_installed(&self) -> u64 {
+        self.inner
+            .installed
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Messages this node sent toward agents on other nodes, again on
