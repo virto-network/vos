@@ -7,7 +7,8 @@ pub mod http;
 mod ingress;
 mod node;
 mod pvm;
-mod storage;
+pub mod raft;
+pub mod storage;
 pub mod store;
 
 pub use ingress::SESSIONS_PER_KEY;

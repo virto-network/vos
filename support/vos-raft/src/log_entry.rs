@@ -26,19 +26,8 @@ pub struct LogEntry<N: NodeId> {
     pub kind: EntryKind<N>,
 }
 
-/// What kind of entry sits in the log at this index.
-///
-/// Storage layers serialize this as a one-byte tag prefixed to
-/// the body. Tag values reserved by this crate:
-/// - `0` = `Data`
-/// - `1` = `ConfigChange` (reserved for the upcoming
-///   joint-consensus implementation; not yet emitted by the
-///   worker)
-///
-/// `#[non_exhaustive]` because future Raft features may add
-/// more kinds.
+/// What an entry holds: application data, or a membership change.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum EntryKind<N: NodeId> {
     /// Application data — the consensus layer doesn't interpret
     /// the payload bytes.

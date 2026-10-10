@@ -70,10 +70,7 @@ fn writer(store: Fjall, appends: Receiver<Append>, cap: usize) {
             batch.append(
                 append.agent,
                 append.index,
-                &LogEntry {
-                    term: 1,
-                    entry: append.entry.to_vec(),
-                },
+                &LogEntry::result(1, append.entry.to_vec()),
             );
             taken.push(append);
         }

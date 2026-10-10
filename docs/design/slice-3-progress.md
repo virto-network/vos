@@ -732,3 +732,87 @@ in: rows name their blobs, the writer reports stalls, the epoch byte
 from 3.3a, the collection races, the export's membership rule, staging
 through the journal, bounded removal. For step 3.7: dropping an agent's
 replica (log, epochs, node rows, pins) with its tombstone.
+
+### 3.3a: Raft rows and the writer
+
+**Built:**
+
+- **The layout** (`store.rs`):
+  - agent rows sit under an epoch byte, fixed at 0;
+  - the node's rows for an agent are `agent ∥ 0xff ∥ row`, named by an
+    enum;
+  - log rows carry their kind and the blobs they name;
+  - a replica's hard state, log start and membership each have a row.
+  - `Store` gains `raft(agent)` (everything recovery needs) and
+    `log_range(…, max_bytes)`.
+  - `Batch` gains `truncate`, `compact`, `hard_state` and `membership`.
+  - A truncation also removes entries the same batch appended earlier: a
+    group can hold one write's appends and the next leader's truncation.
+- **Opening a store syncs what it recovered.** fjall syncs a recovered
+  journal only when it cuts a torn tail, so rows a crashed process left
+  in the page cache could be lost to a later power cut, after the node
+  relied on them. `Fjall::open` syncs every journal and its directory
+  first. Found when the writer refused a compaction after a restart: the
+  core counted the recovered applied index as durable, the writer did not.
+- **The writer** (`storage.rs`, now public):
+  - changes carry their durability, and a group syncs if any change in
+    it must;
+  - the durably applied index is per agent, per synced flush, and is
+    seeded by `recovered(agent, applied)` at startup;
+  - a compaction past it is refused;
+  - an 8 MiB flush cap guards a group's size;
+  - `stalled()` reports a commit that waited past 1 s.
+- **The adapter** (`raft.rs`) maps the core's writes to changes (leaving
+  the meta's snapshot pointer out), loads to ranges, `CompactBound` to a
+  compaction, and rows to `Recovered`; node numbers are `u8`.
+- **The single-node path** commits an append and an apply where it
+  committed one combined change; nothing else moves. vos-raft's
+  `EntryKind` is no longer `#[non_exhaustive]`, so the adapter matches it
+  whole.
+
+**Tests:**
+
+- unit tests: Raft rows across a reopen; a truncation over stored and
+  batched entries, another agent untouched; byte-capped ranges; entries
+  round-tripping through the adapter, an unreadable payload included; the
+  durably applied index moving only with a synced flush; compaction
+  refused past it; a stall reported and cleared.
+- **Three vos-raft cores over three real stores and writers:**
+  - one run restarts a replica every round (the leader every third),
+    each recovering from its store, with compaction off: a replica down
+    while the others compact would need a snapshot (3.3c);
+  - another compacts with every replica up.
+  - Every replica applies the same entries through the same index, and
+    its state agrees.
+- **`raft_crash`:** a child drives the writer as a replica does (synced
+  appends with their hard state, buffered applies and commit moves, new
+  terms, compactions within the durably applied index). Twelve rounds of
+  random kills, the last six tearing the journal's tail. After each:
+  - invariant 1: one prefix of applies;
+  - invariant 2: the log holds every entry from its start through the
+    applied index and on, without a gap;
+  - invariant 4: the log starts at or below the applied index;
+  - the term and every append reported synced survive, but for a tear's
+    reach.
+- Slice 2's suites pass unchanged in substance; its crash test passes on
+  the new layout. The acceptance bench: 29.3 µs per request under load
+  (22.6 µs execution), 0.94 ms per commit, a query at median 53 µs, as
+  in step 2.9.
+
+**Review** (Opus): go, with these fixed before the commit:
+
+- a truncation whose read fails fails its batch, rather than leaving a
+  suffix the core believes removed;
+- applies count toward the durably applied index only once their batch
+  committed;
+- a data payload never becomes a membership change on a round trip;
+- the journals are synced before the store opens, not racing fjall's
+  workers;
+- every replica restarts from its compacted log, in a test of its own;
+- the crash tests tear back from where a journal's data ends (fjall
+  preallocates journals, so a tear from the file's end could hit only
+  zeros), and fail if no torn round reached data.
+
+For later steps: refuse a compaction at or below the log start once a
+switch can move it (3.3c); recover each agent's terms and the log's tail
+only, not its whole live log, when a node runs many agents (3.8).

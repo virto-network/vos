@@ -17,6 +17,7 @@ subtle = { workspace = true }
 tracing = "0.1"
 ureq = "3"
 vos-pvm = { workspace = true }
+vos-raft = { workspace = true }
 vos-wire = { workspace = true }
 
 [dev-dependencies]
@@ -26,6 +27,10 @@ vos-pvm-compiler = { workspace = true }
 
 [[test]]
 name = "crash"
+harness = false
+
+[[test]]
+name = "raft_crash"
 harness = false
 
 [[bench]]

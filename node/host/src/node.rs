@@ -365,7 +365,7 @@ impl Leader {
         let snapshot = inner.store.snapshot();
         let applied = snapshot.applied(id).map_err(infrastructure)?.unwrap_or(0);
         let time = match inner.store.log_entry(id, applied).map_err(infrastructure)? {
-            Some(entry) => pvm::decode::<WorkResult>(&entry.entry)
+            Some(entry) => pvm::decode::<WorkResult>(&entry.body)
                 .map(|result| result.time)
                 .unwrap_or(0),
             None => 0,
@@ -582,18 +582,22 @@ impl Leader {
                 self.version
             )));
         }
-        let change = Change::Log {
-            agent: id,
-            index: self.applied + 1,
-            entry: LogEntry {
-                term: 0,
-                entry: output,
+        let index = self.applied + 1;
+        let changes = vec![
+            Change::Append {
+                agent: id,
+                index,
+                entry: LogEntry::result(0, output),
             },
-            writes,
-        };
+            Change::Apply {
+                agent: id,
+                index,
+                writes,
+            },
+        ];
         inner
             .storage
-            .commit(vec![change])
+            .commit(changes)
             .await
             .map_err(Fault::Storage)?;
         Ok(result)
@@ -938,7 +942,7 @@ impl Inner {
             .log_entry(agent, applied)
             .map_err(|error| CallError::Failed(error.to_string()))?
         {
-            Some(entry) => pvm::decode::<WorkResult>(&entry.entry)
+            Some(entry) => pvm::decode::<WorkResult>(&entry.body)
                 .map(|result| (result.time, result.seed))
                 .unwrap_or((0, [0; 32])),
             None => (0, [0; 32]),

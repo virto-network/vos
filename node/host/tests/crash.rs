@@ -67,10 +67,7 @@ fn writer(dir: &str) {
         batch.append(
             AGENT,
             index,
-            &LogEntry {
-                term: 1,
-                entry: index.to_be_bytes().to_vec(),
-            },
+            &LogEntry::result(1, index.to_be_bytes().to_vec()),
         );
         batch.apply(AGENT, index, &writes(index));
         let durability = if index.is_multiple_of(2) {
@@ -114,6 +111,7 @@ fn main() {
         seed
     };
     let mut last: u64 = 0;
+    let mut tore = 0;
     for round in 0..ROUNDS {
         let mut child = Command::new(std::env::current_exe().unwrap())
             .env(WRITER, dir.path())
@@ -134,8 +132,8 @@ fn main() {
             reported = line.unwrap().parse().unwrap();
         }
         let torn = round >= TORN_FROM;
-        if torn {
-            tear(dir.path(), round.is_multiple_of(2), &mut random);
+        if torn && tear(dir.path(), round.is_multiple_of(2), &mut random) {
+            tore += 1;
         }
 
         let store = Fjall::open(dir.path()).unwrap();
@@ -164,7 +162,7 @@ fn main() {
             store
                 .log_entry(AGENT, applied)
                 .unwrap()
-                .map(|entry| entry.entry),
+                .map(|entry| entry.body),
             (applied > 0).then(|| applied.to_be_bytes().to_vec()),
             "round {round}"
         );
@@ -177,12 +175,14 @@ fn main() {
         println!("round {round}: {how} after {reported}, recovered at {applied}");
         last = applied;
     }
+    assert!(tore > 0, "no torn round reached the journal's data");
     println!("crash: {ROUNDS} rounds recovered one prefix each");
 }
 
-/// Truncate the newest journal by up to [`TEAR`] bytes, or zero up to its
-/// last [`TEAR`] bytes.
-fn tear(dir: &std::path::Path, truncate: bool, random: &mut impl FnMut() -> u64) {
+/// Truncate the newest journal's data by up to [`TEAR`] bytes, or zero up
+/// to its last [`TEAR`] bytes of data: whether it tore any. fjall
+/// preallocates its journals, so the data ends before the file does.
+fn tear(dir: &std::path::Path, truncate: bool, random: &mut impl FnMut() -> u64) -> bool {
     let mut journals = Vec::new();
     let mut pending = vec![dir.to_path_buf()];
     while let Some(path) = pending.pop() {
@@ -201,21 +201,24 @@ fn tear(dir: &std::path::Path, truncate: bool, random: &mut impl FnMut() -> u64)
         }
     }
     let (_, journal) = journals.into_iter().max().expect("a journal");
-    let len = std::fs::metadata(&journal).unwrap().len();
-    if len == 0 {
-        return;
+    let mut bytes = std::fs::read(&journal).unwrap();
+    let end = bytes
+        .iter()
+        .rposition(|&byte| byte != 0)
+        .map_or(0, |at| at + 1);
+    if end == 0 {
+        return false;
     }
-    let reach = 1 + random() % TEAR.min(len);
+    let reach = 1 + (random() % TEAR.min(end as u64)) as usize;
     if truncate {
         let file = std::fs::OpenOptions::new()
             .write(true)
             .open(&journal)
             .unwrap();
-        file.set_len(len - reach).unwrap();
+        file.set_len((end - reach) as u64).unwrap();
     } else {
-        let mut bytes = std::fs::read(&journal).unwrap();
-        let at = (len - reach) as usize;
-        bytes[at..].fill(0);
+        bytes[end - reach..end].fill(0);
         std::fs::write(&journal, bytes).unwrap();
     }
+    true
 }
