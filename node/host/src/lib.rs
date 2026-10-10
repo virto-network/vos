@@ -1,6 +1,7 @@
 //! The VOS node host: its storage and, on one process, every agent it
 //! runs (`Node`).
 
+pub mod blobs;
 pub mod client;
 mod executor;
 pub mod http;

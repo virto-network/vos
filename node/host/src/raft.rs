@@ -11,8 +11,14 @@ use vos_raft::core::{Load, Recovered, Write};
 use vos_raft::{ActiveConfigRecord, EntryKind as RaftKind, LogEntry as RaftEntry, Meta};
 use vos_wire::ids::AgentId;
 
+use std::collections::VecDeque;
+
+use crate::blobs::Blobs;
 use crate::storage::Change;
-use crate::store::{self, EntryKind, HardState, LogEntry, Membership, NodeNumber, RaftRows, Store};
+use crate::store::{
+    self, Batch as _, Durability, EntryKind, Fjall, HardState, LogEntry, Membership, NodeNumber,
+    RaftRows, Store,
+};
 
 /// The store's entry for a Raft entry.
 pub fn to_store(entry: &RaftEntry<NodeNumber>) -> LogEntry {
@@ -134,6 +140,115 @@ fn record(membership: Membership) -> ActiveConfigRecord<NodeNumber> {
     }
 }
 
+/// Cut `agent`'s log at its first entry naming a blob the store does not
+/// hold: the index cut from, if any. Such an entry was never reported
+/// durable, so no replica counted it (section 9.5, invariant 7); every
+/// agent shares one journal, so its row can survive a crash its blob did
+/// not. Run on open, before recovering the core.
+pub fn cut_missing_blobs(
+    store: &Fjall,
+    blobs: &Blobs,
+    agent: AgentId,
+) -> store::Result<Option<u64>> {
+    let rows = store.raft(agent)?;
+    for (index, entry) in &rows.log {
+        for blob in &entry.blobs {
+            if !blobs.contains(&blob.hash)? {
+                let mut batch = store.batch();
+                batch.truncate(agent, index - 1);
+                batch.commit(Durability::Synced)?;
+                return Ok(Some(*index));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// The entry reports one replica owes its core: its writes in order, each
+/// with the blobs its entries name that were missing. A write's entries
+/// are reported once its blobs, and every earlier write's, are stored.
+#[derive(Default)]
+pub struct EntryReports {
+    pending: VecDeque<Pending>,
+}
+
+struct Pending {
+    seq: u64,
+    /// The write's entries that still wait, by index, with their blobs.
+    waiting: Vec<(u64, Vec<[u8; 32]>)>,
+}
+
+impl EntryReports {
+    /// `write` is durable. A truncation in it drops the waits of the
+    /// entries it removed, from earlier writes too. `stored` answers from a
+    /// [`Blobs::touch`] of the write's blobs, so none of them is collected
+    /// while the entry comes to rely on it.
+    pub fn written(&mut self, write: &Write<NodeNumber>, stored: impl Fn(&[u8; 32]) -> bool) {
+        if let Some(after) = write.truncate_after {
+            for pending in &mut self.pending {
+                pending.waiting.retain(|(index, _)| *index <= after);
+            }
+        }
+        let waiting = write
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                let missing: Vec<[u8; 32]> = to_store(entry)
+                    .blobs
+                    .iter()
+                    .map(|blob| blob.hash)
+                    .filter(|hash| !stored(hash))
+                    .collect();
+                (!missing.is_empty()).then_some((entry.index, missing))
+            })
+            .collect();
+        self.pending.push_back(Pending {
+            seq: write.seq,
+            waiting,
+        });
+    }
+
+    /// The last write whose entries can now be reported, if any.
+    pub fn ready(&mut self, stored: impl Fn(&[u8; 32]) -> bool) -> Option<u64> {
+        let mut last = None;
+        while let Some(front) = self.pending.front_mut() {
+            front
+                .waiting
+                .retain(|(_, missing)| missing.iter().any(|hash| !stored(hash)));
+            if !front.waiting.is_empty() {
+                break;
+            }
+            last = Some(front.seq);
+            self.pending.pop_front();
+        }
+        last
+    }
+
+    /// Every blob a waiting write still needs, each once: the host fetches
+    /// them together.
+    pub fn missing(&self) -> Vec<[u8; 32]> {
+        let mut missing: Vec<[u8; 32]> = self
+            .pending
+            .iter()
+            .flat_map(|pending| pending.waiting.iter())
+            .flat_map(|(_, missing)| missing.iter().copied())
+            .collect();
+        missing.sort_unstable();
+        missing.dedup();
+        missing
+    }
+
+    /// A snapshot switch at `index`: the entries at or below it are covered,
+    /// and with them every entry above if the log's suffix went.
+    pub fn switched(&mut self, index: u64, keeps_suffix: bool) {
+        for pending in &mut self.pending {
+            pending
+                .waiting
+                .retain(|(at, _)| keeps_suffix && *at > index);
+        }
+    }
+}
+
 /// What the core recovers from the store's rows.
 pub fn recovered(rows: RaftRows) -> Recovered<NodeNumber> {
     Recovered {
@@ -197,6 +312,114 @@ mod tests {
         let stored = to_store(&disguised);
         assert_eq!(stored.kind, EntryKind::Result);
         assert!(matches!(to_raft(9, &stored).kind, RaftKind::Data { .. }));
+    }
+
+    /// A Raft write of `entries` (index, blobs named), after `truncate`.
+    fn write(seq: u64, truncate: Option<u64>, entries: &[(u64, &[[u8; 32]])]) -> Write<NodeNumber> {
+        Write {
+            seq,
+            truncate_after: truncate,
+            entries: entries
+                .iter()
+                .map(|(index, blobs)| {
+                    let entry = LogEntry {
+                        blobs: blobs
+                            .iter()
+                            .map(|hash| BlobRef {
+                                hash: *hash,
+                                len: 1,
+                            })
+                            .collect(),
+                        ..LogEntry::result(1, vec![1])
+                    };
+                    RaftEntry::data(*index, 1, entry.payload())
+                })
+                .collect(),
+            meta: None,
+            active_config: None,
+            sync: true,
+        }
+    }
+
+    #[test]
+    fn entry_reports_wait_for_blobs_in_write_order() {
+        let stored = std::cell::RefCell::new(std::collections::HashSet::new());
+        let is_stored = |hash: &[u8; 32]| stored.borrow().contains(hash);
+        let mut reports = EntryReports::default();
+        reports.written(&write(1, None, &[(1, &[[7; 32]])]), is_stored);
+        reports.written(&write(2, None, &[(2, &[])]), is_stored);
+        assert_eq!(
+            reports.ready(is_stored),
+            None,
+            "the first write waits for its blob"
+        );
+        assert_eq!(reports.missing(), vec![[7; 32]]);
+        stored.borrow_mut().insert([7; 32]);
+        assert_eq!(reports.ready(is_stored), Some(2));
+        assert_eq!(reports.ready(is_stored), None);
+    }
+
+    #[test]
+    fn a_truncation_drops_the_waits_it_removes() {
+        let is_stored = |_: &[u8; 32]| false;
+        let mut reports = EntryReports::default();
+        reports.written(&write(1, None, &[(11, &[[7; 32]])]), is_stored);
+        // A new leader replaces 11, with an entry naming no blob.
+        reports.written(&write(2, Some(10), &[(11, &[])]), is_stored);
+        assert_eq!(reports.ready(is_stored), Some(2));
+    }
+
+    #[test]
+    fn every_awaited_blob_is_listed_and_a_switch_releases_its_waits() {
+        let is_stored = |_: &[u8; 32]| false;
+        let mut reports = EntryReports::default();
+        reports.written(&write(1, None, &[(1, &[[7; 32]])]), is_stored);
+        reports.written(
+            &write(2, None, &[(2, &[[8; 32], [7; 32]]), (3, &[[9; 32]])]),
+            is_stored,
+        );
+        assert_eq!(reports.missing(), vec![[7; 32], [8; 32], [9; 32]]);
+        // A snapshot through 2, keeping the suffix: only 3 still waits.
+        reports.switched(2, true);
+        assert_eq!(reports.missing(), vec![[9; 32]]);
+        assert_eq!(reports.ready(is_stored), Some(1));
+        // A snapshot that dropped the suffix releases everything.
+        reports.switched(2, false);
+        assert_eq!(reports.ready(is_stored), Some(2));
+    }
+
+    #[test]
+    fn recovery_cuts_the_log_at_its_first_missing_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Fjall::open(dir.path().join("store")).unwrap();
+        let blobs = Blobs::open(dir.path().join("blobs"), &store).unwrap();
+        let held = Arc::new(vec![1u8; 100]);
+        let held_ref = crate::blobs::blob_ref(&held);
+        smol::block_on(blobs.put(held_ref, held)).unwrap();
+        let naming = |blob: BlobRef| LogEntry {
+            blobs: vec![blob],
+            ..LogEntry::result(1, Vec::new())
+        };
+        let lost = BlobRef {
+            hash: [9; 32],
+            len: 100,
+        };
+        let mut batch = store.batch();
+        batch.append(AGENT, 1, &LogEntry::result(1, vec![1]));
+        batch.append(AGENT, 2, &naming(held_ref));
+        batch.append(AGENT, 3, &naming(lost));
+        batch.append(AGENT, 4, &LogEntry::result(1, vec![4]));
+        batch.commit(crate::store::Durability::Synced).unwrap();
+        assert_eq!(cut_missing_blobs(&store, &blobs, AGENT).unwrap(), Some(3));
+        let held_indices: Vec<u64> = store
+            .raft(AGENT)
+            .unwrap()
+            .log
+            .iter()
+            .map(|(index, _)| *index)
+            .collect();
+        assert_eq!(held_indices, vec![1, 2]);
+        assert_eq!(cut_missing_blobs(&store, &blobs, AGENT).unwrap(), None);
     }
 
     /// The key the test's state machine counts applied entries under.

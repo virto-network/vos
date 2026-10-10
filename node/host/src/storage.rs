@@ -67,10 +67,18 @@ pub enum Change {
         index: u64,
         writes: Vec<Write>,
     },
-    Program {
-        hash: ProgramHash,
-        blob: Vec<u8>,
+    /// `agent` keeps the blob `hash`, a program it runs.
+    Pin {
+        hash: [u8; 32],
+        agent: AgentId,
     },
+    Unpin {
+        hash: [u8; 32],
+        agent: AgentId,
+    },
+    /// Nothing, synced: everything committed before it is durable once it
+    /// is answered.
+    Barrier,
     Agent {
         agent: AgentId,
         program: ProgramHash,
@@ -101,7 +109,6 @@ impl Change {
                 .iter()
                 .map(|write| write.key.len() + write.value.as_ref().map_or(0, Vec::len))
                 .sum(),
-            Self::Program { blob, .. } => blob.len(),
             _ => 64,
         }
     }
@@ -200,7 +207,9 @@ impl Writer {
                         let entry = applied.entry(*agent).or_insert(*index);
                         *entry = (*entry).max(*index);
                     }
-                    Change::Program { hash, blob } => batch.program(hash, blob),
+                    Change::Pin { hash, agent } => batch.pin(hash, *agent),
+                    Change::Unpin { hash, agent } => batch.unpin(hash, *agent),
+                    Change::Barrier => {}
                     Change::Agent { agent, program } => batch.agent(*agent, program),
                     Change::Session { id, key, time } => batch.session(*id, key, *time),
                     Change::ForgetSession(id) => batch.forget_session(*id),

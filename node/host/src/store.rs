@@ -6,7 +6,7 @@
 //!   the outbox), keyed the same way, and the node's own rows for each
 //!   agent (its applied index, its Raft state), above every epoch;
 //! - `log`: each agent's log, by (agent, index);
-//! - `programs`: program blobs by hash.
+//! - `blobs`: the blob store's index and pins ([`crate::blobs`]).
 //!
 //! An agent's rows live under an epoch, so that a snapshot can be installed
 //! beside the current state and switched to at once; every agent is at
@@ -16,7 +16,7 @@
 //! batches into one commit. A replicated agent appends with a sync before
 //! applying, and applies without one (section 9.5).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Bound;
 use std::path::Path;
 
@@ -190,11 +190,6 @@ pub trait Store: Send + Sync {
     /// The agent's Raft state, for recovery.
     fn raft(&self, agent: AgentId) -> Result<RaftRows>;
 
-    fn program(&self, hash: &ProgramHash) -> Result<Option<Vec<u8>>>;
-
-    /// Every stored program, for the machine pool at start.
-    fn programs(&self) -> Result<Vec<(ProgramHash, Vec<u8>)>>;
-
     /// The agents this node runs, each with its agent program.
     fn agents(&self) -> Result<Vec<(AgentId, ProgramHash)>>;
 
@@ -255,7 +250,10 @@ pub trait Batch {
         writes: impl IntoIterator<Item = &'a Write>,
     );
 
-    fn program(&mut self, hash: &ProgramHash, blob: &[u8]);
+    /// `agent` keeps the blob `hash`: a program it runs.
+    fn pin(&mut self, hash: &[u8; 32], agent: AgentId);
+
+    fn unpin(&mut self, hash: &[u8; 32], agent: AgentId);
 
     /// Record that this node runs `agent` with the agent program `program`.
     fn agent(&mut self, agent: AgentId, program: &ProgramHash);
@@ -510,7 +508,7 @@ pub struct Fjall {
     state: Keyspace,
     system: Keyspace,
     log: Keyspace,
-    programs: Keyspace,
+    blobs: Keyspace,
 }
 
 impl Fjall {
@@ -537,7 +535,7 @@ impl Fjall {
             // often absent: keep the filters that answer misses cheaply.
             system: db.keyspace("system", KeyspaceCreateOptions::default)?,
             log: db.keyspace("log", KeyspaceCreateOptions::default)?,
-            programs: db.keyspace("programs", KeyspaceCreateOptions::default)?,
+            blobs: db.keyspace("blobs", KeyspaceCreateOptions::default)?,
             db,
         })
     }
@@ -580,6 +578,30 @@ impl Fjall {
 
     pub fn disk_space(&self) -> Result<u64> {
         self.db.disk_space()
+    }
+
+    pub(crate) fn database(&self) -> &Database {
+        &self.db
+    }
+
+    /// The blob store's partition.
+    pub(crate) fn blobs(&self) -> &Keyspace {
+        &self.blobs
+    }
+
+    /// Every blob a log row names or a pin holds, as `snapshot` sees them.
+    pub(crate) fn referenced_blobs(&self, snapshot: &fjall::Snapshot) -> Result<HashSet<[u8; 32]>> {
+        let mut referenced = HashSet::new();
+        for row in snapshot.iter(&self.log) {
+            let value = row.value()?;
+            let entry = decode_entry(&value).expect("a log entry this store wrote");
+            referenced.extend(entry.blobs.iter().map(|blob| blob.hash));
+        }
+        for row in snapshot.prefix(&self.blobs, [crate::blobs::IndexRow::Pin as u8]) {
+            let key = row.key()?;
+            referenced.insert(key[1..33].try_into().expect("a pin names a hash"));
+        }
+        Ok(referenced)
     }
 }
 
@@ -667,21 +689,6 @@ impl Store for Fjall {
             applied,
             log,
         })
-    }
-
-    fn program(&self, hash: &ProgramHash) -> Result<Option<Vec<u8>>> {
-        Ok(self.programs.get(hash.0)?.map(|blob| blob.to_vec()))
-    }
-
-    fn programs(&self) -> Result<Vec<(ProgramHash, Vec<u8>)>> {
-        self.programs
-            .iter()
-            .map(|row| {
-                let (hash, blob) = row.into_inner()?;
-                let hash = hash[..].try_into().expect("a 32-byte program hash");
-                Ok((ProgramHash(hash), blob.to_vec()))
-            })
-            .collect()
     }
 
     fn node_id(&self) -> Result<Option<[u8; 32]>> {
@@ -893,8 +900,14 @@ impl Batch for FjallBatch {
         );
     }
 
-    fn program(&mut self, hash: &ProgramHash, blob: &[u8]) {
-        self.batch.insert(&self.store.programs, hash.0, blob);
+    fn pin(&mut self, hash: &[u8; 32], agent: AgentId) {
+        self.batch
+            .insert(&self.store.blobs, crate::blobs::pin_key(hash, agent.0), []);
+    }
+
+    fn unpin(&mut self, hash: &[u8; 32], agent: AgentId) {
+        self.batch
+            .remove(&self.store.blobs, crate::blobs::pin_key(hash, agent.0));
     }
 
     fn agent(&mut self, agent: AgentId, program: &ProgramHash) {
@@ -937,6 +950,14 @@ impl Batch for FjallBatch {
     fn commit(self, durability: Durability) -> Result<()> {
         if let Some(error) = self.error {
             return Err(error);
+        }
+        // fjall skips an empty batch, sync and all: a synced commit of
+        // nothing still syncs what came before it.
+        if self.batch.is_empty() {
+            if durability == Durability::Synced {
+                self.store.db.persist(PersistMode::SyncAll)?;
+            }
+            return Ok(());
         }
         let mode = match durability {
             Durability::Buffered => PersistMode::Buffer,
@@ -1310,23 +1331,19 @@ mod tests {
     }
 
     #[test]
-    fn logs_and_programs_round_trip() {
+    fn logs_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let store = Fjall::open(dir.path()).unwrap();
         let entry = LogEntry::result(3, b"result".to_vec());
-        let hash = ProgramHash([5; 32]);
         let mut batch = store.batch();
         batch.append(A, 7, &entry);
-        batch.program(&hash, b"blob");
         batch.commit(Durability::Synced).unwrap();
         assert_eq!(store.log_entry(A, 7).unwrap(), Some(entry));
         assert_eq!(store.log_entry(A, 8).unwrap(), None);
         assert_eq!(store.log_entry(B, 7).unwrap(), None);
-        assert_eq!(store.program(&hash).unwrap().as_deref(), Some(&b"blob"[..]));
         drop(store);
 
         let reopened = Fjall::open(dir.path()).unwrap();
         assert_eq!(reopened.log_entry(A, 7).unwrap().unwrap().term, 3);
-        assert!(reopened.program(&hash).unwrap().is_some());
     }
 }

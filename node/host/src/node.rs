@@ -26,11 +26,12 @@ use vos_wire::result::{Outcome, Outgoing, Step, WorkResult};
 use vos_wire::{Decode, defaults, keys};
 
 use crate::Hooks;
+use crate::blobs::Blobs;
 use crate::executor::Executors;
 use crate::pvm::{self, Fault};
 use crate::storage::{Change, StorageThread};
 use crate::store::{
-    Batch as _, Durability, Fjall, FjallSnapshot, LogEntry, NODE_AGENT, Store, View,
+    Batch as _, BlobRef, Durability, Fjall, FjallSnapshot, LogEntry, NODE_AGENT, Store, View,
 };
 
 /// How a node runs.
@@ -200,6 +201,7 @@ impl Agent {
 
 pub(crate) struct Inner {
     pub(crate) store: Fjall,
+    blobs: Blobs,
     storage: StorageThread,
     executors: Executors,
     pool: Arc<MachinePool>,
@@ -545,7 +547,7 @@ impl Leader {
         let id = self.id;
         let program = Arc::clone(&inner.program);
         let pool = Arc::clone(&inner.pool);
-        let store = inner.store.clone();
+        let blobs = inner.blobs.clone();
         let batch = batch.clone();
         let hooks = Arc::clone(&inner.hooks);
         let gas = inner.refine_gas;
@@ -556,7 +558,7 @@ impl Leader {
                 if hooks.fail_refine(id, &batch) {
                     return Err(Fault::Agent("a hook failed the refine".into()));
                 }
-                pvm::refine(&program, &pool, &store, state, id, &Work::Batch(batch), gas)
+                pvm::refine(&program, &pool, &blobs, state, id, &Work::Batch(batch), gas)
             })
             .await)?;
         let result: WorkResult = pvm::decode(&output)?;
@@ -862,25 +864,40 @@ impl Inner {
         let pooled = self
             .executors
             .run(move || {
-                let mut changes = Vec::new();
+                let mut stored = Vec::new();
                 let mut pooled = |blob: Vec<u8>| -> Result<ProgramHash, CallError> {
                     let hash = pool
                         .install(&blob)
                         .map_err(|error| CallError::Failed(format!("{error:?}")))?;
-                    let hash = ProgramHash(hash.0);
-                    changes.push(Change::Program { hash, blob });
-                    Ok(hash)
+                    let reference = BlobRef {
+                        hash: hash.0,
+                        len: blob.len() as u64,
+                    };
+                    stored.push((reference, Arc::new(blob)));
+                    Ok(ProgramHash(hash.0))
                 };
                 let program = pooled(program)?;
                 let attestables = attestables
                     .into_iter()
                     .map(|(method, blob)| Ok((method, pooled(blob)?)))
                     .collect::<Result<Vec<_>, CallError>>()?;
-                Ok((program, attestables, changes))
+                Ok((program, attestables, stored))
             })
             .await
             .map_err(|panicked| CallError::Failed(panicked.0))?;
-        let (program, attestables, changes) = pooled?;
+        let (program, attestables, stored) = pooled?;
+        // The blobs are durable before the pins that keep them.
+        let mut changes = Vec::with_capacity(stored.len());
+        for (reference, blob) in stored {
+            self.blobs
+                .put(reference, blob)
+                .await
+                .map_err(CallError::Failed)?;
+            changes.push(Change::Pin {
+                hash: reference.hash,
+                agent,
+            });
+        }
         self.storage
             .commit(changes)
             .await
@@ -957,12 +974,12 @@ impl Inner {
         });
         let program = Arc::clone(&self.program);
         let pool = Arc::clone(&self.pool);
-        let store = self.store.clone();
+        let blobs = self.blobs.clone();
         let gas = self.refine_gas;
         let failed = |fault: Fault| CallError::Failed(fault.message().to_string());
         let output = ran(self
             .executors
-            .run(move || pvm::refine(&program, &pool, &store, snapshot, agent, &work, gas))
+            .run(move || pvm::refine(&program, &pool, &blobs, snapshot, agent, &work, gas))
             .await)
         .map_err(failed)?;
         pvm::decode::<Outcome>(&output).map_err(failed)
@@ -985,6 +1002,7 @@ pub struct Node {
 
 /// The node's data directory: its store, and the operator's token.
 const STORE: &str = "store";
+const BLOBS: &str = "blobs";
 pub const ADMIN_TOKEN: &str = "admin.token";
 
 impl Node {
@@ -1010,8 +1028,12 @@ impl Node {
                 NodeId(id)
             }
         };
+        let blobs = Blobs::open(data.join(BLOBS), &store)?;
         let pool = Arc::new(MachinePool::new());
-        for (_, blob) in store.programs()? {
+        for hash in blobs.pinned()? {
+            let blob = blobs
+                .get(&hash)?
+                .ok_or_else(|| Error::Program("a pinned program's blob is missing".into()))?;
             pool.install(&blob)
                 .map_err(|error| Error::Program(format!("{error:?}")))?;
         }
@@ -1054,6 +1076,7 @@ impl Node {
         let inner = Arc::new(Inner {
             storage: StorageThread::spawn(store.clone(), Arc::clone(&config.hooks)),
             store,
+            blobs,
             executors: Executors::spawn(config.executors),
             pool,
             program: Arc::new(program),

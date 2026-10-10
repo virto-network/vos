@@ -909,3 +909,115 @@ Notes for later steps:
   discard too early costs a leadership change.
 - 3.3c's switch writes `SnapshotSwitch.log_start_config` into the
   log-start row, in the same batch.
+
+### 3.3b, part 2: the blob store
+
+**Built** (`blobs.rs`):
+
+- **Segments:** append-only files, a group of puts at a time with one
+  data sync, closed at 256 MiB. A new segment is created with a
+  directory sync. A record is a magic, the length, the hash, then the
+  bytes.
+- **The index** is the `blobs` partition of the node's keyspace:
+  location rows (hash → segment, offset, length, put time in
+  milliseconds), segment rows (the end of the indexed records, and
+  where the last starts), and pins. Location rows are written after the
+  segment's sync, without one of their own.
+- **On open,** each segment is synced, then read past its indexed end:
+  whole records are rehashed and indexed, and the file is cut at the
+  first one that is not.
+  - The last indexed record is rehashed too. If it is torn, or the file
+    is shorter than the indexed end (a disk that lost what it said it
+    wrote), the segment is walked from its start and the index rows past
+    the damage go.
+  - Found by `blob_crash`, whose tears reach indexed records as the
+    journal tests' tears reach synced batches.
+- **`put`** takes a reference its caller hashed, off the writer. A put of
+  a stored blob only refreshes its time. `get`, `contains`, and `wait`,
+  which resolves once a blob is stored.
+- **Collection** (`collect`):
+  - It reads references from a store snapshot that a synced barrier then
+    makes durable, so a crash cannot bring a reference back.
+  - Unreferenced, unpinned blobs older than the horizon are candidates.
+    A second snapshot and barrier act as a fence before they are
+    removed, synced.
+  - Segments left empty are deleted; sparse ones (under half live) have
+    their live blobs moved, the index synced, then are deleted.
+- **The writer** gains `Barrier`, `Pin` and `Unpin` changes. A synced
+  commit of nothing still syncs: fjall skips an empty batch, sync and
+  all.
+- **Programs are pinned blobs.** The `programs` partition is gone. An
+  install puts its programs, then pins them. The node loads pinned
+  programs into the machine pool at start, and refine's
+  `historical_lookup` reads the blob store.
+- **Invariant 7** (`raft.rs`):
+  - `cut_missing_blobs` cuts an agent's log at its first entry naming a
+    blob not stored, on open.
+  - `EntryReports` queues a replica's writes in order. A write's entries
+    are reported (`entries_durable(seq)`) once its blobs, and every
+    earlier write's, are stored. A truncation drops the waits of the
+    entries it removes.
+
+**Tests:**
+
+- unit tests:
+  - round trips across segments and a reopen;
+  - a lost index row recovered from the tail, and a torn record cut;
+  - an indexed record torn anyway;
+  - a waiter woken;
+  - collection keeping named, pinned and young blobs, deleting segments
+    and moving live blobs, across a reopen;
+  - a re-put refreshing a blob's age;
+  - entry reports waiting in write order;
+  - a truncation dropping waits;
+  - the recovery cut.
+- **`blob_crash`:** a child appends entries each naming a blob, storing
+  some blobs first and some after the append, and reports an entry only
+  once both are durable. Twelve rounds of random kills, the last six
+  tearing the journal's tail or the blob segment's. After each, with the
+  blob store recovered and the log cut on open:
+  - every surviving entry's blob is stored and holds its bytes;
+  - every reported entry survives, but for a tear's reach;
+  - the log has no gap.
+  Cuts occur both for a torn blob and for an append that never got its
+  blob.
+- Slice 2's suites pass; installs now store programs as blobs. The
+  acceptance bench: 31.1 µs per request under load (24.0 µs execution),
+  0.99 ms per commit, a query at median 50 µs, within run-to-run noise
+  of step 2.9.
+
+**Review** (Opus): go, with the writer stopping on any error before the
+commit. Also done before it:
+
+- **Collection's removal is ordered with puts.**
+  - The collector's decision was not ordered with a dedup put. A blob an
+    entry came to rely on after the collector's last snapshot could
+    still lose its index row.
+  - Removal now runs on the blob writer, in order with puts and touches,
+    rechecking each candidate's age there.
+  - Hosts `touch` every blob they come to rely on, which refreshes its
+    age and says it is stored. `EntryReports::written` answers from a
+    touch.
+  - One collection runs at a time. `get` re-reads a blob that a
+    collection moved meanwhile, and open segment handles are bounded.
+- **The blob writer stops on any error.** A partial record or a failed
+  sync would otherwise misplace every later record. Later puts answer
+  that the writer stopped.
+- **`EntryReports`:** `missing()` lists every awaited blob, so a driver
+  fetches them together, and `switched(index, keeps_suffix)` releases
+  the waits a snapshot switch covered or dropped.
+- **Collection under kills.** `blob_crash`'s child now applies each
+  entry, compacts its log below what is durably applied, leaves orphan
+  blobs, and collects with no horizon over 16 KiB segments, so dead
+  blobs go and segments are deleted or moved. The test found:
+  - **A segment row without its file.** A journal tear took back the
+    synced removal of a deleted segment's rows, but not the unlink. On
+    open, rows of segments whose files are gone are dropped, with the
+    locations in them. A collection deleting a file already gone
+    carries on.
+  - **A blob tear can take an older entry's blob,** which collection
+    moved to the newest segment's tail. The log is then cut at that
+    entry; the test allows that cut, and only that one.
+  It passed 100 runs in a row.
+- vos-node has 28 unit tests, with touch against removal and the new
+  `EntryReports` hooks.

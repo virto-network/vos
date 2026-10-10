@@ -12,12 +12,13 @@ use vos_pvm::refine::Machine;
 use vos_pvm::refine_host::{RefineContext, StateReader};
 use vos_wire::abi::{cap, code};
 use vos_wire::batch::Work;
-use vos_wire::ids::{AgentId, ProgramHash};
+use vos_wire::ids::AgentId;
 use vos_wire::jam::{AccumulateInput, Operand, RefineArgs};
 use vos_wire::result::Write;
 use vos_wire::{Decode, Encode};
 
-use crate::store::{Fjall, FjallSnapshot, Store, View};
+use crate::blobs::Blobs;
+use crate::store::{FjallSnapshot, View};
 
 /// The refine entry point.
 const REFINE_ENTRY: u32 = 0;
@@ -87,7 +88,7 @@ impl StateReader for AgentState {
 pub(crate) fn refine(
     program: &OuterMachines,
     pool: &Arc<MachinePool>,
-    store: &Fjall,
+    blobs: &Blobs,
     snapshot: Arc<FjallSnapshot>,
     agent: AgentId,
     work: &Work,
@@ -104,7 +105,7 @@ pub(crate) fn refine(
     let invocation = RefineContext::new(program.load(REFINE_ENTRY, &arguments, gas)?)
         .with_pool(Arc::clone(pool))
         .with_state(Arc::new(AgentState { snapshot, agent }))
-        .try_run_with_host(|id, machine| serve(id, machine, store))?;
+        .try_run_with_host(|id, machine| serve(id, machine, blobs))?;
     let output = if invocation.exit != ExitReason::Halt {
         Err(Fault::Agent(format!(
             "refine stopped: {:?}",
@@ -121,7 +122,7 @@ pub(crate) fn refine(
 
 /// The calls refine leaves to the node: `historical_lookup` from the
 /// stored programs; every other answers `WHAT`.
-fn serve(id: u64, machine: &mut Machine, store: &Fjall) -> Result<(), ExitReason> {
+fn serve(id: u64, machine: &mut Machine, blobs: &Blobs) -> Result<(), ExitReason> {
     if id != HISTORICAL_LOOKUP {
         machine.registers_mut()[7] = code::WHAT;
         return Ok(());
@@ -134,7 +135,7 @@ fn serve(id: u64, machine: &mut Machine, store: &Fjall) -> Result<(), ExitReason
     {
         return Err(ExitReason::Panic);
     }
-    let blob = store.program(&ProgramHash(hash)).expect("a store read");
+    let blob = blobs.get(&hash).expect("a blob read");
     let Some(blob) = blob else {
         machine.registers_mut()[7] = code::NONE;
         return Ok(());
