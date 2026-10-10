@@ -15,6 +15,7 @@ pub mod ids;
 pub mod ingress;
 pub mod jam;
 pub mod keys;
+pub mod peer;
 pub mod records;
 pub mod result;
 pub mod schema;

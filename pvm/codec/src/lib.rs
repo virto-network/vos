@@ -49,9 +49,13 @@ pub trait Decode: Sized {
     fn decode(data: &[u8]) -> Result<(Self, usize), DecodeError>;
 
     /// Decode `count` items from `data`: one by one, or in a single copy
-    /// for bytes.
+    /// for bytes. The count only claims items: what is reserved up front
+    /// is at most four times `data`'s own size (honest items are rarely
+    /// smaller encoded than a quarter of their size in memory), and the
+    /// rest grows as items decode.
     fn decode_items(data: &[u8], count: usize) -> Result<(Vec<Self>, usize), DecodeError> {
-        let mut items = Vec::with_capacity(count);
+        let reserve = data.len().saturating_mul(4) / size_of::<Self>().max(1);
+        let mut items = Vec::with_capacity(count.min(reserve));
         let mut off = 0;
         for _ in 0..count {
             let (item, used) = Self::decode(&data[off..])?;

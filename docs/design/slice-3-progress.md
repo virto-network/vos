@@ -1481,7 +1481,13 @@ id row is deleted; the child processes are killed from a drop guard.
   budget by active groups.
 - **One executor thread:** smol's global executor runs one thread unless
   `SMOL_THREADS` says otherwise, and quinn's drivers spawn there. Give
-  the network an executor of its own, with a few threads.
+  the network an executor of its own, with a few threads. The receiving
+  side's turns rely on readers being polled in accept order, which one
+  thread gives. With several, a successor stream's reader could take the
+  turn first (a writer stuck waiting for stream credit, retired, then
+  finished just before its successor opened). So either carry a sequence
+  number per (class, id) in the stream header and serve turns in order,
+  or keep each connection's readers on one thread.
 - **A spurious close:** a node whose send to a restarted peer is reset
   may redial and reach the new run before that run's own dial-in is
   processed. The incarnation rule then closes the fresh connection: one
@@ -1493,3 +1499,102 @@ id row is deleted; the child processes are killed from a drop guard.
   the rest.
 - **The hub keeps order across streams,** which QUIC does not; a reorder
   setting would make it a harsher test bed.
+
+**Review of the fixes** (Opus): go. Done after it:
+- the quiet-stream sweep runs on its deadline in every turn of the write
+  loop, so a queue that never empties cannot starve it;
+- the hub's delayed delivery looks for the run up at each try, and
+  waits for room without blocking on a replaced run's full queue (test:
+  a full, unread old run, then a restart).
+- The note on turns and executor threads, above.
+- Taken into 3.4c, which changes the same code: a data directory that
+  exists but holds no store is refused, with the `chmod` to run, rather
+  than having its mode changed.
+
+### 3.4b: messages and authorization
+
+**Built:**
+
+- **The node's messages** (`vos_wire::peer`), SCALE-coded:
+  - `PeerMessage`: a Raft message for an agent's group, a snapshot chunk
+    and its acknowledgement, a blob request, a blob, and liveness with
+    its answer (each carrying the sender's incarnation and a round, for
+    3.8's pair heartbeat).
+  - The Raft types mirror the consensus core's (`Raft`, `AppendResult`,
+    `Entry`, `EntryKind`), so the wire format is the module's own and
+    the core may change underneath it. A data entry's payload is the
+    node's entry payload (kind, blobs, body); a configuration entry is
+    carried as members, not bytes.
+  - vos-raft's `Message` is no longer `#[non_exhaustive]`: the
+    conversions match it whole, so a new message cannot reach the wire
+    unconverted.
+  - Snapshot chunks carry the leader's term, the snapshot's index, term
+    and configuration, a sequence number, rows and a last flag. Step 3.7
+    adds the pinned blobs' manifest and the streaming around it.
+  - Requests and messages between agents, and the directory, come with
+    step 3.5.
+- **The checks** (`vos_node::peer`), pure functions:
+  - `decode` takes a frame only if it is one whole message;
+  - `check(space, from, message, followed)`:
+    - the sender is configured in the space;
+    - an append comes from the leader it names, a vote or pre-vote
+      request from the candidate it names;
+    - a snapshot chunk comes from the leader the replica follows, in
+      that leader's term (`followed` asks the group);
+    - a blob hashes to its name;
+    - the match is exhaustive, so a new message kind needs a decision;
+  - `Refusal` names why, and `Drops` counts drops by why;
+  - `to_wire` and `from_wire` convert the core's messages.
+
+**Tests** (`node/host/tests/peer.rs`):
+
+- every Raft message survives the wire, with arbitrary fields and
+  entries of both kinds (proptest); so does every other message;
+- a frame with a byte too many or too few, or none, is refused;
+- strangers, misnamed leaders and candidates, chunks from anyone but
+  the leader followed in its term, and blobs that do not hash to their
+  name are refused; drops are counted by why;
+- **stale membership,** with a real core: a replica whose members, as
+  it knows them, are 1, 2 and 3 takes node 4's pre-vote, vote and
+  acknowledgement, since node 4 is configured in the space, but counts
+  none of them. A member's then elects it and commits. It follows node 4
+  when node 4 leads a later term. Node 5, not configured, is refused
+  before the core.
+- **Mutations:** removing the core's member check on vote answers leaves
+  the test passing, because the election's tally counts members only, a
+  second layer. Making the tally count every voter as well fails it.
+
+**Review** (Opus): go, with two should-fixes, both done:
+
+1. **The codec reserves at most four times a frame's own size up
+   front.** A count was checked only against the bytes left, and
+   reserved `count × size_of::<T>()`: a 64 MiB frame of snapshot rows
+   could ask for about 3 GiB before failing to decode. This was a slice 2
+   bug, reached from the operator's install too. A bound of one times
+   the input made the agent's 1,000-method schema reallocate as it grew,
+   and its install's gas went from 6.3M to 6.7M, past its reserve.
+   Honest items are rarely smaller encoded than a quarter of their size
+   in memory, so four times keeps it at 6.3M.
+2. **The stale-membership test's second half:** once the leader adds
+   node 4, the joint configuration needs majorities of both sets. A
+   member's acknowledgement then commits nothing, and node 4's commits.
+
+Also done:
+- `peer::class` and `peer::stream` say where each message travels.
+  `check` refuses a message on another class, so a Raft frame on bulk
+  cannot escape its 2 MiB bound, and a Raft message on a stream other
+  than its agent's.
+- The module says which messages their handlers authorise by sender:
+  an acknowledgement only from the replica the snapshot streams to, a
+  blob only if requested, a blob request only from a replica of its
+  agent. Blob requests now name their agent.
+- The ALPN, `vos/1`, versions the format.
+
+**Left to step 3.5:**
+- hash blobs off the consumer's hot path (up to 64 MiB each);
+- test that a removed node which missed its removal keeps campaigning
+  without moving the members' terms. Pre-votes, the log-freshness
+  check, check-quorum and TimeoutNow only from the known leader cover
+  it. An etcd-style lease (ignore a higher-term vote request soon after
+  hearing a leader) is optional hardening, and would need a transfer
+  flag on vote requests.

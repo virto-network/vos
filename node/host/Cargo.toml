@@ -16,6 +16,7 @@ smol = "2"
 subtle = { workspace = true }
 tracing = "0.1"
 ureq = "3"
+vos-net = { workspace = true }
 vos-pvm = { workspace = true }
 vos-raft = { workspace = true }
 vos-wire = { workspace = true }

@@ -2506,6 +2506,7 @@ dependencies = [
  "tempfile",
  "tracing",
  "ureq",
+ "vos-net",
  "vos-pvm",
  "vos-pvm-compiler",
  "vos-raft",

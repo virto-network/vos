@@ -183,11 +183,23 @@ impl Endpoint {
             let hub = self.hub.clone();
             let from = self.number;
             let task = smol::spawn(async move {
-                while let Ok((at, class, incoming)) = pending.recv().await {
+                while let Ok((at, class, mut incoming)) = pending.recv().await {
                     smol::Timer::at(at).await;
-                    let deliver = hub.state().deliver(from, to);
-                    if let Some(deliver) = deliver {
-                        deliver.deliver(class, incoming).await;
+                    // Wait while the run up then is full, looking again
+                    // each time, so a run replaced meanwhile holds
+                    // nothing up.
+                    loop {
+                        let deliver = hub.state().deliver(from, to);
+                        let Some(deliver) = deliver else {
+                            break;
+                        };
+                        match deliver.try_deliver(class, incoming) {
+                            Err(smol::channel::TrySendError::Full(back)) => {
+                                incoming = back;
+                                smol::Timer::after(Duration::from_millis(1)).await;
+                            }
+                            _ => break,
+                        }
                     }
                 }
             });

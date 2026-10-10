@@ -1,0 +1,159 @@
+//! What one node sends another: messages for an agent's replica group,
+//! snapshot chunks, blobs, and liveness. The node checks each against the
+//! space's configuration before it reaches a group.
+//!
+//! The Raft types mirror the consensus core's, so the wire format is this
+//! module's alone and the core may change underneath it. The network's
+//! protocol name (ALPN `vos/1`) versions it.
+
+use alloc::vec::Vec;
+
+use scale::{Decode, Encode};
+
+use crate::ids::AgentId;
+
+/// A node of the space: the 8-bit node part of an agent id.
+pub type NodeNumber = u8;
+
+/// A frame between nodes.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum PeerMessage {
+    /// A message for `agent`'s replica group.
+    #[codec(index = 0)]
+    Raft { agent: AgentId, message: Raft },
+    #[codec(index = 1)]
+    SnapshotChunk(SnapshotChunk),
+    #[codec(index = 2)]
+    SnapshotAck(SnapshotAck),
+    /// The blobs with these hashes, wanted by a replica of `agent`.
+    #[codec(index = 3)]
+    BlobRequest {
+        agent: AgentId,
+        hashes: Vec<[u8; 32]>,
+    },
+    /// A blob, which the receiver hashes before taking.
+    #[codec(index = 4)]
+    Blob { hash: [u8; 32], bytes: Vec<u8> },
+    /// The sending node is alive, in its run `incarnation`.
+    #[codec(index = 5)]
+    Liveness { incarnation: u64, round: u64 },
+    /// The answer to a [`PeerMessage::Liveness`], with the answering run.
+    #[codec(index = 6)]
+    LivenessAnswer { incarnation: u64, round: u64 },
+}
+
+/// A Raft message, as the consensus core has it.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum Raft {
+    /// Entries, or none (a heartbeat), from a leader.
+    #[codec(index = 0)]
+    Append {
+        term: u64,
+        leader: NodeNumber,
+        prev_index: u64,
+        prev_term: u64,
+        commit: u64,
+        round: u64,
+        entries: Vec<Entry>,
+    },
+    #[codec(index = 1)]
+    AppendAnswer {
+        term: u64,
+        round: u64,
+        commit: u64,
+        result: AppendResult,
+    },
+    #[codec(index = 2)]
+    Vote {
+        term: u64,
+        candidate: NodeNumber,
+        last_index: u64,
+        last_term: u64,
+    },
+    #[codec(index = 3)]
+    VoteAnswer { term: u64, granted: bool },
+    #[codec(index = 4)]
+    PreVote {
+        next_term: u64,
+        candidate: NodeNumber,
+        last_index: u64,
+        last_term: u64,
+    },
+    #[codec(index = 5)]
+    PreVoteAnswer {
+        term: u64,
+        next_term: u64,
+        granted: bool,
+    },
+    #[codec(index = 6)]
+    TimeoutNow { term: u64 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum AppendResult {
+    #[codec(index = 0)]
+    Matched { matched: u64 },
+    #[codec(index = 1)]
+    Rejected {
+        rejected: u64,
+        last_index: u64,
+        conflict_term: u64,
+        conflict_first: u64,
+    },
+}
+
+/// A log entry.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct Entry {
+    pub index: u64,
+    pub term: u64,
+    pub kind: EntryKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum EntryKind {
+    /// The node's entry payload: its kind, the blobs it names and its body.
+    #[codec(index = 0)]
+    Data { payload: Vec<u8> },
+    /// A change to the group's members, joint while `joint_old` is set.
+    #[codec(index = 1)]
+    Configuration {
+        members: Vec<NodeNumber>,
+        joint_old: Option<Vec<NodeNumber>>,
+    },
+}
+
+/// The members a snapshot carries, and the index that established them.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct Configuration {
+    pub members: Vec<NodeNumber>,
+    pub joint_old: Option<Vec<NodeNumber>>,
+    pub index: u64,
+}
+
+/// One chunk of the snapshot a leader streams to a replica of `agent`.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct SnapshotChunk {
+    pub agent: AgentId,
+    /// The leader's term: a replica takes chunks only from the leader it
+    /// follows, in that leader's term.
+    pub term: u64,
+    /// The index and term the snapshot is through.
+    pub index: u64,
+    pub snapshot_term: u64,
+    pub configuration: Option<Configuration>,
+    /// The chunk's place in the stream, from 0.
+    pub sequence: u64,
+    /// The agent's rows, by agent-relative key.
+    pub rows: Vec<(Vec<u8>, Vec<u8>)>,
+    pub last: bool,
+}
+
+/// A replica holds the snapshot through `index` up to chunk `sequence`.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct SnapshotAck {
+    pub agent: AgentId,
+    pub term: u64,
+    pub index: u64,
+    pub sequence: u64,
+}

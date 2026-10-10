@@ -453,10 +453,17 @@ async fn write(
     // Writers finishing their quiet streams. A new stream for the same id
     // opens only once its old one is finished and the peer has it all.
     let mut retiring: HashMap<(Class, u64), smol::Task<()>> = HashMap::new();
-    let mut sweep = smol::Timer::interval((quiet / 2).max(Duration::from_millis(1)));
+    let every = (quiet / 2).max(Duration::from_millis(1));
+    let mut sweep = smol::Timer::interval(every);
+    let mut swept = Instant::now();
     let bulk = Arc::new(smol::lock::Semaphore::new(BULK_STREAMS));
     let mut sending: Vec<smol::Task<()>> = Vec::new();
     loop {
+        // Swept on time even while frames never stop coming.
+        if swept.elapsed() >= every {
+            retire(&mut streams, &mut retiring, quiet);
+            swept = Instant::now();
+        }
         let frame = match next.take() {
             Some(frame) => frame,
             None => {
@@ -476,10 +483,7 @@ async fn write(
                 };
                 match frame.or(closed).or(swept).await {
                     Event::Frame(frame) => frame,
-                    Event::Sweep => {
-                        retire(&mut streams, &mut retiring, quiet);
-                        continue;
-                    }
+                    Event::Sweep => continue,
                     Event::Done => return,
                 }
             }

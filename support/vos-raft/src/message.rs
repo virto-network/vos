@@ -7,9 +7,9 @@ use alloc::vec::Vec;
 use crate::config::NodeId;
 use crate::log_entry::LogEntry;
 
-/// One protocol message.
+/// One protocol message. Exhaustive: a host's wire format mirrors every
+/// message, and a new one must reach it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum Message<N: NodeId> {
     /// Entries, or none (a heartbeat), from a leader.
     Append {

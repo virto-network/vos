@@ -7,6 +7,7 @@ mod executor;
 pub mod http;
 mod ingress;
 mod node;
+pub mod peer;
 mod pvm;
 pub mod raft;
 pub mod storage;

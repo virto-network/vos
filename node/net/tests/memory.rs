@@ -314,3 +314,41 @@ fn a_node_whose_consumer_is_gone_loses_frames_without_a_wait() {
         );
     });
 }
+
+#[test]
+fn a_delayed_link_is_not_held_up_by_a_full_old_run() {
+    let hub = Hub::default();
+    let mut nodes = join(&hub, &[1, 2]);
+    hub.set_delay(Duration::from_millis(1));
+    // The old run's queue fills, and is kept, unread.
+    let (old, old_arrivals) = nodes.pop().unwrap();
+    for i in 0..1100u32 {
+        nodes[0]
+            .0
+            .send(2, Class::Consensus, 0, i.to_be_bytes().to_vec())
+            .unwrap();
+    }
+    smol::block_on(async {
+        while !old_arrivals.consensus.is_full() {
+            smol::Timer::after(Duration::from_millis(1)).await;
+        }
+    });
+    let (restarted, arrivals) = hub.join(2);
+    restarted.set_peers(peers(&[1, 2]));
+    nodes[0]
+        .0
+        .send(2, Class::Consensus, 0, b"after".to_vec())
+        .unwrap();
+    smol::block_on(async {
+        loop {
+            let incoming = within(Duration::from_secs(1), arrivals.consensus.recv())
+                .await
+                .expect("the restarted run is reached")
+                .unwrap();
+            if incoming.frame == b"after" {
+                break;
+            }
+        }
+    });
+    drop((old, old_arrivals));
+}
