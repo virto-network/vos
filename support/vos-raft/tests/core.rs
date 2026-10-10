@@ -384,6 +384,72 @@ fn proposals_refused(actions: &[Action<u16>]) -> usize {
         .count()
 }
 
+/// The commits in `actions` sent to `peer` in appends with no entries.
+fn commits_to(actions: &[Action<u16>], peer: u16) -> Vec<(u64, u64)> {
+    actions
+        .iter()
+        .filter_map(|action| match action {
+            Action::Send {
+                to,
+                message:
+                    Message::Append {
+                        commit,
+                        round,
+                        entries,
+                        ..
+                    },
+            } if *to == peer && entries.is_empty() => Some((*commit, *round)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn followers_learn_a_commit_at_once_without_a_heartbeat() {
+    // A three-member group led by ME; its no-op is in flight to A and B.
+    let mut cfg = config();
+    cfg.pre_vote = false;
+    let mut core = Core::new(cfg, Recovered::default(), 0, 5);
+    core.take_actions();
+    core.tick(1_000);
+    let vote = writes(&core.take_actions()).last().unwrap().clone();
+    persist(&mut core, &vote);
+    core.receive(
+        LEADER_A,
+        Message::VoteAnswer {
+            term: 1,
+            granted: true,
+        },
+    );
+    let no_op = writes(&core.take_actions()).last().unwrap().clone();
+    persist(&mut core, &no_op);
+    core.take_actions();
+    // A holds the no-op: it commits, and A is told at once, in the round of
+    // the leader's first heartbeat, opening none; B, with the no-op still
+    // in flight, is not.
+    core.receive(LEADER_A, matched(1));
+    let actions = core.take_actions();
+    assert_eq!(committed(&actions), Some(1));
+    assert_eq!(commits_to(&actions, LEADER_A), vec![(1, 1)]);
+    assert!(commits_to(&actions, LEADER_B).is_empty());
+    // B's answer frees its slot: B learns the commit too, once.
+    core.receive(LEADER_B, matched(1));
+    assert_eq!(commits_to(&core.take_actions(), LEADER_B), vec![(1, 1)]);
+    core.receive(LEADER_B, matched(1));
+    assert!(commits_to(&core.take_actions(), LEADER_B).is_empty());
+    // A later entry: its append carries the old commit, and the new one
+    // follows each acknowledgement, never above what the peer holds.
+    core.propose(1, vec![1]);
+    let write = writes(&core.take_actions()).last().unwrap().clone();
+    persist(&mut core, &write);
+    core.take_actions();
+    core.receive(LEADER_A, matched(2));
+    let actions = core.take_actions();
+    assert_eq!(committed(&actions), Some(2));
+    assert_eq!(commits_to(&actions, LEADER_A), vec![(2, 1)]);
+    assert!(commits_to(&actions, LEADER_B).is_empty());
+}
+
 #[test]
 fn a_proposal_goes_out_at_once_unless_an_append_is_in_flight() {
     let mut core = leader_of_two();

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use smol::future::FutureExt;
 use vos_net::Class;
-use vos_raft::core::{Action, Answer, Core, ProposeError, Write};
+use vos_raft::core::{Action, Answer, Core, ProposeError, ReadIndexError, Write};
 use vos_raft::{Config as RaftConfig, Message, Role};
 use vos_wire::ids::AgentId;
 use vos_wire::peer::{CreationRecord, NodeNumber, PeerMessage};
@@ -56,7 +56,15 @@ pub(crate) enum Local {
     /// This replica's leader loop stopped for good: it hands leadership
     /// over and never campaigns again, but goes on applying.
     Retire,
+    /// A read index: an index to apply through before reading, once a
+    /// quorum has confirmed this replica still leads.
+    ReadIndex {
+        answer: smol::channel::Sender<Result<u64, ReadIndexError>>,
+    },
 }
+
+/// How long a read index may wait for a quorum to confirm the leader.
+const READ_INDEX_MS: u64 = 2_000;
 
 /// How many results' outcomes a group remembers, for its leader loop to
 /// read after its own apply.
@@ -191,6 +199,7 @@ struct Driver {
     writes: VecDeque<(u64, u64)>,
     last_index: u64,
     proposals: HashMap<u64, smol::channel::Sender<Result<u64, ProposeError>>>,
+    reads: HashMap<u64, smol::channel::Sender<Result<u64, ReadIndexError>>>,
     next_token: u64,
     /// The blobs asked for last, and when.
     asked: Option<(Instant, Vec<[u8; 32]>)>,
@@ -261,6 +270,7 @@ impl Driver {
             writes: VecDeque::new(),
             last_index,
             proposals: HashMap::new(),
+            reads: HashMap::new(),
             next_token: 0,
             asked: None,
             turn: 0,
@@ -343,12 +353,21 @@ impl Driver {
         });
         local.close();
         while let Ok(local) = local.try_recv() {
-            if let Local::Propose { answer, .. } = local {
-                let _ = answer.try_send(Err(ProposeError::Stopped));
+            match local {
+                Local::Propose { answer, .. } => {
+                    let _ = answer.try_send(Err(ProposeError::Stopped));
+                }
+                Local::ReadIndex { answer } => {
+                    let _ = answer.try_send(Err(ReadIndexError::Stopped));
+                }
+                Local::Retire => {}
             }
         }
         for (_, answer) in self.proposals.drain() {
             let _ = answer.try_send(Err(ProposeError::Stopped));
+        }
+        for (_, answer) in self.reads.drain() {
+            let _ = answer.try_send(Err(ReadIndexError::Stopped));
         }
     }
 
@@ -377,6 +396,12 @@ impl Driver {
                 self.core.propose(token, payload);
             }
             Local::Retire => self.retired = true,
+            Local::ReadIndex { answer } => {
+                let token = self.next_token;
+                self.next_token += 1;
+                self.reads.insert(token, answer);
+                self.core.read_index(token, Some(READ_INDEX_MS));
+            }
         }
     }
 
@@ -445,6 +470,11 @@ impl Driver {
             Action::SendSnapshot { to, .. } => self.core.snapshot_failed(to),
             Action::Answer(Answer::Propose { token, result }) => {
                 if let Some(answer) = self.proposals.remove(&token) {
+                    let _ = answer.try_send(result);
+                }
+            }
+            Action::Answer(Answer::ReadIndex { token, result }) => {
+                if let Some(answer) = self.reads.remove(&token) {
                     let _ = answer.try_send(result);
                 }
             }

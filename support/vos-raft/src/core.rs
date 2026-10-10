@@ -322,6 +322,8 @@ struct LeaderState<N: NodeId> {
     round: u64,
     /// The latest round each peer has answered at this term.
     acked_round: BTreeMap<N, u64>,
+    /// The commit index each peer was last sent.
+    sent_commit: BTreeMap<N, u64>,
     /// Peers heard from since the last check-quorum.
     recent: BTreeSet<N>,
     /// A leadership transfer in progress, and when it gives up.
@@ -338,6 +340,7 @@ impl<N: NodeId> LeaderState<N> {
             loading: BTreeSet::new(),
             round: 0,
             acked_round: BTreeMap::new(),
+            sent_commit: BTreeMap::new(),
             recent: BTreeSet::new(),
             transfer: None,
         }
@@ -1798,6 +1801,8 @@ impl<N: NodeId> Core<N> {
             };
             let prev_index = next.saturating_sub(1).max(self.log.snap_index());
             let prev_term = self.log.term_at(prev_index).unwrap_or(0);
+            let commit = self.commit.min(matched);
+            self.commit_sent(peer, commit);
             self.send(
                 peer,
                 Message::Append {
@@ -1805,7 +1810,7 @@ impl<N: NodeId> Core<N> {
                     leader: me,
                     prev_index,
                     prev_term,
-                    commit: self.commit.min(matched),
+                    commit,
                     round,
                     entries: Vec::new(),
                 },
@@ -1882,6 +1887,7 @@ impl<N: NodeId> Core<N> {
             return;
         }
         if next > last {
+            self.send_commit(peer);
             return;
         }
         match self.log.entries(next, last, self.cfg.max_append_bytes) {
@@ -1941,6 +1947,8 @@ impl<N: NodeId> Core<N> {
                 leader.round,
             )
         };
+        let commit = self.commit.min(matched);
+        self.commit_sent(peer, commit);
         self.send(
             peer,
             Message::Append {
@@ -1948,11 +1956,50 @@ impl<N: NodeId> Core<N> {
                 leader: me,
                 prev_index,
                 prev_term,
-                commit: self.commit.min(matched),
+                commit,
                 round,
                 entries,
             },
         );
+    }
+
+    /// Send `peer` the commit it has not been sent, at once, in an append
+    /// with no entries, built as a heartbeat is: capped by what the peer
+    /// holds, in the current round, holding no in-flight slot.
+    fn send_commit(&mut self, peer: N) {
+        let (term, me) = (self.term, self.cfg.me);
+        let Some(leader) = self.leader.as_ref() else {
+            return;
+        };
+        let next = leader.next_index.get(&peer).copied().unwrap_or(1);
+        let matched = leader.match_index.get(&peer).copied().unwrap_or(0);
+        let commit = self.commit.min(matched);
+        if commit <= leader.sent_commit.get(&peer).copied().unwrap_or(0) {
+            return;
+        }
+        let round = leader.round;
+        let prev_index = next.saturating_sub(1).max(self.log.snap_index());
+        let prev_term = self.log.term_at(prev_index).unwrap_or(0);
+        self.commit_sent(peer, commit);
+        self.send(
+            peer,
+            Message::Append {
+                term,
+                leader: me,
+                prev_index,
+                prev_term,
+                commit,
+                round,
+                entries: Vec::new(),
+            },
+        );
+    }
+
+    fn commit_sent(&mut self, peer: N, commit: u64) {
+        if let Some(leader) = self.leader.as_mut() {
+            let sent = leader.sent_commit.entry(peer).or_insert(0);
+            *sent = (*sent).max(commit);
+        }
     }
 
     fn leader_timers(&mut self) {
@@ -2035,6 +2082,9 @@ impl<N: NodeId> Core<N> {
         self.commit = floor;
         self.write_meta(false);
         self.actions.push(Action::Committed { index: floor });
+        // Followers learn it at once: entries due carry it, and an idle
+        // peer gets an append with none.
+        self.replicate_all();
         self.auto_finalize_joint_config();
         self.finalize_retirement_confirmation();
         let final_committed = self

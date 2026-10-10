@@ -1,31 +1,23 @@
-//! The node's HTTP ingress: signed calls in their sessions' sequences,
-//! signed queries, and the operator's commands.
-//!
-//! A client names its sessions; the agent keeps them. Only the agent's
-//! leader takes a call. Per (agent, session), a call at or below the
-//! agent's applied mark is a duplicate answered from its reply window; one
-//! in flight waits for that answer; the next after those queued is queued;
-//! any other is refused.
+//! The node's HTTP ingress: signed calls in their sessions' sequences
+//! (run as `calls` says), signed queries, and the operator's commands.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
-use ed25519_dalek::{Signature, VerifyingKey};
 use smol::net::TcpListener;
 use subtle::ConstantTimeEq;
 use vos_wire::abi::{cap, refusal};
-use vos_wire::batch::{Admin, Request};
-use vos_wire::ids::{AgentId, InstanceId, Principal, Session, SessionId};
+use vos_wire::batch::Admin;
+use vos_wire::ids::{AgentId, InstanceId, Principal};
 use vos_wire::ingress::{
-    Answer, Call, Create, Grant, Install, QueryCall, Rejection, call_message, query_message,
+    AgentInfo, Answer, Call, Create, Grant, Install, QueryCall, Rejection, query_message,
 };
-use vos_wire::records::{Installed, SessionMark, unstored};
-use vos_wire::result::Outcome;
-use vos_wire::{Decode, Encode, defaults, keys};
+use vos_wire::records::{Installed, unstored};
+use vos_wire::{Decode, Encode, keys};
 
+use crate::calls::{answer_of, verify};
 use crate::http::{self, Handler, Limits, Response};
-use crate::node::{CallError, Inner, Reply};
+use crate::node::Inner;
 use crate::store::{Store, View};
 
 /// How far ahead a query's `not_after` may be.
@@ -35,57 +27,14 @@ const ENVELOPE: usize = 4096;
 /// The most an install's body may hold: a package's programs.
 const MAX_INSTALL: usize = 64 << 20;
 
-/// One (agent, session)'s requests that ingress has queued.
-#[derive(Default)]
-struct Lane {
-    /// The highest sequence queued or applied.
-    queued: u64,
-    /// The requests in flight, each with the duplicates waiting on it.
-    inflight: HashMap<u64, Vec<smol::channel::Sender<Answer>>>,
-}
-
 pub(crate) struct Ingress {
     inner: Arc<Inner>,
     token: [u8; 32],
-    lanes: Mutex<HashMap<(AgentId, Session), Lane>>,
-}
-
-/// What the agent's applied state holds of a session.
-struct Applied {
-    /// The session's last sequence consumed, 0 for one the agent does not
-    /// hold.
-    mark: u64,
-    /// The reply kept for the sequence asked about, at or below the mark.
-    reply: Option<Outcome>,
-    /// The agent's time, for a session it does not hold.
-    time: Option<u64>,
-}
-
-enum Next {
-    Answer(Answer),
-    Wait(smol::channel::Receiver<Answer>),
-    Queue,
-}
-
-fn reply_answer(reply: Result<Reply, CallError>) -> Answer {
-    match reply {
-        Ok(Reply::Ran(outcome)) => Answer::Ran(outcome),
-        Ok(Reply::Refused(code)) => Answer::Refused(code),
-        Ok(Reply::Failed) => Answer::NotConsumed,
-        Ok(Reply::TooOld) => Answer::Rejected(Rejection::TooOld),
-        Err(CallError::Failed(_)) => Answer::Unavailable,
-        Err(CallError::Busy) => Answer::Busy,
-        Err(CallError::NoAgent) => Answer::NoAgent,
-        Err(CallError::Stopped) => Answer::Stopped,
-        Err(CallError::NotLeader(leader)) => Answer::NotLeader { leader },
-        Err(CallError::Elsewhere(replicas)) => Answer::Elsewhere { replicas },
-        Err(CallError::Unconfirmed(agent)) => Answer::Unconfirmed(agent),
-    }
 }
 
 fn status(answer: &Answer) -> u16 {
     match answer {
-        Answer::Ran(_) | Answer::Created(_) => 200,
+        Answer::Ran { .. } | Answer::Created(_) => 200,
         Answer::Unconfirmed(_) => 202,
         // The session is done with: the client starts another.
         Answer::Refused(refusal::EXPIRED | refusal::STALE_SESSION) => 410,
@@ -99,6 +48,7 @@ fn status(answer: &Answer) -> u16 {
         Answer::NotConsumed => 500,
         Answer::NoAgent => 404,
         Answer::Busy | Answer::Stopped | Answer::Unavailable => 503,
+        Answer::TimedOut => 504,
         // Another node serves it: the answer says which.
         Answer::NotLeader { .. } | Answer::Elsewhere { .. } => 421,
     }
@@ -106,13 +56,6 @@ fn status(answer: &Answer) -> u16 {
 
 fn respond(answer: Answer) -> Response {
     Response::new(status(&answer), answer.encode())
-}
-
-fn verify(key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
-    VerifyingKey::from_bytes(key).is_ok_and(|key| {
-        key.verify_strict(message, &Signature::from_bytes(signature))
-            .is_ok()
-    })
 }
 
 fn decode<T: Decode>(body: &[u8]) -> Result<T, Answer> {
@@ -136,11 +79,7 @@ fn parse_hex(text: &[u8]) -> Option<[u8; 32]> {
 
 impl Ingress {
     pub(crate) fn new(inner: Arc<Inner>, token: [u8; 32]) -> Self {
-        Self {
-            inner,
-            token,
-            lanes: Mutex::new(HashMap::new()),
-        }
+        Self { inner, token }
     }
 
     /// Serve until `stop` resolves, then end every connection.
@@ -195,12 +134,12 @@ impl Ingress {
         let agent = |text: &str| text.parse::<u32>().ok().map(AgentId);
         match (request.method.as_str(), segments.as_slice()) {
             ("GET", []) => Response::new(200, self.inner.node_id.encode()),
-            ("GET", ["agents", id]) => match agent(id).and_then(|agent| self.record(agent)) {
-                Some(record) => Response::new(200, record.encode()),
+            ("GET", ["agents", id]) => match agent(id).and_then(|agent| self.agent_info(agent)) {
+                Some(info) => Response::new(200, info.encode()),
                 None => Response::new(404, Vec::new()),
             },
             ("POST", ["agents", id, "calls"]) => match (agent(id), decode::<Call>(&request.body)) {
-                (Some(agent), Ok(call)) => respond(self.call(agent, call).await),
+                (Some(agent), Ok(call)) => respond(self.inner.client_call(agent, call).await),
                 (None, _) => respond(Answer::NoAgent),
                 (_, Err(answer)) => respond(answer),
             },
@@ -231,7 +170,7 @@ impl Ingress {
                 match create {
                     Ok(create) => respond(match self.inner.create_agent(create.replicas).await {
                         Ok(agent) => Answer::Created(agent),
-                        Err(error) => reply_answer(Err(error)),
+                        Err(error) => answer_of(Err(error)),
                     }),
                     Err(answer) => respond(answer),
                 }
@@ -255,7 +194,7 @@ impl Ingress {
                                 install.roles,
                             )
                             .await;
-                        respond(reply_answer(reply))
+                        respond(answer_of(reply))
                     }
                     Some(Err(answer)) => respond(answer),
                     None => respond(Answer::Unavailable),
@@ -268,7 +207,7 @@ impl Ingress {
                             principal: grant.principal,
                             role: grant.role,
                         };
-                        respond(reply_answer(self.inner.admin(agent, admin).await))
+                        respond(answer_of(self.inner.admin(agent, admin).await))
                     }
                     (None, _) => respond(Answer::NoAgent),
                     (_, Err(answer)) => respond(answer),
@@ -287,155 +226,27 @@ impl Ingress {
             .is_some_and(|token| bool::from(token.ct_eq(&self.token)))
     }
 
-    /// Agent `agent`'s creation record, when this node knows of it.
-    fn record(&self, agent: AgentId) -> Option<vos_wire::peer::CreationRecord> {
-        self.inner
+    /// Agent `agent`'s creation record and replicas, when this node knows
+    /// of it.
+    fn agent_info(&self, agent: AgentId) -> Option<AgentInfo> {
+        let record = self
+            .inner
             .directory
             .lock()
             .expect("the directory")
             .get(&agent)
-            .cloned()
-    }
-
-    /// What the agent's applied state holds of `session`, with the reply
-    /// it kept for `sequence` when that is at or below its mark.
-    fn applied(&self, agent: AgentId, session: &Session, sequence: u64) -> Result<Applied, Answer> {
-        let snapshot = self.inner.store.snapshot();
-        let stored = |key: &[u8]| -> Result<Option<Vec<u8>>, Answer> {
-            let bytes = snapshot.get(agent, key).map_err(|_| Answer::Unavailable)?;
-            Ok(bytes.and_then(|bytes| unstored(&bytes).map(<[u8]>::to_vec)))
-        };
-        let Some(id) = stored(&keys::session_index(session))?
-            .and_then(|bytes| SessionId::decode(&bytes).ok())
-            .map(|(id, _)| id)
-        else {
-            let time = stored(&keys::batch_time())?
-                .and_then(|bytes| u64::decode(&bytes).ok())
-                .map_or(0, |(time, _)| time);
-            return Ok(Applied {
-                mark: 0,
-                reply: None,
-                time: Some(time),
-            });
-        };
-        let mark = stored(&keys::session(id))?
-            .and_then(|bytes| SessionMark::decode(&bytes).ok())
-            .map_or(0, |(mark, _)| mark.sequence);
-        let reply = if sequence <= mark {
-            stored(&keys::reply(id, sequence))?
-                .and_then(|bytes| Outcome::decode(&bytes).ok())
-                .map(|(outcome, _)| outcome)
-        } else {
-            None
-        };
-        Ok(Applied {
-            mark,
-            reply,
-            time: None,
-        })
-    }
-
-    async fn call(&self, agent: AgentId, call: Call) -> Answer {
-        // A follower answers where the leader is, before anything else.
-        let run = match self.inner.leading(agent).await {
-            Ok(run) => run,
-            Err(error) => return reply_answer(Err(error)),
-        };
-        let message = call_message(
-            &run.shared.identity,
-            &call.session,
-            call.sequence,
-            call.instance,
-            call.method,
-            &call.arguments,
-        );
-        if !verify(&call.session.key, &message, &call.signature) {
-            return Answer::Rejected(Rejection::BadSignature);
-        }
-        let sequence = call.sequence;
-        let lane_key = (agent, call.session);
-        let next = {
-            let mut lanes = self.lanes.lock().expect("the lanes");
-            // Read under the lock: an answered request's commit is durable
-            // before its lane changes, so the mark read here includes it.
-            let Applied { mark, reply, time } = match self.applied(agent, &call.session, sequence) {
-                Ok(applied) => applied,
-                Err(answer) => return answer,
-            };
-            // A new session's time must be near the agent's, as refine will
-            // check: the client learns the time it should use.
-            if let Some(time) = time {
-                let now = (self.inner.clock)().max(time);
-                if call.session.t0.abs_diff(now) > defaults::SESSION_SKEW_MS {
-                    return Answer::Rejected(Rejection::StaleSession { now });
-                }
-            }
-            let lane = lanes.entry(lane_key).or_default();
-            lane.queued = lane.queued.max(mark);
-            if sequence == 0 {
-                Next::Answer(Answer::Rejected(Rejection::Gap { expected: mark + 1 }))
-            } else if sequence <= mark {
-                Next::Answer(match reply {
-                    Some(outcome) => Answer::Ran(outcome),
-                    None => Answer::Rejected(Rejection::TooOld),
-                })
-            } else if sequence > mark + defaults::REPLY_WINDOW {
-                Next::Answer(Answer::Rejected(Rejection::Ahead))
-            } else if let Some(waiting) = lane.inflight.get_mut(&sequence) {
-                // The original's answer is this one's too. When that is a
-                // refusal (a gap behind a request that failed) the resend
-                // may already have moved past it; nothing was consumed, and
-                // the client's next resend goes through.
-                let (answer, wait) = smol::channel::bounded(1);
-                waiting.push(answer);
-                Next::Wait(wait)
-            } else if sequence == lane.queued + 1 {
-                lane.queued = sequence;
-                lane.inflight.insert(sequence, Vec::new());
-                Next::Queue
-            } else {
-                Next::Answer(Answer::Rejected(Rejection::Gap {
-                    expected: lane.queued + 1,
-                }))
-            }
-        };
-        match next {
-            Next::Answer(answer) => answer,
-            Next::Wait(wait) => wait.recv().await.unwrap_or(Answer::Stopped),
-            Next::Queue => {
-                let request = Request {
-                    session: call.session,
-                    sequence,
-                    caller: Principal::Client(call.session.key),
-                    instance: call.instance,
-                    method: call.method,
-                    arguments: call.arguments,
-                };
-                let answer = reply_answer(self.inner.call(agent, request).await);
-                let waiting = {
-                    let mut lanes = self.lanes.lock().expect("the lanes");
-                    let lane = lanes.entry(lane_key).or_default();
-                    let waiting = lane.inflight.remove(&sequence).unwrap_or_default();
-                    // Not consumed, the mark stays: the client resends it.
-                    if !matches!(answer, Answer::Ran(_)) {
-                        lane.queued = lane.queued.min(sequence - 1);
-                    }
-                    if lane.inflight.is_empty() {
-                        lanes.remove(&lane_key);
-                    }
-                    waiting
-                };
-                for waiter in waiting {
-                    let _ = waiter.try_send(answer.clone());
-                }
-                answer
-            }
-        }
+            .cloned()?;
+        let replicas = record
+            .replicas
+            .iter()
+            .filter_map(|replica| self.inner.contact(*replica))
+            .collect();
+        Some(AgentInfo { record, replicas })
     }
 
     async fn query(&self, agent: AgentId, query: QueryCall) -> Answer {
         let Some(run) = self.inner.run(agent) else {
-            return reply_answer(Err(self.inner.absent(agent)));
+            return answer_of(Err(self.inner.absent(agent)));
         };
         let message = query_message(
             &run.shared.identity,
@@ -445,8 +256,15 @@ impl Ingress {
             query.method,
             &query.arguments,
         );
-        if !verify(&query.key, &message, &query.signature) {
-            return Answer::Rejected(Rejection::BadSignature);
+        let (key, signature) = (query.key, query.signature);
+        let signed = self
+            .inner
+            .offload(move || verify(&key, &message, &signature))
+            .await;
+        match signed {
+            Some(true) => {}
+            Some(false) => return Answer::Rejected(Rejection::BadSignature),
+            None => return Answer::Unavailable,
         }
         let now = (self.inner.clock)();
         if query.not_after < now || query.not_after > now + QUERY_HORIZON_MS {
@@ -463,8 +281,8 @@ impl Ingress {
             )
             .await;
         match outcome {
-            Ok(outcome) => Answer::Ran(outcome),
-            Err(error) => reply_answer(Err(error)),
+            Ok((outcome, at)) => Answer::Ran { outcome, at },
+            Err(error) => answer_of(Err(error)),
         }
     }
 

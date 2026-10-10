@@ -252,10 +252,14 @@ pub enum Refusal {
     /// A Raft message for an agent with no group here, or whose inbox was
     /// full: Raft sends it again.
     Unrouted = 9,
+    /// A forwarded call from a node that does not replicate its agent.
+    NotAReplica = 10,
+    /// An answer to a forwarded call that is no longer waited for.
+    Unmatched = 11,
 }
 
 impl Refusal {
-    pub const ALL: [Refusal; 10] = [
+    pub const ALL: [Refusal; 12] = [
         Refusal::Undecodable,
         Refusal::Stranger,
         Refusal::NotTheLeaderNamed,
@@ -266,7 +270,19 @@ impl Refusal {
         Refusal::WrongStream,
         Refusal::NotTheCreator,
         Refusal::Unrouted,
+        Refusal::NotAReplica,
+        Refusal::Unmatched,
     ];
+}
+
+/// That `from` replicates the agent whose replicas are `replicas`, as a
+/// forwarded call's sender must: replicas are trusted to have checked the
+/// call's signature.
+pub fn check_replica(replicas: Option<&[NodeNumber]>, from: NodeNumber) -> Result<(), Refusal> {
+    match replicas {
+        Some(replicas) if replicas.contains(&from) => Ok(()),
+        _ => Err(Refusal::NotAReplica),
+    }
 }
 
 /// The class a message travels on.
@@ -276,7 +292,9 @@ pub fn class(message: &PeerMessage) -> Class {
         PeerMessage::SnapshotChunk(_) | PeerMessage::Blob { .. } => Class::Bulk,
         PeerMessage::BlobRequest { .. }
         | PeerMessage::Directory(_)
-        | PeerMessage::DirectoryAck { .. } => Class::Requests,
+        | PeerMessage::DirectoryAck { .. }
+        | PeerMessage::Forward { .. }
+        | PeerMessage::Forwarded { .. } => Class::Requests,
         PeerMessage::Liveness { .. } | PeerMessage::LivenessAnswer { .. } => Class::Liveness,
     }
 }
@@ -290,7 +308,9 @@ pub fn stream(message: &PeerMessage) -> u64 {
         PeerMessage::SnapshotChunk(chunk) => u64::from(chunk.agent.0),
         PeerMessage::SnapshotAck(ack) => u64::from(ack.agent.0),
         PeerMessage::Directory(record) => u64::from(record.agent.0),
-        PeerMessage::DirectoryAck { agent } => u64::from(agent.0),
+        PeerMessage::DirectoryAck { agent }
+        | PeerMessage::Forward { agent, .. }
+        | PeerMessage::Forwarded { agent, .. } => u64::from(agent.0),
         PeerMessage::Blob { .. }
         | PeerMessage::Liveness { .. }
         | PeerMessage::LivenessAnswer { .. } => 0,
@@ -339,7 +359,9 @@ pub fn check(
         | PeerMessage::SnapshotAck(_)
         | PeerMessage::BlobRequest { .. }
         | PeerMessage::Liveness { .. }
-        | PeerMessage::LivenessAnswer { .. } => Ok(()),
+        | PeerMessage::LivenessAnswer { .. }
+        | PeerMessage::Forward { .. }
+        | PeerMessage::Forwarded { .. } => Ok(()),
     }
 }
 

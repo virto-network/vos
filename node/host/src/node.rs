@@ -161,7 +161,14 @@ impl From<fjall::Error> for Error {
     }
 }
 
-pub(crate) type Answer = smol::channel::Sender<Result<Reply, CallError>>;
+/// A reply, with the applied index of the state it reflects.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Answered {
+    pub(crate) reply: Reply,
+    pub(crate) at: u64,
+}
+
+pub(crate) type Answer = smol::channel::Sender<Result<Answered, CallError>>;
 
 /// A queued input, with where its reply goes.
 pub(crate) enum Pending {
@@ -366,6 +373,8 @@ pub(crate) struct Inner {
     /// Held while a creation record is checked and stored, so two records
     /// for one id are never both written.
     pub(crate) recording: smol::lock::Mutex<()>,
+    /// Clients' calls: their lanes, and the calls forwarded both ways.
+    pub(crate) calls: crate::calls::Calls,
 }
 
 impl Inner {
@@ -373,9 +382,12 @@ impl Inner {
         self.runs.lock().expect("the runs").get(&id).cloned()
     }
 
-    /// Why a call to `id` cannot be served here.
+    /// Why a call to `id` cannot be served here: a replica with no group
+    /// running is stopping (or refused the group), and any other node
+    /// names the replicas.
     pub(crate) fn absent(&self, id: AgentId) -> CallError {
         match self.directory.lock().expect("the directory").get(&id) {
+            Some(record) if record.replicas.contains(&self.number) => CallError::Stopped,
             Some(record) => CallError::Elsewhere(
                 record
                     .replicas
@@ -388,7 +400,7 @@ impl Inner {
     }
 
     /// How clients reach node `number`, from the space.
-    fn contact(&self, number: NodeNumber) -> Option<Contact> {
+    pub(crate) fn contact(&self, number: NodeNumber) -> Option<Contact> {
         let node = self.space.as_ref()?.node(number)?;
         Some(Contact {
             address: node.ingress.clone(),
@@ -472,7 +484,7 @@ impl Inner {
 
     /// Whether `run`'s group knows where calls go: a leader elsewhere, or
     /// this replica's leader loop taking inputs.
-    fn knows_leader(&self, run: &Run, state: &group::State) -> bool {
+    pub(crate) fn knows_leader(&self, run: &Run, state: &group::State) -> bool {
         match state.leader {
             Some(leader) if leader == self.number => {
                 run.agent.queue.lock().expect("the queue").leading
@@ -620,6 +632,47 @@ impl Inner {
             .is_some_and(|run| run.local.try_send(local).is_ok())
     }
 
+    /// Confirm that this replica leads agent `id`'s group, by a read
+    /// index, and wait until it has applied through that index: its
+    /// applied state then holds everything committed before the call.
+    pub(crate) async fn read_index(&self, id: AgentId) -> Result<u64, CallError> {
+        let run = self.run(id).ok_or_else(|| self.absent(id))?;
+        let (answer, answered) = smol::channel::bounded(1);
+        if !self.propose(id, Local::ReadIndex { answer }) {
+            return Err(CallError::Stopped);
+        }
+        let index = match answered.recv().await {
+            Ok(Ok(index)) => index,
+            Ok(Err(
+                vos_raft::core::ReadIndexError::Backpressure
+                | vos_raft::core::ReadIndexError::TimedOut,
+            )) => {
+                return Err(CallError::Failed(
+                    "leadership was not confirmed in time".into(),
+                ));
+            }
+            Ok(Err(_)) | Err(_) => return Err(self.not_leader(&run.shared)),
+        };
+        let applied = async {
+            Some(
+                run.shared
+                    .wait(|state| state.stopped || state.applied >= index)
+                    .await,
+            )
+        };
+        let late = async {
+            smol::Timer::after(CATCH_UP).await;
+            None
+        };
+        match applied.or(late).await {
+            Some(state) if !state.stopped => Ok(index),
+            Some(_) => Err(CallError::Stopped),
+            None => Err(CallError::Failed(
+                "the replica has not applied through its read index".into(),
+            )),
+        }
+    }
+
     /// Agent `id`'s leader loop stopped for good: its replica hands
     /// leadership over and never leads again.
     pub(crate) fn retire(&self, id: AgentId) {
@@ -734,7 +787,7 @@ impl Inner {
         program: Vec<u8>,
         attestables: Vec<(MethodId, Vec<u8>)>,
         roles: Vec<(Vec<u8>, u8)>,
-    ) -> Result<Reply, CallError> {
+    ) -> Result<Answered, CallError> {
         // A follower refuses before storing anything.
         self.settled(agent).await?;
         let run = self.run(agent).ok_or_else(|| self.absent(agent))?;
@@ -796,7 +849,7 @@ impl Inner {
         self.executors.run(work).await.ok()
     }
 
-    pub(crate) async fn admin(&self, agent: AgentId, admin: Admin) -> Result<Reply, CallError> {
+    pub(crate) async fn admin(&self, agent: AgentId, admin: Admin) -> Result<Answered, CallError> {
         self.settled(agent).await?;
         let (answer, reply) = smol::channel::bounded(1);
         self.push(agent, Pending::Admin(admin, answer, Vec::new()))?;
@@ -809,7 +862,7 @@ impl Inner {
         self: &Arc<Self>,
         agent: AgentId,
         request: Request,
-    ) -> impl Future<Output = Result<Reply, CallError>> + use<> {
+    ) -> impl Future<Output = Result<Answered, CallError>> + use<> {
         let (answer, reply) = smol::channel::bounded(1);
         let mut pending = Some(Pending::Request(request, answer));
         let known = self.run(agent).is_some_and(|run| {
@@ -839,7 +892,7 @@ impl Inner {
         instance: InstanceId,
         method: MethodId,
         arguments: Vec<u8>,
-    ) -> Result<Outcome, CallError> {
+    ) -> Result<(Outcome, u64), CallError> {
         let run = self.run(agent).ok_or_else(|| self.absent(agent))?;
         let state = run
             .shared
@@ -849,9 +902,11 @@ impl Inner {
             return Err(CallError::Stopped);
         }
         let snapshot = Arc::new(self.store.snapshot());
+        let failed = |error: fjall::Error| CallError::Failed(error.to_string());
+        let at = snapshot.applied(agent).map_err(failed)?.unwrap_or(0);
         let (time, seed) = snapshot
             .last_result(agent)
-            .map_err(|error| CallError::Failed(error.to_string()))?
+            .map_err(failed)?
             .unwrap_or((0, [0; 32]));
         let work = Work::Query(Query {
             time,
@@ -871,7 +926,7 @@ impl Inner {
             .run(move || pvm::refine(&program, &pool, &blobs, snapshot, agent, &work, gas))
             .await)
         .map_err(failed)?;
-        pvm::decode::<Outcome>(&output).map_err(failed)
+        Ok((pvm::decode::<Outcome>(&output).map_err(failed)?, at))
     }
 
     /// Commit changes to the node's own records.
@@ -1105,6 +1160,7 @@ impl Node {
             runtime,
             tasks: Mutex::new(Vec::new()),
             recording: smol::lock::Mutex::new(()),
+            calls: crate::calls::Calls::default(),
         });
         for record in records {
             if record.creator == number {
@@ -1189,6 +1245,7 @@ impl Node {
             inner
                 .install(agent, instance, program, attestables, roles)
                 .await
+                .map(|answered| answered.reply)
         })
     }
 
@@ -1200,9 +1257,12 @@ impl Node {
         role: Option<u8>,
     ) -> impl Future<Output = Result<Reply, CallError>> + use<> {
         let inner = Arc::clone(&self.inner);
-        self.inner
-            .runtime
-            .spawn(async move { inner.admin(agent, Admin::SetRole { principal, role }).await })
+        self.inner.runtime.spawn(async move {
+            inner
+                .admin(agent, Admin::SetRole { principal, role })
+                .await
+                .map(|answered| answered.reply)
+        })
     }
 
     /// A client request to `agent`, answered once its step is applied here.
@@ -1211,7 +1271,8 @@ impl Node {
         agent: AgentId,
         request: Request,
     ) -> impl Future<Output = Result<Reply, CallError>> + use<> {
-        self.inner.call(agent, request)
+        let call = self.inner.call(agent, request);
+        async move { call.await.map(|answered| answered.reply) }
     }
 
     /// Run a query handler on `agent`'s applied state. It never enters the
@@ -1229,6 +1290,7 @@ impl Node {
             inner
                 .query(agent, caller, instance, method, arguments)
                 .await
+                .map(|(outcome, _)| outcome)
         }
     }
 

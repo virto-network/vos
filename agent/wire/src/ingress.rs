@@ -9,6 +9,7 @@ use alloc::vec::Vec;
 use scale::{Decode, Encode};
 
 use crate::ids::{AgentId, InstanceId, MethodId, Principal, Session};
+use crate::peer::CreationRecord;
 use crate::result::Outcome;
 
 pub const CALL_DOMAIN: &[u8] = b"vos/call/1";
@@ -24,6 +25,14 @@ pub struct NodeId(pub [u8; 32]);
 pub struct Contact {
     pub address: String,
     pub node: NodeId,
+}
+
+/// `GET /agents/{agent}`: the agent's creation record, whose hash is its
+/// identity, and its replicas, any of which serves it.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct AgentInfo {
+    pub record: CreationRecord,
+    pub replicas: Vec<Contact>,
 }
 
 /// `POST /agents/{agent}/calls`: a command, in its session's sequence for
@@ -98,9 +107,11 @@ pub enum Rejection {
 /// Ingress's answer to a call, a query or an operator command.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum Answer {
-    /// The step ran, or the query did: its outcome.
+    /// The step ran, or the query did: its outcome, and the applied index
+    /// of the state the answer reflects, which a later query may ask a
+    /// replica to have reached.
     #[codec(index = 0)]
-    Ran(Outcome),
+    Ran { outcome: Outcome, at: u64 },
     /// The agent refused it, with a code from [`crate::abi::refusal`].
     #[codec(index = 1)]
     Refused(u32),
@@ -134,6 +145,10 @@ pub enum Answer {
     /// hold yet: it reaches them as they return.
     #[codec(index = 11)]
     Unconfirmed(AgentId),
+    /// No answer in time: the call may have run, or may yet. Send it again
+    /// with the same sequence.
+    #[codec(index = 12)]
+    TimedOut,
 }
 
 /// The operator's `POST /agents`: the nodes to replicate the new agent,

@@ -174,6 +174,15 @@ impl Inner {
             }
             PeerMessage::BlobRequest { agent, hashes } => self.serve_blobs(from, agent, hashes),
             PeerMessage::DirectoryAck { agent } => self.on_ack(from, agent),
+            // A task of its own runs the call: the dispatcher never waits.
+            PeerMessage::Forward { agent, token, call } => {
+                self.on_forward(from, agent, token, call)
+            }
+            PeerMessage::Forwarded {
+                agent,
+                token,
+                answer,
+            } => self.on_forwarded(from, agent, token, answer),
             PeerMessage::Blob { .. } | PeerMessage::Directory(_) => {
                 unreachable!("blobs and records are handled in tasks")
             }

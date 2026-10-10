@@ -17,7 +17,7 @@ use vos_wire::records::{SessionMark, unstored};
 use vos_wire::result::{Outcome, Outgoing, Step, WorkResult};
 
 use crate::group::{DryRun, Local, Shared, State};
-use crate::node::{Agent, CallError, Inner, Pending, Reply, ran, read, reply, seed};
+use crate::node::{Agent, Answered, CallError, Inner, Pending, Reply, ran, read, reply, seed};
 use crate::pvm::{self, Fault};
 use crate::store::{BlobRef, EntryKind, FjallSnapshot, LogEntry, Store, View};
 
@@ -568,7 +568,10 @@ impl Leader {
             "the agent program fails on one input alone ({failed}); it is dropped"
         );
         if let Pending::Request(_, answer) | Pending::Admin(_, answer, _) = input {
-            let _ = answer.try_send(Ok(Reply::Failed));
+            let _ = answer.try_send(Ok(Answered {
+                reply: Reply::Failed,
+                at: self.applied,
+            }));
         }
     }
 
@@ -603,10 +606,14 @@ impl Leader {
                             .map_err(|fault| CallError::Failed(fault.message().to_string())),
                         _ => Ok(reply(step)),
                     };
-                    let _ = answer.try_send(answered);
+                    let at = self.applied;
+                    let _ = answer.try_send(answered.map(|reply| Answered { reply, at }));
                 }
                 Pending::Admin(_, answer, _) => {
-                    let _ = answer.try_send(Ok(reply(step)));
+                    let _ = answer.try_send(Ok(Answered {
+                        reply: reply(step),
+                        at: self.applied,
+                    }));
                 }
                 Pending::Message(message) => match step {
                     Step::Ran(_) => {

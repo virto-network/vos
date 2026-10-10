@@ -1,6 +1,7 @@
 //! What one node sends another: messages for an agent's replica group,
-//! snapshot chunks, blobs, and liveness. The node checks each against the
-//! space's configuration before it reaches a group.
+//! snapshot chunks, blobs, liveness, the directory of agents, and clients'
+//! calls forwarded to a leader. The node checks each against the space's
+//! configuration before it reaches a group.
 //!
 //! The Raft types mirror the consensus core's, so the wire format is this
 //! module's alone and the core may change underneath it. The network's
@@ -11,6 +12,7 @@ use alloc::vec::Vec;
 use scale::{Decode, Encode};
 
 use crate::ids::{AgentId, ProgramHash};
+use crate::ingress::{Answer, Call};
 
 /// A node of the space: the 8-bit node part of an agent id.
 pub type NodeNumber = u8;
@@ -46,6 +48,21 @@ pub enum PeerMessage {
     /// The receiver holds `agent`'s creation record durably.
     #[codec(index = 8)]
     DirectoryAck { agent: AgentId },
+    /// A client's call to `agent`, whose signature the sending replica
+    /// checked, for the leader to run. `token` names it across re-forwards.
+    #[codec(index = 9)]
+    Forward {
+        agent: AgentId,
+        token: u64,
+        call: Call,
+    },
+    /// The leader's answer to a forwarded call.
+    #[codec(index = 10)]
+    Forwarded {
+        agent: AgentId,
+        token: u64,
+        answer: Answer,
+    },
 }
 
 /// What makes an agent the agent it is. Its hash is the agent's identity.

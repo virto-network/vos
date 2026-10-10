@@ -8,8 +8,10 @@ use vos_node::peer::{self, Drops, Refusal, decode, from_wire, to_wire};
 use vos_raft::core::{Action, Core, Recovered, Write};
 use vos_raft::{AppendResult, Config, LogEntry, Message, Role};
 use vos_wire::Encode;
-use vos_wire::ids::AgentId;
+use vos_wire::ids::{AgentId, InstanceId, MethodId, Session};
+use vos_wire::ingress::{Answer, Call};
 use vos_wire::peer::{Configuration, NodeNumber, PeerMessage, Raft, SnapshotAck, SnapshotChunk};
+use vos_wire::result::Outcome;
 
 const AGENT: AgentId = AgentId(7);
 
@@ -172,10 +174,63 @@ fn every_other_message_survives_the_wire() {
             incarnation: 10,
             round: 3,
         },
+        forward(),
+        PeerMessage::Forwarded {
+            agent: AGENT,
+            token: 77,
+            answer: Answer::Ran {
+                outcome: Outcome::Done(vec![1, 2]),
+                at: 40,
+            },
+        },
     ];
     for message in messages {
         assert_eq!(decode(&message.encode()), Ok(message));
     }
+}
+
+fn forward() -> PeerMessage {
+    PeerMessage::Forward {
+        agent: AGENT,
+        token: 77,
+        call: Call {
+            session: Session {
+                key: [1; 32],
+                name: [2; 16],
+                t0: 3,
+            },
+            sequence: 4,
+            instance: InstanceId(5),
+            method: MethodId(6),
+            arguments: vec![7],
+            signature: [8; 64],
+        },
+    }
+}
+
+#[test]
+fn a_forwarded_call_comes_from_a_replica_on_its_agent_s_requests_stream() {
+    let forward = forward();
+    assert_eq!(peer::class(&forward), Class::Requests);
+    assert_eq!(peer::stream(&forward), u64::from(AGENT.0));
+    assert_eq!(
+        peer::check(
+            &SPACE,
+            2,
+            (Class::Consensus, u64::from(AGENT.0)),
+            &forward,
+            unfollowed
+        ),
+        Err(Refusal::WrongClass)
+    );
+    // Its sender must replicate the agent: the leader trusts it to have
+    // checked the call's signature.
+    assert_eq!(peer::check_replica(Some(&[1, 2, 3]), 2), Ok(()));
+    assert_eq!(
+        peer::check_replica(Some(&[1, 3]), 2),
+        Err(Refusal::NotAReplica)
+    );
+    assert_eq!(peer::check_replica(None, 2), Err(Refusal::NotAReplica));
 }
 
 #[test]

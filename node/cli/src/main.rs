@@ -432,13 +432,17 @@ fn key_bytes(text: &str) -> Result<[u8; 32], String> {
 
 /// A key's sessions, kept next to the key file so calls go on in them:
 /// each agent's session, its identity once fetched, and a call that failed
-/// before its answer, by its digest, until it is answered.
+/// before its answer, by its digest and when, until it is answered.
 #[derive(Default)]
 struct Kept {
     sessions: HashMap<AgentId, client::Kept>,
     identities: HashMap<AgentId, [u8; 32]>,
-    pending: HashMap<AgentId, [u8; 32]>,
+    pending: HashMap<AgentId, ([u8; 32], u64)>,
 }
+
+/// How long a call left unanswered may still be on its way to a leader:
+/// a replica forwards it for 30 s.
+const IN_TRANSIT_MS: u64 = 60_000;
 
 impl Kept {
     fn path(key: &Path) -> PathBuf {
@@ -475,8 +479,9 @@ impl Kept {
                     kept.identities
                         .insert(agent(id)?, key_bytes(identity).ok()?);
                 }
-                ["pending", id, digest] => {
-                    kept.pending.insert(agent(id)?, key_bytes(digest).ok()?);
+                ["pending", id, digest, time] => {
+                    kept.pending
+                        .insert(agent(id)?, (key_bytes(digest).ok()?, time.parse().ok()?));
                 }
                 _ => return None,
             }
@@ -498,8 +503,12 @@ impl Kept {
         for (agent, identity) in &self.identities {
             text.push_str(&format!("identity {} {}\n", agent.0, hex::encode(identity)));
         }
-        for (agent, digest) in &self.pending {
-            text.push_str(&format!("pending {} {}\n", agent.0, hex::encode(digest)));
+        for (agent, (digest, time)) in &self.pending {
+            text.push_str(&format!(
+                "pending {} {} {time}\n",
+                agent.0,
+                hex::encode(digest)
+            ));
         }
         // Replaced whole: a write cut short must not lose a pending call.
         let path = Self::path(key);
@@ -535,20 +544,26 @@ fn invoke(call: &CallArgs, query: bool) -> Result<(), String> {
         // first, so the earlier one's answer is never taken for its own.
         let digest =
             vos_pvm::precompile::blake2b_256(&(instance, method, arguments.clone()).encode());
-        if kept
-            .pending
-            .remove(&agent)
-            .is_some_and(|pending| pending != digest)
-        {
-            client.renew(agent);
+        match kept.pending.remove(&agent) {
+            Some((pending, _)) if pending != digest => client.renew(agent),
+            // Sent again soon after: copies of the first may be on their
+            // way still, so a refusal now does not prove it never ran.
+            Some((_, time)) if vos_node::wall_clock() < time + IN_TRANSIT_MS => {
+                client.repeats_unknown(agent);
+            }
+            _ => {}
         }
         let answer = client.call(agent, instance, method, &arguments);
         // Unanswered: the call may have run, or may yet.
         if matches!(
             answer,
-            Err(_) | Ok(Answer::Stopped | Answer::NotLeader { .. } | Answer::Unavailable)
+            Err(_)
+                | Ok(Answer::Stopped
+                    | Answer::NotLeader { .. }
+                    | Answer::Unavailable
+                    | Answer::TimedOut)
         ) {
-            kept.pending.insert(agent, digest);
+            kept.pending.insert(agent, (digest, vos_node::wall_clock()));
         }
         answer
     };
@@ -567,8 +582,14 @@ fn invoke(call: &CallArgs, query: bool) -> Result<(), String> {
 
 fn describe(answer: &Answer) -> String {
     match answer {
-        Answer::Ran(Outcome::Done(reply)) => format!("done {}", hex::encode(reply)),
-        Answer::Ran(Outcome::Failed { code, detail }) => {
+        Answer::Ran {
+            outcome: Outcome::Done(reply),
+            ..
+        } => format!("done {}", hex::encode(reply)),
+        Answer::Ran {
+            outcome: Outcome::Failed { code, detail },
+            ..
+        } => {
             format!("failed {code} {}", hex::encode(detail))
         }
         Answer::Refused(code) => format!("refused {code}"),
@@ -578,7 +599,7 @@ fn describe(answer: &Answer) -> String {
 
 fn print_answer(answer: &Answer) -> Result<(), String> {
     match answer {
-        Answer::Ran(_) => {
+        Answer::Ran { .. } => {
             println!("{}", describe(answer));
             Ok(())
         }

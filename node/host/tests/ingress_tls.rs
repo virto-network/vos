@@ -83,9 +83,10 @@ fn a_client_pins_the_node_s_key() {
     };
     // A client signs for the agent's identity, its record's hash.
     let client = Client::new(&pinned, SigningKey::from_bytes(&[3; 32]));
-    let record = vos_node::client::record(&pinned, agent)
+    let record = vos_node::client::agent_info(&pinned, agent)
         .unwrap()
-        .expect("its record");
+        .expect("its record")
+        .record;
     assert_eq!(record.agent, agent);
     assert_eq!(client.identity(agent).unwrap(), vos_node::identity(&record));
 

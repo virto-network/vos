@@ -95,7 +95,13 @@ impl Served {
         };
         let installed = operator.install(agent, &install).unwrap();
         assert!(
-            matches!(installed, Answer::Ran(Outcome::Done(_))),
+            matches!(
+                installed,
+                Answer::Ran {
+                    outcome: Outcome::Done(_),
+                    ..
+                }
+            ),
             "{installed:?}"
         );
         let schema = vos_node::client::schema(&target, agent, COUNTER)
@@ -150,7 +156,10 @@ impl Served {
 
 fn done(answer: Answer) -> u64 {
     match answer {
-        Answer::Ran(Outcome::Done(bytes)) => u64::decode(&bytes).unwrap().0,
+        Answer::Ran {
+            outcome: Outcome::Done(bytes),
+            ..
+        } => u64::decode(&bytes).unwrap().0,
         other => panic!("not done: {other:?}"),
     }
 }

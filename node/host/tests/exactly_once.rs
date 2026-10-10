@@ -81,11 +81,54 @@ impl Random {
     }
 }
 
-/// Stops a leader loop once, after its commit and before its answers.
+/// Stops a leader loop once, after its commit and before its answers; and
+/// holds the node's refines, or its commits, while asked.
 #[derive(Default)]
 struct Trip {
     armed: AtomicBool,
     tripped: AtomicBool,
+    refines: Gate,
+    commits: Gate,
+}
+
+/// Holds whoever passes while it is closed, counting them.
+#[derive(Default)]
+struct Gate {
+    closed: Mutex<bool>,
+    opened: std::sync::Condvar,
+    reached: AtomicU64,
+}
+
+impl Gate {
+    fn pass(&self) {
+        let mut closed = self.closed.lock().unwrap();
+        if *closed {
+            self.reached.fetch_add(1, Ordering::SeqCst);
+        }
+        while *closed {
+            closed = self.opened.wait(closed).unwrap();
+        }
+    }
+
+    /// Close the gate until what this gives back is dropped, a failing
+    /// test's included.
+    fn close(&self) -> Closed<'_> {
+        *self.closed.lock().unwrap() = true;
+        Closed(self)
+    }
+
+    fn open(&self) {
+        *self.closed.lock().unwrap() = false;
+        self.opened.notify_all();
+    }
+}
+
+struct Closed<'a>(&'a Gate);
+
+impl Drop for Closed<'_> {
+    fn drop(&mut self) {
+        self.0.open();
+    }
 }
 
 impl Hooks for Trip {
@@ -95,6 +138,15 @@ impl Hooks for Trip {
             return false;
         }
         true
+    }
+
+    fn fail_refine(&self, _: AgentId, _: &vos_wire::batch::Batch) -> bool {
+        self.refines.pass();
+        false
+    }
+
+    fn before_commit(&self) {
+        self.commits.pass();
     }
 }
 
@@ -118,6 +170,8 @@ struct Cluster {
     slots: Vec<Slot>,
     /// What happened, by name: printed, so a run shows what it tried.
     seen: Mutex<std::collections::BTreeMap<&'static str, u64>>,
+    /// The latest events, for a failure to show what led to it.
+    events: Mutex<std::collections::VecDeque<String>>,
 }
 
 impl Cluster {
@@ -159,6 +213,7 @@ impl Cluster {
             agent,
             slots,
             seen: Mutex::new(std::collections::BTreeMap::new()),
+            events: Mutex::new(std::collections::VecDeque::new()),
         };
         for number in 1..=NODES {
             cluster.start(number);
@@ -168,6 +223,23 @@ impl Cluster {
 
     fn saw(&self, what: &'static str) {
         *self.seen.lock().unwrap().entry(what).or_default() += 1;
+        if what.starts_with("fault") {
+            self.event(format!(
+                "{what}, leaders {:?}",
+                self.slots
+                    .iter()
+                    .map(|slot| slot.node.lock().unwrap().is_some())
+                    .collect::<Vec<_>>()
+            ));
+        }
+    }
+
+    fn event(&self, what: String) {
+        let mut events = self.events.lock().unwrap();
+        if events.len() == 40 {
+            events.pop_front();
+        }
+        events.push_back(what);
     }
 
     fn slot(&self, number: NodeNumber) -> &Slot {
@@ -235,10 +307,19 @@ impl Cluster {
 
 /// POST `body` at `address`, answered within [`ATTEMPT`].
 fn post(address: SocketAddr, path: &str, body: &[u8]) -> Result<Answer, String> {
+    post_within(address, path, body, ATTEMPT)
+}
+
+fn post_within(
+    address: SocketAddr,
+    path: &str,
+    body: &[u8],
+    within: Duration,
+) -> Result<Answer, String> {
     let failed = |error: std::io::Error| error.to_string();
-    let mut stream = TcpStream::connect_timeout(&address, ATTEMPT).map_err(failed)?;
-    stream.set_read_timeout(Some(ATTEMPT)).map_err(failed)?;
-    stream.set_write_timeout(Some(ATTEMPT)).map_err(failed)?;
+    let mut stream = TcpStream::connect_timeout(&address, within).map_err(failed)?;
+    stream.set_read_timeout(Some(within)).map_err(failed)?;
+    stream.set_write_timeout(Some(within)).map_err(failed)?;
     let head = format!(
         "POST {path} HTTP/1.1\r\nHost: node\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
         body.len()
@@ -280,8 +361,8 @@ struct Client {
     rotate: u64,
     /// Its sessions, each started when the client reaches it.
     sessions: Mutex<Vec<Session>>,
-    /// The node it believes leads.
-    guess: Mutex<NodeNumber>,
+    /// The node it calls, until it fails.
+    calling: Mutex<NodeNumber>,
 }
 
 impl Client {
@@ -340,19 +421,26 @@ impl Client {
         let body = self.body(&session, sequence, request);
         let path = format!("/agents/{}/calls", self.agent.0);
         let until = Instant::now() + ANSWERED;
+        // Requests take turns at every replica, the leader's followers
+        // forwarding to it.
+        *self.calling.lock().unwrap() =
+            1 + ((request + u64::from(self.number)) % u64::from(NODES)) as NodeNumber;
         loop {
             assert!(
                 Instant::now() < until,
                 "client {}: request {request} was never answered",
                 self.number
             );
-            let at = *self.guess.lock().unwrap();
+            let at = *self.calling.lock().unwrap();
             let starts = cluster.slot(at).starts.load(Ordering::SeqCst);
             let next = |client: &Self| {
-                *client.guess.lock().unwrap() = at % NODES + 1;
+                *client.calling.lock().unwrap() = at % NODES + 1;
             };
             match post(cluster.slot(at).ingress, &path, &body) {
-                Ok(Answer::Ran(Outcome::Done(reply))) => {
+                Ok(Answer::Ran {
+                    outcome: Outcome::Done(reply),
+                    ..
+                }) => {
                     let total = u64::decode(&reply).unwrap().0;
                     assert_eq!(
                         total,
@@ -361,6 +449,18 @@ impl Client {
                         self.number
                     );
                     self.applied_at(cluster, at, starts, &session, sequence);
+                    cluster.event(format!(
+                        "client {} request {request} (sequence {sequence}) answered by {at}, applied {:?}",
+                        self.number,
+                        (1..=NODES)
+                            .map(|n| cluster.node(n).and_then(|node| node.applied(self.agent)))
+                            .collect::<Vec<_>>()
+                    ));
+                    cluster.saw(if cluster.leader(self.agent) == Some(at) {
+                        "answered by the leader"
+                    } else {
+                        "answered by a follower"
+                    });
                     return;
                 }
                 Ok(Answer::NotLeader {
@@ -368,11 +468,12 @@ impl Client {
                 }) => {
                     cluster.saw("redirect");
                     match cluster.number_at(&leader.address) {
-                        Some(leader) => *self.guess.lock().unwrap() = leader,
+                        Some(leader) => *self.calling.lock().unwrap() = leader,
                         None => panic!("a redirect to {}", leader.address),
                     }
                 }
-                Ok(Answer::NotLeader { leader: None }) | Ok(Answer::Stopped) | Err(_) => {
+                Ok(Answer::NotLeader { leader: None } | Answer::Stopped | Answer::TimedOut)
+                | Err(_) => {
                     cluster.saw("resend elsewhere");
                     next(self);
                     std::thread::sleep(Duration::from_millis(10));
@@ -390,8 +491,21 @@ impl Client {
                     std::thread::sleep(Duration::from_millis(5));
                 }
                 Ok(other) => panic!(
-                    "client {}: request {request} (sequence {sequence}) at node {at}: {other:?}",
-                    self.number
+                    "client {}: request {request} (sequence {sequence}) at node {at}: {other:?}; agent {} applied at each node {:?}, leader {:?}\n{}",
+                    self.number,
+                    self.agent.0,
+                    (1..=NODES)
+                        .map(|n| cluster.node(n).map(|node| node.applied(self.agent)))
+                        .collect::<Vec<_>>(),
+                    cluster.leader(self.agent),
+                    cluster
+                        .events
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("\n"),
                 ),
             }
         }
@@ -466,7 +580,7 @@ fn faults(cluster: &Cluster, agents: &[AgentId], random: &mut Random) {
         pause(random);
         let agent = agents[random.below(agents.len() as u64) as usize];
         let any = 1 + random.below(u64::from(NODES)) as NodeNumber;
-        match random.below(5) {
+        match random.below(6) {
             0 => {
                 cluster.saw("fault: stop");
                 let number = cluster.leader(agent).unwrap_or(any);
@@ -496,6 +610,15 @@ fn faults(cluster: &Cluster, agents: &[AgentId], random: &mut Random) {
                 cluster.stop(number);
                 pause(random);
                 cluster.start(number);
+            }
+            5 => {
+                // Clients calling the followers re-forward to the leader
+                // they elect.
+                cluster.saw("fault: the leader cut off");
+                cluster.hub.isolate(cluster.leader(agent).unwrap_or(any));
+                pause(random);
+                pause(random);
+                cluster.hub.heal();
             }
             2 => {
                 cluster.saw("fault: isolate");
@@ -559,9 +682,10 @@ fn exactly_once(mode: Mode, default_seed: u64) {
             );
             let target =
                 Target::loopback(&format!("http://{}", cluster.slot(number).ingress)).unwrap();
-            let record = vos_node::client::record(&target, agent)
+            let record = vos_node::client::agent_info(&target, agent)
                 .unwrap()
-                .expect("the agent's record");
+                .expect("the agent's record")
+                .record;
             Client {
                 number,
                 agent,
@@ -570,7 +694,7 @@ fn exactly_once(mode: Mode, default_seed: u64) {
                 increment,
                 rotate: 32 + 4 * random.below(8),
                 sessions: Mutex::new(Vec::new()),
-                guess: Mutex::new(number),
+                calling: Mutex::new(number),
             }
         })
         .collect();
@@ -629,14 +753,25 @@ fn pipelined_requests_apply_once_through_failures() {
     exactly_once(Mode::Pipelined, 0x5eed_0002);
 }
 
-/// A cluster with one agent running the counter: the agent and its
-/// counter's methods.
-fn counter_agent(cluster: &Cluster) -> (AgentId, MethodId, MethodId) {
+/// The counter's total an answer carries.
+fn done(answer: &Answer) -> Option<u64> {
+    match answer {
+        Answer::Ran {
+            outcome: Outcome::Done(bytes),
+            ..
+        } => Some(u64::decode(bytes).unwrap().0),
+        _ => None,
+    }
+}
+
+/// A cluster with one agent replicated on `replicas`, running the
+/// counter: the agent and its counter's methods.
+fn counter_agent(cluster: &Cluster, replicas: Vec<NodeNumber>) -> (AgentId, MethodId, MethodId) {
     let counter = elf("test-actors/target/riscv64em-vos/release/counter.elf");
     let agent = cluster
-        .node(1)
+        .node(replicas[0])
         .unwrap()
-        .create_replicated(vec![1, 2, 3])
+        .create_replicated(replicas)
         .unwrap();
     wait_until("a leader", Duration::from_secs(20), || {
         cluster.leader(agent).is_some()
@@ -658,31 +793,106 @@ fn target(cluster: &Cluster, number: NodeNumber) -> Target {
     Target::loopback(&format!("http://{}", cluster.slot(number).ingress)).unwrap()
 }
 
-/// A client sent to a follower goes on to the leader the follower names,
-/// and calls it from then on.
+/// The mark node `number` applied for `session` of `agent`.
+fn mark(cluster: &Cluster, number: NodeNumber, agent: AgentId, session: &Session) -> u64 {
+    let node = cluster.node(number).unwrap();
+    let snapshot = node.store().snapshot();
+    let value = |key: &[u8]| {
+        snapshot
+            .get(agent, key)
+            .unwrap()
+            .map(|bytes| unstored(&bytes).unwrap().to_vec())
+    };
+    let Some(id) = value(&keys::session_index(session)) else {
+        return 0;
+    };
+    let id = SessionId::decode(&id).unwrap().0;
+    SessionMark::decode(&value(&keys::session(id)).unwrap())
+        .unwrap()
+        .0
+        .sequence
+}
+
+/// A follower forwards a call to the leader, and answers it once it has
+/// applied it itself; the client goes on calling the follower.
 #[test]
-fn a_client_follows_a_redirect_to_the_leader() {
+fn a_follower_forwards_a_call_and_answers_once_it_applied_it() {
     let cluster = Cluster::new(1);
-    let (agent, increment, _) = counter_agent(&cluster);
+    let (agent, increment, _) = counter_agent(&cluster, vec![1, 2, 3]);
     let leader = cluster.leader(agent).unwrap();
     let follower = leader % NODES + 1;
     let mut client = vos_node::client::Client::new(
         &target(&cluster, follower),
         SigningKey::from_bytes(&[7; 32]),
     );
-    for (by, total) in [(5u64, 5u64), (2, 7)] {
-        assert_eq!(
-            client
-                .call(agent, COUNTER, increment, &by.encode())
-                .unwrap(),
-            Answer::Ran(Outcome::Done(total.encode()))
+    for (sequence, (by, total)) in [(5u64, 5u64), (2, 7)].into_iter().enumerate() {
+        let answer = client
+            .call(agent, COUNTER, increment, &by.encode())
+            .unwrap();
+        assert_eq!(done(&answer), Some(total), "{answer:?}");
+        let session = client.session(agent);
+        assert!(
+            mark(&cluster, follower, agent, &session) > sequence as u64,
+            "answered before the follower applied it"
         );
     }
-    let at = |target: &Target| vos_node::client::node_id(target).unwrap().0;
     assert_eq!(
-        at(client.target()),
-        cluster.space.node(leader).unwrap().key,
-        "the client calls the leader now"
+        vos_node::client::node_id(client.target()).unwrap().0,
+        cluster.space.node(follower).unwrap().key,
+        "the client still calls the follower"
+    );
+}
+
+/// A follower checks a call's signature before it forwards the call: the
+/// leader runs forwarded calls without checking them again.
+#[test]
+fn a_follower_forwards_no_call_it_cannot_verify() {
+    let cluster = Cluster::new(3);
+    let (agent, increment, value) = counter_agent(&cluster, vec![1, 2, 3]);
+    let leader = cluster.leader(agent).unwrap();
+    let follower = leader % NODES + 1;
+    let at = target(&cluster, follower);
+    let client = vos_node::client::Client::new(&at, SigningKey::from_bytes(&[9; 32]));
+    let body = client
+        .call_body(agent, 1, COUNTER, increment, &5u64.encode())
+        .unwrap();
+    let mut call = Call::decode(&body).unwrap().0;
+    call.arguments = 6u64.encode();
+    let path = format!("/agents/{}/calls", agent.0);
+    assert_eq!(
+        post(cluster.slot(follower).ingress, &path, &call.encode()),
+        Ok(Answer::Rejected(Rejection::BadSignature))
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    let node = cluster.node(leader).unwrap();
+    let total = smol::block_on(node.query(
+        agent,
+        Principal::Client([0; 32]),
+        COUNTER,
+        value,
+        Vec::new(),
+    ));
+    assert_eq!(total, Ok(Outcome::Done(0u64.encode())), "it never ran");
+}
+
+/// A node that does not replicate the agent names its replicas, and the
+/// client calls one of them from then on.
+#[test]
+fn a_client_follows_elsewhere_to_a_replica() {
+    let cluster = Cluster::new(4);
+    let (agent, increment, _) = counter_agent(&cluster, vec![1, 2]);
+    let mut client =
+        vos_node::client::Client::new(&target(&cluster, 3), SigningKey::from_bytes(&[10; 32]));
+    let answer = client
+        .call(agent, COUNTER, increment, &4u64.encode())
+        .unwrap();
+    assert_eq!(done(&answer), Some(4), "{answer:?}");
+    let now = vos_node::client::node_id(client.target()).unwrap().0;
+    assert!(
+        [1, 2]
+            .iter()
+            .any(|number| cluster.space.node(*number).unwrap().key == now),
+        "the client calls a replica now"
     );
 }
 
@@ -692,7 +902,7 @@ fn a_client_follows_a_redirect_to_the_leader() {
 #[test]
 fn a_leader_whose_clock_trails_times_its_batches_at_the_agents() {
     let cluster = Cluster::new(2);
-    let (agent, increment, _) = counter_agent(&cluster);
+    let (agent, increment, _) = counter_agent(&cluster, vec![1, 2, 3]);
     let leader = cluster.leader(agent).unwrap();
     let mut client =
         vos_node::client::Client::new(&target(&cluster, leader), SigningKey::from_bytes(&[8; 32]));
@@ -708,12 +918,10 @@ fn a_leader_whose_clock_trails_times_its_batches_at_the_agents() {
     };
     let offset = &cluster.slot(leader).offset;
     offset.store(30_000, Ordering::SeqCst);
-    assert_eq!(
-        client
-            .call(agent, COUNTER, increment, &1u64.encode())
-            .unwrap(),
-        Answer::Ran(Outcome::Done(1u64.encode()))
-    );
+    let answer = client
+        .call(agent, COUNTER, increment, &1u64.encode())
+        .unwrap();
+    assert_eq!(done(&answer), Some(1), "{answer:?}");
     let ahead = batch_time();
     assert!(
         ahead >= vos_node::wall_clock() + 20_000,
@@ -722,12 +930,125 @@ fn a_leader_whose_clock_trails_times_its_batches_at_the_agents() {
     // The clock comes back: it trails the agent's time by more than the
     // bound.
     offset.store(0, Ordering::SeqCst);
-    assert_eq!(
-        client
-            .call(agent, COUNTER, increment, &2u64.encode())
-            .unwrap(),
-        Answer::Ran(Outcome::Done(3u64.encode()))
-    );
+    let answer = client
+        .call(agent, COUNTER, increment, &2u64.encode())
+        .unwrap();
+    assert_eq!(done(&answer), Some(3), "{answer:?}");
     assert_eq!(cluster.leader(agent), Some(leader), "it goes on leading");
     assert!(batch_time() >= ahead, "the agent's time went back");
+}
+
+/// A signed call: `by` added in `session`, at `sequence`.
+fn signed_call(
+    identity: &[u8; 32],
+    key: &SigningKey,
+    session: Session,
+    sequence: u64,
+    increment: MethodId,
+    by: u64,
+) -> Vec<u8> {
+    let arguments = by.encode();
+    let message = call_message(identity, &session, sequence, COUNTER, increment, &arguments);
+    Call {
+        session,
+        sequence,
+        instance: COUNTER,
+        method: increment,
+        arguments,
+        signature: key.sign(&message).to_bytes(),
+    }
+    .encode()
+}
+
+/// A resend of a new session's first call, while the first is queued,
+/// joins it even once the session's time is past the skew: the first was
+/// timed when its batch formed, and refusing the resend `StaleSession`
+/// would have the client run it again in a new session.
+#[test]
+fn a_resend_of_a_queued_first_call_joins_it_past_the_skew() {
+    let cluster = Cluster::new(5);
+    let (agent, increment, value) = counter_agent(&cluster, vec![1, 2, 3]);
+    let leader = cluster.leader(agent).unwrap();
+    let identity = vos_node::identity(
+        &vos_node::client::agent_info(&target(&cluster, leader), agent)
+            .unwrap()
+            .unwrap()
+            .record,
+    );
+    let key = SigningKey::from_bytes(&[11; 32]);
+    let session = Session {
+        key: key.verifying_key().to_bytes(),
+        name: [11; 16],
+        t0: vos_node::wall_clock() - (vos_wire::defaults::SESSION_SKEW_MS - 1_500),
+    };
+    let body = signed_call(&identity, &key, session, 1, increment, 5);
+    let path = format!("/agents/{}/calls", agent.0);
+    let address = cluster.slot(leader).ingress;
+    let refines = &cluster.slot(leader).trip.refines;
+    let reached = refines.reached.load(Ordering::SeqCst);
+    std::thread::scope(|scope| {
+        // Inside the scope: a failure opens it before the scope waits.
+        let closed = refines.close();
+        let first = scope.spawn(|| post_within(address, &path, &body, ANSWERED));
+        wait_until("the first is refined", Duration::from_secs(10), || {
+            refines.reached.load(Ordering::SeqCst) > reached
+        });
+        // Past the skew now.
+        std::thread::sleep(Duration::from_millis(2_000));
+        let second = scope.spawn(|| post_within(address, &path, &body, ANSWERED));
+        std::thread::sleep(Duration::from_millis(300));
+        drop(closed);
+        for answer in [first.join().unwrap(), second.join().unwrap()] {
+            let answer = answer.unwrap();
+            assert_eq!(done(&answer), Some(5), "{answer:?}");
+        }
+    });
+    let node = cluster.node(leader).unwrap();
+    let total = smol::block_on(node.query(
+        agent,
+        Principal::Client([0; 32]),
+        COUNTER,
+        value,
+        Vec::new(),
+    ));
+    assert_eq!(total, Ok(Outcome::Done(5u64.encode())), "ran once");
+}
+
+/// A follower answers a forwarded call only once it has applied it: while
+/// its commits are held, the leader has run the call and the client waits.
+#[test]
+fn a_follower_holding_back_its_apply_holds_back_its_answer() {
+    let cluster = Cluster::new(6);
+    let (agent, increment, value) = counter_agent(&cluster, vec![1, 2, 3]);
+    let leader = cluster.leader(agent).unwrap();
+    let follower = leader % NODES + 1;
+    let mut client = vos_node::client::Client::new(
+        &target(&cluster, follower),
+        SigningKey::from_bytes(&[12; 32]),
+    );
+    client.identity(agent).unwrap();
+    let commits = &cluster.slot(follower).trip.commits;
+    std::thread::scope(|scope| {
+        let closed = commits.close();
+        let (answered, answer) = std::sync::mpsc::channel();
+        scope.spawn(move || {
+            let _ = answered.send(client.call(agent, COUNTER, increment, &3u64.encode()));
+        });
+        let node = cluster.node(leader).unwrap();
+        wait_until("the leader runs it", Duration::from_secs(10), || {
+            smol::block_on(node.query(
+                agent,
+                Principal::Client([0; 32]),
+                COUNTER,
+                value,
+                Vec::new(),
+            )) == Ok(Outcome::Done(3u64.encode()))
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        let early = answer.try_recv();
+        drop(closed);
+        assert!(early.is_err(), "answered before the follower applied it");
+        let answer = answer.recv().unwrap().unwrap();
+        assert_eq!(done(&answer), Some(3), "{answer:?}");
+    });
 }

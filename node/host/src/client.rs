@@ -12,10 +12,9 @@ use rustls::pki_types::ServerName;
 use vos_wire::abi::refusal;
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session};
 use vos_wire::ingress::{
-    Answer, Call, Contact, Create, Grant, Install, NodeId, QueryCall, Rejection, call_message,
-    query_message,
+    AgentInfo, Answer, Call, Contact, Create, Grant, Install, NodeId, QueryCall, Rejection,
+    call_message, query_message,
 };
-use vos_wire::peer::CreationRecord;
 use vos_wire::schema::Schema;
 use vos_wire::{Decode, Encode};
 
@@ -28,6 +27,8 @@ pub enum ClientError {
     Undecodable(u16),
     /// The node knows no agent of that id.
     NoAgent,
+    /// The node's record of the agent is not the one this client kept.
+    OtherAgent,
     /// The node names itself by a key other than the one its TLS showed.
     NotTheNode,
 }
@@ -60,17 +61,7 @@ impl Target {
         } else {
             return Err(invalid("not an http:// or https:// address"));
         };
-        let authority = rest.trim_end_matches('/');
-        if authority.is_empty() || authority.contains('/') {
-            return Err(invalid("a host and a port, with no path"));
-        }
-        let (host, port) = match authority.rsplit_once(':') {
-            Some((host, port)) if !port.contains(']') => (
-                host,
-                port.parse::<u16>().map_err(|_| invalid("not a port"))?,
-            ),
-            _ => (authority, if secure { 443 } else { 80 }),
-        };
+        let (host, port) = host_and_port(rest, secure).map_err(invalid)?;
         let bare = host.trim_start_matches('[').trim_end_matches(']');
         let mut loopback = None;
         let tls = match (secure, &trust) {
@@ -127,6 +118,33 @@ impl Target {
     pub fn loopback(url: &str) -> Result<Self, ClientError> {
         Self::new(url, Trust::Loopback)
     }
+}
+
+/// The host and port of an address's authority (`rest`, after its
+/// scheme), the scheme's port when it gives none.
+fn host_and_port(rest: &str, secure: bool) -> Result<(&str, u16), &'static str> {
+    let authority = rest.trim_end_matches('/');
+    if authority.is_empty() || authority.contains('/') {
+        return Err("a host and a port, with no path");
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port)) if !port.contains(']') => {
+            Ok((host, port.parse::<u16>().map_err(|_| "not a port")?))
+        }
+        _ => Ok((authority, if secure { 443 } else { 80 })),
+    }
+}
+
+/// `host:port` for an `http://` or `https://` address, as a target holds
+/// it.
+fn authority(url: &str) -> Option<String> {
+    let (secure, rest) = match url.split_once("://")? {
+        ("https", rest) => (true, rest),
+        ("http", rest) => (false, rest),
+        _ => return None,
+    };
+    let (host, port) = host_and_port(rest, secure).ok()?;
+    Some(format!("{host}:{port}"))
 }
 
 /// A connection is used again only if it was idle less than this long,
@@ -394,20 +412,21 @@ fn fetch_node_id(http: &Http) -> Result<NodeId, ClientError> {
     }
 }
 
-/// Agent `agent`'s creation record, as the node knows it: `None` when it
-/// knows no such agent.
-pub fn record(target: &Target, agent: AgentId) -> Result<Option<CreationRecord>, ClientError> {
-    record_from(&Http::new(target), agent)
+/// Agent `agent`'s creation record and replicas, as the node knows them:
+/// `None` when it knows no such agent.
+pub fn agent_info(target: &Target, agent: AgentId) -> Result<Option<AgentInfo>, ClientError> {
+    agent_info_from(&Http::new(target), agent)
 }
 
-fn record_from(http: &Http, agent: AgentId) -> Result<Option<CreationRecord>, ClientError> {
+fn agent_info_from(http: &Http, agent: AgentId) -> Result<Option<AgentInfo>, ClientError> {
     let (status, body) = http.get(&format!("/agents/{}", agent.0))?;
     if status == 404 {
         return Ok(None);
     }
-    CreationRecord::decode(&body)
-        .map(|(record, _)| Some(record))
-        .map_err(|_| ClientError::Undecodable(status))
+    match AgentInfo::decode(&body) {
+        Ok((info, _)) if info.record.agent == agent => Ok(Some(info)),
+        _ => Err(ClientError::Undecodable(status)),
+    }
 }
 
 /// One agent's session as its client keeps it: the session's name and
@@ -421,6 +440,12 @@ pub struct Kept {
 
 /// Redirects a call follows before it answers what the last node said.
 const REDIRECTS: usize = 4;
+/// Times a call goes to another replica, after a failure, before it
+/// answers the last.
+const FAILOVERS: usize = 6;
+/// The first wait after `Busy`, doubled each time up to [`MAX_BUSY`].
+const BUSY: Duration = Duration::from_millis(50);
+const MAX_BUSY: Duration = Duration::from_secs(1);
 /// New sessions a call starts before it answers the refusal: one when the
 /// agent refuses a session for good, and one more when the client's clock
 /// is off the agent's time.
@@ -438,6 +463,10 @@ pub struct Client {
     key: SigningKey,
     sessions: Mutex<HashMap<AgentId, Kept>>,
     identities: Mutex<HashMap<AgentId, [u8; 32]>>,
+    /// Each agent's replicas, learned with its identity.
+    replicas: Mutex<HashMap<AgentId, Vec<Contact>>>,
+    /// Agents whose next call repeats one whose fate is unknown.
+    unknown: Mutex<std::collections::HashSet<AgentId>>,
     /// How far the agents' time is ahead of this client's clock, as a
     /// node last reported it: a new session starts at that time.
     offset: Mutex<i64>,
@@ -462,6 +491,8 @@ impl Client {
             key,
             sessions: Mutex::new(sessions),
             identities: Mutex::new(identities),
+            replicas: Mutex::new(HashMap::new()),
+            unknown: Mutex::new(std::collections::HashSet::new()),
             offset: Mutex::new(0),
         }
     }
@@ -474,6 +505,17 @@ impl Client {
     /// Each agent's identity learned, to keep.
     pub fn identities(&self) -> HashMap<AgentId, [u8; 32]> {
         self.identities.lock().expect("the identities").clone()
+    }
+
+    /// Say that the next call to `agent` repeats one whose fate is unknown,
+    /// made lately, as a process that kept it pending can: a refusal saying
+    /// it never ran then proves nothing, while copies of the earlier one
+    /// may still be on their way.
+    pub fn repeats_unknown(&self, agent: AgentId) {
+        self.unknown
+            .lock()
+            .expect("the unknown calls")
+            .insert(agent);
     }
 
     /// The node this client calls: the one it was given, or the last a
@@ -523,27 +565,76 @@ impl Client {
     }
 
     /// The identity of `agent`, which calls to it are signed for: the hash
-    /// of its creation record, fetched from the node once.
+    /// of its creation record, fetched from the node once, with the agent's
+    /// replicas.
     pub fn identity(&self, agent: AgentId) -> Result<[u8; 32], ClientError> {
         if let Some(identity) = self.identities.lock().expect("the identities").get(&agent) {
             return Ok(*identity);
         }
-        let record = record_from(&self.http, agent)?.ok_or(ClientError::NoAgent)?;
-        if record.agent != agent {
-            return Err(ClientError::Undecodable(200));
-        }
-        let identity = crate::identity(&record);
-        self.identities
+        self.learn(agent)
+    }
+
+    /// Fetch `agent`'s record and replicas from the node. An identity kept
+    /// from before stands: a node that names another is refused.
+    fn learn(&self, agent: AgentId) -> Result<[u8; 32], ClientError> {
+        let info = agent_info_from(&self.http, agent)?.ok_or(ClientError::NoAgent)?;
+        let identity = crate::identity(&info.record);
+        let kept = *self
+            .identities
             .lock()
             .expect("the identities")
-            .insert(agent, identity);
+            .entry(agent)
+            .or_insert(identity);
+        if kept != identity {
+            return Err(ClientError::OtherAgent);
+        }
+        self.replicas
+            .lock()
+            .expect("the replicas")
+            .insert(agent, info.replicas);
         Ok(identity)
     }
 
+    /// Call the replica of `agent` after the one this client calls: false
+    /// when it knows no other.
+    fn fail_over(&mut self, agent: AgentId) -> Result<bool, ClientError> {
+        // An identity kept from before comes without the replicas.
+        if !self
+            .replicas
+            .lock()
+            .expect("the replicas")
+            .contains_key(&agent)
+        {
+            let _ = self.learn(agent);
+        }
+        let replicas = self
+            .replicas
+            .lock()
+            .expect("the replicas")
+            .get(&agent)
+            .cloned()
+            .unwrap_or_default();
+        let current = Some(self.http.target.authority.clone());
+        let at = replicas
+            .iter()
+            .position(|replica| authority(&replica.address) == current);
+        let next = match at {
+            Some(at) if replicas.len() > 1 => &replicas[(at + 1) % replicas.len()],
+            None if !replicas.is_empty() => &replicas[0],
+            _ => return Ok(false),
+        };
+        self.follow(&next.clone())?;
+        Ok(true)
+    }
+
     /// Call `method` on `agent`'s `instance`, at the session's next
-    /// sequence for that agent, which moves on only once consumed. It
-    /// follows the node's redirects to the agent's leader, and starts a
-    /// new session when the agent refuses this one for good.
+    /// sequence for that agent, which moves on only once consumed.
+    ///
+    /// Any replica takes the call. On a failure, or an answer that leaves
+    /// it unknown whether the call ran, the call goes to the next replica
+    /// with the same sequence; on `Busy`, again after a wait. Redirects are
+    /// followed, and a new session is started when the agent refuses this
+    /// one for good.
     pub fn call(
         &mut self,
         agent: AgentId,
@@ -551,14 +642,43 @@ impl Client {
         method: MethodId,
         arguments: &[u8],
     ) -> Result<Answer, ClientError> {
+        // Learn the replicas first: the node may be gone when a failover
+        // needs them.
+        if !self
+            .replicas
+            .lock()
+            .expect("the replicas")
+            .contains_key(&agent)
+        {
+            let _ = self.learn(agent);
+        }
         let mut redirects = 0;
         let mut renewals = 0;
+        let mut failovers = 0;
+        let mut busy = BUSY;
+        // An attempt that may have run, or may yet: later refusals that
+        // say it never ran no longer prove it for the call.
+        let mut inconclusive = self
+            .unknown
+            .lock()
+            .expect("the unknown calls")
+            .remove(&agent);
         loop {
             self.session(agent);
             let sequence = self.sessions.lock().expect("the sessions")[&agent].next;
-            let answer = self.call_at(agent, sequence, instance, method, arguments)?;
+            let answer = match self.call_at(agent, sequence, instance, method, arguments) {
+                Ok(answer) => answer,
+                Err(error) => {
+                    inconclusive = true;
+                    if failovers < FAILOVERS && self.fail_over(agent).unwrap_or(false) {
+                        failovers += 1;
+                        continue;
+                    }
+                    return Err(error);
+                }
+            };
             match &answer {
-                Answer::Ran(_) => {
+                Answer::Ran { .. } => {
                     if let Some(kept) = self.sessions.lock().expect("the sessions").get_mut(&agent)
                     {
                         kept.next = sequence + 1;
@@ -575,6 +695,11 @@ impl Client {
                     redirects += 1;
                     self.follow(&replicas[(redirects - 1) % replicas.len()])?;
                 }
+                // An earlier attempt may still run in this session, at a
+                // replica forwarding it: a new session could run it twice.
+                Answer::Rejected(Rejection::StaleSession { .. }) if inconclusive => {
+                    return Ok(Answer::TimedOut);
+                }
                 // Not consumed: the same request goes again in a new session.
                 Answer::Rejected(Rejection::StaleSession { now }) if renewals < RENEWALS => {
                     renewals += 1;
@@ -588,6 +713,27 @@ impl Client {
                 {
                     renewals += 1;
                     self.renew(agent);
+                }
+                Answer::Stopped
+                | Answer::Unavailable
+                | Answer::TimedOut
+                | Answer::NotLeader { leader: None }
+                    if failovers < FAILOVERS =>
+                {
+                    inconclusive = true;
+                    failovers += 1;
+                    let _ = self.fail_over(agent);
+                }
+                // Every replica forwards to the same leader: wait.
+                Answer::Busy if failovers < FAILOVERS => {
+                    failovers += 1;
+                    std::thread::sleep(busy);
+                    busy = (busy * 2).min(MAX_BUSY);
+                }
+                // Busy, or a failure of this attempt, says nothing of an
+                // earlier one.
+                Answer::Busy | Answer::NotConsumed if inconclusive => {
+                    return Ok(Answer::TimedOut);
                 }
                 _ => return Ok(answer),
             }
@@ -748,5 +894,31 @@ impl Operator {
     ) -> Result<Answer, ClientError> {
         let grant = Grant { principal, role };
         self.post(&format!("/agents/{}/roles", agent.0), &grant.encode())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::authority;
+
+    /// A replica's address matches the target made from it, the scheme's
+    /// port written or not.
+    #[test]
+    fn an_address_s_authority_is_its_host_and_port() {
+        assert_eq!(
+            authority("https://n1.example").as_deref(),
+            Some("n1.example:443")
+        );
+        assert_eq!(
+            authority("https://n1.example/").as_deref(),
+            Some("n1.example:443")
+        );
+        assert_eq!(
+            authority("http://127.0.0.1:7700").as_deref(),
+            Some("127.0.0.1:7700")
+        );
+        assert_eq!(authority("http://[::1]").as_deref(), Some("[::1]:80"));
+        assert_eq!(authority("ftp://n1.example"), None);
+        assert_eq!(authority("https://n1.example/path"), None);
     }
 }

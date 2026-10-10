@@ -2752,3 +2752,174 @@ Answered:
 - `#[msg(linearizable)]` waits for the SDK;
 - `TimedOut` is the answer at the deadline, never the leader's outcome.
 
+
+#### 3.5c1 Built
+
+- **vos-raft:**
+  - a leader whose commit advances replicates to every peer at once;
+  - a peer with nothing due gets an append with no entries, carrying the
+    commit capped by its match index, in the current round, and holding
+    no slot;
+  - each peer's last commit sent is tracked, so the append goes once.
+- **The wire:**
+  - `Answer::Ran { outcome, at }` and `Answer::TimedOut`;
+  - `AgentInfo { record, replicas }`;
+  - `PeerMessage::Forward { agent, token, call }` and `Forwarded`, on
+    Requests, on the agent's stream.
+- **`calls.rs`** holds what ingress did for calls, and forwarding:
+  - the lanes, moved out of the HTTP ingress;
+  - each call's signature checked on an executor, then the call run in
+    its lane if this replica leads, else forwarded;
+  - the forwarding loop, as designed:
+    - one token per call;
+    - again on `NotLeader`, `Elsewhere`, `Stopped` or `Unavailable`
+      after a pause or a change of leader, after 2 s without an answer,
+      and on a change of leader;
+    - its own lane once it leads;
+    - on `Ran`, an answer only after its own apply through `at`;
+    - `TimedOut` at 30 s;
+  - the leader's side: the sender checked as a replica (`NotAReplica`),
+    at most 1,024 calls per forwarder (`Busy` past that), each run in a
+    task and answered by token. An answer no one waits for is counted
+    (`Unmatched`).
+- **Answers carry `at`:** the leader's answer channel carries the index
+  of its entry (`Answered`), the window's reply the applied index it was
+  read at, and a query the index it ran on. `Node`'s own API still
+  answers `Reply`.
+- **The client:**
+  - it learns the replicas with the identity (`GET /agents/{id}` now
+    answers `AgentInfo`);
+  - after an error, `Stopped`, `Unavailable` or `TimedOut`, it goes to
+    the next replica, at most 6 times, trusting it as `follow` does;
+  - on `Busy` it waits, from 50 ms doubling to 1 s.
+- **The CLI** keeps a `TimedOut` call as pending.
+
+**Found by the checker, and fixed:**
+1. **A deposed leader that had not heard so answered `Gap` from stale
+   marks.** A leader cut off from its followers still runs its lanes.
+   Its marks trail what its successor applied, so a client's next request
+   was answered `Gap`. The checker's calls through every replica, and its
+   new fault cutting the leader off, found it in every run. It could
+   happen before, rarely, for a client that came back to a deposed
+   leader.
+   - Now a lane's refusal for a low mark or a missing session (`Gap`,
+     `Ahead`, `StaleSession`) is answered only after a read index
+     confirms this replica leads, and its apply reaches that index; the
+     lane is then read again.
+   - Answers from state that is there (the window, `TooOld`) need no
+     confirmation.
+   - The read index goes through the group driver (`Local::ReadIndex`),
+     so 3.5c2's queries use the same path.
+2. **A node shutting down answered forwarded calls `Elsewhere`:** its
+   groups are gone while its dispatcher still runs.
+   - A replica with no group now answers `Stopped`, as does a node that
+     refused the group.
+   - A forwarder treats `Elsewhere` from another replica as it treats
+     `NotLeader`.
+
+Also: a lane with nothing in flight is dropped when its call is answered
+at once. One answered `Gap` used to stay in the map.
+
+**Tests:**
+- vos-raft: followers learn a commit at once, once, and never above what
+  they hold.
+- Peer: forwarding messages survive the wire, travel on Requests on
+  their agent's stream, and come only from replicas.
+- **Over HTTP:**
+  - a follower forwards a call and answers it once it applied it, and the
+    client goes on calling the follower;
+  - a follower forwards no call it cannot verify (the leader would run
+    it): the counter stays 0;
+  - a client follows `Elsewhere` from a node that does not replicate the
+    agent.
+- **The checker:**
+  - requests take turns at every replica, so about 60% are answered by
+    followers;
+  - a new fault cuts the leader off from its followers.
+  - Twenty seeds pass since the fixes above, the default seeds besides.
+- **Mutations caught by the checker:**
+  - no read index before a lane's refusal: `Gap`;
+  - the forwarder answering before its own apply: "answered before it
+    held the session".
+  - The focused test misses the second: with commits sent at once, a
+    quiet follower applies before the answer reaches it.
+- **The acceptance bench** is unmoved: 32.4–33.0 µs per request, query
+  median 51–52 µs.
+
+**Review** (Opus): no-go on one blocking item, now fixed.
+- **B1. A resend of a new session's first call, while the first was still
+  queued, could be refused `StaleSession`,** once the session's time had
+  passed the skew. The client then ran the call again in a new session.
+  The first had been timed when its batch formed, and ran.
+  - Now a leader checks a new session's time only for a session it
+    holds nothing of. A resend joins the call in flight first.
+  - Test: the leader's refine is held, the same first call is sent twice
+    2 s apart across the skew, and both are answered as one run.
+    Without the fix, the second is refused `StaleSession`.
+- **Beyond B1:** the client no longer starts a new session on
+  `StaleSession` after any attempt whose fate it does not know (an
+  error, `Stopped`, `Unavailable`, `TimedOut`, `NotLeader` with no
+  leader). It answers `TimedOut` instead. A replica that lost its
+  client's connection may still be forwarding the first call, and
+  leaders whose clocks differ could take it then.
+
+Should-fixes, all done:
+- **S1, `Busy`:**
+  - a leader drops a re-forward of a call that still runs: one task and
+    one answer per call;
+  - a forwarder passes `Busy` back only from its first send. Later, an
+    earlier send may still run, so it waits and sends again;
+  - the client answers a final `Busy` as `TimedOut` after an attempt
+    whose fate it does not know.
+- **S2:** a lane's `NotConsumed` is confirmed by a read index, then the
+  lane is read again: a deposed leader's stale dry run cannot deny a call
+  its successor ran.
+- **S3:** the client fails over on `NotLeader` with no leader named.
+- **S4:**
+  - the client matches a replica by its normalized `host:port`, the
+    scheme's port included;
+  - it learns the replicas on its first call, while the node it was
+    given is up.
+
+Nits, done:
+- the forwarder waits for its own leader loop as `settled` does;
+- the read index's wait for the apply is bounded;
+- a forwarded call's admission is given back by a drop guard;
+- a failover's error no longer hides the call's;
+- `Forwarded` comes only from a replica.
+
+**The follower-apply test is deterministic now:** the follower's commits
+are held while the leader runs the call, and the client must still be
+waiting. Without the forwarder's wait for its own apply, it fails.
+
+Since: sixteen more seeds pass, and `just ci` is green.
+
+**Re-review** (Opus): go. Also folded in:
+- **A forwarder that sent a call more than once** answers `StaleSession`
+  and `NotConsumed` as `TimedOut`. Another of its sends may still run the
+  call, so a refusal of one says nothing of the call. It does not send
+  again after `NotConsumed`, which would run a failing program again and
+  again.
+- **The client answers `NotConsumed` as `TimedOut`** after an attempt
+  whose fate it does not know, as it does `Busy` and `StaleSession`.
+- **The CLI keeps when a pending call was left unanswered**
+  (`pending <agent> <digest> <time>`). The same call sent again within
+  60 s tells the client it repeats one whose fate is unknown
+  (`Client::repeats_unknown`), so copies still in transit are covered
+  across processes.
+- **The forwarder re-sends after `Busy`** at the 2 s pace of a quiet
+  leader, not every 100 ms.
+- **A kept identity stands:** a node whose record of the agent hashes to
+  another identity is refused (`ClientError::OtherAgent`).
+- **The tests' gates are closed inside their scopes,** so a failing test
+  opens them before the scope waits on its threads.
+
+Left for later:
+- `Forward` could carry the forwarder's view of the leader's term,
+  dropped at any other. vos-net holds frames while it redials, with no
+  expiry, so a held frame can reach a later leader. The lane makes that
+  safe, and the term would bound every copy's life by its forwarder's
+  30 s.
+- the O(tasks) `retain` in the node's `spawn`;
+- seq 0 taking a read index.
+
