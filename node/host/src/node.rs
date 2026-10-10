@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use ed25519_dalek::SigningKey;
 use smol::future::FutureExt;
 use vos_pvm::PvmBackend;
 use vos_pvm::pool::{CodeHash, MachinePool, OuterMachines};
@@ -329,6 +330,23 @@ pub fn wall_clock() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| since.as_millis() as u64)
+}
+
+/// Make `dir` if it is missing, readable by its owner only, and take away
+/// any access others have to one that exists: it holds the node's secret,
+/// in files its store makes without a mode of their own.
+fn private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    let mode = std::fs::metadata(dir)?.permissions().mode();
+    if mode & 0o077 != 0 {
+        tracing::warn!(dir = %dir.display(), mode = format!("{mode:o}"), "taking others' access to the data directory away");
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode & 0o700))?;
+    }
+    Ok(())
 }
 
 fn seed() -> [u8; 32] {
@@ -1021,18 +1039,19 @@ impl Node {
             return Err(Error::Gas);
         }
         let data = data.as_ref().to_path_buf();
-        std::fs::create_dir_all(&data).map_err(|error| Error::Data(error.to_string()))?;
+        private_dir(&data).map_err(|error| Error::Data(error.to_string()))?;
         let store = Fjall::open(data.join(STORE))?;
-        let node_id = match store.node_id()? {
-            Some(id) => NodeId(id),
+        let secret = match store.node_secret()? {
+            Some(secret) => secret,
             None => {
-                let id = seed();
+                let secret = seed();
                 let mut batch = store.batch();
-                batch.node_id(&id);
+                batch.node_secret(&secret);
                 batch.commit(Durability::Synced)?;
-                NodeId(id)
+                secret
             }
         };
+        let node_id = NodeId(SigningKey::from_bytes(&secret).verifying_key().to_bytes());
         let blobs = Blobs::open(data.join(BLOBS), &store)?;
         let pool = Arc::new(MachinePool::new());
         for hash in blobs.pinned()? {
@@ -1114,7 +1133,8 @@ impl Node {
         })
     }
 
-    /// The node's identity, which every client signature names.
+    /// The node's identity, its public key, which every client signature
+    /// names.
     pub fn id(&self) -> NodeId {
         self.inner.node_id
     }

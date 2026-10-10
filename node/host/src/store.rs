@@ -222,8 +222,8 @@ pub trait Store: Send + Sync {
     /// The agents this node runs, each with its agent program.
     fn agents(&self) -> Result<Vec<(AgentId, ProgramHash)>>;
 
-    /// The node's identity, once made.
-    fn node_id(&self) -> Result<Option<[u8; 32]>>;
+    /// The seed of the node's key, once made: secret, never served.
+    fn node_secret(&self) -> Result<Option<[u8; 32]>>;
 
     /// The sessions the node knows, each with its client's key.
     fn sessions(&self) -> Result<Vec<(SessionId, [u8; 32])>>;
@@ -305,7 +305,8 @@ pub trait Batch {
     /// Record that this node runs `agent` with the agent program `program`.
     fn agent(&mut self, agent: AgentId, program: &ProgramHash);
 
-    fn node_id(&mut self, id: &[u8; 32]);
+    /// Record the node's secret seed, and delete the retired public id.
+    fn node_secret(&mut self, seed: &[u8; 32]);
 
     /// Record session `id` for `key`, opened at `time`, and that the next
     /// session gets `id + 1`.
@@ -335,7 +336,9 @@ pub const NODE_AGENT: AgentId = AgentId(u32::MAX);
 enum NodeRow {
     Applied = 0x00,
     Agent = 0x01,
-    NodeId = 0x02,
+    /// Retired: it held a public node id, which must never be read as the
+    /// secret. Deleted when the secret is made.
+    RetiredId = 0x02,
     Session = 0x03,
     NextSession = 0x04,
     KeyOpened = 0x05,
@@ -343,6 +346,7 @@ enum NodeRow {
     LogStart = 0x07,
     Membership = 0x08,
     Epoch = 0x09,
+    Secret = 0x0a,
 }
 
 fn agent_key(agent: AgentId, epoch: u8, key: &[u8]) -> Vec<u8> {
@@ -771,11 +775,11 @@ impl Store for Fjall {
         })
     }
 
-    fn node_id(&self) -> Result<Option<[u8; 32]>> {
+    fn node_secret(&self) -> Result<Option<[u8; 32]>> {
         Ok(self
             .system
-            .get(node_record(NodeRow::NodeId, &[]))?
-            .and_then(|id| id[..].try_into().ok()))
+            .get(node_record(NodeRow::Secret, &[]))?
+            .and_then(|seed| seed[..].try_into().ok()))
     }
 
     fn sessions(&self) -> Result<Vec<(SessionId, [u8; 32])>> {
@@ -1195,9 +1199,11 @@ impl Batch for FjallBatch {
         self.batch.insert(&self.store.system, key, program.0);
     }
 
-    fn node_id(&mut self, id: &[u8; 32]) {
+    fn node_secret(&mut self, seed: &[u8; 32]) {
         self.batch
-            .insert(&self.store.system, node_record(NodeRow::NodeId, &[]), id);
+            .insert(&self.store.system, node_record(NodeRow::Secret, &[]), seed);
+        self.batch
+            .remove(&self.store.system, node_record(NodeRow::RetiredId, &[]));
     }
 
     fn session(&mut self, id: SessionId, key: &[u8; 32], time: u64) {

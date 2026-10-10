@@ -28,16 +28,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run a node until it is killed.
+    /// Nodes.
     Node {
-        /// The node's data directory: its store and admin token.
-        #[arg(long)]
-        data: PathBuf,
-        #[arg(long, default_value = "127.0.0.1:7700")]
-        listen: SocketAddr,
-        /// The agent program, as built by `just build-agent`.
-        #[arg(long, env = "VOS_AGENT")]
-        agent: PathBuf,
+        #[command(subcommand)]
+        command: NodeCommand,
     },
     /// Client keys.
     Key {
@@ -85,6 +79,26 @@ enum Command {
     Call(CallArgs),
     /// Run a query, signed with a client key.
     Query(CallArgs),
+}
+
+#[derive(Subcommand)]
+enum NodeCommand {
+    /// Run a node until it is killed.
+    Run {
+        /// The node's data directory: its store and admin token.
+        #[arg(long)]
+        data: PathBuf,
+        #[arg(long, default_value = "127.0.0.1:7700")]
+        listen: SocketAddr,
+        /// The agent program, as built by `just build-agent`.
+        #[arg(long, env = "VOS_AGENT")]
+        agent: PathBuf,
+    },
+    /// Print a node's public key, its identity.
+    Info {
+        #[arg(long, default_value = "http://127.0.0.1:7700")]
+        node: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -148,10 +162,20 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<(), String> {
     match cli.command {
         Command::Node {
-            data,
-            listen,
-            agent,
+            command:
+                NodeCommand::Run {
+                    data,
+                    listen,
+                    agent,
+                },
         } => node(&data, listen, &agent),
+        Command::Node {
+            command: NodeCommand::Info { node },
+        } => {
+            let id = vos_node::client::node_id(&node).map_err(failed)?;
+            println!("{}", hex::encode(id.0));
+            Ok(())
+        }
         Command::Key {
             command: KeyCommand::New { out },
         } => new_key(&out),

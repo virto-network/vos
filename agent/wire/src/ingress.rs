@@ -13,7 +13,7 @@ pub const OPEN_DOMAIN: &[u8] = b"vos/session/1";
 pub const CALL_DOMAIN: &[u8] = b"vos/call/1";
 pub const QUERY_DOMAIN: &[u8] = b"vos/query/1";
 
-/// A node's identity: 32 random bytes made when it is first opened.
+/// A node's identity: its ed25519 public key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct NodeId(pub [u8; 32]);
 

@@ -1,0 +1,306 @@
+//! Endpoints in one process, joined through a hub, for tests: frames go
+//! through channels, and the hub can cut links, lose frames and delay
+//! them. Order holds per pair of endpoints, as it does per stream over
+//! QUIC (and here across streams too, which QUIC does not promise). As
+//! over QUIC, a node takes frames only from the peers it lists.
+
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use crate::{
+    Arrivals, Class, Deliver, Incoming, Limits, Network, NodeNumber, Peer, Refused, arrivals,
+};
+
+/// Endpoints joined in one process.
+#[derive(Clone)]
+pub struct Hub {
+    state: Arc<Mutex<State>>,
+}
+
+struct State {
+    endpoints: HashMap<NodeNumber, Joined>,
+    generation: u64,
+    /// Directed links that lose everything.
+    cut: HashSet<(NodeNumber, NodeNumber)>,
+    /// Frames lost out of every million sent.
+    loss: u32,
+    random: u64,
+    delay: Duration,
+    limits: Limits,
+}
+
+/// A joined endpoint: the generation it joined in, its arrivals and the
+/// peers it takes frames from.
+struct Joined {
+    generation: u64,
+    deliver: Deliver,
+    peers: Arc<Mutex<Vec<NodeNumber>>>,
+}
+
+impl State {
+    /// Where a frame from `from` to `to` goes, if `to` is up and lists
+    /// `from`.
+    fn deliver(&self, from: NodeNumber, to: NodeNumber) -> Option<Deliver> {
+        let joined = self.endpoints.get(&to)?;
+        let listed = joined.peers.lock().expect("the peers").contains(&from);
+        listed.then(|| joined.deliver.clone())
+    }
+}
+
+impl Default for Hub {
+    fn default() -> Self {
+        Self::new(1)
+    }
+}
+
+impl Hub {
+    /// A hub whose losses follow `seed`.
+    pub fn new(seed: u64) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(State {
+                endpoints: HashMap::new(),
+                generation: 0,
+                cut: HashSet::new(),
+                loss: 0,
+                random: seed | 1,
+                delay: Duration::ZERO,
+                limits: Limits::default(),
+            })),
+        }
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state.lock().expect("the hub")
+    }
+
+    /// Join as node `number`, replacing an endpoint joined before under
+    /// it, as a restarted node does.
+    pub fn join(&self, number: NodeNumber) -> (Endpoint, Arrivals) {
+        let (deliver, arrivals) = arrivals();
+        let peers = Arc::new(Mutex::new(Vec::new()));
+        let mut state = self.state();
+        state.generation += 1;
+        let generation = state.generation;
+        state.endpoints.insert(
+            number,
+            Joined {
+                generation,
+                deliver,
+                peers: Arc::clone(&peers),
+            },
+        );
+        let endpoint = Endpoint {
+            number,
+            generation,
+            hub: self.clone(),
+            peers,
+            delayed: Mutex::new(HashMap::new()),
+            closed: AtomicBool::new(false),
+        };
+        (endpoint, arrivals)
+    }
+
+    /// Lose every frame from `from` to `to`.
+    pub fn cut(&self, from: NodeNumber, to: NodeNumber) {
+        self.state().cut.insert((from, to));
+    }
+
+    /// Lose every frame between `a` and `b`, both ways.
+    pub fn partition(&self, a: NodeNumber, b: NodeNumber) {
+        let mut state = self.state();
+        state.cut.insert((a, b));
+        state.cut.insert((b, a));
+    }
+
+    /// Lose every frame to and from `node`.
+    pub fn isolate(&self, node: NodeNumber) {
+        let mut state = self.state();
+        let others: Vec<_> = state.endpoints.keys().copied().collect();
+        for other in others.into_iter().filter(|other| *other != node) {
+            state.cut.insert((node, other));
+            state.cut.insert((other, node));
+        }
+    }
+
+    /// Restore every link.
+    pub fn heal(&self) {
+        self.state().cut.clear();
+    }
+
+    /// Lose `per_million` of every million frames, at random.
+    pub fn set_loss(&self, per_million: u32) {
+        self.state().loss = per_million.min(1_000_000);
+    }
+
+    /// Deliver every frame `delay` after it was sent.
+    pub fn set_delay(&self, delay: Duration) {
+        self.state().delay = delay;
+    }
+
+    /// The largest frames of each class.
+    pub fn set_limits(&self, limits: Limits) {
+        self.state().limits = limits;
+    }
+}
+
+/// A node's endpoint on a [`Hub`].
+pub struct Endpoint {
+    number: NodeNumber,
+    generation: u64,
+    hub: Hub,
+    peers: Arc<Mutex<Vec<NodeNumber>>>,
+    /// A delivery task per peer while frames are delayed, so they keep
+    /// their order.
+    delayed: Mutex<HashMap<NodeNumber, Delayed>>,
+    closed: AtomicBool,
+}
+
+struct Delayed {
+    frames: smol::channel::Sender<(Instant, Class, Incoming)>,
+    _task: smol::Task<()>,
+}
+
+impl Endpoint {
+    pub fn number(&self) -> NodeNumber {
+        self.number
+    }
+
+    /// Stop sending: every later send is refused as closed.
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.delayed.lock().expect("the delayed links").clear();
+    }
+
+    /// The delivery task to `to`. Each frame goes, when due, to whichever
+    /// run of `to` is up then, if it lists this node.
+    fn delayed(&self, to: NodeNumber) -> smol::channel::Sender<(Instant, Class, Incoming)> {
+        let mut delayed = self.delayed.lock().expect("the delayed links");
+        let link = delayed.entry(to).or_insert_with(|| {
+            let (frames, pending) = smol::channel::unbounded::<(Instant, Class, Incoming)>();
+            let hub = self.hub.clone();
+            let from = self.number;
+            let task = smol::spawn(async move {
+                while let Ok((at, class, incoming)) = pending.recv().await {
+                    smol::Timer::at(at).await;
+                    let deliver = hub.state().deliver(from, to);
+                    if let Some(deliver) = deliver {
+                        deliver.deliver(class, incoming).await;
+                    }
+                }
+            });
+            Delayed {
+                frames,
+                _task: task,
+            }
+        });
+        link.frames.clone()
+    }
+}
+
+impl Drop for Endpoint {
+    fn drop(&mut self) {
+        let mut state = self.hub.state();
+        if state
+            .endpoints
+            .get(&self.number)
+            .is_some_and(|joined| joined.generation == self.generation)
+        {
+            state.endpoints.remove(&self.number);
+        }
+    }
+}
+
+impl Network for Endpoint {
+    fn send(
+        &self,
+        to: NodeNumber,
+        class: Class,
+        stream: u64,
+        frame: Vec<u8>,
+    ) -> Result<(), Refused> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(Refused::Closed);
+        }
+        if !self.peers.lock().expect("the peers").contains(&to) {
+            return Err(Refused::UnknownPeer);
+        }
+        let mut state = self.hub.state();
+        if frame.len() > state.limits.of(class) {
+            return Err(Refused::TooLarge);
+        }
+        let incoming = Incoming {
+            from: self.number,
+            stream,
+            frame,
+        };
+        // A peer that is down, or cut off, loses what is sent to it.
+        if !state.endpoints.contains_key(&to) || state.cut.contains(&(self.number, to)) {
+            return Ok(());
+        }
+        if state.loss > 0 {
+            state.random ^= state.random << 13;
+            state.random ^= state.random >> 7;
+            state.random ^= state.random << 17;
+            if (state.random % 1_000_000) < u64::from(state.loss) {
+                return Ok(());
+            }
+        }
+        let delay = state.delay;
+        let deliver = state.deliver(self.number, to);
+        drop(state);
+        if delay.is_zero()
+            && !self
+                .delayed
+                .lock()
+                .expect("the delayed links")
+                .contains_key(&to)
+        {
+            let Some(deliver) = deliver else {
+                return Ok(());
+            };
+            return match deliver.try_deliver(class, incoming) {
+                Err(smol::channel::TrySendError::Full(_)) => Err(Refused::Full),
+                // Delivered, or lost with a consumer that is gone.
+                _ => Ok(()),
+            };
+        }
+        // Once delayed, a link stays on its delivery task, so a later
+        // frame never passes an earlier one.
+        let _ = self
+            .delayed(to)
+            .try_send((Instant::now() + delay, class, incoming));
+        Ok(())
+    }
+
+    fn ready(&self, to: NodeNumber, class: Class) -> impl Future<Output = ()> + Send {
+        let hub = self.hub.clone();
+        async move {
+            loop {
+                let room = hub
+                    .state()
+                    .endpoints
+                    .get(&to)
+                    .is_none_or(|joined| joined.deliver.has_room(class));
+                if room {
+                    return;
+                }
+                smol::Timer::after(Duration::from_millis(1)).await;
+            }
+        }
+    }
+
+    fn peers(&self) -> Vec<NodeNumber> {
+        self.peers.lock().expect("the peers").clone()
+    }
+
+    fn set_peers(&self, peers: Vec<Peer>) {
+        *self.peers.lock().expect("the peers") = peers
+            .into_iter()
+            .map(|peer| peer.number)
+            .filter(|number| *number != self.number)
+            .collect();
+    }
+}

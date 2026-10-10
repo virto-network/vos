@@ -46,7 +46,15 @@ fn a_client_calls_an_agent_the_operator_installed() {
     let data = dir.path().join("node");
     let data = data.to_str().unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_vos"))
-        .args(["node", "--data", data, "--listen", "127.0.0.1:0", "--agent"])
+        .args([
+            "node",
+            "run",
+            "--data",
+            data,
+            "--listen",
+            "127.0.0.1:0",
+            "--agent",
+        ])
         .arg(guest("default/target/riscv64em-vos/release/vos-agent.elf"))
         .stdout(Stdio::piped())
         .spawn()
@@ -58,6 +66,9 @@ fn a_client_calls_an_agent_the_operator_installed() {
         .strip_prefix("listening on ")
         .expect("its address");
     let url = format!("http://{address}");
+    let started = lines.next().unwrap().unwrap();
+    let node_key = started.strip_prefix("node ").expect("its key");
+    assert_eq!(vos(&["node", "info", "--node", &url]), node_key);
 
     let key = dir.path().join("client.key");
     let public = vos(&["key", "new", "--out", key.to_str().unwrap()]);

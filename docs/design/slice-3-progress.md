@@ -1316,3 +1316,180 @@ Also folded in:
 - the CLI pinning every replica's key.
 
 Then go for 3.4a.
+
+### 3.4a: the layer
+
+**Built:**
+
+- **The node's identity** (`node/host`):
+  - a fresh secret seed, made on first open, in its own node record
+    (`0x0a`), never served;
+  - the old public id's row (`0x02`) is retired, never read as a
+    secret, and deleted when the secret is made;
+  - the data directory is the owner's alone (0700): made so, or others'
+    access taken away on open. fjall gives its files no mode of their
+    own, and the secret is in them;
+  - the node id is the seed's ed25519 public key: `GET /` serves it,
+    clients sign over it, and `vos node info` prints it (`vos node`
+    became `vos node run`).
+- **The interface** (`node/net`, crate `vos-net`):
+  - `Network`: `send` (refusing as full, unknown peer, too large or
+    closed), `ready`, `peers`, `set_peers` and `send_to_all`. `ready`
+    returns `impl Future`, so the trait is used through generics, not as
+    a trait object;
+  - `Arrivals`, a queue per class: 1024 frames each, but 16 for bulk;
+  - `Limits`: the largest frame per class (liveness 64 KiB, consensus
+    2 MiB, requests 1 MiB, bulk 64 MiB and a header), never above a
+    `u32` length;
+  - per peer and class, waiting frames have a budget of four of the
+    largest frames' worth, or one bulk frame's. A queue under its budget
+    takes one frame more, and each frame costs 64 bytes beyond its own,
+    so empty frames are bounded too.
+- **QUIC** (`quinn` 0.11 on smol, rustls 0.23 with ring):
+  - **Raw public keys (RFC 7250), not certificates.** Each side presents
+    its ed25519 key as a bare SubjectPublicKeyInfo, and the key checked
+    is exactly that document, the one the handshake's signature is
+    checked against. There is no X.509 to parse, and no rcgen. Picking a
+    key out of a certificate by its bytes could take a key other than
+    the one the signature was checked against.
+  - The dialing side pins the peer it dialed: a client configuration per
+    peer. The accepting side takes any configured key and reads the
+    peer's number from it.
+  - TLS 1.3, Ed25519, ALPN `vos/1`, no 0-RTT.
+  - **No session resumption,** either side: a resumed handshake skips
+    the key check, so a peer removed since could still connect.
+  - **Restarts:**
+    - The stateless-reset key is derived from the secret.
+    - Connection ids are 16 bytes: 8 random, and an 8-byte HMAC mark over
+      them keyed by the secret. quinn resets only the connections of ids
+      it can tell it made, and drops packets for any other id. With a
+      random mark, a restarted node dropped the old connection's packets,
+      and its peer waited out the idle timeout: 30 s before, 31 ms after.
+    - Every id is new. With a fixed key and quinn's hashed ids (3 random
+      bytes), ids would recur, and a reset token anyone can learn from a
+      handshake would serve again later, for spoofed resets.
+  - **Incarnations:** the name a node dials with carries a random
+    incarnation. A peer dialing in as a new one closes this node's
+    connection to the old one, which then redials.
+  - **Dials:**
+    - a dial times out after 2 s;
+    - backoff runs from 50 ms to 1 s, also after the peer took the
+      handshake and then refused this node (a TLS alert, or no longer
+      configured);
+    - the initial round-trip estimate is 100 ms, a cluster's rather than
+      the internet's, so a lost first packet is soon sent again;
+    - a link whose task ended is started again by `set_peers`.
+  - **Streams and flow control:**
+    - a writer task per long-lived stream, and a task per bulk frame,
+      four at once, each held until the peer has it all;
+    - **a stream quiet for 10 s is finished,** so the streams held open
+      are those of groups busy lately, within the 8192 a peer grants. A
+      new stream for the same id opens once the old one is finished and
+      acknowledged;
+    - the receiving side delivers a stream's frames only once the last
+      stream for its id has delivered all of its own (acknowledged is not
+      yet read). So order holds per id across streams, on one
+      connection;
+    - an unlimited connection receive window, a 1 MiB stream window and
+      a 16 MiB send window, so the bulk streams' share (4 MiB) never
+      fills it.
+  - **Receipt:** each frame's length is checked against its class's
+    bound before reading, and an oversized frame stops its stream. A
+    frame grows as its bytes arrive, from at most the stream window, and
+    four bulk frames are read at once per connection. Every frame is
+    checked against the current peer table, and a removed peer's
+    connection is closed.
+- **The in-process hub** (`memory::Hub`): endpoints joined through
+  channels, with directed cuts, partitions, isolation, seeded random
+  loss and delay.
+  - Order holds per pair of nodes: once a link is delayed it stays on
+    its delivery task. Unlike QUIC, order holds across streams and
+    classes too.
+  - A node takes frames only from the peers it lists, as over QUIC.
+  - A node that joins again under its number replaces its old endpoint,
+    as a restart does. A delayed frame goes to whichever run is up when
+    it is due.
+  - A node whose arrivals were dropped loses frames, with no wait.
+
+**Tests** (`node/net/tests`):
+
+- **`quic`, on localhost:**
+  - three nodes exchange frames on every class, with sender and stream;
+  - order within a stream (2000 frames each on a consensus and a
+    requests stream);
+  - an unknown key is refused, and so is a configured number presented
+    with another key; the dialing side refuses another key at the right
+    address;
+  - a removed peer is cut off;
+  - a queue to an unreachable peer fills per class, and `ready` waits;
+  - an oversized frame is refused by the sender's limits, and by the
+    receiver's when the sender's are larger, while other streams carry
+    on;
+  - after a clean shutdown and start, a peer is reached in about 300 ms
+    (the first packet is lost in the gap);
+  - **stream caps:** with eight streams granted, a ninth opens once the
+    first eight go quiet;
+  - **order across streams:** three bursts on one id, each on a new
+    stream after the last went quiet, read by a slow consumer, arrive in
+    order. Without the receiving side's turns, they did not.
+- **`restart`, a SIGKILLed peer in a child process:**
+  - one that never sends after its restart is reached in about 31 ms,
+    through the stateless reset;
+  - one that greets node 1 on start gets node 1's very next frame. With
+    the incarnation rule switched off, that frame was lost.
+- **`head_of_line`, in a process of its own:** small consensus frames
+  on 16 streams, one per millisecond, alone and beside 4 MiB bulk frames
+  sent back to back. The p99 moves from 0.4–1.2 ms to 2.4–4.2 ms (debug
+  build, both nodes in one process on smol's single global executor
+  thread). The test bounds the rise at 5 ms. The p50 beside bulk is
+  1.0 ms: quinn's pacing granularity.
+- **Unit tests:** a raw key is exactly an ed25519 one; connection ids
+  are new and marked, known to a restarted run and to no other node;
+  ring's public key is ed25519-dalek's; the reset key is not the secret.
+- **`memory`, the hub:** delivery, refusals with their reasons and
+  `ready`, partitions, cuts and healing, a loss rate, delayed frames in
+  order, a restart, a delayed link reaching the restarted run, peers
+  listed, a consumer gone.
+- **The node:** its id is the public key of the stored seed, not the
+  seed, and the same on every open; its data directory is 0700, made so
+  or tightened; `vos node info` prints the key the node printed on
+  start.
+- `just test-agent` now runs `vos-net` too.
+
+**Review** (Opus): go, with seven should-fixes, all done above:
+
+1. connection ids that never recur, so reset tokens cannot be harvested
+   (with quinn's hashed ids under a fixed key, they could);
+2. the data directory made the owner's alone;
+3. a test of the incarnation rule that fails without it;
+4. the hub's delayed links reaching a restarted run;
+5. the head-of-line test in a process of its own;
+6. quiet streams finished, within the peer's stream grant, with order
+   kept per id across streams;
+7. the bulk arrival queue bounded at 16 frames.
+
+Also done: refused dials back off; dead links are respawned; limits are
+clamped to a `u32`; each frame costs 64 bytes in its budget; the retired
+id row is deleted; the child processes are killed from a drop guard.
+
+**Left to step 3.5, which wires the layer in:**
+
+- **`Full` is invisible to vos-raft:** a refused frame is dropped, and
+  the core waits for its in-flight slot to clear. With many groups
+  sending 1 MiB appends to one follower, the budget could stall a group
+  for a heartbeat interval. Feed refusals back to the core, or size the
+  budget by active groups.
+- **One executor thread:** smol's global executor runs one thread unless
+  `SMOL_THREADS` says otherwise, and quinn's drivers spawn there. Give
+  the network an executor of its own, with a few threads.
+- **A spurious close:** a node whose send to a restarted peer is reset
+  may redial and reach the new run before that run's own dial-in is
+  processed. The incarnation rule then closes the fresh connection: one
+  handshake, and the frames in flight, once per restart. The accepting
+  side could send its name on a stream of its own instead.
+- **For 3.8's scale test:** quinn sends at most one stateless reset per
+  20 ms, so a restarted node in a 255-node space resets about 50 old
+  connections a second; the dial-ins of its own pair heartbeats cover
+  the rest.
+- **The hub keeps order across streams,** which QUIC does not; a reorder
+  setting would make it a harsher test bed.

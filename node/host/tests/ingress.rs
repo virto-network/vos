@@ -399,6 +399,39 @@ fn operator_commands_need_the_token() {
     );
 }
 
+#[test]
+fn a_node_is_its_public_key_and_never_serves_its_secret() {
+    use std::os::unix::fs::PermissionsExt;
+    use vos_node::store::{Fjall, Store};
+    let mode =
+        |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    let programs = Programs::load();
+    let dir = tempfile::tempdir().unwrap();
+    // A data directory others could read is made the owner's alone; a new
+    // one is made so.
+    let data = dir.path().join("open");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).unwrap();
+    drop(Node::open(&data, Config::new(programs.agent.clone())).unwrap());
+    assert_eq!(mode(&data), 0o700);
+    let data = dir.path().join("new");
+    let id = Node::open(&data, Config::new(programs.agent.clone()))
+        .unwrap()
+        .id();
+    assert_eq!(mode(&data), 0o700);
+    let store = Fjall::open(data.join("store")).unwrap();
+    let secret = store.node_secret().unwrap().expect("a secret seed");
+    drop(store);
+    assert_eq!(
+        id.0,
+        SigningKey::from_bytes(&secret).verifying_key().to_bytes()
+    );
+    assert_ne!(id.0, secret);
+    // The same key on every open.
+    let node = Node::open(&data, Config::new(programs.agent)).unwrap();
+    assert_eq!(node.id(), id);
+}
+
 /// Holds the refine of a batch holding the poisoned arguments until
 /// released, then fails it, once; and holds commits while asked.
 #[derive(Default)]
