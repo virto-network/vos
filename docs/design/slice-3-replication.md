@@ -229,11 +229,27 @@ and invariant 7 bridges the blob file. What the blob path requires:
 replica can lead. A work result's blob lives until log compaction passes
 its entry; blob files are collected by liveness (step 3.3).
 
-### Transport [owner: decision 2]
+### The network [owner decision 2: QUIC, behind an abstraction]
 
-Proposed: TCP between nodes with the Noise protocol (`XX` handshake, the
-`snow` crate), authenticated by each node's static key, and SCALE-encoded
-frames. One connection per node pair carries:
+Nodes talk through a **network layer that knows nothing of Raft**. Public
+spaces may later replace Raft with a Byzantine-fault-tolerant consensus,
+and libp2p (discovery, NAT traversal, open membership) may replace the
+first implementation. Both must fit without changing what runs above. The
+layer offers:
+
+- **authenticated channels between node identities:** a node is its
+  ed25519 key, not its address;
+- **classes of traffic** with their own priority and flow control:
+  liveness, consensus, requests and messages, bulk (blobs and snapshot
+  chunks);
+- **SCALE-encoded messages,** whose meaning belongs to the layer above
+  (Raft, forwarding, agent messages).
+
+The first implementation is **QUIC** (`quinn`, on its smol runtime):
+TLS 1.3 bound to the node's key, one connection per node pair, and
+streams per class, so bulk transfers never block a heartbeat. An
+in-process implementation serves the tests. One connection per node pair
+carries:
 
 - blobs, ahead of the appends that name them, and fetches of missing
   blobs, with flow control per pair so a 64 MiB program never delays a
@@ -255,7 +271,7 @@ number, its id, address and key.
 - **Groups.** Each agent with more than one replica has a Raft group; a
   single-replica agent keeps slice 2's path (a group of one, through the
   same code, if that costs nothing measurable).
-- **Creation** [owner: decision 3]. The operator creates an agent on one
+- **Creation** [owner decision 3]. The operator creates an agent on one
   node with its replica set; that node tells the others, and each starts
   the group with the same initial configuration.
 - **The leader** batches and refines as in slice 2, proposes the work
@@ -302,7 +318,7 @@ number, its id, address and key.
   per-pair sequence number and acknowledgements are monotone, so every
   retry is safe, as in slice 2.
 
-### Ids and sessions across nodes [owner: decision 3]
+### Ids and sessions across nodes [owner decision 3: client-named sessions]
 
 Agent ids and session ids are per-node counters today. Proposed until the
 catalog:
@@ -311,7 +327,7 @@ catalog:
   configured node number in the high bits. `AgentId` stays 32 bits: 8
   bits of node number, 24 of counter.
 - **Sessions move into the agent,** the only choice that keeps
-  exactly-once across failover. Every replica then authenticates a
+  exactly-once across failover. The owner chose shape (b), below. Every replica then authenticates a
   session's requests and retries, so a client that fails over keeps its
   session, its sequence numbers and its replies. Lane logic runs only on
   the leader (above). Sessions join the agent's snapshot, O(active
@@ -328,6 +344,58 @@ catalog:
 The alternative to both is node-level sessions with ids namespaced by
 node: no log entry per opening, but a client that fails over opens a new
 session and loses exactly-once for requests in flight. Not recommended.
+
+### What a client reveals, and how to reveal less
+
+The owner wants clients as private as possible, and a client that wants
+privacy to be able to run its own node outside the agent's group.
+
+**What replicas learn in this slice:**
+
+- **Every replica of the agent,** so every operator of one, holds in
+  its log, applied state and snapshots, for as long as they are kept:
+  - the session's key and name;
+  - each request's method, arguments and sequence number;
+  - each reply;
+  - the time of each batch;
+  - the writes each handler made.
+- **The node a client connects to** learns its network address.
+- **Nothing links two sessions** unless the client reuses a key.
+
+**What a client can do in this slice:**
+
+- **A fresh key per session, or per agent.** Sessions require no
+  long-term identity; only an actor whose roles name a principal needs
+  one. A session's name is random, 128 bits.
+- The per-key session cap then bounds nothing, so the guard against a
+  flood of sessions is the agent's admission ("busy"), until anonymous
+  rate limits (below).
+- **Collect expired sessions** (marks and reply windows), which moves
+  into this slice as data minimisation: replies do not outlive their
+  window.
+- **Choose replicas:** an agent that holds private data is replicated on
+  nodes its owners trust, such as their own.
+
+**A client's own node** [proposed for step 3.5]: a node outside the
+agent's group can forward requests to its leader, as a follower does. It
+keeps the user's keys on their device and hides which public ingress
+they used. It does not yet hide the request: the agent's leader runs it,
+and sees the node's address. Hiding more takes later work, each piece
+with a home in the build order:
+
+- **The content:** the request runs on the client's own node, against
+  witnessed state, and it submits only its writes and a zero-knowledge
+  proof. This needs `#[attestable]` methods proven (step 5), zero
+  knowledge (items 9–11) and read sets validated at accumulate (open
+  question 8).
+- **The writes themselves** still show what changed, unless state is
+  committed rather than plain (the compressed root format, step 4).
+- **The network address:** a mixnet or relay implementation of the
+  network layer above.
+- **Roles without identity:** anonymous credentials, proving membership
+  of a role in zero knowledge.
+- **Rate limits without identity:** for example rate-limiting
+  nullifiers, so fresh keys cannot flood an agent.
 
 ### Many active agents per node (item 16)
 
@@ -370,8 +438,9 @@ recovery. A crash test like slice 2's, per invariant of section 9.5.
 
 ### 3.4 Transport
 
-The frames (SCALE), the in-process transport on step 3.2's simulated
-network, then TCP with Noise and combined heartbeats per node pair.
+The network layer and its messages (SCALE), the in-process implementation
+on step 3.2's simulated network, then QUIC, with combined heartbeats per
+node pair.
 
 ### 3.5 Replicated agents
 
@@ -390,7 +459,8 @@ it.
 
 ### 3.6 Sessions across replicas
 
-Per decision 3.
+Client-named sessions in the agent (decision 3), fresh keys allowed,
+expired sessions collected.
 
 ### 3.7 Snapshots and catching up
 
@@ -447,28 +517,25 @@ their own review.
 - **The blob path is in this slice** (step 3.1), not step 4: a second
   writer per node, blobs in the transport with flow control, and
   collection by liveness.
-- **Moving sessions into the agent** adds a log entry per opening and
-  changes slice 2's ingress.
+- **Moving sessions into the agent** changes slice 2's ingress and client
+  protocol.
 - **One laptop** measures three replicas on one disk and one CPU, as S3
   did; a second machine, or two, would make the replicated numbers mean
   more.
 
-## Decisions for the owner
+## Decisions [decided by the owner]
 
-1. **vos-raft's core without I/O,** driven by the node, instead of
-   patching the async worker as S3's prototype did. Recommended: the
-   durable index and answers without I/O need it, and one driver for
-   thousands of groups is simpler around a state machine.
-2. **The transport:** TCP with Noise and node keys, peers in the node's
-   configuration. Alternatives: libp2p (master's stack, larger, its own
-   runtime), QUIC (`quinn`, tokio-based where the node uses smol).
-3. **Sessions and what clients sign, until the catalog.** Sessions move
-   into the agent, so failover keeps exactly-once: (a) opened in the
-   log, or (b) named by the client (simplest; recommended). Either way
-   clients sign for the agent's identity instead of a node's, which
-   changes slice 2's client protocol. Agent ids come from per-node ranges.
-4. **Scope:** pipelined refines only if the budget needs them, and the
-   catalog's placement left out.
+1. **vos-raft becomes a core without I/O,** driven by the node.
+2. **QUIC, behind a network layer that knows nothing of Raft,** so a
+   Byzantine-fault-tolerant consensus for public spaces, or libp2p, can
+   come later without changing what runs above.
+3. **Sessions are named by the client and live in the agent,** so
+   failover keeps exactly-once. Clients sign for the agent's identity,
+   which changes slice 2's client protocol. Agent ids come from per-node
+   ranges. Privacy as far as this slice can take it ("What a client
+   reveals"), with a client's own node forwarding requests [proposed].
+4. **Scope as planned:** pipelined refines only if the budget needs them,
+   and the catalog's placement left out.
 
 **Defaults** (engineering, recorded rather than asked): heartbeat 500 ms,
 election timeout 1.5–3 s, quiescence after 4 idle intervals, blob
