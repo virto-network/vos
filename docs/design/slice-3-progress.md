@@ -3744,3 +3744,226 @@ Folded in before the commit:
 
 **3.6 is done.** What 3.7–3.10 carry stands in the list at the end of
 3.5.
+
+
+## Step 3.7: snapshots and catching up
+
+### Design
+
+The pieces exist: vos-raft asks for compaction (`CompactBound`) and for
+a snapshot (`SendSnapshot`), and switches to one it is given
+(`snapshot_switch`, `snapshot_installed`); the store exports an agent's
+state at its own applied index, stages rows under another epoch and
+switches in one synced batch (3.3c); a test harness in `raft.rs` ships
+snapshots through them. The node ignores both actions today: logs grow
+without bound, and a replica that falls behind the log's start, or a new
+one, cannot catch up. Split in two:
+
+- **3.7a:** compaction on every replica, and snapshots streamed to a
+  replica that needs one;
+- **3.7b:** replacing a replica, through a membership change, with the
+  directory following it.
+
+#### 3.7a Compaction and snapshots
+
+**Compaction, on every replica:**
+- On `CompactBound { through }` the group compacts to a point P: `through`
+  less a tail of 256 entries, so a follower a little behind still gets
+  entries, not a snapshot, and never past the lowest index of a snapshot
+  it is streaming (its follower needs the entries after it). The
+  writer's `Compact` change records the configuration in effect at P
+  (`core.config_at(P)`, not the action's, which is for `through`), then
+  `core.compacted(P)`. The core emits a bound only after
+  `compact_hysteresis` entries (1,024 here, a constant), and never past
+  the durably applied index or a retiring configuration.
+- Blobs only compacted entries named are collected, as 3.3b provides.
+
+**A snapshot, from the leader:**
+- On `SendSnapshot { to }` the leader exports its state at its own
+  applied index A (term T there), with the configuration in effect at A
+  (`core.config_at(A)`). That is committed state, at or past the
+  snapshot index the core asked for, and the follower acknowledges A.
+- **The manifest,** in the first chunk:
+  - (A, T) and the configuration;
+  - the programs the state's installed instances name (pinned blobs);
+  - the last result's time and seed (`LastResult`, a node row the
+    export reads from the same store snapshot): queries on the replica
+    are timed by it.
+- **A stream is named by (leader term, A).** Its `SnapshotChunk`s carry
+  both, about 1 MiB of rows each, on the bulk class; each is acknowledged
+  by `SnapshotAck` (with the same name) once staged. Four go
+  unacknowledged at most; an acknowledgement names the next sequence the
+  follower wants, and the leader goes on from there (the bulk class may
+  reorder frames). The leader takes an acknowledgement only from the
+  stream's follower, for its name.
+- **One stream per follower, kept by the host:** a `SendSnapshot` while
+  that stream makes progress is ignored (the core's own deadline, 60 s,
+  is shorter than a large stream, and it asks again on every replicate).
+  No acknowledgement for 10 s, or a lost leadership, ends the stream and
+  calls `core.snapshot_failed`; the core asks again in time.
+- The export holds its store snapshot for the stream's length.
+
+**The follower:**
+- takes chunks only from the leader it follows, in its term (3.4b's
+  check), into the agent's next epoch;
+- **the first chunk of a newer stream** (sequence 0, a name greater
+  than the current stream's, by term then index) starts it: the earlier
+  stream's staged rows are dropped first (`DropEpoch` until empty), as
+  the writer refuses a first `Stage` into an epoch that holds rows. A
+  late first chunk of an older stream is ignored. A stream past its idle
+  limit (30 s) is dropped the same way;
+- only chunks of the current stream are staged, in order; one out of
+  order is not, and the acknowledgement says which one is next;
+- **after the last chunk:**
+  - it fetches the manifest's programs it lacks, from the leader then
+    the other replicas (`BlobRequest`), and waits until each is durable;
+  - it writes the switch, synced, in one batch: the core's
+    `snapshot_switch` rows, the epoch pointer, the applied index A, the
+    `LastResult`, and the pins (a `Pin` for every program the new state
+    names, an `Unpin` for one the old named and the new does not);
+  - then `core.snapshot_installed`, the applier's index moves to A, and
+    the old epoch is dropped in the background;
+- **refuses** a snapshot at or below its applied index (the writer does
+  too).
+
+**What moves with the switch:**
+- the group's shared state (`applied`, `recovered`), so waits on an
+  applied index (read floors, a forwarder's own-apply wait) see A;
+- the applier resumes at A + 1; the writer refuses an apply staged for
+  the old epoch;
+- nothing else holds applied state: lanes and the leader's marks are a
+  leader's, and a follower installs.
+
+**Tests:**
+- a cluster with a small hysteresis: every replica's log stays short;
+- a follower stopped while the log is compacted past it catches up by a
+  snapshot when started, and holds the same state, pins and
+  `LastResult`; its queries answer the same;
+- a follower that lacks an actor's program fetches it before the switch;
+- a stream cut by a leader change, then sent again by the next leader;
+- a stream longer than the core's snapshot deadline, not restarted;
+- a snapshot under sustained load with a small hysteresis: compaction
+  waits for it, and it installs;
+- a snapshot taken during a joint configuration, which it carries;
+- a replica caught up by snapshot that then leads, and answers a resend
+  from its window: sessions, expiry rows and windows came with it;
+- crash points: after some chunks (old state, staged rows dropped on
+  recovery), after the switch (new state), during the old epoch's drop;
+- the checker runs with compaction on, so restarted nodes catch up by
+  snapshot under its faults.
+
+#### 3.7b Replacing a replica
+
+**The directory follows the group's membership.** A creation record
+never changes (its hash is the agent's identity clients sign for), so
+replicas move to a **placement** beside it: `{ agent, replicas, before,
+term, index, committed }`. `index` is the log index of the configuration
+it reflects (0 at creation, from the record), `before` the configuration
+it supersedes, `term` the term of the leader that announced it, and
+`committed` whether that configuration had committed.
+- **Placements are ordered by (term, index, committed).** A new leader's
+  announcement supersedes anything from an older term: a joint
+  configuration announced by a leader that failed before it reached a
+  majority is replaced by the next leader's, even at a lower index, and
+  late messages from a deposed leader are ignored. Ordering by index
+  alone let such a phantom outrank the real configuration for good.
+- Every node keeps, per agent, the record and the greatest placement it
+  has heard of, durably. The replicas everything reads today (routing,
+  a replica's checks, `Elsewhere`, `agent_info`) come from it.
+- During a joint configuration, the placement lists both sets: either
+  may send, and messages may go to either.
+
+**Who says so:** the agent's leader, whenever a configuration entry is
+appended or committed, sends `Placement` to every node in the space
+until each acknowledges it; a new leader does so for its latest
+configuration. The record travels with it, so a node that missed the
+creation learns the agent too, and records are no longer sent only by
+their creator. A placement is taken from a node named in it or in the
+configuration it supersedes (a leader removing itself), or from the
+record's creator at index 0.
+
+**The operator's command:** `vos agent replace --agent A --remove X
+--add Y` (`POST /agents/{id}/replicas`, with the operator's token) at the
+agent's leader (a redirect otherwise):
+- checks: X a member, Y not, Y in the space, no change in progress, and
+  **Y runs the agent:** the leader first sends Y the current placement,
+  and Y's acknowledgement says whether it runs the agent's program;
+  otherwise the replacement is refused before anything is proposed;
+- `core.change_membership` with X replaced by Y: the joint
+  configuration is appended, and the core finalizes it once it commits;
+- answered once the final configuration commits, or `TimedOut` after a
+  bound (the change goes on; the placement says where it is).
+
+**The new replica:**
+- learns a placement naming it and starts the agent's group, as a
+  member of the configuration *before* the change (`before`), so its
+  core is no voter and never campaigns (vos-raft's pre-vote, election
+  and `TimeoutNow` paths all check membership);
+- a later placement that no longer names it (a phantom superseded)
+  stops the group and retires the agent;
+- the leader replicates to it: by entries while they last, else a
+  snapshot (3.7a), which brings the configuration naming it;
+- refuses to start if it runs another agent program (as today), and its
+  acknowledgement says so.
+
+**The removed replica:**
+- once it hears of a **committed, final** placement without it, and is
+  not leading, stops its group and **retires** the agent. A removed
+  leader announces the final placement before it commits; it retires
+  once its core steps down, which it does when the final configuration
+  commits. Retiring is a writer change: the log, commit index,
+  membership and state rows go (the state in chunks, like an old epoch);
+  the record, the placement as a tombstone, and the term and vote stay,
+  so a replica added again never votes twice in a term;
+- a restart leaves a retired agent stopped, and an older placement
+  cannot bring it back; Raft messages for it are dropped as unrouted. A
+  removed replica that restarts with its old log, before its tombstone,
+  cannot disrupt the group: it is no member of the final configuration,
+  and pre-vote stays on.
+
+**Availability while the new replica catches up:** the new configuration
+counts it, so losing one of the others before it catches up stops
+commits until it does. Adding it first as a learner removes that gap;
+it is left for later.
+
+**A replica that refuses the agent's program** (a carried item) still
+holds the record, but no longer counts as running it: `DirectoryAck`
+says whether it runs the agent, and creation waits for a majority that
+does.
+
+**Tests:**
+- in a space of four, an agent on 1, 2, 3 under load; 3 replaced by 4:
+  4 catches up by snapshot, the final placement is {1, 2, 4} on every
+  node, 3 holds no state for the agent and does not start it again
+  after a restart, clients and messages follow the placement;
+- the leader failing during the joint configuration: the next leader
+  finalizes it and sends the placement;
+- **a phantom:** the leader failing before the joint entry reaches a
+  majority; the next leader's placement supersedes it, the would-be
+  replica stops, and a retry with another node succeeds;
+- the leader replacing itself;
+- a placement lost to a node, then resent; an older one ignored;
+- a removed replica restarting with its old log: no disruption, and it
+  does not start the agent again;
+- a new replica that refuses the program: the replacement is refused
+  before anything is proposed.
+- The checker: optionally a replacement fault, with a fourth node.
+
+**Not in 3.7:**
+- adding or removing replicas other than one for one, and placement
+  policy (the catalog);
+- snapshots by pages or witnesses (step 4);
+- combined heartbeats (3.8).
+
+**Review** (Opus): go for 3.7a, no-go for 3.7b until placements were
+ordered by the announcing leader's term as well as the index: by index
+alone, a joint configuration announced by a leader that failed before
+it reached a majority outranked the real one for good, and a retry
+landing at a lower index was ignored while its new replica counted in
+the configuration. Folded in above: placements by (term, index,
+committed), retiring only on a committed final placement and not while
+leading, a placement from the configuration it supersedes, Y checked
+before the change, the term and vote kept in the tombstone; compaction
+held back by a stream in flight and recording the configuration at its
+own point; streams named by (term, A), one per follower kept by the
+host; and the tests.
