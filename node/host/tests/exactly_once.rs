@@ -22,7 +22,9 @@ use vos_node::client::Target;
 use vos_node::store::{Store, View};
 use vos_node::{Config, Hooks, Node, Peers, Space, SpaceNode};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session, SessionId};
-use vos_wire::ingress::{Answer, Call, Rejection, call_message};
+use vos_wire::ingress::{
+    Answer, Call, Consistency, QueryCall, Rejection, call_message, query_message,
+};
 use vos_wire::peer::NodeNumber;
 use vos_wire::records::{SessionMark, unstored};
 use vos_wire::result::Outcome;
@@ -363,6 +365,32 @@ struct Client {
     sessions: Mutex<Vec<Session>>,
     /// The node it calls, until it fails.
     calling: Mutex<NodeNumber>,
+    value: MethodId,
+    /// The highest request it has started to send.
+    sent: AtomicU64,
+    /// The requests answered: through a prefix, and those above it.
+    acked: Mutex<Acked>,
+}
+
+/// The requests a client has had answered.
+#[derive(Default)]
+struct Acked {
+    /// Every request through this one was answered...
+    prefix: u64,
+    /// ... the last of them at this applied index...
+    at: u64,
+    /// ... and these above it, with theirs.
+    above: std::collections::BTreeMap<u64, u64>,
+}
+
+impl Acked {
+    fn answered(&mut self, request: u64, at: u64) {
+        self.above.insert(request, at);
+        while let Some(at) = self.above.remove(&(self.prefix + 1)) {
+            self.prefix += 1;
+            self.at = at;
+        }
+    }
 }
 
 impl Client {
@@ -421,6 +449,7 @@ impl Client {
         let body = self.body(&session, sequence, request);
         let path = format!("/agents/{}/calls", self.agent.0);
         let until = Instant::now() + ANSWERED;
+        self.sent.fetch_max(request, Ordering::SeqCst);
         // Requests take turns at every replica, the leader's followers
         // forwarding to it.
         *self.calling.lock().unwrap() =
@@ -439,7 +468,7 @@ impl Client {
             match post(cluster.slot(at).ingress, &path, &body) {
                 Ok(Answer::Ran {
                     outcome: Outcome::Done(reply),
-                    ..
+                    at: answered_at,
                 }) => {
                     let total = u64::decode(&reply).unwrap().0;
                     assert_eq!(
@@ -449,6 +478,7 @@ impl Client {
                         self.number
                     );
                     self.applied_at(cluster, at, starts, &session, sequence);
+                    self.acked.lock().unwrap().answered(request, answered_at);
                     cluster.event(format!(
                         "client {} request {request} (sequence {sequence}) answered by {at}, applied {:?}",
                         self.number,
@@ -545,6 +575,118 @@ impl Client {
             "node {at} answered sequence {sequence} at mark {}",
             mark.sequence
         );
+    }
+
+    /// Read the counter until `done`, at every replica in turn, by read
+    /// index and at the floor its answers give, and check each read.
+    fn read(&self, cluster: &Cluster, done: &AtomicBool) {
+        let mut floor = 0;
+        let mut last = 0;
+        // The most any read showed.
+        let mut seen = 0;
+        let mut turn = u64::from(self.number);
+        let path = format!("/agents/{}/queries", self.agent.0);
+        while !done.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(20));
+            turn += 1;
+            let at = 1 + (turn % u64::from(NODES)) as NodeNumber;
+            let (prefix, prefix_at) = {
+                let acked = self.acked.lock().unwrap();
+                (acked.prefix, acked.at)
+            };
+            let linearizable = turn.is_multiple_of(2);
+            let consistency = if linearizable {
+                Consistency::Linearizable
+            } else {
+                floor = floor.max(prefix_at);
+                Consistency::Applied { at: floor }
+            };
+            let answer = post(cluster.slot(at).ingress, &path, &self.query(consistency));
+            let sent = self.sent.load(Ordering::SeqCst);
+            let (value, answered_at) = match answer {
+                Ok(Answer::Ran {
+                    outcome: Outcome::Done(bytes),
+                    at,
+                }) => (u64::decode(&bytes).unwrap().0, at),
+                Ok(
+                    Answer::Rejected(Rejection::Behind)
+                    | Answer::TimedOut
+                    | Answer::Stopped
+                    | Answer::Unavailable
+                    | Answer::NotLeader { .. },
+                )
+                | Err(_) => {
+                    cluster.saw("read unanswered");
+                    continue;
+                }
+                Ok(other) => panic!("client {}: a read at node {at}: {other:?}", self.number),
+            };
+            let earlier = seen;
+            seen = seen.max(value);
+            // The applied requests are a prefix of those sent, each total
+            // distinct: the value names how many applied.
+            let applied = (0..=sent).find(|k| self.total(*k) == value);
+            let Some(applied) = applied else {
+                panic!(
+                    "client {}: read {value} at node {at}, no total of up to {sent} requests",
+                    self.number
+                );
+            };
+            if linearizable {
+                // Every read before it showed committed state, which a read
+                // index taken later covers.
+                assert!(
+                    value >= earlier,
+                    "client {}: a linearizable read at node {at} saw {value}, an earlier read {earlier}",
+                    self.number
+                );
+                assert!(
+                    applied >= prefix,
+                    "client {}: a linearizable read at node {at} saw {applied} requests, {prefix} were answered before it",
+                    self.number
+                );
+                cluster.saw("read linearizable");
+            } else {
+                assert!(
+                    value >= last,
+                    "client {}: a read at node {at} went back, from {last} to {value}",
+                    self.number
+                );
+                assert!(
+                    applied >= prefix,
+                    "client {}: a read at node {at} floored at {floor} saw {applied} requests, {prefix} were answered at {prefix_at}",
+                    self.number
+                );
+                last = value;
+                floor = floor.max(answered_at);
+                cluster.saw("read at a floor");
+            }
+        }
+    }
+
+    /// A signed query of the counter's value.
+    fn query(&self, consistency: Consistency) -> Vec<u8> {
+        let not_after = vos_node::wall_clock() + 60_000;
+        let key = self.key.verifying_key().to_bytes();
+        let message = query_message(
+            &self.identity,
+            &key,
+            not_after,
+            consistency,
+            COUNTER,
+            self.value,
+            &[],
+        );
+        QueryCall {
+            key,
+            not_after,
+            consistency,
+            instance: COUNTER,
+            method: self.value,
+            arguments: Vec::new(),
+            signature: self.key.sign(&message).to_bytes(),
+        }
+        .encode()
     }
 
     /// Send requests until `done`: how many were answered.
@@ -695,6 +837,9 @@ fn exactly_once(mode: Mode, default_seed: u64) {
                 rotate: 32 + 4 * random.below(8),
                 sessions: Mutex::new(Vec::new()),
                 calling: Mutex::new(number),
+                value,
+                sent: AtomicU64::new(0),
+                acked: Mutex::new(Acked::default()),
             }
         })
         .collect();
@@ -705,6 +850,10 @@ fn exactly_once(mode: Mode, default_seed: u64) {
             .iter()
             .map(|client| scope.spawn(|| client.run(&cluster, mode, &done)))
             .collect();
+        for client in &clients {
+            let (cluster, done) = (&cluster, &done);
+            scope.spawn(move || client.read(cluster, done));
+        }
         faults(&cluster, &agents, &mut random);
         done.store(true, Ordering::SeqCst);
         running
@@ -1050,5 +1199,155 @@ fn a_follower_holding_back_its_apply_holds_back_its_answer() {
         assert!(early.is_err(), "answered before the follower applied it");
         let answer = answer.recv().unwrap().unwrap();
         assert_eq!(done(&answer), Some(3), "{answer:?}");
+    });
+}
+
+/// A signed query of the counter's value, by `key`.
+fn value_query(
+    identity: &[u8; 32],
+    key: &SigningKey,
+    value: MethodId,
+    consistency: Consistency,
+) -> Vec<u8> {
+    let not_after = vos_node::wall_clock() + 60_000;
+    let public = key.verifying_key().to_bytes();
+    let message = query_message(
+        identity,
+        &public,
+        not_after,
+        consistency,
+        COUNTER,
+        value,
+        &[],
+    );
+    QueryCall {
+        key: public,
+        not_after,
+        consistency,
+        instance: COUNTER,
+        method: value,
+        arguments: Vec::new(),
+        signature: key.sign(&message).to_bytes(),
+    }
+    .encode()
+}
+
+/// A follower reads a write it has not applied yet only once it has: at
+/// the floor the write's answer gave, and by read index.
+#[test]
+fn a_follower_reads_a_write_once_it_has_applied_it() {
+    let cluster = Cluster::new(7);
+    let (agent, increment, value) = counter_agent(&cluster, vec![1, 2, 3]);
+    let leader = cluster.leader(agent).unwrap();
+    let follower = leader % NODES + 1;
+    let identity = vos_node::identity(
+        &vos_node::client::agent_info(&target(&cluster, leader), agent)
+            .unwrap()
+            .unwrap()
+            .record,
+    );
+    let key = SigningKey::from_bytes(&[13; 32]);
+    let path = format!("/agents/{}/queries", agent.0);
+    let commits = &cluster.slot(follower).trip.commits;
+    let session = Session {
+        key: key.verifying_key().to_bytes(),
+        name: [13; 16],
+        t0: vos_node::wall_clock(),
+    };
+    for (sequence, consistency) in [(1, None), (2, Some(Consistency::Linearizable))] {
+        std::thread::scope(|scope| {
+            let closed = commits.close();
+            let call = signed_call(&identity, &key, session, sequence, increment, 4);
+            let calls = format!("/agents/{}/calls", agent.0);
+            let answer =
+                post_within(cluster.slot(leader).ingress, &calls, &call, ANSWERED).unwrap();
+            let Answer::Ran { at, .. } = answer else {
+                panic!("{answer:?}")
+            };
+            let consistency = consistency.unwrap_or(Consistency::Applied { at });
+            let query = value_query(&identity, &key, value, consistency);
+            let (answered, read) = std::sync::mpsc::channel();
+            let (path, address) = (&path, cluster.slot(follower).ingress);
+            scope.spawn(move || {
+                let _ = answered.send(post_within(address, path, &query, ANSWERED));
+            });
+            std::thread::sleep(Duration::from_millis(300));
+            let early = read.try_recv();
+            drop(closed);
+            assert!(
+                early.is_err(),
+                "read before the follower applied it: {early:?}"
+            );
+            let answer = read.recv().unwrap().unwrap();
+            assert_eq!(
+                done(&answer),
+                Some(4 * sequence),
+                "{consistency:?}: {answer:?}"
+            );
+        });
+    }
+}
+
+/// A leader cut off from its followers answers no linearizable read: it
+/// cannot confirm it still leads.
+#[test]
+fn a_leader_cut_off_answers_no_linearizable_read() {
+    let cluster = Cluster::new(8);
+    let (agent, _, value) = counter_agent(&cluster, vec![1, 2, 3]);
+    let leader = cluster.leader(agent).unwrap();
+    let identity = vos_node::identity(
+        &vos_node::client::agent_info(&target(&cluster, leader), agent)
+            .unwrap()
+            .unwrap()
+            .record,
+    );
+    let key = SigningKey::from_bytes(&[14; 32]);
+    let path = format!("/agents/{}/queries", agent.0);
+    cluster.hub.isolate(leader);
+    let answer = post_within(
+        cluster.slot(leader).ingress,
+        &path,
+        &value_query(&identity, &key, value, Consistency::Linearizable),
+        ANSWERED,
+    );
+    cluster.hub.heal();
+    assert!(
+        !matches!(answer, Ok(Answer::Ran { .. })),
+        "a cut-off leader answered: {answer:?}"
+    );
+}
+
+/// A replica that has not applied through a query's floor in time answers
+/// `Behind`, and the client's query goes on to another replica.
+#[test]
+fn a_query_a_replica_is_behind_for_goes_to_another() {
+    let cluster = Cluster::new(9);
+    let (agent, increment, value) = counter_agent(&cluster, vec![1, 2, 3]);
+    let leader = cluster.leader(agent).unwrap();
+    let follower = leader % NODES + 1;
+    let key = SigningKey::from_bytes(&[15; 32]);
+    let mut client = vos_node::client::Client::new(&target(&cluster, leader), key.clone());
+    let identity = client.identity(agent).unwrap();
+    let commits = &cluster.slot(follower).trip.commits;
+    std::thread::scope(|_| {
+        let _closed = commits.close();
+        let answer = client
+            .call(agent, COUNTER, increment, &6u64.encode())
+            .unwrap();
+        let Answer::Ran { at, .. } = answer else {
+            panic!("{answer:?}")
+        };
+        let path = format!("/agents/{}/queries", agent.0);
+        let query = value_query(&identity, &key, value, Consistency::Applied { at });
+        assert_eq!(
+            post_within(cluster.slot(follower).ingress, &path, &query, ANSWERED),
+            Ok(Answer::Rejected(Rejection::Behind))
+        );
+        let reader = vos_node::client::Client::new(&target(&cluster, follower), key.clone());
+        reader.raise_floor(agent, at);
+        let answer = reader
+            .query(agent, COUNTER, value, &[], vos_node::wall_clock() + 60_000)
+            .unwrap();
+        assert_eq!(done(&answer), Some(6), "{answer:?}");
     });
 }

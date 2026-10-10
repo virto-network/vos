@@ -48,15 +48,30 @@ pub struct Call {
 }
 
 /// `POST /agents/{agent}/queries`: a query by `key`, good until
-/// `not_after` by the node's clock.
+/// `not_after` by the node's clock, on state as `consistency` asks.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct QueryCall {
     pub key: [u8; 32],
     pub not_after: u64,
+    pub consistency: Consistency,
     pub instance: InstanceId,
     pub method: MethodId,
     pub arguments: Vec<u8>,
     pub signature: [u8; 64],
+}
+
+/// Which applied state a query reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum Consistency {
+    /// The replica's, once it has applied through `at`: a client reads its
+    /// own writes, and never goes back, by asking for the highest `at` it
+    /// has been answered.
+    #[codec(index = 0)]
+    Applied { at: u64 },
+    /// State that holds every call answered before the query was taken:
+    /// the replica first learns from the leader how far to apply.
+    #[codec(index = 1)]
+    Linearizable,
 }
 
 /// The operator's `POST /agents/{agent}/install`.
@@ -102,6 +117,10 @@ pub enum Rejection {
     Unauthorized,
     #[codec(index = 7)]
     Malformed,
+    /// The replica has not applied through the index the query asked for
+    /// in time: ask another.
+    #[codec(index = 8)]
+    Behind,
 }
 
 /// Ingress's answer to a call, a query or an operator command.
@@ -191,6 +210,7 @@ pub fn query_message(
     identity: &[u8; 32],
     key: &[u8; 32],
     not_after: u64,
+    consistency: Consistency,
     instance: InstanceId,
     method: MethodId,
     arguments: &[u8],
@@ -198,6 +218,7 @@ pub fn query_message(
     message(QUERY_DOMAIN, identity, |bytes| {
         bytes.extend_from_slice(key);
         not_after.encode_to(bytes);
+        consistency.encode_to(bytes);
         instance.encode_to(bytes);
         method.encode_to(bytes);
         arguments.to_vec().encode_to(bytes);

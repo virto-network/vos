@@ -116,6 +116,21 @@ fn a_client_calls_an_agent_the_operator_installed() {
         "done 0700000000000000"
     );
     assert_eq!(client("query", "value", ""), "done 0700000000000000");
+    let linearizable = vos(&[
+        "query",
+        "--linearizable",
+        "--node",
+        &url,
+        "--key",
+        key.to_str().unwrap(),
+        "--agent",
+        &agent,
+        "--instance",
+        "1",
+        "--method",
+        "value",
+    ]);
+    assert_eq!(linearizable, "done 0700000000000000");
     // One session for the agent, kept next to the key, whose sequence
     // went on; and the agent's identity, fetched once.
     let session = |text: &str| -> Vec<String> {
@@ -130,6 +145,8 @@ fn a_client_calls_an_agent_the_operator_installed() {
     assert_eq!(before[..4], after_session[..4], "the same session");
     assert_eq!((&*before[4], &*after_session[4]), ("2", "3"));
     assert!(after.contains(&format!("identity {agent} ")), "{after}");
+    // The floor the answers gave, so the next command reads its writes.
+    assert!(after.contains(&format!("at {agent} ")), "{after}");
 }
 
 /// `vos` that should fail: its error.

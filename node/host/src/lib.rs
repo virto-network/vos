@@ -13,6 +13,7 @@ mod leader;
 mod node;
 pub mod peer;
 mod pvm;
+mod queries;
 pub mod raft;
 pub mod space;
 pub mod storage;

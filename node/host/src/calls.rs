@@ -26,7 +26,7 @@ use vos_wire::result::Outcome;
 use vos_wire::{Decode, defaults, keys};
 
 use crate::node::{Answered, CallError, Inner, Reply, Run};
-use crate::peer::{self, Refusal};
+use crate::peer::Refusal;
 use crate::store::{Store, View};
 
 /// How long a forwarded call may take: its re-forwards, and the wait for
@@ -504,13 +504,7 @@ impl Inner {
         token: u64,
         call: Call,
     ) {
-        let replicas = self
-            .directory
-            .lock()
-            .expect("the directory")
-            .get(&agent)
-            .map(|record| record.replicas.clone());
-        if let Err(refusal) = peer::check_replica(replicas.as_deref(), from) {
+        if let Err(refusal) = self.check_replica(agent, from) {
             self.drops.count(refusal);
             return;
         }
@@ -565,13 +559,7 @@ impl Inner {
         token: u64,
         answer: Answer,
     ) {
-        let replicas = self
-            .directory
-            .lock()
-            .expect("the directory")
-            .get(&agent)
-            .map(|record| record.replicas.clone());
-        if let Err(refusal) = peer::check_replica(replicas.as_deref(), from) {
+        if let Err(refusal) = self.check_replica(agent, from) {
             self.drops.count(refusal);
             return;
         }
@@ -592,7 +580,10 @@ impl Inner {
 }
 
 /// `work`, if it ends within `left`.
-async fn within<T>(left: Duration, work: impl std::future::Future<Output = T>) -> Option<T> {
+pub(crate) async fn within<T>(
+    left: Duration,
+    work: impl std::future::Future<Output = T>,
+) -> Option<T> {
     let work = async { Some(work.await) };
     work.or(async {
         smol::Timer::after(left).await;

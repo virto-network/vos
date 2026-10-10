@@ -1,7 +1,8 @@
 //! What one node sends another: messages for an agent's replica group,
 //! snapshot chunks, blobs, liveness, the directory of agents, and clients'
-//! calls forwarded to a leader. The node checks each against the space's
-//! configuration before it reaches a group.
+//! calls and read indexes, which a replica asks of its leader. The node
+//! checks each against the space's configuration before it reaches a
+//! group.
 //!
 //! The Raft types mirror the consensus core's, so the wire format is this
 //! module's alone and the core may change underneath it. The network's
@@ -62,6 +63,17 @@ pub enum PeerMessage {
         agent: AgentId,
         token: u64,
         answer: Answer,
+    },
+    /// A replica of `agent` asks its leader for a read index.
+    #[codec(index = 11)]
+    ReadIndex { agent: AgentId, token: u64 },
+    /// The leader's read index, once a quorum confirmed it leads; none
+    /// when it could not confirm it.
+    #[codec(index = 12)]
+    ReadIndexAnswer {
+        agent: AgentId,
+        token: u64,
+        index: Option<u64>,
     },
 }
 

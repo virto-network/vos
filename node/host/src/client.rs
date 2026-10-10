@@ -12,8 +12,8 @@ use rustls::pki_types::ServerName;
 use vos_wire::abi::refusal;
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session};
 use vos_wire::ingress::{
-    AgentInfo, Answer, Call, Contact, Create, Grant, Install, NodeId, QueryCall, Rejection,
-    call_message, query_message,
+    AgentInfo, Answer, Call, Consistency, Contact, Create, Grant, Install, NodeId, QueryCall,
+    Rejection, call_message, query_message,
 };
 use vos_wire::schema::Schema;
 use vos_wire::{Decode, Encode};
@@ -467,6 +467,8 @@ pub struct Client {
     replicas: Mutex<HashMap<AgentId, Vec<Contact>>>,
     /// Agents whose next call repeats one whose fate is unknown.
     unknown: Mutex<std::collections::HashSet<AgentId>>,
+    /// Each agent's floor: the highest applied index an answer reflected.
+    floors: Mutex<HashMap<AgentId, u64>>,
     /// How far the agents' time is ahead of this client's clock, as a
     /// node last reported it: a new session starts at that time.
     offset: Mutex<i64>,
@@ -493,6 +495,7 @@ impl Client {
             identities: Mutex::new(identities),
             replicas: Mutex::new(HashMap::new()),
             unknown: Mutex::new(std::collections::HashSet::new()),
+            floors: Mutex::new(HashMap::new()),
             offset: Mutex::new(0),
         }
     }
@@ -678,11 +681,12 @@ impl Client {
                 }
             };
             match &answer {
-                Answer::Ran { .. } => {
+                Answer::Ran { at, .. } => {
                     if let Some(kept) = self.sessions.lock().expect("the sessions").get_mut(&agent)
                     {
                         kept.next = sequence + 1;
                     }
+                    self.raise_floor(agent, *at);
                     return Ok(answer);
                 }
                 Answer::NotLeader {
@@ -744,6 +748,12 @@ impl Client {
     /// trusts nodes: by the same CAs, or pinned by the key the redirecting
     /// node gave, as this client already trusts what that node says.
     fn follow(&mut self, contact: &Contact) -> Result<(), ClientError> {
+        self.http = Http::new(&self.target_for(contact)?);
+        Ok(())
+    }
+
+    /// The node `contact` names, trusted as this client trusts nodes.
+    fn target_for(&self, contact: &Contact) -> Result<Target, ClientError> {
         let trust = match &self.http.target.trust {
             Trust::Ca(roots) => Trust::Ca(roots.clone()),
             Trust::NodeKey(_) | Trust::Loopback if contact.address.starts_with("https://") => {
@@ -751,8 +761,7 @@ impl Client {
             }
             Trust::NodeKey(_) | Trust::Loopback => Trust::Loopback,
         };
-        self.http = Http::new(&Target::new(&contact.address, trust)?);
-        Ok(())
+        Target::new(&contact.address, trust)
     }
 
     /// Call with an explicit `sequence` in the agent's session: to resend
@@ -794,7 +803,9 @@ impl Client {
         .encode())
     }
 
-    /// Run query `method` on `agent`'s `instance`, good until `not_after`.
+    /// Run query `method` on `agent`'s `instance`, good until `not_after`,
+    /// on state that holds every answer this client was given for the
+    /// agent: it reads its own writes, and never reads back.
     pub fn query(
         &self,
         agent: AgentId,
@@ -803,20 +814,122 @@ impl Client {
         arguments: &[u8],
         not_after: u64,
     ) -> Result<Answer, ClientError> {
+        let consistency = Consistency::Applied {
+            at: self.floor(agent),
+        };
+        self.query_with(agent, instance, method, arguments, not_after, consistency)
+    }
+
+    /// Run a query on the state `consistency` asks for.
+    pub fn query_with(
+        &self,
+        agent: AgentId,
+        instance: InstanceId,
+        method: MethodId,
+        arguments: &[u8],
+        not_after: u64,
+        consistency: Consistency,
+    ) -> Result<Answer, ClientError> {
         let identity = self.identity(agent)?;
         let key = self.key.verifying_key().to_bytes();
-        let message = query_message(&identity, &key, not_after, instance, method, arguments);
+        let message = query_message(
+            &identity,
+            &key,
+            not_after,
+            consistency,
+            instance,
+            method,
+            arguments,
+        );
         let query = QueryCall {
             key,
             not_after,
+            consistency,
             instance,
             method,
             arguments: arguments.to_vec(),
             signature: self.key.sign(&message).to_bytes(),
         };
         let path = format!("/agents/{}/queries", agent.0);
-        let (status, body) = self.http.post(&path, None, &query.encode(), true)?;
-        answer(status, &body)
+        let body = query.encode();
+        let ask = |http: &Http| -> Result<Answer, ClientError> {
+            let (status, answered) = http.post(&path, None, &body, true)?;
+            answer(status, &answered)
+        };
+        // A query changes nothing: one this replica cannot answer now goes
+        // to the others in turn, the client still calling this one.
+        let unanswered = |answer: &Result<Answer, ClientError>| {
+            matches!(
+                answer,
+                Err(_)
+                    | Ok(Answer::Rejected(Rejection::Behind)
+                        | Answer::TimedOut
+                        | Answer::Unavailable
+                        | Answer::Stopped
+                        | Answer::NotLeader { .. }
+                        | Answer::Elsewhere { .. })
+            )
+        };
+        let mut answer = ask(&self.http);
+        if unanswered(&answer) {
+            if !self
+                .replicas
+                .lock()
+                .expect("the replicas")
+                .contains_key(&agent)
+            {
+                let _ = self.learn(agent);
+            }
+            let replicas = self
+                .replicas
+                .lock()
+                .expect("the replicas")
+                .get(&agent)
+                .cloned()
+                .unwrap_or_default();
+            let current = Some(self.http.target.authority.clone());
+            for replica in replicas
+                .iter()
+                .filter(|replica| authority(&replica.address) != current)
+            {
+                let Ok(target) = self.target_for(replica) else {
+                    continue;
+                };
+                answer = ask(&Http::new(&target));
+                if !unanswered(&answer) {
+                    break;
+                }
+            }
+        }
+        let answer = answer?;
+        if let Answer::Ran { at, .. } = answer {
+            self.raise_floor(agent, at);
+        }
+        Ok(answer)
+    }
+
+    /// The highest applied index an answer for `agent` reflected: the
+    /// floor its queries ask a replica to have reached.
+    pub fn floor(&self, agent: AgentId) -> u64 {
+        self.floors
+            .lock()
+            .expect("the floors")
+            .get(&agent)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Each agent's floor, to keep.
+    pub fn floors(&self) -> HashMap<AgentId, u64> {
+        self.floors.lock().expect("the floors").clone()
+    }
+
+    /// Raise `agent`'s floor to `at`, as an answer, or one kept from
+    /// before, reflected.
+    pub fn raise_floor(&self, agent: AgentId, at: u64) {
+        let mut floors = self.floors.lock().expect("the floors");
+        let floor = floors.entry(agent).or_insert(0);
+        *floor = (*floor).max(at);
     }
 
     /// The schema installed as `agent`'s `instance`.

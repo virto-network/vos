@@ -175,6 +175,15 @@ fn every_other_message_survives_the_wire() {
             round: 3,
         },
         forward(),
+        PeerMessage::ReadIndex {
+            agent: AGENT,
+            token: 78,
+        },
+        PeerMessage::ReadIndexAnswer {
+            agent: AGENT,
+            token: 78,
+            index: Some(41),
+        },
         PeerMessage::Forwarded {
             agent: AGENT,
             token: 77,
@@ -213,6 +222,12 @@ fn a_forwarded_call_comes_from_a_replica_on_its_agent_s_requests_stream() {
     let forward = forward();
     assert_eq!(peer::class(&forward), Class::Requests);
     assert_eq!(peer::stream(&forward), u64::from(AGENT.0));
+    let read_index = PeerMessage::ReadIndex {
+        agent: AGENT,
+        token: 1,
+    };
+    assert_eq!(peer::class(&read_index), Class::Requests);
+    assert_eq!(peer::stream(&read_index), u64::from(AGENT.0));
     assert_eq!(
         peer::check(
             &SPACE,

@@ -13,7 +13,7 @@ use vos_node::tls::{IngressTls, Trust};
 use vos_node::{ADMIN_TOKEN, Config, NODE_KEY, Node, Space};
 use vos_wire::Encode;
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal};
-use vos_wire::ingress::{Answer, Install};
+use vos_wire::ingress::{Answer, Consistency, Install};
 use vos_wire::result::Outcome;
 use vos_wire::schema::Schema;
 
@@ -78,8 +78,16 @@ enum Command {
     },
     /// Call a command, signed with a client key.
     Call(CallArgs),
-    /// Run a query, signed with a client key.
-    Query(CallArgs),
+    /// Run a query, signed with a client key, on state that holds every
+    /// answer the key was given for the agent.
+    Query {
+        #[command(flatten)]
+        call: CallArgs,
+        /// Read state that holds every call answered anywhere before the
+        /// query: the replica asks the agent's leader how far to apply.
+        #[arg(long)]
+        linearizable: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -341,8 +349,8 @@ fn run(cli: Cli) -> Result<(), String> {
                 .map_err(failed)?;
             print_answer(&answer)
         }
-        Command::Call(call) => invoke(&call, false),
-        Command::Query(call) => invoke(&call, true),
+        Command::Call(call) => invoke(&call, None),
+        Command::Query { call, linearizable } => invoke(&call, Some(linearizable)),
     }
 }
 
@@ -431,12 +439,14 @@ fn key_bytes(text: &str) -> Result<[u8; 32], String> {
 }
 
 /// A key's sessions, kept next to the key file so calls go on in them:
-/// each agent's session, its identity once fetched, and a call that failed
+/// each agent's session, its identity once fetched, its floor (so queries
+/// read the key's own writes across commands), and a call that failed
 /// before its answer, by its digest and when, until it is answered.
 #[derive(Default)]
 struct Kept {
     sessions: HashMap<AgentId, client::Kept>,
     identities: HashMap<AgentId, [u8; 32]>,
+    floors: HashMap<AgentId, u64>,
     pending: HashMap<AgentId, ([u8; 32], u64)>,
 }
 
@@ -479,6 +489,9 @@ impl Kept {
                     kept.identities
                         .insert(agent(id)?, key_bytes(identity).ok()?);
                 }
+                ["at", id, at] => {
+                    kept.floors.insert(agent(id)?, at.parse().ok()?);
+                }
                 ["pending", id, digest, time] => {
                     kept.pending
                         .insert(agent(id)?, (key_bytes(digest).ok()?, time.parse().ok()?));
@@ -503,6 +516,9 @@ impl Kept {
         for (agent, identity) in &self.identities {
             text.push_str(&format!("identity {} {}\n", agent.0, hex::encode(identity)));
         }
+        for (agent, at) in &self.floors {
+            text.push_str(&format!("at {} {at}\n", agent.0));
+        }
         for (agent, (digest, time)) in &self.pending {
             text.push_str(&format!(
                 "pending {} {} {time}\n",
@@ -520,7 +536,8 @@ impl Kept {
     }
 }
 
-fn invoke(call: &CallArgs, query: bool) -> Result<(), String> {
+/// A call, or (`Some(linearizable)`) a query.
+fn invoke(call: &CallArgs, query: Option<bool>) -> Result<(), String> {
     let seed = std::fs::read_to_string(&call.key)
         .map_err(|error| format!("{}: {error}", call.key.display()))?;
     let key = SigningKey::from_bytes(&key_bytes(&seed)?);
@@ -530,14 +547,24 @@ fn invoke(call: &CallArgs, query: bool) -> Result<(), String> {
     let target = call.node.target()?;
     let mut kept = Kept::load(&call.key);
     let mut client = Client::resume(&target, key, kept.sessions.clone(), kept.identities.clone());
+    for (agent, at) in &kept.floors {
+        client.raise_floor(*agent, *at);
+    }
     let schema = client
         .schema(agent, instance)
         .map_err(failed)?
         .ok_or_else(|| format!("nothing is installed as instance {}", call.instance))?;
     let method = method_named(&schema, &call.method)?;
-    let answer = if query {
+    let answer = if let Some(linearizable) = query {
         let not_after = vos_node::wall_clock() + 60_000;
-        client.query(agent, instance, method, &arguments, not_after)
+        let consistency = if linearizable {
+            Consistency::Linearizable
+        } else {
+            Consistency::Applied {
+                at: client.floor(agent),
+            }
+        };
+        client.query_with(agent, instance, method, &arguments, not_after, consistency)
     } else {
         // A call that failed before its answer goes again with its
         // sequence, and is answered once. Another call leaves that session
@@ -569,10 +596,11 @@ fn invoke(call: &CallArgs, query: bool) -> Result<(), String> {
     };
     kept.sessions = client.sessions();
     kept.identities = client.identities();
+    kept.floors = client.floors();
     kept.save(&call.key)?;
     match answer {
         Ok(answer) => print_answer(&answer),
-        Err(error) if !query => Err(format!(
+        Err(error) if query.is_none() => Err(format!(
             "{}; the call may have run: run it again to learn its answer",
             failed(error)
         )),

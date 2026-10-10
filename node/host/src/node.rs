@@ -375,6 +375,8 @@ pub(crate) struct Inner {
     pub(crate) recording: smol::lock::Mutex<()>,
     /// Clients' calls: their lanes, and the calls forwarded both ways.
     pub(crate) calls: crate::calls::Calls,
+    /// The read indexes this replica asked its leaders for.
+    pub(crate) reads: crate::queries::Reads,
 }
 
 impl Inner {
@@ -637,6 +639,16 @@ impl Inner {
     /// applied state then holds everything committed before the call.
     pub(crate) async fn read_index(&self, id: AgentId) -> Result<u64, CallError> {
         let run = self.run(id).ok_or_else(|| self.absent(id))?;
+        let index = self.confirm(id).await?;
+        self.applied_through(&run, index).await?;
+        Ok(index)
+    }
+
+    /// A read index from this replica's core: it leads, as a quorum has
+    /// confirmed, and its applied state, through the index, holds every
+    /// call answered before.
+    pub(crate) async fn confirm(&self, id: AgentId) -> Result<u64, CallError> {
+        let run = self.run(id).ok_or_else(|| self.absent(id))?;
         let (answer, answered) = smol::channel::bounded(1);
         if !self.propose(id, Local::ReadIndex { answer }) {
             return Err(CallError::Stopped);
@@ -653,6 +665,12 @@ impl Inner {
             }
             Ok(Err(_)) | Err(_) => return Err(self.not_leader(&run.shared)),
         };
+        Ok(index)
+    }
+
+    /// Wait until `run`'s replica has applied through `index`, for
+    /// [`CATCH_UP`] at most.
+    pub(crate) async fn applied_through(&self, run: &Run, index: u64) -> Result<(), CallError> {
         let applied = async {
             Some(
                 run.shared
@@ -665,7 +683,7 @@ impl Inner {
             None
         };
         match applied.or(late).await {
-            Some(state) if !state.stopped => Ok(index),
+            Some(state) if !state.stopped => Ok(()),
             Some(_) => Err(CallError::Stopped),
             None => Err(CallError::Failed(
                 "the replica has not applied through its read index".into(),
@@ -1161,6 +1179,7 @@ impl Node {
             tasks: Mutex::new(Vec::new()),
             recording: smol::lock::Mutex::new(()),
             calls: crate::calls::Calls::default(),
+            reads: crate::queries::Reads::default(),
         });
         for record in records {
             if record.creator == number {

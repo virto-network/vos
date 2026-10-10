@@ -2923,3 +2923,87 @@ Left for later:
 - the O(tasks) `retain` in the node's `spawn`;
 - seq 0 taking a read index.
 
+
+#### 3.5c2 Built
+
+- **The wire:**
+  - `QueryCall` carries `consistency`, in the signed bytes:
+    `Consistency::Applied { at }` or `Consistency::Linearizable`;
+  - `Rejection::Behind`;
+  - `PeerMessage::ReadIndex { agent, token }` and
+    `ReadIndexAnswer { agent, token, index }`, on Requests, on the
+    agent's stream.
+  - The enum is `Consistency`, not the design's `Read`, which clashes
+    with `std::io::Read` wherever both are used.
+- **`queries.rs`:**
+  - a query waits until its replica has applied through the index it
+    asks for, for 5 s at most, else `Behind`, then runs on applied state
+    and answers the index it read;
+  - a linearizable query first takes a read index:
+    - its own core's, through the driver, when the replica leads;
+    - else its leader's (`ReadIndex`), asked again after 2 s, on a
+      change of leader, or after a pause when the leader could not
+      confirm;
+    - for 10 s at most;
+  - the leader answers `ReadIndex` in a task, once its core has
+    confirmed it leads, without waiting for its own apply;
+  - `ReadIndex` and its answer come only from replicas of the agent.
+- **`Inner::read_index`** is split into `confirm` (the core's read index)
+  and `applied_through` (the bounded wait for the apply). The lanes use
+  both; a remote read index uses `confirm` alone.
+- **The client:**
+  - keeps each agent's floor: the highest `at` any answer reflected;
+  - `query` reads at that floor, and `query_with` takes any consistency.
+- **The CLI:**
+  - keeps each agent's floor (`at <agent> <index>`);
+  - `vos query --linearizable`.
+
+**Tests:**
+- **Over HTTP, at a follower whose commits are held,** a read at the
+  floor of a write's answer, and a linearizable read, each wait until
+  the follower has applied the write, then see it. Without the floor's
+  wait, or without the read index, the read comes back early.
+- **A leader cut off from its followers** answers no linearizable read.
+  Without the read index it answers from its stale state.
+- **Peer:** the read-index messages survive the wire and travel on
+  Requests on their agent's stream.
+- **CLI:** `--linearizable`, and the kept floor.
+- **The checker reads:** each client reads its counter alongside its
+  calls, at every replica in turn, about 360 linearizable reads and 360
+  at its floor per run:
+  - a read must equal the total of a prefix of the client's requests,
+    up to those sent before it ended;
+  - a linearizable read must hold every request answered before it
+    started;
+  - a read at the floor of the last answered prefix holds that prefix,
+    and never goes back.
+  - Sixteen seeds pass.
+- **Mutations caught by the checker:**
+  - a linearizable read with no read index: "saw 128 requests, 157 were
+    answered before it";
+  - a floor not waited for: "went back".
+
+**Review** (Opus): go, with no blocking issue. Its findings:
+- a follower's read index from a leader deposed before the follower
+  applies through it is still linearizable;
+- the checker's bounds hold in pipelined mode;
+- nothing a deposed leader does can make a query wrong.
+
+Folded in:
+- **A query that a replica cannot answer now goes to the others in
+  turn** (`Behind`, `TimedOut`, `Unavailable`, `Stopped`, `NotLeader`,
+  `Elsewhere`, a transport error): it changes nothing, so it is always
+  safe to send again. Test: a follower whose commits are held answers a
+  floored read `Behind`, and the client's query reads the write at
+  another replica.
+- **A read index is asked of the replica's own core whenever its core
+  leads,** not only once its leader loop takes calls. While a handover is
+  under way it asks the next leader within its deadline.
+- **A leader that answers no index** is asked again at the 2 s pace, not
+  every 100 ms: it may only be busy.
+- **The query's wait for what its replica recovered** counts against the
+  floor's 5 s.
+- **A read index's answer is bound to the agent it was asked for.**
+- **The checker:** a linearizable read is never below what an earlier
+  read by the same client showed.
+- **One `within`,** shared.

@@ -183,6 +183,14 @@ impl Inner {
                 token,
                 answer,
             } => self.on_forwarded(from, agent, token, answer),
+            // A task of its own confirms the leadership: the dispatcher
+            // never waits.
+            PeerMessage::ReadIndex { agent, token } => self.on_read_index(from, agent, token),
+            PeerMessage::ReadIndexAnswer {
+                agent,
+                token,
+                index,
+            } => self.on_read_index_answer(from, agent, token, index),
             PeerMessage::Blob { .. } | PeerMessage::Directory(_) => {
                 unreachable!("blobs and records are handled in tasks")
             }

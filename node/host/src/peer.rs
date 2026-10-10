@@ -294,7 +294,9 @@ pub fn class(message: &PeerMessage) -> Class {
         | PeerMessage::Directory(_)
         | PeerMessage::DirectoryAck { .. }
         | PeerMessage::Forward { .. }
-        | PeerMessage::Forwarded { .. } => Class::Requests,
+        | PeerMessage::Forwarded { .. }
+        | PeerMessage::ReadIndex { .. }
+        | PeerMessage::ReadIndexAnswer { .. } => Class::Requests,
         PeerMessage::Liveness { .. } | PeerMessage::LivenessAnswer { .. } => Class::Liveness,
     }
 }
@@ -310,7 +312,9 @@ pub fn stream(message: &PeerMessage) -> u64 {
         PeerMessage::Directory(record) => u64::from(record.agent.0),
         PeerMessage::DirectoryAck { agent }
         | PeerMessage::Forward { agent, .. }
-        | PeerMessage::Forwarded { agent, .. } => u64::from(agent.0),
+        | PeerMessage::Forwarded { agent, .. }
+        | PeerMessage::ReadIndex { agent, .. }
+        | PeerMessage::ReadIndexAnswer { agent, .. } => u64::from(agent.0),
         PeerMessage::Blob { .. }
         | PeerMessage::Liveness { .. }
         | PeerMessage::LivenessAnswer { .. } => 0,
@@ -361,7 +365,9 @@ pub fn check(
         | PeerMessage::Liveness { .. }
         | PeerMessage::LivenessAnswer { .. }
         | PeerMessage::Forward { .. }
-        | PeerMessage::Forwarded { .. } => Ok(()),
+        | PeerMessage::Forwarded { .. }
+        | PeerMessage::ReadIndex { .. }
+        | PeerMessage::ReadIndexAnswer { .. } => Ok(()),
     }
 }
 

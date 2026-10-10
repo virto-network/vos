@@ -44,6 +44,8 @@ fn status(answer: &Answer) -> u16 {
             Rejection::BadSignature | Rejection::Unauthorized => 401,
             Rejection::Gap { .. } | Rejection::Ahead => 409,
             Rejection::StaleQuery | Rejection::Malformed => 400,
+            // Another replica may be further along.
+            Rejection::Behind => 503,
         },
         Answer::NotConsumed => 500,
         Answer::NoAgent => 404,
@@ -252,6 +254,7 @@ impl Ingress {
             &run.shared.identity,
             &query.key,
             query.not_after,
+            query.consistency,
             query.instance,
             query.method,
             &query.arguments,
@@ -270,20 +273,16 @@ impl Ingress {
         if query.not_after < now || query.not_after > now + QUERY_HORIZON_MS {
             return Answer::Rejected(Rejection::StaleQuery);
         }
-        let outcome = self
-            .inner
-            .query(
+        self.inner
+            .client_query(
                 agent,
                 Principal::Client(query.key),
                 query.instance,
                 query.method,
                 query.arguments,
+                query.consistency,
             )
-            .await;
-        match outcome {
-            Ok((outcome, at)) => Answer::Ran { outcome, at },
-            Err(error) => answer_of(Err(error)),
-        }
+            .await
     }
 
     /// An installed instance's schema, so clients call methods by name.
