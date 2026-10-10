@@ -2553,3 +2553,202 @@ the replicated budget; revisit with 3.10's pipelining).
 - a clock far enough off for `StaleSession` under failures: the jumps
   stay within the skew.
 
+
+### 3.5c: any replica serves
+
+#### Design
+
+A client calls and queries any replica of an agent, and fails over to
+another without a redirect. Two commits, each reviewed:
+- **3.5c1, calls:**
+  - commits reach followers at once;
+  - answers carry the applied index they reflect;
+  - forwarding, and signature checks on executors;
+  - the client using every replica;
+  - the checker calling through any replica.
+- **3.5c2, queries:**
+  - floors and read-index queries;
+  - the checker's reads.
+
+**Commits reach followers at once** (vos-raft). Today a leader with
+nothing new for a peer sends nothing (`replicate`'s `next > last`), so a
+follower learns a commit at the next heartbeat, up to 500 ms later, and
+a forwarded call would wait that long.
+- **A leader tracks the commit index each peer was last sent.** The
+  commit append is built as a heartbeat is:
+  - `prev_index = next − 1`;
+  - `commit = min(commit, match_index)`, the per-peer cap the plan sets,
+    so a commit can never make a follower apply an entry it does not
+    hold as the leader's;
+  - it carries the current round, never a new one. Its acknowledgement
+    confirms only reads registered before it was sent, so that is
+    sound.
+- **When it goes:** at once, when that capped commit passes the last
+  commit sent to the peer, unless an append with entries in the same
+  round already carries it.
+- **It takes no in-flight slot.**
+- One message per commit per peer. 3.8's combined heartbeats revisit it
+  for many groups.
+- Test: a follower applies an entry before any heartbeat is due.
+
+**Answers carry `at`,** the applied index of the state they reflect:
+- `Answer::Ran { outcome, at }`;
+- for a call, the index of the entry it applied in, or for a reply from
+  the window, the applied index the window was read at;
+- for a query, the applied index it ran on.
+
+A client keeps the highest `at` it has seen for each agent, as the floor
+for its next query (3.5c2). Internally the leader's answer carries the
+index beside the `Reply`.
+
+**Forwarding:**
+- **A replica that does not lead takes the call:**
+  1. it checks the signature on an executor;
+  2. it sends `Forward { agent, token, call }` to the leader it follows
+     (class Requests, on the agent's stream). `token` is random, chosen
+     once per call and kept across every re-forward;
+  3. the leader runs the call as its ingress does (the lanes move out of
+     the HTTP ingress into a module both use), and answers
+     `Forwarded { agent, token, answer }` when it would answer its own
+     client;
+  4. on a `Ran`, the forwarder waits until its own applied index reaches
+     `at`, then answers its client. So no reply leaves before the
+     request is applied on the replica that answers. Any other answer
+     goes back at once.
+- **The leader trusts the forwarder's signature check.** A `Forward`
+  comes only from a replica of the agent, and replicas are trusted as
+  Raft members are: under crash faults, one that lied could do worse
+  through its votes. The leader's own ingress checks its own clients.
+  `Forward` carries the signed call whole, so the leader re-verifies it
+  once a space can hold members it does not trust, and for step 5's
+  "client's own node", which is no member.
+- **The dispatcher hands each `Forward` to a task:** its lane waits for
+  the call's answer, and the dispatcher never waits (3.5a's S6).
+- **Installs and grants are not forwarded.** An install carries up to
+  64 MiB of programs, and operator commands still answer `NotLeader`.
+- **Re-forwarding,** with the same call and token, until a deadline
+  (30 s):
+  - on `NotLeader` or `Unavailable` from the leader;
+  - on `Stopped`, once the replica follows another leader, or after a
+    pause: a retired leader answers `Stopped` while it hands over, and
+    sending it the call again at once would spin;
+  - when no answer comes within 2 s;
+  - when the replica follows a new leader;
+  - with no leader known, after the group settles.
+
+  A `Forwarded` is matched by its token, from any node: a late `Ran`
+  from an earlier leader still completes the call.
+- **A forwarder that becomes the leader** runs its pending calls through
+  its own lanes: the network refuses a send to its own number.
+
+  The leader's lane makes each one safe: it joins a duplicate in
+  flight, answers one already applied from the window, and refine's
+  duplicate answer covers the rest.
+- **When the deadline passes, `Answer::TimedOut`:** the call may have
+  run, or may yet. The client sends it again with the same sequence, as
+  after any unanswered call; the CLI keeps it as pending.
+  - The wait for the replica's own apply counts against the same
+    deadline.
+  - At the deadline the answer is `TimedOut`, never the leader's
+    outcome: no reply leaves before its apply on the replica that
+    answers. A resend at another replica is answered from its window at
+    once.
+- **Admission:** the leader holds at most 1,024 forwarded calls in flight
+  per forwarding node, and answers `Busy` past that. A forwarder's own
+  are bounded by its connections.
+- **Checks** (`peer::check`):
+  - `Forward` and `ReadIndex` only from a replica of the agent;
+  - `Forwarded` and `ReadIndexAnswer` are matched by token, and one that
+    matches nothing is dropped and counted.
+- **A node that does not replicate the agent** still answers `Elsewhere`.
+  Forwarding through a node with no replica, as the plan's "client's own
+  node" would, comes with step 5.
+
+**Signature checks on executors:** ingress checks each call and query on
+an executor, at the forwarder and at the leader alike. This keeps about
+50 µs per request off the node's async thread.
+
+**The client:**
+- **`GET /agents/{id}` answers `AgentInfo { record, replicas }`,** the
+  replicas as `Contact`s. The client computes the identity from the
+  record, as before, and keeps the replicas.
+- **Trust:** each replica is trusted as `follow` trusts a node: by the
+  same CAs, or pinned by the key the answering node gave.
+- **It calls the replica it was given.**
+  - On an error, `Stopped`, `Unavailable` or `TimedOut`, it calls the
+    next replica with the same sequence.
+  - On `Busy`, which comes from the leader's admission, it backs off:
+    any replica forwards to the same leader.
+  - It still follows `Elsewhere` and `NotLeader`.
+- `vos call` and `vos query` take any replica's address.
+
+**Queries (3.5c2):**
+- **`QueryCall` gains `read`,** in the signed bytes:
+  - `Read::Applied { at }` waits until the replica has applied through
+    `at`, for 5 s at most, else `Rejected(Behind)`, and the client tries
+    another replica;
+  - `Read::Linearizable` takes a read index first.
+- **The read index:**
+  - a leader asks its core (`read_index`, through the driver's local
+    channel), which confirms leadership with a round and answers an
+    index at or past its term's no-op;
+  - a follower asks its leader (`ReadIndex { agent, token }`, answered
+    `ReadIndexAnswer { agent, token, index }`), and asks again on
+    `NotLeader`, on a timeout, or once it follows a new leader, as
+    forwarding does;
+  - each read opens a round. Batching the reads registered before a round
+    goes out is for heavy linearizable load, later;
+  - then it waits until it has applied that index, and runs the query.
+- **The client's default** is `Applied { at }` at the highest `at` it
+  has seen for the agent: it reads its own writes, and reads never go
+  back, at any replica. `Linearizable` is asked for
+  (`vos query --linearizable`).
+- **The CLI keeps each agent's floor** (`at <agent> <index>`) beside its
+  sessions, so it reads its own writes across `vos` commands.
+- **`#[msg(linearizable)]` is not in this step.** It is a promise to the
+  agent's developer that a method never reads stale state, whatever the
+  client asks. It goes with the SDK's next macro work (step 5 at the
+  latest). Here the client chooses its consistency per query.
+
+**The checker:**
+- **3.5c1:**
+  - clients call a random replica and move to another on failure, so
+    forwarding and re-forwarding meet the faults. The answering
+    replica's mark check stands, now mostly at followers;
+  - a new fault cuts the leader off from its followers while clients
+    call the followers;
+  - a test checks that a forwarder refuses a badly signed call before
+    forwarding it.
+- **3.5c2:** each client reads its counter alongside its calls, at
+  random replicas:
+  - a linearizable read must be `total(k)` for some `k` between the
+    requests acknowledged before it started and those sent before it
+    ended (the totals are distinct and increasing);
+  - a read floored at the last acknowledged call's `at` must be at least
+    that call's total;
+  - a client's successive floored reads never go back, since answers'
+    `at` feed its floor.
+
+**Not in 3.5c:**
+- `#[msg(linearizable)]` (above);
+- leases;
+- forwarding through nodes with no replica;
+- messages across nodes (3.5d).
+
+**Review** (Opus): go, with no blocking issue. Folded in above:
+- the commit append's shape;
+- one token per call, matched from any node;
+- a forwarder that becomes the leader;
+- re-forwarding on `Stopped`;
+- installs and grants not forwarded;
+- `Forward` handled in tasks;
+- the CLI's floors;
+- `ReadIndex`'s checks;
+- the checker's new fault and floored reads.
+
+Answered:
+- trusting the forwarder is sound while members are trusted, and the
+  call travels whole for later re-verification;
+- `#[msg(linearizable)]` waits for the SDK;
+- `TimedOut` is the answer at the deadline, never the leader's outcome.
+
