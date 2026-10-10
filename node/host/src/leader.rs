@@ -10,11 +10,11 @@ use std::time::Duration;
 use smol::future::FutureExt;
 use vos_raft::Role;
 use vos_wire::abi::refusal;
-use vos_wire::batch::{Batch, Message, Work};
-use vos_wire::ids::AgentId;
+use vos_wire::batch::{Batch, Message, Request, Work};
+use vos_wire::ids::{AgentId, SessionId};
 use vos_wire::keys;
-use vos_wire::records::unstored;
-use vos_wire::result::{Outgoing, Step, WorkResult};
+use vos_wire::records::{SessionMark, unstored};
+use vos_wire::result::{Outcome, Outgoing, Step, WorkResult};
 
 use crate::group::{DryRun, Local, Shared, State};
 use crate::node::{Agent, CallError, Inner, Pending, Reply, ran, read, reply, seed};
@@ -25,6 +25,9 @@ use crate::store::{BlobRef, EntryKind, FjallSnapshot, LogEntry, Store, View};
 /// time up to [`MAX_BACKOFF`].
 const BACKOFF: Duration = Duration::from_millis(50);
 const MAX_BACKOFF: Duration = Duration::from_secs(5);
+/// How far this node's clock may trail the agent's time before the leader
+/// says so.
+const CLOCK_BOUND: u64 = 10_000;
 
 /// Lead `agent` whenever this node's replica leads its group, until the
 /// group stops.
@@ -104,7 +107,9 @@ struct Leader {
     term: u64,
     version: u64,
     applied: u64,
-    time: u64,
+    /// The node's clock trails the agent's time: batches are timed at the
+    /// agent's.
+    trailing: bool,
     /// Each sender's pair mark, as applied.
     marks: HashMap<AgentId, u64>,
     /// Each target's last message delivered by this leadership.
@@ -133,16 +138,12 @@ impl Leader {
         let snapshot = inner.store.snapshot();
         let applied = snapshot.applied(id).map_err(infrastructure)?.unwrap_or(0);
         let version = read::<u64>(&snapshot, id, &keys::version())?.unwrap_or(0);
-        let time = snapshot
-            .last_result(id)
-            .map_err(infrastructure)?
-            .map_or(0, |(time, _)| time);
         Ok(Self {
             id,
             term,
             version,
             applied,
-            time,
+            trailing: false,
             marks: HashMap::new(),
             delivered: HashMap::new(),
             max_inputs: inner.max_inputs,
@@ -266,24 +267,27 @@ impl Leader {
         mut pending: Vec<Pending>,
     ) -> bool {
         let snapshot = Arc::new(inner.store.snapshot());
-        // The batch is refined on this state, at its version: an entry an
-        // earlier leadership left may have applied since this one opened.
+        // The batch is refined on this state, at its version and no earlier
+        // than its time: an entry an earlier leadership left may have
+        // applied since this one opened.
         let read_state = read::<u64>(&snapshot, self.id, &keys::version()).and_then(|version| {
             let applied = snapshot
                 .applied(self.id)
                 .map_err(|error| Fault::Infrastructure(error.to_string()))?;
-            Ok((version, applied))
+            let floor = read::<u64>(&snapshot, self.id, &keys::batch_time())?;
+            Ok((version, applied, floor))
         });
-        match read_state {
-            Ok((version, applied)) => {
+        let floor = match read_state {
+            Ok((version, applied, floor)) => {
                 self.version = version.unwrap_or(0);
                 self.applied = applied.unwrap_or(0);
+                floor.unwrap_or(0)
             }
             Err(fault) => {
                 self.retry(inner, agent, pending, fault).await;
                 return true;
             }
-        }
+        };
         let senders: BTreeSet<AgentId> = pending
             .iter()
             .filter_map(|item| match item {
@@ -319,7 +323,7 @@ impl Leader {
         }
         let batch = Batch {
             version: self.version,
-            time: (inner.clock)().max(self.time),
+            time: self.time(inner, floor),
             seed: seed(),
             inputs: pending.iter().map(Pending::input).collect(),
         };
@@ -334,7 +338,6 @@ impl Leader {
             Ok(Ran::Done(result)) => {
                 self.skipped = false;
                 self.version += 1;
-                self.time = batch.time;
                 self.max_inputs = inner.max_inputs;
                 self.backoff = BACKOFF;
                 if !inner.hooks.after_commit(self.id, self.applied) {
@@ -376,6 +379,28 @@ impl Leader {
             Err(fault) => self.retry(inner, agent, pending, fault).await,
         }
         true
+    }
+
+    /// A batch's time: the node's clock, held at the agent's time, `floor`,
+    /// while the clock trails it. Leadership stays: every replica would
+    /// trail an agent a fast clock once led.
+    fn time(&mut self, inner: &Inner, floor: u64) -> u64 {
+        let clock = (inner.clock)();
+        let trailing = floor > clock.saturating_add(CLOCK_BOUND);
+        if trailing && !self.trailing {
+            tracing::error!(
+                agent = self.id.0,
+                behind_ms = floor - clock,
+                "this node's clock trails the agent's time; its batches are timed at the agent's"
+            );
+        } else if !trailing && self.trailing {
+            tracing::info!(
+                agent = self.id.0,
+                "this node's clock no longer trails the agent's time"
+            );
+        }
+        self.trailing = trailing;
+        clock.max(floor)
     }
 
     /// Refine `batch`, dry-run accumulate on the same state, propose the
@@ -567,7 +592,20 @@ impl Leader {
                 continue;
             };
             match item {
-                Pending::Request(_, answer) | Pending::Admin(_, answer, _) => {
+                Pending::Request(request, answer) => {
+                    let answered = match step {
+                        Step::Refused {
+                            code: refusal::SEQUENCE,
+                            ..
+                        } => self
+                            .duplicate(&snapshot, &request)
+                            .map(|duplicate| duplicate.unwrap_or_else(|| reply(step)))
+                            .map_err(|fault| CallError::Failed(fault.message().to_string())),
+                        _ => Ok(reply(step)),
+                    };
+                    let _ = answer.try_send(answered);
+                }
+                Pending::Admin(_, answer, _) => {
                     let _ = answer.try_send(Ok(reply(step)));
                 }
                 Pending::Message(message) => match step {
@@ -651,6 +689,33 @@ impl Leader {
             }
         }
         self.acknowledge(inner, acks);
+    }
+
+    /// The reply to `request`, refused out of its session's sequence, if it
+    /// is at or below the session's applied mark: a duplicate, answered
+    /// from the reply window, or `TooOld`. None for a gap.
+    ///
+    /// Ingress lets a duplicate through when it read the mark before this
+    /// replica applied the original, as a new leader's does while it
+    /// catches up: this answers it.
+    fn duplicate(
+        &self,
+        snapshot: &FjallSnapshot,
+        request: &Request,
+    ) -> Result<Option<Reply>, Fault> {
+        let Some(id) =
+            read::<SessionId>(snapshot, self.id, &keys::session_index(&request.session))?
+        else {
+            return Ok(None);
+        };
+        let Some(mark) = read::<SessionMark>(snapshot, self.id, &keys::session(id))? else {
+            return Ok(None);
+        };
+        if request.sequence > mark.sequence {
+            return Ok(None);
+        }
+        let kept = read::<Outcome>(snapshot, self.id, &keys::reply(id, request.sequence))?;
+        Ok(Some(kept.map_or(Reply::TooOld, Reply::Ran)))
     }
 
     /// Send the outbox's messages to `to` past those already delivered (or

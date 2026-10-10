@@ -8,12 +8,12 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use ed25519_dalek::SigningKey;
-use vos_node::client::{Client, Operator, Target};
+use vos_node::client::{self, Client, Operator, Target};
 use vos_node::tls::{IngressTls, Trust};
 use vos_node::{ADMIN_TOKEN, Config, NODE_KEY, Node, Space};
-use vos_wire::abi::refusal;
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, SessionId};
-use vos_wire::ingress::{Answer, Install, Rejection};
+use vos_wire::Encode;
+use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal};
+use vos_wire::ingress::{Answer, Install};
 use vos_wire::result::Outcome;
 use vos_wire::schema::Schema;
 
@@ -430,14 +430,14 @@ fn key_bytes(text: &str) -> Result<[u8; 32], String> {
         .map_err(|_| "a 32-byte key in hex".to_string())
 }
 
-/// A key's session on one node, kept next to the key file so calls go on
-/// in one session: its node, id, when it was opened, and each agent's next
-/// sequence.
+/// A key's sessions, kept next to the key file so calls go on in them:
+/// each agent's session, its identity once fetched, and a call that failed
+/// before its answer, by its digest, until it is answered.
+#[derive(Default)]
 struct Kept {
-    node: [u8; 32],
-    session: u64,
-    opened: u64,
-    next: HashMap<AgentId, u64>,
+    sessions: HashMap<AgentId, client::Kept>,
+    identities: HashMap<AgentId, [u8; 32]>,
+    pending: HashMap<AgentId, [u8; 32]>,
 }
 
 impl Kept {
@@ -447,23 +447,36 @@ impl Kept {
         PathBuf::from(path)
     }
 
-    fn load(key: &Path) -> Option<Self> {
-        let text = std::fs::read_to_string(Self::path(key)).ok()?;
-        let mut kept = Kept {
-            node: [0; 32],
-            session: 0,
-            opened: 0,
-            next: HashMap::new(),
+    /// What the key kept; nothing when there is no file, or one this
+    /// command did not write.
+    fn load(key: &Path) -> Self {
+        let Ok(text) = std::fs::read_to_string(Self::path(key)) else {
+            return Self::default();
         };
+        Self::parse(&text).unwrap_or_default()
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        let mut kept = Self::default();
+        let agent = |text: &str| text.parse().ok().map(AgentId);
         for line in text.lines() {
             let fields: Vec<&str> = line.split_whitespace().collect();
             match fields.as_slice() {
-                ["node", node] => kept.node = key_bytes(node).ok()?,
-                ["session", session] => kept.session = session.parse().ok()?,
-                ["opened", opened] => kept.opened = opened.parse().ok()?,
-                ["next", agent, sequence] => {
-                    kept.next
-                        .insert(AgentId(agent.parse().ok()?), sequence.parse().ok()?);
+                ["session", id, name, t0, next] => {
+                    let name = hex::decode(name).ok()?.try_into().ok()?;
+                    let session = client::Kept {
+                        name,
+                        t0: t0.parse().ok()?,
+                        next: next.parse().ok()?,
+                    };
+                    kept.sessions.insert(agent(id)?, session);
+                }
+                ["identity", id, identity] => {
+                    kept.identities
+                        .insert(agent(id)?, key_bytes(identity).ok()?);
+                }
+                ["pending", id, digest] => {
+                    kept.pending.insert(agent(id)?, key_bytes(digest).ok()?);
                 }
                 _ => return None,
             }
@@ -472,30 +485,30 @@ impl Kept {
     }
 
     fn save(&self, key: &Path) -> Result<(), String> {
-        let mut text = format!(
-            "node {}\nsession {}\nopened {}\n",
-            hex::encode(self.node),
-            self.session,
-            self.opened
-        );
-        for (agent, sequence) in &self.next {
-            text.push_str(&format!("next {} {sequence}\n", agent.0));
+        let mut text = String::new();
+        for (agent, session) in &self.sessions {
+            text.push_str(&format!(
+                "session {} {} {} {}\n",
+                agent.0,
+                hex::encode(session.name),
+                session.t0,
+                session.next
+            ));
         }
-        std::fs::write(Self::path(key), text).map_err(|error| error.to_string())
+        for (agent, identity) in &self.identities {
+            text.push_str(&format!("identity {} {}\n", agent.0, hex::encode(identity)));
+        }
+        for (agent, digest) in &self.pending {
+            text.push_str(&format!("pending {} {}\n", agent.0, hex::encode(digest)));
+        }
+        // Replaced whole: a write cut short must not lose a pending call.
+        let path = Self::path(key);
+        let mut partial = path.clone().into_os_string();
+        partial.push(".partial");
+        std::fs::write(&partial, text)
+            .and_then(|()| std::fs::rename(&partial, &path))
+            .map_err(|error| format!("{}: {error}", path.display()))
     }
-}
-
-/// Open a new session, signed later than the key's last open.
-fn open(node: &Target, key: &SigningKey, last: u64) -> Result<(Client, Kept), String> {
-    let time = vos_node::wall_clock().max(last + 1);
-    let client = Client::open(node, key.clone(), time).map_err(failed)?;
-    let kept = Kept {
-        node: client.node().0,
-        session: client.session().0,
-        opened: time,
-        next: HashMap::new(),
-    };
-    Ok((client, kept))
 }
 
 fn invoke(call: &CallArgs, query: bool) -> Result<(), String> {
@@ -506,48 +519,50 @@ fn invoke(call: &CallArgs, query: bool) -> Result<(), String> {
     let agent = AgentId(call.agent);
     let instance = InstanceId(call.instance);
     let target = call.node.target()?;
-    let node = vos_node::client::node_id(&target).map_err(failed)?;
-    let kept = Kept::load(&call.key).filter(|kept| kept.node == node.0);
-    let last = kept.as_ref().map_or(0, |kept| kept.opened);
-    let (mut client, mut kept) = match kept {
-        Some(kept) => (
-            Client::resume(
-                &target,
-                key.clone(),
-                node,
-                SessionId(kept.session),
-                kept.next.clone(),
-            ),
-            kept,
-        ),
-        None => open(&target, &key, last)?,
-    };
+    let mut kept = Kept::load(&call.key);
+    let mut client = Client::resume(&target, key, kept.sessions.clone(), kept.identities.clone());
     let schema = client
         .schema(agent, instance)
         .map_err(failed)?
         .ok_or_else(|| format!("nothing is installed as instance {}", call.instance))?;
     let method = method_named(&schema, &call.method)?;
-    let send = |client: &mut Client| {
-        if query {
-            let not_after = vos_node::wall_clock() + 60_000;
-            client.query(agent, instance, method, &arguments, not_after)
-        } else {
-            client.call(agent, instance, method, &arguments)
+    let answer = if query {
+        let not_after = vos_node::wall_clock() + 60_000;
+        client.query(agent, instance, method, &arguments, not_after)
+    } else {
+        // A call that failed before its answer goes again with its
+        // sequence, and is answered once. Another call leaves that session
+        // first, so the earlier one's answer is never taken for its own.
+        let digest =
+            vos_pvm::precompile::blake2b_256(&(instance, method, arguments.clone()).encode());
+        if kept
+            .pending
+            .remove(&agent)
+            .is_some_and(|pending| pending != digest)
+        {
+            client.renew(agent);
         }
-        .map_err(failed)
+        let answer = client.call(agent, instance, method, &arguments);
+        // Unanswered: the call may have run, or may yet.
+        if matches!(
+            answer,
+            Err(_) | Ok(Answer::Stopped | Answer::NotLeader { .. } | Answer::Unavailable)
+        ) {
+            kept.pending.insert(agent, digest);
+        }
+        answer
     };
-    let mut answer = send(&mut client)?;
-    // A session the node forgot or the agent let expire: open another.
-    if matches!(
-        answer,
-        Answer::Rejected(Rejection::UnknownSession) | Answer::Refused(refusal::EXPIRED)
-    ) {
-        (client, kept) = open(&target, &key, kept.opened)?;
-        answer = send(&mut client)?;
-    }
-    kept.next = client.next().clone();
+    kept.sessions = client.sessions();
+    kept.identities = client.identities();
     kept.save(&call.key)?;
-    print_answer(&answer)
+    match answer {
+        Ok(answer) => print_answer(&answer),
+        Err(error) if !query => Err(format!(
+            "{}; the call may have run: run it again to learn its answer",
+            failed(error)
+        )),
+        Err(error) => Err(failed(error)),
+    }
 }
 
 fn describe(answer: &Answer) -> String {

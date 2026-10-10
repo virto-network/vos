@@ -1,16 +1,16 @@
 //! What clients send a node's ingress and what it answers, and the bytes a
 //! client signs. A client is an ed25519 key; every signed message starts
-//! with a domain tag and the node's id, so a signature made for one node or
-//! one kind of message is good for no other.
+//! with a domain tag and the agent's identity, the hash of its creation
+//! record, so a signature made for one agent or one kind of message is good
+//! for no other, and every replica of the agent checks the same one.
 
 use alloc::string::String;
 use alloc::vec::Vec;
 use scale::{Decode, Encode};
 
-use crate::ids::{AgentId, InstanceId, MethodId, Principal, SessionId};
+use crate::ids::{AgentId, InstanceId, MethodId, Principal, Session};
 use crate::result::Outcome;
 
-pub const OPEN_DOMAIN: &[u8] = b"vos/session/1";
 pub const CALL_DOMAIN: &[u8] = b"vos/call/1";
 pub const QUERY_DOMAIN: &[u8] = b"vos/query/1";
 
@@ -18,26 +18,19 @@ pub const QUERY_DOMAIN: &[u8] = b"vos/query/1";
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct NodeId(pub [u8; 32]);
 
-/// `POST /sessions`: open a session for `key`, at the client's `time` in
-/// milliseconds since the Unix epoch.
+/// A node a client can call: its ingress address, and its key, which its
+/// TLS presents.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub struct Open {
-    pub key: [u8; 32],
-    pub time: u64,
-    pub signature: [u8; 64],
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub struct Opened {
+pub struct Contact {
+    pub address: String,
     pub node: NodeId,
-    pub session: SessionId,
 }
 
 /// `POST /agents/{agent}/calls`: a command, in its session's sequence for
-/// that agent.
+/// that agent. The session's key signs it.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Call {
-    pub session: SessionId,
+    pub session: Session,
     pub sequence: u64,
     pub instance: InstanceId,
     pub method: MethodId,
@@ -45,11 +38,11 @@ pub struct Call {
     pub signature: [u8; 64],
 }
 
-/// `POST /agents/{agent}/queries`: a query, good until `not_after` by the
-/// node's clock.
+/// `POST /agents/{agent}/queries`: a query by `key`, good until
+/// `not_after` by the node's clock.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct QueryCall {
-    pub session: SessionId,
+    pub key: [u8; 32],
     pub not_after: u64,
     pub instance: InstanceId,
     pub method: MethodId,
@@ -77,30 +70,28 @@ pub struct Grant {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum Rejection {
     #[codec(index = 0)]
-    UnknownSession,
-    #[codec(index = 1)]
     BadSignature,
     /// A duplicate whose reply the window no longer keeps.
-    #[codec(index = 2)]
+    #[codec(index = 1)]
     TooOld,
     /// A sequence past the next one; resend from `expected`.
-    #[codec(index = 3)]
+    #[codec(index = 2)]
     Gap { expected: u64 },
     /// More than the reply window past the applied mark: receive replies
     /// first.
-    #[codec(index = 4)]
+    #[codec(index = 3)]
     Ahead,
     /// A query past its `not_after`, or one too far ahead.
-    #[codec(index = 5)]
+    #[codec(index = 4)]
     StaleQuery,
-    /// An open whose time is off the node's clock or not after the key's
-    /// last open.
-    #[codec(index = 6)]
-    StaleOpen,
+    /// A new session whose creation time is too far from the agent's time,
+    /// `now`: start one with a time near it.
+    #[codec(index = 5)]
+    StaleSession { now: u64 },
     /// An operator command without the node's admin token.
-    #[codec(index = 7)]
+    #[codec(index = 6)]
     Unauthorized,
-    #[codec(index = 8)]
+    #[codec(index = 7)]
     Malformed,
 }
 
@@ -116,7 +107,7 @@ pub enum Answer {
     #[codec(index = 2)]
     Rejected(Rejection),
     /// Not consumed: the agent program failed on it alone. Resend the same
-    /// sequence, or open a new session.
+    /// sequence, or start a new session.
     #[codec(index = 3)]
     NotConsumed,
     #[codec(index = 4)]
@@ -133,14 +124,12 @@ pub enum Answer {
     /// again.
     #[codec(index = 8)]
     Unavailable,
-    /// This node does not lead the agent: call its leader, at this
-    /// ingress address when known.
+    /// This node does not lead the agent: call its leader, when known.
     #[codec(index = 9)]
-    NotLeader { leader: Option<String> },
-    /// This node does not replicate the agent: its replicas' ingress
-    /// addresses.
+    NotLeader { leader: Option<Contact> },
+    /// This node does not replicate the agent: call one of its replicas.
     #[codec(index = 10)]
-    Elsewhere { replicas: Vec<String> },
+    Elsewhere { replicas: Vec<Contact> },
     /// The operator's new agent, which a majority of its replicas does not
     /// hold yet: it reaches them as they return.
     #[codec(index = 11)]
@@ -154,34 +143,25 @@ pub struct Create {
     pub replicas: Vec<u8>,
 }
 
-fn message(domain: &[u8], node: &NodeId, fields: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
+fn message(domain: &[u8], identity: &[u8; 32], fields: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(domain);
-    bytes.extend_from_slice(&node.0);
+    bytes.extend_from_slice(identity);
     fields(&mut bytes);
     bytes
 }
 
-/// What a client signs to open a session.
-pub fn open_message(node: &NodeId, key: &[u8; 32], time: u64) -> Vec<u8> {
-    message(OPEN_DOMAIN, node, |bytes| {
-        bytes.extend_from_slice(key);
-        time.encode_to(bytes);
-    })
-}
-
-/// What a client signs for a call to `agent`.
+/// What a client signs for a call to the agent whose identity is
+/// `identity`.
 pub fn call_message(
-    node: &NodeId,
-    agent: AgentId,
-    session: SessionId,
+    identity: &[u8; 32],
+    session: &Session,
     sequence: u64,
     instance: InstanceId,
     method: MethodId,
     arguments: &[u8],
 ) -> Vec<u8> {
-    message(CALL_DOMAIN, node, |bytes| {
-        agent.encode_to(bytes);
+    message(CALL_DOMAIN, identity, |bytes| {
         session.encode_to(bytes);
         sequence.encode_to(bytes);
         instance.encode_to(bytes);
@@ -190,19 +170,18 @@ pub fn call_message(
     })
 }
 
-/// What a client signs for a query to `agent`.
+/// What a client signs for a query to the agent whose identity is
+/// `identity`.
 pub fn query_message(
-    node: &NodeId,
-    agent: AgentId,
-    session: SessionId,
+    identity: &[u8; 32],
+    key: &[u8; 32],
     not_after: u64,
     instance: InstanceId,
     method: MethodId,
     arguments: &[u8],
 ) -> Vec<u8> {
-    message(QUERY_DOMAIN, node, |bytes| {
-        agent.encode_to(bytes);
-        session.encode_to(bytes);
+    message(QUERY_DOMAIN, identity, |bytes| {
+        bytes.extend_from_slice(key);
         not_after.encode_to(bytes);
         instance.encode_to(bytes);
         method.encode_to(bytes);

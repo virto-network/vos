@@ -8,7 +8,9 @@ use core::cell::RefCell;
 
 use vos_wire::abi::{self, Kind, cap, code, failure, op, price, refusal};
 use vos_wire::batch::{Admin, Batch, Input, Query, Work};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, SessionId};
+use vos_wire::ids::{
+    AgentId, InstanceId, MethodId, Principal, ProgramHash, Session, SessionId, SessionRef,
+};
 use vos_wire::jam::RefineArgs;
 use vos_wire::records::{Installed, SessionMark, unstored};
 use vos_wire::result::{
@@ -17,7 +19,7 @@ use vos_wire::result::{
 use vos_wire::schema::Schema;
 use vos_wire::{Decode, Encode, defaults, keys};
 
-use crate::host::{STATE_SCAN, ecalli, gas, ptr, state_read, unserved};
+use crate::host::{STATE_SCAN, ecalli, gas, ptr, state_read, state_read_into, unserved};
 use crate::machines::{ARGUMENTS, Exit, Machine, Unavailable};
 
 /// Nested invocations a step may hold at once.
@@ -59,15 +61,21 @@ fn applied(key: &[u8]) -> Result<Option<Vec<u8>>, Corrupt> {
         .transpose()
 }
 
-/// An agent record of applied state.
+/// An agent record of applied state. A small one, as marks and ids are,
+/// is read and decoded on the stack.
 fn record<T: Decode>(key: &[u8]) -> Result<Option<T>, Corrupt> {
-    applied(key)?
-        .map(|bytes| {
-            T::decode(&bytes)
-                .map(|(value, _)| value)
-                .map_err(|_| Corrupt)
-        })
-        .transpose()
+    let decode = |bytes: &[u8]| {
+        let value = unstored(bytes).ok_or(Corrupt)?;
+        T::decode(value)
+            .map(|(value, _)| Some(value))
+            .map_err(|_| Corrupt)
+    };
+    let mut small = [0u8; 32];
+    match state_read_into(key, &mut small) {
+        None => Ok(None),
+        Some(len) if len <= small.len() => decode(&small[..len]),
+        Some(_) => state_read(key).map_or(Ok(None), |bytes| decode(&bytes)),
+    }
 }
 
 /// Applied rows under `prefix` after `after`, a page at a time.
@@ -149,8 +157,45 @@ impl Base {
 
 /// A mark a step advances once it is in the result.
 enum Mark {
-    Session(SessionId, SessionMark),
+    Session(Session, Held),
     Pair(AgentId, u64),
+}
+
+/// A request's session as this refine sees it: its id, none for a session
+/// the state does not hold, and its mark, none for one no step has
+/// created.
+type Held = (Option<SessionId>, Option<SessionMark>);
+
+/// A session as the in-batch map orders it: by its name as a number
+/// first, then its time, then its key, so sessions compare in a few
+/// instructions and one key's many sessions differ at once.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ByName(Session);
+
+impl PartialOrd for ByName {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ByName {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        u128::from_le_bytes(self.0.name)
+            .cmp(&u128::from_le_bytes(other.0.name))
+            .then(self.0.t0.cmp(&other.0.t0))
+            .then_with(|| self.0.key.cmp(&other.0.key))
+    }
+}
+
+/// A session as applied state holds it.
+fn held(session: &Session) -> Result<Held, Corrupt> {
+    match record::<SessionId>(&keys::session_index_key(session))? {
+        Some(id) => {
+            let mark = record::<SessionMark>(&keys::session(id))?.ok_or(Corrupt)?;
+            Ok((Some(id), Some(mark)))
+        }
+        None => Ok((None, None)),
+    }
 }
 
 fn run_batch(agent: AgentId, batch: Batch) -> Vec<u8> {
@@ -161,7 +206,7 @@ fn run_batch(agent: AgentId, batch: Batch) -> Vec<u8> {
         committed: BTreeMap::new(),
         installed: RefCell::new(BTreeMap::new()),
     };
-    let mut sessions: BTreeMap<SessionId, SessionMark> = BTreeMap::new();
+    let mut sessions: BTreeMap<ByName, Held> = BTreeMap::new();
     let mut pairs: BTreeMap<AgentId, u64> = BTreeMap::new();
     let mut result = ResultWriter::new(batch.version, batch.time, batch.seed);
     for (index, input) in batch.inputs.into_iter().enumerate() {
@@ -186,22 +231,34 @@ fn run_batch(agent: AgentId, batch: Batch) -> Vec<u8> {
         let admin = matches!(input, Input::Admin(_));
         let (step, mark) = match input {
             Input::Request(request) => {
+                let held = match sessions.get(&ByName(request.session)) {
+                    Some(held) => Ok(*held),
+                    None => held(&request.session),
+                };
+                // A session the state does not hold names itself whole.
+                let session = match held {
+                    Ok((Some(id), _)) => SessionRef::Known(id),
+                    _ => SessionRef::New(alloc::boxed::Box::new(request.session)),
+                };
                 let input = InputRef::Request {
-                    session: request.session,
+                    session,
                     sequence: request.sequence,
                 };
-                let mark = match sessions.get(&request.session) {
-                    Some(mark) => Ok(Some(*mark)),
-                    None => record::<SessionMark>(&keys::session(request.session)),
-                };
-                let refusal = match mark {
+                let refusal = match held {
                     Err(Corrupt) => Some(refusal::UNREADABLE),
-                    Ok(Some(mark))
+                    Ok((_, Some(mark)))
                         if base.time > mark.time.saturating_add(defaults::SESSION_EXPIRY_MS) =>
                     {
                         Some(refusal::EXPIRED)
                     }
-                    Ok(mark) if request.sequence != mark.map_or(1, |mark| mark.sequence + 1) => {
+                    Ok((_, None))
+                        if request.session.t0.abs_diff(base.time) > defaults::SESSION_SKEW_MS =>
+                    {
+                        Some(refusal::STALE_SESSION)
+                    }
+                    Ok((_, mark))
+                        if request.sequence != mark.map_or(1, |mark| mark.sequence + 1) =>
+                    {
                         Some(refusal::SEQUENCE)
                     }
                     Ok(_) => None,
@@ -222,7 +279,8 @@ fn run_batch(agent: AgentId, batch: Batch) -> Vec<u8> {
                         request.method,
                         &request.arguments,
                     );
-                    (step, Some(Mark::Session(request.session, mark)))
+                    let id = held.ok().and_then(|(id, _)| id);
+                    (step, Some(Mark::Session(request.session, (id, Some(mark)))))
                 }
             }
             Input::Message(message) => {
@@ -275,8 +333,8 @@ fn run_batch(agent: AgentId, batch: Batch) -> Vec<u8> {
             base.installed.borrow_mut().clear();
         }
         match mark {
-            Some(Mark::Session(session, mark)) => {
-                sessions.insert(session, mark);
+            Some(Mark::Session(session, held)) => {
+                sessions.insert(ByName(session), held);
             }
             Some(Mark::Pair(from, sequence)) => {
                 pairs.insert(from, sequence);

@@ -18,12 +18,19 @@ pub mod storage;
 pub mod store;
 pub mod tls;
 
-pub use ingress::SESSIONS_PER_KEY;
 pub use node::{ADMIN_TOKEN, CallError, Config, Error, NODE_KEY, Node, Peers, Reply, wall_clock};
 pub use space::{Space, SpaceNode};
 
+use vos_wire::Encode;
 use vos_wire::batch::Batch;
 use vos_wire::ids::AgentId;
+use vos_wire::peer::CreationRecord;
+
+/// The identity of the agent `record` creates: its record's hash. Clients
+/// sign for it, and its replica group is named by it.
+pub fn identity(record: &CreationRecord) -> [u8; 32] {
+    vos_pvm::precompile::blake2b_256(&record.encode())
+}
 
 /// Points where a test breaks the node as a crash or a bug would.
 pub trait Hooks: Send + Sync {

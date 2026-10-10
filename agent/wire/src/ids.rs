@@ -11,9 +11,31 @@ pub struct AgentId(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
 pub struct InstanceId(pub u32);
 
-/// A client session. The server assigns it and never reuses one.
+/// A session's compact number inside its agent: accumulate assigns it when
+/// it creates the session, and never reuses one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
 pub struct SessionId(pub u64);
+
+/// A client session, named by the client: its key, a random name, and
+/// its creation time in milliseconds since the Unix epoch. The three
+/// together are its identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
+pub struct Session {
+    pub key: [u8; 32],
+    pub name: [u8; 16],
+    pub t0: u64,
+}
+
+/// How a step names its session: by its compact id when the agent holds
+/// it, whole when the step creates it. Boxed, so every step does not carry
+/// a new session's size.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum SessionRef {
+    #[codec(index = 0)]
+    Known(SessionId),
+    #[codec(index = 1)]
+    New(alloc::boxed::Box<Session>),
+}
 
 /// A method of an actor, numbered by its schema.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]

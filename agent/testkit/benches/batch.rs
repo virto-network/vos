@@ -17,7 +17,7 @@ use vos_pvm::refine_host::{RefineContext, StateReader};
 use vos_pvm::{ExitReason, PvmBackend};
 use vos_wire::abi::cap;
 use vos_wire::batch::{Admin, Batch, Input, Request, Work};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, SessionId};
+use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, Session};
 use vos_wire::jam::{AccumulateInput, Operand, RefineArgs};
 use vos_wire::result::{Outcome, Step, WorkResult};
 use vos_wire::schema::Schema;
@@ -203,7 +203,11 @@ fn requests(
     (1..=count)
         .map(|sequence| {
             Input::Request(Request {
-                session: SessionId(1),
+                session: Session {
+                    key: [1; 32],
+                    name: [1; 16],
+                    t0: 1,
+                },
                 sequence,
                 caller: ALICE,
                 instance,

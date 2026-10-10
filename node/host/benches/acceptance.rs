@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use vos_node::{CallError, Config, Hooks, Node, Reply};
 use vos_wire::batch::{Batch, Request};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, SessionId};
+use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session};
 use vos_wire::result::Outcome;
 use vos_wire::schema::Schema;
 use vos_wire::{Decode, Encode};
@@ -50,8 +50,14 @@ fn method(program: &[u8], name: &str) -> MethodId {
 }
 
 fn increment(session: u64, sequence: u64, method: MethodId) -> Request {
+    // Every session starts when the bench does.
+    static START: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     Request {
-        session: SessionId(session),
+        session: Session {
+            key: [1; 32],
+            name: u128::from(session).to_be_bytes(),
+            t0: *START.get_or_init(vos_node::wall_clock),
+        },
         sequence,
         caller: ALICE,
         instance: COUNTER,

@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use vos_wire::ids::{AgentId, SessionId};
+use vos_wire::ids::AgentId;
 use vos_wire::peer::CreationRecord;
 use vos_wire::result::Write;
 
@@ -111,13 +111,6 @@ pub enum Change {
         time: u64,
         seed: [u8; 32],
     },
-    /// A client session opened for `key` at its `time`.
-    Session {
-        id: SessionId,
-        key: [u8; 32],
-        time: u64,
-    },
-    ForgetSession(SessionId),
 }
 
 impl Change {
@@ -382,8 +375,6 @@ impl Writer {
                     Change::LastResult { agent, time, seed } => {
                         batch.last_result(*agent, *time, seed)
                     }
-                    Change::Session { id, key, time } => batch.session(*id, key, *time),
-                    Change::ForgetSession(id) => batch.forget_session(*id),
                 }
             }
             taken.push((commit, None));

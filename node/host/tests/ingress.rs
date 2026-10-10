@@ -1,6 +1,6 @@
 //! The node's HTTP ingress, end to end on the default agent and the
-//! counter actor: sessions, signed calls in their sequences, the reply
-//! window, expiry, and the operator's token.
+//! counter actor: client-named sessions, signed calls in their sequences,
+//! the reply window, expiry, and the operator's token.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -15,7 +15,7 @@ use vos_wire::abi::refusal;
 use vos_wire::batch::{Batch, Input};
 use vos_wire::defaults;
 use vos_wire::ids::{AgentId, InstanceId, MethodId};
-use vos_wire::ingress::{Answer, Call, Install, Open, Rejection, open_message};
+use vos_wire::ingress::{Answer, Call, Install, Rejection};
 use vos_wire::result::Outcome;
 use vos_wire::schema::Schema;
 use vos_wire::{Decode, Encode};
@@ -59,6 +59,7 @@ struct Served {
     base: String,
     target: Target,
     clock: Arc<AtomicU64>,
+    token: String,
     agent: AgentId,
     increment: MethodId,
     value: MethodId,
@@ -105,6 +106,7 @@ impl Served {
             base,
             target,
             clock,
+            token,
             agent,
             increment: method(&schema, "increment"),
             value: method(&schema, "value"),
@@ -117,12 +119,14 @@ impl Served {
     }
 
     fn client(&self, seed: u8) -> Client {
-        Client::open(
-            &self.target,
-            SigningKey::from_bytes(&[seed; 32]),
-            self.now(),
-        )
-        .unwrap()
+        Client::new(&self.target, SigningKey::from_bytes(&[seed; 32]))
+    }
+
+    /// An increment through the client's own sequence.
+    fn call(&self, client: &mut Client, by: u64) -> Answer {
+        client
+            .call(self.agent, COUNTER, self.increment, &by.encode())
+            .unwrap()
     }
 
     fn increment(&self, client: &Client, sequence: u64, by: u64) -> Answer {
@@ -206,7 +210,9 @@ fn signatures_sessions_and_staleness_are_checked() {
     let agent = served.agent;
     let path = format!("/agents/{}/calls", agent.0);
 
-    let mut body = client.call_body(agent, 1, COUNTER, served.increment, &5u64.encode());
+    let mut body = client
+        .call_body(agent, 1, COUNTER, served.increment, &5u64.encode())
+        .unwrap();
     let (mut call, _) = Call::decode(&body).unwrap();
     call.arguments = 6u64.encode();
     assert_eq!(
@@ -214,18 +220,33 @@ fn signatures_sessions_and_staleness_are_checked() {
         Answer::Rejected(Rejection::BadSignature),
         "arguments changed after signing"
     );
+    // The session is in the signed bytes, and its key signs.
     call = Call::decode(&body).unwrap().0;
-    call.session.0 += 1000;
+    call.session.name[0] ^= 1;
     assert_eq!(
         served.post(&path, &call.encode()),
-        Answer::Rejected(Rejection::UnknownSession)
+        Answer::Rejected(Rejection::BadSignature)
     );
-    // Signed for one agent, sent to another: the agent is in the signed
-    // bytes.
-    let elsewhere = format!("/agents/{}/calls", agent.0 + 1);
+    call = Call::decode(&body).unwrap().0;
+    call.session.key = SigningKey::from_bytes(&[2; 32]).verifying_key().to_bytes();
+    assert_eq!(
+        served.post(&path, &call.encode()),
+        Answer::Rejected(Rejection::BadSignature)
+    );
+    // Signed for one agent, sent to another: the agent's identity is in
+    // the signed bytes.
+    let operator = Operator::new(&served.target, &served.token);
+    let Ok(Answer::Created(other)) = operator.create_agent(Vec::new()) else {
+        panic!("another agent")
+    };
+    let elsewhere = format!("/agents/{}/calls", other.0);
     assert_eq!(
         served.post(&elsewhere, &body),
         Answer::Rejected(Rejection::BadSignature)
+    );
+    assert_eq!(
+        served.post(&format!("/agents/{}/calls", other.0 + 1), &body),
+        Answer::NoAgent
     );
     body.truncate(body.len() - 1);
     assert_eq!(
@@ -233,29 +254,38 @@ fn signatures_sessions_and_staleness_are_checked() {
         Answer::Rejected(Rejection::Malformed)
     );
 
-    // A captured open cannot be replayed, nor signed far off the clock.
-    let key = SigningKey::from_bytes(&[9; 32]);
-    let node = vos_node::client::node_id(&served.target).unwrap();
-    let public = key.verifying_key().to_bytes();
-    let open = |time: u64| {
-        use ed25519_dalek::Signer;
-        Open {
-            key: public,
-            time,
-            signature: key.sign(&open_message(&node, &public, time)).to_bytes(),
-        }
-        .encode()
+    // A new session must start near the agent's time, which the refusal
+    // gives.
+    let stale = |t0: u64| {
+        let mut call = Call::decode(
+            &client
+                .call_body(agent, 1, COUNTER, served.increment, &1u64.encode())
+                .unwrap(),
+        )
+        .unwrap()
+        .0;
+        call.session.t0 = t0;
+        let key = SigningKey::from_bytes(&[1; 32]);
+        let identity = client.identity(agent).unwrap();
+        let message = vos_wire::ingress::call_message(
+            &identity,
+            &call.session,
+            call.sequence,
+            call.instance,
+            call.method,
+            &call.arguments,
+        );
+        call.signature = ed25519_dalek::Signer::sign(&key, &message).to_bytes();
+        served.post(&path, &call.encode())
     };
-    let first = open(served.now());
-    assert_eq!(served.status("/sessions", &first), 200);
-    assert_eq!(
-        served.post("/sessions", &first),
-        Answer::Rejected(Rejection::StaleOpen)
-    );
-    assert_eq!(
-        served.post("/sessions", &open(served.now() + 120_000)),
-        Answer::Rejected(Rejection::StaleOpen)
-    );
+    let now = served.now();
+    for t0 in [
+        now - defaults::SESSION_SKEW_MS - 1,
+        now + defaults::SESSION_SKEW_MS + 1,
+    ] {
+        assert_eq!(stale(t0), Answer::Rejected(Rejection::StaleSession { now }));
+    }
+    assert_eq!(done(stale(now - defaults::SESSION_SKEW_MS + 1_000)), 1);
 
     let now = served.now();
     let query = |not_after| {
@@ -268,20 +298,18 @@ fn signatures_sessions_and_staleness_are_checked() {
         query(now + 600_000),
         Answer::Rejected(Rejection::StaleQuery)
     );
-    assert_eq!(done(query(now + 1_000)), 0);
+    assert_eq!(done(query(now + 1_000)), 1);
 }
 
-impl Served {
-    fn status(&self, path: &str, body: &[u8]) -> u16 {
-        vos_node::client::post(&self.target, path, body).unwrap().0
-    }
-}
-
+/// An expired session is refused for good: the client starts another,
+/// and when its clock is off the agent's, starts it again at the time the
+/// refusal gives.
 #[test]
-fn an_expired_session_is_refused() {
+fn an_expired_session_is_refused_and_the_client_starts_another() {
     let served = Served::start(Arc::new(vos_node::NoHooks));
-    let client = served.client(1);
-    assert_eq!(done(served.increment(&client, 1, 5)), 5);
+    let mut client = served.client(1);
+    assert_eq!(done(served.call(&mut client, 5)), 5);
+    let first = client.session(served.agent);
     served
         .clock
         .fetch_add(defaults::SESSION_EXPIRY_MS + 1, Ordering::SeqCst);
@@ -289,8 +317,14 @@ fn an_expired_session_is_refused() {
         served.increment(&client, 2, 1),
         Answer::Refused(refusal::EXPIRED)
     );
-    let renewed = served.client(1);
-    assert_eq!(done(served.increment(&renewed, 1, 1)), 6);
+    assert_eq!(done(served.call(&mut client, 1)), 6);
+    let renewed = client.session(served.agent);
+    assert_ne!(renewed, first);
+    assert!(
+        renewed.t0.abs_diff(served.now()) <= defaults::SESSION_SKEW_MS,
+        "started at the agent's time"
+    );
+    assert_eq!(client.sessions()[&served.agent].next, 2);
 }
 
 #[test]
@@ -300,13 +334,15 @@ fn pipelined_requests_recover_their_lost_replies() {
     let address: SocketAddr = served.base.trim_start_matches("http://").parse().unwrap();
     let mut stream = TcpStream::connect(address).unwrap();
     for (sequence, by) in [(1u64, 1u64), (2, 2), (3, 3)] {
-        let body = client.call_body(
-            served.agent,
-            sequence,
-            COUNTER,
-            served.increment,
-            &by.encode(),
-        );
+        let body = client
+            .call_body(
+                served.agent,
+                sequence,
+                COUNTER,
+                served.increment,
+                &by.encode(),
+            )
+            .unwrap();
         let head = format!(
             "POST /agents/{}/calls HTTP/1.1\r\nHost: node\r\nContent-Length: {}\r\n\r\n",
             served.agent.0,

@@ -11,11 +11,11 @@ use vos_node::store::{EntryKind, Store, View};
 use vos_node::{CallError, Config, Hooks, Node, Reply};
 use vos_wire::abi::refusal;
 use vos_wire::batch::{Batch, Input, Message, Request};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, SessionId};
+use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session};
 use vos_wire::records::unstored;
 use vos_wire::result::Outcome;
 use vos_wire::schema::Schema;
-use vos_wire::{Decode, Encode, keys};
+use vos_wire::{Decode, Encode, defaults, keys};
 
 const COUNTER: InstanceId = InstanceId(1);
 const ALICE: Principal = Principal::Client([1; 32]);
@@ -53,15 +53,31 @@ impl Programs {
     }
 }
 
-/// Requests in one session, numbered in order.
-struct Session(u64);
+/// Requests in one new session of Alice's, numbered in order.
+struct Requests {
+    session: Session,
+    sequence: u64,
+}
 
-impl Session {
+impl Requests {
+    fn new() -> Self {
+        static NAMES: AtomicU64 = AtomicU64::new(0);
+        let name = NAMES.fetch_add(1, Ordering::SeqCst);
+        Self {
+            session: Session {
+                key: [1; 32],
+                name: u128::from(name).to_be_bytes(),
+                t0: vos_node::wall_clock(),
+            },
+            sequence: 0,
+        }
+    }
+
     fn request<A: Encode>(&mut self, method: MethodId, arguments: A) -> Request {
-        self.0 += 1;
+        self.sequence += 1;
         Request {
-            session: SessionId(1),
-            sequence: self.0,
+            session: self.session,
+            sequence: self.sequence,
             caller: ALICE,
             instance: COUNTER,
             method,
@@ -147,7 +163,7 @@ fn calls_apply_and_survive_a_restart() {
     let programs = Programs::load();
     let dir = tempfile::tempdir().unwrap();
     let increment = programs.method("increment");
-    let mut session = Session(0);
+    let mut session = Requests::new();
     let agent = {
         let node = Node::open(dir.path(), config(&programs, Arc::new(vos_node::NoHooks))).unwrap();
         let agent = counter_agent(&node, &programs);
@@ -225,7 +241,7 @@ fn no_reply_before_its_commit_is_durable_and_a_full_queue_is_busy() {
     let node = Node::open(dir.path(), config).unwrap();
     let agent = counter_agent(&node, &programs);
     let increment = programs.method("increment");
-    let mut session = Session(0);
+    let mut session = Requests::new();
 
     gate.hold();
     let reached = gate.reached.load(Ordering::SeqCst);
@@ -275,7 +291,7 @@ fn a_failing_refine_isolates_its_input() {
     let node = Node::open(dir.path(), config(&programs, Arc::new(Poison(poison)))).unwrap();
     let agent = counter_agent(&node, &programs);
     let increment = programs.method("increment");
-    let mut session = Session(0);
+    let mut session = Requests::new();
     // Queued together, they share a batch until it fails.
     let calls: Vec<_> = [1u64, 666, 2, 3]
         .into_iter()
@@ -318,6 +334,35 @@ impl Hooks for PanicOnce {
     }
 }
 
+/// A duplicate that reaches the leader, past ingress, is answered as its
+/// original was, from the reply window, and runs no more; one the window
+/// no longer keeps is too old; a gap is refused.
+#[test]
+fn the_leader_answers_a_duplicate_from_the_reply_window() {
+    let programs = Programs::load();
+    let increment = programs.method("increment");
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::open(dir.path(), config(&programs, Arc::new(vos_node::NoHooks))).unwrap();
+    let agent = counter_agent(&node, &programs);
+    let call = |request: &Request| smol::block_on(node.call(agent, request.clone()));
+    let mut session = Requests::new();
+    let first = session.request(increment, 5u64);
+    assert_eq!(done::<u64>(call(&first)), 5);
+    assert_eq!(done::<u64>(call(&first)), 5, "from the window");
+    for _ in 0..defaults::REPLY_WINDOW {
+        done::<u64>(call(&session.request(increment, 1u64)));
+    }
+    assert_eq!(call(&first), Ok(Reply::TooOld));
+    let mut gap = session.request(increment, 1u64);
+    gap.sequence += 1;
+    assert_eq!(call(&gap), Ok(Reply::Refused(refusal::SEQUENCE)));
+    assert_eq!(
+        value(&node, &programs, agent),
+        5 + defaults::REPLY_WINDOW,
+        "the duplicates ran no more"
+    );
+}
+
 /// The node, not an input, failed the batch: it is retried whole, as one
 /// batch, and no input is dropped.
 #[test]
@@ -329,7 +374,7 @@ fn a_panicking_executor_retries_the_batch_whole() {
     let node = Node::open(dir.path(), config(&programs, panics.clone())).unwrap();
     let agent = counter_agent(&node, &programs);
     panics.0.store(true, Ordering::SeqCst);
-    let mut session = Session(0);
+    let mut session = Requests::new();
     let calls: Vec<_> = [1u64, 2, 3]
         .into_iter()
         .map(|by| node.call(agent, session.request(increment, by)))
@@ -359,7 +404,7 @@ fn a_failed_commit_stops_the_node_and_a_restart_recovers() {
         let node = Node::open(dir.path(), config(&programs, commits.clone())).unwrap();
         let agent = counter_agent(&node, &programs);
         commits.0.store(1, Ordering::SeqCst);
-        let mut session = Session(0);
+        let mut session = Requests::new();
         let calls: Vec<_> = [1u64, 2, 3]
             .into_iter()
             .map(|by| node.call(agent, session.request(increment, by)))
@@ -375,7 +420,7 @@ fn a_failed_commit_stops_the_node_and_a_restart_recovers() {
     let node = Node::open(dir.path(), config(&programs, Arc::new(vos_node::NoHooks))).unwrap();
     assert_eq!(value(&node, &programs, agent), 0);
     assert_eq!(results(&node, agent), 1, "only the install applied");
-    let mut session = Session(0);
+    let mut session = Requests::new();
     assert_eq!(
         done::<u64>(smol::block_on(
             node.call(agent, session.request(increment, 4u64))
@@ -392,7 +437,7 @@ fn agents_exchange_messages_and_acks_clear_outboxes() {
     let sender = counter_agent(&node, &programs);
     let target = counter_agent(&node, &programs);
     let forward = programs.method("forward");
-    let mut session = Session(0);
+    let mut session = Requests::new();
     for by in [5u64, 7] {
         let call = node.call(sender, session.request(forward, (target.0, COUNTER.0, by)));
         assert_eq!(done::<u64>(smol::block_on(call)), by);
@@ -450,7 +495,7 @@ fn a_stop_before_delivery_delivers_on_restart() {
     let programs = Programs::load();
     let dir = tempfile::tempdir().unwrap();
     let forward = programs.method("forward");
-    let mut session = Session(0);
+    let mut session = Requests::new();
     {
         // The sender's second batch, at 3, is the forward: stop before
         // delivery.
@@ -478,7 +523,7 @@ fn a_stop_before_the_ack_redelivers_and_applies_once() {
     let programs = Programs::load();
     let dir = tempfile::tempdir().unwrap();
     let forward = programs.method("forward");
-    let mut session = Session(0);
+    let mut session = Requests::new();
     {
         // The target's second batch, at 3, applies the message: stop
         // before its ack.
@@ -520,7 +565,7 @@ fn redelivery_while_the_sender_sends_more_applies_each_once() {
     let programs = Programs::load();
     let dir = tempfile::tempdir().unwrap();
     let forward = programs.method("forward");
-    let mut session = Session(0);
+    let mut session = Requests::new();
     {
         // The target stops after its first commit of messages, at 3,
         // whichever of the three it held.

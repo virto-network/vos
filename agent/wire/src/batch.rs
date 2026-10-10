@@ -3,7 +3,7 @@
 use alloc::vec::Vec;
 use scale::{Decode, Encode};
 
-use crate::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, SessionId};
+use crate::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, Session};
 
 /// A refine's work item payload: a batch through the log, or a query on
 /// applied state.
@@ -62,7 +62,7 @@ pub enum Input {
 /// A client request, in its session's sequence for this agent.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Request {
-    pub session: SessionId,
+    pub session: Session,
     pub sequence: u64,
     pub caller: Principal,
     pub instance: InstanceId,

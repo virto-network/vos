@@ -2227,7 +2227,9 @@ Also done:
 - the dry run is keyed by the applied index of the snapshot the batch
   is refined on.
 
-#### 3.5b Sessions in the agent
+### 3.5b: sessions in the agent
+
+#### Design
 
 The plan's "Sessions" section, made concrete, without 3.6's expiry,
 collection and caps.
@@ -2386,3 +2388,168 @@ duplicates, which it now is (above). Also folded in:
 - a batch below the mark is an invariant failure, not bisected;
 - `Known`/`New` session references;
 - the live-session count for 3.6.
+
+#### Built
+
+- **The wire** (`vos-wire`):
+  - `Session { key, name, t0 }`, and `SessionRef::{Known(id), New(session)}`
+    in a step's `InputRef`, the new session boxed so every step does not
+    carry its size;
+  - a `Request` carries its session whole;
+  - `SessionMark` stays `{ sequence, time }`: the session's whole is
+    written once, under `session_of(id)`, when accumulate creates it (for
+    3.6's collection). With the whole in the mark, accumulate had to read
+    the mark of every request to rewrite it;
+  - new system keys: `session_index`, `session_of`, `next_session`,
+    `live_sessions`, `batch_time`, and `SESSION_SKEW_MS` (60 s);
+  - the codec encodes a `Box<T>` as its `T`;
+  - `Open`, `Opened`, `UnknownSession` and `StaleOpen` are gone;
+    `Rejection::StaleSession { now }` and `refusal::STALE_SESSION` are
+    new;
+  - `call_message` and `query_message` sign over the agent's identity; a
+    query carries a key;
+  - `NotLeader` and `Elsewhere` carry `Contact { address, node }`;
+  - `STEP_RESULT`'s envelope is 128 bytes, for a new session's 57.
+- **The default agent:**
+  - refine finds a session by its triple (`session_index`, then its
+    mark), names it `Known` or `New`, and refuses a new one outside the
+    skew `STALE_SESSION`, before the sequence check;
+  - accumulate skips a result timed before `batch_time`, or holding a
+    new session outside the skew, whole (version and all: the leader's
+    dry run then fails as an invariant). It creates a step's new session
+    before its writes (id, index, whole, live count). A `Known` step
+    reads nothing: the version check stands for refine's reads, as it
+    does for pair marks;
+  - refine's batch map orders sessions by name as a number, then time,
+    then key, with no copies: the derived order compared the 32-byte key
+    first, and a tuple order copied both sessions per comparison;
+  - small records (ids, marks) are read and decoded on the stack
+    (`state_read_into`), and the index key is built without an
+    allocation.
+- **The node:**
+  - the session registry, `POST /sessions`, its rows and the per-key cap
+    are gone;
+  - `GET /agents/{id}` answers the creation record, and
+    `vos_node::identity(record)` is its hash;
+  - ingress first asks `Inner::leading`: a replica that does not lead
+    answers where the leader is, before the signature or the lanes. The
+    lanes are keyed by (agent, session) and read the agent's state
+    through `session_index`;
+  - a session the agent does not hold, with a t0 outside the skew of
+    max(clock, `batch_time`), is rejected `StaleSession { now }`;
+  - the leader reads `batch_time` with the version per batch and times
+    the batch at max(clock, it), logging once when its clock trails by
+    more than 10 s;
+  - a request refined `SEQUENCE` at or below its applied mark is
+    answered from the window, or `Reply::TooOld`.
+- **The client** (`client.rs`):
+  - one session per agent, named and timed by the client (`Kept`), and
+    the agent's identity fetched once;
+  - `call` follows `NotLeader` and `Elsewhere` (up to 4 times), trusting
+    the next node as it trusts nodes: by the same CAs, or pinned by the
+    key the redirecting node gave;
+  - it starts a new session on `EXPIRED`, `STALE_SESSION` or
+    `StaleSession` (up to 2 times), taking the node's time as an offset
+    to its clock.
+- **The CLI** keeps `session <agent> <name> <t0> <next>` and
+  `identity <agent> <hex>` beside the key, replacing the file whole. A
+  call left unanswered (an error, `Stopped`, `NotLeader`, `Unavailable`)
+  is kept as `pending <agent> <digest>`: the same call again goes with
+  its sequence, and another call first starts a new session, so it never
+  takes the earlier one's answer.
+
+**Found by the checker, and fixed:** right after a failover, a new
+leader's ingress read a mark that trailed what the old leader had
+answered, so a client's next request was answered `Gap`. Ingress now
+waits until the leader has applied its term's no-op (everything its
+predecessors committed) before it reads a mark, for 10 s at most
+(`Unavailable` after). With that, the leader's
+own duplicate answer is a second line: the checker reaches it only when
+ingress lets a duplicate through.
+
+**Tests:**
+- **Agent** (`tests/agent.rs`): sessions named by their triple and
+  created by accumulate (`Known`/`New` references, ids never reused,
+  the session's whole under its id, the live count, `STALE_SESSION`
+  both sides of the skew, a new session starting at 1, another t0
+  another session); accumulate skipping a stale new session, and a
+  result timed before the agent's time. The pricing test measures `send` over eight steps:
+  over one, the heap's growth weighed on 16 sends and the measure moved
+  with the request's size.
+- **Ingress:** a changed session name or key fails the signature; a body
+  signed for one agent fails at another; `StaleSession { now }` both
+  sides of the skew; an expired session renewed by the client at the
+  node's time.
+- **Node:** the leader answers a duplicate past ingress from the window,
+  `TooOld` past it, and refuses a gap.
+- **The exactly-once checker** (`tests/exactly_once.rs`): three nodes on
+  a hub serving HTTP at the addresses their space names, three clients
+  each at its own agent (so every answer is the running total of its
+  amounts), each starting a new session every 32–60 requests (about 100
+  a run), one request at a time or four in flight on their own
+  connections. Sixteen faults per run, seeded: stops; a stop between
+  the leader's apply and its answer (`after_commit`); a node isolated;
+  loss and delay; a clock 15 s ahead or behind. Checks: every answer the
+  running total, no unexpected answer (`Gap` only for a pipelined
+  request that passed its predecessor), the answering replica's mark at
+  or past the sequence, every replica's counter the sum at the end. A
+  run answers about 2,500 requests one at a time and 4,500 pipelined in
+  about 8 s each. Before the fix above, four seeds of twelve failed with
+  `Gap`; since, 24 seeds have passed.
+- **Also over HTTP:** a client sent to a follower calls the leader from
+  then on; a leader whose clock trails by 30 s times its batches at the
+  agent's time and goes on leading.
+- **Mutations, each caught:**
+  - answering on commit, before the leader's apply: "answered sequence
+    3 at mark 2";
+  - no catch-up wait at ingress: `Gap`;
+  - ingress letting duplicates through: the leader's duplicate answer
+    keeps the checker passing; without it too, `Refused(SEQUENCE)`. The
+    node test catches the leader's answer missing alone;
+  - no time floor at the leader: the trailing leader's call is
+    `Stopped`.
+
+**Cost** (acceptance bench on a space of one, against the 3.5a commit on
+the same machine and session; 256 sessions, about 190 a batch, so nearly
+every request is its session's first in its batch):
+- first build: 39.0–39.9 µs per request against 28.1–32.1. Refine gas
+  per request was 132.9k against 95.1k, and accumulate's 26.3k against
+  23.7k;
+- the batch map's order, small reads on the stack, the stack-built key,
+  the mark without the session and the boxed new session bring refine to
+  99.1k (+4%) and accumulate to 24.1k (+2%);
+- **what remains: 32.6–34.5 µs against 30.8–31.2,** all in refine's wall
+  time (20.2–20.6 µs per request against 17.8–18.3; the dry run and the
+  decode are even). It is the second read a request's session costs
+  (triple to id, then the mark): cheap in gas, but a store lookup and a
+  host call each. Ingress pays the same second read per call.
+- **The way to remove it:** keep the mark in the index row, so one read by
+  triple gives id and mark, and have each step carry its session whole
+  (and its id), so accumulate writes that row without reading. That costs
+  56 bytes more per request in the log, which `Known`/`New` was made to
+  avoid. Left for review.
+
+**Review** (Opus): go, with no blocking issue. Folded in before the
+commit:
+- a redirect keeps the client's trust: a client that trusts CAs no longer
+  pins the key it is given, which fails against a node serving a
+  certificate from files;
+- the CLI counts `Unavailable` as unanswered (the leader's duplicate
+  answer fails that way when it cannot read), and writes its file whole;
+- the checker's clients rotate sessions, so a session's first request
+  meets failovers;
+- accumulate skips a whole result holding a stale new session, not the
+  step alone: later steps were refined as if it ran;
+- the catch-up wait is bounded.
+
+Accepted: the mark without the session, the boxed `New`, the pricing
+test over eight steps, and the cost (about 8% on a space of one, inside
+the replicated budget; revisit with 3.10's pipelining).
+
+**Left for later:**
+- `query` does not follow `Elsewhere` (3.5c's queries);
+- the checker could mix two clients on one agent (`Known` and `New` in
+  one batch), and run over TLS with pinned clients;
+- a clock far enough off for `StaleSession` under failures: the jumps
+  stay within the skew.
+

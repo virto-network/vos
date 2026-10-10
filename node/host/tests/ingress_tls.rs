@@ -75,19 +75,19 @@ fn a_client_pins_the_node_s_key() {
     let pinned = Target::new(&url, Trust::NodeKey(node.id().0)).unwrap();
     assert_eq!(vos_node::client::node_id(&pinned).unwrap(), node.id());
     let token = std::fs::read_to_string(dir.path().join(ADMIN_TOKEN)).unwrap();
-    assert!(matches!(
-        Operator::new(&pinned, &token)
-            .create_agent(Vec::new())
-            .unwrap(),
-        Answer::Created(_)
-    ));
-    let client = Client::open(
-        &pinned,
-        SigningKey::from_bytes(&[3; 32]),
-        vos_node::wall_clock(),
-    )
-    .unwrap();
-    assert_eq!(client.node(), node.id());
+    let Answer::Created(agent) = Operator::new(&pinned, &token)
+        .create_agent(Vec::new())
+        .unwrap()
+    else {
+        panic!("an agent")
+    };
+    // A client signs for the agent's identity, its record's hash.
+    let client = Client::new(&pinned, SigningKey::from_bytes(&[3; 32]));
+    let record = vos_node::client::record(&pinned, agent)
+        .unwrap()
+        .expect("its record");
+    assert_eq!(record.agent, agent);
+    assert_eq!(client.identity(agent).unwrap(), vos_node::identity(&record));
 
     // Another key is refused in the handshake, before any request.
     let other = SigningKey::from_bytes(&[4; 32]).verifying_key().to_bytes();
@@ -173,12 +173,7 @@ fn a_repeatable_request_survives_the_node_restarting_under_a_kept_connection() {
     let node = open(dir.path(), None);
     let address = node.serve("127.0.0.1:0".parse().unwrap()).unwrap();
     let target = Target::loopback(&format!("http://{address}")).unwrap();
-    let client = Client::open(
-        &target,
-        SigningKey::from_bytes(&[5; 32]),
-        vos_node::wall_clock(),
-    )
-    .unwrap();
+    let client = Client::new(&target, SigningKey::from_bytes(&[5; 32]));
     let nothing = |client: &Client| {
         client
             .schema(vos_wire::ids::AgentId(1), vos_wire::ids::InstanceId(1))

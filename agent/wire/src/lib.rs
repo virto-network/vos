@@ -31,6 +31,9 @@ pub mod defaults {
     /// A session expires after this much work-result time without a
     /// request, in milliseconds.
     pub const SESSION_EXPIRY_MS: u64 = 60 * 60 * 1000;
+    /// A new session's creation time must be this close to the work
+    /// result's time, in milliseconds.
+    pub const SESSION_SKEW_MS: u64 = 60 * 1000;
     /// A handler's gas limit when its schema declares none: about 500
     /// gets, 150 puts or 5,000 register-only operations, or about 16,000
     /// BLAKE2b compressions.

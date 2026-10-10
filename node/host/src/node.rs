@@ -24,11 +24,11 @@ use vos_pvm::pool::{CodeHash, MachinePool, OuterMachines};
 use vos_raft::Role;
 use vos_wire::batch::{Admin, Input, Message, Query, Request, Work};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash};
-use vos_wire::ingress::NodeId;
+use vos_wire::ingress::{Contact, NodeId};
 use vos_wire::peer::{CreationRecord, NodeNumber};
 use vos_wire::records::unstored;
 use vos_wire::result::{Outcome, Step, Write};
-use vos_wire::{Decode, Encode, defaults};
+use vos_wire::{Decode, defaults};
 
 use crate::Hooks;
 use crate::blobs::Blobs;
@@ -116,6 +116,8 @@ pub enum Reply {
     Refused(u32),
     /// The agent program fails on a batch holding this input alone.
     Failed,
+    /// A duplicate whose reply the window no longer keeps.
+    TooOld,
 }
 
 /// Why a call has no reply.
@@ -128,12 +130,10 @@ pub enum CallError {
     Stopped,
     /// Storage or the agent program failed.
     Failed(String),
-    /// This node does not lead the agent: its leader's ingress address,
-    /// when known.
-    NotLeader(Option<String>),
-    /// This node does not replicate the agent: its replicas' ingress
-    /// addresses.
-    Elsewhere(Vec<String>),
+    /// This node does not lead the agent: its leader, when known.
+    NotLeader(Option<Contact>),
+    /// This node does not replicate the agent: its replicas.
+    Elsewhere(Vec<Contact>),
     /// The agent is created, but a majority of its replicas does not hold
     /// its record yet: it reaches them as they return.
     Unconfirmed(AgentId),
@@ -312,6 +312,9 @@ pub(crate) struct Run {
     tasks: Mutex<Vec<smol::Task<()>>>,
 }
 
+/// How long a call waits for a new leader to apply what it took over.
+const CATCH_UP: Duration = Duration::from_secs(10);
+
 /// A group's inbox: Raft messages beyond it are dropped, and resent.
 const GROUP_INBOX: usize = 1024;
 
@@ -371,21 +374,26 @@ impl Inner {
     }
 
     /// Why a call to `id` cannot be served here.
-    fn absent(&self, id: AgentId) -> CallError {
+    pub(crate) fn absent(&self, id: AgentId) -> CallError {
         match self.directory.lock().expect("the directory").get(&id) {
             Some(record) => CallError::Elsewhere(
                 record
                     .replicas
                     .iter()
-                    .filter_map(|replica| self.ingress_of(*replica))
+                    .filter_map(|replica| self.contact(*replica))
                     .collect(),
             ),
             None => CallError::NoAgent,
         }
     }
 
-    fn ingress_of(&self, node: NodeNumber) -> Option<String> {
-        Some(self.space.as_ref()?.node(node)?.ingress.clone())
+    /// How clients reach node `number`, from the space.
+    fn contact(&self, number: NodeNumber) -> Option<Contact> {
+        let node = self.space.as_ref()?.node(number)?;
+        Some(Contact {
+            address: node.ingress.clone(),
+            node: NodeId(node.key),
+        })
     }
 
     /// That this node does not lead `shared`'s group, with its leader's
@@ -399,8 +407,49 @@ impl Inner {
                 .state()
                 .leader
                 .filter(|leader| *leader != self.number)
-                .and_then(|leader| self.ingress_of(leader)),
+                .and_then(|leader| self.contact(leader)),
         )
+    }
+
+    /// Agent `id`'s replica here, when its leader loop takes inputs and
+    /// it has applied what its predecessors committed: else where calls go
+    /// instead. While the group elects, it waits as a call does.
+    ///
+    /// Applied that far, the replica's marks hold every request an earlier
+    /// leader answered, so ingress reads no gap after one.
+    pub(crate) async fn leading(&self, id: AgentId) -> Result<Arc<Run>, CallError> {
+        let run = self.run(id).ok_or_else(|| self.absent(id))?;
+        let state = run.shared.state();
+        if !state.stopped && !self.knows_leader(&run, &state) {
+            self.settled(id).await?;
+        }
+        let caught_up = async {
+            run.shared
+                .wait(|state| {
+                    state.stopped
+                        || state
+                            .leading_from
+                            .is_none_or(|first| state.applied >= first)
+                })
+                .await;
+            true
+        };
+        let late = async {
+            smol::Timer::after(CATCH_UP).await;
+            false
+        };
+        if !caught_up.or(late).await {
+            return Err(CallError::Failed(
+                "the leader has not applied what it took over".into(),
+            ));
+        }
+        if run.shared.state().stopped || run.agent.queue.lock().expect("the queue").stopped {
+            return Err(CallError::Stopped);
+        }
+        if !run.agent.queue.lock().expect("the queue").leading {
+            return Err(self.not_leader(&run.shared));
+        }
+        Ok(run)
     }
 
     /// Wait until agent `id`'s group here knows a leader, for a few
@@ -485,11 +534,6 @@ impl Inner {
             run.agent.stop();
             run.shared.stop();
         }
-    }
-
-    /// The identity of the agent `record` creates: its record's hash.
-    pub(crate) fn identity(&self, record: &CreationRecord) -> [u8; 32] {
-        vos_pvm::precompile::blake2b_256(&record.encode())
     }
 
     /// Learn of an agent: keep its record, and start its group if this
@@ -1084,8 +1128,7 @@ impl Node {
         })
     }
 
-    /// The node's identity, its public key, which every client signature
-    /// names.
+    /// The node's identity, its public key, which its TLS presents.
     pub fn id(&self) -> NodeId {
         self.inner.node_id
     }
@@ -1228,8 +1271,7 @@ impl Node {
         let local = listener
             .local_addr()
             .map_err(|error| Error::Data(error.to_string()))?;
-        let ingress = crate::ingress::Ingress::open(Arc::clone(&self.inner), token)
-            .map_err(|error| Error::Data(error.to_string()))?;
+        let ingress = crate::ingress::Ingress::new(Arc::clone(&self.inner), token);
         let (stop, stopped) = smol::channel::bounded(1);
         let task = self
             .inner

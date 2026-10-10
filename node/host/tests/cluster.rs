@@ -11,7 +11,8 @@ use vos_node::store::{EntryKind, Store, View};
 use vos_node::{CallError, Config, Hooks, Node, Peers, Reply, Space, SpaceNode};
 use vos_wire::abi::refusal;
 use vos_wire::batch::{Batch, Input, Request};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, SessionId};
+use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session};
+use vos_wire::ingress::{Contact, NodeId};
 use vos_wire::peer::NodeNumber;
 use vos_wire::result::Outcome;
 use vos_wire::schema::Schema;
@@ -74,6 +75,8 @@ struct Cluster {
     node_hooks: Vec<Arc<dyn Hooks>>,
     /// The agent program each node runs, by number, when not the default.
     agent_programs: Vec<Option<Vec<u8>>>,
+    /// Alice's session, for the calls the test makes.
+    session: Session,
 }
 
 impl Cluster {
@@ -114,6 +117,11 @@ impl Cluster {
             hooks,
             node_hooks: Vec::new(),
             agent_programs,
+            session: Session {
+                key: [1; 32],
+                name: [1; 16],
+                t0: vos_node::wall_clock(),
+            },
         };
         cluster.grow(count);
         cluster
@@ -251,7 +259,7 @@ impl Cluster {
         by: u64,
     ) -> Result<Reply, CallError> {
         let request = Request {
-            session: SessionId(1),
+            session: self.session,
             sequence,
             caller: ALICE,
             instance: COUNTER,
@@ -361,9 +369,13 @@ fn followers_and_other_nodes_send_callers_where_the_agent_is_served() {
     cluster.install(agent);
     let leader = cluster.leader(agent);
     let follower = (1..=3).find(|number| *number != leader).unwrap();
+    let contact = |number: NodeNumber| Contact {
+        address: format!("http://node-{number}"),
+        node: NodeId(cluster.space.node(number).unwrap().key),
+    };
     assert_eq!(
         cluster.increment(follower, agent, 1, 1),
-        Err(CallError::NotLeader(Some(format!("http://node-{leader}"))))
+        Err(CallError::NotLeader(Some(contact(leader))))
     );
     wait_until("node 4 learns of the agent", || {
         matches!(
@@ -373,11 +385,7 @@ fn followers_and_other_nodes_send_callers_where_the_agent_is_served() {
     });
     assert_eq!(
         cluster.increment(4, agent, 1, 1),
-        Err(CallError::Elsewhere(
-            (1..=3)
-                .map(|number| format!("http://node-{number}"))
-                .collect()
-        ))
+        Err(CallError::Elsewhere((1..=3).map(contact).collect()))
     );
 }
 
@@ -507,7 +515,7 @@ fn an_input_whose_accumulate_fails_is_isolated_before_the_log() {
     let leader = cluster.leader(agent);
     let node = cluster.node(leader);
     let request = |sequence: u64, by: u64| Request {
-        session: SessionId(1),
+        session: cluster.session,
         sequence,
         caller: ALICE,
         instance: COUNTER,

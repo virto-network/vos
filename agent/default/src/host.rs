@@ -128,6 +128,27 @@ pub fn state_read(key: &[u8]) -> Option<Vec<u8>> {
     value
 }
 
+/// A value of the agent's applied state read into `buffer`, with no
+/// allocation: the value's whole length, of which `buffer` holds the start;
+/// `None` when absent.
+pub fn state_read_into(key: &[u8], buffer: &mut [u8]) -> Option<usize> {
+    let (len, _) = ecalli!(
+        STATE_READ,
+        [
+            ptr(key),
+            key.len() as u64,
+            ptr_mut(buffer),
+            0,
+            buffer.len() as u64,
+            0
+        ]
+    );
+    if len == code::WHAT {
+        unserved();
+    }
+    (len != code::NONE).then_some(len as usize)
+}
+
 /// A preimage of this service by hash: how a program's blob reaches the
 /// loader when the host has no pool.
 pub fn historical_lookup(hash: &[u8; 32]) -> Option<Vec<u8>> {

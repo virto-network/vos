@@ -14,10 +14,12 @@ use vos_pvm::refine_host::{RefineContext, StateReader};
 use vos_testkit::{Testkit, decode, program_hash};
 use vos_wire::abi::{cap, code, failure, refusal};
 use vos_wire::batch::{Admin, Batch, Input, Query, Request, Work};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, SessionId};
+use vos_wire::ids::{
+    AgentId, InstanceId, MethodId, Principal, ProgramHash, Session, SessionId, SessionRef,
+};
 use vos_wire::jam::{AccumulateInput, Operand, RefineArgs};
 use vos_wire::records::{SessionMark, unstored};
-use vos_wire::result::{Outcome, Run, Step, WorkResult};
+use vos_wire::result::{InputRef, Outcome, Run, Step, WorkResult, Write};
 use vos_wire::schema::Schema;
 use vos_wire::{Decode, Encode, defaults, keys};
 
@@ -274,6 +276,16 @@ impl Node {
             .get(key)
             .map(|bytes| unstored(bytes).expect("a stored value").to_vec())
     }
+
+    fn value<T: Decode>(&self, key: &[u8]) -> Option<T> {
+        self.get(key).map(|bytes| decode(&bytes).expect("decodes"))
+    }
+
+    /// A session's id and mark, as accumulate keeps them.
+    fn session(&self, session: &Session) -> Option<(SessionId, SessionMark)> {
+        let id: SessionId = self.value(&keys::session_index(session))?;
+        Some((id, self.value(&keys::session(id)).expect("a mark")))
+    }
 }
 
 /// The test actors, installed in a node and a testkit alike.
@@ -372,10 +384,14 @@ impl Sessions {
         Self(BTreeMap::new())
     }
 
-    fn session(caller: &Principal) -> SessionId {
-        match caller {
-            Principal::Client(key) => SessionId(u64::from(key[0])),
-            _ => SessionId(0),
+    fn session(caller: &Principal) -> Session {
+        Session {
+            key: match caller {
+                Principal::Client(key) => *key,
+                _ => [0; 32],
+            },
+            name: [0; 16],
+            t0: 0,
         }
     }
 
@@ -445,7 +461,7 @@ fn a_failed_step_consumes_its_input_and_later_steps_see_earlier_writes() {
     assert_eq!(failed(&result.steps[1]), failure::HANDLER);
     assert!(ran(&result.steps[1]).writes.is_empty());
     assert_eq!(done::<u64>(&result.steps[2]), 8, "the batch overlay");
-    let mark: SessionMark = decode(&node.get(&keys::session(SessionId(1))).unwrap()).unwrap();
+    let (_, mark) = node.session(&Sessions::session(&ALICE)).unwrap();
     assert_eq!(mark.sequence, 3, "the failed request was consumed too");
     assert_eq!(
         node.query(
@@ -462,9 +478,14 @@ fn a_failed_step_consumes_its_input_and_later_steps_see_earlier_writes() {
 fn sessions_refuse_gaps_and_expiry_and_keep_a_reply_window() {
     let (programs, mut node, _, _) = setup();
     let increment = programs.method(COUNTER, "increment");
+    let session = Session {
+        key: [9; 32],
+        name: [9; 16],
+        t0: 1,
+    };
     let request = |sequence: u64| {
         Input::Request(Request {
-            session: SessionId(9),
+            session,
             sequence,
             caller: ALICE,
             instance: COUNTER,
@@ -493,8 +514,9 @@ fn sessions_refuse_gaps_and_expiry_and_keep_a_reply_window() {
         }
     ));
     assert_eq!(done::<u64>(&result.steps[3]), 2);
+    let (id, _) = node.session(&session).unwrap();
     assert_eq!(
-        node.get(&keys::reply(SessionId(9), 2)),
+        node.get(&keys::reply(id, 2)),
         Some(Outcome::Done(2u64.encode()).encode())
     );
 
@@ -507,6 +529,181 @@ fn sessions_refuse_gaps_and_expiry_and_keep_a_reply_window() {
             ..
         }
     ));
+}
+
+/// A session is its key, name and creation time: accumulate gives each a
+/// compact id when its first request applies, and a step names a session
+/// by that id once the state holds it. A new session must start at 1, near
+/// the batch's time.
+#[test]
+fn sessions_are_named_by_their_client_and_created_by_accumulate() {
+    let (programs, mut node, _, _) = setup();
+    let increment = programs.method(COUNTER, "increment");
+    let now = 1_000_000;
+    let session = |name: u8, t0: u64| Session {
+        key: [1; 32],
+        name: [name; 16],
+        t0,
+    };
+    let (first, second) = (session(1, now), session(2, now - 30_000));
+    let stale = session(3, now - defaults::SESSION_SKEW_MS - 1);
+    let ahead = session(4, now + defaults::SESSION_SKEW_MS + 1);
+    let request = |session: Session, sequence: u64| {
+        Input::Request(Request {
+            session,
+            sequence,
+            caller: ALICE,
+            instance: COUNTER,
+            method: increment,
+            arguments: 1u64.encode(),
+        })
+    };
+    let result = node.batch(
+        now,
+        [0; 32],
+        vec![
+            request(first, 1),
+            request(second, 1),
+            request(first, 2),
+            request(stale, 1),
+            request(ahead, 1),
+            request(session(5, now), 2),
+            request(
+                Session {
+                    t0: now + 1,
+                    ..first
+                },
+                1,
+            ),
+        ],
+    );
+    let named = |step: &Step| match step {
+        Step::Ran(Run {
+            input: InputRef::Request { session, .. },
+            ..
+        })
+        | Step::Refused {
+            input: InputRef::Request { session, .. },
+            ..
+        } => session.clone(),
+        other => panic!("not a request: {other:?}"),
+    };
+    let code = |step: &Step| match step {
+        Step::Refused { code, .. } => *code,
+        Step::Ran(_) => panic!("ran"),
+    };
+    assert_eq!(named(&result.steps[0]), SessionRef::New(Box::new(first)));
+    assert_eq!(named(&result.steps[2]), SessionRef::New(Box::new(first)));
+    assert_eq!(done::<u64>(&result.steps[2]), 3);
+    assert_eq!(code(&result.steps[3]), refusal::STALE_SESSION);
+    assert_eq!(code(&result.steps[4]), refusal::STALE_SESSION);
+    assert_eq!(
+        code(&result.steps[5]),
+        refusal::SEQUENCE,
+        "a new session starts at 1"
+    );
+    assert_eq!(
+        done::<u64>(&result.steps[6]),
+        4,
+        "another t0 is another session"
+    );
+
+    let (one, mark) = node.session(&first).unwrap();
+    assert_eq!(
+        mark,
+        SessionMark {
+            sequence: 2,
+            time: now
+        }
+    );
+    assert_eq!(node.value::<Session>(&keys::session_of(one)), Some(first));
+    let (two, _) = node.session(&second).unwrap();
+    assert_ne!(one, two);
+    assert_eq!(node.session(&stale), None);
+    assert_eq!(node.value::<u64>(&keys::live_sessions()), Some(3));
+    assert_eq!(node.value::<u64>(&keys::next_session()), Some(3));
+    assert_eq!(node.value::<u64>(&keys::batch_time()), Some(now));
+
+    let result = node.batch(now + 5, [0; 32], vec![request(first, 3)]);
+    assert_eq!(named(&result.steps[0]), SessionRef::Known(one));
+    assert_eq!(done::<u64>(&result.steps[0]), 5);
+    assert_eq!(node.session(&first).unwrap().1.sequence, 3);
+}
+
+/// Accumulate is the authority on time: a result with a new session far
+/// from its time, or timed before the agent's latest, applies nothing at
+/// all. Refine refuses such a session, so a later step may have been
+/// refined as if that one had run.
+#[test]
+fn accumulate_skips_stale_sessions_and_results_from_the_past() {
+    let (_, mut node, _, _) = setup();
+    let now = 1_000_000;
+    let session = |name: u8, t0: u64| Session {
+        key: [2; 32],
+        name: [name; 16],
+        t0,
+    };
+    let (fresh, stale) = (session(1, now), session(2, 1));
+    let step = |session: SessionRef, key: u8| {
+        Step::Ran(Run {
+            input: InputRef::Request {
+                session,
+                sequence: 1,
+            },
+            outcome: Outcome::Done(Vec::new()),
+            instances: Vec::new(),
+            writes: vec![Write {
+                key: vec![0x01, key],
+                value: Some(vec![key]),
+            }],
+            messages: Vec::new(),
+            attests: Vec::new(),
+            gas_used: 0,
+        })
+    };
+    let version = node.version;
+    let applied = |node: &Node| {
+        (
+            node.value::<u64>(&keys::version()),
+            node.value::<u64>(&keys::batch_time()),
+        )
+    };
+    let before = applied(&node);
+    let result = WorkResult {
+        version,
+        time: now,
+        seed: [0; 32],
+        steps: vec![
+            step(SessionRef::New(Box::new(stale)), 1),
+            step(SessionRef::New(Box::new(fresh)), 3),
+        ],
+    };
+    node.accumulate(&result.encode());
+    assert_eq!(node.get(&[0x01, 1]), None);
+    assert_eq!(node.get(&[0x01, 3]), None);
+    assert_eq!(node.session(&stale), None);
+    assert_eq!(node.session(&fresh), None);
+    assert_eq!(applied(&node), before, "nothing at all");
+
+    let fresh_only = WorkResult {
+        steps: vec![step(SessionRef::New(Box::new(fresh)), 3)],
+        ..result
+    };
+    node.accumulate(&fresh_only.encode());
+    assert_eq!(node.get(&[0x01, 3]), Some(vec![3]));
+    assert_eq!(node.session(&fresh).unwrap().1.sequence, 1);
+    assert_eq!(node.value::<u64>(&keys::version()), Some(version + 1));
+
+    let past = WorkResult {
+        version: version + 1,
+        time: now - 1,
+        seed: [0; 32],
+        steps: vec![step(SessionRef::New(Box::new(session(3, now))), 4)],
+    };
+    node.accumulate(&past.encode());
+    assert_eq!(node.get(&[0x01, 4]), None);
+    assert_eq!(node.value::<u64>(&keys::version()), Some(version + 1));
+    assert_eq!(node.value::<u64>(&keys::batch_time()), Some(now));
 }
 
 #[test]
@@ -1141,7 +1338,7 @@ fn state_the_agent_did_not_write_fails_only_the_steps_that_read_it() {
         .collect();
     node.state.insert(balances.last().unwrap().clone(), vec![]);
     let bob = Sessions::session(&BOB);
-    node.state.insert(keys::session(bob), vec![1, 0xff]);
+    node.state.insert(keys::session_index(&bob), vec![1, 0xff]);
 
     let result = node.batch(
         2,
@@ -1163,7 +1360,7 @@ fn state_the_agent_did_not_write_fails_only_the_steps_that_read_it() {
                 ..
             }
         ),
-        "a corrupt session mark refuses: {:?}",
+        "a corrupt session index refuses: {:?}",
         result.steps[2]
     );
     assert_eq!(done::<u64>(&result.steps[3]), 10, "other rows still read");
@@ -1279,7 +1476,7 @@ fn every_operation_pays_for_its_serving() {
             .enumerate()
             .map(|(index, (instance, method, arguments))| {
                 Input::Request(Request {
-                    session: SessionId(1),
+                    session: Sessions::session(&ALICE),
                     sequence: index as u64 + 1,
                     caller: ALICE,
                     instance,
@@ -1412,7 +1609,6 @@ fn every_operation_pays_for_its_serving() {
             300,
             SCAN + bytes(1),
         ),
-        ("send", false, vec![], 5, 16, SEND),
         ("call", false, vec![], 6, 1000, MACHINE),
     ];
     let mut short = Vec::new();
@@ -1460,7 +1656,7 @@ fn every_operation_pays_for_its_serving() {
             time: 1,
             seed: [0; 32],
             inputs: vec![Input::Request(Request {
-                session: SessionId(1),
+                session: Sessions::session(&ALICE),
                 sequence: 1,
                 caller: ALICE,
                 instance: InstanceId(100),
@@ -1488,6 +1684,15 @@ fn every_operation_pays_for_its_serving() {
         if cost > charge as i64 * 4 / 5 {
             short.push(name);
         }
+    }
+    // A step sends at most `cap::MESSAGES`: measured over eight steps, so
+    // the heap's growth weighs on more sends than one step's.
+    let sends = |count: u32| (0..8).map(|_| ops_step(vec![(5, 0, count)])).collect();
+    let count = 8 * cap::MESSAGES as i64;
+    let cost = SEND as i64 + (unpaid(sends(cap::MESSAGES as u32)) - unpaid(sends(0))) / count;
+    println!("send: charged {SEND}, costs the agent {cost}");
+    if cost > SEND as i64 * 4 / 5 {
+        short.push("send");
     }
     let attest = |count: u32| vec![(LEDGER, audits, count.encode())];
     let cost = MACHINE as i64 + (unpaid(attest(16)) - unpaid(attest(0))) / 16;

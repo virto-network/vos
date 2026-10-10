@@ -231,11 +231,11 @@ pub mod cap {
     pub const ATTESTS: usize = 16;
     pub const WORK_RESULT: usize = 4 << 20;
 
-    /// The most one step adds to a work result: its reply, writes, messages
-    /// and attests at their caps, with the framing of as many writes and
-    /// instances as its gas can pay for. An install's record is under
-    /// [`STEP_WRITES`] too.
-    pub const STEP_RESULT: usize = 64
+    /// The most one step adds to a work result: its input, a new session's
+    /// whole, its reply, writes, messages and attests at their caps, with
+    /// the framing of as many writes and instances as its gas can pay for.
+    /// An install's record is under [`STEP_WRITES`] too.
+    pub const STEP_RESULT: usize = 128
         + REPLY
         + STEP_WRITES
         + (MAX_HANDLER_GAS / price::PUT) as usize * 9
@@ -290,6 +290,9 @@ pub mod refusal {
     /// Its session's or pair's mark is state the agent cannot read: an
     /// operator must look, and resending cannot help.
     pub const UNREADABLE: u32 = 3;
+    /// A new session whose creation time is too far from the agent's:
+    /// start one with a time near it.
+    pub const STALE_SESSION: u32 = 4;
 }
 
 /// The host calls each kind of program may make, and what a JAM node does

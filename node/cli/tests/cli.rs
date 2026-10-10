@@ -116,15 +116,20 @@ fn a_client_calls_an_agent_the_operator_installed() {
         "done 0700000000000000"
     );
     assert_eq!(client("query", "value", ""), "done 0700000000000000");
-    // One session, kept next to the key, whose sequence went on.
-    let session = |text: &str| {
-        text.lines()
-            .find(|line| line.starts_with("session"))
-            .map(str::to_string)
+    // One session for the agent, kept next to the key, whose sequence
+    // went on; and the agent's identity, fetched once.
+    let session = |text: &str| -> Vec<String> {
+        let line = text
+            .lines()
+            .find(|line| line.starts_with(&format!("session {agent} ")))
+            .expect("the agent's session");
+        line.split_whitespace().map(str::to_string).collect()
     };
     let after = std::fs::read_to_string(dir.path().join("client.key.session")).unwrap();
-    assert_eq!(session(&kept), session(&after));
-    assert!(after.contains(&format!("next {agent} 3")), "{after}");
+    let (before, after_session) = (session(&kept), session(&after));
+    assert_eq!(before[..4], after_session[..4], "the same session");
+    assert_eq!((&*before[4], &*after_session[4]), ("2", "3"));
+    assert!(after.contains(&format!("identity {agent} ")), "{after}");
 }
 
 /// `vos` that should fail: its error.

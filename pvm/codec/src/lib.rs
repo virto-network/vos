@@ -269,6 +269,22 @@ impl<T: Decode> Decode for Vec<T> {
 }
 
 // ============================================================================
+// Box<T> — as T
+// ============================================================================
+
+impl<T: Encode> Encode for alloc::boxed::Box<T> {
+    fn encode_to(&self, buf: &mut Vec<u8>) {
+        (**self).encode_to(buf);
+    }
+}
+
+impl<T: Decode> Decode for alloc::boxed::Box<T> {
+    fn decode(data: &[u8]) -> Result<(Self, usize), DecodeError> {
+        T::decode(data).map(|(value, used)| (alloc::boxed::Box::new(value), used))
+    }
+}
+
+// ============================================================================
 // Option<T> — discriminator byte (0=None, 1=Some) + payload
 // ============================================================================
 

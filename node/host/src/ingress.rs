@@ -1,12 +1,14 @@
-//! The node's HTTP ingress: client sessions, signed calls and queries in
-//! their sequences, and the operator's commands.
+//! The node's HTTP ingress: signed calls in their sessions' sequences,
+//! signed queries, and the operator's commands.
 //!
-//! Per (session, agent), a call at or below the agent's applied mark is a
-//! duplicate answered from its reply window; one in flight waits for that
-//! answer; the next after those queued is queued; any other is refused.
+//! A client names its sessions; the agent keeps them. Only the agent's
+//! leader takes a call. Per (agent, session), a call at or below the
+//! agent's applied mark is a duplicate answered from its reply window; one
+//! in flight waits for that answer; the next after those queued is queued;
+//! any other is refused.
 
-use std::collections::{BTreeSet, HashMap};
-use std::sync::{Arc, Mutex, RwLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -14,10 +16,9 @@ use smol::net::TcpListener;
 use subtle::ConstantTimeEq;
 use vos_wire::abi::{cap, refusal};
 use vos_wire::batch::{Admin, Request};
-use vos_wire::ids::{AgentId, InstanceId, Principal, SessionId};
+use vos_wire::ids::{AgentId, InstanceId, Principal, Session, SessionId};
 use vos_wire::ingress::{
-    Answer, Call, Create, Grant, Install, Open, Opened, QueryCall, Rejection, call_message,
-    open_message, query_message,
+    Answer, Call, Create, Grant, Install, QueryCall, Rejection, call_message, query_message,
 };
 use vos_wire::records::{Installed, SessionMark, unstored};
 use vos_wire::result::Outcome;
@@ -25,25 +26,14 @@ use vos_wire::{Decode, Encode, defaults, keys};
 
 use crate::http::{self, Handler, Limits, Response};
 use crate::node::{CallError, Inner, Reply};
-use crate::storage::Change;
 use crate::store::{Store, View};
 
-/// The most sessions one key holds: opening another forgets its oldest.
-pub const SESSIONS_PER_KEY: usize = 16;
-/// How far an open's time may be from the node's clock.
-const OPEN_SKEW_MS: u64 = 60_000;
 /// How far ahead a query's `not_after` may be.
 const QUERY_HORIZON_MS: u64 = 300_000;
 /// The most a body may hold beyond a request's cap: its envelope.
 const ENVELOPE: usize = 4096;
 /// The most an install's body may hold: a package's programs.
 const MAX_INSTALL: usize = 64 << 20;
-
-struct Opening {
-    next: u64,
-    per_key: HashMap<[u8; 32], BTreeSet<SessionId>>,
-    opened: HashMap<[u8; 32], u64>,
-}
 
 /// One (agent, session)'s requests that ingress has queued.
 #[derive(Default)]
@@ -57,9 +47,18 @@ struct Lane {
 pub(crate) struct Ingress {
     inner: Arc<Inner>,
     token: [u8; 32],
-    sessions: RwLock<HashMap<SessionId, [u8; 32]>>,
-    opening: smol::lock::Mutex<Opening>,
-    lanes: Mutex<HashMap<(AgentId, SessionId), Lane>>,
+    lanes: Mutex<HashMap<(AgentId, Session), Lane>>,
+}
+
+/// What the agent's applied state holds of a session.
+struct Applied {
+    /// The session's last sequence consumed, 0 for one the agent does not
+    /// hold.
+    mark: u64,
+    /// The reply kept for the sequence asked about, at or below the mark.
+    reply: Option<Outcome>,
+    /// The agent's time, for a session it does not hold.
+    time: Option<u64>,
 }
 
 enum Next {
@@ -73,6 +72,7 @@ fn reply_answer(reply: Result<Reply, CallError>) -> Answer {
         Ok(Reply::Ran(outcome)) => Answer::Ran(outcome),
         Ok(Reply::Refused(code)) => Answer::Refused(code),
         Ok(Reply::Failed) => Answer::NotConsumed,
+        Ok(Reply::TooOld) => Answer::Rejected(Rejection::TooOld),
         Err(CallError::Failed(_)) => Answer::Unavailable,
         Err(CallError::Busy) => Answer::Busy,
         Err(CallError::NoAgent) => Answer::NoAgent,
@@ -87,14 +87,14 @@ fn status(answer: &Answer) -> u16 {
     match answer {
         Answer::Ran(_) | Answer::Created(_) => 200,
         Answer::Unconfirmed(_) => 202,
-        // Like an unknown session, an expired one means opening another.
-        Answer::Refused(refusal::EXPIRED) => 410,
+        // The session is done with: the client starts another.
+        Answer::Refused(refusal::EXPIRED | refusal::STALE_SESSION) => 410,
         Answer::Refused(_) => 409,
         Answer::Rejected(rejection) => match rejection {
-            Rejection::UnknownSession | Rejection::TooOld => 410,
+            Rejection::TooOld | Rejection::StaleSession { .. } => 410,
             Rejection::BadSignature | Rejection::Unauthorized => 401,
             Rejection::Gap { .. } | Rejection::Ahead => 409,
-            Rejection::StaleQuery | Rejection::StaleOpen | Rejection::Malformed => 400,
+            Rejection::StaleQuery | Rejection::Malformed => 400,
         },
         Answer::NotConsumed => 500,
         Answer::NoAgent => 404,
@@ -135,25 +135,12 @@ fn parse_hex(text: &[u8]) -> Option<[u8; 32]> {
 }
 
 impl Ingress {
-    pub(crate) fn open(inner: Arc<Inner>, token: [u8; 32]) -> Result<Self, fjall::Error> {
-        let mut sessions = HashMap::new();
-        let mut per_key: HashMap<[u8; 32], BTreeSet<SessionId>> = HashMap::new();
-        for (session, key) in inner.store.sessions()? {
-            sessions.insert(session, key);
-            per_key.entry(key).or_default().insert(session);
-        }
-        let next = inner.store.next_session()?;
-        Ok(Self {
+    pub(crate) fn new(inner: Arc<Inner>, token: [u8; 32]) -> Self {
+        Self {
             inner,
             token,
-            sessions: RwLock::new(sessions),
-            opening: smol::lock::Mutex::new(Opening {
-                next,
-                per_key,
-                opened: HashMap::new(),
-            }),
             lanes: Mutex::new(HashMap::new()),
-        })
+        }
     }
 
     /// Serve until `stop` resolves, then end every connection.
@@ -208,12 +195,9 @@ impl Ingress {
         let agent = |text: &str| text.parse::<u32>().ok().map(AgentId);
         match (request.method.as_str(), segments.as_slice()) {
             ("GET", []) => Response::new(200, self.inner.node_id.encode()),
-            ("POST", ["sessions"]) => match decode::<Open>(&request.body) {
-                Ok(open) => match self.open_session(open).await {
-                    Ok(opened) => Response::new(200, opened.encode()),
-                    Err(answer) => respond(answer),
-                },
-                Err(answer) => respond(answer),
+            ("GET", ["agents", id]) => match agent(id).and_then(|agent| self.record(agent)) {
+                Some(record) => Response::new(200, record.encode()),
+                None => Response::new(404, Vec::new()),
             },
             ("POST", ["agents", id, "calls"]) => match (agent(id), decode::<Call>(&request.body)) {
                 (Some(agent), Ok(call)) => respond(self.call(agent, call).await),
@@ -303,109 +287,69 @@ impl Ingress {
             .is_some_and(|token| bool::from(token.ct_eq(&self.token)))
     }
 
-    async fn open_session(&self, open: Open) -> Result<Opened, Answer> {
-        let node = self.inner.node_id;
-        let now = (self.inner.clock)();
-        if open.time.abs_diff(now) > OPEN_SKEW_MS {
-            return Err(Answer::Rejected(Rejection::StaleOpen));
-        }
-        if !verify(
-            &open.key,
-            &open_message(&node, &open.key, open.time),
-            &open.signature,
-        ) {
-            return Err(Answer::Rejected(Rejection::BadSignature));
-        }
-        let mut opening = self.opening.lock().await;
-        let last = match opening.opened.get(&open.key) {
-            Some(last) => Some(*last),
-            None => self
-                .inner
-                .store
-                .key_opened(&open.key)
-                .map_err(|_| Answer::Unavailable)?,
-        };
-        if last.is_some_and(|last| open.time <= last) {
-            return Err(Answer::Rejected(Rejection::StaleOpen));
-        }
-        let session = SessionId(opening.next);
-        let held = opening.per_key.entry(open.key).or_default();
-        let forgotten: Vec<SessionId> = held
-            .iter()
-            .copied()
-            .take((held.len() + 1).saturating_sub(SESSIONS_PER_KEY))
-            .collect();
-        let mut changes = vec![Change::Session {
-            id: session,
-            key: open.key,
-            time: open.time,
-        }];
-        changes.extend(forgotten.iter().map(|old| Change::ForgetSession(*old)));
+    /// Agent `agent`'s creation record, when this node knows of it.
+    fn record(&self, agent: AgentId) -> Option<vos_wire::peer::CreationRecord> {
         self.inner
-            .commit(changes)
-            .await
-            .map_err(|_| Answer::Unavailable)?;
-        opening.next += 1;
-        opening.opened.insert(open.key, open.time);
-        let held = opening.per_key.entry(open.key).or_default();
-        held.insert(session);
-        let mut sessions = self.sessions.write().expect("the sessions");
-        for old in forgotten {
-            held.remove(&old);
-            sessions.remove(&old);
-        }
-        sessions.insert(session, open.key);
-        Ok(Opened { node, session })
+            .directory
+            .lock()
+            .expect("the directory")
+            .get(&agent)
+            .cloned()
     }
 
-    fn key(&self, session: SessionId) -> Option<[u8; 32]> {
-        self.sessions
-            .read()
-            .expect("the sessions")
-            .get(&session)
-            .copied()
-    }
-
-    /// The agent's applied mark for `session`, and the reply it kept for
-    /// `sequence` when that is at or below it.
-    fn applied(
-        &self,
-        agent: AgentId,
-        session: SessionId,
-        sequence: u64,
-    ) -> Result<(u64, Option<Outcome>), Answer> {
+    /// What the agent's applied state holds of `session`, with the reply
+    /// it kept for `sequence` when that is at or below its mark.
+    fn applied(&self, agent: AgentId, session: &Session, sequence: u64) -> Result<Applied, Answer> {
         let snapshot = self.inner.store.snapshot();
         let stored = |key: &[u8]| -> Result<Option<Vec<u8>>, Answer> {
             let bytes = snapshot.get(agent, key).map_err(|_| Answer::Unavailable)?;
             Ok(bytes.and_then(|bytes| unstored(&bytes).map(<[u8]>::to_vec)))
         };
-        let mark = stored(&keys::session(session))?
+        let Some(id) = stored(&keys::session_index(session))?
+            .and_then(|bytes| SessionId::decode(&bytes).ok())
+            .map(|(id, _)| id)
+        else {
+            let time = stored(&keys::batch_time())?
+                .and_then(|bytes| u64::decode(&bytes).ok())
+                .map_or(0, |(time, _)| time);
+            return Ok(Applied {
+                mark: 0,
+                reply: None,
+                time: Some(time),
+            });
+        };
+        let mark = stored(&keys::session(id))?
             .and_then(|bytes| SessionMark::decode(&bytes).ok())
             .map_or(0, |(mark, _)| mark.sequence);
         let reply = if sequence <= mark {
-            stored(&keys::reply(session, sequence))?
+            stored(&keys::reply(id, sequence))?
                 .and_then(|bytes| Outcome::decode(&bytes).ok())
                 .map(|(outcome, _)| outcome)
         } else {
             None
         };
-        Ok((mark, reply))
+        Ok(Applied {
+            mark,
+            reply,
+            time: None,
+        })
     }
 
     async fn call(&self, agent: AgentId, call: Call) -> Answer {
-        let Some(key) = self.key(call.session) else {
-            return Answer::Rejected(Rejection::UnknownSession);
+        // A follower answers where the leader is, before anything else.
+        let run = match self.inner.leading(agent).await {
+            Ok(run) => run,
+            Err(error) => return reply_answer(Err(error)),
         };
         let message = call_message(
-            &self.inner.node_id,
-            agent,
-            call.session,
+            &run.shared.identity,
+            &call.session,
             call.sequence,
             call.instance,
             call.method,
             &call.arguments,
         );
-        if !verify(&key, &message, &call.signature) {
+        if !verify(&call.session.key, &message, &call.signature) {
             return Answer::Rejected(Rejection::BadSignature);
         }
         let sequence = call.sequence;
@@ -414,10 +358,18 @@ impl Ingress {
             let mut lanes = self.lanes.lock().expect("the lanes");
             // Read under the lock: an answered request's commit is durable
             // before its lane changes, so the mark read here includes it.
-            let (mark, reply) = match self.applied(agent, call.session, sequence) {
+            let Applied { mark, reply, time } = match self.applied(agent, &call.session, sequence) {
                 Ok(applied) => applied,
                 Err(answer) => return answer,
             };
+            // A new session's time must be near the agent's, as refine will
+            // check: the client learns the time it should use.
+            if let Some(time) = time {
+                let now = (self.inner.clock)().max(time);
+                if call.session.t0.abs_diff(now) > defaults::SESSION_SKEW_MS {
+                    return Answer::Rejected(Rejection::StaleSession { now });
+                }
+            }
             let lane = lanes.entry(lane_key).or_default();
             lane.queued = lane.queued.max(mark);
             if sequence == 0 {
@@ -454,7 +406,7 @@ impl Ingress {
                 let request = Request {
                     session: call.session,
                     sequence,
-                    caller: Principal::Client(key),
+                    caller: Principal::Client(call.session.key),
                     instance: call.instance,
                     method: call.method,
                     arguments: call.arguments,
@@ -482,19 +434,18 @@ impl Ingress {
     }
 
     async fn query(&self, agent: AgentId, query: QueryCall) -> Answer {
-        let Some(key) = self.key(query.session) else {
-            return Answer::Rejected(Rejection::UnknownSession);
+        let Some(run) = self.inner.run(agent) else {
+            return reply_answer(Err(self.inner.absent(agent)));
         };
         let message = query_message(
-            &self.inner.node_id,
-            agent,
-            query.session,
+            &run.shared.identity,
+            &query.key,
             query.not_after,
             query.instance,
             query.method,
             &query.arguments,
         );
-        if !verify(&key, &message, &query.signature) {
+        if !verify(&query.key, &message, &query.signature) {
             return Answer::Rejected(Rejection::BadSignature);
         }
         let now = (self.inner.clock)();
@@ -505,7 +456,7 @@ impl Ingress {
             .inner
             .query(
                 agent,
-                Principal::Client(key),
+                Principal::Client(query.key),
                 query.instance,
                 query.method,
                 query.arguments,

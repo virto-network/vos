@@ -1,4 +1,4 @@
-//! A blocking client of a node's ingress: a client key's session, signed
+//! A blocking client of a node's ingress: a client key's sessions, signed
 //! calls and queries, and the operator's commands.
 
 use std::collections::HashMap;
@@ -9,11 +9,13 @@ use std::time::{Duration, Instant};
 
 use ed25519_dalek::{Signer, SigningKey};
 use rustls::pki_types::ServerName;
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, SessionId};
+use vos_wire::abi::refusal;
+use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session};
 use vos_wire::ingress::{
-    Answer, Call, Create, Grant, Install, NodeId, Open, Opened, QueryCall, call_message,
-    open_message, query_message,
+    Answer, Call, Contact, Create, Grant, Install, NodeId, QueryCall, Rejection, call_message,
+    query_message,
 };
+use vos_wire::peer::CreationRecord;
 use vos_wire::schema::Schema;
 use vos_wire::{Decode, Encode};
 
@@ -24,8 +26,8 @@ pub enum ClientError {
     Http(String),
     /// The node answered something this client cannot read.
     Undecodable(u16),
-    /// The node did not open the session.
-    Refused(Answer),
+    /// The node knows no agent of that id.
+    NoAgent,
     /// The node names itself by a key other than the one its TLS showed.
     NotTheNode,
 }
@@ -41,6 +43,8 @@ pub struct Target {
     tls: Option<(Arc<rustls::ClientConfig>, ServerName<'static>)>,
     /// The node's key, when pinned.
     key: Option<[u8; 32]>,
+    /// How the client trusts it, which the nodes it is sent on to inherit.
+    trust: Trust,
 }
 
 impl Target {
@@ -115,6 +119,7 @@ impl Target {
                 Trust::NodeKey(key) => Some(key),
                 _ => None,
             },
+            trust,
         })
     }
 
@@ -372,8 +377,8 @@ pub fn post(target: &Target, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>), 
     Http::new(target).post(path, None, body, false)
 }
 
-/// The node's identity, its key, which its clients sign for. A pinned
-/// node must name itself by the key it was pinned by.
+/// The node's identity, its key, which its TLS presents. A pinned node
+/// must name itself by the key it was pinned by.
 pub fn node_id(target: &Target) -> Result<NodeId, ClientError> {
     fetch_node_id(&Http::new(target))
 }
@@ -389,79 +394,156 @@ fn fetch_node_id(http: &Http) -> Result<NodeId, ClientError> {
     }
 }
 
-/// A client key's session on one node.
+/// Agent `agent`'s creation record, as the node knows it: `None` when it
+/// knows no such agent.
+pub fn record(target: &Target, agent: AgentId) -> Result<Option<CreationRecord>, ClientError> {
+    record_from(&Http::new(target), agent)
+}
+
+fn record_from(http: &Http, agent: AgentId) -> Result<Option<CreationRecord>, ClientError> {
+    let (status, body) = http.get(&format!("/agents/{}", agent.0))?;
+    if status == 404 {
+        return Ok(None);
+    }
+    CreationRecord::decode(&body)
+        .map(|(record, _)| Some(record))
+        .map_err(|_| ClientError::Undecodable(status))
+}
+
+/// One agent's session as its client keeps it: the session's name and
+/// creation time, and the next sequence to send.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Kept {
+    pub name: [u8; 16],
+    pub t0: u64,
+    pub next: u64,
+}
+
+/// Redirects a call follows before it answers what the last node said.
+const REDIRECTS: usize = 4;
+/// New sessions a call starts before it answers the refusal: one when the
+/// agent refuses a session for good, and one more when the client's clock
+/// is off the agent's time.
+const RENEWALS: usize = 2;
+
+/// A client key, calling each agent in a session of its own.
+///
+/// A session goes on until the agent refuses it for good (expired, or
+/// started too far from the agent's time): only then does the client start
+/// another. After an error the call may have run or not: call again with
+/// the same request, which goes with the same sequence, and the agent runs
+/// it once.
 pub struct Client {
     http: Http,
     key: SigningKey,
-    node: NodeId,
-    session: SessionId,
-    next: HashMap<AgentId, u64>,
+    sessions: Mutex<HashMap<AgentId, Kept>>,
+    identities: Mutex<HashMap<AgentId, [u8; 32]>>,
+    /// How far the agents' time is ahead of this client's clock, as a
+    /// node last reported it: a new session starts at that time.
+    offset: Mutex<i64>,
 }
 
 impl Client {
-    /// Open a session for `key` on the node at `base`, signed at `time`
-    /// (milliseconds since the Unix epoch, near the node's clock).
-    pub fn open(target: &Target, key: SigningKey, time: u64) -> Result<Self, ClientError> {
-        let http = Http::new(target);
-        let node = fetch_node_id(&http)?;
-        let public = key.verifying_key().to_bytes();
-        let open = Open {
-            key: public,
-            time,
-            signature: key.sign(&open_message(&node, &public, time)).to_bytes(),
-        };
-        // Never sent twice: the node refuses an open it has seen.
-        let (status, body) = http.post("/sessions", None, &open.encode(), false)?;
-        let opened = match Opened::decode(&body) {
-            Ok((opened, used)) if status == 200 && used == body.len() => opened,
-            _ => return Err(ClientError::Refused(answer(status, &body)?)),
-        };
-        Ok(Self {
-            http,
-            key,
-            node,
-            session: opened.session,
-            next: HashMap::new(),
-        })
+    /// A client for `key` calling the node at `target`.
+    pub fn new(target: &Target, key: SigningKey) -> Self {
+        Self::resume(target, key, HashMap::new(), HashMap::new())
     }
 
-    /// Go on with a session opened before: its node, id, and each agent's
-    /// next sequence.
+    /// A client going on with the sessions it kept, and the agents'
+    /// identities it learned.
     pub fn resume(
         target: &Target,
         key: SigningKey,
-        node: NodeId,
-        session: SessionId,
-        next: HashMap<AgentId, u64>,
+        sessions: HashMap<AgentId, Kept>,
+        identities: HashMap<AgentId, [u8; 32]>,
     ) -> Self {
         Self {
             http: Http::new(target),
             key,
-            node,
-            session,
-            next,
+            sessions: Mutex::new(sessions),
+            identities: Mutex::new(identities),
+            offset: Mutex::new(0),
         }
     }
 
-    pub fn session(&self) -> SessionId {
-        self.session
+    /// Each agent's session, to keep.
+    pub fn sessions(&self) -> HashMap<AgentId, Kept> {
+        self.sessions.lock().expect("the sessions").clone()
     }
 
-    pub fn node(&self) -> NodeId {
-        self.node
+    /// Each agent's identity learned, to keep.
+    pub fn identities(&self) -> HashMap<AgentId, [u8; 32]> {
+        self.identities.lock().expect("the identities").clone()
     }
 
-    /// Each agent's next sequence in this session.
-    pub fn next(&self) -> &HashMap<AgentId, u64> {
-        &self.next
+    /// The node this client calls: the one it was given, or the last a
+    /// redirect named.
+    pub fn target(&self) -> &Target {
+        &self.http.target
     }
 
     pub fn principal(&self) -> Principal {
         Principal::Client(self.key.verifying_key().to_bytes())
     }
 
-    /// Call `method` on `agent`'s `instance` with the session's next
-    /// sequence for that agent, which moves on only once consumed.
+    /// The session this client calls `agent` in, started if there is none.
+    pub fn session(&self, agent: AgentId) -> Session {
+        let kept = *self
+            .sessions
+            .lock()
+            .expect("the sessions")
+            .entry(agent)
+            .or_insert_with(|| self.start());
+        self.whole(kept)
+    }
+
+    /// Start another session for `agent`: the one before is done with.
+    pub fn renew(&self, agent: AgentId) {
+        let kept = self.start();
+        self.sessions
+            .lock()
+            .expect("the sessions")
+            .insert(agent, kept);
+    }
+
+    fn start(&self) -> Kept {
+        let mut name = [0u8; 16];
+        getrandom::getrandom(&mut name).expect("the operating system's randomness");
+        let offset = *self.offset.lock().expect("the offset");
+        let t0 = crate::wall_clock().saturating_add_signed(offset);
+        Kept { name, t0, next: 1 }
+    }
+
+    fn whole(&self, kept: Kept) -> Session {
+        Session {
+            key: self.key.verifying_key().to_bytes(),
+            name: kept.name,
+            t0: kept.t0,
+        }
+    }
+
+    /// The identity of `agent`, which calls to it are signed for: the hash
+    /// of its creation record, fetched from the node once.
+    pub fn identity(&self, agent: AgentId) -> Result<[u8; 32], ClientError> {
+        if let Some(identity) = self.identities.lock().expect("the identities").get(&agent) {
+            return Ok(*identity);
+        }
+        let record = record_from(&self.http, agent)?.ok_or(ClientError::NoAgent)?;
+        if record.agent != agent {
+            return Err(ClientError::Undecodable(200));
+        }
+        let identity = crate::identity(&record);
+        self.identities
+            .lock()
+            .expect("the identities")
+            .insert(agent, identity);
+        Ok(identity)
+    }
+
+    /// Call `method` on `agent`'s `instance`, at the session's next
+    /// sequence for that agent, which moves on only once consumed. It
+    /// follows the node's redirects to the agent's leader, and starts a
+    /// new session when the agent refuses this one for good.
     pub fn call(
         &mut self,
         agent: AgentId,
@@ -469,15 +551,66 @@ impl Client {
         method: MethodId,
         arguments: &[u8],
     ) -> Result<Answer, ClientError> {
-        let sequence = self.next.get(&agent).copied().unwrap_or(1);
-        let answer = self.call_at(agent, sequence, instance, method, arguments)?;
-        if matches!(answer, Answer::Ran(_)) {
-            self.next.insert(agent, sequence + 1);
+        let mut redirects = 0;
+        let mut renewals = 0;
+        loop {
+            self.session(agent);
+            let sequence = self.sessions.lock().expect("the sessions")[&agent].next;
+            let answer = self.call_at(agent, sequence, instance, method, arguments)?;
+            match &answer {
+                Answer::Ran(_) => {
+                    if let Some(kept) = self.sessions.lock().expect("the sessions").get_mut(&agent)
+                    {
+                        kept.next = sequence + 1;
+                    }
+                    return Ok(answer);
+                }
+                Answer::NotLeader {
+                    leader: Some(leader),
+                } if redirects < REDIRECTS => {
+                    redirects += 1;
+                    self.follow(leader)?;
+                }
+                Answer::Elsewhere { replicas } if redirects < REDIRECTS && !replicas.is_empty() => {
+                    redirects += 1;
+                    self.follow(&replicas[(redirects - 1) % replicas.len()])?;
+                }
+                // Not consumed: the same request goes again in a new session.
+                Answer::Rejected(Rejection::StaleSession { now }) if renewals < RENEWALS => {
+                    renewals += 1;
+                    let offset = i128::from(*now) - i128::from(crate::wall_clock());
+                    *self.offset.lock().expect("the offset") =
+                        offset.clamp(i64::MIN.into(), i64::MAX.into()) as i64;
+                    self.renew(agent);
+                }
+                Answer::Refused(refusal::EXPIRED | refusal::STALE_SESSION)
+                    if renewals < RENEWALS =>
+                {
+                    renewals += 1;
+                    self.renew(agent);
+                }
+                _ => return Ok(answer),
+            }
         }
-        Ok(answer)
     }
 
-    /// Call with an explicit `sequence`: to resend one, or to test.
+    /// Call the node `contact` names from now on, trusted as this client
+    /// trusts nodes: by the same CAs, or pinned by the key the redirecting
+    /// node gave, as this client already trusts what that node says.
+    fn follow(&mut self, contact: &Contact) -> Result<(), ClientError> {
+        let trust = match &self.http.target.trust {
+            Trust::Ca(roots) => Trust::Ca(roots.clone()),
+            Trust::NodeKey(_) | Trust::Loopback if contact.address.starts_with("https://") => {
+                Trust::NodeKey(contact.node.0)
+            }
+            Trust::NodeKey(_) | Trust::Loopback => Trust::Loopback,
+        };
+        self.http = Http::new(&Target::new(&contact.address, trust)?);
+        Ok(())
+    }
+
+    /// Call with an explicit `sequence` in the agent's session: to resend
+    /// one, or to test.
     pub fn call_at(
         &self,
         agent: AgentId,
@@ -486,13 +619,13 @@ impl Client {
         method: MethodId,
         arguments: &[u8],
     ) -> Result<Answer, ClientError> {
-        let body = self.call_body(agent, sequence, instance, method, arguments);
+        let body = self.call_body(agent, sequence, instance, method, arguments)?;
         let path = format!("/agents/{}/calls", agent.0);
         let (status, body) = self.http.post(&path, None, &body, true)?;
         answer(status, &body)
     }
 
-    /// A signed call's body, to send by other means.
+    /// A signed call's body in the agent's session, to send by other means.
     pub fn call_body(
         &self,
         agent: AgentId,
@@ -500,25 +633,19 @@ impl Client {
         instance: InstanceId,
         method: MethodId,
         arguments: &[u8],
-    ) -> Vec<u8> {
-        let message = call_message(
-            &self.node,
-            agent,
-            self.session,
-            sequence,
-            instance,
-            method,
-            arguments,
-        );
-        Call {
-            session: self.session,
+    ) -> Result<Vec<u8>, ClientError> {
+        let identity = self.identity(agent)?;
+        let session = self.session(agent);
+        let message = call_message(&identity, &session, sequence, instance, method, arguments);
+        Ok(Call {
+            session,
             sequence,
             instance,
             method,
             arguments: arguments.to_vec(),
             signature: self.key.sign(&message).to_bytes(),
         }
-        .encode()
+        .encode())
     }
 
     /// Run query `method` on `agent`'s `instance`, good until `not_after`.
@@ -530,17 +657,11 @@ impl Client {
         arguments: &[u8],
         not_after: u64,
     ) -> Result<Answer, ClientError> {
-        let message = query_message(
-            &self.node,
-            agent,
-            self.session,
-            not_after,
-            instance,
-            method,
-            arguments,
-        );
+        let identity = self.identity(agent)?;
+        let key = self.key.verifying_key().to_bytes();
+        let message = query_message(&identity, &key, not_after, instance, method, arguments);
         let query = QueryCall {
-            session: self.session,
+            key,
             not_after,
             instance,
             method,

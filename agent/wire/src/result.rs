@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use scale::{Decode, Encode};
 
 use crate::abi::cap;
-use crate::ids::{AgentId, InstanceId, MethodId, ProgramHash, SessionId};
+use crate::ids::{AgentId, InstanceId, MethodId, ProgramHash, SessionRef};
 
 /// What one refine produced. Steps are in dispatch order; accumulate applies
 /// their writes in that order. Inputs not covered by a step were not
@@ -97,7 +97,7 @@ pub struct Run {
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum InputRef {
     #[codec(index = 0)]
-    Request { session: SessionId, sequence: u64 },
+    Request { session: SessionRef, sequence: u64 },
     #[codec(index = 1)]
     Message { from: AgentId, sequence: u64 },
     #[codec(index = 2)]

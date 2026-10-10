@@ -1,7 +1,9 @@
 use proptest::prelude::*;
 use vos_wire::abi::{self, Kind, op};
 use vos_wire::batch::{Admin, Batch, Input, Message, Request};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, SessionId};
+use vos_wire::ids::{
+    AgentId, InstanceId, MethodId, Principal, ProgramHash, Session, SessionId, SessionRef,
+};
 use vos_wire::jam::{AccumulateInput, Operand, RefineArgs, Transfer, WorkError};
 use vos_wire::keys;
 use vos_wire::result::{
@@ -21,10 +23,18 @@ fn principal() -> impl Strategy<Value = Principal> {
     ]
 }
 
+fn session() -> impl Strategy<Value = Session> {
+    (any::<[u8; 32]>(), any::<[u8; 16]>(), any::<u64>()).prop_map(|(key, name, t0)| Session {
+        key,
+        name,
+        t0,
+    })
+}
+
 fn input() -> impl Strategy<Value = Input> {
     prop_oneof![
         (
-            any::<u64>(),
+            session(),
             any::<u64>(),
             principal(),
             any::<u32>(),
@@ -33,7 +43,7 @@ fn input() -> impl Strategy<Value = Input> {
         )
             .prop_map(|(session, sequence, caller, instance, method, arguments)| {
                 Input::Request(Request {
-                    session: SessionId(session),
+                    session,
                     sequence,
                     caller,
                     instance: InstanceId(instance),
@@ -82,7 +92,11 @@ fn input() -> impl Strategy<Value = Input> {
 fn step() -> impl Strategy<Value = Step> {
     let input = prop_oneof![
         (any::<u64>(), any::<u64>()).prop_map(|(session, sequence)| InputRef::Request {
-            session: SessionId(session),
+            session: SessionRef::Known(SessionId(session)),
+            sequence,
+        }),
+        (session(), any::<u64>()).prop_map(|(session, sequence)| InputRef::Request {
+            session: SessionRef::New(Box::new(session)),
             sequence,
         }),
         (any::<u32>(), any::<u64>()).prop_map(|(from, sequence)| InputRef::Message {
@@ -239,6 +253,7 @@ proptest! {
         other in any::<u32>(),
         tag in any::<u32>(),
         session in any::<u64>(),
+        triple in session(),
         sequence in any::<u64>(),
         agent in any::<u32>(),
         member in principal(),
@@ -254,6 +269,11 @@ proptest! {
             keys::member(&member),
             keys::session(SessionId(session)),
             keys::reply(SessionId(session), sequence),
+            keys::session_index(&triple),
+            keys::session_of(SessionId(session)),
+            keys::next_session(),
+            keys::live_sessions(),
+            keys::batch_time(),
             keys::pair_in(AgentId(agent)),
             keys::outbox(AgentId(agent), sequence),
             keys::pair_out(AgentId(agent)),
@@ -273,6 +293,15 @@ proptest! {
     ) {
         let key = |(session, sequence)| keys::reply(SessionId(session), sequence);
         prop_assert_eq!(key(a).cmp(&key(b)), a.cmp(&b));
+    }
+
+    #[test]
+    fn session_indexes_sort_by_key_then_name_then_time(a in session(), b in session()) {
+        let order = |session: &Session| (session.key, session.name, session.t0);
+        prop_assert_eq!(
+            keys::session_index(&a).cmp(&keys::session_index(&b)),
+            order(&a).cmp(&order(&b))
+        );
     }
 }
 
@@ -443,7 +472,7 @@ fn kinds_encode_as_the_index_the_agent_passes() {
 fn a_result_written_step_by_step_is_the_work_result_encoding() {
     let step = |sequence| Step::Refused {
         input: InputRef::Request {
-            session: SessionId(1),
+            session: SessionRef::Known(SessionId(1)),
             sequence,
         },
         code: 1,
@@ -487,7 +516,11 @@ fn the_largest_step_fits_its_bound() {
     write_bytes[0] = cap::STEP_WRITES - writes;
     let step = Step::Ran(Run {
         input: InputRef::Request {
-            session: SessionId(u64::MAX),
+            session: SessionRef::New(Box::new(Session {
+                key: [u8::MAX; 32],
+                name: [u8::MAX; 16],
+                t0: u64::MAX,
+            })),
             sequence: u64::MAX,
         },
         outcome: Outcome::Done(vec![0; cap::REPLY]),

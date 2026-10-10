@@ -22,7 +22,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode, Readable};
-use vos_wire::ids::{AgentId, SessionId};
+use vos_wire::ids::AgentId;
 use vos_wire::peer::CreationRecord;
 use vos_wire::result::Write;
 use vos_wire::{Decode, Encode};
@@ -226,15 +226,6 @@ pub trait Store: Send + Sync {
 
     /// The seed of the node's key, once made: secret, never served.
     fn node_secret(&self) -> Result<Option<[u8; 32]>>;
-
-    /// The sessions the node knows, each with its client's key.
-    fn sessions(&self) -> Result<Vec<(SessionId, [u8; 32])>>;
-
-    /// The id the next session gets: ids are never reused.
-    fn next_session(&self) -> Result<u64>;
-
-    /// When `key` last opened a session, by its own clock.
-    fn key_opened(&self, key: &[u8; 32]) -> Result<Option<u64>>;
 }
 
 /// A read-only view of applied state. Keys are relative to the agent.
@@ -316,12 +307,6 @@ pub trait Batch {
     /// Record the node's secret seed, and delete the retired public id.
     fn node_secret(&mut self, seed: &[u8; 32]);
 
-    /// Record session `id` for `key`, opened at `time`, and that the next
-    /// session gets `id + 1`.
-    fn session(&mut self, id: SessionId, key: &[u8; 32], time: u64);
-
-    fn forget_session(&mut self, id: SessionId);
-
     fn commit(self, durability: Durability) -> Result<()>;
 }
 
@@ -347,9 +332,7 @@ enum NodeRow {
     /// Retired: it held a public node id, which must never be read as the
     /// secret. Deleted when the secret is made.
     RetiredId = 0x02,
-    Session = 0x03,
-    NextSession = 0x04,
-    KeyOpened = 0x05,
+    // 0x03 to 0x05 are unused.
     Hard = 0x06,
     LogStart = 0x07,
     Membership = 0x08,
@@ -595,8 +578,9 @@ impl Fjall {
             .open()?;
         Ok(Self {
             state: db.keyspace("state", || tuning.rows())?,
-            // System keys are looked up for sessions and replies that are
-            // often absent: keep the filters that answer misses cheaply.
+            // System keys are looked up for session indexes and replies
+            // that are often absent: keep the filters that answer misses
+            // cheaply.
             system: db.keyspace("system", KeyspaceCreateOptions::default)?,
             log: db.keyspace("log", KeyspaceCreateOptions::default)?,
             blobs: db.keyspace("blobs", KeyspaceCreateOptions::default)?,
@@ -789,38 +773,6 @@ impl Store for Fjall {
             .system
             .get(node_record(NodeRow::Secret, &[]))?
             .and_then(|seed| seed[..].try_into().ok()))
-    }
-
-    fn sessions(&self) -> Result<Vec<(SessionId, [u8; 32])>> {
-        let prefix = node_record(NodeRow::Session, &[]);
-        self.system
-            .prefix(&prefix)
-            .filter_map(|row| {
-                let (key, value) = match row.into_inner() {
-                    Ok(row) => row,
-                    Err(error) => return Some(Err(error)),
-                };
-                // A record this node did not write is skipped, not trusted.
-                let id = be_u64(&key[prefix.len()..])?;
-                let client = value.get(..32)?.try_into().ok()?;
-                Some(Ok((SessionId(id), client)))
-            })
-            .collect()
-    }
-
-    fn next_session(&self) -> Result<u64> {
-        Ok(self
-            .system
-            .get(node_record(NodeRow::NextSession, &[]))?
-            .and_then(|next| be_u64(&next))
-            .unwrap_or(1))
-    }
-
-    fn key_opened(&self, key: &[u8; 32]) -> Result<Option<u64>> {
-        Ok(self
-            .system
-            .get(node_record(NodeRow::KeyOpened, key))?
-            .and_then(|time| be_u64(&time)))
     }
 
     fn export(&self, agent: AgentId) -> Result<Export> {
@@ -1238,33 +1190,6 @@ impl Batch for FjallBatch {
             .insert(&self.store.system, node_record(NodeRow::Secret, &[]), seed);
         self.batch
             .remove(&self.store.system, node_record(NodeRow::RetiredId, &[]));
-    }
-
-    fn session(&mut self, id: SessionId, key: &[u8; 32], time: u64) {
-        let system = &self.store.system;
-        let value = [&key[..], &time.to_be_bytes()].concat();
-        self.batch.insert(
-            system,
-            node_record(NodeRow::Session, &id.0.to_be_bytes()),
-            value,
-        );
-        self.batch.insert(
-            system,
-            node_record(NodeRow::NextSession, &[]),
-            (id.0 + 1).to_be_bytes(),
-        );
-        self.batch.insert(
-            system,
-            node_record(NodeRow::KeyOpened, key),
-            time.to_be_bytes(),
-        );
-    }
-
-    fn forget_session(&mut self, id: SessionId) {
-        self.batch.remove(
-            &self.store.system,
-            node_record(NodeRow::Session, &id.0.to_be_bytes()),
-        );
     }
 
     fn commit(self, durability: Durability) -> Result<()> {

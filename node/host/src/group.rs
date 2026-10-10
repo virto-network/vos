@@ -84,6 +84,8 @@ pub(crate) struct State {
 pub(crate) struct Shared {
     pub agent: AgentId,
     pub record: CreationRecord,
+    /// The agent's identity: its record's hash, which clients sign for.
+    pub identity: [u8; 32],
     state: Mutex<State>,
     changed: event_listener::Event,
     /// Whether each recent work result took: accumulate advanced the
@@ -95,6 +97,7 @@ impl Shared {
     pub fn new(record: CreationRecord) -> Self {
         Self {
             agent: record.agent,
+            identity: crate::identity(&record),
             record,
             state: Mutex::new(State {
                 role: Role::Follower,
@@ -240,7 +243,7 @@ impl Driver {
         let mut config = RaftConfig::new(
             inner.number,
             shared.record.replicas.clone(),
-            inner.identity(&shared.record),
+            shared.identity,
         );
         config.election_timeout_ms = inner.election_timeout_ms;
         config.heartbeat_interval_ms = inner.heartbeat_ms;
