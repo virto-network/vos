@@ -126,3 +126,88 @@ fn a_client_calls_an_agent_the_operator_installed() {
     assert_eq!(session(&kept), session(&after));
     assert!(after.contains(&format!("next {agent} 3")), "{after}");
 }
+
+/// `vos` that should fail: its error.
+fn vos_fails(args: &[&str]) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_vos"))
+        .args(args)
+        .output()
+        .expect("vos runs");
+    assert!(!output.status.success(), "vos {args:?} succeeded");
+    String::from_utf8_lossy(&output.stderr).to_string()
+}
+
+#[test]
+fn an_operator_reaches_a_tls_node_by_its_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("node");
+    let data = data.to_str().unwrap();
+    let agent = guest("default/target/riscv64em-vos/release/vos-agent.elf");
+
+    // Without TLS, a node listens on a loopback address only.
+    let refused = Command::new(env!("CARGO_BIN_EXE_vos"))
+        .args([
+            "node",
+            "run",
+            "--data",
+            data,
+            "--listen",
+            "0.0.0.0:0",
+            "--agent",
+        ])
+        .arg(&agent)
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("loopback"));
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_vos"))
+        .args([
+            "node",
+            "run",
+            "--tls",
+            "--data",
+            data,
+            "--listen",
+            "127.0.0.1:0",
+            "--agent",
+        ])
+        .arg(&agent)
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("the node starts");
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let _node = Running(child);
+    let listening = lines.next().unwrap().unwrap();
+    let address = listening
+        .strip_prefix("listening on ")
+        .expect("its address");
+    let started = lines.next().unwrap().unwrap();
+    let key = started.strip_prefix("node ").expect("its key").to_string();
+    let url = format!("https://{address}");
+
+    assert_eq!(
+        vos(&["node", "info", "--node", &url, "--node-key", &key]),
+        key
+    );
+    let created = vos(&[
+        "agent",
+        "create",
+        "--node",
+        &url,
+        "--node-key",
+        &key,
+        "--data",
+        data,
+    ]);
+    assert!(created.parse::<u32>().is_ok(), "{created}");
+    // On the node's host, operator commands pin the key the node keeps in
+    // its data directory.
+    let created = vos(&["agent", "create", "--node", &url, "--data", data]);
+    assert!(created.parse::<u32>().is_ok(), "{created}");
+    // Another key, no key, or plain HTTP: refused.
+    let other = "11".repeat(32);
+    vos_fails(&["node", "info", "--node", &url, "--node-key", &other]);
+    vos_fails(&["node", "info", "--node", &url]);
+    vos_fails(&["node", "info", "--node", &format!("http://{address}")]);
+}

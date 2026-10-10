@@ -1,5 +1,5 @@
 //! A small HTTP/1.1 server for the node's ingress: requests with
-//! `Content-Length` bodies over keep-alive connections, no TLS.
+//! `Content-Length` bodies over keep-alive connections, plain or in TLS.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use smol::io::{AsyncReadExt, AsyncWriteExt};
-use smol::net::{TcpListener, TcpStream};
+use smol::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use smol::net::TcpListener;
 
 /// The most a request's head may hold.
 const MAX_HEAD: usize = 16 << 10;
@@ -57,16 +57,42 @@ impl Response {
 pub type Handler =
     Arc<dyn Fn(Request) -> Pin<Box<dyn Future<Output = Response> + Send>> + Send + Sync>;
 
+/// How long a client has to finish its TLS handshake.
+const HANDSHAKE: Duration = Duration::from_secs(10);
+
 /// Accept connections on `listener` and answer each request with
-/// `handler`, until the listener fails.
+/// `handler`, until the listener fails or `stop` resolves; then end every
+/// connection before returning. With `tls`, each connection is in TLS.
 pub async fn serve(
     listener: TcpListener,
+    tls: Option<Arc<rustls::ServerConfig>>,
     handler: Handler,
     limits: Limits,
-    spawn: impl Fn(Pin<Box<dyn Future<Output = ()> + Send>>),
+    spawn: impl Fn(Pin<Box<dyn Future<Output = ()> + Send>>) -> smol::Task<()>,
+    stop: impl Future<Output = ()>,
+) {
+    let mut connections: Vec<smol::Task<()>> = Vec::new();
+    let accepting = async {
+        accept(listener, tls, handler, limits, &spawn, &mut connections).await;
+    };
+    smol::future::or(accepting, stop).await;
+    for connection in connections {
+        connection.cancel().await;
+    }
+}
+
+async fn accept(
+    listener: TcpListener,
+    tls: Option<Arc<rustls::ServerConfig>>,
+    handler: Handler,
+    limits: Limits,
+    spawn: &impl Fn(Pin<Box<dyn Future<Output = ()> + Send>>) -> smol::Task<()>,
+    connections: &mut Vec<smol::Task<()>>,
 ) {
     let open = Arc::new(AtomicUsize::new(0));
+    let acceptor = tls.map(futures_rustls::TlsAcceptor::from);
     while let Ok((stream, _)) = listener.accept().await {
+        connections.retain(|connection| !connection.is_finished());
         if open.fetch_add(1, Ordering::SeqCst) >= limits.connections {
             open.fetch_sub(1, Ordering::SeqCst);
             continue;
@@ -74,12 +100,31 @@ pub async fn serve(
         let handler = Arc::clone(&handler);
         let limits = limits.clone();
         let open = Arc::clone(&open);
-        spawn(Box::pin(async move {
-            if let Err(error) = connection(stream, handler, &limits).await {
+        let acceptor = acceptor.clone();
+        connections.push(spawn(Box::pin(async move {
+            let served = match acceptor {
+                Some(acceptor) => {
+                    let handshake = async { Some(acceptor.accept(stream).await) };
+                    let late = async {
+                        smol::Timer::after(HANDSHAKE).await;
+                        None
+                    };
+                    match smol::future::or(handshake, late).await {
+                        Some(Ok(stream)) => connection(stream, handler, &limits).await,
+                        Some(Err(error)) => Err(error),
+                        None => Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "a slow TLS handshake",
+                        )),
+                    }
+                }
+                None => connection(stream, handler, &limits).await,
+            };
+            if let Err(error) = served {
                 tracing::debug!("an ingress connection ended: {error}");
             }
             open.fetch_sub(1, Ordering::SeqCst);
-        }));
+        })));
     }
 }
 
@@ -88,7 +133,7 @@ pub async fn serve(
 const REQUEST_DEADLINE: Duration = Duration::from_secs(60);
 
 async fn connection(
-    mut stream: TcpStream,
+    mut stream: impl AsyncRead + AsyncWrite + Unpin,
     handler: Handler,
     limits: &Limits,
 ) -> std::io::Result<()> {
@@ -122,7 +167,7 @@ fn invalid(message: &str) -> std::io::Error {
 /// Read what the client sends next, or fail once it has been idle too long
 /// or its request is past its deadline.
 async fn read(
-    stream: &mut TcpStream,
+    stream: &mut (impl AsyncRead + Unpin),
     chunk: &mut [u8],
     idle: Duration,
     deadline: Option<Instant>,
@@ -151,7 +196,7 @@ enum Read {
 
 /// The next request on the connection, and the bytes of `buffer` it used.
 async fn read_request(
-    stream: &mut TcpStream,
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
     buffer: &mut Vec<u8>,
     limits: &Limits,
 ) -> std::io::Result<Read> {
@@ -256,7 +301,7 @@ fn reason(status: u16) -> &'static str {
 }
 
 async fn write_response(
-    stream: &mut TcpStream,
+    stream: &mut (impl AsyncWrite + Unpin),
     response: &Response,
     close: bool,
 ) -> std::io::Result<()> {

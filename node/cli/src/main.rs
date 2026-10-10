@@ -8,8 +8,9 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use ed25519_dalek::SigningKey;
-use vos_node::client::{Client, Operator};
-use vos_node::{ADMIN_TOKEN, Config, Node};
+use vos_node::client::{Client, Operator, Target};
+use vos_node::tls::{IngressTls, Trust};
+use vos_node::{ADMIN_TOKEN, Config, NODE_KEY, Node};
 use vos_wire::abi::refusal;
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, SessionId};
 use vos_wire::ingress::{Answer, Install, Rejection};
@@ -83,7 +84,8 @@ enum Command {
 
 #[derive(Subcommand)]
 enum NodeCommand {
-    /// Run a node until it is killed.
+    /// Run a node until it is killed. Without TLS, it listens on a
+    /// loopback address only.
     Run {
         /// The node's data directory: its store and admin token.
         #[arg(long)]
@@ -93,11 +95,13 @@ enum NodeCommand {
         /// The agent program, as built by `just build-agent`.
         #[arg(long, env = "VOS_AGENT")]
         agent: PathBuf,
+        #[command(flatten)]
+        tls: TlsArgs,
     },
     /// Print a node's public key, its identity.
     Info {
-        #[arg(long, default_value = "http://127.0.0.1:7700")]
-        node: String,
+        #[command(flatten)]
+        node: NodeArgs,
     },
 }
 
@@ -120,10 +124,84 @@ enum AgentCommand {
     },
 }
 
+/// TLS on a node's ingress.
 #[derive(clap::Args)]
-struct OperatorArgs {
+struct TlsArgs {
+    /// Serve TLS with a certificate for the node's own key, which clients
+    /// pin.
+    #[arg(long, conflicts_with = "tls_cert")]
+    tls: bool,
+    /// A name the certificate for the node's key holds: a host name or an
+    /// address. Repeat for more.
+    #[arg(long = "tls-name", requires = "tls")]
+    tls_names: Vec<String>,
+    /// Serve TLS with this PEM certificate chain, which clients trust by
+    /// its CA.
+    #[arg(long, requires = "tls_key")]
+    tls_cert: Option<PathBuf>,
+    /// The PEM key of `--tls-cert`.
+    #[arg(long, requires = "tls_cert")]
+    tls_key: Option<PathBuf>,
+}
+
+impl TlsArgs {
+    fn ingress(&self) -> Option<IngressTls> {
+        match (&self.tls_cert, &self.tls_key) {
+            (Some(chain), Some(key)) => Some(IngressTls::Files {
+                chain: chain.clone(),
+                key: key.clone(),
+            }),
+            _ if self.tls => Some(IngressTls::NodeKey {
+                names: self.tls_names.clone(),
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// A node to reach, and how to trust it.
+#[derive(clap::Args)]
+struct NodeArgs {
+    /// The node's address: `http://` reaches a loopback address only,
+    /// `https://` needs `--node-key` or `--ca`.
     #[arg(long, default_value = "http://127.0.0.1:7700")]
     node: String,
+    /// The node's key, in hex, which its TLS must show: as `vos node run`
+    /// printed it. It wins over `--ca`.
+    #[arg(long, env = "VOS_NODE_KEY")]
+    node_key: Option<String>,
+    /// A PEM file of the CAs that the node's TLS certificate must chain to.
+    #[arg(long, env = "VOS_CA")]
+    ca: Option<PathBuf>,
+}
+
+impl NodeArgs {
+    fn target(&self) -> Result<Target, String> {
+        self.target_or(None)
+    }
+
+    /// The target, pinned by the key in `kept` when neither a key nor a CA
+    /// is given for an `https://` node.
+    fn target_or(&self, kept: Option<&Path>) -> Result<Target, String> {
+        let kept = kept.filter(|_| self.node.starts_with("https://"));
+        let trust = match (&self.node_key, &self.ca, kept) {
+            (Some(key), _, _) => Trust::NodeKey(key_bytes(key)?),
+            (None, Some(ca), _) => Trust::ca_file(ca)?,
+            (None, None, Some(kept)) => {
+                let key = std::fs::read_to_string(kept)
+                    .map_err(|error| format!("{}: {error}", kept.display()))?;
+                Trust::NodeKey(key_bytes(&key)?)
+            }
+            (None, None, None) => Trust::Loopback,
+        };
+        Target::new(&self.node, trust).map_err(failed)
+    }
+}
+
+#[derive(clap::Args)]
+struct OperatorArgs {
+    #[command(flatten)]
+    node: NodeArgs,
     /// The node's data directory, which holds its admin token: operator
     /// commands run on the node's host.
     #[arg(long)]
@@ -132,8 +210,8 @@ struct OperatorArgs {
 
 #[derive(clap::Args)]
 struct CallArgs {
-    #[arg(long, default_value = "http://127.0.0.1:7700")]
-    node: String,
+    #[command(flatten)]
+    node: NodeArgs,
     /// The client key's seed file, from `vos key new`.
     #[arg(long)]
     key: PathBuf,
@@ -167,12 +245,13 @@ fn run(cli: Cli) -> Result<(), String> {
                     data,
                     listen,
                     agent,
+                    tls,
                 },
-        } => node(&data, listen, &agent),
+        } => node(&data, listen, &agent, tls.ingress()),
         Command::Node {
             command: NodeCommand::Info { node },
         } => {
-            let id = vos_node::client::node_id(&node).map_err(failed)?;
+            let id = vos_node::client::node_id(&node.target()?).map_err(failed)?;
             println!("{}", hex::encode(id.0));
             Ok(())
         }
@@ -254,8 +333,15 @@ fn failed(error: vos_node::client::ClientError) -> String {
     format!("{error:?}")
 }
 
-fn node(data: &Path, listen: SocketAddr, agent: &Path) -> Result<(), String> {
-    let node = Node::open(data, Config::new(link(agent)?)).map_err(|error| format!("{error:?}"))?;
+fn node(
+    data: &Path,
+    listen: SocketAddr,
+    agent: &Path,
+    tls: Option<IngressTls>,
+) -> Result<(), String> {
+    let mut config = Config::new(link(agent)?);
+    config.ingress_tls = tls;
+    let node = Node::open(data, config).map_err(|error| format!("{error:?}"))?;
     let address = node.serve(listen).map_err(|error| format!("{error:?}"))?;
     println!("listening on {address}");
     println!("node {}", hex::encode(node.id().0));
@@ -288,7 +374,9 @@ fn operator_of(args: &OperatorArgs) -> Result<Operator, String> {
     let path = args.data.join(ADMIN_TOKEN);
     let token =
         std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
-    Ok(Operator::new(&args.node, &token))
+    // On the node's host, its data directory holds its key.
+    let target = args.node.target_or(Some(&args.data.join(NODE_KEY)))?;
+    Ok(Operator::new(&target, &token))
 }
 
 /// A standard program from an ELF built with the guest toolchain.
@@ -379,7 +467,7 @@ impl Kept {
 }
 
 /// Open a new session, signed later than the key's last open.
-fn open(node: &str, key: &SigningKey, last: u64) -> Result<(Client, Kept), String> {
+fn open(node: &Target, key: &SigningKey, last: u64) -> Result<(Client, Kept), String> {
     let time = vos_node::wall_clock().max(last + 1);
     let client = Client::open(node, key.clone(), time).map_err(failed)?;
     let kept = Kept {
@@ -398,13 +486,14 @@ fn invoke(call: &CallArgs, query: bool) -> Result<(), String> {
     let arguments = hex::decode(call.args.trim()).map_err(|error| error.to_string())?;
     let agent = AgentId(call.agent);
     let instance = InstanceId(call.instance);
-    let node = vos_node::client::node_id(&call.node).map_err(failed)?;
+    let target = call.node.target()?;
+    let node = vos_node::client::node_id(&target).map_err(failed)?;
     let kept = Kept::load(&call.key).filter(|kept| kept.node == node.0);
     let last = kept.as_ref().map_or(0, |kept| kept.opened);
     let (mut client, mut kept) = match kept {
         Some(kept) => (
             Client::resume(
-                &call.node,
+                &target,
                 key.clone(),
                 node,
                 SessionId(kept.session),
@@ -412,7 +501,7 @@ fn invoke(call: &CallArgs, query: bool) -> Result<(), String> {
             ),
             kept,
         ),
-        None => open(&call.node, &key, last)?,
+        None => open(&target, &key, last)?,
     };
     let schema = client
         .schema(agent, instance)
@@ -434,7 +523,7 @@ fn invoke(call: &CallArgs, query: bool) -> Result<(), String> {
         answer,
         Answer::Rejected(Rejection::UnknownSession) | Answer::Refused(refusal::EXPIRED)
     ) {
-        (client, kept) = open(&call.node, &key, kept.opened)?;
+        (client, kept) = open(&target, &key, kept.opened)?;
         answer = send(&mut client)?;
     }
     kept.next = client.next().clone();

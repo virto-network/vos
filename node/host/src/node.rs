@@ -34,6 +34,7 @@ use crate::storage::{Change, StorageThread};
 use crate::store::{
     Batch as _, BlobRef, Durability, Fjall, FjallSnapshot, LogEntry, NODE_AGENT, Store, View,
 };
+use crate::tls::IngressTls;
 
 /// How a node runs.
 pub struct Config {
@@ -55,6 +56,9 @@ pub struct Config {
     /// Milliseconds since the Unix epoch: work-result time, and ingress's
     /// freshness checks. A test moves it.
     pub clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+    /// TLS on the ingress. Without it, the ingress serves loopback
+    /// addresses only.
+    pub ingress_tls: Option<IngressTls>,
 }
 
 impl Config {
@@ -71,6 +75,7 @@ impl Config {
             accumulate_gas: defaults::REFINE_GAS,
             hooks: Arc::new(crate::NoHooks),
             clock: Arc::new(wall_clock),
+            ingress_tls: None,
         }
     }
 }
@@ -332,21 +337,34 @@ pub fn wall_clock() -> u64 {
         .map_or(0, |since| since.as_millis() as u64)
 }
 
-/// Make `dir` if it is missing, readable by its owner only, and take away
-/// any access others have to one that exists: it holds the node's secret,
-/// in files its store makes without a mode of their own.
-fn private_dir(dir: &Path) -> std::io::Result<()> {
+/// Make `dir` if it is missing, readable by its owner only: it holds the
+/// node's secret, in files its store makes without a mode of their own.
+/// An empty directory, or a node's, that others can reach is made its
+/// owner's alone; any other directory others can reach is refused, not
+/// changed (it may be `/tmp`, or a home).
+fn private_dir(dir: &Path) -> Result<(), String> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let failed = |error: std::io::Error| format!("{}: {error}", dir.display());
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
-        .create(dir)?;
-    let mode = std::fs::metadata(dir)?.permissions().mode();
-    if mode & 0o077 != 0 {
-        tracing::warn!(dir = %dir.display(), mode = format!("{mode:o}"), "taking others' access to the data directory away");
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode & 0o700))?;
+        .create(dir)
+        .map_err(failed)?;
+    let mode = std::fs::metadata(dir).map_err(failed)?.permissions().mode();
+    if mode & 0o077 == 0 {
+        return Ok(());
     }
-    Ok(())
+    let empty = std::fs::read_dir(dir).map_err(failed)?.next().is_none();
+    if !empty && !dir.join(STORE).exists() {
+        return Err(format!(
+            "{}: others can reach this directory, and the node's secret would be in it; \
+             run `chmod 700 {}`, or give a new directory",
+            dir.display(),
+            dir.display()
+        ));
+    }
+    tracing::warn!(dir = %dir.display(), mode = format!("{mode:o}"), "taking others' access to the data directory away");
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode & 0o700)).map_err(failed)
 }
 
 fn seed() -> [u8; 32] {
@@ -1018,7 +1036,11 @@ impl Inner {
 pub struct Node {
     inner: Arc<Inner>,
     data: PathBuf,
-    ingress: Mutex<Option<smol::Task<()>>>,
+    /// The seed of the node's key.
+    secret: [u8; 32],
+    ingress_tls: Option<IngressTls>,
+    /// The ingress, and what stops it.
+    ingress: Mutex<Option<(smol::Task<()>, smol::channel::Sender<()>)>>,
     stop: Option<smol::channel::Sender<()>>,
     runtime: Option<JoinHandle<()>>,
 }
@@ -1027,6 +1049,9 @@ pub struct Node {
 const STORE: &str = "store";
 const BLOBS: &str = "blobs";
 pub const ADMIN_TOKEN: &str = "admin.token";
+/// The node's public key, in hex, in its data directory: for operator
+/// commands on the node's host to pin its TLS by.
+pub const NODE_KEY: &str = "node.key";
 
 impl Node {
     /// Open the node's data directory `data` (its store and admin token)
@@ -1039,7 +1064,7 @@ impl Node {
             return Err(Error::Gas);
         }
         let data = data.as_ref().to_path_buf();
-        private_dir(&data).map_err(|error| Error::Data(error.to_string()))?;
+        private_dir(&data).map_err(Error::Data)?;
         let store = Fjall::open(data.join(STORE))?;
         let secret = match store.node_secret()? {
             Some(secret) => secret,
@@ -1052,6 +1077,8 @@ impl Node {
             }
         };
         let node_id = NodeId(SigningKey::from_bytes(&secret).verifying_key().to_bytes());
+        let hex: String = node_id.0.iter().map(|byte| format!("{byte:02x}")).collect();
+        std::fs::write(data.join(NODE_KEY), hex).map_err(|error| Error::Data(error.to_string()))?;
         let blobs = Blobs::open(data.join(BLOBS), &store)?;
         let pool = Arc::new(MachinePool::new());
         for hash in blobs.pinned()? {
@@ -1127,6 +1154,8 @@ impl Node {
         Ok(Self {
             inner,
             data,
+            secret,
+            ingress_tls: config.ingress_tls,
             ingress: Mutex::new(None),
             stop: Some(stop),
             runtime: Some(thread),
@@ -1221,8 +1250,18 @@ impl Node {
 
     /// Serve the HTTP ingress on `address` (`127.0.0.1:0` picks a port):
     /// the address it listens on. The operator's token goes to the data
-    /// directory, readable by its owner only.
+    /// directory, readable by its owner only. Without TLS, only a loopback
+    /// address is served (`0.0.0.0` and `::` are not loopback).
     pub fn serve(&self, address: SocketAddr) -> Result<SocketAddr, Error> {
+        let tls = match &self.ingress_tls {
+            Some(tls) => Some(crate::tls::server_config(tls, &self.secret).map_err(Error::Data)?),
+            None if address.ip().is_loopback() => None,
+            None => {
+                return Err(Error::Data(format!(
+                    "{address}: plain HTTP serves loopback addresses only; give the ingress TLS"
+                )));
+            }
+        };
         let token = seed();
         write_token(&self.data.join(ADMIN_TOKEN), &token)
             .map_err(|error| Error::Data(error.to_string()))?;
@@ -1233,8 +1272,12 @@ impl Node {
             .map_err(|error| Error::Data(error.to_string()))?;
         let ingress = crate::ingress::Ingress::open(Arc::clone(&self.inner), token)
             .map_err(|error| Error::Data(error.to_string()))?;
-        let task = self.inner.runtime.spawn(ingress.serve(listener));
-        *self.ingress.lock().expect("the ingress") = Some(task);
+        let (stop, stopped) = smol::channel::bounded(1);
+        let task = self
+            .inner
+            .runtime
+            .spawn(ingress.serve(listener, tls, stopped));
+        *self.ingress.lock().expect("the ingress") = Some((task, stop));
         Ok(local)
     }
 
@@ -1246,7 +1289,13 @@ impl Node {
     }
 
     fn stop_all(&mut self) {
-        drop(self.ingress.lock().expect("the ingress").take());
+        // End the ingress and its connections while the runtime still runs
+        // them, so none outlives the node holding its store.
+        let ingress = self.ingress.lock().expect("the ingress").take();
+        if let Some((task, stop)) = ingress {
+            let _ = stop.try_send(());
+            smol::block_on(task);
+        }
         let agents: Vec<Arc<Agent>> = self
             .inner
             .agents

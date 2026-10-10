@@ -12,9 +12,10 @@ mod pvm;
 pub mod raft;
 pub mod storage;
 pub mod store;
+pub mod tls;
 
 pub use ingress::SESSIONS_PER_KEY;
-pub use node::{ADMIN_TOKEN, CallError, Config, Error, Node, Reply, wall_clock};
+pub use node::{ADMIN_TOKEN, CallError, Config, Error, NODE_KEY, Node, Reply, wall_clock};
 
 use vos_wire::batch::Batch;
 use vos_wire::ids::AgentId;

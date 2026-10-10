@@ -150,7 +150,13 @@ impl Ingress {
         })
     }
 
-    pub(crate) async fn serve(self, listener: TcpListener) {
+    /// Serve until `stop` resolves, then end every connection.
+    pub(crate) async fn serve(
+        self,
+        listener: TcpListener,
+        tls: Option<Arc<rustls::ServerConfig>>,
+        stop: smol::channel::Receiver<()>,
+    ) {
         let this = Arc::new(self);
         let runtime = Arc::clone(&this.inner.runtime);
         let handler: Handler = {
@@ -171,9 +177,17 @@ impl Ingress {
             idle: Duration::from_secs(30),
             connections: 1024,
         };
-        http::serve(listener, handler, limits, move |connection| {
-            runtime.spawn(connection).detach();
-        })
+        let stopped = async {
+            let _ = stop.recv().await;
+        };
+        http::serve(
+            listener,
+            tls,
+            handler,
+            limits,
+            move |connection| runtime.spawn(connection),
+            stopped,
+        )
         .await;
     }
 

@@ -673,7 +673,7 @@ the version, per-change durability, snapshot export, staged ingestion and
 the atomic switch, recovery. A crash test like slice 2's, per invariant of
 section 9.5.
 
-### 3.4 The network
+### 3.4 The network [done]
 
 The network layer and its messages (SCALE), with authorization in the
 group driver. The in-process implementation is step 3.2's simulator;

@@ -9,7 +9,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
-use vos_node::client::{Client, Operator};
+use vos_node::client::{Client, Operator, Target};
 use vos_node::{ADMIN_TOKEN, Config, Hooks, Node};
 use vos_wire::abi::refusal;
 use vos_wire::batch::{Batch, Input};
@@ -57,6 +57,7 @@ fn method(schema: &Schema, name: &str) -> MethodId {
 struct Served {
     node: Node,
     base: String,
+    target: Target,
     clock: Arc<AtomicU64>,
     agent: AgentId,
     increment: MethodId,
@@ -79,8 +80,9 @@ impl Served {
         let node = Node::open(dir.path(), config).unwrap();
         let address = node.serve("127.0.0.1:0".parse().unwrap()).unwrap();
         let base = format!("http://{address}");
+        let target = Target::loopback(&base).unwrap();
         let token = std::fs::read_to_string(dir.path().join(ADMIN_TOKEN)).unwrap();
-        let operator = Operator::new(&base, &token);
+        let operator = Operator::new(&target, &token);
         let Ok(Answer::Created(agent)) = operator.create_agent() else {
             panic!("an agent")
         };
@@ -95,12 +97,13 @@ impl Served {
             matches!(installed, Answer::Ran(Outcome::Done(_))),
             "{installed:?}"
         );
-        let schema = vos_node::client::schema(&base, agent, COUNTER)
+        let schema = vos_node::client::schema(&target, agent, COUNTER)
             .unwrap()
             .expect("an installed schema");
         Self {
             node,
             base,
+            target,
             clock,
             agent,
             increment: method(&schema, "increment"),
@@ -114,7 +117,12 @@ impl Served {
     }
 
     fn client(&self, seed: u8) -> Client {
-        Client::open(&self.base, SigningKey::from_bytes(&[seed; 32]), self.now()).unwrap()
+        Client::open(
+            &self.target,
+            SigningKey::from_bytes(&[seed; 32]),
+            self.now(),
+        )
+        .unwrap()
     }
 
     fn increment(&self, client: &Client, sequence: u64, by: u64) -> Answer {
@@ -131,15 +139,7 @@ impl Served {
     }
 
     fn post(&self, path: &str, body: &[u8]) -> Answer {
-        let agent = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .build()
-            .new_agent();
-        let mut response = agent
-            .post(&format!("{}{path}", self.base))
-            .send(body)
-            .unwrap();
-        let body = response.body_mut().read_to_vec().unwrap();
+        let (_, body) = vos_node::client::post(&self.target, path, body).unwrap();
         Answer::decode(&body).unwrap().0
     }
 }
@@ -235,7 +235,7 @@ fn signatures_sessions_and_staleness_are_checked() {
 
     // A captured open cannot be replayed, nor signed far off the clock.
     let key = SigningKey::from_bytes(&[9; 32]);
-    let node = vos_node::client::node_id(&served.base).unwrap();
+    let node = vos_node::client::node_id(&served.target).unwrap();
     let public = key.verifying_key().to_bytes();
     let open = |time: u64| {
         use ed25519_dalek::Signer;
@@ -273,16 +273,7 @@ fn signatures_sessions_and_staleness_are_checked() {
 
 impl Served {
     fn status(&self, path: &str, body: &[u8]) -> u16 {
-        let agent = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .build()
-            .new_agent();
-        agent
-            .post(&format!("{}{path}", self.base))
-            .send(body)
-            .unwrap()
-            .status()
-            .as_u16()
+        vos_node::client::post(&self.target, path, body).unwrap().0
     }
 }
 
@@ -381,7 +372,7 @@ fn a_duplicate_in_flight_waits_for_its_answer() {
 #[test]
 fn operator_commands_need_the_token() {
     let served = Served::start(Arc::new(vos_node::NoHooks));
-    let stranger = Operator::new(&served.base, &"00".repeat(32));
+    let stranger = Operator::new(&served.target, &"00".repeat(32));
     assert_eq!(
         stranger.create_agent().unwrap(),
         Answer::Rejected(Rejection::Unauthorized)
@@ -395,7 +386,7 @@ fn operator_commands_need_the_token() {
     );
     assert_eq!(
         served.node.id(),
-        vos_node::client::node_id(&served.base).unwrap()
+        vos_node::client::node_id(&served.target).unwrap()
     );
 }
 
@@ -407,18 +398,30 @@ fn a_node_is_its_public_key_and_never_serves_its_secret() {
         |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
     let programs = Programs::load();
     let dir = tempfile::tempdir().unwrap();
-    // A data directory others could read is made the owner's alone; a new
-    // one is made so.
-    let data = dir.path().join("open");
-    std::fs::create_dir(&data).unwrap();
-    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).unwrap();
-    drop(Node::open(&data, Config::new(programs.agent.clone())).unwrap());
-    assert_eq!(mode(&data), 0o700);
+    // A new data directory is the owner's alone.
     let data = dir.path().join("new");
     let id = Node::open(&data, Config::new(programs.agent.clone()))
         .unwrap()
         .id();
     assert_eq!(mode(&data), 0o700);
+    // A node's directory others could reach is made the owner's alone
+    // again.
+    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).unwrap();
+    drop(Node::open(&data, Config::new(programs.agent.clone())).unwrap());
+    assert_eq!(mode(&data), 0o700);
+    // So is an empty directory others could reach. Any other is refused,
+    // and left as it is.
+    let empty = dir.path().join("empty");
+    std::fs::create_dir(&empty).unwrap();
+    std::fs::set_permissions(&empty, std::fs::Permissions::from_mode(0o755)).unwrap();
+    drop(Node::open(&empty, Config::new(programs.agent.clone())).unwrap());
+    assert_eq!(mode(&empty), 0o700);
+    let shared = dir.path().join("shared");
+    std::fs::create_dir(&shared).unwrap();
+    std::fs::write(shared.join("notes"), b"someone else's").unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(Node::open(&shared, Config::new(programs.agent.clone())).is_err());
+    assert_eq!(mode(&shared), 0o755);
     let store = Fjall::open(data.join("store")).unwrap();
     let secret = store.node_secret().unwrap().expect("a secret seed");
     drop(store);

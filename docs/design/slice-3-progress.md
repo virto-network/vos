@@ -1598,3 +1598,116 @@ Also done:
   it. An etcd-style lease (ignore a higher-term vote request soon after
   hearing a leader) is optional hardening, and would need a transfer
   flag on vote requests.
+
+### 3.4c: TLS on client ingress
+
+**Built:**
+
+- **The ingress serves TLS 1.3** (`futures-rustls` on smol, rustls with
+  ring), with one of two certificates (`vos_node::tls::IngressTls`):
+  - **for the node's own key:** made at start (`rcgen`), self-signed,
+    naming the hosts given (`localhost` by default). Clients pin the key;
+    names and dates do not matter to them;
+  - **from PEM files** (a chain and its key): clients trust its CA.
+  A client has 10 s to finish its handshake. The HTTP server is the same
+  over plain and TLS streams.
+- **Plain HTTP serves loopback addresses only.** `Node::serve` refuses
+  `0.0.0.0`, `::` or any other address without TLS.
+- **The data directory, again:** an empty directory, or a node's own,
+  that others can reach is made its owner's alone, as before. Any other
+  existing directory others can reach is refused, with the `chmod` to
+  run, and not changed: it may be `/tmp`, or a home.
+- **The client** (`vos_node::client`) no longer uses ureq, which cannot
+  take a verifier of its own. It is a small blocking HTTP/1.1 client
+  over `std::net` and rustls. Requests may go at once, each on a
+  connection of its own, and up to four idle connections are kept for up
+  to 20 s (within the node's 30 s). A test pipelines requests from three
+  threads through one client:
+  - `Target::new(url, trust)` pairs an address with a `Trust`:
+    - `Loopback`: plain HTTP, to `localhost` or a loopback address only;
+    - `NodeKey(key)`: TLS 1.3 whose certificate holds this ed25519 key.
+      The key webpki reads from the certificate is the one the
+      handshake's signature is checked against. Names and dates are not
+      checked;
+    - `Ca(certificates)`: TLS whose certificate chains to one of these
+      CAs, for the host's name.
+  - An address and its trust must agree: `https://` needs a key or a CA,
+    `http://` is for loopback alone.
+  - The handshake completes when connecting, so a wrong key fails before
+    any request.
+  - **A pinned node must name itself by its key:** `GET /` answering
+    another id fails as `NotTheNode`, even through a certificate that
+    holds the pinned key.
+- **The CLI:**
+  - `vos node run --tls [--tls-name NAME]...`, or `--tls-cert FILE
+    --tls-key FILE`;
+  - every command that reaches a node takes `--node URL` with
+    `--node-key HEX` (or `VOS_NODE_KEY`) or `--ca FILE` (or `VOS_CA`).
+    The key is the one `vos node run` prints and `vos node info` checks.
+
+**Tests:**
+
+- `node/host/tests/ingress_tls.rs`:
+  - plain HTTP is refused on `0.0.0.0` and `::`, and served on 127.0.0.1;
+  - addresses and trust must agree (eleven cases);
+  - **a pinned key:** the node id, an operator's command and a session
+    over TLS; another key is refused in the handshake; plain HTTP does
+    not reach a TLS ingress;
+  - **a CA:** a node serving a certificate a test CA signed for
+    `localhost` is trusted through that CA. It is refused through
+    another CA, or by the node's key, which this certificate does not
+    hold. A client pinning the certificate's own key passes TLS, but the
+    node names itself otherwise: `NotTheNode`.
+- The node test covers the data directory's four cases.
+- `node/cli/tests/cli.rs`: `vos node run` refuses `0.0.0.0` without
+  TLS; with `--tls`, `vos node info` and `vos agent create` over
+  `https://` with the printed key work; another key, no key, or plain
+  HTTP are refused.
+- The ingress tests, sessions and the operator's, run through the new
+  client.
+
+**Left to later steps:**
+
+- **Step 3.5:** the CLI pins every replica's key, so failing over to
+  another replica passes the check.
+- **Browsers:** some do not take Ed25519 certificates. A node that
+  serves them uses PEM files with another kind of key.
+
+**Review** (Opus): go, with three should-fixes, all done:
+
+1. **Plain targets never resolve a name.** `localhost` maps to 127.0.0.1
+   and ::1, and an address must be a loopback one. A resolver asked for
+   `localhost` (when `/etc/hosts` lacks it, glibc asks DNS) could have
+   sent the operator's token off the host in the clear.
+2. **The server pins TLS 1.3,** rather than relying on no dependency
+   turning on rustls's `tls12` feature.
+3. **The handshake runs within the 10 s connect timeout,** then the
+   timeouts rise to the 300 s an answer may take.
+
+Also done:
+- **A stale kept connection:** a request that the node takes twice as
+  once fails on a kept connection before any answer arrives (the node
+  likely restarted). It is then sent once more on a new connection, and
+  the other kept connections are dropped. That covers reads, and signed
+  calls and queries, which the node deduplicates. A session open and an
+  operator's command are never sent twice. Test: a node restarted in
+  the same process under a client's kept connection; it fails without
+  the retry.
+- **Shutting down ended the ingress but not its connections.** They were
+  detached tasks, and a kept connection held the node's store open
+  after `Node::shutdown`, so the node could not open again in the same
+  process. Step 3.5's in-process clusters restart nodes. The ingress now
+  owns its connections, and on shutdown cancels each before the runtime
+  stops.
+- answers above 16 MiB are refused;
+- the node keeps its public key in its data directory (`node.key`), and
+  operator commands, which run on the node's host, pin it when given
+  neither a key nor a CA;
+- `--node-key` wins over `--ca` (or their variables), rather than
+  conflicting;
+- a host name rustls cannot take (an underscore, say) still works with
+  a pinned key, which needs no name.
+
+**For step 3.5:** `Trust::NodeKey` becomes a set (the replicas' keys,
+from the directory, read from a node already pinned), and a client's
+kept sessions are keyed by agent rather than by node.
