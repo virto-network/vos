@@ -816,3 +816,96 @@ replica (log, epochs, node rows, pins) with its tombstone.
 For later steps: refuse a compaction at or below the log start once a
 switch can move it (3.3c); recover each agent's terms and the log's tail
 only, not its whole live log, when a node runs many agents (3.8).
+
+### 3.3b, part 1: entries reported apart (vos-raft)
+
+**Built:**
+
+- **`durable(seq)` credits terms, votes and truncations only.** Entries
+  count once the host reports them with `entries_durable(seq)`: the
+  entries of every write through `seq` are durable, with every blob each
+  names.
+  - The core remembers which write appended each index (runs of first
+    index and write, cut on truncation). A report credits only entries
+    those writes appended that the log still holds. A report from before
+    a truncation never vouches for an entry written again after it, even
+    one with the same index and term.
+  - The driver, the simulator and the node's adapter report both
+    together after each write.
+- **`discard_unreported()`:** a replica drops the entries it never
+  reported, above max(durable index, commit index), as a crash drops
+  unsynced writes. When to give up on a blob is the host's (steps 3.4 and
+  3.7); the recovery cut (below) does the same at startup.
+  - **Why:** separate reports let a follower holding an entry without
+    its blob vote and campaign. But if the blob is lost with the leader
+    that sent it, that follower wins (its log is the longest) and can
+    never commit, since its own score stops below the entry.
+  - **Safe** because it never acknowledged those entries. Entries at or
+    below the commit index stay: a quorum holds them, blobs included.
+  - **A candidate, pre-candidate or leader steps down first.** A
+    candidate's requests advertised the longer log, so a grant made
+    against it must no longer count. A leader may have counted followers
+    for its own entries, and it cannot know which inherited entries are
+    committed.
+- **The configuration in effect at the log's start.** Found by the
+  chaos run below (two leaders in one term, seed 78):
+  - A follower whose log was compacted past its configuration entries
+    took a truncation that removed a newer one. It fell back to the
+    static members of its first configuration, while its peers counted
+    majorities of the real set.
+  - The core now keeps the configuration in effect at its log's start.
+    `CompactBound` carries it, the host keeps it with the log's start (a
+    snapshot switch sets it too), and `Recovered` returns it. A
+    truncation, or a recovery with no configuration entry left in the
+    log, falls back to it.
+  - A snapshot sent to a peer carries that configuration: the one at the
+    snapshot's index, not the newest view.
+  - vos-raft's `Storage` gains an optional row for it, which `MemStorage`
+    and the worker driver keep. A host that kept none leaves it unknown:
+    a persisted view at or below the log's start stands in, else nothing.
+    A snapshot then carries no configuration, rather than a guess, and a
+    truncation falls back to the static members, as before.
+  - `config_at(index)` is public. A host exporting a snapshot at its own
+    applied index ships the configuration there (3.3c).
+
+**Tests:**
+
+- core tests:
+  - an entry waiting for a lost blob never stalls an election;
+  - a discard keeps committed entries;
+  - a leader steps down before it discards;
+  - a candidate that discards ignores grants for its longer log;
+  - a report from before a discard vouches for nothing written after;
+  - a truncation falls back to the log start's configuration;
+  - an unknown log start's configuration is never sent;
+  - `MemStorage` keeps it across a compaction.
+- **Chaos with lagging entry reports:** entries are reported 1–60 ms
+  after their writes, and replicas discard unreported entries at random,
+  over 200 seeds with membership churn. The other variants, fixed and
+  churning membership, pass as before.
+- **Mutations**, each caught by its core test:
+  - no step-down for a candidate;
+  - reports by (index, term) instead of by write;
+  - a leader that never discards;
+  - the static fallback.
+  The chaos run caught a leader discarding without stepping down (seed
+  1). Since the fixes, it catches none of these: the interleavings are
+  narrow.
+- vos-raft has 111 tests. The node's adapter, its three-replica runs and
+  `raft_crash` carry the log start's configuration.
+
+**Review** (Opus): the first version was a no-go. A candidate that
+discarded could be elected on its advertised longer log, and a stale
+report could vouch for an entry written again in the same term. Both are
+fixed above, as is the leader's step-down it recommended.
+
+The second review was a go, with the reference driver keeping the log
+start's configuration and nothing ever shipping a guess, both done.
+Notes for later steps:
+- 3.3b's host reports `entries_durable(seq)` only once every write
+  through `seq` is synced and has its blobs. A late report is always
+  safe; an early one is not.
+- "Lost" in the discard policy means unfetchable, not merely slow: a
+  discard too early costs a leadership change.
+- 3.3c's switch writes `SnapshotSwitch.log_start_config` into the
+  log-start row, in the same batch.

@@ -63,7 +63,7 @@ struct Exercised {
 /// replicas load from the store or install snapshots. Reads are asked
 /// throughout. Then everything heals, and the group must still make
 /// progress.
-fn chaos(seed: u64, churn: bool) -> Exercised {
+fn chaos(seed: u64, churn: bool, entry_lag: (u64, u64)) -> Exercised {
     // With churn, a fourth node waits outside the group, and the group's
     // membership moves between three-node subsets of the four.
     let nodes: &[u16] = if churn { &[1, 2, 3, 4] } else { &NODES };
@@ -82,6 +82,10 @@ fn chaos(seed: u64, churn: bool) -> Exercised {
         cfg.compact_hysteresis = 4;
     });
     cluster.sync_delay = (1, 80);
+    // With a lag, entries are reported durable after their writes, as
+    // when they wait for blobs, and followers give up on them at random.
+    cluster.entry_lag = entry_lag;
+    let lagging = entry_lag.1 > 0;
     let mut proposals = 0u32;
     let mut down: Vec<(u16, u64)> = Vec::new();
     for _ in 0..2_000 {
@@ -112,6 +116,7 @@ fn chaos(seed: u64, churn: bool) -> Exercised {
                     cluster.read_index(leader);
                 }
             }
+            576..=590 if lagging => cluster.discard_unreported(node),
             561..=575 if churn => {
                 if let Some(leader) = cluster.leader() {
                     let out = nodes[(cluster.random.next_u64() % 4) as usize];
@@ -169,7 +174,7 @@ fn chaos(seed: u64, churn: bool) -> Exercised {
 fn safety_holds_under_faults() {
     let mut total = Exercised::default();
     for seed in 0..200 {
-        let run = chaos(seed, false);
+        let run = chaos(seed, false, (0, 0));
         total.installs += run.installs;
         total.compactions += run.compactions;
         total.loads += run.loads;
@@ -194,7 +199,7 @@ fn safety_holds_under_faults() {
 fn safety_holds_under_faults_and_membership_changes() {
     let mut total = Exercised::default();
     for seed in 0..200 {
-        let run = chaos(seed, true);
+        let run = chaos(seed, true, (0, 0));
         total.changes += run.changes;
         total.installs += run.installs;
     }
@@ -203,4 +208,19 @@ fn safety_holds_under_faults_and_membership_changes() {
         total.changes, total.installs
     );
     assert!(total.changes >= 500, "changes: {}", total.changes);
+}
+
+#[test]
+fn safety_holds_when_entries_wait_for_blobs() {
+    let mut total = Exercised::default();
+    for seed in 0..200 {
+        let run = chaos(seed, true, (1, 60));
+        total.changes += run.changes;
+        total.reads += run.reads;
+    }
+    eprintln!(
+        "changes started {}, reads answered {}",
+        total.changes, total.reads
+    );
+    assert!(total.reads >= 1_000, "reads: {}", total.reads);
 }

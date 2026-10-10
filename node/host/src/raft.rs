@@ -81,11 +81,7 @@ pub fn changes(agent: AgentId, write: &Write<NodeNumber>) -> Vec<Change> {
     if let Some(record) = &write.active_config {
         changes.push(Change::Membership {
             agent,
-            membership: Membership {
-                index: record.log_index,
-                members: record.current.clone(),
-                joint_old: record.joint_old.clone(),
-            },
+            membership: membership(record),
         });
     }
     changes
@@ -104,11 +100,13 @@ pub fn load(
         .collect())
 }
 
-/// The compaction of the log through `through`, if the log still holds it.
+/// The compaction of the log through `through`, if the log still holds it,
+/// with `configuration` in effect there, when the core knows it.
 pub fn compaction(
     store: &impl Store,
     agent: AgentId,
     through: u64,
+    configuration: Option<&ActiveConfigRecord<NodeNumber>>,
 ) -> store::Result<Option<Change>> {
     Ok(store
         .log_entry(agent, through)?
@@ -116,7 +114,24 @@ pub fn compaction(
             agent,
             through,
             term: entry.term,
+            membership: configuration.map(membership),
         }))
+}
+
+fn membership(record: &ActiveConfigRecord<NodeNumber>) -> Membership {
+    Membership {
+        index: record.log_index,
+        members: record.current.clone(),
+        joint_old: record.joint_old.clone(),
+    }
+}
+
+fn record(membership: Membership) -> ActiveConfigRecord<NodeNumber> {
+    ActiveConfigRecord {
+        log_index: membership.index,
+        current: membership.members,
+        joint_old: membership.joint_old,
+    }
 }
 
 /// What the core recovers from the store's rows.
@@ -134,11 +149,8 @@ pub fn recovered(rows: RaftRows) -> Recovered<NodeNumber> {
             .iter()
             .map(|(index, entry)| to_raft(*index, entry))
             .collect(),
-        active_config: rows.membership.map(|membership| ActiveConfigRecord {
-            log_index: membership.index,
-            current: membership.members,
-            joint_old: membership.joint_old,
-        }),
+        active_config: rows.membership.map(record),
+        log_start_config: rows.log_start_membership.map(record),
         applied: rows.applied,
     }
 }
@@ -298,6 +310,7 @@ mod tests {
                         Action::Write(write) => {
                             smol::block_on(writer.commit(changes(AGENT, &write))).unwrap();
                             core.durable(write.seq);
+                            core.entries_durable(write.seq);
                         }
                         Action::Send { to, message } => self.network.push_back((node, to, message)),
                         Action::LoadEntries(request) => {
@@ -331,8 +344,13 @@ mod tests {
                             }
                             core.durably_applied(writer.durably_applied(AGENT));
                         }
-                        Action::CompactBound { through } => {
-                            if let Some(change) = compaction(store, AGENT, through).unwrap() {
+                        Action::CompactBound {
+                            through,
+                            configuration,
+                        } => {
+                            if let Some(change) =
+                                compaction(store, AGENT, through, configuration.as_ref()).unwrap()
+                            {
                                 smol::block_on(writer.commit(vec![change])).unwrap();
                                 core.compacted(through);
                             }

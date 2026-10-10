@@ -562,9 +562,11 @@ where
                                 state: None,
                                 meta,
                                 active_config: write.active_config,
+                                log_start_config: None,
                             })
                             .await?;
                         core.durable(write.seq);
+                        core.entries_durable(write.seq);
                     }
                     Action::Send { to, message } => self.send(to, Envelope::Raft(message)),
                     Action::LoadEntries(load) => {
@@ -585,11 +587,15 @@ where
                         self.start_snapshot(core, to, index, term, configuration)
                             .await?
                     }
-                    Action::CompactBound { through } => {
+                    Action::CompactBound {
+                        through,
+                        configuration,
+                    } => {
                         if let Some(term) = self.storage.term_at(through).await? {
                             self.storage
                                 .commit_batch(WriteBatch {
                                     compact_to: Some((through, term)),
+                                    log_start_config: configuration,
                                     ..Default::default()
                                 })
                                 .await?;
@@ -826,6 +832,7 @@ where
                 state: Some(incoming.buffer),
                 meta: Some(switch.meta),
                 active_config: Some(switch.active_config),
+                log_start_config: switch.log_start_config,
             })
             .await?;
         core.snapshot_installed(incoming.index, incoming.index_term, configuration);
@@ -1047,11 +1054,13 @@ async fn recover<N: NodeId, S: Storage<N>>(storage: &S) -> Result<Recovered<N>, 
         Vec::new()
     };
     let active_config = storage.active_config().await?;
+    let log_start_config = storage.log_start_config().await?;
     let applied = storage.applied_index().await?.unwrap_or(meta.commit_index);
     Ok(Recovered {
         meta,
         entries,
         active_config,
+        log_start_config,
         applied,
     })
 }

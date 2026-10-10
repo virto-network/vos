@@ -171,7 +171,10 @@ pub enum Packet {
 #[derive(Debug, Clone)]
 enum Op<N: NodeId> {
     Write(Write<N>),
-    Compact { through: u64 },
+    Compact {
+        through: u64,
+        configuration: Option<ActiveConfigRecord<N>>,
+    },
 }
 
 /// One node's store: durable state, and operations not yet synced.
@@ -180,6 +183,7 @@ pub struct Store<N: NodeId> {
     meta: Meta<N>,
     log: BTreeMap<u64, LogEntry<N>>,
     active_config: Option<ActiveConfigRecord<N>>,
+    log_start_config: Option<ActiveConfigRecord<N>>,
     applied: u64,
     unsynced: VecDeque<Op<N>>,
 }
@@ -190,6 +194,7 @@ impl<N: NodeId> Default for Store<N> {
             meta: Meta::default(),
             log: BTreeMap::new(),
             active_config: None,
+            log_start_config: None,
             applied: 0,
             unsynced: VecDeque::new(),
         }
@@ -226,13 +231,18 @@ impl<N: NodeId> Store<N> {
                 }
                 synced.seq = Some(write.seq);
             }
-            &Op::Compact { through } => {
+            Op::Compact {
+                through,
+                configuration,
+            } => {
+                let through = *through;
                 if through > self.meta.snap_last_index
                     && let Some(term) = self.log.get(&through).map(|entry| entry.term)
                 {
                     self.log.retain(|&index, _| index > through);
                     self.meta.snap_last_index = through;
                     self.meta.snap_last_term = term;
+                    self.log_start_config = configuration.clone();
                     synced.compacted = Some(through);
                 }
             }
@@ -266,6 +276,7 @@ impl<N: NodeId> Store<N> {
         self.log.retain(|&at, _| at > index);
         self.meta = switch.meta;
         self.active_config = Some(switch.active_config);
+        self.log_start_config = switch.log_start_config;
         self.applied = self.applied.max(index);
     }
 
@@ -278,6 +289,7 @@ impl<N: NodeId> Store<N> {
                 .map(|(_, entry)| entry.clone())
                 .collect(),
             active_config: self.active_config.clone(),
+            log_start_config: self.log_start_config.clone(),
             applied: self.applied,
         }
     }
@@ -325,6 +337,12 @@ pub struct Cluster {
     /// Sync delay in milliseconds.
     pub sync_delay: (u64, u64),
     sync_due: BTreeMap<u16, u64>,
+    /// How long after a sync its entries are reported durable, in
+    /// milliseconds, as when a node waits for the blobs they name: terms,
+    /// votes and truncations are reported at once.
+    pub entry_lag: (u64, u64),
+    /// Entry reports waiting out their lag: (due, write) per node.
+    entry_reports: BTreeMap<u16, Vec<(u64, u64)>>,
     /// Each node's applied index, durable at its next sync.
     applied: BTreeMap<u16, u64>,
     leaders: BTreeMap<u64, u16>,
@@ -378,6 +396,8 @@ impl Cluster {
             cfg,
             sync_delay: (1, 3),
             sync_due: BTreeMap::new(),
+            entry_lag: (0, 0),
+            entry_reports: BTreeMap::new(),
             applied: BTreeMap::new(),
             leaders: BTreeMap::new(),
             committed: BTreeMap::new(),
@@ -424,6 +444,7 @@ impl Cluster {
         self.stores.get_mut(&node).expect("a node").crash(keep);
         self.cores.insert(node, None);
         self.sync_due.remove(&node);
+        self.entry_reports.remove(&node);
     }
 
     pub fn restart(&mut self, node: u16) {
@@ -468,6 +489,14 @@ impl Cluster {
         token
     }
 
+    /// `node`'s host gives up on its unreported entries.
+    pub fn discard_unreported(&mut self, node: u16) {
+        if let Some(Some(core)) = self.cores.get_mut(&node) {
+            core.discard_unreported();
+            self.process(node);
+        }
+    }
+
     /// Ask `node` to change the group's membership to `members`: its token.
     pub fn change_membership(&mut self, node: u16, members: Vec<u16>) -> u64 {
         self.next_token += 1;
@@ -491,6 +520,10 @@ impl Cluster {
         let next = [
             self.network.next_due(),
             self.sync_due.values().min().copied(),
+            self.entry_reports
+                .values()
+                .flat_map(|reports| reports.iter().map(|&(due, ..)| due))
+                .min(),
             self.cores
                 .values()
                 .filter_map(|core| core.as_ref().map(Core::next_deadline))
@@ -531,6 +564,20 @@ impl Cluster {
             self.sync(node);
         }
         for node in self.nodes.clone() {
+            let Some(reports) = self.entry_reports.get_mut(&node) else {
+                continue;
+            };
+            let (ready, waiting): (Vec<_>, Vec<_>) =
+                reports.drain(..).partition(|&(due, ..)| due <= now);
+            *reports = waiting;
+            if let Some(Some(core)) = self.cores.get_mut(&node) {
+                for (_, seq) in ready {
+                    core.entries_durable(seq);
+                }
+                self.process(node);
+            }
+        }
+        for node in self.nodes.clone() {
             if let Some(Some(core)) = self.cores.get_mut(&node)
                 && core.next_deadline() <= now
             {
@@ -554,6 +601,14 @@ impl Cluster {
         };
         if let Some(seq) = synced.seq {
             core.durable(seq);
+        }
+        if let Some(seq) = synced.seq {
+            if self.entry_lag.1 == 0 {
+                core.entries_durable(seq);
+            } else {
+                let due = self.now + self.random.between(self.entry_lag.0, self.entry_lag.1);
+                self.entry_reports.entry(node).or_default().push((due, seq));
+            }
         }
         core.durably_applied(applied);
         if let Some(through) = synced.compacted {
@@ -663,7 +718,16 @@ impl Cluster {
                             },
                         );
                     }
-                    Action::CompactBound { through } => self.queue(node, Op::Compact { through }),
+                    Action::CompactBound {
+                        through,
+                        configuration,
+                    } => self.queue(
+                        node,
+                        Op::Compact {
+                            through,
+                            configuration,
+                        },
+                    ),
                     Action::Answer(Answer::Propose {
                         token,
                         result: Ok(index),

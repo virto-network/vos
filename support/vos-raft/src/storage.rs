@@ -91,6 +91,9 @@ pub struct WriteBatch<N: NodeId> {
     /// installed). Backends that do persist it surface the value at
     /// restart via [`Storage::active_config`].
     pub active_config: Option<ActiveConfigRecord<N>>,
+    /// The configuration in effect at the log's start, kept with a
+    /// compaction or a snapshot switch. `None` leaves the kept one.
+    pub log_start_config: Option<ActiveConfigRecord<N>>,
 }
 
 // Manual impl so the empty-batch shorthand `..Default::default()`
@@ -105,6 +108,7 @@ impl<N: NodeId> Default for WriteBatch<N> {
             state: None,
             meta: None,
             active_config: None,
+            log_start_config: None,
         }
     }
 }
@@ -201,6 +205,15 @@ pub trait Storage<N: NodeId>: Send + 'static {
         async { Ok(None) }
     }
 
+    /// The configuration in effect at the log's start, if the backend keeps
+    /// it ([`WriteBatch::log_start_config`]).
+    fn log_start_config(
+        &self,
+    ) -> impl core::future::Future<Output = Result<Option<ActiveConfigRecord<N>>, Self::Error>> + Send
+    {
+        async { Ok(None) }
+    }
+
     // ── Atomic write (async) ────────────────────────────────
     /// Apply a [`WriteBatch`] atomically, refresh whatever the
     /// implementation needs for its cached `last_*` / `snap_*`
@@ -225,6 +238,7 @@ pub struct MemStorage<N: NodeId> {
     /// worker most recently wrote via `WriteBatch::active_config`.
     /// `None` until a `ConfigChange` has been observed.
     active_config: Option<ActiveConfigRecord<N>>,
+    log_start_config: Option<ActiveConfigRecord<N>>,
 }
 
 impl<N: NodeId> Default for MemStorage<N> {
@@ -235,6 +249,7 @@ impl<N: NodeId> Default for MemStorage<N> {
             meta: Meta::default(),
             applied_index: None,
             active_config: None,
+            log_start_config: None,
         }
     }
 }
@@ -320,6 +335,10 @@ impl<N: NodeId> Storage<N> for MemStorage<N> {
         Ok(self.active_config.clone())
     }
 
+    async fn log_start_config(&self) -> Result<Option<ActiveConfigRecord<N>>, Self::Error> {
+        Ok(self.log_start_config.clone())
+    }
+
     async fn commit_batch(&mut self, batch: WriteBatch<N>) -> Result<(), Self::Error> {
         if let Some(after) = batch.truncate_after {
             self.log.retain(|k, _| *k <= after);
@@ -347,6 +366,9 @@ impl<N: NodeId> Storage<N> for MemStorage<N> {
         }
         if let Some(cfg) = batch.active_config {
             self.active_config = Some(cfg);
+        }
+        if let Some(cfg) = batch.log_start_config {
+            self.log_start_config = Some(cfg);
         }
         Ok(())
     }
@@ -448,6 +470,33 @@ mod tests {
                 1,
                 "only entry 3 survives compaction"
             );
+        });
+    }
+
+    #[test]
+    fn compaction_keeps_the_log_start_configuration() {
+        block_on(async {
+            let mut s = Mem::new();
+            assert_eq!(s.log_start_config().await.unwrap(), None);
+            let at_start = ActiveConfigRecord {
+                log_index: Some(1),
+                current: vec![1, 2, 3],
+                joint_old: None,
+            };
+            s.commit_batch(WriteBatch {
+                appends: vec![entry(1, 1), entry(2, 1)],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            s.commit_batch(WriteBatch {
+                compact_to: Some((2, 1)),
+                log_start_config: Some(at_start.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            assert_eq!(s.log_start_config().await.unwrap(), Some(at_start));
         });
     }
 }

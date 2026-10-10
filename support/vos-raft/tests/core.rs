@@ -4,7 +4,7 @@
 #![cfg(feature = "std")]
 
 use vos_raft::core::{Action, Answer, Core, ProposeError, Recovered, Write};
-use vos_raft::{AppendResult, Config, LogEntry, Message, Meta, Role};
+use vos_raft::{ActiveConfigRecord, AppendResult, Config, LogEntry, Message, Meta, Role};
 
 const LEADER_A: u16 = 2;
 const LEADER_B: u16 = 3;
@@ -35,6 +35,7 @@ fn follower(term: u64, terms: &[u64], commit: u64) -> Core<u16> {
         },
         entries,
         active_config: None,
+        log_start_config: None,
         applied: commit,
     };
     let mut core = Core::new(config(), recovered, 0, 7);
@@ -61,6 +62,13 @@ fn append(
             .map(|&(index, term)| LogEntry::data(index, term, vec![0xee]))
             .collect(),
     }
+}
+
+/// Report `write` durable, its entries included, as a host without
+/// blobs does.
+fn persist(core: &mut Core<u16>, write: &Write<u16>) {
+    core.durable(write.seq);
+    core.entries_durable(write.seq);
 }
 
 fn writes(actions: &[Action<u16>]) -> Vec<Write<u16>> {
@@ -118,7 +126,7 @@ fn a_late_report_of_a_replaced_write_vouches_for_nothing() {
     let mut core = follower(2, &[1; 10], 10);
     core.receive(LEADER_A, append(2, LEADER_A, (10, 1), 0, &[(11, 2)]));
     let first = core.take_actions();
-    let old_write = writes(&first).last().expect("a write").seq;
+    let old_write = writes(&first).last().expect("a write").clone();
     assert_eq!(
         claimed(&first),
         Some(10),
@@ -131,17 +139,17 @@ fn a_late_report_of_a_replaced_write_vouches_for_nothing() {
         append(3, LEADER_B, (10, 1), 0, &[(11, 3), (12, 3)]),
     );
     let second = core.take_actions();
-    let new_write = writes(&second).last().expect("a write").seq;
+    let new_write = writes(&second).last().expect("a write").clone();
 
     // The old write's report arrives late. It wrote an entry at 11 too, but
     // at term 2: it must not vouch for B's entry there.
-    core.durable(old_write);
+    persist(&mut core, &old_write);
     let late = core.take_actions();
     assert!(claimed(&late).is_none_or(|index| index <= 10), "{late:?}");
     assert_eq!(core.status().durable_index, 10);
 
     // B's own write does.
-    core.durable(new_write);
+    persist(&mut core, &new_write);
     let ready = core.take_actions();
     assert_eq!(claimed(&ready), Some(12));
     assert_eq!(core.status().durable_index, 12);
@@ -155,8 +163,8 @@ fn leader_of_two() -> Core<u16> {
     let mut core = Core::new(cfg, Recovered::default(), 0, 5);
     core.take_actions();
     core.tick(1_000);
-    let vote = writes(&core.take_actions()).last().unwrap().seq;
-    core.durable(vote);
+    let vote = writes(&core.take_actions()).last().unwrap().clone();
+    persist(&mut core, &vote);
     core.receive(
         LEADER_A,
         Message::VoteAnswer {
@@ -165,8 +173,8 @@ fn leader_of_two() -> Core<u16> {
         },
     );
     assert_eq!(core.role(), Role::Leader);
-    let no_op = writes(&core.take_actions()).last().unwrap().seq;
-    core.durable(no_op);
+    let no_op = writes(&core.take_actions()).last().unwrap().clone();
+    persist(&mut core, &no_op);
     core.take_actions();
     core
 }
@@ -179,8 +187,8 @@ fn a_leader_sends_each_peer_a_commit_it_has_acknowledged() {
     let mut core = Core::new(cfg, Recovered::default(), 0, 5);
     core.take_actions();
     core.tick(1_000);
-    let vote = writes(&core.take_actions()).last().unwrap().seq;
-    core.durable(vote);
+    let vote = writes(&core.take_actions()).last().unwrap().clone();
+    persist(&mut core, &vote);
     core.receive(
         LEADER_A,
         Message::VoteAnswer {
@@ -192,8 +200,8 @@ fn a_leader_sends_each_peer_a_commit_it_has_acknowledged() {
     for n in 0..4u8 {
         core.propose(u64::from(n), vec![n]);
     }
-    let write = writes(&core.take_actions()).last().unwrap().seq;
-    core.durable(write);
+    let write = writes(&core.take_actions()).last().unwrap().clone();
+    persist(&mut core, &write);
     let answer = |matched| Message::AppendAnswer {
         term: 1,
         round: 0,
@@ -264,7 +272,7 @@ fn a_vote_leaves_only_once_it_is_durable() {
         write.meta.as_ref().map(|meta| meta.voted_for),
         Some(Some(LEADER_B))
     );
-    core.durable(write.seq);
+    persist(&mut core, &write);
     let actions = core.take_actions();
     assert!(sent(&actions).contains(&Message::VoteAnswer {
         term: 2,
@@ -281,7 +289,7 @@ fn an_answer_at_a_new_term_waits_for_the_term() {
     let actions = core.take_actions();
     assert!(sent(&actions).is_empty(), "{actions:?}");
     let write = writes(&actions).last().expect("the term's write").clone();
-    core.durable(write.seq);
+    persist(&mut core, &write);
     let actions = core.take_actions();
     assert!(matches!(
         sent(&actions).as_slice(),
@@ -307,13 +315,13 @@ fn a_candidate_counts_its_own_vote_only_once_durable() {
         "not leader before the vote is durable"
     );
     let write = writes(&actions).last().expect("term and vote").clone();
-    core.durable(write.seq);
+    persist(&mut core, &write);
     let actions = core.take_actions();
     assert_eq!(core.role(), Role::Leader);
     // Its no-op commits only once durable, too.
     assert!(committed(&actions).is_none());
     let no_op = writes(&actions).last().expect("the no-op").clone();
-    core.durable(no_op.seq);
+    persist(&mut core, &no_op);
     assert_eq!(committed(&core.take_actions()), Some(1));
 }
 
@@ -409,8 +417,8 @@ fn an_append_carries_at_most_its_byte_cap() {
     let mut core = Core::new(cfg, Recovered::default(), 0, 5);
     core.take_actions();
     core.tick(1_000);
-    let vote = writes(&core.take_actions()).last().unwrap().seq;
-    core.durable(vote);
+    let vote = writes(&core.take_actions()).last().unwrap().clone();
+    persist(&mut core, &vote);
     core.receive(
         LEADER_A,
         Message::VoteAnswer {
@@ -455,13 +463,14 @@ fn a_rejection_moves_the_probe_past_the_conflicting_term() {
         },
         entries,
         active_config: None,
+        log_start_config: None,
         applied: 3,
     };
     let mut core = Core::new(cfg, recovered, 0, 5);
     core.take_actions();
     core.tick(1_000);
-    let vote = writes(&core.take_actions()).last().unwrap().seq;
-    core.durable(vote);
+    let vote = writes(&core.take_actions()).last().unwrap().clone();
+    persist(&mut core, &vote);
     core.receive(
         LEADER_A,
         Message::VoteAnswer {
@@ -516,8 +525,8 @@ fn a_transfer_hands_over_once_the_target_holds_everything() {
     let mut core = leader_of_two();
     core.receive(LEADER_A, matched(1));
     core.propose(1, vec![1]);
-    let write = writes(&core.take_actions()).last().unwrap().seq;
-    core.durable(write);
+    let write = writes(&core.take_actions()).last().unwrap().clone();
+    persist(&mut core, &write);
     core.transfer_leadership(Some(LEADER_A));
     let actions = core.take_actions();
     assert!(
@@ -587,8 +596,8 @@ fn a_follower_behind_the_cache_catches_up_from_the_store() {
     let mut core = Core::new(cfg, Recovered::default(), 0, 5);
     core.take_actions();
     core.tick(1_000);
-    let vote = writes(&core.take_actions()).last().unwrap().seq;
-    core.durable(vote);
+    let vote = writes(&core.take_actions()).last().unwrap().clone();
+    persist(&mut core, &vote);
     core.receive(
         LEADER_A,
         Message::VoteAnswer {
@@ -598,18 +607,18 @@ fn a_follower_behind_the_cache_catches_up_from_the_store() {
     );
     // The store: every entry the leader writes, made durable at once.
     let mut store: Vec<LogEntry<u16>> = Vec::new();
-    let mut persist = |core: &mut Core<u16>, actions: &[Action<u16>]| {
+    let mut persist_all = |core: &mut Core<u16>, actions: &[Action<u16>]| {
         for write in writes(actions) {
             store.extend(write.entries.iter().cloned());
-            core.durable(write.seq);
+            persist(core, &write);
         }
     };
     let actions = core.take_actions();
-    persist(&mut core, &actions);
+    persist_all(&mut core, &actions);
     for n in 0..6u8 {
         core.propose(u64::from(n), vec![n]);
         let actions = core.take_actions();
-        persist(&mut core, &actions);
+        persist_all(&mut core, &actions);
     }
     // A never answered the no-op; its slot frees after the resend timeout,
     // and what it lacks is no longer cached.
@@ -654,8 +663,8 @@ fn a_leader_refuses_pre_votes() {
     let mut core = Core::new(cfg, Recovered::default(), 0, 5);
     core.take_actions();
     core.tick(1_000);
-    let vote = writes(&core.take_actions()).last().unwrap().seq;
-    core.durable(vote);
+    let vote = writes(&core.take_actions()).last().unwrap().clone();
+    persist(&mut core, &vote);
     core.receive(
         LEADER_A,
         Message::VoteAnswer {
@@ -779,8 +788,8 @@ fn a_load_that_starts_late_sends_nothing() {
     let mut core = Core::new(cfg, Recovered::default(), 0, 5);
     core.take_actions();
     core.tick(1_000);
-    let vote = writes(&core.take_actions()).last().unwrap().seq;
-    core.durable(vote);
+    let vote = writes(&core.take_actions()).last().unwrap().clone();
+    persist(&mut core, &vote);
     core.receive(
         LEADER_A,
         Message::VoteAnswer {
@@ -793,13 +802,13 @@ fn a_load_that_starts_late_sends_nothing() {
         let actions = core.take_actions();
         for write in writes(&actions) {
             store.extend(write.entries.iter().cloned());
-            core.durable(write.seq);
+            persist(&mut core, &write);
         }
         core.propose(u64::from(n), vec![n]);
     }
     for write in writes(&core.take_actions()) {
         store.extend(write.entries.iter().cloned());
-        core.durable(write.seq);
+        persist(&mut core, &write);
     }
     core.tick(1_000 + 1_100);
     let load = loads(&core.take_actions())[0];
@@ -813,4 +822,287 @@ fn a_load_that_starts_late_sends_nothing() {
     let actions = core.take_actions();
     assert!(appends_to(&actions, LEADER_A).is_empty(), "{actions:?}");
     assert!(loads(&actions).is_empty(), "not reissued: {actions:?}");
+}
+
+/// A follower whose entry waits for a blob that never comes (its leader
+/// died with the only copy) still persists terms and votes, and can drop
+/// the entry, so the group elects a leader that can commit.
+#[test]
+fn an_entry_waiting_for_a_lost_blob_never_stalls_an_election() {
+    // Durable through 10. Leader A, at term 2, sends entry 11, naming a
+    // blob that never arrives: the write lands, its entries are never
+    // reported.
+    let mut core = follower(1, &[1; 10], 10);
+    core.receive(LEADER_A, append(2, LEADER_A, (10, 1), 10, &[(11, 2)]));
+    let write = writes(&core.take_actions()).last().unwrap().clone();
+    core.durable(write.seq);
+    core.take_actions();
+    assert_eq!(core.status().durable_index, 10);
+    // A dies. B, without 11, asks for votes at term 3: refused, our log
+    // is longer.
+    let vote = |term| Message::Vote {
+        term,
+        candidate: LEADER_B,
+        last_index: 10,
+        last_term: 1,
+    };
+    core.receive(LEADER_B, vote(3));
+    let actions = core.take_actions();
+    let term_write = writes(&actions).last().unwrap().clone();
+    core.durable(term_write.seq);
+    assert!(
+        sent(&core.take_actions())
+            .iter()
+            .chain(sent(&actions).iter())
+            .all(|message| !matches!(message, Message::VoteAnswer { granted: true, .. }))
+    );
+    // The host gives up on the blob: the unreported entry goes, and B's
+    // next request is granted, once our vote is durable.
+    core.discard_unreported();
+    assert_eq!(core.status().last_log_index, 10);
+    core.receive(LEADER_B, vote(4));
+    let vote_write = writes(&core.take_actions()).last().unwrap().clone();
+    core.durable(vote_write.seq);
+    assert!(sent(&core.take_actions()).contains(&Message::VoteAnswer {
+        term: 4,
+        granted: true
+    }));
+}
+
+#[test]
+fn a_discard_keeps_committed_entries() {
+    // A follower whose leader committed entry 11 keeps it: a quorum holds
+    // its blob.
+    let mut core = follower(1, &[1; 10], 10);
+    core.receive(
+        LEADER_A,
+        append(2, LEADER_A, (10, 1), 11, &[(11, 2), (12, 2)]),
+    );
+    let write = writes(&core.take_actions()).last().unwrap().clone();
+    core.durable(write.seq);
+    core.take_actions();
+    core.discard_unreported();
+    assert_eq!(core.status().last_log_index, 11, "12 goes, 11 is committed");
+}
+
+#[test]
+fn a_leader_steps_down_before_it_discards() {
+    let mut leader = leader_of_two();
+    leader.receive(LEADER_A, matched(1));
+    leader.propose(1, vec![1]);
+    let write = writes(&leader.take_actions()).last().unwrap().clone();
+    leader.durable(write.seq);
+    leader.take_actions();
+    // Entry 2's blob never comes: the leader cannot count it, nor know
+    // whether its follower made it committed. It steps down, then drops
+    // what it never reported, keeping what it committed.
+    leader.discard_unreported();
+    assert_eq!(leader.role(), Role::Follower);
+    assert_eq!(leader.status().last_log_index, 1);
+    assert_eq!(leader.status().commit_index, 1);
+}
+
+#[test]
+fn a_candidate_that_discards_ignores_grants_for_its_longer_log() {
+    // Entry 12 waits for a lost blob: written and durable, never reported.
+    let mut cfg = config();
+    cfg.pre_vote = false;
+    let entries = (1..=11)
+        .map(|index| LogEntry::data(index, if index == 11 { 2 } else { 1 }, vec![]))
+        .collect();
+    let recovered = Recovered {
+        meta: Meta {
+            current_term: 2,
+            voted_for: None,
+            commit_index: 10,
+            snap_last_index: 0,
+            snap_last_term: 0,
+        },
+        entries,
+        active_config: None,
+        log_start_config: None,
+        applied: 10,
+    };
+    let mut core = Core::new(cfg, recovered, 0, 7);
+    core.take_actions();
+    core.receive(LEADER_A, append(2, LEADER_A, (11, 2), 10, &[(12, 2)]));
+    let write = writes(&core.take_actions()).last().unwrap().clone();
+    core.durable(write.seq);
+    core.take_actions();
+    // Its leader goes quiet: it campaigns, advertising (12, 2).
+    core.tick(1_000);
+    let campaign = writes(&core.take_actions()).last().unwrap().clone();
+    core.durable(campaign.seq);
+    core.take_actions();
+    assert_eq!(core.role(), Role::Candidate);
+    // The host gives up on 12's blob. Grants made against (12, 2) then
+    // arrive, and must not make it leader.
+    core.discard_unreported();
+    assert_eq!(core.role(), Role::Follower);
+    assert_eq!(core.status().last_log_index, 11);
+    let term = core.status().current_term;
+    core.receive(
+        LEADER_A,
+        Message::VoteAnswer {
+            term,
+            granted: true,
+        },
+    );
+    core.receive(
+        LEADER_B,
+        Message::VoteAnswer {
+            term,
+            granted: true,
+        },
+    );
+    core.take_actions();
+    assert_ne!(core.role(), Role::Leader);
+}
+
+#[test]
+fn a_report_from_before_a_discard_vouches_for_nothing_written_after() {
+    let mut core = follower(1, &[1; 10], 10);
+    // Entry (11, 2) is written, durable but unreported (its blob waits).
+    core.receive(LEADER_A, append(2, LEADER_A, (10, 1), 10, &[(11, 2)]));
+    let first = writes(&core.take_actions()).last().unwrap().clone();
+    core.durable(first.seq);
+    core.take_actions();
+    // The host gives up, and the leader sends the same entry again.
+    core.discard_unreported();
+    let cut = writes(&core.take_actions()).last().unwrap().clone();
+    core.durable(cut.seq);
+    core.take_actions();
+    core.receive(LEADER_A, append(2, LEADER_A, (10, 1), 10, &[(11, 2)]));
+    let again = writes(&core.take_actions()).last().unwrap().clone();
+    // The first write's report arrives late: it wrote an entry with the
+    // same index and term, but the discard removed it.
+    core.entries_durable(first.seq);
+    core.take_actions();
+    assert_eq!(core.status().durable_index, 10);
+    // The second write's report counts.
+    core.durable(again.seq);
+    core.entries_durable(again.seq);
+    assert_eq!(claimed(&core.take_actions()), Some(11));
+}
+
+/// After compaction took every configuration entry, a truncation that
+/// removes a newer one falls back to the configuration in effect at the
+/// log's start, which the host kept, never to the static members.
+#[test]
+fn a_truncation_falls_back_to_the_log_start_configuration() {
+    let at_start = ActiveConfigRecord {
+        log_index: Some(5),
+        current: vec![ME, LEADER_A, 4],
+        joint_old: None,
+    };
+    let recovered = Recovered {
+        meta: Meta {
+            current_term: 1,
+            voted_for: None,
+            commit_index: 12,
+            snap_last_index: 10,
+            snap_last_term: 1,
+        },
+        entries: vec![LogEntry::data(11, 1, vec![]), LogEntry::data(12, 1, vec![])],
+        active_config: Some(at_start.clone()),
+        log_start_config: Some(at_start),
+        applied: 12,
+    };
+    let mut core = Core::new(config(), recovered, 0, 7);
+    core.take_actions();
+    assert_eq!(core.status().members, vec![ME, LEADER_A, 4]);
+    // Leader A appends a configuration at 13, uncommitted.
+    let change = LogEntry::config_change(
+        13,
+        2,
+        Some(vec![ME, LEADER_A, 4]),
+        vec![ME, LEADER_A, LEADER_B],
+    );
+    core.receive(
+        LEADER_A,
+        Message::Append {
+            term: 2,
+            leader: LEADER_A,
+            prev_index: 12,
+            prev_term: 1,
+            commit: 12,
+            round: 1,
+            entries: vec![change],
+        },
+    );
+    core.take_actions();
+    assert_eq!(core.status().joint_old, Some(vec![ME, LEADER_A, 4]));
+    // Leader 4 of term 3 replaces 13: the configuration goes with it.
+    core.receive(4, append(3, 4, (12, 1), 12, &[(13, 3)]));
+    core.take_actions();
+    let status = core.status();
+    assert_eq!(status.members, vec![ME, LEADER_A, 4]);
+    assert_eq!(status.joint_old, None);
+}
+
+/// A host that kept no record of the configuration at its log's start
+/// sends snapshots without one, rather than a guess.
+#[test]
+fn an_unknown_log_start_configuration_is_never_sent() {
+    let mut cfg = config();
+    cfg.members = vec![ME, LEADER_A];
+    cfg.pre_vote = false;
+    let newest = LogEntry::config_change(12, 1, None, vec![ME, LEADER_A]);
+    let recovered = Recovered {
+        meta: Meta {
+            current_term: 1,
+            voted_for: None,
+            commit_index: 12,
+            snap_last_index: 10,
+            snap_last_term: 1,
+        },
+        entries: vec![LogEntry::data(11, 1, vec![]), newest],
+        active_config: Some(ActiveConfigRecord {
+            log_index: Some(12),
+            current: vec![ME, LEADER_A],
+            joint_old: None,
+        }),
+        log_start_config: None,
+        applied: 12,
+    };
+    let mut core = Core::new(cfg, recovered, 0, 3);
+    core.take_actions();
+    assert_eq!(core.config_at(10), None, "unknown at the log's start");
+    assert!(core.config_at(12).is_some());
+    core.tick(1_000);
+    let vote = writes(&core.take_actions()).last().unwrap().clone();
+    persist(&mut core, &vote);
+    core.receive(
+        LEADER_A,
+        Message::VoteAnswer {
+            term: 2,
+            granted: true,
+        },
+    );
+    assert_eq!(core.role(), Role::Leader);
+    core.take_actions();
+    // A holds nothing: it needs the snapshot at 10.
+    core.receive(
+        LEADER_A,
+        Message::AppendAnswer {
+            term: 2,
+            round: 0,
+            commit: 0,
+            result: AppendResult::Rejected {
+                rejected: 12,
+                last_index: 0,
+                conflict_term: 0,
+                conflict_first: 0,
+            },
+        },
+    );
+    let snapshot = core
+        .take_actions()
+        .into_iter()
+        .find_map(|action| match action {
+            Action::SendSnapshot { configuration, .. } => Some(configuration),
+            _ => None,
+        })
+        .expect("a snapshot for A");
+    assert_eq!(snapshot, None);
 }

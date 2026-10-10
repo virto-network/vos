@@ -43,11 +43,13 @@ pub enum Change {
         agent: AgentId,
         after: u64,
     },
-    /// The log through `through`, at `term`, removed.
+    /// The log through `through`, at `term`, removed; `membership` was in
+    /// effect there, when known.
     Compact {
         agent: AgentId,
         through: u64,
         term: u64,
+        membership: Option<Membership>,
     },
     /// The term, vote and commit index; `sync` when the term or vote moved.
     Hard {
@@ -183,7 +185,8 @@ impl Writer {
                         agent,
                         through,
                         term,
-                    } => batch.compact(*agent, *through, *term),
+                        membership,
+                    } => batch.compact(*agent, *through, *term, membership.as_ref()),
                     Change::Hard { agent, hard, .. } => batch.hard_state(*agent, hard),
                     Change::Membership { agent, membership } => {
                         batch.membership(*agent, membership)
@@ -452,6 +455,7 @@ mod tests {
             agent: A,
             through,
             term: 1,
+            membership: None,
         };
         smol::block_on(writer.commit(vec![apply(5)])).unwrap();
         assert!(smol::block_on(writer.commit(vec![compact(3)])).is_err());

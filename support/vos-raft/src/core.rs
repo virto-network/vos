@@ -142,9 +142,13 @@ pub enum Action<N: NodeId> {
         term: u64,
         configuration: Option<SnapshotConfiguration<N>>,
     },
-    /// The log may be compacted through `through`.
+    /// The log may be compacted through `through`. `configuration` is the
+    /// one in effect there, when known, which the host keeps with the log's
+    /// start: a later truncation that removes every configuration entry
+    /// above it falls back to it.
     CompactBound {
         through: u64,
+        configuration: Option<ActiveConfigRecord<N>>,
     },
     Answer(Answer),
     Changed {
@@ -170,6 +174,20 @@ pub struct SnapshotSwitch<N: NodeId> {
     pub truncate_after: Option<u64>,
     pub meta: Meta<N>,
     pub active_config: ActiveConfigRecord<N>,
+    /// The configuration in effect at the snapshot's index, when known,
+    /// kept with the log's start.
+    pub log_start_config: Option<ActiveConfigRecord<N>>,
+}
+
+/// The log start's configuration from its record.
+fn start_config<N: NodeId>(record: ActiveConfigRecord<N>) -> (u64, ActiveConfig<N>) {
+    (
+        record.log_index.unwrap_or(0),
+        ActiveConfig {
+            current: record.current,
+            joint_old: record.joint_old,
+        },
+    )
 }
 
 /// What a replica recovers from its store.
@@ -179,6 +197,8 @@ pub struct Recovered<N: NodeId> {
     /// The live log, from the snapshot boundary on.
     pub entries: Vec<LogEntry<N>>,
     pub active_config: Option<ActiveConfigRecord<N>>,
+    /// The configuration in effect at the log's start, if the host kept it.
+    pub log_start_config: Option<ActiveConfigRecord<N>>,
     /// The highest applied index recovered.
     pub applied: u64,
 }
@@ -189,6 +209,7 @@ impl<N: NodeId> Default for Recovered<N> {
             meta: Meta::default(),
             entries: Vec::new(),
             active_config: None,
+            log_start_config: None,
             applied: 0,
         }
     }
@@ -354,7 +375,6 @@ struct OpenWrite<N: NodeId> {
 #[derive(Debug, Clone, Copy)]
 struct PendingWrite<N: NodeId> {
     seq: u64,
-    last: Option<(u64, u64)>,
     hard: Option<(u64, Option<N>)>,
 }
 
@@ -372,6 +392,9 @@ pub struct Core<N: NodeId> {
     log: LogView<N>,
 
     durable_index: u64,
+    /// Which write appended the entries above the durable index: runs of
+    /// (first index, write), in index order and so in write order.
+    written: VecDeque<(u64, u64)>,
     durable_term: u64,
     durable_vote: Option<N>,
     /// The highest index matched against the current term's leader.
@@ -396,6 +419,10 @@ pub struct Core<N: NodeId> {
 
     // Membership.
     effective: ActiveConfig<N>,
+    /// The configuration in effect at the log's start, and the index of the
+    /// entry that established it (0 for the static members), when known: a
+    /// host that compacted without keeping it leaves it unknown.
+    log_start_config: Option<(u64, ActiveConfig<N>)>,
     pending_joint_entry: Option<u64>,
     retiring_voters: BTreeMap<N, u64>,
     retiring_voter_acks: BTreeSet<N>,
@@ -435,12 +462,15 @@ impl<N: NodeId> Core<N> {
             .min(log.last_index());
         let mut core = Self {
             effective: ActiveConfig::steady(cfg.members.clone()),
+            log_start_config: (meta.snap_last_index == 0)
+                .then(|| (0, ActiveConfig::steady(cfg.members.clone()))),
             cfg,
             role: Role::Follower,
             term: meta.current_term,
             vote: meta.voted_for,
             commit,
             durable_index: log.last_index(),
+            written: VecDeque::new(),
             durable_term: meta.current_term,
             durable_vote: meta.voted_for,
             verified: commit,
@@ -476,6 +506,18 @@ impl<N: NodeId> Core<N> {
             actions: Vec::new(),
             announced: None,
         };
+        // Hosts that keep the log start's configuration say it; otherwise a
+        // persisted view at or below the log's start serves.
+        let snap = meta.snap_last_index;
+        let start = recovered.log_start_config.or_else(|| {
+            recovered
+                .active_config
+                .clone()
+                .filter(|record| record.log_index.is_some_and(|index| index <= snap))
+        });
+        if let Some(record) = start {
+            core.log_start_config = Some(start_config(record));
+        }
         core.recover_configuration(recovered.active_config);
         core.reset_election_timer();
         if core.commit > meta.commit_index {
@@ -660,15 +702,14 @@ impl<N: NodeId> Core<N> {
         self.replicate_to(target);
     }
 
-    /// The host made its writes through `seq` durable.
+    /// The host made its writes through `seq` durable: their terms, votes
+    /// and truncations. Their entries count once reported with
+    /// [`Self::entries_durable`], which a host may delay (until the blobs
+    /// an entry names are durable too) without holding back a term or a
+    /// vote.
     pub fn durable(&mut self, seq: u64) {
         while self.writes.front().is_some_and(|write| write.seq <= seq) {
             let write = self.writes.pop_front().expect("checked above");
-            if let Some((index, term)) = write.last
-                && self.log.term_at(index) == Some(term)
-            {
-                self.durable_index = self.durable_index.max(index);
-            }
             if let Some((term, vote)) = write.hard
                 && term >= self.durable_term
             {
@@ -696,6 +737,66 @@ impl<N: NodeId> Core<N> {
             self.try_advance_commit();
             self.try_resolve_reads();
             self.maybe_send_timeout_now();
+        }
+    }
+
+    /// The host holds the entries of every write through `seq` durably,
+    /// with every blob each names. It counts only for entries those writes
+    /// appended that the log still holds: an entry written again since, by
+    /// a later write, waits for that write's report.
+    pub fn entries_durable(&mut self, seq: u64) {
+        let bound = self
+            .written
+            .iter()
+            .find(|&&(_, write)| write > seq)
+            .map_or(self.log.last_index(), |&(first, _)| first - 1);
+        if bound <= self.durable_index {
+            return;
+        }
+        self.durable_index = bound;
+        self.forget_written();
+        self.flush_acks();
+        if self.role == Role::Leader {
+            self.try_advance_commit();
+            self.try_resolve_reads();
+            self.maybe_send_timeout_now();
+        }
+    }
+
+    /// The host cannot complete the entries it never reported durable (a
+    /// blob one names is lost): a follower drops those above its commit
+    /// index, as a crash would drop unsynced writes. It never acknowledged
+    /// them, and an entry committed is held, with its blobs, by a quorum
+    /// it can fetch them from. A leader drops nothing: it may have counted
+    /// its followers for its own entries.
+    pub fn discard_unreported(&mut self) {
+        let keep = self.durable_index.max(self.commit);
+        if self.log.last_index() <= keep {
+            return;
+        }
+        // A candidate's requests advertised the longer log, and a leader
+        // may have counted followers for its entries: either steps down
+        // first, so no grant made against that log still counts, and its
+        // next candidacy advertises the shorter one.
+        if self.role != Role::Follower {
+            self.step_down();
+        }
+        self.write_truncate(keep);
+        self.verified = self.verified.min(keep);
+    }
+
+    /// Forget which writes appended entries now durable.
+    fn forget_written(&mut self) {
+        if self.durable_index >= self.log.last_index() {
+            self.written.clear();
+            return;
+        }
+        while self
+            .written
+            .get(1)
+            .is_some_and(|&(first, _)| first <= self.durable_index + 1)
+        {
+            self.written.pop_front();
         }
     }
 
@@ -755,6 +856,24 @@ impl<N: NodeId> Core<N> {
                 snap_last_term: term,
             },
             active_config: self.snapshot_record(index, keeps_suffix, configuration),
+            log_start_config: self.start_after_snapshot(index, configuration),
+        }
+    }
+
+    /// The configuration in effect at an installed snapshot's index: the
+    /// one it carries, else this replica's at that index, if known.
+    fn start_after_snapshot(
+        &self,
+        index: u64,
+        configuration: Option<&SnapshotConfiguration<N>>,
+    ) -> Option<ActiveConfigRecord<N>> {
+        match configuration.filter(|configuration| configuration.index <= index) {
+            Some(configuration) => Some(ActiveConfigRecord {
+                log_index: Some(configuration.index),
+                current: configuration.members.clone(),
+                joint_old: configuration.joint_old.clone(),
+            }),
+            None => self.config_at(index),
         }
     }
 
@@ -771,12 +890,17 @@ impl<N: NodeId> Core<N> {
         }
         let keeps_suffix = self.log.term_at(index) == Some(term);
         let record = self.snapshot_record(index, keeps_suffix, configuration.as_ref());
+        self.log_start_config = self
+            .start_after_snapshot(index, configuration.as_ref())
+            .map(start_config);
         self.log.compact_to(index, term);
         self.durable_index = if keeps_suffix {
             self.durable_index.max(index)
         } else {
+            self.written.clear();
             index
         };
+        self.forget_written();
         self.verified = self.verified.max(index);
         self.adopt_snapshot_configuration(index, keeps_suffix, configuration, record);
         let previous_commit = self.commit;
@@ -820,7 +944,37 @@ impl<N: NodeId> Core<N> {
         if through <= self.log.snap_index() || through > self.compact_bound {
             return;
         }
+        self.log_start_config = self.config_at(through).map(start_config);
         self.log.compact_to(through, term);
+    }
+
+    /// The configuration in effect at `index`, at or after the log's start,
+    /// with the index of the entry that established it: the latest
+    /// configuration entry at or below it, else the log start's, if known.
+    /// A host exporting a snapshot at its applied index ships this.
+    pub fn config_at(&self, index: u64) -> Option<ActiveConfigRecord<N>> {
+        let from_log = self
+            .log
+            .configs()
+            .rev()
+            .find(|entry| entry.index <= index)
+            .and_then(|entry| match &entry.kind {
+                EntryKind::ConfigChange { joint_old, members } => Some(ActiveConfigRecord {
+                    log_index: Some(entry.index),
+                    current: members.clone(),
+                    joint_old: joint_old.clone(),
+                }),
+                _ => None,
+            });
+        from_log.or_else(|| {
+            self.log_start_config
+                .as_ref()
+                .map(|(at, config)| ActiveConfigRecord {
+                    log_index: Some(*at),
+                    current: config.current.clone(),
+                    joint_old: config.joint_old.clone(),
+                })
+        })
     }
 
     /// The writer stalled, or recovered. A replica whose writer is stalled
@@ -920,7 +1074,6 @@ impl<N: NodeId> Core<N> {
         };
         self.writes.push_back(PendingWrite {
             seq: open.seq,
-            last: open.entries.last().map(|entry| (entry.index, entry.term)),
             hard: open
                 .meta
                 .as_ref()
@@ -960,6 +1113,7 @@ impl<N: NodeId> Core<N> {
         write.sync = true;
         self.log.truncate_after(after);
         self.durable_index = self.durable_index.min(after);
+        self.written.retain(|&(first, _)| first <= after);
     }
 
     fn write_entries(&mut self, entries: &[LogEntry<N>]) {
@@ -970,6 +1124,10 @@ impl<N: NodeId> Core<N> {
         let write = self.open_write();
         write.entries.extend_from_slice(entries);
         write.sync = true;
+        let seq = write.seq;
+        if self.written.back().is_none_or(|&(_, write)| write != seq) {
+            self.written.push_back((entries[0].index, seq));
+        }
         // Entries above the durable index may not be in the store yet.
         self.log.evict(self.durable_index + 1);
     }
@@ -1690,13 +1848,15 @@ impl<N: NodeId> Core<N> {
             leader.next_index.get(&peer).copied().unwrap_or(1)
         };
         if next <= snap && snap > 0 {
+            // The snapshot is at the log's start: its configuration is the
+            // one in effect there, when known; never a guess.
             let configuration =
-                self.active_config_index
-                    .filter(|&index| index <= snap)
-                    .map(|index| SnapshotConfiguration {
-                        members: self.effective.current.clone(),
-                        joint_old: self.effective.joint_old.clone(),
-                        index,
+                self.log_start_config
+                    .as_ref()
+                    .map(|(index, start)| SnapshotConfiguration {
+                        members: start.current.clone(),
+                        joint_old: start.joint_old.clone(),
+                        index: *index,
                     });
             let deadline = self.now + self.cfg.snapshot_timeout_ms;
             if let Some(leader) = self.leader.as_mut() {
@@ -1944,7 +2104,10 @@ impl<N: NodeId> Core<N> {
             && bound.saturating_sub(self.log.snap_index()) >= self.cfg.compact_hysteresis
         {
             self.compact_bound = bound;
-            self.actions.push(Action::CompactBound { through: bound });
+            self.actions.push(Action::CompactBound {
+                through: bound,
+                configuration: self.config_at(bound),
+            });
         }
     }
 
@@ -2172,6 +2335,9 @@ impl<N: NodeId> Core<N> {
                     )),
                     _ => None,
                 })
+                // Unknown at the log's start (a host that kept no
+                // record): the static members, the best left.
+                .or_else(|| self.log_start_config.clone())
                 .unwrap_or_else(|| (0, ActiveConfig::steady(self.cfg.members.clone())))
         });
 
@@ -2392,8 +2558,12 @@ impl<N: NodeId> Core<N> {
                 };
                 self.active_config_index = record.log_index;
             } else {
-                self.effective = ActiveConfig::steady(self.cfg.members.clone());
-                self.active_config_index = Some(0);
+                let (index, start) = self
+                    .log_start_config
+                    .clone()
+                    .unwrap_or_else(|| (0, ActiveConfig::steady(self.cfg.members.clone())));
+                self.effective = start;
+                self.active_config_index = Some(index);
             }
             return;
         };

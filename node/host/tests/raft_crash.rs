@@ -142,6 +142,7 @@ fn writer(dir: &str) {
                 agent: AGENT,
                 through,
                 term: term_of(through),
+                membership: None,
             }]);
             log_start = through;
         }

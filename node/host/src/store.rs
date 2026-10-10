@@ -146,6 +146,8 @@ pub struct RaftRows {
     /// The index and term the log starts after: where it was compacted to,
     /// or a snapshot installed at.
     pub log_start: (u64, u64),
+    /// The replica set in effect at the log's start.
+    pub log_start_membership: Option<Membership>,
     pub membership: Option<Membership>,
     pub applied: u64,
     /// The log after its start, in order.
@@ -236,8 +238,9 @@ pub trait Batch {
     fn truncate(&mut self, agent: AgentId, after: u64);
 
     /// Remove the agent's log entries through `through`, whose term is
-    /// `term`, and start the log after it.
-    fn compact(&mut self, agent: AgentId, through: u64, term: u64);
+    /// `term`, and start the log after it, with `membership` the replica
+    /// set in effect there, when known.
+    fn compact(&mut self, agent: AgentId, through: u64, term: u64, membership: Option<&Membership>);
 
     fn hard_state(&mut self, agent: AgentId, hard: &HardState);
 
@@ -638,11 +641,14 @@ impl Store for Fjall {
             .get(node_row(agent, NodeRow::Hard, &[]))?
             .and_then(|bytes| decode_hard(&bytes))
             .unwrap_or_default();
-        let log_start = self
-            .system
-            .get(node_row(agent, NodeRow::LogStart, &[]))?
-            .and_then(|bytes| Some((be_u64(bytes.get(..8)?)?, be_u64(bytes.get(8..)?)?)))
+        let start_row = self.system.get(node_row(agent, NodeRow::LogStart, &[]))?;
+        let log_start = start_row
+            .as_ref()
+            .and_then(|bytes| Some((be_u64(bytes.get(..8)?)?, be_u64(bytes.get(8..16)?)?)))
             .unwrap_or((0, 0));
+        let log_start_membership = start_row
+            .as_ref()
+            .and_then(|bytes| decode_membership(bytes.get(16..)?));
         let membership = self
             .system
             .get(node_row(agent, NodeRow::Membership, &[]))?
@@ -656,6 +662,7 @@ impl Store for Fjall {
         Ok(RaftRows {
             hard,
             log_start,
+            log_start_membership,
             membership,
             applied,
             log,
@@ -815,7 +822,13 @@ impl Batch for FjallBatch {
         }
     }
 
-    fn compact(&mut self, agent: AgentId, through: u64, term: u64) {
+    fn compact(
+        &mut self,
+        agent: AgentId,
+        through: u64,
+        term: u64,
+        membership: Option<&Membership>,
+    ) {
         let mut stored = Vec::new();
         for index in self.store.log_indices(agent, 0) {
             match index {
@@ -830,7 +843,12 @@ impl Batch for FjallBatch {
         for index in stored {
             self.batch.remove(&self.store.log, log_key(agent, index));
         }
-        let start = [through.to_be_bytes(), term.to_be_bytes()].concat();
+        let start = [
+            &through.to_be_bytes()[..],
+            &term.to_be_bytes(),
+            &membership.map(encode_membership).unwrap_or_default(),
+        ]
+        .concat();
         self.batch.insert(
             &self.store.system,
             node_row(agent, NodeRow::LogStart, &[]),
@@ -1215,8 +1233,13 @@ mod tests {
         batch.membership(A, &membership);
         batch.apply(A, 3, &[]);
         batch.commit(Durability::Synced).unwrap();
+        let at_start = Membership {
+            index: Some(1),
+            members: vec![1, 2, 3],
+            joint_old: None,
+        };
         let mut batch = store.batch();
-        batch.compact(A, 2, 2);
+        batch.compact(A, 2, 2, Some(&at_start));
         batch.commit(Durability::Buffered).unwrap();
         drop(store);
 
@@ -1226,6 +1249,7 @@ mod tests {
         assert_eq!(rows.membership, Some(membership));
         assert_eq!(rows.applied, 3);
         assert_eq!(rows.log_start, (2, 2));
+        assert_eq!(rows.log_start_membership, Some(at_start));
         assert_eq!(
             rows.log.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
             vec![3, 4, 5]
