@@ -6,9 +6,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use vos_pvm::ExitReason;
-use vos_pvm::accumulate_host::{AccumulateContext, ServiceStorage};
-use vos_pvm::pool::MachinePool;
-use vos_pvm::refine::{Machine, MemoryModel, PreparedProgram};
+use vos_pvm::accumulate_host::{self, ACCUMULATE_ENTRY, AccumulateContext, ServiceStorage};
+use vos_pvm::pool::{MachinePool, OuterMachines};
+use vos_pvm::refine::Machine;
 use vos_pvm::refine_host::{RefineContext, StateReader};
 use vos_wire::abi::{cap, code};
 use vos_wire::batch::Work;
@@ -18,6 +18,9 @@ use vos_wire::result::Write;
 use vos_wire::{Decode, Encode};
 
 use crate::store::{Fjall, FjallSnapshot, Store, View};
+
+/// The refine entry point.
+const REFINE_ENTRY: u32 = 0;
 
 /// `historical_lookup`, which refine answers from the stored programs.
 const HISTORICAL_LOOKUP: u64 = 7;
@@ -82,7 +85,7 @@ impl StateReader for AgentState {
 
 /// Run the agent's refine on `work` for `agent`: its output, if it halts.
 pub(crate) fn refine(
-    program: &PreparedProgram,
+    program: &OuterMachines,
     pool: &Arc<MachinePool>,
     store: &Fjall,
     snapshot: Arc<FjallSnapshot>,
@@ -98,19 +101,22 @@ pub(crate) fn refine(
         package_hash: [0; 32],
     }
     .encode();
-    let invocation = RefineContext::load_prepared(program, &arguments, gas, MemoryModel::Auto)?
+    let invocation = RefineContext::new(program.load(REFINE_ENTRY, &arguments, gas)?)
         .with_pool(Arc::clone(pool))
         .with_state(Arc::new(AgentState { snapshot, agent }))
         .try_run_with_host(|id, machine| serve(id, machine, store))?;
-    if invocation.exit != ExitReason::Halt {
-        return Err(Fault::Agent(format!(
+    let output = if invocation.exit != ExitReason::Halt {
+        Err(Fault::Agent(format!(
             "refine stopped: {:?}",
             invocation.exit
-        )));
-    }
-    invocation
-        .output_bounded(cap::WORK_RESULT)
-        .ok_or_else(|| Fault::Agent("refine's output is out of bounds".into()))
+        )))
+    } else {
+        invocation
+            .output_bounded(cap::WORK_RESULT)
+            .ok_or_else(|| Fault::Agent("refine's output is out of bounds".into()))
+    };
+    program.restore(invocation);
+    output
 }
 
 /// The calls refine leaves to the node: `historical_lookup` from the
@@ -174,7 +180,7 @@ impl ServiceStorage for Overlay {
 /// Run the agent's accumulate on one work result: the writes to apply,
 /// one per key, if it halts.
 pub(crate) fn accumulate(
-    program: &PreparedProgram,
+    program: &OuterMachines,
     snapshot: Arc<FjallSnapshot>,
     agent: AgentId,
     result: Vec<u8>,
@@ -196,14 +202,14 @@ pub(crate) fn accumulate(
         agent,
         written: BTreeMap::new(),
     };
-    let invocation =
-        AccumulateContext::load(program, 0, u64::from(agent.0), &inputs, gas, &mut storage)?
-            .try_run()?;
-    if invocation.exit != ExitReason::Halt {
-        return Err(Fault::Agent(format!(
-            "accumulate stopped: {:?}",
-            invocation.exit
-        )));
+    let service = u64::from(agent.0);
+    let arguments = accumulate_host::arguments(0, service, inputs.len());
+    let machine = program.load(ACCUMULATE_ENTRY, &arguments, gas)?;
+    let invocation = AccumulateContext::new(machine, service, &inputs, &mut storage).try_run()?;
+    let exit = invocation.exit.clone();
+    program.restore(invocation);
+    if exit != ExitReason::Halt {
+        return Err(Fault::Agent(format!("accumulate stopped: {exit:?}")));
     }
     Ok(storage
         .written

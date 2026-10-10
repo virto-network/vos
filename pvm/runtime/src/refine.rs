@@ -123,7 +123,7 @@ impl PreparedProgram {
 }
 
 /// The result of a completed refine-style invocation.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Invocation {
     /// How execution stopped. `HostCall` is returned untouched — this
     /// harness dispatches nothing.
@@ -137,6 +137,9 @@ pub struct Invocation {
     /// diagnostics without exposing the interpreter itself.
     pub pc: u32,
     mem: Memory,
+    /// What returns the memory to the outer machines that lent it.
+    #[cfg(feature = "std")]
+    lent: Option<crate::pool::PoolTicket>,
 }
 
 /// A loaded, resumable standard PVM invocation.
@@ -149,6 +152,9 @@ pub struct Machine {
     interp: Interpreter,
     terminal_exit: Option<ExitReason>,
     execution: Option<PreparedExecution>,
+    /// What returns the memory to the outer machines that lent it.
+    #[cfg(feature = "std")]
+    lent: Option<crate::pool::PoolTicket>,
 }
 
 /// Read-only entry and instruction events for one standard machine slice.
@@ -208,6 +214,8 @@ impl Machine {
             interp,
             terminal_exit,
             execution: None,
+            #[cfg(feature = "std")]
+            lent: None,
         }
     }
 
@@ -324,12 +332,8 @@ impl Machine {
         // Dirty pages count from the loaded image.
         mem.take_dirty_pages();
 
-        let interp = Interpreter::from_predecoded(
-            prepared.interpreter_program().clone(),
-            registers,
-            mem,
-            gas,
-        );
+        let interp =
+            Interpreter::from_predecoded(prepared.interpreter_program(), registers, mem, gas);
 
         Ok(Self {
             initial_gas: gas,
@@ -339,7 +343,26 @@ impl Machine {
             // retaining cold preparation here would duplicate those tables.
             execution: (prepared.backend() != PvmBackend::ForceInterpreter)
                 .then(|| prepared.clone()),
+            #[cfg(feature = "std")]
+            lent: None,
         })
+    }
+
+    /// A machine an [`crate::pool::OuterMachines`] lent, already laid out.
+    #[cfg(feature = "std")]
+    pub(crate) fn lent(
+        interp: Interpreter,
+        execution: PreparedExecution,
+        gas: Gas,
+        ticket: crate::pool::PoolTicket,
+    ) -> Self {
+        Self {
+            initial_gas: gas,
+            interp,
+            terminal_exit: None,
+            execution: (execution.backend() != PvmBackend::ForceInterpreter).then_some(execution),
+            lent: Some(ticket),
+        }
     }
 
     /// Run until the next PVM exit.
@@ -476,6 +499,8 @@ impl Machine {
             registers: self.interp.registers,
             pc: self.interp.pc,
             mem: self.interp.take_memory(),
+            #[cfg(feature = "std")]
+            lent: self.lent.take(),
         }
     }
 }
@@ -530,6 +555,12 @@ impl Invocation {
     /// The guest memory at exit, for capturing its dirty pages.
     pub fn memory_mut(&mut self) -> &mut Memory {
         &mut self.mem
+    }
+
+    /// The memory and its ticket, when outer machines lent it.
+    #[cfg(feature = "std")]
+    pub(crate) fn into_lent(self) -> Option<(Memory, crate::pool::PoolTicket)> {
+        Some((self.mem, self.lent?))
     }
 }
 

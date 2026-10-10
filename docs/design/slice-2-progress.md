@@ -580,3 +580,110 @@ runtime's in-place service an optimisation that charges the same. The
 agent's own precompile use moves only its own gas, so only where the
 live-gas rule ends a batch: a JAM work item's gas and a VOS refine's
 must be the same number for the same steps to come out.
+
+## Step 2.8: the JIT's host-call exit cost
+
+**Harnesses:**
+
+- `agent/testkit/benches/batch.rs` runs the default agent on a real batch,
+  as a node does, on both backends: an empty refine; 200 counter
+  increments; and the marginal cost of one actor ABI operation (`now`),
+  which is one exit from the actor's machine, the agent serving it, and
+  one re-entry.
+- `pvm/bench`'s `exits` times the bare exit and re-entry: an inner machine
+  that loops on `ecalli`.
+- Slice 1's `machines` harness, the pooled-cycle gate's, gains slice 2's
+  request delivery: `input` copies the request into memory the actor
+  already has mapped, where slice 1 mapped a request page per call.
+
+**What the profile found, and the changes:**
+
+- **Every machine load copied the predecoded program.** An empty refine
+  took 355–382 µs. The interpreter's tables are now shared (`Arc<[T]>`),
+  so a load copies none: 88 µs on the JIT, 94 µs on the interpreter.
+- **Most of what remained was the kernel.** Each refine and accumulate
+  built a fresh native memory: a memfd, two 4 GiB mappings, userfaultfd
+  registration, the first permission sync over all 1,024 slots, lazy
+  tracking faults and the unmapping. That was 55 of 85 µs per refine,
+  with 23 page faults.
+  - The node now keeps its agent's machines laid out between runs
+    (`vos_pvm::pool::OuterMachines`), as the pool keeps inner machines.
+  - A run lays its arguments into a kept machine and sets the registers,
+    gas and entry a fresh load sets. It returns the machine reset to the
+    program's image by the pool's own reset: written pages restored,
+    permissions restored, a deep clean past 256 pages zeroed in place.
+  - Refine, accumulate and queries all use it.
+  - The one difference from a fresh load, which neither the guest nor the
+    embedder sees: the memory spans the whole 32-bit space, as an inner
+    machine's does. Pages past the layout are inaccessible rather than
+    past the span. Both fault alike (the fault page is the first page
+    that fails the check, either way), and `output_bounded` and
+    `pages_mapped` answer alike past the layout.
+  - The node keeps as many idle as it has executors, the most that run at
+    once.
+- **Each inner invoke cloned the machine's preparation**: two reference
+  counts up and down per exit. Invoke now borrows it.
+- **The refine host read the clock four times per outer host call**, for
+  a debug log of phase timings. Each slice's time was truncated to whole
+  microseconds, so short slices counted as zero. The log is gone.
+
+**Results** (medians):
+
+| | Interpreter, before | Interpreter, after | JIT, before | JIT, after |
+|---|---|---|---|---|
+| Empty refine | 94 µs | 10 µs | 88 µs | 13 µs |
+| One increment, in a batch of 200 | 54.5 µs | 53.6 µs | 13.1 µs | 11.5 µs |
+| One `now` operation | 451 ns | 389 ns | 197 ns | 114 ns |
+| Bare exit and re-entry (`exits`) | 36 ns | 30 ns | 58 ns | 46 ns |
+
+"Before" is after the shared tables, the step's first change. An
+interpreter's kept machine uses sparse memory, as a pooled inner machine
+does; an increment runs no slower on it.
+
+Slice 1's pooled-cycle gate (`machines`; ≤ 5 µs for acquire, use and
+reset, JIT included):
+
+| Pooled cycle | Interpreter | JIT |
+|---|---|---|
+| Request mapped (slice 1) | 3.7 µs | 7.3 µs: miss |
+| Request copied (slice 2's `input`) | 1.1 µs | 1.6 µs: pass |
+
+On the JIT the copied cycle is 0.1 µs acquire, 0.5 µs use and 1.0 µs
+reset. A fresh JIT machine is 12.8 µs to create and lay out, plus 19.2 µs
+for its first resume.
+
+**Tests:**
+
+- `kept_outer_machines_equal_fresh_ones` (property test, both backends):
+  - each case is a sequence of runs of one program on one kept machine;
+  - each run lays in arguments of a different length (none to three
+    pages), stores anywhere (read-write data, the stack, read-only data,
+    the arguments, a gap, straddling the end), faults, or runs out of gas;
+  - every run must match a fresh load: exit, gas, registers, counter,
+    output, and every page it may have touched or read, earlier arguments
+    included.
+
+  Skipping the reset fails it, and so does skipping only the permission
+  restore (a shorter run then reads the last run's argument page).
+- The node's suites run every batch, query and accumulate on kept
+  machines.
+
+**Review:** Fable signed off with no blocking or should-fix findings; its
+two nits are in (the idle limit, and the embedder's view of the span).
+
+**Where the time goes now:**
+
+- **A `now` operation (114 ns)** is two exit and re-entry pairs: the
+  actor's exit to the agent, and the agent's own `invoke` call to the
+  node. Each is about 46 ns. The rest is the agent's dispatch.
+- **An increment (11.5 µs on the JIT)** is 59% guest code, the agent's
+  and the actor's.
+- **About 2.7 µs of an increment is kernel time**, from 3.3 write faults
+  per request. Each page an actor writes is write-protected again when it
+  is reset, so the next use faults on its first write to it (about
+  0.8 µs).
+- **The next lever, left for its own step and review:** keep a page an
+  actor writes on every use writable, and restore it at every reset
+  unconditionally. It changes the tracking contract: captures would
+  report a superset of the pages written. Its design lists every
+  consumer of the captures first, the prover's among them.

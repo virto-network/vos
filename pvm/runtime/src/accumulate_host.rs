@@ -42,6 +42,16 @@ pub trait ServiceStorage {
     fn write(&mut self, key: &[u8], value: Option<&[u8]>) -> Option<usize>;
 }
 
+/// Accumulate's arguments for `service` at `timeslot` over `inputs`
+/// inputs: `E(t, s, |inputs|)`.
+pub fn arguments(timeslot: u64, service: u64, inputs: usize) -> Vec<u8> {
+    let mut arguments = Vec::new();
+    vos_pvm_program::encode_nat(timeslot, &mut arguments);
+    vos_pvm_program::encode_nat(service, &mut arguments);
+    vos_pvm_program::encode_nat(inputs as u64, &mut arguments);
+    arguments
+}
+
 /// One accumulate invocation over a batch of inputs.
 pub struct AccumulateContext<'a, S: ServiceStorage> {
     machine: Machine,
@@ -60,23 +70,25 @@ impl<'a, S: ServiceStorage> AccumulateContext<'a, S> {
         gas: Gas,
         storage: &'a mut S,
     ) -> Result<Self, RefineError> {
-        let mut arguments = Vec::new();
-        vos_pvm_program::encode_nat(timeslot, &mut arguments);
-        vos_pvm_program::encode_nat(service, &mut arguments);
-        vos_pvm_program::encode_nat(inputs.len() as u64, &mut arguments);
         let machine = Machine::load_prepared_at(
             program,
             ACCUMULATE_ENTRY,
-            &arguments,
+            &arguments(timeslot, service, inputs.len()),
             gas,
             MemoryModel::Auto,
         )?;
-        Ok(Self {
+        Ok(Self::new(machine, service, inputs, storage))
+    }
+
+    /// Serve accumulate on a machine loaded at [`ACCUMULATE_ENTRY`] with
+    /// [`arguments`], such as one [`crate::pool::OuterMachines`] lent.
+    pub fn new(machine: Machine, service: u64, inputs: &'a [Vec<u8>], storage: &'a mut S) -> Self {
+        Self {
             machine,
             service,
             inputs,
             storage,
-        })
+        }
     }
 
     /// Run to the end, serving accumulate's host calls.

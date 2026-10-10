@@ -3,7 +3,7 @@
 //! The kernel creates CODE caps that wrap compiled code in one of two backends.
 //! `PvmBackend` controls the selection; `CompiledProgram` holds the result.
 
-use alloc::{string::String, sync::Arc, vec, vec::Vec};
+use alloc::{string::String, sync::Arc, vec};
 
 /// Backend selection for PVM execution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -21,26 +21,27 @@ pub enum PvmBackend {
 /// Pre-decoded interpreter program state.
 ///
 /// Contains the instruction stream pre-decoded for the fast interpreter path.
-/// Created by `Interpreter::predecode()` and stored in a `CodeCap`.
+/// Created by `Interpreter::predecode()`. Every table is shared: each
+/// machine loaded from it holds the same tables, so a load copies none.
 #[derive(Clone)]
 pub struct InterpreterProgram {
     /// Pre-decoded instruction stream.
-    pub decoded_insts: Vec<crate::interpreter::DecodedInst>,
+    pub decoded_insts: Arc<[crate::interpreter::DecodedInst]>,
     /// PC byte offset → instruction index mapping.
-    pub pc_to_idx: Vec<u32>,
+    pub pc_to_idx: Arc<[u32]>,
     /// Valid branch/jump landing targets.
-    pub basic_block_starts: Vec<bool>,
+    pub basic_block_starts: Arc<[bool]>,
     /// Per-gas-block costs (indexed by block start PC).
-    pub block_gas_costs: Vec<u32>,
+    pub block_gas_costs: Arc<[u32]>,
     /// For every externally enterable PC, the start of the gas block that
     /// contains it (`u32::MAX` for non-instruction byte positions).
-    pub gas_block_start_by_pc: Vec<u32>,
+    pub gas_block_start_by_pc: Arc<[u32]>,
     /// Instruction bytecode (kept for step/trace fallback).
-    pub code: Vec<u8>,
+    pub code: Arc<[u8]>,
     /// Opcode bitmask.
-    pub bitmask: Vec<u8>,
+    pub bitmask: Arc<[u8]>,
     /// Dynamic jump table.
-    pub jump_table: Vec<u32>,
+    pub jump_table: Arc<[u32]>,
 }
 
 /// Compiled PVM program — either interpreter or recompiler backend.

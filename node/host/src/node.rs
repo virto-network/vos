@@ -16,8 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use smol::future::FutureExt;
 use vos_pvm::PvmBackend;
-use vos_pvm::pool::{CodeHash, MachinePool};
-use vos_pvm::refine::PreparedProgram;
+use vos_pvm::pool::{CodeHash, MachinePool, OuterMachines};
 use vos_wire::abi::refusal;
 use vos_wire::batch::{Admin, Batch, Input, Message, Query, Request, Work};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash};
@@ -204,7 +203,7 @@ pub(crate) struct Inner {
     storage: StorageThread,
     executors: Executors,
     pool: Arc<MachinePool>,
-    program: Arc<PreparedProgram>,
+    program: Arc<OuterMachines>,
     program_hash: ProgramHash,
     queue: usize,
     max_inputs: usize,
@@ -1012,8 +1011,11 @@ impl Node {
             pool.install(&blob)
                 .map_err(|error| Error::Program(format!("{error:?}")))?;
         }
-        let program = PreparedProgram::new_with_backend(&config.agent, PvmBackend::Default)
-            .map_err(|error| Error::Program(format!("{error:?}")))?;
+        // Agent programs run only on executors, one at a time on each: keep
+        // as many machines idle as can run at once.
+        let program =
+            OuterMachines::with_idle_limit(&config.agent, PvmBackend::Default, config.executors)
+                .map_err(|error| Error::Program(format!("{error:?}")))?;
         let program_hash = ProgramHash(CodeHash::of(&config.agent).0);
         let agents = store.agents()?;
         let snapshot = store.snapshot();

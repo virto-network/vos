@@ -2,13 +2,15 @@
 //! on the interpreter and the JIT:
 //! - a fresh machine: create the actor as an inner machine and lay out its
 //!   memory, then resume it for the first time until its first exit;
-//! - a pooled machine: `instantiate` it from the pool, use it (map a
-//!   request page, write a request, run to the first exit), and expunge it,
-//!   which resets it for the next use.
+//! - a pooled machine: `instantiate` it from the pool, use it (deliver a
+//!   request, run to the first exit), and expunge it, which resets it for
+//!   the next use. A request is delivered either as slice 1 did, mapping a
+//!   request page and writing it there, or as the slice 2 ABI does, copying
+//!   it into memory the actor already has mapped (`input`).
 //!
 //! `machines`: medians for both backends.
-//! `machines loop <interpreter|jit> <fresh|pooled> <n>`: repeat n times, for
-//! profiling.
+//! `machines loop <interpreter|jit> <fresh|mapped|copied> <n>`: repeat n
+//! times, for profiling.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -65,24 +67,47 @@ fn fresh(backend: PvmBackend, actor: &Spi) -> (Duration, Duration) {
     (layout, first)
 }
 
+/// How a pooled use delivers its request.
+#[derive(Clone, Copy)]
+enum Delivery {
+    /// Map a request page and write the request there (slice 1).
+    Mapped,
+    /// Copy the request into the actor's mapped stack (slice 2's `input`).
+    Copied,
+}
+
 /// One pooled use: (acquire, use, reset).
-fn pooled(inner: &mut InnerMachines, program: &Arc<PoolProgram>) -> (Duration, Duration, Duration) {
+fn pooled(
+    inner: &mut InnerMachines,
+    program: &Arc<PoolProgram>,
+    delivery: Delivery,
+) -> (Duration, Duration, Duration) {
     let stack_top = (1u64 << 32) - 2 * (1 << 16) - (1 << 24);
     let started = Instant::now();
     let id = inner.instantiate(program).expect("instantiate");
     let acquire = started.elapsed();
 
     let started = Instant::now();
+    let request_at = match delivery {
+        Delivery::Mapped => {
+            inner
+                .pages(id, REQUEST / 4096, 1, PageMode::AllocateReadWrite)
+                .expect("request page");
+            REQUEST
+        }
+        // A page below the stack's top, clear of the frames the actor
+        // pushes before it reads the request.
+        Delivery::Copied => (stack_top - 4096) as u32,
+    };
     inner
-        .pages(id, REQUEST / 4096, 1, PageMode::AllocateReadWrite)
-        .expect("request page");
-    inner.poke(id, REQUEST, &request()).expect("poke request");
+        .poke(id, request_at, &request())
+        .expect("poke request");
     let outcome = inner
         .invoke(
             id,
             InvokeState {
                 gas: 1_000_000,
-                registers: request_registers(stack_top, REQUEST),
+                registers: request_registers(stack_top, request_at),
             },
         )
         .expect("invoke");
@@ -121,7 +146,16 @@ fn main() {
         for _ in 0..n {
             match args[3].as_str() {
                 "fresh" => drop(std::hint::black_box(fresh(backend, &actor))),
-                "pooled" => drop(std::hint::black_box(pooled(&mut inner, &program))),
+                "mapped" => drop(std::hint::black_box(pooled(
+                    &mut inner,
+                    &program,
+                    Delivery::Mapped,
+                ))),
+                "copied" => drop(std::hint::black_box(pooled(
+                    &mut inner,
+                    &program,
+                    Delivery::Copied,
+                ))),
                 other => panic!("unknown mode {other}"),
             }
         }
@@ -137,22 +171,24 @@ fn main() {
             median(first),
         );
 
-        let mut inner = InnerMachines::with_backend(backend);
-        inner.set_pool(Arc::clone(&pool));
-        let (mut acquire, mut used, mut reset, mut cycle) = (vec![], vec![], vec![], vec![]);
-        for _ in 0..SAMPLES {
-            let (a, u, r) = pooled(&mut inner, &program);
-            acquire.push(a);
-            used.push(u);
-            reset.push(r);
-            cycle.push(a + r);
+        for (delivery, named) in [(Delivery::Mapped, "mapped"), (Delivery::Copied, "copied")] {
+            let mut inner = InnerMachines::with_backend(backend);
+            inner.set_pool(Arc::clone(&pool));
+            let (mut acquire, mut used, mut reset, mut cycle) = (vec![], vec![], vec![], vec![]);
+            for _ in 0..SAMPLES {
+                let (a, u, r) = pooled(&mut inner, &program, delivery);
+                acquire.push(a);
+                used.push(u);
+                reset.push(r);
+                cycle.push(a + u + r);
+            }
+            println!(
+                "{name:>12} pooled, request {named}: acquire {:.1} µs, use {:.1} µs, reset {:.1} µs; whole cycle {:.1} µs",
+                median(acquire),
+                median(used),
+                median(reset),
+                median(cycle),
+            );
         }
-        println!(
-            "{name:>12} pooled: acquire {:.1} µs, use {:.1} µs, reset {:.1} µs; acquire + reset {:.1} µs",
-            median(acquire),
-            median(used),
-            median(reset),
-            median(cycle),
-        );
     }
 }

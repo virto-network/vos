@@ -5,7 +5,7 @@
 
 pub mod memory;
 
-use alloc::{vec, vec::Vec};
+use alloc::{sync::Arc, vec, vec::Vec};
 
 use crate::args::{self, Args};
 use crate::instruction::Opcode;
@@ -91,24 +91,25 @@ pub struct Interpreter {
     mem: Memory,
     /// ı: Instruction counter (program counter), indexes into code bytes.
     pub pc: u32,
-    /// c: Instruction bytecode.
-    pub code: Vec<u8>,
+    /// c: Instruction bytecode. This and the tables below are shared with
+    /// the prepared program and every other machine loaded from it.
+    pub code: Arc<[u8]>,
     /// k: Opcode bitmask (1 = start of instruction).
-    pub bitmask: Vec<u8>,
+    pub bitmask: Arc<[u8]>,
     /// j: Dynamic jump table (indices into code).
-    pub jump_table: Vec<u32>,
+    pub jump_table: Arc<[u32]>,
     /// A standard `ecalli` that has been surfaced but not acknowledged.
     pending_host_call: Option<crate::PendingHostCall>,
     /// GP basic-block starts: {PC=0} ∪ {post-terminator PCs}. Branch and
     /// djump targets must land on one of these or the instruction panics
     /// (GP eq A.17/A.18). Gas blocks share the same boundaries.
-    pub(crate) basic_block_starts: Vec<bool>,
+    pub(crate) basic_block_starts: Arc<[bool]>,
     /// Gas cost for each gas block (indexed by block start PC).
     /// Only entries at gas block starts are meaningful. Gas blocks are
     /// {PC=0} ∪ {post-terminator PCs}, NOT branch targets.
-    pub block_gas_costs: Vec<u32>,
+    pub block_gas_costs: Arc<[u32]>,
     /// Containing gas-block start for every externally enterable PC.
-    gas_block_start_by_pc: Vec<u32>,
+    gas_block_start_by_pc: Arc<[u32]>,
     /// Whether the block containing the current PC has already been funded.
     /// This is consensus-visible continuation state: host and page-fault
     /// retries must not charge the same block twice, while a fresh arbitrary
@@ -122,9 +123,9 @@ pub struct Interpreter {
     /// Collected instruction trace: (PC, opcode_byte) pairs.
     pub pc_trace: Vec<(u32, u8)>,
     /// Pre-decoded instruction stream (indexed by instruction number).
-    pub(crate) decoded_insts: Vec<DecodedInst>,
+    pub(crate) decoded_insts: Arc<[DecodedInst]>,
     /// Mapping from PC byte offset → instruction index. u32::MAX = invalid.
-    pub(crate) pc_to_idx: Vec<u32>,
+    pub(crate) pc_to_idx: Arc<[u32]>,
 }
 
 /// Read-only observation of one canonical interpreter instruction.
@@ -177,14 +178,15 @@ impl Interpreter {
         gas: Gas,
     ) -> Self {
         let program = Self::predecode(&code, &bitmask, &jump_table);
-        Self::from_predecoded(program, registers, mem, gas)
+        Self::from_predecoded(&program, registers, mem, gas)
     }
 
     // Crate-private: public InterpreterProgram fields are not a trusted source
     // of gas tables. Callers here must supply tables derived by
     // [`Self::predecode`].
+    /// A machine over `program`'s tables, shared rather than copied.
     pub(crate) fn from_predecoded(
-        program: crate::backend::InterpreterProgram,
+        program: &crate::backend::InterpreterProgram,
         registers: [u64; PVM_REGISTER_COUNT],
         mem: Memory,
         gas: Gas,
@@ -198,7 +200,7 @@ impl Interpreter {
             code,
             bitmask,
             jump_table,
-        } = program;
+        } = program.clone();
         Self {
             gas,
             registers,
@@ -236,14 +238,14 @@ impl Interpreter {
         let gas_block_start_by_pc =
             compute_gas_block_start_by_pc(code, bitmask, &basic_block_starts);
         crate::backend::InterpreterProgram {
-            decoded_insts,
-            pc_to_idx,
-            basic_block_starts,
-            block_gas_costs,
-            gas_block_start_by_pc,
-            code: code.to_vec(),
-            bitmask: bitmask.to_vec(),
-            jump_table: jump_table.to_vec(),
+            decoded_insts: decoded_insts.into(),
+            pc_to_idx: pc_to_idx.into(),
+            basic_block_starts: basic_block_starts.into(),
+            block_gas_costs: block_gas_costs.into(),
+            gas_block_start_by_pc: gas_block_start_by_pc.into(),
+            code: code.into(),
+            bitmask: bitmask.into(),
+            jump_table: jump_table.into(),
         }
     }
 

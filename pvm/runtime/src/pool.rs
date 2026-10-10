@@ -14,6 +14,10 @@
 //!
 //! Memory revision counters keep counting across resets, so caches keyed by
 //! them never mistake a reused machine for its earlier self.
+//!
+//! [`OuterMachines`] keeps one program's outer machines the same way: a
+//! node's agent runs its refine, accumulate and queries on machines laid
+//! out once and reset after each run.
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -26,7 +30,8 @@ use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use crate::backend::{PreparedExecution, PvmBackend};
 use crate::inner::gas;
 use crate::interpreter::{Interpreter, Memory, PERM_NONE, PERM_RO, PERM_RW};
-use crate::spi::CodeBlob;
+use crate::refine::{Invocation, Machine, RefineError};
+use crate::spi::{CodeBlob, StandardProgram};
 use crate::{Gas, PVM_PAGE_SIZE, PVM_REGISTER_COUNT};
 
 const PAGE: usize = PVM_PAGE_SIZE as usize;
@@ -320,6 +325,14 @@ pub(crate) struct PoolTicket {
     zeroed: usize,
 }
 
+impl core::fmt::Debug for PoolTicket {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PoolTicket")
+            .field("program", &self.program.hash)
+            .finish_non_exhaustive()
+    }
+}
+
 /// An inner machine owned by a pool, lent out by `instantiate`.
 pub(crate) struct PooledMachine {
     pub(crate) program: Arc<PoolProgram>,
@@ -346,7 +359,7 @@ impl PooledMachine {
             program.fresh_bytes.get_or_init(|| memory.allocated_bytes());
         }
         let mut vm = Interpreter::from_predecoded(
-            execution.interpreter_program().clone(),
+            execution.interpreter_program(),
             [0; PVM_REGISTER_COUNT],
             memory,
             0,
@@ -545,6 +558,123 @@ impl MachinePool {
             idle.count += 1;
             idle.by_program.entry(key).or_default().push(machine);
         }
+    }
+}
+
+/// Idle outer machines an [`OuterMachines`] keeps by default.
+pub const DEFAULT_IDLE_OUTER: usize = 64;
+
+/// One program's outer machines: a node's agent runs its refine,
+/// accumulate and queries on them.
+///
+/// Each is built as the pool builds an inner machine, with the program's
+/// image and no arguments, and kept between runs. [`Self::load`] lays a
+/// run's arguments in and sets its registers, gas and entry, giving what
+/// [`Machine::load_prepared_at`] gives with one difference that no guest
+/// sees: the memory spans the whole 32-bit address space, as an inner
+/// machine's does, and the pages past the layout are inaccessible rather
+/// than past the span; both fault alike. [`Self::restore`] resets a
+/// finished machine to the image, as [`MachinePool::release`] does.
+pub struct OuterMachines {
+    program: Arc<PoolProgram>,
+    standard: StandardProgram,
+    execution: PreparedExecution,
+    idle: Mutex<Vec<PooledMachine>>,
+    idle_limit: usize,
+}
+
+impl OuterMachines {
+    pub fn new(blob: &[u8], backend: PvmBackend) -> Result<Self, PoolError> {
+        Self::with_idle_limit(blob, backend, DEFAULT_IDLE_OUTER)
+    }
+
+    /// Outer machines of `blob` on `backend`, keeping at most `idle_limit`
+    /// idle.
+    pub fn with_idle_limit(
+        blob: &[u8],
+        backend: PvmBackend,
+        idle_limit: usize,
+    ) -> Result<Self, PoolError> {
+        let standard = crate::spi::parse_standard_program(blob).ok_or(PoolError::InvalidProgram)?;
+        let program = Arc::new(PoolProgram::new(blob)?);
+        let execution = program.prepared(backend)?;
+        Ok(Self {
+            program,
+            standard,
+            execution,
+            idle: Mutex::new(Vec::new()),
+            idle_limit,
+        })
+    }
+
+    /// The resolved backend.
+    pub fn backend(&self) -> PvmBackend {
+        self.execution.backend()
+    }
+
+    /// A machine laid out for `args`, starting at instruction counter
+    /// `entry` with `gas`: 0 is refine, 5 accumulate.
+    pub fn load(&self, entry: u32, args: &[u8], gas: Gas) -> Result<Machine, RefineError> {
+        let layout = self
+            .standard
+            .layout(args)
+            .ok_or(RefineError::LayoutOverflow)?;
+        let idle = lock(&self.idle).pop();
+        let machine = match idle {
+            Some(machine) => machine,
+            None => PooledMachine::build(&self.program, self.execution.clone())
+                .map_err(|_| RefineError::Backend)?,
+        };
+        let (mut vm, execution, ticket) = machine.into_parts();
+        let memory = vm.memory_mut();
+        let args = layout.args;
+        if args.size > 0 {
+            let permission = if args.writable { PERM_RW } else { PERM_RO };
+            let page = PVM_PAGE_SIZE as u64;
+            memory.set_page_range(
+                (args.base / page) as usize,
+                (args.size / page) as usize,
+                permission,
+            );
+            memory.init_copy(args.base as u32, layout.args_data);
+        }
+        // Dirty pages count from the loaded image, as for a fresh load.
+        memory.take_dirty_pages();
+        vm.registers = layout.registers;
+        vm.gas = gas;
+        vm.set_pc(entry);
+        Ok(Machine::lent(vm, execution, gas, ticket))
+    }
+
+    /// Reset the machine `invocation` finished on and keep it idle, or drop
+    /// it when it cannot be reset, grew too large, was not lent here, or
+    /// enough are idle.
+    pub fn restore(&self, invocation: Invocation) {
+        let Some((memory, ticket)) = invocation.into_lent() else {
+            return;
+        };
+        if !Arc::ptr_eq(&ticket.program, &self.program) {
+            return;
+        }
+        let vm = Interpreter::from_predecoded(
+            self.execution.interpreter_program(),
+            [0; PVM_REGISTER_COUNT],
+            memory,
+            0,
+        );
+        let mut machine = PooledMachine::from_parts(vm, self.execution.clone(), ticket);
+        if !machine.reset() || !machine.keep() {
+            return;
+        }
+        let mut idle = lock(&self.idle);
+        if idle.len() < self.idle_limit {
+            idle.push(machine);
+        }
+    }
+
+    /// Idle machines held.
+    pub fn idle(&self) -> usize {
+        lock(&self.idle).len()
     }
 }
 
@@ -996,6 +1126,168 @@ mod tests {
             dump(&machines, id, &touched),
             dump(&reference, reference_id, &touched)
         );
+    }
+
+    /// A standard program that stores u64 `args[8..16]` at address
+    /// `args[0..8]`, then halts with output `args[24..32]` bytes at address
+    /// `args[16..24]`.
+    fn scribe() -> Vec<u8> {
+        let mut code = Vec::new();
+        let mut starts = Vec::new();
+        let mut asm = |instruction: &[u8]| {
+            starts.push(code.len());
+            code.extend_from_slice(instruction);
+        };
+        let load = Opcode::LoadIndU64 as u8;
+        asm(&[load, 2 | (7 << 4)]);
+        asm(&[load, 3 | (7 << 4), 8]);
+        asm(&[load, 4 | (7 << 4), 16]);
+        asm(&[load, 5 | (7 << 4), 24]);
+        asm(&[Opcode::StoreIndU64 as u8, 3 | (2 << 4)]);
+        asm(&[Opcode::MoveReg as u8, 7 | (4 << 4)]);
+        asm(&[Opcode::MoveReg as u8, 8 | (5 << 4)]);
+        asm(&[Opcode::JumpInd as u8, 0]);
+        let mut bitmask = vec![0; code.len()];
+        for start in starts {
+            bitmask[start] = 1;
+        }
+        let code = vos_pvm_program::build_compact_code_blob(&CodeBlob {
+            code,
+            bitmask,
+            jump_table: Vec::new(),
+        })
+        .unwrap();
+        let ro: Vec<u8> = (0..300).map(|i| (i * 7) as u8 | 1).collect();
+        let rw: Vec<u8> = (0..5000).map(|i| (i * 13) as u8).collect();
+        let (heap_pages, stack) = (2u16, 8192u32);
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&(ro.len() as u32).to_le_bytes()[..3]);
+        blob.extend_from_slice(&(rw.len() as u32).to_le_bytes()[..3]);
+        blob.extend_from_slice(&heap_pages.to_le_bytes());
+        blob.extend_from_slice(&stack.to_le_bytes()[..3]);
+        blob.extend_from_slice(&ro);
+        blob.extend_from_slice(&rw);
+        blob.extend_from_slice(&(code.len() as u32).to_le_bytes());
+        blob.extend_from_slice(&code);
+        blob
+    }
+
+    /// `scribe`'s regions: read-only data, read-write data and heap, the
+    /// stack, and the arguments.
+    const SCRIBE_RO: u64 = 0x1_0000;
+    const SCRIBE_RW: u64 = 0x3_0000;
+    const SCRIBE_RW_END: u64 = 0x3_4000;
+    const SCRIBE_STACK: u64 = 0xFEFD_E000;
+    const SCRIBE_ARGS: u64 = 0xFEFF_0000;
+
+    /// An address in or around one of `scribe`'s regions.
+    fn scribe_address() -> impl Strategy<Value = u64> {
+        prop_oneof![
+            (0..0x4000u64 - 8).prop_map(|offset| SCRIBE_RW + offset),
+            (0..0x2000u64 - 8).prop_map(|offset| SCRIBE_STACK + offset),
+            (0..0x1000u64).prop_map(|offset| SCRIBE_RO + offset),
+            (0..0x3000u64).prop_map(|offset| SCRIBE_ARGS + offset),
+            Just(SCRIBE_RW_END - 4),
+            Just(0x2_0000),
+        ]
+    }
+
+    /// One run of `scribe`: its arguments, padded with a pattern to a
+    /// length that spans zero to three pages, and its gas.
+    fn scribe_run() -> impl Strategy<Value = (Vec<u8>, u64)> {
+        (
+            scribe_address(),
+            any::<u64>(),
+            scribe_address(),
+            prop_oneof![Just(0u64), Just(8), Just(100), Just(5000)],
+            prop_oneof![Just(0usize), Just(16), 32..0x2800usize],
+            any::<u8>(),
+            prop_oneof![Just(5u64), Just(1_000_000)],
+        )
+            .prop_map(|(at, value, out, len, size, pattern, gas)| {
+                let mut args = Vec::new();
+                for word in [at, value, out, len] {
+                    args.extend_from_slice(&word.to_le_bytes());
+                }
+                args.resize(size.max(32), pattern | 1);
+                args.truncate(size);
+                (args, gas)
+            })
+    }
+
+    fn finish(mut machine: Machine) -> Invocation {
+        let exit = machine.try_resume().unwrap();
+        machine.finish(exit)
+    }
+
+    /// What a run shows: its exit, gas, registers, counter and output, and
+    /// the bytes of every page it may have touched or read.
+    fn shown(invocation: &Invocation, args: usize) -> (String, Option<Vec<u8>>, Vec<u8>) {
+        let mut bytes = Vec::new();
+        let mut page = |at: u64| {
+            let mut buffer = vec![0u8; PAGE];
+            invocation.memory().read_bytes(at as u32, &mut buffer);
+            bytes.extend_from_slice(&buffer);
+        };
+        for at in (SCRIBE_RO..SCRIBE_RO + 0x1000).step_by(PAGE) {
+            page(at);
+        }
+        for at in (SCRIBE_RW..SCRIBE_RW_END).step_by(PAGE) {
+            page(at);
+        }
+        for at in (SCRIBE_STACK..SCRIBE_STACK + 0x2000).step_by(PAGE) {
+            page(at);
+        }
+        for at in (SCRIBE_ARGS..SCRIBE_ARGS + args.next_multiple_of(PAGE) as u64).step_by(PAGE) {
+            page(at);
+        }
+        let state = format!(
+            "{:?} {} {:?} {}",
+            invocation.exit, invocation.gas_used, invocation.registers, invocation.pc
+        );
+        (state, invocation.output_bounded(0x4000), bytes)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// Over any sequence of runs, each laying in arguments of a
+        /// different length, storing anywhere, faulting or running out of
+        /// gas, a kept outer machine runs as a freshly loaded one does, and
+        /// leaves nothing behind: its earlier arguments and stores read as
+        /// they would on a fresh machine.
+        #[test]
+        fn kept_outer_machines_equal_fresh_ones(
+            runs in proptest::collection::vec(scribe_run(), 1..8),
+        ) {
+            let blob = scribe();
+            for backend in backends() {
+                let outer = OuterMachines::new(&blob, backend).unwrap();
+                let prepared =
+                    crate::refine::PreparedProgram::new_with_backend(&blob, backend).unwrap();
+                for (args, gas) in &runs {
+                    let kept = finish(outer.load(0, args, *gas).unwrap());
+                    let fresh = finish(
+                        Machine::load_prepared_at(
+                            &prepared,
+                            0,
+                            args,
+                            *gas,
+                            crate::refine::MemoryModel::Auto,
+                        )
+                        .unwrap(),
+                    );
+                    prop_assert_eq!(
+                        shown(&kept, args.len()),
+                        shown(&fresh, args.len()),
+                        "{:?}",
+                        backend
+                    );
+                    outer.restore(kept);
+                    prop_assert_eq!(outer.idle(), 1, "the machine is kept");
+                }
+            }
+        }
     }
 
     proptest! {

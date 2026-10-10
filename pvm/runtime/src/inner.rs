@@ -252,7 +252,7 @@ impl InnerMachine {
             let pages = memory.pages();
             memory.set_page_range(0, pages, PERM_NONE);
             let mut vm = Interpreter::from_predecoded(
-                self.execution.interpreter_program().clone(),
+                self.execution.interpreter_program(),
                 [0; PVM_REGISTER_COUNT],
                 memory,
                 0,
@@ -549,10 +549,17 @@ impl InnerMachines {
             slot: id,
             generation: machine.generation,
         };
-        // Clone immutable preparation, never invocation state. The compiled
-        // program remains shared while the mutable architectural state is lent.
-        let execution = machine.execution.clone();
-        let vm = machine.vm()?;
+        // Lay the machine out on first use, then borrow its preparation and
+        // its state apart: cloning the preparation would cost two atomic
+        // reference counts per exit.
+        machine.vm()?;
+        let InnerMachine {
+            execution,
+            vm,
+            backend_failed: failed,
+            ..
+        } = machine;
+        let vm = vm.as_mut().expect("laid out above");
         vm.gas = state.gas;
         vm.registers = state.registers;
         let mut observer = observer;
@@ -623,7 +630,7 @@ impl InnerMachines {
             },
         };
         if backend_failed {
-            machine.backend_failed = true;
+            *failed = true;
             return Err(InnerError::Backend);
         }
         let exit = match exit {

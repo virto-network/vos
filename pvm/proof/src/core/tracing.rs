@@ -806,9 +806,9 @@ impl TracingPvm {
     /// explicit because the interpreter contains the post-execution image;
     /// attach the saved entering image with `SideNote::with_memory`.
     pub fn into_side_note(self) -> crate::SideNote {
-        let code = self.pvm.code.clone();
-        let bitmask = self.pvm.bitmask.clone();
-        let jump_table = self.pvm.jump_table.clone();
+        let code = self.pvm.code.to_vec();
+        let bitmask = self.pvm.bitmask.to_vec();
+        let jump_table = self.pvm.jump_table.to_vec();
         let steps = self.trace();
         let mut side_note = crate::SideNote::new(steps, code, bitmask).with_jump_table(jump_table);
         side_note.blake2b_calls = self

@@ -14,3 +14,7 @@ vos-wire = { workspace = true }
 proptest = "1"
 vos-pvm-compiler = { workspace = true }
 vos-pvm-program = { workspace = true }
+
+[[bench]]
+name = "batch"
+harness = false

@@ -725,9 +725,9 @@ mod prover {
                         self.static_program_copies += 1;
                     }
                     ProgramStatic {
-                        code: Arc::from(machine.code.as_slice()),
-                        bitmask: Arc::from(machine.bitmask.as_slice()),
-                        jump_table: Arc::from(machine.jump_table.as_slice()),
+                        code: Arc::clone(&machine.code),
+                        bitmask: Arc::clone(&machine.bitmask),
+                        jump_table: Arc::clone(&machine.jump_table),
                     }
                 })
                 .clone()

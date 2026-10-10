@@ -26,33 +26,6 @@ enum Dispatch {
     Backend,
 }
 
-/// Aggregate timings only; instruction observation would distort the path
-/// being measured. Inner create includes decoding/preparation, and inner invoke
-/// includes its frame/refund handling. Neither is a queue or quorum benchmark.
-#[cfg(feature = "std")]
-#[derive(Default)]
-struct ExecutionTimings {
-    outer_us: u64,
-    inner_create_us: u64,
-    inner_invoke_us: u64,
-    host_us: u64,
-    outer_slices: u64,
-}
-
-#[cfg(feature = "std")]
-impl Drop for ExecutionTimings {
-    fn drop(&mut self) {
-        tracing::debug!(
-            outer_execution_us = self.outer_us,
-            inner_create_us = self.inner_create_us,
-            inner_invoke_us = self.inner_invoke_us,
-            host_dispatch_us = self.host_us,
-            outer_slices = self.outer_slices,
-            "Refine execution phases"
-        );
-    }
-}
-
 /// Stable identity of a machine participating in one nested Refine run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RefineMachineIdentity {
@@ -204,14 +177,22 @@ impl RefineContext {
         gas: Gas,
         model: MemoryModel,
     ) -> Result<Self, RefineError> {
-        let outer = Machine::load_prepared(program, args, gas, model)?;
+        Ok(Self::new(Machine::load_prepared(
+            program, args, gas, model,
+        )?))
+    }
+
+    /// Serve refine on a loaded machine, such as one
+    /// [`crate::pool::OuterMachines`] lent; inner machines run on its
+    /// backend.
+    pub fn new(outer: Machine) -> Self {
         let inner = InnerMachines::with_backend(outer.backend());
-        Ok(Self {
+        Self {
             outer,
             inner,
             state: None,
             precompiles: true,
-        })
+        }
     }
 
     /// Run as a JAM node would: every call this host does not serve,
@@ -258,44 +239,15 @@ impl RefineContext {
         mut self,
         mut host: impl FnMut(u64, &mut Machine) -> Result<(), ExitReason>,
     ) -> Result<Invocation, RefineError> {
-        #[cfg(feature = "std")]
-        let mut timings = ExecutionTimings::default();
         loop {
-            #[cfg(feature = "std")]
-            let started = std::time::Instant::now();
-            let exit = self.outer.try_resume();
-            #[cfg(feature = "std")]
-            {
-                timings.outer_us += started.elapsed().as_micros() as u64;
-                timings.outer_slices += 1;
-            }
-            let exit = exit?;
+            let exit = self.outer.try_resume()?;
             let ExitReason::HostCall(id) = exit else {
                 return Ok(self.outer.finish(exit));
             };
-            #[cfg(feature = "std")]
-            let started = std::time::Instant::now();
-            let dispatch = self.dispatch(id);
-            #[cfg(feature = "std")]
-            {
-                let elapsed = started.elapsed().as_micros() as u64;
-                match id {
-                    id if id == u64::from(host_call::MACHINE) => timings.inner_create_us += elapsed,
-                    id if id == u64::from(host_call::INVOKE) => timings.inner_invoke_us += elapsed,
-                    _ => timings.host_us += elapsed,
-                }
-            }
-            match dispatch {
+            match self.dispatch(id) {
                 Dispatch::Continue => {}
                 Dispatch::Exit(ExitReason::HostCall(call)) => {
-                    #[cfg(feature = "std")]
-                    let started = std::time::Instant::now();
-                    let result = host(call, &mut self.outer);
-                    #[cfg(feature = "std")]
-                    {
-                        timings.host_us += started.elapsed().as_micros() as u64;
-                    }
-                    if let Err(exit) = result {
+                    if let Err(exit) = host(call, &mut self.outer) {
                         return Ok(self.outer.finish(exit));
                     }
                 }
