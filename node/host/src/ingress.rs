@@ -16,8 +16,8 @@ use vos_wire::abi::{cap, refusal};
 use vos_wire::batch::{Admin, Request};
 use vos_wire::ids::{AgentId, InstanceId, Principal, SessionId};
 use vos_wire::ingress::{
-    Answer, Call, Grant, Install, Open, Opened, QueryCall, Rejection, call_message, open_message,
-    query_message,
+    Answer, Call, Create, Grant, Install, Open, Opened, QueryCall, Rejection, call_message,
+    open_message, query_message,
 };
 use vos_wire::records::{Installed, SessionMark, unstored};
 use vos_wire::result::Outcome;
@@ -77,12 +77,16 @@ fn reply_answer(reply: Result<Reply, CallError>) -> Answer {
         Err(CallError::Busy) => Answer::Busy,
         Err(CallError::NoAgent) => Answer::NoAgent,
         Err(CallError::Stopped) => Answer::Stopped,
+        Err(CallError::NotLeader(leader)) => Answer::NotLeader { leader },
+        Err(CallError::Elsewhere(replicas)) => Answer::Elsewhere { replicas },
+        Err(CallError::Unconfirmed(agent)) => Answer::Unconfirmed(agent),
     }
 }
 
 fn status(answer: &Answer) -> u16 {
     match answer {
         Answer::Ran(_) | Answer::Created(_) => 200,
+        Answer::Unconfirmed(_) => 202,
         // Like an unknown session, an expired one means opening another.
         Answer::Refused(refusal::EXPIRED) => 410,
         Answer::Refused(_) => 409,
@@ -95,6 +99,8 @@ fn status(answer: &Answer) -> u16 {
         Answer::NotConsumed => 500,
         Answer::NoAgent => 404,
         Answer::Busy | Answer::Stopped | Answer::Unavailable => 503,
+        // Another node serves it: the answer says which.
+        Answer::NotLeader { .. } | Answer::Elsewhere { .. } => 421,
     }
 }
 
@@ -232,10 +238,20 @@ impl Ingress {
             {
                 respond(Answer::Rejected(Rejection::Unauthorized))
             }
-            ("POST", ["agents"]) => respond(match self.inner.create_agent().await {
-                Ok(agent) => Answer::Created(agent),
-                Err(error) => reply_answer(Err(error)),
-            }),
+            ("POST", ["agents"]) => {
+                let create = if request.body.is_empty() {
+                    Ok(Create::default())
+                } else {
+                    decode::<Create>(&request.body)
+                };
+                match create {
+                    Ok(create) => respond(match self.inner.create_agent(create.replicas).await {
+                        Ok(agent) => Answer::Created(agent),
+                        Err(error) => reply_answer(Err(error)),
+                    }),
+                    Err(answer) => respond(answer),
+                }
+            }
             ("POST", ["agents", id, "install"]) => {
                 let Some(agent) = agent(id) else {
                     return respond(Answer::NoAgent);

@@ -91,15 +91,21 @@ pub struct Limits {
 
 impl Default for Limits {
     fn default() -> Self {
-        Self {
-            liveness: 64 << 10,
-            // The 1 MiB append cap, with its envelope.
-            consensus: 2 << 20,
-            requests: 1 << 20,
-            // A 64 MiB program, with its header.
-            bulk: (64 << 20) + (64 << 10),
-        }
+        Self::DEFAULT
     }
+}
+
+impl Limits {
+    pub const DEFAULT: Self = Self {
+        liveness: 64 << 10,
+        // The largest log entry a node proposes (a 4 MiB work result), in
+        // an append alone, or entries up to the 1 MiB append cap; with
+        // their envelope.
+        consensus: 5 << 20,
+        requests: 1 << 20,
+        // A 64 MiB program, with its header.
+        bulk: (64 << 20) + (64 << 10),
+    };
 }
 
 impl Limits {

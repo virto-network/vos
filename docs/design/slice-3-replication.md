@@ -681,6 +681,11 @@ then QUIC. Then TLS on client ingress.
 
 ### 3.5 Replicated agents
 
+Split in four, with 3.6's sessions moved ahead of forwarding: the
+replicated group (3.5a), sessions in the agent (3.5b), any replica
+serving (3.5c), and messages across nodes and processes (3.5d). See the
+progress log.
+
 - Groups and the directory.
 - Creation with a replica set.
 - The leader proposing and followers applying.

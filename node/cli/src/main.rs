@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use vos_node::client::{Client, Operator, Target};
 use vos_node::tls::{IngressTls, Trust};
-use vos_node::{ADMIN_TOKEN, Config, NODE_KEY, Node};
+use vos_node::{ADMIN_TOKEN, Config, NODE_KEY, Node, Space};
 use vos_wire::abi::refusal;
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, SessionId};
 use vos_wire::ingress::{Answer, Install, Rejection};
@@ -97,6 +97,10 @@ enum NodeCommand {
         agent: PathBuf,
         #[command(flatten)]
         tls: TlsArgs,
+        /// The space's nodes, one per line: number, key, peer address and
+        /// ingress address. Without it, the node is a space of one.
+        #[arg(long)]
+        space: Option<PathBuf>,
     },
     /// Print a node's public key, its identity.
     Info {
@@ -121,6 +125,10 @@ enum AgentCommand {
     Create {
         #[command(flatten)]
         operator: OperatorArgs,
+        /// The nodes to replicate it on, by number: `1,2,3`. The node
+        /// alone by default.
+        #[arg(long, value_delimiter = ',')]
+        replicas: Vec<u8>,
     },
 }
 
@@ -246,8 +254,9 @@ fn run(cli: Cli) -> Result<(), String> {
                     listen,
                     agent,
                     tls,
+                    space,
                 },
-        } => node(&data, listen, &agent, tls.ingress()),
+        } => node(&data, listen, &agent, tls.ingress(), space.as_deref()),
         Command::Node {
             command: NodeCommand::Info { node },
         } => {
@@ -259,10 +268,18 @@ fn run(cli: Cli) -> Result<(), String> {
             command: KeyCommand::New { out },
         } => new_key(&out),
         Command::Agent {
-            command: AgentCommand::Create { operator },
-        } => match operator_of(&operator)?.create_agent().map_err(failed)? {
+            command: AgentCommand::Create { operator, replicas },
+        } => match operator_of(&operator)?
+            .create_agent(replicas)
+            .map_err(failed)?
+        {
             Answer::Created(agent) => {
                 println!("{}", agent.0);
+                Ok(())
+            }
+            Answer::Unconfirmed(agent) => {
+                println!("{}", agent.0);
+                eprintln!("vos: a majority of its replicas does not hold it yet");
                 Ok(())
             }
             other => Err(describe(&other)),
@@ -338,9 +355,11 @@ fn node(
     listen: SocketAddr,
     agent: &Path,
     tls: Option<IngressTls>,
+    space: Option<&Path>,
 ) -> Result<(), String> {
     let mut config = Config::new(link(agent)?);
     config.ingress_tls = tls;
+    config.space = space.map(Space::read).transpose()?;
     let node = Node::open(data, config).map_err(|error| format!("{error:?}"))?;
     let address = node.serve(listen).map_err(|error| format!("{error:?}"))?;
     println!("listening on {address}");

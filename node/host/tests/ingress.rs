@@ -83,7 +83,7 @@ impl Served {
         let target = Target::loopback(&base).unwrap();
         let token = std::fs::read_to_string(dir.path().join(ADMIN_TOKEN)).unwrap();
         let operator = Operator::new(&target, &token);
-        let Ok(Answer::Created(agent)) = operator.create_agent() else {
+        let Ok(Answer::Created(agent)) = operator.create_agent(Vec::new()) else {
             panic!("an agent")
         };
         let install = Install {
@@ -374,7 +374,7 @@ fn operator_commands_need_the_token() {
     let served = Served::start(Arc::new(vos_node::NoHooks));
     let stranger = Operator::new(&served.target, &"00".repeat(32));
     assert_eq!(
-        stranger.create_agent().unwrap(),
+        stranger.create_agent(Vec::new()).unwrap(),
         Answer::Rejected(Rejection::Unauthorized)
     );
     let client = served.client(1);

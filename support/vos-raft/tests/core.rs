@@ -1106,3 +1106,16 @@ fn an_unknown_log_start_configuration_is_never_sent() {
         .expect("a snapshot for A");
     assert_eq!(snapshot, None);
 }
+
+#[test]
+fn a_lone_member_leads_at_its_first_tick() {
+    let mut cfg = config();
+    cfg.members = vec![ME];
+    let mut core = Core::new(cfg, Recovered::default(), 0, 9);
+    core.tick(0);
+    // Its vote counts once durable.
+    let vote = writes(&core.take_actions()).last().unwrap().clone();
+    persist(&mut core, &vote);
+    let actions = core.take_actions();
+    assert_eq!(core.role(), Role::Leader, "{actions:?}");
+}

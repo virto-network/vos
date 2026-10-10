@@ -2474,6 +2474,7 @@ name = "vos-node"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
+ "event-listener",
  "fjall",
  "futures-rustls",
  "getrandom 0.2.17",

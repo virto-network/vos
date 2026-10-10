@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use vos_node::store::{Store, View};
+use vos_node::store::{EntryKind, Store, View};
 use vos_node::{CallError, Config, Hooks, Node, Reply};
 use vos_wire::abi::refusal;
 use vos_wire::batch::{Batch, Input, Message, Request};
@@ -107,6 +107,18 @@ fn value(node: &Node, programs: &Programs, agent: AgentId) -> u64 {
 
 fn applied(node: &Node, agent: AgentId) -> u64 {
     node.store().snapshot().applied(agent).unwrap().unwrap_or(0)
+}
+
+/// The work results `agent` applied: its batches, not its leaders' no-ops.
+fn results(node: &Node, agent: AgentId) -> usize {
+    (1..=applied(node, agent))
+        .filter(|index| {
+            node.store()
+                .log_entry(agent, *index)
+                .unwrap()
+                .is_some_and(|entry| entry.kind == EntryKind::Result)
+        })
+        .count()
 }
 
 /// A value of `agent`'s applied state.
@@ -329,7 +341,7 @@ fn a_panicking_executor_retries_the_batch_whole() {
     assert_eq!(totals, [1, 3, 6]);
     assert!(!panics.0.load(Ordering::SeqCst), "a job panicked");
     assert_eq!(
-        applied(&node, agent),
+        results(&node, agent),
         2,
         "the install, then the three in one batch"
     );
@@ -361,8 +373,8 @@ fn a_failed_commit_stops_the_node_and_a_restart_recovers() {
         agent
     };
     let node = Node::open(dir.path(), config(&programs, Arc::new(vos_node::NoHooks))).unwrap();
-    assert_eq!(applied(&node, agent), 1, "only the install applied");
     assert_eq!(value(&node, &programs, agent), 0);
+    assert_eq!(results(&node, agent), 1, "only the install applied");
     let mut session = Session(0);
     assert_eq!(
         done::<u64>(smol::block_on(
@@ -423,7 +435,8 @@ impl Hooks for StopAfter {
 }
 
 /// Two counter agents, as the node numbers them: the sender, then the
-/// target, each with its install at log index 1.
+/// target, each with its leader's no-op at log index 1 and its install at
+/// 2.
 const SENDER: AgentId = AgentId(1);
 const TARGET: AgentId = AgentId(2);
 
@@ -439,8 +452,9 @@ fn a_stop_before_delivery_delivers_on_restart() {
     let forward = programs.method("forward");
     let mut session = Session(0);
     {
-        // The sender's second batch is the forward: stop before delivery.
-        let stop = StopAfter::new(SENDER, 2);
+        // The sender's second batch, at 3, is the forward: stop before
+        // delivery.
+        let stop = StopAfter::new(SENDER, 3);
         let node = Node::open(dir.path(), config(&programs, stop.clone())).unwrap();
         two_agents(&node, &programs);
         let call = node.call(
@@ -466,9 +480,9 @@ fn a_stop_before_the_ack_redelivers_and_applies_once() {
     let forward = programs.method("forward");
     let mut session = Session(0);
     {
-        // The target's second batch applies the message: stop before its
-        // ack.
-        let stop = StopAfter::new(TARGET, 2);
+        // The target's second batch, at 3, applies the message: stop
+        // before its ack.
+        let stop = StopAfter::new(TARGET, 3);
         let node = Node::open(dir.path(), config(&programs, stop.clone())).unwrap();
         two_agents(&node, &programs);
         let call = node.call(
@@ -508,9 +522,9 @@ fn redelivery_while_the_sender_sends_more_applies_each_once() {
     let forward = programs.method("forward");
     let mut session = Session(0);
     {
-        // The target stops after its first commit of messages, whichever
-        // of the three it held.
-        let stop = StopAfter::new(TARGET, 2);
+        // The target stops after its first commit of messages, at 3,
+        // whichever of the three it held.
+        let stop = StopAfter::new(TARGET, 3);
         let node = Node::open(dir.path(), config(&programs, stop.clone())).unwrap();
         two_agents(&node, &programs);
         for by in [1u64, 2, 3] {
@@ -543,6 +557,10 @@ fn a_gap_is_refused_unacknowledged_until_it_fills() {
     let target = counter_agent(&node, &programs);
     // A sender with no batches of its own: an ack would be its first.
     let sender = node.create_agent().unwrap();
+    wait_until("the sender leads", || {
+        node.leads(sender) && results(&node, sender) == 0 && applied(&node, sender) >= 1
+    });
+    let leading = applied(&node, sender);
     let message = |sequence: u64, by: u64| Message {
         from: sender,
         sequence,
@@ -557,13 +575,14 @@ fn a_gap_is_refused_unacknowledged_until_it_fills() {
     });
     assert_eq!(value(&node, &programs, target), 0);
     std::thread::sleep(Duration::from_millis(50));
-    assert_eq!(applied(&node, sender), 0, "a gap is not acknowledged");
+    assert_eq!(applied(&node, sender), leading, "a gap is not acknowledged");
     node.deliver(target, message(1, 1)).unwrap();
     node.deliver(target, message(2, 20)).unwrap();
     wait_until("both apply in order", || {
         value(&node, &programs, target) == 21
     });
     wait_until("and are acknowledged", || {
-        get::<u64>(&node, sender, &keys::acked(target)).is_some() || applied(&node, sender) > 0
+        get::<u64>(&node, sender, &keys::acked(target)).is_some()
+            || applied(&node, sender) > leading
     });
 }

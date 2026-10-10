@@ -76,7 +76,9 @@ fn a_client_pins_the_node_s_key() {
     assert_eq!(vos_node::client::node_id(&pinned).unwrap(), node.id());
     let token = std::fs::read_to_string(dir.path().join(ADMIN_TOKEN)).unwrap();
     assert!(matches!(
-        Operator::new(&pinned, &token).create_agent().unwrap(),
+        Operator::new(&pinned, &token)
+            .create_agent(Vec::new())
+            .unwrap(),
         Answer::Created(_)
     ));
     let client = Client::open(

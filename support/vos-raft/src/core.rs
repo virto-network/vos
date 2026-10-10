@@ -520,6 +520,11 @@ impl<N: NodeId> Core<N> {
         }
         core.recover_configuration(recovered.active_config);
         core.reset_election_timer();
+        // No other member could lead: a lone member elects itself at its
+        // first tick, without waiting out a timeout.
+        if core.is_solo() && core.is_member() {
+            core.election_deadline = now;
+        }
         if core.commit > meta.commit_index {
             core.actions.push(Action::Committed { index: core.commit });
         }

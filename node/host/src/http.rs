@@ -284,6 +284,7 @@ async fn read_request(
 fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        202 => "Accepted",
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",
@@ -292,6 +293,7 @@ fn reason(status: u16) -> &'static str {
         410 => "Gone",
         411 => "Length Required",
         413 => "Content Too Large",
+        421 => "Misdirected Request",
         431 => "Request Header Fields Too Large",
         429 => "Too Many Requests",
         500 => "Internal Server Error",

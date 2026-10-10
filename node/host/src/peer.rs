@@ -15,12 +15,15 @@
 //! - **A blob hashes to its name.**
 //! - **Each message comes on its class,** so a frame is bounded by its own
 //!   class's size, and a Raft message on its agent's stream.
+//! - **A creation record comes from the node that created it,** whose
+//!   number its agent id carries.
 //!
-//! Snapshot acknowledgements, blob requests, blobs and liveness pass with
-//! only these checks: their handlers authorise by sender. An
-//! acknowledgement counts only from the replica a snapshot streams to, a
-//! blob only if requested, and a blob request only from a replica of its
-//! agent.
+//! Snapshot acknowledgements, blob requests, blobs, directory
+//! acknowledgements and liveness pass with only these checks: their
+//! handlers authorise by sender. An acknowledgement counts only from the
+//! replica a snapshot streams to, a blob only if requested, a blob request
+//! only from a replica of its agent, and a directory acknowledgement only
+//! for a record this node created.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -28,7 +31,7 @@ use vos_net::Class;
 use vos_raft::{AppendResult, EntryKind, LogEntry, Message};
 use vos_wire::Decode;
 use vos_wire::ids::AgentId;
-use vos_wire::peer::{self, NodeNumber, PeerMessage, Raft, SnapshotChunk};
+use vos_wire::peer::{self, CreationRecord, NodeNumber, PeerMessage, Raft, SnapshotChunk};
 
 /// The wire's message for the core's.
 pub fn to_wire(message: &Message<NodeNumber>) -> Raft {
@@ -243,10 +246,16 @@ pub enum Refusal {
     WrongClass = 6,
     /// A Raft message on a stream other than its agent's.
     WrongStream = 7,
+    /// A creation record from a node other than its creator, or for an
+    /// agent outside the creator's range.
+    NotTheCreator = 8,
+    /// A Raft message for an agent with no group here, or whose inbox was
+    /// full: Raft sends it again.
+    Unrouted = 9,
 }
 
 impl Refusal {
-    pub const ALL: [Refusal; 8] = [
+    pub const ALL: [Refusal; 10] = [
         Refusal::Undecodable,
         Refusal::Stranger,
         Refusal::NotTheLeaderNamed,
@@ -255,6 +264,8 @@ impl Refusal {
         Refusal::WrongBlob,
         Refusal::WrongClass,
         Refusal::WrongStream,
+        Refusal::NotTheCreator,
+        Refusal::Unrouted,
     ];
 }
 
@@ -263,7 +274,9 @@ pub fn class(message: &PeerMessage) -> Class {
     match message {
         PeerMessage::Raft { .. } | PeerMessage::SnapshotAck(_) => Class::Consensus,
         PeerMessage::SnapshotChunk(_) | PeerMessage::Blob { .. } => Class::Bulk,
-        PeerMessage::BlobRequest { .. } => Class::Requests,
+        PeerMessage::BlobRequest { .. }
+        | PeerMessage::Directory(_)
+        | PeerMessage::DirectoryAck { .. } => Class::Requests,
         PeerMessage::Liveness { .. } | PeerMessage::LivenessAnswer { .. } => Class::Liveness,
     }
 }
@@ -276,6 +289,8 @@ pub fn stream(message: &PeerMessage) -> u64 {
         }
         PeerMessage::SnapshotChunk(chunk) => u64::from(chunk.agent.0),
         PeerMessage::SnapshotAck(ack) => u64::from(ack.agent.0),
+        PeerMessage::Directory(record) => u64::from(record.agent.0),
+        PeerMessage::DirectoryAck { agent } => u64::from(agent.0),
         PeerMessage::Blob { .. }
         | PeerMessage::Liveness { .. }
         | PeerMessage::LivenessAnswer { .. } => 0,
@@ -313,7 +328,15 @@ pub fn check(
         PeerMessage::Raft { message, .. } => check_raft(from, message),
         PeerMessage::SnapshotChunk(chunk) => check_chunk(from, chunk, followed(chunk.agent)),
         PeerMessage::Blob { hash, bytes } => check_blob(hash, bytes),
-        PeerMessage::SnapshotAck(_)
+        PeerMessage::Directory(record) => {
+            if record.creator == from && CreationRecord::creator_of(record.agent) == from {
+                Ok(())
+            } else {
+                Err(Refusal::NotTheCreator)
+            }
+        }
+        PeerMessage::DirectoryAck { .. }
+        | PeerMessage::SnapshotAck(_)
         | PeerMessage::BlobRequest { .. }
         | PeerMessage::Liveness { .. }
         | PeerMessage::LivenessAnswer { .. } => Ok(()),

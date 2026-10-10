@@ -3,6 +3,7 @@
 //! with a domain tag and the node's id, so a signature made for one node or
 //! one kind of message is good for no other.
 
+use alloc::string::String;
 use alloc::vec::Vec;
 use scale::{Decode, Encode};
 
@@ -132,6 +133,25 @@ pub enum Answer {
     /// again.
     #[codec(index = 8)]
     Unavailable,
+    /// This node does not lead the agent: call its leader, at this
+    /// ingress address when known.
+    #[codec(index = 9)]
+    NotLeader { leader: Option<String> },
+    /// This node does not replicate the agent: its replicas' ingress
+    /// addresses.
+    #[codec(index = 10)]
+    Elsewhere { replicas: Vec<String> },
+    /// The operator's new agent, which a majority of its replicas does not
+    /// hold yet: it reaches them as they return.
+    #[codec(index = 11)]
+    Unconfirmed(AgentId),
+}
+
+/// The operator's `POST /agents`: the nodes to replicate the new agent,
+/// by number. None means the node alone.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode)]
+pub struct Create {
+    pub replicas: Vec<u8>,
 }
 
 fn message(domain: &[u8], node: &NodeId, fields: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {

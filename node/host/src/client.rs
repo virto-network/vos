@@ -11,8 +11,8 @@ use ed25519_dalek::{Signer, SigningKey};
 use rustls::pki_types::ServerName;
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, SessionId};
 use vos_wire::ingress::{
-    Answer, Call, Grant, Install, NodeId, Open, Opened, QueryCall, call_message, open_message,
-    query_message,
+    Answer, Call, Create, Grant, Install, NodeId, Open, Opened, QueryCall, call_message,
+    open_message, query_message,
 };
 use vos_wire::schema::Schema;
 use vos_wire::{Decode, Encode};
@@ -606,8 +606,13 @@ impl Operator {
         answer(status, &body)
     }
 
-    pub fn create_agent(&self) -> Result<Answer, ClientError> {
-        self.post("/agents", &[])
+    /// Create an agent replicated on `replicas` (the node alone when
+    /// empty).
+    pub fn create_agent(&self, replicas: Vec<u8>) -> Result<Answer, ClientError> {
+        if replicas.is_empty() {
+            return self.post("/agents", &[]);
+        }
+        self.post("/agents", &Create { replicas }.encode())
     }
 
     pub fn install(&self, agent: AgentId, install: &Install) -> Result<Answer, ClientError> {

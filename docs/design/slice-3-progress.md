@@ -1947,8 +1947,9 @@ runtime, owns the agent's vos-raft core:
 - **Calls, installs and grants go to the leader.** A follower answers
   `NotLeader` with the leader's ingress address, and the client retries
   there.
-- **Queries run on any replica** against its applied state, and report
-  the applied index they read (section 7.6).
+- **Queries run on any replica** against its applied state. Reporting
+  the applied index they read (section 7.6) comes with 3.5c's version
+  floors, which compare against it.
 - **Sessions stay slice 2's node-level ones** until 3.5b. A client fails
   over by opening a new session at the new leader, so exactly-once
   across failover is not claimed until 3.5b. A resend in the same
@@ -2012,3 +2013,216 @@ have a rule. The should-fixes are folded in above:
 - vos-net's own one-thread executor.
 
 The step split into four, and the nits, are folded in too.
+
+### 3.5a: the replicated group
+
+**Built:**
+
+- **The space** (`space.rs`): a file of nodes (number, key, peer
+  address, ingress address), `vos node run --space FILE`. A node finds
+  its number by its key; without a file it is node 0, alone.
+- **vos-net's own executor:** a thread of its own drives every network
+  task, quinn's included, through a `quinn::Runtime` that spawns there.
+  Tasks reach it by a weak spawner, so none keeps it alive in a cycle.
+- **The network in the node:** QUIC, or a hub for tests. A dispatcher
+  takes liveness and consensus first, checks each frame (hashing blobs
+  off the node's thread), and routes Raft messages to each group's
+  bounded inbox without waiting.
+- **Creation and the directory** (`dispatch.rs`):
+  - agent ids carry the creating node's number in their top 8 bits;
+  - the creation record (id, replicas, creator, time, program hash,
+    accumulate gas) is the registry row, and its hash the agent's
+    identity;
+  - the creator announces it to every node, and resends every second and
+    after every restart until each acknowledges holding it durably;
+  - a record comes only from its creator (`Refusal::NotTheCreator`), and
+    one that differs from the record held for its agent is refused;
+  - the operator's answer waits, up to 30 s, for a majority of the
+    replicas;
+  - a replica whose agent program has another hash refuses the group.
+- **The group driver** (`group.rs`), following the 3.3c recovery
+  contract:
+  - writes go through the node writer, with `EntryReports` holding back
+    an entry's durability until its blobs are stored;
+  - `CompactBound` is ignored and `SendSnapshot` answered
+    `snapshot_failed` until 3.7;
+  - it publishes the group's role, term, leader, the first index of a
+    term it leads, commit and written indices.
+- **The applier,** a task per agent:
+  - it applies through min(commit, written), one entry at a time, each
+    `Apply` unsynced;
+  - accumulate runs with the creation record's gas, and a deterministic
+    failure applies as no writes;
+  - an infrastructure fault retries, with backoff;
+  - the last work result's time and seed go in a node row (`LastResult`)
+    in the same commit;
+  - pins follow the `Installed` rows the apply writes.
+- **The leader loop** (`leader.rs`, slice 2's leader moved out of
+  `node.rs`):
+  - it starts once this replica applied its term's no-op;
+  - each batch refines, dry-runs accumulate (whose failure isolates
+    inputs off the log), proposes, and answers after its own apply of
+    its own entry. The apply reuses the dry run's writes for that entry
+    on that state;
+  - losing leadership answers `NotLeader`, and a stopped group answers
+    `Stopped`;
+  - `after_commit` false stops the leader loop only; the replica goes on
+    applying;
+  - recovery's redelivery first lets each local target's group settle.
+- **Clients:**
+  - a call to a replica that knows no leader yet waits for one, up to
+    four election timeouts;
+  - a call is still queued at once when the leader is known, so calls
+    made together share a batch;
+  - a follower answers `NotLeader` with the leader's ingress address
+    (HTTP 421), and a node that does not replicate the agent answers
+    `Elsewhere` with the replicas';
+  - `vos agent create --replicas 1,2,3`.
+- **Slice 2's single-node behaviour is unchanged on a space of one,**
+  through the same code. Its tests' log indices now count each term's
+  no-op.
+
+**Tests:**
+
+- `node/host/tests/cluster.rs` (each node with its own clock, on a hub
+  unless said; elections 40–80 ms):
+  - created on three nodes: every replica runs the group; installs and
+    calls at the leader apply alike, row for row and pin for pin; every
+    replica answers queries;
+  - a follower answers `NotLeader` with the leader's address, and a
+    fourth node `Elsewhere` with the replicas;
+  - the leader stops: another serves the same session on, batch time
+    never goes back, and the old one rejoins and catches up;
+  - a partitioned follower catches up, fetches the program blob it
+    missed, pins it, and runs it;
+  - a restarted follower recovers its group;
+  - a record reaches a node that was down, once its creator restarts, or
+    by the creator's resends while it runs;
+  - a replica with another agent program refuses the group;
+  - an input whose accumulate fails is isolated by the dry run, and no
+    entry carries it;
+  - three nodes over QUIC on localhost replicate, fail over and catch
+    up.
+- **Mutations:**
+  - without pins following the applies, the pin comparison fails;
+  - without the resend timer, the late node never learns of the agent;
+  - without blob fetching, a follower cannot acknowledge the install,
+    and the install never commits.
+- Every slice 2 node, ingress and crash test passes on a space of one.
+- **The acceptance bench, on a space of one:**
+  - 28.0 µs per request under load, 35.7k per second (slice 2: 27.5–30.9
+    µs), and 29.1–30.5 µs after the review's fixes;
+  - a request alone takes 2.8–2.9 ms (slice 2: about 3 ms);
+  - query median 50–52 µs.
+
+  So single-replica agents take the group path.
+
+**Not done in 3.5a, deliberately:**
+
+- **Queries do not yet report the applied index they read:** it needs a
+  wire change, which comes with 3.5c's version floors.
+- **Machine caches:** `OuterMachines` reset every machine they restore,
+  so a role change has nothing to flush.
+- **Two paths are built but not tested end to end:**
+  - fetching a blob from a follower when the leader lacks it (the
+    request rotates through the members);
+  - an apply whose accumulate fails on a committed entry (the dry run
+    keeps such entries off the log, and no test can commit one yet).
+- **Results of 64 KiB or more** still go inline in the entry; blobs carry
+  only programs so far.
+
+**Review** (Opus): no-go on two blocking holes, both fixed:
+
+1. **A proposal from an earlier leadership could land in a later term,
+   and a batch be answered `Ran` though accumulate skipped it.** A
+   leader refining a long batch loses leadership and wins it back. Its
+   old proposal lands in the new term, and the new loop's batch, refined
+   at the same version, then applies as no writes but is answered.
+   - Proposals now carry their term, on a channel of their own (never
+     dropped), and the driver refuses one whose term or role no longer
+     holds.
+   - The applier records whether each work result took (accumulate
+     advanced the version with it). The leader answers only one that
+     took, and requeues the inputs of one that did not.
+   - Each batch reads its version from the state it refines on.
+   - Test: a hook fails the apply of the first entry carrying a marked
+     input, on every replica alike. The leader requeues, and the input
+     applies once. Without the outcome check, the call is answered and
+     the state stays 0.
+2. **A work result over 2 MiB could never replicate.** Refine allows 4
+   MiB, but a consensus frame was bounded at 2 MiB, so the append was
+   refused forever while heartbeats kept the leader. The bound is now 5
+   MiB, with a compile-time assert tying it to the work-result cap.
+
+Should-fixes, all done:
+- **S1:** a truncation lowers `written` and the queued writes' last
+  indices, so an entry replaced at the same index never counts as
+  holding the old one's blobs.
+- **S2:** a leader loop that stops for good (a hook, a broken invariant)
+  retires its replica: the driver reports its writer stalled from then
+  on, so the core hands leadership over and never campaigns, while the
+  replica goes on applying and answering queries.
+- **S3:** the queue holds a `leading` flag, set when this replica's
+  leadership starts and cleared with the refusal of what it left. A push
+  checks it under the queue's lock, from any thread, so no input lands
+  where no loop will take it.
+  - Queueing every call through a task on the node's thread did the same,
+    but cost a quarter of the throughput: 39 µs per request against 29.
+  - Calls are queued at once again, and calls made together share a
+    batch.
+  - Installs and grants run on the node's thread.
+- **S4:** a driver that exits answers every proposal still queued, and
+  the leader races its wait for an answer with the group stopping, so a
+  storage failure cannot hang shutdown.
+- **S5:** the leader's proposals no longer share the bounded inbox with
+  peers' messages.
+- **S6:** the dispatcher routes Raft messages inline; blobs (hashed off
+  the thread) and creation records (committed) are handled in tasks of
+  their own. Raft messages with no group, or a full inbox, are counted
+  (`Refusal::Unrouted`).
+- **S7:** a round's messages go out before its writes are waited on (the
+  core holds back what must wait), so a leader's appends and its own
+  fsync overlap. The writer's health reaches the core
+  (`writer_health`).
+- **S8:** a creation that a majority does not confirm within 30 s
+  answers `Unconfirmed` with the agent's id (HTTP 202), not a failure.
+- **S9:** the defaults are the plan's: 500 ms heartbeats and elections
+  between 1.5 and 3 s. **A lone member now elects itself at its first
+  tick** (a vos-raft change, with a test): no other member could lead,
+  and a space of one would otherwise wait out a timeout.
+
+Also done:
+- `recovered` is clamped to what the log holds;
+- the id that would be the node's own records' is never made;
+- blobs are served one at a time, each once the peer's bulk queue has
+  room (for 5 s at most);
+- a test of fetching a blob from another member while the leader
+  withholds it (`Hooks::serve_blob`);
+- the cluster tests take hooks per node.
+
+**Notes for later steps:**
+- **3.7:**
+  - only the creator resends a creation record, so a node that missed it
+    never learns of the agent if the creator is lost for good. Groups'
+    own configurations become the authority with membership changes;
+  - `LastResult` is a node row, not agent state, so snapshots must carry
+    it.
+- **3.8:** a restart re-announces every record the node created, to
+  every node.
+- **The directory, still:** a replica that refuses the agent's program
+  acknowledges its record (it holds it durably), so it counts toward the
+  creation's majority, and it is listed among the replicas in
+  `Elsewhere`.
+
+**Re-review** (Opus): go. Also folded in:
+- a leader loop whose start fails on a read retries with backoff while
+  its replica leads, rather than leave a leader with no loop;
+- a batch whose result applies as no writes twice running is shortened
+  as a failing batch is, so a persistent apply failure cannot append
+  entries without end;
+- a retired replica refuses callers with `NotLeader` and the next
+  leader's address, not `Stopped`;
+- creation records are checked and stored one at a time, so two records
+  for one id are never both written;
+- the dry run is keyed by the applied index of the snapshot the batch
+  is refined on.

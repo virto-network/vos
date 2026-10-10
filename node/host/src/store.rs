@@ -22,8 +22,10 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode, Readable};
-use vos_wire::ids::{AgentId, ProgramHash, SessionId};
+use vos_wire::ids::{AgentId, SessionId};
+use vos_wire::peer::CreationRecord;
 use vos_wire::result::Write;
+use vos_wire::{Decode, Encode};
 
 pub use fjall::Error;
 
@@ -219,8 +221,8 @@ pub trait Store: Send + Sync {
     /// Epochs other than the agent's current one that still hold rows.
     fn stale_epochs(&self, agent: AgentId) -> Result<Vec<u8>>;
 
-    /// The agents this node runs, each with its agent program.
-    fn agents(&self) -> Result<Vec<(AgentId, ProgramHash)>>;
+    /// The agents this node knows, each with its creation record.
+    fn agents(&self) -> Result<Vec<CreationRecord>>;
 
     /// The seed of the node's key, once made: secret, never served.
     fn node_secret(&self) -> Result<Option<[u8; 32]>>;
@@ -254,6 +256,9 @@ pub trait View: Send + Sync {
 
     /// The epoch the agent's rows are under.
     fn epoch(&self, agent: AgentId) -> Result<u8>;
+
+    /// The time and seed of the last work result applied to the agent.
+    fn last_result(&self, agent: AgentId) -> Result<Option<(u64, [u8; 32])>>;
 }
 
 /// An atomic group of writes: all of them or none survive a crash.
@@ -302,8 +307,11 @@ pub trait Batch {
 
     fn unpin(&mut self, hash: &[u8; 32], agent: AgentId);
 
-    /// Record that this node runs `agent` with the agent program `program`.
-    fn agent(&mut self, agent: AgentId, program: &ProgramHash);
+    /// Record an agent's creation.
+    fn agent(&mut self, record: &CreationRecord);
+
+    /// The time and seed of the last work result applied to `agent`.
+    fn last_result(&mut self, agent: AgentId, time: u64, seed: &[u8; 32]);
 
     /// Record the node's secret seed, and delete the retired public id.
     fn node_secret(&mut self, seed: &[u8; 32]);
@@ -347,6 +355,7 @@ enum NodeRow {
     Membership = 0x08,
     Epoch = 0x09,
     Secret = 0x0a,
+    LastResult = 0x0b,
 }
 
 fn agent_key(agent: AgentId, epoch: u8, key: &[u8]) -> Vec<u8> {
@@ -872,17 +881,20 @@ impl Store for Fjall {
         Ok(stale)
     }
 
-    fn agents(&self) -> Result<Vec<(AgentId, ProgramHash)>> {
+    fn agents(&self) -> Result<Vec<CreationRecord>> {
         let prefix = registry_prefix();
-        self.system
-            .prefix(&prefix)
-            .map(|row| {
-                let (key, program) = row.into_inner()?;
-                let agent = key[prefix.len()..].try_into().expect("an agent id");
-                let program = program[..].try_into().expect("a program hash");
-                Ok((AgentId(u32::from_be_bytes(agent)), ProgramHash(program)))
-            })
-            .collect()
+        let mut records = Vec::new();
+        for row in self.system.prefix(&prefix) {
+            let (key, value) = row.into_inner()?;
+            match CreationRecord::decode(&value) {
+                Ok((record, used)) if used == value.len() => records.push(record),
+                _ => tracing::error!(
+                    key = ?&key[prefix.len()..],
+                    "an unreadable creation record; its agent is not run"
+                ),
+            }
+        }
+        Ok(records)
     }
 }
 
@@ -1020,6 +1032,20 @@ impl View for FjallSnapshot {
             .snapshot
             .get(&self.store.system, node_row(agent, NodeRow::Applied, &[]))?
             .and_then(|bytes| be_u64(&bytes)))
+    }
+
+    fn last_result(&self, agent: AgentId) -> Result<Option<(u64, [u8; 32])>> {
+        Ok(self
+            .snapshot
+            .get(
+                &self.store.system,
+                node_row(agent, NodeRow::LastResult, &[]),
+            )?
+            .and_then(|bytes| {
+                let time = be_u64(bytes.get(..8)?)?;
+                let seed = bytes.get(8..40)?.try_into().ok()?;
+                Some((time, seed))
+            }))
     }
 
     fn epoch(&self, agent: AgentId) -> Result<u8> {
@@ -1194,9 +1220,17 @@ impl Batch for FjallBatch {
             .remove(&self.store.blobs, crate::blobs::pin_key(hash, agent.0));
     }
 
-    fn agent(&mut self, agent: AgentId, program: &ProgramHash) {
-        let key = [registry_prefix(), agent.0.to_be_bytes().to_vec()].concat();
-        self.batch.insert(&self.store.system, key, program.0);
+    fn agent(&mut self, record: &CreationRecord) {
+        let key = [registry_prefix(), record.agent.0.to_be_bytes().to_vec()].concat();
+        self.batch.insert(&self.store.system, key, record.encode());
+    }
+
+    fn last_result(&mut self, agent: AgentId, time: u64, seed: &[u8; 32]) {
+        self.batch.insert(
+            &self.store.system,
+            node_row(agent, NodeRow::LastResult, &[]),
+            [&time.to_be_bytes()[..], seed].concat(),
+        );
     }
 
     fn node_secret(&mut self, seed: &[u8; 32]) {

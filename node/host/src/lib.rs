@@ -3,19 +3,24 @@
 
 pub mod blobs;
 pub mod client;
+mod dispatch;
 mod executor;
+mod group;
 pub mod http;
 mod ingress;
+mod leader;
 mod node;
 pub mod peer;
 mod pvm;
 pub mod raft;
+pub mod space;
 pub mod storage;
 pub mod store;
 pub mod tls;
 
 pub use ingress::SESSIONS_PER_KEY;
-pub use node::{ADMIN_TOKEN, CallError, Config, Error, NODE_KEY, Node, Reply, wall_clock};
+pub use node::{ADMIN_TOKEN, CallError, Config, Error, NODE_KEY, Node, Peers, Reply, wall_clock};
+pub use space::{Space, SpaceNode};
 
 use vos_wire::batch::Batch;
 use vos_wire::ids::AgentId;
@@ -38,6 +43,27 @@ pub trait Hooks: Send + Sync {
     fn fail_refine(&self, agent: AgentId, batch: &Batch) -> bool {
         let _ = (agent, batch);
         false
+    }
+
+    /// Before the leader of `agent` dry-runs accumulate on `batch`'s
+    /// result: true makes it fail, as a trap in accumulate would.
+    fn fail_dry_run(&self, agent: AgentId, batch: &Batch) -> bool {
+        let _ = (agent, batch);
+        false
+    }
+
+    /// Before a replica applies `agent`'s work result `result` at `index`:
+    /// true applies it as accumulate failing on it would, with no writes.
+    /// A test must answer alike on every replica.
+    fn fail_apply(&self, agent: AgentId, index: u64, result: &[u8]) -> bool {
+        let _ = (agent, index, result);
+        false
+    }
+
+    /// Before this node serves a peer a blob: false withholds it, as a
+    /// node lacking it would.
+    fn serve_blob(&self) -> bool {
+        true
     }
 
     /// Before the storage thread commits: true makes the commit fail with

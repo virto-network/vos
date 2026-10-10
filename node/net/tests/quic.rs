@@ -201,7 +201,10 @@ fn a_queue_to_an_unreachable_peer_fills() {
         let mut queued = 0;
         while a.send(2, Class::Consensus, 1, frame.clone()).is_ok() {
             queued += frame.len();
-            assert!(queued <= 16 << 20, "the queue is unbounded");
+            assert!(
+                queued <= 4 * Limits::default().consensus + frame.len(),
+                "the queue is unbounded"
+            );
         }
         assert_eq!(
             a.send(2, Class::Consensus, 1, frame.clone()),

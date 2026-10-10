@@ -16,7 +16,8 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use vos_wire::ids::{AgentId, ProgramHash, SessionId};
+use vos_wire::ids::{AgentId, SessionId};
+use vos_wire::peer::CreationRecord;
 use vos_wire::result::Write;
 
 use crate::Hooks;
@@ -102,9 +103,13 @@ pub enum Change {
     /// Nothing, synced: everything committed before it is durable once it
     /// is answered.
     Barrier,
-    Agent {
+    /// An agent's creation, as this node learned of it.
+    Agent(CreationRecord),
+    /// The time and seed of the work result applied in the same commit.
+    LastResult {
         agent: AgentId,
-        program: ProgramHash,
+        time: u64,
+        seed: [u8; 32],
     },
     /// A client session opened for `key` at its `time`.
     Session {
@@ -120,6 +125,7 @@ impl Change {
     fn synced(&self) -> bool {
         match self {
             Self::Apply { .. }
+            | Self::LastResult { .. }
             | Self::Compact { .. }
             | Self::Stage { .. }
             | Self::DropEpoch { .. } => false,
@@ -372,7 +378,10 @@ impl Writer {
                     Change::Pin { hash, agent } => batch.pin(hash, *agent),
                     Change::Unpin { hash, agent } => batch.unpin(hash, *agent),
                     Change::Barrier => {}
-                    Change::Agent { agent, program } => batch.agent(*agent, program),
+                    Change::Agent(record) => batch.agent(record),
+                    Change::LastResult { agent, time, seed } => {
+                        batch.last_result(*agent, *time, seed)
+                    }
                     Change::Session { id, key, time } => batch.session(*id, key, *time),
                     Change::ForgetSession(id) => batch.forget_session(*id),
                 }

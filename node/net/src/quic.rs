@@ -28,8 +28,9 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use quinn::VarInt;
@@ -117,6 +118,87 @@ impl Config {
 pub struct Quic {
     inner: Arc<Inner>,
     accept: Option<smol::Task<()>>,
+    /// Dropped last: it stops the network's thread.
+    _runner: Runner,
+}
+
+/// The network's executor, driven by one thread of its own. Every task of
+/// the network runs on it, quinn's included, so a connection's readers are
+/// polled in the order they were woken: the receiving side's turns rely
+/// on it. Tasks reach it by a [`Spawner`], which does not keep it alive.
+struct Runner {
+    executor: Arc<smol::Executor<'static>>,
+    stop: smol::channel::Sender<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Runner {
+    fn start() -> io::Result<Self> {
+        let executor = Arc::new(smol::Executor::new());
+        let (stop, stopped) = smol::channel::bounded::<()>(1);
+        let thread = std::thread::Builder::new().name("vos-net".into()).spawn({
+            let executor = Arc::clone(&executor);
+            move || {
+                let _ = smol::block_on(executor.run(stopped.recv()));
+            }
+        })?;
+        Ok(Self {
+            executor,
+            stop,
+            thread: Some(thread),
+        })
+    }
+
+    fn spawner(&self) -> Spawner {
+        Spawner(Arc::downgrade(&self.executor))
+    }
+}
+
+impl Drop for Runner {
+    /// Stop the thread; the executor then goes, with the tasks it still
+    /// holds.
+    fn drop(&mut self) {
+        let _ = self.stop.try_send(());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Spawns on the network's executor while it runs.
+#[derive(Clone, Debug)]
+struct Spawner(Weak<smol::Executor<'static>>);
+
+impl Spawner {
+    fn spawn<T: Send + 'static>(
+        &self,
+        future: impl Future<Output = T> + Send + 'static,
+    ) -> Option<smol::Task<T>> {
+        Some(self.0.upgrade()?.spawn(future))
+    }
+}
+
+/// quinn's smol runtime, spawning on the network's executor.
+#[derive(Debug)]
+struct Runtime(Spawner);
+
+impl quinn::Runtime for Runtime {
+    fn new_timer(&self, at: std::time::Instant) -> Pin<Box<dyn quinn::AsyncTimer>> {
+        quinn::Runtime::new_timer(&quinn::SmolRuntime, at)
+    }
+
+    fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send>>) {
+        if let Some(task) = self.0.spawn(future) {
+            task.detach();
+        }
+    }
+
+    fn wrap_udp_socket(
+        &self,
+        socket: std::net::UdpSocket,
+    ) -> io::Result<Arc<dyn quinn::AsyncUdpSocket>> {
+        quinn::Runtime::wrap_udp_socket(&quinn::SmolRuntime, socket)
+    }
 }
 
 struct Inner {
@@ -132,6 +214,7 @@ struct Inner {
     limits: Limits,
     quiet: Duration,
     closed: AtomicBool,
+    spawner: Spawner,
 }
 
 impl Quic {
@@ -142,11 +225,12 @@ impl Quic {
         let table = Table::default();
         let server = identity.server(Arc::clone(&table), Arc::clone(&transport));
         let socket = std::net::UdpSocket::bind(config.listen)?;
+        let runner = Runner::start()?;
         let endpoint = quinn::Endpoint::new(
             identity.endpoint(),
             Some(server),
             socket,
-            Arc::new(quinn::SmolRuntime),
+            Arc::new(Runtime(runner.spawner())),
         )?;
         let mut incarnation = [0u8; 8];
         ring::rand::SystemRandom::new()
@@ -165,13 +249,15 @@ impl Quic {
             limits: config.limits,
             quiet: config.quiet,
             closed: AtomicBool::new(false),
+            spawner: runner.spawner(),
         });
         inner.set_peers(config.peers);
-        let accept = smol::spawn(accept(Arc::clone(&inner)));
+        let accept = runner.spawner().spawn(accept(Arc::clone(&inner)));
         Ok((
             Self {
                 inner,
-                accept: Some(accept),
+                accept,
+                _runner: runner,
             },
             arrivals,
         ))
@@ -207,6 +293,13 @@ impl Quic {
 impl Drop for Quic {
     fn drop(&mut self) {
         self.inner.close();
+        // Let the peers hear the close, briefly, before the thread stops.
+        let told = async {
+            self.inner.endpoint.wait_idle().await;
+        };
+        smol::block_on(told.or(async {
+            smol::Timer::after(Duration::from_millis(100)).await;
+        }));
     }
 }
 
@@ -221,6 +314,9 @@ impl Inner {
     }
 
     fn set_peers(&self, peers: Vec<Peer>) {
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
         let peers: Vec<Peer> = peers
             .into_iter()
             .filter(|peer| peer.number != self.number)
@@ -349,15 +445,18 @@ impl Link {
         let client = inner
             .identity
             .client(peer.key, Arc::clone(&inner.transport));
-        let task = smol::spawn(dial(
-            inner.endpoint.clone(),
+        let dialing = Dialing {
+            endpoint: inner.endpoint.clone(),
             client,
-            peer.address,
-            inner.name.clone(),
-            queued,
-            Arc::clone(&shared),
-            inner.quiet,
-        ));
+            address: peer.address,
+            name: inner.name.clone(),
+            quiet: inner.quiet,
+            spawner: inner.spawner.clone(),
+        };
+        let task = inner
+            .spawner
+            .spawn(dial(dialing, queued, Arc::clone(&shared)))
+            .expect("the network's executor runs while it is open");
         Self {
             peer,
             frames,
@@ -369,15 +468,26 @@ impl Link {
 
 /// Dial the peer whenever there is something to send, and write to it
 /// until the connection closes.
-async fn dial(
+/// What a link dials with.
+struct Dialing {
     endpoint: quinn::Endpoint,
     client: quinn::ClientConfig,
     address: SocketAddr,
+    /// The name this run dials with: its incarnation.
     name: String,
-    queued: smol::channel::Receiver<Outgoing>,
-    shared: Arc<Shared>,
     quiet: Duration,
-) {
+    spawner: Spawner,
+}
+
+async fn dial(dialing: Dialing, queued: smol::channel::Receiver<Outgoing>, shared: Arc<Shared>) {
+    let Dialing {
+        endpoint,
+        client,
+        address,
+        name,
+        quiet,
+        spawner,
+    } = dialing;
     let mut next = None;
     let mut backoff = MIN_BACKOFF;
     loop {
@@ -408,7 +518,7 @@ async fn dial(
             }
         };
         *shared.connection.lock().expect("the connection") = Some(connection.clone());
-        write(&connection, &mut next, &queued, quiet).await;
+        write(&connection, &mut next, &queued, quiet, &spawner).await;
         *shared.connection.lock().expect("the connection") = None;
         if refused(&connection) {
             // The peer took the handshake, then refused this node: dialing
@@ -443,6 +553,7 @@ async fn write(
     next: &mut Option<Outgoing>,
     queued: &smol::channel::Receiver<Outgoing>,
     quiet: Duration,
+    spawner: &Spawner,
 ) {
     enum Event {
         Frame(Outgoing),
@@ -496,10 +607,13 @@ async fn write(
             sending.retain(|task| !task.is_finished());
             let connection = connection.clone();
             let bulk = Arc::clone(&bulk);
-            sending.push(smol::spawn(async move {
+            let Some(task) = spawner.spawn(async move {
                 let _permit = bulk.acquire().await;
                 let _ = write_bulk(&connection, frame).await;
-            }));
+            }) else {
+                return;
+            };
+            sending.push(task);
             continue;
         }
         let key = (frame.class, frame.stream);
@@ -515,7 +629,15 @@ async fn write(
             None => frame,
         };
         let previous = retiring.remove(&key);
-        let writer = Writer::spawn(connection.clone(), frame.class, frame.stream, previous);
+        let Some(writer) = Writer::spawn(
+            spawner,
+            connection.clone(),
+            frame.class,
+            frame.stream,
+            previous,
+        ) else {
+            return;
+        };
         let _ = writer.frames.try_send(frame);
         streams.insert(key, writer);
     }
@@ -553,13 +675,14 @@ impl Writer {
     /// A writer for a new stream, opened once `previous`, the last stream
     /// for the same id, is finished and all acknowledged.
     fn spawn(
+        spawner: &Spawner,
         connection: quinn::Connection,
         class: Class,
         stream: u64,
         previous: Option<smol::Task<()>>,
-    ) -> Self {
+    ) -> Option<Self> {
         let (frames, queued) = smol::channel::unbounded::<Outgoing>();
-        let task = smol::spawn(async move {
+        let task = spawner.spawn(async move {
             if let Some(previous) = previous {
                 previous.await;
             }
@@ -581,11 +704,11 @@ impl Writer {
                 while queued.try_recv().is_ok() {}
             }
         });
-        Self {
+        Some(Self {
             frames,
-            task,
+            task: task?,
             last: Instant::now(),
-        }
+        })
     }
 }
 
@@ -621,7 +744,10 @@ async fn accept(inner: Arc<Inner>) {
     let mut serving: Vec<smol::Task<()>> = Vec::new();
     while let Some(incoming) = inner.endpoint.accept().await {
         serving.retain(|task| !task.is_finished());
-        serving.push(smol::spawn(serve(Arc::clone(&inner), incoming)));
+        let Some(task) = inner.spawner.spawn(serve(Arc::clone(&inner), incoming)) else {
+            return;
+        };
+        serving.push(task);
     }
 }
 
@@ -660,7 +786,10 @@ async fn serve(inner: Arc<Inner>, incoming: quinn::Incoming) {
     let mut reading: Vec<smol::Task<()>> = Vec::new();
     while let Ok(stream) = connection.accept_uni().await {
         reading.retain(|task| !task.is_finished());
-        reading.push(smol::spawn(read(Arc::clone(&peer), stream)));
+        let Some(task) = peer.inner.spawner.spawn(read(Arc::clone(&peer), stream)) else {
+            return;
+        };
+        reading.push(task);
     }
 }
 

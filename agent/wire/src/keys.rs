@@ -54,6 +54,11 @@ pub fn installed(instance: InstanceId) -> Vec<u8> {
     key(&[&[SYSTEM, INSTALLED], &instance.0.to_be_bytes()])
 }
 
+/// The prefix of every instance's [`installed`] row.
+pub fn installed_prefix() -> Vec<u8> {
+    key(&[&[SYSTEM, INSTALLED]])
+}
+
 /// A principal's role byte in this agent.
 pub fn member(principal: &Principal) -> Vec<u8> {
     key(&[&[SYSTEM, MEMBER], &principal.encode()])

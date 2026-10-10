@@ -10,7 +10,7 @@ use alloc::vec::Vec;
 
 use scale::{Decode, Encode};
 
-use crate::ids::AgentId;
+use crate::ids::{AgentId, ProgramHash};
 
 /// A node of the space: the 8-bit node part of an agent id.
 pub type NodeNumber = u8;
@@ -40,6 +40,36 @@ pub enum PeerMessage {
     /// The answer to a [`PeerMessage::Liveness`], with the answering run.
     #[codec(index = 6)]
     LivenessAnswer { incarnation: u64, round: u64 },
+    /// An agent created, from the node that created it.
+    #[codec(index = 7)]
+    Directory(CreationRecord),
+    /// The receiver holds `agent`'s creation record durably.
+    #[codec(index = 8)]
+    DirectoryAck { agent: AgentId },
+}
+
+/// What makes an agent the agent it is. Its hash is the agent's identity.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct CreationRecord {
+    /// Its top 8 bits are the creating node's number.
+    pub agent: AgentId,
+    /// The nodes replicating it, its group's first members.
+    pub replicas: Vec<NodeNumber>,
+    pub creator: NodeNumber,
+    /// Milliseconds since the Unix epoch, by the creating node's clock.
+    pub time: u64,
+    /// The agent program every replica runs.
+    pub program: ProgramHash,
+    /// Accumulate's gas, the same on every replica, so every replica
+    /// applies the same writes.
+    pub accumulate_gas: u64,
+}
+
+impl CreationRecord {
+    /// The number of the node whose range `agent` is in.
+    pub fn creator_of(agent: AgentId) -> NodeNumber {
+        (agent.0 >> 24) as NodeNumber
+    }
 }
 
 /// A Raft message, as the consensus core has it.

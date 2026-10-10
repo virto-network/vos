@@ -1,9 +1,11 @@
-//! The node: every agent's leader loop on one async thread, the executor
-//! threads for PVM work, the storage thread and the machine pool.
+//! The node: every agent's replica group, applier and leader loop on one
+//! async thread, the executor threads for PVM work, the storage thread,
+//! the machine pool, and the network to the space's other nodes.
 //!
-//! Per agent, a batch runs strictly in order: refine, accumulate, one
-//! durable commit of the log entry and its writes, and only then the
-//! replies, the outbox's deliveries and the acknowledgements.
+//! Per agent, a leader's batch runs strictly in order: refine, a dry run
+//! of accumulate, the result proposed and replicated, and once this
+//! replica has applied it, the replies, the outbox's deliveries and the
+//! acknowledgements. Every replica applies the committed log the same way.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::future::Future;
@@ -16,25 +18,36 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::SigningKey;
 use smol::future::FutureExt;
+use vos_net::{Class, Network, Refused};
 use vos_pvm::PvmBackend;
 use vos_pvm::pool::{CodeHash, MachinePool, OuterMachines};
-use vos_wire::abi::refusal;
-use vos_wire::batch::{Admin, Batch, Input, Message, Query, Request, Work};
+use vos_raft::Role;
+use vos_wire::batch::{Admin, Input, Message, Query, Request, Work};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash};
 use vos_wire::ingress::NodeId;
+use vos_wire::peer::{CreationRecord, NodeNumber};
 use vos_wire::records::unstored;
-use vos_wire::result::{Outcome, Outgoing, Step, WorkResult};
-use vos_wire::{Decode, defaults, keys};
+use vos_wire::result::{Outcome, Step, Write};
+use vos_wire::{Decode, Encode, defaults};
 
 use crate::Hooks;
 use crate::blobs::Blobs;
 use crate::executor::Executors;
+use crate::group::{self, DryRun, Input as GroupInput, Local, Shared};
 use crate::pvm::{self, Fault};
+use crate::space::Space;
 use crate::storage::{Change, StorageThread};
-use crate::store::{
-    Batch as _, BlobRef, Durability, Fjall, FjallSnapshot, LogEntry, NODE_AGENT, Store, View,
-};
+use crate::store::{Batch as _, BlobRef, Durability, Fjall, FjallSnapshot, LogEntry, Store, View};
 use crate::tls::IngressTls;
+
+/// How a node reaches the other nodes of its space.
+#[derive(Clone)]
+pub enum Peers {
+    /// QUIC, listening on this node's peer address in the space.
+    Quic,
+    /// A hub in this process, for tests.
+    Hub(vos_net::memory::Hub),
+}
 
 /// How a node runs.
 pub struct Config {
@@ -51,6 +64,8 @@ pub struct Config {
     /// found its queue empty.
     pub linger: Duration,
     pub refine_gas: u64,
+    /// Accumulate's gas for the agents this node creates: their creation
+    /// records carry it to every replica.
     pub accumulate_gas: u64,
     pub hooks: Arc<dyn Hooks>,
     /// Milliseconds since the Unix epoch: work-result time, and ingress's
@@ -59,6 +74,14 @@ pub struct Config {
     /// TLS on the ingress. Without it, the ingress serves loopback
     /// addresses only.
     pub ingress_tls: Option<IngressTls>,
+    /// The space this node runs in. Without one, it is a space of one, as
+    /// node 0.
+    pub space: Option<Space>,
+    pub peers: Peers,
+    /// A replica group's election timeout, drawn between these, and its
+    /// leader's heartbeat, in milliseconds.
+    pub election_timeout_ms: (u64, u64),
+    pub heartbeat_ms: u64,
 }
 
 impl Config {
@@ -76,6 +99,10 @@ impl Config {
             hooks: Arc::new(crate::NoHooks),
             clock: Arc::new(wall_clock),
             ingress_tls: None,
+            space: None,
+            peers: Peers::Quic,
+            election_timeout_ms: (1500, 3000),
+            heartbeat_ms: 500,
         }
     }
 }
@@ -101,6 +128,15 @@ pub enum CallError {
     Stopped,
     /// Storage or the agent program failed.
     Failed(String),
+    /// This node does not lead the agent: its leader's ingress address,
+    /// when known.
+    NotLeader(Option<String>),
+    /// This node does not replicate the agent: its replicas' ingress
+    /// addresses.
+    Elsewhere(Vec<String>),
+    /// The agent is created, but a majority of its replicas does not hold
+    /// its record yet: it reaches them as they return.
+    Unconfirmed(AgentId),
 }
 
 #[derive(Debug)]
@@ -114,14 +150,9 @@ pub enum Error {
     Gas,
     /// A stored value the node cannot read.
     Unreadable(String),
-    /// The data directory, or the ingress's listener, failed.
+    /// The data directory, the space, the network or the ingress's
+    /// listener failed.
     Data(String),
-    /// An agent's applied index and its state version disagree.
-    Inconsistent {
-        agent: AgentId,
-        applied: u64,
-        version: u64,
-    },
 }
 
 impl From<fjall::Error> for Error {
@@ -130,21 +161,25 @@ impl From<fjall::Error> for Error {
     }
 }
 
-type Answer = smol::channel::Sender<Reply>;
+pub(crate) type Answer = smol::channel::Sender<Result<Reply, CallError>>;
 
 /// A queued input, with where its reply goes.
-enum Pending {
+pub(crate) enum Pending {
     Request(Request, Answer),
-    Admin(Admin, Answer),
+    /// An admin command, with the blobs its entry names.
+    Admin(Admin, Answer, Vec<BlobRef>),
     Message(Message),
-    Ack { to: AgentId, sequence: u64 },
+    Ack {
+        to: AgentId,
+        sequence: u64,
+    },
 }
 
 impl Pending {
-    fn input(&self) -> Input {
+    pub(crate) fn input(&self) -> Input {
         match self {
             Pending::Request(request, _) => Input::Request(request.clone()),
-            Pending::Admin(admin, _) => Input::Admin(admin.clone()),
+            Pending::Admin(admin, _, _) => Input::Admin(admin.clone()),
             Pending::Message(message) => Input::Message(message.clone()),
             Pending::Ack { to, sequence } => Input::Ack {
                 to: *to,
@@ -153,7 +188,7 @@ impl Pending {
         }
     }
 
-    fn bytes(&self) -> usize {
+    pub(crate) fn bytes(&self) -> usize {
         match self {
             Pending::Request(request, _) => request.arguments.len(),
             Pending::Message(message) => message.arguments.len(),
@@ -162,23 +197,27 @@ impl Pending {
     }
 
     /// Counts against the queue cap: what a client queued.
-    fn capped(&self) -> bool {
+    pub(crate) fn capped(&self) -> bool {
         matches!(self, Pending::Request(..) | Pending::Admin(..))
     }
 }
 
 #[derive(Default)]
-struct Queue {
-    inputs: VecDeque<Pending>,
+pub(crate) struct Queue {
+    pub(crate) inputs: VecDeque<Pending>,
     /// Capped inputs queued.
-    capped: usize,
-    stopped: bool,
+    pub(crate) capped: usize,
+    pub(crate) stopped: bool,
+    /// The leader loop takes inputs: set when this replica's leadership
+    /// starts, and cleared with the refusal of what it left. Under the
+    /// queue's lock, so no input is queued where no loop will take it.
+    pub(crate) leading: bool,
 }
 
-struct Agent {
-    queue: Mutex<Queue>,
+pub(crate) struct Agent {
+    pub(crate) queue: Mutex<Queue>,
     wake: smol::channel::Sender<()>,
-    woken: smol::channel::Receiver<()>,
+    pub(crate) woken: smol::channel::Receiver<()>,
 }
 
 impl Agent {
@@ -193,7 +232,7 @@ impl Agent {
 
     /// Stop the agent's leader after its batch in flight. Queued inputs are
     /// dropped: their callers see `Stopped`.
-    fn stop(&self) {
+    pub(crate) fn stop(&self) {
         let dropped = {
             let mut queue = self.queue.lock().expect("the queue");
             queue.stopped = true;
@@ -203,42 +242,208 @@ impl Agent {
         drop(dropped);
         let _ = self.wake.try_send(());
     }
+
+    /// Answer every queued input with `error`: this node no longer leads.
+    pub(crate) fn refuse(&self, error: &CallError) {
+        let refused = {
+            let mut queue = self.queue.lock().expect("the queue");
+            queue.leading = false;
+            queue.capped = 0;
+            std::mem::take(&mut queue.inputs)
+        };
+        for pending in refused {
+            pending.refuse(error);
+        }
+    }
 }
+
+/// What the network sends through.
+pub(crate) trait Wire: Send + Sync {
+    fn send(
+        &self,
+        to: NodeNumber,
+        class: Class,
+        stream: u64,
+        frame: Vec<u8>,
+    ) -> Result<(), Refused>;
+
+    /// Resolves once `to` can likely take another frame of `class`.
+    fn ready(
+        &self,
+        to: NodeNumber,
+        class: Class,
+    ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+}
+
+impl<T: Network> Wire for T {
+    fn send(
+        &self,
+        to: NodeNumber,
+        class: Class,
+        stream: u64,
+        frame: Vec<u8>,
+    ) -> Result<(), Refused> {
+        Network::send(self, to, class, stream, frame)
+    }
+
+    fn ready(
+        &self,
+        to: NodeNumber,
+        class: Class,
+    ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(Network::ready(self, to, class))
+    }
+}
+
+/// The network endpoint the node holds.
+enum Endpoint {
+    Quic(Arc<vos_net::quic::Quic>),
+    Hub(Arc<vos_net::memory::Endpoint>),
+}
+
+/// An agent this node replicates: its queue, its group's shared state, the
+/// group's inbox, and their tasks.
+pub(crate) struct Run {
+    pub(crate) agent: Arc<Agent>,
+    pub(crate) shared: Arc<Shared>,
+    pub(crate) inbox: smol::channel::Sender<GroupInput>,
+    /// The leader loop's proposals and its retirement, never dropped.
+    local: smol::channel::Sender<Local>,
+    tasks: Mutex<Vec<smol::Task<()>>>,
+}
+
+/// A group's inbox: Raft messages beyond it are dropped, and resent.
+const GROUP_INBOX: usize = 1024;
+
+// A work result as large as refine allows travels in one append.
+const _: () = assert!(
+    vos_net::Limits::DEFAULT.consensus >= vos_wire::abi::cap::WORK_RESULT + (1 << 20),
+    "a consensus frame must hold the largest work result"
+);
 
 pub(crate) struct Inner {
     pub(crate) store: Fjall,
-    blobs: Blobs,
-    storage: StorageThread,
-    executors: Executors,
-    pool: Arc<MachinePool>,
-    program: Arc<OuterMachines>,
-    program_hash: ProgramHash,
+    pub(crate) blobs: Blobs,
+    pub(crate) storage: StorageThread,
+    pub(crate) executors: Executors,
+    pub(crate) pool: Arc<MachinePool>,
+    pub(crate) program: Arc<OuterMachines>,
+    pub(crate) program_hash: ProgramHash,
     queue: usize,
-    max_inputs: usize,
-    max_bytes: usize,
-    linger: Duration,
-    refine_gas: u64,
+    pub(crate) max_inputs: usize,
+    pub(crate) max_bytes: usize,
+    pub(crate) linger: Duration,
+    pub(crate) refine_gas: u64,
     accumulate_gas: u64,
-    hooks: Arc<dyn Hooks>,
+    pub(crate) hooks: Arc<dyn Hooks>,
     pub(crate) clock: Arc<dyn Fn() -> u64 + Send + Sync>,
     pub(crate) node_id: NodeId,
-    agents: Mutex<HashMap<AgentId, Arc<Agent>>>,
-    leaders: Mutex<Vec<smol::Task<()>>>,
+    /// This node's number in its space.
+    pub(crate) number: NodeNumber,
+    pub(crate) space: Option<Space>,
+    pub(crate) network: Option<Arc<dyn Wire>>,
+    pub(crate) election_timeout_ms: (u64, u64),
+    pub(crate) heartbeat_ms: u64,
+    /// Every agent this node knows of.
+    pub(crate) directory: Mutex<HashMap<AgentId, CreationRecord>>,
+    /// For each agent this node created, the nodes yet to hold its record.
+    pub(crate) unacknowledged: Mutex<HashMap<AgentId, BTreeSet<NodeNumber>>>,
+    pub(crate) acknowledged: event_listener::Event,
+    /// The agents this node replicates.
+    pub(crate) runs: Mutex<HashMap<AgentId, Arc<Run>>>,
+    dry_runs: Mutex<HashMap<AgentId, DryRun>>,
+    /// The groups each blob asked for is wanted by.
+    wanted: Mutex<HashMap<[u8; 32], BTreeSet<AgentId>>>,
+    pub(crate) drops: crate::peer::Drops,
+    /// The low 24 bits of the next agent id this node makes.
     next_agent: smol::lock::Mutex<u32>,
     pub(crate) runtime: Arc<smol::Executor<'static>>,
+    /// Node-wide tasks: the dispatcher and the directory's resends.
+    tasks: Mutex<Vec<smol::Task<()>>>,
+    /// Held while a creation record is checked and stored, so two records
+    /// for one id are never both written.
+    pub(crate) recording: smol::lock::Mutex<()>,
 }
 
 impl Inner {
-    fn agent(&self, id: AgentId) -> Option<Arc<Agent>> {
-        self.agents.lock().expect("the agents").get(&id).cloned()
+    pub(crate) fn run(&self, id: AgentId) -> Option<Arc<Run>> {
+        self.runs.lock().expect("the runs").get(&id).cloned()
     }
 
-    /// Queue `pending` for agent `id`.
-    fn push(&self, id: AgentId, pending: Pending) -> Result<(), CallError> {
-        let agent = self.agent(id).ok_or(CallError::NoAgent)?;
-        let mut queue = agent.queue.lock().expect("the queue");
-        if queue.stopped {
+    /// Why a call to `id` cannot be served here.
+    fn absent(&self, id: AgentId) -> CallError {
+        match self.directory.lock().expect("the directory").get(&id) {
+            Some(record) => CallError::Elsewhere(
+                record
+                    .replicas
+                    .iter()
+                    .filter_map(|replica| self.ingress_of(*replica))
+                    .collect(),
+            ),
+            None => CallError::NoAgent,
+        }
+    }
+
+    fn ingress_of(&self, node: NodeNumber) -> Option<String> {
+        Some(self.space.as_ref()?.node(node)?.ingress.clone())
+    }
+
+    /// That this node does not lead `shared`'s group, with its leader's
+    /// address when known; or that the group stopped.
+    pub(crate) fn not_leader(&self, shared: &Shared) -> CallError {
+        if shared.state().stopped {
+            return CallError::Stopped;
+        }
+        CallError::NotLeader(
+            shared
+                .state()
+                .leader
+                .filter(|leader| *leader != self.number)
+                .and_then(|leader| self.ingress_of(leader)),
+        )
+    }
+
+    /// Wait until agent `id`'s group here knows a leader, for a few
+    /// election timeouts at most: a call to a group just created, or one
+    /// electing, then goes where it should.
+    pub(crate) async fn settled(&self, id: AgentId) -> Result<(), CallError> {
+        let run = self.run(id).ok_or_else(|| self.absent(id))?;
+        let electing = async {
+            run.shared
+                .wait(|state| state.stopped || self.knows_leader(&run, state))
+                .await;
+        };
+        electing
+            .or(async {
+                smol::Timer::after(Duration::from_millis(4 * self.election_timeout_ms.1)).await;
+            })
+            .await;
+        Ok(())
+    }
+
+    /// Whether `run`'s group knows where calls go: a leader elsewhere, or
+    /// this replica's leader loop taking inputs.
+    fn knows_leader(&self, run: &Run, state: &group::State) -> bool {
+        match state.leader {
+            Some(leader) if leader == self.number => {
+                run.agent.queue.lock().expect("the queue").leading
+            }
+            Some(_) => true,
+            None => false,
+        }
+    }
+
+    /// Queue `pending` for agent `id`, whose leader loop this node must
+    /// run. Checked under the queue's lock, from any thread.
+    pub(crate) fn push(&self, id: AgentId, pending: Pending) -> Result<(), CallError> {
+        let run = self.run(id).ok_or_else(|| self.absent(id))?;
+        let mut queue = run.agent.queue.lock().expect("the queue");
+        if queue.stopped || run.shared.state().stopped {
             return Err(CallError::Stopped);
+        }
+        if !queue.leading {
+            drop(queue);
+            return Err(self.not_leader(&run.shared));
         }
         if pending.capped() {
             if queue.capped >= self.queue {
@@ -248,12 +453,12 @@ impl Inner {
         }
         queue.inputs.push_back(pending);
         drop(queue);
-        let _ = agent.wake.try_send(());
+        let _ = run.agent.wake.try_send(());
         Ok(())
     }
 
     /// Put inputs back at the front of agent `id`'s queue, in order.
-    fn requeue(&self, agent: &Agent, inputs: Vec<Pending>) {
+    pub(crate) fn requeue(&self, agent: &Agent, inputs: Vec<Pending>) {
         let mut queue = agent.queue.lock().expect("the queue");
         if queue.stopped {
             return;
@@ -268,47 +473,379 @@ impl Inner {
 
     /// Stop every agent: a commit failed, and storage takes no more.
     /// Queued and later calls answer `Stopped`.
-    fn halt(&self) {
-        let agents: Vec<Arc<Agent>> = self
-            .agents
+    pub(crate) fn halt(&self) {
+        let runs: Vec<Arc<Run>> = self
+            .runs
             .lock()
-            .expect("the agents")
+            .expect("the runs")
             .values()
             .cloned()
             .collect();
-        for agent in agents {
-            agent.stop();
+        for run in runs {
+            run.agent.stop();
+            run.shared.stop();
         }
     }
 
-    fn start(self: &Arc<Self>, id: AgentId) -> smol::Task<()> {
-        let agent = Arc::new(Agent::new());
-        self.agents
+    /// The identity of the agent `record` creates: its record's hash.
+    pub(crate) fn identity(&self, record: &CreationRecord) -> [u8; 32] {
+        vos_pvm::precompile::blake2b_256(&record.encode())
+    }
+
+    /// Learn of an agent: keep its record, and start its group if this
+    /// node replicates it and runs its program.
+    pub(crate) fn learn(self: &Arc<Self>, record: CreationRecord) {
+        let replicates = record.replicas.contains(&self.number);
+        self.directory
             .lock()
-            .expect("the agents")
-            .insert(id, Arc::clone(&agent));
-        let inner = Arc::clone(self);
-        self.runtime.spawn(async move {
-            let lead = async {
-                match Leader::open(&inner, id) {
-                    Ok(mut leader) => leader.lead(&inner, &agent).await,
-                    Err(fault) => tracing::error!(
-                        agent = id.0,
-                        "the leader cannot start: {}",
-                        fault.message()
-                    ),
-                }
+            .expect("the directory")
+            .insert(record.agent, record.clone());
+        if !replicates || self.run(record.agent).is_some() {
+            return;
+        }
+        if record.program != self.program_hash {
+            tracing::error!(
+                agent = record.agent.0,
+                "the agent runs another agent program than this node's; its group does not start here"
+            );
+            return;
+        }
+        self.start(record);
+    }
+
+    fn start(self: &Arc<Self>, record: CreationRecord) {
+        let id = record.agent;
+        let shared = Arc::new(Shared::new(record));
+        let agent = Arc::new(Agent::new());
+        let (inbox, inputs) = smol::channel::bounded(GROUP_INBOX);
+        let (local, locals) = smol::channel::unbounded();
+        let guarded =
+            |name: &'static str, work: std::pin::Pin<Box<dyn Future<Output = ()> + Send>>| {
+                let shared = Arc::clone(&shared);
+                let agent = Arc::clone(&agent);
+                self.runtime.spawn(async move {
+                    if AssertUnwindSafe(work).catch_unwind().await.is_err() {
+                        tracing::error!(
+                            agent = id.0,
+                            "the agent's {name} panicked; the agent stops"
+                        );
+                        agent.stop();
+                        shared.stop();
+                    }
+                })
             };
-            if AssertUnwindSafe(lead).catch_unwind().await.is_err() {
-                tracing::error!(agent = id.0, "the leader panicked; the agent stops");
+        let tasks = vec![
+            guarded(
+                "group",
+                Box::pin(group::drive(
+                    Arc::clone(self),
+                    Arc::clone(&shared),
+                    inputs,
+                    locals,
+                )),
+            ),
+            guarded(
+                "applier",
+                Box::pin(group::apply(Arc::clone(self), Arc::clone(&shared))),
+            ),
+            guarded(
+                "leader",
+                Box::pin(crate::leader::lead(
+                    Arc::clone(self),
+                    Arc::clone(&agent),
+                    Arc::clone(&shared),
+                )),
+            ),
+        ];
+        self.runs.lock().expect("the runs").insert(
+            id,
+            Arc::new(Run {
+                agent,
+                shared,
+                inbox,
+                local,
+                tasks: Mutex::new(tasks),
+            }),
+        );
+    }
+
+    /// Hand the leader loop's `local` to agent `id`'s group. False when it
+    /// has none here, or it stopped.
+    pub(crate) fn propose(&self, id: AgentId, local: Local) -> bool {
+        self.run(id)
+            .is_some_and(|run| run.local.try_send(local).is_ok())
+    }
+
+    /// Agent `id`'s leader loop stopped for good: its replica hands
+    /// leadership over and never leads again.
+    pub(crate) fn retire(&self, id: AgentId) {
+        self.propose(id, Local::Retire);
+    }
+
+    pub(crate) fn keep_dry_run(&self, id: AgentId, dry_run: DryRun) {
+        self.dry_runs
+            .lock()
+            .expect("the dry runs")
+            .insert(id, dry_run);
+    }
+
+    /// The writes of the leader's dry run of `entry`, if it ran on the
+    /// state the entry at `index` applies to: the same entry on the same
+    /// state.
+    pub(crate) fn dry_run(&self, id: AgentId, index: u64, entry: &LogEntry) -> Option<Vec<Write>> {
+        let mut dry_runs = self.dry_runs.lock().expect("the dry runs");
+        let kept = dry_runs.remove(&id)?;
+        (kept.applied + 1 == index && kept.payload == entry.payload()).then_some(kept.writes)
+    }
+
+    /// Agent `id`'s group waits for `hashes`: tell it when they arrive.
+    pub(crate) fn want(&self, id: AgentId, hashes: &[[u8; 32]]) {
+        let mut wanted = self.wanted.lock().expect("the wanted blobs");
+        for hash in hashes {
+            wanted.entry(*hash).or_default().insert(id);
+        }
+    }
+
+    /// Whether a group here asked for `hash`.
+    pub(crate) fn is_wanted(&self, hash: &[u8; 32]) -> bool {
+        self.wanted
+            .lock()
+            .expect("the wanted blobs")
+            .contains_key(hash)
+    }
+
+    /// The groups that wanted `hash`, which arrived.
+    pub(crate) fn arrived(&self, hash: &[u8; 32]) {
+        let waiting = self
+            .wanted
+            .lock()
+            .expect("the wanted blobs")
+            .remove(hash)
+            .unwrap_or_default();
+        for id in waiting {
+            if let Some(run) = self.run(id) {
+                let _ = run.inbox.try_send(GroupInput::Blobs);
             }
-            agent.stop();
-        })
+        }
+    }
+
+    /// Create an agent with `replicas` (this node alone when empty),
+    /// running this node's agent program. Answered once a majority of the
+    /// replicas hold its record durably.
+    pub(crate) async fn create_agent(
+        self: &Arc<Self>,
+        replicas: Vec<NodeNumber>,
+    ) -> Result<AgentId, CallError> {
+        let mut replicas = if replicas.is_empty() {
+            vec![self.number]
+        } else {
+            replicas
+        };
+        replicas.sort_unstable();
+        replicas.dedup();
+        let known = |node: &NodeNumber| match &self.space {
+            Some(space) => space.node(*node).is_some(),
+            None => *node == self.number,
+        };
+        if let Some(node) = replicas.iter().find(|node| !known(node)) {
+            return Err(CallError::Failed(format!(
+                "node {node} is not in the space"
+            )));
+        }
+        let mut next = self.next_agent.lock().await;
+        let agent = AgentId(u32::from(self.number) << 24 | *next);
+        if *next >= 1 << 24 || agent == crate::store::NODE_AGENT {
+            return Err(CallError::Failed(
+                "this node's agent ids are exhausted".into(),
+            ));
+        }
+        let record = CreationRecord {
+            agent,
+            replicas,
+            creator: self.number,
+            time: (self.clock)(),
+            program: self.program_hash,
+            accumulate_gas: self.accumulate_gas,
+        };
+        self.storage
+            .commit(vec![Change::Agent(record.clone())])
+            .await
+            .map_err(CallError::Failed)?;
+        *next += 1;
+        drop(next);
+        self.learn(record.clone());
+        self.announce(&record);
+        if !self.held_by_majority(&record).await {
+            return Err(CallError::Unconfirmed(agent));
+        }
+        Ok(agent)
+    }
+
+    /// Install a package: its programs stored, then the install queued at
+    /// the leader, its entry naming their blobs.
+    pub(crate) async fn install(
+        &self,
+        agent: AgentId,
+        instance: InstanceId,
+        program: Vec<u8>,
+        attestables: Vec<(MethodId, Vec<u8>)>,
+        roles: Vec<(Vec<u8>, u8)>,
+    ) -> Result<Reply, CallError> {
+        // A follower refuses before storing anything.
+        self.settled(agent).await?;
+        let run = self.run(agent).ok_or_else(|| self.absent(agent))?;
+        if run.shared.state().role != Role::Leader {
+            return Err(self.not_leader(&run.shared));
+        }
+        let pool = Arc::clone(&self.pool);
+        let pooled = self
+            .executors
+            .run(move || {
+                let mut stored = Vec::new();
+                let mut pooled = |blob: Vec<u8>| -> Result<ProgramHash, CallError> {
+                    let hash = pool
+                        .install(&blob)
+                        .map_err(|error| CallError::Failed(format!("{error:?}")))?;
+                    let reference = BlobRef {
+                        hash: hash.0,
+                        len: blob.len() as u64,
+                    };
+                    stored.push((reference, Arc::new(blob)));
+                    Ok(ProgramHash(hash.0))
+                };
+                let program = pooled(program)?;
+                let attestables = attestables
+                    .into_iter()
+                    .map(|(method, blob)| Ok((method, pooled(blob)?)))
+                    .collect::<Result<Vec<_>, CallError>>()?;
+                Ok((program, attestables, stored))
+            })
+            .await
+            .map_err(|panicked| CallError::Failed(panicked.0))?;
+        let (program, attestables, stored) = pooled?;
+        // Stored, a blob is kept by its age until the entry names it; the
+        // apply then pins it.
+        let mut references = Vec::with_capacity(stored.len());
+        for (reference, blob) in stored {
+            self.blobs
+                .put(reference, blob)
+                .await
+                .map_err(CallError::Failed)?;
+            references.push(reference);
+        }
+        let admin = Admin::Install {
+            instance,
+            program,
+            attestables,
+            roles,
+        };
+        let (answer, reply) = smol::channel::bounded(1);
+        self.push(agent, Pending::Admin(admin, answer, references))?;
+        reply.recv().await.map_err(|_| CallError::Stopped)?
+    }
+
+    /// Run `work` on an executor, off the thread every leader shares.
+    pub(crate) async fn offload<T: Send + 'static>(
+        &self,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> Option<T> {
+        self.executors.run(work).await.ok()
+    }
+
+    pub(crate) async fn admin(&self, agent: AgentId, admin: Admin) -> Result<Reply, CallError> {
+        self.settled(agent).await?;
+        let (answer, reply) = smol::channel::bounded(1);
+        self.push(agent, Pending::Admin(admin, answer, Vec::new()))?;
+        reply.recv().await.map_err(|_| CallError::Stopped)?
+    }
+
+    /// A call: queued at once when the group knows where calls go, so
+    /// calls made together share a batch; else once it does.
+    pub(crate) fn call(
+        self: &Arc<Self>,
+        agent: AgentId,
+        request: Request,
+    ) -> impl Future<Output = Result<Reply, CallError>> + use<> {
+        let (answer, reply) = smol::channel::bounded(1);
+        let mut pending = Some(Pending::Request(request, answer));
+        let known = self.run(agent).is_some_and(|run| {
+            let state = run.shared.state();
+            state.stopped || self.knows_leader(&run, &state)
+        });
+        let queued = known.then(|| self.push(agent, pending.take().expect("a pending call")));
+        let inner = Arc::clone(self);
+        async move {
+            match queued {
+                Some(queued) => queued?,
+                None => {
+                    inner.settled(agent).await?;
+                    inner.push(agent, pending.take().expect("a pending call"))?;
+                }
+            }
+            reply.recv().await.map_err(|_| CallError::Stopped)?
+        }
+    }
+
+    /// Run a query on this replica's applied state, once it has applied
+    /// what it recovered.
+    pub(crate) async fn query(
+        self: &Arc<Self>,
+        agent: AgentId,
+        caller: Principal,
+        instance: InstanceId,
+        method: MethodId,
+        arguments: Vec<u8>,
+    ) -> Result<Outcome, CallError> {
+        let run = self.run(agent).ok_or_else(|| self.absent(agent))?;
+        let state = run
+            .shared
+            .wait(|state| state.stopped || state.applied >= state.recovered)
+            .await;
+        if state.stopped {
+            return Err(CallError::Stopped);
+        }
+        let snapshot = Arc::new(self.store.snapshot());
+        let (time, seed) = snapshot
+            .last_result(agent)
+            .map_err(|error| CallError::Failed(error.to_string()))?
+            .unwrap_or((0, [0; 32]));
+        let work = Work::Query(Query {
+            time,
+            seed,
+            caller,
+            instance,
+            method,
+            arguments,
+        });
+        let program = Arc::clone(&self.program);
+        let pool = Arc::clone(&self.pool);
+        let blobs = self.blobs.clone();
+        let gas = self.refine_gas;
+        let failed = |fault: Fault| CallError::Failed(fault.message().to_string());
+        let output = ran(self
+            .executors
+            .run(move || pvm::refine(&program, &pool, &blobs, snapshot, agent, &work, gas))
+            .await)
+        .map_err(failed)?;
+        pvm::decode::<Outcome>(&output).map_err(failed)
+    }
+
+    /// Commit changes to the node's own records.
+    pub(crate) async fn commit(&self, changes: Vec<Change>) -> Result<(), String> {
+        self.storage.commit(changes).await
+    }
+
+    /// Run `task` on the node's thread until it ends or the node stops.
+    pub(crate) fn spawn(&self, task: impl Future<Output = ()> + Send + 'static) {
+        let task = self.runtime.spawn(task);
+        let mut tasks = self.tasks.lock().expect("the node's tasks");
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(task);
     }
 }
 
 /// A value of an agent's applied state; `None` when absent or unreadable.
-fn read<T: Decode>(
+pub(crate) fn read<T: Decode>(
     snapshot: &FjallSnapshot,
     agent: AgentId,
     key: &[u8],
@@ -320,15 +857,12 @@ fn read<T: Decode>(
 }
 
 /// An executor's answer, a panic there being the node's fault.
-fn ran<T>(answer: Result<Result<T, Fault>, crate::executor::Panicked>) -> Result<T, Fault> {
+pub(crate) fn ran<T>(
+    answer: Result<Result<T, Fault>, crate::executor::Panicked>,
+) -> Result<T, Fault> {
     answer
         .unwrap_or_else(|panicked| Err(Fault::Infrastructure(format!("panicked: {}", panicked.0))))
 }
-
-/// The first wait before retrying a batch the node failed, doubled each
-/// time up to [`MAX_BACKOFF`].
-const BACKOFF: Duration = Duration::from_millis(50);
-const MAX_BACKOFF: Duration = Duration::from_secs(5);
 
 /// Milliseconds since the Unix epoch, by the system clock.
 pub fn wall_clock() -> u64 {
@@ -367,668 +901,17 @@ fn private_dir(dir: &Path) -> Result<(), String> {
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode & 0o700)).map_err(failed)
 }
 
-fn seed() -> [u8; 32] {
+pub(crate) fn seed() -> [u8; 32] {
     let mut seed = [0u8; 32];
     getrandom::getrandom(&mut seed).expect("the operating system's randomness");
     seed
 }
 
 /// The reply a step gives its request.
-fn reply(step: &Step) -> Reply {
+pub(crate) fn reply(step: &Step) -> Reply {
     match step {
         Step::Ran(run) => Reply::Ran(run.outcome.clone()),
         Step::Refused { code, .. } => Reply::Refused(*code),
-    }
-}
-
-/// An agent's leader: its batches, in order.
-struct Leader {
-    id: AgentId,
-    version: u64,
-    applied: u64,
-    /// The epoch its rows are under.
-    epoch: u8,
-    time: u64,
-    /// Each sender's pair mark, as applied.
-    marks: HashMap<AgentId, u64>,
-    /// Each target's last message delivered by this process.
-    delivered: HashMap<AgentId, u64>,
-    max_inputs: usize,
-    backoff: Duration,
-}
-
-impl Leader {
-    /// Node::open checked the agent's applied index against its version; an
-    /// agent created since has neither.
-    fn open(inner: &Inner, id: AgentId) -> Result<Self, Fault> {
-        let infrastructure = |error: fjall::Error| Fault::Infrastructure(error.to_string());
-        let snapshot = inner.store.snapshot();
-        let applied = snapshot.applied(id).map_err(infrastructure)?.unwrap_or(0);
-        let epoch = snapshot.epoch(id).map_err(infrastructure)?;
-        let time = match inner.store.log_entry(id, applied).map_err(infrastructure)? {
-            Some(entry) => pvm::decode::<WorkResult>(&entry.body)
-                .map(|result| result.time)
-                .unwrap_or(0),
-            None => 0,
-        };
-        Ok(Self {
-            id,
-            version: applied,
-            applied,
-            epoch,
-            time,
-            marks: HashMap::new(),
-            delivered: HashMap::new(),
-            max_inputs: inner.max_inputs,
-            backoff: BACKOFF,
-        })
-    }
-
-    async fn lead(&mut self, inner: &Inner, agent: &Agent) {
-        if let Err(fault) = self.recover(inner) {
-            tracing::error!(agent = self.id.0, "recovery failed: {}", fault.message());
-        }
-        while let Some(pending) = self.take(inner, agent).await {
-            if !self.run(inner, agent, pending).await {
-                return;
-            }
-        }
-    }
-
-    /// Deliver every message in the outbox above its target's ack: what a
-    /// crash may have left unsent.
-    fn recover(&mut self, inner: &Inner) -> Result<(), Fault> {
-        let snapshot = inner.store.snapshot();
-        let mut targets = BTreeSet::new();
-        for row in snapshot.scan(self.id, &keys::outbox_prefix(), None) {
-            let (key, _) = row.map_err(|error| Fault::Infrastructure(error.to_string()))?;
-            let to = key[key.len() - 12..key.len() - 8]
-                .try_into()
-                .expect("an outbox key holds its target");
-            targets.insert(AgentId(u32::from_be_bytes(to)));
-        }
-        for to in targets {
-            self.deliver(inner, &snapshot, to)?;
-        }
-        Ok(())
-    }
-
-    /// The next inputs, once there are any; `None` once stopped.
-    async fn take(&mut self, inner: &Inner, agent: &Agent) -> Option<Vec<Pending>> {
-        let mut waited = false;
-        loop {
-            {
-                let queue = agent.queue.lock().expect("the queue");
-                if queue.stopped {
-                    return None;
-                }
-                if !queue.inputs.is_empty() {
-                    break;
-                }
-            }
-            agent.woken.recv().await.ok()?;
-            waited = true;
-        }
-        if waited {
-            smol::Timer::after(inner.linger).await;
-        }
-        let mut queue = agent.queue.lock().expect("the queue");
-        if queue.stopped {
-            return None;
-        }
-        let mut taken = Vec::new();
-        let mut bytes = 0;
-        while taken.len() < self.max_inputs {
-            let Some(next) = queue.inputs.front() else {
-                break;
-            };
-            if !taken.is_empty() && bytes + next.bytes() > inner.max_bytes {
-                break;
-            }
-            let next = queue.inputs.pop_front().expect("a front input");
-            bytes += next.bytes();
-            if next.capped() {
-                queue.capped -= 1;
-            }
-            taken.push(next);
-        }
-        Some(taken)
-    }
-
-    /// A sender's pair mark, as applied.
-    fn mark(&mut self, snapshot: &FjallSnapshot, from: AgentId) -> Result<u64, Fault> {
-        if let Some(mark) = self.marks.get(&from) {
-            return Ok(*mark);
-        }
-        let mark = read::<u64>(snapshot, self.id, &keys::pair_in(from))?.unwrap_or(0);
-        self.marks.insert(from, mark);
-        Ok(mark)
-    }
-
-    /// Run one batch to its end. False when a hook stops the leader.
-    async fn run(&mut self, inner: &Inner, agent: &Agent, mut pending: Vec<Pending>) -> bool {
-        let snapshot = Arc::new(inner.store.snapshot());
-        let senders: BTreeSet<AgentId> = pending
-            .iter()
-            .filter_map(|item| match item {
-                Pending::Message(message) => Some(message.from),
-                _ => None,
-            })
-            .collect();
-        for from in senders {
-            if let Err(fault) = self.mark(&snapshot, from) {
-                self.retry(inner, agent, pending, fault).await;
-                return true;
-            }
-        }
-        // A message at or below its pair mark applied already: drop it and
-        // acknowledge the mark instead.
-        let mut acks: HashMap<AgentId, u64> = HashMap::new();
-        let mut kept = Vec::with_capacity(pending.len());
-        for item in pending.drain(..) {
-            if let Pending::Message(message) = &item {
-                let mark = self.marks[&message.from];
-                if message.sequence <= mark {
-                    raise(&mut acks, message.from, mark);
-                    continue;
-                }
-            }
-            kept.push(item);
-        }
-        let pending = kept;
-        self.acknowledge(inner, acks);
-        if pending.is_empty() {
-            self.max_inputs = inner.max_inputs;
-            return true;
-        }
-        let batch = Batch {
-            version: self.version,
-            time: (inner.clock)().max(self.time),
-            seed: seed(),
-            inputs: pending.iter().map(Pending::input).collect(),
-        };
-        match self.execute(inner, snapshot, &batch).await {
-            Ok(result) => {
-                self.applied += 1;
-                self.version += 1;
-                self.time = batch.time;
-                self.max_inputs = inner.max_inputs;
-                self.backoff = BACKOFF;
-                if !inner.hooks.after_commit(self.id, self.applied) {
-                    return false;
-                }
-                self.dispatch(inner, agent, pending, &result);
-            }
-            Err(Fault::Agent(message)) => self.fail(inner, agent, pending, message),
-            Err(Fault::Storage(message)) => {
-                tracing::error!(
-                    agent = self.id.0,
-                    "a commit failed ({message}); the node stops and needs a restart"
-                );
-                inner.halt();
-                return false;
-            }
-            Err(Fault::Invariant(message)) => {
-                tracing::error!(agent = self.id.0, "{message}; the agent stops");
-                return false;
-            }
-            Err(fault) => self.retry(inner, agent, pending, fault).await,
-        }
-        true
-    }
-
-    /// Refine, accumulate and commit `batch`.
-    async fn execute(
-        &self,
-        inner: &Inner,
-        snapshot: Arc<FjallSnapshot>,
-        batch: &Batch,
-    ) -> Result<WorkResult, Fault> {
-        let id = self.id;
-        let program = Arc::clone(&inner.program);
-        let pool = Arc::clone(&inner.pool);
-        let blobs = inner.blobs.clone();
-        let batch = batch.clone();
-        let hooks = Arc::clone(&inner.hooks);
-        let gas = inner.refine_gas;
-        let state = Arc::clone(&snapshot);
-        let output = ran(inner
-            .executors
-            .run(move || {
-                if hooks.fail_refine(id, &batch) {
-                    return Err(Fault::Agent("a hook failed the refine".into()));
-                }
-                pvm::refine(&program, &pool, &blobs, state, id, &Work::Batch(batch), gas)
-            })
-            .await)?;
-        let result: WorkResult = pvm::decode(&output)?;
-        let program = Arc::clone(&inner.program);
-        let gas = inner.accumulate_gas;
-        let applied = output.clone();
-        let writes = ran(inner
-            .executors
-            .run(move || pvm::accumulate(&program, snapshot, id, applied, gas))
-            .await)?;
-        // The result applied, so the agent's version moves with the
-        // node's applied index.
-        let version = writes
-            .iter()
-            .find(|write| write.key == keys::version())
-            .and_then(|write| write.value.as_deref())
-            .and_then(unstored)
-            .and_then(|bytes| u64::decode(bytes).ok())
-            .map(|(version, _)| version);
-        if version != Some(self.version + 1) {
-            return Err(Fault::Invariant(format!(
-                "accumulate skipped the work result: the agent's state is not at version {}",
-                self.version
-            )));
-        }
-        let index = self.applied + 1;
-        let changes = vec![
-            Change::Append {
-                agent: id,
-                index,
-                entry: LogEntry::result(0, output),
-            },
-            Change::Apply {
-                agent: id,
-                epoch: self.epoch,
-                index,
-                writes,
-            },
-        ];
-        inner
-            .storage
-            .commit(changes)
-            .await
-            .map_err(Fault::Storage)?;
-        Ok(result)
-    }
-
-    /// A batch the node failed: put it back whole and wait before the next
-    /// try. No input is to blame, so none is dropped.
-    async fn retry(&mut self, inner: &Inner, agent: &Agent, pending: Vec<Pending>, fault: Fault) {
-        tracing::error!(
-            agent = self.id.0,
-            "the node failed a batch ({}); retrying in {:?}",
-            fault.message(),
-            self.backoff
-        );
-        inner.requeue(agent, pending);
-        // Wait in short slices, so a stop does not wait out the backoff.
-        let until = std::time::Instant::now() + self.backoff;
-        while !agent.queue.lock().expect("the queue").stopped {
-            let left = until.saturating_duration_since(std::time::Instant::now());
-            if left.is_zero() {
-                break;
-            }
-            smol::Timer::after(left.min(BACKOFF)).await;
-        }
-        self.backoff = (self.backoff * 2).min(MAX_BACKOFF);
-    }
-
-    /// A batch the agent program failed: requeue it shorter, until one input
-    /// alone fails, which then fails its caller or is reported.
-    fn fail(&mut self, inner: &Inner, agent: &Agent, mut pending: Vec<Pending>, failed: String) {
-        if pending.len() > 1 {
-            tracing::warn!(
-                agent = self.id.0,
-                inputs = pending.len(),
-                "a batch failed ({failed}); retrying shorter"
-            );
-            self.max_inputs = (pending.len() / 2).max(1);
-            inner.requeue(agent, pending);
-            return;
-        }
-        let input = pending.pop().expect("one input");
-        tracing::error!(
-            agent = self.id.0,
-            "the agent program fails on one input alone ({failed}); it is dropped"
-        );
-        if let Pending::Request(_, answer) | Pending::Admin(_, answer) = input {
-            let _ = answer.try_send(Reply::Failed);
-        }
-    }
-
-    /// After a durable commit: answer, requeue what the result did not
-    /// cover, deliver the outbox and acknowledge applied messages.
-    fn dispatch(
-        &mut self,
-        inner: &Inner,
-        agent: &Agent,
-        pending: Vec<Pending>,
-        result: &WorkResult,
-    ) {
-        let snapshot = inner.store.snapshot();
-        let mut acks: HashMap<AgentId, u64> = HashMap::new();
-        let mut rest = Vec::new();
-        let mut again = Vec::new();
-        for (index, item) in pending.into_iter().enumerate() {
-            let Some(step) = result.steps.get(index) else {
-                rest.push(item);
-                continue;
-            };
-            match item {
-                Pending::Request(_, answer) | Pending::Admin(_, answer) => {
-                    let _ = answer.try_send(reply(step));
-                }
-                Pending::Message(message) => match step {
-                    Step::Ran(_) => {
-                        self.marks.insert(message.from, message.sequence);
-                        raise(&mut acks, message.from, message.sequence);
-                    }
-                    Step::Refused {
-                        code: refusal::SEQUENCE,
-                        ..
-                    } => {
-                        // At or below the mark, a duplicate: acknowledge
-                        // it. Above, a gap: drop it for the sender's next
-                        // delivery.
-                        match self.mark(&snapshot, message.from) {
-                            Ok(mark) if message.sequence <= mark => {
-                                raise(&mut acks, message.from, mark);
-                            }
-                            Ok(_) => {}
-                            Err(fault) => tracing::error!(
-                                agent = self.id.0,
-                                "a pair mark is unreadable: {}",
-                                fault.message()
-                            ),
-                        }
-                    }
-                    Step::Refused { code, .. } => tracing::error!(
-                        agent = self.id.0,
-                        from = message.from.0,
-                        sequence = message.sequence,
-                        code,
-                        "a message was refused and dropped"
-                    ),
-                },
-                Pending::Ack { to, sequence } => {
-                    // Ack again while the mark trails it: one ack clears
-                    // at most `ACK_LIMIT` entries.
-                    let marks =
-                        read::<u64>(&snapshot, self.id, &keys::acked(to)).and_then(|acked| {
-                            Ok((acked, read::<u64>(&snapshot, self.id, &keys::pair_out(to))?))
-                        });
-                    match marks {
-                        Ok((acked, sent))
-                            if acked.unwrap_or(0) < sequence.min(sent.unwrap_or(0)) =>
-                        {
-                            again.push(Pending::Ack { to, sequence });
-                        }
-                        Ok(_) => {}
-                        Err(fault) => tracing::error!(
-                            agent = self.id.0,
-                            "an ack mark is unreadable: {}",
-                            fault.message()
-                        ),
-                    }
-                }
-            }
-        }
-        inner.requeue(agent, rest);
-        for pending in again {
-            let _ = inner.push(self.id, pending);
-        }
-        let targets: BTreeSet<AgentId> = result
-            .steps
-            .iter()
-            .filter_map(|step| match step {
-                Step::Ran(run) => Some(run.messages.iter().map(|message| message.to)),
-                Step::Refused { .. } => None,
-            })
-            .flatten()
-            .collect();
-        for to in targets {
-            if let Err(fault) = self.deliver(inner, &snapshot, to) {
-                // The outbox keeps them: the next send to `to`, or a
-                // restart, delivers them.
-                tracing::error!(
-                    agent = self.id.0,
-                    to = to.0,
-                    "delivery failed: {}",
-                    fault.message()
-                );
-            }
-        }
-        self.acknowledge(inner, acks);
-    }
-
-    /// Send the outbox's messages to `to` past those already delivered (or
-    /// acknowledged), in order.
-    fn deliver(
-        &mut self,
-        inner: &Inner,
-        snapshot: &FjallSnapshot,
-        to: AgentId,
-    ) -> Result<(), Fault> {
-        let after = match self.delivered.get(&to) {
-            Some(delivered) => *delivered,
-            None => read::<u64>(snapshot, self.id, &keys::acked(to))?.unwrap_or(0),
-        };
-        let mut prefix = keys::outbox(to, 0);
-        prefix.truncate(prefix.len() - 8);
-        let cursor = keys::outbox(to, after);
-        for row in snapshot.scan(self.id, &prefix, Some(&cursor)) {
-            let (key, value) = row.map_err(|error| Fault::Infrastructure(error.to_string()))?;
-            let sequence = u64::from_be_bytes(key[key.len() - 8..].try_into().expect("a sequence"));
-            let Some(outgoing) = unstored(&value).and_then(|bytes| Outgoing::decode(bytes).ok())
-            else {
-                tracing::error!(
-                    agent = self.id.0,
-                    to = to.0,
-                    sequence,
-                    "an unreadable outbox entry"
-                );
-                break;
-            };
-            let message = Message {
-                from: self.id,
-                sequence,
-                instance: outgoing.0.instance,
-                method: outgoing.0.method,
-                arguments: outgoing.0.arguments,
-            };
-            if let Err(error) = inner.push(to, Pending::Message(message)) {
-                tracing::warn!(
-                    agent = self.id.0,
-                    to = to.0,
-                    "a message is not delivered: {error:?}"
-                );
-                break;
-            }
-            self.delivered.insert(to, sequence);
-        }
-        Ok(())
-    }
-
-    /// Acknowledge each sender's messages through the sequence given.
-    fn acknowledge(&self, inner: &Inner, acks: HashMap<AgentId, u64>) {
-        for (from, sequence) in acks {
-            let ack = Pending::Ack {
-                to: self.id,
-                sequence,
-            };
-            if let Err(error) = inner.push(from, ack) {
-                tracing::warn!(
-                    agent = self.id.0,
-                    to = from.0,
-                    "an ack is not delivered: {error:?}"
-                );
-            }
-        }
-    }
-}
-
-fn raise(acks: &mut HashMap<AgentId, u64>, from: AgentId, sequence: u64) {
-    let ack = acks.entry(from).or_insert(0);
-    *ack = (*ack).max(sequence);
-}
-
-impl Inner {
-    /// Create an agent running the node's agent program, once its registry
-    /// entry is durable.
-    pub(crate) async fn create_agent(self: &Arc<Self>) -> Result<AgentId, CallError> {
-        let mut next = self.next_agent.lock().await;
-        let agent = AgentId(*next);
-        assert_ne!(agent, NODE_AGENT, "agent ids are exhausted");
-        let change = Change::Agent {
-            agent,
-            program: self.program_hash,
-        };
-        self.storage
-            .commit(vec![change])
-            .await
-            .map_err(CallError::Failed)?;
-        *next += 1;
-        let leader = self.start(agent);
-        self.leaders.lock().expect("the leaders").push(leader);
-        Ok(agent)
-    }
-
-    /// Store and pool a package's programs, then queue its install. Pooling
-    /// prepares each program, so it runs on an executor.
-    pub(crate) async fn install(
-        &self,
-        agent: AgentId,
-        instance: InstanceId,
-        program: Vec<u8>,
-        attestables: Vec<(MethodId, Vec<u8>)>,
-        roles: Vec<(Vec<u8>, u8)>,
-    ) -> Result<Reply, CallError> {
-        if self.agent(agent).is_none() {
-            return Err(CallError::NoAgent);
-        }
-        let pool = Arc::clone(&self.pool);
-        let pooled = self
-            .executors
-            .run(move || {
-                let mut stored = Vec::new();
-                let mut pooled = |blob: Vec<u8>| -> Result<ProgramHash, CallError> {
-                    let hash = pool
-                        .install(&blob)
-                        .map_err(|error| CallError::Failed(format!("{error:?}")))?;
-                    let reference = BlobRef {
-                        hash: hash.0,
-                        len: blob.len() as u64,
-                    };
-                    stored.push((reference, Arc::new(blob)));
-                    Ok(ProgramHash(hash.0))
-                };
-                let program = pooled(program)?;
-                let attestables = attestables
-                    .into_iter()
-                    .map(|(method, blob)| Ok((method, pooled(blob)?)))
-                    .collect::<Result<Vec<_>, CallError>>()?;
-                Ok((program, attestables, stored))
-            })
-            .await
-            .map_err(|panicked| CallError::Failed(panicked.0))?;
-        let (program, attestables, stored) = pooled?;
-        // The blobs are durable before the pins that keep them.
-        let mut changes = Vec::with_capacity(stored.len());
-        for (reference, blob) in stored {
-            self.blobs
-                .put(reference, blob)
-                .await
-                .map_err(CallError::Failed)?;
-            changes.push(Change::Pin {
-                hash: reference.hash,
-                agent,
-            });
-        }
-        self.storage
-            .commit(changes)
-            .await
-            .map_err(CallError::Failed)?;
-        let admin = Admin::Install {
-            instance,
-            program,
-            attestables,
-            roles,
-        };
-        self.admin(agent, admin).await
-    }
-
-    /// Run `work` on an executor, off the thread every leader shares.
-    pub(crate) async fn offload<T: Send + 'static>(
-        &self,
-        work: impl FnOnce() -> T + Send + 'static,
-    ) -> Option<T> {
-        self.executors.run(work).await.ok()
-    }
-
-    pub(crate) async fn admin(&self, agent: AgentId, admin: Admin) -> Result<Reply, CallError> {
-        let (answer, reply) = smol::channel::bounded(1);
-        self.push(agent, Pending::Admin(admin, answer))?;
-        reply.recv().await.map_err(|_| CallError::Stopped)
-    }
-
-    pub(crate) fn call(
-        &self,
-        agent: AgentId,
-        request: Request,
-    ) -> impl Future<Output = Result<Reply, CallError>> + use<> {
-        let (answer, reply) = smol::channel::bounded(1);
-        let queued = self.push(agent, Pending::Request(request, answer));
-        async move {
-            queued?;
-            reply.recv().await.map_err(|_| CallError::Stopped)
-        }
-    }
-
-    pub(crate) async fn query(
-        self: &Arc<Self>,
-        agent: AgentId,
-        caller: Principal,
-        instance: InstanceId,
-        method: MethodId,
-        arguments: Vec<u8>,
-    ) -> Result<Outcome, CallError> {
-        if self.agent(agent).is_none() {
-            return Err(CallError::NoAgent);
-        }
-        let snapshot = Arc::new(self.store.snapshot());
-        let applied = snapshot
-            .applied(agent)
-            .map_err(|error| CallError::Failed(error.to_string()))?
-            .unwrap_or(0);
-        let (time, seed) = match self
-            .store
-            .log_entry(agent, applied)
-            .map_err(|error| CallError::Failed(error.to_string()))?
-        {
-            Some(entry) => pvm::decode::<WorkResult>(&entry.body)
-                .map(|result| (result.time, result.seed))
-                .unwrap_or((0, [0; 32])),
-            None => (0, [0; 32]),
-        };
-        let work = Work::Query(Query {
-            time,
-            seed,
-            caller,
-            instance,
-            method,
-            arguments,
-        });
-        let program = Arc::clone(&self.program);
-        let pool = Arc::clone(&self.pool);
-        let blobs = self.blobs.clone();
-        let gas = self.refine_gas;
-        let failed = |fault: Fault| CallError::Failed(fault.message().to_string());
-        let output = ran(self
-            .executors
-            .run(move || pvm::refine(&program, &pool, &blobs, snapshot, agent, &work, gas))
-            .await)
-        .map_err(failed)?;
-        pvm::decode::<Outcome>(&output).map_err(failed)
-    }
-
-    /// Commit changes to the node's own records.
-    pub(crate) async fn commit(&self, changes: Vec<Change>) -> Result<(), String> {
-        self.storage.commit(changes).await
     }
 }
 
@@ -1041,6 +924,7 @@ pub struct Node {
     ingress_tls: Option<IngressTls>,
     /// The ingress, and what stops it.
     ingress: Mutex<Option<(smol::Task<()>, smol::channel::Sender<()>)>>,
+    endpoint: Option<Endpoint>,
     stop: Option<smol::channel::Sender<()>>,
     runtime: Option<JoinHandle<()>>,
 }
@@ -1054,8 +938,8 @@ pub const ADMIN_TOKEN: &str = "admin.token";
 pub const NODE_KEY: &str = "node.key";
 
 impl Node {
-    /// Open the node's data directory `data` (its store and admin token)
-    /// and start every agent it runs.
+    /// Open the node's data directory `data` (its store and admin token),
+    /// join its space and start every agent it replicates.
     pub fn open(data: impl AsRef<Path>, config: Config) -> Result<Self, Error> {
         let largest = defaults::MAX_HANDLER_GAS
             + defaults::STEP_RESERVE.max(defaults::INSTALL_RESERVE)
@@ -1078,7 +962,19 @@ impl Node {
         };
         let node_id = NodeId(SigningKey::from_bytes(&secret).verifying_key().to_bytes());
         let hex: String = node_id.0.iter().map(|byte| format!("{byte:02x}")).collect();
-        std::fs::write(data.join(NODE_KEY), hex).map_err(|error| Error::Data(error.to_string()))?;
+        std::fs::write(data.join(NODE_KEY), &hex)
+            .map_err(|error| Error::Data(error.to_string()))?;
+        let number = match &config.space {
+            Some(space) => {
+                space
+                    .by_key(&node_id.0)
+                    .ok_or_else(|| {
+                        Error::Data(format!("this node's key, {hex}, is not in its space"))
+                    })?
+                    .number
+            }
+            None => 0,
+        };
         let blobs = Blobs::open(data.join(BLOBS), &store)?;
         let pool = Arc::new(MachinePool::new());
         for hash in blobs.pinned()? {
@@ -1094,22 +990,29 @@ impl Node {
             OuterMachines::with_idle_limit(&config.agent, PvmBackend::Default, config.executors)
                 .map_err(|error| Error::Program(format!("{error:?}")))?;
         let program_hash = ProgramHash(CodeHash::of(&config.agent).0);
-        let agents = store.agents()?;
-        let snapshot = store.snapshot();
-        for (agent, _) in &agents {
-            let applied = snapshot.applied(*agent)?.unwrap_or(0);
-            let version = read::<u64>(&snapshot, *agent, &keys::version())
-                .map_err(|fault| Error::Unreadable(fault.message().to_string()))?
-                .unwrap_or(0);
-            if applied != version {
-                return Err(Error::Inconsistent {
-                    agent: *agent,
-                    applied,
-                    version,
-                });
+        let records = store.agents()?;
+        let (endpoint, arrivals) = match (&config.space, &config.peers) {
+            (Some(space), Peers::Quic) if space.nodes().len() > 1 => {
+                let listen = space.node(number).expect("this node is in its space").peer;
+                let (quic, arrivals) = vos_net::quic::Quic::bind(vos_net::quic::Config {
+                    peers: space.peers(),
+                    ..vos_net::quic::Config::new(number, secret, listen)
+                })
+                .map_err(|error| Error::Data(format!("{listen}: {error}")))?;
+                (Some(Endpoint::Quic(Arc::new(quic))), Some(arrivals))
             }
-        }
-        drop(snapshot);
+            (Some(space), Peers::Hub(hub)) => {
+                let (endpoint, arrivals) = hub.join(number);
+                endpoint.set_peers(space.peers());
+                (Some(Endpoint::Hub(Arc::new(endpoint))), Some(arrivals))
+            }
+            _ => (None, None),
+        };
+        let network: Option<Arc<dyn Wire>> = match &endpoint {
+            Some(Endpoint::Quic(quic)) => Some(Arc::clone(quic) as Arc<dyn Wire>),
+            Some(Endpoint::Hub(hub)) => Some(Arc::clone(hub) as Arc<dyn Wire>),
+            None => None,
+        };
         let runtime = Arc::new(smol::Executor::new());
         let (stop, stopped) = smol::channel::bounded::<()>(1);
         let thread = {
@@ -1119,9 +1022,10 @@ impl Node {
                 .spawn(move || smol::block_on(runtime.run(stopped.recv())).unwrap_or(()))
                 .expect("the node's thread starts")
         };
-        let next = agents
+        let next = records
             .iter()
-            .map(|(agent, _)| agent.0 + 1)
+            .filter(|record| CreationRecord::creator_of(record.agent) == number)
+            .map(|record| (record.agent.0 & 0x00ff_ffff) + 1)
             .max()
             .unwrap_or(1);
         let inner = Arc::new(Inner {
@@ -1141,22 +1045,40 @@ impl Node {
             hooks: config.hooks,
             clock: config.clock,
             node_id,
-            agents: Mutex::new(HashMap::new()),
-            leaders: Mutex::new(Vec::new()),
+            number,
+            space: config.space,
+            network,
+            election_timeout_ms: config.election_timeout_ms,
+            heartbeat_ms: config.heartbeat_ms,
+            directory: Mutex::new(HashMap::new()),
+            unacknowledged: Mutex::new(HashMap::new()),
+            acknowledged: event_listener::Event::new(),
+            runs: Mutex::new(HashMap::new()),
+            dry_runs: Mutex::new(HashMap::new()),
+            wanted: Mutex::new(HashMap::new()),
+            drops: crate::peer::Drops::default(),
             next_agent: smol::lock::Mutex::new(next),
             runtime,
+            tasks: Mutex::new(Vec::new()),
+            recording: smol::lock::Mutex::new(()),
         });
-        let leaders: Vec<_> = agents
-            .iter()
-            .map(|(agent, _)| inner.start(*agent))
-            .collect();
-        inner.leaders.lock().expect("the leaders").extend(leaders);
+        for record in records {
+            if record.creator == number {
+                inner.announce(&record);
+            }
+            inner.learn(record);
+        }
+        if let Some(arrivals) = arrivals {
+            inner.spawn(crate::dispatch::dispatch(Arc::clone(&inner), arrivals));
+        }
+        inner.spawn(crate::dispatch::resend_records(Arc::clone(&inner)));
         Ok(Self {
             inner,
             data,
             secret,
             ingress_tls: config.ingress_tls,
             ingress: Mutex::new(None),
+            endpoint,
             stop: Some(stop),
             runtime: Some(thread),
         })
@@ -1168,10 +1090,38 @@ impl Node {
         self.inner.node_id
     }
 
-    /// Create an agent running the node's agent program. Blocks until its
-    /// registry entry is durable.
+    /// The node's number in its space.
+    pub fn number(&self) -> NodeNumber {
+        self.inner.number
+    }
+
+    /// Create an agent running the node's agent program, replicated on
+    /// this node alone. Blocks until its record is durable.
     pub fn create_agent(&self) -> Result<AgentId, CallError> {
-        smol::block_on(self.inner.create_agent())
+        self.create_replicated(Vec::new())
+    }
+
+    /// Create an agent replicated on `replicas`. Blocks until a majority
+    /// of them hold its record.
+    pub fn create_replicated(&self, replicas: Vec<NodeNumber>) -> Result<AgentId, CallError> {
+        let inner = Arc::clone(&self.inner);
+        smol::block_on(
+            self.inner
+                .runtime
+                .spawn(async move { inner.create_agent(replicas).await }),
+        )
+    }
+
+    /// Whether this node's replica leads `agent`'s group.
+    pub fn leads(&self, agent: AgentId) -> bool {
+        self.inner
+            .run(agent)
+            .is_some_and(|run| run.shared.state().role == Role::Leader)
+    }
+
+    /// The last index this node's replica of `agent` applied.
+    pub fn applied(&self, agent: AgentId) -> Option<u64> {
+        Some(self.inner.run(agent)?.shared.state().applied)
     }
 
     /// Install a package as `instance` of `agent`: its actor program, the
@@ -1191,11 +1141,12 @@ impl Node {
             .iter()
             .map(|(method, blob)| (*method, blob.to_vec()))
             .collect();
-        async move {
+        // On the node's thread, as every queueing is.
+        self.inner.runtime.spawn(async move {
             inner
                 .install(agent, instance, program, attestables, roles)
                 .await
-        }
+        })
     }
 
     /// Grant `principal` a role in `agent`, or (`None`) revoke it.
@@ -1206,10 +1157,12 @@ impl Node {
         role: Option<u8>,
     ) -> impl Future<Output = Result<Reply, CallError>> + use<> {
         let inner = Arc::clone(&self.inner);
-        async move { inner.admin(agent, Admin::SetRole { principal, role }).await }
+        self.inner
+            .runtime
+            .spawn(async move { inner.admin(agent, Admin::SetRole { principal, role }).await })
     }
 
-    /// A client request to `agent`, answered once its step is durable.
+    /// A client request to `agent`, answered once its step is applied here.
     pub fn call(
         &self,
         agent: AgentId,
@@ -1219,7 +1172,7 @@ impl Node {
     }
 
     /// Run a query handler on `agent`'s applied state. It never enters the
-    /// log; its time and seed are the last applied batch's.
+    /// log; its time and seed are the last applied work result's.
     pub fn query(
         &self,
         agent: AgentId,
@@ -1246,6 +1199,11 @@ impl Node {
     /// The node's storage, to read applied state and the log.
     pub fn store(&self) -> &Fjall {
         &self.inner.store
+    }
+
+    /// The blobs some agent keeps here: the programs its instances run.
+    pub fn pinned(&self) -> Vec<[u8; 32]> {
+        self.inner.blobs.pinned().unwrap_or_default()
     }
 
     /// Serve the HTTP ingress on `address` (`127.0.0.1:0` picks a port):
@@ -1281,7 +1239,7 @@ impl Node {
         Ok(local)
     }
 
-    /// Stop every leader after its batch in flight, then the threads.
+    /// Stop every agent after its batch in flight, then the threads.
     /// Requests queued but not yet in a batch are not durable: their callers
     /// see `Stopped` and resend.
     pub fn shutdown(mut self) {
@@ -1296,21 +1254,30 @@ impl Node {
             let _ = stop.try_send(());
             smol::block_on(task);
         }
-        let agents: Vec<Arc<Agent>> = self
+        let tasks = std::mem::take(&mut *self.inner.tasks.lock().expect("the node's tasks"));
+        let runs: Vec<Arc<Run>> = self
             .inner
-            .agents
+            .runs
             .lock()
-            .expect("the agents")
-            .values()
-            .cloned()
+            .expect("the runs")
+            .drain()
+            .map(|(_, run)| run)
             .collect();
-        for agent in agents {
-            agent.stop();
+        for run in &runs {
+            run.agent.stop();
+            run.shared.stop();
+            run.inbox.close();
+            run.local.close();
         }
-        let leaders = std::mem::take(&mut *self.inner.leaders.lock().expect("the leaders"));
         smol::block_on(async {
-            for leader in leaders {
-                leader.await;
+            for task in tasks {
+                task.cancel().await;
+            }
+            for run in runs {
+                let tasks = std::mem::take(&mut *run.tasks.lock().expect("the run's tasks"));
+                for task in tasks {
+                    task.await;
+                }
             }
         });
         if let Some(stop) = self.stop.take() {
@@ -1319,6 +1286,7 @@ impl Node {
         if let Some(runtime) = self.runtime.take() {
             let _ = runtime.join();
         }
+        drop(self.endpoint.take());
     }
 }
 

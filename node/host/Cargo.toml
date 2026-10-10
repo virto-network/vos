@@ -10,6 +10,7 @@ description = "The VOS node host: storage, the leader loops and ingress."
 # release may outgrow.
 fjall = "=3.1.12"
 ed25519-dalek = "2"
+event-listener = "5"
 futures-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 getrandom = "0.2"
 httparse = "1"
