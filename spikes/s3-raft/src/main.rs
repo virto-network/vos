@@ -22,10 +22,13 @@ use vos_raft_eager as raft;
 
 use raft::worker::run_worker;
 use raft::{
-    AppendEntriesReq, AppendEntriesResp, ApplySink, Config, EntryKind, InstallSnapshotReq,
-    InstallSnapshotResp, LogEntry, MemStorage, Meta, PreVoteReq, PreVoteResp, RaftMsg,
-    RequestVoteReq, RequestVoteResp, Rng, Role, Storage, TokioClock, Transport, Worker,
-    WriteBatch,
+    ApplySink, Config, EntryKind, LogEntry, MemStorage, Meta, RaftMsg, Rng, Role, Storage,
+    TokioClock, Transport, Worker, WriteBatch,
+};
+#[cfg(feature = "eager")]
+use raft::{
+    AppendEntriesReq, AppendEntriesResp, InstallSnapshotReq, InstallSnapshotResp, PreVoteReq,
+    PreVoteResp, RequestVoteReq, RequestVoteResp,
 };
 
 type N = u32;
@@ -49,11 +52,23 @@ impl PeerTx {
 
 #[derive(Clone)]
 struct InProc {
+    #[cfg_attr(not(feature = "eager"), allow(dead_code))]
     me: N,
     peers: Arc<OnceLock<HashMap<N, PeerTx>>>,
     rpcs: Arc<AtomicU64>,
 }
 
+#[cfg(not(feature = "eager"))]
+impl Transport<N> for InProc {
+    fn send(&self, from: N, to: N, envelope: raft::Envelope<N>) {
+        self.rpcs.fetch_add(1, Ordering::Relaxed);
+        if let Some(peer) = self.peers.get().and_then(|peers| peers.get(&to)) {
+            peer.send(RaftMsg::Deliver { from, envelope });
+        }
+    }
+}
+
+#[cfg(feature = "eager")]
 impl InProc {
     async fn call<R>(
         &self,
@@ -70,6 +85,7 @@ impl InProc {
     }
 }
 
+#[cfg(feature = "eager")]
 impl Transport<N> for InProc {
     type Error = String;
 

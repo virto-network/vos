@@ -1,18 +1,18 @@
 //! Property-based testing for Raft safety invariants.
 //!
-//! These tests generate random sequences of inbound RPCs against
+//! These tests generate random sequences of inbound messages against
 //! a single worker and verify that no matter what order or term
 //! values arrive, the worker upholds the protocol invariants:
 //!
 //! 1. **Term monotonicity** — `current_term` never decreases.
-//! 2. **At-most-one-vote-per-term** — `voted_for` is set for at
-//!    most one peer in any given term.
+//! 2. **At-most-one-vote-per-term** — the durable `voted_for` names
+//!    at most one peer in any given term.
 //! 3. **Log-matching** — once an entry has been written at
 //!    `(index, term)`, no other entry at the same index ever has
 //!    a different term *unless* the term reported by the worker
 //!    itself bumps in between (which authorizes the divergent
 //!    leader to truncate). We assert by snapshotting the entry at
-//!    each touched index after every RPC and detecting a term
+//!    each touched index after every message and detecting a term
 //!    change at the same index without a corresponding worker-term
 //!    advance — that's a violation.
 //! 4. **Snap-pointer monotonicity** — `snap_last_index` only
@@ -28,7 +28,7 @@
 //! xorshift64* identical to `StdRng` but with a caller-controlled
 //! seed; the per-test seed is mixed in. The `Clock` is `StdClock`
 //! but the test windows are wide enough that no spontaneous
-//! election fires during the RPC sequence — timing differences
+//! election fires during the message sequence — timing differences
 //! between runs don't affect the observable state.
 
 #![cfg(feature = "std")]
@@ -38,14 +38,14 @@ use std::sync::{Arc, Mutex};
 use futures_executor::block_on;
 use proptest::prelude::*;
 use vos_raft::{
-    AppendEntriesReq, InstallSnapshotReq, LogEntry, Meta, PreVoteReq, PreVoteResp, RequestVoteReq,
-    StdClock, Storage, Worker, WriteBatch,
+    ActiveConfigRecord, Envelope, InstallSnapshotReq, LogEntry, Message, Meta, StdClock, Storage,
+    Worker, WorkerHandle, WriteBatch,
 };
 
-/// Operations the test can issue against a single worker.
+/// Messages the test can deliver to a single worker.
 #[derive(Debug, Clone)]
 enum Op {
-    /// Inbound `AppendEntries` from a peer at `term` with given
+    /// An append from a peer at `term` with given
     /// `prev_log_index`/`prev_log_term` and `n_entries` filler
     /// entries (all at `term`).
     Append {
@@ -56,14 +56,15 @@ enum Op {
         leader_commit: u64,
         n_entries: u8,
     },
-    /// Inbound `RequestVote` from a peer.
+    /// A vote request from a peer.
     Vote {
         from: u16,
         term: u64,
         last_log_index: u64,
         last_log_term: u64,
     },
-    /// Inbound `InstallSnapshot` from a peer.
+    /// A whole snapshot in one chunk from a peer; installed only when
+    /// that peer leads the worker's current term.
     Install {
         from: u16,
         term: u64,
@@ -73,8 +74,10 @@ enum Op {
 }
 
 fn op_strategy() -> impl Strategy<Value = Op> {
-    let peers = 0xBBBBu16..=0xCCCC;
-    let term = 0u64..50;
+    // The two peers, and few terms, so a snapshot often comes from the
+    // leader of the current term.
+    let peers = prop_oneof![Just(0xBBBBu16), Just(0xCCCC)];
+    let term = 0u64..12;
     let idx = 0u64..30;
     let n = 0u8..3;
     prop_oneof![
@@ -146,7 +149,7 @@ struct StorageMirror {
 /// `Storage` impl that mirrors all writes into a shared
 /// `Arc<Mutex<StorageMirror>>` the test holds a clone of. The
 /// worker drives the live state machine; the mirror gives us a
-/// snapshot we can introspect after every RPC.
+/// snapshot we can introspect after every message.
 struct SharedStorage {
     mirror: Arc<Mutex<StorageMirror>>,
 }
@@ -206,6 +209,9 @@ impl Storage<u16> for SharedStorage {
     async fn load_meta(&self) -> Result<Meta<u16>, Self::Error> {
         Ok(self.mirror.lock().unwrap().meta.clone())
     }
+    async fn active_config(&self) -> Result<Option<ActiveConfigRecord<u16>>, Self::Error> {
+        Ok(None)
+    }
     async fn commit_batch(&mut self, batch: WriteBatch<u16>) -> Result<(), Self::Error> {
         let mut m = self.mirror.lock().unwrap();
         if let Some(after) = batch.truncate_after {
@@ -229,70 +235,59 @@ impl Storage<u16> for SharedStorage {
     }
 }
 
-fn make_worker(seed: u64) -> (Worker<u16>, Arc<Mutex<StorageMirror>>) {
+fn make_worker(seed: u64) -> (Worker<u16>, Arc<Mutex<StorageMirror>>, Arc<Capture>) {
     let mirror: Arc<Mutex<StorageMirror>> = Arc::new(Mutex::new(StorageMirror::default()));
     let storage = SharedStorage {
         mirror: mirror.clone(),
     };
     let mut cfg = vos_raft::Config::new(0xAAAA, vec![0xAAAA, 0xBBBB, 0xCCCC], [0xC0; 32]);
     // Long enough that no spontaneous election fires during the
-    // property test — we want to observe *only* the random RPC
+    // property test — we want to observe *only* the random message
     // sequence's effect on state.
     cfg.election_timeout_ms = (60_000, 120_000);
     cfg.heartbeat_interval_ms = 50;
     let rng_seed = if seed == 0 { 0xBADC0FFEE } else { seed };
+    let capture = Arc::new(Capture::default());
     let worker = Worker::spawn_with(
         storage,
-        Arc::new(NoopTransport),
+        capture.clone(),
         cfg,
         (),
         StdClock,
         SeededRng(rng_seed),
     );
-    (worker, mirror)
+    (worker, mirror, capture)
 }
 
-struct NoopTransport;
+/// Captures what the worker sends.
+#[derive(Default)]
+struct Capture {
+    sent: Mutex<Vec<(u16, Envelope<u16>)>>,
+}
 
-#[derive(Debug)]
-struct NoopErr;
-impl core::fmt::Display for NoopErr {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "noop")
+impl vos_raft::Transport<u16> for Capture {
+    fn send(&self, _from: u16, to: u16, envelope: Envelope<u16>) {
+        self.sent.lock().unwrap().push((to, envelope));
     }
 }
-impl std::error::Error for NoopErr {}
 
-impl vos_raft::Transport<u16> for NoopTransport {
-    type Error = NoopErr;
-    async fn send_append(
-        &self,
-        _peer: u16,
-        _req: AppendEntriesReq<u16>,
-    ) -> Result<vos_raft::AppendEntriesResp, NoopErr> {
-        Err(NoopErr)
+impl Capture {
+    /// Whether the worker granted `candidate` a vote at `term`.
+    fn granted(&self, candidate: u16, term: u64) -> bool {
+        self.sent.lock().unwrap().iter().any(|(to, envelope)| {
+            *to == candidate
+                && matches!(
+                    envelope,
+                    Envelope::Raft(Message::VoteAnswer { term: at, granted: true }) if *at == term
+                )
+        })
     }
-    async fn send_vote(
-        &self,
-        _peer: u16,
-        _req: RequestVoteReq<u16>,
-    ) -> Result<vos_raft::RequestVoteResp, NoopErr> {
-        Err(NoopErr)
-    }
-    async fn send_prevote(
-        &self,
-        _peer: u16,
-        _req: PreVoteReq<u16>,
-    ) -> Result<PreVoteResp, NoopErr> {
-        Err(NoopErr)
-    }
-    async fn send_install(
-        &self,
-        _peer: u16,
-        _req: InstallSnapshotReq<u16>,
-    ) -> Result<vos_raft::InstallSnapshotResp, NoopErr> {
-        Err(NoopErr)
-    }
+}
+
+/// Deliver `envelope` from `from` and wait until it is handled.
+fn deliver(handle: &WorkerHandle<u16>, from: u16, envelope: Envelope<u16>) {
+    handle.deliver(from, envelope);
+    block_on(handle.snapshot()).expect("worker alive");
 }
 
 proptest! {
@@ -302,7 +297,7 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
     /// All five claimed invariants checked simultaneously across an
-    /// arbitrary RPC sequence:
+    /// arbitrary message sequence:
     ///
     /// 1. term monotonicity
     /// 4. snap-pointer monotonicity
@@ -312,17 +307,18 @@ proptest! {
     ///    term)`, AND the entry-term never exceeds the worker's
     ///    `current_term` at observation time.
     ///
-    /// (Invariant 2, at-most-one-vote-per-term, is in its own test
-    /// below.)
+    /// 2. one durable vote per term
     #[test]
-    fn invariants_hold_under_random_rpcs(
+    fn invariants_hold_under_random_messages(
         seed in any::<u64>(),
         ops in proptest::collection::vec(op_strategy(), 0..50),
     ) {
-        let (worker, mirror) = make_worker(seed);
+        let (worker, mirror, _) = make_worker(seed);
         let h = worker.handler();
 
         let mut prev_term = 0u64;
+        // The durable vote of each term seen so far.
+        let mut votes: std::collections::BTreeMap<u64, u16> = std::collections::BTreeMap::new();
         let mut prev_commit = 0u64;
         let mut prev_snap = 0u64;
         // Per-index history: (entry_term, worker_term_at_observation).
@@ -345,34 +341,35 @@ proptest! {
                             vec![i],
                         ))
                         .collect();
-                    let _ = block_on(h.handle_inbound_append(
-                        from,
-                        AppendEntriesReq {
-                            leader: from,
-                            term, prev_log_index, prev_log_term, leader_commit, entries,
-                        },
-                    ));
+                    deliver(&h, from, Envelope::Raft(Message::Append {
+                        term,
+                        leader: from,
+                        prev_index: prev_log_index,
+                        prev_term: prev_log_term,
+                        commit: leader_commit,
+                        round: 1,
+                        entries,
+                    }));
                 }
                 Op::Vote { from, term, last_log_index, last_log_term } => {
-                    let _ = block_on(h.handle_inbound_vote(
-                        from,
-                        RequestVoteReq { candidate: from, term, last_log_index, last_log_term },
-                    ));
+                    deliver(&h, from, Envelope::Raft(Message::Vote {
+                        term,
+                        candidate: from,
+                        last_index: last_log_index,
+                        last_term: last_log_term,
+                    }));
                 }
                 Op::Install { from, term, last_included_index, last_included_term } => {
-                    let _ = block_on(h.handle_inbound_install(
-                        from,
-                        InstallSnapshotReq {
-                            leader: from,
-                            term, last_included_index, last_included_term,
-                            offset: 0,
-                            done: true,
-                            data: vec![0xFF; 4],
-                            members: Vec::new(),
-                            joint_old: None,
-                            active_config_index: None,
-                        },
-                    ));
+                    deliver(&h, from, Envelope::SnapshotChunk(InstallSnapshotReq {
+                        leader: from,
+                        term, last_included_index, last_included_term,
+                        offset: 0,
+                        done: true,
+                        data: vec![0xFF; 4],
+                        members: Vec::new(),
+                        joint_old: None,
+                        active_config_index: None,
+                    }));
                 }
             }
 
@@ -402,6 +399,16 @@ proptest! {
                 "commit_index {} < snap_last_index {}",
                 snap.commit_index, snap.snap_last_index,
             );
+
+            // Invariant 2: one durable vote per term.
+            let meta = mirror.lock().unwrap().meta.clone();
+            if let Some(vote) = meta.voted_for {
+                let first = *votes.entry(meta.current_term).or_insert(vote);
+                prop_assert_eq!(
+                    first, vote,
+                    "two votes in term {}", meta.current_term,
+                );
+            }
 
             // Invariant 3: log-matching. Walk the live entry set
             // through the storage mirror and audit each entry's
@@ -442,7 +449,7 @@ proptest! {
         }
     }
 
-    /// Two `RequestVote`s in the same term, from different
+    /// Two vote requests in the same term, from different
     /// candidates: the worker grants at most one of them.
     #[test]
     fn at_most_one_vote_per_term_under_random_pairings(
@@ -452,26 +459,22 @@ proptest! {
         cand_b in 0xBBBFu16..=0xBBC2,
     ) {
         prop_assume!(cand_a != cand_b);
-        let (worker, _mirror) = make_worker(seed);
+        let (worker, _mirror, capture) = make_worker(seed);
         let h = worker.handler();
-
-        let r1 = block_on(h.handle_inbound_vote(
-            cand_a,
-            RequestVoteReq {
-                candidate: cand_a, term, last_log_index: 0, last_log_term: 0,
-            },
-        ));
-        let r2 = block_on(h.handle_inbound_vote(
-            cand_b,
-            RequestVoteReq {
-                candidate: cand_b, term, last_log_index: 0, last_log_term: 0,
-            },
-        ));
+        for candidate in [cand_a, cand_b] {
+            deliver(&h, candidate, Envelope::Raft(Message::Vote {
+                term,
+                candidate,
+                last_index: 0,
+                last_term: 0,
+            }));
+        }
+        let (r1, r2) = (capture.granted(cand_a, term), capture.granted(cand_b, term));
         // Either we voted for the first only, or neither — never
         // both. (We may grant the second if the term has bumped,
         // but here both calls use the same `term`.)
         prop_assert!(
-            !(r1.vote_granted && r2.vote_granted),
+            !(r1 && r2),
             "granted two votes in term {term}: r1={r1:?}, r2={r2:?}",
         );
     }

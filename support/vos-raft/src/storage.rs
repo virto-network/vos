@@ -21,9 +21,8 @@
 //!   single redb txn, a single flash erase-program cycle, or
 //!   whatever its native unit of atomicity is.
 //! - **Cached scalars** (`last_index`, `last_term`,
-//!   `snap_last_index`, `snap_last_term`) are reads the worker
-//!   hits on every loop iteration; an impl is free to cache
-//!   these in memory and only consult disk on
+//!   `snap_last_index`, `snap_last_term`) are sync reads; an impl
+//!   is free to cache them in memory and only consult disk on
 //!   [`Storage::load_meta`] / [`Storage::commit_batch`].
 
 use alloc::vec::Vec;
@@ -87,11 +86,10 @@ pub struct WriteBatch<N: NodeId> {
     /// the active config when the leader compacts past the
     /// last `ConfigChange` entry.
     ///
-    /// The worker writes this whenever it adopts a new
-    /// `effective_cfg` (joint append, joint finalize, follower
-    /// receiving a `ConfigChange` in `AppendEntries`, follower
-    /// installing a snapshot). Backends that do persist it can
-    /// surface the value at restart via [`Storage::active_config`].
+    /// The core writes this whenever its membership view changes (a
+    /// joint or final configuration appended or received, a snapshot
+    /// installed). Backends that do persist it surface the value at
+    /// restart via [`Storage::active_config`].
     pub active_config: Option<ActiveConfigRecord<N>>,
 }
 
@@ -117,9 +115,8 @@ impl<N: NodeId> Default for WriteBatch<N> {
 /// ships a [`MemStorage`] for tests; vos provides a redb-backed
 /// impl in its own module.
 ///
-/// `last_*` / `snap_last_*` are sync — they're hot-path reads
-/// the worker checks on every loop iteration, and an
-/// implementation is expected to keep them in memory. The
+/// `last_*` / `snap_last_*` are sync, and an implementation is
+/// expected to keep them in memory. The
 /// random-access + write methods are `async fn` so an embedded
 /// SPI-flash impl can yield while the bus transfers bytes.
 pub trait Storage<N: NodeId>: Send + 'static {

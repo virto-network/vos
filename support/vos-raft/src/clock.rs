@@ -57,6 +57,10 @@ pub trait Clock: Send + Sync + 'static {
     /// the host's executor decides how to park the task — we
     /// don't spawn anything.
     fn sleep_until(&self, deadline: Self::Instant) -> Self::Sleep;
+
+    /// Whole milliseconds from `earlier` to `later`; 0 if `later` is not
+    /// after it.
+    fn millis_since(&self, earlier: Self::Instant, later: Self::Instant) -> u64;
 }
 
 /// 64-bit RNG. The worker only uses it to jitter election
@@ -142,6 +146,10 @@ impl Clock for StdClock {
 
     fn sleep_until(&self, deadline: Self::Instant) -> Self::Sleep {
         StdSleep::new(deadline)
+    }
+
+    fn millis_since(&self, earlier: Self::Instant, later: Self::Instant) -> u64 {
+        later.saturating_duration_since(earlier).as_millis() as u64
     }
 }
 
@@ -279,6 +287,10 @@ impl Clock for TokioClock {
 
     fn sleep_until(&self, deadline: Self::Instant) -> Self::Sleep {
         tokio::time::sleep_until(deadline)
+    }
+
+    fn millis_since(&self, earlier: Self::Instant, later: Self::Instant) -> u64 {
+        later.saturating_duration_since(earlier).as_millis() as u64
     }
 }
 

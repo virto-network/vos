@@ -1,131 +1,74 @@
 # vos-raft
 
-Transport- and storage-agnostic Raft consensus core. `no_std + alloc`
-compatible, async by default, runtime-agnostic. Designed to live
-next to whatever transport (libp2p, tarpc, raw TCP, an embedded
-radio) and whatever persistence layer (redb, sled, an MCU flash
-log, an in-memory hash map for tests) the host runs.
+Raft consensus as a protocol core without I/O, plus a driver that runs
+one replica of it.
 
-## Positioning vs `openraft`
+- **`core::Core`** (`no_std + alloc`): one replica of one group as a
+  state machine. The host feeds it events and carries out the actions it
+  returns. It reads no clock, spawns nothing and does no I/O, so one host
+  can drive thousands of groups on whatever executor it has.
+- **`Worker` / `WorkerHandle`** (`std`): a driver for one replica over a
+  `Storage`, a `Transport`, a `Clock` and an `ApplySink`. It also streams
+  snapshots, which the core leaves to its host.
+- **`sim`** (`std`): a deterministic simulator — groups of cores over a
+  simulated network and stores with drops, duplicates, delays, partitions
+  and crashes that lose unsynced writes — checked for Raft's safety
+  properties. Every run is seeded and replays exactly.
 
-`openraft` is a mature, battle-tested Raft library — it has live
-snapshot streaming, learners, joint consensus, observability, and
-years of production use. It is also tightly bound to `tokio` and
-requires `std`.
+Features: pre-vote, check-quorum, leadership transfer, linearizable reads
+(`read_index`), joint-consensus membership changes, chunked snapshot
+streaming, and log compaction.
 
-`vos-raft` is positioned differently: a smaller, runtime-agnostic
-core for hosts that need consensus on a non-tokio executor — Embassy
-on a microcontroller, a deterministic simulator, an `async-std` or
-`smol` host. It is **not feature-equivalent** to `openraft` (no
-joint consensus, no learners, no chunked snapshot streaming yet).
+## The core's contract
 
-| Property                          | `openraft`              | `vos-raft`                          |
-|-----------------------------------|-------------------------|-------------------------------------|
-| Async runtime                     | `tokio` (required)      | runtime-agnostic                    |
-| `no_std + alloc` compatible       | no                      | yes                                 |
-| Worker driver                     | `tokio::spawn`'d task   | single future, host drives it       |
-| Pluggable clock                   | no (uses `tokio::time`) | yes (`Clock` trait)                 |
-| Pluggable RNG                     | no                      | yes (`Rng` trait)                   |
-| Pluggable apply-notification sink | various                 | yes (`ApplySink` trait)             |
-| Storage trait shape               | many small methods      | atomic `WriteBatch`                 |
-| Required deps (no_std mode)       | n/a                     | core + alloc only                   |
-| Pre-vote (term-stability)         | yes                     | yes (`Config::pre_vote`)            |
-| Linearizable reads (`read_index`) | yes                     | yes (`WorkerHandle::read_index`)    |
-| Joint consensus                   | yes                     | yes (`WorkerHandle::change_membership`) |
-| Chunked snapshot streaming        | yes                     | yes (`Config::install_snapshot_chunk_bytes`) |
-| Production maturity               | high                    | first carve-out                     |
+Events in: `tick(now)`, `receive(from, message)`, `propose`, `read_index`,
+`change_membership`, `transfer_leadership`, and the host's reports —
+`durable(seq)`, `loaded(load, entries)`, `snapshot_installed`,
+`snapshot_failed`, `durably_applied`, `compacted`, `writer_health`,
+`peer_alive`.
 
-The core worker — `run_worker(...).await` — is one async future with
-no internal task spawning. The host's executor (tokio, embassy,
-async-std, a deterministic simulator) drives it however it likes.
+Actions out (`take_actions()`), carried out in order:
 
-## Honest disclosure: thread spawning in std defaults
+- `Write`: an ordered, atomic write (truncate, append, then the meta and
+  configuration rows). The host reports each one with `durable(seq)` once
+  it is on disk; `sync` asks for an fsync before the report.
+- `Send`: a one-way message to a peer.
+- `LoadEntries`: entries the core no longer caches; answered with
+  `loaded`.
+- `Committed`: entries through this index may be applied.
+- `SendSnapshot`: stream a snapshot to a peer that needs one.
+- `CompactBound`: the log may be compacted through this index.
+- `Answer`: the outcome of a proposal, read or membership change.
+- `Changed`: the term, role or known leader changed.
 
-The std-feature defaults trade some thread spawns for simplicity:
+Writes follow etcd's asynchronous-storage-writes rules. A replica
+acknowledges only what is durable and agrees with the leader's log. It
+applies nothing beyond what it has verified. It answers at a new term,
+or grants a vote, only once that term or vote is durable. A leader
+counts its own log toward a commit only once it is durable.
 
-- `Worker::spawn` spawns a dedicated thread that runs
-  `futures_executor::block_on(run_worker(...))`. Convenience
-  shim — embedded hosts skip this and call `run_worker` on
-  their own executor directly.
-- `StdClock::sleep_until` spawns a per-`Delay` helper thread
-  that calls `std::thread::sleep` and wakes the parent task.
-  This avoids `futures-timer`'s shared-timer-wheel contention
-  under heavy `cargo test` parallelism but is wasteful at
-  scale. **Production tokio-native deployments should enable
-  the `tokio` feature and use `TokioClock` via
-  [`Worker::spawn_with_tokio_runtime`]** — that helper runs
-  the worker future on a tokio current-thread runtime
-  (`enable_time()` set), which `TokioClock`'s `Sleep` requires.
-  Plain [`Worker::spawn_with`] uses `futures-executor` and
-  panics on the first `TokioClock` poll because it has no
-  timer driver.
-- vos's `VosTransport` (in the `vos` crate, not here) spawns a
-  helper thread per outbound RPC to bridge libp2p's sync reply
-  channel to an async future.
+## The driver
 
-The core itself does not spawn anything; thread spawns are
-introduced by the std-feature convenience layer.
+`Worker::spawn` runs a replica on its own thread
+(`Worker::spawn_with_tokio_runtime` for `TokioClock`); `run_worker` runs
+it as one future on the host's executor. Each round hands the core
+everything already in the inbox, so a burst of proposals or appends
+becomes one write. A store that returns `Err` stops the worker: it
+cannot know what reached the disk. Its handles then report it stopped.
 
-### Picking a `Clock` impl
+`Transport::send(from, to, envelope)` is one-way and must not block;
+deliver what arrives with `WorkerHandle::deliver(from, envelope)`.
 
-| Host                    | Recommended `Clock`               | How to drive                                          |
-|-------------------------|-----------------------------------|-------------------------------------------------------|
-| tokio                   | `TokioClock` (`tokio` feature)    | `Worker::spawn_with_tokio_runtime(...)` — builds a current-thread runtime on the worker thread with `enable_time()` |
-| Embassy / no_std        | Your own (e.g. `embassy_time::Timer` wrapper) | Call `run_worker(...).await` on Embassy's executor    |
-| async-std / smol / quick smoke | `StdClock` (default)       | `Worker::spawn(...)` / `Worker::spawn_with(...)` — uses `futures-executor` |
-| Deterministic simulator | Your own (virtual clock)          | Drive `run_worker` manually under your test harness   |
+## Storage atomicity
 
-## API surface
+`Storage::commit_batch` applies a `WriteBatch` atomically, in this
+order: `truncate_after`, `compact_to`, `appends`, `state`, `meta`,
+`active_config`. A crash leaves the pre-batch or the post-batch state,
+never a mix. `MemStorage` is the in-memory backend for tests.
 
-```rust
-use vos_raft::{
-    ApplySink, Clock, Config, Rng, Storage, Transport,
-    StdClock, StdRng,        // std-feature defaults
-    MemStorage,              // in-memory test backend
-};
+## std and no_std
 
-// Async traits — implementations live in the host crate.
-pub trait Storage<N: NodeId>: Send + 'static { /* async fn ... */ }
-pub trait Transport<N: NodeId>: Send + Sync + 'static { /* async fn ... */ }
-pub trait Clock: Send + Sync + 'static { /* async fn sleep_until ... */ }
-pub trait Rng: Send + 'static { fn next_u64(&mut self) -> u64; }
-pub trait ApplySink: Send + 'static { fn notify(&self, commit_index: u64); }
-```
-
-`Config<N>`, `WorkerSnapshot<N>`, and `ProposeError` are
-`#[non_exhaustive]` — construct `Config` via `Config::new(me,
-members, replication_id)` and match `ProposeError` with a
-wildcard arm so future variants don't break callers.
-
-## std vs no_std
-
-- `default = ["std"]` enables the `Worker::spawn` thread-spawning
-  convenience, `StdClock` / `StdRng`, and the
-  `ApplySink for std::sync::mpsc::Sender<u64>` impl.
-- `default-features = false` keeps only the data types (`Config`,
-  `LogEntry`, `Meta`, `Role`, RPC structs), the `Storage` /
-  `Transport` / `Clock` / `Rng` / `ApplySink` trait definitions,
-  and `MemStorage`. Embedded hosts implement these against
-  Embassy primitives and drive `run_worker(...).await` on their
-  own executor.
-
-Verified `cargo build --no-default-features --target …`:
-- `thumbv7em-none-eabihf` (Cortex-M4F, e.g. an STM32)
-- `riscv32imc-unknown-none-elf`
-
-## Atomicity contract
-
-Storage writes batch through `WriteBatch<N>`. The implementation
-applies the populated fields in a single atomic unit, in this
-order:
-
-1. `truncate_after`  (drop divergent tail)
-2. `compact_to`      (drop head, advance snap pointer)
-3. `appends`         (write the leader's authoritative tail)
-4. `state`           (replace materialized state row)
-5. `meta`            (replace durable scalars)
-
-A crash mid-batch leaves either the pre-batch or the post-batch
-state on disk, never a partial mix. Concrete backends compose
-this into a redb transaction, a flash erase-program cycle, or
-whatever their native unit of atomicity is.
+`default = ["std"]` adds the driver, `StdClock` / `StdRng`, the simulator
+and `ApplySink for std::sync::mpsc::Sender<u64>`. `tokio` adds
+`TokioClock`. With `default-features = false`, the core, the messages,
+the data types and the traits compile on `core + alloc`.

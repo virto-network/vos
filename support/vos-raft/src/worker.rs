@@ -1,139 +1,35 @@
-//! Per-replication-group Raft worker — async, runtime-agnostic.
+//! A driver for one replica: runs the protocol core ([`crate::core::Core`])
+//! on an async executor with a [`Storage`], a [`Transport`] and a [`Clock`].
+//! It carries out the core's writes in order, sends its messages, loads the
+//! entries it asks for, and streams snapshots, which the core leaves to its
+//! host. Hosts that drive many groups (the VOS node) drive the core
+//! themselves.
 //!
-//! The worker is a single async future that loops over four
-//! signal sources via `futures::select!`:
-//!
-//! 1. **Inbox** (`futures_channel::mpsc::UnboundedReceiver`) —
-//!    [`RaftMsg`] messages from external callers (RPC handlers,
-//!    proposes, snapshot queries, shutdown).
-//! 2. **Election timer** ([`Clock::sleep_until`]) — fires when
-//!    the current `election_deadline` expires; promotes a
-//!    Follower to Candidate or makes a Leader send heartbeats.
-//! 3. **In-flight outbound RPCs** (`FuturesUnordered`) — every
-//!    `transport.send_*()` future the worker emits parks here
-//!    until the peer (or the transport's own timeout) replies.
-//!    Completed futures inject their results back into the
-//!    state machine via the `handle_*_response` paths.
-//! 4. **Cooperative yield** — none required; the loop is
-//!    naturally yielding because every storage / transport call
-//!    is async.
-//!
-//! No threads spawned. No runtime selected. The host driving
-//! this future picks the executor (tokio, embassy, async-std,
-//! a deterministic simulator). The std-feature
-//! [`Worker::spawn`] convenience runs the future on a dedicated
-//! thread using the `futures-executor` crate as a tiny
-//! single-task executor — fine for vos's use case but not
-//! mandatory.
+//! A storage error stops the worker: the core keeps no rollback, and a write
+//! that may have half-happened cannot be retried as if it had not.
 
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::future::Future;
-use core::pin::Pin;
 use core::sync::atomic::{AtomicU8, Ordering};
 use core::time::Duration;
 
 use futures_channel::mpsc as fmpsc;
 use futures_channel::oneshot;
 use futures_util::FutureExt;
-use futures_util::stream::{FuturesUnordered, StreamExt};
+use futures_util::stream::StreamExt;
 
 use crate::clock::{ApplySink, Clock, Rng};
 use crate::config::{Config, NodeId};
-use crate::log_entry::LogEntry;
+use crate::core::{Action, Answer, Core, Recovered, SnapshotConfiguration, Status};
+pub use crate::core::{ChangeMembershipError, ProposeError, ReadIndexError};
 use crate::meta::Meta;
 use crate::role::Role;
-use crate::rpc::{
-    AppendEntriesReq, AppendEntriesResp, InstallSnapshotReq, InstallSnapshotResp, PreVoteReq,
-    PreVoteResp, RequestVoteReq, RequestVoteResp,
-};
-use crate::storage::{ActiveConfigRecord, Storage, WriteBatch};
-use crate::transport::Transport;
-
-/// Reasons a [`WorkerHandle::propose`] can fail.
-///
-/// `#[non_exhaustive]` because new failure modes (timeout,
-/// channel-closed, fatal-storage-error) will land in minor
-/// versions; callers should match with a wildcard.
-#[derive(Debug)]
-#[non_exhaustive]
-pub enum ProposeError {
-    /// This worker is currently `Follower` or `Candidate`. The
-    /// caller must retry against the cluster's leader.
-    NotLeader,
-    /// Storage write failed on the append. The error payload is
-    /// erased to `()` because the worker doesn't carry the
-    /// storage error type out — match the unit value or use a
-    /// wildcard. (The host's storage layer typically logs the
-    /// underlying error before the worker sees it.)
-    Storage(()),
-}
-
-/// Reasons a [`WorkerHandle::read_index`] can fail.
-///
-/// `read_index` is the leader's linearizable-read primitive: it
-/// returns the leader's `commit_index` once a quorum has confirmed
-/// leadership at the current term after the request arrived. The
-/// caller then waits for its own apply progress to reach that
-/// index before serving the read.
-#[derive(Debug)]
-#[non_exhaustive]
-pub enum ReadIndexError {
-    /// This worker isn't a leader. Address the cluster's leader
-    /// instead.
-    NotLeader,
-    /// We were leader at request time but stepped down before a
-    /// quorum could confirm. Caller should retry against the new
-    /// leader.
-    LeaderStepped,
-    /// The leader has too many in-flight read_index requests
-    /// queued (see [`Config::max_pending_reads`]). Caller
-    /// should retry shortly. A persistent stream of this error
-    /// usually indicates an asymmetric partition: the leader
-    /// receives proposes but its heartbeats can't quorum-confirm,
-    /// so the queue grows.
-    ///
-    /// [`Config::max_pending_reads`]: crate::Config::max_pending_reads
-    Backpressure,
-    /// The caller's bounded read barrier expired before a current-term quorum
-    /// confirmation arrived. The worker removes the request from its pending
-    /// queue before returning this error.
-    TimedOut,
-}
-
-/// Reasons a [`WorkerHandle::change_membership`] can fail.
-///
-/// Membership changes follow Ongaro thesis §4.3 (joint
-/// consensus): the leader appends a joint `ConfigChange` entry
-/// (`joint_old = current`, `members = new`); once that entry
-/// commits, the leader auto-appends a final non-joint
-/// `ConfigChange` (`joint_old = None`, `members = new`); once
-/// THAT commits, the new membership is steady-state.
-#[derive(Debug)]
-#[non_exhaustive]
-pub enum ChangeMembershipError {
-    /// This worker isn't a leader. Forward the request to the
-    /// cluster's leader.
-    NotLeader,
-    /// Another joint config-change is already in flight. Wait
-    /// for it to commit before issuing another one (Raft
-    /// permits at most one config change at a time).
-    InProgress,
-    /// `new_members` was empty. A cluster needs at least one
-    /// voter; an empty configuration would never elect.
-    EmptyConfig,
-    /// Storage append failed. The error payload is erased to
-    /// `()` because the worker doesn't carry the storage
-    /// error type out — match `ProposeError::Storage(())`.
-    Storage(()),
-}
+use crate::rpc::{InstallSnapshotReq, InstallSnapshotResp};
+use crate::storage::{Storage, WriteBatch};
+use crate::transport::{Envelope, Transport};
 
 /// Diagnostic snapshot of a worker's state.
-///
-/// `#[non_exhaustive]` because future commits will surface
-/// additional state (leader-hint, in-flight RPCs) — construction
-/// is internal-only and consumers should always match with `..`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct WorkerSnapshot<N: NodeId> {
@@ -142,82 +38,64 @@ pub struct WorkerSnapshot<N: NodeId> {
     pub voted_for: Option<N>,
     pub last_log_index: u64,
     pub commit_index: u64,
-    /// Highest log index that has been compacted into the
-    /// snapshot. `0` when no compaction has happened yet.
+    /// Highest log index compacted into the snapshot; 0 before any.
     pub snap_last_index: u64,
-    /// The active member set this replica is operating against.
-    /// During a joint-consensus phase this is the *new* set
-    /// (`joint_old` carries the prior one); during steady state
-    /// this is the only set.
+    /// Highest index this replica holds durably.
+    pub durable_index: u64,
+    /// The member set this replica operates against; during a joint phase
+    /// the new set, with `joint_old` the prior one.
     pub members: Vec<N>,
-    /// Joint-consensus indicator. `Some(prev_members)` while a
-    /// configuration change is in flight; `None` in steady state.
     pub joint_old: Option<Vec<N>>,
-    /// Log or snapshot index that established `members`/`joint_old`.
-    /// `None` means the storage backend could not supply durable provenance.
+    /// Log or snapshot index that established `members` and `joint_old`.
     pub active_config_index: Option<u64>,
-    /// Initial final-configuration index whose removed voters have not yet
-    /// been durably confirmed as notified. `None` means either no voter was
-    /// removed or the replicated retirement-confirmation row has committed.
+    /// The final configuration whose removed voters have not all been
+    /// confirmed as notified.
     pub retirement_final_index: Option<u64>,
-    /// Best-effort hint at who the current leader is. Updated
-    /// from observed `AppendEntries` (leader self-identifies).
-    /// `None` when the replica hasn't seen a leader since the
-    /// last term change. Followers use this to redirect clients
-    /// addressing them by mistake.
+    /// The leader this replica last heard from at its term.
     pub leader_hint: Option<N>,
 }
 
-/// Inbound message processed by the worker loop.
-///
-/// `#[non_exhaustive]` on the enum so we can grow new RPC kinds
-/// (e.g., a future `PreVote`, learner-add/remove, leader-transfer)
-/// without breaking callers. The variant payloads include
-/// `oneshot::Sender<…>` from `futures-channel`, so the enum
-/// itself is internal protocol — most code should not match on
-/// it directly. Use `WorkerHandle::handle_inbound_*` /
-/// [`WorkerHandle::propose`] instead.
-#[allow(dead_code)]
+impl<N: NodeId> From<Status<N>> for WorkerSnapshot<N> {
+    fn from(status: Status<N>) -> Self {
+        Self {
+            role: status.role,
+            current_term: status.current_term,
+            voted_for: status.voted_for,
+            last_log_index: status.last_log_index,
+            commit_index: status.commit_index,
+            snap_last_index: status.snap_last_index,
+            durable_index: status.durable_index,
+            members: status.members,
+            joint_old: status.joint_old,
+            active_config_index: status.active_config_index,
+            retirement_final_index: status.retirement_final_index,
+            leader_hint: status.leader_hint,
+        }
+    }
+}
+
+/// A message to the worker.
 #[non_exhaustive]
 pub enum RaftMsg<N: NodeId> {
-    AppendEntries {
+    /// Something a peer sent.
+    Deliver {
         from: N,
-        req: AppendEntriesReq<N>,
-        reply: oneshot::Sender<AppendEntriesResp>,
+        envelope: Envelope<N>,
     },
-    RequestVote {
-        from: N,
-        req: RequestVoteReq<N>,
-        reply: oneshot::Sender<RequestVoteResp>,
-    },
-    PreVote {
-        from: N,
-        req: PreVoteReq<N>,
-        reply: oneshot::Sender<PreVoteResp>,
-    },
-    InstallSnapshot {
-        from: N,
-        req: InstallSnapshotReq<N>,
-        reply: oneshot::Sender<InstallSnapshotResp>,
-    },
-    /// Append a new entry to the leader's log.
     Propose {
         payload: Vec<u8>,
         reply: oneshot::Sender<Result<u64, ProposeError>>,
     },
-    /// Linearizable-read index request. Resolves to the leader's
-    /// `commit_index` after a heartbeat round to quorum confirms
-    /// leadership at the current term.
     ReadIndex {
         timeout: Option<Duration>,
         reply: oneshot::Sender<Result<u64, ReadIndexError>>,
     },
-    /// Begin a membership change. Leader appends a joint
-    /// `ConfigChange` entry; once that entry commits, the leader
-    /// appends the final non-joint `ConfigChange` automatically.
     ChangeMembership {
         new_members: Vec<N>,
         reply: oneshot::Sender<Result<u64, ChangeMembershipError>>,
+    },
+    TransferLeadership {
+        to: Option<N>,
     },
     QueryState {
         reply: oneshot::Sender<WorkerSnapshot<N>>,
@@ -225,15 +103,7 @@ pub enum RaftMsg<N: NodeId> {
     Shutdown,
 }
 
-/// Sender half of the worker inbox. Cheap to clone.
-///
-/// Opaque newtype around the underlying channel sender. Hidden
-/// so future commits can swap the channel impl
-/// (`futures-channel::mpsc` today, possibly an `embassy_sync`
-/// MPMC or a no_std-friendly `MsgSink` trait later) without
-/// breaking SemVer. Construct via [`Worker::handler`] /
-/// [`WorkerHandle::sender`]; the only public operations are
-/// [`Inbox::send`] and `Clone`.
+/// Sender half of the worker's inbox. Cheap to clone.
 pub struct Inbox<N: NodeId> {
     inner: fmpsc::UnboundedSender<RaftMsg<N>>,
 }
@@ -247,17 +117,12 @@ impl<N: NodeId> Clone for Inbox<N> {
 }
 
 impl<N: NodeId> Inbox<N> {
-    /// Send a message into the worker. `Err` only if the worker
-    /// has shut down (the receiver has been dropped).
-    // Preserve the unsent command for callers that need ownership recovery;
-    // snapshot commands intentionally carry a bounded chunk and membership.
+    /// Send a message into the worker; `Err` once it has stopped.
     #[allow(clippy::result_large_err)]
     pub fn send(&self, msg: RaftMsg<N>) -> Result<(), RaftMsg<N>> {
         self.inner.unbounded_send(msg).map_err(|e| e.into_inner())
     }
 }
-
-// ── std-only spawn helper ───────────────────────────────────
 
 struct PublishedWorkerStatus<N: NodeId> {
     snapshot: WorkerSnapshot<N>,
@@ -266,51 +131,39 @@ struct PublishedWorkerStatus<N: NodeId> {
 
 type SharedWorkerStatus<N> = Arc<std::sync::RwLock<Option<PublishedWorkerStatus<N>>>>;
 
-struct StatusInvalidationGuard<N: NodeId>(SharedWorkerStatus<N>);
+/// On the worker thread's exit, however it ends: no status, and no role
+/// but follower, since a stopped worker leads nothing.
+struct ExitGuard<N: NodeId> {
+    status: SharedWorkerStatus<N>,
+    role: Arc<AtomicU8>,
+}
 
-impl<N: NodeId> Drop for StatusInvalidationGuard<N> {
+impl<N: NodeId> Drop for ExitGuard<N> {
     fn drop(&mut self) {
-        if let Ok(mut status) = self.0.write() {
+        if let Ok(mut status) = self.status.write() {
             *status = None;
         }
+        self.role.store(Role::Follower.as_u8(), Ordering::Relaxed);
     }
 }
 
-/// Owning handle to a worker driven on a dedicated std thread.
-/// Drop or [`shutdown`] cleans up.
-///
-/// Embedded hosts skip this and call [`run_worker`] directly on
-/// their own executor.
+type InitSignal = Arc<(std::sync::Mutex<Option<bool>>, std::sync::Condvar)>;
+
+/// A worker driven on a dedicated thread. Drop or [`shutdown`] stops it.
 ///
 /// [`shutdown`]: Self::shutdown
-#[cfg(feature = "std")]
 pub struct Worker<N: NodeId> {
     inbox: Inbox<N>,
     role: Arc<AtomicU8>,
     status: SharedWorkerStatus<N>,
     join: Option<std::thread::JoinHandle<()>>,
-    /// Init signal: `None` while the worker is still trying to
-    /// load its persisted meta; `Some(true)` once
-    /// `Storage::load_meta` returned `Ok`; `Some(false)` if it
-    /// returned `Err` (the worker thread exits without joining
-    /// the cluster). Hosts wait on this via
-    /// [`Worker::wait_init`] — synchronous, no polling. The
-    /// `Err`'s payload isn't surfaced (carrying it would force
-    /// `S::Error` into `Worker`'s type parameters).
-    init: Arc<(std::sync::Mutex<Option<bool>>, std::sync::Condvar)>,
+    init: InitSignal,
 }
 
-#[cfg(feature = "std")]
 impl<N: NodeId> Worker<N> {
-    /// Spawn a worker thread for one replication group, driven
-    /// by a [`StdClock`](crate::StdClock) +
-    /// [`StdRng`](crate::StdRng). The thread runs a single-task
-    /// `futures_executor::block_on` over the worker future.
-    ///
-    /// `apply_notifier` optionally receives committed indices.
-    /// For embedded use or custom sinks, call
-    /// [`spawn_with`](Self::spawn_with) and pass any
-    /// [`ApplySink`].
+    /// Spawn a worker on a thread with a [`StdClock`](crate::StdClock) and
+    /// a [`StdRng`](crate::StdRng); `apply_notifier` receives commit
+    /// indices.
     pub fn spawn<S, T>(
         storage: S,
         transport: Arc<T>,
@@ -321,7 +174,6 @@ impl<N: NodeId> Worker<N> {
         S: Storage<N>,
         T: Transport<N>,
     {
-        // Select the concrete ApplySink while keeping `spawn_with` generic.
         match apply_notifier {
             Some(tx) => Self::spawn_with(
                 storage,
@@ -342,19 +194,10 @@ impl<N: NodeId> Worker<N> {
         }
     }
 
-    /// Like [`spawn`](Self::spawn) but with caller-supplied
-    /// [`Clock`], [`Rng`], and [`ApplySink`]. Useful for
-    /// deterministic simulators or embedded users with a custom
-    /// notification channel.
-    ///
-    /// **NOTE — this helper drives the worker future on
-    /// `futures-executor::block_on`, which has no timer driver.**
-    /// Clocks whose `Sleep` future requires an external runtime
-    /// (e.g. `TokioClock`'s `tokio::time::Sleep`) will panic on
-    /// the first poll. For tokio hosts use
-    /// [`spawn_with_tokio_runtime`](Self::spawn_with_tokio_runtime).
-    /// For Embassy / async-std / smol hosts, call
-    /// [`run_worker`] directly under your own executor.
+    /// Like [`spawn`](Self::spawn) with a caller's clock, randomness and
+    /// apply sink. It runs on `futures-executor`, which has no timer driver:
+    /// clocks whose sleeps need a runtime (tokio's) panic on first poll;
+    /// use `spawn_with_tokio_runtime` (feature `tokio`).
     pub fn spawn_with<S, T, C, R, A>(
         storage: S,
         transport: Arc<T>,
@@ -370,57 +213,13 @@ impl<N: NodeId> Worker<N> {
         R: Rng,
         A: ApplySink,
     {
-        let (tx, rx) = fmpsc::unbounded();
-        let role = Arc::new(AtomicU8::new(Role::Follower.as_u8()));
-        let role_for_thread = role.clone();
-        let status = Arc::new(std::sync::RwLock::new(None));
-        let status_for_thread = status.clone();
-        let init = Arc::new((
-            std::sync::Mutex::new(None::<bool>),
-            std::sync::Condvar::new(),
-        ));
-        let init_for_thread = init.clone();
-        let join = std::thread::Builder::new()
-            .name(alloc::format!("raft-worker-{:?}", cfg.me))
-            .spawn(move || {
-                let _status_guard = StatusInvalidationGuard(status_for_thread.clone());
-                let init_signal = move |ok: bool| {
-                    let mut g = init_for_thread.0.lock().unwrap();
-                    *g = Some(ok);
-                    init_for_thread.1.notify_all();
-                };
-                let _ = futures_executor::block_on(run_worker_with_status(
-                    storage,
-                    transport,
-                    cfg,
-                    rx,
-                    apply_sink,
-                    clock,
-                    rng,
-                    role_for_thread,
-                    status_for_thread,
-                    init_signal,
-                ));
-            })
-            .expect("spawn raft worker");
-        Self {
-            inbox: Inbox { inner: tx },
-            role,
-            status,
-            join: Some(join),
-            init,
-        }
+        Self::spawn_on(storage, transport, cfg, apply_sink, clock, rng, |future| {
+            let _ = futures_executor::block_on(future);
+        })
     }
 
-    /// Like [`spawn_with`] but drives the worker on a
-    /// dedicated tokio current-thread runtime (with the timer
-    /// driver enabled). Required when using
-    /// [`TokioClock`](crate::TokioClock), whose `Sleep` future
-    /// can't be polled on `futures-executor`.
-    ///
-    /// Requires the `tokio` feature.
-    ///
-    /// [`spawn_with`]: Self::spawn_with
+    /// Like [`spawn_with`](Self::spawn_with), on a tokio current-thread
+    /// runtime, as [`TokioClock`](crate::TokioClock) requires.
     #[cfg(feature = "tokio")]
     pub fn spawn_with_tokio_runtime<S, T, C, R, A>(
         storage: S,
@@ -437,30 +236,57 @@ impl<N: NodeId> Worker<N> {
         R: Rng,
         A: ApplySink,
     {
+        Self::spawn_on(storage, transport, cfg, apply_sink, clock, rng, |future| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("build a tokio current-thread runtime for the raft worker");
+            let _ = runtime.block_on(future);
+        })
+    }
+
+    fn spawn_on<S, T, C, R, A, F>(
+        storage: S,
+        transport: Arc<T>,
+        cfg: Config<N>,
+        apply_sink: A,
+        clock: C,
+        rng: R,
+        run: F,
+    ) -> Self
+    where
+        S: Storage<N>,
+        T: Transport<N>,
+        C: Clock,
+        R: Rng,
+        A: ApplySink,
+        F: FnOnce(
+                core::pin::Pin<
+                    alloc::boxed::Box<dyn core::future::Future<Output = Result<(), S::Error>>>,
+                >,
+            ) + Send
+            + 'static,
+    {
         let (tx, rx) = fmpsc::unbounded();
         let role = Arc::new(AtomicU8::new(Role::Follower.as_u8()));
         let role_for_thread = role.clone();
         let status = Arc::new(std::sync::RwLock::new(None));
         let status_for_thread = status.clone();
-        let init = Arc::new((
-            std::sync::Mutex::new(None::<bool>),
-            std::sync::Condvar::new(),
-        ));
+        let init: InitSignal = Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new()));
         let init_for_thread = init.clone();
         let join = std::thread::Builder::new()
             .name(alloc::format!("raft-worker-{:?}", cfg.me))
             .spawn(move || {
-                let _status_guard = StatusInvalidationGuard(status_for_thread.clone());
+                let _exit = ExitGuard {
+                    status: status_for_thread.clone(),
+                    role: role_for_thread.clone(),
+                };
                 let init_signal = move |ok: bool| {
-                    let mut g = init_for_thread.0.lock().unwrap();
-                    *g = Some(ok);
+                    let mut ready = init_for_thread.0.lock().unwrap();
+                    *ready = Some(ok);
                     init_for_thread.1.notify_all();
                 };
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_time()
-                    .build()
-                    .expect("build tokio current-thread runtime for raft worker");
-                let _ = rt.block_on(run_worker_with_status(
+                run(alloc::boxed::Box::pin(run_worker_with_status(
                     storage,
                     transport,
                     cfg,
@@ -471,7 +297,7 @@ impl<N: NodeId> Worker<N> {
                     role_for_thread,
                     status_for_thread,
                     init_signal,
-                ));
+                )));
             })
             .expect("spawn raft worker");
         Self {
@@ -483,32 +309,21 @@ impl<N: NodeId> Worker<N> {
         }
     }
 
-    /// Block until the worker has finished its persisted-meta
-    /// load attempt. Returns `Ok(())` if `Storage::load_meta`
-    /// succeeded (the worker is now running), `Err(())` if it
-    /// failed (the worker thread has exited; `S::Error` was
-    /// dropped — host-side logging captures the underlying
-    /// cause).
-    ///
-    /// ```text
-    /// let worker = Worker::spawn(storage, transport, cfg, None);
-    /// worker.wait_init().expect("raft init failed");
-    /// // ...the worker is now serving...
-    /// ```
+    /// Block until the worker has loaded its store: `Err` if that failed
+    /// and the worker stopped.
     #[allow(clippy::result_unit_err)]
     pub fn wait_init(&self) -> Result<(), ()> {
-        let mut g = self.init.0.lock().unwrap();
-        while g.is_none() {
-            g = self.init.1.wait(g).unwrap();
+        let mut ready = self.init.0.lock().unwrap();
+        while ready.is_none() {
+            ready = self.init.1.wait(ready).unwrap();
         }
-        match *g {
-            Some(true) => Ok(()),
-            Some(false) => Err(()),
-            None => unreachable!("loop guarantees Some"),
+        if *ready == Some(true) {
+            Ok(())
+        } else {
+            Err(())
         }
     }
 
-    /// Cheap clone-able handle.
     pub fn handler(&self) -> WorkerHandle<N> {
         WorkerHandle {
             inbox: self.inbox.clone(),
@@ -517,31 +332,30 @@ impl<N: NodeId> Worker<N> {
         }
     }
 
-    /// Lock-free read of the worker's current role.
     pub fn role(&self) -> Role {
         Role::from_u8(self.role.load(Ordering::Relaxed))
     }
 
-    /// Stop the worker and join the thread.
+    /// Stop the worker and join its thread.
     pub fn shutdown(mut self) {
+        self.stop();
+    }
+
+    fn stop(&mut self) {
         let _ = self.inbox.send(RaftMsg::Shutdown);
-        if let Some(j) = self.join.take() {
-            let _ = j.join();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
         }
     }
 }
 
-#[cfg(feature = "std")]
 impl<N: NodeId> Drop for Worker<N> {
     fn drop(&mut self) {
-        let _ = self.inbox.send(RaftMsg::Shutdown);
-        if let Some(j) = self.join.take() {
-            let _ = j.join();
-        }
+        self.stop();
     }
 }
 
-/// Cheap-to-clone handle for sending messages into the worker.
+/// A cheap-to-clone handle to a worker.
 #[derive(Clone)]
 pub struct WorkerHandle<N: NodeId> {
     inbox: Inbox<N>,
@@ -550,133 +364,67 @@ pub struct WorkerHandle<N: NodeId> {
 }
 
 impl<N: NodeId> WorkerHandle<N> {
-    /// Lock-free read of the worker's current role.
     pub fn role(&self) -> Role {
         Role::from_u8(self.role.load(Ordering::Relaxed))
     }
 
-    /// Non-blocking snapshot published after every completed state-machine
-    /// event. Unlike [`Self::snapshot`], this never enters the worker inbox,
-    /// so callers may safely use it for best-effort routing while the worker
-    /// is busy or stalled on storage.
+    /// The status published after the worker's last event, without
+    /// entering its inbox; `None` once it is stale or the worker stopped.
     pub fn cached_snapshot(&self) -> Option<WorkerSnapshot<N>> {
         let status = self.status.try_read().ok()?;
         let published = status.as_ref()?;
         (published.valid_until > std::time::Instant::now()).then(|| published.snapshot.clone())
     }
 
-    /// Cheap-to-clone sender for spawning helper tasks.
     pub fn sender(&self) -> Inbox<N> {
         self.inbox.clone()
     }
 
-    /// Diagnostic snapshot of the worker's current state.
-    /// `None` if the worker is shut down.
+    /// The worker's status once it has carried out everything sent to it
+    /// before (its writes durable, its answers sent); `None` once it
+    /// stopped.
     pub async fn snapshot(&self) -> Option<WorkerSnapshot<N>> {
         let (tx, rx) = oneshot::channel();
         self.inbox.send(RaftMsg::QueryState { reply: tx }).ok()?;
         rx.await.ok()
     }
 
-    /// Append a new payload to the cluster log.
+    /// Hand something a peer sent to the worker.
+    pub fn deliver(&self, from: N, envelope: Envelope<N>) {
+        let _ = self.inbox.send(RaftMsg::Deliver { from, envelope });
+    }
+
+    /// Append `payload`: its index, once in the leader's log.
     pub async fn propose(&self, payload: Vec<u8>) -> Result<u64, ProposeError> {
         let (tx, rx) = oneshot::channel();
         self.inbox
             .send(RaftMsg::Propose { payload, reply: tx })
-            .map_err(|_| ProposeError::NotLeader)?;
-        rx.await.unwrap_or(Err(ProposeError::NotLeader))
+            .map_err(|_| ProposeError::Stopped)?;
+        rx.await.unwrap_or(Err(ProposeError::Stopped))
     }
 
-    /// Request a linearizable-read index from the leader.
-    ///
-    /// On success, returns an index `R` such that any read of
-    /// the state machine at or above `last_applied >= R` is
-    /// linearizable: reflects every write committed before this
-    /// call was issued, and never sees data from a future
-    /// term's leader.
-    ///
-    /// Protocol (Ongaro thesis §6.4):
-    /// 1. Worker captures `R = commit_index` at request entry.
-    /// 2. Worker triggers a heartbeat round. Once a quorum has
-    ///    answered, at the current term, that round or a later one,
-    ///    and `match_index_majority_floor >= R`, the worker resolves
-    ///    the request with `Ok(R)`. Answers to rounds sent before the
-    ///    request do not count: they confirm leadership only as of
-    ///    an earlier time.
-    /// 3. If the worker steps down to Follower before quorum
-    ///    confirms, resolves with `Err(LeaderStepped)`.
-    /// 4. If the leader's pending-reads queue is at
-    ///    [`Config::max_pending_reads`], resolves with
-    ///    `Err(Backpressure)`.
-    /// 5. [`Self::read_index_with_timeout`] additionally removes the request
-    ///    from that queue and resolves with `Err(TimedOut)` when its worker
-    ///    clock deadline expires.
-    ///
-    /// Linearizability: a freshly-elected leader appends a
-    /// no-op `Data` entry in its current term as part of
-    /// promotion (Ongaro thesis §6.4); `read_index` therefore
-    /// can't return a `commit_index` pointing only at
-    /// prior-term state.
-    ///
-    /// [`Config::max_pending_reads`]: crate::Config::max_pending_reads
+    /// A linearizable read index: once this replica has applied through it,
+    /// a read reflects every write committed before the call.
     pub async fn read_index(&self) -> Result<u64, ReadIndexError> {
-        let (tx, rx) = oneshot::channel();
-        self.inbox
-            .send(RaftMsg::ReadIndex {
-                timeout: None,
-                reply: tx,
-            })
-            .map_err(|_| ReadIndexError::NotLeader)?;
-        rx.await.unwrap_or(Err(ReadIndexError::NotLeader))
+        self.read(None).await
     }
 
-    /// Request a linearizable-read index with a worker-owned timeout.
-    ///
-    /// Expiry is processed inside the worker loop, which removes the request
-    /// from `pending_read_index` before returning [`ReadIndexError::TimedOut`].
-    /// This is intentionally stronger than racing [`Self::read_index`] against
-    /// a caller-side timer: dropping only the receiving future would leave a
-    /// dead request consuming the worker's bounded queue.
+    /// As [`Self::read_index`], given up after `timeout` on the worker's
+    /// clock.
     pub async fn read_index_with_timeout(&self, timeout: Duration) -> Result<u64, ReadIndexError> {
-        let (tx, rx) = oneshot::channel();
-        self.inbox
-            .send(RaftMsg::ReadIndex {
-                timeout: Some(timeout),
-                reply: tx,
-            })
-            .map_err(|_| ReadIndexError::NotLeader)?;
-        rx.await.unwrap_or(Err(ReadIndexError::NotLeader))
+        self.read(Some(timeout)).await
     }
 
-    /// Begin a cluster-membership change to `new_members`
-    /// (Ongaro thesis §4.3). Internally:
-    ///
-    /// 1. The leader appends a joint `ConfigChange` entry whose
-    ///    `joint_old` is the current member set and `members` is
-    ///    `new_members`. The leader immediately starts using the
-    ///    joint configuration for quorum decisions.
-    /// 2. Once that entry commits (a quorum from BOTH the old
-    ///    and the new sets), the leader auto-appends a final
-    ///    non-joint `ConfigChange { joint_old: None, members:
-    ///    new_members }`.
-    /// 3. Once that entry commits (quorum from the NEW set),
-    ///    the cluster is on the new configuration; old members
-    ///    that aren't in `new_members` can shut down.
-    ///
-    /// Returns the index of the joint entry on success — the
-    /// caller can poll [`WorkerHandle::snapshot`] for
-    /// `commit_index >= that_index` to know when the joint phase
-    /// has committed.
-    ///
-    /// **Restrictions:**
-    /// - One in-flight change at a time. The second concurrent
-    ///   `change_membership` returns `InProgress`.
-    /// - `new_members` must be non-empty and must include `me`
-    ///   if the local replica is meant to remain a voter — Raft
-    ///   tolerates the leader removing itself, but in that case
-    ///   the leader will step down once the final non-joint
-    ///   entry commits and the next leader takes over from the
-    ///   new set.
+    async fn read(&self, timeout: Option<Duration>) -> Result<u64, ReadIndexError> {
+        let (tx, rx) = oneshot::channel();
+        self.inbox
+            .send(RaftMsg::ReadIndex { timeout, reply: tx })
+            .map_err(|_| ReadIndexError::Stopped)?;
+        rx.await.unwrap_or(Err(ReadIndexError::Stopped))
+    }
+
+    /// Change membership to `new_members` by joint consensus: the index of
+    /// the joint entry.
     pub async fn change_membership(
         &self,
         new_members: Vec<N>,
@@ -687,815 +435,425 @@ impl<N: NodeId> WorkerHandle<N> {
                 new_members,
                 reply: tx,
             })
-            .map_err(|_| ChangeMembershipError::NotLeader)?;
-        rx.await.unwrap_or(Err(ChangeMembershipError::NotLeader))
+            .map_err(|_| ChangeMembershipError::Stopped)?;
+        rx.await.unwrap_or(Err(ChangeMembershipError::Stopped))
     }
 
-    /// Inbound `AppendEntries` from a peer.
-    pub async fn handle_inbound_append(
-        &self,
-        from: N,
-        req: AppendEntriesReq<N>,
-    ) -> AppendEntriesResp {
-        let (tx, rx) = oneshot::channel();
-        let term = req.term;
-        if self
-            .inbox
-            .send(RaftMsg::AppendEntries {
-                from,
-                req,
-                reply: tx,
-            })
-            .is_err()
-        {
-            return AppendEntriesResp {
-                term,
-                success: false,
-                match_index: 0,
-            };
-        }
-        rx.await.unwrap_or(AppendEntriesResp {
-            term,
-            success: false,
-            match_index: 0,
-        })
-    }
-
-    /// Inbound `RequestVote` from a peer.
-    pub async fn handle_inbound_vote(&self, from: N, req: RequestVoteReq<N>) -> RequestVoteResp {
-        let (tx, rx) = oneshot::channel();
-        let term = req.term;
-        if self
-            .inbox
-            .send(RaftMsg::RequestVote {
-                from,
-                req,
-                reply: tx,
-            })
-            .is_err()
-        {
-            return RequestVoteResp {
-                term,
-                vote_granted: false,
-            };
-        }
-        rx.await.unwrap_or(RequestVoteResp {
-            term,
-            vote_granted: false,
-        })
-    }
-
-    /// Inbound `PreVote` from a would-be candidate. Replies
-    /// `vote_granted = true` only if our log is at least as
-    /// stale as the requester's claimed log AND we haven't
-    /// heard from a leader recently. Does NOT mutate
-    /// `voted_for` or `current_term`.
-    pub async fn handle_inbound_prevote(&self, from: N, req: PreVoteReq<N>) -> PreVoteResp {
-        let (tx, rx) = oneshot::channel();
-        let term = req.next_term;
-        if self
-            .inbox
-            .send(RaftMsg::PreVote {
-                from,
-                req,
-                reply: tx,
-            })
-            .is_err()
-        {
-            return PreVoteResp {
-                term,
-                vote_granted: false,
-            };
-        }
-        rx.await.unwrap_or(PreVoteResp {
-            term,
-            vote_granted: false,
-        })
-    }
-
-    /// Inbound `InstallSnapshot` from a peer.
-    pub async fn handle_inbound_install(
-        &self,
-        from: N,
-        req: InstallSnapshotReq<N>,
-    ) -> InstallSnapshotResp {
-        let (tx, rx) = oneshot::channel();
-        let term = req.term;
-        if self
-            .inbox
-            .send(RaftMsg::InstallSnapshot {
-                from,
-                req,
-                reply: tx,
-            })
-            .is_err()
-        {
-            return InstallSnapshotResp {
-                term,
-                bytes_received: 0,
-            };
-        }
-        rx.await.unwrap_or(InstallSnapshotResp {
-            term,
-            bytes_received: 0,
-        })
+    /// Hand leadership to `to`, or to the most up-to-date member.
+    pub fn transfer_leadership(&self, to: Option<N>) {
+        let _ = self.inbox.send(RaftMsg::TransferLeadership { to });
     }
 }
 
-// ── Internal state ──────────────────────────────────────────
+// ── The driver ─────────────────────────────────────────────
 
-/// Per-follower replication bookkeeping.
-#[derive(Debug, Clone)]
-struct LeaderState<N: NodeId> {
-    next_index: BTreeMap<N, u64>,
-    match_index: BTreeMap<N, u64>,
-    /// Per-peer in-flight chunked snapshot tracker. Present while
-    /// the leader is streaming chunks of a particular
-    /// `(last_included_index, last_included_term)` identity to
-    /// that peer; cleared on completion or on identity change
-    /// (e.g., if the leader has compacted past the in-flight
-    /// snapshot's index, it abandons the older stream and starts
-    /// a new one). The `offset` field is the byte position of
-    /// the next chunk to send.
-    snapshot_send: BTreeMap<N, SnapshotSendState>,
-    /// Heartbeat rounds sent at this term, numbered from 1. Every
-    /// AppendEntries and InstallSnapshot carries the round that sent it.
-    round: u64,
-    /// The latest round each peer has answered at this term. A read
-    /// barrier confirms leadership only through answers to rounds sent
-    /// after it was queued: an answer to an earlier round proves nothing
-    /// about the time since.
-    acked_round: BTreeMap<N, u64>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct SnapshotSendState {
-    last_included_index: u64,
-    last_included_term: u64,
-    offset: u64,
-}
-
-/// Follower-side accumulator for a chunked `InstallSnapshot`.
-struct IncomingSnapshot<N: NodeId> {
-    /// Leader from whom the chunks are arriving. A different
-    /// leader's first chunk discards this buffer.
-    leader: N,
-    /// Term of the leader sending the chunks. A higher term in
-    /// any follow-up RPC discards this buffer.
+/// A snapshot this replica streams to a peer, one chunk in flight.
+struct Outgoing<N: NodeId> {
+    index: u64,
     term: u64,
-    last_included_index: u64,
-    last_included_term: u64,
-    /// Accumulated bytes (offsets `0..buffer.len()`).
-    buffer: alloc::vec::Vec<u8>,
+    configuration: Option<SnapshotConfiguration<N>>,
+    data: Arc<Vec<u8>>,
+    /// Bytes the peer acknowledged.
+    offset: u64,
+    /// When the chunk in flight was sent, on the core's clock.
+    sent_at: u64,
 }
 
-/// The cluster configuration the worker is currently operating
-/// under. `current` is the active member set; `joint_old`, when
-/// `Some`, marks a joint-consensus phase where quorum requires
-/// majorities from BOTH `joint_old` and `current`.
-#[derive(Debug, Clone)]
-struct ActiveConfig<N: NodeId> {
-    current: Vec<N>,
-    joint_old: Option<Vec<N>>,
+/// A snapshot this replica is receiving.
+struct Incoming<N: NodeId> {
+    leader: N,
+    term: u64,
+    index: u64,
+    index_term: u64,
+    buffer: Vec<u8>,
 }
 
-impl<N: NodeId> ActiveConfig<N> {
-    fn steady(members: Vec<N>) -> Self {
-        Self {
-            current: members,
-            joint_old: None,
-        }
-    }
-
-    fn is_joint(&self) -> bool {
-        self.joint_old.is_some()
-    }
-
-    /// Quorum size for `current` (majority).
-    fn quorum_current(&self) -> usize {
-        self.current.len() / 2 + 1
-    }
-
-    /// Quorum size for `joint_old`, if joint. `0` when not joint.
-    fn quorum_old(&self) -> usize {
-        self.joint_old
-            .as_ref()
-            .map(|m| m.len() / 2 + 1)
-            .unwrap_or(0)
-    }
-
-    /// Iterator over every member in the union of `current` and
-    /// `joint_old` (deduplicated). The leader sends heartbeats
-    /// to every member of this union — old voters that aren't
-    /// in `current` still need to receive entries (joint quorum)
-    /// until the joint phase commits and we move to non-joint.
-    fn all_members(&self) -> Vec<N> {
-        let mut seen: Vec<N> = self.current.clone();
-        if let Some(old) = &self.joint_old {
-            for &m in old {
-                if !seen.contains(&m) {
-                    seen.push(m);
-                }
-            }
-        }
-        seen
-    }
-
-    /// Is the predicate `pred` true for a quorum from BOTH the
-    /// current and (if joint) old configurations? Used by
-    /// `commit_index` advancement and election win checks.
-    fn quorum_holds<F: FnMut(N) -> bool>(&self, mut pred: F) -> bool {
-        let current_yes = self.current.iter().filter(|&&m| pred(m)).count();
-        if current_yes < self.quorum_current() {
-            return false;
-        }
-        if let Some(old) = &self.joint_old {
-            let old_yes = old.iter().filter(|&&m| pred(m)).count();
-            if old_yes < self.quorum_old() {
-                return false;
-            }
-        }
-        true
-    }
-
-    /// Floor of `score(m)` over a quorum of `current` AND (if
-    /// joint) `old`. Used by `match_index_majority_floor` to
-    /// compute the highest replicated index across both sets.
-    /// Returns `None` if the score function returns `None` for
-    /// any member, or if the active config is empty.
-    fn majority_floor<F: FnMut(N) -> u64>(&self, mut score: F) -> Option<u64> {
-        let mut current_scores: Vec<u64> = self.current.iter().map(|&m| score(m)).collect();
-        current_scores.sort_unstable_by(|a, b| b.cmp(a));
-        let q_cur = self.quorum_current();
-        if q_cur == 0 || q_cur > current_scores.len() {
-            return None;
-        }
-        let mut floor = current_scores[q_cur - 1];
-        if let Some(old) = &self.joint_old {
-            let mut old_scores: Vec<u64> = old.iter().map(|&m| score(m)).collect();
-            old_scores.sort_unstable_by(|a, b| b.cmp(a));
-            let q_old = self.quorum_old();
-            if q_old == 0 || q_old > old_scores.len() {
-                return None;
-            }
-            // Joint commit requires BOTH sets to reach the floor;
-            // the lower of the two governs.
-            floor = floor.min(old_scores[q_old - 1]);
-        }
-        Some(floor)
-    }
+struct Replies<N: NodeId> {
+    next: u64,
+    proposals: BTreeMap<u64, oneshot::Sender<Result<u64, ProposeError>>>,
+    reads: BTreeMap<u64, oneshot::Sender<Result<u64, ReadIndexError>>>,
+    changes: BTreeMap<u64, oneshot::Sender<Result<u64, ChangeMembershipError>>>,
+    _node: core::marker::PhantomData<N>,
 }
 
-impl<N: NodeId> LeaderState<N> {
-    fn fresh(members: &[N], me: N, last_log_index: u64) -> Self {
-        let next_index = members
-            .iter()
-            .copied()
-            .filter(|p| *p != me)
-            .map(|p| (p, last_log_index + 1))
-            .collect();
-        let match_index = members
-            .iter()
-            .copied()
-            .filter(|p| *p != me)
-            .map(|p| (p, 0u64))
-            .collect();
-        Self {
-            next_index,
-            match_index,
-            snapshot_send: BTreeMap::new(),
-            round: 0,
-            acked_round: BTreeMap::new(),
-        }
-    }
-}
-
-/// Outbound RPC future result. Each variant is what the worker
-/// would have received over the inbox in the pre-async design;
-/// here we just pull it straight from the future.
-enum RpcOutcome<N: NodeId> {
-    Append {
-        from: N,
-        result: Option<AppendEntriesResp>,
-        /// Commit index carried by the exact request that produced this
-        /// response. A retired peer has learned finality only after
-        /// acknowledging a request at or beyond its final config index.
-        leader_commit: u64,
-        round: u64,
-    },
-    Vote {
-        from: N,
-        result: Option<RequestVoteResp>,
-    },
-    PreVote {
-        from: N,
-        next_term: u64,
-        result: Option<PreVoteResp>,
-    },
-    Install {
-        from: N,
-        result: Option<InstallSnapshotResp>,
-        last_included_index: u64,
-        last_included_term: u64,
-        /// Byte offset of *this* chunk + bytes sent. The leader
-        /// uses the response's `bytes_received` against this to
-        /// decide whether to advance the cursor or back off.
-        chunk_end_offset: u64,
-        /// Whether this chunk was the final one. The response
-        /// handler only treats the install as complete (and
-        /// bumps `match_index` to `last_included_index`) when
-        /// `was_final = true`.
-        was_final: bool,
-        round: u64,
-    },
-}
-
-/// In-flight RPC future. Driven by [`FuturesUnordered`] inside
-/// the main loop's `select!`.
-type RpcFut<N> = Pin<Box<dyn Future<Output = RpcOutcome<N>> + Send>>;
-
-struct PendingReadIndex<I> {
-    required_index: u64,
-    /// The first heartbeat round sent after the request was queued.
-    round: u64,
-    deadline: Option<I>,
-    reply: oneshot::Sender<Result<u64, ReadIndexError>>,
-}
-
-struct WorkerState<N, S, T, C, R, A>
-where
-    N: NodeId,
-    S: Storage<N>,
-    T: Transport<N>,
-    C: Clock,
-    R: Rng,
-    A: ApplySink,
-{
+struct Driver<N: NodeId, S, T, A> {
+    me: N,
     storage: S,
     transport: Arc<T>,
-    cfg: Config<N>,
-    role: Role,
-    meta: Meta<N>,
-    election_deadline: C::Instant,
-    /// Wall-clock instant of the most recent successful
-    /// AppendEntries receipt from a current-term leader. `None`
-    /// until the first heartbeat lands. Used by the pre-vote
-    /// leader-check (refuse pre-vote only when we've heard from
-    /// a leader recently — distinct from "election deadline is
-    /// in the future", which is true for any fresh follower).
-    last_heartbeat_received: Option<C::Instant>,
-    votes_received: BTreeSet<N>,
-    leader: Option<LeaderState<N>>,
-    /// In-flight `read_index` requests waiting for a quorum
-    /// confirmation. A request resolves once a quorum has answered, at
-    /// the current term, a heartbeat round sent after it was queued, and
-    /// `match_index_majority_floor >= required_index`. Bounded requests
-    /// carry a worker-clock deadline and are removed when it expires.
-    pending_read_index: Vec<PendingReadIndex<C::Instant>>,
-    /// Follower-side accumulator for an in-flight chunked
-    /// `InstallSnapshot`. `None` between snapshot streams; `Some`
-    /// while chunks are arriving for a particular `(last_included_index,
-    /// last_included_term)` identity. A new identity from the
-    /// same leader supersedes the buffer; a stale identity is
-    /// rejected as a no-op.
-    incoming_snapshot: Option<IncomingSnapshot<N>>,
-    /// The effective cluster configuration the worker uses for
-    /// quorum decisions, vote counting, heartbeat targets, and
-    /// peer enumeration. Normally tracks the latest `ConfigChange` log entry
-    /// seen, even when uncommitted. One liveness-critical exception applies:
-    /// a leader being retired keeps the preceding joint view until its final
-    /// removal row commits, so a crash cannot leave the replacement with a
-    /// shorter log and neither node eligible to lead. This is a stricter
-    /// quorum than the speculative final view, never a weaker one. Falls back
-    /// to `cfg.members` when no `ConfigChange` has been seen.
-    ///
-    /// `current` is the membership the cluster transitions *to*;
-    /// `joint_old` is `Some(old)` while a joint configuration is
-    /// in flight (quorum requires majority from BOTH sets).
-    effective_cfg: ActiveConfig<N>,
-    /// Log index of the in-flight membership `ConfigChange` entry. While the
-    /// joint row is uncommitted, this points at that row; after the joint row
-    /// commits and the final row is appended, it points at the final row until
-    /// that row commits. `None` between transitions. Keeping both phases
-    /// explicit lets a retiring leader recover the joint quorum after a crash
-    /// without appending a duplicate final row.
-    pending_joint_entry: Option<u64>,
-    /// Peers removed by a final configuration that still need one decisive
-    /// commit notification. They remain transport targets only and never
-    /// contribute to quorum or vote calculations. The live joint/final log
-    /// pair reconstructs this map after a crash and remains uncompacted until
-    /// the acknowledgement is sealed by a committed confirmation row.
-    retiring_voters: BTreeMap<N, u64>,
-    /// Successful finality deliveries observed by this leader. Volatile by
-    /// design: they become durable only through the replicated confirmation
-    /// configuration appended after every retiring voter acknowledges.
-    retiring_voter_acks: BTreeSet<N>,
-    /// The replicated steady-config confirmation row, while it is not yet
-    /// committed. The original final row remains pinned until this commits.
-    retirement_confirmation_entry: Option<u64>,
-    /// Initial final-configuration row associated with the pending
-    /// retirement protocol. This is also set on the retiring replica itself,
-    /// where `retiring_voters` is empty, so hosts know to keep its private
-    /// Raft endpoint alive until confirmation commits.
-    retirement_final_index: Option<u64>,
-    /// Index of the log or installed snapshot that established
-    /// `effective_cfg`. `None` means no durable configuration boundary has
-    /// been established. Lets log-mutation paths
-    /// skip re-scanning the entire live log on every truncate
-    /// — only a truncate that drops below this index actually
-    /// invalidates the cached active config.
-    active_config_index: Option<u64>,
-    /// Index of the leader's first current-term log entry —
-    /// the no-op appended on promotion (Ongaro §6.4). `None`
-    /// for non-leaders, and reset to the new no-op on each
-    /// promotion. `read_index` requests block until
-    /// `commit_index >= current_term_first_index` to guarantee
-    /// at least one current-term entry has committed.
-    /// Without this gate, a freshly-elected leader could
-    /// resolve `read_index` against a prior-term `commit_index`,
-    /// breaking linearizability.
-    current_term_first_index: Option<u64>,
-    /// Best-effort cache of the current leader's id. Updated
-    /// from successful inbound `AppendEntries` (the leader
-    /// self-identifies in `req.leader`). Surfaced through
-    /// [`WorkerSnapshot::leader_hint`] so a follower receiving a
-    /// client-side request that requires the leader can redirect
-    /// the caller without round-tripping. Cleared when our term
-    /// advances so a stale cross-term hint never leaks.
-    seen_leader: Option<N>,
-    /// Number of consecutive PreVote rounds that timed out
-    /// without crossing quorum. After
-    /// `Config::pre_candidate_misses_before_revert` misses,
-    /// the worker reverts to Follower so external observers
-    /// see a clean "no election active" state. Reset whenever
-    /// the worker successfully transitions out of PreCandidate.
-    pre_candidate_misses: u32,
     apply_sink: A,
-    role_atomic: Arc<AtomicU8>,
-    status: SharedWorkerStatus<N>,
-    status_valid_for: Duration,
-    clock: C,
-    rng: R,
+    replies: Replies<N>,
+    outgoing: BTreeMap<N, Outgoing<N>>,
+    incoming: Option<Incoming<N>>,
+    status_replies: Vec<oneshot::Sender<WorkerSnapshot<N>>>,
+    chunk_bytes: usize,
+    max_snapshot_bytes: usize,
+    resend_ms: u64,
+    now: u64,
 }
 
-impl<N, S, T, C, R, A> WorkerState<N, S, T, C, R, A>
+impl<N, S, T, A> Driver<N, S, T, A>
 where
     N: NodeId,
     S: Storage<N>,
     T: Transport<N>,
-    C: Clock,
-    A: ApplySink,
-    R: Rng,
     A: ApplySink,
 {
-    fn publish_role(&self) {
-        self.role_atomic.store(self.role.as_u8(), Ordering::Relaxed);
+    fn send(&self, to: N, envelope: Envelope<N>) {
+        self.transport.send(self.me, to, envelope);
     }
 
-    fn snapshot(&self) -> WorkerSnapshot<N> {
-        WorkerSnapshot {
-            role: self.role,
-            current_term: self.meta.current_term,
-            voted_for: self.meta.voted_for,
-            last_log_index: self.storage.last_index(),
-            commit_index: self.meta.commit_index,
-            snap_last_index: self.storage.snap_last_index(),
-            members: self.effective_cfg.current.clone(),
-            joint_old: self.effective_cfg.joint_old.clone(),
-            active_config_index: self.active_config_index,
-            retirement_final_index: self.retirement_final_index,
-            leader_hint: self.seen_leader,
-        }
+    fn token(&mut self) -> u64 {
+        self.replies.next += 1;
+        self.replies.next
     }
 
-    fn publish_status(&self) {
-        // Read storage-backed counters before taking the cache lock. If a
-        // backend stalls, readers retain the last completed snapshot rather
-        // than blocking behind a writer that can never finish.
-        let snapshot = self.snapshot();
-        if let Ok(mut status) = self.status.write() {
-            *status = Some(PublishedWorkerStatus {
-                snapshot,
-                valid_until: std::time::Instant::now() + self.status_valid_for,
-            });
-        }
-    }
-
-    fn set_role(&mut self, role: Role) {
-        self.role = role;
-        self.publish_role();
-    }
-
-    fn fire_apply_notification(&self) {
-        self.apply_sink.notify(self.meta.commit_index);
-    }
-
-    fn reset_election_timer(&mut self) {
-        let (lo, hi) = self.cfg.election_timeout_ms;
-        let span = (hi.saturating_sub(lo)).max(1);
-        let r = self.rng.next_u64();
-        let me_seed = {
-            use core::hash::{Hash, Hasher};
-            // A trivial FNV-ish hash so we don't pull stdlib's
-            // DefaultHasher (which lives in std::collections).
-            // Quality requirements are mild — just per-peer
-            // separation of jitter.
-            struct Fnv(u64);
-            impl Hasher for Fnv {
-                fn finish(&self) -> u64 {
-                    self.0
-                }
-                fn write(&mut self, bytes: &[u8]) {
-                    for b in bytes {
-                        self.0 = self.0.wrapping_mul(1099511628211);
-                        self.0 ^= u64::from(*b);
-                    }
-                }
+    fn handle(&mut self, core: &mut Core<N>, msg: RaftMsg<N>) -> Option<Envelope<N>> {
+        match msg {
+            RaftMsg::Deliver {
+                from,
+                envelope: Envelope::Raft(message),
+            } => core.receive(from, message),
+            RaftMsg::Deliver { envelope, .. } => return Some(envelope),
+            RaftMsg::Propose { payload, reply } => {
+                let token = self.token();
+                self.replies.proposals.insert(token, reply);
+                core.propose(token, payload);
             }
-            let mut h = Fnv(0xCBF29CE484222325);
-            <N as Hash>::hash(&self.cfg.me, &mut h);
-            h.finish()
-        };
-        let jitter = (r ^ me_seed ^ self.meta.current_term) % span;
-        let timeout = Duration::from_millis(lo + jitter);
-        self.election_deadline = self.clock.add(self.clock.now(), timeout);
-    }
-
-    /// Score for a single member used by quorum / majority-floor
-    /// helpers. The leader scores itself by its `last_index`
-    /// (everything written to its log is implicitly replicated to
-    /// itself); peers score by their tracked `match_index`.
-    fn member_match_score(&self, m: N) -> u64 {
-        if m == self.cfg.me {
-            self.storage.last_index()
-        } else {
-            self.leader
-                .as_ref()
-                .and_then(|l| l.match_index.get(&m).copied())
-                .unwrap_or(0)
+            RaftMsg::ReadIndex { timeout, reply } => {
+                let token = self.token();
+                self.replies.reads.insert(token, reply);
+                core.read_index(token, timeout.map(|timeout| timeout.as_millis() as u64));
+            }
+            RaftMsg::ChangeMembership { new_members, reply } => {
+                let token = self.token();
+                self.replies.changes.insert(token, reply);
+                core.change_membership(token, new_members);
+            }
+            RaftMsg::TransferLeadership { to } => core.transfer_leadership(to),
+            // Answered once the round's actions are carried out.
+            RaftMsg::QueryState { reply } => self.status_replies.push(reply),
+            RaftMsg::Shutdown => {}
         }
+        None
     }
 
-    /// Did `pred` hold for a quorum of the active config? In
-    /// joint mode a quorum from BOTH sets is required.
-    fn quorum_holds<F: FnMut(N) -> bool>(&self, pred: F) -> bool {
-        self.effective_cfg.quorum_holds(pred)
-    }
-
-    async fn match_index_majority_floor(&self) -> Option<u64> {
-        self.leader.as_ref()?;
-        // Score self by last_index (we replicate-to-self by
-        // virtue of writing the log) and each peer by its
-        // tracked match_index. The active config's
-        // `majority_floor` honors joint mode by intersecting the
-        // current and old majority floors.
-        self.effective_cfg
-            .majority_floor(|m| self.member_match_score(m))
-    }
-}
-
-/// Result of scanning the live log for the most recent
-/// `ConfigChange`. `active_config_index` is the durable evidence index
-/// (`0` for the initial `cfg.members`; `None` when none is established),
-/// used by callers to decide
-/// whether a future log mutation requires a fresh scan.
-struct ConfigRecovery<N: NodeId> {
-    active: ActiveConfig<N>,
-    /// Index of the joint `ConfigChange` entry, when joint
-    /// finalization is pending.
-    pending_joint: Option<u64>,
-    /// Durable boundary that established `active`: a log/snapshot index,
-    /// `0` for static genesis membership, or `None` before membership is
-    /// durably established.
-    active_config_index: Option<u64>,
-    /// Old-only voters from a live joint/final pair, keyed by the final
-    /// configuration index they still need to observe as committed.
-    retiring_voters: BTreeMap<N, u64>,
-    /// Initial final row still awaiting a committed confirmation row.
-    retirement_final_index: Option<u64>,
-    /// Uncommitted confirmation row recovered from the live log tail.
-    retirement_confirmation_entry: Option<u64>,
-}
-
-/// Walk the live log tail looking for the most recent
-/// `EntryKind::ConfigChange`; return its membership view as the
-/// recovered effective configuration AND, when the recovered
-/// view is a joint phase, the index of that joint entry (so
-/// auto-finalize can fire on commit). Falls back to
-/// `cfg.members` (steady, non-joint) if nothing is found.
-///
-/// **Boot-time path** (when `consult_persisted = true`):
-/// when the live log contains no `ConfigChange`, consults
-/// `Storage::active_config()` as a fallback so a leader that has
-/// compacted past the last `ConfigChange` entry still recovers
-/// its membership view. The live-log scan takes precedence: a
-/// truncated speculative `ConfigChange` written to the persisted
-/// row by an earlier append must NOT shadow the post-truncate
-/// log state. Audit-found bug: returning the persisted view
-/// before scanning the log left `active_config_index = None`
-/// even when the originating entry was alive in the log, so a
-/// later truncate that dropped that entry didn't trigger the
-/// `truncate_invalidated_cfg` re-scan and the in-memory view
-/// went silently stale.
-async fn recover_active_config<N, S>(
-    storage: &S,
-    cfg: &Config<N>,
-    commit_index: u64,
-    consult_persisted: bool,
-) -> Result<ConfigRecovery<N>, S::Error>
-where
-    N: NodeId,
-    S: Storage<N>,
-{
-    let last = storage.last_index();
-    let snap = storage.snap_last_index();
-    // Live-log scan first — authoritative when any ConfigChange
-    // sits in the live tail.
-    if last > snap {
-        let entries = storage.entries(snap + 1, last).await?;
-        if let Some((latest_pos, latest)) = entries.iter().enumerate().rev().find(|(_, entry)| {
-            matches!(
-                &entry.kind,
-                crate::log_entry::EntryKind::ConfigChange { .. }
-            )
-        }) && let crate::log_entry::EntryKind::ConfigChange { joint_old, members } = &latest.kind
-        {
-            // A second consecutive steady configuration with the same member
-            // set is the replicated retirement-confirmation barrier. The
-            // first row changes membership; the second records that every
-            // removed voter learned the committed first row.
-            let prior_final = if joint_old.is_none() {
-                entries[..latest_pos]
-                    .iter()
-                    .enumerate()
-                    .rev()
-                    .find(|(_, entry)| {
-                        matches!(entry.kind, crate::log_entry::EntryKind::ConfigChange { .. })
-                    })
-                    .and_then(|(pos, entry)| {
-                        let crate::log_entry::EntryKind::ConfigChange {
-                            joint_old: None,
-                            members: prior_members,
-                        } = &entry.kind
-                        else {
-                            return None;
-                        };
-                        (prior_members == members).then_some((pos, entry.index))
-                    })
-            } else {
-                None
-            };
-            let is_retirement_confirmation = prior_final.is_some();
-            let joint_scan_end = prior_final.map_or(latest_pos, |(pos, _)| pos);
-            let prior_joint = if joint_old.is_none() {
-                let from_log = entries[..joint_scan_end].iter().rev().find_map(|entry| {
-                    let crate::log_entry::EntryKind::ConfigChange {
-                        joint_old: Some(old),
-                        members: joint_members,
-                    } = &entry.kind
-                    else {
-                        return None;
-                    };
-                    (joint_members == members).then_some((
-                        ActiveConfig {
-                            current: joint_members.clone(),
-                            joint_old: Some(old.clone()),
-                        },
-                        entry.index,
-                    ))
-                });
-                if from_log.is_none() && consult_persisted {
-                    storage.active_config().await?.and_then(|record| {
-                        let old = record.joint_old?;
-                        (record.current == *members).then_some((
-                            ActiveConfig {
-                                current: record.current,
-                                joint_old: Some(old),
-                            },
-                            record.log_index.unwrap_or(0),
-                        ))
-                    })
-                } else {
-                    from_log
-                }
-            } else {
-                None
-            };
-            let source_final_index = prior_final.map_or(latest.index, |(_, index)| index);
-            let confirmation_committed = is_retirement_confirmation && latest.index <= commit_index;
-            let mut retiring_voters = BTreeMap::new();
-            let mut removed_any = false;
-            if let Some((prior, _)) = &prior_joint
-                && let Some(old) = &prior.joint_old
-            {
-                for voter in old {
-                    if !members.contains(voter) {
-                        removed_any = true;
-                        if *voter != cfg.me && !confirmation_committed {
-                            retiring_voters.insert(*voter, source_final_index);
+    /// Carry out the core's actions, and those they lead to, in order.
+    async fn run_actions(&mut self, core: &mut Core<N>, role: &AtomicU8) -> Result<(), S::Error> {
+        loop {
+            let actions = core.take_actions();
+            if actions.is_empty() {
+                return Ok(());
+            }
+            for action in actions {
+                match action {
+                    Action::Write(write) => {
+                        // Only compaction and a snapshot switch move the
+                        // snapshot pointer; a write keeps the store's.
+                        let meta = write.meta.map(|meta| Meta {
+                            snap_last_index: self.storage.snap_last_index(),
+                            snap_last_term: self.storage.snap_last_term(),
+                            ..meta
+                        });
+                        self.storage
+                            .commit_batch(WriteBatch {
+                                truncate_after: write.truncate_after,
+                                compact_to: None,
+                                appends: write.entries,
+                                state: None,
+                                meta,
+                                active_config: write.active_config,
+                            })
+                            .await?;
+                        core.durable(write.seq);
+                    }
+                    Action::Send { to, message } => self.send(to, Envelope::Raft(message)),
+                    Action::LoadEntries(load) => {
+                        let entries = self.storage.entries(load.from, load.to).await?;
+                        core.loaded(load, entries);
+                    }
+                    Action::Committed { index } => {
+                        self.apply_sink.notify(index);
+                        let applied = self.storage.applied_index().await?.unwrap_or(index);
+                        core.durably_applied(applied);
+                    }
+                    Action::SendSnapshot {
+                        to,
+                        index,
+                        term,
+                        configuration,
+                    } => {
+                        self.start_snapshot(core, to, index, term, configuration)
+                            .await?
+                    }
+                    Action::CompactBound { through } => {
+                        if let Some(term) = self.storage.term_at(through).await? {
+                            self.storage
+                                .commit_batch(WriteBatch {
+                                    compact_to: Some((through, term)),
+                                    ..Default::default()
+                                })
+                                .await?;
+                            core.compacted(through);
                         }
                     }
+                    Action::Answer(answer) => self.answer(answer),
+                    Action::Changed { role: now, .. } => role.store(now.as_u8(), Ordering::Relaxed),
                 }
             }
-            let retirement_final_index =
-                (removed_any && !confirmation_committed).then_some(source_final_index);
-            let retirement_confirmation_entry =
-                (is_retirement_confirmation && !confirmation_committed).then_some(latest.index);
-
-            // A retiring leader may have appended, but not committed, the
-            // final configuration that excludes itself. Recovering that final
-            // row as effective makes the old node ineligible to campaign,
-            // while the replacement still holds the preceding joint view and
-            // cannot elect itself. Retain the joint view until the final entry
-            // commits; the pending index tells auto-finalization to activate
-            // the already-appended final rather than append a duplicate.
-            if joint_old.is_none()
-                && !is_retirement_confirmation
-                && latest.index > commit_index
-                && !members.contains(&cfg.me)
-                && let Some((active, active_index)) = prior_joint
-                && active
-                    .joint_old
-                    .as_ref()
-                    .is_some_and(|old| old.contains(&cfg.me))
-            {
-                return Ok(ConfigRecovery {
-                    active,
-                    pending_joint: Some(latest.index),
-                    active_config_index: Some(active_index),
-                    retiring_voters,
-                    retirement_final_index,
-                    retirement_confirmation_entry,
-                });
-            }
-
-            let active = ActiveConfig {
-                current: members.clone(),
-                joint_old: joint_old.clone(),
-            };
-            let pending_joint = if active.is_joint() {
-                Some(latest.index)
-            } else {
-                None
-            };
-            return Ok(ConfigRecovery {
-                active,
-                pending_joint,
-                active_config_index: Some(latest.index),
-                retiring_voters,
-                retirement_final_index,
-                retirement_confirmation_entry,
-            });
         }
     }
-    // No `ConfigChange` in the live log. On the boot path, the
-    // persisted active_config row is the only place a
-    // recently-compacted membership view can live. New rows retain the
-    // log/snapshot boundary that established the view. A row without that
-    // evidence cannot prove a committed removal.
-    if consult_persisted && let Some(record) = storage.active_config().await? {
-        return Ok(ConfigRecovery {
-            active: ActiveConfig {
-                current: record.current,
-                joint_old: record.joint_old,
-            },
-            pending_joint: None,
-            active_config_index: record.log_index,
-            retiring_voters: BTreeMap::new(),
-            retirement_final_index: None,
-            retirement_confirmation_entry: None,
-        });
+
+    fn answer(&mut self, answer: Answer) {
+        match answer {
+            Answer::Propose { token, result } => {
+                if let Some(reply) = self.replies.proposals.remove(&token) {
+                    let _ = reply.send(result);
+                }
+            }
+            Answer::ReadIndex { token, result } => {
+                if let Some(reply) = self.replies.reads.remove(&token) {
+                    let _ = reply.send(result);
+                }
+            }
+            Answer::ChangeMembership { token, result } => {
+                if let Some(reply) = self.replies.changes.remove(&token) {
+                    let _ = reply.send(result);
+                }
+            }
+        }
     }
-    Ok(ConfigRecovery {
-        active: ActiveConfig::steady(cfg.members.clone()),
-        pending_joint: None,
-        active_config_index: Some(0),
-        retiring_voters: BTreeMap::new(),
-        retirement_final_index: None,
-        retirement_confirmation_entry: None,
-    })
+
+    // ── Snapshots: sending ─────────────────────────────────
+
+    async fn start_snapshot(
+        &mut self,
+        core: &Core<N>,
+        to: N,
+        index: u64,
+        term: u64,
+        configuration: Option<SnapshotConfiguration<N>>,
+    ) -> Result<(), S::Error> {
+        let resumes = self
+            .outgoing
+            .get(&to)
+            .is_some_and(|outgoing| outgoing.index == index && outgoing.term == term);
+        if !resumes {
+            let data = Arc::new(self.storage.read_state().await?);
+            self.outgoing.insert(
+                to,
+                Outgoing {
+                    index,
+                    term,
+                    configuration,
+                    data,
+                    offset: 0,
+                    sent_at: 0,
+                },
+            );
+        }
+        self.send_chunk(core, to);
+        Ok(())
+    }
+
+    fn send_chunk(&mut self, core: &Core<N>, to: N) {
+        let now = self.now;
+        let me = self.me;
+        let term = core.status().current_term;
+        let chunk_bytes = self.chunk_bytes.max(1);
+        let Some(outgoing) = self.outgoing.get_mut(&to) else {
+            return;
+        };
+        outgoing.sent_at = now;
+        let start = (outgoing.offset as usize).min(outgoing.data.len());
+        let end = (start + chunk_bytes).min(outgoing.data.len());
+        let done = end >= outgoing.data.len();
+        let (members, joint_old, active_config_index) = match (&outgoing.configuration, done) {
+            (Some(configuration), true) => (
+                configuration.members.clone(),
+                configuration.joint_old.clone(),
+                Some(configuration.index),
+            ),
+            _ => (Vec::new(), None, None),
+        };
+        let chunk = InstallSnapshotReq {
+            leader: me,
+            term,
+            last_included_index: outgoing.index,
+            last_included_term: outgoing.term,
+            offset: start as u64,
+            done,
+            data: outgoing.data[start..end].to_vec(),
+            members,
+            joint_old,
+            active_config_index,
+        };
+        self.send(to, Envelope::SnapshotChunk(chunk));
+    }
+
+    fn on_snapshot_ack(&mut self, core: &Core<N>, from: N, ack: InstallSnapshotResp) {
+        let Some(outgoing) = self.outgoing.get_mut(&from) else {
+            return;
+        };
+        if outgoing.index != ack.last_included_index || outgoing.term != ack.last_included_term {
+            return;
+        }
+        let total = outgoing.data.len() as u64;
+        // The receiver is authoritative: after a restart it holds nothing,
+        // and the stream rewinds.
+        outgoing.offset = ack.bytes_received.min(total);
+        if ack.bytes_received >= total {
+            self.outgoing.remove(&from);
+        } else {
+            self.send_chunk(core, from);
+        }
+    }
+
+    /// Resend chunks whose acknowledgement is overdue.
+    fn resend_chunks(&mut self, core: &Core<N>) {
+        let overdue: Vec<N> = self
+            .outgoing
+            .iter()
+            .filter(|(_, outgoing)| outgoing.sent_at + self.resend_ms <= self.now)
+            .map(|(&peer, _)| peer)
+            .collect();
+        for peer in overdue {
+            self.send_chunk(core, peer);
+        }
+    }
+
+    fn next_resend(&self) -> Option<u64> {
+        self.outgoing
+            .values()
+            .map(|outgoing| outgoing.sent_at + self.resend_ms)
+            .min()
+    }
+
+    // ── Snapshots: receiving ───────────────────────────────
+
+    async fn on_chunk(
+        &mut self,
+        core: &mut Core<N>,
+        from: N,
+        chunk: InstallSnapshotReq<N>,
+    ) -> Result<(), S::Error> {
+        let status = core.status();
+        let ack = |bytes_received: u64| InstallSnapshotResp {
+            term: status.current_term,
+            last_included_index: chunk.last_included_index,
+            last_included_term: chunk.last_included_term,
+            bytes_received,
+        };
+        // Only the leader this replica follows at its term may install a
+        // snapshot; the core learns of terms and leaders from its messages.
+        if chunk.leader != from
+            || chunk.term != status.current_term
+            || status.leader_hint != Some(from)
+            || status.role != Role::Follower
+        {
+            self.send(from, Envelope::SnapshotAck(ack(0)));
+            return Ok(());
+        }
+        if chunk.last_included_index <= status.snap_last_index
+            || chunk.last_included_index <= status.commit_index
+        {
+            // Covered already, by a snapshot or by committed entries.
+            self.incoming = None;
+            let held = chunk.offset + chunk.data.len() as u64;
+            self.send(from, Envelope::SnapshotAck(ack(held)));
+            return Ok(());
+        }
+        let same = self.incoming.as_ref().is_some_and(|incoming| {
+            incoming.leader == from
+                && incoming.term == chunk.term
+                && incoming.index == chunk.last_included_index
+                && incoming.index_term == chunk.last_included_term
+        });
+        if !same {
+            self.incoming = Some(Incoming {
+                leader: from,
+                term: chunk.term,
+                index: chunk.last_included_index,
+                index_term: chunk.last_included_term,
+                buffer: Vec::new(),
+            });
+        }
+        let incoming = self.incoming.as_mut().expect("set above");
+        let held = incoming.buffer.len() as u64;
+        if chunk.offset > held {
+            self.send(from, Envelope::SnapshotAck(ack(held)));
+            return Ok(());
+        }
+        if chunk.offset == held {
+            if incoming.buffer.len().saturating_add(chunk.data.len()) > self.max_snapshot_bytes {
+                self.incoming = None;
+                self.send(from, Envelope::SnapshotAck(ack(0)));
+                return Ok(());
+            }
+            incoming.buffer.extend_from_slice(&chunk.data);
+        }
+        let held = incoming.buffer.len() as u64;
+        if !chunk.done {
+            self.send(from, Envelope::SnapshotAck(ack(held)));
+            return Ok(());
+        }
+        // Membership and its provenance are one claim; an incomplete or
+        // future one is refused before anything is installed.
+        let configuration = match (chunk.members.is_empty(), chunk.active_config_index) {
+            (false, Some(index)) if index <= chunk.last_included_index => {
+                Some(SnapshotConfiguration {
+                    members: chunk.members.clone(),
+                    joint_old: chunk.joint_old.clone(),
+                    index,
+                })
+            }
+            (true, None) if chunk.joint_old.is_none() => None,
+            _ => {
+                self.incoming = None;
+                self.send(from, Envelope::SnapshotAck(ack(0)));
+                return Ok(());
+            }
+        };
+        let incoming = self.incoming.take().expect("set above");
+        // One switch: the state, the snapshot boundary, and the log suffix
+        // kept only if it continues the snapshot.
+        let switch =
+            core.snapshot_switch(incoming.index, incoming.index_term, configuration.as_ref());
+        self.storage
+            .commit_batch(WriteBatch {
+                truncate_after: switch.truncate_after,
+                compact_to: Some((incoming.index, incoming.index_term)),
+                appends: Vec::new(),
+                state: Some(incoming.buffer),
+                meta: Some(switch.meta),
+                active_config: Some(switch.active_config),
+            })
+            .await?;
+        core.snapshot_installed(incoming.index, incoming.index_term, configuration);
+        self.send(from, Envelope::SnapshotAck(ack(held)));
+        Ok(())
+    }
+
+    async fn on_envelope(
+        &mut self,
+        core: &mut Core<N>,
+        from: N,
+        envelope: Envelope<N>,
+    ) -> Result<(), S::Error> {
+        match envelope {
+            Envelope::Raft(message) => core.receive(from, message),
+            Envelope::SnapshotChunk(chunk) => self.on_chunk(core, from, chunk).await?,
+            Envelope::SnapshotAck(ack) => self.on_snapshot_ack(core, from, ack),
+        }
+        Ok(())
+    }
 }
 
-// ── Public driver ───────────────────────────────────────────
+/// The most inbox messages one round hands the core before carrying out
+/// its actions.
+const MAX_MESSAGES_PER_ROUND: usize = 1024;
 
-/// Run a worker future to completion.
-///
-/// Returns `Ok(())` on `RaftMsg::Shutdown` or when the inbox
-/// sender is dropped (clean termination). Returns `Err(_)` if
-/// the initial `Storage::load_meta` call fails — the worker
-/// can't safely start without its persisted meta state. Hosts
-/// using [`Worker::spawn`] / [`Worker::spawn_with_tokio_runtime`]
-/// can read the result via [`Worker::wait_init`].
-///
-/// `init_done` is invoked exactly once after `Storage::load_meta`
-/// resolves — `true` on success, `false` on failure. The
-/// std-feature spawn helpers use this to signal the host
-/// synchronously rather than forcing a polling loop on the
-/// init-state atomic. Embedded hosts that don't need the
-/// signal can pass `|_| {}`.
-///
-/// Embedded hosts call this directly inside their executor.
-/// Std hosts typically use [`Worker::spawn`].
+/// Run a worker to completion: `Ok` on shutdown, `Err` when its store
+/// fails, at boot or later.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_worker<N, S, T, C, R, A, F>(
     storage: S,
@@ -1537,10 +895,10 @@ async fn run_worker_with_status<N, S, T, C, R, A, F>(
     storage: S,
     transport: Arc<T>,
     cfg: Config<N>,
-    inbox_rx: fmpsc::UnboundedReceiver<RaftMsg<N>>,
+    mut inbox_rx: fmpsc::UnboundedReceiver<RaftMsg<N>>,
     apply_sink: A,
     clock: C,
-    rng: R,
+    mut rng: R,
     role_atomic: Arc<AtomicU8>,
     status: SharedWorkerStatus<N>,
     init_done: F,
@@ -1554,2414 +912,179 @@ where
     A: ApplySink,
     F: FnOnce(bool),
 {
-    let meta = match storage.load_meta().await {
-        Ok(m) => {
+    let recovered = match recover(&storage).await {
+        Ok(recovered) => {
             init_done(true);
-            m
+            recovered
         }
-        Err(e) => {
+        Err(error) => {
             init_done(false);
-            return Err(e);
+            return Err(error);
         }
     };
-    // Recover effective configuration by scanning the live log
-    // tail for the latest `ConfigChange` entry. If none is
-    // found, fall back to `cfg.members`. Recently-compacted
-    // ConfigChange entries can't be recovered from the log —
-    // hosts that need that level of persistence must encode the
-    // active config into their snapshot bytes and re-prime via
-    // a follow-up call (not yet exposed). The storage
-    // window is large enough that this is rare in practice.
-    // On boot, prefer the persisted active config (if the
-    // backend supports it) so a leader that compacted past the
-    // last ConfigChange entry doesn't lose the membership view.
-    let recovery = recover_active_config(&storage, &cfg, meta.commit_index, true).await?;
     let status_valid_for = Duration::from_millis(
         cfg.election_timeout_ms
             .1
             .max(cfg.heartbeat_interval_ms.saturating_mul(3))
             .max(1),
     );
-    let mut state = WorkerState {
+    let start = clock.now();
+    let mut driver = Driver {
+        me: cfg.me,
         storage,
         transport,
-        cfg,
-        role: Role::Follower,
-        meta,
-        election_deadline: clock.now(),
-        last_heartbeat_received: None,
-        votes_received: BTreeSet::new(),
-        pending_read_index: Vec::new(),
-        incoming_snapshot: None,
-        effective_cfg: recovery.active,
-        pending_joint_entry: recovery.pending_joint,
-        retiring_voters: recovery.retiring_voters,
-        retiring_voter_acks: BTreeSet::new(),
-        retirement_confirmation_entry: recovery.retirement_confirmation_entry,
-        retirement_final_index: recovery.retirement_final_index,
-        active_config_index: recovery.active_config_index,
-        current_term_first_index: None,
-        seen_leader: None,
-        pre_candidate_misses: 0,
-        leader: None,
         apply_sink,
-        role_atomic,
-        status,
-        status_valid_for,
-        clock,
-        rng,
+        replies: Replies {
+            next: 0,
+            proposals: BTreeMap::new(),
+            reads: BTreeMap::new(),
+            changes: BTreeMap::new(),
+            _node: core::marker::PhantomData,
+        },
+        outgoing: BTreeMap::new(),
+        incoming: None,
+        status_replies: Vec::new(),
+        chunk_bytes: cfg.install_snapshot_chunk_bytes,
+        max_snapshot_bytes: cfg.max_snapshot_bytes,
+        resend_ms: cfg.resend_timeout_ms,
+        now: 0,
     };
-    state.reset_election_timer();
-    state.publish_role();
-    state.publish_status();
-
-    let mut inbox_rx = inbox_rx;
-    let mut pending: FuturesUnordered<RpcFut<N>> = FuturesUnordered::new();
-
-    loop {
-        // The select! macro's timer arm needs a fused future.
-        // `clock.sleep_until(deadline)` returns C::Sleep — wrap
-        // it with `.fuse()` so it's safe to poll past completion
-        // (FuturesUnordered already hands us fused items).
-        let wake_deadline = state
-            .pending_read_index
-            .iter()
-            .filter_map(|pending| pending.deadline)
-            .fold(state.election_deadline, core::cmp::min);
-        let timer = state.clock.sleep_until(wake_deadline).fuse();
-        futures_util::pin_mut!(timer);
-
-        let next_inbox = inbox_rx.next().fuse();
-        futures_util::pin_mut!(next_inbox);
-
-        // CRITICAL: `FuturesUnordered::next()` resolves
-        // `Ready(None)` *immediately* when the set is empty.
-        // Including it as a select! arm during the (common)
-        // intervals when no outbound RPCs are in flight produces a
-        // 100%-CPU spin — every iteration the empty-set arm fires,
-        // we ignore the `None`, loop, fire again. Branch on
-        // `pending.is_empty()` to drop the arm entirely in that
-        // case so the select! parks on timer + inbox.
-        if pending.is_empty() {
-            futures_util::select! {
-                msg = next_inbox => {
-                    match msg {
-                        Some(RaftMsg::Shutdown) => break,
-                        Some(other) => handle_msg(&mut state, &mut pending, other).await,
-                        None => break,
-                    }
-                }
-                _ = timer => {
-                    on_worker_timer(&mut state, &mut pending).await;
-                }
-            }
-        } else {
-            let next_pending = pending.next().fuse();
-            futures_util::pin_mut!(next_pending);
-            futures_util::select! {
-                msg = next_inbox => {
-                    match msg {
-                        Some(RaftMsg::Shutdown) => break,
-                        Some(other) => handle_msg(&mut state, &mut pending, other).await,
-                        None => break,
-                    }
-                }
-                _ = timer => {
-                    on_worker_timer(&mut state, &mut pending).await;
-                }
-                outcome = next_pending => {
-                    if let Some(o) = outcome {
-                        handle_rpc_outcome(&mut state, o).await;
-                    }
-                }
-            }
-        }
-        state.publish_status();
-    }
-    Ok(())
-}
-
-async fn handle_msg<N, S, T, C, R, A>(
-    state: &mut WorkerState<N, S, T, C, R, A>,
-    pending: &mut FuturesUnordered<RpcFut<N>>,
-    msg: RaftMsg<N>,
-) where
-    N: NodeId,
-    S: Storage<N>,
-    T: Transport<N>,
-    C: Clock,
-    R: Rng,
-    A: ApplySink,
-{
-    match msg {
-        RaftMsg::AppendEntries { from, req, reply } => {
-            if let Ok(resp) = handle_append_entries(state, from, req).await {
-                let _ = reply.send(resp);
-            }
-        }
-        RaftMsg::RequestVote { from, req, reply } => {
-            if let Ok(resp) = handle_request_vote(state, from, req).await {
-                let _ = reply.send(resp);
-            }
-        }
-        RaftMsg::PreVote { from, req, reply } => {
-            let resp = handle_request_prevote(state, from, req);
-            let _ = reply.send(resp);
-        }
-        RaftMsg::InstallSnapshot { from, req, reply } => {
-            if let Ok(resp) = handle_install_snapshot(state, from, req).await {
-                let _ = reply.send(resp);
-            }
-        }
-        RaftMsg::Propose { payload, reply } => {
-            let r = handle_propose(state, payload).await;
-            let _ = reply.send(r);
-        }
-        RaftMsg::ReadIndex { timeout, reply } => {
-            handle_read_index(state, pending, timeout, reply).await;
-        }
-        RaftMsg::ChangeMembership { new_members, reply } => {
-            let r = handle_change_membership(state, new_members).await;
-            let _ = reply.send(r);
-        }
-        RaftMsg::QueryState { reply } => {
-            let _ = reply.send(state.snapshot());
-        }
-        RaftMsg::Shutdown => unreachable!("handled in run_worker"),
-    }
-}
-
-async fn on_timer<N, S, T, C, R, A>(
-    state: &mut WorkerState<N, S, T, C, R, A>,
-    pending: &mut FuturesUnordered<RpcFut<N>>,
-) where
-    N: NodeId,
-    S: Storage<N>,
-    T: Transport<N>,
-    C: Clock,
-    R: Rng,
-    A: ApplySink,
-{
-    match state.role {
-        // Follower whose timer expired: start the pre-election
-        // phase (or skip it if `cfg.pre_vote == false`).
-        Role::Follower => {
-            if state.cfg.pre_vote {
-                let _ = start_pre_election(state, pending).await;
-            } else {
-                let _ = start_election(state, pending).await;
-            }
-        }
-        // PreCandidate whose timer expired: pre-election round
-        // didn't get quorum within the timeout. Bump the miss
-        // counter; if it crosses
-        // `Config::pre_candidate_misses_before_revert`, revert
-        // to Follower so external observers see a clean
-        // "no election in progress" state. Otherwise try another
-        // pre-vote round with a fresh randomized timer.
-        Role::PreCandidate => {
-            state.pre_candidate_misses = state.pre_candidate_misses.saturating_add(1);
-            let cap = state.cfg.pre_candidate_misses_before_revert;
-            if cap > 0 && state.pre_candidate_misses >= cap {
-                state.set_role(Role::Follower);
-                state.votes_received.clear();
-                state.pre_candidate_misses = 0;
-                state.reset_election_timer();
-            } else {
-                let _ = start_pre_election(state, pending).await;
-            }
-        }
-        // Candidate whose timer expired: send the real
-        // RequestVote round. Either we're here freshly-promoted
-        // from PreCandidate (term bump + self-vote happen
-        // inside `start_election`), or we already started this
-        // term's election and the timeout expired without
-        // quorum.
-        Role::Candidate => {
-            let _ = start_election(state, pending).await;
-        }
-        Role::Leader => {
-            let _ = send_heartbeats(state, pending).await;
-        }
-    }
-}
-
-/// Handle the earliest worker deadline. Read-barrier deadlines share the
-/// worker's monotonic clock with elections, but expiring one must not trigger
-/// an early election or heartbeat. Only invoke `on_timer` when the actual
-/// election/heartbeat deadline is also due.
-async fn on_worker_timer<N, S, T, C, R, A>(
-    state: &mut WorkerState<N, S, T, C, R, A>,
-    pending: &mut FuturesUnordered<RpcFut<N>>,
-) where
-    N: NodeId,
-    S: Storage<N>,
-    T: Transport<N>,
-    C: Clock,
-    R: Rng,
-    A: ApplySink,
-{
-    let now = state.clock.now();
-    expire_pending_reads(state, now);
-    if now >= state.election_deadline {
-        on_timer(state, pending).await;
-    }
-}
-
-async fn handle_rpc_outcome<N, S, T, C, R, A>(
-    state: &mut WorkerState<N, S, T, C, R, A>,
-    outcome: RpcOutcome<N>,
-) where
-    N: NodeId,
-    S: Storage<N>,
-    T: Transport<N>,
-    C: Clock,
-    R: Rng,
-    A: ApplySink,
-{
-    match outcome {
-        RpcOutcome::Append {
-            from,
-            result: Some(resp),
-            leader_commit,
-            round,
-        } => {
-            let _ = handle_append_response(state, from, resp, leader_commit, round).await;
-        }
-        RpcOutcome::Vote {
-            from,
-            result: Some(resp),
-        } => {
-            let _ = handle_vote_response(state, from, resp).await;
-        }
-        RpcOutcome::PreVote {
-            from,
-            next_term,
-            result: Some(resp),
-        } => {
-            let _ = handle_prevote_response(state, from, next_term, resp).await;
-        }
-        RpcOutcome::Install {
-            from,
-            result: Some(resp),
-            last_included_index,
-            last_included_term,
-            chunk_end_offset,
-            was_final,
-            round,
-        } => {
-            let _ = handle_install_snapshot_response(
-                state,
-                from,
-                resp,
-                last_included_index,
-                last_included_term,
-                chunk_end_offset,
-                was_final,
-                round,
-            )
-            .await;
-        }
-        // Transport returned Err — treat as no answer.
-        RpcOutcome::Append { .. }
-        | RpcOutcome::Vote { .. }
-        | RpcOutcome::PreVote { .. }
-        | RpcOutcome::Install { .. } => {}
-    }
-}
-
-// ── Inbound RPC handlers ────────────────────────────────────
-
-async fn handle_append_entries<N, S, T, C, R, A>(
-    state: &mut WorkerState<N, S, T, C, R, A>,
-    _from: N,
-    req: AppendEntriesReq<N>,
-) -> Result<AppendEntriesResp, S::Error>
-where
-    N: NodeId,
-    S: Storage<N>,
-    T: Transport<N>,
-    C: Clock,
-    R: Rng,
-    A: ApplySink,
-{
-    if req.term < state.meta.current_term {
-        return Ok(AppendEntriesResp {
-            term: state.meta.current_term,
-            success: false,
-            match_index: 0,
-        });
-    }
-    // Snapshot meta before any mutation so we can roll back on a
-    // storage failure. Without this, a transient
-    // `commit_batch` Err leaves the in-memory term ahead of the
-    // disk row — the worker would reply with the higher term
-    // while crash recovery would silently come back at the
-    // lower one.
-    let meta_snapshot = state.meta.clone();
-    if req.term > state.meta.current_term {
-        state.meta.current_term = req.term;
-        state.meta.voted_for = None;
-        // New term: any cached leader hint refers to the prior
-        // term and is no longer valid. Repopulated below from
-        // `req.leader` for the term we're now observing.
-        state.seen_leader = None;
-    }
-    let was_leader = state.role == Role::Leader;
-    state.set_role(Role::Follower);
-    state.votes_received.clear();
-    state.leader = None;
-    state.current_term_first_index = None;
-    if was_leader {
-        drain_pending_reads_on_step_down(state);
-    }
-    state.reset_election_timer();
-    // We've heard from a current-term leader — record it for
-    // the pre-vote leader-check.
-    state.last_heartbeat_received = Some(state.clock.now());
-    // Cache the leader for this term so a follower can redirect
-    // misaddressed client requests via `WorkerSnapshot::leader_hint`.
-    state.seen_leader = Some(req.leader);
-
-    let our_prev_term = match state.storage.term_at(req.prev_log_index).await {
-        Ok(t) => t,
-        Err(e) => {
-            state.meta = meta_snapshot;
-            return Err(e);
+    let mut core = Core::new(cfg, recovered, 0, rng.next_u64());
+    let publish = |core: &Core<N>| {
+        if let Ok(mut published) = status.write() {
+            *published = Some(PublishedWorkerStatus {
+                snapshot: core.status().into(),
+                valid_until: std::time::Instant::now() + status_valid_for,
+            });
         }
     };
-    let consistent = our_prev_term == Some(req.prev_log_term);
-    if !consistent {
-        if let Err(e) = state
-            .storage
-            .commit_batch(WriteBatch {
-                meta: Some(state.meta.clone()),
-                ..Default::default()
-            })
-            .await
-        {
-            state.meta = meta_snapshot;
-            return Err(e);
-        }
-        return Ok(AppendEntriesResp {
-            term: state.meta.current_term,
-            success: false,
-            match_index: 0,
-        });
-    }
-
-    let mut conflict_at: Option<u64> = None;
-    let mut already_present = 0usize;
-    for (i, e) in req.entries.iter().enumerate() {
-        let idx = req.prev_log_index + 1 + i as u64;
-        let t = match state.storage.term_at(idx).await {
-            Ok(t) => t,
-            Err(e) => {
-                state.meta = meta_snapshot;
-                return Err(e);
-            }
-        };
-        match t {
-            Some(t) if t == e.term => already_present += 1,
-            Some(_) => {
-                conflict_at = Some(idx);
-                break;
-            }
-            None => break,
-        }
-    }
-    let truncate_after = conflict_at.map(|idx| idx - 1);
-    let appends: Vec<LogEntry<N>> = req
-        .entries
-        .iter()
-        .enumerate()
-        .skip(already_present)
-        .map(|(i, e)| LogEntry {
-            index: req.prev_log_index + 1 + i as u64,
-            term: e.term,
-            kind: e.kind.clone(),
-        })
-        .collect();
-
-    let last_new_index = req.prev_log_index + req.entries.len() as u64;
-    let mut commit_advanced = false;
-    if req.leader_commit > state.meta.commit_index {
-        let new_commit = req.leader_commit.min(last_new_index);
-        if new_commit > state.meta.commit_index {
-            state.meta.commit_index = new_commit;
-            commit_advanced = true;
-        }
-    }
-
-    let appended_a_config = appends
-        .iter()
-        .any(|e| matches!(e.kind, crate::log_entry::EntryKind::ConfigChange { .. }));
-    let truncate_invalidated_cfg = match (truncate_after, state.active_config_index) {
-        (Some(ta), Some(idx)) => ta < idx,
-        // No cached index → fallback config is `cfg.members`,
-        // which a truncate can never invalidate.
-        (Some(_), None) => false,
-        (None, _) => false,
-    };
-    let truncate_invalidated_pending = match (truncate_after, state.pending_joint_entry) {
-        (Some(ta), Some(idx)) => ta < idx,
-        _ => false,
-    };
-    // Pre-compute the post-write membership view and roll any
-    // change into the same atomic batch as the log mutation.
-    // Three cases warrant a refresh:
-    //
-    // 1. The leader appended a new ConfigChange entry. Adopt it
-    //    directly from `req.entries`.
-    // 2. A truncate dropped the entry that produced our cached
-    //    `active_config_index`. Scan the surviving log
-    //    `[snap+1..=truncate_after]` for the latest ConfigChange,
-    //    or fall back to `cfg.members`. Audit-found bug: prior
-    //    code wrote nothing to `active_config` in this branch, so
-    //    the persisted row went silently stale and a future
-    //    reboot would re-adopt the truncated speculative view.
-    //
-    // The persisted view follows the in-memory view atomically —
-    // if storage rejects the batch, both stay at their pre-call
-    // values via `meta_snapshot` rollback.
-    let mut active_config_for_batch: Option<ActiveConfigRecord<N>> = None;
-    let mut post_active_view: Option<(ActiveConfig<N>, Option<u64>, Option<u64>)> = None;
-    let mut retiring_after_batch = state.retiring_voters.clone();
-    let mut retirement_final_after_batch = state.retirement_final_index;
-    let mut retirement_confirmation_after_batch = state.retirement_confirmation_entry;
-    let mut retiring_acks_after_batch = state.retiring_voter_acks.clone();
-    if let Some(truncate) = truncate_after {
-        retiring_after_batch.retain(|_, final_index| *final_index <= truncate);
-        if retirement_final_after_batch.is_some_and(|index| index > truncate) {
-            retirement_final_after_batch = None;
-            retirement_confirmation_after_batch = None;
-            retiring_acks_after_batch.clear();
-        } else if retirement_confirmation_after_batch.is_some_and(|index| index > truncate) {
-            retirement_confirmation_after_batch = None;
-            retiring_acks_after_batch.clear();
-        }
-    }
-    // If truncation removes the row behind the cached effective view, derive
-    // the classifier's base from the surviving log before interpreting newly
-    // appended configurations. In particular, a replacement final can follow
-    // a surviving joint row even though the pre-truncation cache still names
-    // the speculative final that is being overwritten.
-    let truncated_base_config = if truncate_invalidated_cfg {
-        let snap = state.storage.snap_last_index();
-        let scan_end =
-            truncate_after.expect("truncate_invalidated_cfg implies Some(truncate_after)");
-        let mut found: Option<(u64, ActiveConfig<N>)> = None;
-        if scan_end > snap {
-            let surviving = match state.storage.entries(snap + 1, scan_end).await {
-                Ok(entries) => entries,
-                Err(error) => {
-                    state.meta = meta_snapshot;
-                    return Err(error);
-                }
+    let result = async {
+        driver.run_actions(&mut core, &role_atomic).await?;
+        publish(&core);
+        loop {
+            let wake = driver.next_resend().map_or(core.next_deadline(), |resend| {
+                resend.min(core.next_deadline())
+            });
+            let timer = clock
+                .sleep_until(clock.add(start, Duration::from_millis(wake)))
+                .fuse();
+            futures_util::pin_mut!(timer);
+            let next = inbox_rx.next().fuse();
+            futures_util::pin_mut!(next);
+            let mut message = futures_util::select! {
+                message = next => match message {
+                    Some(RaftMsg::Shutdown) | None => break,
+                    Some(message) => Some(message),
+                },
+                _ = timer => None,
             };
-            for entry in surviving.iter().rev() {
-                if let crate::log_entry::EntryKind::ConfigChange { joint_old, members } =
-                    &entry.kind
-                {
-                    found = Some((
-                        entry.index,
-                        ActiveConfig {
-                            current: members.clone(),
-                            joint_old: joint_old.clone(),
-                        },
-                    ));
+            let now = clock.millis_since(start, clock.now());
+            driver.now = now;
+            core.tick(now);
+            // Everything already queued joins this round, so the core
+            // coalesces it into one write.
+            let mut stop = false;
+            let mut handled = 0;
+            while let Some(next) = message.take() {
+                if matches!(next, RaftMsg::Shutdown) {
+                    stop = true;
                     break;
                 }
-            }
-        }
-        Some(found.unwrap_or_else(|| (0, ActiveConfig::steady(state.cfg.members.clone()))))
-    } else {
-        None
-    };
-    if appended_a_config {
-        // Interpret only newly appended rows. Reprocessing an already-present
-        // source final as if it were a second consecutive final would forge a
-        // retirement confirmation on an ordinary heartbeat retry.
-        let mut retirement_view = truncated_base_config
-            .as_ref()
-            .map_or_else(|| state.effective_cfg.clone(), |(_, active)| active.clone());
-        for e in &appends {
-            if let crate::log_entry::EntryKind::ConfigChange { joint_old, members } = &e.kind {
-                if let Some(old) = joint_old {
-                    retirement_view = ActiveConfig {
-                        current: members.clone(),
-                        joint_old: Some(old.clone()),
-                    };
-                    retirement_final_after_batch = None;
-                    retirement_confirmation_after_batch = None;
-                    retiring_after_batch.clear();
-                    retiring_acks_after_batch.clear();
-                } else if retirement_final_after_batch.is_some()
-                    && retirement_confirmation_after_batch.is_none()
-                    && retirement_view.current == *members
+                let from = match &next {
+                    RaftMsg::Deliver { from, .. } => Some(*from),
+                    _ => None,
+                };
+                if let Some(envelope) = driver.handle(&mut core, next)
+                    && let Some(from) = from
                 {
-                    // The source final may already be present locally while
-                    // the effective view is still joint because that row was
-                    // not committed. A subsequently appended identical
-                    // steady row is nevertheless the confirmation, not a
-                    // second source final.
-                    retirement_confirmation_after_batch = Some(e.index);
-                    retirement_view = ActiveConfig::steady(members.clone());
-                } else if retirement_view.is_joint() && retirement_view.current == *members {
-                    let removed_any = retirement_view
-                        .joint_old
-                        .as_ref()
-                        .is_some_and(|old| old.iter().any(|voter| !members.contains(voter)));
-                    retirement_final_after_batch = removed_any.then_some(e.index);
-                    retirement_confirmation_after_batch = None;
-                    retiring_after_batch.clear();
-                    retiring_acks_after_batch.clear();
-                    if let Some(old) = &retirement_view.joint_old {
-                        for voter in old {
-                            if *voter != state.cfg.me && !members.contains(voter) {
-                                retiring_after_batch.insert(*voter, e.index);
-                            }
-                        }
+                    if matches!(envelope, Envelope::SnapshotChunk(_)) {
+                        // A snapshot switch follows every write before it.
+                        driver.run_actions(&mut core, &role_atomic).await?;
                     }
-                    retirement_view = ActiveConfig::steady(members.clone());
-                } else {
-                    retirement_view = ActiveConfig::steady(members.clone());
+                    driver.on_envelope(&mut core, from, envelope).await?;
+                }
+                handled += 1;
+                if handled < MAX_MESSAGES_PER_ROUND {
+                    message = match inbox_rx.try_recv() {
+                        Ok(next) => Some(next),
+                        Err(fmpsc::TryRecvError::Closed) => {
+                            stop = true;
+                            None
+                        }
+                        Err(fmpsc::TryRecvError::Empty) => None,
+                    };
                 }
             }
-        }
-        for e in appends.iter().rev() {
-            if let crate::log_entry::EntryKind::ConfigChange { joint_old, members } = &e.kind {
-                let entry_index = e.index;
-                let active = ActiveConfig {
-                    current: members.clone(),
-                    joint_old: joint_old.clone(),
-                };
-                let pending = if active.is_joint() {
-                    Some(entry_index)
-                } else {
-                    None
-                };
-                active_config_for_batch = Some(ActiveConfigRecord {
-                    log_index: Some(entry_index),
-                    current: members.clone(),
-                    joint_old: joint_old.clone(),
-                });
-                post_active_view = Some((active, Some(entry_index), pending));
+            driver.resend_chunks(&core);
+            driver.run_actions(&mut core, &role_atomic).await?;
+            publish(&core);
+            for reply in driver.status_replies.drain(..) {
+                let _ = reply.send(core.status().into());
+            }
+            if stop {
                 break;
             }
         }
-    } else if let Some((idx, active)) = truncated_base_config {
-        let pending = active.is_joint().then_some(idx);
-        active_config_for_batch = Some(ActiveConfigRecord {
-            log_index: Some(idx),
-            current: active.current.clone(),
-            joint_old: active.joint_old.clone(),
-        });
-        post_active_view = Some((active, Some(idx), pending));
+        Ok(())
     }
+    .await;
+    // Before the pending replies and the inbox drop: a caller who sees the
+    // worker gone sees it lead nothing.
+    if let Ok(mut published) = status.write() {
+        *published = None;
+    }
+    role_atomic.store(Role::Follower.as_u8(), Ordering::Relaxed);
+    result
+}
 
-    // Recovery can deliberately retain the joint view while an already-
-    // appended final row is still speculative. A later heartbeat may advance
-    // `leader_commit` across that row without appending another config entry.
-    // Activate the final view in the SAME batch as the commit-index advance;
-    // otherwise the follower can durably report commit_index >= final while
-    // continuing to authenticate and schedule against the preceding joint
-    // configuration forever. Do not inspect a pending row that this request
-    // is about to truncate.
-    let committed_pending_entry = if post_active_view.is_none()
-        && state.effective_cfg.is_joint()
-        && let Some(pending_idx) = state.pending_joint_entry
-        && pending_idx <= state.meta.commit_index
-        && truncate_after.is_none_or(|truncate| truncate >= pending_idx)
-    {
-        match state.storage.entries(pending_idx, pending_idx).await {
-            Ok(entries) => entries.into_iter().next().map(|entry| (pending_idx, entry)),
-            Err(error) => {
-                state.meta = meta_snapshot;
-                return Err(error);
-            }
-        }
+/// What the core needs from the store at boot.
+async fn recover<N: NodeId, S: Storage<N>>(storage: &S) -> Result<Recovered<N>, S::Error> {
+    let meta = storage.load_meta().await?;
+    let last = storage.last_index();
+    let entries = if last > meta.snap_last_index {
+        storage.entries(meta.snap_last_index + 1, last).await?
     } else {
-        None
+        Vec::new()
     };
-    if let Some((pending_idx, pending_entry)) = committed_pending_entry
-        && let crate::log_entry::EntryKind::ConfigChange {
-            joint_old: None,
-            members,
-        } = pending_entry.kind
-    {
-        active_config_for_batch = Some(ActiveConfigRecord {
-            log_index: Some(pending_idx),
-            current: members.clone(),
-            joint_old: None,
-        });
-        post_active_view = Some((ActiveConfig::steady(members), Some(pending_idx), None));
-    }
-    if retirement_confirmation_after_batch.is_some_and(|index| index <= state.meta.commit_index) {
-        retirement_final_after_batch = None;
-        retirement_confirmation_after_batch = None;
-        retiring_after_batch.clear();
-        retiring_acks_after_batch.clear();
-    }
-    if let Err(e) = state
-        .storage
-        .commit_batch(WriteBatch {
-            truncate_after,
-            compact_to: None,
-            appends,
-            state: None,
-            meta: Some(state.meta.clone()),
-            active_config: active_config_for_batch,
-        })
-        .await
-    {
-        state.meta = meta_snapshot;
-        return Err(e);
-    }
-
-    if commit_advanced {
-        state.fire_apply_notification();
-    }
-
-    let retiring_changed = retiring_after_batch != state.retiring_voters;
-    state.retiring_voters = retiring_after_batch;
-    state.retiring_voter_acks = retiring_acks_after_batch;
-    state.retirement_final_index = retirement_final_after_batch;
-    state.retirement_confirmation_entry = retirement_confirmation_after_batch;
-    if let Some((active, idx, pending)) = post_active_view {
-        state.effective_cfg = active;
-        state.active_config_index = idx;
-        state.pending_joint_entry = pending;
-        rebuild_leader_tracking(state);
-    } else if truncate_invalidated_pending {
-        // A speculative final row can be overwritten while the preceding
-        // joint row remains live. Re-arm finalization on that joint row rather
-        // than retaining an index that no longer exists.
-        state.pending_joint_entry = if state.effective_cfg.is_joint() {
-            state.active_config_index
-        } else {
-            None
-        };
-    } else if retiring_changed {
-        rebuild_leader_tracking(state);
-    }
-
-    Ok(AppendEntriesResp {
-        term: state.meta.current_term,
-        success: true,
-        match_index: last_new_index,
+    let active_config = storage.active_config().await?;
+    let applied = storage.applied_index().await?.unwrap_or(meta.commit_index);
+    Ok(Recovered {
+        meta,
+        entries,
+        active_config,
+        applied,
     })
-}
-
-async fn handle_request_vote<N, S, T, C, R, A>(
-    state: &mut WorkerState<N, S, T, C, R, A>,
-    _from: N,
-    req: RequestVoteReq<N>,
-) -> Result<RequestVoteResp, S::Error>
-where
-    N: NodeId,
-    S: Storage<N>,
-    T: Transport<N>,
-    C: Clock,
-    R: Rng,
-    A: ApplySink,
-{
-    if req.term < state.meta.current_term {
-        return Ok(RequestVoteResp {
-            term: state.meta.current_term,
-            vote_granted: false,
-        });
-    }
-    // Snapshot meta so a storage failure rolls in-memory back.
-    let meta_snapshot = state.meta.clone();
-    let mut meta_changed = false;
-    if req.term > state.meta.current_term {
-        state.meta.current_term = req.term;
-        state.meta.voted_for = None;
-        state.seen_leader = None;
-        step_down(state);
-        meta_changed = true;
-    }
-
-    let our_last_term = state.storage.last_term();
-    let our_last_index = state.storage.last_index();
-    let candidate_up_to_date = (req.last_log_term > our_last_term)
-        || (req.last_log_term == our_last_term && req.last_log_index >= our_last_index);
-    let already_voted_otherwise = state.meta.voted_for.is_some_and(|v| v != req.candidate);
-    let granted = !already_voted_otherwise && candidate_up_to_date;
-
-    if granted {
-        state.meta.voted_for = Some(req.candidate);
-        state.reset_election_timer();
-        meta_changed = true;
-    }
-
-    if meta_changed
-        && let Err(e) = state
-            .storage
-            .commit_batch(WriteBatch {
-                meta: Some(state.meta.clone()),
-                ..Default::default()
-            })
-            .await
-    {
-        state.meta = meta_snapshot;
-        return Err(e);
-    }
-
-    Ok(RequestVoteResp {
-        term: state.meta.current_term,
-        vote_granted: granted,
-    })
-}
-
-/// Inbound `PreVote` handler. Critically, this MUST NOT mutate
-/// `current_term` or `voted_for` — we answer the hypothetical
-/// "would you vote for me at `next_term`?" without committing.
-///
-/// Refuses if (1) the requester's `next_term` isn't actually
-/// higher than ours, (2) we've heard from a current-term leader
-/// within `election_timeout_ms.0` (the leader-check that gives
-/// pre-vote its term-stability property), or (3) the requester's
-/// log is staler than ours (Raft §5.4.1).
-fn handle_request_prevote<N, S, T, C, R, A>(
-    state: &WorkerState<N, S, T, C, R, A>,
-    _from: N,
-    req: PreVoteReq<N>,
-) -> PreVoteResp
-where
-    N: NodeId,
-    S: Storage<N>,
-    T: Transport<N>,
-    C: Clock,
-    R: Rng,
-    A: ApplySink,
-{
-    if req.next_term <= state.meta.current_term {
-        return PreVoteResp {
-            term: state.meta.current_term,
-            vote_granted: false,
-        };
-    }
-    // Leader-check (Ongaro §9.6): refuse pre-votes when we've
-    // heard from a current-term leader recently. On a fresh
-    // boot `last_heartbeat_received` is `None` and we waive the
-    // check — there's no leader to protect, and refusing here
-    // would deadlock cluster startup (every fresh follower's
-    // election deadline is in the future, so they'd all refuse
-    // each other's pre-votes until their own timer expires —
-    // and once one does expire and sends pre-votes, the others
-    // would still refuse because their deadlines are also
-    // future).
-    let now = state.clock.now();
-    if let Some(last_hb) = state.last_heartbeat_received {
-        let stale_threshold = state.clock.add(
-            last_hb,
-            core::time::Duration::from_millis(state.cfg.election_timeout_ms.0),
-        );
-        if now < stale_threshold {
-            return PreVoteResp {
-                term: state.meta.current_term,
-                vote_granted: false,
-            };
-        }
-    }
-    let our_last_term = state.storage.last_term();
-    let our_last_index = state.storage.last_index();
-    let up_to_date = (req.last_log_term > our_last_term)
-        || (req.last_log_term == our_last_term && req.last_log_index >= our_last_index);
-    PreVoteResp {
-        term: state.meta.current_term,
-        vote_granted: up_to_date,
-    }
-}
-
-async fn handle_install_snapshot<N, S, T, C, R, A>(
-    state: &mut WorkerState<N, S, T, C, R, A>,
-    from: N,
-    req: InstallSnapshotReq<N>,
-) -> Result<InstallSnapshotResp, S::Error>
-where
-    N: NodeId,
-    S: Storage<N>,
-    T: Transport<N>,
-    C: Clock,
-    R: Rng,
-    A: ApplySink,
-{
-    // Stale-term sender: refuse without touching state.
-    if req.term < state.meta.current_term {
-        return Ok(InstallSnapshotResp {
-            term: state.meta.current_term,
-            bytes_received: 0,
-        });
-    }
-    if req.term > state.meta.current_term {
-        // Raft §5.2 requires current_term and voted_for to survive a crash.
-        // A non-final chunk is still an acknowledgement to this leader, so
-        // persist the higher term before accepting or acknowledging any bytes.
-        persist_term_bump(state, req.term).await?;
-        state.seen_leader = None;
-        // Drop any in-flight snapshot from a prior term — its
-        // identity is now stale.
-        state.incoming_snapshot = None;
-    }
-    // Snapshot meta so a later snapshot-state write failure rolls in-memory
-    // state back without undoing a higher term already persisted above.
-    let meta_snapshot = state.meta.clone();
-    let was_leader = state.role == Role::Leader;
-    state.set_role(Role::Follower);
-    state.votes_received.clear();
-    state.leader = None;
-    state.current_term_first_index = None;
-    if was_leader {
-        drain_pending_reads_on_step_down(state);
-    }
-    state.reset_election_timer();
-    state.last_heartbeat_received = Some(state.clock.now());
-    // Treat the snapshot leader the same as an AppendEntries
-    // sender — they're a current-term leader that just contacted us.
-    state.seen_leader = Some(req.leader);
-
-    // Snapshot already covered by our local snap pointer — no-op. Report this
-    // request's acknowledged end offset so a leader whose final response was
-    // lost can still classify the retry as complete. A newer local snapshot
-    // also safely covers an older install request.
-    if req.last_included_index <= state.storage.snap_last_index() {
-        state.incoming_snapshot = None;
-        return Ok(InstallSnapshotResp {
-            term: state.meta.current_term,
-            bytes_received: req.offset.saturating_add(req.data.len() as u64),
-        });
-    }
-
-    // ── Chunk assembly ──
-    //
-    // Reset the buffer if the identity changed (different
-    // leader, different (idx, term), or no buffer yet).
-    let identity_match = state.incoming_snapshot.as_ref().is_some_and(|s| {
-        s.leader == from
-            && s.term == req.term
-            && s.last_included_index == req.last_included_index
-            && s.last_included_term == req.last_included_term
-    });
-    if !identity_match {
-        state.incoming_snapshot = Some(IncomingSnapshot {
-            leader: from,
-            term: req.term,
-            last_included_index: req.last_included_index,
-            last_included_term: req.last_included_term,
-            buffer: Vec::new(),
-        });
-    }
-
-    let buf = state.incoming_snapshot.as_mut().expect("set above");
-    let current_len = buf.buffer.len() as u64;
-
-    // Out-of-order or duplicate chunk handling:
-    // - offset == current_len  → in-order, append.
-    // - offset <  current_len  → duplicate / overlap; ignore the
-    //   data and report `bytes_received = current_len` so the
-    //   leader can resume.
-    // - offset >  current_len  → gap; refuse and ask the leader
-    //   to resume from `current_len`.
-    if req.offset > current_len {
-        return Ok(InstallSnapshotResp {
-            term: state.meta.current_term,
-            bytes_received: current_len,
-        });
-    }
-    if req.offset == current_len {
-        // DoS bound: reject if accepting this chunk would push
-        // the buffer past `Config::max_snapshot_bytes`. Drop the
-        // partial buffer too — a leader that respects the cap
-        // will have to restart the stream after a retry, but a
-        // misbehaving leader can't sit on a half-buffered
-        // snapshot indefinitely.
-        let cap = state.cfg.max_snapshot_bytes;
-        if buf.buffer.len().saturating_add(req.data.len()) > cap {
-            state.incoming_snapshot = None;
-            return Ok(InstallSnapshotResp {
-                term: state.meta.current_term,
-                bytes_received: 0,
-            });
-        }
-        buf.buffer.extend_from_slice(&req.data);
-    }
-    // (offset < current_len: silently treat as already-have.)
-
-    let new_len = buf.buffer.len() as u64;
-
-    // Not the final chunk — wait for more.
-    if !req.done {
-        return Ok(InstallSnapshotResp {
-            term: state.meta.current_term,
-            bytes_received: new_len,
-        });
-    }
-
-    // Final chunk — commit the assembled snapshot atomically.
-    let snapshot = state.incoming_snapshot.take().expect("set above").buffer;
-
-    // Membership and its provenance are one atomic claim. Reject incomplete
-    // or future provenance before advancing any durable snapshot boundary.
-    // An omitted claim remains useful for state catch-up, but cannot confer
-    // new membership authority.
-    let supplied_config_index = match (req.members.is_empty(), req.active_config_index) {
-        (false, Some(index)) if index <= req.last_included_index => Some(index),
-        (true, None) if req.joint_old.is_none() => None,
-        _ => {
-            return Ok(InstallSnapshotResp {
-                term: state.meta.current_term,
-                bytes_received: 0,
-            });
-        }
-    };
-
-    state.meta.snap_last_index = req.last_included_index;
-    state.meta.snap_last_term = req.last_included_term;
-    state.meta.commit_index = state.meta.commit_index.max(req.last_included_index);
-
-    // Snapshot installs compact past every log entry up to
-    // `last_included_index`. Two membership concerns need
-    // handling in the same atomic batch as the snap-pointer
-    // advance:
-    //
-    // 1. If the leader supplied `members` (and possibly
-    //    `joint_old`) with exact provenance, they ARE the authoritative
-    //    membership at the supplied configuration index. Adopt them — this
-    //    is the only path by which a fresh follower whose first activity is
-    //    an InstallSnapshot can learn the cluster's current
-    //    shape. `members.is_empty()` means the sender omitted membership;
-    //    fall back to keeping the existing
-    //    `effective_cfg` without manufacturing committed provenance.
-    // 2. Persist the resulting `effective_cfg` to the
-    //    `active_config` row so a future reboot whose log scan
-    //    finds nothing (compacted away) can still recover.
-    // 3. `active_config_index` / `pending_joint_entry` pointing at
-    //    speculative evidence covered by an omission are invalidated.
-    let mut new_effective_cfg: Option<ActiveConfig<N>> = None;
-    if !req.members.is_empty() {
-        new_effective_cfg = Some(ActiveConfig {
-            current: req.members.clone(),
-            joint_old: req.joint_old.clone(),
-        });
-    }
-    let active_config_for_batch = Some(match &new_effective_cfg {
-        Some(cfg) => ActiveConfigRecord {
-            log_index: supplied_config_index,
-            current: cfg.current.clone(),
-            joint_old: cfg.joint_old.clone(),
-        },
-        None => ActiveConfigRecord {
-            // Preserve only evidence that was already committed before this
-            // install. Advancing the snapshot commit boundary must not turn a
-            // locally speculative configuration into committed evidence.
-            log_index: state
-                .active_config_index
-                .filter(|index| *index <= meta_snapshot.commit_index),
-            current: state.effective_cfg.current.clone(),
-            joint_old: state.effective_cfg.joint_old.clone(),
-        },
-    });
-    if let Err(e) = state
-        .storage
-        .commit_batch(WriteBatch {
-            compact_to: Some((req.last_included_index, req.last_included_term)),
-            state: Some(snapshot),
-            meta: Some(state.meta.clone()),
-            active_config: active_config_for_batch,
-            ..Default::default()
-        })
-        .await
-    {
-        state.meta = meta_snapshot;
-        return Err(e);
-    }
-    // Any locally reconstructed notice at or below the installed snapshot is
-    // superseded with its source log pair. A leader with a genuinely pending
-    // notice pins compaction below that pair, so an authoritative snapshot can
-    // cross this boundary only after the notice has been acknowledged.
-    if state
-        .retirement_final_index
-        .is_some_and(|final_index| final_index <= req.last_included_index)
-    {
-        state.retirement_final_index = None;
-        state.retirement_confirmation_entry = None;
-        state.retiring_voters.clear();
-        state.retiring_voter_acks.clear();
-    } else {
-        state
-            .retiring_voters
-            .retain(|_, final_index| *final_index > req.last_included_index);
-    }
-    if let Some(cfg) = new_effective_cfg {
-        state.effective_cfg = cfg;
-        // Preserve the exact configuration provenance supplied by the
-        // snapshot leader even though the originating entry was compacted.
-        state.active_config_index = supplied_config_index;
-        // A joint-phase view recovered via snapshot can't
-        // auto-finalize from this replica either — leader-side
-        // joint_idx isn't known to us, so wait for a leader-
-        // emitted joint-or-final ConfigChange to re-prime.
-        state.pending_joint_entry = None;
-        rebuild_leader_tracking(state);
-    } else {
-        // Membership was omitted. Retain only evidence that was committed
-        // before the install; do not let the new commit boundary promote a
-        // speculative local configuration into authoritative evidence.
-        state.active_config_index = state
-            .active_config_index
-            .filter(|index| *index <= meta_snapshot.commit_index);
-        if state
-            .pending_joint_entry
-            .is_some_and(|idx| idx <= req.last_included_index)
-        {
-            state.pending_joint_entry = None;
-        }
-    }
-
-    state.fire_apply_notification();
-    Ok(InstallSnapshotResp {
-        term: state.meta.current_term,
-        bytes_received: new_len,
-    })
-}
-
-// ── Outbound RPC response handlers ──────────────────────────
-
-async fn handle_append_response<N, S, T, C, R, A>(
-    state: &mut WorkerState<N, S, T, C, R, A>,
-    from: N,
-    resp: AppendEntriesResp,
-    sent_leader_commit: u64,
-    round: u64,
-) -> Result<(), S::Error>
-where
-    N: NodeId,
-    S: Storage<N>,
-    T: Transport<N>,
-    C: Clock,
-    R: Rng,
-    A: ApplySink,
-{
-    if resp.term > state.meta.current_term {
-        persist_term_bump(state, resp.term).await?;
-        step_down(state);
-        return Ok(());
-    }
-    if state.role != Role::Leader || resp.term != state.meta.current_term {
-        return Ok(());
-    }
-    let leader = match state.leader.as_mut() {
-        Some(l) => l,
-        None => return Ok(()),
-    };
-    // An answer at the current term confirms leadership as of `round`,
-    // whether or not the logs matched.
-    let acked = leader.acked_round.entry(from).or_insert(0);
-    *acked = (*acked).max(round);
-    if resp.success {
-        // Raft §5.3: match_index is "the highest log entry known
-        // to be replicated" — strictly monotonic per peer. With
-        // FuturesUnordered driving outbound RPCs, a stale ack
-        // from an earlier heartbeat tick can land AFTER a fresh
-        // ack from a later tick; without the max-clamp the stale
-        // lower value would overwrite the live higher one and
-        // stall commit_index advancement / try_compact until the
-        // next ack rebuilds the quorum floor.
-        let prev_match = leader.match_index.get(&from).copied().unwrap_or(0);
-        let new_match = resp.match_index.max(prev_match);
-        leader.match_index.insert(from, new_match);
-        leader.next_index.insert(from, new_match + 1);
-        try_advance_commit_index(state).await?;
-        // Quorum match-index may have advanced past the captured
-        // commit_index of one or more pending read_index
-        // requests. Resolve any that meet the threshold.
-        try_resolve_pending_reads(state).await;
-        let learned_final = state
-            .retiring_voters
-            .get(&from)
-            .copied()
-            .is_some_and(|final_index| {
-                sent_leader_commit >= final_index && resp.match_index >= final_index
-            });
-        if learned_final {
-            state.retiring_voter_acks.insert(from);
-            maybe_append_retirement_confirmation(state).await?;
-        }
-    } else {
-        let cur = leader.next_index.get(&from).copied().unwrap_or(1);
-        let new_next = cur.saturating_sub(1).max(1);
-        leader.next_index.insert(from, new_next);
-        try_resolve_pending_reads(state).await;
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn handle_install_snapshot_response<N, S, T, C, R, A>(
-    state: &mut WorkerState<N, S, T, C, R, A>,
-    from: N,
-    resp: InstallSnapshotResp,
-    last_included_index: u64,
-    last_included_term: u64,
-    chunk_end_offset: u64,
-    was_final: bool,
-    round: u64,
-) -> Result<(), S::Error>
-where
-    N: NodeId,
-    S: Storage<N>,
-    T: Transport<N>,
-    C: Clock,
-    R: Rng,
-    A: ApplySink,
-{
-    if resp.term > state.meta.current_term {
-        persist_term_bump(state, resp.term).await?;
-        step_down(state);
-        return Ok(());
-    }
-    if state.role != Role::Leader || resp.term != state.meta.current_term {
-        return Ok(());
-    }
-    let Some(leader) = state.leader.as_mut() else {
-        return Ok(());
-    };
-    let acked = leader.acked_round.entry(from).or_insert(0);
-    *acked = (*acked).max(round);
-
-    // Update the per-peer chunk cursor. The follower's
-    // `bytes_received` is authoritative — if it tells us it
-    // has fewer bytes than we sent (lost chunk, identity reset
-    // on its side), we resume from there.
-    let cursor = resp.bytes_received.min(chunk_end_offset);
-    let entry = leader
-        .snapshot_send
-        .entry(from)
-        .or_insert(SnapshotSendState {
-            last_included_index,
-            last_included_term,
-            offset: 0,
-        });
-    if entry.last_included_index == last_included_index
-        && entry.last_included_term == last_included_term
-    {
-        // The receiver is authoritative. In particular, zero means it
-        // restarted and lost its volatile partial buffer, so rewind instead
-        // of pinning the old local cursor forever.
-        entry.offset = cursor;
-    } else {
-        // Identity differs — the leader has compacted past this
-        // stream's index, so start a new tracker on next send.
-        leader.snapshot_send.remove(&from);
-    }
-
-    if was_final && resp.bytes_received >= chunk_end_offset {
-        // Follower acknowledged the full snapshot. Bump match/
-        // next_index and clear the per-peer tracker so the next
-        // heartbeat resumes log-based replication.
-        let prev_match = leader.match_index.get(&from).copied().unwrap_or(0);
-        if last_included_index > prev_match {
-            leader.match_index.insert(from, last_included_index);
-        }
-        leader.next_index.insert(from, last_included_index + 1);
-        leader.snapshot_send.remove(&from);
-    }
-    try_resolve_pending_reads(state).await;
-    Ok(())
-}
-
-async fn handle_vote_response<N, S, T, C, R, A>(
-    state: &mut WorkerState<N, S, T, C, R, A>,
-    from: N,
-    resp: RequestVoteResp,
-) -> Result<(), S::Error>
-where
-    N: NodeId,
-    S: Storage<N>,
-    T: Transport<N>,
-    C: Clock,
-    R: Rng,
-    A: ApplySink,
-{
-    if resp.term > state.meta.current_term {
-        persist_term_bump(state, resp.term).await?;
-        step_down(state);
-        return Ok(());
-    }
-    if state.role != Role::Candidate || resp.term != state.meta.current_term {
-        return Ok(());
-    }
-    if resp.vote_granted {
-        // Only count grants from members of the active
-        // configuration. A late-arriving grant from a peer
-        // we just removed via change_membership shouldn't
-        // help us cross quorum, and a forged response from a
-        // non-member must not corrupt votes_received.
-        if !state.effective_cfg.all_members().contains(&from) {
-            return Ok(());
-        }
-        state.votes_received.insert(from);
-        let votes = state.votes_received.clone();
-        if state.quorum_holds(|m| votes.contains(&m)) {
-            // Become leader. We can't pass `pending` here without
-            // major plumbing churn — call become_leader inline,
-            // and the next timer tick will fire heartbeats.
-            become_leader_no_heartbeat(state).await?;
-            // Trigger a heartbeat by collapsing the deadline.
-            state.election_deadline = state.clock.now();
-        }
-    }
-    Ok(())
-}
-
-/// Outcome handler for a `PreVote` reply. On quorum-yes,
-/// transitions PreCandidate → Candidate and collapses the
-/// election deadline so the next `on_timer` fires
-/// `start_election` immediately.
-async fn handle_prevote_response<N, S, T, C, R, A>(
-    state: &mut WorkerState<N, S, T, C, R, A>,
-    from: N,
-    next_term: u64,
-    resp: PreVoteResp,
-) -> Result<(), S::Error>
-where
-    N: NodeId,
-    S: Storage<N>,
-    T: Transport<N>,
-    C: Clock,
-    R: Rng,
-    A: ApplySink,
-{
-    // A peer at a strictly higher term tells us we're stale.
-    if resp.term > state.meta.current_term {
-        persist_term_bump(state, resp.term).await?;
-        step_down(state);
-        return Ok(());
-    }
-    // Stale next_term or wrong role.
-    if state.role != Role::PreCandidate || next_term != state.meta.current_term + 1 {
-        return Ok(());
-    }
-    if resp.vote_granted {
-        // Same active-config gate as `handle_vote_response`: a
-        // pre-vote grant from a non-member must not influence
-        // promotion to Candidate.
-        if !state.effective_cfg.all_members().contains(&from) {
-            return Ok(());
-        }
-        state.votes_received.insert(from);
-        let votes = state.votes_received.clone();
-        if state.quorum_holds(|m| votes.contains(&m)) {
-            // Pre-vote quorum reached. Promote to Candidate and
-            // collapse the timer; `on_timer`'s next fire will
-            // call `start_election` which bumps the term and
-            // sends real RequestVotes.
-            state.set_role(Role::Candidate);
-            state.pre_candidate_misses = 0;
-            state.election_deadline = state.clock.now();
-        }
-    }
-    Ok(())
-}
-
-// ── Higher-level transitions ────────────────────────────────
-
-async fn handle_propose<N, S, T, C, R, A>(
-    state: &mut WorkerState<N, S, T, C, R, A>,
-    payload: Vec<u8>,
-) -> Result<u64, ProposeError>
-where
-    N: NodeId,
-    S: Storage<N>,
-    T: Transport<N>,
-    C: Clock,
-    R: Rng,
-    A: ApplySink,
-{
-    if state.role != Role::Leader {
-        return Err(ProposeError::NotLeader);
-    }
-    let term = state.meta.current_term;
-    let new_index = state.storage.last_index() + 1;
-    let entry = LogEntry::data(new_index, term, payload);
-    state
-        .storage
-        .commit_batch(WriteBatch {
-            appends: alloc::vec![entry],
-            ..Default::default()
-        })
-        .await
-        .map_err(|_| ProposeError::Storage(()))?;
-    let _ = try_advance_commit_index(state).await;
-    Ok(new_index)
-}
-
-/// Handle a `RaftMsg::ChangeMembership` request. The leader
-/// appends a joint `ConfigChange` entry to its log; the joint
-/// configuration takes effect immediately (Ongaro thesis §4.3 —
-/// even before the entry commits) and quorum decisions now
-/// require majorities from BOTH sets.
-///
-/// Auto-progression to non-joint happens later, when
-/// `try_advance_commit_index` observes that the joint entry has
-/// committed.
-async fn handle_change_membership<N, S, T, C, R, A>(
-    state: &mut WorkerState<N, S, T, C, R, A>,
-    new_members: Vec<N>,
-) -> Result<u64, ChangeMembershipError>
-where
-    N: NodeId,
-    S: Storage<N>,
-    T: Transport<N>,
-    C: Clock,
-    R: Rng,
-    A: ApplySink,
-{
-    if state.role != Role::Leader {
-        return Err(ChangeMembershipError::NotLeader);
-    }
-    if state.effective_cfg.is_joint() || state.retirement_final_index.is_some() {
-        return Err(ChangeMembershipError::InProgress);
-    }
-    if new_members.is_empty() {
-        return Err(ChangeMembershipError::EmptyConfig);
-    }
-    let term = state.meta.current_term;
-    let new_index = state.storage.last_index() + 1;
-    let old_members = state.effective_cfg.current.clone();
-    let entry = LogEntry {
-        index: new_index,
-        term,
-        kind: crate::log_entry::EntryKind::ConfigChange {
-            joint_old: Some(old_members.clone()),
-            members: new_members.clone(),
-        },
-    };
-    state
-        .storage
-        .commit_batch(WriteBatch {
-            appends: alloc::vec![entry],
-            // Persist the joint view alongside the entry so a
-            // restart that compacts past this entry can still
-            // recover the joint state via Storage::active_config.
-            active_config: Some(ActiveConfigRecord {
-                log_index: Some(new_index),
-                current: new_members.clone(),
-                joint_old: Some(old_members.clone()),
-            }),
-            ..Default::default()
-        })
-        .await
-        .map_err(|_| ChangeMembershipError::Storage(()))?;
-    // Adopt the joint configuration immediately — the leader
-    // starts demanding joint quorum even before the entry
-    // commits.
-    state.effective_cfg = ActiveConfig {
-        current: new_members,
-        joint_old: Some(old_members),
-    };
-    // Remember the joint entry's index so finalization fires on
-    // *this* entry's commit, not on a prefix-scan match against
-    // any historical joint entry that happens to target the same
-    // member set.
-    state.pending_joint_entry = Some(new_index);
-    state.active_config_index = Some(new_index);
-    rebuild_leader_tracking(state);
-    let _ = try_advance_commit_index(state).await;
-    Ok(new_index)
-}
-
-/// After the active configuration changes (joint entry
-/// adopted, joint entry truncated, or auto-progression to
-/// non-joint), refresh `LeaderState`'s per-peer maps so newly
-/// added members and pending finality-notice recipients are tracked, while
-/// fully retired members are dropped.
-fn rebuild_leader_tracking<N, S, T, C, R, A>(state: &mut WorkerState<N, S, T, C, R, A>)
-where
-    N: NodeId,
-    S: Storage<N>,
-    T: Transport<N>,
-    C: Clock,
-    R: Rng,
-    A: ApplySink,
-{
-    let last = state.storage.last_index();
-    let me = state.cfg.me;
-    let Some(leader) = state.leader.as_mut() else {
-        return;
-    };
-    let mut members = state.effective_cfg.all_members();
-    members.extend(state.retiring_voters.keys().copied());
-    members.sort_unstable();
-    members.dedup();
-    // Add tracking for any newly-known peer.
-    for m in &members {
-        if *m == me {
-            continue;
-        }
-        leader.next_index.entry(*m).or_insert(last + 1);
-        leader.match_index.entry(*m).or_insert(0);
-    }
-    // Drop tracking only after a peer has left the active configuration and
-    // acknowledged its finality notice.
-    leader.next_index.retain(|m, _| members.contains(m));
-    leader.match_index.retain(|m, _| members.contains(m));
-    leader.snapshot_send.retain(|m, _| members.contains(m));
-    leader.acked_round.retain(|m, _| members.contains(m));
-}
-
-/// Handle a `RaftMsg::ReadIndex` request. Captures the leader's
-/// current `commit_index`, queues the request on
-/// `pending_read_index`, and triggers an immediate heartbeat
-/// round so a fresh quorum confirmation arrives soon. The
-/// request resolves once `match_index_majority_floor` reaches
-/// the captured commit_index.
-async fn handle_read_index<N, S, T, C, R, A>(
-    state: &mut WorkerState<N, S, T, C, R, A>,
-    pending: &mut FuturesUnordered<RpcFut<N>>,
-    timeout: Option<Duration>,
-    reply: oneshot::Sender<Result<u64, ReadIndexError>>,
-) where
-    N: NodeId,
-    S: Storage<N>,
-    T: Transport<N>,
-    C: Clock,
-    R: Rng,
-    A: ApplySink,
-{
-    if state.role != Role::Leader {
-        let _ = reply.send(Err(ReadIndexError::NotLeader));
-        return;
-    }
-    // Solo cluster: no peers to confirm with, but the leader IS
-    // the only voter. Resolve immediately.
-    if is_solo_cluster(state) {
-        let _ = reply.send(Ok(state.meta.commit_index));
-        return;
-    }
-    // Backpressure: refuse new requests if the queue is full.
-    // Without this cap, an asymmetric partition (leader receives
-    // but can't quorum-confirm) silently grows the queue until
-    // the worker exhausts its heap.
-    if state.pending_read_index.len() >= state.cfg.max_pending_reads {
-        let _ = reply.send(Err(ReadIndexError::Backpressure));
-        return;
-    }
-    // Capture R = max(commit_index, current_term_first_index).
-    // Bumping R up to the no-op's index ensures we don't resolve
-    // until at least one current-term entry has committed
-    // (Ongaro §6.4 — the linearizability gate). Without this,
-    // a freshly-elected leader could resolve `read_index`
-    // against a prior-term commit_index, returning state from
-    // before its election.
-    let mut r = state.meta.commit_index;
-    if let Some(noop_idx) = state.current_term_first_index
-        && noop_idx > r
-    {
-        r = noop_idx;
-    }
-    let Some(leader) = state.leader.as_ref() else {
-        let _ = reply.send(Err(ReadIndexError::NotLeader));
-        return;
-    };
-    let deadline = timeout.map(|timeout| state.clock.add(state.clock.now(), timeout));
-    state.pending_read_index.push(PendingReadIndex {
-        required_index: r,
-        round: leader.round + 1,
-        deadline,
-        reply,
-    });
-    // Trigger a fresh heartbeat round. A quorum's answers to it, or to
-    // any later round, confirm we're still leader at the current term
-    // and fire `try_resolve_pending_reads`, which drains the queue.
-    let _ = send_heartbeats(state, pending).await;
-}
-
-/// Drain `pending_read_index` entries whose round a quorum has
-/// answered and whose captured commit index is now ≤
-/// `match_index_majority_floor`. Each drained entry is replied with
-/// `Ok(R)`. The round shows leadership after the request; the floor
-/// shows the current term's no-op, which `R` includes, replicated to a
-/// quorum, without which no read at this term may be served (Ongaro
-/// §6.4).
-async fn try_resolve_pending_reads<N, S, T, C, R, A>(state: &mut WorkerState<N, S, T, C, R, A>)
-where
-    N: NodeId,
-    S: Storage<N>,
-    T: Transport<N>,
-    C: Clock,
-    R: Rng,
-    A: ApplySink,
-{
-    if state.pending_read_index.is_empty() {
-        return;
-    }
-    let Some(mf) = state.match_index_majority_floor().await else {
-        return;
-    };
-    let queued = core::mem::take(&mut state.pending_read_index);
-    let Some(leader) = state.leader.as_ref() else {
-        state.pending_read_index = queued;
-        return;
-    };
-    let me = state.cfg.me;
-    let confirmed = |round: u64| {
-        state.quorum_holds(|m| {
-            m == me
-                || leader
-                    .acked_round
-                    .get(&m)
-                    .is_some_and(|acked| *acked >= round)
-        })
-    };
-    let now = state.clock.now();
-    // Partition pending into resolvable + still-waiting.
-    let mut still_waiting = Vec::new();
-    for pending in queued {
-        if pending.deadline.is_some_and(|deadline| deadline <= now) {
-            let _ = pending.reply.send(Err(ReadIndexError::TimedOut));
-        } else if pending.required_index <= mf && confirmed(pending.round) {
-            let _ = pending.reply.send(Ok(pending.required_index));
-        } else {
-            still_waiting.push(pending);
-        }
-    }
-    state.pending_read_index = still_waiting;
-}
-
-/// Remove every bounded read whose worker-clock deadline has elapsed. The
-/// sender is completed before the row is discarded, so callers observe a
-/// typed timeout and the queue slot is immediately reusable.
-fn expire_pending_reads<N, S, T, C, R, A>(
-    state: &mut WorkerState<N, S, T, C, R, A>,
-    now: C::Instant,
-) where
-    N: NodeId,
-    S: Storage<N>,
-    T: Transport<N>,
-    C: Clock,
-    R: Rng,
-    A: ApplySink,
-{
-    let mut still_waiting = Vec::new();
-    for pending in core::mem::take(&mut state.pending_read_index) {
-        if pending.deadline.is_some_and(|deadline| deadline <= now) {
-            let _ = pending.reply.send(Err(ReadIndexError::TimedOut));
-        } else {
-            still_waiting.push(pending);
-        }
-    }
-    state.pending_read_index = still_waiting;
-}
-
-/// Drain every pending read-index entry with a `LeaderStepped`
-/// error. Called by `step_down`.
-fn drain_pending_reads_on_step_down<N, S, T, C, R, A>(state: &mut WorkerState<N, S, T, C, R, A>)
-where
-    N: NodeId,
-    S: Storage<N>,
-    T: Transport<N>,
-    C: Clock,
-    R: Rng,
-    A: ApplySink,
-{
-    for pending in core::mem::take(&mut state.pending_read_index) {
-        let _ = pending.reply.send(Err(ReadIndexError::LeaderStepped));
-    }
-}
-
-async fn become_leader_no_heartbeat<N, S, T, C, R, A>(
-    state: &mut WorkerState<N, S, T, C, R, A>,
-) -> Result<(), S::Error>
-where
-    N: NodeId,
-    S: Storage<N>,
-    T: Transport<N>,
-    C: Clock,
-    R: Rng,
-    A: ApplySink,
-{
-    let last = state.storage.last_index();
-    // Ongaro thesis §6.4: a freshly-elected leader must commit
-    // an entry in its current term before serving reads. Without
-    // this no-op, `read_index` could return commit_index that
-    // points at a prior-term entry — and the read would observe
-    // state that a future leader at a higher term might revert.
-    // The no-op is opaque (`EntryKind::Data` with empty payload);
-    // application apply-sinks just see it as a normal data entry
-    // and skip it (or apply it as a no-op).
-    //
-    // Audit-found bug: previously this function called
-    // `set_role(Leader)` and built `LeaderState` BEFORE the no-op
-    // append, so a `commit_batch` Err left the worker as Leader
-    // without `current_term_first_index` — `read_index` would
-    // then resolve against a prior-term `commit_index`, breaking
-    // linearizability. We now persist the no-op first and only
-    // promote on success; a storage failure stays in Candidate
-    // and the next election timer retries the bump.
-    let term = state.meta.current_term;
-    let new_index = last + 1;
-    let no_op = LogEntry::data(new_index, term, Vec::new());
-    state
-        .storage
-        .commit_batch(WriteBatch {
-            appends: alloc::vec![no_op],
-            ..Default::default()
-        })
-        .await?;
-    state.set_role(Role::Leader);
-    state.votes_received.clear();
-    let members = state.effective_cfg.all_members();
-    state.leader = Some(LeaderState::fresh(&members, state.cfg.me, last));
-    rebuild_leader_tracking(state);
-    // Self-as-leader: surface through `WorkerSnapshot::leader_hint`
-    // so `vosx ps` and join-RPC handlers can answer "the leader
-    // is us" without inspecting `role` separately.
-    state.seen_leader = Some(state.cfg.me);
-    // Remember the no-op's index so `read_index` blocks until
-    // it commits — proves at least one current-term entry has
-    // achieved quorum before any read can serve.
-    state.current_term_first_index = Some(new_index);
-    // For a solo cluster the leader's match-quorum is met by
-    // self alone, so the no-op is "committed" the moment it's
-    // written. Advance commit_index synchronously so an
-    // immediately-following `read_index` doesn't have to wait
-    // for the next heartbeat tick.
-    let _ = try_advance_commit_index(state).await;
-    Ok(())
-}
-
-fn step_down<N, S, T, C, R, A>(state: &mut WorkerState<N, S, T, C, R, A>)
-where
-    N: NodeId,
-    S: Storage<N>,
-    T: Transport<N>,
-    C: Clock,
-    R: Rng,
-    A: ApplySink,
-{
-    state.set_role(Role::Follower);
-    state.votes_received.clear();
-    state.leader = None;
-    state.current_term_first_index = None;
-    state.pre_candidate_misses = 0;
-    // Drop any in-flight chunked-snapshot buffer. The new term's
-    // leader will restart the stream from offset 0 with a fresh
-    // identity; holding the buffer between roles wastes memory
-    // and risks accidental re-use under a future identity match.
-    state.incoming_snapshot = None;
-    drain_pending_reads_on_step_down(state);
-    state.reset_election_timer();
-}
-
-/// Bump the persisted term, clearing `voted_for`, and **only**
-/// mutate the in-memory `state.meta` after the storage write
-/// succeeds. Without this commit-then-mutate ordering, a
-/// transient `Storage::commit_batch` failure leaves the
-/// in-memory term ahead of the on-disk term — the worker
-/// would continue replying with the higher term while restart
-/// recovery would silently come back at the lower one.
-async fn persist_term_bump<N, S, T, C, R, A>(
-    state: &mut WorkerState<N, S, T, C, R, A>,
-    new_term: u64,
-) -> Result<(), S::Error>
-where
-    N: NodeId,
-    S: Storage<N>,
-    T: Transport<N>,
-    C: Clock,
-    R: Rng,
-    A: ApplySink,
-{
-    let mut next = state.meta.clone();
-    next.current_term = new_term;
-    next.voted_for = None;
-    state
-        .storage
-        .commit_batch(WriteBatch {
-            meta: Some(next.clone()),
-            ..Default::default()
-        })
-        .await?;
-    state.meta = next;
-    Ok(())
-}
-
-async fn try_advance_commit_index<N, S, T, C, R, A>(
-    state: &mut WorkerState<N, S, T, C, R, A>,
-) -> Result<(), S::Error>
-where
-    N: NodeId,
-    S: Storage<N>,
-    T: Transport<N>,
-    C: Clock,
-    R: Rng,
-    A: ApplySink,
-{
-    let Some(majority_floor) = state.match_index_majority_floor().await else {
-        return Ok(());
-    };
-    if majority_floor <= state.meta.commit_index {
-        return Ok(());
-    }
-    let entry_term = state.storage.term_at(majority_floor).await?;
-    if entry_term != Some(state.meta.current_term) {
-        return Ok(());
-    }
-    let prev_commit = state.meta.commit_index;
-    state.meta.commit_index = majority_floor;
-    if let Err(e) = state
-        .storage
-        .commit_batch(WriteBatch {
-            meta: Some(state.meta.clone()),
-            ..Default::default()
-        })
-        .await
-    {
-        // Roll back the in-memory commit_index to keep it
-        // consistent with disk after a transient storage
-        // failure.
-        state.meta.commit_index = prev_commit;
-        return Err(e);
-    }
-    state.fire_apply_notification();
-    // Auto-progress joint → non-joint when the joint
-    // ConfigChange entry has committed (Ongaro thesis §4.3).
-    // Append the final non-joint ConfigChange entry; leader
-    // stays leader through the transition.
-    auto_finalize_joint_config(state).await?;
-    finalize_retirement_confirmation(state);
-    // A leader removed by the final configuration must remain leader until
-    // that exact final entry commits. Stepping down when it is merely appended
-    // strands a two-voter {old,new} -> {new} transition: the replacement has
-    // not necessarily received the newer entry yet, while the old node's log
-    // is too new to grant it a vote. Once committed, the new configuration is
-    // authoritative and the retired node can safely stop leading.
-    let final_config_committed = state
-        .active_config_index
-        .is_some_and(|index| index <= state.meta.commit_index);
-    if state.role == Role::Leader
-        && final_config_committed
-        && !state.effective_cfg.all_members().contains(&state.cfg.me)
-    {
-        step_down(state);
-    }
-    Ok(())
-}
-
-/// Append a consensus-visible acknowledgement after every removed voter has
-/// replied to an AppendEntries carrying the committed final configuration.
-/// The row deliberately re-states the same steady membership: existing Raft
-/// storage/wire codecs already replicate it, while its consecutive shape is
-/// unambiguous to recovery and never reaches the application state machine.
-async fn maybe_append_retirement_confirmation<N, S, T, C, R, A>(
-    state: &mut WorkerState<N, S, T, C, R, A>,
-) -> Result<(), S::Error>
-where
-    N: NodeId,
-    S: Storage<N>,
-    T: Transport<N>,
-    C: Clock,
-    R: Rng,
-    A: ApplySink,
-{
-    if state.role != Role::Leader
-        || state.retirement_final_index.is_none()
-        || state.retirement_confirmation_entry.is_some()
-        || state.retiring_voters.is_empty()
-        || !state
-            .retiring_voters
-            .keys()
-            .all(|voter| state.retiring_voter_acks.contains(voter))
-    {
-        return Ok(());
-    }
-    let index = state.storage.last_index() + 1;
-    let members = state.effective_cfg.current.clone();
-    let entry = LogEntry::config_change(index, state.meta.current_term, None, members.clone());
-    state
-        .storage
-        .commit_batch(WriteBatch {
-            appends: alloc::vec![entry],
-            active_config: Some(ActiveConfigRecord {
-                log_index: Some(index),
-                current: members,
-                joint_old: None,
-            }),
-            ..Default::default()
-        })
-        .await?;
-    state.retirement_confirmation_entry = Some(index);
-    state.active_config_index = Some(index);
-    // A one-voter replacement has no follower response to drive another
-    // commit-index pass. Commit the current-term confirmation immediately
-    // when the active quorum already consists solely of this leader.
-    try_advance_commit_index(state).await?;
-    Ok(())
-}
-
-/// Clear retirement delivery debt only after its replicated confirmation row
-/// is committed. This makes the result stable across leader changes and
-/// restarts, and is the sole point that permits log compaction past the
-/// original joint/final pair.
-fn finalize_retirement_confirmation<N, S, T, C, R, A>(state: &mut WorkerState<N, S, T, C, R, A>)
-where
-    N: NodeId,
-    S: Storage<N>,
-    T: Transport<N>,
-    C: Clock,
-    R: Rng,
-    A: ApplySink,
-{
-    if state
-        .retirement_confirmation_entry
-        .is_none_or(|index| index > state.meta.commit_index)
-    {
-        return;
-    }
-    state.retirement_confirmation_entry = None;
-    state.retirement_final_index = None;
-    state.retiring_voters.clear();
-    state.retiring_voter_acks.clear();
-    rebuild_leader_tracking(state);
-}
-
-/// Advance one committed membership-transition phase. A committed joint row
-/// causes the final row to be appended. A committed final row makes the final
-/// configuration effective and durable. Until that second point, a retiring
-/// leader deliberately retains the joint quorum so it remains eligible to
-/// recover and replicate the final row after a crash.
-async fn auto_finalize_joint_config<N, S, T, C, R, A>(
-    state: &mut WorkerState<N, S, T, C, R, A>,
-) -> Result<(), S::Error>
-where
-    N: NodeId,
-    S: Storage<N>,
-    T: Transport<N>,
-    C: Clock,
-    R: Rng,
-    A: ApplySink,
-{
-    if state.role != Role::Leader || !state.effective_cfg.is_joint() {
-        return Ok(());
-    }
-    // Advance only the specific transition entry we appended or recovered.
-    // Matching by member-set equality would misfire on a stale historical
-    // transition that happens to target the same set.
-    let Some(pending_idx) = state.pending_joint_entry else {
-        return Ok(());
-    };
-    if state.meta.commit_index < pending_idx {
-        return Ok(());
-    }
-
-    let Some(pending_entry) = state
-        .storage
-        .entries(pending_idx, pending_idx)
-        .await?
-        .into_iter()
-        .next()
-    else {
-        return Ok(());
-    };
-    let crate::log_entry::EntryKind::ConfigChange { joint_old, members } = pending_entry.kind
-    else {
-        return Ok(());
-    };
-
-    if joint_old.is_none() {
-        // The final row is now committed. Only now make it the effective view
-        // and allow a removed leader to step down.
-        state
-            .storage
-            .commit_batch(WriteBatch {
-                active_config: Some(ActiveConfigRecord {
-                    log_index: Some(pending_idx),
-                    current: members.clone(),
-                    joint_old: None,
-                }),
-                ..Default::default()
-            })
-            .await?;
-        state.effective_cfg = ActiveConfig::steady(members);
-        state.pending_joint_entry = None;
-        state.active_config_index = Some(pending_idx);
-        rebuild_leader_tracking(state);
-        return Ok(());
-    }
-
-    // Append the final non-joint entry.
-    let term = state.meta.current_term;
-    let new_index = state.storage.last_index() + 1;
-    let retiring = joint_old.unwrap_or_default();
-    let final_members = members;
-    let entry = LogEntry {
-        index: new_index,
-        term,
-        kind: crate::log_entry::EntryKind::ConfigChange {
-            joint_old: None,
-            members: final_members.clone(),
-        },
-    };
-    state
-        .storage
-        .commit_batch(WriteBatch {
-            appends: alloc::vec![entry],
-            ..Default::default()
-        })
-        .await?;
-    let mut removed_any = false;
-    for voter in retiring {
-        if !final_members.contains(&voter) {
-            removed_any = true;
-            if voter != state.cfg.me {
-                state.retiring_voters.insert(voter, new_index);
-            }
-        }
-    }
-    state.retirement_final_index = removed_any.then_some(new_index);
-    state.retirement_confirmation_entry = None;
-    state.retiring_voter_acks.clear();
-    // Keep the joint view effective and persisted until this exact final row
-    // commits. If the retiring leader crashes now, boot recovery can campaign
-    // under the joint quorum and replicate the already-appended final row.
-    state.pending_joint_entry = Some(new_index);
-    // (We don't call `try_advance_commit_index` here, even
-    // though the just-written final entry would commit
-    // immediately in a solo cluster: this function is itself
-    // called from try_advance_commit_index, and a direct
-    // recursive call breaks Rust's async-future layout. The
-    // next heartbeat ack will advance commit_index for the
-    // multi-node case; solo finalize-and-commit is one beat
-    // late, which is acceptable.)
-    // Do not step down merely because the final configuration was appended.
-    // `try_advance_commit_index` retires a removed leader only after this
-    // exact entry commits under the active quorum rules.
-    Ok(())
-}
-
-async fn send_heartbeats<N, S, T, C, R, A>(
-    state: &mut WorkerState<N, S, T, C, R, A>,
-    pending: &mut FuturesUnordered<RpcFut<N>>,
-) -> Result<(), S::Error>
-where
-    N: NodeId,
-    S: Storage<N>,
-    T: Transport<N>,
-    C: Clock,
-    R: Rng,
-    A: ApplySink,
-{
-    let term = state.meta.current_term;
-    let me = state.cfg.me;
-    let leader_last_index = state.storage.last_index();
-    let leader_commit = state.meta.commit_index;
-    let snap_idx = state.storage.snap_last_index();
-    let snap_term = state.storage.snap_last_term();
-
-    let leader = match state.leader.as_mut() {
-        Some(l) => {
-            l.round += 1;
-            l.clone()
-        }
-        None => return Ok(()),
-    };
-    let round = leader.round;
-
-    // Heartbeat to every member of the active configuration. Joint mode
-    // includes both sets for quorum. Recently retired voters are transport-
-    // only recipients until they acknowledge the committed final row; their
-    // match indices never participate in the active configuration's quorum.
-    let mut peers = state.effective_cfg.all_members();
-    peers.extend(state.retiring_voters.keys().copied());
-    peers.sort_unstable();
-    peers.dedup();
-    for peer in peers {
-        if peer == me {
-            continue;
-        }
-        let next_idx = leader.next_index.get(&peer).copied().unwrap_or(1);
-
-        if next_idx <= snap_idx && snap_idx > 0 {
-            // Resume from the per-peer cursor if it points at the
-            // current snap identity; otherwise restart from byte 0.
-            let resume_offset = state
-                .leader
-                .as_ref()
-                .and_then(|l| l.snapshot_send.get(&peer).copied())
-                .filter(|s| s.last_included_index == snap_idx && s.last_included_term == snap_term)
-                .map(|s| s.offset)
-                .unwrap_or(0);
-
-            let snapshot = state.storage.read_state().await.unwrap_or_default();
-            let total_len = snapshot.len() as u64;
-            // Cap chunk size, but never produce a 0-byte non-final
-            // chunk (would loop forever). For an empty snapshot
-            // we send a single done=true chunk with zero bytes.
-            let chunk_max = state.cfg.install_snapshot_chunk_bytes.max(1);
-            let start = resume_offset.min(total_len) as usize;
-            let end = (start + chunk_max).min(snapshot.len());
-            let chunk: Vec<u8> = snapshot[start..end].to_vec();
-            let chunk_end_offset = end as u64;
-            let was_final = chunk_end_offset >= total_len;
-
-            // Update / install our local cursor BEFORE sending so
-            // a same-tick second peer resume picks the same value.
-            if let Some(leader_mut) = state.leader.as_mut() {
-                leader_mut.snapshot_send.insert(
-                    peer,
-                    SnapshotSendState {
-                        last_included_index: snap_idx,
-                        last_included_term: snap_term,
-                        offset: resume_offset,
-                    },
-                );
-            }
-
-            // Only the final chunk carries membership — the
-            // follower commits the install atomically with the
-            // active_config write, and intermediate chunks would
-            // pay the bandwidth twice for no benefit.
-            let (members, joint_old, active_config_index) = if was_final
-                && state
-                    .active_config_index
-                    .is_some_and(|index| index <= snap_idx)
-            {
-                (
-                    state.effective_cfg.current.clone(),
-                    state.effective_cfg.joint_old.clone(),
-                    state.active_config_index,
-                )
-            } else {
-                (Vec::new(), None, None)
-            };
-            let req = InstallSnapshotReq {
-                leader: me,
-                term,
-                last_included_index: snap_idx,
-                last_included_term: snap_term,
-                offset: resume_offset,
-                done: was_final,
-                data: chunk,
-                members,
-                joint_old,
-                active_config_index,
-            };
-            let transport = state.transport.clone();
-            let fut: RpcFut<N> = Box::pin(async move {
-                let result = transport.send_install(peer, req).await.ok();
-                RpcOutcome::Install {
-                    from: peer,
-                    result,
-                    last_included_index: snap_idx,
-                    last_included_term: snap_term,
-                    chunk_end_offset,
-                    was_final,
-                    round,
-                }
-            });
-            pending.push(fut);
-            continue;
-        }
-
-        let prev_log_index = next_idx.saturating_sub(1);
-        let prev_log_term = state.storage.term_at(prev_log_index).await?.unwrap_or(0);
-        let entries = if next_idx <= leader_last_index {
-            state.storage.entries(next_idx, leader_last_index).await?
-        } else {
-            Vec::new()
-        };
-        let req = AppendEntriesReq {
-            leader: me,
-            term,
-            prev_log_index,
-            prev_log_term,
-            leader_commit,
-            entries,
-        };
-        let transport = state.transport.clone();
-        let fut: RpcFut<N> = Box::pin(async move {
-            let result = transport.send_append(peer, req).await.ok();
-            RpcOutcome::Append {
-                from: peer,
-                result,
-                leader_commit,
-                round,
-            }
-        });
-        pending.push(fut);
-    }
-
-    let _ = try_compact(state).await;
-
-    // Schedule the next heartbeat.
-    state.election_deadline = state.clock.add(
-        state.clock.now(),
-        Duration::from_millis(state.cfg.heartbeat_interval_ms),
-    );
-    Ok(())
-}
-
-async fn try_compact<N, S, T, C, R, A>(
-    state: &mut WorkerState<N, S, T, C, R, A>,
-) -> Result<(), S::Error>
-where
-    N: NodeId,
-    S: Storage<N>,
-    T: Transport<N>,
-    C: Clock,
-    R: Rng,
-    A: ApplySink,
-{
-    if state.leader.is_none() {
-        return Ok(());
-    };
-    // Compaction floor is the majority-replicated index, not the
-    // min-of-all-peers. Using the min would let a single slow
-    // peer pin the leader's log indefinitely; with the
-    // majority-floor approach, a lagging peer falls behind and
-    // catches up via chunked InstallSnapshot, exactly as Raft's
-    // log-compaction protocol intends. The floor is still
-    // capped by the committed prefix because we only compact
-    // entries the worker is willing to lose locally — the peer
-    // that's behind can request the snapshot.
-    let Some(majority_floor) = state.match_index_majority_floor().await else {
-        return Ok(());
-    };
-    // Defense-in-depth: compaction must NEVER cross
-    // commit_index. With the leader-promotion no-op
-    // (Ongaro §6.4) and the current-term-only commit rule, the
-    // majority-replicated floor and commit_index advance
-    // together, so in practice `majority_floor <=
-    // commit_index`. We hard-cap at `commit_index` instead of
-    // a `debug_assert!` so a future refactor that introduces a
-    // path where the two diverge cannot silently compact past
-    // committed state in release builds.
-    let committed_floor = majority_floor.min(state.meta.commit_index);
-    let applied_floor = state
-        .storage
-        .applied_index()
-        .await?
-        .unwrap_or(committed_floor);
-    let mut floor = committed_floor.min(applied_floor);
-    if let Some(final_index) = state.retirement_final_index {
-        // Keep the joint/final pair (`final_index - 1`, `final_index`) live so
-        // a crash can reconstruct outstanding finality notices. Once every
-        // acknowledgement becomes a committed confirmation row, ordinary
-        // compaction is free to pass this boundary.
-        floor = floor.min(final_index.saturating_sub(2));
-    }
-    let snap = state.storage.snap_last_index();
-    if floor <= snap || floor.saturating_sub(snap) < state.cfg.compact_hysteresis {
-        return Ok(());
-    }
-    let term_at_floor = match state.storage.term_at(floor).await? {
-        Some(t) => t,
-        None => return Ok(()),
-    };
-    let prev_snap_index = state.meta.snap_last_index;
-    let prev_snap_term = state.meta.snap_last_term;
-    state.meta.snap_last_index = floor;
-    state.meta.snap_last_term = term_at_floor;
-    if let Err(e) = state
-        .storage
-        .commit_batch(WriteBatch {
-            compact_to: Some((floor, term_at_floor)),
-            meta: Some(state.meta.clone()),
-            ..Default::default()
-        })
-        .await
-    {
-        state.meta.snap_last_index = prev_snap_index;
-        state.meta.snap_last_term = prev_snap_term;
-        return Err(e);
-    }
-    Ok(())
-}
-
-/// Pre-election phase. Sets role to `PreCandidate`, sends
-/// `PreVote` to every peer asking "would you grant a real vote
-/// at `current_term + 1`?". Does NOT bump `current_term` or
-/// persist `voted_for`. On quorum-yes (handled in
-/// `handle_prevote_response`), promotes to Candidate and
-/// `on_timer` fires `start_election` next.
-///
-/// Solo cluster (members.len() <= 1): self-vote alone is the
-/// quorum; skip pre-vote and go straight to `start_election`.
-async fn start_pre_election<N, S, T, C, R, A>(
-    state: &mut WorkerState<N, S, T, C, R, A>,
-    pending: &mut FuturesUnordered<RpcFut<N>>,
-) -> Result<(), S::Error>
-where
-    N: NodeId,
-    S: Storage<N>,
-    T: Transport<N>,
-    C: Clock,
-    R: Rng,
-    A: ApplySink,
-{
-    // A replica that's been removed from the active configuration
-    // must not solicit votes — even though its self-vote and a
-    // quorum of remaining members could mathematically elect it,
-    // a non-member leader violates the membership contract. The
-    // typical trigger is a previously-removed leader with an
-    // orphan log tail (the final ConfigChange entry it appended
-    // before stepping down) — its log is "more up-to-date" than
-    // the new members', so unconstrained log-staleness checks
-    // would let it re-take leadership of a cluster it no longer
-    // belongs to.
-    if !state.effective_cfg.all_members().contains(&state.cfg.me) {
-        // Reset the timer to avoid a hot loop, but stay Follower.
-        state.reset_election_timer();
-        return Ok(());
-    }
-    if is_solo_cluster(state) {
-        return start_election(state, pending).await;
-    }
-    state.set_role(Role::PreCandidate);
-    state.votes_received.clear();
-    state.votes_received.insert(state.cfg.me);
-
-    let next_term = state.meta.current_term + 1;
-    let me = state.cfg.me;
-    let last_log_index = state.storage.last_index();
-    let last_log_term = state.storage.last_term();
-
-    for peer in state.effective_cfg.all_members() {
-        if peer == me {
-            continue;
-        }
-        let req = PreVoteReq {
-            candidate: me,
-            next_term,
-            last_log_index,
-            last_log_term,
-        };
-        let transport = state.transport.clone();
-        let fut: RpcFut<N> = Box::pin(async move {
-            let result = transport.send_prevote(peer, req).await.ok();
-            RpcOutcome::PreVote {
-                from: peer,
-                next_term,
-                result,
-            }
-        });
-        pending.push(fut);
-    }
-
-    state.reset_election_timer();
-    Ok(())
-}
-
-async fn start_election<N, S, T, C, R, A>(
-    state: &mut WorkerState<N, S, T, C, R, A>,
-    pending: &mut FuturesUnordered<RpcFut<N>>,
-) -> Result<(), S::Error>
-where
-    N: NodeId,
-    S: Storage<N>,
-    T: Transport<N>,
-    C: Clock,
-    R: Rng,
-    A: ApplySink,
-{
-    // Same guard as `start_pre_election`: don't elect ourselves
-    // if we've been removed from the active configuration. With
-    // pre_vote disabled this is the only place to enforce it.
-    if !state.effective_cfg.all_members().contains(&state.cfg.me) {
-        state.reset_election_timer();
-        return Ok(());
-    }
-    state.set_role(Role::Candidate);
-    let prev_term = state.meta.current_term;
-    let prev_voted_for = state.meta.voted_for;
-    state.meta.current_term += 1;
-    state.meta.voted_for = Some(state.cfg.me);
-    if let Err(e) = state
-        .storage
-        .commit_batch(WriteBatch {
-            meta: Some(state.meta.clone()),
-            ..Default::default()
-        })
-        .await
-    {
-        // Roll back: a transient storage failure mid-election
-        // would otherwise leave us with an in-memory term ahead
-        // of disk and a vote we didn't actually persist.
-        state.meta.current_term = prev_term;
-        state.meta.voted_for = prev_voted_for;
-        state.set_role(Role::Follower);
-        return Err(e);
-    }
-    state.votes_received.clear();
-    state.votes_received.insert(state.cfg.me);
-
-    let term = state.meta.current_term;
-    let me = state.cfg.me;
-    let last_log_index = state.storage.last_index();
-    let last_log_term = state.storage.last_term();
-
-    for peer in state.effective_cfg.all_members() {
-        if peer == me {
-            continue;
-        }
-        let req = RequestVoteReq {
-            candidate: me,
-            term,
-            last_log_index,
-            last_log_term,
-        };
-        let transport = state.transport.clone();
-        let fut: RpcFut<N> = Box::pin(async move {
-            let result = transport.send_vote(peer, req).await.ok();
-            RpcOutcome::Vote { from: peer, result }
-        });
-        pending.push(fut);
-    }
-
-    let votes = state.votes_received.clone();
-    if state.quorum_holds(|m| votes.contains(&m)) {
-        become_leader_no_heartbeat(state).await?;
-        // Next loop iteration's timer fires immediately.
-        state.election_deadline = state.clock.now();
-    } else {
-        state.reset_election_timer();
-    }
-    Ok(())
-}
-
-/// True when the active configuration has only this replica as a
-/// voter (in either current or — if joint — old set). Solo
-/// clusters bypass the heartbeat round in `read_index` and the
-/// pre-vote phase, since there's nothing to confirm.
-fn is_solo_cluster<N, S, T, C, R, A>(state: &WorkerState<N, S, T, C, R, A>) -> bool
-where
-    N: NodeId,
-    S: Storage<N>,
-    T: Transport<N>,
-    C: Clock,
-    R: Rng,
-    A: ApplySink,
-{
-    let only_me_in = |set: &Vec<N>| set.iter().all(|m| *m == state.cfg.me);
-    only_me_in(&state.effective_cfg.current)
-        && state
-            .effective_cfg
-            .joint_old
-            .as_ref()
-            .is_none_or(only_me_in)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::clock::{StdClock, StdRng};
+    use crate::log_entry::LogEntry;
+    use crate::message::{AppendResult, Message};
     use crate::storage::MemStorage;
     use crate::testutil::block_on;
-    use crate::transport::test_helpers::RecordingTransport;
+
+    /// Records what the worker sends, for each recipient.
+    #[derive(Default)]
+    struct Recording {
+        sent: std::sync::Mutex<Vec<(u16, Envelope<u16>)>>,
+    }
+
+    impl Transport<u16> for Recording {
+        fn send(&self, _from: u16, to: u16, envelope: Envelope<u16>) {
+            self.sent.lock().unwrap().push((to, envelope));
+        }
+    }
+
+    impl Recording {
+        fn take(&self, to: u16) -> Vec<Envelope<u16>> {
+            let mut sent = self.sent.lock().unwrap();
+            let (theirs, rest) = sent.drain(..).partition(|(at, _)| *at == to);
+            *sent = rest;
+            theirs.into_iter().map(|(_, envelope)| envelope).collect()
+        }
+    }
 
     fn cfg(me: u16, members: Vec<u16>) -> Config<u16> {
         let mut c = Config::new(me, members, [0u8; 32]);
@@ -3970,20 +1093,85 @@ mod tests {
         c
     }
 
-    #[test]
-    fn worker_starts_in_follower_role() {
-        let storage = MemStorage::<u16>::new();
-        let transport = Arc::new(RecordingTransport::default());
+    fn spawn(storage: MemStorage<u16>, cfg: Config<u16>) -> (Worker<u16>, Arc<Recording>) {
+        let transport = Arc::new(Recording::default());
         let worker = Worker::spawn_with(
             storage,
-            transport,
-            cfg(0xAAAA, alloc::vec![0xAAAA, 0xBBBB, 0xCCCC]),
+            transport.clone(),
+            cfg,
             (),
             StdClock,
             StdRng::from_entropy(),
         );
-        let h = worker.handler();
-        let snap = block_on(h.snapshot()).expect("worker alive");
+        (worker, transport)
+    }
+
+    /// Deliver `envelope` from `from` and return what the worker sent back
+    /// once it has handled it (and made its writes durable).
+    fn ask(
+        handle: &WorkerHandle<u16>,
+        transport: &Recording,
+        from: u16,
+        envelope: Envelope<u16>,
+    ) -> Vec<Envelope<u16>> {
+        handle.deliver(from, envelope);
+        block_on(handle.snapshot()).expect("worker alive");
+        transport.take(from)
+    }
+
+    fn append(
+        term: u64,
+        leader: u16,
+        prev: (u64, u64),
+        entries: Vec<LogEntry<u16>>,
+    ) -> Envelope<u16> {
+        Envelope::Raft(Message::Append {
+            term,
+            leader,
+            prev_index: prev.0,
+            prev_term: prev.1,
+            commit: 0,
+            round: 1,
+            entries,
+        })
+    }
+
+    fn vote(term: u64, candidate: u16, last: (u64, u64)) -> Envelope<u16> {
+        Envelope::Raft(Message::Vote {
+            term,
+            candidate,
+            last_index: last.0,
+            last_term: last.1,
+        })
+    }
+
+    fn granted(answers: &[Envelope<u16>]) -> Option<(u64, bool)> {
+        answers.iter().find_map(|envelope| match envelope {
+            Envelope::Raft(Message::VoteAnswer { term, granted }) => Some((*term, *granted)),
+            _ => None,
+        })
+    }
+
+    fn matched(answers: &[Envelope<u16>]) -> Option<u64> {
+        answers
+            .iter()
+            .filter_map(|envelope| match envelope {
+                Envelope::Raft(Message::AppendAnswer {
+                    result: AppendResult::Matched { matched },
+                    ..
+                }) => Some(*matched),
+                _ => None,
+            })
+            .max()
+    }
+
+    #[test]
+    fn worker_starts_in_follower_role() {
+        let (worker, _) = spawn(
+            MemStorage::new(),
+            cfg(0xAAAA, alloc::vec![0xAAAA, 0xBBBB, 0xCCCC]),
+        );
+        let snap = block_on(worker.handler().snapshot()).expect("worker alive");
         assert_eq!(snap.role, Role::Follower);
         assert_eq!(snap.current_term, 0);
         assert_eq!(snap.voted_for, None);
@@ -4001,6 +1189,7 @@ mod tests {
             last_log_index: 11,
             commit_index: 11,
             snap_last_index: 0,
+            durable_index: 11,
             members: alloc::vec![0xAAAA, 0xBBBB],
             joint_old: None,
             active_config_index: Some(11),
@@ -4017,147 +1206,91 @@ mod tests {
                     .unwrap(),
             }))),
         };
-
         assert!(
             handle.cached_snapshot().is_none(),
             "an observation older than its worker lease cannot route clients"
         );
     }
 
-    #[test]
-    fn solo_cluster_self_elects_and_proposes() {
-        let storage = MemStorage::<u16>::new();
-        let transport = Arc::new(RecordingTransport::default());
-        let mut cfg = cfg(0xAAAA, alloc::vec![0xAAAA]);
-        cfg.election_timeout_ms = (10, 30);
-        let worker = Worker::spawn_with(
-            storage,
-            transport,
-            cfg,
-            (),
-            StdClock,
-            StdRng::from_entropy(),
-        );
-        let h = worker.handler();
-
-        let until = std::time::Instant::now() + Duration::from_millis(500);
-        loop {
-            if let Some(s) = block_on(h.snapshot())
-                && s.role == Role::Leader
-            {
-                break;
-            }
+    fn lead_alone(handle: &WorkerHandle<u16>) {
+        let until = std::time::Instant::now() + Duration::from_millis(1_000);
+        while block_on(handle.snapshot()).is_none_or(|snap| snap.role != Role::Leader) {
             assert!(std::time::Instant::now() < until, "no leadership");
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
 
-        let idx = block_on(h.propose(alloc::vec![1, 2, 3])).expect("propose");
-        // Index 1 is the leader-promotion no-op (Ongaro §6.4 —
-        // see become_leader_no_heartbeat); the application
-        // propose lands at index 2.
-        assert_eq!(idx, 2);
+    #[test]
+    fn solo_cluster_self_elects_and_proposes() {
+        let mut cfg = cfg(0xAAAA, alloc::vec![0xAAAA]);
+        cfg.election_timeout_ms = (10, 30);
+        let (worker, _) = spawn(MemStorage::new(), cfg);
+        let h = worker.handler();
+        lead_alone(&h);
+        // Index 1 is the leader's no-op.
+        let index = block_on(h.propose(alloc::vec![1, 2, 3])).expect("propose");
+        assert_eq!(index, 2);
         let snap = block_on(h.snapshot()).unwrap();
         assert_eq!(snap.role, Role::Leader);
         assert_eq!(snap.last_log_index, 2);
         assert_eq!(snap.commit_index, 2);
-
         worker.shutdown();
     }
 
     #[test]
     fn compaction_never_crosses_durable_application_cursor() {
-        // The state bytes represent index 1. Even after index 2 reaches the
-        // single-member quorum, the worker may compact the leader no-op but
-        // must retain the unapplied application entry.
-        let storage = MemStorage::<u16>::new().with_applied_index(1);
-        let transport = Arc::new(RecordingTransport::default());
+        // The state reflects index 1 only: the no-op may be compacted, the
+        // unapplied entry 2 may not.
         let mut cfg = cfg(0xAAAA, alloc::vec![0xAAAA]);
         cfg.election_timeout_ms = (10, 30);
         cfg.heartbeat_interval_ms = 5;
         cfg.compact_hysteresis = 1;
-        let worker = Worker::spawn_with(
-            storage,
-            transport,
-            cfg,
-            (),
-            StdClock,
-            StdRng::from_entropy(),
-        );
-        let handle = worker.handler();
-        let deadline = std::time::Instant::now() + Duration::from_millis(500);
-        loop {
-            if block_on(handle.snapshot()).is_some_and(|snapshot| snapshot.role == Role::Leader) {
-                break;
-            }
-            assert!(std::time::Instant::now() < deadline, "no leadership");
-            std::thread::sleep(Duration::from_millis(5));
-        }
-
-        assert_eq!(block_on(handle.propose(alloc::vec![9])).unwrap(), 2);
+        let (worker, _) = spawn(MemStorage::new().with_applied_index(1), cfg);
+        let h = worker.handler();
+        lead_alone(&h);
+        assert_eq!(block_on(h.propose(alloc::vec![9])).unwrap(), 2);
         std::thread::sleep(Duration::from_millis(30));
-        let snapshot = block_on(handle.snapshot()).unwrap();
-        assert_eq!(snapshot.commit_index, 2);
-        assert_eq!(snapshot.snap_last_index, 1);
-        assert_eq!(snapshot.last_log_index, 2);
+        let snap = block_on(h.snapshot()).unwrap();
+        assert_eq!(snap.commit_index, 2);
+        assert_eq!(snap.snap_last_index, 1);
+        assert_eq!(snap.last_log_index, 2);
         worker.shutdown();
     }
 
     #[test]
     fn follower_accepts_heartbeat_and_advances_term() {
-        let storage = MemStorage::<u16>::new();
-        let transport = Arc::new(RecordingTransport::default());
-        let worker = Worker::spawn_with(
-            storage,
-            transport,
+        let (worker, transport) = spawn(
+            MemStorage::new(),
             cfg(0xAAAA, alloc::vec![0xAAAA, 0xBBBB, 0xCCCC]),
-            (),
-            StdClock,
-            StdRng::from_entropy(),
         );
         let h = worker.handler();
-        let resp = block_on(h.handle_inbound_append(
+        let answers = ask(
+            &h,
+            &transport,
             0xBBBB,
-            AppendEntriesReq {
-                leader: 0xBBBB,
+            append(5, 0xBBBB, (0, 0), alloc::vec![]),
+        );
+        assert!(answers.iter().any(|envelope| matches!(
+            envelope,
+            Envelope::Raft(Message::AppendAnswer {
                 term: 5,
-                prev_log_index: 0,
-                prev_log_term: 0,
-                leader_commit: 0,
-                entries: alloc::vec![],
-            },
-        ));
-        assert!(resp.success);
-        assert_eq!(resp.term, 5);
-        let snap = block_on(h.snapshot()).unwrap();
-        assert_eq!(snap.current_term, 5);
+                result: AppendResult::Matched { .. },
+                ..
+            })
+        )));
+        assert_eq!(block_on(h.snapshot()).unwrap().current_term, 5);
         worker.shutdown();
     }
 
-    /// Regression for the empty-`FuturesUnordered` busy-spin.
-    ///
-    /// Pre-fix the worker's `select!` polled `pending.next()`
-    /// every iteration; an empty `FuturesUnordered::next()`
-    /// resolves `Ready(None)` immediately, so the loop never
-    /// parked — it burned 100% CPU until a timer or inbox event
-    /// happened to win the race.
-    ///
-    /// We detect a spin by wrapping the clock and counting
-    /// `sleep_until` calls. The worker calls it once per loop
-    /// iteration to rebuild the timer arm of `select!`, so the
-    /// counter doubles as a loop-iteration counter. A parked loop
-    /// hits it only when a real event fires (single digits per
-    /// 100ms); a spinning loop hits it >10k times per 100ms on a
-    /// modern CPU.
     #[test]
-    fn idle_worker_does_not_spin_on_empty_pending() {
+    fn idle_worker_does_not_spin() {
         use core::sync::atomic::{AtomicU64, Ordering as AO};
-        use std::sync::Arc as StdArc;
 
         #[derive(Clone)]
         struct CountingClock {
-            sleep_calls: StdArc<AtomicU64>,
+            sleep_calls: Arc<AtomicU64>,
         }
-        impl crate::clock::Clock for CountingClock {
+        impl Clock for CountingClock {
             type Instant = std::time::Instant;
             type Sleep = crate::clock::StdSleep;
             fn now(&self) -> Self::Instant {
@@ -4170,396 +1303,221 @@ mod tests {
                 self.sleep_calls.fetch_add(1, AO::Relaxed);
                 StdClock.sleep_until(deadline)
             }
+            fn millis_since(&self, earlier: Self::Instant, later: Self::Instant) -> u64 {
+                StdClock.millis_since(earlier, later)
+            }
         }
 
-        let storage = MemStorage::<u16>::new();
-        let transport = Arc::new(RecordingTransport::default());
-        // Multi-member cluster, RecordingTransport never replies,
-        // election timer 10s so it doesn't fire during measurement,
-        // and `pending` stays empty (no outbound RPCs queued) for
-        // the whole window.
         let mut cfg_idle = Config::new(0xAAAA, alloc::vec![0xAAAA, 0xBBBB, 0xCCCC], [0u8; 32]);
         cfg_idle.election_timeout_ms = (10_000, 10_000);
         cfg_idle.heartbeat_interval_ms = 1_000;
-
-        let sleep_calls = StdArc::new(AtomicU64::new(0));
-        let clock = CountingClock {
-            sleep_calls: sleep_calls.clone(),
-        };
+        let sleep_calls = Arc::new(AtomicU64::new(0));
         let worker = Worker::spawn_with(
-            storage,
-            transport,
+            MemStorage::<u16>::new(),
+            Arc::new(Recording::default()),
             cfg_idle,
             (),
-            clock,
+            CountingClock {
+                sleep_calls: sleep_calls.clone(),
+            },
             StdRng::from_entropy(),
         );
-
         std::thread::sleep(Duration::from_millis(100));
         let n = sleep_calls.load(AO::Relaxed);
         worker.shutdown();
-        // Empirically: ~5 with the fix, ~12_000 in a spin.
-        // 10_000 is a wide threshold — any spin lights this up.
-        assert!(
-            n < 10_000,
-            "idle worker called sleep_until {n} times in 100ms — busy-spin regression",
-        );
+        // Single digits when parked; thousands in a spin.
+        assert!(n < 100, "idle worker looped {n} times in 100ms");
     }
 
-    /// Multi-entry truncation: a follower's tail conflicts with the
-    /// leader's batch starting at the *first* entry, so all
-    /// pre-existing entries must be dropped. Single-entry truncation
-    /// is exercised by `follower_truncates_conflicting_tail_then_appends`
-    /// in vos's facade tests; this verifies the ≥2-entry conflict
-    /// path doesn't have an off-by-one in the truncate-from index.
     #[test]
     fn follower_truncates_multiple_entries_at_root_conflict() {
-        let storage = MemStorage::<u16>::new();
-        let transport = Arc::new(RecordingTransport::default());
-        let worker = Worker::spawn_with(
-            storage,
-            transport,
+        let (worker, transport) = spawn(
+            MemStorage::new(),
             cfg(0xAAAA, alloc::vec![0xAAAA, 0xBBBB, 0xCCCC]),
-            (),
-            StdClock,
-            StdRng::from_entropy(),
         );
         let h = worker.handler();
-
-        // Seed the follower with three entries at term 1.
-        let r1 = block_on(h.handle_inbound_append(
+        let entries = |term: u64| {
+            (1..=3)
+                .map(|index| LogEntry::data(index, term, alloc::vec![term as u8]))
+                .collect()
+        };
+        let first = ask(
+            &h,
+            &transport,
             0xBBBB,
-            AppendEntriesReq {
-                leader: 0xBBBB,
-                term: 1,
-                prev_log_index: 0,
-                prev_log_term: 0,
-                leader_commit: 0,
-                entries: alloc::vec![
-                    LogEntry::data(1, 1, alloc::vec![1]),
-                    LogEntry::data(2, 1, alloc::vec![1]),
-                    LogEntry::data(3, 1, alloc::vec![1]),
-                ],
-            },
-        ));
-        assert!(r1.success);
-        let snap = block_on(h.snapshot()).unwrap();
-        assert_eq!(snap.last_log_index, 3);
-
-        // Higher-term leader sends three NEW entries at the same
-        // indices — every existing entry diverges from the first.
-        // The follower must drop all three and graft the new ones.
-        let r2 = block_on(h.handle_inbound_append(
+            append(1, 0xBBBB, (0, 0), entries(1)),
+        );
+        assert_eq!(matched(&first), Some(3));
+        // A later leader replaces all three from the first.
+        let second = ask(
+            &h,
+            &transport,
             0xCCCC,
-            AppendEntriesReq {
-                leader: 0xCCCC,
-                term: 2,
-                prev_log_index: 0,
-                prev_log_term: 0,
-                leader_commit: 0,
-                entries: alloc::vec![
-                    LogEntry::data(1, 2, alloc::vec![2]),
-                    LogEntry::data(2, 2, alloc::vec![2]),
-                    LogEntry::data(3, 2, alloc::vec![2]),
-                ],
-            },
-        ));
-        assert!(r2.success);
+            append(2, 0xCCCC, (0, 0), entries(2)),
+        );
+        assert_eq!(matched(&second), Some(3));
         let snap = block_on(h.snapshot()).unwrap();
         assert_eq!(snap.last_log_index, 3);
         assert_eq!(snap.current_term, 2);
         worker.shutdown();
     }
 
-    /// Snapshot install where `last_included_index > last_log_index`:
-    /// a stale follower whose log is far behind the leader's snap
-    /// pointer. The follower drops everything, sets snap pointer +
-    /// last_index to the leader's value, replaces state row.
+    fn chunk(term: u64, index: u64, index_term: u64, data: Vec<u8>) -> Envelope<u16> {
+        Envelope::SnapshotChunk(InstallSnapshotReq {
+            leader: 0xBBBB,
+            term,
+            last_included_index: index,
+            last_included_term: index_term,
+            offset: 0,
+            done: true,
+            data,
+            members: Vec::new(),
+            joint_old: None,
+            active_config_index: None,
+        })
+    }
+
+    fn acked(answers: &[Envelope<u16>]) -> Option<u64> {
+        answers.iter().find_map(|envelope| match envelope {
+            Envelope::SnapshotAck(ack) => Some(ack.bytes_received),
+            _ => None,
+        })
+    }
+
     #[test]
     fn snapshot_install_past_last_log_index() {
-        let storage = MemStorage::<u16>::new();
-        let transport = Arc::new(RecordingTransport::default());
-        let worker = Worker::spawn_with(
-            storage,
-            transport,
+        let (worker, transport) = spawn(
+            MemStorage::new(),
             cfg(0xAAAA, alloc::vec![0xAAAA, 0xBBBB, 0xCCCC]),
-            (),
-            StdClock,
-            StdRng::from_entropy(),
         );
         let h = worker.handler();
-
-        // Fresh follower (last_log_index = 0). Leader installs a
-        // snapshot at index 100.
-        let resp = block_on(h.handle_inbound_install(
+        // The leader's heartbeat establishes term 5 and the leader first.
+        ask(
+            &h,
+            &transport,
             0xBBBB,
-            InstallSnapshotReq {
-                leader: 0xBBBB,
-                term: 5,
-                last_included_index: 100,
-                last_included_term: 4,
-                offset: 0,
-                done: true,
-                data: alloc::vec![0xAA; 32],
-                members: Vec::new(),
-                joint_old: None,
-                active_config_index: None,
-            },
-        ));
-        assert_eq!(resp.term, 5);
-        assert_eq!(resp.bytes_received, 32);
+            append(5, 0xBBBB, (100, 4), alloc::vec![]),
+        );
+        let answers = ask(
+            &h,
+            &transport,
+            0xBBBB,
+            chunk(5, 100, 4, alloc::vec![0xAA; 32]),
+        );
+        assert_eq!(acked(&answers), Some(32));
+        assert_eq!(
+            matched(&answers),
+            Some(100),
+            "the core acknowledges the snapshot"
+        );
         let snap = block_on(h.snapshot()).unwrap();
         assert_eq!(snap.snap_last_index, 100);
         assert_eq!(snap.commit_index, 100);
-        // last_log_index follows the snap pointer when the live
-        // log is empty (per `MemStorage::last_index` fallback).
         assert_eq!(snap.last_log_index, 100);
         worker.shutdown();
     }
 
-    /// Vote rejected because the candidate's log is less up-to-date
-    /// than the follower's. Raft §5.4.1: a follower refuses if its
-    /// own last entry has a higher term, or the same term with a
-    /// higher index.
     #[test]
     fn vote_refused_when_candidate_log_is_stale() {
-        let storage = MemStorage::<u16>::new();
-        let transport = Arc::new(RecordingTransport::default());
-        let worker = Worker::spawn_with(
-            storage,
-            transport,
+        let (worker, transport) = spawn(
+            MemStorage::new(),
             cfg(0xAAAA, alloc::vec![0xAAAA, 0xBBBB, 0xCCCC]),
-            (),
-            StdClock,
-            StdRng::from_entropy(),
         );
         let h = worker.handler();
-
-        // Seed the follower's log with one entry at term 5.
-        let r = block_on(h.handle_inbound_append(
+        ask(
+            &h,
+            &transport,
             0xBBBB,
-            AppendEntriesReq {
-                leader: 0xBBBB,
-                term: 5,
-                prev_log_index: 0,
-                prev_log_term: 0,
-                leader_commit: 0,
-                entries: alloc::vec![LogEntry::data(1, 5, alloc::vec![1])],
-            },
-        ));
-        assert!(r.success);
-
-        // Candidate at term 6 with a stale log (last_log_term=2,
-        // way behind our term 5). Refused.
-        let r = block_on(h.handle_inbound_vote(
-            0xCCCC,
-            RequestVoteReq {
-                candidate: 0xCCCC,
-                term: 6,
-                last_log_index: 99, // even though the index is high…
-                last_log_term: 2,   // …the term is below ours.
-            },
-        ));
-        assert!(!r.vote_granted, "stale-log candidate must be refused");
-        // Term still updates (§5.1: bumps on RequestVote at higher term).
-        assert_eq!(r.term, 6);
-
-        // Same-term-but-shorter-log: also refused.
-        let r = block_on(h.handle_inbound_vote(
-            0xCCCC,
-            RequestVoteReq {
-                candidate: 0xCCCC,
-                term: 7,
-                last_log_index: 0,
-                last_log_term: 5,
-            },
-        ));
-        assert!(
-            !r.vote_granted,
-            "shorter-log-same-term candidate must be refused"
+            append(
+                5,
+                0xBBBB,
+                (0, 0),
+                alloc::vec![LogEntry::data(1, 5, alloc::vec![1])],
+            ),
         );
+        // A higher index cannot make up for a lower last term.
+        let answers = ask(&h, &transport, 0xCCCC, vote(6, 0xCCCC, (99, 2)));
+        assert_eq!(granted(&answers), Some((6, false)));
+        // Nor the same last term with a shorter log.
+        let answers = ask(&h, &transport, 0xCCCC, vote(7, 0xCCCC, (0, 5)));
+        assert_eq!(granted(&answers), Some((7, false)));
         worker.shutdown();
     }
 
-    /// At-most-one-vote-per-term, more rigorously: the same
-    /// candidate asking twice at the same term must get the same
-    /// answer (idempotent grant), but the second grant must NOT
-    /// re-bump `voted_for` or fire a fresh persist. A
-    /// DIFFERENT candidate asking at the same term must be
-    /// refused — only one candidate per term ever wins our vote.
-    ///
-    /// The existing proptest property checks only two DIFFERENT
-    /// candidates; this test pins the same-candidate-twice
-    /// case so a future regression that mistakenly granted
-    /// duplicates would be caught at the unit level.
     #[test]
     fn at_most_one_vote_per_term_handles_same_candidate_twice() {
-        let storage = MemStorage::<u16>::new();
-        let transport = Arc::new(RecordingTransport::default());
-        let worker = Worker::spawn_with(
-            storage,
-            transport,
+        let (worker, transport) = spawn(
+            MemStorage::new(),
             cfg(0xAAAA, alloc::vec![0xAAAA, 0xBBBB, 0xCCCC]),
-            (),
-            StdClock,
-            StdRng::from_entropy(),
         );
         let h = worker.handler();
-
-        // First vote: granted to candidate 0xBBBB at term 4.
-        let r1 = block_on(h.handle_inbound_vote(
-            0xBBBB,
-            RequestVoteReq {
-                candidate: 0xBBBB,
-                term: 4,
-                last_log_index: 0,
-                last_log_term: 0,
-            },
-        ));
-        assert!(r1.vote_granted);
-        let snap1 = block_on(h.snapshot()).unwrap();
-        assert_eq!(snap1.voted_for, Some(0xBBBB));
-        assert_eq!(snap1.current_term, 4);
-
-        // SAME candidate asks again at the SAME term — idempotent
-        // grant. The receiver may re-grant (since voted_for ==
-        // candidate), but voted_for / current_term must be
-        // unchanged.
-        let r2 = block_on(h.handle_inbound_vote(
-            0xBBBB,
-            RequestVoteReq {
-                candidate: 0xBBBB,
-                term: 4,
-                last_log_index: 0,
-                last_log_term: 0,
-            },
-        ));
-        assert!(
-            r2.vote_granted,
-            "same-candidate re-ask at same term must be granted (idempotent)",
-        );
-        let snap2 = block_on(h.snapshot()).unwrap();
         assert_eq!(
-            snap2.voted_for,
-            Some(0xBBBB),
-            "voted_for must still point at the same candidate after re-ask",
+            granted(&ask(&h, &transport, 0xBBBB, vote(4, 0xBBBB, (0, 0)))),
+            Some((4, true))
         );
-        assert_eq!(snap2.current_term, 4);
-
-        // DIFFERENT candidate at SAME term — refused. This is
-        // the actual safety property: at most one candidate per
-        // term wins.
-        let r3 = block_on(h.handle_inbound_vote(
-            0xCCCC,
-            RequestVoteReq {
-                candidate: 0xCCCC,
-                term: 4,
-                last_log_index: 0,
-                last_log_term: 0,
-            },
-        ));
-        assert!(
-            !r3.vote_granted,
-            "different candidate at the same term must be refused — \
-             only one vote per term",
-        );
-        let snap3 = block_on(h.snapshot()).unwrap();
+        // The same candidate again: the same answer, the same vote.
         assert_eq!(
-            snap3.voted_for,
-            Some(0xBBBB),
-            "voted_for must NOT have been overwritten by the rejected RequestVote",
+            granted(&ask(&h, &transport, 0xBBBB, vote(4, 0xBBBB, (0, 0)))),
+            Some((4, true))
         );
-
+        let snap = block_on(h.snapshot()).unwrap();
+        assert_eq!((snap.voted_for, snap.current_term), (Some(0xBBBB), 4));
+        // Another candidate at the same term is refused.
+        assert_eq!(
+            granted(&ask(&h, &transport, 0xCCCC, vote(4, 0xCCCC, (0, 0)))),
+            Some((4, false))
+        );
+        assert_eq!(block_on(h.snapshot()).unwrap().voted_for, Some(0xBBBB));
         worker.shutdown();
     }
 
-    /// Duplicate `InstallSnapshot` delivery (same `req` twice
-    /// in a row) must be idempotent: snap pointer doesn't move
-    /// past the second call's `last_included_index`, the state
-    /// row isn't double-written, the term is adopted only once.
-    ///
-    /// The cluster-level `cluster_converges_under_full_duplication`
-    /// integration test never actually exercises this path
-    /// because it doesn't trigger compaction (5 entries,
-    /// hysteresis 16). This unit test pins the receiver-side
-    /// idempotence directly.
     #[test]
     fn install_snapshot_is_idempotent_on_duplicate_delivery() {
-        let storage = MemStorage::<u16>::new();
-        let transport = Arc::new(RecordingTransport::default());
-        let worker = Worker::spawn_with(
-            storage,
-            transport,
+        let (worker, transport) = spawn(
+            MemStorage::new(),
             cfg(0xAAAA, alloc::vec![0xAAAA, 0xBBBB, 0xCCCC]),
-            (),
-            StdClock,
-            StdRng::from_entropy(),
         );
         let h = worker.handler();
-
-        // First install: term 7, last_included_index 50,
-        // last_included_term 6, snapshot bytes 0xAA…
-        let req = || InstallSnapshotReq {
-            leader: 0xBBBB,
-            term: 7,
-            last_included_index: 50,
-            last_included_term: 6,
-            offset: 0,
-            done: true,
-            data: alloc::vec![0xAA; 16],
-            members: Vec::new(),
-            joint_old: None,
-            active_config_index: None,
-        };
-
-        let r1 = block_on(h.handle_inbound_install(0xBBBB, req()));
-        assert_eq!(r1.term, 7);
-        let snap1 = block_on(h.snapshot()).unwrap();
-        assert_eq!(snap1.snap_last_index, 50);
-        assert_eq!(snap1.commit_index, 50);
-        assert_eq!(snap1.current_term, 7);
-
-        // Duplicate delivery — same RPC bits. The receiver hits
-        // the `req.last_included_index <= snap_last_index`
-        // idempotent branch and no-ops.
-        let r2 = block_on(h.handle_inbound_install(0xBBBB, req()));
-        assert_eq!(r2.term, 7);
-        let snap2 = block_on(h.snapshot()).unwrap();
-        assert_eq!(
-            snap2.snap_last_index, 50,
-            "duplicate install must not move the snap pointer",
-        );
-        assert_eq!(
-            snap2.commit_index, 50,
-            "duplicate install must not double-bump commit_index",
-        );
-        assert_eq!(snap2.current_term, 7);
-
-        // Triple-check: the same install at a LOWER index also
-        // no-ops (already covered by `install_snapshot_at_lower_index_is_no_op`
-        // in vos's facade tests, but worth re-asserting here).
-        let r3 = block_on(h.handle_inbound_install(
+        ask(
+            &h,
+            &transport,
             0xBBBB,
-            InstallSnapshotReq {
-                leader: 0xBBBB,
-                term: 7,
-                last_included_index: 30,
-                last_included_term: 5,
-                offset: 0,
-                done: true,
-                data: alloc::vec![0xBB; 8],
-                members: Vec::new(),
-                joint_old: None,
-                active_config_index: None,
-            },
-        ));
-        assert_eq!(r3.term, 7);
-        let snap3 = block_on(h.snapshot()).unwrap();
-        assert_eq!(
-            snap3.snap_last_index, 50,
-            "lower-index install must not regress the snap pointer",
+            append(7, 0xBBBB, (50, 6), alloc::vec![]),
         );
-
+        assert_eq!(
+            acked(&ask(
+                &h,
+                &transport,
+                0xBBBB,
+                chunk(7, 50, 6, alloc::vec![0xAA; 16])
+            )),
+            Some(16)
+        );
+        let snap = block_on(h.snapshot()).unwrap();
+        assert_eq!(
+            (snap.snap_last_index, snap.commit_index, snap.current_term),
+            (50, 50, 7)
+        );
+        // A duplicate changes nothing, and is acknowledged as held.
+        assert_eq!(
+            acked(&ask(
+                &h,
+                &transport,
+                0xBBBB,
+                chunk(7, 50, 6, alloc::vec![0xAA; 16])
+            )),
+            Some(16)
+        );
+        let snap = block_on(h.snapshot()).unwrap();
+        assert_eq!((snap.snap_last_index, snap.commit_index), (50, 50));
+        // An older snapshot does not move the boundary back.
+        ask(
+            &h,
+            &transport,
+            0xBBBB,
+            chunk(7, 30, 5, alloc::vec![0xBB; 8]),
+        );
+        assert_eq!(block_on(h.snapshot()).unwrap().snap_last_index, 50);
         worker.shutdown();
     }
 }

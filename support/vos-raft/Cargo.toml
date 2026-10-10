@@ -1,6 +1,6 @@
 [package]
 name = "vos-raft"
-description = "Transport- and storage-agnostic Raft consensus core. no_std + alloc compatible (with the `std` feature off). Used by VOS for the `raft` consistency mode."
+description = "Raft consensus as a protocol core without I/O (no_std + alloc), with a std driver and a deterministic simulator."
 keywords = ["raft", "consensus", "no-std", "distributed-systems", "vos"]
 categories = ["network-programming", "no-std", "asynchronous"]
 version.workspace = true
@@ -12,31 +12,20 @@ authors.workspace = true
 
 [features]
 default = ["std"]
-# `std` enables:
-#  - The `Worker` / `WorkerHandle` async loop (uses
-#    `futures-channel::mpsc` for the inbox, which requires std).
-#  - `StdClock` — per-`Delay` thread-spawning timer, robust under
-#    heavy `cargo test` parallelism.
-#  - `StdRng` — entropy from the system clock + pid.
-#  - The `Worker::spawn` helper that runs the worker future on a
-#    dedicated thread via `futures-executor`.
-#
-# Without `std`, only the pure data types compile (`Config`,
-# `LogEntry`, `Meta`, `Role`, `RPC` structs, `Storage` /
-# `Transport` traits, `MemStorage`). An embedded host implements
-# the worker driver itself against its async runtime.
+# `std` enables the `Worker` driver (a thread or a future per replica,
+# with a `futures-channel` inbox), `StdClock`, `StdRng` and the `sim`
+# simulator. Without it, the protocol core, the messages, the data types
+# and the traits compile on `core + alloc`.
 std = ["dep:futures-channel", "dep:futures-util", "dep:futures-executor"]
 # `tokio` enables `TokioClock` — a `Clock` impl that uses
 # `tokio::time::sleep_until` instead of `StdClock`'s per-`Delay`
-# thread spawning. Recommended for tokio-native hosts; transparent
-# to the worker (just plug into `Worker::spawn_with`). Implies
-# `std`.
+# thread spawning; drive it with `Worker::spawn_with_tokio_runtime`.
+# Implies `std`.
 tokio = ["std", "dep:tokio"]
 
 [dependencies]
-# Channels + `select!` + `FuturesUnordered` — only used by the
-# std-feature worker. Optional so a true no_std build pulls in
-# nothing beyond core + alloc.
+# Channels and `select!` — only used by the std-feature worker. Optional
+# so a no_std build pulls in nothing beyond core + alloc.
 futures-channel = { version = "0.3", optional = true, default-features = false, features = ["alloc", "std"] }
 futures-util = { version = "0.3", optional = true, default-features = false, features = ["alloc", "async-await-macro", "std"] }
 futures-executor = { version = "0.3", optional = true, default-features = false, features = ["std"] }
@@ -46,6 +35,6 @@ futures-executor = { version = "0.3", optional = true, default-features = false,
 tokio = { version = "1", optional = true, default-features = false, features = ["time", "rt"] }
 
 [dev-dependencies]
-# Property-based testing — randomly generated AppendEntries /
-# RequestVote sequences vs. Raft safety invariants.
+# Property-based testing — random message sequences vs. Raft safety
+# invariants.
 proptest = { version = "1", default-features = false, features = ["std", "bit-set"] }

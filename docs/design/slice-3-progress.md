@@ -206,3 +206,264 @@ round 2: 15 agents of 1 KiB beside one of 0 KiB, no cap: small 13403 commits/s, 
 round 2: 15 agents of 1 KiB beside one of 32 KiB, no cap: small 13489 commits/s, p50 1.09 ms, p99 1.93 ms; large 897 commits/s
 round 2: 15 agents of 1 KiB beside one of 48 KiB, no cap: small 13350 commits/s, p50 1.09 ms, p99 1.96 ms; large 889 commits/s
 ```
+
+## Step 3.2: the vos-raft core
+
+**What changed:** vos-raft is now a protocol core without I/O, a driver
+around it, and a simulator.
+
+- `core::Core` (`no_std + alloc`) is one replica as a state machine.
+  - Events in: ticks, messages, proposals, reads, membership changes,
+    transfers, and the host's reports (`durable`, `loaded`,
+    `snapshot_installed`, `snapshot_failed`, `durably_applied`,
+    `compacted`, `writer_health`, `peer_alive`).
+  - Actions out: ordered writes, one-way sends, loads, commit
+    notifications, snapshot sends, the compaction bound, answers, and
+    role changes.
+  - It keeps the log's terms as runs and a suffix of entries in a byte-
+    bounded cache (`log_view`); older entries come back through
+    `LoadEntries`.
+- `message::Message` replaces the request/response RPC structs: appends
+  and their answers, votes, pre-votes and `TimeoutNow`. Every message is
+  one-way, and each answer says what it answers (round, commit, matched
+  or rejected, with a hint).
+- `Transport` is now `send(from, to, envelope)`, one-way and non-
+  blocking; a host hands what arrives to `WorkerHandle::deliver`.
+  Snapshot chunks and their acknowledgements travel as their own
+  envelopes, and the driver streams them, one chunk in flight.
+- The worker became the driver. It carries out the core's actions
+  against `Storage`, `Transport` and `ApplySink`.
+  - **Each round hands the core everything already in the inbox**, so a
+    burst of proposals or appends becomes one write.
+  - **`snapshot()` is a barrier:** it is answered after the round's
+    writes are durable and its answers sent.
+  - **A store that returns `Err` stops the worker.** It cannot know what
+    reached the disk. Its role reads follower from then on, and requests
+    report `Stopped`, which replaces the never-returned `Storage(())`
+    variants. Before, a stopped worker answered `NotLeader`.
+- `sim` (std) runs groups of cores over a simulated network and stores.
+  It checks for two leaders in a term, two entries at one committed
+  index, a commit past a replica's log, and a read index below what was
+  committed anywhere when the read was asked.
+  - The network drops, duplicates, delays and partitions messages, and
+    carries snapshots like any other message.
+  - Stores sync after a random delay, and a crash keeps a random prefix
+    of the unsynced writes and compactions. A snapshot switch is durable
+    at once, after every write before it, as the driver's is.
+  - The chaos runs crash nodes every few hundred milliseconds, partition
+    and heal, and propose and read throughout. The cache holds 64 bytes
+    and the log compacts every four entries, so lagging replicas load
+    from the store or install snapshots. One variant has four nodes, with
+    the membership moving between three-node subsets.
+  - Over 200 seeds, the fixed-membership run installs 3,771 snapshots,
+    makes 56,230 compactions durable, answers 54,710 loads and checks
+    16,024 reads. The churn run starts 2,438 membership changes and
+    installs 5,442 snapshots. The test fails if these fall well below.
+
+**The plan's items, and what pins each one:**
+
+| Item | Tests |
+|---|---|
+| Durability as (index, term), with truncation | `a_late_report_of_a_replaced_write_vouches_for_nothing` |
+| `verified`, and the commit index capped per peer | `a_commit_index_never_applies_an_unverified_entry`, `a_leader_sends_each_peer_a_commit_it_has_acknowledged` |
+| Which messages wait for their write | `a_vote_leaves_only_once_it_is_durable`, `an_answer_at_a_new_term_waits_for_the_term`, `a_candidate_counts_its_own_vote_only_once_durable` |
+| Two answers per append, self-describing | `a_late_report_…` (the durable prefix at once, the rest once durable) |
+| Replicate on propose, in-flight slot, byte cap | `a_proposal_goes_out_at_once_unless_an_append_is_in_flight`, `an_append_carries_at_most_its_byte_cap` |
+| Heartbeats regardless of appends | `heartbeats_go_to_peers_with_an_append_in_flight` |
+| Rounds on every append | `read_index_ignores_answers_to_heartbeats_sent_before_it` |
+| Fast backtracking | `a_rejection_moves_the_probe_past_the_conflicting_term` |
+| Check-quorum | `check_quorum_deposes_a_leader_that_hears_from_no_one` |
+| Leadership transfer | `a_transfer_hands_over_once_the_target_holds_everything` |
+| The stalled writer | `a_stalled_writer_hands_leadership_over`, `a_stalled_leader_keeps_handing_over_until_a_peer_catches_up`, `a_stalled_leader_steps_down_and_stays_quiet` |
+| Pre-votes cannot depose a live leader | `a_leader_refuses_pre_votes`, `isolated_follower_does_not_inflate_term_under_pre_vote` |
+| Snapshots and compaction moved out | the chunked-snapshot tests in `state_machine.rs`, `compaction_never_crosses_durable_application_cursor`, `compaction_survives_a_restart` |
+| Loads from the store | `a_follower_behind_the_cache_catches_up_from_the_store` |
+| A snapshot switch is one atomic write | `a_crash_after_a_snapshot_switch_keeps_its_membership` |
+| Safety under faults | `safety_holds_under_faults` and `safety_holds_under_faults_and_membership_changes`: 200 seeds each of 2,000 steps (see below) |
+
+**Mutation checks.** Each safety rule was broken by hand, and the tests
+must fail:
+
+| Mutation | Caught by |
+|---|---|
+| A leader counts its own log before it is durable | core test; chaos (seed 13) |
+| A follower applies past its verified index | core test |
+| A vote leaves before it is durable | core test; churn chaos (seed 96) |
+| A heartbeat's commit is not capped at the peer's match | core test; churn chaos (seed 50) |
+| A late write report vouches for a replaced entry | core test |
+| An answer at a new term leaves before the term is durable | core test |
+| No in-flight slot | core test |
+| No byte cap | core test |
+| Backtracking one index at a time | core test |
+| No check-quorum | core test |
+| Proposals taken during a transfer | core test |
+| `TimeoutNow` before the target holds everything | core test |
+| A stalled leader gives up handing over | core test |
+| A stalled leader never steps down | core test |
+| A stalled replica campaigns | core test |
+| A leader grants pre-votes | core test |
+| `TimeoutNow` taken from anyone | core test |
+| The switch's membership record taken from the old view | persistence tests |
+| Loads that can never join the cache, reissued (the spin) | core test |
+| The switch batch without its meta and membership record | persistence test |
+| No replication on an append's answer | two core tests |
+
+Chaos misses four of these: the early answer at a new term, the late
+write report, applying an unverified entry, and the switch without its
+rows. Each needs a narrow interleaving (for the last, a crash right
+after a switch, during a membership change), and the direct tests pin
+them.
+
+**Found and fixed while building it:**
+
+- **A stalled writer could never hand leadership over.** `TimeoutNow`
+  also waited for the leader's own log to be durable, which a stalled
+  writer never makes it. What makes the handover safe is that the
+  target holds every entry. Found by writing the test.
+- **A stalled leader gave up handing over.** A transfer that outlived its
+  deadline was dropped, and the leader took proposals again with its
+  writer still stalled. While the writer stays stalled, it now starts a
+  new handover to its most up-to-date peer and refuses proposals.
+- **The first driver paid one fsync per proposal.** It took the core's
+  actions after each inbox message. The S3 harness, ported to the new
+  transport, showed it: 4.1k commits per second at 64 proposers on redb,
+  against 23k for the old worker. Draining the inbox each round fixed it.
+
+**Review** (Opus, no-go until B1 and B2 were fixed; all items below are
+fixed, with tests):
+
+- **B1. A lagging follower made the leader spin.** A load for entries
+  the cache had evicted asked for everything up to the end of the log,
+  which could never join the cache's front, so the core dropped the
+  result and asked again, forever. A load now covers only the gap below
+  the cache, capped in bytes, and its result goes straight to the peer
+  waiting for it. An empty result is not reissued; the peer's next
+  answer retries.
+- **B2. A snapshot switch was not atomic with its membership record.**
+  The switch wrote the state and the compaction, and the commit index
+  and membership record came in a later write. After a crash between the
+  two, a replica could restart with the snapshot's state and a membership
+  the group had left, and count a quorum of the wrong members. The core
+  now computes the switch's rows (`snapshot_switch`), and the driver
+  writes them in the switch's batch, after every earlier write.
+- **S1. A leader granted pre-votes**, so a follower that stopped hearing
+  it over a lossy link could depose it. A leader now refuses.
+- **S2. The simulator never exercised snapshots, compaction, loads or
+  reads.** It now does, and it checks reads; see above.
+- **S3. A stalled leader had no fallback.** After three handovers that
+  fail, it steps down, and a replica whose writer is stalled does not
+  campaign.
+- **S4. Followers ignored the cache bound.** They now evict too.
+- **S5.** The answer to an installed snapshot waits for its term to be
+  durable, as every other answer does.
+- **Nits fixed:**
+  - a leader that steps down stops naming itself as the leader;
+  - membership changes are refused during a handover, and finalizing a
+    joint configuration waits for the handover to end or be given up;
+  - `TimeoutNow` counts only from the known leader;
+  - the retirement test pins the index again.
+- **Found while fixing them:** a write's meta row carries the core's
+  snapshot pointer as of when the write was made. A compaction made
+  between the write's creation and its execution would then be undone
+  in the store's meta. Hosts now keep their own pointer, which only
+  compaction and a switch move: the driver, and the simulator's store.
+  The persistence harness asserts that the pointer never moves back.
+
+**Re-review** (Opus): go. Also fixed before the commit:
+
+- **The switch's meta now records the term and vote in memory**, not
+  the durable ones. A host whose writer queues the switch behind writes
+  not yet reported (step 3.3's) would otherwise rewind a vote a queued
+  write already made, and a crash could then let the replica vote twice
+  in one term. The in-memory values are at least as new as anything
+  queued, and persisting them early is safe.
+- **A load that starts past its first index sends nothing.** A store
+  that compacted between the request and the read returns entries from
+  later on; sent as they were, the peer would reject them and its slot
+  would wait out the resend timeout.
+- **A stalled replica ignores `TimeoutNow`**, as it does its own timer.
+
+Tests: `a_snapshot_switch_records_the_newest_term_and_vote`,
+`a_load_that_starts_late_sends_nothing`, and a stalled case in
+`timeout_now_counts_only_from_the_leader`; each fails without its fix.
+
+**Left to later steps, from the review:**
+
+- `Write::sync` does not reach `Storage` yet (step 3.3's store takes it).
+- A snapshot should be labelled with its state's applied index (3.3).
+- Votes have no leader lease (only pre-votes); with pre-vote on, that is
+  enough. Revisit if pre-vote can ever be off in production.
+- The core accepts appends from any sender that names itself leader;
+  step 3.4's group driver checks membership, and its tests cover
+  non-member senders.
+- **The pair heartbeat must vouch only for the groups a node leads**
+  (step 3.8). Otherwise a leader that stepped down, for example because
+  its writer stalled, keeps its followers refusing each other's
+  pre-votes, and the group stays leaderless. `peer_alive`'s
+  documentation states the contract.
+- For step 3.3, keep the snapshot pointer in its own row, so no write
+  touches it.
+- For step 3.7: a replica whose suffix a snapshot drops keeps its
+  current membership view, even when that view came from an entry in the
+  dropped suffix (recorded without provenance). It lasts until the
+  leader's next appends.
+
+**Throughput against the old worker** (S3's `one` harness: three nodes,
+1 KiB entries, in one process, same build profile; `old` is the eager
+worker the spike carries):
+
+| Store | Proposers | Old commits/s | New commits/s | Old p99 | New p99 |
+|---|---|---|---|---|---|
+| redb | 1 | 1,359 | 2,164 | 1.46 ms | 1.00 ms |
+| redb | 64 | 22,953 | 33,691 | 7.80 ms | 3.44 ms |
+| redb | 256 | 23,461 | 57,524 | 37.75 ms | 8.13 ms |
+| memory | 1 | 115,068 | 124,833 | 0.02 ms | 0.02 ms |
+| memory | 64 | 487,812 | 365,324 | 0.22 ms | 0.32 ms |
+
+The one regression is in memory with 64 proposers. A profile puts most
+of that run in tokio's scheduler and channel wake-ups: answers are now
+messages of their own, where the old worker awaited replies inline.
+Raft's own code is a small share. Nothing durable is affected; step 3.4's
+transport sets the real per-message cost.
+
+After the review's fixes: redb with 64 proposers runs at 33.3k–34.2k
+commits per second (p99 3.2–3.4 ms, four runs; one earlier run dipped to
+23.9k, which repeated runs put down to the drive). With 256 proposers it
+runs at 58.5k. Memory with 64 proposers runs at 433k.
+
+**What the old tests had to change:** they ran against the request/
+response worker, and some pinned what the contract now replaces.
+
+- `audit_findings.rs` is now `persistence.rs`, without the audit
+  narrative.
+- **A snapshot chunk moves no term.** A chunk is taken only from the
+  leader of the replica's current term. A higher-term chunk is refused
+  until the leader's heartbeat; that heartbeat makes the term durable
+  before it is answered.
+- **A failed write stops the worker** (`fault_injection.rs`, rewritten).
+  Before, errors were swallowed, mapped to `Storage(())`, or left a
+  candidate retrying.
+- **A leader takes its role before its no-op is durable.** It answers no
+  read until its term's first entry commits.
+- **Recovery clamps the commit index to the log.** Two fixtures claimed a
+  commit over an empty log; they now hold the entries.
+- `proptest_invariants.rs` now also checks one durable vote per term,
+  and draws from the two peers and few terms, so snapshot chunks come
+  from the leader of the current term often enough to install.
+- The S3 spike's transport is ported (the eager variant keeps the old
+  one).
+
+**Left for later steps:**
+
+- `Storage` keeps its shape: step 3.3 replaces it with the node's log
+  kinds, blob store and switch.
+- The driver keeps one thread per worker by default. Step 3.8 drives
+  many groups per node.
+
+**Checks:**
+
+- `just ci` is green.
+- vos-raft has 102 tests in 10 binaries, unit tests and the doctest
+  included. The suite ran 10 times in a row without a failure before the
+  last two deterministic core tests.
+- clippy and rustdoc are clean, with and without features.

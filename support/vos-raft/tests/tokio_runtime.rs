@@ -11,46 +11,11 @@
 
 use std::sync::Arc;
 
-use vos_raft::{
-    AppendEntriesReq, Config, InstallSnapshotReq, MemStorage, PreVoteReq, PreVoteResp,
-    RequestVoteReq, Role, StdRng, TokioClock, Transport, Worker,
-};
+use vos_raft::{Config, Envelope, MemStorage, Role, StdRng, TokioClock, Transport, Worker};
 
 struct NoopT;
-#[derive(Debug)]
-struct NoopE;
-impl core::fmt::Display for NoopE {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "noop")
-    }
-}
-impl std::error::Error for NoopE {}
 impl Transport<u16> for NoopT {
-    type Error = NoopE;
-    async fn send_prevote(&self, _: u16, _: PreVoteReq<u16>) -> Result<PreVoteResp, NoopE> {
-        Err(NoopE)
-    }
-    async fn send_append(
-        &self,
-        _: u16,
-        _: AppendEntriesReq<u16>,
-    ) -> Result<vos_raft::AppendEntriesResp, NoopE> {
-        Err(NoopE)
-    }
-    async fn send_vote(
-        &self,
-        _: u16,
-        _: RequestVoteReq<u16>,
-    ) -> Result<vos_raft::RequestVoteResp, NoopE> {
-        Err(NoopE)
-    }
-    async fn send_install(
-        &self,
-        _: u16,
-        _: InstallSnapshotReq<u16>,
-    ) -> Result<vos_raft::InstallSnapshotResp, NoopE> {
-        Err(NoopE)
-    }
+    fn send(&self, _from: u16, _to: u16, _envelope: Envelope<u16>) {}
 }
 
 /// `spawn_with_tokio_runtime` + `TokioClock` reaches Leader.

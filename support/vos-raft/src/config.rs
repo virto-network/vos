@@ -126,6 +126,22 @@ pub struct Config<N: NodeId> {
     /// Default: `3` — enough to absorb a transient network blip
     /// but quick enough to surface a stuck node.
     pub pre_candidate_misses_before_revert: u32,
+    /// The most inline entry bytes one append carries; an append always
+    /// carries at least one entry. Default: 1 MiB.
+    pub max_append_bytes: usize,
+    /// How long a leader waits for an append's acknowledgement before it
+    /// sends again. Default: 1 s.
+    pub resend_timeout_ms: u64,
+    /// How long a leader waits for a peer to acknowledge a snapshot before
+    /// it starts over. Default: 60 s.
+    pub snapshot_timeout_ms: u64,
+    /// Bytes of recent entries the core keeps in memory; older ones are
+    /// loaded from the host's store when a lagging peer needs them.
+    /// Default: 16 MiB.
+    pub cache_bytes: usize,
+    /// A leader that has not heard from a quorum within an election timeout
+    /// steps down. Default: `true`.
+    pub check_quorum: bool,
 }
 
 impl<N: NodeId> Config<N> {
@@ -147,6 +163,11 @@ impl<N: NodeId> Config<N> {
             max_pending_reads: 1024,
             max_snapshot_bytes: 512 * 1024 * 1024,
             pre_candidate_misses_before_revert: 3,
+            max_append_bytes: 1 << 20,
+            resend_timeout_ms: 1_000,
+            snapshot_timeout_ms: 60_000,
+            cache_bytes: 16 << 20,
+            check_quorum: true,
         }
     }
 }

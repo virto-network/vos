@@ -1,21 +1,12 @@
 //! Integration-style state-machine tests for `vos-raft`.
 //!
-//! These run the worker against `MemStorage` + a controllable
-//! `MockTransport` so we can drive contrived scenarios:
+//! These run workers against `MemStorage` and a controllable one-way
+//! `MockTransport`, to drive contrived scenarios: elections, replication,
+//! partitions, duplication, read barriers, snapshots and membership
+//! changes, under realistic message timings.
 //!
-//! - Three-node cluster reaches consensus.
-//! - Leader truncates a divergent follower's tail and re-grafts.
-//! - Lost RPCs cause retries; reordered RPCs don't break safety.
-//! - Snapshot install brings a far-behind follower up to the
-//!   leader's tail.
-//!
-//! These complement the per-handler unit tests in
-//! `src/worker.rs`. The unit tests prove individual transitions;
-//! these tests prove the whole loop drives the cluster forward
-//! under realistic message timings.
-//!
-//! All tests compile only with the `std` feature (the worker
-//! itself is std-gated).
+//! All tests compile only with the `std` feature (the worker is
+//! std-gated).
 
 #![cfg(feature = "std")]
 
@@ -25,46 +16,34 @@ use std::time::{Duration, Instant};
 
 use futures_executor::block_on;
 use vos_raft::{
-    AppendEntriesReq, AppendEntriesResp, Config, InstallSnapshotReq, InstallSnapshotResp, LogEntry,
-    MemStorage, Meta, PreVoteReq, PreVoteResp, RequestVoteReq, RequestVoteResp, Role, StdClock,
-    StdRng, Storage, Transport, Worker, WorkerHandle, WriteBatch,
+    AppendResult, Config, Envelope, InstallSnapshotReq, InstallSnapshotResp, LogEntry, MemStorage,
+    Message, Meta, Role, StdClock, StdRng, Storage, Transport, Worker, WorkerHandle, WriteBatch,
 };
 
-/// Inbox lookup. Each peer's `WorkerHandle` is registered here
-/// so the `MockTransport` can route inbound RPCs straight into
-/// the right replica's loop.
+/// Inbox lookup: each replica's handle, so the transport can deliver to it.
 type Routes = Arc<Mutex<BTreeMap<u16, WorkerHandle<u16>>>>;
 
-/// Test transport — sends each RPC by looking up the target in
-/// the shared `Routes` map and invoking the handler's `await`
-/// methods directly. Records every RPC into a log so the test
-/// can assert on observed traffic.
+/// A message on the wire: from, to, envelope.
+type Sent = (u16, u16, Envelope<u16>);
+
+/// Test transport: delivers each message straight into the recipient's
+/// inbox, and records it so tests can assert on traffic.
 ///
-/// Partition modeling is per-edge: a `(from, to)` pair stored in
-/// `dropped_edges` causes that direction to silently fail. This
-/// supports asymmetric partitions ("A can send to B but B
-/// can't reply to A") and one-sided isolations.
+/// Partitions are per edge: a `(from, to)` pair in `dropped_edges` drops
+/// that direction, which models asymmetric partitions too. A message to a
+/// node without a route is captured, so a test can play a peer and read
+/// what it was sent.
 struct MockTransport {
     routes: Routes,
     log: Mutex<Vec<RpcRecord>>,
-    /// Set of `(from, to)` edges where outbound RPCs are
-    /// dropped. The transport derives `from` from the
-    /// AppendEntries `leader` / RequestVote `candidate` /
-    /// InstallSnapshot `leader` field.
     dropped_edges: Mutex<std::collections::BTreeSet<(u16, u16)>>,
-    /// Set of `(from, to)` edges where every outbound RPC is
-    /// delivered TWICE (back-to-back). Exercises the worker's
-    /// idempotent paths: a duplicate `AppendEntries` should not
-    /// re-append already-present entries, a duplicate
-    /// `RequestVote` should not grant a second vote, a duplicate
-    /// `InstallSnapshot` should be a no-op.
+    /// Edges on which every message is delivered twice.
     duplicated_edges: Mutex<std::collections::BTreeSet<(u16, u16)>>,
-    /// While `Some`, every AppendEntries is delivered at once but its
-    /// answer is held, in send order, until released: the answers are in
-    /// flight back to the leader.
-    held_answers: Mutex<Option<Vec<futures_channel::oneshot::Sender<()>>>>,
-    /// AppendEntries sent and not yet answered.
-    appends_in_flight: std::sync::atomic::AtomicUsize,
+    /// While `Some`, every append answer is held, in send order, until
+    /// released: the answers are in flight back to the leader.
+    held_answers: Mutex<Option<Vec<Sent>>>,
+    /// Messages to nodes without a route, for tests that play a peer.
+    captured: Mutex<Vec<Sent>>,
 }
 
 #[derive(Debug, Clone)]
@@ -96,21 +75,16 @@ impl MockTransport {
             dropped_edges: Mutex::new(std::collections::BTreeSet::new()),
             duplicated_edges: Mutex::new(std::collections::BTreeSet::new()),
             held_answers: Mutex::new(None),
-            appends_in_flight: std::sync::atomic::AtomicUsize::new(0),
+            captured: Mutex::new(Vec::new()),
         }
     }
 
-    /// Hold every AppendEntries answer from now on.
+    /// Hold every append answer from now on.
     fn hold_answers(&self) {
         self.held_answers
             .lock()
             .unwrap()
             .get_or_insert_with(Vec::new);
-    }
-
-    fn appends_in_flight(&self) -> usize {
-        self.appends_in_flight
-            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn held_answers(&self) -> usize {
@@ -123,24 +97,26 @@ impl MockTransport {
 
     /// Deliver the first `count` held answers, in send order.
     fn release_answers(&self, count: usize) {
-        let mut held = self.held_answers.lock().unwrap();
-        let held = held.as_mut().expect("answers are held");
-        for release in held.drain(..count) {
-            let _ = release.send(());
+        let released: Vec<_> = {
+            let mut held = self.held_answers.lock().unwrap();
+            let held = held.as_mut().expect("answers are held");
+            held.drain(..count).collect()
+        };
+        for (from, to, envelope) in released {
+            self.deliver(from, to, envelope);
         }
     }
 
     /// Deliver every held answer and stop holding.
     fn stop_holding_answers(&self) {
-        for release in self.held_answers.lock().unwrap().take().unwrap_or_default() {
-            let _ = release.send(());
+        let released = self.held_answers.lock().unwrap().take().unwrap_or_default();
+        for (from, to, envelope) in released {
+            self.deliver(from, to, envelope);
         }
     }
 
-    /// Mark `from → to` as a duplicating edge: every outbound
-    /// RPC on that direction is delivered twice (the second
-    /// delivery's reply is discarded). The peer's idempotent
-    /// handlers should produce the same observable state.
+    /// Deliver every message on `from → to` twice; the recipient's
+    /// idempotent paths must make the second a no-op.
     fn duplicate_edge(&self, from: u16, to: u16) {
         self.duplicated_edges.lock().unwrap().insert((from, to));
     }
@@ -149,22 +125,17 @@ impl MockTransport {
         self.duplicated_edges.lock().unwrap().contains(&(from, to))
     }
 
-    /// Drop every outbound RPC `from → to`.
+    /// Drop every message `from → to`.
     fn drop_edge(&self, from: u16, to: u16) {
         self.dropped_edges.lock().unwrap().insert((from, to));
     }
 
-    /// Drop both directions between `a` and `b` — full cut.
+    /// Drop both directions between `a` and `b`.
     fn drop_pair(&self, a: u16, b: u16) {
         self.drop_edge(a, b);
         self.drop_edge(b, a);
     }
 
-    /// Drop every edge into and out of `node`. Equivalent to
-    /// pulling the node's network cable. Provided for symmetry
-    /// with `drop_pair` even though no current test uses it —
-    /// likely needed by future "isolated leader keeps trying
-    /// to send AppendEntries" scenarios.
     #[allow(dead_code)]
     fn isolate(&self, node: u16, members: &[u16]) {
         for peer in members {
@@ -177,145 +148,137 @@ impl MockTransport {
     fn is_dropped(&self, from: u16, to: u16) -> bool {
         self.dropped_edges.lock().unwrap().contains(&(from, to))
     }
-}
 
-#[derive(Debug)]
-struct MockError;
+    fn deliver(&self, from: u16, to: u16, envelope: Envelope<u16>) {
+        let handle = self.routes.lock().unwrap().get(&to).cloned();
+        match handle {
+            Some(handle) => handle.deliver(from, envelope),
+            None => self.captured.lock().unwrap().push((from, to, envelope)),
+        }
+    }
 
-impl core::fmt::Display for MockError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "mock transport: drop")
+    /// What was sent to `to`, a node without a route, since last asked.
+    fn take_captured(&self, to: u16) -> Vec<Envelope<u16>> {
+        let mut captured = self.captured.lock().unwrap();
+        let (theirs, rest): (Vec<_>, Vec<_>) = captured.drain(..).partition(|(_, at, _)| *at == to);
+        *captured = rest;
+        theirs
+            .into_iter()
+            .map(|(_, _, envelope)| envelope)
+            .collect()
     }
 }
-impl std::error::Error for MockError {}
 
 impl Transport<u16> for MockTransport {
-    type Error = MockError;
-
-    async fn send_append(
-        &self,
-        peer: u16,
-        req: AppendEntriesReq<u16>,
-    ) -> Result<AppendEntriesResp, Self::Error> {
-        if self.is_dropped(req.leader, peer) {
-            return Err(MockError);
+    fn send(&self, from: u16, to: u16, envelope: Envelope<u16>) {
+        if self.is_dropped(from, to) {
+            return;
         }
-        self.appends_in_flight
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.log.lock().unwrap().push(RpcRecord::Append {
-            from: req.leader,
-            to: peer,
-            term: req.term,
-            count: req.entries.len(),
-        });
-        let handle = {
-            let routes = self.routes.lock().unwrap();
-            routes.get(&peer).cloned()
-        };
-        let dup = self.is_duplicated(req.leader, peer);
-        let dup_req = if dup { Some(req.clone()) } else { None };
-        let from = req.leader;
-        let result = match handle.clone() {
-            Some(h) => Ok(h.handle_inbound_append(from, req).await),
-            None => Err(MockError),
-        };
-        // Duplicate delivery: replay the same RPC. The receiver's
-        // idempotent path (entry already present at same term →
-        // skip) should produce the same observable state.
-        if let (Some(h), Some(dup_req)) = (handle, dup_req) {
-            let _ = h.handle_inbound_append(from, dup_req).await;
+        match &envelope {
+            Envelope::Raft(Message::Append { term, entries, .. }) => {
+                self.log.lock().unwrap().push(RpcRecord::Append {
+                    from,
+                    to,
+                    term: *term,
+                    count: entries.len(),
+                })
+            }
+            Envelope::Raft(Message::Vote { term, .. }) => {
+                self.log.lock().unwrap().push(RpcRecord::Vote {
+                    from,
+                    to,
+                    term: *term,
+                })
+            }
+            Envelope::SnapshotChunk(chunk) => self.log.lock().unwrap().push(RpcRecord::Install {
+                from,
+                to,
+                last_idx: chunk.last_included_index,
+            }),
+            _ => {}
         }
-        let held = self.held_answers.lock().unwrap().as_mut().map(|held| {
-            let (release, wait) = futures_channel::oneshot::channel();
-            held.push(release);
-            wait
-        });
-        if let Some(wait) = held {
-            let _ = wait.await;
+        if matches!(envelope, Envelope::Raft(Message::AppendAnswer { .. }))
+            && let Some(held) = self.held_answers.lock().unwrap().as_mut()
+        {
+            held.push((from, to, envelope));
+            return;
         }
-        self.appends_in_flight
-            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        result
+        if self.is_duplicated(from, to) {
+            self.deliver(from, to, envelope.clone());
+        }
+        self.deliver(from, to, envelope);
     }
+}
 
-    async fn send_vote(
-        &self,
-        peer: u16,
-        req: RequestVoteReq<u16>,
-    ) -> Result<RequestVoteResp, Self::Error> {
-        if self.is_dropped(req.candidate, peer) {
-            return Err(MockError);
-        }
-        self.log.lock().unwrap().push(RpcRecord::Vote {
-            from: req.candidate,
-            to: peer,
-            term: req.term,
-        });
-        let handle = {
-            let routes = self.routes.lock().unwrap();
-            routes.get(&peer).cloned()
-        };
-        let dup = self.is_duplicated(req.candidate, peer);
-        let from = req.candidate;
-        // RequestVoteReq is Copy; cheap to keep a duplicate.
-        let dup_req = req;
-        let result = match handle.clone() {
-            Some(h) => Ok(h.handle_inbound_vote(from, req).await),
-            None => Err(MockError),
-        };
-        if dup && let Some(h) = handle {
-            let _ = h.handle_inbound_vote(from, dup_req).await;
-        }
-        result
-    }
+/// Deliver `envelope` from `from` to `handle`, wait until it has been
+/// handled, and return what `handle` sent back to `from` (a node without a
+/// route).
+fn ask(
+    handle: &WorkerHandle<u16>,
+    transport: &MockTransport,
+    from: u16,
+    envelope: Envelope<u16>,
+) -> Vec<Envelope<u16>> {
+    handle.deliver(from, envelope);
+    block_on(handle.snapshot()).expect("worker alive");
+    transport.take_captured(from)
+}
 
-    async fn send_prevote(
-        &self,
-        peer: u16,
-        req: PreVoteReq<u16>,
-    ) -> Result<PreVoteResp, Self::Error> {
-        if self.is_dropped(req.candidate, peer) {
-            return Err(MockError);
-        }
-        let handle = {
-            let routes = self.routes.lock().unwrap();
-            routes.get(&peer).cloned()
-        };
-        match handle {
-            Some(h) => Ok(h.handle_inbound_prevote(req.candidate, req).await),
-            None => Err(MockError),
-        }
-    }
+/// The bytes a snapshot acknowledgement among `answers` reports.
+fn snapshot_ack(answers: &[Envelope<u16>]) -> Option<InstallSnapshotResp> {
+    answers.iter().find_map(|envelope| match envelope {
+        Envelope::SnapshotAck(ack) => Some(*ack),
+        _ => None,
+    })
+}
 
-    async fn send_install(
-        &self,
-        peer: u16,
-        req: InstallSnapshotReq<u16>,
-    ) -> Result<InstallSnapshotResp, Self::Error> {
-        if self.is_dropped(req.leader, peer) {
-            return Err(MockError);
-        }
-        self.log.lock().unwrap().push(RpcRecord::Install {
-            from: req.leader,
-            to: peer,
-            last_idx: req.last_included_index,
-        });
-        let handle = {
-            let routes = self.routes.lock().unwrap();
-            routes.get(&peer).cloned()
-        };
-        let dup = self.is_duplicated(req.leader, peer);
-        let dup_req = if dup { Some(req.clone()) } else { None };
-        let from = req.leader;
-        let result = match handle.clone() {
-            Some(h) => Ok(h.handle_inbound_install(from, req).await),
-            None => Err(MockError),
-        };
-        if let (Some(h), Some(dup_req)) = (handle, dup_req) {
-            let _ = h.handle_inbound_install(from, dup_req).await;
-        }
-        result
-    }
+/// The highest index an append answer among `answers` claims.
+fn matched(answers: &[Envelope<u16>]) -> Option<u64> {
+    answers
+        .iter()
+        .filter_map(|envelope| match envelope {
+            Envelope::Raft(Message::AppendAnswer {
+                result: AppendResult::Matched { matched },
+                ..
+            }) => Some(*matched),
+            _ => None,
+        })
+        .max()
+}
+
+/// The leader's heartbeat, which a snapshot's chunks need first: only the
+/// leader a replica follows may install one.
+fn heartbeat(handle: &WorkerHandle<u16>, transport: &MockTransport, leader: u16, term: u64) {
+    ask(
+        handle,
+        transport,
+        leader,
+        Envelope::Raft(Message::Append {
+            term,
+            leader,
+            prev_index: 0,
+            prev_term: 0,
+            commit: 0,
+            round: 1,
+            entries: vec![],
+        }),
+    );
+}
+
+/// Deliver a snapshot chunk: the acknowledgement.
+fn install(
+    handle: &WorkerHandle<u16>,
+    transport: &MockTransport,
+    leader: u16,
+    chunk: InstallSnapshotReq<u16>,
+) -> InstallSnapshotResp {
+    snapshot_ack(&ask(
+        handle,
+        transport,
+        leader,
+        Envelope::SnapshotChunk(chunk),
+    ))
+    .expect("an acknowledgement")
 }
 
 fn cfg(me: u16, members: Vec<u16>) -> Config<u16> {
@@ -643,73 +606,56 @@ fn leader_replicates_to_a_lagging_follower() {
     );
 }
 
-/// `BumpTermTransport` returns a fixed bumped-term response to
-/// every outbound RPC, simulating a leader/candidate that has
-/// fallen behind the cluster's current term. The worker's
-/// `handle_*_response` paths must step the local replica down to
-/// Follower and persist the new term.
+/// `BumpTermTransport` answers every outbound message as a peer at a
+/// higher term would, simulating a leader or candidate that has fallen
+/// behind the cluster's term: the worker must step down and adopt the term.
+/// Pre-votes are granted, so a candidate proceeds to the real election.
 struct BumpTermTransport {
-    /// Term value reported in every outbound response.
     bumped_term: u64,
+    worker: Mutex<Option<WorkerHandle<u16>>>,
 }
 
-#[derive(Debug)]
-struct BumpTermErr;
-impl core::fmt::Display for BumpTermErr {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "bump-term")
+impl BumpTermTransport {
+    fn new(bumped_term: u64) -> Self {
+        Self {
+            bumped_term,
+            worker: Mutex::new(None),
+        }
     }
 }
-impl std::error::Error for BumpTermErr {}
+
+fn rejected() -> AppendResult {
+    AppendResult::Rejected {
+        rejected: 0,
+        last_index: 0,
+        conflict_term: 0,
+        conflict_first: 0,
+    }
+}
 
 impl Transport<u16> for BumpTermTransport {
-    type Error = BumpTermErr;
-    async fn send_append(
-        &self,
-        _peer: u16,
-        _req: AppendEntriesReq<u16>,
-    ) -> Result<AppendEntriesResp, Self::Error> {
-        Ok(AppendEntriesResp {
-            term: self.bumped_term,
-            success: false,
-            match_index: 0,
-        })
-    }
-    async fn send_vote(
-        &self,
-        _peer: u16,
-        _req: RequestVoteReq<u16>,
-    ) -> Result<RequestVoteResp, Self::Error> {
-        Ok(RequestVoteResp {
-            term: self.bumped_term,
-            vote_granted: false,
-        })
-    }
-    async fn send_install(
-        &self,
-        _peer: u16,
-        _req: InstallSnapshotReq<u16>,
-    ) -> Result<InstallSnapshotResp, Self::Error> {
-        Ok(InstallSnapshotResp {
-            term: self.bumped_term,
-            bytes_received: 0,
-        })
-    }
-    async fn send_prevote(
-        &self,
-        _peer: u16,
-        req: PreVoteReq<u16>,
-    ) -> Result<PreVoteResp, Self::Error> {
-        // Mimic a healthy peer at the candidate's current term:
-        // grant the pre-vote, report `next_term - 1` (i.e., the
-        // candidate's view of its own current_term, which is
-        // what a peer at the same term would report). This lets
-        // the candidate proceed to the real election where the
-        // bumped-term refusal in `send_vote` lands.
-        Ok(PreVoteResp {
-            term: req.next_term.saturating_sub(1),
-            vote_granted: true,
-        })
+    fn send(&self, _from: u16, to: u16, envelope: Envelope<u16>) {
+        let answer = match envelope {
+            Envelope::Raft(Message::Append { round, commit, .. }) => Message::AppendAnswer {
+                term: self.bumped_term,
+                round,
+                commit,
+                result: rejected(),
+            },
+            Envelope::Raft(Message::Vote { .. }) => Message::VoteAnswer {
+                term: self.bumped_term,
+                granted: false,
+            },
+            Envelope::Raft(Message::PreVote { next_term, .. }) => Message::PreVoteAnswer {
+                term: next_term.saturating_sub(1),
+                next_term,
+                granted: true,
+            },
+            _ => return,
+        };
+        if let Some(worker) = self.worker.lock().unwrap().as_ref() {
+            worker.deliver(to, Envelope::Raft(answer));
+        }
     }
 }
 
@@ -731,68 +677,41 @@ fn leader_steps_down_on_higher_term_append_response() {
     struct StepDownTransport {
         bumped_term: u64,
         bumped: AtomicBool,
+        worker: Mutex<Option<WorkerHandle<u16>>>,
     }
-    #[derive(Debug)]
-    struct E;
-    impl core::fmt::Display for E {
-        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-            write!(f, "x")
-        }
-    }
-    impl std::error::Error for E {}
     impl Transport<u16> for StepDownTransport {
-        type Error = E;
-        async fn send_vote(
-            &self,
-            _peer: u16,
-            req: RequestVoteReq<u16>,
-        ) -> Result<RequestVoteResp, E> {
-            // First vote: grant at candidate's term so it wins.
-            // Once the leader has been bumped, refuse to grant
-            // further votes so the worker stays Follower.
+        fn send(&self, _from: u16, to: u16, envelope: Envelope<u16>) {
+            // Votes are granted until the leader has been bumped; the
+            // first append is answered at the bumped term.
             let granted = !self.bumped.load(AO::Relaxed);
-            Ok(RequestVoteResp {
-                term: req.term,
-                vote_granted: granted,
-            })
-        }
-        async fn send_append(
-            &self,
-            _peer: u16,
-            _req: AppendEntriesReq<u16>,
-        ) -> Result<AppendEntriesResp, E> {
-            // Mark the bumped flag so the next vote round refuses.
-            self.bumped.store(true, AO::Relaxed);
-            Ok(AppendEntriesResp {
-                term: self.bumped_term,
-                success: false,
-                match_index: 0,
-            })
-        }
-        async fn send_install(
-            &self,
-            _peer: u16,
-            _req: InstallSnapshotReq<u16>,
-        ) -> Result<InstallSnapshotResp, E> {
-            Ok(InstallSnapshotResp {
-                term: self.bumped_term,
-                bytes_received: 0,
-            })
-        }
-        async fn send_prevote(&self, _peer: u16, req: PreVoteReq<u16>) -> Result<PreVoteResp, E> {
-            // Same shape as the BumpTermTransport version but
-            // gated by the `bumped` flag.
-            let granted = !self.bumped.load(AO::Relaxed);
-            Ok(PreVoteResp {
-                term: req.next_term.saturating_sub(1),
-                vote_granted: granted,
-            })
+            let answer = match envelope {
+                Envelope::Raft(Message::Vote { term, .. }) => Message::VoteAnswer { term, granted },
+                Envelope::Raft(Message::Append { round, commit, .. }) => {
+                    self.bumped.store(true, AO::Relaxed);
+                    Message::AppendAnswer {
+                        term: self.bumped_term,
+                        round,
+                        commit,
+                        result: rejected(),
+                    }
+                }
+                Envelope::Raft(Message::PreVote { next_term, .. }) => Message::PreVoteAnswer {
+                    term: next_term.saturating_sub(1),
+                    next_term,
+                    granted,
+                },
+                _ => return,
+            };
+            if let Some(worker) = self.worker.lock().unwrap().as_ref() {
+                worker.deliver(to, Envelope::Raft(answer));
+            }
         }
     }
 
     let transport = Arc::new(StepDownTransport {
         bumped_term: 99,
         bumped: AtomicBool::new(false),
+        worker: Mutex::new(None),
     });
     let storage = MemStorage::<u16>::new();
     let mut cfg_2 = Config::new(0xAAAA, vec![0xAAAA, 0xBBBB], [0xC0; 32]);
@@ -800,12 +719,13 @@ fn leader_steps_down_on_higher_term_append_response() {
     cfg_2.heartbeat_interval_ms = 15;
     let worker = Worker::spawn_with(
         storage,
-        transport,
+        transport.clone(),
         cfg_2,
         (),
         StdClock,
         StdRng::from_entropy(),
     );
+    transport.worker.lock().unwrap().replace(worker.handler());
 
     // The candidate wins the first election (vote granted), then
     // its first heartbeat receives the bumped reply and steps
@@ -835,7 +755,7 @@ fn leader_steps_down_on_higher_term_append_response() {
 /// term than its own. Symmetric to the AppendResponse case.
 #[test]
 fn candidate_steps_down_on_higher_term_vote_response() {
-    let transport = Arc::new(BumpTermTransport { bumped_term: 99 });
+    let transport = Arc::new(BumpTermTransport::new(99));
     let storage = MemStorage::<u16>::new();
     // 2-node cluster — needs the peer's vote to win, so the
     // candidate is forced to send a RequestVote and observe
@@ -845,12 +765,13 @@ fn candidate_steps_down_on_higher_term_vote_response() {
     cfg_2.heartbeat_interval_ms = 15;
     let worker = Worker::spawn_with(
         storage,
-        transport,
+        transport.clone(),
         cfg_2,
         (),
         StdClock,
         StdRng::from_entropy(),
     );
+    transport.worker.lock().unwrap().replace(worker.handler());
 
     // The candidate's first RequestVote receives term=99 —
     // worker steps down to Follower and adopts the new term.
@@ -1322,17 +1243,18 @@ fn read_index_returns_leader_stepped_on_partition_step_down() {
     // Give the thread a moment to enqueue.
     std::thread::sleep(Duration::from_millis(50));
     // Inject a higher-term heartbeat that forces step-down.
-    let _ = block_on(leader_handle.handle_inbound_append(
+    leader_handle.deliver(
         99,
-        AppendEntriesReq {
-            leader: 99,
+        Envelope::Raft(Message::Append {
             term: 1_000,
-            prev_log_index: 0,
-            prev_log_term: 0,
-            leader_commit: 0,
+            leader: 99,
+            prev_index: 0,
+            prev_term: 0,
+            commit: 0,
+            round: 1,
             entries: vec![],
-        },
-    ));
+        }),
+    );
     // The pending read_index must now resolve with LeaderStepped.
     let result = result_thread.join().expect("thread joined");
     assert!(
@@ -1433,6 +1355,9 @@ fn read_index_ignores_answers_to_heartbeats_sent_before_it() {
         let mut config = cfg(me, members.clone());
         config.heartbeat_interval_ms = 30_000;
         config.election_timeout_ms = if me == 1 { (30, 30) } else { (60_000, 60_000) };
+        // Answers are held on purpose; the leader must not step down for
+        // not hearing them.
+        config.check_quorum = false;
         let worker = Worker::spawn_with(
             MemStorage::<u16>::new(),
             transport.clone(),
@@ -1453,11 +1378,7 @@ fn read_index_ignores_answers_to_heartbeats_sent_before_it() {
     let committed = block_on(leader.read_index_with_timeout(Duration::from_secs(2)))
         .expect("a read resolves while answers flow");
     // The read resolved on one answer; let the other land before holding.
-    wait_until(
-        || transport.appends_in_flight() == 0,
-        Duration::from_secs(2),
-        "the earlier round is answered",
-    );
+    std::thread::sleep(Duration::from_millis(50));
 
     // Read A's round goes out and both answers are held in flight.
     transport.hold_answers();
@@ -1526,6 +1447,8 @@ fn read_index_returns_backpressure_when_queue_full() {
         // handful of requests rather than thousands.
         let mut c = cfg(me, members.clone());
         c.max_pending_reads = 4;
+        // The isolated leader keeps leading, so its queue fills.
+        c.check_quorum = false;
         let worker = Worker::spawn_with(
             storage,
             transport.clone(),
@@ -1570,17 +1493,18 @@ fn read_index_returns_backpressure_when_queue_full() {
     // Inject a higher-term AppendEntries to force step-down,
     // which drains the queued requests with LeaderStepped so
     // their threads can join.
-    let _ = block_on(leader_handle.handle_inbound_append(
+    leader_handle.deliver(
         99,
-        AppendEntriesReq {
-            leader: 99,
+        Envelope::Raft(Message::Append {
             term: 1_000,
-            prev_log_index: 0,
-            prev_log_term: 0,
-            leader_commit: 0,
+            leader: 99,
+            prev_index: 0,
+            prev_term: 0,
+            commit: 0,
+            round: 1,
             entries: vec![],
-        },
-    ));
+        }),
+    );
 
     let mut backpressure_seen = 0;
     let mut leader_stepped_seen = 0;
@@ -1617,13 +1541,14 @@ fn install_snapshot_chunked_assembles_across_multiple_rpcs() {
     let leader = 0xBBBBu16;
     let worker = Worker::spawn_with(
         storage,
-        transport,
+        transport.clone(),
         cfg(me, alloc_members(&[me, leader, 0xCCCC])),
         (),
         StdClock,
         StdRng::from_entropy(),
     );
     let h = worker.handler();
+    heartbeat(&h, &transport, leader, 1);
 
     // Build a 100 KiB snapshot. With the default chunk size of
     // 32 KiB we'll need 4 chunks (32 + 32 + 32 + 4 KiB).
@@ -1638,7 +1563,9 @@ fn install_snapshot_chunked_assembles_across_multiple_rpcs() {
         let data = snapshot[offset as usize..end].to_vec();
         let was_final = end == snapshot.len();
 
-        let resp = block_on(h.handle_inbound_install(
+        let resp = install(
+            &h,
+            &transport,
             leader,
             InstallSnapshotReq {
                 leader,
@@ -1652,7 +1579,7 @@ fn install_snapshot_chunked_assembles_across_multiple_rpcs() {
                 joint_old: None,
                 active_config_index: None,
             },
-        ));
+        );
         chunks_sent += 1;
         assert_eq!(resp.term, 1);
         assert_eq!(
@@ -1690,19 +1617,22 @@ fn install_snapshot_chunked_duplicate_chunk_is_idempotent() {
     let leader = 0xBBBBu16;
     let worker = Worker::spawn_with(
         storage,
-        transport,
+        transport.clone(),
         cfg(me, alloc_members(&[me, leader, 0xCCCC])),
         (),
         StdClock,
         StdRng::from_entropy(),
     );
     let h = worker.handler();
+    heartbeat(&h, &transport, leader, 1);
 
     let chunk_a = vec![0xAA; 16];
     let chunk_b = vec![0xBB; 16];
 
     // First chunk at offset 0, not final.
-    let r0 = block_on(h.handle_inbound_install(
+    let r0 = install(
+        &h,
+        &transport,
         leader,
         InstallSnapshotReq {
             leader,
@@ -1716,12 +1646,14 @@ fn install_snapshot_chunked_duplicate_chunk_is_idempotent() {
             joint_old: None,
             active_config_index: None,
         },
-    ));
+    );
     assert_eq!(r0.bytes_received, 16);
 
     // Re-send the SAME first chunk. Follower must report
     // bytes_received = 16 (not 32). Already-have semantics.
-    let r0_dup = block_on(h.handle_inbound_install(
+    let r0_dup = install(
+        &h,
+        &transport,
         leader,
         InstallSnapshotReq {
             leader,
@@ -1735,11 +1667,13 @@ fn install_snapshot_chunked_duplicate_chunk_is_idempotent() {
             joint_old: None,
             active_config_index: None,
         },
-    ));
+    );
     assert_eq!(r0_dup.bytes_received, 16);
 
     // Now send the real second chunk at offset 16 with done=true.
-    let r1 = block_on(h.handle_inbound_install(
+    let r1 = install(
+        &h,
+        &transport,
         leader,
         InstallSnapshotReq {
             leader,
@@ -1753,7 +1687,7 @@ fn install_snapshot_chunked_duplicate_chunk_is_idempotent() {
             joint_old: None,
             active_config_index: None,
         },
-    ));
+    );
     assert_eq!(r1.bytes_received, 32);
 
     let snap = block_on(h.snapshot()).unwrap();
@@ -1774,16 +1708,19 @@ fn install_snapshot_chunked_gap_rejected_with_resume_offset() {
     let leader = 0xBBBBu16;
     let worker = Worker::spawn_with(
         storage,
-        transport,
+        transport.clone(),
         cfg(me, alloc_members(&[me, leader, 0xCCCC])),
         (),
         StdClock,
         StdRng::from_entropy(),
     );
     let h = worker.handler();
+    heartbeat(&h, &transport, leader, 1);
 
     // First chunk at offset 0 lands fine.
-    let r0 = block_on(h.handle_inbound_install(
+    let r0 = install(
+        &h,
+        &transport,
         leader,
         InstallSnapshotReq {
             leader,
@@ -1797,12 +1734,14 @@ fn install_snapshot_chunked_gap_rejected_with_resume_offset() {
             joint_old: None,
             active_config_index: None,
         },
-    ));
+    );
     assert_eq!(r0.bytes_received, 16);
 
     // Skip ahead — offset 100 instead of 16. Follower refuses
     // and reports current length.
-    let r_gap = block_on(h.handle_inbound_install(
+    let r_gap = install(
+        &h,
+        &transport,
         leader,
         InstallSnapshotReq {
             leader,
@@ -1816,7 +1755,7 @@ fn install_snapshot_chunked_gap_rejected_with_resume_offset() {
             joint_old: None,
             active_config_index: None,
         },
-    ));
+    );
     assert_eq!(
         r_gap.bytes_received, 16,
         "gap must be refused with bytes_received = current length",
@@ -1847,11 +1786,21 @@ fn install_snapshot_chunked_rejects_oversized_buffer() {
     // Tight cap: 32 bytes.
     let mut c = cfg(me, alloc_members(&[me, leader, 0xCCCC]));
     c.max_snapshot_bytes = 32;
-    let worker = Worker::spawn_with(storage, transport, c, (), StdClock, StdRng::from_entropy());
+    let worker = Worker::spawn_with(
+        storage,
+        transport.clone(),
+        c,
+        (),
+        StdClock,
+        StdRng::from_entropy(),
+    );
     let h = worker.handler();
+    heartbeat(&h, &transport, leader, 1);
 
     // First chunk: 24 bytes — fits.
-    let r0 = block_on(h.handle_inbound_install(
+    let r0 = install(
+        &h,
+        &transport,
         leader,
         InstallSnapshotReq {
             leader,
@@ -1865,13 +1814,15 @@ fn install_snapshot_chunked_rejects_oversized_buffer() {
             joint_old: None,
             active_config_index: None,
         },
-    ));
+    );
     assert_eq!(r0.bytes_received, 24, "first chunk must accept under cap");
 
     // Second chunk: 16 bytes at offset 24 — pushes total to 40,
     // exceeds cap of 32. Must be rejected (bytes_received = 0)
     // and the partial buffer dropped.
-    let r1 = block_on(h.handle_inbound_install(
+    let r1 = install(
+        &h,
+        &transport,
         leader,
         InstallSnapshotReq {
             leader,
@@ -1885,7 +1836,7 @@ fn install_snapshot_chunked_rejects_oversized_buffer() {
             joint_old: None,
             active_config_index: None,
         },
-    ));
+    );
     assert_eq!(
         r1.bytes_received, 0,
         "oversized chunk must be rejected with bytes_received = 0",
@@ -1900,7 +1851,9 @@ fn install_snapshot_chunked_rejects_oversized_buffer() {
 
     // A subsequent fresh chunk (offset = 0) must work — the
     // partial buffer was dropped, identity reset.
-    let r2 = block_on(h.handle_inbound_install(
+    let r2 = install(
+        &h,
+        &transport,
         leader,
         InstallSnapshotReq {
             leader,
@@ -1914,7 +1867,7 @@ fn install_snapshot_chunked_rejects_oversized_buffer() {
             joint_old: None,
             active_config_index: None,
         },
-    ));
+    );
     assert_eq!(r2.bytes_received, 16);
     let snap = block_on(h.snapshot()).unwrap();
     assert_eq!(snap.snap_last_index, 50);
@@ -1928,65 +1881,70 @@ fn install_snapshot_chunked_rejects_oversized_buffer() {
 fn snapshot_sender_rewinds_after_follower_loses_partial_buffer() {
     struct RewindTransport {
         install_offsets: Mutex<Vec<u64>>,
+        worker: Mutex<Option<WorkerHandle<u16>>>,
     }
 
     impl Transport<u16> for RewindTransport {
-        type Error = core::convert::Infallible;
-
-        async fn send_append(
-            &self,
-            _peer: u16,
-            req: AppendEntriesReq<u16>,
-        ) -> Result<AppendEntriesResp, Self::Error> {
-            Ok(AppendEntriesResp {
-                term: req.term,
-                success: false,
-                match_index: 0,
-            })
-        }
-
-        async fn send_vote(
-            &self,
-            _peer: u16,
-            req: RequestVoteReq<u16>,
-        ) -> Result<RequestVoteResp, Self::Error> {
-            Ok(RequestVoteResp {
-                term: req.term,
-                vote_granted: true,
-            })
-        }
-
-        async fn send_prevote(
-            &self,
-            _peer: u16,
-            req: PreVoteReq<u16>,
-        ) -> Result<PreVoteResp, Self::Error> {
-            Ok(PreVoteResp {
-                term: req.next_term.saturating_sub(1),
-                vote_granted: true,
-            })
-        }
-
-        async fn send_install(
-            &self,
-            _peer: u16,
-            req: InstallSnapshotReq<u16>,
-        ) -> Result<InstallSnapshotResp, Self::Error> {
-            let mut offsets = self.install_offsets.lock().unwrap();
-            let attempt = offsets.len();
-            offsets.push(req.offset);
-            let chunk_end = req.offset + req.data.len() as u64;
-            Ok(InstallSnapshotResp {
-                term: req.term,
-                // The first chunk lands. The follower then restarts before
-                // the final chunk and asks the leader to restart at zero.
-                bytes_received: if attempt == 1 { 0 } else { chunk_end },
-            })
+        fn send(&self, _from: u16, to: u16, envelope: Envelope<u16>) {
+            // Only peer 2 is scripted; what goes to the seeding leader 9 is
+            // dropped.
+            if to != 2 {
+                return;
+            }
+            let answer = match envelope {
+                Envelope::Raft(Message::Append {
+                    term,
+                    round,
+                    commit,
+                    prev_index,
+                    ..
+                }) => Envelope::Raft(Message::AppendAnswer {
+                    term,
+                    round,
+                    commit,
+                    result: AppendResult::Rejected {
+                        rejected: prev_index,
+                        last_index: 0,
+                        conflict_term: 0,
+                        conflict_first: 1,
+                    },
+                }),
+                Envelope::Raft(Message::Vote { term, .. }) => Envelope::Raft(Message::VoteAnswer {
+                    term,
+                    granted: true,
+                }),
+                Envelope::Raft(Message::PreVote { next_term, .. }) => {
+                    Envelope::Raft(Message::PreVoteAnswer {
+                        term: next_term.saturating_sub(1),
+                        next_term,
+                        granted: true,
+                    })
+                }
+                Envelope::SnapshotChunk(chunk) => {
+                    let mut offsets = self.install_offsets.lock().unwrap();
+                    let attempt = offsets.len();
+                    offsets.push(chunk.offset);
+                    let chunk_end = chunk.offset + chunk.data.len() as u64;
+                    Envelope::SnapshotAck(InstallSnapshotResp {
+                        term: chunk.term,
+                        last_included_index: chunk.last_included_index,
+                        last_included_term: chunk.last_included_term,
+                        // The first chunk lands. The follower then restarts
+                        // before the final chunk and asks to restart at zero.
+                        bytes_received: if attempt == 1 { 0 } else { chunk_end },
+                    })
+                }
+                _ => return,
+            };
+            if let Some(worker) = self.worker.lock().unwrap().as_ref() {
+                worker.deliver(2, answer);
+            }
         }
     }
 
     let transport = Arc::new(RewindTransport {
         install_offsets: Mutex::new(Vec::new()),
+        worker: Mutex::new(None),
     });
     let mut config = cfg(1, vec![1, 2]);
     config.pre_vote = false;
@@ -2002,12 +1960,26 @@ fn snapshot_sender_rewinds_after_follower_loses_partial_buffer() {
         StdRng::from_entropy(),
     );
     let handle = worker.handler();
+    transport.worker.lock().unwrap().replace(handle.clone());
 
     // Seed state that is already compacted, so the next elected leader must
-    // use InstallSnapshot once its follower rejects the no-op tail.
-    let installed = block_on(handle.handle_inbound_install(
+    // send a snapshot once its follower rejects the no-op tail. Leader 9's
+    // heartbeat establishes it before its snapshot.
+    handle.deliver(
         9,
-        InstallSnapshotReq {
+        Envelope::Raft(Message::Append {
+            term: 1,
+            leader: 9,
+            prev_index: 10,
+            prev_term: 1,
+            commit: 0,
+            round: 1,
+            entries: vec![],
+        }),
+    );
+    handle.deliver(
+        9,
+        Envelope::SnapshotChunk(InstallSnapshotReq {
             leader: 9,
             term: 1,
             last_included_index: 10,
@@ -2018,9 +1990,9 @@ fn snapshot_sender_rewinds_after_follower_loses_partial_buffer() {
             members: vec![1, 2],
             joint_old: None,
             active_config_index: Some(10),
-        },
-    ));
-    assert_eq!(installed.bytes_received, 16);
+        }),
+    );
+    assert_eq!(block_on(handle.snapshot()).unwrap().snap_last_index, 10);
 
     wait_until(
         || transport.install_offsets.lock().unwrap().len() >= 3,
@@ -2380,7 +2352,7 @@ fn retiring_follower_activates_final_from_leader_commit() {
     config.election_timeout_ms = (5_000, 6_000);
     let worker = Worker::spawn_with(
         storage,
-        transport,
+        transport.clone(),
         config,
         (),
         StdClock,
@@ -2395,18 +2367,24 @@ fn retiring_follower_activates_final_from_leader_commit() {
     assert_eq!(before.active_config_index, Some(2));
     assert_eq!(before.retirement_final_index, Some(3));
 
-    let response = block_on(worker.handler().handle_inbound_append(
+    let response = ask(
+        &worker.handler(),
+        &transport,
         NEW,
-        AppendEntriesReq {
-            leader: NEW,
+        Envelope::Raft(Message::Append {
             term: TERM,
-            prev_log_index: 3,
-            prev_log_term: TERM,
-            leader_commit: 3,
+            leader: NEW,
+            prev_index: 3,
+            prev_term: TERM,
+            commit: 3,
+            round: 1,
             entries: Vec::new(),
-        },
-    ));
-    assert!(response.success, "commit heartbeat must be accepted");
+        }),
+    );
+    assert!(
+        matched(&response).is_some(),
+        "commit heartbeat must be accepted"
+    );
 
     let after = block_on(worker.handler().snapshot()).expect("snapshot after commit notice");
     assert_eq!(after.commit_index, 3);
@@ -2460,7 +2438,7 @@ fn follower_recognizes_confirmation_after_already_present_final() {
     config.election_timeout_ms = (5_000, 6_000);
     let worker = Worker::spawn_with(
         storage,
-        transport,
+        transport.clone(),
         config,
         (),
         StdClock,
@@ -2472,18 +2450,24 @@ fn follower_recognizes_confirmation_after_already_present_final() {
     assert_eq!(before.joint_old, Some(vec![OLD, NEW]));
     assert_eq!(before.retirement_final_index, Some(3));
 
-    let response = block_on(worker.handler().handle_inbound_append(
+    let response = ask(
+        &worker.handler(),
+        &transport,
         NEW,
-        AppendEntriesReq {
-            leader: NEW,
+        Envelope::Raft(Message::Append {
             term: TERM,
-            prev_log_index: 3,
-            prev_log_term: TERM,
-            leader_commit: 4,
+            leader: NEW,
+            prev_index: 3,
+            prev_term: TERM,
+            commit: 4,
+            round: 1,
             entries: vec![LogEntry::config_change(4, TERM, None, vec![NEW])],
-        },
-    ));
-    assert!(response.success, "confirmation append must be accepted");
+        }),
+    );
+    assert!(
+        matched(&response).is_some(),
+        "confirmation append must be accepted"
+    );
 
     let after = block_on(worker.handler().snapshot()).expect("snapshot after confirmation");
     assert_eq!(after.commit_index, 4);
@@ -2541,7 +2525,7 @@ fn replaced_speculative_final_preserves_retirement_debt() {
     config.election_timeout_ms = (5_000, 6_000);
     let worker = Worker::spawn_with(
         storage,
-        transport,
+        transport.clone(),
         config,
         (),
         StdClock,
@@ -2557,21 +2541,27 @@ fn replaced_speculative_final_preserves_retirement_debt() {
         Some(3),
     );
 
-    let response = block_on(worker.handler().handle_inbound_append(
+    let response = ask(
+        &worker.handler(),
+        &transport,
         LEADER,
-        AppendEntriesReq {
-            leader: LEADER,
+        Envelope::Raft(Message::Append {
             term: NEW_TERM,
-            prev_log_index: 2,
-            prev_log_term: OLD_TERM,
-            leader_commit: 2,
+            leader: LEADER,
+            prev_index: 2,
+            prev_term: OLD_TERM,
+            commit: 2,
+            round: 1,
             entries: vec![
                 LogEntry::data(3, NEW_TERM, b"promotion-noop".to_vec()),
                 LogEntry::config_change(4, NEW_TERM, None, new_members.clone()),
             ],
-        },
-    ));
-    assert!(response.success, "replacement tail must be accepted");
+        }),
+    );
+    assert!(
+        matched(&response).is_some(),
+        "replacement tail must be accepted"
+    );
 
     let after = block_on(worker.handler().snapshot()).expect("snapshot after replacement");
     assert_eq!(after.members, new_members);
@@ -2679,7 +2669,10 @@ fn replacement_leader_notifies_a_recovered_retiring_follower() {
                         && old.commit_index >= 3
                         && old.members == vec![NEW]
                         && old.joint_old.is_none()
-                        && old.active_config_index == Some(3)
+                        // The final row (3), or the confirmation that
+                        // restates it (5, after the new leader's no-op),
+                        // which may reach the retiring node too.
+                        && matches!(old.active_config_index, Some(3 | 5))
             )
         },
         Duration::from_secs(8),
@@ -2732,7 +2725,7 @@ fn committed_retirement_confirmation_survives_restart() {
     config.election_timeout_ms = (5_000, 6_000);
     let worker = Worker::spawn_with(
         storage,
-        transport,
+        transport.clone(),
         config,
         (),
         StdClock,

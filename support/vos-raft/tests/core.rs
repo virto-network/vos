@@ -1,0 +1,816 @@
+//! The protocol core, driven directly: what it claims, applies and sends,
+//! write by write. Cluster behaviour under faults is in `tests/simulated.rs`.
+
+#![cfg(feature = "std")]
+
+use vos_raft::core::{Action, Answer, Core, ProposeError, Recovered, Write};
+use vos_raft::{AppendResult, Config, LogEntry, Message, Meta, Role};
+
+const LEADER_A: u16 = 2;
+const LEADER_B: u16 = 3;
+const ME: u16 = 1;
+
+fn config() -> Config<u16> {
+    let mut cfg = Config::new(ME, vec![ME, LEADER_A, LEADER_B], [0; 32]);
+    cfg.election_timeout_ms = (150, 300);
+    cfg.heartbeat_interval_ms = 50;
+    cfg
+}
+
+/// A follower at `term`, durably holding `terms` (entry i + 1 has
+/// `terms[i]`), committed through `commit`.
+fn follower(term: u64, terms: &[u64], commit: u64) -> Core<u16> {
+    let entries = terms
+        .iter()
+        .enumerate()
+        .map(|(at, &term)| LogEntry::data(at as u64 + 1, term, vec![at as u8]))
+        .collect();
+    let recovered = Recovered {
+        meta: Meta {
+            current_term: term,
+            voted_for: None,
+            commit_index: commit,
+            snap_last_index: 0,
+            snap_last_term: 0,
+        },
+        entries,
+        active_config: None,
+        applied: commit,
+    };
+    let mut core = Core::new(config(), recovered, 0, 7);
+    core.take_actions();
+    core
+}
+
+fn append(
+    term: u64,
+    leader: u16,
+    prev: (u64, u64),
+    commit: u64,
+    entries: &[(u64, u64)],
+) -> Message<u16> {
+    Message::Append {
+        term,
+        leader,
+        prev_index: prev.0,
+        prev_term: prev.1,
+        commit,
+        round: 1,
+        entries: entries
+            .iter()
+            .map(|&(index, term)| LogEntry::data(index, term, vec![0xee]))
+            .collect(),
+    }
+}
+
+fn writes(actions: &[Action<u16>]) -> Vec<Write<u16>> {
+    actions
+        .iter()
+        .filter_map(|action| match action {
+            Action::Write(write) => Some(write.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The highest index any acknowledgement in `actions` claims.
+fn claimed(actions: &[Action<u16>]) -> Option<u64> {
+    actions
+        .iter()
+        .filter_map(|action| match action {
+            Action::Send {
+                message:
+                    Message::AppendAnswer {
+                        result: AppendResult::Matched { matched },
+                        ..
+                    },
+                ..
+            } => Some(*matched),
+            _ => None,
+        })
+        .max()
+}
+
+fn committed(actions: &[Action<u16>]) -> Option<u64> {
+    actions
+        .iter()
+        .filter_map(|action| match action {
+            Action::Committed { index } => Some(*index),
+            _ => None,
+        })
+        .max()
+}
+
+fn sent(actions: &[Action<u16>]) -> Vec<Message<u16>> {
+    actions
+        .iter()
+        .filter_map(|action| match action {
+            Action::Send { message, .. } => Some(message.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_late_report_of_a_replaced_write_vouches_for_nothing() {
+    // Durable through 10; leader A (term 2) sends 11, written but not yet
+    // durable.
+    let mut core = follower(2, &[1; 10], 10);
+    core.receive(LEADER_A, append(2, LEADER_A, (10, 1), 0, &[(11, 2)]));
+    let first = core.take_actions();
+    let old_write = writes(&first).last().expect("a write").seq;
+    assert_eq!(
+        claimed(&first),
+        Some(10),
+        "only the durable prefix is claimed"
+    );
+
+    // Leader B (term 3) replaces 11 and adds 12.
+    core.receive(
+        LEADER_B,
+        append(3, LEADER_B, (10, 1), 0, &[(11, 3), (12, 3)]),
+    );
+    let second = core.take_actions();
+    let new_write = writes(&second).last().expect("a write").seq;
+
+    // The old write's report arrives late. It wrote an entry at 11 too, but
+    // at term 2: it must not vouch for B's entry there.
+    core.durable(old_write);
+    let late = core.take_actions();
+    assert!(claimed(&late).is_none_or(|index| index <= 10), "{late:?}");
+    assert_eq!(core.status().durable_index, 10);
+
+    // B's own write does.
+    core.durable(new_write);
+    let ready = core.take_actions();
+    assert_eq!(claimed(&ready), Some(12));
+    assert_eq!(core.status().durable_index, 12);
+}
+
+/// A two-member group led by `ME`, at term 1, holding its no-op durably.
+fn leader_of_two() -> Core<u16> {
+    let mut cfg = config();
+    cfg.members = vec![ME, LEADER_A];
+    cfg.pre_vote = false;
+    let mut core = Core::new(cfg, Recovered::default(), 0, 5);
+    core.take_actions();
+    core.tick(1_000);
+    let vote = writes(&core.take_actions()).last().unwrap().seq;
+    core.durable(vote);
+    core.receive(
+        LEADER_A,
+        Message::VoteAnswer {
+            term: 1,
+            granted: true,
+        },
+    );
+    assert_eq!(core.role(), Role::Leader);
+    let no_op = writes(&core.take_actions()).last().unwrap().seq;
+    core.durable(no_op);
+    core.take_actions();
+    core
+}
+
+#[test]
+fn a_leader_sends_each_peer_a_commit_it_has_acknowledged() {
+    // A three-member group led by ME; peers A and B.
+    let mut cfg = config();
+    cfg.pre_vote = false;
+    let mut core = Core::new(cfg, Recovered::default(), 0, 5);
+    core.take_actions();
+    core.tick(1_000);
+    let vote = writes(&core.take_actions()).last().unwrap().seq;
+    core.durable(vote);
+    core.receive(
+        LEADER_A,
+        Message::VoteAnswer {
+            term: 1,
+            granted: true,
+        },
+    );
+    assert_eq!(core.role(), Role::Leader);
+    for n in 0..4u8 {
+        core.propose(u64::from(n), vec![n]);
+    }
+    let write = writes(&core.take_actions()).last().unwrap().seq;
+    core.durable(write);
+    let answer = |matched| Message::AppendAnswer {
+        term: 1,
+        round: 0,
+        commit: 0,
+        result: AppendResult::Matched { matched },
+    };
+    // A holds everything, B only through 2: the leader commits 5.
+    core.receive(LEADER_A, answer(5));
+    core.receive(LEADER_B, answer(2));
+    assert_eq!(committed(&core.take_actions()), Some(5));
+    // Its next heartbeat tells B no more than B acknowledged.
+    core.tick(1_000 + 60);
+    let to_b: Vec<u64> = core
+        .take_actions()
+        .into_iter()
+        .filter_map(|action| match action {
+            Action::Send {
+                to: LEADER_B,
+                message: Message::Append { commit, .. },
+            } => Some(commit),
+            _ => None,
+        })
+        .collect();
+    assert!(!to_b.is_empty());
+    assert!(to_b.iter().all(|&commit| commit <= 2), "{to_b:?}");
+}
+
+#[test]
+fn a_commit_index_never_applies_an_unverified_entry() {
+    // The follower holds a stale, uncommitted entry 11 from term 2.
+    let mut core = follower(2, &[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2], 10);
+    // Leader B of term 3 committed its own entry 11; its heartbeat, with
+    // commit 11, overtakes the append that would replace ours.
+    core.receive(LEADER_B, append(3, LEADER_B, (10, 1), 11, &[]));
+    let actions = core.take_actions();
+    assert!(
+        committed(&actions).is_none_or(|index| index <= 10),
+        "applied the stale entry: {actions:?}"
+    );
+    // The append arrives: 11 is replaced and verified, and may apply.
+    core.receive(LEADER_B, append(3, LEADER_B, (10, 1), 11, &[(11, 3)]));
+    let actions = core.take_actions();
+    assert_eq!(committed(&actions), Some(11));
+}
+
+#[test]
+fn a_vote_leaves_only_once_it_is_durable() {
+    let mut core = follower(1, &[1, 1], 2);
+    core.receive(
+        LEADER_B,
+        Message::Vote {
+            term: 2,
+            candidate: LEADER_B,
+            last_index: 2,
+            last_term: 1,
+        },
+    );
+    let actions = core.take_actions();
+    assert!(
+        !sent(&actions)
+            .iter()
+            .any(|message| matches!(message, Message::VoteAnswer { granted: true, .. })),
+        "granted before the vote was durable"
+    );
+    let write = writes(&actions).last().expect("the vote's write").clone();
+    assert!(write.sync);
+    assert_eq!(
+        write.meta.as_ref().map(|meta| meta.voted_for),
+        Some(Some(LEADER_B))
+    );
+    core.durable(write.seq);
+    let actions = core.take_actions();
+    assert!(sent(&actions).contains(&Message::VoteAnswer {
+        term: 2,
+        granted: true
+    }));
+}
+
+#[test]
+fn an_answer_at_a_new_term_waits_for_the_term() {
+    let mut core = follower(1, &[1, 1], 2);
+    // A heartbeat at term 3: the follower adopts it, and may not answer at
+    // term 3 until term 3 is durable.
+    core.receive(LEADER_B, append(3, LEADER_B, (2, 1), 2, &[]));
+    let actions = core.take_actions();
+    assert!(sent(&actions).is_empty(), "{actions:?}");
+    let write = writes(&actions).last().expect("the term's write").clone();
+    core.durable(write.seq);
+    let actions = core.take_actions();
+    assert!(matches!(
+        sent(&actions).as_slice(),
+        [Message::AppendAnswer { term: 3, .. }]
+    ));
+    // At the durable term, a heartbeat is answered at once.
+    core.receive(LEADER_B, append(3, LEADER_B, (2, 1), 2, &[]));
+    let actions = core.take_actions();
+    assert_eq!(sent(&actions).len(), 1);
+}
+
+#[test]
+fn a_candidate_counts_its_own_vote_only_once_durable() {
+    let mut cfg = config();
+    cfg.members = vec![ME];
+    let mut core = Core::new(cfg, Recovered::default(), 0, 3);
+    core.take_actions();
+    core.tick(1_000);
+    let actions = core.take_actions();
+    assert_eq!(
+        core.role(),
+        Role::Candidate,
+        "not leader before the vote is durable"
+    );
+    let write = writes(&actions).last().expect("term and vote").clone();
+    core.durable(write.seq);
+    let actions = core.take_actions();
+    assert_eq!(core.role(), Role::Leader);
+    // Its no-op commits only once durable, too.
+    assert!(committed(&actions).is_none());
+    let no_op = writes(&actions).last().expect("the no-op").clone();
+    core.durable(no_op.seq);
+    assert_eq!(committed(&core.take_actions()), Some(1));
+}
+
+#[test]
+fn heartbeats_go_to_peers_with_an_append_in_flight() {
+    let mut core = leader_of_two();
+    // The no-op is in flight to the peer, unanswered; the next heartbeat
+    // still goes.
+    core.tick(1_000 + 60);
+    let actions = core.take_actions();
+    assert!(sent(&actions).iter().any(|message| matches!(
+        message,
+        Message::Append { entries, .. } if entries.is_empty()
+    )));
+}
+
+fn matched(matched: u64) -> Message<u16> {
+    Message::AppendAnswer {
+        term: 1,
+        round: 0,
+        commit: 0,
+        result: AppendResult::Matched { matched },
+    }
+}
+
+/// The appends in `actions` to `peer`, as (prev_index, entry indices).
+fn appends_to(actions: &[Action<u16>], peer: u16) -> Vec<(u64, Vec<u64>)> {
+    actions
+        .iter()
+        .filter_map(|action| match action {
+            Action::Send {
+                to,
+                message:
+                    Message::Append {
+                        prev_index,
+                        entries,
+                        ..
+                    },
+            } if *to == peer => Some((
+                *prev_index,
+                entries.iter().map(|entry| entry.index).collect(),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+fn proposals_refused(actions: &[Action<u16>]) -> usize {
+    actions
+        .iter()
+        .filter(|action| {
+            matches!(
+                action,
+                Action::Answer(Answer::Propose {
+                    result: Err(ProposeError::NotLeader),
+                    ..
+                })
+            )
+        })
+        .count()
+}
+
+#[test]
+fn a_proposal_goes_out_at_once_unless_an_append_is_in_flight() {
+    let mut core = leader_of_two();
+    // The no-op is in flight to A: a proposal waits for its answer.
+    core.propose(1, vec![1]);
+    let actions = core.take_actions();
+    assert!(appends_to(&actions, LEADER_A).is_empty(), "{actions:?}");
+    // A acknowledges the no-op: the proposal follows at once, without
+    // waiting for a heartbeat.
+    core.receive(LEADER_A, matched(1));
+    assert_eq!(
+        appends_to(&core.take_actions(), LEADER_A),
+        vec![(1, vec![2])]
+    );
+    // With the slot free again, a proposal is sent as it is made.
+    core.receive(LEADER_A, matched(2));
+    core.take_actions();
+    core.propose(2, vec![2]);
+    assert_eq!(
+        appends_to(&core.take_actions(), LEADER_A),
+        vec![(2, vec![3])]
+    );
+}
+
+#[test]
+fn an_append_carries_at_most_its_byte_cap() {
+    let mut cfg = config();
+    cfg.members = vec![ME, LEADER_A];
+    cfg.pre_vote = false;
+    cfg.max_append_bytes = 100;
+    let mut core = Core::new(cfg, Recovered::default(), 0, 5);
+    core.take_actions();
+    core.tick(1_000);
+    let vote = writes(&core.take_actions()).last().unwrap().seq;
+    core.durable(vote);
+    core.receive(
+        LEADER_A,
+        Message::VoteAnswer {
+            term: 1,
+            granted: true,
+        },
+    );
+    core.take_actions();
+    for n in 0..3u8 {
+        core.propose(u64::from(n), vec![n; 60]);
+    }
+    core.take_actions();
+    // Each 60-byte entry fills most of the cap: one entry per append.
+    for next in 2..=4 {
+        core.receive(LEADER_A, matched(next - 1));
+        assert_eq!(
+            appends_to(&core.take_actions(), LEADER_A),
+            vec![(next - 1, vec![next])]
+        );
+    }
+}
+
+#[test]
+fn a_rejection_moves_the_probe_past_the_conflicting_term() {
+    // The leader holds 1..=3 at term 1 and 4..=6 at term 3; elected at
+    // term 4, it appends its no-op at 7.
+    let mut cfg = config();
+    cfg.members = vec![ME, LEADER_A];
+    cfg.pre_vote = false;
+    let entries = [1, 1, 1, 3, 3, 3]
+        .iter()
+        .enumerate()
+        .map(|(at, &term)| LogEntry::data(at as u64 + 1, term, vec![at as u8]))
+        .collect();
+    let recovered = Recovered {
+        meta: Meta {
+            current_term: 3,
+            voted_for: None,
+            commit_index: 3,
+            snap_last_index: 0,
+            snap_last_term: 0,
+        },
+        entries,
+        active_config: None,
+        applied: 3,
+    };
+    let mut core = Core::new(cfg, recovered, 0, 5);
+    core.take_actions();
+    core.tick(1_000);
+    let vote = writes(&core.take_actions()).last().unwrap().seq;
+    core.durable(vote);
+    core.receive(
+        LEADER_A,
+        Message::VoteAnswer {
+            term: 4,
+            granted: true,
+        },
+    );
+    assert_eq!(core.role(), Role::Leader);
+    let (probe, _) = appends_to(&core.take_actions(), LEADER_A)[0].clone();
+    assert!(probe >= 6, "the first probe follows the leader's log");
+    // A holds 4..=5 at term 2, which the leader never had: the probe
+    // skips the whole term at once, to the end of the leader's term 1.
+    core.receive(
+        LEADER_A,
+        Message::AppendAnswer {
+            term: 4,
+            round: 0,
+            commit: 0,
+            result: AppendResult::Rejected {
+                rejected: probe,
+                last_index: 5,
+                conflict_term: 2,
+                conflict_first: 4,
+            },
+        },
+    );
+    let appends = appends_to(&core.take_actions(), LEADER_A);
+    assert_eq!(
+        appends.first().map(|(prev, _)| *prev),
+        Some(3),
+        "{appends:?}"
+    );
+}
+
+#[test]
+fn check_quorum_deposes_a_leader_that_hears_from_no_one() {
+    let mut core = leader_of_two();
+    // A's pair heartbeat counts as hearing from it.
+    core.tick(1_000 + 200);
+    core.peer_alive(LEADER_A);
+    core.tick(1_000 + 310);
+    core.take_actions();
+    assert_eq!(core.role(), Role::Leader);
+    // A whole election timeout of silence: the leader steps down.
+    core.tick(1_000 + 620);
+    core.take_actions();
+    assert_eq!(core.role(), Role::Follower);
+}
+
+#[test]
+fn a_transfer_hands_over_once_the_target_holds_everything() {
+    let mut core = leader_of_two();
+    core.receive(LEADER_A, matched(1));
+    core.propose(1, vec![1]);
+    let write = writes(&core.take_actions()).last().unwrap().seq;
+    core.durable(write);
+    core.transfer_leadership(Some(LEADER_A));
+    let actions = core.take_actions();
+    assert!(
+        !sent(&actions).contains(&Message::TimeoutNow { term: 1 }),
+        "A lacks entry 2: {actions:?}"
+    );
+    // While handing over, the leader takes no proposals.
+    core.propose(2, vec![2]);
+    assert_eq!(proposals_refused(&core.take_actions()), 1);
+    core.receive(LEADER_A, matched(2));
+    assert!(sent(&core.take_actions()).contains(&Message::TimeoutNow { term: 1 }));
+}
+
+#[test]
+fn a_stalled_writer_hands_leadership_over() {
+    let mut core = leader_of_two();
+    core.receive(LEADER_A, matched(1));
+    // The leader's own write of entry 2 never completes; A holds it.
+    core.propose(1, vec![1]);
+    core.take_actions();
+    core.receive(LEADER_A, matched(2));
+    core.take_actions();
+    core.writer_health(true);
+    assert!(sent(&core.take_actions()).contains(&Message::TimeoutNow { term: 1 }));
+}
+
+#[test]
+fn a_stalled_leader_keeps_handing_over_until_a_peer_catches_up() {
+    let mut core = leader_of_two();
+    core.receive(LEADER_A, matched(1));
+    core.propose(1, vec![1]);
+    core.take_actions();
+    // A lacks entry 2: the handover waits, and outlives its deadline.
+    core.writer_health(true);
+    assert!(!sent(&core.take_actions()).contains(&Message::TimeoutNow { term: 1 }));
+    core.tick(1_000 + 310);
+    core.receive(LEADER_A, matched(1));
+    core.take_actions();
+    // Still stalled, the leader still takes no proposals.
+    core.propose(2, vec![2]);
+    assert_eq!(proposals_refused(&core.take_actions()), 1);
+    core.receive(LEADER_A, matched(2));
+    assert!(sent(&core.take_actions()).contains(&Message::TimeoutNow { term: 1 }));
+}
+
+/// The loads in `actions`.
+fn loads(actions: &[Action<u16>]) -> Vec<vos_raft::core::Load> {
+    actions
+        .iter()
+        .filter_map(|action| match action {
+            Action::LoadEntries(load) => Some(*load),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_follower_behind_the_cache_catches_up_from_the_store() {
+    // A leader of two whose cache holds almost nothing: entries it has
+    // made durable leave the cache as soon as more arrive.
+    let mut cfg = config();
+    cfg.members = vec![ME, LEADER_A];
+    cfg.pre_vote = false;
+    cfg.cache_bytes = 1;
+    // A stays silent until the resend; check-quorum would depose the leader.
+    cfg.check_quorum = false;
+    let mut core = Core::new(cfg, Recovered::default(), 0, 5);
+    core.take_actions();
+    core.tick(1_000);
+    let vote = writes(&core.take_actions()).last().unwrap().seq;
+    core.durable(vote);
+    core.receive(
+        LEADER_A,
+        Message::VoteAnswer {
+            term: 1,
+            granted: true,
+        },
+    );
+    // The store: every entry the leader writes, made durable at once.
+    let mut store: Vec<LogEntry<u16>> = Vec::new();
+    let mut persist = |core: &mut Core<u16>, actions: &[Action<u16>]| {
+        for write in writes(actions) {
+            store.extend(write.entries.iter().cloned());
+            core.durable(write.seq);
+        }
+    };
+    let actions = core.take_actions();
+    persist(&mut core, &actions);
+    for n in 0..6u8 {
+        core.propose(u64::from(n), vec![n]);
+        let actions = core.take_actions();
+        persist(&mut core, &actions);
+    }
+    // A never answered the no-op; its slot frees after the resend timeout,
+    // and what it lacks is no longer cached.
+    core.tick(1_000 + 1_100);
+    let mut actions = core.take_actions();
+    let mut sent_to_a: Vec<u64> = Vec::new();
+    for _ in 0..20 {
+        for (_, entries) in appends_to(&actions, LEADER_A) {
+            if let Some(&last) = entries.last() {
+                sent_to_a.extend(entries);
+                core.receive(LEADER_A, matched(last));
+            }
+        }
+        let pending = loads(&actions);
+        for load in pending {
+            let entries = store
+                .iter()
+                .filter(|entry| (load.from..=load.to).contains(&entry.index))
+                .cloned()
+                .collect();
+            core.loaded(load, entries);
+        }
+        actions = core.take_actions();
+        if actions.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(
+        sent_to_a,
+        (1..=7).collect::<Vec<u64>>(),
+        "every entry, once, in order"
+    );
+}
+
+#[test]
+fn a_leader_refuses_pre_votes() {
+    // Led for longer than the shortest election timeout: a follower that
+    // stopped hearing it over a lossy link must not win its pre-vote.
+    let mut cfg = config();
+    cfg.pre_vote = false;
+    cfg.check_quorum = false;
+    let mut core = Core::new(cfg, Recovered::default(), 0, 5);
+    core.take_actions();
+    core.tick(1_000);
+    let vote = writes(&core.take_actions()).last().unwrap().seq;
+    core.durable(vote);
+    core.receive(
+        LEADER_A,
+        Message::VoteAnswer {
+            term: 1,
+            granted: true,
+        },
+    );
+    assert_eq!(core.role(), Role::Leader);
+    core.tick(1_000 + 400);
+    core.take_actions();
+    core.receive(
+        LEADER_B,
+        Message::PreVote {
+            next_term: 2,
+            candidate: LEADER_B,
+            last_index: 100,
+            last_term: 1,
+        },
+    );
+    assert!(
+        sent(&core.take_actions()).contains(&Message::PreVoteAnswer {
+            term: 1,
+            next_term: 2,
+            granted: false,
+        })
+    );
+}
+
+#[test]
+fn a_stalled_leader_steps_down_and_stays_quiet() {
+    let mut core = leader_of_two();
+    core.receive(LEADER_A, matched(1));
+    core.propose(1, vec![1]);
+    core.take_actions();
+    // A never catches up: every handover times out, and then the leader
+    // steps down.
+    core.writer_health(true);
+    let mut now = 1_000;
+    for _ in 0..6 {
+        now += 310;
+        core.peer_alive(LEADER_A);
+        core.tick(now);
+        core.take_actions();
+    }
+    assert_eq!(core.role(), Role::Follower);
+    // While its writer is stalled, it does not campaign.
+    for _ in 0..10 {
+        now += 400;
+        core.tick(now);
+        let actions = core.take_actions();
+        assert!(
+            !sent(&actions)
+                .iter()
+                .any(|message| matches!(message, Message::Vote { .. } | Message::PreVote { .. })),
+            "{actions:?}"
+        );
+    }
+    // Once it recovers, it campaigns again.
+    core.writer_health(false);
+    let mut campaigned = false;
+    for _ in 0..4 {
+        now += 400;
+        core.tick(now);
+        campaigned |= sent(&core.take_actions())
+            .iter()
+            .any(|message| matches!(message, Message::Vote { .. } | Message::PreVote { .. }));
+    }
+    assert!(campaigned);
+}
+
+#[test]
+fn timeout_now_counts_only_from_the_leader() {
+    let mut core = follower(1, &[1, 1], 2);
+    core.receive(LEADER_A, append(1, LEADER_A, (2, 1), 2, &[]));
+    core.take_actions();
+    core.receive(LEADER_B, Message::TimeoutNow { term: 1 });
+    core.take_actions();
+    assert_eq!(core.role(), Role::Follower);
+    // Nor while its writer is stalled: it could not persist the vote.
+    core.writer_health(true);
+    core.receive(LEADER_A, Message::TimeoutNow { term: 1 });
+    core.take_actions();
+    assert_eq!(core.role(), Role::Follower);
+    core.writer_health(false);
+    core.receive(LEADER_A, Message::TimeoutNow { term: 1 });
+    core.take_actions();
+    assert_eq!(core.role(), Role::Candidate);
+}
+
+#[test]
+fn a_snapshot_switch_records_the_newest_term_and_vote() {
+    // A vote at term 2 is queued, not yet durable, when a switch is made:
+    // the switch must not write an older term or vote over it.
+    let mut core = follower(1, &[1, 1], 2);
+    core.receive(
+        LEADER_B,
+        Message::Vote {
+            term: 2,
+            candidate: LEADER_B,
+            last_index: 2,
+            last_term: 1,
+        },
+    );
+    core.take_actions();
+    let switch = core.snapshot_switch(10, 2, None);
+    assert_eq!(switch.meta.current_term, 2);
+    assert_eq!(switch.meta.voted_for, Some(LEADER_B));
+    assert_eq!(
+        (switch.meta.snap_last_index, switch.meta.commit_index),
+        (10, 10)
+    );
+}
+
+#[test]
+fn a_load_that_starts_late_sends_nothing() {
+    let mut cfg = config();
+    cfg.members = vec![ME, LEADER_A];
+    cfg.pre_vote = false;
+    cfg.cache_bytes = 1;
+    cfg.check_quorum = false;
+    let mut core = Core::new(cfg, Recovered::default(), 0, 5);
+    core.take_actions();
+    core.tick(1_000);
+    let vote = writes(&core.take_actions()).last().unwrap().seq;
+    core.durable(vote);
+    core.receive(
+        LEADER_A,
+        Message::VoteAnswer {
+            term: 1,
+            granted: true,
+        },
+    );
+    let mut store: Vec<LogEntry<u16>> = Vec::new();
+    for n in 0..4u8 {
+        let actions = core.take_actions();
+        for write in writes(&actions) {
+            store.extend(write.entries.iter().cloned());
+            core.durable(write.seq);
+        }
+        core.propose(u64::from(n), vec![n]);
+    }
+    for write in writes(&core.take_actions()) {
+        store.extend(write.entries.iter().cloned());
+        core.durable(write.seq);
+    }
+    core.tick(1_000 + 1_100);
+    let load = loads(&core.take_actions())[0];
+    // The store compacted the load's first entry away meanwhile.
+    let late = store
+        .iter()
+        .filter(|entry| entry.index > load.from && entry.index <= load.to)
+        .cloned()
+        .collect();
+    core.loaded(load, late);
+    let actions = core.take_actions();
+    assert!(appends_to(&actions, LEADER_A).is_empty(), "{actions:?}");
+    assert!(loads(&actions).is_empty(), "not reissued: {actions:?}");
+}

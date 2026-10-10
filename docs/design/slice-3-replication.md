@@ -648,7 +648,7 @@ Measured durable appends through the node writer on fjall by entry size,
 alone and beside other agents' small entries; found the cause of S3's
 64 KiB case; settled the blob path above (`slice-3-progress.md`).
 
-### 3.2 vos-raft core
+### 3.2 vos-raft core [done]
 
 - Restructure the worker into the core above.
 - Run the existing tests on it through the thin driver.
