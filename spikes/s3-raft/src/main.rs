@@ -678,6 +678,17 @@ fn main() {
             }
         }
         "disk" => disk(),
+        "one" => {
+            // `one <mem|redb> <payload bytes> <concurrency> [heartbeat_ms]`
+            let arg = |n: usize| std::env::args().nth(n).unwrap_or_default();
+            throughput(
+                &arg(2),
+                arg(3).parse().unwrap(),
+                arg(4).parse().unwrap(),
+                arg(5).parse().unwrap_or(50),
+                4,
+            );
+        }
         "active" => {
             let groups: usize = std::env::args().nth(2).and_then(|g| g.parse().ok()).unwrap_or(16);
             let concurrency: usize = std::env::args().nth(3).and_then(|c| c.parse().ok()).unwrap_or(16);

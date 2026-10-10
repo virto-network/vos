@@ -178,22 +178,56 @@ The storage thread from slice 2 becomes the node log writer:
   windows and outbox rows; re-applying regenerates them, with the same
   outbox sequence numbers, which receivers deduplicate (section 9.5).
 
-**Large entries come first** (step 3.1). A work result may be 4 MiB
-(`cap::WORK_RESULT`), and an install carries its programs. S3 measured
-64 KiB entries at 613 commits/s with no explanation. Step 3.1 measures
-durable appends by entry size on fjall through the writer, finds the
-cause, and settles:
+**Large entries take a blob path** [decided by step 3.1; see
+`slice-3-progress.md`]. A work result may be 4 MiB
+(`cap::WORK_RESULT`), and an install carries its programs. Through a
+shared writer, one agent's 4 MiB entries pushed every other agent's small
+appends to a p99 of 263 ms, and no flush cap helped. A separate blob
+writer brought it to 15 ms. So:
 
-- the flush cap and the append cap in bytes;
-- whether entries up to 4 MiB can ride the log inline, or need the
-  content-addressed blob path of open question 3 (blobs pinned at propose,
-  replicated with the entry that names them, invariant 7).
+- entries of 64 KiB or more are content-addressed blobs, written by the
+  node's blob writer (its own thread, files and syncs, with group commit);
+- the log entry carries the blob's hash and length;
+- a replica appends the reference only once its copy of the blob is
+  durable (invariant 7);
+- the leader sends the blob ahead of the append that names it;
+- smaller entries stay inline in the log partition;
+- S3's slow 64 KiB entries were redb's cost per commit, not the driver's.
 
-**Programs** are the first large payload: an install body may hold
-64 MiB (slice 2's cap). Step 3.1 settles them explicitly: inline in the
-install entry up to the append cap, or through the blob path always.
-Either way accumulate stores them in the node's program store, so every
-replica can lead.
+Why not one log file for everything: it would give up invariant 2 (state
+and log share one journal). Blobs keep every reference in the journal,
+and invariant 7 bridges the blob file. What the blob path requires:
+
+- **A blob counts as durable only once verified** against its hash; the
+  length in the reference bounds the receive.
+- **An entry is durable when its reference and every blob it names are.**
+  The writer reports "durable up to n" only then, so the leader's
+  self-count, a follower's `match_index` and the read barrier need nothing
+  more. An append that arrives before its blob is appended but not yet
+  durable, not refused.
+- **So a replica that holds an entry holds its blobs,** which makes a
+  leader change safe: any replica with the entry can serve its blobs.
+- **Fetching:** a replica missing a named blob fetches it from the leader
+  or any replica holding the entry. A leader keeps blobs as long as it
+  keeps their entries for lagging followers.
+- **Hashing runs on executors** (BLAKE2b-256 over 4 MiB is 2–4 ms): the
+  leader hashes at refine's end, a follower on receipt, never on a
+  writer thread.
+- **Accumulate resolves a reference to its bytes** before it runs: a
+  read on the apply path, off the journal.
+- **Collection:** a blob is referenced by log entries, by installed
+  programs across every agent (one blob, many pins) and by the blobs a
+  leader sent ahead of appends still in flight. An unreferenced blob is
+  garbage only after a horizon, since its append may be in flight. Blobs
+  sent ahead by a leader that died, and blobs of a truncated suffix,
+  become such orphans.
+- **New files are durable** only with a directory sync, or segments are
+  preallocated; step 3.3 chooses.
+
+**Programs** always take the blob path: an install body may hold 64 MiB
+(slice 2's cap). The node's program store becomes pinned blobs, so every
+replica can lead. A work result's blob lives until log compaction passes
+its entry; blob files are collected by liveness (step 3.3).
 
 ### Transport [owner: decision 2]
 
@@ -201,6 +235,9 @@ Proposed: TCP between nodes with the Noise protocol (`XX` handshake, the
 `snow` crate), authenticated by each node's static key, and SCALE-encoded
 frames. One connection per node pair carries:
 
+- blobs, ahead of the appends that name them, and fetches of missing
+  blobs, with flow control per pair so a 64 MiB program never delays a
+  heartbeat; the core's byte caps count inline bytes only;
 - Raft messages of every group the two nodes share, with one combined
   heartbeat per pair per interval (it lists the groups and their rounds);
 - forwarded client requests and their answers;
@@ -307,13 +344,11 @@ session and loses exactly-once for requests in flight. Not recommended.
 
 ## Steps
 
-### 3.1 Large entries (item 18)
+### 3.1 Large entries (item 18) [done]
 
-Measure durable appends through the node writer on fjall: entry sizes
-1 KiB–4 MiB, one agent and 16 agents, with and without other agents'
-small entries in the same flushes. Re-run S3's 64 KiB case on redb and on
-fjall to find its cause. Settle the flush cap, the append cap and the
-inline-or-blob question (above), programs included.
+Measured durable appends through the node writer on fjall by entry size,
+alone and beside other agents' small entries; found the cause of S3's
+64 KiB case; settled the blob path above (`slice-3-progress.md`).
 
 ### 3.2 vos-raft core
 
@@ -328,8 +363,8 @@ the core.
 
 ### 3.3 Node storage for Raft
 
-Log kinds, meta rows, truncation, compaction below the durably applied
-index, the applied index apart from the version, per-change durability,
+The blob store and its writer, log kinds, meta rows, truncation,
+compaction below the durably applied index, the applied index apart from the version, per-change durability,
 capped flushes, snapshot export, staged ingestion and the atomic switch,
 recovery. A crash test like slice 2's, per invariant of section 9.5.
 
@@ -361,6 +396,11 @@ Per decision 3.
 
 Log compaction on every replica, snapshots streamed to a lagging or new
 replica, and replacing a replica through a membership change.
+
+A snapshot carries applied state, so work results' blobs need not travel
+with it; pinned blobs (programs) do. Its manifest lists the pinned
+hashes, the receiver fetches those it lacks, and the switch batch is
+written only once every one is durable (as invariant 6).
 
 ### 3.8 Many active agents (item 16)
 
@@ -404,8 +444,9 @@ their own review.
 - **Restructuring vos-raft** touches every path of a 4,500-line worker.
   Porting the existing tests first, and the simulated faults, are the
   guard; the protocol logic moves, it is not rewritten.
-- **Large entries** may need the blob path in this slice rather than in
-  step 4, which grows it.
+- **The blob path is in this slice** (step 3.1), not step 4: a second
+  writer per node, blobs in the transport with flow control, and
+  collection by liveness.
 - **Moving sessions into the agent** adds a log entry per opening and
   changes slice 2's ingress.
 - **One laptop** measures three replicas on one disk and one CPU, as S3
@@ -430,6 +471,7 @@ their own review.
    catalog's placement left out.
 
 **Defaults** (engineering, recorded rather than asked): heartbeat 500 ms,
-election timeout 1.5–3 s, quiescence after 4 idle intervals, append cap
-1 MiB, flush cap 8 MiB, compaction when the log passes 4,096 entries or
-64 MiB beyond the applied index. Steps 3.1 and 3.10 may move them.
+election timeout 1.5–3 s, quiescence after 4 idle intervals, blob
+threshold 64 KiB, append cap 1 MiB, flush cap 8 MiB, compaction when the
+log passes 4,096 entries or 64 MiB beyond the applied index. Step 3.10
+may move them.
