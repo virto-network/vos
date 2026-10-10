@@ -3180,3 +3180,111 @@ Folded nits:
 - the `Acknowledge` field names;
 - the process test's details.
 
+
+#### 3.5d1 Built
+
+- **The wire:** `PeerMessage::Deliver { to, message, relayed }` and
+  `Acknowledge { sender, receiver, sequence, relayed }`, on Requests,
+  on the destination's stream.
+- **`messages.rs`:**
+  - routing to an agent: into its queue here, to its leader, or to one
+    of its replicas from the directory;
+  - receiving, checked by hop: a direct hop from a replica of the
+    origin, a relayed one from a replica of the destination;
+  - a replica that does not lead relays once, never to itself.
+- **One replica per window:**
+  - a window goes through one replica of the target, the same for every
+    entry, so a sender's messages keep their order on one stream. Each
+    round goes through the next replica;
+  - an acknowledgement goes through a different one each time: it is
+    monotone, and any order will do.
+  - Found by the backlog test: picking a replica per message split a
+    window between a direct path and a relayed one. The two arrived out
+    of order, and the gaps dropped most of every round.
+- **The sender's leader keeps a `Window` per target,** in place of the
+  delivered map:
+  - 256 entries and 1 MiB past the acknowledgement;
+  - acknowledgements taken from the queue open it, and the targets whose
+    acknowledgements a batch held are filled after it;
+  - **rounds:** after 1 s with the outbox above the acknowledgement, a
+    window goes back to the acknowledgement and is sent again. The wait
+    doubles on each round with no progress, up to 16 s, and progress
+    resets it;
+  - the loop wakes for a round when one is due, yields to the node's
+    other tasks, and checks rounds between batches too.
+- **The receiver:**
+  - drops gaps before the batch (only each sender's next, in turn,
+    reaches it);
+  - routes its acknowledgements;
+  - queues messages and acknowledgements under a cap of their own.
+- **`Node::messages_sent_across`** counts the messages a node sent
+  toward other nodes.
+
+**Tests:**
+- **Cluster:**
+  - a message to an agent on nodes the sender's node does not replicate
+    goes through the directory and a relay, applies once, and the
+    sender's outbox empties;
+  - four nodes with overlapping replica sets;
+  - the receiver's leader stopping with messages in flight;
+  - the sender's leader stopping with its outbox unacknowledged, the
+    target down meanwhile;
+  - a backlog of 300 (beyond a window) draining once the target's nodes
+    return;
+  - a forged `Deliver`, direct or relayed, from a node replicating
+    neither end, is dropped.
+- **Node:** a gap is dropped before any batch, unacknowledged, until it
+  fills. This replaces the test that refine refuses it.
+- **Peer:** the new messages survive the wire, on Requests and their
+  destination's stream.
+- **The checker:**
+  - every fifth request forwards to the next client's agent's inbox;
+  - inbox reads mid-run are prefix sums of what was forwarded, never
+    going back;
+  - at the end, every replica's inbox, pair mark, acknowledgement and
+    last sequence sent match the forwards, and every outbox is empty;
+  - about 70 to 270 messages per run cross nodes, counted across
+    restarts.
+  - Twelve seeds pass.
+- **Mutations:**
+  - with no rounds, the receiver-stop and backlog tests fail;
+  - with rounds that send nothing, the checker never converges.
+  - A mutation that left rounds due without rewinding them spun the
+    leader loop and starved the node's thread. The loop now yields after
+    a round.
+
+**Review** (Opus): go, with no blocking issue. Its findings:
+- no window wedges or sends past its outbox;
+- nothing spins;
+- gap filtering loses nothing and acknowledges nothing wrongly;
+- the checks by hop and the relay conditions are right.
+
+Folded in:
+- **The checker's inbox reads raise the client's floor** with the index
+  they read at. Reads never go back only at the client's floor, and a
+  lagging replica could otherwise fail the check falsely.
+- **An acknowledgement taken from the queue no longer moves a window:**
+  one whose batch was lost could have opened a window the outbox
+  disagrees with. The targets a batch's acknowledgements touch are filled
+  after it, from the applied acknowledgement.
+- **Acknowledgements:**
+  - one no higher than the applied acknowledgement is dropped before the
+    batch, and the rest are coalesced, one per target, so re-acks cost
+    no log entries;
+  - they no longer count against the cap on messages, which could
+    otherwise starve the agent's own windows.
+- **A target whose delivery fails at a leadership's start** still gets a
+  window, whose round tries again.
+- **A node's windows start at a replica of its own:** directory-routed
+  senders spread over the replicas instead of all trying the first.
+- **Drops are counted:** a message or acknowledgement with nowhere to go
+  (`Refusal::Unplaced`).
+- **`Node::messages_relayed`,** and a test that a follower relays: node
+  1's first window goes through node 3, made a follower first. Without
+  relaying, it fails.
+
+Left for later:
+- acknowledging the mark when a gap is dropped, so the sender goes back
+  at once (fast retransmit);
+- fan-in past the receiver's cap (more than four full windows into one
+  agent), for 3.8.

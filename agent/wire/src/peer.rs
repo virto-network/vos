@@ -1,8 +1,8 @@
 //! What one node sends another: messages for an agent's replica group,
-//! snapshot chunks, blobs, liveness, the directory of agents, and clients'
-//! calls and read indexes, which a replica asks of its leader. The node
-//! checks each against the space's configuration before it reaches a
-//! group.
+//! snapshot chunks, blobs, liveness, the directory of agents, clients'
+//! calls and read indexes, which a replica asks of its leader, and agents'
+//! messages to each other and their acknowledgements. The node checks each
+//! against the space's configuration before it reaches a group.
 //!
 //! The Raft types mirror the consensus core's, so the wire format is this
 //! module's alone and the core may change underneath it. The network's
@@ -12,6 +12,7 @@ use alloc::vec::Vec;
 
 use scale::{Decode, Encode};
 
+use crate::batch::Message;
 use crate::ids::{AgentId, ProgramHash};
 use crate::ingress::{Answer, Call};
 
@@ -74,6 +75,24 @@ pub enum PeerMessage {
         agent: AgentId,
         token: u64,
         index: Option<u64>,
+    },
+    /// A message from agent `message.from` to agent `to`, from the
+    /// sender's leader, or `relayed` by a replica of `to` to its leader.
+    #[codec(index = 13)]
+    Deliver {
+        to: AgentId,
+        message: Message,
+        relayed: bool,
+    },
+    /// Agent `receiver` holds `sender`'s messages through `sequence`, from
+    /// the receiver's leader, or `relayed` by a replica of `sender` to its
+    /// leader.
+    #[codec(index = 14)]
+    Acknowledge {
+        sender: AgentId,
+        receiver: AgentId,
+        sequence: u64,
+        relayed: bool,
     },
 }
 

@@ -594,8 +594,11 @@ fn redelivery_while_the_sender_sends_more_applies_each_once() {
     assert_eq!(get::<u64>(&node, TARGET, &keys::pair_in(SENDER)), Some(4));
 }
 
+/// A message past the next of its pair is a gap: dropped before any batch,
+/// so it costs no log entry, and not acknowledged. The sender's next
+/// delivery fills it.
 #[test]
-fn a_gap_is_refused_unacknowledged_until_it_fills() {
+fn a_gap_is_dropped_unacknowledged_until_it_fills() {
     let programs = Programs::load();
     let dir = tempfile::tempdir().unwrap();
     let node = Node::open(dir.path(), config(&programs, Arc::new(vos_node::NoHooks))).unwrap();
@@ -615,11 +618,9 @@ fn a_gap_is_refused_unacknowledged_until_it_fills() {
     };
     let before = applied(&node, target);
     node.deliver(target, message(2, 20)).unwrap();
-    wait_until("the target refuses the gap", || {
-        applied(&node, target) > before
-    });
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(applied(&node, target), before, "a gap reaches no batch");
     assert_eq!(value(&node, &programs, target), 0);
-    std::thread::sleep(Duration::from_millis(50));
     assert_eq!(applied(&node, sender), leading, "a gap is not acknowledged");
     node.deliver(target, message(1, 1)).unwrap();
     node.deliver(target, message(2, 20)).unwrap();

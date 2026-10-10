@@ -207,6 +207,13 @@ impl Pending {
     pub(crate) fn capped(&self) -> bool {
         matches!(self, Pending::Request(..) | Pending::Admin(..))
     }
+
+    /// Counts against the cap on the messages other agents queue, which
+    /// other nodes now fill. Acknowledgements do not: they open this
+    /// agent's own windows, and the batch takes one per target.
+    pub(crate) fn agents_sent(&self) -> bool {
+        matches!(self, Pending::Message(_))
+    }
 }
 
 #[derive(Default)]
@@ -214,6 +221,8 @@ pub(crate) struct Queue {
     pub(crate) inputs: VecDeque<Pending>,
     /// Capped inputs queued.
     pub(crate) capped: usize,
+    /// Messages from other agents queued.
+    pub(crate) from_agents: usize,
     pub(crate) stopped: bool,
     /// The leader loop takes inputs: set when this replica's leadership
     /// starts, and cleared with the refusal of what it left. Under the
@@ -244,6 +253,7 @@ impl Agent {
             let mut queue = self.queue.lock().expect("the queue");
             queue.stopped = true;
             queue.capped = 0;
+            queue.from_agents = 0;
             std::mem::take(&mut queue.inputs)
         };
         drop(dropped);
@@ -256,6 +266,7 @@ impl Agent {
             let mut queue = self.queue.lock().expect("the queue");
             queue.leading = false;
             queue.capped = 0;
+            queue.from_agents = 0;
             std::mem::take(&mut queue.inputs)
         };
         for pending in refused {
@@ -373,6 +384,12 @@ pub(crate) struct Inner {
     /// Held while a creation record is checked and stored, so two records
     /// for one id are never both written.
     pub(crate) recording: smol::lock::Mutex<()>,
+    /// Turns through an agent's replicas, for what goes to one of them.
+    pub(crate) turn: std::sync::atomic::AtomicU64,
+    /// Messages sent toward other nodes.
+    pub(crate) sent_across: std::sync::atomic::AtomicU64,
+    /// Messages relayed to their agent's leader.
+    pub(crate) relayed: std::sync::atomic::AtomicU64,
     /// Clients' calls: their lanes, and the calls forwarded both ways.
     pub(crate) calls: crate::calls::Calls,
     /// The read indexes this replica asked its leaders for.
@@ -514,6 +531,13 @@ impl Inner {
             }
             queue.capped += 1;
         }
+        // Past the cap, the sender sends it again.
+        if pending.agents_sent() {
+            if queue.from_agents >= self.queue {
+                return Err(CallError::Busy);
+            }
+            queue.from_agents += 1;
+        }
         queue.inputs.push_back(pending);
         drop(queue);
         let _ = run.agent.wake.try_send(());
@@ -529,6 +553,9 @@ impl Inner {
         for pending in inputs.into_iter().rev() {
             if pending.capped() {
                 queue.capped += 1;
+            }
+            if pending.agents_sent() {
+                queue.from_agents += 1;
             }
             queue.inputs.push_front(pending);
         }
@@ -1180,6 +1207,9 @@ impl Node {
             recording: smol::lock::Mutex::new(()),
             calls: crate::calls::Calls::default(),
             reads: crate::queries::Reads::default(),
+            turn: std::sync::atomic::AtomicU64::new(0),
+            sent_across: std::sync::atomic::AtomicU64::new(0),
+            relayed: std::sync::atomic::AtomicU64::new(0),
         });
         for record in records {
             if record.creator == number {
@@ -1206,6 +1236,19 @@ impl Node {
     /// The node's identity, its public key, which its TLS presents.
     pub fn id(&self) -> NodeId {
         self.inner.node_id
+    }
+
+    /// Messages this node sent toward agents on other nodes, again on
+    /// rounds included.
+    pub fn messages_sent_across(&self) -> u64 {
+        self.inner.messages_sent_across()
+    }
+
+    /// Messages this node relayed to their agent's leader.
+    pub fn messages_relayed(&self) -> u64 {
+        self.inner
+            .relayed
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The node's number in its space.

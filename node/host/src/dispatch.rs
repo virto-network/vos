@@ -191,6 +191,17 @@ impl Inner {
                 token,
                 index,
             } => self.on_read_index_answer(from, agent, token, index),
+            PeerMessage::Deliver {
+                to,
+                message,
+                relayed,
+            } => self.on_deliver(from, to, message, relayed),
+            PeerMessage::Acknowledge {
+                sender,
+                receiver,
+                sequence,
+                relayed,
+            } => self.on_acknowledge(from, sender, receiver, sequence, relayed),
             PeerMessage::Blob { .. } | PeerMessage::Directory(_) => {
                 unreachable!("blobs and records are handled in tasks")
             }

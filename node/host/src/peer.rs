@@ -256,10 +256,14 @@ pub enum Refusal {
     NotAReplica = 10,
     /// An answer to a forwarded call that is no longer waited for.
     Unmatched = 11,
+    /// An agent's message or acknowledgement with nowhere to go here: no
+    /// leader to relay to, a second hop, or a full queue. Its sender sends
+    /// it again.
+    Unplaced = 12,
 }
 
 impl Refusal {
-    pub const ALL: [Refusal; 12] = [
+    pub const ALL: [Refusal; 13] = [
         Refusal::Undecodable,
         Refusal::Stranger,
         Refusal::NotTheLeaderNamed,
@@ -272,6 +276,7 @@ impl Refusal {
         Refusal::Unrouted,
         Refusal::NotAReplica,
         Refusal::Unmatched,
+        Refusal::Unplaced,
     ];
 }
 
@@ -296,7 +301,9 @@ pub fn class(message: &PeerMessage) -> Class {
         | PeerMessage::Forward { .. }
         | PeerMessage::Forwarded { .. }
         | PeerMessage::ReadIndex { .. }
-        | PeerMessage::ReadIndexAnswer { .. } => Class::Requests,
+        | PeerMessage::ReadIndexAnswer { .. }
+        | PeerMessage::Deliver { .. }
+        | PeerMessage::Acknowledge { .. } => Class::Requests,
         PeerMessage::Liveness { .. } | PeerMessage::LivenessAnswer { .. } => Class::Liveness,
     }
 }
@@ -314,7 +321,9 @@ pub fn stream(message: &PeerMessage) -> u64 {
         | PeerMessage::Forward { agent, .. }
         | PeerMessage::Forwarded { agent, .. }
         | PeerMessage::ReadIndex { agent, .. }
-        | PeerMessage::ReadIndexAnswer { agent, .. } => u64::from(agent.0),
+        | PeerMessage::ReadIndexAnswer { agent, .. }
+        | PeerMessage::Deliver { to: agent, .. }
+        | PeerMessage::Acknowledge { sender: agent, .. } => u64::from(agent.0),
         PeerMessage::Blob { .. }
         | PeerMessage::Liveness { .. }
         | PeerMessage::LivenessAnswer { .. } => 0,
@@ -367,7 +376,9 @@ pub fn check(
         | PeerMessage::Forward { .. }
         | PeerMessage::Forwarded { .. }
         | PeerMessage::ReadIndex { .. }
-        | PeerMessage::ReadIndexAnswer { .. } => Ok(()),
+        | PeerMessage::ReadIndexAnswer { .. }
+        | PeerMessage::Deliver { .. }
+        | PeerMessage::Acknowledge { .. } => Ok(()),
     }
 }
 

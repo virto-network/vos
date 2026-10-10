@@ -10,6 +10,7 @@ mod group;
 pub mod http;
 mod ingress;
 mod leader;
+mod messages;
 mod node;
 pub mod peer;
 mod pvm;

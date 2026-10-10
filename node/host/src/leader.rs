@@ -3,9 +3,9 @@
 //! same state, the result proposed, and once this replica has applied it,
 //! the replies, the outbox's deliveries and the acknowledgements.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use smol::future::FutureExt;
 use vos_raft::Role;
@@ -28,6 +28,91 @@ const MAX_BACKOFF: Duration = Duration::from_secs(5);
 /// How far this node's clock may trail the agent's time before the leader
 /// says so.
 const CLOCK_BOUND: u64 = 10_000;
+/// What a sender sends a target past the target's acknowledgement at
+/// once: entries, and bytes, at least one entry.
+const WINDOW: usize = 256;
+const WINDOW_BYTES: usize = 1 << 20;
+/// How long a target's acknowledgement may stay behind its outbox before
+/// its window goes again, doubled each time that brings nothing, up to
+/// [`MAX_ROUND`].
+const ROUND: Duration = Duration::from_secs(1);
+const MAX_ROUND: Duration = Duration::from_secs(16);
+
+/// What this leadership sent a target past its acknowledgement.
+struct Window {
+    /// The highest acknowledgement taken, from the queue or applied.
+    acked: u64,
+    /// The last sequence the outbox holds for the target, as last read.
+    last: u64,
+    /// The sequences sent past `acked`, with their sizes.
+    sent: VecDeque<(u64, usize)>,
+    bytes: usize,
+    /// When the acknowledgement last moved, or the window last went again.
+    since: Instant,
+    /// How long after `since` it goes again.
+    wait: Duration,
+    /// Which replica of the target it goes through, when it goes through
+    /// one: the same for a whole window, another each time it goes again.
+    turn: u64,
+}
+
+impl Window {
+    /// A window from `acked` on, through the replica `turn` picks first:
+    /// each node starts at its own, so senders spread over the replicas.
+    fn new(acked: u64, turn: u64) -> Self {
+        Self {
+            acked,
+            last: acked,
+            sent: VecDeque::new(),
+            bytes: 0,
+            since: Instant::now(),
+            wait: ROUND,
+            turn,
+        }
+    }
+
+    /// The last sequence sent, or acknowledged.
+    fn through(&self) -> u64 {
+        self.sent
+            .back()
+            .map_or(self.acked, |(sequence, _)| *sequence)
+    }
+
+    fn ack(&mut self, sequence: u64) {
+        if sequence <= self.acked {
+            return;
+        }
+        self.acked = sequence;
+        while let Some((sent, size)) = self.sent.front().copied() {
+            if sent > sequence {
+                break;
+            }
+            self.sent.pop_front();
+            self.bytes -= size;
+        }
+        self.since = Instant::now();
+        self.wait = ROUND;
+    }
+
+    fn full(&self, size: usize) -> bool {
+        self.sent.len() >= WINDOW || (!self.sent.is_empty() && self.bytes + size > WINDOW_BYTES)
+    }
+
+    /// When it goes again, while the outbox holds more than was
+    /// acknowledged.
+    fn due(&self) -> Option<Instant> {
+        (self.last > self.acked).then(|| self.since + self.wait)
+    }
+
+    /// Go back to the acknowledgement, waiting longer before the next time.
+    fn rewind(&mut self) {
+        self.sent.clear();
+        self.bytes = 0;
+        self.since = Instant::now();
+        self.wait = (self.wait * 2).min(MAX_ROUND);
+        self.turn += 1;
+    }
+}
 
 /// Lead `agent` whenever this node's replica leads its group, until the
 /// group stops.
@@ -112,8 +197,8 @@ struct Leader {
     trailing: bool,
     /// Each sender's pair mark, as applied.
     marks: HashMap<AgentId, u64>,
-    /// Each target's last message delivered by this leadership.
-    delivered: HashMap<AgentId, u64>,
+    /// What this leadership sent each target.
+    windows: HashMap<AgentId, Window>,
     max_inputs: usize,
     backoff: Duration,
     /// The inputs the last batch requeued because its result applied as no
@@ -145,7 +230,7 @@ impl Leader {
             applied,
             trailing: false,
             marks: HashMap::new(),
-            delivered: HashMap::new(),
+            windows: HashMap::new(),
             max_inputs: inner.max_inputs,
             backoff: BACKOFF,
             skipped: false,
@@ -158,9 +243,14 @@ impl Leader {
             tracing::error!(agent = self.id.0, "recovery failed: {}", fault.message());
         }
         while let Some(pending) = self.take(inner, agent, shared).await {
-            if !self.run(inner, agent, shared, pending).await {
+            // Woken for a round, or between batches: windows due go again.
+            if pending.is_empty() {
+                // Woken by a timer alone: let the node's other tasks run.
+                smol::future::yield_now().await;
+            } else if !self.run(inner, agent, shared, pending).await {
                 return false;
             }
+            self.rounds(inner);
             if !leads(&shared.state(), self.term) {
                 break;
             }
@@ -184,7 +274,18 @@ impl Leader {
         }
         for to in targets {
             let _ = inner.settled(to).await;
-            self.deliver(inner, &snapshot, to)?;
+            if let Err(fault) = self.deliver(inner, &snapshot, to) {
+                tracing::error!(
+                    agent = self.id.0,
+                    to = to.0,
+                    "delivery failed: {}",
+                    fault.message()
+                );
+                // A window all the same, whose round reads it again.
+                let mut window = Window::new(0, u64::from(inner.number));
+                window.last = 1;
+                self.windows.entry(to).or_insert(window);
+            }
         }
         Ok(())
     }
@@ -211,14 +312,24 @@ impl Leader {
             if !leads(&shared.state(), self.term) {
                 return None;
             }
-            let woken = async { agent.woken.recv().await.is_ok() };
+            let woken = async { Some(agent.woken.recv().await.is_ok()) };
             let term = self.term;
             let lost = async {
                 shared.wait(|state| !leads(state, term)).await;
-                false
+                Some(false)
             };
-            if !woken.or(lost).await {
-                return None;
+            let next = self.windows.values().filter_map(Window::due).min();
+            let round = async {
+                match next {
+                    Some(at) => smol::Timer::at(at).await,
+                    None => std::future::pending().await,
+                };
+                None
+            };
+            match woken.or(lost).or(round).await {
+                Some(true) => {}
+                Some(false) => return None,
+                None => return Some(Vec::new()),
             }
             waited = true;
         }
@@ -242,6 +353,9 @@ impl Leader {
             bytes += next.bytes();
             if next.capped() {
                 queue.capped -= 1;
+            }
+            if next.agents_sent() {
+                queue.from_agents -= 1;
             }
             taken.push(next);
         }
@@ -302,16 +416,54 @@ impl Leader {
             }
         }
         // A message at or below its pair mark applied already: drop it and
-        // acknowledge the mark instead.
+        // acknowledge the mark instead. One past the next is a gap, dropped
+        // for the sender's next delivery: only each sender's next in turn
+        // reaches the batch.
         let mut acks: HashMap<AgentId, u64> = HashMap::new();
-        let mut kept = Vec::with_capacity(pending.len());
+        let mut next: HashMap<AgentId, u64> = HashMap::new();
+        // Each target's acknowledgement as applied, and where the highest
+        // one taken for it sits in the batch: one goes in, the highest.
+        let mut applied_acks: HashMap<AgentId, u64> = HashMap::new();
+        let mut taken_acks: HashMap<AgentId, usize> = HashMap::new();
+        let mut kept: Vec<Pending> = Vec::with_capacity(pending.len());
         for item in pending.drain(..) {
-            if let Pending::Message(message) = &item {
-                let mark = self.marks[&message.from];
-                if message.sequence <= mark {
-                    raise(&mut acks, message.from, mark);
-                    continue;
+            match &item {
+                Pending::Message(message) => {
+                    let mark = self.marks[&message.from];
+                    let expected = next.entry(message.from).or_insert(mark + 1);
+                    if message.sequence <= mark {
+                        raise(&mut acks, message.from, mark);
+                        continue;
+                    }
+                    if message.sequence != *expected {
+                        continue;
+                    }
+                    *expected += 1;
                 }
+                // One no higher than the applied acknowledgement would
+                // only cost a log entry.
+                Pending::Ack { to, sequence } => {
+                    let applied = *applied_acks.entry(*to).or_insert_with(|| {
+                        read::<u64>(&snapshot, self.id, &keys::acked(*to))
+                            .ok()
+                            .flatten()
+                            .unwrap_or(0)
+                    });
+                    if *sequence <= applied {
+                        continue;
+                    }
+                    if let Some(at) = taken_acks.get(to) {
+                        if let Pending::Ack {
+                            sequence: highest, ..
+                        } = &mut kept[*at]
+                        {
+                            *highest = (*highest).max(*sequence);
+                        }
+                        continue;
+                    }
+                    taken_acks.insert(*to, kept.len());
+                }
+                _ => {}
             }
             kept.push(item);
         }
@@ -589,6 +741,7 @@ impl Leader {
         let mut acks: HashMap<AgentId, u64> = HashMap::new();
         let mut rest = Vec::new();
         let mut again = Vec::new();
+        let mut acked = BTreeSet::new();
         for (index, item) in pending.into_iter().enumerate() {
             let Some(step) = result.steps.get(index) else {
                 rest.push(item);
@@ -648,6 +801,7 @@ impl Leader {
                     ),
                 },
                 Pending::Ack { to, sequence } => {
+                    acked.insert(to);
                     // Ack again while the mark trails it: one ack clears
                     // at most `ACK_LIMIT` entries.
                     let marks =
@@ -674,7 +828,9 @@ impl Leader {
         for pending in again {
             let _ = inner.push(self.id, pending);
         }
-        let targets: BTreeSet<AgentId> = result
+        // The targets of new messages, and those whose acknowledgements
+        // opened their windows.
+        let mut targets: BTreeSet<AgentId> = result
             .steps
             .iter()
             .filter_map(|step| match step {
@@ -683,6 +839,7 @@ impl Leader {
             })
             .flatten()
             .collect();
+        targets.extend(acked);
         for to in targets {
             if let Err(fault) = self.deliver(inner, &snapshot, to) {
                 // The outbox keeps them: the next send to `to`, or a
@@ -725,19 +882,27 @@ impl Leader {
         Ok(Some(kept.map_or(Reply::TooOld, Reply::Ran)))
     }
 
-    /// Send the outbox's messages to `to` past those already delivered (or
-    /// acknowledged), in order. A target this node does not lead keeps
-    /// them in the outbox for now.
+    /// Send `to` what the outbox holds past what this leadership sent it,
+    /// in order, within its window.
     fn deliver(
         &mut self,
         inner: &Inner,
         snapshot: &FjallSnapshot,
         to: AgentId,
     ) -> Result<(), Fault> {
-        let after = match self.delivered.get(&to) {
-            Some(delivered) => *delivered,
-            None => read::<u64>(snapshot, self.id, &keys::acked(to))?.unwrap_or(0),
-        };
+        let acked = read::<u64>(snapshot, self.id, &keys::acked(to))?.unwrap_or(0);
+        let last = read::<u64>(snapshot, self.id, &keys::pair_out(to))?.unwrap_or(0);
+        let turn = u64::from(inner.number);
+        let window = self
+            .windows
+            .entry(to)
+            .or_insert_with(|| Window::new(acked, turn));
+        window.ack(acked);
+        window.last = window.last.max(last);
+        let after = window.through();
+        if after >= window.last {
+            return Ok(());
+        }
         let mut prefix = keys::outbox(to, 0);
         prefix.truncate(prefix.len() - 8);
         let cursor = keys::outbox(to, after);
@@ -757,6 +922,11 @@ impl Leader {
                 );
                 break;
             };
+            let size = outgoing.arguments.len() + 64;
+            let window = self.windows.get_mut(&to).expect("the target's window");
+            if window.full(size) {
+                break;
+            }
             let message = Message {
                 from: self.id,
                 sequence,
@@ -764,33 +934,50 @@ impl Leader {
                 method: outgoing.method,
                 arguments: outgoing.arguments,
             };
-            if let Err(error) = inner.push(to, Pending::Message(message)) {
-                tracing::debug!(
-                    agent = self.id.0,
-                    to = to.0,
-                    "a message waits in the outbox: {error:?}"
-                );
+            // Nowhere to send it now, or a full queue here: it waits in the
+            // outbox for the next round.
+            if !inner.deliver_message(to, message, window.turn) {
                 break;
             }
-            self.delivered.insert(to, sequence);
+            window.sent.push_back((sequence, size));
+            window.bytes += size;
         }
         Ok(())
     }
 
-    /// Acknowledge each sender's messages through the sequence given.
-    fn acknowledge(&self, inner: &Inner, acks: HashMap<AgentId, u64>) {
-        for (from, sequence) in acks {
-            let ack = Pending::Ack {
-                to: self.id,
-                sequence,
-            };
-            if let Err(error) = inner.push(from, ack) {
-                tracing::debug!(
+    /// Send again, from its acknowledgement, the window of each target
+    /// whose acknowledgement stayed behind its outbox for its wait.
+    fn rounds(&mut self, inner: &Inner) {
+        let now = Instant::now();
+        self.windows
+            .retain(|_, window| window.last > window.acked || !window.sent.is_empty());
+        let due: Vec<AgentId> = self
+            .windows
+            .iter()
+            .filter(|(_, window)| window.due().is_some_and(|due| due <= now))
+            .map(|(to, _)| *to)
+            .collect();
+        if due.is_empty() {
+            return;
+        }
+        let snapshot = inner.store.snapshot();
+        for to in due {
+            self.windows.get_mut(&to).expect("a window due").rewind();
+            if let Err(fault) = self.deliver(inner, &snapshot, to) {
+                tracing::error!(
                     agent = self.id.0,
-                    to = from.0,
-                    "an ack is not delivered: {error:?}"
+                    to = to.0,
+                    "delivery failed: {}",
+                    fault.message()
                 );
             }
+        }
+    }
+
+    /// Acknowledge each sender's messages through the sequence given.
+    fn acknowledge(&self, inner: &Inner, acks: HashMap<AgentId, u64>) {
+        for (sender, sequence) in acks {
+            inner.acknowledge(sender, self.id, sequence);
         }
     }
 }

@@ -179,6 +179,23 @@ fn every_other_message_survives_the_wire() {
             agent: AGENT,
             token: 78,
         },
+        PeerMessage::Deliver {
+            to: AGENT,
+            message: vos_wire::batch::Message {
+                from: AgentId(9),
+                sequence: 3,
+                instance: InstanceId(1),
+                method: MethodId(2),
+                arguments: vec![4],
+            },
+            relayed: true,
+        },
+        PeerMessage::Acknowledge {
+            sender: AGENT,
+            receiver: AgentId(9),
+            sequence: 3,
+            relayed: false,
+        },
         PeerMessage::ReadIndexAnswer {
             agent: AGENT,
             token: 78,
@@ -228,6 +245,16 @@ fn a_forwarded_call_comes_from_a_replica_on_its_agent_s_requests_stream() {
     };
     assert_eq!(peer::class(&read_index), Class::Requests);
     assert_eq!(peer::stream(&read_index), u64::from(AGENT.0));
+    // An acknowledgement travels on its sender's stream: the agent it is
+    // for.
+    let acknowledge = PeerMessage::Acknowledge {
+        sender: AGENT,
+        receiver: AgentId(9),
+        sequence: 1,
+        relayed: false,
+    };
+    assert_eq!(peer::class(&acknowledge), Class::Requests);
+    assert_eq!(peer::stream(&acknowledge), u64::from(AGENT.0));
     assert_eq!(
         peer::check(
             &SPACE,

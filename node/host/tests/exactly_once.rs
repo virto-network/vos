@@ -32,6 +32,8 @@ use vos_wire::schema::Schema;
 use vos_wire::{Decode, Encode, keys};
 
 const COUNTER: InstanceId = InstanceId(1);
+/// The counter instance an agent's messages increment.
+const INBOX: InstanceId = InstanceId(2);
 const NODES: NodeNumber = 3;
 /// How long one attempt waits for its answer before trying another node.
 const ATTEMPT: Duration = Duration::from_secs(2);
@@ -157,6 +159,8 @@ impl Hooks for Trip {
 struct Slot {
     node: Mutex<Option<Arc<Node>>>,
     starts: AtomicU64,
+    /// Messages its earlier runs sent across nodes.
+    sent_across: AtomicU64,
     trip: Arc<Trip>,
     offset: Arc<AtomicI64>,
     dir: tempfile::TempDir,
@@ -203,6 +207,7 @@ impl Cluster {
             slots.push(Slot {
                 node: Mutex::new(None),
                 starts: AtomicU64::new(0),
+                sent_across: AtomicU64::new(0),
                 trip: Arc::new(Trip::default()),
                 offset: Arc::new(AtomicI64::new(0)),
                 dir,
@@ -286,6 +291,9 @@ impl Cluster {
                 }
             }
         };
+        self.slot(number)
+            .sent_across
+            .fetch_add(node.messages_sent_across(), Ordering::SeqCst);
         node.shutdown();
     }
 
@@ -366,6 +374,9 @@ struct Client {
     /// The node it calls, until it fails.
     calling: Mutex<NodeNumber>,
     value: MethodId,
+    forward: MethodId,
+    /// The next client's agent, which its forwards go to.
+    next: std::sync::OnceLock<AgentId>,
     /// The highest request it has started to send.
     sent: AtomicU64,
     /// The requests answered: through a prefix, and those above it.
@@ -398,8 +409,27 @@ impl Client {
         request * 1000 + u64::from(self.number)
     }
 
+    /// Whether request `request` forwards its amount to the next agent's
+    /// inbox, rather than incrementing this agent's counter.
+    fn forwards(request: u64) -> bool {
+        request.is_multiple_of(5)
+    }
+
+    /// The counter after requests 1 through `request`.
     fn total(&self, request: u64) -> u64 {
-        (1..=request).map(|request| self.amount(request)).sum()
+        (1..=request)
+            .filter(|request| !Self::forwards(*request))
+            .map(|request| self.amount(request))
+            .sum()
+    }
+
+    /// The next agent's inbox after this client's requests 1 through
+    /// `request` applied there.
+    fn forwarded(&self, request: u64) -> u64 {
+        (1..=request)
+            .filter(|request| Self::forwards(*request))
+            .map(|request| self.amount(request))
+            .sum()
     }
 
     /// The session request number `request` goes in, and its sequence
@@ -422,20 +452,28 @@ impl Client {
     }
 
     fn body(&self, session: &Session, sequence: u64, request: u64) -> Vec<u8> {
-        let arguments = self.amount(request).encode();
+        let (method, arguments) = if Self::forwards(request) {
+            let next = self.next.get().expect("the next agent");
+            (
+                self.forward,
+                (next.0, INBOX.0, self.amount(request)).encode(),
+            )
+        } else {
+            (self.increment, self.amount(request).encode())
+        };
         let message = call_message(
             &self.identity,
             session,
             sequence,
             COUNTER,
-            self.increment,
+            method,
             &arguments,
         );
         Call {
             session: *session,
             sequence,
             instance: COUNTER,
-            method: self.increment,
+            method,
             arguments,
             signature: self.key.sign(&message).to_bytes(),
         }
@@ -471,9 +509,14 @@ impl Client {
                     at: answered_at,
                 }) => {
                     let total = u64::decode(&reply).unwrap().0;
+                    // A forward answers its amount, an increment the total.
+                    let expected = if Self::forwards(request) {
+                        self.amount(request)
+                    } else {
+                        self.total(request)
+                    };
                     assert_eq!(
-                        total,
-                        self.total(request),
+                        total, expected,
                         "client {}: request {request} answered by node {at}",
                         self.number
                     );
@@ -579,9 +622,10 @@ impl Client {
 
     /// Read the counter until `done`, at every replica in turn, by read
     /// index and at the floor its answers give, and check each read.
-    fn read(&self, cluster: &Cluster, done: &AtomicBool) {
+    fn read(&self, cluster: &Cluster, done: &AtomicBool, previous: &Client) {
         let mut floor = 0;
         let mut last = 0;
+        let mut inbox = 0;
         // The most any read showed.
         let mut seen = 0;
         let mut turn = u64::from(self.number);
@@ -601,7 +645,44 @@ impl Client {
                 floor = floor.max(prefix_at);
                 Consistency::Applied { at: floor }
             };
-            let answer = post(cluster.slot(at).ingress, &path, &self.query(consistency));
+            // Now and then the inbox: what the previous client forwarded,
+            // in its order.
+            if turn.is_multiple_of(3) {
+                let answer = post(
+                    cluster.slot(at).ingress,
+                    &path,
+                    &self.query(INBOX, Consistency::Applied { at: floor }),
+                );
+                let sent = previous.sent.load(Ordering::SeqCst);
+                if let Ok(Answer::Ran {
+                    outcome: Outcome::Done(bytes),
+                    at: answered_at,
+                }) = answer
+                {
+                    // Reads never go back only at the client's floor, which
+                    // this one raises.
+                    floor = floor.max(answered_at);
+                    let value = u64::decode(&bytes).unwrap().0;
+                    assert!(
+                        (0..=sent).any(|request| previous.forwarded(request) == value),
+                        "client {}: its inbox at node {at} holds {value}, no prefix of what was forwarded",
+                        self.number
+                    );
+                    assert!(
+                        value >= inbox,
+                        "client {}: its inbox at node {at} went back, from {inbox} to {value}",
+                        self.number
+                    );
+                    inbox = value;
+                    cluster.saw("read of an inbox");
+                }
+                continue;
+            }
+            let answer = post(
+                cluster.slot(at).ingress,
+                &path,
+                &self.query(COUNTER, consistency),
+            );
             let sent = self.sent.load(Ordering::SeqCst);
             let (value, answered_at) = match answer {
                 Ok(Answer::Ran {
@@ -623,15 +704,15 @@ impl Client {
             };
             let earlier = seen;
             seen = seen.max(value);
-            // The applied requests are a prefix of those sent, each total
-            // distinct: the value names how many applied.
-            let applied = (0..=sent).find(|k| self.total(*k) == value);
-            let Some(applied) = applied else {
-                panic!(
-                    "client {}: read {value} at node {at}, no total of up to {sent} requests",
-                    self.number
-                );
-            };
+            // The applied requests are a prefix of those sent: the value is
+            // the total of one. A forward leaves the total as it was, so
+            // reads compare totals.
+            assert!(
+                (0..=sent).any(|request| self.total(request) == value),
+                "client {}: read {value} at node {at}, no total of up to {sent} requests",
+                self.number
+            );
+            let answered = self.total(prefix);
             if linearizable {
                 // Every read before it showed committed state, which a read
                 // index taken later covers.
@@ -641,8 +722,8 @@ impl Client {
                     self.number
                 );
                 assert!(
-                    applied >= prefix,
-                    "client {}: a linearizable read at node {at} saw {applied} requests, {prefix} were answered before it",
+                    value >= answered,
+                    "client {}: a linearizable read at node {at} saw {value}, {prefix} requests answered before it made {answered}",
                     self.number
                 );
                 cluster.saw("read linearizable");
@@ -653,8 +734,8 @@ impl Client {
                     self.number
                 );
                 assert!(
-                    applied >= prefix,
-                    "client {}: a read at node {at} floored at {floor} saw {applied} requests, {prefix} were answered at {prefix_at}",
+                    value >= answered,
+                    "client {}: a read at node {at} floored at {floor} saw {value}, {prefix} requests answered at {prefix_at} made {answered}",
                     self.number
                 );
                 last = value;
@@ -664,8 +745,8 @@ impl Client {
         }
     }
 
-    /// A signed query of the counter's value.
-    fn query(&self, consistency: Consistency) -> Vec<u8> {
+    /// A signed query of a counter's value.
+    fn query(&self, instance: InstanceId, consistency: Consistency) -> Vec<u8> {
         let not_after = vos_node::wall_clock() + 60_000;
         let key = self.key.verifying_key().to_bytes();
         let message = query_message(
@@ -673,7 +754,7 @@ impl Client {
             &key,
             not_after,
             consistency,
-            COUNTER,
+            instance,
             self.value,
             &[],
         );
@@ -681,7 +762,7 @@ impl Client {
             key,
             not_after,
             consistency,
-            instance: COUNTER,
+            instance,
             method: self.value,
             arguments: Vec::new(),
             signature: self.key.sign(&message).to_bytes(),
@@ -817,11 +898,15 @@ fn exactly_once(mode: Mode, default_seed: u64) {
                 cluster.leader(agent).is_some()
             });
             let leader = cluster.node(cluster.leader(agent).unwrap()).unwrap();
-            let installed = smol::block_on(leader.install(agent, COUNTER, &counter, &[], vec![]));
-            assert!(
-                matches!(installed, Ok(vos_node::Reply::Ran(Outcome::Done(_)))),
-                "{installed:?}"
-            );
+            // The inbox first: no message reaches an instance not there yet.
+            for instance in [INBOX, COUNTER] {
+                let installed =
+                    smol::block_on(leader.install(agent, instance, &counter, &[], vec![]));
+                assert!(
+                    matches!(installed, Ok(vos_node::Reply::Ran(Outcome::Done(_)))),
+                    "{installed:?}"
+                );
+            }
             let target =
                 Target::loopback(&format!("http://{}", cluster.slot(number).ingress)).unwrap();
             let record = vos_node::client::agent_info(&target, agent)
@@ -838,11 +923,17 @@ fn exactly_once(mode: Mode, default_seed: u64) {
                 sessions: Mutex::new(Vec::new()),
                 calling: Mutex::new(number),
                 value,
+                forward: method(&counter, "forward"),
+                next: std::sync::OnceLock::new(),
                 sent: AtomicU64::new(0),
                 acked: Mutex::new(Acked::default()),
             }
         })
         .collect();
+    for (at, client) in clients.iter().enumerate() {
+        let next = &clients[(at + 1) % clients.len()];
+        client.next.set(next.agent).unwrap();
+    }
     let agents: Vec<AgentId> = clients.iter().map(|client| client.agent).collect();
     let done = AtomicBool::new(false);
     let sent: Vec<u64> = std::thread::scope(|scope| {
@@ -850,9 +941,10 @@ fn exactly_once(mode: Mode, default_seed: u64) {
             .iter()
             .map(|client| scope.spawn(|| client.run(&cluster, mode, &done)))
             .collect();
-        for client in &clients {
+        for (at, client) in clients.iter().enumerate() {
+            let previous = &clients[(at + clients.len() - 1) % clients.len()];
             let (cluster, done) = (&cluster, &done);
-            scope.spawn(move || client.read(cluster, done));
+            scope.spawn(move || client.read(cluster, done, previous));
         }
         faults(&cluster, &agents, &mut random);
         done.store(true, Ordering::SeqCst);
@@ -874,22 +966,64 @@ fn exactly_once(mode: Mode, default_seed: u64) {
             cluster.start(number);
         }
     }
-    for (client, sent) in clients.iter().zip(sent) {
+    let counted = |node: &Node, agent: AgentId, instance: InstanceId| {
+        smol::block_on(node.query(
+            agent,
+            Principal::Client([0; 32]),
+            instance,
+            value,
+            Vec::new(),
+        ))
+    };
+    let mark = |node: &Node, agent: AgentId, key: &[u8]| {
+        node.store()
+            .snapshot()
+            .get(agent, key)
+            .unwrap()
+            .map(|bytes| u64::decode(unstored(&bytes).unwrap()).unwrap().0)
+            .unwrap_or(0)
+    };
+    for (at, client) in clients.iter().enumerate() {
+        let sent = sent[at];
         let total = client.total(sent);
+        let (next, next_agent) = (
+            &clients[(at + 1) % clients.len()],
+            client.next.get().unwrap(),
+        );
+        let forwards = sent / 5;
+        let inbox = client.forwarded(sent);
         for number in 1..=NODES {
             let node = cluster.node(number).unwrap();
-            wait_until("every replica converges", Duration::from_secs(20), || {
-                let outcome = smol::block_on(node.query(
-                    client.agent,
-                    Principal::Client([0; 32]),
-                    COUNTER,
-                    value,
-                    Vec::new(),
-                ));
-                outcome == Ok(Outcome::Done(total.encode()))
+            wait_until("every replica converges", Duration::from_secs(60), || {
+                counted(&node, client.agent, COUNTER) == Ok(Outcome::Done(total.encode()))
+                    && counted(&node, *next_agent, INBOX) == Ok(Outcome::Done(inbox.encode()))
+                    && mark(&node, client.agent, &keys::acked(*next_agent)) == forwards
+                    && node
+                        .store()
+                        .snapshot()
+                        .scan(client.agent, &keys::outbox_prefix(), None)
+                        .count()
+                        == 0
             });
+            // Each forward applied once at the receiver, and was sent once.
+            assert_eq!(
+                mark(&node, next.agent, &keys::pair_in(client.agent)),
+                forwards
+            );
+            assert_eq!(
+                mark(&node, client.agent, &keys::pair_out(*next_agent)),
+                forwards
+            );
         }
     }
+    let across: u64 = (1..=NODES)
+        .map(|number| {
+            cluster.slot(number).sent_across.load(Ordering::SeqCst)
+                + cluster.node(number).unwrap().messages_sent_across()
+        })
+        .sum();
+    println!("messages sent across nodes: {across}");
+    assert!(across > 0, "no message crossed nodes");
 }
 
 #[test]
