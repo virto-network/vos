@@ -3370,3 +3370,232 @@ Left:
 - **Step 5:** `#[msg(linearizable)]`.
 - **Unscheduled:** seq 0 taking a read index.
 
+
+
+## Step 3.6: sessions
+
+### Design
+
+3.5b put sessions in the agent: named by the client, created by
+accumulate within the skew of batch time, and never collected. This
+step collects them, caps them, keeps a client from running a call
+twice once its session is gone, and makes the checker meet expiry,
+replay and a clock beyond the skew.
+
+**The expiry index** (new system keys):
+- **`expiry(bucket, id)`:** one row per live session, its value empty
+  (stored, as every value is). A bucket is a time divided by
+  `SESSION_BUCKET_MS` (5 minutes), big-endian, so a scan meets the
+  oldest first.
+- **Written once, at creation,** at the creation time's bucket. A
+  request does not move it: the hot path writes nothing more than
+  today, and a `Known` step still reads nothing in accumulate.
+- **Invariant:** a session's row lies at or before its mark's bucket.
+  The sweep moves a row that lags when it reaches it (below), so a
+  session active for hours moves once per expiry period, not once per
+  request.
+- **`key_sessions(key)`:** how many sessions a key holds at this agent,
+  for its cap, deleted at zero so a key with no session leaves nothing.
+  `live_sessions` (3.5b) counts them all.
+- Stores written before this step hold sessions with neither; they are
+  development stores, and are discarded.
+
+**Collecting** (the plan's rule): a session goes once it has expired
+after inactivity, and batch time is past its t0 plus the skew.
+- **A bucket is due** when every session whose mark lies in it has
+  expired: batch time at least the bucket's end plus
+  `SESSION_EXPIRY_MS`. Rows there whose sessions were active since are
+  moved instead.
+- **The t0 rule follows from expiry:** a session was created within the
+  skew of its t0 and time never goes back, so its mark is at least t0
+  minus the skew. Once it has expired, batch time is past t0 plus the
+  skew whenever the expiry is at least twice the skew, which a constant
+  assertion holds. Accumulate checks both anyway: it reads t0 to delete
+  the index.
+- **After collection,** a resend of any of its requests names an absent
+  session with a stale t0: ingress rejects it `StaleSession`, refine
+  refuses it `STALE_SESSION`, and accumulate would skip it. It never
+  runs, and neither does a captured request. Before collection, an
+  expired session's next request is refused `EXPIRED`, and one at or
+  below its mark is answered from the window, as today.
+
+**The sweep:**
+- **`Input::Sweep`:** no payload. The leader puts one **first** in a
+  batch whose time makes its first expiry row due, so a batch cut short
+  by gas or size never drops it. It reads that row with the version and
+  `batch_time`, from the snapshot the batch refines on.
+- **An idle leader** reads it when its queue empties and runs the sweep
+  alone once the row is due by its effective time (max(clock,
+  `batch_time`)). It checks again at least every 5 s while a row
+  exists, as a clock stepped forward does not move a monotonic timer.
+  A leader opens only after it has applied what it took over, so it
+  reads state its predecessors left.
+- **Refine** scans the expiry rows in order and lists those due, up to
+  `SWEEP_LIMIT` (32), as `Step::Swept { due: Vec<(bucket, SessionId)> }`.
+  It reads no marks: accumulate decides. It never traps on the sweep: a
+  row whose key is not an expiry key, or whose value was not stored, is
+  passed over, and an unreadable page lists nothing.
+- **Accumulate, per listed row, leaves it out of the due range:**
+  - no mark: the row alone, deleted;
+  - expired, and past t0 plus the skew: **collected**. The index row,
+    the whole (`session_of`), the mark, the replies it holds
+    (`max(1, mark − W + 1)..=mark`, every one present, so no absent key
+    is deleted), and the expiry row go; the live and key counts drop. A
+    mark without its whole loses what can go without the triple (mark,
+    replies, row, live count);
+  - otherwise the row moves to the bucket of the later of its mark's
+    time and t0 plus the skew, which is not due; nothing is written when
+    it is there already (refine listed it early).
+- **Progress:** an honest sweep deletes or moves every row it lists.
+  When the leader's first due row is the same after a sweep, it adds no
+  sweep for a minute and logs it once.
+- **Order within a batch:** collection and moves change later batches
+  only. A request in the sweep's batch for a collected session is
+  refused `EXPIRED` (same time), a new session cannot take a collected
+  one's triple (its t0 is stale), and a moved row stays at or before
+  its mark when a later step moves the mark.
+- **Cost:** one row scan per batch at the leader, one at idle; a sweep
+  of 32 sessions with full windows is about 2,200 deletes in one apply.
+  Measured in the bench; `SWEEP_LIMIT` and the bucket are constants,
+  revisited in 3.10. A backlog (a mass expiry) puts a sweep on every
+  batch until it drains; 3.10 limits their rate if latency shows it.
+- Logs and counters carry counts only: no key, session name or id.
+
+**The caps refuse, never evict** (`defaults`):
+- `MAX_SESSIONS` (65,536) per agent, `MAX_KEY_SESSIONS` (64) per key at
+  an agent: room for a client that loses its session file on every
+  restart, or a server with many workers under one identity.
+- **Refine** refuses a new session's first request at a cap,
+  `SESSIONS_FULL` or `KEY_SESSIONS_FULL` (new refusals), after the skew
+  and sequence checks. It counts the sessions this batch creates, in all
+  and per key, reading each count once a batch.
+- **Accumulate** counts the result's distinct new triples (a new
+  session's several requests each name it `New`), in all and per key,
+  against the counts before it applies anything, and skips the whole
+  result past a cap, as for a stale session: refine refuses, so it was
+  not refined on this state.
+- **The node:** a refused request consumed nothing, so its lane resets
+  and the client may send it again. Ingress answers 503 for the agent's
+  cap and 429 for the key's.
+- **The client** returns the refusal: a new session would be refused
+  too. After an inconclusive attempt it answers `TimedOut`, as for
+  `Busy`: the earlier attempt may still create the session.
+- **What the caps do not stop:** fresh keys are free, so anyone can fill
+  the agent's cap and refuse new sessions for an expiry period. That is
+  liveness, not safety, and admission bounds the rate. Rate limits
+  without identity are later (the plan's privacy section).
+
+**A call whose fate is unknown, once its session may be gone.** Before
+collection, a resend of a call that ran is answered from the window.
+Collection removes the window, so a client must not take a refusal of
+the session then as proof that the call never ran:
+- **`EXPIRED`** stays safe to start a new session on: a call that ran is
+  at or below the mark, and answered from the window first. Refine
+  checks a duplicate (at or below the mark) before expiry and refuses
+  it `SEQUENCE`, so the leader answers it from the window even when it
+  reaches refine.
+- **`StaleSession { now }` for a call whose fate is unknown** (an
+  earlier attempt failed, or the caller says it repeats one):
+  - in a session it has had an answer in, the session was created and
+    is gone: **`ClientError::Lost`**, final. The call may have run, and
+    nothing can say;
+  - in a session never answered:
+    - `now` at most t0 plus twice the skew: `TimedOut`, as today. Copies
+      may still be on their way, and a leader may still create it, or
+      will once time reaches a t0 that is ahead;
+    - `now` past that but within the expiry less the skew of t0: it was
+      never created (collection needs batch time past t0 minus the skew
+      plus the expiry), and no leader can create it now, as every clock
+      is within half the skew of true time (the plan's NTP assumption).
+      A new session, and the call goes again;
+    - later: `Lost`.
+  - `Refused(STALE_SESSION)` carries no time: `TimedOut`, and the next
+    attempt meets the lane's `StaleSession`.
+- **The CLI** keeps a pending call unknown however old it is: sent
+  again, it is always a repeat of an unknown one. On `Lost` it clears
+  the pending call and says it may have run. The library documents
+  `repeats_unknown` for callers that retry across processes.
+- **Queries' clocks:** `StaleQuery` carries the node's time, and the
+  client signs a query again once, with its `not_after` moved by the
+  difference, as it does for a session's t0.
+
+**The checker:**
+- **One clock offset for the whole cluster,** added to every node's
+  clock, every session's t0 and every query's `not_after`, so a jump is
+  one store. Each node's own ±15 s jump stays on top.
+- **Two clients on one agent:** each agent gains a second client, with
+  its own key and sessions, incrementing a third instance. Batches then
+  mix `Known` and `New` sessions of two keys. It only increments, so
+  the forward ring stays one sender per pair.
+- **A clock beyond the skew, under load:** the offset moves 120 s ahead
+  once, for good: past the skew plus both directions of a node's jump,
+  with 30 s to spare, which the checker asserts from the offsets.
+  - **`StaleSession` is definitive** for a session timed with an earlier
+    offset, on an attempt sent after the jump: every leader's time is
+    then past its t0 plus the skew, so no copy can create it. The
+    session is timed again (a new name, t0 from the offset) from its
+    first request, and the window's later requests follow it.
+  - An attempt sent before the jump is sent again unchanged.
+  - Any other `StaleSession`, `STALE_SESSION` or `EXPIRED` fails the run.
+- **Expiry and replay, once a run:**
+  - clients pause at a request boundary until every request is
+    answered;
+  - each captures a request that ran and one signed but never sent;
+  - the offset moves past the expiry plus a bucket; a leader is stopped
+    while the sweeps run, and started again;
+  - once every replica holds no session row (index, whole, mark, reply,
+    expiry, counts), each captured request is posted to every node:
+    `StaleSession` or `TimedOut`, never `Ran`; then every counter at
+    every replica is still its total;
+  - clients resume, each in a new session.
+- The end checks stand: every total, and each forward once.
+
+**Tests:**
+- **Agent:**
+  - creation writes the expiry row and the key count;
+  - a sweep before due collects nothing; at due, an idle session goes
+    whole and one active since moves;
+  - `EXPIRED` before collection, `STALE_SESSION` after, and a new
+    session's id is never reused;
+  - each cap at its edge, counted within a batch; a collection frees
+    room;
+  - accumulate skipping a hand-built result past a cap, and moving or
+    deleting hand-listed rows (not due, no mark, no whole);
+  - refine passing over a malformed row;
+  - more due rows than `SWEEP_LIMIT` take two sweeps;
+  - **a property test** of the session life cycle against a model: keys
+    from a small pool, t0 near or far, sequences with gaps and
+    duplicates, time moving a little or past expiry, and sweeps. After
+    every batch every session row and count equals the model's.
+- **Node:**
+  - a busy leader's batch carries the sweep once due, and an idle one
+    sweeps alone after its clock steps forward; every replica's session
+    rows are equal;
+  - **a lost answer, over HTTP with test clocks:** a call runs and its
+    answer is lost. Past expiry but before its bucket is due, the resend
+    is answered from the window. Past collection, the client's retry
+    ends `Lost`, and the call ran once. A first call in a session never
+    created, retried after twice the skew, runs in a new session once.
+- **Mutations,** each to be caught: creation without the skew check (in
+  the agent: the resend after collection runs); collection without
+  moving rows (an active session collected); a count not decremented;
+  no idle sweep; the CLI's old in-transit window (the lost answer runs
+  twice).
+
+**Not in 3.6:**
+- caps or expiry set per agent: constants until an operator needs them;
+- a TLS run of the checker with pinned clients (3.9's fault suite);
+- rate limits without identity (later).
+
+**Review** (Opus): no-go until a client could no longer run a call twice
+once its session was collected: the CLI then renewed after its
+in-transit window, and the call ran again. Folded in above: the client's
+rules for a call whose fate is unknown, and `Lost`. Also folded: the
+sweep first in its batch; every listed row leaving the due range, with
+a pause when a sweep makes no progress and no trap on a bad row; the
+idle check every 5 s; one cluster offset and a 120 s jump with its
+margin asserted; `StaleQuery` with the node's time; distinct triples;
+discarded old stores; counts only in logs; the stored empty row; and
+the checker's totals after the replays. Re-review: go, with the renewal
+bound one-sided (a t0 ahead of the agent's time waits) and refine's
+duplicate check before expiry, both folded above.
