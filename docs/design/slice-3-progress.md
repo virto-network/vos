@@ -2226,3 +2226,163 @@ Also done:
   for one id are never both written;
 - the dry run is keyed by the applied index of the snapshot the batch
   is refined on.
+
+#### 3.5b Sessions in the agent
+
+The plan's "Sessions" section, made concrete, without 3.6's expiry,
+collection and caps.
+
+**What a session is:**
+- **Named by the client:** `Session { key, name, t0 }`, its ed25519
+  key, a random 128-bit name, and its creation time in milliseconds
+  since the Unix epoch. The triple is the session's identity: the same
+  key and name with another t0 is another session.
+- **No open:** every request carries its triple, and its key signs it.
+  `POST /sessions`, `Open` and `Opened` go, and so do the node-level
+  session registry (`Change::Session`/`ForgetSession`, the
+  `Session`/`NextSession`/`KeyOpened` rows, retired) and the per-key
+  cap that evicted.
+- **What a client signs:** `domain ∥ agent identity ∥ fields`, where the
+  identity is the hash of the agent's creation record, not a node's id.
+  Any replica, and any later leader, checks the same signature.
+  - `call_message(identity, session, sequence, instance, method,
+    arguments)`;
+  - `query_message(identity, key, not_after, instance, method,
+    arguments)`: queries carry a key, not a session. A captured query
+    can be replayed until its `not_after` (5 min at most), at any
+    replica: it is a read, as its caller.
+  - `GET /agents/{id}` answers the agent's creation record, from which a
+    client computes the identity, and from 3.5c learns the replicas.
+
+**In the agent's state** (new keys under `SYSTEM`):
+- **`session_index(session)`:** keyed by the raw triple (key ∥ name ∥ t0,
+  big-endian), the session's compact `SessionId`. Accumulate assigns it
+  when it creates the session, from a counter that is never reused
+  (`next_session`), so marks and reply keys stay short. A key's
+  sessions sit together, so 3.6's per-key cap is a prefix scan.
+- **`session(id)`:** `SessionMark { session, sequence, time }`, now with
+  its triple, so 3.6's collection can remove the index.
+- **`reply(id, sequence)`:** the reply window, as in slice 2.
+- **`live_sessions`:** a count of sessions, for 3.6's per-agent cap.
+- **`batch_time`:** the high-water mark of work-result time.
+- **A step's reference to its session** is `Known(id)` or `New(triple)`,
+  so only a new session puts its 56 bytes in the log.
+
+**Refine** (the default agent, per request):
+- **A session the state holds:** the expiry and sequence checks of
+  slice 2, as before.
+- **A new session:**
+  - its first request has sequence 1;
+  - its t0 is within the skew (`SESSION_SKEW_MS`, 60 s) of the batch's
+    time, else it is refused `STALE_SESSION` and never runs;
+  - several requests of one new session in one batch run in order.
+- **Refine does not check batch time against the mark.** The leader's
+  floor is the mark, and accumulate refuses below it. A dry run that
+  applies as no writes is the leader's invariant failure, not a poisoned
+  input to bisect.
+
+**Accumulate** is the authority, per result and per request:
+- **A result whose time is below `batch_time`** applies as no writes;
+  otherwise `batch_time` moves to the result's time.
+- **A ran request of a session the state does not hold** creates it if
+  its t0 is within the skew of the result's time: the next id, the
+  index, the live count, then the mark and the reply. Outside the skew,
+  **the whole step is skipped**: no writes, messages, mark or reply. A
+  resend of sequence 1 then runs once, or never.
+
+**The leader:**
+- **Its time floor** is `batch_time`, read with the version from the
+  snapshot a batch refines on. Its batch time is max(clock, floor).
+- **A leader whose clock trails the floor** by more than `CLOCK_BOUND`
+  (10 s) logs it loudly and keeps leading, its time held at the floor.
+  - With `StaleSession` reporting the effective time (below), a held
+    time only delays expiry.
+  - A transfer here would flap: every replica trails after a fast clock
+    led. One to a peer known not to trail waits for 3.8's liveness,
+    which can carry clocks.
+- **It is the authority for duplicates.** A request refined `SEQUENCE`
+  at or below its session's applied mark is answered with the reply in
+  the window, or `TooOld`, the same rule as for messages.
+  - This is the main failover path. A new leader takes calls before its
+    predecessor's last entries apply, so the ingress, reading a stale
+    mark, queues a resend whose original committed. Refine, after the
+    catch-up, refuses it as a duplicate.
+  - So `SEQUENCE` reaches a client only for a gap.
+
+**The ingress, on the leader only** (a follower answers `NotLeader`
+before any of this):
+- **The signature,** checked against the request's own key.
+- **The lane logic of slice 2,** keyed by (agent, triple), reading the
+  agent's applied state through `session_index`:
+  - at or below the mark, the reply from the window, or `TooOld`;
+  - in flight, a wait for its answer;
+  - the next, queued;
+  - otherwise `Gap` or `Ahead`.
+- **A request of a session the state does not hold** whose t0 is outside
+  the skew of the leader's effective batch time, max(clock,
+  `batch_time`), is rejected `StaleSession { now }`, with that time. A
+  client picks a t0 that refine accepts. Refine's refusal stays the
+  authority.
+
+**Redirects:** `NotLeader` and `Elsewhere` carry each node's key as well
+as its ingress address, from the space. A client that pinned one node
+follows a redirect it vouched for: it already trusts that node's
+unsigned replies, so this adds no trust.
+
+**The client:**
+- **One session per agent:** a fresh name and t0 = the time it last
+  learned from the node (its clock at first), and a new session only on
+  a definitive refusal (`EXPIRED`, `STALE_SESSION`, `StaleSession`).
+  Never on an ambiguous failure: it resends the same sequence instead.
+- **Kept with the key file:** `session <agent> <name> <t0> <next>` per
+  agent, and the agent's identity once fetched.
+- **`NotLeader`:** it follows the redirect, pinning the key the
+  redirecting node gave, with the same session and sequence, at most a
+  few times.
+
+**The exactly-once checker, first form** (`tests/exactly_once.rs`):
+- **The cluster:** three nodes in one process on a hub, each serving its
+  ingress on a port chosen before the space is written, so redirects
+  name reachable addresses.
+- **Clients:**
+  - over HTTP, sending increments of distinct amounts, each to the node
+    they believe leads;
+  - on `NotLeader` they follow the hint; on `Stopped`, an error or a
+    timeout they try the next node, the same sequence each time, until
+    it is answered;
+  - one mode sends one request at a time per session; another pipelines
+    several, so lanes, in-flight joins and gaps meet failover.
+- **Faults,** seeded and at random:
+  - the leader stopped and started again;
+  - a stop between the leader's own apply and its answer (a hook stops
+    its loop there, and the node is then stopped): the window path;
+  - a node partitioned and healed;
+  - the hub's loss and delay;
+  - a jump in one node's clock.
+- **Checks:**
+  - every answer equals the running total of its session's amounts, so
+    no request applied twice or was skipped;
+  - an unexpected answer fails the run: `Refused(SEQUENCE)`, `Gap`,
+    `Ahead` or `TooOld` where a client resent in order;
+  - after an answer, the answering replica's applied state holds it: no
+    reply before its apply;
+  - at the end, every replica's counter is the sum of all amounts.
+- Read-index queries join in 3.5c.
+
+**Not in 3.5b:**
+- expiry by collection, the expiry index, the sweep input, and the caps
+  (3.6). Sessions are never collected until then, so state grows with
+  every session a client makes;
+- forwarding, pinning the replica set, and verifying signatures on
+  executors (3.5c).
+
+**Review** (Opus): no-go until the leader was the authority for
+duplicates, which it now is (above). Also folded in:
+- a step whose session accumulate does not create applies nothing;
+- `StaleSession` reports the effective batch time, not the raw clock;
+- no transfer for a trailing clock;
+- redirects carry keys;
+- the checker's stronger checks and faults, and a pipelined mode;
+- a batch below the mark is an invariant failure, not bisected;
+- `Known`/`New` session references;
+- the live-session count for 3.6.
