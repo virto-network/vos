@@ -687,3 +687,174 @@ two nits are in (the idle limit, and the embedder's view of the span).
   unconditionally. It changes the tracking contract: captures would
   report a superset of the pages written. Its design lists every
   consumer of the captures first, the prover's among them.
+
+## Step 2.9: acceptance
+
+**Harnesses:**
+
+- `node/host/benches/acceptance.rs` drives one node with fjall storage
+  through its own API, with the default agent and the counter installed.
+  `GREY_PVM=interpreter` runs the interpreter. It measures:
+  - **Under load:** 25,600 increments from 256 sessions at once, one in
+    flight per session. Node hooks split each batch into execution (from
+    refine's start to the commit's start: refine, accumulate and the hops
+    between threads) and its synced commit.
+  - **One request alone.**
+  - **Queries:** the counter's `value`.
+- The step 2.8 harnesses: the batch bench (`agent/testkit`), and
+  `machines` and `exits` (`pvm/bench`).
+- `store-bench` at 10M rows, re-run on the node's tuning: the store has
+  gained rows since step 2.2.
+
+All runs are on the reference laptop (Core Ultra 7 155H, NVMe), with 21
+executor threads.
+
+**Against section 14:**
+
+| Budget | Threshold | JIT | Interpreter | Verdict |
+|---|---|---|---|---|
+| Actor invocation, refine and accumulate | ≤ 50 µs | 21–24 µs per request | 85 µs per request | JIT passes; the interpreter misses |
+| Fixed cost per refine | ≤ 50 µs | 13 µs | 10 µs | pass |
+| Pooled acquire, use and reset | ≤ 5 µs, JIT included | 1.6 µs | 1.1 µs | pass (slice 1's miss closed) |
+| Table point read or write at 10M rows | ≤ 5 µs | read 3.2 µs, 5.2 µs behind fresh updates; write 2.5–3.3 µs | (host cost) | pass compacted; at the edge behind fresh writes, as in step 2.2 |
+| Query | ≤ 100 µs | median 49 µs, p99 115–175 µs | median 87 µs, p99 240–260 µs | median passes on both |
+| Per-step caps, admission ("busy"), reply window and expiry | each enforced, in tests | — | — | pass (below) |
+
+**The node under load:**
+
+- On the JIT, 25,600 increments take 0.70–0.79 s: 27.5–30.9 µs per
+  request, 32–36k per second for one agent.
+- Execution is 21.0–23.8 µs of that. The rest is commits: batches average
+  165–210 requests, and a synced commit takes 0.9 ms.
+- On the interpreter, execution is 84.7 µs per request: 10.9k per second.
+- One request alone waits for its batch's linger (2 ms) and a commit:
+  about 3 ms on either backend. The linger is the latency floor of a quiet
+  agent, and its policy is the lever: linger only until a second input
+  arrives, or not at all after a small batch.
+- **A lone request's execution is not the batched figure.** It takes
+  260–340 µs on the JIT and 440 µs on the interpreter, against 21 µs per
+  request in a batch. It is idle-core cost: every hop (leader, executor,
+  storage) lands on a core that has idled for 1–3 ms, which pays a C-state
+  exit (C10 here: 310 µs exit latency), cold caches and TLB, and a
+  frequency ramp under HWP (the laptop runs `powersave` with
+  `balance_performance`).
+  - **Measured without the node:** one increment's refine in the batch
+    bench, on one thread, with the same work before each run (medians of
+    101):
+
+    | Before each refine | JIT | Interpreter |
+    |---|---|---|
+    | nothing | 35.8 µs | 109 µs |
+    | a 3 ms sleep | 124.4 µs | 248 µs |
+    | a 3 ms busy-wait | 47.7 µs | 102 µs |
+
+    The software path and the gap are the same; only whether the core
+    idles differs.
+  - In the node:
+    - a shorter gap (no linger) brings the figure to 227 µs;
+    - pinning to performance cores, one executor instead of 21, and a busy
+      core elsewhere change nothing (idle states are per core).
+  - Disabling deep idle states needs root and was not run. Keeping every
+    CPU busy with low-priority spinners is not a substitute: they share
+    the performance cores' sibling threads and the power budget, and
+    slowed everything.
+  - A loaded node stays warm; the budget is a loaded node's cost per
+    invocation. A quiet agent's latency is the linger and the sync, of
+    which execution is a tenth.
+  - Deployment knobs for quiet-agent latency: shallow idle states
+    (`/dev/cpu_dma_latency`), the `performance` energy preference, and
+    the linger policy above.
+
+**The interpreter's miss, and the lever on both backends:**
+
+- Per increment, the agent's own code runs about 7,300 instructions in
+  refine and 4,600 in accumulate, about a third of them memory accesses.
+  That is 86k and 24.5k gas: under GP 0.8 a memory access costs 25.
+- An instruction-level profile (the interpreter's trace, attributed to
+  the agent's symbols) puts the time in:
+  - `memcpy`: 17% of refine, 24% of accumulate;
+  - the refine loop and `Invocation::invoke`, inlined: 33%;
+  - building keys: `keys::key` and `refine::key`, 9–13%;
+  - overlay `BTreeMap` inserts and drops: 5–7%;
+  - `Vec` growth: 7%;
+  - dropping `Step`s: 2–4%.
+- Cutting copies, key allocation and growth is agent work, and it speeds
+  up both backends. The core model reserves the interpreter for tracing
+  and platforms without the JIT (section 6), and the node defaults to the
+  JIT. On that reading the budget binds the JIT, which passes with room.
+  The interpreter's number is recorded, not gated.
+- The consequence: the JIT needs x86-64 Linux 6.7 or later
+  (userfaultfd's asynchronous write-protect). Every aarch64 or non-Linux
+  node runs the interpreter, at 1.7× the budget per request today. If
+  such nodes come before the agent work, the interpreter's number
+  becomes a gate.
+
+**The query's tail:**
+
+- The bench queries one at a time from a `block_on` on the main thread,
+  so each sample includes two thread wakes (to an executor and back) and
+  parking jitter, with 21 executors on 22 threads.
+- The query itself accounts for the median: a snapshot, a 13 µs refine
+  and one actor. The tail is almost certainly scheduling.
+- The lever: run a query on the calling thread when that is not the
+  leaders' thread, or let an executor spin briefly before parking.
+
+**Enforcement, in tests:**
+
+- Per-step caps:
+  - `each_per_step_cap_holds_its_limit_and_fails_one_byte_past` (new): a
+    request, a reply, a value and a key, each exactly at its cap and one
+    byte past. It uses a new counter method, `large`, the only way to
+    reach the reply cap with a request under its own.
+  - `per_step_caps_fail_the_step_and_messages_reach_the_outbox`: a step's
+    writes and messages.
+  - `a_refine_stops_before_its_result_outgrows_the_cap`: the work result.
+- Admission: `no_reply_before_its_commit_is_durable_and_a_full_queue_is_busy`
+  (node).
+- Reply window and expiry:
+  - `sessions_refuse_gaps_and_expiry_and_keep_a_reply_window` (agent);
+  - `pipelined_requests_recover_their_lost_replies` and
+    `an_expired_session_is_refused` (ingress), with `TooOld` past the
+    window.
+
+**The plan's other gates:**
+
+| Gate | Where it stands |
+|---|---|
+| Slice 1 | `just ci-full` green, last at step 2.8 |
+| ABI enforcement | `kinds_and_unserved_ids_are_enforced` (step 2.4) |
+| Agent semantics | `the_agent_matches_the_reference_model`, the differential test (step 2.4) |
+| Apply, then send | `no_reply_before_its_commit_is_durable_and_a_full_queue_is_busy` and the exactly-once restart tests (step 2.5) |
+| JAM harness | in `ci` (step 2.7) |
+| Budgets | above |
+
+**Review:** Fable signed off: slice 2 closes, with no blocking or
+should-fix findings. Its notes are in: the lone request's execution, the
+interpreter's platforms, the query's tail, the open items, and the
+percentile question below.
+
+**Open, carried out of slice 2:**
+
+- Per-step agent work: copies, key building, overlay maps (above).
+- Write-tracking re-arm faults per actor use (step 2.8).
+- The store's read behind fresh writes (step 2.2).
+- The step 4 precompile prerequisite (step 2.7).
+- `Admin::ResetPair`; collecting expired sessions' marks and reply
+  windows at agents (`Admin::ExpireSessions`, or a sweep on `EXPIRED`);
+  signatures in the log; section 8.4's window wording; a linear
+  `Schema::method`; inbound message caps; client-named sessions as an
+  owner alternative.
+- The query's tail and the linger policy (above).
+
+**Proposed row:** "request latency on a quiet node", added to §14 as
+[proposed] at ≤ 5 ms at p99, so it is not read into the invocation row.
+In process it is about 3 ms today; over HTTP it is not yet measured.
+
+**Owner decision, small:** which percentile §14's query row means. The
+table names p99 for the replicated rows and nothing here. At the median
+the row passes; at p99 it misses today, and the query's tail above is
+the work. Fable recommends p99 for a user-facing read path.
+
+**Before master:** slice 2's code lives on `vos-core` beside the spikes,
+the copy of `vos-raft` and the drafts, which need the heavy cleanup the
+owner requires before anything reaches master.

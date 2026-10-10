@@ -569,6 +569,49 @@ fn per_step_caps_fail_the_step_and_messages_reach_the_outbox() {
 }
 
 #[test]
+fn each_per_step_cap_holds_its_limit_and_fails_one_byte_past() {
+    let (programs, mut node, _, mut sessions) = setup();
+    let echo = programs.method(COUNTER, "echo");
+    let large = programs.method(COUNTER, "large");
+    let fill = programs.method(COUNTER, "fill");
+    let put_and_scan = programs.method(COUNTER, "put_and_scan");
+    // Past 16 KiB, a byte vector encodes with a 4-byte length.
+    let bytes = |encoded: usize| encoded - 4;
+    let key = |len: usize| (vec![vec![2u8; len]], vec![2u8], Vec::<u8>::new());
+    let result = node.batch(
+        1,
+        [0; 32],
+        vec![
+            sessions.request(ALICE, COUNTER, echo, vec![1u8; bytes(cap::REQUEST)]),
+            sessions.request(ALICE, COUNTER, echo, vec![1u8; bytes(cap::REQUEST) + 1]),
+            sessions.request(ALICE, COUNTER, large, bytes(cap::REPLY) as u32),
+            sessions.request(ALICE, COUNTER, large, bytes(cap::REPLY) as u32 + 1),
+            sessions.request(ALICE, COUNTER, fill, (1u32, bytes(cap::VALUE) as u32)),
+            sessions.request(ALICE, COUNTER, fill, (1u32, bytes(cap::VALUE) as u32 + 1)),
+            sessions.request(ALICE, COUNTER, put_and_scan, key(cap::KEY)),
+            sessions.request(ALICE, COUNTER, put_and_scan, key(cap::KEY + 1)),
+        ],
+    );
+    for (at, past, what) in [
+        (0, 1, "a request"),
+        (2, 3, "a reply"),
+        (4, 5, "a value"),
+        (6, 7, "a key"),
+    ] {
+        assert!(
+            matches!(ran(&result.steps[at]).outcome, Outcome::Done(_)),
+            "{what} at its cap: {:?}",
+            ran(&result.steps[at]).outcome
+        );
+        assert_eq!(
+            failed(&result.steps[past]),
+            failure::CAP,
+            "{what} past its cap"
+        );
+    }
+}
+
+#[test]
 fn an_ack_clears_the_outbox_through_its_sequence() {
     let (programs, mut node, _, mut sessions) = setup();
     let spam = programs.method(COUNTER, "spam");

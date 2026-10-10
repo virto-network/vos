@@ -103,6 +103,12 @@ impl Counter {
         bytes
     }
 
+    /// A reply of `len` bytes.
+    #[msg]
+    pub async fn large(&self, len: u32) -> Vec<u8> {
+        alloc::vec![5u8; len as usize]
+    }
+
     /// A query that writes through the raw ABI: the agent traps it.
     #[msg]
     pub async fn sneaky(&self) -> u64 {

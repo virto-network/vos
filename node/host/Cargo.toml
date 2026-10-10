@@ -27,3 +27,7 @@ vos-pvm-compiler = { workspace = true }
 [[test]]
 name = "crash"
 harness = false
+
+[[bench]]
+name = "acceptance"
+harness = false

@@ -1032,18 +1032,19 @@ These form a prover track that runs alongside the core slices (section 16).
   verification on the interpreter.
 - The shared-executor Raft driver keeps vos-raft's core free of threads.
 
-## 14. Performance budgets [decided; measured in run 3 and slice 1]
+## 14. Performance budgets [decided; measured in run 3 and slices 1 and 2]
 
 | Path | Budget | Measured | Status |
 |---|---|---|---|
-| Actor invocation, refine and accumulate, one node | ≤ 50 µs | refine side, with a pooled actor machine per request, on an in-memory store: 7.1 µs nested in the agent on the interpreter, 12.7 µs on the JIT; 3.5 and 9.3 µs driven by the node. Accumulate adds 0.3 µs per transfer (slice 1, S2) | passes; storage arrives in slice 2 |
+| Actor invocation, refine and accumulate, one node | ≤ 50 µs | the default agent on one node with fjall storage, counter increments under load: 21–24 µs per request on the JIT, 85 µs on the interpreter, plus a 0.9 ms synced commit per batch of 165–210 requests (slice 2) | passes on the JIT; the interpreter, kept for tracing and platforms without the JIT, misses |
 | Committed-map write on the apply path [proposed] | ≤ 5 µs; background root building keeps up with apply | not yet measured; node rows in accumulate would cost 35–45 µs (S4) | needs background roots |
-| Fixed cost per refine [proposed] | ≤ 50 µs; pooled acquire and reset ≤ 5 µs; a new machine ≤ 50 µs | agent machine per refine 6.3 µs (interpreter) and 16.3 µs (JIT); pooled acquire plus reset after a use 2.4 and 3.5 µs; a new machine 7–10 and about 35 µs (slice 1) | passes |
+| Fixed cost per refine [proposed] | ≤ 50 µs; pooled acquire and reset ≤ 5 µs; a new machine ≤ 50 µs | an empty refine on a kept agent machine 13 µs (JIT) and 10 µs (interpreter); pooled acquire, use and reset 1.6 and 1.1 µs; a new machine 7–10 and about 32 µs (slices 1 and 2) | passes |
 | Replicated agent on 3 LAN nodes, simple mutations | ≥ 20k per second per agent; p99 commit ≤ 10 ms at half load | about 25k/s at p99 8 ms with the prototype driver, on redb, one process, one disk (S3) | passes with section 16 work; repeat on fjall and a network |
 | Many active agents per node [proposed] | 64 active agents: ≥ 40k commits per second in total, p99 ≤ 20 ms | 6.3–26k/s at p99 31–191 ms (S3) | fails; work item 16 |
 | Workflow snapshot capture plus restore, up to 50 KB | ≤ 1 ms | 3-page suspensions: capture 0.2–0.6 µs (interpreter) and 8–12 µs (JIT, quiet machine; 6–19 µs under load), copying and hashing the pages 10–15 µs, writing them into a pooled machine 0.3 µs (excluding its reset on return, 2.4–3.5 µs, and loading registers, gas and counter); a 2 MiB suspension takes 150–190 µs and about 400 µs to write (slice 1, S1) | passes |
-| Table point read or write at 10M rows (host cost) | ≤ 5 µs | write 2.2–2.9 µs; read 2.5 µs compacted, 5.0–5.2 µs with 620k fresh updates in the memtable and level 0, about 0.1 ms cold (slice 2) | pass compacted; at the edge behind fresh writes |
-| Query on a follower | ≤ 100 µs | 1.5–2.3 µs of execution plus reads (S2, S4) | passes warm |
+| Table point read or write at 10M rows (host cost) | ≤ 5 µs | write 2.5–3.3 µs; read 2.5–3.2 µs compacted, 5.0–5.2 µs with 620k fresh updates in the memtable and level 0, about 0.1 ms cold (slice 2) | pass compacted; at the edge behind fresh writes |
+| Query on a follower | ≤ 100 µs | through a node's query path (executor round trip, snapshot, refine in query mode, one actor): median 49 µs and p99 115–175 µs on the JIT, median 87 µs on the interpreter (slice 2) | passes at the median |
+| Request latency on a quiet node [proposed] | ≤ 5 ms at p99 | one request at a time on one node: about 3 ms in process, the batch's 2 ms linger plus a 0.9 ms synced commit; its execution, 260–340 µs, is idle-core cost (slice 2) | passes in process; over HTTP not measured |
 | Merge apply, cost per operation at 1M operations | ≤ 2× the cost at 1k | 1.5–1.8× with incremental apply on LWW maps, in memory (S6) | passes with section 16 work |
 | 1,000 mostly idle Raft groups per node | no thread per group; idle CPU ≤ 5% of one core | about 1.6% at a 500 ms heartbeat (S3) | passes |
 
