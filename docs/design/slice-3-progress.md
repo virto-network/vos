@@ -1711,3 +1711,304 @@ Also done:
 **For step 3.5:** `Trust::NodeKey` becomes a set (the replicas' keys,
 from the directory, read from a node already pinned), and a client's
 kept sessions are keyed by agent rather than by node.
+
+## Step 3.5: replicated agents
+
+### Design
+
+**Sequencing: sessions move into this step,** ahead of forwarding. The
+plan puts forwarding here and client-named sessions in 3.6. But slice
+2's sessions are a node's own: ids the node assigned, keys in a
+node-level registry. Another replica cannot check a session's
+signatures, nor keep its sequence across a failover, and the
+exactly-once checker would fail its first failover. Four parts, each
+reviewed and committed on its own:
+
+1. **3.5a, the replicated group:**
+   - the space's configuration and the network in the node;
+   - creation with a replica set, and the directory;
+   - the group driver;
+   - the leader proposing, and every replica applying;
+   - leader changes;
+   - programs and blobs reaching every replica.
+
+   Clients call the leader. Elsewhere, calls answer `NotLeader` with the
+   leader's address, and queries run on any replica.
+2. **3.5b, sessions in the agent** (3.6's design):
+   - client-named sessions;
+   - signatures over the agent's identity;
+   - failover by `NotLeader` redirect;
+   - the exactly-once checker's first form, under leader kills: no
+     acknowledged request lost or applied twice, no reply before its
+     apply.
+3. **3.5c, any replica serves:**
+   - forwarding with verification, and re-forwarding;
+   - followers' queries with version floors, and read-index queries;
+   - the client pinning every replica's key;
+   - the checker gains linearizable reads;
+   - before this step, commits reach followers eagerly (section 7.5). A
+     leader with nothing new to send sends nothing today
+     (`core.rs:1879`), so followers learn of a commit only from the
+     next heartbeat.
+4. **3.5d, messages between agents across nodes;** then three
+   processes.
+
+What 3.6 keeps: expiry, collection and caps, under the checker (expiry
+and replay).
+
+#### 3.5a The replicated group
+
+**The space.**
+- A node runs in a space given by a file. For each node it lists:
+  - its number;
+  - its key;
+  - its peer address;
+  - its ingress address.
+- `vos node run --space FILE`: the node finds its own entry by its key.
+  `NotLeader` names the leader's ingress address, which a client can
+  reach (a node number is not reachable).
+- Without a space file, the node is a space of one: every agent is a
+  group of one, through the same code.
+
+**The network in the node:**
+- **vos-net gets an executor of its own,** driven by one thread, and a
+  small `quinn::Runtime` that spawns there. Today quinn's smol runtime
+  and vos-net's tasks use smol's global executor, so `SMOL_THREADS`
+  could give it several threads and break the receiving side's turns.
+- **A dispatcher** drains the arrival queues, Liveness and Consensus
+  first. For each frame it:
+  - decodes it and runs `peer::check`, hashing a blob off the runtime
+    thread;
+  - routes it to its group's bounded inbox without waiting;
+  - drops and counts a frame whose agent is unknown, or whose inbox is
+    full.
+
+**Agent ids** carry their creating node: the top 8 bits are its number,
+and the low 24 the next after the highest id in its own range (the
+registry also holds other nodes' agents).
+
+**Creation and the directory:**
+- **The creation record** names:
+  - the agent's id and its replica set;
+  - the creating node and the time;
+  - the hash of the agent program;
+  - accumulate's gas limit.
+
+  Its hash is the agent's identity, which 3.5b's clients sign for.
+- **Making it durable:** the creating node writes the record durably in
+  a registry row, then sends it as `Directory` to every node of the
+  space.
+  - A node that receives it writes its row durably before acknowledging
+    (`DirectoryAck`). Applying it again is idempotent.
+  - The creating node resends what is unacknowledged, on a timer and
+    after every restart.
+- **Authorization:**
+  - an id's top byte must be the number of its sender, the creating
+    node;
+  - a different record for a known id is refused and logged, never
+    written over.
+- **The operator's answer waits for a majority of the replica set to
+  hold the row.** Before that the group cannot elect a leader, and the
+  creating node's disk is its only copy.
+- **What each node does with a row:**
+  - a replica starts the agent's group, with the replica set as its
+    initial members;
+  - every other node keeps the row to route by.
+  - A call or query for an agent the node does not replicate answers
+    with the replica set and their ingress addresses (`Elsewhere`), not
+    `NoAgent`.
+- From 3.7 on, when groups change members, the group's own
+  configuration is the authority, and the directory is a routing hint.
+
+**Every replica applies the same things in the same way.**
+- **The program:** a replica runs a group only if its own agent program
+  has the hash in the creation record. One that does not refuses to
+  start the group, and says so.
+- **Accumulate's gas** is the creation record's, not node
+  configuration. A replica configured lower would run out where the
+  others halt, and diverge in silence. Refine's gas stays a node's own:
+  only the leader refines, and its result is replicated.
+- **A deterministic failure** (a trap, or running out of gas) applies as
+  no writes, on every replica alike, and the applied index moves on.
+- **An infrastructure fault** (an executor panic, a read error) retries
+  the apply, and never skips it.
+
+**The group driver** (`group.rs`), a task per agent on the node's
+runtime, owns the agent's vos-raft core:
+- **Starting** follows the step 3.3c contract:
+  - `writer.recovered(applied)`, then `recovery_cut`;
+  - drop stale epochs;
+  - `Core::new` from `store.raft`.
+- **Inputs:**
+  - timers (`tick` at the core's deadline);
+  - its inbox of Raft messages;
+  - proposals from the agent's leader loop;
+  - blobs arriving.
+- **Its actions:**
+  - `Write`:
+    - the writer commits `raft::changes`;
+    - the core then hears `durable` and, through `EntryReports`,
+      `entries_durable`;
+    - an entry naming a blob the node lacks waits for it (below);
+  - `Send`: frame it with `peer::to_wire`, then send it on Consensus on
+    the agent's stream; a refusal drops it, and Raft resends;
+  - `LoadEntries`: `raft::load`, run off the runtime thread, then
+    `loaded`;
+  - `Committed`: raise the applier's commit bound (below);
+  - `CompactBound`: ignored until 3.7;
+  - `SendSnapshot`: `snapshot_failed` until 3.7;
+  - `Answer`: to the proposer waiting on its token;
+  - `Changed`: to the leader loop.
+
+**The applier,** a task per agent:
+- **It applies through min(commit, written).** `written` is the highest
+  index whose write the local writer committed and whose blobs it holds.
+  A leader's commit can pass its own durable index, since followers'
+  acknowledgements suffice (`member_score(me)` is the durable index in
+  the majority floor), and a new leader may hold old entries without
+  their blobs.
+- **One entry at a time:**
+  - read the entry from the store;
+  - for a work result, run accumulate on the applied state, with the
+    record's gas, and commit `Change::Apply` with its writes;
+  - for a no-op or a configuration, the same `Apply` with no writes.
+  Each apply is visible before the next accumulate takes its snapshot.
+- **`Apply` is not synced:** the state rebuilds from the synced log. One
+  fsync per batch, as in slice 2.
+- **The applied index is published,** for the leader loop and queries
+  to wait on. After a restart, an agent's calls and queries wait until
+  the applier has reached the commit index it recovered.
+- **The last work result's time and seed** go in a node row, in each
+  apply's batch. Refine takes its time floor from it, and queries their
+  time and seed. Reading the entry at the applied index, as slice 2
+  does, gives time 0 after a no-op or a configuration entry.
+
+**The leader loop**, while the group's core leads:
+- **Starting,** on `Changed { Leader }`:
+  1. learn the term's first index: the no-op, the first entry of the
+     term in the core's first `Write`;
+  2. wait until it is applied;
+  3. read the agent's `version`, and the time floor;
+  4. deliver what the outbox holds, as slice 2's recovery does;
+  5. then batch.
+- **A batch:**
+  1. take inputs;
+  2. refine against the applied state;
+  3. **dry-run accumulate** on the same state, to isolate a failure off
+     the log: a trap or running out of gas fails the batch as slice 2's
+     `Fault::Agent` does (requeue it shorter, then fail the one input);
+  4. propose the result; its entry names its blobs;
+  5. wait until its index is applied here, and check the entry there is
+     its own (same term);
+  6. answer from the applied result, and deliver the outbox.
+
+  The leader's apply of its own entry reuses the dry run's writes when
+  nothing was applied in between: the same entry on the same state.
+- **No refine runs ahead of the apply before it.** There is no
+  pipelining in this slice, unless 3.10's budgets need it (p99 at half
+  load likely will).
+- **Stopping,** on losing leadership or a `Propose` error:
+  - inputs taken and inputs still queued answer `NotLeader`, with the
+    leader's address when known;
+  - the loop never waits for the in-flight entry's apply.
+- **Machine caches are flushed on every role change.** Followers' queries
+  fill them too, from older applied states.
+- **Hooks:**
+  - `fail_refine` stays on the leader's refine;
+  - `after_commit(agent, index)` fires after the leader's own apply of
+    its entry, before it answers. False stops the loop, as now;
+  - `before_commit` and `fail_commit` stay on the writer, for Raft
+    writes and applies alike. A failed Raft write halts the node, as in
+    slice 2.
+
+**Blobs and programs:**
+- **An install's entry names its programs' blobs,** as a large result's
+  names its own. The leader knows them from the batch's install inputs.
+- **A follower lacking a blob** asks the leader for it (`BlobRequest`),
+  and falls back to the other members. A new leader asks the followers
+  for blobs its old entries name. A `Blob` is taken if it hashes to its
+  name, and a `BlobRequest` is served only to replicas of its agent.
+- **An entry is reported durable once its blobs are** (`EntryReports`,
+  3.3b). A missing blob holds back that entry's acknowledgement, never
+  a vote.
+- **Pins follow the agent's installed instances:**
+  - an apply that writes an instance's `Installed` row pins the
+    programs it names, in the same batch;
+  - one that replaces or removes it unpins the programs no instance
+    names any more;
+  - so every replica pins the same programs.
+- **The leader no longer pins at install time.** A blob's age keeps it
+  until the entry names it, and an install that never commits ages out.
+- The machine pool prepares a program on its first use, from the blob
+  store, so followers' queries find it.
+- **A follower's ingress refuses an install** before storing its blobs.
+
+**Clients in 3.5a:**
+- **Calls, installs and grants go to the leader.** A follower answers
+  `NotLeader` with the leader's ingress address, and the client retries
+  there.
+- **Queries run on any replica** against its applied state, and report
+  the applied index they read (section 7.6).
+- **Sessions stay slice 2's node-level ones** until 3.5b. A client fails
+  over by opening a new session at the new leader, so exactly-once
+  across failover is not claimed until 3.5b. A resend in the same
+  session to a node that leads again is not applied twice: the lane
+  reads the applied mark, and a new leader applies through its no-op
+  before it refines.
+- **Messages to an agent led on another node** stay in the outbox until
+  3.5d.
+
+**With compaction off** (until 3.7):
+- the log is kept whole, and so are the blobs it names;
+- a restart reads the whole log;
+- the core sends no snapshot while the log starts at 0.
+- **One trap:** `recovery_cut`'s lost-blob path compacts through the
+  applied index. A follower lagging behind that then needs a snapshot,
+  and the leader retries `SendSnapshot` and `snapshot_failed` at each
+  heartbeat until 3.7.
+
+**Tests** (in process, on the hub, each node with its own clock; then
+QUIC in one process):
+- **Creation on three nodes:**
+  - the operator's answer comes after a majority holds the row;
+  - the directory reaches every node, also after the creating node
+    restarts;
+  - a record for a known id from the wrong node is refused.
+- **Calls and installs at the leader:** every replica applies them, and
+  the three states are equal row for row, pins included.
+- A replica with another agent program, or a record with another
+  program hash, refuses the group.
+- **An input whose accumulate traps:** it is isolated by the dry run,
+  and nothing reaches the log.
+- **A follower answers `NotLeader`** with the leader's address. A
+  non-replica answers `Elsewhere` with the replicas.
+- **The leader killed:** another is elected, applies through its no-op,
+  and serves calls, with batch time never going back. The old leader
+  rejoins and catches up from the log.
+- **A follower partitioned during an install:** it catches up, fetches
+  the program blob (from a follower, when the leader lacks it), pins it,
+  and serves queries with it.
+- **A node restarted in process** recovers its groups from its store.
+- Slice 2's tests pass on a space of one.
+- **The acceptance bench** on a space of one, against slice 2's 29–31 µs
+  per request. Single-replica agents keep slice 2's path only if the
+  group of one costs measurably.
+
+**Not in 3.5a:**
+- compaction and snapshots (3.7);
+- combined heartbeats and quiescence (3.8);
+- membership changes after creation.
+
+**Review** (Opus): go, once one blocking item was in the design. It now
+is: every replica applies the same things in the same way. The
+creation record names the program and accumulate's gas, and failures
+have a rule. The should-fixes are folded in above:
+- the applier's bound and its one-at-a-time applies;
+- blobs fetched from any member;
+- the time floor in a node row;
+- the directory's durability, authorization and majority answer;
+- ingress addresses in the space;
+- the leader loop's start, stop and hooks;
+- vos-net's own one-thread executor.
+
+The step split into four, and the nits, are folded in too.
