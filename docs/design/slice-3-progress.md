@@ -4714,3 +4714,174 @@ are dropped by count, not by a scan per spawn.
 **Not in 3.8:** pipelined refines and the active-agent budget itself
 (3.10); a bench in three processes (3.10's acceptance runs three
 `vos node run`).
+
+#### 3.8b Built
+
+**The bench** (`benches/agents.rs`):
+- knobs: `EXECUTORS` per node, `LINGER_MS`, `MAX_INPUTS`;
+- `HOT`: one agent with many sessions beside the rest, its calls
+  reported apart;
+- `FAILOVER=1`: the node leading the most groups stops, then starts
+  again;
+- hooks count the writer's flushes and the committed batches.
+
+**Measured** (three nodes in one process, 22 hardware threads, 64
+agents):
+
+| Run | Result |
+|---|---|
+| 4 sessions each, 22 executors per node (the default: every core) | 12.1k commits/s, p50 21 ms, p99 40 ms |
+| 4 sessions each, 7 executors per node (the machine's share) | 15.0k commits/s, p50 18 ms, p99 25 ms |
+| 16 sessions each, 7 executors | 33.8k commits/s, p50 30 ms, p99 54 ms; 10.5 inputs per batch, 2.6 batches per flush |
+| the same, linger 0 ms / 5 ms (2 ms by default) | 34.4k, p99 91 ms / 32.1k, p99 64 ms |
+| the same, at most 32 inputs a batch | 33.6k, p99 57 ms |
+| 1 session each, 7 executors | 7.3k commits/s, p50 8.7 ms, p99 12.0 ms |
+| the same, the first agent with 64 sessions | the others: p50 9.3 ms, p99 13.1 ms (+9% on their p99 alone); the hot one: 3.6k commits/s, p99 29 ms |
+| 1,064 groups per node, idle | 5.0% of one core for the three nodes |
+| the node leading 365 of 1,064 groups stops | every group has a leader again 2.56 s later (elections 1.5–3 s): a leader, not yet one that serves, which waits for its no-op to apply |
+| it starts again, with 1,064 agents | opens in 0.77 s; 12.6% of one core while its groups catch up |
+
+What the numbers say:
+- **CPU sits near 12 cores in every active run.** The machine is
+  saturated, and throughput follows the cost of a batch, not of a
+  commit. A batch runs the agent program five times: refine and a dry
+  run of accumulate at the leader, then accumulate on each replica.
+  Each run has a fixed cost of a few hundred µs (machine setup, store
+  reads, the JIT's code) beside its inputs'. More inputs per batch
+  raise throughput, and the closed loop's wait with it.
+- **Executors on a machine the nodes share** should be its share: three
+  times the machine's threads cost a fifth of the throughput and half
+  again the p99. The default stays every core, for one node per
+  machine; 3.10's three processes set it.
+- **Linger and batch size** are fine as they are: no linger trades the
+  p99 for nothing, and batches never reach the cap.
+- **Fairness holds:** a hot agent costs the others 9% on their p99, and
+  executors and leader loops stay FIFO.
+- **A mass election finds its leaders on time:** 365 groups within the
+  election timeout. That does not measure the synced placement each
+  election writes under the node-wide `recording` lock: a leader's role
+  is known before its placement is written, and placements are written
+  off the driver. The lock's cost is the directory's convergence, about
+  365 serialized syncs per surviving node here, and more for a node
+  catching up after a restart. It stays open, for 3.10 to measure.
+- **A restart with 1,064 agents** opens in under a second.
+
+**Fixed:** the node's `spawn` scanned every task it held on each spawn.
+Finished tasks are now dropped only once the list has doubled since
+the last pruning (unit test: 10,000 short tasks keep the list under
+65, running ones are kept).
+
+**Found in CI, and fixed:** the crash test (3.3a) failed a round whose
+writer was killed before it reported any append synced: it expected
+the first term even then. Nothing reported now owes no term.
+
+**Carried to 3.10, with these numbers:**
+- **The active-agent budget** (64 agents, 40k commits/s at p99
+  ≤ 20 ms): today 15k at p99 25 ms with four sessions, or 34k at
+  p99 54 ms with sixteen.
+  - The lever is the fixed cost of an agent program run, and the
+    number of runs per batch, not pipelining: the CPU is already full.
+  - Candidates: a machine kept warm per agent, the dry run's
+    accumulate reused at the leader's own apply, fewer store reads per
+    batch.
+- Message batching across agents, and fan-in past a receiver's cap.
+- One heartbeat round per linearizable read (a read joins the next
+  round to start).
+- A bench in three processes.
+
+**Opus's review of 3.7b and 3.8a,** which a Sonnet agent had reviewed
+while Opus was out of quota: GO-with-fixes for both. One finding was
+blocking, a safety bug. It and the rest are folded in this commit:
+- **A replica added again voted with an empty log** (blocking).
+  - What went wrong:
+    - A retirement wipes the log, keeping the term and vote.
+    - Release no longer waits for removed voters to learn of their
+      removal, and vos-raft never checked a voter's own membership.
+    - So a replica removed while down could come back with its old
+      configuration and win an election through the vote of a replica
+      retired and added again, empty.
+    - That leader serves stale state, acknowledges writes the group
+      never holds, and halts the node whose log it tries to cut back.
+  - The fix: the retirement keeps the last log position the replica
+    held (`NodeRow::VoteFloor`), and vos-raft votes, and pre-votes, only
+    for candidates whose log reaches its own or that floor
+    (`Recovered::vote_floor`). Raft's rule, that a vote honours every
+    entry the voter acknowledged, holds across the wipe.
+  - The simulator now models retirement:
+    - a dropped replica's log and state wiped, its term, vote and floor
+      kept;
+    - no group until a configuration names it again, then one starting
+      empty;
+    - leaders releasing removed voters;
+    - 400 seeds each in the paired chaos runs.
+
+    Without the floor, seed 1305 commits two entries at one index;
+    with it, 800 seeds pass through 2,928 retirements. Core test: a
+    wiped replica refuses a vote and a pre-vote to a candidate behind
+    its floor, and grants one that reaches it.
+- **A replica a committed final placement leaves out retires, even
+  while it believes it leads:** it is stale, and an idle stale leader
+  hears from no one.
+  - The test cuts, on the hub's new per-class cuts, a leader's Raft
+    frames both ways and its pair heartbeat to its followers, while it
+    still hears theirs.
+  - Its followers elect another, which replaces it. The stale one,
+    still leading in its own view, retires once the cut heals and the
+    committed final placement reaches it.
+- **A group starts from the members of its creation record,** the log's
+  first configuration, not from the placement's `before`. A creation
+  member restarted between a joint placement and its entry could start
+  as a non-member, and never campaign.
+- **A node resends a placement only while it holds the one it
+  announced:** a removed leader no longer resends forever a later
+  leader's placement, which the receiver refuses from it.
+- **Check-quorum and gray failures:**
+  - A member counts through its node's pair heartbeat only while it
+    holds every entry, or it has sent any Raft message at this term
+    within three times the longer of an election timeout and an
+    append's resend (9 s by default).
+  - A leader whose frames go unanswered, the node alive but its Raft
+    frames lost, steps down. A slow follower, still answering, keeps
+    counting.
+  - Rules tied to the election timeout alone (holding every entry; the
+    matched index moving within two windows) made leaders step down in
+    two to four of eight runs of the cluster suite: under its load, a
+    follower's answers wait on its fsync and a program's blob for
+    longer than the tests' 80 ms windows. The resend timeout is the
+    core's own measure of an answer that is late.
+  - Core test: a leader whose append goes unanswered steps down, though
+    the node is heard.
+  - So a gray failure (Raft frames lost, the node alive) leaves the
+    groups its node leads without a working leader for about 9–12 s by
+    default: the patience, then a check-quorum window. 3.9's deadlines
+    for an answer allow for it.
+- **A placement is written off the driver** (`Local::Placed`): a driver
+  waiting on the node-wide `recording` lock in a mass election would
+  stop stamping `woke`, drop out of the list, and draw another
+  election.
+- **A failed log load is cleared** (`loaded` with nothing), so its peer
+  gets entries again.
+- **The pair heartbeat restarts after 100 ms,** not a second: every
+  group it leads is unvouched meanwhile.
+- **Mutations:** each caught:
+  - the floor dropped from the simulator's retirement (seed 1305);
+  - the floor ignored in votes (its core test);
+  - pair liveness counting every member (the gray failure's test).
+
+  - a leader kept on a committed final placement (the stale leader's
+    test).
+
+  Not caught, and kept as guards:
+  - a group seeded from `before`;
+  - a placement resent whatever order the node holds;
+  - a failed load left in place.
+- **The pair heartbeat's restart** waits 100 ms, doubling while it keeps
+  failing, to 1 s.
+- **Carried:**
+  - the confirmation entry, pure cost once the host releases removed
+    voters (3.10);
+  - a gray failure's deposition at node level: the core's test only.
+
+**3.8 is done.** What it leaves for 3.9 and 3.10 is in the lists
+above and in 3.7's.
+

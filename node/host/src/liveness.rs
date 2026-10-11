@@ -28,8 +28,14 @@ const LISTED: usize = 4_096;
 /// How long a listing not renewed is kept: far past any election timeout,
 /// so the table stays bounded as groups come and go.
 const FORGET: Duration = Duration::from_secs(60);
-/// How long the pair heartbeat waits to start again after it failed.
-const RESTART: Duration = Duration::from_secs(1);
+/// How long the pair heartbeat waits to start again after it failed,
+/// first: short, as every group it leads is unvouched while it waits. It
+/// doubles while it keeps failing, to `RESTART_MOST`.
+const RESTART: Duration = Duration::from_millis(100);
+const RESTART_MOST: Duration = Duration::from_secs(1);
+/// A run of the heartbeat this long counts as recovered: the next
+/// failure waits `RESTART` again.
+const RECOVERED: Duration = Duration::from_secs(10);
 
 pub(crate) struct Liveness {
     /// This run of the node: its start time in microseconds, past every
@@ -80,10 +86,15 @@ pub(crate) fn supervise(
     arrivals: smol::channel::Receiver<Incoming>,
     stopped: smol::channel::Receiver<()>,
 ) {
+    let mut pause = RESTART;
     loop {
+        let started = std::time::Instant::now();
         let ran = catch_unwind(AssertUnwindSafe(|| {
             smol::block_on(run(Arc::clone(&inner), arrivals.clone(), stopped.clone()))
         }));
+        if started.elapsed() >= RECOVERED {
+            pause = RESTART;
+        }
         match ran {
             Ok(Ended::Stopped) => return,
             Ok(Ended::Closed) => {
@@ -104,13 +115,14 @@ pub(crate) fn supervise(
                         true
                     }
                     .or(async {
-                        smol::Timer::after(RESTART).await;
+                        smol::Timer::after(pause).await;
                         false
                     }),
                 );
                 if stop {
                     return;
                 }
+                pause = (pause * 2).min(RESTART_MOST);
             }
         }
     }

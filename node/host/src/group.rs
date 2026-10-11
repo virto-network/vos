@@ -104,6 +104,8 @@ pub(crate) enum Local {
     /// Something changed that the group's next round should see, such as
     /// the writer's health.
     Wake,
+    /// The placement of `order` reached the directory, `kept` or not.
+    Placed { order: (u64, u64, bool), kept: bool },
     /// The snapshot stream to `to`, named by `term` and `index`, ended:
     /// `done` once its follower staged every chunk.
     StreamEnded {
@@ -289,6 +291,9 @@ struct Driver {
     memberships: HashMap<u64, smol::channel::Sender<Result<u64, ChangeMembershipError>>>,
     /// The order of the placement this replica last announced as leader.
     announced: Option<(u64, u64, bool)>,
+    /// A placement on its way to the directory: kept off the driver, which
+    /// never waits on the node-wide lock a placement takes.
+    announcing: Option<(u64, u64, bool)>,
 }
 
 /// A snapshot stream this replica runs to a follower, as leader.
@@ -398,6 +403,7 @@ impl Driver {
             compact_due: false,
             memberships: HashMap::new(),
             announced: None,
+            announcing: None,
             inner,
             shared,
         })
@@ -541,7 +547,11 @@ impl Driver {
                 Local::ChangeMembership { answer, .. } => {
                     let _ = answer.try_send(Err(ChangeMembershipError::Stopped));
                 }
-                Local::Retire | Local::StreamEnded { .. } | Local::Probe(_) | Local::Wake => {}
+                Local::Retire
+                | Local::StreamEnded { .. }
+                | Local::Probe(_)
+                | Local::Wake
+                | Local::Placed { .. } => {}
             }
         }
         for (_, answer) in self.proposals.drain() {
@@ -598,6 +608,15 @@ impl Driver {
             Local::Retire => self.retired = true,
             Local::Probe(node) => self.core.probe(node),
             Local::Wake => {}
+            Local::Placed { order, kept } => {
+                if self.announcing == Some(order) {
+                    self.announcing = None;
+                }
+                // One not kept is tried again the next round.
+                if kept {
+                    self.announced = Some(self.announced.map_or(order, |held| held.max(order)));
+                }
+            }
             Local::ReadIndex { answer } => {
                 let token = self.next_token;
                 self.next_token += 1;
@@ -704,8 +723,12 @@ impl Driver {
                     .await;
                 match loaded {
                     Some(Ok(entries)) => self.core.loaded(load, entries),
-                    // The core asks again when it next needs them.
-                    _ => tracing::warn!(agent = self.agent.0, "a log load failed"),
+                    // Nothing loaded: the core forgets the load, and asks
+                    // again when its peers next answer.
+                    _ => {
+                        tracing::warn!(agent = self.agent.0, "a log load failed");
+                        self.core.loaded(load, Vec::new());
+                    }
                 }
             }
             Action::Committed { index } => self.shared.update(|state| state.commit = index),
@@ -749,7 +772,7 @@ impl Driver {
                     // rather than leave it to the next leader's election.
                     let status = self.core.status();
                     let me = self.inner.number;
-                    let removed = self.announced.is_some()
+                    let removed = (self.announced.is_some() || self.announcing.is_some())
                         && status.joint_old.is_none()
                         && !status.members.contains(&me)
                         && status.commit_index >= status.active_config_index.unwrap_or(0);
@@ -757,6 +780,7 @@ impl Driver {
                         self.announce_placement().await;
                     }
                     self.announced = None;
+                    self.announcing = None;
                     // It retires once it steps down; a group stopping does
                     // not.
                     if !self.shared.state().stopped {
@@ -889,13 +913,19 @@ impl Driver {
             committed: status.commit_index >= index,
         };
         let order = placement.order();
-        if self.announced == Some(order) {
+        if self.announced == Some(order) || self.announcing == Some(order) {
             return;
         }
-        // One not kept is tried again the next round.
-        if self.inner.place(self.agent, placement).await {
-            self.announced = Some(order);
-        }
+        self.announcing = Some(order);
+        let inner = Arc::clone(&self.inner);
+        let agent = self.agent;
+        // The answer goes to whichever run of the agent's group is there
+        // then: a later run, leading at a later term, takes it as one more
+        // placement known kept, which changes nothing it announces.
+        self.inner.spawn(async move {
+            let kept = inner.place(agent, placement).await;
+            inner.propose(agent, Local::Placed { order, kept });
+        });
     }
 
     /// Release each stream whose follower switched to its snapshot, or

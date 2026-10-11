@@ -201,6 +201,10 @@ pub struct Recovered<N: NodeId> {
     pub log_start_config: Option<ActiveConfigRecord<N>>,
     /// The highest applied index recovered.
     pub applied: u64,
+    /// The last log position (index, term) a replica held before its host
+    /// wiped its log and state, keeping its term and vote: it votes only
+    /// for candidates whose log reaches it, as if it still held that log.
+    pub vote_floor: Option<(u64, u64)>,
 }
 
 impl<N: NodeId> Default for Recovered<N> {
@@ -211,6 +215,7 @@ impl<N: NodeId> Default for Recovered<N> {
             active_config: None,
             log_start_config: None,
             applied: 0,
+            vote_floor: None,
         }
     }
 }
@@ -326,6 +331,10 @@ struct LeaderState<N: NodeId> {
     sent_commit: BTreeMap<N, u64>,
     /// The highest commit index each peer answered an append carrying.
     acked_commit: BTreeMap<N, u64>,
+    /// When each peer last sent a message at this term, or this
+    /// leadership began: a peer owed entries that stops answering answers
+    /// for itself at check-quorum, however alive its node.
+    answered: BTreeMap<N, u64>,
     /// Peers heard from since the last check-quorum.
     recent: BTreeSet<N>,
     /// Members whose node the host has not heard lately
@@ -347,6 +356,7 @@ impl<N: NodeId> LeaderState<N> {
             acked_round: BTreeMap::new(),
             sent_commit: BTreeMap::new(),
             acked_commit: BTreeMap::new(),
+            answered: BTreeMap::new(),
             recent: BTreeSet::new(),
             silent: BTreeSet::new(),
             transfer: None,
@@ -434,6 +444,9 @@ pub struct Core<N: NodeId> {
     /// host that compacted without keeping it leaves it unknown.
     log_start_config: Option<(u64, ActiveConfig<N>)>,
     pending_joint_entry: Option<u64>,
+    /// The last log position held before a wipe: see
+    /// [`Recovered::vote_floor`].
+    vote_floor: Option<(u64, u64)>,
     retiring_voters: BTreeMap<N, u64>,
     retiring_voter_acks: BTreeSet<N>,
     retirement_confirmation_entry: Option<u64>,
@@ -500,6 +513,7 @@ impl<N: NodeId> Core<N> {
             writer_stalled: false,
             stalled_handovers: 0,
             pending_joint_entry: None,
+            vote_floor: recovered.vote_floor,
             retiring_voters: BTreeMap::new(),
             retiring_voter_acks: BTreeSet::new(),
             retirement_confirmation_entry: None,
@@ -589,6 +603,7 @@ impl<N: NodeId> Core<N> {
             && message.term() == self.term
         {
             leader.recent.insert(from);
+            leader.answered.insert(from, self.now);
         }
         match message {
             Message::Append {
@@ -688,11 +703,15 @@ impl<N: NodeId> Core<N> {
         self.answer(Answer::ChangeMembership { token, result });
     }
 
-    /// The host told the voters a committed final configuration removed of
-    /// that removal itself: count each as having acknowledged it, so the
-    /// confirmation, and the next change and compaction after it, need not
-    /// wait for a removed voter that is down or gone. Only a leader whose
-    /// final configuration has committed releases them.
+    /// The host tells the voters a committed final configuration removed of
+    /// that removal itself, sooner or later: count each as having
+    /// acknowledged it, so the confirmation, and the next change and
+    /// compaction after it, need not wait for a removed voter that is down
+    /// or gone. Only a leader whose final configuration has committed
+    /// releases them. A host that wipes a removed replica's log must keep
+    /// its last position as the replica's vote floor
+    /// ([`Recovered::vote_floor`]): a replica added again with an empty log
+    /// must not vote for a removed one that never learned of its removal.
     pub fn release_retiring_voters(&mut self) {
         if self.role != Role::Leader
             || self
@@ -1074,7 +1093,23 @@ impl<N: NodeId> Core<N> {
                         continue;
                     }
                     if heard(member).is_some_and(|at| at + high > self.now) {
-                        self.peer_alive(member);
+                        // A member owed entries counts only while it answers
+                        // over Raft now and then: a leader whose frames go
+                        // unanswered for three times the longer of an
+                        // election timeout and an append's resend steps
+                        // down, however alive the member's node is.
+                        let patience = 3 * high.max(self.cfg.resend_timeout_ms);
+                        let answering = self.leader.as_ref().is_some_and(|leader| {
+                            leader.match_index.get(&member).copied().unwrap_or(0)
+                                >= self.log.last_index()
+                                || leader
+                                    .answered
+                                    .get(&member)
+                                    .is_some_and(|at| at + patience > self.now)
+                        });
+                        if answering {
+                            self.peer_alive(member);
+                        }
                     } else {
                         silent.insert(member);
                     }
@@ -1508,6 +1543,16 @@ impl<N: NodeId> Core<N> {
 
     // ── Votes ──────────────────────────────────────────────
 
+    /// Whether a candidate whose log ends at (`last_index`, `last_term`)
+    /// holds everything this replica holds, or held before a wipe.
+    fn log_reached(&self, last_index: u64, last_term: u64) -> bool {
+        let mut own = (self.log.last_term(), self.log.last_index());
+        if let Some((index, term)) = self.vote_floor {
+            own = own.max((term, index));
+        }
+        (last_term, last_index) >= own
+    }
+
     fn on_vote(&mut self, from: N, term: u64, candidate: N, last_index: u64, last_term: u64) {
         if candidate != from {
             return;
@@ -1525,9 +1570,8 @@ impl<N: NodeId> Core<N> {
         if term > self.term {
             self.adopt_term(term);
         }
-        let up_to_date = last_term > self.log.last_term()
-            || (last_term == self.log.last_term() && last_index >= self.log.last_index());
-        let granted = up_to_date && self.vote.is_none_or(|vote| vote == candidate);
+        let granted = self.log_reached(last_index, last_term)
+            && self.vote.is_none_or(|vote| vote == candidate);
         let answer = Message::VoteAnswer {
             term: self.term,
             granted,
@@ -1593,8 +1637,7 @@ impl<N: NodeId> Core<N> {
             self.send(from, refuse);
             return;
         }
-        let up_to_date = last_term > self.log.last_term()
-            || (last_term == self.log.last_term() && last_index >= self.log.last_index());
+        let up_to_date = self.log_reached(last_index, last_term);
         self.send(
             from,
             Message::PreVoteAnswer {
@@ -2346,6 +2389,7 @@ impl<N: NodeId> Core<N> {
 
     fn rebuild_leader_tracking(&mut self) {
         let next = self.log.last_index() + 1;
+        let now = self.now;
         let me = self.cfg.me;
         let mut members = self.effective.all_members();
         members.extend(self.retiring_voters.keys().copied());
@@ -2360,6 +2404,7 @@ impl<N: NodeId> Core<N> {
             }
             leader.next_index.entry(member).or_insert(next);
             leader.match_index.entry(member).or_insert(0);
+            leader.answered.entry(member).or_insert(now);
         }
         leader
             .next_index
@@ -2376,6 +2421,7 @@ impl<N: NodeId> Core<N> {
         leader
             .acked_round
             .retain(|member, _| members.contains(member));
+        leader.answered.retain(|member, _| members.contains(member));
     }
 
     fn start_membership_change(&mut self, members: Vec<N>) -> Result<u64, ChangeMembershipError> {

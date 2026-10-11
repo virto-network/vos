@@ -29,6 +29,8 @@ struct State {
     loss: u32,
     /// Directed links that lose frames of their own, out of a million.
     link_loss: HashMap<(NodeNumber, NodeNumber), u32>,
+    /// Directed links that lose every frame of one class.
+    class_cut: HashSet<(NodeNumber, NodeNumber, Class)>,
     /// Frames sent through the hub, by class, lost or not.
     sent: HashMap<Class, u64>,
     random: u64,
@@ -70,6 +72,7 @@ impl Hub {
                 cut: HashSet::new(),
                 loss: 0,
                 link_loss: HashMap::new(),
+                class_cut: HashSet::new(),
                 sent: HashMap::new(),
                 random: seed | 1,
                 delay: Duration::ZERO,
@@ -136,6 +139,13 @@ impl Hub {
         let mut state = self.state();
         state.cut.clear();
         state.link_loss.clear();
+        state.class_cut.clear();
+    }
+
+    /// Lose every frame of `class` from `from` to `to`, the others going
+    /// through: a gray failure.
+    pub fn cut_class(&self, from: NodeNumber, to: NodeNumber, class: Class) {
+        self.state().class_cut.insert((from, to, class));
     }
 
     /// Lose `per_million` of every million frames between `a` and `b`,
@@ -272,7 +282,10 @@ impl Network for Endpoint {
         };
         *state.sent.entry(class).or_insert(0) += 1;
         // A peer that is down, or cut off, loses what is sent to it.
-        if !state.endpoints.contains_key(&to) || state.cut.contains(&(self.number, to)) {
+        if !state.endpoints.contains_key(&to)
+            || state.cut.contains(&(self.number, to))
+            || state.class_cut.contains(&(self.number, to, class))
+        {
             return Ok(());
         }
         let loss = state

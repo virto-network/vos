@@ -194,6 +194,8 @@ pub struct Store<N: NodeId> {
     log_start_config: Option<ActiveConfigRecord<N>>,
     applied: u64,
     unsynced: VecDeque<Op<N>>,
+    /// The last log position held before a retirement wiped the rest.
+    vote_floor: Option<(u64, u64)>,
 }
 
 impl<N: NodeId> Default for Store<N> {
@@ -205,6 +207,7 @@ impl<N: NodeId> Default for Store<N> {
             log_start_config: None,
             applied: 0,
             unsynced: VecDeque::new(),
+            vote_floor: None,
         }
     }
 }
@@ -299,7 +302,38 @@ impl<N: NodeId> Store<N> {
             active_config: self.active_config.clone(),
             log_start_config: self.log_start_config.clone(),
             applied: self.applied,
+            vote_floor: self.vote_floor,
         }
+    }
+
+    /// Retire: the log, state and configuration go; the term and vote
+    /// stay, and so does the last log position held, as the floor of
+    /// every vote it gives if it is added again.
+    fn retire(&mut self, keep_floor: bool) {
+        self.sync();
+        let last = self.log.last_key_value().map_or(
+            (self.meta.snap_last_index, self.meta.snap_last_term),
+            |(index, entry)| (*index, entry.term),
+        );
+        self.vote_floor = keep_floor.then(|| {
+            let (index, term) = last;
+            self.vote_floor.map_or(last, |floor| {
+                if (floor.1, floor.0) > (term, index) {
+                    floor
+                } else {
+                    last
+                }
+            })
+        });
+        self.log.clear();
+        self.meta = Meta {
+            current_term: self.meta.current_term,
+            voted_for: self.meta.voted_for,
+            ..Meta::default()
+        };
+        self.active_config = None;
+        self.log_start_config = None;
+        self.applied = 0;
     }
 
     /// The entry at `index` as written so far, durable or not.
@@ -374,6 +408,11 @@ pub struct Cluster {
     pub changes_started: u64,
     /// Raft messages sent, by sender and receiver.
     pub raft_sent: BTreeMap<(u16, u16), u64>,
+    /// Retirements, across all nodes.
+    pub retirements: u64,
+    /// Nodes retired, running no group until a configuration names them
+    /// again.
+    retired: BTreeSet<u16>,
     /// The hosts' pair heartbeats, when on.
     pair: Option<Pair>,
     next_token: u64,
@@ -435,6 +474,8 @@ impl Cluster {
             loads: 0,
             changes_started: 0,
             raft_sent: BTreeMap::new(),
+            retirements: 0,
+            retired: BTreeSet::new(),
             pair: None,
             next_token: 0,
         };
@@ -522,11 +563,17 @@ impl Cluster {
         }
     }
 
+    /// Start `node` again: a new run of its host, and its group.
     fn start(&mut self, node: u16) {
         if let Some(pair) = self.pair.as_mut() {
             *pair.incarnations.entry(node).or_insert(0) += 1;
             pair.rounds.remove(&node);
         }
+        self.start_group(node);
+    }
+
+    /// Start `node`'s group from its store.
+    fn start_group(&mut self, node: u16) {
         let mut cfg = self.cfg.clone();
         cfg.me = node;
         let seed = self.random.next_u64();
@@ -560,7 +607,7 @@ impl Cluster {
     }
 
     pub fn restart(&mut self, node: u16) {
-        if self.cores.get(&node).is_some_and(Option::is_none) {
+        if !self.retired.contains(&node) && self.cores.get(&node).is_some_and(Option::is_none) {
             self.start(node);
         }
     }
@@ -626,6 +673,44 @@ impl Cluster {
             core.release_retiring_voters();
             self.process(node);
         }
+    }
+
+    /// `node`'s host retires it, as its directory said a committed final
+    /// configuration dropped it: its group stops, and its log and state
+    /// go, its term, vote and vote floor kept. `keep_floor` false retires
+    /// as a host that kept no floor would.
+    pub fn retire(&mut self, node: u16, keep_floor: bool) {
+        if self.cores.get(&node).is_none_or(Option::is_none) {
+            return;
+        }
+        self.stores
+            .get_mut(&node)
+            .expect("a node")
+            .retire(keep_floor);
+        self.applied.insert(node, 0);
+        self.sync_due.remove(&node);
+        self.entry_reports.remove(&node);
+        self.cores.insert(node, None);
+        self.retired.insert(node);
+        self.retirements += 1;
+    }
+
+    /// A configuration names retired `node` again: its host starts its
+    /// group, empty, from the members the group was created with.
+    pub fn readmit(&mut self, node: u16) {
+        if self.retired.remove(&node) {
+            self.start_group(node);
+        }
+    }
+
+    pub fn is_retired(&self, node: u16) -> bool {
+        self.retired.contains(&node)
+    }
+
+    /// Whether `node`'s store holds anything of the group's log or state.
+    pub fn holds_replica(&self, node: u16) -> bool {
+        let store = &self.stores[&node];
+        !store.log.is_empty() || store.applied > 0 || store.meta.snap_last_index > 0
     }
 
     /// Run for `millis` of simulated time.

@@ -728,7 +728,7 @@ with it, but pinned blobs (programs) do:
 - the switch batch is written only once every one is durable (as
   invariant 6).
 
-### 3.8 Many active agents (item 16)
+### 3.8 Many active agents (item 16) [done]
 
 Writer batching across agents, scheduling under load, combined
 heartbeats and quiescence. Tests with 64 active agents and 1,000 idle

@@ -59,20 +59,38 @@ async fn take(arrivals: &Arrivals) -> Option<(Class, Incoming)> {
 pub(crate) async fn resend_records(inner: Arc<Inner>) {
     loop {
         smol::Timer::after(RESEND).await;
-        let pending: Vec<(AgentId, Vec<NodeNumber>)> = inner
+        let pending: Vec<(AgentId, Order, Vec<NodeNumber>)> = inner
             .unacknowledged
             .lock()
             .expect("the unacknowledged records")
             .iter()
-            .map(|(agent, (_, nodes))| (*agent, nodes.iter().copied().collect()))
+            .map(|(agent, (order, nodes))| (*agent, *order, nodes.iter().copied().collect()))
             .collect();
-        for (agent, nodes) in pending {
+        for (agent, announced, nodes) in pending {
             let known = inner
                 .directory
                 .lock()
                 .expect("the directory")
                 .get(&agent)
                 .cloned();
+            // A placement held since from elsewhere is its sender's to
+            // announce: this node may not even be one that may send it.
+            if known
+                .as_ref()
+                .is_some_and(|known| known.placement.order() != announced)
+            {
+                let mut unacknowledged = inner
+                    .unacknowledged
+                    .lock()
+                    .expect("the unacknowledged records");
+                if unacknowledged
+                    .get(&agent)
+                    .is_some_and(|(order, _)| *order == announced)
+                {
+                    unacknowledged.remove(&agent);
+                }
+                continue;
+            }
             if let Some(known) = known {
                 let message = PeerMessage::Directory {
                     record: known.record,

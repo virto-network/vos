@@ -351,6 +351,7 @@ pub fn recovered(rows: RaftRows) -> Recovered<NodeNumber> {
         active_config: rows.membership.map(record),
         log_start_config: rows.log_start_membership.map(record),
         applied: rows.applied,
+        vote_floor: rows.vote_floor,
     }
 }
 

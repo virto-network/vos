@@ -239,8 +239,10 @@ fn main() {
             last >= floor,
             "round {round}: the log ends at {last}, but {reported} was reported synced"
         );
+        // Nothing reported synced owes no term.
+        let owed = if floor == 0 { 0 } else { term_of(floor) };
         assert!(
-            rows.hard.term >= term_of(floor),
+            rows.hard.term >= owed,
             "round {round}: term {} after {reported} was reported",
             rows.hard.term
         );

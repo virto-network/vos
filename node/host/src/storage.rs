@@ -115,6 +115,7 @@ pub enum Change {
         agent: AgentId,
         epoch: u8,
         hard: HardState,
+        floor: (u64, u64),
     },
     /// The time and seed of the work result applied in the same commit.
     LastResult {
@@ -412,8 +413,13 @@ impl Writer {
                     Change::Barrier => {}
                     Change::Agent(record) => batch.agent(record),
                     Change::Placement { agent, placement } => batch.placement(*agent, placement),
-                    Change::Retire { agent, epoch, hard } => {
-                        batch.retire(*agent, *epoch, hard);
+                    Change::Retire {
+                        agent,
+                        epoch,
+                        hard,
+                        floor,
+                    } => {
+                        batch.retire(*agent, *epoch, hard, *floor);
                         retired.push(*agent);
                     }
                     Change::LastResult { agent, time, seed } => {
@@ -785,6 +791,7 @@ mod tests {
             agent: A,
             epoch,
             hard: HardState::default(),
+            floor: (7, 2),
         };
         commit(apply(1)).unwrap();
         commit(Change::Stage {
@@ -804,6 +811,10 @@ mod tests {
             writes: Vec::new(),
         })
         .unwrap();
+        // The last log position it held stays, for the votes it gives.
+        drop(writer);
+        let store = Fjall::open(dir.path()).unwrap();
+        assert_eq!(store.raft(A).unwrap().vote_floor, Some((7, 2)));
     }
 
     /// Holds every commit until released.

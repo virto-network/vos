@@ -39,6 +39,7 @@ fn follower(term: u64, terms: &[u64], commit: u64) -> Core<u16> {
         active_config: None,
         log_start_config: None,
         applied: commit,
+        vote_floor: None,
     };
     let mut core = Core::new(config(), recovered, 0, 7);
     core.take_actions();
@@ -539,6 +540,7 @@ fn a_rejection_moves_the_probe_past_the_conflicting_term() {
         active_config: None,
         log_start_config: None,
         applied: 3,
+        vote_floor: None,
     };
     let mut core = Core::new(cfg, recovered, 0, 5);
     core.take_actions();
@@ -996,6 +998,7 @@ fn a_candidate_that_discards_ignores_grants_for_its_longer_log() {
         active_config: None,
         log_start_config: None,
         applied: 10,
+        vote_floor: None,
     };
     let mut core = Core::new(cfg, recovered, 0, 7);
     core.take_actions();
@@ -1081,6 +1084,7 @@ fn a_truncation_falls_back_to_the_log_start_configuration() {
         active_config: Some(at_start.clone()),
         log_start_config: Some(at_start),
         applied: 12,
+        vote_floor: None,
     };
     let mut core = Core::new(config(), recovered, 0, 7);
     core.take_actions();
@@ -1138,6 +1142,7 @@ fn an_unknown_log_start_configuration_is_never_sent() {
         }),
         log_start_config: None,
         applied: 12,
+        vote_floor: None,
     };
     let mut core = Core::new(cfg, recovered, 0, 3);
     core.take_actions();
@@ -1556,6 +1561,7 @@ fn recovery_takes_the_later_of_the_record_and_the_logs_start() {
             joint_old: None,
         }),
         applied: 192,
+        vote_floor: None,
     };
     let core = Core::new(config(), recovered, 0, 5);
     let status = core.status();
@@ -1584,6 +1590,7 @@ fn a_recovered_joint_configuration_is_finalized_by_its_leader() {
         }),
         log_start_config: None,
         applied: 20,
+        vote_floor: None,
     };
     let mut cfg = config();
     cfg.pre_vote = false;
@@ -1591,4 +1598,99 @@ fn a_recovered_joint_configuration_is_finalized_by_its_leader() {
     core.take_actions();
     let actions = lead_with_a(&mut core, 1_000);
     assert_eq!(finals(&actions), vec![members]);
+}
+
+#[test]
+fn a_wiped_replica_votes_only_for_a_log_reaching_what_it_held() {
+    // Its log and state were wiped; it last held up to index 40, term 3.
+    let recovered = Recovered {
+        meta: Meta {
+            current_term: 3,
+            ..Meta::default()
+        },
+        vote_floor: Some((40, 3)),
+        ..Recovered::default()
+    };
+    let mut core = Core::new(config(), recovered, 0, 7);
+    core.take_actions();
+    let refused = |actions: &[Action<u16>]| {
+        sent(actions).iter().any(|message| {
+            matches!(
+                message,
+                Message::PreVoteAnswer { granted: false, .. }
+                    | Message::VoteAnswer { granted: false, .. }
+            )
+        })
+    };
+    // A candidate whose log ends behind it, though ahead of its empty
+    // log, is refused both.
+    core.receive(
+        LEADER_A,
+        Message::PreVote {
+            next_term: 4,
+            candidate: LEADER_A,
+            last_index: 30,
+            last_term: 3,
+        },
+    );
+    assert!(refused(&core.take_actions()));
+    core.receive(
+        LEADER_A,
+        Message::Vote {
+            term: 4,
+            candidate: LEADER_A,
+            last_index: 30,
+            last_term: 3,
+        },
+    );
+    // The refusal leaves once the term it adopted is durable.
+    let term = writes(&core.take_actions()).last().unwrap().clone();
+    persist(&mut core, &term);
+    assert!(refused(&core.take_actions()));
+    // One whose log reaches it gets the vote.
+    core.receive(
+        LEADER_B,
+        Message::Vote {
+            term: 5,
+            candidate: LEADER_B,
+            last_index: 40,
+            last_term: 3,
+        },
+    );
+    let vote = writes(&core.take_actions()).last().unwrap().clone();
+    persist(&mut core, &vote);
+    assert!(sent(&core.take_actions()).contains(&Message::VoteAnswer {
+        term: 5,
+        granted: true,
+    }));
+}
+
+#[test]
+fn a_leader_whose_appends_go_unanswered_steps_down_though_the_node_is_heard() {
+    let mut core = leader_of_two_with(|cfg| {
+        cfg.idle_heartbeats = false;
+        cfg.resend_timeout_ms = 100;
+    });
+    core.receive(LEADER_A, acked(1, 1));
+    core.take_actions();
+    // Idle and caught up, A's node heard is enough for check-quorum.
+    core.vouch(1_000 + 250, |_, _| None, |_| Some(1_000 + 240));
+    core.tick(1_000 + 310);
+    core.take_actions();
+    assert_eq!(core.role(), Role::Leader);
+    // An entry A never answers for: its node's pair heartbeat counts while
+    // A answered lately, then no more, and a window deposes the leader.
+    core.propose(1, vec![1]);
+    let write = writes(&core.take_actions()).last().unwrap().clone();
+    persist(&mut core, &write);
+    core.take_actions();
+    // Patience here is three election timeouts: 900 ms.
+    core.vouch(1_000 + 890, |_, _| None, |_| Some(1_000 + 880));
+    core.tick(1_000 + 910);
+    core.take_actions();
+    assert_eq!(core.role(), Role::Leader, "A answered at 1,000");
+    core.vouch(1_000 + 1_190, |_, _| None, |_| Some(1_000 + 1_180));
+    core.tick(1_000 + 1_210);
+    core.take_actions();
+    assert_eq!(core.role(), Role::Follower);
 }

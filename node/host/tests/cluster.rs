@@ -1841,3 +1841,50 @@ fn the_groups_of_a_node_whose_writer_stalls_elect_elsewhere() {
         assert_ne!(cluster.leader(agent), 1);
     }
 }
+
+/// A leader that still believes it leads, though its followers elected
+/// another that replaced it, retires once it hears the committed final
+/// placement: its Raft frames, both ways, and its pair heartbeat to its
+/// followers are lost, while it still hears theirs.
+#[test]
+fn a_stale_leader_left_out_of_the_configuration_retires() {
+    let cluster = Cluster::new(4);
+    let agent = cluster.node(1).create_replicated(vec![1, 2, 3]).unwrap();
+    cluster.install(agent);
+    let stale = cluster.leader(agent);
+    let followers: Vec<NodeNumber> = (1..=3).filter(|number| *number != stale).collect();
+    for &follower in &followers {
+        cluster
+            .hub
+            .cut_class(stale, follower, vos_net::Class::Consensus);
+        cluster
+            .hub
+            .cut_class(follower, stale, vos_net::Class::Consensus);
+        cluster
+            .hub
+            .cut_class(stale, follower, vos_net::Class::Liveness);
+    }
+    let next = loop {
+        let leading: Vec<NodeNumber> = followers
+            .iter()
+            .copied()
+            .filter(|number| cluster.node(*number).leads(agent))
+            .collect();
+        if let [next] = leading[..] {
+            break next;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert!(
+        cluster.node(stale).leads(agent),
+        "the stale one still leads"
+    );
+    let mut replicas: Vec<NodeNumber> = followers.iter().copied().chain([4]).collect();
+    replicas.sort_unstable();
+    assert_eq!(
+        cluster.node(next).replace(agent, stale, 4).unwrap(),
+        replicas
+    );
+    cluster.hub.heal();
+    retired(cluster.node(stale), agent);
+}

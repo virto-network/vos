@@ -177,6 +177,10 @@ pub struct RaftRows {
     pub applied: u64,
     /// The log after its start, in order.
     pub log: Vec<(u64, LogEntry)>,
+    /// The last log position (index, term) held before a retirement wiped
+    /// the log: if the agent is added here again, this replica votes only
+    /// for candidates whose log reaches it.
+    pub vote_floor: Option<(u64, u64)>,
 }
 
 /// Whether a commit returns before or after its data reaches the disk.
@@ -314,8 +318,9 @@ pub trait Batch {
     /// Retire the agent from this node: its log, applied index, log start,
     /// membership and last result go, its state moves to the stale epoch
     /// before `epoch`, and of its hard state only the term and vote stay
-    /// (`hard`), so it never votes twice in a term if added again.
-    fn retire(&mut self, agent: AgentId, epoch: u8, hard: &HardState);
+    /// (`hard`), so it never votes twice in a term if added again. `floor`,
+    /// the last log position it held, bounds the votes it gives then.
+    fn retire(&mut self, agent: AgentId, epoch: u8, hard: &HardState, floor: (u64, u64));
 
     /// The time and seed of the last work result applied to `agent`.
     fn last_result(&mut self, agent: AgentId, time: u64, seed: &[u8; 32]);
@@ -360,6 +365,7 @@ enum NodeRow {
     LastResult = 0x0b,
     Placement = 0x0c,
     Incarnation = 0x0d,
+    VoteFloor = 0x0e,
 }
 
 fn agent_key(agent: AgentId, epoch: u8, key: &[u8]) -> Vec<u8> {
@@ -779,6 +785,10 @@ impl Store for Fjall {
             .and_then(|bytes| be_u64(&bytes))
             .unwrap_or(0);
         let log = self.log_range(agent, log_start.0 + 1, u64::MAX, usize::MAX)?;
+        let vote_floor = self
+            .system
+            .get(node_row(agent, NodeRow::VoteFloor, &[]))?
+            .and_then(|bytes| Some((be_u64(bytes.get(..8)?)?, be_u64(bytes.get(8..16)?)?)));
         Ok(RaftRows {
             hard,
             log_start,
@@ -786,6 +796,7 @@ impl Store for Fjall {
             membership,
             applied,
             log,
+            vote_floor,
         })
     }
 
@@ -1245,7 +1256,12 @@ impl Batch for FjallBatch {
         );
     }
 
-    fn retire(&mut self, agent: AgentId, epoch: u8, hard: &HardState) {
+    fn retire(&mut self, agent: AgentId, epoch: u8, hard: &HardState, floor: (u64, u64)) {
+        self.batch.insert(
+            &self.store.system,
+            node_row(agent, NodeRow::VoteFloor, &[]),
+            [floor.0.to_be_bytes(), floor.1.to_be_bytes()].concat(),
+        );
         let read = self
             .store
             .agent_rows(agent)

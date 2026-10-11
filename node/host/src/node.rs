@@ -429,8 +429,9 @@ pub(crate) struct Inner {
     /// The low 24 bits of the next agent id this node makes.
     next_agent: smol::lock::Mutex<u32>,
     pub(crate) runtime: Arc<smol::Executor<'static>>,
-    /// Node-wide tasks: the dispatcher and the directory's resends.
-    tasks: Mutex<Vec<smol::Task<()>>>,
+    /// Node-wide tasks: the dispatcher, the directory's resends, and the
+    /// work groups hand off.
+    tasks: Mutex<Tasks>,
     /// Held while a creation record is checked and stored, so two records
     /// for one id are never both written.
     pub(crate) recording: smol::lock::Mutex<()>,
@@ -691,26 +692,19 @@ impl Inner {
                     );
                     return;
                 }
-                // Created with it, a member; added later, a member of the
-                // configuration before, so it never campaigns until the
-                // configuration naming it reaches it.
-                let members = if known.placement.index == 0 {
-                    known.record.replicas.clone()
-                } else {
-                    known
-                        .placement
-                        .before
-                        .iter()
-                        .copied()
-                        .filter(|node| *node != self.number)
-                        .collect()
-                };
+                // The members it was created with, the log's first
+                // configuration, used until its store holds another: a
+                // replica added later is none of them, so it never
+                // campaigns until the configuration naming it reaches it.
+                let members = known.record.replicas.clone();
                 self.start(known.record, members);
             }
             Some(run) if !named => {
                 let state = run.shared.state();
+                // A replica a committed final placement leaves out is stale
+                // whatever it believes, its leadership included.
                 let committed_final = known.placement.committed && !known.placement.joint;
-                if !state.established || (committed_final && state.role != Role::Leader) {
+                if !state.established || committed_final {
                     self.retire_agent(agent);
                 }
             }
@@ -764,10 +758,21 @@ impl Inner {
             for row in snapshot.scan(agent, &vos_wire::keys::installed_prefix(), None) {
                 programs.push(row?.1);
             }
-            let hard = self.store.raft(agent)?.hard;
-            Ok::<_, fjall::Error>((group::programs(programs.iter()), hard))
+            let rows = self.store.raft(agent)?;
+            // The last log position held: the log's end, else where it
+            // starts, and no lower than a floor an earlier retirement left.
+            let mut floor = rows
+                .log
+                .last()
+                .map_or(rows.log_start, |(index, entry)| (*index, entry.term));
+            if let Some(earlier) = rows.vote_floor
+                && (earlier.1, earlier.0) > (floor.1, floor.0)
+            {
+                floor = earlier;
+            }
+            Ok::<_, fjall::Error>((group::programs(programs.iter()), rows.hard, floor))
         })();
-        let (programs, hard) = match read {
+        let (programs, hard, floor) = match read {
             Ok(read) => read,
             Err(error) => {
                 tracing::error!(agent = agent.0, "a retiring agent is unreadable: {error}");
@@ -782,6 +787,7 @@ impl Inner {
             agent,
             epoch,
             hard: crate::store::HardState { commit: 0, ..hard },
+            floor,
         }];
         changes.extend(
             programs
@@ -1329,9 +1335,28 @@ impl Inner {
             return;
         }
         let task = self.runtime.spawn(task);
-        let mut tasks = self.tasks.lock().expect("the node's tasks");
-        tasks.retain(|task| !task.is_finished());
-        tasks.push(task);
+        self.tasks.lock().expect("the node's tasks").push(task);
+    }
+}
+
+/// The node's tasks, finished ones dropped whenever the list has doubled
+/// since: a spawn costs the same however many tasks run.
+#[derive(Default)]
+struct Tasks {
+    list: Vec<smol::Task<()>>,
+    prune_at: usize,
+}
+
+impl Tasks {
+    /// The fewest tasks the list holds before it is pruned.
+    const PRUNE_AT: usize = 64;
+
+    fn push(&mut self, task: smol::Task<()>) {
+        if self.list.len() >= self.prune_at {
+            self.list.retain(|task| !task.is_finished());
+            self.prune_at = (2 * self.list.len()).max(Self::PRUNE_AT);
+        }
+        self.list.push(task);
     }
 }
 
@@ -1566,7 +1591,7 @@ impl Node {
             drops: crate::peer::Drops::default(),
             next_agent: smol::lock::Mutex::new(next),
             runtime,
-            tasks: Mutex::new(Vec::new()),
+            tasks: Mutex::new(Tasks::default()),
             recording: smol::lock::Mutex::new(()),
             calls: crate::calls::Calls::default(),
             reads: crate::queries::Reads::default(),
@@ -1867,7 +1892,7 @@ impl Node {
             let _ = stop.try_send(());
             smol::block_on(task);
         }
-        let tasks = std::mem::take(&mut *self.inner.tasks.lock().expect("the node's tasks"));
+        let tasks = std::mem::take(&mut self.inner.tasks.lock().expect("the node's tasks").list);
         let runs: Vec<Arc<Run>> = self
             .inner
             .runs
@@ -1922,4 +1947,34 @@ fn write_token(path: &Path, token: &[u8; 32]) -> std::io::Result<()> {
         .open(path)?;
     file.write_all(hex.as_bytes())?;
     file.sync_all()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Tasks;
+
+    #[test]
+    fn finished_tasks_do_not_pile_up() {
+        let executor = smol::Executor::new();
+        let mut tasks = Tasks::default();
+        for _ in 0..10_000 {
+            tasks.push(executor.spawn(async {}));
+            while executor.try_tick() {}
+        }
+        assert!(
+            tasks.list.len() <= Tasks::PRUNE_AT + 1,
+            "{}",
+            tasks.list.len()
+        );
+        // Tasks still running are kept.
+        let (_hold, held) = smol::channel::bounded::<()>(1);
+        for _ in 0..200 {
+            let held = held.clone();
+            tasks.push(executor.spawn(async move {
+                let _ = held.recv().await;
+            }));
+        }
+        while executor.try_tick() {}
+        assert!(tasks.list.len() >= 200);
+    }
 }

@@ -1062,6 +1062,7 @@ async fn recover<N: NodeId, S: Storage<N>>(storage: &S) -> Result<Recovered<N>, 
         active_config,
         log_start_config,
         applied,
+        vote_floor: None,
     })
 }
 

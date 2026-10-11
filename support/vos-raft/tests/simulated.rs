@@ -88,6 +88,7 @@ struct Exercised {
     compactions: u64,
     loads: u64,
     reads: u64,
+    retirements: u64,
 }
 
 /// A run under harsh faults: short election timeouts, so leaders change
@@ -174,6 +175,12 @@ fn chaos(seed: u64, churn: bool, entry_lag: (u64, u64), paired: bool) -> Exercis
             }
             _ => {}
         }
+        // The hosts' directory, a little late: a replica a committed final
+        // configuration dropped is retired, one a configuration names again
+        // starts empty, and the leader does not wait for removed voters.
+        if paired && churn {
+            directory(&mut cluster, nodes, 200_000);
+        }
         let now = cluster.now;
         down.retain(|&(node, back)| {
             if back <= now {
@@ -197,12 +204,25 @@ fn chaos(seed: u64, churn: bool, entry_lag: (u64, u64), paired: bool) -> Exercis
     for &node in nodes {
         cluster.restart(node);
     }
+    if paired && churn {
+        // The directory reaches every node.
+        for _ in 0..20 {
+            cluster.run(50);
+            directory(&mut cluster, nodes, 1_000_000);
+        }
+    }
     settle(&mut cluster);
     if paired {
         // Healed and idle, every member catches up with no proposal to
         // carry it along.
+        // The members' terms: a replica outside the group may still
+        // campaign, refused, until the directory reaches it.
         let terms = |cluster: &Cluster| -> Vec<Option<u64>> {
-            nodes
+            let members = cluster
+                .leader()
+                .map(|leader| cluster.core(leader).unwrap().status().members)
+                .unwrap_or_default();
+            members
                 .iter()
                 .map(|&node| cluster.core(node).map(|core| core.status().current_term))
                 .collect()
@@ -284,11 +304,42 @@ fn chaos(seed: u64, churn: bool, entry_lag: (u64, u64), paired: bool) -> Exercis
         cluster.violations
     );
     Exercised {
+        retirements: cluster.retirements,
         changes: cluster.changes_started,
         installs: cluster.installs,
         compactions: cluster.compactions,
         loads: cluster.loads,
         reads: cluster.reads.values().filter(|read| read.is_ok()).count() as u64,
+    }
+}
+
+/// The hosts' directory, as the leader's configuration has it: with
+/// `chance` per million, a replica a committed final configuration
+/// dropped is retired, and one a configuration names again starts.
+/// Leaders release removed voters.
+fn directory(cluster: &mut Cluster, nodes: &[u16], chance: u64) {
+    let Some(leader) = cluster.leader() else {
+        return;
+    };
+    cluster.release_retiring_voters(leader);
+    let status = cluster.core(leader).unwrap().status();
+    let named = |node: &u16| {
+        status.members.contains(node)
+            || status
+                .joint_old
+                .as_ref()
+                .is_some_and(|old| old.contains(node))
+    };
+    let settled = status.joint_old.is_none()
+        && status.commit_index >= status.active_config_index.unwrap_or(0);
+    for &node in nodes {
+        if named(&node) {
+            if cluster.is_retired(node) {
+                cluster.readmit(node);
+            }
+        } else if settled && cluster.holds_replica(node) && cluster.random.chance(chance) {
+            cluster.retire(node, true);
+        }
     }
 }
 
@@ -347,20 +398,31 @@ fn safety_holds_when_entries_wait_for_blobs() {
     assert!(total.reads >= 1_000, "reads: {}", total.reads);
 }
 
+/// The chaos runs as a node's host runs its groups: idle heartbeats off,
+/// leaders and members vouched for by the pair heartbeat, and, with
+/// membership changes, removed voters released and dropped replicas
+/// retired (log and state wiped, term, vote and vote floor kept), then
+/// started again empty when a configuration names them.
 #[test]
 fn safety_holds_with_idle_heartbeats_off_and_the_hosts_vouching() {
     let mut total = Exercised::default();
-    for seed in 0..100 {
+    for seed in 0..400 {
         let run = chaos(seed, false, (0, 0), true);
         total.installs += run.installs;
         total.reads += run.reads;
         let run = chaos(1_000 + seed, true, (0, 0), true);
         total.changes += run.changes;
+        total.retirements += run.retirements;
     }
     eprintln!(
-        "installs {}, reads answered {}, changes started {}",
-        total.installs, total.reads, total.changes
+        "installs {}, reads answered {}, changes started {}, retirements {}",
+        total.installs, total.reads, total.changes, total.retirements
     );
-    assert!(total.installs >= 500, "installs: {}", total.installs);
-    assert!(total.changes >= 250, "changes: {}", total.changes);
+    assert!(total.installs >= 2_000, "installs: {}", total.installs);
+    assert!(total.changes >= 1_000, "changes: {}", total.changes);
+    assert!(
+        total.retirements >= 1_000,
+        "retirements: {}",
+        total.retirements
+    );
 }
