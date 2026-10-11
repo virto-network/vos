@@ -68,7 +68,7 @@ pub(crate) struct Calls {
     lanes: Mutex<HashMap<(AgentId, Session), Lane>>,
     /// The calls this replica forwarded, by token, each waiting for its
     /// answer.
-    forwards: Mutex<HashMap<u64, smol::channel::Sender<Answer>>>,
+    forwards: Mutex<HashMap<u64, smol::channel::Sender<(u64, Answer)>>>,
     /// The forwarded calls running here, by the replica that forwarded
     /// them, each by its token: a call forwarded again while it runs is
     /// answered once, when it ends.
@@ -408,7 +408,7 @@ impl Inner {
     async fn forward(self: &Arc<Self>, run: &Arc<Run>, agent: AgentId, call: Call) -> Answer {
         let until = Instant::now() + FORWARDING;
         let token = u64::from_le_bytes(crate::node::seed()[..8].try_into().expect("8 bytes"));
-        let (answer, answered) = smol::channel::unbounded();
+        let (answer, answered) = smol::channel::unbounded::<(u64, Answer)>();
         self.calls
             .forwards
             .lock()
@@ -431,12 +431,15 @@ impl Inner {
         agent: AgentId,
         call: &Call,
         token: u64,
-        answered: &smol::channel::Receiver<Answer>,
+        answered: &smol::channel::Receiver<(u64, Answer)>,
         until: Instant,
     ) -> Answer {
         // How many times the call went: once it went before, nothing the
         // leader answers short of running it says it never ran.
         let mut sent = 0;
+        // A leader at a later term than this replica knows of, as a node
+        // that does not lead named it.
+        let mut named: Option<(NodeNumber, u64)> = None;
         loop {
             let left = until.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -450,9 +453,14 @@ impl Inner {
             if run.agent.queue.lock().expect("the queue").leading {
                 return self.lane_call(agent, call.clone()).await;
             }
-            let (leader, term) = (state.leader, state.term);
+            // The leader this replica follows, or one named at a later term
+            // until this replica's own core reaches it.
+            let (leader, term) = match named {
+                Some((named, at)) if at > state.term => (Some(named), at),
+                _ => (state.leader, state.term),
+            };
             let changed = |state: &crate::group::State| {
-                state.stopped || state.leader != leader || state.term != term
+                state.stopped || state.term > term || (state.term == term && state.leader != leader)
             };
             let Some(to) = leader.filter(|leader| *leader != self.number) else {
                 // No leader known, or this replica leading before its loop
@@ -472,6 +480,7 @@ impl Inner {
                 &PeerMessage::Forward {
                     agent,
                     token,
+                    term,
                     call: call.clone(),
                 },
             );
@@ -485,7 +494,28 @@ impl Inner {
                 None
             };
             match answer.or(moved).or(quiet).await {
-                Some(Answer::Ran { outcome, at }) => {
+                // A node that leads at a later term than this replica
+                // knows, or knows who does: there, at once. One at an
+                // earlier term is behind: this replica waits for its own
+                // core to name a leader, else the two would send the call
+                // back and forth.
+                Some((
+                    answered_at,
+                    Answer::NotLeader {
+                        leader: Some(contact),
+                    },
+                )) if answered_at > term => {
+                    // Never this replica: its own core names itself.
+                    named = self
+                        .number_of(&contact)
+                        .filter(|leader| *leader != self.number)
+                        .map(|leader| (leader, answered_at));
+                    if named.is_none() {
+                        let left = until.saturating_duration_since(Instant::now());
+                        within(PAUSE.min(left), run.shared.wait(changed)).await;
+                    }
+                }
+                Some((_, Answer::Ran { outcome, at })) => {
                     // No reply before its apply here.
                     let left = until.saturating_duration_since(Instant::now());
                     let applied = within(
@@ -503,47 +533,84 @@ impl Inner {
                 // The node it went to does not lead, or could not take it
                 // now: again, once this replica follows another leader, or
                 // after a pause.
-                Some(
+                Some((
+                    _,
                     Answer::NotLeader { .. }
                     | Answer::Elsewhere { .. }
                     | Answer::Stopped
                     | Answer::Unavailable,
-                ) => {
+                )) => {
                     let left = until.saturating_duration_since(Instant::now());
                     within(PAUSE.min(left), run.shared.wait(changed)).await;
                 }
                 // The leader is full: at the first send nothing ran, and
                 // the client may wait and send again. After that, an
                 // earlier send may be running elsewhere: wait here.
-                Some(Answer::Busy) if sent == 1 => return Answer::Busy,
-                Some(Answer::Busy) => {
+                Some((_, Answer::Busy)) if sent == 1 => return Answer::Busy,
+                Some((_, Answer::Busy)) => {
                     let left = until.saturating_duration_since(Instant::now());
                     within(REFORWARD.min(left), run.shared.wait(changed)).await;
                 }
                 // Answers that say the call did not run, about one send of
                 // several: another may still run it.
-                Some(Answer::Rejected(Rejection::StaleSession { .. }) | Answer::NotConsumed)
-                    if sent > 1 =>
-                {
+                Some((
+                    _,
+                    Answer::Rejected(Rejection::StaleSession { .. }) | Answer::NotConsumed,
+                )) if sent > 1 => {
                     return Answer::TimedOut;
                 }
-                Some(Answer::TimedOut) | None => {}
-                Some(answer) => return answer,
+                Some((_, Answer::TimedOut)) | None => {}
+                Some((_, answer)) => return answer,
             }
         }
     }
 
-    /// A call forwarded by `from`, a replica of `agent`: run in its lane,
-    /// in a task of its own, and answered to `from`.
+    /// A call forwarded by `from`, a replica of `agent`, to this replica
+    /// as its leader at `term`: run in its lane, in a task of its own, and
+    /// answered to `from`. A replica not leading at that term, whether it
+    /// leads at another or leads nothing, answers who it knows leads, and
+    /// at what term: a copy the network held across a redial runs no
+    /// later than its sender meant.
     pub(crate) fn on_forward(
         self: &Arc<Self>,
         from: NodeNumber,
         agent: AgentId,
         token: u64,
+        term: u64,
         call: Call,
     ) {
         if let Err(refusal) = self.check_replica(agent, from) {
             self.drops.count(refusal);
+            return;
+        }
+        let Some(run) = self.run(agent) else {
+            // No group here: the forwarder goes again soon, to whoever its
+            // own core names.
+            self.send(
+                from,
+                Class::Requests,
+                &PeerMessage::Forwarded {
+                    agent,
+                    token,
+                    term: 0,
+                    answer: Answer::NotLeader { leader: None },
+                },
+            );
+            return;
+        };
+        let state = run.shared.state();
+        if state.term != term || state.role != vos_raft::Role::Leader {
+            let leader = state.leader.and_then(|leader| self.contact(leader));
+            self.send(
+                from,
+                Class::Requests,
+                &PeerMessage::Forwarded {
+                    agent,
+                    token,
+                    term: state.term,
+                    answer: Answer::NotLeader { leader },
+                },
+            );
             return;
         }
         let admitted = {
@@ -562,6 +629,7 @@ impl Inner {
                 &PeerMessage::Forwarded {
                     agent,
                     token,
+                    term,
                     answer: Answer::Busy,
                 },
             );
@@ -576,12 +644,14 @@ impl Inner {
             };
             let answer = inner.lane_call(agent, call).await;
             drop(running);
+            let term = inner.run(agent).map_or(term, |run| run.shared.state().term);
             inner.send(
                 from,
                 Class::Requests,
                 &PeerMessage::Forwarded {
                     agent,
                     token,
+                    term,
                     answer,
                 },
             );
@@ -595,6 +665,7 @@ impl Inner {
         from: NodeNumber,
         agent: AgentId,
         token: u64,
+        term: u64,
         answer: Answer,
     ) {
         if let Err(refusal) = self.check_replica(agent, from) {
@@ -610,7 +681,7 @@ impl Inner {
             .cloned();
         match waiting {
             Some(waiting) => {
-                let _ = waiting.try_send(answer);
+                let _ = waiting.try_send((term, answer));
             }
             None => self.drops.count(Refusal::Unmatched),
         }

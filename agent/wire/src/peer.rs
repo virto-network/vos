@@ -65,18 +65,22 @@ pub enum PeerMessage {
         runs: bool,
     },
     /// A client's call to `agent`, whose signature the sending replica
-    /// checked, for the leader to run. `token` names it across re-forwards.
+    /// checked, for the leader to run. `token` names it across re-forwards;
+    /// `term` is the term the sender knows the receiver to lead at, and
+    /// the receiver runs it only while it leads at that term.
     #[codec(index = 9)]
     Forward {
         agent: AgentId,
         token: u64,
+        term: u64,
         call: Call,
     },
-    /// The leader's answer to a forwarded call.
+    /// The answer to a forwarded call, and the answering replica's term.
     #[codec(index = 10)]
     Forwarded {
         agent: AgentId,
         token: u64,
+        term: u64,
         answer: Answer,
     },
     /// A replica of `agent` asks its leader for a read index.

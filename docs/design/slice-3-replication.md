@@ -734,7 +734,7 @@ Writer batching across agents, scheduling under load, combined
 heartbeats and quiescence. Tests with 64 active agents and 1,000 idle
 groups, including a flaky link.
 
-### 3.9 Faults across processes
+### 3.9 Faults across processes [done]
 
 The checker's faults on three processes: kills, restarts, partitions
 between processes, slow and stalled disks.

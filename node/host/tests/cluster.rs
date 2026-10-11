@@ -6,6 +6,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use smol::future::FutureExt;
 use vos_net::memory::Hub;
 use vos_node::store::{Batch as _, Durability, EntryKind, Fjall, Store, View};
 use vos_node::{CallError, Config, Hooks, Node, Peers, Reply, Space, SpaceNode};
@@ -81,6 +82,9 @@ struct Cluster {
     /// Compaction every so many entries, keeping a tail, and snapshot
     /// chunks of about so many bytes, when not the defaults.
     compaction: Option<(u64, u64, usize)>,
+    /// How long a leader waits for a snapshot's acknowledgement, when not
+    /// the default.
+    snapshot_timeout_ms: Option<u64>,
     /// The election timeout's range, when not the fast one.
     election_timeout_ms: Option<(u64, u64)>,
 }
@@ -129,6 +133,7 @@ impl Cluster {
                 t0: vos_node::wall_clock(),
             },
             compaction: None,
+            snapshot_timeout_ms: None,
             election_timeout_ms: None,
         };
         cluster.grow(count);
@@ -199,6 +204,9 @@ impl Cluster {
         };
         config.election_timeout_ms = self.election_timeout_ms.unwrap_or((40, 80));
         config.heartbeat_ms = 10;
+        if let Some(timeout) = self.snapshot_timeout_ms {
+            config.snapshot_timeout_ms = timeout;
+        }
         if let Some((every, tail, chunk)) = self.compaction {
             config.compact_every = every;
             config.compact_tail = tail;
@@ -435,6 +443,92 @@ fn a_flush_failing_outside_any_log_halts_the_node() {
         cluster.node(leader).create_agent().is_err(),
         "its store takes no more"
     );
+}
+
+/// A call forwarded to a replica as its leader at a term it does not lead
+/// at is answered with who leads, at what term, and does not run; sent
+/// at the leader's term, it runs once.
+#[test]
+fn a_forward_at_another_term_is_answered_by_who_leads() {
+    let mut cluster = Cluster::new(3);
+    let agent = cluster.node(1).create_replicated(vec![1, 2, 3]).unwrap();
+    wait_until("every replica runs the group", || {
+        (1..=3).all(|number| cluster.node(number).applied(agent).is_some())
+    });
+    cluster.install(agent);
+    let leader = cluster.leader(agent);
+    let term = cluster.node(leader).replica(agent).unwrap().term;
+    // The test stands in for a follower.
+    let follower = leader % 3 + 1;
+    cluster.stop(follower);
+    let (endpoint, arrivals) = cluster.hub.join(follower);
+    vos_net::Network::set_peers(&endpoint, cluster.space.peers());
+    let call = vos_wire::ingress::Call {
+        session: cluster.session,
+        sequence: 1,
+        instance: COUNTER,
+        method: cluster.programs.method("increment"),
+        arguments: 5u64.encode(),
+        signature: [0; 64],
+    };
+    let forward = |token: u64, term: u64| {
+        let message = PeerMessage::Forward {
+            agent,
+            token,
+            term,
+            call: call.clone(),
+        };
+        vos_net::Network::send(
+            &endpoint,
+            leader,
+            vos_net::Class::Requests,
+            vos_node::peer::stream(&message),
+            message.encode(),
+        )
+        .unwrap();
+        // Its answer, past the other requests the leader sends the node.
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            let left = until.saturating_duration_since(Instant::now());
+            let incoming = smol::block_on(async {
+                async { arrivals.requests.recv().await.ok() }
+                    .or(async {
+                        smol::Timer::after(left).await;
+                        None
+                    })
+                    .await
+            })
+            .expect("an answer within 10 s");
+            if let Ok(PeerMessage::Forwarded {
+                token: answered,
+                term,
+                answer,
+                ..
+            }) = vos_node::peer::decode(&incoming.frame)
+                && answered == token
+            {
+                break (term, answer);
+            }
+        }
+    };
+    // A copy held from an earlier term, or sent at a later one.
+    for (token, at) in [(1, term - 1), (2, term + 1)] {
+        let (answered_at, answer) = forward(token, at);
+        assert_eq!(answered_at, term);
+        let vos_wire::ingress::Answer::NotLeader {
+            leader: Some(named),
+        } = answer
+        else {
+            panic!("{answer:?}")
+        };
+        assert_eq!(named.node.0, cluster.space.node(leader).unwrap().key);
+    }
+    let (_, answer) = forward(3, term);
+    assert!(
+        matches!(answer, vos_wire::ingress::Answer::Ran { .. }),
+        "{answer:?}"
+    );
+    assert_eq!(cluster.value(leader, agent), 5, "it ran once");
 }
 
 #[test]
@@ -1039,6 +1133,62 @@ fn a_follower_behind_the_log_catches_up_by_a_snapshot() {
         caught_up.store().stale_epochs(agent).unwrap().is_empty(),
         "the old epoch is dropped"
     );
+}
+
+/// Slows every snapshot chunk, as a slow link would.
+struct SlowChunks(Duration);
+
+impl Hooks for SlowChunks {
+    fn delay_chunk(&self) -> Duration {
+        self.0
+    }
+}
+
+/// A snapshot stream that outlasts the leader's own deadline for it goes
+/// on, and no other starts while it runs: the follower switches to it
+/// once, and catches up.
+#[test]
+fn a_snapshot_stream_outlasting_the_leaders_deadline_goes_on() {
+    let mut cluster = Cluster::build(
+        0,
+        Arc::new(SlowChunks(Duration::from_millis(40))),
+        Vec::new(),
+        false,
+    );
+    cluster.compaction = Some((8, 2, 64));
+    cluster.snapshot_timeout_ms = Some(300);
+    cluster.grow(3);
+    let agent = cluster.node(1).create_replicated(vec![1, 2, 3]).unwrap();
+    let leader = cluster.leader(agent);
+    let follower = (1..=3).find(|number| *number != leader).unwrap();
+    wait_until("the follower runs the group", || {
+        cluster.node(follower).applied(agent).is_some()
+    });
+    cluster.stop(follower);
+    cluster.install(agent);
+    for sequence in 1..=30 {
+        done(cluster.increment(leader, agent, sequence, sequence));
+    }
+    wait_until("the leader compacts", || {
+        log_start(cluster.node(leader), agent) > 20
+    });
+    let started = Instant::now();
+    cluster.start(follower);
+    cluster.converged(agent);
+    let caught_up = cluster.node(follower);
+    assert!(log_start(caught_up, agent) > 20, "installed a snapshot");
+    assert!(
+        started.elapsed() > Duration::from_millis(300),
+        "the stream outlasted the deadline: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(caught_up.snapshots_installed(), 1, "switched once");
+    assert_eq!(
+        cluster.node(leader).snapshots_streamed(),
+        1,
+        "no other stream started"
+    );
+    assert_eq!(cluster.value(follower, agent), (1..=30).sum::<u64>());
 }
 
 /// A replica that caught up by a snapshot holds the sessions with it: once

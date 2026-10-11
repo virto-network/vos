@@ -210,6 +210,7 @@ fn every_other_message_survives_the_wire() {
         PeerMessage::Forwarded {
             agent: AGENT,
             token: 77,
+            term: 6,
             answer: Answer::Ran {
                 outcome: Outcome::Done(vec![1, 2]),
                 at: 40,
@@ -225,6 +226,7 @@ fn forward() -> PeerMessage {
     PeerMessage::Forward {
         agent: AGENT,
         token: 77,
+        term: 6,
         call: Call {
             session: Session {
                 key: [1; 32],

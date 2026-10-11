@@ -82,6 +82,12 @@ pub trait Hooks: Send + Sync {
         true
     }
 
+    /// Before a leader sends a snapshot chunk: how long it waits first, as
+    /// on a slow link.
+    fn delay_chunk(&self) -> std::time::Duration {
+        std::time::Duration::ZERO
+    }
+
     /// Before the storage thread commits: true makes the commit fail with
     /// nothing written, as fjall's first failure does (it then refuses
     /// every later commit, so the node stops).

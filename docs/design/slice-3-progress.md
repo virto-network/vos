@@ -5535,3 +5535,70 @@ folded:
   - a settings line a node cannot read, or a heartbeat not shorter than
     the elections, stops the node at start;
   - `stop_all` pauses every node before killing any.
+
+#### 3.9c Built
+
+**`Forward` carries the forwarder's view of the leader's term,** and
+`Forwarded` its answerer's term (both on the wire, in `PeerMessage`).
+- **The receiver** runs the call only while it leads at that term.
+  Otherwise, whether it leads at another term or leads nothing, it
+  answers `NotLeader`, naming who it knows leads (itself, if it leads at
+  another term), with its own term.
+- **The forwarder** acts on the answer's term:
+  - higher than its own view: it sends the call there at once, carrying
+    that term, and keeps the named leader until its own core reaches
+    that term;
+  - lower or equal: it waits, as before, for its own core to name a
+    leader. Two nodes never send the call back and forth.
+- **Test** (cluster): the test stands in for a follower on the hub, and
+  forwards a call to the leader at a term it does not lead at.
+  - It is answered `NotLeader`, naming the leader at its term, and does
+    not run.
+  - Sent again at the leader's term, it runs once.
+  - Mutation: without the receiver's term check, the call runs at the
+    wrong term, and the test fails.
+- **Not tested on its own:** the forwarder's going at once. Without it a
+  forwarder waits for its own core, which is correct but slower. The
+  checker and fault suites cover its correctness.
+
+**A snapshot stream outlasting the leader's deadline goes on,** as it
+already did. A stream that takes longer than the deadline would never
+finish if it were started over.
+- **When the core's deadline passes,** it asks for another stream. The
+  host starts none while one to that follower runs, and the follower
+  stages only the newest stream it is sent.
+- **The two agree on giving up:**
+  - a stream that falls silent tells the core, as before;
+  - a stream all staged but never switched to, released after its hold,
+    now tells the core too, which sends again at once rather than at
+    its own deadline.
+- **New:**
+  - `Config::snapshot_timeout_ms`, the core's deadline, 60 s by
+    default;
+  - `Hooks::delay_chunk`, which slows a stream;
+  - `Node::snapshots_streamed`, a count of the streams a node started.
+- **Test** (cluster): with the deadline at 300 ms and each 64-byte chunk
+  delayed 40 ms, a stream outlasting the deadline catches a follower up.
+  - The follower switches once, and the leader started no other stream.
+  - Mutation: a host that starts a stream again whenever the core asks
+    started 44, and the test fails.
+
+**Opus's review of 3.9c:** GO. Its nits are folded:
+- **A hint naming the forwarder itself** is never taken as a named
+  leader. A spin it would cause is unreachable today, but only by the
+  order of the core's events.
+- **A forward to a node with no group for the agent** is answered
+  `NotLeader` with no leader, so its forwarder goes again soon rather
+  than after its 2 s.
+- **The test also sends at an earlier term**, the design's case of a
+  copy held across a redial. It reads past other requests to the
+  stand-in, within a deadline.
+- **Doc comments** put back on `Node::leads` and on the window test.
+
+**Carried, a design note:** `Forward` and `Forwarded` gained a field
+under the same codec indexes. Between nodes of two versions, forwards
+would not decode. That is fine before a release, and needs a wire
+version if rolling upgrades are ever promised.
+
+**3.9 is done.** What it leaves for 3.10 is in the lists above and in
+3.8's.

@@ -371,6 +371,7 @@ impl Driver {
         config.election_timeout_ms = inner.election_timeout_ms;
         config.heartbeat_interval_ms = inner.heartbeat_ms;
         config.compact_hysteresis = inner.compact_every;
+        config.snapshot_timeout_ms = inner.snapshot_timeout_ms;
         // The pair heartbeat vouches for an idle group's leader. An idle
         // leader goes round once per check-quorum window, which keeps it
         // listed.
@@ -939,16 +940,26 @@ impl Driver {
     }
 
     /// Release each stream whose follower switched to its snapshot, or
-    /// that waited for it too long.
+    /// that waited for it too long: the core then sends again as soon as
+    /// it would, not once its own deadline passes.
     fn settle_streams(&mut self) {
         let core = &self.core;
+        let mut unswitched = Vec::new();
         let before = self.streams.len();
         self.streams.retain(|to, stream| match stream.staged {
             Some(staged) => {
-                core.match_index(*to).unwrap_or(0) < stream.index && staged.elapsed() < STREAM_HOLD
+                let switched = core.match_index(*to).unwrap_or(0) >= stream.index;
+                let held = !switched && staged.elapsed() < STREAM_HOLD;
+                if !switched && !held {
+                    unswitched.push(*to);
+                }
+                held
             }
             None => true,
         });
+        for to in unswitched {
+            self.core.snapshot_failed(to);
+        }
         if self.streams.len() < before {
             self.compact_due = true;
         }
@@ -1028,6 +1039,9 @@ impl Driver {
                 staged: None,
             },
         );
+        self.inner
+            .streamed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let inner = Arc::clone(&self.inner);
         let shared = Arc::clone(&self.shared);
         let agent = self.agent;
@@ -1510,6 +1524,10 @@ async fn stream(
             })
             .encode();
             window.insert(read, frame.clone());
+            let delay = inner.hooks.delay_chunk();
+            if !delay.is_zero() {
+                smol::Timer::after(delay).await;
+            }
             send(frame).await;
             if end {
                 last = Some(read);

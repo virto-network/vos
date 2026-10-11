@@ -97,6 +97,10 @@ pub struct Config {
     pub compact_tail: u64,
     /// About how many bytes of rows one snapshot chunk carries.
     pub snapshot_chunk: usize,
+    /// How long a leader waits for a follower to acknowledge a snapshot
+    /// before it would send another: one still streaming goes on, and the
+    /// leader starts another only once it ended.
+    pub snapshot_timeout_ms: u64,
 }
 
 impl Config {
@@ -125,6 +129,7 @@ impl Config {
             compact_every: 1024,
             compact_tail: 256,
             snapshot_chunk: 1 << 20,
+            snapshot_timeout_ms: 60_000,
         }
     }
 }
@@ -422,6 +427,7 @@ pub(crate) struct Inner {
     pub(crate) compact_every: u64,
     pub(crate) compact_tail: u64,
     pub(crate) snapshot_chunk: usize,
+    pub(crate) snapshot_timeout_ms: u64,
     /// Every agent this node knows of, and where it runs.
     pub(crate) directory: Mutex<HashMap<AgentId, Known>>,
     /// For each agent whose placement this node announced, its order and
@@ -453,6 +459,8 @@ pub(crate) struct Inner {
     pub(crate) sent_across: std::sync::atomic::AtomicU64,
     /// Snapshots this node's groups switched to.
     pub(crate) installed: std::sync::atomic::AtomicU64,
+    /// Snapshot streams this node's groups started to their followers.
+    pub(crate) streamed: std::sync::atomic::AtomicU64,
     /// The node is shutting down: no group starts or retires.
     pub(crate) closing: std::sync::atomic::AtomicBool,
     /// Agents whose retirement is not yet written: no group starts for
@@ -510,6 +518,16 @@ impl Inner {
             address: node.ingress.clone(),
             node: NodeId(node.key),
         })
+    }
+
+    /// The node `contact` names, by its key.
+    pub(crate) fn number_of(&self, contact: &Contact) -> Option<NodeNumber> {
+        self.space
+            .as_ref()?
+            .nodes()
+            .iter()
+            .find(|node| node.key == contact.node.0)
+            .map(|node| node.number)
     }
 
     /// That this node does not lead `shared`'s group, with its leader's
@@ -1658,6 +1676,7 @@ impl Node {
             compact_every: config.compact_every,
             compact_tail: config.compact_tail,
             snapshot_chunk: config.snapshot_chunk,
+            snapshot_timeout_ms: config.snapshot_timeout_ms,
             directory: Mutex::new(HashMap::new()),
             unacknowledged: Mutex::new(HashMap::new()),
             acknowledged: event_listener::Event::new(),
@@ -1676,6 +1695,7 @@ impl Node {
             turn: std::sync::atomic::AtomicU64::new(0),
             sent_across: std::sync::atomic::AtomicU64::new(0),
             installed: std::sync::atomic::AtomicU64::new(0),
+            streamed: std::sync::atomic::AtomicU64::new(0),
             closing: std::sync::atomic::AtomicBool::new(false),
             retiring: Mutex::new(HashSet::new()),
             halted: std::sync::atomic::AtomicBool::new(false),
@@ -1752,6 +1772,13 @@ impl Node {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Snapshot streams this node started to its followers.
+    pub fn snapshots_streamed(&self) -> u64 {
+        self.inner
+            .streamed
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Messages this node sent toward agents on other nodes, again on
     /// rounds included.
     pub fn messages_sent_across(&self) -> u64 {
@@ -1806,6 +1833,15 @@ impl Node {
     /// Where `agent` runs, as this node last heard.
     pub fn placement(&self, agent: AgentId) -> Option<Placement> {
         self.inner.placement(agent)
+    }
+
+    /// This node's replica of `agent`, as the operator's status route
+    /// reports it, if it runs one.
+    pub fn replica(&self, agent: AgentId) -> Option<vos_wire::ingress::ReplicaStatus> {
+        match self.inner.replica_status(agent) {
+            vos_wire::ingress::Answer::Status(status) => Some(status),
+            _ => None,
+        }
     }
 
     /// Whether this node's replica leads `agent`'s group.

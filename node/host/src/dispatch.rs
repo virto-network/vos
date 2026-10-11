@@ -209,14 +209,18 @@ impl Inner {
                 self.on_ack(from, agent, order, runs)
             }
             // A task of its own runs the call: the dispatcher never waits.
-            PeerMessage::Forward { agent, token, call } => {
-                self.on_forward(from, agent, token, call)
-            }
+            PeerMessage::Forward {
+                agent,
+                token,
+                term,
+                call,
+            } => self.on_forward(from, agent, token, term, call),
             PeerMessage::Forwarded {
                 agent,
                 token,
+                term,
                 answer,
-            } => self.on_forwarded(from, agent, token, answer),
+            } => self.on_forwarded(from, agent, token, term, answer),
             // A task of its own confirms the leadership: the dispatcher
             // never waits.
             PeerMessage::ReadIndex { agent, token } => self.on_read_index(from, agent, token),
