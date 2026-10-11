@@ -7,7 +7,7 @@
 //! replica has applied it, the replies, the outbox's deliveries and the
 //! acknowledgements. Every replica applies the committed log the same way.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::panic::AssertUnwindSafe;
@@ -24,8 +24,8 @@ use vos_pvm::pool::{CodeHash, MachinePool, OuterMachines};
 use vos_raft::Role;
 use vos_wire::batch::{Admin, Input, Message, Query, Request, Work};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash};
-use vos_wire::ingress::{Contact, NodeId};
-use vos_wire::peer::{CreationRecord, NodeNumber};
+use vos_wire::ingress::{Contact, NodeId, Unplaced};
+use vos_wire::peer::{CreationRecord, NodeNumber, Placement};
 use vos_wire::records::unstored;
 use vos_wire::result::{Outcome, Step, Write};
 use vos_wire::{Decode, defaults};
@@ -332,6 +332,16 @@ enum Endpoint {
     Hub(Arc<vos_net::memory::Endpoint>),
 }
 
+/// A placement's order: [`Placement::order`].
+pub(crate) type Order = (u64, u64, bool);
+
+/// What a node knows of an agent: its record, and where it runs.
+#[derive(Clone, Debug)]
+pub(crate) struct Known {
+    pub(crate) record: CreationRecord,
+    pub(crate) placement: Placement,
+}
+
 /// An agent this node replicates: its queue, its group's shared state, the
 /// group's inbox, and their tasks.
 pub(crate) struct Run {
@@ -345,6 +355,25 @@ pub(crate) struct Run {
 
 /// How long a call waits for a new leader to apply what it took over.
 const CATCH_UP: Duration = Duration::from_secs(10);
+/// How long the node a replacement adds has to say it could run the
+/// agent's program, and how long a replacement waits for its final
+/// configuration to commit.
+const CAPABLE: Duration = Duration::from_secs(10);
+const REPLACED: Duration = Duration::from_secs(30);
+/// How long a replacement waits once its node no longer leads: a leader
+/// removing itself steps down as the final configuration commits, and
+/// announces it as it does; another node that took over announces it once
+/// it learns it committed.
+const REPLACED_ELSEWHERE: Duration = Duration::from_secs(2);
+
+/// Why a replica was not replaced.
+#[derive(Debug)]
+pub enum ReplaceError {
+    Call(CallError),
+    Unplaced(Unplaced),
+    /// The change goes on: the agent's placement says where it is.
+    TimedOut,
+}
 
 /// A group's inbox: Raft messages beyond it are dropped, and resent.
 const GROUP_INBOX: usize = 1024;
@@ -381,11 +410,16 @@ pub(crate) struct Inner {
     pub(crate) compact_every: u64,
     pub(crate) compact_tail: u64,
     pub(crate) snapshot_chunk: usize,
-    /// Every agent this node knows of.
-    pub(crate) directory: Mutex<HashMap<AgentId, CreationRecord>>,
-    /// For each agent this node created, the nodes yet to hold its record.
-    pub(crate) unacknowledged: Mutex<HashMap<AgentId, BTreeSet<NodeNumber>>>,
+    /// Every agent this node knows of, and where it runs.
+    pub(crate) directory: Mutex<HashMap<AgentId, Known>>,
+    /// For each agent whose placement this node announced, its order and
+    /// the nodes yet to hold one at least as new.
+    pub(crate) unacknowledged: Mutex<HashMap<AgentId, (Order, BTreeSet<NodeNumber>)>>,
     pub(crate) acknowledged: event_listener::Event,
+    /// For each agent, the nodes that said they could not run its program.
+    pub(crate) refusing: Mutex<HashMap<AgentId, BTreeSet<NodeNumber>>>,
+    /// Who waits to hear whether a node could run an agent's program.
+    pub(crate) capable: Mutex<HashMap<(AgentId, NodeNumber), smol::channel::Sender<bool>>>,
     /// The agents this node replicates.
     pub(crate) runs: Mutex<HashMap<AgentId, Arc<Run>>>,
     dry_runs: Mutex<HashMap<AgentId, DryRun>>,
@@ -406,6 +440,11 @@ pub(crate) struct Inner {
     pub(crate) sent_across: std::sync::atomic::AtomicU64,
     /// Snapshots this node's groups switched to.
     pub(crate) installed: std::sync::atomic::AtomicU64,
+    /// The node is shutting down: no group starts or retires.
+    pub(crate) closing: std::sync::atomic::AtomicBool,
+    /// Agents whose retirement is not yet written: no group starts for
+    /// them until it is.
+    pub(crate) retiring: Mutex<HashSet<AgentId>>,
     /// Messages relayed to their agent's leader.
     pub(crate) relayed: std::sync::atomic::AtomicU64,
     /// Clients' calls: their lanes, and the calls forwarded both ways.
@@ -424,9 +463,10 @@ impl Inner {
     /// names the replicas.
     pub(crate) fn absent(&self, id: AgentId) -> CallError {
         match self.directory.lock().expect("the directory").get(&id) {
-            Some(record) if record.replicas.contains(&self.number) => CallError::Stopped,
-            Some(record) => CallError::Elsewhere(
-                record
+            Some(known) if known.placement.replicas.contains(&self.number) => CallError::Stopped,
+            Some(known) => CallError::Elsewhere(
+                known
+                    .placement
                     .replicas
                     .iter()
                     .filter_map(|replica| self.contact(*replica))
@@ -434,6 +474,15 @@ impl Inner {
             ),
             None => CallError::NoAgent,
         }
+    }
+
+    /// Where agent `id` runs, as this node last heard.
+    pub(crate) fn placement(&self, id: AgentId) -> Option<Placement> {
+        self.directory
+            .lock()
+            .expect("the directory")
+            .get(&id)
+            .map(|known| known.placement.clone())
     }
 
     /// How clients reach node `number`, from the space.
@@ -595,30 +644,209 @@ impl Inner {
         }
     }
 
-    /// Learn of an agent: keep its record, and start its group if this
-    /// node replicates it and runs its program.
-    pub(crate) fn learn(self: &Arc<Self>, record: CreationRecord) {
-        let replicates = record.replicas.contains(&self.number);
+    /// Learn where an agent runs, and act on it.
+    pub(crate) fn learn(self: &Arc<Self>, record: CreationRecord, placement: Placement) {
+        let agent = record.agent;
         self.directory
             .lock()
             .expect("the directory")
-            .insert(record.agent, record.clone());
-        if !replicates || self.run(record.agent).is_some() {
-            return;
-        }
-        if record.program != self.program_hash {
-            tracing::error!(
-                agent = record.agent.0,
-                "the agent runs another agent program than this node's; its group does not start here"
-            );
-            return;
-        }
-        self.start(record);
+            .insert(agent, Known { record, placement });
+        self.reconsider(agent);
     }
 
-    fn start(self: &Arc<Self>, record: CreationRecord) {
+    /// Start the agent's group where its placement names this node, and
+    /// retire it where it no longer does: at once while this replica never
+    /// held a committed configuration naming it (a configuration that never
+    /// committed named it), else once a final configuration without it has
+    /// committed and this replica does not lead.
+    pub(crate) fn reconsider(self: &Arc<Self>, agent: AgentId) {
+        // A group stopping with the node is not started again.
+        if self.closing.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let Some(known) = self
+            .directory
+            .lock()
+            .expect("the directory")
+            .get(&agent)
+            .cloned()
+        else {
+            return;
+        };
+        // A member of the configuration before, while the new one has not
+        // committed, may still be needed to vote.
+        let named = known.placement.admits(self.number);
+        match self.run(agent) {
+            None if named => {
+                if known.record.program != self.program_hash {
+                    tracing::error!(
+                        agent = agent.0,
+                        "the agent runs another agent program than this node's; its group does not start here"
+                    );
+                    return;
+                }
+                // Created with it, a member; added later, a member of the
+                // configuration before, so it never campaigns until the
+                // configuration naming it reaches it.
+                let members = if known.placement.index == 0 {
+                    known.record.replicas.clone()
+                } else {
+                    known
+                        .placement
+                        .before
+                        .iter()
+                        .copied()
+                        .filter(|node| *node != self.number)
+                        .collect()
+                };
+                self.start(known.record, members);
+            }
+            Some(run) if !named => {
+                let state = run.shared.state();
+                let committed_final = known.placement.committed && !known.placement.joint;
+                if !state.established || (committed_final && state.role != Role::Leader) {
+                    self.retire_agent(agent);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Stop the agent's group here for good: its log, state and pins go,
+    /// in a task of their own once the group has stopped; the record, the
+    /// placement and the term and vote stay.
+    fn retire_agent(self: &Arc<Self>, agent: AgentId) {
+        let run = {
+            let mut runs = self.runs.lock().expect("the runs");
+            let Some(run) = runs.remove(&agent) else {
+                return;
+            };
+            self.retiring.lock().expect("the retiring").insert(agent);
+            run
+        };
+        tracing::info!(agent = agent.0, "this node no longer replicates the agent");
+        run.agent.stop();
+        run.shared.stop();
+        run.inbox.close();
+        run.local.close();
+        let inner = Arc::clone(self);
+        self.spawn(async move {
+            let tasks = std::mem::take(&mut *run.tasks.lock().expect("the run's tasks"));
+            for task in tasks {
+                task.await;
+            }
+            inner.finish_retirement(agent).await;
+        });
+    }
+
+    /// Write the agent's retirement, its group stopped, then reconsider
+    /// the agent: a placement naming this node again may have come
+    /// meanwhile.
+    async fn finish_retirement(self: &Arc<Self>, agent: AgentId) {
+        self.write_retirement(agent).await;
+        self.retiring.lock().expect("the retiring").remove(&agent);
+        self.reconsider(agent);
+    }
+
+    /// The agent's state moves to an epoch that holds no rows (not one a
+    /// snapshot was staged in), the programs it named are unpinned, and
+    /// every stale epoch is dropped.
+    async fn write_retirement(&self, agent: AgentId) {
+        let read = (|| {
+            let snapshot = self.store.snapshot();
+            let mut programs = Vec::new();
+            for row in snapshot.scan(agent, &vos_wire::keys::installed_prefix(), None) {
+                programs.push(row?.1);
+            }
+            let hard = self.store.raft(agent)?.hard;
+            Ok::<_, fjall::Error>((group::programs(programs.iter()), hard))
+        })();
+        let (programs, hard) = match read {
+            Ok(read) => read,
+            Err(error) => {
+                tracing::error!(agent = agent.0, "a retiring agent is unreadable: {error}");
+                return;
+            }
+        };
+        let Some(epoch) = group::empty_epoch(self, agent) else {
+            tracing::error!(agent = agent.0, "a retiring agent has no empty epoch");
+            return;
+        };
+        let mut changes = vec![Change::Retire {
+            agent,
+            epoch,
+            hard: crate::store::HardState { commit: 0, ..hard },
+        }];
+        changes.extend(
+            programs
+                .into_iter()
+                .map(|hash| Change::Unpin { hash, agent }),
+        );
+        if let Err(error) = self.storage.commit(changes).await {
+            tracing::error!(agent = agent.0, "an agent did not retire: {error}");
+            return;
+        }
+        group::drop_stale_epochs(self, agent).await;
+    }
+
+    /// Whether this node's store holds anything of `agent`'s replica: a
+    /// log, an applied index, a membership, or rows in any epoch.
+    fn holds_replica(&self, agent: AgentId) -> Result<bool, fjall::Error> {
+        let rows = self.store.raft(agent)?;
+        if !rows.log.is_empty()
+            || rows.applied > 0
+            || rows.log_start.0 > 0
+            || rows.membership.is_some()
+        {
+            return Ok(true);
+        }
+        let current = self.store.snapshot().epoch(agent)?;
+        Ok(self.store.epoch_holds_rows(agent, current)?
+            || !self.store.stale_epochs(agent)?.is_empty())
+    }
+
+    /// Take `placement`, which this node's leadership of the agent gives,
+    /// when it supersedes the one held: kept, acted on, and announced to
+    /// every other node until each holds it. False when it was not kept.
+    pub(crate) async fn place(self: &Arc<Self>, agent: AgentId, placement: Placement) -> bool {
+        let _recording = self.recording.lock().await;
+        let Some(known) = self
+            .directory
+            .lock()
+            .expect("the directory")
+            .get(&agent)
+            .cloned()
+        else {
+            return true;
+        };
+        if !placement.supersedes(&known.placement) {
+            return true;
+        }
+        let change = Change::Placement {
+            agent,
+            placement: placement.clone(),
+        };
+        if let Err(error) = self.storage.commit(vec![change]).await {
+            tracing::warn!(agent = agent.0, "a placement was not kept: {error}");
+            return false;
+        }
+        self.learn(known.record, placement);
+        self.announce(agent);
+        true
+    }
+
+    fn start(self: &Arc<Self>, record: CreationRecord, members: Vec<NodeNumber>) {
+        // Under the runs' lock, which the node's shutdown takes to set
+        // `closing`: a group starts before the shutdown takes the runs, or
+        // not at all.
+        let mut runs = self.runs.lock().expect("the runs");
         let id = record.agent;
-        let shared = Arc::new(Shared::new(record));
+        if self.closing.load(std::sync::atomic::Ordering::SeqCst)
+            || self.retiring.lock().expect("the retiring").contains(&id)
+        {
+            return;
+        }
+        let shared = Arc::new(Shared::new(record, members));
         let agent = Arc::new(Agent::new());
         let (inbox, inputs) = smol::channel::bounded(GROUP_INBOX);
         let (local, locals) = smol::channel::unbounded();
@@ -660,7 +888,7 @@ impl Inner {
                 )),
             ),
         ];
-        self.runs.lock().expect("the runs").insert(
+        runs.insert(
             id,
             Arc::new(Run {
                 agent,
@@ -789,6 +1017,89 @@ impl Inner {
         }
     }
 
+    /// Replace the agent's replica `remove` by node `add`, at the agent's
+    /// leader: once `add` says it could run the agent's program, a joint
+    /// configuration, which the core finalizes; answered with the replicas
+    /// once the final configuration commits.
+    pub(crate) async fn replace(
+        self: &Arc<Self>,
+        agent: AgentId,
+        remove: NodeNumber,
+        add: NodeNumber,
+    ) -> Result<Vec<NodeNumber>, ReplaceError> {
+        let run = self.leading(agent).await.map_err(ReplaceError::Call)?;
+        let placement = self
+            .placement(agent)
+            .ok_or(ReplaceError::Call(CallError::NoAgent))?;
+        let unplaced = |why| Err(ReplaceError::Unplaced(why));
+        if placement.joint || !placement.committed {
+            return unplaced(Unplaced::InProgress);
+        }
+        if !placement.replicas.contains(&remove) {
+            return unplaced(Unplaced::NotAReplica);
+        }
+        if placement.replicas.contains(&add) {
+            return unplaced(Unplaced::AlreadyAReplica);
+        }
+        if self
+            .space
+            .as_ref()
+            .and_then(|space| space.node(add))
+            .is_none()
+        {
+            return unplaced(Unplaced::NotInTheSpace);
+        }
+        if !self.could_run(agent, add, CAPABLE).await {
+            return unplaced(Unplaced::CannotRun);
+        }
+        let mut members: Vec<NodeNumber> = placement
+            .replicas
+            .iter()
+            .copied()
+            .filter(|node| *node != remove)
+            .chain([add])
+            .collect();
+        members.sort_unstable();
+        let (answer, answered) = smol::channel::bounded(1);
+        let change = Local::ChangeMembership {
+            current: placement.replicas.clone(),
+            members,
+            answer,
+        };
+        if !self.propose(agent, change) {
+            return Err(ReplaceError::Call(CallError::Stopped));
+        }
+        let joint = match answered.recv().await {
+            Ok(Ok(index)) => index,
+            Ok(Err(vos_raft::core::ChangeMembershipError::NotLeader)) => {
+                return Err(ReplaceError::Call(self.not_leader(&run.shared)));
+            }
+            Ok(Err(vos_raft::core::ChangeMembershipError::InProgress)) => {
+                return unplaced(Unplaced::InProgress);
+            }
+            _ => return Err(ReplaceError::Call(CallError::Stopped)),
+        };
+        let mut until = std::time::Instant::now() + REPLACED;
+        let mut leading = true;
+        loop {
+            if let Some(placement) = self.placement(agent)
+                && placement.index > joint
+                && !placement.joint
+                && placement.committed
+            {
+                return Ok(placement.replicas);
+            }
+            if leading && run.shared.state().role != Role::Leader {
+                leading = false;
+                until = until.min(std::time::Instant::now() + REPLACED_ELSEWHERE);
+            }
+            if std::time::Instant::now() >= until {
+                return Err(ReplaceError::TimedOut);
+            }
+            smol::Timer::after(Duration::from_millis(20)).await;
+        }
+    }
+
     /// Create an agent with `replicas` (this node alone when empty),
     /// running this node's agent program. Answered once a majority of the
     /// replicas hold its record durably.
@@ -827,14 +1138,21 @@ impl Inner {
             program: self.program_hash,
             accumulate_gas: self.accumulate_gas,
         };
+        let placement = Placement::created(&record);
         self.storage
-            .commit(vec![Change::Agent(record.clone())])
+            .commit(vec![
+                Change::Agent(record.clone()),
+                Change::Placement {
+                    agent,
+                    placement: placement.clone(),
+                },
+            ])
             .await
             .map_err(CallError::Failed)?;
         *next += 1;
         drop(next);
-        self.learn(record.clone());
-        self.announce(&record);
+        self.learn(record.clone(), placement);
+        self.announce(agent);
         if !self.held_by_majority(&record).await {
             return Err(CallError::Unconfirmed(agent));
         }
@@ -999,6 +1317,11 @@ impl Inner {
 
     /// Run `task` on the node's thread until it ends or the node stops.
     pub(crate) fn spawn(&self, task: impl Future<Output = ()> + Send + 'static) {
+        // A node shutting down runs nothing new: what such a task would do
+        // (an old epoch dropped, say) is done again at the next start.
+        if self.closing.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
         let task = self.runtime.spawn(task);
         let mut tasks = self.tasks.lock().expect("the node's tasks");
         tasks.retain(|task| !task.is_finished());
@@ -1155,6 +1478,7 @@ impl Node {
                 .map_err(|error| Error::Program(format!("{error:?}")))?;
         let program_hash = ProgramHash(CodeHash::of(&config.agent).0);
         let records = store.agents()?;
+        let mut placements = store.placements()?;
         let (endpoint, arrivals) = match (&config.space, &config.peers) {
             (Some(space), Peers::Quic) if space.nodes().len() > 1 => {
                 let listen = space.node(number).expect("this node is in its space").peer;
@@ -1220,6 +1544,8 @@ impl Node {
             directory: Mutex::new(HashMap::new()),
             unacknowledged: Mutex::new(HashMap::new()),
             acknowledged: event_listener::Event::new(),
+            refusing: Mutex::new(HashMap::new()),
+            capable: Mutex::new(HashMap::new()),
             runs: Mutex::new(HashMap::new()),
             dry_runs: Mutex::new(HashMap::new()),
             wanted: Mutex::new(HashMap::new()),
@@ -1233,13 +1559,39 @@ impl Node {
             turn: std::sync::atomic::AtomicU64::new(0),
             sent_across: std::sync::atomic::AtomicU64::new(0),
             installed: std::sync::atomic::AtomicU64::new(0),
+            closing: std::sync::atomic::AtomicBool::new(false),
+            retiring: Mutex::new(HashSet::new()),
             relayed: std::sync::atomic::AtomicU64::new(0),
         });
         for record in records {
-            if record.creator == number {
-                inner.announce(&record);
+            let agent = record.agent;
+            let placement = match placements.remove(&agent) {
+                Some(Some(placement)) => placement,
+                Some(None) => {
+                    tracing::error!(
+                        agent = agent.0,
+                        "an unreadable placement; its agent is not run until a placement comes"
+                    );
+                    continue;
+                }
+                None => Placement::created(&record),
+            };
+            let created = record.creator == number && placement.term == 0;
+            // A retirement a crash cut short is finished: no group starts
+            // for an agent its placement no longer names.
+            let unfinished =
+                !placement.admits(number) && inner.holds_replica(agent).unwrap_or(false);
+            if unfinished {
+                inner.retiring.lock().expect("the retiring").insert(agent);
             }
-            inner.learn(record);
+            inner.learn(record, placement);
+            if created {
+                inner.announce(agent);
+            }
+            if unfinished {
+                let retiring = Arc::clone(&inner);
+                inner.spawn(async move { retiring.finish_retirement(agent).await });
+            }
         }
         if let Some(arrivals) = arrivals {
             inner.spawn(crate::dispatch::dispatch(Arc::clone(&inner), arrivals));
@@ -1302,6 +1654,27 @@ impl Node {
                 .runtime
                 .spawn(async move { inner.create_agent(replicas).await }),
         )
+    }
+
+    /// Replace `agent`'s replica `remove` by node `add`: the replicas once
+    /// the change committed.
+    pub fn replace(
+        &self,
+        agent: AgentId,
+        remove: NodeNumber,
+        add: NodeNumber,
+    ) -> Result<Vec<NodeNumber>, ReplaceError> {
+        let inner = Arc::clone(&self.inner);
+        smol::block_on(
+            self.inner
+                .runtime
+                .spawn(async move { inner.replace(agent, remove, add).await }),
+        )
+    }
+
+    /// Where `agent` runs, as this node last heard.
+    pub fn placement(&self, agent: AgentId) -> Option<Placement> {
+        self.inner.placement(agent)
     }
 
     /// Whether this node's replica leads `agent`'s group.
@@ -1444,6 +1817,17 @@ impl Node {
     }
 
     fn stop_all(&mut self) {
+        // Once is enough: the runtime is gone after it, and nothing it
+        // never ran could be awaited.
+        if self.runtime.is_none() {
+            return;
+        }
+        {
+            let _runs = self.inner.runs.lock().expect("the runs");
+            self.inner
+                .closing
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         // End the ingress and its connections while the runtime still runs
         // them, so none outlives the node holding its store.
         let ingress = self.ingress.lock().expect("the ingress").take();

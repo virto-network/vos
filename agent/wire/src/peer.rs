@@ -44,12 +44,22 @@ pub enum PeerMessage {
     /// The answer to a [`PeerMessage::Liveness`], with the answering run.
     #[codec(index = 6)]
     LivenessAnswer { incarnation: u64, round: u64 },
-    /// An agent created, from the node that created it.
+    /// Where an agent runs, with its creation record: from its creator at
+    /// creation, then from its leader as its replicas change.
     #[codec(index = 7)]
-    Directory(CreationRecord),
-    /// The receiver holds `agent`'s creation record durably.
+    Directory {
+        record: CreationRecord,
+        placement: Placement,
+    },
+    /// The receiver holds `agent`'s record and a placement at least as
+    /// new as the one in `order` durably; `runs` says whether it could run
+    /// the agent's program.
     #[codec(index = 8)]
-    DirectoryAck { agent: AgentId },
+    DirectoryAck {
+        agent: AgentId,
+        order: (u64, u64, bool),
+        runs: bool,
+    },
     /// A client's call to `agent`, whose signature the sending replica
     /// checked, for the leader to run. `token` names it across re-forwards.
     #[codec(index = 9)]
@@ -117,6 +127,65 @@ impl CreationRecord {
     /// The number of the node whose range `agent` is in.
     pub fn creator_of(agent: AgentId) -> NodeNumber {
         (agent.0 >> 24) as NodeNumber
+    }
+}
+
+/// Where an agent runs: its group's configuration, as the leader that
+/// announced it had it.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct Placement {
+    /// The nodes replicating it, in order: both sets while the
+    /// configuration is joint.
+    pub replicas: Vec<NodeNumber>,
+    /// The nodes of the configuration this one supersedes: empty at
+    /// creation.
+    pub before: Vec<NodeNumber>,
+    /// The term of the leader that announced it, and the log index of its
+    /// configuration: both 0 at creation.
+    pub term: u64,
+    pub index: u64,
+    pub joint: bool,
+    /// Whether its configuration had committed.
+    pub committed: bool,
+}
+
+impl Placement {
+    /// An agent's placement at its creation: its record's replicas.
+    pub fn created(record: &CreationRecord) -> Self {
+        Self {
+            replicas: record.replicas.clone(),
+            before: Vec::new(),
+            term: 0,
+            index: 0,
+            joint: false,
+            committed: true,
+        }
+    }
+
+    /// Its place among an agent's placements: a newer leader's first, then
+    /// a later configuration, then one that committed. A leader that failed
+    /// before its configuration reached a majority is outranked by the
+    /// next, whatever the index.
+    pub fn order(&self) -> (u64, u64, bool) {
+        (self.term, self.index, self.committed)
+    }
+
+    /// Whether this placement replaces `held`: it ranks higher, and takes
+    /// back no commit. A new leader may announce the configuration a
+    /// committed placement names before it learns that it committed: the
+    /// same configuration uncommitted, or an earlier one, never replaces
+    /// a committed placement.
+    pub fn supersedes(&self, held: &Placement) -> bool {
+        self.order() > held.order()
+            && !(held.committed
+                && (self.index < held.index || (self.index == held.index && !self.committed)))
+    }
+
+    /// Whether `node` speaks for the agent: one of its replicas, or, while
+    /// the configuration is uncommitted, of the one before, which may
+    /// still lead.
+    pub fn admits(&self, node: NodeNumber) -> bool {
+        self.replicas.contains(&node) || (!self.committed && self.before.contains(&node))
     }
 }
 

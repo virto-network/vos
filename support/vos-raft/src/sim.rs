@@ -508,6 +508,14 @@ impl Cluster {
         token
     }
 
+    /// `node`'s host releases the voters a committed change removed.
+    pub fn release_retiring_voters(&mut self, node: u16) {
+        if let Some(Some(core)) = self.cores.get_mut(&node) {
+            core.release_retiring_voters();
+            self.process(node);
+        }
+    }
+
     /// Run for `millis` of simulated time.
     pub fn run(&mut self, millis: u64) {
         let until = self.now + millis;

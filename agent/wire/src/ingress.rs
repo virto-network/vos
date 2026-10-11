@@ -83,6 +83,34 @@ pub struct Install {
     pub roles: Vec<(Vec<u8>, u8)>,
 }
 
+/// The operator's `POST /agents/{agent}/replicas`: one replica replaced
+/// by another node.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct Replace {
+    pub remove: u8,
+    pub add: u8,
+}
+
+/// Why a replacement was not made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum Unplaced {
+    /// The node to remove does not replicate the agent.
+    #[codec(index = 0)]
+    NotAReplica,
+    /// The node to add replicates it already.
+    #[codec(index = 1)]
+    AlreadyAReplica,
+    /// The node to add is not in the space.
+    #[codec(index = 2)]
+    NotInTheSpace,
+    /// Another change of the agent's replicas is under way.
+    #[codec(index = 3)]
+    InProgress,
+    /// The node to add cannot run the agent's program, or did not say.
+    #[codec(index = 4)]
+    CannotRun,
+}
+
 /// The operator's `POST /agents/{agent}/roles`.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Grant {
@@ -169,6 +197,12 @@ pub enum Answer {
     /// with the same sequence.
     #[codec(index = 12)]
     TimedOut,
+    /// The agent's replicas, once a replacement committed.
+    #[codec(index = 13)]
+    Placed(Vec<u8>),
+    /// A replacement not made, and why.
+    #[codec(index = 14)]
+    Unplaced(Unplaced),
 }
 
 /// The operator's `POST /agents`: the nodes to replicate the new agent,

@@ -31,7 +31,9 @@ use vos_net::Class;
 use vos_raft::{AppendResult, EntryKind, LogEntry, Message};
 use vos_wire::Decode;
 use vos_wire::ids::AgentId;
-use vos_wire::peer::{self, CreationRecord, NodeNumber, PeerMessage, Raft, SnapshotChunk};
+use vos_wire::peer::{
+    self, CreationRecord, NodeNumber, PeerMessage, Placement, Raft, SnapshotChunk,
+};
 
 /// The wire's message for the core's.
 pub fn to_wire(message: &Message<NodeNumber>) -> Raft {
@@ -246,8 +248,9 @@ pub enum Refusal {
     WrongClass = 6,
     /// A Raft message on a stream other than its agent's.
     WrongStream = 7,
-    /// A creation record from a node other than its creator, or for an
-    /// agent outside the creator's range.
+    /// A creation-time placement from a node other than its creator, or
+    /// for an agent outside the creator's range; or a later placement from
+    /// a node it does not name, nor the configuration it supersedes.
     NotTheCreator = 8,
     /// A Raft message for an agent with no group here, or whose inbox was
     /// full: Raft sends it again.
@@ -283,9 +286,9 @@ impl Refusal {
 /// That `from` replicates the agent whose replicas are `replicas`, as a
 /// forwarded call's sender must: replicas are trusted to have checked the
 /// call's signature.
-pub fn check_replica(replicas: Option<&[NodeNumber]>, from: NodeNumber) -> Result<(), Refusal> {
-    match replicas {
-        Some(replicas) if replicas.contains(&from) => Ok(()),
+pub fn check_replica(placement: Option<&Placement>, from: NodeNumber) -> Result<(), Refusal> {
+    match placement {
+        Some(placement) if placement.admits(from) => Ok(()),
         _ => Err(Refusal::NotAReplica),
     }
 }
@@ -296,7 +299,7 @@ pub fn class(message: &PeerMessage) -> Class {
         PeerMessage::Raft { .. } | PeerMessage::SnapshotAck(_) => Class::Consensus,
         PeerMessage::SnapshotChunk(_) | PeerMessage::Blob { .. } => Class::Bulk,
         PeerMessage::BlobRequest { .. }
-        | PeerMessage::Directory(_)
+        | PeerMessage::Directory { .. }
         | PeerMessage::DirectoryAck { .. }
         | PeerMessage::Forward { .. }
         | PeerMessage::Forwarded { .. }
@@ -316,8 +319,8 @@ pub fn stream(message: &PeerMessage) -> u64 {
         }
         PeerMessage::SnapshotChunk(chunk) => u64::from(chunk.agent.0),
         PeerMessage::SnapshotAck(ack) => u64::from(ack.agent.0),
-        PeerMessage::Directory(record) => u64::from(record.agent.0),
-        PeerMessage::DirectoryAck { agent }
+        PeerMessage::Directory { record, .. } => u64::from(record.agent.0),
+        PeerMessage::DirectoryAck { agent, .. }
         | PeerMessage::Forward { agent, .. }
         | PeerMessage::Forwarded { agent, .. }
         | PeerMessage::ReadIndex { agent, .. }
@@ -361,8 +364,15 @@ pub fn check(
         PeerMessage::Raft { message, .. } => check_raft(from, message),
         PeerMessage::SnapshotChunk(chunk) => check_chunk(from, chunk, followed(chunk.agent)),
         PeerMessage::Blob { hash, bytes } => check_blob(hash, bytes),
-        PeerMessage::Directory(record) => {
-            if record.creator == from && CreationRecord::creator_of(record.agent) == from {
+        // At creation (term 0) from its creator, then from a node of the
+        // placement, or of the configuration it supersedes: a leader
+        // removing itself.
+        PeerMessage::Directory { record, placement } => {
+            let from_creator =
+                record.creator == from && CreationRecord::creator_of(record.agent) == from;
+            let from_member =
+                placement.replicas.contains(&from) || placement.before.contains(&from);
+            if (placement.term == 0 && from_creator) || (placement.term > 0 && from_member) {
                 Ok(())
             } else {
                 Err(Refusal::NotTheCreator)

@@ -10,14 +10,14 @@ use vos_wire::abi::{cap, refusal};
 use vos_wire::batch::Admin;
 use vos_wire::ids::{AgentId, InstanceId, Principal};
 use vos_wire::ingress::{
-    AgentInfo, Answer, Call, Create, Grant, Install, QueryCall, Rejection, query_message,
+    AgentInfo, Answer, Call, Create, Grant, Install, QueryCall, Rejection, Replace, query_message,
 };
 use vos_wire::records::{Installed, unstored};
 use vos_wire::{Decode, Encode, keys};
 
 use crate::calls::{answer_of, verify};
 use crate::http::{self, Handler, Limits, Response};
-use crate::node::Inner;
+use crate::node::{Inner, ReplaceError};
 use crate::store::{Store, View};
 
 /// How far ahead a query's `not_after` may be.
@@ -34,7 +34,8 @@ pub(crate) struct Ingress {
 
 fn status(answer: &Answer) -> u16 {
     match answer {
-        Answer::Ran { .. } | Answer::Created(_) => 200,
+        Answer::Ran { .. } | Answer::Created(_) | Answer::Placed(_) => 200,
+        Answer::Unplaced(_) => 409,
         Answer::Unconfirmed(_) => 202,
         // The session is done with: the client starts another.
         Answer::Refused(refusal::EXPIRED | refusal::STALE_SESSION) => 410,
@@ -161,7 +162,7 @@ impl Ingress {
                     _ => Response::new(404, Vec::new()),
                 }
             }
-            ("POST", ["agents"] | ["agents", _, "install" | "roles"])
+            ("POST", ["agents"] | ["agents", _, "install" | "roles" | "replicas"])
                 if !self.admitted(&request) =>
             {
                 respond(Answer::Rejected(Rejection::Unauthorized))
@@ -205,6 +206,21 @@ impl Ingress {
                     None => respond(Answer::Unavailable),
                 }
             }
+            ("POST", ["agents", id, "replicas"]) => {
+                match (agent(id), decode::<Replace>(&request.body)) {
+                    (Some(agent), Ok(replace)) => {
+                        let replaced = self.inner.replace(agent, replace.remove, replace.add).await;
+                        respond(match replaced {
+                            Ok(replicas) => Answer::Placed(replicas),
+                            Err(ReplaceError::Unplaced(why)) => Answer::Unplaced(why),
+                            Err(ReplaceError::TimedOut) => Answer::TimedOut,
+                            Err(ReplaceError::Call(error)) => answer_of(Err(error)),
+                        })
+                    }
+                    (None, _) => respond(Answer::NoAgent),
+                    (_, Err(answer)) => respond(answer),
+                }
+            }
             ("POST", ["agents", id, "roles"]) => {
                 match (agent(id), decode::<Grant>(&request.body)) {
                     (Some(agent), Ok(grant)) => {
@@ -234,19 +250,23 @@ impl Ingress {
     /// Agent `agent`'s creation record and replicas, when this node knows
     /// of it.
     fn agent_info(&self, agent: AgentId) -> Option<AgentInfo> {
-        let record = self
+        let known = self
             .inner
             .directory
             .lock()
             .expect("the directory")
             .get(&agent)
             .cloned()?;
-        let replicas = record
+        let replicas = known
+            .placement
             .replicas
             .iter()
             .filter_map(|replica| self.inner.contact(*replica))
             .collect();
-        Some(AgentInfo { record, replicas })
+        Some(AgentInfo {
+            record: known.record,
+            replicas,
+        })
     }
 
     async fn query(&self, agent: AgentId, query: QueryCall) -> Answer {

@@ -490,6 +490,30 @@ impl Client {
             .sum()
     }
 
+    /// Whether `value` is the counter after requests 1 through some
+    /// request up to `sent`.
+    fn is_total_prefix(&self, sent: u64, value: u64) -> bool {
+        let mut total = 0;
+        (0..=sent).any(|request| {
+            if request > 0 && !self.forwards(request) {
+                total += self.amount(request);
+            }
+            total == value
+        })
+    }
+
+    /// Whether `value` is the next agent's inbox after this client's
+    /// requests 1 through some request up to `sent`.
+    fn is_forwarded_prefix(&self, sent: u64, value: u64) -> bool {
+        let mut total = 0;
+        (0..=sent).any(|request| {
+            if request > 0 && self.forwards(request) {
+                total += self.amount(request);
+            }
+            total == value
+        })
+    }
+
     /// The next agent's inbox after this client's requests 1 through
     /// `request` applied there.
     fn forwarded(&self, request: u64) -> u64 {
@@ -808,7 +832,7 @@ impl Client {
                     floor = floor.max(answered_at);
                     let value = u64::decode(&bytes).unwrap().0;
                     assert!(
-                        (0..=sent).any(|request| previous.forwarded(request) == value),
+                        previous.is_forwarded_prefix(sent, value),
                         "client {}: its inbox at node {at} holds {value}, no prefix of what was forwarded",
                         self.number
                     );
@@ -853,7 +877,7 @@ impl Client {
             // the total of one. A forward leaves the total as it was, so
             // reads compare totals.
             assert!(
-                (0..=sent).any(|request| self.total(request) == value),
+                self.is_total_prefix(sent, value),
                 "client {}: read {value} at node {at}, no total of up to {sent} requests",
                 self.number
             );

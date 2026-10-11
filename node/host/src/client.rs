@@ -13,7 +13,7 @@ use vos_wire::abi::refusal;
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session};
 use vos_wire::ingress::{
     AgentInfo, Answer, Call, Consistency, Contact, Create, Grant, Install, NodeId, QueryCall,
-    Rejection, call_message, query_message,
+    Rejection, Replace, call_message, query_message,
 };
 use vos_wire::schema::Schema;
 use vos_wire::{Decode, Encode, defaults};
@@ -1121,6 +1121,12 @@ impl Operator {
     ) -> Result<Answer, ClientError> {
         let grant = Grant { principal, role };
         self.post(&format!("/agents/{}/roles", agent.0), &grant.encode())
+    }
+
+    /// Replace `agent`'s replica `remove` by node `add`, at its leader.
+    pub fn replace(&self, agent: AgentId, remove: u8, add: u8) -> Result<Answer, ClientError> {
+        let replace = Replace { remove, add };
+        self.post(&format!("/agents/{}/replicas", agent.0), &replace.encode())
     }
 }
 

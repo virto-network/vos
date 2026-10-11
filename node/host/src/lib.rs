@@ -21,7 +21,9 @@ pub mod storage;
 pub mod store;
 pub mod tls;
 
-pub use node::{ADMIN_TOKEN, CallError, Config, Error, NODE_KEY, Node, Peers, Reply, wall_clock};
+pub use node::{
+    ADMIN_TOKEN, CallError, Config, Error, NODE_KEY, Node, Peers, ReplaceError, Reply, wall_clock,
+};
 pub use space::{Space, SpaceNode};
 
 use vos_wire::Encode;

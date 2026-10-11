@@ -45,6 +45,41 @@ fn read_index_answers_once_the_leader_is_confirmed() {
     assert!(index >= 2, "the term's no-op and the proposal");
 }
 
+/// A voter removed while it is down never acknowledges its removal, and
+/// the leader takes no further change until it does; once its host
+/// releases it, the leader confirms the change and takes the next.
+#[test]
+fn a_released_voter_lets_the_next_change_through() {
+    let mut cluster = Cluster::with_config(&[1, 2, 3, 4], 3, Faults::default(), |cfg| {
+        cfg.members = NODES.to_vec();
+    });
+    let leader = settle(&mut cluster);
+    let gone = NODES.into_iter().find(|&node| node != leader).unwrap();
+    cluster.crash(gone);
+    let members: Vec<u16> = [1, 2, 3, 4].into_iter().filter(|&n| n != gone).collect();
+    cluster.change_membership(leader, members.clone());
+    cluster.run(1_000);
+    let status = cluster.core(leader).unwrap().status();
+    assert_eq!((status.members, status.joint_old), (members, None));
+    assert!(status.retirement_final_index.is_some(), "waits for {gone}");
+    let started = cluster.changes_started;
+    cluster.change_membership(leader, NODES.to_vec());
+    cluster.run(200);
+    assert_eq!(cluster.changes_started, started, "refused while it waits");
+    cluster.release_retiring_voters(leader);
+    cluster.run(500);
+    let status = cluster.core(leader).unwrap().status();
+    assert_eq!(status.retirement_final_index, None);
+    cluster.change_membership(leader, NODES.to_vec());
+    cluster.run(500);
+    assert_eq!(cluster.changes_started, started + 1);
+    assert_eq!(
+        cluster.core(leader).unwrap().status().members,
+        NODES.to_vec()
+    );
+    assert!(cluster.violations.is_empty(), "{:?}", cluster.violations);
+}
+
 /// What a chaos run exercised.
 #[derive(Default)]
 struct Exercised {

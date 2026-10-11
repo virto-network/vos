@@ -8,10 +8,11 @@ use vos_node::peer::{self, Drops, Refusal, decode, from_wire, to_wire};
 use vos_raft::core::{Action, Core, Recovered, Write};
 use vos_raft::{AppendResult, Config, LogEntry, Message, Role};
 use vos_wire::Encode;
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Session};
+use vos_wire::ids::{AgentId, InstanceId, MethodId, ProgramHash, Session};
 use vos_wire::ingress::{Answer, Call};
 use vos_wire::peer::{
-    Configuration, Manifest, NodeNumber, PeerMessage, Raft, SnapshotAck, SnapshotChunk,
+    Configuration, CreationRecord, Manifest, NodeNumber, PeerMessage, Placement, Raft, SnapshotAck,
+    SnapshotChunk,
 };
 use vos_wire::result::Outcome;
 
@@ -271,13 +272,121 @@ fn a_forwarded_call_comes_from_a_replica_on_its_agent_s_requests_stream() {
         Err(Refusal::WrongClass)
     );
     // Its sender must replicate the agent: the leader trusts it to have
-    // checked the call's signature.
-    assert_eq!(peer::check_replica(Some(&[1, 2, 3]), 2), Ok(()));
+    // checked the call's signature. While a placement is uncommitted, the
+    // nodes of the configuration before may still lead.
+    let placement = |replicas: Vec<NodeNumber>, committed| Placement {
+        replicas,
+        before: vec![1, 2, 3],
+        term: 4,
+        index: 9,
+        joint: false,
+        committed,
+    };
     assert_eq!(
-        peer::check_replica(Some(&[1, 3]), 2),
+        peer::check_replica(Some(&placement(vec![1, 2, 3], true)), 2),
+        Ok(())
+    );
+    assert_eq!(
+        peer::check_replica(Some(&placement(vec![1, 3, 4], true)), 2),
         Err(Refusal::NotAReplica)
     );
+    assert_eq!(
+        peer::check_replica(Some(&placement(vec![1, 3, 4], false)), 2),
+        Ok(())
+    );
     assert_eq!(peer::check_replica(None, 2), Err(Refusal::NotAReplica));
+}
+
+/// Placements are ordered by the announcing leader's term first: a
+/// configuration announced by a leader that failed before it committed is
+/// outranked by the next leader's, at whatever index.
+#[test]
+fn placements_are_ordered_by_term_then_index_then_commitment() {
+    let placement = |term, index, committed| Placement {
+        replicas: vec![1, 2, 3],
+        before: Vec::new(),
+        term,
+        index,
+        joint: false,
+        committed,
+    };
+    assert!(placement(5, 80, false).order() > placement(4, 100, false).order());
+    assert!(placement(4, 100, false).order() > placement(4, 90, true).order());
+    assert!(placement(4, 100, true).order() > placement(4, 100, false).order());
+}
+
+/// A placement at creation comes from the agent's creator; a later one
+/// from a node it names, or one of the configuration it supersedes.
+#[test]
+fn a_placement_comes_from_its_creator_then_from_its_members() {
+    // Created by node 1: its number is the id's top byte.
+    let agent = AgentId(1 << 24 | 7);
+    let record = CreationRecord {
+        agent,
+        replicas: vec![1, 2, 3],
+        creator: CreationRecord::creator_of(agent),
+        time: 0,
+        program: ProgramHash([0; 32]),
+        accumulate_gas: 0,
+    };
+    let creator = record.creator;
+    let check = |from, placement: Placement| {
+        let message = PeerMessage::Directory {
+            record: record.clone(),
+            placement,
+        };
+        peer::check(
+            &SPACE,
+            from,
+            (Class::Requests, u64::from(agent.0)),
+            &message,
+            |_| None,
+        )
+    };
+    let created = Placement::created(&record);
+    assert_eq!(check(creator, created.clone()), Ok(()));
+    let other = SPACE.iter().copied().find(|node| *node != creator).unwrap();
+    assert_eq!(check(other, created), Err(Refusal::NotTheCreator));
+    let later = Placement {
+        replicas: vec![1, 2, 4],
+        before: vec![1, 2, 3, 4],
+        term: 3,
+        index: 12,
+        joint: false,
+        committed: false,
+    };
+    assert_eq!(check(3, later.clone()), Ok(()), "a leader removing itself");
+    assert_eq!(check(4, later.clone()), Ok(()));
+    let stranger = Placement {
+        before: vec![1, 2],
+        ..later
+    };
+    assert_eq!(check(3, stranger), Err(Refusal::NotTheCreator));
+}
+
+/// A placement replaces a held one it outranks, except that none takes
+/// back a commit: a new leader announcing the committed configuration
+/// before it learns that it committed leaves the commit held.
+#[test]
+fn no_placement_takes_back_a_commit() {
+    let placement = |term, index, committed| Placement {
+        replicas: vec![1, 2, 3],
+        before: vec![1, 2, 4],
+        term,
+        index,
+        joint: false,
+        committed,
+    };
+    let held = placement(4, 100, true);
+    assert!(!placement(5, 100, false).supersedes(&held));
+    assert!(!placement(5, 90, true).supersedes(&held));
+    assert!(!placement(4, 100, true).supersedes(&held));
+    assert!(placement(5, 100, true).supersedes(&held));
+    assert!(placement(4, 120, false).supersedes(&held));
+    assert!(
+        placement(5, 80, false).supersedes(&placement(4, 100, false)),
+        "a phantom gives way"
+    );
 }
 
 #[test]

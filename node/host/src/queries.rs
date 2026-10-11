@@ -220,12 +220,6 @@ impl Inner {
 
     /// That `from` replicates `agent`.
     pub(crate) fn check_replica(&self, agent: AgentId, from: NodeNumber) -> Result<(), Refusal> {
-        let replicas = self
-            .directory
-            .lock()
-            .expect("the directory")
-            .get(&agent)
-            .map(|record| record.replicas.clone());
-        peer::check_replica(replicas.as_deref(), from)
+        peer::check_replica(self.placement(agent).as_ref(), from)
     }
 }

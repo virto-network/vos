@@ -681,6 +681,24 @@ impl<N: NodeId> Core<N> {
         self.answer(Answer::ChangeMembership { token, result });
     }
 
+    /// The host told the voters a committed final configuration removed of
+    /// that removal itself: count each as having acknowledged it, so the
+    /// confirmation, and the next change and compaction after it, need not
+    /// wait for a removed voter that is down or gone. Only a leader whose
+    /// final configuration has committed releases them.
+    pub fn release_retiring_voters(&mut self) {
+        if self.role != Role::Leader
+            || self
+                .retirement_final_index
+                .is_none_or(|final_index| self.commit < final_index)
+        {
+            return;
+        }
+        let voters: Vec<N> = self.retiring_voters.keys().copied().collect();
+        self.retiring_voter_acks.extend(voters);
+        self.maybe_append_retirement_confirmation();
+    }
+
     /// Hand leadership to `to`, or to the most up-to-date member.
     pub fn transfer_leadership(&mut self, to: Option<N>) {
         if self.role != Role::Leader {

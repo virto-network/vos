@@ -2,11 +2,13 @@
 //! routed to its agent's group, or handled by the node itself (the
 //! directory, and blobs).
 //!
-//! The directory: the node that creates an agent sends its record to
-//! every node of the space, and again every second (and after every
-//! restart) until each acknowledges holding it durably. A record comes only
-//! from its creator, and one that differs from the record held for its
-//! agent is refused, never written over.
+//! The directory: where each agent runs. The node that creates an agent
+//! sends its record and first placement to every node of the space, and
+//! the agent's leader sends each new placement as its replicas change,
+//! again every second until each node acknowledges holding it durably. A
+//! node keeps the newest placement by its order (the announcing leader's
+//! term, then the configuration's index), and a record that differs from
+//! the one held for its agent is refused, never written over.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -15,10 +17,10 @@ use smol::future::FutureExt;
 use vos_net::{Arrivals, Class, Incoming};
 use vos_wire::Encode;
 use vos_wire::ids::AgentId;
-use vos_wire::peer::{CreationRecord, NodeNumber, PeerMessage};
+use vos_wire::peer::{CreationRecord, NodeNumber, PeerMessage, Placement};
 
 use crate::group::Input;
-use crate::node::Inner;
+use crate::node::{Inner, Order};
 use crate::peer;
 use crate::storage::Change;
 use crate::store::BlobRef;
@@ -56,7 +58,7 @@ async fn take(arrivals: &Arrivals) -> Option<(Class, Incoming)> {
         .await
 }
 
-/// Send unacknowledged creation records again until each node holds them.
+/// Send unacknowledged placements again until each node holds them.
 pub(crate) async fn resend_records(inner: Arc<Inner>) {
     loop {
         smol::Timer::after(RESEND).await;
@@ -65,22 +67,22 @@ pub(crate) async fn resend_records(inner: Arc<Inner>) {
             .lock()
             .expect("the unacknowledged records")
             .iter()
-            .map(|(agent, nodes)| (*agent, nodes.iter().copied().collect()))
+            .map(|(agent, (_, nodes))| (*agent, nodes.iter().copied().collect()))
             .collect();
         for (agent, nodes) in pending {
-            let record = inner
+            let known = inner
                 .directory
                 .lock()
                 .expect("the directory")
                 .get(&agent)
                 .cloned();
-            if let Some(record) = record {
+            if let Some(known) = known {
+                let message = PeerMessage::Directory {
+                    record: known.record,
+                    placement: known.placement,
+                };
                 for node in nodes {
-                    inner.send(
-                        node,
-                        Class::Requests,
-                        &PeerMessage::Directory(record.clone()),
-                    );
+                    inner.send(node, Class::Requests, &message);
                 }
             }
         }
@@ -134,7 +136,7 @@ impl Inner {
             .unwrap_or_default();
         if matches!(
             message,
-            PeerMessage::Blob { .. } | PeerMessage::Directory(_)
+            PeerMessage::Blob { .. } | PeerMessage::Directory { .. }
         ) {
             let inner = Arc::clone(self);
             self.spawn(async move {
@@ -154,7 +156,9 @@ impl Inner {
                 }
                 match message {
                     PeerMessage::Blob { hash, bytes } => inner.take_blob(hash, bytes).await,
-                    PeerMessage::Directory(record) => inner.on_record(from, record).await,
+                    PeerMessage::Directory { record, placement } => {
+                        inner.on_directory(from, record, placement).await
+                    }
                     _ => unreachable!("only blobs and records are handled here"),
                 }
             });
@@ -184,7 +188,9 @@ impl Inner {
                 }
             }
             PeerMessage::BlobRequest { agent, hashes } => self.serve_blobs(from, agent, hashes),
-            PeerMessage::DirectoryAck { agent } => self.on_ack(from, agent),
+            PeerMessage::DirectoryAck { agent, order, runs } => {
+                self.on_ack(from, agent, order, runs)
+            }
             // A task of its own runs the call: the dispatcher never waits.
             PeerMessage::Forward { agent, token, call } => {
                 self.on_forward(from, agent, token, call)
@@ -213,7 +219,7 @@ impl Inner {
                 sequence,
                 relayed,
             } => self.on_acknowledge(from, sender, receiver, sequence, relayed),
-            PeerMessage::Blob { .. } | PeerMessage::Directory(_) => {
+            PeerMessage::Blob { .. } | PeerMessage::Directory { .. } => {
                 unreachable!("blobs and records are handled in tasks")
             }
             PeerMessage::SnapshotChunk(chunk) => {
@@ -233,11 +239,8 @@ impl Inner {
     /// replicates `agent`.
     fn serve_blobs(self: &Arc<Self>, from: NodeNumber, agent: AgentId, hashes: Vec<[u8; 32]>) {
         let replica = self
-            .directory
-            .lock()
-            .expect("the directory")
-            .get(&agent)
-            .is_some_and(|record| record.replicas.contains(&from));
+            .placement(agent)
+            .is_some_and(|placement| placement.admits(from));
         if !replica {
             tracing::debug!(
                 from,
@@ -293,60 +296,107 @@ impl Inner {
         }
     }
 
-    /// Keep a record from its creator, durably, then acknowledge it.
-    async fn on_record(self: &Arc<Self>, from: NodeNumber, record: CreationRecord) {
-        let _recording = self.recording.lock().await;
+    /// Keep a placement newer than the one held, with its record, durably,
+    /// act on it, then acknowledge it, saying whether this node could run
+    /// the agent's program.
+    async fn on_directory(
+        self: &Arc<Self>,
+        from: NodeNumber,
+        record: CreationRecord,
+        placement: Placement,
+    ) {
+        let agent = record.agent;
+        let order = placement.order();
+        let recording = self.recording.lock().await;
         let known = self
             .directory
             .lock()
             .expect("the directory")
-            .get(&record.agent)
+            .get(&agent)
             .cloned();
-        match known {
-            Some(known) if known == record => {}
-            Some(_) => {
-                tracing::error!(
-                    from,
-                    agent = record.agent.0,
-                    "a record differs from the one held for its agent; refused"
-                );
+        if known.as_ref().is_some_and(|known| known.record != record) {
+            tracing::error!(
+                from,
+                agent = agent.0,
+                "a record differs from the one held for its agent; refused"
+            );
+            return;
+        }
+        if known
+            .as_ref()
+            .is_none_or(|known| placement.supersedes(&known.placement))
+        {
+            let mut changes = vec![Change::Placement {
+                agent,
+                placement: placement.clone(),
+            }];
+            if known.is_none() {
+                changes.insert(0, Change::Agent(record.clone()));
+            }
+            if let Err(error) = self.commit(changes).await {
+                tracing::error!(agent = agent.0, "a placement was not stored: {error}");
                 return;
             }
-            None => {
-                if let Err(error) = self.commit(vec![Change::Agent(record.clone())]).await {
-                    tracing::error!(agent = record.agent.0, "a record was not stored: {error}");
-                    return;
-                }
-                self.learn(record.clone());
-            }
+            self.learn(record.clone(), placement);
         }
+        drop(recording);
         self.send(
             from,
             Class::Requests,
             &PeerMessage::DirectoryAck {
-                agent: record.agent,
+                agent,
+                order,
+                runs: record.program == self.program_hash,
             },
         );
     }
 
-    fn on_ack(&self, from: NodeNumber, agent: AgentId) {
+    fn on_ack(&self, from: NodeNumber, agent: AgentId, order: Order, runs: bool) {
         let mut unacknowledged = self
             .unacknowledged
             .lock()
             .expect("the unacknowledged records");
-        if let Some(nodes) = unacknowledged.get_mut(&agent) {
+        if let Some((announced, nodes)) = unacknowledged.get_mut(&agent)
+            && order >= *announced
+        {
             nodes.remove(&from);
             if nodes.is_empty() {
                 unacknowledged.remove(&agent);
             }
         }
         drop(unacknowledged);
+        {
+            let mut refusing = self.refusing.lock().expect("the refusing nodes");
+            let nodes = refusing.entry(agent).or_default();
+            if runs {
+                nodes.remove(&from);
+            } else {
+                nodes.insert(from);
+            }
+        }
+        if let Some(waiting) = self
+            .capable
+            .lock()
+            .expect("the capability waits")
+            .remove(&(agent, from))
+        {
+            let _ = waiting.try_send(runs);
+        }
         self.acknowledged.notify(usize::MAX);
     }
 
-    /// Send a record this node created to every other node, and keep
-    /// sending it until each acknowledges it.
-    pub(crate) fn announce(&self, record: &CreationRecord) {
+    /// Send where `agent` runs, with its record, to every other node, and
+    /// keep sending it until each acknowledges it.
+    pub(crate) fn announce(&self, agent: AgentId) {
+        let Some(known) = self
+            .directory
+            .lock()
+            .expect("the directory")
+            .get(&agent)
+            .cloned()
+        else {
+            return;
+        };
         let others: std::collections::BTreeSet<NodeNumber> = self
             .space
             .as_ref()
@@ -358,17 +408,67 @@ impl Inner {
         if others.is_empty() {
             return;
         }
+        let order = known.placement.order();
+        let message = PeerMessage::Directory {
+            record: known.record,
+            placement: known.placement,
+        };
         for node in &others {
-            self.send(
-                *node,
-                Class::Requests,
-                &PeerMessage::Directory(record.clone()),
-            );
+            self.send(*node, Class::Requests, &message);
         }
         self.unacknowledged
             .lock()
             .expect("the unacknowledged records")
-            .insert(record.agent, others);
+            .insert(agent, (order, others));
+    }
+
+    /// Whether `node` could run `agent`'s program, as it answers when sent
+    /// where the agent runs: false when it does not answer in `within`.
+    pub(crate) async fn could_run(
+        &self,
+        agent: AgentId,
+        node: NodeNumber,
+        within: Duration,
+    ) -> bool {
+        let Some(known) = self
+            .directory
+            .lock()
+            .expect("the directory")
+            .get(&agent)
+            .cloned()
+        else {
+            return false;
+        };
+        let (answer, answered) = smol::channel::bounded(1);
+        self.capable
+            .lock()
+            .expect("the capability waits")
+            .insert((agent, node), answer);
+        let message = PeerMessage::Directory {
+            record: known.record,
+            placement: known.placement,
+        };
+        let until = Instant::now() + within;
+        let runs = loop {
+            self.send(node, Class::Requests, &message);
+            let heard = async { answered.recv().await.ok() };
+            let quiet = async {
+                smol::Timer::after(RESEND.min(until.saturating_duration_since(Instant::now())))
+                    .await;
+                None
+            };
+            if let Some(runs) = heard.or(quiet).await {
+                break runs;
+            }
+            if Instant::now() >= until {
+                break false;
+            }
+        };
+        self.capable
+            .lock()
+            .expect("the capability waits")
+            .remove(&(agent, node));
+        runs
     }
 
     /// Wait until a majority of `record`'s replicas hold it durably: false
@@ -383,13 +483,18 @@ impl Inner {
                     .unacknowledged
                     .lock()
                     .expect("the unacknowledged records");
-                let waiting = unacknowledged.get(&record.agent);
+                let waiting = unacknowledged.get(&record.agent).map(|(_, nodes)| nodes);
+                let refusing = self.refusing.lock().expect("the refusing nodes");
+                let refusing = refusing.get(&record.agent);
+                // A replica counts once it holds the record and could run
+                // the agent's program.
                 record
                     .replicas
                     .iter()
                     .filter(|replica| {
                         **replica == self.number
-                            || !waiting.is_some_and(|nodes| nodes.contains(replica))
+                            || (!waiting.is_some_and(|nodes| nodes.contains(replica))
+                                && !refusing.is_some_and(|nodes| nodes.contains(replica)))
                     })
                     .count()
             };

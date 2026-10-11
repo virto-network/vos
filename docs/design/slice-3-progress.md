@@ -3927,14 +3927,15 @@ agent's leader (a redirect otherwise):
   the final entry is still elected under the joint rules, and may need
   this replica's vote. It then stops its group and **retires** the
   agent. A removed
-  leader announces the final placement before it commits; it retires
-  once its core steps down, which it does when the final configuration
-  commits. Retiring is a writer change: the log, commit index,
+  leader steps down as the final configuration commits, announces the
+  committed final placement as it does, and retires. Retiring is a writer change: the log, commit index,
   membership and state rows go (the state in chunks, like an old epoch);
   the record, the placement as a tombstone, and the term and vote stay,
   so a replica added again never votes twice in a term;
-- a restart leaves a retired agent stopped, and an older placement
-  cannot bring it back; Raft messages for it are dropped as unrouted. A
+- a restart leaves a retired agent stopped, and no placement brings it
+  back unless it supersedes the one held: one ranking lower does not,
+  nor one taking back a commit (a later leader announcing the committed
+  configuration before it learns that it committed); Raft messages for it are dropped as unrouted. A
   removed replica that restarts with its old log, before its tombstone,
   cannot disrupt the group: it is no member of the final configuration,
   and pre-vote stays on.
@@ -4072,3 +4073,213 @@ bring.
 acknowledgement sends one chunk again, not the window; a stream held
 until its follower switches; staged rows dropped in the background, a
 new stream staging into an empty epoch instead.
+
+### 3.7b: replacing a replica
+
+#### Built
+
+- **The wire:**
+  - `Placement { replicas, before, term, index, joint, committed }`,
+    ordered by `order()` (term, index, committed), with `admits(node)`
+    (a replica, or one of `before` while uncommitted), `created(record)`
+    and `supersedes(held)`: it ranks higher and takes back no commit (the
+    same index uncommitted, or an earlier one, never replaces a committed
+    placement);
+  - `PeerMessage::Directory { record, placement }` replaces the record
+    alone; `DirectoryAck` carries the order it was sent (the node holds
+    that placement or one superseding it) and whether the node could run
+    the agent's program;
+  - the operator's `Replace { remove, add }` (`POST
+    /agents/{id}/replicas`), answered `Placed(replicas)`, `Unplaced(why)`
+    (not a replica, already one, not in the space, a change in progress,
+    cannot run) or `TimedOut`.
+- **The store and writer:** a placement row per agent (node-wide, read at
+  start); `Change::Placement`; `Change::Retire { agent, epoch, hard }`,
+  which drops the log (from its start), applied index, log start,
+  membership and last result, moves the state to an epoch holding no rows
+  and keeps the term and vote. The writer refuses a retirement into the
+  current epoch or one holding rows (a snapshot staged there would
+  become a replica's state if it were added again), and resets the
+  agent's state and its durably applied index with it: a stale one would
+  let a replica added again compact past what it applied.
+- **The node:**
+  - the directory holds `Known { record, placement }`; routing, the
+    checks of who may send, `Elsewhere`, `agent_info` and blob requests
+    read the placement;
+  - `reconsider` starts a group where the placement names the node (as a
+    member of `before` without itself, after creation: never a voter
+    until its configuration arrives), and retires it where it no longer
+    does: at once while not established, else on a committed final
+    placement while not leading;
+  - `retire_agent` stops the group, then writes the retirement, into an
+    epoch no snapshot staged in, and the unpins of the programs its state
+    named, and drops every stale epoch in the background; a node starting
+    with a replica its placement no longer names (a crash cut its
+    retirement short) finishes the retirement instead of starting the
+    group. Until the retirement is written no group starts for the agent
+    (one would read rows the retirement then removes under it), and the
+    node then reconsiders it, for a placement naming it again meanwhile;
+  - a placement row that cannot be read leaves its agent unrun until a
+    placement comes, rather than taken for its creation's, which could
+    retire a replica added later;
+  - `place` keeps a placement the node's leadership gives when it
+    supersedes the one held, acts on it, and announces it to every node
+    until each acknowledges it (the record with it); `on_directory` keeps
+    one it hears that supersedes the one held, durably, and acknowledges;
+    a creator re-announces at start only the placement of the creation
+    (term 0);
+  - creation counts toward its majority only the replicas that could run
+    the program;
+  - `replace`: at the leader, after the checks and `could_run` (the
+    current placement sent to the new node until it says), a
+    `ChangeMembership` through the group, from the replicas the directory
+    holds, which the driver refuses as in progress unless they are the
+    core's own configuration (just after an election the directory may
+    trail it); answered once a committed final
+    placement past the joint index is held, or after 30 s (2 s once the
+    node no longer leads: a leader removing itself steps down as the final
+    configuration commits, and says so as it does).
+- **The group driver:** the members a core starts with come from the
+  placement; at start and each round it notes when the replica holds a
+  committed configuration naming it (`established`), and, leading,
+  announces a placement whenever its order changes: on election, on a
+  configuration appended, and once it commits. A leader the committed
+  final configuration removes announces that placement as it steps down,
+  rather than leave it to the next election; a replica that stops leading
+  asks the node to reconsider, so a removed leader retires. A placement
+  not kept is announced again the next round.
+- **Removed voters are released:** vos-raft's leader waits for each
+  voter a change removed to acknowledge the committed final
+  configuration, then appends a confirmation; until that commits it
+  takes no further change and compacts nothing past the configuration
+  before the final one. Here the removed replica learns of its removal
+  from the directory: the leader announces it to every node until each
+  holds it (one that is down once it returns; if the announcer stops
+  first, the next leader announces on its election), and it retires at
+  once, so its group
+  never acknowledges: the leader would wait for good, and the log grow
+  without bound. Each round the leading driver releases them
+  (`Core::release_retiring_voters`, new: it counts every removed voter
+  as acknowledged once the final configuration has committed).
+- **The CLI:** `vos agent replace --agent A --remove X --add Y`.
+
+**Found by the checker, and fixed:** a node shutting down started a
+group again, and then waited for it for good. Its runs were taken out of
+the node first; a stopping driver's last change of role then asked the
+node to reconsider the agent, which, named and running nothing, started
+a new group, whose tasks no runtime polled any more. A node shutting
+down now reconsiders nothing, a stopped driver does not ask, and a group
+starts under the runs' lock only while the node is not closing, which
+the shutdown sets under the same lock: one that checked just before
+could still slip in. And a node's shutdown ran once more when the node
+was dropped, after its runtime had stopped, waiting to cancel tasks a
+stopping driver had spawned meanwhile (an old epoch's removal): no
+runtime would ever run them. A shutdown now runs once, and a node
+closing spawns nothing (what it would do happens at the next start).
+Each race showed about once in thirty to a hundred runs, the checker's
+clients piling sessions on one key meanwhile until its cap refused
+them.
+
+**Tests** (`tests/cluster.rs`, four nodes):
+- a replica replaced under load: the new one catches up, every node holds
+  the final placement, the old one keeps no state or log and stays
+  stopped after a restart;
+- the leader replacing itself: it retires, and a new leader goes on;
+  with elections as slow as a deployment's (2.5–3 s), it is answered
+  before the next one;
+- **a phantom:** the leader cut off from its followers announces a joint
+  configuration that reaches only the node it adds, which starts the
+  group; the next leader's placement outranks it and that node retires;
+  the same replacement at the next leader succeeds;
+- the leader cut off as it appends the final configuration: the others
+  finish the change;
+- a replica down while replaced comes back with its old log: no election,
+  and it retires once it hears;
+- a node that cannot run the program is refused before anything changes;
+- a retirement cut short: a stopped replica given the final placement
+  that drops it, then started cut off from every node, retires on its
+  own;
+- the writer refuses a retirement into the current epoch or one holding
+  rows (`storage.rs`);
+- after a replacement the group compacts again and takes the next
+  change: the leader replaces itself, then its successor replaces
+  another replica (five nodes, compacting);
+- a replica down for good, replaced: the group compacts and takes the
+  next change without it;
+- a retired leader keeps its committed placement when a later leader's
+  arrives for the same configuration, uncommitted and naming it among
+  the nodes before: it does not start the group again;
+- placements' order, `supersedes`, the checks of who may send, and of
+  who may announce (`tests/peer.rs`);
+- a voter removed while down holds the leader's next change until the
+  host releases it, which lets it through (`vos-raft`,
+  `tests/simulated.rs`).
+- **Mutations:** ordering by index alone (four tests fail); no new
+  announcement once a configuration commits (four); no check that the
+  new node can run the program (one); no announcement by a removed
+  leader stepping down (the slow elections' test); no retirement
+  finished at start (the one cut short); a retirement into an epoch
+  holding rows (the writer's test). Not caught: dropping the phantom
+  rule (here the next leader's placement is committed and final, so the
+  other rule retires the phantom's replica too); retiring while leading
+  (a removed leader's core steps down as the final configuration
+  commits, so it never holds that placement while it leads); and a
+  restarted replica not established until its first round (only a
+  placement dropping it, heard in that moment, shows it). All three
+  stay, as guards.
+- **Mutations of the second review's fixes:** no release of removed
+  voters (both new compaction tests fail); placements replaced by order
+  alone (the retired leader's test, and the self-replacement in it then
+  times out, its committed placement taken back; the `supersedes`
+  test). Not caught, and kept as guards: a group starting while its
+  retirement is unwritten (a narrow race), and a change from members
+  the directory holds that the core no longer does (just after an
+  election).
+
+**Not in 3.7b:** a replacement fault in the checker (3.9's fault suite);
+learners (the gap while the new replica catches up).
+
+**Review** (Opus): go, with four things folded in before the commit. A
+retirement moved the state to the next epoch, which could be one a
+snapshot had staged rows in: a replica added again would have taken
+them for its state. It now goes to an empty epoch, and the writer
+refuses any other. A crash between the placement that drops a replica
+and its retirement left the replica's rows for good; a node now
+finishes such a retirement when it starts. A leader removing itself
+left the final placement to the next leader, whose election can take
+longer than the 2 s its answer waits once it steps down (1.5–3 s by
+default); it now announces the placement as it steps down. And a
+restarted replica counted as not established until its group's first
+round, so a placement heard meanwhile could retire it; it now counts as
+established from the configuration it recovers.
+
+**Second review** (Sonnet, on the folds; the Opus reviewer had reached
+its weekly limit): go, with one blocking finding, confirmed by a test
+before the fix. vos-raft's leader waited for every removed voter to
+acknowledge its removal, and the removed replica, retired as soon as
+the directory told it, never did: after any replacement whose removed
+replica retired first (always, once the leader removed itself) the
+group compacted nothing more and refused every further change. The
+directory delivers that finality, so the leader now releases removed
+voters once the final configuration commits; that also keeps a replica
+down for good from holding the group. Folded in with it: a committed
+placement is never replaced by a later leader's announcement of the
+same configuration uncommitted (it restarted the retired leader's group
+on a wiped store); no group starts while a retirement is unwritten; an
+unreadable placement row leaves its agent unrun instead of retiring it;
+a replacement's members are checked against the core's own
+configuration; a creator re-announces only the creation's placement; a
+placement not kept is announced again; comments and this log brought in
+line with the code.
+
+**3.7 is done.** Carried forward, beside what 3.5's list gives 3.8 and
+3.9:
+- **3.8:** every election announces a placement to every node, and
+  every node acknowledges it: with many agents, one leader change per
+  agent is one round to the whole space. A replacement announces up to
+  four (joint, final, and the confirmation uncommitted then committed),
+  each a synced commit on every node.
+- **3.9:** a replacement among the checker's faults; a snapshot stream
+  outlasting the core's own deadline (60 s).
+- **Unscheduled:** learners, so a new replica catches up before it
+  counts toward a majority.

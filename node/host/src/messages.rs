@@ -44,11 +44,8 @@ impl Inner {
             };
         }
         let replicas: Vec<NodeNumber> = self
-            .directory
-            .lock()
-            .expect("the directory")
-            .get(&agent)
-            .map(|record| record.replicas.clone())
+            .placement(agent)
+            .map(|placement| placement.replicas)
             .unwrap_or_default()
             .into_iter()
             .filter(|replica| *replica != self.number)

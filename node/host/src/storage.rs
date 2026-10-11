@@ -17,7 +17,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use vos_wire::ids::AgentId;
-use vos_wire::peer::CreationRecord;
+use vos_wire::peer::{CreationRecord, Placement};
 use vos_wire::result::Write;
 
 use crate::Hooks;
@@ -105,6 +105,17 @@ pub enum Change {
     Barrier,
     /// An agent's creation, as this node learned of it.
     Agent(CreationRecord),
+    /// Where an agent runs, as this node last heard.
+    Placement {
+        agent: AgentId,
+        placement: Placement,
+    },
+    /// The agent retired from this node: see [`crate::store::Batch::retire`].
+    Retire {
+        agent: AgentId,
+        epoch: u8,
+        hard: HardState,
+    },
     /// The time and seed of the work result applied in the same commit.
     LastResult {
         agent: AgentId,
@@ -289,6 +300,32 @@ impl Writer {
                         ));
                     }
                 }
+                Change::Retire { agent, epoch, .. } => {
+                    if *epoch == self.state(&after, *agent)?.epoch {
+                        return Err(format!(
+                            "agent {} retires into its current epoch {epoch}",
+                            agent.0
+                        ));
+                    }
+                    if self
+                        .store
+                        .epoch_holds_rows(*agent, *epoch)
+                        .map_err(|error| error.to_string())?
+                    {
+                        return Err(format!(
+                            "agent {} retires into epoch {epoch}, which holds rows",
+                            agent.0
+                        ));
+                    }
+                    after.insert(
+                        *agent,
+                        AgentState {
+                            epoch: *epoch,
+                            applied: 0,
+                            log_start: 0,
+                        },
+                    );
+                }
                 Change::Switch { agent, switch } => {
                     let mut state = self.state(&after, *agent)?;
                     if switch.epoch == state.epoch || switch.index <= state.applied {
@@ -317,6 +354,8 @@ impl Writer {
         let mut synced = false;
         // Applies in this batch: they count only once it commits.
         let mut applied: HashMap<AgentId, u64> = HashMap::new();
+        // Agents retired in this batch: nothing of theirs is applied.
+        let mut retired = Vec::new();
         // Commits in order, each with its refusal if it has one; a refused
         // commit writes nothing, and is answered in its turn.
         let mut taken = Vec::with_capacity(group.len());
@@ -372,6 +411,11 @@ impl Writer {
                     Change::Unpin { hash, agent } => batch.unpin(hash, *agent),
                     Change::Barrier => {}
                     Change::Agent(record) => batch.agent(record),
+                    Change::Placement { agent, placement } => batch.placement(*agent, placement),
+                    Change::Retire { agent, epoch, hard } => {
+                        batch.retire(*agent, *epoch, hard);
+                        retired.push(*agent);
+                    }
                     Change::LastResult { agent, time, seed } => {
                         batch.last_result(*agent, *time, seed)
                     }
@@ -391,6 +435,14 @@ impl Writer {
         };
         if result.is_ok() {
             self.agents.extend(pending);
+            if !retired.is_empty() {
+                let mut durable = self.shared.durably_applied.lock().expect("unpoisoned");
+                for agent in retired {
+                    self.unsynced_applied.remove(&agent);
+                    applied.remove(&agent);
+                    durable.remove(&agent);
+                }
+            }
             for (agent, index) in applied {
                 let entry = self.unsynced_applied.entry(agent).or_insert(index);
                 *entry = (*entry).max(index);
@@ -722,6 +774,36 @@ mod tests {
             commit(compact(5)).is_err(),
             "at the log start the switch set"
         );
+    }
+
+    #[test]
+    fn a_retirement_goes_only_into_an_empty_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = writer(dir.path());
+        let commit = |change| smol::block_on(writer.commit(vec![change]));
+        let retire = |epoch| Change::Retire {
+            agent: A,
+            epoch,
+            hard: HardState::default(),
+        };
+        commit(apply(1)).unwrap();
+        commit(Change::Stage {
+            agent: A,
+            epoch: 1,
+            first: true,
+            rows: vec![(vec![1, 1], vec![1])],
+        })
+        .unwrap();
+        assert!(commit(retire(0)).is_err(), "the current epoch");
+        assert!(commit(retire(1)).is_err(), "an epoch holding rows");
+        commit(retire(2)).unwrap();
+        commit(Change::Apply {
+            agent: A,
+            epoch: 2,
+            index: 1,
+            writes: Vec::new(),
+        })
+        .unwrap();
     }
 
     /// Holds every commit until released.

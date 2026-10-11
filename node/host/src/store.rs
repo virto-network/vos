@@ -23,7 +23,7 @@ use std::sync::Mutex;
 
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode, Readable};
 use vos_wire::ids::AgentId;
-use vos_wire::peer::CreationRecord;
+use vos_wire::peer::{CreationRecord, Placement};
 use vos_wire::result::Write;
 use vos_wire::{Decode, Encode};
 
@@ -224,6 +224,10 @@ pub trait Store: Send + Sync {
     /// The agents this node knows, each with its creation record.
     fn agents(&self) -> Result<Vec<CreationRecord>>;
 
+    /// Every agent's latest placement this node holds: `None` where its
+    /// row is unreadable.
+    fn placements(&self) -> Result<HashMap<AgentId, Option<Placement>>>;
+
     /// The seed of the node's key, once made: secret, never served.
     fn node_secret(&self) -> Result<Option<[u8; 32]>>;
 }
@@ -301,6 +305,15 @@ pub trait Batch {
     /// Record an agent's creation.
     fn agent(&mut self, record: &CreationRecord);
 
+    /// Record where an agent runs.
+    fn placement(&mut self, agent: AgentId, placement: &Placement);
+
+    /// Retire the agent from this node: its log, applied index, log start,
+    /// membership and last result go, its state moves to the stale epoch
+    /// before `epoch`, and of its hard state only the term and vote stay
+    /// (`hard`), so it never votes twice in a term if added again.
+    fn retire(&mut self, agent: AgentId, epoch: u8, hard: &HardState);
+
     /// The time and seed of the last work result applied to `agent`.
     fn last_result(&mut self, agent: AgentId, time: u64, seed: &[u8; 32]);
 
@@ -339,6 +352,7 @@ enum NodeRow {
     Epoch = 0x09,
     Secret = 0x0a,
     LastResult = 0x0b,
+    Placement = 0x0c,
 }
 
 fn agent_key(agent: AgentId, epoch: u8, key: &[u8]) -> Vec<u8> {
@@ -854,6 +868,28 @@ impl Store for Fjall {
         }
         Ok(records)
     }
+
+    fn placements(&self) -> Result<HashMap<AgentId, Option<Placement>>> {
+        let prefix = node_record(NodeRow::Placement, &[]);
+        let mut placements = HashMap::new();
+        for row in self.system.prefix(&prefix) {
+            let (key, value) = row.into_inner()?;
+            let Some(agent) = key
+                .get(prefix.len()..)
+                .and_then(|id| id.try_into().ok())
+                .map(|id| AgentId(u32::from_be_bytes(id)))
+            else {
+                tracing::error!(key = ?&key[prefix.len()..], "an unreadable placement key");
+                continue;
+            };
+            let placement = match Placement::decode(&value) {
+                Ok((placement, used)) if used == value.len() => Some(placement),
+                _ => None,
+            };
+            placements.insert(agent, placement);
+        }
+        Ok(placements)
+    }
 }
 
 /// An agent's applied state, exported from one store snapshot: labelled
@@ -1184,6 +1220,46 @@ impl Batch for FjallBatch {
     fn agent(&mut self, record: &CreationRecord) {
         let key = [registry_prefix(), record.agent.0.to_be_bytes().to_vec()].concat();
         self.batch.insert(&self.store.system, key, record.encode());
+    }
+
+    fn placement(&mut self, agent: AgentId, placement: &Placement) {
+        self.batch.insert(
+            &self.store.system,
+            node_record(NodeRow::Placement, &agent.0.to_be_bytes()),
+            placement.encode(),
+        );
+    }
+
+    fn retire(&mut self, agent: AgentId, epoch: u8, hard: &HardState) {
+        let read = self
+            .store
+            .agent_rows(agent)
+            .and_then(|rows| Ok((rows.log_start, self.store.last_log_index(agent)?)));
+        let (start, last) = match read {
+            Ok(read) => read,
+            Err(error) => {
+                self.error.get_or_insert(error);
+                return;
+            }
+        };
+        for index in start.saturating_add(1)..=last.unwrap_or(0) {
+            self.batch.remove(&self.store.log, log_key(agent, index));
+        }
+        for row in [
+            NodeRow::Applied,
+            NodeRow::LogStart,
+            NodeRow::Membership,
+            NodeRow::LastResult,
+        ] {
+            self.batch
+                .remove(&self.store.system, node_row(agent, row, &[]));
+        }
+        self.hard_state(agent, hard);
+        self.batch.insert(
+            &self.store.system,
+            node_row(agent, NodeRow::Epoch, &[]),
+            [epoch],
+        );
     }
 
     fn last_result(&mut self, agent: AgentId, time: u64, seed: &[u8; 32]) {

@@ -715,7 +715,7 @@ Client-named sessions in the agent, with t0, caps that refuse, and
 collection with the expiry index and the sweep. The checker gains expiry
 and replay: a resend after collection and a captured request both fail.
 
-### 3.7 Snapshots and catching up
+### 3.7 Snapshots and catching up [done]
 
 Log compaction on every replica, snapshots streamed to a lagging or new
 replica, and replacing a replica through a membership change.

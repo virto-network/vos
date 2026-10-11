@@ -9,12 +9,14 @@ use std::time::{Duration, Instant};
 use smol::future::FutureExt;
 use vos_net::Class;
 use vos_raft::core::{
-    Action, Answer, Core, ProposeError, ReadIndexError, SnapshotConfiguration, Write,
+    Action, Answer, ChangeMembershipError, Core, ProposeError, ReadIndexError,
+    SnapshotConfiguration, Write,
 };
 use vos_raft::{Config as RaftConfig, Message, Role};
 use vos_wire::ids::AgentId;
 use vos_wire::peer::{
-    Configuration, CreationRecord, Manifest, NodeNumber, PeerMessage, SnapshotAck, SnapshotChunk,
+    Configuration, CreationRecord, Manifest, NodeNumber, PeerMessage, Placement, SnapshotAck,
+    SnapshotChunk,
 };
 use vos_wire::records::{Installed, unstored};
 use vos_wire::result::{WorkResult, Write as StateWrite};
@@ -87,6 +89,15 @@ pub(crate) enum Local {
     ReadIndex {
         answer: smol::channel::Sender<Result<u64, ReadIndexError>>,
     },
+    /// Replace the group's members, `current` as the caller saw them, by
+    /// `members`: answered with the index of the joint configuration,
+    /// which the core finalizes once it commits; refused as in progress
+    /// when the core's configuration is not `current`.
+    ChangeMembership {
+        current: Vec<NodeNumber>,
+        members: Vec<NodeNumber>,
+        answer: smol::channel::Sender<Result<u64, ChangeMembershipError>>,
+    },
     /// The snapshot stream to `to`, named by `term` and `index`, ended:
     /// `done` once its follower staged every chunk.
     StreamEnded {
@@ -121,11 +132,15 @@ pub(crate) struct State {
     /// applied.
     pub recovered: u64,
     pub stopped: bool,
+    /// The replica has held a committed configuration naming it.
+    pub established: bool,
 }
 
 pub(crate) struct Shared {
     pub agent: AgentId,
     pub record: CreationRecord,
+    /// The members its core starts with, when its store holds none.
+    pub members: Vec<NodeNumber>,
     /// The agent's identity: its record's hash, which clients sign for.
     pub identity: [u8; 32],
     state: Mutex<State>,
@@ -139,11 +154,12 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
-    pub fn new(record: CreationRecord) -> Self {
+    pub fn new(record: CreationRecord, members: Vec<NodeNumber>) -> Self {
         Self {
             agent: record.agent,
             identity: crate::identity(&record),
             record,
+            members,
             state: Mutex::new(State {
                 role: Role::Follower,
                 term: 0,
@@ -154,6 +170,7 @@ impl Shared {
                 applied: 0,
                 recovered: 0,
                 stopped: false,
+                established: false,
             }),
             changed: event_listener::Event::new(),
             outcomes: Mutex::new(VecDeque::new()),
@@ -258,6 +275,9 @@ struct Driver {
     /// The highest compaction bound the core gave, and whether to compact.
     compact_bound: u64,
     compact_due: bool,
+    memberships: HashMap<u64, smol::channel::Sender<Result<u64, ChangeMembershipError>>>,
+    /// The order of the placement this replica last announced as leader.
+    announced: Option<(u64, u64, bool)>,
 }
 
 /// A snapshot stream this replica runs to a follower, as leader.
@@ -328,19 +348,17 @@ impl Driver {
         // What the log still holds of the commit: a cut at a lost blob may
         // have taken the rest.
         let recovered = rows.hard.commit.min(last_index).max(applied);
-        let mut config = RaftConfig::new(
-            inner.number,
-            shared.record.replicas.clone(),
-            shared.identity,
-        );
+        let mut config = RaftConfig::new(inner.number, shared.members.clone(), shared.identity);
         config.election_timeout_ms = inner.election_timeout_ms;
         config.heartbeat_interval_ms = inner.heartbeat_ms;
         config.compact_hysteresis = inner.compact_every;
         let core = Core::new(config, raft::recovered(rows), 0, rand_seed());
+        let established = established(&core, inner.number);
         shared.update(|state| {
             state.written = last_index;
             state.applied = applied;
             state.recovered = recovered;
+            state.established = established;
         });
         Ok(Self {
             agent,
@@ -362,6 +380,8 @@ impl Driver {
             chunks: VecDeque::new(),
             compact_bound: 0,
             compact_due: false,
+            memberships: HashMap::new(),
+            announced: None,
             inner,
             shared,
         })
@@ -432,6 +452,11 @@ impl Driver {
                 self.report_health();
                 self.core
                     .durably_applied(self.inner.storage.durably_applied(self.agent));
+                // A replica a change removed learns of it from the
+                // directory, which tells every node until each holds it,
+                // one that is down once it returns: the group does not wait
+                // for the replica's own acknowledgement.
+                self.core.release_retiring_voters();
                 self.settle_streams();
                 if !self.process().await
                     || !self.stage().await
@@ -440,6 +465,7 @@ impl Driver {
                 {
                     break;
                 }
+                self.settle_membership().await;
                 self.fetch_blobs();
             }
         }
@@ -459,6 +485,9 @@ impl Driver {
                 Local::ReadIndex { answer } => {
                     let _ = answer.try_send(Err(ReadIndexError::Stopped));
                 }
+                Local::ChangeMembership { answer, .. } => {
+                    let _ = answer.try_send(Err(ChangeMembershipError::Stopped));
+                }
                 Local::Retire | Local::StreamEnded { .. } => {}
             }
         }
@@ -467,6 +496,9 @@ impl Driver {
         }
         for (_, answer) in self.reads.drain() {
             let _ = answer.try_send(Err(ReadIndexError::Stopped));
+        }
+        for (_, answer) in self.memberships.drain() {
+            let _ = answer.try_send(Err(ChangeMembershipError::Stopped));
         }
     }
 
@@ -508,6 +540,25 @@ impl Driver {
                 self.next_token += 1;
                 self.reads.insert(token, answer);
                 self.core.read_index(token, Some(READ_INDEX_MS));
+            }
+            Local::ChangeMembership {
+                current,
+                members,
+                answer,
+            } => {
+                // The caller read the members from the directory, which
+                // may trail the core just after an election.
+                let status = self.core.status();
+                let mut held = status.members;
+                held.sort_unstable();
+                if status.joint_old.is_some() || held != current {
+                    let _ = answer.try_send(Err(ChangeMembershipError::InProgress));
+                    return;
+                }
+                let token = self.next_token;
+                self.next_token += 1;
+                self.memberships.insert(token, answer);
+                self.core.change_membership(token, members);
             }
             Local::StreamEnded {
                 to,
@@ -610,7 +661,11 @@ impl Driver {
                     let _ = answer.try_send(result);
                 }
             }
-            Action::Answer(_) => {}
+            Action::Answer(Answer::ChangeMembership { token, result }) => {
+                if let Some(answer) = self.memberships.remove(&token) {
+                    let _ = answer.try_send(result);
+                }
+            }
             Action::Changed { term, role, leader } => {
                 // A leadership's streams end with it.
                 if role != Role::Leader {
@@ -625,6 +680,26 @@ impl Driver {
                     state.leader = leader;
                     state.leading_from = leading_from;
                 });
+                if role != Role::Leader {
+                    // A leader that removed itself steps down as the final
+                    // configuration commits: it says so itself, at once,
+                    // rather than leave it to the next leader's election.
+                    let status = self.core.status();
+                    let me = self.inner.number;
+                    let removed = self.announced.is_some()
+                        && status.joint_old.is_none()
+                        && !status.members.contains(&me)
+                        && status.commit_index >= status.active_config_index.unwrap_or(0);
+                    if removed {
+                        self.announce_placement().await;
+                    }
+                    self.announced = None;
+                    // It retires once it steps down; a group stopping does
+                    // not.
+                    if !self.shared.state().stopped {
+                        self.inner.reconsider(self.agent);
+                    }
+                }
             }
         }
         true
@@ -698,6 +773,65 @@ impl Driver {
         }
         if let Some(written) = written {
             self.shared.update(|state| state.written = written);
+        }
+    }
+
+    /// Note when this replica holds a committed configuration naming it,
+    /// and, leading, announce where the agent runs whenever that changes.
+    async fn settle_membership(&mut self) {
+        if established(&self.core, self.inner.number) && !self.shared.state().established {
+            self.shared.update(|state| state.established = true);
+        }
+        if self.core.role() != Role::Leader {
+            return;
+        }
+        self.announce_placement().await;
+    }
+
+    /// Announce where the agent runs, as this replica's core has it, when
+    /// that changed since it last did.
+    async fn announce_placement(&mut self) {
+        let status = self.core.status();
+        let index = status.active_config_index.unwrap_or(0);
+        let mut replicas = status.members.clone();
+        replicas.extend(status.joint_old.iter().flatten().copied());
+        replicas.sort_unstable();
+        replicas.dedup();
+        // The configuration before; once compacted away, the one at the
+        // log's start, which may be this one. `before` matters while a
+        // placement is uncommitted, and for a leader the change removed,
+        // which announces it as one of `before`: the core compacts nothing
+        // past the configuration before a final one until the removal is
+        // confirmed.
+        let before = if index == 0 {
+            Vec::new()
+        } else {
+            self.core
+                .config_at(index - 1)
+                .map(|record| {
+                    let mut nodes = record.current;
+                    nodes.extend(record.joint_old.unwrap_or_default());
+                    nodes.sort_unstable();
+                    nodes.dedup();
+                    nodes
+                })
+                .unwrap_or_default()
+        };
+        let placement = Placement {
+            replicas,
+            before,
+            term: status.current_term,
+            index,
+            joint: status.joint_old.is_some(),
+            committed: status.commit_index >= index,
+        };
+        let order = placement.order();
+        if self.announced == Some(order) {
+            return;
+        }
+        // One not kept is tried again the next round.
+        if self.inner.place(self.agent, placement).await {
+            self.announced = Some(order);
         }
     }
 
@@ -1046,48 +1180,16 @@ impl Driver {
     /// be staged under: one an earlier install left is being dropped in the
     /// background, and a stream never waits for it.
     fn empty_epoch(&self) -> Option<u8> {
-        let read = self
-            .inner
-            .store
-            .snapshot()
-            .epoch(self.agent)
-            .and_then(|current| Ok((current, self.inner.store.stale_epochs(self.agent)?)));
-        let (current, stale) = match read {
-            Ok(read) => read,
-            Err(error) => {
-                tracing::warn!(agent = self.agent.0, "the epochs are unreadable: {error}");
-                return None;
-            }
-        };
-        let mut epoch = next_epoch(current);
-        while stale.contains(&epoch) {
-            epoch = next_epoch(epoch);
-            if epoch == current {
-                return None;
-            }
-        }
-        Some(epoch)
+        empty_epoch(&self.inner, self.agent)
     }
 
-    /// Remove an epoch a switch left behind, in the background.
+    /// Remove an epoch a switch, or an abandoned install, left behind, in
+    /// the background.
     fn drop_epoch(&self, epoch: u8) {
         let inner = Arc::clone(&self.inner);
         let agent = self.agent;
         self.inner.spawn(async move {
-            loop {
-                let drop = Change::DropEpoch {
-                    agent,
-                    epoch,
-                    limit: DROP_ROWS,
-                };
-                if inner.storage.commit(vec![drop]).await.is_err() {
-                    return;
-                }
-                match inner.store.stale_epochs(agent) {
-                    Ok(stale) if stale.contains(&epoch) => {}
-                    _ => return,
-                }
-            }
+            drop_epoch(&inner, agent, epoch).await;
         });
     }
 
@@ -1133,11 +1235,11 @@ impl Driver {
         };
         let me = self.inner.number;
         let others: Vec<NodeNumber> = self
-            .shared
-            .record
-            .replicas
-            .iter()
-            .copied()
+            .inner
+            .placement(self.agent)
+            .map(|placement| placement.replicas)
+            .unwrap_or_default()
+            .into_iter()
             .filter(|node| *node != me)
             .collect();
         if others.is_empty() {
@@ -1157,6 +1259,69 @@ impl Driver {
         .encode();
         let _ = network.send(target, Class::Requests, u64::from(self.agent.0), frame);
         self.asked = Some((Instant::now(), missing));
+    }
+}
+
+/// Remove `agent`'s rows under the old `epoch`, a few thousand a write.
+async fn drop_epoch(inner: &Inner, agent: AgentId, epoch: u8) {
+    loop {
+        let drop = Change::DropEpoch {
+            agent,
+            epoch,
+            limit: DROP_ROWS,
+        };
+        if inner.storage.commit(vec![drop]).await.is_err() {
+            return;
+        }
+        match inner.store.stale_epochs(agent) {
+            Ok(stale) if stale.contains(&epoch) => {}
+            _ => return,
+        }
+    }
+}
+
+/// An epoch of `agent`'s past its current one that holds no rows.
+pub(crate) fn empty_epoch(inner: &Inner, agent: AgentId) -> Option<u8> {
+    let read = inner
+        .store
+        .snapshot()
+        .epoch(agent)
+        .and_then(|current| Ok((current, inner.store.stale_epochs(agent)?)));
+    let (current, stale) = match read {
+        Ok(read) => read,
+        Err(error) => {
+            tracing::warn!(agent = agent.0, "the epochs are unreadable: {error}");
+            return None;
+        }
+    };
+    let mut epoch = next_epoch(current);
+    while stale.contains(&epoch) {
+        epoch = next_epoch(epoch);
+        if epoch == current {
+            return None;
+        }
+    }
+    Some(epoch)
+}
+
+/// Whether `core` holds a committed configuration naming `me`.
+fn established(core: &Core<NodeNumber>, me: NodeNumber) -> bool {
+    let status = core.status();
+    let named = status.members.contains(&me)
+        || status
+            .joint_old
+            .as_ref()
+            .is_some_and(|old| old.contains(&me));
+    named && status.commit_index >= status.active_config_index.unwrap_or(0)
+}
+
+/// Remove every stale epoch of `agent`'s, as [`drop_epoch`] does.
+pub(crate) async fn drop_stale_epochs(inner: &Inner, agent: AgentId) {
+    let Ok(stale) = inner.store.stale_epochs(agent) else {
+        return;
+    };
+    for epoch in stale {
+        drop_epoch(inner, agent, epoch).await;
     }
 }
 
@@ -1470,7 +1635,7 @@ fn pins(
 
 /// The programs installed rows name: each instance's, and its attestable
 /// methods'.
-fn programs<'a>(rows: impl Iterator<Item = &'a Vec<u8>>) -> BTreeSet<[u8; 32]> {
+pub(crate) fn programs<'a>(rows: impl Iterator<Item = &'a Vec<u8>>) -> BTreeSet<[u8; 32]> {
     let mut programs = BTreeSet::new();
     for value in rows {
         let Some((installed, _)) = unstored(value).and_then(|bytes| Installed::decode(bytes).ok())

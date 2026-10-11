@@ -7,12 +7,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use vos_net::memory::Hub;
-use vos_node::store::{EntryKind, Store, View};
+use vos_node::store::{Batch as _, Durability, EntryKind, Fjall, Store, View};
 use vos_node::{CallError, Config, Hooks, Node, Peers, Reply, Space, SpaceNode};
 use vos_wire::abi::refusal;
 use vos_wire::batch::{Batch, Input, Message, Request};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session};
-use vos_wire::ingress::{Contact, NodeId};
+use vos_wire::ingress::{Contact, NodeId, Unplaced};
 use vos_wire::keys;
 use vos_wire::peer::{NodeNumber, PeerMessage};
 use vos_wire::result::Outcome;
@@ -81,6 +81,8 @@ struct Cluster {
     /// Compaction every so many entries, keeping a tail, and snapshot
     /// chunks of about so many bytes, when not the defaults.
     compaction: Option<(u64, u64, usize)>,
+    /// The election timeout's range, when not the fast one.
+    election_timeout_ms: Option<(u64, u64)>,
 }
 
 impl Cluster {
@@ -127,6 +129,7 @@ impl Cluster {
                 t0: vos_node::wall_clock(),
             },
             compaction: None,
+            election_timeout_ms: None,
         };
         cluster.grow(count);
         cluster
@@ -194,7 +197,7 @@ impl Cluster {
         } else {
             Peers::Hub(self.hub.clone())
         };
-        config.election_timeout_ms = (40, 80);
+        config.election_timeout_ms = self.election_timeout_ms.unwrap_or((40, 80));
         config.heartbeat_ms = 10;
         if let Some((every, tail, chunk)) = self.compaction {
             config.compact_every = every;
@@ -1115,4 +1118,442 @@ fn a_snapshot_waits_for_the_programs_it_names() {
         cluster.node(follower).pinned(),
         cluster.node(leader).pinned()
     );
+}
+
+/// Every running node holds `placement`'s replicas for `agent`, committed
+/// and final.
+fn placed(cluster: &Cluster, agent: AgentId, replicas: &[NodeNumber]) {
+    wait_until("every node holds the final placement", || {
+        cluster.running().all(|(_, node)| {
+            node.placement(agent).is_some_and(|placement| {
+                placement.replicas == replicas && placement.committed && !placement.joint
+            })
+        })
+    });
+}
+
+/// A node no longer replicating `agent` runs no group for it and keeps
+/// none of its state or log.
+fn retired(node: &Node, agent: AgentId) {
+    wait_until("the replica retires", || {
+        node.applied(agent).is_none()
+            && rows(node, agent).is_empty()
+            && node.store().raft(agent).unwrap().log.is_empty()
+    });
+}
+
+/// One replica replaced by another node while calls go on: the new one
+/// catches up, every node holds the new placement, the old replica keeps
+/// nothing and does not come back after a restart.
+#[test]
+fn a_replica_is_replaced_under_load() {
+    let mut cluster = Cluster::compacting(4);
+    let agent = cluster.node(1).create_replicated(vec![1, 2, 3]).unwrap();
+    cluster.install(agent);
+    let leader = cluster.leader(agent);
+    let removed = (1..=3).find(|number| *number != leader).unwrap();
+    for sequence in 1..=30 {
+        done(cluster.increment(leader, agent, sequence, sequence));
+    }
+    let mut replicas: Vec<NodeNumber> = (1..=3)
+        .filter(|number| *number != removed)
+        .chain([4])
+        .collect();
+    replicas.sort_unstable();
+    std::thread::scope(|scope| {
+        let cluster = &cluster;
+        scope.spawn(move || {
+            for sequence in 31..=60 {
+                done(cluster.increment(leader, agent, sequence, sequence));
+            }
+        });
+        assert_eq!(
+            cluster.node(leader).replace(agent, removed, 4).unwrap(),
+            replicas
+        );
+    });
+    placed(&cluster, agent, &replicas);
+    retired(cluster.node(removed), agent);
+    cluster.converged(agent);
+    assert_eq!(cluster.value(4, agent), (1..=60).sum::<u64>());
+    cluster.stop(removed);
+    cluster.start(removed);
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(cluster.node(removed).applied(agent).is_none());
+    // Clients learn the replicas from any node.
+    let info = cluster
+        .node(removed)
+        .placement(agent)
+        .expect("the placement");
+    assert_eq!(info.replicas, replicas);
+}
+
+/// After a replacement, the group compacts its log again and takes the
+/// next change, though the replica it removed retired without
+/// acknowledging the change to the group. Here the leader removes itself,
+/// then its successor replaces another replica.
+#[test]
+fn a_replacement_leaves_the_group_free_to_change_and_compact() {
+    let cluster = Cluster::compacting(5);
+    let agent = cluster.node(1).create_replicated(vec![1, 2, 3]).unwrap();
+    cluster.install(agent);
+    let leader = cluster.leader(agent);
+    for sequence in 1..=10 {
+        done(cluster.increment(leader, agent, sequence, 1));
+    }
+    let mut replicas: Vec<NodeNumber> = (1..=3)
+        .filter(|number| *number != leader)
+        .chain([4])
+        .collect();
+    replicas.sort_unstable();
+    assert_eq!(
+        cluster.node(leader).replace(agent, leader, 4).unwrap(),
+        replicas
+    );
+    retired(cluster.node(leader), agent);
+    let next = cluster.leader(agent);
+    let start = log_start(cluster.node(next), agent);
+    for sequence in 11..=40 {
+        done(cluster.increment(next, agent, sequence, 1));
+    }
+    assert!(
+        log_start(cluster.node(next), agent) > start,
+        "compacting again"
+    );
+    let removed = *replicas.iter().find(|number| **number != next).unwrap();
+    let mut after: Vec<NodeNumber> = replicas
+        .iter()
+        .copied()
+        .filter(|number| *number != removed)
+        .chain([5])
+        .collect();
+    after.sort_unstable();
+    assert_eq!(
+        cluster.node(next).replace(agent, removed, 5).unwrap(),
+        after
+    );
+    placed(&cluster, agent, &after);
+    cluster.converged(agent);
+}
+
+/// A replica down for good does not hold the group up once it is
+/// replaced: the group compacts and takes the next change without it.
+#[test]
+fn a_replica_replaced_while_down_holds_nothing_up() {
+    let mut cluster = Cluster::compacting(5);
+    let agent = cluster.node(1).create_replicated(vec![1, 2, 3]).unwrap();
+    cluster.install(agent);
+    let leader = cluster.leader(agent);
+    let mut followers = (1..=3).filter(|number| *number != leader);
+    let (gone, other) = (followers.next().unwrap(), followers.next().unwrap());
+    cluster.stop(gone);
+    cluster.node(leader).replace(agent, gone, 4).unwrap();
+    let start = log_start(cluster.node(leader), agent);
+    for sequence in 1..=30 {
+        done(cluster.increment(leader, agent, sequence, 1));
+    }
+    assert!(log_start(cluster.node(leader), agent) > start);
+    let mut after = vec![leader, 4, 5];
+    after.sort_unstable();
+    assert_eq!(
+        cluster.node(leader).replace(agent, other, 5).unwrap(),
+        after
+    );
+    placed(&cluster, agent, &after);
+}
+
+/// A leader that removed itself and retired keeps its committed
+/// placement when a later leader announces the same configuration before
+/// it learns that it committed, naming the old leader among the nodes
+/// before: the old leader does not start the group again.
+#[test]
+fn a_retired_leader_keeps_its_committed_placement() {
+    let mut cluster = Cluster::new(4);
+    let agent = cluster.node(1).create_replicated(vec![1, 2, 3]).unwrap();
+    cluster.install(agent);
+    let leader = cluster.leader(agent);
+    cluster.node(leader).replace(agent, leader, 4).unwrap();
+    retired(cluster.node(leader), agent);
+    let next = cluster.leader(agent);
+    // Settled once the next leader has confirmed the removal and announced
+    // it: the same committed placement on both, twice in a row.
+    let settled = || {
+        let held = cluster.node(leader).placement(agent)?;
+        (held.committed && Some(&held) == cluster.node(next).placement(agent).as_ref())
+            .then_some(held)
+    };
+    let mut held = None;
+    wait_until("the placements settle", || {
+        let first = settled();
+        std::thread::sleep(Duration::from_millis(200));
+        held = first.filter(|first| settled().as_ref() == Some(first));
+        held.is_some()
+    });
+    let held = held.unwrap();
+    let record = cluster
+        .node(leader)
+        .store()
+        .agents()
+        .unwrap()
+        .into_iter()
+        .find(|record| record.agent == agent)
+        .unwrap();
+    // One of the replicas, stopped, speaks for it.
+    let replica = *held
+        .replicas
+        .iter()
+        .find(|number| **number != next)
+        .unwrap();
+    cluster.stop(replica);
+    let (sender, _arrivals) = cluster.hub.join(replica);
+    vos_net::Network::set_peers(&sender, cluster.space.peers());
+    let message = PeerMessage::Directory {
+        record,
+        placement: vos_wire::peer::Placement {
+            before: [held.before.clone(), vec![leader]].concat(),
+            term: held.term + 5,
+            committed: false,
+            ..held.clone()
+        },
+    };
+    vos_net::Network::send(
+        &sender,
+        leader,
+        vos_net::Class::Requests,
+        u64::from(agent.0),
+        message.encode(),
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(cluster.node(leader).applied(agent).is_none());
+    let kept = cluster.node(leader).placement(agent).unwrap();
+    assert!(kept.committed && kept.term < held.term + 5 && !kept.admits(leader));
+}
+
+/// The leader replaces itself: it finalizes the change, steps down and
+/// retires, and the agent goes on under a new leader.
+#[test]
+fn the_leader_replaces_itself() {
+    let cluster = Cluster::new(4);
+    let agent = cluster.node(1).create_replicated(vec![1, 2, 3]).unwrap();
+    cluster.install(agent);
+    let leader = cluster.leader(agent);
+    assert_eq!(done(cluster.increment(leader, agent, 1, 5)), 5);
+    let mut replicas: Vec<NodeNumber> = (1..=3)
+        .filter(|number| *number != leader)
+        .chain([4])
+        .collect();
+    replicas.sort_unstable();
+    assert_eq!(
+        cluster.node(leader).replace(agent, leader, 4).unwrap(),
+        replicas
+    );
+    placed(&cluster, agent, &replicas);
+    retired(cluster.node(leader), agent);
+    let next = cluster.leader(agent);
+    assert_ne!(next, leader);
+    assert_eq!(done(cluster.increment(next, agent, 2, 1)), 6);
+    cluster.converged(agent);
+}
+
+/// With elections as slow as a deployment's, a leader replacing itself
+/// is answered without waiting for the next leader: it says where the
+/// agent runs as it steps down.
+#[test]
+fn a_leader_replacing_itself_is_answered_before_the_next_election() {
+    let mut cluster = Cluster::build(0, Arc::new(vos_node::NoHooks), Vec::new(), false);
+    cluster.election_timeout_ms = Some((2500, 3000));
+    cluster.grow(4);
+    let agent = cluster.node(1).create_replicated(vec![1, 2, 3]).unwrap();
+    cluster.install(agent);
+    let leader = cluster.leader(agent);
+    let mut replicas: Vec<NodeNumber> = (1..=3)
+        .filter(|number| *number != leader)
+        .chain([4])
+        .collect();
+    replicas.sort_unstable();
+    assert_eq!(
+        cluster.node(leader).replace(agent, leader, 4).unwrap(),
+        replicas
+    );
+    placed(&cluster, agent, &replicas);
+    retired(cluster.node(leader), agent);
+}
+
+/// A retirement a crash cut short: the node holds the placement that no
+/// longer names it, and its replica's log and state. Started cut off from
+/// every other node, it finishes the retirement on its own.
+#[test]
+fn a_retirement_cut_short_finishes_at_the_next_start() {
+    let mut cluster = Cluster::new(4);
+    let agent = cluster.node(1).create_replicated(vec![1, 2, 3]).unwrap();
+    cluster.install(agent);
+    let leader = cluster.leader(agent);
+    let removed = (1..=3).find(|number| *number != leader).unwrap();
+    assert_eq!(done(cluster.increment(leader, agent, 1, 3)), 3);
+    cluster.converged(agent);
+    cluster.stop(removed);
+    cluster.node(leader).replace(agent, removed, 4).unwrap();
+    let placement = cluster.node(leader).placement(agent).unwrap();
+    {
+        let store =
+            Fjall::open(cluster.dirs[usize::from(removed) - 1].path().join("store")).unwrap();
+        assert!(
+            store.raft(agent).unwrap().applied > 0,
+            "the replica's state"
+        );
+        let mut batch = store.batch();
+        batch.placement(agent, &placement);
+        batch.commit(Durability::Synced).unwrap();
+    }
+    cluster.hub.isolate(removed);
+    cluster.start(removed);
+    retired(cluster.node(removed), agent);
+    wait_until("the old epoch is dropped", || {
+        cluster
+            .node(removed)
+            .store()
+            .stale_epochs(agent)
+            .unwrap()
+            .is_empty()
+    });
+}
+
+/// A leader cut off before its joint configuration reaches a majority
+/// announces it to the node it would add, which starts the group; the
+/// next leader's placement outranks it, and that node stops. A second
+/// replacement, at the next leader, then succeeds.
+#[test]
+fn a_phantom_placement_gives_way_to_the_next_leader() {
+    let cluster = Cluster::new(4);
+    let agent = cluster.node(1).create_replicated(vec![1, 2, 3]).unwrap();
+    cluster.install(agent);
+    let leader = cluster.leader(agent);
+    let followers: Vec<NodeNumber> = (1..=3).filter(|number| *number != leader).collect();
+    for follower in &followers {
+        cluster.hub.partition(leader, *follower);
+    }
+    std::thread::scope(|scope| {
+        let cluster = &cluster;
+        let gone = followers[1];
+        let replaced = scope.spawn(move || cluster.node(leader).replace(agent, gone, 4));
+        wait_until("the node it would add starts the group", || {
+            cluster.node(4).applied(agent).is_some()
+        });
+        assert!(replaced.join().unwrap().is_err(), "never committed");
+    });
+    let next = loop {
+        let next = cluster.leader(agent);
+        if next != leader {
+            break next;
+        }
+    };
+    retired(cluster.node(4), agent);
+    cluster.hub.heal();
+    let mut replicas = vec![leader, followers[0], 4];
+    replicas.sort_unstable();
+    assert_eq!(
+        cluster.node(next).replace(agent, followers[1], 4).unwrap(),
+        replicas
+    );
+    placed(&cluster, agent, &replicas);
+    cluster.converged(agent);
+}
+
+/// The leader cut off once its joint configuration committed, as it
+/// appends the final one: the next leader finalizes the change, and says
+/// so.
+#[test]
+fn the_next_leader_finalizes_a_joint_configuration() {
+    let cluster = Cluster::new(4);
+    let agent = cluster.node(1).create_replicated(vec![1, 2, 3]).unwrap();
+    cluster.install(agent);
+    let leader = cluster.leader(agent);
+    let removed = (1..=3).find(|number| *number != leader).unwrap();
+    std::thread::scope(|scope| {
+        let cluster = &cluster;
+        scope.spawn(move || {
+            let _ = cluster.node(leader).replace(agent, removed, 4);
+        });
+        // The core appends the final configuration once the joint one
+        // commits.
+        wait_until("the final configuration is appended", || {
+            cluster
+                .node(leader)
+                .placement(agent)
+                .is_some_and(|placement| placement.replicas.contains(&4) && !placement.joint)
+        });
+        cluster.hub.isolate(leader);
+    });
+    let mut replicas: Vec<NodeNumber> = (1..=3)
+        .filter(|number| *number != removed)
+        .chain([4])
+        .collect();
+    replicas.sort_unstable();
+    wait_until("the final placement elsewhere", || {
+        cluster
+            .running()
+            .filter(|(number, _)| *number != leader)
+            .all(|(_, node)| {
+                node.placement(agent).is_some_and(|placement| {
+                    placement.replicas == replicas && placement.committed && !placement.joint
+                })
+            })
+    });
+    cluster.hub.heal();
+    placed(&cluster, agent, &replicas);
+    retired(cluster.node(removed), agent);
+}
+
+/// A replica down while it is replaced comes back with its old log: it
+/// does not disturb the group, and retires once it hears where the agent
+/// runs.
+#[test]
+fn a_removed_replica_back_with_its_old_log_disturbs_nothing() {
+    let mut cluster = Cluster::new(4);
+    let agent = cluster.node(1).create_replicated(vec![1, 2, 3]).unwrap();
+    cluster.install(agent);
+    let leader = cluster.leader(agent);
+    let removed = (1..=3).find(|number| *number != leader).unwrap();
+    assert_eq!(done(cluster.increment(leader, agent, 1, 3)), 3);
+    cluster.converged(agent);
+    cluster.stop(removed);
+    let mut replicas: Vec<NodeNumber> = (1..=3)
+        .filter(|number| *number != removed)
+        .chain([4])
+        .collect();
+    replicas.sort_unstable();
+    assert_eq!(
+        cluster.node(leader).replace(agent, removed, 4).unwrap(),
+        replicas
+    );
+    let term = |cluster: &Cluster| cluster.node(leader).store().raft(agent).unwrap().hard.term;
+    let before = term(&cluster);
+    cluster.start(removed);
+    retired(cluster.node(removed), agent);
+    assert_eq!(cluster.leader(agent), leader);
+    assert_eq!(term(&cluster), before, "no election");
+    placed(&cluster, agent, &replicas);
+}
+
+/// A node that cannot run the agent's program is refused before the
+/// group's configuration changes.
+#[test]
+fn a_replacement_by_a_node_that_cannot_run_the_program_is_refused() {
+    let programs = Programs::load();
+    let cluster = Cluster::with(
+        4,
+        Arc::new(vos_node::NoHooks),
+        vec![None, None, None, Some(programs.counter.clone())],
+    );
+    let agent = cluster.node(1).create_replicated(vec![1, 2, 3]).unwrap();
+    let leader = cluster.leader(agent);
+    let removed = (1..=3).find(|number| *number != leader).unwrap();
+    assert!(matches!(
+        cluster.node(leader).replace(agent, removed, 4),
+        Err(vos_node::ReplaceError::Unplaced(Unplaced::CannotRun))
+    ));
+    let placement = cluster.node(leader).placement(agent).unwrap();
+    assert_eq!(placement.replicas, vec![1, 2, 3]);
+    assert!(!placement.joint);
 }

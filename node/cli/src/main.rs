@@ -139,6 +139,20 @@ enum AgentCommand {
         #[arg(long, value_delimiter = ',')]
         replicas: Vec<u8>,
     },
+    /// Replace one of an agent's replicas by another node, at its leader:
+    /// the replicas are printed once the change committed.
+    Replace {
+        #[command(flatten)]
+        operator: OperatorArgs,
+        #[arg(long)]
+        agent: u32,
+        /// The replica that leaves, by number.
+        #[arg(long)]
+        remove: u8,
+        /// The node that takes its place, by number.
+        #[arg(long)]
+        add: u8,
+    },
 }
 
 /// TLS on a node's ingress.
@@ -276,6 +290,28 @@ fn run(cli: Cli) -> Result<(), String> {
         Command::Key {
             command: KeyCommand::New { out },
         } => new_key(&out),
+        Command::Agent {
+            command:
+                AgentCommand::Replace {
+                    operator,
+                    agent,
+                    remove,
+                    add,
+                },
+        } => match operator_of(&operator)?
+            .replace(AgentId(agent), remove, add)
+            .map_err(failed)?
+        {
+            Answer::Placed(replicas) => {
+                let replicas: Vec<String> = replicas.iter().map(u8::to_string).collect();
+                println!("{}", replicas.join(","));
+                Ok(())
+            }
+            Answer::TimedOut => {
+                Err("not committed in time: the agent's leader goes on with the change".into())
+            }
+            other => Err(format!("{other:?}")),
+        },
         Command::Agent {
             command: AgentCommand::Create { operator, replicas },
         } => match operator_of(&operator)?
