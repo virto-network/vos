@@ -294,6 +294,9 @@ struct Driver {
     /// A placement on its way to the directory: kept off the driver, which
     /// never waits on the node-wide lock a placement takes.
     announcing: Option<(u64, u64, bool)>,
+    /// This run of the group has led: only such a run takes its
+    /// placements' answers, or announces as it steps down.
+    led: bool,
 }
 
 /// A snapshot stream this replica runs to a follower, as leader.
@@ -404,6 +407,7 @@ impl Driver {
             memberships: HashMap::new(),
             announced: None,
             announcing: None,
+            led: false,
             inner,
             shared,
         })
@@ -612,8 +616,10 @@ impl Driver {
                 if self.announcing == Some(order) {
                     self.announcing = None;
                 }
-                // One not kept is tried again the next round.
-                if kept {
+                // One not kept is tried again the next round. An answer
+                // for an earlier run of the group is no concern of a run
+                // that never led.
+                if kept && self.led {
                     self.announced = Some(self.announced.map_or(order, |held| held.max(order)));
                 }
             }
@@ -756,6 +762,8 @@ impl Driver {
                 // A leadership's streams end with it.
                 if role != Role::Leader {
                     self.streams.clear();
+                } else {
+                    self.led = true;
                 }
                 // Becoming leader, the core appended its term's no-op last.
                 let leading_from =
@@ -772,7 +780,8 @@ impl Driver {
                     // rather than leave it to the next leader's election.
                     let status = self.core.status();
                     let me = self.inner.number;
-                    let removed = (self.announced.is_some() || self.announcing.is_some())
+                    let removed = self.led
+                        && (self.announced.is_some() || self.announcing.is_some())
                         && status.joint_old.is_none()
                         && !status.members.contains(&me)
                         && status.commit_index >= status.active_config_index.unwrap_or(0);
@@ -920,8 +929,9 @@ impl Driver {
         let inner = Arc::clone(&self.inner);
         let agent = self.agent;
         // The answer goes to whichever run of the agent's group is there
-        // then: a later run, leading at a later term, takes it as one more
-        // placement known kept, which changes nothing it announces.
+        // then. A later run that has led, at a later term, takes it as one
+        // more placement known kept, which changes nothing it announces; a
+        // later run that never led ignores it.
         self.inner.spawn(async move {
             let kept = inner.place(agent, placement).await;
             inner.propose(agent, Local::Placed { order, kept });
