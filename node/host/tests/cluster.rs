@@ -390,6 +390,53 @@ fn an_agent_created_on_three_nodes_applies_alike_on_each() {
     );
 }
 
+/// Fails the sync of the next synced flush once armed, as a failed fsync
+/// does.
+#[derive(Default)]
+struct FailNextSync(std::sync::atomic::AtomicBool);
+
+impl Hooks for FailNextSync {
+    fn fail_sync(&self) -> bool {
+        self.0.swap(false, std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// A flush that fails where no group's log write meets it still halts the
+/// node: its store takes no more, it falls silent, and a group it led
+/// while idle elects a leader elsewhere.
+#[test]
+fn a_flush_failing_outside_any_log_halts_the_node() {
+    let hooks: Vec<Arc<FailNextSync>> = (0..3).map(|_| Arc::default()).collect();
+    let cluster = Cluster::with_node_hooks(
+        hooks
+            .iter()
+            .map(|hooks| Arc::clone(hooks) as Arc<dyn Hooks>)
+            .collect(),
+    );
+    let agent = cluster.node(1).create_replicated(vec![1, 2, 3]).unwrap();
+    wait_until("every replica runs the group", || {
+        (1..=3).all(|number| cluster.node(number).applied(agent).is_some())
+    });
+    cluster.install(agent);
+    let leader = cluster.leader(agent);
+    hooks[usize::from(leader) - 1]
+        .0
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        cluster.node(leader).create_agent().is_err(),
+        "the record's flush failed"
+    );
+    wait_until("another node leads", || {
+        cluster
+            .running()
+            .any(|(number, node)| number != leader && node.leads(agent))
+    });
+    assert!(
+        cluster.node(leader).create_agent().is_err(),
+        "its store takes no more"
+    );
+}
+
 #[test]
 fn followers_and_other_nodes_send_callers_where_the_agent_is_served() {
     let cluster = Cluster::new(4);

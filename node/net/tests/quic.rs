@@ -12,6 +12,17 @@ use vos_net::{Class, Limits, Network, NodeNumber, Peer, Refused, public_key};
 fn three_nodes_exchange_frames_on_every_class() {
     smol::block_on(async {
         let nodes = cluster(3);
+        // A liveness frame never waits for a connection: connect first.
+        for (quic, _) in &nodes {
+            for to in quic.peers() {
+                send(quic, to, Class::Consensus, 0, b"hello".to_vec()).await;
+            }
+        }
+        for (_, arrivals) in &nodes {
+            for _ in 0..2 {
+                assert_eq!(next(&arrivals.consensus).await.frame, b"hello");
+            }
+        }
         for (quic, _) in &nodes {
             for to in quic.peers() {
                 for class in Class::ALL {
@@ -135,6 +146,34 @@ fn a_peer_shut_down_and_started_again_is_reachable_at_once() {
             started.elapsed(),
             arrived.frame
         );
+    });
+}
+
+/// Frames queued for a peer not yet reachable wait for its connection,
+/// but a liveness frame among them is dropped: it would say, late, that
+/// its sender was alive when it was queued.
+#[test]
+fn a_liveness_frame_is_not_held_for_a_later_connection() {
+    smol::block_on(async {
+        let (a, _) = bind(1, any_port(), Limits::default());
+        // Node 2's address, nothing listening there yet.
+        let address = std::net::UdpSocket::bind(any_port())
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        a.set_peers(vec![Peer {
+            number: 2,
+            key: public_key(&secret(2)),
+            address,
+        }]);
+        send(&a, 2, Class::Liveness, 1, b"alive before".to_vec()).await;
+        send(&a, 2, Class::Consensus, 1, b"held".to_vec()).await;
+        smol::Timer::after(Duration::from_millis(200)).await;
+        let (b, b_arrivals) = rebind(2, address).await;
+        b.set_peers(vec![peer_of(1, &a)]);
+        assert_eq!(next(&b_arrivals.consensus).await.frame, b"held");
+        send(&a, 2, Class::Liveness, 1, b"alive now".to_vec()).await;
+        assert_eq!(next(&b_arrivals.liveness).await.frame, b"alive now");
     });
 }
 

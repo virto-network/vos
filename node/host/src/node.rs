@@ -68,6 +68,9 @@ pub struct Config {
     /// records carry it to every replica.
     pub accumulate_gas: u64,
     pub hooks: Arc<dyn Hooks>,
+    /// The faults a test injects, read from a control file.
+    #[cfg(feature = "faults")]
+    pub faults: Option<Arc<crate::faults::Faults>>,
     /// Milliseconds since the Unix epoch: work-result time, and ingress's
     /// freshness checks. A test moves it.
     pub clock: Arc<dyn Fn() -> u64 + Send + Sync>,
@@ -78,6 +81,11 @@ pub struct Config {
     /// node 0.
     pub space: Option<Space>,
     pub peers: Peers,
+    /// Where the peer endpoint binds, when not the address its space
+    /// lists: behind port forwarding, a relay, or in a container.
+    pub peer_bind: Option<std::net::SocketAddr>,
+    /// How long a connection to a peer may stay quiet before it closes.
+    pub quic_idle: Duration,
     /// A replica group's election timeout, drawn between these, and its
     /// leader's heartbeat, in milliseconds.
     pub election_timeout_ms: (u64, u64),
@@ -104,9 +112,13 @@ impl Config {
             refine_gas: defaults::REFINE_GAS,
             accumulate_gas: defaults::REFINE_GAS,
             hooks: Arc::new(crate::NoHooks),
+            #[cfg(feature = "faults")]
+            faults: None,
             clock: Arc::new(wall_clock),
             ingress_tls: None,
             space: None,
+            peer_bind: None,
+            quic_idle: vos_net::quic::IDLE,
             peers: Peers::Quic,
             election_timeout_ms: (1500, 3000),
             heartbeat_ms: 500,
@@ -634,6 +646,16 @@ impl Inner {
         }
     }
 
+    /// Halt once the store failed a flush, whichever path met the
+    /// failure: the pair heartbeat and the records' resends look, so a
+    /// node halts within one of their rounds.
+    pub(crate) fn halt_if_store_failed(&self) {
+        if self.storage.failed() && !self.halted.load(std::sync::atomic::Ordering::SeqCst) {
+            tracing::error!("a flush failed; the node stops and needs a restart");
+            self.halt();
+        }
+    }
+
     /// Stop every agent: a commit failed, and storage takes no more.
     /// Queued and later calls answer `Stopped`.
     pub(crate) fn halt(&self) {
@@ -799,6 +821,33 @@ impl Inner {
             return;
         }
         group::drop_stale_epochs(self, agent).await;
+    }
+
+    /// This node's replica of `agent`, if it runs one: its Raft state, or
+    /// `Unavailable` if the store cannot be read.
+    pub(crate) fn replica_status(&self, agent: AgentId) -> vos_wire::ingress::Answer {
+        use vos_wire::ingress::Answer;
+        let Some(run) = self.run(agent) else {
+            return Answer::NoAgent;
+        };
+        let state = run.shared.state();
+        let (Ok(rows), Ok(last)) = (
+            self.store.agent_rows(agent),
+            self.store.last_log_index(agent),
+        ) else {
+            return Answer::Unavailable;
+        };
+        let last = last.unwrap_or(0);
+        Answer::Status(vos_wire::ingress::ReplicaStatus {
+            term: state.term,
+            leads: state.role == Role::Leader,
+            leader: state.leader,
+            commit: state.commit,
+            applied: state.applied,
+            log_start: rows.log_start,
+            last_index: last.max(rows.log_start),
+            halted: self.halted.load(std::sync::atomic::Ordering::SeqCst),
+        })
     }
 
     /// Whether this node's store holds anything of `agent`'s replica: a
@@ -1520,9 +1569,12 @@ impl Node {
         let mut placements = store.placements()?;
         let (endpoint, arrivals) = match (&config.space, &config.peers) {
             (Some(space), Peers::Quic) if space.nodes().len() > 1 => {
-                let listen = space.node(number).expect("this node is in its space").peer;
+                let listen = config
+                    .peer_bind
+                    .unwrap_or(space.node(number).expect("this node is in its space").peer);
                 let (quic, arrivals) = vos_net::quic::Quic::bind(vos_net::quic::Config {
                     peers: space.peers(),
+                    idle: config.quic_idle,
                     ..vos_net::quic::Config::new(number, secret, listen)
                 })
                 .map_err(|error| Error::Data(format!("{listen}: {error}")))?;
@@ -1539,6 +1591,15 @@ impl Node {
             Some(Endpoint::Quic(quic)) => Some(Arc::clone(quic) as Arc<dyn Wire>),
             Some(Endpoint::Hub(hub)) => Some(Arc::clone(hub) as Arc<dyn Wire>),
             None => None,
+        };
+        // Frames of a class a test loses go before they reach the network.
+        #[cfg(feature = "faults")]
+        let network = match (network, &config.faults) {
+            (Some(network), Some(faults)) => Some(Arc::new(crate::faults::Lossy {
+                network,
+                faults: Arc::clone(faults),
+            }) as Arc<dyn Wire>),
+            (network, _) => network,
         };
         let runtime = Arc::new(smol::Executor::new());
         let (stop, stopped) = smol::channel::bounded::<()>(1);

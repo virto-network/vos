@@ -1128,6 +1128,19 @@ impl Operator {
         let replace = Replace { remove, add };
         self.post(&format!("/agents/{}/replicas", agent.0), &replace.encode())
     }
+
+    /// The node's replica of `agent`: its term, role, commit, applied
+    /// index and log.
+    pub fn status(&self, agent: AgentId) -> Result<Answer, ClientError> {
+        let (status, body) = self.http.request(
+            "GET",
+            &format!("/agents/{}/status", agent.0),
+            Some(&self.token),
+            &[],
+            true,
+        )?;
+        answer(status, &body)
+    }
 }
 
 #[cfg(test)]

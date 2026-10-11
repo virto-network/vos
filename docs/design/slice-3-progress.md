@@ -5126,3 +5126,207 @@ model both suites share:
     a hook.
 - **Not in 3.9:** fast retransmit on a dropped gap (the suite shows
   whether it is needed); learners stay unscheduled.
+
+#### 3.9a Built
+
+**`vos node run --peer-bind <addr>`** binds the QUIC endpoint there
+(`Config::peer_bind`); the space still lists the address peers dial.
+
+**The relay** (`node/cli/tests/support/relay.rs`), threads in the test
+process:
+- a socket at each node's listed address, and one per (dialer, peer)
+  that stands for the dialer toward the peer, kept for the run;
+- connection cuts, link cuts, a node cut off from the rest, and links
+  thinning or delaying datagrams (delayed ones wait on a thread of their
+  own, in the order they fall due);
+- 4 MiB socket buffers and 64 KiB datagrams;
+- its own failures to pass a datagram on, counted (`own_drops`): a test
+  checks there are none.
+
+**vos-net:**
+- `Config::idle`, QUIC's idle timeout, which the node sets from
+  `Config::quic_idle`.
+- A liveness frame queued before its connection was made is dropped, not
+  sent. Test: frames queued while the peer is unreachable reach it once
+  it binds, the liveness frame among them excepted, and a fresh one
+  arrives.
+- **That covers redials only.** A liveness frame handed to a connection
+  that outlives a cut (any cut shorter than QUIC's idle timeout) is
+  retransmitted by QUIC after the heal. Its receiver stamps it on
+  arrival, as fresh.
+  - **The bound:** a listing stamped late vouches for its leader at its
+    term until a full election timeout after the late frames arrive.
+    After a long cut, QUIC's probe backoff can deliver them seconds
+    after the heal.
+  - **When it matters:** only if the sender stopped leading during the
+    cut while the receiver's group is still at that term. A group at a
+    later term asks about its own term, so the stale listing does not
+    match.
+  - **The cost:** one election delayed by up to an election timeout.
+    Never a safety matter.
+  - **A precise fix,** if 3.9b shows the need: each frame carries its
+    sender's monotonic time, mapped through a windowed minimum offset
+    (windowed, as two machines' clocks drift).
+
+**Faults in the binary** (`node/host/src/faults.rs`, the `faults`
+feature of vos-node and vos-cli), as designed, with these choices:
+- **A generation handshake:** the harness replaces a faults file whole
+  (written beside it, then renamed), headed by `generation <n>`.
+  - Once the faults are in force, the node writes `n` to the file
+    beside it (`.taken`), and `set_faults` waits for it.
+  - It does not wait for a node that is down or paused: that node takes
+    its faults when it starts, which `restart` waits for (the node
+    acknowledges before it prints its address), or when it goes on,
+    which `pause(n, false)` waits for.
+  - The faults are stored with release ordering, so they are in force
+    before the acknowledgement.
+- **Frame losses sit in a network of their own** (`Lossy`), wrapping
+  the node's. The groups' drivers send Raft frames through the network
+  directly, so a loss at `Inner::send` would miss them.
+- **`fail_commits after`** writes the batch unsynced
+  (`Durability::Buffered`), then fails it, through a new hook,
+  `Hooks::fail_sync`.
+- **The clock fault moves `Config::clock` only:** batch times,
+  sessions, and ingress's freshness checks.
+  - Blobs' put times are immune by construction: they are the wall
+    clock at the process's start, moved on by the monotonic clock.
+  - The incarnation reads the system clock, which the fault does not
+    move.
+- **`vos --version` says so,** "(faults: a test build)", and the node
+  warns at start.
+- **`just check-no-faults`, in `ci`:** a plain build of `vos`, after
+  the fault suite built it with the feature, must not say so; and no
+  workspace member turns the feature on for vos-node (`cargo tree`).
+  - It checks a debug build, not the release one the design named.
+    Features resolve the same in both, and a release build would cost
+    CI minutes for nothing.
+- Clippy also runs on vos-cli with the feature.
+
+**An operator status route:** `GET /agents/{id}/status`, with the
+operator's token, answers `Answer::Status(ReplicaStatus)`:
+- the term, and whether this replica leads;
+- the leader it knows;
+- the commit and applied indexes;
+- its log's start and last index;
+- whether the node halted.
+
+A store it cannot read answers `Unavailable`.
+
+The client calls it with `Operator::status`.
+
+**A deadline on a call's answer at its leader** (`calls.rs`, `ANSWERED`
+= 30 s), found by the stalled-disk test.
+- **The problem:** a call waited for its answer as long as its commit
+  took. A leader whose disk stalled held every caller up to the
+  client's own timeout (300 s), though another node had taken over.
+- **Now** the caller is answered `TimedOut` after 30 s, and sends it
+  again. The resend reaches the new leader through a forward, or waits
+  on the same call.
+- The call is pushed when its lane queues it, so the order of a
+  session's calls stays the lane's. Then it runs to its end in a task of
+  its own, which settles the lane however long it takes. Only the
+  caller's wait is cut short.
+
+**A failed flush stops the writer for good** (`storage.rs`), found by
+the review.
+- **The problem:** a flush that failed may still have reached the disk,
+  as `fail_commits after` does and a real failed fsync can. The writer
+  answered `Err` and went on taking commits, checking them against its
+  view of each agent's rows, which the failed flush may have changed.
+  - A snapshot switch written but failed was abandoned, and its epoch
+    dropped in the background, though the store pointed at it.
+  - A compaction written but failed could be retried at a lower point,
+    moving the log start back over a gap.
+- **Now** the writer refuses every commit after a failed flush, and
+  says so (`StorageThread::failed`).
+  - The node halts when it sees this, whichever path met the failure.
+    The pair heartbeat looks each round, and the records' resend loop
+    each second, which a space of one runs too. The node falls silent,
+    and its groups elect elsewhere.
+  - A halted node stores and acknowledges no placement or blob from
+    its peers: their resends are dropped quietly, not logged one by
+    one.
+  - A snapshot switch that fails so halts at once, rather than
+    abandoning its epoch.
+- **Tests:**
+  - the writer refuses everything after a failed sync, and only the
+    failed flush's write is in the store;
+  - a cluster test: a flush failing outside any log write, at an idle
+    leader, halts its node, and the group elects another leader;
+  - an ingress test: the status route reports a replica, refuses a
+    stranger, answers `NoAgent` for an agent the node does not run,
+    and reports a halt in a space of one;
+  - each mutation is caught.
+
+**The node's log:** `vos node run` writes tracing to stderr, at `info`
+or the level `VOS_LOG` names. Halts were dropped silently before.
+
+**The harness** (`node/cli/tests/support/`): `Processes` starts nodes
+through the relay, each with its own data directory, ports, log and
+faults file, in the clear or over TLS. It can:
+- kill a node, emptying its faults file;
+- pause and resume a node, and restart it;
+- read a replica's status, and find the leader at the highest term;
+- list the log lines that tell of a panic or a halt ("needs a
+  restart").
+
+A node's ports are drawn below the range the system gives out for
+outgoing connections, so a restart finds them free. The relay's own
+losses include the datagrams the system dropped at its sockets
+(`/proc/net/udp`).
+
+Opening each store at the end comes with 3.9b's end checks.
+
+**Tests:**
+- `three_processes.rs` (3.5d2's) runs through the relay (24 s).
+- `processes.rs`: the relay cuts a leader off; another node is elected
+  and the calls go on; once healed, the old leader catches up. The relay
+  loses nothing of itself (22 s).
+- `faults.rs`, with the feature (48 s for the three):
+  - a leader whose disk stalls hands its group over. A call made at it
+    is answered within a minute (300 s without the deadline), and the
+    replica catches up once its disk is let go;
+  - a leader whose syncs fail halts, and says so in its status and its
+    log; the others go on, and once restarted it catches up;
+  - a gray failure (Raft frames lost, the pair heartbeat flowing)
+    deposes its leader: it led when the fault took hold, and another
+    node leads at a later term.
+- A unit test of the control file's parser.
+
+**Opus's review of 3.9a:** GO-with-fixes, all folded above.
+- **A failed flush that reached the disk** (should-fix, a safety
+  matter): the writer went on over its stale view. It now stops for
+  good, and the node halts.
+- **Halts were invisible:** `vos` installed no log subscriber, and the
+  harness looked for a word no message holds. Now the node logs to
+  stderr, and the status reports `halted`.
+- **`set_faults` slept 150 ms** and hoped. It now waits for the node's
+  acknowledgement. The gray-failure test checks that the gray node led
+  when the fault took hold, and that leadership moved to a later term.
+- **Liveness frames within a surviving connection** can still arrive
+  late: the bound is stated above.
+- **Nits:**
+  - a queued call is pushed before its task is spawned, so a session's
+    order never depends on task scheduling;
+  - the relay counts the kernel's drops at its sockets;
+  - `leader()` takes the highest term;
+  - nodes' ports are drawn outside the ephemeral range;
+  - `check-no-faults` also checks the workspace's features;
+  - the status route answers `Unavailable` on a store error;
+  - the clock fault's scope is stated.
+
+**Opus's check of the folds:** GO. Its six nits are folded too:
+- `free_port` never draws a privileged port, and falls back to any port
+  when no range is left below the system's;
+- the liveness bound is restated;
+- a halted node no longer logs each placement it is resent;
+- a space of one halts within a second;
+- resuming a paused node waits for its faults;
+- the faults' ordering is release and acquire.
+
+**Carried:**
+- Install and role commands still wait as long as their commit takes at
+  a stalled leader, with no deadline of their own. The operator's
+  client times out at 300 s.
+- One task and one channel per queued call, on the leader's hot path:
+  for 3.10's budget.

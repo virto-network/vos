@@ -635,7 +635,7 @@ impl Fjall {
             .map(|key| Ok(log_index(&key?).expect("an 8-byte log index")))
     }
 
-    fn last_log_index(&self, agent: AgentId) -> Result<Option<u64>> {
+    pub(crate) fn last_log_index(&self, agent: AgentId) -> Result<Option<u64>> {
         let prefix = agent.0.to_be_bytes();
         match self.log.prefix(prefix).next_back() {
             Some(row) => Ok(log_index(&row.key()?)),

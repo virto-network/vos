@@ -6,6 +6,8 @@ mod calls;
 pub mod client;
 mod dispatch;
 mod executor;
+#[cfg(feature = "faults")]
+pub mod faults;
 mod group;
 pub mod http;
 mod ingress;
@@ -83,6 +85,13 @@ pub trait Hooks: Send + Sync {
     /// nothing written, as fjall's first failure does (it then refuses
     /// every later commit, so the node stops).
     fn fail_commit(&self) -> bool {
+        false
+    }
+
+    /// Before the storage thread syncs a commit it wrote: true makes the
+    /// commit fail unsynced, as a failed fsync does. What it wrote may
+    /// still reach the disk.
+    fn fail_sync(&self) -> bool {
         false
     }
 }

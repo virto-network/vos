@@ -62,12 +62,18 @@ pub fn blob_ref(bytes: &[u8]) -> BlobRef {
     }
 }
 
-/// Milliseconds since the epoch, by this node's clock: a put's time, for
-/// the horizon only.
+/// Milliseconds since the epoch: the wall clock as the process started,
+/// moved on by the monotonic clock since, so a clock jumping during a run
+/// ages no blob past the horizon. A put's time, for the horizon only.
 fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| since.as_millis() as u64)
+    static START: std::sync::OnceLock<(u64, std::time::Instant)> = std::sync::OnceLock::new();
+    let (wall, at) = START.get_or_init(|| {
+        let wall = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_millis() as u64);
+        (wall, std::time::Instant::now())
+    });
+    wall + at.elapsed().as_millis() as u64
 }
 
 fn location_key(hash: &[u8; 32]) -> Vec<u8> {

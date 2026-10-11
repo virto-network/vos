@@ -18,9 +18,17 @@ use vos_wire::ingress::{Answer, Consistency, Install};
 use vos_wire::result::Outcome;
 use vos_wire::schema::Schema;
 
+/// The version, saying so when the build injects faults.
+const VERSION: &str = if cfg!(feature = "faults") {
+    concat!(env!("CARGO_PKG_VERSION"), " (faults: a test build)")
+} else {
+    env!("CARGO_PKG_VERSION")
+};
+
 #[derive(Parser)]
 #[command(
     name = "vos",
+    version = VERSION,
     about = "Run a VOS node, operate it, and call its agents"
 )]
 struct Cli {
@@ -110,6 +118,10 @@ enum NodeCommand {
         /// ingress address. Without it, the node is a space of one.
         #[arg(long)]
         space: Option<PathBuf>,
+        /// Bind the peer endpoint here rather than at the address the
+        /// space lists for this node, as behind port forwarding.
+        #[arg(long)]
+        peer_bind: Option<SocketAddr>,
     },
     /// Print a node's public key, its identity.
     Info {
@@ -278,8 +290,16 @@ fn run(cli: Cli) -> Result<(), String> {
                     agent,
                     tls,
                     space,
+                    peer_bind,
                 },
-        } => node(&data, listen, &agent, tls.ingress(), space.as_deref()),
+        } => node(
+            &data,
+            listen,
+            &agent,
+            tls.ingress(),
+            space.as_deref(),
+            peer_bind,
+        ),
         Command::Node {
             command: NodeCommand::Info { node },
         } => {
@@ -401,10 +421,30 @@ fn node(
     agent: &Path,
     tls: Option<IngressTls>,
     space: Option<&Path>,
+    peer_bind: Option<SocketAddr>,
 ) -> Result<(), String> {
+    // The node's log, on stderr: `VOS_LOG` names the level, `info` unless
+    // it says otherwise.
+    let level = std::env::var("VOS_LOG")
+        .ok()
+        .and_then(|level| level.parse().ok())
+        .unwrap_or(tracing_subscriber::filter::LevelFilter::INFO);
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_max_level(level)
+        .init();
     let mut config = Config::new(link(agent)?);
     config.ingress_tls = tls;
     config.space = space.map(Space::read).transpose()?;
+    config.peer_bind = peer_bind;
+    #[cfg(feature = "faults")]
+    {
+        eprintln!("vos: WARNING: this build injects faults; it is for tests only");
+        if let Some(path) = std::env::var_os("VOS_FAULTS") {
+            vos_node::faults::Faults::install(&mut config, Path::new(&path))
+                .map_err(|error| error.to_string())?;
+        }
+    }
     let node = Node::open(data, config).map_err(|error| format!("{error:?}"))?;
     let address = node.serve(listen).map_err(|error| format!("{error:?}"))?;
     println!("listening on {address}");

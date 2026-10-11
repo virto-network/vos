@@ -59,6 +59,8 @@ async fn take(arrivals: &Arrivals) -> Option<(Class, Incoming)> {
 pub(crate) async fn resend_records(inner: Arc<Inner>) {
     loop {
         smol::Timer::after(RESEND).await;
+        // Every node runs this, a space of one too.
+        inner.halt_if_store_failed();
         let pending: Vec<(AgentId, Order, Vec<NodeNumber>)> = inner
             .unacknowledged
             .lock()
@@ -298,7 +300,8 @@ impl Inner {
     /// Store a blob a group asked for, and tell the groups waiting on it.
     /// One nobody asked for is dropped.
     async fn take_blob(&self, hash: [u8; 32], bytes: Vec<u8>) {
-        if !self.is_wanted(&hash) {
+        // A store that failed takes nothing more.
+        if !self.is_wanted(&hash) || self.storage.failed() {
             return;
         }
         let blob = BlobRef {
@@ -320,6 +323,11 @@ impl Inner {
         record: CreationRecord,
         placement: Placement,
     ) {
+        // A store that failed takes nothing more, and its node does not
+        // acknowledge: the sender's resends are dropped quietly.
+        if self.storage.failed() {
+            return;
+        }
         let agent = record.agent;
         let order = placement.order();
         let recording = self.recording.lock().await;

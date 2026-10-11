@@ -9,15 +9,22 @@ description = "The `vos` command: run a node, operate it, and call its agents."
 name = "vos"
 path = "src/main.rs"
 
+[features]
+# A `vos` that injects the faults `VOS_FAULTS` names: for the process
+# tests only.
+faults = ["vos-node/faults"]
+
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
 ed25519-dalek = "2"
 getrandom = "0.2"
 hex = "0.4"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 vos-node = { path = "../host" }
 vos-pvm = { workspace = true }
 vos-pvm-compiler = { workspace = true }
 vos-wire = { workspace = true }
 
 [dev-dependencies]
+socket2 = "0.6"
 tempfile = "3"

@@ -9,9 +9,13 @@
 //! durable too, as they share one journal: the writer records, per synced
 //! flush, each agent's highest applied index up to it, and only that bounds
 //! compaction (section 9.5, invariant 4).
+//!
+//! A flush that fails leaves the disk unknown: some of it may have been
+//! written, and synced or not. The writer then takes no more, and the node
+//! halts until a restart reads what is there.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -168,6 +172,8 @@ struct Shared {
     durably_applied: Mutex<HashMap<AgentId, u64>>,
     /// Commits queued or in flight, by id, with when they were queued.
     pending: Mutex<BTreeMap<u64, Instant>>,
+    /// Whether a flush failed: the writer takes no more.
+    failed: AtomicBool,
 }
 
 pub struct StorageThread {
@@ -188,6 +194,8 @@ struct Writer {
     /// What the writer knows of each agent's rows: read once from the
     /// store, then kept in step with what it commits.
     agents: HashMap<AgentId, AgentState>,
+    /// The failure of a flush, after which nothing more is written.
+    failed: Option<String>,
 }
 
 /// An agent's epoch, applied index and log start, as committed.
@@ -350,6 +358,13 @@ impl Writer {
     }
 
     fn write(&mut self, group: Vec<Commit>) {
+        if let Some(failure) = self.failed.clone() {
+            let refusal = format!("the store failed earlier: {failure}");
+            for commit in group {
+                self.answer(commit, Err(refusal.clone()));
+            }
+            return;
+        }
         self.hooks.before_commit();
         let mut batch = self.store.batch();
         let mut synced = false;
@@ -436,10 +451,21 @@ impl Writer {
         };
         let result = if self.hooks.fail_commit() {
             Err("a hook failed the commit".to_string())
+        } else if synced && self.hooks.fail_sync() {
+            // Written but not synced, and failed, as a failed fsync is.
+            batch
+                .commit(Durability::Buffered)
+                .map_err(|error| error.to_string())
+                .and(Err("a hook failed the sync".to_string()))
         } else {
             batch.commit(durability).map_err(|error| error.to_string())
         };
-        if result.is_ok() {
+        if let Err(failure) = &result {
+            // What reached the disk is unknown, and with it every agent's
+            // rows: nothing more is written over them.
+            self.failed = Some(failure.clone());
+            self.shared.failed.store(true, Ordering::SeqCst);
+        } else {
             self.agents.extend(pending);
             if !retired.is_empty() {
                 let mut durable = self.shared.durably_applied.lock().expect("unpoisoned");
@@ -496,6 +522,7 @@ impl StorageThread {
             shared: Arc::clone(&shared),
             unsynced_applied: HashMap::new(),
             agents: HashMap::new(),
+            failed: None,
         };
         let thread = std::thread::Builder::new()
             .name("vos-storage".into())
@@ -579,6 +606,12 @@ impl StorageThread {
             .get(&agent)
             .copied()
             .unwrap_or(0)
+    }
+
+    /// Whether a flush failed: every commit since is refused, and the node
+    /// must halt.
+    pub fn failed(&self) -> bool {
+        self.shared.failed.load(Ordering::SeqCst)
     }
 
     /// Whether a commit has waited longer than the stall bound.
@@ -675,8 +708,41 @@ mod tests {
             Arc::new(FailOnce(AtomicBool::new(true))),
         );
         assert!(smol::block_on(writer.commit(vec![apply(5)])).is_err());
-        smol::block_on(writer.commit(vec![hard(1, true)])).unwrap();
         assert_eq!(writer.durably_applied(A), 0);
+    }
+
+    /// Fails the sync of the next synced flush once it is written, as a
+    /// failed fsync does.
+    struct FailSyncOnce(AtomicBool);
+
+    impl Hooks for FailSyncOnce {
+        fn fail_sync(&self) -> bool {
+            self.0.swap(false, Ordering::Relaxed)
+        }
+    }
+
+    /// After a flush fails, written or not, the writer writes nothing more:
+    /// its view of the agents' rows may be wrong, so a later commit it
+    /// checks against that view could destroy what the failed one wrote.
+    #[test]
+    fn a_failed_flush_stops_the_writer_for_good() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = StorageThread::spawn(
+            Fjall::open(dir.path()).unwrap(),
+            Arc::new(FailSyncOnce(AtomicBool::new(true))),
+        );
+        assert!(!writer.failed());
+        assert!(smol::block_on(writer.commit(vec![hard(1, true)])).is_err());
+        assert!(writer.failed());
+        assert!(smol::block_on(writer.commit(vec![hard(2, true)])).is_err());
+        assert!(smol::block_on(writer.commit(vec![apply(1)])).is_err());
+        drop(writer);
+        let store = Fjall::open(dir.path()).unwrap();
+        assert_eq!(
+            store.raft(A).unwrap().hard.term,
+            1,
+            "the failed sync's write reached the store; nothing after it did"
+        );
     }
 
     #[test]

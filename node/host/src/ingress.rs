@@ -34,7 +34,7 @@ pub(crate) struct Ingress {
 
 fn status(answer: &Answer) -> u16 {
     match answer {
-        Answer::Ran { .. } | Answer::Created(_) | Answer::Placed(_) => 200,
+        Answer::Ran { .. } | Answer::Created(_) | Answer::Placed(_) | Answer::Status(_) => 200,
         Answer::Unplaced(_) => 409,
         Answer::Unconfirmed(_) => 202,
         // The session is done with: the client starts another.
@@ -163,10 +163,15 @@ impl Ingress {
                 }
             }
             ("POST", ["agents"] | ["agents", _, "install" | "roles" | "replicas"])
+            | ("GET", ["agents", _, "status"])
                 if !self.admitted(&request) =>
             {
                 respond(Answer::Rejected(Rejection::Unauthorized))
             }
+            ("GET", ["agents", id, "status"]) => respond(match agent(id) {
+                Some(agent) => self.inner.replica_status(agent),
+                None => Answer::NoAgent,
+            }),
             ("POST", ["agents"]) => {
                 let create = if request.body.is_empty() {
                     Ok(Create::default())

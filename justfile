@@ -51,6 +51,7 @@ fmt-check:
 clippy:
     cargo clippy --workspace --all-targets --quiet -- -D warnings
     cargo clippy -p vos-pvm-bench --features prove --all-targets --quiet -- -D warnings
+    cargo clippy -p vos-cli --features faults --all-targets --quiet -- -D warnings
 
 # Fails on any JAR remnant in the PVM crates: its ISA and gas modes, opcodes,
 # exits, capability surface, linker entry points and fixtures.
@@ -70,9 +71,18 @@ build-agent:
 # nodes, and the `vos` command.
 test-agent: build-test-actors build-agent
     cargo test -p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-node -p vos-net -p vos-cli
+    cargo test -p vos-cli --features faults --test faults
+
+# A plain build of `vos` carries no faults: building the fault suite's
+# `vos` with the feature must not leak into it, and no workspace member
+# turns the feature on for vos-node.
+check-no-faults:
+    if (cargo tree --workspace -e features -i vos-node | str contains 'feature "faults"') { error make { msg: "a workspace member enables vos-node's faults" } }
+    cargo build -p vos-cli
+    if ((^target/debug/vos --version) | str contains "faults") { error make { msg: "a plain build of vos injects faults" } } else { print "no faults in a plain build of vos" }
 
 # Checks before pushing: everything except proving.
-ci: fmt-check clippy jar-check test vectors test-bench test-agent
+ci: fmt-check clippy jar-check test vectors test-bench test-agent check-no-faults
 
 # The gate before merging: `ci` plus the prover suites, the soundness gates
 # and the bench tests that prove. Run it under a memory limit.

@@ -98,6 +98,8 @@ pub struct Config {
     /// A long-lived stream quiet for this long is finished, so streams
     /// held open are those of groups busy lately.
     pub quiet: Duration,
+    /// A connection quiet for this long closes: [`IDLE`] by default.
+    pub idle: Duration,
 }
 
 impl Config {
@@ -110,6 +112,7 @@ impl Config {
             limits: Limits::default(),
             streams: 1 << 13,
             quiet: Duration::from_secs(10),
+            idle: IDLE,
         }
     }
 }
@@ -221,7 +224,7 @@ impl Quic {
     /// Bind `config.listen` and start accepting the configured peers.
     pub fn bind(config: Config) -> io::Result<(Self, Arrivals)> {
         let identity = Identity::new(&config.secret);
-        let transport = Arc::new(transport(config.streams));
+        let transport = Arc::new(transport(config.streams, config.idle));
         let table = Table::default();
         let server = identity.server(Arc::clone(&table), Arc::clone(&transport));
         let socket = std::net::UdpSocket::bind(config.listen)?;
@@ -359,7 +362,7 @@ impl Inner {
     }
 }
 
-fn transport(streams: u32) -> quinn::TransportConfig {
+fn transport(streams: u32, idle: Duration) -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
     transport
         .max_concurrent_uni_streams(VarInt::from_u32(streams))
@@ -367,7 +370,7 @@ fn transport(streams: u32) -> quinn::TransportConfig {
         .stream_receive_window(VarInt::from_u32(STREAM_WINDOW))
         .send_window(SEND_WINDOW)
         .max_idle_timeout(Some(
-            quinn::IdleTimeout::try_from(IDLE).expect("an idle timeout QUIC can carry"),
+            quinn::IdleTimeout::try_from(idle).expect("an idle timeout QUIC can carry"),
         ))
         .initial_rtt(INITIAL_RTT)
         .keep_alive_interval(None)
@@ -413,6 +416,7 @@ struct Outgoing {
     stream: u64,
     frame: Vec<u8>,
     shared: Arc<Shared>,
+    queued: Instant,
 }
 
 impl Drop for Outgoing {
@@ -518,7 +522,8 @@ async fn dial(dialing: Dialing, queued: smol::channel::Receiver<Outgoing>, share
             }
         };
         *shared.connection.lock().expect("the connection") = Some(connection.clone());
-        write(&connection, &mut next, &queued, quiet, &spawner).await;
+        let connected = Instant::now();
+        write(&connection, &mut next, &queued, quiet, &spawner, connected).await;
         *shared.connection.lock().expect("the connection") = None;
         if refused(&connection) {
             // The peer took the handshake, then refused this node: dialing
@@ -547,13 +552,18 @@ fn refused(connection: &quinn::Connection) -> bool {
 }
 
 /// Write queued frames on `connection` until it closes. A frame taken but
-/// not yet handed to a stream stays in `next`, for the next connection.
+/// not yet handed to a stream stays in `next`, for the next connection. A
+/// liveness frame queued before the connection was made (`connected`) is
+/// dropped: it would say, late, that its sender was alive then. One handed
+/// to a connection that outlives a cut is QUIC's to deliver, and may still
+/// arrive late, after the cut heals.
 async fn write(
     connection: &quinn::Connection,
     next: &mut Option<Outgoing>,
     queued: &smol::channel::Receiver<Outgoing>,
     quiet: Duration,
     spawner: &Spawner,
+    connected: Instant,
 ) {
     enum Event {
         Frame(Outgoing),
@@ -599,6 +609,9 @@ async fn write(
                 }
             }
         };
+        if frame.class == Class::Liveness && frame.queued < connected {
+            continue;
+        }
         if connection.close_reason().is_some() {
             *next = Some(frame);
             return;
@@ -910,6 +923,7 @@ impl Network for Quic {
             stream,
             frame,
             shared: Arc::clone(&link.shared),
+            queued: Instant::now(),
         };
         link.frames.try_send(outgoing).map_err(|_| Refused::Closed)
     }

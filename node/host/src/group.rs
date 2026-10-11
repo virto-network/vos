@@ -1233,6 +1233,16 @@ impl Driver {
         let applying = self.shared.applying.lock().await;
         if let Err(error) = self.inner.storage.commit(changes).await {
             drop(applying);
+            // A failed flush may have written the switch: the staged epoch
+            // may be the store's now, and is not to be dropped.
+            if self.inner.storage.failed() {
+                tracing::error!(
+                    agent = self.agent.0,
+                    "a snapshot switch failed ({error}); the node stops and needs a restart"
+                );
+                self.inner.halt();
+                return false;
+            }
             tracing::warn!(
                 agent = self.agent.0,
                 "a snapshot switch was refused: {error}"

@@ -1,0 +1,286 @@
+//! Faults a test injects into a running node, through a control file a
+//! thread of its own reads every 50 ms: commits delayed, held or failing,
+//! the node's clock moved, frames of one class lost, and QUIC's idle
+//! timeout. Each line of the file is one fault:
+//!
+//! - `delay_commits <ms>`: each writer flush waits that long first;
+//! - `hold_commits`: no flush until the line goes;
+//! - `fail_commits before`: flushes fail with nothing written;
+//! - `fail_commits after`: flushes are written but not synced, and fail,
+//!   as a failed fsync does;
+//! - `clock <ms>`: the node's clock runs that far ahead (or behind, below
+//!   zero);
+//! - `drop <class> <per million> [to <node>]`: frames of `liveness`,
+//!   `consensus`, `requests` or `bulk` lost, to every peer or one;
+//! - `quic_idle <ms>`: QUIC's idle timeout, read once at start;
+//! - `generation <n>`: once the faults are in force, the node writes `n`
+//!   to the file beside it, with the extension `taken`, so a test knows.
+//!
+//! Built only with the `faults` feature: a production build carries none
+//! of it.
+
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use vos_net::Class;
+use vos_wire::peer::NodeNumber;
+
+use crate::{Config, Hooks};
+
+/// How often the control file is read.
+const READ_EVERY: Duration = Duration::from_millis(50);
+
+/// The faults in force, as the control file last said.
+pub struct Faults {
+    delay_commits: AtomicU64,
+    hold_commits: AtomicBool,
+    fail_before: AtomicBool,
+    fail_after: AtomicBool,
+    clock: AtomicI64,
+    drops: Mutex<Vec<Loss>>,
+    random: AtomicU64,
+}
+
+/// Frames of one class lost, out of a million, to one peer or all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Loss {
+    class: Class,
+    per_million: u32,
+    to: Option<NodeNumber>,
+}
+
+/// What one reading of the control file says.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Read {
+    delay_commits: u64,
+    hold_commits: bool,
+    fail_before: bool,
+    fail_after: bool,
+    clock: i64,
+    drops: Vec<Loss>,
+    quic_idle: Option<u64>,
+    generation: Option<u64>,
+}
+
+fn class(name: &str) -> Option<Class> {
+    Some(match name {
+        "liveness" => Class::Liveness,
+        "consensus" => Class::Consensus,
+        "requests" => Class::Requests,
+        "bulk" => Class::Bulk,
+        _ => return None,
+    })
+}
+
+/// The faults `text` names; a line it cannot read is left out.
+fn read(text: &str) -> Read {
+    let mut read = Read::default();
+    for line in text.lines() {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        match words[..] {
+            ["delay_commits", ms] => read.delay_commits = ms.parse().unwrap_or(0),
+            ["hold_commits"] => read.hold_commits = true,
+            ["fail_commits", "before"] => read.fail_before = true,
+            ["fail_commits", "after"] => read.fail_after = true,
+            ["clock", ms] => read.clock = ms.parse().unwrap_or(0),
+            ["quic_idle", ms] => read.quic_idle = ms.parse().ok(),
+            ["generation", n] => read.generation = n.parse().ok(),
+            ["drop", name, per_million, ref rest @ ..] => {
+                let to = match rest {
+                    ["to", node] => node.parse().ok(),
+                    _ => None,
+                };
+                if let (Some(class), Ok(per_million)) = (class(name), per_million.parse()) {
+                    read.drops.push(Loss {
+                        class,
+                        per_million,
+                        to,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    read
+}
+
+impl Faults {
+    /// Take the faults the control file at `path` names into `config`:
+    /// its hooks and clock, and QUIC's idle timeout; then read the file
+    /// again every 50 ms for as long as the process runs.
+    pub fn install(config: &mut Config, path: &Path) -> std::io::Result<Arc<Faults>> {
+        let faults = Arc::new(Faults {
+            delay_commits: AtomicU64::new(0),
+            hold_commits: AtomicBool::new(false),
+            fail_before: AtomicBool::new(false),
+            fail_after: AtomicBool::new(false),
+            clock: AtomicI64::new(0),
+            drops: Mutex::new(Vec::new()),
+            random: AtomicU64::new(0x9e37_79b9_7f4a_7c15),
+        });
+        let first = read(&std::fs::read_to_string(path).unwrap_or_default());
+        if let Some(idle) = first.quic_idle {
+            config.quic_idle = Duration::from_millis(idle);
+        }
+        let mut taken = first.generation;
+        faults.take(first);
+        acknowledge(path, taken);
+        let base = Arc::clone(&config.clock);
+        let moved = Arc::clone(&faults);
+        config.clock =
+            Arc::new(move || base().saturating_add_signed(moved.clock.load(Ordering::Acquire)));
+        config.hooks = Arc::new(FaultHooks(Arc::clone(&faults)));
+        config.faults = Some(Arc::clone(&faults));
+        let watched = Arc::clone(&faults);
+        let path = path.to_path_buf();
+        std::thread::Builder::new()
+            .name("vos-faults".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(READ_EVERY);
+                    let read = read(&std::fs::read_to_string(&path).unwrap_or_default());
+                    let generation = read.generation;
+                    watched.take(read);
+                    if generation != taken {
+                        acknowledge(&path, generation);
+                        taken = generation;
+                    }
+                }
+            })?;
+        Ok(faults)
+    }
+
+    /// Put `read`'s faults in force: each store releases, so whatever
+    /// follows, the acknowledgement among it, comes after them.
+    fn take(&self, read: Read) {
+        self.delay_commits
+            .store(read.delay_commits, Ordering::Release);
+        self.hold_commits
+            .store(read.hold_commits, Ordering::Release);
+        self.fail_before.store(read.fail_before, Ordering::Release);
+        self.fail_after.store(read.fail_after, Ordering::Release);
+        self.clock.store(read.clock, Ordering::Release);
+        *self.drops.lock().expect("the losses") = read.drops;
+    }
+
+    /// Whether a frame of `class` to `to` is lost.
+    pub(crate) fn lost(&self, to: NodeNumber, class: Class) -> bool {
+        let losses = self.drops.lock().expect("the losses");
+        let Some(loss) = losses
+            .iter()
+            .find(|loss| loss.class == class && loss.to.is_none_or(|node| node == to))
+        else {
+            return false;
+        };
+        // A xorshift step: frames lost at about the rate asked.
+        let mut x = self.random.load(Ordering::Relaxed);
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.random.store(x, Ordering::Relaxed);
+        x % 1_000_000 < u64::from(loss.per_million)
+    }
+}
+
+/// Say that the faults of `generation` are in force, in the file beside
+/// the control file at `path`.
+fn acknowledge(path: &Path, generation: Option<u64>) {
+    let Some(generation) = generation else {
+        return;
+    };
+    let staged = path.with_extension("taking");
+    if std::fs::write(&staged, generation.to_string()).is_ok() {
+        let _ = std::fs::rename(&staged, path.with_extension("taken"));
+    }
+}
+
+/// A network losing the frames of the classes the faults name.
+pub(crate) struct Lossy {
+    pub(crate) network: Arc<dyn crate::node::Wire>,
+    pub(crate) faults: Arc<Faults>,
+}
+
+impl crate::node::Wire for Lossy {
+    fn send(
+        &self,
+        to: NodeNumber,
+        class: Class,
+        stream: u64,
+        frame: Vec<u8>,
+    ) -> Result<(), vos_net::Refused> {
+        if self.faults.lost(to, class) {
+            return Ok(());
+        }
+        self.network.send(to, class, stream, frame)
+    }
+
+    fn ready(
+        &self,
+        to: NodeNumber,
+        class: Class,
+    ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        self.network.ready(to, class)
+    }
+}
+
+struct FaultHooks(Arc<Faults>);
+
+impl Hooks for FaultHooks {
+    fn before_commit(&self) {
+        while self.0.hold_commits.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let delay = self.0.delay_commits.load(Ordering::Acquire);
+        if delay > 0 {
+            std::thread::sleep(Duration::from_millis(delay));
+        }
+    }
+
+    fn fail_commit(&self) -> bool {
+        self.0.fail_before.load(Ordering::Acquire)
+    }
+
+    fn fail_sync(&self) -> bool {
+        self.0.fail_after.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_control_file_reads_as_its_faults() {
+        let read = read(
+            "delay_commits 50\nhold_commits\nfail_commits after\nclock -15000\n\
+             drop consensus 500000 to 2\ndrop liveness 1000000\nquic_idle 3000\ngeneration 7\n\
+             nonsense\n",
+        );
+        assert_eq!(
+            read,
+            Read {
+                delay_commits: 50,
+                hold_commits: true,
+                fail_before: false,
+                fail_after: true,
+                clock: -15_000,
+                drops: vec![
+                    Loss {
+                        class: Class::Consensus,
+                        per_million: 500_000,
+                        to: Some(2),
+                    },
+                    Loss {
+                        class: Class::Liveness,
+                        per_million: 1_000_000,
+                        to: None,
+                    },
+                ],
+                quic_idle: Some(3_000),
+                generation: Some(7),
+            }
+        );
+    }
+}

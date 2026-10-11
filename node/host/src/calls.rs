@@ -39,6 +39,20 @@ const REFORWARD: Duration = Duration::from_secs(2);
 const PAUSE: Duration = Duration::from_millis(100);
 /// Forwarded calls the leader runs at once for one forwarding replica.
 const FORWARDED: usize = 1024;
+/// How long a call at its leader waits for its answer before it is
+/// answered `TimedOut`, the client sending it again: a leader stuck on its
+/// disk holds no caller longer. The call itself goes on.
+const ANSWERED: Duration = Duration::from_secs(30);
+
+/// `answer`, or `TimedOut` once `ANSWERED` has passed.
+async fn within_deadline(answer: impl Future<Output = Answer>) -> Answer {
+    answer
+        .or(async {
+            smol::Timer::after(ANSWERED).await;
+            Answer::TimedOut
+        })
+        .await
+}
 
 /// One (agent, session)'s calls the leader has queued.
 #[derive(Default)]
@@ -197,61 +211,85 @@ impl Inner {
                 next => break next,
             }
         };
-        let sequence = call.sequence;
-        let lane_key = (agent, call.session);
         match next {
             Next::Answer(answer) => answer,
-            Next::Wait(wait) => wait.recv().await.unwrap_or(Answer::Stopped),
+            Next::Wait(wait) => {
+                within_deadline(async { wait.recv().await.unwrap_or(Answer::Stopped) }).await
+            }
             Next::Queue => {
+                let (session, sequence) = (call.session, call.sequence);
                 let request = Request {
-                    session: call.session,
+                    session,
                     sequence,
-                    caller: Principal::Client(call.session.key),
+                    caller: Principal::Client(session.key),
                     instance: call.instance,
                     method: call.method,
                     arguments: call.arguments,
                 };
-                let answer = match answer_of(self.call(agent, request).await) {
-                    // The program failed on it alone, here: on state a
-                    // deposed leader may hold. Once this replica is known to
-                    // lead, its state says whether the call ran after all.
-                    Answer::NotConsumed => match self.read_index(agent).await {
-                        Ok(_) => match self.applied_session(agent, &call.session, sequence) {
-                            Ok(Applied {
-                                mark,
-                                reply: Some(outcome),
-                                at,
-                                ..
-                            }) if sequence <= mark => Answer::Ran { outcome, at },
-                            Ok(Applied { mark, .. }) if sequence <= mark => {
-                                Answer::Rejected(Rejection::TooOld)
-                            }
-                            Ok(_) => Answer::NotConsumed,
-                            Err(answer) => answer,
-                        },
-                        Err(error) => answer_of(Err(error)),
-                    },
-                    answer => answer,
-                };
-                let waiting = {
-                    let mut lanes = self.calls.lanes.lock().expect("the lanes");
-                    let lane = lanes.entry(lane_key).or_default();
-                    let waiting = lane.inflight.remove(&sequence).unwrap_or_default();
-                    // Not consumed, the mark stays: the client resends it.
-                    if !matches!(answer, Answer::Ran { .. }) {
-                        lane.queued = lane.queued.min(sequence - 1);
-                    }
-                    if lane.inflight.is_empty() {
-                        lanes.remove(&lane_key);
-                    }
-                    waiting
-                };
-                for waiter in waiting {
-                    let _ = waiter.try_send(answer.clone());
-                }
-                answer
+                // Pushed now, in the lane's order; run to its end in a task
+                // of its own, which settles the lane however long it takes,
+                // and waited for within the deadline.
+                let running = self.call(agent, request);
+                let (answered, answer) = smol::channel::bounded(1);
+                let inner = Arc::clone(self);
+                self.spawn(async move {
+                    let settled = inner.queued_call(agent, session, sequence, running).await;
+                    let _ = answered.try_send(settled);
+                });
+                within_deadline(async { answer.recv().await.unwrap_or(Answer::Stopped) }).await
             }
         }
+    }
+
+    /// The answer to a call its lane queued, once `running` ends; then
+    /// every resend waiting on it is answered too.
+    async fn queued_call(
+        self: Arc<Self>,
+        agent: AgentId,
+        session: Session,
+        sequence: u64,
+        running: impl Future<Output = Result<Answered, CallError>>,
+    ) -> Answer {
+        let lane_key = (agent, session);
+        let answer = match answer_of(running.await) {
+            // The program failed on it alone, here: on state a
+            // deposed leader may hold. Once this replica is known to
+            // lead, its state says whether the call ran after all.
+            Answer::NotConsumed => match self.read_index(agent).await {
+                Ok(_) => match self.applied_session(agent, &session, sequence) {
+                    Ok(Applied {
+                        mark,
+                        reply: Some(outcome),
+                        at,
+                        ..
+                    }) if sequence <= mark => Answer::Ran { outcome, at },
+                    Ok(Applied { mark, .. }) if sequence <= mark => {
+                        Answer::Rejected(Rejection::TooOld)
+                    }
+                    Ok(_) => Answer::NotConsumed,
+                    Err(answer) => answer,
+                },
+                Err(error) => answer_of(Err(error)),
+            },
+            answer => answer,
+        };
+        let waiting = {
+            let mut lanes = self.calls.lanes.lock().expect("the lanes");
+            let lane = lanes.entry(lane_key).or_default();
+            let waiting = lane.inflight.remove(&sequence).unwrap_or_default();
+            // Not consumed, the mark stays: the client resends it.
+            if !matches!(answer, Answer::Ran { .. }) {
+                lane.queued = lane.queued.min(sequence - 1);
+            }
+            if lane.inflight.is_empty() {
+                lanes.remove(&lane_key);
+            }
+            waiting
+        };
+        for waiter in waiting {
+            let _ = waiter.try_send(answer.clone());
+        }
+        answer
     }
 
     /// What a call's lane does with it now.

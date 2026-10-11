@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 description = "The VOS node host: storage, the leader loops and ingress."
 
+[features]
+# Faults a test injects into a running node (`vos_node::faults`): never
+# in a production build.
+faults = []
+
 [dependencies]
 # Exact: the workspace nightly is a 1.90 pre-release, which a later fjall
 # release may outgrow.

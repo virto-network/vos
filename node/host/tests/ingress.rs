@@ -574,6 +574,50 @@ fn operator_commands_need_the_token() {
     );
 }
 
+/// Fails the sync of the next synced flush once armed, as a failed fsync
+/// does.
+#[derive(Default)]
+struct FailNextSync(AtomicBool);
+
+impl Hooks for FailNextSync {
+    fn fail_sync(&self) -> bool {
+        self.0.swap(false, Ordering::SeqCst)
+    }
+}
+
+/// The operator reads a replica's status, and a stranger cannot. A node
+/// of a space of one whose flush fails outside any log write halts, and
+/// its status says so.
+#[test]
+fn the_status_route_reports_a_replica_and_a_halt() {
+    let hooks = Arc::new(FailNextSync::default());
+    let served = Served::start(hooks.clone());
+    let operator = Operator::new(&served.target, &served.token);
+    let Ok(Answer::Status(status)) = operator.status(served.agent) else {
+        panic!("a status")
+    };
+    assert!(status.leads && !status.halted, "{status:?}");
+    assert!(status.applied >= 1 && status.commit >= status.applied);
+    assert!(status.last_index >= status.commit);
+    let stranger = Operator::new(&served.target, &"00".repeat(32));
+    assert_eq!(
+        stranger.status(served.agent).unwrap(),
+        Answer::Rejected(Rejection::Unauthorized)
+    );
+    assert_eq!(operator.status(AgentId(0xdead)).unwrap(), Answer::NoAgent);
+    hooks.0.store(true, Ordering::SeqCst);
+    assert!(
+        served.node.create_agent().is_err(),
+        "the record's flush failed"
+    );
+    wait_until("the node halts", || {
+        matches!(
+            operator.status(served.agent),
+            Ok(Answer::Status(status)) if status.halted
+        )
+    });
+}
+
 #[test]
 fn a_node_is_its_public_key_and_never_serves_its_secret() {
     use std::os::unix::fs::PermissionsExt;

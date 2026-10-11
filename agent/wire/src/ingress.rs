@@ -203,6 +203,26 @@ pub enum Answer {
     /// A replacement not made, and why.
     #[codec(index = 14)]
     Unplaced(Unplaced),
+    /// The operator's `GET /agents/{agent}/status`: this node's replica.
+    #[codec(index = 15)]
+    Status(ReplicaStatus),
+}
+
+/// A replica's Raft state, as its node has it.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct ReplicaStatus {
+    pub term: u64,
+    pub leads: bool,
+    /// The leader it knows, if any.
+    pub leader: Option<u8>,
+    pub commit: u64,
+    pub applied: u64,
+    /// The index its log starts after: where it was compacted to, or a
+    /// snapshot installed at.
+    pub log_start: u64,
+    pub last_index: u64,
+    /// The node halted: a flush failed, and it needs a restart.
+    pub halted: bool,
 }
 
 /// The operator's `POST /agents`: the nodes to replicate the new agent,

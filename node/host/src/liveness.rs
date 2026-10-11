@@ -167,6 +167,7 @@ async fn beat(inner: Arc<Inner>) -> Ended {
             smol::Timer::after(interval).await;
         }
         first = false;
+        inner.halt_if_store_failed();
         // A halted node falls silent: its groups' followers elect others.
         if inner.halted.load(Ordering::SeqCst) {
             continue;
