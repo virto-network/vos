@@ -13,6 +13,9 @@
 //! - `drop <class> <per million> [to <node>]`: frames of `liveness`,
 //!   `consensus`, `requests` or `bulk` lost, to every peer or one;
 //! - `quic_idle <ms>`: QUIC's idle timeout, read once at start;
+//! - `election_ms <low> <high>`, `heartbeat_ms <ms>` and
+//!   `compact <every> <tail>`: the groups' timing and compaction, read
+//!   once at start;
 //! - `generation <n>`: once the faults are in force, the node writes `n`
 //!   to the file beside it, with the extension `taken`, so a test knows.
 //!
@@ -61,7 +64,12 @@ struct Read {
     clock: i64,
     drops: Vec<Loss>,
     quic_idle: Option<u64>,
+    election_ms: Option<(u64, u64)>,
+    heartbeat_ms: Option<u64>,
+    compact: Option<(u64, u64)>,
     generation: Option<u64>,
+    /// Settings lines it could not read: a node does not start on them.
+    unreadable: Vec<String>,
 }
 
 fn class(name: &str) -> Option<Class> {
@@ -74,7 +82,8 @@ fn class(name: &str) -> Option<Class> {
     })
 }
 
-/// The faults `text` names; a line it cannot read is left out.
+/// The faults `text` names; a fault's line it cannot read is left out, a
+/// setting's is kept as unreadable.
 fn read(text: &str) -> Read {
     let mut read = Read::default();
     for line in text.lines() {
@@ -85,8 +94,28 @@ fn read(text: &str) -> Read {
             ["fail_commits", "before"] => read.fail_before = true,
             ["fail_commits", "after"] => read.fail_after = true,
             ["clock", ms] => read.clock = ms.parse().unwrap_or(0),
-            ["quic_idle", ms] => read.quic_idle = ms.parse().ok(),
             ["generation", n] => read.generation = n.parse().ok(),
+            ["quic_idle" | "election_ms" | "heartbeat_ms" | "compact", ..] => {
+                let read_as = |text: &str| text.parse::<u64>().ok();
+                let taken = match words[..] {
+                    ["quic_idle", ms] => read_as(ms).map(|ms| read.quic_idle = Some(ms)),
+                    ["election_ms", low, high] => read_as(low)
+                        .zip(read_as(high))
+                        .filter(|(low, high)| low < high)
+                        .map(|election| read.election_ms = Some(election)),
+                    ["heartbeat_ms", ms] => read_as(ms)
+                        .filter(|ms| *ms > 0)
+                        .map(|ms| read.heartbeat_ms = Some(ms)),
+                    ["compact", every, tail] => read_as(every)
+                        .zip(read_as(tail))
+                        .filter(|(every, _)| *every > 0)
+                        .map(|compact| read.compact = Some(compact)),
+                    _ => None,
+                };
+                if taken.is_none() {
+                    read.unreadable.push(line.to_string());
+                }
+            }
             ["drop", name, per_million, ref rest @ ..] => {
                 let to = match rest {
                     ["to", node] => node.parse().ok(),
@@ -121,8 +150,39 @@ impl Faults {
             random: AtomicU64::new(0x9e37_79b9_7f4a_7c15),
         });
         let first = read(&std::fs::read_to_string(path).unwrap_or_default());
+        if !first.unreadable.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "{}: unreadable settings {:?}",
+                    path.display(),
+                    first.unreadable
+                ),
+            ));
+        }
         if let Some(idle) = first.quic_idle {
             config.quic_idle = Duration::from_millis(idle);
+        }
+        if let Some(election) = first.election_ms {
+            config.election_timeout_ms = election;
+        }
+        if let Some(heartbeat) = first.heartbeat_ms {
+            config.heartbeat_ms = heartbeat;
+        }
+        if let Some((every, tail)) = first.compact {
+            config.compact_every = every;
+            config.compact_tail = tail;
+        }
+        if config.heartbeat_ms >= config.election_timeout_ms.0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "{}: a heartbeat of {} ms within elections of {:?} ms",
+                    path.display(),
+                    config.heartbeat_ms,
+                    config.election_timeout_ms
+                ),
+            ));
         }
         let mut taken = first.generation;
         faults.take(first);
@@ -256,7 +316,7 @@ mod tests {
         let read = read(
             "delay_commits 50\nhold_commits\nfail_commits after\nclock -15000\n\
              drop consensus 500000 to 2\ndrop liveness 1000000\nquic_idle 3000\ngeneration 7\n\
-             nonsense\n",
+             election_ms 300 600\nheartbeat_ms 100\ncompact 32 8\nnonsense\n",
         );
         assert_eq!(
             read,
@@ -279,8 +339,31 @@ mod tests {
                     },
                 ],
                 quic_idle: Some(3_000),
+                election_ms: Some((300, 600)),
+                heartbeat_ms: Some(100),
+                compact: Some((32, 8)),
                 generation: Some(7),
+                unreadable: Vec::new(),
             }
         );
+    }
+
+    #[test]
+    fn a_setting_it_cannot_read_is_kept_as_unreadable() {
+        let read = read(
+            "election_ms 600 300\nheartbeat_ms soon\nheartbeat_ms 0\ncompact 32\ncompact 0 8\n\
+             hold_commits\n",
+        );
+        assert_eq!(
+            read.unreadable,
+            [
+                "election_ms 600 300",
+                "heartbeat_ms soon",
+                "heartbeat_ms 0",
+                "compact 32",
+                "compact 0 8"
+            ]
+        );
+        assert!(read.hold_commits);
     }
 }

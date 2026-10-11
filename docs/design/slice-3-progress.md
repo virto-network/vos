@@ -5330,3 +5330,208 @@ Opening each store at the end comes with 3.9b's end checks.
   client times out at 300 s.
 - One task and one channel per queued call, on the leader's hot path:
   for 3.10's budget.
+
+#### 3.9b Built
+
+**`node/checker` (vos-checker, `publish = false`):** the model both
+exactly-once suites share, behind a trait, `Nodes`, through which a suite
+says what its clients see of its nodes:
+- how many there are, where each one's ingress is reached, and which
+  one an answer's address names;
+- the clock offset every node shares, and how often each one started;
+- the leader, where the suite knows it cheaply;
+- whether clients pause;
+- a log of what was seen;
+- a hook checking what a node answered against its store, where the
+  suite can see it (in process only).
+
+It holds:
+- `Client`: the client model (running totals, forwards to the next
+  agent's inbox, sessions timed ahead and timed again past a clock jump)
+  and its driver.
+  - One request at a time or pipelined.
+  - It follows `NotLeader` and, with five nodes, `Elsewhere`: a node
+    replicating nothing names the replicas, a different one each try.
+- Its reader: linearizable and floored reads, checked against what was
+  answered, and its inbox read against what the previous client
+  forwarded.
+- `capture` and `replay`: requests signed in a live session, sent again
+  once every node has collected it; none may run.
+- `Random`, `Mode`, `Log`, and the instances' and deadlines' constants.
+
+**`exactly_once.rs` runs on it**, its `Cluster` implementing `Nodes`.
+What only one process can do stays there:
+- the check that a node holds a request applied before it answers it;
+- waiting for every replica to collect every session, read in the
+  stores;
+- the end checks on the stores while the nodes run.
+
+**Around it:**
+- `vos_node::client::post_within`: one request on a connection of its
+  own, answered within a deadline, in the clear or over TLS.
+- `ReplicaStatus.sessions`: the live sessions a replica's applied state
+  holds. The process suite waits for every replica to collect every
+  session by it: a session is removed, and the count lowered, in one
+  accumulate.
+- `vos_node::STORE`: where a stopped node's store is opened.
+- **Settings a test build reads once at start, in the faults file:**
+  `election_ms <low> <high>`, `heartbeat_ms <ms>`,
+  `compact <every> <tail>`.
+
+**The harness** serves clients and faults at once (`&self`
+throughout).
+- **Each faults file is written whole each time:**
+  - a generation;
+  - the suite's settings;
+  - a `clock` line: the offset every node shares, plus the node's own
+    jump;
+  - the node's own faults.
+- **A kill clears the node's own faults and jump,** and keeps the
+  shared offset.
+- **New helpers:**
+  - `agent_with`: an agent created on chosen nodes, with programs
+    installed;
+  - `identity`, `operate`, `jump_clock`, `jump_every_clock`;
+  - `stop_all`: SIGKILL every node, then open each store.
+- **A node that never says it listens:** the harness records each of
+  its threads' name, state and kernel wait from `/proc`, and the
+  failure shows them with the run's last events.
+
+**The suite** (`node/cli/tests/fault_suite.rs`, with the feature): as
+designed.
+- **The space:**
+  - five nodes;
+  - six agents, each on three of them in turn;
+  - 200 idle agents;
+  - elections of 300–600 ms, compaction every 32 entries, QUIC's idle
+    timeout at 5 s.
+- **The clients:** twelve, two per agent, with a reader at each
+  forwarding one.
+- **The faults:** 24, one at a time.
+  - Drawn from the design's list: a leader killed, a node paused, a
+    connection cut, a link cut, a leader cut off, a lossy or slow link,
+    a gray leader and the reverse (a node's pair heartbeat lost, its
+    Raft frames flowing), a slow disk, a stalled one, a failing one
+    (before or after its write), a node's clock jump, a random
+    replacement, and the leader replaced.
+  - At set points:
+    - every clock past the skew;
+    - the replacements aimed at the vote floor;
+    - every session expiring, with requests captured and replayed;
+    - the quorum-loss window.
+- **The end checks:** as designed.
+  - After them, each sender's pair marks and outbox, and each
+    receiver's, are read in the stores.
+
+It is its own test binary, beside `faults.rs`. In the same binary,
+cargo would run it beside the three-process tests, and their load would
+change its timing.
+
+**Found by the suite, and fixed:**
+- **A debug build's node took 8.6 s to start**, and more than 20 s
+  under the suite's load. The linker in `vos-pvm-compiler` ran
+  unoptimized.
+  - It is optimized in the dev and test profiles, as `vos-pvm` is: a
+    start takes 0.27 s.
+- **A shared clock jump across processes is not atomic:** the five
+  faults files are written one after another. Clients took the new
+  offset first, so a session they timed met nodes still at the old one,
+  120 s apart.
+  - The harness moves the nodes first and the clients last.
+  - In between it says the clocks are moving (`Nodes::clocks_moving`),
+    and the checker sends a stale-session refusal again then.
+  - The in-process suite moves one atomic and never says so.
+- **A forwarding client used one key for every session.** A long run
+  reached the agent's cap of 64 live sessions on one key, and was
+  refused `KEY_SESSIONS_FULL`.
+  - Such a client now takes a fresh key every 32 sessions.
+  - Retiming a session refused this way would not be safe: unlike a
+    stale one, a copy of it could be created later, once the cap
+    frees.
+
+**Where it departs from the design:**
+- **Answers' deadlines are not suspended.** Every window where waiting
+  is expected is shorter than a client's 60 s to an answer:
+  - a delay of at most 5 s;
+  - a quorum lost for at most 8 s;
+  - a gray leader, whose patience is 3 s at the suite's settings.
+- **The quorum-loss window kills two of a group's replicas,** rather
+  than cutting them off: restarts, catch-up and elections follow at
+  once.
+- **A run's coverage is printed, not required.** The in-process suite
+  requires a session timed again past the clocks' jump; every seed here
+  showed 14 to 16.
+- **The process suite's clients do not know the leader cheaply:** a
+  status read per answer would cost as much as the call. They count
+  "answered", not "by the leader" or "by a follower".
+- **The stores are opened after SIGKILL,** so the end checks read what
+  recovery makes of each.
+
+**Runs:** the default seed and seeds 11–32 pass, each seed its own
+schedule (`2·seed + 1`). After the review's folds, the default seed and
+seeds 33–40 pass, the floor-aimed set point reaching its state in each.
+- Both transports and both client modes.
+- 120 to 300 s a seed.
+- 14,000 to 83,000 requests answered a run.
+- Failing disks halting and recovering, gray leaders and their reverse.
+- The relay losing nothing of itself.
+
+`just ci` runs the default seed. The in-process checker passes its
+48-run loop on the shared crate.
+
+**Opus's review of 3.9b:** GO-with-fixes, all on the test side, all
+folded:
+- **The floor-aimed replacements never reached the state they named.**
+  b, added again, heard its leader at once, and refused a's pre-votes
+  under its lease; c refused them by its log. Deleting the floor left
+  the set point passing.
+  - **Now:**
+    - c, d and e send b no Raft frames while b is added again: b runs
+      the group empty, hearing no leader. e is cut too, as it may lead
+      then and would fill b by a snapshot;
+    - no node tells a of the placement that removed it, so a, restarted,
+      campaigns in its old configuration;
+    - a must never lead, and only b's floor stands in its way: until
+      a's term has caught up with b's, through the refusals that raise
+      it, and two election timeouts after;
+    - b must stay empty all along.
+  - **Mutation:** with the floor disabled in vos-raft, three seeds out
+    of three fail there, a stale node leading on an empty node's vote.
+    The checker saw it too: requests answered from the stale state with
+    a wrong total.
+- **The pair marks and outbox were asserted once, after SIGKILL, with
+  nothing waiting for the last acknowledgements:** a flake.
+  - `ReplicaStatus.outbox` counts the messages a replica's applied state
+    holds unacknowledged.
+  - The end waits until, at every replica of every agent, the leader's
+    log is committed through its end and applied everywhere, and every
+    outbox is empty. Then it waits again after the reads, and stops.
+- **`stores_agree` could compare nothing:** a store without the agent
+  reads as defaults. Now:
+  - every replica must have applied, on disk, at least what it settled
+    at, and all must have applied as far;
+  - every entry in the compared range must be there;
+  - every replica must hold rows.
+- **A node that died on its own went unseen:** the harness now notes
+  any exit it did not make, and the suite fails on one.
+- **Halts were allowed at a failing-disk node at any time:** now only
+  between the fault and its restart, as offsets in the node's log. The
+  fault also waits for a halt it saw, not just for a missing status.
+- **Settled in one pass:** the end settles every agent in one pass
+  just before stopping every node. An election in between would leave a
+  leader an entry ahead of its followers; the window is now one status
+  pass.
+- **Nits:**
+  - a node that exits while the harness waits for its faults fails the
+    wait at once, naming the exit;
+  - trouble lines are read from the log's bytes;
+  - a zero heartbeat or compaction interval is unreadable;
+  - the checker reads whether the clocks move before the offset, so the
+    two loads cannot straddle the harness's;
+  - the harness's statuses and commands are answered within 5 s
+    (`Operator::within`);
+  - a live-sessions count that does not decode answers `Unavailable`;
+  - `post_within`'s deadline is stated per read and write;
+  - a settings line a node cannot read, or a heartbeat not shorter than
+    the elections, stops the node at start;
+  - `stop_all` pauses every node before killing any.

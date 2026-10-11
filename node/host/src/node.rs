@@ -831,9 +831,23 @@ impl Inner {
             return Answer::NoAgent;
         };
         let state = run.shared.state();
-        let (Ok(rows), Ok(last)) = (
+        let snapshot = self.store.snapshot();
+        // No count is none held; one that does not read is no answer.
+        let sessions = match snapshot.get(agent, &vos_wire::keys::live_sessions()) {
+            Ok(None) => Some(0),
+            Ok(Some(bytes)) => unstored(&bytes)
+                .and_then(|bytes| u64::decode(bytes).ok())
+                .map(|(live, _)| live),
+            Err(_) => None,
+        };
+        let outbox = snapshot
+            .scan(agent, &vos_wire::keys::outbox_prefix(), None)
+            .try_fold(0u64, |count, row| row.map(|_| count + 1));
+        let (Ok(rows), Ok(last), Some(sessions), Ok(outbox)) = (
             self.store.agent_rows(agent),
             self.store.last_log_index(agent),
+            sessions,
+            outbox,
         ) else {
             return Answer::Unavailable;
         };
@@ -847,6 +861,8 @@ impl Inner {
             log_start: rows.log_start,
             last_index: last.max(rows.log_start),
             halted: self.halted.load(std::sync::atomic::Ordering::SeqCst),
+            sessions,
+            outbox,
         })
     }
 
@@ -1498,8 +1514,9 @@ pub struct Node {
     liveness: Option<(smol::channel::Sender<()>, JoinHandle<()>)>,
 }
 
-/// The node's data directory: its store, and the operator's token.
-const STORE: &str = "store";
+/// The node's data directory: its store, and the operator's token. A
+/// stopped node's store may be opened at `STORE` in it.
+pub const STORE: &str = "store";
 const BLOBS: &str = "blobs";
 pub const ADMIN_TOKEN: &str = "admin.token";
 /// The node's public key, in hex, in its data directory: for operator

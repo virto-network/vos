@@ -223,6 +223,10 @@ pub struct ReplicaStatus {
     pub last_index: u64,
     /// The node halted: a flush failed, and it needs a restart.
     pub halted: bool,
+    /// The sessions its applied state holds.
+    pub sessions: u64,
+    /// The messages its applied state holds unacknowledged.
+    pub outbox: u64,
 }
 
 /// The operator's `POST /agents`: the nodes to replicate the new agent,

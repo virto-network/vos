@@ -26,5 +26,6 @@ vos-pvm-compiler = { workspace = true }
 vos-wire = { workspace = true }
 
 [dev-dependencies]
+vos-checker = { path = "../checker" }
 socket2 = "0.6"
 tempfile = "3"

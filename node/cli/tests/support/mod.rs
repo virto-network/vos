@@ -10,13 +10,16 @@ use std::io::{BufRead, BufReader};
 use std::net::{SocketAddr, TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use vos_checker::{Log, Methods, Nodes};
 use vos_node::client::{Operator, Target};
 use vos_node::tls::Trust;
-use vos_wire::ids::AgentId;
-use vos_wire::ingress::{Answer, ReplicaStatus};
+use vos_wire::ids::{AgentId, InstanceId};
+use vos_wire::ingress::{Answer, Install, ReplicaStatus};
+use vos_wire::peer::NodeNumber;
 
 use relay::Relay;
 
@@ -36,12 +39,26 @@ pub fn agent_elf() -> PathBuf {
     guest("default/target/riscv64em-vos/release/vos-agent.elf")
 }
 
+/// The counter actor, linked.
+pub fn counter_program() -> Vec<u8> {
+    let counter = std::fs::read(guest(
+        "test-actors/target/riscv64em-vos/release/counter.elf",
+    ))
+    .unwrap();
+    vos_pvm_compiler::link_elf_spi(&counter).expect("links")
+}
+
 /// A running node, killed when dropped, however the test ends.
 pub struct Running(Child);
 
 impl Running {
     fn pid(&self) -> u32 {
         self.0.id()
+    }
+
+    /// How it exited, if it did before the harness killed it.
+    fn exited(&mut self) -> Option<std::process::ExitStatus> {
+        self.0.try_wait().ok().flatten()
     }
 }
 
@@ -83,8 +100,34 @@ pub fn run(args: &[&str], log: &Path, faults: Option<&Path>) -> Option<(Running,
             let _ = lines.send(line);
         }
     });
-    let deadline = Duration::from_secs(20);
-    let listening = read.recv_timeout(deadline).ok()?;
+    let deadline = Duration::from_secs(60);
+    let Ok(listening) = read.recv_timeout(deadline) else {
+        // Where a node that never says it listens is: each thread's name,
+        // state and kernel wait, which /proc shows without tracing it.
+        let threads = std::fs::read_dir(format!("/proc/{}/task", running.pid()))
+            .map(|tasks| {
+                tasks
+                    .filter_map(Result::ok)
+                    .map(|task| {
+                        let read = |name: &str| {
+                            std::fs::read_to_string(task.path().join(name))
+                                .unwrap_or_default()
+                                .trim()
+                                .to_string()
+                        };
+                        let state = read("stat")
+                            .rsplit_once(") ")
+                            .map(|(_, rest)| rest.chars().next().unwrap_or('?'))
+                            .unwrap_or('?');
+                        format!("{} {state} {}", read("comm"), read("wchan"))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        let _ = std::fs::write(log.with_extension("stuck"), threads);
+        return None;
+    };
     listening.strip_prefix("listening on ")?;
     let key = read
         .recv_timeout(deadline)
@@ -149,19 +192,34 @@ pub fn read_log(log: &Path) -> String {
     std::fs::read_to_string(log).unwrap_or_default()
 }
 
-pub fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
-    let until = Instant::now() + Duration::from_secs(60);
-    while !done() {
-        assert!(Instant::now() < until, "timed out: {what}");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+pub fn wait_until(what: &str, done: impl FnMut() -> bool) {
+    vos_checker::wait_until(what, Duration::from_secs(60), done);
 }
 
 /// How the nodes run.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub struct Options {
     /// TLS on the ingress, clients pinning the nodes' keys.
     pub tls: bool,
+    /// Lines of each faults file a node reads once, at start: the groups'
+    /// timing and compaction, QUIC's idle timeout.
+    pub settings: String,
+}
+
+/// One node's process, and the faults the test gives it.
+#[derive(Default)]
+struct Slot {
+    running: Mutex<Option<Running>>,
+    /// How often it started.
+    starts: AtomicU64,
+    /// Paused (SIGSTOP): it takes no faults until it goes on.
+    paused: AtomicBool,
+    /// Its own faults, as lines of its faults file.
+    faults: Mutex<String>,
+    /// How far its clock runs ahead of every node's, or behind.
+    jump: AtomicI64,
+    /// The generation its faults file holds.
+    written: AtomicU64,
 }
 
 /// Nodes 1..=count of one space, each its own process, their peers
@@ -173,22 +231,34 @@ pub struct Processes {
     ingress: Vec<u16>,
     bound: Vec<SocketAddr>,
     pub relay: Relay,
-    running: Vec<Option<Running>>,
-    /// Nodes paused (SIGSTOP), which take no faults until they go on.
-    paused: Vec<AtomicBool>,
+    slots: Vec<Slot>,
+    targets: Vec<Target>,
+    options: Options,
     /// The last generation of faults written, for a node to acknowledge.
     generation: AtomicU64,
-    /// The generation each node's faults file holds.
-    written: Vec<AtomicU64>,
-    options: Options,
+    /// How far every node's clock runs ahead of the wall clock...
+    clocks: AtomicI64,
+    /// ... and the agents' time as clients take it: the same, but while
+    /// the nodes' clocks move, when it moves last.
+    offset: AtomicI64,
+    /// Whether the nodes' clocks are moving, some there and some not.
+    moving: AtomicBool,
+    /// Clients pause at their next request while it is set.
+    pub clients_paused: AtomicBool,
+    log: Log,
+    /// Nodes that exited before the harness killed them.
+    exits: Mutex<Vec<String>>,
 }
+
+/// How long a status or an operator's command may take at one node.
+const OPERATOR: Duration = Duration::from_secs(5);
 
 impl Processes {
     pub fn data(&self, number: usize) -> PathBuf {
         self.dir.path().join(format!("node-{number}"))
     }
 
-    pub fn log(&self, number: usize) -> PathBuf {
+    pub fn log_path(&self, number: usize) -> PathBuf {
         self.dir.path().join(format!("node-{number}.log"))
     }
 
@@ -208,22 +278,22 @@ impl Processes {
         key
     }
 
-    pub fn target(&self, number: usize) -> Target {
-        let trust = if self.options.tls {
-            Trust::NodeKey(self.key(number))
-        } else {
-            Trust::Loopback
-        };
-        Target::new(&self.url(number), trust).unwrap()
+    /// Where node `number`'s ingress is reached.
+    pub fn target(&self, number: usize) -> &Target {
+        &self.targets[number - 1]
     }
 
     pub fn operator(&self, number: usize) -> Operator {
         let token = std::fs::read_to_string(self.data(number).join(vos_node::ADMIN_TOKEN)).unwrap();
-        Operator::new(&self.target(number), &token)
+        Operator::within(self.target(number), &token, OPERATOR)
     }
 
     pub fn is_running(&self, number: usize) -> bool {
-        self.running[number - 1].is_some()
+        self.slot(number).running.lock().unwrap().is_some()
+    }
+
+    fn slot(&self, number: usize) -> &Slot {
+        &self.slots[number - 1]
     }
 
     /// Start `count` nodes, choosing their ports again if one cannot take
@@ -263,24 +333,50 @@ impl Processes {
                 })
                 .collect();
             std::fs::write(dir.path().join("space"), text).unwrap();
-            let mut processes = Processes {
+            let targets = (0..count)
+                .map(|at| {
+                    let url = format!("{scheme}://127.0.0.1:{}", ingress[at]);
+                    let trust = if options.tls {
+                        let mut key = [0; 32];
+                        hex::decode_to_slice(&keys[at], &mut key).unwrap();
+                        Trust::NodeKey(key)
+                    } else {
+                        Trust::Loopback
+                    };
+                    Target::new(&url, trust).unwrap()
+                })
+                .collect();
+            let processes = Processes {
                 dir,
                 count,
                 keys: keys.clone(),
                 ingress,
                 bound,
                 relay,
-                running: Vec::new(),
-                paused: (0..count).map(|_| AtomicBool::new(false)).collect(),
+                slots: (0..count).map(|_| Slot::default()).collect(),
+                targets,
+                options: options.clone(),
                 generation: AtomicU64::new(0),
-                written: (0..count).map(|_| AtomicU64::new(0)).collect(),
-                options,
+                clocks: AtomicI64::new(0),
+                offset: AtomicI64::new(0),
+                moving: AtomicBool::new(false),
+                clients_paused: AtomicBool::new(false),
+                log: Log::default(),
+                exits: Mutex::new(Vec::new()),
             };
-            let started: Vec<Option<Running>> =
-                (1..=count).map(|number| processes.launch(number)).collect();
-            if started.iter().all(Option::is_some) {
-                processes.running = started;
+            let started = (1..=count).all(|number| match processes.launch(number) {
+                Some(running) => {
+                    *processes.slot(number).running.lock().unwrap() = Some(running);
+                    processes.slot(number).starts.fetch_add(1, Ordering::SeqCst);
+                    true
+                }
+                None => false,
+            });
+            if started {
                 return processes;
+            }
+            for number in 1..=count {
+                processes.slot(number).running.lock().unwrap().take();
             }
             dir = processes.dir;
         }
@@ -294,7 +390,7 @@ impl Processes {
         let bind = self.bound[number - 1].to_string();
         let faults = self.faults_file(number);
         if !faults.exists() {
-            std::fs::write(&faults, "").unwrap();
+            self.write_faults(number);
         }
         let mut args = vec![
             "--data",
@@ -309,83 +405,152 @@ impl Processes {
         if self.options.tls {
             args.extend(["--tls", "--tls-name", "127.0.0.1"]);
         }
-        let (running, key) = run(&args, &self.log(number), Some(&faults))?;
+        let (running, key) = run(&args, &self.log_path(number), Some(&faults))?;
         assert_eq!(key, self.keys[number - 1]);
         Some(running)
     }
 
-    /// Kill node `number` with SIGKILL, emptying its faults file: a
-    /// fault left in place would meet its restart.
-    pub fn kill(&mut self, number: usize) {
-        drop(self.running[number - 1].take());
-        self.paused[number - 1].store(false, Ordering::SeqCst);
-        self.set_faults(number, "");
+    /// Kill node `number` with SIGKILL, clearing its own faults: a fault
+    /// left in place would meet its restart. Every node's clock offset
+    /// stays.
+    pub fn kill(&self, number: usize) {
+        self.end(number);
+        let slot = self.slot(number);
+        slot.paused.store(false, Ordering::SeqCst);
+        slot.faults.lock().unwrap().clear();
+        slot.jump.store(0, Ordering::SeqCst);
+        self.write_faults(number);
+    }
+
+    /// End node `number`'s process, noting whether it had exited by
+    /// itself.
+    fn end(&self, number: usize) {
+        let mut running = self.slot(number).running.lock().unwrap();
+        if let Some(status) = running.as_mut().and_then(Running::exited) {
+            self.exits
+                .lock()
+                .unwrap()
+                .push(format!("node {number} exited by itself: {status}"));
+        }
+        drop(running.take());
     }
 
     /// Pause node `number` (SIGSTOP), or let it go on (SIGCONT), once it
     /// takes the faults written while it was paused.
     pub fn pause(&self, number: usize, paused: bool) {
-        if let Some(running) = &self.running[number - 1] {
-            let signal = if paused { "-STOP" } else { "-CONT" };
-            let _ = Command::new("kill")
-                .args([signal, &running.pid().to_string()])
-                .status();
-            self.paused[number - 1].store(paused, Ordering::SeqCst);
-            if !paused {
-                self.taken(number, self.written[number - 1].load(Ordering::SeqCst));
-            }
-        }
-    }
-
-    /// Wait until node `number` says the faults of `generation` are in
-    /// force.
-    fn taken(&self, number: usize, generation: u64) {
-        if generation == 0 {
+        let running = self.slot(number).running.lock().unwrap();
+        let Some(pid) = running.as_ref().map(Running::pid) else {
             return;
+        };
+        drop(running);
+        let signal = if paused { "-STOP" } else { "-CONT" };
+        let _ = Command::new("kill")
+            .args([signal, &pid.to_string()])
+            .status();
+        self.slot(number).paused.store(paused, Ordering::SeqCst);
+        if !paused {
+            self.taken(number, self.slot(number).written.load(Ordering::SeqCst));
         }
-        let taken = self.faults_file(number).with_extension("taken");
-        wait_until("the node takes its faults", || {
-            std::fs::read_to_string(&taken)
-                .ok()
-                .and_then(|text| text.trim().parse::<u64>().ok())
-                == Some(generation)
-        });
     }
 
-    pub fn restart(&mut self, number: usize) {
+    /// Start node `number` again, once its faults are in force.
+    pub fn restart(&self, number: usize) {
         let until = Instant::now() + Duration::from_secs(20);
         loop {
+            let started = Instant::now();
             if let Some(running) = self.launch(number) {
-                self.running[number - 1] = Some(running);
+                *self.slot(number).running.lock().unwrap() = Some(running);
+                self.slot(number).starts.fetch_add(1, Ordering::SeqCst);
+                self.log.event(format!(
+                    "node {number} restarted in {:?}",
+                    started.elapsed()
+                ));
                 return;
             }
             assert!(
                 Instant::now() < until,
-                "node {number} did not restart: {}",
-                read_log(&self.log(number))
+                "node {number} did not restart: {}\nits threads:\n{}\nthe last events:\n{}",
+                read_log(&self.log_path(number)),
+                read_log(&self.log_path(number).with_extension("stuck")),
+                self.log.events(),
             );
             std::thread::sleep(Duration::from_millis(100));
         }
     }
 
-    /// Node `number`'s faults, as lines of its faults file: in force once
-    /// this returns, if the node runs and is not paused, as it says; else
-    /// once it starts or goes on.
+    /// Node `number`'s own faults, as lines of its faults file: in force
+    /// once this returns, if the node runs and is not paused, as it says;
+    /// else once it starts or goes on.
     pub fn set_faults(&self, number: usize, lines: &str) {
+        *self.slot(number).faults.lock().unwrap() = lines.to_string();
+        self.write_faults(number);
+    }
+
+    /// Run node `number`'s clock `jump` milliseconds ahead of every
+    /// node's, or behind.
+    pub fn jump_clock(&self, number: usize, jump: i64) {
+        self.slot(number).jump.store(jump, Ordering::SeqCst);
+        self.write_faults(number);
+    }
+
+    /// Move every node's clock on by `by` milliseconds, one node after
+    /// another; then clients take the agents' time to have moved too.
+    pub fn jump_every_clock(&self, by: i64) {
+        self.moving.store(true, Ordering::SeqCst);
+        self.clocks.fetch_add(by, Ordering::SeqCst);
+        for number in 1..=self.count {
+            self.write_faults(number);
+        }
+        self.offset.fetch_add(by, Ordering::SeqCst);
+        self.moving.store(false, Ordering::SeqCst);
+    }
+
+    /// Write node `number`'s faults file whole, headed by a new
+    /// generation, and wait for the node to take it if it runs and is not
+    /// paused.
+    fn write_faults(&self, number: usize) {
+        let slot = self.slot(number);
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let clock = self.clocks.load(Ordering::SeqCst) + slot.jump.load(Ordering::SeqCst);
+        let text = format!(
+            "generation {generation}\n{}clock {clock}\n{}",
+            self.options.settings,
+            slot.faults.lock().unwrap()
+        );
         let file = self.faults_file(number);
         let staged = file.with_extension("staged");
-        std::fs::write(&staged, format!("generation {generation}\n{lines}")).unwrap();
+        std::fs::write(&staged, text).unwrap();
         std::fs::rename(&staged, &file).unwrap();
-        self.written[number - 1].store(generation, Ordering::SeqCst);
-        if self.is_running(number) && !self.paused[number - 1].load(Ordering::SeqCst) {
+        slot.written.store(generation, Ordering::SeqCst);
+        if self.is_running(number) && !slot.paused.load(Ordering::SeqCst) {
             self.taken(number, generation);
         }
     }
 
-    /// Node `number`'s replica of `agent`, if it runs and holds one.
+    /// Wait until node `number` says the faults of `generation`, or later
+    /// ones, are in force.
+    fn taken(&self, number: usize, generation: u64) {
+        let taken = self.faults_file(number).with_extension("taken");
+        wait_until("the node takes its faults", || {
+            let mut running = self.slot(number).running.lock().unwrap();
+            if let Some(status) = running.as_mut().and_then(Running::exited) {
+                panic!(
+                    "node {number} exited by itself: {status}\n{}",
+                    read_log(&self.log_path(number))
+                );
+            }
+            drop(running);
+            std::fs::read_to_string(&taken)
+                .ok()
+                .and_then(|text| text.trim().parse::<u64>().ok())
+                .is_some_and(|taken| taken >= generation)
+        });
+    }
+
+    /// Node `number`'s replica of `agent`, if it runs, is not paused, and
+    /// holds one.
     pub fn status(&self, number: usize, agent: AgentId) -> Option<ReplicaStatus> {
-        if !self.is_running(number) {
+        if !self.is_running(number) || self.slot(number).paused.load(Ordering::SeqCst) {
             return None;
         }
         match self.operator(number).status(agent) {
@@ -399,64 +564,250 @@ impl Processes {
     pub fn leader(&self, agent: AgentId) -> usize {
         let mut leader = None;
         wait_until("a leader is known", || {
-            leader = (1..=self.count)
-                .filter_map(|number| {
-                    self.status(number, agent)
-                        .filter(|status| status.leads)
-                        .map(|status| (status.term, number))
-                })
-                .max()
-                .map(|(_, number)| number);
+            leader = self.leading(agent);
             leader.is_some()
         });
         leader.unwrap()
     }
 
-    /// Lines of the nodes' logs that tell of a panic or a halt.
-    pub fn troubles(&self) -> Vec<String> {
+    /// The running node leading `agent` at the highest term, if one does.
+    pub fn leading(&self, agent: AgentId) -> Option<usize> {
         (1..=self.count)
+            .filter_map(|number| {
+                self.status(number, agent)
+                    .filter(|status| status.leads)
+                    .map(|status| (status.term, number))
+            })
+            .max()
+            .map(|(_, number)| number)
+    }
+
+    /// Lines of the nodes' logs that tell of a panic or a halt, and the
+    /// nodes that exited by themselves.
+    pub fn troubles(&self) -> Vec<String> {
+        let mut troubles: Vec<String> = (1..=self.count)
             .flat_map(|number| {
-                read_log(&self.log(number))
-                    .lines()
-                    .filter(|line| line.contains("panicked") || line.contains("needs a restart"))
-                    .map(|line| format!("node {number}: {line}"))
-                    .collect::<Vec<_>>()
+                self.trouble_lines(number)
+                    .into_iter()
+                    .map(move |(_, line)| format!("node {number}: {line}"))
+            })
+            .collect();
+        troubles.extend(self.exits.lock().unwrap().iter().cloned());
+        troubles
+    }
+
+    /// Lines of node `number`'s log that tell of a panic or a halt, each
+    /// with where it starts in the log.
+    pub fn trouble_lines(&self, number: usize) -> Vec<(u64, String)> {
+        let log = std::fs::read(self.log_path(number)).unwrap_or_default();
+        let mut at = 0u64;
+        let mut lines = Vec::new();
+        for line in log.split_inclusive(|byte| *byte == b'\n') {
+            let text = String::from_utf8_lossy(line);
+            if text.contains("panicked") || text.contains("needs a restart") {
+                lines.push((at, text.trim_end().to_string()));
+            }
+            at += line.len() as u64;
+        }
+        lines
+    }
+
+    /// How long node `number`'s log is.
+    pub fn log_len(&self, number: usize) -> u64 {
+        std::fs::metadata(self.log_path(number)).map_or(0, |log| log.len())
+    }
+
+    /// The nodes that exited before the harness killed them.
+    pub fn exits(&self) -> Vec<String> {
+        self.exits.lock().unwrap().clone()
+    }
+
+    /// An operator's command, at whichever running node takes it: its
+    /// answer, once one is `accepted`.
+    pub fn operate(
+        &self,
+        command: impl Fn(&Operator) -> Answer,
+        accepted: impl Fn(&Answer) -> bool,
+    ) -> Answer {
+        let mut answer = None;
+        wait_until("an operator's command is taken", || {
+            answer = (1..=self.count)
+                .filter(|number| self.is_running(*number))
+                .map(|number| command(&self.operator(number)))
+                .find(&accepted);
+            answer.is_some()
+        });
+        answer.unwrap()
+    }
+
+    /// An agent created on `replicas`, with `program` installed as each
+    /// of `instances`, in order.
+    pub fn agent_with(
+        &self,
+        replicas: Vec<NodeNumber>,
+        program: &[u8],
+        instances: &[InstanceId],
+    ) -> AgentId {
+        let Answer::Created(agent) = self.operate(
+            |operator| {
+                operator
+                    .create_agent(replicas.clone())
+                    .unwrap_or(Answer::Unavailable)
+            },
+            |answer| matches!(answer, Answer::Created(_)),
+        ) else {
+            unreachable!()
+        };
+        for instance in instances {
+            let install = Install {
+                instance: *instance,
+                program: program.to_vec(),
+                attestables: Vec::new(),
+                roles: Vec::new(),
+            };
+            self.operate(
+                |operator| {
+                    operator
+                        .install(agent, &install)
+                        .unwrap_or(Answer::Unavailable)
+                },
+                |answer| matches!(answer, Answer::Ran { .. }),
+            );
+        }
+        agent
+    }
+
+    /// Agent `agent`'s identity, the hash of its creation record.
+    pub fn identity(&self, agent: AgentId) -> [u8; 32] {
+        let mut identity = None;
+        wait_until("the agent's record is served", || {
+            identity = (1..=self.count)
+                .filter(|number| self.is_running(*number))
+                .find_map(|number| {
+                    vos_node::client::agent_info(self.target(number), agent)
+                        .ok()
+                        .flatten()
+                })
+                .map(|info| vos_node::identity(&info.record));
+            identity.is_some()
+        });
+        identity.unwrap()
+    }
+
+    /// Stop every node at once (SIGSTOP), so none goes on while another
+    /// is killed, then kill them (SIGKILL) and open each one's store.
+    pub fn stop_all(&self) -> Vec<vos_node::store::Fjall> {
+        for number in 1..=self.count {
+            let running = self.slot(number).running.lock().unwrap();
+            if let Some(pid) = running.as_ref().map(Running::pid) {
+                let _ = Command::new("kill")
+                    .args(["-STOP", &pid.to_string()])
+                    .status();
+            }
+        }
+        for number in 1..=self.count {
+            self.end(number);
+        }
+        (1..=self.count)
+            .map(|number| {
+                vos_node::store::Fjall::open(self.data(number).join(vos_node::STORE))
+                    .unwrap_or_else(|error| panic!("node {number}'s store: {error}"))
             })
             .collect()
     }
 }
 
+impl Nodes for Processes {
+    fn count(&self) -> NodeNumber {
+        self.count as NodeNumber
+    }
+
+    fn target(&self, number: NodeNumber) -> &Target {
+        Processes::target(self, usize::from(number))
+    }
+
+    fn number_at(&self, address: &str) -> Option<NodeNumber> {
+        (1..=self.count)
+            .find(|number| self.url(*number) == address)
+            .map(|number| number as NodeNumber)
+    }
+
+    fn offset(&self) -> i64 {
+        self.offset.load(Ordering::SeqCst)
+    }
+
+    fn starts(&self, number: NodeNumber) -> u64 {
+        self.slot(usize::from(number)).starts.load(Ordering::SeqCst)
+    }
+
+    /// Unknown cheaply: a status read per answer would cost as much as the
+    /// call.
+    fn leader(&self, _: AgentId) -> Option<NodeNumber> {
+        None
+    }
+
+    fn paused(&self) -> bool {
+        self.clients_paused.load(Ordering::SeqCst)
+    }
+
+    fn clocks_moving(&self) -> bool {
+        self.moving.load(Ordering::SeqCst)
+    }
+
+    fn log(&self) -> &Log {
+        &self.log
+    }
+
+    fn report(&self, agent: AgentId) -> String {
+        let statuses: Vec<String> = (1..=self.count)
+            .map(|number| match self.status(number, agent) {
+                Some(status) => format!("node {number}: {status:?}"),
+                None => format!("node {number}: no status"),
+            })
+            .collect();
+        format!(
+            "agent {}\n{}\n{}\n{}",
+            agent.0,
+            statuses.join("\n"),
+            self.log.events(),
+            self.troubles().join("\n")
+        )
+    }
+}
+
+/// The counter's methods, by its schema at `agent`'s `instance`.
+pub fn methods(processes: &Processes, agent: AgentId, instance: InstanceId) -> Methods {
+    let mut schema = None;
+    wait_until("the schema is served", || {
+        schema = (1..=processes.count)
+            .filter(|number| processes.is_running(*number))
+            .find_map(|number| {
+                vos_node::client::schema(processes.target(number), agent, instance)
+                    .ok()
+                    .flatten()
+            });
+        schema.is_some()
+    });
+    let schema = schema.unwrap();
+    let method = |name: &str| {
+        schema
+            .methods
+            .iter()
+            .find(|method| method.name == name.as_bytes())
+            .unwrap_or_else(|| panic!("no method {name}"))
+            .id
+    };
+    Methods {
+        increment: method("increment"),
+        value: method("value"),
+        forward: method("forward"),
+    }
+}
+
 /// An agent created on nodes 1 to 3, with the test counter installed as
 /// `instance`, through whichever node takes the operator's commands.
-pub fn counter_agent(processes: &Processes, instance: vos_wire::ids::InstanceId) -> AgentId {
-    let counter = std::fs::read(guest(
-        "test-actors/target/riscv64em-vos/release/counter.elf",
-    ))
-    .unwrap();
-    let counter = vos_pvm_compiler::link_elf_spi(&counter).expect("links");
-    let operate = |command: &dyn Fn(&Operator) -> Answer| -> Answer {
-        let mut answer = None;
-        wait_until("an operator's command is taken", || {
-            answer = (1..=processes.count)
-                .filter(|number| processes.is_running(*number))
-                .map(|number| command(&processes.operator(number)))
-                .find(|answer| matches!(answer, Answer::Ran { .. } | Answer::Created(_)));
-            answer.is_some()
-        });
-        answer.unwrap()
-    };
-    let Answer::Created(agent) = operate(&|operator| operator.create_agent(vec![1, 2, 3]).unwrap())
-    else {
-        unreachable!()
-    };
-    let install = vos_wire::ingress::Install {
-        instance,
-        program: counter,
-        attestables: Vec::new(),
-        roles: Vec::new(),
-    };
-    operate(&|operator| operator.install(agent, &install).unwrap());
-    agent
+pub fn counter_agent(processes: &Processes, instance: InstanceId) -> AgentId {
+    processes.agent_with(vec![1, 2, 3], &counter_program(), &[instance])
 }
 
 /// The value a call answered with, if it ran to completion.
@@ -475,7 +826,7 @@ pub fn done(answer: &Answer) -> Option<u64> {
 pub fn method(
     client: &mut vos_node::client::Client,
     agent: AgentId,
-    instance: vos_wire::ids::InstanceId,
+    instance: InstanceId,
     name: &str,
 ) -> vos_wire::ids::MethodId {
     let mut schema = None;
@@ -498,7 +849,7 @@ pub fn method(
 pub fn increment(
     client: &mut vos_node::client::Client,
     agent: AgentId,
-    instance: vos_wire::ids::InstanceId,
+    instance: InstanceId,
     method: vos_wire::ids::MethodId,
     by: u64,
 ) -> u64 {

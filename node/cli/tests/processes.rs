@@ -15,7 +15,7 @@ const COUNTER: InstanceId = InstanceId(1);
 fn a_leader_cut_off_by_the_relay_is_replaced_and_catches_up() {
     let space = Processes::start(3, Options::default());
     let agent = counter_agent(&space, COUNTER);
-    let mut client = Client::new(&space.target(1), SigningKey::from_bytes(&[31; 32]));
+    let mut client = Client::new(space.target(1), SigningKey::from_bytes(&[31; 32]));
     let add = method(&mut client, agent, COUNTER, "increment");
     let mut total = 0;
     for by in 1..=5 {

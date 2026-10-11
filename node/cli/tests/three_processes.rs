@@ -61,7 +61,7 @@ fn done(answer: &Answer) -> Option<u64> {
 
 #[test]
 fn three_processes_apply_every_call_once_through_a_kill() {
-    let mut space = Processes::start(3, Options::default());
+    let space = Processes::start(3, Options::default());
     let counter = std::fs::read(guest(
         "test-actors/target/riscv64em-vos/release/counter.elf",
     ))
@@ -85,7 +85,7 @@ fn three_processes_apply_every_call_once_through_a_kill() {
         agent
     };
     let (sender, receiver) = (create(&space), create(&space));
-    let mut client = Client::new(&space.target(1), SigningKey::from_bytes(&[21; 32]));
+    let mut client = Client::new(space.target(1), SigningKey::from_bytes(&[21; 32]));
     let schema = client.schema(sender, COUNTER).unwrap().unwrap();
     let (increment, forward, value) = (
         method(&schema, "increment"),
@@ -172,7 +172,7 @@ fn three_processes_apply_every_call_once_through_a_kill() {
             };
             let path = format!("/agents/{}/queries", agent.0);
             let (_, body) =
-                vos_node::client::post(&space.target(number), &path, &query.encode()).ok()?;
+                vos_node::client::post(space.target(number), &path, &query.encode()).ok()?;
             let (answer, _) = <Answer as vos_wire::Decode>::decode(&body).ok()?;
             done(&answer)
         };

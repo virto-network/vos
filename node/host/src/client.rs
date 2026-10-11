@@ -179,13 +179,22 @@ const IDLE_CONNECTIONS: usize = 4;
 struct Http {
     target: Target,
     idle: Mutex<Vec<Connection>>,
+    /// How long a request's answer may take.
+    answer: Duration,
 }
 
 impl Http {
     fn new(target: &Target) -> Self {
+        Self::within(target, ANSWER)
+    }
+
+    /// One whose requests are answered within `answer`, connecting within
+    /// it too.
+    fn within(target: &Target, answer: Duration) -> Self {
         Self {
             target: target.clone(),
             idle: Mutex::new(Vec::new()),
+            answer,
         }
     }
 
@@ -218,8 +227,9 @@ impl Http {
         };
         let mut last = None;
         let mut tcp = None;
+        let connect = CONNECT.min(self.answer);
         for address in addresses {
-            match TcpStream::connect_timeout(&address, CONNECT) {
+            match TcpStream::connect_timeout(&address, connect) {
                 Ok(stream) => {
                     tcp = Some(stream);
                     break;
@@ -231,8 +241,8 @@ impl Http {
             last.unwrap_or_else(|| std::io::Error::other("the host has no address"))
         })?;
         tcp.set_nodelay(true)?;
-        tcp.set_read_timeout(Some(CONNECT))?;
-        tcp.set_write_timeout(Some(CONNECT))?;
+        tcp.set_read_timeout(Some(connect))?;
+        tcp.set_write_timeout(Some(connect))?;
         let stream: Box<dyn Stream> = match &self.target.tls {
             Some((config, name)) => {
                 let tls = rustls::ClientConnection::new(Arc::clone(config), name.clone())
@@ -243,13 +253,13 @@ impl Http {
                 while stream.conn.is_handshaking() {
                     stream.conn.complete_io(&mut stream.sock)?;
                 }
-                stream.sock.set_read_timeout(Some(ANSWER))?;
-                stream.sock.set_write_timeout(Some(ANSWER))?;
+                stream.sock.set_read_timeout(Some(self.answer))?;
+                stream.sock.set_write_timeout(Some(self.answer))?;
                 Box::new(stream)
             }
             None => {
-                tcp.set_read_timeout(Some(ANSWER))?;
-                tcp.set_write_timeout(Some(ANSWER))?;
+                tcp.set_read_timeout(Some(self.answer))?;
+                tcp.set_write_timeout(Some(self.answer))?;
                 Box::new(tcp)
             }
         };
@@ -397,6 +407,21 @@ fn answer(status: u16, body: &[u8]) -> Result<Answer, ClientError> {
 /// client does not otherwise make, as a test of the ingress does.
 pub fn post(target: &Target, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>), ClientError> {
     Http::new(target).post(path, None, body, false)
+}
+
+/// POST `body` to `path` on a connection of its own: the answer. Each
+/// read and write, the connection's included, must be done within
+/// `within`, a positive deadline. For a caller that keeps its own
+/// deadlines and tries another node when one is slow, as a checker
+/// does.
+pub fn post_within(
+    target: &Target,
+    path: &str,
+    body: &[u8],
+    within: Duration,
+) -> Result<Answer, ClientError> {
+    let (status, body) = Http::within(target, within).post(path, None, body, false)?;
+    answer(status, &body)
 }
 
 /// The node's identity, its key, which its TLS presents. A pinned node
@@ -1091,6 +1116,16 @@ impl Operator {
         Self {
             token: token.trim().to_string(),
             http: Http::new(target),
+        }
+    }
+
+    /// One whose commands' answers are read within `answer`, each read
+    /// and write of them: for a caller that tries another node when one
+    /// is slow.
+    pub fn within(target: &Target, token: &str, answer: Duration) -> Self {
+        Self {
+            token: token.trim().to_string(),
+            http: Http::within(target, answer),
         }
     }
 

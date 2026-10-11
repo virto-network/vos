@@ -8,6 +8,7 @@ members = [
     "node/host",
     "node/net",
     "node/cli",
+    "node/checker",
     "support/vos-raft",
     "support/merkle-crdt",
     "pvm/runtime",
@@ -58,6 +59,12 @@ debug-assertions = false
 [profile.dev.package.vos-pvm]
 opt-level = 3
 [profile.test.package.vos-pvm]
+opt-level = 3
+# Linking an agent's program takes seconds unoptimized: a node process
+# a test restarts starts in time only with it optimized.
+[profile.dev.package.vos-pvm-compiler]
+opt-level = 3
+[profile.test.package.vos-pvm-compiler]
 opt-level = 3
 
 [profile.dev.package.stwo]

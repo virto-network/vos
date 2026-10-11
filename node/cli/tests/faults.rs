@@ -26,7 +26,7 @@ fn a_leader_whose_disk_stalls_hands_its_group_over() {
     let space = Processes::start(3, Options::default());
     let agent = counter_agent(&space, COUNTER);
     let stalled = space.leader(agent);
-    let mut client = Client::new(&space.target(stalled), SigningKey::from_bytes(&[32; 32]));
+    let mut client = Client::new(space.target(stalled), SigningKey::from_bytes(&[32; 32]));
     let add = method(&mut client, agent, COUNTER, "increment");
     assert_eq!(increment(&mut client, agent, COUNTER, add, 1), 1);
     space.set_faults(stalled, "hold_commits\n");
@@ -54,11 +54,11 @@ fn a_leader_whose_disk_stalls_hands_its_group_over() {
 /// restarted it catches up.
 #[test]
 fn a_leader_whose_disk_fails_halts_and_a_restart_recovers() {
-    let mut space = Processes::start(3, Options::default());
+    let space = Processes::start(3, Options::default());
     let agent = counter_agent(&space, COUNTER);
     let failing = space.leader(agent);
     let other = (1..=3).find(|number| *number != failing).unwrap();
-    let mut client = Client::new(&space.target(other), SigningKey::from_bytes(&[34; 32]));
+    let mut client = Client::new(space.target(other), SigningKey::from_bytes(&[34; 32]));
     let add = method(&mut client, agent, COUNTER, "increment");
     assert_eq!(increment(&mut client, agent, COUNTER, add, 1), 1);
     space.set_faults(failing, "fail_commits after\n");
@@ -93,7 +93,7 @@ fn a_leader_whose_disk_fails_halts_and_a_restart_recovers() {
 fn a_gray_failure_deposes_its_leader() {
     let space = Processes::start(3, Options::default());
     let agent = counter_agent(&space, COUNTER);
-    let mut client = Client::new(&space.target(1), SigningKey::from_bytes(&[33; 32]));
+    let mut client = Client::new(space.target(1), SigningKey::from_bytes(&[33; 32]));
     let add = method(&mut client, agent, COUNTER, "increment");
     assert_eq!(increment(&mut client, agent, COUNTER, add, 1), 1);
     let gray = space.leader(agent);

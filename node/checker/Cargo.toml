@@ -1,0 +1,15 @@
+[package]
+name = "vos-checker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The exactly-once checker's model, shared by the node suites that run it in one process and across processes."
+publish = false
+
+# vos-node's integration tests depend on this crate, which depends on
+# vos-node: cargo allows it, as integration tests link the same library.
+# vos-node's own unit tests must never use it, being a second instance.
+[dependencies]
+ed25519-dalek = "2"
+vos-node = { path = "../host" }
+vos-wire = { workspace = true }
