@@ -4885,3 +4885,244 @@ blocking, a safety bug. It and the rest are folded in this commit:
 **3.8 is done.** What it leaves for 3.9 and 3.10 is in the lists
 above and in 3.7's.
 
+
+
+## Step 3.9: faults across processes
+
+### Design
+
+The checker (`tests/exactly_once.rs`) runs its faults on nodes in one
+process: cheap, seeded, and blind to everything below the node API.
+3.9 runs faults on real `vos node run` processes over QUIC:
+- kills and restarts, and pauses (SIGSTOP);
+- partitions, lossy links and gray failures between processes;
+- slow, stalled and failing disks;
+- clock jumps;
+- replicas replaced.
+
+Through all of them every client is answered exactly once, and the
+replicas agree. 3.5d2's three-process test grows into it. Split in
+three:
+- **3.9a:** the harness, the relay, and faults in the binary;
+- **3.9b:** the fault suite, in the clear and over TLS, on the checker's
+  model;
+- **3.9c:** `Forward` carrying the term, and a snapshot stream outlasting
+  the core's deadline.
+
+#### 3.9a The harness, the relay, and faults in the binary
+
+**Binding apart from the address listed.** `vos node run --peer-bind
+<addr>` binds the QUIC endpoint there; the space still lists the
+address peers dial. This is useful on its own, for a node behind
+port forwarding or in a container. Here it puts a relay in between.
+
+**The relay** (in the test process, on a thread of its own).
+- **The forwarding:** for each node, a UDP socket at the address the
+  space lists forwards datagrams to the node's bound address, and the
+  node's replies back to their sender.
+  - One socket per sender stands for it toward the node, as a NAT does.
+    It is kept for the whole run, so the node never sees a sender's
+    address move.
+  - A sender is known by its source address: each node sends from the
+    one socket it binds.
+- **Two kinds of fault, as vos-net runs one connection per direction of
+  dialing:**
+  - a *connection* cut: all datagrams of the connection node A dialed
+    to node B, both ways, are lost. B's messages to A go on, over B's
+    own connection. That is one-way message loss.
+  - a *link* fault: the datagrams from A to B, of both connections, are
+    lost in part, delayed, or all lost. This cuts the acknowledgements
+    of the other direction's connection too, so a full link cut is a
+    partition both ways.
+- **Practicalities:**
+  - receive buffers of 64 KiB, as QUIC may probe large datagrams on
+    loopback;
+  - a large `SO_RCVBUF`;
+  - errors from a killed node's port ignored;
+  - the relay's own drops counted, so a run can tell them from the
+    faults it injects.
+
+**QUIC's idle timeout** (30 s) is lowered for the suite by a startup
+setting, so cuts of a few seconds outlast it. Some cuts outlast it
+anyway: idle timeouts, redials and frames held across them are the
+point of the real network.
+
+**vos-net holds no liveness frame across a redial:** one held through a
+cut would arrive after the heal and vouch, as fresh, for what its
+sender led before.
+
+**Faults in the binary,** behind a cargo feature (`faults`, on
+vos-node and vos-cli). Production builds carry none of it.
+- With the feature, `VOS_FAULTS=<file>` names a control file. A thread
+  of its own reads it every 50 ms, never the writer's. Each line is a
+  fault:
+  - `delay_commits <ms>`: each writer flush waits that long first;
+  - `hold_commits`: no flush until the line goes;
+  - `fail_commits before` and `fail_commits after`: flushes fail, as
+    on a full or failing disk, which halts the node.
+    - `before`: before the batch is written.
+    - `after`: once it is written but before its sync: the data may
+      survive the kill in the page cache, which Raft must tolerate (a
+      write reported failed that persisted is harmless).
+  - `clock <ms>`: the node's clock runs that far ahead, or behind;
+  - `drop <class> <per million> [to <node>]`: frames of one class lost
+    above QUIC. That is a gray failure (consensus lost while the pair
+    heartbeat flows) or the reverse.
+  - `quic_idle <ms>`: QUIC's idle timeout, read at start.
+- **The clock fault covers the node's clock** (`Config::clock`): batch
+  times, sessions, queries' staleness.
+  - Blob ages move to the monotonic clock within a run. A wall-clock
+    jump forward must not age a blob stored ahead of its entry past
+    collection's horizon.
+  - The incarnation stays on the wall clock, kept monotonic by the
+    store.
+  - rustls and quinn read their own clocks; their certificates do not
+    expire within a run.
+- **A build with the feature says so:** a warning at startup, and in
+  `vos --version`. CI builds the release binary and checks that its
+  `--version` does not.
+- `just test-agent` runs the fault suite with the feature.
+- **A node's faults file is emptied when the harness kills the node,**
+  unless the scenario keeps a fault through the restart on purpose: a
+  `hold_commits` left in place is a stalled disk at boot.
+- A power loss, unsynced writes lost, is not a fault here: SIGKILL keeps
+  the page cache. 3.3's crash tests cover it.
+
+**An operator status route** (`GET /agents/{id}/status`, with the
+operator's token) reports a replica's term, role, commit, applied index,
+log start and last index. The end checks read every running replica
+with it: a running node's store is locked to others.
+
+**The harness** (`node/cli/tests/support/`), shared by the process
+tests:
+- starting a node with its own data directory, ports and log, and
+  restarting it;
+- SIGKILL, SIGSTOP and SIGCONT;
+- the relay's faults, and a node's faults file;
+- clients pinned to the space's nodes, over HTTP or TLS;
+- at the end, stopping every node and opening each store.
+
+#### 3.9b The fault suite
+
+`node/cli/tests/faults.rs`, on the checker's model.
+
+**A dev-only crate, `node/checker`** (`publish = false`), holds the
+model both suites share:
+- **The core:** the history and its checks, pure (events in, violations
+  out): running totals, linearizable and floored reads, messages,
+  captured replay.
+- **A client driver** over `vos_node::client` (HTTP or TLS), its targets
+  chosen by the suite.
+- **Fault controls behind a trait:** the node clock, its jumps past the
+  skew, and session collection, which each suite drives its own way
+  (in process through `Config::clock`; across processes through the
+  faults file).
+- **Store inspection stays in the in-process suite**: the check that a
+  node holds a request applied before it answers it.
+- **A caution:** the crate depends on vos-node for the client, and
+  vos-node's integration tests depend on it. Cargo allows the cycle, and
+  integration tests link the same library, so types unify. vos-node's
+  own unit tests (`#[cfg(test)]` in `src/`) must never use it: that
+  build is a second instance of vos-node.
+
+**The suite:**
+- **The space:** five node processes.
+  - Six agents are each on three of them, the other nodes spares for
+    replacements.
+  - A few hundred idle agents besides, so restarts and elections come
+    with placement bursts and directory catch-up.
+  - The suite's settings: compaction every few dozen entries, so
+    restarts catch up by snapshot, and elections of 300–600 ms, so a
+    seed sees many.
+- **The clients,** as the checker's:
+  - two per agent, in sessions renewed every few dozen requests, each
+    request resent until answered;
+  - every answer the client's running total;
+  - linearizable reads, and reads at a floor;
+  - messages between agents;
+  - requests captured and replayed after their session is collected;
+  - `Lost` answered by reading the total. A replacement's `TimedOut` or
+    `InProgress`, and a skewed node's refusals, are expected answers,
+    not failures.
+- **The faults,** from a seed:
+  - SIGKILL of a node, often a leader, and its restart a little later;
+  - SIGSTOP for 1–5 s, then SIGCONT;
+  - a connection cut, a link cut, or a node cut off from the rest, for
+    2–10 s, and now and then past QUIC's idle timeout;
+  - a link losing 30–90% of its datagrams, or delaying them by
+    20–200 ms;
+  - a gray failure: one class of frames lost on a link, the others
+    flowing;
+  - a slow disk (commits delayed 20–200 ms), a stalled one (commits
+    held 2–5 s, past the writer's stall bound), or a failing one
+    (commits fail, the node halts, and is restarted);
+  - a node's clock jumping 15 s either way; once a run, every node's
+    clock past the session skew;
+  - **replacements, some aimed at the vote floor:** the shape that
+    produces a stale replica and an empty one that could vote for it.
+    1. Group {1,2,3}, spares 4 and 5; node 1 is killed.
+    2. 1 is replaced by 4: node 1 is now stale.
+    3. 2 is replaced by 5: node 2 retires, keeping its floor.
+    4. 5 is replaced by 2: node 2 is added again, empty, with its
+       floor.
+    5. Node 1 restarts, close to node 2's new start, with no election
+       in between.
+
+    With the floor, node 1 is refused; without it, node 2 could grant
+    it. A down node cannot be added (the node added must say it can
+    run the program), which is why this takes two spares. Besides it:
+    the current leader replaced, and random replacements.
+  - **at most one node down or cut off at a time,** so a majority of
+    every group stays, except a **quorum-loss window** once a run: two
+    of a group's replicas down or cut together. Safety only, then heal
+    and require progress.
+- **Answers' deadlines are suspended** in the windows where waiting is
+  expected:
+  - delays, whose round trips can exceed the low election timeout and
+    bring elections one after another;
+  - the quorum-loss window;
+  - gray failures, whose leader steps down only after its patience
+    (about 3 s at the suite's timeouts).
+
+  Safety is checked throughout.
+- **At the end:**
+  - everything heals, and every client's last request is answered;
+  - every replica applies through the leader's commit, read through the
+    status route;
+  - the nodes stop, and each store is opened:
+    - every agent's replicas hold the same entries above the highest
+      log start, through the lowest commit;
+    - the same rows where their applied indexes are equal;
+  - no node's log holds a panic, or a halt without a failing disk
+    injected.
+- **TLS:** each seed runs in the clear or over TLS, clients pinning the
+  nodes' keys, by its parity.
+- **Runs:** the seed is printed, and `FAULTS_SEED` runs one again. `just
+  ci` runs one seed, a couple of minutes. A loop runs many before a
+  step's commit, as the checker's does.
+
+#### 3.9c The carried items
+
+- **`Forward` carries the forwarder's view of the leader's term.**
+  - A node not leading at that term, whether it leads at another term
+    or leads nothing, answers `NotLeader`, with its hint and its own
+    term, as a node that leads nothing does today. A silent drop would
+    cost every call through a forwarder its 2 s re-forward after each
+    election.
+  - The forwarder re-forwards at once only when the answer's term is
+    higher than its own view, carrying that term. A lower term comes
+    from a stale leader: the forwarder waits for its own core to name
+    one. Otherwise the two would ping-pong.
+  - vos-net holds frames across a redial, with no expiry. A held
+    `Forward` could reach a later leader: the session's lane makes that
+    safe, and the term bounds every copy's life by its forwarder's.
+  - A test: a `Forward` at an old term is answered `NotLeader`, and the
+    call is answered once.
+- **A snapshot stream outlasting the core's own deadline**
+  (`snapshot_timeout_ms`): the stream and the core must agree on giving
+  up. The core starts a new stream only once the host's has ended, and
+  the follower stages only the newest.
+  - A cluster test with the deadline lowered, and the stream slowed by
+    a hook.
+- **Not in 3.9:** fast retransmit on a dropped gap (the suite shows
+  whether it is needed); learners stay unscheduled.
