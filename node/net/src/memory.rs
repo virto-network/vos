@@ -27,6 +27,10 @@ struct State {
     cut: HashSet<(NodeNumber, NodeNumber)>,
     /// Frames lost out of every million sent.
     loss: u32,
+    /// Directed links that lose frames of their own, out of a million.
+    link_loss: HashMap<(NodeNumber, NodeNumber), u32>,
+    /// Frames sent through the hub, by class, lost or not.
+    sent: HashMap<Class, u64>,
     random: u64,
     delay: Duration,
     limits: Limits,
@@ -65,6 +69,8 @@ impl Hub {
                 generation: 0,
                 cut: HashSet::new(),
                 loss: 0,
+                link_loss: HashMap::new(),
+                sent: HashMap::new(),
                 random: seed | 1,
                 delay: Duration::ZERO,
                 limits: Limits::default(),
@@ -125,9 +131,25 @@ impl Hub {
         }
     }
 
-    /// Restore every link.
+    /// Restore every link: no cuts, and no link's own losses.
     pub fn heal(&self) {
-        self.state().cut.clear();
+        let mut state = self.state();
+        state.cut.clear();
+        state.link_loss.clear();
+    }
+
+    /// Lose `per_million` of every million frames between `a` and `b`,
+    /// both ways, at random.
+    pub fn set_link_loss(&self, a: NodeNumber, b: NodeNumber, per_million: u32) {
+        let mut state = self.state();
+        let per_million = per_million.min(1_000_000);
+        state.link_loss.insert((a, b), per_million);
+        state.link_loss.insert((b, a), per_million);
+    }
+
+    /// The frames of `class` sent through the hub so far, lost or not.
+    pub fn sent(&self, class: Class) -> u64 {
+        self.state().sent.get(&class).copied().unwrap_or(0)
     }
 
     /// Lose `per_million` of every million frames, at random.
@@ -248,15 +270,22 @@ impl Network for Endpoint {
             stream,
             frame,
         };
+        *state.sent.entry(class).or_insert(0) += 1;
         // A peer that is down, or cut off, loses what is sent to it.
         if !state.endpoints.contains_key(&to) || state.cut.contains(&(self.number, to)) {
             return Ok(());
         }
-        if state.loss > 0 {
+        let loss = state
+            .link_loss
+            .get(&(self.number, to))
+            .copied()
+            .unwrap_or(0)
+            .max(state.loss);
+        if loss > 0 {
             state.random ^= state.random << 13;
             state.random ^= state.random >> 7;
             state.random ^= state.random << 17;
-            if (state.random % 1_000_000) < u64::from(state.loss) {
+            if (state.random % 1_000_000) < u64::from(loss) {
                 return Ok(());
             }
         }

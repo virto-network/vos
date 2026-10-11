@@ -3,8 +3,10 @@
 
 #![cfg(feature = "std")]
 
-use vos_raft::core::{Action, Answer, Core, ProposeError, Recovered, Write};
-use vos_raft::{ActiveConfigRecord, AppendResult, Config, LogEntry, Message, Meta, Role};
+use vos_raft::core::{Action, Answer, Core, ProposeError, Recovered, SnapshotConfiguration, Write};
+use vos_raft::{
+    ActiveConfigRecord, AppendResult, Config, EntryKind, LogEntry, Message, Meta, Role,
+};
 
 const LEADER_A: u16 = 2;
 const LEADER_B: u16 = 3;
@@ -157,9 +159,15 @@ fn a_late_report_of_a_replaced_write_vouches_for_nothing() {
 
 /// A two-member group led by `ME`, at term 1, holding its no-op durably.
 fn leader_of_two() -> Core<u16> {
+    leader_of_two_with(|_| {})
+}
+
+/// As [`leader_of_two`], with its configuration adjusted by `adjust`.
+fn leader_of_two_with(adjust: impl FnOnce(&mut Config<u16>)) -> Core<u16> {
     let mut cfg = config();
     cfg.members = vec![ME, LEADER_A];
     cfg.pre_vote = false;
+    adjust(&mut cfg);
     let mut core = Core::new(cfg, Recovered::default(), 0, 5);
     core.take_actions();
     core.tick(1_000);
@@ -1184,4 +1192,403 @@ fn a_lone_member_leads_at_its_first_tick() {
     persist(&mut core, &vote);
     let actions = core.take_actions();
     assert_eq!(core.role(), Role::Leader, "{actions:?}");
+}
+
+fn appends(actions: &[Action<u16>]) -> Vec<(u16, u64)> {
+    actions
+        .iter()
+        .filter_map(|action| match action {
+            Action::Send {
+                to,
+                message: Message::Append { commit, .. },
+            } => Some((*to, *commit)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A's answer to an append carrying `commit`.
+fn acked(matched: u64, commit: u64) -> Message<u16> {
+    Message::AppendAnswer {
+        term: 1,
+        round: 0,
+        commit,
+        result: AppendResult::Matched { matched },
+    }
+}
+
+#[test]
+fn an_idle_leader_sends_nothing_once_its_follower_holds_the_commit() {
+    let mut core = leader_of_two_with(|cfg| cfg.idle_heartbeats = false);
+    core.receive(LEADER_A, matched(1));
+    assert_eq!(appends(&core.take_actions()), vec![(LEADER_A, 1)]);
+    core.receive(LEADER_A, acked(1, 1));
+    core.take_actions();
+    // Within check-quorum's window, nothing goes out, and the next
+    // deadline is check-quorum's.
+    core.peer_alive(LEADER_A);
+    for at in (1_050..1_300).step_by(50) {
+        core.tick(at);
+        assert!(appends(&core.take_actions()).is_empty(), "at {at}");
+    }
+    assert_eq!(core.next_deadline(), 1_000 + 300);
+    // A proposal goes out at once, and its commit after it.
+    core.propose(1, vec![1]);
+    let actions = core.take_actions();
+    persist(&mut core, &writes(&actions).last().unwrap().clone());
+    assert_eq!(appends(&actions), vec![(LEADER_A, 1)]);
+    core.receive(LEADER_A, matched(2));
+    assert_eq!(appends(&core.take_actions()), vec![(LEADER_A, 2)]);
+}
+
+#[test]
+fn a_lost_commit_notice_is_sent_again() {
+    let mut core = leader_of_two_with(|cfg| cfg.idle_heartbeats = false);
+    core.receive(LEADER_A, matched(1));
+    // The commit notice is lost: A never acknowledges commit 1, so the
+    // idle leader's heartbeats carry it again.
+    assert_eq!(appends(&core.take_actions()), vec![(LEADER_A, 1)]);
+    core.tick(1_000 + 60);
+    assert_eq!(appends(&core.take_actions()), vec![(LEADER_A, 1)]);
+    core.receive(LEADER_A, acked(1, 1));
+    core.take_actions();
+    core.tick(1_000 + 120);
+    assert!(appends(&core.take_actions()).is_empty());
+}
+
+/// A three-member group led by `ME`, at term 1, with idle heartbeats
+/// off, whose followers acknowledged its no-op and the commit.
+fn idle_leader_of_three() -> Core<u16> {
+    let mut cfg = config();
+    cfg.pre_vote = false;
+    cfg.idle_heartbeats = false;
+    let mut core = Core::new(cfg, Recovered::default(), 0, 5);
+    core.take_actions();
+    core.tick(1_000);
+    let vote = writes(&core.take_actions()).last().unwrap().clone();
+    persist(&mut core, &vote);
+    core.receive(
+        LEADER_A,
+        Message::VoteAnswer {
+            term: 1,
+            granted: true,
+        },
+    );
+    let no_op = writes(&core.take_actions()).last().unwrap().clone();
+    persist(&mut core, &no_op);
+    for peer in [LEADER_A, LEADER_B] {
+        core.receive(peer, acked(1, 0));
+        core.receive(peer, acked(1, 1));
+    }
+    core.take_actions();
+    core
+}
+
+fn appends_to_peer(actions: &[Action<u16>], peer: u16) -> usize {
+    appends(actions)
+        .iter()
+        .filter(|(to, _)| *to == peer)
+        .count()
+}
+
+#[test]
+fn an_idle_leader_leaves_a_silent_member_without_heartbeats() {
+    let mut core = idle_leader_of_three();
+    // A falls behind, and its node has not been heard: no heartbeats to
+    // it, while B, heard, keeps the quorum.
+    core.propose(1, vec![1]);
+    let actions = core.take_actions();
+    persist(&mut core, &writes(&actions).last().unwrap().clone());
+    core.receive(LEADER_B, acked(2, 1));
+    core.receive(LEADER_B, acked(2, 2));
+    core.vouch(
+        1_000 + 40,
+        |_, _| None,
+        |node| (node == LEADER_B).then_some(1_000 + 35),
+    );
+    core.take_actions();
+    for at in [1_000 + 60, 1_000 + 120, 1_000 + 180] {
+        core.tick(at);
+        assert_eq!(
+            appends_to_peer(&core.take_actions(), LEADER_A),
+            0,
+            "at {at}"
+        );
+    }
+    // Heard again, it gets heartbeats as it lacks entries.
+    core.vouch(1_000 + 190, |_, _| None, |_| Some(1_000 + 185));
+    core.take_actions();
+    core.tick(1_000 + 250);
+    assert!(appends_to_peer(&core.take_actions(), LEADER_A) > 0);
+}
+
+#[test]
+fn a_leader_that_hears_no_quorum_goes_on_sending() {
+    let mut core = leader_of_two_with(|cfg| cfg.idle_heartbeats = false);
+    core.take_actions();
+    // Its host hears no one: it may be the one gone deaf, so A, behind,
+    // still gets heartbeats.
+    core.vouch(1_000 + 40, |_, _| None, |_| None);
+    core.take_actions();
+    core.tick(1_000 + 60);
+    assert!(appends_to_peer(&core.take_actions(), LEADER_A) > 0);
+}
+
+#[test]
+fn a_probed_follower_hears_its_idle_leader_at_once() {
+    let mut core = idle_leader_of_three();
+    core.tick(1_000 + 60);
+    assert!(appends(&core.take_actions()).is_empty());
+    core.probe(LEADER_A);
+    assert_eq!(appends(&core.take_actions()), vec![(LEADER_A, 1)]);
+    // Until it answers, it gets a heartbeat each round.
+    core.tick(1_000 + 120);
+    assert_eq!(appends_to_peer(&core.take_actions(), LEADER_A), 1);
+    core.receive(LEADER_A, acked(1, 1));
+    core.take_actions();
+    core.tick(1_000 + 180);
+    assert!(appends(&core.take_actions()).is_empty());
+}
+
+#[test]
+fn a_lost_timeout_now_to_an_idle_target_is_sent_again() {
+    let mut core = idle_leader_of_three();
+    core.transfer_leadership(Some(LEADER_A));
+    assert!(sent(&core.take_actions()).contains(&Message::TimeoutNow { term: 1 }));
+    // Lost: the target is heartbeated, and its answer brings it again.
+    core.tick(1_000 + 60);
+    assert_eq!(appends_to_peer(&core.take_actions(), LEADER_A), 1);
+    core.receive(LEADER_A, acked(1, 1));
+    assert!(sent(&core.take_actions()).contains(&Message::TimeoutNow { term: 1 }));
+}
+
+#[test]
+fn an_idle_leader_still_sends_heartbeats_to_a_lagging_follower() {
+    let mut core = leader_of_two_with(|cfg| cfg.idle_heartbeats = false);
+    // A holds nothing yet: each round still reaches it.
+    core.take_actions();
+    core.tick(1_000 + 50);
+    assert!(appends(&core.take_actions()).contains(&(LEADER_A, 0)));
+    core.tick(1_000 + 100);
+    assert!(!appends(&core.take_actions()).is_empty());
+}
+
+#[test]
+fn a_read_still_takes_a_round_of_heartbeats() {
+    let mut core = leader_of_two_with(|cfg| cfg.idle_heartbeats = false);
+    core.receive(LEADER_A, matched(1));
+    core.take_actions();
+    core.read_index(9, None);
+    assert_eq!(appends(&core.take_actions()), vec![(LEADER_A, 1)]);
+}
+
+#[test]
+fn a_members_pre_vote_draws_a_heartbeat_from_its_leader() {
+    let mut core = leader_of_two_with(|cfg| cfg.idle_heartbeats = false);
+    core.receive(LEADER_A, matched(1));
+    core.take_actions();
+    core.receive(
+        LEADER_A,
+        Message::PreVote {
+            next_term: 2,
+            candidate: LEADER_A,
+            last_index: 1,
+            last_term: 1,
+        },
+    );
+    let actions = core.take_actions();
+    assert!(
+        sent(&actions)
+            .iter()
+            .any(|message| matches!(message, Message::PreVoteAnswer { granted: false, .. }))
+    );
+    assert_eq!(appends(&actions), vec![(LEADER_A, 1)]);
+    assert_eq!(core.role(), Role::Leader);
+}
+
+#[test]
+fn a_vouched_leader_moves_the_deadline_and_holds_stickiness() {
+    let mut core = follower(1, &[1], 1);
+    core.receive(LEADER_A, append(1, LEADER_A, (1, 1), 1, &[]));
+    core.take_actions();
+    // Vouched for at 1,000: no pre-vote before 1,150, and another node's
+    // is refused.
+    core.heard_leader_at(1_000);
+    assert!(core.next_deadline() >= 1_150);
+    core.tick(1_100);
+    assert!(sent(&core.take_actions()).is_empty());
+    core.receive(
+        LEADER_B,
+        Message::PreVote {
+            next_term: 2,
+            candidate: LEADER_B,
+            last_index: 1,
+            last_term: 1,
+        },
+    );
+    assert!(
+        sent(&core.take_actions())
+            .iter()
+            .any(|message| matches!(message, Message::PreVoteAnswer { granted: false, .. }))
+    );
+    // An older vouch changes nothing; with none after, the deadline lapses.
+    core.heard_leader_at(900);
+    core.tick(1_300);
+    assert!(
+        sent(&core.take_actions())
+            .iter()
+            .any(|message| matches!(message, Message::PreVote { .. }))
+    );
+}
+
+#[test]
+fn a_solo_group_with_idle_heartbeats_off_arms_no_timer() {
+    let mut cfg = config();
+    cfg.members = vec![ME];
+    cfg.idle_heartbeats = false;
+    let mut core = Core::new(cfg, Recovered::default(), 0, 5);
+    core.take_actions();
+    core.tick(1_000);
+    let actions = core.take_actions();
+    persist(&mut core, &writes(&actions).last().unwrap().clone());
+    core.take_actions();
+    assert_eq!(core.role(), Role::Leader);
+    assert_eq!(core.next_deadline(), u64::MAX);
+}
+
+const JOINER: u16 = 4;
+
+/// Make `core` (pre-vote off) lead: its deadline lapses at `at`, A grants
+/// its vote, and A acknowledges its no-op. The actions after.
+fn lead_with_a(core: &mut Core<u16>, at: u64) -> Vec<Action<u16>> {
+    core.tick(at);
+    let vote = writes(&core.take_actions()).last().unwrap().clone();
+    persist(core, &vote);
+    let term = core.status().current_term;
+    core.receive(
+        LEADER_A,
+        Message::VoteAnswer {
+            term,
+            granted: true,
+        },
+    );
+    assert_eq!(core.role(), Role::Leader);
+    let no_op = writes(&core.take_actions()).last().unwrap().clone();
+    persist(core, &no_op);
+    let last = core.status().last_log_index;
+    core.receive(
+        LEADER_A,
+        Message::AppendAnswer {
+            term,
+            round: 0,
+            commit: 0,
+            result: AppendResult::Matched { matched: last },
+        },
+    );
+    core.take_actions()
+}
+
+/// The final configurations `actions` append.
+fn finals(actions: &[Action<u16>]) -> Vec<Vec<u16>> {
+    writes(actions)
+        .iter()
+        .flat_map(|write| write.entries.iter())
+        .filter_map(|entry| match &entry.kind {
+            EntryKind::ConfigChange {
+                joint_old: None,
+                members,
+            } => Some(members.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// B replaced by the joiner.
+fn joint() -> (Vec<u16>, Vec<u16>) {
+    (vec![ME, LEADER_A, JOINER], vec![ME, LEADER_A, LEADER_B])
+}
+
+#[test]
+fn a_replica_given_a_joint_snapshot_finalizes_it_when_it_leads() {
+    let mut cfg = config();
+    cfg.pre_vote = false;
+    let mut core = Core::new(cfg, Recovered::default(), 0, 5);
+    core.take_actions();
+    let (members, old) = joint();
+    core.snapshot_installed(
+        20,
+        1,
+        Some(SnapshotConfiguration {
+            members: members.clone(),
+            joint_old: Some(old),
+            index: 15,
+        }),
+    );
+    core.take_actions();
+    assert!(core.status().joint_old.is_some());
+    let actions = lead_with_a(&mut core, 1_000);
+    assert_eq!(finals(&actions), vec![members]);
+    assert!(core.status().retirement_final_index.is_some(), "B retires");
+}
+
+#[test]
+fn recovery_takes_the_later_of_the_record_and_the_logs_start() {
+    let (members, old) = joint();
+    let recovered = Recovered {
+        meta: Meta {
+            current_term: 2,
+            voted_for: None,
+            commit_index: 192,
+            snap_last_index: 192,
+            snap_last_term: 2,
+        },
+        entries: Vec::new(),
+        // A crash lost the record's update to the final configuration,
+        // which a compaction had already made the log's start.
+        active_config: Some(ActiveConfigRecord {
+            log_index: Some(190),
+            current: members.clone(),
+            joint_old: Some(old),
+        }),
+        log_start_config: Some(ActiveConfigRecord {
+            log_index: Some(192),
+            current: members.clone(),
+            joint_old: None,
+        }),
+        applied: 192,
+    };
+    let core = Core::new(config(), recovered, 0, 5);
+    let status = core.status();
+    assert_eq!(
+        (status.members, status.joint_old, status.active_config_index),
+        (members, None, Some(192))
+    );
+}
+
+#[test]
+fn a_recovered_joint_configuration_is_finalized_by_its_leader() {
+    let (members, old) = joint();
+    let recovered = Recovered {
+        meta: Meta {
+            current_term: 1,
+            voted_for: None,
+            commit_index: 20,
+            snap_last_index: 20,
+            snap_last_term: 1,
+        },
+        entries: Vec::new(),
+        active_config: Some(ActiveConfigRecord {
+            log_index: Some(15),
+            current: members.clone(),
+            joint_old: Some(old),
+        }),
+        log_start_config: None,
+        applied: 20,
+    };
+    let mut cfg = config();
+    cfg.pre_vote = false;
+    let mut core = Core::new(cfg, recovered, 0, 5);
+    core.take_actions();
+    let actions = lead_with_a(&mut core, 1_000);
+    assert_eq!(finals(&actions), vec![members]);
 }

@@ -39,11 +39,9 @@ pub(crate) async fn dispatch(inner: Arc<Inner>, arrivals: Arrivals) {
     }
 }
 
-/// The next arrival: liveness and consensus before anything else.
+/// The next arrival: consensus before anything else. Liveness frames go
+/// to the pair heartbeat's own thread.
 async fn take(arrivals: &Arrivals) -> Option<(Class, Incoming)> {
-    if let Ok(incoming) = arrivals.liveness.try_recv() {
-        return Some((Class::Liveness, incoming));
-    }
     if let Ok(incoming) = arrivals.consensus.try_recv() {
         return Some((Class::Consensus, incoming));
     }
@@ -51,8 +49,7 @@ async fn take(arrivals: &Arrivals) -> Option<(Class, Incoming)> {
         let queue = queue.clone();
         async move { queue.recv().await.ok().map(|incoming| (class, incoming)) }
     };
-    on(Class::Liveness, &arrivals.liveness)
-        .or(on(Class::Consensus, &arrivals.consensus))
+    on(Class::Consensus, &arrivals.consensus)
         .or(on(Class::Requests, &arrivals.requests))
         .or(on(Class::Bulk, &arrivals.bulk))
         .await
@@ -230,8 +227,8 @@ impl Inner {
                 let agent = ack.agent;
                 self.to_group(agent, Input::ChunkAck { from, ack });
             }
-            // Pair liveness comes in 3.8.
-            PeerMessage::Liveness { .. } | PeerMessage::LivenessAnswer { .. } => {}
+            // Taken on the pair heartbeat's own thread; none arrives here.
+            PeerMessage::Liveness { .. } => {}
         }
     }
 

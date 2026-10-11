@@ -98,7 +98,11 @@ struct Exercised {
 /// replicas load from the store or install snapshots. Reads are asked
 /// throughout. Then everything heals, and the group must still make
 /// progress.
-fn chaos(seed: u64, churn: bool, entry_lag: (u64, u64)) -> Exercised {
+///
+/// `paired` turns idle heartbeats off and the hosts' pair heartbeats on:
+/// crashes then last long enough for deadlines to lapse unvouched, and
+/// after healing the group must also go quiet.
+fn chaos(seed: u64, churn: bool, entry_lag: (u64, u64), paired: bool) -> Exercised {
     // With churn, a fourth node waits outside the group, and the group's
     // membership moves between three-node subsets of the four.
     let nodes: &[u16] = if churn { &[1, 2, 3, 4] } else { &NODES };
@@ -115,7 +119,12 @@ fn chaos(seed: u64, churn: bool, entry_lag: (u64, u64)) -> Exercised {
         cfg.snapshot_timeout_ms = 100;
         cfg.cache_bytes = 64;
         cfg.compact_hysteresis = 4;
+        cfg.idle_heartbeats = !paired;
     });
+    if paired {
+        cluster.pair_heartbeats(20);
+    }
+    let downtime = if paired { 400 } else { 55 };
     cluster.sync_delay = (1, 80);
     // With a lag, entries are reported durable after their writes, as
     // when they wait for blobs, and followers give up on them at random.
@@ -131,7 +140,7 @@ fn chaos(seed: u64, churn: bool, entry_lag: (u64, u64)) -> Exercised {
                 // Crash a node mid-flight; it restarts 5–60 ms later.
                 if !down.iter().any(|(at, _)| *at == node) {
                     cluster.crash(node);
-                    let back = cluster.now + 5 + cluster.random.next_u64() % 55;
+                    let back = cluster.now + 5 + cluster.random.next_u64() % downtime;
                     down.push((node, back));
                 }
             }
@@ -152,6 +161,10 @@ fn chaos(seed: u64, churn: bool, entry_lag: (u64, u64)) -> Exercised {
                 }
             }
             576..=590 if lagging => cluster.discard_unreported(node),
+            591..=600 if paired => {
+                let millis = 100 + cluster.random.next_u64() % 400;
+                cluster.pair_blackout(node, millis);
+            }
             561..=575 if churn => {
                 if let Some(leader) = cluster.leader() {
                     let out = nodes[(cluster.random.next_u64() % 4) as usize];
@@ -180,9 +193,58 @@ fn chaos(seed: u64, churn: bool, entry_lag: (u64, u64)) -> Exercised {
     // Heal everything: the group elects a leader and commits again.
     cluster.network.heal();
     cluster.network.set_faults(Faults::default());
+    cluster.end_pair_blackouts();
     for &node in nodes {
         cluster.restart(node);
     }
+    settle(&mut cluster);
+    if paired {
+        // Healed and idle, every member catches up with no proposal to
+        // carry it along.
+        let terms = |cluster: &Cluster| -> Vec<Option<u64>> {
+            nodes
+                .iter()
+                .map(|&node| cluster.core(node).map(|core| core.status().current_term))
+                .collect()
+        };
+        // A change in flight at the heal may still remove its leader:
+        // wait for a steady configuration led by one of its members.
+        let steady = |cluster: &Cluster| {
+            cluster.leader().is_some_and(|leader| {
+                let status = cluster.core(leader).unwrap().status();
+                status.joint_old.is_none()
+                    && status.members.contains(&leader)
+                    && status.retirement_final_index.is_none()
+            })
+        };
+        for _ in 0..50 {
+            if steady(&cluster) {
+                break;
+            }
+            cluster.run(100);
+        }
+        assert!(steady(&cluster), "seed {seed}: no steady configuration");
+        let settled = terms(&cluster);
+        cluster.run(2_000);
+        assert_eq!(
+            terms(&cluster),
+            settled,
+            "seed {seed}: an election while idle"
+        );
+        let leader = cluster.leader().expect("a leader");
+        let status = cluster.core(leader).unwrap().status();
+        for member in &status.members {
+            let held = cluster
+                .core(*member)
+                .map(|core| (core.status().last_log_index, core.status().commit_index));
+            assert_eq!(
+                held,
+                Some((status.last_log_index, status.commit_index)),
+                "seed {seed}: member {member} not caught up"
+            );
+        }
+    }
+    // The leader now, which a change in flight at the heal may have moved.
     let leader = settle(&mut cluster);
     let before = cluster.committed_index();
     cluster.propose(leader, b"after".to_vec());
@@ -191,6 +253,31 @@ fn chaos(seed: u64, churn: bool, entry_lag: (u64, u64)) -> Exercised {
         cluster.committed_index() > before,
         "seed {seed}: no progress after healing"
     );
+    if paired {
+        // Idle, the group sends nothing: the pair heartbeats vouch.
+        // A replica removed while it was down may never learn it and
+        // campaign on, refused: only the members' own traffic counts.
+        cluster.run(1_000);
+        let leader = cluster.leader().expect("a leader");
+        let members = cluster.core(leader).unwrap().status().members;
+        let among = |cluster: &Cluster| -> u64 {
+            cluster
+                .raft_sent
+                .iter()
+                .filter(|((from, to), _)| members.contains(from) && members.contains(to))
+                .map(|(_, sent)| sent)
+                .sum()
+        };
+        let sent = among(&cluster);
+        cluster.run(1_000);
+        assert_eq!(among(&cluster), sent, "seed {seed}: not quiet");
+        // Quiet, every member holds the leader's commit.
+        let commit = cluster.core(leader).unwrap().status().commit_index;
+        for member in &members {
+            let held = cluster.core(*member).map(|core| core.status().commit_index);
+            assert_eq!(held, Some(commit), "seed {seed}: member {member} behind");
+        }
+    }
     assert!(
         cluster.violations.is_empty(),
         "seed {seed}: {:?}",
@@ -209,7 +296,7 @@ fn chaos(seed: u64, churn: bool, entry_lag: (u64, u64)) -> Exercised {
 fn safety_holds_under_faults() {
     let mut total = Exercised::default();
     for seed in 0..200 {
-        let run = chaos(seed, false, (0, 0));
+        let run = chaos(seed, false, (0, 0), false);
         total.installs += run.installs;
         total.compactions += run.compactions;
         total.loads += run.loads;
@@ -234,7 +321,7 @@ fn safety_holds_under_faults() {
 fn safety_holds_under_faults_and_membership_changes() {
     let mut total = Exercised::default();
     for seed in 0..200 {
-        let run = chaos(seed, true, (0, 0));
+        let run = chaos(seed, true, (0, 0), false);
         total.changes += run.changes;
         total.installs += run.installs;
     }
@@ -249,7 +336,7 @@ fn safety_holds_under_faults_and_membership_changes() {
 fn safety_holds_when_entries_wait_for_blobs() {
     let mut total = Exercised::default();
     for seed in 0..200 {
-        let run = chaos(seed, true, (1, 60));
+        let run = chaos(seed, true, (1, 60), false);
         total.changes += run.changes;
         total.reads += run.reads;
     }
@@ -258,4 +345,22 @@ fn safety_holds_when_entries_wait_for_blobs() {
         total.changes, total.reads
     );
     assert!(total.reads >= 1_000, "reads: {}", total.reads);
+}
+
+#[test]
+fn safety_holds_with_idle_heartbeats_off_and_the_hosts_vouching() {
+    let mut total = Exercised::default();
+    for seed in 0..100 {
+        let run = chaos(seed, false, (0, 0), true);
+        total.installs += run.installs;
+        total.reads += run.reads;
+        let run = chaos(1_000 + seed, true, (0, 0), true);
+        total.changes += run.changes;
+    }
+    eprintln!(
+        "installs {}, reads answered {}, changes started {}",
+        total.installs, total.reads, total.changes
+    );
+    assert!(total.installs >= 500, "installs: {}", total.installs);
+    assert!(total.changes >= 250, "changes: {}", total.changes);
 }

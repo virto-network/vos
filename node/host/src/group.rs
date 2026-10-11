@@ -98,6 +98,12 @@ pub(crate) enum Local {
         members: Vec<NodeNumber>,
         answer: smol::channel::Sender<Result<u64, ChangeMembershipError>>,
     },
+    /// `node` came back, by the pair heartbeat: a leader sends it a
+    /// heartbeat at once ([`vos_raft::core::Core::probe`]).
+    Probe(NodeNumber),
+    /// Something changed that the group's next round should see, such as
+    /// the writer's health.
+    Wake,
     /// The snapshot stream to `to`, named by `term` and `index`, ended:
     /// `done` once its follower staged every chunk.
     StreamEnded {
@@ -151,6 +157,10 @@ pub(crate) struct Shared {
     /// Held by the applier while it applies an entry, and by a snapshot
     /// switch: an apply never lands on the state a switch replaced.
     pub applying: smol::lock::Mutex<()>,
+    /// When the group's driver last went round, on the node's liveness
+    /// clock: a leader whose driver stopped going round is not vouched
+    /// for.
+    pub woke: std::sync::atomic::AtomicU64,
 }
 
 impl Shared {
@@ -175,6 +185,7 @@ impl Shared {
             changed: event_listener::Event::new(),
             outcomes: Mutex::new(VecDeque::new()),
             applying: smol::lock::Mutex::new(()),
+            woke: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -352,6 +363,11 @@ impl Driver {
         config.election_timeout_ms = inner.election_timeout_ms;
         config.heartbeat_interval_ms = inner.heartbeat_ms;
         config.compact_hysteresis = inner.compact_every;
+        // The pair heartbeat vouches for an idle group's leader. An idle
+        // leader goes round once per check-quorum window, which keeps it
+        // listed.
+        config.idle_heartbeats = false;
+        config.check_quorum = true;
         let core = Core::new(config, raft::recovered(rows), 0, rand_seed());
         let established = established(&core, inner.number);
         shared.update(|state| {
@@ -391,6 +407,25 @@ impl Driver {
         self.start.elapsed().as_millis() as u64
     }
 
+    /// Vouch for this replica's leader and members from the node's pair
+    /// heartbeats.
+    fn vouch(&mut self, now: u64) {
+        let start = self.start;
+        let at = |instant: Instant| instant.saturating_duration_since(start).as_millis() as u64;
+        let agent = self.agent;
+        let table = self
+            .inner
+            .liveness
+            .table
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.core.vouch(
+            now,
+            |node, term| table.listed(node, &agent, term).map(at),
+            |node| table.heard_at(node).map(at),
+        );
+    }
+
     async fn run(
         mut self,
         inbox: smol::channel::Receiver<Input>,
@@ -401,15 +436,25 @@ impl Driver {
                 if self.shared.state().stopped {
                     break;
                 }
-                let mut wake = self.start + Duration::from_millis(self.core.next_deadline());
+                self.shared.woke.store(
+                    self.inner.liveness.elapsed(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                // An idle core may need no tick at all.
+                let mut wake = self
+                    .start
+                    .checked_add(Duration::from_millis(self.core.next_deadline()));
+                let mut sooner = |at: Instant| {
+                    wake = Some(wake.map_or(at, |wake| wake.min(at)));
+                };
                 if let Some((asked, _)) = &self.asked {
-                    wake = wake.min(*asked + BLOB_RETRY);
+                    sooner(*asked + BLOB_RETRY);
                 }
                 if let Some(install) = &self.install {
-                    wake = wake.min(install.since + INSTALL_IDLE);
+                    sooner(install.since + INSTALL_IDLE);
                 }
                 for staged in self.streams.values().filter_map(|stream| stream.staged) {
-                    wake = wake.min(staged + STREAM_HOLD);
+                    sooner(staged + STREAM_HOLD);
                 }
                 let event = async {
                     match local.recv().await {
@@ -424,11 +469,19 @@ impl Driver {
                     }
                 })
                 .or(async {
-                    smol::Timer::at(wake).await;
+                    match wake {
+                        Some(wake) => smol::Timer::at(wake).await,
+                        None => smol::Timer::never().await,
+                    };
                     Event::Timer
                 })
                 .await;
                 let now = self.now();
+                // A deadline due runs only once the pair heartbeat had its
+                // say.
+                if self.core.next_deadline() <= now {
+                    self.vouch(now);
+                }
                 self.core.tick(now);
                 match event {
                     Event::Closed => break,
@@ -488,7 +541,7 @@ impl Driver {
                 Local::ChangeMembership { answer, .. } => {
                     let _ = answer.try_send(Err(ChangeMembershipError::Stopped));
                 }
-                Local::Retire | Local::StreamEnded { .. } => {}
+                Local::Retire | Local::StreamEnded { .. } | Local::Probe(_) | Local::Wake => {}
             }
         }
         for (_, answer) in self.proposals.drain() {
@@ -504,7 +557,15 @@ impl Driver {
 
     fn take(&mut self, input: Input) {
         match input {
-            Input::Raft { from, message } => self.core.receive(from, message),
+            Input::Raft { from, message } => {
+                // A pre-vote meets stickiness as fresh as the pair
+                // heartbeat makes it.
+                if matches!(message, vos_raft::Message::PreVote { .. }) {
+                    let now = self.now();
+                    self.vouch(now);
+                }
+                self.core.receive(from, message)
+            }
             Input::Blobs => self.report_ready(),
             Input::Chunk { from, chunk } => self.chunks.push_back((from, chunk)),
             Input::ChunkAck { from, ack } => {
@@ -535,6 +596,8 @@ impl Driver {
                 self.core.propose(token, payload);
             }
             Local::Retire => self.retired = true,
+            Local::Probe(node) => self.core.probe(node),
+            Local::Wake => {}
             Local::ReadIndex { answer } => {
                 let token = self.next_token;
                 self.next_token += 1;

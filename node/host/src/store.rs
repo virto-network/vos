@@ -230,6 +230,9 @@ pub trait Store: Send + Sync {
 
     /// The seed of the node's key, once made: secret, never served.
     fn node_secret(&self) -> Result<Option<[u8; 32]>>;
+
+    /// The node's last run, as its pair heartbeat numbered it.
+    fn incarnation(&self) -> Result<u64>;
 }
 
 /// A read-only view of applied state. Keys are relative to the agent.
@@ -320,6 +323,9 @@ pub trait Batch {
     /// Record the node's secret seed, and delete the retired public id.
     fn node_secret(&mut self, seed: &[u8; 32]);
 
+    /// Record the node's run, as its pair heartbeat numbers it.
+    fn incarnation(&mut self, incarnation: u64);
+
     fn commit(self, durability: Durability) -> Result<()>;
 }
 
@@ -353,6 +359,7 @@ enum NodeRow {
     Secret = 0x0a,
     LastResult = 0x0b,
     Placement = 0x0c,
+    Incarnation = 0x0d,
 }
 
 fn agent_key(agent: AgentId, epoch: u8, key: &[u8]) -> Vec<u8> {
@@ -787,6 +794,14 @@ impl Store for Fjall {
             .system
             .get(node_record(NodeRow::Secret, &[]))?
             .and_then(|seed| seed[..].try_into().ok()))
+    }
+
+    fn incarnation(&self) -> Result<u64> {
+        Ok(self
+            .system
+            .get(node_record(NodeRow::Incarnation, &[]))?
+            .and_then(|value| value[..].try_into().ok())
+            .map_or(0, u64::from_be_bytes))
     }
 
     fn export(&self, agent: AgentId) -> Result<Export> {
@@ -1267,6 +1282,14 @@ impl Batch for FjallBatch {
             &self.store.system,
             node_row(agent, NodeRow::LastResult, &[]),
             [&time.to_be_bytes()[..], seed].concat(),
+        );
+    }
+
+    fn incarnation(&mut self, incarnation: u64) {
+        self.batch.insert(
+            &self.store.system,
+            node_record(NodeRow::Incarnation, &[]),
+            incarnation.to_be_bytes(),
         );
     }
 

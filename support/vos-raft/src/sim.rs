@@ -21,6 +21,7 @@ use crate::core::{Action, Answer, Core, Recovered, SnapshotConfiguration, Snapsh
 use crate::log_entry::{EntryKind, LogEntry};
 use crate::message::Message;
 use crate::meta::Meta;
+use crate::pair::PeerTable;
 use crate::role::Role;
 use crate::storage::ActiveConfigRecord;
 
@@ -158,6 +159,13 @@ impl<N: Ord + Copy, P: Clone> Network<N, P> {
 #[derive(Debug, Clone)]
 pub enum Packet {
     Raft(Message<u16>),
+    /// A node's pair heartbeat: the term it leads the group at, if it
+    /// does.
+    Pair {
+        incarnation: u64,
+        round: u64,
+        leading: Option<u64>,
+    },
     /// A whole snapshot, sent at the sender's `term`.
     Snapshot {
         term: u64,
@@ -364,7 +372,24 @@ pub struct Cluster {
     pub loads: u64,
     /// Membership changes started, across all nodes.
     pub changes_started: u64,
+    /// Raft messages sent, by sender and receiver.
+    pub raft_sent: BTreeMap<(u16, u16), u64>,
+    /// The hosts' pair heartbeats, when on.
+    pair: Option<Pair>,
     next_token: u64,
+}
+
+/// Each node's host sending pair heartbeats and vouching with what it
+/// hears, as a node does.
+struct Pair {
+    interval: u64,
+    next: u64,
+    tables: BTreeMap<u16, PeerTable<u16, (), u64>>,
+    incarnations: BTreeMap<u16, u64>,
+    rounds: BTreeMap<u16, u64>,
+    /// Nodes whose host sends no pair heartbeat until then, their cores
+    /// running on.
+    silent_until: BTreeMap<u16, u64>,
 }
 
 impl Cluster {
@@ -409,6 +434,8 @@ impl Cluster {
             compactions: 0,
             loads: 0,
             changes_started: 0,
+            raft_sent: BTreeMap::new(),
+            pair: None,
             next_token: 0,
         };
         for &node in nodes {
@@ -418,7 +445,88 @@ impl Cluster {
         cluster
     }
 
+    /// Turn the hosts' pair heartbeats on, every `interval` milliseconds:
+    /// each host vouches with them for the group's leader and members
+    /// before a deadline and a pre-vote, as with idle heartbeats off.
+    pub fn pair_heartbeats(&mut self, interval: u64) {
+        self.pair = Some(Pair {
+            interval,
+            next: self.now,
+            tables: BTreeMap::new(),
+            incarnations: self.nodes.iter().map(|&node| (node, 1)).collect(),
+            rounds: BTreeMap::new(),
+            silent_until: BTreeMap::new(),
+        });
+    }
+
+    /// Every host sends its pair heartbeat again.
+    pub fn end_pair_blackouts(&mut self) {
+        if let Some(pair) = self.pair.as_mut() {
+            pair.silent_until.clear();
+        }
+    }
+
+    /// `node`'s host sends no pair heartbeat for `millis`, as when its
+    /// thread is starved, while its core runs on.
+    pub fn pair_blackout(&mut self, node: u16, millis: u64) {
+        let until = self.now + millis;
+        if let Some(pair) = self.pair.as_mut() {
+            pair.silent_until.insert(node, until);
+        }
+    }
+
+    /// Vouch for `node`'s leader and members from its host's table, empty
+    /// if it heard nothing yet.
+    fn vouch(&mut self, node: u16) {
+        let now = self.now;
+        let (Some(pair), Some(Some(core))) = (self.pair.as_ref(), self.cores.get_mut(&node)) else {
+            return;
+        };
+        let table = pair.tables.get(&node);
+        core.vouch(
+            now,
+            |leader, term| table.and_then(|table| table.listed(leader, &(), term)),
+            |member| table.and_then(|table| table.heard_at(member)),
+        );
+    }
+
+    /// Every live node sends its pair heartbeat.
+    fn send_pair_heartbeats(&mut self) {
+        let now = self.now;
+        let Some(pair) = self.pair.as_mut() else {
+            return;
+        };
+        pair.next = now + pair.interval;
+        for &from in &self.nodes {
+            let Some(Some(core)) = self.cores.get(&from) else {
+                continue;
+            };
+            if pair
+                .silent_until
+                .get(&from)
+                .is_some_and(|&until| until > now)
+            {
+                continue;
+            }
+            let leading = (core.role() == Role::Leader).then(|| core.status().current_term);
+            let round = pair.rounds.entry(from).or_insert(0);
+            *round += 1;
+            for &to in self.nodes.iter().filter(|&&to| to != from) {
+                let packet = Packet::Pair {
+                    incarnation: pair.incarnations[&from],
+                    round: *round,
+                    leading,
+                };
+                self.network.send(&mut self.random, now, from, to, packet);
+            }
+        }
+    }
+
     fn start(&mut self, node: u16) {
+        if let Some(pair) = self.pair.as_mut() {
+            *pair.incarnations.entry(node).or_insert(0) += 1;
+            pair.rounds.remove(&node);
+        }
         let mut cfg = self.cfg.clone();
         cfg.me = node;
         let seed = self.random.next_u64();
@@ -445,6 +553,10 @@ impl Cluster {
         self.cores.insert(node, None);
         self.sync_due.remove(&node);
         self.entry_reports.remove(&node);
+        // A host starts again with nothing heard.
+        if let Some(pair) = self.pair.as_mut() {
+            pair.tables.remove(&node);
+        }
     }
 
     pub fn restart(&mut self, node: u16) {
@@ -527,6 +639,7 @@ impl Cluster {
     fn step(&mut self, until: u64) {
         let next = [
             self.network.next_due(),
+            self.pair.as_ref().map(|pair| pair.next),
             self.sync_due.values().min().copied(),
             self.entry_reports
                 .values()
@@ -544,13 +657,50 @@ impl Cluster {
         .clamp(self.now, until);
         self.now = next.max(self.now);
         let now = self.now;
+        if self.pair.as_ref().is_some_and(|pair| pair.next <= now) {
+            self.send_pair_heartbeats();
+        }
         while let Some((from, to, packet)) = self.network.deliver(now) {
             match packet {
                 Packet::Raft(message) => {
+                    let due = self.cores.get(&to).is_some_and(|core| {
+                        core.as_ref()
+                            .is_some_and(|core| core.next_deadline() <= now)
+                    });
+                    if due || matches!(message, Message::PreVote { .. }) {
+                        self.vouch(to);
+                    }
                     if let Some(Some(core)) = self.cores.get_mut(&to) {
                         core.tick(now);
                         core.receive(from, message);
                         self.process(to);
+                    }
+                }
+                Packet::Pair {
+                    incarnation,
+                    round,
+                    leading,
+                } => {
+                    if self.cores.get(&to).is_some_and(Option::is_some)
+                        && let Some(pair) = self.pair.as_mut()
+                    {
+                        let heard = pair.tables.entry(to).or_default().heard(
+                            from,
+                            now,
+                            incarnation,
+                            round,
+                            leading.map(|term| ((), term)),
+                        );
+                        // A peer's new run, or one heard again after a
+                        // silence, is probed, as a node does.
+                        let gap = self.cfg.election_timeout_ms.1;
+                        if heard.is_some_and(|heard| {
+                            heard.new_run || heard.before.is_some_and(|before| before + gap <= now)
+                        }) && let Some(Some(core)) = self.cores.get_mut(&to)
+                        {
+                            core.probe(from);
+                            self.process(to);
+                        }
                     }
                 }
                 Packet::Snapshot {
@@ -586,6 +736,12 @@ impl Cluster {
             }
         }
         for node in self.nodes.clone() {
+            if self.cores.get(&node).is_some_and(|core| {
+                core.as_ref()
+                    .is_some_and(|core| core.next_deadline() <= now)
+            }) {
+                self.vouch(node);
+            }
             if let Some(Some(core)) = self.cores.get_mut(&node)
                 && core.next_deadline() <= now
             {
@@ -683,6 +839,7 @@ impl Cluster {
                     Action::Write(write) => self.queue(node, Op::Write(write)),
                     Action::Send { to, message } => {
                         let now = self.now;
+                        *self.raft_sent.entry((node, to)).or_insert(0) += 1;
                         self.network
                             .send(&mut self.random, now, node, to, Packet::Raft(message));
                     }

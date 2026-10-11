@@ -142,6 +142,12 @@ pub struct Config<N: NodeId> {
     /// A leader that has not heard from a quorum within an election timeout
     /// steps down. Default: `true`.
     pub check_quorum: bool,
+    /// A leader sends heartbeats to every follower each interval. When
+    /// off, it skips a follower that holds every entry and the commit
+    /// while no read waits, and arms no heartbeat deadline once it skips
+    /// them all: the host vouches for the leader instead
+    /// ([`crate::core::Core::heard_leader_at`]). Default: `true`.
+    pub idle_heartbeats: bool,
 }
 
 impl<N: NodeId> Config<N> {
@@ -168,6 +174,7 @@ impl<N: NodeId> Config<N> {
             snapshot_timeout_ms: 60_000,
             cache_bytes: 16 << 20,
             check_quorum: true,
+            idle_heartbeats: true,
         }
     }
 }

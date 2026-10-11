@@ -11,8 +11,8 @@ use vos_wire::Encode;
 use vos_wire::ids::{AgentId, InstanceId, MethodId, ProgramHash, Session};
 use vos_wire::ingress::{Answer, Call};
 use vos_wire::peer::{
-    Configuration, CreationRecord, Manifest, NodeNumber, PeerMessage, Placement, Raft, SnapshotAck,
-    SnapshotChunk,
+    Configuration, CreationRecord, Leading, Manifest, NodeNumber, PeerMessage, Placement, Raft,
+    SnapshotAck, SnapshotChunk,
 };
 use vos_wire::result::Outcome;
 
@@ -175,10 +175,10 @@ fn every_other_message_survives_the_wire() {
         PeerMessage::Liveness {
             incarnation: 9,
             round: 3,
-        },
-        PeerMessage::LivenessAnswer {
-            incarnation: 10,
-            round: 3,
+            leading: vec![Leading {
+                agent: AGENT,
+                term: 4,
+            }],
         },
         forward(),
         PeerMessage::ReadIndex {
@@ -394,6 +394,7 @@ fn a_frame_is_one_whole_message() {
     let frame = PeerMessage::Liveness {
         incarnation: 1,
         round: 2,
+        leading: Vec::new(),
     }
     .encode();
     assert_eq!(
@@ -477,6 +478,7 @@ fn only_configured_nodes_are_heard() {
     let liveness = PeerMessage::Liveness {
         incarnation: 1,
         round: 1,
+        leading: Vec::new(),
     };
     assert_eq!(check(&SPACE, 4, &liveness, unfollowed), Ok(()));
     assert_eq!(

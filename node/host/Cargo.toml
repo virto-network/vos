@@ -50,3 +50,7 @@ harness = false
 [[bench]]
 name = "acceptance"
 harness = false
+
+[[bench]]
+name = "agents"
+harness = false

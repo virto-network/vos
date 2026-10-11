@@ -38,12 +38,16 @@ pub enum PeerMessage {
     /// A blob, which the receiver hashes before taking.
     #[codec(index = 4)]
     Blob { hash: [u8; 32], bytes: Vec<u8> },
-    /// The sending node is alive, in its run `incarnation`.
+    /// The sending node's pair heartbeat: it is alive, in its run
+    /// `incarnation` (its start time, in microseconds) at heartbeat
+    /// `round`, and leads each group in `leading` at its term. A long
+    /// list comes in several frames of one round.
     #[codec(index = 5)]
-    Liveness { incarnation: u64, round: u64 },
-    /// The answer to a [`PeerMessage::Liveness`], with the answering run.
-    #[codec(index = 6)]
-    LivenessAnswer { incarnation: u64, round: u64 },
+    Liveness {
+        incarnation: u64,
+        round: u64,
+        leading: Vec<Leading>,
+    },
     /// Where an agent runs, with its creation record: from its creator at
     /// creation, then from its leader as its replicas change.
     #[codec(index = 7)]
@@ -187,6 +191,13 @@ impl Placement {
     pub fn admits(&self, node: NodeNumber) -> bool {
         self.replicas.contains(&node) || (!self.committed && self.before.contains(&node))
     }
+}
+
+/// A group a node leads, at `term`, as its pair heartbeat lists it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct Leading {
+    pub agent: AgentId,
+    pub term: u64,
 }
 
 /// A Raft message, as the consensus core has it.

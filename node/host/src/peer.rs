@@ -307,7 +307,7 @@ pub fn class(message: &PeerMessage) -> Class {
         | PeerMessage::ReadIndexAnswer { .. }
         | PeerMessage::Deliver { .. }
         | PeerMessage::Acknowledge { .. } => Class::Requests,
-        PeerMessage::Liveness { .. } | PeerMessage::LivenessAnswer { .. } => Class::Liveness,
+        PeerMessage::Liveness { .. } => Class::Liveness,
     }
 }
 
@@ -327,9 +327,7 @@ pub fn stream(message: &PeerMessage) -> u64 {
         | PeerMessage::ReadIndexAnswer { agent, .. }
         | PeerMessage::Deliver { to: agent, .. }
         | PeerMessage::Acknowledge { sender: agent, .. } => u64::from(agent.0),
-        PeerMessage::Blob { .. }
-        | PeerMessage::Liveness { .. }
-        | PeerMessage::LivenessAnswer { .. } => 0,
+        PeerMessage::Blob { .. } | PeerMessage::Liveness { .. } => 0,
     }
 }
 
@@ -382,7 +380,6 @@ pub fn check(
         | PeerMessage::SnapshotAck(_)
         | PeerMessage::BlobRequest { .. }
         | PeerMessage::Liveness { .. }
-        | PeerMessage::LivenessAnswer { .. }
         | PeerMessage::Forward { .. }
         | PeerMessage::Forwarded { .. }
         | PeerMessage::ReadIndex { .. }

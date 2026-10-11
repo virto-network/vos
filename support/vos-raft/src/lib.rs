@@ -43,6 +43,7 @@ pub mod log_entry;
 mod log_view;
 pub mod message;
 pub mod meta;
+pub mod pair;
 pub mod role;
 pub mod rpc;
 #[cfg(feature = "std")]

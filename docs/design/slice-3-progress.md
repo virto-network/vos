@@ -4283,3 +4283,434 @@ line with the code.
   outlasting the core's own deadline (60 s).
 - **Unscheduled:** learners, so a new replica catches up before it
   counts toward a majority.
+
+
+## Step 3.8: many active agents
+
+### Design
+
+**Where it stands.** A new bench (`benches/agents.rs`) runs three nodes
+in one process over QUIC on localhost, each on its own data directory,
+with the default timeouts (elections 1.5–3 s, heartbeats every 500 ms).
+On the reference laptop (22 hardware threads):
+
+| Run | Result |
+|---|---|
+| 64 agents × 4 sessions, closed loop at each leader | 10–13k commits/s, p50 20–24 ms, p99 30–45 ms, 12 cores busy |
+| 64 agents × 16 sessions | 29k commits/s, p50 37 ms, p99 61 ms, 12.5 cores |
+| 1,064 groups per node, idle | 56% of one core for the three nodes; 90 threads |
+
+- **Active:** the process is CPU-bound, and the PVM takes most of it.
+  - The latencies are closed-loop at saturation: sessions divided by
+    throughput, not service time.
+  - 60% of samples are on the executors: 22 per node, so 66 threads on
+    22 hardware threads. 28% is JIT code; the rest is machine setup and
+    teardown (page permissions, dirty pages, resets), overstated perhaps
+    by 66 threads sharing one process's memory map.
+  - Store point reads take 11%.
+  - A batch runs refine and a dry-run accumulate on the leader, and
+    accumulate on every replica (section 2). With few sessions per agent,
+    batches hold a few inputs, so the fixed cost per batch dominates.
+  - The budget itself is 3.10's ("pipelined refines, if needed, come
+    there"); 3.8 measures the curve, so 3.10 knows early whether it
+    needs them.
+- **Idle:** 62% of samples are in the network thread (QUIC frames, one
+  heartbeat per group per follower every 500 ms). 36% is in group
+  drivers: timers and wakeups, two per group per heartbeat.
+- **Writer batching across agents** is in place since 3.3a: the writer
+  takes every commit queued into one batch and one sync. The bench
+  reports commits per sync.
+
+Split in two:
+- **3.8a:** pair heartbeats, and group timers they vouch for;
+- **3.8b:** the active path measured, scheduling under load, and the
+  carried items.
+
+#### 3.8a Pair heartbeats, and group timers they vouch for
+
+An idle group sends nothing; its timers stay, re-armed from what the
+node-wide heartbeat says. A group never parks without a timer: whatever
+fails (the pair heartbeat, a node's table, a stopped or stalled group),
+it falls back to Raft's own timing, not to a group stuck asleep.
+
+**The pair heartbeat.**
+- Every node sends every other node of its space one
+  `Liveness { incarnation, round, leading }` per heartbeat interval, on
+  a thread of its own (`vos-liveness`), which also takes the liveness
+  frames arriving: a busy node thread delays neither.
+  - The incarnation is the node's start time in µs, or one past the
+    last run's when the clock stands behind it: it is kept in the store
+    and written at each start, so a clock stepped back cannot make a
+    new run look older than the last.
+  - `round` counts within an incarnation.
+  - `leading` lists `(agent, term)` for each group the sender leads at
+    that term, sent only to peers its placement admits (every node when
+    it holds none): 12 bytes a group.
+  - A group is left out when its driver is stopped, or has not gone
+    round in two election timeouts (an idle leader goes round at least
+    once per check-quorum window): a wedged driver stops being vouched
+    for.
+- A node whose writer is stalled lists no group.
+- A node that halted sends no heartbeat.
+- A long list goes in several frames of one round, 4,096 groups each,
+  within the liveness frame's 64 KiB.
+- `LivenessAnswer` goes: the other side's own heartbeat is the answer.
+- The node keeps a **peer table** (`vos_raft::pair::PeerTable`, which
+  the simulator uses too): for each peer, when it was last heard, the
+  `(incarnation, round)` last taken, and for each group it listed, the
+  term and when it last listed it.
+  - A heartbeat below the last `(incarnation, round)` taken is ignored
+    (equal is another frame of the same round), so a late frame changes
+    nothing. A new run's first heartbeat forgets what the last listed.
+  - A group a peer stops listing ages out of the window a vouch
+    accepts. No frame of a round needs the others.
+  - The table holds facts only. It raises no events and wakes no group;
+    drivers read it when they need it.
+
+**vos-raft:**
+- `Config::idle_heartbeats` (true by default; the node turns it off).
+  When off, a leader's heartbeat round skips a follower that is caught
+  up: it acknowledged the last index and an append carrying the commit
+  index (answers echo the commit they answer), nothing is in flight to
+  it, and no read waits on a round. It also skips a member whose node
+  the host has not heard lately (below). With none left to send to and
+  no read waiting, the leader arms no heartbeat deadline, only
+  check-quorum's.
+  - A proposal still goes out at once.
+  - A commit still reaches followers at once (`send_commit`); one lost
+    is sent again, as its follower is not caught up until it answers.
+  - Whenever a follower stops being caught up (entries or a commit it
+    has not acknowledged, an append or a snapshot that failed), the
+    leader arms its heartbeat deadline again: each round retries what
+    the follower lacks.
+  - A read starts its own round as today.
+- **A leader that gets a pre-vote from a member** refuses it as today,
+  and also sends that member a heartbeat at once: a follower whose timer
+  lapsed hears its leader.
+- `Core::heard_leader_at(at)`, at a follower: its leader was vouched
+  for at `at`. When `at` is later than the last time it heard the
+  leader, it takes `at` as that time, and re-arms its election deadline
+  to `at` plus a random span in [low, high). Stickiness then holds as
+  if a heartbeat had come at `at`.
+- `Core::vouch(now, listed, heard)` is what a host calls with its
+  table: at a follower, `heard_leader_at` with the time its leader last
+  listed the group at the follower's term, if within the election
+  timeout's lower bound; at a leader, `peer_alive` for each member heard
+  within check-quorum's window, and every other member marked silent.
+- A solo group arms no timer at all: no check-quorum, no heartbeats. A
+  solo leader that adds members starts check-quorum's window then.
+
+**The driver:**
+- **Before any tick a deadline is due for,** whatever woke the driver,
+  and before delivering a pre-vote, the driver calls `Core::vouch` with
+  the table. A follower vouched for moves its deadline and starts no
+  pre-vote, or refuses one by stickiness; one not vouched for runs Raft
+  as today. A leader counts the members heard, so one cut off from a
+  majority still steps down within the same bound as today.
+- The lookups take a read lock on the table and a map lookup per group,
+  only when a deadline is due or a pre-vote arrives.
+
+**What an idle group costs.**
+- A follower wakes once per election timeout (about every 2 s).
+- A leader wakes once per check-quorum interval (3 s).
+- No group sends frames.
+- For 1,000 groups per node that is about 450 wakes per second, near
+  20 µs each in today's profile: about 1% of a core. Add the pair
+  heartbeats: two frames per interval per node, with lists.
+
+**Failure cases.**
+- **A leader's node dies:** its followers' deadlines, re-armed from the
+  last vouch, lapse 1.5 to 3 s after its last pair heartbeat, as after
+  its last heartbeat today. They pre-vote, and the others, also
+  unvouched, grant.
+- **A flaky link:**
+  - A lapse needs three heartbeats in a row lost, so a link losing half
+    its frames lets one group in eight pre-vote at each lapse.
+  - The other follower is vouched for and refuses, refreshing first
+    from the table. The leader answers with a heartbeat. No term moves.
+- **A cut link:** the cut follower pre-votes once per election timeout
+  in each group. The other follower refuses, and the leader hears
+  nothing; no term moves. When the link heals, the next heartbeat
+  vouches again.
+- **A leader's group stopped, halted, stalled or wedged** drops out of
+  the list. Its followers' next lapse goes unvouched, and they elect.
+- **Both followers unvouched while the leader lives** (its pair
+  heartbeats lost or late): one's pre-vote can win the other's grant
+  before the leader's answering heartbeat lands, and an election
+  follows that was not needed. Safety holds; the pair heartbeat's own
+  thread makes it rare. The simulator's chaos includes blackouts of a
+  node's pair heartbeat.
+- **A member's node is down:** the leader marks it silent and sends it
+  nothing; heard again, it is not caught up, so heartbeats start and
+  catch it up.
+
+**Tests.**
+- **vos-raft core:**
+  - with idle heartbeats off, an idle leader sends nothing once its
+    follower acknowledged the commit;
+  - a lost commit notice is sent again;
+  - a lagging follower still gets heartbeats; a silent member gets
+    none until heard again;
+  - a proposal and a read go out at once;
+  - `heard_leader_at` moves the deadline and holds stickiness;
+  - a member's pre-vote draws a heartbeat;
+  - a solo group arms no timer.
+- **Simulator:**
+  - the chaos runs with idle heartbeats off and the pair heartbeat
+    model through the faulty network, the hosts' tables lost in their
+    crashes, and blackouts of a node's pair heartbeat;
+  - crashes long enough for deadlines to lapse unvouched;
+  - safety as today; after healing the group commits, then its members
+    send each other nothing for a second, every member holding the
+    leader's commit.
+- **Cluster** (in process, over the hub):
+  - 1,000 idle groups go quiet: after a settling time, no Raft frames
+    cross the hub, only pair heartbeats;
+  - a call to a quiet group goes through at once;
+  - the node leading many groups stops: every group elects within a
+    bound set from measurement;
+  - a follower node restarts and catches up;
+  - a link losing half its frames for 10 s, then a link cut for 10 s:
+    no term moves, every group serves after;
+  - a node whose writer stalls stops being listed, and its groups elect
+    elsewhere.
+- **The exactly-once checker** with idle heartbeats off: its stops,
+  cuts and lost frames meet the vouching.
+- **Bench:** idle CPU for 1,000 groups per node within 5% of one core
+  per node, with idle single-replica agents beside them.
+
+#### 3.8a Built
+
+- **vos-raft:**
+  - `Config::idle_heartbeats`. When off, a follower is caught up once
+    it has:
+    - acknowledged the last index;
+    - acknowledged an append carrying the commit (`acked_commit`, from
+      the commit an answer echoes);
+    - nothing in flight;
+    - or a silent node.
+
+    An idle leader skips caught-up followers, and parks its heartbeat
+    deadline once it skips them all. `take_actions` re-arms the deadline
+    as soon as a follower stops being caught up.
+  - A member's pre-vote at a leader draws a heartbeat, and so does
+    `probe(node)`, for a member that came back. A probe also drops the
+    member's acknowledged commit, so it gets a heartbeat each round
+    until it answers.
+  - A transfer's target is never caught up, so a lost TimeoutNow goes
+    again with its next answer.
+  - `heard_leader_at`; `vouch(now, listed, heard)`, which marks the
+    members not heard as silent, unless the ones heard (the leader
+    with them) make no quorum: then the host may be the one gone deaf,
+    and the leader goes on sending.
+  - A solo group arms no timer. A solo leader that adds members starts
+    its check-quorum window then.
+  - `pair::PeerTable`.
+  - The simulator:
+    - the pair heartbeat model (`pair_heartbeats`), with tables lost in a
+      crash;
+    - `pair_blackout`;
+    - Raft sends counted per pair of nodes.
+- **The wire:** `Liveness { incarnation, round, leading }`, with
+  `Leading { agent, term }`; `LivenessAnswer` is gone.
+- **The node:**
+  - `liveness.rs`, on the `vos-liveness` thread. It sends the pair
+    heartbeat and takes the liveness frames; dispatch takes them no
+    more.
+  - What the heartbeat lists:
+    - every group the node leads, sent to the peers its placement
+      admits;
+    - not a group whose driver is stopped;
+    - not a group whose driver has not gone round in two election
+      timeouts (`Shared::woke`, stamped each round);
+    - nothing while the writer is stalled;
+    - nothing at all, not even a heartbeat, once the node halted
+      (`Inner::halted`).
+  - The incarnation is kept in the store (`NodeRow::Incarnation`):
+    the clock's µs, or one past the last run's.
+  - A peer heard as a new run, or again after a silence of an election
+    timeout, is probed (`Local::Probe`) by every group the node leads
+    with it. A replica that restarted while its groups were quiet thus
+    hears its leaders at once, not at its first deadline.
+  - When the writer's stall starts or ends, the thread wakes every group
+    the node leads (`Local::Wake`), so it hands over at once.
+  - The thread starts again after a panic, logging it, unless stopped
+    meanwhile. Its rounds go on across restarts (peers ignore a round
+    below the last they took from a run). The table's lock tolerates
+    poisoning: a failed pair heartbeat never stops the node's groups.
+    The first heartbeat goes at once.
+  - The driver turns idle heartbeats off. It vouches before any tick a
+    deadline is due for and before a pre-vote, and arms no timer when
+    nothing is due.
+- **vos-net's hub** counts frames by class and loses frames per link
+  (`sent`, `set_link_loss`), for the tests.
+
+**Found while building, and fixed:** a replica added while its group
+was idle never caught up.
+- The leader's heartbeat deadline was parked.
+- The snapshot stream to the new replica failed once, and nothing
+  retried it: the next heartbeat round used to.
+- The 3.7b test that replaces a replica while it is down caught it in
+  two runs of three.
+- The fix is the re-arm above. The review's lost-commit case is its
+  twin.
+
+**Found by the paired chaos's check for a steady configuration, and
+fixed in vos-raft** (from before 3.8, unseen while no run checked that
+the group settles):
+- A replica that installed a snapshot holding a joint configuration
+  kept it, but not the entry that started it. Leading later, it never
+  finalized it, and its group stayed joint for good, taking no further
+  change. It now keeps that entry pending.
+- A leader whose pending entry was compacted away finalizes from the
+  configuration in effect:
+  - the joint one, when the pending entry is the one in effect;
+  - otherwise the final one, pending past it: it goes steady without
+    appending the final again, which a recovery would read as a
+    retirement's confirmation.
+- Recovery took the persisted configuration record over a newer one at
+  the log's start, when a crash had lost the record's update. It now
+  takes the later of the two, and a joint one stays pending.
+- Each has a core test of its own: a replica given a joint snapshot
+  finalizes it when it leads; recovery takes the later configuration; a
+  recovered joint configuration is finalized by its leader.
+
+**Results** (bench, three nodes in one process):
+- 1,004 groups per node, idle, take 4.7% of one core for the three
+  nodes, against 56% before: about 1.6% per node, within 5%.
+- With the tests' timeouts (elections 40–80 ms), 21 quiet groups whose
+  leader's node stopped had new leaders within 68 ms.
+
+**Tests:**
+- **vos-raft:** core tests. They cover:
+  - an idle leader quiet once its follower acknowledged the commit;
+  - a lost commit notice sent again;
+  - a lagging follower still heartbeated;
+  - a silent member left alone until heard;
+  - a read's round;
+  - a member's pre-vote drawing a heartbeat;
+  - a vouched leader holding stickiness;
+  - a solo group with no timer.
+
+  The paired chaos runs come on top: 100 seeds each with and without
+  membership churn; long crashes; blackouts. They check safety, quiet
+  among the members after healing, and every member holding the
+  leader's commit.
+- **Cluster:**
+  - 100 idle groups go quiet (no Raft frames for half a second, pair
+    heartbeats going on), and a call then goes through with no term
+    moving;
+  - 60 quiet groups elect again when their leaders' node stops;
+  - a restarted follower catches up its quiet groups;
+  - a link losing half its frames for 3 s, then cut for 3 s, moves no
+    term in 40 groups;
+  - a node whose writer stalls loses all its groups to other leaders,
+    the one waiting on the held write included.
+- **The node's own:**
+  - a new run's incarnation outranks the last when the clock stands
+    behind it;
+  - a long list goes in frames of one round.
+- **More, from the review:**
+  - vos-raft: a probe, a lost TimeoutNow to an idle target, a leader
+    hearing no quorum going on sending;
+  - the peer table: late frames, a new run, listings forgotten;
+  - the chaos runs:
+    - after healing, before any proposal could carry them, every
+      member matches the leader's last index and commit;
+    - the configuration settles;
+    - no election while idle (blackouts ended at the heal);
+  - a follower node restarted with nothing written meanwhile hears its
+    leaders within 32 ms (elections of 1–2 s here);
+  - the stopped leader's node, back, is heard as a new run, and every
+    group goes quiet again;
+  - the quiet tests run elections of 300–600 ms, so a loaded machine
+    does not let the pair heartbeat lapse;
+  - the flaky link loses 95% of its frames, so vouches do lapse.
+- **Mutations, each caught:**
+  - no vouch before a due tick: the quiet test and the flaky link's;
+  - idle heartbeats left on: the quiet test;
+  - no re-arm when a follower falls behind: the silent member's core
+    test, and the 3.7b replacement test, again;
+  - caught up on a commit sent rather than acknowledged: the lost
+    notice's test;
+  - silent members heartbeated: their core test;
+  - the vouching mutations of the core (follower, leader), and the
+    pre-vote heartbeat.
+- **Mutations of the review's fixes, caught:**
+  - no probe (the restarted follower's test);
+  - the transfer target counted as caught up;
+  - no rule for a deaf host;
+  - each membership fix, by its core test. A compacted joint entry not
+    finalized fails the chaos run's steady configuration too. The
+    steady route for a compacted final has no test of its own; it is
+    reached only when a transfer holds back a final configuration's
+    commit until compaction passes it.
+- **Not caught alone, and kept as guards:**
+  - listing groups while the writer is stalled, and listing a group
+    whose driver has not gone round: each covers the other in the
+    stalled writer's test, and without both it fails;
+  - the wake on a stall flip: with the tests' timeouts an idle leader
+    goes round within 80 ms anyway.
+
+**Review** (Sonnet, the Opus reviewer having reached its weekly limit):
+- **The design:** the first version quiesced groups outright. It was
+  sent back: a leader re-woken by its followers' answers, and groups
+  left leaderless by edge-triggered events. It was replaced by
+  vouched timers, which fall back to Raft's own timing.
+- **The design check** found:
+  - idle skipping that trusted a commit sent, not acknowledged;
+  - a wall-clock incarnation that a clock stepped back would sink;
+  - an unlisted wedged driver;
+  - the pair heartbeat sharing the node's thread;
+  - the simulator's tables surviving crashes.
+- **The diff review:** go, with four fixes folded in before the
+  commit:
+  - probing a member that came back;
+  - heartbeats to a transfer's target;
+  - waking leaders on a stall flip;
+  - supervising the thread.
+
+  With them came:
+  - the rule for a deaf host;
+  - a pinned check-quorum;
+  - the test gaps above.
+
+#### 3.8b The active path, scheduling under load, and carried items
+
+**Measured with the bench:**
+- **A session sweep** (1 to 64 per agent) for commits per second
+  against p50 and p99, to find the knee 3.10's "40k/s at p99 ≤ 20 ms"
+  needs.
+- **A linger and batch-size sweep** (`linger`, `max_inputs`): the
+  cheapest throughput lever.
+- **Executors per node** set to the machine's share when nodes share
+  it, as 3.10's three processes will.
+- **Commits per sync.**
+- **Fairness:** one hot agent (64 sessions) beside 63 with one each.
+  The cold agents' p99 must stay within a bound of their p99 alone. If
+  it does not, executors and leader loops take work round-robin across
+  agents, not FIFO.
+- **A node stopping while it leads 1,000 groups:** the time until every
+  group serves again. Every election writes a synced placement under
+  the node-wide `recording` lock, so about 333 serialized syncs per
+  node. If the time shows it, the lock is striped by agent and the
+  writer batches the syncs.
+- **A restart with 1,000 agents:** time to serve and CPU, including
+  every creator re-announcing its records.
+
+**Fixed:** the O(tasks) `retain` in the node's `spawn`: finished tasks
+are dropped by count, not by a scan per spawn.
+
+**Carried to 3.10 with their numbers, or settled:**
+- Message batching across agents, and fan-in past a receiver's cap:
+  measured with agents messaging across nodes.
+- One heartbeat round per linearizable read. A read must join the next
+  round to start, never one already in flight: that round's answers do
+  not prove leadership at the read's arrival.
+- Recovery loading the whole live log is bounded by compaction (3.7a).
+- The pair heartbeat vouches only for groups its node leads, by its
+  `leading` list.
+
+**Not in 3.8:** pipelined refines and the active-agent budget itself
+(3.10); a bench in three processes (3.10's acceptance runs three
+`vos node run`).

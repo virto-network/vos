@@ -445,6 +445,11 @@ pub(crate) struct Inner {
     /// Agents whose retirement is not yet written: no group starts for
     /// them until it is.
     pub(crate) retiring: Mutex<HashSet<AgentId>>,
+    /// Storage failed: every group stopped, and the node sends no pair
+    /// heartbeat.
+    pub(crate) halted: std::sync::atomic::AtomicBool,
+    /// The pair heartbeat this node sends, and what it hears.
+    pub(crate) liveness: crate::liveness::Liveness,
     /// Messages relayed to their agent's leader.
     pub(crate) relayed: std::sync::atomic::AtomicU64,
     /// Clients' calls: their lanes, and the calls forwarded both ways.
@@ -631,6 +636,7 @@ impl Inner {
     /// Stop every agent: a commit failed, and storage takes no more.
     /// Queued and later calls answer `Stopped`.
     pub(crate) fn halt(&self) {
+        self.halted.store(true, std::sync::atomic::Ordering::SeqCst);
         let runs: Vec<Arc<Run>> = self
             .runs
             .lock()
@@ -1414,6 +1420,8 @@ pub struct Node {
     endpoint: Option<Endpoint>,
     stop: Option<smol::channel::Sender<()>>,
     runtime: Option<JoinHandle<()>>,
+    /// The pair heartbeat's thread, and what stops it.
+    liveness: Option<(smol::channel::Sender<()>, JoinHandle<()>)>,
 }
 
 /// The node's data directory: its store, and the operator's token.
@@ -1447,6 +1455,12 @@ impl Node {
                 secret
             }
         };
+        // Each run's pair heartbeat outranks the last run's, whatever the
+        // clock did between them.
+        let incarnation = crate::liveness::next_incarnation(store.incarnation()?);
+        let mut batch = store.batch();
+        batch.incarnation(incarnation);
+        batch.commit(Durability::Synced)?;
         let node_id = NodeId(SigningKey::from_bytes(&secret).verifying_key().to_bytes());
         let hex: String = node_id.0.iter().map(|byte| format!("{byte:02x}")).collect();
         std::fs::write(data.join(NODE_KEY), &hex)
@@ -1561,6 +1575,8 @@ impl Node {
             installed: std::sync::atomic::AtomicU64::new(0),
             closing: std::sync::atomic::AtomicBool::new(false),
             retiring: Mutex::new(HashSet::new()),
+            halted: std::sync::atomic::AtomicBool::new(false),
+            liveness: crate::liveness::Liveness::new(incarnation),
             relayed: std::sync::atomic::AtomicU64::new(0),
         });
         for record in records {
@@ -1593,7 +1609,18 @@ impl Node {
                 inner.spawn(async move { retiring.finish_retirement(agent).await });
             }
         }
+        let mut liveness = None;
         if let Some(arrivals) = arrivals {
+            let (stop, stopped) = smol::channel::bounded::<()>(1);
+            let heard = arrivals.liveness.clone();
+            let thread = {
+                let inner = Arc::clone(&inner);
+                std::thread::Builder::new()
+                    .name("vos-liveness".into())
+                    .spawn(move || crate::liveness::supervise(inner, heard, stopped))
+                    .expect("the liveness thread starts")
+            };
+            liveness = Some((stop, thread));
             inner.spawn(crate::dispatch::dispatch(Arc::clone(&inner), arrivals));
         }
         inner.spawn(crate::dispatch::resend_records(Arc::clone(&inner)));
@@ -1606,6 +1633,7 @@ impl Node {
             endpoint,
             stop: Some(stop),
             runtime: Some(thread),
+            liveness,
         })
     }
 
@@ -1827,6 +1855,10 @@ impl Node {
             self.inner
                 .closing
                 .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        if let Some((stop, thread)) = self.liveness.take() {
+            let _ = stop.try_send(());
+            let _ = thread.join();
         }
         // End the ingress and its connections while the runtime still runs
         // them, so none outlives the node holding its store.

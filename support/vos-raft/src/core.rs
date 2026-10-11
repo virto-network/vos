@@ -324,8 +324,13 @@ struct LeaderState<N: NodeId> {
     acked_round: BTreeMap<N, u64>,
     /// The commit index each peer was last sent.
     sent_commit: BTreeMap<N, u64>,
+    /// The highest commit index each peer answered an append carrying.
+    acked_commit: BTreeMap<N, u64>,
     /// Peers heard from since the last check-quorum.
     recent: BTreeSet<N>,
+    /// Members whose node the host has not heard lately
+    /// ([`Core::vouch`]): an idle leader sends them no heartbeats.
+    silent: BTreeSet<N>,
     /// A leadership transfer in progress, and when it gives up.
     transfer: Option<(N, u64)>,
 }
@@ -341,7 +346,9 @@ impl<N: NodeId> LeaderState<N> {
             round: 0,
             acked_round: BTreeMap::new(),
             sent_commit: BTreeMap::new(),
+            acked_commit: BTreeMap::new(),
             recent: BTreeSet::new(),
+            silent: BTreeSet::new(),
             transfer: None,
         }
     }
@@ -569,7 +576,7 @@ impl<N: NodeId> Core<N> {
             if let Some((_, at)) = leader.transfer {
                 deadline = deadline.min(at);
             }
-            if self.cfg.check_quorum {
+            if self.cfg.check_quorum && !self.is_solo() {
                 deadline = deadline.min(self.check_quorum_due);
             }
         }
@@ -1015,12 +1022,105 @@ impl<N: NodeId> Core<N> {
         }
     }
 
-    /// `node` answered the host's pair heartbeat: count it as heard from.
-    /// The host reports it for this group only while `node`'s heartbeat
-    /// says it leads the group (or follows it, for a leader's count): a
-    /// node whose leader here stepped down must stop vouching for it, or
-    /// its followers refuse each other's pre-votes and the group stays
-    /// leaderless.
+    /// The host vouches that this replica's leader was alive and leading at
+    /// `at`, by a heartbeat of its own: a follower takes that as having
+    /// heard the leader then, when it is later than the last time it did,
+    /// and its election deadline runs from it.
+    pub fn heard_leader_at(&mut self, at: u64) {
+        if self.role != Role::Follower
+            || self.seen_leader.is_none()
+            || self.last_heard_leader.is_some_and(|heard| heard >= at)
+        {
+            return;
+        }
+        self.last_heard_leader = Some(at);
+        let (low, high) = self.cfg.election_timeout_ms;
+        let span = high.saturating_sub(low).max(1);
+        let jitter = self.next_random() % span;
+        self.election_deadline = self.election_deadline.max(at + low + jitter);
+    }
+
+    /// Vouch for this replica's leader and members from the host's pair
+    /// heartbeats, at `now`: `listed(node, term)` says when `node` last
+    /// said it leads this group at `term`, `heard(node)` when `node` was
+    /// last heard at all, both on the core's clock.
+    ///
+    /// A follower whose leader listed the group at its term within the
+    /// election timeout's lower bound hears of it then
+    /// ([`Self::heard_leader_at`]). A leader counts each member heard
+    /// within check-quorum's window as heard from ([`Self::peer_alive`]).
+    pub fn vouch(
+        &mut self,
+        now: u64,
+        listed: impl Fn(N, u64) -> Option<u64>,
+        heard: impl Fn(N) -> Option<u64>,
+    ) {
+        self.now = self.now.max(now);
+        let (low, high) = self.cfg.election_timeout_ms;
+        match self.role {
+            Role::Follower => {
+                if let Some(leader) = self.seen_leader
+                    && let Some(at) = listed(leader, self.term)
+                    && at + low > self.now
+                {
+                    self.heard_leader_at(at);
+                }
+            }
+            Role::Leader => {
+                let me = self.cfg.me;
+                let mut silent = BTreeSet::new();
+                for member in self.effective.all_members() {
+                    if member == me {
+                        continue;
+                    }
+                    if heard(member).is_some_and(|at| at + high > self.now) {
+                        self.peer_alive(member);
+                    } else {
+                        silent.insert(member);
+                    }
+                }
+                // A host that hears too few to make a quorum may be the one
+                // gone deaf: its leader goes on sending, and lets
+                // check-quorum judge by the answers.
+                if !self
+                    .effective
+                    .quorum_holds(|member| member == me || !silent.contains(&member))
+                {
+                    silent.clear();
+                }
+                if let Some(leader) = self.leader.as_mut() {
+                    leader.silent = silent;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `node` came back (a new run of it, or heard again after a silence):
+    /// a leader no longer counts it as caught up, and sends it a heartbeat
+    /// at once, so a replica that restarted learns its leader and the
+    /// commit without waiting for its own deadline.
+    pub fn probe(&mut self, node: N) {
+        if self.role != Role::Leader || node == self.cfg.me {
+            return;
+        }
+        let Some(leader) = self.leader.as_mut() else {
+            return;
+        };
+        leader.acked_commit.remove(&node);
+        leader.silent.remove(&node);
+        let round = leader.round;
+        if self.replication_peers().contains(&node) {
+            self.heartbeat_to(node, round);
+        }
+    }
+
+    /// The host heard `node` lately, by its pair heartbeat: a leader counts
+    /// it toward check-quorum, and a follower whose leader it is counts the
+    /// leader as heard now. A host reports a leader only while `node`'s
+    /// heartbeat says it leads this group ([`Self::vouch`] does so): one
+    /// vouched for after it stepped down would keep its followers refusing
+    /// each other's pre-votes.
     pub fn peer_alive(&mut self, node: N) {
         if let Some(leader) = self.leader.as_mut() {
             leader.recent.insert(node);
@@ -1033,6 +1133,19 @@ impl<N: NodeId> Core<N> {
     /// The actions since the last call, in order.
     pub fn take_actions(&mut self) -> Vec<Action<N>> {
         self.close_write();
+        // An idle leader's heartbeats start again once a follower is not
+        // caught up: entries or a commit it has not acknowledged, an
+        // append or a snapshot that failed.
+        if self.role == Role::Leader && self.election_deadline == u64::MAX {
+            let me = self.cfg.me;
+            if self
+                .replication_peers()
+                .into_iter()
+                .any(|peer| peer != me && !self.caught_up(peer))
+            {
+                self.election_deadline = self.now + self.cfg.heartbeat_interval_ms;
+            }
+        }
         let state = (self.term, self.role, self.seen_leader);
         if self.announced != Some(state) {
             self.announced = Some(state);
@@ -1466,6 +1579,11 @@ impl<N: NodeId> Core<N> {
         // stopped hearing it over a lossy link must not win.
         if next_term <= self.term || self.role == Role::Leader {
             self.send(from, refuse);
+            // A member whose deadline lapsed hears its leader at once.
+            if self.role == Role::Leader && self.replication_peers().contains(&from) {
+                let round = self.leader.as_ref().map_or(0, |leader| leader.round);
+                self.heartbeat_to(from, round);
+            }
             return;
         }
         if let Some(heard) = self.last_heard_leader
@@ -1736,6 +1854,8 @@ impl<N: NodeId> Core<N> {
         *acked = (*acked).max(round);
         match result {
             AppendResult::Matched { matched } => {
+                let acked = leader.acked_commit.entry(from).or_insert(0);
+                *acked = (*acked).max(commit.min(matched));
                 let previous = leader.match_index.get(&from).copied().unwrap_or(0);
                 if matched > previous {
                     leader.match_index.insert(from, matched);
@@ -1802,7 +1922,6 @@ impl<N: NodeId> Core<N> {
     }
 
     fn send_heartbeats(&mut self) {
-        let term = self.term;
         let me = self.cfg.me;
         let peers = self.replication_peers();
         let round = {
@@ -1812,36 +1931,69 @@ impl<N: NodeId> Core<N> {
             leader.round += 1;
             leader.round
         };
+        // A read needs a round every member answers.
+        let every = self.cfg.idle_heartbeats || !self.reads.is_empty();
+        let mut sent = false;
         for peer in peers {
-            if peer == me {
+            if peer == me || (!every && self.caught_up(peer)) {
                 continue;
             }
-            let (next, matched) = {
-                let leader = self.leader.as_ref().expect("leader");
-                (
-                    leader.next_index.get(&peer).copied().unwrap_or(1),
-                    leader.match_index.get(&peer).copied().unwrap_or(0),
-                )
-            };
-            let prev_index = next.saturating_sub(1).max(self.log.snap_index());
-            let prev_term = self.log.term_at(prev_index).unwrap_or(0);
-            let commit = self.commit.min(matched);
-            self.commit_sent(peer, commit);
-            self.send(
-                peer,
-                Message::Append {
-                    term,
-                    leader: me,
-                    prev_index,
-                    prev_term,
-                    commit,
-                    round,
-                    entries: Vec::new(),
-                },
-            );
-            self.replicate_to(peer);
+            self.heartbeat_to(peer, round);
+            sent = true;
         }
-        self.election_deadline = self.now + self.cfg.heartbeat_interval_ms;
+        self.election_deadline = if every || sent {
+            self.now + self.cfg.heartbeat_interval_ms
+        } else {
+            u64::MAX
+        };
+    }
+
+    /// Send `peer` an append with no entries in `round`, carrying the
+    /// commit it holds the entries for, then whatever entries it lacks.
+    fn heartbeat_to(&mut self, peer: N, round: u64) {
+        let (term, me) = (self.term, self.cfg.me);
+        let Some(leader) = self.leader.as_ref() else {
+            return;
+        };
+        let next = leader.next_index.get(&peer).copied().unwrap_or(1);
+        let matched = leader.match_index.get(&peer).copied().unwrap_or(0);
+        let prev_index = next.saturating_sub(1).max(self.log.snap_index());
+        let prev_term = self.log.term_at(prev_index).unwrap_or(0);
+        let commit = self.commit.min(matched);
+        self.commit_sent(peer, commit);
+        self.send(
+            peer,
+            Message::Append {
+                term,
+                leader: me,
+                prev_index,
+                prev_term,
+                commit,
+                round,
+                entries: Vec::new(),
+            },
+        );
+        self.replicate_to(peer);
+    }
+
+    /// Whether an idle leader may leave `peer` without heartbeats: it
+    /// acknowledged every entry and the commit, with nothing on its way to
+    /// it, or its node has gone silent.
+    fn caught_up(&self, peer: N) -> bool {
+        let Some(leader) = self.leader.as_ref() else {
+            return false;
+        };
+        // A transfer's target hears each round, so a lost TimeoutNow is
+        // sent again with its next answer.
+        if leader.transfer.is_some_and(|(target, _)| target == peer) {
+            return false;
+        }
+        leader.silent.contains(&peer)
+            || (leader.match_index.get(&peer).copied().unwrap_or(0) >= self.log.last_index()
+                && leader.acked_commit.get(&peer).copied().unwrap_or(0) >= self.commit
+                && !leader.in_flight.contains_key(&peer)
+                && !leader.snapshotting.contains_key(&peer)
+                && !leader.loading.contains(&peer))
     }
 
     fn replication_peers(&self) -> Vec<N> {
@@ -2233,6 +2385,13 @@ impl<N: NodeId> Core<N> {
         if self.effective.is_joint() || self.retirement_final_index.is_some() {
             return Err(ChangeMembershipError::InProgress);
         }
+        // A solo leader ran no check-quorum: its window starts now.
+        if self.is_solo() {
+            self.check_quorum_due = self.now + self.cfg.election_timeout_ms.1;
+            if let Some(leader) = self.leader.as_mut() {
+                leader.recent.clear();
+            }
+        }
         if members.is_empty() {
             return Err(ChangeMembershipError::EmptyConfig);
         }
@@ -2275,11 +2434,17 @@ impl<N: NodeId> Core<N> {
         if self.commit < pending {
             return;
         }
-        let Some(entry) = self.log.entry(pending) else {
-            return;
-        };
-        let EntryKind::ConfigChange { joint_old, members } = entry.kind else {
-            return;
+        // An entry compacted away is the joint configuration in effect, or,
+        // pending past it, its final one.
+        let (joint_old, members) = match self.log.entry(pending).map(|entry| entry.kind) {
+            Some(EntryKind::ConfigChange { joint_old, members }) => (joint_old, members),
+            None if pending <= self.log.snap_index() => {
+                let joint_old = (Some(pending) == self.active_config_index)
+                    .then(|| self.effective.joint_old.clone())
+                    .flatten();
+                (joint_old, self.effective.current.clone())
+            }
+            _ => return,
         };
         if joint_old.is_none() {
             self.write_active_config(ActiveConfigRecord {
@@ -2608,12 +2773,18 @@ impl<N: NodeId> Core<N> {
         let live_above = keeps_suffix && self.log.configs().next_back().is_some();
         let from_snapshot =
             !live_above && configuration.is_some_and(|configuration| configuration.index <= index);
+        // A joint configuration the snapshot holds stays pending at its
+        // entry, compacted or not, so this replica, leading, finalizes it.
         if from_snapshot {
             self.effective = ActiveConfig {
                 current: record.current.clone(),
                 joint_old: record.joint_old.clone(),
             };
-            self.pending_joint_entry = None;
+            self.pending_joint_entry = if self.effective.is_joint() {
+                record.log_index
+            } else {
+                None
+            };
             self.rebuild_leader_tracking();
         } else if self.pending_joint_entry.is_some_and(|at| at <= index) {
             self.pending_joint_entry = None;
@@ -2630,20 +2801,36 @@ impl<N: NodeId> Core<N> {
         let commit = self.commit;
         let me = self.cfg.me;
         let Some(latest) = configs.last() else {
-            if let Some(record) = persisted {
-                self.effective = ActiveConfig {
-                    current: record.current,
-                    joint_old: record.joint_old,
-                };
-                self.active_config_index = record.log_index;
-            } else {
-                let (index, start) = self
-                    .log_start_config
-                    .clone()
-                    .unwrap_or_else(|| (0, ActiveConfig::steady(self.cfg.members.clone())));
-                self.effective = start;
-                self.active_config_index = Some(index);
+            // The later of the persisted record and the configuration at
+            // the log's start: a crash can lose the record's update after
+            // a compaction past a newer configuration made it durable.
+            let start = self.log_start_config.clone();
+            match persisted {
+                Some(record)
+                    if start
+                        .as_ref()
+                        .is_none_or(|(index, _)| record.log_index.unwrap_or(0) >= *index) =>
+                {
+                    self.effective = ActiveConfig {
+                        current: record.current,
+                        joint_old: record.joint_old,
+                    };
+                    self.active_config_index = record.log_index;
+                }
+                _ => {
+                    let (index, start) = start
+                        .unwrap_or_else(|| (0, ActiveConfig::steady(self.cfg.members.clone())));
+                    self.effective = start;
+                    self.active_config_index = Some(index);
+                }
             }
+            // A joint one stays pending at its entry, for a leader to
+            // finalize.
+            self.pending_joint_entry = if self.effective.is_joint() {
+                self.active_config_index
+            } else {
+                None
+            };
             return;
         };
         let EntryKind::ConfigChange { joint_old, members } = &latest.kind else {
