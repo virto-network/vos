@@ -5602,3 +5602,244 @@ version if rolling upgrades are ever promised.
 
 **3.9 is done.** What it leaves for 3.10 is in the lists above and in
 3.8's.
+
+
+
+## Step 3.10: acceptance
+
+### Design
+
+3.10 measures section 14's budgets as the plan's table states them:
+- three `vos node run` processes, each on its own data directory (the
+  shared disk a caveat), talking QUIC;
+- clients over HTTP.
+
+It then works on the ones that miss until they pass, or until the levers
+are spent and the owner decides. Split in three:
+- **3.10a:** the bench, and the table measured as the code stands, with
+  the costs attributed;
+- **3.10b:** the levers, one at a time, each kept only if it moves the
+  cost it targets by the method below;
+- **3.10c:** section 14 and the slice's defaults updated, every carried
+  item closed or carried on to a named slice, and the gates checked.
+
+**Where it starts** (the in-process bench of 3.8b; three nodes in one
+process; 64 agents × 16 sessions; 7 executors per node):
+- 31k commits/s at p99 57 ms;
+- 12.7 cores busy, about 410 µs of CPU per commit across the three
+  nodes.
+
+A first profile of that run (perf, 999 Hz, no call graphs):
+
+| Where | Share |
+|---|---|
+| the agent program's guest code (JIT) | 31–34% |
+| libc: memory copies and fills, malloc and free | 20–22% |
+| fjall point reads (memtable search, snapshot versions) | about 15% |
+| the rest: the PVM runtime, QUIC, the executors, Raft | about 30% |
+
+Without callers it names no lever by itself. 3.10a attributes it first.
+
+#### 3.10a The bench, and the table as it stands
+
+**The machine, pinned.** Section 14's budgets are per node, on three
+LAN machines; here one laptop holds the three nodes and the clients.
+- **Each node process is pinned** (`taskset`) to its own cores, the same
+  mix for each:
+  - two P-cores, four threads;
+  - two E-cores.
+
+  On the reference laptop: node 1 on CPUs 0, 5, 1, 2, 12, 13; node 2 on
+  3, 4, 6, 7, 14, 15; node 3 on 8–11, 16, 17.
+  - Not quite the same mix: the two 4.8 GHz P-cores (1/2, 3/4) went to
+    nodes 1 and 2, and node 3's run at 4.5 GHz.
+  - It matters at light load, so each light-load run notes which node
+    leads its agent.
+- **The driver** has the rest: its timing threads on the E-cores 18 and
+  19, the rest of it on 18–21.
+- **The executor count** follows the affinity mask
+  (`available_parallelism` honours it), so a node uses what it is
+  given, as on a machine of its own.
+- **The pass criterion:** a budget passes when one pinned node, a third
+  of the laptop, carries its share.
+  - CPU per commit is reported by role, leader and follower, so the
+    numbers translate to a machine per node.
+  - The shared disk stays a caveat.
+
+**The bench** (`node/cli/benches/processes.rs`; not run by `just ci`):
+- **The nodes:** three release builds of `vos node run`, each with its
+  own data directory under `target/`, the peer endpoints bound directly.
+- **The driver** is async (smol), with few threads:
+  - a task per session, over a connection it keeps;
+  - every call's body signed before the timed window, as sessions and
+    sequences are known in advance;
+  - for long runs (the soak), signed ahead into a bounded queue instead,
+    that CPU counted as the driver's;
+  - each session's t0 set just before its first call, so no session is
+    timed further from it than the skew;
+  - its own CPU is reported.
+- **Its send lag is reported:** each open-loop run gives the p50 and p99
+  of a call's actual send time minus its scheduled one. A run whose p99
+  lag passes 0.5 ms is invalid. A late driver would otherwise count as
+  the nodes' latency.
+- **Calls go to the agent's leader,** following redirects, through
+  ingress: signature check and lanes included.
+
+**Load, and how it is timed:**
+- **Open loop for every latency.** Calls are sent at an offered rate,
+  each timed from when it was scheduled to go, not from when it went: a
+  slow call does not delay the next and hide the queue. Each session's
+  interval is far above the latency it measures, so each has at most one
+  call in flight (e.g. 256 sessions at 10k/s).
+- **Closed loop only for the most commits per second.**
+
+**What it reports,** each from runs after a warm-up, on a store
+pre-populated by running the load itself (never by writing rows past
+Raft) until it is in the steady state the run would leave:
+- **One replicated agent:**
+  - the most commits per second, closed loop, swept over sessions;
+  - at half load, max(10k/s, half that most), open loop, a call's p50
+    and p99, client to answer;
+  - beside it, the node's own batch-to-commit, from a new operator
+    stats route: histograms of the writer's and the leader loop's
+    times, read as deltas over the window, so they give percentiles.
+- **64 active agents:**
+  - the most commits per second, closed loop;
+  - open loop at 40k/s offered, p50 and p99;
+  - the knee: the highest offered rate whose p99 stays ≤ 20 ms.
+- **A quiet node:** one session, one call at a time, p50 and p99 over
+  HTTP (the "request latency on a quiet node ≤ 5 ms at p99" row).
+- **Idle groups:** 1,000 idle agents per node. For each process over
+  10 s, from `/proc`: its CPU as a share of one core, its threads and its
+  RSS.
+- **A query on a follower:** the counter's value at applied consistency,
+  open loop, client to answer, p50 and p99. Slice 2's node-path measure
+  is repeated in process (`benches/acceptance.rs`).
+  - Which percentile the budget means is the owner's open decision from
+    slice 2. Both are reported; if p99, the query's tail joins the
+    levers.
+- **Table reads under continuous writes:** in process, a 10M-row table.
+  - Point reads are timed while writes run at the 64-agent run's rate,
+    in rows per second, with that run's mix of rows (log entries,
+    applied state, sessions).
+  - In the steady state compaction keeps, not right after a load.
+- **Mass failover:** the node leading the most groups is killed.
+  - The time until every group has a leader again, and until every
+    node's directory agrees: the `recording` lock and the directory's
+    convergence, which 3.8b left to 3.10.
+  - Then its restart: the time to open and catch up.
+- **A soak:** the 64-agent load at half its knee for 10 minutes or more.
+  No hot path may grow with history: CPU per commit and p99 over the last
+  minute must stay within 10% of the first minute's, after the warm-up.
+  A bigger difference is either explained or a failure.
+- **Memory:** each process's RSS in every active run.
+- **TLS:** the 64-agent run once with TLS on ingress, its production
+  default off loopback.
+- **Exactly once:** the checker and the fault suite pass (3.9).
+- **Slice 2's rows** the levers touch (invocation, fixed cost per refine,
+  pooled acquire) are re-measured with `benches/acceptance.rs`.
+
+**Attribution, before any lever is chosen:**
+- **Call graphs:** a build with frame pointers
+  (`-C force-frame-pointers=yes`), or perf's DWARF unwinding.
+- **The JIT's code named:** the PVM JIT writes a perf map
+  (`/tmp/perf-<pid>.map`) behind an environment variable, opt-in.
+  - It is created new (never following a link), with mode 0600, as it
+    tells where code lies.
+- **An off-CPU profile** (scheduler waits: locks, fsync, channels).
+- **The same load on fewer pinned cores,** to tell a saturated CPU from
+  a queue or a lock. The lever is CPU per commit only if that holds.
+
+Nothing is optimized in 3.10a. Its results go into a table like section
+14's, with the earlier numbers beside them.
+
+#### 3.10b The levers
+
+**The method, for each lever:**
+- **The metrics:** instructions and CPU per commit (`perf stat`), at a
+  fixed offered load below saturation; and the lever's own target,
+  measured directly (reads per run, reset µs, allocations per input).
+- **At least five runs per variant,** interleaved A/B, on the pinned
+  cores, with fresh data and a warm-up; the performance governor where
+  the machine allows it.
+- **Kept only if its median moves past the other's spread** (or a rank
+  test says so). Else it is reverted, and the result recorded.
+- **After each kept lever,** the safety gates again: the checker loop,
+  several fault-suite seeds, the simulator's chaos runs and the crash
+  tests.
+- **The budgets** are judged on throughput and p99 only at the end.
+
+**The candidates,** ordered by 3.10a's attribution. As the first profile
+suggests them:
+1. **Store reads, scoped to a batch.** They keep fjall's snapshot
+   consistency:
+   - one snapshot shared by refine and the dry run;
+   - a memo of the rows read, valid for that snapshot only;
+   - the apply reading its entry from the core's cache, and its epoch
+     from memory, rather than a snapshot per apply.
+2. **Machine setup and reset**, if the attribution puts the memory
+   copies and fills there.
+   - Resetting only dirty pages, or keeping an agent's machine warm.
+   - Replicas must run alike: a page left dirty would make a leader's
+     dry run and a follower's apply differ.
+   - So it comes with a differential test (a warm, reset machine against
+     a fresh one, over random inputs), the fault suite's store
+     comparison, and a memory bound at 1,000 agents.
+3. **Allocation** on the per-input path.
+4. **The agent program's own work** per input: the session bookkeeping
+   the default agent does in refine and accumulate.
+   - Measured per input; changed only where it is waste, never its
+     semantics.
+   - The JIT's share is the largest, so this may come first.
+5. **A row cache per agent across batches,** last, and only with every
+   guard below. The leader's apply reuses its dry run's writes, so a
+   stale read there would make replicas diverge, not just waste a
+   batch.
+   - Every reader (refine, dry run, query) sees exactly one applied
+     index.
+   - It is updated only after a committed apply's store commit
+     succeeds: never by a refine or a dry run (a deposed leader's dry
+     run never commits).
+   - It is keyed by epoch, and dropped with a snapshot switch, a
+     retirement, a halt and a restart, at once.
+   - Its memory is bounded.
+   - A shadow mode compares every read with the store's, under the
+     checker and the fault suite.
+6. **Pipelined refines,** only if the single-agent budget misses once
+   CPU per commit has come down, as the plan says, with their own design
+   and review.
+
+**Carried items, taken where they are levers:**
+- message batching across agents;
+- one heartbeat round per linearizable read;
+- the leader's one task and one channel per queued call.
+
+#### 3.10c Closing the slice
+
+- **Section 14's rows** updated with 3.10's numbers, each with the setup
+  it was measured on.
+- **The defaults:** the plan's table disagrees with the code in places,
+  and each is settled, with its reason:
+
+  | Default | Plan | Code |
+  |---|---|---|
+  | Session skew | 5 min | 60 s |
+  | Live sessions | 1M | 65,536 |
+  | Compaction | 4,096 entries or 64 MiB | 1,024, keeping 256 |
+  | Quiescence | after 4 idle intervals | the pair heartbeat (3.8) |
+
+  The rest (heartbeat, elections, thresholds, caps) are confirmed or
+  moved.
+- **Each carried item closed, or carried to a named slice:**
+  - the directory's convergence and the `recording` lock, from 3.10a's
+    failover run;
+  - the confirmation entry's overhead;
+  - install and role commands without a deadline at a stalled leader;
+  - liveness frames late within a surviving connection;
+  - the wire version;
+  - fast retransmit on a dropped gap (3.9);
+  - fan-in past a receiver's cap (3.8b).
+- **The gates** (the plan's "Gates") checked one by one, ending with
+  `just ci-full`.
+
+After 3.10, the slice's end review, by Fable 5.1.
