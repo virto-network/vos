@@ -38,6 +38,8 @@ rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"]
 proptest = "1"
 tempfile = "3"
 vos-pvm-compiler = { workspace = true }
+# The node's binary runs on mimalloc: its tests run on it too.
+mimalloc = "0.1.52"
 
 [[test]]
 name = "crash"

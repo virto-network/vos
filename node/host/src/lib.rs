@@ -2,6 +2,12 @@
 //! runs (`Node`).
 
 pub mod blobs;
+
+/// The allocator the node's binary runs on.
+#[cfg(test)]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod calls;
 pub mod client;
 mod dispatch;

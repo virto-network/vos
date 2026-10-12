@@ -1,6 +1,10 @@
 //! TLS on the client ingress: plain HTTP serves loopback addresses only; a
 //! client pins the node's key, or trusts a CA, and nothing else.
 
+/// The allocator the node's binary runs on.
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::path::Path;
 
 use ed25519_dalek::SigningKey;

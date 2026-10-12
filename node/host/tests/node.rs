@@ -3,6 +3,10 @@
 //! sent, admission, failing refines, and messages between agents applied
 //! exactly once across stops and restarts.
 
+/// The allocator the node's binary runs on.
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};

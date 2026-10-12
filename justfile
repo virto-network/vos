@@ -46,6 +46,10 @@ build-guests: build-settle
 build-settle:
     cd pvm/proof/settlement-verifier; cargo build --release --target riscv64em-vos.json -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem --features pvm-settle --bin settle
 
+# The tests run on mimalloc as the node's binary does, and as it does with
+# transparent huge pages off.
+export MIMALLOC_ALLOW_THP := "0"
+
 fmt-check:
     cargo fmt --all -- --check
 
@@ -53,6 +57,7 @@ clippy:
     cargo clippy --workspace --all-targets --quiet -- -D warnings
     cargo clippy -p vos-pvm-bench --features prove --all-targets --quiet -- -D warnings
     cargo clippy -p vos-cli --features faults --all-targets --quiet -- -D warnings
+    cargo clippy -p vos-cli --no-default-features --all-targets --quiet -- -D warnings
 
 # Fails on any JAR remnant in the PVM crates: its ISA and gas modes, opcodes,
 # exits, capability surface, linker entry points and fixtures.

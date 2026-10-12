@@ -14,6 +14,10 @@
 //!
 //! The seed is printed; `EXACTLY_ONCE_SEED` runs one again.
 
+/// The allocator the node's binary runs on.
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};

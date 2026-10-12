@@ -16,6 +16,10 @@
 //! - no staged row of an unfinished install is visible;
 //! - every install reported survives, but for a tear's reach.
 
+/// The allocator the node's binary runs on.
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};

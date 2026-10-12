@@ -2,6 +2,10 @@
 //! each arrival passes the checks before it reaches a group, here a real
 //! consensus core.
 
+/// The allocator the node's binary runs on.
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use proptest::prelude::*;
 use vos_net::Class;
 use vos_node::peer::{self, Drops, Refusal, decode, from_wire, to_wire};

@@ -10,11 +10,16 @@ name = "vos"
 path = "src/main.rs"
 
 [features]
+default = ["mimalloc"]
 # A `vos` that injects the faults `VOS_FAULTS` names: for the process
 # tests only.
 faults = ["vos-node/faults"]
+# mimalloc as the process's allocator; without it, the system's (which
+# heap tools such as heaptrack, valgrind and sanitizers see).
+mimalloc = ["dep:mimalloc", "dep:libc"]
 
 [dependencies]
+mimalloc = { version = "0.1.52", optional = true }
 clap = { version = "4", features = ["derive", "env"] }
 ed25519-dalek = "2"
 getrandom = "0.2"
@@ -24,6 +29,9 @@ vos-node = { path = "../host" }
 vos-pvm = { workspace = true }
 vos-pvm-compiler = { workspace = true }
 vos-wire = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
 futures-rustls = { version = "0.26", default-features = false, features = ["ring"] }

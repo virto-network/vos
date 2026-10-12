@@ -185,6 +185,20 @@ fn driver_cpu() -> f64 {
     stat_cpu(&std::fs::read_to_string("/proc/self/stat").unwrap_or_default())
 }
 
+/// The machine's transparent huge page counters (`/proc/vmstat`'s
+/// `thp_*`), by name.
+fn transparent_huge_pages() -> Vec<(String, u64)> {
+    std::fs::read_to_string("/proc/vmstat")
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.starts_with("thp_"))
+        .filter_map(|line| {
+            let (name, value) = line.split_once(' ')?;
+            Some((name.to_string(), value.trim().parse().ok()?))
+        })
+        .collect()
+}
+
 /// The whole machine's busy CPU so far, every process's, in seconds
 /// (`/proc/stat`, all but idle and waiting on IO).
 fn machine_cpu() -> f64 {
@@ -306,6 +320,17 @@ impl Process {
             sum("vos-net"),
             sum("fjall"),
         ]
+    }
+
+    /// Its anonymous memory backed by huge pages, in MiB.
+    fn huge_pages(&self) -> u64 {
+        std::fs::read_to_string(format!("/proc/{}/smaps_rollup", self.pid()))
+            .unwrap_or_default()
+            .lines()
+            .find_map(|line| line.strip_prefix("AnonHugePages:"))
+            .and_then(|value| value.split_whitespace().next()?.parse::<u64>().ok())
+            .unwrap_or(0)
+            / 1024
     }
 
     /// Its threads and its resident memory in MiB.
@@ -1898,6 +1923,7 @@ fn soak(space: &Space, agents: &[Signed], next: &mut dyn FnMut(u64) -> u64) {
         })
         .collect();
     quiet(space);
+    let huge_before = transparent_huge_pages();
     let measured: Vec<Measured> =
         drive_windows(space, plans, Pace::Open(interval), window, windows as usize)
             .into_iter()
@@ -1911,6 +1937,35 @@ fn soak(space: &Space, agents: &[Signed], next: &mut dyn FnMut(u64) -> u64) {
                 )
             })
             .collect();
+    // Memory under load: each node's, and what transparent huge pages cost
+    // the machine meanwhile (khugepaged's CPU is not the nodes').
+    let memory: Vec<String> = space
+        .processes
+        .iter()
+        .map(|process| {
+            let (_, rss) = process.threads_and_rss();
+            format!(
+                "node {} {rss} MiB ({} MiB in huge pages)",
+                process.number,
+                process.huge_pages()
+            )
+        })
+        .collect();
+    let huge: Vec<String> = transparent_huge_pages()
+        .into_iter()
+        .zip(huge_before)
+        .filter(|((_, after), (_, before))| after != before)
+        .map(|((name, after), (_, before))| format!("{name} +{}", after - before))
+        .collect();
+    println!(
+        "soak memory: {}; huge pages over the run: {}",
+        memory.join(", "),
+        if huge.is_empty() {
+            "none".to_string()
+        } else {
+            huge.join(", ")
+        }
+    );
     let clean: Vec<&Measured> = measured
         .iter()
         .skip(warm)

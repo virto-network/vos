@@ -2,6 +2,10 @@
 //! counter actor: client-named sessions, signed calls in their sequences,
 //! the reply window, expiry, and the operator's token.
 
+/// The allocator the node's binary runs on.
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

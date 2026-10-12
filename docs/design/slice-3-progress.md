@@ -6957,3 +6957,69 @@ comes first:
   and a node stopped while a job holds its state opens again on the same
   directory at once. Without the close in `stop`, that open fails with
   the store locked.
+
+#### 3.10b3: mimalloc as the node's allocator
+
+**Why:** libc's allocation was 13% of a loaded node's CPU in 3.10a2's
+profile, and in 3.10b0's screening mimalloc lowered CPU per commit by
+4–7%.
+
+**The verifying-key cache** (lever 2 in the order) is skipped on
+3.10a2's microbenchmark: a cached key saves nothing measurable on a
+P-core.
+
+**The change:**
+- `vos-cli`'s default feature `mimalloc` makes it the `vos` binary's
+  global allocator. A build without the feature keeps the system's, which
+  heap tools (heaptrack, valgrind, sanitizers) see.
+- With it, the binary turns transparent huge pages off for its process
+  at start (`PR_SET_THP_DISABLE`), as mimalloc's own `allow_thp=0` does.
+- vos-node's unit and integration tests run on mimalloc too, as the
+  binary does.
+- The crate builds mimalloc 3.3.2.
+
+**Measured** on tmpfs: the 64 agents at 6k/s, continuous; 5-minute
+soaks with 100 s of warm-up, four steady windows each; interleaved. CPU
+per commit and memory are from the bench; instructions and cycles from
+`perf stat` (user space only: the kernel's counts are not open to an
+unprivileged user here) over the steady windows.
+
+| Build | Runs | CPU per commit | Cycles per commit | Instructions per commit | p99 | Resident per node |
+|---|---|---|---|---|---|---|
+| system allocator | 8 | 821–874 µs | 2,471k–2,520k | 2,289k–2,300k | 4.9–6.7 ms | 452–456 MiB |
+| mimalloc | 5 | 759–790 µs | 2,369k–2,391k | 2,267k–2,272k | 4.1–4.6 ms | 530–544 MiB |
+| system allocator, no huge pages | 3 | 844–857 µs | 2,538k–2,551k | 2,292k–2,293k | 5.4–7.2 ms | 449–453 MiB |
+| mimalloc, no huge pages | 6 | 763–787 µs | 2,414k–2,431k | 2,268k–2,273k | 4.3–4.7 ms | 483–491 MiB |
+
+- **mimalloc does about 8% less CPU per commit,** with or without huge
+  pages: about 5% fewer cycles a commit (4% without huge pages) for 1%
+  fewer instructions, so it saves stalls more than work, and kernel time
+  besides. Its p99 is lower too. The ranges do not overlap.
+- **With huge pages, it kept about a fifth more memory resident,** past
+  the limit set before measuring (10%). It also split many more huge pages
+  (about 800 deferred splits a run against 7).
+- **Without huge pages** its memory is 8% above the system allocator's
+  (one pair 9.3%), within the limit.
+- **Huge pages off is not free:** about 2% more cycles a commit for
+  either allocator (2,471k–2,520k against 2,538k–2,551k for the system
+  allocator; 2,369k–2,391k against 2,414k–2,431k for mimalloc). The ranges
+  do not overlap, though CPU per commit's wider spread hides it. Likely
+  TLB misses on the heap and the binary's text.
+- **What ships, against what was:** mimalloc without huge pages, against
+  the system allocator with them: about 3% fewer cycles and 8% less CPU a
+  commit, and 8% more memory (at five minutes). **Kept, without huge
+  pages,** subject to the 30-minute soaks below.
+- **The tests** run on mimalloc with huge pages off too
+  (`MIMALLOC_ALLOW_THP=0` in the `justfile`); ci also lints the build
+  without the feature, the one heap tools use.
+- **The final build** (mimalloc, huge pages turned off by the binary
+  itself), three runs interleaved with the system allocator's three:
+  CPU per commit 772, 784 and 776 µs against 827, 828 and 791; p99
+  4.3–4.5 ms against 4.8–5.4 ms; 483–494 MiB a node against 452–456 MiB
+  (+8%). The binary's nodes report `THP_enabled: 0`.
+- **Thirty minutes each** (tmpfs, the same load, after 150 s of
+  warm-up): both soaks hold. Steady CPU per commit was 777 µs with
+  mimalloc and 835 µs with the system allocator; p99 5.0 and 5.8 ms. At
+  the end, mimalloc's nodes held 897–904 MiB and the system allocator's
+  924–931 MiB. Both grow with the run's data: the extra 8% after five
+  minutes does not last, and after thirty mimalloc holds about 3% less.

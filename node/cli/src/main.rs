@@ -18,6 +18,34 @@ use vos_wire::ingress::{Answer, Consistency, Install};
 use vos_wire::result::Outcome;
 use vos_wire::schema::Schema;
 
+/// mimalloc, unless built without it: a thread frees memory another thread
+/// allocated without taking that thread's lock, as the node's executors,
+/// writer and store workers do all the time.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// With mimalloc, transparent huge pages are off for the process. Backing
+/// its arenas with 2 MiB pages kept about a fifth more of a node resident
+/// under load; without them it holds about what the system allocator does
+/// with them, for about 8% less CPU a commit. Off, they cost about 2% more
+/// cycles (TLB misses), for either allocator. Processes it starts inherit
+/// the setting: it spawns none today.
+fn huge_pages_off() {
+    #[cfg(all(feature = "mimalloc", target_os = "linux"))]
+    {
+        let (on, none): (libc::c_ulong, libc::c_ulong) = (1, 0);
+        // SAFETY: it sets a flag on this process; no memory is passed.
+        let set = unsafe { libc::prctl(libc::PR_SET_THP_DISABLE, on, none, none, none) };
+        if set != 0 {
+            eprintln!(
+                "vos: transparent huge pages stay on ({}): more memory stays resident",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+
 /// The version, saying so when the build injects faults.
 const VERSION: &str = if cfg!(feature = "faults") {
     concat!(env!("CARGO_PKG_VERSION"), " (faults: a test build)")
@@ -276,6 +304,7 @@ struct CallArgs {
 }
 
 fn main() -> ExitCode {
+    huge_pages_off();
     match run(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
