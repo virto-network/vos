@@ -71,6 +71,8 @@ struct LinkedElf {
     stack_size: u32,
     /// Heap pages
     heap_pages: u32,
+    /// Function symbols (`STT_FUNC`): each one's entry vaddr and name.
+    functions: Vec<(u64, String)>,
     /// PCREL_HI20: AUIPC instruction vaddr → resolved data address.
     /// The AUIPC itself should emit load_imm with this address.
     hi20_targets: HashMap<u64, u64>,
@@ -122,6 +124,8 @@ struct TranspiledElf {
     stack_size: u32,
     /// Zeroed heap pages beyond `rw_data`.
     heap_pages: u32,
+    /// Each function's first PVM instruction, and its name, by offset.
+    functions: crate::Functions,
 }
 
 /// `Z_Z` — the GP initialization zone size (2¹⁶).
@@ -165,6 +169,17 @@ fn zone_round(x: u64) -> u64 {
 /// the stack is SP-relative).
 pub fn link_elf_spi(elf_data: &[u8]) -> Result<Vec<u8>, TranspileError> {
     spi_blob(transpile_elf(elf_data)?)
+}
+
+/// [`link_elf_spi`], and each function's first PVM instruction in the
+/// blob's code, with its name (demangled), by offset: what a profiler
+/// names compiled code by.
+pub fn link_elf_spi_with_symbols(
+    elf_data: &[u8],
+) -> Result<(Vec<u8>, crate::Functions), TranspileError> {
+    let transpiled = transpile_elf(elf_data)?;
+    let functions = transpiled.functions.clone();
+    Ok((spi_blob(transpiled)?, functions))
 }
 
 /// Lay translated code and data out as a standard program.
@@ -317,11 +332,24 @@ fn transpile_linked(elf: &LinkedElf) -> Result<TranspiledElf, TranspileError> {
 
     crate::peephole_fuse_load_imm_alu(&mut ctx.code, &mut ctx.bitmask, &ctx.jump_table);
     crate::peephole_fuse_load_imm_memory(&mut ctx.code, &mut ctx.bitmask, &ctx.jump_table);
-    crate::ensure_branch_targets_are_block_starts(
+    // The pass may insert instructions: the functions' offsets move with it.
+    let mut moved: Option<Vec<u32>> = None;
+    crate::ensure_branch_targets_with_pc_map(
         &mut ctx.code,
         &mut ctx.bitmask,
         &mut ctx.jump_table,
+        |offsets| moved = Some(offsets.to_vec()),
     );
+    let mut functions: Vec<(u32, String)> = elf
+        .functions
+        .iter()
+        .filter_map(|(vaddr, name)| {
+            let at = *ctx.address_map.get(vaddr)?;
+            let at = moved.as_ref().map_or(at, |offsets| offsets[at as usize]);
+            Some((at, name.clone()))
+        })
+        .collect();
+    functions.sort();
 
     Ok(TranspiledElf {
         code: ctx.code,
@@ -334,6 +362,7 @@ fn transpile_linked(elf: &LinkedElf) -> Result<TranspiledElf, TranspileError> {
         rw_min: elf.rw_min,
         stack_size: elf.stack_size,
         heap_pages: elf.heap_pages,
+        functions,
     })
 }
 
@@ -467,6 +496,7 @@ fn parse_linked_elf(data: &[u8]) -> Result<LinkedElf, TranspileError> {
 
     // Parse symbol table
     let mut symbols_by_idx: Vec<(String, u64)> = Vec::new();
+    let mut functions: Vec<(u64, String)> = Vec::new();
     if let Some(si) = symtab_idx {
         let s = &sections[si];
         // Get associated string table
@@ -482,6 +512,7 @@ fn parse_linked_elf(data: &[u8]) -> Result<LinkedElf, TranspileError> {
                 break;
             }
             let st_name = u32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as usize;
+            let st_info = data[off + 4];
             let st_value = u64::from_le_bytes(data[off + 8..off + 16].try_into().unwrap());
 
             let name = {
@@ -496,6 +527,10 @@ fn parse_linked_elf(data: &[u8]) -> Result<LinkedElf, TranspileError> {
                 }
             };
 
+            // STT_FUNC, defined, named as source spells it.
+            if st_info & 0xf == 2 && st_value != 0 && !name.is_empty() {
+                functions.push((st_value, format!("{:#}", rustc_demangle::demangle(name))));
+            }
             symbols_by_idx.push((name.to_string(), st_value));
         }
     }
@@ -812,6 +847,7 @@ fn parse_linked_elf(data: &[u8]) -> Result<LinkedElf, TranspileError> {
         rw_min,
         stack_size: stack_size as u32,
         heap_pages,
+        functions,
         hi20_targets,
         lo12_targets,
         call_targets,
@@ -1302,6 +1338,7 @@ mod tests {
             rw_min: 0x2_0000,
             stack_size: 0x1_0000,
             heap_pages: 0,
+            functions: Vec::new(),
             hi20_targets: HashMap::new(),
             lo12_targets: HashMap::new(),
             call_targets: HashMap::from([(CALL_SITE, CALLEE)]),

@@ -130,6 +130,9 @@ pub struct CompileResult {
     pub block_gas_costs: Vec<u32>,
     pub trap_table: Vec<(u32, u32)>,
     pub exit_label_offset: u32,
+    /// The panic stub's offset: what the dispatch table holds for every PC
+    /// that is neither a gas-block start nor a resume point.
+    pub panic_offset: i32,
     /// If set, code is already mmap'd and mprotected as PROT_READ|PROT_EXEC.
     /// Skips the copy in NativeCode::new.
     pub mmap_ptr: Option<*mut u8>,
@@ -678,6 +681,7 @@ impl Compiler {
                     block_gas_costs: self.block_gas_costs,
                     trap_table,
                     exit_label_offset,
+                    panic_offset,
                     mmap_ptr: Some(ptr),
                     mmap_len: code_len,
                     mmap_cap,
@@ -691,6 +695,7 @@ impl Compiler {
                 block_gas_costs: self.block_gas_costs,
                 trap_table,
                 exit_label_offset,
+                panic_offset,
                 mmap_ptr: None,
                 mmap_len: 0,
                 mmap_cap: 0,

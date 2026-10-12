@@ -19,6 +19,8 @@ pub mod gas_sim;
 pub mod inner;
 pub mod instruction;
 pub mod interpreter;
+#[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+pub mod perf_map;
 #[cfg(feature = "std")]
 pub mod pool;
 pub mod precompile;

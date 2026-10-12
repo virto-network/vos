@@ -46,6 +46,17 @@ fn huge_pages_off() {
     }
 }
 
+/// With `VOS_PVM_PERF_MAP` set, the code the PVM compiles is named in
+/// `/tmp/perf-<pid>.map`, so perf attributes guest time to its programs.
+fn perf_map() {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if std::env::var_os("VOS_PVM_PERF_MAP").is_some()
+        && let Err(error) = vos_pvm::perf_map::enable()
+    {
+        eprintln!("vos: the PVM's perf map is off ({error})");
+    }
+}
+
 /// The version, saying so when the build injects faults.
 const VERSION: &str = if cfg!(feature = "faults") {
     concat!(env!("CARGO_PKG_VERSION"), " (faults: a test build)")
@@ -305,6 +316,7 @@ struct CallArgs {
 
 fn main() -> ExitCode {
     huge_pages_off();
+    perf_map();
     match run(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -521,10 +533,21 @@ fn operator_of(args: &OperatorArgs) -> Result<Operator, String> {
     Ok(Operator::new(&target, &token))
 }
 
-/// A standard program from an ELF built with the guest toolchain.
+/// A standard program from an ELF built with the guest toolchain. With the
+/// PVM's perf map on, its functions are named in it.
 fn link(path: &Path) -> Result<Vec<u8>, String> {
     let elf = std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    vos_pvm_compiler::link_elf_spi(&elf).map_err(|error| format!("{}: {error:?}", path.display()))
+    let failed = |error| format!("{}: {error:?}", path.display());
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if vos_pvm::perf_map::enabled() {
+        let (blob, functions) =
+            vos_pvm_compiler::link_elf_spi_with_symbols(&elf).map_err(failed)?;
+        if let Some(program) = vos_pvm::spi::parse_standard_program(&blob) {
+            vos_pvm::perf_map::register(&program.code.code, functions);
+        }
+        return Ok(blob);
+    }
+    vos_pvm_compiler::link_elf_spi(&elf).map_err(failed)
 }
 
 fn schema_of(program: &[u8]) -> Result<Schema, String> {

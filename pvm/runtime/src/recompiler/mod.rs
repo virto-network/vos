@@ -195,6 +195,8 @@ pub struct CompiledCode {
     pub block_gas_costs: Vec<u32>,
     pub trap_table: Vec<(u32, u32)>,
     pub exit_label_offset: u32,
+    /// What the dispatch table holds for a PC with no entry of its own.
+    pub panic_offset: i32,
     /// Strict basic-block starts ({0} ∪ post-terminator), one byte per code
     /// byte position. The runtime djump validation reads this through
     /// `JitContext.bb_starts`.
@@ -302,6 +304,15 @@ pub fn compile_code(
     } else {
         NativeCode::new(&result.native_code)?
     };
+    if crate::perf_map::enabled() {
+        crate::perf_map::name_program(
+            code,
+            native_code.ptr,
+            native_code.len,
+            &dispatch_table,
+            result.panic_offset,
+        );
+    }
 
     Ok(CompiledCode {
         native_code,
@@ -311,6 +322,7 @@ pub fn compile_code(
         block_gas_costs: result.block_gas_costs,
         trap_table: result.trap_table,
         exit_label_offset: result.exit_label_offset,
+        panic_offset: result.panic_offset,
         block_starts,
     })
 }

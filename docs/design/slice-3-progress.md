@@ -7957,3 +7957,67 @@ parallel thread `fifo_ttl_then_limit_additional_drops_blob_unit` set it
 to 10,000,000 s. That expired both of `fifo_ttl`'s tables. The vendored
 crate's test clock is now per thread (`VENDORED.md`, and a note for
 upstream in `UPSTREAM.md`). Its unit suite then passed 30 runs of 30.
+
+#### Built: guest code named in perf
+
+As designed, with the review's changes:
+- **`vos_pvm::perf_map`:**
+  - the binary turns it on at start from `VOS_PVM_PERF_MAP`;
+  - it empties `/tmp/perf-<pid>.map` then, as a process that had the
+    pid before may have left one;
+  - each `recompiler::compile_code` appends its lines, one write each,
+    under a lock.
+- **Its programs' names:**
+  - a program whose functions were registered (`register`, by its
+    code's hash) is named a line a function: entry and exits apart, a
+    function from its entry's native offset to the next one's;
+  - any other program, a line for the whole.
+- **`vos_pvm_compiler::link_elf_spi_with_symbols`:** the linker reads the
+  ELF's function symbols and carries their PVM offsets through the pass
+  that inserts block starts (`ensure_branch_targets_with_pc_map`). It
+  names them as source spells them (`rustc-demangle`).
+- **The CLI** registers its agent's functions when the map is on.
+- **The codegen** reports its panic stub's offset: a pc the dispatch table
+  does not map holds it.
+
+**Tests:**
+- the line's format;
+- a program's name;
+- the regions: an unmapped entry starts at the next mapped pc, one that
+  falls onto another's entry leaves that function its name, and a dead
+  one is dropped;
+- a compile names the region its code occupies (its own test binary, as
+  it turns the map on for its process);
+- on the real agent:
+  - every function's entry is a basic-block start, and maps exactly in
+    the dispatch table;
+  - the compiled agent is named in contiguous regions, entry to exits,
+    exactly its code's span, `run_batch` among them.
+
+**Where the guest time goes** (the one agent's leader at saturation, the
+map on, 88k samples): guest code is 19% of the leader's samples, about
+30 µs an input of refine and dry run together. Of it:
+
+| Region | Share of guest time |
+|---|---|
+| `vos_agent::refine::run_batch` (the input loop, much of it inlined) | 14% |
+| the counter actor (its whole program) | 11% |
+| `Invocation::invoke` | 8% |
+| `compiler_builtins::mem::memcpy` (the guest's own) | 8% |
+| `vos_accumulate` (the dry run's entry, inlined) | 6% |
+| `refine::command` | 6% |
+| `vos_refine` (refine's entry, inlined) | 5% |
+| `ResultWriter::push`, `keys::key`, `BTreeMap::insert` | 3% each |
+| allocation and growth (`RawVec`, realloc) | about 5% |
+| drops (`Step`, `BTreeMap` iterators, `Vec<Attest>`) | about 4% |
+| the rest, under 1% each | the remainder |
+
+- **No one hotspot:** the agent's own code is nine tenths of it, spread
+  over the shape of general Rust: building owned keys and values,
+  copying them (`memcpy` alone 8%), growing vectors, inserting into
+  `BTreeMap`s, encoding steps, and dropping it all.
+- So the agent's per-input cost falls only by reworking how it handles
+  an input's data (borrowed keys, fewer owned copies, preallocated
+  buffers), not by one fix. That is its own design.
+- The JIT's entry and exits, named apart, are under 1%: switching
+  machines is not where the time goes.

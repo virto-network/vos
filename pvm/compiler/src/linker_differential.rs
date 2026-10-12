@@ -287,6 +287,7 @@ fn link(text: &[u8]) -> Vec<u8> {
         rw_min: 0x2_0000,
         stack_size: 0x1_0000,
         heap_pages: 0,
+        functions: Vec::new(),
         hi20_targets: HashMap::new(),
         lo12_targets: HashMap::new(),
         call_targets: HashMap::new(),

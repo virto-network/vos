@@ -68,6 +68,16 @@ pub fn link_elf_spi(elf_data: &[u8]) -> Result<Vec<u8>, TranspileError> {
     linker::link_elf_spi(elf_data)
 }
 
+/// A program's functions: each one's first PVM instruction in its code, and
+/// its name (demangled), by offset.
+pub type Functions = Vec<(u32, String)>;
+
+/// [`link_elf_spi`], with the blob's [`Functions`]: what a profiler names
+/// compiled code by.
+pub fn link_elf_spi_with_symbols(elf_data: &[u8]) -> Result<(Vec<u8>, Functions), TranspileError> {
+    linker::link_elf_spi_with_symbols(elf_data)
+}
+
 /// Compute skip distance from bitmask: number of continuation bytes after position `pc`.
 fn skip_for(bitmask: &[u8], pc: usize) -> usize {
     for j in 0..25 {
