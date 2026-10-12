@@ -7023,3 +7023,38 @@ unprivileged user here) over the steady windows.
   the end, mimalloc's nodes held 897–904 MiB and the system allocator's
   924–931 MiB. Both grow with the run's data: the extra 8% after five
   minutes does not last, and after thirty mimalloc holds about 3% less.
+
+#### After levers 0, 1 and 3: where the node stands
+
+**The rows again** (tmpfs, the pinned laptop, this build):
+
+| Row | Before the levers (3.10a) | Now |
+|---|---|---|
+| one agent, capacity | about 14k/s | about 14k/s (closed 13.7k at 256 sessions; open falls behind at 15k) |
+| 64 agents × 16 sessions, closed | 27k/s (disk) | 23.5k/s, every node about 5.1 of its 6 cores busy |
+| 64 agents, the knee (p99 ≤ 20 ms) | 5k–20k/s, by the run's stalls | between 15k and 20k/s (p99 14 ms at 15k) |
+
+- **The single agent** is still held by its serial refine: its leader's
+  executors run at about 46%, one batch at a time.
+- **The 64 agents are now held by CPU:** at saturation every node is
+  near its six cores, at about 216 µs of CPU a commit each. The runtime
+  thread runs at about 70%, and its probe's lateness reaches 6 ms at p99
+  near the knee.
+
+**Where a loaded node's CPU goes** (one node at 15k/s, `perf record`, by
+symbol, both core types together):
+
+| Where | Share |
+|---|---|
+| fjall: memtable lookups (`Memtable::get`, the skiplist search), versions, writes | about 19% |
+| signature checks (curve25519's field arithmetic, `calls::verify`) | about 18% |
+| libc | about 7% |
+| the PVM runtime (its memory permissions and dirty pages, the run loop) | about 7% |
+| the async runtime | about 7% |
+| the allocator (mimalloc) | about 5% |
+| the node's own code | about 4% |
+| the network (QUIC, TLS) | about 3% |
+
+**Next, each with its own design:** store reads scoped to a batch (the
+memtable lookups), then cheaper signature checks that keep the strict
+check's semantics.
