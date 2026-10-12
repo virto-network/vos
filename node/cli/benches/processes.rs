@@ -31,7 +31,8 @@
 //! driver, separated by `/`; `RUNTIME_THREADS` sets each node's runtime
 //! threads; `DATA` where the stores go; `VOS_BIN` another `vos` to run the
 //! nodes, for a lever's A/B runs; `LOGS` a directory to keep the nodes'
-//! logs in.
+//! logs in. `machine.sh`, beside this file, runs the rows on a machine of
+//! its own, each node on cores of its own.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
