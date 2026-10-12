@@ -6984,6 +6984,8 @@ per commit and memory are from the bench; instructions and cycles from
 `perf stat` (user space only: the kernel's counts are not open to an
 unprivileged user here) over the steady windows.
 
+(The cycles and instructions here are `perf stat`'s scaled sums, about twice the counts executed: see "Perf's counts on this CPU were scaled", below.)
+
 | Build | Runs | CPU per commit | Cycles per commit | Instructions per commit | p99 | Resident per node |
 |---|---|---|---|---|---|---|
 | system allocator | 8 | 821–874 µs | 2,471k–2,520k | 2,289k–2,300k | 4.9–6.7 ms | 452–456 MiB |
@@ -7169,6 +7171,8 @@ again.
 
 **Measured:** five interleaved 5-minute soaks of each build, tmpfs, the
 64 agents at 6k/s:
+
+(The cycles and instructions here are `perf stat`'s scaled sums, about twice the counts executed: see "Perf's counts on this CPU were scaled", below.)
 
 | | Without (3.10b3) | With the kept keys |
 |---|---|---|
@@ -7381,3 +7385,241 @@ agent fail. That is routing, not the group's availability.
   - With the ask, nodes 2 and 3 elect and serve, and the creator, back,
     catches up.
 - The cluster suite, 20 runs: all pass.
+
+#### Where a node's CPU goes, by phase
+
+The frame-pointer profile of 3.10a2's last run (one node at 15k/s,
+152,810 samples) split by thread and by phase. The leader's refine and
+dry run are the two jobs `leader::execute` hands the executors.
+Accumulate in an apply runs only on followers, as the leader applies
+its dry run's writes.
+
+| Thread | Share | Of it |
+|---|---|---|
+| executors | 62.8% | mainly: the agent's guest code 22.1% (compiled, without frames, so not split by phase); signature checks 17.0%; followers' accumulate 9.9%; refine 7.4%; the dry run 5.0% |
+| the runtime thread | 15.8% | store reads 5.1%, HTTP 2.6%, Raft 1.1%, the async runtime's own about 5% |
+| the writer | 9.6% | |
+| the network thread | 9.4% | |
+| fjall's workers | 1.6% | flushes and compactions |
+
+- **The agent's work** is about 44% of the node: its guest code, and the
+  host side of refine, the dry run and followers' accumulate.
+  - The host side is mostly store reads: about 11% of the node. 6.4% of
+    that is accumulate's `write` looking up each key's previous length.
+- **Each node leads a third of the agents:** per commit, it refines and
+  dry-runs for a third, and runs accumulate again for the other two
+  thirds.
+
+**What would move it a lot changes a contract, so it is the owner's:**
+- **Followers apply the leader's writes** instead of running accumulate
+  again: about 15–18% of a node (their accumulate's host side, and its
+  share of the guest code).
+  - Followers already take refine's output from the leader; they would
+    take accumulate's too.
+  - The log's entries would carry the writes, so more bytes on the
+    network and the disk.
+- **A write host call that returns no previous length,** used by the
+  default agent: the lookup goes on every replica, about 6% of a node.
+  An addition to the agents' ABI.
+- **Signature checks in batches:** ed25519's batch verification costs
+  up to about half as much per signature in large batches, on the
+  11.2% the equation costs.
+  - Its semantics are not `verify_strict`'s. With a torsion component
+    in R, a batch can pass a signature the strict check refuses: its
+    random weights clear the component at least one time in eight, so a
+    signer who resubmits gets one through in a few tries.
+  - Keeping the strict semantics would take a torsion check per
+    signature, which costs about what batching saves. So it is a
+    choice of semantics.
+
+#### 3.10b5 Design: memtables that fit the cache
+
+**Why:** a loaded node spends about 14% of its samples in point reads
+(the frame-pointer profile of 3.10a2's run, one node at 15k/s, 152,810
+samples), most of it searching the active memtable.
+
+| Where in a point read | Share of the node |
+|---|---|
+| following the skiplist's pointers (`decompose_tag` alone 4.0%) and comparing keys | 5.9% |
+| libc, most of it the key comparisons' `memcmp` | 3.1% |
+| pinning crossbeam's epoch | 1.5% |
+| the tables: filters, indexes, blocks | 1.1% |
+| clones, drops and the bound key's allocation | about 1.9% |
+| the rest (the version's lock, sealed memtables) | about 0.5% |
+
+The writer's inserts search the same skiplists (3.5%, outside these
+rows).
+
+- **What size can move** is the traversal and the comparisons, about 9%
+  of the node. The epoch pin, the reference counts and the copies are
+  paid per search, whatever the size.
+- **Why the traversal is dear:** fjall's default memtable is 64 MiB,
+  about a million skiplist nodes. A search visits about 2·log2(n) of
+  them, about 40. The samples gather on the load of each node's next
+  pointer, as they do when that load misses the cache:
+  - each node has up to 64 MiB of active memtable in each keyspace,
+    against a 24 MiB last-level cache the three nodes and the driver
+    share;
+  - the counter's key holds one version per call: the state keyspace's
+    memtable is mostly runs of versions of a few keys, and comparing
+    within a run compares equal keys whole.
+- **By count alone,** a 4 MiB memtable (about 64k nodes) visits about 20%
+  fewer nodes. Any gain past that is the cache's, and the measurement
+  counts the misses to tell which.
+
+**Who reads:**
+- Accumulate's `write` looks up each key's previous length (the host
+  call returns it): 6.4% of the node.
+  - 4.3% of it is in followers' applies. The leader applies its dry
+    run's writes without running accumulate again (`Inner::dry_run`).
+  - 2.1% is in the leader's dry run.
+- Refine's reads: 2.7%. The runtime thread's (sessions, the log): 5.1%.
+- **A memo of the rows a batch read does not help.**
+  - Per request, the agent's accumulate writes four keys (the state key
+    refine computed, the session's mark, the new reply, the reply
+    leaving the window) and reads none of them first.
+  - Refine read the first two at the same snapshot, but only on the
+    leader. A memo would save part of the dry run's lookups, about 1%
+    of the node.
+- **The previous length is only a return value:** the accumulate host
+  puts it in φ7 and uses it for nothing else, and the default agent
+  discards it. Two other levers follow from that, for later:
+  - a read of the length alone, without copying the value: small;
+  - a write host call that returns nothing, used by the default agent:
+    no lookup on any replica. An addition to the agents' ABI, so the
+    owner's decision.
+
+**The change:** the `state` and `system` keyspaces get a smaller
+`max_memtable_size` (`KeyspaceCreateOptions::max_memtable_size`, in
+`store::Tuning::rows` and for `system`). One setting, the size measured
+below.
+- **`log` keeps 64 MiB.**
+  - Its keys are unique and appended, with no runs of versions, and its
+    reads are near the tail, which stays in cache.
+  - Its entries are large, so its skiplist is shallower anyway.
+  - An entry and its delete, soon after the apply, meet in a large
+    memtable, where the flush writes only the tombstone.
+  - It takes the most bytes, so it would add the most flushes.
+- **New stores only:** fjall keeps a keyspace's options from its
+  creation, and a reopened keyspace takes them from its metadata. An
+  existing store keeps 64 MiB. Nothing is released yet, so the defaults
+  apply to every store from here on, and the doc says so.
+
+**What it costs:**
+- **More flushes,** each smaller: the bytes flushed are the same, less
+  what a larger memtable would have dropped as shadowed versions.
+  - A reply lives about 4 s at this load (64 calls of a session at about
+    15 a second) before its delete. A memtable that seals sooner than
+    that writes both the reply and its tombstone to tables, where a
+    larger one may hold both and drop the reply at the flush. So more
+    compaction.
+- **More level-0 tables** for misses to probe (their filters).
+- **More stalls per flush on disk:**
+  - every flush takes the version write lock for its syncs (3.10b0);
+  - every flush syncs the journal under the journal writer's lock,
+    which the node's writer appends through (fjall's flush worker
+    rotates the journal or `persist(SyncAll)`s it).
+  - On tmpfs these are cheap. On ext4 each adds its sync to the
+    writer's stalls, about sixteen times as often at 4 MiB as at 64. So
+    the disk is measured before a size is kept.
+- **fjall's own write stalls:**
+  - writes sleep in 100 ms steps while a keyspace has 4 sealed
+    memtables;
+  - they spin from 20 level-0 runs and halt at 30.
+  - A faster flush rate brings both nearer. The 100 ms sleeps show in
+    the batches of 49 ms or more, which each run reports.
+- The memtables' memory: less.
+
+**Measured** by 3.10b's method, on tmpfs:
+- **The nodes on P-cores only** (`CPUS=0,5,1,2/3,4,6,7/8,9,10,11/12-21`),
+  each on two P-cores. The driver gets the E-cores. With the reference
+  pinning, the scheduler moves a node's threads between core types, and
+  an E-core takes more cycles for the same work, so summed cycles shift
+  with placement. At 6k/s a node needs about two cores.
+- **Primary: user cycles per commit** from `perf stat`. Not
+  instructions: a cache miss costs cycles, not instructions.
+- **Beside it, per commit:** user instructions, and
+  `mem_load_retired.l2_miss` and `l3_miss` (user). A change in cycles
+  then has its cause counted, and a null result its reason.
+- **Also reported:** CPU per commit, p50 and p99, the batches of 49 ms or
+  more and the longest batch, and fjall's workers' CPU (flushes and
+  compactions) from their threads' times.
+- **Screening:** one 5-minute soak each at 64, 16 and 4 MiB, to choose
+  the size. Then five interleaved soaks of that size against 64 MiB.
+- **Kept if:**
+  - cycles per commit fall past the other build's spread;
+  - p99 and the batches of 49 ms or more do not get worse;
+  - on disk, three interleaved soaks each show stalls a window (batches
+    of 49 ms or more, the longest batch) that are no worse. The journal
+    syncs a flush adds are the expected cause if they are.
+
+#### 3.10b5 Measured: not kept
+
+**Screened** on tmpfs, one 5-minute soak of each size (the 64 agents at
+6k/s, four steady windows), the nodes on P-cores only:
+
+| Memtable (`state`, `system`) | Cycles a commit | Instructions | L2 misses | L3 misses | fjall's workers | p99 |
+|---|---|---|---|---|---|---|
+| 64 MiB | 1,235k | 1,130k | 1,804 | 463 | 9.2 µs | 7.6 ms |
+| 16 MiB | 1,220k | 1,128k | 1,708 | 402 | 8.6 µs | 5.7 ms |
+| 4 MiB | 1,218k | 1,146k | 1,595 | 314 | 12.0 µs | 4.9 ms |
+
+- **The search got cheaper; the flushing took back about half.** At
+  4 MiB, against 64 (one soak each, so roughly):
+  - cycles fell 17k a commit (1.4%), and 1.2% at 16 MiB;
+  - fjall's workers did 2.8 µs more a commit, about 12–13k cycles,
+    which matches the 16k more instructions;
+  - so outside the workers, cycles fell about 30k a commit, about 2.4%;
+  - and L3 misses fell 149 a commit (463 to 314), at about 200 cycles
+    each. So the search got cheaper mostly through misses.
+- **On disk it can only cost more:** each flush also syncs fjall's journal
+  under the lock the writer appends through, and 4 MiB flushes sixteen
+  times as often.
+- **Not taken to an A/B.** The screened gain is within a build's spread
+  as measured so far (1.5–1.7% in 3.10b4's soaks, with the nodes on both
+  core types; the spread on P-cores alone is not yet measured), and the
+  disk can only add cost. The change is set aside: `max_memtable_size`
+  stays fjall's default. p99 is reported, not judged.
+
+#### Perf's counts on this CPU were scaled: a correction
+
+**Found** in 3.10b5's screening: with the nodes on P-cores only,
+instructions per commit came out at about half of 3.10b4's, at the same
+load.
+- On the hybrid CPU, `perf stat` opens each event on both core types'
+  counters. Each counts only while a thread runs on its kind of core.
+- perf then divides each count by the share of the time it was running,
+  extrapolating it to the whole time, as it does for multiplexed
+  counters. These soaks ran 37% on E-cores and 62% on P-cores.
+- So the sums in 3.10b3's and 3.10b4's tables were about twice the
+  instructions and cycles executed: 1.95 times, in one run checked.
+- **The true counts** are each line's value times its running share. With
+  the nodes on one kind of core, as from 3.10b5 on, nothing is scaled.
+- **Per commit** divides by 6,000 a second over perf's 180 s, which holds
+  as the open loop kept its 6k/s through every steady window of these
+  runs.
+- Raw cycles of the two core types are still not equal work, so the
+  measurements from here on keep the nodes on P-cores.
+
+**Recomputed, the conclusions hold:**
+
+| Run | Instructions a commit | Cycles a commit |
+|---|---|---|
+| 3.10b3: system allocator | 1,171–1,178k | 1,244–1,269k |
+| 3.10b3: mimalloc | 1,158–1,164k | 1,189–1,203k |
+| 3.10b3: system allocator, no huge pages | 1,175–1,176k | 1,277–1,284k |
+| 3.10b3: mimalloc, no huge pages | 1,159–1,161k | 1,213–1,221k |
+| 3.10b4: without the kept keys | 1,147–1,159k, median 1,158k | 1,216–1,237k, median 1,219.5k |
+| 3.10b4: with them | 1,120–1,127k, median 1,122k | 1,194–1,213k, median 1,204.5k |
+
+- **mimalloc:** about 5% fewer cycles, with huge pages or without, for
+  1.3% fewer instructions; turning huge pages off costs about 2% more
+  cycles for either allocator. The ranges still do not meet.
+- **The kept keys:** 3.1% fewer instructions and 1.2% fewer cycles a
+  commit. Both builds' ranges still do not meet, the cycles' by a small
+  margin (1,213k against 1,216k). The work saved ran at roughly 2 or
+  more instructions a cycle (36k instructions, 15k cycles, the cycles'
+  difference smaller than either build's own range), against the node's
+  0.93.
+- The tables in 3.10b3 and 3.10b4 above keep their scaled numbers, as
+  measured. These are the ones to read.
