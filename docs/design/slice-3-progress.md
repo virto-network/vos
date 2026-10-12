@@ -8021,3 +8021,65 @@ map on, 88k samples): guest code is 19% of the leader's samples, about
   buffers), not by one fix. That is its own design.
 - The JIT's entry and exits, named apart, are under 1%: switching
   machines is not where the time goes.
+
+#### Refine on this laptop: why the cluster's is twice the in-process node's
+
+**Found:** the in-process bench (`benches/acceptance.rs`, one node, the same
+agent and counter, now printing the node's stage means) refines at
+16.7–19.5 µs an input across runs, and dry-runs at about 5 µs. The
+cluster's leader refines at about 40 µs an input, and dry-runs at about
+11.
+- **The in-process node is a quieter one,** not only a differently pinned
+  one. It is called directly (`Node::call`), so it has no ingress and no
+  signature checks, no network thread and no replication; its cores do
+  little but refine and dry-run. Its rate bounds refine from below, and
+  does not predict a node on a machine of its own.
+
+**What changes refine there** (the in-process bench, one run each, so
+effects under about 8%, the baseline's own range, are not resolved):
+
+| Condition | Refine an input | Dry run an input |
+|---|---|---|
+| two threads on two P-cores, their siblings idle | 16.7 µs | 4.7 µs |
+| the same, the siblings running a busy loop | 23.1 µs | 7.3 µs |
+| two hyperthread pairs, the other eight P-core threads busy | 23.6 µs | 6.7 µs |
+| huge pages off for the process | about +4%, within the noise | |
+
+- Sharing a core with a busy thread costs refine about 40%. The busy loop
+  is a scalar loop, not the leader's actual co-runners (AVX2 curve
+  arithmetic, a memory-bound runtime thread, QUIC's encryption), so what
+  those cost is not measured here.
+- The third row changes two things at once: both siblings of two cores,
+  and the clock (it fell from about 4.5 GHz to 3.4–3.7 with every other
+  P-core busy). Separating them would keep the node on one thread a
+  core, and load only the other cores.
+
+**The cluster with the leader's four threads on four separate P-cores**
+(`CPUS=0,1,3,6/8,10,12,13/14,15,16,17/18,19,20,21`, their siblings idle;
+node 1 led; one run):
+- refine 32 µs an input, against about 40 on the reference pinning;
+- closed at 64 sessions 17.3k/s, against 12.7–14.6k; at 256, 16.9k/s;
+- open at 15k/s: kept up, p99 14 ms. At 18k/s it fell behind, the driver
+  keeping up (its send lag's p99 0.014 ms);
+- **at half load (10k/s): p99 7.0 ms, within the budget's 10, in this one
+  run.**
+- **The rest of the gap,** 32 µs against 17, is not separated. The
+  candidates are:
+  - the lower clock with every P-core of the laptop busy;
+  - the last-level cache the three nodes and the driver share;
+  - the leader's own other work sharing its four CPUs: about a core of
+    signature checks, its runtime thread and its network thread.
+    (Moving two thirds of the checks off the leader, `SPREAD=1`, left
+    refine unchanged, which argues against the checks alone, not
+    against the rest.)
+
+**What it means for the budgets:**
+- **The half-load p99** passed once the leader's cores were its own, in
+  one run. 3.10c repeats it.
+- **The capacity budget (20k/s):** pipelining's estimate (13–15%, itself an
+  upper estimate: it assumes the 1 ms hidden completely) on 16.9–17.3k/s
+  gives 19.1–19.9k/s: at the edge, not past it.
+- **Unmeasured, a hypothesis:** whether a node with a machine of its own
+  refines nearer 17 µs an input than 32. Only another machine can tell.
+- 3.10c reports the single agent's rows on both pinnings, with this as
+  the reason.

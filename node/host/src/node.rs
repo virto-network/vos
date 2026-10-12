@@ -1975,6 +1975,12 @@ impl Node {
         self.inner.push(target, Pending::Message(message))
     }
 
+    /// How long its stages took since it started, as its operator's stats
+    /// route reports them.
+    pub fn stats(&self) -> vos_wire::ingress::Stats {
+        self.inner.stats()
+    }
+
     /// The node's storage, to read applied state and the log.
     pub fn store(&self) -> &Fjall {
         &self.inner.store

@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use vos_node::{CallError, Config, Hooks, Node, Reply};
 use vos_wire::batch::{Batch, Request};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session};
+use vos_wire::ingress::Stats;
 use vos_wire::result::Outcome;
 use vos_wire::schema::Schema;
 use vos_wire::{Decode, Encode};
@@ -154,6 +155,28 @@ impl Hooks for Timing {
     }
 }
 
+/// Each stage's mean between two of the node's stats: its values' sum
+/// over their count.
+fn stage_means(before: &Stats, after: &Stats) -> Vec<(String, f64)> {
+    after
+        .stages
+        .iter()
+        .filter_map(|stage| {
+            let earlier = before
+                .stages
+                .iter()
+                .find(|earlier| earlier.name == stage.name)?;
+            let count = stage
+                .counts
+                .iter()
+                .sum::<u64>()
+                .saturating_sub(earlier.counts.iter().sum::<u64>());
+            let total = stage.total.saturating_sub(earlier.total);
+            (count > 0).then(|| (stage.name.clone(), total as f64 / count as f64))
+        })
+        .collect()
+}
+
 /// The median and the 99th percentile, by nearest rank, in microseconds.
 fn percentiles(mut samples: Vec<Duration>) -> (f64, f64) {
     samples.sort();
@@ -187,6 +210,7 @@ fn main() {
     // Warm the machines, the store and the queues once.
     load(&node, agent, increment_method, 1, SESSIONS, 10);
     timing.take();
+    let before = node.stats();
     let elapsed = load(
         &node,
         agent,
@@ -199,6 +223,7 @@ fn main() {
     let per_request = elapsed.as_secs_f64() * 1e6 / requests as f64;
     let phases = timing.take();
     assert_eq!(phases.inputs, requests, "every request ran once");
+    let stages = stage_means(&before, &node.stats());
 
     let alone_session = 2 * SESSIONS + 1;
     let alone: Vec<Duration> = (1..=ALONE as u64)
@@ -238,6 +263,20 @@ fn main() {
         phases.batches,
         phases.inputs as f64 / phases.batches as f64,
         phases.commits.as_secs_f64() * 1e3 / phases.batches as f64,
+    );
+    let mean = |name: &str| {
+        stages
+            .iter()
+            .find(|(stage, _)| stage == name)
+            .map_or(0.0, |(_, mean)| *mean)
+    };
+    println!(
+        "  the stages' means: {} inputs a batch; refine {:.0} µs ({:.1} µs an input), the dry run {:.0} µs ({:.1} µs an input)",
+        mean("batch_inputs"),
+        mean("refine"),
+        mean("refine") / mean("batch_inputs"),
+        mean("dry_run"),
+        mean("dry_run") / mean("batch_inputs"),
     );
     println!(
         "one request alone: median {alone_median:.0} µs, p99 {alone_p99:.0} µs; execution {:.1} µs on average",
