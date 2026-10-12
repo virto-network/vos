@@ -6748,3 +6748,126 @@ failed on the commit before 3.10b1 in four copies out of nine.
   loaded `just ci`, in 24 loaded copies across these runs. The directory
   is rebuilt from synced records at open, so it should not happen; it
   stays on the open list until it recurs or is explained.
+
+
+#### 3.10b2 Design: table writes reach the disk as they go
+
+**The stall left** (3.10b0's measurements, on ext4 after levers 0 and 1):
+on disk, about 184–263 batches a window take 49 ms or more, the longest
+229–524 ms, p99 41–101 ms, where tmpfs has 4 ms. Each thread's kernel
+wait point:
+- the writer waits on ext4's journal commit (`jbd2_log_wait_commit`)
+  for most of its time: nearly every sync it makes commits, since it
+  changes the journal file's mtime and writes into the sparse journal;
+- during a table's flush, up to 180 ms in `do_get_write_access`: the
+  BH_Shadow wait, for a metadata block (most likely the inode-table block
+  holding the journal file's inode) that the committing transaction is
+  writing to ext4's journal;
+- meanwhile a fjall worker waits on page writeback, then on a commit.
+
+**Why, on this mount** (`dioread_nolock`, `delalloc`, `data=ordered`):
+- With `dioread_nolock`, delalloc blocks are allocated as unwritten
+  extents and converted when their I/O completes, so no transaction
+  carries a table's data (the kernel's code says so; jbd2's averages
+  since mount agree: 0 ms flushing ordered data, about 1.2 ms and 3
+  blocks a commit).
+- So the 180 ms is most likely one small journal write waiting in the
+  drive's queue,
+  behind a table's tens of megabytes. A table is written whole into the
+  page cache, and its final `sync_all` (`table/writer/mod.rs`, `finish`)
+  submits all of it at once, or the next commit's cache flush drains it.
+- So the lever works through the drive, not through jbd2: spread a
+  table's writes, and the queue a commit waits behind stays short.
+
+**The change, in the vendored lsm-tree's table writer:**
+- After each data block, once a megabyte or more has reached the kernel
+  since the last time, it writes that range back:
+  `sync_file_range(fd, from, to - from, flags)`, `to` rounded down to
+  4 KiB, never a zero length (which means to the end of the file).
+- **Two variants, measured from the start:**
+  - **write:** `SYNC_FILE_RANGE_WRITE`, as RocksDB's `bytes_per_sync`:
+    starts the range's writeback and returns. It bounds nothing if the
+    writer outruns the drive;
+  - **bounded:** `SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE`
+    over `[0, to)`, as RocksDB's `strict_bytes_per_sync`: it first waits
+    for everything before to be written, so at most a megabyte or two
+    of a table is ever queued. One wait a megabyte, on a fjall worker.
+- **Every error fails the table write.** With a wait, the kernel reports
+  a writeback error there and advances the file's error cursor, so the
+  final `sync_all` would not report it again: logging it and going on
+  could install a table whose blocks were lost. Without a wait the error
+  would still reach the final sync, but both variants fail the same way.
+- The final `sync_all` stays, so what is durable when does not change.
+- The descriptor: `file_writer.get_mut().inner_mut().get_ref()`; the
+  bytes in the kernel: the writer's offset less the `BufWriter`'s
+  buffered bytes (no seek, which would flush it).
+- Linux only (`libc`, a Linux-only dependency); elsewhere, nothing.
+- Every table the node writes goes through this writer, on a fjall
+  worker: flushes, and compactions (64 MiB tables, the larger source of
+  bursts). A snapshot's rows are staged in ordinary batches, so they
+  reach tables by flushes too.
+- A failed table write fails the fjall worker, which poisons the
+  database, and the node halts: as a failing final sync does today, so
+  only where the error is seen is new.
+
+**What does not change:** a table's bytes, when it is durable, and the
+order of anything.
+
+**The A/B's builds:** fjall builds lsm-tree's settings itself, so a
+variant cannot be chosen from the node. Each arm is a build with its
+variant as a constant. After the A/B the winner stays and the loser is
+deleted, with its tests. **The rule, set now:** bounded is kept unless
+write does better on the tail in every pair, as bounded's limit does not
+depend on the drive's state.
+
+**Considered, and not taken:** smaller memtables. They shrink only
+flushes' tables: compactions still write 64 MiB tables, and more level-0
+runs mean more compaction.
+
+**Tests** (the writer's unit tests, in `src/`, where a test-only counter
+and hook are visible):
+- A table of several megabytes reads back whole, through a reopen.
+- What was written back, checked on a live writer before `finish`: the
+  synced-to offset is 4 KiB-aligned and only grows; it never passes the
+  file's size as the filesystem reports it (`metadata().len()`, the bytes
+  written so far, an independent oracle); and it reaches at least the
+  size less the threshold and the buffer (64 KiB).
+- The error path, through an injected range sync that fails: the table
+  write fails.
+- The stall itself is measured, not unit-tested.
+
+**Measured:** on disk, kept quiet (no builds or tests on it during the
+soaks), three interleaved 7.5-minute soaks each of lever 1's build,
+**write** and **bounded**:
+- judged on the tail: batches of 49 ms or more, the longest batch, p99,
+  the runtime stalls a window, and the writer's longest
+  `do_get_write_access` run; p50 reported too (flat, or a little up);
+- the writer's long waits split by wait point, jbd2's against futexes:
+  the lever also shortens a compaction's finish under the version lock,
+  and without the split a gain there would be credited to the drive;
+- the jbd2 wait share is not the test: every sync commits today either
+  way;
+- the mechanism checked: `/sys/block/nvme0n1/inflight` sampled each
+  millisecond beside the wait points. The long waits should line up with
+  a queued write backlog without the lever, and not with it.
+- All three nodes share one drive and one ext4 journal, and replicas
+  flush nearly together: the absolute counts are a shared-disk worst
+  case.
+
+**Found on the way, not in this step:**
+- **A compaction finishes its last table under the version write lock**
+  (`compaction/worker.rs`: `finish`'s `sync_all`, the directory sync and
+  the table's recovery, under `version_history.write()`), so reads and
+  rotations on that tree wait for it. This lever shortens that hold; the
+  hold itself is its own lever (finish before taking the locks), and
+  could go upstream.
+- **fjall's journal syncs** (the larger lever for the writer's routine
+  latency, after this one): preallocating the journal with written
+  extents (`FALLOC_FL_WRITE_ZEROES`) and syncing data only would take
+  most commits off the writer's path. It touches fjall. Even then,
+  `write()` journals the mtime change about once a millisecond, and the
+  same BH_Shadow wait can still occur unless the filesystem is mounted
+  `lazytime` (this root filesystem is `rw,noatime`): a deployment note.
+
+**Upstream:** `bytes_per_sync` and `strict_bytes_per_sync` settings, in
+`UPSTREAM.md`.
