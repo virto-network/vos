@@ -53,6 +53,10 @@ const INSTALL_IDLE: Duration = Duration::from_secs(30);
 /// Rows of an old epoch one write removes.
 const DROP_ROWS: usize = 4096;
 
+/// Where a proposal's answer goes: the index it took, or why not, and
+/// when the driver answered.
+pub(crate) type Proposed = smol::channel::Sender<(Result<u64, ProposeError>, Instant)>;
+
 /// What a group hears from the network and the node: bounded, and
 /// dropped when full.
 pub(crate) enum Input {
@@ -79,7 +83,7 @@ pub(crate) enum Local {
     Propose {
         term: u64,
         payload: Vec<u8>,
-        answer: smol::channel::Sender<Result<u64, ProposeError>>,
+        answer: Proposed,
     },
     /// This replica's leader loop stopped for good: it hands leadership
     /// over and never campaigns again, but goes on applying.
@@ -139,6 +143,10 @@ pub(crate) struct State {
     /// The commit index the replica recovered: queries wait until it is
     /// applied.
     pub recovered: u64,
+    /// When the commit and the applied index last moved: a stage's end, as
+    /// the driver and the applier saw it, not as a waiter woken later does.
+    pub commit_at: Option<Instant>,
+    pub applied_at: Option<Instant>,
     pub stopped: bool,
     /// The replica has held a committed configuration naming it.
     pub established: bool,
@@ -181,6 +189,8 @@ impl Shared {
                 written: 0,
                 applied: 0,
                 recovered: 0,
+                commit_at: None,
+                applied_at: None,
                 stopped: false,
                 established: false,
             }),
@@ -266,7 +276,7 @@ struct Driver {
     /// log's last index after it.
     writes: VecDeque<(u64, u64)>,
     last_index: u64,
-    proposals: HashMap<u64, smol::channel::Sender<Result<u64, ProposeError>>>,
+    proposals: HashMap<u64, Proposed>,
     reads: HashMap<u64, smol::channel::Sender<Result<u64, ReadIndexError>>>,
     next_token: u64,
     /// The blobs asked for last, and when.
@@ -544,7 +554,7 @@ impl Driver {
         while let Ok(local) = local.try_recv() {
             match local {
                 Local::Propose { answer, .. } => {
-                    let _ = answer.try_send(Err(ProposeError::Stopped));
+                    let _ = answer.try_send((Err(ProposeError::Stopped), Instant::now()));
                 }
                 Local::ReadIndex { answer } => {
                     let _ = answer.try_send(Err(ReadIndexError::Stopped));
@@ -560,7 +570,7 @@ impl Driver {
             }
         }
         for (_, answer) in self.proposals.drain() {
-            let _ = answer.try_send(Err(ProposeError::Stopped));
+            let _ = answer.try_send((Err(ProposeError::Stopped), Instant::now()));
         }
         for (_, answer) in self.reads.drain() {
             let _ = answer.try_send(Err(ReadIndexError::Stopped));
@@ -602,7 +612,7 @@ impl Driver {
                 answer,
             } => {
                 if self.core.role() != Role::Leader || self.core.status().current_term != term {
-                    let _ = answer.try_send(Err(ProposeError::NotLeader));
+                    let _ = answer.try_send((Err(ProposeError::NotLeader), Instant::now()));
                     return;
                 }
                 let token = self.next_token;
@@ -738,7 +748,10 @@ impl Driver {
                     }
                 }
             }
-            Action::Committed { index } => self.shared.update(|state| state.commit = index),
+            Action::Committed { index } => self.shared.update(|state| {
+                state.commit = index;
+                state.commit_at = Some(Instant::now());
+            }),
             Action::CompactBound { through, .. } => {
                 self.compact_bound = self.compact_bound.max(through);
                 self.compact_due = true;
@@ -746,7 +759,7 @@ impl Driver {
             Action::SendSnapshot { to, .. } => self.send_snapshot(to),
             Action::Answer(Answer::Propose { token, result }) => {
                 if let Some(answer) = self.proposals.remove(&token) {
-                    let _ = answer.try_send(result);
+                    let _ = answer.try_send((result, Instant::now()));
                 }
             }
             Action::Answer(Answer::ReadIndex { token, result }) => {
@@ -1616,7 +1629,10 @@ pub(crate) async fn apply(inner: Arc<Inner>, shared: Arc<Shared>) {
         let index = state.applied + 1;
         let applied = apply_one(&inner, &shared, index).await;
         if applied.is_ok() {
-            shared.update(|state| state.applied = index);
+            shared.update(|state| {
+                state.applied = index;
+                state.applied_at = Some(Instant::now());
+            });
         }
         drop(applying);
         match applied {

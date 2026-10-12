@@ -370,14 +370,19 @@ impl Leader {
         }
         let mut taken = Vec::new();
         let mut bytes = 0;
+        let now = Instant::now();
         while taken.len() < self.max_inputs {
-            let Some(next) = queue.inputs.front() else {
+            let Some((next, _)) = queue.inputs.front() else {
                 break;
             };
             if !taken.is_empty() && bytes + next.bytes() > inner.max_bytes {
                 break;
             }
-            let next = queue.inputs.pop_front().expect("a front input");
+            let (next, queued) = queue.inputs.pop_front().expect("a front input");
+            inner
+                .stats
+                .queued
+                .took(now.saturating_duration_since(queued));
             bytes += next.bytes();
             if next.capped() {
                 queue.capped -= 1;
@@ -669,6 +674,8 @@ impl Leader {
         blobs: Vec<BlobRef>,
     ) -> Result<Ran, Fault> {
         let id = self.id;
+        let started = Instant::now();
+        inner.stats.batch_inputs.record(batch.inputs.len() as u64);
         let program = Arc::clone(&inner.program);
         let pool = Arc::clone(&inner.pool);
         let store_blobs = inner.blobs.clone();
@@ -676,13 +683,16 @@ impl Leader {
         let hooks = Arc::clone(&inner.hooks);
         let gas = inner.refine_gas;
         let state = Arc::clone(&snapshot);
+        let queued = Instant::now();
         let output = ran(inner
             .executors
             .run(move || {
+                let running = Instant::now();
                 if hooks.fail_refine(id, &refined) {
-                    return Err(Fault::Agent("a hook failed the refine".into()));
+                    let failed = Err(Fault::Agent("a hook failed the refine".into()));
+                    return (failed, [queued, running, Instant::now()]);
                 }
-                pvm::refine(
+                let output = pvm::refine(
                     &program,
                     &pool,
                     &store_blobs,
@@ -690,9 +700,16 @@ impl Leader {
                     id,
                     &Work::Batch(refined),
                     gas,
-                )
+                );
+                (output, [queued, running, Instant::now()])
             })
-            .await)?;
+            .await
+            .map(|(output, [queued, running, finished])| {
+                inner.stats.refine_queue.took(running - queued);
+                inner.stats.refine.took(finished - running);
+                inner.stats.resume.took(finished.elapsed());
+                output
+            }))?;
         let result: WorkResult = pvm::decode(&output)?;
         // The dry run: a failure here isolates its input off the log.
         let program = Arc::clone(&inner.program);
@@ -701,15 +718,25 @@ impl Leader {
         let state = Arc::clone(&snapshot);
         let hooks = Arc::clone(&inner.hooks);
         let dried = batch.clone();
+        let queued = Instant::now();
         let writes = ran(inner
             .executors
             .run(move || {
+                let running = Instant::now();
                 if hooks.fail_dry_run(id, &dried) {
-                    return Err(Fault::Agent("a hook failed accumulate".into()));
+                    let failed = Err(Fault::Agent("a hook failed accumulate".into()));
+                    return (failed, [queued, running, Instant::now()]);
                 }
-                pvm::accumulate(&program, state, id, applied, gas)
+                let writes = pvm::accumulate(&program, state, id, applied, gas);
+                (writes, [queued, running, Instant::now()])
             })
-            .await)?;
+            .await
+            .map(|(writes, [queued, running, finished])| {
+                inner.stats.dry_run_queue.took(running - queued);
+                inner.stats.dry_run.took(finished - running);
+                inner.stats.resume.took(finished.elapsed());
+                writes
+            }))?;
         let version = writes
             .iter()
             .find(|write| write.key == keys::version())
@@ -740,6 +767,7 @@ impl Leader {
         );
         let (answer, answered) = smol::channel::bounded(1);
         let term = self.term;
+        let proposing = Instant::now();
         let proposed = inner.propose(
             id,
             Local::Propose {
@@ -756,16 +784,43 @@ impl Leader {
             shared.wait(|state| state.stopped).await;
             None
         };
-        let index = match answer.or(stopped).await {
-            Some(Ok(Ok(index))) => index,
+        let (index, taken) = match answer.or(stopped).await {
+            Some(Ok((Ok(index), taken))) => (index, taken),
             _ => return Ok(Ran::Lost),
         };
+        inner
+            .stats
+            .propose
+            .took(taken.saturating_duration_since(proposing));
+        inner.stats.resume.took(taken.elapsed());
+        let state = shared
+            .wait(|state| state.stopped || !leads(state, term) || state.commit >= index)
+            .await;
+        if state.commit < index {
+            return Ok(Ran::Lost);
+        }
+        // The commit's and the apply's ends as the driver and the applier
+        // saw them: the time this task took to be polled again is the
+        // runtime's, apart.
+        let committed = state.commit_at.unwrap_or_else(Instant::now);
+        inner
+            .stats
+            .commit
+            .took(committed.saturating_duration_since(taken));
+        inner.stats.resume.took(committed.elapsed());
         let state = shared
             .wait(|state| state.stopped || !leads(state, term) || state.applied >= index)
             .await;
         if state.applied < index {
             return Ok(Ran::Lost);
         }
+        let applied = state.applied_at.unwrap_or_else(Instant::now);
+        inner
+            .stats
+            .apply
+            .took(applied.saturating_duration_since(committed));
+        inner.stats.resume.took(applied.elapsed());
+        inner.stats.batch.took(started.elapsed());
         // The entry at its index is this leader's, of its term.
         let ours = inner
             .store

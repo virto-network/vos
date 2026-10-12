@@ -62,3 +62,7 @@ harness = false
 [[bench]]
 name = "agents"
 harness = false
+
+[[bench]]
+name = "verify"
+harness = false

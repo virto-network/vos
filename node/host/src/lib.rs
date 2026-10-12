@@ -20,6 +20,7 @@ mod pvm;
 mod queries;
 pub mod raft;
 pub mod space;
+mod stats;
 pub mod storage;
 pub mod store;
 pub mod tls;

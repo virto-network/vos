@@ -167,9 +167,12 @@ impl Inner {
             return answer_of(Err(self.absent(agent)));
         };
         let identity = run.shared.identity;
+        let inner = Arc::clone(self);
         let checked = self
             .offload(move || {
+                let started = Instant::now();
                 let signed = signed(&identity, &call);
+                inner.stats.verify.took(started.elapsed());
                 (signed, call)
             })
             .await;

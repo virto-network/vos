@@ -1,0 +1,119 @@
+//! How long the node's stages take, as histograms an operator reads
+//! (`GET /stats`): each a count per bucket of `vos_wire::ingress::bucket`,
+//! in microseconds, or in units for a count. Recording is a relaxed atomic
+//! add, so any thread records without a lock.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+use vos_wire::ingress::{BUCKETS, Stage, Stats as Wire, bucket};
+
+/// One stage's counts.
+pub(crate) struct Histogram {
+    counts: Vec<AtomicU64>,
+}
+
+impl Default for Histogram {
+    fn default() -> Self {
+        Self {
+            counts: (0..BUCKETS).map(|_| AtomicU64::new(0)).collect(),
+        }
+    }
+}
+
+impl Histogram {
+    pub(crate) fn record(&self, value: u64) {
+        self.counts[bucket(value)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn took(&self, duration: Duration) {
+        self.record(duration.as_micros().min(u128::from(u64::MAX)) as u64);
+    }
+
+    fn counts(&self) -> Vec<u64> {
+        self.counts
+            .iter()
+            .map(|count| count.load(Ordering::Relaxed))
+            .collect()
+    }
+}
+
+/// The stages a leader's batch goes through, and the writer's flushes.
+#[derive(Default)]
+pub(crate) struct Stats {
+    /// An input's wait in its agent's queue, until its batch takes it.
+    pub(crate) queued: Histogram,
+    /// Inputs in a batch.
+    pub(crate) batch_inputs: Histogram,
+    /// A batch's refine waiting for an executor.
+    pub(crate) refine_queue: Histogram,
+    pub(crate) refine: Histogram,
+    /// Its dry run waiting for an executor.
+    pub(crate) dry_run_queue: Histogram,
+    pub(crate) dry_run: Histogram,
+    /// From proposing its result to the core's taking it.
+    pub(crate) propose: Histogram,
+    /// From the core's taking it to its commit.
+    pub(crate) commit: Histogram,
+    /// From its commit to its apply here.
+    pub(crate) apply: Histogram,
+    /// The whole batch, from its inputs taken to its apply.
+    pub(crate) batch: Histogram,
+    /// The leader loop's wait to be polled again after each stage ended:
+    /// the runtime's queue.
+    pub(crate) resume: Histogram,
+    /// A signature check of a call or a query, on an executor.
+    pub(crate) verify: Histogram,
+    /// How late a probe on the runtime wakes once due: a proxy for every
+    /// task's wait to be polled there, the driver's and the applier's too
+    /// (to the timers' millisecond or so).
+    pub(crate) late: Histogram,
+}
+
+/// How often [`probe`] wakes.
+const PROBE: Duration = Duration::from_millis(10);
+
+/// Sleep [`PROBE`] at a time on the node's runtime, and record how late
+/// each wake comes.
+pub(crate) async fn probe(inner: Arc<crate::node::Inner>) {
+    loop {
+        let due = Instant::now() + PROBE;
+        smol::Timer::at(due).await;
+        inner
+            .stats
+            .late
+            .took(Instant::now().saturating_duration_since(due));
+    }
+}
+
+/// `histogram` on the wire, as `name`.
+pub(crate) fn stage(name: &str, histogram: &Histogram) -> Stage {
+    Stage {
+        name: name.to_string(),
+        counts: histogram.counts(),
+    }
+}
+
+impl Stats {
+    /// Its stages, and `more` after them.
+    pub(crate) fn wire(&self, more: Vec<Stage>) -> Wire {
+        let mut stages = vec![
+            stage("queued", &self.queued),
+            stage("batch_inputs", &self.batch_inputs),
+            stage("refine_queue", &self.refine_queue),
+            stage("refine", &self.refine),
+            stage("dry_run_queue", &self.dry_run_queue),
+            stage("dry_run", &self.dry_run),
+            stage("propose", &self.propose),
+            stage("commit", &self.commit),
+            stage("apply", &self.apply),
+            stage("batch", &self.batch),
+            stage("resume", &self.resume),
+            stage("verify", &self.verify),
+            stage("late", &self.late),
+        ];
+        stages.extend(more);
+        Wire { stages }
+    }
+}

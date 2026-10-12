@@ -1187,6 +1187,14 @@ impl Operator {
         self.post(&format!("/agents/{}/replicas", agent.0), &replace.encode())
     }
 
+    /// How long the node's stages took since it started.
+    pub fn stats(&self) -> Result<Answer, ClientError> {
+        let (status, body) = self
+            .http
+            .request("GET", "/stats", Some(&self.token), &[], true)?;
+        answer(status, &body)
+    }
+
     /// The node's replica of `agent`: its term, role, commit, applied
     /// index and log.
     pub fn status(&self, agent: AgentId) -> Result<Answer, ClientError> {

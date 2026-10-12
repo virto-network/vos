@@ -321,12 +321,13 @@ proptest! {
         let mut votes: std::collections::BTreeMap<u64, u16> = std::collections::BTreeMap::new();
         let mut prev_commit = 0u64;
         let mut prev_snap = 0u64;
-        // Per-index history: (entry_term, worker_term_at_observation).
-        // A different entry_term at the same index in a later
-        // observation is a log-matching violation unless the
-        // worker's term has advanced between observations (which
-        // authorizes a higher-term leader to truncate).
-        let mut entry_history: std::collections::BTreeMap<u64, (u64, u64)> =
+        // Each index's entry term as last observed. A different term
+        // at the same index later is a log-matching violation unless
+        // the worker now holds a later term than the entry's: a later
+        // leader replaced it. (Random messages may come from senders
+        // no real leader would be, so even a committed entry may be
+        // replaced: the core trusts its leaders.)
+        let mut entry_history: std::collections::BTreeMap<u64, u64> =
             std::collections::BTreeMap::new();
 
         for op in ops {
@@ -425,22 +426,21 @@ proptest! {
                     "entry term {} > worker current_term {} at index {}",
                     entry_term, snap.current_term, idx,
                 );
-                if let Some((prev_entry_term, prev_worker_term)) =
-                    entry_history.get(idx).copied()
+                if let Some(prev_entry_term) = entry_history.get(idx).copied()
                     && *entry_term != prev_entry_term
                 {
-                    // Divergence at the same index — only valid
-                    // if the worker's term advanced since the
-                    // last observation (a higher-term leader's
-                    // truncate-and-graft is the authorized path).
+                    // Divergence at the same index: only by a leader of a
+                    // later term than the entry's, whose term the worker
+                    // now holds.
                     prop_assert!(
-                        snap.current_term > prev_worker_term,
+                        snap.current_term > prev_entry_term,
                         "log-matching violation at index {idx}: entry term \
-                         changed {prev_entry_term} -> {entry_term} without \
-                         worker term advancing (was {prev_worker_term})",
+                         changed {prev_entry_term} -> {entry_term} at worker \
+                         term {}, not later than the entry's",
+                        snap.current_term,
                     );
                 }
-                entry_history.insert(*idx, (*entry_term, snap.current_term));
+                entry_history.insert(*idx, *entry_term);
             }
 
             prev_term = snap.current_term;

@@ -14,7 +14,7 @@ use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::SigningKey;
 use smol::future::FutureExt;
@@ -55,6 +55,9 @@ pub struct Config {
     pub agent: Vec<u8>,
     /// Executor threads for PVM work.
     pub executors: usize,
+    /// Threads that run the node's tasks: its groups' drivers, leader and
+    /// apply loops, its ingress and its peers' messages.
+    pub runtime_threads: usize,
     /// Client requests an agent queues before a call answers busy.
     pub queue: usize,
     /// The most inputs, and argument bytes, in one batch.
@@ -109,6 +112,7 @@ impl Config {
             agent,
             executors: std::thread::available_parallelism()
                 .map_or(1, |cores| cores.get().saturating_sub(1).max(1)),
+            runtime_threads: 1,
             queue: 1024,
             max_inputs: 256,
             max_bytes: 1 << 20,
@@ -248,7 +252,8 @@ impl Pending {
 
 #[derive(Default)]
 pub(crate) struct Queue {
-    pub(crate) inputs: VecDeque<Pending>,
+    /// Each with when it was queued.
+    pub(crate) inputs: VecDeque<(Pending, Instant)>,
     /// Capped inputs queued.
     pub(crate) capped: usize,
     /// Messages from other agents queued.
@@ -299,7 +304,7 @@ impl Agent {
             queue.from_agents = 0;
             std::mem::take(&mut queue.inputs)
         };
-        for pending in refused {
+        for (pending, _) in refused {
             pending.refuse(error);
         }
     }
@@ -461,6 +466,8 @@ pub(crate) struct Inner {
     pub(crate) installed: std::sync::atomic::AtomicU64,
     /// Snapshot streams this node's groups started to their followers.
     pub(crate) streamed: std::sync::atomic::AtomicU64,
+    /// How long its leaders' batches spend in each stage.
+    pub(crate) stats: crate::stats::Stats,
     /// The node is shutting down: no group starts or retires.
     pub(crate) closing: std::sync::atomic::AtomicBool,
     /// Agents whose retirement is not yet written: no group starts for
@@ -641,13 +648,14 @@ impl Inner {
             }
             queue.from_agents += 1;
         }
-        queue.inputs.push_back(pending);
+        queue.inputs.push_back((pending, Instant::now()));
         drop(queue);
         let _ = run.agent.wake.try_send(());
         Ok(())
     }
 
-    /// Put inputs back at the front of agent `id`'s queue, in order.
+    /// Put inputs back at the front of agent `id`'s queue, in order, as
+    /// queued now.
     pub(crate) fn requeue(&self, agent: &Agent, inputs: Vec<Pending>) {
         let mut queue = agent.queue.lock().expect("the queue");
         if queue.stopped {
@@ -660,7 +668,7 @@ impl Inner {
             if pending.agents_sent() {
                 queue.from_agents += 1;
             }
-            queue.inputs.push_front(pending);
+            queue.inputs.push_front((pending, Instant::now()));
         }
     }
 
@@ -839,6 +847,12 @@ impl Inner {
             return;
         }
         group::drop_stale_epochs(self, agent).await;
+    }
+
+    /// How long its stages took since it started: its leaders' batches'
+    /// and its writer's.
+    pub(crate) fn stats(&self) -> vos_wire::ingress::Stats {
+        self.stats.wire(self.storage.stages())
     }
 
     /// This node's replica of `agent`, if it runs one: its Raft state, or
@@ -1527,7 +1541,7 @@ pub struct Node {
     ingress: Mutex<Option<(smol::Task<()>, smol::channel::Sender<()>)>>,
     endpoint: Option<Endpoint>,
     stop: Option<smol::channel::Sender<()>>,
-    runtime: Option<JoinHandle<()>>,
+    runtime: Vec<JoinHandle<()>>,
     /// The pair heartbeat's thread, and what stops it.
     liveness: Option<(smol::channel::Sender<()>, JoinHandle<()>)>,
 }
@@ -1637,14 +1651,21 @@ impl Node {
             (network, _) => network,
         };
         let runtime = Arc::new(smol::Executor::new());
+        // Closed to stop: every runtime thread sees it.
         let (stop, stopped) = smol::channel::bounded::<()>(1);
-        let thread = {
-            let runtime = Arc::clone(&runtime);
-            std::thread::Builder::new()
-                .name("vos-node".into())
-                .spawn(move || smol::block_on(runtime.run(stopped.recv())).unwrap_or(()))
-                .expect("the node's thread starts")
-        };
+        let threads: Vec<JoinHandle<()>> = (0..config.runtime_threads.max(1))
+            .map(|index| {
+                let (runtime, stopped) = (Arc::clone(&runtime), stopped.clone());
+                std::thread::Builder::new()
+                    .name(if index == 0 {
+                        "vos-node".into()
+                    } else {
+                        format!("vos-node-{index}")
+                    })
+                    .spawn(move || smol::block_on(runtime.run(stopped.recv())).unwrap_or(()))
+                    .expect("the node's thread starts")
+            })
+            .collect();
         let next = records
             .iter()
             .filter(|record| CreationRecord::creator_of(record.agent) == number)
@@ -1696,6 +1717,7 @@ impl Node {
             sent_across: std::sync::atomic::AtomicU64::new(0),
             installed: std::sync::atomic::AtomicU64::new(0),
             streamed: std::sync::atomic::AtomicU64::new(0),
+            stats: crate::stats::Stats::default(),
             closing: std::sync::atomic::AtomicBool::new(false),
             retiring: Mutex::new(HashSet::new()),
             halted: std::sync::atomic::AtomicBool::new(false),
@@ -1747,6 +1769,7 @@ impl Node {
             inner.spawn(crate::dispatch::dispatch(Arc::clone(&inner), arrivals));
         }
         inner.spawn(crate::dispatch::resend_records(Arc::clone(&inner)));
+        inner.spawn(crate::stats::probe(Arc::clone(&inner)));
         Ok(Self {
             inner,
             data,
@@ -1755,7 +1778,7 @@ impl Node {
             ingress: Mutex::new(None),
             endpoint,
             stop: Some(stop),
-            runtime: Some(thread),
+            runtime: threads,
             liveness,
         })
     }
@@ -1986,7 +2009,7 @@ impl Node {
     fn stop_all(&mut self) {
         // Once is enough: the runtime is gone after it, and nothing it
         // never ran could be awaited.
-        if self.runtime.is_none() {
+        if self.runtime.is_empty() {
             return;
         }
         {
@@ -2033,9 +2056,9 @@ impl Node {
             }
         });
         if let Some(stop) = self.stop.take() {
-            let _ = stop.try_send(());
+            stop.close();
         }
-        if let Some(runtime) = self.runtime.take() {
+        for runtime in self.runtime.drain(..) {
             let _ = runtime.join();
         }
         drop(self.endpoint.take());

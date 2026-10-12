@@ -556,3 +556,27 @@ fn the_largest_step_fits_its_bound() {
     });
     assert!(step.encode().len() <= cap::STEP_RESULT);
 }
+
+/// Every value falls in a bucket that holds it, and the buckets run in
+/// order without gaps.
+#[test]
+fn stage_buckets_hold_their_values_in_order() {
+    use vos_wire::ingress::{BUCKETS, bucket, bucket_top};
+    let mut previous_top = None;
+    for index in 0..BUCKETS {
+        let top = bucket_top(index);
+        if let Some(previous) = previous_top {
+            assert_eq!(
+                bucket(previous + 1),
+                index,
+                "bucket {index} starts after {previous}"
+            );
+        }
+        assert_eq!(bucket(top), index);
+        previous_top = Some(top);
+    }
+    assert_eq!(previous_top, Some(u64::MAX));
+    for value in [0, 7, 8, 9, 15, 16, 1_000, 999_999, u64::MAX] {
+        assert!(bucket_top(bucket(value)) >= value);
+    }
+}

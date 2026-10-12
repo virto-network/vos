@@ -206,6 +206,49 @@ pub enum Answer {
     /// The operator's `GET /agents/{agent}/status`: this node's replica.
     #[codec(index = 15)]
     Status(ReplicaStatus),
+    /// The operator's `GET /stats`: how long this node's stages took.
+    #[codec(index = 16)]
+    Stats(Stats),
+}
+
+/// How long a node's stages took since it started, each as a histogram
+/// over [`bucket`]'s buckets.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct Stats {
+    pub stages: Vec<Stage>,
+}
+
+/// One stage's histogram: how many times it took a value in each bucket,
+/// in microseconds (or, for a count, in units).
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct Stage {
+    pub name: String,
+    pub counts: Vec<u64>,
+}
+
+/// The buckets a stage's values fall in: exact below 8, then four to each
+/// power of two, so a bucket's values are within 25% of each other.
+pub const BUCKETS: usize = 252;
+
+/// The bucket `value` falls in.
+pub fn bucket(value: u64) -> usize {
+    if value < 8 {
+        return value as usize;
+    }
+    let exponent = 63 - value.leading_zeros() as usize;
+    let sub = ((value >> (exponent - 2)) & 3) as usize;
+    8 + (exponent - 3) * 4 + sub
+}
+
+/// The highest value bucket `index` holds.
+pub fn bucket_top(index: usize) -> u64 {
+    if index < 8 {
+        return index as u64;
+    }
+    let exponent = 3 + (index - 8) / 4;
+    let sub = ((index - 8) % 4) as u64;
+    let low = (4 + sub) << (exponent - 2);
+    low + ((1u64 << (exponent - 2)) - 1)
 }
 
 /// A replica's Raft state, as its node has it.

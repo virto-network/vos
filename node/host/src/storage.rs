@@ -172,6 +172,14 @@ struct Shared {
     durably_applied: Mutex<HashMap<AgentId, u64>>,
     /// Commits queued or in flight, by id, with when they were queued.
     pending: Mutex<BTreeMap<u64, Instant>>,
+    /// How long each synced flush took, written and synced, and each
+    /// buffered one, written.
+    flush_synced: crate::stats::Histogram,
+    flush_buffered: crate::stats::Histogram,
+    /// How many commits each flush took.
+    flush_commits: crate::stats::Histogram,
+    /// How long each commit waited in the queue before its flush began.
+    commit_queue: crate::stats::Histogram,
     /// Whether a flush failed: the writer takes no more.
     failed: AtomicBool,
 }
@@ -366,6 +374,18 @@ impl Writer {
             return;
         }
         self.hooks.before_commit();
+        let started = Instant::now();
+        self.shared.flush_commits.record(group.len() as u64);
+        {
+            let pending = self.shared.pending.lock().expect("unpoisoned");
+            for commit in &group {
+                if let Some(queued) = pending.get(&commit.id) {
+                    self.shared
+                        .commit_queue
+                        .took(started.saturating_duration_since(*queued));
+                }
+            }
+        }
         let mut batch = self.store.batch();
         let mut synced = false;
         // Applies in this batch: they count only once it commits.
@@ -460,6 +480,11 @@ impl Writer {
         } else {
             batch.commit(durability).map_err(|error| error.to_string())
         };
+        if synced {
+            self.shared.flush_synced.took(started.elapsed());
+        } else {
+            self.shared.flush_buffered.took(started.elapsed());
+        }
         if let Err(failure) = &result {
             // What reached the disk is unknown, and with it every agent's
             // rows: nothing more is written over them.
@@ -606,6 +631,16 @@ impl StorageThread {
             .get(&agent)
             .copied()
             .unwrap_or(0)
+    }
+
+    /// Its flushes' times and sizes, as stages.
+    pub(crate) fn stages(&self) -> Vec<vos_wire::ingress::Stage> {
+        vec![
+            crate::stats::stage("flush_synced", &self.shared.flush_synced),
+            crate::stats::stage("flush_buffered", &self.shared.flush_buffered),
+            crate::stats::stage("flush_commits", &self.shared.flush_commits),
+            crate::stats::stage("commit_queue", &self.shared.commit_queue),
+        ]
     }
 
     /// Whether a flush failed: every commit since is refused, and the node

@@ -34,7 +34,11 @@ pub(crate) struct Ingress {
 
 fn status(answer: &Answer) -> u16 {
     match answer {
-        Answer::Ran { .. } | Answer::Created(_) | Answer::Placed(_) | Answer::Status(_) => 200,
+        Answer::Ran { .. }
+        | Answer::Created(_)
+        | Answer::Placed(_)
+        | Answer::Status(_)
+        | Answer::Stats(_) => 200,
         Answer::Unplaced(_) => 409,
         Answer::Unconfirmed(_) => 202,
         // The session is done with: the client starts another.
@@ -163,11 +167,12 @@ impl Ingress {
                 }
             }
             ("POST", ["agents"] | ["agents", _, "install" | "roles" | "replicas"])
-            | ("GET", ["agents", _, "status"])
+            | ("GET", ["agents", _, "status"] | ["stats"])
                 if !self.admitted(&request) =>
             {
                 respond(Answer::Rejected(Rejection::Unauthorized))
             }
+            ("GET", ["stats"]) => respond(Answer::Stats(self.inner.stats())),
             ("GET", ["agents", id, "status"]) => respond(match agent(id) {
                 Some(agent) => self.inner.replica_status(agent),
                 None => Answer::NoAgent,
@@ -290,7 +295,15 @@ impl Ingress {
         let (key, signature) = (query.key, query.signature);
         let signed = self
             .inner
-            .offload(move || verify(&key, &message, &signature))
+            .offload({
+                let inner = Arc::clone(&self.inner);
+                move || {
+                    let started = std::time::Instant::now();
+                    let signed = verify(&key, &message, &signature);
+                    inner.stats.verify.took(started.elapsed());
+                    signed
+                }
+            })
             .await;
         match signed {
             Some(true) => {}

@@ -5995,3 +5995,352 @@ and stage times):
 - the attribution: call graphs, the JIT's perf map, off-CPU, and fewer
   cores;
 - repeated runs for the variance.
+
+#### 3.10a2 Built: attribution
+
+**Each thread's CPU in every run.** For each node: its runtime threads
+(`vos-node`), its writer (`vos-storage`) and its network (`vos-net`),
+beside its executors, from `/proc/<pid>/task`. For 64 agents × 16
+sessions, closed:
+- the runtime about 70–77%;
+- the writer about 45%;
+- the network about 30%;
+- the executors 60–63% each.
+
+None is saturated.
+
+**The node's runtime on several threads, an experiment.**
+- **The setting:** `Config::runtime_threads`, 1 by default. Its flag,
+  `vos node run --runtime-threads`, is hidden: more than one thread has
+  run under no fault suite.
+- **The result:** with three threads, each node's throughput fell (one
+  agent 14.0k/s rather than 15.0k/s; 64 agents 14.7k and 26.1k rather
+  than 18.0k and 27.8k). The runtime threads used about 100% between
+  them, rather than 70%.
+- **It proves less than it seems.** The nodes' six pinned CPUs were
+  already about 4.7 busy, and two more threads oversubscribe them. The
+  drop measures CPU contention as much as anything the runtime does. The
+  default stays 1, and the stage times below, not this run, place the
+  runtime.
+
+**Stage times, from a new operator stats route** (`GET /stats`,
+`Answer::Stats`).
+- **What it serves:** log-linear histograms (four buckets to each power
+  of two, `vos_wire::ingress::bucket`), recorded with relaxed atomics.
+- **Each stage is stamped where it ends:**
+  - an executor's work ends inside the executor;
+  - a proposal ends when the driver answers it;
+  - a commit when the driver takes `Committed`;
+  - an apply when the applier records it.
+
+  The leader loop's wait to be polled again after each is a stage of its
+  own (`resume`).
+- **The stages:**
+  - **the leader's batch:** its inputs; its refine and dry run, each
+    with its wait for an executor; its proposal; its commit; its apply;
+    the whole batch;
+  - **the writer:** each commit's wait in its queue (`commit_queue`), its
+    synced and its buffered flushes apart, and the commits each took;
+  - **ingress:** each signature check (`verify`);
+  - **the queue:** each input's wait in its agent's queue until a batch
+    takes it (`queued`);
+  - **the runtime:** how late a probe sleeping 10 ms at a time wakes
+    (`late`).
+- **Lost batches** record only their early stages, so the stages'
+  counts differ.
+- **The bench** reads the stats at each window's edges, and gives each
+  stage's p50, p99 and largest over the window, with its count.
+
+| Run | refine | dry run | propose | commit | apply | resume | queue | synced flush | verify |
+|---|---|---|---|---|---|---|---|---|---|
+| one agent, 256 sessions closed (about 190 inputs a batch) | 5.1 ms | 1.8 ms | 23 µs | 1.3 ms | 0.8 ms | 13 µs | 6 µs | 0.8 ms | |
+| 64 agents, 10k/s open (about 19 inputs) | 0.8 ms | 0.3 ms | 13 µs | 1.0 ms | 0.1 ms | 7 µs | 4 µs | 0.8 ms | |
+| 64 agents × 4, closed (4 inputs) | 0.5 ms | 0.2 ms | 0.2 ms | 4.1 ms | 3.1 ms | 0.2 ms | 0.8 ms | 1.3 ms | 127 µs |
+| 64 agents × 16, closed (13 inputs) | 1.3 ms | 0.4 ms | 0.9 ms | 10.2 ms | 5.1 ms | 0.9 ms | 0.9 ms | 1.3 ms | 159 µs |
+
+(p50s; their p99s are 2–5 times as long under load.)
+
+**One agent: its capacity is about 14k/s.**
+- Open loop at 15k, 18k and 21k/s offered, it falls behind at each.
+- A batch's refine takes about 27 µs an input, run in series in one
+  program run: 5 ms for 190 inputs. The dry run takes about a third as
+  long, and the commit and apply about 2 ms.
+- The levers are a cheaper refine per input, and the next batch's refine
+  overlapping the last one's commit (pipelined refines).
+
+**64 agents: the commit waits on serialized rounds.**
+- Under the 16-session load, a commit takes 10 ms and an apply 5 ms.
+  Meanwhile a commit waits about 0.9 ms in the writer's queue, and a
+  synced flush takes about 1.3 ms.
+  - The leader loop's own wait to be polled again is apart (`resume`,
+    about 1 ms).
+  - The driver and the applier are tasks on the same runtime thread,
+    though, so `commit` and `apply` include their waits to be polled.
+  - A probe now measures that wait directly (`late`): a task on the
+    runtime sleeps 10 ms at a time and records how late it wakes.
+- So a commit spans several rounds of about 2 ms each.
+- The structural cause is in the driver: a round awaits its durable write
+  inline (`act()`'s `Action::Write(write) => return self.write(write).await`),
+  and takes no input, acknowledgement or proposal until the writer
+  answers. An append, a follower's acknowledgement and the commit each
+  wait a round.
+- The core already supports writes answered later (as etcd does). The
+  design of that lever starts there.
+
+**Profiles (perf, no frame pointers, by symbol).**
+
+*A follower answering queries at 6k/s:*
+- ed25519 verification: about 50% of the node's CPU (curve25519 field
+  operations; `calls::verify`).
+- Parsing and validating a program's code blob (`spi::validate_code_blob`,
+  `parse_compact_code_blob`): about 16%.
+- The query's marginal cost, from two rates (2k/s and 6k/s), is about
+  420–470 µs of the follower's CPU, against 50 µs for the node's query
+  path in process (`benches/acceptance.rs`: median 50.6 µs, p99 151 µs).
+  - So most of a query over HTTP is its signature check and its
+    program's parse.
+
+*One node under 64 agents × 4, closed:*
+
+| Where | Share |
+|---|---|
+| ed25519 verification (curve25519 field operations, `calls::verify`) | about 36% |
+| the agents' guest code (JIT) | 21% |
+| libc (copies, fills, malloc and free) | 13% |
+| fjall point reads (memtable search, skiplist) | about 8% |
+
+**What a signature check costs** (`benches/verify.rs`, ed25519-dalek
+alone, pinned):
+
+| Check | A P-core | An E-core |
+|---|---|---|
+| key decompressed each time, strict (the node's check) | 34 µs | 77 µs |
+| key decompressed once, strict | 36 µs | 66 µs |
+| key decompressed once, not strict | 27 µs | 54 µs |
+
+- **In a loaded node, a check takes 127–159 µs at p50** (the `verify`
+  stage), exactly one per call. With the node's hyperthread siblings and
+  E-cores busy, a check runs 2–4 times as long.
+- At 27.6k calls/s that is about 1.5 cores per node, the profile's 36%.
+- **The levers:**
+  - Caching decompressed keys buys little: nothing on a P-core, 14% on
+    an E-core.
+  - A non-strict check, or batch verification, buys more. Each changes
+    what signatures are accepted, so each needs a design for strict
+    semantics.
+
+**Why programs are parsed again.**
+- **Where the pool's programs come from:** a node puts a program in its
+  machine pool in two places only:
+  - when it takes the program's install as the agent's leader;
+  - at start, for every program pinned then.
+- **What a node without it does:** a follower applies the install, and
+  pins the program, but leaves it out of its pool.
+  - The agent's `instantiate` then answers `WHO`, and the guest builds
+    the machine itself, as on a JAM host: `historical_lookup`, then
+    `machine` (which parses and validates the whole blob), `pages` and
+    `poke`.
+  - **The gas differs.**
+    - The failed `instantiate` still charges `machine`'s base.
+    - Then the guest pays for `historical_lookup` twice (a 256-byte
+      head, then the rest: about the blob's length in all), for its own
+      copying, and for the loader's calls, which cost what the pool's
+      price does.
+    - Inner machines are made only in refine, whose output the log
+      carries, so replicas never diverge.
+    - But a refine's outcome near its gas limit depends on whether its
+      leader's pool held the program, and a query's on the node it
+      reaches.
+- **Where it costs:** until the node restarts, every query on a node
+  that never took the program's install, and every refine there once
+  it leads.
+- **The lever:** the pool loads a stored program on a miss, at the
+  same price, so `instantiate` answers alike on every node holding it.
+
+**Slice 2's rows, in process** (`benches/acceptance.rs`, one node):
+- 34.7 µs per request under load, of which 26.5 µs is execution;
+- one request alone, 2.9 ms;
+- a query, median 50.6 µs, p99 151 µs.
+
+They are unchanged.
+
+**Found in CI, and fixed: a property test's check was wrong** (vos-raft,
+`tests/proptest_invariants.rs`). It is pre-existing.
+- **The old check:** an entry's term could change at an index only if
+  the worker's term had advanced since its last observation.
+- **What failed:** a random case, a term-0 append, then a term-11 one
+  rejected (raising the term), then a term-11 append replacing the entry.
+  That is ordinary Raft: a later leader replaces an uncommitted entry,
+  its term already known.
+- **The check now:** an entry is replaced only when the worker holds a
+  later term than the entry's.
+- **Not added: committed entries never change.** The test's random
+  messages come from senders no real leader would be (a "leader" at
+  term 0 commits an entry that one at term 1 then contradicts), and the
+  core trusts its leaders.
+- **Carried to 3.10c:** whether the core refuses to truncate below its
+  commit, as etcd's does (it panics), against a bug elsewhere.
+- proptest's regression file keeps the first case.
+
+**Failover and the soak: the baseline** (after the 64-agent rows, on
+the same nodes).
+- **Failover:** node 3, leading 24 of the 64 agents, is killed. Every
+  agent has a leader again 2.63 s later. Restarted, node 3 listens after
+  4.29 s, then takes 4% of one core over 10 s.
+- **The soak:** 64 agents × 4 sessions, open at 6k/s, twelve windows of
+  50 s, after the failover. No call failed, and every agent's counter
+  holds every increment it answered, once.
+
+  | Window | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 |
+  |---|---|---|---|---|---|---|---|---|---|---|---|---|
+  | p99 (ms) | 10.3 | 31.1 | 24.7 | 28.6 | 71.6 | 35.5 | 19.7 | 27.9 | 53.9 | 407.9 | 38.2 | 48.5 |
+  | node 1 busy (cores) | 1.93 | 2.15 | 2.12 | 2.09 | 2.14 | 2.08 | 2.07 | 2.10 | 2.11 | 2.12 | 2.24 | 2.31 |
+
+  - p50 stays at 5.3–5.6 ms throughout. Window 2 overlapped a build of
+    mine on the same cores.
+- **It fails the criterion as it stood** (±10% between the first window
+  and the last):
+  - CPU per commit rose from 756 µs to 889 µs (+17%), most of it in the
+    last two windows;
+  - the p99 rose from 10.3 ms to 48.5 ms.
+- **The p99 is decided by rare stalls,** not by a rising cost.
+  - In every window, a few thousand calls waited on their session's
+    previous one: some calls took longer than a session's 43 ms between
+    calls.
+  - The same stalls appear at 10k/s before the failover (p99 103–117 ms,
+    500–700 calls waiting). They put that run's knee between 5k and
+    10k/s, where earlier runs had it between 10k and 20k.
+
+- **Its CPU per commit is not the open rows'.** Four sessions an agent
+  hold a batch to 4 inputs, where the open rows' batches take 7 to 19.
+  So each commit carries more of a batch's fixed cost.
+- **Its rise is not explained yet.** Node 1's busy cores went from 1.93
+  to 2.31 at the same rate. Three later soaks of 5 minutes rose by 2–7%.
+  The bench now splits each window's CPU by thread with fjall's workers
+  (flushes and compactions) apart, and the next soak runs 30 minutes, to
+  see whether it levels off.
+- **The criterion, changed** (the soak's purpose is no growth with
+  history, and the p99 is decided by rare stalls):
+  - over the clean windows only: the machine ran under 1.5 cores outside
+    the run, and every task on it waited on IO under 10% of the window;
+    the windows dropped are reported;
+  - the median of the first three windows against the last three, for
+    CPU per commit, p50 and p95, within 10%;
+  - the stalls as a trend of their own: the runtime probe's wakes about
+    50 ms late or more and the batches as long (within 10% and one
+    more), and the longest batch (within one bucket);
+  - one load throughout, each call signed as its session goes, with the
+    CPU and the stats read at each window's edges: the nodes never rest
+    between windows, so flushes and compactions stay in the windows;
+  - 30 minutes by default;
+  - the p99 is still each window's, and the budgets judge it, stalls and
+    all.
+- **Its first continuous run** (5 minutes, disk, no failover before):
+  - all six windows clean; fjall's workers now show 1–3% of a core,
+    where windows with gaps between them showed none;
+  - window 1 had no stall (nothing flushed yet), then about six runtime
+    stalls a window;
+  - p95 6.4 ms in window 1, 17–18 ms after; p50 flat at 5.3–5.6 ms; CPU
+    per commit 787 µs, then 831;
+  - the verdict: it grows, on the batches of 49 ms or more (26, then 112)
+    and the longest batch (131 ms, then 328).
+  - Part of that rise is the store reaching its steady state, not
+    growth with history: the first windows come before any flush.
+- **Carried to the next soak's use** (3.10b0's A/B):
+  - the early median starts after a warm-up, once every keyspace has
+    flushed;
+  - sessions keep arriving: each plan moves to a new session every so
+    many calls, as real clients do, so the session rows, the expiry
+    index and its sweeps grow as they would;
+  - a session that runs out before the first window counts in the
+    first, not the last.
+
+**The stalls, found: fjall frees a flushed memtable under its version
+lock.**
+- **What the stages show:** each stage's largest value (the bench now
+  prints p50/p99/max). In a soak window whose p99 is 4.5 ms, the largest
+  `queued`, `commit`, `apply`, `resume` and `refine` are still 114–196
+  ms. Stalls of 100–260 ms come a few times a minute, on every run.
+- **Not the disk:** the same soak on tmpfs (`DATA=/tmp`) has no IO
+  stalls (`/proc/pressure/io` reads 0%), and the same stalls, though its
+  synced flushes take at most 2 ms in some of those windows.
+- **Not the machine:** what else ran stayed at 0.2–1.3 cores (`/proc/stat`
+  less the run), the nodes were far from busy, and memory pressure was
+  nil.
+- **Where:** node 1 sampled at 499 Hz with its stacks for 120 s of the
+  soak (`perf record --call-graph dwarf`, no samples lost).
+  - Four times, its runtime thread, its writer and its executors all go
+    without a sample for 110–160 ms at the same instant, while fjall's
+    workers run.
+  - In each gap, one fjall worker is flushing a memtable to a table
+    (`fjall::flush::worker::run`), and another is dropping sealed
+    memtables (`drop_in_place<Vec<Arc<Memtable>>>`, freeing every
+    skiplist node).
+- **Why it blocks everyone:** lsm-tree 3.1.10's `register_tables` takes
+  the tree's `compaction_state` lock, then its `version_history` write
+  lock. Under both:
+  - **The version's upgrade:** `persist_version` syncs the version file
+    and its directory, then `rewrite_atomic` replaces `CURRENT` (a
+    synced temporary file, a rename, a sync, a directory sync). Five
+    syncs a version, under the lock.
+  - **`maintenance`** pops the versions older than the watermark. The
+    one holding a flushed memtable's last reference frees that whole
+    skiplist there: a 64 MiB memtable, fjall's default, is about a
+    million nodes.
+  - **Every reader and writer waits:** `get`, ranges and `append_entry`
+    take the same lock to read. The log keyspace takes every Raft
+    append, so a stall there stops the writer, and with it every agent
+    on the node.
+  - **Compactions do the same:** the compaction worker upgrades versions
+    and runs `maintenance` under the write lock too.
+  - **No node thread can be the one to free it:** a version below the
+    watermark has no live snapshot, and while a snapshot lives, the
+    history holds its version.
+- **How often:** each keyspace's memtable fills and flushes every few
+  tens of seconds under load, so a node stalls a few times a minute.
+  Every agent on the node shares the keyspaces, so every agent stalls.
+
+**The levers, in the order 3.10b takes them** (by the attribution above;
+each by 3.10b's method):
+0. **No memtable freed under fjall's version lock.** It decides the p99
+   and the knee, so it comes first, with its own design and review.
+   - **The fix:** `maintenance` returns the versions it popped, and
+     every caller (flush, compactions) drops them after its locks.
+     - A patch to lsm-tree, through `[patch.crates-io]`, offered
+       upstream.
+     - It is one more thing to remove before master, as vos-raft's
+       copy is.
+     - Before patching, the stacks confirm the chain: the drop under
+       `maintenance`, under `register_tables`.
+   - **Measured beside it, in the same A/B:**
+     - smaller memtables: shorter stalls, but more flushes, so more
+       version upgrades with their syncs and more level-0 tables. fjall
+       keeps each keyspace's size from its creation, so a change takes
+       new keyspaces; the log keyspace is the hot one;
+     - an allocator whose frees from another thread are cheap. It would
+       shorten the free, and libc's allocation is 13% of a loaded node.
+       But it changes the whole process, and the free still happens
+       under the lock.
+   - **What stays:** the five syncs under the lock at every flush and
+     every compaction. Measured apart, disk against tmpfs, after the
+     fix.
+   - **Its measure:** the soak's stalls and largest stage times, against
+     the baselines above, and a soak of 30 minutes first.
+1. **`instantiate` loads a stored program the pool lacks,** at the same
+   price. Queries on a node that never took the install, and refines
+   there once it leads, run pooled, and every node charges the same gas.
+   With its own design and review.
+2. **A cache of decompressed verifying keys,** bounded. Small by the
+   microbenchmark; kept only if it moves the node's numbers.
+3. **Store reads scoped to a batch** (3.10b's first candidate).
+4. **The driver's durable writes, answered later,** so a round goes on
+   while the writer syncs. With its own design and review.
+5. **Cheaper signature checks:** batch or non-strict verification,
+   keeping the strict check's semantics. With its own design and review.
+6. **A cheaper refine per input, then pipelined refines,** once the
+   single agent's open-loop capacity is measured again. Pipelined
+   refines have their own design and review.
+
+**Moved:** TLS and table reads under writes are measured in 3.10c, with
+the final numbers. Failover and the soak run twice: a baseline now, and
+again at the end.
