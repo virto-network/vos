@@ -296,11 +296,11 @@ impl Ingress {
         let signed = self
             .inner
             .offload({
-                let inner = Arc::clone(&self.inner);
+                let stats = Arc::clone(&self.inner.stats);
                 move || {
                     let started = std::time::Instant::now();
                     let signed = verify(&key, &message, &signature);
-                    inner.stats.verify.took(started.elapsed());
+                    stats.verify.took(started.elapsed());
                     signed
                 }
             })

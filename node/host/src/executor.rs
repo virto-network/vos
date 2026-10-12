@@ -14,8 +14,8 @@ type Job = Box<dyn FnOnce() + Send>;
 pub(crate) struct Panicked(pub String);
 
 pub(crate) struct Executors {
-    sender: Option<mpsc::Sender<Job>>,
-    threads: Vec<JoinHandle<()>>,
+    sender: Mutex<Option<mpsc::Sender<Job>>>,
+    threads: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl Executors {
@@ -43,8 +43,27 @@ impl Executors {
             })
             .collect();
         Self {
-            sender: Some(sender),
-            threads,
+            sender: Mutex::new(Some(sender)),
+            threads: Mutex::new(threads),
+        }
+    }
+
+    /// Take no more jobs, and wait for the threads to finish the ones
+    /// taken, and with them all their jobs hold. The current thread is not
+    /// waited for: the executors' last owner can go with a job one of them
+    /// runs, and that thread ends on its own once the job returns.
+    pub(crate) fn close(&self) {
+        self.sender
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let threads =
+            std::mem::take(&mut *self.threads.lock().unwrap_or_else(PoisonError::into_inner));
+        let current = std::thread::current().id();
+        for thread in threads {
+            if thread.thread().id() != current {
+                let _ = thread.join();
+            }
         }
     }
 
@@ -69,6 +88,8 @@ impl Executors {
         });
         let sent = self
             .sender
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
             .map(|sender| sender.send(job).is_ok())
             .unwrap_or(false);
@@ -85,22 +106,35 @@ impl Executors {
 
 impl Drop for Executors {
     fn drop(&mut self) {
-        self.sender.take();
-        // Their last owner can go with a job one of them runs: that thread
-        // ends on its own once its job returns, and joining it would wait
-        // for itself.
-        let current = std::thread::current().id();
-        for thread in self.threads.drain(..) {
-            if thread.thread().id() != current {
-                let _ = thread.join();
-            }
-        }
+        self.close();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Closing waits for the jobs already taken, so what they hold is gone
+    /// once it returns.
+    #[test]
+    fn closing_waits_for_the_jobs_taken() {
+        let executors = Executors::spawn(2);
+        let held = Arc::new(());
+        let job = {
+            let held = Arc::clone(&held);
+            executors.run(move || {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                drop(held);
+            })
+        };
+        executors.close();
+        assert_eq!(Arc::strong_count(&held), 1, "a job outlived the close");
+        assert!(smol::block_on(job).is_ok());
+        assert!(
+            smol::block_on(executors.run(|| ())).is_err(),
+            "a job taken after the close"
+        );
+    }
 
     /// The executors' last owner, dropped by a job on one of their threads,
     /// stops them without joining that thread.

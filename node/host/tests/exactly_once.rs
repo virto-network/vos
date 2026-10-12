@@ -431,25 +431,32 @@ fn post_within(
         .map_err(|_| "an answer that does not decode".to_string())
 }
 
-/// [`FAULTS`] failures, one at a time: among them every clock jumping
-/// past the skew under load, and every session expiring.
 /// A follower of `agent` stays down until its leader has compacted the log
 /// past the follower's last entry, so it comes back by a snapshot however
-/// slowly the clients go (within a minute).
+/// slowly the clients go (within a minute). A skip, or a minute run out, is
+/// logged as such: a later missing snapshot can be traced to it.
 fn follower_down_past_compaction(cluster: &Cluster, agent: AgentId) {
-    let Some(leader) = cluster.leader(agent) else {
-        return;
+    let follower = || {
+        let leader = cluster.leader(agent)?;
+        (1..=NODES)
+            .filter(|number| *number != leader)
+            .find_map(|number| Some((number, cluster.node(number)?.replica(agent)?.last_index)))
     };
-    let Some((number, last)) = (1..=NODES)
-        .filter(|number| *number != leader)
-        .find_map(|number| Some((number, cluster.node(number)?.replica(agent)?.last_index)))
-    else {
-        return;
+    let until = Instant::now() + Duration::from_secs(10);
+    let (number, last) = loop {
+        if let Some(found) = follower() {
+            break found;
+        }
+        if Instant::now() >= until {
+            cluster.saw("fault: a follower down past compaction, skipped: no leader and follower");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
     };
     cluster.saw("fault: a follower down past compaction");
     cluster.stop(number);
     let until = Instant::now() + Duration::from_secs(60);
-    while Instant::now() < until {
+    loop {
         let compacted = cluster
             .leader(agent)
             .and_then(|leader| cluster.node(leader)?.replica(agent))
@@ -457,11 +464,18 @@ fn follower_down_past_compaction(cluster: &Cluster, agent: AgentId) {
         if compacted {
             break;
         }
+        if Instant::now() >= until {
+            cluster.saw("fault: a follower down past compaction, a minute run out");
+            break;
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
     cluster.start(number);
 }
 
+/// [`FAULTS`] failures, one at a time: among them every clock jumping
+/// past the skew under load, every session expiring, and a follower kept
+/// down until the log compacts past it.
 fn faults(cluster: &Cluster, clients: &[Client], random: &mut Random) {
     let pause = |random: &mut Random| {
         std::thread::sleep(Duration::from_millis(100 + random.below(400)));

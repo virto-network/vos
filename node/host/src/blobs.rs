@@ -187,8 +187,9 @@ struct Inner {
     thread: Mutex<Option<JoinHandle<()>>>,
     /// One collection at a time.
     collecting: smol::lock::Mutex<()>,
-    /// Who waits for a blob to be stored.
-    waiters: Mutex<HashMap<[u8; 32], Vec<smol::channel::Sender<()>>>>,
+    /// Who waits for a blob to be stored: shared with the writer, which
+    /// holds no reference to this state, so it never drops it last.
+    waiters: Arc<Waiters>,
     /// Open segments, for reads.
     files: Mutex<HashMap<u64, Arc<File>>>,
 }
@@ -265,7 +266,7 @@ impl Blobs {
             index,
             sender: Mutex::new(Some(sender)),
             thread: Mutex::new(None),
-            waiters: Mutex::new(HashMap::new()),
+            waiters: Arc::default(),
             files: Mutex::new(HashMap::new()),
             collecting: smol::lock::Mutex::new(()),
         });
@@ -276,7 +277,7 @@ impl Blobs {
                 index: inner.index.clone(),
                 segment_bytes,
                 current,
-                inner: Arc::downgrade(&inner),
+                waiters: Arc::clone(&inner.waiters),
             };
             std::thread::Builder::new()
                 .name("vos-blobs".into())
@@ -698,8 +699,11 @@ struct Writer {
     index: Keyspace,
     segment_bytes: u64,
     current: Current,
-    inner: std::sync::Weak<Inner>,
+    waiters: Arc<Waiters>,
 }
+
+/// Who waits for which blob to be stored.
+type Waiters = Mutex<HashMap<[u8; 32], Vec<smol::channel::Sender<()>>>>;
 
 impl Writer {
     /// Requests in order; consecutive puts share a group and a sync. Any
@@ -756,10 +760,8 @@ impl Writer {
                 }
             }
             let result = self.write(&group).map_err(|error| error.to_string());
-            if result.is_ok()
-                && let Some(inner) = self.inner.upgrade()
-            {
-                let mut waiters = inner.waiters.lock().expect("unpoisoned");
+            if result.is_ok() {
+                let mut waiters = self.waiters.lock().expect("unpoisoned");
                 for put in &group {
                     for notify in waiters.remove(&put.blob.hash).unwrap_or_default() {
                         let _ = notify.try_send(());

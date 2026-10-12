@@ -467,7 +467,7 @@ pub(crate) struct Inner {
     /// Snapshot streams this node's groups started to their followers.
     pub(crate) streamed: std::sync::atomic::AtomicU64,
     /// How long its leaders' batches spend in each stage.
-    pub(crate) stats: crate::stats::Stats,
+    pub(crate) stats: Arc<crate::stats::Stats>,
     /// The node is shutting down: no group starts or retires.
     pub(crate) closing: std::sync::atomic::AtomicBool,
     /// Agents whose retirement is not yet written: no group starts for
@@ -1732,7 +1732,7 @@ impl Node {
             sent_across: std::sync::atomic::AtomicU64::new(0),
             installed: std::sync::atomic::AtomicU64::new(0),
             streamed: std::sync::atomic::AtomicU64::new(0),
-            stats: crate::stats::Stats::default(),
+            stats: Arc::default(),
             closing: std::sync::atomic::AtomicBool::new(false),
             retiring: Mutex::new(HashSet::new()),
             halted: std::sync::atomic::AtomicBool::new(false),
@@ -2082,6 +2082,9 @@ impl Node {
         for runtime in self.runtime.drain(..) {
             let _ = runtime.join();
         }
+        // The jobs left finish here, and what they hold goes with them: no
+        // part of the node (its store and its lock among them) outlives it.
+        self.inner.executors.close();
         drop(self.endpoint.take());
     }
 }
@@ -2109,7 +2112,36 @@ fn write_token(path: &Path, token: &[u8; 32]) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::Tasks;
+    use super::{Config, Node, Tasks};
+    use std::sync::Arc;
+
+    /// A node stopped while an executor runs a job holding its state (as
+    /// a signature check did, and any job may) is gone once its stop
+    /// returns, its store and the store's lock with it: it opens again on
+    /// the same directory at once.
+    #[test]
+    fn a_node_stopped_while_a_job_holds_it_opens_again_at_once() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../agent/default/target/riscv64em-vos/release/vos-agent.elf"
+        );
+        let elf = std::fs::read(path).expect("run `just build-agent`");
+        let agent = vos_pvm_compiler::link_elf_spi(&elf).expect("links");
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::open(dir.path(), Config::new(agent.clone())).unwrap();
+        let (started, start) = std::sync::mpsc::channel();
+        let held = Arc::clone(&node.inner);
+        let job = node.inner.executors.run(move || {
+            started.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            drop(held);
+        });
+        start.recv().unwrap();
+        node.shutdown();
+        drop(job);
+        let opened = Node::open(dir.path(), Config::new(agent));
+        assert!(opened.is_ok(), "{:?}", opened.err());
+    }
 
     #[test]
     fn finished_tasks_do_not_pile_up() {

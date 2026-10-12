@@ -6742,8 +6742,8 @@ failed on the commit before 3.10b1 in four copies out of nine.
   test's reader took for a failure. The poll now counts that as nothing
   yet, until its deadline. (Its `just ci` failed so once.)
 - **Since:** nine loaded copies, none failing either way. One failed to
-  bind an address another copy held, which only concurrent copies of the
-  binary do.
+  bind an address another cluster's port picker took, in another copy
+  or a parallel test in the same binary.
 - **Not reproduced:** the `NoAgent` a restarted node answered once in a
   loaded `just ci`, in 24 loaded copies across these runs. The directory
   is rebuilt from synced records at open, so it should not happen; it
@@ -6871,3 +6871,89 @@ soaks), three interleaved 7.5-minute soaks each of lever 1's build,
 
 **Upstream:** `bytes_per_sync` and `strict_bytes_per_sync` settings, in
 `UPSTREAM.md`.
+
+#### 3.10b2 Built and measured: not kept
+
+**Built as designed:**
+- each megabyte written back after a data block, in the two variants;
+- every error failing the table write;
+- unit tests on the synced-to offset against the file's real size, and
+  on an injected failure;
+- a read-back test through a reopen.
+
+Three mutations (never writing back, swallowing the error, ignoring the
+buffered bytes) each failed a test.
+
+**Measured** on disk, quiet, three interleaved 7.5-minute soaks of each
+build (`soak steady`, after 150 s of warm-up):
+
+| Build | Batches ≥ 49 ms a window | Longest batch | p95 | p99 |
+|---|---|---|---|---|
+| 3.10b1's | 100, 274, 264 | 328, 459, 524 ms | 19.6, 28.8, 24.6 ms | 31, 220, 68 ms |
+| write | 245, 115, 183 | 655, 786, 786 ms | 23.3, 26.8, 25.2 ms | 144, 378, 316 ms |
+| bounded | 182, 266, 268 | 262, 393, 197 ms | 23.4, 30.9, 52.4 ms | 50, 178, 356 ms |
+
+- **write is worse:** its longest batch passes every run of the build
+  before it.
+- **bounded does not move past the spread:** the counts of long batches
+  and the p99 overlap entirely. Its longest batch is the lowest of the
+  three in every round (262, 393 and 197 ms), but the p99 and the counts
+  do not follow: suggestive, not shown.
+- **By the rule set before measuring,** neither is kept. The code is
+  reverted; this design and these numbers are the record, and nothing
+  goes to `UPSTREAM.md`.
+- **Not run:** the design's mechanism measures (the writer's longest
+  `do_get_write_access` run, the drive's requests in flight beside it,
+  p50). With neither variant kept they could not change the outcome.
+
+**Why the measurement could not decide:**
+- The runs vary more than any effect. The same build gives p99 31 ms in
+  one run and 220 ms in another.
+- Every build drifts worse through the session (p95 from about 20 ms to
+  30–50 ms, CPU per commit from about 1,000 to 1,270 µs).
+  - The drive's own state fits the latency: DRAM-less, 89% full, mounted
+    without discard, so each soak's deleted store is never trimmed.
+  - It does not explain the CPU, as a slow drive adds waiting, not work.
+    That could be fjall's write throttle (it spins once level 0 holds 20
+    runs, as compactions fall behind a slower drive), heat, or memory
+    pressure.
+  - Repeated tmpfs soaks over one session would tell the machine's drift
+    from the drive's.
+- A soak is slow to count rare events: a fresh store flushes nothing for
+  its first minutes, and a 64 MiB memtable flushes a few times a minute.
+
+**For any later disk lever** (fjall's journal first), the measurement
+comes first:
+- more events a minute, and a shorter warm-up, from a bench setting of
+  smaller memtables, with any result confirmed at the default sizes;
+- the writer's own synced-flush times (the `flush_synced` stage) as the
+  primary measure, closer to the cause than whole batches;
+- and a drive in a known state (`fstrim` before each round).
+
+#### The exactly-once tests under load: the review's follow-ups
+
+- **A node's teardown no longer outlives it.** `stop` now closes the
+  executors after the runtime threads, waiting for the jobs already
+  taken. Before, jobs left over (a signature check, a log load, a
+  snapshot export) could still hold the node's state, with its store and
+  the store directory's lock, after `Node::drop` returned. An in-process
+  restart could then find the store locked. That late teardown was what
+  joined an executor thread from itself.
+- **A signature check holds only the stats it records,** not the node's
+  state (`Inner::stats` is shared).
+- **The blob writer holds only the waiters it notifies,** so it never
+  holds the blob store's last reference. Before, it held it while
+  notifying, and dropping it there would have joined the writer from
+  itself, the same bug.
+- **The follower-down fault is never skipped silently.** It waits up to
+  10 s for a leader and a follower, and logs a skip, or a minute run out,
+  as such.
+- **The backlog test counts only an unknown instance as "not yet".**
+  Anything else fails it at once, as before.
+- **Shutdown now waits for the executors' jobs in flight.** A refine runs
+  to its end, bounded by its gas; a test hook that holds one must let it
+  go before its node stops.
+- **Tests:** closing waits for the jobs taken, and takes none after it;
+  and a node stopped while a job holds its state opens again on the same
+  directory at once. Without the close in `stop`, that open fails with
+  the store locked.

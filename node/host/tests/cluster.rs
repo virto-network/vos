@@ -10,7 +10,7 @@ use smol::future::FutureExt;
 use vos_net::memory::Hub;
 use vos_node::store::{Batch as _, Durability, EntryKind, Fjall, Store, View};
 use vos_node::{CallError, Config, Hooks, Node, Peers, Reply, Space, SpaceNode};
-use vos_wire::abi::refusal;
+use vos_wire::abi::{failure, refusal};
 use vos_wire::batch::{Batch, Input, Message, Request};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session};
 use vos_wire::ingress::{Contact, NodeId, Unplaced};
@@ -306,12 +306,16 @@ impl Cluster {
         }
     }
 
-    /// The counter at `at`, once its replica answers it: a replica still
+    /// The counter at `at`, or what was answered instead: a replica still
     /// catching up after a restart may not hold the instance yet.
-    fn value_once_served(&self, at: NodeNumber, agent: AgentId) -> Option<u64> {
+    fn value_once_served(
+        &self,
+        at: NodeNumber,
+        agent: AgentId,
+    ) -> Result<u64, Result<Outcome, CallError>> {
         match self.query_value(at, agent) {
-            Ok(Outcome::Done(bytes)) => Some(u64::decode(&bytes).unwrap().0),
-            _ => None,
+            Ok(Outcome::Done(bytes)) => Ok(u64::decode(&bytes).unwrap().0),
+            other => Err(other),
         }
     }
 
@@ -995,7 +999,17 @@ fn a_backlog_beyond_a_window_drains() {
     cluster.start(2);
     cluster.start(3);
     let until = Instant::now() + Duration::from_secs(60);
-    while cluster.value_once_served(2, target).unwrap_or(0) < 300 {
+    loop {
+        match cluster.value_once_served(2, target) {
+            Ok(300..) => break,
+            // Not caught up yet: the count so far, or no instance yet.
+            Ok(_)
+            | Err(Ok(Outcome::Failed {
+                code: failure::UNKNOWN,
+                ..
+            })) => {}
+            Err(other) => panic!("{other:?}"),
+        }
         assert!(Instant::now() < until, "the backlog did not drain");
         std::thread::sleep(Duration::from_millis(20));
     }
