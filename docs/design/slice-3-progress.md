@@ -7058,3 +7058,26 @@ symbol, both core types together):
 **Next, each with its own design:** store reads scoped to a batch (the
 memtable lookups), then cheaper signature checks that keep the strict
 check's semantics.
+
+**Where the reads and the signature checks go** (a build with frame
+pointers and line tables, one node at 15k/s, 152,810 samples):
+- **Memtable lookups** (8.5% of samples) by caller:
+  - the writer's own inserts searching the skiplist: 3.5% (write cost);
+  - accumulate's `write` reading each key's old value to report its old
+    length (the JAM call returns it): 2.5%;
+  - refine's state reads: 0.7%;
+  - accumulate's own reads: 0.7%;
+  - the rest (log entries, sessions, the node's checks): about 1%.
+
+  So a memo of rows read, per snapshot, saves the repeats: accumulate
+  reading a key and then writing it, and the dry run reading what refine
+  read. That is a few percent of the node.
+- **Signature checks** (17% of samples):
+  - the check's equation (the double-base scalar multiplication): 11.2%;
+  - decompressing the caller's key (`VerifyingKey::from_bytes`), at every
+    call: 3.4%;
+  - other curve work 2%, hashing 0.3%.
+- **The microbenchmark was wrong about the key:** in it, a cached key
+  saved nothing on a P-core. In the node, decompression is a fifth of
+  each check. So the verifying-key cache, skipped in 3.10b3, is back in
+  the order, and next: about 3% of a node's CPU, bounded by sessions.
