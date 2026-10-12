@@ -667,24 +667,25 @@ fn a_restarted_follower_recovers_its_group() {
 }
 
 #[test]
-fn a_record_reaches_a_node_that_was_down_once_its_creator_restarts() {
+fn a_record_reaches_a_node_that_was_down_from_a_replica() {
     let mut cluster = Cluster::new(3);
     cluster.stop(3);
     // Nodes 1 and 2 are a majority: the creation is answered.
     let agent = cluster.node(1).create_replicated(vec![1, 2, 3]).unwrap();
+    // The creator, and with it any leader it was, is lost before node 3
+    // comes back. Node 2's group campaigns; node 3, sent its requests,
+    // asks node 2 for the record, and the two are a majority.
     cluster.stop(1);
     cluster.start(3);
-    std::thread::sleep(Duration::from_millis(300));
-    assert!(
-        cluster.node(3).applied(agent).is_none(),
-        "only the creator sends it"
-    );
-    cluster.start(1);
-    wait_until("node 3 learns of the agent", || {
-        cluster.node(3).applied(agent).is_some()
-    });
+    let leader = cluster.leader(agent);
     cluster.install(agent);
+    assert_eq!(done(cluster.increment(leader, agent, 1, 3)), 3);
     cluster.converged(agent);
+    // The creator back: its re-announcement meets nodes that hold the
+    // record, and it catches up.
+    cluster.start(1);
+    cluster.converged(agent);
+    assert_eq!(cluster.value(1, agent), 3);
 }
 
 #[test]

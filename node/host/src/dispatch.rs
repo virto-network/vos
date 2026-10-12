@@ -9,7 +9,14 @@
 //! node keeps the newest placement by its order (the announcing leader's
 //! term, then the configuration's index), and a record that differs from
 //! the one held for its agent is refused, never written over.
+//!
+//! An announcer can stop before every member holds its placement, and
+//! then no one sends it. So a node sent Raft traffic for an agent it runs
+//! no group for asks the sender, which answers with the record and the
+//! placement it holds if that names the asker: a member that missed its
+//! placement learns it once its group needs it, a vote or entries.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -31,6 +38,44 @@ const RESEND: Duration = Duration::from_secs(1);
 const MAJORITY: Duration = Duration::from_secs(30);
 /// How long a blob being served waits for room in its peer's queue.
 const BLOB_ROOM: Duration = Duration::from_secs(5);
+/// How often a node asks one peer for one agent's record.
+const ASK_EVERY: Duration = Duration::from_secs(1);
+/// The asks kept before those past [`ASK_EVERY`] are forgotten.
+const ASKS_KEPT: usize = 1024;
+
+/// Whether a node sent Raft traffic for an agent asks the sender for its
+/// record: when it runs no group for the agent, and the placement it
+/// holds, if any, leaves it out (a newer one may name it); at most once
+/// every [`ASK_EVERY`] per agent and peer. A group's full inbox does not
+/// ask, and nor does a replica whose placement names it but which runs no
+/// group (one refused for another agent program).
+pub(crate) fn should_ask(
+    held: Option<&Placement>,
+    has_group: bool,
+    me: NodeNumber,
+    last: Option<Instant>,
+    now: Instant,
+) -> bool {
+    !has_group
+        && !held.is_some_and(|placement| placement.admits(me))
+        && last.is_none_or(|last| now.saturating_duration_since(last) >= ASK_EVERY)
+}
+
+/// Whether node `me`, holding `placement`, answers `asker`'s request for
+/// the agent's record: when it names the asker (a creation's placement is
+/// its record's replicas, committed), and `me` is one the asker takes a
+/// placement from, a node of it or of the configuration before.
+pub(crate) fn should_answer(placement: &Placement, asker: NodeNumber, me: NodeNumber) -> bool {
+    placement.admits(asker) && (placement.replicas.contains(&me) || placement.before.contains(&me))
+}
+
+/// Forget the asks older than [`ASK_EVERY`], once more than [`ASKS_KEPT`]
+/// are kept.
+pub(crate) fn trim_asks(asked: &mut HashMap<(AgentId, NodeNumber), Instant>, now: Instant) {
+    if asked.len() > ASKS_KEPT {
+        asked.retain(|_, at| now.saturating_duration_since(*at) < ASK_EVERY);
+    }
+}
 
 /// Take arrivals until the network closes.
 pub(crate) async fn dispatch(inner: Arc<Inner>, arrivals: Arrivals) {
@@ -191,7 +236,8 @@ impl Inner {
         }
         match message {
             PeerMessage::Raft { agent, message } => {
-                let routed = self.run(agent).is_some_and(|run| {
+                let run = self.run(agent);
+                let routed = run.as_ref().is_some_and(|run| {
                     run.inbox
                         .try_send(Input::Raft {
                             from,
@@ -202,12 +248,14 @@ impl Inner {
                 if !routed {
                     // No group here, or its inbox is full: Raft sends again.
                     self.drops.count(peer::Refusal::Unrouted);
+                    self.ask_for_record(from, agent, run.is_some());
                 }
             }
             PeerMessage::BlobRequest { agent, hashes } => self.serve_blobs(from, agent, hashes),
             PeerMessage::DirectoryAck { agent, order, runs } => {
                 self.on_ack(from, agent, order, runs)
             }
+            PeerMessage::DirectoryRequest { agent } => self.on_request(from, agent),
             // A task of its own runs the call: the dispatcher never waits.
             PeerMessage::Forward {
                 agent,
@@ -378,6 +426,59 @@ impl Inner {
         );
     }
 
+    /// Ask `from`, whose group sent Raft traffic for `agent` that found no
+    /// room here, for the agent's record and placement, as [`should_ask`]
+    /// says.
+    fn ask_for_record(&self, from: NodeNumber, agent: AgentId, has_group: bool) {
+        let held = self
+            .directory
+            .lock()
+            .expect("the directory")
+            .get(&agent)
+            .map(|known| known.placement.clone());
+        let now = Instant::now();
+        {
+            let mut asked = self.asked.lock().expect("the asks");
+            let last = asked.get(&(agent, from)).copied();
+            if !should_ask(held.as_ref(), has_group, self.number, last, now) {
+                return;
+            }
+            asked.insert((agent, from), now);
+            trim_asks(&mut asked, now);
+        }
+        self.send(
+            from,
+            Class::Requests,
+            &PeerMessage::DirectoryRequest { agent },
+        );
+    }
+
+    /// Answer `from`'s request for `agent`'s record with the record and
+    /// placement held here, if the placement names it: an ordinary record,
+    /// acknowledged as any. It is sent once; the asker asks again.
+    fn on_request(&self, from: NodeNumber, agent: AgentId) {
+        let Some(known) = self
+            .directory
+            .lock()
+            .expect("the directory")
+            .get(&agent)
+            .cloned()
+        else {
+            return;
+        };
+        if !should_answer(&known.placement, from, self.number) {
+            return;
+        }
+        self.send(
+            from,
+            Class::Requests,
+            &PeerMessage::Directory {
+                record: known.record,
+                placement: known.placement,
+            },
+        );
+    }
+
     fn on_ack(&self, from: NodeNumber, agent: AgentId, order: Order, runs: bool) {
         let mut unacknowledged = self
             .unacknowledged
@@ -537,5 +638,100 @@ impl Inner {
                 })
                 .await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn placement(replicas: Vec<NodeNumber>) -> Placement {
+        Placement {
+            replicas,
+            before: Vec::new(),
+            term: 2,
+            index: 1,
+            joint: false,
+            committed: true,
+        }
+    }
+
+    /// A node asks only when it runs no group and its placement leaves it
+    /// out, at most once a second per agent and peer.
+    #[test]
+    fn a_node_asks_for_a_record_only_when_it_may_need_one() {
+        let now = Instant::now();
+        let names_me = placement(vec![1, 2, 3]);
+        let leaves_me_out = placement(vec![1, 2, 4]);
+        assert!(should_ask(None, false, 3, None, now), "no placement");
+        assert!(should_ask(Some(&leaves_me_out), false, 3, None, now));
+        assert!(!should_ask(None, true, 3, None, now), "a group runs here");
+        assert!(
+            !should_ask(Some(&names_me), false, 3, None, now),
+            "named, yet no group: refused for another program"
+        );
+        let asked = now - Duration::from_millis(400);
+        assert!(
+            !should_ask(None, false, 3, Some(asked), now),
+            "asked lately"
+        );
+        assert!(should_ask(None, false, 3, Some(asked), asked + ASK_EVERY));
+    }
+
+    /// A node answers the members its placement names, and no one else,
+    /// and only with a placement the asker takes from it.
+    #[test]
+    fn a_node_answers_only_the_members_its_placement_names() {
+        let held = placement(vec![1, 2, 3]);
+        assert!(should_answer(&held, 3, 2));
+        assert!(!should_answer(&held, 4, 2));
+        assert!(
+            !should_answer(&held, 3, 4),
+            "a placement leaving the answerer out, which the asker would refuse"
+        );
+        let joint = Placement {
+            before: vec![1, 2, 4],
+            committed: false,
+            ..held.clone()
+        };
+        assert!(
+            should_answer(&joint, 4, 2),
+            "a member of the configuration before"
+        );
+        let removing = Placement {
+            replicas: vec![1, 2, 5],
+            before: vec![1, 2, 3],
+            ..held.clone()
+        };
+        assert!(
+            should_answer(&removing, 5, 3),
+            "a leader that removed itself"
+        );
+        let created = Placement::created(&CreationRecord {
+            agent: AgentId(1 << 24 | 1),
+            replicas: vec![1, 2, 3],
+            creator: 1,
+            time: 0,
+            program: vos_wire::ids::ProgramHash([0; 32]),
+            accumulate_gas: 0,
+        });
+        assert!(should_answer(&created, 3, 2));
+    }
+
+    /// The asks kept are bounded: past the bound, those older than the
+    /// limit go, and the recent stay.
+    #[test]
+    fn the_asks_kept_stay_bounded() {
+        let now = Instant::now();
+        let old = now - ASK_EVERY;
+        let mut asked: HashMap<(AgentId, NodeNumber), Instant> = (0..ASKS_KEPT as u32)
+            .map(|agent| ((AgentId(agent), 2), old))
+            .collect();
+        trim_asks(&mut asked, now);
+        assert_eq!(asked.len(), ASKS_KEPT, "within the bound, all kept");
+        asked.insert((AgentId(u32::MAX), 2), now);
+        trim_asks(&mut asked, now);
+        assert_eq!(asked.len(), 1);
+        assert!(asked.contains_key(&(AgentId(u32::MAX), 2)));
     }
 }

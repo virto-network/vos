@@ -443,6 +443,8 @@ pub(crate) struct Inner {
     pub(crate) refusing: Mutex<HashMap<AgentId, BTreeSet<NodeNumber>>>,
     /// Who waits to hear whether a node could run an agent's program.
     pub(crate) capable: Mutex<HashMap<(AgentId, NodeNumber), smol::channel::Sender<bool>>>,
+    /// When this node last asked each peer for each agent's record.
+    pub(crate) asked: Mutex<HashMap<(AgentId, NodeNumber), Instant>>,
     /// The agents this node replicates.
     pub(crate) runs: Mutex<HashMap<AgentId, Arc<Run>>>,
     dry_runs: Mutex<HashMap<AgentId, DryRun>>,
@@ -1718,6 +1720,7 @@ impl Node {
             acknowledged: event_listener::Event::new(),
             refusing: Mutex::new(HashMap::new()),
             capable: Mutex::new(HashMap::new()),
+            asked: Mutex::new(HashMap::new()),
             runs: Mutex::new(HashMap::new()),
             dry_runs: Mutex::new(HashMap::new()),
             wanted: Mutex::new(HashMap::new()),

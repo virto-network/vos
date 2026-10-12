@@ -7268,3 +7268,116 @@ no one else sends.
     stops applying once removed.
 - **The gap itself** is the next step's, with its own design and review.
 
+
+#### Design: a node asks for the record its group's peers need
+
+**Two ways, weighed** (with the review):
+- **Push:** every member sends the placement it keeps to the other members
+  until each acknowledges. It needs the creator's and the members' sends
+  for one agent merged by order. It also needs a send of every held
+  placement at each start, as resends live only in memory: about 2,000
+  frames for 1,000 groups of three.
+- **Pull, taken:** a node that gets Raft traffic for an agent it runs no
+  group for asks the sender for the record and placement. That is exactly
+  when the record matters, as the group needs this node's vote or log. It
+  covers a lost announcer and restarts alike, with no start-time sends
+  and no resend bookkeeping.
+
+**The change:**
+- **A new peer message,** `DirectoryRequest { agent }` (requests class, the
+  agent's stream).
+- **Asking** (`dispatch.rs`, `arrive`): a Raft message for an agent with no
+  group here asks its sender, when the directory has no placement for the
+  agent or the one held does not admit this node, so a newer one may.
+  - Keyed on there being no group, not on the message going unrouted:
+    a running group's full inbox also leaves a message unrouted, and
+    must not ask for a record it holds.
+  - At most once a second per agent and sender. The times asked are
+    kept in a map; once it holds more than 1,024, those older than a
+    second go.
+  - A group refused for another agent program (its placement admits the
+    node) does not ask.
+- **Answering:** a node holding the agent's record and a placement that
+  admits the asker (a creation's placement is its record's replicas,
+  committed), and names the node itself, in it or in the configuration
+  before, as the asker's check requires, sends
+  it an ordinary `Directory`. Anyone else ignores the request. The asker
+  acknowledges it as any record. The answer goes to the asker only, and
+  takes no resend: the asker asks again.
+- **The check,** tightened as the review asked, for a term-0 placement
+  relayed by a member: accepted from the creator as now, or from a node
+  the record names as a replica when the placement is exactly
+  `Placement::created(record)` and the record's creator is the one its
+  id names. A relayed creation is then the creator's, whoever relays it.
+  A record that differs from the one held is still refused, and a
+  placement is kept only if it `supersedes`.
+
+**What does not change:** the creator's and leaders' announcements to
+every node, the acknowledgements, which placement is kept.
+
+**Still open, recorded:** a node outside the placement that missed both
+the creator's and the first leader's announcements learns of the agent
+only at the next leadership change. Until then, calls sent to it for the
+agent fail. That is routing, not the group's availability.
+
+**Tests:**
+- `a_record_reaches_a_node_that_was_down_from_a_replica`: node 3 down at
+  the creation; the creator stopped; node 3 started. Node 2's vote
+  requests make node 3 ask; it learns, and nodes 2 and 3 elect and serve.
+  It replaces `a_record_reaches_a_node_that_was_down_once_its_creator_restarts`,
+  whose "only the creator sends it" no longer holds.
+- **`peer::check`:**
+  - a term-0 placement relayed by a replica is accepted when it is the
+    creation's;
+  - one that differs from `Placement::created`, or relayed by a node
+    neither its creator nor a replica, is refused.
+  - Which placement the integration test relays depends on timing:
+    term 0 if no election placed another before the creator stops, else
+    term 1. The unit tests cover the relayed creation either way.
+- **The rules, as pure functions with unit tests** (no sleeps):
+  - `should_ask(held, has_group, me, last_asked, now)`: no ask with a
+    group, nor when the placement held admits the node; an ask with no
+    placement, or one that does not admit it; at most once a second,
+    `now` given; the map trimmed;
+  - `should_answer(placement, asker)`: members are answered, others not.
+- **The integration test** keeps the wiring: without the ask it fails.
+  Its end keeps the replaced test's second half (the creator restarts,
+  node 3 converges), so the creator's re-announcement still runs.
+- **Why Raft alone triggers enough** (the review): with the leader gone,
+  a holder campaigns and its pre-votes reach the node every round;
+  while a leader lives, its appends, or its announcement's resends,
+  reach it; snapshot chunks come only after appends.
+- The cluster suite 20 times.
+
+#### Built: a node asks for the record its group's peers need
+
+**The change,** as designed:
+- the wire: `PeerMessage::DirectoryRequest { agent }`, index 15;
+- `peer::check`: a term-0 placement relayed by a replica is accepted when
+  it is exactly the creation's, under a record whose creator is the one
+  its id names; the new message's class and stream;
+- `dispatch.rs`:
+  - `arrive` asks when a Raft message finds no group, by `should_ask`;
+  - `on_request` answers by `should_answer`;
+  - the asks kept are `Inner::asked`, bounded by `trim_asks`.
+  - Every Raft message that finds no room asks through `should_ask`, a
+    full inbox too, so the rule tested is the rule applied: a node with
+    a group never asks.
+
+**Tests:**
+- `should_ask`, `should_answer` and `trim_asks`, as unit tests with the
+  time given;
+- `peer::check`:
+  - a creation relayed by a replica is accepted;
+  - refused from a node neither its creator nor a replica, when it
+    differs from the creation's, and when its record claims a creator
+    its id does not name;
+  - the new message survives the wire.
+- `a_record_reaches_a_node_that_was_down_from_a_replica`:
+  - **Without the ask it fails:** no leader in 20 s. Node 2 then still
+    held the creation's placement, term 0, as no election had placed
+    another before the creator stopped, so the test meets the relayed
+    creation too.
+  - With the ask, nodes 2 and 3 elect and serve, and the creator, back,
+    catches up.
+- The cluster suite, 20 runs: all pass.

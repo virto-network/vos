@@ -301,6 +301,7 @@ pub fn class(message: &PeerMessage) -> Class {
         PeerMessage::BlobRequest { .. }
         | PeerMessage::Directory { .. }
         | PeerMessage::DirectoryAck { .. }
+        | PeerMessage::DirectoryRequest { .. }
         | PeerMessage::Forward { .. }
         | PeerMessage::Forwarded { .. }
         | PeerMessage::ReadIndex { .. }
@@ -321,6 +322,7 @@ pub fn stream(message: &PeerMessage) -> u64 {
         PeerMessage::SnapshotAck(ack) => u64::from(ack.agent.0),
         PeerMessage::Directory { record, .. } => u64::from(record.agent.0),
         PeerMessage::DirectoryAck { agent, .. }
+        | PeerMessage::DirectoryRequest { agent }
         | PeerMessage::Forward { agent, .. }
         | PeerMessage::Forwarded { agent, .. }
         | PeerMessage::ReadIndex { agent, .. }
@@ -362,21 +364,28 @@ pub fn check(
         PeerMessage::Raft { message, .. } => check_raft(from, message),
         PeerMessage::SnapshotChunk(chunk) => check_chunk(from, chunk, followed(chunk.agent)),
         PeerMessage::Blob { hash, bytes } => check_blob(hash, bytes),
-        // At creation (term 0) from its creator, then from a node of the
-        // placement, or of the configuration it supersedes: a leader
+        // At creation (term 0) from its creator, or relayed whole by one
+        // of its replicas, which holds the creator's; then from a node of
+        // the placement, or of the configuration it supersedes: a leader
         // removing itself.
         PeerMessage::Directory { record, placement } => {
-            let from_creator =
-                record.creator == from && CreationRecord::creator_of(record.agent) == from;
+            let creator = CreationRecord::creator_of(record.agent);
+            let from_creator = record.creator == from && creator == from;
+            let relayed = record.creator == creator
+                && record.replicas.contains(&from)
+                && *placement == Placement::created(record);
             let from_member =
                 placement.replicas.contains(&from) || placement.before.contains(&from);
-            if (placement.term == 0 && from_creator) || (placement.term > 0 && from_member) {
+            if (placement.term == 0 && (from_creator || relayed))
+                || (placement.term > 0 && from_member)
+            {
                 Ok(())
             } else {
                 Err(Refusal::NotTheCreator)
             }
         }
         PeerMessage::DirectoryAck { .. }
+        | PeerMessage::DirectoryRequest { .. }
         | PeerMessage::SnapshotAck(_)
         | PeerMessage::BlobRequest { .. }
         | PeerMessage::Liveness { .. }

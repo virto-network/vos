@@ -49,7 +49,8 @@ pub enum PeerMessage {
         leading: Vec<Leading>,
     },
     /// Where an agent runs, with its creation record: from its creator at
-    /// creation, then from its leader as its replicas change.
+    /// creation, then from its leader as its replicas change, or from a
+    /// member asked for it.
     #[codec(index = 7)]
     Directory {
         record: CreationRecord,
@@ -112,6 +113,11 @@ pub enum PeerMessage {
         sequence: u64,
         relayed: bool,
     },
+    /// The sender runs no group for `agent` and was sent Raft traffic for
+    /// it: a node holding a placement that names the sender answers with
+    /// a `Directory`.
+    #[codec(index = 15)]
+    DirectoryRequest { agent: AgentId },
 }
 
 /// What makes an agent the agent it is. Its hash is the agent's identity.

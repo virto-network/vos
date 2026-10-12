@@ -206,6 +206,7 @@ fn every_other_message_survives_the_wire() {
             sequence: 3,
             relayed: false,
         },
+        PeerMessage::DirectoryRequest { agent: AGENT },
         PeerMessage::ReadIndexAnswer {
             agent: AGENT,
             token: 78,
@@ -321,8 +322,9 @@ fn placements_are_ordered_by_term_then_index_then_commitment() {
     assert!(placement(4, 100, true).order() > placement(4, 100, false).order());
 }
 
-/// A placement at creation comes from the agent's creator; a later one
-/// from a node it names, or one of the configuration it supersedes.
+/// A placement at creation comes from the agent's creator, or relayed
+/// whole by one of its replicas; a later one from a node it names, or one
+/// of the configuration it supersedes.
 #[test]
 fn a_placement_comes_from_its_creator_then_from_its_members() {
     // Created by node 1: its number is the id's top byte.
@@ -351,8 +353,40 @@ fn a_placement_comes_from_its_creator_then_from_its_members() {
     };
     let created = Placement::created(&record);
     assert_eq!(check(creator, created.clone()), Ok(()));
-    let other = SPACE.iter().copied().find(|node| *node != creator).unwrap();
-    assert_eq!(check(other, created), Err(Refusal::NotTheCreator));
+    assert_eq!(check(2, created.clone()), Ok(()), "relayed by a replica");
+    assert_eq!(
+        check(4, created.clone()),
+        Err(Refusal::NotTheCreator),
+        "neither its creator nor a replica"
+    );
+    let altered = Placement {
+        replicas: vec![1, 2],
+        ..created.clone()
+    };
+    assert_eq!(
+        check(2, altered),
+        Err(Refusal::NotTheCreator),
+        "a term-0 placement other than the creation's"
+    );
+    // A record claiming a creator other than its id's.
+    let claimed = CreationRecord {
+        creator: 2,
+        ..record.clone()
+    };
+    let relayed = PeerMessage::Directory {
+        placement: Placement::created(&claimed),
+        record: claimed,
+    };
+    assert_eq!(
+        peer::check(
+            &SPACE,
+            3,
+            (Class::Requests, u64::from(agent.0)),
+            &relayed,
+            |_| None,
+        ),
+        Err(Refusal::NotTheCreator)
+    );
     let later = Placement {
         replicas: vec![1, 2, 4],
         before: vec![1, 2, 3, 4],
