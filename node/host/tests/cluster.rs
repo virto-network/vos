@@ -60,6 +60,7 @@ impl Programs {
     }
 }
 
+#[track_caller]
 fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
     let until = Instant::now() + Duration::from_secs(20);
     while !done() {
@@ -260,19 +261,29 @@ impl Cluster {
             .filter_map(|(node, number)| Some((number, node.as_ref()?)))
     }
 
-    /// The one running node leading `agent`, once there is one.
+    /// The one running node leading `agent`, once there is one. Past the
+    /// deadline, what each running replica says of itself.
+    #[track_caller]
     fn leader(&self, agent: AgentId) -> NodeNumber {
-        let mut leader = None;
-        wait_until("a leader", || {
+        let until = Instant::now() + Duration::from_secs(20);
+        loop {
             let leading: Vec<NodeNumber> = self
                 .running()
                 .filter(|(_, node)| node.leads(agent))
                 .map(|(number, _)| number)
                 .collect();
-            leader = (leading.len() == 1).then(|| leading[0]);
-            leader.is_some()
-        });
-        leader.unwrap()
+            if let [leader] = leading[..] {
+                return leader;
+            }
+            if Instant::now() >= until {
+                let replicas: Vec<_> = self
+                    .running()
+                    .map(|(number, node)| (number, node.replica(agent), node.placement(agent)))
+                    .collect();
+                panic!("timed out: a leader; the replicas: {replicas:?}");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     fn install(&self, agent: AgentId) {
@@ -333,20 +344,33 @@ impl Cluster {
         ))
     }
 
-    /// Every running replica of `agent` has applied as far as the others,
-    /// and holds the same rows.
+    /// Every running node the newest placement of `agent` names runs it,
+    /// has applied as far as the others, and holds the same rows. A
+    /// replica still learning of the agent is waited for, not skipped.
     fn converged(&self, agent: AgentId) {
+        let mut replicas = Vec::new();
         wait_until("every replica applies the same", || {
-            let applied: Vec<Option<u64>> = self
+            let Some(placement) = self
                 .running()
-                .filter_map(|(_, node)| node.applied(agent).map(Some))
+                .filter_map(|(_, node)| node.placement(agent))
+                .max_by_key(|placement| placement.order())
+            else {
+                return false;
+            };
+            replicas = self
+                .running()
+                .filter(|(number, _)| placement.replicas.contains(number))
+                .map(|(number, _)| number)
                 .collect();
-            applied.windows(2).all(|pair| pair[0] == pair[1])
+            let applied: Vec<Option<u64>> = replicas
+                .iter()
+                .map(|number| self.node(*number).applied(agent))
+                .collect();
+            applied.iter().all(Option::is_some) && applied.windows(2).all(|pair| pair[0] == pair[1])
         });
-        let rows: Vec<Vec<(Vec<u8>, Vec<u8>)>> = self
-            .running()
-            .filter(|(_, node)| node.applied(agent).is_some())
-            .map(|(_, node)| rows(node, agent))
+        let rows: Vec<Vec<(Vec<u8>, Vec<u8>)>> = replicas
+            .iter()
+            .map(|number| rows(self.node(*number), agent))
             .collect();
         assert!(rows.len() > 1, "fewer than two replicas to compare");
         assert!(

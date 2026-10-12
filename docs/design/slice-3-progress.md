@@ -7081,3 +7081,190 @@ pointers and line tables, one node at 15k/s, 152,810 samples):
   saved nothing on a P-core. In the node, decompression is a fifth of
   each check. So the verifying-key cache, skipped in 3.10b3, is back in
   the order, and next: about 3% of a node's CPU, bounded by sessions.
+
+#### 3.10b4 Design: decompressed verifying keys, kept
+
+**Why:** in a loaded node, `calls::verify` decompresses the caller's key
+at every check (`VerifyingKey::from_bytes`): 1.7% of the node's samples,
+about a tenth of each signature check. (The profile's 3.4% for
+decompression counted R's too, which `verify_strict` decompresses
+itself; the split is below.) A call is checked once, at the node that
+takes it from the client; a leader does not check a forwarded call
+again.
+
+**The change:**
+- `calls::verify` takes the decompressed key from one cache the node's
+  executors share (`quick_cache::sync::Cache`, 0.6.24, already in the
+  tree through lsm-tree).
+  - Not one per executor: every executor takes jobs from one queue, so
+    each would come to hold the same keys, and a session of k calls would
+    miss about min(k, executors) times.
+  - A hit takes a read lock on one of the cache's shards, tens of
+    nanoseconds against the microseconds it saves.
+- A miss decompresses as now, and keeps the key.
+- A key that fails to decompress is not kept, and fails as now.
+- **The bound:** an agent's live sessions, `MAX_SESSIONS` (65,536 keys,
+  about 200 bytes each, so about 13 MB at most).
+  - The cache is the process's, so every agent on the node shares it.
+    A node with many busy agents can outgrow it, and a check whose key
+    was pushed out decompresses it again, at today's cost.
+  - Random keys can push out real ones, but the cache's admission
+    shields keys used again, and its hasher is randomized. The worst
+    case is today's cost.
+
+**What does not change:** which signatures pass.
+- `from_bytes` only decompresses: a pure function of the 32 bytes, with
+  no weak-key check.
+- Every strict check runs inside `verify_strict`, at each call: R
+  decompressed, R's and the key's small-order checks, and the equation
+  over the key's own stored bytes. So a kept key is bit-identical to a
+  fresh one.
+- The cache is keyed by the encoding, not the point: two encodings of one
+  point are kept apart, each with its bytes.
+
+**Tests:**
+- a signature passes, and a wrong one fails, before and after its key is
+  kept;
+- a check uses the key kept for its bytes: kept under other bytes,
+  another key's signature passes for them, which only the cache can do
+  (the test calls the check, `verify_in`, which `verify` runs on the
+  node's cache);
+- bytes that are no key fail every time and are not kept;
+- the cache stays within its bound (a small instance).
+
+**Measured** on tmpfs, five interleaved 5-minute soaks of each build
+(the 64 agents at 6k/s, four steady windows each):
+- **primary:** user instructions per commit from `perf stat`, whose
+  spread was 0.2% where CPU per commit's was 3–4%;
+- CPU per commit, p50 and p99 reported;
+- kept if instructions per commit move past the other build's spread;
+- the mechanism: one node re-profiled with the frame-pointer build,
+  where `from_bytes` should fall to about nothing.
+
+**Also folded:** `benches/verify.rs` corrected, below.
+
+#### 3.10b4 Built: decompressed verifying keys, kept
+
+**The change** (`calls.rs`):
+- `verify` takes the key from `KEYS`, a `quick_cache::sync::Cache` of
+  `MAX_SESSIONS` keys every executor shares. A miss decompresses and
+  keeps the key, and bytes that are no key are not kept.
+- The four tests above, the bound on an instance of 8.
+
+**The microbenchmark, corrected** (`benches/verify.rs`):
+- **What was wrong:** two single runs, one after the other, the kept
+  key's always second. Turbo, heat or a busy sibling between them
+  easily outweighed the 3–10 µs a kept key saves.
+- **Now:** the variants alternate in blocks of 2,000 checks, 25 blocks
+  each, and each reports its median block. It also times a key's
+  decompression alone.
+
+| Core | Strict check, key decompressed each time | Key kept | Decompression alone |
+|---|---|---|---|
+| P-core (CPU 1, its sibling idle) | 36.3 µs | 32.9 µs | 3.2 µs |
+| E-core (CPU 12) | 77.0 µs | 66.7 µs | 10.2 µs |
+
+- So a kept key saves 9–13% of a check, about the decompression's cost.
+  3.10b3's "nothing measurable on a P-core" is withdrawn.
+
+**Measured:** five interleaved 5-minute soaks of each build, tmpfs, the
+64 agents at 6k/s:
+
+| | Without (3.10b3) | With the kept keys |
+|---|---|---|
+| user instructions per commit (three nodes) | 2,241–2,267k, median 2,262k | 2,194–2,206k, median 2,197k |
+| user cycles per commit | 2,414–2,457k, median 2,427k | 2,370–2,411k, median 2,394k |
+| CPU per commit | 775–904 µs, median 842 | 780–883 µs, median 811 |
+| p99, the median run | 5.35 ms | 5.26 ms |
+| resident memory a node | 489–495 MiB | 483–500 MiB |
+
+- **Kept:** instructions per commit fell 2.8%, and the two builds' ranges
+  do not meet. Cycles fell 1.4%, also without overlap. p99 and memory
+  did not move.
+- **An upper bound:** the bench's sessions last 1,000 calls, so about
+  99.5% of checks hit. Shorter sessions gain less.
+- **The mechanism,** in one node at 15k/s with the frame-pointer build
+  (154,368 samples), against 3.10a2's profile:
+  - the key's decompression fell from 1.73% of the node's samples to
+    0.05%, and signature checks from 17.0% to 15.7%;
+  - the cache's own lookups drew no samples.
+  - **A correction:** the 3.4% "Where the reads and the signature checks
+    go" gave the key was both decompressions: the key's (1.73%) and R's
+    (1.72%), which `verify_strict` decompresses at every check.
+  - The kept key saves more instructions (2.8%) than cycles (1.4%): the
+    work it saves ran at about 2 instructions a cycle (between the
+    medians, 65k instructions and 33k cycles a commit), against the
+    node's 0.92. The 33k is within either build's own range of cycles,
+    so the 2 is rough.
+- **Batches of 49 ms or more** varied from 0 to 68 a window on tmpfs.
+  The high runs were two of each build, and came together in time (run
+  2, then runs 7–9): they follow the machine, not the build.
+  - Every window of runs 7–9 passed the bench's clean filter (outside
+    the run 0.4–0.9 cores, IO stalled 0–0.2%), so other load is not
+    their lead. Their cause is open; 3.10b5 reports them per run.
+  - The calls that waited on their session's previous one rise with
+    them: about 2,300 a run in runs 7–9, about 600 in runs 4–6. At 6k/s
+    that is what marks nearly every window "past the knee", by the
+    bench's rule. Those waits come from the long batches, not from
+    load, so the label is wrong at this rate. The steady CPU per commit
+    does not use it.
+
+#### Found in 3.10b4's gates: a replica that missed its record, and no one left to send it
+
+**What failed:** `just ci` failed once in the cluster suite:
+`three_nodes_over_quic_replicate_and_fail_over` timed out waiting for a
+leader after the first one stopped. The whole suite run 12 times failed
+it 3 times; the test alone, or three copies at once, passed 80 of 80. It
+is older than the levers.
+
+**What the replicas said** (the harness now prints it when no leader
+comes; below):
+- node 2: term 1, following node 1, the placement of term 1 committed;
+- node 3: no group, and no placement: it never learned of the agent.
+
+**Why** (logs of a failing run, the test in one process and the rest of
+the suite beside it for the load):
+- node 1 creates the agent on nodes 1, 2 and 3, and is answered once a
+  majority, nodes 1 and 2, holds the record. Its first send to node 3
+  waited behind a QUIC dial begun before node 3 listened, retried on
+  the dial's backoff.
+- The test then stopped node 1, the leader too, within the second
+  before the creator's resend.
+- Nodes 2 and 3 are a majority of the three, but node 3 runs no group,
+  so node 2 cannot be elected.
+- Node 2 holds the record and the placement, but only an announcer
+  sends them: the creator at term 0, a leader after.
+- **A second failure, from the same lateness:** `converged` skipped the
+  running nodes without the agent. Once node 3 learned of it (from node
+  2's leadership, 140 ms after the creation), it could start its group
+  between `converged`'s two checks, and its empty rows "differed".
+
+**The gap is known:** 3.5 handed it to 3.7 ("only the creator resends a
+creation record, so a node that missed it never learns of the agent if
+the creator is lost for good"). 3.7 added the leader's announcements,
+which share it: when the announcer stops before a member acknowledges,
+no one else sends.
+- A majority of live replicas can then be unable to elect, which a
+  Raft group promises they can.
+- The test only met it because a slow dial and a quick stop came
+  together. A replica down at the creation, and a creator lost before
+  it returns, meet it every time.
+
+**Fixed in the harness now** (with 3.10b4):
+- `converged` waits for every running node the newest placement names
+  to run the agent and apply as far as the others, and compares their
+  rows. A replica still learning of the agent is waited for, not
+  skipped.
+- `leader`, on its deadline, reports each running node's replica status
+  and placement, and both helpers report their caller's line.
+- With it, the failover test establishes its premise, three replicating
+  nodes, before it stops the leader. The whole suite then passed 20 runs
+  of 20.
+- So that test no longer meets the gap. The next step's tests must.
+  - Joint configurations: `Placement::replicas` holds both sets while
+    joint, so `converged` waits for every member. Once the new one
+    commits, the nodes left in `before` are no longer compared. The old
+    helper compared a removed replica still running its group, which
+    stops applying once removed.
+- **The gap itself** is the next step's, with its own design and review.
+

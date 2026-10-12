@@ -2540,6 +2540,7 @@ dependencies = [
  "httparse",
  "mimalloc",
  "proptest",
+ "quick_cache",
  "rcgen",
  "rustls",
  "rustls-webpki",
