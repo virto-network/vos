@@ -6717,3 +6717,34 @@ interleaved, lever 0's build against this one):
   - once, in a loaded `just ci`, a restarted node answered `NoAgent` for
     agents it replicates, not reproduced since.
   The next step fixes the first two and looks for the third.
+
+#### The exactly-once tests under load: two fixes
+
+Found while gating 3.10b1, and already in the code before it: three
+copies of the exactly-once tests at once, with the seed `just ci` uses,
+failed on the commit before 3.10b1 in four copies out of nine.
+- **An executor thread joined itself.** The executors' last owner (the
+  node's state) went with a job one of them ran, and their `Drop` joined
+  every executor thread, that one included: `EDEADLK`, which std turns
+  into a panic. `Executors::drop` now leaves the current thread to end on
+  its own. A unit test hands the last owner to a job; with the old join
+  it panics exactly so.
+- **"No node caught up by a snapshot".** The check holds only if some
+  fault happened to keep a node down while the log compacted past it;
+  under load the clients go slower and it may not. A fault at three
+  quarters of the schedule now stops a follower and keeps it down until
+  its leader's log starts past the follower's last entry (at most a
+  minute), so its restart is by a snapshot under any load.
+- **A cluster test read a replica before it caught up.** The backlog
+  test stops both of an agent's replicas right after its install, starts
+  them again, and polls one for the count. A replica not yet holding the
+  install again answers its query with an unknown instance, which the
+  test's reader took for a failure. The poll now counts that as nothing
+  yet, until its deadline. (Its `just ci` failed so once.)
+- **Since:** nine loaded copies, none failing either way. One failed to
+  bind an address another copy held, which only concurrent copies of the
+  binary do.
+- **Not reproduced:** the `NoAgent` a restarted node answered once in a
+  loaded `just ci`, in 24 loaded copies across these runs. The directory
+  is rebuilt from synced records at open, so it should not happen; it
+  stays on the open list until it recurs or is explained.

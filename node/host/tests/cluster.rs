@@ -300,18 +300,29 @@ impl Cluster {
     }
 
     fn value(&self, at: NodeNumber, agent: AgentId) -> u64 {
-        let outcome = smol::block_on(self.node(at).query(
+        match self.query_value(at, agent) {
+            Ok(Outcome::Done(bytes)) => u64::decode(&bytes).unwrap().0,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The counter at `at`, once its replica answers it: a replica still
+    /// catching up after a restart may not hold the instance yet.
+    fn value_once_served(&self, at: NodeNumber, agent: AgentId) -> Option<u64> {
+        match self.query_value(at, agent) {
+            Ok(Outcome::Done(bytes)) => Some(u64::decode(&bytes).unwrap().0),
+            _ => None,
+        }
+    }
+
+    fn query_value(&self, at: NodeNumber, agent: AgentId) -> Result<Outcome, CallError> {
+        smol::block_on(self.node(at).query(
             agent,
             ALICE,
             COUNTER,
             self.programs.method("value"),
             Vec::new(),
         ))
-        .unwrap();
-        match outcome {
-            Outcome::Done(bytes) => u64::decode(&bytes).unwrap().0,
-            other => panic!("{other:?}"),
-        }
     }
 
     /// Every running replica of `agent` has applied as far as the others,
@@ -984,7 +995,7 @@ fn a_backlog_beyond_a_window_drains() {
     cluster.start(2);
     cluster.start(3);
     let until = Instant::now() + Duration::from_secs(60);
-    while cluster.value(2, target) < 300 {
+    while cluster.value_once_served(2, target).unwrap_or(0) < 300 {
         assert!(Instant::now() < until, "the backlog did not drain");
         std::thread::sleep(Duration::from_millis(20));
     }

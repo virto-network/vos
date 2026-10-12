@@ -86,8 +86,38 @@ impl Executors {
 impl Drop for Executors {
     fn drop(&mut self) {
         self.sender.take();
+        // Their last owner can go with a job one of them runs: that thread
+        // ends on its own once its job returns, and joining it would wait
+        // for itself.
+        let current = std::thread::current().id();
         for thread in self.threads.drain(..) {
-            let _ = thread.join();
+            if thread.thread().id() != current {
+                let _ = thread.join();
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The executors' last owner, dropped by a job on one of their threads,
+    /// stops them without joining that thread.
+    #[test]
+    fn executors_dropped_by_their_own_job_stop_without_joining_it() {
+        let executors = Arc::new(Executors::spawn(2));
+        let held = Arc::clone(&executors);
+        let (go, wait) = mpsc::channel::<()>();
+        let job = executors.run(move || {
+            wait.recv().unwrap();
+            drop(held);
+        });
+        drop(executors);
+        go.send(()).unwrap();
+        assert!(
+            smol::block_on(job).is_ok(),
+            "the job dropping the last owner panicked"
+        );
     }
 }

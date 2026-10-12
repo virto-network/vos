@@ -433,6 +433,35 @@ fn post_within(
 
 /// [`FAULTS`] failures, one at a time: among them every clock jumping
 /// past the skew under load, and every session expiring.
+/// A follower of `agent` stays down until its leader has compacted the log
+/// past the follower's last entry, so it comes back by a snapshot however
+/// slowly the clients go (within a minute).
+fn follower_down_past_compaction(cluster: &Cluster, agent: AgentId) {
+    let Some(leader) = cluster.leader(agent) else {
+        return;
+    };
+    let Some((number, last)) = (1..=NODES)
+        .filter(|number| *number != leader)
+        .find_map(|number| Some((number, cluster.node(number)?.replica(agent)?.last_index)))
+    else {
+        return;
+    };
+    cluster.saw("fault: a follower down past compaction");
+    cluster.stop(number);
+    let until = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < until {
+        let compacted = cluster
+            .leader(agent)
+            .and_then(|leader| cluster.node(leader)?.replica(agent))
+            .is_some_and(|status| status.log_start > last);
+        if compacted {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    cluster.start(number);
+}
+
 fn faults(cluster: &Cluster, clients: &[Client], random: &mut Random) {
     let pause = |random: &mut Random| {
         std::thread::sleep(Duration::from_millis(100 + random.below(400)));
@@ -459,6 +488,13 @@ fn faults(cluster: &Cluster, clients: &[Client], random: &mut Random) {
         }
         if fault == FAULTS / 2 {
             expire_every_session(cluster, clients, random);
+            continue;
+        }
+        if fault == 3 * FAULTS / 4 {
+            follower_down_past_compaction(
+                cluster,
+                agents[random.below(agents.len() as u64) as usize],
+            );
             continue;
         }
         let agent = agents[random.below(agents.len() as u64) as usize];
