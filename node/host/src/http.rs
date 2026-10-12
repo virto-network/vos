@@ -92,6 +92,9 @@ async fn accept(
     let open = Arc::new(AtomicUsize::new(0));
     let acceptor = tls.map(futures_rustls::TlsAcceptor::from);
     while let Ok((stream, _)) = listener.accept().await {
+        // An answer goes as soon as it is written, not once the client
+        // acknowledges what went before it.
+        let _ = stream.set_nodelay(true);
         connections.retain(|connection| !connection.is_finished());
         if open.fetch_add(1, Ordering::SeqCst) >= limits.connections {
             open.fetch_sub(1, Ordering::SeqCst);
@@ -314,7 +317,10 @@ async fn write_response(
         response.body.len(),
         if close { "Connection: close\r\n" } else { "" },
     );
-    stream.write_all(head.as_bytes()).await?;
-    stream.write_all(&response.body).await?;
+    // One write: the head and its body leave together.
+    let mut answer = Vec::with_capacity(head.len() + response.body.len());
+    answer.extend_from_slice(head.as_bytes());
+    answer.extend_from_slice(&response.body);
+    stream.write_all(&answer).await?;
     stream.flush().await
 }

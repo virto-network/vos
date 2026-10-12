@@ -5843,3 +5843,155 @@ suggests them:
   `just ci-full`.
 
 After 3.10, the slice's end review, by Fable 5.1.
+
+#### 3.10a1 Built: the bench, and the table's first rows
+
+**`node/cli/benches/processes.rs`** (`cargo bench -p vos-cli --bench
+processes`; `ROWS` picks rows, `CPUS` overrides the pinning), as
+designed.
+- **The setup:** three release node processes pinned as above, each
+  running five executors.
+- **The driver:**
+  - two executor threads on CPUs 18 and 19, signing on 18–21;
+  - a task per session over a connection it keeps (`smol`, with
+    `futures-rustls` for TLS);
+  - every call signed before its run.
+  - `Target::authority` and `Target::tls` are now public, so the driver
+    opens its own connections.
+- **How a run is measured:**
+  - each node's CPU is sampled at the timed window's edges;
+  - the nodes are left to go quiet before each run;
+  - an open-loop call's latency is timed from its schedule.
+- **What a run reports, beside the latency:**
+  - each node's CPU, and its executors' (the busiest's share of a core,
+    and their mean), from `/proc/<pid>/task`;
+  - the driver's own CPU;
+  - the driver's own lag: the time past both the schedule and the
+    session's previous answer. Above 0.5 ms at p99, the run is invalid;
+  - the calls that waited on their session's previous one, as a sign
+    the run is past the knee. It then gives no CPU per commit, as the
+    calls answered in the window are not those scheduled in it;
+  - sessions that ran out of signed calls (an undercount);
+  - the first failed answer.
+- **The knee is searched upward,** from 5k/s, so no run meets the backlog
+  of one past it. It is reported as a bracket, and 40k/s runs last.
+- **At the end, every agent's counter, read at its leader, must equal
+  the increments it answered,** over every run: a silent failure cannot
+  pass as a commit.
+- **`DATA`** puts the stores elsewhere: `/tmp` (tmpfs) takes the disk
+  out of a run.
+
+**Found, and fixed: every answer over HTTP waited about 40 ms.**
+- **Why:** the ingress set no `TCP_NODELAY` on the connections it
+  accepted, and wrote each response's head and body apart. Nagle's
+  algorithm held the body until the head was acknowledged, and the
+  client delayed that acknowledgement.
+- **The effect:** a quiet node answered at 46 ms. Slice 2 never measured
+  over HTTP, so nothing showed it.
+- **Now** accepted connections set `TCP_NODELAY`, and a response goes in
+  one write. A quiet node answers at 3.5 ms.
+- **The client library** (`vos_node::client`) also sends a request's head
+  and body in one write: it already set `TCP_NODELAY`, so there was no
+  stall, but two segments woke the node twice.
+
+**The first rows.** Each node is pinned to two P-cores and two E-cores,
+six logical CPUs, and runs five executors. `/proc` counts each logical
+CPU's busy time, so a node saturated on all six would read about 6
+cores busy. Hyperthreading lowers what each gets done, not what it
+reports.
+
+Numbers from the run after the review's fixes (the rows before them gave
+the same picture, with CPU over a wider window):
+
+| Row | Result | Budget |
+|---|---|---|
+| One agent, most, closed (256 sessions) | 15.2–16.3k/s, p99 20–25 ms. The leader 2.3 cores busy, its executors 36% each | ≥ 20k/s: misses |
+| One agent, half load, open (10k/s) | p50 5.9 ms; p99 8.4, 18.6 and 9.9 ms in three runs | p99 ≤ 10 ms: varies across runs |
+| 64 agents, most, closed | 17.9k/s at 4 sessions each (p99 23 ms), 27.2k/s at 16 (p99 54 ms). The nodes 4.0–4.6 of 6 CPUs busy, their executors only 50–63% each; 170–226 µs of CPU per commit per node | ≥ 40k/s: misses |
+| 64 agents, open | p99 5.9 ms at 5k/s, 5.1 ms at 10k/s, 15 ms at 15k/s (that run invalid: the driver's lag p99 0.76 ms), 696 ms at 20k/s: the knee between 10k and 20k/s offered until a valid 15k/s run | p99 ≤ 20 ms at 40k/s: misses |
+| Quiet node, one call at a time | p50 3.5 ms, p99 3.8–4.1 ms | p99 ≤ 5 ms: passes |
+| Query on a follower, open, 2k/s | p50 0.36–0.40 ms, p99 0.60–0.72 ms over HTTP; about 350 µs of the follower's executor time per query at this rate, fixed costs (executors spinning before they park) included: the marginal cost needs two rates | ≤ 100 µs for the node's path (re-measured in 3.10a2) |
+| Idle, about 1,065 groups per node | 1.1–1.4% of one core, 16 threads, 620–690 MiB resident | ≤ 5%, no thread per group: passes |
+| The counters | each agent's counter holds every increment it answered, once | |
+
+**With the stores on tmpfs** (`DATA=/tmp`), 64 agents gave 20.9k/s at 4
+sessions each (+17%) and 29.3k/s at 16 (+7%), the executors still 58–66%
+busy. The disk costs something, and is not the ceiling.
+
+The same run's open loop at 5k/s gave a p99 of 78 ms (p50 1.9 ms),
+against 5.9 ms on disk. That stays an unexplained outlier, not noise: an
+election, a compaction stall, or the driver's reactor on a slow core
+would each explain it, and a p99 like that is what the budget
+measures.
+
+**Per-thread, at 16 sessions each, closed:**
+- the runtime thread (`vos-node`) about 70%;
+- the five executors 55–70% each;
+- the writer about 45%;
+- QUIC (`vos-net`) about 30%.
+
+None is saturated, and together they are about 4.75 of 6 CPUs.
+
+**An earlier "low-load tail"** (p99 35 ms at 10k/s) came from the backlog
+of the overloaded runs the knee search used to start from. Searching
+upward, it is gone: p99 5.1 ms at 10k/s.
+
+**What the rows say so far** (to be confirmed by 3.10a2's thread times
+and stage times):
+- **Neither budget is missed for want of total CPU.** The nodes leave a
+  quarter of their CPUs idle, and the executors a third. But single
+  threads are not ruled out:
+  - the node's one async runtime thread (`vos-node`, about 70%), which
+    runs every group's driver, leader loop and apply loop, and every
+    ingress connection, with each lane's store reads and each apply's
+    snapshot;
+  - the driver, whose lag was already marginal at 15k/s on two E-cores.
+- **64 agents: the cap is something they share, not each agent's
+  cycle.**
+  - 27.2k/s over 64 agents is about 425/s each. With 16 closed sessions
+    each, Little's law gives about 38 ms in flight per call.
+  - A cycle's own stages take a few milliseconds: the 2 ms linger, the
+    refine of 16 inputs (about 0.35 ms) and the dry run, the append,
+    sync and replication (2–3 ms). So most of the 38 ms is waiting.
+  - The suspects: the `vos-node` thread first, the driver, the writer,
+    executor bursts.
+- **One agent:** its leader's `vos-node` thread parses and routes every
+  call, runs each lane's check with its reads, and writes every answer:
+  some 30–50 µs a call, at 15k/s near all of one thread. It is the
+  likelier cap than the cycle.
+- **The linger is not a lever.** It is taken only after the leader loop
+  found its queue empty and waited, so in a closed loop it gathers the
+  next burst, as meant. 3.8b measured none at all: +2% throughput,
+  against a p99 of 91 ms rather than 54.
+- **The disk** costs 7–17% of the 64-agent throughput on this laptop.
+
+**The order the levers will be taken in, once attributed:**
+1. **If the `vos-node` thread or the driver is the cap:**
+   - the node's runtime spread over several threads (its tasks are
+     already `Send`);
+   - the lanes' and the applies' store reads off that thread.
+2. **Cheaper refines per input.**
+3. **Pipelined refines** for the single agent, with their own design and
+   review.
+4. **CPU per commit.**
+
+**Left for 3.10a2, the attribution first:**
+- each node's `vos-node`, `vos-storage` and `vos-net` CPU, and the
+  driver's threads apart, in every run;
+- the closed-loop maxima with the driver on P-cores, which shows whether
+  the driver capped them;
+- the stats route's stage times, with the waits between stages: input to
+  batch, batch to refine, refine, propose to commit, commit to apply,
+  apply to answer;
+- the node's runtime on two or three threads, as an experiment: if
+  throughput rises, the one runtime thread was the cap;
+- a query's marginal cost, from two rates;
+- a valid run at 15k/s.
+
+**Then:**
+- the operator stats route with its histograms;
+- mass failover, the soak, TLS, and table reads under writes;
+- slice 2's rows re-measured;
+- the attribution: call graphs, the JIT's perf map, off-CPU, and fewer
+  cores;
+- repeated runs for the variance.

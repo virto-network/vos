@@ -1,0 +1,1322 @@
+//! Section 14's budgets on three node processes (slice 3, step 3.10):
+//! three release builds of `vos node run`, each pinned to a third of the
+//! laptop (`taskset`) and on its own data directory, joined over QUIC; a
+//! driver on the rest of the machine sends calls over HTTP, every one
+//! signed before its timed window.
+//! - **agent:** one agent, the most commits per second, closed loop, over
+//!   sessions; then at half load, max(10k/s, half the most), open loop.
+//! - **agents:** 64 agents, the most, closed loop at 4 and 16 sessions
+//!   each; open loop at 40k/s offered; and the knee, the highest offered
+//!   rate whose p99 stays at 20 ms or below.
+//! - **quiet:** one session, one call at a time.
+//! - **query:** the counter's value on a follower, open loop.
+//! - **idle:** 1,000 agents per node left alone: each process's CPU,
+//!   threads and memory.
+//!
+//! Every open-loop latency is timed from when its call was scheduled to
+//! go, so a slow call never hides the queue behind it; each such run gives
+//! its send lag, and one whose p99 lag passes 0.5 ms is marked invalid.
+//! Each run gives every process's CPU, and the CPU per commit.
+//!
+//! `cargo bench -p vos-cli --bench processes` (after `just build-agent
+//! build-test-actors`). `ROWS` picks rows (`agent,agents,quiet,query,
+//! idle`); `CPUS` overrides the pinning, as `taskset -c` lists for each
+//! node and the driver, separated by `/`.
+
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader};
+use std::net::{TcpListener, UdpSocket};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+use ed25519_dalek::{Signer, SigningKey};
+use smol::io::{AsyncReadExt, AsyncWriteExt};
+use vos_node::client::{Operator, Target};
+use vos_node::tls::Trust;
+use vos_wire::ids::{AgentId, InstanceId, MethodId, Session};
+use vos_wire::ingress::{
+    Answer, Call, Consistency, Install, QueryCall, call_message, query_message,
+};
+use vos_wire::result::Outcome;
+use vos_wire::{Decode, Encode};
+
+const COUNTER: InstanceId = InstanceId(1);
+const WARM: Duration = Duration::from_secs(2);
+const MEASURE: Duration = Duration::from_secs(5);
+const IDLE_SETTLE: Duration = Duration::from_secs(5);
+const IDLE_MEASURE: Duration = Duration::from_secs(10);
+/// The most an open-loop run's p99 send lag may be.
+const LAG: Duration = Duration::from_micros(500);
+/// The p99 the many-agent budget allows.
+const KNEE_P99: Duration = Duration::from_millis(20);
+/// The pinning on the reference laptop: each node two P-cores (four
+/// threads) and two E-cores; the driver the rest.
+const CPUS: [&str; 4] = [
+    "0,5,1,2,12,13",
+    "3,4,6,7,14,15",
+    "8,9,10,11,16,17",
+    "18,19,20,21",
+];
+
+fn guest(path: &str) -> PathBuf {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../agent")
+        .join(path);
+    assert!(
+        path.exists(),
+        "{}: run `just build-agent build-test-actors`",
+        path.display()
+    );
+    path
+}
+
+fn rows() -> Vec<String> {
+    std::env::var("ROWS")
+        .unwrap_or_else(|_| "agent,agents,quiet,query,idle".into())
+        .split(',')
+        .map(|row| row.trim().to_string())
+        .collect()
+}
+
+fn cpus() -> Vec<String> {
+    match std::env::var("CPUS") {
+        Ok(cpus) => cpus.split('/').map(str::to_string).collect(),
+        Err(_) => CPUS.iter().map(|cpus| cpus.to_string()).collect(),
+    }
+}
+
+fn pinning() -> bool {
+    Command::new("taskset")
+        .arg("-V")
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+/// Pin the calling thread to `cpus`, by its thread id.
+fn pin_thread(cpus: &str) {
+    let tid = std::fs::read_link("/proc/thread-self")
+        .ok()
+        .and_then(|link| link.file_name()?.to_str()?.parse::<u32>().ok());
+    if let Some(tid) = tid {
+        let _ = Command::new("taskset")
+            .args(["-p", "-c", cpus, &tid.to_string()])
+            .stdout(Stdio::null())
+            .status();
+    }
+}
+
+fn free_port(udp: bool) -> u16 {
+    if udp {
+        UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    } else {
+        TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+}
+
+/// The CPU a `/proc` stat line says its process or thread used, in
+/// seconds: utime and stime, the 14th and 15th fields.
+fn stat_cpu(stat: &str) -> f64 {
+    let fields: Vec<&str> = stat
+        .rsplit_once(") ")
+        .map(|(_, rest)| rest.split_whitespace().collect())
+        .unwrap_or_default();
+    let ticks: u64 = fields
+        .get(11..13)
+        .map(|times| {
+            times
+                .iter()
+                .filter_map(|time| time.parse::<u64>().ok())
+                .sum()
+        })
+        .unwrap_or(0);
+    ticks as f64 / 100.0
+}
+
+/// The CPU so far of each thread of process `pid` whose name starts with
+/// `named`, in seconds, in the order of their names.
+fn threads_cpu(pid: u32, named: &str) -> Vec<f64> {
+    let mut threads: Vec<(String, f64)> = std::fs::read_dir(format!("/proc/{pid}/task"))
+        .map(|tasks| {
+            tasks
+                .filter_map(Result::ok)
+                .filter_map(|task| {
+                    let name = std::fs::read_to_string(task.path().join("comm")).ok()?;
+                    let name = name.trim().to_string();
+                    name.starts_with(named).then(|| {
+                        let stat =
+                            std::fs::read_to_string(task.path().join("stat")).unwrap_or_default();
+                        (name, stat_cpu(&stat))
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    threads.sort_by(|a, b| a.0.cmp(&b.0));
+    threads.into_iter().map(|(_, cpu)| cpu).collect()
+}
+
+/// The driver's own CPU so far, in seconds.
+fn driver_cpu() -> f64 {
+    stat_cpu(&std::fs::read_to_string("/proc/self/stat").unwrap_or_default())
+}
+
+/// A node process, killed when dropped.
+struct Process {
+    child: Child,
+    number: u8,
+    url: String,
+    target: Target,
+    token: String,
+}
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Process {
+    fn operator(&self) -> Operator {
+        Operator::new(&self.target, &self.token)
+    }
+
+    /// Its CPU so far, in seconds.
+    fn cpu(&self) -> f64 {
+        stat_cpu(
+            &std::fs::read_to_string(format!("/proc/{}/stat", self.child.id())).unwrap_or_default(),
+        )
+    }
+
+    /// Each of its executor threads' CPU so far, in seconds.
+    fn executors_cpu(&self) -> Vec<f64> {
+        threads_cpu(self.child.id(), "vos-executor")
+    }
+
+    /// Its threads and its resident memory in MiB.
+    fn threads_and_rss(&self) -> (u64, u64) {
+        let status = std::fs::read_to_string(format!("/proc/{}/status", self.child.id()))
+            .unwrap_or_default();
+        let field = |name: &str| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix(name))
+                .and_then(|value| value.split_whitespace().next()?.parse::<u64>().ok())
+                .unwrap_or(0)
+        };
+        (field("Threads:"), field("VmRSS:") / 1024)
+    }
+}
+
+/// Run `vos node run` with `args`, pinned to `cpus` if any: the process,
+/// once it printed its address, and its key.
+fn launch(args: &[&str], cpus: Option<&str>, log: &Path) -> (Child, String) {
+    let errors = std::fs::File::create(log).unwrap();
+    let vos = env!("CARGO_BIN_EXE_vos");
+    let agent = guest("default/target/riscv64em-vos/release/vos-agent.elf");
+    let mut command = match cpus {
+        Some(cpus) => {
+            let mut command = Command::new("taskset");
+            command.args(["-c", cpus, vos]);
+            command
+        }
+        None => Command::new(vos),
+    };
+    command
+        .args(["node", "run"])
+        .args(args)
+        .arg("--agent")
+        .arg(agent)
+        .stdout(Stdio::piped())
+        .stderr(errors);
+    let mut child = command.spawn().expect("vos runs");
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let listening = lines.next().and_then(Result::ok).unwrap_or_default();
+    assert!(
+        listening.starts_with("listening on "),
+        "{}",
+        std::fs::read_to_string(log).unwrap_or_default()
+    );
+    let key = lines
+        .next()
+        .and_then(Result::ok)
+        .and_then(|line| line.strip_prefix("node ").map(str::to_string))
+        .expect("the node's key");
+    std::thread::spawn(move || for _ in lines {});
+    (child, key)
+}
+
+/// Three nodes, each pinned to its share of the machine.
+struct Space {
+    processes: Vec<Process>,
+    /// The increments each agent answered as run, every run's.
+    ran: Mutex<HashMap<AgentId, u64>>,
+    _dir: tempfile::TempDir,
+}
+
+impl Space {
+    fn start(pinned: bool, cpus: &[String]) -> Self {
+        // Under `target/` by default (on the reference laptop `/tmp` is
+        // tmpfs); `DATA` puts the stores elsewhere, `/tmp` to take the
+        // disk out of a run.
+        let base = std::env::var("DATA").unwrap_or_else(|_| env!("CARGO_TARGET_TMPDIR").into());
+        let dir = tempfile::Builder::new()
+            .prefix("processes-")
+            .tempdir_in(base)
+            .unwrap();
+        let keys: Vec<String> = (1..=3)
+            .map(|number| {
+                let data = dir.path().join(format!("node-{number}"));
+                let log = dir.path().join(format!("first-{number}.log"));
+                let (mut child, key) = launch(
+                    &["--data", data.to_str().unwrap(), "--listen", "127.0.0.1:0"],
+                    None,
+                    &log,
+                );
+                let _ = child.kill();
+                let _ = child.wait();
+                key
+            })
+            .collect();
+        let ingress: Vec<u16> = (0..3).map(|_| free_port(false)).collect();
+        let peers: Vec<u16> = (0..3).map(|_| free_port(true)).collect();
+        let space: String = (0..3)
+            .map(|at| {
+                format!(
+                    "{} {} 127.0.0.1:{} http://127.0.0.1:{}\n",
+                    at + 1,
+                    keys[at],
+                    peers[at],
+                    ingress[at]
+                )
+            })
+            .collect();
+        let space_file = dir.path().join("space");
+        std::fs::write(&space_file, space).unwrap();
+        let processes = (1..=3u8)
+            .map(|number| {
+                let at = usize::from(number) - 1;
+                let data = dir.path().join(format!("node-{number}"));
+                let listen = format!("127.0.0.1:{}", ingress[at]);
+                let log = dir.path().join(format!("node-{number}.log"));
+                let (child, key) = launch(
+                    &[
+                        "--data",
+                        data.to_str().unwrap(),
+                        "--listen",
+                        &listen,
+                        "--space",
+                        space_file.to_str().unwrap(),
+                    ],
+                    pinned.then(|| cpus[at].as_str()),
+                    &log,
+                );
+                assert_eq!(key, keys[at]);
+                let url = format!("http://{listen}");
+                let token = std::fs::read_to_string(data.join(vos_node::ADMIN_TOKEN)).unwrap();
+                Process {
+                    child,
+                    number,
+                    target: Target::new(&url, Trust::Loopback).unwrap(),
+                    url,
+                    token,
+                }
+            })
+            .collect();
+        Self {
+            processes,
+            ran: Mutex::new(HashMap::new()),
+            _dir: dir,
+        }
+    }
+
+    fn by_url(&self, url: &str) -> Option<usize> {
+        self.processes.iter().position(|process| process.url == url)
+    }
+
+    /// An operator's command, at whichever node takes it.
+    fn operate(
+        &self,
+        command: impl Fn(&Operator) -> Answer,
+        taken: impl Fn(&Answer) -> bool,
+    ) -> Answer {
+        let until = Instant::now() + Duration::from_secs(60);
+        loop {
+            for process in &self.processes {
+                let answer = command(&process.operator());
+                if taken(&answer) {
+                    return answer;
+                }
+            }
+            assert!(Instant::now() < until, "no node took an operator's command");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// An agent on the three nodes, with the counter installed.
+    fn counter_agent(&self, counter: &[u8]) -> AgentId {
+        let Answer::Created(agent) = self.operate(
+            |operator| {
+                operator
+                    .create_agent(vec![1, 2, 3])
+                    .unwrap_or(Answer::Unavailable)
+            },
+            |answer| matches!(answer, Answer::Created(_)),
+        ) else {
+            unreachable!()
+        };
+        let install = Install {
+            instance: COUNTER,
+            program: counter.to_vec(),
+            attestables: Vec::new(),
+            roles: Vec::new(),
+        };
+        self.operate(
+            |operator| {
+                operator
+                    .install(agent, &install)
+                    .unwrap_or(Answer::Unavailable)
+            },
+            |answer| matches!(answer, Answer::Ran { .. }),
+        );
+        agent
+    }
+
+    /// The node leading `agent`, by index.
+    fn leader(&self, agent: AgentId) -> usize {
+        let until = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(at) = self.processes.iter().position(|process| {
+                matches!(process.operator().status(agent), Ok(Answer::Status(status)) if status.leads)
+            }) {
+                return at;
+            }
+            assert!(Instant::now() < until, "agent {} has no leader", agent.0);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn cpu(&self) -> Vec<f64> {
+        self.processes.iter().map(Process::cpu).collect()
+    }
+
+    fn executors_cpu(&self) -> Vec<Vec<f64>> {
+        self.processes.iter().map(Process::executors_cpu).collect()
+    }
+}
+
+/// CPU at a run's window's edges: each node's, each node's executors',
+/// and the driver's.
+#[derive(Default)]
+struct Cpu {
+    nodes: Vec<f64>,
+    executors: Vec<Vec<f64>>,
+    driver: f64,
+}
+
+impl Cpu {
+    fn now(space: &Space) -> Self {
+        Self {
+            nodes: space.cpu(),
+            executors: space.executors_cpu(),
+            driver: driver_cpu(),
+        }
+    }
+}
+
+/// What the driver needs of an agent to sign its calls.
+#[derive(Clone, Copy)]
+struct Signed {
+    agent: AgentId,
+    identity: [u8; 32],
+    increment: MethodId,
+    value: MethodId,
+}
+
+fn signed(space: &Space, agent: AgentId) -> Signed {
+    // At whichever node has applied its install.
+    let until = Instant::now() + Duration::from_secs(30);
+    let (info, schema) = loop {
+        let served = space.processes.iter().find_map(|process| {
+            let info = vos_node::client::agent_info(&process.target, agent).ok()??;
+            let schema = vos_node::client::schema(&process.target, agent, COUNTER).ok()??;
+            Some((info, schema))
+        });
+        if let Some(served) = served {
+            break served;
+        }
+        assert!(
+            Instant::now() < until,
+            "agent {}'s schema is not served",
+            agent.0
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let method = |name: &str| {
+        schema
+            .methods
+            .iter()
+            .find(|method| method.name == name.as_bytes())
+            .unwrap()
+            .id
+    };
+    Signed {
+        agent,
+        identity: vos_node::identity(&info.record),
+        increment: method("increment"),
+        value: method("value"),
+    }
+}
+
+/// One session's calls, signed: the node it starts at, and each call's
+/// path and body in order.
+struct Plan {
+    /// The agent whose counter its calls increment, if they do.
+    counts: Option<AgentId>,
+    node: usize,
+    path: String,
+    bodies: Vec<Vec<u8>>,
+}
+
+/// `calls` increments in a new session `number` at `signed`'s agent.
+fn session_plan(signed: &Signed, number: u64, calls: usize, node: usize) -> Plan {
+    let mut seed = [7u8; 32];
+    seed[..8].copy_from_slice(&number.to_le_bytes());
+    seed[8..12].copy_from_slice(&signed.agent.0.to_le_bytes());
+    let key = SigningKey::from_bytes(&seed);
+    let mut name = [0u8; 16];
+    name[..8].copy_from_slice(&number.to_le_bytes());
+    let session = Session {
+        key: key.verifying_key().to_bytes(),
+        name,
+        t0: vos_node::wall_clock(),
+    };
+    let arguments = 1u64.encode();
+    let bodies = (1..=calls as u64)
+        .map(|sequence| {
+            let message = call_message(
+                &signed.identity,
+                &session,
+                sequence,
+                COUNTER,
+                signed.increment,
+                &arguments,
+            );
+            Call {
+                session,
+                sequence,
+                instance: COUNTER,
+                method: signed.increment,
+                arguments: arguments.clone(),
+                signature: key.sign(&message).to_bytes(),
+            }
+            .encode()
+        })
+        .collect();
+    Plan {
+        counts: Some(signed.agent),
+        node,
+        path: format!("/agents/{}/calls", signed.agent.0),
+        bodies,
+    }
+}
+
+/// Plans signed on the driver's threads at once.
+fn sign_plans(jobs: Vec<(Signed, u64, usize, usize)>) -> Vec<Plan> {
+    let threads = 4;
+    let chunk = jobs.len().div_ceil(threads).max(1);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = jobs
+            .chunks(chunk)
+            .map(|jobs| {
+                scope.spawn(move || {
+                    jobs.iter()
+                        .map(|(signed, number, calls, node)| {
+                            session_plan(signed, *number, *calls, *node)
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap())
+            .collect()
+    })
+}
+
+trait Stream: smol::io::AsyncRead + smol::io::AsyncWrite + Unpin + Send {}
+impl<T: smol::io::AsyncRead + smol::io::AsyncWrite + Unpin + Send> Stream for T {}
+
+/// HTTP/1.1 on a connection kept open.
+struct Http {
+    stream: Box<dyn Stream>,
+    authority: String,
+    buffer: Vec<u8>,
+}
+
+impl Http {
+    async fn connect(target: &Target) -> std::io::Result<Self> {
+        let tcp = smol::net::TcpStream::connect(target.authority()).await?;
+        tcp.set_nodelay(true)?;
+        let stream: Box<dyn Stream> = match target.tls() {
+            Some((config, name)) => Box::new(
+                futures_rustls::TlsConnector::from(config)
+                    .connect(name, tcp)
+                    .await?,
+            ),
+            None => Box::new(tcp),
+        };
+        Ok(Self {
+            stream,
+            authority: target.authority().to_string(),
+            buffer: Vec::with_capacity(4096),
+        })
+    }
+
+    async fn post(&mut self, path: &str, body: &[u8]) -> std::io::Result<Answer> {
+        let head = format!(
+            "POST {path} HTTP/1.1\r\nHost: {}\r\nContent-Length: {}\r\n\r\n",
+            self.authority,
+            body.len()
+        );
+        let mut request = Vec::with_capacity(head.len() + body.len());
+        request.extend_from_slice(head.as_bytes());
+        request.extend_from_slice(body);
+        self.stream.write_all(&request).await?;
+        self.stream.flush().await?;
+        let invalid = |why: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, why);
+        let mut chunk = [0u8; 8192];
+        loop {
+            let mut headers = [httparse::EMPTY_HEADER; 16];
+            let mut response = httparse::Response::new(&mut headers);
+            if let httparse::Status::Complete(head) = response
+                .parse(&self.buffer)
+                .map_err(|_| invalid("not HTTP"))?
+            {
+                let length = response
+                    .headers
+                    .iter()
+                    .find(|header| header.name.eq_ignore_ascii_case("content-length"))
+                    .and_then(|header| {
+                        std::str::from_utf8(header.value)
+                            .ok()?
+                            .trim()
+                            .parse::<usize>()
+                            .ok()
+                    })
+                    .ok_or_else(|| invalid("no length"))?;
+                while self.buffer.len() < head + length {
+                    let read = self.stream.read(&mut chunk).await?;
+                    if read == 0 {
+                        return Err(invalid("closed"));
+                    }
+                    self.buffer.extend_from_slice(&chunk[..read]);
+                }
+                let answer = Answer::decode(&self.buffer[head..head + length])
+                    .map(|(answer, _)| answer)
+                    .map_err(|_| invalid("no answer"));
+                self.buffer.drain(..head + length);
+                return answer;
+            }
+            let read = self.stream.read(&mut chunk).await?;
+            if read == 0 {
+                return Err(invalid("closed"));
+            }
+            self.buffer.extend_from_slice(&chunk[..read]);
+        }
+    }
+}
+
+/// What a run measured: each call's latency, and in an open loop its send
+/// lag, for the calls scheduled in the timed window.
+#[derive(Default)]
+struct Samples {
+    latencies: Vec<Duration>,
+    lags: Vec<Duration>,
+    failed: u64,
+    /// The first answer that was not a call run to completion.
+    first_failure: Option<String>,
+    /// Calls in an open loop that waited for their session's previous call
+    /// to be answered: the nodes, not the driver, held them.
+    behind: u64,
+    /// Sessions whose signed calls ran out before the window ended.
+    exhausted: u64,
+}
+
+fn percentile(sorted: &[Duration], at: f64) -> Duration {
+    if sorted.is_empty() {
+        return Duration::ZERO;
+    }
+    sorted[((sorted.len() - 1) as f64 * at).round() as usize]
+}
+
+fn ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
+
+/// When calls go: back to back, or each at its scheduled time.
+#[derive(Clone, Copy)]
+enum Pace {
+    Closed,
+    /// One call every so long per session, the sessions staggered.
+    Open(Duration),
+}
+
+/// Send one call until it is answered, following the leader: its answer,
+/// or none once the run ends.
+async fn call(
+    space: &Space,
+    http: &mut Option<Http>,
+    node: &mut usize,
+    path: &str,
+    body: &[u8],
+    until: Instant,
+) -> Option<Answer> {
+    loop {
+        if Instant::now() >= until + Duration::from_secs(10) {
+            return None;
+        }
+        if http.is_none() {
+            *http = Http::connect(&space.processes[*node].target).await.ok();
+        }
+        let Some(connection) = http.as_mut() else {
+            smol::Timer::after(Duration::from_millis(10)).await;
+            continue;
+        };
+        match connection.post(path, body).await {
+            Ok(answer @ Answer::Ran { .. }) => return Some(answer),
+            Ok(Answer::NotLeader {
+                leader: Some(leader),
+            }) => {
+                if let Some(at) = space.by_url(&leader.address) {
+                    *node = at;
+                }
+                *http = None;
+            }
+            Ok(
+                Answer::Busy | Answer::Unavailable | Answer::TimedOut | Answer::NotLeader { .. },
+            ) => {
+                smol::Timer::after(Duration::from_millis(2)).await;
+            }
+            Ok(other) => return Some(other),
+            Err(_) => {
+                *http = None;
+                smol::Timer::after(Duration::from_millis(10)).await;
+            }
+        }
+    }
+}
+
+/// Run `plans` paced as `pace`, measuring the calls scheduled in the
+/// window after the warm-up, on the driver's executor: two threads, each
+/// on one of the driver's first two cores. With the samples, each node's
+/// CPU at the window's start and end.
+fn drive(space: &Space, plans: Vec<Plan>, pace: Pace) -> (Samples, (Cpu, Cpu)) {
+    let samples = Mutex::new(Samples::default());
+    let cpu = Mutex::new((Cpu::default(), Cpu::default()));
+    let stop = AtomicBool::new(false);
+    let executor = smol::Executor::new();
+    let start = Instant::now() + Duration::from_millis(200);
+    let window = (start + WARM, start + WARM + MEASURE);
+    let count = plans.len() as u32;
+    let cores: Vec<String> = cpus()
+        .get(3)
+        .map(|cpus| cpus.split(',').map(str::to_string).collect())
+        .unwrap_or_default();
+    std::thread::scope(|scope| {
+        let cpu = &cpu;
+        scope.spawn(move || {
+            std::thread::sleep(window.0.saturating_duration_since(Instant::now()));
+            let before = Cpu::now(space);
+            std::thread::sleep(window.1.saturating_duration_since(Instant::now()));
+            *cpu.lock().unwrap() = (before, Cpu::now(space));
+        });
+        for thread in 0..2 {
+            let (executor, stop, core) = (&executor, &stop, cores.get(thread).cloned());
+            scope.spawn(move || {
+                if let Some(core) = core {
+                    pin_thread(&core);
+                }
+                smol::block_on(executor.run(async {
+                    while !stop.load(Ordering::Relaxed) {
+                        smol::Timer::after(Duration::from_millis(20)).await;
+                    }
+                }));
+            });
+        }
+        let tasks: Vec<_> = plans
+            .into_iter()
+            .enumerate()
+            .map(|(at, plan)| {
+                let samples = &samples;
+                executor.spawn(async move {
+                    let mut node = plan.node;
+                    let mut http = None;
+                    let mut mine = Samples::default();
+                    let mut scheduled = start
+                        + match pace {
+                            Pace::Closed => Duration::ZERO,
+                            Pace::Open(interval) => interval * at as u32 / count,
+                        };
+                    smol::Timer::at(scheduled).await;
+                    let mut bodies = plan.bodies.iter();
+                    // When the session's previous call was answered: no
+                    // call goes before it.
+                    let mut previous = scheduled;
+                    // Its increments run, in or out of the window.
+                    let mut ran = 0u64;
+                    while scheduled < window.1 {
+                        let Some(body) = bodies.next() else {
+                            mine.exhausted += 1;
+                            break;
+                        };
+                        if let Pace::Open(_) = pace {
+                            smol::Timer::at(scheduled).await;
+                        }
+                        let sent = Instant::now();
+                        let from = match pace {
+                            Pace::Closed => sent,
+                            Pace::Open(_) => scheduled,
+                        };
+                        let answer =
+                            call(space, &mut http, &mut node, &plan.path, body, window.1).await;
+                        let answered = Instant::now();
+                        if matches!(
+                            answer,
+                            Some(Answer::Ran {
+                                outcome: Outcome::Done(_),
+                                ..
+                            })
+                        ) {
+                            ran += 1;
+                        }
+                        if from >= window.0 && from < window.1 {
+                            match answer {
+                                Some(Answer::Ran {
+                                    outcome: Outcome::Done(_),
+                                    ..
+                                }) => {
+                                    mine.latencies.push(answered - from);
+                                    if let Pace::Open(_) = pace {
+                                        // The driver's own lateness: past
+                                        // the schedule and the previous
+                                        // answer both.
+                                        mine.lags.push(
+                                            sent.saturating_duration_since(scheduled.max(previous)),
+                                        );
+                                        if previous > scheduled {
+                                            mine.behind += 1;
+                                        }
+                                    }
+                                }
+                                other => {
+                                    mine.failed += 1;
+                                    mine.first_failure.get_or_insert(format!("{other:?}"));
+                                }
+                            }
+                        }
+                        previous = answered;
+                        scheduled = match pace {
+                            Pace::Closed => answered,
+                            Pace::Open(interval) => scheduled + interval,
+                        };
+                    }
+                    if let Some(agent) = plan.counts {
+                        *space.ran.lock().unwrap().entry(agent).or_default() += ran;
+                    }
+                    let mut samples = samples.lock().unwrap();
+                    samples.latencies.extend(mine.latencies);
+                    samples.lags.extend(mine.lags);
+                    samples.failed += mine.failed;
+                    samples.exhausted += mine.exhausted;
+                    samples.behind += mine.behind;
+                    if samples.first_failure.is_none() {
+                        samples.first_failure = mine.first_failure;
+                    }
+                })
+            })
+            .collect();
+        for task in tasks {
+            smol::block_on(task);
+        }
+        stop.store(true, Ordering::Relaxed);
+    });
+    drop(executor);
+    (samples.into_inner().unwrap(), cpu.into_inner().unwrap())
+}
+
+/// What one run gives: commits per second, latency and lag percentiles,
+/// and each node's CPU over the window, per commit too.
+fn report(name: &str, samples: &mut Samples, cpu: (Cpu, Cpu)) -> (f64, Duration) {
+    samples.latencies.sort();
+    samples.lags.sort();
+    let seconds = MEASURE.as_secs_f64();
+    let commits = samples.latencies.len() as f64 / seconds;
+    let p50 = percentile(&samples.latencies, 0.50);
+    let p99 = percentile(&samples.latencies, 0.99);
+    let (before, after) = cpu;
+    let busy: Vec<f64> = after
+        .nodes
+        .iter()
+        .zip(&before.nodes)
+        .map(|(after, before)| (after - before) / seconds)
+        .collect();
+    // Past the knee the calls answered in the window are not those
+    // scheduled in it: no CPU per commit then.
+    let per_commit: Vec<f64> = busy
+        .iter()
+        .map(|busy| {
+            if commits > 0.0 && samples.behind == 0 {
+                busy / commits * 1e6
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    // Each node's executors: the busiest's share of a core, and their mean.
+    let executors: Vec<String> = after
+        .executors
+        .iter()
+        .zip(&before.executors)
+        .map(|(after, before)| {
+            let shares: Vec<f64> = after
+                .iter()
+                .zip(before)
+                .map(|(after, before)| (after - before) / seconds * 100.0)
+                .collect();
+            let most = shares.iter().copied().fold(0.0, f64::max);
+            let mean = shares.iter().sum::<f64>() / shares.len().max(1) as f64;
+            format!("{most:.0}%/{mean:.0}%")
+        })
+        .collect();
+    let driver = (after.driver - before.driver) / seconds;
+    let lag = if samples.lags.is_empty() {
+        String::new()
+    } else {
+        let lag99 = percentile(&samples.lags, 0.99);
+        format!(
+            "; send lag p50 {:.3} ms, p99 {:.3} ms{}",
+            ms(percentile(&samples.lags, 0.50)),
+            ms(lag99),
+            if lag99 > LAG { " INVALID" } else { "" }
+        )
+    };
+    let failure = match &samples.first_failure {
+        Some(failure) => format!(" (first: {failure})"),
+        None => String::new(),
+    };
+    let behind = if samples.behind > 0 {
+        format!(
+            "; {} calls waited on their session's previous one: past the knee",
+            samples.behind
+        )
+    } else {
+        String::new()
+    };
+    let exhausted = if samples.exhausted > 0 {
+        format!(
+            "; {} sessions ran out of calls UNDERCOUNTED",
+            samples.exhausted
+        )
+    } else {
+        String::new()
+    };
+    println!(
+        "{name}: {commits:.0}/s, p50 {:.2} ms, p99 {:.2} ms, {} failed{failure}; nodes busy {:?} cores (executors most/mean {executors:?}), {:?} µs CPU per commit; driver {driver:.2} cores{lag}{behind}{exhausted}",
+        ms(p50),
+        ms(p99),
+        samples.failed,
+        busy.iter()
+            .map(|busy| (busy * 100.0).round() / 100.0)
+            .collect::<Vec<_>>(),
+        per_commit.iter().map(|cpu| cpu.round()).collect::<Vec<_>>(),
+    );
+    (commits, p99)
+}
+
+/// Sessions spread over `agents`, each starting at its agent's leader,
+/// with `calls` signed calls each.
+fn plans(
+    agents: &[Signed],
+    leaders: &HashMap<AgentId, usize>,
+    sessions: u64,
+    calls: usize,
+    first: u64,
+) -> Vec<Plan> {
+    let jobs = agents
+        .iter()
+        .flat_map(|signed| {
+            (0..sessions)
+                .map(move |session| (*signed, first + session, calls, leaders[&signed.agent]))
+        })
+        .collect();
+    sign_plans(jobs)
+}
+
+/// One timed run of `plans`, reported as `name`, once the nodes are
+/// quiet after the last.
+fn run(name: &str, space: &Space, plans: Vec<Plan>, pace: Pace) -> (f64, Duration) {
+    quiet(space);
+    let (mut samples, cpu) = drive(space, plans, pace);
+    report(name, &mut samples, cpu)
+}
+
+/// Wait until the nodes use under a third of a core together, for at most
+/// 20 s: the last run's backlog spent.
+fn quiet(space: &Space) {
+    let until = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < until {
+        let before: f64 = space.cpu().iter().sum();
+        std::thread::sleep(Duration::from_millis(300));
+        let after: f64 = space.cpu().iter().sum();
+        if (after - before) / 0.3 < 0.33 {
+            return;
+        }
+    }
+    println!("the nodes did not go quiet within 20 s");
+}
+
+/// Signed calls for each session of a closed-loop run: enough for a
+/// session's share of the most the nodes could take, within a bound on
+/// them all, so memory stays bounded.
+fn closed_calls(sessions: u64) -> usize {
+    (400_000 / sessions as usize).min(4_000) + 64
+}
+
+/// Calls per session a run needs at `rate` per session, with room.
+fn calls_for(per_session: f64) -> usize {
+    ((per_session * (WARM + MEASURE).as_secs_f64()) * 1.2) as usize + 16
+}
+
+fn main() {
+    if std::env::args().any(|arg| arg == "--list") {
+        return;
+    }
+    let rows = rows();
+    let cpus = cpus();
+    let pinned = pinning();
+    if pinned {
+        // The driver, and the threads it signs on, on its own cores.
+        let _ = Command::new("taskset")
+            .args(["-p", "-c", &cpus[3], &std::process::id().to_string()])
+            .stdout(Stdio::null())
+            .status();
+        println!(
+            "pinned: nodes on {:?}, the driver on {}",
+            &cpus[..3],
+            cpus[3]
+        );
+    } else {
+        println!("taskset is missing: the nodes and the driver share every core");
+    }
+    let counter = vos_pvm_compiler::link_elf_spi(
+        &std::fs::read(guest(
+            "test-actors/target/riscv64em-vos/release/counter.elf",
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let space = Space::start(pinned, &cpus);
+    let mut session = 0u64;
+    let mut next = |count: u64| {
+        let first = session;
+        session += count;
+        first
+    };
+
+    let one = signed(&space, space.counter_agent(&counter));
+    let leaders: HashMap<AgentId, usize> = [(one.agent, space.leader(one.agent))].into();
+    if rows.iter().any(|row| row == "agent") {
+        println!(
+            "agent {} leads on node {}",
+            one.agent.0,
+            leaders[&one.agent] + 1
+        );
+        let mut most = 0.0f64;
+        for sessions in [1u64, 4, 16, 64, 256] {
+            let plans = plans(
+                &[one],
+                &leaders,
+                sessions,
+                closed_calls(sessions),
+                next(sessions),
+            );
+            let (commits, _) = run(
+                &format!("agent, {sessions} sessions closed"),
+                &space,
+                plans,
+                Pace::Closed,
+            );
+            most = most.max(commits);
+        }
+        let half = (most / 2.0).max(10_000.0);
+        let sessions = 256u64;
+        let interval = Duration::from_secs_f64(sessions as f64 / half);
+        let plans = plans(
+            &[one],
+            &leaders,
+            sessions,
+            calls_for(half / sessions as f64),
+            next(sessions),
+        );
+        run(
+            &format!("agent, open at {half:.0}/s (256 sessions)"),
+            &space,
+            plans,
+            Pace::Open(interval),
+        );
+    }
+
+    if rows.iter().any(|row| row == "quiet") {
+        let plans = plans(&[one], &leaders, 1, closed_calls(1), next(1));
+        run(
+            "quiet node, one call at a time",
+            &space,
+            plans,
+            Pace::Closed,
+        );
+    }
+
+    if rows.iter().any(|row| row == "query") {
+        let leader = leaders[&one.agent];
+        let follower = (leader + 1) % 3;
+        query(&space, &one, follower);
+    }
+
+    let many = if rows.iter().any(|row| row == "agents") {
+        let agents: Vec<Signed> = (0..64)
+            .map(|_| signed(&space, space.counter_agent(&counter)))
+            .collect();
+        let leaders: HashMap<AgentId, usize> = agents
+            .iter()
+            .map(|signed| (signed.agent, space.leader(signed.agent)))
+            .collect();
+        let mut led = [0usize; 3];
+        for leader in leaders.values() {
+            led[*leader] += 1;
+        }
+        println!(
+            "64 agents, leaders per node {led:?}: 16 sessions each, as many connections to each"
+        );
+        for sessions in [4u64, 16] {
+            let plans = plans(
+                &agents,
+                &leaders,
+                sessions,
+                closed_calls(64 * sessions),
+                next(64 * sessions),
+            );
+            run(
+                &format!("64 agents × {sessions} sessions closed"),
+                &space,
+                plans,
+                Pace::Closed,
+            );
+        }
+        let open = |rate: f64, next: &mut dyn FnMut(u64) -> u64| {
+            let sessions = 16u64;
+            let all = 64.0 * sessions as f64;
+            let interval = Duration::from_secs_f64(all / rate);
+            let plans = plans(
+                &agents,
+                &leaders,
+                sessions,
+                calls_for(rate / all),
+                next(64 * sessions),
+            );
+            run(
+                &format!("64 agents, open at {rate:.0}/s"),
+                &space,
+                plans,
+                Pace::Open(interval),
+            )
+        };
+        // Upward, so no run meets the backlog of one past the knee: the
+        // knee lies between the last rate that held and the first that
+        // did not.
+        let mut held = None;
+        let mut missed = None;
+        for rate in [
+            5_000.0, 10_000.0, 15_000.0, 20_000.0, 25_000.0, 30_000.0, 35_000.0,
+        ] {
+            let (_, p99) = open(rate, &mut next);
+            if p99 > KNEE_P99 {
+                missed = Some(rate);
+                break;
+            }
+            held = Some(rate);
+        }
+        match (held, missed) {
+            (Some(held), Some(missed)) => {
+                println!(
+                    "64 agents: the knee, p99 ≤ 20 ms, between {held:.0}/s and {missed:.0}/s offered"
+                )
+            }
+            (Some(held), None) => println!("64 agents: p99 ≤ 20 ms up to {held:.0}/s offered"),
+            (None, _) => println!("64 agents: p99 above 20 ms from 5k/s offered"),
+        }
+        // The budget's own rate, last: past the knee, it leaves a backlog.
+        open(40_000.0, &mut next);
+        agents
+    } else {
+        Vec::new()
+    };
+
+    // Every increment answered as run is in its agent's counter, once.
+    let mut agents = vec![one];
+    agents.extend(many);
+    counters_hold(&space, &agents);
+
+    if rows.iter().any(|row| row == "idle") {
+        idle(&space);
+    }
+}
+
+/// Each agent's counter, read at its leader, equals the increments it
+/// answered as run.
+fn counters_hold(space: &Space, agents: &[Signed]) {
+    let ran = space.ran.lock().unwrap().clone();
+    let key = SigningKey::from_bytes(&[11; 32]);
+    let public = key.verifying_key().to_bytes();
+    for signed in agents {
+        let Some(expected) = ran.get(&signed.agent).copied() else {
+            continue;
+        };
+        let not_after = vos_node::wall_clock() + 60_000;
+        let consistency = Consistency::Linearizable;
+        let message = query_message(
+            &signed.identity,
+            &public,
+            not_after,
+            consistency,
+            COUNTER,
+            signed.value,
+            &[],
+        );
+        let body = QueryCall {
+            key: public,
+            not_after,
+            consistency,
+            instance: COUNTER,
+            method: signed.value,
+            arguments: Vec::new(),
+            signature: key.sign(&message).to_bytes(),
+        }
+        .encode();
+        let leader = &space.processes[space.leader(signed.agent)];
+        let path = format!("/agents/{}/queries", signed.agent.0);
+        let answer =
+            vos_node::client::post_within(&leader.target, &path, &body, Duration::from_secs(5));
+        let value = match answer {
+            Ok(Answer::Ran {
+                outcome: Outcome::Done(bytes),
+                ..
+            }) => u64::decode(&bytes).unwrap().0,
+            other => panic!("agent {}'s counter: {other:?}", signed.agent.0),
+        };
+        assert_eq!(
+            value, expected,
+            "agent {}'s counter against the increments it answered",
+            signed.agent.0
+        );
+    }
+    println!("every agent's counter holds every increment it answered, once");
+}
+
+/// The counter's value read on `follower`, open loop, client to answer.
+fn query(space: &Space, signed: &Signed, follower: usize) {
+    let key = SigningKey::from_bytes(&[9; 32]);
+    let public = key.verifying_key().to_bytes();
+    let not_after = vos_node::wall_clock() + 240_000;
+    let consistency = Consistency::Applied { at: 0 };
+    let message = query_message(
+        &signed.identity,
+        &public,
+        not_after,
+        consistency,
+        COUNTER,
+        signed.value,
+        &[],
+    );
+    let body = QueryCall {
+        key: public,
+        not_after,
+        consistency,
+        instance: COUNTER,
+        method: signed.value,
+        arguments: Vec::new(),
+        signature: key.sign(&message).to_bytes(),
+    }
+    .encode();
+    let rate = 2_000.0;
+    let sessions = 16usize;
+    let per = calls_for(rate / sessions as f64);
+    let plans: Vec<Plan> = (0..sessions)
+        .map(|_| Plan {
+            counts: None,
+            node: follower,
+            path: format!("/agents/{}/queries", signed.agent.0),
+            bodies: vec![body.clone(); per],
+        })
+        .collect();
+    let interval = Duration::from_secs_f64(sessions as f64 / rate);
+    run(
+        &format!(
+            "query on follower node {}, open at {rate:.0}/s",
+            follower + 1
+        ),
+        space,
+        plans,
+        Pace::Open(interval),
+    );
+}
+
+/// 1,000 agents more on every node, left alone: each process's CPU,
+/// threads and memory.
+fn idle(space: &Space) {
+    let started = Instant::now();
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            scope.spawn(|| {
+                for _ in 0..125 {
+                    space.operate(
+                        |operator| {
+                            operator
+                                .create_agent(vec![1, 2, 3])
+                                .unwrap_or(Answer::Unavailable)
+                        },
+                        |answer| matches!(answer, Answer::Created(_)),
+                    );
+                }
+            });
+        }
+    });
+    println!(
+        "1,000 idle agents created in {:.1} s",
+        started.elapsed().as_secs_f64()
+    );
+    std::thread::sleep(IDLE_SETTLE);
+    let before = space.cpu();
+    std::thread::sleep(IDLE_MEASURE);
+    let after = space.cpu();
+    for (at, process) in space.processes.iter().enumerate() {
+        let (threads, rss) = process.threads_and_rss();
+        println!(
+            "idle node {}: {:.1}% of one core, {threads} threads, {rss} MiB resident",
+            process.number,
+            (after[at] - before[at]) / IDLE_MEASURE.as_secs_f64() * 100.0
+        );
+    }
+}

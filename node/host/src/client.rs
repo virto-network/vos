@@ -53,6 +53,17 @@ pub struct Target {
 }
 
 impl Target {
+    /// The `host:port` it connects to.
+    pub fn authority(&self) -> &str {
+        &self.authority
+    }
+
+    /// The TLS a connection to it speaks, and the name it presents, for a
+    /// caller with its own connections; none for plain HTTP.
+    pub fn tls(&self) -> Option<(Arc<rustls::ClientConfig>, ServerName<'static>)> {
+        self.tls.clone()
+    }
+
     /// The node at `url` (`http://` or `https://`, then a host and an
     /// optional port), trusted as `trust` says. Plain HTTP reaches
     /// loopback addresses only, and HTTPS needs a key or a CA to trust.
@@ -159,6 +170,8 @@ const CONNECT: Duration = Duration::from_secs(10);
 const ANSWER: Duration = Duration::from_secs(300);
 /// The largest answer taken: a schema, a reply, a refusal.
 const MAX_ANSWER: usize = 16 << 20;
+/// The largest request body sent in one write with its head.
+const ONE_WRITE: usize = 64 << 10;
 
 trait Stream: Read + Write + Send {}
 
@@ -332,10 +345,20 @@ fn exchange(
     head: &[u8],
     body: &[u8],
 ) -> Result<(u16, Vec<u8>, bool), (std::io::Error, bool)> {
-    connection
-        .stream
-        .write_all(head)
-        .and_then(|()| connection.stream.write_all(body))
+    // A small request in one write, so it wakes the node once; a large one
+    // (an install) is not copied for it.
+    let written = if body.len() <= ONE_WRITE {
+        let mut request = Vec::with_capacity(head.len() + body.len());
+        request.extend_from_slice(head);
+        request.extend_from_slice(body);
+        connection.stream.write_all(&request)
+    } else {
+        connection
+            .stream
+            .write_all(head)
+            .and_then(|()| connection.stream.write_all(body))
+    };
+    written
         .and_then(|()| connection.stream.flush())
         .map_err(|error| (error, false))?;
     read_answer(connection).map_err(|error| {

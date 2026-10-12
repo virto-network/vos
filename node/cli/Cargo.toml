@@ -26,6 +26,13 @@ vos-pvm-compiler = { workspace = true }
 vos-wire = { workspace = true }
 
 [dev-dependencies]
+futures-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+httparse = "1"
+smol = "2"
 vos-checker = { path = "../checker" }
 socket2 = "0.6"
 tempfile = "3"
+
+[[bench]]
+name = "processes"
+harness = false

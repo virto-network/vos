@@ -2481,8 +2481,11 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "ed25519-dalek",
+ "futures-rustls",
  "getrandom 0.2.17",
  "hex",
+ "httparse",
+ "smol",
  "socket2",
  "tempfile",
  "tracing-subscriber",
