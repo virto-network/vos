@@ -8,6 +8,7 @@ default:
 # agent, so it is tested with it.
 test:
     cargo test -p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-proof-verifier -p vos-wire
+    cargo test --manifest-path support/lsm-tree/Cargo.toml --target-dir target
     cargo test -p vos-pvm-proof --lib
 
 # Bench guests, built with the guest toolchain in `pvm/guest`.

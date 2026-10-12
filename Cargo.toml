@@ -33,7 +33,13 @@ exclude = [
     "pvm/proof/settlement-verifier",
     # Throwaway measurement code from the design runs.
     "spikes",
+    # A dependency's published source, patched (see its VENDORED.md): kept
+    # as published, outside the workspace's formatting and lints.
+    "support/lsm-tree",
 ]
+
+[patch.crates-io]
+lsm-tree = { path = "support/lsm-tree" }
 
 [workspace.package]
 version = "0.1.0"

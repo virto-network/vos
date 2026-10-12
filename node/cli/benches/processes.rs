@@ -654,27 +654,42 @@ struct Plan {
     bodies: Bodies,
 }
 
-/// A session's call bodies: signed before the run, or one at a time as it
+/// A plan's call bodies: signed before the run, or one at a time as it
 /// goes, after each answer, for runs too long to sign ahead.
 enum Bodies {
     Ready(std::vec::IntoIter<Vec<u8>>),
-    Signing {
-        signer: Box<SessionKey>,
-        next: u64,
-        last: u64,
-    },
+    Signing(Box<Signing>),
+}
+
+/// Calls signed as a plan goes, in a new session every `every` calls, as
+/// clients come and go: session `number`, then `number + stride`, and so
+/// on.
+struct Signing {
+    signed: Signed,
+    number: u64,
+    stride: u64,
+    every: u64,
+    key: SessionKey,
+    /// The plan's next call, from 1, and its last.
+    next: u64,
+    last: u64,
 }
 
 impl Bodies {
     fn next(&mut self) -> Option<Vec<u8>> {
         match self {
             Bodies::Ready(bodies) => bodies.next(),
-            Bodies::Signing { signer, next, last } => {
-                if *next > *last {
+            Bodies::Signing(signing) => {
+                if signing.next > signing.last {
                     return None;
                 }
-                *next += 1;
-                Some(signer.sign(*next - 1))
+                let sequence = (signing.next - 1) % signing.every + 1;
+                if sequence == 1 && signing.next > 1 {
+                    signing.number += signing.stride;
+                    signing.key = SessionKey::new(&signing.signed, signing.number);
+                }
+                signing.next += 1;
+                Some(signing.key.sign(sequence))
             }
         }
     }
@@ -748,17 +763,28 @@ fn session_plan(signed: &Signed, number: u64, calls: usize, node: usize) -> Plan
     }
 }
 
-/// The same session, each call signed as it goes.
-fn signing_plan(signed: &Signed, number: u64, calls: usize, node: usize) -> Plan {
+/// `calls` increments at `signed`'s agent, each signed as it goes, in
+/// session `number` and then a new one every `every` calls, `stride`
+/// apart.
+fn signing_plan(
+    signed: &Signed,
+    (number, stride, every): (u64, u64, u64),
+    calls: usize,
+    node: usize,
+) -> Plan {
     Plan {
         counts: Some(signed.agent),
         node,
         path: format!("/agents/{}/calls", signed.agent.0),
-        bodies: Bodies::Signing {
-            signer: Box::new(SessionKey::new(signed, number)),
+        bodies: Bodies::Signing(Box::new(Signing {
+            signed: *signed,
+            number,
+            stride,
+            every,
+            key: SessionKey::new(signed, number),
             next: 1,
             last: calls as u64,
-        },
+        })),
     }
 }
 
@@ -1035,7 +1061,12 @@ fn drive_windows(
                         // Signed, when it is signed as it goes, in the
                         // session's time between calls.
                         let Some(body) = bodies.next() else {
-                            mine[window_of(scheduled).unwrap_or(windows - 1)].exhausted += 1;
+                            let window = if scheduled < first {
+                                0
+                            } else {
+                                window_of(scheduled).unwrap_or(windows - 1)
+                            };
+                            mine[window].exhausted += 1;
                             break;
                         };
                         if let Pace::Open(_) = pace {
@@ -1807,12 +1838,15 @@ fn failover(space: &Space, agents: &[Signed]) {
 }
 
 /// The 64-agent load open at `SOAK_RATE` (6k/s by default) for
-/// `SOAK_SECONDS` (1,800), in windows of 50 s, each signed before it.
+/// `SOAK_SECONDS` (1,800), one load throughout, in windows of 50 s; the
+/// windows within `SOAK_WARMUP` (150 s) of its start are reported, not
+/// compared. Each session moves to a new one every 1,000 calls.
 ///
-/// The history a run leaves must not cost more: over the clean windows
-/// (outside the run under [`CLEAN_OUTSIDE`] cores, IO stalled under
-/// [`CLEAN_IO`]%), the median of the first three and of the last three
-/// must agree for
+/// After the warm-up, its steady state over the clean windows (outside
+/// the run under [`CLEAN_OUTSIDE`] cores, IO stalled under [`CLEAN_IO`]%):
+/// the stalls and longest batch, p95, p99 and CPU per commit, to compare
+/// runs by. And the history a run leaves must not cost more: the median
+/// of the first three clean windows and of the last three must agree for
 /// - CPU per commit, and p50 and p95, within 10%;
 /// - the stalls, within 10% and one more;
 /// - the longest batch, within one bucket (a quarter).
@@ -1828,8 +1862,15 @@ fn soak(space: &Space, agents: &[Signed], next: &mut dyn FnMut(u64) -> u64) {
         .ok()
         .and_then(|seconds| seconds.parse().ok())
         .unwrap_or(1_800);
+    // Its first windows come before the store's steady state (nothing
+    // flushed yet): reported, not compared.
+    let warmup: u64 = std::env::var("SOAK_WARMUP")
+        .ok()
+        .and_then(|seconds| seconds.parse().ok())
+        .unwrap_or(150);
     let window = Duration::from_secs(50);
-    let windows = (seconds / window.as_secs()).max(6);
+    let windows = (seconds / window.as_secs()).max(1);
+    let warm = warmup.div_ceil(window.as_secs()) as usize;
     let leaders: HashMap<AgentId, usize> = agents
         .iter()
         .map(|signed| (signed.agent, space.leader(signed.agent)))
@@ -1838,14 +1879,22 @@ fn soak(space: &Space, agents: &[Signed], next: &mut dyn FnMut(u64) -> u64) {
     let all = agents.len() as f64 * sessions as f64;
     let interval = Duration::from_secs_f64(all / rate);
     // One load throughout, each call signed as its session goes: the
-    // nodes never rest between windows.
+    // nodes never rest between windows. Each plan moves to a new session
+    // every `SESSION_CALLS`, so new sessions keep arriving, as clients'
+    // do. (They expire after an hour, past a default soak.)
+    const SESSION_CALLS: u64 = 1_000;
     let calls = calls_over(rate / all, window * windows as u32);
-    let first = next(agents.len() as u64 * sessions);
+    let plans_count = agents.len() as u64 * sessions;
+    let first = next(plans_count * (calls as u64).div_ceil(SESSION_CALLS));
     let plans: Vec<Plan> = agents
         .iter()
-        .flat_map(|signed| {
+        .enumerate()
+        .flat_map(|(at, signed)| {
             let node = leaders[&signed.agent];
-            (0..sessions).map(move |session| signing_plan(signed, first + session, calls, node))
+            (0..sessions).map(move |session| {
+                let number = first + at as u64 * sessions + session;
+                signing_plan(signed, (number, plans_count, SESSION_CALLS), calls, node)
+            })
         })
         .collect();
     quiet(space);
@@ -1864,14 +1913,15 @@ fn soak(space: &Space, agents: &[Signed], next: &mut dyn FnMut(u64) -> u64) {
             .collect();
     let clean: Vec<&Measured> = measured
         .iter()
+        .skip(warm)
         .filter(|outcome| outcome.outside < CLEAN_OUTSIDE && outcome.io < CLEAN_IO)
         .collect();
     println!(
-        "soak: {} of {windows} windows clean (outside the run under {CLEAN_OUTSIDE} cores, IO stalled under {CLEAN_IO}%)",
-        clean.len()
+        "soak: {} of the {} windows after {warm} of warm-up clean (outside the run under {CLEAN_OUTSIDE} cores, IO stalled under {CLEAN_IO}%)",
+        clean.len(),
+        windows.saturating_sub(warm as u64)
     );
-    if clean.len() < 6 {
-        println!("soak: too few clean windows to judge");
+    if clean.is_empty() {
         return;
     }
     let median = |outcomes: &[&Measured], of: &dyn Fn(&Measured) -> f64| {
@@ -1879,6 +1929,31 @@ fn soak(space: &Space, agents: &[Signed], next: &mut dyn FnMut(u64) -> u64) {
         values.sort_by(f64::total_cmp);
         values[values.len() / 2]
     };
+    // The steady state, to compare runs by.
+    let mean = |of: &dyn Fn(&Measured) -> f64| {
+        clean.iter().map(|outcome| of(outcome)).sum::<f64>() / clean.len() as f64
+    };
+    println!(
+        "soak steady: {:.1} runtime stalls and {:.1} batches of {:.0} ms or more a window, the longest batch {:.0} ms; median p95 {:.2} ms, p99 {:.2} ms; CPU per commit {:.0} µs",
+        mean(&|outcome| outcome.stalls as f64),
+        mean(&|outcome| outcome.long_batches as f64),
+        STALL as f64 / 1000.0,
+        clean
+            .iter()
+            .map(|outcome| outcome.longest_batch)
+            .max()
+            .unwrap_or(0) as f64
+            / 1000.0,
+        median(&clean, &|outcome| ms(outcome.p95)),
+        median(&clean, &|outcome| ms(outcome.p99)),
+        median(&clean, &|outcome| {
+            outcome.busy.iter().sum::<f64>() / outcome.commits * 1e6
+        }),
+    );
+    if clean.len() < 6 {
+        println!("soak: too few clean windows to judge a trend");
+        return;
+    }
     let (early, late) = (&clean[..3], &clean[clean.len() - 3..]);
     let mut grew = Vec::new();
     let mut judge =

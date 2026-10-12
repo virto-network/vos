@@ -6526,3 +6526,124 @@ eviction, the retirement test.
   about 420–470 µs now;
 - the single agent's closed-loop throughput with its leader moved to a
   node that never took the install.
+
+#### 3.10b0 Built: memtables freed off the version lock
+
+**The design changed once it was measured.**
+- **The first shape** (`maintenance` returning what it popped, for
+  lsm-tree's callers to drop after their locks) changed nothing: one
+  soak each on tmpfs, 4.8 runtime stalls a window against 5.0.
+- **Why:** fjall calls `maintenance` itself. `Keyspace::inner_rotate_memtable`,
+  on a fjall worker after every memtable rotation, runs
+  `keyspace.tree.get_version_history_lock().maintenance(..)` on every
+  keyspace. The guard is a temporary of that statement, so whatever it
+  returned was dropped under the lock. That rotation is where the gc
+  watermark moves up, so it is where most flushed memtables lose their
+  last reference.
+- **Ruled out on the way:**
+  - glibc's heap trimming (`GLIBC_TUNABLES=glibc.malloc.trim_threshold`
+    at 16 GiB): 4.8 runtime stalls a window;
+  - mimalloc alone: 4.7, since the free stays under the lock.
+
+**The shape now** (`support/lsm-tree/src/version/super_version.rs`, the
+only source that differs from lsm-tree 3.1.10):
+- a version `maintenance` pops has its memtables sent to a thread of
+  their own (`lsm-release`, started on first use), which frees them. No
+  caller changes, fjall's included;
+- its tables are dropped where it is popped, as before. A deleted table
+  removes its file when dropped, and removed later, on that thread, the
+  file could already be a reopened tree's: the cluster tests and the
+  checker reopen nodes in one process, and recovery restarts table ids
+  at the highest live one plus one;
+- with no thread, the memtables are freed where they are popped, as
+  before.
+
+**Carried as a patch:**
+- `support/lsm-tree`, outside the workspace (its own empty `[workspace]`;
+  excluded in the root manifest), taken through `[patch.crates-io]`;
+- its tests run in `just test`;
+- `VENDORED.md` says what differs and when the copy goes;
+- `UPSTREAM.md` holds the issue, and two fixes for upstream to choose
+  from (callers dropping what `maintenance` returns, fjall's included;
+  or the release thread), for the owner to file.
+
+**The test** (`tests/released_versions.rs`):
+- A memtable is grown until freeing it alone takes 50 ms or more here;
+  on a machine too fast for 12 M items, the test says so and passes.
+- A tree flushed with a watermark of 0 keeps the versions holding that
+  memtable. A small flush with every version below the watermark then
+  pops them, while a thread times `get`s until the memtable is gone, and
+  through the free's length after.
+- Unpatched, a read waits 102 ms through a 103 ms free, and the test
+  fails. Patched, it passes, in debug and release, with the crate's 236
+  unit and 23 doc tests.
+
+**Measured** (`ROWS=soak SOAK_SECONDS=450 SOAK_WARMUP=150`, the 64 agents
+at 6k/s, continuous; `soak steady` over the windows after the warm-up):
+
+| Run | Runtime stalls a window | Batches ≥ 49 ms a window | Longest batch | p95 | p99 | CPU per commit |
+|---|---|---|---|---|---|---|
+| tmpfs, A (published) | 5.0, 5.0, 4.8 | 134, 165, 131 | 328, 262, 328 ms | 3.33–3.35 ms | 39, 50, 34 ms | 682, 683, 676 µs |
+| tmpfs, B (patched) | 0.0, 0.0, 0.0 | 87, 103, 91 | 164, 164, 197 ms | 3.29–3.41 ms | 4.1, 4.2, 3.8 ms | 710, 714, 676 µs |
+| disk, A | 5.3 | 263 | 655 ms | 23.6 ms | 250 ms | 815 µs |
+| disk, B | 0.7 | 263 | 524 ms | 22.7 ms | 101 ms | 807 µs |
+
+- **On tmpfs it holds in every pair:** no runtime stall, and p99 from
+  34–50 ms to 3.8–4.2 ms. Kept.
+- **CPU per commit** is within A's spread, though twice higher: freeing
+  nodes allocated in the writer's arena takes that arena's lock, so the
+  free contends a little with the writer.
+- **mimalloc** (screening, one soak each): with the patch, p99 3.6 ms and
+  CPU per commit 661 µs; alone, 656 µs. A CPU lever, taken later by
+  3.10b's method.
+- **The pairs above** ran a build that sent whole versions to the
+  thread, tables too. The final shape, memtables only, measured on its
+  own (one soak each):
+  - tmpfs: no runtime stall, 96 batches of 49 ms or more a window, the
+    longest 164 ms; p95 3.35 ms, p99 3.98 ms; CPU per commit 689 µs;
+  - disk: no runtime stall, 184 batches a window, the longest 229 ms;
+    p95 17.0 ms, p99 41 ms; CPU per commit 850 µs.
+  - So deleted tables unlinking under the lock again, as published,
+    costs nothing seen: on disk it does no worse than the whole-version
+    build (p99 101 ms, longest batch 524 ms).
+  - Every agent's counter held every increment it answered, once.
+
+**What remains:**
+- **On tmpfs:** about 90 batches a window of 49 ms or more (under 0.1%
+  of batches). The writer's synced flushes reach 57 ms there, where a
+  sync costs nothing, with propose, commit and apply stretched behind
+  them, and the runtime on time (`late` at most 6 ms). That is fjall's
+  write path: its throttles (writes sleep 100 ms at a time while four
+  sealed memtables wait; they spin once level 0 holds 20 runs), or its
+  journal's work.
+- **On disk, ext4's journal.** Each thread's kernel wait point
+  (`/proc/<pid>/task/<tid>/wchan`, sampled each millisecond) shows the
+  writer waiting on the journal's commit (`jbd2_log_wait_commit`) most of
+  the time, and during a flush up to 180 ms in `do_get_write_access`,
+  behind the commit carrying the flushed table's data (ordered mode).
+  Tables are written whole and synced once at the end, by flushes and
+  compactions alike. The next step: progressive writeback (RocksDB's
+  `bytes_per_sync`), smaller memtables, or both, by their own design.
+
+**The 30-minute soak, before the patch** (disk, continuous, the 64
+agents at 6k/s, 36 windows, all clean):
+- CPU levels off: each node busy 1.6–1.9 cores from the second window to
+  the last, CPU per commit 827 µs early and 854 µs late.
+- p50 rises over the run: 5.3 ms, then 6.0, 6.6, 6.9 and 7.3 ms by the
+  last windows, at a fixed rate and with CPU per commit flat.
+- The stalls run throughout: 6.3 runtime stalls and 270 batches of 49 ms
+  or more a window, the longest batch 786 ms, p99 131 ms at the median.
+  Its verdict, "grows", is mostly the stall.
+
+**Open, in order:**
+1. **The disk's stalls** (ext4's journal behind table writes): the next
+   lever, with its own design.
+2. **The p50 creep:** 5.3 ms to 7.3 ms over 30 minutes at a fixed 6k/s,
+   CPU per commit flat. Growth with history, apart from the stalls; the
+   soak after the next lever shows whether it remains, then it is found.
+3. **fjall's write path on tmpfs:** the writer's synced flushes up to
+   57 ms with nothing to sync.
+
+**Carried, for the owner:** `historical_lookup` answers any hash in the
+node's blob store, whatever the agent: an isolation question (from
+3.10b1's review).
