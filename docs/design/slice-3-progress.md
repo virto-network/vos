@@ -6344,3 +6344,185 @@ each by 3.10b's method):
 **Moved:** TLS and table reads under writes are measured in 3.10c, with
 the final numbers. Failover and the soak run twice: a baseline now, and
 again at the end.
+
+#### 3.10b The levers: designs
+
+Each lever below was reviewed before it was built (Opus 5.5).
+
+#### 3.10b0 Design: no memtable freed under fjall's version lock
+
+**The defect** (3.10a2's attribution): lsm-tree 3.1.10 frees a flushed
+memtable while it holds the tree's `version_history` write lock. Every
+reader and writer of that keyspace waits, 110–160 ms for a 64 MiB
+memtable on the reference laptop, a few times a minute under load. The
+log keyspace takes every Raft append, so its stall stops every agent on
+the node.
+
+**The fix, in lsm-tree:** `SuperVersions::maintenance` returns the
+versions it pops instead of dropping them. Each caller drops them after
+its guards:
+- the flush's `Tree::register_tables` (after `version_lock` and
+  `compaction_state`);
+- the compaction worker's three version upgrades: returned up to the
+  worker's top, past `compaction_state` too. No reader or writer takes
+  that lock, but a flush's registration does, so a free under it would
+  still hold a flush back by the free's time, toward fjall's write
+  backpressure;
+- the two ingestions, which call it with a watermark of 0 and pop
+  nothing, take the new signature only.
+
+The popped versions are then freed on fjall's own worker thread, as
+now, with no lock held. A table a popped version held, marked deleted,
+is unlinked there too.
+
+**What does not change:** which versions are popped, when, and what a
+reader sees. A version below the watermark has no live snapshot, and a
+live snapshot keeps its version in the history, so no node thread ever
+drops one; the patch only moves the drop past the guards.
+
+**How it is carried:**
+- `support/lsm-tree`, lsm-tree 3.1.10's published source with the patch,
+  and `[patch.crates-io] lsm-tree = { path = "support/lsm-tree" }` in the
+  workspace.
+- Its tests and fjall's run in `just ci`.
+- A removal item for the cleanup before master, as for vos-raft's copy:
+  replaced by an upstream release with the fix.
+- An upstream issue and pull request, drafted here for the owner to
+  file. The draft also notes that the version's syncs could be prepared
+  before the lock is taken.
+
+**First, the chain confirmed:** node 1 sampled again with deeper stacks
+(`--call-graph dwarf,65528`) on fjall's workers, until a sample in a
+stall shows `drop_in_place<SuperVersion>` under `maintenance` under
+`register_tables` (or the compaction worker).
+
+**Tests:**
+- in the patched lsm-tree:
+  - `maintenance` returns the versions it pops, and the history no
+    longer holds them;
+  - a flush releasing a memtable large enough that freeing it takes
+    50 ms or more, with no snapshot left open (so the popped version
+    holds its last reference), and `get`s timed on another thread
+    throughout: the longest waits under half the free, which the same
+    test times, so the margin is checked and CI's load does not make it
+    flaky;
+- in the node: none new; the soak measures it.
+
+**Measured** by 3.10b's method, staged, as the effect is large (stalls
+of 100–160 ms a few times a minute against none):
+- **A against B,** three interleaved 6-minute soaks each, one load
+  throughout, on the reference pinning and disk (`ROWS=soak`, the 64
+  agents without their rows). Each gives the stalls per window (runtime
+  wakes and batches of about 50 ms or more), the longest batch, p95, p99
+  and CPU per commit. **B is kept if its stalls and longest batch move
+  past A's spread.**
+- **Smaller memtables** only if the owner declines the patch: once the
+  free leaves the lock they only multiply flushes, and the syncs with
+  them.
+- **mimalloc** later, as a CPU lever by 3.10b's method (instructions and
+  CPU per commit), not as a stall fix.
+
+**What stays after it:** the five syncs under the lock at every flush
+and compaction, measured apart: B on disk against B on tmpfs.
+
+#### 3.10b1 Design: `instantiate` loads a program its agent pins
+
+**The gap** (3.10a2's attribution): a node adds a program to its machine
+pool only when it takes the install as the agent's leader, and at start
+for every pinned program. Elsewhere `instantiate` answers `WHO`, and the
+agent builds the machine from the blob on every run: `historical_lookup`
+twice, `machine` (a whole parse and validation), `pages`, `poke`.
+- **CPU:** on a follower answering queries, that parse is about 16% of
+  the node's CPU.
+- **Gas:** the fallback costs more: `instantiate`'s base, then two
+  lookups (a head, then the rest: about the blob's length in all), the
+  guest's copying, then the loader's calls, which cost the price.
+  - Replicas never diverge, since inner machines are made only in
+    refine, whose output the log carries.
+  - But a refine's outcome near its gas limit depends on whether its
+    leader's pool held the program, and a query's on the node it
+    reaches.
+
+**The rule: the pool is a cache that `instantiate` fills.**
+- **A source, per run:** `RefineContext::with_programs`, a function from
+  a code hash to the program's bytes. The node's gives the blob only if
+  the running agent pins it (its pin row, `pin_key(hash, agent)`), so
+  the pool stays what pins make it, as at a restart; any other stored
+  blob, however valid, is no program of this agent's.
+- **Its answers:** `Ok(Some(bytes))`, `Ok(None)` (not this agent's, or
+  not stored), or `Err` (the store could not be read).
+- **On a miss,** `instantiate` asks the source:
+  - **bytes:** checked against the hash asked for (a corrupt store
+    installs nothing), installed, and then as for a hit: the same base,
+    the same `price()`;
+  - **none, or bytes that are not a valid program:** `WHO`, as today;
+  - **an error:** the run faults, as other store reads do. Answering
+    `WHO` instead would send the guest down the fallback, with its gas.
+- **So the gas is the same on every node:** every replica holds the
+  blobs its agent pins, so for an agent's own programs `instantiate`
+  answers alike everywhere, by construction.
+- **Loading on an executor:** `instantiate` already runs there, inside
+  refine. Two misses at once may both parse; the first install wins and
+  the other's copy is dropped.
+- **The first run after a miss** pays the parse and, on the recompiler,
+  the build of the prepared code: once per program per node.
+
+**Whose programs:** the pin check applies on a miss, not on a hit. Any
+program in the node's pool can be instantiated by its hash, whichever
+agent pinned it.
+- That holds because `instantiate`'s only caller is the node's own
+  agent program, which names only its agent's installed programs.
+  Actors cannot reach it.
+- So the check on a miss is a defense. A guest naming another agent's
+  program would get an answer that depends on the node; that case
+  belongs with the isolation question carried below.
+- Hits are not checked: the leader's install pools its programs before
+  their pins exist.
+
+**Eviction:** after a committed change set with an unpin (an apply whose
+writes touch the installed rows, a snapshot switch, a retirement), each
+program unpinned that no agent here still pins leaves the pool, as a
+restart would leave it. A race with a new pin costs at most a reload on
+the next miss, at the same gas, so no lock is needed.
+
+**What does not change:**
+- The leader's install still adds its programs before the entry
+  commits. One that never commits stays pooled until restart or its
+  eviction: memory only, since the guest instantiates installed
+  programs.
+- Machines lent when a program leaves the pool are dropped on return
+  (`MachinePool::release`).
+- A context without a source (JAM, and every test that sets none)
+  answers `WHO` on a miss, as now.
+
+**Carried, for the owner, out of this step:** `historical_lookup`
+answers any hash in the node's blob store, whatever the agent. An agent
+that knows a hash can read another agent's blobs, programs or a large
+entry's. It is an isolation question.
+
+**Tests:**
+- vos-pvm:
+  - a refine instantiating a program its pool lacks but its source holds
+    uses exactly the gas of one whose pool holds it, and the program is
+    pooled after;
+  - a source answering none answers `WHO`, as does one giving an invalid
+    program or bytes of another hash;
+  - a source erring faults the run.
+- node:
+  - a follower that never took an agent's install holds its program in
+    the pool after its first query;
+  - a leader elected later holds it after its first refine;
+  - a program pinned only by another agent is not loaded;
+  - the pool drops a program once the last agent pinning it retires,
+    keeps one another agent still pins, and reloads an evicted one on
+    its next use.
+
+**Mutations:** without the miss path, the first vos-pvm test and the
+follower test fail; without the pin check, the other-agent test; without
+eviction, the retirement test.
+
+**Measured** by 3.10b's method, five interleaved runs a variant:
+- the query row's marginal cost on the follower (2k and 6k/s), against
+  about 420–470 µs now;
+- the single agent's closed-loop throughput with its leader moved to a
+  node that never took the install.
