@@ -6647,3 +6647,73 @@ agents at 6k/s, 36 windows, all clean):
 **Carried, for the owner:** `historical_lookup` answers any hash in the
 node's blob store, whatever the agent: an isolation question (from
 3.10b1's review).
+
+#### 3.10b1 Built: `instantiate` loads a program its agent pins
+
+**vos-pvm** (`refine_host.rs`):
+- `ProgramSource`: where `instantiate` finds a program its pool lacks,
+  set per run with `RefineContext::with_programs`.
+- On a miss, `instantiate` asks it. Bytes of the very program asked for
+  (their code hash checked) and a valid program are installed in the pool,
+  then lent as a hit is, at the same base and the same `price()`.
+  Anything else answers `WHO`, as a missing program does.
+
+**The node:**
+- **Its source** (`pvm.rs`, `AgentPrograms`): the blob, only if the
+  running agent pins it (`Blobs::pinned_by`). A store it cannot read
+  panics the run, as refine's other reads do, and the executor turns that
+  into a fault.
+- **Eviction:** after a committed change set that unpins (an apply that
+  touches the installed rows, a snapshot switch, a retirement), each
+  program no agent here still pins (`Blobs::pinned_by_any`) leaves the
+  pool (`Inner::evict`). No lock: a pin made meanwhile costs a reload.
+- `Node::pooled`, whether the pool holds a program.
+
+**Tests:**
+- vos-pvm: a program loaded from the source costs exactly the gas an
+  installed one does, and is pooled after. A source with nothing, with an
+  invalid program, or with another program's bytes answers `WHO` and
+  pools nothing.
+- node, unit: an agent loads a program it pins, not one only another
+  agent pins.
+- cluster:
+  - replicas that never took the install hold the program in the pool
+    once they run it: a leader elected later at its first call, a
+    follower at its first query;
+  - the pool keeps a program another agent still pins, drops it once the
+    last pinning agent retires from the node, and holds it again once it
+    is pinned and run there again.
+- **Mutations**, each caught:
+  - without the miss path, both cluster tests and the vos-pvm test fail;
+  - without the pin check, the unit test;
+  - without eviction, the retirement test;
+  - with eviction ignoring other pins, the retirement test too.
+
+**Measured** (the query row: one agent, 16 sessions querying a follower
+that never took its install, at 2k and 6k/s; five runs a build,
+interleaved, lever 0's build against this one):
+
+| Build | The follower's CPU per query (from the two rates) | At 6k/s: p50 | p99 | The follower's busy cores |
+|---|---|---|---|---|
+| before | 407, 411, 434, 413, 407 µs | 0.41–0.42 ms | 0.59–0.67 ms | 2.31–2.43 |
+| loading on a miss | 90, 104, 95, 101, 105 µs | 0.13–0.15 ms | 0.22–0.24 ms | 0.77–0.85 |
+
+- **A query costs the follower a quarter of what it did.** That is far
+  more than the parse (16% in the profile): the whole fallback went too,
+  the two lookups copying the blob into the guest, the machine laid out
+  by host calls, the prepared code looked up by the blob's bytes.
+- **Not measured:** the single agent's throughput with a leader elected
+  after the install. The bench has no such row, and the cluster test
+  shows that leader pooling the program at its first call.
+- Slice 2's in-process query (50 µs) was always pooled: the gap left over
+  HTTP is the signature check and the transport.
+- **Found while gating it, already in the code before:** under heavy load
+  (three copies of the exactly-once tests at once), those tests fail on
+  the commit before this step as often as on this one:
+  - an executor thread panics joining itself: the last owner of the
+    executors dropped on one of their own threads;
+  - "no node caught up by a snapshot": a coverage check the load can
+    defeat, as fewer requests leave every log short of compaction;
+  - once, in a loaded `just ci`, a restarted node answered `NoAgent` for
+    agents it replicates, not reproduced since.
+  The next step fixes the first two and looks for the third.

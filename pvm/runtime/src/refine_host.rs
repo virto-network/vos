@@ -86,6 +86,17 @@ pub trait StateReader: Send + Sync {
     ) -> alloc::boxed::Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + 'a>;
 }
 
+/// Where `instantiate` finds a program its node's pool lacks: the program
+/// with this code hash, if the running agent may load it.
+///
+/// A program it gives is installed in the pool and lent as an installed one
+/// is, at the same price, so a run's gas does not depend on what the pool
+/// held. A store it cannot read is its own to fault on.
+#[cfg(feature = "std")]
+pub trait ProgramSource: Send + Sync {
+    fn program(&self, hash: &crate::pool::CodeHash) -> Option<Vec<u8>>;
+}
+
 /// Gas for a host call the Gray Paper prices at its base cost.
 const BASE_CALL_GAS: Gas = 10;
 /// `state_read`'s price per byte copied, on top of the base price.
@@ -96,6 +107,9 @@ pub struct RefineContext {
     outer: Machine,
     inner: InnerMachines,
     state: Option<alloc::sync::Arc<dyn StateReader>>,
+    /// Where `instantiate` finds a program its pool lacks.
+    #[cfg(feature = "std")]
+    programs: Option<alloc::sync::Arc<dyn ProgramSource>>,
     /// Whether precompiles are computed in place, here and in inner
     /// machines.
     precompiles: bool,
@@ -116,6 +130,8 @@ impl RefineContext {
             outer: Machine::load_with(program, args, gas, model)?,
             inner: InnerMachines::new(),
             state: None,
+            #[cfg(feature = "std")]
+            programs: None,
             precompiles: true,
         })
     }
@@ -137,6 +153,8 @@ impl RefineContext {
             outer,
             inner,
             state: None,
+            #[cfg(feature = "std")]
+            programs: None,
             precompiles: true,
         })
     }
@@ -170,6 +188,14 @@ impl RefineContext {
         self
     }
 
+    /// Load a program the pool lacks from `source` on `instantiate`, as
+    /// [`ProgramSource`] says. Needs a pool ([`Self::with_pool`]).
+    #[cfg(feature = "std")]
+    pub fn with_programs(mut self, source: alloc::sync::Arc<dyn ProgramSource>) -> Self {
+        self.programs = Some(source);
+        self
+    }
+
     /// Reuse validated program preparation, never per-invocation machines.
     pub fn load_prepared(
         program: &crate::refine::PreparedProgram,
@@ -191,6 +217,8 @@ impl RefineContext {
             outer,
             inner,
             state: None,
+            #[cfg(feature = "std")]
+            programs: None,
             precompiles: true,
         }
     }
@@ -602,7 +630,18 @@ impl RefineContext {
             return Dispatch::Exit(ExitReason::Panic);
         };
         let hash = crate::pool::CodeHash(hash.try_into().expect("32 bytes read"));
-        let program = self.inner.pool().and_then(|pool| pool.program(&hash));
+        let program = self.inner.pool().and_then(|pool| {
+            pool.program(&hash).or_else(|| {
+                // Only bytes of the very program asked for, and only a valid
+                // one: anything else answers `WHO`, as a missing one does.
+                let bytes = self.programs.as_ref()?.program(&hash)?;
+                if crate::pool::CodeHash::of(&bytes) != hash {
+                    return None;
+                }
+                pool.install(&bytes).ok()?;
+                pool.program(&hash)
+            })
+        });
         let result = match program {
             None => result::WHO,
             Some(program) => {
@@ -1244,6 +1283,72 @@ mod tests {
             50, 0, // jump_ind φ0 (the halt address)
         ];
         standard_program_with_rw(&code, &[0, 5, 8], &hash)
+    }
+
+    /// A program the pool lacks, given by the run's source, is installed and
+    /// lent at the gas an installed one costs. A source without it, with an
+    /// invalid program, or with another program's bytes answers `WHO`.
+    #[cfg(feature = "std")]
+    #[test]
+    fn instantiate_loads_what_its_source_gives_at_the_installed_price() {
+        use crate::pool::{CodeHash, MachinePool};
+        use alloc::sync::Arc;
+
+        struct Source(Vec<(CodeHash, Vec<u8>)>);
+        impl ProgramSource for Source {
+            fn program(&self, hash: &CodeHash) -> Option<Vec<u8>> {
+                self.0
+                    .iter()
+                    .find(|(given, _)| given == hash)
+                    .map(|(_, bytes)| bytes.clone())
+            }
+        }
+
+        let program = compression_program(crate::precompile::BLAKE2B_COMPRESS as u16);
+        let hash = CodeHash::of(&program);
+        let another = instantiating_program([0; 32]);
+        let run = |pool: &Arc<MachinePool>, source: Option<Source>| {
+            let context = RefineContext::load_with_backend(
+                &instantiating_program(hash.0),
+                &[],
+                1_000_000,
+                crate::refine::MemoryModel::Auto,
+                PvmBackend::ForceInterpreter,
+            )
+            .unwrap()
+            .with_pool(Arc::clone(pool));
+            match source {
+                Some(source) => context.with_programs(Arc::new(source)),
+                None => context,
+            }
+            .try_run()
+            .unwrap()
+        };
+
+        let installed = Arc::new(MachinePool::new());
+        installed.install(&program).unwrap();
+        let reference = run(&installed, None);
+        assert_eq!(reference.registers[7], 0, "the installed program is lent");
+
+        let empty = Arc::new(MachinePool::new());
+        let loaded = run(&empty, Some(Source(vec![(hash, program.clone())])));
+        assert_eq!(loaded.registers[7], 0, "the source's program is lent");
+        assert_eq!(loaded.gas_used, reference.gas_used, "at the same gas");
+        assert!(empty.program(&hash).is_some(), "and pooled after");
+
+        for (why, source) in [
+            ("nothing", Source(Vec::new())),
+            ("an invalid program", Source(vec![(hash, vec![1, 2, 3])])),
+            (
+                "another program's bytes",
+                Source(vec![(hash, another.clone())]),
+            ),
+        ] {
+            let pool = Arc::new(MachinePool::new());
+            let refused = run(&pool, Some(source));
+            assert_eq!(refused.registers[7], result::WHO, "{why}");
+            assert!(pool.program(&hash).is_none(), "{why}: nothing pooled");
+        }
     }
 
     #[cfg(feature = "std")]

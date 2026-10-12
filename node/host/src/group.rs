@@ -1258,6 +1258,7 @@ impl Driver {
                 .map(|hash| Change::Unpin { hash: *hash, agent }),
         );
         let applying = self.shared.applying.lock().await;
+        let unpinned = unpinned(&changes);
         if let Err(error) = self.inner.storage.commit(changes).await {
             drop(applying);
             // A failed flush may have written the switch: the staged epoch
@@ -1278,6 +1279,7 @@ impl Driver {
             self.abandon().await;
             return true;
         }
+        self.inner.evict(&unpinned);
         let index = install.index;
         self.core
             .snapshot_installed(index, install.snapshot_term, configuration);
@@ -1716,7 +1718,25 @@ async fn apply_one(inner: &Arc<Inner>, shared: &Shared, index: u64) -> Result<()
         writes,
     }];
     changes.extend(rest);
-    inner.storage.commit(changes).await.map_err(Fault::Storage)
+    let unpinned = unpinned(&changes);
+    inner
+        .storage
+        .commit(changes)
+        .await
+        .map_err(Fault::Storage)?;
+    inner.evict(&unpinned);
+    Ok(())
+}
+
+/// The programs `changes` unpin.
+pub(crate) fn unpinned(changes: &[Change]) -> Vec<[u8; 32]> {
+    changes
+        .iter()
+        .filter_map(|change| match change {
+            Change::Unpin { hash, .. } => Some(*hash),
+            _ => None,
+        })
+        .collect()
 }
 
 async fn accumulate(

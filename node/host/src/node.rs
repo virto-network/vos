@@ -672,6 +672,19 @@ impl Inner {
         }
     }
 
+    /// Take out of the pool each program in `unpinned` that no agent here
+    /// pins any more, as a restart would leave it. A program pinned again
+    /// meanwhile is only loaded again on its next use, at the same gas.
+    pub(crate) fn evict(&self, unpinned: &[[u8; 32]]) {
+        for hash in unpinned {
+            match self.blobs.pinned_by_any(hash) {
+                Ok(false) => self.pool.uninstall(&CodeHash(*hash)),
+                Ok(true) => {}
+                Err(error) => tracing::warn!("a pin read failed: {error}"),
+            }
+        }
+    }
+
     /// Halt once the store failed a flush, whichever path met the
     /// failure: the pair heartbeat and the records' resends look, so a
     /// node halts within one of their rounds.
@@ -842,10 +855,12 @@ impl Inner {
                 .into_iter()
                 .map(|hash| Change::Unpin { hash, agent }),
         );
+        let unpinned = group::unpinned(&changes);
         if let Err(error) = self.storage.commit(changes).await {
             tracing::error!(agent = agent.0, "an agent did not retire: {error}");
             return;
         }
+        self.evict(&unpinned);
         group::drop_stale_epochs(self, agent).await;
     }
 
@@ -1965,6 +1980,12 @@ impl Node {
     /// The blobs some agent keeps here: the programs its instances run.
     pub fn pinned(&self) -> Vec<[u8; 32]> {
         self.inner.blobs.pinned().unwrap_or_default()
+    }
+
+    /// Whether the machine pool holds `program`: instances of it run
+    /// without loading it first.
+    pub fn pooled(&self, program: &[u8; 32]) -> bool {
+        self.inner.pool.program(&CodeHash(*program)).is_some()
     }
 
     /// Serve the HTTP ingress on `address` (`127.0.0.1:0` picks a port):

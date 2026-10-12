@@ -7,9 +7,9 @@ use std::sync::Arc;
 
 use vos_pvm::ExitReason;
 use vos_pvm::accumulate_host::{self, ACCUMULATE_ENTRY, AccumulateContext, ServiceStorage};
-use vos_pvm::pool::{MachinePool, OuterMachines};
+use vos_pvm::pool::{CodeHash, MachinePool, OuterMachines};
 use vos_pvm::refine::Machine;
-use vos_pvm::refine_host::{RefineContext, StateReader};
+use vos_pvm::refine_host::{ProgramSource, RefineContext, StateReader};
 use vos_wire::abi::{cap, code};
 use vos_wire::batch::Work;
 use vos_wire::ids::AgentId;
@@ -84,6 +84,27 @@ impl StateReader for AgentState {
     }
 }
 
+/// The programs `agent` pins, from the node's blob store: what
+/// `instantiate` loads when the pool lacks one. A store that cannot be read
+/// faults the run, as refine's other reads do.
+struct AgentPrograms {
+    blobs: Blobs,
+    agent: AgentId,
+}
+
+impl ProgramSource for AgentPrograms {
+    fn program(&self, hash: &CodeHash) -> Option<Vec<u8>> {
+        if !self
+            .blobs
+            .pinned_by(&hash.0, self.agent.0)
+            .expect("a pin read")
+        {
+            return None;
+        }
+        self.blobs.get(&hash.0).expect("a blob read")
+    }
+}
+
 /// Run the agent's refine on `work` for `agent`: its output, if it halts.
 pub(crate) fn refine(
     program: &OuterMachines,
@@ -104,6 +125,10 @@ pub(crate) fn refine(
     .encode();
     let invocation = RefineContext::new(program.load(REFINE_ENTRY, &arguments, gas)?)
         .with_pool(Arc::clone(pool))
+        .with_programs(Arc::new(AgentPrograms {
+            blobs: blobs.clone(),
+            agent,
+        }))
         .with_state(Arc::new(AgentState { snapshot, agent }))
         .try_run_with_host(|id, machine| serve(id, machine, blobs))?;
     let output = if invocation.exit != ExitReason::Halt {
@@ -224,4 +249,36 @@ pub(crate) fn decode<T: Decode>(bytes: &[u8]) -> Result<T, Fault> {
     T::decode(bytes)
         .map(|(value, _)| value)
         .map_err(|error| Fault::Agent(format!("undecodable output: {error:?}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{Batch, Durability, Fjall, Store};
+
+    /// An agent's programs are the ones it pins: a program another agent
+    /// pins is stored here, but is not this agent's to load.
+    #[test]
+    fn an_agent_loads_only_the_programs_it_pins() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Fjall::open(dir.path().join("store")).unwrap();
+        let blobs = Blobs::open(dir.path().join("blobs"), &store).unwrap();
+        let program = Arc::new(vec![1u8, 2, 3]);
+        let blob = crate::blobs::blob_ref(&program);
+        smol::block_on(blobs.put(blob, Arc::clone(&program))).unwrap();
+        let mut batch = store.batch();
+        batch.pin(&blob.hash, AgentId(1));
+        batch.commit(Durability::Synced).unwrap();
+
+        let programs = |agent| AgentPrograms {
+            blobs: blobs.clone(),
+            agent: AgentId(agent),
+        };
+        let hash = CodeHash(blob.hash);
+        assert_eq!(programs(1).program(&hash), Some(program.to_vec()));
+        assert_eq!(programs(2).program(&hash), None, "another agent's program");
+        assert_eq!(programs(1).program(&CodeHash([9; 32])), None);
+        assert!(blobs.pinned_by_any(&blob.hash).unwrap());
+        assert!(!blobs.pinned_by_any(&[9; 32]).unwrap());
+    }
 }

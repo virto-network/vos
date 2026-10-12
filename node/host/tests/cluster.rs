@@ -2085,3 +2085,109 @@ fn a_stale_leader_left_out_of_the_configuration_retires() {
     cluster.hub.heal();
     retired(cluster.node(stale), agent);
 }
+
+/// A replica that never took an agent's install holds its program in the
+/// pool once it runs it: a leader elected later at its first call, a
+/// follower at its first query. Neither builds the program from its blob
+/// at every run.
+#[test]
+fn replicas_that_never_took_the_install_pool_the_program_on_first_use() {
+    let mut cluster = Cluster::new(3);
+    let agent = cluster.node(1).create_replicated(vec![1, 2, 3]).unwrap();
+    cluster.install(agent);
+    let first = cluster.leader(agent);
+    let program = cluster.node(first).pinned()[0];
+    assert!(cluster.node(first).pooled(&program), "the install pools it");
+    wait_until("every replica pins the program", || {
+        (1..=3).all(|number| cluster.node(number).pinned().contains(&program))
+    });
+    assert!(
+        (1..=3)
+            .filter(|number| *number != first)
+            .all(|number| !cluster.node(number).pooled(&program))
+    );
+
+    cluster.stop(first);
+    let second = cluster.leader(agent);
+    assert!(!cluster.node(second).pooled(&program));
+    assert_eq!(done(cluster.increment(second, agent, 1, 5)), 5);
+    assert!(
+        cluster.node(second).pooled(&program),
+        "pooled at its first call"
+    );
+
+    let follower = (1..=3)
+        .find(|number| *number != first && *number != second)
+        .unwrap();
+    assert!(!cluster.node(follower).pooled(&program));
+    wait_until("the follower applies the call", || {
+        cluster.node(follower).applied(agent) >= cluster.node(second).applied(agent)
+    });
+    assert_eq!(cluster.value(follower, agent), 5);
+    assert!(
+        cluster.node(follower).pooled(&program),
+        "pooled at its first query"
+    );
+}
+
+/// The pool drops a program once no agent on the node pins it, keeps one
+/// another agent still pins, and holds it again once it is pinned and run
+/// again.
+#[test]
+fn a_program_leaves_the_pool_with_its_last_pin() {
+    let cluster = Cluster::new(4);
+    let agents: Vec<AgentId> = (0..2)
+        .map(|_| cluster.node(1).create_replicated(vec![1, 2, 3]).unwrap())
+        .collect();
+    for agent in &agents {
+        cluster.install(*agent);
+    }
+    let leaders: Vec<NodeNumber> = agents.iter().map(|agent| cluster.leader(*agent)).collect();
+    let node = (1..=3).find(|number| !leaders.contains(number)).unwrap();
+    let program = cluster.node(leaders[0]).pinned()[0];
+    for agent in &agents {
+        wait_until("the replica applies the install", || {
+            cluster.node(node).applied(*agent)
+                >= cluster.node(cluster.leader(*agent)).applied(*agent)
+        });
+        assert_eq!(cluster.value(node, *agent), 0);
+    }
+    assert!(cluster.node(node).pooled(&program));
+
+    let replace = |agent: AgentId, leader: NodeNumber| {
+        let mut replicas: Vec<NodeNumber> = (1..=3)
+            .filter(|number| *number != node)
+            .chain([4])
+            .collect();
+        replicas.sort_unstable();
+        assert_eq!(
+            cluster.node(leader).replace(agent, node, 4).unwrap(),
+            replicas
+        );
+        placed(&cluster, agent, &replicas);
+        retired(cluster.node(node), agent);
+    };
+    replace(agents[0], leaders[0]);
+    assert!(
+        cluster.node(node).pooled(&program),
+        "kept while another agent pins it"
+    );
+    replace(agents[1], leaders[1]);
+    wait_until("the pool drops the program", || {
+        !cluster.node(node).pooled(&program)
+    });
+
+    let mut replicas: Vec<NodeNumber> = (1..=4)
+        .filter(|number| *number != node)
+        .take(2)
+        .chain([node])
+        .collect();
+    replicas.sort_unstable();
+    let third = cluster.node(1).create_replicated(replicas).unwrap();
+    cluster.install(third);
+    wait_until("the replica applies the install", || {
+        cluster.node(node).applied(third) >= cluster.node(cluster.leader(third)).applied(third)
+    });
+    assert_eq!(cluster.value(node, third), 0);
+    assert!(cluster.node(node).pooled(&program), "held again once run");
+}

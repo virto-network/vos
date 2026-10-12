@@ -477,13 +477,15 @@ impl MachinePool {
     }
 
     /// Install a standard program, returning its code hash. Installing the
-    /// same program again is a no-op.
+    /// same program again is a no-op. It is parsed before the pool's lock is
+    /// taken, so a program loading holds no other run.
     pub fn install(&self, blob: &[u8]) -> Result<CodeHash, PoolError> {
         let hash = CodeHash::of(blob);
-        let mut programs = lock(&self.programs);
-        if let std::collections::hash_map::Entry::Vacant(entry) = programs.entry(hash) {
-            entry.insert(Arc::new(PoolProgram::new(blob)?));
+        if lock(&self.programs).contains_key(&hash) {
+            return Ok(hash);
         }
+        let program = Arc::new(PoolProgram::new(blob)?);
+        lock(&self.programs).entry(hash).or_insert(program);
         Ok(hash)
     }
 

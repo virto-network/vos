@@ -400,6 +400,20 @@ impl Blobs {
         let _ = wait.recv().await;
     }
 
+    /// Whether `agent` pins the blob: a program it runs.
+    pub fn pinned_by(&self, hash: &[u8; 32], agent: u32) -> Result<bool> {
+        Ok(self.inner.index.get(pin_key(hash, agent))?.is_some())
+    }
+
+    /// Whether any agent pins the blob.
+    pub fn pinned_by_any(&self, hash: &[u8; 32]) -> Result<bool> {
+        let prefix = [&[IndexRow::Pin as u8][..], hash].concat();
+        match self.inner.index.prefix(prefix).next() {
+            Some(row) => row.key().map(|_| true),
+            None => Ok(false),
+        }
+    }
+
     /// The pinned blobs, each once.
     pub fn pinned(&self) -> Result<Vec<[u8; 32]>> {
         let mut out: Vec<[u8; 32]> = Vec::new();
