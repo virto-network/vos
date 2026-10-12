@@ -574,14 +574,21 @@ struct Cpu {
     io_stalled: f64,
     /// Each stage's counts, summed over the nodes, from their stats route.
     stages: Vec<(String, Vec<u64>)>,
+    /// Each stage's values' sum, over the nodes.
+    totals: Vec<(String, u64)>,
 }
 
 impl Cpu {
     fn now(space: &Space) -> Self {
         let mut stages: Vec<(String, Vec<u64>)> = Vec::new();
+        let mut totals: Vec<(String, u64)> = Vec::new();
         for process in &space.processes {
             if let Ok(Answer::Stats(stats)) = process.operator().stats() {
                 for stage in stats.stages {
+                    match totals.iter_mut().find(|(name, _)| *name == stage.name) {
+                        Some((_, total)) => *total = total.wrapping_add(stage.total),
+                        None => totals.push((stage.name.clone(), stage.total)),
+                    }
                     match stages.iter_mut().find(|(name, _)| *name == stage.name) {
                         Some((_, counts)) => {
                             for (sum, count) in counts.iter_mut().zip(&stage.counts) {
@@ -601,6 +608,7 @@ impl Cpu {
             machine: machine_cpu(),
             io_stalled: io_stalled(),
             stages,
+            totals,
         }
     }
 }
@@ -1338,16 +1346,31 @@ fn report(name: &str, samples: &mut Samples, cpu: (Cpu, Cpu), measure: Duration)
             .map(|(_, delta)| delta.as_slice())
             .unwrap_or_default()
     };
+    // A stage's exact mean over the window: its values' sum over its
+    // count. The stages' means add up where their bucket tops do not.
+    let mean = |name: &str, delta: &[u64]| {
+        let count: u64 = delta.iter().sum();
+        let total = |cpu: &Cpu| {
+            cpu.totals
+                .iter()
+                .find(|(stage, _)| stage == name)
+                .map_or(0, |(_, total)| *total)
+        };
+        // A node restarted in the window counts from zero again: its part
+        // of the counts is lost, and so is its part of the sum.
+        (count > 0).then(|| total(&after).saturating_sub(total(&before)) as f64 / count as f64)
+    };
     let stalls = over(stage("late"), STALL);
     let long_batches = over(stage("batch"), STALL);
     let longest_batch = stage_percentiles(stage("batch")).map_or(0, |(_, _, max)| max);
-    // p50/p99/max, in µs (in units for counts).
+    // p50/p99/max and the mean, in µs (in units for counts).
     let stages: Vec<String> = deltas
         .iter()
         .filter_map(|(name, delta)| {
             let (p50, p99, max) = stage_percentiles(delta)?;
+            let mean = mean(name, delta)?;
             let count: u64 = delta.iter().sum();
-            Some(format!("{name} {p50}/{p99}/{max} ({count})"))
+            Some(format!("{name} {p50}/{p99}/{max} mean {mean:.0} ({count})"))
         })
         .collect();
     println!(
@@ -1361,7 +1384,7 @@ fn report(name: &str, samples: &mut Samples, cpu: (Cpu, Cpu), measure: Duration)
         per_commit.iter().map(|cpu| cpu.round()).collect::<Vec<_>>(),
     );
     if !stages.is_empty() {
-        println!("  stages p50/p99/max µs: {}", stages.join(", "));
+        println!("  stages p50/p99/max, mean µs: {}", stages.join(", "));
         println!(
             "  stalls: {stalls} runtime wakes and {long_batches} batches of {:.0} ms or more; the longest batch {:.0} ms; p95 {:.2} ms",
             STALL as f64 / 1000.0,
@@ -1392,14 +1415,32 @@ fn plans(
     calls: usize,
     first: u64,
 ) -> Vec<Plan> {
+    let spread = spread();
     let jobs = agents
         .iter()
         .flat_map(|signed| {
-            (0..sessions)
-                .map(move |session| (*signed, first + session, calls, leaders[&signed.agent]))
+            (0..sessions).map(move |session| {
+                let leader = leaders[&signed.agent];
+                // Spread, each session goes to one of the space's three
+                // nodes in turn, which checks its calls' signatures and
+                // forwards them to the leader, as clients spread over the
+                // replicas would.
+                let node = if spread {
+                    (leader + session as usize) % 3
+                } else {
+                    leader
+                };
+                (*signed, first + session, calls, node)
+            })
         })
         .collect();
     sign_plans(jobs)
+}
+
+/// Whether sessions are spread over the three nodes (`SPREAD=1`), rather
+/// than sent to their agent's leader.
+fn spread() -> bool {
+    std::env::var("SPREAD").is_ok_and(|value| value == "1")
 }
 
 /// One timed run of `plans`, reported as `name`, once the nodes are

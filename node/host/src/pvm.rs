@@ -105,7 +105,8 @@ impl ProgramSource for AgentPrograms {
     }
 }
 
-/// Run the agent's refine on `work` for `agent`: its output, if it halts.
+/// Run the agent's refine on `work` for `agent`: its output, if it halts,
+/// and the gas the run used.
 pub(crate) fn refine(
     program: &OuterMachines,
     pool: &Arc<MachinePool>,
@@ -114,7 +115,7 @@ pub(crate) fn refine(
     agent: AgentId,
     work: &Work,
     gas: u64,
-) -> Result<Vec<u8>, Fault> {
+) -> Result<(Vec<u8>, u64), Fault> {
     let arguments = RefineArgs {
         core: 0,
         item: 0,
@@ -131,6 +132,7 @@ pub(crate) fn refine(
         }))
         .with_state(Arc::new(AgentState { snapshot, agent }))
         .try_run_with_host(|id, machine| serve(id, machine, blobs))?;
+    let used = invocation.gas_used;
     let output = if invocation.exit != ExitReason::Halt {
         Err(Fault::Agent(format!(
             "refine stopped: {:?}",
@@ -142,7 +144,7 @@ pub(crate) fn refine(
             .ok_or_else(|| Fault::Agent("refine's output is out of bounds".into()))
     };
     program.restore(invocation);
-    output
+    output.map(|output| (output, used))
 }
 
 /// The calls refine leaves to the node: `historical_lookup` from the

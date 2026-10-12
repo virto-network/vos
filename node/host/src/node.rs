@@ -1428,7 +1428,7 @@ impl Inner {
         let blobs = self.blobs.clone();
         let gas = self.refine_gas;
         let failed = |fault: Fault| CallError::Failed(fault.message().to_string());
-        let output = ran(self
+        let (output, _) = ran(self
             .executors
             .run(move || pvm::refine(&program, &pool, &blobs, snapshot, agent, &work, gas))
             .await)

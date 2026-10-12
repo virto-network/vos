@@ -59,3 +59,9 @@ No caller changes.
   when it is finally dropped, and that file is the new table's if its id
   was reused. Never reusing an id within a process (a counter above every
   id it has seen) would rule that out.
+- **A flaky test:** the clock tests set (`time::set_unix_timestamp_for_test`)
+  is the process's, and tests run in parallel. `fifo_ttl`, which sets
+  1,011 s, can meet `fifo_ttl_then_limit_additional_drops_blob_unit`'s
+  10,000,000 s and find both tables expired. A per-thread override (the
+  fix here) keeps each test's clock to itself, as its flushes and
+  compactions run on its own thread.

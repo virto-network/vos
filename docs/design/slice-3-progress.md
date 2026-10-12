@@ -7623,3 +7623,337 @@ load.
   0.93.
 - The tables in 3.10b3 and 3.10b4 above keep their scaled numbers, as
   measured. These are the ones to read.
+
+#### 3.10b6 Design: pipelined refines
+
+**Why:** the single-agent budget is 20k/s, with p99 ≤ 10 ms at half load.
+Its capacity is about 14k/s, because the leader runs one batch at a
+time:
+- refine, then the dry run, on an executor;
+- then propose, commit and apply;
+- then the replies, and only then the next batch.
+
+At capacity a batch is about 190 inputs (3.10a2):
+- refine takes 5.1 ms (about 27 µs an input, in one program run);
+- the dry run 1.8 ms;
+- the commit 1.3 ms;
+- the apply 0.8 ms.
+
+The leader's executors are busy about 46% of the time.
+
+- **What pipelining can buy:** the next batch's refine and dry run run
+  while the last batch commits and applies. Measured since ("One agent's
+  batch cycle, accounted"), that hides about 1.0 ms of an 8.0–8.6 ms
+  cycle: about +13–15%.
+- **The rest of the gap** is refine's own cost per input. That is guest
+  code, measured on its own.
+- **It does not help the 64 agents:** their nodes are out of CPU, and a
+  speculation thrown away costs some.
+
+**Fixed already** (core model §7.2 and §7.5; plan §3, "Leader changes"):
+- the base is the applied state plus an overlay of the leader's pending
+  work results;
+- a work result's version counts the leader's pending results;
+- accumulate skips a result whose version is not current;
+- a skipped result or a term change aborts the pipeline;
+- replies, acknowledgements and outbox sends happen only after the
+  local apply;
+- a retry of a pending input joins it.
+
+**The change** (`leader.rs`, `pvm.rs`, `node.rs`):
+- **Depth two.** One batch, N, may be in flight from its dry run until its
+  local apply while the next, N+1, is refined, dry-run and proposed. N+1
+  waits for N's apply before its own replies. Deeper adds little:
+  refine dominates the cycle.
+- **The rule for everything that leaves the node:** nothing leaves on the
+  strength of the view, only of applied state. Replies, acknowledgements,
+  deliveries and outbox sends stay where they are, after the local
+  apply of the batch they belong to.
+- **The view.** N+1 is refined on a `Pending` view: the snapshot N was
+  refined on, under N's dry-run writes (key to value, or deleted). It
+  implements the store's `View` trait (its applied index is N's index),
+  so every read of the leader's works on it unchanged.
+  - **Refine** reads through it: `StateReader::read`, and `rows`, which
+    merges the writes into the snapshot's scan in key order. The merge
+    mirrors the guest's own (`refine.rs`, which merges a batch's writes
+    over paged applied rows), and `FjallSnapshot::scan`'s cursor rule:
+    a cursor below the prefix starts at the prefix, one past it yields
+    nothing. The guest scans page by page from the last key it got, so
+    the merge must be exact from any cursor.
+  - **The dry run's** accumulate takes the view as its base. Accumulate
+    only reads and writes keys, so its `Overlay` needs only `read` of
+    the view.
+  - **The leader's own reads** for N+1 read it too: the version, the batch
+    time floor, the first expiry row (the sweep decision), and the
+    sessions a duplicate's reply is found in (`dispatch`'s `before`).
+  - **Two marks per sender.** A message is filtered, and a gap found, by
+    the view's pair mark; but the early acknowledgement of a duplicate
+    rises only to the applied mark, which is what has applied.
+    - Otherwise a resend of a message N consumed would be acknowledged
+      before N applied. If N were then lost, the sender would clear its
+      outbox through it, and the message would apply nowhere.
+    - N's own steps are acknowledged at N's dispatch, after its apply,
+      as now.
+  - **Acknowledgements as inputs** (`Pending::Ack`) are filtered by the
+    applied `acked` row, not the view's, so a lost N never makes one
+    vanish.
+  - **The caches** (`marks`, and the sweep's `swept` and `stuck`) are
+    valid within one pipeline run: they advance when N+1 starts, and on
+    any outcome but `Done` they are cleared and read again from applied
+    state.
+- **Version and time:** N+1's version is N's plus one, and its time is no
+  earlier than N's.
+- **The log:** N+1 is proposed after N, so it follows N in the log.
+  - Only this leader proposes results. Within one term only a
+    configuration entry can come between two of them (a term's no-op
+    comes first), and it writes no agent state (`apply_one` gives it no
+    writes). Snapshots install only on a follower, and pins change only
+    at an install's apply, which ends the pipeline. So the view stays
+    the state N+1 applies on.
+  - Proposals keep their order through the group's local channel, and
+    N+1's term is checked as N's is.
+- **The dry runs kept:** today one per agent, taken when its entry is
+  the next index. They become a short queue, and an entry's kept writes
+  are used only when all of these hold:
+  - it is the entry the dry run was made for: its payload, at the index
+    after the state the dry run read;
+  - **the entry before it took:** `apply_one` drops the agent's queue
+    whenever an entry applies as no writes, or not with its kept
+    writes. Otherwise, after N applied as no writes at the leader, N+1's
+    kept writes, built on N's, would apply there while every follower
+    skipped N+1: the leader would diverge for good. This sits in the
+    applier, as the leader loop learns N's outcome only after the
+    applier has used the kept writes.
+  - Stale entries are popped from the front, and the queue is dropped
+    when leadership ends and when the agent stops.
+  - Otherwise accumulate runs at apply, which is always correct.
+- **N's uncovered tail goes back first.** When N's result covers fewer
+  inputs than its batch (its gas or size cut it short), the inputs
+  without a step are requeued at the front right after N's dry run,
+  before N+1 takes any. Today that happens at dispatch, which would put
+  them behind N+1's: a session's next request, already queued, would
+  then be refined before the one left over, and refused as a gap.
+- **Linger only with nothing in flight:** while N commits and applies, its
+  time is N+1's batching window.
+- **What ends the pipeline,** so the next batch waits for the last
+  batch's apply:
+  - a batch holding an `Admin` input: an install pins programs at
+    apply, and N+1's refine would not find them;
+  - a batch whose result applied as no writes (`Ran::Skipped`);
+  - leadership ending;
+  - the agent stopping.
+
+**When N does not end well:**
+- **N is lost** (leadership ended before it applied here):
+  - N+1 cannot commit before N, so it is lost too;
+  - if N+1 was not yet proposed, it is not;
+  - both batches' callers are refused with the leader's hint, as a lost
+    batch's are today;
+  - entries a new leader commits apply on every replica in log order,
+    on the state N+1 was refined on.
+- **N applies as no writes** (skipped by the version check):
+  - N's writes never happened, and N+1's version is past the stored
+    one, so accumulate skips N+1 too;
+  - both are requeued, N's inputs first: the queue takes them at its
+    front in order, so N+1's go back first, then N's;
+  - the "skipped twice in a row" rule counts N's skip, not N+1's,
+    which is its consequence: N+1's skip runs neither `fail` nor the
+    shortening, which would answer a caller `Failed` for an input
+    never at fault. N+1 skipped with N done counts as a first skip.
+- **N's refine or dry run fails:** N+1 has not started, as it starts from
+  N's dry-run writes.
+- **N+1's refine or dry run fails:** as a failed batch today (requeued
+  shorter, or retried); N is unaffected.
+  - A retry's backoff (up to 5 s) waits until N is finished, so N's
+    callers are not held behind it.
+  - An input of N+1 answered `Failed` carries the last index applied
+    here, not N's.
+- **N's proposal refused:** N+1 is lost before it is proposed. N+1's dry
+  run's predecessor index is N's, known from N's proposal answer.
+- **A new leadership** starts with no view, marks, kept dry runs or
+  caches from the last, even on the same node.
+- **A storage fault:** the node halts, as today.
+
+**What does not change:** the log's format, accumulate, followers,
+the version rule, apply-then-send, and exactly-once. Queries read
+applied state only, never a view.
+
+**First, the cycle measured** (before building): the stage times at
+capacity sum to less than a batch's cycle, so `/stats` gains the rest
+of it: `prepare` (inputs taken to refine), `dispatch` (replies,
+deliveries) and `between` (a batch's end to the next one's taking its
+inputs). Pipelining hides commit and apply, and whatever runtime work
+overlaps N+1's refine (N's dispatch, its HTTP answers): from about +15%
+if the rest is serial, to about +50% if the executor alone bounds it.
+
+**Measured** on tmpfs, nodes on P-cores only, the counts unscaled:
+- **One agent,** judged on the open rows:
+  - open at 15k, 18k and 21k/s: whether it keeps up;
+  - p99 at half of the new capacity;
+  - closed: at 256 sessions the pipeline is under-fed (N+1 gets what
+    arrived during N's refine), so closed is reported at 512 and 1,024
+    sessions too, or as latency.
+- **64 agents at 6k/s:** CPU and cycles per commit, with depth two
+  against without: the pipeline's fixed cost, as two in flight are rare
+  there. The knee does not move down.
+- **Aborted speculation's cost:** the failover run, 24 leaders lost at
+  once.
+- `batch` is defined once batches overlap: from a batch's refine to its
+  apply, as now, so two batches' times overlap.
+- The exactly-once checker loop and the fault suite.
+
+**Tests** (the review's, with the design's):
+- **No acknowledgement leaves on the view:** a message consumed in N, its
+  duplicate in N+1 while N's commit is held by a hook; no
+  `Acknowledge` before N applies. Then N lost (its leader killed before
+  the commit): the message applies once (`pair_in`, `acked`, an empty
+  outbox, as the checker checks).
+- **N applied as no writes with N+1 in flight:** the replicas' whole agent
+  state compared, not only the counter.
+- **N cut short by gas,** the session's next request already queued: the
+  client sees only running totals.
+- **Leadership lost between N's and N+1's proposals, the same node elected
+  again:** the new leadership inherits nothing.
+- **A stop after a commit** (`after_commit`) with two in flight.
+- **A configuration change between N and N+1:** N+1 applies with the same
+  writes on every replica.
+- **The view:**
+  - reads, deletes, and scans merged in key order with an `after` cursor;
+  - unit tests, with a proptest against a model map.
+- **A batch refined on the view sees the last batch's writes:** two
+  batches in flight on one counter, with the commit held by a hook, add
+  up.
+- **N skipped:** a hook makes N apply as no writes. N+1 skips too, both
+  are retried, each caller is answered once, and the counter adds up.
+- **Leadership lost with N and N+1 in flight:** both refused; the checker
+  sees each request applied once.
+- **An `Admin` input ends the pipeline:** an install, then a call to the
+  installed instance, in the batch after it.
+- **The kept dry runs:** used for the next entry; not used when a
+  configuration entry came between (accumulate runs, with the same
+  writes).
+
+**The baseline** (HEAD 6528733c, tmpfs, the nodes on P-cores only; two
+runs, the agent led from node 1 and from node 2):
+- closed at 256 sessions: 15.1k and 14.7k/s;
+- open at 15k/s: kept up (p99 21 and 35 ms); at 18k and 21k/s: fell
+  behind;
+- at half load, 10k/s: p99 14.8 and 12.1 ms, against the budget's 10;
+- at saturation, about 100 inputs a batch:
+  - refine 5–6 ms, the dry run about 1.5 ms, the commit about 0.3 ms,
+    the apply about 0.5 ms;
+  - the whole batch cycle about 10 ms;
+  - the leader's executors 61–66% busy.
+
+**Reviewed by Fable** (design v1, then folded here):
+- **two soundness holes,** both closed above:
+  - an early acknowledgement on the view's pair mark could lose a
+    message for good if N was lost;
+  - the kept dry run of N+1 could apply at the leader after N applied
+    as no writes, and diverge it from every follower for good;
+- the caches cleared on any outcome but `Done`;
+- N's uncovered tail requeued before N+1 takes inputs;
+- the skip, backoff and `at` details;
+- linger only with nothing in flight;
+- the measurement asked for first, which found the gain at about 15%
+  (the next section).
+
+Not built yet: refine's own cost is measured first.
+
+#### One agent's batch cycle, accounted
+
+**Why:** Fable's review of 3.10b6 found the stage p50s at capacity summed
+to less than a batch's cycle, so pipelining's gain could not be
+predicted.
+- **`/stats` gains three stages:**
+  - `prepare`: inputs taken to refine;
+  - `dispatch`: the replies, deliveries and acknowledgements;
+  - `between`: a batch's end to the next one's taking its inputs. That
+    includes any idle wait for inputs, so it means something only at
+    capacity.
+- **Each histogram also keeps the sum of what it recorded,** so the bench
+  prints each stage's exact mean beside its percentiles. Bucket tops are
+  up to a quarter apart, and do not add up; means do.
+- **Two counts per batch:** `refine_gas` (refine's gas, per input) and
+  `step_gas` (its steps' gas, per input).
+
+**Measured** (one agent, tmpfs, the nodes on P-cores only; exact means,
+in µs):
+
+| Stage | Closed, 256 sessions (14.85k/s) | Open, 15k/s |
+|---|---|---|
+| inputs a batch | 128 | 121 |
+| refine's wait for an executor | 6 | 9 |
+| refine | 5,150 | 5,265 |
+| dry run's wait for an executor | 1,021 | 113 |
+| dry run | 1,386 | 1,566 |
+| propose, commit, apply | 26 + 358 + 489 | 28 + 322 + 580 |
+| `batch`, refine to apply | 8,537 | 7,952 |
+| `prepare`, `dispatch`, `between` | 23, 50, 8 | 23, 51, 6 |
+
+- **It adds up:** the stages inside `batch`, with its four resumes (about
+  20 µs each), are 8.52 ms of its 8.54. The whole cycle is 8.62 ms, and
+  128 inputs every 8.62 ms is 14.85k/s, the rate measured. Open: 121
+  inputs every 8.03 ms is 15.06k/s, at 15k offered.
+- **Refine is 60–66% of the cycle,** about 40–44 µs an input on a P-core.
+  The dry run is another 16–20%, about 11–13 µs an input.
+- **The dry run waits behind signature checks** when closed, 1.0 ms a
+  batch, as the executors take both from one queue. Open, 0.1 ms.
+- **What pipelining can hide** is propose, commit and apply, and the loop's
+  own steps: about 1.0 ms a cycle. So **about +13–15%** (8.62 / 7.59
+  closed, 8.03 / 6.96 open), not the +25–30% first estimated.
+- **So refine's own cost decides the single-agent budget.** Halving it
+  would gain about 40–50%. It is measured next, before pipelining is
+  built: if a cheaper refine reaches 20k/s, the pipeline's complexity is
+  not needed.
+
+**Gas cannot tell where the time goes:**
+- refine uses about 100k gas an input, 95k of it in its steps;
+- but a step's gas is mostly prices, charges rather than work: the
+  counter's `get` (20,000) and `put` (64,000) and a few 2,000-gas
+  operations;
+- and the rest is not instructions either. The recompiler charges each
+  basic block on entry the Gray Paper's modeled cycles on an ideal
+  core, often well under one an instruction. About 5k gas is left in
+  the handler, and about 5k in the agent around it.
+- The profile, below, puts about two thirds of refine's time in
+  compiled guest code. So either that code runs several times slower
+  than the model, or its samples include the work around it (the JIT's
+  entry and exit code, memory setup). The perf map, next, will tell.
+- `refine_gas` and `step_gas` record each batch's average per input, so
+  their means do not weight batches by size: negligible at capacity,
+  where batches are much alike.
+
+**Where refine's 40 µs an input go** (the leader under the one agent at
+saturation, the frame-pointer build, 84,468 samples):
+- **Signature checks take 42.7% of the leader's CPU,** about a core at 15k
+  calls a second, as the bench sends every session's calls to the leader.
+  Refine's host side is 6.6% (store reads 2.1%), and the guest code of
+  refine and the dry run 16.9%, about two thirds of it refine's.
+- So refine is about two thirds guest code (the default agent and the
+  counter actor, the JIT's own entry and exit code with them) and one
+  third host side (the runtime's `invoke`, machine setup, and about
+  4 µs of store reads).
+- **Are the checks slowing refine?** The leader's executors share two
+  P-cores, so the serial refine can run beside a check on its
+  hyperthread sibling. A bench setting, `SPREAD=1`, sends the sessions to
+  the three nodes in turn, each checking its calls and forwarding them,
+  as the plan's clients would:
+  - the leader's load fell from 2.4 to 2.0 cores, and the dry run's wait
+    for an executor from about 0.6 ms a batch to nearly nothing;
+  - but refine took 41.5 µs an input against 40 (bucket means, that
+    run), and the capacity stayed about 15.9k/s.
+  - So refine's cost is its own.
+  - Why the 0.6 ms saved a batch did not raise the capacity is not
+    measured: the forwarding hop, and batches of another size, are
+    candidates.
+- **Next:** where refine's guest time goes, by program and by function,
+  with the PVM's code mapped back to the programs' symbols. Then
+  pipelining, as reviewed, for its 13–15%.
+
+**Found in the gates, and fixed:** lsm-tree's own unit test `fifo_ttl`
+failed once in `just test`. Its tests set a process-wide clock, and on a
+parallel thread `fifo_ttl_then_limit_additional_drops_blob_unit` set it
+to 10,000,000 s. That expired both of `fifo_ttl`'s tables. The vendored
+crate's test clock is now per thread (`VENDORED.md`, and a note for
+upstream in `UPSTREAM.md`). Its unit suite then passed 30 runs of 30.

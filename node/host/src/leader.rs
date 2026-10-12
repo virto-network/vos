@@ -213,6 +213,8 @@ struct Leader {
     /// The first due expiry row when the last sweep applied, or failed
     /// alone, and when.
     swept: Option<((u64, SessionId), Instant)>,
+    /// When the last batch ended.
+    ended: Option<Instant>,
     /// That a sweep left its first due row in place, said once.
     stuck: bool,
 }
@@ -246,6 +248,7 @@ impl Leader {
             backoff: BACKOFF,
             skipped: false,
             swept: None,
+            ended: None,
             stuck: false,
         })
     }
@@ -260,8 +263,15 @@ impl Leader {
             if pending.is_empty() {
                 // Woken by a timer alone: let the node's other tasks run.
                 smol::future::yield_now().await;
-            } else if !self.run(inner, agent, shared, pending).await {
-                return false;
+            } else {
+                if let Some(ended) = self.ended {
+                    inner.stats.between.took(ended.elapsed());
+                }
+                let ran = self.run(inner, agent, shared, pending).await;
+                self.ended = Some(Instant::now());
+                if !ran {
+                    return false;
+                }
             }
             self.rounds(inner);
             if !leads(&shared.state(), self.term) {
@@ -465,6 +475,7 @@ impl Leader {
         shared: &Shared,
         mut pending: Vec<Pending>,
     ) -> bool {
+        let taken = Instant::now();
         // Whether to sweep is decided below, on the batch's state.
         pending.retain(|item| !matches!(item, Pending::Sweep));
         let snapshot = Arc::new(inner.store.snapshot());
@@ -588,6 +599,7 @@ impl Leader {
                 _ => Vec::new(),
             })
             .collect();
+        inner.stats.prepare.took(taken.elapsed());
         match self.execute(inner, shared, snapshot, &batch, blobs).await {
             Ok(Ran::Done(result)) => {
                 self.skipped = false;
@@ -598,7 +610,9 @@ impl Leader {
                 if !inner.hooks.after_commit(self.id, self.applied) {
                     return false;
                 }
+                let dispatching = Instant::now();
                 self.dispatch(inner, agent, pending, &result, &before);
+                inner.stats.dispatch.took(dispatching.elapsed());
             }
             Ok(Ran::Lost) => {
                 let hint = inner.not_leader(shared);
@@ -684,7 +698,7 @@ impl Leader {
         let gas = inner.refine_gas;
         let state = Arc::clone(&snapshot);
         let queued = Instant::now();
-        let output = ran(inner
+        let (output, refine_gas) = ran(inner
             .executors
             .run(move || {
                 let running = Instant::now();
@@ -711,6 +725,17 @@ impl Leader {
                 output
             }))?;
         let result: WorkResult = pvm::decode(&output)?;
+        let inputs = batch.inputs.len().max(1) as u64;
+        let step_gas: u64 = result
+            .steps
+            .iter()
+            .map(|step| match step {
+                Step::Ran(run) => run.gas_used,
+                Step::Refused { .. } | Step::Swept { .. } => 0,
+            })
+            .sum();
+        inner.stats.refine_gas.record(refine_gas / inputs);
+        inner.stats.step_gas.record(step_gas / inputs);
         // The dry run: a failure here isolates its input off the log.
         let program = Arc::clone(&inner.program);
         let gas = shared.record.accumulate_gas;

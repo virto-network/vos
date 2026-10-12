@@ -9,15 +9,17 @@ use std::time::{Duration, Instant};
 
 use vos_wire::ingress::{BUCKETS, Stage, Stats as Wire, bucket};
 
-/// One stage's counts.
+/// One stage's counts, and their values' sum.
 pub(crate) struct Histogram {
     counts: Vec<AtomicU64>,
+    total: AtomicU64,
 }
 
 impl Default for Histogram {
     fn default() -> Self {
         Self {
             counts: (0..BUCKETS).map(|_| AtomicU64::new(0)).collect(),
+            total: AtomicU64::new(0),
         }
     }
 }
@@ -25,6 +27,7 @@ impl Default for Histogram {
 impl Histogram {
     pub(crate) fn record(&self, value: u64) {
         self.counts[bucket(value)].fetch_add(1, Ordering::Relaxed);
+        self.total.fetch_add(value, Ordering::Relaxed);
     }
 
     pub(crate) fn took(&self, duration: Duration) {
@@ -46,6 +49,11 @@ pub(crate) struct Stats {
     pub(crate) queued: Histogram,
     /// Inputs in a batch.
     pub(crate) batch_inputs: Histogram,
+    /// A batch's refine's gas, per input.
+    pub(crate) refine_gas: Histogram,
+    /// The gas its steps used, per input: what is left of `refine_gas` is
+    /// the agent program's own, around the steps.
+    pub(crate) step_gas: Histogram,
     /// A batch's refine waiting for an executor.
     pub(crate) refine_queue: Histogram,
     pub(crate) refine: Histogram,
@@ -58,8 +66,16 @@ pub(crate) struct Stats {
     pub(crate) commit: Histogram,
     /// From its commit to its apply here.
     pub(crate) apply: Histogram,
-    /// The whole batch, from its inputs taken to its apply.
+    /// The whole batch, from its refine's start to its apply.
     pub(crate) batch: Histogram,
+    /// Before it: from its inputs taken to its refine's start (the state
+    /// read, the inputs filtered).
+    pub(crate) prepare: Histogram,
+    /// After its apply: the replies, deliveries and acknowledgements.
+    pub(crate) dispatch: Histogram,
+    /// From a batch's end to the next one's taking its inputs: the queue
+    /// read, the linger after an idle wait, the windows' rounds.
+    pub(crate) between: Histogram,
     /// The leader loop's wait to be polled again after each stage ended:
     /// the runtime's queue.
     pub(crate) resume: Histogram,
@@ -92,6 +108,7 @@ pub(crate) fn stage(name: &str, histogram: &Histogram) -> Stage {
     Stage {
         name: name.to_string(),
         counts: histogram.counts(),
+        total: histogram.total.load(Ordering::Relaxed),
     }
 }
 
@@ -101,6 +118,8 @@ impl Stats {
         let mut stages = vec![
             stage("queued", &self.queued),
             stage("batch_inputs", &self.batch_inputs),
+            stage("refine_gas", &self.refine_gas),
+            stage("step_gas", &self.step_gas),
             stage("refine_queue", &self.refine_queue),
             stage("refine", &self.refine),
             stage("dry_run_queue", &self.dry_run_queue),
@@ -109,6 +128,9 @@ impl Stats {
             stage("commit", &self.commit),
             stage("apply", &self.apply),
             stage("batch", &self.batch),
+            stage("prepare", &self.prepare),
+            stage("dispatch", &self.dispatch),
+            stage("between", &self.between),
             stage("resume", &self.resume),
             stage("verify", &self.verify),
             stage("late", &self.late),

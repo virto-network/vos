@@ -224,6 +224,8 @@ pub struct Stats {
 pub struct Stage {
     pub name: String,
     pub counts: Vec<u64>,
+    /// The values recorded, summed: with the counts, an exact mean.
+    pub total: u64,
 }
 
 /// The buckets a stage's values fall in: exact below 8, then four to each
