@@ -1,0 +1,502 @@
+//! A node's refine and accumulate hosts around the default agent, the test
+//! actors installed in it and in a testkit, and what the tests read of a
+//! batch's steps.
+
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+
+use vos_pvm::ExitReason;
+use vos_pvm::accumulate_host::{AccumulateContext, ServiceStorage};
+use vos_pvm::pool::MachinePool;
+use vos_pvm::refine::{Invocation, Machine, MemoryModel, PreparedProgram};
+use vos_pvm::refine_host::{RefineContext, StateReader};
+use vos_testkit::programs::{actor, agent, method};
+use vos_testkit::{Testkit, decode, program_hash};
+use vos_wire::abi::{cap, code};
+use vos_wire::batch::{Admin, Batch, Input, Query, Request, Work};
+use vos_wire::ids::{
+    AgentId, InstanceId, MethodId, Principal, ProgramHash, Session, SessionId, SessionRef,
+};
+use vos_wire::jam::{AccumulateInput, Operand, RefineArgs};
+use vos_wire::records::{SessionMark, unstored};
+use vos_wire::result::{InputRef, Outcome, Run, Step, WorkResult, Write};
+use vos_wire::{Decode, Encode, keys};
+
+pub const AGENT: AgentId = AgentId(7);
+pub const COUNTER: InstanceId = InstanceId(1);
+pub const LEDGER: InstanceId = InstanceId(2);
+pub const CALLER: InstanceId = InstanceId(3);
+pub const ALICE: Principal = Principal::Client([1; 32]);
+pub const BOB: Principal = Principal::Client([2; 32]);
+pub const MINTER: u8 = 1;
+pub const OUTER_GAS: u64 = 4_000_000_000;
+
+struct Snapshot(BTreeMap<Vec<u8>, Vec<u8>>);
+
+impl StateReader for Snapshot {
+    fn read(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.0.get(key).cloned()
+    }
+
+    fn rows<'a>(
+        &'a self,
+        prefix: &'a [u8],
+        after: Option<&'a [u8]>,
+    ) -> Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + 'a> {
+        Box::new(
+            self.0
+                .range(prefix.to_vec()..)
+                .take_while(move |(key, _)| key.starts_with(prefix))
+                .filter(move |(key, _)| after.is_none_or(|after| key.as_slice() > after))
+                .map(|(key, value)| (key.clone(), value.clone())),
+        )
+    }
+}
+
+struct Storage<'a>(&'a mut BTreeMap<Vec<u8>, Vec<u8>>);
+
+impl ServiceStorage for Storage<'_> {
+    fn read(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.0.get(key).cloned()
+    }
+
+    fn write(&mut self, key: &[u8], value: Option<&[u8]>) -> Option<usize> {
+        let previous = match value {
+            Some(value) => self.0.insert(key.to_vec(), value.to_vec()),
+            None => self.0.remove(key),
+        };
+        previous.map(|value| value.len())
+    }
+}
+
+/// `historical_lookup` from the node's programs; every other call the host
+/// does not serve answers `WHAT`.
+fn serve(id: u64, machine: &mut Machine, programs: &HashMap<[u8; 32], Vec<u8>>) {
+    let registers = *machine.registers();
+    if id != 7 {
+        machine.registers_mut()[7] = code::WHAT;
+        return;
+    }
+    let mut hash = [0u8; 32];
+    assert!(
+        machine
+            .memory()
+            .read_bytes_checked(registers[8] as u32, &mut hash)
+    );
+    match programs.get(&hash) {
+        Some(blob) => {
+            let offset = (registers[10] as usize).min(blob.len());
+            let len = (registers[11] as usize).min(blob.len() - offset);
+            assert!(
+                machine
+                    .memory_mut()
+                    .write_bytes_checked(registers[9] as u32, &blob[offset..offset + len])
+            );
+            machine.registers_mut()[7] = blob.len() as u64;
+        }
+        None => machine.registers_mut()[7] = code::NONE,
+    }
+}
+
+/// A node's view of one agent: its program, the pool, programs by hash and
+/// the agent's storage.
+pub struct Node {
+    /// The agent, prepared once for every refine and accumulate.
+    program: Arc<PreparedProgram>,
+    /// `None` leaves the loader to build every machine, as on a JAM node.
+    pool: Option<Arc<MachinePool>>,
+    /// Whether refine may read applied state; a JAM node cannot until
+    /// witnesses.
+    serves_state: bool,
+    programs: HashMap<[u8; 32], Vec<u8>>,
+    pub state: BTreeMap<Vec<u8>, Vec<u8>>,
+    pub version: u64,
+}
+
+impl Node {
+    pub fn new() -> Self {
+        Self::with(true, true)
+    }
+
+    pub fn with(pool: bool, serves_state: bool) -> Self {
+        // Preparing the agent takes most of a test's setup: once a run.
+        static AGENT: std::sync::OnceLock<Arc<PreparedProgram>> = std::sync::OnceLock::new();
+        let program = AGENT.get_or_init(|| Arc::new(PreparedProgram::new(&agent()).unwrap()));
+        Self {
+            program: Arc::clone(program),
+            pool: pool.then(|| Arc::new(MachinePool::new())),
+            serves_state,
+            programs: HashMap::new(),
+            state: BTreeMap::new(),
+            version: 0,
+        }
+    }
+
+    pub fn add(&mut self, blob: &[u8]) -> ProgramHash {
+        let hash = program_hash(blob);
+        if let Some(pool) = &self.pool {
+            assert_eq!(pool.install(blob).unwrap().0, hash.0);
+        }
+        self.programs.insert(hash.0, blob.to_vec());
+        hash
+    }
+
+    /// A batch of `inputs` at `time`, at the agent's next version, its seed
+    /// all zeros.
+    pub fn work(&self, time: u64, inputs: Vec<Input>) -> Work {
+        self.seeded_work(time, [0; 32], inputs)
+    }
+
+    /// A batch of `inputs` at `time`, at the agent's next version, seeded
+    /// with `seed`.
+    pub fn seeded_work(&self, time: u64, seed: [u8; 32], inputs: Vec<Input>) -> Work {
+        Work::Batch(Batch {
+            version: self.version,
+            time,
+            seed,
+            inputs,
+        })
+    }
+
+    pub fn refine(&self, work: &Work) -> Vec<u8> {
+        self.refine_with(work, OUTER_GAS)
+    }
+
+    pub fn refine_with(&self, work: &Work, gas: u64) -> Vec<u8> {
+        let invocation = self.run_refine(work, gas);
+        assert_eq!(invocation.exit, ExitReason::Halt, "refine halts");
+        invocation.output_bounded(cap::WORK_RESULT).unwrap()
+    }
+
+    pub fn run_refine(&self, work: &Work, gas: u64) -> Invocation {
+        let arguments = RefineArgs {
+            core: 0,
+            item: 0,
+            service: u64::from(AGENT.0),
+            payload: work.encode(),
+            package_hash: [0; 32],
+        }
+        .encode();
+        let mut context =
+            RefineContext::load_prepared(&self.program, &arguments, gas, MemoryModel::Auto)
+                .unwrap();
+        if let Some(pool) = &self.pool {
+            context = context.with_pool(Arc::clone(pool));
+        }
+        if self.serves_state {
+            context = context.with_state(Arc::new(Snapshot(self.state.clone())));
+        }
+        if self.pool.is_none() && !self.serves_state {
+            // A JAM node: no pool, no state, and no precompile computed.
+            context = context.without_precompiles();
+        }
+        context
+            .try_run_with_host(|id, machine| {
+                serve(id, machine, &self.programs);
+                Ok(())
+            })
+            .unwrap()
+    }
+
+    /// The gas a refine of `inputs` at time 1 spends beyond its steps'
+    /// gas, which holds what they run and what they are charged: the
+    /// agent's own work, less what the charges cover of it. Every step
+    /// runs to `Done`.
+    pub fn agent_gas(&self, inputs: Vec<Input>) -> i64 {
+        let invocation = self.run_refine(&self.work(1, inputs), OUTER_GAS);
+        assert_eq!(invocation.exit, ExitReason::Halt, "refine halts");
+        let (result, _) =
+            WorkResult::decode(&invocation.output_bounded(cap::WORK_RESULT).unwrap()).unwrap();
+        let steps: u64 = result
+            .steps
+            .iter()
+            .map(|step| ran_done(step).gas_used)
+            .sum();
+        invocation.gas_used as i64 - steps as i64
+    }
+
+    pub fn accumulate(&mut self, result: &[u8]) {
+        let input = AccumulateInput::Operand(Operand {
+            package_hash: [0; 32],
+            segment_root: [0; 32],
+            authorizer: [0; 32],
+            payload_hash: [0; 32],
+            gas_limit: 0,
+            result: Ok(result.to_vec()),
+            auth_trace: Vec::new(),
+        })
+        .encode();
+        let inputs = [input];
+        let invocation = AccumulateContext::load(
+            &self.program,
+            0,
+            u64::from(AGENT.0),
+            &inputs,
+            OUTER_GAS,
+            &mut Storage(&mut self.state),
+        )
+        .unwrap()
+        .try_run()
+        .unwrap();
+        assert_eq!(invocation.exit, ExitReason::Halt, "accumulate halts");
+    }
+
+    /// A batch of `inputs` at `time`, its seed all zeros, refined and
+    /// accumulated: its work result.
+    pub fn batch(&mut self, time: u64, inputs: Vec<Input>) -> WorkResult {
+        self.apply(&self.work(time, inputs))
+    }
+
+    /// `work` refined and accumulated: its work result.
+    pub fn apply(&mut self, work: &Work) -> WorkResult {
+        let bytes = self.refine(work);
+        self.accumulate(&bytes);
+        self.version += 1;
+        WorkResult::decode(&bytes).unwrap().0
+    }
+
+    pub fn query(
+        &self,
+        caller: Principal,
+        instance: InstanceId,
+        method: MethodId,
+        arguments: Vec<u8>,
+    ) -> Outcome {
+        let work = Work::Query(Query {
+            time: 0,
+            seed: [0; 32],
+            caller,
+            instance,
+            method,
+            arguments,
+        });
+        Outcome::decode(&self.refine(&work)).unwrap().0
+    }
+
+    pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.state
+            .get(key)
+            .map(|bytes| unstored(bytes).expect("a stored value").to_vec())
+    }
+
+    pub fn value<T: Decode>(&self, key: &[u8]) -> Option<T> {
+        self.get(key).map(|bytes| decode(&bytes).expect("decodes"))
+    }
+
+    /// A session's id and mark, as accumulate keeps them.
+    pub fn session(&self, session: &Session) -> Option<(SessionId, SessionMark)> {
+        let id: SessionId = self.value(&keys::session_index(session))?;
+        Some((id, self.value(&keys::session(id)).expect("a mark")))
+    }
+}
+
+/// The test actors, installed in a node and a testkit alike.
+pub struct Actors {
+    pub counter: Vec<u8>,
+    pub ledger: Vec<u8>,
+    pub caller: Vec<u8>,
+    pub checksum: Vec<u8>,
+}
+
+impl Actors {
+    pub fn load() -> Self {
+        Self {
+            counter: actor("counter"),
+            ledger: actor("ledger"),
+            caller: actor("caller"),
+            checksum: actor("checksum"),
+        }
+    }
+
+    pub fn method(&self, instance: InstanceId, name: &str) -> MethodId {
+        let program = match instance {
+            COUNTER => &self.counter,
+            LEDGER => &self.ledger,
+            _ => &self.caller,
+        };
+        method(program, name)
+    }
+
+    /// Install the actors and make Alice a minter, in the node through a
+    /// batch of admin inputs and in the testkit directly.
+    pub fn install(&self, node: &mut Node, kit: &mut Testkit) {
+        let counter = node.add(&self.counter);
+        let ledger = node.add(&self.ledger);
+        let caller = node.add(&self.caller);
+        let checksum = node.add(&self.checksum);
+        let audit = method(&self.ledger, "checksum");
+        let result = node.batch(
+            0,
+            vec![
+                install(COUNTER, counter),
+                Input::Admin(Admin::Install {
+                    instance: LEDGER,
+                    program: ledger,
+                    attestables: vec![(audit, checksum)],
+                    roles: vec![(b"minter".to_vec(), MINTER)],
+                }),
+                install(CALLER, caller),
+                Input::Admin(Admin::SetRole {
+                    principal: ALICE,
+                    role: Some(MINTER),
+                }),
+            ],
+        );
+        for step in &result.steps {
+            ran_done(step);
+        }
+        kit.install(COUNTER, &self.counter, &[], &[]).unwrap();
+        kit.install(
+            LEDGER,
+            &self.ledger,
+            &[(audit, &self.checksum)],
+            &[("minter", MINTER)],
+        )
+        .unwrap();
+        kit.install(CALLER, &self.caller, &[], &[]).unwrap();
+        kit.set_role(ALICE, Some(MINTER));
+    }
+}
+
+/// Requests in one session per caller, numbered in order.
+pub struct Sessions(BTreeMap<Principal, u64>);
+
+impl Sessions {
+    pub fn new() -> Self {
+        Self(BTreeMap::new())
+    }
+
+    pub fn session(caller: &Principal) -> Session {
+        Session {
+            key: match caller {
+                Principal::Client(key) => *key,
+                _ => [0; 32],
+            },
+            name: [0; 16],
+            t0: 0,
+        }
+    }
+
+    pub fn request<A: Encode>(
+        &mut self,
+        caller: Principal,
+        instance: InstanceId,
+        method: MethodId,
+        arguments: A,
+    ) -> Input {
+        let sequence = self.0.entry(caller).or_insert(0);
+        *sequence += 1;
+        request(caller, *sequence, instance, method, arguments.encode())
+    }
+}
+
+/// `caller`'s request at `sequence` of its session in [`Sessions`].
+pub fn request(
+    caller: Principal,
+    sequence: u64,
+    instance: InstanceId,
+    method: MethodId,
+    arguments: Vec<u8>,
+) -> Input {
+    Input::Request(Request {
+        session: Sessions::session(&caller),
+        sequence,
+        caller,
+        instance,
+        method,
+        arguments,
+    })
+}
+
+/// A request incrementing the counter by one, in `session` at `sequence`,
+/// from the session's key.
+pub fn increment_in(actors: &Actors, session: Session, sequence: u64) -> Input {
+    Input::Request(Request {
+        session,
+        sequence,
+        caller: Principal::Client(session.key),
+        instance: COUNTER,
+        method: actors.method(COUNTER, "increment"),
+        arguments: 1u64.encode(),
+    })
+}
+
+/// An install of `program` at `instance`, with no attestable and no role.
+pub fn install(instance: InstanceId, program: ProgramHash) -> Input {
+    Input::Admin(Admin::Install {
+        instance,
+        program,
+        attestables: vec![],
+        roles: vec![],
+    })
+}
+
+/// The step refine gives accumulate for a request in `session` at
+/// `sequence` that ran to `Done` with `writes`, and nothing else.
+pub fn ran_step(session: SessionRef, sequence: u64, writes: Vec<Write>) -> Step {
+    Step::Ran(Run {
+        input: InputRef::Request { session, sequence },
+        outcome: Outcome::Done(Vec::new()),
+        instances: Vec::new(),
+        writes,
+        messages: Vec::new(),
+        attests: Vec::new(),
+        gas_used: 0,
+    })
+}
+
+pub fn setup() -> (Actors, Node, Testkit, Sessions) {
+    let actors = Actors::load();
+    let mut node = Node::new();
+    let mut kit = Testkit::new(AGENT);
+    actors.install(&mut node, &mut kit);
+    (actors, node, kit, Sessions::new())
+}
+
+/// `node` with the counter alone installed.
+pub fn counter_only(mut node: Node) -> (Actors, Node) {
+    let actors = Actors::load();
+    let program = node.add(&actors.counter);
+    let result = node.batch(0, vec![install(COUNTER, program)]);
+    ran(&result.steps[0]);
+    (actors, node)
+}
+
+pub fn ran(step: &Step) -> &Run {
+    match step {
+        Step::Ran(run) => run,
+        other => panic!("did not run: {other:?}"),
+    }
+}
+
+/// The run of a step that ran to `Done`.
+pub fn ran_done(step: &Step) -> &Run {
+    let run = ran(step);
+    assert!(
+        matches!(run.outcome, Outcome::Done(_)),
+        "failed: {:?}",
+        run.outcome
+    );
+    run
+}
+
+pub fn done<T: Decode>(step: &Step) -> T {
+    match &ran(step).outcome {
+        Outcome::Done(bytes) => decode(bytes).expect("decodes"),
+        other => panic!("failed: {other:?}"),
+    }
+}
+
+pub fn failed(step: &Step) -> u32 {
+    match &ran(step).outcome {
+        Outcome::Failed { code, .. } => *code,
+        other => panic!("done: {other:?}"),
+    }
+}
+
+pub fn refused(step: &Step) -> u32 {
+    match step {
+        Step::Refused { code, .. } => *code,
+        other => panic!("not refused: {other:?}"),
+    }
+}
