@@ -63,12 +63,12 @@ fn session(named: &SessionRef, time: u64) -> SessionId {
         SessionRef::New(session) => session,
     };
     // An earlier step of the same result may have created it.
-    if let Some(id) = get::<SessionId>(&keys::session_index(&session)) {
+    if let Some(id) = get::<SessionId>(&keys::session_index(session)) {
         return id;
     }
     let id = SessionId(get::<u64>(&keys::next_session()).unwrap_or(0));
     put(&keys::next_session(), &(id.0 + 1).encode());
-    put(&keys::session_index(&session), &id.encode());
+    put(&keys::session_index(session), &id.encode());
     put(&keys::session_of(id), &session.encode());
     put(&keys::expiry(expiry::bucket(time), id), &[]);
     let live = get::<u64>(&keys::live_sessions()).unwrap_or(0);
@@ -79,39 +79,38 @@ fn session(named: &SessionRef, time: u64) -> SessionId {
     id
 }
 
-/// The sessions `result` creates: those its ran steps name whole, each
-/// once.
-fn created(result: &WorkResult) -> BTreeSet<Session> {
-    result
-        .steps
-        .iter()
-        .filter_map(|step| match step {
-            Step::Ran(Run {
-                input:
-                    InputRef::Request {
-                        session: SessionRef::New(session),
-                        ..
-                    },
-                ..
-            }) => Some(**session),
-            _ => None,
-        })
-        .collect()
+/// The sessions `result`'s ran steps name whole: those it creates, each
+/// as many times as steps name it.
+fn new_sessions(result: &WorkResult) -> impl Iterator<Item = &Session> {
+    result.steps.iter().filter_map(|step| match step {
+        Step::Ran(Run {
+            input:
+                InputRef::Request {
+                    session: SessionRef::New(session),
+                    ..
+                },
+            ..
+        }) => Some(&**session),
+        _ => None,
+    })
 }
 
 /// Whether the sessions `result` creates fit the caps.
 fn within_caps(result: &WorkResult) -> bool {
-    let created = created(result);
+    // Each created session once, counted under its key.
+    let mut created = BTreeSet::new();
+    let mut per_key: BTreeMap<&[u8; 32], u64> = BTreeMap::new();
+    for session in new_sessions(result) {
+        if created.insert(session) {
+            *per_key.entry(&session.key).or_default() += 1;
+        }
+    }
     if created.is_empty() {
         return true;
     }
     let live = get::<u64>(&keys::live_sessions()).unwrap_or(0);
     if live.saturating_add(created.len() as u64) > defaults::MAX_SESSIONS {
         return false;
-    }
-    let mut per_key: BTreeMap<[u8; 32], u64> = BTreeMap::new();
-    for session in &created {
-        *per_key.entry(session.key).or_default() += 1;
     }
     per_key.iter().all(|(key, new)| {
         get::<u64>(&keys::key_sessions(key))
@@ -123,17 +122,7 @@ fn within_caps(result: &WorkResult) -> bool {
 
 /// Whether a step of `result` creates a session far from its time.
 fn stale(result: &WorkResult) -> bool {
-    result.steps.iter().any(|step| match step {
-        Step::Ran(Run {
-            input:
-                InputRef::Request {
-                    session: SessionRef::New(session),
-                    ..
-                },
-            ..
-        }) => session.t0.abs_diff(result.time) > defaults::SESSION_SKEW_MS,
-        _ => false,
-    })
+    new_sessions(result).any(|session| session.t0.abs_diff(result.time) > defaults::SESSION_SKEW_MS)
 }
 
 fn apply(result: &WorkResult) {

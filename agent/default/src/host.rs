@@ -111,41 +111,30 @@ pub fn unserved() -> ! {
     panic!("the host serves no applied state")
 }
 
-/// The agent's applied state, by agent-relative key; `None` when absent.
-pub fn state_read(key: &[u8]) -> Option<Vec<u8>> {
-    let mut served = true;
-    let value = whole(|out, offset, capacity| {
-        let (len, _) = ecalli!(
-            STATE_READ,
-            [ptr(key), key.len() as u64, out as u64, offset, capacity, 0]
-        );
-        served &= len != code::WHAT;
-        len
-    });
-    if !served {
+/// One `state_read` of `key`: up to `capacity` bytes of its value from
+/// `offset`, copied to `out`. Returns the value's whole length, or `NONE`
+/// when absent; traps when the host serves no applied state.
+fn state_read_at(key: &[u8], out: *mut u8, offset: u64, capacity: u64) -> u64 {
+    let (len, _) = ecalli!(
+        STATE_READ,
+        [ptr(key), key.len() as u64, out as u64, offset, capacity, 0]
+    );
+    if len == code::WHAT {
         unserved();
     }
-    value
+    len
+}
+
+/// The agent's applied state, by agent-relative key; `None` when absent.
+pub fn state_read(key: &[u8]) -> Option<Vec<u8>> {
+    whole(|out, offset, capacity| state_read_at(key, out, offset, capacity))
 }
 
 /// A value of the agent's applied state read into `buffer`, with no
 /// allocation: the value's whole length, of which `buffer` holds the start;
 /// `None` when absent.
 pub fn state_read_into(key: &[u8], buffer: &mut [u8]) -> Option<usize> {
-    let (len, _) = ecalli!(
-        STATE_READ,
-        [
-            ptr(key),
-            key.len() as u64,
-            ptr_mut(buffer),
-            0,
-            buffer.len() as u64,
-            0
-        ]
-    );
-    if len == code::WHAT {
-        unserved();
-    }
+    let len = state_read_at(key, buffer.as_mut_ptr(), 0, buffer.len() as u64);
     (len != code::NONE).then_some(len as usize)
 }
 

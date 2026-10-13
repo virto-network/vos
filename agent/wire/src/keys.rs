@@ -8,28 +8,51 @@ use alloc::vec::Vec;
 use crate::Encode;
 use crate::ids::{AgentId, InstanceId, Principal, Session, SessionId};
 
-const SYSTEM: u8 = 0x00;
-const INSTANCE: u8 = 0x01;
+/// Who owns a row, its key's first byte: the agent itself, or one of its
+/// instances.
+#[derive(Clone, Copy)]
+#[repr(u8)]
+enum Owner {
+    System = 0x00,
+    Instance = 0x01,
+}
 
-const INSTANCE_STRUCT: u8 = 0x00;
-const INSTANCE_TABLE: u8 = 0x01;
+/// An instance's row, after its id: its struct state, or a table's row.
+#[derive(Clone, Copy)]
+#[repr(u8)]
+enum Part {
+    Struct = 0x00,
+    Table = 0x01,
+}
 
-const INSTALLED: u8 = 0x01;
-const MEMBER: u8 = 0x02;
-const SESSION: u8 = 0x03;
-const REPLY: u8 = 0x04;
-const PAIR_IN: u8 = 0x05;
-const OUTBOX: u8 = 0x06;
-const PAIR_OUT: u8 = 0x07;
-const ACKED: u8 = 0x08;
-const VERSION: u8 = 0x09;
-const SESSION_INDEX: u8 = 0x0a;
-const NEXT_SESSION: u8 = 0x0b;
-const LIVE_SESSIONS: u8 = 0x0c;
-const BATCH_TIME: u8 = 0x0d;
-const SESSION_OF: u8 = 0x0e;
-const EXPIRY: u8 = 0x0f;
-const KEY_SESSIONS: u8 = 0x10;
+/// The agent's own rows, each tagged after [`Owner::System`].
+#[derive(Clone, Copy)]
+#[repr(u8)]
+enum Row {
+    Installed = 0x01,
+    Member = 0x02,
+    Session = 0x03,
+    Reply = 0x04,
+    PairIn = 0x05,
+    Outbox = 0x06,
+    PairOut = 0x07,
+    Acked = 0x08,
+    Version = 0x09,
+    SessionIndex = 0x0a,
+    NextSession = 0x0b,
+    LiveSessions = 0x0c,
+    BatchTime = 0x0d,
+    SessionOf = 0x0e,
+    Expiry = 0x0f,
+    KeySessions = 0x10,
+}
+
+impl Row {
+    /// The two bytes every key of this row starts with.
+    const fn prefix(self) -> [u8; 2] {
+        [Owner::System as u8, self as u8]
+    }
+}
 
 fn key(parts: &[&[u8]]) -> Vec<u8> {
     parts.concat()
@@ -37,47 +60,51 @@ fn key(parts: &[&[u8]]) -> Vec<u8> {
 
 /// An instance's struct state.
 pub fn instance_struct(instance: InstanceId) -> Vec<u8> {
-    key(&[&[INSTANCE], &instance.0.to_be_bytes(), &[INSTANCE_STRUCT]])
+    key(&[
+        &[Owner::Instance as u8],
+        &instance.0.to_be_bytes(),
+        &[Part::Struct as u8],
+    ])
 }
 
 /// The prefix of every row of one of an instance's tables. `tag` is derived
 /// from the table field's name.
 pub fn table_prefix(instance: InstanceId, tag: u32) -> Vec<u8> {
     key(&[
-        &[INSTANCE],
+        &[Owner::Instance as u8],
         &instance.0.to_be_bytes(),
-        &[INSTANCE_TABLE],
+        &[Part::Table as u8],
         &tag.to_be_bytes(),
     ])
 }
 
 /// The prefix of everything an instance owns; its ABI reaches nothing else.
 pub fn instance_prefix(instance: InstanceId) -> Vec<u8> {
-    key(&[&[INSTANCE], &instance.0.to_be_bytes()])
+    key(&[&[Owner::Instance as u8], &instance.0.to_be_bytes()])
 }
 
 /// The program an instance runs.
 pub fn installed(instance: InstanceId) -> Vec<u8> {
-    key(&[&[SYSTEM, INSTALLED], &instance.0.to_be_bytes()])
+    key(&[&Row::Installed.prefix(), &instance.0.to_be_bytes()])
 }
 
 /// The prefix of every instance's [`installed`] row.
 pub fn installed_prefix() -> Vec<u8> {
-    key(&[&[SYSTEM, INSTALLED]])
+    Row::Installed.prefix().to_vec()
 }
 
 /// A principal's role byte in this agent.
 pub fn member(principal: &Principal) -> Vec<u8> {
-    key(&[&[SYSTEM, MEMBER], &principal.encode()])
+    key(&[&Row::Member.prefix(), &principal.encode()])
 }
 
 /// A session's high-water mark and last activity, for this agent.
 pub fn session(session: SessionId) -> Vec<u8> {
-    key(&[&[SYSTEM, SESSION], &session.0.to_be_bytes()])
+    key(&[&Row::Session.prefix(), &session.0.to_be_bytes()])
 }
 
 /// The length of a [`session_index`] key.
-pub const SESSION_INDEX_LEN: usize = 2 + 32 + 16 + 8;
+const SESSION_INDEX_LEN: usize = 2 + 32 + 16 + 8;
 
 /// A session's compact id, by its triple: key, name, then t0 big-endian,
 /// so one key's sessions sit together.
@@ -88,7 +115,7 @@ pub fn session_index(session: &Session) -> Vec<u8> {
 /// [`session_index`] with no allocation.
 pub fn session_index_key(session: &Session) -> [u8; SESSION_INDEX_LEN] {
     let mut key = [0u8; SESSION_INDEX_LEN];
-    key[..2].copy_from_slice(&[SYSTEM, SESSION_INDEX]);
+    key[..2].copy_from_slice(&Row::SessionIndex.prefix());
     key[2..34].copy_from_slice(&session.key);
     key[34..50].copy_from_slice(&session.name);
     key[50..].copy_from_slice(&session.t0.to_be_bytes());
@@ -98,7 +125,7 @@ pub fn session_index_key(session: &Session) -> [u8; SESSION_INDEX_LEN] {
 /// The session a compact id stands for, whole: written once, when
 /// accumulate creates it.
 pub fn session_of(session: SessionId) -> Vec<u8> {
-    key(&[&[SYSTEM, SESSION_OF], &session.0.to_be_bytes()])
+    key(&[&Row::SessionOf.prefix(), &session.0.to_be_bytes()])
 }
 
 /// A session's row in the expiry index: its bucket (a time divided by
@@ -107,24 +134,24 @@ pub fn session_of(session: SessionId) -> Vec<u8> {
 /// mark's bucket.
 pub fn expiry(bucket: u64, session: SessionId) -> Vec<u8> {
     key(&[
-        &[SYSTEM, EXPIRY],
+        &Row::Expiry.prefix(),
         &bucket.to_be_bytes(),
         &session.0.to_be_bytes(),
     ])
 }
 
 /// The length of an [`expiry`] key.
-pub const EXPIRY_LEN: usize = 2 + 8 + 8;
+const EXPIRY_LEN: usize = 2 + 8 + 8;
 
 /// The prefix of the expiry index.
 pub fn expiry_prefix() -> Vec<u8> {
-    key(&[&[SYSTEM, EXPIRY]])
+    Row::Expiry.prefix().to_vec()
 }
 
 /// The bucket and session an [`expiry`] key names; `None` for any other
 /// key.
 pub fn expiry_entry(key: &[u8]) -> Option<(u64, SessionId)> {
-    if key.len() != EXPIRY_LEN || key[..2] != [SYSTEM, EXPIRY] {
+    if key.len() != EXPIRY_LEN || key[..2] != Row::Expiry.prefix() {
         return None;
     }
     let bucket = u64::from_be_bytes(key[2..10].try_into().ok()?);
@@ -134,29 +161,29 @@ pub fn expiry_entry(key: &[u8]) -> Option<(u64, SessionId)> {
 
 /// How many sessions a key holds at this agent.
 pub fn key_sessions(client: &[u8; 32]) -> Vec<u8> {
-    key(&[&[SYSTEM, KEY_SESSIONS], client])
+    key(&[&Row::KeySessions.prefix(), client])
 }
 
 /// The id the next session gets: ids are never reused.
 pub fn next_session() -> Vec<u8> {
-    key(&[&[SYSTEM, NEXT_SESSION]])
+    Row::NextSession.prefix().to_vec()
 }
 
 /// How many sessions the agent holds.
 pub fn live_sessions() -> Vec<u8> {
-    key(&[&[SYSTEM, LIVE_SESSIONS]])
+    Row::LiveSessions.prefix().to_vec()
 }
 
 /// The high-water mark of work-result time: it never goes back.
 pub fn batch_time() -> Vec<u8> {
-    key(&[&[SYSTEM, BATCH_TIME]])
+    Row::BatchTime.prefix().to_vec()
 }
 
 /// A kept reply, by session and sequence; the window keeps the last
 /// [`crate::defaults::REPLY_WINDOW`].
 pub fn reply(session: SessionId, sequence: u64) -> Vec<u8> {
     key(&[
-        &[SYSTEM, REPLY],
+        &Row::Reply.prefix(),
         &session.0.to_be_bytes(),
         &sequence.to_be_bytes(),
     ])
@@ -164,13 +191,13 @@ pub fn reply(session: SessionId, sequence: u64) -> Vec<u8> {
 
 /// The high-water mark of messages received from an agent.
 pub fn pair_in(from: AgentId) -> Vec<u8> {
-    key(&[&[SYSTEM, PAIR_IN], &from.0.to_be_bytes()])
+    key(&[&Row::PairIn.prefix(), &from.0.to_be_bytes()])
 }
 
 /// A message waiting in the outbox until acknowledged.
 pub fn outbox(to: AgentId, sequence: u64) -> Vec<u8> {
     key(&[
-        &[SYSTEM, OUTBOX],
+        &Row::Outbox.prefix(),
         &to.0.to_be_bytes(),
         &sequence.to_be_bytes(),
     ])
@@ -178,22 +205,22 @@ pub fn outbox(to: AgentId, sequence: u64) -> Vec<u8> {
 
 /// The prefix of the outbox, for the node to send after apply.
 pub fn outbox_prefix() -> Vec<u8> {
-    key(&[&[SYSTEM, OUTBOX]])
+    Row::Outbox.prefix().to_vec()
 }
 
 /// The next sequence number for messages to an agent.
 pub fn pair_out(to: AgentId) -> Vec<u8> {
-    key(&[&[SYSTEM, PAIR_OUT], &to.0.to_be_bytes()])
+    key(&[&Row::PairOut.prefix(), &to.0.to_be_bytes()])
 }
 
 /// The highest sequence an agent acknowledged.
 pub fn acked(to: AgentId) -> Vec<u8> {
-    key(&[&[SYSTEM, ACKED], &to.0.to_be_bytes()])
+    key(&[&Row::Acked.prefix(), &to.0.to_be_bytes()])
 }
 
 /// The agent's state version: applied, non-skipped work results.
 pub fn version() -> Vec<u8> {
-    key(&[&[SYSTEM, VERSION]])
+    Row::Version.prefix().to_vec()
 }
 
 /// Whether `key` lies inside `instance`'s own state.

@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 use core::cell::RefCell;
 
 use vos_wire::abi::{self, Kind, cap, code, failure, op, price, refusal};
-use vos_wire::batch::{Admin, Batch, Input, Query, Work};
+use vos_wire::batch::{Admin, Batch, Input, Query, Request, Work};
 use vos_wire::ids::{
     AgentId, InstanceId, MethodId, Principal, ProgramHash, Session, SessionId, SessionRef,
 };
@@ -31,6 +31,8 @@ const SCAN_PAGE: usize = 4096;
 const SCHEMA_AT: u64 = 1 << 16;
 
 type Overlay = BTreeMap<Vec<u8>, Option<Vec<u8>>>;
+/// Rows of state, each a key and its value, in key order.
+type Rows = Vec<(Vec<u8>, Vec<u8>)>;
 
 pub fn run(arguments: &[u8]) -> Vec<u8> {
     let arguments = RefineArgs::decode(arguments).expect("refine arguments");
@@ -81,7 +83,7 @@ fn record<T: Decode>(key: &[u8]) -> Result<Option<T>, Corrupt> {
 }
 
 /// Applied rows under `prefix` after `after`, a page at a time.
-fn applied_rows(prefix: &[u8], after: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Corrupt> {
+fn applied_rows(prefix: &[u8], after: &[u8]) -> Result<Rows, Corrupt> {
     scan_page(prefix, after)
         .into_iter()
         .map(|(key, value)| Ok((key, unstored(&value).ok_or(Corrupt)?.to_vec())))
@@ -89,7 +91,7 @@ fn applied_rows(prefix: &[u8], after: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, 
 }
 
 /// A page of rows under `prefix` after `after`, their values as stored.
-fn scan_page(prefix: &[u8], after: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+fn scan_page(prefix: &[u8], after: &[u8]) -> Rows {
     let mut capacity = SCAN_PAGE;
     let out = loop {
         let mut out: Vec<u8> = Vec::with_capacity(capacity);
@@ -171,30 +173,41 @@ enum Mark {
     Pair(AgentId, u64),
 }
 
-/// A request's session as this refine sees it: its id, none for a session
-/// the state does not hold, and its mark, none for one no step has
-/// created.
-type Held = (Option<SessionId>, Option<SessionMark>);
+/// A request's session as this refine sees it.
+#[derive(Clone, Copy)]
+enum Held {
+    /// Neither the state holds it nor has a step created it.
+    Absent,
+    /// An earlier step of this refine created it: it has no id yet.
+    New(SessionMark),
+    /// The state holds it, under its id.
+    Known(SessionId, SessionMark),
+}
+
+impl Held {
+    fn mark(self) -> Option<SessionMark> {
+        match self {
+            Held::Absent => None,
+            Held::New(mark) | Held::Known(_, mark) => Some(mark),
+        }
+    }
+
+    /// The session once a step has run at `mark`.
+    fn advanced(self, mark: SessionMark) -> Held {
+        match self {
+            Held::Known(id, _) => Held::Known(id, mark),
+            Held::Absent | Held::New(_) => Held::New(mark),
+        }
+    }
+}
 
 /// A session as the in-batch map orders it: by its name as a number
 /// first, then its time, then its key, so sessions compare in a few
 /// instructions and one key's many sessions differ at once.
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct ByName(Session);
+type ByName = (u128, u64, [u8; 32]);
 
-impl PartialOrd for ByName {
-    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for ByName {
-    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        u128::from_le_bytes(self.0.name)
-            .cmp(&u128::from_le_bytes(other.0.name))
-            .then(self.0.t0.cmp(&other.0.t0))
-            .then_with(|| self.0.key.cmp(&other.0.key))
-    }
+fn by_name(session: &Session) -> ByName {
+    (u128::from_le_bytes(session.name), session.t0, session.key)
 }
 
 /// The sessions the agent holds, in all and per key, as this refine has
@@ -241,10 +254,60 @@ fn held(session: &Session) -> Result<Held, Corrupt> {
     match record::<SessionId>(&keys::session_index_key(session))? {
         Some(id) => {
             let mark = record::<SessionMark>(&keys::session(id))?.ok_or(Corrupt)?;
-            Ok((Some(id), Some(mark)))
+            Ok(Held::Known(id, mark))
         }
-        None => Ok((None, None)),
+        None => Ok(Held::Absent),
     }
+}
+
+/// A request against its session as this refine sees it: how the result
+/// names the session, and the session before the step, or the code that
+/// refuses the step. A session the step would create must fit the caps;
+/// it counts toward them once the step is in the result ([`Counts::add`]).
+fn admit(
+    base: &Base,
+    sessions: &BTreeMap<ByName, Held>,
+    counts: &mut Counts,
+    request: &Request,
+) -> (InputRef, Result<Held, u32>) {
+    let held = match sessions.get(&by_name(&request.session)) {
+        Some(held) => Ok(*held),
+        None => held(&request.session),
+    };
+    // A session the state does not hold names itself whole.
+    let session = match held {
+        Ok(Held::Known(id, _)) => SessionRef::Known(id),
+        _ => SessionRef::New(alloc::boxed::Box::new(request.session)),
+    };
+    let input = InputRef::Request {
+        session,
+        sequence: request.sequence,
+    };
+    let Ok(held) = held else {
+        return (input, Err(refusal::UNREADABLE));
+    };
+    let admitted = match held.mark() {
+        // A duplicate first, even in an expired session: the leader
+        // answers it from the window.
+        Some(mark) if request.sequence <= mark.sequence => Err(refusal::SEQUENCE),
+        Some(mark) if base.time > mark.time.saturating_add(defaults::SESSION_EXPIRY_MS) => {
+            Err(refusal::EXPIRED)
+        }
+        Some(mark) if request.sequence != mark.sequence + 1 => Err(refusal::SEQUENCE),
+        Some(_) => Ok(held),
+        None if request.session.t0.abs_diff(base.time) > defaults::SESSION_SKEW_MS => {
+            Err(refusal::STALE_SESSION)
+        }
+        None if request.sequence != 1 => Err(refusal::SEQUENCE),
+        // Neither held nor created by an earlier step: this one creates
+        // it, within the caps.
+        None => match counts.full(&request.session.key) {
+            Ok(None) => Ok(held),
+            Ok(Some(code)) => Err(code),
+            Err(Corrupt) => Err(refusal::UNREADABLE),
+        },
+    };
+    (input, admitted)
 }
 
 fn run_batch(agent: AgentId, batch: Batch) -> Vec<u8> {
@@ -282,61 +345,12 @@ fn run_batch(agent: AgentId, batch: Batch) -> Vec<u8> {
         // The key of a session this step creates.
         let mut creates = None;
         let (step, mark) = match input {
-            Input::Request(request) => {
-                let held = match sessions.get(&ByName(request.session)) {
-                    Some(held) => Ok(*held),
-                    None => held(&request.session),
-                };
-                // A session the state does not hold names itself whole.
-                let session = match held {
-                    Ok((Some(id), _)) => SessionRef::Known(id),
-                    _ => SessionRef::New(alloc::boxed::Box::new(request.session)),
-                };
-                let input = InputRef::Request {
-                    session,
-                    sequence: request.sequence,
-                };
-                let refusal = match held {
-                    Err(Corrupt) => Some(refusal::UNREADABLE),
-                    // A duplicate first, even in an expired session: the
-                    // leader answers it from the window.
-                    Ok((_, Some(mark))) if request.sequence <= mark.sequence => {
-                        Some(refusal::SEQUENCE)
+            Input::Request(request) => match admit(&base, &sessions, &mut counts, &request) {
+                (input, Err(code)) => (Step::Refused { input, code }, None),
+                (input, Ok(held)) => {
+                    if let Held::Absent = held {
+                        creates = Some(request.session.key);
                     }
-                    Ok((_, Some(mark)))
-                        if base.time > mark.time.saturating_add(defaults::SESSION_EXPIRY_MS) =>
-                    {
-                        Some(refusal::EXPIRED)
-                    }
-                    Ok((_, None))
-                        if request.session.t0.abs_diff(base.time) > defaults::SESSION_SKEW_MS =>
-                    {
-                        Some(refusal::STALE_SESSION)
-                    }
-                    Ok((_, mark))
-                        if request.sequence != mark.map_or(1, |mark| mark.sequence + 1) =>
-                    {
-                        Some(refusal::SEQUENCE)
-                    }
-                    // Neither held nor created by an earlier step: this one
-                    // creates it, within the caps.
-                    Ok((_, None)) => match counts.full(&request.session.key) {
-                        Ok(None) => {
-                            creates = Some(request.session.key);
-                            None
-                        }
-                        Ok(Some(code)) => Some(code),
-                        Err(Corrupt) => Some(refusal::UNREADABLE),
-                    },
-                    Ok(_) => None,
-                };
-                if let Some(code) = refusal {
-                    (Step::Refused { input, code }, None)
-                } else {
-                    let mark = SessionMark {
-                        sequence: request.sequence,
-                        time: base.time,
-                    };
                     let step = command(
                         &base,
                         index,
@@ -346,10 +360,16 @@ fn run_batch(agent: AgentId, batch: Batch) -> Vec<u8> {
                         request.method,
                         &request.arguments,
                     );
-                    let id = held.ok().and_then(|(id, _)| id);
-                    (step, Some(Mark::Session(request.session, (id, Some(mark)))))
+                    let mark = SessionMark {
+                        sequence: request.sequence,
+                        time: base.time,
+                    };
+                    (
+                        step,
+                        Some(Mark::Session(request.session, held.advanced(mark))),
+                    )
                 }
-            }
+            },
             Input::Message(message) => {
                 let input = InputRef::Message {
                     from: message.from,
@@ -405,7 +425,7 @@ fn run_batch(agent: AgentId, batch: Batch) -> Vec<u8> {
         }
         match mark {
             Some(Mark::Session(session, held)) => {
-                sessions.insert(ByName(session), held);
+                sessions.insert(by_name(&session), held);
             }
             Some(Mark::Pair(from, sequence)) => {
                 pairs.insert(from, sequence);

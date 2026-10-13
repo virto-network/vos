@@ -12,8 +12,8 @@ use crate::ids::{AgentId, InstanceId, MethodId, Principal, Session};
 use crate::peer::CreationRecord;
 use crate::result::Outcome;
 
-pub const CALL_DOMAIN: &[u8] = b"vos/call/1";
-pub const QUERY_DOMAIN: &[u8] = b"vos/query/1";
+const CALL_DOMAIN: &[u8] = b"vos/call/1";
+const QUERY_DOMAIN: &[u8] = b"vos/query/1";
 
 /// A node's identity: its ed25519 public key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
@@ -307,7 +307,7 @@ pub fn call_message(
         sequence.encode_to(bytes);
         instance.encode_to(bytes);
         method.encode_to(bytes);
-        arguments.to_vec().encode_to(bytes);
+        arguments.encode_to(bytes);
     })
 }
 
@@ -328,6 +328,6 @@ pub fn query_message(
         consistency.encode_to(bytes);
         instance.encode_to(bytes);
         method.encode_to(bytes);
-        arguments.to_vec().encode_to(bytes);
+        arguments.encode_to(bytes);
     })
 }

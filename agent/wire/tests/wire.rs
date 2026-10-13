@@ -582,3 +582,130 @@ fn stage_buckets_hold_their_values_in_order() {
         assert!(bucket_top(bucket(value)) >= value);
     }
 }
+
+/// Every key's layout, byte for byte: each row tag once, the integers
+/// big-endian. Stored state is keyed by these bytes.
+#[test]
+fn keys_keep_their_bytes() {
+    let instance = InstanceId(0x1122_3344);
+    let agent = AgentId(0x0a0b_0c0d);
+    let session = SessionId(0x0102_0304_0506_0708);
+    let id = [1, 2, 3, 4, 5, 6, 7, 8];
+    let sequence = 0x090a_0b0c_0d0e_0f10u64;
+    let at = [9, 10, 11, 12, 13, 14, 15, 16];
+    let cat = |parts: &[&[u8]]| parts.concat();
+    assert_eq!(
+        keys::instance_struct(instance),
+        [0x01, 0x11, 0x22, 0x33, 0x44, 0x00]
+    );
+    assert_eq!(
+        keys::table_prefix(instance, 0xa1b2_c3d4),
+        [0x01, 0x11, 0x22, 0x33, 0x44, 0x01, 0xa1, 0xb2, 0xc3, 0xd4]
+    );
+    assert_eq!(
+        keys::instance_prefix(instance),
+        [0x01, 0x11, 0x22, 0x33, 0x44]
+    );
+    assert_eq!(
+        keys::installed(instance),
+        [0x00, 0x01, 0x11, 0x22, 0x33, 0x44]
+    );
+    assert_eq!(keys::installed_prefix(), [0x00, 0x01]);
+    assert_eq!(
+        keys::member(&Principal::Agent(agent)),
+        [0x00, 0x02, 0x01, 0x0d, 0x0c, 0x0b, 0x0a]
+    );
+    assert_eq!(keys::session(session), cat(&[&[0x00, 0x03], &id]));
+    assert_eq!(
+        keys::reply(session, sequence),
+        cat(&[&[0x00, 0x04], &id, &at])
+    );
+    assert_eq!(keys::pair_in(agent), [0x00, 0x05, 0x0a, 0x0b, 0x0c, 0x0d]);
+    assert_eq!(
+        keys::outbox(agent, sequence),
+        cat(&[&[0x00, 0x06, 0x0a, 0x0b, 0x0c, 0x0d], &at])
+    );
+    assert_eq!(keys::outbox_prefix(), [0x00, 0x06]);
+    assert_eq!(keys::pair_out(agent), [0x00, 0x07, 0x0a, 0x0b, 0x0c, 0x0d]);
+    assert_eq!(keys::acked(agent), [0x00, 0x08, 0x0a, 0x0b, 0x0c, 0x0d]);
+    assert_eq!(keys::version(), [0x00, 0x09]);
+    let triple = Session {
+        key: [0xee; 32],
+        name: [0xdd; 16],
+        t0: sequence,
+    };
+    let index = cat(&[&[0x00, 0x0a], &[0xee; 32], &[0xdd; 16], &at]);
+    assert_eq!(keys::session_index(&triple), index);
+    assert_eq!(keys::session_index_key(&triple), index.as_slice());
+    assert_eq!(keys::next_session(), [0x00, 0x0b]);
+    assert_eq!(keys::live_sessions(), [0x00, 0x0c]);
+    assert_eq!(keys::batch_time(), [0x00, 0x0d]);
+    assert_eq!(keys::session_of(session), cat(&[&[0x00, 0x0e], &id]));
+    let expiry = cat(&[&[0x00, 0x0f], &at, &id]);
+    assert_eq!(keys::expiry(sequence, session), expiry);
+    assert_eq!(keys::expiry_prefix(), [0x00, 0x0f]);
+    assert_eq!(keys::expiry_entry(&expiry), Some((sequence, session)));
+    assert_eq!(keys::expiry_entry(&keys::session_of(session)), None);
+    assert_eq!(
+        keys::key_sessions(&[0xee; 32]),
+        cat(&[&[0x00, 0x10], &[0xee; 32]])
+    );
+}
+
+/// What a client signs: the domain, the agent's identity, then the fields
+/// as encoded, the arguments as a byte vector (a little-endian `u32` count,
+/// then the bytes).
+#[test]
+fn signed_messages_keep_their_bytes() {
+    use vos_wire::ingress::{Consistency, call_message, query_message};
+    let identity = [7; 32];
+    let session = Session {
+        key: [1; 32],
+        name: [2; 16],
+        t0: 3,
+    };
+    let (instance, method) = (InstanceId(5), MethodId(6));
+    let consistency = Consistency::Applied { at: 8 };
+    for len in [0usize, 1, 255, 256, 70_000] {
+        let arguments: Vec<u8> = (0..len).map(|i| i as u8).collect();
+        let call = [
+            b"vos/call/1".as_slice(),
+            &identity,
+            &session.encode(),
+            &4u64.encode(),
+            &instance.encode(),
+            &method.encode(),
+            &arguments.encode(),
+        ]
+        .concat();
+        assert_eq!(
+            call_message(&identity, &session, 4, instance, method, &arguments),
+            call
+        );
+        let query = [
+            b"vos/query/1".as_slice(),
+            &identity,
+            &[9; 32],
+            &10u64.encode(),
+            &consistency.encode(),
+            &instance.encode(),
+            &method.encode(),
+            &arguments.encode(),
+        ]
+        .concat();
+        assert_eq!(
+            query_message(
+                &identity,
+                &[9; 32],
+                10,
+                consistency,
+                instance,
+                method,
+                &arguments
+            ),
+            query
+        );
+    }
+    let call = call_message(&identity, &session, 4, instance, method, &[0xaa, 0xbb]);
+    assert!(call.ends_with(&[5, 0, 0, 0, 6, 0, 0, 0, 2, 0, 0, 0, 0xaa, 0xbb]));
+}
