@@ -546,7 +546,11 @@ Why handlers run to completion:
     batch time is past t0 plus the skew, so a collected session is never
     created again. Caps on live sessions refuse new ones and never evict.
     This relies on batch time never going backwards: the agent keeps a
-    replicated high-water mark that refine never goes below.
+    replicated high-water mark that refine never goes below. A leader
+    whose clock trails that mark times its batches at the mark. So after
+    a clock ran fast, batch time stands still until real time catches
+    up: sessions do not expire meanwhile, and once the cap is reached new
+    ones are refused. A liveness cost, never a replay.
   - **Sequences** are kept per (session, receiver agent), so requests to
     different agents never leave gaps in each other's sequence.
   - **State:** the high-water mark and the window of replies, kept until

@@ -6010,9 +6010,9 @@ sessions, closed:
 None is saturated.
 
 **The node's runtime on several threads, an experiment.**
-- **The setting:** `Config::runtime_threads`, 1 by default. Its flag,
-  `vos node run --runtime-threads`, is hidden: more than one thread has
-  run under no fault suite.
+- **The setting:** `Config::runtime_threads`, 1 by default, with a hidden
+  flag, `vos node run --runtime-threads`. (Removed in 3.10c: a call's
+  lane relies on the node's tasks sharing one thread.)
 - **The result:** with three threads, each node's throughput fell (one
   agent 14.0k/s rather than 15.0k/s; 64 agents 14.7k and 26.1k rather
   than 18.0k and 27.8k). The runtime threads used about 100% between
@@ -8508,9 +8508,9 @@ section 14 records.
 | Query on a follower, applied | p50 0.20–0.23 ms, p99 0.28–0.34 ms at 2k/s; p50 0.12–0.14, p99 0.22 at 6k/s. The follower's marginal CPU 86–92 µs a query. Three runs: two over HTTP, one over HTTPS | ≤ 100 µs: the node's path (in process: median 51 µs, p99 151 µs) |
 | Query on a follower, linearizable | p50 0.36 ms, p99 0.87 ms at 2k/s; p50 0.41, p99 1.25 at 6k/s. The follower's marginal CPU 244 µs a query; the leader about 110 µs a query at 6k/s | (item 13) |
 | 1,000 idle groups per node, beside the agent rows' | 1.0–1.2% of one core, 17 threads, 490–513 MiB | ≤ 5%: passes |
-| Failover, 64 agents under load (second run) | a leader for every agent 2.73 s after the kill; every directory 2.74 s (a sweep: 0.01 s) | 6 s, then 1 s: passes |
+| Failover, the 64 agents just after their load rows ended (second run; the kill comes once the load is over) | a leader for every agent 2.73 s after the kill; every directory 2.74 s (a sweep: 0.01 s) | 6 s, then 1 s: passes |
 | Failover, 1,000 idle agents a node (second run) | 2.57 s; 2.64 s (a sweep: 0.07 s) | passes |
-| Soak, 30 min at 6k/s on the 64 agents, on this build (3.10b3's two 30-minute soaks held too: 777 and 835 µs per commit, p99 5.0 and 5.8 ms) | holds: p50 2.80 → 2.83 ms, p95 3.19 → 3.22 ms, CPU per commit 615 → 628 µs, no runtime stall, 900 MiB a node | ±10%: holds |
+| Soak, 30 min at 6k/s on the 64 agents, on this build (3.10b3's two 30-minute soaks held too: 777 and 835 µs per commit, p99 5.0 and 5.8 ms) | holds on what it judges: p50 2.80 → 2.83 ms, p95 3.19 → 3.22 ms, CPU per commit 615 → 628 µs, no runtime stall. Not judged: 43.6 batches of 49 ms or more a window (the longest 197 ms), and memory, 900 MiB a node at 30 minutes against about 490 MiB at 5 in 3.10b3, growing with the run's sessions, which expire only after an hour | ±10% on CPU per commit, p50, p95 and stalls: holds |
 
 **What the rows add:**
 - **A linearizable read's round** (item 13), the difference between the
@@ -8568,7 +8568,141 @@ section 14 records.
 | 1,000 idle groups: ≤ 5% of a core, no thread per group | **met:** 1.0–1.4%, 16–17 threads. |
 | Table read at 10M rows ≤ 5 µs, under continuous writes | **met** at the store: p99 3.70–3.81 µs under the 64-agent mix, two runs. |
 | Failover: a leader within 6 s, directories within 1 s more | **met:** 2.2–2.7 s; directories within 0.07 s, twice each at 64 agents and at 1,000 a node. |
-| Soak: no growth over 30 minutes | **holds:** 3.10b3's two soaks and this build's. |
-| Exactly-once | **holds:** the checker loop (48 runs) and the fault suite; every bench run's counters too. |
+| Soak: no growth over 30 minutes | **holds** on CPU per commit, p50, p95 and runtime stalls: 3.10b3's two soaks and this build's. Memory is not judged: it grows with sessions that live an hour, longer than the soak. |
+| Exactly-once | **holds:** the checker loop (seeds 601–612, both modes, twice: 48 runs), the fault suite (its default seed in `just ci`), and every bench run's counters. |
 
 "Awaiting" is not "passed": the end review weighs it as open.
+
+#### 3.10c The end review (Fable 5.1)
+
+**Verdict:** close slice 3 once its named fixes are in.
+- No path was found that loses an acknowledged write, applies twice,
+  diverges replicas, elects a stale leader or wedges a group, as the code
+  runs.
+- The budgets' verdicts are honest: nothing awaiting passes as passed.
+- `just ci-full` was green at `86e7f1c8` (124 suites).
+
+**Fixed, each reviewed by Opus:**
+1. **Blob collection never ran in the node.** `Blobs::collect` had no
+   caller outside tests. Only an install's entry names blobs (its
+   programs), so what stayed on every replica was:
+   - the programs of retired agents and replaced installs;
+   - the programs of installs that never committed.
+
+   That was unbounded disk, and against the plan's privacy statement.
+   - A thread of its own now collects every `blob_collect_every` (10
+     minutes), with a horizon of `blob_horizon` (an hour).
+   - Only a blob aged past the horizon and unpinned can go, so with none
+     a collection reads no log row. With one, it reads every live row,
+     which is why it stays off the node's one runtime thread.
+   - It stops between its steps when the node stops.
+   - It is stopped and joined before the writers it waits on.
+   - The pool test now collects every 100 ms: the retired node's store
+     drops the program, the pinning nodes keep it, and it is fetched
+     again once pinned again. Without the thread it fails.
+2. **The snapshot switch** checked its programs with `contains`, then
+   pinned them. A collection between the two could remove one, and the
+   new epoch would pin a blob gone. It now touches them (`Blobs::touch`),
+   which the blob writer orders with a collection's removals, as an
+   entry's blobs already were.
+3. **The simulation's `CommitConflict` check** compared, when a replica's
+   commit jumped, only the entry at its tip. It now compares every entry
+   from that replica's last checked index. A retirement or a crash resets
+   it, so entries committed again are compared again.
+4. **The host's vote floor** had no test at the host.
+   `a_replica_retired_twice_keeps_its_first_floor`:
+   - retires a replica;
+   - adds it again with no entry reaching it;
+   - retires it again;
+   - checks the floor row is the first retirement's.
+
+   Without the earlier floor's max it is (0, 0).
+5. **A call's lane relied on one runtime thread.** `next` releases the
+   lanes lock before the push. The hidden `--runtime-threads` option,
+   whose experiment measured worse and was never kept, is removed.
+6. **The plan's trailing clock:** it said a trailing leader hands over.
+   The code holds batch time at the stored time instead (3.5b). The plan
+   and the core model now state the cost: a liveness one, never a
+   replay.
+7. **Labels:** the failover row ran after the load, not under it; the
+   soak judges CPU per commit, p50, p95 and stalls, not memory; the
+   checker loop's seeds are named.
+
+**Found after the review: replicas could diverge.** While these fixes
+ran, the fault suite failed once in about 37 runs:
+
+```
+client 2: a read at node 2: Ran { outcome: Failed { code: 6 }, at: 3042 }
+```
+
+A follower answered UNKNOWN for an instance installed long before, at
+an applied index that holds it. Chasing it, Opus found the one path that
+yields that answer:
+- **The drop:** an install a follower abandons leaves its rows in its
+  epoch E: the replica became leader, the install sat idle for 30 s, or
+  a stage or switch was refused. A background task drops them, a pass at
+  a time, and goes on while E holds any row. (An install a newer stream
+  replaced was safe: its epoch was chosen past before its drop began.)
+- **The reuse:** `empty_epoch` chose the first epoch past the current
+  one that held no rows. Once a pass had emptied E, a new install could
+  take it, and the writer's check (a first stage only into an empty
+  epoch) let it.
+- **The loss:** the drop's next pass then removed the new install's
+  first chunk, the agent's system rows and its installed records among
+  them. The switch went ahead, and the replica held its applied index
+  without them. Queries answered UNKNOWN there, and a later leader there
+  would refine on that state.
+
+The fix:
+- **A mark:** the node counts the drops running on each agent's epoch.
+  An epoch is marked before its drop is spawned, and unmarked when the
+  drop ends. `drop_stale_epochs` marks every epoch it will drop before
+  the first.
+- **Its use:** `empty_epoch` skips a marked epoch.
+- **The test:** `an_epoch_being_dropped_takes_no_install` stages rows
+  into epoch 1, marks it, empties it with one pass, and checks epoch 1
+  is not chosen until the mark goes. Without the skip it is chosen. It
+  also checks a retirement's drops are marked before their first pass.
+- **Carried:** a guard before the switch that counts the rows the chunks
+  delivered against the rows under the staged epoch, so any such loss
+  in future makes a fresh stream rather than a silent divergence.
+
+The path fits every observation:
+- the applied index came from the query's own snapshot;
+- no blob was missing;
+- DropEpoch never touches the current epoch.
+
+The failure did not recur, in 36 runs before the fix, so the path is
+not confirmed as its cause; the race is real either way. The
+review found no path that diverges replicas in what it read; this one
+sat in the snapshot install's cleanup.
+
+**Carried, by name:**
+- **A message whose handler fails in refine alone** is dropped without an
+  acknowledgement (`leader.rs`, `fail`), so its sender resends it every
+  round, forever. Noise, not a double effect: pair marks never move for
+  it. Slice 4's workflows meet it first.
+- **The simulation's crash model** keeps a random part of the unsynced
+  writes, never a longer prefix, and has no blob store of its own. The
+  open-time cut at a missing blob is covered by `blob_crash` alone.
+- **Directory writes under the `recording` lock** are synced one at a
+  time. A node losing the leader of hundreds of groups writes hundreds
+  of placements in a row: free on tmpfs.
+  - On this laptop's NVMe, with the stores under `target/`:
+    - 1,000 idle agents a node, 339 led by the node killed: a leader for
+      every agent at 2.78 s, every directory at 2.85 s;
+    - the 64 agents: 2.33 s and 2.34 s.
+  - The gate's second (1 s) holds on this disk. A slower disk, or a
+    node leading thousands of groups, would need the lock gone or the
+    writes grouped.
+- **The fault suite** passes seeds 11–20 on the final code, and the
+  checker loop seeds 601–612 in both modes.
+- The one `NoAgent` after a restart (3.10b), and a restarted node
+  listening 3–6 s after a kill under load: unexplained.
+- **Before master** (the owner's cleanup, with Fable's list):
+  - vos-raft's legacy driver (`worker.rs` and its tests);
+  - the retirement-confirmation subprotocol, which the host bypasses;
+  - the lsm-tree vendoring, as a fork with a patch, and its two
+    `#[ignore]` tests;
+  - the host's single-implementation traits and duplicated loops;
+  - `spikes/` and the drafts.

@@ -319,9 +319,10 @@ What the blob path requires:
 - **Accumulate resolves a reference to its bytes** before it runs: a
   read on the apply path, off the journal.
 - **Collection:**
-  - A blob is referenced by log entries, by installed programs across
-    every agent (one blob, many pins), and by blobs a leader sent ahead of
-    appends still in flight.
+  - A blob is referenced by log entries, and by installed programs
+    across every agent (one blob, many pins). A blob a leader sent ahead
+    of its append, or an install's programs before their entry is
+    written, is kept by the horizon alone.
   - An unreferenced blob is garbage only after a horizon, since its append
     may be in flight. Blobs sent ahead by a leader that died, and blobs of
     a truncated suffix, become such orphans.
@@ -518,10 +519,15 @@ usually its own no-op, or compacted away. So:
 - refine never goes below it, and accumulate refuses a result that does;
 - nodes are kept within seconds of each other (NTP), an assumption the
   plan states;
-- a leader whose clock trails the stored time by more than a bound hands
-  over leadership. A fast clock otherwise pushes batch time ahead for
-  every later leader, and a slow one freezes it. Once the gap passes the
-  skew, every new session is refused until real time catches up.
+- a leader whose clock trails the stored time keeps leading, its batches
+  timed at the stored time, and logs an error past a bound (10 s). A fast
+  clock pushes batch time ahead for every later leader, and a slow one
+  freezes it: until real time catches up, sessions do not expire,
+  collection does not advance, and once the live-session cap is reached
+  new sessions are refused. Time never goes back, so nothing replays; the
+  cost is liveness only. (Handing leadership over was planned, and
+  dropped in step 3.5b's design: after a fast clock led, every replica
+  trails, so a transfer would flap.)
 - **Lane logic** runs only on the leader (above).
 
 ### What a client reveals, and how to reveal less
