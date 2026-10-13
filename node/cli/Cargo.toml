@@ -42,4 +42,5 @@ tempfile = "3"
 
 [[bench]]
 name = "processes"
+path = "benches/processes/main.rs"
 harness = false
