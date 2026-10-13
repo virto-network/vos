@@ -1,10 +1,10 @@
 //! Groups of protocol cores over a simulated network and stores
 //! (`vos_raft::sim`), checked for Raft's safety properties under faults:
 //! one leader per term, one entry per committed index, no commit past a
-//! replica's log. Every run is seeded; a failing seed replays exactly.
+//! replica's log, no compaction past its commit. Every run is seeded; a
+//! failing seed replays exactly.
 
-#![cfg(feature = "std")]
-
+use vos_raft::Role;
 use vos_raft::sim::{Cluster, Faults};
 
 const NODES: [u16; 3] = [1, 2, 3];
@@ -43,6 +43,46 @@ fn read_index_answers_once_the_leader_is_confirmed() {
     let index = cluster.reads[&token].expect("a read index");
     assert!(index >= cluster.committed_index().min(index));
     assert!(index >= 2, "the term's no-op and the proposal");
+}
+
+/// Cut in two, a group has a leader on its majority side only, which goes
+/// on committing: the minority never gathers a quorum.
+#[test]
+fn partitioned_minority_loses_quorum_majority_keeps_a_leader() {
+    let all = [1, 2, 3, 4, 5];
+    let mut cluster = Cluster::new(&all, 4, Faults::default());
+    cluster.network.isolate(&[4, 5], &all);
+    let leader = settle(&mut cluster);
+    cluster.run(2_000);
+    let leading: Vec<u16> = all
+        .into_iter()
+        .filter(|&node| cluster.core(node).unwrap().role() == Role::Leader)
+        .collect();
+    assert_eq!(leading, [leader]);
+    assert!([1, 2, 3].contains(&leader));
+    cluster.propose(leader, vec![7]);
+    cluster.run(200);
+    assert_eq!(cluster.committed_payloads(), [vec![7]]);
+    assert!(cluster.violations.is_empty(), "{:?}", cluster.violations);
+}
+
+/// A follower cut off from its group asks for pre-votes it never gets: its
+/// term stays put, and so does the leader's.
+#[test]
+fn isolated_follower_does_not_inflate_term_under_pre_vote() {
+    let mut cluster = Cluster::new(&NODES, 5, Faults::default());
+    let leader = settle(&mut cluster);
+    let isolated = NODES.into_iter().find(|&node| node != leader).unwrap();
+    let terms = |cluster: &Cluster| {
+        [leader, isolated].map(|node| cluster.core(node).unwrap().status().current_term)
+    };
+    let before = terms(&cluster);
+    cluster.network.isolate(&[isolated], &NODES);
+    // Ten election timeouts and more.
+    cluster.run(3_000);
+    assert_eq!(terms(&cluster), before);
+    assert_eq!(cluster.leader(), Some(leader));
+    assert!(cluster.violations.is_empty(), "{:?}", cluster.violations);
 }
 
 /// A voter removed while it is down never acknowledges its removal, and

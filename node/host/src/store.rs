@@ -1732,6 +1732,39 @@ mod tests {
         }
     }
 
+    /// A switch writes, in its one batch, the Raft rows a replica recovers
+    /// with its state: the hard state, the log's start, and the membership
+    /// in effect there and now.
+    #[test]
+    fn a_switch_writes_the_raft_rows_it_recovers_with() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Fjall::open(dir.path()).unwrap();
+        let membership = Membership {
+            index: Some(30),
+            members: vec![1, 2, 4],
+            joint_old: None,
+        };
+        let at_start = Membership {
+            index: Some(12),
+            members: vec![1, 2, 3],
+            joint_old: None,
+        };
+        let switch = Switch {
+            membership: membership.clone(),
+            log_start_membership: Some(at_start.clone()),
+            ..switch_to(1, 37)
+        };
+        let mut batch = store.batch();
+        batch.switch(B, &switch);
+        batch.commit(Durability::Synced).unwrap();
+        let rows = store.raft(B).unwrap();
+        assert_eq!(rows.hard, switch.hard);
+        assert_eq!(rows.log_start, (37, 2));
+        assert_eq!(rows.applied, 37);
+        assert_eq!(rows.membership, Some(membership));
+        assert_eq!(rows.log_start_membership, Some(at_start));
+    }
+
     /// An export of one agent, staged under a new epoch of another and
     /// switched to, gives the second the first's state; a snapshot taken
     /// before the switch keeps reading the old epoch; the old epoch's rows

@@ -35,7 +35,6 @@ use crate::log_view::LogView;
 use crate::message::{AppendResult, Message};
 use crate::meta::Meta;
 use crate::role::Role;
-use crate::storage::ActiveConfigRecord;
 
 /// Why a proposal was not appended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,7 +42,7 @@ use crate::storage::ActiveConfigRecord;
 pub enum ProposeError {
     /// This replica is not the leader, or is handing leadership over.
     NotLeader,
-    /// The replica's driver stopped (its store failed, or it shut down).
+    /// The replica's host stopped it (its store failed, or it shut down).
     /// The core never returns it.
     Stopped,
 }
@@ -59,7 +58,7 @@ pub enum ReadIndexError {
     Backpressure,
     /// The read's deadline passed first.
     TimedOut,
-    /// The replica's driver stopped. The core never returns it.
+    /// The replica's host stopped it. The core never returns it.
     Stopped,
 }
 
@@ -71,7 +70,7 @@ pub enum ChangeMembershipError {
     /// Another change is still in progress.
     InProgress,
     EmptyConfig,
-    /// The replica's driver stopped. The core never returns it.
+    /// The replica's host stopped it. The core never returns it.
     Stopped,
 }
 
@@ -164,6 +163,20 @@ pub struct SnapshotConfiguration<N: NodeId> {
     pub members: Vec<N>,
     pub joint_old: Option<Vec<N>>,
     pub index: u64,
+}
+
+/// Durable active-membership view.
+///
+/// `log_index` identifies the log/snapshot boundary that made this view
+/// effective. Consumers must compare it with the durable `commit_index`
+/// before treating exclusion from the view as a committed removal.
+/// `None` represents unknown provenance and must not be used as proof of a
+/// committed removal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveConfigRecord<N: NodeId> {
+    pub log_index: Option<u64>,
+    pub current: Vec<N>,
+    pub joint_old: Option<Vec<N>>,
 }
 
 /// The rows a host's snapshot switch writes in the same atomic batch as

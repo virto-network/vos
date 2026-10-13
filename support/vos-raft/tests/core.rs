@@ -1,9 +1,10 @@
 //! The protocol core, driven directly: what it claims, applies and sends,
 //! write by write. Cluster behaviour under faults is in `tests/simulated.rs`.
 
-#![cfg(feature = "std")]
-
-use vos_raft::core::{Action, Answer, Core, ProposeError, Recovered, SnapshotConfiguration, Write};
+use vos_raft::core::{
+    Action, Answer, ChangeMembershipError, Core, ProposeError, ReadIndexError, Recovered,
+    SnapshotConfiguration, Write,
+};
 use vos_raft::{
     ActiveConfigRecord, AppendResult, Config, EntryKind, LogEntry, Message, Meta, Role,
 };
@@ -13,7 +14,7 @@ const LEADER_B: u16 = 3;
 const ME: u16 = 1;
 
 fn config() -> Config<u16> {
-    let mut cfg = Config::new(ME, vec![ME, LEADER_A, LEADER_B], [0; 32]);
+    let mut cfg = Config::new(ME, vec![ME, LEADER_A, LEADER_B]);
     cfg.election_timeout_ms = (150, 300);
     cfg.heartbeat_interval_ms = 50;
     cfg
@@ -1747,4 +1748,307 @@ fn large_entries_make_a_compaction_due_by_their_bytes() {
     assert_eq!(compact_bounds(&core.take_actions()), [6]);
     // The tail's entry count bounds it as well.
     assert_eq!(core.compaction_point(6, 1, 700), 5);
+}
+
+/// The read answers in `actions`, as (token, result).
+fn reads(actions: &[Action<u16>]) -> Vec<(u64, Result<u64, ReadIndexError>)> {
+    actions
+        .iter()
+        .filter_map(|action| match action {
+            Action::Answer(Answer::ReadIndex { token, result }) => Some((*token, *result)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// An answer, in heartbeat `round`, that the peer holds through `matched`.
+fn matched_in(round: u64, matched: u64) -> Message<u16> {
+    Message::AppendAnswer {
+        term: 1,
+        round,
+        commit: 0,
+        result: AppendResult::Matched { matched },
+    }
+}
+
+/// A read resolves only on answers to a round sent after it was asked: an
+/// answer to an earlier round proves leadership only as of then, and a
+/// newer leader may have committed since.
+#[test]
+fn read_index_ignores_answers_to_heartbeats_sent_before_it() {
+    let mut core = idle_leader_of_three();
+    core.read_index(1, None);
+    let [(_, first)] = commits_to(&core.take_actions(), LEADER_A)[..] else {
+        panic!("one heartbeat to A");
+    };
+    core.read_index(2, None);
+    let [(_, second)] = commits_to(&core.take_actions(), LEADER_A)[..] else {
+        panic!("one heartbeat to A");
+    };
+    // Both answers to the first round land after the second read was asked.
+    for peer in [LEADER_A, LEADER_B] {
+        core.receive(peer, matched_in(first, 1));
+    }
+    assert_eq!(reads(&core.take_actions()), [(1, Ok(1))]);
+    core.receive(LEADER_A, matched_in(second, 1));
+    assert_eq!(reads(&core.take_actions()), [(2, Ok(1))]);
+}
+
+#[test]
+fn read_index_returns_backpressure_when_queue_full() {
+    let mut core = leader_of_two_with(|cfg| cfg.max_pending_reads = 2);
+    let mut actions = Vec::new();
+    for token in 1..=3 {
+        core.read_index(token, None);
+        actions.extend(core.take_actions());
+    }
+    assert_eq!(reads(&actions), [(3, Err(ReadIndexError::Backpressure))]);
+    // A answers the latest round: the queue drains, and takes reads again.
+    let round = commits_to(&actions, LEADER_A).last().unwrap().1;
+    core.receive(LEADER_A, matched_in(round, 1));
+    assert_eq!(reads(&core.take_actions()), [(1, Ok(1)), (2, Ok(1))]);
+    core.read_index(4, None);
+    assert!(reads(&core.take_actions()).is_empty());
+}
+
+/// A leader cut off from its group steps down at check-quorum, and answers
+/// every read it holds that it stepped down.
+#[test]
+fn read_index_returns_leader_stepped_on_partition_step_down() {
+    let mut core = leader_of_two();
+    core.read_index(1, None);
+    core.take_actions();
+    core.tick(1_000 + 310);
+    let actions = core.take_actions();
+    assert_eq!(core.role(), Role::Follower);
+    assert_eq!(reads(&actions), [(1, Err(ReadIndexError::LeaderStepped))]);
+}
+
+#[test]
+fn pre_candidate_reverts_to_follower_after_consecutive_misses() {
+    let mut cfg = config();
+    cfg.pre_candidate_misses_before_revert = 2;
+    let mut core = Core::new(cfg, Recovered::default(), 0, 5);
+    // No pre-vote is ever answered.
+    let mut roles = Vec::new();
+    for _ in 0..3 {
+        core.tick(core.next_deadline());
+        core.take_actions();
+        roles.push(core.role());
+    }
+    assert_eq!(
+        roles,
+        [Role::PreCandidate, Role::PreCandidate, Role::Follower]
+    );
+    assert_eq!(core.status().current_term, 0);
+}
+
+/// Any answer at a higher term deposes a leader, which adopts the term
+/// durably.
+#[test]
+fn leader_steps_down_on_higher_term_append_response() {
+    let mut core = leader_of_two();
+    core.receive(
+        LEADER_A,
+        Message::AppendAnswer {
+            term: 99,
+            round: 1,
+            commit: 0,
+            result: AppendResult::Rejected {
+                rejected: 0,
+                last_index: 0,
+                conflict_term: 0,
+                conflict_first: 0,
+            },
+        },
+    );
+    let actions = core.take_actions();
+    assert_eq!(
+        (core.role(), core.status().current_term),
+        (Role::Follower, 99)
+    );
+    let write = writes(&actions).last().expect("the term's write").clone();
+    assert!(write.sync);
+    assert_eq!(write.meta.map(|meta| meta.current_term), Some(99));
+}
+
+#[test]
+fn candidate_steps_down_on_higher_term_vote_response() {
+    let mut cfg = config();
+    cfg.pre_vote = false;
+    let mut core = Core::new(cfg, Recovered::default(), 0, 5);
+    core.tick(1_000);
+    core.take_actions();
+    assert_eq!(core.role(), Role::Candidate);
+    core.receive(
+        LEADER_A,
+        Message::VoteAnswer {
+            term: 99,
+            granted: false,
+        },
+    );
+    core.take_actions();
+    assert_eq!(
+        (core.role(), core.status().current_term),
+        (Role::Follower, 99)
+    );
+}
+
+/// A membership change starts only at a leader, with members, and while no
+/// other change is in progress.
+#[test]
+fn change_membership_is_refused_off_a_leader_empty_or_in_progress() {
+    let change = |core: &mut Core<u16>, token, members| {
+        core.change_membership(token, members);
+        core.take_actions()
+            .into_iter()
+            .find_map(|action| match action {
+                Action::Answer(Answer::ChangeMembership { result, .. }) => Some(result),
+                _ => None,
+            })
+            .expect("an answer")
+    };
+    let mut not_leader = follower(1, &[1], 1);
+    assert_eq!(
+        change(&mut not_leader, 1, vec![ME, LEADER_A]),
+        Err(ChangeMembershipError::NotLeader)
+    );
+    let mut leader = leader_of_two();
+    assert_eq!(
+        change(&mut leader, 2, Vec::new()),
+        Err(ChangeMembershipError::EmptyConfig)
+    );
+    assert!(change(&mut leader, 3, vec![ME, LEADER_A, LEADER_B]).is_ok());
+    assert_eq!(
+        change(&mut leader, 4, vec![ME, LEADER_A]),
+        Err(ChangeMembershipError::InProgress)
+    );
+}
+
+/// A replayed append, shorter than one already taken, leaves the log as it
+/// is: every entry it carries is already there.
+#[test]
+fn stale_append_entries_does_not_regress_follower_log() {
+    let mut core = follower(5, &[], 0);
+    let entries = [(1, 5), (2, 5), (3, 5)];
+    core.receive(LEADER_A, append(5, LEADER_A, (0, 0), 0, &entries));
+    core.take_actions();
+    core.receive(LEADER_A, append(5, LEADER_A, (0, 0), 0, &entries[..2]));
+    let actions = core.take_actions();
+    assert!(
+        writes(&actions)
+            .iter()
+            .all(|write| write.truncate_after.is_none()),
+        "{actions:?}"
+    );
+    assert_eq!(core.status().last_log_index, 3);
+}
+
+fn record(
+    log_index: Option<u64>,
+    current: Vec<u16>,
+    joint_old: Option<Vec<u16>>,
+) -> ActiveConfigRecord<u16> {
+    ActiveConfigRecord {
+        log_index,
+        current,
+        joint_old,
+    }
+}
+
+/// A truncation that removes the entry the membership record came from
+/// writes the record again: a restart must not adopt a configuration no
+/// entry backs.
+#[test]
+fn truncate_dropping_originating_config_change_invalidates_persisted_view() {
+    let grown = vec![ME, LEADER_A, LEADER_B, JOINER];
+    let recovered = Recovered {
+        meta: Meta {
+            current_term: 1,
+            ..Meta::default()
+        },
+        entries: vec![LogEntry::config_change(1, 1, None, grown.clone())],
+        active_config: Some(record(Some(1), grown.clone(), None)),
+        ..Recovered::default()
+    };
+    let mut core = Core::new(config(), recovered, 0, 7);
+    core.take_actions();
+    assert_eq!(core.status().members, grown);
+    // A leader of term 5 replaces entry 1 with data.
+    core.receive(LEADER_A, append(5, LEADER_A, (0, 0), 0, &[(1, 5)]));
+    let records: Vec<_> = writes(&core.take_actions())
+        .into_iter()
+        .filter_map(|write| write.active_config)
+        .collect();
+    let members = vec![ME, LEADER_A, LEADER_B];
+    assert_eq!(records, [record(Some(0), members.clone(), None)]);
+    assert_eq!(core.status().members, members);
+}
+
+/// A snapshot switch records the membership in effect at the snapshot: the
+/// one it carries; else the replica's, with its entry's index only if that
+/// entry committed, since an uncommitted one may yet be replaced.
+#[test]
+fn a_snapshot_switch_records_the_membership_in_effect() {
+    let three = vec![ME, LEADER_A, LEADER_B];
+    let mut cfg = config();
+    cfg.members = vec![ME];
+    // A configuration committed at 5, which the switch compacts away.
+    let committed = Recovered {
+        meta: Meta {
+            current_term: 1,
+            voted_for: None,
+            commit_index: 6,
+            snap_last_index: 4,
+            snap_last_term: 1,
+        },
+        entries: vec![
+            LogEntry::config_change(5, 1, None, three.clone()),
+            LogEntry::data(6, 1, vec![]),
+        ],
+        active_config: Some(record(Some(5), three.clone(), None)),
+        applied: 6,
+        ..Recovered::default()
+    };
+    let core = Core::new(cfg.clone(), committed, 0, 7);
+    let switch = core.snapshot_switch(10, 5, None);
+    assert_eq!(switch.active_config, record(Some(5), three.clone(), None));
+    assert!(switch.meta.commit_index >= 10);
+    // A fresh replica takes the snapshot's own.
+    let fresh = Core::new(cfg, Recovered::default(), 0, 7);
+    let carried = SnapshotConfiguration {
+        members: three.clone(),
+        joint_old: None,
+        index: 37,
+    };
+    let switch = fresh.snapshot_switch(100, 6, Some(&carried));
+    assert_eq!(switch.active_config, record(Some(37), three, None));
+    assert!(switch.meta.commit_index >= 100);
+    // A joint configuration appended at 5, committed only through 2.
+    let speculative = Recovered {
+        meta: Meta {
+            current_term: 3,
+            commit_index: 2,
+            ..Meta::default()
+        },
+        entries: (1..=4)
+            .map(|index| LogEntry::data(index, 3, vec![]))
+            .chain([LogEntry::config_change(
+                5,
+                3,
+                Some(vec![LEADER_A]),
+                vec![ME, LEADER_A],
+            )])
+            .collect(),
+        active_config: Some(record(Some(5), vec![ME, LEADER_A], Some(vec![LEADER_A]))),
+        applied: 2,
+        ..Recovered::default()
+    };
+    let core = Core::new(config(), speculative, 0, 7);
+    let switch = core.snapshot_switch(10, 3, None);
+    assert_eq!(
+        switch.active_config,
+        record(None, vec![ME, LEADER_A], Some(vec![LEADER_A]))
+    );
+    assert_eq!(switch.meta.commit_index, 10);
 }

@@ -1,7 +1,0 @@
-# Seeds for failure cases proptest has generated in the past. It is
-# automatically read and these particular cases re-run before any
-# novel cases are generated.
-#
-# It is recommended to check this file in to source control so that
-# everyone who runs the test benefits from these saved cases.
-cc 208db59c289419341fa7324327dfe251753cbb20daa594a9efefdcd6a64a3ce3 # shrinks to seed = 0, ops = [Append { from: 48059, term: 0, prev_log_index: 0, prev_log_term: 0, leader_commit: 0, n_entries: 1 }, Append { from: 48059, term: 11, prev_log_index: 0, prev_log_term: 1, leader_commit: 0, n_entries: 0 }, Append { from: 48059, term: 11, prev_log_index: 0, prev_log_term: 0, leader_commit: 0, n_entries: 1 }]

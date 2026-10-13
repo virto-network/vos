@@ -23,9 +23,6 @@ pub struct Config<N: NodeId> {
     pub election_timeout_ms: (u64, u64),
     /// A leader's heartbeat interval in milliseconds. Default: 50.
     pub heartbeat_interval_ms: u64,
-    /// A transport's routing key for the group. Nothing reads it but the
-    /// thread-per-group driver's transports.
-    pub replication_id: [u8; 32],
     /// Entries through the compaction bound, the lower of the commit and
     /// what the host applied durably, past the log's start that make a
     /// compaction due. Default: 16.
@@ -37,16 +34,10 @@ pub struct Config<N: NodeId> {
     /// Ask for pre-votes before an election, so a flapping partition does
     /// not inflate terms. Default: `true`.
     pub pre_vote: bool,
-    /// The most bytes in one `InstallSnapshot` chunk, for the
-    /// thread-per-group driver. Default: 32 KiB.
-    pub install_snapshot_chunk_bytes: usize,
     /// The most reads a leader holds; more are refused with
     /// [`ReadIndexError::Backpressure`](crate::core::ReadIndexError::Backpressure).
     /// Default: 1024.
     pub max_pending_reads: usize,
-    /// The most bytes a follower buffers assembling a chunked snapshot,
-    /// for the thread-per-group driver. Default: 512 MiB.
-    pub max_snapshot_bytes: usize,
     /// Pre-vote rounds that may time out before a pre-candidate reverts to
     /// follower; `0` never reverts. Default: 3.
     pub pre_candidate_misses_before_revert: u32,
@@ -76,19 +67,16 @@ pub struct Config<N: NodeId> {
 
 impl<N: NodeId> Config<N> {
     /// A configuration with every default.
-    pub fn new(me: N, members: Vec<N>, replication_id: [u8; 32]) -> Self {
+    pub fn new(me: N, members: Vec<N>) -> Self {
         Self {
             me,
             members,
             election_timeout_ms: (150, 300),
             heartbeat_interval_ms: 50,
-            replication_id,
             compact_hysteresis: 16,
             compact_bytes: 64 << 20,
             pre_vote: true,
-            install_snapshot_chunk_bytes: 32 * 1024,
             max_pending_reads: 1024,
-            max_snapshot_bytes: 512 * 1024 * 1024,
             pre_candidate_misses_before_revert: 3,
             max_append_bytes: 1 << 20,
             resend_timeout_ms: 1_000,

@@ -6,7 +6,7 @@
 //!   by one seeded generator, so a failing seed replays exactly.
 //! - [`Store`] is one node's durable state with a queue of unsynced writes
 //!   and compactions; a crash keeps any prefix of them. A snapshot switch
-//!   is durable at once, as the driver's is.
+//!   is durable at once.
 //! - [`Cluster`] runs one [`Core`] per node over both, carries snapshots
 //!   between them, and checks Raft's safety properties as it goes, and
 //!   every answered read index against what was committed when the read
@@ -17,13 +17,15 @@ use alloc::vec::Vec;
 use core::cmp::Reverse;
 
 use crate::config::{Config, NodeId};
-use crate::core::{Action, Answer, Core, Recovered, SnapshotConfiguration, SnapshotSwitch, Write};
+use crate::core::{
+    Action, ActiveConfigRecord, Answer, Core, Recovered, SnapshotConfiguration, SnapshotSwitch,
+    Write,
+};
 use crate::log_entry::{EntryKind, LogEntry};
 use crate::message::Message;
 use crate::meta::Meta;
 use crate::pair::PeerTable;
 use crate::role::Role;
-use crate::storage::ActiveConfigRecord;
 
 /// A small, seeded generator.
 #[derive(Debug, Clone)]
@@ -365,6 +367,8 @@ pub enum Violation {
     CommitBeyondLog { index: u64 },
     /// A read index below what was committed when the read was asked.
     StaleRead { index: u64, committed: u64 },
+    /// A replica compacted past its commit index.
+    SnapshotPastCommit { snapshot: u64, commit: u64 },
 }
 
 /// Replicas of one group over a simulated network and stores.
@@ -447,7 +451,7 @@ impl Cluster {
         faults: Faults,
         adjust: impl FnOnce(&mut Config<u16>),
     ) -> Self {
-        let mut cfg = Config::new(nodes[0], nodes.to_vec(), [0; 32]);
+        let mut cfg = Config::new(nodes[0], nodes.to_vec());
         cfg.election_timeout_ms = (150, 300);
         cfg.heartbeat_interval_ms = 50;
         cfg.resend_timeout_ms = 100;
@@ -871,6 +875,13 @@ impl Cluster {
         if let Some(through) = synced.compacted {
             self.compactions += 1;
             core.compacted(through);
+            let status = core.status();
+            if status.snap_last_index > status.commit_index {
+                self.violations.push(Violation::SnapshotPastCommit {
+                    snapshot: status.snap_last_index,
+                    commit: status.commit_index,
+                });
+            }
         }
         self.process(node);
     }

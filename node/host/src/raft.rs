@@ -602,7 +602,7 @@ mod tests {
     }
 
     fn config(me: NodeNumber, compact_hysteresis: u64) -> Config<NodeNumber> {
-        let mut cfg = Config::new(me, NODES.to_vec(), [0; 32]);
+        let mut cfg = Config::new(me, NODES.to_vec());
         cfg.election_timeout_ms = (150, 300);
         cfg.heartbeat_interval_ms = 50;
         cfg.compact_hysteresis = compact_hysteresis;

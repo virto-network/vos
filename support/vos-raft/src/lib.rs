@@ -1,7 +1,6 @@
 //! # vos-raft
 //!
-//! Raft consensus as a protocol core without I/O, plus a driver that runs
-//! one replica of it.
+//! Raft consensus as a protocol core without I/O, on `core + alloc`.
 //!
 //! ## Concepts
 //!
@@ -9,34 +8,37 @@
 //!   feeds it events (messages, proposals, ticks, write completions) and
 //!   carries out the actions it returns (ordered writes, messages, loads,
 //!   commit notifications, answers). It reads no clock and does no I/O, so
-//!   one host can drive thousands of groups. `no_std + alloc`.
+//!   one host can drive thousands of groups.
 //! - [`Message`]: the one-way protocol messages between replicas.
-//! - [`Worker`] / [`WorkerHandle`] (std): a driver for one replica, with a
-//!   [`Storage`], a [`Transport`], a [`Clock`] and an [`ApplySink`]; it
-//!   also streams snapshots, which the core leaves to its host.
+//! - [`sim`]: groups of cores over a simulated network and stores, checked
+//!   for Raft's safety properties under faults.
 //!
-//! ## Std-feature quickstart
+//! ## A group of one
 //!
 //! ```
-//! use std::sync::Arc;
-//! use vos_raft::{Config, Envelope, MemStorage, Transport, Worker};
+//! use vos_raft::core::{Action, Core, Recovered};
+//! use vos_raft::{Config, Role};
 //!
-//! struct NoopT;
-//! impl Transport<u16> for NoopT {
-//!     fn send(&self, _from: u16, _to: u16, _envelope: Envelope<u16>) {}
+//! // A lone member campaigns at its first tick, and leads once its term
+//! // and vote are durable.
+//! let mut core = Core::new(Config::new(1u16, vec![1]), Recovered::default(), 0, 7);
+//! core.tick(0);
+//! for action in core.take_actions() {
+//!     if let Action::Write(write) = action {
+//!         // The host writes it to its store, then reports it.
+//!         core.durable(write.seq);
+//!         core.entries_durable(write.seq);
+//!     }
 //! }
-//! // A one-member group elects itself.
-//! let mut cfg = Config::new(0xAAAA, vec![0xAAAA], [0xC0; 32]);
-//! cfg.election_timeout_ms = (10, 30);
-//! let worker = Worker::spawn(MemStorage::<u16>::new(), Arc::new(NoopT), cfg, None);
-//! worker.shutdown();
+//! assert_eq!(core.role(), Role::Leader);
 //! ```
+//!
+//! `tests/core.rs` drives the core write by write.
 
-#![cfg_attr(not(feature = "std"), no_std)]
+#![no_std]
 
 extern crate alloc;
 
-pub mod clock;
 pub mod config;
 pub mod core;
 pub mod log_entry;
@@ -45,34 +47,11 @@ pub mod message;
 pub mod meta;
 pub mod pair;
 pub mod role;
-pub mod rpc;
-#[cfg(feature = "std")]
 pub mod sim;
-pub mod storage;
-pub mod transport;
 
-#[cfg(test)]
-pub(crate) mod testutil;
-
-#[cfg(feature = "std")]
-pub mod worker;
-
-#[cfg(feature = "tokio")]
-pub use clock::TokioClock;
-pub use clock::{ApplySink, Clock, Rng};
-#[cfg(feature = "std")]
-pub use clock::{StdClock, StdRng};
+pub use crate::core::ActiveConfigRecord;
 pub use config::{Config, NodeId};
 pub use log_entry::{EntryKind, LogEntry};
 pub use message::{AppendResult, Message};
 pub use meta::Meta;
 pub use role::Role;
-pub use rpc::{InstallSnapshotReq, InstallSnapshotResp};
-pub use storage::{ActiveConfigRecord, MemStorage, Storage, WriteBatch};
-pub use transport::{Envelope, Transport};
-
-#[cfg(feature = "std")]
-pub use worker::{
-    ChangeMembershipError, ProposeError, RaftMsg, ReadIndexError, Worker, WorkerHandle,
-    WorkerSnapshot,
-};

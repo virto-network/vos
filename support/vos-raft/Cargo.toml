@@ -1,38 +1,14 @@
 [package]
 name = "vos-raft"
-description = "Raft consensus as a protocol core without I/O (no_std + alloc), with a std driver and a deterministic simulator."
+description = "Raft consensus as a protocol core without I/O (no_std + alloc), with a deterministic simulator."
 keywords = ["raft", "consensus", "no-std", "distributed-systems", "vos"]
-categories = ["network-programming", "no-std", "asynchronous"]
+categories = ["network-programming", "no-std"]
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
-
-[features]
-default = ["std"]
-# `std` enables the `Worker` driver (a thread or a future per replica,
-# with a `futures-channel` inbox), `StdClock`, `StdRng` and the `sim`
-# simulator. Without it, the protocol core, the messages, the data types
-# and the traits compile on `core + alloc`.
-std = ["dep:futures-channel", "dep:futures-util", "dep:futures-executor"]
-# `tokio` enables `TokioClock` — a `Clock` impl that uses
-# `tokio::time::sleep_until` instead of `StdClock`'s per-`Delay`
-# thread spawning; drive it with `Worker::spawn_with_tokio_runtime`.
-# Implies `std`.
-tokio = ["std", "dep:tokio"]
-
-[dependencies]
-# Channels and `select!` — only used by the std-feature worker. Optional
-# so a no_std build pulls in nothing beyond core + alloc.
-futures-channel = { version = "0.3", optional = true, default-features = false, features = ["alloc", "std"] }
-futures-util = { version = "0.3", optional = true, default-features = false, features = ["alloc", "async-await-macro", "std"] }
-futures-executor = { version = "0.3", optional = true, default-features = false, features = ["std"] }
-# Tokio adapter — std-only, optional. Provides `TokioClock` plus
-# `Worker::spawn_with_tokio_runtime` (needs `rt` for the
-# current-thread runtime builder).
-tokio = { version = "1", optional = true, default-features = false, features = ["time", "rt"] }
 
 [dev-dependencies]
 # Property-based testing — random message sequences vs. Raft safety

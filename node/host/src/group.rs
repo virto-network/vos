@@ -383,7 +383,7 @@ impl Driver {
         // of them, so it never campaigns until the configuration naming it
         // reaches it.
         let members = shared.record.replicas.clone();
-        let mut config = RaftConfig::new(inner.number, members, shared.identity);
+        let mut config = RaftConfig::new(inner.number, members);
         config.election_timeout_ms = inner.election_timeout_ms;
         config.heartbeat_interval_ms = inner.heartbeat_ms;
         config.compact_hysteresis = inner.compact_every;

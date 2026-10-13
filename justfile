@@ -88,6 +88,11 @@ check-no-faults:
     cargo build -p vos-cli
     if ((^target/debug/vos --version) | str contains "faults") { error make { msg: "a plain build of vos injects faults" } } else { print "no faults in a plain build of vos" }
 
+# vos-raft builds for an embedded target, on core and alloc alone. Needs
+# `rustup target add thumbv7em-none-eabihf`.
+check-no-std:
+    cargo build -p vos-raft --target thumbv7em-none-eabihf
+
 # Checks before pushing: everything except proving.
 ci: fmt-check clippy jar-check test vectors test-bench test-agent check-no-faults
 

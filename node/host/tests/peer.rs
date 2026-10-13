@@ -635,12 +635,7 @@ fn drops_are_counted_by_why() {
 /// The space also configures node 4, which a change the replica has not
 /// seen yet made a member, and not node 5.
 fn replica() -> Core<NodeNumber> {
-    let mut core = Core::new(
-        Config::new(1, vec![1, 2, 3], [0; 32]),
-        Recovered::default(),
-        0,
-        3,
-    );
+    let mut core = Core::new(Config::new(1, vec![1, 2, 3]), Recovered::default(), 0, 3);
     core.take_actions();
     core
 }
