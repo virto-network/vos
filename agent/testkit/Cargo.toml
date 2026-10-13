@@ -4,15 +4,17 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "A native host for VOS actor programs: the reference model of the default agent."
+publish = false
 
 [dependencies]
 blake2 = "0.10"
 vos-pvm = { workspace = true }
+# For `programs` only: linking the guest programs tests and benches load.
+vos-pvm-compiler = { workspace = true }
 vos-wire = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"
-vos-pvm-compiler = { workspace = true }
 vos-pvm-program = { workspace = true }
 
 [[bench]]

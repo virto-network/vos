@@ -18,10 +18,10 @@
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
-use std::time::{Duration, SystemTime};
+use std::path::Path;
+use std::time::Duration;
 
+use vos_checker::crash::{Round, Rounds, tear};
 use vos_node::store::{Batch, Durability, Fjall, LogEntry, Store, View};
 use vos_wire::ids::{AgentId, InstanceId};
 use vos_wire::keys;
@@ -30,13 +30,18 @@ use vos_wire::result::Write;
 const AGENT: AgentId = AgentId(1);
 const WRITES: u64 = 200;
 const SLOTS: u64 = 5_000;
-const ROUNDS: usize = 12;
-/// Rounds from this one on tear the journal before reopening.
-const TORN_FROM: usize = 6;
+/// Twelve rounds, the last six tearing the journal before reopening.
+const ROUNDS: Rounds = Rounds {
+    writer: "VOS_CRASH_WRITER",
+    rounds: 12,
+    torn_from: 6,
+    report: "",
+    reports: 50,
+    kill_within: Duration::from_millis(3),
+};
 /// At most this many bytes are torn: less than one work result's batch,
 /// so a tear reaches at most the last two.
 const TEAR: u64 = 4096;
-const WRITER: &str = "VOS_CRASH_WRITER";
 
 fn slot_key(slot: u64) -> Vec<u8> {
     [
@@ -61,7 +66,7 @@ fn writes(index: u64) -> Vec<Write> {
     writes
 }
 
-fn writer(dir: &str) {
+fn writer(dir: &Path) {
     let store = Fjall::open(dir).unwrap();
     let mut index = store.snapshot().applied(AGENT).unwrap().unwrap_or(0);
     loop {
@@ -97,131 +102,61 @@ fn expected(applied: u64) -> BTreeMap<Vec<u8>, Vec<u8>> {
 }
 
 fn main() {
-    if let Ok(dir) = std::env::var(WRITER) {
-        writer(&dir);
-        return;
-    }
-    let dir = tempfile::tempdir().unwrap();
-    let mut seed = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64
-        | 1;
-    let mut random = move || {
-        seed ^= seed << 13;
-        seed ^= seed >> 7;
-        seed ^= seed << 17;
-        seed
-    };
-    let mut last: u64 = 0;
-    let mut tore = 0;
-    for round in 0..ROUNDS {
-        let mut child = Command::new(std::env::current_exe().unwrap())
-            .env(WRITER, dir.path())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
-        let wait = random() % 50;
-        let mut reported = last;
-        for _ in 0..wait {
-            reported = lines.next().unwrap().unwrap().parse().unwrap();
-        }
-        std::thread::sleep(Duration::from_micros(random() % 3_000));
-        child.kill().unwrap();
-        child.wait().unwrap();
-        // Lines the child printed before it died were committed too.
-        for line in lines {
-            reported = line.unwrap().parse().unwrap();
-        }
-        let torn = round >= TORN_FROM;
-        if torn && tear(dir.path(), round.is_multiple_of(2), &mut random) {
-            tore += 1;
-        }
-
-        let store = Fjall::open(dir.path()).unwrap();
-        let view = store.snapshot();
-        let applied = view.applied(AGENT).unwrap().unwrap_or(0);
-        // A tear reaches at most the last batch on disk, which may be one
-        // an earlier round committed.
-        let floor = if torn {
-            reported.saturating_sub(1)
-        } else {
-            reported
-        };
-        assert!(
-            applied >= floor,
-            "round {round}: applied {applied}, but {reported} was reported committed"
-        );
-        let state: BTreeMap<_, _> = view
-            .scan(AGENT, &keys::instance_prefix(InstanceId(0)), None)
-            .map(Result::unwrap)
-            .collect();
-        assert!(
-            state == expected(applied),
-            "round {round}: the state is not the prefix ending at {applied}"
-        );
-        assert_eq!(
-            store
-                .log_entry(AGENT, applied)
-                .unwrap()
-                .map(|entry| entry.body),
-            (applied > 0).then(|| applied.to_be_bytes().to_vec()),
-            "round {round}"
-        );
-        assert_eq!(
-            store.log_entry(AGENT, applied + 1).unwrap(),
-            None,
-            "round {round}"
-        );
-        let how = if torn { "killed and torn" } else { "killed" };
-        println!("round {round}: {how} after {reported}, recovered at {applied}");
-        last = applied;
-    }
-    assert!(tore > 0, "no torn round reached the journal's data");
-    println!("crash: {ROUNDS} rounds recovered one prefix each");
+    let mut last = 0;
+    ROUNDS.run(
+        writer,
+        |round, dir, random| tear(dir, Some("jnl"), TEAR, round.is_multiple_of(2), random),
+        |round| check(round, &mut last),
+    );
+    println!("crash: {} rounds recovered one prefix each", ROUNDS.rounds);
 }
 
-/// Truncate the newest journal's data by up to [`TEAR`] bytes, or zero up
-/// to its last [`TEAR`] bytes of data: whether it tore any. fjall
-/// preallocates its journals, so the data ends before the file does.
-fn tear(dir: &std::path::Path, truncate: bool, random: &mut impl FnMut() -> u64) -> bool {
-    let mut journals = Vec::new();
-    let mut pending = vec![dir.to_path_buf()];
-    while let Some(path) = pending.pop() {
-        for entry in std::fs::read_dir(&path).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                pending.push(path);
-            } else if path.extension().is_some_and(|extension| extension == "jnl") {
-                let id: u64 = path
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .and_then(|stem| stem.parse().ok())
-                    .unwrap_or(0);
-                journals.push((id, path));
-            }
-        }
-    }
-    let (_, journal) = journals.into_iter().max().expect("a journal");
-    let mut bytes = std::fs::read(&journal).unwrap();
-    let end = bytes
-        .iter()
-        .rposition(|&byte| byte != 0)
-        .map_or(0, |at| at + 1);
-    if end == 0 {
-        return false;
-    }
-    let reach = 1 + (random() % TEAR.min(end as u64)) as usize;
-    if truncate {
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&journal)
-            .unwrap();
-        file.set_len((end - reach) as u64).unwrap();
+/// The store recovered one prefix, at least through what the writer
+/// reported committed, or else through the index `last` recovered at.
+fn check(round: Round, last: &mut u64) {
+    let Round {
+        number: round,
+        dir,
+        reported,
+        torn,
+    } = round;
+    let reported = reported.unwrap_or(*last);
+    let store = Fjall::open(dir).unwrap();
+    let view = store.snapshot();
+    let applied = view.applied(AGENT).unwrap().unwrap_or(0);
+    // A tear reaches at most the last batch on disk, which may be one
+    // an earlier round committed.
+    let floor = if torn {
+        reported.saturating_sub(1)
     } else {
-        bytes[end - reach..end].fill(0);
-        std::fs::write(&journal, bytes).unwrap();
-    }
-    true
+        reported
+    };
+    assert!(
+        applied >= floor,
+        "round {round}: applied {applied}, but {reported} was reported committed"
+    );
+    let state: BTreeMap<_, _> = view
+        .scan(AGENT, &keys::instance_prefix(InstanceId(0)), None)
+        .map(Result::unwrap)
+        .collect();
+    assert!(
+        state == expected(applied),
+        "round {round}: the state is not the prefix ending at {applied}"
+    );
+    assert_eq!(
+        store
+            .log_entry(AGENT, applied)
+            .unwrap()
+            .map(|entry| entry.body),
+        (applied > 0).then(|| applied.to_be_bytes().to_vec()),
+        "round {round}"
+    );
+    assert_eq!(
+        store.log_entry(AGENT, applied + 1).unwrap(),
+        None,
+        "round {round}"
+    );
+    let how = if torn { "killed and torn" } else { "killed" };
+    println!("round {round}: {how} after {reported}, recovered at {applied}");
+    *last = applied;
 }

@@ -1,27 +1,18 @@
 //! The `vos` command end to end: a node, an operator and a client, as
 //! separate processes.
 
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
+use std::time::Duration;
 
-fn guest(path: &str) -> PathBuf {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../agent")
-        .join(path);
-    assert!(
-        path.exists(),
-        "{}: run `just build-agent build-test-actors`",
-        path.display()
-    );
-    path
-}
+use vos_checker::processes::{Running, Started, read_log, run};
+use vos_checker::programs::{actor_elf, agent, agent_elf};
+use vos_checker::wait_until;
+
+const VOS: &str = env!("CARGO_BIN_EXE_vos");
 
 fn vos(args: &[&str]) -> String {
-    let output = Command::new(env!("CARGO_BIN_EXE_vos"))
-        .args(args)
-        .output()
-        .expect("vos runs");
+    let output = Command::new(VOS).args(args).output().expect("vos runs");
     assert!(
         output.status.success(),
         "vos {args:?}: {}",
@@ -30,13 +21,38 @@ fn vos(args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_string()
 }
 
-/// Kills the node when the test ends, however it ends.
-struct Running(Child);
+/// A node `vos node run` started, killed when dropped; a failing test
+/// prints its log.
+struct Node {
+    running: Running,
+    address: String,
+    key: String,
+    log: PathBuf,
+}
 
-impl Drop for Running {
+impl Drop for Node {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        if std::thread::panicking() {
+            self.running.kill();
+            eprintln!("the node's log:\n{}", read_log(&self.log));
+        }
+    }
+}
+
+/// `vos node run` with `args`, its log in `dir`: once it listens.
+fn node_run(dir: &Path, args: &[&str]) -> Node {
+    let log = dir.join("node.log");
+    let Started {
+        running,
+        address,
+        key,
+    } = run(Path::new(VOS), args, &log, None, None)
+        .unwrap_or_else(|| panic!("the node starts: {}", read_log(&log)));
+    Node {
+        running,
+        address,
+        key,
+        log,
     }
 }
 
@@ -45,36 +61,15 @@ fn a_client_calls_an_agent_the_operator_installed() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("node");
     let data = data.to_str().unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_vos"))
-        .args([
-            "node",
-            "run",
-            "--data",
-            data,
-            "--listen",
-            "127.0.0.1:0",
-            "--agent",
-        ])
-        .arg(guest("default/target/riscv64em-vos/release/vos-agent.elf"))
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("the node starts");
-    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
-    let _node = Running(child);
-    let listening = lines.next().unwrap().unwrap();
-    let address = listening
-        .strip_prefix("listening on ")
-        .expect("its address");
-    let url = format!("http://{address}");
-    let started = lines.next().unwrap().unwrap();
-    let node_key = started.strip_prefix("node ").expect("its key");
-    assert_eq!(vos(&["node", "info", "--node", &url]), node_key);
+    let node = node_run(dir.path(), &["--data", data, "--listen", "127.0.0.1:0"]);
+    let url = format!("http://{}", node.address);
+    assert_eq!(vos(&["node", "info", "--node", &url]), node.key);
 
     let key = dir.path().join("client.key");
     let public = vos(&["key", "new", "--out", key.to_str().unwrap()]);
     assert_eq!(public.len(), 64);
     let agent = vos(&["agent", "create", "--node", &url, "--data", data]);
-    let counter = guest("test-actors/target/riscv64em-vos/release/counter.elf");
+    let counter = actor_elf("counter");
     let installed = vos(&[
         "install",
         "--node",
@@ -151,10 +146,7 @@ fn a_client_calls_an_agent_the_operator_installed() {
 
 /// `vos` that should fail: its error.
 fn vos_fails(args: &[&str]) -> String {
-    let output = Command::new(env!("CARGO_BIN_EXE_vos"))
-        .args(args)
-        .output()
-        .expect("vos runs");
+    let output = Command::new(VOS).args(args).output().expect("vos runs");
     assert!(!output.status.success(), "vos {args:?} succeeded");
     String::from_utf8_lossy(&output.stderr).to_string()
 }
@@ -164,48 +156,26 @@ fn an_operator_reaches_a_tls_node_by_its_key() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("node");
     let data = data.to_str().unwrap();
-    let agent = guest("default/target/riscv64em-vos/release/vos-agent.elf");
+    let agent = agent_elf();
 
     // Without TLS, a node listens on a loopback address only.
-    let refused = Command::new(env!("CARGO_BIN_EXE_vos"))
-        .args([
-            "node",
-            "run",
-            "--data",
-            data,
-            "--listen",
-            "0.0.0.0:0",
-            "--agent",
-        ])
-        .arg(&agent)
-        .output()
-        .unwrap();
-    assert!(!refused.status.success());
-    assert!(String::from_utf8_lossy(&refused.stderr).contains("loopback"));
+    let refused = vos_fails(&[
+        "node",
+        "run",
+        "--data",
+        data,
+        "--listen",
+        "0.0.0.0:0",
+        "--agent",
+        agent.to_str().unwrap(),
+    ]);
+    assert!(refused.contains("loopback"), "{refused}");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_vos"))
-        .args([
-            "node",
-            "run",
-            "--tls",
-            "--data",
-            data,
-            "--listen",
-            "127.0.0.1:0",
-            "--agent",
-        ])
-        .arg(&agent)
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("the node starts");
-    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
-    let _node = Running(child);
-    let listening = lines.next().unwrap().unwrap();
-    let address = listening
-        .strip_prefix("listening on ")
-        .expect("its address");
-    let started = lines.next().unwrap().unwrap();
-    let key = started.strip_prefix("node ").expect("its key").to_string();
+    let node = node_run(
+        dir.path(),
+        &["--tls", "--data", data, "--listen", "127.0.0.1:0"],
+    );
+    let (address, key) = (&node.address, node.key.clone());
     let url = format!("https://{address}");
 
     assert_eq!(
@@ -271,10 +241,7 @@ fn a_pending_call_whose_session_was_collected_is_lost() {
     let clock = Arc::new(AtomicU64::new(start));
     let lose = Arc::new(LoseAnswer::default());
     let open = || {
-        let elf =
-            std::fs::read(guest("default/target/riscv64em-vos/release/vos-agent.elf")).unwrap();
-        let agent = vos_pvm_compiler::link_elf_spi(&elf).expect("links");
-        let mut config = vos_node::Config::new(agent);
+        let mut config = vos_node::Config::new(agent());
         config.hooks = lose.clone();
         config.clock = {
             let clock = Arc::clone(&clock);
@@ -289,7 +256,7 @@ fn a_pending_call_whose_session_was_collected_is_lost() {
     let key = dir.path().join("client.key");
     vos(&["key", "new", "--out", key.to_str().unwrap()]);
     let agent = vos(&["agent", "create", "--node", &url, "--data", data]);
-    let counter = guest("test-actors/target/riscv64em-vos/release/counter.elf");
+    let counter = actor_elf("counter");
     let installed = vos(&[
         "install",
         "--node",
@@ -332,11 +299,9 @@ fn a_pending_call_whose_session_was_collected_is_lost() {
     lose.armed.store(true, Ordering::SeqCst);
     let unanswered = std::thread::scope(|scope| {
         let call = scope.spawn(|| fails(client(&url, "call", "increment", "0200000000000000")));
-        let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        while !lose.tripped.load(Ordering::SeqCst) {
-            assert!(std::time::Instant::now() < until, "never committed");
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+        wait_until("the call commits", Duration::from_secs(20), || {
+            lose.tripped.load(Ordering::SeqCst)
+        });
         node.shutdown();
         call.join().unwrap()
     });
@@ -364,8 +329,7 @@ fn a_pending_call_whose_session_was_collected_is_lost() {
     clock.store(expiry::due(expiry::bucket(start)), Ordering::SeqCst);
     let (node, url) = open();
     let id = vos_wire::ids::AgentId(agent.parse().unwrap());
-    let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    loop {
+    wait_until("the session is collected", Duration::from_secs(20), || {
         let live = node
             .store()
             .snapshot()
@@ -373,12 +337,8 @@ fn a_pending_call_whose_session_was_collected_is_lost() {
             .unwrap()
             .and_then(|bytes| u64::decode(vos_wire::records::unstored(&bytes)?).ok())
             .map(|(live, _)| live);
-        if live == Some(0) {
-            break;
-        }
-        assert!(std::time::Instant::now() < until, "never collected");
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+        live == Some(0)
+    });
     let lost = fails(client(&url, "call", "increment", "0200000000000000"));
     assert!(lost.contains("lost"), "{lost}");
     assert!(

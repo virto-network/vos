@@ -36,22 +36,22 @@
 //! each node on cores of its own.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
-use std::net::{TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::{Signer, SigningKey};
 use smol::io::{AsyncReadExt, AsyncWriteExt};
+use vos_checker::calls::signed_query;
+use vos_checker::processes::{self, Running, first_run, read_log};
+use vos_checker::programs::actor;
+use vos_checker::spaces::{free_tcp_port, free_udp_port};
 use vos_node::client::{Operator, Target};
 use vos_node::tls::Trust;
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Session};
-use vos_wire::ingress::{
-    Answer, Call, Consistency, Install, QueryCall, call_message, query_message,
-};
+use vos_wire::ingress::{Answer, Call, Consistency, Install, call_message};
 use vos_wire::result::Outcome;
 use vos_wire::{Decode, Encode};
 
@@ -76,18 +76,6 @@ const CPUS: [&str; 4] = [
     "8,9,10,11,16,17",
     "18,19,20,21",
 ];
-
-fn guest(path: &str) -> PathBuf {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../agent")
-        .join(path);
-    assert!(
-        path.exists(),
-        "{}: run `just build-agent build-test-actors`",
-        path.display()
-    );
-    path
-}
 
 fn rows() -> Vec<String> {
     std::env::var("ROWS")
@@ -121,22 +109,6 @@ fn pin_thread(cpus: &str) {
             .args(["-p", "-c", cpus, &tid.to_string()])
             .stdout(Stdio::null())
             .status();
-    }
-}
-
-fn free_port(udp: bool) -> u16 {
-    if udp {
-        UdpSocket::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
-    } else {
-        TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
     }
 }
 
@@ -245,7 +217,7 @@ fn io_stalled() -> f64 {
 
 /// A node process, killed when dropped.
 struct Process {
-    child: Mutex<Child>,
+    running: Mutex<Running>,
     number: u8,
     url: String,
     target: Target,
@@ -260,9 +232,7 @@ struct Process {
 
 impl Drop for Process {
     fn drop(&mut self) {
-        let child = self.child.get_mut().unwrap();
-        let _ = child.kill();
-        let _ = child.wait();
+        self.running.get_mut().unwrap().kill();
         // `LOGS` keeps each node's log past the run.
         if let Ok(logs) = std::env::var("LOGS") {
             let _ = std::fs::create_dir_all(&logs);
@@ -276,7 +246,7 @@ impl Drop for Process {
 
 impl Process {
     fn pid(&self) -> u32 {
-        self.child.lock().unwrap().id()
+        self.running.lock().unwrap().pid()
     }
 
     fn operator(&self) -> Operator {
@@ -287,17 +257,15 @@ impl Process {
 
     /// Kill it (SIGKILL).
     fn kill(&self) {
-        let mut child = self.child.lock().unwrap();
-        let _ = child.kill();
-        let _ = child.wait();
+        self.running.lock().unwrap().kill();
     }
 
     /// Start it again: how long until it listens.
     fn restart(&self) -> Duration {
         let started = Instant::now();
         let args: Vec<&str> = self.args.iter().map(String::as_str).collect();
-        let (child, _) = launch(&args, self.cpus.as_deref(), &self.log);
-        *self.child.lock().unwrap() = child;
+        let (running, _) = launch(&args, self.cpus.as_deref(), &self.log);
+        *self.running.lock().unwrap() = running;
         started.elapsed()
     }
 
@@ -350,48 +318,20 @@ impl Process {
     }
 }
 
-/// Run `vos node run` with `args`, pinned to `cpus` if any: the process,
-/// once it printed its address, and its key.
-fn launch(args: &[&str], cpus: Option<&str>, log: &Path) -> (Child, String) {
-    // Appended to, so a restart keeps what came before.
-    let errors = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log)
-        .unwrap();
-    let vos = std::env::var("VOS_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_vos").into());
-    let vos = vos.as_str();
-    let agent = guest("default/target/riscv64em-vos/release/vos-agent.elf");
-    let mut command = match cpus {
-        Some(cpus) => {
-            let mut command = Command::new("taskset");
-            command.args(["-c", cpus, vos]);
-            command
-        }
-        None => Command::new(vos),
-    };
-    command
-        .args(["node", "run"])
-        .args(args)
-        .arg("--agent")
-        .arg(agent)
-        .stdout(Stdio::piped())
-        .stderr(errors);
-    let mut child = command.spawn().expect("vos runs");
-    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
-    let listening = lines.next().and_then(Result::ok).unwrap_or_default();
-    assert!(
-        listening.starts_with("listening on "),
-        "{}",
-        std::fs::read_to_string(log).unwrap_or_default()
-    );
-    let key = lines
-        .next()
-        .and_then(Result::ok)
-        .and_then(|line| line.strip_prefix("node ").map(str::to_string))
-        .expect("the node's key");
-    std::thread::spawn(move || for _ in lines {});
-    (child, key)
+/// The `vos` that runs the nodes: `VOS_BIN`, or this build's.
+fn vos() -> PathBuf {
+    std::env::var("VOS_BIN")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_vos").into())
+        .into()
+}
+
+/// Run `vos node run` with `args`, pinned to `cpus` if any, its log
+/// appended to `log`: the process, once it printed its address, and its
+/// key.
+fn launch(args: &[&str], cpus: Option<&str>, log: &Path) -> (Running, String) {
+    let started = processes::run(&vos(), args, log, None, cpus)
+        .unwrap_or_else(|| panic!("{}", read_log(log)));
+    (started.running, started.key)
 }
 
 /// Three nodes, each pinned to its share of the machine.
@@ -414,20 +354,15 @@ impl Space {
             .unwrap();
         let keys: Vec<String> = (1..=3)
             .map(|number| {
-                let data = dir.path().join(format!("node-{number}"));
-                let log = dir.path().join(format!("first-{number}.log"));
-                let (mut child, key) = launch(
-                    &["--data", data.to_str().unwrap(), "--listen", "127.0.0.1:0"],
-                    None,
-                    &log,
-                );
-                let _ = child.kill();
-                let _ = child.wait();
-                key
+                first_run(
+                    &vos(),
+                    &dir.path().join(format!("node-{number}")),
+                    &dir.path().join(format!("first-{number}.log")),
+                )
             })
             .collect();
-        let ingress: Vec<u16> = (0..3).map(|_| free_port(false)).collect();
-        let peers: Vec<u16> = (0..3).map(|_| free_port(true)).collect();
+        let ingress: Vec<u16> = (0..3).map(|_| free_tcp_port()).collect();
+        let peers: Vec<u16> = (0..3).map(|_| free_udp_port()).collect();
         let tls = std::env::var("TLS").is_ok_and(|tls| tls == "1");
         let scheme = if tls { "https" } else { "http" };
         let space: String = (0..3)
@@ -465,7 +400,7 @@ impl Space {
                 }
                 let pinning = pinned.then(|| cpus[at].clone());
                 let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
-                let (child, key) = launch(&borrowed, pinning.as_deref(), &log);
+                let (running, key) = launch(&borrowed, pinning.as_deref(), &log);
                 assert_eq!(key, keys[at]);
                 let url = format!("{scheme}://{listen}");
                 let trust = if tls {
@@ -476,7 +411,7 @@ impl Space {
                     Trust::Loopback
                 };
                 Process {
-                    child: Mutex::new(child),
+                    running: Mutex::new(running),
                     number,
                     target: Target::new(&url, trust).unwrap(),
                     url,
@@ -670,19 +605,11 @@ fn signed(space: &Space, agent: AgentId) -> Signed {
         );
         std::thread::sleep(Duration::from_millis(20));
     };
-    let method = |name: &str| {
-        schema
-            .methods
-            .iter()
-            .find(|method| method.name == name.as_bytes())
-            .unwrap()
-            .id
-    };
     Signed {
         agent,
         identity: vos_node::identity(&info.record),
-        increment: method("increment"),
-        value: method("value"),
+        increment: schema.method_id("increment").unwrap(),
+        value: schema.method_id("value").unwrap(),
     }
 }
 
@@ -1561,13 +1488,7 @@ fn main() {
     } else {
         println!("taskset is missing: the nodes and the driver share every core");
     }
-    let counter = vos_pvm_compiler::link_elf_spi(
-        &std::fs::read(guest(
-            "test-actors/target/riscv64em-vos/release/counter.elf",
-        ))
-        .unwrap(),
-    )
-    .unwrap();
+    let counter = actor("counter");
     let space = Space::start(pinned, &cpus);
     let mut session = 0u64;
     let mut next = |count: u64| {
@@ -1769,32 +1690,18 @@ fn main() {
 fn counters_hold(space: &Space, agents: &[Signed]) {
     let ran = space.ran.lock().unwrap().clone();
     let key = SigningKey::from_bytes(&[11; 32]);
-    let public = key.verifying_key().to_bytes();
     for signed in agents {
         let Some(expected) = ran.get(&signed.agent).copied() else {
             continue;
         };
-        let not_after = vos_node::wall_clock() + 60_000;
-        let consistency = Consistency::Linearizable;
-        let message = query_message(
+        let body = signed_query(
             &signed.identity,
-            &public,
-            not_after,
-            consistency,
+            &key,
+            vos_node::wall_clock() + 60_000,
+            Consistency::Linearizable,
             COUNTER,
             signed.value,
-            &[],
         );
-        let body = QueryCall {
-            key: public,
-            not_after,
-            consistency,
-            instance: COUNTER,
-            method: signed.value,
-            arguments: Vec::new(),
-            signature: key.sign(&message).to_bytes(),
-        }
-        .encode();
         let leader = &space.processes[space.leader(signed.agent)];
         let path = format!("/agents/{}/queries", signed.agent.0);
         let answer =
@@ -1819,31 +1726,18 @@ fn counters_hold(space: &Space, agents: &[Signed]) {
 /// client to answer.
 fn query(space: &Space, signed: &Signed, follower: usize, consistency: Consistency) {
     let key = SigningKey::from_bytes(&[9; 32]);
-    let public = key.verifying_key().to_bytes();
-    let not_after = vos_node::wall_clock() + 240_000;
     let read = match consistency {
         Consistency::Linearizable => "linearizable",
         Consistency::Applied { .. } => "applied",
     };
-    let message = query_message(
+    let body = signed_query(
         &signed.identity,
-        &public,
-        not_after,
+        &key,
+        vos_node::wall_clock() + 240_000,
         consistency,
         COUNTER,
         signed.value,
-        &[],
     );
-    let body = QueryCall {
-        key: public,
-        not_after,
-        consistency,
-        instance: COUNTER,
-        method: signed.value,
-        arguments: Vec::new(),
-        signature: key.sign(&message).to_bytes(),
-    }
-    .encode();
     // At two rates: what one more query costs the follower, beside what
     // it costs at a rate, its fixed costs included.
     let busy: Vec<f64> = [2_000.0, 6_000.0]

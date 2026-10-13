@@ -19,6 +19,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::Random;
+
 /// The largest datagram taken: QUIC may probe large ones on loopback.
 const DATAGRAM: usize = 64 * 1024;
 /// How long a blocking receive waits before it checks for the stop.
@@ -32,14 +34,13 @@ pub struct Link {
     pub delay: Duration,
 }
 
-#[derive(Default)]
 struct Faults {
     /// Connections cut, by (dialer, peer).
     cut_connections: HashSet<(usize, usize)>,
     /// Links cut, by (from, to).
     cut_links: HashSet<(usize, usize)>,
     links: HashMap<(usize, usize), Link>,
-    random: u64,
+    random: Random,
 }
 
 impl Faults {
@@ -54,13 +55,8 @@ impl Faults {
             return None;
         }
         let link = self.links.get(&(from, to)).copied().unwrap_or_default();
-        if link.loss > 0 {
-            self.random ^= self.random << 13;
-            self.random ^= self.random >> 7;
-            self.random ^= self.random << 17;
-            if self.random % 1_000_000 < u64::from(link.loss) {
-                return None;
-            }
+        if link.loss > 0 && self.random.below(1_000_000) < u64::from(link.loss) {
+            return None;
         }
         Some(link.delay)
     }
@@ -171,8 +167,10 @@ impl Relay {
             .collect::<Result<_, _>>()?;
         let shared = Arc::new(Shared {
             faults: Mutex::new(Faults {
-                random: 0x2545_f491_4f6c_dd1d,
-                ..Faults::default()
+                cut_connections: HashSet::new(),
+                cut_links: HashSet::new(),
+                links: HashMap::new(),
+                random: Random(0x2545_f491_4f6c_dd1d),
             }),
             delayed: Mutex::new(BinaryHeap::new()),
             due: Condvar::new(),

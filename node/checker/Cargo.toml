@@ -3,7 +3,7 @@ name = "vos-checker"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "The exactly-once checker's model, shared by the node suites that run it in one process and across processes."
+description = "The exactly-once checker's model, and what the node's tests and benches share: calls, hooks, spaces in one process, crash rounds and node processes."
 publish = false
 
 # vos-node's integration tests depend on this crate, which depends on
@@ -11,5 +11,9 @@ publish = false
 # vos-node's own unit tests must never use it, being a second instance.
 [dependencies]
 ed25519-dalek = "2"
+hex = "0.4"
+socket2 = "0.6"
+tempfile = "3"
 vos-node = { path = "../host" }
+vos-testkit = { path = "../../agent/testkit" }
 vos-wire = { workspace = true }

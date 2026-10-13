@@ -2493,7 +2493,11 @@ name = "vos-checker"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
+ "hex",
+ "socket2",
+ "tempfile",
  "vos-node",
+ "vos-testkit",
  "vos-wire",
 ]
 
@@ -2510,7 +2514,6 @@ dependencies = [
  "libc",
  "mimalloc",
  "smol",
- "socket2",
  "tempfile",
  "tracing-subscriber",
  "vos-checker",

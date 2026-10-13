@@ -545,10 +545,7 @@ fn schema_of(program: &[u8]) -> Result<Schema, String> {
 
 fn method_named(schema: &Schema, name: &str) -> Result<MethodId, String> {
     schema
-        .methods
-        .iter()
-        .find(|method| method.name == name.as_bytes())
-        .map(|method| method.id)
+        .method_id(name)
         .ok_or_else(|| format!("no method {name}"))
 }
 

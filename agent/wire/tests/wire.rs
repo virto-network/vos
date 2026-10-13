@@ -438,6 +438,8 @@ fn schemas_read_back_from_their_section_and_validate() {
     ro_data.extend_from_slice(b"the rest of the read-only data");
     assert_eq!(Schema::read(&ro_data), Ok(schema.clone()));
     assert_eq!(&ro_data[..4], &MAGIC);
+    assert_eq!(schema.method_id("transfer"), Some(MethodId(7)));
+    assert_eq!(schema.method_id("mint"), None);
 
     assert_eq!(Schema::read(b"no schema here"), Err(SchemaError::Missing));
     let section = schema.section();

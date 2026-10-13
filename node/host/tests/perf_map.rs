@@ -9,14 +9,12 @@ static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
+use vos_checker::programs::agent_elf;
 use vos_pvm::perf_map;
 
+/// The default agent, linked, and its functions.
 fn agent() -> (Vec<u8>, Vec<(u32, String)>) {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../agent/default/target/riscv64em-vos/release/vos-agent.elf"
-    );
-    let elf = std::fs::read(path).expect("run `just build-agent`");
+    let elf = std::fs::read(agent_elf()).unwrap();
     vos_pvm_compiler::link_elf_spi_with_symbols(&elf).expect("links")
 }
 

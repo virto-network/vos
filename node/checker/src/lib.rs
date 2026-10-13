@@ -11,6 +11,21 @@
 //!
 //! The suite says what the clients see of its nodes through [`Nodes`], and
 //! drives its faults its own way.
+//!
+//! Beside the model, what the node's tests and benches share:
+//! [`programs`], the guest programs; [`calls`], a call's total and signed
+//! queries; [`hooks`], what a test gives a node to hold or fail it;
+//! [`spaces`], nodes in one process and free ports; [`crash`], the crash
+//! tests' rounds; [`processes`], node processes and the relay between
+//! them.
+
+pub mod calls;
+pub mod crash;
+pub mod hooks;
+pub mod processes;
+pub mod spaces;
+
+pub use vos_testkit::programs;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Mutex;
@@ -21,9 +36,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use vos_node::client::{ClientError, Target, post_within};
 use vos_wire::abi::refusal;
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Session};
-use vos_wire::ingress::{
-    Answer, Call, Consistency, QueryCall, Rejection, call_message, query_message,
-};
+use vos_wire::ingress::{Answer, Call, Consistency, Rejection, call_message};
 use vos_wire::peer::NodeNumber;
 use vos_wire::result::Outcome;
 use vos_wire::{Decode, Encode};
@@ -59,12 +72,28 @@ impl Random {
     }
 }
 
+/// Wait until `done`, checking every 5 ms, for at most `within`.
+#[track_caller]
 pub fn wait_until(what: &str, within: Duration, mut done: impl FnMut() -> bool) {
     let until = Instant::now() + within;
     while !done() {
         assert!(Instant::now() < until, "timed out: {what}");
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+/// The median and the 99th percentile of `samples`, by nearest rank, in
+/// `unit`s: both zero without samples.
+pub fn percentiles(mut samples: Vec<Duration>, unit: Duration) -> (f64, f64) {
+    if samples.is_empty() {
+        return (0.0, 0.0);
+    }
+    samples.sort();
+    let at = |fraction: f64| {
+        let rank = (samples.len() as f64 * fraction).ceil() as usize;
+        samples[rank.max(1) - 1].div_duration_f64(unit)
+    };
+    (at(0.5), at(0.99))
 }
 
 /// How a client sends its requests.
@@ -732,27 +761,14 @@ impl Client {
 
     /// A signed query of a counter's value.
     fn query(&self, nodes: &dyn Nodes, instance: InstanceId, consistency: Consistency) -> Vec<u8> {
-        let not_after = nodes.time() + 60_000;
-        let key = self.key.verifying_key().to_bytes();
-        let message = query_message(
+        calls::signed_query(
             &self.identity,
-            &key,
-            not_after,
+            &self.key,
+            nodes.time() + 60_000,
             consistency,
             instance,
             self.methods.value,
-            &[],
-        );
-        QueryCall {
-            key,
-            not_after,
-            consistency,
-            instance,
-            method: self.methods.value,
-            arguments: Vec::new(),
-            signature: self.key.sign(&message).to_bytes(),
-        }
-        .encode()
+        )
     }
 
     /// Send requests until `done`: how many were sent, each answered.

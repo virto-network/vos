@@ -18,12 +18,16 @@
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::{Signer, SigningKey};
+use vos_checker::calls::{Total, signed_query};
+use vos_checker::hooks::Gate;
+use vos_checker::programs::{actor, agent, method};
+use vos_checker::spaces::{free_tcp_port, space};
 use vos_checker::{
     ANSWERED, ATTEMPT, COUNTER, Client, INBOX, Log, Methods, Mode, Nodes, Random, SECOND,
     wait_until,
@@ -31,15 +35,12 @@ use vos_checker::{
 use vos_net::memory::Hub;
 use vos_node::client::Target;
 use vos_node::store::{Store, View};
-use vos_node::{Config, Hooks, Node, Peers, Space, SpaceNode};
+use vos_node::{Config, Hooks, Node, Peers, Space};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session, SessionId};
-use vos_wire::ingress::{
-    Answer, Call, Consistency, QueryCall, Rejection, call_message, query_message,
-};
+use vos_wire::ingress::{Answer, Call, Consistency, Rejection, call_message};
 use vos_wire::peer::NodeNumber;
 use vos_wire::records::{SessionMark, unstored};
 use vos_wire::result::Outcome;
-use vos_wire::schema::Schema;
 use vos_wire::{Decode, Encode, defaults, keys};
 
 /// How far one node's clock jumps, either way.
@@ -52,25 +53,6 @@ const NODES: NodeNumber = 3;
 /// Failures a run goes through; clients send until they are over.
 const FAULTS: usize = 16;
 
-fn elf(path: &str) -> Vec<u8> {
-    let path = format!("{}/../../agent/{path}", env!("CARGO_MANIFEST_DIR"));
-    let elf = std::fs::read(&path).unwrap_or_else(|error| {
-        panic!("{path}: {error}; run `just build-agent build-test-actors`")
-    });
-    vos_pvm_compiler::link_elf_spi(&elf).expect("links")
-}
-
-fn method(program: &[u8], name: &str) -> MethodId {
-    let parsed = vos_pvm::spi::parse_standard_program(program).unwrap();
-    Schema::read(&parsed.ro_data)
-        .unwrap()
-        .methods
-        .iter()
-        .find(|method| method.name == name.as_bytes())
-        .unwrap_or_else(|| panic!("no method {name}"))
-        .id
-}
-
 /// Stops a leader loop once, after its commit and before its answers; and
 /// holds the node's refines, or its commits, while asked.
 #[derive(Default)]
@@ -79,46 +61,6 @@ struct Trip {
     tripped: AtomicBool,
     refines: Gate,
     commits: Gate,
-}
-
-/// Holds whoever passes while it is closed, counting them.
-#[derive(Default)]
-struct Gate {
-    closed: Mutex<bool>,
-    opened: std::sync::Condvar,
-    reached: AtomicU64,
-}
-
-impl Gate {
-    fn pass(&self) {
-        let mut closed = self.closed.lock().unwrap();
-        if *closed {
-            self.reached.fetch_add(1, Ordering::SeqCst);
-        }
-        while *closed {
-            closed = self.opened.wait(closed).unwrap();
-        }
-    }
-
-    /// Close the gate until what this gives back is dropped, a failing
-    /// test's included.
-    fn close(&self) -> Closed<'_> {
-        *self.closed.lock().unwrap() = true;
-        Closed(self)
-    }
-
-    fn open(&self) {
-        *self.closed.lock().unwrap() = false;
-        self.opened.notify_all();
-    }
-}
-
-struct Closed<'a>(&'a Gate);
-
-impl Drop for Closed<'_> {
-    fn drop(&mut self) {
-        self.0.open();
-    }
 }
 
 impl Hooks for Trip {
@@ -176,35 +118,21 @@ struct Cluster {
 
 impl Cluster {
     fn new(seed: u64) -> Self {
-        let agent = elf("default/target/riscv64em-vos/release/vos-agent.elf");
-        let mut slots = Vec::new();
-        let mut nodes = Vec::new();
-        for number in 1..=NODES {
-            let dir = tempfile::tempdir().unwrap();
-            // A first open makes the node's key.
-            let node = Node::open(dir.path(), Config::new(agent.clone())).unwrap();
-            let key = node.id().0;
-            node.shutdown();
-            // Below the ephemeral range, so no client's connection takes
-            // one while its node is down.
-            let free = || loop {
-                use std::hash::{BuildHasher, Hasher};
-                let random = std::collections::hash_map::RandomState::new()
-                    .build_hasher()
-                    .finish();
-                let port = 20_000 + (random % 12_000) as u16;
-                if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) {
-                    break listener.local_addr().unwrap();
-                }
-            };
-            let ingress = free();
-            nodes.push(SpaceNode {
-                number,
-                key,
-                peer: free(),
-                ingress: format!("http://{ingress}"),
-            });
-            slots.push(Slot {
+        let agent = agent();
+        let dirs: Vec<tempfile::TempDir> =
+            (1..=NODES).map(|_| tempfile::tempdir().unwrap()).collect();
+        // Below the ephemeral range, so no client's connection takes one
+        // while its node is down.
+        let ingresses: Vec<SocketAddr> = (1..=NODES)
+            .map(|_| SocketAddr::from(([127, 0, 0, 1], free_tcp_port())))
+            .collect();
+        let space = space(&agent, &dirs, |number| {
+            format!("http://{}", ingresses[usize::from(number) - 1])
+        });
+        let slots: Vec<Slot> = dirs
+            .into_iter()
+            .zip(ingresses)
+            .map(|(dir, ingress)| Slot {
                 node: Mutex::new(None),
                 starts: AtomicU64::new(0),
                 sent_across: AtomicU64::new(0),
@@ -213,15 +141,15 @@ impl Cluster {
                 offset: Arc::new(AtomicI64::new(0)),
                 dir,
                 ingress,
-            });
-        }
+            })
+            .collect();
         let targets = slots
             .iter()
             .map(|slot| Target::loopback(&format!("http://{}", slot.ingress)).unwrap())
             .collect();
         let cluster = Self {
             hub: Hub::new(seed),
-            space: Space::new(nodes).unwrap(),
+            space,
             agent,
             slots,
             targets,
@@ -705,7 +633,7 @@ fn exactly_once(mode: Mode, default_seed: u64) {
     println!("seed {seed}");
     let mut random = Random(seed | 1);
     let cluster = Cluster::new(seed);
-    let counter = elf("test-actors/target/riscv64em-vos/release/counter.elf");
+    let counter = actor("counter");
     let methods = Methods {
         increment: method(&counter, "increment"),
         value: method(&counter, "value"),
@@ -880,21 +808,10 @@ fn pipelined_requests_apply_once_through_failures() {
     exactly_once(Mode::Pipelined, 0x5eed_0002);
 }
 
-/// The counter's total an answer carries.
-fn done(answer: &Answer) -> Option<u64> {
-    match answer {
-        Answer::Ran {
-            outcome: Outcome::Done(bytes),
-            ..
-        } => Some(u64::decode(bytes).unwrap().0),
-        _ => None,
-    }
-}
-
 /// A cluster with one agent replicated on `replicas`, running the
 /// counter: the agent and its counter's methods.
 fn counter_agent(cluster: &Cluster, replicas: Vec<NodeNumber>) -> (AgentId, MethodId, MethodId) {
-    let counter = elf("test-actors/target/riscv64em-vos/release/counter.elf");
+    let counter = actor("counter");
     let agent = cluster
         .node(replicas[0])
         .unwrap()
@@ -956,7 +873,7 @@ fn a_follower_forwards_a_call_and_answers_once_it_applied_it() {
         let answer = client
             .call(agent, COUNTER, increment, &by.encode())
             .unwrap();
-        assert_eq!(done(&answer), Some(total), "{answer:?}");
+        assert_eq!(answer.total(), Some(total), "{answer:?}");
         let session = client.session(agent);
         assert!(
             mark(&cluster, follower, agent, &session) > sequence as u64,
@@ -1013,7 +930,7 @@ fn a_client_follows_elsewhere_to_a_replica() {
     let answer = client
         .call(agent, COUNTER, increment, &4u64.encode())
         .unwrap();
-    assert_eq!(done(&answer), Some(4), "{answer:?}");
+    assert_eq!(answer.total(), Some(4), "{answer:?}");
     let now = vos_node::client::node_id(client.target()).unwrap().0;
     assert!(
         [1, 2]
@@ -1048,7 +965,7 @@ fn a_leader_whose_clock_trails_times_its_batches_at_the_agents() {
     let answer = client
         .call(agent, COUNTER, increment, &1u64.encode())
         .unwrap();
-    assert_eq!(done(&answer), Some(1), "{answer:?}");
+    assert_eq!(answer.total(), Some(1), "{answer:?}");
     let ahead = batch_time();
     assert!(
         ahead >= vos_node::wall_clock() + 20_000,
@@ -1060,7 +977,7 @@ fn a_leader_whose_clock_trails_times_its_batches_at_the_agents() {
     let answer = client
         .call(agent, COUNTER, increment, &2u64.encode())
         .unwrap();
-    assert_eq!(done(&answer), Some(3), "{answer:?}");
+    assert_eq!(answer.total(), Some(3), "{answer:?}");
     assert_eq!(cluster.leader(agent), Some(leader), "it goes on leading");
     assert!(batch_time() >= ahead, "the agent's time went back");
 }
@@ -1112,13 +1029,13 @@ fn a_resend_of_a_queued_first_call_joins_it_past_the_skew() {
     let path = format!("/agents/{}/calls", agent.0);
     let address = cluster.slot(leader).ingress;
     let refines = &cluster.slot(leader).trip.refines;
-    let reached = refines.reached.load(Ordering::SeqCst);
+    let reached = refines.reached();
     std::thread::scope(|scope| {
         // Inside the scope: a failure opens it before the scope waits.
         let closed = refines.close();
         let first = scope.spawn(|| post_within(address, &path, &body, ANSWERED));
         wait_until("the first is refined", Duration::from_secs(10), || {
-            refines.reached.load(Ordering::SeqCst) > reached
+            refines.reached() > reached
         });
         // Past the skew now.
         std::thread::sleep(Duration::from_millis(2_000));
@@ -1127,7 +1044,7 @@ fn a_resend_of_a_queued_first_call_joins_it_past_the_skew() {
         drop(closed);
         for answer in [first.join().unwrap(), second.join().unwrap()] {
             let answer = answer.unwrap();
-            assert_eq!(done(&answer), Some(5), "{answer:?}");
+            assert_eq!(answer.total(), Some(5), "{answer:?}");
         }
     });
     let node = cluster.node(leader).unwrap();
@@ -1176,7 +1093,7 @@ fn a_follower_holding_back_its_apply_holds_back_its_answer() {
         drop(closed);
         assert!(early.is_err(), "answered before the follower applied it");
         let answer = answer.recv().unwrap().unwrap();
-        assert_eq!(done(&answer), Some(3), "{answer:?}");
+        assert_eq!(answer.total(), Some(3), "{answer:?}");
     });
 }
 
@@ -1188,26 +1105,7 @@ fn value_query(
     consistency: Consistency,
 ) -> Vec<u8> {
     let not_after = vos_node::wall_clock() + 60_000;
-    let public = key.verifying_key().to_bytes();
-    let message = query_message(
-        identity,
-        &public,
-        not_after,
-        consistency,
-        COUNTER,
-        value,
-        &[],
-    );
-    QueryCall {
-        key: public,
-        not_after,
-        consistency,
-        instance: COUNTER,
-        method: value,
-        arguments: Vec::new(),
-        signature: key.sign(&message).to_bytes(),
-    }
-    .encode()
+    signed_query(identity, key, not_after, consistency, COUNTER, value)
 }
 
 /// A follower reads a write it has not applied yet only once it has: at
@@ -1258,7 +1156,7 @@ fn a_follower_reads_a_write_once_it_has_applied_it() {
             );
             let answer = read.recv().unwrap().unwrap();
             assert_eq!(
-                done(&answer),
+                answer.total(),
                 Some(4 * sequence),
                 "{consistency:?}: {answer:?}"
             );
@@ -1326,6 +1224,6 @@ fn a_query_a_replica_is_behind_for_goes_to_another() {
         let answer = reader
             .query(agent, COUNTER, value, &[], vos_node::wall_clock() + 60_000)
             .unwrap();
-        assert_eq!(done(&answer), Some(6), "{answer:?}");
+        assert_eq!(answer.total(), Some(6), "{answer:?}");
     });
 }

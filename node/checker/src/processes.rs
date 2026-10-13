@@ -1,59 +1,46 @@
-//! Node processes for the process tests: each a `vos node run` with its
-//! own data directory, ports, log and faults file, joined through a relay
-//! the test controls, served in the clear or over TLS.
-
-#![allow(dead_code)]
+//! Node processes, each a `vos node run` of the `vos` binary a test
+//! names, with its own data directory, ports, log and faults file, joined
+//! through a relay the test controls, served in the clear or over TLS.
 
 pub mod relay;
 
 use std::io::{BufRead, BufReader};
-use std::net::{SocketAddr, TcpListener, UdpSocket};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use vos_checker::{Log, Methods, Nodes};
-use vos_node::client::{Operator, Target};
+use vos_node::client::{Client, Operator, Target};
 use vos_node::tls::Trust;
-use vos_wire::ids::{AgentId, InstanceId};
+use vos_wire::Encode;
+use vos_wire::ids::{AgentId, InstanceId, MethodId};
 use vos_wire::ingress::{Answer, Install, ReplicaStatus};
 use vos_wire::peer::NodeNumber;
 
+use crate::calls::Total;
+use crate::programs::{actor, agent_elf};
+use crate::spaces::{free_tcp_port, free_udp_port};
+use crate::{Log, Methods, Nodes, wait_until};
 use relay::Relay;
 
-pub fn guest(path: &str) -> PathBuf {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../agent")
-        .join(path);
-    assert!(
-        path.exists(),
-        "{}: run `just build-agent build-test-actors`",
-        path.display()
-    );
-    path
-}
-
-pub fn agent_elf() -> PathBuf {
-    guest("default/target/riscv64em-vos/release/vos-agent.elf")
-}
-
-/// The counter actor, linked.
-pub fn counter_program() -> Vec<u8> {
-    let counter = std::fs::read(guest(
-        "test-actors/target/riscv64em-vos/release/counter.elf",
-    ))
-    .unwrap();
-    vos_pvm_compiler::link_elf_spi(&counter).expect("links")
-}
+/// How long the harness waits for what it waits on: a node to listen or
+/// to take its faults, a leader, an operator's command, a call's answer.
+pub const PROCESS_WAIT: Duration = Duration::from_secs(60);
 
 /// A running node, killed when dropped, however the test ends.
 pub struct Running(Child);
 
 impl Running {
-    fn pid(&self) -> u32 {
+    pub fn pid(&self) -> u32 {
         self.0.id()
+    }
+
+    /// Kill it (SIGKILL), and wait for it to end.
+    pub fn kill(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
 
     /// How it exited, if it did before the harness killed it.
@@ -64,22 +51,43 @@ impl Running {
 
 impl Drop for Running {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        self.kill();
     }
 }
 
-/// Start `vos node run` with `args` and `faults` as its faults file: the
-/// node, once it printed its address and key, or `None` if it exited
-/// first. Its stderr goes to `log`; its stdout is read to the end, so the
-/// node never writes to a closed pipe.
-pub fn run(args: &[&str], log: &Path, faults: Option<&Path>) -> Option<(Running, String)> {
+/// A node that started: the address it listens on, and its key in hex.
+pub struct Started {
+    pub running: Running,
+    pub address: String,
+    pub key: String,
+}
+
+/// Start `vos node run` of the binary `vos` with `args`, the default
+/// agent, `faults` as its faults file, and pinned to `cpus` (as `taskset
+/// -c` lists them) if given: the node, once it printed its address and
+/// key, or `None` if it exited first. Its stderr goes to `log`, appended
+/// to; its stdout is read to the end, so the node never writes to a
+/// closed pipe.
+pub fn run(
+    vos: &Path,
+    args: &[&str],
+    log: &Path,
+    faults: Option<&Path>,
+    cpus: Option<&str>,
+) -> Option<Started> {
     let errors = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(log)
         .unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_vos"));
+    let mut command = match cpus {
+        Some(cpus) => {
+            let mut command = Command::new("taskset");
+            command.args(["-c", cpus]).arg(vos);
+            command
+        }
+        None => Command::new(vos),
+    };
     command
         .args(["node", "run"])
         .args(args)
@@ -100,8 +108,7 @@ pub fn run(args: &[&str], log: &Path, faults: Option<&Path>) -> Option<(Running,
             let _ = lines.send(line);
         }
     });
-    let deadline = Duration::from_secs(60);
-    let Ok(listening) = read.recv_timeout(deadline) else {
+    let Ok(listening) = read.recv_timeout(PROCESS_WAIT) else {
         // Where a node that never says it listens is: each thread's name,
         // state and kernel wait, which /proc shows without tracing it.
         let threads = std::fs::read_dir(format!("/proc/{}/task", running.pid()))
@@ -128,72 +135,31 @@ pub fn run(args: &[&str], log: &Path, faults: Option<&Path>) -> Option<(Running,
         let _ = std::fs::write(log.with_extension("stuck"), threads);
         return None;
     };
-    listening.strip_prefix("listening on ")?;
+    let address = listening.strip_prefix("listening on ")?.to_string();
     let key = read
-        .recv_timeout(deadline)
+        .recv_timeout(PROCESS_WAIT)
         .ok()?
         .strip_prefix("node ")?
         .to_string();
-    Some((running, key))
+    Some(Started {
+        running,
+        address,
+        key,
+    })
 }
 
-/// A free local port, TCP or UDP, below the range the system gives out
-/// for outgoing connections: a node restarted takes its ports again, and
-/// a connection made meanwhile must not have taken one.
-pub fn free_port(udp: bool) -> u16 {
-    static STATE: AtomicU64 = AtomicU64::new(0);
-    let lowest_ephemeral = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
-        .ok()
-        .and_then(|range| range.split_whitespace().next()?.parse::<u16>().ok())
-        .unwrap_or(32_768);
-    // Never a privileged port.
-    let (low, high) = ((lowest_ephemeral / 2).max(1024), lowest_ephemeral);
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(1, |since| since.as_nanos() as u64)
-        ^ u64::from(std::process::id()) << 32;
-    for _ in 0..if high > low { 1000 } else { 0 } {
-        // A xorshift step, shared by the tests of this process.
-        let mut x = STATE.load(Ordering::Relaxed);
-        if x == 0 {
-            x = seed | 1;
-        }
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        STATE.store(x, Ordering::Relaxed);
-        let port = low + (x % u64::from(high - low)) as u16;
-        let free = if udp {
-            UdpSocket::bind(("127.0.0.1", port)).is_ok()
-        } else {
-            TcpListener::bind(("127.0.0.1", port)).is_ok()
-        };
-        if free {
-            return port;
-        }
-    }
-    // No room below that range: any port the system gives.
-    if udp {
-        UdpSocket::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
-    } else {
-        TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
-    }
+/// The key, in hex, a first run of `vos` alone makes at `data`, logging
+/// to `log`.
+pub fn first_run(vos: &Path, data: &Path, log: &Path) -> String {
+    let args = ["--data", data.to_str().unwrap(), "--listen", "127.0.0.1:0"];
+    run(vos, &args, log, None, None)
+        .unwrap_or_else(|| panic!("a node alone starts: {}", read_log(log)))
+        .key
 }
 
+/// What a node logged to `log`, if anything.
 pub fn read_log(log: &Path) -> String {
     std::fs::read_to_string(log).unwrap_or_default()
-}
-
-pub fn wait_until(what: &str, done: impl FnMut() -> bool) {
-    vos_checker::wait_until(what, Duration::from_secs(60), done);
 }
 
 /// How the nodes run.
@@ -220,11 +186,16 @@ struct Slot {
     jump: AtomicI64,
     /// The generation its faults file holds.
     written: AtomicU64,
+    /// Its operator, with the token of the run it was made for: kept, so
+    /// that what polls the node goes on one connection.
+    operator: Mutex<Option<(String, Arc<Operator>)>>,
 }
 
 /// Nodes 1..=count of one space, each its own process, their peers
 /// joined through a relay.
 pub struct Processes {
+    /// The `vos` binary the nodes run.
+    vos: PathBuf,
     pub dir: tempfile::TempDir,
     pub count: usize,
     keys: Vec<String>,
@@ -283,9 +254,19 @@ impl Processes {
         &self.targets[number - 1]
     }
 
-    pub fn operator(&self, number: usize) -> Operator {
+    /// Node `number`'s operator, by the token its run wrote: the same
+    /// one, and its kept connections, until the node starts again.
+    pub fn operator(&self, number: usize) -> Arc<Operator> {
         let token = std::fs::read_to_string(self.data(number).join(vos_node::ADMIN_TOKEN)).unwrap();
-        Operator::within(self.target(number), &token, OPERATOR)
+        let mut kept = self.slot(number).operator.lock().unwrap();
+        match &*kept {
+            Some((made_for, operator)) if *made_for == token => Arc::clone(operator),
+            _ => {
+                let operator = Arc::new(Operator::within(self.target(number), &token, OPERATOR));
+                *kept = Some((token, Arc::clone(&operator)));
+                operator
+            }
+        }
     }
 
     pub fn is_running(&self, number: usize) -> bool {
@@ -296,9 +277,10 @@ impl Processes {
         &self.slots[number - 1]
     }
 
-    /// Start `count` nodes, choosing their ports again if one cannot take
-    /// them.
-    pub fn start(count: usize, options: Options) -> Self {
+    /// Start `count` nodes of the binary `vos`, choosing their ports
+    /// again if one cannot take them.
+    pub fn start(vos: impl AsRef<Path>, count: usize, options: Options) -> Self {
+        let vos = vos.as_ref();
         let mut dir = tempfile::tempdir().unwrap();
         // `KEEP_NODES` keeps the nodes' data and logs, to look at after.
         if std::env::var_os("KEEP_NODES").is_some() {
@@ -308,21 +290,17 @@ impl Processes {
         // A first run alone makes each node's key.
         let keys: Vec<String> = (1..=count)
             .map(|number| {
-                let data = dir.path().join(format!("node-{number}"));
-                let log = dir.path().join(format!("node-{number}.log"));
-                let (_, key) = run(
-                    &["--data", data.to_str().unwrap(), "--listen", "127.0.0.1:0"],
-                    &log,
-                    None,
+                first_run(
+                    vos,
+                    &dir.path().join(format!("node-{number}")),
+                    &dir.path().join(format!("node-{number}.log")),
                 )
-                .unwrap_or_else(|| panic!("a node alone starts: {}", read_log(&log)));
-                key
             })
             .collect();
         for _attempt in 0..5 {
-            let ingress: Vec<u16> = (0..count).map(|_| free_port(false)).collect();
+            let ingress: Vec<u16> = (0..count).map(|_| free_tcp_port()).collect();
             let bound: Vec<SocketAddr> = (0..count)
-                .map(|_| format!("127.0.0.1:{}", free_port(true)).parse().unwrap())
+                .map(|_| format!("127.0.0.1:{}", free_udp_port()).parse().unwrap())
                 .collect();
             let relay = Relay::start(&bound).expect("the relay starts");
             let scheme = if options.tls { "https" } else { "http" };
@@ -352,6 +330,7 @@ impl Processes {
                 })
                 .collect();
             let processes = Processes {
+                vos: vos.to_path_buf(),
                 dir,
                 count,
                 keys: keys.clone(),
@@ -410,9 +389,15 @@ impl Processes {
         if self.options.tls {
             args.extend(["--tls", "--tls-name", "127.0.0.1"]);
         }
-        let (running, key) = run(&args, &self.log_path(number), Some(&faults))?;
-        assert_eq!(key, self.keys[number - 1]);
-        Some(running)
+        let started = run(
+            &self.vos,
+            &args,
+            &self.log_path(number),
+            Some(&faults),
+            None,
+        )?;
+        assert_eq!(started.key, self.keys[number - 1]);
+        Some(started.running)
     }
 
     /// Kill node `number` with SIGKILL, clearing its own faults: a fault
@@ -536,7 +521,7 @@ impl Processes {
     /// ones, are in force.
     fn taken(&self, number: usize, generation: u64) {
         let taken = self.faults_file(number).with_extension("taken");
-        wait_until("the node takes its faults", || {
+        wait_until("the node takes its faults", PROCESS_WAIT, || {
             let mut running = self.slot(number).running.lock().unwrap();
             if let Some(status) = running.as_mut().and_then(Running::exited) {
                 panic!(
@@ -568,7 +553,7 @@ impl Processes {
     /// does: a deposed leader may not know yet.
     pub fn leader(&self, agent: AgentId) -> usize {
         let mut leader = None;
-        wait_until("a leader is known", || {
+        wait_until("a leader is known", PROCESS_WAIT, || {
             leader = self.leading(agent);
             leader.is_some()
         });
@@ -635,7 +620,7 @@ impl Processes {
         accepted: impl Fn(&Answer) -> bool,
     ) -> Answer {
         let mut answer = None;
-        wait_until("an operator's command is taken", || {
+        wait_until("an operator's command is taken", PROCESS_WAIT, || {
             answer = (1..=self.count)
                 .filter(|number| self.is_running(*number))
                 .map(|number| command(&self.operator(number)))
@@ -685,7 +670,7 @@ impl Processes {
     /// Agent `agent`'s identity, the hash of its creation record.
     pub fn identity(&self, agent: AgentId) -> [u8; 32] {
         let mut identity = None;
-        wait_until("the agent's record is served", || {
+        wait_until("the agent's record is served", PROCESS_WAIT, || {
             identity = (1..=self.count)
                 .filter(|number| self.is_running(*number))
                 .find_map(|number| {
@@ -783,7 +768,7 @@ impl Nodes for Processes {
 /// The counter's methods, by its schema at `agent`'s `instance`.
 pub fn methods(processes: &Processes, agent: AgentId, instance: InstanceId) -> Methods {
     let mut schema = None;
-    wait_until("the schema is served", || {
+    wait_until("the schema is served", PROCESS_WAIT, || {
         schema = (1..=processes.count)
             .filter(|number| processes.is_running(*number))
             .find_map(|number| {
@@ -796,11 +781,8 @@ pub fn methods(processes: &Processes, agent: AgentId, instance: InstanceId) -> M
     let schema = schema.unwrap();
     let method = |name: &str| {
         schema
-            .methods
-            .iter()
-            .find(|method| method.name == name.as_bytes())
+            .method_id(name)
             .unwrap_or_else(|| panic!("no method {name}"))
-            .id
     };
     Methods {
         increment: method("increment"),
@@ -812,80 +794,80 @@ pub fn methods(processes: &Processes, agent: AgentId, instance: InstanceId) -> M
 /// An agent created on nodes 1 to 3, with the test counter installed as
 /// `instance`, through whichever node takes the operator's commands.
 pub fn counter_agent(processes: &Processes, instance: InstanceId) -> AgentId {
-    processes.agent_with(vec![1, 2, 3], &counter_program(), &[instance])
-}
-
-/// The value a call answered with, if it ran to completion.
-pub fn done(answer: &Answer) -> Option<u64> {
-    match answer {
-        Answer::Ran {
-            outcome: vos_wire::result::Outcome::Done(bytes),
-            ..
-        } => Some(vos_wire::Decode::decode(bytes).unwrap().0),
-        _ => None,
-    }
+    processes.agent_with(vec![1, 2, 3], &actor("counter"), &[instance])
 }
 
 /// The method `name` of `agent`'s `instance`, read once its schema is
 /// served.
-pub fn method(
-    client: &mut vos_node::client::Client,
+pub fn served_method(
+    client: &mut Client,
     agent: AgentId,
     instance: InstanceId,
     name: &str,
-) -> vos_wire::ids::MethodId {
+) -> MethodId {
     let mut schema = None;
-    wait_until("the schema is served", || {
+    wait_until("the schema is served", PROCESS_WAIT, || {
         schema = client.schema(agent, instance).ok().flatten();
         schema.is_some()
     });
     schema
         .unwrap()
-        .methods
-        .iter()
-        .find(|method| method.name == name.as_bytes())
+        .method_id(name)
         .unwrap_or_else(|| panic!("no method {name}"))
-        .id
 }
 
-/// Call `method` of `agent`'s `instance` with `by` through `client`,
-/// sending again with the same sequence until it is answered: the value
-/// it answers with.
-pub fn increment(
-    client: &mut vos_node::client::Client,
+/// Call `method` of `agent`'s `instance` with `arguments` through
+/// `client`, sending again with the same sequence until it is answered:
+/// the counter's total it answers with.
+pub fn call(
+    client: &mut Client,
     agent: AgentId,
     instance: InstanceId,
-    method: vos_wire::ids::MethodId,
-    by: u64,
+    method: MethodId,
+    arguments: &[u8],
 ) -> u64 {
-    let arguments = vos_wire::Encode::encode(&by);
     let mut answered = None;
-    wait_until("a call is answered", || {
+    wait_until("a call is answered", PROCESS_WAIT, || {
         answered = client
-            .call(agent, instance, method, &arguments)
+            .call(agent, instance, method, arguments)
             .ok()
-            .as_ref()
-            .and_then(done);
+            .and_then(|answer| answer.total());
         answered.is_some()
     });
     answered.unwrap()
 }
 
+/// Call `method` of `agent`'s `instance` with `by` through `client`, as
+/// [`call`] does.
+pub fn increment(
+    client: &mut Client,
+    agent: AgentId,
+    instance: InstanceId,
+    method: MethodId,
+    by: u64,
+) -> u64 {
+    call(client, agent, instance, method, &by.encode())
+}
+
 /// Wait until the three replicas of `agent` applied through the commit
 /// of its leader at the highest term: their statuses, read at each node.
 pub fn converged(processes: &Processes, agent: AgentId) {
-    wait_until("every replica applies through the commit", || {
-        let statuses: Vec<ReplicaStatus> = (1..=processes.count)
-            .filter_map(|number| processes.status(number, agent))
-            .collect();
-        let Some(commit) = statuses
-            .iter()
-            .filter(|status| status.leads)
-            .max_by_key(|status| status.term)
-            .map(|status| status.commit)
-        else {
-            return false;
-        };
-        statuses.len() == 3 && statuses.iter().all(|status| status.applied >= commit)
-    });
+    wait_until(
+        "every replica applies through the commit",
+        PROCESS_WAIT,
+        || {
+            let statuses: Vec<ReplicaStatus> = (1..=processes.count)
+                .filter_map(|number| processes.status(number, agent))
+                .collect();
+            let Some(commit) = statuses
+                .iter()
+                .filter(|status| status.leads)
+                .max_by_key(|status| status.term)
+                .map(|status| status.commit)
+            else {
+                return false;
+            };
+            statuses.len() == 3 && statuses.iter().all(|status| status.applied >= commit)
+        },
+    );
 }

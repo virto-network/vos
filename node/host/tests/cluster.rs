@@ -10,62 +10,28 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use smol::future::FutureExt;
+use vos_checker::calls::done;
+use vos_checker::hooks::{FailNextSync, Gate};
+use vos_checker::programs::Programs;
+use vos_checker::spaces::{IN_PROCESS_WAIT, open_node, space};
 use vos_net::memory::Hub;
 use vos_node::store::{Batch as _, Durability, EntryKind, Fjall, Store, View};
-use vos_node::{CallError, Config, Hooks, Node, Peers, Reply, Space, SpaceNode};
+use vos_node::{CallError, Config, Hooks, Node, Peers, Reply, Space};
 use vos_wire::abi::{failure, refusal};
 use vos_wire::batch::{Batch, Input, Message, Request};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session};
+use vos_wire::ids::{AgentId, InstanceId, Principal, Session};
 use vos_wire::ingress::{Contact, NodeId, Unplaced};
 use vos_wire::keys;
 use vos_wire::peer::{NodeNumber, PeerMessage};
 use vos_wire::result::Outcome;
-use vos_wire::schema::Schema;
 use vos_wire::{Decode, Encode};
 
 const COUNTER: InstanceId = InstanceId(1);
 const ALICE: Principal = Principal::Client([1; 32]);
 
-fn elf(path: &str) -> Vec<u8> {
-    let path = format!("{}/../../agent/{path}", env!("CARGO_MANIFEST_DIR"));
-    let elf = std::fs::read(&path).unwrap_or_else(|error| {
-        panic!("{path}: {error}; run `just build-agent build-test-actors`")
-    });
-    vos_pvm_compiler::link_elf_spi(&elf).expect("links")
-}
-
-struct Programs {
-    agent: Vec<u8>,
-    counter: Vec<u8>,
-}
-
-impl Programs {
-    fn load() -> Self {
-        Self {
-            agent: elf("default/target/riscv64em-vos/release/vos-agent.elf"),
-            counter: elf("test-actors/target/riscv64em-vos/release/counter.elf"),
-        }
-    }
-
-    fn method(&self, name: &str) -> MethodId {
-        let parsed = vos_pvm::spi::parse_standard_program(&self.counter).unwrap();
-        Schema::read(&parsed.ro_data)
-            .unwrap()
-            .methods
-            .iter()
-            .find(|method| method.name == name.as_bytes())
-            .unwrap_or_else(|| panic!("no method {name}"))
-            .id
-    }
-}
-
 #[track_caller]
-fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
-    let until = Instant::now() + Duration::from_secs(20);
-    while !done() {
-        assert!(Instant::now() < until, "timed out: {what}");
-        std::thread::sleep(Duration::from_millis(5));
-    }
+fn wait_until(what: &str, done: impl FnMut() -> bool) {
+    vos_checker::wait_until(what, IN_PROCESS_WAIT, done);
 }
 
 /// Nodes 1..=count of one space, on a hub or over QUIC on localhost.
@@ -166,31 +132,11 @@ impl Cluster {
 
     /// Make and start nodes 1..=count.
     fn grow(&mut self, count: u8) {
-        let programs = Arc::clone(&self.programs);
-        // A first open makes each node's key.
         let dirs: Vec<tempfile::TempDir> =
             (0..count).map(|_| tempfile::tempdir().unwrap()).collect();
-        let nodes: Vec<SpaceNode> = dirs
-            .iter()
-            .zip(1..)
-            .map(|(dir, number)| {
-                let node = Node::open(dir.path(), Config::new(programs.agent.clone())).unwrap();
-                let key = node.id().0;
-                node.shutdown();
-                // A free port, for QUIC.
-                let peer = std::net::UdpSocket::bind("127.0.0.1:0")
-                    .unwrap()
-                    .local_addr()
-                    .unwrap();
-                SpaceNode {
-                    number,
-                    key,
-                    peer,
-                    ingress: format!("http://node-{number}"),
-                }
-            })
-            .collect();
-        self.space = Space::new(nodes).unwrap();
+        self.space = space(&self.programs.agent, &dirs, |number| {
+            format!("http://node-{number}")
+        });
         self.dirs = dirs;
         self.nodes = (0..count).map(|_| None).collect();
         for number in 1..=count {
@@ -246,20 +192,7 @@ impl Cluster {
 
     fn start(&mut self, number: NodeNumber) {
         let dir = self.dirs[usize::from(number) - 1].path().to_path_buf();
-        // A restarted node binds its peer address again once the last run
-        // has let it go.
-        let until = Instant::now() + Duration::from_secs(5);
-        let node = loop {
-            match Node::open(&dir, self.config(number)) {
-                Ok(node) => break node,
-                Err(vos_node::Error::Data(error))
-                    if Instant::now() < until && error.contains("in use") =>
-                {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(error) => panic!("node {number}: {error:?}"),
-            }
-        };
+        let node = open_node(number, &dir, || self.config(number));
         self.nodes[usize::from(number) - 1] = Some(node);
     }
 
@@ -421,13 +354,6 @@ fn log_start(node: &Node, agent: AgentId) -> u64 {
     node.store().raft(agent).unwrap().log_start.0
 }
 
-fn done(reply: Result<Reply, CallError>) -> u64 {
-    match reply {
-        Ok(Reply::Ran(Outcome::Done(bytes))) => u64::decode(&bytes).unwrap().0,
-        other => panic!("not done: {other:?}"),
-    }
-}
-
 #[test]
 fn an_agent_created_on_three_nodes_applies_alike_on_each() {
     let cluster = Cluster::new(3);
@@ -462,17 +388,6 @@ fn an_agent_created_on_three_nodes_applies_alike_on_each() {
     );
 }
 
-/// Fails the sync of the next synced flush once armed, as a failed fsync
-/// does.
-#[derive(Default)]
-struct FailNextSync(std::sync::atomic::AtomicBool);
-
-impl Hooks for FailNextSync {
-    fn fail_sync(&self) -> bool {
-        self.0.swap(false, std::sync::atomic::Ordering::SeqCst)
-    }
-}
-
 /// A flush that fails where no group's log write meets it still halts the
 /// node: its store takes no more, it falls silent, and a group it led
 /// while idle elects a leader elsewhere.
@@ -491,9 +406,7 @@ fn a_flush_failing_outside_any_log_halts_the_node() {
     });
     cluster.install(agent);
     let leader = cluster.leader(agent);
-    hooks[usize::from(leader) - 1]
-        .0
-        .store(true, std::sync::atomic::Ordering::SeqCst);
+    hooks[usize::from(leader) - 1].arm();
     assert!(
         cluster.node(leader).create_agent().is_err(),
         "the record's flush failed"
@@ -1666,14 +1579,13 @@ fn the_leader_replaces_itself() {
 /// again once commits go on, it installs, as an install overwrites.
 #[test]
 fn an_install_at_a_stalled_leader_times_out() {
-    let hold = Arc::new(HoldCommits(std::sync::atomic::AtomicBool::new(false)));
-    let mut cluster = Cluster::build(0, hold.clone(), Vec::new(), false);
+    let commits = Arc::new(Gate::default());
+    let mut cluster = Cluster::build(0, commits.clone(), Vec::new(), false);
     cluster.answered = Some(Duration::from_millis(400));
     cluster.grow(3);
     let agent = cluster.node(1).create_replicated(vec![1, 2, 3]).unwrap();
     let leader = cluster.node(cluster.leader(agent));
-    hold.0.store(true, std::sync::atomic::Ordering::Relaxed);
-    let release = Release(&hold.0);
+    let closed = commits.close();
     let started = Instant::now();
     // Bounded here too, so that waiting for the commit fails, not hangs.
     let install = leader.install(agent, COUNTER, &cluster.programs.counter, &[], vec![]);
@@ -1691,7 +1603,7 @@ fn an_install_at_a_stalled_leader_times_out() {
         "answered within the deadline, not the commit: {:?}",
         started.elapsed()
     );
-    drop(release);
+    drop(closed);
     // Sent again, as its operator would after `TimedOut`, until it
     // installs: with so short a deadline, the held commits' backlog can
     // outlast one try.
@@ -2124,34 +2036,13 @@ fn a_flaky_then_cut_link_moves_no_term() {
     assert_eq!(done(cluster.increment(leader, agents[0], 1, 7)), 7);
 }
 
-/// Holds every commit while asked.
-struct HoldCommits(std::sync::atomic::AtomicBool);
-
-impl Hooks for HoldCommits {
-    fn before_commit(&self) {
-        while self.0.load(std::sync::atomic::Ordering::Relaxed) {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    }
-}
-
-/// Lets held commits go when dropped, even by a failing assertion, so the
-/// call waiting on them returns.
-struct Release<'a>(&'a std::sync::atomic::AtomicBool);
-
-impl Drop for Release<'_> {
-    fn drop(&mut self) {
-        self.0.store(false, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
 /// A node whose writer stalls stops being vouched for: the quiet groups
 /// it leads elect leaders elsewhere.
 #[test]
 fn the_groups_of_a_node_whose_writer_stalls_elect_elsewhere() {
-    let hold = Arc::new(HoldCommits(std::sync::atomic::AtomicBool::new(false)));
+    let commits = Arc::new(Gate::default());
     let cluster = Cluster::with_node_hooks(vec![
-        Arc::clone(&hold) as Arc<dyn Hooks>,
+        Arc::clone(&commits) as Arc<dyn Hooks>,
         Arc::new(vos_node::NoHooks),
         Arc::new(vos_node::NoHooks),
     ]);
@@ -2171,9 +2062,9 @@ fn the_groups_of_a_node_whose_writer_stalls_elect_elsewhere() {
         }
         std::thread::sleep(Duration::from_millis(50));
     };
-    hold.0.store(true, std::sync::atomic::Ordering::Relaxed);
     std::thread::scope(|scope| {
-        let _release = Release(&hold.0);
+        // Inside the scope: a failure opens it before the scope waits.
+        let closed = commits.close();
         let cluster = &cluster;
         let held = led[0];
         let call = scope.spawn(move || cluster.increment(1, held, 1, 1));
@@ -2183,7 +2074,7 @@ fn the_groups_of_a_node_whose_writer_stalls_elect_elsewhere() {
             led.iter()
                 .all(|&agent| cluster.node(2).leads(agent) || cluster.node(3).leads(agent))
         });
-        drop(_release);
+        drop(closed);
         let _ = call.join();
     });
     for &agent in &led {

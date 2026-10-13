@@ -8,23 +8,14 @@ use std::path::Path;
 
 use ed25519_dalek::SigningKey;
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+use vos_checker::programs::agent;
 use vos_node::client::{Client, ClientError, Operator, Target};
 use vos_node::tls::{IngressTls, Trust};
 use vos_node::{ADMIN_TOKEN, Config, Node};
 use vos_wire::ingress::Answer;
 
-fn agent_program() -> Vec<u8> {
-    let path = format!(
-        "{}/../../agent/default/target/riscv64em-vos/release/vos-agent.elf",
-        env!("CARGO_MANIFEST_DIR")
-    );
-    let elf = std::fs::read(&path)
-        .unwrap_or_else(|error| panic!("{path}: {error}; run `just build-agent`"));
-    vos_pvm_compiler::link_elf_spi(&elf).expect("links")
-}
-
 fn open(dir: &Path, tls: Option<IngressTls>) -> Node {
-    let mut config = Config::new(agent_program());
+    let mut config = Config::new(agent());
     config.executors = 1;
     config.ingress_tls = tls;
     Node::open(dir, config).unwrap()

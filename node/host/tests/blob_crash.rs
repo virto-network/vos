@@ -23,11 +23,12 @@
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
+use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
+use vos_checker::Random;
+use vos_checker::crash::{Round, Rounds, tear};
 use vos_node::NoHooks;
 use vos_node::blobs::{Blobs, blob_ref};
 use vos_node::raft::recovery_cut;
@@ -36,9 +37,15 @@ use vos_node::store::{Fjall, LogEntry, Store};
 use vos_wire::ids::AgentId;
 
 const AGENT: AgentId = AgentId(1);
-const ROUNDS: usize = 12;
-/// Rounds from this one on tear a tail before reopening.
-const TORN_FROM: usize = 6;
+/// Twelve rounds, the last six tearing a tail before reopening.
+const ROUNDS: Rounds = Rounds {
+    writer: "VOS_BLOB_CRASH_WRITER",
+    rounds: 12,
+    torn_from: 6,
+    report: "appended ",
+    reports: 40,
+    kill_within: Duration::from_millis(3),
+};
 /// At most this many bytes of a blob segment are torn: less than one blob.
 const BLOB_TEAR: u64 = 1024;
 /// At most this many bytes of the journal are torn: less than one append.
@@ -47,29 +54,20 @@ const JOURNAL_TEAR: u64 = 64;
 const BLOB: usize = 3000;
 /// Segments hold a few blobs, so collection deletes and moves them.
 const SEGMENT: u64 = 16 << 10;
-const WRITER: &str = "VOS_BLOB_CRASH_WRITER";
 
 /// Entry `index`'s blob.
 fn blob_bytes(index: u64) -> Vec<u8> {
-    let mut seed = index.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
-    (0..BLOB)
-        .map(|_| {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            seed as u8
-        })
-        .collect()
+    let mut random = Random(index.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+    (0..BLOB).map(|_| random.draw() as u8).collect()
 }
 
-fn open(dir: &std::path::Path) -> (Fjall, Blobs) {
+fn open(dir: &Path) -> (Fjall, Blobs) {
     let store = Fjall::open(dir.join("store")).unwrap();
     let blobs = Blobs::open_with(dir.join("blobs"), &store, SEGMENT).unwrap();
     (store, blobs)
 }
 
-fn writer(dir: &str) {
-    let dir = std::path::Path::new(dir);
+fn writer(dir: &Path) {
     let (store, blobs) = open(dir);
     let writer = StorageThread::spawn(store.clone(), Arc::new(NoHooks));
     writer.recovered(AGENT, store.raft(AGENT).unwrap().applied);
@@ -139,159 +137,77 @@ fn writer(dir: &str) {
 }
 
 fn main() {
-    if let Ok(dir) = std::env::var(WRITER) {
-        writer(&dir);
-        return;
-    }
-    let dir = tempfile::tempdir().unwrap();
-    let mut seed = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64
-        | 1;
-    let mut random = move || {
-        seed ^= seed << 13;
-        seed ^= seed >> 7;
-        seed ^= seed << 17;
-        seed
-    };
-    let mut tore = 0;
-    for round in 0..ROUNDS {
-        let mut child = Command::new(std::env::current_exe().unwrap())
-            .env(WRITER, dir.path())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
-        let mut reported: u64 = 0;
-        for _ in 0..random() % 40 {
-            let line = lines.next().unwrap().unwrap();
-            reported = line["appended ".len()..].parse().unwrap();
-        }
-        std::thread::sleep(Duration::from_micros(random() % 3_000));
-        child.kill().unwrap();
-        child.wait().unwrap();
-        for line in lines {
-            reported = line.unwrap()["appended ".len()..].parse().unwrap();
-        }
-        let torn = round >= TORN_FROM;
-        let blob_torn = torn && !round.is_multiple_of(2);
-        if torn {
-            let (dir, extension, reach) = if round.is_multiple_of(2) {
-                (dir.path().join("store"), Some("jnl"), JOURNAL_TEAR)
+    ROUNDS.run(
+        writer,
+        |round, dir, random| {
+            let (dir, extension, most) = if round.is_multiple_of(2) {
+                (dir.join("store"), Some("jnl"), JOURNAL_TEAR)
             } else {
-                (dir.path().join("blobs"), None, BLOB_TEAR)
+                (dir.join("blobs"), None, BLOB_TEAR)
             };
-            if tear(&dir, extension, reach, round.is_multiple_of(3), &mut random) {
-                tore += 1;
-            }
-        }
-
-        let (store, blobs) = open(dir.path());
-        let writer = StorageThread::spawn(store.clone(), Arc::new(NoHooks));
-        writer.recovered(AGENT, store.raft(AGENT).unwrap().applied);
-        let recovery = recovery_cut(&store, &blobs, AGENT).unwrap();
-        smol::block_on(writer.commit(recovery.changes)).unwrap();
-        drop(writer);
-        let cut = recovery.from;
-        let rows = store.raft(AGENT).unwrap();
-        let start = rows.log_start.0;
-        let held: Vec<u64> = rows.log.iter().map(|(index, _)| *index).collect();
-        let last = held.last().copied().unwrap_or(start);
-        assert_eq!(
-            held,
-            (start + 1..=last).collect::<Vec<_>>(),
-            "round {round}: the log has a gap"
-        );
-        for (index, entry) in &rows.log {
-            let blob = entry.blobs[0];
-            let bytes = blobs.get(&blob.hash).unwrap();
-            assert_eq!(
-                bytes.as_deref(),
-                Some(&blob_bytes(*index)[..]),
-                "round {round}: entry {index} lacks its blob"
-            );
-        }
-        // A journal tear reaches the last batch. A blob tear reaches the
-        // tail of the newest segment, which may hold an older entry's blob
-        // that collection moved there: the log is cut at that entry, and
-        // only that cut, from a blob truly gone, may take reported entries.
-        let floor = match (torn, cut) {
-            (false, _) => reported,
-            (true, Some(at)) if blob_torn => reported.min(at - 1),
-            (true, _) => reported.saturating_sub(1),
-        };
-        assert!(
-            last >= floor,
-            "round {round}: the log ends at {last}, but {reported} was reported durable"
-        );
-        let how = if torn { "killed and torn" } else { "killed" };
-        let cut = cut.map_or(String::new(), |at| format!(", cut at {at}"));
-        println!(
-            "round {round}: {how} after {reported}; log {}..={last}{cut}",
-            start + 1
-        );
-        drop(blobs);
-        drop(store);
-    }
-    assert!(tore > 0, "no torn round reached data");
-    println!("blob_crash: {ROUNDS} rounds kept every entry's blob");
+            tear(&dir, extension, most, round.is_multiple_of(3), random)
+        },
+        check,
+    );
+    println!(
+        "blob_crash: {} rounds kept every entry's blob",
+        ROUNDS.rounds
+    );
 }
 
-/// Tear the newest file under `dir` (with `extension`, if given): truncate
-/// its data by up to `most` bytes, or zero up to its last `most` bytes of
-/// data. Whether it tore any. Journals are preallocated, so the data ends
-/// before the file does.
-fn tear(
-    dir: &std::path::Path,
-    extension: Option<&str>,
-    most: u64,
-    truncate: bool,
-    random: &mut impl FnMut() -> u64,
-) -> bool {
-    let mut files = Vec::new();
-    let mut pending = vec![dir.to_path_buf()];
-    while let Some(path) = pending.pop() {
-        for entry in std::fs::read_dir(&path).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                pending.push(path);
-                continue;
-            }
-            let matches = match extension {
-                Some(extension) => path.extension().is_some_and(|found| found == extension),
-                None => path.extension().is_none(),
-            };
-            let Some(id) = path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .and_then(|stem| stem.parse::<u64>().ok())
-            else {
-                continue;
-            };
-            if matches {
-                files.push((id, path));
-            }
-        }
+fn check(round: Round) {
+    let Round {
+        number: round,
+        dir,
+        reported,
+        torn,
+    } = round;
+    let reported = reported.unwrap_or(0);
+    let blob_torn = torn && !round.is_multiple_of(2);
+    let (store, blobs) = open(dir);
+    let writer = StorageThread::spawn(store.clone(), Arc::new(NoHooks));
+    writer.recovered(AGENT, store.raft(AGENT).unwrap().applied);
+    let recovery = recovery_cut(&store, &blobs, AGENT).unwrap();
+    smol::block_on(writer.commit(recovery.changes)).unwrap();
+    drop(writer);
+    let cut = recovery.from;
+    let rows = store.raft(AGENT).unwrap();
+    let start = rows.log_start.0;
+    let held: Vec<u64> = rows.log.iter().map(|(index, _)| *index).collect();
+    let last = held.last().copied().unwrap_or(start);
+    assert_eq!(
+        held,
+        (start + 1..=last).collect::<Vec<_>>(),
+        "round {round}: the log has a gap"
+    );
+    for (index, entry) in &rows.log {
+        let blob = entry.blobs[0];
+        let bytes = blobs.get(&blob.hash).unwrap();
+        assert_eq!(
+            bytes.as_deref(),
+            Some(&blob_bytes(*index)[..]),
+            "round {round}: entry {index} lacks its blob"
+        );
     }
-    let Some((_, file)) = files.into_iter().max() else {
-        return false;
+    // A journal tear reaches the last batch. A blob tear reaches the
+    // tail of the newest segment, which may hold an older entry's blob
+    // that collection moved there: the log is cut at that entry, and
+    // only that cut, from a blob truly gone, may take reported entries.
+    let floor = match (torn, cut) {
+        (false, _) => reported,
+        (true, Some(at)) if blob_torn => reported.min(at - 1),
+        (true, _) => reported.saturating_sub(1),
     };
-    let mut bytes = std::fs::read(&file).unwrap();
-    let end = bytes
-        .iter()
-        .rposition(|&byte| byte != 0)
-        .map_or(0, |at| at + 1);
-    if end == 0 {
-        return false;
-    }
-    let reach = 1 + (random() % most.min(end as u64)) as usize;
-    if truncate {
-        let handle = std::fs::OpenOptions::new().write(true).open(&file).unwrap();
-        handle.set_len((end - reach) as u64).unwrap();
-    } else {
-        bytes[end - reach..end].fill(0);
-        std::fs::write(&file, bytes).unwrap();
-    }
-    true
+    assert!(
+        last >= floor,
+        "round {round}: the log ends at {last}, but {reported} was reported durable"
+    );
+    let how = if torn { "killed and torn" } else { "killed" };
+    let cut = cut.map_or(String::new(), |at| format!(", cut at {at}"));
+    println!(
+        "round {round}: {how} after {reported}; log {}..={last}{cut}",
+        start + 1
+    );
+    drop(blobs);
+    drop(store);
 }

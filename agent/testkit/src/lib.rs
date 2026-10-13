@@ -5,6 +5,11 @@
 //! It is the reference model for the agent's differential test, so it
 //! shares no overlay, dispatch or enforcement code with the agent: only
 //! the wire definitions in `vos_wire`.
+//!
+//! Beside it, [`programs`]: the guest programs, linked, for tests and
+//! benches.
+
+pub mod programs;
 
 use std::collections::BTreeMap;
 

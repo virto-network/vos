@@ -14,12 +14,12 @@ use vos_pvm::accumulate_host::{self, ACCUMULATE_ENTRY, AccumulateContext, Servic
 use vos_pvm::pool::{MachinePool, OuterMachines};
 use vos_pvm::refine_host::{RefineContext, StateReader};
 use vos_pvm::{ExitReason, PvmBackend};
+use vos_testkit::programs::{actor, agent, method};
 use vos_wire::abi::cap;
 use vos_wire::batch::{Admin, Batch, Input, Request, Work};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, Session};
 use vos_wire::jam::{AccumulateInput, Operand, RefineArgs};
 use vos_wire::result::{Outcome, Step, WorkResult};
-use vos_wire::schema::Schema;
 use vos_wire::{Decode, Encode};
 
 const AGENT: AgentId = AgentId(7);
@@ -28,25 +28,6 @@ const LEDGER: InstanceId = InstanceId(2);
 const ALICE: Principal = Principal::Client([1; 32]);
 const GAS: u64 = 4_000_000_000;
 const ROUNDS: usize = 9;
-
-fn elf(path: &str) -> Vec<u8> {
-    let path = format!("{}/../{path}", env!("CARGO_MANIFEST_DIR"));
-    let elf = std::fs::read(&path).unwrap_or_else(|error| {
-        panic!("{path}: {error}; run `just build-agent build-test-actors`")
-    });
-    vos_pvm_compiler::link_elf_spi(&elf).expect("links")
-}
-
-fn method(program: &[u8], name: &str) -> MethodId {
-    let parsed = vos_pvm::spi::parse_standard_program(program).unwrap();
-    Schema::read(&parsed.ro_data)
-        .unwrap()
-        .methods
-        .iter()
-        .find(|method| method.name == name.as_bytes())
-        .unwrap()
-        .id
-}
 
 struct Snapshot(BTreeMap<Vec<u8>, Vec<u8>>);
 
@@ -218,9 +199,9 @@ fn requests(
 }
 
 fn main() {
-    let agent = elf("default/target/riscv64em-vos/release/vos-agent.elf");
-    let counter = elf("test-actors/target/riscv64em-vos/release/counter.elf");
-    let ledger = elf("test-actors/target/riscv64em-vos/release/ledger.elf");
+    let agent = agent();
+    let counter = actor("counter");
+    let ledger = actor("ledger");
     let increment = method(&counter, "increment");
     let ops = method(&counter, "ops");
     let total = method(&ledger, "total");

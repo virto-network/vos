@@ -116,4 +116,12 @@ impl Schema {
     pub fn method(&self, id: MethodId) -> Option<&MethodSchema> {
         self.methods.iter().find(|method| method.id == id)
     }
+
+    /// The id of the method named `name`.
+    pub fn method_id(&self, name: &str) -> Option<MethodId> {
+        self.methods
+            .iter()
+            .find(|method| method.name == name.as_bytes())
+            .map(|method| method.id)
+    }
 }

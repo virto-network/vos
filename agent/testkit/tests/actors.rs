@@ -2,27 +2,17 @@
 //! build-test-actors`) running on the testkit. The tests fail, not skip,
 //! when the programs are missing.
 
+use vos_testkit::programs::{actor, method, schema};
 use vos_testkit::{InstallError, Testkit, decode, program_hash};
 use vos_wire::abi::failure;
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal};
+use vos_wire::ids::{AgentId, InstanceId, Principal};
 use vos_wire::result::Outcome;
-use vos_wire::schema::Schema;
 use vos_wire::{Decode, Encode};
 
 const COUNTER: InstanceId = InstanceId(1);
 const LEDGER: InstanceId = InstanceId(2);
 const CALLER: InstanceId = InstanceId(3);
 const ALICE: Principal = Principal::Client([1; 32]);
-
-fn program(name: &str) -> Vec<u8> {
-    let path = format!(
-        "{}/../test-actors/target/riscv64em-vos/release/{name}.elf",
-        env!("CARGO_MANIFEST_DIR")
-    );
-    let elf = std::fs::read(&path)
-        .unwrap_or_else(|error| panic!("{path}: {error}; run `just build-test-actors`"));
-    vos_pvm_compiler::link_elf_spi(&elf).expect("links")
-}
 
 fn reply<T: Decode>(outcome: Outcome) -> T {
     match outcome {
@@ -33,10 +23,10 @@ fn reply<T: Decode>(outcome: Outcome) -> T {
 
 fn kit() -> Testkit {
     let mut kit = Testkit::new(AgentId(7));
-    kit.install(COUNTER, &program("counter"), &[], &[]).unwrap();
-    let ledger = program("ledger");
-    let checksum = program("checksum");
-    let checksum_method = method_of(&ledger, "checksum");
+    kit.install(COUNTER, &actor("counter"), &[], &[]).unwrap();
+    let ledger = actor("ledger");
+    let checksum = actor("checksum");
+    let checksum_method = method(&ledger, "checksum");
     kit.install(
         LEDGER,
         &ledger,
@@ -44,20 +34,8 @@ fn kit() -> Testkit {
         &[("minter", 1)],
     )
     .unwrap();
-    kit.install(CALLER, &program("caller"), &[], &[]).unwrap();
+    kit.install(CALLER, &actor("caller"), &[], &[]).unwrap();
     kit
-}
-
-/// A method's id, from the program's own schema.
-fn method_of(program: &[u8], name: &str) -> MethodId {
-    let parsed = vos_pvm::spi::parse_standard_program(program).unwrap();
-    let schema = Schema::read(&parsed.ro_data).unwrap();
-    schema
-        .methods
-        .iter()
-        .find(|method| method.name == name.as_bytes())
-        .unwrap()
-        .id
 }
 
 fn call<A: Encode>(
@@ -77,10 +55,7 @@ fn query<A: Encode, R: Decode>(kit: &Testkit, instance: InstanceId, name: &str, 
 
 #[test]
 fn programs_carry_their_schema_first_in_read_only_data() {
-    let counter = program("counter");
-    let parsed = vos_pvm::spi::parse_standard_program(&counter).unwrap();
-    let schema = Schema::read(&parsed.ro_data).expect("a schema");
-    let names: Vec<_> = schema
+    let names: Vec<_> = schema(&actor("counter"))
         .methods
         .iter()
         .map(|method| String::from_utf8(method.name.clone()).unwrap())
@@ -103,12 +78,11 @@ fn programs_carry_their_schema_first_in_read_only_data() {
         ]
     );
 
-    let ledger = program("ledger");
-    let parsed = vos_pvm::spi::parse_standard_program(&ledger).unwrap();
-    let schema = Schema::read(&parsed.ro_data).unwrap();
-    let mint = schema.method(method_of(&ledger, "mint")).unwrap();
+    let ledger = actor("ledger");
+    let schema = schema(&ledger);
+    let mint = schema.method(method(&ledger, "mint")).unwrap();
     assert_eq!(mint.role.as_deref(), Some(&b"minter"[..]));
-    let transfer = schema.method(method_of(&ledger, "transfer")).unwrap();
+    let transfer = schema.method(method(&ledger, "transfer")).unwrap();
     assert_eq!(transfer.gas, Some(2_000_000));
 }
 
@@ -206,7 +180,7 @@ fn an_attestable_method_runs_as_its_own_program() {
     let step = call(&mut kit, LEDGER, "audit", values.clone());
     assert_eq!(reply::<u64>(step.outcome), expected);
     assert_eq!(step.attests.len(), 1);
-    assert_eq!(step.attests[0].program, program_hash(&program("checksum")));
+    assert_eq!(step.attests[0].program, program_hash(&actor("checksum")));
     assert_eq!(step.attests[0].arguments, values.encode());
     assert_eq!(step.attests[0].output, expected.encode());
 }
@@ -214,17 +188,17 @@ fn an_attestable_method_runs_as_its_own_program() {
 #[test]
 fn installing_needs_every_attestable_program_and_role() {
     let mut kit = Testkit::new(AgentId(7));
-    let ledger = program("ledger");
+    let ledger = actor("ledger");
     assert_eq!(
         kit.install(LEDGER, &ledger, &[], &[("minter", 1)]),
-        Err(InstallError::Unbound(method_of(&ledger, "checksum")))
+        Err(InstallError::Unbound(method(&ledger, "checksum")))
     );
-    let checksum = program("checksum");
+    let checksum = actor("checksum");
     assert_eq!(
         kit.install(
             LEDGER,
             &ledger,
-            &[(method_of(&ledger, "checksum"), &checksum)],
+            &[(method(&ledger, "checksum"), &checksum)],
             &[]
         ),
         Err(InstallError::UnmappedRole(b"minter".to_vec()))
@@ -303,12 +277,12 @@ fn an_attestable_program_may_not_make_host_calls() {
         },
     })
     .unwrap();
-    let ledger = program("ledger");
+    let ledger = actor("ledger");
     let mut kit = Testkit::new(AgentId(7));
     kit.install(
         LEDGER,
         &ledger,
-        &[(method_of(&ledger, "checksum"), &bad)],
+        &[(method(&ledger, "checksum"), &bad)],
         &[("minter", 1)],
     )
     .unwrap();

@@ -20,11 +20,11 @@
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
+use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
+use vos_checker::crash::{Round, Rounds, tear};
 use vos_node::NoHooks;
 use vos_node::storage::{Change, StorageThread};
 use vos_node::store::{Fjall, HardState, Membership, Store, Switch, View, next_epoch};
@@ -38,11 +38,17 @@ const KEYS: u64 = 600;
 const EVERY: u64 = 10;
 const APPLIES: u64 = 3;
 const CHUNK: usize = 100;
-const ROUNDS: usize = 12;
-const TORN_FROM: usize = 6;
+/// Twelve rounds, the last six tearing the journal before reopening.
+const ROUNDS: Rounds = Rounds {
+    writer: "VOS_SNAPSHOT_CRASH_WRITER",
+    rounds: 12,
+    torn_from: 6,
+    report: "installed ",
+    reports: 6,
+    kill_within: Duration::from_millis(20),
+};
 /// At most this many bytes of the journal are torn: about one batch.
 const TEAR: u64 = 64;
-const WRITER: &str = "VOS_SNAPSHOT_CRASH_WRITER";
 
 fn key(slot: u64) -> Vec<u8> {
     [
@@ -92,7 +98,7 @@ fn expected(applied: u64) -> BTreeMap<Vec<u8>, Vec<u8>> {
     rows
 }
 
-fn writer(dir: &str) {
+fn writer(dir: &Path) {
     let store = Fjall::open(dir).unwrap();
     let writer = StorageThread::spawn(store.clone(), Arc::new(NoHooks));
     let commit = |change| smol::block_on(writer.commit(vec![change])).unwrap();
@@ -162,117 +168,50 @@ fn writer(dir: &str) {
 }
 
 fn main() {
-    if let Ok(dir) = std::env::var(WRITER) {
-        writer(&dir);
-        return;
-    }
-    let dir = tempfile::tempdir().unwrap();
-    let mut seed = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64
-        | 1;
-    let mut random = move || {
-        seed ^= seed << 13;
-        seed ^= seed >> 7;
-        seed ^= seed << 17;
-        seed
-    };
-    let mut tore = 0;
-    for round in 0..ROUNDS {
-        let mut child = Command::new(std::env::current_exe().unwrap())
-            .env(WRITER, dir.path())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
-        let mut reported: u64 = 0;
-        for _ in 0..random() % 6 {
-            let line = lines.next().unwrap().unwrap();
-            reported = line["installed ".len()..].parse().unwrap();
-        }
-        std::thread::sleep(Duration::from_micros(random() % 20_000));
-        child.kill().unwrap();
-        child.wait().unwrap();
-        for line in lines {
-            reported = line.unwrap()["installed ".len()..].parse().unwrap();
-        }
-        let torn = round >= TORN_FROM;
-        if torn && tear(dir.path(), round.is_multiple_of(2), &mut random) {
-            tore += 1;
-        }
-
-        let store = Fjall::open(dir.path()).unwrap();
-        let view = store.snapshot();
-        let applied = view.applied(AGENT).unwrap().unwrap_or(0);
-        let rows: BTreeMap<_, _> = view
-            .scan(AGENT, &keys::instance_prefix(InstanceId(0)), None)
-            .map(Result::unwrap)
-            .collect();
-        assert!(
-            rows == expected(applied),
-            "round {round}: the rows are not snapshot {} with applies through {applied}",
-            applied - applied % EVERY
-        );
-        let floor = if torn {
-            reported.saturating_sub(EVERY)
-        } else {
-            reported
-        };
-        assert!(
-            applied >= floor,
-            "round {round}: applied {applied}, but {reported} was reported installed"
-        );
-        let how = if torn { "killed and torn" } else { "killed" };
-        println!(
-            "round {round}: {how} after {reported}; at {applied} in epoch {}, stale {:?}",
-            view.epoch(AGENT).unwrap(),
-            store.stale_epochs(AGENT).unwrap()
-        );
-    }
-    assert!(tore > 0, "no torn round reached the journal's data");
-    println!("snapshot_crash: {ROUNDS} rounds held one snapshot each");
+    ROUNDS.run(
+        writer,
+        |round, dir, random| tear(dir, Some("jnl"), TEAR, round.is_multiple_of(2), random),
+        check,
+    );
+    println!(
+        "snapshot_crash: {} rounds held one snapshot each",
+        ROUNDS.rounds
+    );
 }
 
-/// Truncate the newest journal's data by up to [`TEAR`] bytes, or zero up
-/// to its last [`TEAR`] bytes of data: whether it tore any.
-fn tear(dir: &std::path::Path, truncate: bool, random: &mut impl FnMut() -> u64) -> bool {
-    let mut journals = Vec::new();
-    let mut pending = vec![dir.to_path_buf()];
-    while let Some(path) = pending.pop() {
-        for entry in std::fs::read_dir(&path).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                pending.push(path);
-            } else if path.extension().is_some_and(|extension| extension == "jnl") {
-                let id: u64 = path
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .and_then(|stem| stem.parse().ok())
-                    .unwrap_or(0);
-                journals.push((id, path));
-            }
-        }
-    }
-    let (_, journal) = journals.into_iter().max().expect("a journal");
-    let mut bytes = std::fs::read(&journal).unwrap();
-    let end = bytes
-        .iter()
-        .rposition(|&byte| byte != 0)
-        .map_or(0, |at| at + 1);
-    if end == 0 {
-        return false;
-    }
-    let reach = 1 + (random() % TEAR.min(end as u64)) as usize;
-    if truncate {
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&journal)
-            .unwrap();
-        file.set_len((end - reach) as u64).unwrap();
+fn check(round: Round) {
+    let Round {
+        number: round,
+        dir,
+        reported,
+        torn,
+    } = round;
+    let reported = reported.unwrap_or(0);
+    let store = Fjall::open(dir).unwrap();
+    let view = store.snapshot();
+    let applied = view.applied(AGENT).unwrap().unwrap_or(0);
+    let rows: BTreeMap<_, _> = view
+        .scan(AGENT, &keys::instance_prefix(InstanceId(0)), None)
+        .map(Result::unwrap)
+        .collect();
+    assert!(
+        rows == expected(applied),
+        "round {round}: the rows are not snapshot {} with applies through {applied}",
+        applied - applied % EVERY
+    );
+    let floor = if torn {
+        reported.saturating_sub(EVERY)
     } else {
-        bytes[end - reach..end].fill(0);
-        std::fs::write(&journal, bytes).unwrap();
-    }
-    true
+        reported
+    };
+    assert!(
+        applied >= floor,
+        "round {round}: applied {applied}, but {reported} was reported installed"
+    );
+    let how = if torn { "killed and torn" } else { "killed" };
+    println!(
+        "round {round}: {how} after {reported}; at {applied} in epoch {}, stale {:?}",
+        view.epoch(AGENT).unwrap(),
+        store.stale_epochs(AGENT).unwrap()
+    );
 }

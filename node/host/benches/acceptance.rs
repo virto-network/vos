@@ -16,13 +16,15 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use vos_node::{CallError, Config, Hooks, Node, Reply};
+use vos_checker::calls::done;
+use vos_checker::percentiles;
+use vos_checker::programs::{Programs, method};
+use vos_node::{Config, Hooks, Node, Reply};
+use vos_wire::Encode;
 use vos_wire::batch::{Batch, Request};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session};
 use vos_wire::ingress::Stats;
 use vos_wire::result::Outcome;
-use vos_wire::schema::Schema;
-use vos_wire::{Decode, Encode};
 
 const COUNTER: InstanceId = InstanceId(1);
 const ALICE: Principal = Principal::Client([1; 32]);
@@ -30,25 +32,6 @@ const SESSIONS: u64 = 256;
 const PER_SESSION: u64 = 100;
 const ALONE: usize = 201;
 const QUERIES: usize = 2001;
-
-fn elf(path: &str) -> Vec<u8> {
-    let path = format!("{}/../../agent/{path}", env!("CARGO_MANIFEST_DIR"));
-    let elf = std::fs::read(&path).unwrap_or_else(|error| {
-        panic!("{path}: {error}; run `just build-agent build-test-actors`")
-    });
-    vos_pvm_compiler::link_elf_spi(&elf).expect("links")
-}
-
-fn method(program: &[u8], name: &str) -> MethodId {
-    let parsed = vos_pvm::spi::parse_standard_program(program).unwrap();
-    Schema::read(&parsed.ro_data)
-        .unwrap()
-        .methods
-        .iter()
-        .find(|method| method.name == name.as_bytes())
-        .unwrap()
-        .id
-}
 
 fn increment(session: u64, sequence: u64, method: MethodId) -> Request {
     // Every session starts when the bench does, each with a key of its
@@ -67,13 +50,6 @@ fn increment(session: u64, sequence: u64, method: MethodId) -> Request {
         instance: COUNTER,
         method,
         arguments: 1u64.encode(),
-    }
-}
-
-fn done(reply: Result<Reply, CallError>) -> u64 {
-    match reply {
-        Ok(Reply::Ran(Outcome::Done(bytes))) => u64::decode(&bytes).unwrap().0,
-        other => panic!("not done: {other:?}"),
     }
 }
 
@@ -177,19 +153,11 @@ fn stage_means(before: &Stats, after: &Stats) -> Vec<(String, f64)> {
         .collect()
 }
 
-/// The median and the 99th percentile, by nearest rank, in microseconds.
-fn percentiles(mut samples: Vec<Duration>) -> (f64, f64) {
-    samples.sort();
-    let at = |fraction: f64| {
-        let rank = (samples.len() as f64 * fraction).ceil() as usize;
-        samples[rank.max(1) - 1].as_secs_f64() * 1e6
-    };
-    (at(0.5), at(0.99))
-}
-
 fn main() {
-    let agent_program = elf("default/target/riscv64em-vos/release/vos-agent.elf");
-    let counter = elf("test-actors/target/riscv64em-vos/release/counter.elf");
+    let Programs {
+        agent: agent_program,
+        counter,
+    } = Programs::load();
     let increment_method = method(&counter, "increment");
     let value = method(&counter, "value");
     let backend = std::env::var("GREY_PVM").unwrap_or_else(|_| "default".into());
@@ -236,7 +204,8 @@ fn main() {
             started.elapsed()
         })
         .collect();
-    let (alone_median, alone_p99) = percentiles(alone);
+    assert!(!alone.is_empty(), "a request alone was timed");
+    let (alone_median, alone_p99) = percentiles(alone, Duration::from_micros(1));
     let alone_phases = timing.take();
     assert_eq!(alone_phases.inputs, ALONE as u64, "one request per batch");
 
@@ -249,7 +218,8 @@ fn main() {
             started.elapsed()
         })
         .collect();
-    let (query_median, query_p99) = percentiles(queries);
+    assert!(!queries.is_empty(), "a query was timed");
+    let (query_median, query_p99) = percentiles(queries, Duration::from_micros(1));
 
     println!("backend {backend}, {executors} executors");
     println!(

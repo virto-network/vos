@@ -28,15 +28,15 @@
 
 #![cfg(feature = "faults")]
 
-mod support;
-
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use support::{Options, Processes, counter_program, methods, wait_until};
-use vos_checker::{ANSWERED, COUNTER, Client, INBOX, Mode, Nodes, Random, SECOND};
+use vos_checker::processes::relay::Link;
+use vos_checker::processes::{Options, PROCESS_WAIT, Processes, methods};
+use vos_checker::programs::actor;
+use vos_checker::{ANSWERED, COUNTER, Client, INBOX, Mode, Nodes, Random, SECOND, wait_until};
 use vos_node::store::{Fjall, Store, View};
 use vos_wire::ids::AgentId;
 use vos_wire::ingress::{Answer, Consistency, Unplaced};
@@ -198,13 +198,13 @@ fn fault(run: &Run) {
             let to = 1 + (node + run.below(NODES as u64 - 1) as usize) % NODES;
             let link = if run.below(2) == 0 {
                 run.saw("fault: a lossy link");
-                support::relay::Link {
+                Link {
                     loss: 300_000 + run.below(600_000) as u32,
                     delay: Duration::ZERO,
                 }
             } else {
                 run.saw("fault: a slow link");
-                support::relay::Link {
+                Link {
                     loss: 0,
                     delay: Duration::from_millis(20 + run.below(180)),
                 }
@@ -251,7 +251,7 @@ fn fault(run: &Run) {
             let from = space.log_len(failing);
             let how = if run.below(2) == 0 { "before" } else { "after" };
             space.set_faults(failing, &format!("fail_commits {how}\n"));
-            wait_until("the failing node halts", || {
+            wait_until("the failing node halts", PROCESS_WAIT, || {
                 space
                     .status(failing, agent)
                     .is_some_and(|status| status.halted)
@@ -324,7 +324,7 @@ fn floor_aimed(run: &Run) {
     }
     space.set_faults(b, &unheard);
     run.replace(agent, e, b);
-    wait_until("b runs the group again, empty", || {
+    wait_until("b runs the group again, empty", PROCESS_WAIT, || {
         space
             .status(b, agent)
             .is_some_and(|status| status.applied == 0 && !status.leads)
@@ -390,7 +390,7 @@ fn expire_every_session(run: &Run, clients: &[Client]) {
     run.saw("fault: every session expires");
     space.clients_paused.store(true, Ordering::SeqCst);
     // A client finishes the request it is sending first.
-    vos_checker::wait_until("the clients pause", 2 * ANSWERED, || {
+    wait_until("the clients pause", 2 * ANSWERED, || {
         clients.iter().all(Client::idle)
     });
     let captured: Vec<Vec<Vec<u8>>> = clients.iter().map(|client| client.capture(space)).collect();
@@ -401,7 +401,7 @@ fn expire_every_session(run: &Run, clients: &[Client]) {
     space.kill(leader);
     run.pause(100, 500);
     space.restart(leader);
-    vos_checker::wait_until("every replica collects every session", ANSWERED, || {
+    wait_until("every replica collects every session", ANSWERED, || {
         run.agents().into_iter().all(|agent| {
             run.replicas(agent).into_iter().all(|replica| {
                 space
@@ -417,7 +417,7 @@ fn expire_every_session(run: &Run, clients: &[Client]) {
     for client in clients {
         let total = client.total(client.sent());
         for replica in run.replicas(client.agent) {
-            wait_until("every counter as it was", || {
+            wait_until("every counter as it was", PROCESS_WAIT, || {
                 client
                     .read_at(
                         space,
@@ -566,6 +566,7 @@ fn five_processes_apply_once_through_faults() {
     );
     println!("seed {seed}: tls {tls}, {mode:?}");
     let space = Processes::start(
+        env!("CARGO_BIN_EXE_vos"),
         NODES,
         Options {
             tls,
@@ -581,7 +582,7 @@ fn five_processes_apply_once_through_faults() {
         failed_disks: Mutex::new(Vec::new()),
     };
     let space = &run.space;
-    let counter = counter_program();
+    let counter = actor("counter");
     // Each agent on three nodes in turn, so every node holds some.
     let agents: Vec<AgentId> = (0..AGENTS)
         .map(|at| {
@@ -709,7 +710,7 @@ fn five_processes_apply_once_through_faults() {
     // Every agent settled, read in one pass.
     let settle_all = || -> BTreeMap<AgentId, u64> {
         let mut all = BTreeMap::new();
-        wait_until("every agent settles", || {
+        wait_until("every agent settles", PROCESS_WAIT, || {
             all = run
                 .agents()
                 .into_iter()
@@ -723,7 +724,7 @@ fn five_processes_apply_once_through_faults() {
     for (at, client) in clients.iter().enumerate() {
         let total = client.total(sent[at]);
         for replica in run.replicas(client.agent) {
-            wait_until("every counter holds its total", || {
+            wait_until("every counter holds its total", PROCESS_WAIT, || {
                 client
                     .read_at(
                         space,
@@ -738,7 +739,7 @@ fn five_processes_apply_once_through_faults() {
             let inbox = client.forwarded(sent[at]);
             let reader = &forwarding[(at + 1) % AGENTS];
             for replica in run.replicas(next) {
-                wait_until("every inbox holds what was forwarded", || {
+                wait_until("every inbox holds what was forwarded", PROCESS_WAIT, || {
                     reader
                         .read_at(
                             space,

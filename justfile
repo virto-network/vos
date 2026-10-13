@@ -77,7 +77,8 @@ build-agent:
 # nodes, and the `vos` command.
 test-agent: build-test-actors build-agent
     cargo test -p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-node -p vos-net -p vos-cli
-    cargo test -p vos-cli --features faults --test faults --test fault_suite
+    cargo test -p vos-cli --features faults --test processes faults::
+    cargo test -p vos-cli --features faults --test fault_suite
 
 # A plain build of `vos` carries no faults: building the fault suite's
 # `vos` with the feature must not leak into it, and no workspace member

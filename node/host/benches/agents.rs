@@ -27,14 +27,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use vos_checker::percentiles;
+use vos_checker::programs::{Programs, method};
+use vos_checker::spaces::{open_node, space};
 use vos_node::store::{EntryKind, Store};
-use vos_node::{CallError, Config, Hooks, Node, Peers, Reply, Space, SpaceNode};
+use vos_node::{CallError, Config, Hooks, Node, Peers, Reply, Space};
 use vos_wire::Encode;
 use vos_wire::batch::Request;
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session};
 use vos_wire::peer::NodeNumber;
 use vos_wire::result::Outcome;
-use vos_wire::schema::Schema;
 
 const COUNTER: InstanceId = InstanceId(1);
 const NODES: u8 = 3;
@@ -42,25 +44,6 @@ const WARM: Duration = Duration::from_secs(2);
 const MEASURE: Duration = Duration::from_secs(5);
 const IDLE_SETTLE: Duration = Duration::from_secs(5);
 const IDLE_MEASURE: Duration = Duration::from_secs(10);
-
-fn elf(path: &str) -> Vec<u8> {
-    let path = format!("{}/../../agent/{path}", env!("CARGO_MANIFEST_DIR"));
-    let elf = std::fs::read(&path).unwrap_or_else(|error| {
-        panic!("{path}: {error}; run `just build-agent build-test-actors`")
-    });
-    vos_pvm_compiler::link_elf_spi(&elf).expect("links")
-}
-
-fn method(program: &[u8], name: &str) -> MethodId {
-    let parsed = vos_pvm::spi::parse_standard_program(program).unwrap();
-    Schema::read(&parsed.ro_data)
-        .unwrap()
-        .methods
-        .iter()
-        .find(|method| method.name == name.as_bytes())
-        .unwrap()
-        .id
-}
 
 fn count(name: &str) -> Option<u64> {
     std::env::var(name)
@@ -99,30 +82,11 @@ impl Cluster {
         let dirs: Vec<PathBuf> = (1..=NODES)
             .map(|number| root.join(format!("node-{number}")))
             .collect();
-        let members: Vec<SpaceNode> = dirs
-            .iter()
-            .zip(1..)
-            .map(|(dir, number)| {
-                // A first open makes each node's key.
-                let node = Node::open(dir, Config::new(agent.clone())).unwrap();
-                let key = node.id().0;
-                node.shutdown();
-                let peer = std::net::UdpSocket::bind("127.0.0.1:0")
-                    .unwrap()
-                    .local_addr()
-                    .unwrap();
-                SpaceNode {
-                    number,
-                    key,
-                    peer,
-                    ingress: format!("http://node-{number}"),
-                }
-            })
-            .collect();
+        let space = space(&agent, &dirs, |number| format!("http://node-{number}"));
         Self {
             agent,
             dirs,
-            space: Space::new(members).unwrap(),
+            space,
             counts: Arc::default(),
         }
     }
@@ -145,20 +109,8 @@ impl Cluster {
     }
 
     fn open(&self, number: NodeNumber) -> Arc<Node> {
-        // A restarted node binds its peer address once the last run let
-        // it go.
-        let until = Instant::now() + Duration::from_secs(5);
-        loop {
-            match Node::open(&self.dirs[usize::from(number) - 1], self.config()) {
-                Ok(node) => return Arc::new(node),
-                Err(vos_node::Error::Data(error))
-                    if Instant::now() < until && error.contains("in use") =>
-                {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(error) => panic!("node {number}: {error:?}"),
-            }
-        }
+        let dir = &self.dirs[usize::from(number) - 1];
+        Arc::new(open_node(number, dir, || self.config()))
     }
 }
 
@@ -215,19 +167,6 @@ fn cpu_over(span: Duration) -> f64 {
 
 fn threads() -> usize {
     std::fs::read_dir("/proc/self/task").unwrap().count()
-}
-
-/// The median and the 99th percentile, by nearest rank, in milliseconds.
-fn percentiles(mut samples: Vec<Duration>) -> (f64, f64) {
-    if samples.is_empty() {
-        return (0.0, 0.0);
-    }
-    samples.sort();
-    let at = |fraction: f64| {
-        let rank = (samples.len() as f64 * fraction).ceil() as usize;
-        samples[rank.max(1) - 1].as_secs_f64() * 1e3
-    };
-    (at(0.5), at(0.99))
 }
 
 /// One session's closed loop on `agent` until `until`: its calls'
@@ -331,8 +270,10 @@ fn main() {
     let hot = count("HOT");
     let idle = count("IDLE").unwrap_or(1_000);
     let failover = count("FAILOVER").is_some_and(|on| on > 0);
-    let agent_program = elf("default/target/riscv64em-vos/release/vos-agent.elf");
-    let counter = elf("test-actors/target/riscv64em-vos/release/counter.elf");
+    let Programs {
+        agent: agent_program,
+        counter,
+    } = Programs::load();
     let increment = method(&counter, "increment");
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let cluster = Cluster::new(agent_program, dir.path());
@@ -379,7 +320,10 @@ fn main() {
     let (flushes, batches, cpu) = counted.join().unwrap();
     let per_second = |n: usize| n as f64 / MEASURE.as_secs_f64();
     let commits = hot_latencies.len() + cold_latencies.len();
-    let (p50, p99) = percentiles([&hot_latencies[..], &cold_latencies[..]].concat());
+    let (p50, p99) = percentiles(
+        [&hot_latencies[..], &cold_latencies[..]].concat(),
+        Duration::from_millis(1),
+    );
     println!(
         "active: {agents} agents × {sessions} sessions{}: {:.0} commits per second, p50 {p50:.2} ms, p99 {p99:.2} ms, {:.0}% of one core; {:.1} inputs per batch, {:.1} batches per flush",
         hot.map(|hot| format!(" (the first × {hot})"))
@@ -412,8 +356,8 @@ fn main() {
         per_entry * batches as f64 / commits.max(1) as f64
     );
     if hot.is_some() {
-        let (hot_p50, hot_p99) = percentiles(hot_latencies.clone());
-        let (cold_p50, cold_p99) = percentiles(cold_latencies.clone());
+        let (hot_p50, hot_p99) = percentiles(hot_latencies.clone(), Duration::from_millis(1));
+        let (cold_p50, cold_p99) = percentiles(cold_latencies.clone(), Duration::from_millis(1));
         println!(
             "  the hot agent: {:.0} commits per second, p50 {hot_p50:.2} ms, p99 {hot_p99:.2} ms; the others: {:.0}, p50 {cold_p50:.2} ms, p99 {cold_p99:.2} ms",
             per_second(hot_latencies.len()),

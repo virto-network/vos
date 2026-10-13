@@ -11,6 +11,7 @@ use vos_pvm::accumulate_host::{AccumulateContext, ServiceStorage};
 use vos_pvm::pool::MachinePool;
 use vos_pvm::refine::{Machine, MemoryModel, PreparedProgram};
 use vos_pvm::refine_host::{RefineContext, StateReader};
+use vos_testkit::programs::{actor, agent, method};
 use vos_testkit::{Testkit, decode, program_hash};
 use vos_wire::abi::{cap, code, failure, refusal};
 use vos_wire::batch::{Admin, Batch, Input, Query, Request, Work};
@@ -31,31 +32,6 @@ const ALICE: Principal = Principal::Client([1; 32]);
 const BOB: Principal = Principal::Client([2; 32]);
 const MINTER: u8 = 1;
 const OUTER_GAS: u64 = 4_000_000_000;
-
-fn elf(path: &str) -> Vec<u8> {
-    let path = format!("{}/../{path}", env!("CARGO_MANIFEST_DIR"));
-    let elf = std::fs::read(&path).unwrap_or_else(|error| {
-        panic!("{path}: {error}; run `just build-agent build-test-actors`")
-    });
-    vos_pvm_compiler::link_elf_spi(&elf).expect("links")
-}
-
-fn actor(name: &str) -> Vec<u8> {
-    elf(&format!(
-        "test-actors/target/riscv64em-vos/release/{name}.elf"
-    ))
-}
-
-fn method(program: &[u8], name: &str) -> MethodId {
-    let parsed = vos_pvm::spi::parse_standard_program(program).unwrap();
-    Schema::read(&parsed.ro_data)
-        .unwrap()
-        .methods
-        .iter()
-        .find(|method| method.name == name.as_bytes())
-        .unwrap_or_else(|| panic!("no method {name}"))
-        .id
-}
 
 struct Snapshot(BTreeMap<Vec<u8>, Vec<u8>>);
 
@@ -147,10 +123,7 @@ impl Node {
     fn with(pool: bool, serves_state: bool) -> Self {
         // Preparing the agent takes most of a test's setup: once a run.
         static AGENT: std::sync::OnceLock<Arc<PreparedProgram>> = std::sync::OnceLock::new();
-        let program = AGENT.get_or_init(|| {
-            let agent = elf("default/target/riscv64em-vos/release/vos-agent.elf");
-            Arc::new(PreparedProgram::new(&agent).unwrap())
-        });
+        let program = AGENT.get_or_init(|| Arc::new(PreparedProgram::new(&agent()).unwrap()));
         Self {
             program: Arc::clone(program),
             pool: pool.then(|| Arc::new(MachinePool::new())),
@@ -1783,8 +1756,7 @@ fn the_step_reserve_covers_the_largest_install() {
 fn every_program_calls_only_its_surface() {
     use vos_wire::abi::surface;
     let calls = |blob: &[u8]| vos_pvm::spi::inspect_standard_program_host_calls(blob).unwrap();
-    let agent = elf("default/target/riscv64em-vos/release/vos-agent.elf");
-    let mut seen: Vec<u64> = calls(&agent);
+    let mut seen: Vec<u64> = calls(&agent());
     seen.sort_unstable();
     seen.dedup();
     for call in &seen {

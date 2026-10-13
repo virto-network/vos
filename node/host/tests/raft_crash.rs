@@ -23,11 +23,11 @@
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
+use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
+use vos_checker::crash::{Round, Rounds, tear};
 use vos_node::NoHooks;
 use vos_node::storage::{Change, StorageThread};
 use vos_node::store::{Fjall, HardState, LogEntry, Store, View};
@@ -38,12 +38,17 @@ use vos_wire::result::Write;
 const AGENT: AgentId = AgentId(1);
 const WRITES: u64 = 50;
 const SLOTS: u64 = 1_000;
-const ROUNDS: usize = 12;
-/// Rounds from this one on tear the journal before reopening.
-const TORN_FROM: usize = 6;
+/// Twelve rounds, the last six tearing the journal before reopening.
+const ROUNDS: Rounds = Rounds {
+    writer: "VOS_RAFT_CRASH_WRITER",
+    rounds: 12,
+    torn_from: 6,
+    report: "appended ",
+    reports: 60,
+    kill_within: Duration::from_millis(3),
+};
 /// At most this many bytes are torn: less than one entry's batches.
 const TEAR: u64 = 1024;
-const WRITER: &str = "VOS_RAFT_CRASH_WRITER";
 
 fn slot_key(slot: u64) -> Vec<u8> {
     [
@@ -78,7 +83,7 @@ fn term_of(index: u64) -> u64 {
     1 + index / 25
 }
 
-fn writer(dir: &str) {
+fn writer(dir: &Path) {
     let store = Fjall::open(dir).unwrap();
     let rows = store.raft(AGENT).unwrap();
     let writer = StorageThread::spawn(store.clone(), Arc::new(NoHooks));
@@ -154,150 +159,82 @@ fn writer(dir: &str) {
 }
 
 fn main() {
-    if let Ok(dir) = std::env::var(WRITER) {
-        writer(&dir);
-        return;
-    }
-    let dir = tempfile::tempdir().unwrap();
-    let mut seed = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64
-        | 1;
-    let mut random = move || {
-        seed ^= seed << 13;
-        seed ^= seed >> 7;
-        seed ^= seed << 17;
-        seed
-    };
-    let mut tore = 0;
-    for round in 0..ROUNDS {
-        let mut child = Command::new(std::env::current_exe().unwrap())
-            .env(WRITER, dir.path())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
-        let mut reported: u64 = 0;
-        for _ in 0..random() % 60 {
-            let line = lines.next().unwrap().unwrap();
-            reported = line["appended ".len()..].parse().unwrap();
-        }
-        std::thread::sleep(Duration::from_micros(random() % 3_000));
-        child.kill().unwrap();
-        child.wait().unwrap();
-        for line in lines {
-            reported = line.unwrap()["appended ".len()..].parse().unwrap();
-        }
-        let torn = round >= TORN_FROM;
-        if torn && tear(dir.path(), round.is_multiple_of(2), &mut random) {
-            tore += 1;
-        }
-
-        let store = Fjall::open(dir.path()).unwrap();
-        let rows = store.raft(AGENT).unwrap();
-        let applied = store.snapshot().applied(AGENT).unwrap().unwrap_or(0);
-        assert_eq!(rows.applied, applied);
-        // Invariant 1: one prefix.
-        let state: BTreeMap<_, _> = store
-            .snapshot()
-            .scan(AGENT, &keys::instance_prefix(InstanceId(0)), None)
-            .map(Result::unwrap)
-            .collect();
-        assert!(
-            state == expected(applied),
-            "round {round}: the state is not the prefix ending at {applied}"
-        );
-        // Invariant 4: the log starts at or below the applied index.
-        assert!(
-            rows.log_start.0 <= applied,
-            "round {round}: the log starts at {} past applied {applied}",
-            rows.log_start.0
-        );
-        // Invariant 2: the log holds every entry from its start, through
-        // the applied index, with no gap.
-        let held: Vec<u64> = rows.log.iter().map(|(index, _)| *index).collect();
-        let last = held.last().copied().unwrap_or(rows.log_start.0);
-        assert_eq!(
-            held,
-            (rows.log_start.0 + 1..=last).collect::<Vec<_>>(),
-            "round {round}: the log has a gap"
-        );
-        assert!(
-            last >= applied,
-            "round {round}: applied {applied} past the log's end {last}"
-        );
-        for (index, entry) in &rows.log {
-            assert_eq!(entry.term, term_of(*index), "round {round}: entry {index}");
-            assert_eq!(entry.body, index.to_be_bytes().to_vec());
-        }
-        // Synced appends and terms survive, but for a tear's reach.
-        let floor = if torn {
-            reported.saturating_sub(1)
-        } else {
-            reported
-        };
-        assert!(
-            last >= floor,
-            "round {round}: the log ends at {last}, but {reported} was reported synced"
-        );
-        // Nothing reported synced owes no term.
-        let owed = if floor == 0 { 0 } else { term_of(floor) };
-        assert!(
-            rows.hard.term >= owed,
-            "round {round}: term {} after {reported} was reported",
-            rows.hard.term
-        );
-        let how = if torn { "killed and torn" } else { "killed" };
-        println!(
-            "round {round}: {how} after {reported}; log {}..={last}, applied {applied}",
-            rows.log_start.0 + 1
-        );
-    }
-    assert!(tore > 0, "no torn round reached the journal's data");
-    println!("raft_crash: {ROUNDS} rounds recovered a state Raft can trust");
+    ROUNDS.run(
+        writer,
+        |round, dir, random| tear(dir, Some("jnl"), TEAR, round.is_multiple_of(2), random),
+        check,
+    );
+    println!(
+        "raft_crash: {} rounds recovered a state Raft can trust",
+        ROUNDS.rounds
+    );
 }
 
-/// Truncate the newest journal's data by up to [`TEAR`] bytes, or zero up
-/// to its last [`TEAR`] bytes of data: whether it tore any. fjall
-/// preallocates its journals, so the data ends before the file does.
-fn tear(dir: &std::path::Path, truncate: bool, random: &mut impl FnMut() -> u64) -> bool {
-    let mut journals = Vec::new();
-    let mut pending = vec![dir.to_path_buf()];
-    while let Some(path) = pending.pop() {
-        for entry in std::fs::read_dir(&path).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                pending.push(path);
-            } else if path.extension().is_some_and(|extension| extension == "jnl") {
-                let id: u64 = path
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .and_then(|stem| stem.parse().ok())
-                    .unwrap_or(0);
-                journals.push((id, path));
-            }
-        }
+fn check(round: Round) {
+    let Round {
+        number: round,
+        dir,
+        reported,
+        torn,
+    } = round;
+    let reported = reported.unwrap_or(0);
+    let store = Fjall::open(dir).unwrap();
+    let rows = store.raft(AGENT).unwrap();
+    let applied = store.snapshot().applied(AGENT).unwrap().unwrap_or(0);
+    assert_eq!(rows.applied, applied);
+    // Invariant 1: one prefix.
+    let state: BTreeMap<_, _> = store
+        .snapshot()
+        .scan(AGENT, &keys::instance_prefix(InstanceId(0)), None)
+        .map(Result::unwrap)
+        .collect();
+    assert!(
+        state == expected(applied),
+        "round {round}: the state is not the prefix ending at {applied}"
+    );
+    // Invariant 4: the log starts at or below the applied index.
+    assert!(
+        rows.log_start.0 <= applied,
+        "round {round}: the log starts at {} past applied {applied}",
+        rows.log_start.0
+    );
+    // Invariant 2: the log holds every entry from its start, through
+    // the applied index, with no gap.
+    let held: Vec<u64> = rows.log.iter().map(|(index, _)| *index).collect();
+    let last = held.last().copied().unwrap_or(rows.log_start.0);
+    assert_eq!(
+        held,
+        (rows.log_start.0 + 1..=last).collect::<Vec<_>>(),
+        "round {round}: the log has a gap"
+    );
+    assert!(
+        last >= applied,
+        "round {round}: applied {applied} past the log's end {last}"
+    );
+    for (index, entry) in &rows.log {
+        assert_eq!(entry.term, term_of(*index), "round {round}: entry {index}");
+        assert_eq!(entry.body, index.to_be_bytes().to_vec());
     }
-    let (_, journal) = journals.into_iter().max().expect("a journal");
-    let mut bytes = std::fs::read(&journal).unwrap();
-    let end = bytes
-        .iter()
-        .rposition(|&byte| byte != 0)
-        .map_or(0, |at| at + 1);
-    if end == 0 {
-        return false;
-    }
-    let reach = 1 + (random() % TEAR.min(end as u64)) as usize;
-    if truncate {
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&journal)
-            .unwrap();
-        file.set_len((end - reach) as u64).unwrap();
+    // Synced appends and terms survive, but for a tear's reach.
+    let floor = if torn {
+        reported.saturating_sub(1)
     } else {
-        bytes[end - reach..end].fill(0);
-        std::fs::write(&journal, bytes).unwrap();
-    }
-    true
+        reported
+    };
+    assert!(
+        last >= floor,
+        "round {round}: the log ends at {last}, but {reported} was reported synced"
+    );
+    // Nothing reported synced owes no term.
+    let owed = if floor == 0 { 0 } else { term_of(floor) };
+    assert!(
+        rows.hard.term >= owed,
+        "round {round}: term {} after {reported} was reported",
+        rows.hard.term
+    );
+    let how = if torn { "killed and torn" } else { "killed" };
+    println!(
+        "round {round}: {how} after {reported}; log {}..={last}, applied {applied}",
+        rows.log_start.0 + 1
+    );
 }

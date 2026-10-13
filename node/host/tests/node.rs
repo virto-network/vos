@@ -6,10 +6,14 @@
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use vos_checker::calls::done;
+use vos_checker::hooks::Gate;
+use vos_checker::programs::Programs;
+use vos_checker::spaces::IN_PROCESS_WAIT;
 use vos_node::store::{EntryKind, Store, View};
 use vos_node::{CallError, Config, Hooks, Node, Reply};
 use vos_wire::abi::refusal;
@@ -17,44 +21,10 @@ use vos_wire::batch::{Batch, Input, Message, Request};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session};
 use vos_wire::records::unstored;
 use vos_wire::result::Outcome;
-use vos_wire::schema::Schema;
 use vos_wire::{Decode, Encode, defaults, keys};
 
 const COUNTER: InstanceId = InstanceId(1);
 const ALICE: Principal = Principal::Client([1; 32]);
-
-fn elf(path: &str) -> Vec<u8> {
-    let path = format!("{}/../../agent/{path}", env!("CARGO_MANIFEST_DIR"));
-    let elf = std::fs::read(&path).unwrap_or_else(|error| {
-        panic!("{path}: {error}; run `just build-agent build-test-actors`")
-    });
-    vos_pvm_compiler::link_elf_spi(&elf).expect("links")
-}
-
-struct Programs {
-    agent: Vec<u8>,
-    counter: Vec<u8>,
-}
-
-impl Programs {
-    fn load() -> Self {
-        Self {
-            agent: elf("default/target/riscv64em-vos/release/vos-agent.elf"),
-            counter: elf("test-actors/target/riscv64em-vos/release/counter.elf"),
-        }
-    }
-
-    fn method(&self, name: &str) -> MethodId {
-        let parsed = vos_pvm::spi::parse_standard_program(&self.counter).unwrap();
-        Schema::read(&parsed.ro_data)
-            .unwrap()
-            .methods
-            .iter()
-            .find(|method| method.name == name.as_bytes())
-            .unwrap_or_else(|| panic!("no method {name}"))
-            .id
-    }
-}
 
 /// Requests in one new session of Alice's, numbered in order.
 struct Requests {
@@ -94,13 +64,6 @@ fn config(programs: &Programs, hooks: Arc<dyn Hooks>) -> Config {
     config.executors = 2;
     config.hooks = hooks;
     config
-}
-
-fn done<T: Decode>(reply: Result<Reply, CallError>) -> T {
-    match reply {
-        Ok(Reply::Ran(Outcome::Done(bytes))) => T::decode(&bytes).expect("decodes").0,
-        other => panic!("not done: {other:?}"),
-    }
 }
 
 /// An agent with the counter installed at [`COUNTER`].
@@ -146,12 +109,9 @@ fn get<T: Decode>(node: &Node, agent: AgentId, key: &[u8]) -> Option<T> {
     Some(T::decode(unstored(&bytes)?).unwrap().0)
 }
 
-fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
-    let until = Instant::now() + Duration::from_secs(20);
-    while !done() {
-        assert!(Instant::now() < until, "timed out: {what}");
-        std::thread::sleep(Duration::from_millis(5));
-    }
+#[track_caller]
+fn wait_until(what: &str, done: impl FnMut() -> bool) {
+    vos_checker::wait_until(what, IN_PROCESS_WAIT, done);
 }
 
 /// `agent` has no unacknowledged message to `to`, and acknowledged `sent`.
@@ -171,13 +131,13 @@ fn calls_apply_and_survive_a_restart() {
         let node = Node::open(dir.path(), config(&programs, Arc::new(vos_node::NoHooks))).unwrap();
         let agent = counter_agent(&node, &programs);
         assert_eq!(
-            done::<u64>(smol::block_on(
+            done(smol::block_on(
                 node.call(agent, session.request(increment, 5u64))
             )),
             5
         );
         assert_eq!(
-            done::<u64>(smol::block_on(
+            done(smol::block_on(
                 node.call(agent, session.request(increment, 2u64))
             )),
             7
@@ -187,7 +147,7 @@ fn calls_apply_and_survive_a_restart() {
     };
     let node = Node::open(dir.path(), config(&programs, Arc::new(vos_node::NoHooks))).unwrap();
     assert_eq!(
-        done::<u64>(smol::block_on(
+        done(smol::block_on(
             node.call(agent, session.request(increment, 1u64))
         )),
         8
@@ -205,35 +165,6 @@ fn calls_apply_and_survive_a_restart() {
     assert_eq!(unknown, Err(CallError::NoAgent));
 }
 
-/// Holds every commit while `held`, and counts the commits that reached it.
-#[derive(Default)]
-struct Gate {
-    held: Mutex<bool>,
-    released: Condvar,
-    reached: AtomicU64,
-}
-
-impl Gate {
-    fn hold(&self) {
-        *self.held.lock().unwrap() = true;
-    }
-
-    fn release(&self) {
-        *self.held.lock().unwrap() = false;
-        self.released.notify_all();
-    }
-}
-
-impl Hooks for Gate {
-    fn before_commit(&self) {
-        self.reached.fetch_add(1, Ordering::SeqCst);
-        let mut held = self.held.lock().unwrap();
-        while *held {
-            held = self.released.wait(held).unwrap();
-        }
-    }
-}
-
 #[test]
 fn no_reply_before_its_commit_is_durable_and_a_full_queue_is_busy() {
     let programs = Programs::load();
@@ -246,11 +177,11 @@ fn no_reply_before_its_commit_is_durable_and_a_full_queue_is_busy() {
     let increment = programs.method("increment");
     let mut session = Requests::new();
 
-    gate.hold();
-    let reached = gate.reached.load(Ordering::SeqCst);
+    let closed = gate.close();
+    let reached = gate.reached();
     let first = node.call(agent, session.request(increment, 1u64));
     wait_until("the first batch reaches its commit", || {
-        gate.reached.load(Ordering::SeqCst) > reached
+        gate.reached() > reached
     });
     // In flight, the first is not queued: two more fit, the next does not.
     let second = node.call(agent, session.request(increment, 2u64));
@@ -267,11 +198,11 @@ fn no_reply_before_its_commit_is_durable_and_a_full_queue_is_busy() {
         answers.try_recv().is_err(),
         "no reply while its commit is held"
     );
-    gate.release();
+    drop(closed);
     let first = answers.recv_timeout(Duration::from_secs(20)).unwrap();
-    assert_eq!(done::<u64>(first), 1);
-    assert_eq!(done::<u64>(smol::block_on(second)), 3);
-    assert_eq!(done::<u64>(smol::block_on(third)), 6);
+    assert_eq!(done(first), 1);
+    assert_eq!(done(smol::block_on(second)), 3);
+    assert_eq!(done(smol::block_on(third)), 6);
 }
 
 /// Fails every refine whose batch holds the poisoned argument.
@@ -301,7 +232,7 @@ fn a_failing_refine_isolates_its_input() {
         .map(|by| node.call(agent, session.request(increment, by)))
         .collect();
     let replies: Vec<_> = calls.into_iter().map(smol::block_on).collect();
-    assert_eq!(done::<u64>(replies[0].clone()), 1);
+    assert_eq!(done(replies[0].clone()), 1);
     assert_eq!(replies[1], Ok(Reply::Failed));
     // The dropped request leaves a gap in its session.
     assert_eq!(replies[2], Ok(Reply::Refused(refusal::SEQUENCE)));
@@ -350,10 +281,10 @@ fn the_leader_answers_a_duplicate_from_the_reply_window() {
     let call = |request: &Request| smol::block_on(node.call(agent, request.clone()));
     let mut session = Requests::new();
     let first = session.request(increment, 5u64);
-    assert_eq!(done::<u64>(call(&first)), 5);
-    assert_eq!(done::<u64>(call(&first)), 5, "from the window");
+    assert_eq!(done(call(&first)), 5);
+    assert_eq!(done(call(&first)), 5, "from the window");
     for _ in 0..defaults::REPLY_WINDOW {
-        done::<u64>(call(&session.request(increment, 1u64)));
+        done(call(&session.request(increment, 1u64)));
     }
     assert_eq!(call(&first), Ok(Reply::TooOld));
     let mut gap = session.request(increment, 1u64);
@@ -425,7 +356,7 @@ fn a_failed_commit_stops_the_node_and_a_restart_recovers() {
     assert_eq!(results(&node, agent), 1, "only the install applied");
     let mut session = Requests::new();
     assert_eq!(
-        done::<u64>(smol::block_on(
+        done(smol::block_on(
             node.call(agent, session.request(increment, 4u64))
         )),
         4
@@ -443,7 +374,7 @@ fn agents_exchange_messages_and_acks_clear_outboxes() {
     let mut session = Requests::new();
     for by in [5u64, 7] {
         let call = node.call(sender, session.request(forward, (target.0, COUNTER.0, by)));
-        assert_eq!(done::<u64>(smol::block_on(call)), by);
+        assert_eq!(done(smol::block_on(call)), by);
     }
     wait_until("the target applies both", || {
         value(&node, &programs, target) == 12
@@ -537,7 +468,7 @@ fn a_stop_before_the_ack_redelivers_and_applies_once() {
             SENDER,
             session.request(forward, (TARGET.0, COUNTER.0, 5u64)),
         );
-        assert_eq!(done::<u64>(smol::block_on(call)), 5);
+        assert_eq!(done(smol::block_on(call)), 5);
         wait_until("the target applies and stops", || {
             stop.fired.load(Ordering::SeqCst)
         });
@@ -553,7 +484,7 @@ fn a_stop_before_the_ack_redelivers_and_applies_once() {
     // Redelivery and new sends interleave: each applies once, in order.
     for by in [10u64, 20] {
         let call = node.call(SENDER, session.request(forward, (TARGET.0, COUNTER.0, by)));
-        assert_eq!(done::<u64>(smol::block_on(call)), by);
+        assert_eq!(done(smol::block_on(call)), by);
     }
     wait_until("the new messages apply", || {
         value(&node, &programs, TARGET) == 35
@@ -577,7 +508,7 @@ fn redelivery_while_the_sender_sends_more_applies_each_once() {
         two_agents(&node, &programs);
         for by in [1u64, 2, 3] {
             let call = node.call(SENDER, session.request(forward, (TARGET.0, COUNTER.0, by)));
-            assert_eq!(done::<u64>(smol::block_on(call)), by);
+            assert_eq!(done(smol::block_on(call)), by);
         }
         wait_until("the target stops", || stop.fired.load(Ordering::SeqCst));
         node.shutdown();
@@ -587,7 +518,7 @@ fn redelivery_while_the_sender_sends_more_applies_each_once() {
         SENDER,
         session.request(forward, (TARGET.0, COUNTER.0, 10u64)),
     );
-    assert_eq!(done::<u64>(smol::block_on(call)), 10);
+    assert_eq!(done(smol::block_on(call)), 10);
     wait_until("every message applies once", || {
         value(&node, &programs, TARGET) == 16
     });

@@ -7,13 +7,17 @@ static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use std::collections::HashMap;
 
+use vos_checker::calls::done;
+use vos_checker::hooks::{FailNextSync, Gate};
+use vos_checker::programs::Programs;
+use vos_checker::spaces::IN_PROCESS_WAIT;
 use vos_node::client::{self, Client, ClientError, Operator, Target};
 use vos_node::store::{Store, View};
 use vos_node::{ADMIN_TOKEN, Config, Hooks, Node};
@@ -22,42 +26,10 @@ use vos_wire::batch::{Batch, Input};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Session};
 use vos_wire::ingress::{Answer, Call, Install, Rejection};
 use vos_wire::result::Outcome;
-use vos_wire::schema::Schema;
 use vos_wire::{Decode, Encode};
 use vos_wire::{defaults, expiry, keys};
 
 const COUNTER: InstanceId = InstanceId(1);
-
-fn elf(path: &str) -> Vec<u8> {
-    let path = format!("{}/../../agent/{path}", env!("CARGO_MANIFEST_DIR"));
-    let elf = std::fs::read(&path).unwrap_or_else(|error| {
-        panic!("{path}: {error}; run `just build-agent build-test-actors`")
-    });
-    vos_pvm_compiler::link_elf_spi(&elf).expect("links")
-}
-
-struct Programs {
-    agent: Vec<u8>,
-    counter: Vec<u8>,
-}
-
-impl Programs {
-    fn load() -> Self {
-        Self {
-            agent: elf("default/target/riscv64em-vos/release/vos-agent.elf"),
-            counter: elf("test-actors/target/riscv64em-vos/release/counter.elf"),
-        }
-    }
-}
-
-fn method(schema: &Schema, name: &str) -> MethodId {
-    schema
-        .methods
-        .iter()
-        .find(|method| method.name == name.as_bytes())
-        .unwrap_or_else(|| panic!("no method {name}"))
-        .id
-}
 
 /// A node serving ingress, with one agent running the counter.
 struct Served {
@@ -120,8 +92,8 @@ impl Served {
             clock,
             token,
             agent,
-            increment: method(&schema, "increment"),
-            value: method(&schema, "value"),
+            increment: schema.method_id("increment").unwrap(),
+            value: schema.method_id("value").unwrap(),
             _dir: dir,
         }
     }
@@ -185,22 +157,9 @@ impl Served {
     }
 }
 
-fn done(answer: Answer) -> u64 {
-    match answer {
-        Answer::Ran {
-            outcome: Outcome::Done(bytes),
-            ..
-        } => u64::decode(&bytes).unwrap().0,
-        other => panic!("not done: {other:?}"),
-    }
-}
-
-fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
-    let until = Instant::now() + Duration::from_secs(20);
-    while !done() {
-        assert!(Instant::now() < until, "timed out: {what}");
-        std::thread::sleep(Duration::from_millis(5));
-    }
+#[track_caller]
+fn wait_until(what: &str, done: impl FnMut() -> bool) {
+    vos_checker::wait_until(what, IN_PROCESS_WAIT, done);
 }
 
 #[test]
@@ -512,45 +471,24 @@ fn pipelined_requests_recover_their_lost_replies() {
     assert_eq!(served.value(&client), 6);
 }
 
-/// Holds every commit while `held`, counting the commits that reached it.
-#[derive(Default)]
-struct Gate {
-    held: Mutex<bool>,
-    released: Condvar,
-    reached: AtomicU64,
-}
-
-impl Hooks for Gate {
-    fn before_commit(&self) {
-        self.reached.fetch_add(1, Ordering::SeqCst);
-        let mut held = self.held.lock().unwrap();
-        while *held {
-            held = self.released.wait(held).unwrap();
-        }
-    }
-}
-
 #[test]
 fn a_duplicate_in_flight_waits_for_its_answer() {
     let gate = Arc::new(Gate::default());
     let served = Arc::new(Served::start(gate.clone()));
     let client = Arc::new(served.client(1));
-    *gate.held.lock().unwrap() = true;
-    let reached = gate.reached.load(Ordering::SeqCst);
+    let closed = gate.close();
+    let reached = gate.reached();
     let first = {
         let (served, client) = (Arc::clone(&served), Arc::clone(&client));
         std::thread::spawn(move || served.increment(&client, 1, 5))
     };
-    wait_until("the first is in flight", || {
-        gate.reached.load(Ordering::SeqCst) > reached
-    });
+    wait_until("the first is in flight", || gate.reached() > reached);
     let second = {
         let (served, client) = (Arc::clone(&served), Arc::clone(&client));
         std::thread::spawn(move || served.increment(&client, 1, 5))
     };
     std::thread::sleep(Duration::from_millis(100));
-    *gate.held.lock().unwrap() = false;
-    gate.released.notify_all();
+    drop(closed);
     assert_eq!(done(first.join().unwrap()), 5);
     assert_eq!(done(second.join().unwrap()), 5);
     assert_eq!(served.value(&client), 5, "applied once");
@@ -577,17 +515,6 @@ fn operator_commands_need_the_token() {
     );
 }
 
-/// Fails the sync of the next synced flush once armed, as a failed fsync
-/// does.
-#[derive(Default)]
-struct FailNextSync(AtomicBool);
-
-impl Hooks for FailNextSync {
-    fn fail_sync(&self) -> bool {
-        self.0.swap(false, Ordering::SeqCst)
-    }
-}
-
 /// The operator reads a replica's status, and a stranger cannot. A node
 /// of a space of one whose flush fails outside any log write halts, and
 /// its status says so.
@@ -608,7 +535,7 @@ fn the_status_route_reports_a_replica_and_a_halt() {
         Answer::Rejected(Rejection::Unauthorized)
     );
     assert_eq!(operator.status(AgentId(0xdead)).unwrap(), Answer::NoAgent);
-    hooks.0.store(true, Ordering::SeqCst);
+    hooks.arm();
     assert!(
         served.node.create_agent().is_err(),
         "the record's flush failed"
@@ -666,18 +593,14 @@ fn a_node_is_its_public_key_and_never_serves_its_secret() {
     assert_eq!(node.id(), id);
 }
 
-/// Holds the refine of a batch holding the poisoned arguments until
-/// released, then fails it, once; and holds commits while asked.
+/// Holds the refine of a batch holding the poisoned arguments at its
+/// gate, then fails it, once; and holds commits at theirs.
 #[derive(Default)]
 struct GatedPoison {
     poison: Vec<u8>,
-    held: Mutex<bool>,
-    released: Condvar,
     armed: AtomicBool,
-    reached: AtomicU64,
-    commits_held: Mutex<bool>,
-    commits_released: Condvar,
-    commits_reached: AtomicU64,
+    refines: Gate,
+    commits: Gate,
 }
 
 impl Hooks for GatedPoison {
@@ -688,20 +611,12 @@ impl Hooks for GatedPoison {
         if !poisoned || !self.armed.load(Ordering::SeqCst) {
             return false;
         }
-        self.reached.fetch_add(1, Ordering::SeqCst);
-        let mut held = self.held.lock().unwrap();
-        while *held {
-            held = self.released.wait(held).unwrap();
-        }
+        self.refines.pass();
         self.armed.swap(false, Ordering::SeqCst)
     }
 
     fn before_commit(&self) {
-        self.commits_reached.fetch_add(1, Ordering::SeqCst);
-        let mut held = self.commits_held.lock().unwrap();
-        while *held {
-            held = self.commits_released.wait(held).unwrap();
-        }
+        self.commits.pass();
     }
 }
 
@@ -716,34 +631,30 @@ fn a_request_not_consumed_is_resent_with_its_sequence() {
     });
     let served = Arc::new(Served::start(gate.clone()));
     let client = Arc::new(served.client(1));
-    *gate.held.lock().unwrap() = true;
+    let refines = gate.refines.close();
     gate.armed.store(true, Ordering::SeqCst);
     let send = |sequence: u64| {
         let (served, client) = (Arc::clone(&served), Arc::clone(&client));
         std::thread::spawn(move || served.increment(&client, sequence, sequence))
     };
     let first = send(1);
-    wait_until("the first is refined", || {
-        gate.reached.load(Ordering::SeqCst) > 0
-    });
+    wait_until("the first is refined", || gate.refines.reached() > 0);
     let second = send(2);
     std::thread::sleep(Duration::from_millis(100));
     let third = send(3);
     std::thread::sleep(Duration::from_millis(100));
     // The batch of 2 and 3 will wait at its commit, so they stay in flight.
-    *gate.commits_held.lock().unwrap() = true;
-    let commits = gate.commits_reached.load(Ordering::SeqCst);
-    *gate.held.lock().unwrap() = false;
-    gate.released.notify_all();
+    let commits = gate.commits.close();
+    let reached = gate.commits.reached();
+    drop(refines);
     assert_eq!(first.join().unwrap(), Answer::NotConsumed);
     wait_until("2 and 3 reach their commit", || {
-        gate.commits_reached.load(Ordering::SeqCst) > commits
+        gate.commits.reached() > reached
     });
     // Resent while 2 and 3 are in flight: the lane went back to before 1.
     let resent = send(1);
     std::thread::sleep(Duration::from_millis(100));
-    *gate.commits_held.lock().unwrap() = false;
-    gate.commits_released.notify_all();
+    drop(commits);
     assert_eq!(second.join().unwrap(), Answer::Refused(refusal::SEQUENCE));
     assert_eq!(third.join().unwrap(), Answer::Refused(refusal::SEQUENCE));
     assert_eq!(done(resent.join().unwrap()), 1);
