@@ -8815,3 +8815,168 @@ the node, and `just ci`.
 `#[repr(u32)]` enums, a numbered gap in `PeerMessage`, and the directory
 acknowledgement's anonymous order tuple. Each is a wire-format change,
 so it goes before `vos/1` freezes or not at all.
+#### 3.10d Design: removing the retirement-confirmation subprotocol
+
+**What it is.** When a joint configuration's final entry removes voters,
+vos-raft's core keeps a confirmation subprotocol:
+- the leader keeps replicating to the removed voters (`retiring_voters`)
+  until each acknowledges the committed final entry (`learned_final` in
+  `on_append_answer`);
+- then it appends a confirmation, a second steady configuration entry
+  with the same members (`maybe_append_retirement_confirmation`);
+- until that confirmation commits:
+  - a new membership change is refused (`InProgress`);
+  - compaction stops at `final_index - 2` (`update_compact_bound`);
+  - `Status::retirement_final_index` is set;
+- followers track the same state in `follow_membership`'s
+  `retirement_view`;
+- recovery reconstructs it from the log (`recover_configuration`: "a
+  second consecutive steady configuration with the same members is the
+  confirmation").
+
+Its footprint is about 280 lines of core.rs, the longer halves of
+`follow_membership` (149 lines) and `recover_configuration` (140), four
+fields, four identical "clear retirement" blocks, the simulation's
+`release_retiring_voters` and two simulated tests.
+
+**What the node does with it today.** The group driver calls
+`core.release_retiring_voters()` every round (group.rs ~534). That counts
+every removed voter as having acknowledged once the final entry commits.
+So in the node the subprotocol never waits on a removed voter:
+1. the final entry commits;
+2. the leader appends the confirmation at once;
+3. the confirmation commits about one round later.
+
+What it still does, observable, between steps 1 and 3:
+- one extra log entry per replacement;
+- the next membership change is refused for that round;
+- compaction is held at `final_index - 2`;
+- the removed voters get appends for that round too.
+
+**Why the node does not need it.** The rule everything rests on: a
+replica adopts a configuration entry when it is appended, not when it
+commits. So a steady final entry F makes the new configuration effective
+at once, at every replica holding it. A removed replica learns of its
+removal from the node's directory, not from the log:
+- the committed final placement reaches every node that held the agent,
+  and a node it leaves out retires its replica whatever its role (3.8b);
+- a node that missed the placement asks for it when sent Raft traffic for
+  an agent it runs no group for (the directory's pull);
+- a removed replica that never learns campaigns in its old configuration:
+  - its pre-votes and votes need a majority of that configuration;
+  - the members it shares with the new one hold the final entry and a
+    newer term, so they refuse it by Raft's log comparison;
+  - in full, for a removed voter that never learns:
+    - **holding F:** its effective configuration excludes it, so it
+      never campaigns. It still votes, harmlessly.
+    - **holding the joint entry J only:** its view is joint, so it needs
+      a majority of the new configuration. That majority holds F, above
+      its log, and refuses it.
+    - **holding neither:** its view is the old configuration. Every
+      majority of it holds J, committed there, and refuses it.
+    - Pre-votes never raise terms.
+  - a member removed and added again empty would not refuse it; that is
+    the case the vote floor exists for (the floor-aimed fault, the
+    simulation's retire-and-readmit chaos runs,
+    `a_replica_retired_twice_keeps_its_first_floor`).
+
+The confirmation adds none of these guarantees: Raft's joint consensus
+is safe without it. What it adds is the removed voters hearing the final
+entry through the log, which the directory already provides.
+
+**The change.**
+- **The core:**
+  - remove the four fields, `release_retiring_voters`,
+    `maybe_append_retirement_confirmation`,
+    `finalize_retirement_confirmation`, `learned_final`, and
+    `Status::retirement_final_index`;
+  - `replication_peers` is `effective.all_members()`;
+  - `update_compact_bound` loses the `final_index - 2` clamp;
+  - `start_membership_change` refuses only while the configuration is
+    joint;
+  - `auto_finalize_joint_config` appends the final entry and nothing
+    else;
+  - `follow_membership` adopts the last configuration entry an append
+    brings, with no retirement view;
+  - `recover_configuration` drops the confirmation heuristics (about 60
+    lines), and keeps two things:
+    - a retiring leader that appended, but did not commit, a final
+      entry excluding itself keeps the joint view, so it can campaign
+      and replicate that entry. That is liveness, not confirmation: a
+      two-member old configuration cannot elect without it. It needs
+      the `prior_joint` scan.
+    - the branch for a log with no live entries, and
+      `pending_joint_entry` for a joint latest entry.
+  - `follow_committed_membership` keeps its joint-to-steady part (a
+    leader that stepped down with F pending, and the recovered retiring
+    leader above); only its retirement half goes.
+  - `rebuild_leader_tracking` drops the retiring voters' extension: its
+    `retain`s then prune removed voters at F's commit.
+  - `adopt_snapshot_configuration` loses its first half.
+  - `leader_timers` keeps `auto_finalize_joint_config` after a dropped
+    transfer, and loses the confirmation call.
+  - `try_advance_commit` loses `finalize_retirement_confirmation`, and
+    keeps the removed leader's step-down at F's commit.
+- **The node:** the driver no longer calls `release_retiring_voters`
+  (group.rs:540), its only use; nothing in the node reads
+  `retirement_final_index`.
+- **The simulation:** remove `release_retiring_voters`, its call in the
+  chaos `directory()`, and the `steady` closure's
+  `retirement_final_index` clause. `retirements` stays: it counts
+  `cluster.retire`, the host's retirement, and the chaos runs assert at
+  least 1,000 of them. Retire and readmit stay.
+- **Tests:**
+  - replace `a_released_voter_lets_the_next_change_through` with the
+    case that matters: crash a voter, change the membership without it,
+    and check that:
+    - the next change starts without any release;
+    - the voter, restarted unretired and never told, never leads;
+    - no violation occurs;
+  - a core test of the next change: ABC to ABD, acknowledged through F.
+    Then `change_membership` succeeds at once, no append goes to C from
+    F's commit on, and the compaction bound reaches `min(commit,
+    durably applied)` with no clamp;
+  - a core test of the adoption rule:
+    - a removed C holding F sends no pre-vote on its timer;
+    - one holding J only is refused by A, which holds F;
+  - rewrite any test that waits on a confirmation entry to wait on the
+    final entry;
+  - the chaos runs' assertions on membership changes and retirements stay
+    as they are.
+
+**Behaviour after it:**
+- a replacement's log carries the final entry and no confirmation;
+- the next change may start once the final entry commits;
+- compaction runs to `min(commit, durably applied)` at once;
+- removed voters get no appends after the final entry commits. They got
+  appends until it committed, as the joint configuration needs.
+
+**What could go wrong, and what checks it:**
+1. **A removed voter that never learns, campaigning:** pre-vote, the log
+   comparison and the vote floor, as before. The checks are the
+   simulation's retire-and-readmit sweep (800 seeds), the fault suite's
+   floor-aimed fault, and the host test
+   `a_replica_retired_twice_keeps_its_first_floor`.
+2. **A next change starting while a removed voter still counts:** it does
+   not. After the final entry commits, the effective configuration is the
+   new one at every replica that holds that entry. Checked by the
+   simulation with membership changes (`CommitConflict`, `TwoLeaders`).
+3. **Recovery choosing another configuration than before:** the last
+   configuration entry is what the log says; the confirmation heuristic
+   only chose between two entries with the same members. Checked by the
+   core's recovery tests and the simulation's crash-and-restart under
+   changes.
+4. **A follower's view after a truncation inside a change:** the
+   truncation path (`truncated_base`) is unchanged; only the retirement
+   view goes.
+
+**Docs:** the carried item "the confirmation entry's overhead" becomes
+moot; the 3.10d entry says so. The core model and the plan need no
+change.
+
+**Reviewed by Fable:** go, with the recovery case kept, the retirement
+count kept and the three tests above.
+
+**Order:** after the driver is deleted, so the driver's tests that drive
+the subprotocol go with it, and before core.rs is unified and split, so
+nothing moves twice.
