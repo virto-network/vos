@@ -11,7 +11,6 @@ use vos_checker::programs::Programs;
 use vos_checker::spaces::{IN_PROCESS_WAIT, open_node, space};
 use vos_net::memory::{Endpoint, Hub};
 use vos_net::{Arrivals, Class, Network};
-use vos_node::store::{Store, View};
 use vos_node::{CallError, Config, Hooks, Node, Peers, Reply, Space};
 use vos_wire::batch::Request;
 use vos_wire::ids::{AgentId, InstanceId, Principal, Session};

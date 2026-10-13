@@ -16,7 +16,7 @@ use std::collections::VecDeque;
 use crate::blobs::Blobs;
 use crate::storage::Change;
 use crate::store::{
-    self, EntryKind, Fjall, HardState, LogEntry, Membership, NodeNumber, RaftRows, Store, Switch,
+    self, EntryKind, Fjall, HardState, LogEntry, Membership, NodeNumber, RaftRows, Switch,
 };
 
 /// The store's entry for a Raft entry.
@@ -94,7 +94,7 @@ pub fn changes(agent: AgentId, write: &Write<NodeNumber>) -> Vec<Change> {
 
 /// The entries a load asks for, within its bytes.
 pub fn load(
-    store: &impl Store,
+    store: &Fjall,
     agent: AgentId,
     load: &Load,
 ) -> store::Result<Vec<RaftEntry<NodeNumber>>> {
@@ -108,7 +108,7 @@ pub fn load(
 /// The compaction of the log through `through`, if the log still holds it,
 /// with `configuration` in effect there, when the core knows it.
 pub fn compaction(
-    store: &impl Store,
+    store: &Fjall,
     agent: AgentId,
     through: u64,
     configuration: Option<&ActiveConfigRecord<NodeNumber>>,
@@ -357,7 +357,7 @@ pub fn recovered(rows: RaftRows) -> Recovered<NodeNumber> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, VecDeque};
+    use std::collections::{BTreeMap, HashSet, VecDeque};
     use std::sync::Arc;
 
     use vos_raft::core::{Action, Answer, Core};
@@ -367,7 +367,7 @@ mod tests {
     use super::*;
     use crate::NoHooks;
     use crate::storage::StorageThread;
-    use crate::store::{Batch as _, BlobRef, Fjall, View};
+    use crate::store::{BlobRef, Fjall};
 
     const AGENT: AgentId = AgentId(7);
     const NODES: [NodeNumber; 3] = [1, 2, 3];
@@ -428,7 +428,7 @@ mod tests {
 
     #[test]
     fn entry_reports_wait_for_blobs_in_write_order() {
-        let stored = std::cell::RefCell::new(std::collections::HashSet::new());
+        let stored = std::cell::RefCell::new(HashSet::new());
         let is_stored = |hash: &[u8; 32]| stored.borrow().contains(hash);
         let mut reports = EntryReports::default();
         reports.written(&write(1, None, &[(1, &[[7; 32]])]), is_stored);
@@ -494,7 +494,7 @@ mod tests {
         batch.append(AGENT, 2, &naming(held_ref));
         batch.append(AGENT, 3, &naming(lost));
         batch.append(AGENT, 4, &LogEntry::result(1, vec![4]));
-        batch.commit(crate::store::Durability::Synced).unwrap();
+        batch.commit(crate::store::PersistMode::SyncAll).unwrap();
         let writer = StorageThread::spawn(store.clone(), Arc::new(NoHooks));
         let cut = recovery_cut(&store, &blobs, AGENT).unwrap();
         assert_eq!(cut.from, Some(3));
@@ -541,7 +541,7 @@ mod tests {
         batch.append(AGENT, 3, &lost);
         batch.append(AGENT, 4, &LogEntry::result(1, vec![4]));
         batch.apply(AGENT, 0, 3, &[]);
-        batch.commit(crate::store::Durability::Synced).unwrap();
+        batch.commit(crate::store::PersistMode::SyncAll).unwrap();
         let writer = StorageThread::spawn(store.clone(), Arc::new(NoHooks));
         writer.recovered(AGENT, 3);
         let cut = recovery_cut(&store, &blobs, AGENT).unwrap();

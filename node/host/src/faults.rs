@@ -30,7 +30,7 @@ use std::time::Duration;
 use vos_net::Class;
 use vos_wire::peer::NodeNumber;
 
-use crate::{Config, Hooks};
+use crate::{Config, Hooks, lock};
 
 /// How often the control file is read.
 const READ_EVERY: Duration = Duration::from_millis(50);
@@ -222,12 +222,12 @@ impl Faults {
         self.fail_before.store(read.fail_before, Ordering::Release);
         self.fail_after.store(read.fail_after, Ordering::Release);
         self.clock.store(read.clock, Ordering::Release);
-        *self.drops.lock().expect("the losses") = read.drops;
+        *lock(&self.drops) = read.drops;
     }
 
     /// Whether a frame of `class` to `to` is lost.
     pub(crate) fn lost(&self, to: NodeNumber, class: Class) -> bool {
-        let losses = self.drops.lock().expect("the losses");
+        let losses = lock(&self.drops);
         let Some(loss) = losses
             .iter()
             .find(|loss| loss.class == class && loss.to.is_none_or(|node| node == to))

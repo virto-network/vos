@@ -30,7 +30,7 @@ use std::time::Duration;
 use vos_checker::crash::{Round, Rounds, tear};
 use vos_node::NoHooks;
 use vos_node::storage::{Change, StorageThread};
-use vos_node::store::{Fjall, HardState, LogEntry, Store, View};
+use vos_node::store::{Fjall, HardState, LogEntry};
 use vos_wire::ids::{AgentId, InstanceId};
 use vos_wire::keys;
 use vos_wire::result::Write;

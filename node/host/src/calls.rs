@@ -17,8 +17,8 @@
 //! the call's signature, forwards the call to the leader, again through
 //! leader changes, and answers once it has applied the call itself.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -32,9 +32,9 @@ use vos_wire::records::{SessionMark, unstored};
 use vos_wire::result::Outcome;
 use vos_wire::{Decode, defaults, keys};
 
-use crate::node::{Answered, CallError, Inner, Reply, Run};
+use crate::node::{Answered, CallError, Inner, Reply, Run, random_u64};
 use crate::peer::Refusal;
-use crate::store::{Store, View};
+use crate::{lock, timeout};
 
 /// How long a forwarded call may take: its re-forwards, and the wait for
 /// this replica's own apply.
@@ -46,15 +46,6 @@ const REFORWARD: Duration = Duration::from_secs(2);
 const PAUSE: Duration = Duration::from_millis(100);
 /// Forwarded calls the leader runs at once for one forwarding replica.
 const FORWARDED: usize = 1024;
-/// `answer`, or `TimedOut` once `answered` has passed.
-async fn within_deadline(answered: Duration, answer: impl Future<Output = Answer>) -> Answer {
-    answer
-        .or(async {
-            smol::Timer::after(answered).await;
-            Answer::TimedOut
-        })
-        .await
-}
 
 /// One (agent, session)'s calls the leader has queued.
 #[derive(Default)]
@@ -74,7 +65,7 @@ pub(crate) struct Calls {
     /// The forwarded calls running here, by the replica that forwarded
     /// them, each by its token: a call forwarded again while it runs is
     /// answered once, when it ends.
-    forwarded: Mutex<HashMap<NodeNumber, std::collections::HashSet<u64>>>,
+    forwarded: Mutex<HashMap<NodeNumber, HashSet<u64>>>,
 }
 
 /// A forwarded call's place among those running, given back when it ends,
@@ -87,7 +78,7 @@ struct Running<'a> {
 
 impl Drop for Running<'_> {
     fn drop(&mut self) {
-        let mut forwarded = self.calls.forwarded.lock().expect("the forwarded");
+        let mut forwarded = lock(&self.calls.forwarded);
         if let Some(running) = forwarded.get_mut(&self.from) {
             running.remove(&self.token);
             if running.is_empty() {
@@ -123,12 +114,18 @@ pub(crate) fn answer_of(reply: Result<Answered, CallError>) -> Answer {
             reply: Reply::Ran(outcome),
             at,
         }) => Answer::Ran { outcome, at },
-        Ok(Answered { reply, .. }) => match reply {
-            Reply::Ran(_) => unreachable!("matched above"),
-            Reply::Refused(code) => Answer::Refused(code),
-            Reply::Failed => Answer::NotConsumed,
-            Reply::TooOld => Answer::Rejected(Rejection::TooOld),
-        },
+        Ok(Answered {
+            reply: Reply::Refused(code),
+            ..
+        }) => Answer::Refused(code),
+        Ok(Answered {
+            reply: Reply::Failed,
+            ..
+        }) => Answer::NotConsumed,
+        Ok(Answered {
+            reply: Reply::TooOld,
+            ..
+        }) => Answer::Rejected(Rejection::TooOld),
         Err(CallError::Failed(_)) => Answer::Unavailable,
         Err(CallError::Busy) => Answer::Busy,
         Err(CallError::NoAgent) => Answer::NoAgent,
@@ -149,8 +146,7 @@ pub(crate) fn verify(key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bo
 /// and every executor, sized to one agent's live sessions: with many busy
 /// agents it overflows, and a key evicted is decompressed again. Only keys
 /// that decompress are kept.
-static KEYS: std::sync::LazyLock<Keys> =
-    std::sync::LazyLock::new(|| kept_keys(defaults::MAX_SESSIONS as usize));
+static KEYS: LazyLock<Keys> = LazyLock::new(|| kept_keys(defaults::MAX_SESSIONS as usize));
 
 type Keys = quick_cache::sync::Cache<[u8; 32], VerifyingKey>;
 
@@ -215,7 +211,7 @@ impl Inner {
         if let Err(error) = self.settled(agent).await {
             return answer_of(Err(error));
         }
-        if run.agent.queue.lock().expect("the queue").leading {
+        if lock(&run.agent.queue).leading {
             self.lane_call(agent, call).await
         } else {
             self.forward(&run, agent, call).await
@@ -247,12 +243,9 @@ impl Inner {
         };
         match next {
             Next::Answer(answer) => answer,
-            Next::Wait(wait) => {
-                within_deadline(self.answered, async {
-                    wait.recv().await.unwrap_or(Answer::Stopped)
-                })
+            Next::Wait(wait) => timeout(self.settings.answered, wait.recv())
                 .await
-            }
+                .map_or(Answer::TimedOut, |answer| answer.unwrap_or(Answer::Stopped)),
             Next::Queue => {
                 let (session, sequence) = (call.session, call.sequence);
                 let request = Request {
@@ -272,10 +265,9 @@ impl Inner {
                     let settled = inner.queued_call(agent, session, sequence, running).await;
                     let _ = answered.try_send(settled);
                 });
-                within_deadline(self.answered, async {
-                    answer.recv().await.unwrap_or(Answer::Stopped)
-                })
-                .await
+                timeout(self.settings.answered, answer.recv())
+                    .await
+                    .map_or(Answer::TimedOut, |answer| answer.unwrap_or(Answer::Stopped))
             }
         }
     }
@@ -313,7 +305,7 @@ impl Inner {
             answer => answer,
         };
         let waiting = {
-            let mut lanes = self.calls.lanes.lock().expect("the lanes");
+            let mut lanes = lock(&self.calls.lanes);
             let lane = lanes.entry(lane_key).or_default();
             let waiting = lane.inflight.remove(&sequence).unwrap_or_default();
             // Not consumed, the mark stays: the client resends it.
@@ -334,7 +326,7 @@ impl Inner {
     /// What a call's lane does with it now.
     fn next(&self, agent: AgentId, call: &Call) -> Next {
         let sequence = call.sequence;
-        let mut lanes = self.calls.lanes.lock().expect("the lanes");
+        let mut lanes = lock(&self.calls.lanes);
         // Read under the lock: an answered call's commit is durable before
         // its lane changes, so the mark read here includes it.
         let Applied {
@@ -446,21 +438,13 @@ impl Inner {
     /// then answer once this replica has applied it.
     async fn forward(self: &Arc<Self>, run: &Arc<Run>, agent: AgentId, call: Call) -> Answer {
         let until = Instant::now() + FORWARDING;
-        let token = u64::from_le_bytes(crate::node::seed()[..8].try_into().expect("8 bytes"));
+        let token = random_u64();
         let (answer, answered) = smol::channel::unbounded::<(u64, Answer)>();
-        self.calls
-            .forwards
-            .lock()
-            .expect("the forwards")
-            .insert(token, answer);
+        lock(&self.calls.forwards).insert(token, answer);
         let answer = self
             .forwarding(run, agent, &call, token, &answered, until)
             .await;
-        self.calls
-            .forwards
-            .lock()
-            .expect("the forwards")
-            .remove(&token);
+        lock(&self.calls.forwards).remove(&token);
         answer
     }
 
@@ -489,7 +473,7 @@ impl Inner {
                 return Answer::Stopped;
             }
             // This replica leads now: the call runs in its own lane.
-            if run.agent.queue.lock().expect("the queue").leading {
+            if lock(&run.agent.queue).leading {
                 return self.lane_call(agent, call.clone()).await;
             }
             // The leader this replica follows, or one named at a later term
@@ -504,7 +488,7 @@ impl Inner {
             let Some(to) = leader.filter(|leader| *leader != self.number) else {
                 // No leader known, or this replica leading before its loop
                 // takes calls: wait for either to change.
-                within(
+                timeout(
                     left,
                     run.shared
                         .wait(|state| changed(state) || self.knows_leader(run, state)),
@@ -528,11 +512,10 @@ impl Inner {
                 run.shared.wait(changed).await;
                 None
             };
-            let quiet = async {
-                smol::Timer::after(REFORWARD.min(left)).await;
-                None
-            };
-            match answer.or(moved).or(quiet).await {
+            match timeout(REFORWARD.min(left), answer.or(moved))
+                .await
+                .flatten()
+            {
                 // A node that leads at a later term than this replica
                 // knows, or knows who does: there, at once. One at an
                 // earlier term is behind: this replica waits for its own
@@ -551,13 +534,13 @@ impl Inner {
                         .map(|leader| (leader, answered_at));
                     if named.is_none() {
                         let left = until.saturating_duration_since(Instant::now());
-                        within(PAUSE.min(left), run.shared.wait(changed)).await;
+                        timeout(PAUSE.min(left), run.shared.wait(changed)).await;
                     }
                 }
                 Some((_, Answer::Ran { outcome, at })) => {
                     // No reply before its apply here.
                     let left = until.saturating_duration_since(Instant::now());
-                    let applied = within(
+                    let applied = timeout(
                         left,
                         run.shared
                             .wait(|state| state.stopped || state.applied >= at),
@@ -580,7 +563,7 @@ impl Inner {
                     | Answer::Unavailable,
                 )) => {
                     let left = until.saturating_duration_since(Instant::now());
-                    within(PAUSE.min(left), run.shared.wait(changed)).await;
+                    timeout(PAUSE.min(left), run.shared.wait(changed)).await;
                 }
                 // The leader is full: at the first send nothing ran, and
                 // the client may wait and send again. After that, an
@@ -588,7 +571,7 @@ impl Inner {
                 Some((_, Answer::Busy)) if sent == 1 => return Answer::Busy,
                 Some((_, Answer::Busy)) => {
                     let left = until.saturating_duration_since(Instant::now());
-                    within(REFORWARD.min(left), run.shared.wait(changed)).await;
+                    timeout(REFORWARD.min(left), run.shared.wait(changed)).await;
                 }
                 // Answers that say the call did not run, about one send of
                 // several: another may still run it.
@@ -653,7 +636,7 @@ impl Inner {
             return;
         }
         let admitted = {
-            let mut forwarded = self.calls.forwarded.lock().expect("the forwarded");
+            let mut forwarded = lock(&self.calls.forwarded);
             let running = forwarded.entry(from).or_default();
             if running.contains(&token) {
                 // It runs already, and is answered when it ends.
@@ -711,13 +694,7 @@ impl Inner {
             self.drops.count(refusal);
             return;
         }
-        let waiting = self
-            .calls
-            .forwards
-            .lock()
-            .expect("the forwards")
-            .get(&token)
-            .cloned();
+        let waiting = lock(&self.calls.forwards).get(&token).cloned();
         match waiting {
             Some(waiting) => {
                 let _ = waiting.try_send((term, answer));
@@ -725,19 +702,6 @@ impl Inner {
             None => self.drops.count(Refusal::Unmatched),
         }
     }
-}
-
-/// `work`, if it ends within `left`.
-pub(crate) async fn within<T>(
-    left: Duration,
-    work: impl std::future::Future<Output = T>,
-) -> Option<T> {
-    let work = async { Some(work.await) };
-    work.or(async {
-        smol::Timer::after(left).await;
-        None
-    })
-    .await
 }
 
 #[cfg(test)]

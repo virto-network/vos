@@ -11,7 +11,6 @@ use vos_checker::calls::{Total, signed_query};
 use vos_checker::programs::{actor, method};
 use vos_checker::{ANSWERED, ATTEMPT, COUNTER, Nodes, wait_until};
 use vos_node::client::{Client, post_within};
-use vos_node::store::{Store, View};
 use vos_wire::ids::{AgentId, MethodId, Session};
 use vos_wire::ingress::{Answer, Call, Consistency, Rejection, call_message};
 use vos_wire::peer::NodeNumber;

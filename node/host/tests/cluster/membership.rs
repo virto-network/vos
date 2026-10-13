@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use vos_checker::calls::done;
 use vos_checker::programs::actor;
-use vos_node::store::{Batch as _, Durability, Fjall, Store, View};
+use vos_node::store::{Fjall, PersistMode};
 use vos_wire::ingress::Unplaced;
 use vos_wire::peer::{NodeNumber, PeerMessage};
 
@@ -224,7 +224,7 @@ fn a_retirement_cut_short_finishes_at_the_next_start() {
         );
         let mut batch = store.batch();
         batch.placement(agent, &placement);
-        batch.commit(Durability::Synced).unwrap();
+        batch.commit(PersistMode::SyncAll).unwrap();
     }
     cluster.hub.isolate(removed);
     cluster.start(removed);

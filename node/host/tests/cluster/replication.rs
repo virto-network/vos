@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use vos_checker::calls::done;
 use vos_checker::programs::actor;
-use vos_node::store::{EntryKind, Store, View};
+use vos_node::store::EntryKind;
 use vos_node::{CallError, Hooks, Node, Reply};
 use vos_wire::Encode;
 use vos_wire::abi::refusal;

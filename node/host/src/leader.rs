@@ -19,7 +19,8 @@ use vos_wire::{expiry, keys};
 use crate::group::{DryRun, Local, Shared, State};
 use crate::node::{Agent, Answered, CallError, Inner, Pending, Reply, ran, read, reply, seed};
 use crate::pvm::{self, Fault};
-use crate::store::{BlobRef, EntryKind, FjallSnapshot, LogEntry, Store, View};
+use crate::store::{BlobRef, EntryKind, LogEntry, Snapshot};
+use crate::{lock, timeout};
 
 /// The first wait before retrying a batch the node failed, doubled each
 /// time up to [`MAX_BACKOFF`].
@@ -136,7 +137,7 @@ pub(crate) async fn lead(inner: Arc<Inner>, agent: Arc<Agent>, shared: Arc<Share
             state.leading_from.expect("a leader's first index"),
         );
         // Inputs queue from now on, while the term's no-op applies.
-        agent.queue.lock().expect("the queue").leading = true;
+        lock(&agent.queue).leading = true;
         shared.update(|_| {});
         // Everything before the term's no-op applies first.
         let state = shared
@@ -166,13 +167,7 @@ pub(crate) async fn lead(inner: Arc<Inner>, agent: Arc<Agent>, shared: Arc<Share
                         "the leader cannot start ({}); retrying in {backoff:?}",
                         fault.message()
                     );
-                    let lost = async {
-                        shared.wait(|state| !leads(state, term)).await;
-                    };
-                    lost.or(async {
-                        smol::Timer::after(backoff).await;
-                    })
-                    .await;
+                    timeout(backoff, shared.wait(|state| !leads(state, term))).await;
                     backoff = (backoff * 2).min(MAX_BACKOFF);
                     if leads(&shared.state(), term) {
                         continue;
@@ -244,7 +239,7 @@ impl Leader {
             trailing: false,
             marks: HashMap::new(),
             windows: HashMap::new(),
-            max_inputs: inner.max_inputs,
+            max_inputs: inner.settings.max_inputs,
             backoff: BACKOFF,
             skipped: false,
             swept: None,
@@ -324,7 +319,7 @@ impl Leader {
         let mut waited = false;
         loop {
             {
-                let queue = agent.queue.lock().expect("the queue");
+                let queue = lock(&agent.queue);
                 if queue.stopped {
                     return None;
                 }
@@ -371,9 +366,9 @@ impl Leader {
             waited = true;
         }
         if waited {
-            smol::Timer::after(inner.linger).await;
+            smol::Timer::after(inner.settings.linger).await;
         }
-        let mut queue = agent.queue.lock().expect("the queue");
+        let mut queue = lock(&agent.queue);
         if queue.stopped {
             return None;
         }
@@ -384,7 +379,7 @@ impl Leader {
             let Some((next, _)) = queue.inputs.front() else {
                 break;
             };
-            if !taken.is_empty() && bytes + next.bytes() > inner.max_bytes {
+            if !taken.is_empty() && bytes + next.bytes() > inner.settings.max_bytes {
                 break;
             }
             let (next, queued) = queue.inputs.pop_front().expect("a front input");
@@ -405,7 +400,7 @@ impl Leader {
     }
 
     /// A sender's pair mark, as applied.
-    fn mark(&mut self, snapshot: &FjallSnapshot, from: AgentId) -> Result<u64, Fault> {
+    fn mark(&mut self, snapshot: &Snapshot, from: AgentId) -> Result<u64, Fault> {
         if let Some(mark) = self.marks.get(&from) {
             return Ok(*mark);
         }
@@ -582,7 +577,7 @@ impl Leader {
             }
         };
         if pending.is_empty() {
-            self.max_inputs = inner.max_inputs;
+            self.max_inputs = inner.settings.max_inputs;
             return true;
         }
         let batch = Batch {
@@ -594,7 +589,7 @@ impl Leader {
         let blobs: Vec<BlobRef> = pending
             .iter()
             .flat_map(|item| match item {
-                Pending::Admin(_, _, blobs) => blobs.clone(),
+                Pending::Admin { blobs, .. } => blobs.clone(),
                 _ => Vec::new(),
             })
             .collect();
@@ -603,7 +598,7 @@ impl Leader {
             Ok(Ran::Done(result)) => {
                 self.skipped = false;
                 self.version += 1;
-                self.max_inputs = inner.max_inputs;
+                self.max_inputs = inner.settings.max_inputs;
                 self.backoff = BACKOFF;
                 swept(self);
                 if !inner.hooks.after_commit(self.id, self.applied) {
@@ -682,7 +677,7 @@ impl Leader {
         &mut self,
         inner: &Inner,
         shared: &Shared,
-        snapshot: Arc<FjallSnapshot>,
+        snapshot: Arc<Snapshot>,
         batch: &Batch,
         blobs: Vec<BlobRef>,
     ) -> Result<Ran, Fault> {
@@ -694,7 +689,7 @@ impl Leader {
         let store_blobs = inner.blobs.clone();
         let refined = batch.clone();
         let hooks = Arc::clone(&inner.hooks);
-        let gas = inner.refine_gas;
+        let gas = inner.settings.refine_gas;
         let state = Arc::clone(&snapshot);
         let queued = Instant::now();
         let (output, refine_gas) = ran(inner
@@ -872,9 +867,9 @@ impl Leader {
         );
         inner.requeue(agent, pending);
         // Wait in short slices, so a stop does not wait out the backoff.
-        let until = std::time::Instant::now() + self.backoff;
-        while !agent.queue.lock().expect("the queue").stopped {
-            let left = until.saturating_duration_since(std::time::Instant::now());
+        let until = Instant::now() + self.backoff;
+        while !lock(&agent.queue).stopped {
+            let left = until.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 break;
             }
@@ -901,7 +896,7 @@ impl Leader {
             agent = self.id.0,
             "the agent program fails on one input alone ({failed}); it is dropped"
         );
-        if let Pending::Request(_, answer) | Pending::Admin(_, answer, _) = input {
+        if let Pending::Request { answer, .. } | Pending::Admin { answer, .. } = input {
             let _ = answer.try_send(Ok(Answered {
                 reply: Reply::Failed,
                 at: self.applied,
@@ -918,7 +913,7 @@ impl Leader {
         agent: &Agent,
         pending: Vec<Pending>,
         result: &WorkResult,
-        before: &FjallSnapshot,
+        before: &Snapshot,
     ) {
         let snapshot = inner.store.snapshot();
         let mut acks: HashMap<AgentId, u64> = HashMap::new();
@@ -931,7 +926,7 @@ impl Leader {
                 continue;
             };
             match item {
-                Pending::Request(request, answer) => {
+                Pending::Request { request, answer } => {
                     let answered = match step {
                         Step::Refused {
                             code: refusal::SEQUENCE,
@@ -951,7 +946,7 @@ impl Leader {
                     let at = self.applied;
                     let _ = answer.try_send(answered.map(|reply| Answered { reply, at }));
                 }
-                Pending::Admin(_, answer, _) => {
+                Pending::Admin { answer, .. } => {
                     let _ = answer.try_send(Ok(Answered {
                         reply: reply(step),
                         at: self.applied,
@@ -1056,11 +1051,7 @@ impl Leader {
     /// Ingress lets a duplicate through when it read the mark before this
     /// replica applied the original, as a new leader's does while it
     /// catches up: this answers it.
-    fn duplicate(
-        &self,
-        snapshot: &FjallSnapshot,
-        request: &Request,
-    ) -> Result<Option<Reply>, Fault> {
+    fn duplicate(&self, snapshot: &Snapshot, request: &Request) -> Result<Option<Reply>, Fault> {
         let Some(id) =
             read::<SessionId>(snapshot, self.id, &keys::session_index(&request.session))?
         else {
@@ -1078,12 +1069,7 @@ impl Leader {
 
     /// Send `to` what the outbox holds past what this leadership sent it,
     /// in order, within its window.
-    fn deliver(
-        &mut self,
-        inner: &Inner,
-        snapshot: &FjallSnapshot,
-        to: AgentId,
-    ) -> Result<(), Fault> {
+    fn deliver(&mut self, inner: &Inner, snapshot: &Snapshot, to: AgentId) -> Result<(), Fault> {
         let acked = read::<u64>(snapshot, self.id, &keys::acked(to))?.unwrap_or(0);
         let last = read::<u64>(snapshot, self.id, &keys::pair_out(to))?.unwrap_or(0);
         let turn = u64::from(inner.number);
@@ -1178,10 +1164,7 @@ impl Leader {
 
 /// The first row of `agent`'s expiry index: the oldest bucket, and its
 /// session.
-fn first_expiry(
-    snapshot: &FjallSnapshot,
-    agent: AgentId,
-) -> Result<Option<(u64, SessionId)>, Fault> {
+fn first_expiry(snapshot: &Snapshot, agent: AgentId) -> Result<Option<(u64, SessionId)>, Fault> {
     for row in snapshot.scan(agent, &keys::expiry_prefix(), None) {
         let (key, _) = row.map_err(|error| Fault::Infrastructure(error.to_string()))?;
         if let Some(entry) = keys::expiry_entry(&key) {
@@ -1194,13 +1177,4 @@ fn first_expiry(
 fn raise(acks: &mut HashMap<AgentId, u64>, from: AgentId, sequence: u64) {
     let ack = acks.entry(from).or_insert(0);
     *ack = (*ack).max(sequence);
-}
-
-impl Pending {
-    /// Answer that this node does not lead, when the input has a caller.
-    pub(crate) fn refuse(self, hint: &CallError) {
-        if let Pending::Request(_, answer) | Pending::Admin(_, answer, _) = self {
-            let _ = answer.try_send(Err(hint.clone()));
-        }
-    }
 }

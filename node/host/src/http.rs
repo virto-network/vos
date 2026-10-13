@@ -10,17 +10,20 @@ use std::time::{Duration, Instant};
 use smol::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use smol::net::TcpListener;
 
+use crate::timeout;
+
 /// The most a request's head may hold.
 const MAX_HEAD: usize = 16 << 10;
-
-/// The most a body may hold, by method and path.
-pub type BodyLimit = Arc<dyn Fn(&str, &str) -> usize + Send + Sync>;
 
 /// What one connection may take.
 #[derive(Clone)]
 pub struct Limits {
-    /// Checked against a body's `Content-Length` before it is read.
-    pub body: BodyLimit,
+    /// The most a body may hold, checked against its `Content-Length`
+    /// before it is read.
+    pub body: usize,
+    /// The most an install's body (a `POST` to a path ending in
+    /// `/install`) may hold, in place of `body`.
+    pub install: usize,
     /// How long a connection may wait for its next bytes.
     pub idle: Duration,
     /// The most connections at once; more are closed on accept.
@@ -106,21 +109,14 @@ async fn accept(
         let acceptor = acceptor.clone();
         connections.push(spawn(Box::pin(async move {
             let served = match acceptor {
-                Some(acceptor) => {
-                    let handshake = async { Some(acceptor.accept(stream).await) };
-                    let late = async {
-                        smol::Timer::after(HANDSHAKE).await;
-                        None
-                    };
-                    match smol::future::or(handshake, late).await {
-                        Some(Ok(stream)) => connection(stream, handler, &limits).await,
-                        Some(Err(error)) => Err(error),
-                        None => Err(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            "a slow TLS handshake",
-                        )),
-                    }
-                }
+                Some(acceptor) => match timeout(HANDSHAKE, acceptor.accept(stream)).await {
+                    Some(Ok(stream)) => connection(stream, handler, &limits).await,
+                    Some(Err(error)) => Err(error),
+                    None => Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "a slow TLS handshake",
+                    )),
+                },
                 None => connection(stream, handler, &limits).await,
             };
             if let Err(error) = served {
@@ -179,14 +175,12 @@ async fn read(
         Some(deadline) => idle.min(deadline.saturating_duration_since(Instant::now())),
         None => idle,
     };
-    smol::future::or(stream.read(chunk), async {
-        smol::Timer::after(wait).await;
+    timeout(wait, stream.read(chunk)).await.unwrap_or_else(|| {
         Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
             "an idle or slow connection",
         ))
     })
-    .await
 }
 
 enum Read {
@@ -237,7 +231,12 @@ async fn read_request(
                     },
                     None => 0,
                 };
-                if length > (limits.body)(&method, &path) {
+                let limit = if method == "POST" && path.ends_with("/install") {
+                    limits.install
+                } else {
+                    limits.body
+                };
+                if length > limit {
                     return Ok(Read::Refuse(413));
                 }
                 let pending = buffer.len() < head + length;

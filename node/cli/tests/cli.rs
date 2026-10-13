@@ -231,7 +231,6 @@ impl vos_node::Hooks for LoseAnswer {
 fn a_pending_call_whose_session_was_collected_is_lost() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use vos_node::store::{Store, View};
     use vos_wire::{Decode, defaults, expiry, keys};
 
     let dir = tempfile::tempdir().unwrap();

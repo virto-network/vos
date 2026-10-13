@@ -8,7 +8,6 @@ use std::time::{Duration, Instant};
 
 use vos_checker::calls::done;
 use vos_checker::hooks::{FailNextSync, Gate};
-use vos_node::store::Store;
 use vos_node::{CallError, Reply};
 use vos_wire::ids::AgentId;
 use vos_wire::peer::NodeNumber;

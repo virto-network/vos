@@ -19,7 +19,6 @@ use vos_checker::hooks::{FailNextSync, Gate};
 use vos_checker::programs::Programs;
 use vos_checker::spaces::IN_PROCESS_WAIT;
 use vos_node::client::{self, Client, ClientError, Operator, Target};
-use vos_node::store::{Store, View};
 use vos_node::{ADMIN_TOKEN, Config, Hooks, Node};
 use vos_wire::abi::refusal;
 use vos_wire::batch::{Batch, Input};
@@ -551,7 +550,7 @@ fn the_status_route_reports_a_replica_and_a_halt() {
 #[test]
 fn a_node_is_its_public_key_and_never_serves_its_secret() {
     use std::os::unix::fs::PermissionsExt;
-    use vos_node::store::{Fjall, Store};
+    use vos_node::store::Fjall;
     let mode =
         |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
     let programs = Programs::load();

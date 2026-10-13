@@ -13,6 +13,7 @@ use vos_wire::batch::Message;
 use vos_wire::ids::AgentId;
 use vos_wire::peer::{NodeNumber, PeerMessage};
 
+use crate::lock;
 use crate::node::{Inner, Pending};
 use crate::peer::Refusal;
 
@@ -32,7 +33,7 @@ impl Inner {
     /// order on one stream.
     fn route(&self, agent: AgentId, turn: u64) -> Route {
         if let Some(run) = self.run(agent) {
-            if run.agent.queue.lock().expect("the queue").leading {
+            if lock(&run.agent.queue).leading {
                 return Route::Here;
             }
             // Never to itself: a group naming this node leader before its

@@ -26,7 +26,8 @@ use vos_wire::peer::{CreationRecord, Placement};
 use vos_wire::result::Write;
 
 use crate::Hooks;
-use crate::store::{Batch, Durability, Fjall, HardState, LogEntry, Membership, Row, Store, Switch};
+use crate::lock;
+use crate::store::{Fjall, HardState, LogEntry, Membership, PersistMode, Row, Switch};
 
 /// How long the oldest pending commit may wait before the writer counts as
 /// stalled.
@@ -249,11 +250,7 @@ impl Writer {
         for change in &commit.changes {
             match change {
                 Change::Compact { agent, through, .. } => {
-                    let durable = self
-                        .shared
-                        .durably_applied
-                        .lock()
-                        .expect("unpoisoned")
+                    let durable = lock(&self.shared.durably_applied)
                         .get(agent)
                         .copied()
                         .unwrap_or(0);
@@ -377,7 +374,7 @@ impl Writer {
         let started = Instant::now();
         self.shared.flush_commits.record(group.len() as u64);
         {
-            let pending = self.shared.pending.lock().expect("unpoisoned");
+            let pending = lock(&self.shared.pending);
             for commit in &group {
                 if let Some(queued) = pending.get(&commit.id) {
                     self.shared
@@ -465,16 +462,16 @@ impl Writer {
             taken.push((commit, None));
         }
         let durability = if synced {
-            Durability::Synced
+            PersistMode::SyncAll
         } else {
-            Durability::Buffered
+            PersistMode::Buffer
         };
         let result = if self.hooks.fail_commit() {
             Err("a hook failed the commit".to_string())
         } else if synced && self.hooks.fail_sync() {
             // Written but not synced, and failed, as a failed fsync is.
             batch
-                .commit(Durability::Buffered)
+                .commit(PersistMode::Buffer)
                 .map_err(|error| error.to_string())
                 .and(Err("a hook failed the sync".to_string()))
         } else {
@@ -493,7 +490,7 @@ impl Writer {
         } else {
             self.agents.extend(pending);
             if !retired.is_empty() {
-                let mut durable = self.shared.durably_applied.lock().expect("unpoisoned");
+                let mut durable = lock(&self.shared.durably_applied);
                 for agent in retired {
                     self.unsynced_applied.remove(&agent);
                     applied.remove(&agent);
@@ -507,7 +504,7 @@ impl Writer {
             if synced {
                 // Every batch before this one shares the journal, so it is
                 // durable now too.
-                let mut durable = self.shared.durably_applied.lock().expect("unpoisoned");
+                let mut durable = lock(&self.shared.durably_applied);
                 for (agent, index) in self.unsynced_applied.drain() {
                     let entry = durable.entry(agent).or_insert(index);
                     *entry = (*entry).max(index);
@@ -524,11 +521,7 @@ impl Writer {
     }
 
     fn answer(&self, commit: Commit, result: Result<(), String>) {
-        self.shared
-            .pending
-            .lock()
-            .expect("unpoisoned")
-            .remove(&commit.id);
+        lock(&self.shared.pending).remove(&commit.id);
         let _ = commit.done.try_send(result);
     }
 }
@@ -590,11 +583,7 @@ impl StorageThread {
     pub async fn commit(&self, changes: Vec<Change>) -> Result<(), String> {
         let (done, wait) = smol::channel::bounded(1);
         let id = self.next.fetch_add(1, Ordering::Relaxed);
-        self.shared
-            .pending
-            .lock()
-            .expect("unpoisoned")
-            .insert(id, Instant::now());
+        lock(&self.shared.pending).insert(id, Instant::now());
         let commit = Commit { id, changes, done };
         if let Err(error) = self
             .sender
@@ -602,11 +591,7 @@ impl StorageThread {
             .expect("the storage thread runs")
             .send(commit)
         {
-            self.shared
-                .pending
-                .lock()
-                .expect("unpoisoned")
-                .remove(&error.0.id);
+            lock(&self.shared.pending).remove(&error.0.id);
             return Err("the storage thread stopped".to_string());
         }
         wait.recv()
@@ -617,17 +602,14 @@ impl StorageThread {
     /// `agent` recovered with `applied` as its applied index, before any of
     /// its commits: the store synced what it recovered, so that is durable.
     pub fn recovered(&self, agent: AgentId, applied: u64) {
-        let mut durable = self.shared.durably_applied.lock().expect("unpoisoned");
+        let mut durable = lock(&self.shared.durably_applied);
         let entry = durable.entry(agent).or_insert(applied);
         *entry = (*entry).max(applied);
     }
 
     /// `agent`'s highest applied index a synced flush made durable.
     pub fn durably_applied(&self, agent: AgentId) -> u64 {
-        self.shared
-            .durably_applied
-            .lock()
-            .expect("unpoisoned")
+        lock(&self.shared.durably_applied)
             .get(&agent)
             .copied()
             .unwrap_or(0)
@@ -651,10 +633,7 @@ impl StorageThread {
 
     /// Whether a commit has waited longer than the stall bound.
     pub fn stalled(&self) -> bool {
-        self.shared
-            .pending
-            .lock()
-            .expect("unpoisoned")
+        lock(&self.shared.pending)
             .values()
             .next()
             .is_some_and(|queued| queued.elapsed() > self.stall_after)

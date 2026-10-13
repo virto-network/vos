@@ -14,7 +14,6 @@ use vos_checker::spaces::{free_tcp_port, space};
 use vos_checker::{Log, Nodes};
 use vos_net::memory::Hub;
 use vos_node::client::Target;
-use vos_node::store::{Store, View};
 use vos_node::{CallError, Config, Hooks, Node, Peers, Space};
 use vos_wire::Decode;
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session, SessionId};

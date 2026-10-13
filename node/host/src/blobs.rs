@@ -17,17 +17,18 @@
 //! A blob lives while a log row names it, a pin holds it, or it was put
 //! within a horizon; [`Blobs::collect`] removes the rest.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::Write as _;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fjall::{Keyspace, PersistMode, Readable};
 
+use crate::lock;
 use crate::storage::{Change, StorageThread};
 use crate::store::{BlobRef, Error, Fjall, Result};
 
@@ -65,12 +66,12 @@ pub fn blob_ref(bytes: &[u8]) -> BlobRef {
 /// moved on by the monotonic clock since, so a clock jumping during a run
 /// ages no blob past the horizon. A put's time, for the horizon only.
 fn now() -> u64 {
-    static START: std::sync::OnceLock<(u64, std::time::Instant)> = std::sync::OnceLock::new();
+    static START: OnceLock<(u64, Instant)> = OnceLock::new();
     let (wall, at) = START.get_or_init(|| {
         let wall = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |since| since.as_millis() as u64);
-        (wall, std::time::Instant::now())
+        (wall, Instant::now())
     });
     wall + at.elapsed().as_millis() as u64
 }
@@ -192,8 +193,8 @@ struct Inner {
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        self.sender.lock().expect("unpoisoned").take();
-        if let Some(thread) = self.thread.lock().expect("unpoisoned").take() {
+        lock(&self.sender).take();
+        if let Some(thread) = lock(&self.thread).take() {
             let _ = thread.join();
         }
     }
@@ -278,7 +279,7 @@ impl Blobs {
                 .spawn(move || writer.run(receiver))
                 .expect("the blob writer starts")
         };
-        *inner.thread.lock().expect("unpoisoned") = Some(thread);
+        *lock(&inner.thread) = Some(thread);
         Ok(Self { inner })
     }
 
@@ -310,10 +311,7 @@ impl Blobs {
         make: impl FnOnce(Answer<T>) -> Request,
     ) -> std::result::Result<T, String> {
         let (done, wait) = smol::channel::bounded(1);
-        self.inner
-            .sender
-            .lock()
-            .expect("unpoisoned")
+        lock(&self.inner.sender)
             .as_ref()
             .ok_or("the blob writer stopped")?
             .send(make(done))
@@ -361,7 +359,7 @@ impl Blobs {
 
     fn read(&self, location: &Location) -> Result<Vec<u8>> {
         let file = {
-            let mut files = self.inner.files.lock().expect("unpoisoned");
+            let mut files = lock(&self.inner.files);
             match files.get(&location.segment) {
                 Some(file) => Arc::clone(file),
                 None => {
@@ -417,29 +415,25 @@ impl Blobs {
         writer: &StorageThread,
         horizon: Duration,
         stop: &dyn Fn() -> bool,
-    ) -> Result<Collected> {
+    ) -> std::result::Result<Collected, String> {
         let _one = self.inner.collecting.lock().await;
         let mut collected = Collected::default();
         let store = &self.inner.store;
-        let barrier = || async {
-            writer
-                .commit(vec![Change::Barrier])
-                .await
-                .map_err(|error| Error::Io(std::io::Error::other(error)))
-        };
+        let failed = |error: Error| error.to_string();
+        let barrier = || writer.commit(vec![Change::Barrier]);
         // A blob put at or before the cutoff has aged out of the horizon.
         let cutoff = now().saturating_sub(horizon.as_millis() as u64);
         let first = store.database().snapshot();
         // Only a blob aged and unpinned can go: with none, no log row is
         // read.
-        let mut pinned = std::collections::HashSet::new();
+        let mut pinned = HashSet::new();
         for row in first.prefix(&self.inner.index, [IndexRow::Pin as u8]) {
-            let key = row.key()?;
+            let key = row.key().map_err(failed)?;
             pinned.insert(<[u8; 32]>::try_from(&key[1..33]).expect("a pin names a hash"));
         }
         let mut candidates = Vec::new();
         for row in first.prefix(&self.inner.index, [IndexRow::Location as u8]) {
-            let (key, value) = row.into_inner()?;
+            let (key, value) = row.into_inner().map_err(failed)?;
             let hash: [u8; 32] = key[1..].try_into().expect("a location names a hash");
             let location = Location::decode(&value).expect("a location this store wrote");
             if location.time <= cutoff && !pinned.contains(&hash) {
@@ -450,7 +444,7 @@ impl Blobs {
             // What the snapshot shows becomes durable with the barrier after
             // it, so the references read are ones a crash cannot bring back.
             barrier().await?;
-            let referenced = store.referenced_blobs(&first)?;
+            let referenced = store.referenced_blobs(&first).map_err(failed)?;
             candidates.retain(|hash| !referenced.contains(hash));
         } else {
             candidates.clear();
@@ -460,7 +454,7 @@ impl Blobs {
             // A fence: anything that came to need a candidate since is seen.
             let second = store.database().snapshot();
             barrier().await?;
-            let referenced = store.referenced_blobs(&second)?;
+            let referenced = store.referenced_blobs(&second).map_err(failed)?;
             drop(second);
             candidates.retain(|hash| !referenced.contains(hash));
             // The blob writer removes them, synced, in order with puts and
@@ -472,10 +466,9 @@ impl Blobs {
                     cutoff,
                     done,
                 })
-                .await
-                .map_err(|error| Error::Io(std::io::Error::other(error)))?;
+                .await?;
         }
-        let (live, current) = self.live_bytes()?;
+        let (live, current) = self.live_bytes().map_err(failed)?;
         let mut to_delete = Vec::new();
         'segments: for (segment, live) in live {
             if segment == current {
@@ -491,16 +484,14 @@ impl Blobs {
                     if stop() {
                         break 'segments;
                     }
-                    let Some(bytes) = self.get(&hash)? else {
+                    let Some(bytes) = self.get(&hash).map_err(failed)? else {
                         continue;
                     };
                     let blob = BlobRef {
                         hash,
                         len: location.len,
                     };
-                    self.send(blob, Arc::new(bytes), true)
-                        .await
-                        .map_err(|error| Error::Io(std::io::Error::other(error)))?;
+                    self.send(blob, Arc::new(bytes), true).await?;
                     collected.moved += 1;
                 }
                 to_delete.push(segment);
@@ -511,28 +502,30 @@ impl Blobs {
         }
         // The moved blobs' new index rows are durable before their old
         // segment goes.
-        store.database().persist(PersistMode::SyncAll)?;
+        store
+            .database()
+            .persist(PersistMode::SyncAll)
+            .map_err(failed)?;
         let mut batch = store.database().batch();
         for &segment in &to_delete {
             batch.remove(&self.inner.index, segment_key(segment));
         }
-        batch.durability(Some(PersistMode::SyncAll)).commit()?;
+        batch
+            .durability(Some(PersistMode::SyncAll))
+            .commit()
+            .map_err(failed)?;
         for segment in to_delete {
-            self.inner
-                .files
-                .lock()
-                .expect("unpoisoned")
-                .remove(&segment);
+            lock(&self.inner.files).remove(&segment);
             // Gone already: a crash took back the rows' removal, not this.
             match std::fs::remove_file(segment_path(&self.inner.dir, segment)) {
                 Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-                    return Err(error.into());
+                    return Err(error.to_string());
                 }
                 _ => {}
             }
             collected.segments_deleted += 1;
         }
-        sync_dir(&self.inner.dir)?;
+        sync_dir(&self.inner.dir).map_err(failed)?;
         Ok(collected)
     }
 
@@ -875,7 +868,7 @@ impl Writer {
 mod tests {
     use super::*;
     use crate::NoHooks;
-    use crate::store::{Batch, Durability, LogEntry, Store};
+    use crate::store::{LogEntry, PersistMode};
     use vos_wire::ids::AgentId;
 
     fn bytes(seed: u8, len: usize) -> Arc<Vec<u8>> {
@@ -1010,7 +1003,7 @@ mod tests {
         let mut batch = store.batch();
         batch.append(AgentId(1), 1, &entry);
         batch.pin(&pinned.hash, AgentId(1));
-        batch.commit(Durability::Synced).unwrap();
+        batch.commit(PersistMode::SyncAll).unwrap();
 
         // Everything is younger than a day: nothing goes.
         let kept =

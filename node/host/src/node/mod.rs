@@ -7,28 +7,31 @@
 //! replica has applied it, the replies, the outbox's deliveries and the
 //! acknowledgements. Every replica applies the committed log the same way.
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+mod config;
+mod open;
+mod queue;
+
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::panic::AssertUnwindSafe;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
-use ed25519_dalek::SigningKey;
 use smol::future::FutureExt;
 use vos_net::{Class, Network, Refused};
-use vos_pvm::PvmBackend;
 use vos_pvm::pool::{CodeHash, MachinePool, OuterMachines};
 use vos_raft::Role;
-use vos_wire::batch::{Admin, Input, Message, Query, Request, Work};
+use vos_wire::Decode;
+use vos_wire::batch::{Admin, Message, Query, Request, Work};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash};
 use vos_wire::ingress::{Contact, NodeId, Unplaced};
 use vos_wire::peer::{CreationRecord, NodeNumber, Placement};
 use vos_wire::records::unstored;
 use vos_wire::result::{Outcome, Step, Write};
-use vos_wire::{Decode, defaults};
 
 use crate::Hooks;
 use crate::blobs::Blobs;
@@ -37,300 +40,16 @@ use crate::group::{self, DryRun, Input as GroupInput, Local, Shared};
 use crate::pvm::{self, Fault};
 use crate::space::Space;
 use crate::storage::{Change, StorageThread};
-use crate::store::{Batch as _, BlobRef, Durability, Fjall, FjallSnapshot, LogEntry, Store, View};
+use crate::store::{BlobRef, Fjall, LogEntry, Snapshot};
 use crate::tls::IngressTls;
+use crate::{lock, timeout};
 
-/// How a node reaches the other nodes of its space.
-#[derive(Clone)]
-pub enum Peers {
-    /// QUIC, listening on this node's peer address in the space.
-    Quic,
-    /// A hub in this process, for tests.
-    Hub(vos_net::memory::Hub),
-}
-
-/// How a node runs.
-pub struct Config {
-    /// The agent program every agent runs, as a standard program.
-    pub agent: Vec<u8>,
-    /// Executor threads for PVM work.
-    pub executors: usize,
-    /// Client requests an agent queues before a call answers busy.
-    pub queue: usize,
-    /// The most inputs in one batch.
-    pub max_inputs: usize,
-    /// The most argument bytes in one batch.
-    pub max_bytes: usize,
-    /// How long a leader waits for more inputs after the first, when it
-    /// found its queue empty.
-    pub linger: Duration,
-    /// Refine's gas for one run: a batch, or a query.
-    pub refine_gas: u64,
-    /// Accumulate's gas for the agents this node creates: their creation
-    /// records carry it to every replica.
-    pub accumulate_gas: u64,
-    /// Where a test breaks the node as a crash or a bug would.
-    pub hooks: Arc<dyn Hooks>,
-    /// The faults a test injects, read from a control file.
-    #[cfg(feature = "faults")]
-    pub faults: Option<Arc<crate::faults::Faults>>,
-    /// Milliseconds since the Unix epoch: work-result time, and ingress's
-    /// freshness checks. A test moves it.
-    pub clock: Arc<dyn Fn() -> u64 + Send + Sync>,
-    /// TLS on the ingress. Without it, the ingress serves loopback
-    /// addresses only.
-    pub ingress_tls: Option<IngressTls>,
-    /// The space this node runs in. Without one, it is a space of one, as
-    /// node 0.
-    pub space: Option<Space>,
-    /// How the node reaches the other nodes of its space.
-    pub peers: Peers,
-    /// Where the peer endpoint binds, when not the address its space
-    /// lists: behind port forwarding, a relay, or in a container.
-    pub peer_bind: Option<std::net::SocketAddr>,
-    /// How long a connection to a peer may stay quiet before it closes.
-    pub quic_idle: Duration,
-    /// A replica group's election timeout in milliseconds, drawn between
-    /// these.
-    pub election_timeout_ms: (u64, u64),
-    /// How often a group's leader sends heartbeats, in milliseconds.
-    pub heartbeat_ms: u64,
-    /// How long a call or an admin command, once queued at the leader,
-    /// waits for its answer before it answers that it may have run.
-    pub answered: Duration,
-    /// A group's log is compacted once this many entries past its start
-    /// are applied durably.
-    pub compact_every: u64,
-    /// A group's log is compacted once this many bytes of entries past its
-    /// start are applied durably, as its core counts an entry.
-    pub compact_bytes: u64,
-    /// The most entries a compaction keeps below the point it could
-    /// compact to, for a follower a little behind.
-    pub compact_tail: u64,
-    /// The most bytes of entries a compaction keeps below that point: well
-    /// under `compact_bytes`, or every commit makes a compaction due.
-    pub compact_tail_bytes: u64,
-    /// How often the node collects its blob store.
-    pub blob_collect_every: Duration,
-    /// A blob goes once no log row names it, no pin holds it, and nobody
-    /// put or touched it within this horizon: long enough for an install's
-    /// entry to name the programs its leader alone holds.
-    pub blob_horizon: Duration,
-    /// About how many bytes of rows one snapshot chunk carries.
-    pub snapshot_chunk: usize,
-    /// How long a leader waits for a follower to acknowledge a snapshot
-    /// before it would send another: one still streaming goes on, and the
-    /// leader starts another only once it ended.
-    pub snapshot_timeout_ms: u64,
-}
-
-impl Config {
-    pub fn new(agent: Vec<u8>) -> Self {
-        Self {
-            agent,
-            executors: std::thread::available_parallelism()
-                .map_or(1, |cores| cores.get().saturating_sub(1).max(1)),
-            queue: 1024,
-            max_inputs: 256,
-            max_bytes: 1 << 20,
-            linger: Duration::from_millis(2),
-            refine_gas: defaults::REFINE_GAS,
-            accumulate_gas: defaults::REFINE_GAS,
-            hooks: Arc::new(crate::NoHooks),
-            #[cfg(feature = "faults")]
-            faults: None,
-            clock: Arc::new(wall_clock),
-            ingress_tls: None,
-            space: None,
-            peer_bind: None,
-            quic_idle: vos_net::quic::IDLE,
-            peers: Peers::Quic,
-            election_timeout_ms: (1500, 3000),
-            heartbeat_ms: 500,
-            answered: Duration::from_secs(30),
-            compact_every: 1024,
-            compact_bytes: 64 << 20,
-            blob_collect_every: Duration::from_secs(600),
-            blob_horizon: Duration::from_secs(3_600),
-            compact_tail: 256,
-            compact_tail_bytes: 16 << 20,
-            snapshot_chunk: 1 << 20,
-            snapshot_timeout_ms: 60_000,
-        }
-    }
-}
-
-/// How the node answered a request or an admin command.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Reply {
-    /// The step ran: the handler's reply, or its failure.
-    Ran(Outcome),
-    /// Refine refused it, with a code from [`vos_wire::abi::refusal`].
-    Refused(u32),
-    /// The agent program fails on a batch holding this input alone.
-    Failed,
-    /// A duplicate whose reply the window no longer keeps.
-    TooOld,
-}
-
-/// Why a call has no reply.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CallError {
-    /// The agent's queue is full.
-    Busy,
-    NoAgent,
-    /// The agent's leader stopped before answering.
-    Stopped,
-    /// Storage or the agent program failed.
-    Failed(String),
-    /// This node does not lead the agent: its leader, when known.
-    NotLeader(Option<Contact>),
-    /// This node does not replicate the agent: its replicas.
-    Elsewhere(Vec<Contact>),
-    /// The agent is created, but a majority of its replicas does not hold
-    /// its record yet: it reaches them as they return.
-    Unconfirmed(AgentId),
-    /// No answer within the node's deadline: it may have run, or may yet.
-    TimedOut,
-}
-
-#[derive(Debug)]
-pub enum Error {
-    Store(fjall::Error),
-    /// The agent program does not load, or a stored program does not
-    /// install.
-    Program(String),
-    /// The refine gas cannot fit the largest handler with the agent's
-    /// reserves: some input could never be dispatched.
-    Gas,
-    /// The data directory, the space, the network or the ingress's
-    /// listener failed.
-    Data(String),
-}
-
-impl From<fjall::Error> for Error {
-    fn from(error: fjall::Error) -> Self {
-        Error::Store(error)
-    }
-}
-
-/// A reply, with the applied index of the state it reflects.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Answered {
-    pub(crate) reply: Reply,
-    pub(crate) at: u64,
-}
-
-pub(crate) type Answer = smol::channel::Sender<Result<Answered, CallError>>;
-
-/// A queued input, with where its reply goes.
-pub(crate) enum Pending {
-    Request(Request, Answer),
-    /// An admin command, with the blobs its entry names.
-    Admin(Admin, Answer, Vec<BlobRef>),
-    Message(Message),
-    Ack {
-        to: AgentId,
-        sequence: u64,
-    },
-    /// The leader's sweep of expired sessions.
-    Sweep,
-}
-
-impl Pending {
-    pub(crate) fn input(&self) -> Input {
-        match self {
-            Pending::Request(request, _) => Input::Request(request.clone()),
-            Pending::Admin(admin, _, _) => Input::Admin(admin.clone()),
-            Pending::Message(message) => Input::Message(message.clone()),
-            Pending::Ack { to, sequence } => Input::Ack {
-                to: *to,
-                sequence: *sequence,
-            },
-            Pending::Sweep => Input::Sweep,
-        }
-    }
-
-    pub(crate) fn bytes(&self) -> usize {
-        match self {
-            Pending::Request(request, _) => request.arguments.len(),
-            Pending::Message(message) => message.arguments.len(),
-            Pending::Admin(..) | Pending::Ack { .. } | Pending::Sweep => 0,
-        }
-    }
-
-    /// Counts against the queue cap: what a client queued.
-    pub(crate) fn capped(&self) -> bool {
-        matches!(self, Pending::Request(..) | Pending::Admin(..))
-    }
-
-    /// Counts against the cap on the messages other agents queue, which
-    /// other nodes now fill. Acknowledgements do not: they open this
-    /// agent's own windows, and the batch takes one per target.
-    pub(crate) fn agents_sent(&self) -> bool {
-        matches!(self, Pending::Message(_))
-    }
-}
-
-#[derive(Default)]
-pub(crate) struct Queue {
-    /// Each with when it was queued.
-    pub(crate) inputs: VecDeque<(Pending, Instant)>,
-    /// Capped inputs queued.
-    pub(crate) capped: usize,
-    /// Messages from other agents queued.
-    pub(crate) from_agents: usize,
-    pub(crate) stopped: bool,
-    /// The leader loop takes inputs: set when this replica's leadership
-    /// starts, and cleared with the refusal of what it left. Under the
-    /// queue's lock, so no input is queued where no loop will take it.
-    pub(crate) leading: bool,
-}
-
-pub(crate) struct Agent {
-    pub(crate) queue: Mutex<Queue>,
-    wake: smol::channel::Sender<()>,
-    pub(crate) woken: smol::channel::Receiver<()>,
-}
-
-impl Agent {
-    fn new() -> Self {
-        let (wake, woken) = smol::channel::bounded(1);
-        Self {
-            queue: Mutex::new(Queue::default()),
-            wake,
-            woken,
-        }
-    }
-
-    /// Stop the agent's leader after its batch in flight. Queued inputs are
-    /// dropped: their callers see `Stopped`.
-    pub(crate) fn stop(&self) {
-        let dropped = {
-            let mut queue = self.queue.lock().expect("the queue");
-            queue.stopped = true;
-            queue.capped = 0;
-            queue.from_agents = 0;
-            std::mem::take(&mut queue.inputs)
-        };
-        drop(dropped);
-        let _ = self.wake.try_send(());
-    }
-
-    /// Answer every queued input with `error`: this node no longer leads.
-    pub(crate) fn refuse(&self, error: &CallError) {
-        let refused = {
-            let mut queue = self.queue.lock().expect("the queue");
-            queue.leading = false;
-            queue.capped = 0;
-            queue.from_agents = 0;
-            std::mem::take(&mut queue.inputs)
-        };
-        for (pending, _) in refused {
-            pending.refuse(error);
-        }
-    }
-}
+pub(crate) use config::Settings;
+pub use config::{CallError, Config, Error, Peers, ReplaceError, Reply};
+use open::write_token;
+pub use open::{ADMIN_TOKEN, NODE_KEY, STORE, wall_clock};
+pub(crate) use open::{random_u64, seed};
+pub(crate) use queue::{Agent, Answered, Pending};
 
 /// What the network sends through.
 pub(crate) trait Wire: Send + Sync {
@@ -403,15 +122,6 @@ const REPLACED: Duration = Duration::from_secs(30);
 /// by the node that took over.
 const REPLACED_ELSEWHERE: Duration = Duration::from_secs(2);
 
-/// Why a replica was not replaced.
-#[derive(Debug)]
-pub enum ReplaceError {
-    Call(CallError),
-    Unplaced(Unplaced),
-    /// The change goes on: the agent's placement says where it is.
-    TimedOut,
-}
-
 /// A group's inbox: Raft messages beyond it are dropped, and resent.
 const GROUP_INBOX: usize = 1024;
 
@@ -429,12 +139,7 @@ pub(crate) struct Inner {
     pub(crate) pool: Arc<MachinePool>,
     pub(crate) program: Arc<OuterMachines>,
     pub(crate) program_hash: ProgramHash,
-    queue: usize,
-    pub(crate) max_inputs: usize,
-    pub(crate) max_bytes: usize,
-    pub(crate) linger: Duration,
-    pub(crate) refine_gas: u64,
-    accumulate_gas: u64,
+    pub(crate) settings: Settings,
     pub(crate) hooks: Arc<dyn Hooks>,
     pub(crate) clock: Arc<dyn Fn() -> u64 + Send + Sync>,
     pub(crate) node_id: NodeId,
@@ -442,20 +147,8 @@ pub(crate) struct Inner {
     pub(crate) number: NodeNumber,
     pub(crate) space: Option<Space>,
     pub(crate) network: Option<Arc<dyn Wire>>,
-    pub(crate) election_timeout_ms: (u64, u64),
-    /// How long a queued call or admin command waits for its answer.
-    pub(crate) answered: Duration,
-    pub(crate) heartbeat_ms: u64,
-    pub(crate) compact_every: u64,
-    pub(crate) compact_bytes: u64,
-    pub(crate) compact_tail: u64,
-    pub(crate) compact_tail_bytes: u64,
-    pub(crate) blob_collect_every: Duration,
-    pub(crate) blob_horizon: Duration,
-    pub(crate) snapshot_chunk: usize,
-    pub(crate) snapshot_timeout_ms: u64,
     /// Every agent this node knows of, and where it runs.
-    pub(crate) directory: Mutex<HashMap<AgentId, Known>>,
+    pub(crate) directory: Mutex<HashMap<AgentId, Arc<Known>>>,
     /// For each agent whose placement this node announced, its order and
     /// the nodes yet to hold one at least as new.
     pub(crate) unacknowledged: Mutex<HashMap<AgentId, (Order, BTreeSet<NodeNumber>)>>,
@@ -487,27 +180,27 @@ pub(crate) struct Inner {
     /// compares and writes, and neither may store over a newer placement.
     pub(crate) recording: smol::lock::Mutex<()>,
     /// Turns through an agent's replicas, for what goes to one of them.
-    pub(crate) turn: std::sync::atomic::AtomicU64,
+    pub(crate) turn: AtomicU64,
     /// Messages sent toward other nodes.
-    pub(crate) sent_across: std::sync::atomic::AtomicU64,
+    pub(crate) sent_across: AtomicU64,
     /// Snapshots this node's groups switched to.
-    pub(crate) installed: std::sync::atomic::AtomicU64,
+    pub(crate) installed: AtomicU64,
     /// Snapshot streams this node's groups started to their followers.
-    pub(crate) streamed: std::sync::atomic::AtomicU64,
+    pub(crate) streamed: AtomicU64,
     /// How long its leaders' batches spend in each stage.
     pub(crate) stats: Arc<crate::stats::Stats>,
     /// The node is shutting down: no group starts or retires.
-    pub(crate) closing: std::sync::atomic::AtomicBool,
+    pub(crate) closing: AtomicBool,
     /// Agents whose retirement is not yet written: no group starts for
     /// them until it is.
     pub(crate) retiring: Mutex<HashSet<AgentId>>,
     /// Storage failed: every group stopped, and the node sends no pair
     /// heartbeat.
-    pub(crate) halted: std::sync::atomic::AtomicBool,
+    pub(crate) halted: AtomicBool,
     /// The pair heartbeat this node sends, and what it hears.
     pub(crate) liveness: crate::liveness::Liveness,
     /// Messages relayed to their agent's leader.
-    pub(crate) relayed: std::sync::atomic::AtomicU64,
+    pub(crate) relayed: AtomicU64,
     /// Clients' calls: their lanes, and the calls forwarded both ways.
     pub(crate) calls: crate::calls::Calls,
     /// The read indexes this replica asked its leaders for.
@@ -516,14 +209,14 @@ pub(crate) struct Inner {
 
 impl Inner {
     pub(crate) fn run(&self, id: AgentId) -> Option<Arc<Run>> {
-        self.runs.lock().expect("the runs").get(&id).cloned()
+        lock(&self.runs).get(&id).cloned()
     }
 
     /// Why a call to `id` cannot be served here: a replica with no group
     /// running is stopping (or refused the group), and any other node
     /// names the replicas.
     pub(crate) fn absent(&self, id: AgentId) -> CallError {
-        match self.directory.lock().expect("the directory").get(&id) {
+        match lock(&self.directory).get(&id) {
             Some(known) if known.placement.replicas.contains(&self.number) => CallError::Stopped,
             Some(known) => CallError::Elsewhere(
                 known
@@ -539,9 +232,7 @@ impl Inner {
 
     /// Where agent `id` runs, as this node last heard.
     pub(crate) fn placement(&self, id: AgentId) -> Option<Placement> {
-        self.directory
-            .lock()
-            .expect("the directory")
+        lock(&self.directory)
             .get(&id)
             .map(|known| known.placement.clone())
     }
@@ -592,30 +283,21 @@ impl Inner {
         if !state.stopped && !self.knows_leader(&run, &state) {
             self.settled(id).await?;
         }
-        let caught_up = async {
-            run.shared
-                .wait(|state| {
-                    state.stopped
-                        || state
-                            .leading_from
-                            .is_none_or(|first| state.applied >= first)
-                })
-                .await;
-            true
-        };
-        let late = async {
-            smol::Timer::after(CATCH_UP).await;
-            false
-        };
-        if !caught_up.or(late).await {
+        let caught_up = run.shared.wait(|state| {
+            state.stopped
+                || state
+                    .leading_from
+                    .is_none_or(|first| state.applied >= first)
+        });
+        if timeout(CATCH_UP, caught_up).await.is_none() {
             return Err(CallError::Failed(
                 "the leader has not applied what it took over".into(),
             ));
         }
-        if run.shared.state().stopped || run.agent.queue.lock().expect("the queue").stopped {
+        if run.shared.state().stopped || lock(&run.agent.queue).stopped {
             return Err(CallError::Stopped);
         }
-        if !run.agent.queue.lock().expect("the queue").leading {
+        if !lock(&run.agent.queue).leading {
             return Err(self.not_leader(&run.shared));
         }
         Ok(run)
@@ -626,16 +308,14 @@ impl Inner {
     /// electing, then goes where it should.
     pub(crate) async fn settled(&self, id: AgentId) -> Result<(), CallError> {
         let run = self.run(id).ok_or_else(|| self.absent(id))?;
-        let electing = async {
-            run.shared
-                .wait(|state| state.stopped || self.knows_leader(&run, state))
-                .await;
-        };
-        electing
-            .or(async {
-                smol::Timer::after(Duration::from_millis(4 * self.election_timeout_ms.1)).await;
-            })
-            .await;
+        let electing = run
+            .shared
+            .wait(|state| state.stopped || self.knows_leader(&run, state));
+        timeout(
+            Duration::from_millis(4 * self.settings.election_timeout_ms.1),
+            electing,
+        )
+        .await;
         Ok(())
     }
 
@@ -643,60 +323,9 @@ impl Inner {
     /// this replica's leader loop taking inputs.
     pub(crate) fn knows_leader(&self, run: &Run, state: &group::State) -> bool {
         match state.leader {
-            Some(leader) if leader == self.number => {
-                run.agent.queue.lock().expect("the queue").leading
-            }
+            Some(leader) if leader == self.number => lock(&run.agent.queue).leading,
             Some(_) => true,
             None => false,
-        }
-    }
-
-    /// Queue `pending` for agent `id`, whose leader loop this node must
-    /// run. Checked under the queue's lock, from any thread.
-    pub(crate) fn push(&self, id: AgentId, pending: Pending) -> Result<(), CallError> {
-        let run = self.run(id).ok_or_else(|| self.absent(id))?;
-        let mut queue = run.agent.queue.lock().expect("the queue");
-        if queue.stopped || run.shared.state().stopped {
-            return Err(CallError::Stopped);
-        }
-        if !queue.leading {
-            drop(queue);
-            return Err(self.not_leader(&run.shared));
-        }
-        if pending.capped() {
-            if queue.capped >= self.queue {
-                return Err(CallError::Busy);
-            }
-            queue.capped += 1;
-        }
-        // Past the cap, the sender sends it again.
-        if pending.agents_sent() {
-            if queue.from_agents >= self.queue {
-                return Err(CallError::Busy);
-            }
-            queue.from_agents += 1;
-        }
-        queue.inputs.push_back((pending, Instant::now()));
-        drop(queue);
-        let _ = run.agent.wake.try_send(());
-        Ok(())
-    }
-
-    /// Put inputs back at the front of agent `id`'s queue, in order, as
-    /// queued now.
-    pub(crate) fn requeue(&self, agent: &Agent, inputs: Vec<Pending>) {
-        let mut queue = agent.queue.lock().expect("the queue");
-        if queue.stopped {
-            return;
-        }
-        for pending in inputs.into_iter().rev() {
-            if pending.capped() {
-                queue.capped += 1;
-            }
-            if pending.agents_sent() {
-                queue.from_agents += 1;
-            }
-            queue.inputs.push_front((pending, Instant::now()));
         }
     }
 
@@ -717,7 +346,7 @@ impl Inner {
     /// failure: the pair heartbeat and the records' resends look, so a
     /// node halts within one of their rounds.
     pub(crate) fn halt_if_store_failed(&self) {
-        if self.storage.failed() && !self.halted.load(std::sync::atomic::Ordering::SeqCst) {
+        if self.storage.failed() && !self.halted.load(Ordering::SeqCst) {
             tracing::error!("a flush failed; the node stops and needs a restart");
             self.halt();
         }
@@ -726,14 +355,8 @@ impl Inner {
     /// Stop every agent: a commit failed, and storage takes no more.
     /// Queued and later calls answer `Stopped`.
     pub(crate) fn halt(&self) {
-        self.halted.store(true, std::sync::atomic::Ordering::SeqCst);
-        let runs: Vec<Arc<Run>> = self
-            .runs
-            .lock()
-            .expect("the runs")
-            .values()
-            .cloned()
-            .collect();
+        self.halted.store(true, Ordering::SeqCst);
+        let runs: Vec<Arc<Run>> = lock(&self.runs).values().cloned().collect();
         for run in runs {
             run.agent.stop();
             run.shared.stop();
@@ -743,10 +366,7 @@ impl Inner {
     /// Learn where an agent runs, and act on it.
     pub(crate) fn learn(self: &Arc<Self>, record: CreationRecord, placement: Placement) {
         let agent = record.agent;
-        self.directory
-            .lock()
-            .expect("the directory")
-            .insert(agent, Known { record, placement });
+        lock(&self.directory).insert(agent, Arc::new(Known { record, placement }));
         self.reconsider(agent);
     }
 
@@ -757,16 +377,10 @@ impl Inner {
     /// committed and this replica does not lead.
     pub(crate) fn reconsider(self: &Arc<Self>, agent: AgentId) {
         // A group stopping with the node is not started again.
-        if self.closing.load(std::sync::atomic::Ordering::SeqCst) {
+        if self.closing.load(Ordering::SeqCst) {
             return;
         }
-        let Some(known) = self
-            .directory
-            .lock()
-            .expect("the directory")
-            .get(&agent)
-            .cloned()
-        else {
+        let Some(known) = lock(&self.directory).get(&agent).cloned() else {
             return;
         };
         // A member of the configuration before, while the new one has not
@@ -781,7 +395,7 @@ impl Inner {
                     );
                     return;
                 }
-                self.start(known.record);
+                self.start(known.record.clone());
             }
             Some(run) if !named => {
                 let state = run.shared.state();
@@ -801,11 +415,11 @@ impl Inner {
     /// placement and the term and vote stay.
     fn retire_agent(self: &Arc<Self>, agent: AgentId) {
         let run = {
-            let mut runs = self.runs.lock().expect("the runs");
+            let mut runs = lock(&self.runs);
             let Some(run) = runs.remove(&agent) else {
                 return;
             };
-            self.retiring.lock().expect("the retiring").insert(agent);
+            lock(&self.retiring).insert(agent);
             run
         };
         tracing::info!(agent = agent.0, "this node no longer replicates the agent");
@@ -815,7 +429,7 @@ impl Inner {
         run.local.close();
         let inner = Arc::clone(self);
         self.spawn(async move {
-            let tasks = std::mem::take(&mut *run.tasks.lock().expect("the run's tasks"));
+            let tasks = std::mem::take(&mut *lock(&run.tasks));
             for task in tasks {
                 task.await;
             }
@@ -828,7 +442,7 @@ impl Inner {
     /// meanwhile.
     async fn finish_retirement(self: &Arc<Self>, agent: AgentId) {
         self.write_retirement(agent).await;
-        self.retiring.lock().expect("the retiring").remove(&agent);
+        lock(&self.retiring).remove(&agent);
         self.reconsider(agent);
     }
 
@@ -930,7 +544,7 @@ impl Inner {
             applied: state.applied,
             log_start: rows.log_start,
             last_index: last.max(rows.log_start),
-            halted: self.halted.load(std::sync::atomic::Ordering::SeqCst),
+            halted: self.halted.load(Ordering::SeqCst),
             sessions,
             outbox,
             placement_term: self.placement(agent).map_or(0, |placement| placement.term),
@@ -958,13 +572,7 @@ impl Inner {
     /// every other node until each holds it. False when it was not kept.
     pub(crate) async fn place(self: &Arc<Self>, agent: AgentId, placement: Placement) -> bool {
         let _recording = self.recording.lock().await;
-        let Some(known) = self
-            .directory
-            .lock()
-            .expect("the directory")
-            .get(&agent)
-            .cloned()
-        else {
+        let Some(known) = lock(&self.directory).get(&agent).cloned() else {
             return true;
         };
         if !placement.supersedes(&known.placement) {
@@ -978,7 +586,7 @@ impl Inner {
             tracing::warn!(agent = agent.0, "a placement was not kept: {error}");
             return false;
         }
-        self.learn(known.record, placement);
+        self.learn(known.record.clone(), placement);
         self.announce(agent);
         true
     }
@@ -987,11 +595,9 @@ impl Inner {
         // Under the runs' lock, which the node's shutdown takes to set
         // `closing`: a group starts before the shutdown takes the runs, or
         // not at all.
-        let mut runs = self.runs.lock().expect("the runs");
+        let mut runs = lock(&self.runs);
         let id = record.agent;
-        if self.closing.load(std::sync::atomic::Ordering::SeqCst)
-            || self.retiring.lock().expect("the retiring").contains(&id)
-        {
+        if self.closing.load(Ordering::SeqCst) || lock(&self.retiring).contains(&id) {
             return;
         }
         let shared = Arc::new(Shared::new(record));
@@ -1092,18 +698,10 @@ impl Inner {
     /// Wait until `run`'s replica has applied through `index`, for
     /// [`CATCH_UP`] at most.
     pub(crate) async fn applied_through(&self, run: &Run, index: u64) -> Result<(), CallError> {
-        let applied = async {
-            Some(
-                run.shared
-                    .wait(|state| state.stopped || state.applied >= index)
-                    .await,
-            )
-        };
-        let late = async {
-            smol::Timer::after(CATCH_UP).await;
-            None
-        };
-        match applied.or(late).await {
+        let applied = run
+            .shared
+            .wait(|state| state.stopped || state.applied >= index);
+        match timeout(CATCH_UP, applied).await {
             Some(state) if !state.stopped => Ok(()),
             Some(_) => Err(CallError::Stopped),
             None => Err(CallError::Failed(
@@ -1113,24 +711,21 @@ impl Inner {
     }
 
     pub(crate) fn keep_dry_run(&self, id: AgentId, dry_run: DryRun) {
-        self.dry_runs
-            .lock()
-            .expect("the dry runs")
-            .insert(id, dry_run);
+        lock(&self.dry_runs).insert(id, dry_run);
     }
 
     /// The writes of the leader's dry run of `entry`, if it ran on the
     /// state the entry at `index` applies to: the same entry on the same
     /// state.
     pub(crate) fn dry_run(&self, id: AgentId, index: u64, entry: &LogEntry) -> Option<Vec<Write>> {
-        let mut dry_runs = self.dry_runs.lock().expect("the dry runs");
+        let mut dry_runs = lock(&self.dry_runs);
         let kept = dry_runs.remove(&id)?;
         (kept.applied + 1 == index && kept.payload == entry.payload()).then_some(kept.writes)
     }
 
     /// Agent `id`'s group waits for `hashes`: tell it when they arrive.
     pub(crate) fn want(&self, id: AgentId, hashes: &[[u8; 32]]) {
-        let mut wanted = self.wanted.lock().expect("the wanted blobs");
+        let mut wanted = lock(&self.wanted);
         for hash in hashes {
             wanted.entry(*hash).or_default().insert(id);
         }
@@ -1138,20 +733,12 @@ impl Inner {
 
     /// Whether a group here asked for `hash`.
     pub(crate) fn is_wanted(&self, hash: &[u8; 32]) -> bool {
-        self.wanted
-            .lock()
-            .expect("the wanted blobs")
-            .contains_key(hash)
+        lock(&self.wanted).contains_key(hash)
     }
 
     /// The groups that wanted `hash`, which arrived.
     pub(crate) fn arrived(&self, hash: &[u8; 32]) {
-        let waiting = self
-            .wanted
-            .lock()
-            .expect("the wanted blobs")
-            .remove(hash)
-            .unwrap_or_default();
+        let waiting = lock(&self.wanted).remove(hash).unwrap_or_default();
         for id in waiting {
             if let Some(run) = self.run(id) {
                 let _ = run.inbox.try_send(GroupInput::Blobs);
@@ -1221,7 +808,7 @@ impl Inner {
             }
             _ => return Err(ReplaceError::Call(CallError::Stopped)),
         };
-        let mut until = std::time::Instant::now() + REPLACED;
+        let mut until = Instant::now() + REPLACED;
         let mut leading = true;
         loop {
             if let Some(placement) = self.placement(agent)
@@ -1233,9 +820,9 @@ impl Inner {
             }
             if leading && run.shared.state().role != Role::Leader {
                 leading = false;
-                until = until.min(std::time::Instant::now() + REPLACED_ELSEWHERE);
+                until = until.min(Instant::now() + REPLACED_ELSEWHERE);
             }
-            if std::time::Instant::now() >= until {
+            if Instant::now() >= until {
                 return Err(ReplaceError::TimedOut);
             }
             smol::Timer::after(Duration::from_millis(20)).await;
@@ -1278,7 +865,7 @@ impl Inner {
             creator: self.number,
             time: (self.clock)(),
             program: self.program_hash,
-            accumulate_gas: self.accumulate_gas,
+            accumulate_gas: self.settings.accumulate_gas,
         };
         let placement = Placement::created(&record);
         self.storage
@@ -1360,7 +947,14 @@ impl Inner {
             roles,
         };
         let (answer, reply) = smol::channel::bounded(1);
-        self.push(agent, Pending::Admin(admin, answer, references))?;
+        self.push(
+            agent,
+            Pending::Admin {
+                admin,
+                answer,
+                blobs: references,
+            },
+        )?;
         self.admin_answer(reply).await
     }
 
@@ -1370,7 +964,7 @@ impl Inner {
         &self,
         reply: smol::channel::Receiver<Result<Answered, CallError>>,
     ) -> Result<Answered, CallError> {
-        match crate::calls::within(self.answered, reply.recv()).await {
+        match timeout(self.settings.answered, reply.recv()).await {
             Some(answer) => answer.map_err(|_| CallError::Stopped)?,
             None => Err(CallError::TimedOut),
         }
@@ -1387,7 +981,14 @@ impl Inner {
     pub(crate) async fn admin(&self, agent: AgentId, admin: Admin) -> Result<Answered, CallError> {
         self.settled(agent).await?;
         let (answer, reply) = smol::channel::bounded(1);
-        self.push(agent, Pending::Admin(admin, answer, Vec::new()))?;
+        self.push(
+            agent,
+            Pending::Admin {
+                admin,
+                answer,
+                blobs: Vec::new(),
+            },
+        )?;
         self.admin_answer(reply).await
     }
 
@@ -1399,7 +1000,7 @@ impl Inner {
         request: Request,
     ) -> impl Future<Output = Result<Answered, CallError>> + use<> {
         let (answer, reply) = smol::channel::bounded(1);
-        let mut pending = Some(Pending::Request(request, answer));
+        let mut pending = Some(Pending::Request { request, answer });
         let known = self.run(agent).is_some_and(|run| {
             let state = run.shared.state();
             state.stopped || self.knows_leader(&run, &state)
@@ -1454,7 +1055,7 @@ impl Inner {
         let program = Arc::clone(&self.program);
         let pool = Arc::clone(&self.pool);
         let blobs = self.blobs.clone();
-        let gas = self.refine_gas;
+        let gas = self.settings.refine_gas;
         let failed = |fault: Fault| CallError::Failed(fault.message().to_string());
         let (output, _) = ran(self
             .executors
@@ -1467,17 +1068,12 @@ impl Inner {
     /// Mark `epoch` of `agent`'s as one a drop runs on, before the drop can
     /// remove a row.
     pub(crate) fn dropping(&self, agent: AgentId, epoch: u8) {
-        *self
-            .dropping
-            .lock()
-            .expect("the epochs dropped")
-            .entry((agent, epoch))
-            .or_default() += 1;
+        *lock(&self.dropping).entry((agent, epoch)).or_default() += 1;
     }
 
     /// A drop on `epoch` of `agent`'s ended.
     pub(crate) fn dropped(&self, agent: AgentId, epoch: u8) {
-        let mut dropping = self.dropping.lock().expect("the epochs dropped");
+        let mut dropping = lock(&self.dropping);
         if let Some(running) = dropping.get_mut(&(agent, epoch)) {
             *running -= 1;
             if *running == 0 {
@@ -1488,21 +1084,18 @@ impl Inner {
 
     /// Whether a drop runs on `epoch` of `agent`'s.
     pub(crate) fn is_dropping(&self, agent: AgentId, epoch: u8) -> bool {
-        self.dropping
-            .lock()
-            .expect("the epochs dropped")
-            .contains_key(&(agent, epoch))
+        lock(&self.dropping).contains_key(&(agent, epoch))
     }
 
     /// Run `task` on the node's thread until it ends or the node stops.
     pub(crate) fn spawn(&self, task: impl Future<Output = ()> + Send + 'static) {
         // A node shutting down runs nothing new: what such a task would do
         // (an old epoch dropped, say) is done again at the next start.
-        if self.closing.load(std::sync::atomic::Ordering::SeqCst) {
+        if self.closing.load(Ordering::SeqCst) {
             return;
         }
         let task = self.runtime.spawn(task);
-        self.tasks.lock().expect("the node's tasks").push(task);
+        lock(&self.tasks).push(task);
     }
 }
 
@@ -1529,7 +1122,7 @@ impl Tasks {
 
 /// A value of an agent's applied state; `None` when absent or unreadable.
 pub(crate) fn read<T: Decode>(
-    snapshot: &FjallSnapshot,
+    snapshot: &Snapshot,
     agent: AgentId,
     key: &[u8],
 ) -> Result<Option<T>, Fault> {
@@ -1545,49 +1138,6 @@ pub(crate) fn ran<T>(
 ) -> Result<T, Fault> {
     answer
         .unwrap_or_else(|panicked| Err(Fault::Infrastructure(format!("panicked: {}", panicked.0))))
-}
-
-/// Milliseconds since the Unix epoch, by the system clock.
-pub fn wall_clock() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| since.as_millis() as u64)
-}
-
-/// Make `dir` if it is missing, readable by its owner only: it holds the
-/// node's secret, in files its store makes without a mode of their own.
-/// An empty directory, or a node's, that others can reach is made its
-/// owner's alone; any other directory others can reach is refused, not
-/// changed (it may be `/tmp`, or a home).
-fn private_dir(dir: &Path) -> Result<(), String> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    let failed = |error: std::io::Error| format!("{}: {error}", dir.display());
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)
-        .map_err(failed)?;
-    let mode = std::fs::metadata(dir).map_err(failed)?.permissions().mode();
-    if mode & 0o077 == 0 {
-        return Ok(());
-    }
-    let empty = std::fs::read_dir(dir).map_err(failed)?.next().is_none();
-    if !empty && !dir.join(STORE).exists() {
-        return Err(format!(
-            "{}: others can reach this directory, and the node's secret would be in it; \
-             run `chmod 700 {}`, or give a new directory",
-            dir.display(),
-            dir.display()
-        ));
-    }
-    tracing::warn!(dir = %dir.display(), mode = format!("{mode:o}"), "taking others' access to the data directory away");
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode & 0o700)).map_err(failed)
-}
-
-pub(crate) fn seed() -> [u8; 32] {
-    let mut seed = [0u8; 32];
-    getrandom::getrandom(&mut seed).expect("the operating system's randomness");
-    seed
 }
 
 /// The reply a step gives its request.
@@ -1614,253 +1164,10 @@ pub struct Node {
     /// The pair heartbeat's thread, and what stops it.
     liveness: Option<(smol::channel::Sender<()>, JoinHandle<()>)>,
     /// The blob collector's thread, and what stops it.
-    collector: Option<(std::sync::mpsc::Sender<()>, JoinHandle<()>)>,
+    collector: Option<(mpsc::Sender<()>, JoinHandle<()>)>,
 }
 
-/// The node's data directory: its store, and the operator's token. A
-/// stopped node's store may be opened at `STORE` in it.
-pub const STORE: &str = "store";
-const BLOBS: &str = "blobs";
-pub const ADMIN_TOKEN: &str = "admin.token";
-/// The node's public key, in hex, in its data directory: for operator
-/// commands on the node's host to pin its TLS by.
-pub const NODE_KEY: &str = "node.key";
-
 impl Node {
-    /// Open the node's data directory `data` (its store and admin token),
-    /// join its space and start every agent it replicates.
-    pub fn open(data: impl AsRef<Path>, config: Config) -> Result<Self, Error> {
-        let largest = defaults::MAX_HANDLER_GAS
-            + defaults::STEP_RESERVE.max(defaults::INSTALL_RESERVE)
-            + defaults::FINISH_RESERVE;
-        if config.refine_gas < largest {
-            return Err(Error::Gas);
-        }
-        let data = data.as_ref().to_path_buf();
-        private_dir(&data).map_err(Error::Data)?;
-        let store = Fjall::open(data.join(STORE))?;
-        let secret = match store.node_secret()? {
-            Some(secret) => secret,
-            None => {
-                let secret = seed();
-                let mut batch = store.batch();
-                batch.node_secret(&secret);
-                batch.commit(Durability::Synced)?;
-                secret
-            }
-        };
-        // Each run's pair heartbeat outranks the last run's, whatever the
-        // clock did between them.
-        let incarnation = crate::liveness::next_incarnation(store.incarnation()?);
-        let mut batch = store.batch();
-        batch.incarnation(incarnation);
-        batch.commit(Durability::Synced)?;
-        let node_id = NodeId(SigningKey::from_bytes(&secret).verifying_key().to_bytes());
-        let hex: String = node_id.0.iter().map(|byte| format!("{byte:02x}")).collect();
-        std::fs::write(data.join(NODE_KEY), &hex)
-            .map_err(|error| Error::Data(error.to_string()))?;
-        let number = match &config.space {
-            Some(space) => {
-                space
-                    .by_key(&node_id.0)
-                    .ok_or_else(|| {
-                        Error::Data(format!("this node's key, {hex}, is not in its space"))
-                    })?
-                    .number
-            }
-            None => 0,
-        };
-        let blobs = Blobs::open(data.join(BLOBS), &store)?;
-        let pool = Arc::new(MachinePool::new());
-        for hash in blobs.pinned()? {
-            let blob = blobs
-                .get(&hash)?
-                .ok_or_else(|| Error::Program("a pinned program's blob is missing".into()))?;
-            pool.install(&blob)
-                .map_err(|error| Error::Program(format!("{error:?}")))?;
-        }
-        // Agent programs run only on executors, one at a time on each: keep
-        // as many machines idle as can run at once.
-        let program =
-            OuterMachines::with_idle_limit(&config.agent, PvmBackend::Default, config.executors)
-                .map_err(|error| Error::Program(format!("{error:?}")))?;
-        let program_hash = ProgramHash(CodeHash::of(&config.agent).0);
-        let records = store.agents()?;
-        let mut placements = store.placements()?;
-        let (network, arrivals): (Option<Arc<dyn Wire>>, _) = match (&config.space, &config.peers) {
-            (Some(space), Peers::Quic) if space.nodes().len() > 1 => {
-                let listen = config
-                    .peer_bind
-                    .unwrap_or(space.node(number).expect("this node is in its space").peer);
-                let (quic, arrivals) = vos_net::quic::Quic::bind(vos_net::quic::Config {
-                    peers: space.peers(),
-                    idle: config.quic_idle,
-                    ..vos_net::quic::Config::new(number, secret, listen)
-                })
-                .map_err(|error| Error::Data(format!("{listen}: {error}")))?;
-                (Some(Arc::new(quic)), Some(arrivals))
-            }
-            (Some(space), Peers::Hub(hub)) => {
-                let (endpoint, arrivals) = hub.join(number);
-                endpoint.set_peers(space.peers());
-                (Some(Arc::new(endpoint)), Some(arrivals))
-            }
-            _ => (None, None),
-        };
-        // Frames of a class a test loses go before they reach the network.
-        #[cfg(feature = "faults")]
-        let network = match (network, &config.faults) {
-            (Some(network), Some(faults)) => Some(Arc::new(crate::faults::Lossy {
-                network,
-                faults: Arc::clone(faults),
-            }) as Arc<dyn Wire>),
-            (network, _) => network,
-        };
-        let runtime = Arc::new(smol::Executor::new());
-        let (stop, stopped) = smol::channel::bounded::<()>(1);
-        // One thread runs the node's tasks: its groups' drivers, leader and
-        // apply loops, its ingress and its peers' messages. Calls keep their
-        // lane's order by it (see `calls`).
-        let threads: Vec<JoinHandle<()>> = vec![{
-            let runtime = Arc::clone(&runtime);
-            std::thread::Builder::new()
-                .name("vos-node".into())
-                .spawn(move || smol::block_on(runtime.run(stopped.recv())).unwrap_or(()))
-                .expect("the node's thread starts")
-        }];
-        let next = records
-            .iter()
-            .filter(|record| CreationRecord::creator_of(record.agent) == number)
-            .map(|record| (record.agent.0 & 0x00ff_ffff) + 1)
-            .max()
-            .unwrap_or(1);
-        let inner = Arc::new(Inner {
-            storage: StorageThread::spawn(store.clone(), Arc::clone(&config.hooks)),
-            store,
-            blobs,
-            executors: Executors::spawn(config.executors),
-            pool,
-            program: Arc::new(program),
-            program_hash,
-            queue: config.queue,
-            max_inputs: config.max_inputs.max(1),
-            max_bytes: config.max_bytes,
-            linger: config.linger,
-            refine_gas: config.refine_gas,
-            accumulate_gas: config.accumulate_gas,
-            hooks: config.hooks,
-            clock: config.clock,
-            node_id,
-            number,
-            space: config.space,
-            network,
-            election_timeout_ms: config.election_timeout_ms,
-            answered: config.answered,
-            heartbeat_ms: config.heartbeat_ms,
-            compact_every: config.compact_every,
-            compact_bytes: config.compact_bytes,
-            compact_tail: config.compact_tail,
-            compact_tail_bytes: config.compact_tail_bytes,
-            blob_collect_every: config.blob_collect_every,
-            blob_horizon: config.blob_horizon,
-            snapshot_chunk: config.snapshot_chunk,
-            snapshot_timeout_ms: config.snapshot_timeout_ms,
-            directory: Mutex::new(HashMap::new()),
-            unacknowledged: Mutex::new(HashMap::new()),
-            acknowledged: event_listener::Event::new(),
-            refusing: Mutex::new(HashMap::new()),
-            capable: Mutex::new(HashMap::new()),
-            asked: Mutex::new(HashMap::new()),
-            dropping: Mutex::new(HashMap::new()),
-            runs: Mutex::new(HashMap::new()),
-            dry_runs: Mutex::new(HashMap::new()),
-            wanted: Mutex::new(HashMap::new()),
-            drops: crate::peer::Drops::default(),
-            next_agent: smol::lock::Mutex::new(next),
-            runtime,
-            tasks: Mutex::new(Tasks::default()),
-            recording: smol::lock::Mutex::new(()),
-            calls: crate::calls::Calls::default(),
-            reads: crate::queries::Reads::default(),
-            turn: std::sync::atomic::AtomicU64::new(0),
-            sent_across: std::sync::atomic::AtomicU64::new(0),
-            installed: std::sync::atomic::AtomicU64::new(0),
-            streamed: std::sync::atomic::AtomicU64::new(0),
-            stats: Arc::default(),
-            closing: std::sync::atomic::AtomicBool::new(false),
-            retiring: Mutex::new(HashSet::new()),
-            halted: std::sync::atomic::AtomicBool::new(false),
-            liveness: crate::liveness::Liveness::new(incarnation),
-            relayed: std::sync::atomic::AtomicU64::new(0),
-        });
-        for record in records {
-            let agent = record.agent;
-            let placement = match placements.remove(&agent) {
-                Some(Some(placement)) => placement,
-                Some(None) => {
-                    tracing::error!(
-                        agent = agent.0,
-                        "an unreadable placement; its agent is not run until a placement comes"
-                    );
-                    continue;
-                }
-                None => Placement::created(&record),
-            };
-            let created = record.creator == number && placement.term == 0;
-            // A retirement a crash cut short is finished: no group starts
-            // for an agent its placement no longer names.
-            let unfinished =
-                !placement.admits(number) && inner.holds_replica(agent).unwrap_or(false);
-            if unfinished {
-                inner.retiring.lock().expect("the retiring").insert(agent);
-            }
-            inner.learn(record, placement);
-            if created {
-                inner.announce(agent);
-            }
-            if unfinished {
-                let retiring = Arc::clone(&inner);
-                inner.spawn(async move { retiring.finish_retirement(agent).await });
-            }
-        }
-        let mut liveness = None;
-        if let Some(arrivals) = arrivals {
-            let (stop, stopped) = smol::channel::bounded::<()>(1);
-            let heard = arrivals.liveness.clone();
-            let thread = {
-                let inner = Arc::clone(&inner);
-                std::thread::Builder::new()
-                    .name("vos-liveness".into())
-                    .spawn(move || crate::liveness::supervise(inner, heard, stopped))
-                    .expect("the liveness thread starts")
-            };
-            liveness = Some((stop, thread));
-            inner.spawn(crate::dispatch::dispatch(Arc::clone(&inner), arrivals));
-        }
-        inner.spawn(crate::dispatch::resend_records(Arc::clone(&inner)));
-        inner.spawn(crate::stats::probe(Arc::clone(&inner)));
-        let collector = {
-            let (stop, stopped) = std::sync::mpsc::channel::<()>();
-            let inner = Arc::clone(&inner);
-            let thread = std::thread::Builder::new()
-                .name("vos-blob-collect".into())
-                .spawn(move || collect_blobs(&inner, &stopped))
-                .expect("the blob collector's thread starts");
-            Some((stop, thread))
-        };
-        Ok(Self {
-            inner,
-            data,
-            secret,
-            ingress_tls: config.ingress_tls,
-            ingress: Mutex::new(None),
-            stop: Some(stop),
-            runtime: threads,
-            liveness,
-            collector,
-        })
-    }
-
     /// The node's identity, its public key, which its TLS presents.
     pub fn id(&self) -> NodeId {
         self.inner.node_id
@@ -1868,31 +1175,23 @@ impl Node {
 
     /// Snapshots this node's groups switched to.
     pub fn snapshots_installed(&self) -> u64 {
-        self.inner
-            .installed
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.inner.installed.load(Ordering::Relaxed)
     }
 
     /// Snapshot streams this node started to its followers.
     pub fn snapshots_streamed(&self) -> u64 {
-        self.inner
-            .streamed
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.inner.streamed.load(Ordering::Relaxed)
     }
 
     /// Messages this node sent toward agents on other nodes, again on
     /// rounds included.
     pub fn messages_sent_across(&self) -> u64 {
-        self.inner
-            .sent_across
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.inner.sent_across.load(Ordering::Relaxed)
     }
 
     /// Messages this node relayed to their agent's leader.
     pub fn messages_relayed(&self) -> u64 {
-        self.inner
-            .relayed
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.inner.relayed.load(Ordering::Relaxed)
     }
 
     /// The node's number in its space.
@@ -2092,130 +1391,9 @@ impl Node {
             .inner
             .runtime
             .spawn(ingress.serve(listener, tls, stopped));
-        *self.ingress.lock().expect("the ingress") = Some((task, stop));
+        *lock(&self.ingress) = Some((task, stop));
         Ok(local)
     }
-
-    /// Stop every agent after its batch in flight, then the threads.
-    /// Requests queued but not yet in a batch are not durable: their callers
-    /// see `Stopped` and resend.
-    pub fn shutdown(mut self) {
-        self.stop_all();
-    }
-
-    fn stop_all(&mut self) {
-        // Once is enough: the runtime is gone after it, and nothing it
-        // never ran could be awaited.
-        if self.runtime.is_empty() {
-            return;
-        }
-        {
-            let _runs = self.inner.runs.lock().expect("the runs");
-            self.inner
-                .closing
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-        }
-        if let Some((stop, thread)) = self.liveness.take() {
-            let _ = stop.try_send(());
-            let _ = thread.join();
-        }
-        // A collection under way ends first: it waits on the writers.
-        if let Some((stop, thread)) = self.collector.take() {
-            let _ = stop.send(());
-            let _ = thread.join();
-        }
-        // End the ingress and its connections while the runtime still runs
-        // them, so none outlives the node holding its store.
-        let ingress = self.ingress.lock().expect("the ingress").take();
-        if let Some((task, stop)) = ingress {
-            let _ = stop.try_send(());
-            smol::block_on(task);
-        }
-        let tasks = std::mem::take(&mut self.inner.tasks.lock().expect("the node's tasks").list);
-        let runs: Vec<Arc<Run>> = self
-            .inner
-            .runs
-            .lock()
-            .expect("the runs")
-            .drain()
-            .map(|(_, run)| run)
-            .collect();
-        for run in &runs {
-            run.agent.stop();
-            run.shared.stop();
-            run.inbox.close();
-            run.local.close();
-        }
-        smol::block_on(async {
-            for task in tasks {
-                task.cancel().await;
-            }
-            for run in runs {
-                let tasks = std::mem::take(&mut *run.tasks.lock().expect("the run's tasks"));
-                for task in tasks {
-                    task.await;
-                }
-            }
-        });
-        if let Some(stop) = self.stop.take() {
-            stop.close();
-        }
-        for runtime in self.runtime.drain(..) {
-            let _ = runtime.join();
-        }
-        // The jobs left finish here, and what they hold goes with them: no
-        // part of the node (its store and its lock among them) outlives it.
-        self.inner.executors.close();
-    }
-}
-
-impl Drop for Node {
-    fn drop(&mut self) {
-        self.stop_all();
-    }
-}
-
-/// Collect the blob store every `blob_collect_every` until stopped, on a
-/// thread of its own: a collection with a blob to consider reads every
-/// live log row, which the node's one runtime thread must not wait on.
-fn collect_blobs(inner: &Inner, stopped: &std::sync::mpsc::Receiver<()>) {
-    while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
-        stopped.recv_timeout(inner.blob_collect_every)
-    {
-        let stopping = || inner.closing.load(std::sync::atomic::Ordering::SeqCst);
-        match smol::block_on(
-            inner
-                .blobs
-                .collect(&inner.storage, inner.blob_horizon, &stopping),
-        ) {
-            Ok(collected) => {
-                if collected.removed + collected.moved + collected.segments_deleted > 0 {
-                    tracing::info!(
-                        removed = collected.removed,
-                        moved = collected.moved,
-                        segments_deleted = collected.segments_deleted,
-                        "blobs collected"
-                    );
-                }
-            }
-            Err(error) => tracing::warn!("a blob collection failed: {error}"),
-        }
-    }
-}
-
-/// Write the operator's token, in hex, readable by its owner only.
-fn write_token(path: &Path, token: &[u8; 32]) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let hex: String = token.iter().map(|byte| format!("{byte:02x}")).collect();
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    file.write_all(hex.as_bytes())?;
-    file.sync_all()
 }
 
 #[cfg(test)]

@@ -22,7 +22,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use vos_checker::crash::{Round, Rounds, tear};
-use vos_node::store::{Batch, Durability, Fjall, LogEntry, Store, View};
+use vos_node::store::{Fjall, LogEntry, PersistMode};
 use vos_wire::ids::{AgentId, InstanceId};
 use vos_wire::keys;
 use vos_wire::result::Write;
@@ -79,9 +79,9 @@ fn writer(dir: &Path) {
         );
         batch.apply(AGENT, 0, index, &writes(index));
         let durability = if index.is_multiple_of(2) {
-            Durability::Synced
+            PersistMode::SyncAll
         } else {
-            Durability::Buffered
+            PersistMode::Buffer
         };
         batch.commit(durability).unwrap();
         println!("{index}");

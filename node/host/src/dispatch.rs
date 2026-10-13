@@ -16,7 +16,7 @@
 //! placement it holds if that names the asker: a member that missed its
 //! placement learns it once its group needs it, a vote or entries.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -31,6 +31,7 @@ use crate::node::{Inner, Order};
 use crate::peer;
 use crate::storage::Change;
 use crate::store::BlobRef;
+use crate::{lock, timeout};
 
 /// How often unacknowledged records are sent again.
 const RESEND: Duration = Duration::from_secs(1);
@@ -108,30 +109,19 @@ pub(crate) async fn resend_records(inner: Arc<Inner>) {
         smol::Timer::after(RESEND).await;
         // Every node runs this, a space of one too.
         inner.halt_if_store_failed();
-        let pending: Vec<(AgentId, Order, Vec<NodeNumber>)> = inner
-            .unacknowledged
-            .lock()
-            .expect("the unacknowledged records")
+        let pending: Vec<(AgentId, Order, Vec<NodeNumber>)> = lock(&inner.unacknowledged)
             .iter()
             .map(|(agent, (order, nodes))| (*agent, *order, nodes.iter().copied().collect()))
             .collect();
         for (agent, announced, nodes) in pending {
-            let known = inner
-                .directory
-                .lock()
-                .expect("the directory")
-                .get(&agent)
-                .cloned();
+            let known = lock(&inner.directory).get(&agent).cloned();
             // A placement held since from elsewhere is its sender's to
             // announce: this node may not even be one that may send it.
             if known
                 .as_ref()
                 .is_some_and(|known| known.placement.order() != announced)
             {
-                let mut unacknowledged = inner
-                    .unacknowledged
-                    .lock()
-                    .expect("the unacknowledged records");
+                let mut unacknowledged = lock(&inner.unacknowledged);
                 if unacknowledged
                     .get(&agent)
                     .is_some_and(|(order, _)| *order == announced)
@@ -142,8 +132,8 @@ pub(crate) async fn resend_records(inner: Arc<Inner>) {
             }
             if let Some(known) = known {
                 let message = PeerMessage::Directory {
-                    record: known.record,
-                    placement: known.placement,
+                    record: known.record.clone(),
+                    placement: known.placement.clone(),
                 };
                 for node in nodes {
                     inner.send(node, Class::Requests, &message);
@@ -325,18 +315,12 @@ impl Inner {
             // One at a time, each once the peer's queue has room for it:
             // a blob is read only to be sent.
             for hash in hashes {
-                if let Some(network) = &inner.network {
-                    let room = async {
-                        network.ready(from, Class::Bulk).await;
-                        true
-                    };
-                    let late = async {
-                        smol::Timer::after(BLOB_ROOM).await;
-                        false
-                    };
-                    if !room.or(late).await {
-                        return;
-                    }
+                if let Some(network) = &inner.network
+                    && timeout(BLOB_ROOM, network.ready(from, Class::Bulk))
+                        .await
+                        .is_none()
+                {
+                    return;
                 }
                 let blobs = inner.blobs.clone();
                 let read = inner.offload(move || blobs.get(&hash)).await;
@@ -382,12 +366,7 @@ impl Inner {
         let agent = record.agent;
         let order = placement.order();
         let recording = self.recording.lock().await;
-        let known = self
-            .directory
-            .lock()
-            .expect("the directory")
-            .get(&agent)
-            .cloned();
+        let known = lock(&self.directory).get(&agent).cloned();
         if known.as_ref().is_some_and(|known| known.record != record) {
             tracing::error!(
                 from,
@@ -429,15 +408,12 @@ impl Inner {
     /// room here, for the agent's record and placement, as [`should_ask`]
     /// says.
     fn ask_for_record(&self, from: NodeNumber, agent: AgentId, has_group: bool) {
-        let held = self
-            .directory
-            .lock()
-            .expect("the directory")
+        let held = lock(&self.directory)
             .get(&agent)
             .map(|known| known.placement.clone());
         let now = Instant::now();
         {
-            let mut asked = self.asked.lock().expect("the asks");
+            let mut asked = lock(&self.asked);
             let last = asked.get(&(agent, from)).copied();
             if !should_ask(held.as_ref(), has_group, self.number, last, now) {
                 return;
@@ -456,13 +432,7 @@ impl Inner {
     /// placement held here, if the placement names it: an ordinary record,
     /// acknowledged as any. It is sent once; the asker asks again.
     fn on_request(&self, from: NodeNumber, agent: AgentId) {
-        let Some(known) = self
-            .directory
-            .lock()
-            .expect("the directory")
-            .get(&agent)
-            .cloned()
-        else {
+        let Some(known) = lock(&self.directory).get(&agent).cloned() else {
             return;
         };
         if !should_answer(&known.placement, from, self.number) {
@@ -472,17 +442,14 @@ impl Inner {
             from,
             Class::Requests,
             &PeerMessage::Directory {
-                record: known.record,
-                placement: known.placement,
+                record: known.record.clone(),
+                placement: known.placement.clone(),
             },
         );
     }
 
     fn on_ack(&self, from: NodeNumber, agent: AgentId, order: Order, runs: bool) {
-        let mut unacknowledged = self
-            .unacknowledged
-            .lock()
-            .expect("the unacknowledged records");
+        let mut unacknowledged = lock(&self.unacknowledged);
         if let Some((announced, nodes)) = unacknowledged.get_mut(&agent)
             && order >= *announced
         {
@@ -493,7 +460,7 @@ impl Inner {
         }
         drop(unacknowledged);
         {
-            let mut refusing = self.refusing.lock().expect("the refusing nodes");
+            let mut refusing = lock(&self.refusing);
             let nodes = refusing.entry(agent).or_default();
             if runs {
                 nodes.remove(&from);
@@ -501,12 +468,7 @@ impl Inner {
                 nodes.insert(from);
             }
         }
-        if let Some(waiting) = self
-            .capable
-            .lock()
-            .expect("the capability waits")
-            .remove(&(agent, from))
-        {
+        if let Some(waiting) = lock(&self.capable).remove(&(agent, from)) {
             let _ = waiting.try_send(runs);
         }
         self.acknowledged.notify(usize::MAX);
@@ -515,16 +477,10 @@ impl Inner {
     /// Send where `agent` runs, with its record, to every other node, and
     /// keep sending it until each acknowledges it.
     pub(crate) fn announce(&self, agent: AgentId) {
-        let Some(known) = self
-            .directory
-            .lock()
-            .expect("the directory")
-            .get(&agent)
-            .cloned()
-        else {
+        let Some(known) = lock(&self.directory).get(&agent).cloned() else {
             return;
         };
-        let others: std::collections::BTreeSet<NodeNumber> = self
+        let others: BTreeSet<NodeNumber> = self
             .space
             .as_ref()
             .map(|space| space.numbers())
@@ -537,16 +493,13 @@ impl Inner {
         }
         let order = known.placement.order();
         let message = PeerMessage::Directory {
-            record: known.record,
-            placement: known.placement,
+            record: known.record.clone(),
+            placement: known.placement.clone(),
         };
         for node in &others {
             self.send(*node, Class::Requests, &message);
         }
-        self.unacknowledged
-            .lock()
-            .expect("the unacknowledged records")
-            .insert(agent, (order, others));
+        lock(&self.unacknowledged).insert(agent, (order, others));
     }
 
     /// Whether `node` could run `agent`'s program, as it answers when sent
@@ -557,44 +510,27 @@ impl Inner {
         node: NodeNumber,
         within: Duration,
     ) -> bool {
-        let Some(known) = self
-            .directory
-            .lock()
-            .expect("the directory")
-            .get(&agent)
-            .cloned()
-        else {
+        let Some(known) = lock(&self.directory).get(&agent).cloned() else {
             return false;
         };
         let (answer, answered) = smol::channel::bounded(1);
-        self.capable
-            .lock()
-            .expect("the capability waits")
-            .insert((agent, node), answer);
+        lock(&self.capable).insert((agent, node), answer);
         let message = PeerMessage::Directory {
-            record: known.record,
-            placement: known.placement,
+            record: known.record.clone(),
+            placement: known.placement.clone(),
         };
         let until = Instant::now() + within;
         let runs = loop {
             self.send(node, Class::Requests, &message);
-            let heard = async { answered.recv().await.ok() };
-            let quiet = async {
-                smol::Timer::after(RESEND.min(until.saturating_duration_since(Instant::now())))
-                    .await;
-                None
-            };
-            if let Some(runs) = heard.or(quiet).await {
+            let quiet = RESEND.min(until.saturating_duration_since(Instant::now()));
+            if let Some(runs) = timeout(quiet, answered.recv()).await.and_then(Result::ok) {
                 break runs;
             }
             if Instant::now() >= until {
                 break false;
             }
         };
-        self.capable
-            .lock()
-            .expect("the capability waits")
-            .remove(&(agent, node));
+        lock(&self.capable).remove(&(agent, node));
         runs
     }
 
@@ -606,12 +542,9 @@ impl Inner {
         loop {
             let acknowledged = self.acknowledged.listen();
             let holding = {
-                let unacknowledged = self
-                    .unacknowledged
-                    .lock()
-                    .expect("the unacknowledged records");
+                let unacknowledged = lock(&self.unacknowledged);
                 let waiting = unacknowledged.get(&record.agent).map(|(_, nodes)| nodes);
-                let refusing = self.refusing.lock().expect("the refusing nodes");
+                let refusing = lock(&self.refusing);
                 let refusing = refusing.get(&record.agent);
                 // A replica counts once it holds the record and could run
                 // the agent's program.

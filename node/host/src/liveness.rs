@@ -21,6 +21,7 @@ use vos_wire::peer::{Leading, NodeNumber, PeerMessage, Placement};
 use crate::group::Local;
 use crate::node::Inner;
 use crate::peer;
+use crate::{lock, timeout};
 
 /// The most groups one frame lists, well within the network's cap on a
 /// liveness frame.
@@ -88,7 +89,7 @@ pub(crate) fn supervise(
 ) {
     let mut pause = RESTART;
     loop {
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         let ran = catch_unwind(AssertUnwindSafe(|| {
             smol::block_on(run(Arc::clone(&inner), arrivals.clone(), stopped.clone()))
         }));
@@ -109,17 +110,7 @@ pub(crate) fn supervise(
                     .unwrap_or_default();
                 tracing::error!("the pair heartbeat failed, and starts again: {message}");
                 // Stopped meanwhile, it does not start again.
-                let stop = smol::block_on(
-                    async {
-                        let _ = stopped.recv().await;
-                        true
-                    }
-                    .or(async {
-                        smol::Timer::after(pause).await;
-                        false
-                    }),
-                );
-                if stop {
+                if smol::block_on(timeout(pause, stopped.recv())).is_some() {
                     return;
                 }
                 pause = (pause * 2).min(RESTART_MOST);
@@ -158,7 +149,7 @@ async fn run(
 /// leads when its writer stalls or recovers, so they hand over or go on
 /// at once rather than at their next deadline.
 async fn beat(inner: Arc<Inner>) -> Ended {
-    let interval = Duration::from_millis(inner.heartbeat_ms);
+    let interval = Duration::from_millis(inner.settings.heartbeat_ms);
     let mut stalled = false;
     // The first heartbeat goes at once, then one each interval.
     let mut first = true;
@@ -236,11 +227,8 @@ impl Inner {
             return Vec::new();
         }
         let now = self.liveness.elapsed();
-        let stuck = 2 * self.election_timeout_ms.1;
-        let led: Vec<(AgentId, u64)> = self
-            .runs
-            .lock()
-            .expect("the runs")
+        let stuck = 2 * self.settings.election_timeout_ms.1;
+        let led: Vec<(AgentId, u64)> = lock(&self.runs)
             .iter()
             .filter_map(|(agent, run)| {
                 let state = run.shared.state();
@@ -249,7 +237,7 @@ impl Inner {
                     .then_some((*agent, state.term))
             })
             .collect();
-        let directory = self.directory.lock().expect("the directory");
+        let directory = lock(&self.directory);
         led.into_iter()
             .map(|(agent, term)| {
                 let placement = directory.get(&agent).map(|known| known.placement.clone());
@@ -261,10 +249,7 @@ impl Inner {
     /// Give each group this node leads `local`: every one, or those whose
     /// placement admits `member`.
     fn to_led(&self, member: Option<NodeNumber>, local: impl Fn() -> Local) {
-        let led: Vec<AgentId> = self
-            .runs
-            .lock()
-            .expect("the runs")
+        let led: Vec<AgentId> = lock(&self.runs)
             .iter()
             .filter(|(_, run)| run.shared.state().role == Role::Leader)
             .map(|(agent, _)| *agent)
@@ -272,7 +257,7 @@ impl Inner {
         let admitted: Vec<AgentId> = match member {
             None => led,
             Some(member) => {
-                let directory = self.directory.lock().expect("the directory");
+                let directory = lock(&self.directory);
                 led.into_iter()
                     .filter(|agent| {
                         directory
@@ -335,7 +320,7 @@ impl Inner {
                 round,
                 leading.into_iter().map(|led| (led.agent, led.term)),
             );
-        let silence = Duration::from_millis(self.election_timeout_ms.1);
+        let silence = Duration::from_millis(self.settings.election_timeout_ms.1);
         let returned = heard.is_some_and(|heard| {
             heard.new_run
                 || heard

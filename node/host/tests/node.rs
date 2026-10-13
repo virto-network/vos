@@ -14,7 +14,7 @@ use vos_checker::calls::done;
 use vos_checker::hooks::Gate;
 use vos_checker::programs::Programs;
 use vos_checker::spaces::IN_PROCESS_WAIT;
-use vos_node::store::{EntryKind, Store, View};
+use vos_node::store::EntryKind;
 use vos_node::{CallError, Config, Hooks, Node, Reply};
 use vos_wire::abi::refusal;
 use vos_wire::batch::{Batch, Input, Message, Request};

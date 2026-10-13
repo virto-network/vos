@@ -13,9 +13,10 @@ use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal};
 use vos_wire::ingress::{Answer, Consistency, Rejection};
 use vos_wire::peer::{NodeNumber, PeerMessage};
 
-use crate::calls::{answer_of, within};
-use crate::node::{CallError, Inner, Run};
+use crate::calls::answer_of;
+use crate::node::{CallError, Inner, Run, random_u64};
 use crate::peer::{self, Refusal};
+use crate::{lock, timeout};
 
 /// How long a query waits for its replica to apply through the index it
 /// asks for.
@@ -60,18 +61,10 @@ impl Inner {
             },
         };
         // Through what it recovered too, which the query would wait for.
-        let applied = async {
-            Some(
-                run.shared
-                    .wait(|state| state.stopped || state.applied >= through.max(state.recovered))
-                    .await,
-            )
-        };
-        let late = async {
-            smol::Timer::after(FLOOR).await;
-            None
-        };
-        match applied.or(late).await {
+        let applied = run
+            .shared
+            .wait(|state| state.stopped || state.applied >= through.max(state.recovered));
+        match timeout(FLOOR, applied).await {
             Some(state) if state.stopped => return Answer::Stopped,
             Some(_) => {}
             None => return Answer::Rejected(Rejection::Behind),
@@ -90,15 +83,11 @@ impl Inner {
         agent: AgentId,
     ) -> Result<u64, Answer> {
         let until = Instant::now() + READING;
-        let token = u64::from_le_bytes(crate::node::seed()[..8].try_into().expect("8 bytes"));
+        let token = random_u64();
         let (answer, answered) = smol::channel::unbounded();
-        self.reads
-            .asked
-            .lock()
-            .expect("the reads")
-            .insert(token, (agent, answer));
+        lock(&self.reads.asked).insert(token, (agent, answer));
         let index = self.asking(run, agent, token, &answered, until).await;
-        self.reads.asked.lock().expect("the reads").remove(&token);
+        lock(&self.reads.asked).remove(&token);
         index
     }
 
@@ -131,13 +120,13 @@ impl Inner {
                     Err(CallError::Stopped) => return Err(Answer::Stopped),
                     Err(_) => {
                         let left = until.saturating_duration_since(Instant::now());
-                        within(PAUSE.min(left), run.shared.wait(changed)).await;
+                        timeout(PAUSE.min(left), run.shared.wait(changed)).await;
                         continue;
                     }
                 }
             }
             let Some(to) = leader else {
-                within(left, run.shared.wait(changed)).await;
+                timeout(left, run.shared.wait(changed)).await;
                 continue;
             };
             self.send(
@@ -150,18 +139,14 @@ impl Inner {
                 run.shared.wait(changed).await;
                 None
             };
-            let quiet = async {
-                smol::Timer::after(REASK.min(left)).await;
-                None
-            };
-            match answer.or(moved).or(quiet).await {
+            match timeout(REASK.min(left), answer.or(moved)).await.flatten() {
                 Some(Some(index)) => return Ok(index),
                 // It could not confirm it leads, now: again once this
                 // replica follows another leader, or at the pace of a quiet
                 // one, as it may only be busy.
                 Some(None) => {
                     let left = until.saturating_duration_since(Instant::now());
-                    within(REASK.min(left), run.shared.wait(changed)).await;
+                    timeout(REASK.min(left), run.shared.wait(changed)).await;
                 }
                 None => {}
             }
@@ -202,11 +187,7 @@ impl Inner {
             self.drops.count(refusal);
             return;
         }
-        let waiting = self
-            .reads
-            .asked
-            .lock()
-            .expect("the reads")
+        let waiting = lock(&self.reads.asked)
             .get(&token)
             .filter(|(asked, _)| *asked == agent)
             .map(|(_, waiting)| waiting.clone());

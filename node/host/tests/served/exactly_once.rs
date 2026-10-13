@@ -22,7 +22,6 @@ use vos_checker::{
     ANSWERED, ATTEMPT, COUNTER, Client, INBOX, Methods, Mode, Random, SECOND, wait_until,
 };
 use vos_node::Node;
-use vos_node::store::{Store, View};
 use vos_wire::ids::{AgentId, InstanceId, Session, SessionId};
 use vos_wire::peer::NodeNumber;
 use vos_wire::records::unstored;

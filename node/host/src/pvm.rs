@@ -18,7 +18,7 @@ use vos_wire::result::Write;
 use vos_wire::{Decode, Encode};
 
 use crate::blobs::Blobs;
-use crate::store::{FjallSnapshot, View};
+use crate::store::Snapshot;
 
 /// The refine entry point.
 const REFINE_ENTRY: u32 = 0;
@@ -62,7 +62,7 @@ impl From<vos_pvm::refine::RefineError> for Fault {
 
 /// One agent's applied state, as refine reads it.
 struct AgentState {
-    snapshot: Arc<FjallSnapshot>,
+    snapshot: Arc<Snapshot>,
     agent: AgentId,
 }
 
@@ -119,7 +119,7 @@ pub(crate) fn refine(
     program: &OuterMachines,
     pool: &Arc<MachinePool>,
     blobs: &Blobs,
-    snapshot: Arc<FjallSnapshot>,
+    snapshot: Arc<Snapshot>,
     agent: AgentId,
     work: &Work,
     gas: u64,
@@ -201,7 +201,7 @@ fn serve(id: u64, machine: &mut Machine, blobs: &Blobs) -> Result<(), ExitReason
 /// Accumulate's view of storage: the snapshot, under the writes it made,
 /// which its later reads see.
 struct Overlay {
-    snapshot: Arc<FjallSnapshot>,
+    snapshot: Arc<Snapshot>,
     agent: AgentId,
     written: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
 }
@@ -225,7 +225,7 @@ impl ServiceStorage for Overlay {
 /// one per key, if it halts.
 pub(crate) fn accumulate(
     program: &OuterMachines,
-    snapshot: Arc<FjallSnapshot>,
+    snapshot: Arc<Snapshot>,
     agent: AgentId,
     result: Vec<u8>,
     gas: u64,
@@ -272,7 +272,7 @@ pub(crate) fn decode<T: Decode>(bytes: &[u8]) -> Result<T, Fault> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{Batch, Durability, Fjall, Store};
+    use crate::store::{Fjall, PersistMode};
 
     /// An agent's programs are the ones it pins: a program another agent
     /// pins is stored here, but is not this agent's to load.
@@ -286,7 +286,7 @@ mod tests {
         smol::block_on(blobs.put(blob, Arc::clone(&program))).unwrap();
         let mut batch = store.batch();
         batch.pin(&blob.hash, AgentId(1));
-        batch.commit(Durability::Synced).unwrap();
+        batch.commit(PersistMode::SyncAll).unwrap();
 
         let programs = |agent| AgentPrograms {
             blobs: blobs.clone(),

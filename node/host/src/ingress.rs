@@ -2,7 +2,7 @@
 //! (run as `calls` says), signed queries, and the operator's commands.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use smol::net::TcpListener;
 use subtle::ConstantTimeEq;
@@ -17,8 +17,8 @@ use vos_wire::{Decode, Encode, keys};
 
 use crate::calls::{answer_of, verify};
 use crate::http::{self, Handler, Limits, Response};
+use crate::lock;
 use crate::node::{Inner, ReplaceError};
-use crate::store::{Store, View};
 
 /// How far ahead a query's `not_after` may be.
 const QUERY_HORIZON_MS: u64 = 300_000;
@@ -109,13 +109,8 @@ impl Ingress {
             })
         };
         let limits = Limits {
-            body: Arc::new(|method, path| {
-                if method == "POST" && path.ends_with("/install") {
-                    MAX_INSTALL
-                } else {
-                    cap::REQUEST + ENVELOPE
-                }
-            }),
+            body: cap::REQUEST + ENVELOPE,
+            install: MAX_INSTALL,
             idle: Duration::from_secs(30),
             connections: 1024,
         };
@@ -260,13 +255,7 @@ impl Ingress {
     /// Agent `agent`'s creation record and replicas, when this node knows
     /// of it.
     fn agent_info(&self, agent: AgentId) -> Option<AgentInfo> {
-        let known = self
-            .inner
-            .directory
-            .lock()
-            .expect("the directory")
-            .get(&agent)
-            .cloned()?;
+        let known = lock(&self.inner.directory).get(&agent).cloned()?;
         let replicas = known
             .placement
             .replicas
@@ -274,7 +263,7 @@ impl Ingress {
             .filter_map(|replica| self.inner.contact(*replica))
             .collect();
         Some(AgentInfo {
-            record: known.record,
+            record: known.record.clone(),
             replicas,
         })
     }
@@ -298,7 +287,7 @@ impl Ingress {
             .offload({
                 let stats = Arc::clone(&self.inner.stats);
                 move || {
-                    let started = std::time::Instant::now();
+                    let started = Instant::now();
                     let signed = verify(&key, &message, &signature);
                     stats.verify.took(started.elapsed());
                     signed

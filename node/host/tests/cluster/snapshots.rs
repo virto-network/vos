@@ -6,7 +6,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use vos_checker::calls::done;
-use vos_node::store::{Store, View};
 use vos_node::{Hooks, Node};
 
 use crate::common::{Cluster, WithholdBlobs, compacting, log_start, wait_until};

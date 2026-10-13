@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
-use vos_node::store::{Batch, Durability, Fjall, LogEntry, Store};
+use vos_node::store::{Fjall, LogEntry, PersistMode};
 use vos_wire::ids::AgentId;
 
 const RUN: Duration = Duration::from_secs(4);
@@ -74,7 +74,7 @@ fn writer(store: Fjall, appends: Receiver<Append>, cap: usize) {
             );
             taken.push(append);
         }
-        batch.commit(Durability::Synced).expect("a synced commit");
+        batch.commit(PersistMode::SyncAll).expect("a synced commit");
         for append in taken {
             let _ = append.done.send(());
         }

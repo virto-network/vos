@@ -4,7 +4,6 @@
 
 use std::time::{Duration, Instant};
 
-use vos_node::store::{Store, View};
 use vos_node::{CallError, Reply};
 use vos_wire::abi::failure;
 use vos_wire::batch::{Message, Request};

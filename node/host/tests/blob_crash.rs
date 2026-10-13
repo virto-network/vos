@@ -33,7 +33,7 @@ use vos_node::NoHooks;
 use vos_node::blobs::{Blobs, blob_ref};
 use vos_node::raft::recovery_cut;
 use vos_node::storage::{Change, StorageThread};
-use vos_node::store::{Fjall, LogEntry, Store};
+use vos_node::store::{Fjall, LogEntry};
 use vos_wire::ids::AgentId;
 
 const AGENT: AgentId = AgentId(1);

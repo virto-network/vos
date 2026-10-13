@@ -16,7 +16,6 @@ use vos_checker::processes::{
 use vos_checker::programs::actor;
 use vos_checker::wait_until;
 use vos_node::client::Client;
-use vos_node::store::{Store, View};
 use vos_wire::ids::{AgentId, InstanceId};
 use vos_wire::ingress::{Answer, Consistency};
 use vos_wire::records::unstored;

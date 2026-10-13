@@ -37,7 +37,7 @@ use vos_checker::processes::relay::Link;
 use vos_checker::processes::{Options, PROCESS_WAIT, Processes, methods};
 use vos_checker::programs::actor;
 use vos_checker::{ANSWERED, COUNTER, Client, INBOX, Mode, Nodes, Random, SECOND, wait_until};
-use vos_node::store::{Fjall, Store, View};
+use vos_node::store::Fjall;
 use vos_wire::ids::AgentId;
 use vos_wire::ingress::{Answer, Consistency, Unplaced};
 use vos_wire::peer::NodeNumber;

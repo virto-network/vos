@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 use vos_checker::percentiles;
 use vos_checker::programs::{Programs, method};
 use vos_checker::spaces::{open_node, space};
-use vos_node::store::{EntryKind, Store};
+use vos_node::store::EntryKind;
 use vos_node::{CallError, Config, Hooks, Node, Peers, Reply, Space};
 use vos_wire::Encode;
 use vos_wire::batch::Request;

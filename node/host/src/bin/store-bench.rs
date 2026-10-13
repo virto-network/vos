@@ -16,7 +16,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use vos_node::store::{Batch, Durability, Fjall, HardState, LogEntry, Store, Tuning, View};
+use vos_node::store::{Fjall, HardState, LogEntry, PersistMode, Tuning};
 use vos_wire::defaults::REPLY_WINDOW;
 use vos_wire::ids::{AgentId, InstanceId, SessionId};
 use vos_wire::keys;
@@ -256,8 +256,8 @@ fn write_load(store: &Fjall, rate: u64, stop: &AtomicBool, written: &AtomicU64) 
                 applies.compact(agent, index - COMPACT_TAIL, 1, None);
             }
         }
-        appends.commit(Durability::Synced).unwrap();
-        applies.commit(Durability::Buffered).unwrap();
+        appends.commit(PersistMode::SyncAll).unwrap();
+        applies.commit(PersistMode::Buffer).unwrap();
         written.fetch_add(batches * INPUTS, Ordering::Relaxed);
     }
 }
@@ -380,7 +380,7 @@ fn run(rows: u64, variant: &str) {
         index += 1;
         let mut batch = store.batch();
         batch.apply(AGENT, 0, index, &writes);
-        batch.commit(Durability::Buffered).unwrap();
+        batch.commit(PersistMode::Buffer).unwrap();
     }
     let load = started.elapsed();
     let started = Instant::now();
@@ -399,7 +399,7 @@ fn run(rows: u64, variant: &str) {
     let hit = reads(&store, &mut rng, rows, true);
     let miss = reads(&store, &mut rng, rows, false);
 
-    let mut update = |size: u64, durability: Durability, rounds: u64| {
+    let mut update = |size: u64, durability: PersistMode, rounds: u64| {
         let started = Instant::now();
         for _ in 0..rounds {
             let writes: Vec<_> = (0..size)
@@ -415,9 +415,9 @@ fn run(rows: u64, variant: &str) {
         }
         us(started.elapsed(), size * rounds)
     };
-    let update_1 = update(1, Durability::Buffered, 20_000);
-    let update_1000 = update(1_000, Durability::Buffered, 500);
-    let update_1000_synced = update(1_000, Durability::Synced, 100);
+    let update_1 = update(1, PersistMode::Buffer, 20_000);
+    let update_1000 = update(1_000, PersistMode::Buffer, 500);
+    let update_1000_synced = update(1_000, PersistMode::SyncAll, 100);
     let hit_after = reads(&store, &mut rng, rows, true);
 
     let started = Instant::now();

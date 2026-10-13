@@ -36,6 +36,11 @@ pub use node::{
 };
 pub use space::{Space, SpaceNode};
 
+use std::future::Future;
+use std::sync::{Mutex, MutexGuard};
+use std::time::Duration;
+
+use smol::future::FutureExt;
 use vos_wire::Encode;
 use vos_wire::batch::Batch;
 use vos_wire::ids::AgentId;
@@ -45,6 +50,22 @@ use vos_wire::peer::CreationRecord;
 /// sign for it, and its replica group is named by it.
 pub fn identity(record: &CreationRecord) -> [u8; 32] {
     vos_pvm::precompile::blake2b_256(&record.encode())
+}
+
+/// `work`'s output, if it ends within `limit`.
+pub(crate) async fn timeout<T>(limit: Duration, work: impl Future<Output = T>) -> Option<T> {
+    let work = async { Some(work.await) };
+    work.or(async {
+        smol::Timer::after(limit).await;
+        None
+    })
+    .await
+}
+
+/// `mutex`, locked. A lock a panic poisoned panics here too.
+#[track_caller]
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().expect("unpoisoned")
 }
 
 /// Points where a test breaks the node as a crash or a bug would.
@@ -90,8 +111,8 @@ pub trait Hooks: Send + Sync {
 
     /// Before a leader sends a snapshot chunk: how long it waits first, as
     /// on a slow link.
-    fn delay_chunk(&self) -> std::time::Duration {
-        std::time::Duration::ZERO
+    fn delay_chunk(&self) -> Duration {
+        Duration::ZERO
     }
 
     /// Before the storage thread commits: true makes the commit fail with

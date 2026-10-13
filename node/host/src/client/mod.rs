@@ -1,14 +1,14 @@
 //! A blocking client of a node's ingress: a client key's sessions, signed
 //! calls and queries, and the operator's commands.
 
-use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+mod http;
+mod target;
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
+use std::time::Duration;
 
 use ed25519_dalek::{Signer, SigningKey};
-use rustls::pki_types::ServerName;
 use vos_wire::abi::refusal;
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session};
 use vos_wire::ingress::{
@@ -18,7 +18,11 @@ use vos_wire::ingress::{
 use vos_wire::schema::Schema;
 use vos_wire::{Decode, Encode, defaults};
 
-use crate::tls::{self, Trust};
+use crate::lock;
+use crate::tls::Trust;
+use http::Http;
+pub use target::Target;
+use target::authority;
 
 #[derive(Debug)]
 pub enum ClientError {
@@ -35,389 +39,6 @@ pub enum ClientError {
     /// run, and nothing can say. Its session was collected, or may have
     /// been.
     Lost,
-}
-
-/// A node's ingress, and how this client trusts it.
-#[derive(Clone)]
-pub struct Target {
-    /// The `host:port` to connect to, which is also the `Host` header.
-    authority: String,
-    /// Where a plain target connects: loopback addresses, never a name a
-    /// resolver could answer for.
-    loopback: Option<Vec<SocketAddr>>,
-    tls: Option<(Arc<rustls::ClientConfig>, ServerName<'static>)>,
-    /// The node's key, when pinned.
-    key: Option<[u8; 32]>,
-    /// How the client trusts it, which the nodes it is sent on to inherit.
-    trust: Trust,
-}
-
-impl Target {
-    /// The `host:port` it connects to.
-    pub fn authority(&self) -> &str {
-        &self.authority
-    }
-
-    /// The TLS a connection to it speaks, and the name it presents, for a
-    /// caller with its own connections; none for plain HTTP.
-    pub fn tls(&self) -> Option<(Arc<rustls::ClientConfig>, ServerName<'static>)> {
-        self.tls.clone()
-    }
-
-    /// The node at `url` (`http://` or `https://`, then a host and an
-    /// optional port), trusted as `trust` says. Plain HTTP reaches
-    /// loopback addresses only, and HTTPS needs a key or a CA to trust.
-    pub fn new(url: &str, trust: Trust) -> Result<Self, ClientError> {
-        let invalid = |why: &str| ClientError::Http(format!("{url}: {why}"));
-        let (secure, rest) = if let Some(rest) = url.strip_prefix("https://") {
-            (true, rest)
-        } else if let Some(rest) = url.strip_prefix("http://") {
-            (false, rest)
-        } else {
-            return Err(invalid("not an http:// or https:// address"));
-        };
-        let (host, port) = host_and_port(rest, secure).map_err(invalid)?;
-        let bare = host.trim_start_matches('[').trim_end_matches(']');
-        let mut loopback = None;
-        let tls = match (secure, &trust) {
-            (false, Trust::Loopback) => {
-                let addresses: Vec<IpAddr> = if bare == "localhost" {
-                    vec![Ipv4Addr::LOCALHOST.into(), Ipv6Addr::LOCALHOST.into()]
-                } else {
-                    match bare.parse::<IpAddr>() {
-                        Ok(address) if address.is_loopback() => vec![address],
-                        _ => return Err(invalid("plain HTTP reaches loopback addresses only")),
-                    }
-                };
-                loopback = Some(
-                    addresses
-                        .into_iter()
-                        .map(|address| SocketAddr::new(address, port))
-                        .collect(),
-                );
-                None
-            }
-            (false, _) => return Err(invalid("a key or a CA to trust needs https://")),
-            (true, Trust::Loopback) => {
-                return Err(invalid("https:// needs a key or a CA to trust"));
-            }
-            (true, trust) => {
-                let config = tls::client_config(trust)
-                    .map_err(ClientError::Http)?
-                    .expect("TLS for a key or a CA");
-                let name = match (ServerName::try_from(bare.to_string()), trust) {
-                    (Ok(name), _) => name,
-                    // A pinned key does not need the name, which only
-                    // goes in the handshake.
-                    (Err(_), Trust::NodeKey(_)) => ServerName::try_from("node.vos")
-                        .expect("a host name")
-                        .to_owned(),
-                    (Err(_), _) => return Err(invalid("not a host name or an address")),
-                };
-                Some((config, name))
-            }
-        };
-        Ok(Self {
-            authority: format!("{host}:{port}"),
-            loopback,
-            tls,
-            key: match trust {
-                Trust::NodeKey(key) => Some(key),
-                _ => None,
-            },
-            trust,
-        })
-    }
-
-    /// The node at `url`, over plain HTTP on a loopback address.
-    pub fn loopback(url: &str) -> Result<Self, ClientError> {
-        Self::new(url, Trust::Loopback)
-    }
-}
-
-/// The host and port of an address's authority (`rest`, after its
-/// scheme), the scheme's port when it gives none.
-fn host_and_port(rest: &str, secure: bool) -> Result<(&str, u16), &'static str> {
-    let authority = rest.trim_end_matches('/');
-    if authority.is_empty() || authority.contains('/') {
-        return Err("a host and a port, with no path");
-    }
-    match authority.rsplit_once(':') {
-        Some((host, port)) if !port.contains(']') => {
-            Ok((host, port.parse::<u16>().map_err(|_| "not a port")?))
-        }
-        _ => Ok((authority, if secure { 443 } else { 80 })),
-    }
-}
-
-/// `host:port` for an `http://` or `https://` address, as a target holds
-/// it.
-fn authority(url: &str) -> Option<String> {
-    let (secure, rest) = match url.split_once("://")? {
-        ("https", rest) => (true, rest),
-        ("http", rest) => (false, rest),
-        _ => return None,
-    };
-    let (host, port) = host_and_port(rest, secure).ok()?;
-    Some(format!("{host}:{port}"))
-}
-
-/// A connection is used again only if it was idle less than this long,
-/// well within the node's idle limit.
-const REUSE: Duration = Duration::from_secs(20);
-const CONNECT: Duration = Duration::from_secs(10);
-/// A request's answer may take this long: an install prepares a program.
-const ANSWER: Duration = Duration::from_secs(300);
-/// The largest answer taken: a schema, a reply, a refusal.
-const MAX_ANSWER: usize = 16 << 20;
-/// The largest request body sent in one write with its head.
-const ONE_WRITE: usize = 64 << 10;
-
-trait Stream: Read + Write + Send {}
-
-impl<T: Read + Write + Send> Stream for T {}
-
-struct Connection {
-    stream: Box<dyn Stream>,
-    /// Bytes read past the last answer.
-    buffer: Vec<u8>,
-    used: Instant,
-}
-
-/// Idle connections kept open to one node.
-const IDLE_CONNECTIONS: usize = 4;
-
-/// HTTP/1.1 to one node, keeping connections open between requests.
-/// Requests may go at once, each on a connection of its own.
-struct Http {
-    target: Target,
-    idle: Mutex<Vec<Connection>>,
-    /// How long a request's answer may take.
-    answer: Duration,
-}
-
-impl Http {
-    fn new(target: &Target) -> Self {
-        Self::within(target, ANSWER)
-    }
-
-    /// One whose requests are answered within `answer`, connecting within
-    /// it too.
-    fn within(target: &Target, answer: Duration) -> Self {
-        Self {
-            target: target.clone(),
-            idle: Mutex::new(Vec::new()),
-            answer,
-        }
-    }
-
-    /// An idle connection still fresh enough, or a new one, and whether
-    /// it was kept.
-    fn connection(&self) -> std::io::Result<(Connection, bool)> {
-        let fresh = {
-            let mut idle = self.idle.lock().expect("the idle connections");
-            idle.retain(|connection| connection.used.elapsed() < REUSE);
-            idle.pop()
-        };
-        match fresh {
-            Some(connection) => Ok((connection, true)),
-            None => Ok((self.connect()?, false)),
-        }
-    }
-
-    fn keep(&self, mut connection: Connection) {
-        connection.used = Instant::now();
-        let mut idle = self.idle.lock().expect("the idle connections");
-        if idle.len() < IDLE_CONNECTIONS {
-            idle.push(connection);
-        }
-    }
-
-    fn connect(&self) -> std::io::Result<Connection> {
-        let addresses: Vec<SocketAddr> = match &self.target.loopback {
-            Some(addresses) => addresses.clone(),
-            None => self.target.authority.to_socket_addrs()?.collect(),
-        };
-        let mut last = None;
-        let mut tcp = None;
-        let connect = CONNECT.min(self.answer);
-        for address in addresses {
-            match TcpStream::connect_timeout(&address, connect) {
-                Ok(stream) => {
-                    tcp = Some(stream);
-                    break;
-                }
-                Err(error) => last = Some(error),
-            }
-        }
-        let tcp = tcp.ok_or_else(|| {
-            last.unwrap_or_else(|| std::io::Error::other("the host has no address"))
-        })?;
-        tcp.set_nodelay(true)?;
-        tcp.set_read_timeout(Some(connect))?;
-        tcp.set_write_timeout(Some(connect))?;
-        let stream: Box<dyn Stream> = match &self.target.tls {
-            Some((config, name)) => {
-                let tls = rustls::ClientConnection::new(Arc::clone(config), name.clone())
-                    .map_err(std::io::Error::other)?;
-                let mut stream = rustls::StreamOwned::new(tls, tcp);
-                // Handshake now, within the connect timeout, so a wrong key
-                // or a stalled node fails here, not mid-request.
-                while stream.conn.is_handshaking() {
-                    stream.conn.complete_io(&mut stream.sock)?;
-                }
-                stream.sock.set_read_timeout(Some(self.answer))?;
-                stream.sock.set_write_timeout(Some(self.answer))?;
-                Box::new(stream)
-            }
-            None => {
-                tcp.set_read_timeout(Some(self.answer))?;
-                tcp.set_write_timeout(Some(self.answer))?;
-                Box::new(tcp)
-            }
-        };
-        Ok(Connection {
-            stream,
-            buffer: Vec::new(),
-            used: Instant::now(),
-        })
-    }
-
-    /// Send a request and read its answer. `repeatable` says the node
-    /// takes it twice as once (a read, or a signed call or query, which
-    /// the node deduplicates): such a request that fails on a kept
-    /// connection before any answer arrives is sent once more on a new
-    /// one. The node likely restarted, so no kept connection is used.
-    fn request(
-        &self,
-        method: &str,
-        path: &str,
-        token: Option<&str>,
-        body: &[u8],
-        repeatable: bool,
-    ) -> Result<(u16, Vec<u8>), ClientError> {
-        let failed = |error: std::io::Error| ClientError::Http(error.to_string());
-        let authorization = token.map_or(String::new(), |token| {
-            format!("Authorization: Bearer {token}\r\n")
-        });
-        let head = format!(
-            "{method} {path} HTTP/1.1\r\nHost: {}\r\nContent-Length: {}\r\n{authorization}\r\n",
-            self.target.authority,
-            body.len(),
-        );
-        let (mut connection, kept) = self.connection().map_err(failed)?;
-        let (status, body, close) = match exchange(&mut connection, head.as_bytes(), body) {
-            Ok(answer) => answer,
-            Err((_, false)) if kept && repeatable => {
-                self.idle.lock().expect("the idle connections").clear();
-                connection = self.connect().map_err(failed)?;
-                exchange(&mut connection, head.as_bytes(), body)
-                    .map_err(|(error, _)| failed(error))?
-            }
-            Err((error, _)) => return Err(failed(error)),
-        };
-        if !close {
-            self.keep(connection);
-        }
-        Ok((status, body))
-    }
-
-    fn get(&self, path: &str) -> Result<(u16, Vec<u8>), ClientError> {
-        self.request("GET", path, None, &[], true)
-    }
-
-    fn post(
-        &self,
-        path: &str,
-        token: Option<&str>,
-        body: &[u8],
-        repeatable: bool,
-    ) -> Result<(u16, Vec<u8>), ClientError> {
-        self.request("POST", path, token, body, repeatable)
-    }
-}
-
-/// Write a request and read its answer: the status, the body, and whether
-/// the node closes the connection after it. On failure, whether any of
-/// the answer had arrived.
-fn exchange(
-    connection: &mut Connection,
-    head: &[u8],
-    body: &[u8],
-) -> Result<(u16, Vec<u8>, bool), (std::io::Error, bool)> {
-    // A small request in one write, so it wakes the node once; a large one
-    // (an install) is not copied for it.
-    let written = if body.len() <= ONE_WRITE {
-        let mut request = Vec::with_capacity(head.len() + body.len());
-        request.extend_from_slice(head);
-        request.extend_from_slice(body);
-        connection.stream.write_all(&request)
-    } else {
-        connection
-            .stream
-            .write_all(head)
-            .and_then(|()| connection.stream.write_all(body))
-    };
-    written
-        .and_then(|()| connection.stream.flush())
-        .map_err(|error| (error, false))?;
-    read_answer(connection).map_err(|error| {
-        let answered = !connection.buffer.is_empty();
-        (error, answered)
-    })
-}
-
-/// The next answer on `connection`: its status, its body, and whether the
-/// node closes the connection after it.
-fn read_answer(connection: &mut Connection) -> std::io::Result<(u16, Vec<u8>, bool)> {
-    let invalid = |why: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, why.to_string());
-    let mut chunk = [0u8; 8192];
-    loop {
-        let mut headers = [httparse::EMPTY_HEADER; 32];
-        let mut answer = httparse::Response::new(&mut headers);
-        match answer.parse(&connection.buffer) {
-            Ok(httparse::Status::Complete(head)) => {
-                let status = answer.code.unwrap_or(0);
-                let header = |name: &str| {
-                    answer
-                        .headers
-                        .iter()
-                        .find(|header| header.name.eq_ignore_ascii_case(name))
-                        .map(|header| header.value)
-                };
-                let length = header("content-length")
-                    .and_then(|value| std::str::from_utf8(value).ok())
-                    .and_then(|value| value.trim().parse::<usize>().ok())
-                    .ok_or_else(|| invalid("an answer without a length"))?;
-                if length > MAX_ANSWER {
-                    return Err(invalid("an answer larger than any the node gives"));
-                }
-                let close =
-                    header("connection").is_some_and(|value| value.eq_ignore_ascii_case(b"close"));
-                while connection.buffer.len() < head + length {
-                    let read = connection.stream.read(&mut chunk)?;
-                    if read == 0 {
-                        return Err(invalid("the answer ended early"));
-                    }
-                    connection.buffer.extend_from_slice(&chunk[..read]);
-                }
-                let body = connection.buffer[head..head + length].to_vec();
-                connection.buffer.drain(..head + length);
-                return Ok((status, body, close));
-            }
-            Ok(httparse::Status::Partial) => {
-                if connection.buffer.len() > 16 << 10 {
-                    return Err(invalid("an answer's head too large"));
-                }
-                let read = connection.stream.read(&mut chunk)?;
-                if read == 0 {
-                    return Err(invalid("the connection closed"));
-                }
-                connection.buffer.extend_from_slice(&chunk[..read]);
-            }
-            Err(_) => return Err(invalid("an answer that is not HTTP")),
-        }
-    }
 }
 
 fn answer(status: u16, body: &[u8]) -> Result<Answer, ClientError> {
@@ -531,7 +152,7 @@ pub struct Client {
     /// Each agent's replicas, learned with its identity.
     replicas: Mutex<HashMap<AgentId, Vec<Contact>>>,
     /// Agents whose next call repeats one whose fate is unknown.
-    unknown: Mutex<std::collections::HashSet<AgentId>>,
+    unknown: Mutex<HashSet<AgentId>>,
     /// Each agent's floor: the highest applied index an answer reflected.
     floors: Mutex<HashMap<AgentId, u64>>,
     /// How far the agents' time is ahead of this client's clock, as a
@@ -559,7 +180,7 @@ impl Client {
             sessions: Mutex::new(sessions),
             identities: Mutex::new(identities),
             replicas: Mutex::new(HashMap::new()),
-            unknown: Mutex::new(std::collections::HashSet::new()),
+            unknown: Mutex::new(HashSet::new()),
             floors: Mutex::new(HashMap::new()),
             offset: Mutex::new(0),
         }
@@ -567,12 +188,12 @@ impl Client {
 
     /// Each agent's session, to keep.
     pub fn sessions(&self) -> HashMap<AgentId, Kept> {
-        self.sessions.lock().expect("the sessions").clone()
+        lock(&self.sessions).clone()
     }
 
     /// Each agent's identity learned, to keep.
     pub fn identities(&self) -> HashMap<AgentId, [u8; 32]> {
-        self.identities.lock().expect("the identities").clone()
+        lock(&self.identities).clone()
     }
 
     /// Say that the next call to `agent` repeats one whose fate is unknown,
@@ -581,10 +202,7 @@ impl Client {
     /// may be on their way, and once the session may be collected, the
     /// call ends [`ClientError::Lost`].
     pub fn repeats_unknown(&self, agent: AgentId) {
-        self.unknown
-            .lock()
-            .expect("the unknown calls")
-            .insert(agent);
+        lock(&self.unknown).insert(agent);
     }
 
     /// The node this client calls: the one it was given, or the last a
@@ -599,10 +217,7 @@ impl Client {
 
     /// The session this client calls `agent` in, started if there is none.
     pub fn session(&self, agent: AgentId) -> Session {
-        let kept = *self
-            .sessions
-            .lock()
-            .expect("the sessions")
+        let kept = *lock(&self.sessions)
             .entry(agent)
             .or_insert_with(|| self.start());
         self.whole(kept)
@@ -611,16 +226,13 @@ impl Client {
     /// Start another session for `agent`: the one before is done with.
     pub fn renew(&self, agent: AgentId) {
         let kept = self.start();
-        self.sessions
-            .lock()
-            .expect("the sessions")
-            .insert(agent, kept);
+        lock(&self.sessions).insert(agent, kept);
     }
 
     fn start(&self) -> Kept {
         let mut name = [0u8; 16];
         getrandom::getrandom(&mut name).expect("the operating system's randomness");
-        let offset = *self.offset.lock().expect("the offset");
+        let offset = *lock(&self.offset);
         let t0 = crate::wall_clock().saturating_add_signed(offset);
         Kept { name, t0, next: 1 }
     }
@@ -637,7 +249,7 @@ impl Client {
     /// of its creation record, fetched from the node once, with the agent's
     /// replicas.
     pub fn identity(&self, agent: AgentId) -> Result<[u8; 32], ClientError> {
-        if let Some(identity) = self.identities.lock().expect("the identities").get(&agent) {
+        if let Some(identity) = lock(&self.identities).get(&agent) {
             return Ok(*identity);
         }
         self.learn(agent)
@@ -648,19 +260,11 @@ impl Client {
     fn learn(&self, agent: AgentId) -> Result<[u8; 32], ClientError> {
         let info = agent_info_from(&self.http, agent)?.ok_or(ClientError::NoAgent)?;
         let identity = crate::identity(&info.record);
-        let kept = *self
-            .identities
-            .lock()
-            .expect("the identities")
-            .entry(agent)
-            .or_insert(identity);
+        let kept = *lock(&self.identities).entry(agent).or_insert(identity);
         if kept != identity {
             return Err(ClientError::OtherAgent);
         }
-        self.replicas
-            .lock()
-            .expect("the replicas")
-            .insert(agent, info.replicas);
+        lock(&self.replicas).insert(agent, info.replicas);
         Ok(identity)
     }
 
@@ -668,18 +272,10 @@ impl Client {
     /// when it knows no other.
     fn fail_over(&mut self, agent: AgentId) -> Result<bool, ClientError> {
         // An identity kept from before comes without the replicas.
-        if !self
-            .replicas
-            .lock()
-            .expect("the replicas")
-            .contains_key(&agent)
-        {
+        if !lock(&self.replicas).contains_key(&agent) {
             let _ = self.learn(agent);
         }
-        let replicas = self
-            .replicas
-            .lock()
-            .expect("the replicas")
+        let replicas = lock(&self.replicas)
             .get(&agent)
             .cloned()
             .unwrap_or_default();
@@ -713,12 +309,7 @@ impl Client {
     ) -> Result<Answer, ClientError> {
         // Learn the replicas first: the node may be gone when a failover
         // needs them.
-        if !self
-            .replicas
-            .lock()
-            .expect("the replicas")
-            .contains_key(&agent)
-        {
+        if !lock(&self.replicas).contains_key(&agent) {
             let _ = self.learn(agent);
         }
         let mut redirects = 0;
@@ -727,14 +318,10 @@ impl Client {
         let mut busy = BUSY;
         // An attempt that may have run, or may yet: later refusals that
         // say it never ran no longer prove it for the call.
-        let mut inconclusive = self
-            .unknown
-            .lock()
-            .expect("the unknown calls")
-            .remove(&agent);
+        let mut inconclusive = lock(&self.unknown).remove(&agent);
         loop {
             self.session(agent);
-            let sequence = self.sessions.lock().expect("the sessions")[&agent].next;
+            let sequence = lock(&self.sessions)[&agent].next;
             let answer = match self.call_at(agent, sequence, instance, method, arguments) {
                 Ok(answer) => answer,
                 Err(error) => {
@@ -748,8 +335,7 @@ impl Client {
             };
             match &answer {
                 Answer::Ran { at, .. } => {
-                    if let Some(kept) = self.sessions.lock().expect("the sessions").get_mut(&agent)
-                    {
+                    if let Some(kept) = lock(&self.sessions).get_mut(&agent) {
                         kept.next = sequence + 1;
                     }
                     self.raise_floor(agent, *at);
@@ -837,13 +423,7 @@ impl Client {
     /// What a call whose fate is unknown can be, its session refused as one
     /// the agent does not hold at the agent's time `now`.
     fn unknown_fate(&self, agent: AgentId, now: u64) -> Fate {
-        let Some(kept) = self
-            .sessions
-            .lock()
-            .expect("the sessions")
-            .get(&agent)
-            .copied()
-        else {
+        let Some(kept) = lock(&self.sessions).get(&agent).copied() else {
             return Fate::InTransit;
         };
         // Answered in, the session was created, and is gone.
@@ -869,8 +449,7 @@ impl Client {
     /// from this client's clock.
     fn learn_time(&self, now: u64) {
         let offset = i128::from(now) - i128::from(crate::wall_clock());
-        *self.offset.lock().expect("the offset") =
-            offset.clamp(i64::MIN.into(), i64::MAX.into()) as i64;
+        *lock(&self.offset) = offset.clamp(i64::MIN.into(), i64::MAX.into()) as i64;
     }
 
     /// Call the node `contact` names from now on, trusted as this client
@@ -962,7 +541,7 @@ impl Client {
         consistency: Consistency,
     ) -> Result<Answer, ClientError> {
         let identity = self.identity(agent)?;
-        let offset = || *self.offset.lock().expect("the offset");
+        let offset = || *lock(&self.offset);
         let used = offset();
         let answer = self.query_until(
             agent,
@@ -1034,18 +613,10 @@ impl Client {
         };
         let mut answer = ask(&self.http);
         if unanswered(&answer) {
-            if !self
-                .replicas
-                .lock()
-                .expect("the replicas")
-                .contains_key(&agent)
-            {
+            if !lock(&self.replicas).contains_key(&agent) {
                 let _ = self.learn(agent);
             }
-            let replicas = self
-                .replicas
-                .lock()
-                .expect("the replicas")
+            let replicas = lock(&self.replicas)
                 .get(&agent)
                 .cloned()
                 .unwrap_or_default();
@@ -1073,23 +644,18 @@ impl Client {
     /// The highest applied index an answer for `agent` reflected: the
     /// floor its queries ask a replica to have reached.
     pub fn floor(&self, agent: AgentId) -> u64 {
-        self.floors
-            .lock()
-            .expect("the floors")
-            .get(&agent)
-            .copied()
-            .unwrap_or(0)
+        lock(&self.floors).get(&agent).copied().unwrap_or(0)
     }
 
     /// Each agent's floor, to keep.
     pub fn floors(&self) -> HashMap<AgentId, u64> {
-        self.floors.lock().expect("the floors").clone()
+        lock(&self.floors).clone()
     }
 
     /// Raise `agent`'s floor to `at`, as an answer, or one kept from
     /// before, reflected.
     pub fn raise_floor(&self, agent: AgentId, at: u64) {
-        let mut floors = self.floors.lock().expect("the floors");
+        let mut floors = lock(&self.floors);
         let floor = floors.entry(agent).or_insert(0);
         *floor = (*floor).max(at);
     }
@@ -1206,31 +772,5 @@ impl Operator {
             true,
         )?;
         answer(status, &body)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::authority;
-
-    /// A replica's address matches the target made from it, the scheme's
-    /// port written or not.
-    #[test]
-    fn an_address_s_authority_is_its_host_and_port() {
-        assert_eq!(
-            authority("https://n1.example").as_deref(),
-            Some("n1.example:443")
-        );
-        assert_eq!(
-            authority("https://n1.example/").as_deref(),
-            Some("n1.example:443")
-        );
-        assert_eq!(
-            authority("http://127.0.0.1:7700").as_deref(),
-            Some("127.0.0.1:7700")
-        );
-        assert_eq!(authority("http://[::1]").as_deref(), Some("[::1]:80"));
-        assert_eq!(authority("ftp://n1.example"), None);
-        assert_eq!(authority("https://n1.example/path"), None);
     }
 }
