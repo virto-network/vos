@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use common::*;
 use vos_net::quic::Quic;
-use vos_net::{Class, Limits, Network, Peer, public_key};
+use vos_net::{Class, Limits, Peer, public_key};
 
 const PEER: &str = "VOS_NET_RESTARTED_PEER";
 

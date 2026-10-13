@@ -29,7 +29,7 @@ use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -67,6 +67,15 @@ const MIN_BACKOFF: Duration = Duration::from_millis(50);
 const MAX_BACKOFF: Duration = Duration::from_secs(1);
 /// The bytes before a stream's frames: its class and id.
 const HEADER: usize = 9;
+/// Streams a peer may hold open at once, unless configured otherwise.
+const STREAMS: u32 = 1 << 13;
+/// How long a long-lived stream stays quiet before it is finished, unless
+/// configured otherwise.
+const QUIET: Duration = Duration::from_secs(10);
+/// How long a network dropped waits for its peers to hear the close.
+const CLOSING: Duration = Duration::from_millis(100);
+/// QUIC's CRYPTO_ERROR codes: 0x100 plus a TLS alert's code.
+const CRYPTO_ERRORS: std::ops::Range<u64> = 0x100..0x200;
 
 /// Codes a connection or stream is closed with.
 mod code {
@@ -110,17 +119,18 @@ impl Config {
             listen,
             peers: Vec::new(),
             limits: Limits::default(),
-            streams: 1 << 13,
-            quiet: Duration::from_secs(10),
+            streams: STREAMS,
+            quiet: QUIET,
             idle: IDLE,
         }
     }
 }
 
-/// The network over QUIC. Dropping it closes every connection.
+/// The network over QUIC. Dropping it closes every connection, waits
+/// briefly for the peers to hear it, and stops every task.
 pub struct Quic {
     inner: Arc<Inner>,
-    accept: Option<smol::Task<()>>,
+    _accept: smol::Task<()>,
     /// Dropped last: it stops the network's thread.
     _runner: Runner,
 }
@@ -181,6 +191,27 @@ impl Spawner {
     }
 }
 
+/// Tasks that stop when their holder drops them; the finished ones are let
+/// go as new ones come.
+#[derive(Default)]
+struct Tasks(Vec<smol::Task<()>>);
+
+impl Tasks {
+    /// Spawn `future` and hold its task: `false` once the executor is gone.
+    fn spawn(
+        &mut self,
+        spawner: &Spawner,
+        future: impl Future<Output = ()> + Send + 'static,
+    ) -> bool {
+        self.0.retain(|task| !task.is_finished());
+        let Some(task) = spawner.spawn(future) else {
+            return false;
+        };
+        self.0.push(task);
+        true
+    }
+}
+
 /// quinn's smol runtime, spawning on the network's executor.
 #[derive(Debug)]
 struct Runtime(Spawner);
@@ -216,7 +247,6 @@ struct Inner {
     deliver: Deliver,
     limits: Limits,
     quiet: Duration,
-    closed: AtomicBool,
     spawner: Spawner,
 }
 
@@ -251,15 +281,17 @@ impl Quic {
             deliver,
             limits: config.limits,
             quiet: config.quiet,
-            closed: AtomicBool::new(false),
             spawner: runner.spawner(),
         });
         inner.set_peers(config.peers);
-        let accept = runner.spawner().spawn(accept(Arc::clone(&inner)));
+        let accept = runner
+            .spawner()
+            .spawn(accept(Arc::clone(&inner)))
+            .expect("the network's executor runs while it is open");
         Ok((
             Self {
                 inner,
-                accept,
+                _accept: accept,
                 _runner: runner,
             },
             arrivals,
@@ -279,17 +311,10 @@ impl Quic {
         self.inner.identity.key
     }
 
-    /// Close every connection, wait until the peers have been told, and
-    /// stop every task.
-    pub async fn shutdown(mut self) {
-        let links = self.inner.close();
-        self.inner.endpoint.wait_idle().await;
-        for link in links {
-            link.task.cancel().await;
-        }
-        if let Some(accept) = self.accept.take() {
-            accept.cancel().await;
-        }
+    /// Replace the peer table, without a restart: a peer changed or gone
+    /// loses its connection.
+    pub fn set_peers(&self, peers: Vec<Peer>) {
+        self.inner.set_peers(peers);
     }
 }
 
@@ -301,25 +326,21 @@ impl Drop for Quic {
             self.inner.endpoint.wait_idle().await;
         };
         smol::block_on(told.or(async {
-            smol::Timer::after(Duration::from_millis(100)).await;
+            smol::Timer::after(CLOSING).await;
         }));
     }
 }
 
 impl Inner {
-    /// Refuse every later send and close every connection: the links
-    /// taken out, whose tasks stop when dropped.
-    fn close(&self) -> Vec<Link> {
-        self.closed.store(true, Ordering::Release);
+    /// Close every connection.
+    fn close(&self) {
         let links = std::mem::take(&mut *self.links.lock().expect("the links"));
         self.endpoint.close(code::CLOSED, b"");
-        links.into_values().collect()
+        // Dropping a link stops its task.
+        drop(links);
     }
 
     fn set_peers(&self, peers: Vec<Peer>) {
-        if self.closed.load(Ordering::Acquire) {
-            return;
-        }
         let peers: Vec<Peer> = peers
             .into_iter()
             .filter(|peer| peer.number != self.number)
@@ -470,8 +491,6 @@ impl Link {
     }
 }
 
-/// Dial the peer whenever there is something to send, and write to it
-/// until the connection closes.
 /// What a link dials with.
 struct Dialing {
     endpoint: quinn::Endpoint,
@@ -483,6 +502,8 @@ struct Dialing {
     spawner: Spawner,
 }
 
+/// Dial the peer whenever there is something to send, and write to it
+/// until the connection closes.
 async fn dial(dialing: Dialing, queued: smol::channel::Receiver<Outgoing>, shared: Arc<Shared>) {
     let Dialing {
         endpoint,
@@ -516,8 +537,7 @@ async fn dial(dialing: Dialing, queued: smol::channel::Receiver<Outgoing>, share
             Ok(connection) => connection,
             Err(error) => {
                 tracing::debug!(%address, %error, "dial failed");
-                smol::Timer::after(backoff).await;
-                backoff = (backoff * 2).min(MAX_BACKOFF);
+                back_off(&mut backoff).await;
                 continue;
             }
         };
@@ -529,12 +549,17 @@ async fn dial(dialing: Dialing, queued: smol::channel::Receiver<Outgoing>, share
             // The peer took the handshake, then refused this node: dialing
             // again at once would only be refused again.
             tracing::debug!(%address, "a peer refused this node");
-            smol::Timer::after(backoff).await;
-            backoff = (backoff * 2).min(MAX_BACKOFF);
+            back_off(&mut backoff).await;
         } else {
             backoff = MIN_BACKOFF;
         }
     }
+}
+
+/// Wait `backoff`, then double it, up to [`MAX_BACKOFF`].
+async fn back_off(backoff: &mut Duration) {
+    smol::Timer::after(*backoff).await;
+    *backoff = (*backoff * 2).min(MAX_BACKOFF);
 }
 
 /// Whether the peer closed `connection` refusing this node: a TLS alert
@@ -542,8 +567,7 @@ async fn dial(dialing: Dialing, queued: smol::channel::Receiver<Outgoing>, share
 fn refused(connection: &quinn::Connection) -> bool {
     match connection.close_reason() {
         Some(quinn::ConnectionError::ConnectionClosed(close)) => {
-            // QUIC's CRYPTO_ERROR range: 0x100 plus the TLS alert's code.
-            (0x100..0x200).contains(&u64::from(close.error_code))
+            CRYPTO_ERRORS.contains(&u64::from(close.error_code))
         }
         Some(quinn::ConnectionError::ApplicationClosed(close)) => {
             close.error_code == code::UNCONFIGURED
@@ -579,7 +603,7 @@ async fn write(
     let mut sweep = smol::Timer::interval(every);
     let mut swept = Instant::now();
     let bulk = Arc::new(smol::lock::Semaphore::new(BULK_STREAMS));
-    let mut sending: Vec<smol::Task<()>> = Vec::new();
+    let mut sending = Tasks::default();
     loop {
         // Swept on time even while frames never stop coming.
         if swept.elapsed() >= every {
@@ -618,16 +642,15 @@ async fn write(
             return;
         }
         if frame.class.stream_per_frame() {
-            sending.retain(|task| !task.is_finished());
             let connection = connection.clone();
             let bulk = Arc::clone(&bulk);
-            let Some(task) = spawner.spawn(async move {
+            let sent = async move {
                 let _permit = bulk.acquire().await;
                 let _ = write_bulk(&connection, frame).await;
-            }) else {
-                return;
             };
-            sending.push(task);
+            if !sending.spawn(spawner, sent) {
+                return;
+            }
             continue;
         }
         let key = (frame.class, frame.stream);
@@ -701,9 +724,7 @@ impl Writer {
                 previous.await;
             }
             let written = async {
-                let mut send = connection.open_uni().await.ok()?;
-                send.set_priority(class.priority()).ok()?;
-                send.write_all(&header(class, stream)).await.ok()?;
+                let mut send = open(&connection, class, stream).await?;
                 while let Ok(frame) = queued.recv().await {
                     write_frame(&mut send, &frame.frame).await.ok()?;
                 }
@@ -726,11 +747,20 @@ impl Writer {
     }
 }
 
-fn header(class: Class, stream: u64) -> [u8; HEADER] {
+/// A new stream for frames of `class` with id `stream`: sent by its
+/// class's priority, its header written.
+async fn open(
+    connection: &quinn::Connection,
+    class: Class,
+    stream: u64,
+) -> Option<quinn::SendStream> {
+    let mut send = connection.open_uni().await.ok()?;
+    send.set_priority(class.priority()).ok()?;
     let mut header = [0u8; HEADER];
     header[0] = class as u8;
     header[1..].copy_from_slice(&stream.to_be_bytes());
-    header
+    send.write_all(&header).await.ok()?;
+    Some(send)
 }
 
 async fn write_frame(send: &mut quinn::SendStream, frame: &[u8]) -> Result<(), quinn::WriteError> {
@@ -741,11 +771,7 @@ async fn write_frame(send: &mut quinn::SendStream, frame: &[u8]) -> Result<(), q
 
 /// A bulk frame on a stream of its own, held until the peer has it all.
 async fn write_bulk(connection: &quinn::Connection, frame: Outgoing) -> Option<()> {
-    let mut send = connection.open_uni().await.ok()?;
-    send.set_priority(frame.class.priority()).ok()?;
-    send.write_all(&header(frame.class, frame.stream))
-        .await
-        .ok()?;
+    let mut send = open(connection, frame.class, frame.stream).await?;
     write_frame(&mut send, &frame.frame).await.ok()?;
     send.finish().ok()?;
     drop(frame);
@@ -755,13 +781,11 @@ async fn write_bulk(connection: &quinn::Connection, frame: Outgoing) -> Option<(
 
 /// Accept peers' connections, for as long as the endpoint is open.
 async fn accept(inner: Arc<Inner>) {
-    let mut serving: Vec<smol::Task<()>> = Vec::new();
+    let mut serving = Tasks::default();
     while let Some(incoming) = inner.endpoint.accept().await {
-        serving.retain(|task| !task.is_finished());
-        let Some(task) = inner.spawner.spawn(serve(Arc::clone(&inner), incoming)) else {
+        if !serving.spawn(&inner.spawner, serve(Arc::clone(&inner), incoming)) {
             return;
-        };
-        serving.push(task);
+        }
     }
 }
 
@@ -797,13 +821,11 @@ async fn serve(inner: Arc<Inner>, incoming: quinn::Incoming) {
         bulk: smol::lock::Semaphore::new(BULK_STREAMS),
         turns: Mutex::new(HashMap::new()),
     });
-    let mut reading: Vec<smol::Task<()>> = Vec::new();
+    let mut reading = Tasks::default();
     while let Ok(stream) = connection.accept_uni().await {
-        reading.retain(|task| !task.is_finished());
-        let Some(task) = peer.inner.spawner.spawn(read(Arc::clone(&peer), stream)) else {
+        if !reading.spawn(&peer.inner.spawner, read(Arc::clone(&peer), stream)) {
             return;
-        };
-        reading.push(task);
+        }
     }
 }
 
@@ -909,9 +931,6 @@ impl Network for Quic {
         stream: u64,
         frame: Vec<u8>,
     ) -> Result<(), Refused> {
-        if self.inner.closed.load(Ordering::Acquire) {
-            return Err(Refused::Closed);
-        }
         if frame.len() > self.inner.limits.of(class) {
             return Err(Refused::TooLarge);
         }
@@ -930,7 +949,7 @@ impl Network for Quic {
         link.frames.try_send(outgoing).map_err(|_| Refused::Closed)
     }
 
-    fn ready(&self, to: NodeNumber, class: Class) -> impl Future<Output = ()> + Send {
+    fn ready(&self, to: NodeNumber, class: Class) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         let shared = self
             .inner
             .links
@@ -938,7 +957,7 @@ impl Network for Quic {
             .expect("the links")
             .get(&to)
             .map(|link| Arc::clone(&link.shared));
-        async move {
+        Box::pin(async move {
             let Some(shared) = shared else {
                 return;
             };
@@ -949,20 +968,6 @@ impl Network for Quic {
                 }
                 released.await;
             }
-        }
-    }
-
-    fn peers(&self) -> Vec<NodeNumber> {
-        self.inner
-            .links
-            .lock()
-            .expect("the links")
-            .keys()
-            .copied()
-            .collect()
-    }
-
-    fn set_peers(&self, peers: Vec<Peer>) {
-        self.inner.set_peers(peers);
+        })
     }
 }

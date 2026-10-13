@@ -6,13 +6,16 @@
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::{
     Arrivals, Class, Deliver, Incoming, Limits, Network, NodeNumber, Peer, Refused, arrivals,
 };
+
+/// How often a frame waiting for room looks again.
+const POLL: Duration = Duration::from_millis(1);
 
 /// Endpoints joined in one process.
 #[derive(Clone)]
@@ -53,12 +56,6 @@ impl State {
         let joined = self.endpoints.get(&to)?;
         let listed = joined.peers.lock().expect("the peers").contains(&from);
         listed.then(|| joined.deliver.clone())
-    }
-}
-
-impl Default for Hub {
-    fn default() -> Self {
-        Self::new(1)
     }
 }
 
@@ -107,14 +104,8 @@ impl Hub {
             hub: self.clone(),
             peers,
             delayed: Mutex::new(HashMap::new()),
-            closed: AtomicBool::new(false),
         };
         (endpoint, arrivals)
-    }
-
-    /// Lose every frame from `from` to `to`.
-    pub fn cut(&self, from: NodeNumber, to: NodeNumber) {
-        self.state().cut.insert((from, to));
     }
 
     /// Lose every frame between `a` and `b`, both ways.
@@ -187,7 +178,6 @@ pub struct Endpoint {
     /// A delivery task per peer while frames are delayed, so they keep
     /// their order.
     delayed: Mutex<HashMap<NodeNumber, Delayed>>,
-    closed: AtomicBool,
 }
 
 struct Delayed {
@@ -196,14 +186,13 @@ struct Delayed {
 }
 
 impl Endpoint {
-    pub fn number(&self) -> NodeNumber {
-        self.number
-    }
-
-    /// Stop sending: every later send is refused as closed.
-    pub fn close(&self) {
-        self.closed.store(true, Ordering::Release);
-        self.delayed.lock().expect("the delayed links").clear();
+    /// Replace the peers this endpoint sends to and takes frames from.
+    pub fn set_peers(&self, peers: Vec<Peer>) {
+        *self.peers.lock().expect("the peers") = peers
+            .into_iter()
+            .map(|peer| peer.number)
+            .filter(|number| *number != self.number)
+            .collect();
     }
 
     /// The delivery task to `to`. Each frame goes, when due, to whichever
@@ -228,7 +217,7 @@ impl Endpoint {
                         match deliver.try_deliver(class, incoming) {
                             Err(smol::channel::TrySendError::Full(back)) => {
                                 incoming = back;
-                                smol::Timer::after(Duration::from_millis(1)).await;
+                                smol::Timer::after(POLL).await;
                             }
                             _ => break,
                         }
@@ -265,9 +254,6 @@ impl Network for Endpoint {
         stream: u64,
         frame: Vec<u8>,
     ) -> Result<(), Refused> {
-        if self.closed.load(Ordering::Acquire) {
-            return Err(Refused::Closed);
-        }
         if !self.peers.lock().expect("the peers").contains(&to) {
             return Err(Refused::UnknownPeer);
         }
@@ -329,9 +315,9 @@ impl Network for Endpoint {
         Ok(())
     }
 
-    fn ready(&self, to: NodeNumber, class: Class) -> impl Future<Output = ()> + Send {
+    fn ready(&self, to: NodeNumber, class: Class) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         let hub = self.hub.clone();
-        async move {
+        Box::pin(async move {
             loop {
                 let room = hub
                     .state()
@@ -341,20 +327,8 @@ impl Network for Endpoint {
                 if room {
                     return;
                 }
-                smol::Timer::after(Duration::from_millis(1)).await;
+                smol::Timer::after(POLL).await;
             }
-        }
-    }
-
-    fn peers(&self) -> Vec<NodeNumber> {
-        self.peers.lock().expect("the peers").clone()
-    }
-
-    fn set_peers(&self, peers: Vec<Peer>) {
-        *self.peers.lock().expect("the peers") = peers
-            .into_iter()
-            .map(|peer| peer.number)
-            .filter(|number| *number != self.number)
-            .collect();
+        })
     }
 }

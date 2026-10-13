@@ -59,7 +59,7 @@ fn spki(key: &NodeKey) -> Vec<u8> {
 }
 
 /// The key a raw public key holds, if it is exactly an ed25519 one.
-pub(crate) fn key_of(spki: &[u8]) -> Option<NodeKey> {
+fn key_of(spki: &[u8]) -> Option<NodeKey> {
     spki.strip_prefix(&SPKI_PREFIX[..])?.try_into().ok()
 }
 
@@ -230,12 +230,7 @@ impl quinn_proto::ConnectionIdGenerator for MarkedIds {
         if id.len() != ID_RANDOM + ID_MARK {
             return Err(quinn_proto::InvalidCid);
         }
-        let mark = self.mark(&id[..ID_RANDOM]);
-        let differ = mark
-            .iter()
-            .zip(&id[ID_RANDOM..])
-            .fold(0, |differ, (a, b)| differ | (a ^ b));
-        if differ == 0 {
+        if equal(&self.mark(&id[..ID_RANDOM]), &id[ID_RANDOM..]) {
             Ok(())
         } else {
             Err(quinn_proto::InvalidCid)
@@ -249,6 +244,12 @@ impl quinn_proto::ConnectionIdGenerator for MarkedIds {
     fn cid_lifetime(&self) -> Option<std::time::Duration> {
         None
     }
+}
+
+/// Whether `a` and `b` hold the same bytes, in a time that depends only
+/// on their lengths.
+fn equal(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0, |differ, (a, b)| differ | (a ^ b)) == 0
 }
 
 /// The keys a side takes.

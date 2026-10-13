@@ -21,13 +21,13 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use vos_net::{Class, Network, Refused};
+use vos_net::Network;
 use vos_pvm::pool::{CodeHash, MachinePool, OuterMachines};
 use vos_raft::Role;
 use vos_wire::Decode;
 use vos_wire::batch::{Admin, Message, Query, Request, Work};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash};
-use vos_wire::ingress::{Contact, NodeId, Unplaced};
+use vos_wire::ingress::{Contact, Grant, NodeId, Unplaced};
 use vos_wire::peer::{CreationRecord, NodeNumber, Placement};
 use vos_wire::records::unstored;
 use vos_wire::result::{Outcome, Step, Write};
@@ -49,44 +49,6 @@ pub(crate) use directory::{Directory, Order};
 use open::write_token;
 pub use open::{ADMIN_TOKEN, NODE_KEY, STORE, wall_clock};
 pub(crate) use queue::{Agent, Answered, Pending};
-
-/// What the network sends through.
-pub(crate) trait Wire: Send + Sync {
-    fn send(
-        &self,
-        to: NodeNumber,
-        class: Class,
-        stream: u64,
-        frame: Vec<u8>,
-    ) -> Result<(), Refused>;
-
-    /// Resolves once `to` can likely take another frame of `class`.
-    fn ready(
-        &self,
-        to: NodeNumber,
-        class: Class,
-    ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + '_>>;
-}
-
-impl<T: Network> Wire for T {
-    fn send(
-        &self,
-        to: NodeNumber,
-        class: Class,
-        stream: u64,
-        frame: Vec<u8>,
-    ) -> Result<(), Refused> {
-        Network::send(self, to, class, stream, frame)
-    }
-
-    fn ready(
-        &self,
-        to: NodeNumber,
-        class: Class,
-    ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        Box::pin(Network::ready(self, to, class))
-    }
-}
 
 /// An agent this node replicates: its queue, its group's shared state, the
 /// group's inbox, and their tasks.
@@ -132,7 +94,7 @@ pub(crate) struct Inner {
     /// This node's number in its space.
     pub(crate) number: NodeNumber,
     pub(crate) space: Option<Space>,
-    pub(crate) network: Option<Arc<dyn Wire>>,
+    pub(crate) network: Option<Arc<dyn Network>>,
     /// Where each agent runs, and the placements this node sends.
     pub(crate) directory: Directory,
     /// The agents' epochs a drop may still remove rows from, with how many
@@ -1033,7 +995,7 @@ impl Node {
         let inner = Arc::clone(&self.inner);
         self.inner.runtime.spawn(async move {
             inner
-                .admin(agent, Admin::SetRole { principal, role })
+                .admin(agent, Admin::SetRole(Grant { principal, role }))
                 .await
                 .map(|answered| answered.reply)
         })

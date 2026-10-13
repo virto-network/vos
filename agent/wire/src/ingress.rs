@@ -9,7 +9,7 @@ use alloc::vec::Vec;
 use scale::{Decode, Encode};
 
 use crate::ids::{AgentId, InstanceId, MethodId, Principal, Session};
-use crate::peer::CreationRecord;
+use crate::peer::{CreationRecord, NodeNumber};
 use crate::result::Outcome;
 
 const CALL_DOMAIN: &[u8] = b"vos/call/1";
@@ -87,8 +87,8 @@ pub struct Install {
 /// by another node.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Replace {
-    pub remove: u8,
-    pub add: u8,
+    pub remove: NodeNumber,
+    pub add: NodeNumber,
 }
 
 /// Why a replacement was not made.
@@ -111,7 +111,9 @@ pub enum Unplaced {
     CannotRun,
 }
 
-/// The operator's `POST /agents/{agent}/roles`.
+/// The operator's `POST /agents/{agent}/roles`: a principal's role in the
+/// agent, or (`None`) none. The log carries it as
+/// [`crate::batch::Admin::SetRole`].
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Grant {
     pub principal: Principal,
@@ -199,7 +201,7 @@ pub enum Answer {
     TimedOut,
     /// The agent's replicas, once a replacement committed.
     #[codec(index = 13)]
-    Placed(Vec<u8>),
+    Placed(Vec<NodeNumber>),
     /// A replacement not made, and why.
     #[codec(index = 14)]
     Unplaced(Unplaced),
@@ -259,7 +261,7 @@ pub struct ReplicaStatus {
     pub term: u64,
     pub leads: bool,
     /// The leader it knows, if any.
-    pub leader: Option<u8>,
+    pub leader: Option<NodeNumber>,
     pub commit: u64,
     pub applied: u64,
     /// The index its log starts after: where it was compacted to, or a
@@ -281,7 +283,7 @@ pub struct ReplicaStatus {
 /// by number. None means the node alone.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode)]
 pub struct Create {
-    pub replicas: Vec<u8>,
+    pub replicas: Vec<NodeNumber>,
 }
 
 fn message(domain: &[u8], identity: &[u8; 32], fields: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {

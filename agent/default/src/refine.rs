@@ -586,9 +586,9 @@ fn admin(admin: Admin) -> Step {
                 value: Some(installed.encode()),
             }
         }
-        Admin::SetRole { principal, role } => Write {
-            key: keys::member(&principal),
-            value: role.map(|role| alloc::vec![role]),
+        Admin::SetRole(grant) => Write {
+            key: keys::member(&grant.principal),
+            value: grant.role.map(|role| alloc::vec![role]),
         },
     };
     if write.key.len() + write.value.as_ref().map_or(0, Vec::len) > cap::STEP_WRITES {

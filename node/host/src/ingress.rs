@@ -228,10 +228,7 @@ impl Ingress {
             ("POST", ["agents", id, "roles"]) => {
                 match (agent(id), decode::<Grant>(&request.body)) {
                     (Some(agent), Ok(grant)) => {
-                        let admin = Admin::SetRole {
-                            principal: grant.principal,
-                            role: grant.role,
-                        };
+                        let admin = Admin::SetRole(grant);
                         respond(answer_of(self.inner.admin(agent, admin).await))
                     }
                     (None, _) => respond(Answer::NoAgent),

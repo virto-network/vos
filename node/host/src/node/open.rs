@@ -17,7 +17,7 @@ use vos_wire::ids::ProgramHash;
 use vos_wire::ingress::NodeId;
 use vos_wire::peer::{CreationRecord, Placement};
 
-use super::{Config, Directory, Error, Inner, Node, Peers, Run, Settings, Tasks, Wire};
+use super::{Config, Directory, Error, Inner, Node, Peers, Run, Settings, Tasks};
 use crate::blobs::Blobs;
 use crate::executor::Executors;
 use crate::storage::StorageThread;
@@ -94,33 +94,34 @@ impl Node {
         let program_hash = ProgramHash(CodeHash::of(&config.agent).0);
         let records = store.agents()?;
         let mut placements = store.placements()?;
-        let (network, arrivals): (Option<Arc<dyn Wire>>, _) = match (&config.space, &config.peers) {
-            (Some(space), Peers::Quic) if space.nodes().len() > 1 => {
-                let listen = config
-                    .peer_bind
-                    .unwrap_or(space.node(number).expect("this node is in its space").peer);
-                let (quic, arrivals) = vos_net::quic::Quic::bind(vos_net::quic::Config {
-                    peers: space.peers(),
-                    idle: config.quic_idle,
-                    ..vos_net::quic::Config::new(number, secret, listen)
-                })
-                .map_err(|error| Error::Data(format!("{listen}: {error}")))?;
-                (Some(Arc::new(quic)), Some(arrivals))
-            }
-            (Some(space), Peers::Hub(hub)) => {
-                let (endpoint, arrivals) = hub.join(number);
-                endpoint.set_peers(space.peers());
-                (Some(Arc::new(endpoint)), Some(arrivals))
-            }
-            _ => (None, None),
-        };
+        let (network, arrivals): (Option<Arc<dyn Network>>, _) =
+            match (&config.space, &config.peers) {
+                (Some(space), Peers::Quic) if space.nodes().len() > 1 => {
+                    let listen = config
+                        .peer_bind
+                        .unwrap_or(space.node(number).expect("this node is in its space").peer);
+                    let (quic, arrivals) = vos_net::quic::Quic::bind(vos_net::quic::Config {
+                        peers: space.peers(),
+                        idle: config.quic_idle,
+                        ..vos_net::quic::Config::new(number, secret, listen)
+                    })
+                    .map_err(|error| Error::Data(format!("{listen}: {error}")))?;
+                    (Some(Arc::new(quic)), Some(arrivals))
+                }
+                (Some(space), Peers::Hub(hub)) => {
+                    let (endpoint, arrivals) = hub.join(number);
+                    endpoint.set_peers(space.peers());
+                    (Some(Arc::new(endpoint)), Some(arrivals))
+                }
+                _ => (None, None),
+            };
         // Frames of a class a test loses go before they reach the network.
         #[cfg(feature = "faults")]
         let network = match (network, &config.faults) {
             (Some(network), Some(faults)) => Some(Arc::new(crate::faults::Lossy {
                 network,
                 faults: Arc::clone(faults),
-            }) as Arc<dyn Wire>),
+            }) as Arc<dyn Network>),
             (network, _) => network,
         };
         let runtime = Arc::new(smol::Executor::new());

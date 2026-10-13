@@ -4,6 +4,7 @@ use vos_wire::batch::{Admin, Batch, Input, Message, Request};
 use vos_wire::ids::{
     AgentId, InstanceId, MethodId, Principal, ProgramHash, Session, SessionId, SessionRef,
 };
+use vos_wire::ingress::Grant;
 use vos_wire::jam::{AccumulateInput, Operand, RefineArgs, Transfer, WorkError};
 use vos_wire::keys;
 use vos_wire::result::{
@@ -85,7 +86,7 @@ fn input() -> impl Strategy<Value = Input> {
                 })
             }),
         (principal(), any::<Option<u8>>())
-            .prop_map(|(principal, role)| Input::Admin(Admin::SetRole { principal, role })),
+            .prop_map(|(principal, role)| Input::Admin(Admin::SetRole(Grant { principal, role }))),
     ]
 }
 
@@ -708,4 +709,20 @@ fn signed_messages_keep_their_bytes() {
     }
     let call = call_message(&identity, &session, 4, instance, method, &[0xaa, 0xbb]);
     assert!(call.ends_with(&[5, 0, 0, 0, 6, 0, 0, 0, 2, 0, 0, 0, 0xaa, 0xbb]));
+}
+
+/// The operator's grant, and the role change it becomes in a batch: the
+/// principal, then the role; the batch's after its variant's index.
+#[test]
+fn role_changes_keep_their_bytes() {
+    let principal = Principal::Agent(AgentId(0x0a0b_0c0d));
+    for (role, encoded) in [(Some(3), &[0x01, 0x03][..]), (None, &[0x00][..])] {
+        let fields = [&[0x01, 0x0d, 0x0c, 0x0b, 0x0a], encoded].concat();
+        let grant = Grant { principal, role };
+        assert_eq!(grant.encode(), fields);
+        assert_eq!(
+            Admin::SetRole(grant).encode(),
+            [&[0x01], fields.as_slice()].concat()
+        );
+    }
 }

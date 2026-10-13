@@ -7,6 +7,7 @@ use vos_testkit::programs::{agent, method};
 use vos_wire::abi::surface;
 use vos_wire::batch::{Admin, Input};
 use vos_wire::ids::AgentId;
+use vos_wire::ingress::Grant;
 
 use crate::common::{
     ALICE, Actors, BOB, COUNTER, LEDGER, MINTER, Node, OUTER_GAS, Sessions, counter_only, done,
@@ -73,24 +74,24 @@ fn vos_and_jam_hosts_agree_on_batches_that_read_no_state() {
                 attestables: vec![(audit, checksum)],
                 roles: vec![(b"minter".to_vec(), MINTER)],
             }),
-            Input::Admin(Admin::SetRole {
+            Input::Admin(Admin::SetRole(Grant {
                 principal: ALICE,
                 role: Some(MINTER),
-            }),
+            })),
         ],
         vec![
             Input::Ack {
                 to: AgentId(5),
                 sequence: 1,
             },
-            Input::Admin(Admin::SetRole {
+            Input::Admin(Admin::SetRole(Grant {
                 principal: ALICE,
                 role: None,
-            }),
-            Input::Admin(Admin::SetRole {
+            })),
+            Input::Admin(Admin::SetRole(Grant {
                 principal: BOB,
                 role: Some(MINTER),
-            }),
+            })),
         ],
     ];
     for (time, inputs) in batches.into_iter().enumerate() {

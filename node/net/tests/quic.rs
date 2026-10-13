@@ -12,9 +12,10 @@ use vos_net::{Class, Limits, Network, NodeNumber, Peer, Refused, public_key};
 fn three_nodes_exchange_frames_on_every_class() {
     smol::block_on(async {
         let nodes = cluster(3);
+        let others = |number: NodeNumber| (1..=3).filter(move |other| *other != number);
         // A liveness frame never waits for a connection: connect first.
-        for (quic, _) in &nodes {
-            for to in quic.peers() {
+        for ((quic, _), number) in nodes.iter().zip(1..) {
+            for to in others(number) {
                 send(quic, to, Class::Consensus, 0, b"hello".to_vec()).await;
             }
         }
@@ -23,8 +24,8 @@ fn three_nodes_exchange_frames_on_every_class() {
                 assert_eq!(next(&arrivals.consensus).await.frame, b"hello");
             }
         }
-        for (quic, _) in &nodes {
-            for to in quic.peers() {
+        for ((quic, _), number) in nodes.iter().zip(1..) {
+            for to in others(number) {
                 for class in Class::ALL {
                     let frame = format!("{class:?} to {to}").into_bytes();
                     send(quic, to, class, u64::from(to) * 10, frame).await;
@@ -44,7 +45,7 @@ fn three_nodes_exchange_frames_on_every_class() {
                     from.push(incoming.from);
                 }
                 from.sort();
-                let others: Vec<_> = (1..=3).filter(|other| *other != number).collect();
+                let others: Vec<_> = others(number).collect();
                 assert_eq!(from, others, "node {number}, {class:?}");
             }
         }
@@ -71,8 +72,10 @@ fn frames_keep_their_order_within_a_stream() {
     });
 }
 
+/// Each side takes only the keys it configured: the accepting side, a
+/// configured peer's; the dialing side, the one it dialed.
 #[test]
-fn a_peer_whose_key_is_not_configured_is_refused() {
+fn a_key_not_configured_is_refused_on_either_side() {
     smol::block_on(async {
         let nodes = cluster(2);
         let (a, _) = &nodes[0];
@@ -93,16 +96,8 @@ fn a_peer_whose_key_is_not_configured_is_refused() {
         // Node 1 itself still gets through.
         send(a, 2, Class::Consensus, 1, b"node 1".to_vec()).await;
         assert_eq!(next(&b_arrivals.consensus).await.frame, b"node 1");
-    });
-}
-
-#[test]
-fn the_dialing_side_refuses_another_key_at_the_address() {
-    smol::block_on(async {
-        let nodes = cluster(2);
-        let (a, _) = &nodes[0];
-        let (b, b_arrivals) = &nodes[1];
-        // Node 1 believes node 2 has node 3's key, at node 2's address.
+        // Node 1 believes node 2 has node 3's key, at node 2's address:
+        // node 2 would take node 1, but node 1 refuses node 2.
         a.set_peers(vec![Peer {
             number: 2,
             key: public_key(&secret(3)),
@@ -121,7 +116,7 @@ fn a_peer_shut_down_and_started_again_is_reachable_at_once() {
         let (a, _) = nodes.pop().unwrap();
         let address = b.local_addr();
         send(&a, 2, Class::Consensus, 1, b"before".to_vec()).await;
-        b.shutdown().await;
+        drop(b);
 
         // Node 1 sends first: its old connection is reset, and it redials.
         let (b, b_arrivals) = rebind(2, address).await;

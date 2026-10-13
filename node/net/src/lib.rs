@@ -19,6 +19,7 @@
 
 use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 
 pub mod memory;
 pub mod quic;
@@ -69,7 +70,7 @@ impl Class {
 
     /// The stream priority: higher is sent first.
     fn priority(self) -> i32 {
-        3 - self as i32
+        Class::Bulk as i32 - self as i32
     }
 
     /// Whether a frame opens a stream of its own.
@@ -131,7 +132,7 @@ impl Limits {
 }
 
 /// A frame that arrived.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Incoming {
     /// The authenticated peer it came from.
     pub from: NodeNumber,
@@ -209,11 +210,12 @@ pub enum Refused {
     UnknownPeer,
     /// The frame is larger than its class allows.
     TooLarge,
-    /// The network was shut down.
+    /// The link to the peer is down for good: its address cannot be
+    /// dialed.
     Closed,
 }
 
-/// The network between this node and its peers.
+/// The network between this node and its peers, as a node sends on it.
 pub trait Network: Send + Sync + 'static {
     /// Queue `frame` for `to` on stream `stream` of `class`. Never blocks:
     /// it refuses, and the caller decides (Raft drops; a forward or a bulk
@@ -227,23 +229,5 @@ pub trait Network: Send + Sync + 'static {
     ) -> Result<(), Refused>;
 
     /// Resolves once `to` can likely take another frame of `class`.
-    fn ready(&self, to: NodeNumber, class: Class) -> impl Future<Output = ()> + Send;
-
-    /// The peers this node knows.
-    fn peers(&self) -> Vec<NodeNumber>;
-
-    /// Replace the peer table, without a restart.
-    fn set_peers(&self, peers: Vec<Peer>);
-
-    /// Send to every peer; a gossip implementation may do better.
-    fn send_to_all(&self, class: Class, stream: u64, frame: &[u8]) -> Vec<(NodeNumber, Refused)> {
-        self.peers()
-            .into_iter()
-            .filter_map(|to| {
-                self.send(to, class, stream, frame.to_vec())
-                    .err()
-                    .map(|refused| (to, refused))
-            })
-            .collect()
-    }
+    fn ready(&self, to: NodeNumber, class: Class) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }

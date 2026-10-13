@@ -4,6 +4,7 @@ use alloc::vec::Vec;
 use scale::{Decode, Encode};
 
 use crate::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, Session};
+use crate::ingress::Grant;
 
 /// A refine's work item payload: a batch through the log, or a query on
 /// applied state.
@@ -97,12 +98,9 @@ pub enum Admin {
         attestables: Vec<(MethodId, ProgramHash)>,
         roles: Vec<(Vec<u8>, u8)>,
     },
-    /// Grant a principal a role in this agent, or (`None`) revoke it. A role
-    /// is a byte; a package's schema names its roles, and `#[msg(role)]`
-    /// refers to one by name.
+    /// Grant a principal a role in this agent, or (`None`) revoke it, as
+    /// the operator posted it. A role is a byte; a package's schema names
+    /// its roles, and `#[msg(role)]` refers to one by name.
     #[codec(index = 1)]
-    SetRole {
-        principal: Principal,
-        role: Option<u8>,
-    },
+    SetRole(Grant),
 }

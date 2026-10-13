@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use vos_net::Class;
+use vos_net::{Class, Network, Refused};
 use vos_wire::peer::NodeNumber;
 
 use crate::{Config, Hooks, lock};
@@ -258,18 +258,18 @@ fn acknowledge(path: &Path, generation: Option<u64>) {
 
 /// A network losing the frames of the classes the faults name.
 pub(crate) struct Lossy {
-    pub(crate) network: Arc<dyn crate::node::Wire>,
+    pub(crate) network: Arc<dyn Network>,
     pub(crate) faults: Arc<Faults>,
 }
 
-impl crate::node::Wire for Lossy {
+impl Network for Lossy {
     fn send(
         &self,
         to: NodeNumber,
         class: Class,
         stream: u64,
         frame: Vec<u8>,
-    ) -> Result<(), vos_net::Refused> {
+    ) -> Result<(), Refused> {
         if self.faults.lost(to, class) {
             return Ok(());
         }

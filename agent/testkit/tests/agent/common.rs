@@ -17,6 +17,7 @@ use vos_wire::batch::{Admin, Batch, Input, Query, Request, Work};
 use vos_wire::ids::{
     AgentId, InstanceId, MethodId, Principal, ProgramHash, Session, SessionId, SessionRef,
 };
+use vos_wire::ingress::Grant;
 use vos_wire::jam::{AccumulateInput, Operand, RefineArgs};
 use vos_wire::records::{SessionMark, unstored};
 use vos_wire::result::{InputRef, Outcome, Run, Step, WorkResult, Write};
@@ -336,10 +337,10 @@ impl Actors {
                     roles: vec![(b"minter".to_vec(), MINTER)],
                 }),
                 install(CALLER, caller),
-                Input::Admin(Admin::SetRole {
+                Input::Admin(Admin::SetRole(Grant {
                     principal: ALICE,
                     role: Some(MINTER),
-                }),
+                })),
             ],
         );
         for step in &result.steps {
