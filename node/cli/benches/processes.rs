@@ -960,6 +960,14 @@ struct Samples {
     /// Calls in an open loop that waited for their session's previous call
     /// to be answered: the nodes, not the driver, held them.
     behind: u64,
+    /// Calls answered after their window ended: a backlog past the knee,
+    /// once more than the few in flight at its end.
+    answered_after: u64,
+    /// The latencies of the calls scheduled in the window's first quarter,
+    /// and in its last: past the knee the backlog, and with it the
+    /// latency, grows across the window.
+    first_quarter: Vec<Duration>,
+    last_quarter: Vec<Duration>,
     /// Sessions whose signed calls ran out before the window ended.
     exhausted: u64,
 }
@@ -1143,6 +1151,16 @@ fn drive_windows(
                             ran += 1;
                         }
                         if let Some(window) = window_of(from) {
+                            let opened = first + measure * window as u32;
+                            if answered >= opened + measure {
+                                mine[window].answered_after += 1;
+                            }
+                            let into = from - opened;
+                            if into < measure / 4 {
+                                mine[window].first_quarter.push(answered - from);
+                            } else if into >= measure * 3 / 4 {
+                                mine[window].last_quarter.push(answered - from);
+                            }
                             let mine = &mut mine[window];
                             match answer {
                                 Some(Answer::Ran {
@@ -1184,6 +1202,9 @@ fn drive_windows(
                         samples.failed += mine.failed;
                         samples.exhausted += mine.exhausted;
                         samples.behind += mine.behind;
+                        samples.answered_after += mine.answered_after;
+                        samples.first_quarter.extend(mine.first_quarter);
+                        samples.last_quarter.extend(mine.last_quarter);
                         if samples.first_failure.is_none() {
                             samples.first_failure = mine.first_failure;
                         }
@@ -1265,12 +1286,24 @@ fn report(name: &str, samples: &mut Samples, cpu: (Cpu, Cpu), measure: Duration)
         .zip(&before.nodes)
         .map(|(after, before)| (after - before) / seconds)
         .collect();
-    // Past the knee the calls answered in the window are not those
-    // scheduled in it: no CPU per commit then.
+    // Past the knee the calls scheduled in the window are answered after
+    // it, their CPU spent past it: no CPU per commit then. Its sign is a
+    // backlog that grows: more than 1% of the window's calls answered after
+    // it, and the last quarter's median latency at least twice the
+    // first's. A stall at the window's end makes calls late without
+    // moving that median; calls that waited on their session's previous
+    // one are no sign alone either, as one long batch holds them too.
+    let late = samples.answered_after as f64 / samples.latencies.len().max(1) as f64;
+    let median = |latencies: &mut Vec<Duration>| {
+        latencies.sort_unstable();
+        percentile(latencies, 0.5)
+    };
+    let growing = median(&mut samples.last_quarter) >= median(&mut samples.first_quarter) * 2;
+    let past_knee = late > 0.01 && growing;
     let per_commit: Vec<f64> = busy
         .iter()
         .map(|busy| {
-            if commits > 0.0 && samples.behind == 0 {
+            if commits > 0.0 && !past_knee {
                 busy / commits * 1e6
             } else {
                 0.0
@@ -1331,11 +1364,19 @@ fn report(name: &str, samples: &mut Samples, cpu: (Cpu, Cpu), measure: Duration)
     };
     let behind = if samples.behind > 0 {
         format!(
-            "; {} calls waited on their session's previous one: past the knee",
+            "; {} calls waited on their session's previous one",
             samples.behind
         )
     } else {
         String::new()
+    };
+    let behind = if past_knee {
+        format!(
+            "{behind}; past the knee: {:.0}% of its calls answered after the window",
+            late * 100.0
+        )
+    } else {
+        behind
     };
     let exhausted = if samples.exhausted > 0 {
         format!(

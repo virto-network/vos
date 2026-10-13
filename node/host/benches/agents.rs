@@ -4,7 +4,8 @@
 //! - active: `AGENTS` agents (64), each on all three nodes, under
 //!   closed-loop increments from `SESSIONS` sessions each (4), sent to
 //!   the agent's leader: commits per second in total, a call's p50 and
-//!   p99, inputs per batch and batches per writer flush. With `HOT`, the
+//!   p99, inputs per batch and batches per writer flush, and the bytes a
+//!   work result's log entry stores per input. With `HOT`, the
 //!   first agent has that many sessions instead, and its calls and the
 //!   others' are reported apart;
 //! - idle: `IDLE` more agents (1,000), created and left alone: the
@@ -26,6 +27,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use vos_node::store::{EntryKind, Store};
 use vos_node::{CallError, Config, Hooks, Node, Peers, Reply, Space, SpaceNode};
 use vos_wire::Encode;
 use vos_wire::batch::Request;
@@ -386,6 +388,28 @@ fn main() {
         cpu * 100.0,
         commits as f64 / batches.max(1) as f64,
         batches as f64 / flushes.max(1) as f64,
+    );
+    // The work results the leaders' logs still hold, per input at the
+    // run's inputs per batch.
+    let (mut bytes, mut entries) = (0usize, 0usize);
+    for &agent in &active {
+        let log = node(&nodes, leader(&nodes, agent))
+            .store()
+            .raft(agent)
+            .unwrap()
+            .log;
+        for (_, entry) in log
+            .iter()
+            .filter(|(_, entry)| entry.kind == EntryKind::Result)
+        {
+            bytes += entry.payload().len();
+            entries += 1;
+        }
+    }
+    let per_entry = bytes as f64 / entries.max(1) as f64;
+    println!(
+        "  a work result's log entry: {per_entry:.0} bytes, {:.0} per input",
+        per_entry * batches as f64 / commits.max(1) as f64
     );
     if hot.is_some() {
         let (hot_p50, hot_p99) = percentiles(hot_latencies.clone());

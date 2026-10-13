@@ -655,6 +655,20 @@ impl Fjall {
         self.db.disk_space()
     }
 
+    /// The bytes of the state partition's active memtable, which a read
+    /// of its rows searches first: it only grows until the memtable is
+    /// sealed and another takes its place.
+    pub fn state_memtable_bytes(&self) -> u64 {
+        use fjall::AbstractTree;
+        self.state.tree.active_memtable().size()
+    }
+
+    /// The state partition's sealed memtables not yet flushed, which reads
+    /// search next.
+    pub fn state_sealed_memtables(&self) -> usize {
+        self.state.sealed_memtable_count()
+    }
+
     /// Whether the agent has rows under `epoch`.
     pub(crate) fn epoch_holds_rows(&self, agent: AgentId, epoch: u8) -> Result<bool> {
         let prefix = agent_key(agent, epoch, &[]);
