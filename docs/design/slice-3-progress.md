@@ -9014,3 +9014,92 @@ nothing moves twice.
   `a_removed_voter_campaigns_only_in_the_configuration_it_holds` pin the
   rule the safety argument rests on;
 - `a_load_answered_after_a_removal_sends_the_removed_voter_nothing`.
+
+#### 3.10d Built: the code-quality cleanup
+
+All ten steps, each a commit reviewed by Opus; step 9's design also by
+Fable.
+
+| Area | Before | After |
+|---|---|---|
+| vos-raft (src, tests) | 14,891 (7,842, 7,049) | 7,399 (4,725, 2,674) |
+| The node host's code | 17,317 | 17,131 |
+| Net, wire, the agent, CLI, checker, host tests and benches | 26,448 | 25,743 |
+| All | 58,656 | 50,273 |
+
+(Rust lines; the design's counts were the reviewers' own, so this table
+counts both sides the same way.)
+
+**Against the design:**
+- **vos-raft:** about 7,500 lines out of the 8,000 planned. The driver
+  is gone, so the crate is `no_std` with no dependencies. There is one
+  configuration record, and the core is split into durability,
+  election, replication and membership modules.
+- **The host** came out about the same size. What changed is its shape:
+  - node.rs, group.rs and store.rs are module directories, and no file
+    exceeds 1,250 lines;
+  - calls and queries share one registry of waits;
+  - the directory resends through one path, in its own module.
+
+  The duplicated code it removed went back in as module docs, plus the
+  fixes below.
+- **The rest** lost about 700 lines of the 1,900 planned. The shared test
+  helpers moved into the checker rather than disappearing. The process
+  bench still carries its own harness.
+
+**Behaviour changes, each reviewed:**
+- **A liveness bug fixed.**
+  - Two overlapping replacements that added the same silent node made
+    the second `could_run` close the first one's channel.
+  - Both then re-sent directory frames without yielding, on the node's
+    runtime thread, until their 10-second deadline, which held up every
+    other group on the node.
+  - `could_run` now waits for the node's acknowledgement in the
+    directory's single resend set.
+  - Test: `overlapping_replacements_by_a_silent_node_hold_nothing_else_up`.
+- **A forwarded call's answer about another agent is dropped**, as read
+  indexes already were.
+- **A query's failover** tries the replicas after the current one,
+  wrapping round.
+- **A failed placement write is not retried:** only a failed writer
+  refuses it, and that halts the node.
+- **A kept dry run matches its result entry by index, term and batch
+  seed.** The payload comparison is gone. The seed means a second
+  proposer could never pair a dry run with another entry, which matters
+  if pipelining returns.
+- **Dropping a QUIC endpoint is its only close.**
+
+**Encodings unchanged:**
+- `keys_keep_their_bytes`, `signed_messages_keep_their_bytes` and
+  `role_changes_keep_their_bytes` pin the bytes.
+- `Admin::SetRole(Grant)` replaces a variant with the same fields.
+- `NodeNumber` is the `u8` it names.
+
+**Gates:**
+- `just check` runs per step: format, workspace lints, and the tests of
+  every crate but the slow suites.
+- `just ci` and the exactly-once checker loop run at milestones.
+- **At the end:**
+  - `just ci` is green: 81 suites in 389 seconds;
+  - the checker loop is all ok: seeds 601–612, both modes, in 528
+    seconds.
+
+**Left, with reasons:**
+- **The process bench's own harness and its pinning in Rust:**
+  `machine.sh` runs the bench on the owner's machine now, and its output
+  must not move until those results are in.
+- **Node keys seeded rather than made by a first run:** not yet done.
+- **The fault suite as part of one binary:** it stays a binary of its
+  own, because it takes about 166 seconds and `just check` leaves it
+  out.
+- **Fault hooks run on the executor**, because the crash tests rely on
+  them blocking or panicking there. `Pending::input()` still copies
+  each request's arguments.
+- **net's TLS key comparison stays a fold:** ring's
+  `verify_slices_are_equal` is deprecated, and the crate has no
+  `subtle`.
+- **`check-no-std` is not part of `just ci`**, because the embedded
+  target is not installed here.
+- **For the owner, unchanged:** the refusal and failure codes as enums,
+  the `PeerMessage` index gap, and the directory acknowledgement's order
+  tuple.
