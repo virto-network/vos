@@ -8706,3 +8706,112 @@ sat in the snapshot install's cleanup.
     `#[ignore]` tests;
   - the host's single-implementation traits and duplicated loops;
   - `spikes/` and the drafts.
+
+#### 3.10d Design: the code-quality cleanup
+
+Three reviews at the slice's end, one per area, read every file slice 3
+wrote or changed for module size, idiom, concision and comment density.
+Merged, they find about 10,000 removable lines. Behaviour is unchanged
+except where a step below says otherwise.
+
+| Area | Lines today | Removable |
+|---|---|---|
+| vos-raft | 16,200 (src 9,150, tests 7,050) | about 8,000: the driver and its tests, the retirement-confirmation subprotocol, three configuration types as one |
+| The node host's code | 15,900 | about 700, and node.rs, group.rs and store.rs split into modules |
+| Net, wire, the agent, CLI, checker, host tests and benches | 24,700 | about 1,900, nearly all copies on the test side |
+
+**What the reviews found, in short:**
+- **The test side copies itself.** One in-process cluster harness and
+  one process harness exist three times each. A dozen helpers exist
+  three to nine times:
+  - loading an ELF, a method by name, `wait_until`, `done`;
+  - the commit gate, the crash test's round loop and tear, xorshift;
+  - percentiles, a signed query.
+- **Abstractions with one user:**
+  - the store's `Store`/`View`/`Batch` traits;
+  - `Durability`, which is a bool;
+  - vos-raft's `Storage`, `Transport`, `Clock` and `Worker`, unused by
+    the node;
+  - the host's `Wire` beside the net's `Network`.
+- **Duplicated machinery:**
+  - the "ask the leader with a token" loop in calls and queries;
+  - two directory resend paths;
+  - about twelve hand-rolled timeouts;
+  - three Raft configuration types converted by hand 21 times.
+- **Size:**
+  - node.rs (2,400 lines), group.rs (1,850), store.rs (1,800) and
+    vos-raft's core.rs (3,000) each hold several concerns;
+  - cluster.rs (2,450 lines, 48 tests) and the testkit's agent.rs
+    (2,350) are single files;
+  - the process bench (2,200) carries its own harness.
+- **Comments:**
+  - density is right in the newer code;
+  - about twenty lines tell history ("slice 2", "step 3.3c's contract",
+    measurements "as of this table"), which comments must not;
+  - vos-raft's older files (config.rs is 63% comments) speak of a
+    driver the node does not use;
+  - about ten comments are genuinely missing.
+
+**The steps,** lowest risk first. Each is a commit with an Opus review of
+its diff, the tests of what it touches, the checker loop when it touches
+the node, and `just ci`.
+1. **Comments** across every area:
+   - history out;
+   - stale driver references out;
+   - per-field config docs;
+   - restating comments cut;
+   - the missing ones added.
+2. **Dead code:**
+   - in the host: blob waiters, an unused error, the endpoint holder,
+     a group field that always equals the record's replicas;
+   - in vos-raft: fields and functions nothing reads;
+   - in the CLI: a compatibility line no released build wrote.
+3. **One test-support crate** (the checker grows into it):
+   - the shared helpers and `Schema::method`;
+   - the crash tests' round loop;
+   - one process harness for the tests and the bench, the node keys
+     seeded rather than made by a first run;
+   - the fault tests as one binary.
+4. **The big test files:**
+   - cluster.rs gets one tuning closure for its seven option fields
+     and four constructors, helpers for its repeated bodies, and a split
+     by theme;
+   - exactly_once.rs, the testkit's agent.rs and vos-raft's
+     tests/core.rs split the same way.
+5. **The host, mechanically:**
+   - the store's traits go, and `Durability` becomes `PersistMode`;
+   - one `timeout`, `lock` and `random_u64` helper each;
+   - store.rs, group.rs and node.rs as modules (config, queue,
+     directory, open);
+   - `Arc<Known>`, and `Fjall` as an `Arc`.
+6. **The host's duplicated machinery,** touching behaviour's
+   neighbourhood, so each gets its own review:
+   - one ask-the-leader loop for calls and queries;
+   - one directory resend path;
+   - one placement field in the group;
+   - the leader's batch moved, not cloned;
+   - the liveness listing as one function.
+7. **vos-raft's driver deleted,** after its ~23 scenarios the node relies
+   on are ported to the core and simulation tests:
+   - no `std`, `tokio` or `futures`, and no dependencies;
+   - the simulation needs no `std`.
+8. **vos-raft's core:**
+   - one configuration type;
+   - entries moved by value: one payload copy fewer per append;
+   - `OpenWrite` as `Write`;
+   - the repeated idioms as helpers;
+   - then core.rs as election, replication and membership modules.
+9. **Remove the retirement-confirmation subprotocol,** which the host
+   bypasses (about 330 lines). A protocol change: its design gets
+   Fable's review first, and the simulation's chaos runs after.
+10. **The rest:**
+    - the net's `Network` trait as the host's `Wire`;
+    - the CLI's main.rs split;
+    - the bench split, its pinning in Rust instead of `machine.sh`'s
+      Python;
+    - the wire and agent tidy-ups that change no encoding.
+
+**For the owner:** the wire's `refusal` and `failure` codes as
+`#[repr(u32)]` enums, a numbered gap in `PeerMessage`, and the directory
+acknowledgement's anonymous order tuple. Each is a wire-format change,
+so it goes before `vos/1` freezes or not at all.
