@@ -155,7 +155,7 @@ pub(crate) async fn lead(inner: Arc<Inner>, agent: Arc<Agent>, shared: Arc<Share
                         // over and goes on applying, and callers go to
                         // the next leader.
                         agent.refuse(&inner.not_leader(&shared));
-                        inner.retire(shared.agent);
+                        inner.propose(shared.agent, Local::Retire);
                         return;
                     }
                 }

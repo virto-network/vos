@@ -203,8 +203,6 @@ pub enum Error {
     /// The refine gas cannot fit the largest handler with the agent's
     /// reserves: some input could never be dispatched.
     Gas,
-    /// A stored value the node cannot read.
-    Unreadable(String),
     /// The data directory, the space, the network or the ingress's
     /// listener failed.
     Data(String),
@@ -370,12 +368,6 @@ impl<T: Network> Wire for T {
     ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(Network::ready(self, to, class))
     }
-}
-
-/// The network endpoint the node holds.
-enum Endpoint {
-    Quic(Arc<vos_net::quic::Quic>),
-    Hub(Arc<vos_net::memory::Endpoint>),
 }
 
 /// A placement's order: [`Placement::order`].
@@ -789,12 +781,7 @@ impl Inner {
                     );
                     return;
                 }
-                // The members it was created with, the log's first
-                // configuration, used until its store holds another: a
-                // replica added later is none of them, so it never
-                // campaigns until the configuration naming it reaches it.
-                let members = known.record.replicas.clone();
-                self.start(known.record, members);
+                self.start(known.record);
             }
             Some(run) if !named => {
                 let state = run.shared.state();
@@ -996,7 +983,7 @@ impl Inner {
         true
     }
 
-    fn start(self: &Arc<Self>, record: CreationRecord, members: Vec<NodeNumber>) {
+    fn start(self: &Arc<Self>, record: CreationRecord) {
         // Under the runs' lock, which the node's shutdown takes to set
         // `closing`: a group starts before the shutdown takes the runs, or
         // not at all.
@@ -1007,7 +994,7 @@ impl Inner {
         {
             return;
         }
-        let shared = Arc::new(Shared::new(record, members));
+        let shared = Arc::new(Shared::new(record));
         let agent = Arc::new(Agent::new());
         let (inbox, inputs) = smol::channel::bounded(GROUP_INBOX);
         let (local, locals) = smol::channel::unbounded();
@@ -1123,12 +1110,6 @@ impl Inner {
                 "the replica has not applied through its read index".into(),
             )),
         }
-    }
-
-    /// Agent `id`'s leader loop stopped for good: its replica hands
-    /// leadership over and never leads again.
-    pub(crate) fn retire(&self, id: AgentId) {
-        self.propose(id, Local::Retire);
     }
 
     pub(crate) fn keep_dry_run(&self, id: AgentId, dry_run: DryRun) {
@@ -1483,11 +1464,6 @@ impl Inner {
         Ok((pvm::decode::<Outcome>(&output).map_err(failed)?, at))
     }
 
-    /// Commit changes to the node's own records.
-    pub(crate) async fn commit(&self, changes: Vec<Change>) -> Result<(), String> {
-        self.storage.commit(changes).await
-    }
-
     /// Mark `epoch` of `agent`'s as one a drop runs on, before the drop can
     /// remove a row.
     pub(crate) fn dropping(&self, agent: AgentId, epoch: u8) {
@@ -1633,7 +1609,6 @@ pub struct Node {
     ingress_tls: Option<IngressTls>,
     /// The ingress, and what stops it.
     ingress: Mutex<Option<(smol::Task<()>, smol::channel::Sender<()>)>>,
-    endpoint: Option<Endpoint>,
     stop: Option<smol::channel::Sender<()>>,
     runtime: Vec<JoinHandle<()>>,
     /// The pair heartbeat's thread, and what stops it.
@@ -1712,7 +1687,7 @@ impl Node {
         let program_hash = ProgramHash(CodeHash::of(&config.agent).0);
         let records = store.agents()?;
         let mut placements = store.placements()?;
-        let (endpoint, arrivals) = match (&config.space, &config.peers) {
+        let (network, arrivals): (Option<Arc<dyn Wire>>, _) = match (&config.space, &config.peers) {
             (Some(space), Peers::Quic) if space.nodes().len() > 1 => {
                 let listen = config
                     .peer_bind
@@ -1723,19 +1698,14 @@ impl Node {
                     ..vos_net::quic::Config::new(number, secret, listen)
                 })
                 .map_err(|error| Error::Data(format!("{listen}: {error}")))?;
-                (Some(Endpoint::Quic(Arc::new(quic))), Some(arrivals))
+                (Some(Arc::new(quic)), Some(arrivals))
             }
             (Some(space), Peers::Hub(hub)) => {
                 let (endpoint, arrivals) = hub.join(number);
                 endpoint.set_peers(space.peers());
-                (Some(Endpoint::Hub(Arc::new(endpoint))), Some(arrivals))
+                (Some(Arc::new(endpoint)), Some(arrivals))
             }
             _ => (None, None),
-        };
-        let network: Option<Arc<dyn Wire>> = match &endpoint {
-            Some(Endpoint::Quic(quic)) => Some(Arc::clone(quic) as Arc<dyn Wire>),
-            Some(Endpoint::Hub(hub)) => Some(Arc::clone(hub) as Arc<dyn Wire>),
-            None => None,
         };
         // Frames of a class a test loses go before they reach the network.
         #[cfg(feature = "faults")]
@@ -1884,7 +1854,6 @@ impl Node {
             secret,
             ingress_tls: config.ingress_tls,
             ingress: Mutex::new(None),
-            endpoint,
             stop: Some(stop),
             runtime: threads,
             liveness,
@@ -1914,7 +1883,9 @@ impl Node {
     /// Messages this node sent toward agents on other nodes, again on
     /// rounds included.
     pub fn messages_sent_across(&self) -> u64 {
-        self.inner.messages_sent_across()
+        self.inner
+            .sent_across
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Messages this node relayed to their agent's leader.
@@ -2195,7 +2166,6 @@ impl Node {
         // The jobs left finish here, and what they hold goes with them: no
         // part of the node (its store and its lock among them) outlives it.
         self.inner.executors.close();
-        drop(self.endpoint.take());
     }
 }
 

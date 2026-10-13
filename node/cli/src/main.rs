@@ -636,8 +636,7 @@ impl Kept {
                     ["at", id, at] => {
                         kept.floors.insert(agent(id)?, at.parse().ok()?);
                     }
-                    // A fourth field, the time the call was left, is ignored.
-                    ["pending", id, digest] | ["pending", id, digest, _] => {
+                    ["pending", id, digest] => {
                         kept.pending.insert(agent(id)?, key_bytes(digest).ok()?);
                     }
                     _ => return None,

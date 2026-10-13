@@ -6,7 +6,6 @@
 //! place is dropped: the sender's leader sends again, and messages are
 //! idempotent by their pair's sequence, acknowledgements monotone.
 
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use vos_net::Class;
@@ -188,12 +187,5 @@ impl Inner {
             // The receiver acknowledges again, with the next delivery.
             _ => self.drops.count(Refusal::Unplaced),
         }
-    }
-}
-
-impl Inner {
-    /// Messages this node sent toward other nodes.
-    pub(crate) fn messages_sent_across(self: &Arc<Self>) -> u64 {
-        self.sent_across.load(Ordering::Relaxed)
     }
 }

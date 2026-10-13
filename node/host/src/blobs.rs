@@ -186,9 +186,6 @@ struct Inner {
     thread: Mutex<Option<JoinHandle<()>>>,
     /// One collection at a time.
     collecting: smol::lock::Mutex<()>,
-    /// Who waits for a blob to be stored: shared with the writer, which
-    /// holds no reference to this state, so it never drops it last.
-    waiters: Arc<Waiters>,
     /// Open segments, for reads.
     files: Mutex<HashMap<u64, Arc<File>>>,
 }
@@ -265,7 +262,6 @@ impl Blobs {
             index,
             sender: Mutex::new(Some(sender)),
             thread: Mutex::new(None),
-            waiters: Arc::default(),
             files: Mutex::new(HashMap::new()),
             collecting: smol::lock::Mutex::new(()),
         });
@@ -276,7 +272,6 @@ impl Blobs {
                 index: inner.index.clone(),
                 segment_bytes,
                 current,
-                waiters: Arc::clone(&inner.waiters),
             };
             std::thread::Builder::new()
                 .name("vos-blobs".into())
@@ -383,20 +378,6 @@ impl Blobs {
         let mut bytes = vec![0; location.len as usize];
         file.read_exact_at(&mut bytes, location.offset + HEADER)?;
         Ok(bytes)
-    }
-
-    /// Resolves once the blob is stored.
-    pub async fn wait(&self, hash: [u8; 32]) {
-        let wait = {
-            let mut waiters = self.inner.waiters.lock().expect("unpoisoned");
-            if self.contains(&hash).unwrap_or(false) {
-                return;
-            }
-            let (notify, wait) = smol::channel::bounded(1);
-            waiters.entry(hash).or_default().push(notify);
-            wait
-        };
-        let _ = wait.recv().await;
     }
 
     /// Whether `agent` pins the blob: a program it runs.
@@ -722,11 +703,7 @@ struct Writer {
     index: Keyspace,
     segment_bytes: u64,
     current: Current,
-    waiters: Arc<Waiters>,
 }
-
-/// Who waits for which blob to be stored.
-type Waiters = Mutex<HashMap<[u8; 32], Vec<smol::channel::Sender<()>>>>;
 
 impl Writer {
     /// Requests in order; consecutive puts share a group and a sync. Any
@@ -783,14 +760,6 @@ impl Writer {
                 }
             }
             let result = self.write(&group).map_err(|error| error.to_string());
-            if result.is_ok() {
-                let mut waiters = self.waiters.lock().expect("unpoisoned");
-                for put in &group {
-                    for notify in waiters.remove(&put.blob.hash).unwrap_or_default() {
-                        let _ = notify.try_send(());
-                    }
-                }
-            }
             let failed = result.is_err();
             for put in group {
                 let _ = put.done.try_send(result.clone());
@@ -1023,25 +992,6 @@ mod tests {
         // It can be stored again.
         put(&blobs, &bytes(2, 500));
         assert_eq!(blobs.get(&second.hash).unwrap().unwrap(), *bytes(2, 500));
-    }
-
-    #[test]
-    fn a_waiter_wakes_when_its_blob_is_stored() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Fjall::open(dir.path().join("store")).unwrap();
-        let blobs = Blobs::open(dir.path().join("blobs"), &store).unwrap();
-        let data = bytes(4, 64);
-        let blob = blob_ref(&data);
-        let waiting = {
-            let blobs = blobs.clone();
-            std::thread::spawn(move || smol::block_on(blobs.wait(blob.hash)))
-        };
-        std::thread::sleep(Duration::from_millis(20));
-        assert!(!waiting.is_finished());
-        put(&blobs, &data);
-        waiting.join().unwrap();
-        // Waiting for a stored blob returns at once.
-        smol::block_on(blobs.wait(blob.hash));
     }
 
     #[test]

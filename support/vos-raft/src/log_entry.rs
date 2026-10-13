@@ -75,14 +75,4 @@ impl<N: NodeId> LogEntry<N> {
             kind: EntryKind::ConfigChange { joint_old, members },
         }
     }
-
-    /// Borrow the entry's data payload, if it's a `Data` entry.
-    /// Returns `None` for `ConfigChange` entries — apply sinks
-    /// can use this to skip non-data entries cleanly.
-    pub fn payload(&self) -> Option<&[u8]> {
-        match &self.kind {
-            EntryKind::Data { payload } => Some(payload),
-            _ => None,
-        }
-    }
 }

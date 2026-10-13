@@ -348,17 +348,9 @@ fn a_pending_call_whose_session_was_collected_is_lost() {
             .contains(&format!("pending {agent} ")),
         "kept pending"
     );
-    // With a fourth field, the time the call was left: still read.
+    // A line it does not know: the file is refused, and kept as it is.
     let kept = std::fs::read_to_string(&session_file).unwrap();
-    let old: String = kept
-        .lines()
-        .map(|line| match line.starts_with("pending ") {
-            true => format!("{line} 1\n"),
-            false => format!("{line}\n"),
-        })
-        .collect();
-    // A line no version wrote: the file is refused, and kept as it is.
-    std::fs::write(&session_file, format!("{old}something else\n")).unwrap();
+    std::fs::write(&session_file, format!("{kept}something else\n")).unwrap();
     let refused = fails(client(&url, "call", "increment", "0200000000000000"));
     assert!(refused.contains("cannot read"), "{refused}");
     assert!(
@@ -366,7 +358,7 @@ fn a_pending_call_whose_session_was_collected_is_lost() {
             .unwrap()
             .contains("something else")
     );
-    std::fs::write(&session_file, &old).unwrap();
+    std::fs::write(&session_file, &kept).unwrap();
 
     // Back after its session's row came due: the idle leader collects it.
     clock.store(expiry::due(expiry::bucket(start)), Ordering::SeqCst);

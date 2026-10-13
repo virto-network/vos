@@ -99,30 +99,3 @@ impl<N: NodeId> Config<N> {
         }
     }
 }
-
-impl<N: NodeId> Config<N> {
-    /// A majority of `members`, the candidate's own vote counted: 1 of 1,
-    /// 2 of 3, 3 of 5.
-    pub fn quorum(&self) -> usize {
-        self.members.len() / 2 + 1
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use alloc::vec;
-
-    fn cfg(members: Vec<u16>) -> Config<u16> {
-        Config::new(members[0], members, [0u8; 32])
-    }
-
-    #[test]
-    fn quorum_matches_raft_majority_rule() {
-        assert_eq!(cfg(vec![0xA]).quorum(), 1);
-        assert_eq!(cfg(vec![0xA, 0xB]).quorum(), 2);
-        assert_eq!(cfg(vec![0xA, 0xB, 0xC]).quorum(), 2);
-        assert_eq!(cfg(vec![0xA, 0xB, 0xC, 0xD, 0xE]).quorum(), 3);
-        assert_eq!(cfg((0..7).collect()).quorum(), 4);
-    }
-}

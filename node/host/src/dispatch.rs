@@ -407,7 +407,7 @@ impl Inner {
             if known.is_none() {
                 changes.insert(0, Change::Agent(record.clone()));
             }
-            if let Err(error) = self.commit(changes).await {
+            if let Err(error) = self.storage.commit(changes).await {
                 tracing::error!(agent = agent.0, "a placement was not stored: {error}");
                 return;
             }

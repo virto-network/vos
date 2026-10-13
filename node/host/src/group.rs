@@ -156,8 +156,6 @@ pub(crate) struct State {
 pub(crate) struct Shared {
     pub agent: AgentId,
     pub record: CreationRecord,
-    /// The members its core starts with, when its store holds none.
-    pub members: Vec<NodeNumber>,
     /// The agent's identity: its record's hash, which clients sign for.
     pub identity: [u8; 32],
     state: Mutex<State>,
@@ -175,12 +173,11 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
-    pub fn new(record: CreationRecord, members: Vec<NodeNumber>) -> Self {
+    pub fn new(record: CreationRecord) -> Self {
         Self {
             agent: record.agent,
             identity: crate::identity(&record),
             record,
-            members,
             state: Mutex::new(State {
                 role: Role::Follower,
                 term: 0,
@@ -381,7 +378,12 @@ impl Driver {
         // What the log still holds of the commit: a cut at a lost blob may
         // have taken the rest.
         let recovered = rows.hard.commit.min(last_index).max(applied);
-        let mut config = RaftConfig::new(inner.number, shared.members.clone(), shared.identity);
+        // The members it was created with, the log's first configuration,
+        // used until its store holds another: a replica added later is none
+        // of them, so it never campaigns until the configuration naming it
+        // reaches it.
+        let members = shared.record.replicas.clone();
+        let mut config = RaftConfig::new(inner.number, members, shared.identity);
         config.election_timeout_ms = inner.election_timeout_ms;
         config.heartbeat_interval_ms = inner.heartbeat_ms;
         config.compact_hysteresis = inner.compact_every;
