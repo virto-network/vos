@@ -30,8 +30,10 @@
 #
 # Builds the agent, the test actors and the benches, then runs: the
 # in-process bench (one node: refine and dry run an input); one agent and
-# the quiet, query and idle rows; one agent with its sessions spread over
-# the nodes; the 64 agents, closed and open, and their knee. Everything
+# the quiet, query (applied and linearizable) and idle rows, then a
+# failover of the idle agents; one agent with its sessions spread over
+# the nodes; the 64 agents, closed and open, and their knee, then a
+# failover under them. Everything
 # goes into `bench-<host>-<time>/` in the directory it is run from, with
 # the machine's description and a summary, and into a `.tar.gz` of it to
 # send back. It takes about an hour, more with `--data`, and longer the
@@ -278,9 +280,9 @@ note "running the in-process bench, on node 1's CPUs"
 scoped taskset -c "$node1" cargo bench -q -p vos-node --bench acceptance \
   > "$out/in-process.log" 2>&1 || note "in-process failed: see $out/in-process.log"
 
-rows tmpfs-agent DATA="$shm" ROWS=agent,quiet,query,idle
+rows tmpfs-agent DATA="$shm" ROWS=agent,quiet,query,linearizable,idle,failover-idle
 rows tmpfs-agent-spread DATA="$shm" ROWS=agent SPREAD=1
-rows tmpfs-agents DATA="$shm" ROWS=agents
+rows tmpfs-agents DATA="$shm" ROWS=agents,failover
 if [ -n "$disk" ]; then
   rows disk-agent DATA="$disk" ROWS=agent,quiet
   rows disk-agents DATA="$disk" ROWS=agents

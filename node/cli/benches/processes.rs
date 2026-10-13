@@ -9,12 +9,17 @@
 //!   each; open loop at 40k/s offered; and the knee, the highest offered
 //!   rate whose p99 stays at 20 ms or below.
 //! - **quiet:** one session, one call at a time.
-//! - **query:** the counter's value on a follower, open loop.
+//! - **query:** the counter's value on a follower, open loop, as applied
+//!   there.
+//! - **linearizable:** the same at `Linearizable`: the heartbeat round
+//!   each read takes is the difference.
 //! - **idle:** 1,000 agents per node left alone: each process's CPU,
 //!   threads and memory.
 //! - **failover** (on the 64 agents, with or without their rows): the
 //!   node leading the most of them killed, the time until each has a
-//!   leader again, and its restart.
+//!   leader again and every node's directory names it, and its restart.
+//! - **failover-idle:** the same on the idle row's 1,000 agents a node
+//!   (with or without that row).
 //! - **soak** (on the 64 agents, after any failover): their load open for
 //!   `SOAK_SECONDS` (1,800) at `SOAK_RATE` (6k/s), one load throughout:
 //!   CPU per commit, p50, p95 and the stalls compared early and late.
@@ -26,12 +31,14 @@
 //!
 //! `cargo bench -p vos-cli --bench processes` (after `just build-agent
 //! build-test-actors`). `ROWS` picks rows (`agent,agents,quiet,query,
-//! idle,failover,soak`; all but the last two by default); `CPUS`
+//! linearizable,idle,failover,failover-idle,soak`; all but the last three
+//! by default); `CPUS`
 //! overrides the pinning, as `taskset -c` lists for each node and the
 //! driver, separated by `/`; `RUNTIME_THREADS` sets each node's runtime
 //! threads; `DATA` where the stores go; `VOS_BIN` another `vos` to run the
 //! nodes, for a lever's A/B runs; `LOGS` a directory to keep the nodes'
-//! logs in. `machine.sh`, beside this file, runs the rows on a machine of
+//! logs in; `TLS=1` serves every node's ingress over TLS, each client
+//! pinning the node's key, for the rows against plain HTTP. `machine.sh`, beside this file, runs the rows on a machine of
 //! its own, each node on cores of its own.
 
 use std::collections::HashMap;
@@ -90,7 +97,7 @@ fn guest(path: &str) -> PathBuf {
 
 fn rows() -> Vec<String> {
     std::env::var("ROWS")
-        .unwrap_or_else(|_| "agent,agents,quiet,query,idle".into())
+        .unwrap_or_else(|_| "agent,agents,quiet,query,linearizable,idle".into())
         .split(',')
         .map(|row| row.trim().to_string())
         .collect()
@@ -427,10 +434,12 @@ impl Space {
             .collect();
         let ingress: Vec<u16> = (0..3).map(|_| free_port(false)).collect();
         let peers: Vec<u16> = (0..3).map(|_| free_port(true)).collect();
+        let tls = std::env::var("TLS").is_ok_and(|tls| tls == "1");
+        let scheme = if tls { "https" } else { "http" };
         let space: String = (0..3)
             .map(|at| {
                 format!(
-                    "{} {} 127.0.0.1:{} http://127.0.0.1:{}\n",
+                    "{} {} 127.0.0.1:{} {scheme}://127.0.0.1:{}\n",
                     at + 1,
                     keys[at],
                     peers[at],
@@ -449,7 +458,7 @@ impl Space {
                 // `RUNTIME_THREADS` runs the nodes' tasks on that many
                 // threads each.
                 let runtime = std::env::var("RUNTIME_THREADS").unwrap_or_else(|_| "1".into());
-                let args: Vec<String> = [
+                let mut args: Vec<String> = [
                     "--data",
                     data.to_str().unwrap(),
                     "--listen",
@@ -462,15 +471,25 @@ impl Space {
                 .iter()
                 .map(|arg| arg.to_string())
                 .collect();
+                if tls {
+                    args.push("--tls".into());
+                }
                 let pinning = pinned.then(|| cpus[at].clone());
                 let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
                 let (child, key) = launch(&borrowed, pinning.as_deref(), &log);
                 assert_eq!(key, keys[at]);
-                let url = format!("http://{listen}");
+                let url = format!("{scheme}://{listen}");
+                let trust = if tls {
+                    let mut pinned = [0u8; 32];
+                    hex::decode_to_slice(&key, &mut pinned).unwrap();
+                    Trust::NodeKey(pinned)
+                } else {
+                    Trust::Loopback
+                };
                 Process {
                     child: Mutex::new(child),
                     number,
-                    target: Target::new(&url, Trust::Loopback).unwrap(),
+                    target: Target::new(&url, trust).unwrap(),
                     url,
                     data,
                     args,
@@ -1597,15 +1616,20 @@ fn main() {
         );
     }
 
-    if rows.iter().any(|row| row == "query") {
+    let wanted = |name: &str| rows.iter().any(|row| row == name);
+    if wanted("query") || wanted("linearizable") {
         let leader = leaders[&one.agent];
         let follower = (leader + 1) % 3;
-        query(&space, &one, follower);
+        if wanted("query") {
+            query(&space, &one, follower, Consistency::Applied { at: 0 });
+        }
+        if wanted("linearizable") {
+            query(&space, &one, follower, Consistency::Linearizable);
+        }
     }
 
     // `failover` and `soak` take the 64 agents, with or without their
     // rows.
-    let wanted = |name: &str| rows.iter().any(|row| row == name);
     let many = if wanted("agents") || wanted("failover") || wanted("soak") {
         let agents: Vec<Signed> = (0..64)
             .map(|_| signed(&space, space.counter_agent(&counter)))
@@ -1688,7 +1712,8 @@ fn main() {
     };
 
     if wanted("failover") {
-        failover(&space, &many);
+        let agents: Vec<AgentId> = many.iter().map(|signed| signed.agent).collect();
+        failover(&space, &agents);
     }
     if wanted("soak") {
         soak(&space, &many, &mut next);
@@ -1699,8 +1724,11 @@ fn main() {
     agents.extend(many);
     counters_hold(&space, &agents);
 
-    if rows.iter().any(|row| row == "idle") {
-        idle(&space);
+    if wanted("idle") || wanted("failover-idle") {
+        let idle = idle(&space);
+        if wanted("failover-idle") {
+            failover(&space, &idle);
+        }
     }
 }
 
@@ -1755,12 +1783,16 @@ fn counters_hold(space: &Space, agents: &[Signed]) {
     println!("every agent's counter holds every increment it answered, once");
 }
 
-/// The counter's value read on `follower`, open loop, client to answer.
-fn query(space: &Space, signed: &Signed, follower: usize) {
+/// The counter's value read on `follower` at `consistency`, open loop,
+/// client to answer.
+fn query(space: &Space, signed: &Signed, follower: usize, consistency: Consistency) {
     let key = SigningKey::from_bytes(&[9; 32]);
     let public = key.verifying_key().to_bytes();
     let not_after = vos_node::wall_clock() + 240_000;
-    let consistency = Consistency::Applied { at: 0 };
+    let read = match consistency {
+        Consistency::Linearizable => "linearizable",
+        Consistency::Applied { .. } => "applied",
+    };
     let message = query_message(
         &signed.identity,
         &public,
@@ -1798,7 +1830,7 @@ fn query(space: &Space, signed: &Signed, follower: usize) {
             let interval = Duration::from_secs_f64(sessions as f64 / rate);
             let outcome = run(
                 &format!(
-                    "query on follower node {}, open at {rate:.0}/s",
+                    "query ({read}) on follower node {}, open at {rate:.0}/s",
                     follower + 1
                 ),
                 space,
@@ -1809,20 +1841,21 @@ fn query(space: &Space, signed: &Signed, follower: usize) {
         })
         .collect();
     println!(
-        "query: the follower's marginal CPU, {:.0} µs per query",
+        "query ({read}): the follower's marginal CPU, {:.0} µs per query",
         (busy[1] - busy[0]) / 4_000.0 * 1e6
     );
 }
 
 /// 1,000 agents more on every node, left alone: each process's CPU,
 /// threads and memory.
-fn idle(space: &Space) {
+fn idle(space: &Space) -> Vec<AgentId> {
     let started = Instant::now();
+    let created = Mutex::new(Vec::new());
     std::thread::scope(|scope| {
         for _ in 0..8 {
             scope.spawn(|| {
                 for _ in 0..125 {
-                    space.operate(
+                    let answer = space.operate(
                         |operator| {
                             operator
                                 .create_agent(vec![1, 2, 3])
@@ -1830,6 +1863,9 @@ fn idle(space: &Space) {
                         },
                         |answer| matches!(answer, Answer::Created(_)),
                     );
+                    if let Answer::Created(agent) = answer {
+                        created.lock().unwrap().push(agent);
+                    }
                 }
             });
         }
@@ -1850,15 +1886,17 @@ fn idle(space: &Space) {
             (after[at] - before[at]) / IDLE_MEASURE.as_secs_f64() * 100.0
         );
     }
+    created.into_inner().unwrap()
 }
 
 /// The node leading the most of `agents` killed: the time until every one
-/// has a leader again; then its restart: the time until it listens, and
-/// its CPU while its groups catch up.
-fn failover(space: &Space, agents: &[Signed]) {
+/// has a leader again, and until every node left names that leader's
+/// placement in its directory; then its restart: the time until it
+/// listens, and its CPU while its groups catch up.
+fn failover(space: &Space, agents: &[AgentId]) {
     let mut led = [0usize; 3];
-    for signed in agents {
-        led[space.leader(signed.agent)] += 1;
+    for agent in agents {
+        led[space.leader(*agent)] += 1;
     }
     let victim = (0..3).max_by_key(|at| led[*at]).unwrap();
     println!(
@@ -1869,27 +1907,67 @@ fn failover(space: &Space, agents: &[Signed]) {
     );
     let started = Instant::now();
     space.processes[victim].kill();
-    for signed in agents {
+    let left: Vec<&Process> = space
+        .processes
+        .iter()
+        .enumerate()
+        .filter(|(at, _)| *at != victim)
+        .map(|(_, process)| process)
+        .collect();
+    let status = |process: &Process, agent: AgentId| match process.operator().status(agent) {
+        Ok(Answer::Status(status)) => Some(status),
+        _ => None,
+    };
+    // The term each agent's new leader leads at.
+    let mut terms = Vec::with_capacity(agents.len());
+    for agent in agents {
         let until = Instant::now() + Duration::from_secs(60);
         loop {
-            let led = space.processes.iter().enumerate().any(|(at, process)| {
-                at != victim
-                    && matches!(process.operator().status(signed.agent), Ok(Answer::Status(status)) if status.leads)
-            });
-            if led {
+            let term = left
+                .iter()
+                .find_map(|process| status(process, *agent).filter(|status| status.leads))
+                .map(|status| status.term);
+            if let Some(term) = term {
+                terms.push(term);
                 break;
             }
-            assert!(
-                Instant::now() < until,
-                "agent {} has no leader",
-                signed.agent.0
-            );
+            assert!(Instant::now() < until, "agent {} has no leader", agent.0);
             std::thread::sleep(Duration::from_millis(20));
         }
     }
     println!(
         "failover: every agent has a leader again {:.2} s after the kill",
         started.elapsed().as_secs_f64()
+    );
+    // Each node left names a placement at least as new as its leader's.
+    for (agent, term) in agents.iter().zip(&terms) {
+        let until = Instant::now() + Duration::from_secs(60);
+        while !left.iter().all(|process| {
+            status(process, *agent).is_some_and(|status| status.placement_term >= *term)
+        }) {
+            assert!(
+                Instant::now() < until,
+                "agent {}'s new placement did not reach every node",
+                agent.0
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    println!(
+        "failover: every node left names the new leaders' placements {:.2} s after the kill",
+        started.elapsed().as_secs_f64()
+    );
+    // Each time above is when a sweep of the statuses saw its event: one
+    // sweep's own time is their resolution.
+    let swept = Instant::now();
+    for agent in agents {
+        for process in &left {
+            status(process, *agent);
+        }
+    }
+    println!(
+        "failover: one sweep of every agent's status on the nodes left takes {:.2} s",
+        swept.elapsed().as_secs_f64()
     );
     let opened = space.processes[victim].restart();
     let before = space.processes[victim].cpu();
