@@ -85,38 +85,62 @@ fn isolated_follower_does_not_inflate_term_under_pre_vote() {
     assert!(cluster.violations.is_empty(), "{:?}", cluster.violations);
 }
 
-/// A voter removed while it is down never acknowledges its removal, and
-/// the leader takes no further change until it does; once its host
-/// releases it, the leader confirms the change and takes the next.
+/// A voter removed while it is down holds nothing up: the next change
+/// starts once the final entry commits, and the voter, restarted with the
+/// log it had and never told of its removal, never leads.
 #[test]
-fn a_released_voter_lets_the_next_change_through() {
-    let mut cluster = Cluster::with_config(&[1, 2, 3, 4], 3, Faults::default(), |cfg| {
+fn a_voter_removed_while_down_holds_nothing_up() {
+    let all = [1, 2, 3, 4, 5];
+    let mut cluster = Cluster::with_config(&all, 3, Faults::default(), |cfg| {
         cfg.members = NODES.to_vec();
     });
     let leader = settle(&mut cluster);
     let gone = NODES.into_iter().find(|&node| node != leader).unwrap();
     cluster.crash(gone);
-    let members: Vec<u16> = [1, 2, 3, 4].into_iter().filter(|&n| n != gone).collect();
+    let replaced = |members: &[u16], out: u16, by: u16| -> Vec<u16> {
+        let mut members: Vec<u16> = members.iter().copied().filter(|&n| n != out).collect();
+        members.push(by);
+        members
+    };
+    let members = replaced(&NODES, gone, 4);
     cluster.change_membership(leader, members.clone());
-    cluster.run(1_000);
-    let status = cluster.core(leader).unwrap().status();
-    assert_eq!((status.members, status.joint_old), (members, None));
-    assert!(status.retirement_final_index.is_some(), "waits for {gone}");
-    let started = cluster.changes_started;
-    cluster.change_membership(leader, NODES.to_vec());
-    cluster.run(200);
-    assert_eq!(cluster.changes_started, started, "refused while it waits");
-    cluster.release_retiring_voters(leader);
-    cluster.run(500);
-    let status = cluster.core(leader).unwrap().status();
-    assert_eq!(status.retirement_final_index, None);
-    cluster.change_membership(leader, NODES.to_vec());
-    cluster.run(500);
-    assert_eq!(cluster.changes_started, started + 1);
-    assert_eq!(
-        cluster.core(leader).unwrap().status().members,
-        NODES.to_vec()
+    let final_committed = |cluster: &Cluster| {
+        let status = cluster.core(leader).unwrap().status();
+        status.joint_old.is_none()
+            && status.members == members
+            && status.commit_index >= status.active_config_index.unwrap_or(0)
+    };
+    for _ in 0..100 {
+        if final_committed(&cluster) {
+            break;
+        }
+        cluster.run(10);
+    }
+    assert!(
+        final_committed(&cluster),
+        "the change completes without {gone}"
     );
+    // The next change starts at once.
+    let started = cluster.changes_started;
+    let next = replaced(&members, 4, 5);
+    cluster.change_membership(leader, next.clone());
+    assert_eq!(cluster.changes_started, started + 1);
+    cluster.restart(gone);
+    for _ in 0..60 {
+        cluster.run(50);
+        assert_ne!(
+            cluster.core(gone).unwrap().role(),
+            Role::Leader,
+            "{gone} leads"
+        );
+    }
+    let leader = cluster.leader().expect("a leader");
+    let status = cluster.core(leader).unwrap().status();
+    assert_eq!((status.members, status.joint_old), (next, None));
+    let before = cluster.committed_index();
+    cluster.propose(leader, vec![1]);
+    cluster.run(500);
+    assert!(cluster.committed_index() > before);
     assert!(cluster.violations.is_empty(), "{:?}", cluster.violations);
 }
 
@@ -216,8 +240,8 @@ fn chaos(seed: u64, churn: bool, entry_lag: (u64, u64), paired: bool) -> Exercis
             _ => {}
         }
         // The hosts' directory, a little late: a replica a committed final
-        // configuration dropped is retired, one a configuration names again
-        // starts empty, and the leader does not wait for removed voters.
+        // configuration dropped is retired, and one a configuration names
+        // again starts empty.
         if paired && churn {
             directory(&mut cluster, nodes, 200_000);
         }
@@ -272,9 +296,7 @@ fn chaos(seed: u64, churn: bool, entry_lag: (u64, u64), paired: bool) -> Exercis
         let steady = |cluster: &Cluster| {
             cluster.leader().is_some_and(|leader| {
                 let status = cluster.core(leader).unwrap().status();
-                status.joint_old.is_none()
-                    && status.members.contains(&leader)
-                    && status.retirement_final_index.is_none()
+                status.joint_old.is_none() && status.members.contains(&leader)
             })
         };
         for _ in 0..50 {
@@ -356,12 +378,10 @@ fn chaos(seed: u64, churn: bool, entry_lag: (u64, u64), paired: bool) -> Exercis
 /// The hosts' directory, as the leader's configuration has it: with
 /// `chance` per million, a replica a committed final configuration
 /// dropped is retired, and one a configuration names again starts.
-/// Leaders release removed voters.
 fn directory(cluster: &mut Cluster, nodes: &[u16], chance: u64) {
     let Some(leader) = cluster.leader() else {
         return;
     };
-    cluster.release_retiring_voters(leader);
     let status = cluster.core(leader).unwrap().status();
     let named = |node: &u16| {
         status.members.contains(node)
@@ -440,9 +460,9 @@ fn safety_holds_when_entries_wait_for_blobs() {
 
 /// The chaos runs as a node's host runs its groups: idle heartbeats off,
 /// leaders and members vouched for by the pair heartbeat, and, with
-/// membership changes, removed voters released and dropped replicas
-/// retired (log and state wiped, term, vote and vote floor kept), then
-/// started again empty when a configuration names them.
+/// membership changes, dropped replicas retired (log and state wiped,
+/// term, vote and vote floor kept), then started again empty when a
+/// configuration names them.
 #[test]
 fn safety_holds_with_idle_heartbeats_off_and_the_hosts_vouching() {
     let mut total = Exercised::default();

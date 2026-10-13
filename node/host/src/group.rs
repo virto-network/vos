@@ -533,11 +533,6 @@ impl Driver {
                 self.report_health();
                 self.core
                     .durably_applied(self.inner.storage.durably_applied(self.agent));
-                // A replica a change removed learns of it from the
-                // directory, which tells every node until each holds it,
-                // one that is down once it returns: the group does not wait
-                // for the replica's own acknowledgement.
-                self.core.release_retiring_voters();
                 self.settle_streams();
                 if !self.process().await
                     || !self.stage().await

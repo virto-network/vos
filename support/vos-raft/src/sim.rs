@@ -678,14 +678,6 @@ impl Cluster {
         token
     }
 
-    /// `node`'s host releases the voters a committed change removed.
-    pub fn release_retiring_voters(&mut self, node: u16) {
-        if let Some(Some(core)) = self.cores.get_mut(&node) {
-            core.release_retiring_voters();
-            self.process(node);
-        }
-    }
-
     /// `node`'s host retires it, as its directory said a committed final
     /// configuration dropped it: its group stops, and its log and state
     /// go, its term, vote and vote floor kept. `keep_floor` false retires

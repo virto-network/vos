@@ -8980,3 +8980,37 @@ count kept and the three tests above.
 **Order:** after the driver is deleted, so the driver's tests that drive
 the subprotocol go with it, and before core.rs is unified and split, so
 nothing moves twice.
+
+#### 3.10d Built: the retirement-confirmation subprotocol removed
+
+**As designed:**
+- core.rs drops from 3,007 to 2,761 lines: `follow_membership` from 146
+  lines to 64, `recover_configuration` from 140 to 95.
+- The kept cases remain as Fable asked.
+- The chaos runs pass their thresholds and start more membership changes
+  than before (3,022 against 2,607 with changes), with 3,135
+  retirements.
+- The carried item "the confirmation entry's overhead" is moot.
+
+**Beyond the design, reviewed by Fable:**
+- **A leader tracks its configuration's members only.**
+  - A late answer from a voter the final entry removed would otherwise
+    put it back in the leader's tracking, and draw the final entry and
+    the next change's.
+  - `on_append_answer` ignores a non-member's answer, after the term
+    check, so a higher term still deposes.
+  - `replicate_to` sends nothing to a non-member, which also closes a
+    load answered after the removal.
+  - `rebuild_leader_tracking` prunes every per-peer map.
+- **The commit-carrying append stays:** in the step the final entry
+  commits, the leader's view is still joint, so a removed voter that
+  holds it learns it committed. Its host then retires it without
+  waiting for the directory.
+
+**Tests:**
+- `a_voter_removed_while_down_holds_nothing_up` (simulation; also run
+  over seeds 0–299) replaces the released-voter test;
+- `the_next_change_starts_once_the_final_entry_commits` and
+  `a_removed_voter_campaigns_only_in_the_configuration_it_holds` pin the
+  rule the safety argument rests on;
+- `a_load_answered_after_a_removal_sends_the_removed_voter_nothing`.

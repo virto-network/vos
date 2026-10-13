@@ -217,6 +217,9 @@ pub struct Recovered<N: NodeId> {
     /// The last log position (index, term) a replica held before its host
     /// wiped its log and state, keeping its term and vote: it votes only
     /// for candidates whose log reaches it, as if it still held that log.
+    /// A host that wipes a replica a change removed keeps it, so the
+    /// replica, added again empty, never votes for a removed one that
+    /// never learned of its removal.
     pub vote_floor: Option<(u64, u64)>,
 }
 
@@ -247,7 +250,6 @@ pub struct Status<N: NodeId> {
     pub members: Vec<N>,
     pub joint_old: Option<Vec<N>>,
     pub active_config_index: Option<u64>,
-    pub retirement_final_index: Option<u64>,
     pub leader_hint: Option<N>,
 }
 
@@ -462,10 +464,6 @@ pub struct Core<N: NodeId> {
     /// The last log position held before a wipe: see
     /// [`Recovered::vote_floor`].
     vote_floor: Option<(u64, u64)>,
-    retiring_voters: BTreeMap<N, u64>,
-    retiring_voter_acks: BTreeSet<N>,
-    retirement_confirmation_entry: Option<u64>,
-    retirement_final_index: Option<u64>,
     active_config_index: Option<u64>,
 
     open: Option<OpenWrite<N>>,
@@ -529,10 +527,6 @@ impl<N: NodeId> Core<N> {
             stalled_handovers: 0,
             pending_joint_entry: None,
             vote_floor: recovered.vote_floor,
-            retiring_voters: BTreeMap::new(),
-            retiring_voter_acks: BTreeSet::new(),
-            retirement_confirmation_entry: None,
-            retirement_final_index: None,
             active_config_index: None,
             open: None,
             next_seq: 1,
@@ -716,28 +710,6 @@ impl<N: NodeId> Core<N> {
     pub fn change_membership(&mut self, token: u64, members: Vec<N>) {
         let result = self.start_membership_change(members);
         self.answer(Answer::ChangeMembership { token, result });
-    }
-
-    /// The host tells the voters a committed final configuration removed of
-    /// that removal itself, sooner or later: count each as having
-    /// acknowledged it, so the confirmation, and the next change and
-    /// compaction after it, need not wait for a removed voter that is down
-    /// or gone. Only a leader whose final configuration has committed
-    /// releases them. A host that wipes a removed replica's log must keep
-    /// its last position as the replica's vote floor
-    /// ([`Recovered::vote_floor`]): a replica added again with an empty log
-    /// must not vote for a removed one that never learned of its removal.
-    pub fn release_retiring_voters(&mut self) {
-        if self.role != Role::Leader
-            || self
-                .retirement_final_index
-                .is_none_or(|final_index| self.commit < final_index)
-        {
-            return;
-        }
-        let voters: Vec<N> = self.retiring_voters.keys().copied().collect();
-        self.retiring_voter_acks.extend(voters);
-        self.maybe_append_retirement_confirmation();
     }
 
     /// Hand leadership to `to`, or to the most up-to-date member.
@@ -1167,7 +1139,7 @@ impl<N: NodeId> Core<N> {
         leader.acked_commit.remove(&node);
         leader.silent.remove(&node);
         let round = leader.round;
-        if self.replication_peers().contains(&node) {
+        if self.effective.all_members().contains(&node) {
             self.heartbeat_to(node, round);
         }
     }
@@ -1196,7 +1168,8 @@ impl<N: NodeId> Core<N> {
         if self.role == Role::Leader && self.election_deadline == u64::MAX {
             let me = self.cfg.me;
             if self
-                .replication_peers()
+                .effective
+                .all_members()
                 .into_iter()
                 .any(|peer| peer != me && !self.caught_up(peer))
             {
@@ -1237,7 +1210,6 @@ impl<N: NodeId> Core<N> {
             members: self.effective.current.clone(),
             joint_old: self.effective.joint_old.clone(),
             active_config_index: self.active_config_index,
-            retirement_final_index: self.retirement_final_index,
             leader_hint: self.seen_leader,
         }
     }
@@ -1646,7 +1618,7 @@ impl<N: NodeId> Core<N> {
         if next_term <= self.term || self.role == Role::Leader {
             self.send(from, refuse);
             // A member whose deadline lapsed hears its leader at once.
-            if self.role == Role::Leader && self.replication_peers().contains(&from) {
+            if self.role == Role::Leader && self.effective.all_members().contains(&from) {
                 let round = self.leader.as_ref().map_or(0, |leader| leader.round);
                 self.heartbeat_to(from, round);
             }
@@ -1833,14 +1805,13 @@ impl<N: NodeId> Core<N> {
         }
         self.write_entries(&appends);
         self.verified = self.verified.max(last_new);
-        let previous_commit = self.commit;
         let new_commit = commit.min(self.verified);
         if new_commit > self.commit {
             self.commit = new_commit;
             self.write_meta(false);
             self.actions.push(Action::Committed { index: self.commit });
         }
-        self.follow_committed_membership(previous_commit);
+        self.follow_committed_membership();
 
         let matched = self.durable_index.min(self.verified);
         self.respond(
@@ -1912,6 +1883,11 @@ impl<N: NodeId> Core<N> {
         if self.role != Role::Leader || term != self.term {
             return;
         }
+        // A leader tracks its configuration's members only: a late answer
+        // from a replica a change removed draws nothing more.
+        if !self.effective.all_members().contains(&from) {
+            return;
+        }
         let Some(leader) = self.leader.as_mut() else {
             return;
         };
@@ -1943,14 +1919,6 @@ impl<N: NodeId> Core<N> {
                 }
                 self.try_advance_commit();
                 self.try_resolve_reads();
-                let learned_final = self
-                    .retiring_voters
-                    .get(&from)
-                    .is_some_and(|&final_index| commit >= final_index && matched >= final_index);
-                if learned_final {
-                    self.retiring_voter_acks.insert(from);
-                    self.maybe_append_retirement_confirmation();
-                }
                 self.maybe_send_timeout_now();
                 self.replicate_to(from);
             }
@@ -1988,7 +1956,7 @@ impl<N: NodeId> Core<N> {
 
     fn send_heartbeats(&mut self) {
         let me = self.cfg.me;
-        let peers = self.replication_peers();
+        let peers = self.effective.all_members();
         let round = {
             let Some(leader) = self.leader.as_mut() else {
                 return;
@@ -2061,27 +2029,22 @@ impl<N: NodeId> Core<N> {
                 && !leader.loading.contains(&peer))
     }
 
-    fn replication_peers(&self) -> Vec<N> {
-        let mut peers = self.effective.all_members();
-        peers.extend(self.retiring_voters.keys().copied());
-        peers.sort_unstable();
-        peers.dedup();
-        peers
-    }
-
     fn replicate_all(&mut self) {
         let me = self.cfg.me;
-        for peer in self.replication_peers() {
+        for peer in self.effective.all_members() {
             if peer != me {
                 self.replicate_to(peer);
             }
         }
     }
 
-    /// Send `peer` the entries it lacks, unless an append or a snapshot is
-    /// in flight to it.
+    /// Send `peer`, a member, the entries it lacks, unless an append or a
+    /// snapshot is in flight to it.
     fn replicate_to(&mut self, peer: N) {
-        if self.role != Role::Leader || peer == self.cfg.me {
+        if self.role != Role::Leader
+            || peer == self.cfg.me
+            || !self.effective.all_members().contains(&peer)
+        {
             return;
         }
         let (term, last) = (self.term, self.log.last_index());
@@ -2278,7 +2241,6 @@ impl<N: NodeId> Core<N> {
         if dropped {
             // Membership steps held back during the handover.
             self.auto_finalize_joint_config();
-            self.maybe_append_retirement_confirmation();
         }
         for peer in expired.into_iter().chain(snapshots) {
             self.replicate_to(peer);
@@ -2324,10 +2286,12 @@ impl<N: NodeId> Core<N> {
         self.write_meta(false);
         self.actions.push(Action::Committed { index: floor });
         // Followers learn it at once: entries due carry it, and an idle
-        // peer gets an append with none.
+        // peer gets an append with none. This comes before a committed final
+        // configuration takes effect: the view is still joint, so a voter the
+        // final entry removed that holds it learns it committed too, and its
+        // host can retire it without waiting for the directory.
         self.replicate_all();
         self.auto_finalize_joint_config();
-        self.finalize_retirement_confirmation();
         let final_committed = self
             .active_config_index
             .is_some_and(|index| index <= self.commit);
@@ -2392,10 +2356,7 @@ impl<N: NodeId> Core<N> {
     }
 
     fn update_compact_bound(&mut self) {
-        let mut bound = self.commit.min(self.durably_applied);
-        if let Some(final_index) = self.retirement_final_index {
-            bound = bound.min(final_index.saturating_sub(2));
-        }
+        let bound = self.commit.min(self.durably_applied);
         let due = bound.saturating_sub(self.log.snap_index()) >= self.cfg.compact_hysteresis
             || self.log.bytes_through(bound) >= self.cfg.compact_bytes;
         if bound > self.compact_bound && due {
@@ -2413,10 +2374,7 @@ impl<N: NodeId> Core<N> {
         let next = self.log.last_index() + 1;
         let now = self.now;
         let me = self.cfg.me;
-        let mut members = self.effective.all_members();
-        members.extend(self.retiring_voters.keys().copied());
-        members.sort_unstable();
-        members.dedup();
+        let members = self.effective.all_members();
         let Some(leader) = self.leader.as_mut() else {
             return;
         };
@@ -2444,13 +2402,21 @@ impl<N: NodeId> Core<N> {
             .acked_round
             .retain(|member, _| members.contains(member));
         leader.answered.retain(|member, _| members.contains(member));
+        leader
+            .sent_commit
+            .retain(|member, _| members.contains(member));
+        leader
+            .acked_commit
+            .retain(|member, _| members.contains(member));
+        leader.loading.retain(|member| members.contains(member));
+        leader.silent.retain(|member| members.contains(member));
     }
 
     fn start_membership_change(&mut self, members: Vec<N>) -> Result<u64, ChangeMembershipError> {
         if self.role != Role::Leader || self.transferring() {
             return Err(ChangeMembershipError::NotLeader);
         }
-        if self.effective.is_joint() || self.retirement_final_index.is_some() {
+        if self.effective.is_joint() {
             return Err(ChangeMembershipError::InProgress);
         }
         // A solo leader ran no check-quorum: its window starts now.
@@ -2527,82 +2493,18 @@ impl<N: NodeId> Core<N> {
             return;
         }
         let index = self.log.last_index() + 1;
-        let retiring = joint_old.unwrap_or_default();
         self.append_own(alloc::vec![LogEntry::config_change(
-            index,
-            self.term,
-            None,
-            members.clone(),
+            index, self.term, None, members,
         )]);
-        let mut removed_any = false;
-        for voter in retiring {
-            if !members.contains(&voter) {
-                removed_any = true;
-                if voter != self.cfg.me {
-                    self.retiring_voters.insert(voter, index);
-                }
-            }
-        }
-        self.retirement_final_index = removed_any.then_some(index);
-        self.retirement_confirmation_entry = None;
-        self.retiring_voter_acks.clear();
         // The joint view stays effective until this final entry commits, so a
         // retiring leader that crashes can still recover and replicate it.
         self.pending_joint_entry = Some(index);
-        self.rebuild_leader_tracking();
         self.replicate_all();
-    }
-
-    /// Once every removed voter has acknowledged the committed final
-    /// configuration, append a confirmation that restates it.
-    fn maybe_append_retirement_confirmation(&mut self) {
-        if self.role != Role::Leader
-            || self.transferring()
-            || self.retirement_final_index.is_none()
-            || self.retirement_confirmation_entry.is_some()
-            || self.retiring_voters.is_empty()
-            || !self
-                .retiring_voters
-                .keys()
-                .all(|voter| self.retiring_voter_acks.contains(voter))
-        {
-            return;
-        }
-        let index = self.log.last_index() + 1;
-        let members = self.effective.current.clone();
-        self.append_own(alloc::vec![LogEntry::config_change(
-            index,
-            self.term,
-            None,
-            members.clone(),
-        )]);
-        self.write_active_config(ActiveConfigRecord {
-            log_index: Some(index),
-            current: members,
-            joint_old: None,
-        });
-        self.retirement_confirmation_entry = Some(index);
-        self.active_config_index = Some(index);
-        self.try_advance_commit();
-        self.replicate_all();
-    }
-
-    fn finalize_retirement_confirmation(&mut self) {
-        if self
-            .retirement_confirmation_entry
-            .is_none_or(|index| index > self.commit)
-        {
-            return;
-        }
-        self.retirement_confirmation_entry = None;
-        self.retirement_final_index = None;
-        self.retiring_voters.clear();
-        self.retiring_voter_acks.clear();
-        self.rebuild_leader_tracking();
     }
 
     /// A follower's view of membership after an append: truncated rows drop
-    /// their configurations, appended rows adopt theirs.
+    /// their configurations, and the last configuration entry appended takes
+    /// effect at once.
     fn follow_membership(&mut self, truncate_after: Option<u64>, appends: &[LogEntry<N>]) {
         let invalidated_config = match (truncate_after, self.active_config_index) {
             (Some(after), Some(index)) => after < index,
@@ -2612,28 +2514,22 @@ impl<N: NodeId> Core<N> {
             (Some(after), Some(index)) => after < index,
             _ => false,
         };
-        let appended_config = appends
-            .iter()
-            .any(|entry| matches!(entry.kind, EntryKind::ConfigChange { .. }));
-
-        let mut retiring = self.retiring_voters.clone();
-        let mut final_index = self.retirement_final_index;
-        let mut confirmation = self.retirement_confirmation_entry;
-        let mut acks = self.retiring_voter_acks.clone();
-        if let Some(after) = truncate_after {
-            retiring.retain(|_, index| *index <= after);
-            if final_index.is_some_and(|index| index > after) {
-                final_index = None;
-                confirmation = None;
-                acks.clear();
-            } else if confirmation.is_some_and(|index| index > after) {
-                confirmation = None;
-                acks.clear();
-            }
-        }
-        let truncated_base = invalidated_config.then(|| {
-            let after = truncate_after.expect("invalidation implies a truncation");
-            self.log
+        let appended = appends.iter().rev().find_map(|entry| match &entry.kind {
+            EntryKind::ConfigChange { joint_old, members } => Some((
+                entry.index,
+                ActiveConfig {
+                    current: members.clone(),
+                    joint_old: joint_old.clone(),
+                },
+            )),
+            _ => None,
+        });
+        // A truncation that removes the entry the view came from falls back
+        // to the latest configuration entry it keeps, else the log start's.
+        let adopted = appended.or_else(|| {
+            let after = truncate_after.filter(|_| invalidated_config)?;
+            let kept = self
+                .log
                 .configs()
                 .rev()
                 .find(|entry| entry.index <= after)
@@ -2650,109 +2546,33 @@ impl<N: NodeId> Core<N> {
                 // Unknown at the log's start (a host that kept no
                 // record): the static members, the best left.
                 .or_else(|| self.log_start_config.clone())
-                .unwrap_or_else(|| (0, ActiveConfig::steady(self.cfg.members.clone())))
+                .unwrap_or_else(|| (0, ActiveConfig::steady(self.cfg.members.clone())));
+            Some(kept)
         });
-
-        let mut record = None;
-        let mut view: Option<(ActiveConfig<N>, Option<u64>, Option<u64>)> = None;
-        if appended_config {
-            let mut retirement_view = truncated_base
-                .as_ref()
-                .map_or_else(|| self.effective.clone(), |(_, active)| active.clone());
-            for entry in appends {
-                if let EntryKind::ConfigChange { joint_old, members } = &entry.kind {
-                    if let Some(old) = joint_old {
-                        retirement_view = ActiveConfig {
-                            current: members.clone(),
-                            joint_old: Some(old.clone()),
-                        };
-                        final_index = None;
-                        confirmation = None;
-                        retiring.clear();
-                        acks.clear();
-                    } else if final_index.is_some()
-                        && confirmation.is_none()
-                        && retirement_view.current == *members
-                    {
-                        confirmation = Some(entry.index);
-                        retirement_view = ActiveConfig::steady(members.clone());
-                    } else if retirement_view.is_joint() && retirement_view.current == *members {
-                        let removed_any = retirement_view
-                            .joint_old
-                            .as_ref()
-                            .is_some_and(|old| old.iter().any(|voter| !members.contains(voter)));
-                        final_index = removed_any.then_some(entry.index);
-                        confirmation = None;
-                        retiring.clear();
-                        acks.clear();
-                        if let Some(old) = &retirement_view.joint_old {
-                            for voter in old {
-                                if *voter != self.cfg.me && !members.contains(voter) {
-                                    retiring.insert(*voter, entry.index);
-                                }
-                            }
-                        }
-                        retirement_view = ActiveConfig::steady(members.clone());
-                    } else {
-                        retirement_view = ActiveConfig::steady(members.clone());
-                    }
-                }
-            }
-            if let Some(entry) = appends
-                .iter()
-                .rev()
-                .find(|entry| matches!(entry.kind, EntryKind::ConfigChange { .. }))
-                && let EntryKind::ConfigChange { joint_old, members } = &entry.kind
-            {
-                let active = ActiveConfig {
-                    current: members.clone(),
-                    joint_old: joint_old.clone(),
+        let Some((index, active)) = adopted else {
+            if invalidated_pending {
+                self.pending_joint_entry = if self.effective.is_joint() {
+                    self.active_config_index
+                } else {
+                    None
                 };
-                let pending = active.is_joint().then_some(entry.index);
-                record = Some(ActiveConfigRecord {
-                    log_index: Some(entry.index),
-                    current: members.clone(),
-                    joint_old: joint_old.clone(),
-                });
-                view = Some((active, Some(entry.index), pending));
             }
-        } else if let Some((index, active)) = truncated_base {
-            let pending = active.is_joint().then_some(index);
-            record = Some(ActiveConfigRecord {
-                log_index: Some(index),
-                current: active.current.clone(),
-                joint_old: active.joint_old.clone(),
-            });
-            view = Some((active, Some(index), pending));
-        }
-
-        let retiring_changed = retiring != self.retiring_voters;
-        self.retiring_voters = retiring;
-        self.retiring_voter_acks = acks;
-        self.retirement_final_index = final_index;
-        self.retirement_confirmation_entry = confirmation;
-        if let Some(record) = record {
-            self.write_active_config(record);
-        }
-        if let Some((active, index, pending)) = view {
-            self.effective = active;
-            self.active_config_index = index;
-            self.pending_joint_entry = pending;
-            self.rebuild_leader_tracking();
-        } else if invalidated_pending {
-            self.pending_joint_entry = if self.effective.is_joint() {
-                self.active_config_index
-            } else {
-                None
-            };
-        } else if retiring_changed {
-            self.rebuild_leader_tracking();
-        }
+            return;
+        };
+        self.write_active_config(ActiveConfigRecord {
+            log_index: Some(index),
+            current: active.current.clone(),
+            joint_old: active.joint_old.clone(),
+        });
+        self.pending_joint_entry = active.is_joint().then_some(index);
+        self.effective = active;
+        self.active_config_index = Some(index);
+        self.rebuild_leader_tracking();
     }
 
-    /// A follower whose commit index crossed a pending final configuration
-    /// adopts it, and a committed confirmation clears the retirement.
-    fn follow_committed_membership(&mut self, _previous_commit: u64) {
+    /// A replica whose commit index crossed a pending final configuration
+    /// adopts it.
+    fn follow_committed_membership(&mut self) {
         if self.effective.is_joint()
             && let Some(pending) = self.pending_joint_entry
             && pending <= self.commit
@@ -2771,15 +2591,6 @@ impl<N: NodeId> Core<N> {
             self.active_config_index = Some(pending);
             self.pending_joint_entry = None;
             self.rebuild_leader_tracking();
-        }
-        if self
-            .retirement_confirmation_entry
-            .is_some_and(|index| index <= self.commit)
-        {
-            self.retirement_final_index = None;
-            self.retirement_confirmation_entry = None;
-            self.retiring_voters.clear();
-            self.retiring_voter_acks.clear();
         }
     }
 
@@ -2825,18 +2636,6 @@ impl<N: NodeId> Core<N> {
         configuration: Option<SnapshotConfiguration<N>>,
         record: ActiveConfigRecord<N>,
     ) {
-        if self
-            .retirement_final_index
-            .is_some_and(|final_index| final_index <= index)
-        {
-            self.retirement_final_index = None;
-            self.retirement_confirmation_entry = None;
-            self.retiring_voters.clear();
-            self.retiring_voter_acks.clear();
-        } else {
-            self.retiring_voters
-                .retain(|_, final_index| *final_index > index);
-        }
         // After compaction, only configuration entries above `index` remain.
         let live_above = keeps_suffix && self.log.configs().next_back().is_some();
         let from_snapshot =
@@ -2904,44 +2703,26 @@ impl<N: NodeId> Core<N> {
         let EntryKind::ConfigChange { joint_old, members } = &latest.kind else {
             return;
         };
-        let latest_position = configs.len() - 1;
-        // A second consecutive steady configuration with the same members is
-        // the retirement confirmation.
-        let prior_final = if joint_old.is_none() {
-            configs[..latest_position]
+        // A retiring leader that appended, but did not commit, the final
+        // configuration excluding itself keeps the joint view, so it can still
+        // campaign and replicate that final entry.
+        let prior_joint = || {
+            let from_log = configs[..configs.len() - 1]
                 .iter()
-                .enumerate()
-                .next_back()
-                .and_then(|(position, entry)| match &entry.kind {
+                .rev()
+                .find_map(|entry| match &entry.kind {
                     EntryKind::ConfigChange {
-                        joint_old: None,
-                        members: prior,
-                    } if prior == members => Some((position, entry.index)),
+                        joint_old: Some(old),
+                        members: joint_members,
+                    } if joint_members == members => Some((
+                        ActiveConfig {
+                            current: joint_members.clone(),
+                            joint_old: Some(old.clone()),
+                        },
+                        entry.index,
+                    )),
                     _ => None,
-                })
-        } else {
-            None
-        };
-        let is_confirmation = prior_final.is_some();
-        let joint_scan_end = prior_final.map_or(latest_position, |(position, _)| position);
-        let prior_joint = if joint_old.is_none() {
-            let from_log =
-                configs[..joint_scan_end]
-                    .iter()
-                    .rev()
-                    .find_map(|entry| match &entry.kind {
-                        EntryKind::ConfigChange {
-                            joint_old: Some(old),
-                            members: joint_members,
-                        } if joint_members == members => Some((
-                            ActiveConfig {
-                                current: joint_members.clone(),
-                                joint_old: Some(old.clone()),
-                            },
-                            entry.index,
-                        )),
-                        _ => None,
-                    });
+                });
             from_log.or_else(|| {
                 let record = persisted.as_ref()?;
                 let old = record.joint_old.clone()?;
@@ -2955,38 +2736,11 @@ impl<N: NodeId> Core<N> {
                     )
                 })
             })
-        } else {
-            None
         };
-        let source_final = prior_final.map_or(latest.index, |(_, index)| index);
-        let confirmation_committed = is_confirmation && latest.index <= commit;
-        let mut retiring = BTreeMap::new();
-        let mut removed_any = false;
-        if let Some((prior, _)) = &prior_joint
-            && let Some(old) = &prior.joint_old
-        {
-            for voter in old {
-                if !members.contains(voter) {
-                    removed_any = true;
-                    if *voter != me && !confirmation_committed {
-                        retiring.insert(*voter, source_final);
-                    }
-                }
-            }
-        }
-        self.retiring_voters = retiring;
-        self.retirement_final_index =
-            (removed_any && !confirmation_committed).then_some(source_final);
-        self.retirement_confirmation_entry =
-            (is_confirmation && !confirmation_committed).then_some(latest.index);
-        // A retiring leader that appended, but did not commit, the final
-        // configuration excluding itself keeps the joint view, so it can still
-        // campaign and replicate that final entry.
         if joint_old.is_none()
-            && !is_confirmation
             && latest.index > commit
             && !members.contains(&me)
-            && let Some((active, active_index)) = prior_joint
+            && let Some((active, active_index)) = prior_joint()
             && active
                 .joint_old
                 .as_ref()

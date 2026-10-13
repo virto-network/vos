@@ -1265,9 +1265,16 @@ fn a_lost_commit_notice_is_sent_again() {
 /// A three-member group led by `ME`, at term 1, with idle heartbeats
 /// off, whose followers acknowledged its no-op and the commit.
 fn idle_leader_of_three() -> Core<u16> {
+    leader_of_three_with(|cfg| cfg.idle_heartbeats = false)
+}
+
+/// A three-member group led by `ME`, at term 1, its configuration
+/// adjusted by `adjust`, whose followers acknowledged its no-op and the
+/// commit.
+fn leader_of_three_with(adjust: impl FnOnce(&mut Config<u16>)) -> Core<u16> {
     let mut cfg = config();
     cfg.pre_vote = false;
-    cfg.idle_heartbeats = false;
+    adjust(&mut cfg);
     let mut core = Core::new(cfg, Recovered::default(), 0, 5);
     core.take_actions();
     core.tick(1_000);
@@ -1534,7 +1541,6 @@ fn a_replica_given_a_joint_snapshot_finalizes_it_when_it_leads() {
     assert!(core.status().joint_old.is_some());
     let actions = lead_with_a(&mut core, 1_000);
     assert_eq!(finals(&actions), vec![members]);
-    assert!(core.status().retirement_final_index.is_some(), "B retires");
 }
 
 #[test]
@@ -1599,6 +1605,190 @@ fn a_recovered_joint_configuration_is_finalized_by_its_leader() {
     core.take_actions();
     let actions = lead_with_a(&mut core, 1_000);
     assert_eq!(finals(&actions), vec![members]);
+}
+
+/// Once a change's final entry commits, the next change starts at once,
+/// the voter it removed hears nothing more, and compaction reaches the
+/// commit.
+#[test]
+fn the_next_change_starts_once_the_final_entry_commits() {
+    let mut core = leader_of_three_with(|cfg| cfg.compact_hysteresis = 1);
+    // B is replaced by the joiner: the joint entry at 2.
+    let (members, _) = joint();
+    core.change_membership(1, members.clone());
+    let actions = core.take_actions();
+    assert!(actions.contains(&Action::Answer(Answer::ChangeMembership {
+        token: 1,
+        result: Ok(2),
+    })));
+    persist(&mut core, &writes(&actions).last().unwrap().clone());
+    // A acknowledges it: it commits, and the final entry follows at 3.
+    core.receive(LEADER_A, matched(2));
+    let actions = core.take_actions();
+    assert_eq!(finals(&actions), vec![members.clone()]);
+    persist(&mut core, &writes(&actions).last().unwrap().clone());
+    // A acknowledges the final entry: it commits, and B is out. B still has
+    // the joint entry's append in flight, so the append carrying the commit
+    // skips it.
+    core.receive(LEADER_A, matched(3));
+    let mut after = core.take_actions();
+    assert_eq!(committed(&after), Some(3));
+    let status = core.status();
+    assert_eq!((status.members, status.joint_old), (members, None));
+    // The next change starts at once.
+    core.change_membership(2, vec![ME, LEADER_A]);
+    let actions = core.take_actions();
+    assert!(actions.contains(&Action::Answer(Answer::ChangeMembership {
+        token: 2,
+        result: Ok(4),
+    })));
+    after.extend(actions);
+    // Compaction may reach the commit.
+    core.durably_applied(3);
+    assert_eq!(compact_bounds(&core.take_actions()), [3]);
+    // B's late answer draws nothing, and no heartbeat goes to it.
+    core.receive(LEADER_B, matched(2));
+    after.extend(core.take_actions());
+    for at in (1_050..=1_250).step_by(50) {
+        core.tick(at);
+        after.extend(core.take_actions());
+    }
+    assert!(appends_to_peer(&after, LEADER_A) > 0);
+    assert_eq!(appends_to_peer(&after, LEADER_B), 0, "{after:?}");
+}
+
+/// A load a voter waited on that comes back after the final entry removed
+/// it sends that voter nothing.
+#[test]
+fn a_load_answered_after_a_removal_sends_the_removed_voter_nothing() {
+    // A leader of three whose cache holds almost nothing; B never answers.
+    let mut cfg = config();
+    cfg.pre_vote = false;
+    cfg.cache_bytes = 1;
+    cfg.resend_timeout_ms = 100;
+    cfg.check_quorum = false;
+    let mut core = Core::new(cfg, Recovered::default(), 0, 5);
+    core.take_actions();
+    lead_with_a(&mut core, 1_000);
+    let mut store: Vec<LogEntry<u16>> = vec![LogEntry::data(1, 1, Vec::new())];
+    let mut persist_all = |core: &mut Core<u16>, actions: &[Action<u16>]| {
+        for write in writes(actions) {
+            store.extend(write.entries.iter().cloned());
+            persist(core, &write);
+        }
+    };
+    // B is replaced by the joiner: the joint entry at 2, the final one at 3.
+    let (members, _) = joint();
+    core.change_membership(1, members);
+    let actions = core.take_actions();
+    persist_all(&mut core, &actions);
+    core.receive(LEADER_A, matched(2));
+    let actions = core.take_actions();
+    persist_all(&mut core, &actions);
+    // B's slot frees after the resend timeout, and what it lacks is no
+    // longer cached: the leader loads it.
+    core.tick(1_000 + 150);
+    let load = loads(&core.take_actions())
+        .into_iter()
+        .find(|load| load.from == 1)
+        .expect("a load for B");
+    // The final entry commits, then the load comes back.
+    core.receive(LEADER_A, matched(3));
+    let mut after = core.take_actions();
+    assert_eq!(committed(&after), Some(3));
+    let entries = store
+        .iter()
+        .filter(|entry| (load.from..=load.to).contains(&entry.index))
+        .cloned()
+        .collect();
+    core.loaded(load, entries);
+    after.extend(core.take_actions());
+    let to_b = after.iter().any(|action| {
+        matches!(
+            action,
+            Action::Send { to: LEADER_B, .. } | Action::SendSnapshot { to: LEADER_B, .. }
+        )
+    });
+    assert!(!to_b, "{after:?}");
+}
+
+/// A configuration entry takes effect where it is appended: a voter
+/// removed that holds the final entry never campaigns, and one holding
+/// only the joint entry is refused by a member that holds the final one.
+#[test]
+fn a_removed_voter_campaigns_only_in_the_configuration_it_holds() {
+    // ME is replaced by the joiner: the joint entry at 2, the final one
+    // at 3.
+    let old = vec![ME, LEADER_A, LEADER_B];
+    let members = vec![LEADER_A, LEADER_B, JOINER];
+    let joint = LogEntry::config_change(2, 1, Some(old.clone()), members.clone());
+    let last = LogEntry::config_change(3, 1, None, members.clone());
+    let from_a = |entries: Vec<LogEntry<u16>>| Message::Append {
+        term: 1,
+        leader: LEADER_A,
+        prev_index: 1,
+        prev_term: 1,
+        commit: 1,
+        round: 1,
+        entries,
+    };
+    let campaigns = |actions: &[Action<u16>]| {
+        sent(actions)
+            .into_iter()
+            .filter(|message| matches!(message, Message::PreVote { .. } | Message::Vote { .. }))
+            .collect::<Vec<_>>()
+    };
+    // Holding the final entry, ME is no member: its timer asks for nothing.
+    let mut removed = follower(1, &[1], 1);
+    removed.receive(LEADER_A, from_a(vec![joint.clone(), last.clone()]));
+    removed.take_actions();
+    assert_eq!(removed.status().members, members);
+    for at in (1_000..=5_000).step_by(500) {
+        removed.tick(at);
+        assert!(campaigns(&removed.take_actions()).is_empty(), "at {at}");
+    }
+    // Holding only the joint entry, it asks A for a pre-vote.
+    let mut behind = follower(1, &[1], 1);
+    behind.receive(LEADER_A, from_a(vec![joint.clone()]));
+    behind.take_actions();
+    behind.tick(1_000);
+    let pre_vote = behind
+        .take_actions()
+        .into_iter()
+        .find_map(|action| match action {
+            Action::Send {
+                to: LEADER_A,
+                message: message @ Message::PreVote { .. },
+            } => Some(message),
+            _ => None,
+        })
+        .expect("a pre-vote to A");
+    // A replica of A's that held only the joint entry would grant it; A,
+    // holding the final entry, refuses it.
+    let granted = |entries: Vec<LogEntry<u16>>| {
+        let recovered = Recovered {
+            meta: Meta {
+                current_term: 1,
+                commit_index: 1,
+                ..Meta::default()
+            },
+            entries,
+            applied: 1,
+            ..Recovered::default()
+        };
+        let mut a = Core::new(Config::new(LEADER_A, old.clone()), recovered, 0, 7);
+        a.take_actions();
+        a.receive(ME, pre_vote.clone());
+        sent(&a.take_actions())
+            .into_iter()
+            .find_map(|message| match message {
+                Message::PreVoteAnswer { granted, .. } => Some(granted),
+                _ => None,
+            })
+    };
+    let no_op = LogEntry::data(1, 1, vec![0]);
+    assert_eq!(granted(vec![no_op.clone(), joint.clone()]), Some(true));
+    assert_eq!(granted(vec![no_op, joint, last]), Some(false));
 }
 
 #[test]
