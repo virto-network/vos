@@ -17,7 +17,6 @@ use vos_wire::{Decode, Encode, keys};
 
 use crate::calls::{answer_of, verify};
 use crate::http::{self, Handler, Limits, Response};
-use crate::lock;
 use crate::node::{Inner, ReplaceError};
 
 /// How far ahead a query's `not_after` may be.
@@ -255,7 +254,7 @@ impl Ingress {
     /// Agent `agent`'s creation record and replicas, when this node knows
     /// of it.
     fn agent_info(&self, agent: AgentId) -> Option<AgentInfo> {
-        let known = lock(&self.inner.directory).get(&agent).cloned()?;
+        let known = self.inner.directory.get(agent)?;
         let replicas = known
             .placement
             .replicas

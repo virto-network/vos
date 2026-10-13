@@ -168,7 +168,13 @@ async fn beat(inner: Arc<Inner>) -> Ended {
             inner.to_led(None, || Local::Wake);
         }
         let round = inner.liveness.next_round();
-        let leading = inner.led_groups();
+        // None listed while the writer is stalled, so their followers elect
+        // leaders that can write, and none that is not live.
+        let leading = if inner.storage.stalled() {
+            Vec::new()
+        } else {
+            inner.led()
+        };
         let peers = inner
             .space
             .as_ref()
@@ -179,12 +185,13 @@ async fn beat(inner: Arc<Inner>) -> Ended {
             // every node.
             let listed: Vec<Leading> = leading
                 .iter()
-                .filter(|(_, placement)| {
-                    placement
-                        .as_ref()
-                        .is_none_or(|placement| placement.admits(peer))
+                .filter(|(_, placement, live)| {
+                    *live
+                        && placement
+                            .as_ref()
+                            .is_none_or(|placement| placement.admits(peer))
                 })
-                .map(|(leading, _)| *leading)
+                .map(|(leading, ..)| *leading)
                 .collect();
             for frame in frames(inner.liveness.incarnation, round, &listed, LISTED) {
                 inner.send(peer, Class::Liveness, &frame);
@@ -218,30 +225,32 @@ fn frames(incarnation: u64, round: u64, listed: &[Leading], size: usize) -> Vec<
 }
 
 impl Inner {
-    /// The groups this node leads, at their terms, each with its
-    /// placement when known: none while the writer is stalled, so their
-    /// followers elect leaders that can write, and none whose driver has
-    /// not gone round in two election timeouts.
-    fn led_groups(&self) -> Vec<(Leading, Option<Placement>)> {
-        if self.storage.stalled() {
-            return Vec::new();
-        }
+    /// The groups this node leads, at their terms, each with its placement
+    /// when known, and whether it is live: not stopped, and its driver gone
+    /// round in two election timeouts.
+    fn led(&self) -> Vec<(Leading, Option<Placement>, bool)> {
         let now = self.liveness.elapsed();
         let stuck = 2 * self.settings.election_timeout_ms.1;
-        let led: Vec<(AgentId, u64)> = lock(&self.runs)
+        let led: Vec<(Leading, bool)> = lock(&self.runs)
             .iter()
             .filter_map(|(agent, run)| {
                 let state = run.shared.state();
                 let woke = run.shared.woke.load(Ordering::Relaxed);
-                (state.role == Role::Leader && !state.stopped && now.saturating_sub(woke) < stuck)
-                    .then_some((*agent, state.term))
+                let live = !state.stopped && now.saturating_sub(woke) < stuck;
+                let leading = Leading {
+                    agent: *agent,
+                    term: state.term,
+                };
+                (state.role == Role::Leader).then_some((leading, live))
             })
             .collect();
-        let directory = lock(&self.directory);
+        let directory = lock(&self.directory.known);
         led.into_iter()
-            .map(|(agent, term)| {
-                let placement = directory.get(&agent).map(|known| known.placement.clone());
-                (Leading { agent, term }, placement)
+            .map(|(leading, live)| {
+                let placement = directory
+                    .get(&leading.agent)
+                    .map(|known| known.placement.clone());
+                (leading, placement, live)
             })
             .collect()
     }
@@ -249,26 +258,12 @@ impl Inner {
     /// Give each group this node leads `local`: every one, or those whose
     /// placement admits `member`.
     fn to_led(&self, member: Option<NodeNumber>, local: impl Fn() -> Local) {
-        let led: Vec<AgentId> = lock(&self.runs)
-            .iter()
-            .filter(|(_, run)| run.shared.state().role == Role::Leader)
-            .map(|(agent, _)| *agent)
-            .collect();
-        let admitted: Vec<AgentId> = match member {
-            None => led,
-            Some(member) => {
-                let directory = lock(&self.directory);
-                led.into_iter()
-                    .filter(|agent| {
-                        directory
-                            .get(agent)
-                            .is_none_or(|known| known.placement.admits(member))
-                    })
-                    .collect()
+        for (leading, placement, _) in self.led() {
+            let admitted = member
+                .is_none_or(|member| placement.is_none_or(|placement| placement.admits(member)));
+            if admitted {
+                self.propose(leading.agent, local());
             }
-        };
-        for agent in admitted {
-            self.propose(agent, local());
         }
     }
 

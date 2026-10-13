@@ -79,8 +79,6 @@ pub(crate) enum Local {
     /// Something changed that the group's next round should see, such as
     /// the writer's health.
     Wake,
-    /// The placement of `order` reached the directory, `kept` or not.
-    Placed { order: Order, kept: bool },
     /// The snapshot stream to `to`, named by `term` and `index`, ended:
     /// `done` once its follower staged every chunk.
     StreamEnded {
@@ -250,8 +248,8 @@ struct Driver {
     turn: usize,
     /// The leader loop stopped for good.
     retired: bool,
-    /// The writer health last reported to the core.
-    stalled: bool,
+    /// The core was last told to hand leadership over and not campaign.
+    handing_over: bool,
     /// The snapshot streams this replica runs as leader, by follower.
     shipments: HashMap<NodeNumber, Shipment>,
     /// The snapshot this replica stages, from the leader it follows.
@@ -265,12 +263,9 @@ struct Driver {
     /// A compaction is due at the next chance.
     compact_due: bool,
     memberships: HashMap<u64, smol::channel::Sender<Result<u64, ChangeMembershipError>>>,
-    /// The order of the placement this replica last announced as leader.
+    /// The order of the placement this replica last announced as leader,
+    /// since it last stepped down: set as it goes to the directory, in a
+    /// task of its own, as the driver never waits on the node-wide lock a
+    /// placement takes.
     announced: Option<Order>,
-    /// A placement on its way to the directory: kept off the driver, which
-    /// never waits on the node-wide lock a placement takes.
-    announcing: Option<Order>,
-    /// This run of the group has led: only such a run takes its
-    /// placements' answers, or announces as it steps down.
-    led: bool,
 }

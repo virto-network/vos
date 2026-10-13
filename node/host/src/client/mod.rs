@@ -268,27 +268,39 @@ impl Client {
         Ok(identity)
     }
 
-    /// Call the replica of `agent` after the one this client calls: false
-    /// when it knows no other.
-    fn fail_over(&mut self, agent: AgentId) -> Result<bool, ClientError> {
-        // An identity kept from before comes without the replicas.
+    /// Learn `agent`'s replicas, unless this client knows them: an
+    /// identity kept from before comes without them.
+    fn ensure_replicas(&self, agent: AgentId) {
         if !lock(&self.replicas).contains_key(&agent) {
             let _ = self.learn(agent);
         }
+    }
+
+    /// `agent`'s replicas other than the one this client calls, learned
+    /// first if need be: from the one after it on, in turn.
+    fn other_replicas(&self, agent: AgentId) -> Vec<Contact> {
+        self.ensure_replicas(agent);
         let replicas = lock(&self.replicas)
             .get(&agent)
             .cloned()
             .unwrap_or_default();
         let current = Some(self.http.target.authority.clone());
-        let at = replicas
+        match replicas
             .iter()
-            .position(|replica| authority(&replica.address) == current);
-        let next = match at {
-            Some(at) if replicas.len() > 1 => &replicas[(at + 1) % replicas.len()],
-            None if !replicas.is_empty() => &replicas[0],
-            _ => return Ok(false),
+            .position(|replica| authority(&replica.address) == current)
+        {
+            Some(at) => [&replicas[at + 1..], &replicas[..at]].concat(),
+            None => replicas,
+        }
+    }
+
+    /// Call the replica of `agent` after the one this client calls: false
+    /// when it knows no other.
+    fn fail_over(&mut self, agent: AgentId) -> Result<bool, ClientError> {
+        let Some(next) = self.other_replicas(agent).into_iter().next() else {
+            return Ok(false);
         };
-        self.follow(&next.clone())?;
+        self.follow(&next)?;
         Ok(true)
     }
 
@@ -309,9 +321,7 @@ impl Client {
     ) -> Result<Answer, ClientError> {
         // Learn the replicas first: the node may be gone when a failover
         // needs them.
-        if !lock(&self.replicas).contains_key(&agent) {
-            let _ = self.learn(agent);
-        }
+        self.ensure_replicas(agent);
         let mut redirects = 0;
         let mut renewals = 0;
         let mut failovers = 0;
@@ -613,19 +623,8 @@ impl Client {
         };
         let mut answer = ask(&self.http);
         if unanswered(&answer) {
-            if !lock(&self.replicas).contains_key(&agent) {
-                let _ = self.learn(agent);
-            }
-            let replicas = lock(&self.replicas)
-                .get(&agent)
-                .cloned()
-                .unwrap_or_default();
-            let current = Some(self.http.target.authority.clone());
-            for replica in replicas
-                .iter()
-                .filter(|replica| authority(&replica.address) != current)
-            {
-                let Ok(target) = self.target_for(replica) else {
+            for replica in self.other_replicas(agent) {
+                let Ok(target) = self.target_for(&replica) else {
                     continue;
                 };
                 answer = ask(&Http::new(&target));

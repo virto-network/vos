@@ -17,12 +17,12 @@ use vos_wire::ids::ProgramHash;
 use vos_wire::ingress::NodeId;
 use vos_wire::peer::{CreationRecord, Placement};
 
-use super::{Config, Error, Inner, Node, Peers, Run, Settings, Tasks, Wire};
+use super::{Config, Directory, Error, Inner, Node, Peers, Run, Settings, Tasks, Wire};
 use crate::blobs::Blobs;
 use crate::executor::Executors;
-use crate::lock;
 use crate::storage::StorageThread;
 use crate::store::{Fjall, PersistMode};
+use crate::{lock, seed};
 
 /// The node's data directory: its store, and the operator's token. A
 /// stopped node's store may be opened at `STORE` in it.
@@ -157,12 +157,7 @@ impl Node {
             number,
             space: config.space,
             network,
-            directory: Mutex::new(HashMap::new()),
-            unacknowledged: Mutex::new(HashMap::new()),
-            acknowledged: event_listener::Event::new(),
-            refusing: Mutex::new(HashMap::new()),
-            capable: Mutex::new(HashMap::new()),
-            asked: Mutex::new(HashMap::new()),
+            directory: Directory::default(),
             dropping: Mutex::new(HashMap::new()),
             runs: Mutex::new(HashMap::new()),
             dry_runs: Mutex::new(HashMap::new()),
@@ -173,7 +168,7 @@ impl Node {
             tasks: Mutex::new(Tasks::default()),
             recording: smol::lock::Mutex::new(()),
             calls: crate::calls::Calls::default(),
-            reads: crate::queries::Reads::default(),
+            reads: crate::asking::Waits::default(),
             turn: AtomicU64::new(0),
             sent_across: AtomicU64::new(0),
             installed: AtomicU64::new(0),
@@ -229,7 +224,7 @@ impl Node {
             liveness = Some((stop, thread));
             inner.spawn(crate::dispatch::dispatch(Arc::clone(&inner), arrivals));
         }
-        inner.spawn(crate::dispatch::resend_records(Arc::clone(&inner)));
+        inner.spawn(super::directory::resend_records(Arc::clone(&inner)));
         inner.spawn(crate::stats::probe(Arc::clone(&inner)));
         let collector = {
             let (stop, stopped) = mpsc::channel::<()>();
@@ -401,17 +396,4 @@ pub fn wall_clock() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| since.as_millis() as u64)
-}
-
-pub(crate) fn seed() -> [u8; 32] {
-    let mut seed = [0u8; 32];
-    getrandom::getrandom(&mut seed).expect("the operating system's randomness");
-    seed
-}
-
-/// A random number, from the operating system's randomness.
-pub(crate) fn random_u64() -> u64 {
-    let mut bytes = [0u8; 8];
-    getrandom::getrandom(&mut bytes).expect("the operating system's randomness");
-    u64::from_le_bytes(bytes)
 }

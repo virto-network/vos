@@ -7,6 +7,7 @@ pub mod blobs;
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod asking;
 mod calls;
 pub mod client;
 mod dispatch;
@@ -66,6 +67,20 @@ pub(crate) async fn timeout<T>(limit: Duration, work: impl Future<Output = T>) -
 #[track_caller]
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().expect("unpoisoned")
+}
+
+/// 32 random bytes, from the operating system's randomness.
+pub(crate) fn seed() -> [u8; 32] {
+    let mut seed = [0u8; 32];
+    getrandom::getrandom(&mut seed).expect("the operating system's randomness");
+    seed
+}
+
+/// A random number, from the operating system's randomness.
+pub(crate) fn random_u64() -> u64 {
+    let mut bytes = [0u8; 8];
+    getrandom::getrandom(&mut bytes).expect("the operating system's randomness");
+    u64::from_le_bytes(bytes)
 }
 
 /// Points where a test breaks the node as a crash or a bug would.

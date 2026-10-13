@@ -2,7 +2,7 @@
 //! changing under load, across leader changes, partitions and crashes,
 //! and the replica it removes retiring for good.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use vos_checker::calls::done;
 use vos_checker::programs::actor;
@@ -362,6 +362,55 @@ fn a_replacement_by_a_node_that_cannot_run_the_program_is_refused() {
     let placement = cluster.node(leader).placement(agent).unwrap();
     assert_eq!(placement.replicas, vec![1, 2, 3]);
     assert!(!placement.joint);
+}
+
+/// Two replacements by a node that never answers, at once: each is
+/// refused once its deadline passes, and meanwhile the leader's node
+/// serves its other agents as before.
+#[test]
+fn overlapping_replacements_by_a_silent_node_hold_nothing_else_up() {
+    let mut cluster = Cluster::new(4);
+    let agent = cluster.counter_agent(&[1, 2, 3]);
+    let (leader, removed) = cluster.leader_and_follower(agent);
+    let other = cluster.counter_agent(&[leader]);
+    cluster.stop(4);
+    std::thread::scope(|scope| {
+        let cluster = &cluster;
+        let replace = move || {
+            let started = Instant::now();
+            let replaced = cluster.node(leader).replace(agent, removed, 4);
+            (replaced, started.elapsed())
+        };
+        let first = scope.spawn(replace);
+        std::thread::sleep(Duration::from_millis(200));
+        let second = scope.spawn(replace);
+        let mut sequence = 0;
+        while !(first.is_finished() && second.is_finished()) {
+            sequence += 1;
+            let called = Instant::now();
+            assert_eq!(
+                done(cluster.increment(leader, other, sequence, 1)),
+                sequence
+            );
+            let took = called.elapsed();
+            assert!(took < Duration::from_secs(3), "a call took {took:?}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        for replacing in [first, second] {
+            let (replaced, took) = replacing.join().unwrap();
+            assert!(
+                matches!(
+                    replaced,
+                    Err(vos_node::ReplaceError::Unplaced(Unplaced::CannotRun))
+                ),
+                "{replaced:?}"
+            );
+            assert!(
+                took < Duration::from_secs(12),
+                "a replacement took {took:?}"
+            );
+        }
+    });
 }
 
 /// A leader that still believes it leads, though its followers elected

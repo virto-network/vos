@@ -8,20 +8,19 @@
 //! acknowledgements. Every replica applies the committed log the same way.
 
 mod config;
+mod directory;
 mod open;
 mod queue;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::net::SocketAddr;
-use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use smol::future::FutureExt;
 use vos_net::{Class, Network, Refused};
 use vos_pvm::pool::{CodeHash, MachinePool, OuterMachines};
 use vos_raft::Role;
@@ -40,15 +39,15 @@ use crate::group::{self, DryRun, Input as GroupInput, Local, Shared};
 use crate::pvm::{self, Fault};
 use crate::space::Space;
 use crate::storage::{Change, StorageThread};
-use crate::store::{BlobRef, Fjall, LogEntry, Snapshot};
+use crate::store::{BlobRef, Fjall, Snapshot};
 use crate::tls::IngressTls;
-use crate::{lock, timeout};
+use crate::{lock, seed, timeout};
 
 pub(crate) use config::Settings;
 pub use config::{CallError, Config, Error, Peers, ReplaceError, Reply};
+pub(crate) use directory::{Directory, Order};
 use open::write_token;
 pub use open::{ADMIN_TOKEN, NODE_KEY, STORE, wall_clock};
-pub(crate) use open::{random_u64, seed};
 pub(crate) use queue::{Agent, Answered, Pending};
 
 /// What the network sends through.
@@ -89,16 +88,6 @@ impl<T: Network> Wire for T {
     }
 }
 
-/// A placement's order: [`Placement::order`].
-pub(crate) type Order = (u64, u64, bool);
-
-/// What a node knows of an agent: its record, and where it runs.
-#[derive(Clone, Debug)]
-pub(crate) struct Known {
-    pub(crate) record: CreationRecord,
-    pub(crate) placement: Placement,
-}
-
 /// An agent this node replicates: its queue, its group's shared state, the
 /// group's inbox, and their tasks.
 pub(crate) struct Run {
@@ -122,9 +111,6 @@ const REPLACED: Duration = Duration::from_secs(30);
 /// by the node that took over.
 const REPLACED_ELSEWHERE: Duration = Duration::from_secs(2);
 
-/// A group's inbox: Raft messages beyond it are dropped, and resent.
-const GROUP_INBOX: usize = 1024;
-
 // A work result as large as refine allows travels in one append.
 const _: () = assert!(
     vos_net::Limits::DEFAULT.consensus >= vos_wire::abi::cap::WORK_RESULT + (1 << 20),
@@ -147,18 +133,8 @@ pub(crate) struct Inner {
     pub(crate) number: NodeNumber,
     pub(crate) space: Option<Space>,
     pub(crate) network: Option<Arc<dyn Wire>>,
-    /// Every agent this node knows of, and where it runs.
-    pub(crate) directory: Mutex<HashMap<AgentId, Arc<Known>>>,
-    /// For each agent whose placement this node announced, its order and
-    /// the nodes yet to hold one at least as new.
-    pub(crate) unacknowledged: Mutex<HashMap<AgentId, (Order, BTreeSet<NodeNumber>)>>,
-    pub(crate) acknowledged: event_listener::Event,
-    /// For each agent, the nodes that said they could not run its program.
-    pub(crate) refusing: Mutex<HashMap<AgentId, BTreeSet<NodeNumber>>>,
-    /// Who waits to hear whether a node could run an agent's program.
-    pub(crate) capable: Mutex<HashMap<(AgentId, NodeNumber), smol::channel::Sender<bool>>>,
-    /// When this node last asked each peer for each agent's record.
-    pub(crate) asked: Mutex<HashMap<(AgentId, NodeNumber), Instant>>,
+    /// Where each agent runs, and the placements this node sends.
+    pub(crate) directory: Directory,
     /// The agents' epochs a drop may still remove rows from, with how many
     /// drops run on each: no install is staged into one (`empty_epoch`),
     /// or a drop would take its rows.
@@ -204,7 +180,7 @@ pub(crate) struct Inner {
     /// Clients' calls: their lanes, and the calls forwarded both ways.
     pub(crate) calls: crate::calls::Calls,
     /// The read indexes this replica asked its leaders for.
-    pub(crate) reads: crate::queries::Reads,
+    pub(crate) reads: crate::asking::Waits<Option<u64>>,
 }
 
 impl Inner {
@@ -216,7 +192,7 @@ impl Inner {
     /// running is stopping (or refused the group), and any other node
     /// names the replicas.
     pub(crate) fn absent(&self, id: AgentId) -> CallError {
-        match lock(&self.directory).get(&id) {
+        match self.directory.get(id) {
             Some(known) if known.placement.replicas.contains(&self.number) => CallError::Stopped,
             Some(known) => CallError::Elsewhere(
                 known
@@ -232,9 +208,7 @@ impl Inner {
 
     /// Where agent `id` runs, as this node last heard.
     pub(crate) fn placement(&self, id: AgentId) -> Option<Placement> {
-        lock(&self.directory)
-            .get(&id)
-            .map(|known| known.placement.clone())
+        self.directory.get(id).map(|known| known.placement.clone())
     }
 
     /// How clients reach node `number`, from the space.
@@ -363,144 +337,6 @@ impl Inner {
         }
     }
 
-    /// Learn where an agent runs, and act on it.
-    pub(crate) fn learn(self: &Arc<Self>, record: CreationRecord, placement: Placement) {
-        let agent = record.agent;
-        lock(&self.directory).insert(agent, Arc::new(Known { record, placement }));
-        self.reconsider(agent);
-    }
-
-    /// Start the agent's group where its placement names this node, and
-    /// retire it where it no longer does: at once while this replica never
-    /// held a committed configuration naming it (a configuration that never
-    /// committed named it), else once a final configuration without it has
-    /// committed and this replica does not lead.
-    pub(crate) fn reconsider(self: &Arc<Self>, agent: AgentId) {
-        // A group stopping with the node is not started again.
-        if self.closing.load(Ordering::SeqCst) {
-            return;
-        }
-        let Some(known) = lock(&self.directory).get(&agent).cloned() else {
-            return;
-        };
-        // A member of the configuration before, while the new one has not
-        // committed, may still be needed to vote.
-        let named = known.placement.admits(self.number);
-        match self.run(agent) {
-            None if named => {
-                if known.record.program != self.program_hash {
-                    tracing::error!(
-                        agent = agent.0,
-                        "the agent runs another agent program than this node's; its group does not start here"
-                    );
-                    return;
-                }
-                self.start(known.record.clone());
-            }
-            Some(run) if !named => {
-                let state = run.shared.state();
-                // A replica a committed final placement leaves out is stale
-                // whatever it believes, its leadership included.
-                let committed_final = known.placement.committed && !known.placement.joint;
-                if !state.established || committed_final {
-                    self.retire_agent(agent);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Stop the agent's group here for good: its log, state and pins go,
-    /// in a task of their own once the group has stopped; the record, the
-    /// placement and the term and vote stay.
-    fn retire_agent(self: &Arc<Self>, agent: AgentId) {
-        let run = {
-            let mut runs = lock(&self.runs);
-            let Some(run) = runs.remove(&agent) else {
-                return;
-            };
-            lock(&self.retiring).insert(agent);
-            run
-        };
-        tracing::info!(agent = agent.0, "this node no longer replicates the agent");
-        run.agent.stop();
-        run.shared.stop();
-        run.inbox.close();
-        run.local.close();
-        let inner = Arc::clone(self);
-        self.spawn(async move {
-            let tasks = std::mem::take(&mut *lock(&run.tasks));
-            for task in tasks {
-                task.await;
-            }
-            inner.finish_retirement(agent).await;
-        });
-    }
-
-    /// Write the agent's retirement, its group stopped, then reconsider
-    /// the agent: a placement naming this node again may have come
-    /// meanwhile.
-    async fn finish_retirement(self: &Arc<Self>, agent: AgentId) {
-        self.write_retirement(agent).await;
-        lock(&self.retiring).remove(&agent);
-        self.reconsider(agent);
-    }
-
-    /// The agent's state moves to an epoch that holds no rows (not one a
-    /// snapshot was staged in), the programs it named are unpinned, and
-    /// every stale epoch is dropped.
-    async fn write_retirement(&self, agent: AgentId) {
-        let read = (|| {
-            let snapshot = self.store.snapshot();
-            let mut programs = Vec::new();
-            for row in snapshot.scan(agent, &vos_wire::keys::installed_prefix(), None) {
-                programs.push(row?.1);
-            }
-            let rows = self.store.raft(agent)?;
-            // The last log position held: the log's end, else where it
-            // starts, and no lower than a floor an earlier retirement left.
-            let mut floor = rows
-                .log
-                .last()
-                .map_or(rows.log_start, |(index, entry)| (*index, entry.term));
-            if let Some(earlier) = rows.vote_floor
-                && (earlier.1, earlier.0) > (floor.1, floor.0)
-            {
-                floor = earlier;
-            }
-            Ok::<_, fjall::Error>((group::programs(programs.iter()), rows.hard, floor))
-        })();
-        let (programs, hard, floor) = match read {
-            Ok(read) => read,
-            Err(error) => {
-                tracing::error!(agent = agent.0, "a retiring agent is unreadable: {error}");
-                return;
-            }
-        };
-        let Some(epoch) = group::empty_epoch(self, agent) else {
-            tracing::error!(agent = agent.0, "a retiring agent has no empty epoch");
-            return;
-        };
-        let mut changes = vec![Change::Retire {
-            agent,
-            epoch,
-            hard: crate::store::HardState { commit: 0, ..hard },
-            floor,
-        }];
-        changes.extend(
-            programs
-                .into_iter()
-                .map(|hash| Change::Unpin { hash, agent }),
-        );
-        let unpinned = group::unpinned(&changes);
-        if let Err(error) = self.storage.commit(changes).await {
-            tracing::error!(agent = agent.0, "an agent did not retire: {error}");
-            return;
-        }
-        self.evict(&unpinned);
-        group::drop_stale_epochs(self, agent).await;
-    }
-
     /// How long its stages took since it started: its leaders' batches'
     /// and its writer's.
     pub(crate) fn stats(&self) -> vos_wire::ingress::Stats {
@@ -549,109 +385,6 @@ impl Inner {
             outbox,
             placement_term: self.placement(agent).map_or(0, |placement| placement.term),
         })
-    }
-
-    /// Whether this node's store holds anything of `agent`'s replica: a
-    /// log, an applied index, a membership, or rows in any epoch.
-    fn holds_replica(&self, agent: AgentId) -> Result<bool, fjall::Error> {
-        let rows = self.store.raft(agent)?;
-        if !rows.log.is_empty()
-            || rows.applied > 0
-            || rows.log_start.0 > 0
-            || rows.membership.is_some()
-        {
-            return Ok(true);
-        }
-        let current = self.store.snapshot().epoch(agent)?;
-        Ok(self.store.epoch_holds_rows(agent, current)?
-            || !self.store.stale_epochs(agent)?.is_empty())
-    }
-
-    /// Take `placement`, which this node's leadership of the agent gives,
-    /// when it supersedes the one held: kept, acted on, and announced to
-    /// every other node until each holds it. False when it was not kept.
-    pub(crate) async fn place(self: &Arc<Self>, agent: AgentId, placement: Placement) -> bool {
-        let _recording = self.recording.lock().await;
-        let Some(known) = lock(&self.directory).get(&agent).cloned() else {
-            return true;
-        };
-        if !placement.supersedes(&known.placement) {
-            return true;
-        }
-        let change = Change::Placement {
-            agent,
-            placement: placement.clone(),
-        };
-        if let Err(error) = self.storage.commit(vec![change]).await {
-            tracing::warn!(agent = agent.0, "a placement was not kept: {error}");
-            return false;
-        }
-        self.learn(known.record.clone(), placement);
-        self.announce(agent);
-        true
-    }
-
-    fn start(self: &Arc<Self>, record: CreationRecord) {
-        // Under the runs' lock, which the node's shutdown takes to set
-        // `closing`: a group starts before the shutdown takes the runs, or
-        // not at all.
-        let mut runs = lock(&self.runs);
-        let id = record.agent;
-        if self.closing.load(Ordering::SeqCst) || lock(&self.retiring).contains(&id) {
-            return;
-        }
-        let shared = Arc::new(Shared::new(record));
-        let agent = Arc::new(Agent::new());
-        let (inbox, inputs) = smol::channel::bounded(GROUP_INBOX);
-        let (local, locals) = smol::channel::unbounded();
-        let guarded =
-            |name: &'static str, work: std::pin::Pin<Box<dyn Future<Output = ()> + Send>>| {
-                let shared = Arc::clone(&shared);
-                let agent = Arc::clone(&agent);
-                self.runtime.spawn(async move {
-                    if AssertUnwindSafe(work).catch_unwind().await.is_err() {
-                        tracing::error!(
-                            agent = id.0,
-                            "the agent's {name} panicked; the agent stops"
-                        );
-                        agent.stop();
-                        shared.stop();
-                    }
-                })
-            };
-        let tasks = vec![
-            guarded(
-                "group",
-                Box::pin(group::drive(
-                    Arc::clone(self),
-                    Arc::clone(&shared),
-                    inputs,
-                    locals,
-                )),
-            ),
-            guarded(
-                "applier",
-                Box::pin(group::apply(Arc::clone(self), Arc::clone(&shared))),
-            ),
-            guarded(
-                "leader",
-                Box::pin(crate::leader::lead(
-                    Arc::clone(self),
-                    Arc::clone(&agent),
-                    Arc::clone(&shared),
-                )),
-            ),
-        ];
-        runs.insert(
-            id,
-            Arc::new(Run {
-                agent,
-                shared,
-                inbox,
-                local,
-                tasks: Mutex::new(tasks),
-            }),
-        );
     }
 
     /// Hand the leader loop's `local` to agent `id`'s group. False when it
@@ -714,13 +447,19 @@ impl Inner {
         lock(&self.dry_runs).insert(id, dry_run);
     }
 
-    /// The writes of the leader's dry run of `entry`, if it ran on the
-    /// state the entry at `index` applies to: the same entry on the same
-    /// state.
-    pub(crate) fn dry_run(&self, id: AgentId, index: u64, entry: &LogEntry) -> Option<Vec<Write>> {
-        let mut dry_runs = lock(&self.dry_runs);
-        let kept = dry_runs.remove(&id)?;
-        (kept.applied + 1 == index && kept.payload == entry.payload()).then_some(kept.writes)
+    /// The writes of the leader's dry run of the result entry at `index`,
+    /// of `term` and the batch `seed`, if it ran on the state that entry
+    /// applies to.
+    pub(crate) fn dry_run(
+        &self,
+        id: AgentId,
+        index: u64,
+        term: u64,
+        seed: Option<[u8; 32]>,
+    ) -> Option<Vec<Write>> {
+        let kept = lock(&self.dry_runs).remove(&id)?;
+        (kept.applied + 1 == index && kept.term == term && Some(kept.seed) == seed)
+            .then_some(kept.writes)
     }
 
     /// Agent `id`'s group waits for `hashes`: tell it when they arrive.

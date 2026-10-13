@@ -12,9 +12,9 @@
 //! beside the current state and switched to at once: one synced batch moves
 //! the agent's epoch pointer, and reads go through it.
 //!
-//! Writes go through a [`Batch`]; the storage thread groups several agents'
-//! batches into one commit. A replicated agent appends with a sync before
-//! applying, and applies without one.
+//! Writes go through a [`Batch`]; the storage thread folds the changes of
+//! several commits, of any agents, into one. A replicated agent appends
+//! with a sync before applying, and applies without one.
 
 mod batch;
 mod keys;

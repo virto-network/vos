@@ -13,14 +13,14 @@ use vos_wire::abi::refusal;
 use vos_wire::batch::{Batch, Message, Request, Work};
 use vos_wire::ids::{AgentId, SessionId};
 use vos_wire::records::{SessionMark, unstored};
-use vos_wire::result::{Outcome, Outgoing, Step, WorkResult};
+use vos_wire::result::{Outcome, Outgoing, Step, WorkResult, Write as StateWrite};
 use vos_wire::{expiry, keys};
 
 use crate::group::{DryRun, Local, Shared, State};
-use crate::node::{Agent, Answered, CallError, Inner, Pending, Reply, ran, read, reply, seed};
+use crate::node::{Agent, Answered, CallError, Inner, Pending, Reply, ran, read, reply};
 use crate::pvm::{self, Fault};
 use crate::store::{BlobRef, EntryKind, LogEntry, Snapshot};
-use crate::{lock, timeout};
+use crate::{lock, seed, timeout};
 
 /// The first wait before retrying a batch the node failed, doubled each
 /// time up to [`MAX_BACKOFF`].
@@ -509,60 +509,7 @@ impl Leader {
                 return true;
             }
         }
-        // A message at or below its pair mark applied already: drop it and
-        // acknowledge the mark instead. One past the next is a gap, dropped
-        // for the sender's next delivery: only each sender's next in turn
-        // reaches the batch.
-        let mut acks: HashMap<AgentId, u64> = HashMap::new();
-        let mut next: HashMap<AgentId, u64> = HashMap::new();
-        // Each target's acknowledgement as applied, and where the highest
-        // one taken for it sits in the batch: one goes in, the highest.
-        let mut applied_acks: HashMap<AgentId, u64> = HashMap::new();
-        let mut taken_acks: HashMap<AgentId, usize> = HashMap::new();
-        let mut kept: Vec<Pending> = Vec::with_capacity(pending.len());
-        for item in pending.drain(..) {
-            match &item {
-                Pending::Message(message) => {
-                    let mark = self.marks[&message.from];
-                    let expected = next.entry(message.from).or_insert(mark + 1);
-                    if message.sequence <= mark {
-                        raise(&mut acks, message.from, mark);
-                        continue;
-                    }
-                    if message.sequence != *expected {
-                        continue;
-                    }
-                    *expected += 1;
-                }
-                // One no higher than the applied acknowledgement would
-                // only cost a log entry.
-                Pending::Ack { to, sequence } => {
-                    let applied = *applied_acks.entry(*to).or_insert_with(|| {
-                        read::<u64>(&snapshot, self.id, &keys::acked(*to))
-                            .ok()
-                            .flatten()
-                            .unwrap_or(0)
-                    });
-                    if *sequence <= applied {
-                        continue;
-                    }
-                    if let Some(at) = taken_acks.get(to) {
-                        if let Pending::Ack {
-                            sequence: highest, ..
-                        } = &mut kept[*at]
-                        {
-                            *highest = (*highest).max(*sequence);
-                        }
-                        continue;
-                    }
-                    taken_acks.insert(*to, kept.len());
-                }
-                _ => {}
-            }
-            kept.push(item);
-        }
-        let mut pending = kept;
-        self.acknowledge(inner, acks);
+        let mut pending = self.filter(inner, &snapshot, pending);
         let time = self.time(inner, floor);
         // First, so a batch its gas or size cuts short keeps it.
         let sweeping = first.filter(|first| self.sweeps(*first, time));
@@ -594,7 +541,7 @@ impl Leader {
             })
             .collect();
         inner.stats.prepare.took(taken.elapsed());
-        match self.execute(inner, shared, snapshot, &batch, blobs).await {
+        match self.execute(inner, shared, snapshot, batch, blobs).await {
             Ok(Ran::Done(result)) => {
                 self.skipped = false;
                 self.version += 1;
@@ -649,6 +596,65 @@ impl Leader {
         true
     }
 
+    /// What of `pending` goes into the batch, the marks of its messages'
+    /// senders read. A message at or below its pair mark applied already:
+    /// it is dropped, and the mark acknowledged instead. One past the next
+    /// is a gap, dropped for the sender's next delivery: only each sender's
+    /// next in turn goes in. Of a target's acknowledgements, the highest
+    /// goes in, if above the one applied.
+    fn filter(&self, inner: &Inner, snapshot: &Snapshot, pending: Vec<Pending>) -> Vec<Pending> {
+        let mut acks: HashMap<AgentId, u64> = HashMap::new();
+        let mut next: HashMap<AgentId, u64> = HashMap::new();
+        // Each target's acknowledgement as applied, and where the highest
+        // one taken for it sits in the batch.
+        let mut applied_acks: HashMap<AgentId, u64> = HashMap::new();
+        let mut taken_acks: HashMap<AgentId, usize> = HashMap::new();
+        let mut kept: Vec<Pending> = Vec::with_capacity(pending.len());
+        for item in pending {
+            match &item {
+                Pending::Message(message) => {
+                    let mark = self.marks[&message.from];
+                    let expected = next.entry(message.from).or_insert(mark + 1);
+                    if message.sequence <= mark {
+                        raise(&mut acks, message.from, mark);
+                        continue;
+                    }
+                    if message.sequence != *expected {
+                        continue;
+                    }
+                    *expected += 1;
+                }
+                // One no higher than the applied acknowledgement would
+                // only cost a log entry.
+                Pending::Ack { to, sequence } => {
+                    let applied = *applied_acks.entry(*to).or_insert_with(|| {
+                        read::<u64>(snapshot, self.id, &keys::acked(*to))
+                            .ok()
+                            .flatten()
+                            .unwrap_or(0)
+                    });
+                    if *sequence <= applied {
+                        continue;
+                    }
+                    if let Some(at) = taken_acks.get(to) {
+                        if let Pending::Ack {
+                            sequence: highest, ..
+                        } = &mut kept[*at]
+                        {
+                            *highest = (*highest).max(*sequence);
+                        }
+                        continue;
+                    }
+                    taken_acks.insert(*to, kept.len());
+                }
+                _ => {}
+            }
+            kept.push(item);
+        }
+        self.acknowledge(inner, acks);
+        kept
+    }
+
     /// A batch's time: the node's clock, held at the agent's time, `floor`,
     /// while the clock trails it. Leadership stays: every replica would
     /// trail an agent a fast clock once led.
@@ -678,48 +684,15 @@ impl Leader {
         inner: &Inner,
         shared: &Shared,
         snapshot: Arc<Snapshot>,
-        batch: &Batch,
+        batch: Batch,
         blobs: Vec<BlobRef>,
     ) -> Result<Ran, Fault> {
         let id = self.id;
         let started = Instant::now();
-        inner.stats.batch_inputs.record(batch.inputs.len() as u64);
-        let program = Arc::clone(&inner.program);
-        let pool = Arc::clone(&inner.pool);
-        let store_blobs = inner.blobs.clone();
-        let refined = batch.clone();
-        let hooks = Arc::clone(&inner.hooks);
-        let gas = inner.settings.refine_gas;
-        let state = Arc::clone(&snapshot);
-        let queued = Instant::now();
-        let (output, refine_gas) = ran(inner
-            .executors
-            .run(move || {
-                let running = Instant::now();
-                if hooks.fail_refine(id, &refined) {
-                    let failed = Err(Fault::Agent("a hook failed the refine".into()));
-                    return (failed, [queued, running, Instant::now()]);
-                }
-                let output = pvm::refine(
-                    &program,
-                    &pool,
-                    &store_blobs,
-                    state,
-                    id,
-                    &Work::Batch(refined),
-                    gas,
-                );
-                (output, [queued, running, Instant::now()])
-            })
-            .await
-            .map(|(output, [queued, running, finished])| {
-                inner.stats.refine_queue.took(running - queued);
-                inner.stats.refine.took(finished - running);
-                inner.stats.resume.took(finished.elapsed());
-                output
-            }))?;
+        let inputs = batch.inputs.len() as u64;
+        inner.stats.batch_inputs.record(inputs);
+        let (output, refine_gas, batch) = self.refine(inner, Arc::clone(&snapshot), batch).await?;
         let result: WorkResult = pvm::decode(&output)?;
-        let inputs = batch.inputs.len().max(1) as u64;
         let step_gas: u64 = result
             .steps
             .iter()
@@ -728,34 +701,19 @@ impl Leader {
                 Step::Refused { .. } | Step::Swept { .. } => 0,
             })
             .sum();
-        inner.stats.refine_gas.record(refine_gas / inputs);
-        inner.stats.step_gas.record(step_gas / inputs);
+        inner.stats.refine_gas.record(refine_gas / inputs.max(1));
+        inner.stats.step_gas.record(step_gas / inputs.max(1));
+        let entry = LogEntry {
+            term: 0,
+            kind: EntryKind::Result,
+            blobs,
+            body: output,
+        };
+        let payload = entry.payload();
         // The dry run: a failure here isolates its input off the log.
-        let program = Arc::clone(&inner.program);
-        let gas = shared.record.accumulate_gas;
-        let applied = output.clone();
-        let state = Arc::clone(&snapshot);
-        let hooks = Arc::clone(&inner.hooks);
-        let dried = batch.clone();
-        let queued = Instant::now();
-        let writes = ran(inner
-            .executors
-            .run(move || {
-                let running = Instant::now();
-                if hooks.fail_dry_run(id, &dried) {
-                    let failed = Err(Fault::Agent("a hook failed accumulate".into()));
-                    return (failed, [queued, running, Instant::now()]);
-                }
-                let writes = pvm::accumulate(&program, state, id, applied, gas);
-                (writes, [queued, running, Instant::now()])
-            })
-            .await
-            .map(|(writes, [queued, running, finished])| {
-                inner.stats.dry_run_queue.took(running - queued);
-                inner.stats.dry_run.took(finished - running);
-                inner.stats.resume.took(finished.elapsed());
-                writes
-            }))?;
+        let writes = self
+            .dry_run(inner, shared, snapshot, batch, entry.body)
+            .await?;
         let version = writes
             .iter()
             .find(|write| write.key == keys::version())
@@ -769,18 +727,12 @@ impl Leader {
                 self.version
             )));
         }
-        let entry = LogEntry {
-            term: 0,
-            kind: EntryKind::Result,
-            blobs,
-            body: output,
-        };
-        let payload = entry.payload();
         inner.keep_dry_run(
             id,
             DryRun {
                 applied: self.applied,
-                payload: payload.clone(),
+                term: self.term,
+                seed: result.seed,
                 writes,
             },
         );
@@ -854,6 +806,81 @@ impl Leader {
             Some(true) => Ok(Ran::Done(result)),
             _ => Ok(Ran::Skipped),
         }
+    }
+
+    /// Refine `batch` on an executor, unless the refine hook fails it: its
+    /// output and gas, with the batch back for the dry run's hook.
+    async fn refine(
+        &self,
+        inner: &Inner,
+        snapshot: Arc<Snapshot>,
+        batch: Batch,
+    ) -> Result<(Vec<u8>, u64, Batch), Fault> {
+        let id = self.id;
+        let program = Arc::clone(&inner.program);
+        let pool = Arc::clone(&inner.pool);
+        let blobs = inner.blobs.clone();
+        let hooks = Arc::clone(&inner.hooks);
+        let gas = inner.settings.refine_gas;
+        let queued = Instant::now();
+        let refined = inner
+            .executors
+            .run(move || {
+                let running = Instant::now();
+                if hooks.fail_refine(id, &batch) {
+                    let failed = Err(Fault::Agent("a hook failed the refine".into()));
+                    return (failed, [queued, running, Instant::now()]);
+                }
+                let work = Work::Batch(batch);
+                let output = pvm::refine(&program, &pool, &blobs, snapshot, id, &work, gas);
+                let Work::Batch(batch) = work else {
+                    unreachable!("a batch's work")
+                };
+                let output = output.map(|(output, gas)| (output, gas, batch));
+                (output, [queued, running, Instant::now()])
+            })
+            .await;
+        ran(refined.map(|(output, [queued, running, finished])| {
+            inner.stats.refine_queue.took(running - queued);
+            inner.stats.refine.took(finished - running);
+            inner.stats.resume.took(finished.elapsed());
+            output
+        }))
+    }
+
+    /// Accumulate `result` on `snapshot` on an executor, unless the dry
+    /// run's hook fails `batch`: the writes applying it would make.
+    async fn dry_run(
+        &self,
+        inner: &Inner,
+        shared: &Shared,
+        snapshot: Arc<Snapshot>,
+        batch: Batch,
+        result: Vec<u8>,
+    ) -> Result<Vec<StateWrite>, Fault> {
+        let id = self.id;
+        let program = Arc::clone(&inner.program);
+        let hooks = Arc::clone(&inner.hooks);
+        let gas = shared.record.accumulate_gas;
+        let queued = Instant::now();
+        let dried = inner
+            .executors
+            .run(move || {
+                let running = Instant::now();
+                if hooks.fail_dry_run(id, &batch) {
+                    let failed = Err(Fault::Agent("a hook failed accumulate".into()));
+                    return (failed, [queued, running, Instant::now()]);
+                }
+                let writes = pvm::accumulate(&program, snapshot, id, result, gas);
+                (writes, [queued, running, Instant::now()])
+            })
+            .await;
+        ran(dried.map(|(writes, [queued, running, finished])| {
+            inner.stats.dry_run_queue.took(running - queued);
+            inner.stats.dry_run.took(finished - running);
+            inner.stats.resume.took(finished.elapsed());
+            writes
+        }))
     }
 
     /// A batch the node failed: put it back whole and wait before the next

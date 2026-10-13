@@ -23,12 +23,17 @@ const BACKOFF: Duration = Duration::from_millis(50);
 const MAX_BACKOFF: Duration = Duration::from_secs(5);
 
 /// A leader's accumulate of its own result, run before proposing it, kept
-/// so the apply of that entry need not run it again.
+/// so the apply of that entry need not run it again. It matches the result
+/// entry right after the state's index, of the proposing leader's term,
+/// carrying the batch's seed: a leader loop proposes its next result only
+/// once the last one applied or was refused.
 pub(crate) struct DryRun {
     /// The applied index the state was at.
     pub applied: u64,
-    /// The entry's payload, which the applied entry must equal.
-    pub payload: Vec<u8>,
+    /// The term of the leader proposing the result.
+    pub term: u64,
+    /// The seed of the batch the result is of.
+    pub seed: [u8; 32],
     pub writes: Vec<StateWrite>,
 }
 
@@ -99,17 +104,21 @@ async fn apply_one(inner: &Arc<Inner>, shared: &Shared, index: u64) -> Result<()
     let mut rest = Vec::new();
     let writes = match entry.kind {
         EntryKind::Result => {
+            let result = WorkResult::decode(&entry.body)
+                .ok()
+                .map(|(result, _)| result);
             let writes = if inner.hooks.fail_apply(agent, index, &entry.body) {
                 Vec::new()
             } else {
-                match inner.dry_run(agent, index, &entry) {
+                let seed = result.as_ref().map(|result| result.seed);
+                match inner.dry_run(agent, index, entry.term, seed) {
                     Some(writes) => writes,
                     None => accumulate(inner, shared, &snapshot, &entry, index).await?,
                 }
             };
             let took = writes.iter().any(|write| write.key == keys::version());
             shared.record_outcome(index, took);
-            if let Ok((result, _)) = WorkResult::decode(&entry.body) {
+            if let Some(result) = result {
                 rest.push(Change::LastResult {
                     agent,
                     time: result.time,

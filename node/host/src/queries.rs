@@ -3,20 +3,19 @@
 //! through a read index from the agent's leader, which then holds every
 //! call answered before the query.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use smol::future::FutureExt;
 use vos_net::Class;
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal};
 use vos_wire::ingress::{Answer, Consistency, Rejection};
 use vos_wire::peer::{NodeNumber, PeerMessage};
 
+use crate::asking::pause;
 use crate::calls::answer_of;
-use crate::node::{CallError, Inner, Run, random_u64};
+use crate::node::{CallError, Inner, Run};
 use crate::peer::{self, Refusal};
-use crate::{lock, timeout};
+use crate::timeout;
 
 /// How long a query waits for its replica to apply through the index it
 /// asks for.
@@ -28,15 +27,6 @@ const REASK: Duration = Duration::from_secs(2);
 /// How long it waits, for a change of leader, before it asks again a leader
 /// that could not answer.
 const PAUSE: Duration = Duration::from_millis(100);
-
-#[derive(Default)]
-pub(crate) struct Reads {
-    /// The read indexes this replica asked its leaders for, by token.
-    asked: Mutex<HashMap<u64, Asked>>,
-}
-
-/// A read index asked for `agent`'s group, and where its answer goes.
-type Asked = (AgentId, smol::channel::Sender<Option<u64>>);
 
 impl Inner {
     /// A client's query, its signature checked: run on this replica's
@@ -83,22 +73,7 @@ impl Inner {
         agent: AgentId,
     ) -> Result<u64, Answer> {
         let until = Instant::now() + READING;
-        let token = random_u64();
-        let (answer, answered) = smol::channel::unbounded();
-        lock(&self.reads.asked).insert(token, (agent, answer));
-        let index = self.asking(run, agent, token, &answered, until).await;
-        lock(&self.reads.asked).remove(&token);
-        index
-    }
-
-    async fn asking(
-        self: &Arc<Self>,
-        run: &Arc<Run>,
-        agent: AgentId,
-        token: u64,
-        answered: &smol::channel::Receiver<Option<u64>>,
-        until: Instant,
-    ) -> Result<u64, Answer> {
+        let wait = self.reads.register(agent);
         loop {
             let left = until.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -119,8 +94,7 @@ impl Inner {
                     Ok(index) => return Ok(index),
                     Err(CallError::Stopped) => return Err(Answer::Stopped),
                     Err(_) => {
-                        let left = until.saturating_duration_since(Instant::now());
-                        timeout(PAUSE.min(left), run.shared.wait(changed)).await;
+                        pause(run, PAUSE, until, changed).await;
                         continue;
                     }
                 }
@@ -132,22 +106,17 @@ impl Inner {
             self.send(
                 to,
                 Class::Requests,
-                &PeerMessage::ReadIndex { agent, token },
+                &PeerMessage::ReadIndex {
+                    agent,
+                    token: wait.token,
+                },
             );
-            let answer = async { answered.recv().await.ok() };
-            let moved = async {
-                run.shared.wait(changed).await;
-                None
-            };
-            match timeout(REASK.min(left), answer.or(moved)).await.flatten() {
+            match wait.within(REASK.min(left), run.shared.wait(changed)).await {
                 Some(Some(index)) => return Ok(index),
                 // It could not confirm it leads, now: again once this
                 // replica follows another leader, or at the pace of a quiet
                 // one, as it may only be busy.
-                Some(None) => {
-                    let left = until.saturating_duration_since(Instant::now());
-                    timeout(REASK.min(left), run.shared.wait(changed)).await;
-                }
+                Some(None) => pause(run, REASK, until, changed).await,
                 None => {}
             }
         }
@@ -173,30 +142,6 @@ impl Inner {
                 },
             );
         });
-    }
-
-    /// The leader's answer to a read index this replica asked for.
-    pub(crate) fn on_read_index_answer(
-        &self,
-        from: NodeNumber,
-        agent: AgentId,
-        token: u64,
-        index: Option<u64>,
-    ) {
-        if let Err(refusal) = self.check_replica(agent, from) {
-            self.drops.count(refusal);
-            return;
-        }
-        let waiting = lock(&self.reads.asked)
-            .get(&token)
-            .filter(|(asked, _)| *asked == agent)
-            .map(|(_, waiting)| waiting.clone());
-        match waiting {
-            Some(waiting) => {
-                let _ = waiting.try_send(index);
-            }
-            None => self.drops.count(Refusal::Unmatched),
-        }
     }
 
     /// That `from` replicates `agent`.

@@ -22,7 +22,6 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::{Signature, VerifyingKey};
-use smol::future::FutureExt;
 use vos_net::Class;
 use vos_wire::batch::Request;
 use vos_wire::ids::{AgentId, Principal, Session, SessionId};
@@ -32,8 +31,8 @@ use vos_wire::records::{SessionMark, unstored};
 use vos_wire::result::Outcome;
 use vos_wire::{Decode, defaults, keys};
 
-use crate::node::{Answered, CallError, Inner, Reply, Run, random_u64};
-use crate::peer::Refusal;
+use crate::asking::{Waits, pause};
+use crate::node::{Answered, CallError, Inner, Reply, Run};
 use crate::{lock, timeout};
 
 /// How long a forwarded call may take: its re-forwards, and the wait for
@@ -59,9 +58,9 @@ struct Lane {
 #[derive(Default)]
 pub(crate) struct Calls {
     lanes: Mutex<HashMap<(AgentId, Session), Lane>>,
-    /// The calls this replica forwarded, by token, each waiting for its
-    /// answer.
-    forwards: Mutex<HashMap<u64, smol::channel::Sender<(u64, Answer)>>>,
+    /// The calls this replica forwarded, each waiting for its answer and
+    /// the term it came at.
+    pub(crate) forwards: Waits<(u64, Answer)>,
     /// The forwarded calls running here, by the replica that forwarded
     /// them, each by its token: a call forwarded again while it runs is
     /// answered once, when it ends.
@@ -438,25 +437,7 @@ impl Inner {
     /// then answer once this replica has applied it.
     async fn forward(self: &Arc<Self>, run: &Arc<Run>, agent: AgentId, call: Call) -> Answer {
         let until = Instant::now() + FORWARDING;
-        let token = random_u64();
-        let (answer, answered) = smol::channel::unbounded::<(u64, Answer)>();
-        lock(&self.calls.forwards).insert(token, answer);
-        let answer = self
-            .forwarding(run, agent, &call, token, &answered, until)
-            .await;
-        lock(&self.calls.forwards).remove(&token);
-        answer
-    }
-
-    async fn forwarding(
-        self: &Arc<Self>,
-        run: &Arc<Run>,
-        agent: AgentId,
-        call: &Call,
-        token: u64,
-        answered: &smol::channel::Receiver<(u64, Answer)>,
-        until: Instant,
-    ) -> Answer {
+        let wait = self.calls.forwards.register(agent);
         // How many times the call went: once it went before, nothing the
         // leader answers short of running it says it never ran.
         let mut sent = 0;
@@ -474,7 +455,7 @@ impl Inner {
             }
             // This replica leads now: the call runs in its own lane.
             if lock(&run.agent.queue).leading {
-                return self.lane_call(agent, call.clone()).await;
+                return self.lane_call(agent, call).await;
             }
             // The leader this replica follows, or one named at a later term
             // until this replica's own core reaches it.
@@ -502,19 +483,14 @@ impl Inner {
                 Class::Requests,
                 &PeerMessage::Forward {
                     agent,
-                    token,
+                    token: wait.token,
                     term,
                     call: call.clone(),
                 },
             );
-            let answer = async { answered.recv().await.ok() };
-            let moved = async {
-                run.shared.wait(changed).await;
-                None
-            };
-            match timeout(REFORWARD.min(left), answer.or(moved))
+            match wait
+                .within(REFORWARD.min(left), run.shared.wait(changed))
                 .await
-                .flatten()
             {
                 // A node that leads at a later term than this replica
                 // knows, or knows who does: there, at once. One at an
@@ -533,8 +509,7 @@ impl Inner {
                         .filter(|leader| *leader != self.number)
                         .map(|leader| (leader, answered_at));
                     if named.is_none() {
-                        let left = until.saturating_duration_since(Instant::now());
-                        timeout(PAUSE.min(left), run.shared.wait(changed)).await;
+                        pause(run, PAUSE, until, changed).await;
                     }
                 }
                 Some((_, Answer::Ran { outcome, at })) => {
@@ -561,18 +536,12 @@ impl Inner {
                     | Answer::Elsewhere { .. }
                     | Answer::Stopped
                     | Answer::Unavailable,
-                )) => {
-                    let left = until.saturating_duration_since(Instant::now());
-                    timeout(PAUSE.min(left), run.shared.wait(changed)).await;
-                }
+                )) => pause(run, PAUSE, until, changed).await,
                 // The leader is full: at the first send nothing ran, and
                 // the client may wait and send again. After that, an
                 // earlier send may be running elsewhere: wait here.
                 Some((_, Answer::Busy)) if sent == 1 => return Answer::Busy,
-                Some((_, Answer::Busy)) => {
-                    let left = until.saturating_duration_since(Instant::now());
-                    timeout(REFORWARD.min(left), run.shared.wait(changed)).await;
-                }
+                Some((_, Answer::Busy)) => pause(run, REFORWARD, until, changed).await,
                 // Answers that say the call did not run, about one send of
                 // several: another may still run it.
                 Some((
@@ -678,29 +647,6 @@ impl Inner {
                 },
             );
         });
-    }
-
-    /// The leader's answer to a call this replica forwarded, from a replica
-    /// of `agent`.
-    pub(crate) fn on_forwarded(
-        &self,
-        from: NodeNumber,
-        agent: AgentId,
-        token: u64,
-        term: u64,
-        answer: Answer,
-    ) {
-        if let Err(refusal) = self.check_replica(agent, from) {
-            self.drops.count(refusal);
-            return;
-        }
-        let waiting = lock(&self.calls.forwards).get(&token).cloned();
-        match waiting {
-            Some(waiting) => {
-                let _ = waiting.try_send((term, answer));
-            }
-            None => self.drops.count(Refusal::Unmatched),
-        }
     }
 }
 

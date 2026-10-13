@@ -17,8 +17,9 @@ use vos_wire::peer::{NodeNumber, PeerMessage, Placement};
 
 use super::snapshot::{INSTALL_IDLE, STREAM_HOLD};
 use super::{Driver, Input, Local, Shared};
-use crate::node::{Inner, random_u64};
+use crate::node::Inner;
 use crate::raft::{self, EntryReports};
+use crate::random_u64;
 use crate::storage::Change;
 
 /// How long a group waits for blobs it asked for before asking again,
@@ -106,7 +107,7 @@ impl Driver {
             asked: None,
             turn: 0,
             retired: false,
-            stalled: false,
+            handing_over: false,
             shipments: HashMap::new(),
             install: None,
             install_missing: Vec::new(),
@@ -115,8 +116,6 @@ impl Driver {
             compact_due: false,
             memberships: HashMap::new(),
             announced: None,
-            announcing: None,
-            led: false,
             inner,
             shared,
         })
@@ -258,11 +257,7 @@ impl Driver {
                 Local::ChangeMembership { answer, .. } => {
                     let _ = answer.try_send(Err(ChangeMembershipError::Stopped));
                 }
-                Local::Retire
-                | Local::StreamEnded { .. }
-                | Local::Probe(_)
-                | Local::Wake
-                | Local::Placed { .. } => {}
+                Local::Retire | Local::StreamEnded { .. } | Local::Probe(_) | Local::Wake => {}
             }
         }
         for (_, answer) in self.proposals.drain() {
@@ -320,17 +315,6 @@ impl Driver {
             Local::Retire => self.retired = true,
             Local::Probe(node) => self.core.probe(node),
             Local::Wake => {}
-            Local::Placed { order, kept } => {
-                if self.announcing == Some(order) {
-                    self.announcing = None;
-                }
-                // One not kept is tried again the next round. An answer
-                // for an earlier run of the group is no concern of a run
-                // that never led.
-                if kept && self.led {
-                    self.announced = Some(self.announced.map_or(order, |held| held.max(order)));
-                }
-            }
             Local::ReadIndex { answer } => {
                 let token = self.next_token;
                 self.next_token += 1;
@@ -382,14 +366,14 @@ impl Driver {
         }
     }
 
-    /// Tell the core whether its writer is stalled. A replica whose leader
-    /// loop stopped for good (`retired`) is reported as stalled on purpose:
-    /// the core then hands leadership over and does not campaign.
+    /// Tell the core whether to hand leadership over and not campaign, as
+    /// it does while its writer is stalled. A replica whose leader loop
+    /// stopped for good (`retired`) is reported as stalled on purpose.
     fn report_health(&mut self) {
-        let stalled = self.retired || self.inner.storage.stalled();
-        if stalled != self.stalled {
-            self.stalled = stalled;
-            self.core.writer_health(stalled);
+        let handing_over = self.retired || self.inner.storage.stalled();
+        if handing_over != self.handing_over {
+            self.handing_over = handing_over;
+            self.core.writer_health(handing_over);
         }
     }
 
@@ -475,8 +459,6 @@ impl Driver {
                 // A leadership's streams end with it.
                 if role != Role::Leader {
                     self.shipments.clear();
-                } else {
-                    self.led = true;
                 }
                 // Becoming leader, the core appended its term's no-op last.
                 let leading_from =
@@ -493,8 +475,7 @@ impl Driver {
                     // rather than leave it to the next leader's election.
                     let status = self.core.status();
                     let me = self.inner.number;
-                    let removed = self.led
-                        && (self.announced.is_some() || self.announcing.is_some())
+                    let removed = self.announced.is_some()
                         && status.joint_old.is_none()
                         && !status.members.contains(&me)
                         && status.commit_index >= status.active_config_index.unwrap_or(0);
@@ -502,7 +483,6 @@ impl Driver {
                         self.announce_placement().await;
                     }
                     self.announced = None;
-                    self.announcing = None;
                     // It retires once it steps down; a group stopping does
                     // not.
                     if !self.shared.state().stopped {
@@ -607,9 +587,9 @@ impl Driver {
         replicas.sort_unstable();
         replicas.dedup();
         // The configuration before, or, once that is compacted away, the
-        // log's first, which may be this one. It matters while a placement is uncommitted, and
-        // names a leader the change removed: the core keeps it until the
-        // removal is confirmed.
+        // log's first, which may be this one. It matters while a placement
+        // is uncommitted, and names a leader the change removed, which
+        // leads until the configuration without it commits.
         let before = if index == 0 {
             Vec::new()
         } else {
@@ -633,20 +613,14 @@ impl Driver {
             committed: status.commit_index >= index,
         };
         let order = placement.order();
-        if self.announced == Some(order) || self.announcing == Some(order) {
+        if self.announced == Some(order) {
             return;
         }
-        self.announcing = Some(order);
+        self.announced = Some(order);
         let inner = Arc::clone(&self.inner);
         let agent = self.shared.agent;
-        // The answer goes to whichever run of the agent's group is there
-        // then. A later run that has led, at a later term, takes it as one
-        // more placement known kept, which changes nothing it announces; a
-        // later run that never led ignores it.
-        self.inner.spawn(async move {
-            let kept = inner.place(agent, placement).await;
-            inner.propose(agent, Local::Placed { order, kept });
-        });
+        self.inner
+            .spawn(async move { inner.place(agent, placement).await });
     }
 
     /// Ask for the blobs the group's entries wait for: the leader first,

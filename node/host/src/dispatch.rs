@@ -1,82 +1,24 @@
 //! What arrives from the space's other nodes: each frame checked, then
 //! routed to its agent's group, or handled by the node itself (the
 //! directory, and blobs).
-//!
-//! The directory: where each agent runs. The node that creates an agent
-//! sends its record and first placement to every node of the space, and
-//! the agent's leader sends each new placement as its replicas change,
-//! again every second until each node acknowledges holding it durably. A
-//! node keeps the newest placement by its order (the announcing leader's
-//! term, then the configuration's index), and a record that differs from
-//! the one held for its agent is refused, never written over.
-//!
-//! An announcer can stop before every member holds its placement, and
-//! then no one sends it. So a node sent Raft traffic for an agent it runs
-//! no group for asks the sender, which answers with the record and the
-//! placement it holds if that names the asker: a member that missed its
-//! placement learns it once its group needs it, a vote or entries.
 
-use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use smol::future::FutureExt;
 use vos_net::{Arrivals, Class, Incoming};
 use vos_wire::Encode;
 use vos_wire::ids::AgentId;
-use vos_wire::peer::{CreationRecord, NodeNumber, PeerMessage, Placement};
+use vos_wire::peer::{NodeNumber, PeerMessage};
 
 use crate::group::Input;
-use crate::node::{Inner, Order};
+use crate::node::Inner;
 use crate::peer;
-use crate::storage::Change;
 use crate::store::BlobRef;
-use crate::{lock, timeout};
+use crate::timeout;
 
-/// How often unacknowledged records are sent again.
-const RESEND: Duration = Duration::from_secs(1);
-/// How long the operator's creation waits for a majority of the replicas.
-const MAJORITY: Duration = Duration::from_secs(30);
 /// How long a blob being served waits for room in its peer's queue.
 const BLOB_ROOM: Duration = Duration::from_secs(5);
-/// How often a node asks one peer for one agent's record.
-const ASK_EVERY: Duration = Duration::from_secs(1);
-/// The asks kept before those past [`ASK_EVERY`] are forgotten.
-const ASKS_KEPT: usize = 1024;
-
-/// Whether a node sent Raft traffic for an agent asks the sender for its
-/// record: when it runs no group for the agent, and the placement it
-/// holds, if any, leaves it out (a newer one may name it); at most once
-/// every [`ASK_EVERY`] per agent and peer. A group's full inbox does not
-/// ask, and nor does a replica whose placement names it but which runs no
-/// group (one refused for another agent program).
-pub(crate) fn should_ask(
-    held: Option<&Placement>,
-    has_group: bool,
-    me: NodeNumber,
-    last: Option<Instant>,
-    now: Instant,
-) -> bool {
-    !has_group
-        && !held.is_some_and(|placement| placement.admits(me))
-        && last.is_none_or(|last| now.saturating_duration_since(last) >= ASK_EVERY)
-}
-
-/// Whether node `me`, holding `placement`, answers `asker`'s request for
-/// the agent's record: when it names the asker (a creation's placement is
-/// its record's replicas, committed), and `me` is one the asker takes a
-/// placement from, a node of it or of the configuration before.
-pub(crate) fn should_answer(placement: &Placement, asker: NodeNumber, me: NodeNumber) -> bool {
-    placement.admits(asker) && (placement.replicas.contains(&me) || placement.before.contains(&me))
-}
-
-/// Forget the asks older than [`ASK_EVERY`], once more than [`ASKS_KEPT`]
-/// are kept.
-pub(crate) fn trim_asks(asked: &mut HashMap<(AgentId, NodeNumber), Instant>, now: Instant) {
-    if asked.len() > ASKS_KEPT {
-        asked.retain(|_, at| now.saturating_duration_since(*at) < ASK_EVERY);
-    }
-}
 
 /// Take arrivals until the network closes. Work that waits on a group or
 /// a quorum runs in a task of its own, so the frames behind it are not
@@ -101,46 +43,6 @@ async fn take(arrivals: &Arrivals) -> Option<(Class, Incoming)> {
         .or(on(Class::Requests, &arrivals.requests))
         .or(on(Class::Bulk, &arrivals.bulk))
         .await
-}
-
-/// Send unacknowledged placements again until each node holds them.
-pub(crate) async fn resend_records(inner: Arc<Inner>) {
-    loop {
-        smol::Timer::after(RESEND).await;
-        // Every node runs this, a space of one too.
-        inner.halt_if_store_failed();
-        let pending: Vec<(AgentId, Order, Vec<NodeNumber>)> = lock(&inner.unacknowledged)
-            .iter()
-            .map(|(agent, (order, nodes))| (*agent, *order, nodes.iter().copied().collect()))
-            .collect();
-        for (agent, announced, nodes) in pending {
-            let known = lock(&inner.directory).get(&agent).cloned();
-            // A placement held since from elsewhere is its sender's to
-            // announce: this node may not even be one that may send it.
-            if known
-                .as_ref()
-                .is_some_and(|known| known.placement.order() != announced)
-            {
-                let mut unacknowledged = lock(&inner.unacknowledged);
-                if unacknowledged
-                    .get(&agent)
-                    .is_some_and(|(order, _)| *order == announced)
-                {
-                    unacknowledged.remove(&agent);
-                }
-                continue;
-            }
-            if let Some(known) = known {
-                let message = PeerMessage::Directory {
-                    record: known.record.clone(),
-                    placement: known.placement.clone(),
-                };
-                for node in nodes {
-                    inner.send(node, Class::Requests, &message);
-                }
-            }
-        }
-    }
 }
 
 impl Inner {
@@ -259,13 +161,13 @@ impl Inner {
                 token,
                 term,
                 answer,
-            } => self.on_forwarded(from, agent, token, term, answer),
+            } => self.on_answer(&self.calls.forwards, from, agent, token, (term, answer)),
             PeerMessage::ReadIndex { agent, token } => self.on_read_index(from, agent, token),
             PeerMessage::ReadIndexAnswer {
                 agent,
                 token,
                 index,
-            } => self.on_read_index_answer(from, agent, token, index),
+            } => self.on_answer(&self.reads, from, agent, token, index),
             PeerMessage::Deliver {
                 to,
                 message,
@@ -347,323 +249,5 @@ impl Inner {
             Ok(()) => self.arrived(&hash),
             Err(error) => tracing::warn!("a blob from a peer was not stored: {error}"),
         }
-    }
-
-    /// Keep a placement newer than the one held, with its record, durably,
-    /// act on it, then acknowledge it, saying whether this node could run
-    /// the agent's program.
-    async fn on_directory(
-        self: &Arc<Self>,
-        from: NodeNumber,
-        record: CreationRecord,
-        placement: Placement,
-    ) {
-        // A store that failed takes nothing more, and its node does not
-        // acknowledge: the sender's resends are dropped quietly.
-        if self.storage.failed() {
-            return;
-        }
-        let agent = record.agent;
-        let order = placement.order();
-        let recording = self.recording.lock().await;
-        let known = lock(&self.directory).get(&agent).cloned();
-        if known.as_ref().is_some_and(|known| known.record != record) {
-            tracing::error!(
-                from,
-                agent = agent.0,
-                "a record differs from the one held for its agent; refused"
-            );
-            return;
-        }
-        if known
-            .as_ref()
-            .is_none_or(|known| placement.supersedes(&known.placement))
-        {
-            let mut changes = vec![Change::Placement {
-                agent,
-                placement: placement.clone(),
-            }];
-            if known.is_none() {
-                changes.insert(0, Change::Agent(record.clone()));
-            }
-            if let Err(error) = self.storage.commit(changes).await {
-                tracing::error!(agent = agent.0, "a placement was not stored: {error}");
-                return;
-            }
-            self.learn(record.clone(), placement);
-        }
-        drop(recording);
-        self.send(
-            from,
-            Class::Requests,
-            &PeerMessage::DirectoryAck {
-                agent,
-                order,
-                runs: record.program == self.program_hash,
-            },
-        );
-    }
-
-    /// Ask `from`, whose group sent Raft traffic for `agent` that found no
-    /// room here, for the agent's record and placement, as [`should_ask`]
-    /// says.
-    fn ask_for_record(&self, from: NodeNumber, agent: AgentId, has_group: bool) {
-        let held = lock(&self.directory)
-            .get(&agent)
-            .map(|known| known.placement.clone());
-        let now = Instant::now();
-        {
-            let mut asked = lock(&self.asked);
-            let last = asked.get(&(agent, from)).copied();
-            if !should_ask(held.as_ref(), has_group, self.number, last, now) {
-                return;
-            }
-            asked.insert((agent, from), now);
-            trim_asks(&mut asked, now);
-        }
-        self.send(
-            from,
-            Class::Requests,
-            &PeerMessage::DirectoryRequest { agent },
-        );
-    }
-
-    /// Answer `from`'s request for `agent`'s record with the record and
-    /// placement held here, if the placement names it: an ordinary record,
-    /// acknowledged as any. It is sent once; the asker asks again.
-    fn on_request(&self, from: NodeNumber, agent: AgentId) {
-        let Some(known) = lock(&self.directory).get(&agent).cloned() else {
-            return;
-        };
-        if !should_answer(&known.placement, from, self.number) {
-            return;
-        }
-        self.send(
-            from,
-            Class::Requests,
-            &PeerMessage::Directory {
-                record: known.record.clone(),
-                placement: known.placement.clone(),
-            },
-        );
-    }
-
-    fn on_ack(&self, from: NodeNumber, agent: AgentId, order: Order, runs: bool) {
-        let mut unacknowledged = lock(&self.unacknowledged);
-        if let Some((announced, nodes)) = unacknowledged.get_mut(&agent)
-            && order >= *announced
-        {
-            nodes.remove(&from);
-            if nodes.is_empty() {
-                unacknowledged.remove(&agent);
-            }
-        }
-        drop(unacknowledged);
-        {
-            let mut refusing = lock(&self.refusing);
-            let nodes = refusing.entry(agent).or_default();
-            if runs {
-                nodes.remove(&from);
-            } else {
-                nodes.insert(from);
-            }
-        }
-        if let Some(waiting) = lock(&self.capable).remove(&(agent, from)) {
-            let _ = waiting.try_send(runs);
-        }
-        self.acknowledged.notify(usize::MAX);
-    }
-
-    /// Send where `agent` runs, with its record, to every other node, and
-    /// keep sending it until each acknowledges it.
-    pub(crate) fn announce(&self, agent: AgentId) {
-        let Some(known) = lock(&self.directory).get(&agent).cloned() else {
-            return;
-        };
-        let others: BTreeSet<NodeNumber> = self
-            .space
-            .as_ref()
-            .map(|space| space.numbers())
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|node| *node != self.number)
-            .collect();
-        if others.is_empty() {
-            return;
-        }
-        let order = known.placement.order();
-        let message = PeerMessage::Directory {
-            record: known.record.clone(),
-            placement: known.placement.clone(),
-        };
-        for node in &others {
-            self.send(*node, Class::Requests, &message);
-        }
-        lock(&self.unacknowledged).insert(agent, (order, others));
-    }
-
-    /// Whether `node` could run `agent`'s program, as it answers when sent
-    /// where the agent runs: false when it does not answer in `within`.
-    pub(crate) async fn could_run(
-        &self,
-        agent: AgentId,
-        node: NodeNumber,
-        within: Duration,
-    ) -> bool {
-        let Some(known) = lock(&self.directory).get(&agent).cloned() else {
-            return false;
-        };
-        let (answer, answered) = smol::channel::bounded(1);
-        lock(&self.capable).insert((agent, node), answer);
-        let message = PeerMessage::Directory {
-            record: known.record.clone(),
-            placement: known.placement.clone(),
-        };
-        let until = Instant::now() + within;
-        let runs = loop {
-            self.send(node, Class::Requests, &message);
-            let quiet = RESEND.min(until.saturating_duration_since(Instant::now()));
-            if let Some(runs) = timeout(quiet, answered.recv()).await.and_then(Result::ok) {
-                break runs;
-            }
-            if Instant::now() >= until {
-                break false;
-            }
-        };
-        lock(&self.capable).remove(&(agent, node));
-        runs
-    }
-
-    /// Wait until a majority of `record`'s replicas hold it durably: false
-    /// when they do not within [`MAJORITY`].
-    pub(crate) async fn held_by_majority(&self, record: &CreationRecord) -> bool {
-        let needed = record.replicas.len() / 2 + 1;
-        let until = Instant::now() + MAJORITY;
-        loop {
-            let acknowledged = self.acknowledged.listen();
-            let holding = {
-                let unacknowledged = lock(&self.unacknowledged);
-                let waiting = unacknowledged.get(&record.agent).map(|(_, nodes)| nodes);
-                let refusing = lock(&self.refusing);
-                let refusing = refusing.get(&record.agent);
-                // A replica counts once it holds the record and could run
-                // the agent's program.
-                record
-                    .replicas
-                    .iter()
-                    .filter(|replica| {
-                        **replica == self.number
-                            || (!waiting.is_some_and(|nodes| nodes.contains(replica))
-                                && !refusing.is_some_and(|nodes| nodes.contains(replica)))
-                    })
-                    .count()
-            };
-            if holding >= needed {
-                return true;
-            }
-            if Instant::now() >= until {
-                return false;
-            }
-            acknowledged
-                .or(async {
-                    smol::Timer::at(until).await;
-                })
-                .await;
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn placement(replicas: Vec<NodeNumber>) -> Placement {
-        Placement {
-            replicas,
-            before: Vec::new(),
-            term: 2,
-            index: 1,
-            joint: false,
-            committed: true,
-        }
-    }
-
-    /// A node asks only when it runs no group and its placement leaves it
-    /// out, at most once a second per agent and peer.
-    #[test]
-    fn a_node_asks_for_a_record_only_when_it_may_need_one() {
-        let now = Instant::now();
-        let names_me = placement(vec![1, 2, 3]);
-        let leaves_me_out = placement(vec![1, 2, 4]);
-        assert!(should_ask(None, false, 3, None, now), "no placement");
-        assert!(should_ask(Some(&leaves_me_out), false, 3, None, now));
-        assert!(!should_ask(None, true, 3, None, now), "a group runs here");
-        assert!(
-            !should_ask(Some(&names_me), false, 3, None, now),
-            "named, yet no group: refused for another program"
-        );
-        let asked = now - Duration::from_millis(400);
-        assert!(
-            !should_ask(None, false, 3, Some(asked), now),
-            "asked lately"
-        );
-        assert!(should_ask(None, false, 3, Some(asked), asked + ASK_EVERY));
-    }
-
-    /// A node answers the members its placement names, and no one else,
-    /// and only with a placement the asker takes from it.
-    #[test]
-    fn a_node_answers_only_the_members_its_placement_names() {
-        let held = placement(vec![1, 2, 3]);
-        assert!(should_answer(&held, 3, 2));
-        assert!(!should_answer(&held, 4, 2));
-        assert!(
-            !should_answer(&held, 3, 4),
-            "a placement leaving the answerer out, which the asker would refuse"
-        );
-        let joint = Placement {
-            before: vec![1, 2, 4],
-            committed: false,
-            ..held.clone()
-        };
-        assert!(
-            should_answer(&joint, 4, 2),
-            "a member of the configuration before"
-        );
-        let removing = Placement {
-            replicas: vec![1, 2, 5],
-            before: vec![1, 2, 3],
-            ..held.clone()
-        };
-        assert!(
-            should_answer(&removing, 5, 3),
-            "a leader that removed itself"
-        );
-        let created = Placement::created(&CreationRecord {
-            agent: AgentId(1 << 24 | 1),
-            replicas: vec![1, 2, 3],
-            creator: 1,
-            time: 0,
-            program: vos_wire::ids::ProgramHash([0; 32]),
-            accumulate_gas: 0,
-        });
-        assert!(should_answer(&created, 3, 2));
-    }
-
-    /// The asks kept are bounded: past the bound, those older than the
-    /// limit go, and the recent stay.
-    #[test]
-    fn the_asks_kept_stay_bounded() {
-        let now = Instant::now();
-        let old = now - ASK_EVERY;
-        let mut asked: HashMap<(AgentId, NodeNumber), Instant> = (0..ASKS_KEPT as u32)
-            .map(|agent| ((AgentId(agent), 2), old))
-            .collect();
-        trim_asks(&mut asked, now);
-        assert_eq!(asked.len(), ASKS_KEPT, "within the bound, all kept");
-        asked.insert((AgentId(u32::MAX), 2), now);
-        trim_asks(&mut asked, now);
-        assert_eq!(asked.len(), 1);
-        assert!(asked.contains_key(&(AgentId(u32::MAX), 2)));
     }
 }
