@@ -802,12 +802,12 @@ their own review.
 |---|---|
 | Heartbeat | 500 ms |
 | Election timeout | 1.5–3 s |
-| Quiescence | after 4 idle intervals |
+| Idle groups | no heartbeats of their own: the pair heartbeat vouches for their leaders |
 | Blob threshold | 64 KiB |
 | Append cap | 1 MiB inline |
 | Flush cap | 8 MiB |
-| Compaction | past 4,096 entries or 64 MiB beyond the applied index |
-| Session skew | 5 minutes |
-| Live sessions | 1M per agent |
+| Compaction | 1,024 entries or 64 MiB applied past the log's start, keeping at most 256 entries and 16 MiB |
+| Session skew | 60 s |
+| Live sessions | 65,536 per agent (the owner's call: the plan had 1M) |
 
 Step 3.10 may move them.

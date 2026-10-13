@@ -93,11 +93,20 @@ pub struct Config {
     /// leader's heartbeat, in milliseconds.
     pub election_timeout_ms: (u64, u64),
     pub heartbeat_ms: u64,
+    /// How long a call or an admin command, once queued at the leader,
+    /// waits for its answer before it answers that it may have run.
+    pub answered: Duration,
     /// A group's log is compacted once this many entries past its start
-    /// are applied durably, and keeps this many below the point it could
-    /// compact to, for a follower a little behind.
+    /// are applied durably,
     pub compact_every: u64,
+    /// or this many bytes of them, as its core counts an entry.
+    pub compact_bytes: u64,
+    /// A compaction keeps at most this many entries below the point it
+    /// could compact to, for a follower a little behind,
     pub compact_tail: u64,
+    /// and at most this many bytes of them: well under `compact_bytes`,
+    /// or every commit makes a compaction due.
+    pub compact_tail_bytes: u64,
     /// About how many bytes of rows one snapshot chunk carries.
     pub snapshot_chunk: usize,
     /// How long a leader waits for a follower to acknowledge a snapshot
@@ -130,8 +139,11 @@ impl Config {
             peers: Peers::Quic,
             election_timeout_ms: (1500, 3000),
             heartbeat_ms: 500,
+            answered: Duration::from_secs(30),
             compact_every: 1024,
+            compact_bytes: 64 << 20,
             compact_tail: 256,
+            compact_tail_bytes: 16 << 20,
             snapshot_chunk: 1 << 20,
             snapshot_timeout_ms: 60_000,
         }
@@ -168,6 +180,8 @@ pub enum CallError {
     /// The agent is created, but a majority of its replicas does not hold
     /// its record yet: it reaches them as they return.
     Unconfirmed(AgentId),
+    /// No answer within the node's deadline: it may have run, or may yet.
+    TimedOut,
 }
 
 #[derive(Debug)]
@@ -428,9 +442,13 @@ pub(crate) struct Inner {
     pub(crate) space: Option<Space>,
     pub(crate) network: Option<Arc<dyn Wire>>,
     pub(crate) election_timeout_ms: (u64, u64),
+    /// How long a queued call or admin command waits for its answer.
+    pub(crate) answered: Duration,
     pub(crate) heartbeat_ms: u64,
     pub(crate) compact_every: u64,
+    pub(crate) compact_bytes: u64,
     pub(crate) compact_tail: u64,
+    pub(crate) compact_tail_bytes: u64,
     pub(crate) snapshot_chunk: usize,
     pub(crate) snapshot_timeout_ms: u64,
     /// Every agent this node knows of, and where it runs.
@@ -912,6 +930,7 @@ impl Inner {
             halted: self.halted.load(std::sync::atomic::Ordering::SeqCst),
             sessions,
             outbox,
+            placement_term: self.placement(agent).map_or(0, |placement| placement.term),
         })
     }
 
@@ -1345,7 +1364,19 @@ impl Inner {
         };
         let (answer, reply) = smol::channel::bounded(1);
         self.push(agent, Pending::Admin(admin, answer, references))?;
-        reply.recv().await.map_err(|_| CallError::Stopped)?
+        self.admin_answer(reply).await
+    }
+
+    /// A queued admin command's answer, within the node's deadline. Sent
+    /// again, an admin command is safe: an install and a role overwrite.
+    async fn admin_answer(
+        &self,
+        reply: smol::channel::Receiver<Result<Answered, CallError>>,
+    ) -> Result<Answered, CallError> {
+        match crate::calls::within(self.answered, reply.recv()).await {
+            Some(answer) => answer.map_err(|_| CallError::Stopped)?,
+            None => Err(CallError::TimedOut),
+        }
     }
 
     /// Run `work` on an executor, off the thread every leader shares.
@@ -1360,7 +1391,7 @@ impl Inner {
         self.settled(agent).await?;
         let (answer, reply) = smol::channel::bounded(1);
         self.push(agent, Pending::Admin(admin, answer, Vec::new()))?;
-        reply.recv().await.map_err(|_| CallError::Stopped)?
+        self.admin_answer(reply).await
     }
 
     /// A call: queued at once when the group knows where calls go, so
@@ -1710,9 +1741,12 @@ impl Node {
             space: config.space,
             network,
             election_timeout_ms: config.election_timeout_ms,
+            answered: config.answered,
             heartbeat_ms: config.heartbeat_ms,
             compact_every: config.compact_every,
+            compact_bytes: config.compact_bytes,
             compact_tail: config.compact_tail,
+            compact_tail_bytes: config.compact_tail_bytes,
             snapshot_chunk: config.snapshot_chunk,
             snapshot_timeout_ms: config.snapshot_timeout_ms,
             directory: Mutex::new(HashMap::new()),

@@ -988,6 +988,15 @@ impl<N: NodeId> Core<N> {
         self.update_compact_bound();
     }
 
+    /// Where a compaction through `through` stops to keep a tail of at
+    /// most `entries` entries and `bytes` bytes for a follower a little
+    /// behind.
+    pub fn compaction_point(&self, through: u64, entries: u64, bytes: u64) -> u64 {
+        through
+            .saturating_sub(entries)
+            .max(self.log.point_keeping(through, bytes))
+    }
+
     /// The host compacted its log through `through`.
     pub fn compacted(&mut self, through: u64) {
         let Some(term) = self.log.term_at(through) else {
@@ -2374,9 +2383,9 @@ impl<N: NodeId> Core<N> {
         if let Some(final_index) = self.retirement_final_index {
             bound = bound.min(final_index.saturating_sub(2));
         }
-        if bound > self.compact_bound
-            && bound.saturating_sub(self.log.snap_index()) >= self.cfg.compact_hysteresis
-        {
+        let due = bound.saturating_sub(self.log.snap_index()) >= self.cfg.compact_hysteresis
+            || self.log.bytes_through(bound) >= self.cfg.compact_bytes;
+        if bound > self.compact_bound && due {
             self.compact_bound = bound;
             self.actions.push(Action::CompactBound {
                 through: bound,

@@ -8083,3 +8083,291 @@ node 1 led; one run):
   refines nearer 17 µs an input than 32. Only another machine can tell.
 - 3.10c reports the single agent's rows on both pinnings, with this as
   the reason.
+
+#### 3.10c Design: closing the slice
+
+**Where the budgets stand** before the closing runs (tmpfs, the laptop):
+- the quiet node, idle groups and exactly-once pass;
+- the query on a follower has a median of 51 µs and a p99 of 151 µs,
+  against 100 µs: which percentile the budget means is the owner's
+  call, open since slice 2;
+- one agent:
+  - about 15k/s, its half-load p99 12–15 ms on the reference pinning;
+  - 17k/s and 7.0 ms with the leader on cores of its own;
+- 64 agents: the knee between 15k and 20k/s, every node out of CPU.
+
+**Decided by the owner:**
+- pipelined refines are shelved, their design and review kept;
+- the single agent's and the 64 agents' final numbers come from a
+  machine of its own (`machine.sh`), when the owner runs it.
+
+**The defaults**, plan against code, settled:
+
+| Default | Plan | Code | Settled |
+|---|---|---|---|
+| Session skew | 5 min | 60 s | **60 s**: the owner's slice-2 default (`vos_wire::defaults`). A client clock more than a minute off is refused (`STALE_SESSION`), as JWT's usual leeway. Expiry stays at least twice the skew. |
+| Live sessions | 1M per agent | 65,536 | **The owner's call:** a session keeps up to 64 replies, so a million full ones is gigabytes of an agent's state. The code keeps 65,536, the verifying-key cache's size too. |
+| Compaction | 4,096 entries or 64 MiB | 1,024 entries, keeping 256 | **1,024 entries or 64 MiB, keeping at most 256 entries and 16 MiB:** the code lacks the plan's byte bound. Recovery loads the whole live log, so at 1 MiB entries 1,024 of them are a gigabyte, and a 256-entry tail a quarter of one. The core keeps a running count of its live log's bytes: added on append, taken off on a truncated suffix and at compaction, set at recovery. It triggers on either bound. The tail is bounded in bytes too. |
+| Quiescence | after 4 idle intervals | the pair heartbeat | **The pair heartbeat:** 3.8 replaced quiescence. The plan's row is corrected. |
+
+The rest match the code: heartbeat 500 ms, elections 1.5–3 s, an
+append's 1 MiB inline, a flush's 8 MiB.
+
+**The carried items**, each closed or carried to a named slice:
+
+1. **The directory's convergence and the `recording` lock under a mass
+   failover:** measured by the bench's failover row, now on the laptop
+   and again on the owner's machine.
+   - The replica status gains the term of the placement its node holds,
+     so the bench times, after the kill, until every node holds the new
+     leaders' placements.
+   - **Passes if** every group has a leader within two election timeouts'
+     upper bound (6 s), and every directory agrees within a second more,
+     at 64 agents and at the idle row's 1,000 groups a node.
+2. **The confirmation entry's overhead:** one extra log entry for each
+   replacement, an operator's action. **Closed** by count: nothing on the
+   hot path.
+3. **Install and role commands without a deadline at a stalled leader:**
+   **fixed.**
+   - The wait for an admin command's answer, once it is queued, gets
+     the call path's deadline. That deadline becomes `Config::answered`,
+     30 s by default. An install's storing of its blobs before is local
+     work, and stays unbounded.
+   - Past the deadline the command answers `CallError::TimedOut`, the
+     wire's `Answer::TimedOut` ("it may have run, or may yet"). It is
+     not `Unconfirmed`, which means a new agent's record not yet held by
+     a majority.
+   - Sending it again is safe: an install and a role are overwrites
+     (`installed(instance)`, `member(principal)`), where a call is safe
+     by its sequence.
+   - Test: a hook holds the leader's commits, and an install answers
+     `TimedOut` within a lowered deadline.
+4. **Liveness frames late within a surviving connection:** **closed, a
+   bounded liveness delay.**
+   - A vouch is keyed by node, agent and term (`listed(node, agent,
+     term)`). So a frame that QUIC retransmits after a cut can only
+     vouch for a leadership the receiver still follows at that term,
+     from a sender alive when the cut began.
+   - It can lengthen one patience window, by at most the cut, which is
+     shorter than QUIC's idle timeout.
+   - Safety does not rest on vouching: elections still need votes,
+     commits a quorum's acknowledgements, and linearizable reads a
+     heartbeat round acknowledged after they arrive
+     (`try_resolve_reads`).
+   - **The leader's side:** `heard(member)` is keyed by node alone, and
+     counts a member only while it also answers over Raft within the
+     patience (three times the larger of the election timeout's bound
+     and the resend). Its only use is `check_quorum`, so a late frame
+     can only delay a step-down, by its own lateness.
+5. **The wire version:** **carried** to the first release that promises
+   rolling upgrades (a version in the peer framing). Not a slice-4
+   item.
+6. **Fast retransmit on a dropped gap:** **carried to slice 4.** The 3.9
+   suite recovers without it, within its deadlines. A dropped gap costs
+   a message one window round (1 s, doubling to 16 s), and nothing in
+   slice 3 budgets a message's latency. Slice 4's workflows, with
+   their cross-agent awaits and deadlines, do.
+7. **Fan-in past a receiver's cap, and message batching across
+   agents:** **carried to slice 4,** with a bench of agents messaging
+   across nodes, for the same reason.
+8. **Learners** (3.7, 3.9c): **unscheduled.** A replaced replica catches
+   up from its first append, and a snapshot when it is far behind. The
+   gap while it does is a vote it cannot cast yet, which only a smaller
+   group would feel.
+9. **A sequence-0 query taking a read index** (3.5): **unscheduled,** a
+   detail of the lane's reads with no row that needs it.
+10. **`#[msg(linearizable)]`** (3.5, "step 5"): the client already chooses
+    `Consistency::Linearizable` per query. The attribute, which makes a
+    handler always take it, is **carried to the SDK's next step** (slice
+    4's actor framework work).
+11. **A gray failure's deposition at node level** (3.8, "the core's test
+    only"): **closed** by 3.9's suite, which kills it across processes
+    (`node/cli/tests/faults.rs`, `a_gray_failure_deposes_its_leader`).
+12. **One task and one channel per queued call** (3.9a, for 3.10):
+    **closed by the profiles.** The async runtime is about 5% of a
+    loaded node, its tasks and channels within it, against 17% for
+    signature checks and 22% for the agent's code.
+13. **One heartbeat round per linearizable read** (3.8b): **measured.** The
+    query row reads at `Applied`, so a second query row reads at
+    `Linearizable` on the follower, and the round's cost is their
+    difference.
+
+**Also open, carried by name:**
+- the one `NoAgent` after a restart (3.10b's load fixes), not seen
+  again;
+- the bench's "past the knee" label at 6k/s. Its waits come from long
+  batches, not load: the bench's rule is corrected to say what it saw;
+- a node outside an agent's placement that missed both announcements
+  learns of the agent only at the next leadership change: carried to
+  the catalog slice;
+- for the owner: `historical_lookup`'s isolation, the query
+  percentile, the live-session cap, and the 64 agents' contract
+  levers (followers applying the leader's writes, a write host call
+  without the previous length, batch signature checks).
+
+**The measurements left to 3.10c:**
+- **TLS:** the call and query rows over HTTPS against plain HTTP, the
+  same rows and node (`ingress_tls`).
+- **Table reads under continuous writes** (section 9.5's steady-state
+  cost): in process, a 10M-row table, point reads timed while writes
+  run at the 64-agent run's rows a second and mix (log entries,
+  applied state, sessions), after compaction settles. It extends
+  `store-bench`.
+- **The failover row and the soak's second run:** on the laptop now, and
+  on the owner's machine.
+
+**Section 14** gets each row with the setup it was measured on: the
+laptop's two pinnings now, the owner's machine when its numbers come.
+
+**The gates, each with its evidence:**
+- **Slices 1 and 2:** `just ci-full`.
+- **Raft safety:** the vos-raft simulation suite's invariants (election
+  safety, log matching, leader completeness, state-machine safety)
+  under its faults, and its read-index checks across leader changes:
+  the suites named, with their seeds and runs.
+- **Section 9.5:** each invariant mapped to its crash test, with any
+  3.10 added: the pool's pins and eviction (3.10b1), and the record a
+  node asks for (the directory's pull).
+- **Exactly-once:** the checker loop and the fault suite.
+- **The budgets,** each with a verdict: met, missed, or awaiting the
+  owner's machine.
+  - One agent's half-load p99 passes only with cores of its own.
+  - The 64 agents' 40k/s at p99 ≤ 20 ms is missed on the laptop (knee
+    15–20k/s): awaiting the owner's machine, and the owner's contract
+    levers.
+  - The query's percentile is the owner's call.
+
+  So the end review does not take "awaiting" for "passed".
+
+**Then Fable's end-of-slice review.**
+
+#### 3.10c Built: admin deadlines, the directory's convergence, compaction by bytes
+
+**An admin command's deadline** (item 3):
+- `Config::answered` (30 s) bounds the wait for an install's or a role's
+  answer once queued, as it bounds a call's.
+- Past it the command answers `CallError::TimedOut`. The CLI says it
+  may have run, or may yet, and that sending it again is safe.
+- `an_install_at_a_stalled_leader_times_out` holds the leader's commits:
+  - the install answers `TimedOut` within a 400 ms deadline;
+  - once released, it is sent again until it answers `Done`.
+- Without the deadline the test fails; it passed 15 runs of 15.
+
+**The directory's convergence** (item 1):
+- `ReplicaStatus` gains `placement_term`, the term of the placement the
+  node's directory holds.
+- The bench's failover row times, after the kill, until every node left
+  holds each new leader's term. Every node here runs every agent, so
+  this is every surviving replica's directory; a node outside an
+  agent's placement is not measured.
+- The times are upper bounds: each is when a sweep of the statuses saw
+  its event. The row now gives one sweep's own time, their resolution.
+- `a_new_leader_serves_after_the_old_one_stops_and_the_old_one_catches_up`
+  checks it in `just ci`: every node left names the new leader's
+  placement at its term. It fails with the term left at 0.
+- A `failover-idle` row does the same with the idle row's 1,000 groups a
+  node.
+
+On the laptop (tmpfs, the reference pinning):
+
+| Row | Killed node led | Every agent has a leader | Every directory agrees |
+|---|---|---|---|
+| 64 agents under load | 26 of 64 | 2.22 s | 2.23 s |
+| 1,000 idle agents | 356 of 1,000 | 2.64 s | 2.70 s |
+
+**Passes:**
+- leaders within the 6 s bound;
+- directories within 0.06 s after their leaders, against a second;
+- every counter holds every increment it answered, once.
+
+The `recording` lock shows no cost in it.
+
+**Compaction by bytes** (the defaults):
+- The core's log view keeps a running byte count at each live entry's
+  end, as the cache counts an entry (64 bytes beyond its payload):
+  - append adds to it;
+  - a truncated suffix and a compaction take entries off;
+  - recovery appends the live log, so it is set there too.
+- A compaction is due once the entries through the eligible index reach
+  `compact_hysteresis` past the log's start, or `compact_bytes` (64 MiB
+  by default).
+- `Core::compaction_point` stops a compaction short to keep a tail of at
+  most so many entries and bytes. The host passes 256 entries and
+  `compact_tail_bytes` (16 MiB).
+
+The counts cost one `u64` per live entry per group: about 10 KB a group
+at the defaults, 10 MB for 1,000 groups.
+
+The tests:
+- the log view's counts across appends, truncations and both kinds of
+  compaction, and on an empty log;
+- the core's trigger on bytes, with the entry count out of reach;
+- the host's cluster test `a_log_compacts_on_its_bytes_and_keeps_a_tail_within_them`,
+  whose entry bounds are infinite. It fails with the byte trigger left
+  out, and with the tail's byte bound left out.
+
+#### 3.10c Gates: Raft safety and section 9.5
+
+**Raft safety**, vos-raft's simulation (`tests/simulated.rs`, over
+`vos_raft::sim`):
+- Groups of cores run over a simulated network and stores, under:
+  - drops, delays and partitions;
+  - crashes that lose unsynced writes;
+  - snapshot installs, compactions and log loads.
+- Every run is seeded and replays exactly. Each step checks four
+  violations:
+  - `TwoLeaders`: election safety, one leader per term;
+  - `CommitConflict`: two entries committed at one index, across
+    replicas and over time. This is log matching and state-machine
+    safety for what commits. Leader completeness holds as observed: no
+    later leader's commit replaces an earlier commit.
+  - `CommitBeyondLog`: a replica committing past its own log;
+  - `StaleRead`: a read index below what was committed when the read
+    was asked. This checks linearizable reads across leader changes.
+- The runs:
+
+| Test | Seeds | What it adds |
+|---|---|---|
+| `safety_holds_under_faults` | 0–199 | at least 1,000 installs, 10,000 compactions, 10,000 loads and 5,000 reads answered |
+| `safety_holds_under_faults_and_membership_changes` | 0–199 | at least 500 membership changes |
+| `safety_holds_when_entries_wait_for_blobs` | 0–199 | entries reported durable 1–60 ms after their sync, with changes; at least 1,000 reads |
+| `safety_holds_with_idle_heartbeats_off_and_the_hosts_vouching` | 0–399 and 1,000–1,399 | the host's way: idle heartbeats off, the pair heartbeat vouching, voters released and replicas retired; at least 2,000 installs, 1,000 changes and 1,000 retirements |
+
+- `tests/proptest_invariants.rs` (256 cases) drives one worker with
+  random messages. It checks:
+  - terms never go back;
+  - one durable vote per term;
+  - log matching;
+  - the snapshot and commit indexes never go back.
+
+All of them run in `just ci`.
+
+**Section 9.5**, each invariant and its test:
+
+| Invariant | Test |
+|---|---|
+| 1. The apply batch holds the applied index | `crash` (one prefix of applies and state, kills and torn tails), `raft_crash` (the same beside the log) |
+| 2. One journal: no apply durable without its append | `raft_crash`: the log holds every entry from its start through the applied index, and on without a gap |
+| 3. Only quorum-committed entries apply | a protocol property, not a crash's: the core's `a_commit_index_never_applies_an_unverified_entry` and the simulation's `CommitConflict` and `CommitBeyondLog` under faults. The host applies only on the core's `Committed`. |
+| 4. Truncation at or below the durable applied index | `raft_crash` (the log starts at or below the applied index); the worker's `compaction_never_crosses_durable_application_cursor`. The byte bound changes only how far below it a compaction stops: `compaction_point` is at most the core's bound, `min(commit, durably applied)`. |
+| 5. Accumulate reads no node-local input | not a crash's either. A work result carries its time and seed, and every replica applies the log's (`a_leader_whose_clock_trails_times_its_batches_at_the_agents`); the cluster suite checks that replicas agree, state and all. |
+| 6. A snapshot and the index that depends on it are one durable batch | `snapshot_crash` |
+| 7. A blob is durable before its entry counts durable | `blob_crash`; on open a log is cut at its first entry missing a blob |
+
+**What 3.10 added:**
+- **The pool's pins** (3.10b1):
+  - A pin or unpin is a row the writer commits in the very batch of
+    its apply or switch. So invariants 1 and 2 cover it: a crash loses
+    it only with its apply, which the restart applies again.
+  - The pool itself is memory, rebuilt at start from the pins.
+  - `a_program_leaves_the_pool_with_its_last_pin` now restarts the
+    node twice:
+    - with no pin left, the program is not pooled;
+    - pinned again, it is pooled before any run.
+- **The directory's pull:**
+  - A node that holds no record of an agent it is sent Raft traffic for
+    asks the sender, whether it never had the record or lost it.
+  - `a_record_reaches_a_node_that_was_down_from_a_replica` and
+    `a_record_reaches_a_node_that_comes_up_later_while_its_creator_runs`
+    stop and start a node, rather than kill it mid-write. The pull's
+    rule is the same either way: no record, so it asks.

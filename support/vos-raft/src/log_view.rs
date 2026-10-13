@@ -49,6 +49,11 @@ pub(crate) struct LogView<N: NodeId> {
     cache_limit: usize,
     /// Every live configuration entry, by index.
     configs: BTreeMap<u64, LogEntry<N>>,
+    /// The log's running byte count at the end of each live entry, in
+    /// order: the entry at `snap_index + 1 + k` ends at `ends[k]`, and the
+    /// snapshot at `start`.
+    ends: VecDeque<u64>,
+    start: u64,
 }
 
 impl<N: NodeId> LogView<N> {
@@ -62,6 +67,8 @@ impl<N: NodeId> LogView<N> {
             cache_bytes: 0,
             cache_limit,
             configs: BTreeMap::new(),
+            ends: VecDeque::new(),
+            start: 0,
         }
     }
 
@@ -92,6 +99,30 @@ impl<N: NodeId> LogView<N> {
         }
         let at = self.runs.partition_point(|&(first, _)| first <= index);
         Some(self.runs[at - 1].1)
+    }
+
+    /// The bytes of the live entries through `index`.
+    pub(crate) fn bytes_through(&self, index: u64) -> u64 {
+        self.end_at(index) - self.start
+    }
+
+    /// The lowest index from which the entries after it, through `to`,
+    /// take at most `max_bytes`.
+    pub(crate) fn point_keeping(&self, to: u64, max_bytes: u64) -> u64 {
+        let to = to.clamp(self.snap_index, self.last);
+        let floor = self.end_at(to).saturating_sub(max_bytes);
+        if self.start >= floor {
+            return self.snap_index;
+        }
+        self.snap_index + 1 + self.ends.partition_point(|&end| end < floor) as u64
+    }
+
+    fn end_at(&self, index: u64) -> u64 {
+        let index = index.min(self.last);
+        if index <= self.snap_index {
+            return self.start;
+        }
+        self.ends[(index - self.snap_index - 1) as usize]
     }
 
     /// The first index of the run of `term` that holds `index`.
@@ -131,6 +162,8 @@ impl<N: NodeId> LogView<N> {
                 _ => self.runs.push((entry.index, entry.term)),
             }
             self.last = entry.index;
+            let end = self.ends.back().map_or(self.start, |&end| end);
+            self.ends.push_back(end + entry_bytes(entry) as u64);
             if matches!(entry.kind, EntryKind::ConfigChange { .. }) {
                 self.configs.insert(entry.index, entry.clone());
             }
@@ -154,6 +187,7 @@ impl<N: NodeId> LogView<N> {
         }
         let index = index.max(self.snap_index);
         self.last = index;
+        self.ends.truncate((index - self.snap_index) as usize);
         while self.runs.last().is_some_and(|&(first, _)| first > index) {
             self.runs.pop();
         }
@@ -175,6 +209,8 @@ impl<N: NodeId> LogView<N> {
             self.runs.clear();
             self.clear_cache();
             self.configs.clear();
+            self.ends.clear();
+            self.start = 0;
             self.last = index;
         } else {
             let at = self.runs.partition_point(|&(first, _)| first <= index);
@@ -194,6 +230,9 @@ impl<N: NodeId> LogView<N> {
                 self.cache_bytes -= entry_bytes(&entry);
             }
             self.configs.retain(|&at, _| at > index);
+            let dropped = (index - self.snap_index) as usize;
+            self.start = self.ends[dropped - 1];
+            self.ends.drain(..dropped);
         }
         self.snap_index = index;
         self.snap_term = term;
@@ -361,5 +400,45 @@ mod tests {
         log.evict(2);
         assert!(log.entries(1, 1, usize::MAX).is_none());
         assert_eq!(log.entries(2, 3, usize::MAX).unwrap().len(), 2);
+    }
+
+    fn sized(index: u64, term: u64, bytes: usize) -> LogEntry<u16> {
+        LogEntry::data(index, term, vec![0u8; bytes - ENTRY_OVERHEAD])
+    }
+
+    #[test]
+    fn live_bytes_follow_appends_truncations_and_compactions() {
+        let mut log = LogView::new(0, 0, usize::MAX);
+        log.append(&[
+            sized(1, 1, 100),
+            sized(2, 1, 200),
+            sized(3, 1, 300),
+            sized(4, 1, 400),
+        ]);
+        assert_eq!(log.bytes_through(4), 1000);
+        assert_eq!(log.bytes_through(2), 300);
+        assert_eq!(log.bytes_through(9), 1000);
+        // Entries 3 and 4 take 700 bytes; 2 through 4 take more.
+        assert_eq!(log.point_keeping(4, 700), 2);
+        assert_eq!(log.point_keeping(4, 699), 3);
+        assert_eq!(log.point_keeping(4, 0), 4);
+        assert_eq!(log.point_keeping(4, u64::MAX), 0);
+        log.truncate_after(2);
+        assert_eq!(log.bytes_through(4), 300);
+        log.append(&[sized(3, 2, 1000)]);
+        assert_eq!(log.bytes_through(3), 1300);
+        log.compact_to(1, 1);
+        assert_eq!(log.bytes_through(1), 0);
+        assert_eq!(log.bytes_through(3), 1200);
+        assert_eq!(log.point_keeping(3, 1000), 2);
+        assert_eq!(log.point_keeping(3, u64::MAX), 1);
+        // A snapshot the log does not match leaves nothing live.
+        log.compact_to(5, 3);
+        assert_eq!(log.bytes_through(5), 0);
+        assert_eq!(log.bytes_through(9), 0);
+        assert_eq!(log.point_keeping(9, 0), 5);
+        log.append(&[sized(6, 3, 100)]);
+        assert_eq!(log.bytes_through(6), 100);
+        assert_eq!(log.point_keeping(6, 99), 6);
     }
 }

@@ -272,6 +272,9 @@ pub struct ReplicaStatus {
     pub sessions: u64,
     /// The messages its applied state holds unacknowledged.
     pub outbox: u64,
+    /// The term of the placement its node's directory holds for the agent:
+    /// the leader's that announced it.
+    pub placement_term: u64,
 }
 
 /// The operator's `POST /agents`: the nodes to replicate the new agent,

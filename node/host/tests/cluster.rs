@@ -87,11 +87,16 @@ struct Cluster {
     /// Compaction every so many entries, keeping a tail, and snapshot
     /// chunks of about so many bytes, when not the defaults.
     compaction: Option<(u64, u64, usize)>,
+    /// Compaction once the log holds so many bytes, keeping a tail of at
+    /// most so many, when not the defaults.
+    compaction_bytes: Option<(u64, u64)>,
     /// How long a leader waits for a snapshot's acknowledgement, when not
     /// the default.
     snapshot_timeout_ms: Option<u64>,
     /// The election timeout's range, when not the fast one.
     election_timeout_ms: Option<(u64, u64)>,
+    /// How long a queued call or admin command waits for its answer.
+    answered: Option<Duration>,
 }
 
 impl Cluster {
@@ -138,8 +143,10 @@ impl Cluster {
                 t0: vos_node::wall_clock(),
             },
             compaction: None,
+            compaction_bytes: None,
             snapshot_timeout_ms: None,
             election_timeout_ms: None,
+            answered: None,
         };
         cluster.grow(count);
         cluster
@@ -208,6 +215,9 @@ impl Cluster {
             Peers::Hub(self.hub.clone())
         };
         config.election_timeout_ms = self.election_timeout_ms.unwrap_or((40, 80));
+        if let Some(answered) = self.answered {
+            config.answered = answered;
+        }
         config.heartbeat_ms = 10;
         if let Some(timeout) = self.snapshot_timeout_ms {
             config.snapshot_timeout_ms = timeout;
@@ -216,6 +226,10 @@ impl Cluster {
             config.compact_every = every;
             config.compact_tail = tail;
             config.snapshot_chunk = chunk;
+        }
+        if let Some((bytes, tail)) = self.compaction_bytes {
+            config.compact_bytes = bytes;
+            config.compact_tail_bytes = tail;
         }
         // Each node's own clock, a few milliseconds apart.
         let skew = u64::from(number) * 7;
@@ -620,6 +634,14 @@ fn a_new_leader_serves_after_the_old_one_stops_and_the_old_one_catches_up() {
     cluster.stop(first);
     let second = cluster.leader(agent);
     assert_ne!(second, first);
+    // Every node left names the new leader's placement, at its term.
+    let term = cluster.node(second).replica(agent).unwrap().term;
+    wait_until("every node names the new leader's placement", || {
+        cluster.running().all(|(_, node)| {
+            node.replica(agent)
+                .is_some_and(|status| status.placement_term >= term)
+        })
+    });
     // The same session goes on at the new leader.
     assert_eq!(done(cluster.increment(second, agent, 2, 7)), 12);
     assert!(time(cluster.node(second)) >= before, "batch time went back");
@@ -1134,6 +1156,31 @@ fn every_replica_compacts_its_log_as_it_applies() {
     });
 }
 
+/// A log compacts on its bytes long before its length, and keeps a tail
+/// bounded in bytes: here no count would ever compact it.
+#[test]
+fn a_log_compacts_on_its_bytes_and_keeps_a_tail_within_them() {
+    let mut cluster = Cluster::build(0, Arc::new(vos_node::NoHooks), Vec::new(), false);
+    cluster.compaction = Some((u64::MAX, u64::MAX, 64));
+    cluster.compaction_bytes = Some((1024, 256));
+    cluster.grow(3);
+    let agent = cluster.node(1).create_replicated(vec![1, 2, 3]).unwrap();
+    cluster.install(agent);
+    let leader = cluster.leader(agent);
+    for sequence in 1..=40 {
+        done(cluster.increment(leader, agent, sequence, sequence));
+    }
+    cluster.converged(agent);
+    // Each entry counts at least 64 bytes, so the log holds at most 16
+    // past its start before a compaction is due.
+    wait_until("every replica compacts", || {
+        cluster.running().all(|(_, node)| {
+            let rows = node.store().raft(agent).unwrap();
+            rows.log_start.0 > 20 && rows.log.len() <= 16
+        })
+    });
+}
+
 /// A follower down while the log is compacted past it catches up by a
 /// snapshot, under load: the same state, last result and pins, the
 /// program it missed fetched before the switch, and its queries answer
@@ -1605,6 +1652,50 @@ fn the_leader_replaces_itself() {
     assert_ne!(next, leader);
     assert_eq!(done(cluster.increment(next, agent, 2, 1)), 6);
     cluster.converged(agent);
+}
+
+/// An install at a leader whose commits stall answers that it may have
+/// run, within the node's deadline, rather than wait for the commit; sent
+/// again once commits go on, it installs, as an install overwrites.
+#[test]
+fn an_install_at_a_stalled_leader_times_out() {
+    let hold = Arc::new(HoldCommits(std::sync::atomic::AtomicBool::new(false)));
+    let mut cluster = Cluster::build(0, hold.clone(), Vec::new(), false);
+    cluster.answered = Some(Duration::from_millis(400));
+    cluster.grow(3);
+    let agent = cluster.node(1).create_replicated(vec![1, 2, 3]).unwrap();
+    let leader = cluster.node(cluster.leader(agent));
+    hold.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    let release = Release(&hold.0);
+    let started = Instant::now();
+    // Bounded here too, so that waiting for the commit fails, not hangs.
+    let install = leader.install(agent, COUNTER, &cluster.programs.counter, &[], vec![]);
+    let installed = smol::block_on(smol::future::or(async { Some(install.await) }, async {
+        smol::Timer::after(Duration::from_secs(10)).await;
+        None
+    }))
+    .expect("the install waited for its commit, past the deadline");
+    assert!(
+        matches!(installed, Err(CallError::TimedOut)),
+        "{installed:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "answered within the deadline, not the commit: {:?}",
+        started.elapsed()
+    );
+    drop(release);
+    // Sent again, as its operator would after `TimedOut`, until it
+    // installs: with so short a deadline, the held commits' backlog can
+    // outlast one try.
+    wait_until("the install, sent again", || {
+        let leader = cluster.node(cluster.leader(agent));
+        let installed =
+            smol::block_on(leader.install(agent, COUNTER, &cluster.programs.counter, &[], vec![]));
+        matches!(installed, Ok(Reply::Ran(Outcome::Done(_))))
+    });
+    let leader = cluster.leader(agent);
+    assert_eq!(done(cluster.increment(leader, agent, 1, 2)), 2);
 }
 
 /// With elections as slow as a deployment's, a leader replacing itself
@@ -2186,10 +2277,10 @@ fn replicas_that_never_took_the_install_pool_the_program_on_first_use() {
 
 /// The pool drops a program once no agent on the node pins it, keeps one
 /// another agent still pins, and holds it again once it is pinned and run
-/// again.
+/// again. A restart leaves it as the pins do.
 #[test]
 fn a_program_leaves_the_pool_with_its_last_pin() {
-    let cluster = Cluster::new(4);
+    let mut cluster = Cluster::new(4);
     let agents: Vec<AgentId> = (0..2)
         .map(|_| cluster.node(1).create_replicated(vec![1, 2, 3]).unwrap())
         .collect();
@@ -2230,6 +2321,12 @@ fn a_program_leaves_the_pool_with_its_last_pin() {
     wait_until("the pool drops the program", || {
         !cluster.node(node).pooled(&program)
     });
+    cluster.stop(node);
+    cluster.start(node);
+    assert!(
+        !cluster.node(node).pooled(&program),
+        "a restart pools no program unpinned"
+    );
 
     let mut replicas: Vec<NodeNumber> = (1..=4)
         .filter(|number| *number != node)
@@ -2244,4 +2341,10 @@ fn a_program_leaves_the_pool_with_its_last_pin() {
     });
     assert_eq!(cluster.value(node, third), 0);
     assert!(cluster.node(node).pooled(&program), "held again once run");
+    cluster.stop(node);
+    cluster.start(node);
+    assert!(
+        cluster.node(node).pooled(&program),
+        "a restart pools a program pinned"
+    );
 }

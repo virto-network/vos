@@ -1694,3 +1694,57 @@ fn a_leader_whose_appends_go_unanswered_steps_down_though_the_node_is_heard() {
     core.take_actions();
     assert_eq!(core.role(), Role::Follower);
 }
+
+fn compact_bounds(actions: &[Action<u16>]) -> Vec<u64> {
+    actions
+        .iter()
+        .filter_map(|action| match action {
+            Action::CompactBound { through, .. } => Some(*through),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A log of large entries makes a compaction due on its bytes before its
+/// length, and the tail a compaction keeps is bounded in bytes too.
+#[test]
+fn large_entries_make_a_compaction_due_by_their_bytes() {
+    let mut cfg = config();
+    cfg.compact_hysteresis = 1_000;
+    cfg.compact_bytes = 1_000;
+    // Each entry costs 300 bytes as the cache counts it: 64 beyond its
+    // payload.
+    let entries = (1..=8)
+        .map(|index| LogEntry::data(index, 1, vec![0; 236]))
+        .collect();
+    let recovered = Recovered {
+        meta: Meta {
+            current_term: 1,
+            voted_for: None,
+            commit_index: 8,
+            snap_last_index: 0,
+            snap_last_term: 0,
+        },
+        entries,
+        ..Recovered::default()
+    };
+    let mut core = Core::new(cfg, recovered, 0, 7);
+    core.take_actions();
+    core.durably_applied(3);
+    assert!(compact_bounds(&core.take_actions()).is_empty(), "900 bytes");
+    core.durably_applied(4);
+    assert_eq!(compact_bounds(&core.take_actions()), [4]);
+    // Entries 3 and 4 take 600 bytes; 2 through 4 more than 700.
+    let point = core.compaction_point(4, 10, 700);
+    assert_eq!(point, 2);
+    core.compacted(point);
+    core.durably_applied(5);
+    assert!(
+        compact_bounds(&core.take_actions()).is_empty(),
+        "the tail and entry 5 take 900 bytes"
+    );
+    core.durably_applied(6);
+    assert_eq!(compact_bounds(&core.take_actions()), [6]);
+    // The tail's entry count bounds it as well.
+    assert_eq!(core.compaction_point(6, 1, 700), 5);
+}

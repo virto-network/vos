@@ -39,16 +39,11 @@ const REFORWARD: Duration = Duration::from_secs(2);
 const PAUSE: Duration = Duration::from_millis(100);
 /// Forwarded calls the leader runs at once for one forwarding replica.
 const FORWARDED: usize = 1024;
-/// How long a call at its leader waits for its answer before it is
-/// answered `TimedOut`, the client sending it again: a leader stuck on its
-/// disk holds no caller longer. The call itself goes on.
-const ANSWERED: Duration = Duration::from_secs(30);
-
-/// `answer`, or `TimedOut` once `ANSWERED` has passed.
-async fn within_deadline(answer: impl Future<Output = Answer>) -> Answer {
+/// `answer`, or `TimedOut` once `answered` has passed.
+async fn within_deadline(answered: Duration, answer: impl Future<Output = Answer>) -> Answer {
     answer
         .or(async {
-            smol::Timer::after(ANSWERED).await;
+            smol::Timer::after(answered).await;
             Answer::TimedOut
         })
         .await
@@ -134,6 +129,7 @@ pub(crate) fn answer_of(reply: Result<Answered, CallError>) -> Answer {
         Err(CallError::NotLeader(leader)) => Answer::NotLeader { leader },
         Err(CallError::Elsewhere(replicas)) => Answer::Elsewhere { replicas },
         Err(CallError::Unconfirmed(agent)) => Answer::Unconfirmed(agent),
+        Err(CallError::TimedOut) => Answer::TimedOut,
     }
 }
 
@@ -246,7 +242,10 @@ impl Inner {
         match next {
             Next::Answer(answer) => answer,
             Next::Wait(wait) => {
-                within_deadline(async { wait.recv().await.unwrap_or(Answer::Stopped) }).await
+                within_deadline(self.answered, async {
+                    wait.recv().await.unwrap_or(Answer::Stopped)
+                })
+                .await
             }
             Next::Queue => {
                 let (session, sequence) = (call.session, call.sequence);
@@ -268,7 +267,10 @@ impl Inner {
                     let settled = inner.queued_call(agent, session, sequence, running).await;
                     let _ = answered.try_send(settled);
                 });
-                within_deadline(async { answer.recv().await.unwrap_or(Answer::Stopped) }).await
+                within_deadline(self.answered, async {
+                    answer.recv().await.unwrap_or(Answer::Stopped)
+                })
+                .await
             }
         }
     }

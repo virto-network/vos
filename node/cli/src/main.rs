@@ -433,7 +433,7 @@ fn run(cli: Cli) -> Result<(), String> {
             let answer = operator_of(&operator)?
                 .install(AgentId(agent), &install)
                 .map_err(failed)?;
-            print_answer(&answer)
+            print_admin_answer(&answer)
         }
         Command::Role {
             operator,
@@ -452,7 +452,7 @@ fn run(cli: Cli) -> Result<(), String> {
             let answer = operator_of(&operator)?
                 .grant(AgentId(agent), Principal::Client(key), role)
                 .map_err(failed)?;
-            print_answer(&answer)
+            print_admin_answer(&answer)
         }
         Command::Call(call) => invoke(&call, None),
         Command::Query { call, linearizable } => invoke(&call, Some(linearizable)),
@@ -787,6 +787,17 @@ fn describe(answer: &Answer) -> String {
             code => format!("refused {code}"),
         },
         other => format!("{other:?}"),
+    }
+}
+
+/// An install's or a role's answer. Each overwrites what it sets, so one
+/// that timed out is safe to send again.
+fn print_admin_answer(answer: &Answer) -> Result<(), String> {
+    match answer {
+        Answer::TimedOut => {
+            Err("no answer in time: it may have run, or may yet; sending it again is safe".into())
+        }
+        other => print_answer(other),
     }
 }
 

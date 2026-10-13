@@ -57,6 +57,11 @@ pub struct Config<N: NodeId> {
     /// production workloads with high churn can lower it.
     /// Embedded targets writing to flash may want it larger.
     pub compact_hysteresis: u64,
+    /// Or once the live entries through the eligible index take this many
+    /// bytes, as the cache counts them: a log of large entries compacts
+    /// before it grows long. A host that compacts short of the bound keeps
+    /// well under this behind it, or every commit makes a compaction due.
+    pub compact_bytes: u64,
     /// Enable the pre-vote phase (Ongaro thesis §9.6).
     ///
     /// When `true` (default), a follower whose election timer
@@ -155,7 +160,7 @@ impl<N: NodeId> Config<N> {
     /// caller-required fields. Election timeouts default to
     /// 150–300ms and the heartbeat interval to 50ms — Raft's
     /// "10× smaller" guidance with margin. Compaction hysteresis
-    /// defaults to 16.
+    /// defaults to 16 entries or 64 MiB.
     pub fn new(me: N, members: Vec<N>, replication_id: [u8; 32]) -> Self {
         Self {
             me,
@@ -164,6 +169,7 @@ impl<N: NodeId> Config<N> {
             heartbeat_interval_ms: 50,
             replication_id,
             compact_hysteresis: 16,
+            compact_bytes: 64 << 20,
             pre_vote: true,
             install_snapshot_chunk_bytes: 32 * 1024,
             max_pending_reads: 1024,

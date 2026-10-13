@@ -381,6 +381,7 @@ impl Driver {
         config.election_timeout_ms = inner.election_timeout_ms;
         config.heartbeat_interval_ms = inner.heartbeat_ms;
         config.compact_hysteresis = inner.compact_every;
+        config.compact_bytes = inner.compact_bytes;
         config.snapshot_timeout_ms = inner.snapshot_timeout_ms;
         // The pair heartbeat vouches for an idle group's leader. An idle
         // leader goes round once per check-quorum window, which keeps it
@@ -986,7 +987,11 @@ impl Driver {
         if !std::mem::take(&mut self.compact_due) {
             return true;
         }
-        let mut point = self.compact_bound.saturating_sub(self.inner.compact_tail);
+        let mut point = self.core.compaction_point(
+            self.compact_bound,
+            self.inner.compact_tail,
+            self.inner.compact_tail_bytes,
+        );
         if let Some(lowest) = self.streams.values().map(|stream| stream.index).min() {
             point = point.min(lowest);
         }
