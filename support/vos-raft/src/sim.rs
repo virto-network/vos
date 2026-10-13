@@ -14,45 +14,16 @@
 
 use alloc::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use alloc::vec::Vec;
-use core::cmp::Reverse;
+use core::cmp::{self, Reverse};
 
 use crate::config::{Config, NodeId};
-use crate::core::{
-    Action, ActiveConfigRecord, Answer, Core, Recovered, SnapshotConfiguration, SnapshotSwitch,
-    Write,
-};
+use crate::core::{Action, ActiveConfigRecord, Answer, Core, Recovered, SnapshotSwitch, Write};
 use crate::log_entry::{EntryKind, LogEntry};
 use crate::message::Message;
 use crate::meta::Meta;
 use crate::pair::PeerTable;
+pub use crate::random::Random;
 use crate::role::Role;
-
-/// A small, seeded generator.
-#[derive(Debug, Clone)]
-pub struct Random(u64);
-
-impl Random {
-    pub fn new(seed: u64) -> Self {
-        Self(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
-    }
-
-    pub fn next_u64(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-
-    /// True with probability `per_million` / 1,000,000.
-    pub fn chance(&mut self, per_million: u64) -> bool {
-        self.next_u64() % 1_000_000 < per_million
-    }
-
-    /// Uniform in `low..=high`.
-    pub fn between(&mut self, low: u64, high: u64) -> u64 {
-        low + self.next_u64() % (high - low + 1)
-    }
-}
 
 /// What the network does to messages.
 #[derive(Debug, Clone, Copy)]
@@ -117,17 +88,18 @@ impl<N: Ord + Copy, P: Clone> Network<N, P> {
 
     /// The next delivery due at or before `now`.
     pub fn deliver(&mut self, now: u64) -> Option<(N, N, P)> {
-        let Reverse((at, _, _, _)) = *self.in_flight.peek()?;
-        if at > now {
-            return None;
+        loop {
+            let Reverse((at, _, _, _)) = *self.in_flight.peek()?;
+            if at > now {
+                return None;
+            }
+            let Reverse((_, id, from, to)) = self.in_flight.pop().expect("peeked");
+            let payload = self.payloads.remove(&id).expect("queued with its payload");
+            // A partition made after sending still stops the message.
+            if !self.cut.contains(&(from, to)) {
+                return Some((from, to, payload));
+            }
         }
-        let Reverse((_, id, from, to)) = self.in_flight.pop().expect("peeked");
-        let payload = self.payloads.remove(&id).expect("queued with its payload");
-        // A partition made after sending still stops the message.
-        if self.cut.contains(&(from, to)) {
-            return self.deliver(now);
-        }
-        Some((from, to, payload))
     }
 
     /// When the next message is due.
@@ -173,7 +145,7 @@ pub enum Packet {
         term: u64,
         index: u64,
         index_term: u64,
-        configuration: Option<SnapshotConfiguration<u16>>,
+        configuration: Option<ActiveConfigRecord<u16>>,
     },
 }
 
@@ -317,14 +289,10 @@ impl<N: NodeId> Store<N> {
             (self.meta.snap_last_index, self.meta.snap_last_term),
             |(index, entry)| (*index, entry.term),
         );
+        // The later position, by term then index.
         self.vote_floor = keep_floor.then(|| {
-            let (index, term) = last;
             self.vote_floor.map_or(last, |floor| {
-                if (floor.1, floor.0) > (term, index) {
-                    floor
-                } else {
-                    last
-                }
+                cmp::max_by_key(floor, last, |&(index, term)| (term, index))
             })
         });
         self.log.clear();
@@ -377,7 +345,8 @@ pub struct Cluster {
     pub now: u64,
     pub network: Network<u16, Packet>,
     nodes: Vec<u16>,
-    cores: BTreeMap<u16, Option<Core<u16>>>,
+    /// The cores of the nodes up: a node down or retired has none.
+    cores: BTreeMap<u16, Core<u16>>,
     stores: BTreeMap<u16, Store<u16>>,
     cfg: Config<u16>,
     /// Sync delay in milliseconds.
@@ -458,7 +427,8 @@ impl Cluster {
         cfg.snapshot_timeout_ms = 1_000;
         adjust(&mut cfg);
         let mut cluster = Self {
-            random: Random::new(seed),
+            // Spread, so that nearby seeds start far apart.
+            random: Random::new(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15)),
             now: 0,
             network: Network::new(faults),
             nodes: nodes.to_vec(),
@@ -528,7 +498,7 @@ impl Cluster {
     /// if it heard nothing yet.
     fn vouch(&mut self, node: u16) {
         let now = self.now;
-        let (Some(pair), Some(Some(core))) = (self.pair.as_ref(), self.cores.get_mut(&node)) else {
+        let (Some(pair), Some(core)) = (self.pair.as_ref(), self.cores.get_mut(&node)) else {
             return;
         };
         let table = pair.tables.get(&node);
@@ -547,7 +517,7 @@ impl Cluster {
         };
         pair.next = now + pair.interval;
         for &from in &self.nodes {
-            let Some(Some(core)) = self.cores.get(&from) else {
+            let Some(core) = self.cores.get(&from) else {
                 continue;
             };
             if pair
@@ -588,7 +558,7 @@ impl Cluster {
         let recovered = self.stores[&node].recovered();
         self.applied.insert(node, recovered.applied);
         let core = Core::new(cfg, recovered, self.now, seed);
-        self.cores.insert(node, Some(core));
+        self.cores.insert(node, core);
         self.process(node);
     }
 
@@ -597,7 +567,7 @@ impl Cluster {
     }
 
     pub fn core(&self, node: u16) -> Option<&Core<u16>> {
-        self.cores.get(&node)?.as_ref()
+        self.cores.get(&node)
     }
 
     /// Crash `node`: it loses its unsynced writes after a random prefix and
@@ -605,7 +575,7 @@ impl Cluster {
     pub fn crash(&mut self, node: u16) {
         let keep = self.random.next_u64() as usize % 4;
         self.stores.get_mut(&node).expect("a node").crash(keep);
-        self.cores.insert(node, None);
+        self.cores.remove(&node);
         // What it committed but had not synced is gone: once it commits
         // there again, those entries are compared again.
         self.checked.remove(&node);
@@ -618,19 +588,29 @@ impl Cluster {
     }
 
     pub fn restart(&mut self, node: u16) {
-        if !self.retired.contains(&node) && self.cores.get(&node).is_some_and(Option::is_none) {
+        let down = self.stores.contains_key(&node) && !self.cores.contains_key(&node);
+        if down && !self.retired.contains(&node) {
             self.start(node);
         }
+    }
+
+    /// Run until a leader is elected, for ten seconds at most: the leader.
+    pub fn settle(&mut self) -> u16 {
+        for _ in 0..100 {
+            self.run(100);
+            if let Some(leader) = self.leader() {
+                return leader;
+            }
+        }
+        panic!("no leader elected");
     }
 
     /// The node that leads at the highest term, if any.
     pub fn leader(&self) -> Option<u16> {
         self.cores
             .iter()
-            .filter_map(|(&node, core)| {
-                let core = core.as_ref()?;
-                (core.role() == Role::Leader).then(|| (core.status().current_term, node))
-            })
+            .filter(|(_, core)| core.role() == Role::Leader)
+            .map(|(&node, core)| (core.status().current_term, node))
             .max()
             .map(|(_, node)| node)
     }
@@ -639,7 +619,7 @@ impl Cluster {
     pub fn propose(&mut self, node: u16, payload: Vec<u8>) -> u64 {
         self.next_token += 1;
         let token = self.next_token;
-        if let Some(Some(core)) = self.cores.get_mut(&node) {
+        if let Some(core) = self.cores.get_mut(&node) {
             core.propose(token, payload);
             self.process(node);
         }
@@ -652,7 +632,7 @@ impl Cluster {
         let token = self.next_token;
         let floor = self.committed_index();
         self.read_floors.insert(token, floor);
-        if let Some(Some(core)) = self.cores.get_mut(&node) {
+        if let Some(core) = self.cores.get_mut(&node) {
             core.read_index(token, Some(2_000));
             self.process(node);
         }
@@ -661,7 +641,7 @@ impl Cluster {
 
     /// `node`'s host gives up on its unreported entries.
     pub fn discard_unreported(&mut self, node: u16) {
-        if let Some(Some(core)) = self.cores.get_mut(&node) {
+        if let Some(core) = self.cores.get_mut(&node) {
             core.discard_unreported();
             self.process(node);
         }
@@ -671,7 +651,7 @@ impl Cluster {
     pub fn change_membership(&mut self, node: u16, members: Vec<u16>) -> u64 {
         self.next_token += 1;
         let token = self.next_token;
-        if let Some(Some(core)) = self.cores.get_mut(&node) {
+        if let Some(core) = self.cores.get_mut(&node) {
             core.change_membership(token, members);
             self.process(node);
         }
@@ -683,7 +663,7 @@ impl Cluster {
     /// go, its term, vote and vote floor kept. `keep_floor` false retires
     /// as a host that kept no floor would.
     pub fn retire(&mut self, node: u16, keep_floor: bool) {
-        if self.cores.get(&node).is_none_or(Option::is_none) {
+        if !self.cores.contains_key(&node) {
             return;
         }
         self.stores
@@ -694,7 +674,7 @@ impl Cluster {
         self.checked.remove(&node);
         self.sync_due.remove(&node);
         self.entry_reports.remove(&node);
-        self.cores.insert(node, None);
+        self.cores.remove(&node);
         self.retired.insert(node);
         self.retirements += 1;
     }
@@ -734,32 +714,39 @@ impl Cluster {
                 .values()
                 .flat_map(|reports| reports.iter().map(|&(due, ..)| due))
                 .min(),
-            self.cores
-                .values()
-                .filter_map(|core| core.as_ref().map(Core::next_deadline))
-                .min(),
+            self.cores.values().map(Core::next_deadline).min(),
         ]
         .into_iter()
         .flatten()
         .min()
-        .unwrap_or(until)
-        .clamp(self.now, until);
-        self.now = next.max(self.now);
-        let now = self.now;
-        if self.pair.as_ref().is_some_and(|pair| pair.next <= now) {
+        .unwrap_or(until);
+        self.now = next.clamp(self.now, until);
+        if self.pair.as_ref().is_some_and(|pair| pair.next <= self.now) {
             self.send_pair_heartbeats();
         }
+        self.deliver();
+        self.run_syncs();
+        self.report_entries();
+        self.tick_all();
+        if self.now == until {
+            self.now += 1;
+        }
+    }
+
+    /// Deliver every packet due.
+    fn deliver(&mut self) {
+        let now = self.now;
         while let Some((from, to, packet)) = self.network.deliver(now) {
             match packet {
                 Packet::Raft(message) => {
-                    let due = self.cores.get(&to).is_some_and(|core| {
-                        core.as_ref()
-                            .is_some_and(|core| core.next_deadline() <= now)
-                    });
+                    let due = self
+                        .cores
+                        .get(&to)
+                        .is_some_and(|core| core.next_deadline() <= now);
                     if due || matches!(message, Message::PreVote { .. }) {
                         self.vouch(to);
                     }
-                    if let Some(Some(core)) = self.cores.get_mut(&to) {
+                    if let Some(core) = self.cores.get_mut(&to) {
                         core.tick(now);
                         core.receive(from, message);
                         self.process(to);
@@ -770,7 +757,7 @@ impl Cluster {
                     round,
                     leading,
                 } => {
-                    if self.cores.get(&to).is_some_and(Option::is_some)
+                    if self.cores.contains_key(&to)
                         && let Some(pair) = self.pair.as_mut()
                     {
                         let heard = pair.tables.entry(to).or_default().heard(
@@ -785,7 +772,7 @@ impl Cluster {
                         let gap = self.cfg.election_timeout_ms.1;
                         if heard.is_some_and(|heard| {
                             heard.new_run || heard.before.is_some_and(|before| before + gap <= now)
-                        }) && let Some(Some(core)) = self.cores.get_mut(&to)
+                        }) && let Some(core) = self.cores.get_mut(&to)
                         {
                             core.probe(from);
                             self.process(to);
@@ -800,6 +787,11 @@ impl Cluster {
                 } => self.install(from, to, term, index, index_term, configuration),
             }
         }
+    }
+
+    /// Sync every store whose sync is due.
+    fn run_syncs(&mut self) {
+        let now = self.now;
         let due: Vec<u16> = self
             .sync_due
             .iter()
@@ -810,6 +802,11 @@ impl Cluster {
             self.sync_due.remove(&node);
             self.sync(node);
         }
+    }
+
+    /// Report the entries whose lag ran out durable.
+    fn report_entries(&mut self) {
+        let now = self.now;
         for node in self.nodes.clone() {
             let Some(reports) = self.entry_reports.get_mut(&node) else {
                 continue;
@@ -817,29 +814,32 @@ impl Cluster {
             let (ready, waiting): (Vec<_>, Vec<_>) =
                 reports.drain(..).partition(|&(due, ..)| due <= now);
             *reports = waiting;
-            if let Some(Some(core)) = self.cores.get_mut(&node) {
+            if let Some(core) = self.cores.get_mut(&node) {
                 for (_, seq) in ready {
                     core.entries_durable(seq);
                 }
                 self.process(node);
             }
         }
+    }
+
+    /// Tick every core whose deadline is due, vouched for first.
+    fn tick_all(&mut self) {
+        let now = self.now;
         for node in self.nodes.clone() {
-            if self.cores.get(&node).is_some_and(|core| {
-                core.as_ref()
-                    .is_some_and(|core| core.next_deadline() <= now)
-            }) {
+            if self
+                .cores
+                .get(&node)
+                .is_some_and(|core| core.next_deadline() <= now)
+            {
                 self.vouch(node);
             }
-            if let Some(Some(core)) = self.cores.get_mut(&node)
+            if let Some(core) = self.cores.get_mut(&node)
                 && core.next_deadline() <= now
             {
                 core.tick(now);
                 self.process(node);
             }
-        }
-        if self.now == until {
-            self.now += 1;
         }
     }
 
@@ -849,13 +849,11 @@ impl Cluster {
         let store = self.stores.get_mut(&node).expect("a node");
         let synced = store.sync();
         store.applied = store.applied.max(applied);
-        let Some(Some(core)) = self.cores.get_mut(&node) else {
+        let Some(core) = self.cores.get_mut(&node) else {
             return;
         };
         if let Some(seq) = synced.seq {
             core.durable(seq);
-        }
-        if let Some(seq) = synced.seq {
             if self.entry_lag.1 == 0 {
                 core.entries_durable(seq);
             } else {
@@ -887,7 +885,7 @@ impl Cluster {
         term: u64,
         index: u64,
         index_term: u64,
-        configuration: Option<SnapshotConfiguration<u16>>,
+        configuration: Option<ActiveConfigRecord<u16>>,
     ) {
         for _ in 0..8 {
             if self.stores[&to].unsynced.is_empty() {
@@ -896,7 +894,7 @@ impl Cluster {
             self.sync_due.remove(&to);
             self.sync(to);
         }
-        let Some(Some(core)) = self.cores.get_mut(&to) else {
+        let Some(core) = self.cores.get_mut(&to) else {
             return;
         };
         let status = core.status();
@@ -923,10 +921,10 @@ impl Cluster {
     /// Carry out `node`'s actions.
     fn process(&mut self, node: u16) {
         loop {
-            let actions = match self.cores.get_mut(&node) {
-                Some(Some(core)) => core.take_actions(),
-                _ => return,
+            let Some(core) = self.cores.get_mut(&node) else {
+                return;
             };
+            let actions = core.take_actions();
             if actions.is_empty() {
                 break;
             }
@@ -946,7 +944,7 @@ impl Cluster {
                             .map(|(_, entry)| entry.clone())
                             .collect();
                         self.loads += 1;
-                        if let Some(Some(core)) = self.cores.get_mut(&node) {
+                        if let Some(core) = self.cores.get_mut(&node) {
                             core.loaded(load, entries);
                         }
                     }
@@ -961,10 +959,10 @@ impl Cluster {
                         term,
                         configuration,
                     } => {
-                        let sender_term = match self.cores.get(&node) {
-                            Some(Some(core)) => core.status().current_term,
-                            _ => continue,
+                        let Some(core) = self.cores.get(&node) else {
+                            continue;
                         };
+                        let sender_term = core.status().current_term;
                         let now = self.now;
                         self.network.send(
                             &mut self.random,
@@ -1041,7 +1039,7 @@ impl Cluster {
     /// Record what `node` committed through `index`, and compare it with
     /// what every other replica committed there.
     fn check_commit(&mut self, node: u16, index: u64) {
-        let Some(Some(core)) = self.cores.get(&node) else {
+        let Some(core) = self.cores.get(&node) else {
             return;
         };
         if index > core.status().last_log_index {

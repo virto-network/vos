@@ -46,6 +46,7 @@ mod log_view;
 pub mod message;
 pub mod meta;
 pub mod pair;
+mod random;
 pub mod role;
 pub mod sim;
 

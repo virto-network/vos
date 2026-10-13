@@ -22,9 +22,9 @@ Events in: `tick(now)` (`next_deadline()` says when), `receive(from,
 message)`, `propose`, `read_index`, `change_membership`,
 `transfer_leadership`, and the host's reports: `durable(seq)`,
 `entries_durable(seq)`, `loaded(load, entries)`, `snapshot_installed`,
-`snapshot_failed`, `durably_applied`, `compacted`, `writer_health`,
-`peer_alive`. `snapshot_switch` gives the rows a snapshot install
-writes.
+`snapshot_failed`, `durably_applied`, `compacted`, `writer_health`, and
+from the pair heartbeats `vouch` and `probe`. `snapshot_switch` gives the
+rows a snapshot install writes.
 
 Actions out (`take_actions()`), carried out in order:
 

@@ -360,7 +360,7 @@ mod tests {
     use std::collections::{BTreeMap, VecDeque};
     use std::sync::Arc;
 
-    use vos_raft::core::{Action, Answer, Core, SnapshotConfiguration};
+    use vos_raft::core::{Action, Answer, Core};
     use vos_raft::{Config, Message, Role};
     use vos_wire::result::Write as StateWrite;
 
@@ -584,7 +584,7 @@ mod tests {
         NodeNumber,
         u64,
         u64,
-        Option<SnapshotConfiguration<NodeNumber>>,
+        Option<ActiveConfigRecord<NodeNumber>>,
         Vec<(Vec<u8>, Vec<u8>)>,
     );
 
@@ -739,13 +739,7 @@ mod tests {
                             // Exported at the leader's own applied index,
                             // with the configuration in effect there.
                             let mut export = store.export(AGENT).unwrap();
-                            let configuration = core.config_at(export.applied).map(|record| {
-                                SnapshotConfiguration {
-                                    members: record.current,
-                                    joint_old: record.joint_old,
-                                    index: record.log_index.unwrap_or(0),
-                                }
-                            });
+                            let configuration = core.config_at(export.applied);
                             let mut rows = Vec::new();
                             while let Some(chunk) = export.next_chunk(1 << 12).unwrap() {
                                 rows.extend(chunk);

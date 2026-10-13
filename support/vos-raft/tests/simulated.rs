@@ -9,20 +9,10 @@ use vos_raft::sim::{Cluster, Faults};
 
 const NODES: [u16; 3] = [1, 2, 3];
 
-fn settle(cluster: &mut Cluster) -> u16 {
-    for _ in 0..100 {
-        cluster.run(100);
-        if let Some(leader) = cluster.leader() {
-            return leader;
-        }
-    }
-    panic!("no leader elected");
-}
-
 #[test]
 fn a_healthy_group_commits_in_order() {
     let mut cluster = Cluster::new(&NODES, 1, Faults::default());
-    let leader = settle(&mut cluster);
+    let leader = cluster.settle();
     for n in 0..20u8 {
         cluster.propose(leader, vec![n + 1]);
     }
@@ -35,13 +25,12 @@ fn a_healthy_group_commits_in_order() {
 #[test]
 fn read_index_answers_once_the_leader_is_confirmed() {
     let mut cluster = Cluster::new(&NODES, 2, Faults::default());
-    let leader = settle(&mut cluster);
+    let leader = cluster.settle();
     cluster.propose(leader, vec![9]);
     cluster.run(200);
     let token = cluster.read_index(leader);
     cluster.run(200);
     let index = cluster.reads[&token].expect("a read index");
-    assert!(index >= cluster.committed_index().min(index));
     assert!(index >= 2, "the term's no-op and the proposal");
 }
 
@@ -52,7 +41,7 @@ fn partitioned_minority_loses_quorum_majority_keeps_a_leader() {
     let all = [1, 2, 3, 4, 5];
     let mut cluster = Cluster::new(&all, 4, Faults::default());
     cluster.network.isolate(&[4, 5], &all);
-    let leader = settle(&mut cluster);
+    let leader = cluster.settle();
     cluster.run(2_000);
     let leading: Vec<u16> = all
         .into_iter()
@@ -71,7 +60,7 @@ fn partitioned_minority_loses_quorum_majority_keeps_a_leader() {
 #[test]
 fn isolated_follower_does_not_inflate_term_under_pre_vote() {
     let mut cluster = Cluster::new(&NODES, 5, Faults::default());
-    let leader = settle(&mut cluster);
+    let leader = cluster.settle();
     let isolated = NODES.into_iter().find(|&node| node != leader).unwrap();
     let terms = |cluster: &Cluster| {
         [leader, isolated].map(|node| cluster.core(node).unwrap().status().current_term)
@@ -94,7 +83,7 @@ fn a_voter_removed_while_down_holds_nothing_up() {
     let mut cluster = Cluster::with_config(&all, 3, Faults::default(), |cfg| {
         cfg.members = NODES.to_vec();
     });
-    let leader = settle(&mut cluster);
+    let leader = cluster.settle();
     let gone = NODES.into_iter().find(|&node| node != leader).unwrap();
     cluster.crash(gone);
     let replaced = |members: &[u16], out: u16, by: u16| -> Vec<u16> {
@@ -275,7 +264,7 @@ fn chaos(seed: u64, churn: bool, entry_lag: (u64, u64), paired: bool) -> Exercis
             directory(&mut cluster, nodes, 1_000_000);
         }
     }
-    settle(&mut cluster);
+    cluster.settle();
     if paired {
         // Healed and idle, every member catches up with no proposal to
         // carry it along.
@@ -327,7 +316,7 @@ fn chaos(seed: u64, churn: bool, entry_lag: (u64, u64), paired: bool) -> Exercis
         }
     }
     // The leader now, which a change in flight at the heal may have moved.
-    let leader = settle(&mut cluster);
+    let leader = cluster.settle();
     let before = cluster.committed_index();
     cluster.propose(leader, b"after".to_vec());
     cluster.run(1_000);

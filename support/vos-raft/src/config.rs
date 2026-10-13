@@ -61,7 +61,7 @@ pub struct Config<N: NodeId> {
     /// off, it skips a follower that holds every entry and the commit
     /// while no read waits, and arms no heartbeat deadline once it skips
     /// them all: the host vouches for the leader instead
-    /// ([`crate::core::Core::heard_leader_at`]). Default: `true`.
+    /// ([`crate::core::Core::vouch`]). Default: `true`.
     pub idle_heartbeats: bool,
 }
 

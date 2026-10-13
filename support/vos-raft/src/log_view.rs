@@ -7,6 +7,7 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
 
 use crate::config::NodeId;
+use crate::core::ActiveConfigRecord;
 use crate::log_entry::{EntryKind, LogEntry};
 
 /// Bytes an entry costs the cache beyond its payload.
@@ -47,8 +48,8 @@ pub(crate) struct LogView<N: NodeId> {
     cache: VecDeque<LogEntry<N>>,
     cache_bytes: usize,
     cache_limit: usize,
-    /// Every live configuration entry, by index.
-    configs: BTreeMap<u64, LogEntry<N>>,
+    /// The configuration of every live configuration entry, by index.
+    configs: BTreeMap<u64, ActiveConfigRecord<N>>,
     /// The log's running byte count at the end of each live entry, in
     /// order: the entry at `snap_index + 1 + k` ends at `ends[k]`, and the
     /// snapshot at `start`.
@@ -164,8 +165,8 @@ impl<N: NodeId> LogView<N> {
             self.last = entry.index;
             let end = self.ends.back().map_or(self.start, |&end| end);
             self.ends.push_back(end + entry_bytes(entry) as u64);
-            if matches!(entry.kind, EntryKind::ConfigChange { .. }) {
-                self.configs.insert(entry.index, entry.clone());
+            if let Some(config) = ActiveConfigRecord::from_entry(entry) {
+                self.configs.insert(entry.index, config);
             }
             // The cache is a suffix of the log: an append always continues it.
             if self
@@ -267,16 +268,36 @@ impl<N: NodeId> LogView<N> {
     /// The entry at `index`, if the cache or the configuration index holds
     /// it.
     pub(crate) fn entry(&self, index: u64) -> Option<LogEntry<N>> {
-        if let Some(entry) = self.configs.get(&index) {
-            return Some(entry.clone());
+        if let Some(config) = self.configs.get(&index) {
+            let (joint_old, members) = (config.joint_old.clone(), config.current.clone());
+            return Some(LogEntry::config_change(
+                index,
+                self.term_at(index)?,
+                joint_old,
+                members,
+            ));
         }
         let first = self.cache.front()?.index;
         (index >= first && index <= self.last).then(|| self.cache[(index - first) as usize].clone())
     }
 
-    /// Live configuration entries, in index order.
-    pub(crate) fn configs(&self) -> impl DoubleEndedIterator<Item = &LogEntry<N>> {
+    /// The configurations of live configuration entries, in index order.
+    pub(crate) fn configs(&self) -> impl DoubleEndedIterator<Item = &ActiveConfigRecord<N>> {
         self.configs.values()
+    }
+
+    /// The configuration of the latest configuration entry at or below
+    /// `index`, if the log holds one.
+    pub(crate) fn config_at(&self, index: u64) -> Option<&ActiveConfigRecord<N>> {
+        self.configs
+            .range(..=index)
+            .next_back()
+            .map(|(_, config)| config)
+    }
+
+    /// Whether the log holds a configuration entry above `index`.
+    pub(crate) fn config_after(&self, index: u64) -> bool {
+        self.configs.range(index + 1..).next().is_some()
     }
 
     /// The first cached index, if any entry is cached.

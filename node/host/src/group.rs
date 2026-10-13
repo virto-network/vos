@@ -9,10 +9,9 @@ use std::time::{Duration, Instant};
 use smol::future::FutureExt;
 use vos_net::Class;
 use vos_raft::core::{
-    Action, Answer, ChangeMembershipError, Core, ProposeError, ReadIndexError,
-    SnapshotConfiguration, Write,
+    Action, Answer, ChangeMembershipError, Core, ProposeError, ReadIndexError, Write,
 };
-use vos_raft::{Config as RaftConfig, Message, Role};
+use vos_raft::{ActiveConfigRecord, Config as RaftConfig, Message, Role};
 use vos_wire::ids::AgentId;
 use vos_wire::peer::{
     Configuration, CreationRecord, Manifest, NodeNumber, PeerMessage, Placement, SnapshotAck,
@@ -1225,10 +1224,10 @@ impl Driver {
                 .manifest
                 .configuration
                 .clone()
-                .map(|configuration| SnapshotConfiguration {
-                    members: configuration.members,
+                .map(|configuration| ActiveConfigRecord {
+                    log_index: Some(configuration.index),
+                    current: configuration.members,
                     joint_old: configuration.joint_old,
-                    index: configuration.index,
                 });
         let switch =
             self.core
