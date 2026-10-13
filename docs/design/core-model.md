@@ -1041,25 +1041,36 @@ These form a prover track that runs alongside the core slices (section 16).
   verification on the interpreter.
 - The shared-executor Raft driver keeps vos-raft's core free of threads.
 
-## 14. Performance budgets [decided; measured in run 3 and slices 1 and 2]
+## 14. Performance budgets [decided; measured in run 3 and slices 1 to 3]
 
 | Path | Budget | Measured | Status |
 |---|---|---|---|
 | Actor invocation, refine and accumulate, one node | ≤ 50 µs | the default agent on one node with fjall storage, counter increments under load: 21–24 µs per request on the JIT, 85 µs on the interpreter, plus a 0.9 ms synced commit per batch of 165–210 requests (slice 2) | passes on the JIT; the interpreter, kept for tracing and platforms without the JIT, misses |
 | Committed-map write on the apply path [proposed] | ≤ 5 µs; background root building keeps up with apply | not yet measured; node rows in accumulate would cost 35–45 µs (S4) | needs background roots |
 | Fixed cost per refine [proposed] | ≤ 50 µs; pooled acquire and reset ≤ 5 µs; a new machine ≤ 50 µs | an empty refine on a kept agent machine 13 µs (JIT) and 10 µs (interpreter); pooled acquire, use and reset 1.6 and 1.1 µs; a new machine 7–10 and about 32 µs (slices 1 and 2) | passes |
-| Replicated agent on 3 LAN nodes, simple mutations | ≥ 20k per second per agent; p99 commit ≤ 10 ms at half load | about 25k/s at p99 8 ms with the prototype driver, on redb, one process, one disk (S3) | passes with section 16 work; repeat on fjall and a network |
-| Many active agents per node [proposed] | 64 active agents: ≥ 40k commits per second in total, p99 ≤ 20 ms | 6.3–26k/s at p99 31–191 ms (S3) | fails; work item 16 |
+| Replicated agent on 3 LAN nodes, simple mutations | ≥ 20k per second per agent; p99 commit ≤ 10 ms at half load | three node processes over QUIC, signed calls over HTTP (slice 3). The most, closed loop at 256 sessions: 18.6–19.5k/s on the reference pinning, 19.7–20.1k/s with the leader on cores of its own. The half-load p99, open loop: 6.7–14.2 ms in five runs (one of four over HTTP within 10 ms, 8.2 ms over HTTPS), and 7.0–10.9 ms in four with cores of its own (three within 10 ms). The prototype driver's 25k/s at p99 8 ms (S3) was one process, unsigned | at the edge on the laptop: capacity just short or just met; the half-load p99 not met reliably; awaiting a machine of its own |
+| Many active agents per node [proposed] | 64 active agents: ≥ 40k commits per second in total, p99 ≤ 20 ms | three node processes, reference pinning (slice 3): 33.9k/s most at 16 sessions each (p99 45 ms); open loop p99 6.8 ms at 20k/s and 106 ms at 25k/s, so the knee lies between; closed, the nodes 4.6–5.3 of their 6 logical CPUs busy, hyperthreads included | misses on the laptop; awaiting a machine of its own and the owner's contract levers |
 | Workflow snapshot capture plus restore, up to 50 KB | ≤ 1 ms | 3-page suspensions: capture 0.2–0.6 µs (interpreter) and 8–12 µs (JIT, quiet machine; 6–19 µs under load), copying and hashing the pages 10–15 µs, writing them into a pooled machine 0.3 µs (excluding its reset on return, 2.4–3.5 µs, and loading registers, gas and counter); a 2 MiB suspension takes 150–190 µs and about 400 µs to write (slice 1, S1) | passes |
-| Table point read or write at 10M rows (host cost) | ≤ 5 µs | write 2.5–3.3 µs; read 2.5–3.2 µs compacted, 5.0–5.2 µs with 620k fresh updates in the memtable and level 0, about 0.1 ms cold (slice 2) | pass compacted; at the edge behind fresh writes |
-| Query on a follower | ≤ 100 µs | through a node's query path (executor round trip, snapshot, refine in query mode, one actor): median 49 µs and p99 115–175 µs on the JIT, median 87 µs on the interpreter (slice 2) | passes at the median |
-| Request latency on a quiet node [proposed] | ≤ 5 ms at p99 | one request at a time on one node: about 3 ms in process, the batch's 2 ms linger plus a 0.9 ms synced commit; its execution, 260–340 µs, is idle-core cost (slice 2) | passes in process; over HTTP not measured |
+| Table point read or write at 10M rows (host cost) | ≤ 5 µs | write 2.5–3.3 µs; read 2.5–3.2 µs compacted, 5.0–5.2 µs with 620k fresh updates in the memtable and level 0, about 0.1 ms cold (slice 2); read under the 64-agent run's writes at 31–32k inputs/s, over a whole memtable cycle, at the store: mean 2.68–2.72 µs, p99 3.70–3.81 µs, against 2.29–2.34 and 3.54–3.68 alone (slice 3, two runs) | passes compacted and under continuous writes; at the edge behind a bulk of fresh writes to the table itself |
+| Query on a follower | ≤ 100 µs | through a node's query path (executor round trip, snapshot, refine in query mode, one actor): median 49 µs and p99 115–175 µs on the JIT, median 87 µs on the interpreter (slice 2); a follower of three processes (two runs over HTTP, one over HTTPS): p50 0.12–0.23 ms, p99 0.22–0.34 ms client to answer, 86–92 µs of the follower's CPU a query; linearizable, p50 0.36–0.41 ms and 244 µs (slice 3) | open: met at the median, missed at p99; the percentile is the owner's call |
+| Request latency on a quiet node [proposed] | ≤ 5 ms at p99 | one request at a time on one node: about 3 ms in process, the batch's 2 ms linger plus a 0.9 ms synced commit; its execution, 260–340 µs, is idle-core cost (slice 2); three processes over HTTP, one call at a time: p50 2.7 ms, p99 3.3 ms (slice 3) | passes |
 | Merge apply, cost per operation at 1M operations | ≤ 2× the cost at 1k | 1.5–1.8× with incremental apply on LWW maps, in memory (S6) | passes with section 16 work |
-| 1,000 mostly idle Raft groups per node | no thread per group; idle CPU ≤ 5% of one core | about 1.6% at a 500 ms heartbeat (S3) | passes |
+| 1,000 mostly idle Raft groups per node | no thread per group; idle CPU ≤ 5% of one core | about 1.6% at a 500 ms heartbeat (S3); three node processes with 1,000–1,065 groups each: 1.0–1.4% of one core, 16–17 threads (slice 3) | passes |
 
 - All measurements ran on one laptop (Core Ultra 7 155H, consumer NVMe),
   with all three replicas sharing one disk and a warm page cache. Runs
   with many active agents varied up to 4×.
+- Slice 3's rows ran three release node processes, their stores on
+  tmpfs, a driver signing every call before its window, and two
+  pinnings:
+  - **the reference:** each node on two hyperthread pairs of P-cores
+    and two E-cores;
+  - **cores of its own:** the leader on two P-cores whose siblings stay
+    idle, and two E-cores.
+
+  Refine an input costs about 40 µs on the reference pinning against
+  17–20 µs in one process, so a machine of its own may move the
+  replicated rows. The slice 3 progress log has every run.
 - No hot path may grow with history length.
 
 ## 15. Worked examples

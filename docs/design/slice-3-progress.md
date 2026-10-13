@@ -8371,3 +8371,204 @@ All of them run in `just ci`.
     `a_record_reaches_a_node_that_comes_up_later_while_its_creator_runs`
     stop and start a node, rather than kill it mid-write. The pull's
     rule is the same either way: no record, so it asks.
+
+#### 3.10c Measured: table reads under continuous writes
+
+Section 9.5 left the steady-state cost of a table read under continuous
+writes to this slice. `store-bench <rows> writes` measures it in
+process, on one store under `target/` (the disk):
+- **The table:** 10M rows of 64 bytes, loaded and compacted.
+- **The writers:** 64 other agents writing as the 64-agent run does,
+  calibrated against the in-process run (`benches/agents.rs` now prints
+  a work result's stored bytes):
+  - 10 inputs a batch and 2.6 batches a flush. The run measured 10.3 and
+    2.7 at 16 sessions each.
+  - Each flush: its log entries in one synced commit, its applies in one
+    buffered.
+  - Per input: a session mark, a kept reply, and the reply the window
+    drops.
+  - Per batch: the agent's state row, its batch time, last result and
+    hard state.
+  - A work result's entry of 1,000 bytes, random so no block compression
+    shrinks it. The run stored 996 bytes for 10.3 inputs, and 286 for
+    2.5: about 58 + 91 per input.
+  - Every agent's log compacted every 1,024 entries, keeping 256.
+- **What a read pays:** of all those writes, only the agents' state rows
+  reach the table's partition. So a read pays:
+  - the partition's memtable, which it searches first;
+  - interference from the other partitions: CPU, cache and the journal.
+  - It does not pay the table's own write amplification: nothing
+    rewrites the table here.
+- **Timed over one whole memtable cycle,** from one rotation to the
+  next. Rotations in the first minute are passed over: the table's load
+  left rows in the memtable, and the other partitions' cycles have only
+  begun.
+  - fjall rotates a memtable at its size cap (64 MiB), or when the
+    shared journal reaches its own (512 MiB).
+  - Here the journal's cap came first: the cycle ended at 16.4 MiB.
+
+| 10M rows, two runs | Mean | p50 | p99 |
+|---|---|---|---|
+| Reads alone | 2.29, 2.34 µs | 2.27, 2.31 µs | 3.54, 3.68 µs |
+| Under the writers, over one cycle (64 s, 67 s) | 2.72, 2.68 µs | 2.69, 2.67 µs | 3.81, 3.70 µs (30 and 16 reads past 100 µs) |
+
+- **The writers kept 32,350 and 31,017 inputs a second of the 40,000
+  asked.** One
+  thread synced each flush on the disk. That is still above the laptop's
+  64-agent knee (20–25k/s in 3.10c's run), so the node never writes this
+  much.
+- **Through the first run's cycle,** each window's mean against the
+  active memtable's size (the second's: 2.99, 2.67, 2.62, 2.63 and 2.80
+  µs, no memtable sealed at its start):
+
+| Active memtable | Sealed, not yet flushed | Mean |
+|---|---|---|
+| 0 MiB | 1 | 3.05 µs |
+| 4.1 MiB | 0 | 2.71 µs |
+| 7.9 MiB | 0 | 2.76 µs |
+| 12.4 MiB | 0 | 2.64 µs |
+| 16.4 MiB | 0 | 3.15 µs |
+
+- The first and last marks are the cycle's dearer moments:
+  - the first, with the previous memtable sealed and flushing;
+  - the last, at the largest memtable.
+  - The whole cycle's mean includes both, as it should.
+
+**Verdict:** at the store, the table point read budget (≤ 5 µs at 10M
+rows) holds under the 64-agent run's writes. Over two runs: +0.34 to
++0.43 µs mean, +0.02 to +0.27 µs p99. That is with one reader, the
+writers at 31–32k inputs/s synced on disk, and memtable cycles that the
+journal's cap ended at 16 MiB.
+
+**What it does not include:**
+- **A loaded node's own contention for CPU:** executors, its runtime and
+  signature checks. At the knee every node is out of CPU, which weighs
+  on a read far more than this. So it is the store's own cost of reading
+  under the mix, not a read's time in a saturated node.
+- **The marks within a cycle vary by about ±0.25 µs,** as much as
+  between the two runs.
+
+#### 3.10c Measured: the rows on the laptop
+
+**Setup:** the laptop, stores on tmpfs (`DATA=/tmp`), nodes pinned as
+section 14 records.
+- **The reference pinning:** each node on two hyperthread pairs of
+  P-cores and two E-cores (`0,5,1,2,12,13` / `3,4,6,7,14,15` /
+  `8,9,10,11,16,17`), the driver on `18–21`.
+- **Cores of its own:** `CPUS=0,1,3,6/8,10,12,13/14,15,16,17/18,19,20,21`.
+  - Each P-core here has its sibling idle.
+  - In all four runs node 2 led: two such P-cores and two E-cores.
+
+**One agent** (the budget: ≥ 20k/s; p99 ≤ 10 ms at half load):
+
+| Pinning, leader | Most, closed (256 sessions) | Half load, open: p99 | Open at 15k/s: p99 | Open at 18k/s |
+|---|---|---|---|---|
+| reference, node 2 | 18.9k/s | 12.0 ms | 18.8 ms | behind: p50 151 ms |
+| reference, node 1 (the TLS comparison's plain run) | 19.5k/s | 6.7 ms | 14.9 ms | behind |
+| reference, node 1, TLS | 19.5k/s | 8.2 ms | 11.5 ms | behind |
+| reference, node 1 (the knee rule's first check) | 19.5k/s | 14.2 ms | 9.1 ms | behind: p50 22 ms |
+| reference, node 2 (its second check) | 18.6k/s | 10.9 ms | 11.5 ms | behind: p50 242 ms |
+| its own cores, node 2, four runs | 19.7–20.1k/s | 8.8, 9.0, 7.0, 10.9 ms | 7.9–10.1 ms | behind: p50 40–248 ms |
+
+- **Capacity:** at the edge with cores of its own (19.7–20.1k/s closed),
+  just short on the reference pinning (18.6–19.5k/s).
+  - The open loop keeps up at 15k/s and falls behind by 18k/s. That is
+    within a tenth of what its 256 sessions do closed, where queueing
+    grows without bound. The closed rows are the capacity measure.
+- **The half-load p99 is not met reliably on the laptop:**
+  - with cores of its own, three runs of four are within 10 ms (7.0–10.9
+    ms);
+  - on the reference pinning over HTTP, one of four (6.7, 10.9, 12.0 and
+    14.2 ms), and the HTTPS run 8.2 ms.
+  - It varies from run to run, more than the budget's margin.
+- **Since 3.10a–b, at 256 sessions closed:**
+  - then: 15.2–16.3k/s on the reference pinning, and 16.9k/s with cores
+    of its own;
+  - now: 18.6–19.5k/s and 19.7–20.1k/s.
+  - At 64 sessions the runs are not clearly higher: 11.9–17.1k/s now,
+    12.7–14.6k/s then.
+  - Nothing on the hot path changed in 3.10c, and the difference is not
+    separated. The machine's load outside the runs was −0.2 to 1.2
+    cores.
+
+**64 agents**, reference pinning (the budget: 40k/s at p99 ≤ 20 ms):
+- **Closed:** 22.9k/s at 4 sessions each (p99 17 ms) and 33.9k/s at 16
+  (p99 45 ms). Every node is 4.6–5.3 of its 6 CPUs busy.
+- **Open:** p99 3.3, 3.7, 4.1 and 6.8 ms at 5k, 10k, 15k and 20k/s; 106
+  ms at 25k/s. **The knee lies between 20k and 25k/s**, against 15–20k/s
+  in 3.10a. At 40k/s: p50 0.73 s.
+- **Missed on the laptop,** as before: the owner's machine and contract
+  levers decide it.
+
+**The rest:**
+
+| Row | Result | Budget |
+|---|---|---|
+| Quiet node, one call at a time | p50 2.71 ms, p99 3.27 ms | p99 ≤ 5 ms: passes |
+| Query on a follower, applied | p50 0.20–0.23 ms, p99 0.28–0.34 ms at 2k/s; p50 0.12–0.14, p99 0.22 at 6k/s. The follower's marginal CPU 86–92 µs a query. Three runs: two over HTTP, one over HTTPS | ≤ 100 µs: the node's path (in process: median 51 µs, p99 151 µs) |
+| Query on a follower, linearizable | p50 0.36 ms, p99 0.87 ms at 2k/s; p50 0.41, p99 1.25 at 6k/s. The follower's marginal CPU 244 µs a query; the leader about 110 µs a query at 6k/s | (item 13) |
+| 1,000 idle groups per node, beside the agent rows' | 1.0–1.2% of one core, 17 threads, 490–513 MiB | ≤ 5%: passes |
+| Failover, 64 agents under load (second run) | a leader for every agent 2.73 s after the kill; every directory 2.74 s (a sweep: 0.01 s) | 6 s, then 1 s: passes |
+| Failover, 1,000 idle agents a node (second run) | 2.57 s; 2.64 s (a sweep: 0.07 s) | passes |
+| Soak, 30 min at 6k/s on the 64 agents, on this build (3.10b3's two 30-minute soaks held too: 777 and 835 µs per commit, p99 5.0 and 5.8 ms) | holds: p50 2.80 → 2.83 ms, p95 3.19 → 3.22 ms, CPU per commit 615 → 628 µs, no runtime stall, 900 MiB a node | ±10%: holds |
+
+**What the rows add:**
+- **A linearizable read's round** (item 13), the difference between the
+  two query rows at 6k/s:
+  - the follower: +158 µs of CPU and +0.29 ms at p50;
+  - the leader: about 110 µs of CPU per read, where an applied read
+    costs it nothing;
+  - the other follower: about 34 µs, its share of the round's
+    heartbeats.
+  - Reads that arrive together could share one read index request and
+    its round. Batching them is a candidate lever, unscheduled.
+- **TLS** costs little once connected (the TLS run against the plain run
+  beside it, the same pinning and leader):
+  - the leader's CPU per commit within 2% from 4 sessions up;
+  - +42 µs at one call at a time (781 against 739 µs);
+  - the follower's marginal CPU per query 88 against 92 µs.
+  - The connections persist, so this is TLS per request. Handshakes are
+    not measured.
+- **A restarted node listened 3.3 s and 6.5 s after its start** in these
+  runs. In the first, which had no load before the kill, it took 0.2–0.3
+  s. Here it was killed after minutes of load, so a fjall journal to
+  replay is the candidate cause, bounded by the journal's 512 MiB cap.
+  Not attributed.
+
+**The bench's knee rule, corrected:**
+- It had called a run past the knee whenever a call waited on its
+  session's previous one, and then gave no CPU per commit.
+- One long batch holds calls that way well below the knee. That is why
+  the soak printed no CPU per commit in most windows, and why 3.10b
+  flagged 6k/s.
+- A run is now past the knee when its backlog grows. Two signs, both
+  needed:
+  - more than 1% of the calls scheduled in its window are answered after
+    the window ends;
+  - the median latency of the calls scheduled in the window's last
+    quarter is at least twice the first quarter's.
+- **Why both:** 1% alone is a latency threshold that scales with the
+  window. It is 50 ms of a 5 s window and 500 ms of the soak's 50 s ones,
+  so one long batch straddling a window's end could flag a run below the
+  knee. Such a stall does not move the last quarter's median. A growing
+  backlog does.
+- **A closed loop is never flagged:** its late calls are at most one per
+  session, a fraction of a percent here.
+- The calls that waited are still counted, and printed apart.
+
+#### 3.10c Gates: the budgets, each with a verdict
+
+| Budget | Verdict on the laptop |
+|---|---|
+| One agent: ≥ 20k/s | **at the edge:** 19.7–20.1k/s with the leader on cores of its own, 18.6–19.5k/s on the reference pinning. Awaiting a machine of its own. |
+| One agent: p99 ≤ 10 ms at half load | **not met reliably on the laptop:** within 10 ms in three runs of four with cores of its own (7.0–10.9 ms); on the reference pinning in one of four over HTTP (6.7, 10.9, 12.0, 14.2 ms) and 8.2 ms over HTTPS. Awaiting a machine of its own. |
+| 64 agents: ≥ 40k/s at p99 ≤ 20 ms | **missed:** the knee lies between 20k and 25k/s; closed, the nodes are 4.6–5.3 of their 6 logical CPUs busy, hyperthreads included. Awaiting a machine of its own and the owner's contract levers: followers applying the leader's writes, a write host call without the previous length, batch signature checks. |
+| Query on a follower ≤ 100 µs | **open:** met at the median on the node's path (51 µs), missed at p99 (151 µs). Which percentile is the owner's call. |
+| Quiet node: p99 ≤ 5 ms | **met:** 3.3 ms over HTTP. |
+| 1,000 idle groups: ≤ 5% of a core, no thread per group | **met:** 1.0–1.4%, 16–17 threads. |
+| Table read at 10M rows ≤ 5 µs, under continuous writes | **met** at the store: p99 3.70–3.81 µs under the 64-agent mix, two runs. |
+| Failover: a leader within 6 s, directories within 1 s more | **met:** 2.2–2.7 s; directories within 0.07 s, twice each at 64 agents and at 1,000 a node. |
+| Soak: no growth over 30 minutes | **holds:** 3.10b3's two soaks and this build's. |
+| Exactly-once | **holds:** the checker loop (48 runs) and the fault suite; every bench run's counters too. |
+
+"Awaiting" is not "passed": the end review weighs it as open.
