@@ -15,8 +15,7 @@
 //! writer indexes in order, so only a segment's tail can be unindexed.
 //!
 //! A blob lives while a log row names it, a pin holds it, or it was put
-//! within a horizon; [`Blobs::collect`] removes the rest (section 9.5,
-//! invariant 7, and step 3.3's design).
+//! within a horizon; [`Blobs::collect`] removes the rest.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
@@ -373,7 +372,6 @@ impl Blobs {
                 None => {
                     let path = segment_path(&self.inner.dir, location.segment);
                     let file = Arc::new(File::open(path)?);
-                    // Open handles, bounded.
                     if files.len() >= OPEN_SEGMENTS {
                         files.clear();
                     }
@@ -629,7 +627,7 @@ fn record_at(file: &File, at: u64, len: u64) -> Result<Option<([u8; 32], u64)>> 
 /// what it said it wrote) is checked too: the last indexed record is
 /// rehashed, and if it, or the file, falls short, the segment is walked
 /// from its start and the index rows past the damage go, so the log's
-/// entries naming those blobs are cut on open (invariant 7).
+/// entries naming those blobs are cut on open.
 fn recover(
     dir: &Path,
     index: &Keyspace,
@@ -689,7 +687,7 @@ fn recover(
 /// Drop the rows of segments whose files are gone: a collection deleted
 /// the file, and a crash took back the synced batch that removed its rows
 /// (a disk that lost what it said it wrote). Blobs indexed there are lost,
-/// and the log's entries naming them are cut on open (invariant 7).
+/// and the log's entries naming them are cut on open.
 fn forget_missing_segments(
     index: &Keyspace,
     batch: &mut fjall::OwnedWriteBatch,

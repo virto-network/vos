@@ -74,6 +74,8 @@ pub enum AppendResult {
     Rejected {
         rejected: u64,
         last_index: u64,
+        /// The term of the follower's entry at `rejected`, or 0 when it
+        /// holds none there: the leader then goes on from `last_index + 1`.
         conflict_term: u64,
         conflict_first: u64,
     },

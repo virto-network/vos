@@ -1,5 +1,5 @@
 //! Log entries and the blobs they name, killed mid-write: no surviving
-//! entry lacks its blob (section 9.5, invariant 7).
+//! entry lacks its blob.
 //!
 //! A child process appends entries that each name a blob, as a replica
 //! does: some after storing the blob, some before (an append may arrive
@@ -20,7 +20,6 @@
 //!   (collection may have moved an older blob to the tail);
 //! - the log has no gap.
 
-/// The allocator the node's binary runs on.
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

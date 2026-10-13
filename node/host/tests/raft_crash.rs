@@ -8,19 +8,17 @@
 //! checks, over several rounds on one store, later rounds tearing the
 //! journal's tail as a power loss could:
 //!
-//! - the applied index and the state are one prefix of the applies
-//!   (section 9.5, invariant 1);
+//! - the applied index and the state are one prefix of the applies;
 //! - the log holds every entry from its start through the applied index,
-//!   and on to its end with no gap (invariant 2: an apply is never durable
-//!   without the append before it);
-//! - the log starts at or below the applied index (invariant 4);
+//!   and on to its end with no gap: an apply is never durable without the
+//!   append before it;
+//! - the log starts at or below the applied index;
 //! - the term and every append the child reported synced survive, but for
 //!   a tear's reach.
 //!
 //! The store lives in a temporary directory, which may be tmpfs: the test
 //! covers recovery, not the disk's durability.
 
-/// The allocator the node's binary runs on.
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

@@ -12,13 +12,12 @@ use alloc::vec::Vec;
 use crate::config::NodeId;
 
 /// One log entry. `index` is 1-based and contiguous within a
-/// group; entries with `index <= snap_last_index` are eligible
-/// for compaction once the leader observes a quorum has
-/// replicated them.
+/// group; each replica compacts on its own through the lower of
+/// its commit and what it has applied durably.
 ///
 /// Most entries are `EntryKind::Data` carrying an application
-/// payload; membership APIs add `EntryKind::ConfigChange`
-/// entries produced by membership-change APIs.
+/// payload; a membership change adds `EntryKind::ConfigChange`
+/// entries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogEntry<N: NodeId> {
     pub index: u64,
@@ -40,11 +39,9 @@ pub enum EntryKind<N: NodeId> {
     /// follow-up `ConfigChange { joint_old: None, .. }` retires
     /// the joint phase.
     ///
-    /// Reserved variant: emitted by a forthcoming
-    /// `WorkerHandle::change_membership(...)` API and consumed
-    /// by the worker itself to update its quorum view.
-    /// Application apply-sinks should ignore entries whose
-    /// `kind` isn't `Data`.
+    /// The core appends these for a membership change and takes
+    /// its quorum view from them; an application's apply skips
+    /// entries whose `kind` isn't `Data`.
     ConfigChange {
         joint_old: Option<Vec<N>>,
         members: Vec<N>,
@@ -65,11 +62,7 @@ impl<N: NodeId> LogEntry<N> {
     /// Construct an `EntryKind::ConfigChange` entry. `joint_old`
     /// = `Some(...)` produces the joint-phase entry; `None`
     /// produces the final non-joint entry that retires a joint
-    /// phase. Mostly useful in tests; production callers use
-    /// [`WorkerHandle::change_membership`] which constructs
-    /// these internally.
-    ///
-    /// [`WorkerHandle::change_membership`]: crate::worker::WorkerHandle::change_membership
+    /// phase.
     pub fn config_change(
         index: u64,
         term: u64,

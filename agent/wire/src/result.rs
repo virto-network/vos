@@ -13,7 +13,7 @@ use crate::ids::{AgentId, InstanceId, MethodId, ProgramHash, SessionId, SessionR
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct WorkResult {
     /// The state version the refine read; accumulate applies the result
-    /// only if it is still current (section 7.5).
+    /// only if it is still current.
     pub version: u64,
     pub time: u64,
     pub seed: [u8; 32],
@@ -144,9 +144,9 @@ pub struct Outgoing {
     pub arguments: Vec<u8>,
 }
 
-/// An attestable method run in this step, unproven in slice 2, kept for
-/// step 5's proofs. Its arguments may be private: work results stay in the
-/// space's log (section 11.1) and are never published as they are.
+/// An attestable method run in this step, kept so the run can be proven
+/// later. Its arguments may be private: work results stay in the space's
+/// log and are never published as they are.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Attest {
     pub program: ProgramHash,

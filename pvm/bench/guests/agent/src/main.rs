@@ -42,7 +42,7 @@ const EXPUNGE: u64 = 14;
 const INSTANTIATE: u64 = 0x480;
 const WHAT: u64 = u64::MAX - 1;
 
-// Node calls (VOS extensions in this spike).
+// Node calls (VOS extensions).
 const INPUT_NEXT: u64 = 0x100;
 const STATE_GET: u64 = 0x101;
 const STATE_PUT: u64 = 0x102;

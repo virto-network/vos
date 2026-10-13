@@ -24,7 +24,7 @@ test-bench: build-bench-guests
 test-bench-proof: build-bench-guests
     cargo test -p vos-pvm-bench --features prove --test diverse_proof --test precompile_tamper -- --test-threads=1
 
-# Spike benches against this tree: S1 snapshots, S2 nesting.
+# Machine benches: snapshots of suspended workflows, and nested invocation.
 bench: build-bench-guests
     cargo run --release -p vos-pvm-bench --bin snapshots
     cargo run --release -p vos-pvm-bench --bin nesting

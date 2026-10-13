@@ -2,7 +2,6 @@
 //! each arrival passes the checks before it reaches a group, here a real
 //! consensus core.
 
-/// The allocator the node's binary runs on.
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

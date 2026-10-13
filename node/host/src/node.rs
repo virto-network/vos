@@ -57,16 +57,19 @@ pub struct Config {
     pub executors: usize,
     /// Client requests an agent queues before a call answers busy.
     pub queue: usize,
-    /// The most inputs, and argument bytes, in one batch.
+    /// The most inputs in one batch.
     pub max_inputs: usize,
+    /// The most argument bytes in one batch.
     pub max_bytes: usize,
     /// How long a leader waits for more inputs after the first, when it
     /// found its queue empty.
     pub linger: Duration,
+    /// Refine's gas for one run: a batch, or a query.
     pub refine_gas: u64,
     /// Accumulate's gas for the agents this node creates: their creation
     /// records carry it to every replica.
     pub accumulate_gas: u64,
+    /// Where a test breaks the node as a crash or a bug would.
     pub hooks: Arc<dyn Hooks>,
     /// The faults a test injects, read from a control file.
     #[cfg(feature = "faults")]
@@ -80,37 +83,38 @@ pub struct Config {
     /// The space this node runs in. Without one, it is a space of one, as
     /// node 0.
     pub space: Option<Space>,
+    /// How the node reaches the other nodes of its space.
     pub peers: Peers,
     /// Where the peer endpoint binds, when not the address its space
     /// lists: behind port forwarding, a relay, or in a container.
     pub peer_bind: Option<std::net::SocketAddr>,
     /// How long a connection to a peer may stay quiet before it closes.
     pub quic_idle: Duration,
-    /// A replica group's election timeout, drawn between these, and its
-    /// leader's heartbeat, in milliseconds.
+    /// A replica group's election timeout in milliseconds, drawn between
+    /// these.
     pub election_timeout_ms: (u64, u64),
+    /// How often a group's leader sends heartbeats, in milliseconds.
     pub heartbeat_ms: u64,
     /// How long a call or an admin command, once queued at the leader,
     /// waits for its answer before it answers that it may have run.
     pub answered: Duration,
     /// A group's log is compacted once this many entries past its start
-    /// are applied durably,
+    /// are applied durably.
     pub compact_every: u64,
-    /// or this many bytes of them, as its core counts an entry.
+    /// A group's log is compacted once this many bytes of entries past its
+    /// start are applied durably, as its core counts an entry.
     pub compact_bytes: u64,
-    /// A compaction keeps at most this many entries below the point it
-    /// could compact to, for a follower a little behind,
+    /// The most entries a compaction keeps below the point it could
+    /// compact to, for a follower a little behind.
     pub compact_tail: u64,
-    /// and at most this many bytes of them: well under `compact_bytes`,
-    /// or every commit makes a compaction due.
+    /// The most bytes of entries a compaction keeps below that point: well
+    /// under `compact_bytes`, or every commit makes a compaction due.
     pub compact_tail_bytes: u64,
-    /// Every so often the node collects its blob store: a blob goes once
-    /// no log row names it, no pin holds it, and nobody put or touched it
-    /// within the horizon. A follower fetches a blob its entry names and
-    /// lacks, so the horizon matters where one node alone holds a blob:
-    /// an install's programs at its leader, from their put until the
-    /// install's entry names them.
+    /// How often the node collects its blob store.
     pub blob_collect_every: Duration,
+    /// A blob goes once no log row names it, no pin holds it, and nobody
+    /// put or touched it within this horizon: long enough for an install's
+    /// entry to name the programs its leader alone holds.
     pub blob_horizon: Duration,
     /// About how many bytes of rows one snapshot chunk carries.
     pub snapshot_chunk: usize,
@@ -398,14 +402,13 @@ pub(crate) struct Run {
 /// How long a call waits for a new leader to apply what it took over.
 const CATCH_UP: Duration = Duration::from_secs(10);
 /// How long the node a replacement adds has to say it could run the
-/// agent's program, and how long a replacement waits for its final
-/// configuration to commit.
+/// agent's program.
 const CAPABLE: Duration = Duration::from_secs(10);
+/// How long a replacement waits for its final configuration to commit.
 const REPLACED: Duration = Duration::from_secs(30);
-/// How long a replacement waits once its node no longer leads: a leader
-/// removing itself steps down as the final configuration commits, and
-/// announces it as it does; another node that took over announces it once
-/// it learns it committed.
+/// How long a replacement waits, once its node no longer leads, for the
+/// final configuration to be announced: by this node as it steps down, or
+/// by the node that took over.
 const REPLACED_ELSEWHERE: Duration = Duration::from_secs(2);
 
 /// Why a replica was not replaced.
@@ -487,8 +490,9 @@ pub(crate) struct Inner {
     /// Node-wide tasks: the dispatcher, the directory's resends, and the
     /// work groups hand off.
     tasks: Mutex<Tasks>,
-    /// Held while a creation record is checked and stored, so two records
-    /// for one id are never both written.
+    /// Held while a record or a placement is checked against the directory
+    /// and stored. It orders `place` against `on_directory`: each reads,
+    /// compares and writes, and neither may store over a newer placement.
     pub(crate) recording: smol::lock::Mutex<()>,
     /// Turns through an agent's replicas, for what goes to one of them.
     pub(crate) turn: std::sync::atomic::AtomicU64,
@@ -1484,7 +1488,6 @@ impl Inner {
         self.storage.commit(changes).await
     }
 
-    /// Run `task` on the node's thread until it ends or the node stops.
     /// Mark `epoch` of `agent`'s as one a drop runs on, before the drop can
     /// remove a row.
     pub(crate) fn dropping(&self, agent: AgentId, epoch: u8) {
@@ -1515,6 +1518,7 @@ impl Inner {
             .contains_key(&(agent, epoch))
     }
 
+    /// Run `task` on the node's thread until it ends or the node stops.
     pub(crate) fn spawn(&self, task: impl Future<Output = ()> + Send + 'static) {
         // A node shutting down runs nothing new: what such a task would do
         // (an old epoch dropped, say) is done again at the next start.
@@ -1743,11 +1747,10 @@ impl Node {
             (network, _) => network,
         };
         let runtime = Arc::new(smol::Executor::new());
-        // Closed to stop the runtime thread.
         let (stop, stopped) = smol::channel::bounded::<()>(1);
         // One thread runs the node's tasks: its groups' drivers, leader and
-        // apply loops, its ingress and its peers' messages. A call's lane
-        // relies on it (`Inner::lane_call`).
+        // apply loops, its ingress and its peers' messages. Calls keep their
+        // lane's order by it (see `calls`).
         let threads: Vec<JoinHandle<()>> = vec![{
             let runtime = Arc::clone(&runtime);
             std::thread::Builder::new()

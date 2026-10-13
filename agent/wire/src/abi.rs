@@ -156,30 +156,8 @@ pub const fn allowed(kind: Kind, op: u64) -> bool {
 /// way. Each covers what the default agent measurably spends serving it,
 /// so a handler's gas limit bounds the agent's work too.
 ///
-/// The agent's cost per operation at a handler's limit, after the writes
-/// that make its overlays largest or through the deepest call frames
-/// (measured by the testkit's `every_operation_pays_for_its_serving`,
-/// which requires a fifth of each charge spare). Measured with the
-/// translator as of this table: a change to the translator, the codec or
-/// the overlays re-runs it.
-///
-/// | operation | charge | cost |
-/// |---|---|---|
-/// | unserved id, `now`, `self_id`, `input` | 2,000 | 1,170–1,530 |
-/// | `random` | 6,768 | 4,400 |
-/// | `caller` | 6,792 | 5,050 |
-/// | `log` of 9 bytes | 4,216 | 2,740 |
-/// | `send` | 4,000 | 3,070 |
-/// | `get` after 1,000 writes | 20,120 | 14,340 |
-/// | `get` of a 1 KiB key | 44,600 | 29,270 |
-/// | `put` after 500 writes | 64,120 | 45,140 |
-/// | `put` of 4 KiB | 162,400 | 105,590 |
-/// | `put` of a 1 KiB key | 88,600 | 63,130 |
-/// | `get` through 61 call frames | 20,096 | 12,950 |
-/// | `scan` after a batch of writes | 60,024 | 41,040 |
-/// | `scan` through 61 call frames | 60,024 | 44,120 |
-/// | `call` | 60,000 | 27,530 |
-/// | `attest` | 60,000 | 39,360 |
+/// The testkit's `every_operation_pays_for_its_serving` prints each charge
+/// and its cost, and requires a fifth of each charge spare.
 pub mod price {
     use super::op;
 

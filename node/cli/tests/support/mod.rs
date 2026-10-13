@@ -236,12 +236,12 @@ pub struct Processes {
     options: Options,
     /// The last generation of faults written, for a node to acknowledge.
     generation: AtomicU64,
-    /// How far every node's clock runs ahead of the wall clock...
+    /// How far every node's clock runs ahead of the wall clock.
     clocks: AtomicI64,
-    /// ... and the agents' time as clients take it: the same, but while
-    /// the nodes' clocks move, when it moves last.
+    /// How far the agents' time runs ahead of the wall clock, as clients
+    /// take it: as `clocks`, but moved last while the nodes' clocks move.
     offset: AtomicI64,
-    /// Whether the nodes' clocks are moving, some there and some not.
+    /// Whether the nodes' clocks are moving: some moved on, some not yet.
     moving: AtomicBool,
     /// Clients pause at their next request while it is set.
     pub clients_paused: AtomicBool,

@@ -1,12 +1,11 @@
-//! Machine costs (slice 1, steps 1.4 and 1.6 gates), for the ledger actor
-//! on the interpreter and the JIT:
+//! Machine costs for the ledger actor on the interpreter and the JIT:
 //! - a fresh machine: create the actor as an inner machine and lay out its
 //!   memory, then resume it for the first time until its first exit;
 //! - a pooled machine: `instantiate` it from the pool, use it (deliver a
 //!   request, run to the first exit), and expunge it, which resets it for
-//!   the next use. A request is delivered either as slice 1 did, mapping a
-//!   request page and writing it there, or as the slice 2 ABI does, copying
-//!   it into memory the actor already has mapped (`input`).
+//!   the next use. A request is delivered either by mapping a request page
+//!   and writing it there, or as the actor ABI's `input` does, by copying
+//!   it into memory the actor already has mapped.
 //!
 //! `machines`: medians for both backends.
 //! `machines loop <interpreter|jit> <fresh|mapped|copied> <n>`: repeat n
@@ -70,9 +69,9 @@ fn fresh(backend: PvmBackend, actor: &Spi) -> (Duration, Duration) {
 /// How a pooled use delivers its request.
 #[derive(Clone, Copy)]
 enum Delivery {
-    /// Map a request page and write the request there (slice 1).
+    /// Map a request page and write the request there.
     Mapped,
-    /// Copy the request into the actor's mapped stack (slice 2's `input`).
+    /// Copy the request into the actor's mapped stack, as `input` does.
     Copied,
 }
 

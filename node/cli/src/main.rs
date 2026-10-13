@@ -25,12 +25,9 @@ use vos_wire::schema::Schema;
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-/// With mimalloc, transparent huge pages are off for the process. Backing
-/// its arenas with 2 MiB pages kept about a fifth more of a node resident
-/// under load; without them it holds about what the system allocator does
-/// with them, for about 8% less CPU a commit. Off, they cost about 2% more
-/// cycles (TLB misses), for either allocator. Processes it starts inherit
-/// the setting: it spawns none today.
+/// With mimalloc, transparent huge pages are off: 2 MiB pages under its
+/// arenas keep more of a node resident, at the cost of some TLB misses
+/// without them. Processes it starts inherit this.
 fn huge_pages_off() {
     #[cfg(all(feature = "mimalloc", target_os = "linux"))]
     {
@@ -567,10 +564,17 @@ fn key_bytes(text: &str) -> Result<[u8; 32], String> {
         .map_err(|_| "a 32-byte key in hex".to_string())
 }
 
-/// A key's sessions, kept next to the key file so calls go on in them:
-/// each agent's session, its identity once fetched, its floor (so queries
-/// read the key's own writes across commands), and a call that failed
-/// before its answer, by its digest and when, until it is answered.
+/// A key's sessions, kept next to the key file so calls go on in them.
+/// The file holds a line per item, its fields split by spaces, agent ids
+/// in decimal and bytes in hex:
+///
+/// - `session <agent> <name> <t0> <next>`: the agent's session, its
+///   creation time and the next sequence to send;
+/// - `identity <agent> <identity>`: the agent's identity, once fetched;
+/// - `at <agent> <index>`: the agent's floor, so queries read the key's own
+///   writes across commands;
+/// - `pending <agent> <digest>`: a call that failed before its answer,
+///   until it is answered.
 #[derive(Default)]
 struct Kept {
     sessions: HashMap<AgentId, client::Kept>,
@@ -632,7 +636,7 @@ impl Kept {
                     ["at", id, at] => {
                         kept.floors.insert(agent(id)?, at.parse().ok()?);
                     }
-                    // Earlier versions kept the time it was left too.
+                    // A fourth field, the time the call was left, is ignored.
                     ["pending", id, digest] | ["pending", id, digest, _] => {
                         kept.pending.insert(agent(id)?, key_bytes(digest).ok()?);
                     }

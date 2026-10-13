@@ -1,4 +1,4 @@
-//! Snapshot cost for suspended workflows (spike S1). Guests:
+//! Snapshot cost for suspended workflows. Guests:
 //! `just build-bench-guests`.
 //!
 //! For each workflow the harness runs the guest straight through (the

@@ -77,7 +77,9 @@ pub(crate) fn trim_asks(asked: &mut HashMap<(AgentId, NodeNumber), Instant>, now
     }
 }
 
-/// Take arrivals until the network closes.
+/// Take arrivals until the network closes. Work that waits on a group or
+/// a quorum runs in a task of its own, so the frames behind it are not
+/// held.
 pub(crate) async fn dispatch(inner: Arc<Inner>, arrivals: Arrivals) {
     while let Some((class, incoming)) = take(&arrivals).await {
         inner.arrive(class, incoming).await;
@@ -256,7 +258,6 @@ impl Inner {
                 self.on_ack(from, agent, order, runs)
             }
             PeerMessage::DirectoryRequest { agent } => self.on_request(from, agent),
-            // A task of its own runs the call: the dispatcher never waits.
             PeerMessage::Forward {
                 agent,
                 token,
@@ -269,8 +270,6 @@ impl Inner {
                 term,
                 answer,
             } => self.on_forwarded(from, agent, token, term, answer),
-            // A task of its own confirms the leadership: the dispatcher
-            // never waits.
             PeerMessage::ReadIndex { agent, token } => self.on_read_index(from, agent, token),
             PeerMessage::ReadIndexAnswer {
                 agent,

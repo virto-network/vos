@@ -166,15 +166,15 @@ pub fn switch_change(
     }
 }
 
-/// What recovery must do to `agent`'s log for invariant 7, before its
-/// core is recovered: the changes, for the node log writer (after it was
-/// told the agent's recovered applied index), and the index the log is cut
-/// from, if any.
+/// What recovery must do to `agent`'s log so that no entry is left
+/// without its blob, before its core is recovered: the changes, for the
+/// node log writer (after it was told the agent's recovered applied
+/// index), and the index the log is cut from, if any.
 ///
 /// An entry naming a blob the store does not hold was never reported
-/// durable, so no replica counted it (section 9.5, invariant 7); every
-/// agent shares one journal, so its row can survive a crash its blob did
-/// not. The log is cut at the first such entry.
+/// durable, so no replica counted it; every agent shares one journal, so
+/// its row can survive a crash its blob did not. The log is cut at the
+/// first such entry.
 ///
 /// An entry at or below the applied index whose blob is gone (a disk that
 /// lost what it said it wrote) is committed, and the state holds its

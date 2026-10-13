@@ -71,8 +71,8 @@ pub mod host_call {
 
 /// Gray Paper 0.8.0 general and refine host calls the node serves besides
 /// the inner-machine calls. `fetch` (2), `write` (5) and `log` (100) were
-/// confirmed on PolkaJam 0.1.29 (spike SJ); the rest follow the same
-/// numbering, which places `machine` at 9.
+/// confirmed on PolkaJam 0.1.29; the rest follow the same numbering, which
+/// places `machine` at 9.
 pub mod gp_call {
     pub const GAS: u32 = 0;
     pub const FETCH: u32 = 2;

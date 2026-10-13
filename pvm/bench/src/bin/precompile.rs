@@ -1,4 +1,4 @@
-//! Proving the BLAKE2b precompile on the Gray Paper refine path (spike S5b).
+//! Proving the BLAKE2b precompile on the Gray Paper refine path.
 //!
 //! `precompile prove <n>`: trace, prove, encode and verify n hashes. Run one
 //! size per process: peak RSS is per process, and proving needs 4–24 GiB.

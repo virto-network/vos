@@ -355,7 +355,6 @@ impl Leader {
                 };
                 Some(None)
             };
-            // Look at the first expiry row again.
             let recheck = async {
                 match sweep {
                     Some(wait) => smol::Timer::after(wait).await,

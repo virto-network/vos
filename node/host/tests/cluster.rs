@@ -3,7 +3,6 @@
 //! applied on every replica alike, leader changes, a partitioned follower
 //! catching up, and restarts.
 
-/// The allocator the node's binary runs on.
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

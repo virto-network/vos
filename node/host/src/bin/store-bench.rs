@@ -1,16 +1,17 @@
-//! Store costs (slice 2, step 2.2): S4's table workload through the node's
-//! `Store`, with the agent key layout, at a given row count and tuning.
+//! Store costs: a table of 64-byte rows loaded, compacted, read (hits and
+//! misses), updated and scanned through the node's `Store`, with the agent
+//! key layout, at a given row count and tuning.
 //!
 //! `store-bench <rows> [variant...]`; variants are `default`, `filters`
 //! (last-level filters kept), and on top of the default `hash` (in-block
 //! hash index), `pin` (filters and indexes pinned) and `cache2g`. Data goes
 //! under `target/`: on the reference laptop `/tmp` is tmpfs.
 //!
-//! The variant `writes` (slice 3, section 9.5's steady state) times point
-//! reads on the table alone, then while 64 other agents write as the
-//! 64-agent run's do, at `WRITE_RATE` inputs a second (40,000): over one
-//! whole cycle of the state partition's memtable, from one rotation under
-//! the load to the next, past the first minute's.
+//! The variant `writes` times point reads on the table alone, then while
+//! 64 other agents write as the 64-agent run's do, at `WRITE_RATE` inputs
+//! a second (40,000): over one whole cycle of the state partition's
+//! memtable, from one rotation under the load to the next, past the first
+//! minute's.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -166,7 +167,7 @@ fn random_bytes(rng: &mut XorShift, len: usize) -> Vec<u8> {
 }
 
 /// The agents writing beside the table, and how they write, as the
-/// in-process 64-agent run measured at 16 sessions each: inputs a batch,
+/// in-process 64-agent run writes at 16 sessions each: inputs a batch,
 /// batches a flush (2.6 on average: 13 over every 5 flushes), sessions an
 /// agent, and a work result's log entry, about 1,000 bytes for its 10
 /// inputs.

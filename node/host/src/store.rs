@@ -14,7 +14,7 @@
 //!
 //! Writes go through a [`Batch`]; the storage thread groups several agents'
 //! batches into one commit. A replicated agent appends with a sync before
-//! applying, and applies without one (section 9.5).
+//! applying, and applies without one.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Bound;

@@ -1,9 +1,9 @@
 //! Dirty-page capture agrees across backends and memory models, and covers
-//! every change. The S1 workflows run on the interpreter (sparse and flat
-//! memory) and on the JIT side by side; at every host call each machine's
-//! capture must be identical, and must include every page whose contents
-//! changed since the previous capture. Replies are host writes, so they
-//! land in the next capture.
+//! every change. The snapshot bench's workflows run on the interpreter
+//! (sparse and flat memory) and on the JIT side by side; at every host call
+//! each machine's capture must be identical, and must include every page
+//! whose contents changed since the previous capture. Replies are host
+//! writes, so they land in the next capture.
 
 use std::collections::BTreeMap;
 
@@ -29,7 +29,8 @@ fn writable_image(memory: &Memory) -> BTreeMap<u32, Vec<u8>> {
         .collect()
 }
 
-/// Answer a host call the way S1's harness does, as a host write.
+/// Answer a host call the way the snapshot bench's harness does, as a host
+/// write.
 fn serve(machine: &mut Machine, call: u64, ordinal: usize) {
     let registers = *machine.registers();
     let answer = format!("reply {call:#x} #{ordinal} ")

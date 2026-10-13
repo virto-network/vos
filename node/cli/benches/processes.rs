@@ -1,28 +1,19 @@
-//! Section 14's budgets on three node processes (slice 3, step 3.10):
-//! three release builds of `vos node run`, each pinned to a third of the
-//! laptop (`taskset`) and on its own data directory, joined over QUIC; a
-//! driver on the rest of the machine sends calls over HTTP, every one
-//! signed before its timed window.
+//! The node's costs on three node processes: three release builds of
+//! `vos node run`, each pinned to a third of the laptop (`taskset`) and on
+//! its own data directory, joined over QUIC; a driver on the rest of the
+//! machine sends calls over HTTP, every one signed before its timed window.
 //! - **agent:** one agent, the most commits per second, closed loop, over
 //!   sessions; then at half load, max(10k/s, half the most), open loop.
 //! - **agents:** 64 agents, the most, closed loop at 4 and 16 sessions
 //!   each; open loop at 40k/s offered; and the knee, the highest offered
 //!   rate whose p99 stays at 20 ms or below.
 //! - **quiet:** one session, one call at a time.
-//! - **query:** the counter's value on a follower, open loop, as applied
-//!   there.
-//! - **linearizable:** the same at `Linearizable`: the heartbeat round
-//!   each read takes is the difference.
-//! - **idle:** 1,000 agents per node left alone: each process's CPU,
-//!   threads and memory.
-//! - **failover** (on the 64 agents, with or without their rows): the
-//!   node leading the most of them killed, the time until each has a
-//!   leader again and every node's directory names it, and its restart.
-//! - **failover-idle:** the same on the idle row's 1,000 agents a node
-//!   (with or without that row).
-//! - **soak** (on the 64 agents, after any failover): their load open for
-//!   `SOAK_SECONDS` (1,800) at `SOAK_RATE` (6k/s), one load throughout:
-//!   CPU per commit, p50, p95 and the stalls compared early and late.
+//! - **query** and **linearizable:** see `query`; the heartbeat round each
+//!   linearizable read takes is the difference.
+//! - **idle:** see `idle`.
+//! - **failover** and **failover-idle:** see `failover`, on the 64 agents
+//!   or on the idle row's, with or without their rows.
+//! - **soak:** see `soak`, on the 64 agents after any failover.
 //!
 //! Every open-loop latency is timed from when its call was scheduled to
 //! go, so a slow call never hides the queue behind it; each such run gives
@@ -36,7 +27,7 @@
 //! - `CPUS` overrides the pinning, as `taskset -c` lists for each node and
 //!   the driver, separated by `/`;
 //! - `DATA` where the stores go;
-//! - `VOS_BIN` another `vos` to run the nodes, for a lever's A/B runs;
+//! - `VOS_BIN` another `vos` to run the nodes, to compare two builds;
 //! - `LOGS` a directory to keep the nodes' logs in;
 //! - `TLS=1` serves every node's ingress over TLS, each client pinning the
 //!   node's key, for the rows against plain HTTP.
@@ -1530,9 +1521,11 @@ fn quiet(space: &Space) {
     println!("the nodes did not go quiet within 20 s");
 }
 
-/// Signed calls for each session of a closed-loop run: enough for a
-/// session's share of the most the nodes could take, within a bound on
-/// them all, so memory stays bounded.
+/// Signed calls for each session of a closed-loop run, all signed before
+/// it: an even share of 400,000, a bound on the memory the calls take; at
+/// most 4,000, about what one session sends in a run at a few milliseconds
+/// a call (a faster machine may run a session out: counted as exhausted);
+/// and 64 more for room.
 fn closed_calls(sessions: u64) -> usize {
     (400_000 / sessions as usize).min(4_000) + 64
 }
@@ -2024,19 +2017,14 @@ fn failover(space: &Space, agents: &[AgentId]) {
 /// The 64-agent load open at `SOAK_RATE` (6k/s by default) for
 /// `SOAK_SECONDS` (1,800), one load throughout, in windows of 50 s; the
 /// windows within `SOAK_WARMUP` (150 s) of its start are reported, not
-/// compared. Each session moves to a new one every 1,000 calls.
+/// compared.
 ///
 /// After the warm-up, its steady state over the clean windows (outside
-/// the run under [`CLEAN_OUTSIDE`] cores, IO stalled under [`CLEAN_IO`]%):
-/// the stalls and longest batch, p95, p99 and CPU per commit, to compare
-/// runs by. And the history a run leaves must not cost more: the median
-/// of the first three clean windows and of the last three must agree for
-/// - CPU per commit, and p50 and p95, within 10%;
-/// - the stalls, within 10% and one more;
-/// - the longest batch, within one bucket (a quarter).
-///
-/// The p99 is reported for each window and judged by the budgets, stalls
-/// and all, not here.
+/// the run under [`CLEAN_OUTSIDE`] cores, IO stalled under [`CLEAN_IO`]%),
+/// to compare runs by. And the history a run leaves must not cost more:
+/// the medians of the first three clean windows and of the last three
+/// must agree within the bounds `judge` is given. The p99 is reported for
+/// each window and judged by the budgets, not here.
 fn soak(space: &Space, agents: &[Signed], next: &mut dyn FnMut(u64) -> u64) {
     let rate: f64 = std::env::var("SOAK_RATE")
         .ok()

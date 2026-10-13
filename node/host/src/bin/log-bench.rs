@@ -1,8 +1,8 @@
-//! Durable log appends by entry size (slice 3, step 3.1), through writers
-//! shaped like the node log writer: one thread per node drains every queued
-//! append into one batch and one sync, up to a cap in bytes. Three nodes on
-//! one disk stand in for a leader and two followers: an entry commits once
-//! two of the three writers made it durable.
+//! Durable log appends by entry size, through writers shaped like the node
+//! log writer: one thread per node drains every queued append into one
+//! batch and one sync, up to a cap in bytes. Three nodes on one disk stand
+//! in for a leader and two followers: an entry commits once two of the
+//! three writers made it durable.
 //!
 //! - `log-bench sizes [nodes] [cap]`: entries of 1 KiB to 4 MiB from
 //!   closed-loop proposers: commits per second, MiB per second, p50 and p99.

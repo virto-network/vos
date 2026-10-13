@@ -1,6 +1,6 @@
-//! Many agents on three nodes (slice 3, step 3.8), in one process over
-//! QUIC on localhost, each node on its own data directory, with the
-//! default election timeouts and heartbeats:
+//! Many agents on three nodes, in one process over QUIC on localhost, each
+//! node on its own data directory, with the default election timeouts and
+//! heartbeats:
 //! - active: `AGENTS` agents (64), each on all three nodes, under
 //!   closed-loop increments from `SESSIONS` sessions each (4), sent to
 //!   the agent's leader: commits per second in total, a call's p50 and

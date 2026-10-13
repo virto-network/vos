@@ -14,7 +14,6 @@
 //! The store lives in a temporary directory, which may be tmpfs: the test
 //! covers recovery, not the disk's durability.
 
-/// The allocator the node's binary runs on.
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

@@ -1,4 +1,4 @@
-//! Dirty-page tracking options for native execution (slice 1, step 1.5).
+//! Dirty-page tracking options for native execution.
 //!
 //! Each option runs on a JIT-like window: 4 GiB of reserved address space
 //! with a memfd mapped shared over it, a writable region and a second host

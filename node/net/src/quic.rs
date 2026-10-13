@@ -542,6 +542,7 @@ async fn dial(dialing: Dialing, queued: smol::channel::Receiver<Outgoing>, share
 fn refused(connection: &quinn::Connection) -> bool {
     match connection.close_reason() {
         Some(quinn::ConnectionError::ConnectionClosed(close)) => {
+            // QUIC's CRYPTO_ERROR range: 0x100 plus the TLS alert's code.
             (0x100..0x200).contains(&u64::from(close.error_code))
         }
         Some(quinn::ConnectionError::ApplicationClosed(close)) => {
@@ -847,7 +848,8 @@ async fn read(peer: Arc<Reading>, mut stream: quinn::RecvStream) {
     frames(&peer, stream, class, id).await;
     drop(held);
     let mut turns = peer.turns.lock().expect("the turns");
-    // No later stream waits for this id: forget it.
+    // Only the map and this stream hold the turn: no later stream waits
+    // for this id, so forget it.
     if Arc::strong_count(&turn) == 2 {
         turns.remove(&(class, id));
     }

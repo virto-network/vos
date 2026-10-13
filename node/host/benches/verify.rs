@@ -1,9 +1,9 @@
 //! What a signature check costs: ed25519's strict check with the key
-//! decompressed at every check, as the node did, and with it decompressed
-//! once and kept, as it does now; and a key's decompression alone. The
-//! variants alternate in short blocks and each reports its median block,
-//! so neither meets the core in another state. Run it pinned to a core
-//! whose sibling is idle, e.g. `taskset -c 1` on the reference laptop.
+//! decompressed at every check, and with it decompressed once and kept;
+//! and a key's decompression alone. The variants alternate in short blocks
+//! and each reports its median block, so neither meets the core in another
+//! state. Run it pinned to a core whose sibling is idle, e.g. `taskset -c 1`
+//! on the reference laptop.
 //!
 //! `cargo bench -p vos-node --bench verify`.
 

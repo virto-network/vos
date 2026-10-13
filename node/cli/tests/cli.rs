@@ -348,7 +348,7 @@ fn a_pending_call_whose_session_was_collected_is_lost() {
             .contains(&format!("pending {agent} ")),
         "kept pending"
     );
-    // As an earlier version kept it, with the time it was left: still read.
+    // With a fourth field, the time the call was left: still read.
     let kept = std::fs::read_to_string(&session_file).unwrap();
     let old: String = kept
         .lines()

@@ -1,6 +1,6 @@
 //! A native host for actor programs: it runs them on the PVM interpreter and
-//! serves the actor ABI against in-memory state, with the semantics the
-//! slice 2 plan and the core model give the default agent.
+//! serves the actor ABI against in-memory state, with the default agent's
+//! semantics.
 //!
 //! It is the reference model for the agent's differential test, so it
 //! shares no overlay, dispatch or enforcement code with the agent: only

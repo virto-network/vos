@@ -89,8 +89,7 @@ pub const ECALL_SCALAR_ADD_MOD_L: u32 = 114;
 /// This is the runtime's precompile set plus the Ristretto and scalar ids
 /// 110–114, which only this tracer serves: the refine host answers them with
 /// `WHAT`, and the guest computes in software. A program using them
-/// therefore traces differently here than it runs on VOS. Step 5 moves these
-/// ids into the VOS range and serves them on the refine host as well.
+/// therefore traces differently here than it runs on VOS.
 ///
 /// ProgramMemory commits the dispatch identifier, which is non-zero exactly
 /// for these calls, so an untrusted prover cannot mark an unknown call as
@@ -122,8 +121,7 @@ mod tests {
     use super::*;
 
     /// The tracer serves exactly the refine host's precompiles plus the
-    /// Ristretto and scalar ids 110–114. When step 5 serves those on the
-    /// refine host, this becomes plain equality.
+    /// Ristretto and scalar ids 110–114.
     #[test]
     fn tracer_serves_the_runtime_precompiles_plus_the_ristretto_ids() {
         for id in 0..0x1000u64 {

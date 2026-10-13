@@ -1,5 +1,5 @@
-//! Host-call exit cost (slice 2, step 2.8): an inner machine that loops on
-//! `ecalli`, invoked again at every exit, on the interpreter and the JIT.
+//! Host-call exit cost: an inner machine that loops on `ecalli`, invoked
+//! again at every exit, on the interpreter and the JIT.
 //! Each iteration is one exit to the host and one re-entry, with nothing
 //! else to run.
 //!

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Slice 3's acceptance rows on a machine of its own, each node on physical
+# The process bench's rows on a machine of its own, each node on physical
 # cores of its own (one thread a core where there are cores enough, the
 # siblings left idle), the driver on further cores: what the laptop's
-# shared, hyperthreaded pinning cannot show. Run from anywhere in a
-# vos-core checkout:
+# shared, hyperthreaded pinning cannot show. Run from anywhere in the
+# checkout:
 #
 #   node/cli/benches/machine.sh [--plan] [--cpus LIST] [--data DIR]
 #                               [--memory SIZE|none] [--soak]

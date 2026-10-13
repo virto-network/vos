@@ -143,9 +143,10 @@ pub(crate) struct State {
     /// The commit index the replica recovered: queries wait until it is
     /// applied.
     pub recovered: u64,
-    /// When the commit and the applied index last moved: a stage's end, as
-    /// the driver and the applier saw it, not as a waiter woken later does.
+    /// When the commit index last moved: a stage's end as the driver saw
+    /// it, not as a waiter woken later does.
     pub commit_at: Option<Instant>,
+    /// When the applied index last moved, as the applier saw it.
     pub applied_at: Option<Instant>,
     pub stopped: bool,
     /// The replica has held a committed configuration naming it.
@@ -275,6 +276,8 @@ struct Driver {
     /// Each write not yet reported with its blobs, by sequence, with the
     /// log's last index after it.
     writes: VecDeque<(u64, u64)>,
+    /// The log's last index as written to the store. [`State::written`]
+    /// reaches it only once the entries' blobs are stored too.
     last_index: u64,
     proposals: HashMap<u64, Proposed>,
     reads: HashMap<u64, smol::channel::Sender<Result<u64, ReadIndexError>>>,
@@ -295,8 +298,9 @@ struct Driver {
     install_missing: Vec<[u8; 32]>,
     /// Snapshot chunks taken this round, staged once it is processed.
     chunks: VecDeque<(NodeNumber, SnapshotChunk)>,
-    /// The highest compaction bound the core gave, and whether to compact.
+    /// The highest compaction bound the core gave.
     compact_bound: u64,
+    /// A compaction is due at the next chance.
     compact_due: bool,
     memberships: HashMap<u64, smol::channel::Sender<Result<u64, ChangeMembershipError>>>,
     /// The order of the placement this replica last announced as leader.
@@ -347,9 +351,9 @@ enum Event {
 }
 
 impl Driver {
-    /// Recover the group from the store, as step 3.3c's contract says:
-    /// the writer told what is applied, the log cut at a lost blob, stale
-    /// epochs dropped, then the core.
+    /// Recover the group from the store, in order: the writer told what is
+    /// applied, the log cut at a lost blob, stale epochs dropped, then the
+    /// core.
     async fn start(inner: Arc<Inner>, shared: Arc<Shared>) -> Result<Self, String> {
         let agent = shared.agent;
         let store = &inner.store;
@@ -686,8 +690,9 @@ impl Driver {
         }
     }
 
-    /// Tell the core whether its writer is stalled, or the replica retired:
-    /// either way it hands leadership over and does not campaign.
+    /// Tell the core whether its writer is stalled. A replica whose leader
+    /// loop stopped for good (`retired`) is reported as stalled on purpose:
+    /// the core then hands leadership over and does not campaign.
     fn report_health(&mut self) {
         let stalled = self.retired || self.inner.storage.stalled();
         if stalled != self.stalled {
@@ -908,12 +913,10 @@ impl Driver {
         replicas.extend(status.joint_old.iter().flatten().copied());
         replicas.sort_unstable();
         replicas.dedup();
-        // The configuration before; once compacted away, the one at the
-        // log's start, which may be this one. `before` matters while a
-        // placement is uncommitted, and for a leader the change removed,
-        // which announces it as one of `before`: the core compacts nothing
-        // past the configuration before a final one until the removal is
-        // confirmed.
+        // The configuration before, or, once that is compacted away, the
+        // log's first, which may be this one. It matters while a placement is uncommitted, and
+        // names a leader the change removed: the core keeps it until the
+        // removal is confirmed.
         let before = if index == 0 {
             Vec::new()
         } else {
@@ -1081,7 +1084,6 @@ impl Driver {
     /// snapshot once it is whole and its programs are here. False when the
     /// node must halt.
     async fn stage(&mut self) -> bool {
-        // A leader installs nothing.
         if self.core.role() == Role::Leader {
             self.chunks.clear();
             self.abandon().await;

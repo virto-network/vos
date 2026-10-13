@@ -7,7 +7,7 @@ use vos_pvm_program::{encode_nat, read_nat};
 
 /// Refine's arguments, `E(c, i, s, ↕payload, H(p))`: core index, work item
 /// index, service id, the work item's payload and the work package hash.
-/// Spike SJ confirmed this layout on PolkaJam 0.1.29.
+/// PolkaJam 0.1.29 uses this layout.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RefineArgs {
     pub core: u64,

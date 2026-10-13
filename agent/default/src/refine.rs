@@ -70,6 +70,8 @@ fn record<T: Decode>(key: &[u8]) -> Result<Option<T>, Corrupt> {
             .map(|(value, _)| Some(value))
             .map_err(|_| Corrupt)
     };
+    // Every record refine reads fits, the stored byte included (a session
+    // mark takes 17 bytes); a larger one is read again whole.
     let mut small = [0u8; 32];
     match state_read_into(key, &mut small) {
         None => Ok(None),

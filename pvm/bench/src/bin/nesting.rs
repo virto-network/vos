@@ -1,4 +1,4 @@
-//! Invocation overhead (spike S2): the ledger actor hosted by the agent program as a
+//! Invocation overhead: the ledger actor hosted by the agent program as a
 //! JAM inner machine (nested path) versus driven by the node directly
 //! (fast path), on the interpreter and the JIT, with a machine built per
 //! request (fresh), lent from the machine pool per request (pooled), or

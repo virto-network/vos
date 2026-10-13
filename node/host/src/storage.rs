@@ -8,7 +8,8 @@
 //! and a compaction are not. A synced flush makes every earlier batch
 //! durable too, as they share one journal: the writer records, per synced
 //! flush, each agent's highest applied index up to it, and only that bounds
-//! compaction (section 9.5, invariant 4).
+//! compaction, so the log on disk never starts past the applied index on
+//! disk.
 //!
 //! A flush that fails leaves the disk unknown: some of it may have been
 //! written, and synced or not. The writer then takes no more, and the node
@@ -279,7 +280,6 @@ impl Writer {
                     ..
                 } => {
                     let mut state = self.state(&after, *agent)?;
-                    // Applies come one index at a time.
                     if *epoch != state.epoch || *index != state.applied + 1 {
                         return Err(format!(
                             "an apply of agent {} at {index} in epoch {epoch} is stale: it is at {} in epoch {}",

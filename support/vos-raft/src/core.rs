@@ -423,6 +423,8 @@ pub struct Core<N: NodeId> {
     durably_applied: u64,
 
     now: u64,
+    /// When the election timer fires; while leading, when the next
+    /// heartbeat round is due (`u64::MAX` for none).
     election_deadline: u64,
     check_quorum_due: u64,
     last_heard_leader: Option<u64>,
@@ -820,17 +822,14 @@ impl<N: NodeId> Core<N> {
     /// and commit indexes, as a crash would drop unsynced writes. It never
     /// acknowledged them, and an entry committed is held, with its blobs,
     /// by a quorum it can fetch them from. A candidate or a leader steps
-    /// down first: its requests advertised the longer log, and a leader
-    /// counts only a quorum, so what it committed is kept.
+    /// down first: its requests advertised the longer log, so no grant
+    /// made against it may still count, and a leader counts only a quorum,
+    /// so what it committed is kept.
     pub fn discard_unreported(&mut self) {
         let keep = self.durable_index.max(self.commit);
         if self.log.last_index() <= keep {
             return;
         }
-        // A candidate's requests advertised the longer log, and a leader
-        // may have counted followers for its entries: either steps down
-        // first, so no grant made against that log still counts, and its
-        // next candidacy advertises the shorter one.
         if self.role != Role::Follower {
             self.step_down();
         }

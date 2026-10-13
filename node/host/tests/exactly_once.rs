@@ -14,7 +14,6 @@
 //!
 //! The seed is printed; `EXACTLY_ONCE_SEED` runs one again.
 
-/// The allocator the node's binary runs on.
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -605,6 +604,8 @@ fn holds_sessions(node: &Node, agent: AgentId) -> bool {
         .get(agent, &keys::live_sessions())
         .unwrap()
         .map(|bytes| u64::decode(unstored(&bytes).unwrap()).unwrap().0);
+    // A key of each session kind, for its first two bytes: the prefix every
+    // row of that kind shares.
     [
         keys::session_index(&any),
         keys::session_of(SessionId(0)),

@@ -1,8 +1,7 @@
 //! The default agent's refine on a real batch, on the interpreter and the
-//! JIT (slice 2, step 2.8): the time per request in a batch of counter
-//! increments, and the marginal time of one actor ABI operation, which is
-//! one exit from the actor's machine, the agent serving it, and one
-//! re-entry.
+//! JIT: the time per request in a batch of counter increments, and the
+//! marginal time of one actor ABI operation, which is one exit from the
+//! actor's machine, the agent serving it, and one re-entry.
 //!
 //! `cargo bench -p vos-testkit --bench batch` (after `just build-agent
 //! build-test-actors`).

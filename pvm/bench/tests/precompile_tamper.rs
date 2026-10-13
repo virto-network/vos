@@ -1,7 +1,7 @@
 //! A tampered precompile call never yields an accepted proof. The honest
 //! one-hash run proves and verifies; corrupting the recorded compression
 //! input, its output bytes in the memory ledger, or dropping the call
-//! altogether is rejected at proving or at verification (S5b).
+//! altogether is rejected at proving or at verification.
 
 use vos_pvm_bench::{GAS, guest_program};
 use vos_pvm_proof::{prove_refine, trace_refine_with_output, verify_refine_bundle_replayed};

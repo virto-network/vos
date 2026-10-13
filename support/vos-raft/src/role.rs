@@ -1,8 +1,4 @@
-//! Cluster role for a Raft replication group.
-//!
-//! Pure data — no atomics, no locking. The worker (added in a
-//! later commit) holds a `Role` value as part of its state and
-//! mirrors it into a shared atomic for lock-free external reads.
+//! A replica's role in a Raft group.
 
 /// Where this replica currently sits in the Raft consensus
 /// lifecycle.
@@ -16,7 +12,8 @@ pub enum Role {
     /// would succeed at `current_term + 1`. Has NOT yet bumped
     /// `current_term` or persisted a self-vote. Transitions to
     /// `Candidate` on quorum of yes-replies, or back to
-    /// `Follower` on no-reply or any higher-term response.
+    /// `Follower` on a higher-term response or after
+    /// `pre_candidate_misses_before_revert` rounds without a quorum.
     PreCandidate,
     /// Soliciting votes for a real election. Term has been
     /// bumped, self-vote persisted. Stays here until we either
@@ -30,11 +27,8 @@ pub enum Role {
 }
 
 impl Role {
-    /// 8-bit encoding for atomic mirrors. The worker exposes its
-    /// current role through a shared `AtomicU8` so external
-    /// readers (e.g. a `CommitStrategy::is_writable` check) can
-    /// read leader-vs-follower without bouncing through the
-    /// worker's mailbox.
+    /// 8-bit encoding, for the thread-per-group driver's atomic
+    /// mirror of its role.
     pub fn as_u8(self) -> u8 {
         match self {
             Self::Follower => 0,

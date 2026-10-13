@@ -1,5 +1,5 @@
-//! A node's costs with storage (slice 2, step 2.9): the default agent with
-//! the counter installed, driven through the node's own API.
+//! A node's costs with storage: the default agent with the counter
+//! installed, driven through the node's own API.
 //! - Per request under load: increments from many sessions at once, one in
 //!   flight per session, so batches fill. Wall time per applied request
 //!   covers refine, accumulate and the durable commit, shared by a batch;

@@ -2,7 +2,6 @@
 //! counter actor: client-named sessions, signed calls in their sequences,
 //! the reply window, expiry, and the operator's token.
 
-/// The allocator the node's binary runs on.
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

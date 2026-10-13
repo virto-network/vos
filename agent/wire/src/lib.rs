@@ -41,7 +41,7 @@ pub mod expiry {
 pub use scale;
 pub use scale::{Decode, DecodeError, Encode};
 
-/// Defaults the owner set for slice 2. Each is a constant, cheap to change.
+/// The node's and the agent's defaults. Each is a constant, cheap to change.
 pub mod defaults {
     /// Replies kept per (session, agent), so a pipelining client can recover
     /// any lost reply.
@@ -91,8 +91,7 @@ pub mod defaults {
     /// Gas a refine keeps to finish its result once its steps are written.
     pub const FINISH_RESERVE: u64 = 100_000;
     /// The most outbox entries one acknowledgement clears, bounding an ack
-    /// step's accumulate work; the node acks again for the rest. Clearing
-    /// them is a thousand storage deletions, far inside an accumulate's
-    /// gas (`REFINE_GAS` on a node).
+    /// step's accumulate work, far inside its gas; the node acks again for
+    /// the rest.
     pub const ACK_LIMIT: u64 = 1024;
 }

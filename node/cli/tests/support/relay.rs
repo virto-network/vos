@@ -86,6 +86,7 @@ impl PartialOrd for Delayed {
     }
 }
 impl Ord for Delayed {
+    /// Reversed, so the max-heap `BinaryHeap` pops the earliest due first.
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         other.due.cmp(&self.due)
     }

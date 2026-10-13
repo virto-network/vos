@@ -1,8 +1,8 @@
 //! BLAKE2b-256 through the guest precompile shim (`vos-pvm-precompiles`),
 //! which calls the VOS compression precompile (`ecalli 0x400`) and falls
 //! back to software when the host answers `WHAT`, as a JAM node does for an
-//! id it does not assign. Same chain as S4's guest: hash a 76-byte node
-//! input `n` times, feeding each output into the next input.
+//! id it does not assign. Same chain as the `hash-software` guest: hash a
+//! 76-byte node input `n` times, feeding each output into the next input.
 
 #![no_std]
 #![no_main]

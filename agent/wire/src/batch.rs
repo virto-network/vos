@@ -34,7 +34,7 @@ pub struct Query {
 /// and seed for it, and the inputs in order.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Batch {
-    /// Applied, non-skipped work results before this one (section 7.5).
+    /// Applied, non-skipped work results before this one.
     pub version: u64,
     /// Milliseconds since the Unix epoch by the leader's wall clock,
     /// monotonic across leaders.

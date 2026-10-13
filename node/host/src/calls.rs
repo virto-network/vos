@@ -6,6 +6,13 @@
 //! flight waits for that answer; the next after those queued is queued;
 //! any other is refused.
 //!
+//! The leader pushes a call to its group in its lane's order: nothing
+//! awaits between the call's turn and its push, and the node's tasks share
+//! one thread, so no other call of the lane comes between them. Should a
+//! push have to wait for a leader, a later call may go first; refine
+//! refuses that one as a gap, consuming nothing, and its client sends it
+//! again.
+//!
 //! A replica that does not lead runs no lane: its marks may lag. It checks
 //! the call's signature, forwards the call to the leader, again through
 //! leader changes, and answers once it has applied the call itself.
@@ -137,11 +144,10 @@ pub(crate) fn verify(key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bo
     verify_in(&KEYS, key, message, signature)
 }
 
-/// The keys checks decompressed, kept: decompressing one is about a tenth
-/// of a check. One cache for the process, so for every executor (a
-/// session's calls go to any of them) and every agent; as large as one
-/// agent's live sessions, so a node with many busy agents can outgrow it,
-/// and a check whose key was pushed out decompresses it again. Only keys
+/// The keys signature checks decompressed: decompressing one is about a
+/// tenth of a check. One cache for the whole node, every agent's sessions
+/// and every executor, sized to one agent's live sessions: with many busy
+/// agents it overflows, and a key evicted is decompressed again. Only keys
 /// that decompress are kept.
 static KEYS: std::sync::LazyLock<Keys> =
     std::sync::LazyLock::new(|| kept_keys(defaults::MAX_SESSIONS as usize));
@@ -257,16 +263,8 @@ impl Inner {
                     method: call.method,
                     arguments: call.arguments,
                 };
-                // Pushed now, in the lane's order, when the group knows
-                // where calls go, as it does while this replica leads:
-                // nothing awaits between `next` and the push, and the
-                // node's tasks share one thread, so no other call of the
-                // lane comes between them. Should the push have to wait
-                // for a leader, a later call of the lane may go first;
-                // refine refuses that one as a gap, consuming nothing, and
-                // its client sends it again. Run to its end in a task of
-                // its own, which settles the lane however long it takes,
-                // and waited for within the deadline.
+                // Pushed now, in the lane's order (see the module doc), and
+                // run to its end in a task that settles the lane.
                 let running = self.call(agent, request);
                 let (answered, answer) = smol::channel::bounded(1);
                 let inner = Arc::clone(self);

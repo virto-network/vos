@@ -1,6 +1,6 @@
 //! Snapshot installs killed mid-way: an agent's state is always exactly one
 //! installed snapshot, plus the applies after it, at the applied index
-//! recorded with it (section 9.5, invariant 6).
+//! recorded with it.
 //!
 //! A child process installs snapshots of known content in a loop, as a
 //! replica does: it clears the next epoch, stages the snapshot's rows
@@ -16,7 +16,6 @@
 //! - no staged row of an unfinished install is visible;
 //! - every install reported survives, but for a tear's reach.
 
-/// The allocator the node's binary runs on.
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
