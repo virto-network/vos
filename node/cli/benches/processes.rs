@@ -30,16 +30,19 @@
 //! Each run gives every process's CPU, and the CPU per commit.
 //!
 //! `cargo bench -p vos-cli --bench processes` (after `just build-agent
-//! build-test-actors`). `ROWS` picks rows (`agent,agents,quiet,query,
-//! linearizable,idle,failover,failover-idle,soak`; all but the last three
-//! by default); `CPUS`
-//! overrides the pinning, as `taskset -c` lists for each node and the
-//! driver, separated by `/`; `RUNTIME_THREADS` sets each node's runtime
-//! threads; `DATA` where the stores go; `VOS_BIN` another `vos` to run the
-//! nodes, for a lever's A/B runs; `LOGS` a directory to keep the nodes'
-//! logs in; `TLS=1` serves every node's ingress over TLS, each client
-//! pinning the node's key, for the rows against plain HTTP. `machine.sh`, beside this file, runs the rows on a machine of
-//! its own, each node on cores of its own.
+//! build-test-actors`). Its settings:
+//! - `ROWS` picks rows (`agent,agents,quiet,query,linearizable,idle,
+//!   failover,failover-idle,soak`; all but the last three by default);
+//! - `CPUS` overrides the pinning, as `taskset -c` lists for each node and
+//!   the driver, separated by `/`;
+//! - `DATA` where the stores go;
+//! - `VOS_BIN` another `vos` to run the nodes, for a lever's A/B runs;
+//! - `LOGS` a directory to keep the nodes' logs in;
+//! - `TLS=1` serves every node's ingress over TLS, each client pinning the
+//!   node's key, for the rows against plain HTTP.
+//!
+//! `machine.sh`, beside this file, runs the rows on a machine of its own,
+//! each node on cores of its own.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
@@ -317,7 +320,7 @@ impl Process {
         threads_cpu(self.pid(), "vos-executor")
     }
 
-    /// Its runtime threads', its writer's, its network's and fjall's
+    /// Its runtime thread's, its writer's, its network's and fjall's
     /// workers' (flushes and compactions) CPU so far, in seconds.
     fn others_cpu(&self) -> [f64; 4] {
         let pid = self.pid();
@@ -455,9 +458,6 @@ impl Space {
                 let data = dir.path().join(format!("node-{number}"));
                 let listen = format!("127.0.0.1:{}", ingress[at]);
                 let log = dir.path().join(format!("node-{number}.log"));
-                // `RUNTIME_THREADS` runs the nodes' tasks on that many
-                // threads each.
-                let runtime = std::env::var("RUNTIME_THREADS").unwrap_or_else(|_| "1".into());
                 let mut args: Vec<String> = [
                     "--data",
                     data.to_str().unwrap(),
@@ -465,8 +465,6 @@ impl Space {
                     &listen,
                     "--space",
                     space_file.to_str().unwrap(),
-                    "--runtime-threads",
-                    &runtime,
                 ]
                 .iter()
                 .map(|arg| arg.to_string())
@@ -581,7 +579,7 @@ impl Space {
 }
 
 /// CPU at a run's window's edges: each node's, each node's executors',
-/// runtime threads', writer's, network's and fjall workers', and the
+/// runtime thread's, writer's, network's and fjall workers', and the
 /// driver's.
 #[derive(Clone, Default)]
 struct Cpu {
@@ -1331,7 +1329,7 @@ fn report(name: &str, samples: &mut Samples, cpu: (Cpu, Cpu), measure: Duration)
     // waited on IO at once: a run is only as clean as these.
     let outside = (after.machine - before.machine) / seconds - busy.iter().sum::<f64>() - driver;
     let io = (after.io_stalled - before.io_stalled) / seconds * 100.0;
-    // Each node's runtime threads, writer and network, as shares of a core.
+    // Each node's runtime thread, writer and network, as shares of a core.
     let others: Vec<String> = after
         .others
         .iter()

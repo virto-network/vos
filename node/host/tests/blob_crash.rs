@@ -134,7 +134,7 @@ fn writer(dir: &str) {
                 }]);
                 log_start = through;
             }
-            smol::block_on(blobs.collect(&writer, Duration::ZERO)).unwrap();
+            smol::block_on(blobs.collect(&writer, Duration::ZERO, &|| false)).unwrap();
         }
     }
 }

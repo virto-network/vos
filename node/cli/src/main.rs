@@ -161,11 +161,6 @@ enum NodeCommand {
         /// space lists for this node, as behind port forwarding.
         #[arg(long)]
         peer_bind: Option<SocketAddr>,
-        /// Threads that run the node's tasks: its groups, their leader and
-        /// apply loops, its ingress and its peers' messages. For
-        /// measuring: more than one has run under no fault suite.
-        #[arg(long, default_value_t = 1, hide = true)]
-        runtime_threads: usize,
     },
     /// Print a node's public key, its identity.
     Info {
@@ -337,7 +332,6 @@ fn run(cli: Cli) -> Result<(), String> {
                     tls,
                     space,
                     peer_bind,
-                    runtime_threads,
                 },
         } => node(
             &data,
@@ -346,7 +340,6 @@ fn run(cli: Cli) -> Result<(), String> {
             tls.ingress(),
             space.as_deref(),
             peer_bind,
-            runtime_threads,
         ),
         Command::Node {
             command: NodeCommand::Info { node },
@@ -470,7 +463,6 @@ fn node(
     tls: Option<IngressTls>,
     space: Option<&Path>,
     peer_bind: Option<SocketAddr>,
-    runtime_threads: usize,
 ) -> Result<(), String> {
     // The node's log, on stderr: `VOS_LOG` names the level, `info` unless
     // it says otherwise.
@@ -486,7 +478,6 @@ fn node(
     config.ingress_tls = tls;
     config.space = space.map(Space::read).transpose()?;
     config.peer_bind = peer_bind;
-    config.runtime_threads = runtime_threads;
     #[cfg(feature = "faults")]
     {
         eprintln!("vos: WARNING: this build injects faults; it is for tests only");

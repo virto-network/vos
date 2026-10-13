@@ -101,7 +101,15 @@ impl ProgramSource for AgentPrograms {
         {
             return None;
         }
-        self.blobs.get(&hash.0).expect("a blob read")
+        let program = self.blobs.get(&hash.0).expect("a blob read");
+        if program.is_none() {
+            tracing::warn!(
+                agent = self.agent.0,
+                program = %hex_prefix(&hash.0),
+                "a program the agent pins is not stored"
+            );
+        }
+        program
     }
 }
 
@@ -147,6 +155,11 @@ pub(crate) fn refine(
     output.map(|output| (output, used))
 }
 
+/// A hash's first bytes, for a log line.
+fn hex_prefix(hash: &[u8; 32]) -> String {
+    hash[..4].iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 /// The calls refine leaves to the node: `historical_lookup` from the
 /// stored programs; every other answers `WHAT`.
 fn serve(id: u64, machine: &mut Machine, blobs: &Blobs) -> Result<(), ExitReason> {
@@ -164,6 +177,9 @@ fn serve(id: u64, machine: &mut Machine, blobs: &Blobs) -> Result<(), ExitReason
     }
     let blob = blobs.get(&hash).expect("a blob read");
     let Some(blob) = blob else {
+        // The agent looks up only programs it runs: one missing is a
+        // program its state names and this node lacks.
+        tracing::warn!(blob = %hex_prefix(&hash), "a blob refine looked up is not stored");
         machine.registers_mut()[7] = code::NONE;
         return Ok(());
     };

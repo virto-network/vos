@@ -90,6 +90,9 @@ struct Cluster {
     /// Compaction once the log holds so many bytes, keeping a tail of at
     /// most so many, when not the defaults.
     compaction_bytes: Option<(u64, u64)>,
+    /// Blob collection every so often, with this horizon, when not the
+    /// defaults.
+    blob_collection: Option<(Duration, Duration)>,
     /// How long a leader waits for a snapshot's acknowledgement, when not
     /// the default.
     snapshot_timeout_ms: Option<u64>,
@@ -144,6 +147,7 @@ impl Cluster {
             },
             compaction: None,
             compaction_bytes: None,
+            blob_collection: None,
             snapshot_timeout_ms: None,
             election_timeout_ms: None,
             answered: None,
@@ -230,6 +234,10 @@ impl Cluster {
         if let Some((bytes, tail)) = self.compaction_bytes {
             config.compact_bytes = bytes;
             config.compact_tail_bytes = tail;
+        }
+        if let Some((every, horizon)) = self.blob_collection {
+            config.blob_collect_every = every;
+            config.blob_horizon = horizon;
         }
         // Each node's own clock, a few milliseconds apart.
         let skew = u64::from(number) * 7;
@@ -2231,6 +2239,85 @@ fn a_stale_leader_left_out_of_the_configuration_retires() {
     retired(cluster.node(stale), agent);
 }
 
+/// A replica retired twice keeps the floor its first retirement left.
+/// Added again and removed before it held any entry, its empty log alone
+/// would lower the floor below what it once held, and it could then vote
+/// for a candidate missing entries it had acknowledged.
+#[test]
+fn a_replica_retired_twice_keeps_its_first_floor() {
+    let cluster = Cluster::new(4);
+    let agent = cluster.node(1).create_replicated(vec![1, 2, 3]).unwrap();
+    cluster.install(agent);
+    let leader = cluster.leader(agent);
+    let gone = (1..=3).find(|number| *number != leader).unwrap();
+    for sequence in 1..=5 {
+        done(cluster.increment(leader, agent, sequence, sequence));
+    }
+    wait_until("the replica holds every entry", || {
+        cluster.node(gone).applied(agent) >= cluster.node(leader).applied(agent)
+    });
+    let held = cluster.node(gone).applied(agent).unwrap();
+    let replaced = |replicas: &[NodeNumber], out: NodeNumber, inn: NodeNumber| {
+        let mut next: Vec<NodeNumber> = replicas
+            .iter()
+            .copied()
+            .filter(|number| *number != out)
+            .chain([inn])
+            .collect();
+        next.sort_unstable();
+        next
+    };
+    let first = replaced(&[1, 2, 3], gone, 4);
+    assert_eq!(cluster.node(leader).replace(agent, gone, 4).unwrap(), first);
+    retired(cluster.node(gone), agent);
+    let floor = cluster
+        .node(gone)
+        .store()
+        .raft(agent)
+        .unwrap()
+        .vote_floor
+        .expect("a floor");
+    assert!(floor.0 >= held, "the floor {floor:?} is below {held}");
+
+    // Added again with no entry reaching it: its directory still learns.
+    for number in (1..=4).filter(|number| *number != gone) {
+        cluster
+            .hub
+            .cut_class(gone, number, vos_net::Class::Consensus);
+        cluster
+            .hub
+            .cut_class(number, gone, vos_net::Class::Consensus);
+    }
+    let leader = cluster.leader(agent);
+    let again = replaced(&first, 4, gone);
+    assert_eq!(cluster.node(leader).replace(agent, 4, gone).unwrap(), again);
+    wait_until("the replica runs the group again", || {
+        cluster.node(gone).applied(agent).is_some()
+    });
+    assert!(
+        cluster
+            .node(gone)
+            .store()
+            .raft(agent)
+            .unwrap()
+            .log
+            .is_empty()
+    );
+    // The retirement's batch moves the state to a new, empty epoch: once
+    // the epoch moves, its floor is written.
+    let epoch = cluster.node(gone).store().snapshot().epoch(agent).unwrap();
+    assert_eq!(cluster.node(leader).replace(agent, gone, 4).unwrap(), first);
+    retired(cluster.node(gone), agent);
+    wait_until("the retirement is written", || {
+        cluster.node(gone).store().snapshot().epoch(agent).unwrap() != epoch
+    });
+    assert_eq!(
+        cluster.node(gone).store().raft(agent).unwrap().vote_floor,
+        Some(floor),
+        "the second retirement lowered the floor"
+    );
+}
+
 /// A replica that never took an agent's install holds its program in the
 /// pool once it runs it: a leader elected later at its first call, a
 /// follower at its first query. Neither builds the program from its blob
@@ -2277,10 +2364,14 @@ fn replicas_that_never_took_the_install_pool_the_program_on_first_use() {
 
 /// The pool drops a program once no agent on the node pins it, keeps one
 /// another agent still pins, and holds it again once it is pinned and run
-/// again. A restart leaves it as the pins do.
+/// again. A restart leaves it as the pins do. The blob store, collected
+/// every 100 ms, drops the program past its horizon (3 s) too, while the
+/// nodes that pin it keep it.
 #[test]
 fn a_program_leaves_the_pool_with_its_last_pin() {
-    let mut cluster = Cluster::new(4);
+    let mut cluster = Cluster::build(0, Arc::new(vos_node::NoHooks), Vec::new(), false);
+    cluster.blob_collection = Some((Duration::from_millis(100), Duration::from_secs(3)));
+    cluster.grow(4);
     let agents: Vec<AgentId> = (0..2)
         .map(|_| cluster.node(1).create_replicated(vec![1, 2, 3]).unwrap())
         .collect();
@@ -2321,6 +2412,15 @@ fn a_program_leaves_the_pool_with_its_last_pin() {
     wait_until("the pool drops the program", || {
         !cluster.node(node).pooled(&program)
     });
+    wait_until("the blob store drops the program", || {
+        !cluster.node(node).stores_blob(&program)
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    for (number, running) in cluster.running() {
+        if number != node {
+            assert!(running.stores_blob(&program), "node {number} pins it");
+        }
+    }
     cluster.stop(node);
     cluster.start(node);
     assert!(
@@ -2341,6 +2441,7 @@ fn a_program_leaves_the_pool_with_its_last_pin() {
     });
     assert_eq!(cluster.value(node, third), 0);
     assert!(cluster.node(node).pooled(&program), "held again once run");
+    assert!(cluster.node(node).stores_blob(&program), "fetched again");
     cluster.stop(node);
     cluster.start(node);
     assert!(

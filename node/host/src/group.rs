@@ -1192,13 +1192,30 @@ impl Driver {
         let Some(install) = self.install.as_ref() else {
             return true;
         };
+        let named: Vec<[u8; 32]> = install.programs.iter().copied().collect();
         let blobs = &self.inner.blobs;
-        self.install_missing = install
-            .programs
+        self.install_missing = named
             .iter()
             .filter(|hash| !blobs.contains(hash).unwrap_or(false))
             .copied()
             .collect();
+        // Once every program is here, each is touched: it stays while the
+        // switch comes to pin it, as the blob writer orders the touch with
+        // a collection's removals. One removed meanwhile is wanted again.
+        if self.install_missing.is_empty() && !named.is_empty() {
+            match blobs.touch(named.clone()).await {
+                Ok(stored) => {
+                    self.install_missing = named
+                        .into_iter()
+                        .filter(|hash| !stored.contains(hash))
+                        .collect();
+                }
+                Err(error) => {
+                    tracing::warn!(agent = self.agent.0, "a blob touch failed: {error}");
+                    return true;
+                }
+            }
+        }
         if !self.install_missing.is_empty() {
             self.inner.want(self.agent, &self.install_missing);
             return true;
@@ -1331,12 +1348,14 @@ impl Driver {
     }
 
     /// Remove an epoch a switch, or an abandoned install, left behind, in
-    /// the background.
+    /// the background: marked as dropped before the drop can run.
     fn drop_epoch(&self, epoch: u8) {
         let inner = Arc::clone(&self.inner);
         let agent = self.agent;
+        self.inner.dropping(agent, epoch);
         self.inner.spawn(async move {
             drop_epoch(&inner, agent, epoch).await;
+            inner.dropped(agent, epoch);
         });
     }
 
@@ -1409,7 +1428,10 @@ impl Driver {
     }
 }
 
-/// Remove `agent`'s rows under the old `epoch`, a few thousand a write.
+/// Remove `agent`'s rows under the old `epoch`, a few thousand a write,
+/// until it holds none. Its caller marks the epoch as dropped first
+/// (`Inner::dropping`): an epoch emptied by one pass, and chosen for a new
+/// install before the next, would lose the install's rows.
 async fn drop_epoch(inner: &Inner, agent: AgentId, epoch: u8) {
     loop {
         let drop = Change::DropEpoch {
@@ -1427,7 +1449,8 @@ async fn drop_epoch(inner: &Inner, agent: AgentId, epoch: u8) {
     }
 }
 
-/// An epoch of `agent`'s past its current one that holds no rows.
+/// An epoch of `agent`'s past its current one that holds no rows, and that
+/// no drop runs on.
 pub(crate) fn empty_epoch(inner: &Inner, agent: AgentId) -> Option<u8> {
     let read = inner
         .store
@@ -1442,7 +1465,7 @@ pub(crate) fn empty_epoch(inner: &Inner, agent: AgentId) -> Option<u8> {
         }
     };
     let mut epoch = next_epoch(current);
-    while stale.contains(&epoch) {
+    while stale.contains(&epoch) || inner.is_dropping(agent, epoch) {
         epoch = next_epoch(epoch);
         if epoch == current {
             return None;
@@ -1467,8 +1490,12 @@ pub(crate) async fn drop_stale_epochs(inner: &Inner, agent: AgentId) {
     let Ok(stale) = inner.store.stale_epochs(agent) else {
         return;
     };
+    for &epoch in &stale {
+        inner.dropping(agent, epoch);
+    }
     for epoch in stale {
         drop_epoch(inner, agent, epoch).await;
+        inner.dropped(agent, epoch);
     }
 }
 

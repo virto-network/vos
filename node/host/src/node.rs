@@ -55,9 +55,6 @@ pub struct Config {
     pub agent: Vec<u8>,
     /// Executor threads for PVM work.
     pub executors: usize,
-    /// Threads that run the node's tasks: its groups' drivers, leader and
-    /// apply loops, its ingress and its peers' messages.
-    pub runtime_threads: usize,
     /// Client requests an agent queues before a call answers busy.
     pub queue: usize,
     /// The most inputs, and argument bytes, in one batch.
@@ -107,6 +104,14 @@ pub struct Config {
     /// and at most this many bytes of them: well under `compact_bytes`,
     /// or every commit makes a compaction due.
     pub compact_tail_bytes: u64,
+    /// Every so often the node collects its blob store: a blob goes once
+    /// no log row names it, no pin holds it, and nobody put or touched it
+    /// within the horizon. A follower fetches a blob its entry names and
+    /// lacks, so the horizon matters where one node alone holds a blob:
+    /// an install's programs at its leader, from their put until the
+    /// install's entry names them.
+    pub blob_collect_every: Duration,
+    pub blob_horizon: Duration,
     /// About how many bytes of rows one snapshot chunk carries.
     pub snapshot_chunk: usize,
     /// How long a leader waits for a follower to acknowledge a snapshot
@@ -121,7 +126,6 @@ impl Config {
             agent,
             executors: std::thread::available_parallelism()
                 .map_or(1, |cores| cores.get().saturating_sub(1).max(1)),
-            runtime_threads: 1,
             queue: 1024,
             max_inputs: 256,
             max_bytes: 1 << 20,
@@ -142,6 +146,8 @@ impl Config {
             answered: Duration::from_secs(30),
             compact_every: 1024,
             compact_bytes: 64 << 20,
+            blob_collect_every: Duration::from_secs(600),
+            blob_horizon: Duration::from_secs(3_600),
             compact_tail: 256,
             compact_tail_bytes: 16 << 20,
             snapshot_chunk: 1 << 20,
@@ -449,6 +455,8 @@ pub(crate) struct Inner {
     pub(crate) compact_bytes: u64,
     pub(crate) compact_tail: u64,
     pub(crate) compact_tail_bytes: u64,
+    pub(crate) blob_collect_every: Duration,
+    pub(crate) blob_horizon: Duration,
     pub(crate) snapshot_chunk: usize,
     pub(crate) snapshot_timeout_ms: u64,
     /// Every agent this node knows of, and where it runs.
@@ -463,6 +471,10 @@ pub(crate) struct Inner {
     pub(crate) capable: Mutex<HashMap<(AgentId, NodeNumber), smol::channel::Sender<bool>>>,
     /// When this node last asked each peer for each agent's record.
     pub(crate) asked: Mutex<HashMap<(AgentId, NodeNumber), Instant>>,
+    /// The agents' epochs a drop may still remove rows from, with how many
+    /// drops run on each: no install is staged into one (`empty_epoch`),
+    /// or a drop would take its rows.
+    pub(crate) dropping: Mutex<HashMap<(AgentId, u8), usize>>,
     /// The agents this node replicates.
     pub(crate) runs: Mutex<HashMap<AgentId, Arc<Run>>>,
     dry_runs: Mutex<HashMap<AgentId, DryRun>>,
@@ -1473,6 +1485,36 @@ impl Inner {
     }
 
     /// Run `task` on the node's thread until it ends or the node stops.
+    /// Mark `epoch` of `agent`'s as one a drop runs on, before the drop can
+    /// remove a row.
+    pub(crate) fn dropping(&self, agent: AgentId, epoch: u8) {
+        *self
+            .dropping
+            .lock()
+            .expect("the epochs dropped")
+            .entry((agent, epoch))
+            .or_default() += 1;
+    }
+
+    /// A drop on `epoch` of `agent`'s ended.
+    pub(crate) fn dropped(&self, agent: AgentId, epoch: u8) {
+        let mut dropping = self.dropping.lock().expect("the epochs dropped");
+        if let Some(running) = dropping.get_mut(&(agent, epoch)) {
+            *running -= 1;
+            if *running == 0 {
+                dropping.remove(&(agent, epoch));
+            }
+        }
+    }
+
+    /// Whether a drop runs on `epoch` of `agent`'s.
+    pub(crate) fn is_dropping(&self, agent: AgentId, epoch: u8) -> bool {
+        self.dropping
+            .lock()
+            .expect("the epochs dropped")
+            .contains_key(&(agent, epoch))
+    }
+
     pub(crate) fn spawn(&self, task: impl Future<Output = ()> + Send + 'static) {
         // A node shutting down runs nothing new: what such a task would do
         // (an old epoch dropped, say) is done again at the next start.
@@ -1592,6 +1634,8 @@ pub struct Node {
     runtime: Vec<JoinHandle<()>>,
     /// The pair heartbeat's thread, and what stops it.
     liveness: Option<(smol::channel::Sender<()>, JoinHandle<()>)>,
+    /// The blob collector's thread, and what stops it.
+    collector: Option<(std::sync::mpsc::Sender<()>, JoinHandle<()>)>,
 }
 
 /// The node's data directory: its store, and the operator's token. A
@@ -1699,21 +1743,18 @@ impl Node {
             (network, _) => network,
         };
         let runtime = Arc::new(smol::Executor::new());
-        // Closed to stop: every runtime thread sees it.
+        // Closed to stop the runtime thread.
         let (stop, stopped) = smol::channel::bounded::<()>(1);
-        let threads: Vec<JoinHandle<()>> = (0..config.runtime_threads.max(1))
-            .map(|index| {
-                let (runtime, stopped) = (Arc::clone(&runtime), stopped.clone());
-                std::thread::Builder::new()
-                    .name(if index == 0 {
-                        "vos-node".into()
-                    } else {
-                        format!("vos-node-{index}")
-                    })
-                    .spawn(move || smol::block_on(runtime.run(stopped.recv())).unwrap_or(()))
-                    .expect("the node's thread starts")
-            })
-            .collect();
+        // One thread runs the node's tasks: its groups' drivers, leader and
+        // apply loops, its ingress and its peers' messages. A call's lane
+        // relies on it (`Inner::lane_call`).
+        let threads: Vec<JoinHandle<()>> = vec![{
+            let runtime = Arc::clone(&runtime);
+            std::thread::Builder::new()
+                .name("vos-node".into())
+                .spawn(move || smol::block_on(runtime.run(stopped.recv())).unwrap_or(()))
+                .expect("the node's thread starts")
+        }];
         let next = records
             .iter()
             .filter(|record| CreationRecord::creator_of(record.agent) == number)
@@ -1747,6 +1788,8 @@ impl Node {
             compact_bytes: config.compact_bytes,
             compact_tail: config.compact_tail,
             compact_tail_bytes: config.compact_tail_bytes,
+            blob_collect_every: config.blob_collect_every,
+            blob_horizon: config.blob_horizon,
             snapshot_chunk: config.snapshot_chunk,
             snapshot_timeout_ms: config.snapshot_timeout_ms,
             directory: Mutex::new(HashMap::new()),
@@ -1755,6 +1798,7 @@ impl Node {
             refusing: Mutex::new(HashMap::new()),
             capable: Mutex::new(HashMap::new()),
             asked: Mutex::new(HashMap::new()),
+            dropping: Mutex::new(HashMap::new()),
             runs: Mutex::new(HashMap::new()),
             dry_runs: Mutex::new(HashMap::new()),
             wanted: Mutex::new(HashMap::new()),
@@ -1822,6 +1866,15 @@ impl Node {
         }
         inner.spawn(crate::dispatch::resend_records(Arc::clone(&inner)));
         inner.spawn(crate::stats::probe(Arc::clone(&inner)));
+        let collector = {
+            let (stop, stopped) = std::sync::mpsc::channel::<()>();
+            let inner = Arc::clone(&inner);
+            let thread = std::thread::Builder::new()
+                .name("vos-blob-collect".into())
+                .spawn(move || collect_blobs(&inner, &stopped))
+                .expect("the blob collector's thread starts");
+            Some((stop, thread))
+        };
         Ok(Self {
             inner,
             data,
@@ -1832,6 +1885,7 @@ impl Node {
             stop: Some(stop),
             runtime: threads,
             liveness,
+            collector,
         })
     }
 
@@ -2025,6 +2079,11 @@ impl Node {
         self.inner.blobs.pinned().unwrap_or_default()
     }
 
+    /// Whether the blob store holds `hash`.
+    pub fn stores_blob(&self, hash: &[u8; 32]) -> bool {
+        self.inner.blobs.contains(hash).unwrap_or(false)
+    }
+
     /// Whether the machine pool holds `program`: instances of it run
     /// without loading it first.
     pub fn pooled(&self, program: &[u8; 32]) -> bool {
@@ -2086,6 +2145,11 @@ impl Node {
             let _ = stop.try_send(());
             let _ = thread.join();
         }
+        // A collection under way ends first: it waits on the writers.
+        if let Some((stop, thread)) = self.collector.take() {
+            let _ = stop.send(());
+            let _ = thread.join();
+        }
         // End the ingress and its connections while the runtime still runs
         // them, so none outlives the node holding its store.
         let ingress = self.ingress.lock().expect("the ingress").take();
@@ -2138,6 +2202,34 @@ impl Drop for Node {
     }
 }
 
+/// Collect the blob store every `blob_collect_every` until stopped, on a
+/// thread of its own: a collection with a blob to consider reads every
+/// live log row, which the node's one runtime thread must not wait on.
+fn collect_blobs(inner: &Inner, stopped: &std::sync::mpsc::Receiver<()>) {
+    while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+        stopped.recv_timeout(inner.blob_collect_every)
+    {
+        let stopping = || inner.closing.load(std::sync::atomic::Ordering::SeqCst);
+        match smol::block_on(
+            inner
+                .blobs
+                .collect(&inner.storage, inner.blob_horizon, &stopping),
+        ) {
+            Ok(collected) => {
+                if collected.removed + collected.moved + collected.segments_deleted > 0 {
+                    tracing::info!(
+                        removed = collected.removed,
+                        moved = collected.moved,
+                        segments_deleted = collected.segments_deleted,
+                        "blobs collected"
+                    );
+                }
+            }
+            Err(error) => tracing::warn!("a blob collection failed: {error}"),
+        }
+    }
+}
+
 /// Write the operator's token, in hex, readable by its owner only.
 fn write_token(path: &Path, token: &[u8; 32]) -> std::io::Result<()> {
     use std::io::Write;
@@ -2184,6 +2276,60 @@ mod tests {
         drop(job);
         let opened = Node::open(dir.path(), Config::new(agent));
         assert!(opened.is_ok(), "{:?}", opened.err());
+    }
+
+    /// An epoch a drop runs on is chosen for no install, though a pass of
+    /// the drop has emptied it: the drop's next pass would take the
+    /// install's rows.
+    #[test]
+    fn an_epoch_being_dropped_takes_no_install() {
+        use crate::group::empty_epoch;
+        use crate::storage::Change;
+        use vos_wire::ids::AgentId;
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../agent/default/target/riscv64em-vos/release/vos-agent.elf"
+        );
+        let elf = std::fs::read(path).expect("run `just build-agent`");
+        let agent_program = vos_pvm_compiler::link_elf_spi(&elf).expect("links");
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::open(dir.path(), Config::new(agent_program)).unwrap();
+        let inner = &node.inner;
+        let agent = AgentId(9);
+        let commit = |change: Change| smol::block_on(inner.storage.commit(vec![change])).unwrap();
+        // An abandoned install's rows in epoch 1: not empty, so not chosen.
+        commit(Change::Stage {
+            agent,
+            epoch: 1,
+            first: true,
+            rows: vec![(b"\x01row".to_vec(), b"value".to_vec())],
+        });
+        assert_eq!(empty_epoch(inner, agent), Some(2));
+        // Its drop runs, and one pass empties it.
+        inner.dropping(agent, 1);
+        commit(Change::DropEpoch {
+            agent,
+            epoch: 1,
+            limit: usize::MAX,
+        });
+        assert_eq!(empty_epoch(inner, agent), Some(2), "chosen mid-drop");
+        inner.dropped(agent, 1);
+        assert_eq!(empty_epoch(inner, agent), Some(1));
+        // A retirement's drops mark every epoch before their first pass,
+        // and unmark each once it is gone.
+        commit(Change::Stage {
+            agent,
+            epoch: 3,
+            first: true,
+            rows: vec![(b"\x01row".to_vec(), b"value".to_vec())],
+        });
+        let mut drops = Box::pin(crate::group::drop_stale_epochs(inner, agent));
+        if smol::block_on(smol::future::poll_once(&mut drops)).is_none() {
+            assert!(inner.is_dropping(agent, 3), "dropped unmarked");
+            smol::block_on(drops);
+        }
+        assert!(!inner.is_dropping(agent, 3));
+        assert_eq!(empty_epoch(inner, agent), Some(1));
     }
 
     #[test]

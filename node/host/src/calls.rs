@@ -257,8 +257,15 @@ impl Inner {
                     method: call.method,
                     arguments: call.arguments,
                 };
-                // Pushed now, in the lane's order; run to its end in a task
-                // of its own, which settles the lane however long it takes,
+                // Pushed now, in the lane's order, when the group knows
+                // where calls go, as it does while this replica leads:
+                // nothing awaits between `next` and the push, and the
+                // node's tasks share one thread, so no other call of the
+                // lane comes between them. Should the push have to wait
+                // for a leader, a later call of the lane may go first;
+                // refine refuses that one as a gap, consuming nothing, and
+                // its client sends it again. Run to its end in a task of
+                // its own, which settles the lane however long it takes,
                 // and waited for within the deadline.
                 let running = self.call(agent, request);
                 let (answered, answer) = smol::channel::bounded(1);

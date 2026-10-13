@@ -300,6 +300,11 @@ impl Processes {
     /// them.
     pub fn start(count: usize, options: Options) -> Self {
         let mut dir = tempfile::tempdir().unwrap();
+        // `KEEP_NODES` keeps the nodes' data and logs, to look at after.
+        if std::env::var_os("KEEP_NODES").is_some() {
+            dir.disable_cleanup(true);
+            eprintln!("the nodes' data and logs stay in {}", dir.path().display());
+        }
         // A first run alone makes each node's key.
         let keys: Vec<String> = (1..=count)
             .map(|number| {

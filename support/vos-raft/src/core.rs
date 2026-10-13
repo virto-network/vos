@@ -816,11 +816,12 @@ impl<N: NodeId> Core<N> {
     }
 
     /// The host cannot complete the entries it never reported durable (a
-    /// blob one names is lost): a follower drops those above its commit
-    /// index, as a crash would drop unsynced writes. It never acknowledged
-    /// them, and an entry committed is held, with its blobs, by a quorum
-    /// it can fetch them from. A leader drops nothing: it may have counted
-    /// its followers for its own entries.
+    /// blob one names is lost): the replica drops those above its durable
+    /// and commit indexes, as a crash would drop unsynced writes. It never
+    /// acknowledged them, and an entry committed is held, with its blobs,
+    /// by a quorum it can fetch them from. A candidate or a leader steps
+    /// down first: its requests advertised the longer log, and a leader
+    /// counts only a quorum, so what it committed is kept.
     pub fn discard_unreported(&mut self) {
         let keep = self.durable_index.max(self.commit);
         if self.log.last_index() <= keep {

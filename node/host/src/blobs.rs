@@ -430,8 +430,15 @@ impl Blobs {
 
     /// Remove what no durable log row names, no pin holds and nobody put
     /// within `horizon`; delete segments left empty, and move the live
-    /// blobs out of segments under half live, then delete those.
-    pub async fn collect(&self, writer: &StorageThread, horizon: Duration) -> Result<Collected> {
+    /// blobs out of segments under half live, then delete those. `stop`
+    /// ends it early, between its steps, when the node stops: what it did
+    /// by then stands, and the next collection goes on from there.
+    pub async fn collect(
+        &self,
+        writer: &StorageThread,
+        horizon: Duration,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<Collected> {
         let _one = self.inner.collecting.lock().await;
         let mut collected = Collected::default();
         let store = &self.inner.store;
@@ -441,43 +448,57 @@ impl Blobs {
                 .await
                 .map_err(|error| Error::Io(std::io::Error::other(error)))
         };
-        // What a snapshot shows becomes durable with the barrier after it,
-        // so the references read are ones a crash cannot bring back.
-        let first = store.database().snapshot();
-        barrier().await?;
-        let referenced = store.referenced_blobs(&first)?;
         // A blob put at or before the cutoff has aged out of the horizon.
         let cutoff = now().saturating_sub(horizon.as_millis() as u64);
+        let first = store.database().snapshot();
+        // Only a blob aged and unpinned can go: with none, no log row is
+        // read.
+        let mut pinned = std::collections::HashSet::new();
+        for row in first.prefix(&self.inner.index, [IndexRow::Pin as u8]) {
+            let key = row.key()?;
+            pinned.insert(<[u8; 32]>::try_from(&key[1..33]).expect("a pin names a hash"));
+        }
         let mut candidates = Vec::new();
         for row in first.prefix(&self.inner.index, [IndexRow::Location as u8]) {
             let (key, value) = row.into_inner()?;
             let hash: [u8; 32] = key[1..].try_into().expect("a location names a hash");
             let location = Location::decode(&value).expect("a location this store wrote");
-            if location.time <= cutoff && !referenced.contains(&hash) {
+            if location.time <= cutoff && !pinned.contains(&hash) {
                 candidates.push(hash);
             }
         }
+        if !candidates.is_empty() && !stop() {
+            // What the snapshot shows becomes durable with the barrier after
+            // it, so the references read are ones a crash cannot bring back.
+            barrier().await?;
+            let referenced = store.referenced_blobs(&first)?;
+            candidates.retain(|hash| !referenced.contains(hash));
+        } else {
+            candidates.clear();
+        }
         drop(first);
-        // A fence: anything that came to need a candidate since is seen.
-        let second = store.database().snapshot();
-        barrier().await?;
-        let referenced = store.referenced_blobs(&second)?;
-        drop(second);
-        candidates.retain(|hash| !referenced.contains(hash));
-        // The blob writer removes them, synced, in order with puts and
-        // touches: one that refreshed a candidate since keeps it. Dead blobs
-        // leave the index before any segment goes.
-        collected.removed = self
-            .request(|done| Request::Remove {
-                candidates,
-                cutoff,
-                done,
-            })
-            .await
-            .map_err(|error| Error::Io(std::io::Error::other(error)))?;
+        if !candidates.is_empty() && !stop() {
+            // A fence: anything that came to need a candidate since is seen.
+            let second = store.database().snapshot();
+            barrier().await?;
+            let referenced = store.referenced_blobs(&second)?;
+            drop(second);
+            candidates.retain(|hash| !referenced.contains(hash));
+            // The blob writer removes them, synced, in order with puts and
+            // touches: one that refreshed a candidate since keeps it. Dead
+            // blobs leave the index before any segment goes.
+            collected.removed = self
+                .request(|done| Request::Remove {
+                    candidates,
+                    cutoff,
+                    done,
+                })
+                .await
+                .map_err(|error| Error::Io(std::io::Error::other(error)))?;
+        }
         let (live, current) = self.live_bytes()?;
         let mut to_delete = Vec::new();
-        for (segment, live) in live {
+        'segments: for (segment, live) in live {
             if segment == current {
                 continue;
             }
@@ -487,6 +508,10 @@ impl Blobs {
                 to_delete.push(segment);
             } else if live.bytes * 2 < size {
                 for (hash, location) in live.blobs {
+                    // A segment only partly moved stays, for the next one.
+                    if stop() {
+                        break 'segments;
+                    }
                     let Some(bytes) = self.get(&hash)? else {
                         continue;
                     };
@@ -1040,11 +1065,12 @@ mod tests {
         batch.commit(Durability::Synced).unwrap();
 
         // Everything is younger than a day: nothing goes.
-        let kept = smol::block_on(blobs.collect(&writer, Duration::from_secs(86_400))).unwrap();
+        let kept =
+            smol::block_on(blobs.collect(&writer, Duration::from_secs(86_400), &|| false)).unwrap();
         assert_eq!(kept.removed, 0);
         // With no horizon, the unnamed and unpinned blobs go, and segments
         // left empty or sparse are deleted, their live blobs moved.
-        let collected = smol::block_on(blobs.collect(&writer, Duration::ZERO)).unwrap();
+        let collected = smol::block_on(blobs.collect(&writer, Duration::ZERO, &|| false)).unwrap();
         assert_eq!(collected.removed, dead.len());
         assert!(collected.segments_deleted >= 1, "{collected:?}");
         for blob in &dead {
@@ -1117,7 +1143,8 @@ mod tests {
             .insert(location_key(&blob.hash), old.encode())
             .unwrap();
         put(&blobs, &data);
-        let kept = smol::block_on(blobs.collect(&writer, Duration::from_secs(3_600))).unwrap();
+        let kept =
+            smol::block_on(blobs.collect(&writer, Duration::from_secs(3_600), &|| false)).unwrap();
         assert_eq!(kept.removed, 0);
         assert!(blobs.contains(&blob.hash).unwrap());
         let segment_records = std::fs::metadata(segment_path(&dir.path().join("blobs"), 0))

@@ -391,6 +391,9 @@ pub struct Cluster {
     /// The committed entry at each index, as the first replica that
     /// committed it held it.
     committed: BTreeMap<u64, (u64, Option<Vec<u8>>)>,
+    /// Each replica's highest index whose committed entry was compared: a
+    /// commit that jumps compares every entry it passes, not just its tip.
+    checked: BTreeMap<u16, u64>,
     pub violations: Vec<Violation>,
     /// Proposal answers: token to index.
     pub proposed: BTreeMap<u64, u64>,
@@ -465,6 +468,7 @@ impl Cluster {
             applied: BTreeMap::new(),
             leaders: BTreeMap::new(),
             committed: BTreeMap::new(),
+            checked: BTreeMap::new(),
             violations: Vec::new(),
             proposed: BTreeMap::new(),
             reads: BTreeMap::new(),
@@ -598,6 +602,9 @@ impl Cluster {
         let keep = self.random.next_u64() as usize % 4;
         self.stores.get_mut(&node).expect("a node").crash(keep);
         self.cores.insert(node, None);
+        // What it committed but had not synced is gone: once it commits
+        // there again, those entries are compared again.
+        self.checked.remove(&node);
         self.sync_due.remove(&node);
         self.entry_reports.remove(&node);
         // A host starts again with nothing heard.
@@ -688,6 +695,7 @@ impl Cluster {
             .expect("a node")
             .retire(keep_floor);
         self.applied.insert(node, 0);
+        self.checked.remove(&node);
         self.sync_due.remove(&node);
         self.entry_reports.remove(&node);
         self.cores.insert(node, None);
@@ -1038,12 +1046,10 @@ impl Cluster {
             return;
         }
         let store = &self.stores[&node];
-        let start = self
-            .committed
-            .keys()
-            .next_back()
-            .map_or(1, |&at| at + 1)
-            .min(index);
+        let start = self.checked.get(&node).map_or(1, |&at| at + 1);
+        if index >= start {
+            self.checked.insert(node, index);
+        }
         for at in start..=index {
             let Some(entry) = store.written(at) else {
                 continue;
