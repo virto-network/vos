@@ -1,6 +1,6 @@
 # Slice 4: Workflows, committed state and JAM
 
-Plan v2 for build step 4 of `core-model.md` (section 16):
+Plan v3 for build step 4 of `core-model.md` (section 16):
 - the compressed root format and witnessed state reads (item 17);
 - workflows and their snapshots (sections 8.2 and 8.3, item 21);
 - the first JAM milestone (section 12).
@@ -8,7 +8,9 @@ Plan v2 for build step 4 of `core-model.md` (section 16):
 It also takes the items slice 3 carried to it. It builds on slice 3's
 replicated node (`slice-3-replication.md`) and on S1 and SJ
 (`spikes.md`). v1 was reviewed for soundness (Fable) and against the
-code (Opus); v2 folds both. Tags as in the core model.
+code (Opus), and v2 folded both. v3 folds the review of the owner's
+two changes: scans on JAM, and preemption at the awaits. Tags as in the
+core model.
 
 ## Goal
 
@@ -210,32 +212,47 @@ A crate `agent/tree` (`vos-tree`, `no_std + alloc`). Its users:
   software on JAM.
 
 **Format** (section 9.3):
-- **Keys enter the tree in one of two modes,** chosen per tree; the
-  format is otherwise the same:
-  - **hashed:** `key' = H(TAG_KEY ‖ tree ‖ encoded key)`, 32 bytes.
-    Depth stays near log₂ n whatever keys an actor chooses, and a
-    shared path hides its neighbours' keys. No range proofs. Each
-    `CommittedMap`'s own root on VOS uses it;
-  - **ordered** [owner decision 8]: `key'` is the key itself, made
-    prefix-free while keeping byte order (each `0x00` byte escaped as
-    `0x00 0xFF`, then a terminator `0x00 0x00`). The tree's order is
-    then the keys' order, so the leaves of a range are adjacent and a
-    proof can show the range complete. JAM's whole-keyspace tree uses
-    it, because a JAM refine's scans must be witnessed.
-  - **Ordered depth is not log₂ n:** a path is at most as deep as its
-    key has bits (the ABI caps keys at 1 KiB), and at most as deep as
-    the tree has keys, since each level is a branch where another key
-    diverges. So deep paths cost whoever makes them one insert per
-    level, and a witness for them pays in gas. Sequential and
-    structured keys stay near log₂ n, because empty levels are never
-    hashed.
-- **Ordered scans** stay on the value rows on VOS. The tree serves
-  roots and proofs.
+- **One tree format over prefix-free key strings.** A row's key in the
+  tree is `key' = prefix ‖ transform(key)`, and each table chooses its
+  transform, as a Substrate map chooses its hasher [owner decision 8;
+  the default proposed]:
+  - **hashed,** the default: `H128(key) ‖ escape(key)`, as Substrate's
+    `Blake2_128Concat`. Depth stays near log₂ n whatever keys clients
+    choose. The table iterates, whole or from a cursor, in hash order,
+    and the raw key stays in the row key for the scan to return;
+  - **ordered,** `#[table(ordered)]`: `escape(key)`, as Substrate's
+    `Identity`. The table scans in key order, with ranges. Its keys are
+    capped at 64 bytes, so a path through it is at most about 1,040
+    levels deep: about 5M gas for a witnessed read on JAM at worst;
+  - **private,** in slice 5: `H(key)` alone, for maps whose proofs leave
+    the space. A shared path then hides its neighbours' keys, and the
+    map does not iterate.
+- **Why per table:** an ordered key lets whoever chooses keys make paths
+  deep (a chain k, k‖0, k‖00, … grows a level per insert). With 1 KiB
+  keys one witnessed read on JAM could cost about 78M gas, a dozen of
+  them a package's whole budget. So only a table that needs key order
+  takes it, with short keys.
+- **The same order on both hosts:** a table's value rows on VOS are
+  keyed by the same `key'`, so a scan returns rows in the same order on
+  VOS and JAM, and the refines agree byte for byte.
+- **Refine computes `key'`,** through the precompile on VOS and in
+  software on JAM, so accumulate writes rows by the keys the work result
+  names and never hashes.
+- **`escape`** is prefix-free and keeps byte order: each `0x00` becomes
+  `0x00 0xFF`, then `0x00 0x00` ends the key.
+  - `0x00 0x00` never occurs inside an escaped body, and no body ends
+    in a lone `0x00`, so no encoded key prefixes another.
+  - At the first differing byte, nonzero bytes compare as they did, and
+    `0x00 0xFF` sorts below any nonzero byte.
+  - A key that prefixes another continues with `0x00 0x00`, which sorts
+    below both continuations of the longer key.
+- **Ordered scans** on VOS read the value rows, in the tree's order. The
+  tree serves roots and proofs.
 - **A leaf:** `H(TAG_LEAF ‖ key' ‖ salt ‖ H(value))`. It does not depend
   on its depth.
 - **A branch:** `H(TAG_BRANCH ‖ level ‖ left ‖ right)`. `level` is the
-  first bit where its two subtrees' keys differ. Empty levels are never
-  hashed.
+  first bit where its two subtrees' keys differ, a big-endian `u16`.
+  Empty levels are never hashed.
 - **The empty tree's root:** `H(TAG_EMPTY)`.
 - **Deleting a leaf** replaces its parent branch with the sibling. A
   leaf's hash does not depend on its depth, and a branch's commits its
@@ -251,20 +268,35 @@ A crate `agent/tree` (`vos-tree`, `no_std + alloc`). Its users:
   canonical order.
 - `verify(root, proof, claims)` checks the claims. Along each path the
   verifier checks:
-  - that levels increase strictly and stay below 256;
+  - that levels increase strictly and stay within the key's bits;
   - that at each branch, the key's bit at that branch's level selects
     the child taken.
-- **Range proofs** (ordered mode): `RangeProof` shows that the leaves
-  it holds are every key in `[from, to)`:
-  - the paths to the boundaries, with the siblings outside them as
-    hashes;
-  - every subtree between the two paths given in full, down to its
+- **Range proofs:** `RangeProof` shows that the leaves it holds are
+  every key in `[from, to)`. Its boundaries are leaves, never a cursor's
+  path: a cursor between keys has no leaf, and below the branch its
+  path reaches, a sibling given as a hash cannot show which side of the
+  cursor it lies on.
+  - **Boundaries:** the predecessor of `from` (the largest key below
+    it) and the first key at or past `to`, as leaves, or the tree's edge
+    on either side.
+  - **The proof:** the two boundary paths with their outside siblings
+    as hashes, and every subtree between them in full, down to its
     leaves.
-  - The verifier rebuilds the root from them, so a leaf left out of the
-    range changes the root. A bounded scan (from a cursor, at most
-    `limit` rows) is proven as the range from the cursor to the last
-    row returned, or to the end of the scanned prefix when fewer than
-    `limit` came back.
+  - **The verifier checks** predecessor < `from` ≤ the first leaf
+    included, the last leaf included < `to` ≤ successor, and the
+    leaves in order. It then rebuilds the root, so a leaf left out
+    changes it.
+  - **An empty range:** the two boundary leaves are adjacent, with
+    nothing between their paths, and they bracket the range. In an
+    empty tree, the root `H(TAG_EMPTY)`.
+  - **A bounded scan,** from a cursor, of at most `limit` rows, is the
+    range from the cursor to just past the last row returned. When
+    fewer than `limit` came back, it runs to the end of the scanned
+    prefix: the successor of the encoded prefix in byte order (the last
+    byte below `0xFF` incremented, the rest dropped), or the tree's right
+    edge when there is none.
+  - **`update` works over a range proof,** whose subtrees are complete,
+    so refine writes inside a range it scanned.
 - `update(proof, writes) -> root` computes the root after inserting,
   changing and deleting the proven keys. It needs nothing beyond the
   proof: an insert's path ends at the leaf (or the empty root) that
@@ -299,39 +331,38 @@ A crate `agent/tree` (`vos-tree`, `no_std + alloc`). Its users:
 ### `CommittedMap<K, V>` [decided type; proposed rows]
 
 - **In the SDK:** a field type like `Table<K, V>`, with the same point
-  reads, writes and ordered scans. A handler never sees a root: on VOS
-  the root is built after commit.
+  reads, writes and scans, and the same choice of key transform. A
+  handler never sees a root: on VOS the root is built after commit.
 - **The ABI marks its writes as committed,** so the step's `Run` carries
   them apart and accumulate knows which rows to mark dirty.
 - **No hashing on the apply path.** The accumulate host serves no
-  precompile, so two software hashes a write (`key'` and the salt)
-  would break the budget. Accumulate writes rows only; the native
-  builder hashes.
+  precompile, so a software hash per write would break the budget.
+  Refine computes `key'` (the transform), the work result names rows by
+  it, accumulate writes rows only, and the native builder computes the
+  salts and the tree.
 - **Rows** in the agent's keyspace:
-  - **value rows:** `c/<map>/<key>` → `(version, value)`, the version
-    that wrote it;
-  - **dirty rows:** `d/<map>/<version>/<key>`, written in accumulate
+  - **value rows:** `c/<map>/<key'>` → `(version, value)`, the version
+    that wrote it, in the tree's order;
+  - **dirty rows:** `d/<map>/<version>/<key'>`, written in accumulate
     beside each committed write, under the state version the write
-    makes, with the raw key so the builder finds the value row. One row
-    each, so the apply path stays at table cost (section 9.3). The
-    version keeps a later write's row apart from an earlier one's, so
-    consuming the rows through one version never deletes a newer row;
+    makes. One row each, so the apply path stays at table cost (section
+    9.3). The version keeps a later write's row apart from an earlier
+    one's, so consuming the rows through one version never deletes a
+    newer row;
   - **seed rows:** `s/<version>` → the work result's seed, one per
     version that wrote a committed row, kept until the builder has
     consumed that version;
   - **the builder's rows,** which accumulate never writes:
     - node rows `n/<map>/<level><prefix>` at branching points;
-    - leaf rows `l/<map>/<key'>` → `(key, salt, leaf hash)`: the
-      present keys in the tree's order, which the value rows (in key
-      order) cannot give, and what a proof needs once the seed row is
-      gone;
+    - leaf rows `l/<map>/<key'>` → `(salt, leaf hash)`: what a proof
+      needs once the seed row is gone;
     - a root row `r/<map>` → `(root, version)`.
 - **The root builder** runs on every replica:
   - it takes a storage snapshot at the agent's state version V;
   - it reads the dirty rows through V, in batches of 10,000 keys,
     deduplicated and sorted by key;
-  - it computes each dirty key's `key'`, and its salt from the seed row
-    of the version that wrote it;
+  - it computes each dirty key's salt from the seed row of the version
+    that wrote it;
   - **one invariant carries correctness:** every leaf and node row
     whose subtree holds no dirty key matches the value rows;
   - each batch recomputes the whole path of each of its dirty keys,
@@ -382,7 +413,6 @@ impl Shop {
             .request(bank_agent, bank_ref, bank::Charge { amount: held.total })
             .within(Duration::from_secs(30))
             .await?;
-        ctx.checkpoint().await;
         Ok(Receipt { paid })
     }
 }
@@ -404,12 +434,19 @@ impl Shop {
   - `start(..)` and `result(id).within(d)`: a workflow of another agent,
     started, then its result awaited;
   - `sleep_until(t)`;
-  - `checkpoint()`;
   - `now`, `random`, `log`.
-- **`.await` stays in the API** (the owner's decision in draft 4). A
-  suspending call is a host call that does not return until the agent
-  resumes the machine, possibly in another process after a restore. So
-  the guest needs no executor: `block_on`'s single poll completes.
+- **Every `.await` is a point where the workflow may pause** and return
+  control to its agent [owner decision 5]. There is no `checkpoint()`:
+  - an await on another agent, or on a timer, always pauses;
+  - an await on a same-agent `call` pauses only when the workflow's
+    share of the refine's gas is spent; otherwise the step goes on;
+  - so the code between two awaits runs atomically, as async Rust
+    already suggests, and a pause commits the effects made before it
+    with the snapshot.
+- **The guest needs no executor.** A pausing call is a host call that
+  does not return until the agent resumes the machine, possibly in
+  another process after a restore, so `block_on`'s single poll
+  completes.
 - **Starting** [owner decision 3, for clients and agents alike]:
   - a client request or an agent's `Call` naming a workflow starts one;
   - the start answers `Started(id)` at once: a client's reply, or an
@@ -458,8 +495,8 @@ impl Shop {
     its deadline or timer.
   - **Machine:** the agent restores the workflow's machine and passes
     the input in.
-  - **Run:** it runs until the next suspending call, completion, a
-    trap or the step's gas limit.
+  - **Run:** it runs until it pauses at an await, is preempted,
+    completes, traps or passes the step's gas limit (decision 5).
   - **Commit:** the step's synchronous calls' effects, its messages and
     its snapshot commit together as one `Run`.
   - **On a trap or the gas limit:** the step's effects are discarded,
@@ -468,8 +505,8 @@ impl Shop {
     learns of it. Earlier steps stay.
 - **Gas:** each step has a fixed limit, declared per workflow, with the
   agent's default. A step is dispatched only if the refine's remaining
-  gas covers it, as handlers are (section 8.1). Preemption, if decision
-  5 takes it, lets a step's effect-free phase span refines.
+  gas covers it, as handlers are (section 8.1). Preemption lets
+  effect-free code between awaits span refines (decision 5).
 
 **Snapshots with Gray Paper calls alone,** the same calls on VOS and
 JAM, so a step's `gas_used` is the same on both hosts:
@@ -495,7 +532,7 @@ JAM, so a step's `gas_used` is the same on both hosts:
       proportion to the writable pages (4.0 measures it);
     - one exit and one `pages` call per page written in a step: three
       for a typical suspension (S1), 514 for a long computation's first
-      checkpoint.
+      pause.
 - **The program counter:** from `expunge`, at the step's end, on both
   hosts. A machine is never kept past its step (decision 4), so nothing
   is lost, and no VOS-only call changes the gas between hosts. If the
@@ -512,7 +549,7 @@ JAM, so a step's `gas_used` is the same on both hosts:
   - **a work result of 64 KiB or more travels as a blob,** its log
     entry carrying the hash, as programs do since step 3.1. This
     slice builds that path (4.4), on the program blobs' fetch and the
-    entry reports, so a 2 MiB checkpoint never rides inline beside
+    entry reports, so a 2 MiB snapshot never rides inline beside
     small entries;
   - on JAM, as exported segments, one raw page each (see JAM mode).
   - So the work result proper is the same on both hosts, and the pages
@@ -523,7 +560,7 @@ JAM, so a step's `gas_used` is the same on both hosts:
     the next batch, as the other caps do.
   - Pages count apart from `STEP_WRITES` (256 KiB) and `WORK_RESULT`
     (4 MiB), which stay as they are. S1's long computation ships 2 MiB
-    on its first checkpoint, which neither would hold.
+    on its first pause, which neither would hold.
 - **Accumulate** overwrites the page rows in place. A workflow owns its
   pages, and only its latest snapshot is kept, so pages need no
   reference counts until XOR deltas share them (section 8.3, later).
@@ -567,9 +604,8 @@ JAM, so a step's `gas_used` is the same on both hosts:
   committed maps, workflows and their pages (section 12). Every row
   written on JAM is a salted leaf.
 - **Scans on JAM are witnessed** [owner decision 8]:
-  - the whole-keyspace tree is ordered, so the builder's simulation
-    records each scan's range and the witness proves it complete with
-    a `RangeProof`;
+  - the builder's simulation records each scan's range, in the table's
+    order, and the witness proves it complete with a `RangeProof`;
   - refine serves `state_scan` from the witness, and a scan past what
     the witness covers traps;
   - the sweep stays scan-free (the batch names its due rows), so the
@@ -625,6 +661,15 @@ JAM, so a step's `gas_used` is the same on both hosts:
   roots and exports are extra.
 - **Time and the seed:** the builder supplies them in the batch, and
   refine passes them to accumulate in its output.
+- **Privacy on JAM:** a path through an ordered or hashed table shows
+  its neighbours' raw keys, since both transforms keep the key. On JAM
+  the witness is public, so a table whose keys must stay private uses
+  the private transform (slice 5) or stays off JAM.
+- **Every input costs leaf updates on JAM:** a session mark, a pair mark
+  or an outbox row is a row of the tree, so the root after costs grow
+  with a batch's inputs, not only with its handlers' writes.
+- **The CI surface check pins PolkaJam's prices** for the calls 4.0
+  measured, so a change in either host shows.
 
 **The builder** (`node/jam`, a library and `vos jam` commands):
 - it holds the agent's full state in a node store, with one root over
@@ -694,12 +739,10 @@ It also records:
 
 ### 4.1 The wire, and requests and replies between agents
 
-- **The slice's wire changes, at once:**
-  - `Message`'s body, `Input::Failed`, `Behind`, the `Due` input, the
-    due rows in `Input::Sweep`, `Run`'s `pages`, the committed-write
-    flag, a workflow kind beside the install's attestables;
-  - the owner's three wire-format items, if taken [owner decision 7].
-  - Later steps then only use them.
+- **Wire changes land with the step that uses them;** nothing is
+  frozen before `vos/1`. This step brings `Message`'s body,
+  `Input::Failed` and `Behind`, and the owner's three wire-format items
+  (decision 7).
 - **The receiver's side of a request:** a `Call` that awaits gets its
   `Reply` in the sender's outbox, its outcome whatever it was.
 - **The failed message** as `Input::Failed`, asserted after two lone
@@ -839,7 +882,7 @@ the builder 3,000, the rest 1,000 each or less.
   builder's simulation and the refine must run the same code on the
   same host interface; the dynamic comparison guards that.
 - **Fault tracking costs an exit per written page.** A long computation's
-  first checkpoint pays 514 of them, and every step pays the arming;
+  first pause pays 514 of them, and every step pays the arming;
   measured in 4.5 against the snapshot row.
 - **The slice is the widest so far:** messages, storage, the SDK, the
   agent, the node and JAM. Each step stands alone and is checked
@@ -859,48 +902,82 @@ the builder 3,000, the rest 1,000 each or less.
    optional wait.
 4. **The leader's live-machine cache only if the budget needs it,**
    restoring from rows otherwise.
-5. **Preemption** [under discussion]: proposed as an implicit
-   checkpoint, below.
+5. **Preemption, at the awaits and between them,** as below: every
+   `.await` may pause, and no `checkpoint()` exists.
 6. **`historical_lookup` scoped to the agent's pinned programs,** as on
    JAM.
-7. **The wire-format items now,** with this slice's other wire changes
-   in 4.1:
+7. **The wire-format items now,** in 4.1:
    - the refusal and failure codes as enums;
    - the `PeerMessage` index gap;
    - the directory acknowledgement's order tuple.
-8. **Scans on JAM in this slice:** the tree gains an ordered mode with
-   range proofs, which JAM's whole-keyspace tree uses, so an actor that
-   scans its tables runs on JAM too.
+8. **Scans on JAM in this slice,** as Substrate's iterable maps lead
+   users to expect:
+   - one tree format over prefix-free keys, with range proofs;
+   - each table chooses its key transform, as a Substrate map chooses
+     its hasher. Proposed: hashed (`H128(key) ‖ key`, iterating in hash
+     order, balanced) by default, and ordered (`#[table(ordered)]`,
+     key order and ranges, keys of at most 64 bytes) by choice;
+   - so an actor that scans its tables runs on JAM too.
 
-**Decision 5, preemption as an implicit checkpoint** [proposed]. Section
-8.3's effect-free preemption, built on this slice's snapshots instead
-of on live machines:
-- **The effect-free phase** runs from a step's resume to its first
-  effect (a call, send, request or start). The workflow's machine runs
-  on the refine's gas share for it, by the agent's own accounting.
-- **If the share runs out there,** the machine exits out of gas at the
-  start of a block, having done nothing of it. The agent ends the step
-  with a snapshot and no effects: an implicit `checkpoint()`. The
-  workflow is due at once, so the next batch continues it, and a
-  failover resumes from that snapshot as from any.
-- **At the first effect,** the workflow exits to the agent for it.
+**Decision 5: preemption.** Section 8.3's effect-free preemption,
+built on this slice's snapshots instead of on live machines, with the
+awaits as the pause points:
+- **A unit** is the code between two awaits. It runs atomically: its
+  effects (calls, sends, table writes through calls) commit together or
+  not at all.
+- **A step** is one or more units, from a resume to a pause. At every
+  await the agent may end the step: it must for another agent or a
+  timer, and does at a same-agent `call` when the workflow's share of
+  the refine's gas is spent. The step's effects and its snapshot commit
+  together.
+- **Between awaits, a unit with no effect yet may be preempted:**
+  - it runs on the workflow's share. If the share runs out there, the
+    machine exits out of gas at the start of a block, having done
+    nothing of it;
+  - the agent ends the step there: the effects of the step's earlier
+    units commit with the snapshot. That is safe, because an await
+    separates them from this unit, which has done nothing;
+  - the workflow is due at once, so the next batch continues it.
+- **At a unit's first effect,** the workflow exits to the agent for it.
   Before serving it, the agent checks that the refine's remaining gas
   covers the step's limit. If not, it ends the step there, snapshotted
-  at that call, still effect-free, and the resumed step serves the
-  pending call first.
-- **The effectful phase,** from the first effect to the step's end,
-  runs within the step's limit and is never preempted. Past the limit
-  the step fails.
-- **What it adds:**
-  - a snapshot per preemption;
-  - resuming at a pending host call;
-  - resuming after an out-of-gas exit, which the probe is extended to
-    check on PolkaJam and on ours before 4.5 builds on it.
-- **What it gives:** a long computation spans refines with no explicit
-  `checkpoint()`, and a heavy workflow never holds a batch past its
-  share.
-- **Recommended: in this slice,** in 4.5, since it is a small addition
-  on the snapshots 4.5 builds anyway.
+  at that call, still effect-free in this unit. The resumed step serves
+  the pending call first.
+- **After its first effect, a unit runs to its next await** within the
+  step's limit, and is never preempted. Past the limit the step fails.
+- **The share comes from the batch, never from the `gas` host call:**
+  - the batch carries its budget (`Batch.budget`, from 4.1);
+  - the agent accounts for it itself, from the dispatched steps' limits
+    and their use, all of it state;
+  - so the same batch preempts at the same block on every host, and on
+    JAM. Today refine dispatches by `gas()`, so this accounting is a 4.4
+    prerequisite.
+- **A progress floor:** a step is preempted only after at least one
+  block has run since its resume. Otherwise it gets the step's full
+  limit for this resume, so a share smaller than the first block can
+  never pin a workflow at one counter, committing a snapshot every
+  batch.
+- **The snapshot records how the step exited:** a pending host call
+  (its id, beside the counter, registers and gas), or out of gas, which
+  needs nothing. The block an out-of-gas exit stopped at is charged
+  once on resume, as a block entered at its start is (4.0).
+- **The gas stored is the agent's to set:** the remaining limit of an
+  effectful unit, never the machine's counter, which is negative after
+  an out-of-gas exit. The agent sets the inner gas at every invoke.
+- **A preempted step still consumes its input:** the `Reply`'s pair
+  mark, the `Due` row or the start's session mark moves in that `Run`,
+  so the input is never redelivered to a workflow that already holds it
+  in its snapshot.
+- **What stays as it was:**
+  - failover resumes from the committed snapshot, and the due row
+    brings the next step on any leader;
+  - no reply can target a preempted workflow, which is running, not
+    awaiting, and a duplicate drops at the pair mark;
+  - `now` and `random` are drawn per step from the batch and written
+    into tracked memory.
+- **Probe:** resuming after an out-of-gas exit at a block start, on
+  PolkaJam (the interpreter now, the recompiler once the owner enables
+  it) and on both of our backends, before 4.5 builds on it.
 
 **Core-model edits these decisions make,** amended with the plan:
 - §8.2 "Its result is sent to whoever started it" becomes: answered
@@ -908,10 +985,15 @@ of on live machines:
 - §8.3 "The leader caches live machines" becomes conditional on the
   budget (decision 4); "Pages are reference-counted by snapshots"
   waits for XOR deltas, since a workflow owns its pages.
-- §8.3 preemption: as decision 5 settles it.
+- §8.2 and §8.3: no `checkpoint()`. Every `.await` may pause, the code
+  between two awaits is atomic, and effect-free code between awaits is
+  preempted when its gas share runs out (decision 5).
 - §9.3: the salt source is the work result's seed (decision 2); keys
-  enter a tree hashed or ordered, chosen per tree (decision 8).
-- §12: JAM's whole-keyspace tree is ordered, and scans are witnessed by
+  enter the tree through each table's transform, hashed by default or
+  ordered, and "variable-length keys are hashed to a fixed width"
+  becomes the hashed transform (decision 8).
+- §12: JAM's whole-keyspace tree is over each table's transformed keys,
+  and scans are witnessed by
   range proofs (decision 8).
 
 **Defaults** (engineering, recorded rather than asked):
