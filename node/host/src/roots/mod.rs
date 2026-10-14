@@ -446,7 +446,11 @@ impl Build {
             self.tops.insert(map, tree.top);
         }
         writes.extend(rows.into_iter().map(|row| (row, None)));
-        // The seeds of the versions whose dirty rows are all read.
+        // The seeds of the versions whose dirty rows are all read. A batch
+        // before the last keeps its cursor version's seed even once that
+        // version's rows are read: an interrupted build then always leaves
+        // a seed past the watermark, so the next build starts and finishes
+        // the maps it left part-way.
         let through = match last {
             true => self.version,
             false => {
