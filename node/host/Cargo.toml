@@ -11,9 +11,7 @@ description = "The VOS node host: storage, the leader loops and ingress."
 faults = []
 
 [dependencies]
-# Exact: the workspace nightly is a 1.90 pre-release, which a later fjall
-# release may outgrow.
-fjall = "=3.1.12"
+fjall = { workspace = true }
 ed25519-dalek = "2"
 quick_cache = { version = "0.6.24", default-features = false }
 event-listener = "5"

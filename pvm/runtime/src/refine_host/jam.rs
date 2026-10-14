@@ -26,13 +26,20 @@ pub mod jam_gas {
     pub const FETCH_PER_KIB: Gas = 40;
     /// `export`, a segment, measured at 4,096 bytes.
     pub const EXPORT: Gas = 3_521;
-    /// `historical_lookup`: not measured on PolkaJam, so the Gray Paper's
-    /// base.
-    pub const HISTORICAL_LOOKUP: Gas = 10;
+    /// `historical_lookup`, by the length asked for: 1,125 for none, 1,203
+    /// for 300 bytes, 2,181 for 4 KiB, served or answering `NONE`.
+    pub const HISTORICAL_LOOKUP_BASE: Gas = 1_125;
+    pub const HISTORICAL_LOOKUP_PER_KIB: Gas = 264;
 
     /// `fetch` of `len` bytes.
     pub const fn fetch(len: u64) -> Gas {
         FETCH_BASE.saturating_add(crate::inner::gas::memory(FETCH_PER_KIB, len))
+    }
+
+    /// `historical_lookup` of `len` bytes.
+    pub const fn historical_lookup(len: u64) -> Gas {
+        HISTORICAL_LOOKUP_BASE
+            .saturating_add(crate::inner::gas::memory(HISTORICAL_LOOKUP_PER_KIB, len))
     }
 }
 
@@ -170,7 +177,7 @@ fn serve_jam(
             }
         }
         Ok(gp_call::HISTORICAL_LOOKUP) => {
-            charge(machine, jam_gas::HISTORICAL_LOOKUP)?;
+            charge(machine, jam_gas::historical_lookup(r[11]))?;
             let mut hash = [0u8; 32];
             let readable = u32::try_from(r[8])
                 .is_ok_and(|address| machine.memory().read_bytes_checked(address, &mut hash));
@@ -280,6 +287,10 @@ mod tests {
         );
         assert_eq!(jam_gas::fetch(SEGMENT as u64), 171, "a segment's fetch");
         assert_eq!(jam_gas::EXPORT, 3_521);
+        assert_eq!(
+            [0, 300, 4096].map(jam_gas::historical_lookup),
+            [1_125, 1_203, 2_181]
+        );
         let program = calling_program(0, [0; 5]);
         let jam = RefineContext::load(&program, &[], 1_000_000)
             .unwrap()
@@ -381,7 +392,7 @@ mod tests {
         // the length.
         let own = u32::MAX;
         let (price, run) = jam_price(7, [own, WINDOW, WINDOW + 4096, 0, 64], jam.clone());
-        assert_eq!(price, jam_gas::HISTORICAL_LOOKUP);
+        assert_eq!(price, jam_gas::historical_lookup(64));
         assert_eq!(run.invocation.registers[7], 10);
         let (_, other) = jam_price(7, [8, WINDOW, WINDOW + 4096, 0, 64], jam);
         assert_eq!(other.invocation.registers[7], result::NONE, "another's");

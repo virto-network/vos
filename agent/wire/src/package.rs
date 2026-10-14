@@ -13,9 +13,14 @@
 //! zero bytes, in the order the result's runs list them; then the work
 //! result's encoding, a segment at a time, the last zero-padded. The
 //! builder keeps them, and where each page went: refine cannot know its
-//! exports' segment root, which the guarantor computes. A package that
+//! exports' segment root, which the guarantor computes, so accumulate
+//! keeps the last package's ([`EXPORTS`]) beside the root. A package that
 //! resumes a workflow imports its pages by that root, and refine checks
 //! each against its row, which holds the page's hash.
+//!
+//! **Programs** an agent runs on JAM are preimages of its service, which
+//! its accumulate solicits when a package names them ([`Package::solicit`]),
+//! before any package installs or runs them.
 
 use alloc::vec::Vec;
 use scale::{Decode, Encode};
@@ -23,7 +28,7 @@ use vos_tree::{BatchProof, Hash, RangeProof, Salt};
 
 use crate::batch::Batch;
 use crate::defaults::SESSION_SKEW_MS;
-use crate::ids::WorkflowId;
+use crate::ids::{ProgramHash, WorkflowId};
 
 /// A segment's length: a page then eight zero bytes.
 pub const SEGMENT: usize = 4104;
@@ -31,8 +36,23 @@ pub const SEGMENT: usize = 4104;
 pub const MAX_SEGMENTS: usize = 3072;
 
 /// The key under which accumulate keeps the agent's root, in its service's
-/// storage, which holds nothing else. Absent, the root is the empty tree's.
+/// storage. Absent, the root is the empty tree's.
 pub const ROOT: &[u8] = b"root";
+/// The key under which accumulate keeps the last package it took's
+/// [`Exports`]: where its pages and work result lie. The service's storage
+/// holds nothing else.
+pub const EXPORTS: &[u8] = b"exports";
+
+/// A package's exports, as accumulate keeps the last one's: the work
+/// package's hash, its exports' segment root, the pages first, then the
+/// work result, `segments` in all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct Exports {
+    pub package: Hash,
+    pub root: Hash,
+    pub pages: u32,
+    pub segments: u32,
+}
 
 /// The start of JAM's common era, 1200 UTC on 1 January 2025, in
 /// milliseconds since the Unix epoch: slot 0's start.
@@ -41,14 +61,16 @@ pub const EPOCH_MS: u64 = 1_735_732_800_000;
 pub const SLOT_MS: u64 = 6_000;
 
 /// A JAM work item's payload: a batch, the agent's root before it, the
-/// witness of every row refine reads or writes against that root, and the
-/// page each of the item's imports holds, in import order.
+/// witness of every row refine reads or writes against that root, the
+/// page each of the item's imports holds, in import order, and the
+/// programs, by hash and length, for accumulate to solicit as preimages.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Package {
     pub batch: Batch,
     pub root: Hash,
     pub witness: StateWitness,
     pub imports: Vec<(WorkflowId, u32)>,
+    pub solicit: Vec<(ProgramHash, u32)>,
 }
 
 /// The rows a package's refine touches, against its root.
@@ -98,9 +120,9 @@ pub struct Row {
 }
 
 /// Refine's output for a package, small, as JAM caps it: the roots before
-/// and after, the batch's time and seed, the work result's hash, and what
-/// it exported: `pages` pages, then the work result, `exports` segments in
-/// all.
+/// and after, the batch's time and seed, the work result's hash, what it
+/// exported: `pages` pages, then the work result, `exports` segments in
+/// all; and the programs accumulate solicits, the package's.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct JamOutput {
     pub root_before: Hash,
@@ -111,6 +133,14 @@ pub struct JamOutput {
     pub work_result_hash: Hash,
     pub pages: u32,
     pub exports: u32,
+    pub solicit: Vec<(ProgramHash, u32)>,
+}
+
+/// The identity a client signs its calls to the agent of JAM service
+/// `service` for ([`crate::ingress::call_message`]), as it signs for a
+/// VOS node's agent by the agent's.
+pub fn identity(service: u64) -> Hash {
+    crate::result::digest(&[b"vos/jam/service".as_slice(), &service.to_le_bytes()].concat())
 }
 
 /// The segments a work result of `len` bytes takes.

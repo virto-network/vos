@@ -40,6 +40,12 @@ pub trait ServiceStorage {
     /// Set or (with `None`) delete a value, returning the previous value's
     /// length.
     fn write(&mut self, key: &[u8], value: Option<&[u8]>) -> Option<usize>;
+    /// Ask for the preimage of `hash`, `len` bytes long: whether the store
+    /// takes the request. A VOS node, which keeps its programs itself,
+    /// serves none: the call answers `WHAT`.
+    fn solicit(&mut self, _hash: &[u8; 32], _len: u64) -> Option<bool> {
+        None
+    }
 }
 
 /// Accumulate's arguments for `service` at `timeslot` over `inputs`
@@ -110,6 +116,7 @@ impl<'a, S: ServiceStorage> AccumulateContext<'a, S> {
                 Ok(gp_call::FETCH) => self.fetch(),
                 Ok(gp_call::READ) => self.read(),
                 Ok(gp_call::WRITE) => self.write(),
+                Ok(gp_call::SOLICIT) => self.solicit(),
                 Ok(gp_call::LOG) => {
                     self.log();
                     true
@@ -235,6 +242,22 @@ impl<'a, S: ServiceStorage> AccumulateContext<'a, S> {
             return false;
         }
         self.machine.registers_mut()[7] = value.len() as u64;
+        true
+    }
+
+    /// `solicit`: φ7 the hash, φ8 the length; φ7 becomes `OK`, `HUH` when
+    /// the store refuses, or `WHAT` when it serves none.
+    fn solicit(&mut self) -> bool {
+        let registers = *self.machine.registers();
+        let Some(hash) = self.read_guest(registers[7], 32) else {
+            return false;
+        };
+        let hash: [u8; 32] = hash.try_into().expect("32 bytes");
+        self.machine.registers_mut()[7] = match self.storage.solicit(&hash, registers[8]) {
+            Some(true) => result::OK,
+            Some(false) => result::HUH,
+            None => result::WHAT,
+        };
         true
     }
 

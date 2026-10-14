@@ -1,0 +1,31 @@
+PolkaJam nightly-2026-10-13 (polkajam and jamt 0.1.29, GP 0.8.0), interpreter.
+Probes `O` and `R`, then `S` and `L`, as `probe.sh compare` printed them.
+
+== PolkaJam, payload "OR" (service 2)
+  inner run straight     exit=HALT(0) φ8=0x36000 gas-left=999975 inner-used=25
+  inner run starved      exit=OOG(4) φ8=0x36000 gas-left=1 inner-used=0
+  inner run resumed      exit=HALT(0) φ8=0x36000 gas-left=999975 inner-used=25
+  inner run starved      exit=OOG(4) φ8=0x36000 gas-left=22 inner-used=2
+  inner run resumed      exit=HALT(0) φ8=0x36000 gas-left=999977 inner-used=23
+  inner run starved      exit=OOG(4) φ8=0x36000 gas-left=22 inner-used=2
+  expunge                φ7=7 arg=0 extra=7 diff=383 charge=335
+  inner run starved      exit=FAULT(2) φ8=0x11000 gas-left=999899 inner-used=101
+  expunge                φ7=9 arg=0 extra=9 diff=383 charge=335
+  inner run resumed      exit=HOST(3) φ8=7 gas-left=999899 inner-used=101
+  inner run resumed      exit=HOST(3) φ8=7 gas-left=999899 inner-used=101
+  done
+== VOS JAM-only host, interpreter: 14 of 14 records agree in results and own charge
+== VOS JAM-only host, recompiler: 14 of 14 records agree in results and own charge
+
+== PolkaJam, payload "L" before the preimage was solicited and provided (service 2)
+  historical_lookup      φ7=NONE arg=0 extra=0 diff=1251 charge=1203
+
+== payload "S": accumulate's `solicit` (id 24) answered 0 (OK); RPC
+   serviceRequest(service 2, hash, 300) then answered [] (requested);
+   `jamt provide 2 probe-preimage.bin`: "Preimage provided at slot 9377359";
+   serviceRequest then answered [9377359].
+
+== PolkaJam, payload "L" after it (service 3, the same flow)
+  historical_lookup      φ7=300 arg=0 extra=0xd354bf90f0ff031 diff=1251 charge=1203
+  historical_lookup      φ7=300 arg=0 extra=0 diff=1173 charge=1125
+  historical_lookup      φ7=300 arg=0x1000 extra=0 diff=2229 charge=2181

@@ -80,6 +80,13 @@ test-agent: build-test-actors build-agent
     cargo test -p vos-cli --features faults --test processes faults::
     cargo test -p vos-cli --features faults --test fault_suite
 
+# The JAM milestone on a local PolkaJam testnet, which it starts and stops:
+# the default agent deployed as a service, a workflow suspended in one work
+# package and resumed in later ones, every read witnessed. Outside `ci`: it
+# needs the PolkaJam binaries, in POLKAJAM or the 4.0 probe's directory.
+jam-milestone: build-test-actors build-agent
+    bash node/jam/milestone.sh
+
 # A plain build of `vos` carries no faults: building the fault suite's
 # `vos` with the feature must not leak into it, and no workspace member
 # turns the feature on for vos-node.

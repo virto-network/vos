@@ -1,5 +1,5 @@
-//! Data availability, emulated in process: the segments each package
-//! exported, by its segment root, which an import names with an index.
+//! Data availability: where a package's segments are read from, by their
+//! segment root and index; and its emulation in process.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -8,6 +8,12 @@ use vos_tree::{Blake2b, Hash, Hasher};
 
 /// The tag of [`segment_root`]'s hashes.
 const TAG: &[u8] = b"vos/jam/segments";
+
+/// Where exported segments are read from.
+pub trait Segments: Send + Sync {
+    /// Export `index` of the package whose exports' segment root is `root`.
+    fn segment(&self, root: &Hash, index: u32) -> Option<Vec<u8>>;
+}
 
 /// A package's exports, by their segment root.
 #[derive(Clone, Debug, Default)]
@@ -27,13 +33,11 @@ impl Da {
     pub fn exports(&self, root: &Hash) -> Option<&Arc<Vec<Vec<u8>>>> {
         self.exports.get(root)
     }
+}
 
-    /// Export `index` under `root`.
-    pub fn segment(&self, root: &Hash, index: u32) -> Option<&[u8]> {
-        self.exports
-            .get(root)?
-            .get(index as usize)
-            .map(Vec::as_slice)
+impl Segments for Da {
+    fn segment(&self, root: &Hash, index: u32) -> Option<Vec<u8>> {
+        self.exports.get(root)?.get(index as usize).cloned()
     }
 }
 

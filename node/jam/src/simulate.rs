@@ -22,7 +22,7 @@ use vos_wire::result::{PAGE, WorkResult, digest, split_output};
 use vos_wire::{Encode, defaults, keys};
 
 use crate::Error;
-use crate::store::{Rows, Store, Writes};
+use crate::store::{RowsFrom, View, Writes};
 
 /// What refines an agent's work: its program, its service and its
 /// preimages.
@@ -82,10 +82,10 @@ pub struct Simulation {
     pub gas_used: u64,
 }
 
-/// Simulate `batch` on `store`, the pages its workflows hold from `pages`.
+/// Simulate `batch` on `view`, the pages its workflows hold from `pages`.
 pub fn simulate(
     runner: &Runner,
-    store: &Store,
+    view: &View,
     pages: Pages,
     batch: &Batch,
 ) -> Result<Simulation, Error> {
@@ -93,7 +93,7 @@ pub fn simulate(
     let arguments = runner.arguments(&payload, [0; 32]);
     let gas = batch.budget + defaults::refine_start(batch.inputs.len(), arguments.len());
     let recorder = Arc::new(Recorder {
-        rows: Arc::clone(store.rows()),
+        view: view.clone(),
         pages,
         log: Mutex::default(),
     });
@@ -105,6 +105,9 @@ pub fn simulate(
         .map_err(Error::Load)?;
     let invocation = run.invocation;
     let log = std::mem::take(&mut *recorder.log.lock().expect("the log"));
+    if let Some(error) = log.error {
+        return Err(error);
+    }
     if let Some(&(workflow, index)) = log.missing.first() {
         return Err(Error::Page(workflow, index));
     }
@@ -116,7 +119,7 @@ pub fn simulate(
         .ok_or(Error::Output)?;
     let (result, section) = split_output(&output).ok_or(Error::Output)?;
     let mut reads = log.reads;
-    let writes = store.writes(&result, &mut reads).ok_or(Error::Refused)?;
+    let writes = view.writes(&result, &mut reads)?.ok_or(Error::Refused)?;
     Ok(Simulation {
         encoded: result.encode(),
         result,
@@ -131,7 +134,7 @@ pub fn simulate(
 
 /// The store as a refine reads it, recording what it reads.
 struct Recorder {
-    rows: Arc<Rows>,
+    view: View,
     pages: Pages,
     log: Mutex<Log>,
 }
@@ -143,6 +146,18 @@ struct Log {
     imports: BTreeSet<(WorkflowId, u32)>,
     /// Pages whose rows refine read that the source lacks.
     missing: Vec<(WorkflowId, u32)>,
+    /// A read the store failed, which spoils the simulation.
+    error: Option<Error>,
+}
+
+impl Log {
+    fn failed<T>(&mut self, result: Result<T, Error>) -> Option<T> {
+        result
+            .map_err(|error| {
+                self.error.get_or_insert(error);
+            })
+            .ok()
+    }
 }
 
 impl StateReader for Recorder {
@@ -152,12 +167,12 @@ impl StateReader for Recorder {
     fn read(&self, key: &[u8]) -> Option<Vec<u8>> {
         let mut log = self.log.lock().expect("the log");
         log.reads.insert(key.to_vec());
-        let value = self.rows.get(key)?;
+        let value = log.failed(self.view.get(key))??;
         let Some(place) = keys::page_entry(key) else {
-            return Some(value.clone());
+            return Some(value);
         };
         let page = (self.pages)(place.0, place.1)
-            .filter(|page| page.len() == PAGE && unstored(value) == Some(&digest(page)[..]));
+            .filter(|page| page.len() == PAGE && unstored(&value) == Some(&digest(page)[..]));
         match page {
             Some(page) => {
                 log.imports.insert(place);
@@ -165,7 +180,7 @@ impl StateReader for Recorder {
             }
             None => {
                 log.missing.push(place);
-                Some(value.clone())
+                Some(value)
             }
         }
     }
@@ -181,7 +196,7 @@ impl StateReader for Recorder {
         }
         Box::new(Scan {
             log: &self.log,
-            rows: self.rows.range(from.clone()..),
+            rows: self.view.rows_from(&from),
             prefix,
             from,
             last: None,
@@ -195,7 +210,7 @@ impl StateReader for Recorder {
 /// prefix's end once the rows under it ran out.
 struct Scan<'a> {
     log: &'a Mutex<Log>,
-    rows: std::collections::btree_map::Range<'a, Vec<u8>, Vec<u8>>,
+    rows: RowsFrom,
     prefix: &'a [u8],
     from: Vec<u8>,
     last: Option<Vec<u8>>,
@@ -207,9 +222,13 @@ impl Iterator for Scan<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         match self.rows.next() {
-            Some((key, value)) if key.starts_with(self.prefix) => {
+            Some(Ok((key, value))) if key.starts_with(self.prefix) => {
                 self.last = Some(key.clone());
-                Some((key.clone(), value.clone()))
+                Some((key, value))
+            }
+            Some(Err(error)) => {
+                self.log.lock().expect("the log").failed::<()>(Err(error));
+                None
             }
             _ => {
                 self.exhausted = true;

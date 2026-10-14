@@ -5,6 +5,7 @@
 #   probe.sh create                   create the service (prints its id)
 #   probe.sh item <service> <payload> [jamt item options...]
 #   probe.sh get <service> <key>      a storage value, in full, as hex (RPC)
+#   probe.sh provide <service>        provide the preimage `S` solicits
 #   probe.sh compare <service> <key>  PolkaJam's records beside VOS's
 #   probe.sh local <payload>          refine on VOS's JAM-only host
 # POLKAJAM names the directory holding the PolkaJam binaries.
@@ -55,7 +56,12 @@ item)
     "$POLKAJAM/jamt" item "$@" "$service" "$payload"
     ;;
 get) get "$2" "$3" ;;
+provide)
+    python3 -I -c 'import sys; sys.stdout.buffer.write(bytes((i * 37 + 11) & 0xff for i in range(300)))' \
+        >"$here/probe-preimage.bin"
+    "$POLKAJAM/jamt" provide "$(printf '%08x' "$2")" "$here/probe-preimage.bin"
+    ;;
 compare) "$tool" compare "$blob" "$(get "$2" "$3")" ;;
 local) "$tool" local "$blob" "$2" ;;
-*) sed -n '2,10p' "$0"; exit 1 ;;
+*) sed -n '2,11p' "$0"; exit 1 ;;
 esac

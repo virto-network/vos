@@ -809,3 +809,104 @@ under the refine limit.
 
 **Decided by the owner meanwhile:** tables are hashed by default, and a
 finished workflow's result is kept an hour.
+
+## Step 4.9: the builder, and the JAM milestone
+
+**The milestone holds on a live PolkaJam testnet** (`nightly-2026-10-13`:
+polkajam and jamt 0.1.29, Gray Paper 0.8.0, interpreter backend).
+- **What was deployed:** the default agent as a JAM service, with two
+  actors (the shop, and the counter for a table to scan) and their
+  programs solicited and provided as preimages.
+- **The workflow:** a computation started in one work package was
+  suspended and resumed across three later packages, its pages
+  exported and imported by segment root (69 out, 102 in), and ended
+  with the result a VOS node gives.
+- **Every package checked:**
+  - the root the chain stores, before and after;
+  - the work result read back from the chain's DA, byte for byte equal
+    to an in-process VOS node's;
+  - every read witnessed, a table scan by a range proof.
+- **Record:** `/tmp/vos-jam-milestone.1T0z2x/builder/record.txt`, with
+  `build.txt`. It holds every package's full hash, every attempt with
+  its fate and reason, the roots, the witness, imports and exports, and
+  the testnet's errors.
+
+| Package | Work result | Witness | Imports | Exports |
+|---|---|---|---|---|
+| Solicit the programs | 52 B | 2 keys | 0 | 1 |
+| Install the counter and the shop | 1,889 B | 4 keys | 0 | 1 |
+| Write state | 1,004 B | 25 keys | 0 | 1 |
+| Start the computation | 3,471 B | 46 keys | 0 | 35 (34 pages) |
+| Sweep 1 | 2,402 B | 40 keys | 34 | 18 (17 pages) |
+| Sweep 2 | 2,447 B | 40 keys | 34 | 19 (18 pages) |
+| Sweep 3, the workflow ends | 789 B | 42 keys | 34 | 1 |
+| Scan the table | 172 B | 7 keys, a range of 12 rows | 0 | 1 |
+
+The refines took 0.26M to 41M gas each, measured on our JAM-only host,
+since PolkaJam reports none. That is far within the testnet's 1e9.
+
+**The first run was weaker than this, and the reviews caught it:**
+- **The race:** its first package was refused in core, the
+  code-availability race 4.0 found, and the builder's retry landed it.
+  Its record did not show the refusal.
+- **The equality check:** it compared the builder's simulation with VOS,
+  not the chain's own result.
+- **The fixes:** the builder now waits two slots past the code's
+  availability, and the record lists every attempt. In an experiment a
+  package anchored at the preimage's own slot was refused 2 of 2 times,
+  and one a slot later landed 5 of 5. Equality is now checked on the
+  chain's bytes.
+- Two later runs landed every package at its first attempt.
+
+**The builder (`vos-jam`):**
+- **The store:** persistent (fjall), holding rows, the tree and pages'
+  export locations. A package in flight is an overlay of what it
+  touches, committed in one synced batch.
+- **Its loop:** prepare (simulate, witness, fit), submit through `jamt`,
+  wait by the package's time window, then accept or recover.
+- **Accept and recovery:**
+  - accept reads the result back from DA and requires the root the chain
+    stored;
+  - a refused package is rebuilt at a new time;
+  - a package that landed late is taken, its result kept;
+  - one landed by another builder is taken from its exports if it
+    reaches the chain's root; more than one behind stops with
+    `Diverged`.
+- **Fitting a batch:**
+  - gas: the package's own work (verifying, applying, the root after,
+    exports) is estimated, and the batch's budget leaves it room under
+    the refine limit;
+  - batches, a sweep's due rows included, are trimmed to 3,072 segments
+    and 12 MiB;
+  - a workflow whose pages left DA is left due, and the rest proceeds.
+- **The chain:**
+  - accumulate on JAM also stores the last package's exports record
+    (the guarantor's segment root), which is how the builder learns
+    where pages live, and solicits the preimages a package names;
+  - the builder reads the chain at one finalized head;
+  - transient RPC errors are retried, and `jamt` runs with a timeout.
+- **Run it again:** `just jam-milestone`. It needs the PolkaJam binaries
+  and systemd-run, so it stays outside `ci`. The builder's logic is in
+  `ci` against the emulated chain.
+
+**Probed on PolkaJam** (spikes/sj-jam-b), agreeing with our runtime on
+all 14 records:
+- a machine starved of gas stops at a block start, charged nothing of
+  it, and is charged that block once on resume;
+- `expunge` at a faulting store gives the store's counter, and
+  re-entering there charges the whole block again;
+- `solicit` is host call 24, and the solicit, provide, lookup flow
+  works;
+- `historical_lookup` costs 1,125 plus 264 a KiB, now our JAM-only
+  host's price too.
+
+**For the owner:** PolkaJam's recompiler needs
+`vm.unprivileged_userfaultfd=1`, so the milestone ran on its interpreter.
+Our own runtime passes on both of its backends.
+
+**Reviewed:**
+- Fable: go. Nothing lets a builder move the root to a transition the
+  witness does not produce, nor double-apply an input.
+- Opus: GO with fixes, all in. The availability race, the equality on
+  the chain's bytes, late landings, trimming sweeps, finality, and the
+  record were all fixed, and the milestone was rerun.

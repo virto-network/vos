@@ -82,6 +82,9 @@ pub mod gp_call {
     pub const INFO: u32 = 6;
     pub const HISTORICAL_LOOKUP: u32 = 7;
     pub const EXPORT: u32 = 8;
+    /// Accumulate's: ask for a preimage of the service's (confirmed on
+    /// PolkaJam 0.1.29).
+    pub const SOLICIT: u32 = 24;
     pub const LOG: u32 = 100;
 }
 

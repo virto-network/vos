@@ -15,6 +15,7 @@ pub const MACHINE: u64 = 9;
 pub const PEEK: u64 = 10;
 pub const POKE: u64 = 11;
 pub const PAGES: u64 = 12;
+pub const SOLICIT: u64 = 24;
 pub const INVOKE: u64 = 13;
 pub const EXPUNGE: u64 = 14;
 pub const INSTANTIATE: u64 = 0x480;
@@ -218,6 +219,12 @@ pub fn read(key: &[u8]) -> Option<Vec<u8>> {
         )
         .0
     })
+}
+
+/// Ask for the preimage of `hash`, `len` bytes long, for this service:
+/// accumulate's only, and served on JAM only.
+pub fn solicit(hash: &[u8; 32], len: u32) {
+    ecalli!(SOLICIT, [ptr(hash), u64::from(len), 0, 0, 0, 0]);
 }
 
 /// Write a value of this service's storage; an empty value deletes it.

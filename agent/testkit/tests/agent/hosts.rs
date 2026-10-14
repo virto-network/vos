@@ -92,8 +92,9 @@ fn every_program_calls_only_its_surface() {
 /// The JAM-only host charges PolkaJam's prices where they differ from the
 /// Gray Paper's base, as the probe in `spikes/sj-jam-b` measured them:
 /// `gas` 48, `log` 1,000 and answering `WHAT`, a call it does not serve
-/// 1,000, a segment's `fetch` 171 and an `export` 3,521. The runtime's
-/// tests measure each charge. Its segments are the agent's.
+/// 1,000, a segment's `fetch` 171, an `export` 3,521, and
+/// `historical_lookup` 1,125 and 264 a KiB asked for. The runtime's tests
+/// measure each charge. Its segments are the agent's.
 #[test]
 fn the_jam_host_charges_polkajams_prices() {
     use vos_pvm::refine_host::{MAX_EXPORTS, SEGMENT, jam_gas};
@@ -107,6 +108,10 @@ fn the_jam_host_charges_polkajams_prices() {
     );
     assert_eq!(SEGMENT, vos_wire::package::SEGMENT);
     assert_eq!(MAX_EXPORTS as usize, vos_wire::package::MAX_SEGMENTS);
+    assert_eq!(
+        [0, 300, 4096].map(jam_gas::historical_lookup),
+        [1_125, 1_203, 2_181]
+    );
 }
 
 /// The agent serves its machines the precompiles a VOS node serves the

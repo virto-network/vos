@@ -197,6 +197,7 @@ pub(super) fn run(agent: AgentId, package: Package) -> Vec<u8> {
         root,
         witness,
         imports,
+        solicit,
     } = package;
     let witnessed = Witnessed::verify(witness, &root, imports);
     let (time, seed) = (batch.time, batch.seed);
@@ -246,6 +247,7 @@ pub(super) fn run(agent: AgentId, package: Package) -> Vec<u8> {
         work_result_hash: digest(&result),
         pages,
         exports,
+        solicit,
     }
     .encode()
 }

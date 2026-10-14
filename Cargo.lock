@@ -2485,6 +2485,7 @@ dependencies = [
  "tempfile",
  "tracing-subscriber",
  "vos-checker",
+ "vos-jam",
  "vos-node",
  "vos-pvm",
  "vos-pvm-compiler",
@@ -2495,7 +2496,12 @@ dependencies = [
 name = "vos-jam"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "ed25519-dalek",
+ "fjall",
+ "hex",
  "lz4_flex 0.13.1",
+ "serde_json",
  "vos-pvm",
  "vos-tree",
  "vos-wire",

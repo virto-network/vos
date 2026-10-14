@@ -3,6 +3,7 @@
 
 mod args;
 mod call;
+mod jam;
 mod kept;
 
 use std::fmt::Display;
@@ -82,6 +83,7 @@ fn run(cli: Cli) -> Result<(), String> {
         Command::Call(call) => invoke(&call, None),
         Command::Query { call, linearizable } => invoke(&call, Some(linearizable)),
         Command::Workflow(read) => read_workflow(&read),
+        Command::Jam { command } => command.run(),
     }
 }
 

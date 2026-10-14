@@ -576,8 +576,8 @@ pub mod surface {
     pub fn agent(id: u64) -> Option<OnJam> {
         match id {
             // gas, fetch, read, write, historical_lookup, export,
-            // machine..expunge, log.
-            0 | 2 | 4 | 5 | 7..=14 | 100 => Some(OnJam::Served),
+            // machine..expunge, solicit, log.
+            0 | 2 | 4 | 5 | 7..=14 | 24 | 100 => Some(OnJam::Served),
             0x480 => Some(OnJam::Loader),
             // state_read, state_scan, and the report of lost state.
             0x481..=0x483 => Some(OnJam::NoResult),

@@ -7,8 +7,11 @@
 //! VOS node's, but for what only a VOS node keeps and the page rows.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
-use vos_jam::{Builder, Chain, Error, Refined, Runner};
+use vos_jam::{
+    Builder, Chain, Emulated, Error, Fate, Fault, Landed, Refined, Runner, Store, Taken,
+};
 use vos_pvm::PvmBackend;
 use vos_testkit::programs::{actor, method};
 use vos_tree::{Blake2b, Hash, Hasher, empty_root};
@@ -23,18 +26,14 @@ use vos_wire::result::{Outgoing, PAGE, Step, WorkResult, digest, split_output};
 use vos_wire::{Encode, defaults};
 
 use crate::common::{
-    AGENT, ALICE, Actors, BOB, CALLER, COUNTER, LEDGER, MINTER, Node, SHOP, install,
+    AGENT, ALICE, Actors, BOB, CALLER, COUNTER, LEDGER, MINTER, Node, SHOP, done, install,
 };
 
 /// A batch time well past JAM's common era; the sessions start at it.
 const T0: u64 = 1_760_000_000_000;
 
-/// Each batch's budget.
-const BUDGET: u64 = defaults::REFINE_GAS;
-
-/// Gas a package's refine has beyond its batch's: its witness verified,
-/// its result applied, its root after computed, and its exports.
-const JAM_EXTRA: u64 = 3_000_000_000;
+/// The refine gas of a work package on the PolkaJam testnet, `G_R`.
+const G_R: u64 = 1_000_000_000;
 
 /// The agent the shop's workflows ask.
 const RISK: AgentId = AgentId(9);
@@ -58,7 +57,7 @@ struct Paired {
     vos: Node,
     runner: Runner,
     builder: Builder,
-    chain: Chain,
+    chain: Emulated,
     /// Every client's requests, numbered in its session started at `T0`.
     sequences: BTreeMap<Principal, u64>,
     /// Other agents' messages, numbered in their pairs.
@@ -67,8 +66,8 @@ struct Paired {
 
 impl Paired {
     /// The pair on `backend`, with `programs` the node's and the agent's
-    /// preimages.
-    fn new(backend: PvmBackend, programs: &[&[u8]]) -> Self {
+    /// preimages, the builder's work packages each of `refine_gas`.
+    fn new(backend: PvmBackend, programs: &[&[u8]], refine_gas: u64) -> Self {
         let mut vos = Node::on(backend);
         for program in programs {
             vos.add(program);
@@ -81,8 +80,8 @@ impl Paired {
         Self {
             vos,
             runner,
-            builder: Builder::default(),
-            chain: Chain::default(),
+            builder: Builder::new(Store::temporary().unwrap(), refine_gas),
+            chain: Emulated::default(),
             sequences: BTreeMap::new(),
             pairs: BTreeMap::new(),
         }
@@ -127,23 +126,12 @@ impl Paired {
         })
     }
 
-    /// `inputs` at `time`, on the VOS node and as a JAM package, which must
-    /// agree.
+    /// `inputs` at `time`, as a JAM package and on the VOS node, which must
+    /// agree: the builder's batch, which the work package's refine gas
+    /// shapes, runs on both.
     fn batch(&mut self, time: u64, inputs: Vec<Input>) -> Ran {
         let seed = Blake2b.hash(b"seed", &[&time.to_le_bytes()]);
-        let work = self.vos.budgeted_work(time, seed, BUDGET, inputs);
-        let on_vos = self.vos.refine(&work);
-        self.vos.accumulate(&on_vos);
-        self.vos.version += 1;
-        let (vos_result, vos_pages) = split_output(&on_vos).expect("a VOS output");
-        let vos_encoded = vos_result.encode();
-        assert_eq!(on_vos[..vos_encoded.len()], vos_encoded[..]);
-
-        let Work::Batch(batch) = work else {
-            unreachable!("a batch")
-        };
-        let inputs = batch.inputs.len();
-        let root = self.builder.store.root();
+        let root = self.builder.store.root().unwrap();
         assert_eq!(
             self.chain.root().unwrap_or_else(|| empty_root(&Blake2b)),
             root,
@@ -151,26 +139,34 @@ impl Paired {
         );
         let prepared = self
             .builder
-            .prepare(&self.runner, &self.chain.da, batch)
+            .prepare(&self.runner, self.chain.segments(), inputs, time, seed, &[])
             .expect("a package");
+        let work = Work::Batch(prepared.package.batch.clone());
+        assert_eq!(prepared.package.batch.version, self.vos.version);
+        let on_vos = self.vos.refine(&work);
+        self.vos.accumulate(&on_vos);
+        self.vos.version += 1;
+        let (vos_result, vos_pages) = split_output(&on_vos).expect("a VOS output");
+        let vos_encoded = vos_result.encode();
+        assert_eq!(on_vos[..vos_encoded.len()], vos_encoded[..]);
         assert_eq!(
             prepared.simulation.encoded, vos_encoded,
             "the simulation's work result is the VOS node's"
         );
         assert_eq!(prepared.package.root, root);
         assert!(shows(&prepared.package), "the witness verifies");
-        let payload = Work::Package(prepared.package.clone()).encode();
-        let gas = BUDGET + defaults::refine_start(inputs, payload.len() + 64) + JAM_EXTRA;
+        assert!(prepared.gas <= self.builder.refine_gas);
         let imports = self
             .builder
-            .imports(&prepared, &self.chain.da)
+            .imports(&prepared, self.chain.segments().as_ref())
             .expect("the pages in DA");
         let refined = self
             .chain
-            .refine(&self.runner, &prepared.package, imports, gas)
-            .expect("the package refines");
+            .refine(&self.runner, &prepared.package, imports, prepared.gas)
+            .expect("the package refines within the gas the builder gives it");
         let output = &refined.output;
         assert_eq!(output.root_before, root);
+        assert_eq!(output.root_after, prepared.pending.root);
         assert_eq!((output.time, output.seed), (time, seed));
         let slot = (time - EPOCH_MS) / SLOT_MS + 1;
         let stored = self
@@ -178,19 +174,36 @@ impl Paired {
             .accumulate(&self.runner, &refined, slot)
             .expect("accumulate halts");
         assert_eq!(stored, Some(output.root_after), "accumulate takes the root");
-        let result = self
+        let landed = self.chain.landed().unwrap();
+        assert_eq!(
+            landed
+                .exports
+                .map(|exports| (exports.root, exports.pages, exports.segments)),
+            Some((refined.segment_root, output.pages, output.exports))
+        );
+        let pages = output.pages as usize;
+        let simulated = prepared.simulation.gas_used;
+        assert!(
+            refined.gas_used <= simulated + prepared.own,
+            "the package's own work, {} beyond the simulation, within its estimate {}",
+            refined.gas_used - simulated.min(refined.gas_used),
+            prepared.own
+        );
+        let witness = prepared.package.witness.clone();
+        let imported = prepared.package.imports.len();
+        let (result, on_chain) = self
             .builder
-            .accept(&refined, stored, &self.chain.da)
+            .accept(&prepared, &landed, self.chain.segments().as_ref())
             .expect("the builder takes the result");
+        assert_eq!(on_chain, vos_encoded, "the chain's work result is VOS's");
         assert_eq!(result, vos_result);
-        assert_eq!(self.builder.store.root(), output.root_after);
+        assert_eq!(self.builder.store.root().unwrap(), output.root_after);
 
         let exports = self
             .chain
             .da
             .exports(&refined.segment_root)
             .expect("the exports");
-        let pages = output.pages as usize;
         let encoded = exports[pages..].concat();
         assert_eq!(
             encoded[..vos_encoded.len()],
@@ -205,12 +218,11 @@ impl Paired {
         let on_vos: Vec<Hash> = vos_pages.iter().map(|lz4| digest(&unpacked(lz4))).collect();
         assert_eq!(on_jam, on_vos, "the pages, by hash");
         self.rows_agree();
-        let witness = &prepared.package.witness;
         Ran {
             result,
             jam_gas: refined.gas_used,
-            simulated_gas: prepared.simulation.gas_used,
-            imported: prepared.package.imports.len(),
+            simulated_gas: simulated,
+            imported,
             exported: pages,
             witnessed: witness.keys.len(),
             scanned: witness.ranges.iter().map(|range| range.rows.len()).sum(),
@@ -237,7 +249,7 @@ impl Paired {
             })
             .collect();
         assert!(
-            vos == **self.builder.store.rows(),
+            vos == self.builder.store.view().rows().unwrap(),
             "the builder's rows are the VOS node's"
         );
     }
@@ -302,7 +314,7 @@ fn with_shop(backend: PvmBackend, actors: &Actors) -> (Paired, Vec<u8>) {
     let mut all = programs(actors);
     all.push(&shop);
     all.extend(bound.iter().map(Vec::as_slice));
-    let mut paired = Paired::new(backend, &all);
+    let mut paired = Paired::new(backend, &all, G_R);
     let mut first = installs(&mut paired, actors);
     first.push(Input::Admin(Admin::Install {
         instance: SHOP,
@@ -334,7 +346,7 @@ fn packages_agree_with_vos_on_stateful_batches() {
 
 fn stateful_batches(backend: PvmBackend) {
     let actors = Actors::load();
-    let mut paired = Paired::new(backend, &programs(&actors));
+    let mut paired = Paired::new(backend, &programs(&actors), G_R);
     let method = |instance, name| actors.method(instance, name);
     let first = installs(&mut paired, &actors);
     ran_or_refused(&paired.batch(T0, first).result);
@@ -426,7 +438,7 @@ fn packages_agree_with_vos_on_scans_and_committed_maps() {
 
 fn scans_and_committed_maps(backend: PvmBackend) {
     let actors = Actors::load();
-    let mut paired = Paired::new(backend, &programs(&actors));
+    let mut paired = Paired::new(backend, &programs(&actors), G_R);
     let method = |instance, name| actors.method(instance, name);
     let first = installs(&mut paired, &actors);
     paired.batch(T0, first);
@@ -629,7 +641,7 @@ fn requests(result: &WorkResult) -> Vec<Await> {
 #[test]
 fn a_witnessed_reads_gas_on_jam() {
     let actors = Actors::load();
-    let mut paired = Paired::new(PvmBackend::Default, &programs(&actors));
+    let mut paired = Paired::new(PvmBackend::Default, &programs(&actors), G_R);
     let first = installs(&mut paired, &actors);
     paired.batch(T0, first);
     let ops = actors.method(COUNTER, "ops");
@@ -696,17 +708,13 @@ fn a_package_refines_and_accumulates_only_on_what_it_shows() {
     paired.batch(T0 + 1_000, vec![fill, compute]);
 
     let refines = |paired: &mut Paired, package: &Package, imports| {
-        let gas = BUDGET + defaults::refine_start(8, 1 << 20) + JAM_EXTRA;
-        paired.chain.refine(&paired.runner, package, imports, gas)
+        paired.chain.refine(&paired.runner, package, imports, G_R)
     };
     let prepare = |paired: &Paired, inputs: Vec<Input>, time: u64| {
-        let seed = [3; 32];
-        let Work::Batch(batch) = paired.vos.budgeted_work(time, seed, BUDGET, inputs) else {
-            unreachable!()
-        };
+        let segments = paired.chain.segments();
         paired
             .builder
-            .prepare(&paired.runner, &paired.chain.da, batch)
+            .prepare(&paired.runner, segments, inputs, time, [3; 32], &[])
             .expect("a package")
     };
     let trapped = |refined: Result<Refined, Error>, what: &str| {
@@ -773,8 +781,8 @@ fn a_package_refines_and_accumulates_only_on_what_it_shows() {
     let mut cut = widest(&mut package);
     let to = vos_tree::keys::after(&cut.rows[0].key);
     cut.rows.truncate(1);
-    cut.proof =
-        vos_tree::RangeProof::generate(paired.builder.store.tree(), &cut.from, Some(&to)).unwrap();
+    let view = paired.builder.store.view();
+    cut.proof = vos_tree::RangeProof::generate(&view.tree(), &cut.from, Some(&to)).unwrap();
     cut.to = Some(to);
     let whole = widest(&mut package);
     package.witness.ranges = vec![cut];
@@ -793,18 +801,22 @@ fn a_package_refines_and_accumulates_only_on_what_it_shows() {
     // The computation's pages: missing from DA, then imported as zeros.
     let time = T0 + 3_000;
     let sweep = paired.vos.sweep(time);
-    let Work::Batch(batch) = paired
-        .vos
-        .budgeted_work(time, [3; 32], BUDGET, vec![sweep.clone()])
-    else {
-        unreachable!()
-    };
+    // A workflow whose pages DA lacks is left out of the sweep, and stays
+    // due.
     let empty = vos_jam::Da::default();
-    let missing = paired.builder.prepare(&paired.runner, &empty, batch);
-    assert!(
-        matches!(missing, Err(Error::Page(WorkflowId(0), _))),
-        "{missing:?}"
-    );
+    let missing = paired
+        .builder
+        .prepare(
+            &paired.runner,
+            Arc::new(empty.clone()),
+            vec![sweep.clone()],
+            time,
+            [3; 32],
+            &[],
+        )
+        .expect("a package without it");
+    assert_eq!(missing.skipped, [WorkflowId(0)]);
+    assert!(missing.package.batch.inputs.is_empty());
     let prepared = prepare(&paired, vec![sweep], time);
     assert!(matches!(
         paired.builder.imports(&prepared, &empty),
@@ -825,7 +837,7 @@ fn a_package_refines_and_accumulates_only_on_what_it_shows() {
         .imports(&prepared, &paired.chain.da)
         .expect("the pages in DA");
     let refined = refines(&mut paired, &prepared.package, imports).expect("it refines");
-    let before = (paired.chain.root(), paired.builder.store.root());
+    let before = (paired.chain.root(), paired.builder.store.root().unwrap());
     let skew = defaults::SESSION_SKEW_MS;
     let late = (time + skew - EPOCH_MS) / SLOT_MS + 2;
     let early = (time - skew - EPOCH_MS) / SLOT_MS - 2;
@@ -838,38 +850,50 @@ fn a_package_refines_and_accumulates_only_on_what_it_shows() {
             .accumulate(&paired.runner, &refined, slot)
             .unwrap();
         assert_eq!(stored, before.0, "{what}");
-        let accepted = paired.builder.accept(&refined, stored, &paired.chain.da);
+        let landed = paired.chain.landed().unwrap();
+        let accepted = paired.builder.accept(&prepared, &landed, &paired.chain.da);
         assert_eq!(accepted, Err(Error::Unaccumulated), "{what}");
-        assert_eq!(paired.builder.store.root(), before.1, "{what}");
+        assert_eq!(paired.builder.store.root().unwrap(), before.1, "{what}");
     }
-    // Accumulated in its slot; its exports not where it says, then taken.
+    // Accumulated in its slot, then taken, its pages where it exported
+    // them.
     let slot = (time - EPOCH_MS) / SLOT_MS;
     let stored = paired
         .chain
         .accumulate(&paired.runner, &refined, slot)
         .unwrap();
     assert_eq!(stored, Some(refined.output.root_after));
-    let elsewhere = Refined {
-        segment_root: [0; 32],
-        ..refined.clone()
+    let landed = paired.chain.landed().unwrap();
+    let exports = landed.exports.unwrap();
+    let wrong = Landed {
+        exports: Some(vos_wire::package::Exports {
+            pages: exports.pages + 1,
+            ..exports
+        }),
+        ..landed
     };
-    let accepted = paired.builder.accept(&elsewhere, stored, &paired.chain.da);
-    assert_eq!(accepted, Err(Error::Exports));
-    assert_eq!(paired.builder.store.root(), before.1);
+    assert_eq!(
+        paired.builder.accept(&prepared, &wrong, &paired.chain.da),
+        Err(Error::Exports),
+        "exports that are not its pages"
+    );
+    assert_eq!(paired.builder.store.root().unwrap(), before.1);
     assert!(
         paired
             .builder
-            .accept(&refined, stored, &paired.chain.da)
+            .accept(&prepared, &landed, &paired.chain.da)
             .is_ok()
     );
-    // Once more: refined on a root neither holds now.
+    // Once more: built on a root neither holds now.
     let again = paired
         .chain
         .accumulate(&paired.runner, &refined, slot)
         .unwrap();
     assert_eq!(again, stored, "the chain keeps the root after");
-    let accepted = paired.builder.accept(&refined, again, &paired.chain.da);
-    assert_eq!(accepted, Err(Error::Root));
+    assert_eq!(
+        paired.builder.accept(&prepared, &landed, &paired.chain.da),
+        Err(Error::Root)
+    );
 }
 
 /// A witness's keys, each opened.
@@ -918,4 +942,316 @@ fn shows(package: &Package) -> bool {
             )
             .is_ok()
     })
+}
+
+/// A builder over its own store, beside the test actors and the shop, and
+/// an emulated chain it submits to.
+struct Driven {
+    actors: Actors,
+    shop: Vec<u8>,
+    runner: Runner,
+    builder: Builder,
+    chain: Emulated,
+    /// Alice's requests, in her session started at `T0`.
+    sequence: u64,
+    time: u64,
+}
+
+impl Driven {
+    /// A builder whose packages each have `refine_gas`, over `store`, and
+    /// the actors and the shop installed through it.
+    fn new(store: Store, refine_gas: u64) -> Self {
+        let actors = Actors::load();
+        let (paired, shop) = with_shop(PvmBackend::Default, &actors);
+        let mut driven = Self {
+            runner: paired.runner,
+            builder: Builder::new(store, refine_gas),
+            chain: Emulated::default(),
+            actors,
+            shop,
+            sequence: 0,
+            time: T0,
+        };
+        let installs = driven.installs();
+        driven.run(installs);
+        driven
+    }
+
+    fn installs(&mut self) -> Vec<Input> {
+        let flows = crate::workflows::FLOWS;
+        let hash = vos_testkit::program_hash;
+        let beside = flows
+            .iter()
+            .map(|name| {
+                let program = hash(&actor(name));
+                (
+                    method(&self.shop, name),
+                    vos_wire::abi::Kind::Workflow,
+                    program,
+                )
+            })
+            .collect();
+        vec![
+            install(COUNTER, hash(&self.actors.counter)),
+            Input::Admin(Admin::Install {
+                instance: SHOP,
+                program: hash(&self.shop),
+                beside,
+                roles: vec![],
+            }),
+        ]
+    }
+
+    /// Alice's next request.
+    fn request<A: Encode>(
+        &mut self,
+        instance: InstanceId,
+        method: MethodId,
+        arguments: A,
+    ) -> Input {
+        self.sequence += 1;
+        Input::Request(Request {
+            session: Session {
+                key: [1; 32],
+                name: [0; 16],
+                t0: T0,
+            },
+            sequence: self.sequence,
+            caller: ALICE,
+            instance,
+            method,
+            arguments: arguments.encode(),
+        })
+    }
+
+    /// `inputs` run through the builder's loop, each attempt a second after
+    /// the last: the work result.
+    fn run(&mut self, inputs: Vec<Input>) -> WorkResult {
+        self.try_run(inputs).expect("the package lands").result
+    }
+
+    fn try_run(&mut self, inputs: Vec<Input>) -> Result<Taken, Error> {
+        let time = &mut self.time;
+        let mut clock = || {
+            *time += 1_000;
+            (*time, Blake2b.hash(b"seed", &[&time.to_le_bytes()]))
+        };
+        let taken = self
+            .builder
+            .run(&mut self.chain, &self.runner, &inputs, &mut clock, &[])?;
+        assert_eq!(self.chain.root(), Some(self.builder.store.root().unwrap()));
+        assert_eq!(taken.encoded, taken.prepared.simulation.encoded);
+        Ok(taken)
+    }
+}
+
+/// A package the chain refused, accumulated past its time or refined out
+/// of gas, is made again at a new time, and lands.
+#[test]
+fn the_builder_makes_a_refused_package_again() {
+    let mut driven = Driven::new(Store::temporary().unwrap(), G_R);
+    let increment = driven.actors.method(COUNTER, "increment");
+    driven.chain.faults = vec![Fault::Late, Fault::Starved];
+    let request = driven.request(COUNTER, increment, 5u64);
+    let taken = driven.try_run(vec![request.clone()]).expect("it lands");
+    assert_eq!(done::<u64>(&taken.result.steps[0]), 5);
+    let fates: Vec<Fate> = taken
+        .attempts
+        .iter()
+        .map(|attempt| attempt.fate.clone())
+        .collect();
+    assert_eq!(fates, [Fate::Refused, Fate::Refused, Fate::Landed]);
+    assert!(taken.attempts[1].submitted.contains("refine stopped"));
+    // Refused as often as the builder tries, it stops.
+    driven.chain.faults = vec![Fault::Late; 4];
+    let again = driven.request(COUNTER, increment, 1u64);
+    let Err(Error::Attempts(attempts)) = driven.try_run(vec![again]) else {
+        panic!("it lands");
+    };
+    assert_eq!(attempts.len(), 4);
+    assert!(attempts.iter().all(|attempt| attempt.fate == Fate::Refused));
+}
+
+/// A work package's refine gas too small for the batch's budget and the
+/// package's own work lowers the budget; too small for the agent's own
+/// work alone, the builder makes no package.
+#[test]
+fn the_builder_fits_its_budget_to_a_packages_gas() {
+    let mut driven = Driven::new(Store::temporary().unwrap(), G_R);
+    let increment = driven.actors.method(COUNTER, "increment");
+    let refine_gas = 18_000_000;
+    driven.builder.refine_gas = refine_gas;
+    let request = driven.request(COUNTER, increment, 2u64);
+    let taken = driven.try_run(vec![request]).expect("it lands");
+    let usable = refine_gas - refine_gas / 1000 * 50;
+    let budget = taken.prepared.package.batch.budget;
+    assert!(budget < usable / 5 * 4, "the budget lowered to {budget}");
+    assert!(taken.prepared.gas <= usable);
+    assert_eq!(done::<u64>(&taken.result.steps[0]), 2);
+    driven.builder.refine_gas = 3_000_000;
+    let request = driven.request(COUNTER, increment, 2u64);
+    assert!(matches!(driven.try_run(vec![request]), Err(Error::Unfit)));
+}
+
+/// A package another builder's landed before: the builder takes that one
+/// from its exports, then makes its own again on it. One that cannot be
+/// reached from the store stops the builder, its store left as it was.
+#[test]
+fn the_builder_takes_a_package_that_landed_first() {
+    let mut first = Driven::new(Store::temporary().unwrap(), G_R);
+    let mut second = Builder::new(Store::temporary().unwrap(), G_R);
+    let landed = first.chain.landed().unwrap();
+    second
+        .resync(&first.chain, &landed)
+        .expect("one package behind");
+    assert_eq!(second.store.root().unwrap(), landed.root);
+    // The second lands a package of Bob's.
+    let increment = first.actors.method(COUNTER, "increment");
+    let bob = Input::Request(Request {
+        session: Session {
+            key: [2; 32],
+            name: [0; 16],
+            t0: T0,
+        },
+        sequence: 1,
+        caller: BOB,
+        instance: COUNTER,
+        method: increment,
+        arguments: 3u64.encode(),
+    });
+    let mut time = first.time + 1_000;
+    let mut clock = || {
+        time += 1_000;
+        (time, [9; 32])
+    };
+    second
+        .run(&mut first.chain, &first.runner, &[bob], &mut clock, &[])
+        .expect("the second's package lands");
+    first.time = time;
+    // The first, a package behind, takes the second's, then lands its own.
+    let alice = first.request(COUNTER, increment, 4u64);
+    let taken = first.try_run(vec![alice]).expect("it lands");
+    assert_eq!(done::<u64>(&taken.result.steps[0]), 7, "on Bob's increment");
+    let fates: Vec<Fate> = taken
+        .attempts
+        .iter()
+        .map(|attempt| attempt.fate.clone())
+        .collect();
+    assert_eq!(fates, [Fate::Overtaken, Fate::Landed]);
+    // Two packages behind, the second cannot reach the chain's root.
+    let third = first.request(COUNTER, increment, 1u64);
+    first.run(vec![third]);
+    let before = second.store.root().unwrap();
+    let landed = first.chain.landed().unwrap();
+    assert_eq!(second.resync(&first.chain, &landed), Err(Error::Diverged));
+    assert_eq!(second.store.root().unwrap(), before);
+}
+
+/// A batch whose pages pass a work package's exports loses its later
+/// inputs, which a later package takes; a package's refine fits its gas.
+#[test]
+fn the_builder_fits_a_batch_to_a_packages_segments() {
+    let mut driven = Driven::new(Store::temporary().unwrap(), 8_000_000_000);
+    let compute = method(&driven.shop, "compute");
+    let starts: Vec<Input> = (0..7)
+        .map(|_| driven.request(SHOP, compute, (262_144u32, 1u32)))
+        .collect();
+    let (time, seed) = (driven.time + 1_000, [1; 32]);
+    let prepared = driven
+        .builder
+        .prepare(
+            &driven.runner,
+            driven.chain.segments(),
+            starts.clone(),
+            time,
+            seed,
+            &[],
+        )
+        .expect("a package");
+    let exports = prepared.exports() as usize;
+    let inputs = prepared.package.batch.inputs.len();
+    assert!(inputs < starts.len(), "{inputs} of the starts");
+    assert!(
+        exports <= vos_wire::package::MAX_SEGMENTS,
+        "{exports} exports"
+    );
+    assert!(
+        exports > vos_wire::package::MAX_SEGMENTS / 3,
+        "{exports} exports"
+    );
+    let refined = driven
+        .chain
+        .refine(&driven.runner, &prepared.package, vec![], prepared.gas)
+        .expect("the package refines within its gas");
+    assert!(refined.gas_used <= prepared.gas);
+    println!(
+        "JAM: {inputs} of 7 computations in a package: {exports} exports, refine {} of {} gas",
+        refined.gas_used, prepared.gas
+    );
+}
+
+/// The builder's store outlives it: reopened, it holds the same root and
+/// where the pages it took were exported, so a workflow it suspended
+/// resumes from their imports. The packages it lands solicit what it
+/// names.
+#[test]
+fn the_builders_store_outlives_it() {
+    let scratch =
+        Scratch(std::env::temp_dir().join(format!("vos-jam-outlives-{}", std::process::id())));
+    let path = &scratch.0;
+    let _ = std::fs::remove_dir_all(path);
+    let mut driven = Driven::new(Store::open(path).unwrap(), G_R);
+    let nap = method(&driven.shop, "nap");
+    let start = driven.request(SHOP, nap, 500u64);
+    driven.run(vec![start]);
+    let root = driven.builder.store.root().unwrap();
+    let program = vos_testkit::program_hash(&driven.actors.counter);
+    let len = driven.actors.counter.len() as u32;
+    // The builder gone, its store reopened: the old one is dropped first,
+    // which releases its lock on the directory, a temporary store standing
+    // in meanwhile.
+    driven.builder = Builder::new(Store::temporary().unwrap(), G_R);
+    driven.builder = Builder::new(Store::open(path).unwrap(), G_R);
+    assert_eq!(driven.builder.store.root().unwrap(), root);
+    let time = driven.time + 1_000;
+    let sweep = driven.builder.sweep(time).unwrap().expect("the nap is due");
+    let mut clock = || (time, [7; 32]);
+    let Taken {
+        prepared, result, ..
+    } = driven
+        .builder
+        .run(
+            &mut driven.chain,
+            &driven.runner,
+            &[sweep],
+            &mut clock,
+            &[(program, len)],
+        )
+        .expect("the nap resumes");
+    assert!(!prepared.package.imports.is_empty(), "its pages imported");
+    let workflow = driven
+        .builder
+        .workflow(&ALICE, WorkflowId(0))
+        .unwrap()
+        .expect("Alice's workflow");
+    assert!(
+        matches!(workflow.state, WorkflowState::Ended(_)),
+        "{result:?}"
+    );
+    assert_eq!(driven.builder.workflow(&BOB, WorkflowId(0)).unwrap(), None);
+    assert!(
+        driven
+            .chain
+            .solicited
+            .contains(&(program.0, u64::from(len)))
+    );
+}
+
+/// A directory removed when dropped, so a test that panics leaves none.
+struct Scratch(std::path::PathBuf);
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }

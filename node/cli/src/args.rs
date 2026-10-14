@@ -64,6 +64,11 @@ pub enum Command {
     /// Read a workflow the client key started, by the id its start was
     /// answered with: where it stands, or its result once it ended.
     Workflow(WorkflowArgs),
+    /// An agent as a JAM service, which its builder drives.
+    Jam {
+        #[command(subcommand)]
+        command: crate::jam::JamCommand,
+    },
 }
 
 #[derive(Subcommand)]

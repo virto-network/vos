@@ -7,7 +7,13 @@
 //! - `X`: export two 4 KiB pages as segments;
 //! - `I`: fetch both imports and check their bytes;
 //! - `U`: the gas of a host call the host does not serve, and of `log`;
-//! - `P`: the protocol's gas parameters (`fetch` kind 0).
+//! - `P`: the protocol's gas parameters (`fetch` kind 0);
+//! - `O`: an inner machine starved of gas, at its first block and at a
+//!   later one, then resumed, against a straight run;
+//! - `R`: a machine restored at the counter of a store that faulted;
+//! - `L`: the probe preimage through `historical_lookup`;
+//! - `S`: accumulate solicits the probe preimage (`solicit`, id 24) and
+//!   stores the call's result under `solicit`.
 //!
 //! Its output is the payload, then one fixed-size record per measured call.
 //! Accumulate stores each input under `r:<payload>` and under `last`.
@@ -40,6 +46,7 @@ global_asm!(
 const GAS: u64 = 0;
 const FETCH: u64 = 2;
 const WRITE: u64 = 5;
+const HISTORICAL_LOOKUP: u64 = 7;
 const EXPORT: u64 = 8;
 const MACHINE: u64 = 9;
 const PEEK: u64 = 10;
@@ -48,6 +55,17 @@ const PAGES: u64 = 12;
 const INVOKE: u64 = 13;
 const EXPUNGE: u64 = 14;
 const LOG: u64 = 100;
+/// Gray Paper 0.8.0's `solicit`, if its calls follow 0.7's numbering one
+/// up, as `fetch` (2) and `machine` (9) do.
+const SOLICIT: u64 = 24;
+
+/// The preimage `L` looks up and `S` solicits: 300 bytes, byte `i` being
+/// `37 i + 11`, and its BLAKE2b-256.
+const PREIMAGE_LEN: u64 = 300;
+const PREIMAGE_HASH: [u8; 32] = [
+    0x0c, 0x37, 0x6d, 0xbd, 0x10, 0xb8, 0x60, 0x1d, 0x6c, 0xa5, 0x02, 0xdd, 0xf4, 0x84, 0x92, 0xd5,
+    0xf2, 0x77, 0x5c, 0x8f, 0xeb, 0x3b, 0xd5, 0x4a, 0x2d, 0x7f, 0xeb, 0xef, 0x06, 0xb1, 0x83, 0x47,
+];
 /// A VOS extension (`instantiate`), which a JAM node does not serve.
 const UNSERVED: u64 = 0x480;
 
@@ -91,6 +109,33 @@ static INNER: [u8; 45] = [
 ];
 /// The counter just after the inner program's `ecalli`.
 const AFTER_HOST_CALL: u64 = 20;
+/// The counter of the inner program's store to page 17.
+const STORE_TO_17: u64 = 9;
+
+/// Two basic blocks, the second from counter 7:
+///
+/// ```text
+///  0: load_imm r1, 1
+///  3: load_imm r2, 2
+///  6: fallthrough
+///  7: load_imm r3, 3
+/// 10: load_imm r4, 4
+/// 13: load_imm r0, 0xffff0000
+/// 19: jump_ind r0, 0                        halt
+/// ```
+static BLOCKS: [u8; 27] = [
+    0x00, 0x01, 21, //
+    51, 0x01, 0x01, //
+    51, 0x02, 0x02, //
+    1, //
+    51, 0x03, 0x03, //
+    51, 0x04, 0x04, //
+    51, 0x00, 0x00, 0x00, 0xff, 0xff, //
+    50, 0x00, //
+    0xc9, 0x24, 0x08,
+];
+/// Where the second block starts.
+const SECOND_BLOCK: u64 = 7;
 const INNER_GAS: u64 = 1_000_000;
 /// The arena whose arming is measured: 2,048 pages (8 MiB) from page 32.
 const ARENA_FIRST: u64 = 32;
@@ -120,6 +165,10 @@ mod step {
     pub const PARAMETERS: u8 = 20;
     pub const POKE_READ_ONLY: u8 = 21;
     pub const SEGMENT: u8 = 22;
+    pub const STRAIGHT: u8 = 23;
+    pub const STARVED: u8 = 24;
+    pub const RESUMED: u8 = 25;
+    pub const LOOKUP: u8 = 26;
     pub const DONE: u8 = 0xff;
 }
 
@@ -285,6 +334,95 @@ fn invoke(records: &mut Records, machine: u64, frame: &mut [u8; 112]) -> (u64, u
     let used = INNER_GAS.wrapping_sub(frame_gas(frame));
     records.push(step::INVOKE, exit, detail, gas, used);
     (exit, detail)
+}
+
+/// `invoke` with `gas`; records the exit (φ7), its detail (φ8), the gas
+/// left in the frame and the inner gas used, under `step`.
+fn invoke_with(
+    records: &mut Records,
+    step: u8,
+    machine: u64,
+    frame: &mut [u8; 112],
+    gas: u64,
+) -> (u64, u64) {
+    set_frame_gas(frame, gas);
+    let (exit, detail, _) = timed!(INVOKE, machine, frame.as_mut_ptr(), 0, 0, 0, 0);
+    let left = frame_gas(frame);
+    records.push(step, exit, detail, left, gas.wrapping_sub(left));
+    (exit, left)
+}
+
+/// Behaviour `O`: a machine of two blocks run straight, then starved at
+/// its first block and at its second, each resumed with gas to spare;
+/// and the counter `expunge` gives where it starved.
+fn probe_starved(records: &mut Records, frame: &mut [u8; 112]) {
+    let machine = hostcall!(MACHINE, BLOCKS.as_ptr(), BLOCKS.len(), 0, 0, 0);
+    invoke_with(records, step::STRAIGHT, machine, frame, INNER_GAS);
+    let straight = INNER_GAS - frame_gas(frame);
+    hostcall!(EXPUNGE, machine, 0, 0, 0, 0);
+    for starved in [1, straight - 1] {
+        let machine = hostcall!(MACHINE, BLOCKS.as_ptr(), BLOCKS.len(), 0, 0, 0);
+        invoke_with(records, step::STARVED, machine, frame, starved);
+        invoke_with(records, step::RESUMED, machine, frame, INNER_GAS);
+        hostcall!(EXPUNGE, machine, 0, 0, 0, 0);
+    }
+    let machine = hostcall!(MACHINE, BLOCKS.as_ptr(), BLOCKS.len(), 0, 0, 0);
+    invoke_with(records, step::STARVED, machine, frame, straight - 1);
+    let (counter, _, gas) = timed!(EXPUNGE, machine, 0, 0, 0, 0, 0);
+    records.push(step::EXPUNGE, counter, 0, gas, SECOND_BLOCK);
+}
+
+/// Behaviour `R`: the store to page 17 faults; `expunge` gives its
+/// counter; a machine made there runs on to the host call, against one
+/// made at counter 0.
+fn probe_reentry(records: &mut Records, frame: &mut [u8; 112]) {
+    let machine = hostcall!(MACHINE, INNER.as_ptr(), INNER.len(), 0, 0, 0);
+    hostcall!(PAGES, machine, 16, 2, ALLOC_RW, 0);
+    hostcall!(PAGES, machine, 17, 1, SET_RO, 0);
+    invoke_with(records, step::STARVED, machine, frame, INNER_GAS);
+    let (counter, _, gas) = timed!(EXPUNGE, machine, 0, 0, 0, 0, 0);
+    records.push(step::EXPUNGE, counter, 0, gas, STORE_TO_17);
+    for at in [counter, 0] {
+        let machine = hostcall!(MACHINE, INNER.as_ptr(), INNER.len(), at, 0, 0);
+        hostcall!(PAGES, machine, 16, 2, ALLOC_RW, 0);
+        invoke_with(records, step::RESUMED, machine, frame, INNER_GAS);
+        hostcall!(EXPUNGE, machine, 0, 0, 0, 0);
+    }
+}
+
+/// Behaviour `L`: the probe preimage through `historical_lookup`: its
+/// length, or `NONE`, and its bytes' FNV-1a; then asking for none of it,
+/// and for 4 KiB, to price the call by the length asked.
+fn probe_lookup(records: &mut Records, buffers: &mut Buffers) {
+    let out = &mut buffers.input;
+    let (length, _, gas) = timed!(
+        HISTORICAL_LOOKUP,
+        u64::MAX,
+        PREIMAGE_HASH.as_ptr(),
+        out.as_mut_ptr(),
+        0,
+        PREIMAGE_LEN,
+        0
+    );
+    let fnv = if length == PREIMAGE_LEN {
+        fnv(&out[..PREIMAGE_LEN as usize])
+    } else {
+        0
+    };
+    records.push(step::LOOKUP, length, 0, gas, fnv);
+    // The same, asking for none of it, then for 4 KiB.
+    for asked in [0, 4096] {
+        let (length, _, gas) = timed!(
+            HISTORICAL_LOOKUP,
+            u64::MAX,
+            PREIMAGE_HASH.as_ptr(),
+            out.as_mut_ptr(),
+            0,
+            asked,
+            0
+        );
+        records.push(step::LOOKUP, length, asked, gas, 0);
+    }
 }
 
 fn pages(records: &mut Records, step: u8, machine: u64, first: u64, count: u64, mode: u64) {
@@ -509,6 +647,9 @@ extern "C" fn probe_refine(arguments: *const u8, len: u64) -> Output {
             b'A' => probe_arena(&mut records),
             b'X' => probe_export(&mut records, buffers),
             b'I' => probe_import(&mut records, buffers),
+            b'O' => probe_starved(&mut records, &mut buffers.frame),
+            b'R' => probe_reentry(&mut records, &mut buffers.frame),
+            b'L' => probe_lookup(&mut records, buffers),
             b'P' => {
                 let input = &mut buffers.input;
                 let length = hostcall!(
@@ -600,6 +741,11 @@ extern "C" fn probe_accumulate(arguments: *const u8, len: u64) -> Output {
                 3
             }
         };
+        if key_len > 2 && key[2] == b'S' {
+            let result = hostcall!(SOLICIT, PREIMAGE_HASH.as_ptr(), PREIMAGE_LEN, 0, 0, 0);
+            let bytes = result.to_le_bytes();
+            hostcall!(WRITE, b"solicit".as_ptr(), 7, bytes.as_ptr(), 8, 0);
+        }
         for key in [&key[..key_len], b"last".as_slice()] {
             let previous = hostcall!(WRITE, key.as_ptr(), key.len(), value.as_ptr(), stored, 0u64);
             if previous == u64::MAX - 4 {

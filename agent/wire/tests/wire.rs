@@ -1881,10 +1881,11 @@ fn peer_messages_keep_their_bytes() {
 }
 
 /// JAM mode's payload and output, byte for byte: a package is the work
-/// item's third kind, its batch, root, witness and imports in order; a
-/// witness's keys each opened absent, with a value, or by commitment; a
-/// range its bounds, rows and proof; the output its roots, time, seed,
-/// result hash and export counts.
+/// item's third kind, its batch, root, witness, imports and solicited
+/// programs in order; a witness's keys each opened absent, with a value,
+/// or by commitment; a range its bounds, rows and proof; the output its
+/// roots, time, seed, result hash, export counts and solicited programs;
+/// the exports accumulate keeps, their package, root and counts.
 #[test]
 fn packages_keep_their_bytes() {
     use vos_tree::{BatchProof, Entry, RangeProof};
@@ -1929,6 +1930,7 @@ fn packages_keep_their_bytes() {
             }],
         },
         imports: vec![(WorkflowId(17), 18)],
+        solicit: vec![(ProgramHash([19; 32]), 20)],
     };
     let bytes = [
         &batch.encode()[..],
@@ -1961,6 +1963,9 @@ fn packages_keep_their_bytes() {
         &1u32.to_le_bytes(),
         &17u64.to_le_bytes(),
         &18u32.to_le_bytes(),
+        &1u32.to_le_bytes(),
+        &[19; 32],
+        &20u32.to_le_bytes(),
     ]
     .concat();
     assert_eq!(package.encode(), bytes);
@@ -1976,6 +1981,7 @@ fn packages_keep_their_bytes() {
         work_result_hash: [5; 32],
         pages: 6,
         exports: 7,
+        solicit: vec![(ProgramHash([8; 32]), 9)],
     };
     let bytes = [
         &[1; 32][..],
@@ -1985,10 +1991,27 @@ fn packages_keep_their_bytes() {
         &[5; 32],
         &6u32.to_le_bytes(),
         &7u32.to_le_bytes(),
+        &1u32.to_le_bytes(),
+        &[8; 32],
+        &9u32.to_le_bytes(),
     ]
     .concat();
     assert_eq!(output.encode(), bytes);
     round_trip(&output);
+    let exports = vos_wire::package::Exports {
+        package: [4; 32],
+        root: [1; 32],
+        pages: 2,
+        segments: 3,
+    };
+    let bytes = [
+        &[4; 32][..],
+        &[1; 32],
+        &2u32.to_le_bytes(),
+        &3u32.to_le_bytes(),
+    ]
+    .concat();
+    assert_eq!(exports.encode(), bytes);
 }
 
 /// A batch's time fits a slot from the slot's start back by the session

@@ -102,6 +102,10 @@ fn step_name(step: u8) -> &'static str {
         20 => "parameters",
         21 => "poke read-only page",
         22 => "imported page hash",
+        23 => "inner run straight",
+        24 => "inner run starved",
+        25 => "inner run resumed",
+        26 => "historical_lookup",
         0xff => "done",
         _ => "?",
     }
@@ -159,6 +163,15 @@ fn describe(records: &[Record]) -> Vec<String> {
                     charge.wrapping_sub(record.extra) as i64
                 ),
                 19 => format!("{:<22} {}", step_name(19), record.r7),
+                23..=25 => format!(
+                    "{:<22} exit={}({}) φ8={} gas-left={} inner-used={}",
+                    step_name(record.step),
+                    exit_name(record.r7),
+                    record.r7,
+                    value(record.r8),
+                    record.gas,
+                    record.extra
+                ),
                 22 => format!(
                     "{:<22} fnv={} index={}",
                     step_name(22),
@@ -218,7 +231,10 @@ fn run_local(blob: &[u8], payload: &[u8], backend: PvmBackend) -> LocalRun {
     )
     .expect("load the service program")
     .without_precompiles();
-    let invocation = context.try_run_jam().expect("the backend runs");
+    let invocation = context
+        .try_run_jam(vos_pvm::refine_host::JamRefine::default())
+        .expect("the backend runs")
+        .invocation;
     LocalRun {
         exit: invocation.exit.clone(),
         gas_used: invocation.gas_used,

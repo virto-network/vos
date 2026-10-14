@@ -7,63 +7,66 @@ use std::collections::BTreeMap;
 use vos_tree::{BatchProof, RangeProof};
 use vos_wire::package::{Opened, Range, Row, StateWitness};
 
+use crate::Error;
 use crate::simulate::Simulation;
-use crate::store::Store;
+use crate::store::View;
 
-/// The witness of `simulation` against `store`'s root.
-pub fn witness(store: &Store, simulation: &Simulation) -> StateWitness {
+/// The witness of `simulation` against `view`'s root.
+pub fn witness(view: &View, simulation: &Simulation) -> Result<StateWitness, Error> {
     let mut keys: BTreeMap<&[u8], Opened> = BTreeMap::new();
     for key in &simulation.reads {
-        let opened = match (store.get(key), store.leaf(key)) {
+        let opened = match (view.get(key)?, view.leaf(key)?) {
             (Some(value), Some(leaf)) => Opened::Value {
                 salt: leaf.salt,
-                value: value.to_vec(),
+                value,
             },
             _ => Opened::Absent,
         };
         keys.insert(key, opened);
     }
     for key in simulation.writes.keys() {
-        keys.entry(key).or_insert_with(|| match store.leaf(key) {
+        if keys.contains_key(key.as_slice()) {
+            continue;
+        }
+        let opened = match view.leaf(key)? {
             Some(leaf) => Opened::Written(leaf.value_hash),
             None => Opened::Absent,
-        });
+        };
+        keys.insert(key, opened);
     }
-    let proof = BatchProof::generate(store.tree(), &keys.keys().collect::<Vec<_>>())
-        .expect("a tree in memory");
+    let proof = BatchProof::generate(&view.tree(), &keys.keys().collect::<Vec<_>>())?;
     let ranges = merged(&simulation.ranges)
         .into_iter()
-        .map(|(from, to)| range(store, from, to))
-        .collect();
-    StateWitness {
+        .map(|(from, to)| range(view, from, to))
+        .collect::<Result<_, _>>()?;
+    Ok(StateWitness {
         keys: keys
             .into_iter()
             .map(|(key, opened)| (key.to_vec(), opened))
             .collect(),
         proof,
         ranges,
-    }
+    })
 }
 
-/// The range `[from, to)` of `store`: its rows and their proof.
-fn range(store: &Store, from: Vec<u8>, to: Option<Vec<u8>>) -> Range {
-    let rows = store
-        .rows()
-        .range(from.clone()..)
-        .take_while(|(key, _)| to.as_ref().is_none_or(|to| *key < to))
-        .map(|(key, value)| Row {
-            key: key.clone(),
-            salt: store.leaf(key).expect("a row's leaf").salt,
-            value: value.clone(),
-        })
-        .collect();
-    let proof = RangeProof::generate(store.tree(), &from, to.as_deref()).expect("a tree in memory");
-    Range {
+/// The range `[from, to)` of `view`: its rows and their proof.
+fn range(view: &View, from: Vec<u8>, to: Option<Vec<u8>>) -> Result<Range, Error> {
+    let mut rows = Vec::new();
+    for row in view.rows_from(&from) {
+        let (key, value) = row?;
+        if to.as_ref().is_some_and(|to| key >= *to) {
+            break;
+        }
+        let salt = view.leaf(&key)?.ok_or(Error::Corrupt("a row's leaf"))?.salt;
+        rows.push(Row { key, salt, value });
+    }
+    let proof = RangeProof::generate(&view.tree(), &from, to.as_deref())?;
+    Ok(Range {
         from,
         to,
         rows,
         proof,
-    }
+    })
 }
 
 /// `ranges` in key order, those that meet or overlap joined, so none
