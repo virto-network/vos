@@ -642,47 +642,58 @@ The Local (replica-only) lane is deferred until a use case needs it.
 - `CommittedMap<K, V>` also yields a Merkle root and multiproofs
   (`BatchProof`) for attestable methods and JAM witnesses. Only branching
   nodes are stored: about log₂(n) rows per key path.
-- **Compressed root format** [decided]:
-  - a leaf hash commits a domain tag, the fixed-width key, the leaf's salt
-    and H(value);
-  - a branch hash commits a different domain tag, its split level and both
-    children;
-  - spines through empty levels are never hashed;
-  - variable-length keys are hashed to a fixed width first;
-  - the empty map has a defined root;
-  - verifiers check that split levels strictly increase along a path and
-    fit the key width;
-  - **salted leaves** [proposed]: each row stores a salt of 16 bytes, so a
-    root or a path never lets anyone guess low-entropy values. The salt
-    is deterministic for every replica: it comes from the work result, or
-    from a keyed function of a space secret and the key. A local random
-    source would give each replica a different root (section 9.5,
-    invariant 5).
-    Keys and the tree's shape remain visible in any path that is shared,
-    so paths stay private witnesses.
+- **Each table chooses how its keys enter the keyspace** [decided,
+  slice 4]: as Substrate maps choose a hasher.
+  - **Hashed,** the default: `H128(key) ‖ key`. It is balanced whatever
+    keys clients choose, and scans in hash order.
+  - **Ordered,** `Table<K, V, Ordered>`: the key itself, with keys of at
+    most 64 bytes. It scans in key order, ranges included.
+  - Both are escaped so that every row key in the keyspace is
+    prefix-free, and a scan returns rows in the same order on every
+    host.
+- **The compressed tree** [decided; built in slice 4, `vos-tree`]:
+  - **A leaf** commits a domain tag, its key's length and bytes, and
+    `vh = H(tag ‖ salt ‖ value)`. The salt sits inside `vh`, so a proof
+    that opens a neighbour's leaf never shows a hash of its bare value.
+  - **A branch** commits a different domain tag, its split level (a
+    `u16`) and both children.
+  - Spines through empty levels are never hashed, and the empty tree has
+    a defined root.
+  - **Verifiers check** that levels strictly increase along a path, that
+    each branch's bit selects the child taken, and that opened leaves
+    are in order.
+  - **Multiproofs** (`BatchProof`) prove keys present or absent. A
+    `RangeProof` proves a range complete, its bounds being the leaves
+    around it. Both can update a root from the proof alone, which is
+    what a JAM refine runs.
+  - **Salts** are 16 bytes from the seed of the work result that wrote
+    the row, the same on every replica. They hide values as far as the
+    seed is kept, inside the space. Keys and the tree's shape stay
+    visible in any shared path, so paths remain private witnesses.
 
-  Non-inclusion of a key k is shown by the leaf for a different key k′
-  that k's path reaches. An update costs 8–25 hashes (3–8 µs at 1M–10M
-  keys), against 100–280 for the fixed-depth format it replaces (S4). The
-  change moves together through `CommittedMap`, `BatchProof`, the witness
-  math, the attestable kernels and cipher-clerk (`merkle.rs`,
-  `state_root.rs`, `succinct.rs`, `snapshot.rs`), which the owner cleared
-  to change.
-- **Root maintenance** [proposed]:
-  - Accumulate only records each committed write's key as dirty, one row
-    each, so the apply path stays at table cost.
-  - A deterministic background task builds node rows in sorted batches
-    from a storage snapshot at an exact applied index, off the apply
-    thread. Batches of 10,000 rewrite 7–10 node rows per update; single
-    updates rewrite 20–24 (S4).
-  - An attest waits for the root at its window's applied index.
-
-  Maintaining node rows inside accumulate would cost about 35–45 µs per
-  committed write (8–25 hashes plus 20–24 row writes at about 1.5 µs).
-  That would cap a ledger at about 12k transfers per second per agent,
-  below the replication budget.
+  An update costs 8 to 25 hashes, as S4 measured.
+- **Root maintenance** [decided; built in slice 4]:
+  - Accumulate writes each committed value with its version, a dirty
+    row (version first) and a seed row per version. It hashes nothing.
+  - **A root builder on every replica:**
+    - folds the dirty rows past its watermark into the map's tree, in
+      batches it commits through the writer only while the agent's epoch
+      holds;
+    - deletes the rows it consumed, so a long backlog never grows its
+      memory or its commits;
+    - leaves the roots equal on every replica by construction, and
+      resumes after a crash to the same root.
+  - **Proofs** are served against a map's last complete root, or
+    refused as `Building` while its tree is mid-build.
+  - **Cost:** a committed write takes about 4.3 µs on the apply path,
+    and the builder keeps up at 20k committed writes a second (slice 4).
+  - An attest waits for the root at its window's version.
+- **On JAM the whole keyspace is one tree** over the rows' keys, so every
+  read, scan and write of a refine is witnessed against the root the
+  chain stores (section 12).
 - Hashing inside the PVM uses the hash precompile (section 11.2).
-- No global state root on VOS. Agents deployed on JAM keep one.
+- No global state root on VOS. Agents deployed on JAM keep one, over
+  their whole keyspace.
 
 ### 9.4 Merge lane
 
@@ -1018,36 +1029,63 @@ These form a prover track that runs alongside the core slices (section 16).
 - **JAR is gone** [decided]. Its capability-manifest encoding, the `ecall`
   opcode paths, JAR lifecycle stubs and capability calls in the prover's
   allow-list, and JAR blob tests are removed.
-- JAM mode differs from VOS mode:
-  - Continuity is (root before, root after) plus witnesses, checked in
-    accumulate; the version counter has no meaning there.
-  - All system tables (sessions, outbox, workflows) sit under the committed
-    root, so the default agent maintains that root on JAM only.
-  - Root continuity serializes an agent's work packages. The builder
-    chains them with prerequisites.
-  - Refine output is capped, so state data goes to data availability (DA)
-    and accumulate only swaps roots.
-  - Every work package ends with workflow snapshots exported as segments.
-    DA retention is finite, so long-waiting workflows re-export their pages
-    or move them to preimages.
-  - Messages map to transfers, whose memos are small; payloads go through
-    preimages. Each hop takes several blocks.
-  - Time and randomness supplied by the builder are checked against the
-    slot.
-  - Precompiles fall back to software (section 11.2). Witnessed state reads
-    therefore cost about 25 × 4,760 gas per row in hashing.
+- **JAM mode, as built in slice 4:**
+  - **The work.** A work package carries a batch, the agent's root
+    before, and a witness: a multiproof over every key the refine reads
+    or writes, and a range proof per scan. Every table's rows are under
+    one tree over the whole keyspace (section 9.3).
+  - **Refine:**
+    - serves every read and scan from the witness, and traps on anything
+      the witness does not cover;
+    - runs the batch as VOS does;
+    - applies the result with the same code VOS's accumulate runs;
+    - computes the root after, each written row salted from the batch's
+      seed;
+    - exports the workflows' pages and the work result as segments.
+    - Its output is small: the roots, the time, the seed and the
+      result's hash.
+  - **Accumulate:**
+    - swaps the root only from the one it stores, and only for a time
+      within the slot and the session skew;
+    - records the package's exports (the guarantor's segment root),
+      which is how the builder learns where pages live;
+    - solicits the program preimages the package names.
+    - It verifies nothing else: the builder is trusted for the batch's
+      content until proofs (slice 5).
+  - **Root continuity serializes an agent's packages.** The builder
+    chains them, and recovers from a refused, late or foreign package.
+  - **Pages:**
+    - a workflow's pages travel as segments, and the row keeps each
+      page's hash;
+    - a resumed workflow's package imports its pages by segment root,
+      and refine checks them;
+    - DA retention is finite, and a workflow that waits longer cannot
+      resume until pages are re-exported or failed (carried to slice
+      5).
+  - **Programs are derived from the actor's ELF** (section 6.4) and
+    provided as preimages, solicited by the agent.
+  - **Messages between agents on JAM,** as transfers with small memos
+    and payloads in preimages, are not built yet. Each hop would take
+    several blocks.
+  - **Witnessed reads cost gas:** software BLAKE2b runs about 20k gas a
+    compression on JAM, so a witnessed read costs about 190k to 255k gas
+    and a scanned range about 85k a row (slice 4).
   - The Merge lane is VOS-only in v1.
-- Refine witnesses are built by simulating refine off-chain, as CoreVM's
-  builder does. Actor and workflow programs are preimages.
-- Deployment tooling waits until the code preimage is available at the
-  package's lookup anchor; a submission made earlier refines to `BAD` (SJ).
-- **First milestone:** the default agent and one actor deployed on a JAM
-  node, with a workflow suspended in one work package and resumed in a
-  later one. It needs:
-  - the agent framework's loader, which builds inner machines from standard
-    programs (`machine` with bare code, then `pages` and `poke`);
-  - snapshot pages carried through export and import segments;
-  - witnessed state reads on the compressed root format.
+- **The builder** (`vos-jam`):
+  - simulates refine off-chain, recording every key it touches, and
+    builds the witness;
+  - fits each package to the chain's limits and gas;
+  - waits two slots past a program's availability, since an earlier
+    submission refines to an error;
+  - keeps the agent's full state in a persistent store.
+- **The first milestone held on a PolkaJam testnet** (slice 4):
+  - the default agent and two actors ran as a service;
+  - a workflow started in one package resumed across three later ones,
+    its pages exported and imported by segment root;
+  - every read was witnessed, and every package's work result, read
+    back from the chain, equalled a VOS node's byte for byte.
+  - It ran on PolkaJam's interpreter backend; its recompiler needs a
+    kernel setting that is the owner's to grant.
 - **Next:** the per-space aggregate-balance agent that accepts settlement
   proofs (Clerk settlement), once the privacy track's aggregation exists.
 
@@ -1064,16 +1102,19 @@ These form a prover track that runs alongside the core slices (section 16).
   verification on the interpreter.
 - The shared-executor Raft driver keeps vos-raft's core free of threads.
 
-## 14. Performance budgets [decided; measured in run 3 and slices 1 to 3]
+## 14. Performance budgets [decided; measured in run 3 and slices 1 to 4]
 
 | Path | Budget | Measured | Status |
 |---|---|---|---|
 | Actor invocation, refine and accumulate, one node | ≤ 50 µs | the default agent on one node with fjall storage, counter increments under load: 21–24 µs per request on the JIT, 85 µs on the interpreter, plus a 0.9 ms synced commit per batch of 165–210 requests (slice 2) | passes on the JIT; the interpreter, kept for tracing and platforms without the JIT, misses |
-| Committed-map write on the apply path [proposed] | ≤ 5 µs; background root building keeps up with apply | not yet measured; node rows in accumulate would cost 35–45 µs (S4) | needs background roots |
+| Committed-map write on the apply path [proposed] | ≤ 5 µs; background root building keeps up with apply | about 4.3 µs a committed write at 1M keys: accumulate 1.05 µs on the JIT, the store's value and dirty rows 3.2–3.3 µs. The root builder at 20k committed writes a second for 30 s: 19.9k rows a second built, a median build of 137 ms, at most 14 versions behind, caught up in 162 ms (slice 4) | passes; the builder near its capacity, a faster native BLAKE2b its lever |
 | Fixed cost per refine [proposed] | ≤ 50 µs; pooled acquire and reset ≤ 5 µs; a new machine ≤ 50 µs | an empty refine on a kept agent machine 13 µs (JIT) and 10 µs (interpreter); pooled acquire, use and reset 1.6 and 1.1 µs; a new machine 7–10 and about 32 µs (slices 1 and 2) | passes |
 | Replicated agent on 3 LAN nodes, simple mutations | ≥ 20k per second per agent; p99 commit ≤ 10 ms at half load | three node processes over QUIC, signed calls over HTTP (slice 3). The most, closed loop at 256 sessions: 18.6–19.5k/s on the reference pinning, 19.7–20.1k/s with the leader on cores of its own. The half-load p99, open loop: 6.7–14.2 ms in five runs (one of four over HTTP within 10 ms, 8.2 ms over HTTPS), and 7.0–10.9 ms in four with cores of its own (three within 10 ms). The prototype driver's 25k/s at p99 8 ms (S3) was one process, unsigned | at the edge on the laptop: capacity just short or just met; the half-load p99 not met reliably; awaiting a machine of its own |
 | Many active agents per node [proposed] | 64 active agents: ≥ 40k commits per second in total, p99 ≤ 20 ms | three node processes, reference pinning (slice 3): 33.9k/s most at 16 sessions each (p99 45 ms); open loop p99 6.8 ms at 20k/s and 106 ms at 25k/s, so the knee lies between; closed, the nodes 4.6–5.3 of their 6 logical CPUs busy, hyperthreads included | misses on the laptop; awaiting a machine of its own and the owner's contract levers |
-| Workflow snapshot capture plus restore, up to 50 KB | ≤ 1 ms | 3-page suspensions: capture 0.2–0.6 µs (interpreter) and 8–12 µs (JIT, quiet machine; 6–19 µs under load), copying and hashing the pages 10–15 µs, writing them into a pooled machine 0.3 µs (excluding its reset on return, 2.4–3.5 µs, and loading registers, gas and counter); a 2 MiB suspension takes 150–190 µs and about 400 µs to write (slice 1, S1) | passes |
+| Workflow snapshot capture plus restore, up to 50 KB | ≤ 1 ms | through a real workflow step on the JIT, beyond an empty refine: a typical suspension (3 pages restored, 2 captured) 176–252 µs; 50 KB (15 restored, 14 captured) 0.62–0.81 ms on a quiet machine, 1.47 ms under contention (slice 4). Page hashing, one precompile call per 128-byte block, is about a fifth of it. The runtime's own capture and restore are microseconds (slice 1, S1) | passes on a quiet machine, so the leader's live-machine cache is not built |
+| A workflow's resume, a reply in to its step applied [proposed] | — | one node in process, synced commits: median 1.3–1.6 ms, p99 2.1 ms (slice 4). On three processes: carried to slice 5 | measured on one node |
+| Fan-in across nodes [proposed] | — | three nodes over QUIC, one receiving agent: 13.2k messages a second applied from 4 senders, 17.6k from 8; past the receiver's queue, its refine bounds it (97–98% busy, about 1.1 frames a message when nothing drops); after a full queue drains, the receiver asks its dropped senders to resend, so 32 senders' backlog drains in about 5 s, not 9–26 (slice 4) | refine-bound; no frame batching needed |
+| A witnessed read on JAM [proposed] | — | beyond the VOS run, on the JAM-only host at PolkaJam's prices: about 255k gas for a read alone, about 192k each among 64, about 85k a row of a scanned range; a workflow package's own work at most about 4.9M; the milestone's refines 0.26M–41M of a 1e9 limit (slice 4) | far within the refine limit |
 | Table point read or write at 10M rows (host cost) | ≤ 5 µs | write 2.5–3.3 µs; read 2.5–3.2 µs compacted, 5.0–5.2 µs with 620k fresh updates in the memtable and level 0, about 0.1 ms cold (slice 2); read under the 64-agent run's writes at 31–32k inputs/s, over a whole memtable cycle, at the store: mean 2.68–2.72 µs, p99 3.70–3.81 µs, against 2.29–2.34 and 3.54–3.68 alone (slice 3, two runs) | passes compacted and under continuous writes; at the edge behind a bulk of fresh writes to the table itself |
 | Query on a follower | ≤ 100 µs | through a node's query path (executor round trip, snapshot, refine in query mode, one actor): median 49 µs and p99 115–175 µs on the JIT, median 87 µs on the interpreter (slice 2); a follower of three processes (two runs over HTTP, one over HTTPS): p50 0.12–0.23 ms, p99 0.22–0.34 ms client to answer, 86–92 µs of the follower's CPU a query; linearizable, p50 0.36–0.41 ms and 244 µs (slice 3) | open: met at the median, missed at p99; the percentile is the owner's call |
 | Request latency on a quiet node [proposed] | ≤ 5 ms at p99 | one request at a time on one node: about 3 ms in process, the batch's 2 ms linger plus a 0.9 ms synced commit; its execution, 260–340 µs, is idle-core cost (slice 2); three processes over HTTP, one call at a time: p50 2.7 ms, p99 3.3 ms (slice 3) | passes |
