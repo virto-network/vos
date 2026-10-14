@@ -875,6 +875,139 @@ on it.
 - A recipe, `just jam-milestone`. It is outside `ci`, because it needs
   the PolkaJam binaries.
 
+### 4.9b One actor, one ELF [owner decisions 10–12; reviewed by Fable]
+
+**For the developer:**
+- One crate per actor, built once with plain `cargo build`. The SDK
+  ships the toolchain file, the cargo configuration, the target spec and
+  the linker script as a template.
+- That gives one ELF, published as it is (`vos publish actor.elf`). No
+  program per workflow, no crate per attestable, no linking by hand,
+  nothing declared beyond the macros.
+
+**What the ELF carries:**
+- the actor's entry, which routes by method to a command, a query or a
+  workflow, as handlers are routed today;
+- one entry symbol per attestable method (`__vos_attest_<method>`);
+- the actor's schema (methods, kinds, roles, gas limits), which the
+  macros generate into a section of its own, so the ELF describes
+  itself.
+
+**What the platform derives from it, once, at install:**
+- **The actor's program:** the ELF linked from the actor's entry and
+  transpiled to PVM. Its workflows are in it: a workflow's machine
+  starts at the program's entry with an input naming the workflow
+  method, and the entry routes there.
+- **One kernel per attestable method:**
+  - the ELF linked from that method's entry symbol alone, following
+    every call and data reference its relocations name, so only the
+    code it can reach is in it;
+  - a static check that the reachable code makes no host call but the
+    precompiles, refusing the install otherwise;
+  - one kernel per method, so a method's proof pins a hash that changes
+    only when its own code does.
+- **Reachability follows relocations only:**
+  - the target builds position-independent code with `--emit-relocs`;
+    an ELF without relocations is refused;
+  - calls, tail calls, address-taken functions, vtables, function
+    pointers in data, switch tables and the builtins all reach their
+    targets through relocations under this toolchain, and safe Rust
+    cannot compute a code address;
+  - the linker's heuristic scan for code-like values in data, kept for
+    stripped ELFs, may add targets but never justifies pruning one;
+  - a code pointer whose target was pruned is rewritten to an address
+    outside the kernel's jump table, so jumping to it panics.
+  - So a missed target can only trap, never run something else, and
+    the data the kernel reaches comes with it through the same
+    relocations.
+  - Over-approximation is harmless: an unreachable branch of a shared
+    helper still pulls its callee in. If that callee makes a host call
+    other than a precompile, the install is refused, and the error names
+    the chain of symbols from the entry to the call.
+- **The install record:** the actor program's hash, each kernel's hash
+  by method, the schema, the transpiler's version, and the ELF's hash
+  for provenance.
+- **Bit-reproducible:** the same ELF and transpiler version give the same
+  bytes on any machine, because the VOS installing node and the JAM
+  builder must agree whenever a space's proof is verified on chain. The
+  output's order comes from sorted sections and symbols, never from a
+  map's iteration. A test derives the test actors twice, on different
+  machines, and compares them.
+
+**Identity:**
+- The PVM program's hash is the identity everywhere: pins, workflows'
+  snapshots, proofs, JAM preimages.
+- An installed program is never transpiled again: a newer transpiler
+  would change bytes that running workflows and proofs refer to. A
+  re-publish is an upgrade, and running workflows keep the program they
+  pin. On JAM, the builder keeps a program's preimage solicited while
+  any live workflow names it.
+- **A kernel's hash on chain is pinned per transpiler version:** a
+  transpiler upgrade means re-pinning the verifiers. That is the simpler
+  of the two choices; the other is to pin the ELF's hash and a version
+  and derive at verification. Slice 5 may revisit it.
+
+**Where the derivation runs:**
+- **On VOS,** the node that takes the install derives the programs
+  before proposing it. The log carries their hashes, and the replicas
+  fetch the programs as blobs, as installs do today. The space's nodes
+  trust each other, so no two node versions need agree on a
+  transpilation.
+- **On JAM,** validators run PVM only, so the builder derives the same
+  programs with the same transpiler and provides them as preimages.
+- `vos publish` prints the hashes either way, so a developer sees when
+  a kernel's hash moved. rustc can change a kernel's machine code when
+  unrelated code changes, through inlining, so its hash is far more
+  stable than the whole program's but not fixed.
+
+**The node now parses uploaded ELFs:**
+- fuzzed;
+- bounded in size (the install body's cap), sections, symbols and
+  relocations;
+- run off the node's runtime thread;
+- a panic in parsing or linking fails the install and never halts the
+  node. The operator is trusted, but the toolchain that made the ELF is
+  not part of that trust.
+- `#[inline(never)]` on each generated `__vos_attest_<method>` entry,
+  and `codegen-units = 1` in the SDK's cargo configuration, make a
+  kernel's code move less with unrelated changes.
+
+**`ctx.read(|actor: &Self| ..)` and `ctx.update(|actor: &mut Self| ..)`**
+[owner decision 11]:
+- **Synchronous sections** on the starting instance's state, tables
+  included:
+  - the SDK opens a section with a host call naming the instance;
+  - the agent serves that instance's state operations to the workflow's
+    machine until the section closes;
+  - the closure runs, and the section closes.
+- **Atomic, holding nothing across a pause:** a closure is not `async`
+  and holds no context, so it can neither await nor call. State is read
+  afresh after every await.
+- **Runs as the instance itself,** with no role check, as the actor's
+  own code.
+- **Counts as an effect** for preemption, commits with the step, and on
+  JAM its rows are witnessed like any. A `read` counts too: a value
+  read and then updated within one unit stays atomic across a
+  preemption.
+  - A workflow that reads, computes long, then updates cannot keep that
+    atomicity: it must pause between, re-reading after. The doc shows
+    the pattern: a short computation goes inside one `update`.
+- **Enforced at run time, not only by types:** inside an open section
+  the agent serves only that instance's `GET`, `PUT`, `DELETE` and
+  `SCAN`, plus `NOW` and `LOG`. A `CALL`, `SEND`, `REQUEST`, `RESULT`,
+  `SLEEP`, or a second open, traps the step, since `host::send` is a
+  public function.
+
+**What goes away:**
+- `workflow_program!`, `attestable_program!`;
+- the per-workflow and per-attestable crates in the test actors;
+- `--workflow` and `--attestable` at install.
+- Snapshots stay as small: a page unchanged from the program's image is
+  never stored.
+- The workflow's writable runs are the actor program's, heap included,
+  so arming (200 gas a page, every step) follows the heap the actor
+  configures.
+
 ### 4.10 Acceptance
 
 - The section 14 rows: committed writes and the builder keeping up,
@@ -956,6 +1089,15 @@ the builder 3,000, the rest 1,000 each or less.
    - so an actor that scans its tables runs on JAM too.
 9. **A finished workflow's result is kept an hour** for its owner to
    read, then collected, and it reads `Unknown` like a stranger's id.
+10. **One actor, one ELF:** the developer builds one ELF and publishes
+    it. The platform derives at install the actor's program (its
+    workflows in it, routed by method) and one kernel per attestable
+    method by reachability, transpiled once and pinned (4.9b).
+11. **A workflow reaches its actor's state** through `ctx.read` and
+    `ctx.update`, synchronous and atomic, never across an await (4.9b).
+12. **The ELF is the upload format:** VOS's installing node, or JAM's
+    builder, links and transpiles it; the developer runs only the Rust
+    compiler.
 
 **Decision 5: preemption.** Section 8.3's effect-free preemption,
 built on this slice's snapshots instead of on live machines, with the
@@ -1036,6 +1178,16 @@ awaits as the pause points:
   it) and on both of our backends, before 4.5 builds on it.
 
 **Core-model edits these decisions make,** amended with the plan:
+- §6.4: a package is the ELF. The install record holds the derived
+  program and kernel hashes, the schema and the transpiler's version.
+  Packages are content-addressed by the ELF, and derived hashes are per
+  transpiler version, so two spaces agree on a kernel's hash only when
+  they derive with the same version (decisions 10, 12).
+- §6.5: workflows read and write their actor's Linear state, through
+  sections only (decision 11).
+- §11.1: an attestable method is "derived from the actor's ELF by
+  reachability from its entry", no longer "compiled into its own small
+  program" (decision 10).
 - §8.2 "Its result is sent to whoever started it" becomes: answered
   `Started(id)`, the result read by id (decision 3).
 - §8.3 "The leader caches live machines" becomes conditional on the
