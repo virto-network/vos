@@ -3,7 +3,7 @@
 use alloc::vec::Vec;
 use scale::{Decode, Encode};
 
-use crate::abi::Failure;
+use crate::abi::{Failure, Kind};
 use crate::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, Session, WorkflowId};
 use crate::ingress::Grant;
 use crate::result::Outcome;
@@ -166,14 +166,15 @@ impl From<Outcome> for Answer {
 /// An operator command, applied through the log like any input.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum Admin {
-    /// Install a package as an instance: its actor program, the program
-    /// bound to each attestable method, and the agent's role byte for each
-    /// role name the schema uses.
+    /// Install a package as an instance: its actor program, the programs
+    /// beside it, each bound to a method of its kind, an attestable or a
+    /// workflow, and the agent's role byte for each role name the schema
+    /// uses.
     #[codec(index = 0)]
     Install {
         instance: InstanceId,
         program: ProgramHash,
-        attestables: Vec<(MethodId, ProgramHash)>,
+        beside: Vec<(MethodId, Kind, ProgramHash)>,
         roles: Vec<(Vec<u8>, u8)>,
     },
     /// Grant a principal a role in this agent, or (`None`) revoke it, as

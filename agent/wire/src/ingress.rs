@@ -8,7 +8,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use scale::{Decode, Encode};
 
-use crate::abi::Refusal;
+use crate::abi::{Kind, Refusal};
 use crate::ids::{AgentId, InstanceId, MethodId, Principal, Session};
 use crate::peer::{CreationRecord, NodeNumber};
 use crate::result::Outcome;
@@ -75,12 +75,14 @@ pub enum Consistency {
     Linearizable,
 }
 
-/// The operator's `POST /agents/{agent}/install`.
+/// The operator's `POST /agents/{agent}/install`: the actor program, and
+/// the programs beside it, each bound to a method of its kind, an
+/// attestable or a workflow.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Install {
     pub instance: InstanceId,
     pub program: Vec<u8>,
-    pub attestables: Vec<(MethodId, Vec<u8>)>,
+    pub beside: Vec<(MethodId, Kind, Vec<u8>)>,
     pub roles: Vec<(Vec<u8>, u8)>,
 }
 

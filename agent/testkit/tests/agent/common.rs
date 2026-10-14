@@ -5,14 +5,14 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use vos_pvm::ExitReason;
 use vos_pvm::accumulate_host::{AccumulateContext, ServiceStorage};
 use vos_pvm::pool::MachinePool;
 use vos_pvm::refine::{Invocation, Machine, MemoryModel, PreparedProgram};
 use vos_pvm::refine_host::{RefineContext, StateReader};
+use vos_pvm::{ExitReason, PvmBackend};
 use vos_testkit::programs::{actor, agent, method};
 use vos_testkit::{Testkit, decode, program_hash};
-use vos_wire::abi::{Failure, Refusal, cap, code};
+use vos_wire::abi::{Failure, Kind, Refusal, cap, code};
 use vos_wire::batch::{Admin, Batch, Input, Query, Request, Work};
 use vos_wire::ids::{
     AgentId, InstanceId, MethodId, Principal, ProgramHash, Session, SessionId, SessionRef,
@@ -70,13 +70,24 @@ impl ServiceStorage for Storage<'_> {
     }
 }
 
+/// What PolkaJam charges for a call it does not serve (step 4.0).
+pub const JAM_UNSERVED_GAS: u64 = 1_000;
+
 /// `historical_lookup` from the node's programs; every other call the host
-/// does not serve answers `WHAT`.
-fn serve(id: u64, machine: &mut Machine, programs: &HashMap<[u8; 32], Vec<u8>>) {
+/// does not serve answers `WHAT`, at `unserved` gas.
+fn serve(
+    id: u64,
+    machine: &mut Machine,
+    programs: &HashMap<[u8; 32], Vec<u8>>,
+    unserved: u64,
+) -> Result<(), ExitReason> {
     let registers = *machine.registers();
     if id != 7 {
+        if !machine.charge(unserved) {
+            return Err(ExitReason::OutOfGas);
+        }
         machine.registers_mut()[7] = code::WHAT;
-        return;
+        return Ok(());
     }
     let mut hash = [0u8; 32];
     assert!(
@@ -97,6 +108,7 @@ fn serve(id: u64, machine: &mut Machine, programs: &HashMap<[u8; 32], Vec<u8>>) 
         }
         None => machine.registers_mut()[7] = code::NONE,
     }
+    Ok(())
 }
 
 /// A node's view of one agent: its program, the pool, programs by hash and
@@ -109,6 +121,11 @@ pub struct Node {
     /// Whether refine may read applied state; a JAM node cannot until
     /// witnesses.
     serves_state: bool,
+    /// Whether the host computes the agent's precompiles; a JAM node does
+    /// not.
+    precompiles: bool,
+    /// The gas a call the host does not serve costs.
+    unserved: u64,
     programs: HashMap<[u8; 32], Vec<u8>>,
     pub state: BTreeMap<Vec<u8>, Vec<u8>>,
     pub version: u64,
@@ -119,6 +136,8 @@ impl Node {
         Self::with(true, true)
     }
 
+    /// A VOS node's host, with or without a pool and applied state. With
+    /// neither it is a JAM node's, which computes no precompile.
     pub fn with(pool: bool, serves_state: bool) -> Self {
         // Preparing the agent takes most of a test's setup: once a run.
         static AGENT: std::sync::OnceLock<Arc<PreparedProgram>> = std::sync::OnceLock::new();
@@ -127,9 +146,22 @@ impl Node {
             program: Arc::clone(program),
             pool: pool.then(|| Arc::new(MachinePool::new())),
             serves_state,
+            precompiles: pool || serves_state,
+            unserved: 0,
             programs: HashMap::new(),
             state: BTreeMap::new(),
             version: 0,
+        }
+    }
+
+    /// A JAM node's host: no pool, no precompile computed, and PolkaJam's
+    /// price for a call it does not serve. With `serves_state`, it reads
+    /// applied state as the witnesses of JAM mode will give it.
+    pub fn jam(serves_state: bool) -> Self {
+        Self {
+            precompiles: false,
+            unserved: JAM_UNSERVED_GAS,
+            ..Self::with(false, serves_state)
         }
     }
 
@@ -151,11 +183,22 @@ impl Node {
     /// A batch of `inputs` at `time`, at the agent's next version, seeded
     /// with `seed`.
     pub fn seeded_work(&self, time: u64, seed: [u8; 32], inputs: Vec<Input>) -> Work {
+        self.budgeted_work(time, seed, OUTER_GAS, inputs)
+    }
+
+    /// [`Node::seeded_work`] with a budget of `budget`.
+    pub fn budgeted_work(
+        &self,
+        time: u64,
+        seed: [u8; 32],
+        budget: u64,
+        inputs: Vec<Input>,
+    ) -> Work {
         Work::Batch(Batch {
             version: self.version,
             time,
             seed,
-            budget: OUTER_GAS,
+            budget,
             inputs,
         })
     }
@@ -170,15 +213,28 @@ impl Node {
         invocation.output_bounded(cap::WORK_RESULT).unwrap()
     }
 
-    pub fn run_refine(&self, work: &Work, gas: u64) -> Invocation {
-        let arguments = RefineArgs {
+    /// The refine's arguments for `work`, as the node passes them.
+    pub fn arguments(&self, work: &Work) -> Vec<u8> {
+        RefineArgs {
             core: 0,
             item: 0,
             service: u64::from(AGENT.0),
             payload: work.encode(),
             package_hash: [0; 32],
         }
-        .encode();
+        .encode()
+    }
+
+    /// Refine `work` with `gas` and, as a node gives it, what decoding a
+    /// batch may take beyond it.
+    pub fn run_refine(&self, work: &Work, gas: u64) -> Invocation {
+        let arguments = self.arguments(work);
+        let gas = match work {
+            Work::Batch(batch) => {
+                gas + vos_wire::defaults::refine_start(batch.inputs.len(), arguments.len())
+            }
+            Work::Query(_) => gas,
+        };
         let mut context =
             RefineContext::load_prepared(&self.program, &arguments, gas, MemoryModel::Auto)
                 .unwrap();
@@ -188,15 +244,33 @@ impl Node {
         if self.serves_state {
             context = context.with_state(Arc::new(Snapshot(self.state.clone())));
         }
-        if self.pool.is_none() && !self.serves_state {
-            // A JAM node: no pool, no state, and no precompile computed.
+        if !self.precompiles {
             context = context.without_precompiles();
         }
         context
-            .try_run_with_host(|id, machine| {
-                serve(id, machine, &self.programs);
-                Ok(())
-            })
+            .try_run_with_host(|id, machine| serve(id, machine, &self.programs, self.unserved))
+            .unwrap()
+    }
+
+    /// Run `program`, an outer program like the agent, on `arguments` with
+    /// this node's host and `backend`.
+    pub fn run_outer(&self, program: &[u8], arguments: &[u8], backend: PvmBackend) -> Invocation {
+        let mut context = RefineContext::load_with_backend(
+            program,
+            arguments,
+            OUTER_GAS,
+            MemoryModel::Auto,
+            backend,
+        )
+        .unwrap();
+        if let Some(pool) = &self.pool {
+            context = context.with_pool(Arc::clone(pool));
+        }
+        if !self.precompiles {
+            context = context.without_precompiles();
+        }
+        context
+            .try_run_with_host(|id, machine| serve(id, machine, &self.programs, self.unserved))
             .unwrap()
     }
 
@@ -292,12 +366,14 @@ impl Node {
     }
 }
 
-/// The test actors, installed in a node and a testkit alike.
+/// The test actors, installed in a node and a testkit alike, and the
+/// ledger's programs beside its own.
 pub struct Actors {
     pub counter: Vec<u8>,
     pub ledger: Vec<u8>,
     pub caller: Vec<u8>,
     pub checksum: Vec<u8>,
+    pub tally: Vec<u8>,
 }
 
 impl Actors {
@@ -307,7 +383,43 @@ impl Actors {
             ledger: actor("ledger"),
             caller: actor("caller"),
             checksum: actor("checksum"),
+            tally: actor("tally"),
         }
+    }
+
+    /// The ledger's install in `node`, which stores its programs: the
+    /// attestable's and the workflow's beside its own.
+    pub fn install_ledger(&self, node: &mut Node) -> Input {
+        let ledger = node.add(&self.ledger);
+        let checksum = node.add(&self.checksum);
+        let tally = node.add(&self.tally);
+        Input::Admin(Admin::Install {
+            instance: LEDGER,
+            program: ledger,
+            beside: vec![
+                (method(&self.ledger, "checksum"), Kind::Attestable, checksum),
+                (method(&self.ledger, "tally"), Kind::Workflow, tally),
+            ],
+            roles: vec![(b"minter".to_vec(), MINTER)],
+        })
+    }
+
+    /// The ledger's install in a testkit.
+    pub fn install_ledger_in(&self, kit: &mut Testkit) {
+        kit.install(
+            LEDGER,
+            &self.ledger,
+            &[
+                (
+                    method(&self.ledger, "checksum"),
+                    Kind::Attestable,
+                    &self.checksum,
+                ),
+                (method(&self.ledger, "tally"), Kind::Workflow, &self.tally),
+            ],
+            &[("minter", MINTER)],
+        )
+        .unwrap();
     }
 
     pub fn method(&self, instance: InstanceId, name: &str) -> MethodId {
@@ -323,20 +435,13 @@ impl Actors {
     /// batch of admin inputs and in the testkit directly.
     pub fn install(&self, node: &mut Node, kit: &mut Testkit) {
         let counter = node.add(&self.counter);
-        let ledger = node.add(&self.ledger);
         let caller = node.add(&self.caller);
-        let checksum = node.add(&self.checksum);
-        let audit = method(&self.ledger, "checksum");
+        let ledger = self.install_ledger(node);
         let result = node.batch(
             0,
             vec![
                 install(COUNTER, counter),
-                Input::Admin(Admin::Install {
-                    instance: LEDGER,
-                    program: ledger,
-                    attestables: vec![(audit, checksum)],
-                    roles: vec![(b"minter".to_vec(), MINTER)],
-                }),
+                ledger,
                 install(CALLER, caller),
                 Input::Admin(Admin::SetRole(Grant {
                     principal: ALICE,
@@ -348,13 +453,7 @@ impl Actors {
             ran_done(step);
         }
         kit.install(COUNTER, &self.counter, &[], &[]).unwrap();
-        kit.install(
-            LEDGER,
-            &self.ledger,
-            &[(audit, &self.checksum)],
-            &[("minter", MINTER)],
-        )
-        .unwrap();
+        self.install_ledger_in(kit);
         kit.install(CALLER, &self.caller, &[], &[]).unwrap();
         kit.set_role(ALICE, Some(MINTER));
     }
@@ -439,7 +538,7 @@ pub fn install(instance: InstanceId, program: ProgramHash) -> Input {
     Input::Admin(Admin::Install {
         instance,
         program,
-        attestables: vec![],
+        beside: vec![],
         roles: vec![],
     })
 }

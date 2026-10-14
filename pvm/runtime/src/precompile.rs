@@ -8,9 +8,12 @@
 //! leaves every register unchanged; φ[7] holds an input pointer, never
 //! `WHAT`, so the guest can tell the two apart.
 //!
-//! The refine host serves precompiles in place, inside the current machine
-//! slice, for the outer machine and for inner machines alike, and reports
-//! each call so a proof tracer can attach the matching chip rows.
+//! The refine host serves the outer machine's precompiles in place, inside
+//! the current machine slice, and reports each call so a proof tracer can
+//! attach the matching chip rows. An inner machine's precompile call exits
+//! to the outer machine as a host call, on every host: the agent serves it
+//! at the same price, natively through its own call here or in software on
+//! JAM, and writes its output through the agent's tracked writes.
 
 /// One BLAKE2b compression: φ[7] = h pointer (64 bytes, read and written),
 /// φ[8] = m pointer (128 bytes, read), φ[9] = counter low 64 bits,
@@ -25,7 +28,8 @@ pub const BLAKE2B_COMPRESS: u64 = 0x400;
 /// same hash in software inside the guest costs about 15,900 gas.
 pub const BLAKE2B_COMPRESS_GAS: crate::Gas = 600;
 
-/// Whether `id` names a precompile the refine host serves in place.
+/// Whether `id` names a precompile the refine host serves in place for the
+/// outer machine.
 pub const fn is_precompile(id: u64) -> bool {
     id == BLAKE2B_COMPRESS
 }

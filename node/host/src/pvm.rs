@@ -15,7 +15,7 @@ use vos_wire::batch::Work;
 use vos_wire::ids::AgentId;
 use vos_wire::jam::{AccumulateInput, Operand, RefineArgs};
 use vos_wire::result::Write;
-use vos_wire::{Decode, Encode};
+use vos_wire::{Decode, Encode, defaults};
 
 use crate::blobs::Blobs;
 use crate::store::Snapshot;
@@ -113,7 +113,8 @@ impl ProgramSource for AgentPrograms {
     }
 }
 
-/// Run the agent's refine on `work` for `agent`: its output, if it halts,
+/// Run the agent's refine on `work` for `agent` with `gas`, and a batch's
+/// decoding beyond it (`defaults::refine_start`): its output, if it halts,
 /// and the gas the run used.
 pub(crate) fn refine(
     program: &OuterMachines,
@@ -132,6 +133,10 @@ pub(crate) fn refine(
         package_hash: [0; 32],
     }
     .encode();
+    let gas = match work {
+        Work::Batch(batch) => gas + defaults::refine_start(batch.inputs.len(), arguments.len()),
+        Work::Query(_) => gas,
+    };
     let invocation = RefineContext::new(program.load(REFINE_ENTRY, &arguments, gas)?)
         .with_pool(Arc::clone(pool))
         .with_programs(Arc::new(AgentPrograms {

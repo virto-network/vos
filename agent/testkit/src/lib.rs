@@ -40,8 +40,13 @@ pub fn program_hash(blob: &[u8]) -> ProgramHash {
 pub enum InstallError {
     NotAProgram,
     Schema(SchemaError),
-    /// An attestable method has no program bound.
+    /// An attestable or workflow method has no program bound.
     Unbound(MethodId),
+    /// A program is bound to no method of its kind, an attestable or a
+    /// workflow.
+    Unmatched(MethodId),
+    /// A method has two programs bound.
+    Duplicate(MethodId),
     /// A role name the schema uses has no role byte.
     UnmappedRole(Vec<u8>),
 }
@@ -50,7 +55,22 @@ struct Installed {
     program: Vec<u8>,
     schema: Schema,
     roles: BTreeMap<Vec<u8>, u8>,
-    attestables: BTreeMap<MethodId, Vec<u8>>,
+    /// The programs beside the actor's, each bound to a method of its kind.
+    beside: Vec<(MethodId, Kind, Vec<u8>)>,
+}
+
+impl Installed {
+    fn bound(&self, method: MethodId, kind: Kind) -> Option<&[u8]> {
+        self.beside
+            .iter()
+            .find(|(bound, of, _)| *bound == method && *of == kind)
+            .map(|(_, _, program)| program.as_slice())
+    }
+}
+
+/// Whether a method of `kind` runs as its own program, never as a handler.
+fn has_own_program(kind: Kind) -> bool {
+    matches!(kind, Kind::Attestable | Kind::Workflow)
 }
 
 /// What one step produced: as a work result's step, applied to the
@@ -100,13 +120,13 @@ impl Testkit {
         }
     }
 
-    /// Install an actor program, binding its attestable methods to their
-    /// programs and its role names to role bytes.
+    /// Install an actor program, binding its attestable and workflow methods
+    /// to their programs and its role names to role bytes.
     pub fn install(
         &mut self,
         instance: InstanceId,
         program: &[u8],
-        attestables: &[(MethodId, &[u8])],
+        beside: &[(MethodId, Kind, &[u8])],
         roles: &[(&str, u8)],
     ) -> Result<(), InstallError> {
         let parsed =
@@ -116,12 +136,28 @@ impl Testkit {
             .iter()
             .map(|(name, role)| (name.as_bytes().to_vec(), *role))
             .collect();
-        let attestables: BTreeMap<MethodId, Vec<u8>> = attestables
-            .iter()
-            .map(|(method, blob)| (*method, blob.to_vec()))
-            .collect();
+        let installed = Installed {
+            program: program.to_vec(),
+            schema,
+            roles,
+            beside: beside
+                .iter()
+                .map(|(method, kind, blob)| (*method, *kind, blob.to_vec()))
+                .collect(),
+        };
+        let (schema, roles) = (&installed.schema, &installed.roles);
+        for (index, (method, kind, _)) in beside.iter().enumerate() {
+            if !has_own_program(*kind)
+                || schema.method(*method).map(|bound| bound.kind) != Some(*kind)
+            {
+                return Err(InstallError::Unmatched(*method));
+            }
+            if beside[..index].iter().any(|(bound, ..)| bound == method) {
+                return Err(InstallError::Duplicate(*method));
+            }
+        }
         for method in &schema.methods {
-            if method.kind == Kind::Attestable && !attestables.contains_key(&method.id) {
+            if has_own_program(method.kind) && installed.bound(method.id, method.kind).is_none() {
                 return Err(InstallError::Unbound(method.id));
             }
             if let Some(role) = &method.role
@@ -130,15 +166,7 @@ impl Testkit {
                 return Err(InstallError::UnmappedRole(role.clone()));
             }
         }
-        self.instances.insert(
-            instance,
-            Installed {
-                program: program.to_vec(),
-                schema,
-                roles,
-                attestables,
-            },
-        );
+        self.instances.insert(instance, installed);
         Ok(())
     }
 
@@ -406,8 +434,7 @@ impl<'a> Run<'a> {
         }
         let installed = self.kit.instances.get(&instance).ok_or(Failure::Unknown)?;
         let schema = installed.schema.method(method).ok_or(Failure::Unknown)?;
-        if schema.kind == Kind::Attestable
-            || (self.kind == Kind::Query && schema.kind != Kind::Query)
+        if has_own_program(schema.kind) || (self.kind == Kind::Query && schema.kind != Kind::Query)
         {
             return Err(Failure::Unknown);
         }
@@ -659,7 +686,7 @@ impl<'a> Run<'a> {
                     .and_then(|installed| installed.schema.method(method))
                     .map(|schema| schema.kind)
                     .ok_or(Failure::Unknown)?;
-                if callee_kind == Kind::Attestable
+                if has_own_program(callee_kind)
                     || (kind == Kind::Query && callee_kind != Kind::Query)
                 {
                     return Err(Failure::Trapped);
@@ -730,7 +757,7 @@ impl<'a> Run<'a> {
                     .kit
                     .instances
                     .get(&instance)
-                    .and_then(|installed| installed.attestables.get(&method))
+                    .and_then(|installed| installed.bound(method, Kind::Attestable))
                     .ok_or(Failure::Unknown)?;
                 let gas = machine.gas_remaining();
                 let (output, used) = attestable(program, &call_arguments, gas)?;
@@ -826,8 +853,8 @@ fn read_key(machine: &mut Machine, address: u64, len: u64) -> Result<Vec<u8>, Fa
     }
 }
 
-/// Serve a precompile as the node's machines do: its price, then its work
-/// on the actor's memory.
+/// Serve a precompile as the agent serves its machines': the node's price,
+/// then its work on the actor's memory.
 fn precompile(machine: &mut Machine, id: u64) -> Result<(), Failure> {
     if !machine.charge(vos_pvm::precompile::price(id).unwrap_or(0)) {
         return Err(Failure::OutOfGas);

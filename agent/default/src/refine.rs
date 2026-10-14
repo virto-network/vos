@@ -4,9 +4,9 @@
 use alloc::collections::BTreeMap;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
 
-use vos_wire::abi::{self, Failure, Kind, Refusal, Rows, cap, code, op, price};
+use vos_wire::abi::{self, Failure, Kind, Refusal, Rows, cap, code, op, precompile, price};
 use vos_wire::batch::{Admin, Await, Batch, Body, Input, Message, Query, Request, Work};
 use vos_wire::ids::{
     AgentId, InstanceId, MethodId, Principal, ProgramHash, Session, SessionId, SessionRef,
@@ -43,6 +43,45 @@ pub fn run(arguments: &[u8]) -> Vec<u8> {
     match work {
         Work::Batch(batch) => run_batch(agent, batch),
         Work::Query(query) => run_query(agent, query).encode(),
+    }
+}
+
+/// The refine's gas as the agent accounts for it, from the batch and state
+/// alone, never from `gas`, whose readings differ between hosts: what the
+/// batch's budget leaves once the dispatched steps are taken. So every host
+/// dispatches the same steps.
+struct Meter {
+    left: Cell<u64>,
+    /// What the running step keeps of `left`: its reserve, its handler's
+    /// limit and the finish. The installed records it reads first and its
+    /// served precompiles take from above it.
+    kept: Cell<u64>,
+    /// A charge found nothing above `kept`.
+    overrun: Cell<bool>,
+}
+
+impl Meter {
+    fn new(left: u64) -> Self {
+        Self {
+            left: Cell::new(left),
+            kept: Cell::new(0),
+            overrun: Cell::new(false),
+        }
+    }
+
+    /// Take `gas` before the agent spends it; false, the step overrun, when
+    /// what lies above what the step keeps cannot pay it.
+    fn take(&self, gas: u64) -> bool {
+        match self.left.get().checked_sub(gas) {
+            Some(left) if left >= self.kept.get() => {
+                self.left.set(left);
+                true
+            }
+            _ => {
+                self.overrun.set(true);
+                false
+            }
+        }
     }
 }
 
@@ -153,6 +192,7 @@ struct Base {
     agent: AgentId,
     time: u64,
     seed: [u8; 32],
+    meter: Meter,
     /// Writes of the steps already committed in this refine, in order.
     earlier: Overlay,
     /// Installed records read in this refine. Only admin steps change
@@ -169,11 +209,22 @@ impl Base {
         }
     }
 
-    fn installed(&self, instance: InstanceId) -> Result<Option<Rc<Installed>>, Corrupt> {
+    /// An instance's installed record. Read the first time in a refine, it
+    /// is paid first, by its length ([`defaults::RECORD_BYTE`]): out of gas
+    /// when the meter cannot pay it.
+    fn installed(&self, instance: InstanceId) -> Result<Option<Rc<Installed>>, Failure> {
         if let Some(cached) = self.installed.borrow().get(&instance) {
             return Ok(cached.clone());
         }
-        let installed = match self.read(&keys::installed(instance))? {
+        let key = keys::installed(instance);
+        let len = match self.earlier.get(&key) {
+            Some(value) => value.as_ref().map_or(0, Vec::len),
+            None => state_read_into(&key, &mut []).unwrap_or(0),
+        };
+        if !self.meter.take(defaults::RECORD_BYTE * len as u64) {
+            return Err(Failure::OutOfGas);
+        }
+        let installed = match self.read(&key)? {
             Some(bytes) => Some(Rc::new(Installed::decode(&bytes).map_err(|_| Corrupt)?.0)),
             None => None,
         };
@@ -327,11 +378,21 @@ fn admit(
     (input, admitted)
 }
 
+/// Run a batch's inputs as steps, within its budget.
 fn run_batch(agent: AgentId, batch: Batch) -> Vec<u8> {
+    // The one reading of `gas`. A node gives a refine its batch's budget and
+    // what decoding the batch may take (`defaults::refine_start`), so the
+    // budget is left now; a refine given less traps rather than run out
+    // partway, and nothing else depends on the reading.
+    assert!(
+        gas() >= batch.budget,
+        "the refine's gas does not cover its budget"
+    );
     let mut base = Base {
         agent,
         time: batch.time,
         seed: batch.seed,
+        meter: Meter::new(batch.budget),
         earlier: BTreeMap::new(),
         installed: RefCell::new(BTreeMap::new()),
     };
@@ -339,30 +400,49 @@ fn run_batch(agent: AgentId, batch: Batch) -> Vec<u8> {
     let mut pairs: BTreeMap<AgentId, u64> = BTreeMap::new();
     let mut counts = Counts::default();
     let mut result = ResultWriter::new(batch.version, batch.time, batch.seed);
+    // Whether a step in the result ran a handler.
+    let mut handled = false;
     for (index, input) in batch.inputs.into_iter().enumerate() {
         let index = index as u32;
-        // Dispatch only what the refine's gas can finish. The reserve comes
-        // first: reading an input's installed record can cost most of it.
+        // Dispatch only what the budget can finish, by the meter: the
+        // input's reserve first, then its handler's limit, once its
+        // installed record, paid for above the reserve, gives it.
+        let handler = matches!(
+            &input,
+            Input::Request(_)
+                | Input::Message(Message {
+                    body: Body::Call { .. },
+                    ..
+                })
+        );
         let reserve = match input {
+            _ if handler => defaults::STEP_RESERVE,
             Input::Admin(_) => defaults::INSTALL_RESERVE,
-            _ => defaults::STEP_RESERVE,
-        } + defaults::FINISH_RESERVE;
-        if gas() < reserve {
+            Input::Sweep => defaults::SWEEP_RESERVE,
+            _ => defaults::INPUT_RESERVE,
+        };
+        base.meter.kept.set(reserve + defaults::FINISH_RESERVE);
+        if base.meter.left.get() < base.meter.kept.get() {
             break;
         }
         let limit = match &input {
             Input::Request(request) => limit(&base, request.instance, request.method),
-            Input::Message(message) => match &message.body {
-                Body::Call {
+            Input::Message(Message {
+                body: Body::Call {
                     instance, method, ..
-                } => limit(&base, *instance, *method),
-                Body::Reply { .. } => 0,
-            },
-            Input::Failed { .. } | Input::Admin(_) | Input::Ack { .. } | Input::Sweep => 0,
+                },
+                ..
+            }) => limit(&base, *instance, *method),
+            _ => Some(0),
         };
-        if gas() < limit + reserve {
+        let Some(limit) = limit else {
+            break;
+        };
+        let kept = reserve + limit + defaults::FINISH_RESERVE;
+        if base.meter.left.get() < kept {
             break;
         }
+        base.meter.kept.set(kept);
         let admin = matches!(input, Input::Admin(_));
         // The key of a session this step creates.
         let mut creates = None;
@@ -402,11 +482,23 @@ fn run_batch(agent: AgentId, batch: Batch) -> Vec<u8> {
             Input::Ack { to, sequence } => (acknowledge(to, sequence), None),
             Input::Sweep => (sweep(base.time), None),
         };
-        // A step the result cannot hold waits, with every later input, for
-        // the next batch; one alone always fits (`cap::STEP_RESULT`).
-        if !result.push(&step) {
+        // A step that overran the budget, reading records or serving
+        // precompiles, waits with every later input for the next batch
+        // behind a step that ran a handler. With none before it, only inputs
+        // that run none came first, a sweep or acknowledgements, which leave
+        // it as little room in any batch: it fails, consumed. A step the
+        // result cannot hold waits too; one alone always fits
+        // (`cap::STEP_RESULT`).
+        if (base.meter.overrun.get() && handled) || !result.push(&step) {
             break;
         }
+        base.meter.overrun.set(false);
+        handled |= handler && matches!(step, Step::Ran(_));
+        let used = match &step {
+            Step::Ran(run) => run.gas_used,
+            _ => 0,
+        };
+        base.meter.left.set(base.meter.left.get() - reserve - used);
         if let Some(key) = creates {
             counts.add(&key);
         }
@@ -437,16 +529,21 @@ fn run_batch(agent: AgentId, batch: Batch) -> Vec<u8> {
 }
 
 /// The gas limit a handler's schema requests, capped; 0 for an input that
-/// will fail before running.
-fn limit(base: &Base, instance: InstanceId, method: MethodId) -> u64 {
-    base.installed(instance)
-        .ok()
-        .flatten()
-        .and_then(|installed| installed.schema.method(method).map(|schema| schema.gas))
-        .map_or(0, |gas| {
-            gas.unwrap_or(defaults::HANDLER_GAS)
-                .min(defaults::MAX_HANDLER_GAS)
-        })
+/// will fail before running. `None` when the meter cannot pay the installed
+/// record that gives it.
+fn limit(base: &Base, instance: InstanceId, method: MethodId) -> Option<u64> {
+    let installed = match base.installed(instance) {
+        Err(Failure::OutOfGas) => return None,
+        installed => installed.ok().flatten(),
+    };
+    Some(
+        installed
+            .and_then(|installed| installed.schema.method(method).map(|schema| schema.gas))
+            .map_or(0, |gas| {
+                gas.unwrap_or(defaults::HANDLER_GAS)
+                    .min(defaults::MAX_HANDLER_GAS)
+            }),
+    )
 }
 
 /// Why a message from `from` at `sequence` is out of its pair's order, if
@@ -614,6 +711,8 @@ fn run_query(agent: AgentId, query: Query) -> Outcome {
         agent,
         time: query.time,
         seed: query.seed,
+        // One invocation, within its handler's limit: nothing to dispatch.
+        meter: Meter::new(u64::MAX),
         earlier: BTreeMap::new(),
         installed: RefCell::new(BTreeMap::new()),
     };
@@ -675,10 +774,10 @@ fn admin(admin: Admin) -> Step {
         Admin::Install {
             instance,
             program,
-            attestables,
+            beside,
             roles,
         } => {
-            let Some(installed) = install(program, attestables, roles) else {
+            let Some(installed) = install(program, beside, roles) else {
                 return failed(Failure::Unknown);
             };
             Write {
@@ -706,11 +805,13 @@ fn admin(admin: Admin) -> Step {
     })
 }
 
-/// Read a program's schema from its machine and check the package binds
-/// every attestable method and maps every role name.
+/// Read a program's schema from its machine and check the package: each
+/// program beside the actor's is bound to a method of its kind, an
+/// attestable or a workflow, every such method has exactly one, and every
+/// role name is mapped.
 fn install(
     program: ProgramHash,
-    attestables: Vec<(MethodId, ProgramHash)>,
+    beside: Vec<(MethodId, Kind, ProgramHash)>,
     roles: Vec<(Vec<u8>, u8)>,
 ) -> Option<Installed> {
     let machine = Machine::acquire(&program.0).ok()?;
@@ -723,13 +824,21 @@ fn install(
     let schema = Schema::read(&section).ok()?;
     let installed = Installed {
         program,
-        attestables,
+        beside,
         roles,
         schema,
     };
-    for method in &installed.schema.methods {
-        if method.kind == Kind::Attestable && installed.attestable(method.id).is_none() {
+    for &(method, kind, _) in &installed.beside {
+        let schema = installed.schema.method(method)?;
+        if schema.kind != kind || !has_own_program(kind) {
             return None;
+        }
+    }
+    let mut own = 0;
+    for method in &installed.schema.methods {
+        if has_own_program(method.kind) {
+            own += 1;
+            installed.bound(method.id, method.kind)?;
         }
         if let Some(role) = &method.role
             && installed.role(role).is_none()
@@ -737,7 +846,15 @@ fn install(
             return None;
         }
     }
-    Some(installed)
+    // Each program is bound to such a method, and each such method has
+    // one: as many as there are of them, no method has two.
+    (installed.beside.len() == own).then_some(installed)
+}
+
+/// Whether a method of `kind` runs as its own program, bound at install,
+/// never as a handler of the actor's.
+fn has_own_program(kind: Kind) -> bool {
+    matches!(kind, Kind::Attestable | Kind::Workflow)
 }
 
 enum Ended {
@@ -803,8 +920,7 @@ impl<'a> Invocation<'a> {
         let Some(schema) = installed.schema.method(method) else {
             return failed(Failure::Unknown);
         };
-        if schema.kind == Kind::Attestable
-            || (self.entry == Kind::Query && schema.kind != Kind::Query)
+        if has_own_program(schema.kind) || (self.entry == Kind::Query && schema.kind != Kind::Query)
         {
             return failed(Failure::Unknown);
         }
@@ -919,7 +1035,10 @@ impl<'a> Invocation<'a> {
             match machine.invoke() {
                 Exit::Halt => return Ok(outcome.unwrap_or(Ended::Replied(Vec::new()))),
                 Exit::OutOfGas => return Err(Failure::OutOfGas),
-                Exit::Panic | Exit::Fault => return Err(Failure::Trapped),
+                Exit::Panic | Exit::Fault(_) => return Err(Failure::Trapped),
+                Exit::Host(id) if precompile::price(id).is_some() => {
+                    serve_precompile(&self.base.meter, machine, id)?;
+                }
                 Exit::Host(id) => {
                     if !known(id) {
                         if !machine.charge(price::OPERATION) {
@@ -1053,7 +1172,7 @@ impl<'a> Invocation<'a> {
                     .method(method)
                     .map(|schema| schema.kind)
                     .ok_or(Failure::Unknown)?;
-                if callee_kind == Kind::Attestable
+                if has_own_program(callee_kind)
                     || (kind == Kind::Query && callee_kind != Kind::Query)
                 {
                     return Err(Failure::Trapped);
@@ -1117,7 +1236,7 @@ impl<'a> Invocation<'a> {
                 }
                 let program = installed.attestable(method).ok_or(Failure::Unknown)?;
                 let gas = machine.gas();
-                let (output, used) = attestable(&program, &call_arguments, gas)?;
+                let (output, used) = attestable(&self.base.meter, &program, &call_arguments, gas)?;
                 if !machine.charge(used) {
                     return Err(Failure::OutOfGas);
                 }
@@ -1265,10 +1384,20 @@ fn random(seed: &[u8; 32], step: u32, draw: u64) -> [u8; 32] {
     )
 }
 
+/// Serve a machine's precompile call, accounting for the agent's serving
+/// on the meter first.
+fn serve_precompile(meter: &Meter, machine: &mut Machine, id: u64) -> Result<(), Failure> {
+    if !meter.take(defaults::PRECOMPILE_SERVING) {
+        return Err(Failure::OutOfGas);
+    }
+    machine.precompile(id)
+}
+
 /// Run an attestable program in its own machine: arguments in the standard
-/// window, output by the halt convention, no host calls (the node serves
-/// precompiles in place).
+/// window, output by the halt convention, and no host calls but
+/// precompiles, which the agent serves.
 fn attestable(
+    meter: &Meter,
     program: &ProgramHash,
     arguments: &[u8],
     gas: u64,
@@ -1283,18 +1412,23 @@ fn attestable(
     machine.set_gas(gas);
     machine.set_register(7, ARGUMENTS);
     machine.set_register(8, arguments.len() as u64);
-    match machine.invoke() {
-        Exit::Halt => {
-            let used = gas - machine.gas();
-            let len = machine.register(8) as usize;
-            if len > cap::REPLY {
-                return Err(Failure::Cap);
+    loop {
+        match machine.invoke() {
+            Exit::Host(id) if precompile::price(id).is_some() => {
+                serve_precompile(meter, &mut machine, id)?;
             }
-            let output = machine.peek(machine.register(7), len).ok_or(Failure::Cap)?;
-            Ok((output, used))
+            Exit::Halt => {
+                let used = gas - machine.gas();
+                let len = machine.register(8) as usize;
+                if len > cap::REPLY {
+                    return Err(Failure::Cap);
+                }
+                let output = machine.peek(machine.register(7), len).ok_or(Failure::Cap)?;
+                return Ok((output, used));
+            }
+            Exit::OutOfGas => return Err(Failure::OutOfGas),
+            _ => return Err(Failure::Trapped),
         }
-        Exit::OutOfGas => Err(Failure::OutOfGas),
-        _ => Err(Failure::Trapped),
     }
 }
 
@@ -1334,15 +1468,13 @@ fn read(machine: &mut Machine, address: u64, len: u64, limit: usize) -> Result<V
     machine.peek(address, len).ok_or(Failure::Trapped)
 }
 
+/// Write `bytes` into the actor's memory through the machine's tracked
+/// write, at their price.
 fn write(machine: &mut Machine, address: u64, bytes: &[u8]) -> Result<(), Failure> {
     if !machine.charge(bytes.len() as u64 * price::PER_BYTE) {
         return Err(Failure::OutOfGas);
     }
-    if machine.poke(address, bytes) {
-        Ok(())
-    } else {
-        Err(Failure::Trapped)
-    }
+    machine.write(address, bytes)
 }
 
 fn copy_out(

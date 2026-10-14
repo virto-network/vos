@@ -250,8 +250,8 @@ fn pins(
     Ok(pinned.chain(unpinned).collect())
 }
 
-/// The programs installed rows name: each instance's, and its attestable
-/// methods'.
+/// The programs installed rows name: each instance's, and those beside it,
+/// its attestables' and workflows'.
 pub(crate) fn programs<'a>(rows: impl Iterator<Item = &'a Vec<u8>>) -> BTreeSet<[u8; 32]> {
     let mut programs = BTreeSet::new();
     for value in rows {
@@ -259,8 +259,7 @@ pub(crate) fn programs<'a>(rows: impl Iterator<Item = &'a Vec<u8>>) -> BTreeSet<
         else {
             continue;
         };
-        programs.insert(installed.program.0);
-        programs.extend(installed.attestables.iter().map(|(_, hash)| hash.0));
+        programs.extend(installed.programs().map(|hash| hash.0));
     }
     programs
 }

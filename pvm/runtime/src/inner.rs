@@ -213,11 +213,6 @@ pub enum InnerMachineObservation<'a> {
         identity: InnerMachineIdentity,
         instruction: crate::interpreter::InstructionObservation<'a>,
     },
-    /// A precompile served in place; execution continues in the same slice.
-    Precompile {
-        identity: InnerMachineIdentity,
-        call: &'a crate::precompile::PrecompileCall,
-    },
     Exit {
         identity: InnerMachineIdentity,
         exit: InnerExit,
@@ -291,9 +286,6 @@ pub struct InnerMachines {
     /// The node's pool, which serves `instantiate`.
     #[cfg(feature = "std")]
     pool: Option<Arc<crate::pool::MachinePool>>,
-    /// Whether precompiles are computed in place; otherwise they return to
-    /// the outer machine as host calls, as on a JAM node.
-    precompiles: bool,
 }
 
 impl Default for InnerMachines {
@@ -316,7 +308,6 @@ impl InnerMachines {
             backend,
             #[cfg(feature = "std")]
             pool: None,
-            precompiles: true,
         }
     }
 
@@ -324,12 +315,6 @@ impl InnerMachines {
     #[cfg(feature = "std")]
     pub fn set_pool(&mut self, pool: Arc<crate::pool::MachinePool>) {
         self.pool = Some(pool);
-    }
-
-    /// Return precompile calls to the outer machine instead of computing
-    /// them, as a JAM node does.
-    pub fn without_precompiles(&mut self) {
-        self.precompiles = false;
     }
 
     /// The pool serving `instantiate`, if any.
@@ -551,7 +536,6 @@ impl InnerMachines {
         state: InvokeState,
         observer: Option<&mut dyn for<'a> FnMut(InnerMachineObservation<'a>)>,
     ) -> Result<InvokeOutcome, InnerError> {
-        let precompiles = self.precompiles;
         let machine = self.machines.get_mut(&id).ok_or(InnerError::Unknown)?;
         let identity = InnerMachineIdentity {
             slot: id,
@@ -572,68 +556,27 @@ impl InnerMachines {
         vm.registers = state.registers;
         let mut observer = observer;
         let mut backend_failed = false;
-        // Precompiles are served in place and execution continues; every
-        // other exit returns to the outer machine.
+        // Every exit returns to the outer machine, a precompile call's too:
+        // the agent serves an inner machine's precompiles, on every host.
         let exit = match observer.as_deref_mut() {
             Some(observer) => {
                 observer(InnerMachineObservation::Enter {
                     identity,
                     machine: vm,
                 });
-                loop {
-                    let exit = vm
-                        .run_observed(|instruction| {
-                            observer(InnerMachineObservation::Instruction {
-                                identity,
-                                instruction,
-                            });
-                        })
-                        .0;
-                    match exit {
-                        ExitReason::HostCall(call)
-                            if precompiles && crate::precompile::is_precompile(call) =>
-                        {
-                            if !crate::precompile::charge(call, &mut vm.gas) {
-                                break ExitReason::OutOfGas;
-                            }
-                            let registers = vm.registers;
-                            let Some(served) =
-                                crate::precompile::execute(call, &registers, vm.memory_mut())
-                            else {
-                                break ExitReason::Panic;
-                            };
-                            observer(InnerMachineObservation::Precompile {
-                                identity,
-                                call: &served,
-                            });
-                            assert!(vm.resume_after_host_call());
-                        }
-                        other => break other,
-                    }
-                }
+                vm.run_observed(|instruction| {
+                    observer(InnerMachineObservation::Instruction {
+                        identity,
+                        instruction,
+                    });
+                })
+                .0
             }
-            None => loop {
-                let exit = match execution.run(vm) {
-                    Ok(exit) => exit,
-                    Err(_) => {
-                        backend_failed = true;
-                        break ExitReason::Panic;
-                    }
-                };
-                match exit {
-                    ExitReason::HostCall(call)
-                        if precompiles && crate::precompile::is_precompile(call) =>
-                    {
-                        if !crate::precompile::charge(call, &mut vm.gas) {
-                            break ExitReason::OutOfGas;
-                        }
-                        let registers = vm.registers;
-                        if crate::precompile::execute(call, &registers, vm.memory_mut()).is_none() {
-                            break ExitReason::Panic;
-                        }
-                        assert!(vm.resume_after_host_call());
-                    }
-                    other => break other,
+            None => match execution.run(vm) {
+                Ok(exit) => exit,
+                Err(_) => {
+                    backend_failed = true;
+                    ExitReason::Panic
                 }
             },
         };

@@ -1,5 +1,5 @@
 //! A ledger: balances in a table, a role-gated mint, transfers that fail
-//! without funds, scans, and an attestable checksum.
+//! without funds, scans, an attestable checksum and a workflow's program.
 
 #![no_std]
 
@@ -117,6 +117,12 @@ impl Ledger {
                 .unwrap_or(0);
         }
         total
+    }
+
+    /// The sum of `amounts`, as a workflow's own program would compute it.
+    #[workflow]
+    pub fn tally(amounts: Vec<u64>) -> u64 {
+        amounts.iter().sum()
     }
 
     #[attestable]

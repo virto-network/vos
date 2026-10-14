@@ -378,9 +378,12 @@ fn activity_from_steps(side_note: &side_note::SideNote) -> ChipActivity {
     use crate::core::opcode::Opcode;
     let mut a = ChipActivity::default();
     for step in &side_note.steps {
-        // Blake2b ECALL detection via opcode + imm match (mirrors
-        // trace_fill.rs's IsBlakeEcall fill at ~line 1075).
-        if matches!(step.opcode, Opcode::Ecalli) && step.imm == ECALL_BLAKE2B_COMPRESS as u64 {
+        // A precompile call counts only when acknowledged: an unacknowledged
+        // one ends its slice at a host exit, as an inner machine's does for
+        // its agent to serve, and selects no relation (trace_fill.rs's
+        // IsBlakeEcall and Is11*Ecall fills).
+        let ecall = matches!(step.opcode, Opcode::Ecalli) && step.host_call_acknowledged;
+        if ecall && step.imm == ECALL_BLAKE2B_COMPRESS as u64 {
             a.blake2b = true;
         }
         // Ristretto scalar-mult ECALL gates RistrettoEcallChip. Whether
@@ -392,13 +395,13 @@ fn activity_from_steps(side_note: &side_note::SideNote) -> ChipActivity {
         // so activate RistrettoChip only via the `ristretto_field_rows`
         // post-ingest check; this avoids activating an empty chip when
         // every scalar mult in the trace was FixedBase.
-        if matches!(step.opcode, Opcode::Ecalli) && step.imm == ECALL_RISTRETTO_SCALAR_MULT as u64 {
+        if ecall && step.imm == ECALL_RISTRETTO_SCALAR_MULT as u64 {
             a.ristretto_ecall = true;
         }
         // The point-add and scalar-reduce-wide ECALLs
         // activate the RistrettoEcallChip but not RistrettoChip
         // (those don't fire field-op rows).
-        if matches!(step.opcode, Opcode::Ecalli)
+        if ecall
             && (step.imm == ECALL_RISTRETTO_POINT_ADD as u64
                 || step.imm == ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE as u64
                 || step.imm == ECALL_SCALAR_MUL_MOD_L as u64

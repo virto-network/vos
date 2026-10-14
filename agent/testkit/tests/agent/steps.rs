@@ -5,19 +5,20 @@
 use std::collections::BTreeMap;
 
 use proptest::prelude::*;
+use vos_pvm::ExitReason;
 use vos_testkit::programs::{method, table_tag};
 use vos_testkit::{Testkit, decode};
-use vos_wire::abi::{Failure, Refusal, Rows, cap, code};
+use vos_wire::abi::{Failure, Kind, Refusal, Rows, cap, code};
 use vos_wire::batch::{Admin, Input};
 use vos_wire::ids::{AgentId, InstanceId, MethodId};
 use vos_wire::keys::{self, Transform};
 use vos_wire::records::unstored;
 use vos_wire::result::{Outcome, WorkResult};
-use vos_wire::{Decode, Encode};
+use vos_wire::{Decode, Encode, defaults};
 
 use crate::common::{
-    AGENT, ALICE, Actors, BOB, CALLER, COUNTER, LEDGER, MINTER, Node, Sessions, done, failed,
-    install, ran, refused, setup,
+    AGENT, ALICE, Actors, BOB, CALLER, COUNTER, LEDGER, MINTER, Node, OUTER_GAS, Sessions, done,
+    failed, install, ran, ran_done, refused, request, setup,
 };
 
 #[test]
@@ -235,22 +236,35 @@ fn an_attestable_may_not_write_its_arguments() {
     let actors = Actors::load();
     let mut node = Node::new();
     let mut kit = Testkit::new(AGENT);
-    let ledger = node.add(&actors.ledger);
     let program = node.add(&scribble);
-    let checksum = method(&actors.ledger, "checksum");
+    let Input::Admin(Admin::Install {
+        instance,
+        program: ledger,
+        mut beside,
+        roles,
+    }) = actors.install_ledger(&mut node)
+    else {
+        unreachable!("an install")
+    };
+    beside[0].2 = program;
     node.batch(
         0,
         vec![Input::Admin(Admin::Install {
-            instance: LEDGER,
+            instance,
             program: ledger,
-            attestables: vec![(checksum, program)],
-            roles: vec![(b"minter".to_vec(), MINTER)],
+            beside,
+            roles,
         })],
     );
+    let checksum = method(&actors.ledger, "checksum");
+    let tally = method(&actors.ledger, "tally");
     kit.install(
         LEDGER,
         &actors.ledger,
-        &[(checksum, &scribble)],
+        &[
+            (checksum, Kind::Attestable, &scribble),
+            (tally, Kind::Workflow, &actors.tally),
+        ],
         &[("minter", MINTER)],
     )
     .unwrap();
@@ -296,21 +310,27 @@ fn a_call_that_cannot_get_a_machine_fails_the_step() {
     assert_eq!(deeper.gas_used, ran(&result.steps[1]).gas_used);
 }
 
+/// A refine dispatches by its own accounting of its batch's budget, never
+/// by the gas it reads: from a budget under a handler's limit up, every
+/// refine halts with a prefix of the batch, longer as the budget grows, and
+/// the same prefix whatever gas it has beyond its budget.
 #[test]
-fn a_refine_dispatches_only_what_its_gas_can_finish() {
+fn a_refine_dispatches_only_what_its_budget_can_finish() {
     let (actors, node, _, mut sessions) = setup();
     let increment = actors.method(COUNTER, "increment");
-    let work = node.work(
-        1,
-        (0..10)
-            .map(|_| sessions.request(ALICE, COUNTER, increment, 1u64))
-            .collect(),
-    );
-    // From less than a handler's limit up: every refine halts with a prefix
-    // of the batch, longer as the gas grows.
+    let inputs: Vec<Input> = (0..10)
+        .map(|_| sessions.request(ALICE, COUNTER, increment, 1u64))
+        .collect();
     let mut counts = Vec::new();
-    for gas in (0..60).map(|step| vos_wire::defaults::HANDLER_GAS + step * 100_000) {
-        let (result, _) = WorkResult::decode(&node.refine_with(&work, gas)).unwrap();
+    for budget in (0..60).map(|step| defaults::HANDLER_GAS + step * 1_000_000) {
+        let work = node.budgeted_work(1, [0; 32], budget, inputs.clone());
+        let bytes = node.refine_with(&work, budget);
+        assert_eq!(
+            node.refine_with(&work, 2 * budget),
+            bytes,
+            "gas beyond the budget changes nothing"
+        );
+        let (result, _) = WorkResult::decode(&bytes).unwrap();
         for (index, step) in result.steps.iter().enumerate() {
             assert_eq!(done::<u64>(step), index as u64 + 1);
         }
@@ -320,6 +340,233 @@ fn a_refine_dispatches_only_what_its_gas_can_finish() {
     assert!(counts.windows(2).all(|pair| pair[0] <= pair[1]));
     assert!(counts.iter().any(|count| 0 < *count && *count < 10));
     assert_eq!(*counts.last().unwrap(), 10);
+}
+
+/// A refine given less gas than its batch's budget, beyond what starting
+/// and decoding may take, traps at its start rather than run out partway.
+#[test]
+fn a_refine_given_less_gas_than_its_budget_traps() {
+    let (actors, node, _, mut sessions) = setup();
+    let increment = actors.method(COUNTER, "increment");
+    let budget = 100_000_000;
+    let work = node.budgeted_work(
+        1,
+        [0; 32],
+        budget,
+        vec![sessions.request(ALICE, COUNTER, increment, 1u64)],
+    );
+    assert_eq!(node.run_refine(&work, budget).exit, ExitReason::Halt);
+    assert_eq!(node.run_refine(&work, budget / 2).exit, ExitReason::Panic);
+}
+
+/// A step's first read of an installed record and its served precompiles
+/// draw on what its batch's budget leaves above the step's own limit. A
+/// step that finds nothing left there waits for the next batch behind a
+/// step that ran a handler. With none before it, even behind a sweep and an
+/// acknowledgement, it fails, consumed, so nothing waits on it. Every host
+/// meters the same.
+#[test]
+fn a_step_whose_precompiles_overrun_the_budget_waits_or_fails() {
+    let (actors, mut node, _, _) = setup();
+    let mut jam = Node::jam(true);
+    for program in [
+        &actors.counter,
+        &actors.ledger,
+        &actors.checksum,
+        &actors.tally,
+        &actors.caller,
+    ] {
+        jam.add(program);
+    }
+    jam.state = node.state.clone();
+    jam.version = node.version;
+    let increment = actors.method(COUNTER, "increment");
+    let hash = actors.method(COUNTER, "hash");
+    // Forty rounds: forty-two compressions, the first round's three blocks
+    // and one a round after.
+    let hashing = |sequence| {
+        request(
+            ALICE,
+            sequence,
+            COUNTER,
+            hash,
+            (vec![7u8; 300], 40u32).encode(),
+        )
+    };
+    let record = defaults::RECORD_BYTE * node.state[&keys::installed(COUNTER)].len() as u64;
+    // A budget that dispatches the hash after `before`, the counter's record
+    // read once, with `calls` served precompiles' worth above its limit.
+    let budget = |before: u64, calls: u64| {
+        before
+            + record
+            + defaults::STEP_RESERVE
+            + 50_000_000
+            + defaults::FINISH_RESERVE
+            + calls * defaults::PRECOMPILE_SERVING
+    };
+    let refine = |inputs: &[Input], budget: u64| {
+        let work = node.budgeted_work(1, [0; 32], budget, inputs.to_vec());
+        let bytes = node.refine_with(&work, budget);
+        assert_eq!(
+            bytes,
+            jam.refine_with(&work, budget),
+            "every host meters the same"
+        );
+        WorkResult::decode(&bytes).unwrap().0
+    };
+
+    let incrementing = request(ALICE, 1, COUNTER, increment, 1u64.encode());
+    let alone = refine(std::slice::from_ref(&incrementing), OUTER_GAS);
+    let incremented = defaults::STEP_RESERVE + ran_done(&alone.steps[0]).gas_used;
+    let behind = [incrementing, hashing(2)];
+    let waited = refine(&behind, budget(incremented, 10));
+    assert_eq!(waited.steps.len(), 1, "the hash waits for the next batch");
+    let both = refine(&behind, budget(incremented, 42));
+    ran_done(&both.steps[1]);
+
+    let sweep = [
+        Input::Sweep,
+        Input::Ack {
+            to: AgentId(5),
+            sequence: 1,
+        },
+        hashing(1),
+    ];
+    let short = budget(defaults::SWEEP_RESERVE + defaults::INPUT_RESERVE, 10);
+    let result = refine(&sweep, short);
+    assert_eq!(
+        failed(&result.steps[2]),
+        Failure::OutOfGas,
+        "behind no handler, it fails"
+    );
+    node.apply(&node.budgeted_work(1, [0; 32], short, sweep.to_vec()));
+    let next = node.batch(2, vec![hashing(2)]);
+    ran_done(&next.steps[0]);
+}
+
+/// A full batch of small steps takes a small part of a refine's default
+/// budget: each its reserve and the gas it used, and its instance's record
+/// once.
+#[test]
+fn a_full_batch_of_small_steps_fits_the_default_budget() {
+    let (actors, mut node, _, _) = setup();
+    let increment = actors.method(COUNTER, "increment");
+    let inputs: Vec<Input> = (1..=256)
+        .map(|sequence| request(ALICE, sequence, COUNTER, increment, 1u64.encode()))
+        .collect();
+    let record = defaults::RECORD_BYTE * node.state[&keys::installed(COUNTER)].len() as u64;
+    let work = node.budgeted_work(1, [0; 32], defaults::REFINE_GAS, inputs);
+    let result = node.apply(&work);
+    assert_eq!(result.steps.len(), 256);
+    let taken: u64 = record
+        + result
+            .steps
+            .iter()
+            .map(|step| defaults::STEP_RESERVE + ran_done(step).gas_used)
+            .sum::<u64>();
+    println!(
+        "256 increments take {taken} of {}: {} would fit",
+        defaults::REFINE_GAS,
+        256 * (defaults::REFINE_GAS - defaults::HANDLER_GAS) / taken
+    );
+    assert!(taken * 5 < defaults::REFINE_GAS, "{taken}");
+}
+
+/// An actor's precompile calls cost it their price, as the testkit serves
+/// them, though the agent serves each by an exit.
+#[test]
+fn precompile_calls_cost_their_price() {
+    let (actors, mut node, mut kit, mut sessions) = setup();
+    let hash = actors.method(COUNTER, "hash");
+    let arguments = (vec![7u8; 1000], 20u32);
+    let result = node.batch(
+        1,
+        vec![sessions.request(ALICE, COUNTER, hash, arguments.clone())],
+    );
+    kit.batch(1, [0; 32]);
+    let expected = kit.command(ALICE, COUNTER, hash, &arguments.encode());
+    let run = ran_done(&result.steps[0]);
+    assert_eq!(run.outcome, expected.outcome);
+    assert_eq!(run.gas_used, expected.gas_used);
+}
+
+/// An install binds each program beside the actor's to a method of its
+/// kind: exactly one for each attestable and workflow method, and none that
+/// names another method or kind. Its record keeps them with their kinds.
+#[test]
+fn an_install_binds_each_program_to_a_method_of_its_kind() {
+    let actors = Actors::load();
+    let mut node = Node::new();
+    let Input::Admin(Admin::Install {
+        instance,
+        program,
+        beside,
+        roles,
+    }) = actors.install_ledger(&mut node)
+    else {
+        unreachable!("an install")
+    };
+    let with = |beside: Vec<(MethodId, Kind, vos_wire::ids::ProgramHash)>| {
+        Input::Admin(Admin::Install {
+            instance,
+            program,
+            beside,
+            roles: roles.clone(),
+        })
+    };
+    let (checksum, tally) = (beside[0], beside[1]);
+    let mint = actors.method(LEDGER, "mint");
+    let result = node.batch(
+        0,
+        vec![
+            with(vec![checksum]),
+            with(vec![tally]),
+            with(vec![(checksum.0, Kind::Workflow, checksum.2), tally]),
+            with(vec![checksum, tally, (mint, Kind::Attestable, checksum.2)]),
+            with(vec![checksum, (tally.0, Kind::Command, tally.2)]),
+            with(vec![checksum, tally, tally]),
+            with(beside.clone()),
+        ],
+    );
+    for (index, step) in result.steps[..6].iter().enumerate() {
+        assert_eq!(failed(step), Failure::Unknown, "install {index}");
+    }
+    ran_done(&result.steps[6]);
+    let installed: vos_wire::records::Installed =
+        node.value(&keys::installed(LEDGER)).expect("installed");
+    assert_eq!(installed.beside, beside);
+}
+
+/// A workflow method runs as its own program, never as a handler: a
+/// request or a query naming one is unknown, and a call naming one traps.
+#[test]
+fn a_workflow_method_is_no_handler() {
+    let (actors, mut node, mut kit, mut sessions) = setup();
+    let tally = actors.method(LEDGER, "tally");
+    let ops = actors.method(COUNTER, "ops");
+    let call = (vec![(6u8, 0u32, 1u32)], (LEDGER.0, tally.0));
+    let result = node.batch(
+        1,
+        vec![
+            sessions.request(ALICE, LEDGER, tally, vec![1u64]),
+            sessions.request(ALICE, COUNTER, ops, call.clone()),
+        ],
+    );
+    assert_eq!(failed(&result.steps[0]), Failure::Unknown);
+    assert_eq!(failed(&result.steps[1]), Failure::Trapped);
+    assert_eq!(
+        node.query(ALICE, LEDGER, tally, vec![1u64].encode()),
+        Outcome::Failed {
+            code: Failure::Unknown,
+            detail: vec![],
+        }
+    );
+    kit.batch(1, [0; 32]);
+    let refused = kit.command(ALICE, LEDGER, tally, &vec![1u64].encode());
+    assert_eq!(refused.outcome, ran(&result.steps[0]).outcome);
+    let trapped = kit.command(ALICE, COUNTER, ops, &call.encode());
+    assert_eq!(trapped.outcome, ran(&result.steps[1]).outcome);
+    assert_eq!(trapped.gas_used, ran(&result.steps[1]).gas_used);
 }
 
 #[test]

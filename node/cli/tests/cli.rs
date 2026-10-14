@@ -144,7 +144,92 @@ fn a_client_calls_an_agent_the_operator_installed() {
     assert!(after.contains(&format!("at {agent} ")), "{after}");
 }
 
-/// `vos` that should fail: its error.
+/// An operator installs a package's programs beside its actor, each bound
+/// by name to a method of its kind: an attestable's and a workflow's. A
+/// program named for a method of another kind is refused before anything
+/// is sent, and the agent refuses a package that leaves a workflow without
+/// its program.
+#[test]
+fn an_operator_installs_programs_beside_an_actor() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("node");
+    let data = data.to_str().unwrap();
+    let node = node_run(dir.path(), &["--data", data, "--listen", "127.0.0.1:0"]);
+    let url = format!("http://{}", node.address);
+    let key = dir.path().join("client.key");
+    vos(&["key", "new", "--out", key.to_str().unwrap()]);
+    let agent = vos(&["agent", "create", "--node", &url, "--data", data]);
+    let elf = |name: &str| actor_elf(name).to_str().unwrap().to_string();
+    let attestable = format!("checksum={}", elf("checksum"));
+    let workflow = format!("tally={}", elf("tally"));
+    let ledger = elf("ledger");
+    let install = |beside: &[&str]| -> Vec<String> {
+        let mut args: Vec<String> = [
+            "install",
+            "--node",
+            &url,
+            "--data",
+            data,
+            "--agent",
+            &agent,
+            "--instance",
+            "2",
+            "--program",
+            &ledger,
+            "--role",
+            "minter=1",
+        ]
+        .map(str::to_string)
+        .to_vec();
+        args.extend(beside.iter().map(|arg| arg.to_string()));
+        args
+    };
+
+    let swapped = format!("checksum={}", elf("tally"));
+    let mismatched = vos_fails(&strs(&install(&[
+        "--attestable",
+        &attestable,
+        "--workflow",
+        &swapped,
+    ])));
+    assert!(
+        mismatched.contains("checksum is not a method of kind Workflow"),
+        "{mismatched}"
+    );
+    let unbound = vos(&strs(&install(&["--attestable", &attestable])));
+    assert!(unbound.starts_with("failed 6"), "unknown: {unbound}");
+    let installed = vos(&strs(&install(&[
+        "--attestable",
+        &attestable,
+        "--workflow",
+        &workflow,
+    ])));
+    assert!(installed.starts_with("done"), "{installed}");
+    // The attestable runs from the program installed beside the ledger: the
+    // checksum of no values is its offset basis.
+    let audited = vos(&[
+        "call",
+        "--node",
+        &url,
+        "--key",
+        key.to_str().unwrap(),
+        "--agent",
+        &agent,
+        "--instance",
+        "2",
+        "--method",
+        "audit",
+        "--args",
+        "00000000",
+    ]);
+    assert_eq!(audited, "done 25232284e49cf2cb");
+}
+
+fn strs(args: &[String]) -> Vec<&str> {
+    args.iter().map(String::as_str).collect()
+}
+
+/// `vos` that should fail: its error./// `vos` that should fail: its error.
 fn vos_fails(args: &[&str]) -> String {
     let output = Command::new(VOS).args(args).output().expect("vos runs");
     assert!(!output.status.success(), "vos {args:?} succeeded");

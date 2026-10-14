@@ -1,22 +1,26 @@
-//! The hosts the agent runs on: a VOS node's, with a pool and applied
-//! state, and a JAM node's, with neither, and the host calls every program
-//! makes.
+//! The hosts the agent runs on: a VOS node's, with a pool, applied state
+//! and precompiles computed, and a JAM node's, with none of them and
+//! PolkaJam's price for a call it does not serve; and the host calls every
+//! program makes.
 
 use vos_pvm::ExitReason;
-use vos_testkit::programs::{agent, method};
-use vos_wire::abi::surface;
-use vos_wire::batch::{Admin, Input};
+use vos_testkit::programs::agent;
+use vos_wire::abi::{self, cap, surface};
+use vos_wire::batch::{Admin, Input, Message, Work};
 use vos_wire::ids::AgentId;
 use vos_wire::ingress::Grant;
+use vos_wire::result::WorkResult;
+use vos_wire::{Decode, Encode};
 
 use crate::common::{
-    ALICE, Actors, BOB, COUNTER, LEDGER, MINTER, Node, OUTER_GAS, Sessions, counter_only, done,
-    install,
+    ALICE, Actors, BOB, CALLER, COUNTER, LEDGER, MINTER, Node, OUTER_GAS, Sessions, counter_only,
+    done, install, ran_done,
 };
 
 /// Every program calls only what a JAM node serves, or what has a
 /// fallback there (`abi::surface`): the default agent, the test actors and
-/// the attestable program, every `ecalli` in them, reachable or not.
+/// the attestable and workflow programs, every `ecalli` in them, reachable
+/// or not.
 #[test]
 fn every_program_calls_only_its_surface() {
     let calls = |blob: &[u8]| vos_pvm::spi::inspect_standard_program_host_calls(blob).unwrap();
@@ -26,11 +30,15 @@ fn every_program_calls_only_its_surface() {
     for call in &seen {
         assert!(surface::agent(*call).is_some(), "the agent calls {call:#x}");
     }
-    assert!(
-        seen.iter()
-            .any(|call| surface::agent(*call) == Some(surface::OnJam::Loader)),
-        "the agent instantiates: the check sees its calls"
-    );
+    for (kind, name) in [
+        (surface::OnJam::Loader, "instantiates"),
+        (surface::OnJam::Software, "computes BLAKE2b"),
+    ] {
+        assert!(
+            seen.iter().any(|call| surface::agent(*call) == Some(kind)),
+            "the agent {name}: the check sees its calls"
+        );
+    }
     let actors = Actors::load();
     for (name, blob) in [
         ("counter", &actors.counter),
@@ -44,6 +52,23 @@ fn every_program_calls_only_its_surface() {
     for call in calls(&actors.checksum) {
         assert!(surface::attestable(call), "checksum calls {call:#x}");
     }
+    for call in calls(&actors.tally) {
+        assert!(surface::workflow(call), "tally calls {call:#x}");
+    }
+}
+
+/// The agent serves its machines the precompiles a VOS node serves the
+/// agent, each at the node's price; every other id among the precompiles
+/// it leaves unserved, as a JAM node does.
+#[test]
+fn the_agent_serves_the_precompiles_a_node_does_at_its_price() {
+    for id in surface::PRECOMPILES {
+        assert_eq!(
+            abi::precompile::price(id),
+            vos_pvm::precompile::price(id),
+            "{id:#x}"
+        );
+    }
 }
 
 /// Batches that read no state refine on a VOS host (the pool, applied
@@ -55,25 +80,20 @@ fn every_program_calls_only_its_surface() {
 fn vos_and_jam_hosts_agree_on_batches_that_read_no_state() {
     let actors = Actors::load();
     let mut vos = Node::new();
-    let mut jam = Node::with(false, false);
-    let mut add = |blob: &[u8]| {
-        let hash = vos.add(blob);
-        assert_eq!(jam.add(blob), hash);
-        hash
-    };
-    let counter = add(&actors.counter);
-    let ledger = add(&actors.ledger);
-    let checksum = add(&actors.checksum);
-    let audit = method(&actors.ledger, "checksum");
+    let mut jam = Node::jam(false);
+    let counter = vos.add(&actors.counter);
+    for program in [
+        &actors.counter,
+        &actors.ledger,
+        &actors.checksum,
+        &actors.tally,
+    ] {
+        jam.add(program);
+    }
     let batches = vec![
         vec![
             install(COUNTER, counter),
-            Input::Admin(Admin::Install {
-                instance: LEDGER,
-                program: ledger,
-                attestables: vec![(audit, checksum)],
-                roles: vec![(b"minter".to_vec(), MINTER)],
-            }),
+            actors.install_ledger(&mut vos),
             Input::Admin(Admin::SetRole(Grant {
                 principal: ALICE,
                 role: Some(MINTER),
@@ -107,6 +127,119 @@ fn vos_and_jam_hosts_agree_on_batches_that_read_no_state() {
     }
 }
 
+/// Batches that run actors refine on a VOS host and on a JAM host to the
+/// same work result, byte for byte, and accumulate to the same storage:
+/// requests and a message, nested calls, an attestable, and precompile
+/// calls, which the agent serves at the same price on both, though their
+/// outer gas differs (in software on JAM); and a batch its budget cuts
+/// short, at the same step on both, since the agent dispatches by its own
+/// accounting. The JAM host reads applied state here, as JAM mode's
+/// witnesses will give it; without them a batch that reads state has no
+/// result there (`a_refine_that_cannot_read_state_produces_no_result`).
+#[test]
+fn vos_and_jam_hosts_agree_on_batches_that_run_actors() {
+    let actors = Actors::load();
+    let mut vos = Node::new();
+    let mut jam = Node::jam(true);
+    let mut add = |blob: &[u8]| {
+        let hash = vos.add(blob);
+        assert_eq!(jam.add(blob), hash);
+        hash
+    };
+    let counter = add(&actors.counter);
+    let caller = add(&actors.caller);
+    for program in [&actors.ledger, &actors.checksum, &actors.tally] {
+        add(program);
+    }
+    let mut sessions = Sessions::new();
+    let method = |instance, name| actors.method(instance, name);
+    let hash = |sessions: &mut Sessions, rounds: u32| {
+        sessions.request(
+            ALICE,
+            COUNTER,
+            method(COUNTER, "hash"),
+            (vec![7u8; 300], rounds),
+        )
+    };
+    let installs = vec![
+        install(COUNTER, counter),
+        actors.install_ledger(&mut vos),
+        install(CALLER, caller),
+        Input::Admin(Admin::SetRole(Grant {
+            principal: ALICE,
+            role: Some(MINTER),
+        })),
+    ];
+    let actor_steps = vec![
+        sessions.request(ALICE, COUNTER, method(COUNTER, "increment"), 5u64),
+        hash(&mut sessions, 4),
+        sessions.request(ALICE, LEDGER, method(LEDGER, "mint"), (1u64, 100u64)),
+        sessions.request(ALICE, LEDGER, method(LEDGER, "audit"), vec![1u64, 2, 3]),
+        sessions.request(
+            ALICE,
+            CALLER,
+            method(CALLER, "pay"),
+            ((LEDGER.0, 1u64), (2u64, 40u64)),
+        ),
+        Input::Message(Message {
+            from: AgentId(5),
+            sequence: 1,
+            body: vos_wire::batch::Body::Call {
+                instance: COUNTER,
+                method: method(COUNTER, "hash"),
+                arguments: (vec![1u8; 1000], 2u32).encode(),
+                awaiting: None,
+            },
+        }),
+    ];
+    let hashes: Vec<Input> = (0..10).map(|_| hash(&mut sessions, 3)).collect();
+    // Room for a few of the hashes after the first, each 50M of limit.
+    let short = 52_000_000;
+    let batches = [
+        (installs, OUTER_GAS),
+        (actor_steps, OUTER_GAS),
+        (hashes, short),
+    ];
+    for (time, (inputs, budget)) in batches.into_iter().enumerate() {
+        let time = time as u64 + 1;
+        let work = vos.budgeted_work(time, [time as u8; 32], budget, inputs);
+        let (on_vos, vos_gas) = refined(&vos, &work, budget);
+        let (on_jam, jam_gas) = refined(&jam, &work, budget);
+        assert_eq!(on_vos, on_jam, "batch {time}");
+        let result = WorkResult::decode(&on_vos).unwrap().0;
+        for step in &result.steps {
+            ran_done(step);
+        }
+        if time > 1 {
+            assert_ne!(
+                vos_gas, jam_gas,
+                "batch {time}: the hosts' outer gas differs"
+            );
+        }
+        if time == 3 {
+            assert!(
+                !result.steps.is_empty() && result.steps.len() < 10,
+                "the budget cuts the batch: {} steps",
+                result.steps.len()
+            );
+        }
+        vos.accumulate(&on_vos);
+        jam.accumulate(&on_jam);
+        vos.version += 1;
+        jam.version += 1;
+        assert_eq!(vos.state, jam.state, "storage after batch {time}");
+    }
+}
+
+/// `work`'s result on `node`, refined with its budget's gas, and the gas
+/// the refine used.
+fn refined(node: &Node, work: &Work, gas: u64) -> (Vec<u8>, u64) {
+    let invocation = node.run_refine(work, gas);
+    assert_eq!(invocation.exit, ExitReason::Halt, "refine halts");
+    let output = invocation.output_bounded(cap::WORK_RESULT).unwrap();
+    (output, invocation.gas_used)
+}
+
 #[test]
 fn without_a_pool_the_loader_builds_the_machines() {
     let actors = Actors::load();
@@ -133,7 +266,7 @@ fn without_a_pool_the_loader_builds_the_machines() {
 #[test]
 fn a_refine_that_cannot_read_state_produces_no_result() {
     // Admin inputs read no state: the install applies.
-    let (actors, node) = counter_only(Node::with(false, false));
+    let (actors, node) = counter_only(Node::jam(false));
     let increment = actors.method(COUNTER, "increment");
     let mut sessions = Sessions::new();
     for time in [2, 3] {

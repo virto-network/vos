@@ -200,7 +200,7 @@ impl Ingress {
                                 agent,
                                 install.instance,
                                 install.program,
-                                install.attestables,
+                                install.beside,
                                 install.roles,
                             )
                             .await;

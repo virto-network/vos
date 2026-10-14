@@ -3,7 +3,8 @@
 //! - `#[actor]` on the state struct: its encoding, which skips `Table` and
 //!   `CommittedMap` fields, and each one's tag.
 //! - `#[messages]` on the impl block: a message type per handler, the
-//!   dispatcher, the program's entry point and its schema.
+//!   dispatcher, the program's entry point and its schema; and for each
+//!   `#[attestable]` or `#[workflow]` method, the entry of its own program.
 
 use std::collections::BTreeMap;
 
@@ -251,27 +252,42 @@ fn msg_options(attribute: &Attribute) -> syn::Result<(Option<String>, Option<u64
     Ok((role, gas))
 }
 
+/// The kind of program an attribute marks a method to run as, apart from
+/// the actor's: `#[attestable]` or `#[workflow]`.
+fn own_program(attribute: &Attribute) -> Option<Kind> {
+    if attribute.path().is_ident("attestable") {
+        Some(Kind::Attestable)
+    } else if attribute.path().is_ident("workflow") {
+        Some(Kind::Workflow)
+    } else {
+        None
+    }
+}
+
 fn handler(
     mut method: ImplItemFn,
     attribute: &Attribute,
-    attestable: bool,
+    program: Option<Kind>,
     ids: &mut Ids,
 ) -> syn::Result<Handler> {
     let name = method.sig.ident.to_string();
-    let (role, gas) = if attestable {
-        (None, None)
-    } else {
-        msg_options(attribute)?
+    let (role, gas) = match program {
+        Some(_) => (None, None),
+        None => msg_options(attribute)?,
     };
     let mut inputs = method.sig.inputs.iter();
-    let kind = if attestable {
+    let kind = if let Some(kind) = program {
         if let Some(FnArg::Receiver(receiver)) = method.sig.inputs.first() {
             return Err(Error::new(
                 receiver.span(),
-                "an #[attestable] method takes no `self`: it sees only its arguments",
+                if kind == Kind::Workflow {
+                    "a #[workflow] takes no `self`: it holds only its own memory"
+                } else {
+                    "an #[attestable] method takes no `self`: it sees only its arguments"
+                },
             ));
         }
-        Kind::Attestable
+        kind
     } else {
         match inputs.next() {
             Some(FnArg::Receiver(receiver)) if receiver.reference.is_some() => {
@@ -304,7 +320,7 @@ fn handler(
                 Kind::Command => {
                     is_named(&reference.elem, "Command") && reference.mutability.is_some()
                 }
-                Kind::Attestable => false,
+                Kind::Attestable | Kind::Workflow => false,
             };
             if !expected {
                 return Err(Error::new(
@@ -313,6 +329,7 @@ fn handler(
                         Kind::Query => "a `&self` handler takes `&Query<Self>`",
                         Kind::Command => "a `&mut self` handler takes `&mut Command<Self>`",
                         Kind::Attestable => "an #[attestable] method takes no context",
+                        Kind::Workflow => "a #[workflow] takes no context",
                     },
                 ));
             }
@@ -328,16 +345,16 @@ fn handler(
         arguments.push((pattern.ident.clone(), (*typed.ty).clone()));
     }
     let (reply, error) = reply_and_error(&method.sig.output);
-    if attestable && error.is_some() {
+    if kind == Kind::Attestable && error.is_some() {
         return Err(Error::new(
             method.sig.output.span(),
             "an #[attestable] method cannot fail: return its output",
         ));
     }
     let id = ids.take("vos/method/", &name, method.sig.ident.span())?;
-    method.attrs.retain(|attribute| {
-        !attribute.path().is_ident("msg") && !attribute.path().is_ident("attestable")
-    });
+    method
+        .attrs
+        .retain(|attribute| !attribute.path().is_ident("msg") && own_program(attribute).is_none());
     Ok(Handler {
         method,
         name,
@@ -355,7 +372,10 @@ fn handler(
 /// The handlers of an actor. Each `#[msg]` method becomes a message type in
 /// a module named after the actor in snake case, or as
 /// `#[messages(module = "...")]` names it, with the handler's arguments as
-/// fields; `#[attestable]` methods likewise, run as their own programs. The
+/// fields; `#[attestable]` and `#[workflow]` methods likewise, each run as
+/// its own program (`attestable_program!`, `workflow_program!`) from the
+/// entry generated for it, `__vos_attest_<name>` or `__vos_workflow_<name>`.
+/// A `#[workflow]` takes no `self`, and here only its arguments. The
 /// module imports its parent's names, so argument types resolve as they do
 /// beside the impl; a message type shadows a parent type of the same name,
 /// so a handler must not be named after an argument type (a `balance`
@@ -406,14 +426,12 @@ fn messages_impl(mut input: ItemImpl, module: Option<String>) -> syn::Result<Tok
         let marker = method
             .attrs
             .iter()
-            .find(|attribute| {
-                attribute.path().is_ident("msg") || attribute.path().is_ident("attestable")
-            })
+            .find(|attribute| attribute.path().is_ident("msg") || own_program(attribute).is_some())
             .cloned();
         match marker {
             Some(attribute) => {
-                let attestable = attribute.path().is_ident("attestable");
-                let handler = handler(method, &attribute, attestable, &mut ids)?;
+                let program = own_program(&attribute);
+                let handler = handler(method, &attribute, program, &mut ids)?;
                 items.push(ImplItem::Fn(handler.method.clone()));
                 handlers.push(handler);
             }
@@ -430,7 +448,7 @@ fn messages_impl(mut input: ItemImpl, module: Option<String>) -> syn::Result<Tok
 
     let mut types = Vec::new();
     let mut arms = Vec::new();
-    let mut attest_fns = Vec::new();
+    let mut own_entries = Vec::new();
     let mut schema = Schema {
         methods: Vec::new(),
     };
@@ -457,18 +475,22 @@ fn messages_impl(mut input: ItemImpl, module: Option<String>) -> syn::Result<Tok
                 #(#fields,)*
             }
         });
-        if handler.kind == Kind::Attestable {
-            types.push(quote! {
-                impl ::vos_sdk::context::AttestableMethod for #message {
-                    type Actor = super::#actor;
-                    const ID: u32 = #id;
-                    type Output = #reply;
-                }
-            });
-            let entry = format_ident!("__vos_attest_{}", handler.name);
-            attest_fns.push(quote! {
-                /// Run this attestable method on encoded arguments; the
-                /// entry of its own program.
+        if matches!(handler.kind, Kind::Attestable | Kind::Workflow) {
+            let entry = if handler.kind == Kind::Attestable {
+                types.push(quote! {
+                    impl ::vos_sdk::context::AttestableMethod for #message {
+                        type Actor = super::#actor;
+                        const ID: u32 = #id;
+                        type Output = #reply;
+                    }
+                });
+                format_ident!("__vos_attest_{}", handler.name)
+            } else {
+                format_ident!("__vos_workflow_{}", handler.name)
+            };
+            own_entries.push(quote! {
+                /// Run this method on encoded arguments; the entry of its
+                /// own program.
                 #[doc(hidden)]
                 pub fn #entry(input: &[u8]) -> ::vos_sdk::Vec<u8> {
                     let ::core::result::Result::Ok((#module::#message { #(#names),* }, _)) =
@@ -552,7 +574,7 @@ fn messages_impl(mut input: ItemImpl, module: Option<String>) -> syn::Result<Tok
         #impl_block
 
         impl #actor {
-            #(#attest_fns)*
+            #(#own_entries)*
         }
 
         impl ::vos_sdk::state::New for #actor {

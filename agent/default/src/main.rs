@@ -11,9 +11,9 @@
 extern crate alloc;
 
 mod accumulate;
-mod host;
-mod machines;
 mod refine;
+
+use vos_agent::{host, machines};
 
 use alloc::vec::Vec;
 use core::mem::ManuallyDrop;

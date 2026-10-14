@@ -1,0 +1,15 @@
+[package]
+name = "tracker"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "tracker"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+vos-agent = { path = "../../default" }
+vos-sdk = { workspace = true }

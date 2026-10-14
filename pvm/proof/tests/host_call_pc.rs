@@ -112,3 +112,30 @@ fn unhandled_host_call_rejects_forged_resume_pc() {
     steps[0].next_pc = 2;
     prove_and_verify(steps, &code, &bitmask);
 }
+
+/// A BLAKE2b call left to the embedder, as an inner machine's is left to
+/// its agent, ends its segment at the cause PC and reads no register: the
+/// call relation and its register reads come only with acknowledgment.
+#[test]
+fn unhandled_blake2b_call_segment_proves_at_cause_pc() {
+    let code = vec![Opcode::Ecalli as u8, 0x00, 0x04, Opcode::Trap as u8];
+    let bitmask = vec![1, 0, 0, 1];
+    let mut registers = [0; PVM_REGISTER_COUNT];
+    registers[7] = u64::from(PVM_ZONE_SIZE);
+    registers[8] = u64::from(PVM_ZONE_SIZE) + 0x40;
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        registers,
+        vec![0; MEMORY_LEN],
+        10_000,
+    );
+    let mut tracing = TracingPvm::new(pvm);
+    assert_eq!(tracing.step(), Some(ExitReason::HostCall(0x400)));
+    let steps = tracing.into_trace();
+    assert_eq!(steps.len(), 1);
+    assert!(!steps[0].host_call_acknowledged);
+    assert_eq!((steps[0].pc, steps[0].next_pc), (0, 0));
+    prove_and_verify(steps, &code, &bitmask);
+}

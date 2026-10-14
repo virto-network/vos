@@ -424,3 +424,55 @@ with Fable.
 **Noted:** counting blobs, the default kept tail holds about 4 to 8 large
 results, and a follower further behind takes a snapshot. 4.10 measures
 it.
+
+## Step 4.4b: what workflows need in the agent
+
+**Built:**
+- **Tracked machines** (`agent/default/src/machines.rs`): `track()` arms
+  a machine's writable runs read-only.
+  - A fault on an unmarked writable page marks it, opens it and resumes;
+    any other fault stays a fault.
+  - Every write the agent makes into a machine goes through a tracked
+    write, and `written()` gives the exact set.
+  - The runs come from the program's header (`StandardHeader` in
+    vos-pvm-program).
+  - Actor runs are not tracked; workflows will be.
+- **The agent serves its machines' precompiles** on every host.
+  - An inner machine's call exits to the agent, which charges the
+    machine the fixed price (600), computes through its own precompile
+    (natively on VOS, in software on JAM), and writes the output through
+    a tracked write.
+  - The bounce costs the agent about 5.0k gas on VOS and 20.0k on JAM.
+  - Batches that run actors and hash now give byte-equal work results on
+    VOS and the JAM-only host.
+- **The prover gates a BLAKE2b call's relations on its acknowledgment,**
+  as it already did for its chip. A refine whose inner machine's call
+  the agent serves now proves (a new lib test).
+  - Each served call costs two of a proof's 1,024 slices.
+- **The agent meters its own budget** (`Batch.budget`), never the outer
+  gas.
+  - A step debits a reserve by kind (a call 300k, an ack 50k, a sweep 1M,
+    an install 8M), the gas its handler used, and 64 gas per byte of an
+    installed record read on a cache miss.
+  - Decoding is paid on top of the budget.
+  - 256 small calls take a tenth of a 1e9 budget.
+  - **Overruns:** a step that overruns waits for the next batch only
+    behind a step that ran a handler; otherwise it fails alone.
+  - The node's floor covers a full batch.
+- **Programs beside an actor have a kind,** attestable or workflow.
+  - Install binds each to a method of its kind, refusing duplicates.
+  - A workflow method is never run as a handler.
+  - `workflow_program!` builds one, and `vos install --workflow` installs
+    it.
+- **Prices:** a request's input costs 2,500 (was 2,000).
+
+**Reviewed** (Opus): GO with fixes, all in:
+- the prover's gating;
+- the meter's record reads and per-kind reserves;
+- the overrun rule behind sweeps;
+- duplicate installs;
+- the node's floor.
+
+**Also fixed on the way** (afe274a7, 8e1cbf43): a replica whose recovered
+entries wait for their blobs neither campaigns nor leads, from its first
+tick.

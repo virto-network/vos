@@ -27,9 +27,12 @@
 //!   is served (a scan's output, before it is copied).
 //! - An id the agent does not serve, including every Gray Paper id and node
 //!   extension, costs [`price::OPERATION`], answers [`code::WHAT`] and
-//!   execution continues. Precompiles are served as on every machine. A
-//!   served operation outside the invocation's [`Kind`] fails the
-//!   invocation.
+//!   execution continues. A served operation outside the invocation's
+//!   [`Kind`] fails the invocation.
+//! - A [`precompile`] call is served by the agent in every kind, at its
+//!   price, as a node serves its own machine's: its output is written into
+//!   the caller's memory and every register is left as it was. Any other id
+//!   among [`surface::PRECOMPILES`] is unserved, as on JAM.
 //! - Exceeding a [`cap`] fails the invocation.
 //! - A nested callee that fails or is refused leaves no effects: its
 //!   writes, sends and attests, and its share of the step's write cap, are
@@ -56,6 +59,10 @@ pub enum Kind {
     /// An `#[attestable]` method: no operations at all.
     #[codec(index = 2)]
     Attestable,
+    /// A `#[workflow]` method: its own program, which the agent runs as a
+    /// workflow, never as a handler.
+    #[codec(index = 3)]
+    Workflow,
 }
 
 /// The rows a row operation reaches, in its φ7.
@@ -167,7 +174,7 @@ pub mod op {
 /// command.
 pub const fn allowed(kind: Kind, op: u64) -> bool {
     match kind {
-        Kind::Attestable => false,
+        Kind::Attestable | Kind::Workflow => false,
         Kind::Query => matches!(
             op,
             op::INPUT
@@ -218,6 +225,8 @@ pub mod price {
     /// An id the agent does not serve, and the operations that only read
     /// or set registers.
     pub const OPERATION: u64 = 2_000;
+    /// The request's arguments, copied out with a `poke`.
+    pub const INPUT: u64 = 2_500;
     pub const RANDOM: u64 = 6_000;
     pub const CALLER: u64 = 6_000;
     pub const LOG: u64 = 4_000;
@@ -245,6 +254,7 @@ pub mod price {
             op::RANDOM => RANDOM,
             op::CALLER => CALLER,
             op::LOG => LOG,
+            op::INPUT => INPUT,
             _ => OPERATION,
         }
     }
@@ -292,6 +302,24 @@ pub mod cap {
 
     // Every step fits an empty result, so a batch always makes progress.
     const _: () = assert!(STEP_RESULT + 64 <= WORK_RESULT);
+}
+
+/// The precompiles the agent serves its machines, each at the price a
+/// node's own machine pays for it, on every host.
+pub mod precompile {
+    /// One BLAKE2b compression: φ7 h (64 bytes, read and written), φ8 m
+    /// (128 bytes), φ9 the counter's low 64 bits, φ10 non-zero for the last
+    /// block.
+    pub const BLAKE2B_COMPRESS: u64 = 0x400;
+
+    /// The gas a call to precompile `id` costs its caller, beside its
+    /// `ecalli`'s block, or `None` if the agent serves no precompile `id`.
+    pub const fn price(id: u64) -> Option<u64> {
+        match id {
+            BLAKE2B_COMPRESS => Some(600),
+            _ => None,
+        }
+    }
 }
 
 /// Results in φ7: the Gray Paper's host-call results.
@@ -410,8 +438,9 @@ codes! {
 pub mod surface {
     use core::ops::RangeInclusive;
 
-    /// Precompiles: the node computes them in place; elsewhere they answer
-    /// `WHAT` and the shims compute in software.
+    /// Precompiles: a VOS node computes an agent's in place, and the agent
+    /// its machines' ([`super::precompile`]); a JAM node answers `WHAT`,
+    /// and the shims compute in software.
     pub const PRECOMPILES: RangeInclusive<u64> = 0x400..=0x47f;
     /// The actor ABI, which an agent serves; ids it does not serve answer
     /// `WHAT`.
@@ -449,6 +478,13 @@ pub mod surface {
     /// An actor program's call: the actor ABI or a precompile.
     pub fn actor(id: u64) -> bool {
         ACTOR_ABI.contains(&id) || PRECOMPILES.contains(&id)
+    }
+
+    /// A workflow program's call: as an actor's, for now. No workflow runs
+    /// yet ([`super::allowed`] grants [`super::Kind::Workflow`] nothing): the
+    /// workflows' own operations decide what a workflow may call.
+    pub fn workflow(id: u64) -> bool {
+        actor(id)
     }
 
     /// An attestable program's call: a precompile only, as the prover

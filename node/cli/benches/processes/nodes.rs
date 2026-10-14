@@ -425,7 +425,7 @@ impl Space {
         let install = Install {
             instance: COUNTER,
             program: counter.to_vec(),
-            attestables: Vec::new(),
+            beside: Vec::new(),
             roles: Vec::new(),
         };
         self.operate(

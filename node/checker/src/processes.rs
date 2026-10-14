@@ -652,7 +652,7 @@ impl Processes {
             let install = Install {
                 instance: *instance,
                 program: program.to_vec(),
-                attestables: Vec::new(),
+                beside: Vec::new(),
                 roles: Vec::new(),
             };
             self.operate(

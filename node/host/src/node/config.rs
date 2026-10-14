@@ -39,7 +39,8 @@ pub struct Config {
     /// How long a leader waits for more inputs after the first, when it
     /// found its queue empty.
     pub linger: Duration,
-    /// Refine's gas for one run: a batch, or a query.
+    /// Refine's gas for one run: a query's, or a batch's budget, beyond
+    /// which a refine has what decoding its batch may take.
     pub refine_gas: u64,
     /// Accumulate's gas for the agents this node creates: their creation
     /// records carry it to every replica.
@@ -256,7 +257,8 @@ pub enum Error {
     /// install.
     Program(String),
     /// The refine gas cannot fit the largest handler with the agent's
-    /// reserves: some input could never be dispatched.
+    /// reserves behind a full batch's other inputs
+    /// (`defaults::min_refine_gas`): some input could never be dispatched.
     Gas,
     /// The data directory, the space, the network or the ingress's
     /// listener failed.

@@ -40,6 +40,7 @@ dependencies = [
 name = "counter"
 version = "0.1.0"
 dependencies = [
+ "vos-pvm-precompiles",
  "vos-sdk",
 ]
 
@@ -128,6 +129,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tally"
+version = "0.1.0"
+dependencies = [
+ "ledger",
+ "vos-sdk",
+]
+
+[[package]]
 name = "thiserror"
 version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -148,6 +157,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracker"
+version = "0.1.0"
+dependencies = [
+ "vos-agent",
+ "vos-sdk",
+]
+
+[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -164,6 +181,16 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "vos-agent"
+version = "0.1.0"
+dependencies = [
+ "vos-pvm-precompiles",
+ "vos-pvm-program",
+ "vos-sdk",
+ "vos-wire",
+]
 
 [[package]]
 name = "vos-pvm-codec"

@@ -77,19 +77,86 @@ pub mod defaults {
     pub const MAX_HANDLER_GAS: u64 = 100_000_000;
     /// A refine's gas budget: a hundred handlers at their default limit.
     pub const REFINE_GAS: u64 = 1_000_000_000;
-    /// Gas a refine keeps for a request or message beyond its handler's
-    /// limit, for the agent's own work: at most the first read of an
-    /// installed record with a schema of `schema::MAX_LEN` bytes, about
-    /// 3.2M, then the top machine and the step's framing. Checked once,
-    /// before the step: a refine stops early by at most this much, and the
-    /// node need not pack by it. Measured by the testkit's
-    /// `the_step_reserve_covers_the_largest_install`.
-    pub const STEP_RESERVE: u64 = 4_000_000;
+    /// The agent's own work on an input that may run a handler, a request
+    /// or a message's call, beyond its handler's gas and the installed
+    /// records it reads ([`RECORD_BYTE`]): admitting it, acquiring its top
+    /// machine, through the loader on JAM, and framing its step. About
+    /// 50,000 for the test actors; the rest is for larger programs, up to
+    /// about 512 KiB, whose loading grows with the blob. Measured by the
+    /// testkit's `the_reserves_cover_the_agents_own_work`.
+    ///
+    /// The agent dispatches by its own accounting of the batch's budget
+    /// ([`crate::batch::Batch::budget`]), never by the `gas` host call,
+    /// whose readings differ between hosts: an input goes only if what the
+    /// earlier steps left covers its reserve, its handler's limit and the
+    /// finish, and it takes its reserve, the gas its handler used, the
+    /// installed records it read first, and its served precompiles'
+    /// [`PRECOMPILE_SERVING`]. So every host dispatches the same steps.
+    pub const STEP_RESERVE: u64 = 300_000;
+    /// The same for an input that runs no handler: an acknowledgement, a
+    /// reply, a message that failed in refine.
+    pub const INPUT_RESERVE: u64 = 50_000;
+    /// The same for a sweep: scanning the expiry index for its due rows.
+    pub const SWEEP_RESERVE: u64 = 1_000_000;
     /// The same for an install: reading, validating and encoding a schema
     /// of `schema::MAX_LEN` bytes from its program's machine, about 6.3M.
     pub const INSTALL_RESERVE: u64 = 8_000_000;
+    /// Gas the agent takes per byte of an installed record it reads for the
+    /// first time in a refine, before it reads it: reading and decoding the
+    /// record, about 3.2M for a schema of `schema::MAX_LEN` bytes. The
+    /// refine keeps it after, and so pays a record once whatever reads it.
+    pub const RECORD_BYTE: u64 = 64;
     /// Gas a refine keeps to finish its result once its steps are written.
     pub const FINISH_RESERVE: u64 = 100_000;
+    /// Gas a refine keeps to start: the program's entry and the batch's
+    /// fixed fields. Decoding its inputs takes [`DECODE_INPUT`] more for
+    /// each, and [`DECODE_BYTE`] for every byte of the refine's arguments.
+    /// Measured by the testkit's `the_start_reserves_cover_decoding_a_batch`.
+    pub const START_RESERVE: u64 = 100_000;
+    /// Gas a refine keeps per input of its batch, for decoding it.
+    pub const DECODE_INPUT: u64 = 6_000;
+    /// Gas a refine keeps per byte of its arguments, for decoding them.
+    pub const DECODE_BYTE: u64 = 20;
+
+    /// What decoding a batch of `inputs` may take, from refine arguments of
+    /// `len` bytes: the gas a node gives a refine beyond its batch's
+    /// budget, which its steps alone take from. The agent checks that the
+    /// budget is left once it has decoded the batch, and traps otherwise.
+    pub const fn refine_start(inputs: usize, len: usize) -> u64 {
+        START_RESERVE + DECODE_INPUT * inputs as u64 + DECODE_BYTE * len as u64
+    }
+
+    /// The least budget of a batch of at most `max_inputs` that dispatches
+    /// any input that runs a handler, whatever runs before it: a sweep and
+    /// the rest of the batch's plain inputs, then the input's own reserve,
+    /// its record at the most an install writes, and the most a handler may
+    /// request, or an install; and the finish. A node refines with no less,
+    /// so every batch makes progress.
+    pub const fn min_refine_gas(max_inputs: usize) -> u64 {
+        let handler = STEP_RESERVE + RECORD_BYTE * crate::abi::cap::STEP_WRITES as u64;
+        let first = if handler > INSTALL_RESERVE {
+            handler
+        } else {
+            INSTALL_RESERVE
+        };
+        SWEEP_RESERVE
+            + INPUT_RESERVE * max_inputs.saturating_sub(1) as u64
+            + first
+            + MAX_HANDLER_GAS
+            + FINISH_RESERVE
+    }
+
+    /// Gas the agent accounts for serving one precompile call of an inner
+    /// machine, beyond the price the machine pays: the exit, the copies in
+    /// and out, and the computation, natively on a VOS node (about 5,000 in
+    /// all for a BLAKE2b compression) and in software on JAM (about
+    /// 20,000). Measured by the testkit's
+    /// `serving_a_precompile_costs_the_agent_its_bounce`.
+    ///
+    /// It is the batch's, not the machine's: a compression costs a handler
+    /// 600 of its gas and the batch's budget this much, so one step hashes
+    /// at most about 4 MiB in a refine of the default budget, on any host.
+    pub const PRECOMPILE_SERVING: u64 = 27_000;
     /// The most outbox entries one acknowledgement clears, bounding an ack
     /// step's accumulate work, far inside its gas; the node acks again for
     /// the rest.

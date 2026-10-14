@@ -3,14 +3,17 @@
 //! own work.
 
 use vos_testkit::Testkit;
-use vos_wire::Encode;
 use vos_wire::abi::cap;
 use vos_wire::defaults;
 use vos_wire::ids::{InstanceId, MethodId};
-use vos_wire::result::Outcome;
+use vos_wire::result::{Outcome, WorkResult};
 use vos_wire::schema::Schema;
+use vos_wire::{Decode, Encode};
 
-use crate::common::{AGENT, ALICE, CALLER, COUNTER, LEDGER, Node, install, ran, request, setup};
+use crate::common::{
+    AGENT, ALICE, CALLER, COUNTER, LEDGER, Node, OUTER_GAS, counter_only, install, ran, ran_done,
+    request, setup,
+};
 
 /// A refine's gas is the agent's serving plus its steps' gas, which holds
 /// what the actors run and what they are charged. Over a phase of one kind
@@ -21,7 +24,7 @@ use crate::common::{AGENT, ALICE, CALLER, COUNTER, LEDGER, Node, install, ran, r
 #[test]
 fn every_operation_pays_for_its_serving() {
     use vos_wire::abi::price::{
-        self, GET, KEY_BYTE, LOG, MACHINE, OPERATION, PER_BYTE, PUT, RANDOM, SCAN, SEND,
+        self, GET, INPUT, KEY_BYTE, LOG, MACHINE, OPERATION, PER_BYTE, PUT, RANDOM, SCAN, SEND,
     };
     let (actors, node, _, _) = setup();
     let ops = actors.method(COUNTER, "ops");
@@ -57,6 +60,8 @@ fn every_operation_pays_for_its_serving() {
     let full_scan = rows * row as u64 * PER_BYTE + rows * 1024 * KEY_BYTE;
     // A row operation's key, copied and transformed.
     let key = |len: u64| len * (PER_BYTE + KEY_BYTE);
+    // What `input` copies: the arguments of the step that measures it.
+    let input_len = ops_step(vec![(13, 0, 1000)]).2.len() as u64;
     // (name, steps before in the batch, phases before, kind, count, charge per operation)
     type Case = (&'static str, bool, Vec<(u8, u32, u32)>, u8, u32, u64);
     let cases: Vec<Case> = vec![
@@ -66,7 +71,7 @@ fn every_operation_pays_for_its_serving() {
         ("caller", false, vec![], 9, 1000, price::CALLER + bytes(33)),
         ("log", false, vec![], 10, 1000, LOG + bytes(9)),
         ("self_id", false, vec![], 12, 1000, OPERATION),
-        ("input", false, vec![], 13, 1000, OPERATION),
+        ("input", false, vec![], 13, 1000, INPUT + bytes(input_len)),
         ("get of an absent key", false, vec![], 2, 1000, GET + key(4)),
         (
             "get after 1,000 writes",
@@ -166,7 +171,7 @@ fn every_operation_pays_for_its_serving() {
             SCAN,
         ),
         ("scan after a batch of writes", true, vec![], 4, 300, SCAN),
-        ("call", false, vec![], 6, 1000, MACHINE),
+        ("call", false, vec![], 6, 900, MACHINE),
     ];
     let mut short = Vec::new();
     for (name, batched, before, kind, count, charge) in cases {
@@ -232,12 +237,12 @@ fn every_operation_pays_for_its_serving() {
     assert!(short.is_empty(), "priced without a fifth spare: {short:?}");
 }
 
-/// The agent's own work on a step leaves a fifth of its reserve spare at
-/// its most: installing a program whose schema is as large as a schema may
-/// be (`INSTALL_RESERVE`), and the first read of that installed record
-/// (`STEP_RESERVE`).
+/// The agent's own work leaves a fifth of what it takes spare at its most:
+/// installing a program whose schema is as large as a schema may be
+/// (`INSTALL_RESERVE`), and a step's first read of that installed record
+/// (`STEP_RESERVE` and the record's `RECORD_BYTE`).
 #[test]
-fn the_step_reserve_covers_the_largest_install() {
+fn the_install_reserve_and_record_price_cover_the_largest_install() {
     use vos_pvm_program::{CodeBlob, StandardProgram, build_standard_program};
     use vos_wire::abi::Kind;
     use vos_wire::schema::{MAX_LEN, MethodSchema};
@@ -276,13 +281,216 @@ fn the_step_reserve_covers_the_largest_install() {
     assert!(matches!(ran(&result.steps[0]).outcome, Outcome::Done(_)));
     let first_read = sessions.request(ALICE, big_instance, MethodId(1), ());
     let reading = node.agent_gas(vec![first_read]) - empty;
-    println!("install {installing}, first read and run {reading}");
+    let record = node.state[&vos_wire::keys::installed(big_instance)].len() as u64;
+    let taken = defaults::STEP_RESERVE + defaults::RECORD_BYTE * record;
+    println!("install {installing}, first read of {record} bytes and run {reading} of {taken}");
     assert!(
         installing <= (defaults::INSTALL_RESERVE * 4 / 5) as i64,
         "install: {installing}"
     );
-    assert!(
-        reading <= (defaults::STEP_RESERVE * 4 / 5) as i64,
-        "first read: {reading}"
+    assert!(reading <= (taken * 4 / 5) as i64, "first read: {reading}");
+}
+
+/// The agent's own work on each kind of input leaves a fifth of its reserve
+/// spare, on a VOS host and on a JAM host, which loads every machine from
+/// its blob: a request or a message running a handler that does next to
+/// nothing, beyond its first read of the installed record, which that pays
+/// for; an acknowledgement; a message failed in refine; and a sweep
+/// collecting as many sessions as a sweep may.
+#[test]
+fn the_reserves_cover_the_agents_own_work() {
+    use vos_wire::batch::{Body, Input, Message};
+    use vos_wire::ids::{AgentId, Session};
+    for (host, node) in [("VOS", Node::new()), ("JAM", Node::jam(true))] {
+        let (actors, mut node) = counter_only(node);
+        let value = actors.method(COUNTER, "value");
+        let empty = node.agent_gas(vec![]);
+        let record = node.state[&vos_wire::keys::installed(COUNTER)].len() as u64;
+        let check = |name: &str, cost: i64, taken: u64| {
+            println!("{host}: {name} costs the agent {cost} of {taken}");
+            assert!(cost <= (taken * 4 / 5) as i64, "{host}: {name}");
+        };
+        // Each a steps' worth of inputs: the first's cost, then each other's.
+        let costs = |make: &dyn Fn(u64) -> Input| {
+            let one = node.agent_gas(vec![make(1)]) - empty;
+            let many = node.agent_gas((1..=21).map(make).collect()) - empty;
+            (one, (many - one) / 20)
+        };
+        let (first, each) = costs(&|sequence| request(ALICE, sequence, COUNTER, value, vec![]));
+        check(
+            "a request's first",
+            first,
+            defaults::STEP_RESERVE + defaults::RECORD_BYTE * record,
+        );
+        check("a request", each, defaults::STEP_RESERVE);
+        let call = |sequence| {
+            Input::Message(Message {
+                from: AgentId(5),
+                sequence,
+                body: Body::Call {
+                    instance: COUNTER,
+                    method: value,
+                    arguments: vec![],
+                    awaiting: None,
+                },
+            })
+        };
+        check("a message", costs(&call).1, defaults::STEP_RESERVE);
+        // Inputs that run no handler: their cost is the refine's beyond
+        // the empty one's, every step's gas being 0.
+        let plain = |inputs: Vec<Input>| {
+            let work = node.work(1, inputs);
+            node.run_refine(&work, OUTER_GAS).gas_used as i64
+        };
+        let none = plain(vec![]);
+        let acks = |count: u32| {
+            (1..=count)
+                .map(|to| Input::Ack {
+                    to: AgentId(to),
+                    sequence: 1,
+                })
+                .collect::<Vec<_>>()
+        };
+        check(
+            "an ack",
+            (plain(acks(21)) - none) / 21,
+            defaults::INPUT_RESERVE,
+        );
+        let failed = (1..=21)
+            .map(|sequence| Input::Failed {
+                from: AgentId(5),
+                sequence,
+                awaiting: None,
+            })
+            .collect();
+        check(
+            "a failed message",
+            (plain(failed) - none) / 21,
+            defaults::INPUT_RESERVE,
+        );
+        // Sessions created long ago, more than a sweep collects.
+        let bucket = defaults::SESSION_BUCKET_MS;
+        let created = (0..2 * defaults::SWEEP_LIMIT as u8)
+            .map(|name| {
+                let session = Session {
+                    key: [name; 32],
+                    name: [name; 16],
+                    t0: 10 * bucket,
+                };
+                crate::common::increment_in(&actors, session, 1)
+            })
+            .collect();
+        node.batch(10 * bucket, created);
+        let later = 10 * bucket + defaults::SESSION_EXPIRY_MS + 2 * bucket;
+        let sweeping = node.run_refine(&node.work(later, vec![Input::Sweep]), OUTER_GAS);
+        let swept = WorkResult::decode(&sweeping.output_bounded(cap::WORK_RESULT).unwrap())
+            .unwrap()
+            .0;
+        assert!(
+            matches!(&swept.steps[0], vos_wire::result::Step::Swept { due } if due.len() == defaults::SWEEP_LIMIT)
+        );
+        let idle = node
+            .run_refine(&node.work(later, vec![]), OUTER_GAS)
+            .gas_used;
+        check(
+            "a full sweep",
+            (sweeping.gas_used - idle) as i64,
+            defaults::SWEEP_RESERVE,
+        );
+    }
+}
+
+/// An actor's precompile call exits to the agent, which serves it: the
+/// actor pays the node's price for it on every host, and the agent's own
+/// work serving it, its bounce (the exit, the copies, and the compression,
+/// natively on a VOS node and in software on JAM), leaves a fifth of what
+/// the agent accounts for it spare (`PRECOMPILE_SERVING`).
+#[test]
+fn serving_a_precompile_costs_the_agent_its_bounce() {
+    use vos_wire::abi::precompile::{BLAKE2B_COMPRESS, price};
+    let price = price(BLAKE2B_COMPRESS).unwrap();
+    let mut actor_gas = Vec::new();
+    for (host, node) in [("VOS", Node::new()), ("JAM", Node::jam(true))] {
+        let (actors, node) = counter_only(node);
+        let ops = actors.method(COUNTER, "ops");
+        // The refine's gas and its step's, with `count` compressions.
+        let run = |count: u32| {
+            let arguments = (vec![(19u8, 0u32, count)], (0u32, 0u32)).encode();
+            let work = node.work(1, vec![request(ALICE, 1, COUNTER, ops, arguments)]);
+            let invocation = node.run_refine(&work, OUTER_GAS);
+            let bytes = invocation.output_bounded(cap::WORK_RESULT).unwrap();
+            let (result, _) = WorkResult::decode(&bytes).unwrap();
+            let used = ran_done(&result.steps[0]).gas_used;
+            (invocation.gas_used as i64, used as i64)
+        };
+        let ((refine, used), (refine_without, used_without)) = (run(1000), run(0));
+        let per_call = (used - used_without) / 1000;
+        let bounce = price as i64 + (refine - used - (refine_without - used_without)) / 1000;
+        println!(
+            "{host}: a compression costs the actor {per_call}, {price} of it its price; \
+             serving it costs the agent {bounce}"
+        );
+        actor_gas.push(per_call);
+        assert!(
+            bounce <= (defaults::PRECOMPILE_SERVING * 4 / 5) as i64,
+            "{host}: {bounce}"
+        );
+    }
+    assert_eq!(
+        actor_gas[0], actor_gas[1],
+        "the actor pays the same on both"
     );
+}
+
+/// What a refine spends before its first step, decoding its batch, and on
+/// finishing it, leaves a fifth spare of what a node gives it for them
+/// beyond its budget (`refine_start`): the start, a share for each input and
+/// one for each byte of its arguments. Measured with a budget of nothing, on
+/// batches of many small inputs and of large arguments.
+#[test]
+fn the_start_reserves_cover_decoding_a_batch() {
+    use vos_wire::batch::{Body, Input, Message};
+    use vos_wire::ids::AgentId;
+    let (actors, node, _, _) = setup();
+    let increment = actors.method(COUNTER, "increment");
+    let requests = |count: u64, len: usize| -> Vec<Input> {
+        (1..=count)
+            .map(|sequence| request(ALICE, sequence, COUNTER, increment, vec![7; len]))
+            .collect()
+    };
+    let messages = |count: u64, len: usize| -> Vec<Input> {
+        (1..=count)
+            .map(|sequence| {
+                Input::Message(Message {
+                    from: AgentId(5),
+                    sequence,
+                    body: Body::Call {
+                        instance: COUNTER,
+                        method: increment,
+                        arguments: vec![7; len],
+                        awaiting: None,
+                    },
+                })
+            })
+            .collect()
+    };
+    for (name, inputs) in [
+        ("no input", vec![]),
+        ("a request", requests(1, 8)),
+        ("256 requests", requests(256, 8)),
+        ("256 messages", messages(256, 8)),
+        ("a request of 60 KB", requests(1, 60_000)),
+        ("16 requests of 60 KB", requests(16, 60_000)),
+    ] {
+        let count = inputs.len() as u64;
+        let work = node.budgeted_work(1, [0; 32], 0, inputs);
+        let arguments = node.arguments(&work).len() as u64;
+        let invocation = node.run_refine(&work, OUTER_GAS);
+        let (result, _) =
+            WorkResult::decode(&invocation.output_bounded(cap::WORK_RESULT).unwrap()).unwrap();
+        assert!(result.steps.is_empty(), "{name}: nothing dispatched");
+        let kept = defaults::refine_start(count as usize, arguments as usize);
+        println!("{name}: {} of {kept}", invocation.gas_used);
+        assert!(invocation.gas_used <= kept * 4 / 5, "{name}");
+    }
 }

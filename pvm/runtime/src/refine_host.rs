@@ -60,7 +60,8 @@ pub enum RefineObservation<'a> {
         exit: ExitReason,
         machine: &'a crate::interpreter::Interpreter,
     },
-    /// A precompile served in place inside the current slice.
+    /// An outer precompile served in place inside the current slice. An
+    /// inner machine's precompile call exits to the outer machine instead.
     Precompile {
         identity: RefineMachineIdentity,
         call: &'a crate::precompile::PrecompileCall,
@@ -110,8 +111,7 @@ pub struct RefineContext {
     /// Where `instantiate` finds a program its pool lacks.
     #[cfg(feature = "std")]
     programs: Option<alloc::sync::Arc<dyn ProgramSource>>,
-    /// Whether precompiles are computed in place, here and in inner
-    /// machines.
+    /// Whether the outer machine's precompiles are computed in place.
     precompiles: bool,
 }
 
@@ -160,11 +160,10 @@ impl RefineContext {
     }
 
     /// Compute no precompile, as a JAM node does: the outer machine's
-    /// reach the embedder, and inner machines' return to the outer machine
-    /// as host calls.
+    /// reach the embedder. An inner machine's return to the outer machine
+    /// as host calls on every host, for its agent to serve.
     pub fn without_precompiles(mut self) -> Self {
         self.precompiles = false;
-        self.inner.without_precompiles();
         self
     }
 
@@ -833,12 +832,6 @@ impl RefineContext {
                     observer(RefineObservation::Instruction {
                         identity: RefineMachineIdentity::Inner(identity),
                         instruction,
-                    });
-                }
-                InnerMachineObservation::Precompile { identity, call } => {
-                    observer(RefineObservation::Precompile {
-                        identity: RefineMachineIdentity::Inner(identity),
-                        call,
                     });
                 }
                 InnerMachineObservation::Exit {
@@ -1673,8 +1666,7 @@ mod tests {
         let code = [10, 9, 51, 8, b0, b1, b2, 10, 13, 50, 0];
         let outer = standard_program_with_rw(&code, &[0, 2, 7, 9], &frame);
         let [id_lo, id_hi] = id.to_le_bytes();
-        // ecalli id; trap. The inner machine maps no pages, so a served
-        // compression faults on its pointers after paying.
+        // ecalli id; trap.
         let inner = vec![0, 1, 4, 10, id_lo, id_hi, 0, 0b0000_1001];
         let mut context =
             RefineContext::load_with(&outer, &inner, 1_000_000, MemoryModel::Sparse).unwrap();
@@ -1688,42 +1680,22 @@ mod tests {
         (invocation.registers[7], u64::from_le_bytes(left))
     }
 
+    /// An inner machine's precompile call returns to the outer machine as a
+    /// host call, unpriced, whether or not the host computes the outer
+    /// machine's: its agent serves it, on every host. Without precompiles,
+    /// as on a JAM node, the outer machine's own reach the embedder.
     #[test]
-    fn inner_machine_precompile_pays_the_same_price() {
-        const PANIC: u64 = 1;
-        const HOST: u64 = 3;
-        const OUT_OF_GAS: u64 = 4;
-        let (outcome, unpriced_left) = invoke_inner_call(0x4ff, 100_000);
-        assert_eq!(outcome, HOST, "an unknown id returns to the outer machine");
-        let (outcome, priced_left) =
-            invoke_inner_call(crate::precompile::BLAKE2B_COMPRESS as u16, 100_000);
-        assert_eq!(
-            outcome, PANIC,
-            "the served call faults on unmapped pointers"
-        );
-        assert_eq!(
-            unpriced_left - priced_left,
-            crate::precompile::BLAKE2B_COMPRESS_GAS
-        );
-
-        // Funds the block but not the price.
-        let blocks = 100_000 - unpriced_left;
-        let budget = blocks + crate::precompile::BLAKE2B_COMPRESS_GAS - 1;
-        let (outcome, left) = invoke_inner_call(crate::precompile::BLAKE2B_COMPRESS as u16, budget);
-        assert_eq!(outcome, OUT_OF_GAS);
-        assert_eq!(left, 0);
-    }
-
-    /// Without precompiles, as on a JAM node, an inner machine's call
-    /// returns to the outer machine unpriced, and the outer machine's own
-    /// reaches the embedder.
-    #[test]
-    fn without_precompiles_they_reach_the_caller() {
+    fn an_inner_machines_precompile_reaches_its_agent() {
         const HOST: u64 = 3;
         let id = crate::precompile::BLAKE2B_COMPRESS as u16;
-        let (outcome, left) = invoke_inner_call_on(id, 100_000, false);
-        assert_eq!(outcome, HOST);
-        assert_eq!(left, invoke_inner_call(0x4ff, 100_000).1, "unpriced");
+        let (_, unknown) = invoke_inner_call(0x4ff, 100_000);
+        for precompiles in [true, false] {
+            assert_eq!(
+                invoke_inner_call_on(id, 100_000, precompiles),
+                (HOST, unknown),
+                "precompiles {precompiles}"
+            );
+        }
 
         let [id_lo, id_hi] = id.to_le_bytes();
         let outer = standard_program(&[10, id_lo, id_hi, 50, 0], &[0, 3]);

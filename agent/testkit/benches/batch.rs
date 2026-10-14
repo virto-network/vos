@@ -29,7 +29,9 @@ const AGENT: AgentId = AgentId(7);
 const COUNTER: InstanceId = InstanceId(1);
 const LEDGER: InstanceId = InstanceId(2);
 const ALICE: Principal = Principal::Client([1; 32]);
+/// A refine's gas: its batch's budget, and room beyond it for decoding.
 const GAS: u64 = 4_000_000_000;
+const BUDGET: u64 = vos_wire::defaults::REFINE_GAS;
 const ROUNDS: usize = 9;
 
 struct Snapshot(BTreeMap<Vec<u8>, Vec<u8>>);
@@ -93,7 +95,7 @@ impl Node {
             Input::Admin(Admin::Install {
                 instance,
                 program,
-                attestables: vec![],
+                beside: vec![],
                 roles: vec![],
             })
         };
@@ -107,7 +109,7 @@ impl Node {
             version: self.version,
             time: 1,
             seed: [0; 32],
-            budget: GAS,
+            budget: BUDGET,
             inputs,
         });
         let arguments = RefineArgs {
@@ -253,7 +255,7 @@ fn main() {
                     version: node.version,
                     time: 1,
                     seed: [0; 32],
-                    budget: GAS,
+                    budget: BUDGET,
                     inputs: Vec::new(),
                 });
                 let arguments = RefineArgs {

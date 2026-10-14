@@ -92,6 +92,15 @@ fn message() -> impl Strategy<Value = Message> {
     })
 }
 
+fn kind() -> impl Strategy<Value = Kind> {
+    prop_oneof![
+        Just(Kind::Command),
+        Just(Kind::Query),
+        Just(Kind::Attestable),
+        Just(Kind::Workflow),
+    ]
+}
+
 fn input() -> impl Strategy<Value = Input> {
     prop_oneof![
         (
@@ -123,16 +132,18 @@ fn input() -> impl Strategy<Value = Input> {
         (
             any::<u32>(),
             any::<[u8; 32]>(),
-            prop::collection::vec((any::<u32>(), any::<[u8; 32]>()), 0..3),
+            prop::collection::vec((any::<u32>(), kind(), any::<[u8; 32]>()), 0..3),
             prop::collection::vec((bytes(), any::<u8>()), 0..3),
         )
-            .prop_map(|(instance, program, attestables, roles)| {
+            .prop_map(|(instance, program, beside, roles)| {
                 Input::Admin(Admin::Install {
                     instance: InstanceId(instance),
                     program: ProgramHash(program),
-                    attestables: attestables
+                    beside: beside
                         .into_iter()
-                        .map(|(method, program)| (MethodId(method), ProgramHash(program)))
+                        .map(|(method, kind, program)| {
+                            (MethodId(method), kind, ProgramHash(program))
+                        })
                         .collect(),
                     roles,
                 })
@@ -488,6 +499,7 @@ fn kinds_reach_only_their_operations() {
         assert!(abi::allowed(Kind::Command, id));
         assert_eq!(abi::allowed(Kind::Query, id), !writes.contains(&id));
         assert!(!abi::allowed(Kind::Attestable, id));
+        assert!(!abi::allowed(Kind::Workflow, id));
     }
     for unknown in [0, 5, 0x480, 0x4ff, 0x507, 0x524, 0x5ff] {
         assert!(!abi::allowed(Kind::Command, unknown));
@@ -613,6 +625,87 @@ fn kinds_encode_as_the_index_the_agent_passes() {
     assert_eq!(Kind::Command.encode(), [0]);
     assert_eq!(Kind::Query.encode(), [1]);
     assert_eq!(Kind::Attestable.encode(), [2]);
+    assert_eq!(Kind::Workflow.encode(), [3]);
+    assert!(Kind::decode(&[4]).is_err());
+}
+
+/// An install names its programs beside the actor's, each with its method
+/// and kind: in the batch, in the installed record the agent keeps, and in
+/// the operator's request, which carries the blobs.
+#[test]
+fn installs_keep_their_bytes() {
+    use vos_wire::ingress::Install;
+    use vos_wire::records::Installed;
+    use vos_wire::schema::Schema;
+    let beside = vec![
+        (
+            MethodId(0x0a0b_0c0d),
+            Kind::Attestable,
+            ProgramHash([1; 32]),
+        ),
+        (MethodId(0x0e0f_1011), Kind::Workflow, ProgramHash([2; 32])),
+    ];
+    let entry = |method: u32, kind: u8, program: &[u8]| {
+        [&method.to_le_bytes()[..], &[kind], program].concat()
+    };
+    let entries = [
+        &2u32.to_le_bytes()[..],
+        &entry(0x0a0b_0c0d, 2, &[1; 32]),
+        &entry(0x0e0f_1011, 3, &[2; 32]),
+    ]
+    .concat();
+    let roles = [&1u32.to_le_bytes()[..], &1u32.to_le_bytes(), b"m", &[7]].concat();
+    let admin = Admin::Install {
+        instance: InstanceId(5),
+        program: ProgramHash([3; 32]),
+        beside: beside.clone(),
+        roles: vec![(b"m".to_vec(), 7)],
+    };
+    let fields = [&5u32.to_le_bytes()[..], &[3; 32], &entries, &roles].concat();
+    assert_eq!(admin.encode(), [&[0][..], &fields].concat());
+
+    let installed = Installed {
+        program: ProgramHash([3; 32]),
+        beside: beside.clone(),
+        roles: vec![(b"m".to_vec(), 7)],
+        schema: Schema { methods: vec![] },
+    };
+    let record = [&[3; 32][..], &entries, &roles, &0u32.to_le_bytes()].concat();
+    assert_eq!(installed.encode(), record);
+    assert_eq!(
+        installed.programs().collect::<Vec<_>>(),
+        [
+            ProgramHash([3; 32]),
+            ProgramHash([1; 32]),
+            ProgramHash([2; 32])
+        ],
+        "every program the agent pins"
+    );
+    assert_eq!(
+        installed.bound(MethodId(0x0e0f_1011), Kind::Workflow),
+        Some(ProgramHash([2; 32]))
+    );
+    assert_eq!(installed.attestable(MethodId(0x0e0f_1011)), None);
+
+    let install = Install {
+        instance: InstanceId(5),
+        program: vec![9],
+        beside: vec![(MethodId(0x0e0f_1011), Kind::Workflow, vec![8, 8])],
+        roles: vec![],
+    };
+    let request = [
+        &5u32.to_le_bytes()[..],
+        &1u32.to_le_bytes(),
+        &[9],
+        &1u32.to_le_bytes(),
+        &0x0e0f_1011u32.to_le_bytes(),
+        &[3],
+        &2u32.to_le_bytes(),
+        &[8, 8],
+        &0u32.to_le_bytes(),
+    ]
+    .concat();
+    assert_eq!(install.encode(), request);
 }
 
 #[test]

@@ -2,17 +2,19 @@
 
 use alloc::vec::Vec;
 
+use crate::abi::Kind;
 use crate::ids::{MethodId, ProgramHash};
 use crate::schema::Schema;
 use crate::{Decode, Encode};
 
 /// An installed instance, under [`crate::keys::installed`]: its program,
-/// the program bound to each attestable method, the agent's role byte for
-/// each role name, and the program's schema, read once at install.
+/// the programs beside it, each bound to a method of its kind, the agent's
+/// role byte for each role name, and the program's schema, read once at
+/// install.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Installed {
     pub program: ProgramHash,
-    pub attestables: Vec<(MethodId, ProgramHash)>,
+    pub beside: Vec<(MethodId, Kind, ProgramHash)>,
     pub roles: Vec<(Vec<u8>, u8)>,
     pub schema: Schema,
 }
@@ -25,11 +27,21 @@ impl Installed {
             .map(|(_, byte)| *byte)
     }
 
-    pub fn attestable(&self, method: MethodId) -> Option<ProgramHash> {
-        self.attestables
+    /// The program bound to `method` as a method of `kind`.
+    pub fn bound(&self, method: MethodId, kind: Kind) -> Option<ProgramHash> {
+        self.beside
             .iter()
-            .find(|(bound, _)| *bound == method)
-            .map(|(_, program)| *program)
+            .find(|(bound, of, _)| *bound == method && *of == kind)
+            .map(|(_, _, program)| *program)
+    }
+
+    pub fn attestable(&self, method: MethodId) -> Option<ProgramHash> {
+        self.bound(method, Kind::Attestable)
+    }
+
+    /// Every program the instance runs, its own first: what its agent pins.
+    pub fn programs(&self) -> impl Iterator<Item = ProgramHash> + '_ {
+        core::iter::once(self.program).chain(self.beside.iter().map(|(_, _, program)| *program))
     }
 }
 

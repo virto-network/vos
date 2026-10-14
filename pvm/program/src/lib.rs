@@ -68,37 +68,87 @@ fn zone_round(value: u64) -> Option<u64> {
         .map(|rounded| rounded / u64::from(ZONE_SIZE) * u64::from(ZONE_SIZE))
 }
 
-impl StandardProgram {
-    /// Compute the initial flat-memory layout and register file.
-    pub fn layout<'a>(&'a self, args: &'a [u8]) -> Option<StandardLayout<'a>> {
-        let ro_size = self.ro_data.len() as u64;
-        let rw_size = self.rw_data.len() as u64;
-        let stack_size = u64::from(self.stack_size);
-        let args_size = args.len() as u64;
-        if args_size > u64::from(INPUT_SIZE) {
-            return None;
-        }
+/// A standard program's memory sizes, from the first [`Self::LEN`] bytes of
+/// its blob: all its layout needs, without its data or code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StandardHeader {
+    pub ro_size: u32,
+    pub rw_size: u32,
+    pub heap_pages: u32,
+    pub stack_size: u32,
+}
 
+impl StandardHeader {
+    /// The bytes of a blob that hold its header.
+    pub const LEN: usize = 11;
+
+    /// The header `blob` starts with.
+    pub fn read(blob: &[u8]) -> Option<Self> {
+        let field = |offset, width| u32::try_from(read_le(blob, offset, width)?).ok();
+        Some(Self {
+            ro_size: field(0, 3)?,
+            rw_size: field(3, 3)?,
+            heap_pages: field(6, 2)?,
+            stack_size: field(8, 3)?,
+        })
+    }
+
+    /// Where the standard layout places the read-only data, the read-write
+    /// data with its heap, and the stack, each whole pages; `None` when
+    /// they do not fit the address space beside the argument window.
+    pub fn regions(&self) -> Option<[Region; 3]> {
+        let ro_size = u64::from(self.ro_size);
+        let stack_size = u64::from(self.stack_size);
         let ro_zone = zone_round(ro_size)?;
-        let rw_total = rw_size.checked_add(u64::from(self.heap_pages) * u64::from(PAGE_SIZE))?;
-        let rw_zone = zone_round(rw_total)?;
-        let stack_zone = zone_round(stack_size)?;
+        let rw_total = u64::from(self.rw_size)
+            .checked_add(u64::from(self.heap_pages) * u64::from(PAGE_SIZE))?;
         let total = 5u64
             .checked_mul(u64::from(ZONE_SIZE))?
             .checked_add(ro_zone)?
-            .checked_add(rw_zone)?
-            .checked_add(stack_zone)?
+            .checked_add(zone_round(rw_total)?)?
+            .checked_add(zone_round(stack_size)?)?
             .checked_add(u64::from(INPUT_SIZE))?;
         if total > ADDRESS_SPACE {
             return None;
         }
-
-        let ro_base = u64::from(ZONE_SIZE);
-        let rw_base = 2 * u64::from(ZONE_SIZE) + ro_zone;
         let stack_top = ADDRESS_SPACE - 2 * u64::from(ZONE_SIZE) - u64::from(INPUT_SIZE);
-        let stack_bottom = stack_top.checked_sub(page_round(stack_size)?)?;
+        Some([
+            Region {
+                base: u64::from(ZONE_SIZE),
+                size: page_round(ro_size)?,
+                writable: false,
+            },
+            Region {
+                base: 2 * u64::from(ZONE_SIZE) + ro_zone,
+                size: page_round(rw_total)?,
+                writable: true,
+            },
+            Region {
+                base: stack_top.checked_sub(page_round(stack_size)?)?,
+                size: page_round(stack_size)?,
+                writable: true,
+            },
+        ])
+    }
+}
+
+impl StandardProgram {
+    /// Compute the initial flat-memory layout and register file.
+    pub fn layout<'a>(&'a self, args: &'a [u8]) -> Option<StandardLayout<'a>> {
+        let args_size = args.len() as u64;
+        if args_size > u64::from(INPUT_SIZE) {
+            return None;
+        }
+        let header = StandardHeader {
+            ro_size: u32::try_from(self.ro_data.len()).ok()?,
+            rw_size: u32::try_from(self.rw_data.len()).ok()?,
+            heap_pages: self.heap_pages,
+            stack_size: self.stack_size,
+        };
+        let [ro, rw, stack] = header.regions()?;
+        let stack_top = stack.base + stack.size;
         let args_base = ADDRESS_SPACE - u64::from(ZONE_SIZE) - u64::from(INPUT_SIZE);
-        let heap_top = rw_base.checked_add(page_round(rw_total)?)?;
+        let heap_top = rw.base.checked_add(rw.size)?;
 
         let mut registers = [0; REGISTER_COUNT];
         registers[0] = HALT_ADDRESS;
@@ -107,21 +157,9 @@ impl StandardProgram {
         registers[8] = args_size;
 
         Some(StandardLayout {
-            ro: Region {
-                base: ro_base,
-                size: page_round(ro_size)?,
-                writable: false,
-            },
-            rw: Region {
-                base: rw_base,
-                size: page_round(rw_total)?,
-                writable: true,
-            },
-            stack: Region {
-                base: stack_bottom,
-                size: page_round(stack_size)?,
-                writable: true,
-            },
+            ro,
+            rw,
+            stack,
             args: Region {
                 base: args_base,
                 size: page_round(args_size)?,
@@ -298,11 +336,10 @@ pub fn parse_standard_program(blob: &[u8]) -> Option<StandardProgram> {
     if blob.len() < 15 {
         return None;
     }
-    let ro_size = usize::try_from(read_le(blob, 0, 3)?).ok()?;
-    let rw_size = usize::try_from(read_le(blob, 3, 3)?).ok()?;
-    let heap_pages = u32::try_from(read_le(blob, 6, 2)?).ok()?;
-    let stack_size = u32::try_from(read_le(blob, 8, 3)?).ok()?;
-    let mut offset = 11usize;
+    let header = StandardHeader::read(blob)?;
+    let (ro_size, rw_size) = (header.ro_size as usize, header.rw_size as usize);
+    let (heap_pages, stack_size) = (header.heap_pages, header.stack_size);
+    let mut offset = StandardHeader::LEN;
     let ro_end = offset.checked_add(ro_size)?;
     let ro_data = copy_bytes(blob.get(offset..ro_end)?)?;
     offset = ro_end;
@@ -387,6 +424,20 @@ mod tests {
         assert_eq!(layout.registers[0], HALT_ADDRESS);
         assert_eq!(layout.registers[7], layout.args.base);
         assert_eq!(layout.registers[8], 3);
+    }
+
+    /// A blob's first bytes alone place its regions as its whole layout does.
+    #[test]
+    fn the_header_places_the_layouts_regions() {
+        let program = sample();
+        let bytes = build_standard_program(&program).unwrap();
+        let header = StandardHeader::read(&bytes[..StandardHeader::LEN]).unwrap();
+        let layout = program.layout(&[]).unwrap();
+        assert_eq!(header.regions(), Some([layout.ro, layout.rw, layout.stack]));
+        assert_eq!(
+            StandardHeader::read(&bytes[..StandardHeader::LEN - 1]),
+            None
+        );
     }
 
     #[test]

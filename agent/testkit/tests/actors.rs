@@ -4,8 +4,8 @@
 
 use vos_testkit::programs::{actor, method, schema};
 use vos_testkit::{InstallError, Testkit, decode, program_hash};
-use vos_wire::abi::Failure;
-use vos_wire::ids::{AgentId, InstanceId, Principal};
+use vos_wire::abi::{Failure, Kind};
+use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal};
 use vos_wire::result::Outcome;
 use vos_wire::{Decode, Encode};
 
@@ -21,19 +21,23 @@ fn reply<T: Decode>(outcome: Outcome) -> T {
     }
 }
 
+/// The ledger's programs beside its own: its attestable's and its
+/// workflow's.
+fn beside<'a>(ledger: &[u8]) -> Vec<(MethodId, Kind, &'a [u8])> {
+    static PROGRAMS: std::sync::OnceLock<(Vec<u8>, Vec<u8>)> = std::sync::OnceLock::new();
+    let (checksum, tally) = PROGRAMS.get_or_init(|| (actor("checksum"), actor("tally")));
+    vec![
+        (method(ledger, "checksum"), Kind::Attestable, checksum),
+        (method(ledger, "tally"), Kind::Workflow, tally),
+    ]
+}
+
 fn kit() -> Testkit {
     let mut kit = Testkit::new(AgentId(7));
     kit.install(COUNTER, &actor("counter"), &[], &[]).unwrap();
     let ledger = actor("ledger");
-    let checksum = actor("checksum");
-    let checksum_method = method(&ledger, "checksum");
-    kit.install(
-        LEDGER,
-        &ledger,
-        &[(checksum_method, &checksum)],
-        &[("minter", 1)],
-    )
-    .unwrap();
+    kit.install(LEDGER, &ledger, &beside(&ledger), &[("minter", 1)])
+        .unwrap();
     kit.install(CALLER, &actor("caller"), &[], &[]).unwrap();
     kit
 }
@@ -80,6 +84,7 @@ fn programs_carry_their_schema_first_in_read_only_data() {
             "fill",
             "spam",
             "ops",
+            "hash",
             "stamp"
         ]
     );
@@ -90,6 +95,9 @@ fn programs_carry_their_schema_first_in_read_only_data() {
     assert_eq!(mint.role.as_deref(), Some(&b"minter"[..]));
     let transfer = schema.method(method(&ledger, "transfer")).unwrap();
     assert_eq!(transfer.gas, Some(2_000_000));
+    let kinds = |name| schema.method(method(&ledger, name)).unwrap().kind;
+    assert_eq!(kinds("checksum"), Kind::Attestable);
+    assert_eq!(kinds("tally"), Kind::Workflow);
 }
 
 #[test]
@@ -192,23 +200,42 @@ fn an_attestable_method_runs_as_its_own_program() {
 }
 
 #[test]
-fn installing_needs_every_attestable_program_and_role() {
+fn installing_needs_every_attestable_and_workflow_program_and_role() {
     let mut kit = Testkit::new(AgentId(7));
     let ledger = actor("ledger");
+    let all = beside(&ledger);
     assert_eq!(
-        kit.install(LEDGER, &ledger, &[], &[("minter", 1)]),
+        kit.install(LEDGER, &ledger, &all[1..], &[("minter", 1)]),
         Err(InstallError::Unbound(method(&ledger, "checksum")))
     );
-    let checksum = actor("checksum");
     assert_eq!(
-        kit.install(
-            LEDGER,
-            &ledger,
-            &[(method(&ledger, "checksum"), &checksum)],
-            &[]
-        ),
+        kit.install(LEDGER, &ledger, &all[..1], &[("minter", 1)]),
+        Err(InstallError::Unbound(method(&ledger, "tally")))
+    );
+    // Each program runs a method of its own kind.
+    let (checksum, tally) = (all[0], all[1]);
+    let swapped = [(checksum.0, Kind::Workflow, checksum.2), tally];
+    assert_eq!(
+        kit.install(LEDGER, &ledger, &swapped, &[("minter", 1)]),
+        Err(InstallError::Unmatched(checksum.0))
+    );
+    let mut twice = all.clone();
+    twice.push(tally);
+    assert_eq!(
+        kit.install(LEDGER, &ledger, &twice, &[("minter", 1)]),
+        Err(InstallError::Duplicate(tally.0))
+    );
+    let mut stray = all.clone();
+    stray.push((method(&ledger, "mint"), Kind::Attestable, checksum.2));
+    assert_eq!(
+        kit.install(LEDGER, &ledger, &stray, &[("minter", 1)]),
+        Err(InstallError::Unmatched(method(&ledger, "mint")))
+    );
+    assert_eq!(
+        kit.install(LEDGER, &ledger, &all, &[]),
         Err(InstallError::UnmappedRole(b"minter".to_vec()))
     );
+    assert_eq!(kit.install(LEDGER, &ledger, &all, &[("minter", 1)]), Ok(()));
 }
 
 #[test]
@@ -285,13 +312,10 @@ fn an_attestable_program_may_not_make_host_calls() {
     .unwrap();
     let ledger = actor("ledger");
     let mut kit = Testkit::new(AgentId(7));
-    kit.install(
-        LEDGER,
-        &ledger,
-        &[(method(&ledger, "checksum"), &bad)],
-        &[("minter", 1)],
-    )
-    .unwrap();
+    let mut programs = beside(&ledger);
+    programs[0].2 = &bad;
+    kit.install(LEDGER, &ledger, &programs, &[("minter", 1)])
+        .unwrap();
     let step = call(&mut kit, LEDGER, "audit", vec![1u64]);
     assert_eq!(
         step.outcome,

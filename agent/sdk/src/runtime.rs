@@ -106,6 +106,28 @@ macro_rules! actor_program {
 #[macro_export]
 macro_rules! attestable_program {
     ($run:path) => {
+        $crate::__method_program!($run);
+    };
+}
+
+/// The program of a workflow: `workflow_program!(path)`, where `path` is the
+/// `__vos_workflow_<method>` function `#[messages]` generates. It is laid
+/// out as an attestable's program is: the arguments in the standard
+/// argument window, the result by the halt convention. An install binds it
+/// to its method, and the agent pins it with the install's other programs.
+#[macro_export]
+macro_rules! workflow_program {
+    ($run:path) => {
+        $crate::__method_program!($run);
+    };
+}
+
+/// A method's own program, entered with its arguments in the standard
+/// window and leaving its output by the halt convention.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __method_program {
+    ($run:path) => {
         $crate::program_runtime!($crate::runtime::PROGRAM_HEAP);
 
         #[cfg(target_arch = "riscv64")]
@@ -114,7 +136,7 @@ macro_rules! attestable_program {
             ".type _start, @function",
             "_start:",
             "mv s0, ra",
-            "jal ra, vos_attest_entry",
+            "jal ra, vos_method_entry",
             "mv ra, s0",
             "ret",
         );
@@ -127,7 +149,7 @@ macro_rules! attestable_program {
 
         #[cfg(target_arch = "riscv64")]
         #[unsafe(no_mangle)]
-        extern "C" fn vos_attest_entry(arguments: *const u8, len: u64) -> VosOutput {
+        extern "C" fn vos_method_entry(arguments: *const u8, len: u64) -> VosOutput {
             // SAFETY: the loader maps the argument window read-only at
             // (φ7, φ8) for the whole invocation.
             let arguments = unsafe { ::core::slice::from_raw_parts(arguments, len as usize) };

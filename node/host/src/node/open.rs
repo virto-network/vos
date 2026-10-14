@@ -37,10 +37,7 @@ impl Node {
     /// Open the node's data directory `data` (its store and admin token),
     /// join its space and start every agent it replicates.
     pub fn open(data: impl AsRef<Path>, config: Config) -> Result<Self, Error> {
-        let largest = defaults::MAX_HANDLER_GAS
-            + defaults::STEP_RESERVE.max(defaults::INSTALL_RESERVE)
-            + defaults::FINISH_RESERVE;
-        if config.refine_gas < largest {
+        if config.refine_gas < defaults::min_refine_gas(config.max_inputs.max(1)) {
             return Err(Error::Gas);
         }
         let data = data.as_ref().to_path_buf();

@@ -8,6 +8,12 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[lib]
+name = "vos_agent"
+path = "src/lib.rs"
+test = false
+bench = false
+
 [[bin]]
 name = "vos-agent"
 path = "src/main.rs"

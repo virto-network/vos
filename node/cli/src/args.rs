@@ -148,6 +148,9 @@ pub struct InstallArgs {
     /// An attestable method's program: `METHOD=ELF`.
     #[arg(long = "attestable")]
     pub attestables: Vec<String>,
+    /// A workflow's program: `METHOD=ELF`.
+    #[arg(long = "workflow")]
+    pub workflows: Vec<String>,
     /// A role name's byte: `NAME=BYTE`.
     #[arg(long = "role")]
     pub roles: Vec<String>,

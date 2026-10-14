@@ -28,6 +28,11 @@ use crate::Proof;
 ///     instead of one byte per page.
 pub const REFINE_BUNDLE_FORMAT_VERSION: u32 = 4;
 /// Post-decode protocol ceiling for independently proven machine slices.
+///
+/// An inner machine's precompile call ends its slice at a host exit, and its
+/// agent serves it in a slice of its own, so each served call costs two: a
+/// proven refine holds about 500 BLAKE2b compressions of its machines.
+/// Proving attestable methods (slice 5) inherits that bound.
 pub const MAX_REFINE_PROOF_SLICES: usize = 1_024;
 /// A handled outer host call can contribute at most one boundary per slice.
 pub const MAX_REFINE_HOST_BOUNDARIES: usize = MAX_REFINE_PROOF_SLICES;
@@ -1777,6 +1782,77 @@ mod tests {
         // once more after its invocation mutates the invoke frame.
         assert_eq!(metrics.full_value_scans, 3);
         assert_eq!(metrics.full_permission_scans, 2);
+    }
+
+    /// An inner machine's BLAKE2b call exits to its outer machine, which
+    /// serves it in place with its own call before resuming the inner one:
+    /// the inner slice ends at the unacknowledged call, the outer slice holds
+    /// the acknowledged one, and the whole refine proves and verifies.
+    #[test]
+    fn a_refine_serving_an_inner_precompile_proves() {
+        const RW_BASE: u32 = 2 * vos_pvm::PVM_ZONE_SIZE;
+        let mut rw = vec![0u8; 112 + 64 + 128];
+        rw[..8].copy_from_slice(&100_000u64.to_le_bytes());
+        rw[8..16].copy_from_slice(&vos_pvm::PVM_HALT_ADDR.to_le_bytes());
+        let le = |value: u32| -> [u8; 3] {
+            let [b0, b1, b2, _] = value.to_le_bytes();
+            [b0, b1, b2]
+        };
+        let [f0, f1, f2] = le(RW_BASE);
+        let [h0, h1, h2] = le(RW_BASE + 112);
+        let [m0, m1, m2] = le(RW_BASE + 176);
+        // machine(args); invoke it to its call; compress in place with φ7..φ10
+        // on the outer machine's own buffers; invoke it again to its halt;
+        // halt.
+        let code = [
+            10, 9, // machine
+            51, 8, f0, f1, f2, // φ8 <- the frame
+            10, 13, // invoke
+            51, 7, h0, h1, h2, // φ7 <- h
+            51, 8, m0, m1, m2, // φ8 <- m
+            51, 9, 0, // φ9 <- 0
+            51, 10, 1, // φ10 <- 1
+            10, 0x00, 0x04, // BLAKE2b
+            51, 7, 0, // φ7 <- machine 0
+            51, 8, f0, f1, f2, // φ8 <- the frame
+            10, 13, // invoke
+            50, 0, // halt
+        ];
+        let starts = [0, 2, 7, 9, 14, 19, 22, 25, 28, 31, 36, 38];
+        let outer = standard_program_with_rw(&code, &starts, &rw);
+        // BLAKE2b, then return to the halt address in φ0.
+        let inner = vec![0, 1, 5, 10, 0x00, 0x04, 50, 0, 0b0000_1001];
+
+        let trace = trace_refine(&outer, &inner, 1_000_000).expect("trace");
+        assert_eq!(trace.result, RefineSliceExit::Halt);
+        let blake = |slice: &RefineTraceSlice| {
+            slice
+                .side_note
+                .steps
+                .iter()
+                .filter(|step| {
+                    step.opcode == crate::core::opcode::Opcode::Ecalli
+                        && step.imm == crate::core::ecall::ECALL_BLAKE2B_COMPRESS as u64
+                })
+                .map(|step| step.host_call_acknowledged)
+                .collect::<Vec<_>>()
+        };
+        let calls: Vec<(bool, Vec<bool>)> = trace
+            .slices
+            .iter()
+            .map(|slice| {
+                let inner = matches!(slice.identity, RefineMachineId::Inner { .. });
+                (inner, blake(slice))
+            })
+            .filter(|(_, calls)| !calls.is_empty())
+            .collect();
+        assert_eq!(
+            calls,
+            [(true, vec![false]), (false, vec![true])],
+            "the inner call left to its outer machine, which serves it"
+        );
+        let bundle = prove_refine(trace).expect("prove");
+        verify_refine_bundle_replayed(&bundle, &outer, &inner, 1_000_000).expect("verify");
     }
 
     #[test]

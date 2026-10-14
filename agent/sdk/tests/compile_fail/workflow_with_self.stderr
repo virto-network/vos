@@ -1,0 +1,5 @@
+error: a #[workflow] takes no `self`: it holds only its own memory
+  --> tests/compile_fail/workflow_with_self.rs:15:21
+   |
+15 |     pub fn checkout(&mut self, items: u64) -> u64 {
+   |                     ^^^^^^^^^

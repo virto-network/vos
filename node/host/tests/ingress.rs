@@ -67,7 +67,7 @@ impl Served {
         let install = Install {
             instance: COUNTER,
             program: programs.counter.clone(),
-            attestables: Vec::new(),
+            beside: Vec::new(),
             roles: Vec::new(),
         };
         let installed = operator.install(agent, &install).unwrap();

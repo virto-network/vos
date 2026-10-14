@@ -25,6 +25,7 @@ use vos_net::Network;
 use vos_pvm::pool::{CodeHash, MachinePool, OuterMachines};
 use vos_raft::Role;
 use vos_wire::Decode;
+use vos_wire::abi::Kind;
 use vos_wire::batch::{Admin, Message, Query, Request, Work};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash};
 use vos_wire::ingress::{Contact, Grant, NodeId, Unplaced};
@@ -606,7 +607,7 @@ impl Inner {
         agent: AgentId,
         instance: InstanceId,
         program: Vec<u8>,
-        attestables: Vec<(MethodId, Vec<u8>)>,
+        beside: Vec<(MethodId, Kind, Vec<u8>)>,
         roles: Vec<(Vec<u8>, u8)>,
     ) -> Result<Answered, CallError> {
         // A follower refuses before storing anything.
@@ -632,15 +633,15 @@ impl Inner {
                     Ok(ProgramHash(hash.0))
                 };
                 let program = pooled(program)?;
-                let attestables = attestables
+                let beside = beside
                     .into_iter()
-                    .map(|(method, blob)| Ok((method, pooled(blob)?)))
+                    .map(|(method, kind, blob)| Ok((method, kind, pooled(blob)?)))
                     .collect::<Result<Vec<_>, CallError>>()?;
-                Ok((program, attestables, stored))
+                Ok((program, beside, stored))
             })
             .await
             .map_err(|panicked| CallError::Failed(panicked.0))?;
-        let (program, attestables, stored) = pooled?;
+        let (program, beside, stored) = pooled?;
         // Stored, a blob is kept by its age until the entry names it; the
         // apply then pins it.
         let mut references = Vec::with_capacity(stored.len());
@@ -654,7 +655,7 @@ impl Inner {
         let admin = Admin::Install {
             instance,
             program,
-            attestables,
+            beside,
             roles,
         };
         let (answer, reply) = smol::channel::bounded(1);
@@ -970,26 +971,27 @@ impl Node {
     }
 
     /// Install a package as `instance` of `agent`: its actor program, the
-    /// program of each attestable method, and its roles' bytes. The blobs
-    /// are stored and pooled, then the install is queued and answered.
+    /// programs beside it, each bound to a method of its kind, an
+    /// attestable or a workflow, and its roles' bytes. The blobs are stored
+    /// and pooled, then the install is queued and answered.
     pub fn install(
         &self,
         agent: AgentId,
         instance: InstanceId,
         program: &[u8],
-        attestables: &[(MethodId, &[u8])],
+        beside: &[(MethodId, Kind, &[u8])],
         roles: Vec<(Vec<u8>, u8)>,
     ) -> impl Future<Output = Result<Reply, CallError>> + use<> {
         let inner = Arc::clone(&self.inner);
         let program = program.to_vec();
-        let attestables: Vec<(MethodId, Vec<u8>)> = attestables
+        let beside: Vec<(MethodId, Kind, Vec<u8>)> = beside
             .iter()
-            .map(|(method, blob)| (*method, blob.to_vec()))
+            .map(|(method, kind, blob)| (*method, *kind, blob.to_vec()))
             .collect();
         // On the node's thread, as every queueing is.
         self.inner.runtime.spawn(async move {
             inner
-                .install(agent, instance, program, attestables, roles)
+                .install(agent, instance, program, beside, roles)
                 .await
                 .map(|answered| answered.reply)
         })

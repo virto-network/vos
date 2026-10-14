@@ -13,6 +13,7 @@ use clap::Parser;
 use ed25519_dalek::SigningKey;
 use vos_node::client::{ClientError, Operator};
 use vos_node::{ADMIN_TOKEN, Config, NODE_KEY, Node, Space};
+use vos_wire::abi::Kind;
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal};
 use vos_wire::ingress::{Answer, Install};
 use vos_wire::schema::Schema;
@@ -215,12 +216,16 @@ impl InstallArgs {
     fn run(self) -> Result<(), String> {
         let program = link(&self.program)?;
         let schema = schema_of(&program)?;
-        let attestables = self
-            .attestables
-            .iter()
-            .map(|pair| {
+        let attestables = self.attestables.iter().map(|pair| (pair, Kind::Attestable));
+        let beside = attestables
+            .chain(self.workflows.iter().map(|pair| (pair, Kind::Workflow)))
+            .map(|(pair, kind)| {
                 let (name, path) = split(pair)?;
-                Ok((method_named(&schema, name)?, link(Path::new(path))?))
+                let method = method_named(&schema, name)?;
+                if schema.method(method).map(|method| method.kind) != Some(kind) {
+                    return Err(format!("{name} is not a method of kind {kind:?}"));
+                }
+                Ok((method, kind, link(Path::new(path))?))
             })
             .collect::<Result<Vec<_>, String>>()?;
         let roles = self
@@ -234,7 +239,7 @@ impl InstallArgs {
         let install = Install {
             instance: InstanceId(self.instance),
             program,
-            attestables,
+            beside,
             roles,
         };
         let answer = operator_of(&self.operator)?

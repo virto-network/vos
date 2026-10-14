@@ -224,7 +224,8 @@ impl Counter {
     /// 10 `log`, 11 `delete`, 12 `self_id`, 13 `input`, 14 `get` of a 1 KiB
     /// key, 15 `put` of one byte at a 1 KiB key; and at 1 KiB keys of zero
     /// bytes but the index, 16 `get`, 17 `put` of one byte, and 18 a `scan`
-    /// as large as a scan may be, from the table's first row.
+    /// as large as a scan may be, from the table's first row; and 19 a
+    /// BLAKE2b compression, a precompile call.
     #[msg(gas = 100_000_000)]
     pub async fn ops(
         &mut self,
@@ -238,6 +239,7 @@ impl Counter {
         let mut long = [8u8; 1024];
         let mut zeros = [0u8; 1024];
         let mut full = alloc::vec![0u8; vos_sdk::abi::cap::SCAN];
+        let mut h = [1u8; 64];
         for (kind, start, count) in phases {
             for index in start..start + count {
                 let [_, a, b, c] = index.to_be_bytes();
@@ -284,11 +286,27 @@ impl Counter {
                         vos_sdk::host::put(RAW, &zeros, &[1]);
                         0
                     }
-                    _ => vos_sdk::host::scan(RAW, None, &mut full),
+                    18 => vos_sdk::host::scan(RAW, None, &mut full),
+                    _ => {
+                        vos_pvm_precompiles::blake2b_compress(&mut h, &[2; 128], 128, false);
+                        u64::from(h[0])
+                    }
                 };
             }
         }
         total
+    }
+
+    /// BLAKE2b-256 of `data`, then of the digest, `rounds` times in all:
+    /// each compression a precompile call the agent serves.
+    #[msg(gas = 50_000_000)]
+    pub async fn hash(&self, data: Vec<u8>, rounds: u32) -> [u8; 32] {
+        let mut digest = [0u8; 32];
+        for round in 0..rounds {
+            let input: &[u8] = if round == 0 { &data } else { &digest };
+            digest = vos_pvm_precompiles::blake2b_hash::<32>(b"vos/test", &[input]);
+        }
+        digest
     }
 
     /// Set the counter to the batch time, and return a random draw.

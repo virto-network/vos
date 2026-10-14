@@ -24,6 +24,7 @@ pub const STATE_SCAN: u64 = 0x482;
 pub const SELF_SERVICE: u64 = u64::MAX;
 
 #[cfg(target_arch = "riscv64")]
+#[macro_export]
 macro_rules! ecalli {
     ($id:expr, $a:expr) => {{
         let [a0, a1, a2, a3, a4, a5]: [u64; 6] = $a;
@@ -52,6 +53,7 @@ macro_rules! ecalli {
 }
 
 #[cfg(not(target_arch = "riscv64"))]
+#[macro_export]
 macro_rules! ecalli {
     ($id:expr, $a:expr) => {{
         let _: (u64, [u64; 6]) = ($id, $a);
@@ -59,7 +61,7 @@ macro_rules! ecalli {
     }};
 }
 
-pub(crate) use ecalli;
+pub use crate::ecalli;
 
 pub fn ptr(bytes: &[u8]) -> u64 {
     bytes.as_ptr() as u64
@@ -138,16 +140,25 @@ pub fn state_read_into(key: &[u8], buffer: &mut [u8]) -> Option<usize> {
     (len != code::NONE).then_some(len as usize)
 }
 
+fn historical_lookup_at(hash: &[u8; 32], out: *mut u8, offset: u64, capacity: u64) -> u64 {
+    ecalli!(
+        HISTORICAL_LOOKUP,
+        [SELF_SERVICE, ptr(hash), out as u64, offset, capacity, 0]
+    )
+    .0
+}
+
 /// A preimage of this service by hash: how a program's blob reaches the
 /// loader when the host has no pool.
 pub fn historical_lookup(hash: &[u8; 32]) -> Option<Vec<u8>> {
-    whole(|out, offset, capacity| {
-        ecalli!(
-            HISTORICAL_LOOKUP,
-            [SELF_SERVICE, ptr(hash), out as u64, offset, capacity, 0]
-        )
-        .0
-    })
+    whole(|out, offset, capacity| historical_lookup_at(hash, out, offset, capacity))
+}
+
+/// The start of a preimage of this service, read into `buffer`, with no
+/// allocation: the preimage's whole length; `None` when absent.
+pub fn historical_lookup_into(hash: &[u8; 32], buffer: &mut [u8]) -> Option<usize> {
+    let len = historical_lookup_at(hash, buffer.as_mut_ptr(), 0, buffer.len() as u64);
+    (len != code::NONE && len != code::WHAT).then_some(len as usize)
 }
 
 /// One accumulate input, by index (`fetch` kind 15). Accumulate's only: a

@@ -756,6 +756,9 @@ mod tests {
     /// A standard program whose code stores φ9 at φ8 (8 bytes) and φ11 at
     /// φ10 (2 bytes), compresses with BLAKE2b (h at φ7, m at φ8), stops at
     /// host call 0x77, stores φ9's low byte at φ12, then traps.
+    ///
+    /// The compression exits to the outer machine, as every inner
+    /// precompile call does; [`run`] serves it as an agent does.
     fn program() -> Vec<u8> {
         let code = vec![
             Opcode::StoreIndU64 as u8,
@@ -968,7 +971,7 @@ mod tests {
                 }
                 registers[9] = value;
                 registers[11] = value.rotate_left(17);
-                let outcome = machines.invoke(id, InvokeState { gas, registers });
+                let outcome = run(machines, id, InvokeState { gas, registers });
                 if let Ok(outcome) = outcome {
                     *carried = outcome.state;
                 }
@@ -999,11 +1002,52 @@ mod tests {
     fn probe(machines: &mut InnerMachines, id: u32) -> (InnerExit, InvokeState) {
         let mut state = probe_state();
         loop {
-            let outcome = machines.invoke(id, state).unwrap();
+            let outcome = run(machines, id, state).unwrap();
             state = outcome.state;
             if outcome.exit != InnerExit::Host(0x77) {
                 return (outcome.exit, state);
             }
+        }
+    }
+
+    /// Invoke, serving BLAKE2b compressions as an agent does: their price
+    /// from the machine's gas, then the output poked over h. Any other
+    /// exit, or a call that cannot be paid or read, returns.
+    fn run(
+        machines: &mut InnerMachines,
+        id: u32,
+        mut state: InvokeState,
+    ) -> Result<crate::inner::InvokeOutcome, InnerError> {
+        use crate::precompile::{BLAKE2B_COMPRESS, BLAKE2B_COMPRESS_GAS, compress};
+        loop {
+            let outcome = machines.invoke(id, state)?;
+            let registers = outcome.state.registers;
+            let words = |bytes: Vec<u8>| -> Vec<u64> {
+                bytes
+                    .chunks(8)
+                    .map(|word| u64::from_le_bytes(word.try_into().unwrap()))
+                    .collect()
+            };
+            let served = (outcome.exit == InnerExit::Host(BLAKE2B_COMPRESS)
+                && outcome.state.gas >= BLAKE2B_COMPRESS_GAS)
+                .then(|| {
+                    let h = machines.peek(id, registers[7] as u32, 64).ok()?;
+                    let m = machines.peek(id, registers[8] as u32, 128).ok()?;
+                    let out = compress(
+                        &words(h).try_into().unwrap(),
+                        &words(m).try_into().unwrap(),
+                        u128::from(registers[9]),
+                        registers[10] != 0,
+                    );
+                    let bytes: Vec<u8> = out.iter().flat_map(|word| word.to_le_bytes()).collect();
+                    machines.poke(id, registers[7] as u32, &bytes).ok()
+                })
+                .flatten();
+            if served.is_none() {
+                return Ok(outcome);
+            }
+            state = outcome.state;
+            state.gas -= BLAKE2B_COMPRESS_GAS;
         }
     }
 
@@ -1086,13 +1130,12 @@ mod tests {
         let state = probe_state();
         let [h, m, last] = [7, 8, 12].map(|register| state.registers[register] as u32);
         let half = state.registers[10] as u32;
-        let compression = crate::precompile::price(crate::precompile::BLAKE2B_COMPRESS).unwrap();
         for backend in backends() {
             let mut machines = InnerMachines::with_backend(backend);
             machines.set_pool(Arc::clone(&pool));
             let to_the_call = |machines: &mut InnerMachines| {
                 let id = machines.instantiate(&program, 0).unwrap();
-                let outcome = machines.invoke(id, probe_state()).unwrap();
+                let outcome = run(machines, id, probe_state()).unwrap();
                 assert_eq!(outcome.exit, InnerExit::Host(0x77), "{backend:?}");
                 (id, outcome.state)
             };
@@ -1104,7 +1147,7 @@ mod tests {
                 .collect();
             let pc = machines.expunge(stopped).unwrap();
             assert_eq!(pc, 9, "{backend:?}: right after the 2-byte call at 7");
-            let block = state.gas - suspended.gas - compression;
+            let block = state.gas - suspended.gas - crate::precompile::BLAKE2B_COMPRESS_GAS;
 
             let (going, at_call) = to_the_call(&mut machines);
             let continued = machines.invoke(going, at_call.clone()).unwrap();
