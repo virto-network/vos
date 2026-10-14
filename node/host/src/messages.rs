@@ -16,7 +16,7 @@ use vos_wire::ids::AgentId;
 use vos_wire::peer::{NodeNumber, PeerMessage};
 
 use crate::lock;
-use crate::node::{Inner, Pending};
+use crate::node::{CallError, Inner, Pending};
 use crate::peer::Refusal;
 
 /// Where an agent's input goes from this node.
@@ -115,9 +115,10 @@ impl Inner {
     }
 
     /// Tell agent `sender` that `receiver` refused one of its messages past
-    /// a gap: its leader sends again at once. Routed as an acknowledgement
-    /// is. A message dropped at a full queue waits for the sender's
-    /// rounds, whose backoff a congested receiver needs.
+    /// a gap, or dropped one at a full queue that has drained since: its
+    /// leader sends again at once. Routed as an acknowledgement is. While
+    /// the queue stays full, the sender's rounds and their backoff send
+    /// again, as a congested receiver needs.
     pub(crate) fn behind(&self, sender: AgentId, receiver: AgentId) {
         let turn = self.turn.fetch_add(1, Ordering::Relaxed);
         match self.route(sender, turn) {
@@ -152,11 +153,11 @@ impl Inner {
             return;
         }
         match self.route(to, 0) {
-            Route::Here => {
-                if self.push(to, Pending::Message(message)).is_err() {
-                    self.drops.count(Refusal::Unplaced);
-                }
-            }
+            Route::Here => match self.push(to, Pending::Message(message)) {
+                Ok(()) => {}
+                Err(CallError::Busy) => self.drops.count(Refusal::Full),
+                Err(_) => self.drops.count(Refusal::Unplaced),
+            },
             Route::To(leader) if !relayed && self.run(to).is_some() => {
                 self.relayed.fetch_add(1, Ordering::Relaxed);
                 self.send(

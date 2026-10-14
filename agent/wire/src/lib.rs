@@ -105,11 +105,11 @@ pub mod defaults {
     /// The same for a sweep: reading the rows of the due index it lists.
     pub const SWEEP_RESERVE: u64 = 1_000_000;
     /// The same for an install: reading, validating and encoding a schema
-    /// of `schema::MAX_LEN` bytes from its program's machine, about 6.3M.
-    pub const INSTALL_RESERVE: u64 = 8_000_000;
+    /// of `schema::MAX_LEN` bytes from its program's machine, about 6.8M.
+    pub const INSTALL_RESERVE: u64 = 9_000_000;
     /// Gas the agent takes per byte of an installed record it reads for the
     /// first time in a refine, before it reads it: reading and decoding the
-    /// record, about 3.2M for a schema of `schema::MAX_LEN` bytes. The
+    /// record, about 3.4M for a schema of `schema::MAX_LEN` bytes. The
     /// refine keeps it after, and so pays a record once whatever reads it.
     pub const RECORD_BYTE: u64 = 64;
     /// Gas a refine keeps to finish its result once its steps are written.

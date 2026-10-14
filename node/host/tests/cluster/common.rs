@@ -2,7 +2,7 @@
 
 use std::ops::RangeInclusive;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use smol::future::FutureExt;
@@ -12,7 +12,7 @@ use vos_checker::spaces::{IN_PROCESS_WAIT, open_node, space};
 use vos_net::memory::{Endpoint, Hub};
 use vos_net::{Arrivals, Class, Network};
 use vos_node::{CallError, Config, Hooks, Node, Peers, Reply, Space};
-use vos_wire::batch::Request;
+use vos_wire::batch::{Batch, Request};
 use vos_wire::ids::{AgentId, InstanceId, Principal, Session};
 use vos_wire::peer::{NodeNumber, PeerMessage};
 use vos_wire::result::Outcome;
@@ -372,6 +372,40 @@ pub fn compacting(_: NodeNumber, config: &mut Config) {
     config.compact_every = 8;
     config.compact_tail = 2;
     config.snapshot_chunk = 64;
+}
+
+/// Holds every refine while armed, counting those it held.
+#[derive(Default)]
+pub struct HoldRefines {
+    armed: AtomicBool,
+    held: AtomicUsize,
+}
+
+impl HoldRefines {
+    pub fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    pub fn release(&self) {
+        self.armed.store(false, Ordering::SeqCst);
+    }
+
+    /// How many refines it held.
+    pub fn held(&self) -> usize {
+        self.held.load(Ordering::SeqCst)
+    }
+}
+
+impl Hooks for HoldRefines {
+    fn fail_refine(&self, _: AgentId, _: &Batch) -> bool {
+        if self.armed.load(Ordering::SeqCst) {
+            self.held.fetch_add(1, Ordering::SeqCst);
+            while self.armed.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        false
+    }
 }
 
 /// Withholds every blob this node is asked for, while told to.

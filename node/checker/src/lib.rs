@@ -17,13 +17,14 @@
 //! queries; [`hooks`], what a test gives a node to hold or fail it;
 //! [`spaces`], nodes in one process and free ports; [`crash`], the crash
 //! tests' rounds; [`processes`], node processes and the relay between
-//! them.
+//! them; [`workflows`], the workflows the checker starts and their reads.
 
 pub mod calls;
 pub mod crash;
 pub mod hooks;
 pub mod processes;
 pub mod spaces;
+pub mod workflows;
 
 pub use vos_testkit::programs;
 
@@ -238,6 +239,9 @@ pub struct Client {
     sent: AtomicU64,
     /// The requests answered: through a prefix, and those above it.
     acked: Mutex<Acked>,
+    /// A touring client's tours: each request starts one, at the rounds
+    /// actor, asking the next agent.
+    touring: Option<workflows::Touring>,
 }
 
 /// A session from its first request on, timed with the nodes' clock
@@ -302,6 +306,26 @@ impl Client {
             next: std::sync::OnceLock::new(),
             sent: AtomicU64::new(0),
             acked: Mutex::new(Acked::default()),
+            touring: None,
+        }
+    }
+
+    /// Client `number` at `agent`, each of whose requests starts a tour of
+    /// the next agent at [`workflows::ROUNDS`], which it reads to its end
+    /// before its next; `methods` are the counter's, which the tours ask
+    /// and tell. It starts a session every `rotate` requests.
+    pub fn touring(
+        number: u8,
+        agent: AgentId,
+        identity: [u8; 32],
+        methods: Methods,
+        tours: workflows::TourMethods,
+        rotate: u64,
+    ) -> Self {
+        Self {
+            instance: workflows::ROUNDS,
+            touring: Some(workflows::Touring::new(tours)),
+            ..Self::new(number, agent, identity, methods, false, rotate)
         }
     }
 
@@ -458,7 +482,11 @@ impl Client {
 
     fn body(&self, timed: &Timed, sequence: u64, request: u64) -> Vec<u8> {
         let session = &timed.session;
-        let (method, arguments) = if self.forwards(request) {
+        let (method, arguments) = if let Some(touring) = &self.touring {
+            let next = self.next.get().expect("the next agent");
+            let tour = workflows::tour(*next, request);
+            (touring.methods.tour, tour.arguments())
+        } else if self.forwards(request) {
             let next = self.next.get().expect("the next agent");
             (
                 self.methods.forward,
@@ -520,21 +548,33 @@ impl Client {
             let offset = nodes.offset();
             match post(nodes, at, &path, &body) {
                 Ok(Answer::Ran {
-                    outcome: Outcome::Done(reply),
+                    outcome,
                     at: answered_at,
                 }) => {
-                    let total = u64::decode(&reply).unwrap().0;
-                    // A forward answers its amount, an increment the total.
-                    let expected = if self.forwards(request) {
-                        self.amount(request)
-                    } else {
-                        self.total(request)
-                    };
-                    assert_eq!(
-                        total, expected,
-                        "client {}: request {request} answered by node {at}",
-                        self.number
-                    );
+                    match outcome {
+                        Outcome::Started(workflow) if self.touring.is_some() => {
+                            self.tour_started(request, workflow, answered_at, &timed);
+                        }
+                        Outcome::Done(reply) if self.touring.is_none() => {
+                            let total = u64::decode(&reply).unwrap().0;
+                            // A forward answers its amount, an increment the
+                            // total.
+                            let expected = if self.forwards(request) {
+                                self.amount(request)
+                            } else {
+                                self.total(request)
+                            };
+                            assert_eq!(
+                                total, expected,
+                                "client {}: request {request} answered by node {at}",
+                                self.number
+                            );
+                        }
+                        other => panic!(
+                            "client {}: request {request} answered by node {at}: {other:?}",
+                            self.number
+                        ),
+                    }
                     nodes.answered(at, starts, self.agent, &session, sequence);
                     self.acked.lock().unwrap().answered(request, answered_at);
                     nodes.log().event(format!(
@@ -786,6 +826,13 @@ impl Client {
                 continue;
             }
             match mode {
+                // A tour at a time: each one's result is known before it
+                // starts.
+                _ if self.touring.is_some() => {
+                    sent += 1;
+                    self.send(nodes, Mode::OneAtATime, sent);
+                    self.finish_tour(nodes, sent);
+                }
                 Mode::OneAtATime => {
                     sent += 1;
                     self.send(nodes, mode, sent);

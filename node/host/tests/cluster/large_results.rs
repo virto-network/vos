@@ -4,7 +4,7 @@
 //! past them.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -13,48 +13,19 @@ use vos_net::Class;
 use vos_node::blobs::Blobs;
 use vos_node::store::{BlobRef, EntryKind, Fjall, LARGE_RESULT};
 use vos_node::{CallError, Hooks, Node, Reply};
-use vos_wire::batch::{Batch, Request};
+use vos_wire::batch::Request;
 use vos_wire::ids::AgentId;
 use vos_wire::peer::NodeNumber;
 use vos_wire::result::Outcome;
 use vos_wire::{Decode, Encode};
 
-use crate::common::{Cluster, compacting, log_start, wait_until};
+use crate::common::{Cluster, HoldRefines, compacting, log_start, wait_until};
 
 /// Rows each call writes, of [`ROW`] bytes: within a step's 256 KiB.
 const ROWS: u32 = 4;
 const ROW: u32 = 60_000;
 /// Calls the second batch holds: a result past 2 MiB.
 const CALLS: u64 = 10;
-
-/// Holds every refine while armed, counting those it held.
-#[derive(Default)]
-struct HoldRefines {
-    armed: AtomicBool,
-    held: AtomicUsize,
-}
-
-impl HoldRefines {
-    fn arm(&self) {
-        self.armed.store(true, Ordering::SeqCst);
-    }
-
-    fn release(&self) {
-        self.armed.store(false, Ordering::SeqCst);
-    }
-}
-
-impl Hooks for HoldRefines {
-    fn fail_refine(&self, _: AgentId, _: &Batch) -> bool {
-        if self.armed.load(Ordering::SeqCst) {
-            self.held.fetch_add(1, Ordering::SeqCst);
-            while self.armed.load(Ordering::SeqCst) {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        }
-        false
-    }
-}
 
 /// Three nodes whose refines `hooks` can hold, each tuned further by
 /// `tuning`.
@@ -100,11 +71,9 @@ fn two_batches(
     let node = cluster.node(leader);
     let before = node.applied(agent).unwrap();
     hooks.arm();
-    let held = hooks.held.load(Ordering::SeqCst);
+    let held = hooks.held();
     let alone = node.call(agent, fill(cluster, first));
-    wait_until("the first batch's refine is held", || {
-        hooks.held.load(Ordering::SeqCst) > held
-    });
+    wait_until("the first batch's refine is held", || hooks.held() > held);
     let together: Vec<_> = (first + 1..=first + CALLS)
         .map(|sequence| node.call(agent, fill(cluster, sequence)))
         .collect();

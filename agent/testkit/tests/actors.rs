@@ -59,7 +59,15 @@ fn query<A: Encode, R: Decode>(kit: &Testkit, instance: InstanceId, name: &str, 
 
 #[test]
 fn programs_carry_their_schema_first_in_read_only_data() {
-    let names: Vec<_> = schema(&actor("counter"))
+    let counter = schema(&actor("counter"));
+    let linearizable: Vec<_> = counter
+        .methods
+        .iter()
+        .filter(|method| method.linearizable)
+        .map(|method| method.name.as_slice())
+        .collect();
+    assert_eq!(linearizable, [b"latest"]);
+    let names: Vec<_> = counter
         .methods
         .iter()
         .map(|method| String::from_utf8(method.name.clone()).unwrap())
@@ -69,6 +77,7 @@ fn programs_carry_their_schema_first_in_read_only_data() {
         [
             "increment",
             "value",
+            "latest",
             "forward",
             "put_and_scan",
             "store",

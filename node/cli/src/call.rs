@@ -1,37 +1,56 @@
-//! Calls and queries signed with a client key, and the answers printed.
+//! Calls and queries signed with a client key, reads of the workflows it
+//! started, and the answers printed.
 
 use std::mem;
+use std::path::Path;
+use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use vos_node::client::{Client, ClientError};
 use vos_wire::Encode;
 use vos_wire::abi::Refusal;
-use vos_wire::ids::{AgentId, InstanceId};
-use vos_wire::ingress::{Answer, Consistency};
+use vos_wire::ids::{AgentId, InstanceId, WorkflowId};
+use vos_wire::ingress::{Answer, Consistency, WorkflowStatus};
 use vos_wire::result::Outcome;
 
-use crate::args::CallArgs;
+use crate::args::{CallArgs, NodeArgs, WorkflowArgs};
 use crate::kept::Kept;
 use crate::{at, failed, key_bytes, method_named};
 
-/// A call, or (`Some(linearizable)`) a query.
-pub fn invoke(call: &CallArgs, query: Option<bool>) -> Result<(), String> {
-    let seed = std::fs::read_to_string(&call.key).map_err(at(&call.key))?;
-    let key = SigningKey::from_bytes(&key_bytes(&seed)?);
-    let arguments = hex::decode(call.args.trim()).map_err(|error| error.to_string())?;
-    let agent = AgentId(call.agent);
-    let instance = InstanceId(call.instance);
-    let target = call.node.target()?;
-    let mut kept = Kept::load(&call.key)?;
-    let mut client = Client::resume(
+/// A client of the node `node` for the key whose seed file is `key`, going
+/// on with what the key kept, which comes back emptied of what the client
+/// took.
+fn resume(node: &NodeArgs, key: &Path) -> Result<(Client, Kept), String> {
+    let seed = std::fs::read_to_string(key).map_err(at(key))?;
+    let signing = SigningKey::from_bytes(&key_bytes(&seed)?);
+    let target = node.target()?;
+    let mut kept = Kept::load(key)?;
+    let client = Client::resume(
         &target,
-        key,
+        signing,
         mem::take(&mut kept.sessions),
         mem::take(&mut kept.identities),
     );
     for (agent, at) in mem::take(&mut kept.floors) {
         client.raise_floor(agent, at);
     }
+    Ok((client, kept))
+}
+
+/// Keep what `client` learned beside the key `key`.
+fn keep(client: &Client, mut kept: Kept, key: &Path) -> Result<(), String> {
+    kept.sessions = client.sessions();
+    kept.identities = client.identities();
+    kept.floors = client.floors();
+    kept.save(key)
+}
+
+/// A call, or (`Some(linearizable)`) a query.
+pub fn invoke(call: &CallArgs, query: Option<bool>) -> Result<(), String> {
+    let arguments = hex::decode(call.args.trim()).map_err(|error| error.to_string())?;
+    let agent = AgentId(call.agent);
+    let instance = InstanceId(call.instance);
+    let (mut client, mut kept) = resume(&call.node, &call.key)?;
     let schema = client
         .schema(agent, instance)
         .map_err(failed)?
@@ -82,10 +101,7 @@ pub fn invoke(call: &CallArgs, query: Option<bool>) -> Result<(), String> {
         }
         answer
     };
-    kept.sessions = client.sessions();
-    kept.identities = client.identities();
-    kept.floors = client.floors();
-    kept.save(&call.key)?;
+    keep(&client, kept, &call.key)?;
     match answer {
         Ok(answer) => print_answer(&answer),
         Err(ClientError::Lost) => Err(
@@ -124,6 +140,44 @@ pub fn said(answer: &Answer) -> Result<String, String> {
         Answer::Refused(code) => Err(format!("refused {}", code.code())),
         other => Err(format!("{other:?}")),
     }
+}
+
+/// Read a workflow the key started, waiting as asked for it to end, and
+/// print where it stands: `running`, `awaiting <agent> until <time>`,
+/// `sleeping until <time>`, or its result as a call's is printed.
+pub fn read_workflow(read: &WorkflowArgs) -> Result<(), String> {
+    let agent = AgentId(read.agent);
+    let (client, kept) = resume(&read.node, &read.key)?;
+    let consistency = if read.linearizable {
+        Consistency::Linearizable
+    } else {
+        Consistency::Applied {
+            at: client.floor(agent),
+        }
+    };
+    let wait = Duration::from_secs(read.wait);
+    let answer = client.workflow_with(agent, WorkflowId(read.id), wait, consistency);
+    keep(&client, kept, &read.key)?;
+    let status = match answer.map_err(failed)? {
+        Answer::Workflow { status, .. } => status,
+        other => return Err(said(&other).err().unwrap_or_else(|| format!("{other:?}"))),
+    };
+    let line = match status {
+        WorkflowStatus::Unknown => {
+            return Err(format!(
+                "agent {} holds no workflow {} this key started: a result is kept about an hour after its workflow ends",
+                read.agent, read.id
+            ));
+        }
+        WorkflowStatus::Running => "running".to_string(),
+        WorkflowStatus::Awaiting { agent, deadline } => {
+            format!("awaiting {} until {deadline}", agent.0)
+        }
+        WorkflowStatus::Sleeping { until } => format!("sleeping until {until}"),
+        WorkflowStatus::Ended(outcome) => said(&Answer::Ran { outcome, at: 0 })?,
+    };
+    println!("{line}");
+    Ok(())
 }
 
 pub fn print_answer(answer: &Answer) -> Result<(), String> {

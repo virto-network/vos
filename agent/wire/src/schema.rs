@@ -35,6 +35,11 @@ pub struct MethodSchema {
     /// The gas limit the handler requests; the agent caps it by policy.
     /// `None` takes the agent's default.
     pub gas: Option<u64>,
+    /// A query that always reads after a read index, whatever consistency
+    /// its client asks (`#[msg(linearizable)]`). It governs the query a
+    /// client names: a method that query calls reads the caller's snapshot,
+    /// marked or not.
+    pub linearizable: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,6 +54,9 @@ pub enum SchemaError {
     /// Method id 0, which is reserved.
     ReservedId,
     Duplicate(MethodId),
+    /// A method marked linearizable that is not a query: what runs through
+    /// the log reads its state as it applies.
+    Linearizable(MethodId),
 }
 
 impl Schema {
@@ -84,7 +92,8 @@ impl Schema {
         Ok(schema)
     }
 
-    /// Unique, non-zero ids within the limits.
+    /// Unique, non-zero ids within the limits, and only queries marked
+    /// linearizable.
     pub fn validate(&self) -> Result<(), SchemaError> {
         if self.methods.len() > MAX_METHODS {
             return Err(SchemaError::Limits);
@@ -101,6 +110,9 @@ impl Schema {
             }
             if method.id.0 == 0 {
                 return Err(SchemaError::ReservedId);
+            }
+            if method.linearizable && method.kind != Kind::Query {
+                return Err(SchemaError::Linearizable(method.id));
             }
             ids.push(method.id.0);
         }

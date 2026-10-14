@@ -12,19 +12,28 @@
 //! answers it, a captured request never runs, and at the end every
 //! replica holds every request once.
 //!
+//! With workflows, a client at each agent also starts tours of the next
+//! agent, one at a time, each round awaiting the next agent's counter,
+//! counting here, sending it a message, sleeping and computing, while
+//! leaders are stopped mid-await and mid-computation; its owner reads each
+//! tour's result by its id. Every tour ends as a straight run ends it, or
+//! fails on the record, and each of its effects applies once.
+//!
 //! The seed is printed; `EXACTLY_ONCE_SEED` runs one again.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use vos_checker::programs::{actor, method};
+use vos_checker::workflows::{ASKED, ROUNDS, Rounds, TOLD, Touring, check_tallies};
 use vos_checker::{
     ANSWERED, ATTEMPT, COUNTER, Client, INBOX, Methods, Mode, Random, SECOND, wait_until,
 };
 use vos_node::Node;
-use vos_wire::ids::{AgentId, InstanceId, Session, SessionId};
+use vos_wire::ids::{AgentId, InstanceId, Session, SessionId, WorkflowId};
+use vos_wire::keys::Due;
 use vos_wire::peer::NodeNumber;
-use vos_wire::records::unstored;
+use vos_wire::records::{Workflow, WorkflowState, unstored};
 use vos_wire::result::Outcome;
 use vos_wire::{Decode, Encode, defaults, keys};
 
@@ -81,10 +90,89 @@ fn follower_down_past_compaction(cluster: &Cluster, agent: AgentId) {
     cluster.start(number);
 }
 
+/// Workflow `workflow`'s state in `node`'s applied state at `agent`.
+fn tour_state(node: &Node, agent: AgentId, workflow: WorkflowId) -> Option<WorkflowState> {
+    let bytes = node
+        .store()
+        .snapshot()
+        .get(agent, &keys::workflow(workflow))
+        .ok()??;
+    Some(Workflow::decode(unstored(&bytes)?).ok()?.0.state)
+}
+
+/// Whether a tour in `state` is where a stop aims: preempted between two
+/// awaits (`computing`), or else awaiting the next agent's answer.
+fn aimed(state: &WorkflowState, computing: bool) -> bool {
+    match state {
+        WorkflowState::Preempted(_) => computing,
+        WorkflowState::Awaiting { .. } => !computing,
+        _ => false,
+    }
+}
+
+/// A leader stopped while a tour of its agent stands where the stop aims,
+/// and started again: another leader resumes the tour from that snapshot.
+///
+/// So that the tour's next step cannot commit before the stop, the
+/// leader's refines are held, and the tour must still stand there once
+/// everything it proposed before has committed and applied; then it is
+/// cut off, so nothing it proposes once let go commits, and stopped.
+fn stop_mid_tour(cluster: &Cluster, clients: &[Client], computing: bool, random: &mut Random) {
+    let until = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < until {
+        for client in clients {
+            let Some(workflow) = client.tours().and_then(Touring::current) else {
+                continue;
+            };
+            let Some(leader) = cluster.leader(client.agent) else {
+                continue;
+            };
+            let Some(node) = cluster.node(leader) else {
+                continue;
+            };
+            let standing = || {
+                tour_state(&node, client.agent, workflow)
+                    .is_some_and(|state| aimed(&state, computing))
+            };
+            if !standing() {
+                continue;
+            }
+            let held = cluster.slot(leader).trip.refines.close();
+            // A batch past the gate is proposed, committed and applied.
+            std::thread::sleep(Duration::from_millis(50));
+            let settled = node.replica(client.agent).is_some_and(|status| {
+                status.leads
+                    && status.applied == status.commit
+                    && status.commit == status.last_index
+            });
+            if settled && standing() {
+                cluster.saw(if computing {
+                    "fault: a leader stops mid-computation"
+                } else {
+                    "fault: a leader stops mid-await"
+                });
+                cluster.hub.isolate(leader);
+                drop(held);
+                drop(node);
+                cluster.stop(leader);
+                cluster.hub.heal();
+                std::thread::sleep(Duration::from_millis(100 + random.below(400)));
+                cluster.start(leader);
+                return;
+            }
+            drop(held);
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    cluster.saw("fault: a leader stops mid-tour, skipped: none found");
+}
+
 /// [`FAULTS`] failures, one at a time: among them every clock jumping
-/// past the skew under load, every session expiring, and a follower kept
-/// down until the log compacts past it.
+/// past the skew under load, every session expiring, a follower kept
+/// down until the log compacts past it, and, with tours, leaders stopped
+/// mid-await and mid-computation.
 fn faults(cluster: &Cluster, clients: &[Client], random: &mut Random) {
+    let touring = clients.iter().any(|client| client.tours().is_some());
     let pause = |random: &mut Random| {
         std::thread::sleep(Duration::from_millis(100 + random.below(400)));
     };
@@ -117,6 +205,10 @@ fn faults(cluster: &Cluster, clients: &[Client], random: &mut Random) {
                 cluster,
                 agents[random.below(agents.len() as u64) as usize],
             );
+            continue;
+        }
+        if touring && fault % 4 == 2 {
+            stop_mid_tour(cluster, clients, fault % 8 == 6, random);
             continue;
         }
         let agent = agents[random.below(agents.len() as u64) as usize];
@@ -197,7 +289,8 @@ fn faults(cluster: &Cluster, clients: &[Client], random: &mut Random) {
     }
 }
 
-/// Whether `node` holds any of `agent`'s session state.
+/// Whether `node` holds any of `agent`'s session state: rows of the
+/// sessions' kinds, a session's row in the due index, or a count.
 fn holds_sessions(node: &Node, agent: AgentId) -> bool {
     let snapshot = node.store().snapshot();
     let any = Session {
@@ -211,17 +304,21 @@ fn holds_sessions(node: &Node, agent: AgentId) -> bool {
         .map(|bytes| u64::decode(unstored(&bytes).unwrap()).unwrap().0);
     // A key of each session kind, for its first two bytes: the prefix every
     // row of that kind shares.
-    [
+    let rows = [
         keys::session_index(&any),
         keys::session_of(SessionId(0)),
         keys::session(SessionId(0)),
         keys::reply(SessionId(0), 0),
-        keys::due_prefix(),
         keys::key_sessions(&[0; 32]),
     ]
     .iter()
-    .any(|key| snapshot.scan(agent, &key[..2], None).next().is_some())
-        || live.is_some_and(|live| live > 0)
+    .any(|key| snapshot.scan(agent, &key[..2], None).next().is_some());
+    // Workflows share the due index.
+    let due = snapshot.scan(agent, &keys::due_prefix(), None).any(|row| {
+        let (key, _) = row.unwrap();
+        matches!(keys::due_entry(&key), Some((_, Due::Session(_))))
+    });
+    rows || due || live.is_some_and(|live| live > 0)
 }
 
 /// Clients pause with every request answered, each keeping one it ran and
@@ -262,12 +359,24 @@ fn expire_every_session(cluster: &Cluster, clients: &[Client], random: &mut Rand
     }
     cluster.saw("captured requests refused");
     for client in clients {
-        let total = client.total(client.sent());
+        // Every tour ended: its own tallies are as they stay.
+        if let Some(touring) = client.tours() {
+            for number in 1..=NODES {
+                let node = cluster.node(number).unwrap();
+                let checked = tallied(&node, client.agent, ROUNDS, touring);
+                assert!(checked.is_ok(), "client {}: {checked:?}", client.number);
+            }
+            continue;
+        }
+        let (instance, method, total) = (
+            client.instance,
+            client.methods.value,
+            client.total(client.sent()),
+        );
         for number in 1..=NODES {
             let node = cluster.node(number).unwrap();
             wait_until("every counter as it was", ANSWERED, || {
-                query(&node, client.agent, client.instance, client.methods.value)
-                    == Ok(Outcome::Done(total.encode()))
+                query(&node, client.agent, instance, method) == Ok(Outcome::Done(total.encode()))
             });
         }
     }
@@ -285,7 +394,40 @@ impl Drop for Ending<'_> {
     }
 }
 
-fn exactly_once(mode: Mode, default_seed: u64) {
+/// Install the rounds actor at `agent` as the instance its tours start at,
+/// and as those the previous agent's tours ask and tell.
+fn install_rounds(cluster: &Cluster, agent: AgentId, rounds: &Rounds) {
+    let leader = cluster.node(cluster.leader(agent).unwrap()).unwrap();
+    for instance in [ASKED, TOLD, ROUNDS] {
+        let install = leader.install(agent, instance, &rounds.program, &rounds.beside(), vec![]);
+        let installed = smol::block_on(install);
+        assert!(
+            matches!(installed, Ok(vos_node::Reply::Ran(Outcome::Done(_)))),
+            "{installed:?}"
+        );
+    }
+}
+
+/// `node`'s tallies at `agent`'s rounds `instance`, checked against what
+/// `touring`'s tours tallied there: how many amounts applied, each once.
+fn tallied(
+    node: &Node,
+    agent: AgentId,
+    instance: InstanceId,
+    touring: &Touring,
+) -> Result<u64, String> {
+    let read = |method| match query(node, agent, instance, method) {
+        Ok(Outcome::Done(bytes)) => Ok(bytes),
+        other => Err(format!("{other:?}")),
+    };
+    let tallies = <Vec<(u64, u64)>>::decode(&read(touring.methods.tallies)?)
+        .unwrap()
+        .0;
+    let total = u64::decode(&read(touring.methods.total)?).unwrap().0;
+    check_tallies(touring, &tallies, total)
+}
+
+fn exactly_once(mode: Mode, default_seed: u64, workflows: bool) {
     let seed = std::env::var("EXACTLY_ONCE_SEED")
         .ok()
         .and_then(|seed| seed.parse().ok())
@@ -300,6 +442,7 @@ fn exactly_once(mode: Mode, default_seed: u64) {
         forward: method(&counter, "forward"),
     };
     let value = methods.value;
+    let rounds = workflows.then(Rounds::load);
     let agents: Vec<(AgentId, [u8; 32])> = (1..=3u8)
         .map(|number| {
             let creator = cluster.node(number).unwrap();
@@ -317,13 +460,18 @@ fn exactly_once(mode: Mode, default_seed: u64) {
                     "{installed:?}"
                 );
             }
+            if let Some(rounds) = &rounds {
+                install_rounds(&cluster, agent, rounds);
+            }
             (agent, cluster.identity(number, agent))
         })
         .collect();
     // At each agent, one client forwarding to the next agent's inbox and a
     // second incrementing a counter of its own: batches mix their
-    // sessions, new and held.
-    let clients: Vec<Client> = (1..=6u8)
+    // sessions, new and held. With workflows, a third tours the next agent.
+    let tours = rounds.as_ref().map(|rounds| rounds.methods);
+    let count = if workflows { 9 } else { 6 };
+    let clients: Vec<Client> = (1..=count)
         .map(|number| {
             let (agent, identity) = agents[usize::from(number - 1) % agents.len()];
             let forwarding = number <= 3;
@@ -334,13 +482,18 @@ fn exactly_once(mode: Mode, default_seed: u64) {
             } else {
                 4 + 4 * random.below(2)
             };
-            Client::new(number, agent, identity, methods, forwarding, rotate)
+            match tours {
+                Some(tours) if number > 6 => {
+                    Client::touring(number, agent, identity, methods, tours, rotate)
+                }
+                _ => Client::new(number, agent, identity, methods, forwarding, rotate),
+            }
         })
         .collect();
     let forwarding = &clients[..agents.len()];
-    for (at, client) in forwarding.iter().enumerate() {
-        let next = &forwarding[(at + 1) % forwarding.len()];
-        client.forward_to(next.agent);
+    let touring = &clients[2 * agents.len()..];
+    for (at, client) in forwarding.iter().chain(touring).enumerate() {
+        client.forward_to(agents[(at + 1) % agents.len()].0);
     }
     let done = AtomicBool::new(false);
     let sent: Vec<u64> = std::thread::scope(|scope| {
@@ -367,10 +520,19 @@ fn exactly_once(mode: Mode, default_seed: u64) {
     });
     println!("requests answered: {sent:?}");
     println!("{:?}", cluster.log.seen());
+    let seen = cluster.log.seen();
     assert!(
-        cluster.log.seen().contains_key("session timed again"),
+        seen.contains_key("session timed again"),
         "no session met the clocks' jump"
     );
+    if workflows {
+        for stop in [
+            "fault: a leader stops mid-await",
+            "fault: a leader stops mid-computation",
+        ] {
+            assert!(seen.contains_key(stop), "never: {stop}");
+        }
+    }
     // Healed, every replica holds every request once.
     cluster.hub.heal();
     for number in 1..=NODES {
@@ -388,13 +550,75 @@ fn exactly_once(mode: Mode, default_seed: u64) {
             .map(|bytes| u64::decode(unstored(&bytes).unwrap()).unwrap().0)
             .unwrap_or(0)
     };
-    for (at, client) in clients.iter().enumerate().skip(forwarding.len()) {
+    for (at, client) in clients
+        .iter()
+        .enumerate()
+        .skip(forwarding.len())
+        .take(agents.len())
+    {
         let total = client.total(sent[at]);
         for number in 1..=NODES {
             let node = cluster.node(number).unwrap();
             wait_until("every replica converges", Duration::from_secs(60), || {
                 counted(&node, client.agent, client.instance) == Ok(Outcome::Done(total.encode()))
             });
+        }
+    }
+    // Each tour's effects applied once: the next agent's asked and told
+    // rounds, and this agent's own, tally every amount of a tour that ended
+    // done once, and of one that failed once or not at all; its requests
+    // and messages went once, each request answered once. Every workflow
+    // started once, and none lives on.
+    let mut toured = vec![0; agents.len()];
+    for (at, client) in touring.iter().enumerate() {
+        let touring = client.tours().unwrap();
+        let (ended, failed) = touring.ended();
+        println!(
+            "client {}: {ended} tours ended as a straight run, {failed} failed",
+            client.number
+        );
+        assert!(ended > 0, "client {} ended no tour", client.number);
+        let (agent, next) = (client.agent, client.next_agent().unwrap());
+        let forwards = sent[at] / 5;
+        for number in 1..=NODES {
+            let node = cluster.node(number).unwrap();
+            let mut checked = Err(String::new());
+            wait_until(
+                "every replica holds every tour's effects",
+                Duration::from_secs(60),
+                || {
+                    checked = (|| {
+                        tallied(&node, agent, ROUNDS, touring)?;
+                        let asked = tallied(&node, next, ASKED, touring)?;
+                        let told = tallied(&node, next, TOLD, touring)?;
+                        let sent = mark(&node, agent, &keys::pair_out(next));
+                        let replies = mark(&node, next, &keys::pair_out(agent));
+                        let settled = mark(&node, agent, &keys::live_workflows()) == 0
+                            && sent == forwards + asked + told
+                            && mark(&node, next, &keys::pair_in(agent)) == sent
+                            && replies == asked
+                            && mark(&node, agent, &keys::pair_in(next)) == replies;
+                        settled
+                            .then_some(asked + told)
+                            .ok_or_else(|| format!("{asked} asked, {told} told, {sent} sent"))
+                    })();
+                    checked.is_ok()
+                },
+            );
+            let messages = checked.unwrap();
+            assert!(
+                number == 1 || toured[at] == messages,
+                "client {}: replicas differ",
+                client.number
+            );
+            toured[at] = messages;
+            assert_eq!(
+                mark(&node, agent, &keys::next_workflow()),
+                sent[2 * agents.len() + at],
+                "every tour started once"
+            );
+            let pins = keys::workflow_pins_prefix();
+            assert_eq!(node.store().snapshot().scan(agent, &pins, None).count(), 0);
         }
     }
     for (at, client) in forwarding.iter().enumerate() {
@@ -406,12 +630,16 @@ fn exactly_once(mode: Mode, default_seed: u64) {
         );
         let forwards = sent / 5;
         let inbox = client.forwarded(sent);
+        // The forwards, and the tours' requests and messages, on one pair.
+        let messages = forwards + toured[at];
         for number in 1..=NODES {
             let node = cluster.node(number).unwrap();
             wait_until("every replica converges", Duration::from_secs(60), || {
+                let acked = mark(&node, client.agent, &keys::acked(next_agent));
                 counted(&node, client.agent, COUNTER) == Ok(Outcome::Done(total.encode()))
                     && counted(&node, next_agent, INBOX) == Ok(Outcome::Done(inbox.encode()))
-                    && mark(&node, client.agent, &keys::acked(next_agent)) == forwards
+                    && acked == messages
+                    && acked == mark(&node, client.agent, &keys::pair_out(next_agent))
                     && node
                         .store()
                         .snapshot()
@@ -419,14 +647,10 @@ fn exactly_once(mode: Mode, default_seed: u64) {
                         .count()
                         == 0
             });
-            // Each forward applied once at the receiver, and was sent once.
+            // Each message applied once at the receiver, and was sent once.
             assert_eq!(
                 mark(&node, next.agent, &keys::pair_in(client.agent)),
-                forwards
-            );
-            assert_eq!(
-                mark(&node, client.agent, &keys::pair_out(next_agent)),
-                forwards
+                mark(&node, client.agent, &keys::pair_out(next_agent))
             );
         }
     }
@@ -450,10 +674,15 @@ fn exactly_once(mode: Mode, default_seed: u64) {
 
 #[test]
 fn one_request_at_a_time_applies_once_through_failures() {
-    exactly_once(Mode::OneAtATime, 0x5eed_0001);
+    exactly_once(Mode::OneAtATime, 0x5eed_0001, false);
 }
 
 #[test]
 fn pipelined_requests_apply_once_through_failures() {
-    exactly_once(Mode::Pipelined, 0x5eed_0002);
+    exactly_once(Mode::Pipelined, 0x5eed_0002, false);
+}
+
+#[test]
+fn workflows_apply_once_through_failures() {
+    exactly_once(Mode::OneAtATime, 0x5eed_0003, true);
 }

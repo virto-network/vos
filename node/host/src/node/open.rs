@@ -177,6 +177,7 @@ impl Node {
             halted: AtomicBool::new(false),
             liveness: crate::liveness::Liveness::new(incarnation),
             relayed: AtomicU64::new(0),
+            arrived: Default::default(),
         });
         for record in records {
             let agent = record.agent;

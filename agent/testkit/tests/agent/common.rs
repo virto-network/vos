@@ -2,13 +2,13 @@
 //! actors installed in it and in a testkit, and what the tests read of a
 //! batch's steps.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use vos_pvm::accumulate_host::{AccumulateContext, ServiceStorage};
-use vos_pvm::pool::MachinePool;
+use vos_pvm::pool::{CodeHash, MachinePool};
 use vos_pvm::refine::{Invocation, Machine, MemoryModel, PreparedProgram};
-use vos_pvm::refine_host::{RefineContext, StateReader};
+use vos_pvm::refine_host::{ProgramSource, RefineContext, StateReader};
 use vos_pvm::{ExitReason, PvmBackend};
 use vos_testkit::programs::{actor, agent, method};
 use vos_testkit::{Testkit, decode, program_hash};
@@ -19,7 +19,7 @@ use vos_wire::ids::{
 };
 use vos_wire::ingress::Grant;
 use vos_wire::jam::{AccumulateInput, Operand, RefineArgs};
-use vos_wire::records::{SessionMark, unstored};
+use vos_wire::records::{Installed, SessionMark, unstored};
 use vos_wire::result::{InputRef, Outcome, Run, Step, WorkResult, Write};
 use vos_wire::{Decode, Encode, keys};
 
@@ -55,6 +55,25 @@ impl StateReader for Snapshot {
     }
 }
 
+/// A VOS node's program source: the node's programs in the agent's scope.
+struct Scoped {
+    programs: Arc<HashMap<[u8; 32], Vec<u8>>>,
+    scope: Arc<BTreeSet<[u8; 32]>>,
+}
+
+impl ProgramSource for Scoped {
+    fn owns(&self, hash: &CodeHash) -> bool {
+        self.scope.contains(&hash.0)
+    }
+
+    fn program(&self, hash: &CodeHash) -> Option<Vec<u8>> {
+        self.programs
+            .get(&hash.0)
+            .filter(|_| self.owns(hash))
+            .cloned()
+    }
+}
+
 struct Storage<'a>(&'a mut BTreeMap<Vec<u8>, Vec<u8>>);
 
 impl ServiceStorage for Storage<'_> {
@@ -78,13 +97,15 @@ pub const JAM_UNSERVED_GAS: u64 = 1_000;
 /// the refine at it.
 pub const LOST: u64 = 0x483;
 
-/// `historical_lookup` from the node's programs, and the agent's report of
-/// lost state, which stops the refine; every other call the host does not
-/// serve answers `WHAT`, at `unserved` gas.
+/// `historical_lookup` from the node's programs, those in `scope` when it is
+/// given, in the agent's own preimages alone, as a node scopes them; and
+/// the agent's report of lost state, which stops the refine. Every other
+/// call the host does not serve answers `WHAT`, at `unserved` gas.
 fn serve(
     id: u64,
     machine: &mut Machine,
     programs: &HashMap<[u8; 32], Vec<u8>>,
+    scope: Option<&BTreeSet<[u8; 32]>>,
     unserved: u64,
 ) -> Result<(), ExitReason> {
     let registers = *machine.registers();
@@ -104,7 +125,9 @@ fn serve(
             .memory()
             .read_bytes_checked(registers[8] as u32, &mut hash)
     );
-    match programs.get(&hash) {
+    let own = registers[7] == u64::MAX || registers[7] == u64::from(AGENT.0);
+    let scoped = own && scope.is_none_or(|scope| scope.contains(&hash));
+    match programs.get(&hash).filter(|_| scoped) {
         Some(blob) => {
             let offset = (registers[10] as usize).min(blob.len());
             let len = (registers[11] as usize).min(blob.len() - offset);
@@ -135,7 +158,7 @@ pub struct Node {
     precompiles: bool,
     /// The gas a call the host does not serve costs.
     unserved: u64,
-    programs: HashMap<[u8; 32], Vec<u8>>,
+    programs: Arc<HashMap<[u8; 32], Vec<u8>>>,
     pub state: BTreeMap<Vec<u8>, Vec<u8>>,
     pub version: u64,
 }
@@ -157,7 +180,7 @@ impl Node {
             serves_state,
             precompiles: pool || serves_state,
             unserved: 0,
-            programs: HashMap::new(),
+            programs: Arc::default(),
             state: BTreeMap::new(),
             version: 0,
         }
@@ -209,7 +232,7 @@ impl Node {
         if let Some(pool) = &self.pool {
             pool.uninstall(&vos_pvm::pool::CodeHash(hash.0));
         }
-        self.programs
+        Arc::make_mut(&mut self.programs)
             .remove(&hash.0)
             .expect("a program the node holds")
     }
@@ -219,7 +242,7 @@ impl Node {
         if let Some(pool) = &self.pool {
             assert_eq!(pool.install(blob).unwrap().0, hash.0);
         }
-        self.programs.insert(hash.0, blob.to_vec());
+        Arc::make_mut(&mut self.programs).insert(hash.0, blob.to_vec());
         hash
     }
 
@@ -287,8 +310,14 @@ impl Node {
         let mut context =
             RefineContext::load_prepared(&self.program, &arguments, gas, MemoryModel::Auto)
                 .unwrap();
+        let scope = Arc::new(self.scope(work));
         if let Some(pool) = &self.pool {
-            context = context.with_pool(Arc::clone(pool));
+            context = context
+                .with_pool(Arc::clone(pool))
+                .with_programs(Arc::new(Scoped {
+                    programs: Arc::clone(&self.programs),
+                    scope: Arc::clone(&scope),
+                }));
         }
         if self.serves_state {
             context = context.with_state(Arc::new(Snapshot(self.state.clone())));
@@ -297,8 +326,34 @@ impl Node {
             context = context.without_precompiles();
         }
         context
-            .try_run_with_host(|id, machine| serve(id, machine, &self.programs, self.unserved))
+            .try_run_with_host(|id, machine| {
+                serve(id, machine, &self.programs, Some(&scope), self.unserved)
+            })
             .unwrap()
+    }
+
+    /// The programs the agent may load in `work`, as a node scopes them:
+    /// those its state pins, its installed instances' and its living
+    /// workflows', and those `work` installs.
+    fn scope(&self, work: &Work) -> BTreeSet<[u8; 32]> {
+        let rows = |prefix: Vec<u8>| {
+            self.state
+                .range(prefix.clone()..)
+                .take_while(move |(key, _)| key.starts_with(&prefix))
+        };
+        let mut scope: BTreeSet<[u8; 32]> = rows(keys::installed_prefix())
+            .filter_map(|(_, value)| Installed::decode(unstored(value)?).ok())
+            .flat_map(|(installed, _)| installed.programs().collect::<Vec<_>>())
+            .chain(
+                rows(keys::workflow_pins_prefix())
+                    .filter_map(|(key, _)| keys::workflow_pins_entry(key)),
+            )
+            .map(|program| program.0)
+            .collect();
+        if let Work::Batch(batch) = work {
+            scope.extend(batch.installs().map(|program| program.0));
+        }
+        scope
     }
 
     /// Run `program`, an outer program like the agent, on `arguments` with
@@ -319,7 +374,9 @@ impl Node {
             context = context.without_precompiles();
         }
         context
-            .try_run_with_host(|id, machine| serve(id, machine, &self.programs, self.unserved))
+            .try_run_with_host(|id, machine| {
+                serve(id, machine, &self.programs, None, self.unserved)
+            })
             .unwrap()
     }
 

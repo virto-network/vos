@@ -638,3 +638,90 @@ process tests and the fault suite.
 - Fable: go. Units are atomic, preemption is deterministic, the floor
   holds, and a pending call is served once.
 - Opus: GO with fixes, all in, with 3178a486's own follow-ups.
+
+## Step 4.6: workflows in the replicated node
+
+**Built:**
+- **A workflow's owner reads its status and result** (`POST
+  /agents/{id}/workflows`, `Client::workflow`, `vos workflow`), signed
+  like a query, with a bounded wait.
+  - The node reads the workflow's row at applied state, decoding only
+    its head, and runs no refine. It is the agent's own owner rule, and
+    what a JAM client would do.
+  - A stranger, an unknown id and a collected workflow all read
+    `Unknown`. A result is kept about an hour after the workflow ends.
+  - At most 64 reads wait at once on a node, each for at most 30 s,
+    re-reading on the executors at each apply.
+  - A read's `not_after` is held within 60 s plus its wait.
+- **The exactly-once checker's workflow mode** (the `rounds` actor's
+  tours, each round of which does five things):
+  - requests another agent's counter and awaits it;
+  - calls its own;
+  - sends a message;
+  - sleeps;
+  - computes long enough to be preempted.
+  - Each round tallies its own amount, so a duplicate anywhere shows as
+    a count of two.
+  - Leaders are stopped while a tour awaits and while it computes, its
+    refines held so the stop lands inside.
+  - Seeds 601–612, all modes, 36 runs: all ok. 0 of 1,927 tours failed,
+    across 24 stops mid-await and 24 mid-computation.
+- **Across processes:** a workflow awaiting an agent cut off by a
+  partition, its own leader SIGKILLed, completes once with its pair
+  marks exact.
+
+**Measured:**
+
+| | Quiet | Notes |
+|---|---|---|
+| Capture plus restore, a typical suspension (3 pages), JIT | 176–252 µs | beyond an empty refine |
+| Capture plus restore, 50 KB (15 pages), JIT | 0.62–0.81 ms | 1.47 ms under contention |
+| A workflow's resume, a reply in to its step applied, one node | median 1.3–1.6 ms, p99 2.1 ms | synced commits |
+
+- The 50 KB row is within the 1 ms budget, so the live-machine cache
+  (decision 4) is not built.
+- **Where the snapshot time goes:**
+  - hashing pages, one precompile call per 128-byte block: 22%;
+  - LZ4: 14%;
+  - restore's page loop: 13%;
+  - entering and leaving the JIT: 8%.
+  - A precompile that hashes a whole page in one call is the lever if
+    the row ever needs one.
+
+**Reviewed** (Opus): GO with fixes, all in: the waits' bound and cheap
+re-reads, the checker exact under failures, the read horizon.
+
+## Step 4.7: the carried smaller items
+
+**Built:**
+- **`#[msg(linearizable)]`:** the schema marks the method. The executor
+  decides the marking from the query's own snapshot; a marked query not
+  yet past a read index runs again past one, on a follower too. Install
+  refuses the mark on anything but a query.
+- **`historical_lookup` answers only the agent's own programs:** those
+  it pins or its batch installs, and only for its own service id.
+  - A pooled program the agent does not own answers as missing, so the
+    pool is no way around the scope.
+  - The testkit's JAM host follows the same rule.
+- **The fan-in bench** (`node/host/benches/fan_in.rs`, three nodes over
+  QUIC):
+  - **Frames do not bound fan-in, refine does:** the receiver is 97–98%
+    busy, about 78% of it in refine, with about 1.1 frames a message
+    when nothing drops. So combining agents' deliveries into one frame
+    is not built.
+  - **A full queue now asks for more once it has room:** the receiver
+    tells the senders it dropped, in arrival order, as many as fit, at
+    most once per 100 ms. Before it, dropped senders sat out their
+    backoff, up to 16 s, while the receiver idled.
+  - At 32 senders, the drain after the load fell from 9–26 s to 5 s, the
+    receiver 95% busy in it.
+  - A `Behind` that comes too soon is deferred, and cancelled if the
+    acknowledgement moves meanwhile.
+- **An install reserves 9M gas** (was 8M): the schema grew a byte a
+  method, and the largest install must keep a fifth of its price spare.
+
+**Reviewed** (Opus): GO with fixes, all in:
+- the pool hit scoped;
+- the service id;
+- the marking decided off the node's thread;
+- the drain paced and triggered by room.

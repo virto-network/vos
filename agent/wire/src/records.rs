@@ -84,7 +84,26 @@ impl Workflow {
     /// The record's format. The agent reads no other: a record of another
     /// format is data it lost, which halts the node that reads it, so a
     /// new format needs the records migrated before any replica runs it.
+    /// The node reads the record too, as its [`WorkflowHead`], to answer
+    /// its owner: a new format changes that reader with the agent.
     pub const FORMAT: u8 = 2;
+}
+
+/// A [`Workflow`] record's fields before its snapshot, in its order:
+/// decoded from a record's bytes, it reads the workflow's owner and state
+/// without its pages' list, as the node does to answer its owner.
+#[derive(Clone, Debug, PartialEq, Eq, Decode)]
+pub struct WorkflowHead {
+    pub format: u8,
+    pub program: ProgramHash,
+    pub instance: InstanceId,
+    pub owner: Principal,
+    pub gas: u64,
+    pub writable: u32,
+    pub awaits: u64,
+    pub due: u64,
+    pub waiter: Option<Await>,
+    pub state: WorkflowState,
 }
 
 /// Where a workflow stands between its steps.

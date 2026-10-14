@@ -260,13 +260,17 @@ pub enum Refusal {
     /// An answer to a forwarded call that is no longer waited for.
     Unmatched = 11,
     /// An agent's message, acknowledgement or `Behind` with nowhere to go
-    /// here: no leader to relay to, a second hop, or a full queue. Its
-    /// sender sends it again.
+    /// here: no leader to relay to, or a second hop. Its sender sends it
+    /// again.
     Unplaced = 12,
+    /// An agent's message its leader's queue here had no room for: its
+    /// sender sends it again, told it is behind once the queue drained, or
+    /// at its round.
+    Full = 13,
 }
 
 impl Refusal {
-    pub const ALL: [Refusal; 13] = [
+    pub const ALL: [Refusal; 14] = [
         Refusal::Undecodable,
         Refusal::Stranger,
         Refusal::NotTheLeaderNamed,
@@ -280,6 +284,7 @@ impl Refusal {
         Refusal::NotAReplica,
         Refusal::Unmatched,
         Refusal::Unplaced,
+        Refusal::Full,
     ];
 }
 

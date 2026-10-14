@@ -1,5 +1,5 @@
-//! A counter: struct state, a query, and a command that can fail; a
-//! committed map; and probes of the agent's enforcement.
+//! A counter: struct state, queries, one linearizable, and a command that
+//! can fail; a committed map; and probes of the agent's enforcement.
 
 #![no_std]
 
@@ -70,6 +70,13 @@ impl Counter {
 
     #[msg]
     pub async fn value(&self) -> u64 {
+        self.value
+    }
+
+    /// The value, read after a read index whatever consistency the client
+    /// asks.
+    #[msg(linearizable)]
+    pub async fn latest(&self) -> u64 {
         self.value
     }
 

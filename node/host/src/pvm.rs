@@ -2,8 +2,8 @@
 //! threads against a store snapshot. A store read that fails there panics,
 //! which the executor turns into an infrastructure fault.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::{Arc, Mutex};
 
 use vos_pvm::ExitReason;
 use vos_pvm::accumulate_host::{self, ACCUMULATE_ENTRY, AccumulateContext, ServiceStorage};
@@ -18,14 +18,17 @@ use vos_wire::result::Write;
 use vos_wire::{Decode, Encode, defaults};
 
 use crate::blobs::Blobs;
+use crate::lock;
 use crate::store::Snapshot;
 
 /// The refine entry point.
 const REFINE_ENTRY: u32 = 0;
 
-/// `historical_lookup`, which refine answers from the stored programs.
+/// `historical_lookup`, which refine answers from the agent's programs.
 const HISTORICAL_LOOKUP: u64 = 7;
 const LOOKUP_GAS: u64 = 10;
+/// The service a lookup names for the caller's own.
+const SELF_SERVICE: u64 = u64::MAX;
 /// The agent found its own state lost data it wrote: φ7/φ8 what. The
 /// refine stops at the call, and the node halts, as for a blob it lost.
 const LOST: u64 = 0x483;
@@ -89,32 +92,74 @@ impl StateReader for AgentState {
     }
 }
 
-/// The programs `agent` pins, from the node's blob store: what
-/// `instantiate` loads when the pool lacks one. A store that cannot be read
-/// faults the run, as refine's other reads do.
+/// The programs `agent` may load, from the node's blob store: those it
+/// pins, and those its batch installs, which the batch's apply pins. A JAM
+/// service looks up only its own preimages: `historical_lookup` answers
+/// these alone, and `instantiate` lends no other, though the node's pool
+/// holds every agent's. A store that cannot be read faults the run, as
+/// refine's other reads do.
+///
+/// A program a batch installs is the agent's in that batch on VOS, its
+/// blob stored before the batch; on JAM its preimage must be provided
+/// before the package's lookup anchor.
 struct AgentPrograms {
     blobs: Blobs,
     agent: AgentId,
+    installing: BTreeSet<[u8; 32]>,
+    /// Whether the agent pins a program, as this run asked.
+    pinned: Mutex<HashMap<[u8; 32], bool>>,
 }
 
-impl ProgramSource for AgentPrograms {
-    fn program(&self, hash: &CodeHash) -> Option<Vec<u8>> {
-        if !self
-            .blobs
-            .pinned_by(&hash.0, self.agent.0)
-            .expect("a pin read")
-        {
+impl AgentPrograms {
+    fn new(blobs: &Blobs, agent: AgentId, work: &Work) -> Self {
+        let installing = match work {
+            Work::Batch(batch) => batch.installs().map(|program| program.0).collect(),
+            Work::Query(_) => BTreeSet::new(),
+        };
+        Self {
+            blobs: blobs.clone(),
+            agent,
+            installing,
+            pinned: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Whether `hash` is one of the agent's programs.
+    fn owns(&self, hash: &[u8; 32]) -> bool {
+        if self.installing.contains(hash) {
+            return true;
+        }
+        *lock(&self.pinned).entry(*hash).or_insert_with(|| {
+            self.blobs
+                .pinned_by(hash, self.agent.0)
+                .expect("a pin read")
+        })
+    }
+
+    /// The bytes of `hash`, if it is one of the agent's programs.
+    fn get(&self, hash: &[u8; 32]) -> Option<Vec<u8>> {
+        if !self.owns(hash) {
             return None;
         }
-        let program = self.blobs.get(&hash.0).expect("a blob read");
+        let program = self.blobs.get(hash).expect("a blob read");
         if program.is_none() {
             tracing::warn!(
                 agent = self.agent.0,
-                program = %hex_prefix(&hash.0),
-                "a program the agent pins is not stored"
+                program = %hex_prefix(hash),
+                "a program of the agent's is not stored"
             );
         }
         program
+    }
+}
+
+impl ProgramSource for AgentPrograms {
+    fn owns(&self, hash: &CodeHash) -> bool {
+        AgentPrograms::owns(self, &hash.0)
+    }
+
+    fn program(&self, hash: &CodeHash) -> Option<Vec<u8>> {
+        self.get(&hash.0)
     }
 }
 
@@ -142,14 +187,12 @@ pub(crate) fn refine(
         Work::Batch(batch) => gas + defaults::refine_start(batch.inputs.len(), arguments.len()),
         Work::Query(_) => gas,
     };
+    let programs = Arc::new(AgentPrograms::new(blobs, agent, work));
     let invocation = RefineContext::new(program.load(REFINE_ENTRY, &arguments, gas)?)
         .with_pool(Arc::clone(pool))
-        .with_programs(Arc::new(AgentPrograms {
-            blobs: blobs.clone(),
-            agent,
-        }))
+        .with_programs(Arc::clone(&programs) as Arc<dyn ProgramSource>)
         .with_state(Arc::new(AgentState { snapshot, agent }))
-        .try_run_with_host(|id, machine| serve(id, machine, blobs))?;
+        .try_run_with_host(|id, machine| serve(id, machine, &programs))?;
     let used = invocation.gas_used;
     let output = if invocation.exit == ExitReason::HostCall(LOST) {
         let registers = invocation.registers;
@@ -185,9 +228,11 @@ fn hex_prefix(hash: &[u8; 32]) -> String {
 }
 
 /// The calls refine leaves to the node: `historical_lookup` from the
-/// stored programs, and the agent's report of lost state, which stops the
-/// refine; every other answers `WHAT`.
-fn serve(id: u64, machine: &mut Machine, blobs: &Blobs) -> Result<(), ExitReason> {
+/// agent's programs, and the agent's report of lost state, which stops the
+/// refine; every other answers `WHAT`. A lookup naming another service
+/// finds none: JAM would read that service's preimages, which are not this
+/// agent's programs.
+fn serve(id: u64, machine: &mut Machine, programs: &AgentPrograms) -> Result<(), ExitReason> {
     if id == LOST {
         return Err(ExitReason::HostCall(LOST));
     }
@@ -203,11 +248,10 @@ fn serve(id: u64, machine: &mut Machine, blobs: &Blobs) -> Result<(), ExitReason
     {
         return Err(ExitReason::Panic);
     }
-    let blob = blobs.get(&hash).expect("a blob read");
-    let Some(blob) = blob else {
-        // The agent looks up only programs it runs: one missing is a
-        // program its state names and this node lacks.
-        tracing::warn!(blob = %hex_prefix(&hash), "a blob refine looked up is not stored");
+    // Another agent's blob is absent here, as one this node lacks.
+    let service = registers[7];
+    let own = service == SELF_SERVICE || service == u64::from(programs.agent.0);
+    let Some(blob) = own.then(|| programs.get(&hash)).flatten() else {
         machine.registers_mut()[7] = code::NONE;
         return Ok(());
     };
@@ -301,30 +345,114 @@ pub(crate) fn decode<T: Decode>(bytes: &[u8]) -> Result<T, Fault> {
 mod tests {
     use super::*;
     use crate::store::{Fjall, PersistMode};
+    use vos_pvm_program::{CodeBlob, StandardProgram, build_standard_program};
+    use vos_wire::batch::{Admin, Batch, Input, Query};
+    use vos_wire::ids::{InstanceId, MethodId, Principal, ProgramHash};
 
-    /// An agent's programs are the ones it pins: a program another agent
-    /// pins is stored here, but is not this agent's to load.
+    /// `historical_lookup` of `hash` in `service`'s preimages, served for
+    /// `programs` into a machine whose arguments are the hash: the bytes it
+    /// wrote, or `None` for `NONE`.
+    fn lookup(programs: &AgentPrograms, service: u64, hash: &[u8; 32]) -> Option<Vec<u8>> {
+        let blob = build_standard_program(&StandardProgram {
+            ro_data: vec![],
+            rw_data: vec![],
+            heap_pages: 0,
+            stack_size: 4096,
+            code: CodeBlob {
+                jump_table: vec![],
+                code: vec![0],
+                bitmask: vec![1],
+            },
+        })
+        .unwrap();
+        let mut machine = Machine::load(&blob, hash, 1_000_000).unwrap();
+        let registers = machine.registers_mut();
+        let out = registers[1] - 4096;
+        registers[8] = registers[7];
+        registers[7] = service;
+        registers[9] = out;
+        registers[10] = 0;
+        registers[11] = 4096;
+        serve(HISTORICAL_LOOKUP, &mut machine, programs).unwrap();
+        let len = machine.registers()[7];
+        if len == code::NONE {
+            return None;
+        }
+        let mut bytes = vec![0; len as usize];
+        assert!(machine.memory().read_bytes_checked(out as u32, &mut bytes));
+        Some(bytes)
+    }
+
+    /// An agent's programs are those it pins and those its batch installs:
+    /// `historical_lookup` reads no other, nor another service's, and the
+    /// program source owns no other, so `instantiate` lends none from the
+    /// pool, though another agent's is stored and pooled here.
     #[test]
-    fn an_agent_loads_only_the_programs_it_pins() {
+    fn an_agent_reads_only_its_own_programs() {
         let dir = tempfile::tempdir().unwrap();
         let store = Fjall::open(dir.path().join("store")).unwrap();
         let blobs = Blobs::open(dir.path().join("blobs"), &store).unwrap();
-        let program = Arc::new(vec![1u8, 2, 3]);
-        let blob = crate::blobs::blob_ref(&program);
-        smol::block_on(blobs.put(blob, Arc::clone(&program))).unwrap();
+        let stored = |bytes: Vec<u8>| {
+            let program = Arc::new(bytes);
+            let blob = crate::blobs::blob_ref(&program);
+            smol::block_on(blobs.put(blob, Arc::clone(&program))).unwrap();
+            (blob.hash, program.to_vec())
+        };
+        let (pinned, pinned_bytes) = stored(vec![1, 2, 3]);
+        let (installed, installed_bytes) = stored(vec![4, 5]);
         let mut batch = store.batch();
-        batch.pin(&blob.hash, AgentId(1));
+        batch.pin(&pinned, AgentId(1));
         batch.commit(PersistMode::SyncAll).unwrap();
 
-        let programs = |agent| AgentPrograms {
-            blobs: blobs.clone(),
-            agent: AgentId(agent),
-        };
-        let hash = CodeHash(blob.hash);
-        assert_eq!(programs(1).program(&hash), Some(program.to_vec()));
-        assert_eq!(programs(2).program(&hash), None, "another agent's program");
-        assert_eq!(programs(1).program(&CodeHash([9; 32])), None);
-        assert!(blobs.pinned_by_any(&blob.hash).unwrap());
-        assert!(!blobs.pinned_by_any(&[9; 32]).unwrap());
+        let query = Work::Query(Query {
+            time: 0,
+            seed: [0; 32],
+            caller: Principal::Client([1; 32]),
+            instance: InstanceId(1),
+            method: MethodId(1),
+            arguments: Vec::new(),
+        });
+        let install = Work::Batch(Batch {
+            version: 0,
+            time: 0,
+            seed: [0; 32],
+            budget: 0,
+            inputs: vec![Input::Admin(Admin::Install {
+                instance: InstanceId(1),
+                program: ProgramHash(installed),
+                beside: Vec::new(),
+                roles: Vec::new(),
+            })],
+        });
+        let programs = |agent, work| AgentPrograms::new(&blobs, AgentId(agent), work);
+        let (first, second) = (programs(1, &query), programs(2, &query));
+        for service in [SELF_SERVICE, 1] {
+            assert_eq!(lookup(&first, service, &pinned), Some(pinned_bytes.clone()));
+        }
+        assert_eq!(lookup(&first, 2, &pinned), None, "another service's");
+        assert!(ProgramSource::owns(&first, &CodeHash(pinned)));
+        assert_eq!(
+            lookup(&second, SELF_SERVICE, &pinned),
+            None,
+            "another agent's"
+        );
+        assert!(!ProgramSource::owns(&second, &CodeHash(pinned)));
+        assert_eq!(second.program(&CodeHash(pinned)), None);
+        assert_eq!(
+            lookup(&first, SELF_SERVICE, &installed),
+            None,
+            "one it never had"
+        );
+        assert_eq!(lookup(&first, SELF_SERVICE, &[9; 32]), None);
+
+        let installing = programs(2, &install);
+        assert_eq!(
+            lookup(&installing, SELF_SERVICE, &installed),
+            Some(installed_bytes)
+        );
+        assert!(ProgramSource::owns(&installing, &CodeHash(installed)));
+        assert_eq!(lookup(&installing, SELF_SERVICE, &pinned), None);
+        assert!(blobs.pinned_by_any(&pinned).unwrap());
+        assert!(!blobs.pinned_by_any(&installed).unwrap());
     }
 }

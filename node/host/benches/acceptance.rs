@@ -8,6 +8,11 @@
 //! - One request alone: its latency, the batch's linger and its commit's
 //!   sync included, and its execution alone.
 //! - A query: the counter's `value` on applied state.
+//! - A workflow's resume: a reply delivered to the leader, until the
+//!   workflow's next step is applied. A tour of the rounds actor awaits an
+//!   agent the node does not hold, whose replies the bench delivers as
+//!   that agent's would arrive; each resumed step runs its round and
+//!   awaits the next reply.
 //!
 //! `cargo bench -p vos-node --bench acceptance` (after `just build-agent
 //! build-test-actors`); `GREY_PVM=interpreter` runs the interpreter. Data
@@ -19,12 +24,14 @@ use std::time::{Duration, Instant};
 use vos_checker::calls::done;
 use vos_checker::percentiles;
 use vos_checker::programs::{Programs, method};
+use vos_checker::workflows::{ROUNDS, Rounds, Tour};
 use vos_node::{Config, Hooks, Node, Reply};
-use vos_wire::Encode;
-use vos_wire::batch::{Batch, Request};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session};
+use vos_wire::batch::{Answer, Await, Batch, Body, Message, Request};
+use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session, WorkflowId};
 use vos_wire::ingress::Stats;
+use vos_wire::records::{Workflow, WorkflowState, unstored};
 use vos_wire::result::Outcome;
+use vos_wire::{Decode, Encode, keys};
 
 const COUNTER: InstanceId = InstanceId(1);
 const ALICE: Principal = Principal::Client([1; 32]);
@@ -32,8 +39,23 @@ const SESSIONS: u64 = 256;
 const PER_SESSION: u64 = 100;
 const ALONE: usize = 201;
 const QUERIES: usize = 2001;
+const RESUMES: u64 = 201;
+/// The agent a tour asks, which the node does not hold: the bench delivers
+/// its replies.
+const ASKED: AgentId = AgentId(0x0a5c);
 
 fn increment(session: u64, sequence: u64, method: MethodId) -> Request {
+    request(session, sequence, COUNTER, method, 1u64.encode())
+}
+
+/// A request of `method` at `instance` in `session`.
+fn request(
+    session: u64,
+    sequence: u64,
+    instance: InstanceId,
+    method: MethodId,
+    arguments: Vec<u8>,
+) -> Request {
     // Every session starts when the bench does, each with a key of its
     // own: one key's sessions are capped.
     static START: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -47,10 +69,81 @@ fn increment(session: u64, sequence: u64, method: MethodId) -> Request {
         },
         sequence,
         caller: Principal::Client(key),
-        instance: COUNTER,
+        instance,
         method,
-        arguments: 1u64.encode(),
+        arguments,
     }
+}
+
+/// Workflow `id`'s state, as `node` applied it.
+fn state(node: &Node, agent: AgentId, id: WorkflowId) -> WorkflowState {
+    let bytes = node
+        .store()
+        .snapshot()
+        .get(agent, &keys::workflow(id))
+        .unwrap()
+        .expect("the workflow's record");
+    Workflow::decode(unstored(&bytes).unwrap()).unwrap().0.state
+}
+
+/// A tour's resumes at `agent`, which runs the rounds actor: each the time
+/// from a reply delivered to the node, the tour's leader, until the tour's
+/// next step is applied.
+fn resumes(node: &Node, agent: AgentId, session: u64) -> Vec<Duration> {
+    let rounds = Rounds::load();
+    let methods = rounds.methods;
+    let install = node.install(agent, ROUNDS, &rounds.program, &rounds.beside(), vec![]);
+    let installed = smol::block_on(install);
+    assert!(
+        matches!(installed, Ok(Reply::Ran(Outcome::Done(_)))),
+        "{installed:?}"
+    );
+    let tour = Tour {
+        other: ASKED,
+        amounts: (1..=RESUMES).collect(),
+        nap: 0,
+        words: 64,
+        passes: 4,
+    };
+    let start = request(session, 1, ROUNDS, methods.tour, tour.arguments());
+    let id = match smol::block_on(node.call(agent, start)) {
+        Ok(Reply::Ran(Outcome::Started(id))) => id,
+        other => panic!("{other:?}"),
+    };
+    let awaiting = || loop {
+        match state(node, agent, id) {
+            WorkflowState::Awaiting { counter, .. } => return Some(counter),
+            WorkflowState::Ended(_) => return None,
+            _ => std::thread::yield_now(),
+        }
+    };
+    let mut total = 0;
+    let mut samples = Vec::new();
+    while let Some(counter) = awaiting() {
+        total += samples.len() as u64 + 1;
+        let reply = Message {
+            from: ASKED,
+            sequence: samples.len() as u64 + 1,
+            body: Body::Reply {
+                awaiting: Await {
+                    workflow: id,
+                    counter,
+                },
+                answer: Answer::Done(total.encode()),
+            },
+        };
+        let started = Instant::now();
+        node.deliver(agent, reply).unwrap();
+        while matches!(
+            state(node, agent, id),
+            WorkflowState::Awaiting { counter: at, .. } if at == counter
+        ) {
+            std::thread::yield_now();
+        }
+        samples.push(started.elapsed());
+    }
+    assert_eq!(samples.len() as u64, RESUMES, "a resume a round");
+    samples
 }
 
 /// Run `per_session` increments in each of `sessions`, starting at session
@@ -253,5 +346,14 @@ fn main() {
         alone_phases.execution.as_secs_f64() * 1e6 / ALONE as f64,
     );
     println!("query: median {query_median:.1} µs, p99 {query_p99:.1} µs");
+
+    timing.take();
+    let resumed = resumes(&node, agent, alone_session + 1);
+    let resume_phases = timing.take();
+    let (resume_median, resume_p99) = percentiles(resumed, Duration::from_micros(1));
+    println!(
+        "a workflow's resume, a reply delivered to its next step applied: median {resume_median:.0} µs, p99 {resume_p99:.0} µs; execution {:.1} µs a batch on average",
+        resume_phases.execution.as_secs_f64() * 1e6 / resume_phases.batches.max(1) as f64,
+    );
     Arc::into_inner(node).expect("tasks done").shutdown();
 }

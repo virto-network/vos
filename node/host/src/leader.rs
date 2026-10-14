@@ -69,6 +69,9 @@ struct Window {
     turn: u64,
     /// When a receiver's `Behind` last sent it again.
     behind: Option<Instant>,
+    /// A `Behind` came too soon after that: it sends again once
+    /// [`BEHIND_EVERY`] has passed.
+    deferred: bool,
 }
 
 impl Window {
@@ -86,6 +89,7 @@ impl Window {
             round,
             turn,
             behind: None,
+            deferred: false,
         }
     }
 
@@ -101,6 +105,9 @@ impl Window {
             return;
         }
         self.acked = sequence;
+        // The receiver moves on: a deferred `Behind` would send again what
+        // it may hold, which its round sends if it does not.
+        self.deferred = false;
         while let Some((sent, size)) = self.sent.front().copied() {
             if sent > sequence {
                 break;
@@ -122,11 +129,13 @@ impl Window {
         (self.last > self.acked).then(|| self.since + self.wait)
     }
 
-    /// Go back to the acknowledgement: what was sent past it goes again.
+    /// Go back to the acknowledgement: what was sent past it goes again,
+    /// which a deferred `Behind` asked for too.
     fn rewind(&mut self) {
         self.sent.clear();
         self.bytes = 0;
         self.since = Instant::now();
+        self.deferred = false;
     }
 
     /// A round: rewind, through the next replica, and wait longer before
@@ -137,20 +146,38 @@ impl Window {
         self.turn += 1;
     }
 
-    /// A receiver's `Behind`: rewind at once, while the outbox holds more
-    /// than was acknowledged, at most once every [`BEHIND_EVERY`]. Whether
-    /// it did. Nothing in the frame moves the window: a stale one only
-    /// sends again what the receiver drops at its mark.
+    /// A receiver's `Behind`: rewind, while the outbox holds more than was
+    /// acknowledged, at once or, within [`BEHIND_EVERY`] of the last,
+    /// deferred until then. Whether it did now. Nothing in the frame moves
+    /// the window: a stale one only sends again what the receiver drops at
+    /// its mark.
     fn behind(&mut self, now: Instant) -> bool {
-        let recent = self
+        if self.last <= self.acked {
+            self.deferred = false;
+            return false;
+        }
+        if self
             .behind
-            .is_some_and(|at| now.saturating_duration_since(at) < BEHIND_EVERY);
-        if self.last <= self.acked || recent {
+            .is_some_and(|at| now.saturating_duration_since(at) < BEHIND_EVERY)
+        {
+            self.deferred = true;
             return false;
         }
         self.behind = Some(now);
         self.rewind();
         true
+    }
+
+    /// When a deferred `Behind` rewinds it.
+    fn deferred(&self) -> Option<Instant> {
+        self.behind
+            .filter(|_| self.deferred)
+            .map(|at| at + BEHIND_EVERY)
+    }
+
+    /// When it goes again next: at its round, or at a deferred `Behind`.
+    fn next(&self) -> Option<Instant> {
+        [self.due(), self.deferred()].into_iter().flatten().min()
     }
 }
 
@@ -248,6 +275,9 @@ struct Leader {
     ended: Option<Instant>,
     /// That a sweep left its first due row in place, said once.
     stuck: bool,
+    /// When it last told senders whose messages the queue dropped full
+    /// that they are behind.
+    told: Option<Instant>,
 }
 
 /// How a batch ended.
@@ -282,6 +312,7 @@ impl Leader {
             swept: None,
             ended: None,
             stuck: false,
+            told: None,
         })
     }
 
@@ -356,14 +387,33 @@ impl Leader {
     ) -> Option<Vec<Pending>> {
         let mut waited = false;
         loop {
-            {
-                let queue = lock(&agent.queue);
+            let (told, queued, untold) = {
+                let mut queue = lock(&agent.queue);
                 if queue.stopped {
                     return None;
                 }
-                if !queue.inputs.is_empty() {
-                    break;
+                // Senders whose messages it dropped full go again as its
+                // room fits their windows, at most a queue's worth of
+                // windows every `BEHIND_EVERY`, so those told have arrived.
+                let now = Instant::now();
+                let told = if self
+                    .told
+                    .is_none_or(|at| now.saturating_duration_since(at) >= BEHIND_EVERY)
+                {
+                    queue.untold(inner.settings.queue_cap, WINDOW)
+                } else {
+                    Vec::new()
+                };
+                if !told.is_empty() {
+                    self.told = Some(now);
                 }
+                (told, !queue.inputs.is_empty(), !queue.dropped.is_empty())
+            };
+            for sender in told {
+                inner.behind(sender, self.id);
+            }
+            if queued {
+                break;
             }
             if !leads(&shared.state(), self.term) {
                 return None;
@@ -384,7 +434,7 @@ impl Leader {
                 shared.wait(|state| !leads(state, term)).await;
                 Some(Some(false))
             };
-            let next = self.windows.values().filter_map(Window::due).min();
+            let next = self.windows.values().filter_map(Window::next).min();
             let round = async {
                 match next {
                     Some(at) => smol::Timer::at(at).await,
@@ -399,7 +449,18 @@ impl Leader {
                 };
                 None
             };
-            match woken.or(lost).or(round).or(recheck).await {
+            // Senders still to tell: told at a `Behind`'s pace.
+            let told = self.told;
+            let tell = async {
+                if !untold {
+                    std::future::pending::<()>().await;
+                }
+                if let Some(at) = told {
+                    smol::Timer::at(at + BEHIND_EVERY).await;
+                }
+                None
+            };
+            match woken.or(lost).or(round).or(recheck).or(tell).await {
                 Some(Some(true)) => {}
                 Some(Some(false)) => return None,
                 Some(None) => return Some(Vec::new()),
@@ -1271,7 +1332,7 @@ impl Leader {
 
     /// Send again, from its acknowledgement, the window of each target
     /// whose acknowledgement stayed behind its outbox for its wait, and of
-    /// each that found this agent behind it.
+    /// each that found this agent behind it, now or deferred until now.
     fn rounds(&mut self, inner: &Inner, agent: &Agent) {
         let now = Instant::now();
         let behind = std::mem::take(&mut lock(&agent.queue).behind);
@@ -1281,6 +1342,8 @@ impl Leader {
         for (to, window) in &mut self.windows {
             if window.due().is_some_and(|due| due <= now) {
                 window.round();
+                again.insert(*to);
+            } else if window.deferred().is_some_and(|at| at <= now) && window.behind(now) {
                 again.insert(*to);
             }
         }
@@ -1390,7 +1453,7 @@ mod tests {
 
     /// A receiver's `Behind` sends the window again from its
     /// acknowledgement at once, through the same replica and with the same
-    /// wait, and again only once `BEHIND_EVERY` has passed.
+    /// wait; one within `BEHIND_EVERY` of it, once that has passed.
     #[test]
     fn behind_rewinds_at_most_once_every_interval() {
         let mut window = window(&[3, 4, 5]);
@@ -1400,19 +1463,41 @@ mod tests {
         assert_eq!((window.bytes, window.turn, window.wait), (0, 0, ROUND));
         window.sent.push_back((3, 10));
         assert!(!window.behind(now + BEHIND_EVERY / 2));
-        assert_eq!(window.through(), 3, "a second one too soon is ignored");
+        assert_eq!(window.through(), 3, "a second one too soon waits");
+        assert_eq!(window.deferred(), Some(now + BEHIND_EVERY));
+        assert_eq!(window.next(), Some(now + BEHIND_EVERY), "before its round");
         assert!(window.behind(now + BEHIND_EVERY));
         assert_eq!(window.through(), 2);
+        assert_eq!(window.deferred(), None);
     }
 
-    /// A `Behind` with nothing past the acknowledgement does nothing: a
-    /// stale one.
+    /// A deferred `Behind` is dropped once the acknowledgement moves: the
+    /// receiver took more, and what it may hold would go again.
+    #[test]
+    fn an_acknowledgement_cancels_a_deferred_behind() {
+        let mut window = window(&[3, 4, 5]);
+        let now = Instant::now();
+        assert!(window.behind(now));
+        window.sent.push_back((3, 10));
+        window.bytes += 10;
+        assert!(!window.behind(now));
+        assert!(window.deferred().is_some());
+        window.ack(3);
+        assert_eq!(window.deferred(), None);
+        assert_eq!(window.next(), window.due(), "only its round");
+    }
+
+    /// A `Behind` with nothing past the acknowledgement does nothing, now
+    /// or later: a stale one.
     #[test]
     fn behind_with_everything_acknowledged_does_nothing() {
         let mut window = window(&[3, 4, 5]);
+        let now = Instant::now();
+        assert!(window.behind(now));
+        assert!(!window.behind(now));
         window.ack(5);
-        assert!(!window.behind(Instant::now()));
-        assert_eq!(window.behind, None);
+        assert!(!window.behind(now + BEHIND_EVERY));
+        assert_eq!((window.behind, window.deferred()), (Some(now), None));
     }
 
     /// A round rewinds through the next replica and doubles its wait.

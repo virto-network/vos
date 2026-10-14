@@ -5,8 +5,12 @@
 //! - three processes as one space take calls through any of them and send
 //!   messages to another agent, through the leader's SIGKILL and its
 //!   restart, every call applied once;
+//! - a workflow awaiting another agent completes once through its leader's
+//!   SIGKILL and a partition;
 //! - built with `--features faults`, the faults of `mod faults`, which a
 //!   test build injects.
+
+use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use vos_checker::calls::{Total, signed_query};
@@ -15,10 +19,12 @@ use vos_checker::processes::{
 };
 use vos_checker::programs::actor;
 use vos_checker::wait_until;
+use vos_checker::workflows::{ASKED, ROUNDS, Rounds, TOLD, Tour};
 use vos_node::client::Client;
 use vos_wire::ids::{AgentId, InstanceId};
-use vos_wire::ingress::{Answer, Consistency};
+use vos_wire::ingress::{Answer, Consistency, WorkflowStatus};
 use vos_wire::records::unstored;
+use vos_wire::result::Outcome;
 use vos_wire::{Decode, Encode, keys};
 
 const COUNTER: InstanceId = InstanceId(1);
@@ -156,13 +162,147 @@ fn three_processes_apply_every_call_once_through_a_kill() {
     }
 }
 
+/// A workflow awaiting another agent's counter, the other agent's quorum
+/// cut off by a partition, loses its leader while it awaits: once the
+/// partition heals, a new leader resumes it from its snapshot, and it
+/// completes as a straight run, its owner reading the result by its id.
+/// Every effect applied once: the counters it asked and told, its own
+/// count, and its pair's messages and replies, on every replica.
+#[test]
+fn a_workflow_mid_await_completes_once_through_a_kill_and_a_partition() {
+    let space = start();
+    let rounds = Rounds::load();
+    let methods = rounds.methods;
+    let touring = space.agent_installing(vec![1, 2, 3], &[rounds.install(ROUNDS)]);
+    // The agent it asks lives on the two nodes its leader does not.
+    let leader = space.leader(touring);
+    let asked_on: Vec<usize> = (1..=3).filter(|number| *number != leader).collect();
+    let asked = space.agent_installing(
+        asked_on.iter().map(|number| *number as u8).collect(),
+        &[rounds.install(ASKED), rounds.install(TOLD)],
+    );
+    // One of its nodes cut off: it holds no quorum, and the tour's first
+    // round awaits.
+    let (cut, other) = (asked_on[0], asked_on[1]);
+    space.relay.isolate(cut, 3);
+    let mut client = Client::new(space.target(other), SigningKey::from_bytes(&[41; 32]));
+    let tour = Tour {
+        other: asked,
+        amounts: vec![2, 3, 4],
+        nap: 0,
+        words: 64,
+        passes: 4,
+    };
+    let started = client
+        .call(touring, ROUNDS, methods.tour, &tour.arguments())
+        .unwrap();
+    let Answer::Ran {
+        outcome: Outcome::Started(workflow),
+        ..
+    } = started
+    else {
+        panic!("{started:?}")
+    };
+    wait_until("the tour awaits the cut off agent", PROCESS_WAIT, || {
+        matches!(
+            client.workflow(touring, workflow, Duration::ZERO),
+            Ok(Answer::Workflow {
+                status: WorkflowStatus::Awaiting { agent, .. },
+                ..
+            }) if agent == asked
+        )
+    });
+    // Its leader killed mid-await: the tour's agent too is left without a
+    // quorum until the partition heals.
+    space.kill(leader);
+    std::thread::sleep(Duration::from_secs(1));
+    space.relay.heal();
+    space.restart(leader);
+    let mut ended = None;
+    wait_until("the tour ends", PROCESS_WAIT, || {
+        ended = match client.workflow(touring, workflow, Duration::from_secs(5)) {
+            Ok(Answer::Workflow {
+                status: WorkflowStatus::Ended(outcome),
+                ..
+            }) => Some(outcome),
+            _ => None,
+        };
+        ended.is_some()
+    });
+    assert_eq!(ended, Some(Outcome::Done(tour.result(0))));
+
+    // Read at each replica itself, which a failover to another would hide.
+    let key = SigningKey::from_bytes(&[43; 32]);
+    let identities = [
+        (touring, client.identity(touring).unwrap()),
+        (asked, client.identity(asked).unwrap()),
+    ];
+    let read = |number: usize, agent: AgentId, instance: InstanceId| {
+        let identity = identities.iter().find(|(id, _)| *id == agent).unwrap().1;
+        let query = signed_query(
+            &identity,
+            &key,
+            vos_node::wall_clock() + 60_000,
+            Consistency::Linearizable,
+            instance,
+            methods.tallies,
+        );
+        let path = format!("/agents/{}/queries", agent.0);
+        let (_, body) = vos_node::client::post(space.target(number), &path, &query).ok()?;
+        match Answer::decode(&body).ok()?.0 {
+            Answer::Ran {
+                outcome: Outcome::Done(tallies),
+                ..
+            } => <Vec<(u64, u64)>>::decode(&tallies)
+                .ok()
+                .map(|(tallies, _)| tallies),
+            _ => None,
+        }
+    };
+    // Each amount tallied once, here and by request and message there.
+    let mut once: Vec<(u64, u64)> = tour.amounts.iter().map(|amount| (*amount, 1)).collect();
+    once.sort_unstable();
+    let tallied = |number, agent, instance| {
+        read(number, agent, instance).map(|mut tallies| {
+            tallies.sort_unstable();
+            tallies
+        }) == Some(once.clone())
+    };
+    for number in 1..=3 {
+        wait_until(
+            "every replica holds the tour's effects",
+            PROCESS_WAIT,
+            || {
+                tallied(number, touring, ROUNDS)
+                    && (number == leader
+                        || tallied(number, asked, ASKED) && tallied(number, asked, TOLD))
+            },
+        );
+    }
+    // Each round's request and message sent once and applied once, and
+    // each request answered once: the pairs' marks, on disk.
+    let rounds = tour.amounts.len() as u64;
+    for (number, store) in (1..=3).zip(space.stop_all()) {
+        let mark = |agent: AgentId, key: &[u8]| {
+            let bytes = store.snapshot().get(agent, key).unwrap().unwrap();
+            u64::decode(unstored(&bytes).unwrap()).unwrap().0
+        };
+        assert_eq!(mark(touring, &keys::pair_out(asked)), 2 * rounds);
+        assert_eq!(mark(touring, &keys::pair_in(asked)), rounds);
+        if number != leader {
+            assert_eq!(mark(asked, &keys::pair_in(touring)), 2 * rounds);
+            assert_eq!(mark(asked, &keys::pair_out(touring)), rounds);
+        }
+    }
+}
+
 /// Faults a test build injects into node processes through their faults
 /// files: a stalled disk hands a leader's groups over, a failing one halts
 /// its node until a restart, and a gray failure, its Raft frames lost while
 /// its pair heartbeat flows, deposes a leader.
 #[cfg(feature = "faults")]
 mod faults {
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     use super::*;
 

@@ -2,7 +2,7 @@
 # `just build-test-actors`. Each actor is a library (its state, handlers and
 # message types, which other actors use) and a program (`actor_program!`).
 [workspace]
-members = ["counter", "ledger", "caller", "checksum", "tally", "tracker", "shop"]
+members = ["counter", "ledger", "caller", "checksum", "tally", "tracker", "shop", "rounds"]
 resolver = "3"
 
 [workspace.package]

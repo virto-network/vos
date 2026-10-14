@@ -1,7 +1,7 @@
 //! An agent's queue: the inputs its leader loop takes, with where their
 //! replies go.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -110,11 +110,61 @@ pub(crate) struct Queue {
     /// The agents that refused this agent's messages past a gap since the
     /// leader loop last looked: it sends them again.
     pub(crate) behind: BTreeSet<AgentId>,
+    /// The agents whose messages this queue dropped full: told they are
+    /// behind once it has room for them, rather than left to their rounds'
+    /// backoff.
+    pub(crate) dropped: Dropped,
     pub(crate) stopped: bool,
     /// The leader loop takes inputs: set when this replica's leadership
     /// starts, and cleared with the refusal of what it left. Under the
     /// queue's lock, so no input is queued where no loop will take it.
     pub(crate) leading: bool,
+}
+
+impl Queue {
+    /// The first senders whose messages it dropped full, as many as its
+    /// room under `cap` fits a `window` of each's: to be told they are
+    /// behind.
+    pub(crate) fn untold(&mut self, cap: usize, window: usize) -> Vec<AgentId> {
+        let window = window.min(cap).max(1);
+        self.dropped
+            .take(cap.saturating_sub(self.from_agents) / window)
+    }
+}
+
+/// Senders whose messages a queue dropped full, each once, in the order
+/// first dropped.
+#[derive(Default)]
+pub(crate) struct Dropped {
+    order: VecDeque<AgentId>,
+    senders: HashSet<AgentId>,
+}
+
+impl Dropped {
+    /// Note `sender`, while fewer than `most` are.
+    fn insert(&mut self, sender: AgentId, most: usize) {
+        if self.order.len() < most && self.senders.insert(sender) {
+            self.order.push_back(sender);
+        }
+    }
+
+    /// The first `count`, taken.
+    fn take(&mut self, count: usize) -> Vec<AgentId> {
+        let taken: Vec<AgentId> = self.order.drain(..count.min(self.order.len())).collect();
+        for sender in &taken {
+            self.senders.remove(sender);
+        }
+        taken
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.order.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.order.clear();
+        self.senders.clear();
+    }
 }
 
 pub(crate) struct Agent {
@@ -142,6 +192,7 @@ impl Agent {
             queue.capped = 0;
             queue.from_agents = 0;
             queue.behind.clear();
+            queue.dropped.clear();
             std::mem::take(&mut queue.inputs)
         };
         drop(dropped);
@@ -156,6 +207,7 @@ impl Agent {
             queue.capped = 0;
             queue.from_agents = 0;
             queue.behind.clear();
+            queue.dropped.clear();
             std::mem::take(&mut queue.inputs)
         };
         for (pending, _) in refused {
@@ -186,6 +238,9 @@ impl Inner {
         // Past the cap, the sender sends it again.
         if pending.agents_sent() {
             if queue.from_agents >= self.settings.queue_cap {
+                if let Pending::Message(message) = &pending {
+                    queue.dropped.insert(message.from, self.settings.queue_cap);
+                }
                 return Err(CallError::Busy);
             }
             queue.from_agents += 1;
@@ -228,5 +283,41 @@ impl Inner {
             }
             queue.inputs.push_front((pending, Instant::now()));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A queue tells the senders it dropped, each once and in turn, as many
+    /// as its room fits a window of each's, a steady trickle of other
+    /// messages queued or not.
+    #[test]
+    fn dropped_senders_are_told_as_the_room_fits_their_windows() {
+        let mut queue = Queue::default();
+        for sender in [3, 1, 3, 2, 4, 5] {
+            queue.dropped.insert(AgentId(sender), 1024);
+        }
+        queue.from_agents = 1024;
+        assert!(queue.untold(1024, 256).is_empty(), "a full queue");
+        queue.from_agents = 700;
+        assert_eq!(queue.untold(1024, 256), [AgentId(3)]);
+        queue.from_agents = 10;
+        assert_eq!(
+            queue.untold(1024, 256),
+            [AgentId(1), AgentId(2), AgentId(4)]
+        );
+        queue.dropped.insert(AgentId(3), 1024);
+        queue.from_agents = 0;
+        assert_eq!(queue.untold(1024, 256), [AgentId(5), AgentId(3)]);
+        assert!(queue.dropped.is_empty());
+
+        // A cap under a window: a window's room is the whole queue.
+        queue.dropped.insert(AgentId(6), 2);
+        queue.from_agents = 1;
+        assert!(queue.untold(2, 256).is_empty());
+        queue.from_agents = 0;
+        assert_eq!(queue.untold(2, 256), [AgentId(6)]);
     }
 }

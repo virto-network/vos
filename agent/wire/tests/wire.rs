@@ -675,9 +675,14 @@ fn schemas_read_back_from_their_section_and_validate() {
         kind,
         role: Some(b"minter".to_vec()),
         gas: Some(1_000_000),
+        linearizable: false,
+    };
+    let linearizable = MethodSchema {
+        linearizable: true,
+        ..method(9, Kind::Query)
     };
     let schema = Schema {
-        methods: vec![method(7, Kind::Command), method(9, Kind::Query)],
+        methods: vec![method(7, Kind::Command), linearizable],
     };
     let mut ro_data = schema.section();
     ro_data.extend_from_slice(b"the rest of the read-only data");
@@ -705,6 +710,35 @@ fn schemas_read_back_from_their_section_and_validate() {
     assert_eq!(
         Schema::read(&reserved.section()),
         Err(SchemaError::ReservedId)
+    );
+    let command = Schema {
+        methods: vec![MethodSchema {
+            linearizable: true,
+            ..method(7, Kind::Command)
+        }],
+    };
+    assert_eq!(
+        Schema::read(&command.section()),
+        Err(SchemaError::Linearizable(MethodId(7)))
+    );
+}
+
+/// A method's schema encodes as the agent and the node read it: its id,
+/// name, kind, role, gas and marking, in that order.
+#[test]
+fn method_schemas_encode_field_by_field() {
+    use vos_wire::schema::MethodSchema;
+    let method = MethodSchema {
+        id: MethodId(0x0102_0304),
+        name: b"get".to_vec(),
+        kind: Kind::Query,
+        role: Some(b"r".to_vec()),
+        gas: Some(5),
+        linearizable: true,
+    };
+    assert_eq!(
+        method.encode(),
+        hex("04030201030000006765740101010000007201050000000000000001")
     );
 }
 
@@ -1334,7 +1368,7 @@ fn committed_writes_keep_their_bytes() {
 /// then the bytes).
 #[test]
 fn signed_messages_keep_their_bytes() {
-    use vos_wire::ingress::{Consistency, call_message, query_message};
+    use vos_wire::ingress::{Consistency, call_message, query_message, workflow_message};
     let identity = [7; 32];
     let session = Session {
         key: [1; 32],
@@ -1385,6 +1419,53 @@ fn signed_messages_keep_their_bytes() {
     }
     let call = call_message(&identity, &session, 4, instance, method, &[0xaa, 0xbb]);
     assert!(call.ends_with(&[5, 0, 0, 0, 6, 0, 0, 0, 2, 0, 0, 0, 0xaa, 0xbb]));
+    let read = [
+        b"vos/workflow/1".as_slice(),
+        &identity,
+        &[9; 32],
+        &10u64.to_le_bytes(),
+        &[0],
+        &8u64.to_le_bytes(),
+        &11u64.to_le_bytes(),
+        &12u64.to_le_bytes(),
+    ]
+    .concat();
+    assert_eq!(
+        workflow_message(&identity, &[9; 32], 10, consistency, WorkflowId(11), 12),
+        read
+    );
+}
+
+/// A workflow's status as its owner reads it: after the answer's index,
+/// the status's, its fields, then the applied index read at.
+#[test]
+fn workflow_reads_keep_their_bytes() {
+    use vos_wire::ingress::{Answer, WorkflowStatus};
+    let at = 5u64.to_le_bytes();
+    let agent = 0x0a0b_0c0du32.to_le_bytes();
+    let ended = Outcome::Done(vec![0xbb]);
+    for (status, bytes) in [
+        (WorkflowStatus::Unknown, vec![0]),
+        (WorkflowStatus::Running, vec![1]),
+        (
+            WorkflowStatus::Awaiting {
+                agent: AgentId(0x0a0b_0c0d),
+                deadline: 7,
+            },
+            [&[2][..], &agent, &7u64.to_le_bytes()].concat(),
+        ),
+        (
+            WorkflowStatus::Sleeping { until: 7 },
+            [&[3][..], &7u64.to_le_bytes()].concat(),
+        ),
+        (
+            WorkflowStatus::Ended(ended.clone()),
+            [&[4][..], &ended.encode()].concat(),
+        ),
+    ] {
+        let answer = Answer::Workflow { status, at: 5 };
+        assert_eq!(answer.encode(), [&[17][..], &bytes, &at].concat());
+    }
 }
 
 /// The operator's grant, and the role change it becomes in a batch: the
@@ -1636,6 +1717,17 @@ fn workflows_keep_their_bytes() {
     .concat();
     assert_eq!(record.encode(), bytes);
     round_trip(&record);
+    // Its head is its fields before the snapshot.
+    let (head, used) = vos_wire::records::WorkflowHead::decode(&bytes).unwrap();
+    assert_eq!(
+        (head.owner, head.state),
+        (record.owner, record.state.clone())
+    );
+    assert_eq!(
+        (head.format, head.awaits, head.due),
+        (Workflow::FORMAT, 6, 7)
+    );
+    assert_eq!(&bytes[used..], &record.snapshot.encode()[..]);
     let ended = WorkflowState::Ended(Outcome::Started(WorkflowId(1)));
     round_trip(&ended);
     assert_eq!(

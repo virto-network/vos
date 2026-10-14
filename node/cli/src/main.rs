@@ -22,7 +22,7 @@ use args::{
     AgentCommand, Cli, Command, InstallArgs, KeyCommand, NodeCommand, OperatorArgs, RoleArgs,
     RunArgs,
 };
-use call::{invoke, print_admin_answer, said};
+use call::{invoke, print_admin_answer, read_workflow, said};
 
 /// mimalloc, unless built without it: a thread frees memory another thread
 /// allocated without taking that thread's lock, as the node's executors,
@@ -81,6 +81,7 @@ fn run(cli: Cli) -> Result<(), String> {
         Command::Role(role) => role.run(),
         Command::Call(call) => invoke(&call, None),
         Command::Query { call, linearizable } => invoke(&call, Some(linearizable)),
+        Command::Workflow(read) => read_workflow(&read),
     }
 }
 

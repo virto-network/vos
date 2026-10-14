@@ -181,11 +181,15 @@ already in the sender's outbox, so the receiver keeps no reply cache.
 
 **Fast retransmit** (carried):
 - A receiver that refuses a gap answers the sender with `Behind`.
-- **A message dropped past a full queue gets no `Behind`:** a rewind per
-  drop would remove the rounds' backoff exactly when the receiver is
-  overloaded. Its recovery stays with the rounds, and 4.7's fan-in
-  bench decides whether it needs more, such as one `Behind` per dropped
-  sender once the queue drains.
+- **A message dropped past a full queue gets no `Behind` while the queue
+  stays full,** so the rounds' backoff holds when the receiver is
+  overloaded.
+- **Once the queue drains of other agents' messages,** the receiver sends
+  a `Behind` to the senders it dropped, in arrival order:
+  - as many at a time as their windows fit (4 by default);
+  - the next ones at the 100 ms pace while it stays idle.
+  - The fan-in bench (4.7) showed that dropped senders otherwise sit out
+    their backoff, up to 16 s, while the receiver idles.
 - **`Behind` is a trigger, not a cursor:**
   - the sender rewinds its window to the acknowledgement at once, as a
     due round does (`Window::rewind`), instead of waiting for the round;
@@ -195,6 +199,8 @@ already in the sender's outbox, so the receiver keeps no reply cache.
     `Deliver` and `Acknowledge` are;
   - one rewind per window per 100 ms at most, so a receiver that keeps
     refusing cannot make the sender resend a whole window per message.
+    A `Behind` that comes sooner is deferred to that moment, not
+    ignored, so a drain's `Behind` is never lost to the pace.
 - Rounds stay as the fallback when `Behind` itself is lost.
 
 **Fan-in and batching across agents** (carried): measured first.
@@ -202,6 +208,9 @@ already in the sender's outbox, so the receiver keeps no reply cache.
   each other in pairs.
 - Combining the deliveries of several agent pairs to one node into one
   frame is built only if the bench shows frames, not refine, bound it.
+  It did not (4.7): the receiver's refine bounds fan-in, at 97–98%
+  busy, with about 1.1 frames a message when nothing drops. So it is
+  not built.
 
 ### The compressed tree [decided format; proposed details]
 
@@ -655,10 +664,13 @@ JAM, so a step's `gas_used` is the same on both hosts:
 - **Snapshot pages:**
   - each written page is exported as one segment (4,104 bytes: the
     page, then 8 zero bytes);
-  - the page's row holds its hash, the exporting package's segment root
-    and the segment's index. An import by package hash works only while
-    that package is in recent history (8 blocks), and by segment root
-    for as long as DA holds it (4.0);
+  - the page's row holds its hash, as on VOS. Refine cannot know the
+    segment root of its own exports, which the guarantor computes; it
+    reaches accumulate and the builder in the work report. So the
+    builder keeps, off-chain, where each page was exported: the
+    package's segment root and the export's index. An import names the
+    segment root, which works as long as DA holds it; a package hash
+    works only for 8 blocks of history (4.0);
   - the package that resumes the workflow imports those segments, and
     refine checks each page against its hash. A segment exported as
     zeros by a failed package fails that check;

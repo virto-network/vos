@@ -51,6 +51,24 @@ pub struct Batch {
     pub inputs: Vec<Input>,
 }
 
+impl Batch {
+    /// The programs its installs name: each instance's own and those
+    /// beside it.
+    pub fn installs(&self) -> impl Iterator<Item = ProgramHash> + '_ {
+        self.inputs
+            .iter()
+            .filter_map(|input| match input {
+                Input::Admin(Admin::Install {
+                    program, beside, ..
+                }) => Some((program, beside)),
+                _ => None,
+            })
+            .flat_map(|(program, beside)| {
+                core::iter::once(*program).chain(beside.iter().map(|(_, _, program)| *program))
+            })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum Input {
     #[codec(index = 0)]

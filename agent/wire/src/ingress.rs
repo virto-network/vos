@@ -9,12 +9,25 @@ use alloc::vec::Vec;
 use scale::{Decode, Encode};
 
 use crate::abi::{Kind, Refusal};
-use crate::ids::{AgentId, InstanceId, MethodId, Principal, Session};
+use crate::ids::{AgentId, InstanceId, MethodId, Principal, Session, WorkflowId};
 use crate::peer::{CreationRecord, NodeNumber};
 use crate::result::Outcome;
 
 const CALL_DOMAIN: &[u8] = b"vos/call/1";
 const QUERY_DOMAIN: &[u8] = b"vos/query/1";
+const WORKFLOW_DOMAIN: &[u8] = b"vos/workflow/1";
+
+/// The longest a read of a workflow waits for it to end, in milliseconds.
+pub const MAX_WORKFLOW_WAIT_MS: u64 = 30_000;
+/// How far past its wait a read of a workflow may be good, in milliseconds
+/// of the node's time: a read captured is good no longer.
+pub const WORKFLOW_READ_HORIZON_MS: u64 = 60_000;
+
+/// How far past the node's time a read of a workflow waiting `wait_ms` may
+/// be good, in milliseconds.
+pub fn workflow_read_horizon(wait_ms: u64) -> u64 {
+    WORKFLOW_READ_HORIZON_MS + wait_ms.min(MAX_WORKFLOW_WAIT_MS)
+}
 
 /// A node's identity: its ed25519 public key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
@@ -59,6 +72,44 @@ pub struct QueryCall {
     pub method: MethodId,
     pub arguments: Vec<u8>,
     pub signature: [u8; 64],
+}
+
+/// `POST /agents/{agent}/workflows`: workflow `workflow`'s status, read by
+/// `key`, its owner, good until `not_after` by the node's clock, at most
+/// [`workflow_read_horizon`] past it, on state as `consistency` asks. A workflow not
+/// ended is waited for, until it ends or `wait_ms` pass, at most
+/// [`MAX_WORKFLOW_WAIT_MS`], or less as the node allows.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct WorkflowRead {
+    pub key: [u8; 32],
+    pub not_after: u64,
+    pub consistency: Consistency,
+    pub workflow: WorkflowId,
+    pub wait_ms: u64,
+    pub signature: [u8; 64],
+}
+
+/// Where a workflow stands, as its owner reads it.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum WorkflowStatus {
+    /// No workflow of that id owned by the key that read: never started,
+    /// another's, or collected. An ended workflow's result is kept about an
+    /// hour ([`crate::defaults::WORKFLOW_KEPT_MS`]) after its end, then
+    /// reads as this.
+    #[codec(index = 0)]
+    Unknown,
+    /// Due to run: started, or preempted between two awaits.
+    #[codec(index = 1)]
+    Running,
+    /// Awaiting `agent`'s answer until `deadline`, by the agent's time.
+    #[codec(index = 2)]
+    Awaiting { agent: AgentId, deadline: u64 },
+    /// Asleep until a batch at or past `until`.
+    #[codec(index = 3)]
+    Sleeping { until: u64 },
+    /// Ended: its result, or why it failed.
+    #[codec(index = 4)]
+    Ended(Outcome),
 }
 
 /// Which applied state a query reads.
@@ -214,6 +265,10 @@ pub enum Answer {
     /// The operator's `GET /stats`: how long this node's stages took.
     #[codec(index = 16)]
     Stats(Stats),
+    /// A workflow's status, and the applied index of the state it was read
+    /// at.
+    #[codec(index = 17)]
+    Workflow { status: WorkflowStatus, at: u64 },
 }
 
 /// How long a node's stages took since it started, each as a histogram
@@ -334,5 +389,24 @@ pub fn query_message(
         instance.encode_to(bytes);
         method.encode_to(bytes);
         arguments.encode_to(bytes);
+    })
+}
+
+/// What a client signs for a read of a workflow of the agent whose
+/// identity is `identity`.
+pub fn workflow_message(
+    identity: &[u8; 32],
+    key: &[u8; 32],
+    not_after: u64,
+    consistency: Consistency,
+    workflow: WorkflowId,
+    wait_ms: u64,
+) -> Vec<u8> {
+    message(WORKFLOW_DOMAIN, identity, |bytes| {
+        bytes.extend_from_slice(key);
+        not_after.encode_to(bytes);
+        consistency.encode_to(bytes);
+        workflow.encode_to(bytes);
+        wait_ms.encode_to(bytes);
     })
 }

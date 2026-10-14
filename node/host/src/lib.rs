@@ -31,6 +31,7 @@ mod stats;
 pub mod storage;
 pub mod store;
 pub mod tls;
+mod workflows;
 
 pub use node::{
     ADMIN_TOKEN, CallError, Config, Error, NODE_KEY, Node, Peers, ReplaceError, Reply, STORE,

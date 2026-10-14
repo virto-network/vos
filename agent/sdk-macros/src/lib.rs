@@ -170,8 +170,7 @@ struct Handler {
     name: String,
     id: u32,
     kind: Kind,
-    role: Option<String>,
-    gas: Option<u64>,
+    options: Options,
     has_context: bool,
     arguments: Vec<(syn::Ident, Type)>,
     reply: Type,
@@ -227,13 +226,23 @@ fn reply_and_error(output: &ReturnType) -> (Type, Option<Type>) {
     (ty, None)
 }
 
-/// The handler's options from `#[msg(role = "...", gas = N)]`.
-fn msg_options(attribute: &Attribute) -> syn::Result<(Option<String>, Option<u64>)> {
-    let (mut role, mut gas) = (None, None);
+/// A handler's options, from `#[msg(role = "...", gas = N, linearizable)]`.
+#[derive(Default)]
+struct Options {
+    role: Option<String>,
+    gas: Option<u64>,
+    /// A query that always reads after a read index.
+    linearizable: Option<Span>,
+}
+
+fn msg_options(attribute: &Attribute) -> syn::Result<Options> {
+    let mut options = Options::default();
     if let Meta::List(_) = attribute.meta {
         attribute.parse_nested_meta(|meta| {
             if meta.path.is_ident("role") {
-                role = Some(string_arg(&meta)?);
+                options.role = Some(string_arg(&meta)?);
+            } else if meta.path.is_ident("linearizable") {
+                options.linearizable = Some(meta.path.span());
             } else if meta.path.is_ident("gas") {
                 let Expr::Lit(ExprLit {
                     lit: Lit::Int(value),
@@ -242,14 +251,14 @@ fn msg_options(attribute: &Attribute) -> syn::Result<(Option<String>, Option<u64
                 else {
                     return Err(meta.error("expected an integer gas limit"));
                 };
-                gas = Some(value.base10_parse()?);
+                options.gas = Some(value.base10_parse()?);
             } else {
-                return Err(meta.error("expected `role = \"...\"` or `gas = N`"));
+                return Err(meta.error("expected `role = \"...\"`, `gas = N` or `linearizable`"));
             }
             Ok(())
         })?;
     }
-    Ok((role, gas))
+    Ok(options)
 }
 
 /// The kind of program an attribute marks a method to run as, apart from
@@ -271,8 +280,8 @@ fn handler(
     ids: &mut Ids,
 ) -> syn::Result<Handler> {
     let name = method.sig.ident.to_string();
-    let (role, gas) = match program {
-        Some(Kind::Attestable) => (None, None),
+    let options = match program {
+        Some(Kind::Attestable) => Options::default(),
         _ => msg_options(attribute)?,
     };
     let mut inputs = method.sig.inputs.iter();
@@ -305,6 +314,14 @@ fn handler(
             }
         }
     };
+    if let Some(span) = options.linearizable
+        && kind != Kind::Query
+    {
+        return Err(Error::new(
+            span,
+            "only a query (`&self`) is `linearizable`: what runs through the log already is",
+        ));
+    }
     let mut has_context = false;
     let mut arguments = Vec::new();
     for (index, input) in inputs.enumerate() {
@@ -362,8 +379,7 @@ fn handler(
         name,
         id,
         kind,
-        role,
-        gas,
+        options,
         has_context,
         arguments,
         reply,
@@ -377,15 +393,18 @@ fn handler(
 /// fields; `#[attestable]` and `#[workflow]` methods likewise, each run as
 /// its own program (`attestable_program!`, `workflow_program!`) from the
 /// entry generated for it, `__vos_attest_<name>` or `__vos_workflow_<name>`.
+/// A handler's options are `#[msg(role = "...", gas = N)]`, the role a
+/// caller needs and its gas limit, and on a query `linearizable`: it always
+/// reads after a read index, whatever consistency its client asks. That
+/// governs the query a client names: a method it calls reads its snapshot.
 /// A `#[workflow]` takes no `self`: `ctx: &mut Workflow<Self>` if it uses
 /// one, then its arguments, and `#[workflow(role = "...", gas = N)]` as a
 /// handler's options, the role checked when it starts and the gas each
-/// step's. The
-/// module imports its parent's names, so argument types resolve as they do
-/// beside the impl; a message type shadows a parent type of the same name,
-/// so a handler must not be named after an argument type (a `balance`
-/// handler beside a `Balance` argument). The impl block must define
-/// `fn new() -> Self`, the state of a new instance.
+/// step's. The module imports its parent's names, so argument types
+/// resolve as they do beside the impl; a message type shadows a parent type
+/// of the same name, so a handler must not be named after an argument type
+/// (a `balance` handler beside a `Balance` argument). The impl block must
+/// define `fn new() -> Self`, the state of a new instance.
 #[proc_macro_attribute]
 pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut module = None;
@@ -471,8 +490,9 @@ fn messages_impl(mut input: ItemImpl, module: Option<String>) -> syn::Result<Tok
             id: MethodId(id),
             name: handler.name.clone().into_bytes(),
             kind: handler.kind,
-            role: handler.role.clone().map(String::into_bytes),
-            gas: handler.gas,
+            role: handler.options.role.clone().map(String::into_bytes),
+            gas: handler.options.gas,
+            linearizable: handler.options.linearizable.is_some(),
         });
         types.push(quote! {
             #[derive(::vos_sdk::Encode, ::vos_sdk::Decode)]

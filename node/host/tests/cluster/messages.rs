@@ -2,13 +2,16 @@
 //! applied once at its target and acknowledged, through the directory,
 //! relays and leader changes, and checked at every hop; a request answered
 //! by a reply, a message the agent program fails on consumed as failed,
-//! and a gap sent again at the receiver's word.
+//! and a gap, or drops at a full queue once it drained, sent again at the
+//! receiver's word.
 
+use std::ops::RangeInclusive;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use vos_net::Class;
+use vos_node::peer::Refusal;
 use vos_node::store::EntryKind;
 use vos_node::{CallError, Hooks, Reply};
 use vos_wire::abi::Failure;
@@ -20,7 +23,7 @@ use vos_wire::records::unstored;
 use vos_wire::result::{InputRef, Outcome, Run, Step, WorkResult};
 use vos_wire::{Decode, Encode};
 
-use crate::common::{COUNTER, Cluster, wait_until};
+use crate::common::{COUNTER, Cluster, HoldRefines, wait_until};
 
 impl Cluster {
     /// `from`'s forward of `by` to `to`'s counter, called at node `at`.
@@ -359,6 +362,118 @@ fn a_gap_is_filled_within_a_round_trip() {
         took < Duration::from_secs(5),
         "the gap took {took:?}, waiting for a round of {round:?}"
     );
+}
+
+/// Two nodes with a resend round of `ROUND`, the second's queues capped at
+/// `queue` and its refines held while `hold` is armed.
+fn held_receiver(queue: usize, hold: &Arc<HoldRefines>) -> Cluster {
+    let hold = Arc::clone(hold);
+    Cluster::tuned(2, move |number, config| {
+        config.resend_round = ROUND;
+        if number == 2 {
+            config.queue = queue;
+            config.hooks = hold.clone();
+        }
+    })
+}
+
+/// A resend round no test waits for.
+const ROUND: Duration = Duration::from_secs(20);
+
+/// `sender`'s forwards of 1 to `target` at `sequences` of the cluster's
+/// session, called at node 1 together and answered.
+fn forwarded(cluster: &Cluster, sender: AgentId, target: AgentId, sequences: RangeInclusive<u64>) {
+    let forwards: Vec<_> = sequences
+        .map(|sequence| {
+            let request = Request {
+                method: cluster.programs.method("forward"),
+                arguments: (target.0, COUNTER.0, 1u64).encode(),
+                ..cluster.request(sequence, 1)
+            };
+            cluster.node(1).call(sender, request)
+        })
+        .collect();
+    for forward in forwards {
+        assert!(matches!(
+            smol::block_on(forward),
+            Ok(Reply::Ran(Outcome::Done(_)))
+        ));
+    }
+}
+
+/// Messages dropped at the receiver's full queue, with none after them to
+/// leave a gap, are sent again once the queue drained: the receiver tells
+/// their sender it is behind, long before its next round.
+#[test]
+fn a_full_queues_drops_go_again_once_it_drained() {
+    let hold = Arc::new(HoldRefines::default());
+    let cluster = held_receiver(2, &hold);
+    let sender = cluster.counter_agent(&[1]);
+    let target = cluster.counter_agent(&[2]);
+    cluster.forward_once(sender, 1, target, 1);
+    cluster.delivered((sender, &[1]), (target, &[2]), 1);
+    hold.arm();
+    forwarded(&cluster, sender, target, 2..=11);
+    wait_until("the receiver's full queue drops some", || {
+        hold.held() > 0 && cluster.node(2).dropped(Refusal::Full) > 0
+    });
+    let released = Instant::now();
+    hold.release();
+    cluster.delivered((sender, &[1]), (target, &[2]), 11);
+    let took = released.elapsed();
+    assert!(
+        took < Duration::from_secs(5),
+        "the drops took {took:?}, waiting for a round of {ROUND:?}"
+    );
+}
+
+/// While another agent sends steadily, so the receiver's queue is seldom
+/// empty, the senders whose windows it dropped full are told they are
+/// behind as soon as it has room for them.
+#[test]
+fn a_full_queues_drops_go_again_beside_a_steady_sender() {
+    const LAST: u64 = 301;
+    let hold = Arc::new(HoldRefines::default());
+    let cluster = held_receiver(300, &hold);
+    let steady = cluster.counter_agent(&[1]);
+    let bulk = [cluster.counter_agent(&[1]), cluster.counter_agent(&[1])];
+    let target = cluster.counter_agent(&[2]);
+    for sender in [steady, bulk[0], bulk[1]] {
+        cluster.forward_once(sender, 1, target, 1);
+    }
+    cluster.delivered((steady, &[1]), (target, &[2]), 3);
+    hold.arm();
+    std::thread::scope(|scope| {
+        for sender in bulk {
+            let cluster = &cluster;
+            scope.spawn(move || forwarded(cluster, sender, target, 2..=LAST));
+        }
+    });
+    wait_until("the receiver's full queue drops some", || {
+        hold.held() > 0 && cluster.node(2).dropped(Refusal::Full) > 0
+    });
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let mut sequence = 2;
+            while !stop.load(Ordering::SeqCst) {
+                forwarded(&cluster, steady, target, sequence..=sequence + 7);
+                sequence += 8;
+            }
+        });
+        let released = Instant::now();
+        hold.release();
+        wait_until("every bulk message applies", || {
+            bulk.iter()
+                .all(|sender| cluster.read::<u64>(2, target, &keys::pair_in(*sender)) == Some(LAST))
+        });
+        stop.store(true, Ordering::SeqCst);
+        let took = released.elapsed();
+        assert!(
+            took < Duration::from_secs(5),
+            "the drops took {took:?}, waiting for a round of {ROUND:?}"
+        );
+    });
 }
 
 /// A stale `Behind`, from a replica of the receiver, only sends again what

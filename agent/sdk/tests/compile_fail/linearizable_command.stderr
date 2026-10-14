@@ -1,0 +1,5 @@
+error: only a query (`&self`) is `linearizable`: what runs through the log already is
+  --> tests/compile_fail/linearizable_command.rs:15:11
+   |
+15 |     #[msg(linearizable)]
+   |           ^^^^^^^^^^^^

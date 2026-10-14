@@ -249,10 +249,11 @@ fn the_install_reserve_and_record_price_cover_the_largest_install() {
     let methods: Vec<MethodSchema> = (1..=1000u32)
         .map(|id| MethodSchema {
             id: MethodId(id),
-            name: format!("{id:0>52}").into_bytes(),
+            name: format!("{id:0>53}").into_bytes(),
             kind: Kind::Command,
             role: None,
             gas: None,
+            linearizable: false,
         })
         .collect();
     let schema = Schema { methods };

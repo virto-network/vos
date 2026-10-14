@@ -2529,6 +2529,7 @@ dependencies = [
  "vos-net",
  "vos-pvm",
  "vos-pvm-compiler",
+ "vos-pvm-program",
  "vos-raft",
  "vos-tree",
  "vos-wire",

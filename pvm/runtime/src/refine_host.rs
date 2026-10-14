@@ -87,14 +87,19 @@ pub trait StateReader: Send + Sync {
     ) -> alloc::boxed::Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + 'a>;
 }
 
-/// Where `instantiate` finds a program its node's pool lacks: the program
-/// with this code hash, if the running agent may load it.
+/// The programs the running agent may load, and where `instantiate` finds
+/// one its node's pool lacks.
 ///
-/// A program it gives is installed in the pool and lent as an installed one
+/// The pool is the node's, shared by its agents: a program the agent may
+/// not load answers `WHO` though pooled, as a missing one does. A program
+/// the source gives is installed in the pool and lent as an installed one
 /// is, at the same price, so a run's gas does not depend on what the pool
 /// held. A store it cannot read is its own to fault on.
 #[cfg(feature = "std")]
 pub trait ProgramSource: Send + Sync {
+    /// Whether the agent may load the program with this code hash.
+    fn owns(&self, hash: &crate::pool::CodeHash) -> bool;
+    /// The program with this code hash, if the agent may load it.
     fn program(&self, hash: &crate::pool::CodeHash) -> Option<Vec<u8>>;
 }
 
@@ -632,7 +637,11 @@ impl RefineContext {
             return Dispatch::Exit(ExitReason::Panic);
         };
         let hash = crate::pool::CodeHash(hash.try_into().expect("32 bytes read"));
-        let program = self.inner.pool().and_then(|pool| {
+        let owned = self
+            .programs
+            .as_ref()
+            .is_none_or(|source| source.owns(&hash));
+        let program = self.inner.pool().filter(|_| owned).and_then(|pool| {
             pool.program(&hash).or_else(|| {
                 // Only bytes of the very program asked for, and only a valid
                 // one: anything else answers `WHO`, as a missing one does.
@@ -1286,7 +1295,8 @@ mod tests {
 
     /// A program the pool lacks, given by the run's source, is installed and
     /// lent at the gas an installed one costs. A source without it, with an
-    /// invalid program, or with another program's bytes answers `WHO`.
+    /// invalid program, or with another program's bytes answers `WHO`, as
+    /// does a pooled program the source does not own.
     #[cfg(feature = "std")]
     #[test]
     fn instantiate_loads_what_its_source_gives_at_the_installed_price() {
@@ -1295,6 +1305,10 @@ mod tests {
 
         struct Source(Vec<(CodeHash, Vec<u8>)>);
         impl ProgramSource for Source {
+            fn owns(&self, hash: &CodeHash) -> bool {
+                self.0.iter().any(|(given, _)| given == hash)
+            }
+
             fn program(&self, hash: &CodeHash) -> Option<Vec<u8>> {
                 self.0
                     .iter()
@@ -1328,6 +1342,12 @@ mod tests {
         installed.install(&program).unwrap();
         let reference = run(&installed, None);
         assert_eq!(reference.registers[7], 0, "the installed program is lent");
+        let another_agents = run(&installed, Some(Source(Vec::new())));
+        assert_eq!(
+            another_agents.registers[7],
+            result::WHO,
+            "a pooled program the source does not own"
+        );
 
         let empty = Arc::new(MachinePool::new());
         let loaded = run(&empty, Some(Source(vec![(hash, program.clone())])));

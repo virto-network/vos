@@ -38,6 +38,7 @@ use crate::blobs::{Blobs, Keep};
 use crate::executor::Executors;
 use crate::group::{self, DryRun, Input as GroupInput, Local, Shared};
 use crate::pvm::{self, Fault};
+use crate::queries::Queried;
 use crate::space::Space;
 use crate::storage::{Change, StorageThread};
 use crate::store::{BlobRef, Fjall, Snapshot};
@@ -141,6 +142,9 @@ pub(crate) struct Inner {
     pub(crate) liveness: crate::liveness::Liveness,
     /// Messages relayed to their agent's leader.
     pub(crate) relayed: AtomicU64,
+    /// Frames that arrived from other nodes, by class: every class but
+    /// liveness, which the pair heartbeat takes.
+    pub(crate) arrived: [AtomicU64; vos_net::Class::ALL.len()],
     /// Clients' calls: their lanes, and the calls forwarded both ways.
     pub(crate) calls: crate::calls::Calls,
     /// The read indexes this replica asked its leaders for.
@@ -749,32 +753,61 @@ impl Inner {
         if state.stopped {
             return Err(CallError::Stopped);
         }
-        let snapshot = Arc::new(self.store.snapshot());
-        let failed = |error: fjall::Error| CallError::Failed(error.to_string());
-        let at = snapshot.applied(agent).map_err(failed)?.unwrap_or(0);
-        let (time, seed) = snapshot
-            .last_result(agent)
-            .map_err(failed)?
-            .unwrap_or((0, [0; 32]));
-        let work = Work::Query(Query {
-            time,
-            seed,
-            caller,
-            instance,
-            method,
-            arguments,
-        });
+        let snapshot = self.store.snapshot();
+        match self
+            .query_on(snapshot, agent, caller, instance, method, arguments, true)
+            .await?
+        {
+            Queried::Ran(outcome, at) => Ok((outcome, at)),
+            Queried::Linearizable(_) => unreachable!("a query read as it stands runs"),
+        }
+    }
+
+    /// Run a query on `snapshot` of `agent`'s applied state, on an
+    /// executor. Unless `linearized`, a method its schema marks
+    /// linearizable does not run there: the snapshot was not read after a
+    /// read index.
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) async fn query_on(
+        &self,
+        snapshot: Snapshot,
+        agent: AgentId,
+        caller: Principal,
+        instance: InstanceId,
+        method: MethodId,
+        arguments: Vec<u8>,
+        linearized: bool,
+    ) -> Result<Queried, CallError> {
         let program = Arc::clone(&self.program);
         let pool = Arc::clone(&self.pool);
         let blobs = self.blobs.clone();
         let gas = self.settings.refine_gas;
-        let failed = |fault: Fault| CallError::Failed(fault.message().to_string());
-        let (output, _) = ran(self
-            .executors
-            .run(move || pvm::refine(&program, &pool, &blobs, snapshot, agent, &work, gas))
-            .await)
-        .map_err(failed)?;
-        Ok((pvm::decode::<Outcome>(&output).map_err(failed)?, at))
+        let run = move || {
+            let read = |error: fjall::Error| Fault::Infrastructure(error.to_string());
+            if !linearized
+                && crate::queries::linearizable(&snapshot, agent, instance, method).map_err(read)?
+            {
+                return Ok(Queried::Linearizable(arguments));
+            }
+            let at = snapshot.applied(agent).map_err(read)?.unwrap_or(0);
+            let (time, seed) = snapshot
+                .last_result(agent)
+                .map_err(read)?
+                .unwrap_or((0, [0; 32]));
+            let work = Work::Query(Query {
+                time,
+                seed,
+                caller,
+                instance,
+                method,
+                arguments,
+            });
+            let snapshot = Arc::new(snapshot);
+            let (output, _) = pvm::refine(&program, &pool, &blobs, snapshot, agent, &work, gas)?;
+            Ok(Queried::Ran(pvm::decode::<Outcome>(&output)?, at))
+        };
+        ran(self.executors.run(run).await)
+            .map_err(|fault| CallError::Failed(fault.message().to_string()))
     }
 
     /// Mark `epoch` of `agent`'s as one a drop runs on, before the drop can
@@ -904,6 +937,17 @@ impl Node {
     /// Messages this node relayed to their agent's leader.
     pub fn messages_relayed(&self) -> u64 {
         self.inner.relayed.load(Ordering::Relaxed)
+    }
+
+    /// Frames of `class` that arrived here from other nodes; none of
+    /// liveness, which are not counted.
+    pub fn frames_arrived(&self, class: vos_net::Class) -> u64 {
+        self.inner.arrived[class as usize].load(Ordering::Relaxed)
+    }
+
+    /// Arrivals this node dropped for `refusal`.
+    pub fn dropped(&self, refusal: crate::peer::Refusal) -> u64 {
+        self.inner.drops.get(refusal)
     }
 
     /// The node's number in its space.

@@ -113,6 +113,15 @@ pub struct Config {
     /// before it would send another: one still streaming goes on, and the
     /// leader starts another only once it ended.
     pub snapshot_timeout_ms: u64,
+    /// How many owners' reads of workflows may wait at once at the node's
+    /// ingress, each read again at every apply: one past them answers
+    /// where its workflow stands at once. The node cannot tell a client
+    /// that hung up mid-wait, whose read holds its place until its wait
+    /// ends; the bound keeps what such reads cost small.
+    pub workflow_waits: usize,
+    /// The longest a read of a workflow waits for it to end: at most
+    /// [`vos_wire::ingress::MAX_WORKFLOW_WAIT_MS`].
+    pub workflow_wait: Duration,
 }
 
 impl Config {
@@ -149,6 +158,8 @@ impl Config {
             compact_tail_bytes: 16 << 20,
             snapshot_chunk: 1 << 20,
             snapshot_timeout_ms: 60_000,
+            workflow_waits: 64,
+            workflow_wait: Duration::from_millis(vos_wire::ingress::MAX_WORKFLOW_WAIT_MS),
         }
     }
 }
@@ -176,6 +187,8 @@ pub(crate) struct Settings {
     pub(crate) blob_horizons: Horizons,
     pub(crate) snapshot_chunk: usize,
     pub(crate) snapshot_timeout_ms: u64,
+    pub(crate) workflow_waits: usize,
+    pub(crate) workflow_wait: Duration,
 }
 
 impl Settings {
@@ -203,6 +216,10 @@ impl Settings {
             },
             snapshot_chunk: config.snapshot_chunk,
             snapshot_timeout_ms: config.snapshot_timeout_ms,
+            workflow_waits: config.workflow_waits,
+            workflow_wait: config.workflow_wait.min(Duration::from_millis(
+                vos_wire::ingress::MAX_WORKFLOW_WAIT_MS,
+            )),
         }
     }
 }

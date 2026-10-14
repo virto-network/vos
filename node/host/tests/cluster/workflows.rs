@@ -1,19 +1,25 @@
 //! Workflows on a replicated agent: started by a client, stepped by the
 //! leader's sweeps and by another agent's replies, their snapshots riding
 //! the result's blob path, their programs pinned while they live, through
-//! snapshots and retirements, and a lost page halting the node that lost
-//! it.
+//! upgrades, snapshots and retirements, and a lost page halting the node
+//! that lost it.
+
+use std::sync::Arc;
+use std::time::Duration;
 
 use vos_checker::programs::{actor, method};
 use vos_node::store::{EntryKind, PersistMode};
 use vos_node::{Node, Reply};
+use vos_pvm::pool::CodeHash;
 use vos_wire::abi::Kind;
 use vos_wire::ids::{AgentId, InstanceId, MethodId, WorkflowId};
 use vos_wire::records::{Workflow, WorkflowState, unstored};
-use vos_wire::result::{Outcome, Write};
+use vos_wire::result::{InputRef, Outcome, Run, Step, WorkResult, Write};
 use vos_wire::{Decode, Encode, keys};
 
-use crate::common::{ALICE, Cluster, compacting, log_start, replaced, retired, wait_until};
+use crate::common::{
+    ALICE, Cluster, HoldRefines, compacting, log_start, replaced, retired, wait_until,
+};
 
 const SHOP: InstanceId = InstanceId(4);
 /// The shop's workflows, each its own program.
@@ -58,10 +64,10 @@ impl Shop {
         method(&self.shop, name)
     }
 
-    /// Install the shop at `agent`'s leader, each workflow method bound to
-    /// its own program, or to the program `rebound` names for it.
-    fn install(&self, cluster: &Cluster, agent: AgentId, rebound: &[(&str, &str)]) {
-        let beside: Vec<(MethodId, Kind, &[u8])> = FLOWS
+    /// Each workflow method bound to its own program, or to the program
+    /// `rebound` names for it.
+    fn beside(&self, rebound: &[(&str, &str)]) -> Vec<(MethodId, Kind, &[u8])> {
+        FLOWS
             .iter()
             .map(|name| {
                 let program = rebound
@@ -71,8 +77,14 @@ impl Shop {
                 let (_, blob) = self.flows.iter().find(|(flow, _)| flow == program).unwrap();
                 (self.method(name), Kind::Workflow, blob.as_slice())
             })
-            .collect();
+            .collect()
+    }
+
+    /// Install the shop at `agent`'s leader, its workflow methods bound as
+    /// [`Shop::beside`] binds them.
+    fn install(&self, cluster: &Cluster, agent: AgentId, rebound: &[(&str, &str)]) {
         let leader = cluster.node(cluster.leader(agent));
+        let beside = self.beside(rebound);
         let installed = smol::block_on(leader.install(agent, SHOP, &self.shop, &beside, vec![]));
         assert!(
             matches!(installed, Ok(Reply::Ran(Outcome::Done(_)))),
@@ -81,7 +93,24 @@ impl Shop {
     }
 
     /// Alice's request starting workflow `name`, at `sequence` of the
-    /// cluster's session: answered with its id.
+    /// cluster's session.
+    fn starting<A: Encode>(
+        &self,
+        cluster: &Cluster,
+        sequence: u64,
+        name: &str,
+        arguments: A,
+    ) -> vos_wire::batch::Request {
+        vos_wire::batch::Request {
+            instance: SHOP,
+            method: self.method(name),
+            arguments: arguments.encode(),
+            ..cluster.request(sequence, 0)
+        }
+    }
+
+    /// Start workflow `name` by [`Shop::starting`]'s request at `agent`'s
+    /// leader: its id.
     fn start<A: Encode>(
         &self,
         cluster: &Cluster,
@@ -90,12 +119,7 @@ impl Shop {
         name: &str,
         arguments: A,
     ) -> WorkflowId {
-        let request = vos_wire::batch::Request {
-            instance: SHOP,
-            method: self.method(name),
-            arguments: arguments.encode(),
-            ..cluster.request(sequence, 0)
-        };
+        let request = self.starting(cluster, sequence, name, arguments);
         let leader = cluster.node(cluster.leader(agent));
         match smol::block_on(leader.call(agent, request)) {
             Ok(Reply::Ran(Outcome::Started(workflow))) => workflow,
@@ -234,6 +258,83 @@ fn a_workflow_awaits_another_agent_and_pins_its_program_while_it_lives() {
     );
     let living = record(cluster.node(cluster.leader(agent)), agent, nap).unwrap();
     assert!(matches!(living.state, WorkflowState::Sleeping { .. }));
+}
+
+/// A workflow sleeping through an upgrade that binds its method to another
+/// program wakes on its own, which only its life pins: the agent reads
+/// the programs it pins, and no other.
+#[test]
+fn a_workflow_wakes_on_the_program_only_its_life_pins() {
+    let cluster = Cluster::new(3);
+    let shop = Shop::load();
+    let agent = cluster.counter_agent(&[1, 2, 3]);
+    shop.install(&cluster, agent, &[]);
+    let nap = shop.start(&cluster, agent, 1, "nap", 1_500u64);
+    shop.install(&cluster, agent, &[("nap", "compute")]);
+    let leader = cluster.node(cluster.leader(agent));
+    let program = record(leader, agent, nap).unwrap().program.0;
+    assert!(leader.pinned().contains(&program));
+    assert!(matches!(ended(&cluster, agent, nap), Outcome::Done(_)));
+    wait_until("the ended workflow's program is released", || {
+        cluster
+            .running()
+            .all(|(_, node)| !node.pinned().contains(&program))
+    });
+}
+
+/// A workflow started in the batch that installs its program loads it,
+/// though only the batch's apply pins it.
+#[test]
+fn a_workflow_starts_in_the_batch_that_installs_its_program() {
+    let hold = Arc::new(HoldRefines::default());
+    let cluster = {
+        let hold = Arc::clone(&hold);
+        Cluster::tuned(3, move |_, config| config.hooks = hold.clone())
+    };
+    let shop = Shop::load();
+    let agent = cluster.counter_agent(&[1, 2, 3]);
+    let leader = cluster.node(cluster.leader(agent));
+    let before = leader.applied(agent).unwrap();
+    hold.arm();
+    let held = leader.call(agent, cluster.request(1, 1));
+    wait_until("a batch's refine is held", || hold.held() > 0);
+    let beside = shop.beside(&[]);
+    let installed = leader.install(agent, SHOP, &shop.shop, &beside, vec![]);
+    let last = CodeHash::of(beside.last().unwrap().2).0;
+    wait_until("the package is stored", || leader.stores_blob(&last));
+    // Its install is queued once its last blob is stored.
+    std::thread::sleep(Duration::from_millis(200));
+    let started = leader.call(agent, shop.starting(&cluster, 2, "nap", 0u64));
+    hold.release();
+    assert!(matches!(
+        smol::block_on(held),
+        Ok(Reply::Ran(Outcome::Done(_)))
+    ));
+    assert!(matches!(
+        smol::block_on(installed),
+        Ok(Reply::Ran(Outcome::Done(_)))
+    ));
+    let Ok(Reply::Ran(Outcome::Started(nap))) = smol::block_on(started) else {
+        panic!("the workflow did not start");
+    };
+    let together = (before + 1..=leader.applied(agent).unwrap()).any(|index| {
+        let Some(entry) = leader.store().log_entry(agent, index).unwrap() else {
+            return false;
+        };
+        let Ok((result, _)) = WorkResult::decode(&entry.body) else {
+            return false;
+        };
+        let ran = |input: fn(&Run) -> bool| {
+            result
+                .steps
+                .iter()
+                .any(|step| matches!(step, Step::Ran(run) if input(run)))
+        };
+        ran(|run| run.input == InputRef::Admin)
+            && ran(|run| matches!(run.outcome, Outcome::Started(_)))
+    });
+    assert!(together, "the install and the start shared no batch");
+    assert!(matches!(ended(&cluster, agent, nap), Outcome::Done(_)));
 }
 
 /// A workflow that lives pins its program, which an upgrade no longer

@@ -1,5 +1,5 @@
 //! A blocking client of a node's ingress: a client key's sessions, signed
-//! calls and queries, and the operator's commands.
+//! calls and queries, its workflows' results, and the operator's commands.
 
 mod http;
 mod target;
@@ -10,10 +10,11 @@ use std::time::Duration;
 
 use ed25519_dalek::{Signer, SigningKey};
 use vos_wire::abi::Refusal;
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session};
+use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session, WorkflowId};
 use vos_wire::ingress::{
     AgentInfo, Answer, Call, Consistency, Contact, Create, Grant, Install, NodeId, QueryCall,
-    Rejection, Replace, call_message, query_message,
+    Rejection, Replace, WORKFLOW_READ_HORIZON_MS, WorkflowRead, call_message, query_message,
+    workflow_message, workflow_read_horizon,
 };
 use vos_wire::schema::Schema;
 use vos_wire::{Decode, Encode, defaults};
@@ -601,14 +602,80 @@ impl Client {
             arguments: arguments.to_vec(),
             signature: self.key.sign(&message).to_bytes(),
         };
-        let path = format!("/agents/{}/queries", agent.0);
-        let body = query.encode();
+        self.read(
+            agent,
+            &format!("/agents/{}/queries", agent.0),
+            &query.encode(),
+        )
+    }
+
+    /// Read workflow `workflow` of `agent`, which this client's key
+    /// started, on state that holds every answer this client was given for
+    /// the agent, waiting up to `wait` for it to end, as long as the node
+    /// allows: its status, as [`Answer::Workflow`]. Only the workflow's
+    /// owner learns of it: to any other key it is unknown, as it is to its
+    /// owner once collected, about an hour after it ended
+    /// ([`defaults::WORKFLOW_KEPT_MS`]).
+    pub fn workflow(
+        &self,
+        agent: AgentId,
+        workflow: WorkflowId,
+        wait: Duration,
+    ) -> Result<Answer, ClientError> {
+        let consistency = Consistency::Applied {
+            at: self.floor(agent),
+        };
+        self.workflow_with(agent, workflow, wait, consistency)
+    }
+
+    /// [`Client::workflow`] on the state `consistency` asks for.
+    pub fn workflow_with(
+        &self,
+        agent: AgentId,
+        workflow: WorkflowId,
+        wait: Duration,
+        consistency: Consistency,
+    ) -> Result<Answer, ClientError> {
+        let identity = self.identity(agent)?;
+        let wait_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
+        let key = self.key.verifying_key().to_bytes();
+        let path = format!("/agents/{}/workflows", agent.0);
+        let read_until = |not_after: u64| {
+            let message =
+                workflow_message(&identity, &key, not_after, consistency, workflow, wait_ms);
+            let read = WorkflowRead {
+                key,
+                not_after,
+                consistency,
+                workflow,
+                wait_ms,
+                signature: self.key.sign(&message).to_bytes(),
+            };
+            self.read(agent, &path, &read.encode())
+        };
+        // Good past the wait, by the agents' time, within half the horizon
+        // a node allows: room for clocks off by as much either way.
+        let not_after = || {
+            crate::wall_clock()
+                .saturating_add(workflow_read_horizon(wait_ms) - WORKFLOW_READ_HORIZON_MS / 2)
+                .saturating_add_signed(*lock(&self.offset))
+        };
+        let answer = read_until(not_after())?;
+        let Answer::Rejected(Rejection::StaleQuery { now }) = answer else {
+            return Ok(answer);
+        };
+        self.learn_time(now);
+        read_until(not_after())
+    }
+
+    /// A signed read, `body` posted to `path`: it changes nothing, so one
+    /// this replica cannot answer now goes to the others in turn, the
+    /// client still calling this one. An answer raises the agent's floor.
+    fn read(&self, agent: AgentId, path: &str, body: &[u8]) -> Result<Answer, ClientError> {
         let ask = |http: &Http| -> Result<Answer, ClientError> {
-            let (status, answered) = http.post(&path, None, &body, true)?;
+            let (status, answered) = http.post(path, None, body, true)?;
             answer(status, &answered)
         };
-        // A query changes nothing: one this replica cannot answer now goes
-        // to the others in turn, the client still calling this one.
         let unanswered = |answer: &Result<Answer, ClientError>| {
             matches!(
                 answer,
@@ -634,7 +701,7 @@ impl Client {
             }
         }
         let answer = answer?;
-        if let Answer::Ran { at, .. } = answer {
+        if let Answer::Ran { at, .. } | Answer::Workflow { at, .. } = answer {
             self.raise_floor(agent, at);
         }
         Ok(answer)

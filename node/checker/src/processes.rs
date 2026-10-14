@@ -638,6 +638,21 @@ impl Processes {
         program: &[u8],
         instances: &[InstanceId],
     ) -> AgentId {
+        let installs: Vec<Install> = instances
+            .iter()
+            .map(|instance| Install {
+                instance: *instance,
+                program: program.to_vec(),
+                beside: Vec::new(),
+                roles: Vec::new(),
+            })
+            .collect();
+        self.agent_installing(replicas, &installs)
+    }
+
+    /// An agent created on `replicas`, with each of `installs` made, in
+    /// order.
+    pub fn agent_installing(&self, replicas: Vec<NodeNumber>, installs: &[Install]) -> AgentId {
         let Answer::Created(agent) = self.operate(
             |operator| {
                 operator
@@ -648,17 +663,11 @@ impl Processes {
         ) else {
             unreachable!()
         };
-        for instance in instances {
-            let install = Install {
-                instance: *instance,
-                program: program.to_vec(),
-                beside: Vec::new(),
-                roles: Vec::new(),
-            };
+        for install in installs {
             self.operate(
                 |operator| {
                     operator
-                        .install(agent, &install)
+                        .install(agent, install)
                         .unwrap_or(Answer::Unavailable)
                 },
                 |answer| matches!(answer, Answer::Ran { .. }),

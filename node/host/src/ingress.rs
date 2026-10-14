@@ -1,7 +1,9 @@
 //! The node's HTTP ingress: signed calls in their sessions' sequences
-//! (run as `calls` says), signed queries, and the operator's commands.
+//! (run as `calls` says), signed queries, owners' reads of their
+//! workflows, and the operator's commands.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use smol::net::TcpListener;
@@ -10,7 +12,8 @@ use vos_wire::abi::{Refusal, cap};
 use vos_wire::batch::Admin;
 use vos_wire::ids::{AgentId, InstanceId, Principal};
 use vos_wire::ingress::{
-    AgentInfo, Answer, Call, Create, Grant, Install, QueryCall, Rejection, Replace, query_message,
+    AgentInfo, Answer, Call, Create, Grant, Install, QueryCall, Rejection, Replace, WorkflowRead,
+    query_message, workflow_message, workflow_read_horizon,
 };
 use vos_wire::records::{Installed, unstored};
 use vos_wire::{Decode, Encode, keys};
@@ -29,6 +32,31 @@ const MAX_INSTALL: usize = 64 << 20;
 pub(crate) struct Ingress {
     inner: Arc<Inner>,
     token: [u8; 32],
+    /// Owners' reads of workflows waiting now.
+    waiting: AtomicUsize,
+}
+
+/// A read's place among those waiting, given back when it ends, however it
+/// ends: a client that hangs up mid-wait goes unnoticed, so its read holds
+/// its place until its wait ends.
+struct Waiting<'a>(&'a AtomicUsize);
+
+impl<'a> Waiting<'a> {
+    /// A place among `waiting`, if fewer than `most` hold one.
+    fn take(waiting: &'a AtomicUsize, most: usize) -> Option<Self> {
+        waiting
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
+                (held < most).then_some(held + 1)
+            })
+            .ok()
+            .map(|_| Waiting(waiting))
+    }
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 fn status(answer: &Answer) -> u16 {
@@ -37,7 +65,8 @@ fn status(answer: &Answer) -> u16 {
         | Answer::Created(_)
         | Answer::Placed(_)
         | Answer::Status(_)
-        | Answer::Stats(_) => 200,
+        | Answer::Stats(_)
+        | Answer::Workflow { .. } => 200,
         Answer::Unplaced(_) => 409,
         Answer::Unconfirmed(_) => 202,
         // The session is done with: the client starts another.
@@ -88,7 +117,11 @@ fn parse_hex(text: &[u8]) -> Option<[u8; 32]> {
 
 impl Ingress {
     pub(crate) fn new(inner: Arc<Inner>, token: [u8; 32]) -> Self {
-        Self { inner, token }
+        Self {
+            inner,
+            token,
+            waiting: AtomicUsize::new(0),
+        }
     }
 
     /// Serve until `stop` resolves, then end every connection.
@@ -150,6 +183,13 @@ impl Ingress {
             ("POST", ["agents", id, "queries"]) => {
                 match (agent(id), decode::<QueryCall>(&request.body)) {
                     (Some(agent), Ok(query)) => respond(self.query(agent, query).await),
+                    (None, _) => respond(Answer::NoAgent),
+                    (_, Err(answer)) => respond(answer),
+                }
+            }
+            ("POST", ["agents", id, "workflows"]) => {
+                match (agent(id), decode::<WorkflowRead>(&request.body)) {
+                    (Some(agent), Ok(read)) => respond(self.workflow(agent, read).await),
                     (None, _) => respond(Answer::NoAgent),
                     (_, Err(answer)) => respond(answer),
                 }
@@ -277,7 +317,79 @@ impl Ingress {
             query.method,
             &query.arguments,
         );
-        let (key, signature) = (query.key, query.signature);
+        if let Err(answer) = self
+            .signed(
+                query.key,
+                message,
+                query.signature,
+                query.not_after,
+                QUERY_HORIZON_MS,
+            )
+            .await
+        {
+            return answer;
+        }
+        self.inner
+            .client_query(
+                agent,
+                Principal::Client(query.key),
+                query.instance,
+                query.method,
+                query.arguments,
+                query.consistency,
+            )
+            .await
+    }
+
+    /// An owner's read of a workflow's status, waiting for it to end, as
+    /// long as it asks and the node allows, and only while fewer reads than
+    /// the node allows wait: past them, it answers at once.
+    async fn workflow(&self, agent: AgentId, read: WorkflowRead) -> Answer {
+        let Some(run) = self.inner.run(agent) else {
+            return answer_of(Err(self.inner.absent(agent)));
+        };
+        let message = workflow_message(
+            &run.shared.identity,
+            &read.key,
+            read.not_after,
+            read.consistency,
+            read.workflow,
+            read.wait_ms,
+        );
+        let horizon = workflow_read_horizon(read.wait_ms);
+        if let Err(answer) = self
+            .signed(read.key, message, read.signature, read.not_after, horizon)
+            .await
+        {
+            return answer;
+        }
+        let settings = &self.inner.settings;
+        let place = (read.wait_ms > 0)
+            .then(|| Waiting::take(&self.waiting, settings.workflow_waits))
+            .flatten();
+        let wait = match place {
+            Some(_) => Duration::from_millis(read.wait_ms).min(settings.workflow_wait),
+            None => Duration::ZERO,
+        };
+        let answer = self
+            .inner
+            .client_workflow(agent, read.key, read.workflow, read.consistency, wait)
+            .await;
+        drop(place);
+        answer
+    }
+
+    /// That `key` signed `message`, good until `not_after`, at most
+    /// `horizon` ms past the node's time: checked off the leaders' thread,
+    /// then against the node's clock.
+    async fn signed(
+        &self,
+        key: [u8; 32],
+        message: Vec<u8>,
+        signature: [u8; 64],
+        not_after: u64,
+        horizon: u64,
+    ) -> Result<(), Answer> {
         let signed = self
             .inner
             .offload({
@@ -292,23 +404,14 @@ impl Ingress {
             .await;
         match signed {
             Some(true) => {}
-            Some(false) => return Answer::Rejected(Rejection::BadSignature),
-            None => return Answer::Unavailable,
+            Some(false) => return Err(Answer::Rejected(Rejection::BadSignature)),
+            None => return Err(Answer::Unavailable),
         }
         let now = (self.inner.clock)();
-        if query.not_after < now || query.not_after > now + QUERY_HORIZON_MS {
-            return Answer::Rejected(Rejection::StaleQuery { now });
+        if not_after < now || not_after > now.saturating_add(horizon) {
+            return Err(Answer::Rejected(Rejection::StaleQuery { now }));
         }
-        self.inner
-            .client_query(
-                agent,
-                Principal::Client(query.key),
-                query.instance,
-                query.method,
-                query.arguments,
-                query.consistency,
-            )
-            .await
+        Ok(())
     }
 
     /// An installed instance's schema, so clients call methods by name.

@@ -225,11 +225,83 @@ fn an_operator_installs_programs_beside_an_actor() {
     assert_eq!(audited, "done 25232284e49cf2cb");
 }
 
+/// A call that starts a workflow prints its id; the key that started it
+/// reads its result by the id, waiting for it to end, and another key
+/// reads nothing.
+#[test]
+fn a_client_reads_the_workflow_it_started() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("node");
+    let data = data.to_str().unwrap();
+    let node = node_run(dir.path(), &["--data", data, "--listen", "127.0.0.1:0"]);
+    let url = format!("http://{}", node.address);
+    let agent = vos(&["agent", "create", "--node", &url, "--data", data]);
+    let elf = |name: &str| actor_elf(name).to_str().unwrap().to_string();
+    let installed = vos(&[
+        "install",
+        "--node",
+        &url,
+        "--data",
+        data,
+        "--agent",
+        &agent,
+        "--instance",
+        "2",
+        "--program",
+        &elf("ledger"),
+        "--role",
+        "minter=1",
+        "--attestable",
+        &format!("checksum={}", elf("checksum")),
+        "--workflow",
+        &format!("tally={}", elf("tally")),
+    ]);
+    assert!(installed.starts_with("done"), "{installed}");
+    let key = |name: &str| {
+        let path = dir.path().join(name);
+        vos(&["key", "new", "--out", path.to_str().unwrap()]);
+        path.to_str().unwrap().to_string()
+    };
+    let (owner, stranger) = (key("owner.key"), key("stranger.key"));
+    // The amounts 1 and 2.
+    let amounts = "0200000001000000000000000200000000000000";
+    let started = vos(&[
+        "call",
+        "--node",
+        &url,
+        "--key",
+        &owner,
+        "--agent",
+        &agent,
+        "--instance",
+        "2",
+        "--method",
+        "tally",
+        "--args",
+        amounts,
+    ]);
+    let id = started
+        .strip_prefix("started ")
+        .unwrap_or_else(|| panic!("{started}"));
+    let read = |key: &str| {
+        [
+            "workflow", "--node", &url, "--key", key, "--agent", &agent, "--id", id, "--wait", "10",
+        ]
+        .map(str::to_string)
+    };
+    assert_eq!(vos(&strs(&read(&owner))), "done 0300000000000000");
+    let unknown = vos_fails(&strs(&read(&stranger)));
+    assert!(
+        unknown.contains(&format!("holds no workflow {id} this key started")),
+        "{unknown}"
+    );
+}
+
 fn strs(args: &[String]) -> Vec<&str> {
     args.iter().map(String::as_str).collect()
 }
 
-/// `vos` that should fail: its error./// `vos` that should fail: its error.
+/// `vos` that should fail: its error.
 fn vos_fails(args: &[&str]) -> String {
     let output = Command::new(VOS).args(args).output().expect("vos runs");
     assert!(!output.status.success(), "vos {args:?} succeeded");

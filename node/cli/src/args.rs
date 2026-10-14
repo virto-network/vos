@@ -61,6 +61,9 @@ pub enum Command {
         #[arg(long)]
         linearizable: bool,
     },
+    /// Read a workflow the client key started, by the id its start was
+    /// answered with: where it stands, or its result once it ended.
+    Workflow(WorkflowArgs),
 }
 
 #[derive(Subcommand)]
@@ -248,6 +251,27 @@ pub struct OperatorArgs {
     /// commands run on the node's host.
     #[arg(long)]
     pub data: PathBuf,
+}
+
+#[derive(clap::Args)]
+pub struct WorkflowArgs {
+    #[command(flatten)]
+    pub node: NodeArgs,
+    /// The client key's seed file, from `vos key new`: the key that
+    /// started the workflow.
+    #[arg(long)]
+    pub key: PathBuf,
+    #[arg(long)]
+    pub agent: u32,
+    /// The workflow's id, as `started` printed it.
+    #[arg(long)]
+    pub id: u64,
+    /// Wait this many seconds, at most 30, for the workflow to end.
+    #[arg(long, default_value_t = 0)]
+    pub wait: u64,
+    /// Read state that holds every call answered anywhere before the read.
+    #[arg(long)]
+    pub linearizable: bool,
 }
 
 #[derive(clap::Args)]

@@ -3,6 +3,7 @@
 //! directory, and blobs).
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use smol::future::FutureExt;
@@ -73,6 +74,7 @@ impl Inner {
     /// blob (hashed) and a creation record (committed) run in tasks of
     /// their own, so no group's consensus waits behind them.
     async fn arrive(self: &Arc<Self>, class: Class, incoming: Incoming) {
+        self.arrived[class as usize].fetch_add(1, Ordering::Relaxed);
         let Incoming {
             from,
             stream,

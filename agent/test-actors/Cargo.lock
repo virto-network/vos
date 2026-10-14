@@ -107,6 +107,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rounds"
+version = "0.1.0"
+dependencies = [
+ "vos-sdk",
+]
+
+[[package]]
 name = "shop"
 version = "0.1.0"
 dependencies = [
