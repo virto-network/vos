@@ -19,7 +19,7 @@ use vos_wire::peer::NodeNumber;
 use vos_wire::result::Outcome;
 use vos_wire::{Decode, Encode};
 
-use crate::common::{Cluster, compacting, wait_until};
+use crate::common::{Cluster, compacting, log_start, wait_until};
 
 /// Rows each call writes, of [`ROW`] bytes: within a step's 256 KiB.
 const ROWS: u32 = 4;
@@ -261,17 +261,24 @@ fn large_results_make_a_compaction_due_by_their_blobs() {
     let agent = cluster.counter_agent(&[1, 2, 3]);
     let leader = cluster.leader(agent);
     let indices = two_batches(&cluster, &hooks, leader, agent, 1);
-    // Small calls after them sync their applies.
-    for sequence in 12..=14 {
+    // The second result alone weighs past the tail's megabyte, so the log
+    // keeps neither. An apply is durable, and so compactable, only once a
+    // later synced flush covers it: small calls bring those flushes.
+    let compacted =
+        || (1..=3).all(|number| log_start(cluster.node(number), agent) > indices[1] - 1);
+    for sequence in 12.. {
+        if compacted() {
+            break;
+        }
+        assert!(
+            sequence < 112,
+            "every node compacts past {}",
+            indices[1] - 1
+        );
         assert_eq!(
             done(cluster.increment(leader, agent, sequence, 1)),
             sequence - 11
         );
-    }
-    for number in 1..=3 {
-        // The second result alone weighs past the tail's megabyte, so the
-        // log keeps neither.
-        cluster.compacted_past(number, agent, indices[1] - 1);
     }
 }
 

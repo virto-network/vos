@@ -177,6 +177,9 @@ impl Driver {
         inbox: smol::channel::Receiver<Input>,
         local: smol::channel::Receiver<Local>,
     ) {
+        // Before the first tick, so a replica whose recovered entries wait
+        // for their blobs never campaigns.
+        self.report_health();
         if self.process().await {
             // Blobs recovery found lost are asked for at once.
             self.fetch_blobs();
