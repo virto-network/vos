@@ -303,6 +303,13 @@ impl EntryReports {
         }
     }
 
+    /// Whether recovered entries still wait for their blobs.
+    pub fn recovering(&self) -> bool {
+        self.pending
+            .front()
+            .is_some_and(|pending| pending.seq == RECOVERED)
+    }
+
     /// `write` is durable. A truncation in it drops the waits of the
     /// entries it removed, from earlier writes too. `stored` answers from a
     /// [`Blobs::touch`] of the write's blobs, so none of them is collected

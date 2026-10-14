@@ -94,6 +94,11 @@ impl Driver {
         let established = established(&core, inner.number);
         // The core counts every recovered entry durable, which a committed
         // one is safe to be; nothing applies past its lost blob meanwhile.
+        // A leader that still holds this replica's next entries keeps
+        // appending rather than sending a snapshot, so if every member has
+        // collected the blobs, this replica waits until the leader's log
+        // compacts past its own: seconds on a busy group, longer on an idle
+        // one.
         let mut reports = EntryReports::default();
         let mut writes = VecDeque::new();
         let mut written = last_index;
@@ -103,8 +108,8 @@ impl Driver {
                 index = first,
                 "the store lost the blobs of committed entries from {first}: this replica keeps \
                  them, so it never votes without them, and fetches the blobs again from its \
-                 members; it applies nothing from {first} on until they come, and stays there \
-                 if no member holds them"
+                 members; it applies nothing from {first} on until they come, never campaigns \
+                 or leads meanwhile, and stays there if no member holds them"
             );
             written = first - 1;
             writes.push_back((raft::RECOVERED, last_index));
@@ -399,7 +404,11 @@ impl Driver {
     /// it does while its writer is stalled. A replica whose leader loop
     /// stopped for good (`retired`) is reported as stalled on purpose.
     fn report_health(&mut self) {
-        let handing_over = self.retired || self.inner.storage.stalled();
+        // A replica whose recovered entries wait for their blobs neither
+        // campaigns nor leads: as leader it would wait on its own no-op
+        // behind them, and hold up the group.
+        let handing_over =
+            self.retired || self.inner.storage.stalled() || self.reports.recovering();
         if handing_over != self.handing_over {
             self.handing_over = handing_over;
             self.core.writer_health(handing_over);

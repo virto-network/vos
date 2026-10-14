@@ -547,10 +547,10 @@ fn a_replica_that_lost_a_committed_entrys_blob_halts_and_fetches_it_again() {
 
 /// The leader and one follower commit a large result while the other
 /// follower is cut off; the first follower's disk then loses its blob,
-/// and the leader stops. The two left elect a leader that still holds the
-/// entry, committed: the restarted follower never forgot it. It applies
-/// nothing past it until a member holding the blob, the old leader, is
-/// back.
+/// and the leader stops. The restarted follower never forgot the entry,
+/// so it never elects the other, which lacks it, and it neither campaigns
+/// nor leads while the blob is away. Once a member holding the blob, the
+/// old leader, is back, the entry applies everywhere.
 #[test]
 fn a_committed_entry_whose_blob_a_replica_lost_stays_committed() {
     let (mut cluster, hooks) = losing_cluster();
@@ -572,13 +572,15 @@ fn a_committed_entry_whose_blob_a_replica_lost_stays_committed() {
     cluster.stop(leader);
     cluster.hub.heal();
     cluster.start(follower);
-    // The one holding the entry leads, and the other takes it from it.
+    // The one that kept the entry never votes for the other, which lacks
+    // it, and neither campaigns nor leads while the blob is away: no
+    // leader comes, for many election timeouts, until a member holding
+    // the blob returns.
     let holds = |number: NodeNumber| {
         large_blobs(cluster.node(number), agent, index - 1).first() == Some(&(index, blob))
     };
-    wait_until("the follower that kept the entry leads", || {
-        cluster.node(follower).leads(agent) && holds(follower)
-    });
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(holds(follower), "the follower kept the entry");
     let committed = cluster
         .node(follower)
         .store()
@@ -587,9 +589,9 @@ fn a_committed_entry_whose_blob_a_replica_lost_stays_committed() {
         .hard
         .commit;
     assert!(committed >= index, "committed through {committed}");
-    wait_until("the other follower holds the entry", || holds(other));
     for number in [follower, other] {
         let node = cluster.node(number);
+        assert!(!node.leads(agent), "node {number} leads");
         assert!(
             !node.stores_blob(&blob.hash),
             "node {number} lacks the blob"
