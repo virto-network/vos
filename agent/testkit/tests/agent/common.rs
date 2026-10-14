@@ -27,6 +27,7 @@ pub const AGENT: AgentId = AgentId(7);
 pub const COUNTER: InstanceId = InstanceId(1);
 pub const LEDGER: InstanceId = InstanceId(2);
 pub const CALLER: InstanceId = InstanceId(3);
+pub const SHOP: InstanceId = InstanceId(4);
 pub const ALICE: Principal = Principal::Client([1; 32]);
 pub const BOB: Principal = Principal::Client([2; 32]);
 pub const MINTER: u8 = 1;
@@ -73,8 +74,13 @@ impl ServiceStorage for Storage<'_> {
 /// What PolkaJam charges for a call it does not serve (step 4.0).
 pub const JAM_UNSERVED_GAS: u64 = 1_000;
 
-/// `historical_lookup` from the node's programs; every other call the host
-/// does not serve answers `WHAT`, at `unserved` gas.
+/// The agent's report that its state lost data it wrote: a VOS node stops
+/// the refine at it.
+pub const LOST: u64 = 0x483;
+
+/// `historical_lookup` from the node's programs, and the agent's report of
+/// lost state, which stops the refine; every other call the host does not
+/// serve answers `WHAT`, at `unserved` gas.
 fn serve(
     id: u64,
     machine: &mut Machine,
@@ -82,6 +88,9 @@ fn serve(
     unserved: u64,
 ) -> Result<(), ExitReason> {
     let registers = *machine.registers();
+    if id == LOST {
+        return Err(ExitReason::HostCall(LOST));
+    }
     if id != 7 {
         if !machine.charge(unserved) {
             return Err(ExitReason::OutOfGas);
@@ -154,6 +163,35 @@ impl Node {
         }
     }
 
+    /// A VOS node's host whose agent and inner machines run on `backend`.
+    pub fn on(backend: PvmBackend) -> Self {
+        static AGENTS: std::sync::Mutex<Vec<(PvmBackend, Arc<PreparedProgram>)>> =
+            std::sync::Mutex::new(Vec::new());
+        let mut agents = AGENTS.lock().unwrap();
+        let program = match agents.iter().find(|(prepared, _)| *prepared == backend) {
+            Some((_, program)) => Arc::clone(program),
+            None => {
+                let program =
+                    Arc::new(PreparedProgram::new_with_backend(&agent(), backend).unwrap());
+                agents.push((backend, Arc::clone(&program)));
+                program
+            }
+        };
+        Self {
+            program,
+            ..Self::new()
+        }
+    }
+
+    /// The backends a test runs on: the interpreter, and the recompiler
+    /// where it runs.
+    pub fn backends() -> Vec<PvmBackend> {
+        let mut backends = vec![PvmBackend::ForceInterpreter];
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        backends.push(PvmBackend::ForceRecompiler);
+        backends
+    }
+
     /// A JAM node's host: no pool, no precompile computed, and PolkaJam's
     /// price for a call it does not serve. With `serves_state`, it reads
     /// applied state as the witnesses of JAM mode will give it.
@@ -210,7 +248,7 @@ impl Node {
     pub fn refine_with(&self, work: &Work, gas: u64) -> Vec<u8> {
         let invocation = self.run_refine(work, gas);
         assert_eq!(invocation.exit, ExitReason::Halt, "refine halts");
-        invocation.output_bounded(cap::WORK_RESULT).unwrap()
+        invocation.output_bounded(cap::OUTPUT).unwrap()
     }
 
     /// The refine's arguments for `work`, as the node passes them.
@@ -282,7 +320,7 @@ impl Node {
         let invocation = self.run_refine(&self.work(1, inputs), OUTER_GAS);
         assert_eq!(invocation.exit, ExitReason::Halt, "refine halts");
         let (result, _) =
-            WorkResult::decode(&invocation.output_bounded(cap::WORK_RESULT).unwrap()).unwrap();
+            WorkResult::decode(&invocation.output_bounded(cap::OUTPUT).unwrap()).unwrap();
         let steps: u64 = result
             .steps
             .iter()
@@ -347,6 +385,21 @@ impl Node {
             arguments,
         });
         Outcome::decode(&self.refine(&work)).unwrap().0
+    }
+
+    /// A sweep of the rows of the due index due at `time`, as a leader
+    /// lists them: the earliest first, at most `SWEEP_LIMIT`.
+    pub fn sweep(&self, time: u64) -> Input {
+        let prefix = keys::due_prefix();
+        let due = self
+            .state
+            .range(prefix.clone()..)
+            .take_while(|(key, _)| key.starts_with(&prefix))
+            .filter_map(|(key, _)| keys::due_entry(key))
+            .take_while(|(at, _)| *at <= time)
+            .take(vos_wire::defaults::SWEEP_LIMIT)
+            .collect();
+        Input::Sweep { due }
     }
 
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
@@ -554,6 +607,7 @@ pub fn ran_step(session: SessionRef, sequence: u64, writes: Vec<Write>) -> Step 
         committed: Vec::new(),
         messages: Vec::new(),
         attests: Vec::new(),
+        pages: Vec::new(),
         gas_used: 0,
     })
 }

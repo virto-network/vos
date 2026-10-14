@@ -14,7 +14,9 @@ use scale::{Decode, Encode};
 use vos_tree::Blake2b;
 
 use crate::abi::{Failure, Rows, cap};
-use crate::ids::{AgentId, InstanceId, MapId, Principal, Session, SessionId};
+use crate::ids::{
+    AgentId, InstanceId, MapId, Principal, ProgramHash, Session, SessionId, WorkflowId,
+};
 
 /// Who owns a row, its key's first byte: the agent itself, one of its
 /// instances, or the node's root builder.
@@ -123,10 +125,15 @@ enum Row {
     LiveSessions = 0x0c,
     BatchTime = 0x0d,
     SessionOf = 0x0e,
-    Expiry = 0x0f,
+    Due = 0x0f,
     KeySessions = 0x10,
     Dirty = 0x11,
     Seed = 0x12,
+    Workflow = 0x13,
+    Page = 0x14,
+    NextWorkflow = 0x15,
+    LiveWorkflows = 0x16,
+    WorkflowPins = 0x17,
 }
 
 /// The root builder's rows, each tagged after [`Owner::Tree`]: a committed
@@ -443,35 +450,103 @@ pub fn session_of(session: SessionId) -> Vec<u8> {
     key(&[&Row::SessionOf.prefix(), &session.0.to_be_bytes()])
 }
 
-/// A session's row in the expiry index: its bucket (a time divided by
-/// [`crate::defaults::SESSION_BUCKET_MS`]), then its id, big-endian, so
-/// a scan meets the oldest first. A session's row lies at or before its
-/// mark's bucket.
-pub fn expiry(bucket: u64, session: SessionId) -> Vec<u8> {
+/// What a row of the due index brings: a session to collect once it has
+/// expired, or a workflow's step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
+pub enum Due {
+    #[codec(index = 0)]
+    Session(SessionId),
+    /// Its first step, its deadline or timer, or its collection once ended.
+    #[codec(index = 1)]
+    Workflow(WorkflowId),
+}
+
+impl Due {
+    fn tag(self) -> (u8, u64) {
+        match self {
+            Due::Session(id) => (0, id.0),
+            Due::Workflow(id) => (1, id.0),
+        }
+    }
+}
+
+/// A row of the due index, which the leader reads to time its sweeps and
+/// lists in them: the batch time it is due at, then its entry's kind and
+/// id, big-endian, so a scan meets the earliest first. A session's row is
+/// due once it may have expired ([`crate::expiry::due`]), and lies at or
+/// before that.
+pub fn due(at: u64, entry: Due) -> Vec<u8> {
+    let (kind, id) = entry.tag();
     key(&[
-        &Row::Expiry.prefix(),
-        &bucket.to_be_bytes(),
-        &session.0.to_be_bytes(),
+        &Row::Due.prefix(),
+        &at.to_be_bytes(),
+        &[kind],
+        &id.to_be_bytes(),
     ])
 }
 
-/// The length of an [`expiry`] key.
-const EXPIRY_LEN: usize = 2 + 8 + 8;
+/// The length of a [`due`] key.
+const DUE_LEN: usize = 2 + 8 + 1 + 8;
 
-/// The prefix of the expiry index.
-pub fn expiry_prefix() -> Vec<u8> {
-    Row::Expiry.prefix().to_vec()
+/// The prefix of the due index.
+pub fn due_prefix() -> Vec<u8> {
+    Row::Due.prefix().to_vec()
 }
 
-/// The bucket and session an [`expiry`] key names; `None` for any other
-/// key.
-pub fn expiry_entry(key: &[u8]) -> Option<(u64, SessionId)> {
-    if key.len() != EXPIRY_LEN || key[..2] != Row::Expiry.prefix() {
+/// The time and entry a [`due`] key names; `None` for any other key.
+pub fn due_entry(key: &[u8]) -> Option<(u64, Due)> {
+    if key.len() != DUE_LEN || key[..2] != Row::Due.prefix() {
         return None;
     }
-    let bucket = u64::from_be_bytes(key[2..10].try_into().ok()?);
-    let session = u64::from_be_bytes(key[10..].try_into().ok()?);
-    Some((bucket, SessionId(session)))
+    let at = u64::from_be_bytes(key[2..10].try_into().ok()?);
+    let id = u64::from_be_bytes(key[11..].try_into().ok()?);
+    let entry = match key[10] {
+        0 => Due::Session(SessionId(id)),
+        1 => Due::Workflow(WorkflowId(id)),
+        _ => return None,
+    };
+    Some((at, entry))
+}
+
+/// A workflow's record ([`crate::records::Workflow`]).
+pub fn workflow(id: WorkflowId) -> Vec<u8> {
+    key(&[&Row::Workflow.prefix(), &id.0.to_be_bytes()])
+}
+
+/// A page a workflow's snapshot stores, LZ4-compressed, by its index.
+pub fn page(id: WorkflowId, index: u32) -> Vec<u8> {
+    key(&[
+        &Row::Page.prefix(),
+        &id.0.to_be_bytes(),
+        &index.to_be_bytes(),
+    ])
+}
+
+/// The id the next workflow gets: ids are never reused.
+pub fn next_workflow() -> Vec<u8> {
+    Row::NextWorkflow.prefix().to_vec()
+}
+
+/// How many workflows the agent holds that have not ended.
+pub fn live_workflows() -> Vec<u8> {
+    Row::LiveWorkflows.prefix().to_vec()
+}
+
+/// How many workflows that have not ended run `program`: each pins it, as
+/// an installed instance pins its programs.
+pub fn workflow_pins(program: &ProgramHash) -> Vec<u8> {
+    key(&[&Row::WorkflowPins.prefix(), &program.0])
+}
+
+/// The prefix of the workflows' pins.
+pub fn workflow_pins_prefix() -> Vec<u8> {
+    Row::WorkflowPins.prefix().to_vec()
+}
+
+/// The program a [`workflow_pins`] key names; `None` for any other key.
+pub fn workflow_pins_entry(key: &[u8]) -> Option<ProgramHash> {
+    let rest = key.strip_prefix(&Row::WorkflowPins.prefix())?;
+    Some(ProgramHash(rest.try_into().ok()?))
 }
 
 /// How many sessions a key holds at this agent.

@@ -476,3 +476,105 @@ it.
 **Also fixed on the way** (afe274a7, 8e1cbf43): a replica whose recovered
 entries wait for their blobs neither campaigns nor leads, from its first
 tick.
+
+## Step 4.5, parts A–D: workflows in the agent
+
+**Built:**
+- **The SDK:** `#[workflow] async fn f(ctx: &mut Workflow<Self>, ..)`,
+  with no `self`; `#[workflow(role, gas)]`.
+  - `Workflow<A>` offers `call`, `send`, `request(..).within(d)`,
+    `start`, `result(..).within(d)`, `sleep_until`, `now`, `random` and
+    `log`. There is no `checkpoint()`: every `.await` pauses.
+  - A pausing operation (REQUEST, RESULT, SLEEP; 8,000 gas each) returns
+    only when the agent resumes the machine.
+  - A workflow touches no state of its own; it reaches state through
+    calls.
+  - Compile-fail tests cover the misuses.
+- **The workflow table:**
+  - rows `w/<id>` (a record with a format byte) and `p/<id>/<page>`;
+  - counters, and a pin per program a live workflow runs;
+  - a start, by a request or a call, answers `Started(id)`, and its first
+    step runs in the same batch when the meter allows;
+  - a `Reply` resumes only the workflow awaiting that agent at that
+    counter;
+  - an owning agent waits for a result with `Body::Wait`;
+  - a failure discards the step's effects, consumes its input and ends
+    the workflow;
+  - ended workflows are collected an hour later through the due index;
+  - at most 65,536 live workflows an agent.
+- **Snapshots:**
+  - the counter from `expunge`, the registers, and every written page
+    that differs from its base (the image's data, or zeros);
+  - `Run.pages` carries each page's index and hash, and the LZ4 bytes
+    travel in the refine output's page section beside the work result;
+  - restore instantiates the program at the counter, writes the pages
+    back checked against their hashes, and arms the writable runs;
+  - the interpreter and the JIT agree on every step's pages and gas.
+- **One due index** for session expiry, awaits' deadlines, timers and
+  collection.
+  - The leader lists its due rows in `Input::Sweep`, and refine checks
+    each, never scanning.
+  - A row whose workflow is gone or has moved is deleted.
+  - A step that could never fit the budget fails with `Cap`.
+  - A sleep files at the next millisecond at least, so the head always
+    moves.
+- **Lost data halts the node.** A workflow record, page or count that
+  is missing or corrupt ends the refine through `LOST` (0x483), which a
+  VOS node takes as a storage fault and on JAM traps. It is never a
+  committed failure of the workflow.
+- **The meter prices pages at JAM's cost on every host,** so a step's
+  gas is the same on both:
+  - a step reserves 400k;
+  - arming costs 200 gas a page, restoring 950k a page, and each page
+    written 1.1M;
+  - a workflow holds at most 768 pages (3 MiB);
+  - at the default budget, a step writes about 800 pages, or about 140
+    while it holds 768.
+- **The depth rule counts the workflow's own machine,** and the stack's
+  worst case is 57 KiB of 64.
+- **Also:**
+  - attests made by a workflow's nested calls are kept;
+  - a workflow requesting its own agent traps;
+  - `Failure::TimedOut` and `Failure::Unloadable`;
+  - an in-place `blake2b_256` in the precompiles crate;
+  - `refine.rs` split into `invocation`, `sessions`, `snapshots` and
+    `workflows`.
+
+**Tests:**
+- 63 agent tests and more, on both backends, each step equal to the
+  reference model's.
+  - The workflows: transfer, a saga of five awaits, and a 2 MiB
+    computation.
+  - Replies: foreign, late and wrong ones dropped.
+  - Time: deadlines and timers; a sleep ahead of its batch.
+  - Lifecycle: traps; pages back at base; an owner's wait; a workflow
+    starting another agent's workflow; an upgrade keeping the program;
+    the caps and the combined page bound.
+  - Effects: a precompile's output tracked across pauses; two steps of
+    one workflow in a batch; a nested attest.
+  - The due index: orphan and stale rows; a workflow's 62-deep chain;
+    lost state halting.
+- VOS and the JAM-only host agree, byte for byte, with state served.
+- Across nodes:
+  - a 2 MiB computation's results traveling as blobs;
+  - a saga awaiting another node's agent;
+  - pins kept through snapshots and retirement;
+  - a lost page halting its node.
+
+**Reviewed:**
+- Fable: go. The lifecycle is exactly-once and deterministic, snapshots
+  are exact, the wire split is unambiguous, and pins are taken and
+  released once.
+- Opus: GO with fixes, all in:
+  - the stack;
+  - the nested attests;
+  - the due index's head;
+  - lost data halting;
+  - the page bound;
+  - prices measured (`PAUSE`, `NOW`);
+  - `refine.rs` split.
+
+**For the owner, when it matters:** VOS pays JAM's page prices so a
+step's gas is the same on every host. If VOS should pay less, the sound
+shape is a price table chosen by a package's declared deployment
+target, stored in the agent's state, so every replica prices alike.

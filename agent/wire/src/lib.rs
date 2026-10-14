@@ -20,7 +20,8 @@ pub mod records;
 pub mod result;
 pub mod schema;
 
-/// The expiry index's buckets.
+/// When a session's row in the due index is due: sessions are filed by the
+/// bucket of their last activity, so one sweep collects many.
 pub mod expiry {
     use crate::defaults::{SESSION_BUCKET_MS, SESSION_EXPIRY_MS};
 
@@ -35,6 +36,11 @@ pub mod expiry {
         (bucket + 1)
             .saturating_mul(SESSION_BUCKET_MS)
             .saturating_add(SESSION_EXPIRY_MS)
+    }
+
+    /// Where a session last active at `time` lies in the due index.
+    pub const fn at(time: u64) -> u64 {
+        due(bucket(time))
     }
 }
 
@@ -56,7 +62,7 @@ pub mod defaults {
     /// milliseconds: a session is collected at most this long after it
     /// expires.
     pub const SESSION_BUCKET_MS: u64 = 5 * 60 * 1000;
-    /// The most expiry rows one sweep lists.
+    /// The most rows of the due index one sweep lists.
     pub const SWEEP_LIMIT: usize = 32;
     /// The most sessions an agent holds: more are refused until some are
     /// collected.
@@ -96,7 +102,7 @@ pub mod defaults {
     /// The same for an input that runs no handler: an acknowledgement, a
     /// reply, a message that failed in refine.
     pub const INPUT_RESERVE: u64 = 50_000;
-    /// The same for a sweep: scanning the expiry index for its due rows.
+    /// The same for a sweep: reading the rows of the due index it lists.
     pub const SWEEP_RESERVE: u64 = 1_000_000;
     /// The same for an install: reading, validating and encoding a schema
     /// of `schema::MAX_LEN` bytes from its program's machine, about 6.3M.
@@ -130,15 +136,24 @@ pub mod defaults {
     /// any input that runs a handler, whatever runs before it: a sweep and
     /// the rest of the batch's plain inputs, then the input's own reserve,
     /// its record at the most an install writes, and the most a handler may
-    /// request, or an install; and the finish. A node refines with no less,
-    /// so every batch makes progress.
+    /// request; or an install; or a workflow's step, restoring the most
+    /// pages a snapshot holds, its record at its largest; and the finish. A
+    /// node refines with no less, so every batch makes progress, and every
+    /// workflow's step can run.
     pub const fn min_refine_gas(max_inputs: usize) -> u64 {
-        let handler = STEP_RESERVE + RECORD_BYTE * crate::abi::cap::STEP_WRITES as u64;
-        let first = if handler > INSTALL_RESERVE {
-            handler
-        } else {
-            INSTALL_RESERVE
-        };
+        use crate::abi::cap;
+        let handler = STEP_RESERVE + RECORD_BYTE * cap::STEP_WRITES as u64;
+        let workflow = WORKFLOW_RESERVE
+            + ARM_PAGE * cap::WORKFLOW_PAGES as u64
+            + RESTORED_PAGE * cap::HELD_PAGES as u64
+            + RECORD_BYTE * cap::WORKFLOW_ROWS as u64;
+        let mut first = INSTALL_RESERVE;
+        if handler > first {
+            first = handler;
+        }
+        if workflow > first {
+            first = workflow;
+        }
         SWEEP_RESERVE
             + INPUT_RESERVE * max_inputs.saturating_sub(1) as u64
             + first
@@ -161,4 +176,38 @@ pub mod defaults {
     /// step's accumulate work, far inside its gas; the node acks again for
     /// the rest.
     pub const ACK_LIMIT: u64 = 1024;
+
+    /// An await's deadline when its call sets none: after the batch time
+    /// of the step that awaits, in milliseconds.
+    pub const AWAIT_MS: u64 = 60 * 1000;
+    /// The most workflows an agent holds that have not ended: a start past
+    /// it fails. An ended one, kept for its result until collected, is not
+    /// among them.
+    pub const MAX_WORKFLOWS: u64 = 1 << 16;
+    /// How long an ended workflow's result is kept for its owner to read,
+    /// in milliseconds of batch time: as long as an idle session lives.
+    pub const WORKFLOW_KEPT_MS: u64 = SESSION_EXPIRY_MS;
+    // A node's default batch restores any workflow's snapshot.
+    const _: () = assert!(min_refine_gas(256) <= REFINE_GAS);
+
+    /// The agent's own work on a workflow's step beyond its handler's
+    /// gas and its pages: reading its record and its program's header,
+    /// acquiring its machine at its counter, and writing its record and
+    /// rows back. Measured by the testkit's
+    /// `the_workflow_reserves_cover_the_agents_own_work`.
+    pub const WORKFLOW_RESERVE: u64 = 400_000;
+    /// The same per page its program may write, which every step arms
+    /// read-only and a pool prices a machine by.
+    pub const ARM_PAGE: u64 = 200;
+    /// The same per page a step writes, taken as it is written: the exit
+    /// and repair of its first store, then its capture, compared with its
+    /// base, hashed, in software on JAM, and compressed. About 340,000 on
+    /// a VOS node and 830,000 on JAM for a page of random bytes, which
+    /// compress the slowest; so a refine of the default budget writes
+    /// about a thousand pages, whatever its host.
+    pub const WRITTEN_PAGE: u64 = 1_100_000;
+    /// The same per page a step restores: read, decompressed, hashed, in
+    /// software on JAM, and written back. About 230,000 on a VOS node and
+    /// 710,000 on JAM for a page of random bytes.
+    pub const RESTORED_PAGE: u64 = 950_000;
 }

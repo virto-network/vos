@@ -1,0 +1,5 @@
+error[E0599]: no method named `request` found for mutable reference `&mut vos_sdk::context::Command<Shop>` in the current scope
+  --> tests/compile_fail/command_requests.rs:23:13
+   |
+23 |         ctx.request(AgentId(2), Ref::<Shop>::new(InstanceId(1)), shop::Count {})
+   |             ^^^^^^^ method not found in `&mut vos_sdk::context::Command<Shop>`

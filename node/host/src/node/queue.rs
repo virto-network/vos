@@ -5,8 +5,9 @@ use std::collections::{BTreeSet, VecDeque};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use vos_wire::batch::{Admin, Body, Input, Message, Request};
+use vos_wire::batch::{Admin, Input, Message, Request};
 use vos_wire::ids::AgentId;
+use vos_wire::keys::Due;
 
 use super::{CallError, Inner, Reply};
 use crate::lock;
@@ -41,8 +42,10 @@ pub(crate) enum Pending {
         to: AgentId,
         sequence: u64,
     },
-    /// The leader's sweep of expired sessions.
-    Sweep,
+    /// The leader's sweep of the rows of the due index due at its batch's
+    /// time, which it lists: expired sessions, and workflows' steps. Empty,
+    /// an idle leader's mark that a sweep may be due.
+    Sweep(Vec<(u64, Due)>),
 }
 
 impl Pending {
@@ -54,16 +57,13 @@ impl Pending {
             Pending::Failed(message) => Input::Failed {
                 from: message.from,
                 sequence: message.sequence,
-                awaiting: match message.body {
-                    Body::Call { awaiting, .. } => awaiting,
-                    Body::Reply { .. } => None,
-                },
+                awaiting: message.body.awaiting(),
             },
             Pending::Ack { to, sequence } => Input::Ack {
                 to: *to,
                 sequence: *sequence,
             },
-            Pending::Sweep => Input::Sweep,
+            Pending::Sweep(due) => Input::Sweep { due: due.clone() },
         }
     }
 
@@ -72,7 +72,10 @@ impl Pending {
             Pending::Request { request, .. } => request.arguments.len(),
             Pending::Message(message) => message.body.payload_len(),
             // Its batch carries no body.
-            Pending::Failed(_) | Pending::Admin { .. } | Pending::Ack { .. } | Pending::Sweep => 0,
+            Pending::Failed(_)
+            | Pending::Admin { .. }
+            | Pending::Ack { .. }
+            | Pending::Sweep(_) => 0,
         }
     }
 

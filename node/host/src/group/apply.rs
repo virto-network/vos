@@ -129,8 +129,7 @@ async fn apply_one(inner: &Arc<Inner>, shared: &Shared, index: u64) -> Result<()
         }
         EntryKind::NoOp | EntryKind::Configuration => Vec::new(),
     };
-    let prefix = keys::installed_prefix();
-    if writes.iter().any(|write| write.key.starts_with(&prefix)) {
+    if repins(&snapshot, agent, &writes).map_err(infrastructure)? {
         rest.extend(pins(&snapshot, agent, &writes).map_err(infrastructure)?);
     }
     let mut changes = vec![Change::Apply {
@@ -219,28 +218,80 @@ async fn accumulate(
     }
 }
 
+/// The prefixes of the rows that pin an agent's programs: its installed
+/// instances', and its workflows' counts.
+fn pin_prefixes() -> [Vec<u8>; 2] {
+    [keys::installed_prefix(), keys::workflow_pins_prefix()]
+}
+
+/// Whether a row of the agent's pins a program.
+fn pins_row(key: &[u8]) -> bool {
+    pin_prefixes().iter().any(|prefix| key.starts_with(prefix))
+}
+
+/// Whether `writes` may change the programs `agent` pins: an install's
+/// row written, or a workflows' pins row that appears or goes. A count
+/// that only moves, as most workflows' starts and ends move it, changes
+/// nothing.
+fn repins(
+    snapshot: &Snapshot,
+    agent: AgentId,
+    writes: &[StateWrite],
+) -> Result<bool, fjall::Error> {
+    let installed = keys::installed_prefix();
+    for write in writes {
+        if write.key.starts_with(&installed) {
+            return Ok(true);
+        }
+        if keys::workflow_pins_entry(&write.key).is_some()
+            && snapshot.get(agent, &write.key)?.is_some() != write.value.is_some()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Rows of state, each a key and its value.
+type Rows = Vec<(Vec<u8>, Vec<u8>)>;
+
+/// The rows of `agent`'s state at `snapshot` that pin its programs.
+fn pin_rows(snapshot: &Snapshot, agent: AgentId) -> Result<Rows, fjall::Error> {
+    let mut rows = Vec::new();
+    for prefix in pin_prefixes() {
+        for row in snapshot.scan(agent, &prefix, None) {
+            rows.push(row?);
+        }
+    }
+    Ok(rows)
+}
+
+/// The programs `agent`'s state at `snapshot` pins.
+pub(crate) fn pinned(
+    snapshot: &Snapshot,
+    agent: AgentId,
+) -> Result<BTreeSet<[u8; 32]>, fjall::Error> {
+    let rows = pin_rows(snapshot, agent)?;
+    Ok(programs(rows.iter().map(|(key, value)| (key, value))))
+}
+
 /// The pins an apply's `writes` change: every program the agent's
-/// installed instances name is pinned, and one no instance names any more
-/// is not.
+/// installed instances name, or a workflow that has not ended runs, is
+/// pinned, and one neither names any more is not.
 fn pins(
     snapshot: &Snapshot,
     agent: AgentId,
     writes: &[StateWrite],
 ) -> Result<Vec<Change>, fjall::Error> {
-    let prefix = keys::installed_prefix();
-    let mut rows: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
-    for row in snapshot.scan(agent, &prefix, None) {
-        let (key, value) = row?;
-        rows.insert(key, value);
-    }
-    let before = programs(rows.values());
-    for write in writes.iter().filter(|write| write.key.starts_with(&prefix)) {
+    let mut rows: HashMap<Vec<u8>, Vec<u8>> = pin_rows(snapshot, agent)?.into_iter().collect();
+    let before = programs(rows.iter());
+    for write in writes.iter().filter(|write| pins_row(&write.key)) {
         match &write.value {
             Some(value) => rows.insert(write.key.clone(), value.clone()),
             None => rows.remove(&write.key),
         };
     }
-    let after = programs(rows.values());
+    let after = programs(rows.iter());
     let pinned = after
         .difference(&before)
         .map(|hash| Change::Pin { hash: *hash, agent });
@@ -250,11 +301,21 @@ fn pins(
     Ok(pinned.chain(unpinned).collect())
 }
 
-/// The programs installed rows name: each instance's, and those beside it,
-/// its attestables' and workflows'.
-pub(crate) fn programs<'a>(rows: impl Iterator<Item = &'a Vec<u8>>) -> BTreeSet<[u8; 32]> {
+/// The programs pinning rows pin: each installed instance's, and those
+/// beside it, its attestables' and workflows'; and each program a
+/// workflow that has not ended runs. Other rows pin nothing.
+pub(crate) fn programs<'a>(
+    rows: impl Iterator<Item = (&'a Vec<u8>, &'a Vec<u8>)>,
+) -> BTreeSet<[u8; 32]> {
     let mut programs = BTreeSet::new();
-    for value in rows {
+    for (key, value) in rows {
+        if let Some(program) = keys::workflow_pins_entry(key) {
+            programs.insert(program.0);
+            continue;
+        }
+        if !key.starts_with(&keys::installed_prefix()) {
+            continue;
+        }
         let Some((installed, _)) = unstored(value).and_then(|bytes| Installed::decode(bytes).ok())
         else {
             continue;

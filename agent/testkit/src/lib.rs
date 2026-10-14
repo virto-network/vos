@@ -10,6 +10,7 @@
 //! benches.
 
 pub mod programs;
+mod workflows;
 
 use std::collections::BTreeMap;
 
@@ -19,10 +20,10 @@ use vos_pvm::ExitReason;
 use vos_pvm::refine::Machine;
 use vos_wire::abi::{self, Failure, Kind, Rows, cap, code, op, price};
 use vos_wire::batch::{Await, Body};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash};
+use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, WorkflowId};
 use vos_wire::keys;
-use vos_wire::records::{unversioned, versioned};
-use vos_wire::result::{Attest, CommittedWrite, InstanceGas, Outcome, Outgoing, Write};
+use vos_wire::records::{WorkflowState, unversioned, versioned};
+use vos_wire::result::{Attest, CommittedWrite, InstanceGas, Outcome, Outgoing, Page, Write};
 use vos_wire::schema::{Schema, SchemaError};
 use vos_wire::{Decode, Encode};
 
@@ -74,7 +75,7 @@ fn has_own_program(kind: Kind) -> bool {
 }
 
 /// What one step produced: as a work result's step, applied to the
-/// testkit's state when it succeeded.
+/// testkit's state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Step {
     pub outcome: Outcome,
@@ -83,7 +84,25 @@ pub struct Step {
     pub committed: Vec<CommittedWrite>,
     pub messages: Vec<Outgoing>,
     pub attests: Vec<Attest>,
+    /// The pages of a workflow's snapshot it stores or drops.
+    pub pages: Vec<Page>,
     pub gas_used: u64,
+}
+
+impl Step {
+    /// A step that ran nothing: `outcome`, and no effects.
+    fn consumed(outcome: Outcome) -> Self {
+        Self {
+            outcome,
+            instances: Vec::new(),
+            writes: Vec::new(),
+            committed: Vec::new(),
+            messages: Vec::new(),
+            attests: Vec::new(),
+            pages: Vec::new(),
+            gas_used: 0,
+        }
+    }
 }
 
 pub struct Testkit {
@@ -98,9 +117,17 @@ pub struct Testkit {
     /// any handler may request.
     pub default_gas: u64,
     pub max_gas: u64,
+    /// The batch's budget: a workflow's step that could never run in a
+    /// batch of it fails.
+    pub budget: u64,
     instances: BTreeMap<InstanceId, Installed>,
     members: BTreeMap<Principal, u8>,
     state: BTreeMap<Vec<u8>, Vec<u8>>,
+    /// Every program installed, by hash, which a workflow keeps running
+    /// whatever an upgrade does.
+    programs: BTreeMap<ProgramHash, Vec<u8>>,
+    /// The bytes of each page a workflow's snapshot stores.
+    pages: BTreeMap<(WorkflowId, u32), Vec<u8>>,
     steps: u32,
 }
 
@@ -113,9 +140,12 @@ impl Testkit {
             version: 0,
             default_gas: vos_wire::defaults::HANDLER_GAS,
             max_gas: vos_wire::defaults::MAX_HANDLER_GAS,
+            budget: u64::MAX,
             instances: BTreeMap::new(),
             members: BTreeMap::new(),
             state: BTreeMap::new(),
+            programs: BTreeMap::new(),
+            pages: BTreeMap::new(),
             steps: 0,
         }
     }
@@ -166,6 +196,11 @@ impl Testkit {
                 return Err(InstallError::UnmappedRole(role.clone()));
             }
         }
+        for program in core::iter::once(&installed.program)
+            .chain(installed.beside.iter().map(|(_, _, program)| program))
+        {
+            self.programs.insert(program_hash(program), program.clone());
+        }
         self.instances.insert(instance, installed);
         Ok(())
     }
@@ -177,6 +212,22 @@ impl Testkit {
         self.seed = seed;
         self.steps = 0;
         self.version += 1;
+    }
+
+    /// A step the model does not run, a sweep's or a refusal: it takes its
+    /// index in the batch all the same.
+    pub fn pass(&mut self) {
+        self.steps += 1;
+    }
+
+    /// Set a row of the agent's state, as a test plants it in a node's.
+    pub fn set_row(&mut self, key: Vec<u8>, value: Vec<u8>) {
+        self.state.insert(key, value);
+    }
+
+    /// The bytes of a page workflow `id`'s snapshot stores.
+    pub fn page(&self, id: WorkflowId, index: u32) -> Option<&[u8]> {
+        self.pages.get(&(id, index)).map(Vec::as_slice)
     }
 
     pub fn set_role(&mut self, principal: Principal, role: Option<u8>) {
@@ -211,8 +262,8 @@ impl Testkit {
         self.state.get(key).map(Vec::as_slice)
     }
 
-    /// Run a step: a handler through the log. Its writes apply when it
-    /// succeeds.
+    /// Run a step: a handler through the log, its writes applied when it
+    /// succeeds, or a workflow's start.
     pub fn command(
         &mut self,
         caller: Principal,
@@ -220,6 +271,9 @@ impl Testkit {
         method: MethodId,
         arguments: &[u8],
     ) -> Step {
+        if self.is_workflow(instance, method) {
+            return self.start(caller, instance, method, arguments);
+        }
         let step = self.steps;
         self.steps += 1;
         let mut run = Run::new(self, step, Kind::Command);
@@ -233,67 +287,61 @@ impl Testkit {
                 detail: Vec::new(),
             },
         };
-        if let Outcome::Done(_) = outcome {
-            let overlay = run.frames.pop().expect("the step overlay");
-            let messages = std::mem::take(&mut run.messages);
-            let attests = std::mem::take(&mut run.attests);
-            let mut writes = Vec::new();
-            let mut committed = Vec::new();
-            for (key, value) in overlay {
-                match keys::committed_entry(&key) {
-                    Some((map, transformed)) => committed.push(CommittedWrite {
-                        map,
-                        key: transformed.to_vec(),
-                        value,
-                    }),
-                    None => writes.push(Write { key, value }),
+        let mut step = Step::consumed(outcome);
+        step.instances = instances;
+        step.gas_used = gas_used;
+        if let Outcome::Done(_) = step.outcome {
+            step.messages = std::mem::take(&mut run.messages);
+            step.attests = std::mem::take(&mut run.attests);
+            (step.writes, step.committed) = split(run.frames.pop().expect("the step overlay"));
+            self.apply(&step, Vec::new());
+        }
+        step
+    }
+
+    /// Apply a step's effects to the state: its writes, its committed
+    /// writes at the batch's version, and the pages it stores, `stored`'s
+    /// bytes in order, or drops.
+    fn apply(&mut self, step: &Step, stored: Vec<Vec<u8>>) {
+        for write in &step.writes {
+            match &write.value {
+                Some(value) => self.state.insert(write.key.clone(), value.clone()),
+                None => self.state.remove(&write.key),
+            };
+        }
+        for write in &step.committed {
+            let row = keys::committed(&write.map, &write.key);
+            match &write.value {
+                Some(value) => self.state.insert(row, versioned(self.version, value)),
+                None => self.state.remove(&row),
+            };
+            let dirty = keys::dirty(self.version, &write.map, &write.key);
+            self.state.insert(dirty, Vec::new());
+        }
+        if !step.committed.is_empty() {
+            self.state
+                .insert(keys::seed(self.version), self.seed.to_vec());
+        }
+        let mut stored = stored.into_iter();
+        for page in &step.pages {
+            let key = (page.workflow, page.index);
+            match page.hash {
+                Some(_) => {
+                    let bytes = stored.next().expect("a stored page's bytes");
+                    self.pages.insert(key, bytes);
                 }
-            }
-            for write in &writes {
-                match &write.value {
-                    Some(value) => self.state.insert(write.key.clone(), value.clone()),
-                    None => self.state.remove(&write.key),
-                };
-            }
-            for write in &committed {
-                let row = keys::committed(&write.map, &write.key);
-                match &write.value {
-                    Some(value) => self.state.insert(row, versioned(self.version, value)),
-                    None => self.state.remove(&row),
-                };
-                let dirty = keys::dirty(self.version, &write.map, &write.key);
-                self.state.insert(dirty, Vec::new());
-            }
-            if !committed.is_empty() {
-                self.state
-                    .insert(keys::seed(self.version), self.seed.to_vec());
-            }
-            Step {
-                outcome,
-                instances,
-                writes,
-                committed,
-                messages,
-                attests,
-                gas_used,
-            }
-        } else {
-            Step {
-                outcome,
-                instances,
-                writes: Vec::new(),
-                committed: Vec::new(),
-                messages: Vec::new(),
-                attests: Vec::new(),
-                gas_used,
+                None => {
+                    self.pages.remove(&key);
+                }
             }
         }
     }
 
     /// Run a message from agent `from` as a step: a call runs as a command
-    /// of that agent's, and one that awaits adds its reply to the step's
-    /// messages, whatever its outcome; a reply is consumed, with no await
-    /// to resume.
+    /// of that agent's, or starts a workflow, and one that awaits adds its
+    /// reply to the step's messages, whatever its outcome; a reply resumes
+    /// the workflow awaiting it, or is consumed and dropped; a wait for a
+    /// workflow's result is answered, or held until it ends.
     pub fn message(&mut self, from: AgentId, body: &Body) -> Step {
         match body {
             Body::Call {
@@ -308,7 +356,11 @@ impl Testkit {
                 }
                 step
             }
-            Body::Reply { .. } => self.consumed(Outcome::Done(Vec::new()), None),
+            Body::Reply { awaiting, answer } => match self.resume(from, awaiting, answer) {
+                Some(step) => step,
+                None => self.consumed(Outcome::Done(Vec::new()), None),
+            },
+            Body::Wait { workflow, awaiting } => self.wait(from, *workflow, *awaiting),
         }
     }
 
@@ -332,13 +384,8 @@ impl Testkit {
             .into_iter()
             .collect();
         Step {
-            outcome,
-            instances: Vec::new(),
-            writes: Vec::new(),
-            committed: Vec::new(),
             messages,
-            attests: Vec::new(),
-            gas_used: 0,
+            ..Step::consumed(outcome)
         }
     }
 
@@ -361,6 +408,24 @@ impl Testkit {
     }
 }
 
+/// A step's writes, those to committed maps apart, by map and transformed
+/// key.
+fn split(overlay: BTreeMap<Vec<u8>, Option<Vec<u8>>>) -> (Vec<Write>, Vec<CommittedWrite>) {
+    let mut writes = Vec::new();
+    let mut committed = Vec::new();
+    for (key, value) in overlay {
+        match keys::committed_entry(&key) {
+            Some((map, transformed)) => committed.push(CommittedWrite {
+                map,
+                key: transformed.to_vec(),
+                value,
+            }),
+            None => writes.push(Write { key, value }),
+        }
+    }
+    (writes, committed)
+}
+
 /// The reply to agent `to`'s request awaiting at `awaiting`: the step's
 /// outcome.
 fn reply(to: AgentId, awaiting: Await, outcome: &Outcome) -> Outgoing {
@@ -380,6 +445,8 @@ enum Ended {
     Failed(Vec<u8>),
     /// The caller lacks the handler's role; it did not run.
     Forbidden,
+    /// A workflow paused, in this state.
+    Paused(WorkflowState),
 }
 
 /// One step's execution: the overlays, the call stack and the effects.
@@ -388,6 +455,8 @@ struct Run<'a> {
     step: u32,
     /// The entry's kind: queries never write.
     kind: Kind,
+    /// A workflow's step: the workflow and its next await's counter.
+    awaits: Option<Await>,
     /// The step overlay, then one per nested call.
     frames: Vec<BTreeMap<Vec<u8>, Option<Vec<u8>>>>,
     stack: Vec<InstanceId>,
@@ -409,6 +478,7 @@ impl<'a> Run<'a> {
             kit,
             step,
             kind,
+            awaits: None,
             frames: vec![BTreeMap::new()],
             stack: Vec::new(),
             nested: Vec::new(),
@@ -460,6 +530,7 @@ impl<'a> Run<'a> {
                 code: Failure::Forbidden,
                 detail: Vec::new(),
             },
+            Ended::Paused(_) => unreachable!("only a workflow pauses"),
         })
     }
 
@@ -491,7 +562,9 @@ impl<'a> Run<'a> {
         if self.stack.contains(&instance) {
             return Err((Failure::Cycle, 0));
         }
-        if self.stack.len() >= MAX_DEPTH {
+        // A workflow's own machine is on no stack, but counts as one.
+        let depth = self.stack.len() + usize::from(self.kind == Kind::Workflow);
+        if depth >= MAX_DEPTH {
             return Err((Failure::Depth, 0));
         }
         let kind = schema.kind;
@@ -536,6 +609,9 @@ impl<'a> Run<'a> {
     ) -> Result<Ended, Failure> {
         let mut outcome: Option<Ended> = None;
         loop {
+            if let Some(Ended::Paused(_)) = outcome {
+                return Ok(outcome.take().expect("paused"));
+            }
             match machine.try_resume().map_err(|_| Failure::Trapped)? {
                 ExitReason::Halt => {
                     return Ok(outcome.unwrap_or(Ended::Replied(Vec::new())));
@@ -720,6 +796,7 @@ impl<'a> Run<'a> {
                     }
                     Ended::Failed(detail) => (detail, Some(Failure::Handler)),
                     Ended::Forbidden => (Vec::new(), Some(Failure::Forbidden)),
+                    Ended::Paused(_) => unreachable!("only a workflow pauses"),
                 };
                 if failed.is_some() {
                     let (messages, attests, written) = effects;
@@ -773,9 +850,63 @@ impl<'a> Run<'a> {
                 machine.registers_mut()[7] = output.len() as u64;
                 machine.registers_mut()[8] = 0;
             }
+            op::REQUEST | op::RESULT | op::SLEEP => {
+                if outcome.is_some() {
+                    return Err(Failure::Trapped);
+                }
+                let state = match id {
+                    op::SLEEP => WorkflowState::Sleeping {
+                        until: r[7].max(self.kit.time + 1),
+                    },
+                    _ => self.request(machine, id, &r)?,
+                };
+                *outcome = Some(Ended::Paused(state));
+            }
             _ => unreachable!("served operations are known"),
         }
         Ok(())
+    }
+
+    /// A workflow's request of another agent, or its wait for a result
+    /// there: the message it sends, and the await, until its deadline.
+    fn request(
+        &mut self,
+        machine: &mut Machine,
+        id: u64,
+        r: &[u64; 13],
+    ) -> Result<WorkflowState, Failure> {
+        let awaiting = self.awaits.expect("only a workflow awaits");
+        let agent = AgentId(r[7] as u32);
+        if agent == self.kit.agent {
+            return Err(Failure::Trapped);
+        }
+        let (body, within) = if id == op::REQUEST {
+            let arguments = read(machine, r[10], r[11], cap::MESSAGE)?;
+            let body = Body::Call {
+                instance: InstanceId(r[8] as u32),
+                method: MethodId(r[9] as u32),
+                arguments,
+                awaiting: Some(awaiting),
+            };
+            (body, r[12])
+        } else {
+            let workflow = WorkflowId(r[8]);
+            (Body::Wait { workflow, awaiting }, r[9])
+        };
+        if self.messages.len() == cap::MESSAGES {
+            return Err(Failure::Cap);
+        }
+        self.messages.push(Outgoing { to: agent, body });
+        let within = if within == 0 {
+            vos_wire::defaults::AWAIT_MS
+        } else {
+            within
+        };
+        Ok(WorkflowState::Awaiting {
+            agent,
+            counter: awaiting.counter,
+            deadline: self.kit.time.saturating_add(within),
+        })
     }
 
     /// A value through the overlays and applied state.
@@ -904,6 +1035,9 @@ fn known(id: u64) -> bool {
             | op::SEND
             | op::ATTEST
             | op::SELF_ID
+            | op::REQUEST
+            | op::RESULT
+            | op::SLEEP
     )
 }
 

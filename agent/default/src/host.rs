@@ -19,6 +19,7 @@ pub const EXPUNGE: u64 = 14;
 pub const INSTANTIATE: u64 = 0x480;
 pub const STATE_READ: u64 = 0x481;
 pub const STATE_SCAN: u64 = 0x482;
+pub const LOST: u64 = 0x483;
 
 /// The calling service, for `read` and `historical_lookup`.
 pub const SELF_SERVICE: u64 = u64::MAX;
@@ -113,6 +114,16 @@ pub fn unserved() -> ! {
     panic!("the host serves no applied state")
 }
 
+/// Stop the refine: the agent's state lost data the agent wrote, a row
+/// gone or not what it was, which no input causes and no retry mends.
+/// `what` names it. A VOS node stops the refine at the call and halts, as
+/// for a blob its log names and its store lost; any other host answers
+/// `WHAT`, and the refine traps.
+pub fn lost(what: &str) -> ! {
+    ecalli!(LOST, [ptr(what.as_bytes()), what.len() as u64, 0, 0, 0, 0]);
+    panic!("the agent's state lost data")
+}
+
 /// One `state_read` of `key`: up to `capacity` bytes of its value from
 /// `offset`, copied to `out`. Returns the value's whole length, or `NONE`
 /// when absent; traps when the host serves no applied state.
@@ -157,7 +168,12 @@ pub fn historical_lookup(hash: &[u8; 32]) -> Option<Vec<u8>> {
 /// The start of a preimage of this service, read into `buffer`, with no
 /// allocation: the preimage's whole length; `None` when absent.
 pub fn historical_lookup_into(hash: &[u8; 32], buffer: &mut [u8]) -> Option<usize> {
-    let len = historical_lookup_at(hash, buffer.as_mut_ptr(), 0, buffer.len() as u64);
+    historical_lookup_from(hash, 0, buffer)
+}
+
+/// [`historical_lookup_into`] from `offset` into the preimage.
+pub fn historical_lookup_from(hash: &[u8; 32], offset: u64, buffer: &mut [u8]) -> Option<usize> {
+    let len = historical_lookup_at(hash, buffer.as_mut_ptr(), offset, buffer.len() as u64);
     (len != code::NONE && len != code::WHAT).then_some(len as usize)
 }
 

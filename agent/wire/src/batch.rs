@@ -6,6 +6,7 @@ use scale::{Decode, Encode};
 use crate::abi::{Failure, Kind};
 use crate::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, Session, WorkflowId};
 use crate::ingress::Grant;
+use crate::keys::Due;
 use crate::result::Outcome;
 
 /// A refine's work item payload: a batch through the log, or a query on
@@ -62,10 +63,13 @@ pub enum Input {
     /// `sequence`: their outbox entries can go. The node sends it.
     #[codec(index = 3)]
     Ack { to: AgentId, sequence: u64 },
-    /// Collect the sessions whose expiry rows are due at the batch's time.
-    /// The node puts it first in a batch.
+    /// Rows of the due index the leader read as due at the batch's time,
+    /// oldest first, at most [`crate::defaults::SWEEP_LIMIT`], each its
+    /// time and entry: refine collects the sessions among them and runs
+    /// each workflow's due step, and ignores a row that is not there or
+    /// not due. The node puts it first in a batch.
     #[codec(index = 4)]
-    Sweep,
+    Sweep { due: Vec<(u64, Due)> },
     /// A message the agent program failed on alone, twice, each time on
     /// fresh state: the leader asserts it failed. Refine consumes it in
     /// its pair's order without running it, and answers the request's
@@ -112,6 +116,14 @@ pub enum Body {
     /// A request's answer, for the await it names.
     #[codec(index = 1)]
     Reply { awaiting: Await, answer: Answer },
+    /// The sender awaits the result of a workflow it started here, at
+    /// `awaiting`: answered with its outcome once it ends, at once if it
+    /// has.
+    #[codec(index = 2)]
+    Wait {
+        workflow: WorkflowId,
+        awaiting: Await,
+    },
 }
 
 impl Body {
@@ -123,6 +135,16 @@ impl Body {
                 Answer::Done(bytes) | Answer::Failed { detail: bytes, .. } => bytes.len(),
                 Answer::Started(_) => 0,
             },
+            Body::Wait { .. } => 0,
+        }
+    }
+
+    /// The await a request names, which its step answers.
+    pub fn awaiting(&self) -> Option<Await> {
+        match self {
+            Body::Call { awaiting, .. } => *awaiting,
+            Body::Wait { awaiting, .. } => Some(*awaiting),
+            Body::Reply { .. } => None,
         }
     }
 }
@@ -159,6 +181,7 @@ impl From<Outcome> for Answer {
         match outcome {
             Outcome::Done(reply) => Answer::Done(reply),
             Outcome::Failed { code, detail } => Answer::Failed { code, detail },
+            Outcome::Started(workflow) => Answer::Started(workflow),
         }
     }
 }

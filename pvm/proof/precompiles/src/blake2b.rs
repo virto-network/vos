@@ -9,6 +9,9 @@
 //! N-byte digest (1..=64).  Matches the `blake2` crate's
 //! `Blake2b<UN>::default()` for any N.
 //!
+//! `blake2b_256(data)`: BLAKE2b-256 of one buffer, its full blocks
+//! compressed where they lie, with no copy: for hashing pages.
+//!
 //! Self-contained — no curve25519-dalek dep — so a guest that only
 //! needs hashing can build with `default-features = false, features
 //! = ["blake2b"]`.
@@ -172,9 +175,46 @@ pub fn blake2b_hash<const OUT_LEN: usize>(domain: &[u8], parts: &[&[u8]]) -> [u8
     out
 }
 
+/// BLAKE2b-256 of `data`, as the `blake2` crate's `Blake2b<U32>`
+/// computes it: every block but the last compressed where it lies, and the
+/// last copied, padded with zeros.
+pub fn blake2b_256(data: &[u8]) -> [u8; 32] {
+    let mut h = [0u8; 64];
+    for (word, iv) in h.chunks_exact_mut(8).zip(BLAKE2B_IV) {
+        word.copy_from_slice(&iv.to_le_bytes());
+    }
+    // The parameter block: a 32-byte digest, fanout 1, depth 1.
+    h[0] ^= 32;
+    h[2] ^= 1;
+    h[3] ^= 1;
+    // The last block holds at least one byte, unless `data` is empty.
+    let full = data.len().saturating_sub(1) / 128;
+    let (blocks, _) = data[..full * 128].as_chunks::<128>();
+    for (index, block) in blocks.iter().enumerate() {
+        blake2b_compress(&mut h, block, ((index + 1) * 128) as u128, false);
+    }
+    let mut last = [0u8; 128];
+    let rest = &data[full * 128..];
+    last[..rest.len()].copy_from_slice(rest);
+    blake2b_compress(&mut h, &last, data.len() as u128, true);
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(&h[..32]);
+    digest
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blake2b_256_of_a_buffer_matches_blake2_crate() {
+        use blake2::digest::{Digest, consts::U32};
+        for len in [0, 1, 127, 128, 129, 255, 256, 4095, 4096, 4097] {
+            let data: alloc::vec::Vec<u8> = (0..len).map(|byte| (byte * 7 + 3) as u8).collect();
+            let theirs: [u8; 32] = blake2::Blake2b::<U32>::digest(&data).into();
+            assert_eq!(blake2b_256(&data), theirs, "{len} bytes");
+        }
+    }
 
     #[test]
     fn blake2b_512_matches_blake2_crate() {

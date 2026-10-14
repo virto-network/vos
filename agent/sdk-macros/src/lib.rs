@@ -272,8 +272,8 @@ fn handler(
 ) -> syn::Result<Handler> {
     let name = method.sig.ident.to_string();
     let (role, gas) = match program {
-        Some(_) => (None, None),
-        None => msg_options(attribute)?,
+        Some(Kind::Attestable) => (None, None),
+        _ => msg_options(attribute)?,
     };
     let mut inputs = method.sig.inputs.iter();
     let kind = if let Some(kind) = program {
@@ -313,14 +313,16 @@ fn handler(
         };
         if index == 0
             && let Type::Reference(reference) = &*typed.ty
-            && (is_named(&reference.elem, "Query") || is_named(&reference.elem, "Command"))
+            && ["Query", "Command", "Workflow"]
+                .iter()
+                .any(|context| is_named(&reference.elem, context))
         {
+            let mutable = reference.mutability.is_some();
             let expected = match kind {
-                Kind::Query => is_named(&reference.elem, "Query") && reference.mutability.is_none(),
-                Kind::Command => {
-                    is_named(&reference.elem, "Command") && reference.mutability.is_some()
-                }
-                Kind::Attestable | Kind::Workflow => false,
+                Kind::Query => is_named(&reference.elem, "Query") && !mutable,
+                Kind::Command => is_named(&reference.elem, "Command") && mutable,
+                Kind::Workflow => is_named(&reference.elem, "Workflow") && mutable,
+                Kind::Attestable => false,
             };
             if !expected {
                 return Err(Error::new(
@@ -329,7 +331,7 @@ fn handler(
                         Kind::Query => "a `&self` handler takes `&Query<Self>`",
                         Kind::Command => "a `&mut self` handler takes `&mut Command<Self>`",
                         Kind::Attestable => "an #[attestable] method takes no context",
-                        Kind::Workflow => "a #[workflow] takes no context",
+                        Kind::Workflow => "a #[workflow] takes `&mut Workflow<Self>`",
                     },
                 ));
             }
@@ -375,7 +377,10 @@ fn handler(
 /// fields; `#[attestable]` and `#[workflow]` methods likewise, each run as
 /// its own program (`attestable_program!`, `workflow_program!`) from the
 /// entry generated for it, `__vos_attest_<name>` or `__vos_workflow_<name>`.
-/// A `#[workflow]` takes no `self`, and here only its arguments. The
+/// A `#[workflow]` takes no `self`: `ctx: &mut Workflow<Self>` if it uses
+/// one, then its arguments, and `#[workflow(role = "...", gas = N)]` as a
+/// handler's options, the role checked when it starts and the gas each
+/// step's. The
 /// module imports its parent's names, so argument types resolve as they do
 /// beside the impl; a message type shadows a parent type of the same name,
 /// so a handler must not be named after an argument type (a `balance`
@@ -475,19 +480,19 @@ fn messages_impl(mut input: ItemImpl, module: Option<String>) -> syn::Result<Tok
                 #(#fields,)*
             }
         });
-        if matches!(handler.kind, Kind::Attestable | Kind::Workflow) {
-            let entry = if handler.kind == Kind::Attestable {
-                types.push(quote! {
-                    impl ::vos_sdk::context::AttestableMethod for #message {
-                        type Actor = super::#actor;
-                        const ID: u32 = #id;
-                        type Output = #reply;
-                    }
-                });
-                format_ident!("__vos_attest_{}", handler.name)
-            } else {
-                format_ident!("__vos_workflow_{}", handler.name)
-            };
+        let error = handler
+            .error
+            .clone()
+            .unwrap_or_else(|| syn::parse_quote!(::vos_sdk::context::Never));
+        if handler.kind == Kind::Attestable {
+            types.push(quote! {
+                impl ::vos_sdk::context::AttestableMethod for #message {
+                    type Actor = super::#actor;
+                    const ID: u32 = #id;
+                    type Output = #reply;
+                }
+            });
+            let entry = format_ident!("__vos_attest_{}", handler.name);
             own_entries.push(quote! {
                 /// Run this method on encoded arguments; the entry of its
                 /// own program.
@@ -503,10 +508,54 @@ fn messages_impl(mut input: ItemImpl, module: Option<String>) -> syn::Result<Tok
             });
             continue;
         }
-        let error = handler
-            .error
-            .clone()
-            .unwrap_or_else(|| syn::parse_quote!(::vos_sdk::context::Never));
+        if handler.kind == Kind::Workflow {
+            types.push(quote! {
+                impl ::vos_sdk::context::WorkflowMethod for #message {
+                    type Actor = super::#actor;
+                    const ID: u32 = #id;
+                    type Output = #reply;
+                    type Error = #error;
+                }
+            });
+            let entry = format_ident!("__vos_workflow_{}", handler.name);
+            let (context, argument) = match handler.has_context {
+                true => (
+                    quote!(let mut context = ::vos_sdk::context::Workflow::<Self>::new();),
+                    quote!(&mut context,),
+                ),
+                false => (quote!(), quote!()),
+            };
+            let call = quote!(Self::#method(#argument #(#names),*));
+            let call = if handler.method.sig.asyncness.is_some() {
+                quote!(::vos_sdk::runtime::block_on(#call))
+            } else {
+                call
+            };
+            let outcome = if handler.error.is_some() {
+                call
+            } else {
+                quote!(::core::result::Result::<_, ::vos_sdk::context::Never>::Ok(#call))
+            };
+            own_entries.push(quote! {
+                /// Run this workflow from its arguments to its result; the
+                /// entry of its own program.
+                #[doc(hidden)]
+                pub fn #entry() {
+                    let #module::#message { #(#names),* } =
+                        ::vos_sdk::runtime::arguments::<#module::#message>();
+                    #context
+                    match #outcome {
+                        ::core::result::Result::Ok(result) => {
+                            ::vos_sdk::host::reply(&::vos_sdk::Encode::encode(&result));
+                        }
+                        ::core::result::Result::Err(error) => {
+                            ::vos_sdk::host::fail(&::vos_sdk::Encode::encode(&error));
+                        }
+                    }
+                }
+            });
+            continue;
+        }
         types.push(quote! {
             impl ::vos_sdk::context::Method for #message {
                 type Actor = super::#actor;

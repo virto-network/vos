@@ -56,7 +56,7 @@ pub use ecalls::{
 #[cfg(feature = "blake2b")]
 pub mod blake2b;
 #[cfg(feature = "blake2b")]
-pub use blake2b::{blake2b_compress, blake2b_hash};
+pub use blake2b::{blake2b_256, blake2b_compress, blake2b_hash};
 
 #[cfg(feature = "ristretto")]
 pub mod scalar;

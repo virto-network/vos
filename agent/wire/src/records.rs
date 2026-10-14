@@ -3,7 +3,9 @@
 use alloc::vec::Vec;
 
 use crate::abi::Kind;
-use crate::ids::{MethodId, ProgramHash};
+use crate::batch::Await;
+use crate::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash};
+use crate::result::Outcome;
 use crate::schema::Schema;
 use crate::{Decode, Encode};
 
@@ -43,6 +45,78 @@ impl Installed {
     pub fn programs(&self) -> impl Iterator<Item = ProgramHash> + '_ {
         core::iter::once(self.program).chain(self.beside.iter().map(|(_, _, program)| *program))
     }
+}
+
+/// A workflow, under [`crate::keys::workflow`], from its start until it is
+/// collected, some time after it ends.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct Workflow {
+    /// The record's format, [`Workflow::FORMAT`]: a record of another the
+    /// agent refuses to read.
+    pub format: u8,
+    /// The program it runs, which it pins until it ends, whatever an
+    /// upgrade does meanwhile.
+    pub program: ProgramHash,
+    /// The instance whose method it is: its calls' caller.
+    pub instance: InstanceId,
+    /// Who started it, a client's key or an agent: who reads its result.
+    pub owner: Principal,
+    /// Each step's gas limit.
+    pub gas: u64,
+    /// The pages its program may write, which each step arms.
+    pub writable: u32,
+    /// The awaits it has made: the next one's counter.
+    pub awaits: u64,
+    /// The batch time of its row in the due index: its next step's, or its
+    /// collection's once it has ended.
+    pub due: u64,
+    /// The owner's await of its result, when the owner is an agent that
+    /// waits for it.
+    pub waiter: Option<Await>,
+    pub state: WorkflowState,
+    /// Its machine as its last step left it; none before its first.
+    pub snapshot: Option<Snapshot>,
+}
+
+impl Workflow {
+    /// The record's format.
+    pub const FORMAT: u8 = 1;
+}
+
+/// Where a workflow stands between its steps.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum WorkflowState {
+    /// Due at once: started, its arguments the input of its first step.
+    #[codec(index = 0)]
+    Ready(Vec<u8>),
+    /// Awaiting `agent`'s answer to await `counter` until `deadline`.
+    #[codec(index = 1)]
+    Awaiting {
+        agent: AgentId,
+        counter: u64,
+        deadline: u64,
+    },
+    /// Asleep until a batch at or past `until`.
+    #[codec(index = 2)]
+    Sleeping { until: u64 },
+    /// Ended: its result, or why it failed. Its row in the due index
+    /// collects it.
+    #[codec(index = 3)]
+    Ended(Outcome),
+}
+
+/// A workflow's machine between steps, restored with Gray Paper calls
+/// alone: its program counter, its registers, the gas its next step starts
+/// with, and each page that differs from its base, the program's image or
+/// zeros, by its index and the hash of its bytes, which a row holds. The
+/// gas is the step's limit until preemption leaves a step part of it.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct Snapshot {
+    pub counter: u32,
+    /// φ0 to φ12.
+    pub registers: Vec<u64>,
+    pub gas: u64,
+    pub pages: Vec<(u32, [u8; 32])>,
 }
 
 /// A session's mark, under [`crate::keys::session`]: the last sequence

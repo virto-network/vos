@@ -1,10 +1,15 @@
-//! Handler contexts. A query's context reaches only operations that
-//! read; a command's adds the ones that write.
+//! Handler and workflow contexts. A query's context reaches only
+//! operations that read; a command's adds the ones that write; a
+//! workflow's reaches state only through calls, and adds the awaits that
+//! pause it.
 
+use core::future::{IntoFuture, Ready, ready};
 use core::marker::PhantomData;
+use core::time::Duration;
 
 use vos_wire::abi::Failure;
-use vos_wire::ids::{AgentId, InstanceId, Principal};
+use vos_wire::batch::Answer;
+use vos_wire::ids::{AgentId, InstanceId, Principal, WorkflowId};
 use vos_wire::{Decode, DecodeError, Encode};
 
 use crate::host;
@@ -26,6 +31,15 @@ pub trait AttestableMethod: Encode {
     type Actor;
     const ID: u32;
     type Output: Decode;
+}
+
+/// A `#[workflow]` method, run as its own program: a request naming it
+/// starts one, answered with its id, and its result is read by that id.
+pub trait WorkflowMethod: Encode {
+    type Actor;
+    const ID: u32;
+    type Output: Decode;
+    type Error: Decode;
 }
 
 /// The error type of a handler that cannot fail.
@@ -203,5 +217,260 @@ impl<A> Command<A> {
             Ok(output) => decode(&output).ok_or(CallError::Undecodable),
             Err(_) => Err(CallError::Undecodable),
         }
+    }
+}
+
+/// Why an await of another agent returned an error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RequestError<E> {
+    /// The callee's own error.
+    Failed(E),
+    /// The deadline passed before the answer came.
+    TimedOut,
+    /// The callee failed otherwise, or never ran: no such method or
+    /// workflow, a role missing, a trap; the code says which.
+    Refused(Failure),
+    /// The answer did not decode as the method's types.
+    Undecodable,
+}
+
+/// An answer, its failures as the awaited method's error.
+fn awaited<E: Decode>(answer: &[u8]) -> Result<Answer, RequestError<E>> {
+    let answer: Answer = decode(answer).ok_or(RequestError::Undecodable)?;
+    match answer {
+        Answer::Failed {
+            code: Failure::Handler,
+            detail,
+        } => Err(decode(&detail).map_or(RequestError::Undecodable, RequestError::Failed)),
+        Answer::Failed {
+            code: Failure::TimedOut,
+            ..
+        } => Err(RequestError::TimedOut),
+        Answer::Failed { code, .. } => Err(RequestError::Refused(code)),
+        answer => Ok(answer),
+    }
+}
+
+/// An answer that is a reply, decoded.
+fn replied<T: Decode, E: Decode>(answer: &[u8]) -> Result<T, RequestError<E>> {
+    match awaited::<E>(answer)? {
+        Answer::Done(reply) => decode(&reply).ok_or(RequestError::Undecodable),
+        _ => Err(RequestError::Undecodable),
+    }
+}
+
+/// A deadline as the ABI takes it: milliseconds, at least one and at most
+/// `u64::MAX`; 0 for the agent's default.
+fn millis(within: Option<Duration>) -> u64 {
+    within.map_or(0, |within| {
+        u64::try_from(within.as_millis()).map_or(u64::MAX, |millis| millis.max(1))
+    })
+}
+
+/// The context of a `#[workflow]`: no state of its own, calls to this
+/// agent's instances, messages, and the awaits of other agents and timers
+/// at which it pauses. Every `.await` may pause: the code between two of
+/// them runs atomically, its effects committing with the snapshot taken at
+/// the next pause.
+pub struct Workflow<A> {
+    _actor: PhantomData<fn() -> A>,
+}
+
+impl<A> Workflow<A> {
+    #[doc(hidden)]
+    pub const fn new() -> Self {
+        Self {
+            _actor: PhantomData,
+        }
+    }
+
+    /// This agent, and the instance whose workflow this is.
+    pub fn me(&self) -> (AgentId, InstanceId) {
+        let (instance, agent) = host::self_id();
+        (AgentId(agent), InstanceId(instance))
+    }
+
+    /// The time of the batch running this step, in milliseconds since the
+    /// Unix epoch.
+    pub fn now(&self) -> u64 {
+        host::now()
+    }
+
+    /// 32 bytes derived from the batch seed: the same on every replica.
+    pub fn random(&self) -> [u8; 32] {
+        host::random()
+    }
+
+    pub fn log(&self, level: Level, message: &str) {
+        host::log(level as u8, message.as_bytes());
+    }
+
+    /// Call any handler of an instance of this agent, as the workflow's
+    /// instance. The callee runs nested and completes before this returns.
+    pub async fn call<M: Method>(
+        &mut self,
+        to: Ref<M::Actor>,
+        message: M,
+    ) -> Result<M::Reply, CallError<M::Error>> {
+        outcome(host::call(to.instance.0, M::ID, &message.encode()))
+    }
+
+    /// Send a message to an instance of any agent, delivered after this
+    /// step commits.
+    pub fn send<M: Method>(&mut self, agent: AgentId, to: Ref<M::Actor>, message: M) {
+        host::send(agent.0, to.instance.0, M::ID, &message.encode());
+    }
+
+    /// Ask a handler of another agent's instance, and await its reply:
+    /// the step ends here, and the workflow resumes once the reply comes,
+    /// or the deadline passes ([`Request::within`]).
+    pub fn request<M: Method>(
+        &mut self,
+        agent: AgentId,
+        to: Ref<M::Actor>,
+        message: M,
+    ) -> Request<M> {
+        Request {
+            agent,
+            instance: to.instance,
+            message,
+            within: None,
+        }
+    }
+
+    /// Start a workflow of another agent's instance, and await its id,
+    /// which [`Workflow::result`] then awaits the result by.
+    pub fn start<M: WorkflowMethod>(
+        &mut self,
+        agent: AgentId,
+        to: Ref<M::Actor>,
+        arguments: M,
+    ) -> Start<M> {
+        Start {
+            agent,
+            instance: to.instance,
+            arguments,
+            within: None,
+        }
+    }
+
+    /// Await the result of a workflow this one started at `agent`.
+    pub fn result<M: WorkflowMethod>(
+        &mut self,
+        agent: AgentId,
+        workflow: WorkflowId,
+    ) -> Pending<M> {
+        Pending {
+            agent,
+            workflow,
+            within: None,
+            _method: PhantomData,
+        }
+    }
+
+    /// Pause until a batch at or past `time`, in milliseconds since the
+    /// Unix epoch.
+    pub async fn sleep_until(&mut self, time: u64) {
+        host::sleep(time);
+    }
+}
+
+/// A request of another agent, awaited.
+#[must_use = "a request is sent when awaited"]
+pub struct Request<M> {
+    agent: AgentId,
+    instance: InstanceId,
+    message: M,
+    within: Option<Duration>,
+}
+
+impl<M> Request<M> {
+    /// The deadline, after this step's batch time; the agent's default
+    /// otherwise.
+    pub fn within(mut self, deadline: Duration) -> Self {
+        self.within = Some(deadline);
+        self
+    }
+}
+
+impl<M: Method> IntoFuture for Request<M> {
+    type Output = Result<M::Reply, RequestError<M::Error>>;
+    type IntoFuture = Ready<Self::Output>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        let answer = host::request(
+            self.agent.0,
+            self.instance.0,
+            M::ID,
+            &self.message.encode(),
+            millis(self.within),
+        );
+        ready(replied::<M::Reply, M::Error>(&answer))
+    }
+}
+
+/// A start of another agent's workflow, awaited for its id.
+#[must_use = "a start is sent when awaited"]
+pub struct Start<M> {
+    agent: AgentId,
+    instance: InstanceId,
+    arguments: M,
+    within: Option<Duration>,
+}
+
+impl<M> Start<M> {
+    /// The deadline, after this step's batch time; the agent's default
+    /// otherwise.
+    pub fn within(mut self, deadline: Duration) -> Self {
+        self.within = Some(deadline);
+        self
+    }
+}
+
+impl<M: WorkflowMethod> IntoFuture for Start<M> {
+    type Output = Result<WorkflowId, RequestError<Never>>;
+    type IntoFuture = Ready<Self::Output>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        let answer = host::request(
+            self.agent.0,
+            self.instance.0,
+            M::ID,
+            &self.arguments.encode(),
+            millis(self.within),
+        );
+        ready(match awaited::<Never>(&answer) {
+            Ok(Answer::Started(workflow)) => Ok(workflow),
+            Ok(_) => Err(RequestError::Undecodable),
+            Err(error) => Err(error),
+        })
+    }
+}
+
+/// A wait for another agent's workflow's result.
+#[must_use = "a wait is sent when awaited"]
+pub struct Pending<M> {
+    agent: AgentId,
+    workflow: WorkflowId,
+    within: Option<Duration>,
+    _method: PhantomData<fn() -> M>,
+}
+
+impl<M> Pending<M> {
+    /// The deadline, after this step's batch time; the agent's default
+    /// otherwise.
+    pub fn within(mut self, deadline: Duration) -> Self {
+        self.within = Some(deadline);
+        self
+    }
+}
+
+impl<M: WorkflowMethod> IntoFuture for Pending<M> {
+    type Output = Result<M::Output, RequestError<M::Error>>;
+    type IntoFuture = Ready<Self::Output>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        let answer = host::result(self.agent.0, self.workflow.0, millis(self.within));
+        ready(replied::<M::Output, M::Error>(&answer))
     }
 }

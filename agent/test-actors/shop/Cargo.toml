@@ -1,0 +1,106 @@
+[package]
+name = "shop"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+test = false
+bench = false
+
+[[bin]]
+name = "shop"
+path = "src/main.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "transfer"
+path = "src/bin/transfer.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "saga"
+path = "src/bin/saga.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "compute"
+path = "src/bin/compute.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "nap"
+path = "src/bin/nap.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "fragile"
+path = "src/bin/fragile.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "scratch"
+path = "src/bin/scratch.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "delegate"
+path = "src/bin/delegate.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "hog"
+path = "src/bin/hog.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "huge"
+path = "src/bin/huge.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "fill"
+path = "src/bin/fill.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "digest"
+path = "src/bin/digest.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "chain"
+path = "src/bin/chain.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "audit"
+path = "src/bin/audit.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "probe"
+path = "src/bin/probe.rs"
+test = false
+bench = false
+
+[dependencies]
+caller = { path = "../caller" }
+counter = { path = "../counter" }
+ledger = { path = "../ledger" }
+vos-pvm-precompiles = { path = "../../../pvm/proof/precompiles", default-features = false, features = ["blake2b"] }
+vos-sdk = { workspace = true }

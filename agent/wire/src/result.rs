@@ -5,7 +5,7 @@ use scale::{Decode, Encode};
 
 use crate::abi::{Failure, Refusal, cap};
 use crate::batch::Body;
-use crate::ids::{AgentId, InstanceId, MapId, ProgramHash, SessionId, SessionRef};
+use crate::ids::{AgentId, InstanceId, MapId, ProgramHash, SessionId, SessionRef, WorkflowId};
 
 /// What one refine produced. Steps are in dispatch order; accumulate applies
 /// their writes in that order. Inputs not covered by a step were not
@@ -21,12 +21,20 @@ pub struct WorkResult {
     pub steps: Vec<Step>,
 }
 
-/// A [`WorkResult`]'s encoding, built a step at a time: each step's size
-/// is known as it is added, and finishing re-encodes nothing.
+/// A refine's output for a batch: the [`WorkResult`]'s encoding, then its
+/// page section, `Vec<Vec<u8>>`: the LZ4 bytes of each page its steps store
+/// ([`Run::pages`]), in the order they list them. Decoding the work result
+/// reads none of the section, so the work result proper is the same
+/// whatever carries its pages: this section on VOS, segments on JAM.
+///
+/// Built a step at a time: each step's size is known as it is added, and
+/// finishing re-encodes nothing.
 pub struct ResultWriter {
     bytes: Vec<u8>,
     count: u32,
     count_at: usize,
+    pages: Vec<u8>,
+    stored: u32,
 }
 
 impl ResultWriter {
@@ -41,12 +49,24 @@ impl ResultWriter {
             bytes,
             count: 0,
             count_at,
+            pages: Vec::new(),
+            stored: 0,
         }
     }
 
-    /// Add `step` if the result stays within [`cap::WORK_RESULT`]; false,
-    /// with nothing added, if it would not.
-    pub fn push(&mut self, step: &Step) -> bool {
+    /// The steps added so far.
+    pub fn count(&self) -> u32 {
+        self.count
+    }
+
+    /// Add `step`, with the LZ4 bytes of the pages it stores, if the
+    /// result stays within [`cap::WORK_RESULT`] and its pages within
+    /// [`cap::RESULT_PAGES`]; false, with nothing added, if it would not.
+    pub fn push(&mut self, step: &Step, pages: &[Vec<u8>]) -> bool {
+        let stored = self.stored as usize + pages.len();
+        if stored * PAGE > cap::RESULT_PAGES {
+            return false;
+        }
         let before = self.bytes.len();
         step.encode_to(&mut self.bytes);
         if self.bytes.len() > cap::WORK_RESULT {
@@ -54,13 +74,34 @@ impl ResultWriter {
             return false;
         }
         self.count += 1;
+        for page in pages {
+            page.encode_to(&mut self.pages);
+        }
+        self.stored = stored as u32;
         true
     }
 
     pub fn finish(mut self) -> Vec<u8> {
         self.bytes[self.count_at..self.count_at + 4].copy_from_slice(&self.count.to_le_bytes());
+        self.stored.encode_to(&mut self.bytes);
+        self.bytes.extend_from_slice(&self.pages);
         self.bytes
     }
+}
+
+/// A page's bytes, as a workflow's snapshot holds it.
+pub const PAGE: usize = 4096;
+
+/// A refine's output split: the work result, and its page section. A work
+/// result with nothing after it stores no pages.
+pub fn split_output(output: &[u8]) -> Option<(WorkResult, Vec<Vec<u8>>)> {
+    let (result, used) = WorkResult::decode(output).ok()?;
+    let rest = &output[used..];
+    if rest.is_empty() {
+        return Some((result, Vec::new()));
+    }
+    let (pages, section) = <Vec<Vec<u8>>>::decode(rest).ok()?;
+    (section == rest.len()).then_some((result, pages))
 }
 
 /// One input's step.
@@ -76,16 +117,19 @@ pub enum Step {
     /// applies nothing for it; the node answers the sender.
     #[codec(index = 1)]
     Refused { input: InputRef, code: Refusal },
-    /// The sweep: the expiry rows refine found due, each a bucket and a
-    /// session. Accumulate collects each session that has expired and
-    /// moves the row of one active since.
+    /// The sweep: the sessions among the rows of the due index the leader
+    /// listed that refine found there and due, each the time its row is due
+    /// at and the session. Accumulate collects each session that has
+    /// expired and moves the row of one active since. The listed workflows'
+    /// steps follow it.
     #[codec(index = 2)]
     Swept { due: Vec<(u64, SessionId)> },
 }
 
 /// A dispatched step: how it ended and its effects. A failed step has no
 /// writes or attests, and no messages but a request's reply, but still
-/// consumes its input.
+/// consumes its input; a failed workflow step still records the
+/// workflow's end, with its rows and pages, and answers its owner.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Run {
     pub input: InputRef,
@@ -100,7 +144,20 @@ pub struct Run {
     pub committed: Vec<CommittedWrite>,
     pub messages: Vec<Outgoing>,
     pub attests: Vec<Attest>,
+    /// The pages of a workflow's snapshot the step stores or drops, apart
+    /// from its writes: each stored page's bytes are in the output's page
+    /// section ([`ResultWriter`]).
+    pub pages: Vec<Page>,
     pub gas_used: u64,
+}
+
+/// A page of a workflow's snapshot: stored, by the hash of its bytes, or
+/// dropped (`None`), back at its base, the program's image or zeros.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct Page {
+    pub workflow: WorkflowId,
+    pub index: u32,
+    pub hash: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
@@ -113,6 +170,11 @@ pub enum InputRef {
     Admin,
     #[codec(index = 3)]
     Ack { to: AgentId, sequence: u64 },
+    /// A workflow's step that no input resumes: its first, its deadline or
+    /// its timer, or its collection once ended. Its row in the due index
+    /// goes or moves with the step.
+    #[codec(index = 4)]
+    Due { workflow: WorkflowId },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
@@ -123,6 +185,10 @@ pub enum Outcome {
     /// The step failed: why, and detail bytes.
     #[codec(index = 1)]
     Failed { code: Failure, detail: Vec<u8> },
+    /// The request started a workflow, whose result its owner reads by its
+    /// id.
+    #[codec(index = 2)]
+    Started(WorkflowId),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]

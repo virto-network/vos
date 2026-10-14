@@ -1,0 +1,12 @@
+error[E0424]: expected value, found module `self`
+  --> tests/compile_fail/workflow_reads_state.rs:20:9
+   |
+19 |     pub async fn checkout(ctx: &mut Workflow<Self>, order: u64) -> u64 {
+   |                  -------- this function doesn't have a `self` parameter
+20 |         self.orders.get(&order).unwrap_or(0)
+   |         ^^^^ `self` value is a keyword only available in methods with a `self` parameter
+   |
+help: add a `self` receiver parameter to make the associated `fn` a method
+   |
+19 |     pub async fn checkout(&self, ctx: &mut Workflow<Self>, order: u64) -> u64 {
+   |                           ++++++

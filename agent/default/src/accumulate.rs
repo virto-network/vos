@@ -6,21 +6,24 @@
 //! through its sequence. A write to a committed map writes its value row
 //! with the new state version and a dirty row beside it, and the result's
 //! seed is kept under that version, for the node's root builder: nothing
-//! here hashes. A step's new session is created first, with its
-//! row in the expiry index. A refused step applies nothing. A sweep
-//! collects the sessions it lists that have expired, and moves the rows of
-//! those active since. A work result built on another state version, timed
-//! before the agent's latest, or holding a new session whose creation time
-//! is far from its own or past a cap, applies nothing at all: refine
-//! refuses such a session, so the result was not refined on this state as
-//! it says.
+//! here hashes. A step's new session is created first, with its row in the
+//! due index. A workflow's step writes the pages its snapshot stores, from
+//! the output's page section, and deletes those back at their base. A
+//! refused step applies nothing. A sweep collects the sessions it lists
+//! that have expired, and moves the rows of those active since. A work
+//! result built on another state version, timed before the agent's latest,
+//! or holding a new session whose creation time is far from its own or
+//! past a cap, applies nothing at all: refine refuses such a session, so
+//! the result was not refined on this state as it says.
 
 use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::vec::Vec;
 
 use vos_wire::ids::{Session, SessionId, SessionRef};
 use vos_wire::jam::AccumulateInput;
+use vos_wire::keys::Due;
 use vos_wire::records::{SessionMark, stored, stored_versioned, unstored};
-use vos_wire::result::{InputRef, Run, Step, WorkResult};
+use vos_wire::result::{InputRef, Run, Step, WorkResult, split_output};
 use vos_wire::{Decode, Encode, defaults, expiry, keys};
 
 use crate::host::{fetch_input, read, write};
@@ -39,8 +42,8 @@ pub fn run(arguments: &[u8]) {
         let Ok(output) = operand.result else {
             continue;
         };
-        if let Ok((result, _)) = WorkResult::decode(&output) {
-            apply(&result);
+        if let Some((result, pages)) = split_output(&output) {
+            apply(&result, &pages);
         }
     }
 }
@@ -73,7 +76,7 @@ fn session(named: &SessionRef, time: u64) -> SessionId {
     put(&keys::next_session(), &(id.0 + 1).encode());
     put(&keys::session_index(session), &id.encode());
     put(&keys::session_of(id), &session.encode());
-    put(&keys::expiry(expiry::bucket(time), id), &[]);
+    put(&keys::due(expiry::at(time), Due::Session(id)), &[]);
     let live = get::<u64>(&keys::live_sessions()).unwrap_or(0);
     put(&keys::live_sessions(), &(live + 1).encode());
     let held = keys::key_sessions(&session.key);
@@ -128,7 +131,7 @@ fn stale(result: &WorkResult) -> bool {
     new_sessions(result).any(|session| session.t0.abs_diff(result.time) > defaults::SESSION_SKEW_MS)
 }
 
-fn apply(result: &WorkResult) {
+fn apply(result: &WorkResult, pages: &[Vec<u8>]) {
     let version: u64 = get(&keys::version()).unwrap_or(0);
     if result.version != version {
         return;
@@ -142,10 +145,11 @@ fn apply(result: &WorkResult) {
     }
     let next = version + 1;
     let mut committed = false;
+    let mut pages = pages.iter();
     for step in &result.steps {
         match step {
             Step::Ran(run) => {
-                apply_run(run, result.time, next);
+                apply_run(run, result.time, next, &mut pages);
                 committed |= !run.committed.is_empty();
             }
             Step::Swept { due } => sweep(due, result.time),
@@ -158,14 +162,14 @@ fn apply(result: &WorkResult) {
     put(&keys::version(), &next.encode());
 }
 
-/// Take each listed expiry row out of the due range: collect its session
-/// once it has expired and `time` is past its t0 plus the skew, else move
-/// the row to where it is next due.
+/// Take each listed session's row out of the due range: collect the
+/// session once it has expired and `time` is past its t0 plus the skew,
+/// else move the row to where it is next due.
 fn sweep(due: &[(u64, SessionId)], time: u64) {
     let before = get::<u64>(&keys::live_sessions()).unwrap_or(0);
     let mut live = before;
-    for &(bucket, id) in due {
-        let row = keys::expiry(bucket, id);
+    for &(at, id) in due {
+        let row = keys::due(at, Due::Session(id));
         let Some(mark) = get::<SessionMark>(&keys::session(id)) else {
             delete(&row);
             continue;
@@ -180,10 +184,10 @@ fn sweep(due: &[(u64, SessionId)], time: u64) {
             delete(&row);
             live = live.saturating_sub(1);
         } else {
-            let next = expiry::bucket(mark.time.max(creatable));
-            if next != bucket {
+            let next = expiry::at(mark.time.max(creatable));
+            if next != at {
                 delete(&row);
-                put(&keys::expiry(next, id), &[]);
+                put(&keys::due(next, Due::Session(id)), &[]);
             }
         }
     }
@@ -218,8 +222,14 @@ fn collect(id: SessionId, mark: SessionMark, whole: Option<Session>) {
     }
 }
 
-/// Apply a step's effects, its committed writes made at `version`.
-fn apply_run(run: &Run, time: u64, version: u64) {
+/// Apply a step's effects, its committed writes made at `version`, and
+/// the pages it stores from `stored`, the result's page section.
+fn apply_run<'a>(
+    run: &Run,
+    time: u64,
+    version: u64,
+    stored: &mut impl Iterator<Item = &'a Vec<u8>>,
+) {
     let session = match &run.input {
         InputRef::Request { session: named, .. } => Some(session(named, time)),
         _ => None,
@@ -238,6 +248,13 @@ fn apply_run(run: &Run, time: u64, version: u64) {
         }
         put(&keys::dirty(version, &item.map, &item.key), &[]);
     }
+    for page in &run.pages {
+        let row = keys::page(page.workflow, page.index);
+        match page.hash {
+            Some(_) => put(&row, stored.next().expect("a stored page's bytes")),
+            None => delete(&row),
+        }
+    }
     match run.input {
         InputRef::Request { sequence, .. } => {
             let id = session.expect("a request's session");
@@ -251,7 +268,7 @@ fn apply_run(run: &Run, time: u64, version: u64) {
         InputRef::Message { from, sequence } => {
             put(&keys::pair_in(from), &sequence.encode());
         }
-        InputRef::Admin => {}
+        InputRef::Admin | InputRef::Due { .. } => {}
         InputRef::Ack { to, sequence } => {
             // Monotonic and idempotent: a stale ack does nothing, one past
             // what was sent stops there, and one ack clears at most

@@ -11,13 +11,13 @@ use std::time::{Duration, Instant};
 use smol::future::FutureExt;
 use vos_net::Class;
 use vos_raft::{ActiveConfigRecord, Role};
+use vos_wire::Encode;
 use vos_wire::ids::AgentId;
 use vos_wire::peer::{
     Configuration, Manifest, NodeNumber, PeerMessage, SnapshotAck, SnapshotChunk,
 };
-use vos_wire::{Encode, keys};
 
-use super::{Driver, Local, Shared, programs, unpinned};
+use super::{Driver, Local, Shared, pinned, programs, unpinned};
 use crate::blobs::Keep;
 use crate::node::Inner;
 use crate::raft;
@@ -286,14 +286,9 @@ impl Driver {
             self.ack(from, name, next);
             return;
         }
-        let prefix = keys::installed_prefix();
-        install.programs.extend(programs(
-            chunk
-                .rows
-                .iter()
-                .filter(|(key, _)| key.starts_with(&prefix))
-                .map(|(_, value)| value),
-        ));
+        install
+            .programs
+            .extend(programs(chunk.rows.iter().map(|(key, value)| (key, value))));
         let stage = Change::Stage {
             agent: self.shared.agent,
             epoch: install.epoch,
@@ -368,13 +363,10 @@ impl Driver {
                 .snapshot_switch(install.index, install.snapshot_term, configuration.as_ref());
         let keeps_suffix = switch.truncate_after.is_none();
         let snapshot = self.inner.store.snapshot();
-        let (old_epoch, before) = match snapshot.epoch(self.shared.agent).and_then(|epoch| {
-            let mut values = Vec::new();
-            for row in snapshot.scan(self.shared.agent, &keys::installed_prefix(), None) {
-                values.push(row?.1);
-            }
-            Ok((epoch, programs(values.iter())))
-        }) {
+        let (old_epoch, before) = match snapshot
+            .epoch(self.shared.agent)
+            .and_then(|epoch| Ok((epoch, pinned(&snapshot, self.shared.agent)?)))
+        {
             Ok(read) => read,
             Err(error) => {
                 tracing::warn!(

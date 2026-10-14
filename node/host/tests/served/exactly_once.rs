@@ -216,7 +216,7 @@ fn holds_sessions(node: &Node, agent: AgentId) -> bool {
         keys::session_of(SessionId(0)),
         keys::session(SessionId(0)),
         keys::reply(SessionId(0), 0),
-        keys::expiry_prefix(),
+        keys::due_prefix(),
         keys::key_sessions(&[0; 32]),
     ]
     .iter()

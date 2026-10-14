@@ -42,6 +42,18 @@ pub enum Unavailable {
     Full,
     /// Neither the pool nor the preimages know the program.
     Missing,
+    /// The counter starts no instruction of the program.
+    Counter,
+}
+
+impl From<Unavailable> for Failure {
+    fn from(unavailable: Unavailable) -> Failure {
+        match unavailable {
+            Unavailable::Full => Failure::Depth,
+            Unavailable::Missing => Failure::Unloadable,
+            Unavailable::Counter => Failure::Trapped,
+        }
+    }
 }
 
 /// How an invocation stopped. A tracked machine's fault on a page it may
@@ -98,12 +110,19 @@ impl Machine {
     /// covers past a program of about 512 KiB: JAM mode prices it by the
     /// blob.
     pub fn acquire(program: &[u8; 32]) -> Result<Self, Unavailable> {
-        let (id, _) = ecalli!(INSTANTIATE, [ptr(program), 0, 0, 0, 0, 0]);
+        Self::acquire_at(program, 0)
+    }
+
+    /// [`Machine::acquire`], its program counter at `counter`: a machine
+    /// entered mid-block is charged the whole block, on every host.
+    pub fn acquire_at(program: &[u8; 32], counter: u32) -> Result<Self, Unavailable> {
+        let (id, _) = ecalli!(INSTANTIATE, [ptr(program), u64::from(counter), 0, 0, 0, 0]);
         let id = match id {
             code::FULL => return Err(Unavailable::Full),
+            code::HUH => return Err(Unavailable::Counter),
             code::WHAT | code::WHO => {
                 let blob = historical_lookup(program).ok_or(Unavailable::Missing)?;
-                load(&blob)?
+                load(&blob, counter)?
             }
             id => id,
         };
@@ -119,11 +138,9 @@ impl Machine {
 
     /// Track the pages written in the machine from here on: arm its
     /// writable pages, as `header` places them, read-only. False when
-    /// `pages` refuses them.
-    ///
-    /// Neither the arming nor a page's repair is metered yet: workflows
-    /// will take both from the batch's budget, the arming by its pages and
-    /// each repair at a measured bounce, as a served precompile is taken.
+    /// `pages` refuses them. A workflow's step takes the arming and each
+    /// page's repair from the batch's budget, by the pages
+    /// (`defaults::ARM_PAGE`, `defaults::WRITTEN_PAGE`).
     pub fn track(&mut self, header: &StandardHeader) -> bool {
         let Some([_, rw, stack]) = header.regions() else {
             return false;
@@ -145,6 +162,13 @@ impl Machine {
     /// when it is not tracked.
     pub fn written(&self) -> Option<&BTreeSet<u64>> {
         self.tracking.as_ref().map(|tracking| &tracking.written)
+    }
+
+    /// End the machine, as dropping it does: its program counter, where
+    /// a host call's exit left it after the call.
+    pub fn expunge(self) -> u64 {
+        let machine = core::mem::ManuallyDrop::new(self);
+        ecalli!(EXPUNGE, [machine.id, 0, 0, 0, 0, 0]).0
     }
 
     #[inline]
@@ -256,7 +280,7 @@ impl Machine {
 
     /// Read the machine's bytes at `address` into `out`; false when
     /// unreadable.
-    fn peek_into(&self, address: u64, out: &mut [u8]) -> bool {
+    pub fn peek_into(&self, address: u64, out: &mut [u8]) -> bool {
         let (status, _) = ecalli!(
             PEEK,
             [self.id, ptr_mut(out), address, out.len() as u64, 0, 0]
@@ -394,10 +418,10 @@ fn le(bytes: &[u8]) -> u64 {
         .fold(0, |value, byte| value << 8 | u64::from(*byte))
 }
 
-/// Build a machine from a standard program: its code through `machine`,
-/// then each region through `pages` and `poke`, at the Gray Paper's
-/// standard layout with no arguments.
-fn load(blob: &[u8]) -> Result<u64, Unavailable> {
+/// Build a machine from a standard program: its code through `machine` at
+/// `counter`, then each region through `pages` and `poke`, at the Gray
+/// Paper's standard layout with no arguments.
+fn load(blob: &[u8], counter: u32) -> Result<u64, Unavailable> {
     let header = StandardHeader::read(blob).ok_or(Unavailable::Missing)?;
     let [ro, rw, stack] = header.regions().ok_or(Unavailable::Missing)?;
     let (ro_len, rw_len) = (header.ro_size as usize, header.rw_size as usize);
@@ -412,9 +436,13 @@ fn load(blob: &[u8]) -> Result<u64, Unavailable> {
         .get(at + 4..at + 4 + code_len)
         .ok_or(Unavailable::Missing)?;
 
-    let (id, _) = ecalli!(MACHINE, [ptr(code), code.len() as u64, 0, 0, 0, 0]);
+    let (id, _) = ecalli!(
+        MACHINE,
+        [ptr(code), code.len() as u64, u64::from(counter), 0, 0, 0]
+    );
     match id {
         code::FULL => return Err(Unavailable::Full),
+        code::HUH if counter != 0 => return Err(Unavailable::Counter),
         code::HUH | code::WHAT => return Err(Unavailable::Missing),
         _ => {}
     }

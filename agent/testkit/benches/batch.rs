@@ -129,7 +129,7 @@ impl Node {
             })
             .unwrap();
         assert_eq!(invocation.exit, ExitReason::Halt);
-        let output = invocation.output_bounded(cap::WORK_RESULT).unwrap();
+        let output = invocation.output_bounded(cap::OUTPUT).unwrap();
         self.agent.restore(invocation);
         output
     }

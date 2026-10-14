@@ -1,0 +1,29 @@
+error[E0277]: the trait bound `Count: WorkflowMethod` is not satisfied
+  --> tests/compile_fail/workflow_starts_a_handler.rs:24:41
+   |
+24 |         match ctx.start(AgentId(2), to, shop::Count {}).await {
+   |                   -----                 ^^^^^^^^^^^^^^ the trait `WorkflowMethod` is not implemented for `Count`
+   |                   |
+   |                   required by a bound introduced by this call
+   |
+   = help: the trait `WorkflowMethod` is implemented for `Delegate`
+note: required by a bound in `vos_sdk::context::Workflow::<A>::start`
+  --> src/context.rs
+   |
+   |     pub fn start<M: WorkflowMethod>(
+   |                     ^^^^^^^^^^^^^^ required by this bound in `Workflow::<A>::start`
+
+error[E0277]: `vos_sdk::context::Start<Count>` is not a future
+  --> tests/compile_fail/workflow_starts_a_handler.rs:24:57
+   |
+24 |         match ctx.start(AgentId(2), to, shop::Count {}).await {
+   |                                                         ^^^^^ `vos_sdk::context::Start<Count>` is not a future
+   |
+   = help: the trait `IntoFuture` is not implemented for `vos_sdk::context::Start<Count>`
+   = note: vos_sdk::context::Start<Count> must be a future or must implement `IntoFuture` to be awaited
+   = help: the trait `IntoFuture` is implemented for `vos_sdk::context::Start<M>`
+help: remove the `.await`
+   |
+24 -         match ctx.start(AgentId(2), to, shop::Count {}).await {
+24 +         match ctx.start(AgentId(2), to, shop::Count {}) {
+   |

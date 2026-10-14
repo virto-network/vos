@@ -106,28 +106,6 @@ macro_rules! actor_program {
 #[macro_export]
 macro_rules! attestable_program {
     ($run:path) => {
-        $crate::__method_program!($run);
-    };
-}
-
-/// The program of a workflow: `workflow_program!(path)`, where `path` is the
-/// `__vos_workflow_<method>` function `#[messages]` generates. It is laid
-/// out as an attestable's program is: the arguments in the standard
-/// argument window, the result by the halt convention. An install binds it
-/// to its method, and the agent pins it with the install's other programs.
-#[macro_export]
-macro_rules! workflow_program {
-    ($run:path) => {
-        $crate::__method_program!($run);
-    };
-}
-
-/// A method's own program, entered with its arguments in the standard
-/// window and leaving its output by the halt convention.
-#[doc(hidden)]
-#[macro_export]
-macro_rules! __method_program {
-    ($run:path) => {
         $crate::program_runtime!($crate::runtime::PROGRAM_HEAP);
 
         #[cfg(target_arch = "riscv64")]
@@ -162,16 +140,53 @@ macro_rules! __method_program {
     };
 }
 
-/// Run a handler to completion. Every operation it awaits is ready when
-/// polled: the agent completes a nested call before the caller's machine
-/// resumes. A handler that is still pending has awaited something else,
-/// which only workflows may do, and traps.
+/// The program of a workflow: `workflow_program!(path)`, where `path` is the
+/// `__vos_workflow_<method>` function `#[messages]` generates, with a heap
+/// of [`PROGRAM_HEAP`] or `heap = N` bytes. An install binds it to its
+/// method, and each workflow pins it until it ends.
+///
+/// Instruction 0 runs the workflow from its start: it reads its arguments
+/// with `INPUT`, as a handler does, and ends with `REPLY` or `FAIL`. Each
+/// pause is a host call that returns only once the agent resumes the
+/// machine, in a later step, restored from its snapshot.
+#[macro_export]
+macro_rules! workflow_program {
+    ($run:path) => {
+        $crate::workflow_program!($run, heap = $crate::runtime::PROGRAM_HEAP);
+    };
+    ($run:path, heap = $heap:expr) => {
+        $crate::program_runtime!($heap);
+
+        #[cfg(target_arch = "riscv64")]
+        ::core::arch::global_asm!(
+            ".global _start",
+            ".type _start, @function",
+            "_start:",
+            "mv s0, ra",
+            "jal ra, vos_workflow_entry",
+            "mv ra, s0",
+            "ret",
+        );
+
+        #[cfg(target_arch = "riscv64")]
+        #[unsafe(no_mangle)]
+        extern "C" fn vos_workflow_entry() {
+            $run();
+        }
+    };
+}
+
+/// Run a handler or a workflow to completion. Every operation either
+/// awaits is ready when polled: the agent completes a nested call before
+/// the caller's machine resumes, and a workflow's pause returns only once
+/// the agent resumes its machine, in a later step. A future still pending
+/// awaited something else, and traps.
 pub fn block_on<F: Future>(future: F) -> F::Output {
     // SAFETY: the vtable's functions ignore the data pointer.
     let waker = unsafe { Waker::from_raw(noop_raw()) };
     let mut context = Context::from_waker(&waker);
     match pin!(future).poll(&mut context) {
         Poll::Ready(output) => output,
-        Poll::Pending => panic!("a handler awaited something that is not ready"),
+        Poll::Pending => panic!("awaited something that is not ready"),
     }
 }

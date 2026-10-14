@@ -55,6 +55,24 @@ fn every_program_calls_only_its_surface() {
     for call in calls(&actors.tally) {
         assert!(surface::workflow(call), "tally calls {call:#x}");
     }
+    // The shop's workflows, which pause: each calls an operation only a
+    // workflow may use.
+    let pauses = [abi::op::REQUEST, abi::op::RESULT, abi::op::SLEEP];
+    for name in [
+        "transfer", "saga", "compute", "nap", "fragile", "scratch", "delegate", "hog",
+    ] {
+        let calls = calls(&vos_testkit::programs::actor(name));
+        for call in &calls {
+            assert!(surface::workflow(*call), "{name} calls {call:#x}");
+        }
+        assert!(
+            calls.iter().any(|call| pauses.contains(call)),
+            "{name} pauses: the check sees its calls"
+        );
+    }
+    for call in calls(&vos_testkit::programs::actor("shop")) {
+        assert!(surface::actor(call), "shop calls {call:#x}");
+    }
 }
 
 /// The agent serves its machines the precompiles a VOS node serves the
@@ -236,7 +254,7 @@ fn vos_and_jam_hosts_agree_on_batches_that_run_actors() {
 fn refined(node: &Node, work: &Work, gas: u64) -> (Vec<u8>, u64) {
     let invocation = node.run_refine(work, gas);
     assert_eq!(invocation.exit, ExitReason::Halt, "refine halts");
-    let output = invocation.output_bounded(cap::WORK_RESULT).unwrap();
+    let output = invocation.output_bounded(cap::OUTPUT).unwrap();
     (output, invocation.gas_used)
 }
 

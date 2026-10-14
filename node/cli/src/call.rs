@@ -99,8 +99,8 @@ pub fn invoke(call: &CallArgs, query: Option<bool>) -> Result<(), String> {
     }
 }
 
-/// What an answer says: a call that ran, done or failed, as printed; any
-/// other answer as an error.
+/// What an answer says: a call that ran, done or failed, or the workflow
+/// it started, as printed; any other answer as an error.
 pub fn said(answer: &Answer) -> Result<String, String> {
     match answer {
         Answer::Ran {
@@ -111,6 +111,10 @@ pub fn said(answer: &Answer) -> Result<String, String> {
             outcome: Outcome::Failed { code, detail },
             ..
         } => Ok(format!("failed {} {}", code.code(), hex::encode(detail))),
+        Answer::Ran {
+            outcome: Outcome::Started(workflow),
+            ..
+        } => Ok(format!("started {}", workflow.0)),
         Answer::Refused(Refusal::SessionsFull) => {
             Err("refused: the agent holds as many sessions as it may; try again later".into())
         }

@@ -10,10 +10,10 @@ use vos_testkit::programs::{method, table_tag};
 use vos_testkit::{Testkit, decode};
 use vos_wire::abi::{Failure, Kind, Refusal, Rows, cap, code};
 use vos_wire::batch::{Admin, Input};
-use vos_wire::ids::{AgentId, InstanceId, MethodId};
+use vos_wire::ids::{AgentId, InstanceId, MethodId, WorkflowId};
 use vos_wire::keys::{self, Transform};
-use vos_wire::records::unstored;
-use vos_wire::result::{Outcome, WorkResult};
+use vos_wire::records::{Workflow, WorkflowState, unstored};
+use vos_wire::result::{InputRef, Outcome, WorkResult};
 use vos_wire::{Decode, Encode, defaults};
 
 use crate::common::{
@@ -425,7 +425,7 @@ fn a_step_whose_precompiles_overrun_the_budget_waits_or_fails() {
     ran_done(&both.steps[1]);
 
     let sweep = [
-        Input::Sweep,
+        Input::Sweep { due: Vec::new() },
         Input::Ack {
             to: AgentId(5),
             sequence: 1,
@@ -538,7 +538,8 @@ fn an_install_binds_each_program_to_a_method_of_its_kind() {
 }
 
 /// A workflow method runs as its own program, never as a handler: a
-/// request or a query naming one is unknown, and a call naming one traps.
+/// request naming one starts a workflow, whose first step follows it, a
+/// query naming one is unknown, and a call naming one traps.
 #[test]
 fn a_workflow_method_is_no_handler() {
     let (actors, mut node, mut kit, mut sessions) = setup();
@@ -548,12 +549,16 @@ fn a_workflow_method_is_no_handler() {
     let result = node.batch(
         1,
         vec![
-            sessions.request(ALICE, LEDGER, tally, vec![1u64]),
+            sessions.request(ALICE, LEDGER, tally, vec![1u64, 2]),
             sessions.request(ALICE, COUNTER, ops, call.clone()),
         ],
     );
-    assert_eq!(failed(&result.steps[0]), Failure::Unknown);
-    assert_eq!(failed(&result.steps[1]), Failure::Trapped);
+    let workflow = WorkflowId(0);
+    assert_eq!(ran(&result.steps[0]).outcome, Outcome::Started(workflow));
+    let first = ran(&result.steps[1]);
+    assert_eq!(first.input, InputRef::Due { workflow });
+    assert_eq!(first.outcome, Outcome::Done(vec![]));
+    assert_eq!(failed(&result.steps[2]), Failure::Trapped);
     assert_eq!(
         node.query(ALICE, LEDGER, tally, vec![1u64].encode()),
         Outcome::Failed {
@@ -561,12 +566,22 @@ fn a_workflow_method_is_no_handler() {
             detail: vec![],
         }
     );
+    let record: Workflow = node.value(&keys::workflow(workflow)).unwrap();
+    assert_eq!(
+        record.state,
+        WorkflowState::Ended(Outcome::Done(3u64.encode()))
+    );
     kit.batch(1, [0; 32]);
-    let refused = kit.command(ALICE, LEDGER, tally, &vec![1u64].encode());
-    assert_eq!(refused.outcome, ran(&result.steps[0]).outcome);
+    let started = kit.command(ALICE, LEDGER, tally, &vec![1u64, 2].encode());
+    assert_eq!(started.outcome, ran(&result.steps[0]).outcome);
+    assert_eq!(started.writes, ran(&result.steps[0]).writes);
+    let stepped = kit.due(workflow).expect("due at once");
+    assert_eq!(stepped.writes, first.writes);
+    assert_eq!(stepped.gas_used, first.gas_used);
+    assert_eq!(stepped.instances, first.instances);
     let trapped = kit.command(ALICE, COUNTER, ops, &call.encode());
-    assert_eq!(trapped.outcome, ran(&result.steps[1]).outcome);
-    assert_eq!(trapped.gas_used, ran(&result.steps[1]).gas_used);
+    assert_eq!(trapped.outcome, ran(&result.steps[2]).outcome);
+    assert_eq!(trapped.gas_used, ran(&result.steps[2]).gas_used);
 }
 
 #[test]

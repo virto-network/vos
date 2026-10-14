@@ -167,14 +167,54 @@ pub mod op {
     pub const ATTEST: u64 = 0x522;
     /// → φ7 the instance, φ8 the agent.
     pub const SELF_ID: u64 = 0x523;
+
+    /// A workflow's operations, each a pause: the workflow's step ends
+    /// there, its effects commit with its snapshot, and the call returns
+    /// only when the agent resumes the machine, in a later step, with φ7
+    /// the length of the input that resumed it, which `INPUT` copies out:
+    /// an encoded [`crate::batch::Answer`] for an await, nothing for a
+    /// sleep. φ8 is 0.
+    ///
+    /// φ7 agent, φ8 instance, φ9 method, φ10/φ11 arguments, φ12 the
+    /// deadline, milliseconds after the batch's time (0 for the default,
+    /// [`crate::defaults::AWAIT_MS`]). Sent after the step commits, as a
+    /// request: the answer is the callee's outcome, `Started` for a
+    /// workflow method, or `Failed` with [`super::Failure::TimedOut`] once
+    /// the deadline passed. The agent is another: a request of this
+    /// workflow's own agent fails the invocation, which `CALL`s it.
+    pub const REQUEST: u64 = 0x530;
+    /// φ7 another agent, φ8 a workflow it runs, which this workflow
+    /// started, φ9 the deadline as `REQUEST`'s: awaits the workflow's
+    /// result, its outcome as the answer.
+    pub const RESULT: u64 = 0x531;
+    /// φ7 a batch time, milliseconds since the Unix epoch: resumes in the
+    /// first batch at or past it, and later than the batch that sleeps, so
+    /// a sleep's row in the due index always lies ahead of its step.
+    pub const SLEEP: u64 = 0x532;
 }
 
 /// Whether an invocation of `kind` may use operation `op`. `CALL` from a
 /// query is allowed here; the agent also refuses a query that calls a
-/// command.
+/// command. A workflow holds no state of its own: it reaches state only
+/// through calls.
 pub const fn allowed(kind: Kind, op: u64) -> bool {
     match kind {
-        Kind::Attestable | Kind::Workflow => false,
+        Kind::Attestable => false,
+        Kind::Workflow => matches!(
+            op,
+            op::INPUT
+                | op::REPLY
+                | op::FAIL
+                | op::LOG
+                | op::NOW
+                | op::RANDOM
+                | op::CALL
+                | op::SEND
+                | op::SELF_ID
+                | op::REQUEST
+                | op::RESULT
+                | op::SLEEP
+        ),
         Kind::Query => matches!(
             op,
             op::INPUT
@@ -231,6 +271,8 @@ pub mod price {
     pub const CALLER: u64 = 6_000;
     pub const LOG: u64 = 4_000;
     pub const SEND: u64 = 5_000;
+    /// A pause: its message, its await and its row in the due index.
+    pub const PAUSE: u64 = 8_000;
     /// A row operation hashes its key under a hashed table's transform,
     /// and looks it up in the step's overlays at a random place.
     pub const GET: u64 = 30_000;
@@ -250,6 +292,7 @@ pub mod price {
             op::PUT | op::DELETE => PUT,
             op::SCAN => SCAN,
             op::SEND => SEND,
+            op::REQUEST | op::RESULT | op::SLEEP => PAUSE,
             op::CALL | op::ATTEST => MACHINE,
             op::RANDOM => RANDOM,
             op::CALLER => CALLER,
@@ -285,6 +328,35 @@ pub mod cap {
     pub const MESSAGE: usize = 64 << 10;
     pub const ATTESTS: usize = 16;
     pub const WORK_RESULT: usize = 4 << 20;
+    /// The pages a workflow's program may write, its data, heap and stack:
+    /// a start of a larger one fails.
+    pub const WORKFLOW_PAGES: usize = 4096;
+    /// The raw bytes of the pages one workflow step may write: past it, the
+    /// step fails.
+    ///
+    /// **The budget binds first.** A step is taken its pages from the
+    /// batch's budget, whatever host it runs on: it restores the pages its
+    /// workflow holds at [`crate::defaults::RESTORED_PAGE`] each, and
+    /// writes others at [`crate::defaults::WRITTEN_PAGE`] each, beside its
+    /// gas limit and the agent's reserves. So the pages a step restores and
+    /// writes satisfy `restored × RESTORED_PAGE + written × WRITTEN_PAGE +
+    /// limit + reserves ≤ budget`: in a refine of the default budget
+    /// (`REFINE_GAS`), a step that restores no page writes about 800, and
+    /// one that restores [`HELD_PAGES`] about 140. A step that would pass it
+    /// waits for the next batch behind a step that ran a handler, or fails
+    /// alone, out of gas.
+    pub const STEP_PAGES: usize = 8 << 20;
+    /// The pages a workflow's snapshot may hold, 3 MiB: a step that would
+    /// leave it more fails, so the least budget a node refines with
+    /// ([`crate::defaults::min_refine_gas`]) restores any snapshot.
+    pub const HELD_PAGES: usize = 768;
+    /// The raw bytes of the pages one work result's page section may hold:
+    /// a step that would pass it waits for the next batch.
+    pub const RESULT_PAGES: usize = 16 << 20;
+    /// A refine's whole output: the work result, then its page section, in
+    /// which a page, LZ4-compressed and framed, may outgrow its 4 KiB by a
+    /// few dozen bytes.
+    pub const OUTPUT: usize = WORK_RESULT + RESULT_PAGES + RESULT_PAGES / 64;
 
     /// The most one step adds to a work result: its input, a new session's
     /// whole, its reply, writes, messages and attests at their caps, a
@@ -300,8 +372,15 @@ pub mod cap {
         + (REPLY + 40)
         + ATTESTS * (REQUEST + REPLY + 40);
 
-    // Every step fits an empty result, so a batch always makes progress.
-    const _: () = assert!(STEP_RESULT + 64 <= WORK_RESULT);
+    /// What a workflow's step adds beyond its calls' effects: its record,
+    /// with its arguments or result and the hash of each page it holds, the
+    /// rows beside it, and an entry for each page it stores, at most those
+    /// it holds after, and drops, at most those it held before.
+    pub const WORKFLOW_ROWS: usize = 1024 + REQUEST + HELD_PAGES * 36 + 2 * HELD_PAGES * 48;
+
+    // Every step fits an empty result, so a batch always makes progress: a
+    // workflow's too, whose calls' effects are a handler's at most.
+    const _: () = assert!(STEP_RESULT + WORKFLOW_ROWS + 64 <= WORK_RESULT);
 }
 
 /// The precompiles the agent serves its machines, each at the price a
@@ -402,6 +481,11 @@ codes! {
         /// time on fresh state: its leader asserted the failure in the
         /// batch, and the handler never ran.
         InRefine = 9,
+        /// An await's deadline passed before its answer came.
+        TimedOut = 10,
+        /// The callee's program could not be loaded: the node lacks a
+        /// program the agent's state names, its fault, not the caller's.
+        Unloadable = 11,
     }
 }
 
@@ -456,8 +540,9 @@ pub mod surface {
         Loader,
         /// A precompile: the software implementation.
         Software,
-        /// Applied state, which a JAM node cannot give until witnesses: the
-        /// refine traps, so no result is computed on empty state.
+        /// Applied state, which a JAM node cannot give until witnesses, or
+        /// the agent's report that its state lost data it wrote: the refine
+        /// traps, so no result is computed on state that is not there.
         NoResult,
     }
 
@@ -469,7 +554,8 @@ pub mod surface {
             // log.
             0 | 2 | 4 | 5 | 7 | 9..=14 | 100 => Some(OnJam::Served),
             0x480 => Some(OnJam::Loader),
-            0x481 | 0x482 => Some(OnJam::NoResult),
+            // state_read, state_scan, and the report of lost state.
+            0x481..=0x483 => Some(OnJam::NoResult),
             _ if PRECOMPILES.contains(&id) => Some(OnJam::Software),
             _ => None,
         }
@@ -480,11 +566,10 @@ pub mod surface {
         ACTOR_ABI.contains(&id) || PRECOMPILES.contains(&id)
     }
 
-    /// A workflow program's call: as an actor's, for now. No workflow runs
-    /// yet ([`super::allowed`] grants [`super::Kind::Workflow`] nothing): the
-    /// workflows' own operations decide what a workflow may call.
+    /// A workflow program's call: the operations [`super::allowed`] grants
+    /// [`super::Kind::Workflow`], or a precompile.
     pub fn workflow(id: u64) -> bool {
-        actor(id)
+        super::allowed(super::Kind::Workflow, id) || PRECOMPILES.contains(&id)
     }
 
     /// An attestable program's call: a precompile only, as the prover

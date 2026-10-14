@@ -17,7 +17,7 @@ const ALICE: Principal = Principal::Client([1; 32]);
 fn reply<T: Decode>(outcome: Outcome) -> T {
     match outcome {
         Outcome::Done(bytes) => decode(&bytes).expect("decodes"),
-        Outcome::Failed { code, detail } => panic!("failed with {code:?}: {detail:?}"),
+        other => panic!("not done: {other:?}"),
     }
 }
 

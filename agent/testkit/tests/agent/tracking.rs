@@ -234,28 +234,31 @@ fn a_fault_outside_the_tracked_pages_is_still_a_fault() {
     }
 }
 
-/// A workflow's program, built by the SDK, run tracked from its arguments
-/// to its result: its pages written lie among those it may write, and every
-/// host and backend agree on them.
+/// A program the SDK built, an attestable's, run tracked from its arguments
+/// to its result: its pages written lie among those it may write, and
+/// every host and backend agree on them.
 #[test]
-fn a_tracked_workflow_program_runs_to_its_result() {
-    let tally = Actors::load().tally;
-    let amounts: Vec<u64> = (1..=300).collect();
+fn a_tracked_program_runs_to_its_result() {
+    let checksum = Actors::load().checksum;
+    let values: Vec<u64> = (1..=300).collect();
     let probe = Probe {
-        program: vos_testkit::program_hash(&tally).0,
+        program: vos_testkit::program_hash(&checksum).0,
         track: true,
         gas: 10_000_000,
-        arguments: Some(amounts.encode()),
+        arguments: Some(values.encode()),
         writes: vec![],
         registers: vec![],
         reads: vec![],
     };
-    let report = agreed(&tally, &probe);
+    let report = agreed(&checksum, &probe);
     assert_eq!(report.status, HALT);
-    assert_eq!(report.output, 45_150u64.encode());
+    let expected = values.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, value| {
+        (hash ^ value).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    assert_eq!(report.output, expected.encode());
     let written = report.written.expect("tracked");
     assert!(!written.is_empty());
-    let parsed = vos_pvm::spi::parse_standard_program(&tally).unwrap();
+    let parsed = vos_pvm::spi::parse_standard_program(&checksum).unwrap();
     let layout = parsed.layout(&[]).unwrap();
     let pages =
         |region: vos_pvm::spi::SpiRegion| region.base / PAGE..(region.base + region.size) / PAGE;

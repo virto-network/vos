@@ -300,6 +300,51 @@ pub fn attest(method: u32, arguments: &[u8]) -> Result<Vec<u8>, (u32, Vec<u8>)> 
     })
 }
 
+/// The input a workflow's machine was resumed with, `len` bytes: an
+/// encoded [`vos_wire::batch::Answer`] after an await, nothing after a
+/// sleep.
+fn resumed(len: u64) -> Vec<u8> {
+    let mut input = alloc::vec![0u8; len as usize];
+    if !input.is_empty() {
+        ecalli!(
+            op::INPUT,
+            [ptr_mut(&mut input), 0, input.len() as u64, 0, 0, 0]
+        );
+    }
+    input
+}
+
+/// A workflow's request of another agent's instance, sent once its step
+/// commits: it pauses the workflow, and returns the encoded answer once the
+/// agent resumes it, at the latest `within` milliseconds of batch time
+/// later (0 for the agent's default).
+pub fn request(agent: u32, instance: u32, method: u32, arguments: &[u8], within: u64) -> Vec<u8> {
+    let Results(len, _) = ecalli!(
+        op::REQUEST,
+        [
+            u64::from(agent),
+            u64::from(instance),
+            u64::from(method),
+            ptr(arguments),
+            arguments.len() as u64,
+            within
+        ]
+    );
+    resumed(len)
+}
+
+/// A workflow's wait for the result of a workflow it started at `agent`:
+/// it pauses, and returns the encoded answer, as [`request`] does.
+pub fn result(agent: u32, workflow: u64, within: u64) -> Vec<u8> {
+    let Results(len, _) = ecalli!(op::RESULT, [u64::from(agent), workflow, within, 0, 0, 0]);
+    resumed(len)
+}
+
+/// Pause a workflow until a batch at or past `time`.
+pub fn sleep(time: u64) {
+    ecalli!(op::SLEEP, [time, 0, 0, 0, 0, 0]);
+}
+
 /// Queue a message for another agent's instance, sent after the step
 /// commits.
 pub fn send(agent: u32, instance: u32, method: u32, arguments: &[u8]) {

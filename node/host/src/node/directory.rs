@@ -242,10 +242,7 @@ impl Inner {
     async fn write_retirement(&self, agent: AgentId) {
         let read = (|| {
             let snapshot = self.store.snapshot();
-            let mut programs = Vec::new();
-            for row in snapshot.scan(agent, &vos_wire::keys::installed_prefix(), None) {
-                programs.push(row?.1);
-            }
+            let programs = group::pinned(&snapshot, agent)?;
             let rows = self.store.raft(agent)?;
             // The last log position held: the log's end, else where it
             // starts, and no lower than a floor an earlier retirement left.
@@ -258,7 +255,7 @@ impl Inner {
             {
                 floor = earlier;
             }
-            Ok::<_, fjall::Error>((group::programs(programs.iter()), rows.hard, floor))
+            Ok::<_, fjall::Error>((programs, rows.hard, floor))
         })();
         let (programs, hard, floor) = match read {
             Ok(read) => read,

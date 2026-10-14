@@ -14,9 +14,10 @@ use vos_raft::Role;
 use vos_wire::abi::Refusal;
 use vos_wire::batch::{Batch, Message, Request, Work};
 use vos_wire::ids::{AgentId, SessionId};
+use vos_wire::keys::Due;
 use vos_wire::records::{SessionMark, unstored};
-use vos_wire::result::{Outcome, Outgoing, Step, WorkResult, Write as StateWrite};
-use vos_wire::{expiry, keys};
+use vos_wire::result::{InputRef, Outcome, Outgoing, Run, Step, WorkResult, Write as StateWrite};
+use vos_wire::{defaults, keys};
 
 use crate::blobs::{Held, Keep, blob_ref};
 use crate::group::{DryRun, Local, Shared, State};
@@ -41,7 +42,7 @@ const WINDOW_BYTES: usize = 1 << 20;
 const MAX_ROUNDS: u32 = 16;
 /// How often a receiver's `Behind` may send a target's window again.
 const BEHIND_EVERY: Duration = Duration::from_millis(100);
-/// How often an idle leader looks again at its first expiry row: a clock
+/// How often an idle leader looks again at its first due row: a clock
 /// stepped forward does not move a timer.
 const SWEEP_RECHECK: Duration = Duration::from_secs(5);
 /// How long a leader adds no sweep once one left its first due row in
@@ -240,9 +241,9 @@ struct Leader {
     /// The inputs the last batch requeued because its result applied as no
     /// writes: a second time, the batch is shortened as a failing one is.
     skipped: bool,
-    /// The first due expiry row when the last sweep applied, or failed
-    /// alone, and when.
-    swept: Option<((u64, SessionId), Instant)>,
+    /// The first row of the due index when the last sweep applied, or
+    /// failed alone, and when.
+    swept: Option<((u64, Due), Instant)>,
     /// When the last batch ended.
     ended: Option<Instant>,
     /// That a sweep left its first due row in place, said once.
@@ -371,7 +372,7 @@ impl Leader {
             let sweep = self.sweep_wait(inner);
             if sweep == Some(Duration::ZERO) {
                 smol::future::yield_now().await;
-                return Some(vec![Pending::Sweep]);
+                return Some(vec![Pending::Sweep(Vec::new())]);
             }
             // A receiver found this agent behind it: windows go again.
             if !lock(&agent.queue).behind.is_empty() {
@@ -454,7 +455,7 @@ impl Leader {
     /// sweep is due now, none when the agent holds no session.
     fn sweep_wait(&mut self, inner: &Inner) -> Option<Duration> {
         let snapshot = inner.store.snapshot();
-        let first = match first_expiry(&snapshot, self.id) {
+        let first = match first_due(&snapshot, self.id) {
             Ok(Some(first)) => first,
             Ok(None) => return None,
             Err(_) => return Some(SWEEP_RECHECK),
@@ -469,19 +470,19 @@ impl Leader {
         }
         let wait = match self.swept {
             // Paused on this row: until the pause ends.
-            Some((left, at)) if left == first && expiry::due(first.0) <= now => {
+            Some((left, at)) if left == first && first.0 <= now => {
                 SWEEP_PAUSE.saturating_sub(at.elapsed())
             }
-            _ => Duration::from_millis(expiry::due(first.0).saturating_sub(now)),
+            _ => Duration::from_millis(first.0.saturating_sub(now)),
         };
         Some(wait.clamp(Duration::from_millis(1), SWEEP_RECHECK))
     }
 
-    /// Whether a batch timed `time` sweeps, the first expiry row being
-    /// `first`: once it is due, unless the last sweep left it in place a
-    /// moment ago.
-    fn sweeps(&mut self, first: (u64, SessionId), time: u64) -> bool {
-        if expiry::due(first.0) > time {
+    /// Whether a batch timed `time` sweeps, the first row of the due index
+    /// being `first`: once it is due, unless the last sweep left it in
+    /// place a moment ago.
+    fn sweeps(&mut self, first: (u64, Due), time: u64) -> bool {
+        if first.0 > time {
             return false;
         }
         match self.swept {
@@ -490,7 +491,7 @@ impl Leader {
                     self.stuck = true;
                     tracing::warn!(
                         agent = self.id.0,
-                        "a sweep left its first due expiry row in place; sweeps pause"
+                        "a sweep left its first due row in place; sweeps pause"
                     );
                 }
                 false
@@ -512,7 +513,7 @@ impl Leader {
     ) -> bool {
         let taken = Instant::now();
         // Whether to sweep is decided below, on the batch's state.
-        pending.retain(|item| !matches!(item, Pending::Sweep));
+        pending.retain(|item| !matches!(item, Pending::Sweep(_)));
         let snapshot = Arc::new(inner.store.snapshot());
         let before = Arc::clone(&snapshot);
         // The batch is refined on this state, at its version and no earlier
@@ -523,7 +524,7 @@ impl Leader {
                 .applied(self.id)
                 .map_err(|error| Fault::Infrastructure(error.to_string()))?;
             let floor = read::<u64>(&snapshot, self.id, &keys::batch_time())?;
-            let first = first_expiry(&snapshot, self.id)?;
+            let first = first_due(&snapshot, self.id)?;
             Ok((version, applied, floor, first))
         });
         let (floor, first) = match read_state {
@@ -552,10 +553,17 @@ impl Leader {
         }
         let mut pending = self.filter(inner, &snapshot, pending);
         let time = self.time(inner, floor);
-        // First, so a batch its gas or size cuts short keeps it.
+        // First, so a batch its gas or size cuts short keeps it, with the
+        // rows due at the batch's time, which refine takes by their keys.
         let sweeping = first.filter(|first| self.sweeps(*first, time));
         if sweeping.is_some() {
-            pending.insert(0, Pending::Sweep);
+            match due_rows(&snapshot, self.id, time) {
+                Ok(due) => pending.insert(0, Pending::Sweep(due)),
+                Err(fault) => {
+                    self.retry(inner, agent, pending, fault).await;
+                    return true;
+                }
+            }
         }
         // Once a sweep applied, or failed alone, the next waits while it left
         // the first due row in place.
@@ -744,10 +752,15 @@ impl Leader {
         inner.stats.batch_inputs.record(inputs);
         let (output, refine_gas, batch) = self.refine(inner, Arc::clone(&snapshot), batch).await?;
         let result: WorkResult = pvm::decode(&output)?;
+        // The inputs' steps' gas: a workflow's due step is no input's.
         let step_gas: u64 = result
             .steps
             .iter()
             .map(|step| match step {
+                Step::Ran(Run {
+                    input: InputRef::Due { .. },
+                    ..
+                }) => 0,
                 Step::Ran(run) => run.gas_used,
                 Step::Refused { .. } | Step::Swept { .. } => 0,
             })
@@ -1028,7 +1041,8 @@ impl Leader {
 
     /// After this replica applied the result: answer, requeue what the
     /// result did not cover, deliver the outbox and acknowledge applied
-    /// messages.
+    /// messages. A step no input made, a workflow's due step after its
+    /// start or the sweep, pairs with no input.
     fn dispatch(
         &mut self,
         inner: &Inner,
@@ -1042,8 +1056,17 @@ impl Leader {
         let mut rest = Vec::new();
         let mut again = Vec::new();
         let mut acked = BTreeSet::new();
-        for (index, item) in pending.into_iter().enumerate() {
-            let Some(step) = result.steps.get(index) else {
+        let mut steps = result.steps.iter().filter(|step| {
+            !matches!(
+                step,
+                Step::Ran(Run {
+                    input: InputRef::Due { .. },
+                    ..
+                })
+            )
+        });
+        for item in pending {
+            let Some(step) = steps.next() else {
                 rest.push(item);
                 continue;
             };
@@ -1074,7 +1097,7 @@ impl Leader {
                         at: self.applied,
                     }));
                 }
-                Pending::Sweep => {}
+                Pending::Sweep(_) => {}
                 Pending::Message(message) | Pending::Failed(message) => match step {
                     Step::Ran(_) => {
                         self.marks.insert(message.from, message.sequence);
@@ -1309,16 +1332,37 @@ async fn store_result(inner: &Inner, result: Arc<Vec<u8>>) -> Result<(BlobRef, H
     Ok((blob, held))
 }
 
-/// The first row of `agent`'s expiry index: the oldest bucket, and its
-/// session.
-fn first_expiry(snapshot: &Snapshot, agent: AgentId) -> Result<Option<(u64, SessionId)>, Fault> {
-    for row in snapshot.scan(agent, &keys::expiry_prefix(), None) {
+/// The first row of `agent`'s due index: the earliest, its time and entry.
+fn first_due(snapshot: &Snapshot, agent: AgentId) -> Result<Option<(u64, Due)>, Fault> {
+    Ok(due_rows_until(snapshot, agent, u64::MAX, 1)?.pop())
+}
+
+/// The rows of `agent`'s due index due at `time`, earliest first, as many
+/// as a sweep lists.
+fn due_rows(snapshot: &Snapshot, agent: AgentId, time: u64) -> Result<Vec<(u64, Due)>, Fault> {
+    due_rows_until(snapshot, agent, time, defaults::SWEEP_LIMIT)
+}
+
+/// At most `limit` rows of `agent`'s due index due at `time`, earliest
+/// first; a key under the index that names no entry is passed over.
+fn due_rows_until(
+    snapshot: &Snapshot,
+    agent: AgentId,
+    time: u64,
+    limit: usize,
+) -> Result<Vec<(u64, Due)>, Fault> {
+    let mut due = Vec::new();
+    for row in snapshot.scan(agent, &keys::due_prefix(), None) {
         let (key, _) = row.map_err(|error| Fault::Infrastructure(error.to_string()))?;
-        if let Some(entry) = keys::expiry_entry(&key) {
-            return Ok(Some(entry));
+        let Some((at, entry)) = keys::due_entry(&key) else {
+            continue;
+        };
+        if at > time || due.len() == limit {
+            break;
         }
+        due.push((at, entry));
     }
-    Ok(None)
+    Ok(due)
 }
 
 fn raise(acks: &mut HashMap<AgentId, u64>, from: AgentId, sequence: u64) {

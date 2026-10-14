@@ -1,0 +1,5 @@
+error: a #[workflow] takes `&mut Workflow<Self>`
+  --> tests/compile_fail/workflow_with_command_context.rs:16:32
+   |
+16 |     pub async fn checkout(ctx: &mut Command<Self>, items: u64) -> u64 {
+   |                                ^^^^^^^^^^^^^^^^^^

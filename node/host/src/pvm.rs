@@ -26,6 +26,11 @@ const REFINE_ENTRY: u32 = 0;
 /// `historical_lookup`, which refine answers from the stored programs.
 const HISTORICAL_LOOKUP: u64 = 7;
 const LOOKUP_GAS: u64 = 10;
+/// The agent found its own state lost data it wrote: φ7/φ8 what. The
+/// refine stops at the call, and the node halts, as for a blob it lost.
+const LOST: u64 = 0x483;
+/// The most of the agent's account of what it lost that a log line keeps.
+const LOST_WHAT: usize = 256;
 
 /// Why a batch produced nothing.
 #[derive(Debug)]
@@ -146,14 +151,28 @@ pub(crate) fn refine(
         .with_state(Arc::new(AgentState { snapshot, agent }))
         .try_run_with_host(|id, machine| serve(id, machine, blobs))?;
     let used = invocation.gas_used;
-    let output = if invocation.exit != ExitReason::Halt {
+    let output = if invocation.exit == ExitReason::HostCall(LOST) {
+        let registers = invocation.registers;
+        let mut what = vec![0; (registers[8] as usize).min(LOST_WHAT)];
+        if !invocation
+            .memory()
+            .read_bytes_checked(registers[7] as u32, &mut what)
+        {
+            what.clear();
+        }
+        let what = String::from_utf8_lossy(&what);
+        Err(Fault::Storage(format!(
+            "agent {} lost state it wrote: {what}",
+            agent.0
+        )))
+    } else if invocation.exit != ExitReason::Halt {
         Err(Fault::Agent(format!(
             "refine stopped: {:?}",
             invocation.exit
         )))
     } else {
         invocation
-            .output_bounded(cap::WORK_RESULT)
+            .output_bounded(cap::OUTPUT)
             .ok_or_else(|| Fault::Agent("refine's output is out of bounds".into()))
     };
     program.restore(invocation);
@@ -166,8 +185,12 @@ fn hex_prefix(hash: &[u8; 32]) -> String {
 }
 
 /// The calls refine leaves to the node: `historical_lookup` from the
-/// stored programs; every other answers `WHAT`.
+/// stored programs, and the agent's report of lost state, which stops the
+/// refine; every other answers `WHAT`.
 fn serve(id: u64, machine: &mut Machine, blobs: &Blobs) -> Result<(), ExitReason> {
+    if id == LOST {
+        return Err(ExitReason::HostCall(LOST));
+    }
     if id != HISTORICAL_LOOKUP {
         machine.registers_mut()[7] = code::WHAT;
         return Ok(());

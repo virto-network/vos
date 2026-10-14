@@ -22,7 +22,7 @@ use crate::node::Inner;
 use crate::raft::EntryReports;
 use driver::Asks;
 
-pub(crate) use apply::{DryRun, apply, programs, unpinned};
+pub(crate) use apply::{DryRun, apply, pinned, programs, unpinned};
 use snapshot::{Install, Shipment};
 pub(crate) use snapshot::{drop_stale_epochs, empty_epoch};
 

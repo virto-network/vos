@@ -7,10 +7,11 @@ use vos_wire::ids::{
 };
 use vos_wire::ingress::Grant;
 use vos_wire::jam::{AccumulateInput, Operand, RefineArgs, Transfer, WorkError};
-use vos_wire::keys::{self, Transform};
+use vos_wire::keys::{self, Due, Transform};
+use vos_wire::records::{Snapshot, Workflow, WorkflowState};
 use vos_wire::result::{
-    Attest, CommittedWrite, InputRef, InstanceGas, Outcome, Outgoing, ResultWriter, Run, Step,
-    WorkResult, Write,
+    self, Attest, CommittedWrite, InputRef, InstanceGas, Outcome, Outgoing, Page, ResultWriter,
+    Run, Step, WorkResult, Write,
 };
 use vos_wire::{Decode, Encode};
 
@@ -81,6 +82,10 @@ fn body() -> impl Strategy<Value = Body> {
                 awaiting,
             }),
         (awaiting(), answer).prop_map(|(awaiting, answer)| Body::Reply { awaiting, answer }),
+        (any::<u64>(), awaiting()).prop_map(|(workflow, awaiting)| Body::Wait {
+            workflow: WorkflowId(workflow),
+            awaiting,
+        }),
     ]
 }
 
@@ -150,6 +155,14 @@ fn input() -> impl Strategy<Value = Input> {
             }),
         (principal(), any::<Option<u8>>())
             .prop_map(|(principal, role)| Input::Admin(Admin::SetRole(Grant { principal, role }))),
+        prop::collection::vec((any::<u64>(), due()), 0..4).prop_map(|due| Input::Sweep { due }),
+    ]
+}
+
+fn due() -> impl Strategy<Value = Due> {
+    prop_oneof![
+        any::<u64>().prop_map(|id| Due::Session(SessionId(id))),
+        any::<u64>().prop_map(|id| Due::Workflow(WorkflowId(id))),
     ]
 }
 
@@ -168,11 +181,22 @@ fn step() -> impl Strategy<Value = Step> {
             sequence,
         }),
         Just(InputRef::Admin),
+        any::<u64>().prop_map(|id| InputRef::Due {
+            workflow: WorkflowId(id),
+        }),
     ];
     let outcome = prop_oneof![
         bytes().prop_map(Outcome::Done),
         (failure(), bytes()).prop_map(|(code, detail)| Outcome::Failed { code, detail }),
+        any::<u64>().prop_map(|id| Outcome::Started(WorkflowId(id))),
     ];
+    let page = (any::<u64>(), any::<u32>(), any::<Option<[u8; 32]>>()).prop_map(
+        |(workflow, index, hash)| Page {
+            workflow: WorkflowId(workflow),
+            index,
+            hash,
+        },
+    );
     let instance = (any::<u32>(), any::<u64>()).prop_map(|(instance, gas)| InstanceGas {
         instance: InstanceId(instance),
         gas,
@@ -198,10 +222,11 @@ fn step() -> impl Strategy<Value = Step> {
         prop::collection::vec(committed, 0..3),
         prop::collection::vec(outgoing, 0..3),
         prop::collection::vec(attest, 0..2),
+        prop::collection::vec(page, 0..3),
         any::<u64>(),
     )
         .prop_map(
-            |(input, outcome, instances, writes, committed, messages, attests, gas_used)| {
+            |(input, outcome, instances, writes, committed, messages, attests, pages, gas_used)| {
                 Step::Ran(Run {
                     input,
                     outcome,
@@ -210,6 +235,7 @@ fn step() -> impl Strategy<Value = Step> {
                     committed,
                     messages,
                     attests,
+                    pages,
                     gas_used,
                 })
             },
@@ -367,6 +393,8 @@ proptest! {
             keys::live_sessions(),
             keys::batch_time(),
             keys::version(),
+            keys::next_workflow(),
+            keys::live_workflows(),
         ];
         for (a, b, transform, key, number, member, triple, level) in parts {
             let instance = InstanceId(a);
@@ -391,7 +419,11 @@ proptest! {
                 keys::acked(AgentId(a)),
                 keys::session_index(&triple),
                 keys::session_of(SessionId(number)),
-                keys::expiry(number, SessionId(u64::from(b))),
+                keys::due(number, Due::Session(SessionId(u64::from(b)))),
+                keys::due(number, Due::Workflow(WorkflowId(u64::from(a)))),
+                keys::workflow(WorkflowId(number)),
+                keys::page(WorkflowId(number), a),
+                keys::workflow_pins(&ProgramHash(triple.key)),
                 keys::key_sessions(&triple.key),
                 keys::dirty(number, &map, &transformed),
                 keys::seed(number),
@@ -477,7 +509,7 @@ fn natural_widths_follow_the_gray_paper() {
 
 #[test]
 fn kinds_reach_only_their_operations() {
-    let all = [
+    let handlers = [
         op::INPUT,
         op::REPLY,
         op::FAIL,
@@ -494,17 +526,38 @@ fn kinds_reach_only_their_operations() {
         op::ATTEST,
         op::SELF_ID,
     ];
+    let pauses = [op::REQUEST, op::RESULT, op::SLEEP];
     let writes = [op::PUT, op::DELETE, op::SEND, op::ATTEST];
-    for id in all {
+    // A workflow holds no state and attests nothing: it reaches state
+    // through calls, and does not ask who called.
+    let stateful = [
+        op::CALLER,
+        op::GET,
+        op::PUT,
+        op::DELETE,
+        op::SCAN,
+        op::ATTEST,
+    ];
+    for id in handlers {
         assert!(abi::allowed(Kind::Command, id));
         assert_eq!(abi::allowed(Kind::Query, id), !writes.contains(&id));
         assert!(!abi::allowed(Kind::Attestable, id));
-        assert!(!abi::allowed(Kind::Workflow, id));
+        assert_eq!(abi::allowed(Kind::Workflow, id), !stateful.contains(&id));
     }
-    for unknown in [0, 5, 0x480, 0x4ff, 0x507, 0x524, 0x5ff] {
+    for id in pauses {
+        assert!(abi::allowed(Kind::Workflow, id));
+        assert!(!abi::allowed(Kind::Command, id));
+        assert!(!abi::allowed(Kind::Query, id));
+        assert!(!abi::allowed(Kind::Attestable, id));
+        assert!(abi::surface::workflow(id));
+    }
+    for unknown in [0, 5, 0x480, 0x4ff, 0x507, 0x524, 0x52f, 0x533, 0x5ff] {
         assert!(!abi::allowed(Kind::Command, unknown));
         assert!(!abi::allowed(Kind::Query, unknown));
+        assert!(!abi::allowed(Kind::Workflow, unknown));
     }
+    assert!(abi::surface::workflow(abi::precompile::BLAKE2B_COMPRESS));
+    assert!(!abi::surface::workflow(op::GET));
 }
 
 #[test]
@@ -718,32 +771,50 @@ fn a_result_written_step_by_step_is_the_work_result_encoding() {
         code: Refusal::Sequence,
     };
     let mut writer = ResultWriter::new(3, 4, [5; 32]);
-    assert!(writer.push(&step(1)));
-    assert!(writer.push(&step(2)));
+    assert!(writer.push(&step(1), &[]));
+    assert!(writer.push(&step(2), &[]));
     let result = WorkResult {
         version: 3,
         time: 4,
         seed: [5; 32],
         steps: vec![step(1), step(2)],
     };
-    assert_eq!(writer.finish(), result.encode());
+    let output = writer.finish();
+    assert_eq!(output, [result.encode(), 0u32.encode()].concat());
+    assert_eq!(result::split_output(&output), Some((result, vec![])));
 
-    let big = Step::Ran(Run {
+    let ran = |outcome| Run {
         input: InputRef::Admin,
-        outcome: Outcome::Done(vec![0; abi::cap::WORK_RESULT / 3]),
+        outcome,
         instances: vec![],
         writes: vec![],
         committed: vec![],
         messages: vec![],
         attests: vec![],
+        pages: vec![],
         gas_used: 0,
-    });
+    };
+    let big = Step::Ran(ran(Outcome::Done(vec![0; abi::cap::WORK_RESULT / 3])));
     let mut writer = ResultWriter::new(0, 0, [0; 32]);
-    assert!(writer.push(&big));
-    assert!(writer.push(&big));
-    assert!(!writer.push(&big), "a third would pass the cap");
+    assert!(writer.push(&big, &[]));
+    assert!(writer.push(&big, &[]));
+    assert!(!writer.push(&big, &[]), "a third would pass the cap");
     let (decoded, _) = WorkResult::decode(&writer.finish()).unwrap();
     assert_eq!(decoded.steps.len(), 2);
+
+    // Pages follow the work result proper, in the order their steps list
+    // them; past the section's cap a step waits.
+    let pages = abi::cap::RESULT_PAGES / result::PAGE / 2;
+    let stored: Vec<Vec<u8>> = (0..pages).map(|page| vec![page as u8; 3]).collect();
+    let small = Step::Ran(ran(Outcome::Done(vec![])));
+    let mut writer = ResultWriter::new(0, 0, [0; 32]);
+    assert!(writer.push(&small, &stored));
+    assert!(writer.push(&small, &stored));
+    assert!(!writer.push(&small, &stored[..1]), "a page past the cap");
+    assert!(writer.push(&small, &[]));
+    let (result, section) = result::split_output(&writer.finish()).unwrap();
+    assert_eq!(result.steps.len(), 3);
+    assert_eq!(section, [stored.clone(), stored].concat());
 }
 
 /// A step at every cap, with as many writes (committed ones, the larger)
@@ -817,9 +888,60 @@ fn the_largest_step_fits_its_bound() {
                 output: vec![0; cap::REPLY],
             })
             .collect(),
+        pages: vec![],
         gas_used: u64::MAX,
     });
     assert!(step.encode().len() <= cap::STEP_RESULT);
+
+    // A workflow's step: its record, holding its arguments and a hash for
+    // every page it may hold, its rows, and an entry for each page it drops
+    // or stores, in place of a handler's attests.
+    let workflow = WorkflowId(u64::MAX);
+    let record = Workflow {
+        format: u8::MAX,
+        program: ProgramHash([0; 32]),
+        instance: InstanceId(0),
+        owner: Principal::Client([0; 32]),
+        gas: u64::MAX,
+        writable: u32::MAX,
+        awaits: u64::MAX,
+        due: u64::MAX,
+        waiter: Some(largest_await),
+        state: WorkflowState::Ready(vec![0; cap::REQUEST]),
+        snapshot: Some(Snapshot {
+            counter: u32::MAX,
+            registers: vec![u64::MAX; 13],
+            gas: u64::MAX,
+            pages: (0..cap::HELD_PAGES as u32)
+                .map(|page| (page, [0; 32]))
+                .collect(),
+        }),
+    };
+    let rows = [
+        keys::workflow(workflow),
+        keys::due(u64::MAX, Due::Workflow(workflow)),
+        keys::due(u64::MAX, Due::Workflow(workflow)),
+        keys::next_workflow(),
+        keys::live_workflows(),
+        keys::workflow_pins(&ProgramHash([0; 32])),
+    ];
+    let mut writes: Vec<Write> = rows
+        .into_iter()
+        .map(|key| Write {
+            key,
+            value: Some(u64::MAX.encode()),
+        })
+        .collect();
+    writes[0].value = Some(record.encode());
+    let pages: Vec<Page> = (0..2 * cap::HELD_PAGES as u32)
+        .map(|index| Page {
+            workflow,
+            index,
+            hash: Some([0; 32]),
+        })
+        .collect();
+    let rows_bytes = writes.encode().len() + pages.encode().len();
+    assert!(rows_bytes <= cap::WORKFLOW_ROWS, "{rows_bytes}");
 }
 
 /// Every value falls in a bucket that holds it, and the buckets run in
@@ -904,15 +1026,44 @@ fn keys_keep_their_bytes() {
     assert_eq!(keys::live_sessions(), [0x00, 0x0c]);
     assert_eq!(keys::batch_time(), [0x00, 0x0d]);
     assert_eq!(keys::session_of(session), cat(&[&[0x00, 0x0e], &id]));
-    let expiry = cat(&[&[0x00, 0x0f], &at, &id]);
-    assert_eq!(keys::expiry(sequence, session), expiry);
-    assert_eq!(keys::expiry_prefix(), [0x00, 0x0f]);
-    assert_eq!(keys::expiry_entry(&expiry), Some((sequence, session)));
-    assert_eq!(keys::expiry_entry(&keys::session_of(session)), None);
+    let due = cat(&[&[0x00, 0x0f], &at, &[0], &id]);
+    assert_eq!(keys::due(sequence, Due::Session(session)), due);
+    assert_eq!(keys::due_prefix(), [0x00, 0x0f]);
+    assert_eq!(
+        keys::due_entry(&due),
+        Some((sequence, Due::Session(session)))
+    );
+    let workflow = WorkflowId(session.0);
+    let woken = cat(&[&[0x00, 0x0f], &at, &[1], &id]);
+    assert_eq!(keys::due(sequence, Due::Workflow(workflow)), woken);
+    assert_eq!(
+        keys::due_entry(&woken),
+        Some((sequence, Due::Workflow(workflow)))
+    );
+    assert_eq!(keys::due_entry(&keys::session_of(session)), None);
+    assert_eq!(
+        keys::due_entry(&cat(&[&[0x00, 0x0f], &at, &[2], &id])),
+        None
+    );
     assert_eq!(
         keys::key_sessions(&[0xee; 32]),
         cat(&[&[0x00, 0x10], &[0xee; 32]])
     );
+    assert_eq!(keys::workflow(workflow), cat(&[&[0x00, 0x13], &id]));
+    assert_eq!(
+        keys::page(workflow, 0x0102_0304),
+        cat(&[&[0x00, 0x14], &id, &[1, 2, 3, 4]])
+    );
+    assert_eq!(keys::next_workflow(), [0x00, 0x15]);
+    assert_eq!(keys::live_workflows(), [0x00, 0x16]);
+    let pins = keys::workflow_pins(&ProgramHash([0xcc; 32]));
+    assert_eq!(pins, cat(&[&[0x00, 0x17], &[0xcc; 32]]));
+    assert_eq!(keys::workflow_pins_prefix(), [0x00, 0x17]);
+    assert_eq!(
+        keys::workflow_pins_entry(&pins),
+        Some(ProgramHash([0xcc; 32]))
+    );
+    assert_eq!(keys::workflow_pins_entry(&keys::workflow(workflow)), None);
 }
 
 /// The keys of a table's and a committed map's rows, their builder's rows,
@@ -1052,8 +1203,9 @@ fn rows_registers_keep_their_bits() {
 }
 
 /// A run's committed writes follow its writes: each its map (instance, tag,
-/// transform's index), its transformed key and its value. A value row
-/// holds the version that wrote it, little-endian, then the value.
+/// transform's index), its transformed key and its value; its pages follow
+/// its attests. A value row holds the version that wrote it,
+/// little-endian, then the value.
 #[test]
 fn committed_writes_keep_their_bytes() {
     let run = Run {
@@ -1075,6 +1227,11 @@ fn committed_writes_keep_their_bytes() {
         }],
         messages: vec![],
         attests: vec![],
+        pages: vec![Page {
+            workflow: WorkflowId(3),
+            index: 4,
+            hash: None,
+        }],
         gas_used: 9,
     };
     let bytes = [
@@ -1085,6 +1242,10 @@ fn committed_writes_keep_their_bytes() {
         &[5, 0, 0, 0, 6, 0, 0, 0, 1],
         &[1, 0, 0, 0, 0xbb, 1, 1, 0, 0, 0, 0xcc],
         &[0, 0, 0, 0, 0, 0, 0, 0],
+        &[1, 0, 0, 0],
+        &3u64.to_le_bytes(),
+        &4u32.to_le_bytes(),
+        &[0],
         &9u64.to_le_bytes(),
     ]
     .concat();
@@ -1189,6 +1350,8 @@ fn codes_keep_their_values() {
         (Failure::Cycle, 7),
         (Failure::Depth, 8),
         (Failure::InRefine, 9),
+        (Failure::TimedOut, 10),
+        (Failure::Unloadable, 11),
     ];
     for (failure, code) in failures {
         assert_eq!(failure.code(), code);
@@ -1208,7 +1371,7 @@ fn codes_keep_their_values() {
         assert_eq!(Refusal::from_code(code), Some(refusal));
         assert_eq!(refusal.encode(), code.to_le_bytes());
     }
-    for outside in [0u32, 10, u32::MAX] {
+    for outside in [0u32, 12, u32::MAX] {
         assert!(Failure::decode(&outside.to_le_bytes()).is_err());
     }
     for outside in [0u32, 7, u32::MAX] {
@@ -1224,6 +1387,12 @@ fn codes_keep_their_values() {
         code: Refusal::Expired,
     };
     assert_eq!(refused.encode(), [1, 2, 2, 0, 0, 0]);
+    let started = Outcome::Started(WorkflowId(7));
+    assert_eq!(started.encode(), [&[2][..], &7u64.to_le_bytes()].concat());
+    let due = InputRef::Due {
+        workflow: WorkflowId(7),
+    };
+    assert_eq!(due.encode(), [&[4][..], &7u64.to_le_bytes()].concat());
     assert_eq!(
         vos_wire::ingress::Answer::Refused(Refusal::Sequence).encode(),
         [1, 1, 0, 0, 0]
@@ -1252,6 +1421,16 @@ fn messages_keep_their_bytes() {
     assert_eq!(call(Some(awaiting)).encode(), request);
     assert_eq!(call(None).encode(), [&[0][..], &call_fields, &[0]].concat());
     let started = [&[2][..], &4u64.to_le_bytes()].concat();
+    let wait = Body::Wait {
+        workflow: WorkflowId(4),
+        awaiting,
+    };
+    assert_eq!(
+        wait.encode(),
+        [&[2][..], &4u64.to_le_bytes(), &await_bytes].concat()
+    );
+    assert_eq!(wait.awaiting(), Some(awaiting));
+    assert_eq!(call(None).awaiting(), None);
     for (answer, bytes) in [
         (Answer::Done(vec![0xbb]), &[0, 1, 0, 0, 0, 0xbb][..]),
         (
@@ -1299,7 +1478,8 @@ fn messages_keep_their_bytes() {
     assert_eq!(outgoing.encode(), [&agent[..], &request].concat());
 }
 
-/// A batch: its version, time, seed and gas budget, then its inputs.
+/// A batch: its version, time, seed and gas budget, then its inputs. A
+/// sweep lists its rows of the due index, each its time and entry.
 #[test]
 fn batches_keep_their_bytes() {
     let batch = Batch {
@@ -1307,7 +1487,12 @@ fn batches_keep_their_bytes() {
         time: 2,
         seed: [3; 32],
         budget: 4,
-        inputs: vec![Input::Sweep],
+        inputs: vec![Input::Sweep {
+            due: vec![
+                (5, Due::Session(SessionId(6))),
+                (7, Due::Workflow(WorkflowId(8))),
+            ],
+        }],
     };
     let bytes = [
         &1u64.to_le_bytes()[..],
@@ -1316,9 +1501,75 @@ fn batches_keep_their_bytes() {
         &4u64.to_le_bytes(),
         &1u32.to_le_bytes(),
         &[4],
+        &2u32.to_le_bytes(),
+        &5u64.to_le_bytes(),
+        &[0],
+        &6u64.to_le_bytes(),
+        &7u64.to_le_bytes(),
+        &[1],
+        &8u64.to_le_bytes(),
     ]
     .concat();
     assert_eq!(batch.encode(), bytes);
+}
+
+/// A workflow's record and a step's page entries, byte for byte.
+#[test]
+fn workflows_keep_their_bytes() {
+    let page = Page {
+        workflow: WorkflowId(1),
+        index: 2,
+        hash: Some([3; 32]),
+    };
+    assert_eq!(
+        page.encode(),
+        [&1u64.to_le_bytes()[..], &2u32.to_le_bytes(), &[1], &[3; 32]].concat()
+    );
+    let record = Workflow {
+        format: Workflow::FORMAT,
+        program: ProgramHash([1; 32]),
+        instance: InstanceId(2),
+        owner: Principal::Agent(AgentId(3)),
+        gas: 4,
+        writable: 5,
+        awaits: 6,
+        due: 7,
+        waiter: None,
+        state: WorkflowState::Sleeping { until: 8 },
+        snapshot: Some(Snapshot {
+            counter: 9,
+            registers: vec![10],
+            gas: 11,
+            pages: vec![(12, [13; 32])],
+        }),
+    };
+    let bytes = [
+        &[Workflow::FORMAT][..],
+        &[1; 32],
+        &2u32.to_le_bytes(),
+        &[1],
+        &3u32.to_le_bytes(),
+        &4u64.to_le_bytes(),
+        &5u32.to_le_bytes(),
+        &6u64.to_le_bytes(),
+        &7u64.to_le_bytes(),
+        &[0],
+        &[2],
+        &8u64.to_le_bytes(),
+        &[1],
+        &9u32.to_le_bytes(),
+        &1u32.to_le_bytes(),
+        &10u64.to_le_bytes(),
+        &11u64.to_le_bytes(),
+        &1u32.to_le_bytes(),
+        &12u32.to_le_bytes(),
+        &[13; 32],
+    ]
+    .concat();
+    assert_eq!(record.encode(), bytes);
+    round_trip(&record);
+    let ended = WorkflowState::Ended(Outcome::Started(WorkflowId(1)));
+    round_trip(&ended);
 }
 
 /// Every frame between nodes starts with its variant's index, the indexes

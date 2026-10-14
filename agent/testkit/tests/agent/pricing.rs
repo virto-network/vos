@@ -382,8 +382,8 @@ fn the_reserves_cover_the_agents_own_work() {
             .collect();
         node.batch(10 * bucket, created);
         let later = 10 * bucket + defaults::SESSION_EXPIRY_MS + 2 * bucket;
-        let sweeping = node.run_refine(&node.work(later, vec![Input::Sweep]), OUTER_GAS);
-        let swept = WorkResult::decode(&sweeping.output_bounded(cap::WORK_RESULT).unwrap())
+        let sweeping = node.run_refine(&node.work(later, vec![node.sweep(later)]), OUTER_GAS);
+        let swept = WorkResult::decode(&sweeping.output_bounded(cap::OUTPUT).unwrap())
             .unwrap()
             .0;
         assert!(
@@ -418,7 +418,7 @@ fn serving_a_precompile_costs_the_agent_its_bounce() {
             let arguments = (vec![(19u8, 0u32, count)], (0u32, 0u32)).encode();
             let work = node.work(1, vec![request(ALICE, 1, COUNTER, ops, arguments)]);
             let invocation = node.run_refine(&work, OUTER_GAS);
-            let bytes = invocation.output_bounded(cap::WORK_RESULT).unwrap();
+            let bytes = invocation.output_bounded(cap::OUTPUT).unwrap();
             let (result, _) = WorkResult::decode(&bytes).unwrap();
             let used = ran_done(&result.steps[0]).gas_used;
             (invocation.gas_used as i64, used as i64)
@@ -487,10 +487,123 @@ fn the_start_reserves_cover_decoding_a_batch() {
         let arguments = node.arguments(&work).len() as u64;
         let invocation = node.run_refine(&work, OUTER_GAS);
         let (result, _) =
-            WorkResult::decode(&invocation.output_bounded(cap::WORK_RESULT).unwrap()).unwrap();
+            WorkResult::decode(&invocation.output_bounded(cap::OUTPUT).unwrap()).unwrap();
         assert!(result.steps.is_empty(), "{name}: nothing dispatched");
         let kept = defaults::refine_start(count as usize, arguments as usize);
         println!("{name}: {} of {kept}", invocation.gas_used);
         assert!(invocation.gas_used <= kept * 4 / 5, "{name}");
+    }
+}
+
+/// What the agent spends on a workflow's step beyond its gas leaves a
+/// fifth spare of what it accounts for it: its reserve, each page its
+/// program may write, armed every step, each page the step writes, and
+/// each page it restores (`WORKFLOW_RESERVE`, `ARM_PAGE`, `WRITTEN_PAGE`,
+/// `RESTORED_PAGE`). Measured on a VOS node and on a JAM node, whose
+/// agent hashes in software, from steps that write and restore up to
+/// 2 MiB of pages, some of them random, which compress the least.
+#[test]
+fn the_workflow_reserves_cover_the_agents_own_work() {
+    use crate::workflows::Flows;
+    use vos_wire::result::{Run, Step};
+    /// A step's measure: the agent's gas beyond the step's, the pages its
+    /// program may write, those it stored, and those it restored.
+    type Measure = (u64, u64, u64, u64);
+    let run = |step: &Step| match step {
+        Step::Ran(run) => run.clone(),
+        other => panic!("{other:?}"),
+    };
+    let stored = |run: &Run| run.pages.iter().filter(|page| page.hash.is_some()).count() as u64;
+    type Host = (&'static str, fn() -> Node);
+    let hosts: [Host; 2] = [("VOS", Node::new), ("JAM", || Node::jam(true))];
+    for (host, node) in hosts {
+        // A workflow's first step, after its start, and its next, after a
+        // sweep, each beside its batch's other step's reserve.
+        let steps = |name: &str, arguments: Vec<u8>| -> [(Measure, u64); 2] {
+            let mut flows = Flows::new(node());
+            let idle = flows.measured(1, vec![]).1;
+            let start = flows.start_bytes(name, arguments);
+            let (result, gas) = flows.measured(1, vec![start]);
+            let first = run(&result.steps[1]);
+            let record = flows.record(0);
+            let writable = u64::from(record.writable);
+            let held = record.snapshot.map_or(0, |snapshot| snapshot.pages.len()) as u64;
+            let measure = (gas - idle - first.gas_used, writable, stored(&first), 0);
+            let started = (measure, defaults::STEP_RESERVE);
+            let sweep = flows.sweeping(1);
+            let (result, gas) = flows.measured(1, vec![sweep]);
+            let second = run(&result.steps[1]);
+            let measure = (
+                gas - idle - second.gas_used,
+                writable,
+                stored(&second),
+                held,
+            );
+            [started, (measure, defaults::SWEEP_RESERVE)]
+        };
+        let accounted = |(_, writable, written, restored): Measure| {
+            defaults::WORKFLOW_RESERVE
+                + writable * defaults::ARM_PAGE
+                + written * defaults::WRITTEN_PAGE
+                + restored * defaults::RESTORED_PAGE
+        };
+        let cases = [
+            ("nap", 1u64.encode()),
+            ("hog", 0u32.encode()),
+            ("hog", (1u32 << 20).encode()),
+            ("hog", (2u32 << 20).encode()),
+            // Random words, a few pages sorted a step.
+            ("compute", (1u32 << 17, 64u32).encode()),
+            ("compute", (1u32 << 18, 64u32).encode()),
+        ];
+        for (name, arguments) in cases {
+            for (which, (measure, beside)) in
+                ["first", "second"].into_iter().zip(steps(name, arguments))
+            {
+                let (own, writable, written, restored) = measure;
+                let kept = accounted(measure) + beside;
+                println!(
+                    "{host} {name} {which}: {own} for {writable} writable, {written} written, \
+                     {restored} restored; {kept} accounted"
+                );
+                assert!(own <= kept * 4 / 5, "{host} {name} {which}");
+            }
+        }
+    }
+}
+
+/// A workflow's pauses pay for their serving, a fifth spare
+/// (`price::PAUSE`): a request with its arguments, and a wait for a
+/// result, against a sleep, in steps that write the same memory. A sleep's
+/// own serving reads two registers, and is taken at a register-only
+/// operation's price.
+#[test]
+fn a_pause_pays_for_its_serving() {
+    use crate::workflows::Flows;
+    use vos_wire::abi::price::{OPERATION, PAUSE, PER_BYTE};
+    use vos_wire::result::Step;
+    // The agent's gas beyond its steps' for a start and its first step.
+    let own = |kind: u8, len: u32| -> i64 {
+        let mut flows = Flows::new(Node::new());
+        let idle = flows.measured(1, vec![]).1;
+        let start = flows.start("probe", (kind, 9u32, len));
+        let (result, gas) = flows.measured(1, vec![start]);
+        let Step::Ran(run) = &result.steps[1] else {
+            panic!("{:?}", result.steps[1]);
+        };
+        gas as i64 - idle as i64 - run.gas_used as i64
+    };
+    for len in [0u32, 60_000] {
+        let sleep = own(0, len);
+        // The echo's arguments, a byte vector, as the request copies them.
+        let arguments = u64::from(len) + 4;
+        for (name, kind, charge) in [
+            ("a request", 1, PAUSE + PER_BYTE * arguments),
+            ("a wait for a result", 2, PAUSE),
+        ] {
+            let cost = own(kind, len) - sleep + charge as i64 - PAUSE as i64 + OPERATION as i64;
+            println!("{name} of {len} bytes: charged {charge}, costs the agent {cost}");
+            assert!(cost <= (charge * 4 / 5) as i64, "{name}, {len} bytes");
+        }
     }
 }

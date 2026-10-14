@@ -1,0 +1,5 @@
+error: a `&mut self` handler takes `&mut Command<Self>`
+  --> tests/compile_fail/handler_with_workflow_context.rs:16:43
+   |
+16 |     pub async fn checkout(&mut self, ctx: &mut Workflow<Self>, items: u64) -> u64 {
+   |                                           ^^^^^^^^^^^^^^^^^^^

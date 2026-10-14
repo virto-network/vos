@@ -27,9 +27,10 @@ pub use vos_wire::{Decode, Encode, abi, keys, scale};
 pub mod prelude {
     pub use alloc::string::String;
     pub use alloc::vec::Vec;
+    pub use core::time::Duration;
 
-    pub use crate::context::{CallError, Command, Level, Query, Ref};
+    pub use crate::context::{CallError, Command, Level, Query, Ref, RequestError, Workflow};
     pub use crate::table::{CommittedMap, Hashed, Ordered, Table};
     pub use crate::{Decode, Encode, actor, messages, scale};
-    pub use vos_wire::ids::{AgentId, InstanceId, Principal};
+    pub use vos_wire::ids::{AgentId, InstanceId, Principal, WorkflowId};
 }

@@ -10,6 +10,7 @@ use vos_wire::Encode;
 use vos_wire::abi::Refusal;
 use vos_wire::batch::Input;
 use vos_wire::ids::{Session, SessionId, SessionRef};
+use vos_wire::keys::Due;
 use vos_wire::records::{SessionMark, stored};
 use vos_wire::result::{InputRef, Outcome, Run, Step, WorkResult, Write};
 use vos_wire::{defaults, expiry, keys};
@@ -26,11 +27,28 @@ fn session(key: u8, name: u8, t0: u64) -> Session {
     }
 }
 
+/// The sessions a sweep listed, each by its row's bucket.
 fn swept(step: &Step) -> Vec<(u64, SessionId)> {
     match step {
-        Step::Swept { due } => due.clone(),
+        Step::Swept { due } => due.iter().map(|&(at, id)| (bucket_of(at), id)).collect(),
         other => panic!("not a sweep: {other:?}"),
     }
+}
+
+/// The bucket whose sessions are due at `at`.
+fn bucket_of(at: u64) -> u64 {
+    let bucket = (at - defaults::SESSION_EXPIRY_MS) / defaults::SESSION_BUCKET_MS - 1;
+    assert_eq!(
+        expiry::due(bucket),
+        at,
+        "a session's row is due at a bucket's end"
+    );
+    bucket
+}
+
+/// The row of session `id` in the due index, filed in `bucket`.
+fn expiry_row(bucket: u64, id: SessionId) -> Vec<u8> {
+    keys::due(expiry::due(bucket), Due::Session(id))
 }
 
 #[test]
@@ -219,20 +237,20 @@ fn sessions_are_collected_once_expired_and_moved_while_active() {
     let (idle_id, _) = node.session(&idle).unwrap();
     let (active_id, _) = node.session(&active).unwrap();
     for id in [idle_id, active_id] {
-        assert_eq!(node.get(&keys::expiry(bucket, id)), Some(Vec::new()));
+        assert_eq!(node.get(&expiry_row(bucket, id)), Some(Vec::new()));
     }
     assert_eq!(node.value::<u64>(&keys::key_sessions(&[3; 32])), Some(2));
 
     let later = now + defaults::SESSION_EXPIRY_MS / 2;
     node.batch(later, vec![increment_in(&actors, active, 2)]);
     assert_eq!(
-        node.get(&keys::expiry(bucket, active_id)),
+        node.get(&expiry_row(bucket, active_id)),
         Some(Vec::new()),
         "a request does not move its row"
     );
 
     let due = expiry::due(bucket);
-    let result = node.batch(due - 1, vec![Input::Sweep]);
+    let result = node.batch(due - 1, vec![node.sweep(due - 1)]);
     assert_eq!(swept(&result.steps[0]), Vec::new(), "not due yet");
     let result = node.batch(
         due - 1,
@@ -244,7 +262,7 @@ fn sessions_are_collected_once_expired_and_moved_while_active() {
     assert_eq!(refused(&result.steps[0]), Refusal::Expired);
     assert_eq!(refused(&result.steps[1]), Refusal::Sequence);
 
-    let result = node.batch(due, vec![Input::Sweep]);
+    let result = node.batch(due, vec![node.sweep(due)]);
     assert_eq!(
         swept(&result.steps[0]),
         vec![(bucket, idle_id), (bucket, active_id)]
@@ -255,10 +273,10 @@ fn sessions_are_collected_once_expired_and_moved_while_active() {
     for sequence in 1..=2 {
         assert_eq!(node.get(&keys::reply(idle_id, sequence)), None);
     }
-    assert_eq!(node.get(&keys::expiry(bucket, idle_id)), None);
-    assert_eq!(node.get(&keys::expiry(bucket, active_id)), None);
+    assert_eq!(node.get(&expiry_row(bucket, idle_id)), None);
+    assert_eq!(node.get(&expiry_row(bucket, active_id)), None);
     assert_eq!(
-        node.get(&keys::expiry(expiry::bucket(later), active_id)),
+        node.get(&expiry_row(expiry::bucket(later), active_id)),
         Some(Vec::new()),
         "moved to its mark's bucket"
     );
@@ -285,7 +303,7 @@ fn sessions_are_collected_once_expired_and_moved_while_active() {
 
     // The moved row comes due in its turn, and the active session goes.
     let due = expiry::due(expiry::bucket(later));
-    let result = node.batch(due, vec![Input::Sweep]);
+    let result = node.batch(due, vec![node.sweep(due)]);
     assert_eq!(
         swept(&result.steps[0]),
         vec![(expiry::bucket(later), active_id)]
@@ -348,7 +366,7 @@ fn session_caps_refuse_new_sessions_until_some_are_collected() {
     let due = expiry::due(expiry::bucket(now));
     let mut sweeps = 0;
     loop {
-        let result = node.batch(due, vec![Input::Sweep]);
+        let result = node.batch(due, vec![node.sweep(due)]);
         let listed = swept(&result.steps[0]).len();
         assert!(listed <= defaults::SWEEP_LIMIT);
         if listed == 0 {
@@ -419,25 +437,25 @@ fn accumulate_holds_the_caps_and_clears_the_rows_a_sweep_lists() {
     let bucket = expiry::bucket(now);
     let orphan = (bucket, SessionId(99));
     node.state
-        .insert(keys::expiry(orphan.0, orphan.1), stored(&[]));
+        .insert(expiry_row(orphan.0, orphan.1), stored(&[]));
     let sweep = |time: u64, version: u64| WorkResult {
         version,
         time,
         seed: [0; 32],
         steps: vec![Step::Swept {
-            due: vec![orphan, (bucket, id)],
+            due: vec![(expiry::due(orphan.0), orphan.1), (expiry::due(bucket), id)],
         }],
     };
     node.accumulate(&sweep(now + 1, version(&node)).encode());
-    assert_eq!(node.get(&keys::expiry(orphan.0, orphan.1)), None);
-    assert_eq!(node.get(&keys::expiry(bucket, id)), Some(Vec::new()));
+    assert_eq!(node.get(&expiry_row(orphan.0, orphan.1)), None);
+    assert_eq!(node.get(&expiry_row(bucket, id)), Some(Vec::new()));
     node.state.remove(&keys::session_of(id));
     let due = expiry::due(bucket);
     node.accumulate(&sweep(due, version(&node)).encode());
     assert_eq!(node.get(&keys::session(id)), None);
     assert_eq!(node.get(&keys::reply(id, 1)), None);
     assert_eq!(node.get(&keys::reply(id, 2)), None);
-    assert_eq!(node.get(&keys::expiry(bucket, id)), None);
+    assert_eq!(node.get(&expiry_row(bucket, id)), None);
     assert!(
         node.get(&keys::session_index(&session(6, 1, now)))
             .is_some(),
@@ -449,26 +467,29 @@ fn accumulate_holds_the_caps_and_clears_the_rows_a_sweep_lists() {
     );
 }
 
-/// Refine lists due rows by their keys alone: a key under the index that
-/// is not an expiry key is passed over, and a row whose value was not
-/// stored is listed like any.
+/// Refine takes the rows of the due index the leader lists by their keys:
+/// a row whose value was not stored is taken like any, and one that is not
+/// there, or not due, is passed over.
 #[test]
-fn refine_lists_due_rows_by_their_keys() {
+fn refine_takes_the_due_rows_listed_by_their_keys() {
     let (actors, mut node, _, _) = setup();
     let now = 100 * defaults::SESSION_BUCKET_MS;
     let session = session(8, 8, now);
     node.batch(now, vec![increment_in(&actors, session, 1)]);
     let (id, _) = node.session(&session).unwrap();
-    let mut malformed = keys::expiry_prefix();
-    malformed.extend_from_slice(&[0; 3]);
-    node.state.insert(malformed.clone(), stored(&[]));
-    node.state
-        .insert(keys::expiry(expiry::bucket(now), id), vec![0xff]);
-    let due = expiry::due(expiry::bucket(now));
-    let result = node.batch(due, vec![Input::Sweep]);
-    assert_eq!(swept(&result.steps[0]), vec![(expiry::bucket(now), id)]);
+    let bucket = expiry::bucket(now);
+    node.state.insert(expiry_row(bucket, id), vec![0xff]);
+    let due = expiry::due(bucket);
+    let listed = Input::Sweep {
+        due: vec![
+            (due, Due::Session(id)),
+            (due, Due::Session(SessionId(99))),
+            (due + 1, Due::Session(id)),
+        ],
+    };
+    let result = node.batch(due, vec![listed]);
+    assert_eq!(swept(&result.steps[0]), vec![(bucket, id)]);
     assert_eq!(node.session(&session), None);
-    assert!(node.state.contains_key(&malformed));
 }
 
 /// The agent's session state, every row of it.
@@ -479,7 +500,7 @@ fn session_rows(node: &Node) -> BTreeMap<Vec<u8>, Vec<u8>> {
         keys::reply(SessionId(0), 0),
         keys::session_index(&any),
         keys::session_of(SessionId(0)),
-        keys::expiry_prefix(),
+        keys::due_prefix(),
         keys::key_sessions(&[0; 32]),
         keys::live_sessions(),
         keys::next_session(),
@@ -630,7 +651,7 @@ impl SessionModel {
             *keys_held.entry(session.key).or_default() += 1;
         }
         for (bucket, id) in &self.rows {
-            rows.insert(keys::expiry(*bucket, *id), stored(&[]));
+            rows.insert(expiry_row(*bucket, *id), stored(&[]));
         }
         for (key, count) in keys_held {
             rows.insert(keys::key_sessions(&key), stored(&count.encode()));
@@ -683,7 +704,7 @@ proptest! {
             };
             let mut inputs = Vec::new();
             if sweep {
-                inputs.push(Input::Sweep);
+                inputs.push(node.sweep(time));
             }
             let mut requested = Vec::new();
             for (key, name, t0, sequence) in requests {

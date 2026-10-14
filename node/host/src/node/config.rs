@@ -256,9 +256,10 @@ pub enum Error {
     /// The agent program does not load, or a stored program does not
     /// install.
     Program(String),
-    /// The refine gas cannot fit the largest handler with the agent's
-    /// reserves behind a full batch's other inputs
-    /// (`defaults::min_refine_gas`): some input could never be dispatched.
+    /// The refine gas cannot fit the largest handler, or a workflow's
+    /// largest step, with the agent's reserves behind a full batch's other
+    /// inputs (`defaults::min_refine_gas`): some input or step could never
+    /// be dispatched.
     Gas,
     /// The data directory, the space, the network or the ingress's
     /// listener failed.
