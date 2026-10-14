@@ -44,7 +44,7 @@ use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
 use vos_checker::calls::signed_query;
-use vos_checker::programs::actor;
+use vos_checker::programs::package;
 use vos_wire::Decode;
 use vos_wire::ids::{AgentId, InstanceId};
 use vos_wire::ingress::{Answer, Consistency};
@@ -98,7 +98,7 @@ fn main() {
     } else {
         println!("taskset is missing: the nodes and the driver share every core");
     }
-    let counter = actor("counter");
+    let counter = package("counter");
     let space = Space::start(pinned, &cpus);
     // A run of `sessions` new sessions at each of `agents`: closed, or open
     // at `rate` offered over them all.

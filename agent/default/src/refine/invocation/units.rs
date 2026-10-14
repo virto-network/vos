@@ -21,6 +21,12 @@
 //! **A call of this agent's is an await:** the unit ends with it, and so
 //! does the step once its share is spent.
 //!
+//! **A section** on the workflow's instance's state is an effect: opened, it
+//! runs within the unit's whole limit, never preempted, so it never spans
+//! a pause. Inside it only the instance's row operations, the time, logs
+//! and its close are served, besides precompiles; anything else fails the
+//! step, and so does a machine that halts with a section open.
+//!
 //! **The floor:** a step ends early only once its machine has moved since
 //! it resumed; one that has not fails, out of gas, as no step of its limit
 //! could move it, or, stopped by the meter, waits for a batch with room, as
@@ -121,6 +127,7 @@ impl Invocation<'_> {
                 }
             };
             match exit {
+                Exit::Halt if self.section => return Err(Failure::Trapped),
                 Exit::Halt => return Ok(outcome.unwrap_or(Ended::Replied(Vec::new()))),
                 Exit::Panic => return Err(Failure::Trapped),
                 Exit::OutOfGas => {
@@ -154,7 +161,7 @@ impl Invocation<'_> {
         id: u64,
         outcome: &mut Option<Ended>,
     ) -> Result<(), Failure> {
-        if known(id) && !abi::allowed(Kind::Workflow, id) {
+        if !serves(self.section, id) {
             return Err(Failure::Trapped);
         }
         let used = share.used(machine);
@@ -268,6 +275,13 @@ impl Invocation<'_> {
         }
         Ok(())
     }
+}
+
+/// Whether a workflow's machine may make host call `id`, with a section
+/// open or not ([`abi::workflow_may_use`]). A precompile or an id the agent
+/// does not serve is served alike either way.
+fn serves(section: bool, id: u64) -> bool {
+    !known(id) || abi::workflow_may_use(section, id)
 }
 
 /// Pay a page the machine first stores to, before it is opened.

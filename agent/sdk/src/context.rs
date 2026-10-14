@@ -1,8 +1,9 @@
 //! Handler and workflow contexts. A query's context reaches only
 //! operations that read; a command's adds the ones that write; a
-//! workflow's reaches state only through calls, and adds the awaits that
-//! pause it.
+//! workflow's reaches its instance's state only through sections and
+//! calls, and adds the awaits that pause it.
 
+use core::cell::Cell;
 use core::future::{IntoFuture, Ready, ready};
 use core::marker::PhantomData;
 use core::time::Duration;
@@ -13,6 +14,7 @@ use vos_wire::ids::{AgentId, InstanceId, Principal, WorkflowId};
 use vos_wire::{Decode, DecodeError, Encode};
 
 use crate::host;
+use crate::state::{self, New, Tables};
 
 /// A handler of an actor, as a message another actor can send.
 pub trait Method: Encode {
@@ -33,8 +35,9 @@ pub trait AttestableMethod: Encode {
     type Output: Decode;
 }
 
-/// A `#[workflow]` method, run as its own program: a request naming it
-/// starts one, answered with its id, and its result is read by that id.
+/// A `#[workflow]` method, routed in its actor's program and run as a
+/// workflow: a request naming it starts one, answered with its id, and its
+/// result is read by that id.
 pub trait WorkflowMethod: Encode {
     type Actor;
     const ID: u32;
@@ -267,18 +270,41 @@ fn millis(within: Option<Duration>) -> u64 {
     })
 }
 
-/// The context of a `#[workflow]`: no state of its own, calls to this
-/// agent's instances, messages, and the awaits of other agents and timers
-/// at which it pauses. Every `.await` may pause: the code between two of
-/// them runs atomically, its effects committing with the snapshot taken at
-/// the next pause.
+/// The context of a `#[workflow]`: its instance's state through sections,
+/// calls to this agent's instances, messages, and the awaits of other
+/// agents and timers at which it pauses. Every `.await` may pause: the code
+/// between two of them runs atomically, its effects committing with the
+/// snapshot taken at the next pause.
 ///
 /// Code with no effect yet may pause anywhere: when the step's share of
 /// the batch's gas is spent, the workflow is snapshotted and goes on in the
 /// next batch, so a long computation needs no await. From its first effect
-/// (a call, a send, a request, a wait or the result) to its next await, the
-/// code has the workflow's whole gas limit, and never pauses.
+/// (a section, a call, a send, a request, a wait or the result) to its next
+/// await, the code has the workflow's whole gas limit, and never pauses.
+///
+/// **Sections** ([`Workflow::read`], [`Workflow::update`]) reach the state
+/// of the instance the workflow runs for, its tables included, as the
+/// instance itself. A section is synchronous: its closure can neither await
+/// nor call, and the agent serves only the instance's rows, the time and
+/// logs inside it, so a section never spans a pause. State is read afresh
+/// in every section. A short computation on state belongs inside one
+/// `update`, which reads and writes atomically; a long one cannot keep that
+/// atomicity, since a unit that computes long must pause between its read
+/// and its write, and so re-reads after the pause:
+///
+/// ```text
+/// let order = ctx.read(|shop: &Shop| shop.orders.get(&id));
+/// let priced = price(order).await; // a pause: state may change meanwhile
+/// ctx.update(|shop: &mut Shop| {
+///     if shop.orders.get(&id) == order {
+///         shop.orders.insert(&id, &priced);
+///     }
+/// });
+/// ```
 pub struct Workflow<A> {
+    /// This agent and instance, asked once: the workflow's memory keeps
+    /// them across its pauses.
+    me: Cell<Option<(AgentId, InstanceId)>>,
     _actor: PhantomData<fn() -> A>,
 }
 
@@ -286,14 +312,20 @@ impl<A> Workflow<A> {
     #[doc(hidden)]
     pub const fn new() -> Self {
         Self {
+            me: Cell::new(None),
             _actor: PhantomData,
         }
     }
 
     /// This agent, and the instance whose workflow this is.
     pub fn me(&self) -> (AgentId, InstanceId) {
+        if let Some(me) = self.me.get() {
+            return me;
+        }
         let (instance, agent) = host::self_id();
-        (AgentId(agent), InstanceId(instance))
+        let me = (AgentId(agent), InstanceId(instance));
+        self.me.set(Some(me));
+        me
     }
 
     /// The time of the batch running this step, in milliseconds since the
@@ -379,6 +411,34 @@ impl<A> Workflow<A> {
     /// Unix epoch.
     pub async fn sleep_until(&mut self, time: u64) {
         host::sleep(time);
+    }
+}
+
+impl<A: Encode + Decode + Tables + New> Workflow<A> {
+    /// Read the state of the workflow's instance, its tables included, in
+    /// a section: `f`'s result. A new instance's state when none is stored.
+    /// It borrows the context whole, so `f` reaches nothing of it.
+    pub fn read<R>(&mut self, f: impl FnOnce(&A) -> R) -> R {
+        let (_, instance) = self.me();
+        host::open(instance.0);
+        let state = state::load::<A>();
+        let result = f(&state);
+        host::close();
+        result
+    }
+
+    /// Read and change the state of the workflow's instance, its tables
+    /// included, atomically in a section: `f`'s result. The state is
+    /// written back if it changed; its tables' writes are `f`'s own.
+    pub fn update<R>(&mut self, f: impl FnOnce(&mut A) -> R) -> R {
+        let (_, instance) = self.me();
+        host::open(instance.0);
+        let mut state = state::load::<A>();
+        let before = state.encode();
+        let result = f(&mut state);
+        state::save(&state, &before);
+        host::close();
+        result
     }
 }
 

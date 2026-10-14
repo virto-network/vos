@@ -1,15 +1,19 @@
 [package]
-name = "tally"
+name = "kernels"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[lib]
+test = false
+bench = false
+
 [[bin]]
-name = "tally"
+name = "kernels"
 path = "src/main.rs"
 test = false
 bench = false
 
 [dependencies]
-ledger = { path = "../ledger" }
+vos-pvm-precompiles = { path = "../../../pvm/proof/precompiles", default-features = false, features = ["blake2b"] }
 vos-sdk = { workspace = true }

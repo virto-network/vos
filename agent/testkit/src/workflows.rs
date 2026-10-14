@@ -1,5 +1,7 @@
-//! The model's workflows: started by a request or a call, stepped by the
-//! input that resumes each, a unit at a time, and snapshotted between steps
+//! The model's workflows: started by a request or a call, run in their
+//! instance's actor program, stepped by the input that resumes each, a unit
+//! at a time, reaching their instance's state in sections, and snapshotted
+//! between steps
 //! as the default agent snapshots them: the counter after the pausing call,
 //! or where the step was preempted, the registers, each page the step wrote
 //! that differs from its base, and the call it left unserved.
@@ -149,9 +151,10 @@ impl Testkit {
         {
             return Err(Failure::Forbidden);
         }
-        let blob = installed
-            .bound(method, Kind::Workflow)
-            .ok_or(Failure::Unknown)?;
+        if schema.kind != Kind::Workflow {
+            return Err(Failure::Unknown);
+        }
+        let blob = &installed.program;
         let program = program_hash(blob);
         let parsed = vos_pvm::spi::parse_standard_program(blob).ok_or(Failure::Unloadable)?;
         let layout = parsed.layout(&[]).ok_or(Failure::Unloadable)?;
@@ -168,6 +171,7 @@ impl Testkit {
             format: Workflow::FORMAT,
             program,
             instance,
+            method,
             owner,
             gas: schema.gas.unwrap_or(self.default_gas).min(self.max_gas),
             writable: writable as u32,
@@ -437,11 +441,21 @@ impl Testkit {
                 );
             }
         }
-        // A machine preempted resumes as it was; one paused learns its
-        // input's length.
-        if !matches!(workflow.state, WorkflowState::Preempted(_)) {
-            machine.registers_mut()[7] = resume.len() as u64;
-            machine.registers_mut()[8] = 0;
+        // Its first step enters the actor program as a handler does, the
+        // method routed; a machine preempted resumes as it was; one paused
+        // learns its input's length.
+        let registers = machine.registers_mut();
+        match (&workflow.snapshot, &workflow.state) {
+            (None, _) => {
+                registers[7] = u64::from(workflow.method.0);
+                registers[8] = Kind::Workflow.encode()[0].into();
+                registers[9] = resume.len() as u64;
+            }
+            (Some(_), WorkflowState::Preempted(_)) => {}
+            (Some(_), _) => {
+                registers[7] = resume.len() as u64;
+                registers[8] = 0;
+            }
         }
         machine.memory_mut().take_dirty_pages();
         let pending = workflow
@@ -642,6 +656,8 @@ impl Run<'_> {
                 None => machine.try_resume().map_err(|_| Failure::Trapped)?,
             };
             match exit {
+                // A section never outlives the workflow's run.
+                ExitReason::Halt if self.section => return Err(Failure::Trapped),
                 ExitReason::Halt => return Ok(outcome.unwrap_or(Ended::Replied(Vec::new()))),
                 // The share is spent: the gas a host leaves after an
                 // out-of-gas exit is its own.
@@ -670,7 +686,7 @@ impl Run<'_> {
         id: u64,
         outcome: &mut Option<Ended>,
     ) -> Result<(), Failure> {
-        if known(id) && !abi::allowed(Kind::Workflow, id) {
+        if known(id) && !abi::workflow_may_use(self.section, id) {
             return Err(Failure::Trapped);
         }
         let used = share.used(machine);

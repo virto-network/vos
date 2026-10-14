@@ -52,39 +52,20 @@ fn every_program_calls_only_its_surface() {
     for call in calls(&actors.checksum) {
         assert!(surface::attestable(call), "checksum calls {call:#x}");
     }
-    for call in calls(&actors.tally) {
-        assert!(surface::workflow(call), "tally calls {call:#x}");
+    // The shop's program holds its workflows: it pauses, reaches its state
+    // in sections, and compresses.
+    let shop = calls(&vos_testkit::programs::actor("shop"));
+    for call in [
+        abi::op::REQUEST,
+        abi::op::RESULT,
+        abi::op::SLEEP,
+        abi::op::OPEN,
+        abi::op::CLOSE,
+        abi::precompile::BLAKE2B_COMPRESS,
+    ] {
+        assert!(shop.contains(&call), "the shop calls {call:#x}");
     }
-    // The shop's workflows: each that pauses calls an operation only a
-    // workflow may use, and each that compresses calls the precompile.
-    let pauses = [abi::op::REQUEST, abi::op::RESULT, abi::op::SLEEP];
-    let computes = [
-        "chain",
-        "grind",
-        "grind_whole",
-        "settle",
-        "relay",
-        "stuck",
-        "press",
-    ];
-    let compresses = ["digest", "press"];
-    for name in crate::workflows::FLOWS {
-        let calls = calls(&vos_testkit::programs::actor(name));
-        for call in &calls {
-            assert!(surface::workflow(*call), "{name} calls {call:#x}");
-        }
-        assert_eq!(
-            calls.iter().any(|call| pauses.contains(call)),
-            !computes.contains(&name),
-            "{name} pauses: the check sees its calls"
-        );
-        assert_eq!(
-            calls.contains(&abi::precompile::BLAKE2B_COMPRESS),
-            compresses.contains(&name),
-            "{name} compresses"
-        );
-    }
-    for call in calls(&vos_testkit::programs::actor("shop")) {
+    for call in shop {
         assert!(surface::actor(call), "shop calls {call:#x}");
     }
 }
@@ -139,12 +120,7 @@ fn vos_and_jam_hosts_agree_on_batches_that_read_no_state() {
     let mut vos = Node::new();
     let mut jam = Node::jam(false);
     let counter = vos.add(&actors.counter);
-    for program in [
-        &actors.counter,
-        &actors.ledger,
-        &actors.checksum,
-        &actors.tally,
-    ] {
+    for program in [&actors.counter, &actors.ledger, &actors.checksum] {
         jam.add(program);
     }
     let batches = vec![
@@ -205,7 +181,7 @@ fn vos_and_jam_hosts_agree_on_batches_that_run_actors() {
     };
     let counter = add(&actors.counter);
     let caller = add(&actors.caller);
-    for program in [&actors.ledger, &actors.checksum, &actors.tally] {
+    for program in [&actors.ledger, &actors.checksum] {
         add(program);
     }
     let mut sessions = Sessions::new();

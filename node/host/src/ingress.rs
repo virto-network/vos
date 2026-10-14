@@ -26,8 +26,9 @@ use crate::node::{Inner, ReplaceError};
 const QUERY_HORIZON_MS: u64 = 300_000;
 /// The most a body may hold beyond a request's cap: its envelope.
 const ENVELOPE: usize = 4096;
-/// The most an install's body may hold: a package's programs.
-const MAX_INSTALL: usize = 64 << 20;
+/// The most an install's body may hold: a package's ELF, at the most a
+/// derivation reads, and its envelope.
+const MAX_INSTALL: usize = vos_pvm_compiler::MAX_ELF + ENVELOPE;
 
 pub(crate) struct Ingress {
     inner: Arc<Inner>,
@@ -236,13 +237,7 @@ impl Ingress {
                     Some(Ok(install)) => {
                         let reply = self
                             .inner
-                            .install(
-                                agent,
-                                install.instance,
-                                install.program,
-                                install.beside,
-                                install.roles,
-                            )
+                            .install(agent, install.instance, install.elf, install.roles)
                             .await;
                         respond(answer_of(reply))
                     }

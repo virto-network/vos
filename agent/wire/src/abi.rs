@@ -59,8 +59,9 @@ pub enum Kind {
     /// An `#[attestable]` method: no operations at all.
     #[codec(index = 2)]
     Attestable,
-    /// A `#[workflow]` method: its own program, which the agent runs as a
-    /// workflow, never as a handler.
+    /// A `#[workflow]` method: routed in the actor's program as a handler
+    /// is, but run by the agent as a workflow, never as a handler. Its
+    /// instance's state it reaches only inside a section ([`op::OPEN`]).
     #[codec(index = 3)]
     Workflow,
 }
@@ -161,9 +162,10 @@ pub mod op {
     pub const SEND: u64 = 0x521;
     /// φ7 an attestable method of this instance's package, φ8/φ9
     /// arguments, φ10 output, φ11 capacity → φ7 the output's length, φ8 0
-    /// or a [`super::Failure`] code. The agent runs the program the package
-    /// bound to the method at install, never one the caller names. As with
-    /// `CALL`, the output should hold [`super::cap::REPLY`] bytes.
+    /// or a [`super::Failure`] code. The agent runs the method's kernel,
+    /// derived from the package at install, never a program the caller
+    /// names. As with `CALL`, the output should hold [`super::cap::REPLY`]
+    /// bytes.
     pub const ATTEST: u64 = 0x522;
     /// → φ7 the instance, φ8 the agent.
     pub const SELF_ID: u64 = 0x523;
@@ -191,24 +193,40 @@ pub mod op {
     /// first batch at or past it, and later than the batch that sleeps, so
     /// a sleep's row in the due index always lies ahead of its step.
     pub const SLEEP: u64 = 0x532;
+
+    /// A workflow's section on its instance's state, as the instance
+    /// itself, with no role check: φ7 the instance, which must be the
+    /// workflow's own. Until [`CLOSE`], the agent serves only that
+    /// instance's `GET`, `PUT`, `DELETE` and `SCAN`, and `NOW` and `LOG`:
+    /// any other operation, a second `OPEN` among them, fails the
+    /// invocation, as does a workflow that ends with a section open. A
+    /// section is an effect ([`super::is_effect`]): it runs to the unit's
+    /// next await, so it never spans a pause, and its writes commit with
+    /// the step.
+    pub const OPEN: u64 = 0x540;
+    /// Close the open section; with none open, it fails the invocation.
+    pub const CLOSE: u64 = 0x541;
 }
 
 /// Whether operation `op` is an effect a workflow makes: a call, a send, a
-/// request or a wait for a result, or its result. A workflow's unit, the
-/// code between two awaits, is preempted only before its first effect, and
-/// from it runs to its next await with the step's whole limit. Every other
-/// operation a workflow may use only reads, sets registers or pauses.
+/// request or a wait for a result, a section on its instance's state, or
+/// its result. A workflow's unit, the code between two awaits, is preempted
+/// only before its first effect, and from it runs to its next await with
+/// the step's whole limit. A section's reads count too: a value read and
+/// then written within one unit stays atomic. Every other operation a
+/// workflow may use only reads, sets registers or pauses.
 pub const fn is_effect(op: u64) -> bool {
     matches!(
         op,
-        op::CALL | op::SEND | op::REQUEST | op::RESULT | op::REPLY | op::FAIL
+        op::CALL | op::SEND | op::REQUEST | op::RESULT | op::REPLY | op::FAIL | op::OPEN
     )
 }
 
 /// Whether an invocation of `kind` may use operation `op`. `CALL` from a
 /// query is allowed here; the agent also refuses a query that calls a
-/// command. A workflow holds no state of its own: it reaches state only
-/// through calls.
+/// command. A workflow reaches its instance's state only inside a section,
+/// where the agent serves the row operations and refuses the rest
+/// ([`in_section`]); outside one, a row operation fails the invocation.
 pub const fn allowed(kind: Kind, op: u64) -> bool {
     match kind {
         Kind::Attestable => false,
@@ -220,12 +238,18 @@ pub const fn allowed(kind: Kind, op: u64) -> bool {
                 | op::LOG
                 | op::NOW
                 | op::RANDOM
+                | op::GET
+                | op::PUT
+                | op::DELETE
+                | op::SCAN
                 | op::CALL
                 | op::SEND
                 | op::SELF_ID
                 | op::REQUEST
                 | op::RESULT
                 | op::SLEEP
+                | op::OPEN
+                | op::CLOSE
         ),
         Kind::Query => matches!(
             op,
@@ -262,6 +286,29 @@ pub const fn allowed(kind: Kind, op: u64) -> bool {
     }
 }
 
+/// Whether a workflow may use operation `op` with a section open: its
+/// instance's row operations, the time, a log and the section's close.
+/// The row operations it may use only then.
+pub const fn in_section(op: u64) -> bool {
+    matches!(
+        op,
+        op::GET | op::PUT | op::DELETE | op::SCAN | op::NOW | op::LOG | op::CLOSE
+    )
+}
+
+/// Whether a workflow may use operation `op`, one the agent serves, with a
+/// section open or not: inside one, what [`in_section`] names; outside
+/// one, what its kind may use but the row operations and a close.
+pub const fn workflow_may_use(section: bool, op: u64) -> bool {
+    match section {
+        true => in_section(op),
+        false => {
+            allowed(Kind::Workflow, op)
+                && !matches!(op, op::GET | op::PUT | op::DELETE | op::SCAN | op::CLOSE)
+        }
+    }
+}
+
 /// Gas an operation costs the actor, charged before it is served: the
 /// operation's price, then [`price::PER_BYTE`] for every byte copied either
 /// way, and [`price::KEY_BYTE`] for every byte of a key a row operation
@@ -277,6 +324,9 @@ pub mod price {
     /// An id the agent does not serve, and the operations that only read
     /// or set registers.
     pub const OPERATION: u64 = 2_000;
+    /// A section's open, and its close: each a workflow's exit through the
+    /// agent's checks of its unit's effects.
+    pub const SECTION: u64 = 3_000;
     /// The request's arguments, copied out with a `poke`.
     pub const INPUT: u64 = 2_500;
     pub const RANDOM: u64 = 6_000;
@@ -305,6 +355,7 @@ pub mod price {
             op::SCAN => SCAN,
             op::SEND => SEND,
             op::REQUEST | op::RESULT | op::SLEEP => PAUSE,
+            op::OPEN | op::CLOSE => SECTION,
             op::CALL | op::ATTEST => MACHINE,
             op::RANDOM => RANDOM,
             op::CALLER => CALLER,
@@ -340,8 +391,8 @@ pub mod cap {
     pub const MESSAGE: usize = 64 << 10;
     pub const ATTESTS: usize = 16;
     pub const WORK_RESULT: usize = 4 << 20;
-    /// The pages a workflow's program may write, its data, heap and stack:
-    /// a start of a larger one fails.
+    /// The pages a workflow's program, its actor's, may write, its data,
+    /// heap and stack: a start of a workflow of a larger one fails.
     pub const WORKFLOW_PAGES: usize = 4096;
     /// The raw bytes of the pages one workflow step may write: past it, the
     /// step fails.
@@ -591,14 +642,14 @@ pub mod surface {
         ACTOR_ABI.contains(&id) || PRECOMPILES.contains(&id)
     }
 
-    /// A workflow program's call: the operations [`super::allowed`] grants
+    /// A workflow's call: the operations [`super::allowed`] grants
     /// [`super::Kind::Workflow`], or a precompile.
     pub fn workflow(id: u64) -> bool {
         super::allowed(super::Kind::Workflow, id) || PRECOMPILES.contains(&id)
     }
 
-    /// An attestable program's call: a precompile only, as the prover
-    /// needs.
+    /// An attestable method's kernel's call: a precompile only, as the
+    /// prover needs, which its derivation checks.
     pub fn attestable(id: u64) -> bool {
         PRECOMPILES.contains(&id)
     }

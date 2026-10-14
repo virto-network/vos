@@ -80,7 +80,7 @@ fn a_client_calls_an_agent_the_operator_installed() {
         &agent,
         "--instance",
         "1",
-        "--program",
+        "--elf",
         counter.to_str().unwrap(),
     ]);
     assert!(installed.starts_with("done"), "{installed}");
@@ -144,13 +144,13 @@ fn a_client_calls_an_agent_the_operator_installed() {
     assert!(after.contains(&format!("at {agent} ")), "{after}");
 }
 
-/// An operator installs a package's programs beside its actor, each bound
-/// by name to a method of its kind: an attestable's and a workflow's. A
-/// program named for a method of another kind is refused before anything
-/// is sent, and the agent refuses a package that leaves a workflow without
-/// its program.
+/// An operator installs a package, the ELF its actor's crate built: the
+/// node derives its programs, the actor's and a kernel per attestable
+/// method, and the install prints their hashes, as the derivation here
+/// gives them. An ELF that is no package is refused before anything is
+/// sent, and the agent refuses an install whose roles leave one unmapped.
 #[test]
-fn an_operator_installs_programs_beside_an_actor() {
+fn an_operator_installs_a_package() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("node");
     let data = data.to_str().unwrap();
@@ -159,11 +159,8 @@ fn an_operator_installs_programs_beside_an_actor() {
     let key = dir.path().join("client.key");
     vos(&["key", "new", "--out", key.to_str().unwrap()]);
     let agent = vos(&["agent", "create", "--node", &url, "--data", data]);
-    let elf = |name: &str| actor_elf(name).to_str().unwrap().to_string();
-    let attestable = format!("checksum={}", elf("checksum"));
-    let workflow = format!("tally={}", elf("tally"));
-    let ledger = elf("ledger");
-    let install = |beside: &[&str]| -> Vec<String> {
+    let ledger = actor_elf("ledger").to_str().unwrap().to_string();
+    let install = |elf: &str, roles: &[&str]| -> Vec<String> {
         let mut args: Vec<String> = [
             "install",
             "--node",
@@ -174,38 +171,35 @@ fn an_operator_installs_programs_beside_an_actor() {
             &agent,
             "--instance",
             "2",
-            "--program",
-            &ledger,
-            "--role",
-            "minter=1",
+            "--elf",
+            elf,
         ]
         .map(str::to_string)
         .to_vec();
-        args.extend(beside.iter().map(|arg| arg.to_string()));
+        args.extend(roles.iter().map(|arg| arg.to_string()));
         args
     };
 
-    let swapped = format!("checksum={}", elf("tally"));
-    let mismatched = vos_fails(&strs(&install(&[
-        "--attestable",
-        &attestable,
-        "--workflow",
-        &swapped,
-    ])));
-    assert!(
-        mismatched.contains("checksum is not a method of kind Workflow"),
-        "{mismatched}"
+    let agent_elf = agent_elf();
+    let refused = vos_fails(&strs(&install(agent_elf.to_str().unwrap(), &[])));
+    assert!(refused.contains("vos_schema"), "{refused}");
+    let unmapped = vos(&strs(&install(&ledger, &[])));
+    assert!(unmapped.starts_with("failed 6"), "unknown: {unmapped}");
+    let installed = vos(&strs(&install(&ledger, &["--role", "minter=1"])));
+    // The node's derivation is the one a JAM builder makes of the same ELF.
+    let elf = std::fs::read(&ledger).unwrap();
+    let jam = vos_jam::programs::derive(&elf).unwrap().derivation;
+    assert_eq!(
+        installed,
+        format!(
+            "done\nprogram {}\nkernel checksum {}\nelf {}\ntranspiler {}",
+            hex::encode(jam.program.0),
+            hex::encode(jam.kernels[0].1.0),
+            hex::encode(jam.elf),
+            vos_pvm_compiler::TRANSPILER_VERSION,
+        )
     );
-    let unbound = vos(&strs(&install(&["--attestable", &attestable])));
-    assert!(unbound.starts_with("failed 6"), "unknown: {unbound}");
-    let installed = vos(&strs(&install(&[
-        "--attestable",
-        &attestable,
-        "--workflow",
-        &workflow,
-    ])));
-    assert!(installed.starts_with("done"), "{installed}");
-    // The attestable runs from the program installed beside the ledger: the
+    // The attestable runs as the kernel derived from the ledger's ELF: the
     // checksum of no values is its offset basis.
     let audited = vos(&[
         "call",
@@ -247,14 +241,10 @@ fn a_client_reads_the_workflow_it_started() {
         &agent,
         "--instance",
         "2",
-        "--program",
+        "--elf",
         &elf("ledger"),
         "--role",
         "minter=1",
-        "--attestable",
-        &format!("checksum={}", elf("checksum")),
-        "--workflow",
-        &format!("tally={}", elf("tally")),
     ]);
     assert!(installed.starts_with("done"), "{installed}");
     let key = |name: &str| {
@@ -423,7 +413,7 @@ fn a_pending_call_whose_session_was_collected_is_lost() {
         &agent,
         "--instance",
         "1",
-        "--program",
+        "--elf",
         counter.to_str().unwrap(),
     ]);
     assert!(installed.starts_with("done"), "{installed}");

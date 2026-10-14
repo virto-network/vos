@@ -1,7 +1,6 @@
 //! Rounds: a workflow whose every effect a checker can count, and one
 //! that writes its memory at every step, for the node's exactly-once
-//! checker and the snapshot bench. Each workflow is a program of its own
-//! (`src/bin`).
+//! checker and the snapshot bench, both in the rounds' program.
 //!
 //! A tour's effects are tallies of its amounts, at rounds instances of its
 //! own agent and of another: each amount's count says how often it

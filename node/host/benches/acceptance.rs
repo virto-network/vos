@@ -92,7 +92,7 @@ fn state(node: &Node, agent: AgentId, id: WorkflowId) -> WorkflowState {
 fn resumes(node: &Node, agent: AgentId, session: u64) -> Vec<Duration> {
     let rounds = Rounds::load();
     let methods = rounds.methods;
-    let install = node.install(agent, ROUNDS, &rounds.program, &rounds.beside(), vec![]);
+    let install = node.install(agent, ROUNDS, &rounds.elf, vec![]);
     let installed = smol::block_on(install);
     assert!(
         matches!(installed, Ok(Reply::Ran(Outcome::Done(_)))),
@@ -250,6 +250,7 @@ fn main() {
     let Programs {
         agent: agent_program,
         counter,
+        counter_elf,
     } = Programs::load();
     let increment_method = method(&counter, "increment");
     let value = method(&counter, "value");
@@ -262,7 +263,7 @@ fn main() {
     let executors = config.executors;
     let node = Arc::new(Node::open(dir.path(), config).unwrap());
     let agent = node.create_agent().unwrap();
-    let installed = smol::block_on(node.install(agent, COUNTER, &counter, &[], vec![]));
+    let installed = smol::block_on(node.install(agent, COUNTER, &counter_elf, vec![]));
     assert!(
         matches!(installed, Ok(Reply::Ran(Outcome::Done(_)))),
         "{installed:?}"

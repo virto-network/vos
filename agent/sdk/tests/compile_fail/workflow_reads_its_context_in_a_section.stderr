@@ -1,0 +1,13 @@
+error[E0502]: cannot borrow `*ctx` as mutable because it is also borrowed as immutable
+  --> tests/compile_fail/workflow_reads_its_context_in_a_section.rs:18:9
+   |
+18 |           ctx.read(|shop: &Shop| {
+   |           ^   ---- ------------- immutable borrow occurs here
+   |           |   |
+   |  _________|   immutable borrow later used by call
+   | |
+19 | |             let _ = ctx.now();
+   | |                     --- first borrow occurs due to use of `*ctx` in closure
+20 | |             shop.sales
+21 | |         })
+   | |__________^ mutable borrow occurs here

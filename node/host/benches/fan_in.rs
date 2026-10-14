@@ -80,11 +80,12 @@ fn node(nodes: &Nodes, number: NodeNumber) -> &Node {
     &nodes[usize::from(number) - 1]
 }
 
-/// An agent on node `at` alone, with the counter installed.
+/// An agent on node `at` alone, with `counter`, the counter's package,
+/// installed.
 fn agent(nodes: &Nodes, at: NodeNumber, counter: &[u8]) -> AgentId {
     let node = node(nodes, at);
     let agent = node.create_agent().unwrap();
-    let installed = smol::block_on(node.install(agent, COUNTER, counter, &[], vec![]));
+    let installed = smol::block_on(node.install(agent, COUNTER, counter, vec![]));
     assert!(
         matches!(installed, Ok(Reply::Ran(Outcome::Done(_)))),
         "{installed:?}"
@@ -382,8 +383,8 @@ fn run(
 }
 
 /// Fresh agents for a run of `row` with `count` senders, half on node 1
-/// and half on node 2, once every node knows them: its routes, and the
-/// receiver's node for fan-in.
+/// and half on node 2, each with the counter's package installed, once
+/// every node knows them: its routes, and the receiver's node for fan-in.
 fn routes(
     nodes: &Nodes,
     counter: &[u8],
@@ -456,6 +457,7 @@ fn main() {
     let Programs {
         agent: agent_program,
         counter,
+        counter_elf,
     } = Programs::load();
     let forward = method(&counter, "forward");
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -484,7 +486,7 @@ fn main() {
     let nodes = Arc::new(nodes);
     for row in &rows {
         for &count in &senders {
-            let (pairs, receiver) = routes(&nodes, &counter, row, count);
+            let (pairs, receiver) = routes(&nodes, &counter_elf, row, count);
             run(row, &nodes, &pairs, receiver, sessions, forward);
         }
     }

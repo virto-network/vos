@@ -18,6 +18,7 @@
 //!   bytes cannot change.
 
 pub mod assembler;
+pub mod derive;
 pub mod linker;
 pub mod riscv;
 pub mod spi;
@@ -67,6 +68,8 @@ pub enum TranspileError {
 pub fn link_elf_spi(elf_data: &[u8]) -> Result<Vec<u8>, TranspileError> {
     linker::link_elf_spi(elf_data)
 }
+
+pub use derive::{DeriveError, Derived, MAX_ELF, TRANSPILER_VERSION, derive};
 
 /// A JAM service's metadata, which its code blob carries before its
 /// program, as PolkaJam's own services do: a version (0), then its name,
@@ -651,13 +654,14 @@ fn ensure_branch_targets_with_pc_map(
         }
     }
     // Also check jump table entries
+    let mut inserted: std::collections::HashSet<usize> = insert_positions.iter().copied().collect();
     for &jt_entry in jump_table.iter() {
         let t = jt_entry as usize;
         if t < len
             && t < bitmask.len()
             && bitmask[t] == 1
             && !post_term.contains(&t)
-            && !insert_positions.contains(&t)
+            && inserted.insert(t)
         {
             insert_positions.push(t);
         }

@@ -910,3 +910,81 @@ Our own runtime passes on both of its backends.
 - Opus: GO with fixes, all in. The availability race, the equality on
   the chain's bytes, late landings, trimming sweeps, finality, and the
   record were all fixed, and the milestone was rerun.
+
+## Step 4.9b: one actor, one ELF
+
+**Built,** to the design Fable reviewed and approved:
+- **One crate, one build, one ELF.** `vos install --elf actor.elf`
+  uploads it as it is, and the platform derives the rest. No program per
+  workflow, no crate per attestable.
+- **Workflows live in the actor's program.** A workflow's first step
+  starts it at instruction 0 with the method, its kind and its
+  arguments' length, and `dispatch` routes it. Its record names the
+  method (format 3).
+- **Attestable methods** are `#[inline(never)]` entries listed in a
+  `VOS_ATTEST` table of (method, entry). A table, not exported symbols,
+  so dependencies with attestables of the same name never collide.
+- **`derive(elf)`** (`pvm/compiler/src/derive.rs`, transpiler version
+  1):
+  - **The actor's program:** today's link, byte for byte.
+  - **One kernel per attestable method:** the code and data its entry
+    reaches through relocations and branches, behind a prologue.
+    Unreached data is zeroed in place.
+  - **What it refuses:**
+    - an ELF without relocations, with an unknown relocation type, or
+      with more than one code section;
+    - a kernel that reaches a host call other than a precompile, its
+      call chain named.
+  - **Pruned code traps:** a pointer into pruned code goes to an address
+    no jump table holds, a branch to a trap, and every kept span ends in
+    a trap.
+  - **Bit-reproducible:** tested across processes with different hash
+    seeds, and the hashes are pinned on a committed fixture.
+  - **Bounded:** work grows with the ELF once and with each kernel's
+    reach; a crafted 17 MiB package derives in 267 ms.
+  - **Fuzzed:** 256 cases in the suite, more by
+    `VOS_DERIVE_FUZZ_CASES`.
+- **The node derives on an executor:** a panic fails the install, not
+  the node. It proposes `Admin::Install { instance, derivation, roles }`
+  with `Derivation { program, kernels, elf, transpiler }`, one
+  constructor shared with the JAM builder. The agent binds each
+  attestable method to exactly one kernel.
+- **`ctx.read(|actor| ..)` and `ctx.update(|actor| ..)`:**
+  - sections on the workflow's own instance's state, opened and closed
+    by `OPEN` (0x540) and `CLOSE` (0x541), 3,000 gas each;
+  - inside one, only that instance's GET, PUT, DELETE and SCAN, with
+    NOW and LOG, are served (`abi::workflow_may_use`);
+  - anything else traps, as do a second open or a halt while open;
+  - a section is an effect for preemption;
+  - neither closure can reach the context, which the types forbid.
+- **An actor's heap is paid by every invocation of it:** arming on a
+  workflow step, and on JAM the heap's pages on every call. So actors
+  keep small heaps, and a test needing a big one installs a big build
+  of its actor. A heap mapped per kind of invocation is carried to a
+  later slice.
+- **The core model's** §6.4, §6.5 and §11.1 now say so.
+
+**Kernels:** the ledger's `checksum` kernel is 5,654 bytes, against
+5,103 as a program of its own. The test actor `kernels` derives through
+a vtable, a real switch table (11 ADD32/SUB32 pairs) and a precompile
+with its software fallback.
+
+**Tests:**
+- reproducibility, the pinned fixture, bounds and fuzzing;
+- kernels run alike on VOS, the JAM-only host and the model;
+- sections atomic, misuse trapping, compile-fail cases;
+- a workflow resuming on its own program through an upgrade, on VOS and
+  on JAM;
+- the milestone rerun on derived programs: every package landed first
+  time, equal to VOS.
+
+**Reviewed:**
+- Fable: approve. Then three should-fixes, all in: the heap's cost
+  stated, an unreadable span refused, the fuzz count true.
+- Opus: GO with fixes, all in:
+  - derivation linear;
+  - `read` unable to reach the context;
+  - a real switch table tested;
+  - unknown relocations refused;
+  - one section rule;
+  - one `Derivation` constructor.

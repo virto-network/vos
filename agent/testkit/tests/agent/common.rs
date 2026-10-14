@@ -12,9 +12,9 @@ use vos_pvm::refine_host::{
     JamItem, JamRefine, Preimages, ProgramSource, RefineContext, StateReader,
 };
 use vos_pvm::{ExitReason, PvmBackend};
-use vos_testkit::programs::{actor, agent, method};
+use vos_testkit::programs::{actor, agent, bare, derivation, derived, kernel, method, package};
 use vos_testkit::{Testkit, decode, program_hash};
-use vos_wire::abi::{Failure, Kind, Refusal, cap, code};
+use vos_wire::abi::{Failure, Refusal, cap, code};
 use vos_wire::batch::{Admin, Batch, Input, Query, Request, Work};
 use vos_wire::ids::{
     AgentId, InstanceId, MethodId, Principal, ProgramHash, Session, SessionId, SessionRef,
@@ -534,13 +534,12 @@ impl Node {
 }
 
 /// The test actors, installed in a node and a testkit alike, and the
-/// ledger's programs beside its own.
+/// ledger's attestable's kernel, derived from its ELF.
 pub struct Actors {
     pub counter: Vec<u8>,
     pub ledger: Vec<u8>,
     pub caller: Vec<u8>,
     pub checksum: Vec<u8>,
-    pub tally: Vec<u8>,
 }
 
 impl Actors {
@@ -549,41 +548,29 @@ impl Actors {
             counter: actor("counter"),
             ledger: actor("ledger"),
             caller: actor("caller"),
-            checksum: actor("checksum"),
-            tally: actor("tally"),
+            checksum: kernel("ledger", "checksum"),
         }
     }
 
-    /// The ledger's install in `node`, which stores its programs: the
-    /// attestable's and the workflow's beside its own.
+    /// The ledger's install in `node`, which stores its programs: its own,
+    /// which holds its workflow, and its attestable's kernel.
     pub fn install_ledger(&self, node: &mut Node) -> Input {
-        let ledger = node.add(&self.ledger);
-        let checksum = node.add(&self.checksum);
-        let tally = node.add(&self.tally);
+        node.add(&self.ledger);
+        node.add(&self.checksum);
         Input::Admin(Admin::Install {
             instance: LEDGER,
-            program: ledger,
-            beside: vec![
-                (method(&self.ledger, "checksum"), Kind::Attestable, checksum),
-                (method(&self.ledger, "tally"), Kind::Workflow, tally),
-            ],
+            derivation: derivation(&package("ledger"), &derived("ledger")),
             roles: vec![(b"minter".to_vec(), MINTER)],
         })
     }
 
     /// The ledger's install in a testkit.
     pub fn install_ledger_in(&self, kit: &mut Testkit) {
+        let checksum = method(&self.ledger, "checksum");
         kit.install(
             LEDGER,
             &self.ledger,
-            &[
-                (
-                    method(&self.ledger, "checksum"),
-                    Kind::Attestable,
-                    &self.checksum,
-                ),
-                (method(&self.ledger, "tally"), Kind::Workflow, &self.tally),
-            ],
+            &[(checksum, &self.checksum)],
             &[("minter", MINTER)],
         )
         .unwrap();
@@ -704,8 +691,7 @@ pub fn increment_in(actors: &Actors, session: Session, sequence: u64) -> Input {
 pub fn install(instance: InstanceId, program: ProgramHash) -> Input {
     Input::Admin(Admin::Install {
         instance,
-        program,
-        beside: vec![],
+        derivation: bare(program),
         roles: vec![],
     })
 }

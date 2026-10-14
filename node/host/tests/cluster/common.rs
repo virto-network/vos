@@ -172,7 +172,7 @@ impl Cluster {
     pub fn install(&self, agent: AgentId) {
         let leader = self.node(self.leader(agent));
         let installed =
-            smol::block_on(leader.install(agent, COUNTER, &self.programs.counter, &[], vec![]));
+            smol::block_on(leader.install(agent, COUNTER, &self.programs.counter_elf, vec![]));
         assert!(
             matches!(installed, Ok(Reply::Ran(Outcome::Done(_)))),
             "{installed:?}"

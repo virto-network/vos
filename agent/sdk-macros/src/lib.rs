@@ -3,8 +3,9 @@
 //! - `#[actor]` on the state struct: its encoding, which skips `Table` and
 //!   `CommittedMap` fields, and each one's tag.
 //! - `#[messages]` on the impl block: a message type per handler, the
-//!   dispatcher, the program's entry point and its schema; and for each
-//!   `#[attestable]` or `#[workflow]` method, the entry of its own program.
+//!   dispatcher, which routes to handlers and workflows alike, and the
+//!   program's schema; and for each `#[attestable]` method, the entry its
+//!   kernel is derived from.
 
 use std::collections::BTreeMap;
 
@@ -261,9 +262,9 @@ fn msg_options(attribute: &Attribute) -> syn::Result<Options> {
     Ok(options)
 }
 
-/// The kind of program an attribute marks a method to run as, apart from
-/// the actor's: `#[attestable]` or `#[workflow]`.
-fn own_program(attribute: &Attribute) -> Option<Kind> {
+/// The kind an attribute marks a method to run as, apart from a handler:
+/// `#[attestable]` or `#[workflow]`.
+fn marked(attribute: &Attribute) -> Option<Kind> {
     if attribute.path().is_ident("attestable") {
         Some(Kind::Attestable)
     } else if attribute.path().is_ident("workflow") {
@@ -373,7 +374,7 @@ fn handler(
     let id = ids.take("vos/method/", &name, method.sig.ident.span())?;
     method
         .attrs
-        .retain(|attribute| !attribute.path().is_ident("msg") && own_program(attribute).is_none());
+        .retain(|attribute| !attribute.path().is_ident("msg") && marked(attribute).is_none());
     Ok(Handler {
         method,
         name,
@@ -390,9 +391,10 @@ fn handler(
 /// The handlers of an actor. Each `#[msg]` method becomes a message type in
 /// a module named after the actor in snake case, or as
 /// `#[messages(module = "...")]` names it, with the handler's arguments as
-/// fields; `#[attestable]` and `#[workflow]` methods likewise, each run as
-/// its own program (`attestable_program!`, `workflow_program!`) from the
-/// entry generated for it, `__vos_attest_<name>` or `__vos_workflow_<name>`.
+/// fields; `#[attestable]` and `#[workflow]` methods likewise. A workflow
+/// is routed in the actor's program as a handler is; an attestable method
+/// runs as its own kernel, derived at install from the entry generated for
+/// it, `__vos_attest_<name>`.
 /// A handler's options are `#[msg(role = "...", gas = N)]`, the role a
 /// caller needs and its gas limit, and on a query `linearizable`: it always
 /// reads after a read index, whatever consistency its client asks. That
@@ -450,12 +452,12 @@ fn messages_impl(mut input: ItemImpl, module: Option<String>) -> syn::Result<Tok
         let marker = method
             .attrs
             .iter()
-            .find(|attribute| attribute.path().is_ident("msg") || own_program(attribute).is_some())
+            .find(|attribute| attribute.path().is_ident("msg") || marked(attribute).is_some())
             .cloned();
         match marker {
             Some(attribute) => {
-                let program = own_program(&attribute);
-                let handler = handler(method, &attribute, program, &mut ids)?;
+                let kind = marked(&attribute);
+                let handler = handler(method, &attribute, kind, &mut ids)?;
                 items.push(ImplItem::Fn(handler.method.clone()));
                 handlers.push(handler);
             }
@@ -472,7 +474,8 @@ fn messages_impl(mut input: ItemImpl, module: Option<String>) -> syn::Result<Tok
 
     let mut types = Vec::new();
     let mut arms = Vec::new();
-    let mut own_entries = Vec::new();
+    let mut entries = Vec::new();
+    let mut attestables = Vec::new();
     let mut schema = Schema {
         methods: Vec::new(),
     };
@@ -513,17 +516,41 @@ fn messages_impl(mut input: ItemImpl, module: Option<String>) -> syn::Result<Tok
                 }
             });
             let entry = format_ident!("__vos_attest_{}", handler.name);
-            own_entries.push(quote! {
-                /// Run this method on encoded arguments; the entry of its
-                /// own program.
+            entries.push(quote! {
+                /// Run this method on its encoded arguments, `len` bytes at
+                /// `arguments`, leaving its encoded output where the result
+                /// says: the root of its kernel, the program derived from
+                /// what this entry reaches.
+                ///
+                /// # Safety
+                ///
+                /// `arguments` must point at `len` readable bytes.
                 #[doc(hidden)]
-                pub fn #entry(input: &[u8]) -> ::vos_sdk::Vec<u8> {
+                #[inline(never)]
+                pub unsafe extern "C" fn #entry(
+                    arguments: *const u8,
+                    len: u64,
+                ) -> ::vos_sdk::runtime::Output {
+                    // SAFETY: the caller's contract.
+                    let input = unsafe { ::core::slice::from_raw_parts(arguments, len as usize) };
                     let ::core::result::Result::Ok((#module::#message { #(#names),* }, _)) =
                         <#module::#message as ::vos_sdk::Decode>::decode(input)
                     else {
                         ::core::panic!("undecodable arguments")
                     };
-                    ::vos_sdk::Encode::encode(&Self::#method(#(#names),*))
+                    let output = ::core::mem::ManuallyDrop::new(
+                        ::vos_sdk::Encode::encode(&Self::#method(#(#names),*)),
+                    );
+                    ::vos_sdk::runtime::Output {
+                        address: output.as_ptr() as u64,
+                        len: output.len() as u64,
+                    }
+                }
+            });
+            attestables.push(quote! {
+                ::vos_sdk::runtime::Attestable {
+                    method: #id as u64,
+                    entry: super::#actor::#entry,
                 }
             });
             continue;
@@ -537,15 +564,14 @@ fn messages_impl(mut input: ItemImpl, module: Option<String>) -> syn::Result<Tok
                     type Error = #error;
                 }
             });
-            let entry = format_ident!("__vos_workflow_{}", handler.name);
             let (context, argument) = match handler.has_context {
                 true => (
-                    quote!(let mut context = ::vos_sdk::context::Workflow::<Self>::new();),
+                    quote!(let mut context = ::vos_sdk::context::Workflow::<super::#actor>::new();),
                     quote!(&mut context,),
                 ),
                 false => (quote!(), quote!()),
             };
-            let call = quote!(Self::#method(#argument #(#names),*));
+            let call = quote!(super::#actor::#method(#argument #(#names),*));
             let call = if handler.method.sig.asyncness.is_some() {
                 quote!(::vos_sdk::runtime::block_on(#call))
             } else {
@@ -556,13 +582,9 @@ fn messages_impl(mut input: ItemImpl, module: Option<String>) -> syn::Result<Tok
             } else {
                 quote!(::core::result::Result::<_, ::vos_sdk::context::Never>::Ok(#call))
             };
-            own_entries.push(quote! {
-                /// Run this workflow from its arguments to its result; the
-                /// entry of its own program.
-                #[doc(hidden)]
-                pub fn #entry() {
-                    let #module::#message { #(#names),* } =
-                        ::vos_sdk::runtime::arguments::<#module::#message>();
+            arms.push(quote! {
+                #id => {
+                    let #message { #(#names),* } = ::vos_sdk::runtime::arguments::<#message>();
                     #context
                     match #outcome {
                         ::core::result::Result::Ok(result) => {
@@ -638,12 +660,13 @@ fn messages_impl(mut input: ItemImpl, module: Option<String>) -> syn::Result<Tok
 
     let schema = schema.section();
     let schema_len = schema.len();
+    let attestable_count = attestables.len();
     let impl_block = &input;
     Ok(quote! {
         #impl_block
 
         impl #actor {
-            #(#own_entries)*
+            #(#entries)*
         }
 
         impl ::vos_sdk::state::New for #actor {
@@ -658,8 +681,9 @@ fn messages_impl(mut input: ItemImpl, module: Option<String>) -> syn::Result<Tok
 
             #(#types)*
 
-            /// Run the handler `method` names on the invocation's
-            /// arguments: the body of the program's entry point.
+            /// Run the handler or the workflow `method` names on the
+            /// invocation's arguments: the body of the program's entry
+            /// point.
             pub fn dispatch(method: u32) {
                 match method {
                     #(#arms)*
@@ -668,8 +692,13 @@ fn messages_impl(mut input: ItemImpl, module: Option<String>) -> syn::Result<Tok
             }
 
             /// The schema's section bytes; `vos_sdk::actor_program!` places
-            /// them first in the program's read-only data.
+            /// them in `.vos_schema`, first in the program's read-only data.
             pub const SCHEMA: [u8; #schema_len] = [#(#schema),*];
+
+            /// Each attestable method's entry, which
+            /// `vos_sdk::actor_program!` places in `.vos_attest`.
+            pub const ATTESTABLES: [::vos_sdk::runtime::Attestable; #attestable_count] =
+                [#(#attestables),*];
         }
     })
 }

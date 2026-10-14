@@ -87,9 +87,16 @@ pub struct TranslationContext {
     /// Set by the CSR marker 0x801: the next ecall becomes a PVM `ecalli`
     /// whose id was loaded into t0.
     ecalli_marked: bool,
-    /// RISC-V code address ranges (lo, hi) — used to detect function pointers
-    /// loaded via auipc+addi that need jump table entries.
+    /// RISC-V code address ranges (lo, hi), sorted and merged — used to
+    /// detect function pointers loaded via auipc+addi that need jump table
+    /// entries.
     pub code_ranges: Vec<(u64, u64)>,
+    /// Each `ecalli` emitted: the RISC-V address of its `ecall`, and its id.
+    pub(crate) host_calls: Vec<(u64, u32)>,
+    /// Point a branch whose target was never translated at a trap, rather
+    /// than leave it unresolved: a kernel's code, its unreachable targets
+    /// pruned.
+    pub(crate) trap_unresolved: bool,
 }
 
 impl TranslationContext {
@@ -109,6 +116,8 @@ impl TranslationContext {
             last_t0_imm: None,
             ecalli_marked: false,
             code_ranges: Vec::new(),
+            host_calls: Vec::new(),
+            trap_unresolved: false,
         }
     }
 
@@ -166,7 +175,7 @@ impl TranslationContext {
     }
 
     /// Translate a single 32-bit RISC-V instruction.
-    fn translate_one(&mut self, inst: u32, _addr: u64) -> Result<(), TranspileError> {
+    fn translate_one(&mut self, inst: u32, addr: u64) -> Result<(), TranspileError> {
         let opcode = inst & 0x7F;
         let rd = ((inst >> 7) & 0x1F) as u8;
         let funct3 = (inst >> 12) & 0x7;
@@ -209,7 +218,7 @@ impl TranslationContext {
             0x17 => {
                 // AUIPC — PC + upper immediate
                 let imm = (inst & 0xFFFFF000) as i32;
-                let computed = (_addr as i64 + imm as i64) as u64;
+                let computed = (addr as i64 + imm as i64) as u64;
                 // Record for pairing with the next JALR instruction.
                 // Don't emit anything yet — the JALR handler will use this.
                 self.pending_auipc = Some((rd, computed));
@@ -217,13 +226,13 @@ impl TranslationContext {
             0x6F => {
                 // JAL
                 let imm = decode_j_imm(inst);
-                let target = (_addr as i64 + imm as i64) as u64;
+                let target = (addr as i64 + imm as i64) as u64;
                 if rd == 0 {
                     // Plain jump (tail call / goto)
                     self.emit_jump(target);
                 } else {
                     // Function call: fused load_imm_jump (opcode 80)
-                    let rv_return_addr = _addr + 4;
+                    let rv_return_addr = addr + 4;
                     self.emit_call(rd, rv_return_addr, target)?;
                 }
             }
@@ -232,11 +241,11 @@ impl TranslationContext {
                 match funct3 {
                     0 => {
                         let imm = (inst as i32) >> 20;
-                        self.translate_jalr(rd, rs1, imm, _addr)?;
+                        self.translate_jalr(rd, rs1, imm, addr)?;
                     }
                     _ => {
                         return Err(TranspileError::UnsupportedInstruction {
-                            offset: _addr as usize,
+                            offset: addr as usize,
                             detail: format!("JALR funct3={funct3}"),
                         });
                     }
@@ -245,18 +254,18 @@ impl TranslationContext {
             0x63 => {
                 // Branch
                 let imm = decode_b_imm(inst);
-                let target = (_addr as i64 + imm as i64) as u64;
-                self.translate_branch(funct3, rs1, rs2, target, _addr)?;
+                let target = (addr as i64 + imm as i64) as u64;
+                self.translate_branch(funct3, rs1, rs2, target, addr)?;
             }
             0x03 => {
                 // Load
                 let imm = (inst as i32) >> 20;
-                self.translate_load(funct3, rd, rs1, imm, _addr)?;
+                self.translate_load(funct3, rd, rs1, imm, addr)?;
             }
             0x23 => {
                 // Store
                 let imm = decode_s_imm(inst);
-                self.translate_store(funct3, rs1, rs2, imm, _addr)?;
+                self.translate_store(funct3, rs1, rs2, imm, addr)?;
             }
             0x13 => {
                 // OP-IMM (add_i, xor_i, etc.)
@@ -265,7 +274,7 @@ impl TranslationContext {
             }
             0x33 => {
                 // OP (add, sub, mul, etc.)
-                self.translate_op(funct3, funct7, rd, rs1, rs2, _addr)?;
+                self.translate_op(funct3, funct7, rd, rs1, rs2, addr)?;
             }
             0x1B => {
                 // OP-IMM-32 (addiw, slliw, etc.) — RV64 only
@@ -274,7 +283,7 @@ impl TranslationContext {
             }
             0x3B => {
                 // OP-32 (addw, subw, etc.) — RV64 only
-                self.translate_op_32(funct3, funct7, rd, rs1, rs2, _addr)?;
+                self.translate_op_32(funct3, funct7, rd, rs1, rs2, addr)?;
             }
             0x73 => {
                 // SYSTEM
@@ -288,6 +297,7 @@ impl TranslationContext {
                                 if std::mem::take(&mut self.ecalli_marked) {
                                     let id = self.last_t0_imm.unwrap_or(0) as u32;
                                     self.emit_ecalli(id);
+                                    self.host_calls.push((addr, id));
                                     self.last_t0_imm = None;
                                 } else {
                                     self.emit_inst(0);
@@ -371,7 +381,7 @@ impl TranslationContext {
                     }
                     _ => {
                         return Err(TranspileError::UnsupportedInstruction {
-                            offset: _addr as usize,
+                            offset: addr as usize,
                             detail: format!("custom-0 funct7={funct7:#x} funct3={funct3}"),
                         });
                     }
@@ -379,7 +389,7 @@ impl TranslationContext {
             }
             _ => {
                 return Err(TranspileError::UnsupportedInstruction {
-                    offset: _addr as usize,
+                    offset: addr as usize,
                     detail: format!("unknown opcode {opcode:#x}"),
                 });
             }
@@ -419,10 +429,7 @@ impl TranslationContext {
         // if a section was linked there; otherwise the jump traps.
         if rs1 == 0 {
             let target = i64::from(imm) as u64;
-            let is_code = self
-                .code_ranges
-                .iter()
-                .any(|&(lo, hi)| target >= lo && target < hi);
+            let is_code = self.is_code_addr(target);
             if !is_code {
                 self.emit_inst(0); // trap
             } else if rd == 0 {
@@ -1938,9 +1945,7 @@ impl TranslationContext {
     /// RISC-V addresses actually referenced as function pointers (e.g. from
     /// Check whether an address falls within any RISC-V code section.
     pub fn is_code_addr(&self, addr: u64) -> bool {
-        self.code_ranges
-            .iter()
-            .any(|(lo, hi)| addr >= *lo && addr < *hi)
+        crate::linker::in_ranges(&self.code_ranges, addr)
     }
 
     /// absolute relocations in data sections like vtables). Returns a map of
@@ -1971,9 +1976,19 @@ impl TranslationContext {
     }
 
     pub(crate) fn apply_fixups(&mut self) {
+        let mut trap = None;
         // PC-relative fixups (branches, jumps)
         for (pvm_offset, rv_target, size) in self.fixups.drain(..).collect::<Vec<_>>() {
-            if let Some(&pvm_target) = self.address_map.get(&rv_target) {
+            let target = self.address_map.get(&rv_target).copied().or_else(|| {
+                self.trap_unresolved.then(|| {
+                    *trap.get_or_insert_with(|| {
+                        let at = self.code.len() as u32;
+                        self.emit_inst(0);
+                        at
+                    })
+                })
+            });
+            if let Some(pvm_target) = target {
                 let inst_pc = self
                     .fixup_pcs
                     .get(&pvm_offset)
@@ -1998,7 +2013,6 @@ impl TranslationContext {
         // return target. Left at 0, the entry would name the refine entry
         // point, which is a valid jump target: returning would restart the
         // program instead of failing.
-        let mut trap = None;
         for (jt_idx, rv_addr) in self.return_fixups.drain(..).collect::<Vec<_>>() {
             let target = match self.address_map.get(&rv_addr) {
                 Some(&pvm_target) => pvm_target,

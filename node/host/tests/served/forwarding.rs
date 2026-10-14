@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use ed25519_dalek::{Signer, SigningKey};
 use vos_checker::calls::{Total, signed_query};
-use vos_checker::programs::{actor, method};
+use vos_checker::programs::{actor, method, package};
 use vos_checker::{ANSWERED, ATTEMPT, COUNTER, Nodes, wait_until};
 use vos_node::client::{Client, post_within};
 use vos_wire::ids::{AgentId, MethodId, Session};
@@ -26,7 +26,7 @@ const SEED: u64 = 1;
 /// An agent replicated on `replicas`, running the counter: the agent and
 /// its counter's increment and value methods.
 fn counter_agent(cluster: &Cluster, replicas: Vec<NodeNumber>) -> (AgentId, MethodId, MethodId) {
-    let counter = actor("counter");
+    let counter = package("counter");
     let agent = cluster
         .node(replicas[0])
         .unwrap()
@@ -36,15 +36,15 @@ fn counter_agent(cluster: &Cluster, replicas: Vec<NodeNumber>) -> (AgentId, Meth
         cluster.leader(agent).is_some()
     });
     let leader = cluster.node(cluster.leader(agent).unwrap()).unwrap();
-    let installed = smol::block_on(leader.install(agent, COUNTER, &counter, &[], vec![]));
+    let installed = smol::block_on(leader.install(agent, COUNTER, &counter, vec![]));
     assert!(
         matches!(installed, Ok(vos_node::Reply::Ran(Outcome::Done(_)))),
         "{installed:?}"
     );
     (
         agent,
-        method(&counter, "increment"),
-        method(&counter, "value"),
+        method(&actor("counter"), "increment"),
+        method(&actor("counter"), "value"),
     )
 }
 

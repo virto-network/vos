@@ -8,6 +8,9 @@
 //! fits the package to a work package ([`builder`]). Once the chain holds
 //! the package's root after, it commits the package to its store.
 //!
+//! The agent's programs are its service's preimages, derived from each
+//! package's ELF as a VOS node derives them ([`programs`]).
+//!
 //! [`chain::Emulated`] is a JAM node in process, DA included, so the whole
 //! loop runs without one; [`live`] reaches a PolkaJam node.
 
@@ -16,6 +19,7 @@ pub mod chain;
 pub mod da;
 pub mod gas;
 pub mod live;
+pub mod programs;
 pub mod simulate;
 pub mod store;
 pub mod witness;
@@ -71,6 +75,8 @@ pub enum Error {
     Node(String),
     /// A call not signed by its session's key.
     Signature,
+    /// A package's ELF derives no programs.
+    Package(String),
 }
 
 impl std::fmt::Display for Error {
@@ -98,6 +104,7 @@ impl std::fmt::Display for Error {
             Error::Tree(error) => write!(f, "the tree: {error}"),
             Error::Node(error) => write!(f, "the JAM node: {error}"),
             Error::Signature => f.write_str("a call not signed by its session's key"),
+            Error::Package(error) => write!(f, "the package: {error}"),
         }
     }
 }

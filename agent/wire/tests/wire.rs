@@ -8,7 +8,7 @@ use vos_wire::ids::{
 use vos_wire::ingress::Grant;
 use vos_wire::jam::{AccumulateInput, Operand, RefineArgs, Transfer, WorkError};
 use vos_wire::keys::{self, Due, Transform};
-use vos_wire::records::{Snapshot, Workflow, WorkflowState};
+use vos_wire::records::{Derivation, Snapshot, Workflow, WorkflowState};
 use vos_wire::result::{
     self, Attest, CommittedWrite, InputRef, InstanceGas, Outcome, Outgoing, Page, PageSection,
     ResultWriter, Run, Step, WorkResult, Write,
@@ -97,15 +97,6 @@ fn message() -> impl Strategy<Value = Message> {
     })
 }
 
-fn kind() -> impl Strategy<Value = Kind> {
-    prop_oneof![
-        Just(Kind::Command),
-        Just(Kind::Query),
-        Just(Kind::Attestable),
-        Just(Kind::Workflow),
-    ]
-}
-
 fn input() -> impl Strategy<Value = Input> {
     prop_oneof![
         (
@@ -136,20 +127,26 @@ fn input() -> impl Strategy<Value = Input> {
         ),
         (
             any::<u32>(),
-            any::<[u8; 32]>(),
-            prop::collection::vec((any::<u32>(), kind(), any::<[u8; 32]>()), 0..3),
+            (
+                any::<[u8; 32]>(),
+                prop::collection::vec((any::<u32>(), any::<[u8; 32]>()), 0..3),
+                any::<[u8; 32]>(),
+                any::<u32>(),
+            ),
             prop::collection::vec((bytes(), any::<u8>()), 0..3),
         )
-            .prop_map(|(instance, program, beside, roles)| {
+            .prop_map(|(instance, (program, kernels, elf, transpiler), roles)| {
                 Input::Admin(Admin::Install {
                     instance: InstanceId(instance),
-                    program: ProgramHash(program),
-                    beside: beside
-                        .into_iter()
-                        .map(|(method, kind, program)| {
-                            (MethodId(method), kind, ProgramHash(program))
-                        })
-                        .collect(),
+                    derivation: Derivation {
+                        program: ProgramHash(program),
+                        kernels: kernels
+                            .into_iter()
+                            .map(|(method, kernel)| (MethodId(method), ProgramHash(kernel)))
+                            .collect(),
+                        elf,
+                        transpiler,
+                    },
                     roles,
                 })
             }),
@@ -527,37 +524,55 @@ fn kinds_reach_only_their_operations() {
         op::SELF_ID,
     ];
     let pauses = [op::REQUEST, op::RESULT, op::SLEEP];
+    let sections = [op::OPEN, op::CLOSE];
     let writes = [op::PUT, op::DELETE, op::SEND, op::ATTEST];
-    // A workflow holds no state and attests nothing: it reaches state
-    // through calls, and does not ask who called.
-    let stateful = [
-        op::CALLER,
-        op::GET,
-        op::PUT,
-        op::DELETE,
-        op::SCAN,
-        op::ATTEST,
-    ];
+    // A workflow attests nothing, and does not ask who called.
+    let stateful = [op::CALLER, op::ATTEST];
+    // Its instance's rows it reaches only inside a section.
+    let rows = [op::GET, op::PUT, op::DELETE, op::SCAN];
     for id in handlers {
         assert!(abi::allowed(Kind::Command, id));
         assert_eq!(abi::allowed(Kind::Query, id), !writes.contains(&id));
         assert!(!abi::allowed(Kind::Attestable, id));
         assert_eq!(abi::allowed(Kind::Workflow, id), !stateful.contains(&id));
+        assert_eq!(
+            abi::in_section(id),
+            rows.contains(&id) || [op::NOW, op::LOG].contains(&id),
+            "{id:#x}"
+        );
     }
-    for id in pauses {
+    for id in pauses.into_iter().chain(sections) {
         assert!(abi::allowed(Kind::Workflow, id));
         assert!(!abi::allowed(Kind::Command, id));
         assert!(!abi::allowed(Kind::Query, id));
         assert!(!abi::allowed(Kind::Attestable, id));
         assert!(abi::surface::workflow(id));
+        assert_eq!(abi::in_section(id), id == op::CLOSE, "{id:#x}");
     }
-    for unknown in [0, 5, 0x480, 0x4ff, 0x507, 0x524, 0x52f, 0x533, 0x5ff] {
+    for unknown in [0, 5, 0x480, 0x4ff, 0x507, 0x524, 0x52f, 0x533, 0x542, 0x5ff] {
         assert!(!abi::allowed(Kind::Command, unknown));
         assert!(!abi::allowed(Kind::Query, unknown));
         assert!(!abi::allowed(Kind::Workflow, unknown));
+        assert!(!abi::in_section(unknown));
     }
     assert!(abi::surface::workflow(abi::precompile::BLAKE2B_COMPRESS));
-    assert!(!abi::surface::workflow(op::GET));
+    assert!(abi::surface::workflow(op::GET));
+    assert!(!abi::surface::workflow(op::ATTEST));
+    // A workflow's rows and a close only inside a section; inside one, its
+    // rows, the time, logs and the close alone.
+    for id in handlers.into_iter().chain(pauses).chain(sections) {
+        let rows_or_close = rows.contains(&id) || id == op::CLOSE;
+        assert_eq!(
+            abi::workflow_may_use(false, id),
+            abi::allowed(Kind::Workflow, id) && !rows_or_close,
+            "{id:#x}"
+        );
+        assert_eq!(
+            abi::workflow_may_use(true, id),
+            abi::in_section(id),
+            "{id:#x}"
+        );
+    }
 }
 
 /// Every operation a workflow may use is classed: an effect, which a unit
@@ -573,7 +588,9 @@ fn a_workflows_operations_are_effects_or_not() {
         op::RESULT,
         op::REPLY,
         op::FAIL,
+        op::OPEN,
     ];
+    // The row operations and a section's close come only after its open.
     let others = [
         op::INPUT,
         op::LOG,
@@ -581,6 +598,11 @@ fn a_workflows_operations_are_effects_or_not() {
         op::RANDOM,
         op::SELF_ID,
         op::SLEEP,
+        op::GET,
+        op::PUT,
+        op::DELETE,
+        op::SCAN,
+        op::CLOSE,
     ];
     for id in 0..0x1000u64 {
         if !abi::allowed(Kind::Workflow, id) {
@@ -751,48 +773,50 @@ fn kinds_encode_as_the_index_the_agent_passes() {
     assert!(Kind::decode(&[4]).is_err());
 }
 
-/// An install names its programs beside the actor's, each with its method
-/// and kind: in the batch, in the installed record the agent keeps, and in
-/// the operator's request, which carries the blobs.
+/// An install names the programs derived from its package's ELF, its
+/// kernels by method, and their provenance: in the batch, in the installed
+/// record the agent keeps, and in the operator's request, which carries the
+/// ELF.
 #[test]
 fn installs_keep_their_bytes() {
     use vos_wire::ingress::Install;
     use vos_wire::records::Installed;
     use vos_wire::schema::Schema;
-    let beside = vec![
-        (
-            MethodId(0x0a0b_0c0d),
-            Kind::Attestable,
-            ProgramHash([1; 32]),
-        ),
-        (MethodId(0x0e0f_1011), Kind::Workflow, ProgramHash([2; 32])),
-    ];
-    let entry = |method: u32, kind: u8, program: &[u8]| {
-        [&method.to_le_bytes()[..], &[kind], program].concat()
+    let derivation = Derivation {
+        program: ProgramHash([3; 32]),
+        kernels: vec![
+            (MethodId(0x0a0b_0c0d), ProgramHash([1; 32])),
+            (MethodId(0x0e0f_1011), ProgramHash([2; 32])),
+        ],
+        elf: [4; 32],
+        transpiler: 5,
     };
-    let entries = [
-        &2u32.to_le_bytes()[..],
-        &entry(0x0a0b_0c0d, 2, &[1; 32]),
-        &entry(0x0e0f_1011, 3, &[2; 32]),
+    let kernel = |method: u32, program: &[u8]| [&method.to_le_bytes()[..], program].concat();
+    let derived = [
+        &[3; 32][..],
+        &2u32.to_le_bytes(),
+        &kernel(0x0a0b_0c0d, &[1; 32]),
+        &kernel(0x0e0f_1011, &[2; 32]),
+        &[4; 32],
+        &5u32.to_le_bytes(),
     ]
     .concat();
+    assert_eq!(derivation.encode(), derived);
     let roles = [&1u32.to_le_bytes()[..], &1u32.to_le_bytes(), b"m", &[7]].concat();
     let admin = Admin::Install {
         instance: InstanceId(5),
-        program: ProgramHash([3; 32]),
-        beside: beside.clone(),
+        derivation: derivation.clone(),
         roles: vec![(b"m".to_vec(), 7)],
     };
-    let fields = [&5u32.to_le_bytes()[..], &[3; 32], &entries, &roles].concat();
+    let fields = [&5u32.to_le_bytes()[..], &derived, &roles].concat();
     assert_eq!(admin.encode(), [&[0][..], &fields].concat());
 
     let installed = Installed {
-        program: ProgramHash([3; 32]),
-        beside: beside.clone(),
+        derivation,
         roles: vec![(b"m".to_vec(), 7)],
         schema: Schema { methods: vec![] },
     };
-    let record = [&[3; 32][..], &entries, &roles, &0u32.to_le_bytes()].concat();
+    let record = [&derived[..], &roles, &0u32.to_le_bytes()].concat();
     assert_eq!(installed.encode(), record);
     assert_eq!(
         installed.programs().collect::<Vec<_>>(),
@@ -804,26 +828,20 @@ fn installs_keep_their_bytes() {
         "every program the agent pins"
     );
     assert_eq!(
-        installed.bound(MethodId(0x0e0f_1011), Kind::Workflow),
+        installed.attestable(MethodId(0x0e0f_1011)),
         Some(ProgramHash([2; 32]))
     );
-    assert_eq!(installed.attestable(MethodId(0x0e0f_1011)), None);
+    assert_eq!(installed.attestable(MethodId(1)), None);
 
     let install = Install {
         instance: InstanceId(5),
-        program: vec![9],
-        beside: vec![(MethodId(0x0e0f_1011), Kind::Workflow, vec![8, 8])],
+        elf: vec![9, 9],
         roles: vec![],
     };
     let request = [
         &5u32.to_le_bytes()[..],
-        &1u32.to_le_bytes(),
-        &[9],
-        &1u32.to_le_bytes(),
-        &0x0e0f_1011u32.to_le_bytes(),
-        &[3],
         &2u32.to_le_bytes(),
-        &[8, 8],
+        &[9, 9],
         &0u32.to_le_bytes(),
     ]
     .concat();
@@ -1001,6 +1019,7 @@ fn the_largest_step_fits_its_bound() {
         format: u8::MAX,
         program: ProgramHash([0; 32]),
         instance: InstanceId(0),
+        method: MethodId(u32::MAX),
         owner: Principal::Client([0; 32]),
         gas: u64::MAX,
         writable: u32::MAX,
@@ -1677,6 +1696,7 @@ fn workflows_keep_their_bytes() {
         format: Workflow::FORMAT,
         program: ProgramHash([1; 32]),
         instance: InstanceId(2),
+        method: MethodId(0x0e0f_1011),
         owner: Principal::Agent(AgentId(3)),
         gas: 4,
         writable: 5,
@@ -1695,6 +1715,7 @@ fn workflows_keep_their_bytes() {
         &[Workflow::FORMAT][..],
         &[1; 32],
         &2u32.to_le_bytes(),
+        &0x0e0f_1011u32.to_le_bytes(),
         &[1],
         &3u32.to_le_bytes(),
         &4u64.to_le_bytes(),
@@ -1720,8 +1741,8 @@ fn workflows_keep_their_bytes() {
     // Its head is its fields before the snapshot.
     let (head, used) = vos_wire::records::WorkflowHead::decode(&bytes).unwrap();
     assert_eq!(
-        (head.owner, head.state),
-        (record.owner, record.state.clone())
+        (head.method, head.owner, head.state),
+        (record.method, record.owner, record.state.clone())
     );
     assert_eq!(
         (head.format, head.awaits, head.due),

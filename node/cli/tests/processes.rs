@@ -17,7 +17,7 @@ use vos_checker::calls::{Total, signed_query};
 use vos_checker::processes::{
     Options, PROCESS_WAIT, Processes, call, converged, counter_agent, increment, served_method,
 };
-use vos_checker::programs::actor;
+use vos_checker::programs::package;
 use vos_checker::wait_until;
 use vos_checker::workflows::{ASKED, ROUNDS, Rounds, TOLD, Tour};
 use vos_node::client::Client;
@@ -75,7 +75,7 @@ fn a_leader_cut_off_by_the_relay_is_replaced_and_catches_up() {
 #[test]
 fn three_processes_apply_every_call_once_through_a_kill() {
     let space = start();
-    let counter = actor("counter");
+    let counter = package("counter");
     let create = || space.agent_with(vec![1, 2, 3], &counter, &[INBOX, COUNTER]);
     let (sender, receiver) = (create(), create());
     let mut client = Client::new(space.target(1), SigningKey::from_bytes(&[21; 32]));

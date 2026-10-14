@@ -364,3 +364,15 @@ pub fn send(agent: u32, instance: u32, method: u32, arguments: &[u8]) {
         ]
     );
 }
+
+/// Open a section on `instance`'s state, which must be the workflow's own:
+/// until [`close`], the row operations reach it, and the agent serves only
+/// them, the time and logs.
+pub fn open(instance: u32) {
+    ecalli!(op::OPEN, [u64::from(instance), 0, 0, 0, 0, 0]);
+}
+
+/// Close the open section.
+pub fn close() {
+    ecalli!(op::CLOSE, [0; 6]);
+}

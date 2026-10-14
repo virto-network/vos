@@ -18,7 +18,7 @@ use vos_wire::records::{Installed, WorkflowState};
 use vos_wire::result::{Attest, InstanceGas, Outcome, Outgoing};
 use vos_wire::{Encode, defaults, keys};
 
-use super::{Base, Corrupt, Meter, Overlay, has_own_program};
+use super::{Base, Corrupt, Meter, Overlay, is_handler};
 use crate::machines::{self, ARGUMENTS, Exit, Machine};
 
 /// Machines a step may hold at once: a handler and its nested callees, or
@@ -105,6 +105,8 @@ pub(super) struct Invocation<'a> {
     pub(super) awaits: Option<Await>,
     /// The pages of the workflow's machine the meter has taken.
     pages_paid: usize,
+    /// A workflow's section on its instance's state is open.
+    section: bool,
     /// The step overlay, then one per nested call.
     pub(super) frames: Vec<Overlay>,
     stack: Vec<InstanceId>,
@@ -127,6 +129,7 @@ impl<'a> Invocation<'a> {
             entry,
             awaits: None,
             pages_paid: 0,
+            section: false,
             frames: alloc::vec![BTreeMap::new()],
             stack: Vec::new(),
             nested: Vec::new(),
@@ -160,8 +163,7 @@ impl<'a> Invocation<'a> {
         let Some(schema) = installed.schema.method(method) else {
             return failed(Failure::Unknown);
         };
-        if has_own_program(schema.kind) || (self.entry == Kind::Query && schema.kind != Kind::Query)
-        {
+        if !is_handler(schema.kind) || (self.entry == Kind::Query && schema.kind != Kind::Query) {
             return failed(Failure::Unknown);
         }
         let gas = schema
@@ -218,7 +220,7 @@ impl<'a> Invocation<'a> {
             return Err((Failure::Depth, 0));
         }
         let kind = schema.kind;
-        let mut machine = machines::pinned(&installed.program.0, 0)
+        let mut machine = machines::pinned(&installed.program().0, 0)
             .map_err(|unavailable| (unavailable.into(), 0))?;
         machine.set_gas(gas);
         machine.set_register(7, u64::from(method.0));
@@ -365,7 +367,7 @@ impl<'a> Invocation<'a> {
             .method(method)
             .map(|schema| schema.kind)
             .ok_or(Failure::Unknown)?;
-        if has_own_program(callee_kind) || (kind == Kind::Query && callee_kind != Kind::Query) {
+        if !is_handler(callee_kind) || (kind == Kind::Query && callee_kind != Kind::Query) {
             return Err(Failure::Trapped);
         }
         self.frames.push(BTreeMap::new());
@@ -540,6 +542,21 @@ impl<'a> Invocation<'a> {
                     return Err(Failure::Trapped);
                 }
                 *outcome = Some(Ended::Paused(self.pause(machine, id)?));
+            }
+            // A workflow's section: on its own instance, never two at once.
+            op::OPEN => {
+                if self.section || r[7] != u64::from(instance.0) {
+                    return Err(Failure::Trapped);
+                }
+                self.section = true;
+                machine.set_register(7, code::OK);
+            }
+            op::CLOSE => {
+                if !self.section {
+                    return Err(Failure::Trapped);
+                }
+                self.section = false;
+                machine.set_register(7, code::OK);
             }
             _ => unreachable!("served operations are known, and the others served apart"),
         }
@@ -717,6 +734,8 @@ fn known(id: u64) -> bool {
             | op::REQUEST
             | op::RESULT
             | op::SLEEP
+            | op::OPEN
+            | op::CLOSE
     )
 }
 

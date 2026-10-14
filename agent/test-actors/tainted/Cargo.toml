@@ -1,15 +1,18 @@
 [package]
-name = "checksum"
+name = "tainted"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[lib]
+test = false
+bench = false
+
 [[bin]]
-name = "checksum"
+name = "tainted"
 path = "src/main.rs"
 test = false
 bench = false
 
 [dependencies]
-ledger = { path = "../ledger" }
 vos-sdk = { workspace = true }

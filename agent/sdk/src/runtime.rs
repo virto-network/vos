@@ -1,6 +1,6 @@
-//! What an actor program needs around its handlers: driving an `async`
-//! handler and, as macros a program crate invokes, the entry point, the
-//! allocator and the panic handler.
+//! What an actor program needs around its handlers and workflows: driving
+//! an `async` one and, as macros a program crate invokes, the entry point,
+//! the allocator and the panic handler.
 
 use core::future::Future;
 use core::pin::pin;
@@ -57,16 +57,50 @@ macro_rules! program_runtime {
     };
 }
 
-/// An actor's or attestable program's heap by default: the pool prices a
-/// machine by its mapped pages, so a larger arena costs every call.
+/// An actor program's heap by default. Every invocation pays for the heap,
+/// of whatever kind: the pool prices a machine by its mapped pages, a JAM
+/// node's loader maps each, and a workflow, which runs in its actor's
+/// program, arms each page it may write at every step
+/// (`defaults::ARM_PAGE`). So an actor configures the least heap its
+/// largest workflow needs.
 pub const PROGRAM_HEAP: usize = 512 << 10;
 
+/// An attestable method's output, by the halt convention: its address in
+/// φ7 and its length in φ8.
+#[repr(C)]
+pub struct Output {
+    pub address: u64,
+    pub len: u64,
+}
+
+/// An attestable method's entry: its arguments' address and length, in the
+/// standard argument window, and its output.
+pub type Entry = unsafe extern "C" fn(*const u8, u64) -> Output;
+
+/// An attestable method of the actor and its entry, which `#[messages]`
+/// generates as `__vos_attest_<method>`: the root a kernel is derived from
+/// at install, by what the entry reaches.
+#[repr(C)]
+pub struct Attestable {
+    pub method: u64,
+    pub entry: Entry,
+}
+
 /// An actor program: `actor_program!(crate_name::module)`, naming the
-/// module `#[messages]` generates. It places the schema first in the
-/// program's read-only data, and defines the entry point: instruction 0
+/// module `#[messages]` generates, with a heap of [`PROGRAM_HEAP`] or
+/// `heap = N` bytes, its workflows' too. It places the schema first in the
+/// program's read-only data, then the table of its attestable methods'
+/// entries, `VOS_ATTEST`, and defines the entry point: instruction 0
 /// calls the module's `dispatch` with the method in φ7 and returns to the
 /// halt address the agent left in φ0. φ8 holds the kind and φ9 the
 /// arguments' length, which the agent enforces and `input` reports.
+///
+/// A workflow starts there too, its method in φ7: its machine runs from its
+/// start to its result, pausing at host calls that return only once the
+/// agent resumes it, in a later step, restored from its snapshot.
+///
+/// It belongs in the actor's binary crate alone, once: `VOS_ATTEST`,
+/// `_start` and `vos_entry` are unmangled symbols of the program.
 #[macro_export]
 macro_rules! actor_program {
     ($($module:ident)::+) => {
@@ -78,6 +112,12 @@ macro_rules! actor_program {
         #[used]
         #[unsafe(link_section = ".vos_schema")]
         static VOS_SCHEMA: [u8; $($module)::+::SCHEMA.len()] = $($module)::+::SCHEMA;
+
+        #[used]
+        #[unsafe(no_mangle)]
+        #[unsafe(link_section = ".vos_attest")]
+        static VOS_ATTEST: [$crate::runtime::Attestable; $($module)::+::ATTESTABLES.len()] =
+            $($module)::+::ATTESTABLES;
 
         #[cfg(target_arch = "riscv64")]
         ::core::arch::global_asm!(
@@ -94,84 +134,6 @@ macro_rules! actor_program {
         #[unsafe(no_mangle)]
         extern "C" fn vos_entry(method: u64) {
             $($module)::+::dispatch(method as u32);
-        }
-    };
-}
-
-/// The program of an attestable method: `attestable_program!(path)`, where
-/// `path` is the `__vos_attest_<method>` function `#[messages]` generates.
-/// The arguments arrive in the standard argument window and the output
-/// leaves by the halt convention: its address in φ7 and length in φ8. The
-/// program makes no host calls; precompiles aside.
-#[macro_export]
-macro_rules! attestable_program {
-    ($run:path) => {
-        $crate::program_runtime!($crate::runtime::PROGRAM_HEAP);
-
-        #[cfg(target_arch = "riscv64")]
-        ::core::arch::global_asm!(
-            ".global _start",
-            ".type _start, @function",
-            "_start:",
-            "mv s0, ra",
-            "jal ra, vos_method_entry",
-            "mv ra, s0",
-            "ret",
-        );
-
-        #[repr(C)]
-        pub struct VosOutput {
-            address: u64,
-            len: u64,
-        }
-
-        #[cfg(target_arch = "riscv64")]
-        #[unsafe(no_mangle)]
-        extern "C" fn vos_method_entry(arguments: *const u8, len: u64) -> VosOutput {
-            // SAFETY: the loader maps the argument window read-only at
-            // (φ7, φ8) for the whole invocation.
-            let arguments = unsafe { ::core::slice::from_raw_parts(arguments, len as usize) };
-            let output = ::core::mem::ManuallyDrop::new($run(arguments));
-            VosOutput {
-                address: output.as_ptr() as u64,
-                len: output.len() as u64,
-            }
-        }
-    };
-}
-
-/// The program of a workflow: `workflow_program!(path)`, where `path` is the
-/// `__vos_workflow_<method>` function `#[messages]` generates, with a heap
-/// of [`PROGRAM_HEAP`] or `heap = N` bytes. An install binds it to its
-/// method, and each workflow pins it until it ends.
-///
-/// Instruction 0 runs the workflow from its start: it reads its arguments
-/// with `INPUT`, as a handler does, and ends with `REPLY` or `FAIL`. Each
-/// pause is a host call that returns only once the agent resumes the
-/// machine, in a later step, restored from its snapshot.
-#[macro_export]
-macro_rules! workflow_program {
-    ($run:path) => {
-        $crate::workflow_program!($run, heap = $crate::runtime::PROGRAM_HEAP);
-    };
-    ($run:path, heap = $heap:expr) => {
-        $crate::program_runtime!($heap);
-
-        #[cfg(target_arch = "riscv64")]
-        ::core::arch::global_asm!(
-            ".global _start",
-            ".type _start, @function",
-            "_start:",
-            "mv s0, ra",
-            "jal ra, vos_workflow_entry",
-            "mv ra, s0",
-            "ret",
-        );
-
-        #[cfg(target_arch = "riscv64")]
-        #[unsafe(no_mangle)]
-        extern "C" fn vos_workflow_entry() {
-            $run();
         }
     };
 }

@@ -14,17 +14,5 @@ path = "src/main.rs"
 test = false
 bench = false
 
-[[bin]]
-name = "tour"
-path = "src/bin/tour.rs"
-test = false
-bench = false
-
-[[bin]]
-name = "rewrite"
-path = "src/bin/rewrite.rs"
-test = false
-bench = false
-
 [dependencies]
 vos-sdk = { workspace = true }

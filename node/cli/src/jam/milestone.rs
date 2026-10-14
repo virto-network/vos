@@ -1,6 +1,6 @@
 //! The JAM milestone: the default agent deployed on a running PolkaJam
-//! testnet, with the counter and the shop and its workflows' programs as
-//! the service's preimages, and run, a package each: the programs
+//! testnet, with the counter's and the shop's programs, its workflows in
+//! it, as the service's preimages, and run, a package each: the programs
 //! solicited, the installs, a request that writes state, a workflow's
 //! start, the sweeps that resume it until it ends, and a scan; then the
 //! owner reads the workflow's result through the builder.
@@ -25,7 +25,6 @@ use vos_jam::{Attempt, Builder, Chain, Emulated, Error, Fate, Runner, Store, Tak
 use vos_pvm::refine::PreparedProgram;
 use vos_pvm::refine_host::Preimages;
 use vos_pvm_compiler::service_blob;
-use vos_wire::abi::Kind;
 use vos_wire::batch::{Admin, Input};
 use vos_wire::ids::{InstanceId, MethodId, Principal, ProgramHash, Session};
 use vos_wire::ingress::{Call, call_message};
@@ -81,48 +80,33 @@ pub fn run(args: MilestoneArgs) -> Result<(), String> {
     outcome
 }
 
-/// The test actors the agent runs, each linked once: the counter, the
-/// shop, and its workflows' programs by method name.
+/// The test actors the agent runs, each derived once from its ELF, as a VOS
+/// node derives it: the counter and the shop, its workflows in its program.
 struct Actors {
-    counter: Vec<u8>,
-    shop: Vec<u8>,
-    workflows: HashMap<String, Vec<u8>>,
+    counter: vos_jam::programs::Installable,
+    shop: vos_jam::programs::Installable,
 }
 
 impl Actors {
-    fn link(dir: &std::path::Path) -> Result<Self, String> {
-        let actor = |name: &str| link(&dir.join(format!("{name}.elf")));
-        let shop = actor("shop")?;
-        let workflows = schema(&shop)?
-            .methods
-            .iter()
-            .filter(|method| method.kind == Kind::Workflow)
-            .map(|method| {
-                let name = String::from_utf8_lossy(&method.name).into_owned();
-                Ok((name.clone(), actor(&name)?))
-            })
-            .collect::<Result<_, String>>()?;
+    fn derive(dir: &std::path::Path) -> Result<Self, String> {
+        let actor = |name: &str| {
+            let path = dir.join(format!("{name}.elf"));
+            let elf = std::fs::read(&path).map_err(at(&path))?;
+            vos_jam::programs::derive(&elf).map_err(at(&path))
+        };
         Ok(Self {
             counter: actor("counter")?,
-            shop,
-            workflows,
+            shop: actor("shop")?,
         })
     }
 
-    /// Every program, by hash.
+    /// Every program, by hash: what the agent's service solicits.
     fn programs(&self) -> HashMap<[u8; 32], Vec<u8>> {
         [&self.counter, &self.shop]
             .into_iter()
-            .chain(self.workflows.values())
+            .flat_map(|package| &package.programs)
             .map(|program| (digest(program), program.clone()))
             .collect()
-    }
-
-    fn workflow(&self, name: &str) -> Result<&[u8], String> {
-        self.workflows
-            .get(name)
-            .map(Vec::as_slice)
-            .ok_or_else(|| format!("the shop has no workflow {name}"))
     }
 }
 
@@ -176,7 +160,7 @@ impl Milestone {
         getrandom::getrandom(&mut seed).map_err(said)?;
         Ok(Self {
             agent: link(&args.agent)?,
-            actors: Actors::link(&args.actors)?,
+            actors: Actors::derive(&args.actors)?,
             args,
             node,
             alice: SigningKey::from_bytes(&seed),
@@ -238,11 +222,10 @@ impl Milestone {
         // The programs the agent runs, solicited, then provided.
         let mut solicit = Vec::new();
         let mut files = Vec::new();
-        for program in [
-            &self.actors.shop[..],
-            &self.actors.counter,
-            self.actors.workflow("compute")?,
-        ] {
+        let programs = self.actors.programs();
+        let mut programs: Vec<&Vec<u8>> = programs.values().collect();
+        programs.sort();
+        for program in programs {
             let hash = digest(program);
             let file = self
                 .args
@@ -269,15 +252,15 @@ impl Milestone {
 
         let installs = self.installs()?;
         self.step(&mut rig, "install the counter and the shop", installs, &[])?;
-        let increment = method(&self.actors.counter, "increment")?;
-        let fill = method(&self.actors.counter, "fill")?;
+        let increment = method(&self.actors.counter.programs[0], "increment")?;
+        let fill = method(&self.actors.counter.programs[0], "fill")?;
         let calls = vec![
             self.call(service, COUNTER, increment, 5u64.encode())?,
             self.call(service, COUNTER, fill, (12u32, 8u32).encode())?,
         ];
         let ran = self.step(&mut rig, "write state", calls, &[])?;
         expect_done(&ran.result)?;
-        let start = method(&self.actors.shop, "compute")?;
+        let start = method(&self.actors.shop.programs[0], "compute")?;
         let call = self.call(service, SHOP, start, (16_000u32, 2u32).encode())?;
         let ran = self.step(&mut rig, "start the computation", vec![call], &[])?;
         // The start's step, then, as the budget allows, the workflow's first.
@@ -312,7 +295,7 @@ impl Milestone {
             exported += ran.exports;
             imported += ran.imports;
         }
-        let keys_of = method(&self.actors.counter, "blob_keys")?;
+        let keys_of = method(&self.actors.counter.programs[0], "blob_keys")?;
         let call = self.call(service, COUNTER, keys_of, ().encode())?;
         let ran = self.step(&mut rig, "scan the table", vec![call], &[])?;
         expect_done(&ran.result)?;
@@ -524,30 +507,19 @@ impl Milestone {
         });
     }
 
-    /// The counter's install, and the shop's with each workflow method
-    /// bound to its program.
+    /// The counter's install, and the shop's, each naming the programs
+    /// derived from its ELF.
     fn installs(&self) -> Result<Vec<Input>, String> {
-        let mut beside = Vec::new();
-        for method in &schema(&self.actors.shop)?.methods {
-            if method.kind == Kind::Workflow {
-                let name = String::from_utf8_lossy(&method.name);
-                let program = self.actors.workflow(&name)?;
-                beside.push((method.id, Kind::Workflow, ProgramHash(digest(program))));
-            }
-        }
+        let install = |instance, package: &vos_jam::programs::Installable| {
+            Input::Admin(Admin::Install {
+                instance,
+                derivation: package.derivation.clone(),
+                roles: vec![],
+            })
+        };
         Ok(vec![
-            Input::Admin(Admin::Install {
-                instance: COUNTER,
-                program: ProgramHash(digest(&self.actors.counter)),
-                beside: vec![],
-                roles: vec![],
-            }),
-            Input::Admin(Admin::Install {
-                instance: SHOP,
-                program: ProgramHash(digest(&self.actors.shop)),
-                beside,
-                roles: vec![],
-            }),
+            install(COUNTER, &self.actors.counter),
+            install(SHOP, &self.actors.shop),
         ])
     }
 

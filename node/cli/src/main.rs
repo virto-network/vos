@@ -14,9 +14,11 @@ use clap::Parser;
 use ed25519_dalek::SigningKey;
 use vos_node::client::{ClientError, Operator};
 use vos_node::{ADMIN_TOKEN, Config, NODE_KEY, Node, Space};
-use vos_wire::abi::Kind;
+use vos_wire::Decode;
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal};
 use vos_wire::ingress::{Answer, Install};
+use vos_wire::records::Derivation;
+use vos_wire::result::Outcome;
 use vos_wire::schema::Schema;
 
 use args::{
@@ -217,20 +219,12 @@ impl AgentCommand {
 
 impl InstallArgs {
     fn run(self) -> Result<(), String> {
-        let program = link(&self.program)?;
-        let schema = schema_of(&program)?;
-        let attestables = self.attestables.iter().map(|pair| (pair, Kind::Attestable));
-        let beside = attestables
-            .chain(self.workflows.iter().map(|pair| (pair, Kind::Workflow)))
-            .map(|(pair, kind)| {
-                let (name, path) = split(pair)?;
-                let method = method_named(&schema, name)?;
-                if schema.method(method).map(|method| method.kind) != Some(kind) {
-                    return Err(format!("{name} is not a method of kind {kind:?}"));
-                }
-                Ok((method, kind, link(Path::new(path))?))
-            })
-            .collect::<Result<Vec<_>, String>>()?;
+        let elf = std::fs::read(&self.elf).map_err(at(&self.elf))?;
+        // Derived here too, to refuse a package before it is sent and to
+        // name its kernels' methods.
+        let derived = vos_pvm_compiler::derive(&elf).map_err(at(&self.elf))?;
+        let schema = Schema::read(&derived.schema)
+            .map_err(|error| format!("{}: its schema: {error:?}", self.elf.display()))?;
         let roles = self
             .roles
             .iter()
@@ -241,15 +235,61 @@ impl InstallArgs {
             .collect::<Result<Vec<_>, String>>()?;
         let install = Install {
             instance: InstanceId(self.instance),
-            program,
-            beside,
+            elf: elf.clone(),
             roles,
         };
         let answer = operator_of(&self.operator)?
             .install(AgentId(self.agent), &install)
             .map_err(failed)?;
-        print_admin_answer(&answer)
+        let Answer::Ran {
+            outcome: Outcome::Done(reply),
+            ..
+        } = &answer
+        else {
+            return print_admin_answer(&answer);
+        };
+        let derivation = Derivation::decode(reply)
+            .map(|(derivation, _)| derivation)
+            .map_err(|_| format!("an install answered {}", hex::encode(reply)))?;
+        let local = Derivation::new(
+            &elf,
+            &derived.actor,
+            derived
+                .kernels
+                .iter()
+                .map(|(method, kernel)| (MethodId(*method), kernel.as_slice())),
+            derived.transpiler_version,
+        );
+        if local != derivation {
+            eprintln!(
+                "warning: the node derived other programs than this vos, with transpiler {} \
+                 against {}: the node's are installed",
+                derivation.transpiler, local.transpiler
+            );
+        }
+        print!("{}", derived_lines(&derivation, &schema));
+        Ok(())
     }
+}
+
+/// The programs an install derived, a line each: `done`, then the actor's
+/// program, each kernel by its method's name, the ELF and the transpiler
+/// version.
+fn derived_lines(derivation: &Derivation, schema: &Schema) -> String {
+    let mut lines = format!("done\nprogram {}\n", hex::encode(derivation.program.0));
+    for (method, kernel) in &derivation.kernels {
+        let name = schema.method(*method).map_or_else(
+            || format!("{:#010x}", method.0),
+            |method| String::from_utf8_lossy(&method.name).into_owned(),
+        );
+        lines += &format!("kernel {name} {}\n", hex::encode(kernel.0));
+    }
+    lines += &format!(
+        "elf {}\ntranspiler {}\n",
+        hex::encode(derivation.elf),
+        derivation.transpiler
+    );
+    lines
 }
 
 impl RoleArgs {
@@ -293,11 +333,6 @@ fn link(path: &Path) -> Result<Vec<u8>, String> {
         return Ok(blob);
     }
     vos_pvm_compiler::link_elf_spi(&elf).map_err(failed)
-}
-
-fn schema_of(program: &[u8]) -> Result<Schema, String> {
-    let parsed = vos_pvm::spi::parse_standard_program(program).ok_or("not a standard program")?;
-    Schema::read(&parsed.ro_data).map_err(|error| format!("its schema: {error:?}"))
 }
 
 fn method_named(schema: &Schema, name: &str) -> Result<MethodId, String> {

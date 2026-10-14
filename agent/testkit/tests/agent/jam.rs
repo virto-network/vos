@@ -22,8 +22,8 @@ use vos_wire::keys::{self, Transform};
 use vos_wire::package::{EPOCH_MS, SLOT_MS};
 use vos_wire::package::{Opened, Package};
 use vos_wire::records::{Workflow, WorkflowState, stored, unstored};
-use vos_wire::result::{Outgoing, PAGE, Step, WorkResult, digest, split_output};
-use vos_wire::{Encode, defaults};
+use vos_wire::result::{Outcome, Outgoing, PAGE, Step, WorkResult, digest, split_output};
+use vos_wire::{Decode, Encode, defaults};
 
 use crate::common::{
     AGENT, ALICE, Actors, BOB, CALLER, COUNTER, LEDGER, MINTER, Node, SHOP, done, install,
@@ -301,32 +301,21 @@ fn programs(actors: &Actors) -> Vec<&[u8]> {
         &actors.ledger,
         &actors.caller,
         &actors.checksum,
-        &actors.tally,
     ]
 }
 
-/// A pair with the test actors, the shop and its workflows installed: and
-/// the shop's program.
+/// A pair with the test actors and the shop, its workflows in its
+/// program, installed, and the shop's upgrade among its preimages: and the
+/// shop's program.
 fn with_shop(backend: PvmBackend, actors: &Actors) -> (Paired, Vec<u8>) {
-    let shop = actor("shop");
-    let flows = crate::workflows::FLOWS;
-    let bound: Vec<Vec<u8>> = flows.iter().map(|name| actor(name)).collect();
+    let (shop, lean) = (actor("shop"), actor("lean"));
     let mut all = programs(actors);
-    all.push(&shop);
-    all.extend(bound.iter().map(Vec::as_slice));
+    all.extend([shop.as_slice(), lean.as_slice()]);
     let mut paired = Paired::new(backend, &all, G_R);
     let mut first = installs(&mut paired, actors);
     first.push(Input::Admin(Admin::Install {
         instance: SHOP,
-        program: vos_testkit::program_hash(&shop),
-        beside: flows
-            .iter()
-            .zip(&bound)
-            .map(|(name, blob)| {
-                let program = vos_testkit::program_hash(blob);
-                (method(&shop, name), vos_wire::abi::Kind::Workflow, program)
-            })
-            .collect(),
+        derivation: vos_testkit::programs::bare(vos_testkit::program_hash(&shop)),
         roles: vec![],
     }));
     ran_or_refused(&paired.batch(T0, first).result);
@@ -558,6 +547,8 @@ fn workflows_across_packages(backend: PvmBackend) {
         start(&mut paired, "compute", (20_000u32, 3u32).encode()),
         start(&mut paired, "scratch", RISK.0.encode()),
         start(&mut paired, "nap", 2_500u64.encode()),
+        start(&mut paired, "record", (7u64, 30u64).encode()),
+        start(&mut paired, "restock", vec![5u64, 6, 7].encode()),
     ];
     let mut ran = paired.batch(T0 + 1_000, starts);
     let (mut imported, mut exported) = (ran.imported, ran.exported);
@@ -590,12 +581,23 @@ fn workflows_across_packages(backend: PvmBackend) {
         exported += ran.exported;
         overhead = overhead.max(beyond(&ran));
     }
-    for id in 0..4 {
+    for id in 0..6 {
         assert!(
             matches!(paired.record(id).state, WorkflowState::Ended(_)),
             "workflow {id} ended"
         );
     }
+    // Sections' rows, witnessed: what each section read and wrote.
+    assert_eq!(
+        paired.record(4).state,
+        WorkflowState::Ended(Outcome::Done((30u64, Some(30u64)).encode()))
+    );
+    let WorkflowState::Ended(Outcome::Done(restocked)) = paired.record(5).state else {
+        panic!("restocked");
+    };
+    let restocked: Vec<u64> = vos_testkit::decode(&restocked).unwrap();
+    assert_eq!(restocked.len(), 3);
+    assert!(restocked.windows(2).all(|pair| pair[0] < pair[1]));
     assert!(
         answered >= 5,
         "the saga's and the scratch's awaits answered"
@@ -978,25 +980,12 @@ impl Driven {
     }
 
     fn installs(&mut self) -> Vec<Input> {
-        let flows = crate::workflows::FLOWS;
         let hash = vos_testkit::program_hash;
-        let beside = flows
-            .iter()
-            .map(|name| {
-                let program = hash(&actor(name));
-                (
-                    method(&self.shop, name),
-                    vos_wire::abi::Kind::Workflow,
-                    program,
-                )
-            })
-            .collect();
         vec![
             install(COUNTER, hash(&self.actors.counter)),
             Input::Admin(Admin::Install {
                 instance: SHOP,
-                program: hash(&self.shop),
-                beside,
+                derivation: vos_testkit::programs::bare(hash(&self.shop)),
                 roles: vec![],
             }),
         ]
@@ -1254,4 +1243,53 @@ impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+/// A workflow keeps the program it started on through an upgrade on JAM
+/// too: its program is a preimage the builder never forgets, so the
+/// workflow resumes on it and ends there, while a start since runs the
+/// upgrade.
+#[test]
+fn a_workflow_resumes_on_its_program_through_an_upgrade_on_jam() {
+    let mut driven = Driven::new(Store::temporary().unwrap(), G_R);
+    let hash = vos_testkit::program_hash;
+    let (shop, lean) = (hash(&driven.shop), hash(&actor("lean")));
+    let nap = method(&driven.shop, "nap");
+    let start = driven.request(SHOP, nap, 2_500u64);
+    driven.run(vec![start]);
+    driven.run(vec![Input::Admin(Admin::Install {
+        instance: SHOP,
+        derivation: vos_testkit::programs::bare(lean),
+        roles: vec![],
+    })]);
+    let record = |driven: &Driven, id: u64| {
+        let row = driven
+            .builder
+            .store
+            .view()
+            .get(&keys::workflow(WorkflowId(id)));
+        Workflow::decode(unstored(&row.unwrap().unwrap()).unwrap())
+            .unwrap()
+            .0
+    };
+    for _ in 0..10 {
+        if matches!(record(&driven, 0).state, WorkflowState::Ended(_)) {
+            break;
+        }
+        if let Some(sweep) = driven.builder.sweep(driven.time + 1_000).unwrap() {
+            driven.run(vec![sweep]);
+        } else {
+            driven.time += 1_000;
+        }
+    }
+    let napped = record(&driven, 0);
+    assert_eq!(napped.program, shop);
+    assert!(
+        matches!(napped.state, WorkflowState::Ended(Outcome::Done(_))),
+        "{:?}",
+        napped.state
+    );
+    let start = driven.request(SHOP, nap, 1u64);
+    driven.run(vec![start]);
+    assert_eq!(record(&driven, 1).program, lean);
 }

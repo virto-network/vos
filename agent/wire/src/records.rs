@@ -2,21 +2,69 @@
 
 use alloc::vec::Vec;
 
-use crate::abi::Kind;
 use crate::batch::Await;
 use crate::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash};
 use crate::result::Outcome;
 use crate::schema::Schema;
 use crate::{Decode, Encode};
 
-/// An installed instance, under [`crate::keys::installed`]: its program,
-/// the programs beside it, each bound to a method of its kind, the agent's
-/// role byte for each role name, and the program's schema, read once at
-/// install.
+/// The programs a node derived from a package's ELF at its install, by
+/// their hashes: the actor's program, which holds its handlers and its
+/// workflows, and a kernel for each attestable method, by method in
+/// ascending order; and their provenance, the ELF's hash and the version of
+/// the transpiler that derived them. The same ELF and version derive the
+/// same bytes on any machine.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct Derivation {
+    pub program: ProgramHash,
+    pub kernels: Vec<(MethodId, ProgramHash)>,
+    pub elf: [u8; 32],
+    pub transpiler: u32,
+}
+
+impl Derivation {
+    /// The derivation of package `elf`: its actor's program and each
+    /// attestable method's kernel, as version `transpiler` derived them,
+    /// each named by its hash. The one constructor of a VOS node's install
+    /// and of a JAM builder's, so the two agree.
+    pub fn new<'a>(
+        elf: &[u8],
+        actor: &[u8],
+        kernels: impl IntoIterator<Item = (MethodId, &'a [u8])>,
+        transpiler: u32,
+    ) -> Self {
+        let hash = |bytes: &[u8]| ProgramHash(crate::result::digest(bytes));
+        Self {
+            program: hash(actor),
+            kernels: kernels
+                .into_iter()
+                .map(|(method, kernel)| (method, hash(kernel)))
+                .collect(),
+            elf: crate::result::digest(elf),
+            transpiler,
+        }
+    }
+
+    /// The kernel of attestable `method`.
+    pub fn kernel(&self, method: MethodId) -> Option<ProgramHash> {
+        self.kernels
+            .iter()
+            .find(|(bound, _)| *bound == method)
+            .map(|(_, kernel)| *kernel)
+    }
+
+    /// Every program it derived, the actor's first: what its agent pins.
+    pub fn programs(&self) -> impl Iterator<Item = ProgramHash> + '_ {
+        core::iter::once(self.program).chain(self.kernels.iter().map(|(_, kernel)| *kernel))
+    }
+}
+
+/// An installed instance, under [`crate::keys::installed`]: the programs
+/// derived from its package, the agent's role byte for each role name, and
+/// the actor program's schema, read once at install.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Installed {
-    pub program: ProgramHash,
-    pub beside: Vec<(MethodId, Kind, ProgramHash)>,
+    pub derivation: Derivation,
     pub roles: Vec<(Vec<u8>, u8)>,
     pub schema: Schema,
 }
@@ -29,21 +77,19 @@ impl Installed {
             .map(|(_, byte)| *byte)
     }
 
-    /// The program bound to `method` as a method of `kind`.
-    pub fn bound(&self, method: MethodId, kind: Kind) -> Option<ProgramHash> {
-        self.beside
-            .iter()
-            .find(|(bound, of, _)| *bound == method && *of == kind)
-            .map(|(_, _, program)| *program)
+    /// The actor's program: its handlers and its workflows.
+    pub fn program(&self) -> ProgramHash {
+        self.derivation.program
     }
 
+    /// The kernel of attestable `method`.
     pub fn attestable(&self, method: MethodId) -> Option<ProgramHash> {
-        self.bound(method, Kind::Attestable)
+        self.derivation.kernel(method)
     }
 
     /// Every program the instance runs, its own first: what its agent pins.
     pub fn programs(&self) -> impl Iterator<Item = ProgramHash> + '_ {
-        core::iter::once(self.program).chain(self.beside.iter().map(|(_, _, program)| *program))
+        self.derivation.programs()
     }
 }
 
@@ -54,11 +100,14 @@ pub struct Workflow {
     /// The record's format, [`Workflow::FORMAT`]: a record of another the
     /// agent refuses to read.
     pub format: u8,
-    /// The program it runs, which it pins until it ends, whatever an
-    /// upgrade does meanwhile.
+    /// The program it runs, its instance's actor program, which it pins
+    /// until it ends, whatever an upgrade does meanwhile.
     pub program: ProgramHash,
-    /// The instance whose method it is: its calls' caller.
+    /// The instance whose method it is: its calls' caller, and the state
+    /// its sections reach.
     pub instance: InstanceId,
+    /// The workflow method it runs, which the program's entry routes to.
+    pub method: MethodId,
     /// Who started it, a client's key or an agent: who reads its result.
     pub owner: Principal,
     /// Each step's limit: what its effect-free code may spend in all, and
@@ -86,7 +135,7 @@ impl Workflow {
     /// new format needs the records migrated before any replica runs it.
     /// The node reads the record too, as its [`WorkflowHead`], to answer
     /// its owner: a new format changes that reader with the agent.
-    pub const FORMAT: u8 = 2;
+    pub const FORMAT: u8 = 3;
 }
 
 /// A [`Workflow`] record's fields before its snapshot, in its order:
@@ -97,6 +146,7 @@ pub struct WorkflowHead {
     pub format: u8,
     pub program: ProgramHash,
     pub instance: InstanceId,
+    pub method: MethodId,
     pub owner: Principal,
     pub gas: u64,
     pub writable: u32,

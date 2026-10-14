@@ -35,7 +35,7 @@ use std::time::Duration;
 
 use vos_checker::processes::relay::Link;
 use vos_checker::processes::{Options, PROCESS_WAIT, Processes, methods};
-use vos_checker::programs::actor;
+use vos_checker::programs::package;
 use vos_checker::{ANSWERED, COUNTER, Client, INBOX, Mode, Nodes, Random, SECOND, wait_until};
 use vos_node::store::Fjall;
 use vos_wire::ids::AgentId;
@@ -582,7 +582,7 @@ fn five_processes_apply_once_through_faults() {
         failed_disks: Mutex::new(Vec::new()),
     };
     let space = &run.space;
-    let counter = actor("counter");
+    let counter = package("counter");
     // Each agent on three nodes in turn, so every node holds some.
     let agents: Vec<AgentId> = (0..AGENTS)
         .map(|at| {

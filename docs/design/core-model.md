@@ -239,11 +239,20 @@ impl Ledger {
   - an overlay per step, with conflicts detected before commit;
   - cycle detection across call trees.
 
-### 6.4 Packages [decided: separately compiled; proposed details]
+### 6.4 Packages [decided: a package is the ELF, its programs derived at install; proposed details]
 
-- A package holds actor and workflow program hashes, schema (methods, state
-  fields and their lanes), attestable program hashes, vendor id, signature
-  and license terms. Packages are content-addressed and move between spaces.
+- A package is the ELF its actor's crate builds: its entry, which routes
+  by method to a command, a query or a workflow, an entry per attestable
+  method, and its schema (methods, state fields and their lanes) in a
+  section of its own; with its vendor id, signature and license terms.
+  Packages are content-addressed by the ELF and move between spaces.
+- Installing derives the package's programs from the ELF: the actor's
+  program, which holds its handlers and its workflows, and one kernel per
+  attestable method (section 11.1). The install record holds the derived
+  program and kernel hashes, the schema, the transpiler's version and the
+  ELF's hash. Derived hashes are per transpiler version, so two spaces
+  agree on a kernel's hash only when they derive with the same version.
+  An installed program is never transpiled again.
 - Installing creates an actor instance with an id, the package hash and a
   state namespace.
 - Upgrade drain rule: new invocations use the new program immediately.
@@ -265,8 +274,8 @@ agent program, which serves them. Precompiles are the one exception
 | Operation | Command | Query | Merge | Workflow |
 |---|---|---|---|---|
 | input, reply, log, caller | yes | yes | yes | yes |
-| read own Linear state | yes | yes | no | no |
-| write own Linear state | yes | no | no | no |
+| read own Linear state | yes | yes | no | in a section |
+| write own Linear state | yes | no | no | in a section |
 | read and write own Merge fields | yes (applied after commit) | read | yes | no |
 | `call` an instance in the same agent (nested, synchronous) | yes | queries only | no | yes |
 | `send` to any agent; `start` a workflow | yes | no | no | yes |
@@ -279,6 +288,12 @@ agent program, which serves them. Precompiles are the one exception
 - **Unknown ids:** the agent answers any id it does not serve with `WHAT`,
   as a JAM node does. That includes a precompile id an inner machine
   raises on JAM.
+- **A workflow reads and writes its actor's Linear state through sections
+  only:** `ctx.read` and `ctx.update`, synchronous and atomic, on the state
+  of the instance it runs for, tables included, as that instance. Inside a
+  section the agent serves only that instance's row operations, `now` and
+  `log`; anything else fails the step. A section counts as an effect, so it
+  never spans a pause: state is read afresh after every await.
 - **Inside an attestable method,** the agent serves no ABI at all. Only
   precompiles run (section 11.1).
 - An actor cannot touch another instance's state; everything else is a call
@@ -839,10 +854,12 @@ outbox sequence numbers, which receivers deduplicate.
 
 ### 11.1 Mechanism [decided: restricted methods; details proposed]
 
-- An `#[attestable]` method is compiled into its own small program and
-  shipped in the package. It is pure: it uses no context and makes no calls,
-  sends, `now` or `random`; only precompiles run inside it. The macro
-  enforces this.
+- An `#[attestable]` method is derived from the actor's ELF by reachability
+  from its entry: its kernel, the code and data its entry's relocations
+  reach, linked and transpiled once at install (section 6.4). It is pure: it
+  uses no context and makes no calls, sends, `now` or `random`; only
+  precompiles run inside it. The macro enforces this, and the derivation
+  refuses a kernel whose reachable code makes any other host call.
 - **Inputs** (private): its arguments, plus the committed fields it reads,
   delivered as witnesses (rows plus a `BatchProof` against `CommittedMap`
   roots). Plain fields and tables have no root, so the macro rejects any
@@ -852,7 +869,7 @@ outbox sequence numbers, which receivers deduplicate.
     program hash;
   - **private:** its writes to committed fields, bound by the root after.
     The enclosing command applies them as ordinary writes.
-- A live call runs that same program as an inner machine, so what runs is
+- A live call runs that same kernel as an inner machine, so what runs is
   what gets proven. The agent records the program hash, the witness and the
   output with the agent's replicated state. The record is internal to the
   space, so losing the producing node cannot make a settlement window
@@ -1078,6 +1095,14 @@ These form a prover track that runs alongside the core slices (section 16).
   17–20 µs in one process, so a machine of its own may move the
   replicated rows. The slice 3 progress log has every run.
 - No hot path may grow with history length.
+- **An actor's heap is paid per invocation of any kind:** its workflows
+  run in its program (section 6.4), so it configures one heap for them
+  and its handlers alike, and each handler's machine maps all of it, on
+  JAM through the loader's calls (about 372,000 gas a call for 12 MiB,
+  about 15,000 at the SDK's default) and on VOS in the pool's price by
+  pages. A bump allocator over the header's heap region, mapping a small
+  heap for handlers and a larger one for workflow steps, is carried to a
+  later slice.
 
 ## 15. Worked examples
 

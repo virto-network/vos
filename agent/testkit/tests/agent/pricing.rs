@@ -608,3 +608,29 @@ fn a_pause_pays_for_its_serving() {
         }
     }
 }
+
+/// A section's open and its close pay for their serving, a fifth spare
+/// (`price::SECTION` each): a workflow's thousands of empty sections
+/// against none.
+#[test]
+fn a_section_pays_for_its_serving() {
+    use crate::workflows::Flows;
+    use vos_wire::abi::price::SECTION;
+    use vos_wire::result::Step;
+    // The agent's gas beyond its steps' for a start and its first step.
+    let own = |count: u32| -> i64 {
+        let mut flows = Flows::new(Node::new());
+        let idle = flows.measured(1, vec![]).1;
+        let start = flows.start("sections", count);
+        let (result, gas) = flows.measured(1, vec![start]);
+        let Step::Ran(run) = &result.steps[1] else {
+            panic!("{:?}", result.steps[1]);
+        };
+        gas as i64 - idle as i64 - run.gas_used as i64
+    };
+    let count = 4_000;
+    let charge = 2 * SECTION;
+    let cost = charge as i64 + (own(count) - own(0)) / i64::from(count);
+    println!("a section: charged {charge}, costs the agent {cost}");
+    assert!(cost <= (charge * 4 / 5) as i64, "{cost} of {charge}");
+}

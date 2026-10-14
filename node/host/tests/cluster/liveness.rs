@@ -310,7 +310,7 @@ fn an_install_at_a_stalled_leader_times_out() {
     let closed = commits.close();
     let started = Instant::now();
     // Bounded here too, so that waiting for the commit fails, not hangs.
-    let install = leader.install(agent, COUNTER, &cluster.programs.counter, &[], vec![]);
+    let install = leader.install(agent, COUNTER, &cluster.programs.counter_elf, vec![]);
     let installed = smol::block_on(smol::future::or(async { Some(install.await) }, async {
         smol::Timer::after(Duration::from_secs(10)).await;
         None
@@ -332,7 +332,7 @@ fn an_install_at_a_stalled_leader_times_out() {
     wait_until("the install, sent again", || {
         let leader = cluster.node(cluster.leader(agent));
         let installed =
-            smol::block_on(leader.install(agent, COUNTER, &cluster.programs.counter, &[], vec![]));
+            smol::block_on(leader.install(agent, COUNTER, &cluster.programs.counter_elf, vec![]));
         matches!(installed, Ok(Reply::Ran(Outcome::Done(_))))
     });
     let leader = cluster.leader(agent);

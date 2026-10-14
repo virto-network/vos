@@ -140,7 +140,7 @@ fn status(record: &WorkflowHead, reader: Principal) -> WorkflowStatus {
 mod tests {
     use super::*;
     use vos_wire::Encode;
-    use vos_wire::ids::{InstanceId, ProgramHash};
+    use vos_wire::ids::{InstanceId, MethodId, ProgramHash};
     use vos_wire::result::Outcome;
 
     /// The head of a record of `owner`'s workflow in `state`.
@@ -149,6 +149,7 @@ mod tests {
             format: Workflow::FORMAT,
             program: ProgramHash([1; 32]),
             instance: InstanceId(1),
+            method: MethodId(1),
             owner,
             gas: 1,
             writable: 1,

@@ -17,7 +17,6 @@ use std::time::{Duration, Instant};
 
 use ed25519_dalek::{Signer, SigningKey};
 use vos_node::client::post_within;
-use vos_wire::abi::Kind;
 use vos_wire::ids::{AgentId, InstanceId, MethodId, WorkflowId};
 use vos_wire::ingress::{
     Answer, Consistency, Install, Rejection, WORKFLOW_READ_HORIZON_MS, WorkflowRead,
@@ -60,12 +59,12 @@ impl TourMethods {
     }
 }
 
-/// The rounds actor's programs, its own and its workflows', and its
+/// The rounds actor's package and program, its workflows in it, and its
 /// methods.
 pub struct Rounds {
+    /// Its package, the ELF its crate built.
+    pub elf: Vec<u8>,
     pub program: Vec<u8>,
-    pub tour: Vec<u8>,
-    pub rewrite: Vec<u8>,
     pub methods: TourMethods,
 }
 
@@ -73,31 +72,17 @@ impl Rounds {
     pub fn load() -> Self {
         let program = crate::programs::actor("rounds");
         Self {
+            elf: crate::programs::package("rounds"),
             methods: TourMethods::of(&program),
             program,
-            tour: crate::programs::actor("tour"),
-            rewrite: crate::programs::actor("rewrite"),
         }
-    }
-
-    /// Its workflows' programs, each bound to its method.
-    pub fn beside(&self) -> Vec<(MethodId, Kind, &[u8])> {
-        vec![
-            (self.methods.tour, Kind::Workflow, &self.tour),
-            (self.methods.rewrite, Kind::Workflow, &self.rewrite),
-        ]
     }
 
     /// An operator's install of it as `instance`.
     pub fn install(&self, instance: InstanceId) -> Install {
         Install {
             instance,
-            program: self.program.clone(),
-            beside: self
-                .beside()
-                .into_iter()
-                .map(|(method, kind, blob)| (method, kind, blob.to_vec()))
-                .collect(),
+            elf: self.elf.clone(),
             roles: Vec::new(),
         }
     }

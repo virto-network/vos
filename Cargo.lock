@@ -2503,6 +2503,7 @@ dependencies = [
  "lz4_flex 0.13.1",
  "serde_json",
  "vos-pvm",
+ "vos-pvm-compiler",
  "vos-tree",
  "vos-wire",
 ]
@@ -2698,6 +2699,7 @@ dependencies = [
  "blake2",
  "lz4_flex 0.13.1",
  "proptest",
+ "tempfile",
  "vos-jam",
  "vos-pvm",
  "vos-pvm-compiler",

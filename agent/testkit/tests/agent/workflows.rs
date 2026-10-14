@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use vos_testkit::programs::{actor, method};
 use vos_testkit::{Step as KitStep, Testkit, decode};
-use vos_wire::abi::{Failure, Kind, cap, op, price};
+use vos_wire::abi::{Failure, cap, op, price};
 use vos_wire::batch::{Admin, Answer, Await, Body, Input, Message};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, WorkflowId};
 use vos_wire::keys::{self, Due};
@@ -19,30 +19,8 @@ use vos_wire::{Encode, defaults};
 use crate::common::{ALICE, Actors, COUNTER, LEDGER, Node, SHOP, Sessions, ran};
 
 mod preemption;
+mod sections;
 
-/// The shop's workflows, each its own program.
-pub const FLOWS: [&str; 20] = [
-    "transfer",
-    "saga",
-    "compute",
-    "nap",
-    "fragile",
-    "scratch",
-    "delegate",
-    "hog",
-    "fill",
-    "digest",
-    "chain",
-    "audit",
-    "probe",
-    "grind",
-    "grind_whole",
-    "settle",
-    "relay",
-    "stuck",
-    "splurge",
-    "press",
-];
 /// The agent the shop's workflows ask, at its counter, instance 1.
 const RISK: AgentId = AgentId(9);
 
@@ -82,15 +60,16 @@ pub struct Flows {
     budget: u64,
 }
 
-/// The shop's programs: its own, then each workflow's.
+/// The shop's programs, its workflows in each: its own, one with a heap
+/// for its largest steps, one with a heap past what a workflow may write,
+/// and one with the default heap, which an upgrade installs.
 fn programs() -> BTreeMap<&'static str, Vec<u8>> {
     static PROGRAMS: std::sync::OnceLock<BTreeMap<&'static str, Vec<u8>>> =
         std::sync::OnceLock::new();
     PROGRAMS
         .get_or_init(|| {
-            ["shop", "huge"]
+            ["shop", "big", "huge", "lean"]
                 .into_iter()
-                .chain(FLOWS)
                 .map(|name| (name, actor(name)))
                 .collect()
         })
@@ -110,36 +89,20 @@ impl Flows {
             budget: crate::common::OUTER_GAS,
         };
         flows.actors.install(&mut flows.node, &mut flows.kit);
-        let install = flows.install(&FLOWS.map(|name| (name, name)));
+        let install = flows.install("shop");
         flows.node.batch(0, vec![install]);
         flows.kit.version = flows.node.version;
         flows
     }
 
-    /// The shop's install with each workflow method bound to a program,
-    /// in the node, which stores its programs, and in the model.
-    fn install(&mut self, bound: &[(&str, &str)]) -> Input {
-        let shop = &self.programs["shop"];
-        let beside: Vec<(MethodId, Kind, &[u8])> = bound
-            .iter()
-            .map(|(name, program)| {
-                (
-                    method(shop, name),
-                    Kind::Workflow,
-                    self.programs[program].as_slice(),
-                )
-            })
-            .collect();
-        self.kit.install(SHOP, shop, &beside, &[]).unwrap();
-        let program = self.node.add(shop);
-        let beside = beside
-            .into_iter()
-            .map(|(method, kind, blob)| (method, kind, self.node.add(blob)))
-            .collect();
+    /// The shop's install as its program `program`, in the node, which
+    /// stores it, and in the model.
+    fn install(&mut self, program: &str) -> Input {
+        let shop = &self.programs[program];
+        self.kit.install(SHOP, shop, &[], &[]).unwrap();
         Input::Admin(Admin::Install {
             instance: SHOP,
-            program,
-            beside,
+            derivation: vos_testkit::programs::bare(self.node.add(shop)),
             roles: vec![],
         })
     }
@@ -442,7 +405,7 @@ fn a_transfer_awaits_one_answer_then_calls_this_agents_actors() {
         assert_eq!(record.awaits, 1);
         let held = flows.pages(0);
         assert!(!held.is_empty() && held.len() < 16, "{} pages", held.len());
-        let program = flows.program("transfer");
+        let program = flows.program("shop");
         assert_eq!(flows.count(&keys::workflow_pins(&program)), Some(1));
         assert_eq!(flows.count(&keys::live_workflows()), Some(1));
         assert!(
@@ -692,7 +655,7 @@ fn a_trap_fails_the_workflow_and_keeps_its_earlier_steps() {
                 detail: vec![],
             }
         );
-        let program = flows.program("fragile");
+        let program = flows.program("shop");
         assert_eq!(flows.count(&keys::workflow_pins(&program)), None);
         for (index, _) in held {
             assert_eq!(flows.node.get(&keys::page(WorkflowId(0), index)), None);
@@ -881,32 +844,31 @@ fn a_workflow_starts_another_agents_and_awaits_its_result() {
     }
 }
 
-/// A workflow keeps the program it started on whatever an upgrade binds
-/// its method to meanwhile: it pins it until it ends.
+/// A workflow keeps the program it started on, its instance's actor
+/// program, whatever an upgrade installs meanwhile: it pins it until it
+/// ends.
 #[test]
 fn a_workflow_keeps_its_program_through_an_upgrade() {
     for backend in Node::backends() {
         let mut flows = Flows::new(Node::on(backend));
         let start = flows.start("transfer", transfer(0));
         flows.batch(1, vec![start]);
-        let mut bound = FLOWS.map(|name| (name, name));
-        bound[0] = ("transfer", "saga");
-        let upgrade = flows.install(&bound);
+        let upgrade = flows.install("lean");
         let result = flows.batch(1, vec![upgrade]);
         ran(&result.steps[0]);
-        let transfer = flows.program("transfer");
-        assert_eq!(flows.record(0).program, transfer);
-        assert_eq!(flows.count(&keys::workflow_pins(&transfer)), Some(1));
+        let shop = flows.program("shop");
+        assert_eq!(flows.record(0).program, shop);
+        assert_eq!(flows.count(&keys::workflow_pins(&shop)), Some(1));
         let answer = flows.reply(RISK, 0, 0, Answer::Done(9u64.encode()));
         flows.batch(1, vec![answer]);
         assert_eq!(ended(&flows.record(0)), &Outcome::Done(9u64.encode()));
-        assert_eq!(flows.count(&keys::workflow_pins(&transfer)), None);
+        assert_eq!(flows.count(&keys::workflow_pins(&shop)), None);
 
-        // A start now runs the program bound since.
-        let start = flows.start("transfer", (RISK.0, 1u32));
+        // A start now runs the program installed since.
+        let start = flows.start("transfer", transfer(0));
         let result = flows.batch(1, vec![start]);
-        assert_eq!(flows.record(1).program, flows.program("saga"));
-        asks_risk(&flows, due(&result, 1), 1, 0, 1);
+        assert_eq!(flows.record(1).program, flows.program("lean"));
+        asks_risk(&flows, due(&result, 1), 1, 0, 0);
     }
 }
 
@@ -936,15 +898,15 @@ fn the_caps_hold() {
         assert_eq!(ran(&result.steps[2]).outcome, cap, "one past the agent's");
 
         let mut flows = Flows::new(Node::on(backend));
-        let mut bound = FLOWS.map(|name| (name, name));
-        bound[7] = ("hog", "huge");
-        let install = flows.install(&bound);
+        let install = flows.install("huge");
         flows.batch(1, vec![install]);
         let start = flows.start("hog", 1u32);
         let result = flows.batch(1, vec![start]);
         assert_eq!(ran(&result.steps[0]).outcome, cap, "a program too large");
 
         let mut flows = Flows::new(Node::on(backend));
+        let install = flows.install("big");
+        flows.batch(1, vec![install]);
         let past = (cap::STEP_PAGES + 4096) as u32;
         let start = flows.start("hog", past);
         let result = flows.batch(1, vec![start]);
@@ -1385,6 +1347,8 @@ fn the_meter_holds_workflows_steps() {
 fn restored_and_written_pages_share_the_budget() {
     for backend in Node::backends() {
         let mut flows = Flows::at_default_budget(Node::on(backend));
+        let install = flows.install("big");
+        flows.batch(1, vec![install]);
         let start = flows.start("fill", (0u32, vec![700 * 4096u32, 300 * 4096]));
         let result = flows.unmodelled(1, vec![start]);
         assert_eq!(due(&result, 0).outcome, Outcome::Done(vec![]));
@@ -1447,7 +1411,7 @@ fn a_lost_pinned_program_stops_the_refine() {
     let start = flows.start("transfer", transfer(0));
     flows.batch(1, vec![start]);
     let answer = flows.reply(RISK, 0, 0, Answer::Done(7u64.encode()));
-    let program = flows.program("transfer");
+    let program = flows.program("shop");
     let blob = flows.node.forget(&program);
     let refined = flows.refine(1, vec![answer.clone()]);
     let lost = vos_pvm::ExitReason::HostCall(crate::common::LOST);
@@ -1466,7 +1430,7 @@ fn a_lost_pinned_program_stops_the_refine() {
     let mut flows = Flows::new(Node::jam(true));
     let start = flows.start("transfer", transfer(0));
     flows.unmodelled(1, vec![start]);
-    let program = flows.program("transfer");
+    let program = flows.program("shop");
     flows.node.forget(&program);
     let answer = flows.reply(RISK, 0, 0, Answer::Done(7u64.encode()));
     flows.unmodelled(1, vec![answer]);

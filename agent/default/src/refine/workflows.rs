@@ -1,8 +1,9 @@
 //! Workflows: their table and their steps.
 //!
-//! A workflow's record (`keys::workflow`) holds its program, owner, state
-//! and snapshot ([`super::snapshots`]). A workflow that has not ended pins
-//! its program and counts toward the agent's live workflows; every
+//! A workflow's record (`keys::workflow`) holds its program, its
+//! instance's actor program, which routes its method, its owner, state and
+//! snapshot ([`super::snapshots`]). A workflow that has not ended pins its
+//! program and counts toward the agent's live workflows; every
 //! workflow has exactly one row in the due index, at its next step's time,
 //! or once ended at its collection's.
 //!
@@ -230,9 +231,10 @@ fn started(
             return Err(Failure::Forbidden);
         }
     }
-    let program = installed
-        .bound(method, Kind::Workflow)
-        .ok_or(Failure::Unknown)?;
+    if schema.kind != Kind::Workflow {
+        return Err(Failure::Unknown);
+    }
+    let program = installed.program();
     let header = machines::pinned_header(&program.0).ok_or(Failure::Unloadable)?;
     let writable = writable(&header).ok_or(Failure::Unloadable)?;
     if writable > cap::WORKFLOW_PAGES as u64 {
@@ -248,6 +250,7 @@ fn started(
         format: Workflow::FORMAT,
         program,
         instance,
+        method,
         owner: caller,
         gas: schema
             .gas
@@ -463,9 +466,11 @@ fn unfit(base: &Base, input: InputRef, id: WorkflowId, mut workflow: Workflow) -
 }
 
 /// Restore workflow `id`'s machine, run it through its step with `resume`
-/// as its input, and capture it if it paused. A machine resumed from a
-/// pause has the input's length in φ7; one preempted resumes as it was, its
-/// unserved call first.
+/// as its input, and capture it if it paused. Its first step enters the
+/// actor program at its start, as a handler does: the method in φ7, the
+/// workflow's kind in φ8 and its arguments' length in φ9. A machine resumed
+/// from a pause has the input's length in φ7; one preempted resumes as it
+/// was, its unserved call first.
 fn run(
     base: &Base,
     invocation: &mut Invocation,
@@ -478,9 +483,17 @@ fn run(
         Ok(restored) => restored,
         Err(code) => return Left::Failed(code),
     };
-    if !matches!(workflow.state, WorkflowState::Preempted(_)) {
-        machine.set_register(7, resume.len() as u64);
-        machine.set_register(8, 0);
+    match (&workflow.snapshot, &workflow.state) {
+        (None, _) => {
+            machine.set_register(7, u64::from(workflow.method.0));
+            machine.set_register(8, u64::from(Kind::Workflow.encode()[0]));
+            machine.set_register(9, resume.len() as u64);
+        }
+        (Some(_), WorkflowState::Preempted(_)) => {}
+        (Some(_), _) => {
+            machine.set_register(7, resume.len() as u64);
+            machine.set_register(8, 0);
+        }
     }
     let snapshot = workflow.snapshot.as_ref();
     let pending = snapshot.and_then(|snapshot| snapshot.pending);

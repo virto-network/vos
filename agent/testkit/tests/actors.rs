@@ -2,7 +2,7 @@
 //! build-test-actors`) running on the testkit. The tests fail, not skip,
 //! when the programs are missing.
 
-use vos_testkit::programs::{actor, method, schema};
+use vos_testkit::programs::{actor, kernel, method, schema};
 use vos_testkit::{InstallError, Testkit, decode, program_hash};
 use vos_wire::abi::{Failure, Kind};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal};
@@ -21,22 +21,19 @@ fn reply<T: Decode>(outcome: Outcome) -> T {
     }
 }
 
-/// The ledger's programs beside its own: its attestable's and its
-/// workflow's.
-fn beside<'a>(ledger: &[u8]) -> Vec<(MethodId, Kind, &'a [u8])> {
-    static PROGRAMS: std::sync::OnceLock<(Vec<u8>, Vec<u8>)> = std::sync::OnceLock::new();
-    let (checksum, tally) = PROGRAMS.get_or_init(|| (actor("checksum"), actor("tally")));
-    vec![
-        (method(ledger, "checksum"), Kind::Attestable, checksum),
-        (method(ledger, "tally"), Kind::Workflow, tally),
-    ]
+/// The ledger's kernels: its attestable's, derived from its ELF. Its
+/// workflow runs in its own program.
+fn kernels<'a>(ledger: &[u8]) -> Vec<(MethodId, &'a [u8])> {
+    static CHECKSUM: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    let checksum = CHECKSUM.get_or_init(|| kernel("ledger", "checksum"));
+    vec![(method(ledger, "checksum"), checksum)]
 }
 
 fn kit() -> Testkit {
     let mut kit = Testkit::new(AgentId(7));
     kit.install(COUNTER, &actor("counter"), &[], &[]).unwrap();
     let ledger = actor("ledger");
-    kit.install(LEDGER, &ledger, &beside(&ledger), &[("minter", 1)])
+    kit.install(LEDGER, &ledger, &kernels(&ledger), &[("minter", 1)])
         .unwrap();
     kit.install(CALLER, &actor("caller"), &[], &[]).unwrap();
     kit
@@ -194,7 +191,7 @@ fn a_ledger_moves_balances_in_a_table() {
 }
 
 #[test]
-fn an_attestable_method_runs_as_its_own_program() {
+fn an_attestable_method_runs_as_its_own_kernel() {
     let mut kit = kit();
     let values = vec![1u64, 2, 3];
     let expected = values.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, value| {
@@ -203,39 +200,39 @@ fn an_attestable_method_runs_as_its_own_program() {
     let step = call(&mut kit, LEDGER, "audit", values.clone());
     assert_eq!(reply::<u64>(step.outcome), expected);
     assert_eq!(step.attests.len(), 1);
-    assert_eq!(step.attests[0].program, program_hash(&actor("checksum")));
+    assert_eq!(
+        step.attests[0].program,
+        program_hash(&kernel("ledger", "checksum"))
+    );
     assert_eq!(step.attests[0].arguments, values.encode());
     assert_eq!(step.attests[0].output, expected.encode());
 }
 
 #[test]
-fn installing_needs_every_attestable_and_workflow_program_and_role() {
+fn installing_needs_every_attestable_kernel_and_role() {
     let mut kit = Testkit::new(AgentId(7));
     let ledger = actor("ledger");
-    let all = beside(&ledger);
+    let all = kernels(&ledger);
     assert_eq!(
-        kit.install(LEDGER, &ledger, &all[1..], &[("minter", 1)]),
+        kit.install(LEDGER, &ledger, &[], &[("minter", 1)]),
         Err(InstallError::Unbound(method(&ledger, "checksum")))
     );
+    // A kernel runs an attestable method, never a workflow, which runs in
+    // the actor's program.
+    let checksum = all[0];
+    let tally = (method(&ledger, "tally"), checksum.1);
     assert_eq!(
-        kit.install(LEDGER, &ledger, &all[..1], &[("minter", 1)]),
-        Err(InstallError::Unbound(method(&ledger, "tally")))
-    );
-    // Each program runs a method of its own kind.
-    let (checksum, tally) = (all[0], all[1]);
-    let swapped = [(checksum.0, Kind::Workflow, checksum.2), tally];
-    assert_eq!(
-        kit.install(LEDGER, &ledger, &swapped, &[("minter", 1)]),
-        Err(InstallError::Unmatched(checksum.0))
+        kit.install(LEDGER, &ledger, &[checksum, tally], &[("minter", 1)]),
+        Err(InstallError::Unmatched(tally.0))
     );
     let mut twice = all.clone();
-    twice.push(tally);
+    twice.push(checksum);
     assert_eq!(
         kit.install(LEDGER, &ledger, &twice, &[("minter", 1)]),
-        Err(InstallError::Duplicate(tally.0))
+        Err(InstallError::Duplicate(checksum.0))
     );
     let mut stray = all.clone();
-    stray.push((method(&ledger, "mint"), Kind::Attestable, checksum.2));
+    stray.push((method(&ledger, "mint"), checksum.1));
     assert_eq!(
         kit.install(LEDGER, &ledger, &stray, &[("minter", 1)]),
         Err(InstallError::Unmatched(method(&ledger, "mint")))
@@ -304,7 +301,7 @@ fn a_failed_callee_leaves_no_messages() {
 }
 
 #[test]
-fn an_attestable_program_may_not_make_host_calls() {
+fn a_kernel_may_not_make_host_calls() {
     use vos_pvm_program::{CodeBlob, StandardProgram, build_standard_program};
     // ecalli 9 (`machine`), then return to the halt address.
     let bad = build_standard_program(&StandardProgram {
@@ -321,8 +318,8 @@ fn an_attestable_program_may_not_make_host_calls() {
     .unwrap();
     let ledger = actor("ledger");
     let mut kit = Testkit::new(AgentId(7));
-    let mut programs = beside(&ledger);
-    programs[0].2 = &bad;
+    let mut programs = kernels(&ledger);
+    programs[0].1 = &bad;
     kit.install(LEDGER, &ledger, &programs, &[("minter", 1)])
         .unwrap();
     let step = call(&mut kit, LEDGER, "audit", vec![1u64]);

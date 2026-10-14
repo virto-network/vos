@@ -24,7 +24,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use vos_checker::programs::{actor, method};
+use vos_checker::programs::{actor, method, package};
 use vos_checker::workflows::{ASKED, ROUNDS, Rounds, TOLD, Touring, check_tallies};
 use vos_checker::{
     ANSWERED, ATTEMPT, COUNTER, Client, INBOX, Methods, Mode, Random, SECOND, wait_until,
@@ -399,7 +399,7 @@ impl Drop for Ending<'_> {
 fn install_rounds(cluster: &Cluster, agent: AgentId, rounds: &Rounds) {
     let leader = cluster.node(cluster.leader(agent).unwrap()).unwrap();
     for instance in [ASKED, TOLD, ROUNDS] {
-        let install = leader.install(agent, instance, &rounds.program, &rounds.beside(), vec![]);
+        let install = leader.install(agent, instance, &rounds.elf, vec![]);
         let installed = smol::block_on(install);
         assert!(
             matches!(installed, Ok(vos_node::Reply::Ran(Outcome::Done(_)))),
@@ -435,11 +435,11 @@ fn exactly_once(mode: Mode, default_seed: u64, workflows: bool) {
     println!("seed {seed}");
     let mut random = Random(seed | 1);
     let cluster = Cluster::new(seed);
-    let counter = actor("counter");
+    let (program, counter) = (actor("counter"), package("counter"));
     let methods = Methods {
-        increment: method(&counter, "increment"),
-        value: method(&counter, "value"),
-        forward: method(&counter, "forward"),
+        increment: method(&program, "increment"),
+        value: method(&program, "value"),
+        forward: method(&program, "forward"),
     };
     let value = methods.value;
     let rounds = workflows.then(Rounds::load);
@@ -453,8 +453,7 @@ fn exactly_once(mode: Mode, default_seed: u64, workflows: bool) {
             let leader = cluster.node(cluster.leader(agent).unwrap()).unwrap();
             // The inbox first: no message reaches an instance not there yet.
             for instance in [INBOX, COUNTER, SECOND] {
-                let installed =
-                    smol::block_on(leader.install(agent, instance, &counter, &[], vec![]));
+                let installed = smol::block_on(leader.install(agent, instance, &counter, vec![]));
                 assert!(
                     matches!(installed, Ok(vos_node::Reply::Ran(Outcome::Done(_)))),
                     "{installed:?}"

@@ -1,14 +1,18 @@
 /* Gray Paper standard-program layout: read-only data at Z_Z, read-write data
  * (including .bss) from 2*Z_Z + zone_round(|ro|), set explicitly. An actor
- * program's schema (.vos_schema) comes first in the read-only data, where
- * the agent and the node look for it. */
+ * program's schema comes first in the read-only data, a section of its own
+ * (.vos_schema) where the agent looks for it and the ELF describes itself,
+ * then the table of its attestable methods' entries (.vos_attest), the
+ * roots its kernels are derived from. */
 
 ENTRY(_start)
 
 SECTIONS
 {
-    .rodata 0x10000 : { KEEP(*(.vos_schema)) *(.rodata .rodata.* .srodata .srodata.*) }
-    . = 0x20000 + ((SIZEOF(.rodata) + 0xffff) & ~0xffff);
+    . = 0x10000;
+    .vos_schema : { KEEP(*(.vos_schema)) }
+    .rodata : { KEEP(*(.vos_attest)) *(.rodata .rodata.* .srodata .srodata.*) }
+    . = 0x20000 + ((. - 0x10000 + 0xffff) & ~0xffff);
     /* The GOT and relocated read-only data are written at link time, so
      * they belong with the read-write data, not after .rodata. */
     .data : { *(.data .data.* .sdata .sdata.* .got .got.* .data.rel.ro .data.rel.ro.*) }

@@ -25,12 +25,11 @@ use vos_net::Network;
 use vos_pvm::pool::{CodeHash, MachinePool, OuterMachines};
 use vos_raft::Role;
 use vos_wire::Decode;
-use vos_wire::abi::Kind;
 use vos_wire::batch::{Admin, Message, Query, Request, Work};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash};
 use vos_wire::ingress::{Contact, Grant, NodeId, Unplaced};
 use vos_wire::peer::{CreationRecord, NodeNumber, Placement};
-use vos_wire::records::unstored;
+use vos_wire::records::{Derivation, unstored};
 use vos_wire::result::{Outcome, Step, Write};
 
 use crate::Hooks;
@@ -604,17 +603,19 @@ impl Inner {
         Ok(agent)
     }
 
-    /// Install a package: its programs stored, then the install queued at
-    /// the leader, its entry naming their blobs.
+    /// Install a package, the ELF its actor's crate built: its programs
+    /// derived from it off the node's runtime thread, the actor's and a
+    /// kernel per attestable method, stored and pooled, then the install
+    /// queued at the leader, its entry naming their blobs. A derivation
+    /// that fails, or panics, fails the install, never the node.
     pub(crate) async fn install(
         &self,
         agent: AgentId,
         instance: InstanceId,
-        program: Vec<u8>,
-        beside: Vec<(MethodId, Kind, Vec<u8>)>,
+        elf: Vec<u8>,
         roles: Vec<(Vec<u8>, u8)>,
     ) -> Result<Answered, CallError> {
-        // A follower refuses before storing anything.
+        // A follower refuses before deriving anything.
         self.settled(agent).await?;
         let run = self.run(agent).ok_or_else(|| self.absent(agent))?;
         if run.shared.state().role != Role::Leader {
@@ -624,6 +625,8 @@ impl Inner {
         let pooled = self
             .executors
             .run(move || {
+                let derived = vos_pvm_compiler::derive(&elf)
+                    .map_err(|error| CallError::Failed(format!("the package: {error}")))?;
                 let mut stored = Vec::new();
                 let mut pooled = |blob: Vec<u8>| -> Result<ProgramHash, CallError> {
                     let hash = pool
@@ -636,16 +639,26 @@ impl Inner {
                     stored.push((reference, Arc::new(blob)));
                     Ok(ProgramHash(hash.0))
                 };
-                let program = pooled(program)?;
-                let beside = beside
-                    .into_iter()
-                    .map(|(method, kind, blob)| Ok((method, kind, pooled(blob)?)))
-                    .collect::<Result<Vec<_>, CallError>>()?;
-                Ok((program, beside, stored))
+                let derivation = Derivation::new(
+                    &elf,
+                    &derived.actor,
+                    derived
+                        .kernels
+                        .iter()
+                        .map(|(method, kernel)| (MethodId(*method), kernel.as_slice())),
+                    derived.transpiler_version,
+                );
+                pooled(derived.actor)?;
+                for (_, kernel) in derived.kernels {
+                    pooled(kernel)?;
+                }
+                Ok((derivation, stored))
             })
             .await
-            .map_err(|panicked| CallError::Failed(panicked.0))?;
-        let (program, beside, stored) = pooled?;
+            .map_err(|panicked| {
+                CallError::Failed(format!("deriving and storing the package: {}", panicked.0))
+            })?;
+        let (derivation, stored) = pooled?;
         // Stored, a blob is kept by its age until the entry names it; the
         // apply then pins it.
         let mut references = Vec::with_capacity(stored.len());
@@ -658,8 +671,7 @@ impl Inner {
         }
         let admin = Admin::Install {
             instance,
-            program,
-            beside,
+            derivation,
             roles,
         };
         let (answer, reply) = smol::channel::bounded(1);
@@ -1014,28 +1026,23 @@ impl Node {
         Some(self.inner.run(agent)?.shared.state().applied)
     }
 
-    /// Install a package as `instance` of `agent`: its actor program, the
-    /// programs beside it, each bound to a method of its kind, an
-    /// attestable or a workflow, and its roles' bytes. The blobs are stored
-    /// and pooled, then the install is queued and answered.
+    /// Install a package as `instance` of `agent`: the ELF its actor's
+    /// crate built, from which the node derives its programs, stored and
+    /// pooled, and its roles' bytes. The install is queued and answered
+    /// with its derivation, encoded.
     pub fn install(
         &self,
         agent: AgentId,
         instance: InstanceId,
-        program: &[u8],
-        beside: &[(MethodId, Kind, &[u8])],
+        elf: &[u8],
         roles: Vec<(Vec<u8>, u8)>,
     ) -> impl Future<Output = Result<Reply, CallError>> + use<> {
         let inner = Arc::clone(&self.inner);
-        let program = program.to_vec();
-        let beside: Vec<(MethodId, Kind, Vec<u8>)> = beside
-            .iter()
-            .map(|(method, kind, blob)| (*method, *kind, blob.to_vec()))
-            .collect();
+        let elf = elf.to_vec();
         // On the node's thread, as every queueing is.
         self.inner.runtime.spawn(async move {
             inner
-                .install(agent, instance, program, beside, roles)
+                .install(agent, instance, elf, roles)
                 .await
                 .map(|answered| answered.reply)
         })

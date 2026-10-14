@@ -1,5 +1,5 @@
 //! A ledger: balances in a table, a role-gated mint, transfers that fail
-//! without funds, scans, an attestable checksum and a workflow's program.
+//! without funds, scans, an attestable checksum and a workflow.
 
 #![no_std]
 
@@ -100,7 +100,7 @@ impl Ledger {
     }
 
     /// Check `values` with the attestable `checksum`, run as its own
-    /// program.
+    /// kernel.
     #[msg]
     pub async fn audit(&mut self, ctx: &mut Command<Self>, values: Vec<u64>) -> u64 {
         ctx.attest(ledger::Checksum { values }).await.unwrap_or(0)
@@ -119,7 +119,7 @@ impl Ledger {
         total
     }
 
-    /// The sum of `amounts`, as a workflow's own program would compute it.
+    /// The sum of `amounts`, as a workflow.
     #[workflow]
     pub fn tally(amounts: Vec<u64>) -> u64 {
         amounts.iter().sum()

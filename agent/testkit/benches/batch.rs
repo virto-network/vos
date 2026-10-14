@@ -26,7 +26,7 @@ use vos_pvm::refine::Machine;
 use vos_pvm::refine_host::{RefineContext, StateReader};
 use vos_pvm::{ExitReason, PvmBackend};
 use vos_testkit::programs::{actor, agent, method};
-use vos_wire::abi::{Kind, cap, code};
+use vos_wire::abi::{cap, code};
 use vos_wire::batch::{Admin, Batch, Input, Request, Work};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, Session, WorkflowId};
 use vos_wire::jam::{AccumulateInput, Operand, RefineArgs};
@@ -141,36 +141,19 @@ impl Node {
             version: 0,
             time: 1,
         };
-        let inputs = vec![
-            node.install(counter, COUNTER, &[]),
-            node.install(ledger, LEDGER, &[]),
-        ];
+        let inputs = vec![node.install(counter, COUNTER), node.install(ledger, LEDGER)];
         node.apply(inputs);
         node
     }
 
-    /// An install of `blob` as `instance`, with `beside` bound to their
-    /// workflow methods, its programs added to the pool and served.
-    fn install(
-        &mut self,
-        blob: &[u8],
-        instance: InstanceId,
-        beside: &[(MethodId, &[u8])],
-    ) -> Input {
-        let mut add = |blob: &[u8]| {
-            let program = ProgramHash(self.pool.install(blob).unwrap().0);
-            self.programs.insert(program.0, blob.to_vec());
-            program
-        };
-        let program = add(blob);
-        let beside = beside
-            .iter()
-            .map(|(method, blob)| (*method, Kind::Workflow, add(blob)))
-            .collect();
+    /// An install of `blob` as `instance`, its workflows in it, the
+    /// program added to the pool and served.
+    fn install(&mut self, blob: &[u8], instance: InstanceId) -> Input {
+        let program = ProgramHash(self.pool.install(blob).unwrap().0);
+        self.programs.insert(program.0, blob.to_vec());
         Input::Admin(Admin::Install {
             instance,
-            program,
-            beside,
+            derivation: vos_testkit::programs::bare(program),
             roles: vec![],
         })
     }
@@ -353,11 +336,7 @@ fn rewriting(backend: PvmBackend, programs: &Programs, bytes: u32) -> (Node, Inp
         &programs.ledger,
     );
     let rewrite = method(&programs.rounds, "rewrite");
-    let beside = [
-        (method(&programs.rounds, "tour"), programs.tour.as_slice()),
-        (rewrite, programs.rewrite.as_slice()),
-    ];
-    let install = node.install(&programs.rounds, WORKFLOWS, &beside);
+    let install = node.install(&programs.rounds, WORKFLOWS);
     node.apply(vec![install]);
     let start = requests(rewrite, WORKFLOWS, |_| (bytes, u32::MAX).encode(), 1);
     let started = node.apply(start);
@@ -385,8 +364,6 @@ struct Programs {
     counter: Vec<u8>,
     ledger: Vec<u8>,
     rounds: Vec<u8>,
-    tour: Vec<u8>,
-    rewrite: Vec<u8>,
 }
 
 fn requests(
@@ -419,8 +396,6 @@ fn main() {
         counter: actor("counter"),
         ledger: actor("ledger"),
         rounds: actor("rounds"),
-        tour: actor("tour"),
-        rewrite: actor("rewrite"),
     };
     let (agent, counter, ledger) = (&programs.agent, &programs.counter, &programs.ledger);
     let increment = method(counter, "increment");

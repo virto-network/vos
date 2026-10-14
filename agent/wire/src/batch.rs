@@ -3,10 +3,11 @@
 use alloc::vec::Vec;
 use scale::{Decode, Encode};
 
-use crate::abi::{Failure, Kind};
+use crate::abi::Failure;
 use crate::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, Session, WorkflowId};
 use crate::ingress::Grant;
 use crate::keys::Due;
+use crate::records::Derivation;
 use crate::result::Outcome;
 
 /// A refine's work item payload: a batch through the log, a query on
@@ -68,20 +69,16 @@ pub struct Batch {
 }
 
 impl Batch {
-    /// The programs its installs name: each instance's own and those
-    /// beside it.
+    /// The programs its installs name: each instance's own and its
+    /// kernels.
     pub fn installs(&self) -> impl Iterator<Item = ProgramHash> + '_ {
         self.inputs
             .iter()
             .filter_map(|input| match input {
-                Input::Admin(Admin::Install {
-                    program, beside, ..
-                }) => Some((program, beside)),
+                Input::Admin(Admin::Install { derivation, .. }) => Some(derivation),
                 _ => None,
             })
-            .flat_map(|(program, beside)| {
-                core::iter::once(*program).chain(beside.iter().map(|(_, _, program)| *program))
-            })
+            .flat_map(Derivation::programs)
     }
 }
 
@@ -223,15 +220,14 @@ impl From<Outcome> for Answer {
 /// An operator command, applied through the log like any input.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum Admin {
-    /// Install a package as an instance: its actor program, the programs
-    /// beside it, each bound to a method of its kind, an attestable or a
-    /// workflow, and the agent's role byte for each role name the schema
-    /// uses.
+    /// Install a package as an instance: the programs the node derived
+    /// from its ELF, which it stored as blobs before proposing the install,
+    /// and the agent's role byte for each role name the schema uses. The
+    /// install's outcome is the derivation, encoded.
     #[codec(index = 0)]
     Install {
         instance: InstanceId,
-        program: ProgramHash,
-        beside: Vec<(MethodId, Kind, ProgramHash)>,
+        derivation: Derivation,
         roles: Vec<(Vec<u8>, u8)>,
     },
     /// Grant a principal a role in this agent, or (`None`) revoke it, as

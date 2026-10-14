@@ -7,11 +7,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use vos_checker::programs::{actor, method};
+use vos_checker::programs::{actor, method, package};
 use vos_node::store::{EntryKind, PersistMode};
 use vos_node::{Node, Reply};
 use vos_pvm::pool::CodeHash;
-use vos_wire::abi::Kind;
 use vos_wire::ids::{AgentId, InstanceId, MethodId, WorkflowId};
 use vos_wire::records::{Workflow, WorkflowState, unstored};
 use vos_wire::result::{InputRef, Outcome, Run, Step, WorkResult, Write};
@@ -22,70 +21,37 @@ use crate::common::{
 };
 
 const SHOP: InstanceId = InstanceId(4);
-/// The shop's workflows, each its own program.
-const FLOWS: [&str; 20] = [
-    "transfer",
-    "saga",
-    "compute",
-    "nap",
-    "fragile",
-    "scratch",
-    "delegate",
-    "hog",
-    "fill",
-    "digest",
-    "chain",
-    "audit",
-    "probe",
-    "grind",
-    "grind_whole",
-    "settle",
-    "relay",
-    "stuck",
-    "splurge",
-    "press",
-];
 
-/// The shop's program and those of the workflows a test binds, by name.
+/// The shop's programs, its workflows in each, and their packages: its
+/// own, and the one an upgrade installs.
 struct Shop {
     shop: Vec<u8>,
-    flows: Vec<(&'static str, Vec<u8>)>,
+    lean: Vec<u8>,
 }
 
 impl Shop {
     fn load() -> Self {
         Self {
             shop: actor("shop"),
-            flows: FLOWS.into_iter().map(|name| (name, actor(name))).collect(),
+            lean: actor("lean"),
         }
+    }
+
+    /// The package of the shop's program, or once `upgraded` the upgrade's.
+    fn package(&self, upgraded: bool) -> Vec<u8> {
+        package(if upgraded { "lean" } else { "shop" })
     }
 
     fn method(&self, name: &str) -> MethodId {
         method(&self.shop, name)
     }
 
-    /// Each workflow method bound to its own program, or to the program
-    /// `rebound` names for it.
-    fn beside(&self, rebound: &[(&str, &str)]) -> Vec<(MethodId, Kind, &[u8])> {
-        FLOWS
-            .iter()
-            .map(|name| {
-                let program = rebound
-                    .iter()
-                    .find(|(method, _)| method == name)
-                    .map_or(name, |(_, program)| program);
-                let (_, blob) = self.flows.iter().find(|(flow, _)| flow == program).unwrap();
-                (self.method(name), Kind::Workflow, blob.as_slice())
-            })
-            .collect()
-    }
-
-    /// Install the shop at `agent`'s leader, its workflow methods bound as
-    /// [`Shop::beside`] binds them.
-    fn install(&self, cluster: &Cluster, agent: AgentId, rebound: &[(&str, &str)]) {
+    /// Install the shop at `agent`'s leader, or once `upgraded` its
+    /// upgrade.
+    fn install(&self, cluster: &Cluster, agent: AgentId, upgraded: bool) {
         let leader = cluster.node(cluster.leader(agent));
-        let beside = self.beside(rebound);
-        let installed = smol::block_on(leader.install(agent, SHOP, &self.shop, &beside, vec![]));
+        let elf = self.package(upgraded);
+        let installed = smol::block_on(leader.install(agent, SHOP, &elf, vec![]));
         assert!(
             matches!(installed, Ok(Reply::Ran(Outcome::Done(_)))),
             "{installed:?}"
@@ -164,7 +130,7 @@ fn a_workflows_snapshots_ride_the_result_blob_path() {
     let cluster = Cluster::new(3);
     let shop = Shop::load();
     let agent = cluster.counter_agent(&[1, 2, 3]);
-    shop.install(&cluster, agent, &[]);
+    shop.install(&cluster, agent, false);
     let workflow = shop.start(&cluster, agent, 1, "compute", (262_144u32, 16u32));
     let outcome = ended(&cluster, agent, workflow);
     assert!(matches!(outcome, Outcome::Done(_)), "{outcome:?}");
@@ -191,7 +157,7 @@ fn a_preempted_computation_resumes_on_a_new_leader() {
     let mut cluster = Cluster::new(3);
     let shop = Shop::load();
     let agent = cluster.counter_agent(&[1, 2, 3]);
-    shop.install(&cluster, agent, &[]);
+    shop.install(&cluster, agent, false);
     let arguments = (4096u32, 5000u32);
     let whole = shop.start(&cluster, agent, 1, "grind_whole", arguments);
     let expected = ended(&cluster, agent, whole);
@@ -217,15 +183,15 @@ fn a_preempted_computation_resumes_on_a_new_leader() {
 
 /// A workflow awaits another agent's counter twice, each reply resuming
 /// it on whichever replica leads, and ends with both answers; one that
-/// lives keeps its program pinned when an upgrade binds its method to
-/// another, and one that ended releases it.
+/// lives keeps its program pinned when an upgrade installs another, and
+/// one that ended releases its pin.
 #[test]
 fn a_workflow_awaits_another_agent_and_pins_its_program_while_it_lives() {
     let cluster = Cluster::new(3);
     let shop = Shop::load();
     let risk = cluster.counter_agent(&[1, 2, 3]);
     let agent = cluster.counter_agent(&[1, 2, 3]);
-    shop.install(&cluster, agent, &[]);
+    shop.install(&cluster, agent, false);
     let saga = shop.start(&cluster, agent, 1, "saga", (risk.0, 2u32));
     let answers: Vec<u64> = vec![1, 3];
     assert_eq!(
@@ -243,34 +209,44 @@ fn a_workflow_awaits_another_agent_and_pins_its_program_while_it_lives() {
     assert_eq!(sales, Ok(Outcome::Done(4u64.encode())));
 
     let nap = shop.start(&cluster, agent, 2, "nap", 600_000u64);
-    shop.install(&cluster, agent, &[("saga", "compute"), ("nap", "compute")]);
+    shop.install(&cluster, agent, true);
     let leader = cluster.node(cluster.leader(agent));
-    let saga_program = record(leader, agent, saga).unwrap().program.0;
-    let nap_program = record(leader, agent, nap).unwrap().program.0;
+    let program = record(leader, agent, nap).unwrap().program;
+    assert_eq!(program, record(leader, agent, saga).unwrap().program);
+    let upgrade = CodeHash::of(&shop.lean).0;
     wait_until(
-        "the replicas pin the living workflow's program alone",
+        "the replicas pin the living workflow's program and the upgrade",
         || {
             cluster.running().all(|(_, node)| {
                 let pinned = node.pinned();
-                pinned.contains(&nap_program) && !pinned.contains(&saga_program)
+                pinned.contains(&program.0) && pinned.contains(&upgrade)
             })
         },
     );
+    // The ended saga released its pin: the living nap's alone holds it.
+    let pins = cluster
+        .node(cluster.leader(agent))
+        .store()
+        .snapshot()
+        .get(agent, &keys::workflow_pins(&program))
+        .unwrap()
+        .expect("the living workflow's pin");
+    assert_eq!(u64::decode(unstored(&pins).unwrap()).unwrap().0, 1);
     let living = record(cluster.node(cluster.leader(agent)), agent, nap).unwrap();
     assert!(matches!(living.state, WorkflowState::Sleeping { .. }));
 }
 
-/// A workflow sleeping through an upgrade that binds its method to another
-/// program wakes on its own, which only its life pins: the agent reads
-/// the programs it pins, and no other.
+/// A workflow sleeping through an upgrade that installs another program
+/// wakes on its own, which only its life pins: the agent reads the
+/// programs it pins, and no other.
 #[test]
 fn a_workflow_wakes_on_the_program_only_its_life_pins() {
     let cluster = Cluster::new(3);
     let shop = Shop::load();
     let agent = cluster.counter_agent(&[1, 2, 3]);
-    shop.install(&cluster, agent, &[]);
+    shop.install(&cluster, agent, false);
     let nap = shop.start(&cluster, agent, 1, "nap", 1_500u64);
-    shop.install(&cluster, agent, &[("nap", "compute")]);
+    shop.install(&cluster, agent, true);
     let leader = cluster.node(cluster.leader(agent));
     let program = record(leader, agent, nap).unwrap().program.0;
     assert!(leader.pinned().contains(&program));
@@ -298,11 +274,10 @@ fn a_workflow_starts_in_the_batch_that_installs_its_program() {
     hold.arm();
     let held = leader.call(agent, cluster.request(1, 1));
     wait_until("a batch's refine is held", || hold.held() > 0);
-    let beside = shop.beside(&[]);
-    let installed = leader.install(agent, SHOP, &shop.shop, &beside, vec![]);
-    let last = CodeHash::of(beside.last().unwrap().2).0;
-    wait_until("the package is stored", || leader.stores_blob(&last));
-    // Its install is queued once its last blob is stored.
+    let installed = leader.install(agent, SHOP, &shop.package(false), vec![]);
+    let program = CodeHash::of(&shop.shop).0;
+    wait_until("the package is stored", || leader.stores_blob(&program));
+    // Its install is queued once its program is stored.
     std::thread::sleep(Duration::from_millis(200));
     let started = leader.call(agent, shop.starting(&cluster, 2, "nap", 0u64));
     hold.release();
@@ -351,9 +326,9 @@ fn a_snapshot_carries_a_living_workflows_pin() {
     });
     cluster.stop(follower);
     cluster.install(agent);
-    shop.install(&cluster, agent, &[]);
+    shop.install(&cluster, agent, false);
     let nap = shop.start(&cluster, agent, 1, "nap", 600_000u64);
-    shop.install(&cluster, agent, &[("nap", "compute")]);
+    shop.install(&cluster, agent, true);
     let program = record(cluster.node(leader), agent, nap).unwrap().program.0;
     for sequence in 2..=40 {
         let added = vos_checker::calls::done(cluster.increment(leader, agent, sequence, 1));
@@ -376,9 +351,9 @@ fn a_retired_replica_releases_a_living_workflows_pin() {
     let cluster = Cluster::tuned(4, compacting);
     let shop = Shop::load();
     let agent = cluster.counter_agent(&[1, 2, 3]);
-    shop.install(&cluster, agent, &[]);
+    shop.install(&cluster, agent, false);
     let nap = shop.start(&cluster, agent, 1, "nap", 600_000u64);
-    shop.install(&cluster, agent, &[("nap", "compute")]);
+    shop.install(&cluster, agent, true);
     let (leader, removed) = cluster.leader_and_follower(agent);
     let program = record(cluster.node(leader), agent, nap).unwrap().program.0;
     wait_until("every replica pins the workflow's program", || {
@@ -405,7 +380,7 @@ fn a_lost_page_halts_the_node_that_lost_it() {
     let cluster = Cluster::new(3);
     let shop = Shop::load();
     let agent = cluster.counter_agent(&[1, 2, 3]);
-    shop.install(&cluster, agent, &[]);
+    shop.install(&cluster, agent, false);
     let leader = cluster.leader(agent);
     let nap = shop.start(&cluster, agent, 1, "nap", 1_000u64);
     let node = cluster.node(leader);

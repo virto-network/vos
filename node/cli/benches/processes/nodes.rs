@@ -419,13 +419,12 @@ impl Space {
         agent
     }
 
-    /// An agent on every node, with the counter installed.
+    /// An agent on every node, with the counter's package installed.
     pub fn counter_agent(&self, counter: &[u8]) -> AgentId {
         let agent = self.create_agent();
         let install = Install {
             instance: COUNTER,
-            program: counter.to_vec(),
-            beside: Vec::new(),
+            elf: counter.to_vec(),
             roles: Vec::new(),
         };
         self.operate(

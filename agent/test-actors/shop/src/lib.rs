@@ -1,6 +1,6 @@
 //! A shop: workflows that await other agents, call this agent's actors,
-//! sleep, compute, fail and write their memory back, for the agent's
-//! workflow tests. Each workflow is a program of its own (`src/bin`).
+//! sleep, compute, fail, write their memory back and reach the shop's
+//! state in sections, for the agent's workflow tests.
 
 #![no_std]
 
@@ -20,6 +20,8 @@ const RISK: Ref<Counter> = Ref::new(InstanceId(1));
 #[actor]
 pub struct Shop {
     sales: u64,
+    /// Orders by id, their amounts: what workflows record in sections.
+    orders: Table<u64, u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
@@ -73,7 +75,10 @@ static STATE: Page = Page(UnsafeCell::new([0; 4096]));
 #[messages]
 impl Shop {
     pub fn new() -> Self {
-        Self { sales: 0 }
+        Self {
+            sales: 0,
+            orders: Table::default(),
+        }
     }
 
     /// Count a sale: what a workflow's calls change.
@@ -402,6 +407,98 @@ impl Shop {
         let memory = core::hint::black_box(vec![1u8; bytes as usize]);
         ctx.sleep_until(ctx.now()).await;
         memory.len() as u32
+    }
+
+    /// Record order `id` of `amount` in one section, its row and the
+    /// sales; then read both back in a second section of the same unit:
+    /// the sales after, and the order's amount as read.
+    #[workflow]
+    pub async fn record(ctx: &mut Workflow<Self>, id: u64, amount: u64) -> (u64, Option<u64>) {
+        ctx.update(|shop: &mut Shop| {
+            shop.orders.insert(&id, &amount);
+            shop.sales += amount;
+        });
+        ctx.read(|shop: &Shop| (shop.sales, shop.orders.get(&id)))
+    }
+
+    /// Read the sales, spend `rounds` reads of the time, then write what it
+    /// read plus `by`, in one unit: from its first section the unit runs to
+    /// its end within the step's limit, never preempted, so what it writes
+    /// still holds what it read. The sales it wrote.
+    #[workflow(gas = 5_000_000)]
+    pub async fn bump(ctx: &mut Workflow<Self>, by: u64, rounds: u32) -> u64 {
+        let sales = ctx.read(|shop: &Shop| shop.sales);
+        for _ in 0..rounds {
+            core::hint::black_box(ctx.now());
+        }
+        ctx.update(|shop: &mut Shop| {
+            shop.sales = sales + by;
+            shop.sales
+        })
+    }
+
+    /// Add each of `orders`, sleeping between them, re-reading the sales in
+    /// each section after a pause: the sales after each.
+    #[workflow]
+    pub async fn restock(ctx: &mut Workflow<Self>, orders: Vec<u64>) -> Vec<u64> {
+        let mut seen = Vec::new();
+        for amount in orders {
+            let sales = ctx.update(|shop: &mut Shop| {
+                shop.sales += amount;
+                shop.sales
+            });
+            seen.push(sales);
+            ctx.sleep_until(ctx.now()).await;
+        }
+        seen
+    }
+
+    /// Misuse a section, by `how`, each failing the step: inside one, 0 a
+    /// call, 1 a send, 2 a request, 3 a wait for a result, 4 a sleep, 5 a
+    /// second open, 6 the input; 7 an open of another instance; 8 a row
+    /// read with none open; 9 a close with none open; 10 an end with one
+    /// open.
+    #[workflow]
+    pub async fn misuse(ctx: &mut Workflow<Self>, how: u8) -> u8 {
+        use vos_sdk::abi::Rows;
+        use vos_sdk::context::Method;
+        use vos_sdk::host;
+        let (_, me) = ctx.me();
+        match how {
+            0..=6 => {
+                host::open(me.0);
+                match how {
+                    0 => drop(host::call(me.0, shop::Sales::ID, &[])),
+                    1 => host::send(9, 1, shop::Sales::ID, &[]),
+                    2 => drop(host::request(9, 1, shop::Sales::ID, &[], 0)),
+                    3 => drop(host::result(9, 1, 0)),
+                    4 => host::sleep(host::now() + 1),
+                    5 => host::open(me.0),
+                    _ => drop(host::input()),
+                }
+                host::close();
+            }
+            7 => {
+                host::open(me.0 + 1);
+                host::close();
+            }
+            8 => drop(host::get(Rows::Struct, &[])),
+            9 => host::close(),
+            _ => host::open(me.0),
+        }
+        how
+    }
+
+    /// Open and close `count` empty sections: what a section costs the
+    /// agent, apart.
+    #[workflow(gas = 100_000_000)]
+    pub async fn sections(ctx: &mut Workflow<Self>, count: u32) -> u32 {
+        let (_, me) = ctx.me();
+        for _ in 0..count {
+            vos_sdk::host::open(me.0);
+            vos_sdk::host::close();
+        }
+        count
     }
 
     /// Encode `len` bytes as the risk agent's counter's echo takes them,

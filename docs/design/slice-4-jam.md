@@ -1007,6 +1007,17 @@ on it.
 - The workflow's writable runs are the actor program's, heap included,
   so arming (200 gas a page, every step) follows the heap the actor
   configures.
+- **An actor's heap is paid by every invocation of any kind,** not only
+  by its workflows' steps: a handler's machine maps the whole heap too,
+  on JAM through the loader's calls (about 372,000 gas a call for a
+  12 MiB heap, against about 15,000 at the SDK's default) and on VOS in
+  the price the pool gives a machine by its pages. So an actor keeps its
+  heap as small as its largest workflow needs, and the test actors keep
+  small heaps but where a test needs one: the shop's 4 MiB, and its `big`
+  and `huge` builds for the steps and caps that need more.
+  - **Carried to a later slice:** a bump allocator over the header's heap
+    region, so the agent maps a small heap for a handler and a larger
+    one for a workflow's step.
 
 ### 4.10 Acceptance
 

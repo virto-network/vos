@@ -9,13 +9,15 @@ publish = false
 [dependencies]
 blake2 = "0.10"
 vos-pvm = { workspace = true }
-# For `programs` only: linking the guest programs tests and benches load.
+# For `programs` only: linking and deriving the guest programs tests and
+# benches load.
 vos-pvm-compiler = { workspace = true }
 vos-wire = { workspace = true }
 
 [dev-dependencies]
 lz4_flex = "0.13"
 proptest = "1"
+tempfile = "3"
 vos-jam = { workspace = true }
 vos-pvm-program = { workspace = true }
 vos-tree = { workspace = true }

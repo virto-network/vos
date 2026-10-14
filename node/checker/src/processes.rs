@@ -20,7 +20,7 @@ use vos_wire::ingress::{Answer, Install, ReplicaStatus};
 use vos_wire::peer::NodeNumber;
 
 use crate::calls::Total;
-use crate::programs::{actor, agent_elf};
+use crate::programs::{agent_elf, package};
 use crate::spaces::{free_tcp_port, free_udp_port};
 use crate::{Log, Methods, Nodes, wait_until};
 use relay::Relay;
@@ -630,20 +630,19 @@ impl Processes {
         answer.unwrap()
     }
 
-    /// An agent created on `replicas`, with `program` installed as each
+    /// An agent created on `replicas`, with package `elf` installed as each
     /// of `instances`, in order.
     pub fn agent_with(
         &self,
         replicas: Vec<NodeNumber>,
-        program: &[u8],
+        elf: &[u8],
         instances: &[InstanceId],
     ) -> AgentId {
         let installs: Vec<Install> = instances
             .iter()
             .map(|instance| Install {
                 instance: *instance,
-                program: program.to_vec(),
-                beside: Vec::new(),
+                elf: elf.to_vec(),
                 roles: Vec::new(),
             })
             .collect();
@@ -803,7 +802,7 @@ pub fn methods(processes: &Processes, agent: AgentId, instance: InstanceId) -> M
 /// An agent created on nodes 1 to 3, with the test counter installed as
 /// `instance`, through whichever node takes the operator's commands.
 pub fn counter_agent(processes: &Processes, instance: InstanceId) -> AgentId {
-    processes.agent_with(vec![1, 2, 3], &actor("counter"), &[instance])
+    processes.agent_with(vec![1, 2, 3], &package("counter"), &[instance])
 }
 
 /// The method `name` of `agent`'s `instance`, read once its schema is

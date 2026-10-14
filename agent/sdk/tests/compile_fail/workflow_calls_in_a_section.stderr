@@ -1,0 +1,26 @@
+error[E0501]: cannot borrow `*ctx` as mutable because previous closure requires unique access
+  --> tests/compile_fail/workflow_calls_in_a_section.rs:24:9
+   |
+24 |           ctx.update(|shop: &mut Shop| {
+   |           ^   ------ ----------------- closure construction occurs here
+   |           |   |
+   |  _________|   first borrow later used by call
+   | |
+25 | |             let me = Ref::<Shop>::new(InstanceId(1));
+26 | |             let _ = ctx.call(me, shop::Sell { amount });
+   | |                     --- first borrow occurs due to use of `*ctx` in closure
+27 | |             shop.sales
+28 | |         })
+   | |__________^ second borrow occurs here
+
+error[E0500]: closure requires unique access to `*ctx` but it is already borrowed
+  --> tests/compile_fail/workflow_calls_in_a_section.rs:24:20
+   |
+24 |         ctx.update(|shop: &mut Shop| {
+   |         --- ------ ^^^^^^^^^^^^^^^^^ closure construction occurs here
+   |         |   |
+   |         |   first borrow later used by call
+   |         borrow occurs here
+25 |             let me = Ref::<Shop>::new(InstanceId(1));
+26 |             let _ = ctx.call(me, shop::Sell { amount });
+   |                     --- second borrow occurs due to use of `*ctx` in closure

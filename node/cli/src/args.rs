@@ -44,7 +44,8 @@ pub enum Command {
         #[command(subcommand)]
         command: AgentCommand,
     },
-    /// Install a package as an instance of an agent, with the admin token.
+    /// Install a package, an actor's ELF, as an instance of an agent, with
+    /// the admin token: prints the programs the node derived from it.
     Install(InstallArgs),
     /// Grant a client key a role in an agent, or revoke it, with the admin
     /// token.
@@ -150,15 +151,11 @@ pub struct InstallArgs {
     pub agent: u32,
     #[arg(long)]
     pub instance: u32,
-    /// The actor program, an ELF built with the guest toolchain.
+    /// The package: the ELF the actor's crate built with the guest
+    /// toolchain, uploaded as it is. The node derives the actor's program
+    /// and its attestable methods' kernels from it.
     #[arg(long)]
-    pub program: PathBuf,
-    /// An attestable method's program: `METHOD=ELF`.
-    #[arg(long = "attestable")]
-    pub attestables: Vec<String>,
-    /// A workflow's program: `METHOD=ELF`.
-    #[arg(long = "workflow")]
-    pub workflows: Vec<String>,
+    pub elf: PathBuf,
     /// A role name's byte: `NAME=BYTE`.
     #[arg(long = "role")]
     pub roles: Vec<String>,

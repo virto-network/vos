@@ -1,8 +1,9 @@
 # Actors the SDK's tests run, built for the PVM with the guest toolchain:
-# `just build-test-actors`. Each actor is a library (its state, handlers and
-# message types, which other actors use) and a program (`actor_program!`).
+# `just build-test-actors`. Each actor is a library (its state, handlers,
+# workflows and message types, which other actors use) and a program
+# (`actor_program!`).
 [workspace]
-members = ["counter", "ledger", "caller", "checksum", "tally", "tracker", "shop", "rounds"]
+members = ["counter", "ledger", "caller", "tracker", "shop", "rounds", "kernels", "tainted"]
 resolver = "3"
 
 [workspace.package]

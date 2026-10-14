@@ -13,6 +13,11 @@ rustflags = [
     "-Clink-arg=-Tpvm.ld",
 ]
 
+# One codegen unit: a kernel's code then moves less with unrelated changes
+# to its actor, so its hash does too.
+[profile.release]
+codegen-units = 1
+
 [unstable]
 json-target-spec = true
 build-std = ["core", "alloc", "compiler_builtins"]

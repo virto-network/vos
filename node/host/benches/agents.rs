@@ -273,6 +273,7 @@ fn main() {
     let Programs {
         agent: agent_program,
         counter,
+        counter_elf,
     } = Programs::load();
     let increment = method(&counter, "increment");
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -286,7 +287,7 @@ fn main() {
     for &agent in &active {
         let at = leader(&nodes, agent);
         let installed =
-            smol::block_on(node(&nodes, at).install(agent, COUNTER, &counter, &[], vec![]));
+            smol::block_on(node(&nodes, at).install(agent, COUNTER, &counter_elf, vec![]));
         assert!(
             matches!(installed, Ok(Reply::Ran(Outcome::Done(_)))),
             "{installed:?}"

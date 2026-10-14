@@ -69,7 +69,7 @@ fn config(programs: &Programs, hooks: Arc<dyn Hooks>) -> Config {
 /// An agent with the counter installed at [`COUNTER`].
 fn counter_agent(node: &Node, programs: &Programs) -> AgentId {
     let agent = node.create_agent().unwrap();
-    let installed = smol::block_on(node.install(agent, COUNTER, &programs.counter, &[], vec![]));
+    let installed = smol::block_on(node.install(agent, COUNTER, &programs.counter_elf, vec![]));
     assert!(
         matches!(installed, Ok(Reply::Ran(Outcome::Done(_)))),
         "{installed:?}"

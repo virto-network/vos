@@ -13,8 +13,8 @@ impl Shop {
         }
     }
 
-    /// A workflow holds no state of its own: it reaches state only through
-    /// calls, and has no `self` to read tables through.
+    /// A workflow holds no state of its own: it reaches its instance's
+    /// state only in sections, and has no `self` to read tables through.
     #[workflow]
     pub async fn checkout(ctx: &mut Workflow<Self>, order: u64) -> u64 {
         self.orders.get(&order).unwrap_or(0)

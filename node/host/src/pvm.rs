@@ -419,8 +419,12 @@ mod tests {
             budget: 0,
             inputs: vec![Input::Admin(Admin::Install {
                 instance: InstanceId(1),
-                program: ProgramHash(installed),
-                beside: Vec::new(),
+                derivation: vos_wire::records::Derivation {
+                    program: ProgramHash(installed),
+                    kernels: Vec::new(),
+                    elf: [0; 32],
+                    transpiler: 0,
+                },
                 roles: Vec::new(),
             })],
         });
