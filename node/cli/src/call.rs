@@ -5,7 +5,7 @@ use std::mem;
 use ed25519_dalek::SigningKey;
 use vos_node::client::{Client, ClientError};
 use vos_wire::Encode;
-use vos_wire::abi::refusal;
+use vos_wire::abi::Refusal;
 use vos_wire::ids::{AgentId, InstanceId};
 use vos_wire::ingress::{Answer, Consistency};
 use vos_wire::result::Outcome;
@@ -110,14 +110,14 @@ pub fn said(answer: &Answer) -> Result<String, String> {
         Answer::Ran {
             outcome: Outcome::Failed { code, detail },
             ..
-        } => Ok(format!("failed {code} {}", hex::encode(detail))),
-        Answer::Refused(refusal::SESSIONS_FULL) => {
+        } => Ok(format!("failed {} {}", code.code(), hex::encode(detail))),
+        Answer::Refused(Refusal::SessionsFull) => {
             Err("refused: the agent holds as many sessions as it may; try again later".into())
         }
-        Answer::Refused(refusal::KEY_SESSIONS_FULL) => {
+        Answer::Refused(Refusal::KeySessionsFull) => {
             Err("refused: this key holds as many sessions at the agent as it may".into())
         }
-        Answer::Refused(code) => Err(format!("refused {code}")),
+        Answer::Refused(code) => Err(format!("refused {}", code.code())),
         other => Err(format!("{other:?}")),
     }
 }

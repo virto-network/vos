@@ -193,9 +193,12 @@ fn every_other_message_survives_the_wire() {
             message: vos_wire::batch::Message {
                 from: AgentId(9),
                 sequence: 3,
-                instance: InstanceId(1),
-                method: MethodId(2),
-                arguments: vec![4],
+                body: vos_wire::batch::Body::Call {
+                    instance: InstanceId(1),
+                    method: MethodId(2),
+                    arguments: vec![4],
+                    awaiting: None,
+                },
             },
             relayed: true,
         },
@@ -204,6 +207,11 @@ fn every_other_message_survives_the_wire() {
             receiver: AgentId(9),
             sequence: 3,
             relayed: false,
+        },
+        PeerMessage::Behind {
+            sender: AGENT,
+            receiver: AgentId(9),
+            relayed: true,
         },
         PeerMessage::DirectoryRequest { agent: AGENT },
         PeerMessage::ReadIndexAnswer {

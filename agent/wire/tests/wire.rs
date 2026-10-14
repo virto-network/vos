@@ -1,8 +1,9 @@
 use proptest::prelude::*;
-use vos_wire::abi::{self, Kind, op};
-use vos_wire::batch::{Admin, Batch, Input, Message, Request};
+use vos_wire::abi::{self, Failure, Kind, Refusal, op};
+use vos_wire::batch::{Admin, Answer, Await, Batch, Body, Input, Message, Request};
 use vos_wire::ids::{
     AgentId, InstanceId, MethodId, Principal, ProgramHash, Session, SessionId, SessionRef,
+    WorkflowId,
 };
 use vos_wire::ingress::Grant;
 use vos_wire::jam::{AccumulateInput, Operand, RefineArgs, Transfer, WorkError};
@@ -32,6 +33,52 @@ fn session() -> impl Strategy<Value = Session> {
     })
 }
 
+fn failure() -> impl Strategy<Value = Failure> {
+    (1u32..=9).prop_map(|code| Failure::from_code(code).unwrap())
+}
+
+fn refusal() -> impl Strategy<Value = Refusal> {
+    (1u32..=6).prop_map(|code| Refusal::from_code(code).unwrap())
+}
+
+fn awaiting() -> impl Strategy<Value = Await> {
+    (any::<u64>(), any::<u64>()).prop_map(|(workflow, counter)| Await {
+        workflow: WorkflowId(workflow),
+        counter,
+    })
+}
+
+fn body() -> impl Strategy<Value = Body> {
+    let answer = prop_oneof![
+        bytes().prop_map(Answer::Done),
+        (failure(), bytes()).prop_map(|(code, detail)| Answer::Failed { code, detail }),
+        any::<u64>().prop_map(|id| Answer::Started(WorkflowId(id))),
+    ];
+    prop_oneof![
+        (
+            any::<u32>(),
+            any::<u32>(),
+            bytes(),
+            prop::option::of(awaiting())
+        )
+            .prop_map(|(instance, method, arguments, awaiting)| Body::Call {
+                instance: InstanceId(instance),
+                method: MethodId(method),
+                arguments,
+                awaiting,
+            }),
+        (awaiting(), answer).prop_map(|(awaiting, answer)| Body::Reply { awaiting, answer }),
+    ]
+}
+
+fn message() -> impl Strategy<Value = Message> {
+    (any::<u32>(), any::<u64>(), body()).prop_map(|(from, sequence, body)| Message {
+        from: AgentId(from),
+        sequence,
+        body,
+    })
+}
+
 fn input() -> impl Strategy<Value = Input> {
     prop_oneof![
         (
@@ -52,22 +99,14 @@ fn input() -> impl Strategy<Value = Input> {
                     arguments,
                 })
             }),
-        (
-            any::<u32>(),
-            any::<u64>(),
-            any::<u32>(),
-            any::<u32>(),
-            bytes()
-        )
-            .prop_map(|(from, sequence, instance, method, arguments)| {
-                Input::Message(Message {
-                    from: AgentId(from),
-                    sequence,
-                    instance: InstanceId(instance),
-                    method: MethodId(method),
-                    arguments,
-                })
-            }),
+        message().prop_map(Input::Message),
+        (any::<u32>(), any::<u64>(), prop::option::of(awaiting())).prop_map(
+            |(from, sequence, awaiting)| Input::Failed {
+                from: AgentId(from),
+                sequence,
+                awaiting,
+            }
+        ),
         (
             any::<u32>(),
             any::<[u8; 32]>(),
@@ -108,21 +147,17 @@ fn step() -> impl Strategy<Value = Step> {
     ];
     let outcome = prop_oneof![
         bytes().prop_map(Outcome::Done),
-        (any::<u32>(), bytes()).prop_map(|(code, detail)| Outcome::Failed { code, detail }),
+        (failure(), bytes()).prop_map(|(code, detail)| Outcome::Failed { code, detail }),
     ];
     let instance = (any::<u32>(), any::<u64>()).prop_map(|(instance, gas)| InstanceGas {
         instance: InstanceId(instance),
         gas,
     });
     let write = (bytes(), prop::option::of(bytes())).prop_map(|(key, value)| Write { key, value });
-    let outgoing = (any::<u32>(), any::<u32>(), any::<u32>(), bytes()).prop_map(
-        |(to, instance, method, arguments)| Outgoing {
-            to: AgentId(to),
-            instance: InstanceId(instance),
-            method: MethodId(method),
-            arguments,
-        },
-    );
+    let outgoing = (any::<u32>(), body()).prop_map(|(to, body)| Outgoing {
+        to: AgentId(to),
+        body,
+    });
     let attest =
         (any::<[u8; 32]>(), bytes(), bytes()).prop_map(|(program, arguments, output)| Attest {
             program: ProgramHash(program),
@@ -151,7 +186,7 @@ fn step() -> impl Strategy<Value = Step> {
                 })
             },
         );
-    let refused = (input, any::<u32>()).prop_map(|(input, code)| Step::Refused { input, code });
+    let refused = (input, refusal()).prop_map(|(input, code)| Step::Refused { input, code });
     prop_oneof![3 => ran, 1 => refused]
 }
 
@@ -179,9 +214,10 @@ proptest! {
         version in any::<u64>(),
         time in any::<u64>(),
         seed in any::<[u8; 32]>(),
+        budget in any::<u64>(),
         inputs in prop::collection::vec(input(), 0..8),
     ) {
-        round_trip(&Batch { version, time, seed, inputs });
+        round_trip(&Batch { version, time, seed, budget, inputs });
     }
 
     #[test]
@@ -478,7 +514,7 @@ fn a_result_written_step_by_step_is_the_work_result_encoding() {
             session: SessionRef::Known(SessionId(1)),
             sequence,
         },
-        code: 1,
+        code: Refusal::Sequence,
     };
     let mut writer = ResultWriter::new(3, 4, [5; 32]);
     assert!(writer.push(&step(1)));
@@ -509,11 +545,15 @@ fn a_result_written_step_by_step_is_the_work_result_encoding() {
 }
 
 /// A step at every cap, with as many writes and instances as its gas pays
-/// for, stays within `STEP_RESULT`.
+/// for, and a request's reply, stays within `STEP_RESULT`.
 #[test]
 fn the_largest_step_fits_its_bound() {
     use abi::cap;
     use vos_wire::defaults::MAX_HANDLER_GAS;
+    let largest_await = Await {
+        workflow: WorkflowId(u64::MAX),
+        counter: u64::MAX,
+    };
     let writes = (MAX_HANDLER_GAS / abi::price::PUT) as usize;
     let mut write_bytes = vec![0usize; writes];
     write_bytes[0] = cap::STEP_WRITES - writes;
@@ -543,10 +583,23 @@ fn the_largest_step_fits_its_bound() {
         messages: (0..cap::MESSAGES)
             .map(|_| Outgoing {
                 to: AgentId(0),
-                instance: InstanceId(0),
-                method: MethodId(0),
-                arguments: vec![0; cap::MESSAGE],
+                body: Body::Call {
+                    instance: InstanceId(0),
+                    method: MethodId(0),
+                    arguments: vec![0; cap::MESSAGE],
+                    awaiting: Some(largest_await),
+                },
             })
+            .chain([Outgoing {
+                to: AgentId(0),
+                body: Body::Reply {
+                    awaiting: largest_await,
+                    answer: Answer::Failed {
+                        code: Failure::Handler,
+                        detail: vec![0; cap::REPLY],
+                    },
+                },
+            }])
             .collect(),
         attests: (0..cap::ATTESTS)
             .map(|_| Attest {
@@ -725,4 +778,294 @@ fn role_changes_keep_their_bytes() {
             [&[0x01], fields.as_slice()].concat()
         );
     }
+}
+
+/// The failure and refusal codes keep their values, each a little-endian
+/// `u32` wherever it is carried; a code outside its set does not decode.
+#[test]
+fn codes_keep_their_values() {
+    let failures = [
+        (Failure::Handler, 1),
+        (Failure::Trapped, 2),
+        (Failure::OutOfGas, 3),
+        (Failure::Cap, 4),
+        (Failure::Forbidden, 5),
+        (Failure::Unknown, 6),
+        (Failure::Cycle, 7),
+        (Failure::Depth, 8),
+        (Failure::InRefine, 9),
+    ];
+    for (failure, code) in failures {
+        assert_eq!(failure.code(), code);
+        assert_eq!(Failure::from_code(code), Some(failure));
+        assert_eq!(failure.encode(), code.to_le_bytes());
+    }
+    let refusals = [
+        (Refusal::Sequence, 1),
+        (Refusal::Expired, 2),
+        (Refusal::Unreadable, 3),
+        (Refusal::StaleSession, 4),
+        (Refusal::SessionsFull, 5),
+        (Refusal::KeySessionsFull, 6),
+    ];
+    for (refusal, code) in refusals {
+        assert_eq!(refusal.code(), code);
+        assert_eq!(Refusal::from_code(code), Some(refusal));
+        assert_eq!(refusal.encode(), code.to_le_bytes());
+    }
+    for outside in [0u32, 10, u32::MAX] {
+        assert!(Failure::decode(&outside.to_le_bytes()).is_err());
+    }
+    for outside in [0u32, 7, u32::MAX] {
+        assert!(Refusal::decode(&outside.to_le_bytes()).is_err());
+    }
+    let failed = Outcome::Failed {
+        code: Failure::Forbidden,
+        detail: vec![7],
+    };
+    assert_eq!(failed.encode(), [1, 5, 0, 0, 0, 1, 0, 0, 0, 7]);
+    let refused = Step::Refused {
+        input: InputRef::Admin,
+        code: Refusal::Expired,
+    };
+    assert_eq!(refused.encode(), [1, 2, 2, 0, 0, 0]);
+    assert_eq!(
+        vos_wire::ingress::Answer::Refused(Refusal::Sequence).encode(),
+        [1, 1, 0, 0, 0]
+    );
+}
+
+/// A message between agents: its sender and sequence, then its body after
+/// the body's index. An await is its workflow, then its counter; a reply's
+/// answer follows its await, after the answer's index. A message asserted
+/// failed is its sender, sequence and await alone.
+#[test]
+fn messages_keep_their_bytes() {
+    let awaiting = Await {
+        workflow: WorkflowId(0x0102_0304_0506_0708),
+        counter: 9,
+    };
+    let await_bytes = [0x0102_0304_0506_0708u64.to_le_bytes(), 9u64.to_le_bytes()].concat();
+    let call = |awaiting| Body::Call {
+        instance: InstanceId(5),
+        method: MethodId(6),
+        arguments: vec![0xaa],
+        awaiting,
+    };
+    let call_fields = [5, 0, 0, 0, 6, 0, 0, 0, 1, 0, 0, 0, 0xaa];
+    let request = [&[0][..], &call_fields, &[1], &await_bytes].concat();
+    assert_eq!(call(Some(awaiting)).encode(), request);
+    assert_eq!(call(None).encode(), [&[0][..], &call_fields, &[0]].concat());
+    let started = [&[2][..], &4u64.to_le_bytes()].concat();
+    for (answer, bytes) in [
+        (Answer::Done(vec![0xbb]), &[0, 1, 0, 0, 0, 0xbb][..]),
+        (
+            Answer::Failed {
+                code: Failure::InRefine,
+                detail: vec![],
+            },
+            &[1, 9, 0, 0, 0, 0, 0, 0, 0][..],
+        ),
+        (Answer::Started(WorkflowId(4)), &started[..]),
+    ] {
+        let reply = Body::Reply { awaiting, answer };
+        assert_eq!(reply.encode(), [&[1][..], &await_bytes, bytes].concat());
+    }
+
+    let agent = 0x0a0b_0c0du32.to_le_bytes();
+    let message = Message {
+        from: AgentId(0x0a0b_0c0d),
+        sequence: 3,
+        body: call(Some(awaiting)),
+    };
+    let message_bytes = [&agent[..], &3u64.to_le_bytes(), &request].concat();
+    assert_eq!(message.encode(), message_bytes);
+    assert_eq!(
+        Input::Message(message.clone()).encode(),
+        [&[1][..], &message_bytes].concat()
+    );
+    // A failed one names its pair's sequence and its await, not its body.
+    let failed = |awaiting| Input::Failed {
+        from: AgentId(0x0a0b_0c0d),
+        sequence: 3,
+        awaiting,
+    };
+    let named = [&[5][..], &agent, &3u64.to_le_bytes()].concat();
+    assert_eq!(
+        failed(Some(awaiting)).encode(),
+        [&named[..], &[1], &await_bytes].concat()
+    );
+    assert_eq!(failed(None).encode(), [&named[..], &[0]].concat());
+    // The outbox holds the target, then the body.
+    let outgoing = Outgoing {
+        to: AgentId(0x0a0b_0c0d),
+        body: message.body,
+    };
+    assert_eq!(outgoing.encode(), [&agent[..], &request].concat());
+}
+
+/// A batch: its version, time, seed and gas budget, then its inputs.
+#[test]
+fn batches_keep_their_bytes() {
+    let batch = Batch {
+        version: 1,
+        time: 2,
+        seed: [3; 32],
+        budget: 4,
+        inputs: vec![Input::Sweep],
+    };
+    let bytes = [
+        &1u64.to_le_bytes()[..],
+        &2u64.to_le_bytes(),
+        &[3; 32],
+        &4u64.to_le_bytes(),
+        &1u32.to_le_bytes(),
+        &[4],
+    ]
+    .concat();
+    assert_eq!(batch.encode(), bytes);
+}
+
+/// Every frame between nodes starts with its variant's index, the indexes
+/// running from 0 without a gap. A directory acknowledgement's order is
+/// its term, index and commitment, and a `Behind` names its pair alone.
+#[test]
+fn peer_messages_keep_their_bytes() {
+    use vos_wire::ingress::{self, Call};
+    use vos_wire::peer::{
+        CreationRecord, Order, PeerMessage, Placement, Raft, SnapshotAck, SnapshotChunk,
+    };
+    let agent = AgentId(0x0a0b_0c0d);
+    let record = CreationRecord {
+        agent,
+        replicas: vec![1],
+        creator: 1,
+        time: 0,
+        program: ProgramHash([0; 32]),
+        accumulate_gas: 0,
+    };
+    let order = Order {
+        term: 2,
+        index: 3,
+        committed: true,
+    };
+    let message = Message {
+        from: agent,
+        sequence: 1,
+        body: Body::Call {
+            instance: InstanceId(0),
+            method: MethodId(0),
+            arguments: vec![],
+            awaiting: None,
+        },
+    };
+    let frames = [
+        PeerMessage::Raft {
+            agent,
+            message: Raft::TimeoutNow { term: 1 },
+        },
+        PeerMessage::SnapshotChunk(SnapshotChunk {
+            agent,
+            term: 0,
+            index: 0,
+            snapshot_term: 0,
+            sequence: 0,
+            manifest: None,
+            rows: vec![],
+            last: true,
+        }),
+        PeerMessage::SnapshotAck(SnapshotAck {
+            agent,
+            term: 0,
+            index: 0,
+            next: 0,
+        }),
+        PeerMessage::BlobRequest {
+            agent,
+            hashes: vec![],
+        },
+        PeerMessage::Blob {
+            hash: [0; 32],
+            bytes: vec![],
+        },
+        PeerMessage::Liveness {
+            incarnation: 0,
+            round: 0,
+            leading: vec![],
+        },
+        PeerMessage::Directory {
+            placement: Placement::created(&record),
+            record,
+        },
+        PeerMessage::DirectoryAck {
+            agent,
+            order,
+            runs: false,
+        },
+        PeerMessage::DirectoryRequest { agent },
+        PeerMessage::Forward {
+            agent,
+            token: 0,
+            term: 0,
+            call: Call {
+                session: Session {
+                    key: [0; 32],
+                    name: [0; 16],
+                    t0: 0,
+                },
+                sequence: 1,
+                instance: InstanceId(0),
+                method: MethodId(0),
+                arguments: vec![],
+                signature: [0; 64],
+            },
+        },
+        PeerMessage::Forwarded {
+            agent,
+            token: 0,
+            term: 0,
+            answer: ingress::Answer::Busy,
+        },
+        PeerMessage::ReadIndex { agent, token: 0 },
+        PeerMessage::ReadIndexAnswer {
+            agent,
+            token: 0,
+            index: None,
+        },
+        PeerMessage::Deliver {
+            to: agent,
+            message,
+            relayed: false,
+        },
+        PeerMessage::Acknowledge {
+            sender: agent,
+            receiver: agent,
+            sequence: 0,
+            relayed: false,
+        },
+        PeerMessage::Behind {
+            sender: agent,
+            receiver: AgentId(4),
+            relayed: true,
+        },
+    ];
+    for (index, frame) in frames.iter().enumerate() {
+        assert_eq!(usize::from(frame.encode()[0]), index, "{frame:?}");
+    }
+    let agent_bytes = 0x0a0b_0c0du32.to_le_bytes();
+    assert_eq!(
+        frames[7].encode(),
+        [
+            &[7][..],
+            &agent_bytes,
+            &2u64.to_le_bytes(),
+            &3u64.to_le_bytes(),
+            &[1, 0]
+        ]
+        .concat()
+    );
+    assert_eq!(
+        frames[15].encode(),
+        [&[15][..], &agent_bytes, &4u32.to_le_bytes(), &[1]].concat()
+    );
 }

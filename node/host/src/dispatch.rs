@@ -179,6 +179,11 @@ impl Inner {
                 sequence,
                 relayed,
             } => self.on_acknowledge(from, sender, receiver, sequence, relayed),
+            PeerMessage::Behind {
+                sender,
+                receiver,
+                relayed,
+            } => self.on_behind(from, sender, receiver, relayed),
             PeerMessage::Blob { .. } | PeerMessage::Directory { .. } => {
                 unreachable!("blobs and records are handled in tasks")
             }

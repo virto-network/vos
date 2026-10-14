@@ -3,8 +3,9 @@
 use alloc::vec::Vec;
 use scale::{Decode, Encode};
 
-use crate::abi::cap;
-use crate::ids::{AgentId, InstanceId, MethodId, ProgramHash, SessionId, SessionRef};
+use crate::abi::{Failure, Refusal, cap};
+use crate::batch::Body;
+use crate::ids::{AgentId, InstanceId, ProgramHash, SessionId, SessionRef};
 
 /// What one refine produced. Steps are in dispatch order; accumulate applies
 /// their writes in that order. Inputs not covered by a step were not
@@ -68,14 +69,13 @@ pub enum Step {
     /// The input was dispatched and consumed.
     #[codec(index = 0)]
     Ran(Run),
-    /// Refine refused the input, with a code from [`crate::abi::refusal`],
-    /// and consumed nothing. The leader batches only requests in their
-    /// session's order in live sessions, and messages in their pair's
-    /// order; refine checks again, and refuses rather than let accumulate
-    /// advance a mark past a gap. Accumulate applies nothing for it; the
-    /// node answers the sender.
+    /// Refine refused the input, and consumed nothing. The leader batches
+    /// only requests in their session's order in live sessions, and
+    /// messages in their pair's order; refine checks again, and refuses
+    /// rather than let accumulate advance a mark past a gap. Accumulate
+    /// applies nothing for it; the node answers the sender.
     #[codec(index = 1)]
-    Refused { input: InputRef, code: u32 },
+    Refused { input: InputRef, code: Refusal },
     /// The sweep: the expiry rows refine found due, each a bucket and a
     /// session. Accumulate collects each session that has expired and
     /// moves the row of one active since.
@@ -84,7 +84,8 @@ pub enum Step {
 }
 
 /// A dispatched step: how it ended and its effects. A failed step has no
-/// writes, messages or attests, but still consumes its input.
+/// writes or attests, and no messages but a request's reply, but still
+/// consumes its input.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Run {
     pub input: InputRef,
@@ -116,10 +117,9 @@ pub enum Outcome {
     /// The handler's reply.
     #[codec(index = 0)]
     Done(Vec<u8>),
-    /// The step failed: a code from [`crate::abi::failure`] and detail
-    /// bytes.
+    /// The step failed: why, and detail bytes.
     #[codec(index = 1)]
-    Failed { code: u32, detail: Vec<u8> },
+    Failed { code: Failure, detail: Vec<u8> },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
@@ -139,9 +139,7 @@ pub struct Write {
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Outgoing {
     pub to: AgentId,
-    pub instance: InstanceId,
-    pub method: MethodId,
-    pub arguments: Vec<u8>,
+    pub body: Body,
 }
 
 /// An attestable method run in this step, kept so the run can be proven

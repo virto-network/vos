@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use proptest::prelude::*;
 use vos_testkit::programs::method;
 use vos_testkit::{Testkit, decode};
-use vos_wire::abi::{cap, code, failure, refusal};
+use vos_wire::abi::{Failure, Refusal, cap, code};
 use vos_wire::batch::{Admin, Input};
 use vos_wire::ids::{AgentId, InstanceId};
 use vos_wire::keys;
@@ -33,7 +33,7 @@ fn a_failed_step_consumes_its_input_and_later_steps_see_earlier_writes() {
         ],
     );
     assert_eq!(done::<u64>(&result.steps[0]), 5);
-    assert_eq!(failed(&result.steps[1]), failure::HANDLER);
+    assert_eq!(failed(&result.steps[1]), Failure::Handler);
     assert!(ran(&result.steps[1]).writes.is_empty());
     assert_eq!(done::<u64>(&result.steps[2]), 8, "the batch overlay");
     let (_, mark) = node.session(&Sessions::session(&ALICE)).unwrap();
@@ -56,7 +56,7 @@ fn kinds_and_unserved_ids_are_enforced() {
     );
     assert_eq!(
         failed(&result.steps[0]),
-        failure::TRAPPED,
+        Failure::Trapped,
         "a query may not write"
     );
     assert_eq!(done::<u64>(&result.steps[1]), code::WHAT);
@@ -68,7 +68,7 @@ fn kinds_and_unserved_ids_are_enforced() {
             1u64.encode()
         ),
         Outcome::Failed {
-            code: failure::UNKNOWN,
+            code: Failure::Unknown,
             detail: vec![],
         },
         "a query cannot run a command"
@@ -90,10 +90,10 @@ fn per_step_caps_fail_the_step_and_messages_reach_the_outbox() {
     );
     assert_eq!(
         failed(&result.steps[0]),
-        failure::CAP,
+        Failure::Cap,
         "writes past 256 KiB"
     );
-    assert_eq!(failed(&result.steps[1]), failure::CAP, "too many messages");
+    assert_eq!(failed(&result.steps[1]), Failure::Cap, "too many messages");
     assert_eq!(ran(&result.steps[2]).messages.len(), 2);
     assert!(node.get(&keys::outbox(AgentId(5), 1)).is_some());
     assert!(node.get(&keys::outbox(AgentId(5), 2)).is_some());
@@ -137,7 +137,7 @@ fn each_per_step_cap_holds_its_limit_and_fails_one_byte_past() {
         );
         assert_eq!(
             failed(&result.steps[past]),
-            failure::CAP,
+            Failure::Cap,
             "{what} past its cap"
         );
     }
@@ -195,7 +195,7 @@ fn roles_nested_calls_cycles_and_attests() {
             sessions.request(ALICE, CALLER, actors.method(CALLER, "relay"), LEDGER.0),
         ],
     );
-    assert_eq!(failed(&result.steps[0]), failure::FORBIDDEN);
+    assert_eq!(failed(&result.steps[0]), Failure::Forbidden);
     assert_eq!(done::<u64>(&result.steps[1]), 100);
     assert_eq!(done::<u64>(&result.steps[2]), 40);
     let instances: Vec<_> = ran(&result.steps[2])
@@ -204,7 +204,7 @@ fn roles_nested_calls_cycles_and_attests() {
         .map(|entry| entry.instance)
         .collect();
     assert_eq!(instances, [CALLER, LEDGER]);
-    assert_eq!(failed(&result.steps[3]), failure::CYCLE);
+    assert_eq!(failed(&result.steps[3]), Failure::Cycle);
     assert_eq!(ran(&result.steps[4]).attests.len(), 1);
     assert!(done::<bool>(&result.steps[5]));
     assert!(ran(&result.steps[5]).messages.is_empty());
@@ -251,7 +251,7 @@ fn an_attestable_may_not_write_its_arguments() {
     let audit = actors.method(LEDGER, "audit");
     let mut sessions = Sessions::new();
     let result = node.batch(1, vec![sessions.request(ALICE, LEDGER, audit, vec![1u64])]);
-    assert_eq!(failed(&result.steps[0]), failure::TRAPPED);
+    assert_eq!(failed(&result.steps[0]), Failure::Trapped);
     kit.batch(1, [0; 32]);
     let expected = kit.command(ALICE, LEDGER, audit, &vec![1u64].encode());
     assert_eq!(ran(&result.steps[0]).outcome, expected.outcome);
@@ -281,7 +281,7 @@ fn a_call_that_cannot_get_a_machine_fails_the_step() {
         ],
     );
     assert_eq!(done::<u32>(&result.steps[0]), 10);
-    assert_eq!(failed(&result.steps[1]), failure::DEPTH);
+    assert_eq!(failed(&result.steps[1]), Failure::Depth);
     kit.batch(1, [0; 32]);
     let deep = kit.command(ALICE, InstanceId(100), hop, &(101u32, 10u32).encode());
     assert_eq!(&deep.outcome, &ran(&result.steps[0]).outcome);
@@ -409,11 +409,11 @@ fn state_the_agent_did_not_write_fails_only_the_steps_that_read_it() {
             sessions.request(ALICE, LEDGER, actors.method(LEDGER, "balance"), 1u64),
         ],
     );
-    assert_eq!(failed(&result.steps[0]), failure::TRAPPED, "a corrupt get");
-    assert_eq!(failed(&result.steps[1]), failure::TRAPPED, "a corrupt scan");
+    assert_eq!(failed(&result.steps[0]), Failure::Trapped, "a corrupt get");
+    assert_eq!(failed(&result.steps[1]), Failure::Trapped, "a corrupt scan");
     assert_eq!(
         refused(&result.steps[2]),
-        refusal::UNREADABLE,
+        Refusal::Unreadable,
         "a corrupt session index refuses"
     );
     assert_eq!(done::<u64>(&result.steps[3]), 10, "other rows still read");

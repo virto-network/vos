@@ -8,6 +8,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use scale::{Decode, Encode};
 
+use crate::abi::Refusal;
 use crate::ids::{AgentId, InstanceId, MethodId, Principal, Session};
 use crate::peer::{CreationRecord, NodeNumber};
 use crate::result::Outcome;
@@ -162,9 +163,9 @@ pub enum Answer {
     /// replica to have reached.
     #[codec(index = 0)]
     Ran { outcome: Outcome, at: u64 },
-    /// The agent refused it, with a code from [`crate::abi::refusal`].
+    /// The agent refused it.
     #[codec(index = 1)]
-    Refused(u32),
+    Refused(Refusal),
     #[codec(index = 2)]
     Rejected(Rejection),
     /// Not consumed: the agent program failed on it alone. Resend the same

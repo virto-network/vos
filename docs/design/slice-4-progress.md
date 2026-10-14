@@ -110,8 +110,8 @@ for the PVM target. Its crate doc is the format's spec.
 - **Hashing:** BLAKE2b-256 behind a `Hasher` trait, natively through
   the precompiles crate's software BLAKE2b, which is the precompile on
   the PVM. Tags `vos/tree/{key,leaf,branch,empty,salt,value}`.
-- **A leaf** is `H(leaf ‖ u16 len ‖ key' ‖ vh)`, with
-  `vh = H(value ‖ salt ‖ value bytes)`. A proof opens leaves as
+- **A leaf** is `H(TAG_LEAF ‖ u16 len ‖ key' ‖ vh)`, with
+  `vh = H(TAG_VALUE ‖ salt ‖ value)`. A proof opens leaves as
   `(key', vh)` and never carries a salt, so an opened neighbour shows
   nothing a low-entropy guess could match.
 - **A branch** is `H(branch ‖ u16 level ‖ left ‖ right)`. The empty
@@ -161,3 +161,58 @@ allocation; outside it, the tree's own time matches S4's pointer tree.
 **Reviewed** for soundness (Fable): the format and the three proof
 algorithms hold. The fixes it asked for are in: the salted value
 commitment, and errors on the store path.
+
+## Step 4.1: requests and replies between agents
+
+**Built:**
+- **A message carries a body:** `Call { instance, method, arguments,
+  awaiting }` or `Reply { awaiting, answer }`.
+  - The answer is `Done`, `Failed { code, detail }` or `Started`. A
+    refusal is `Failed` with `Unknown` or `Forbidden`, as outcomes
+    already report it.
+  - A `Call` that awaits gets its `Reply` in the sender's outbox, on
+    the reverse pair, whatever its outcome. An incoming `Reply` is
+    consumed in its pair's order; nothing awaits one until 4.5.
+- **A message that fails in refine twice alone,** each on a fresh
+  snapshot, is proposed as `Input::Failed { from, sequence, awaiting }`.
+  - It is consumed as a failed `Ran` step with the code `InRefine`,
+    acknowledged, and answered when it awaited.
+  - A lone failure is retried first.
+- **`Behind`:** a receiver that refuses a gap asks the sender to resend
+  now.
+  - It is a trigger, never a cursor: the sender rewinds to its own
+    acknowledgement, at most once per window per 100 ms, and only from a
+    replica of the receiver.
+  - A message dropped at a full queue waits for the rounds and their
+    backoff, so overload never loses it.
+  - The idle sweep goes before `Behind`.
+- **The resend round is configurable** (`Config::resend_round`, 1 s by
+  default; a window's wait doubles to 16 rounds).
+- **`Batch.budget`** carries the refine's gas budget, which the agent
+  reads from 4.4 on.
+- **The owner's wire items:**
+  - the failure and refusal codes are `#[repr(u32)]` enums with the same
+    values, an unknown code failing to decode;
+  - `PeerMessage` runs 0 to 15 with no gap;
+  - the directory acknowledgement's order is `peer::Order { term,
+    index, committed }`.
+- **A send's price rose** from 4,000 to 5,000 gas: serving the larger
+  body costs 3,580.
+
+**Tests:**
+- byte pins for codes, messages, batches and every peer message;
+- the testkit's requests answered whatever their outcome, replies
+  consumed in order, failed messages consumed and answered;
+- across nodes:
+  - a message failing refine consumed once and never resent;
+  - a gap filled within a round trip: under 5 s with a 20 s round, and
+    19.8 s without `Behind`;
+  - a stale `Behind` changing nothing;
+  - a request answered across nodes, and after its leader stops.
+- the window's own tests.
+
+**Gates:** `just check` (65 suites); the checker loop all ok; the
+faults process tests.
+
+**Reviewed** (Opus): GO with fixes, all in: `Behind` for gaps only,
+the sweep first, the compact failed input, the configurable round.

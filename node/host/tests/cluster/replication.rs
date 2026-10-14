@@ -11,7 +11,7 @@ use vos_checker::programs::actor;
 use vos_node::store::EntryKind;
 use vos_node::{CallError, Hooks, Node, Reply};
 use vos_wire::Encode;
-use vos_wire::abi::refusal;
+use vos_wire::abi::Refusal;
 use vos_wire::batch::{Batch, Input};
 use vos_wire::ids::AgentId;
 use vos_wire::ingress::{Answer, Call, Contact, NodeId};
@@ -271,7 +271,7 @@ fn an_input_whose_accumulate_fails_is_isolated_before_the_log() {
     let replies: Vec<_> = calls.into_iter().map(smol::block_on).collect();
     assert_eq!(done(replies[0].clone()), 1);
     assert_eq!(replies[1], Ok(Reply::Failed));
-    assert_eq!(replies[2], Ok(Reply::Refused(refusal::SEQUENCE)));
+    assert_eq!(replies[2], Ok(Reply::Refused(Refusal::Sequence)));
     cluster.converged(agent);
     // No entry carries the poisoned input.
     let store = node.store();

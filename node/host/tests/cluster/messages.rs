@@ -1,16 +1,23 @@
 //! Messages between replicated agents on nodes in one process: each
 //! applied once at its target and acknowledged, through the directory,
-//! relays and leader changes, and checked at every hop.
+//! relays and leader changes, and checked at every hop; a request answered
+//! by a reply, a message the agent program fails on consumed as failed,
+//! and a gap sent again at the receiver's word.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use vos_node::{CallError, Reply};
-use vos_wire::abi::failure;
-use vos_wire::batch::{Message, Request};
-use vos_wire::ids::AgentId;
+use vos_net::Class;
+use vos_node::store::EntryKind;
+use vos_node::{CallError, Hooks, Reply};
+use vos_wire::abi::Failure;
+use vos_wire::batch::{Answer, Await, Batch, Body, Input, Message, Request};
+use vos_wire::ids::{AgentId, WorkflowId};
 use vos_wire::keys;
 use vos_wire::peer::{NodeNumber, PeerMessage};
-use vos_wire::result::Outcome;
+use vos_wire::records::unstored;
+use vos_wire::result::{InputRef, Outcome, Run, Step, WorkResult};
 use vos_wire::{Decode, Encode};
 
 use crate::common::{COUNTER, Cluster, wait_until};
@@ -52,6 +59,26 @@ impl Cluster {
             .snapshot()
             .scan(agent, &keys::outbox_prefix(), None)
             .count()
+    }
+
+    /// A value of `agent`'s applied state at node `at`.
+    fn read<T: Decode>(&self, at: NodeNumber, agent: AgentId, key: &[u8]) -> Option<T> {
+        let bytes = self.node(at).store().snapshot().get(agent, key).unwrap()?;
+        Some(T::decode(unstored(&bytes)?).unwrap().0)
+    }
+
+    /// The runs of the steps `agent` applied at node `at` for `input`.
+    fn runs(&self, at: NodeNumber, agent: AgentId, input: &InputRef) -> Vec<Run> {
+        let node = self.node(at);
+        (1..=node.applied(agent).unwrap_or(0))
+            .filter_map(|index| node.store().log_entry(agent, index).unwrap())
+            .filter(|entry| entry.kind == EntryKind::Result)
+            .flat_map(|entry| WorkResult::decode(&entry.body).unwrap().0.steps)
+            .filter_map(|step| match step {
+                Step::Ran(run) if run.input == *input => Some(run),
+                _ => None,
+            })
+            .collect()
     }
 
     /// `to`'s counter is `total` at every running replica in `replicas`,
@@ -160,7 +187,7 @@ fn a_backlog_beyond_a_window_drains() {
             // replica still catching up after a restart may not hold it.
             Ok(Outcome::Done(_))
             | Ok(Outcome::Failed {
-                code: failure::UNKNOWN,
+                code: Failure::Unknown,
                 ..
             }) => {}
             other => panic!("{other:?}"),
@@ -188,9 +215,12 @@ fn a_message_from_a_node_replicating_neither_end_is_dropped() {
                 message: Message {
                     from: sender,
                     sequence: 1,
-                    instance: COUNTER,
-                    method: cluster.programs.method("increment"),
-                    arguments: 9u64.encode(),
+                    body: Body::Call {
+                        instance: COUNTER,
+                        method: cluster.programs.method("increment"),
+                        arguments: 9u64.encode(),
+                        awaiting: None,
+                    },
                 },
                 relayed,
             },
@@ -228,4 +258,284 @@ fn a_follower_relays_a_message_to_its_leader() {
         cluster.node(3).messages_relayed() > 0,
         "node 3 relayed nothing"
     );
+}
+
+/// Fails the refine of every batch holding a message that calls with the
+/// poisoned arguments, as the agent program failing on it would, and
+/// counts them.
+struct PoisonedMessage {
+    poison: Vec<u8>,
+    failed: AtomicU64,
+}
+
+impl Hooks for PoisonedMessage {
+    fn fail_refine(&self, _: AgentId, batch: &Batch) -> bool {
+        let poisoned = batch.inputs.iter().any(|input| {
+            matches!(
+                input,
+                Input::Message(Message {
+                    body: Body::Call { arguments, .. },
+                    ..
+                }) if *arguments == self.poison
+            )
+        });
+        if poisoned {
+            self.failed.fetch_add(1, Ordering::SeqCst);
+        }
+        poisoned
+    }
+}
+
+/// A message the agent program fails on alone, twice, is consumed as
+/// failed: applied once, without running, acknowledged, and never sent
+/// again. The pair goes on past it.
+#[test]
+fn a_message_failing_refine_is_consumed_once_and_never_sent_again() {
+    let hook = Arc::new(PoisonedMessage {
+        poison: 666u64.encode(),
+        failed: AtomicU64::new(0),
+    });
+    let hooks = Arc::clone(&hook);
+    let cluster = Cluster::tuned(3, move |_, config| config.hooks = hooks.clone());
+    let sender = cluster.counter_agent(&[1]);
+    let target = cluster.counter_agent(&[2, 3]);
+    cluster.forward_once(sender, 1, target, 666);
+    cluster.delivered((sender, &[1]), (target, &[2, 3]), 0);
+    assert!(
+        hook.failed.load(Ordering::SeqCst) >= 2,
+        "it failed alone twice"
+    );
+    let leader = cluster.leader(target);
+    let input = InputRef::Message {
+        from: sender,
+        sequence: 1,
+    };
+    let runs = cluster.runs(leader, target, &input);
+    assert_eq!(runs.len(), 1, "applied once");
+    assert_eq!(
+        runs[0].outcome,
+        Outcome::Failed {
+            code: Failure::InRefine,
+            detail: vec![],
+        }
+    );
+    assert_eq!(
+        cluster.read::<u64>(1, sender, &keys::acked(target)),
+        Some(1)
+    );
+
+    // Past two rounds, nothing went again.
+    let failed = hook.failed.load(Ordering::SeqCst);
+    let sent = cluster.node(1).messages_sent_across();
+    std::thread::sleep(Duration::from_millis(3_500));
+    assert_eq!(hook.failed.load(Ordering::SeqCst), failed);
+    assert_eq!(cluster.node(1).messages_sent_across(), sent);
+
+    cluster.forward_once(sender, 2, target, 3);
+    cluster.delivered((sender, &[1]), (target, &[2, 3]), 3);
+}
+
+/// A message lost on its way leaves a gap, which the receiver refuses and
+/// answers with `Behind`: the sender sends again at once, long before its
+/// next round.
+#[test]
+fn a_gap_is_filled_within_a_round_trip() {
+    let round = Duration::from_secs(20);
+    let cluster = Cluster::tuned(2, move |_, config| config.resend_round = round);
+    let sender = cluster.counter_agent(&[1]);
+    let target = cluster.counter_agent(&[2]);
+    cluster.forward_once(sender, 1, target, 1);
+    cluster.delivered((sender, &[1]), (target, &[2]), 1);
+    cluster.hub.cut_class(1, 2, Class::Requests);
+    cluster.forward_once(sender, 2, target, 10);
+    // Sent, and lost.
+    std::thread::sleep(Duration::from_millis(200));
+    cluster.hub.heal();
+    let started = Instant::now();
+    cluster.forward_once(sender, 3, target, 100);
+    cluster.delivered((sender, &[1]), (target, &[2]), 111);
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_secs(5),
+        "the gap took {took:?}, waiting for a round of {round:?}"
+    );
+}
+
+/// A stale `Behind`, from a replica of the receiver, only sends again what
+/// the receiver holds already: it drops the copies at its mark, and
+/// nothing applies twice.
+#[test]
+fn a_stale_behind_changes_nothing() {
+    let mut cluster = Cluster::new(4);
+    let sender = cluster.counter_agent(&[1]);
+    let target = cluster.counter_agent(&[2, 3, 4]);
+    for (sequence, by) in [(1, 1), (2, 2)] {
+        cluster.forward_once(sender, sequence, target, by);
+    }
+    cluster.delivered((sender, &[1]), (target, &[2, 3, 4]), 3);
+    let replica = cluster.impersonate(4);
+    // The target applies the next two, but its acknowledgements are lost:
+    // the sender's window holds them.
+    cluster.hub.cut_class(2, 1, Class::Requests);
+    cluster.hub.cut_class(3, 1, Class::Requests);
+    for (sequence, by) in [(3, 4), (4, 8)] {
+        cluster.forward_once(sender, sequence, target, by);
+    }
+    wait_until("the target applies both, unacknowledged", || {
+        cluster.value(cluster.leader(target), target) == 15 && cluster.outbox(1, sender) == 2
+    });
+    let sent = cluster.node(1).messages_sent_across();
+    replica.send(
+        1,
+        &PeerMessage::Behind {
+            sender,
+            receiver: target,
+            relayed: false,
+        },
+    );
+    wait_until("the sender sends its window again", || {
+        cluster.node(1).messages_sent_across() >= sent + 2
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    let leader = cluster.leader(target);
+    assert_eq!(cluster.value(leader, target), 15, "a copy applied");
+    cluster.hub.heal();
+    cluster.delivered((sender, &[1]), (target, &[2, 3]), 15);
+    for at in [2, 3] {
+        assert_eq!(
+            cluster.read::<u64>(at, target, &keys::pair_in(sender)),
+            Some(4)
+        );
+    }
+}
+
+/// A call from `sender` to `target`'s counter adding `by`, at `sequence`
+/// of their pair, awaited by workflow 7's await `counter`.
+fn request(cluster: &Cluster, sender: AgentId, sequence: u64, by: u64) -> Message {
+    Message {
+        from: sender,
+        sequence,
+        body: Body::Call {
+            instance: COUNTER,
+            method: cluster.programs.method("increment"),
+            arguments: by.encode(),
+            awaiting: Some(awaiting(sequence)),
+        },
+    }
+}
+
+fn awaiting(counter: u64) -> Await {
+    Await {
+        workflow: WorkflowId(7),
+        counter,
+    }
+}
+
+/// `target`'s reply to `sender`'s request at `sequence` holds `answer`, in
+/// the run that applied the request at node `at`.
+fn replied(
+    cluster: &Cluster,
+    at: NodeNumber,
+    (sender, target): (AgentId, AgentId),
+    sequence: u64,
+    answer: Answer,
+) {
+    let input = InputRef::Message {
+        from: sender,
+        sequence,
+    };
+    let runs = cluster.runs(at, target, &input);
+    assert_eq!(runs.len(), 1);
+    let replies: Vec<_> = runs[0]
+        .messages
+        .iter()
+        .map(|outgoing| (outgoing.to, outgoing.body.clone()))
+        .collect();
+    let reply = Body::Reply {
+        awaiting: awaiting(sequence),
+        answer,
+    };
+    assert_eq!(replies, [(sender, reply)]);
+}
+
+/// The requester consumed the reply at `sequence` once, at node `at`, and
+/// the replier's outbox emptied at every running replica of `replicas`.
+fn consumed(
+    cluster: &Cluster,
+    at: NodeNumber,
+    (sender, target): (AgentId, AgentId),
+    replicas: &[NodeNumber],
+    sequence: u64,
+) {
+    wait_until("the reply is consumed and acknowledged", || {
+        cluster.read::<u64>(at, sender, &keys::pair_in(target)) == Some(sequence)
+            && cluster
+                .running()
+                .filter(|(number, _)| replicas.contains(number))
+                .all(|(number, _)| cluster.outbox(number, target) == 0)
+    });
+    let input = InputRef::Message {
+        from: target,
+        sequence,
+    };
+    let runs = cluster.runs(at, sender, &input);
+    assert_eq!(runs.len(), 1, "consumed once");
+    assert_eq!(runs[0].outcome, Outcome::Done(vec![]));
+}
+
+/// A request from an agent on another node is answered by a reply on the
+/// reverse pair, which its sender consumes and acknowledges.
+#[test]
+fn a_request_is_answered_by_a_reply_across_nodes() {
+    let cluster = Cluster::new(3);
+    let sender = cluster.counter_agent(&[1]);
+    let target = cluster.counter_agent(&[2, 3]);
+    let leader = cluster.leader(target);
+    cluster
+        .node(leader)
+        .deliver(target, request(&cluster, sender, 1, 5))
+        .unwrap();
+    consumed(&cluster, 1, (sender, target), &[2, 3], 1);
+    replied(
+        &cluster,
+        leader,
+        (sender, target),
+        1,
+        Answer::Done(5u64.encode()),
+    );
+    assert_eq!(cluster.value(leader, target), 5);
+}
+
+/// The replying agent's leader stops with its reply unsent, its requester
+/// down: the next leader sends the reply from its outbox, once the
+/// requester is back, and it is consumed once.
+#[test]
+fn a_reply_outlives_its_leader_stopping() {
+    let mut cluster = Cluster::new(4);
+    let sender = cluster.counter_agent(&[1]);
+    let target = cluster.counter_agent(&[2, 3, 4]);
+    cluster.stop(1);
+    let leader = cluster.leader(target);
+    cluster
+        .node(leader)
+        .deliver(target, request(&cluster, sender, 1, 9))
+        .unwrap();
+    wait_until("the request applies, its reply unsent", || {
+        cluster.value(leader, target) == 9 && cluster.outbox(leader, target) == 1
+    });
+    replied(
+        &cluster,
+        leader,
+        (sender, target),
+        1,
+        Answer::Done(9u64.encode()),
+    );
+    cluster.stop(leader);
+    let next = cluster.leader(target);
+    assert_ne!(next, leader);
+    cluster.start(1);
+    let replicas: Vec<NodeNumber> = [2, 3, 4].into_iter().filter(|n| *n != leader).collect();
+    consumed(&cluster, 1, (sender, target), &replicas, 1);
+    cluster.start(leader);
+    cluster.delivered((sender, &[1]), (target, &[2, 3, 4]), 9);
 }

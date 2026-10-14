@@ -37,6 +37,11 @@ pub enum SessionRef {
     New(alloc::boxed::Box<Session>),
 }
 
+/// A workflow of an agent: numbered by the agent when it starts one, and
+/// never reused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
+pub struct WorkflowId(pub u64);
+
 /// A method of an actor, numbered by its schema.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
 pub struct MethodId(pub u32);

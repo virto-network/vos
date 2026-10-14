@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 
 use ed25519_dalek::{Signer, SigningKey};
 use vos_node::client::{ClientError, Target, post_within};
-use vos_wire::abi::refusal;
+use vos_wire::abi::Refusal;
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Session};
 use vos_wire::ingress::{Answer, Call, Consistency, Rejection, call_message};
 use vos_wire::peer::NodeNumber;
@@ -594,7 +594,7 @@ impl Client {
                 // Its first request times it again; the others follow.
                 Ok(
                     stale @ (Answer::Rejected(Rejection::StaleSession { .. })
-                    | Answer::Refused(refusal::STALE_SESSION)),
+                    | Answer::Refused(Refusal::StaleSession)),
                 ) if timed.offset < offset => {
                     nodes.log().event(format!(
                         "client {} request {request} (sequence {sequence}) at {at}: {stale:?}",
@@ -611,7 +611,7 @@ impl Client {
                 // moving only once the offset has moved.
                 Ok(
                     Answer::Rejected(Rejection::StaleSession { .. })
-                    | Answer::Refused(refusal::STALE_SESSION),
+                    | Answer::Refused(Refusal::StaleSession),
                 ) if nodes.clocks_moving() || nodes.offset() > offset => {
                     nodes.log().saw("stale session across the jump");
                     std::thread::sleep(Duration::from_millis(10));

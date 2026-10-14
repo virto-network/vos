@@ -104,6 +104,7 @@ impl Node {
             version: self.version,
             time: 1,
             seed: [0; 32],
+            budget: GAS,
             inputs,
         });
         let arguments = RefineArgs {
@@ -227,6 +228,7 @@ fn main() {
                     version: node.version,
                     time: 1,
                     seed: [0; 32],
+                    budget: GAS,
                     inputs: Vec::new(),
                 });
                 let arguments = RefineArgs {

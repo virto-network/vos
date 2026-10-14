@@ -232,8 +232,8 @@ fn with_reply_buffer<R>(f: impl FnOnce(&mut [u8]) -> R) -> R {
     }
 }
 
-/// A nested call's result: the reply, or an error code from
-/// [`vos_wire::abi::failure`] with its detail. The callee runs once, so
+/// A nested call's result: the reply, or an error code, a
+/// [`vos_wire::abi::Failure`], with its detail. The callee runs once, so
 /// the output holds [`cap::REPLY`] bytes.
 pub fn call(instance: u32, method: u32, arguments: &[u8]) -> Result<Vec<u8>, (u32, Vec<u8>)> {
     with_reply_buffer(|out| {

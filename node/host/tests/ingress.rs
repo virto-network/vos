@@ -20,7 +20,7 @@ use vos_checker::programs::Programs;
 use vos_checker::spaces::IN_PROCESS_WAIT;
 use vos_node::client::{self, Client, ClientError, Operator, Target};
 use vos_node::{ADMIN_TOKEN, Config, Hooks, Node};
-use vos_wire::abi::refusal;
+use vos_wire::abi::Refusal;
 use vos_wire::batch::{Batch, Input};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Session};
 use vos_wire::ingress::{Answer, Call, Install, Rejection};
@@ -323,7 +323,7 @@ fn an_expired_session_is_refused_and_the_client_starts_another() {
         .fetch_add(defaults::SESSION_EXPIRY_MS + 1, Ordering::SeqCst);
     assert_eq!(
         served.increment(&client, 2, 1),
-        Answer::Refused(refusal::EXPIRED)
+        Answer::Refused(Refusal::Expired)
     );
     assert_eq!(done(served.call(&mut client, 1)), 6);
     let renewed = client.session(served.agent);
@@ -654,8 +654,8 @@ fn a_request_not_consumed_is_resent_with_its_sequence() {
     let resent = send(1);
     std::thread::sleep(Duration::from_millis(100));
     drop(commits);
-    assert_eq!(second.join().unwrap(), Answer::Refused(refusal::SEQUENCE));
-    assert_eq!(third.join().unwrap(), Answer::Refused(refusal::SEQUENCE));
+    assert_eq!(second.join().unwrap(), Answer::Refused(Refusal::Sequence));
+    assert_eq!(third.join().unwrap(), Answer::Refused(Refusal::Sequence));
     assert_eq!(done(resent.join().unwrap()), 1);
     let rest: Vec<u64> = (2..=3)
         .map(|sequence| done(served.increment(&client, sequence, sequence)))

@@ -3,7 +3,7 @@
 
 use core::marker::PhantomData;
 
-use vos_wire::abi::failure;
+use vos_wire::abi::Failure;
 use vos_wire::ids::{AgentId, InstanceId, Principal};
 use vos_wire::{Decode, DecodeError, Encode};
 
@@ -88,11 +88,13 @@ fn outcome<R: Decode, E: Decode>(
 ) -> Result<R, CallError<E>> {
     match result {
         Ok(reply) => decode(&reply).ok_or(CallError::Undecodable),
-        Err((failure::HANDLER, detail)) => {
-            Err(decode(&detail).map_or(CallError::Undecodable, CallError::Failed))
-        }
-        Err((failure::FORBIDDEN, _)) => Err(CallError::Forbidden),
-        Err(_) => Err(CallError::Undecodable),
+        Err((code, detail)) => match Failure::from_code(code) {
+            Some(Failure::Handler) => {
+                Err(decode(&detail).map_or(CallError::Undecodable, CallError::Failed))
+            }
+            Some(Failure::Forbidden) => Err(CallError::Forbidden),
+            _ => Err(CallError::Undecodable),
+        },
     }
 }
 

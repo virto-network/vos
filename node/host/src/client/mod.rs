@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use ed25519_dalek::{Signer, SigningKey};
-use vos_wire::abi::refusal;
+use vos_wire::abi::Refusal;
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session};
 use vos_wire::ingress::{
     AgentInfo, Answer, Call, Consistency, Contact, Create, Grant, Install, NodeId, QueryCall,
@@ -386,12 +386,12 @@ impl Client {
                 }
                 // Timed by refine, past the lane: the next attempt meets the
                 // lane's refusal, with the agent's time.
-                Answer::Refused(refusal::STALE_SESSION) if inconclusive => {
+                Answer::Refused(Refusal::StaleSession) if inconclusive => {
                     return Ok(Answer::TimedOut);
                 }
                 // An expired session's calls that ran are answered from its
                 // window: refused, this one never ran, and never will.
-                Answer::Refused(refusal::EXPIRED | refusal::STALE_SESSION)
+                Answer::Refused(Refusal::Expired | Refusal::StaleSession)
                     if renewals < RENEWALS =>
                 {
                     renewals += 1;
@@ -399,7 +399,7 @@ impl Client {
                     self.renew(agent);
                 }
                 // The earlier attempt may still create the session.
-                Answer::Refused(refusal::SESSIONS_FULL | refusal::KEY_SESSIONS_FULL)
+                Answer::Refused(Refusal::SessionsFull | Refusal::KeySessionsFull)
                     if inconclusive =>
                 {
                     return Ok(Answer::TimedOut);

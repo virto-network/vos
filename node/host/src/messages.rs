@@ -1,10 +1,12 @@
-//! Agents' messages and acknowledgements between nodes.
+//! Agents' messages between nodes, their acknowledgements, and their
+//! receivers' calls to send again (`Behind`).
 //!
 //! One reaches its agent's queue when this node leads that agent, goes to
 //! the agent's leader when this node replicates it, and otherwise to one of
 //! its replicas, which relays it to its leader once. Anything a node cannot
 //! place is dropped: the sender's leader sends again, and messages are
-//! idempotent by their pair's sequence, acknowledgements monotone.
+//! idempotent by their pair's sequence, acknowledgements monotone, and a
+//! `Behind` only makes the sender send again what it sent.
 
 use std::sync::atomic::Ordering;
 
@@ -112,6 +114,29 @@ impl Inner {
         }
     }
 
+    /// Tell agent `sender` that `receiver` refused one of its messages past
+    /// a gap: its leader sends again at once. Routed as an acknowledgement
+    /// is. A message dropped at a full queue waits for the sender's
+    /// rounds, whose backoff a congested receiver needs.
+    pub(crate) fn behind(&self, sender: AgentId, receiver: AgentId) {
+        let turn = self.turn.fetch_add(1, Ordering::Relaxed);
+        match self.route(sender, turn) {
+            Route::Here => {
+                self.note_behind(sender, receiver);
+            }
+            Route::To(node) => self.send(
+                node,
+                Class::Requests,
+                &PeerMessage::Behind {
+                    sender,
+                    receiver,
+                    relayed: false,
+                },
+            ),
+            Route::Nowhere => {}
+        }
+    }
+
     /// A message for agent `to` from node `from`: a direct hop must come
     /// from a replica of its sender, a relayed one from a replica of `to`.
     pub(crate) fn on_deliver(
@@ -186,6 +211,42 @@ impl Inner {
                 },
             ),
             // The receiver acknowledges again, with the next delivery.
+            _ => self.drops.count(Refusal::Unplaced),
+        }
+    }
+
+    /// A `Behind` for agent `sender` from node `from`: a direct hop must
+    /// come from a replica of its receiver, a relayed one from a replica of
+    /// `sender`.
+    pub(crate) fn on_behind(
+        &self,
+        from: NodeNumber,
+        sender: AgentId,
+        receiver: AgentId,
+        relayed: bool,
+    ) {
+        let origin = if relayed { sender } else { receiver };
+        if let Err(refusal) = self.check_replica(origin, from) {
+            self.drops.count(refusal);
+            return;
+        }
+        match self.route(sender, 0) {
+            Route::Here => {
+                if !self.note_behind(sender, receiver) {
+                    self.drops.count(Refusal::Unplaced);
+                }
+            }
+            Route::To(leader) if !relayed && self.run(sender).is_some() => self.send(
+                leader,
+                Class::Requests,
+                &PeerMessage::Behind {
+                    sender,
+                    receiver,
+                    relayed: true,
+                },
+            ),
+            // The receiver says so again at its next refusal, and the
+            // sender's rounds send again meanwhile.
             _ => self.drops.count(Refusal::Unplaced),
         }
     }

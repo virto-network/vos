@@ -259,9 +259,9 @@ pub enum Refusal {
     NotAReplica = 10,
     /// An answer to a forwarded call that is no longer waited for.
     Unmatched = 11,
-    /// An agent's message or acknowledgement with nowhere to go here: no
-    /// leader to relay to, a second hop, or a full queue. Its sender sends
-    /// it again.
+    /// An agent's message, acknowledgement or `Behind` with nowhere to go
+    /// here: no leader to relay to, a second hop, or a full queue. Its
+    /// sender sends it again.
     Unplaced = 12,
 }
 
@@ -307,7 +307,8 @@ pub fn class(message: &PeerMessage) -> Class {
         | PeerMessage::ReadIndex { .. }
         | PeerMessage::ReadIndexAnswer { .. }
         | PeerMessage::Deliver { .. }
-        | PeerMessage::Acknowledge { .. } => Class::Requests,
+        | PeerMessage::Acknowledge { .. }
+        | PeerMessage::Behind { .. } => Class::Requests,
         PeerMessage::Liveness { .. } => Class::Liveness,
     }
 }
@@ -328,7 +329,8 @@ pub fn stream(message: &PeerMessage) -> u64 {
         | PeerMessage::ReadIndex { agent, .. }
         | PeerMessage::ReadIndexAnswer { agent, .. }
         | PeerMessage::Deliver { to: agent, .. }
-        | PeerMessage::Acknowledge { sender: agent, .. } => u64::from(agent.0),
+        | PeerMessage::Acknowledge { sender: agent, .. }
+        | PeerMessage::Behind { sender: agent, .. } => u64::from(agent.0),
         PeerMessage::Blob { .. } | PeerMessage::Liveness { .. } => 0,
     }
 }
@@ -394,7 +396,8 @@ pub fn check(
         | PeerMessage::ReadIndex { .. }
         | PeerMessage::ReadIndexAnswer { .. }
         | PeerMessage::Deliver { .. }
-        | PeerMessage::Acknowledge { .. } => Ok(()),
+        | PeerMessage::Acknowledge { .. }
+        | PeerMessage::Behind { .. } => Ok(()),
     }
 }
 

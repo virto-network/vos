@@ -12,7 +12,7 @@ use vos_pvm::refine::{Invocation, Machine, MemoryModel, PreparedProgram};
 use vos_pvm::refine_host::{RefineContext, StateReader};
 use vos_testkit::programs::{actor, agent, method};
 use vos_testkit::{Testkit, decode, program_hash};
-use vos_wire::abi::{cap, code};
+use vos_wire::abi::{Failure, Refusal, cap, code};
 use vos_wire::batch::{Admin, Batch, Input, Query, Request, Work};
 use vos_wire::ids::{
     AgentId, InstanceId, MethodId, Principal, ProgramHash, Session, SessionId, SessionRef,
@@ -155,6 +155,7 @@ impl Node {
             version: self.version,
             time,
             seed,
+            budget: OUTER_GAS,
             inputs,
         })
     }
@@ -488,14 +489,14 @@ pub fn done<T: Decode>(step: &Step) -> T {
     }
 }
 
-pub fn failed(step: &Step) -> u32 {
+pub fn failed(step: &Step) -> Failure {
     match &ran(step).outcome {
         Outcome::Failed { code, .. } => *code,
         other => panic!("done: {other:?}"),
     }
 }
 
-pub fn refused(step: &Step) -> u32 {
+pub fn refused(step: &Step) -> Refusal {
     match step {
         Step::Refused { code, .. } => *code,
         other => panic!("not refused: {other:?}"),

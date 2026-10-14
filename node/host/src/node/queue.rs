@@ -1,11 +1,11 @@
 //! An agent's queue: the inputs its leader loop takes, with where their
 //! replies go.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use vos_wire::batch::{Admin, Input, Message, Request};
+use vos_wire::batch::{Admin, Body, Input, Message, Request};
 use vos_wire::ids::AgentId;
 
 use super::{CallError, Inner, Reply};
@@ -34,6 +34,9 @@ pub(crate) enum Pending {
         blobs: Vec<BlobRef>,
     },
     Message(Message),
+    /// A message the agent program failed on alone twice, which the
+    /// leader asserts failed: its batch names it without its body.
+    Failed(Message),
     Ack {
         to: AgentId,
         sequence: u64,
@@ -48,6 +51,14 @@ impl Pending {
             Pending::Request { request, .. } => Input::Request(request.clone()),
             Pending::Admin { admin, .. } => Input::Admin(admin.clone()),
             Pending::Message(message) => Input::Message(message.clone()),
+            Pending::Failed(message) => Input::Failed {
+                from: message.from,
+                sequence: message.sequence,
+                awaiting: match message.body {
+                    Body::Call { awaiting, .. } => awaiting,
+                    Body::Reply { .. } => None,
+                },
+            },
             Pending::Ack { to, sequence } => Input::Ack {
                 to: *to,
                 sequence: *sequence,
@@ -59,8 +70,9 @@ impl Pending {
     pub(crate) fn bytes(&self) -> usize {
         match self {
             Pending::Request { request, .. } => request.arguments.len(),
-            Pending::Message(message) => message.arguments.len(),
-            Pending::Admin { .. } | Pending::Ack { .. } | Pending::Sweep => 0,
+            Pending::Message(message) => message.body.payload_len(),
+            // Its batch carries no body.
+            Pending::Failed(_) | Pending::Admin { .. } | Pending::Ack { .. } | Pending::Sweep => 0,
         }
     }
 
@@ -73,7 +85,7 @@ impl Pending {
     /// other nodes now fill. Acknowledgements do not: they open this
     /// agent's own windows, and the batch takes one per target.
     pub(crate) fn agents_sent(&self) -> bool {
-        matches!(self, Pending::Message(_))
+        matches!(self, Pending::Message(_) | Pending::Failed(_))
     }
 
     /// Answer that this node does not lead, when the input has a caller.
@@ -92,6 +104,9 @@ pub(crate) struct Queue {
     pub(crate) capped: usize,
     /// Messages from other agents queued.
     pub(crate) from_agents: usize,
+    /// The agents that refused this agent's messages past a gap since the
+    /// leader loop last looked: it sends them again.
+    pub(crate) behind: BTreeSet<AgentId>,
     pub(crate) stopped: bool,
     /// The leader loop takes inputs: set when this replica's leadership
     /// starts, and cleared with the refusal of what it left. Under the
@@ -123,6 +138,7 @@ impl Agent {
             queue.stopped = true;
             queue.capped = 0;
             queue.from_agents = 0;
+            queue.behind.clear();
             std::mem::take(&mut queue.inputs)
         };
         drop(dropped);
@@ -136,6 +152,7 @@ impl Agent {
             queue.leading = false;
             queue.capped = 0;
             queue.from_agents = 0;
+            queue.behind.clear();
             std::mem::take(&mut queue.inputs)
         };
         for (pending, _) in refused {
@@ -174,6 +191,22 @@ impl Inner {
         drop(queue);
         let _ = run.agent.wake.try_send(());
         Ok(())
+    }
+
+    /// Tell agent `sender`'s leader loop here that `receiver` found it
+    /// behind: false when this node does not lead it.
+    pub(crate) fn note_behind(&self, sender: AgentId, receiver: AgentId) -> bool {
+        let Some(run) = self.run(sender) else {
+            return false;
+        };
+        let mut queue = lock(&run.agent.queue);
+        if queue.stopped || !queue.leading {
+            return false;
+        }
+        queue.behind.insert(receiver);
+        drop(queue);
+        let _ = run.agent.wake.try_send(());
+        true
     }
 
     /// Put inputs back at the front of agent `id`'s queue, in order, as

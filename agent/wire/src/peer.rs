@@ -1,8 +1,9 @@
 //! What one node sends another: messages for an agent's replica group,
 //! snapshot chunks, blobs, liveness, the directory of agents, clients'
 //! calls and read indexes, which a replica asks of its leader, and agents'
-//! messages to each other and their acknowledgements. The node checks each
-//! against the space's configuration before it reaches a group.
+//! messages to each other, their acknowledgements and their receivers'
+//! calls to send again. The node checks each against the space's
+//! configuration before it reaches a group.
 //!
 //! The Raft types mirror the consensus core's, so the wire format is this
 //! module's alone and the core may change underneath it. The network's
@@ -51,20 +52,25 @@ pub enum PeerMessage {
     /// Where an agent runs, with its creation record: from its creator at
     /// creation, then from its leader as its replicas change, or from a
     /// member asked for it.
-    #[codec(index = 7)]
+    #[codec(index = 6)]
     Directory {
         record: CreationRecord,
         placement: Placement,
     },
     /// The receiver holds `agent`'s record and a placement at least as
-    /// new as the one in `order` durably; `runs` says whether it could run
-    /// the agent's program.
-    #[codec(index = 8)]
+    /// new as `order` durably; `runs` says whether it could run the
+    /// agent's program.
+    #[codec(index = 7)]
     DirectoryAck {
         agent: AgentId,
-        order: (u64, u64, bool),
+        order: Order,
         runs: bool,
     },
+    /// The sender runs no group for `agent` and was sent Raft traffic for
+    /// it: a node holding a placement that names the sender answers with
+    /// a `Directory`.
+    #[codec(index = 8)]
+    DirectoryRequest { agent: AgentId },
     /// A client's call to `agent`, whose signature the sending replica
     /// checked, for the leader to run. `token` names it across re-forwards;
     /// `term` is the term the sender knows the receiver to lead at, and
@@ -113,11 +119,17 @@ pub enum PeerMessage {
         sequence: u64,
         relayed: bool,
     },
-    /// The sender runs no group for `agent` and was sent Raft traffic for
-    /// it: a node holding a placement that names the sender answers with
-    /// a `Directory`.
+    /// Agent `receiver` refused a message of `sender`'s past a gap:
+    /// `sender`'s leader sends again, now, what it sent past the
+    /// acknowledgement it holds. From the receiver's leader, or `relayed`
+    /// by a replica of `sender` to its leader. It names no sequence, so a
+    /// stale one only sends again what the receiver drops at its mark.
     #[codec(index = 15)]
-    DirectoryRequest { agent: AgentId },
+    Behind {
+        sender: AgentId,
+        receiver: AgentId,
+        relayed: bool,
+    },
 }
 
 /// What makes an agent the agent it is. Its hash is the agent's identity.
@@ -176,12 +188,13 @@ impl Placement {
         }
     }
 
-    /// Its place among an agent's placements: a newer leader's first, then
-    /// a later configuration, then one that committed. A leader that failed
-    /// before its configuration reached a majority is outranked by the
-    /// next, whatever the index.
-    pub fn order(&self) -> (u64, u64, bool) {
-        (self.term, self.index, self.committed)
+    /// Its place among an agent's placements.
+    pub fn order(&self) -> Order {
+        Order {
+            term: self.term,
+            index: self.index,
+            committed: self.committed,
+        }
     }
 
     /// Whether this placement replaces `held`: it ranks higher, and takes
@@ -201,6 +214,20 @@ impl Placement {
     pub fn admits(&self, node: NodeNumber) -> bool {
         self.replicas.contains(&node) || (!self.committed && self.before.contains(&node))
     }
+}
+
+/// A placement's place among an agent's placements, compared field by
+/// field: a newer leader's first, then a later configuration, then one
+/// that committed. A leader that failed before its configuration reached a
+/// majority is outranked by the next, whatever the index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
+pub struct Order {
+    /// The term of the leader that announced it.
+    pub term: u64,
+    /// The log index of its configuration.
+    pub index: u64,
+    /// Whether its configuration had committed.
+    pub committed: bool,
 }
 
 /// A group a node leads, at `term`, as its pair heartbeat lists it.

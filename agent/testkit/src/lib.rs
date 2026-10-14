@@ -17,7 +17,8 @@ use blake2::digest::consts::U32;
 use blake2::{Blake2b, Digest};
 use vos_pvm::ExitReason;
 use vos_pvm::refine::Machine;
-use vos_wire::abi::{self, Kind, cap, code, failure, op, price};
+use vos_wire::abi::{self, Failure, Kind, cap, code, op, price};
+use vos_wire::batch::{Await, Body};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash};
 use vos_wire::keys;
 use vos_wire::result::{Attest, InstanceGas, Outcome, Outgoing, Write};
@@ -226,6 +227,57 @@ impl Testkit {
         }
     }
 
+    /// Run a message from agent `from` as a step: a call runs as a command
+    /// of that agent's, and one that awaits adds its reply to the step's
+    /// messages, whatever its outcome; a reply is consumed, with no await
+    /// to resume.
+    pub fn message(&mut self, from: AgentId, body: &Body) -> Step {
+        match body {
+            Body::Call {
+                instance,
+                method,
+                arguments,
+                awaiting,
+            } => {
+                let mut step = self.command(Principal::Agent(from), *instance, *method, arguments);
+                if let Some(awaiting) = awaiting {
+                    step.messages.push(reply(from, *awaiting, &step.outcome));
+                }
+                step
+            }
+            Body::Reply { .. } => self.consumed(Outcome::Done(Vec::new()), None),
+        }
+    }
+
+    /// A message from agent `from` that the leader asserts failed in
+    /// refine: consumed as failed without running, and answered when it
+    /// awaits.
+    pub fn failed(&mut self, from: AgentId, awaiting: Option<Await>) -> Step {
+        let outcome = Outcome::Failed {
+            code: Failure::InRefine,
+            detail: Vec::new(),
+        };
+        self.consumed(outcome, awaiting.map(|awaiting| (from, awaiting)))
+    }
+
+    /// A step that runs nothing: `outcome`, and the reply to the request
+    /// awaiting, if any.
+    fn consumed(&mut self, outcome: Outcome, awaiting: Option<(AgentId, Await)>) -> Step {
+        self.steps += 1;
+        let messages = awaiting
+            .map(|(from, awaiting)| reply(from, awaiting, &outcome))
+            .into_iter()
+            .collect();
+        Step {
+            outcome,
+            instances: Vec::new(),
+            writes: Vec::new(),
+            messages,
+            attests: Vec::new(),
+            gas_used: 0,
+        }
+    }
+
     /// Run a query: a `&self` handler on applied state, outside the log.
     pub fn query(
         &self,
@@ -242,6 +294,18 @@ impl Testkit {
                 detail: Vec::new(),
             },
         }
+    }
+}
+
+/// The reply to agent `to`'s request awaiting at `awaiting`: the step's
+/// outcome.
+fn reply(to: AgentId, awaiting: Await, outcome: &Outcome) -> Outgoing {
+    Outgoing {
+        to,
+        body: Body::Reply {
+            awaiting,
+            answer: outcome.clone().into(),
+        },
     }
 }
 
@@ -300,16 +364,16 @@ impl<'a> Run<'a> {
         instance: InstanceId,
         method: MethodId,
         arguments: &[u8],
-    ) -> Result<Outcome, u32> {
+    ) -> Result<Outcome, Failure> {
         if arguments.len() > cap::REQUEST {
-            return Err(failure::CAP);
+            return Err(Failure::Cap);
         }
-        let installed = self.kit.instances.get(&instance).ok_or(failure::UNKNOWN)?;
-        let schema = installed.schema.method(method).ok_or(failure::UNKNOWN)?;
+        let installed = self.kit.instances.get(&instance).ok_or(Failure::Unknown)?;
+        let schema = installed.schema.method(method).ok_or(Failure::Unknown)?;
         if schema.kind == Kind::Attestable
             || (self.kind == Kind::Query && schema.kind != Kind::Query)
         {
-            return Err(failure::UNKNOWN);
+            return Err(Failure::Unknown);
         }
         let gas = schema
             .gas
@@ -326,11 +390,11 @@ impl<'a> Run<'a> {
         Ok(match ended {
             Ended::Replied(reply) => Outcome::Done(reply),
             Ended::Failed(detail) => Outcome::Failed {
-                code: failure::HANDLER,
+                code: Failure::Handler,
                 detail,
             },
             Ended::Forbidden => Outcome::Failed {
-                code: failure::FORBIDDEN,
+                code: Failure::Forbidden,
                 detail: Vec::new(),
             },
         })
@@ -345,16 +409,16 @@ impl<'a> Run<'a> {
         method: MethodId,
         arguments: &[u8],
         gas: u64,
-    ) -> Result<(Ended, u64), (u32, u64)> {
+    ) -> Result<(Ended, u64), (Failure, u64)> {
         let installed = self
             .kit
             .instances
             .get(&instance)
-            .ok_or((failure::UNKNOWN, 0))?;
+            .ok_or((Failure::Unknown, 0))?;
         let schema = installed
             .schema
             .method(method)
-            .ok_or((failure::UNKNOWN, 0))?;
+            .ok_or((Failure::Unknown, 0))?;
         if let Some(role) = &schema.role {
             let required = installed.roles[role];
             if self.kit.members.get(&caller) != Some(&required) {
@@ -362,14 +426,14 @@ impl<'a> Run<'a> {
             }
         }
         if self.stack.contains(&instance) {
-            return Err((failure::CYCLE, 0));
+            return Err((Failure::Cycle, 0));
         }
         if self.stack.len() >= MAX_DEPTH {
-            return Err((failure::DEPTH, 0));
+            return Err((Failure::Depth, 0));
         }
         let kind = schema.kind;
         let mut machine =
-            Machine::load(&installed.program, &[], gas).map_err(|_| (failure::TRAPPED, 0))?;
+            Machine::load(&installed.program, &[], gas).map_err(|_| (Failure::Trapped, 0))?;
         let registers = machine.registers_mut();
         registers[7] = u64::from(method.0);
         registers[8] = kind.encode()[0].into();
@@ -406,14 +470,14 @@ impl<'a> Run<'a> {
         instance: InstanceId,
         kind: Kind,
         arguments: &[u8],
-    ) -> Result<Ended, u32> {
+    ) -> Result<Ended, Failure> {
         let mut outcome: Option<Ended> = None;
         loop {
-            match machine.try_resume().map_err(|_| failure::TRAPPED)? {
+            match machine.try_resume().map_err(|_| Failure::Trapped)? {
                 ExitReason::Halt => {
                     return Ok(outcome.unwrap_or(Ended::Replied(Vec::new())));
                 }
-                ExitReason::OutOfGas => return Err(failure::OUT_OF_GAS),
+                ExitReason::OutOfGas => return Err(Failure::OutOfGas),
                 ExitReason::HostCall(id) => {
                     if vos_pvm::precompile::is_precompile(id) {
                         precompile(machine, id)?;
@@ -422,20 +486,20 @@ impl<'a> Run<'a> {
                     if !known(id) {
                         // Not an actor operation: the agent answers WHAT.
                         if !machine.charge(price::OPERATION) {
-                            return Err(failure::OUT_OF_GAS);
+                            return Err(Failure::OutOfGas);
                         }
                         machine.registers_mut()[7] = code::WHAT;
                         continue;
                     }
                     if !abi::allowed(kind, id) {
-                        return Err(failure::TRAPPED);
+                        return Err(Failure::Trapped);
                     }
                     if !machine.charge(price::of(id)) {
-                        return Err(failure::OUT_OF_GAS);
+                        return Err(Failure::OutOfGas);
                     }
                     self.operation(machine, id, caller, instance, kind, arguments, &mut outcome)?;
                 }
-                _ => return Err(failure::TRAPPED),
+                _ => return Err(Failure::Trapped),
             }
         }
     }
@@ -450,7 +514,7 @@ impl<'a> Run<'a> {
         kind: Kind,
         arguments: &[u8],
         outcome: &mut Option<Ended>,
-    ) -> Result<(), u32> {
+    ) -> Result<(), Failure> {
         let r = *machine.registers();
         match id {
             op::INPUT => {
@@ -459,7 +523,7 @@ impl<'a> Run<'a> {
             }
             op::REPLY | op::FAIL => {
                 if outcome.is_some() {
-                    return Err(failure::TRAPPED);
+                    return Err(Failure::Trapped);
                 }
                 let bytes = read(machine, r[7], r[8], cap::REPLY)?;
                 *outcome = Some(if id == op::REPLY {
@@ -507,7 +571,7 @@ impl<'a> Run<'a> {
                 };
                 self.written += key.len() + value.as_ref().map_or(0, Vec::len);
                 if self.written > cap::STEP_WRITES {
-                    return Err(failure::CAP);
+                    return Err(Failure::Cap);
                 }
                 self.frames.last_mut().expect("a frame").insert(key, value);
                 machine.registers_mut()[7] = code::OK;
@@ -541,11 +605,11 @@ impl<'a> Run<'a> {
                     .get(&callee)
                     .and_then(|installed| installed.schema.method(method))
                     .map(|schema| schema.kind)
-                    .ok_or(failure::UNKNOWN)?;
+                    .ok_or(Failure::Unknown)?;
                 if callee_kind == Kind::Attestable
                     || (kind == Kind::Query && callee_kind != Kind::Query)
                 {
-                    return Err(failure::TRAPPED);
+                    return Err(Failure::Trapped);
                 }
                 self.frames.push(BTreeMap::new());
                 // A failed callee's effects are discarded: its writes with
@@ -566,18 +630,18 @@ impl<'a> Run<'a> {
                 let frame = self.frames.pop().expect("the call's frame");
                 *self.nested.last_mut().expect("the caller's entry") += used;
                 if !machine.charge(used) {
-                    return Err(failure::OUT_OF_GAS);
+                    return Err(Failure::OutOfGas);
                 }
-                let (bytes, status) = match ended {
+                let (bytes, failed) = match ended {
                     Ended::Replied(reply) => {
                         let parent = self.frames.last_mut().expect("a frame");
                         parent.extend(frame);
-                        (reply, 0)
+                        (reply, None)
                     }
-                    Ended::Failed(detail) => (detail, failure::HANDLER),
-                    Ended::Forbidden => (Vec::new(), failure::FORBIDDEN),
+                    Ended::Failed(detail) => (detail, Some(Failure::Handler)),
+                    Ended::Forbidden => (Vec::new(), Some(Failure::Forbidden)),
                 };
-                if status != 0 {
+                if failed.is_some() {
                     let (messages, attests, written) = effects;
                     self.messages.truncate(messages);
                     self.attests.truncate(attests);
@@ -585,18 +649,21 @@ impl<'a> Run<'a> {
                 }
                 copy_out(machine, &bytes, r[11], 0, r[12])?;
                 machine.registers_mut()[7] = bytes.len() as u64;
-                machine.registers_mut()[8] = u64::from(status);
+                machine.registers_mut()[8] = failed.map_or(0, |code| code.code().into());
             }
             op::SEND => {
                 let call_arguments = read(machine, r[10], r[11], cap::MESSAGE)?;
                 if self.messages.len() == cap::MESSAGES {
-                    return Err(failure::CAP);
+                    return Err(Failure::Cap);
                 }
                 self.messages.push(Outgoing {
                     to: AgentId(r[7] as u32),
-                    instance: InstanceId(r[8] as u32),
-                    method: MethodId(r[9] as u32),
-                    arguments: call_arguments,
+                    body: Body::Call {
+                        instance: InstanceId(r[8] as u32),
+                        method: MethodId(r[9] as u32),
+                        arguments: call_arguments,
+                        awaiting: None,
+                    },
                 });
                 machine.registers_mut()[7] = code::OK;
             }
@@ -604,18 +671,18 @@ impl<'a> Run<'a> {
                 let method = MethodId(r[7] as u32);
                 let call_arguments = read(machine, r[8], r[9], cap::REQUEST)?;
                 if self.attests.len() == cap::ATTESTS {
-                    return Err(failure::CAP);
+                    return Err(Failure::Cap);
                 }
                 let program = self
                     .kit
                     .instances
                     .get(&instance)
                     .and_then(|installed| installed.attestables.get(&method))
-                    .ok_or(failure::UNKNOWN)?;
+                    .ok_or(Failure::Unknown)?;
                 let gas = machine.gas_remaining();
                 let (output, used) = attestable(program, &call_arguments, gas)?;
                 if !machine.charge(used) {
-                    return Err(failure::OUT_OF_GAS);
+                    return Err(Failure::OutOfGas);
                 }
                 self.attests.push(Attest {
                     program: program_hash(program),
@@ -639,10 +706,10 @@ impl<'a> Run<'a> {
         instance: InstanceId,
         address: u64,
         len: u64,
-    ) -> Result<Vec<u8>, u32> {
+    ) -> Result<Vec<u8>, Failure> {
         let relative = read(machine, address, len, cap::KEY)?;
         if relative.is_empty() {
-            return Err(failure::TRAPPED);
+            return Err(Failure::Trapped);
         }
         Ok([keys::instance_prefix(instance), relative].concat())
     }
@@ -683,33 +750,33 @@ impl<'a> Run<'a> {
 
 /// Serve a precompile as the node's machines do: its price, then its work
 /// on the actor's memory.
-fn precompile(machine: &mut Machine, id: u64) -> Result<(), u32> {
+fn precompile(machine: &mut Machine, id: u64) -> Result<(), Failure> {
     if !machine.charge(vos_pvm::precompile::price(id).unwrap_or(0)) {
-        return Err(failure::OUT_OF_GAS);
+        return Err(Failure::OutOfGas);
     }
     let registers = *machine.registers();
     vos_pvm::precompile::execute(id, &registers, machine.memory_mut())
         .map(|_| ())
-        .ok_or(failure::TRAPPED)
+        .ok_or(Failure::Trapped)
 }
 
 /// Run an attestable program: arguments in the standard window, output by
 /// the halt convention, and no host calls but precompiles. Its output and
 /// gas used.
-fn attestable(program: &[u8], arguments: &[u8], gas: u64) -> Result<(Vec<u8>, u64), u32> {
-    let mut machine = Machine::load(program, arguments, gas).map_err(|_| failure::TRAPPED)?;
+fn attestable(program: &[u8], arguments: &[u8], gas: u64) -> Result<(Vec<u8>, u64), Failure> {
+    let mut machine = Machine::load(program, arguments, gas).map_err(|_| Failure::Trapped)?;
     loop {
-        match machine.try_resume().map_err(|_| failure::TRAPPED)? {
+        match machine.try_resume().map_err(|_| Failure::Trapped)? {
             ExitReason::HostCall(id) if vos_pvm::precompile::is_precompile(id) => {
                 precompile(&mut machine, id)?;
             }
             ExitReason::Halt => {
                 let invocation = machine.finish(ExitReason::Halt);
-                let output = invocation.output_bounded(cap::REPLY).ok_or(failure::CAP)?;
+                let output = invocation.output_bounded(cap::REPLY).ok_or(Failure::Cap)?;
                 return Ok((output, invocation.gas_used));
             }
-            ExitReason::OutOfGas => return Err(failure::OUT_OF_GAS),
-            _ => return Err(failure::TRAPPED),
+            ExitReason::OutOfGas => return Err(Failure::OutOfGas),
+            _ => return Err(Failure::Trapped),
         }
     }
 }
@@ -749,34 +816,34 @@ fn random(seed: &[u8; 32], step: u32, draw: u64) -> [u8; 32] {
 
 /// The actor's bytes at `address`, at most `limit` of them; an unreadable
 /// buffer traps and a longer one exceeds a cap.
-fn read(machine: &mut Machine, address: u64, len: u64, limit: usize) -> Result<Vec<u8>, u32> {
-    let len = usize::try_from(len).map_err(|_| failure::CAP)?;
+fn read(machine: &mut Machine, address: u64, len: u64, limit: usize) -> Result<Vec<u8>, Failure> {
+    let len = usize::try_from(len).map_err(|_| Failure::Cap)?;
     if len > limit {
-        return Err(failure::CAP);
+        return Err(Failure::Cap);
     }
     price_bytes(machine, len)?;
     let mut bytes = vec![0; len];
     if len > 0 {
-        let address = u32::try_from(address).map_err(|_| failure::TRAPPED)?;
+        let address = u32::try_from(address).map_err(|_| Failure::Trapped)?;
         if !machine.memory().is_readable(address, len)
             || !machine.memory().read_bytes_checked(address, &mut bytes)
         {
-            return Err(failure::TRAPPED);
+            return Err(Failure::Trapped);
         }
     }
     Ok(bytes)
 }
 
-fn write(machine: &mut Machine, address: u64, bytes: &[u8]) -> Result<(), u32> {
+fn write(machine: &mut Machine, address: u64, bytes: &[u8]) -> Result<(), Failure> {
     price_bytes(machine, bytes.len())?;
     if bytes.is_empty() {
         return Ok(());
     }
-    let address = u32::try_from(address).map_err(|_| failure::TRAPPED)?;
+    let address = u32::try_from(address).map_err(|_| Failure::Trapped)?;
     if machine.memory_mut().write_bytes_checked(address, bytes) {
         Ok(())
     } else {
-        Err(failure::TRAPPED)
+        Err(Failure::Trapped)
     }
 }
 
@@ -787,7 +854,7 @@ fn copy_out(
     address: u64,
     offset: u64,
     capacity: u64,
-) -> Result<(), u32> {
+) -> Result<(), Failure> {
     let offset = usize::try_from(offset)
         .unwrap_or(usize::MAX)
         .min(bytes.len());
@@ -797,11 +864,11 @@ fn copy_out(
     write(machine, address, &bytes[offset..offset + len])
 }
 
-fn price_bytes(machine: &mut Machine, len: usize) -> Result<(), u32> {
+fn price_bytes(machine: &mut Machine, len: usize) -> Result<(), Failure> {
     if machine.charge(len as u64 * price::PER_BYTE) {
         Ok(())
     } else {
-        Err(failure::OUT_OF_GAS)
+        Err(Failure::OutOfGas)
     }
 }
 

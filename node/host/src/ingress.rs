@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use smol::net::TcpListener;
 use subtle::ConstantTimeEq;
-use vos_wire::abi::{cap, refusal};
+use vos_wire::abi::{Refusal, cap};
 use vos_wire::batch::Admin;
 use vos_wire::ids::{AgentId, InstanceId, Principal};
 use vos_wire::ingress::{
@@ -41,10 +41,10 @@ fn status(answer: &Answer) -> u16 {
         Answer::Unplaced(_) => 409,
         Answer::Unconfirmed(_) => 202,
         // The session is done with: the client starts another.
-        Answer::Refused(refusal::EXPIRED | refusal::STALE_SESSION) => 410,
+        Answer::Refused(Refusal::Expired | Refusal::StaleSession) => 410,
         // No new session until some are collected.
-        Answer::Refused(refusal::SESSIONS_FULL) => 503,
-        Answer::Refused(refusal::KEY_SESSIONS_FULL) => 429,
+        Answer::Refused(Refusal::SessionsFull) => 503,
+        Answer::Refused(Refusal::KeySessionsFull) => 429,
         Answer::Refused(_) => 409,
         Answer::Rejected(rejection) => match rejection {
             Rejection::TooOld | Rejection::StaleSession { .. } => 410,

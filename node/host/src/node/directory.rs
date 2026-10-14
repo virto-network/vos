@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use smol::future::FutureExt;
 use vos_net::Class;
 use vos_wire::ids::AgentId;
-use vos_wire::peer::{CreationRecord, NodeNumber, PeerMessage, Placement};
+use vos_wire::peer::{CreationRecord, NodeNumber, Order, PeerMessage, Placement};
 
 use super::{Agent, Inner, Run};
 use crate::group::{self, Shared};
@@ -42,9 +42,6 @@ const ASK_EVERY: Duration = Duration::from_secs(1);
 const ASKS_KEPT: usize = 1024;
 /// A group's inbox: Raft messages beyond it are dropped, and resent.
 const GROUP_INBOX: usize = 1024;
-
-/// A placement's order: [`Placement::order`].
-pub(crate) type Order = (u64, u64, bool);
 
 /// What a node knows of an agent: its record, and where it runs.
 #[derive(Clone, Debug)]

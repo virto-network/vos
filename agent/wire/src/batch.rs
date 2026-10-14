@@ -3,8 +3,10 @@
 use alloc::vec::Vec;
 use scale::{Decode, Encode};
 
-use crate::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, Session};
+use crate::abi::Failure;
+use crate::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, Session, WorkflowId};
 use crate::ingress::Grant;
+use crate::result::Outcome;
 
 /// A refine's work item payload: a batch through the log, or a query on
 /// applied state.
@@ -43,6 +45,8 @@ pub struct Batch {
     /// From the leader's operating system. The work result carries both,
     /// so a replay reads them and never draws them again.
     pub seed: [u8; 32],
+    /// The gas the node runs the refine with.
+    pub budget: u64,
     pub inputs: Vec<Input>,
 }
 
@@ -62,6 +66,16 @@ pub enum Input {
     /// The node puts it first in a batch.
     #[codec(index = 4)]
     Sweep,
+    /// A message the agent program failed on alone, twice, each time on
+    /// fresh state: the leader asserts it failed. Refine consumes it in
+    /// its pair's order without running it, and answers the request's
+    /// await, if any. Named by its pair's sequence, without its body.
+    #[codec(index = 5)]
+    Failed {
+        from: AgentId,
+        sequence: u64,
+        awaiting: Option<Await>,
+    },
 }
 
 /// A client request, in its session's sequence for this agent.
@@ -80,9 +94,73 @@ pub struct Request {
 pub struct Message {
     pub from: AgentId,
     pub sequence: u64,
-    pub instance: InstanceId,
-    pub method: MethodId,
-    pub arguments: Vec<u8>,
+    pub body: Body,
+}
+
+/// What a message between agents carries.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum Body {
+    /// A call of `instance`'s `method`. One that names an await is a
+    /// request: its step replies to the sender, whatever its outcome.
+    #[codec(index = 0)]
+    Call {
+        instance: InstanceId,
+        method: MethodId,
+        arguments: Vec<u8>,
+        awaiting: Option<Await>,
+    },
+    /// A request's answer, for the await it names.
+    #[codec(index = 1)]
+    Reply { awaiting: Await, answer: Answer },
+}
+
+impl Body {
+    /// The bytes it carries: a call's arguments, or a reply's.
+    pub fn payload_len(&self) -> usize {
+        match self {
+            Body::Call { arguments, .. } => arguments.len(),
+            Body::Reply { answer, .. } => match answer {
+                Answer::Done(bytes) | Answer::Failed { detail: bytes, .. } => bytes.len(),
+                Answer::Started(_) => 0,
+            },
+        }
+    }
+}
+
+/// An await of a workflow: the workflow, and its count of awaits when it
+/// made this one, so a reply finds the await it answers, or none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
+pub struct Await {
+    pub workflow: WorkflowId,
+    pub counter: u64,
+}
+
+/// What a request is answered: its step's outcome, or the workflow it
+/// started.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum Answer {
+    /// The handler's reply.
+    #[codec(index = 0)]
+    Done(Vec<u8>),
+    /// The step failed, with its code and detail. A request refused before
+    /// its handler ran fails too: [`Failure::Unknown`] for no such
+    /// instance or method, [`Failure::Forbidden`] when the requesting
+    /// agent lacks the handler's role.
+    #[codec(index = 1)]
+    Failed { code: Failure, detail: Vec<u8> },
+    /// The request started a workflow, which answers its result to an
+    /// await of its own.
+    #[codec(index = 2)]
+    Started(WorkflowId),
+}
+
+impl From<Outcome> for Answer {
+    fn from(outcome: Outcome) -> Self {
+        match outcome {
+            Outcome::Done(reply) => Answer::Done(reply),
+            Outcome::Failed { code, detail } => Answer::Failed { code, detail },
+        }
+    }
 }
 
 /// An operator command, applied through the log like any input.

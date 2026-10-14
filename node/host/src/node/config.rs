@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use vos_wire::abi::Refusal;
 use vos_wire::defaults;
 use vos_wire::ids::AgentId;
 use vos_wire::ingress::{Contact, Unplaced};
@@ -71,6 +72,11 @@ pub struct Config {
     /// How long a call or an admin command, once queued at the leader,
     /// waits for its answer before it answers that it may have run.
     pub answered: Duration,
+    /// How long an agent's messages to another may stay unacknowledged
+    /// before its leader sends them again, doubled each time that brings
+    /// nothing, up to 16 times this. A receiver's `Behind` sends them
+    /// again sooner.
+    pub resend_round: Duration,
     /// A group's log is compacted once this many entries past its start
     /// are applied durably.
     pub compact_every: u64,
@@ -121,6 +127,7 @@ impl Config {
             election_timeout_ms: (1500, 3000),
             heartbeat_ms: 500,
             answered: Duration::from_secs(30),
+            resend_round: Duration::from_secs(1),
             compact_every: 1024,
             compact_bytes: 64 << 20,
             blob_collect_every: Duration::from_secs(600),
@@ -146,6 +153,7 @@ pub(crate) struct Settings {
     pub(crate) accumulate_gas: u64,
     pub(crate) election_timeout_ms: (u64, u64),
     pub(crate) answered: Duration,
+    pub(crate) resend_round: Duration,
     pub(crate) heartbeat_ms: u64,
     pub(crate) compact_every: u64,
     pub(crate) compact_bytes: u64,
@@ -169,6 +177,7 @@ impl Settings {
             accumulate_gas: config.accumulate_gas,
             election_timeout_ms: config.election_timeout_ms,
             answered: config.answered,
+            resend_round: config.resend_round,
             heartbeat_ms: config.heartbeat_ms,
             compact_every: config.compact_every,
             compact_bytes: config.compact_bytes,
@@ -187,8 +196,8 @@ impl Settings {
 pub enum Reply {
     /// The step ran: the handler's reply, or its failure.
     Ran(Outcome),
-    /// Refine refused it, with a code from [`vos_wire::abi::refusal`].
-    Refused(u32),
+    /// Refine refused it.
+    Refused(Refusal),
     /// The agent program fails on a batch holding this input alone.
     Failed,
     /// A duplicate whose reply the window no longer keeps.

@@ -14,10 +14,10 @@ use std::time::Instant;
 use vos_raft::core::{ChangeMembershipError, Core, ProposeError, ReadIndexError};
 use vos_raft::{Message, Role};
 use vos_wire::ids::AgentId;
-use vos_wire::peer::{CreationRecord, NodeNumber, SnapshotAck, SnapshotChunk};
+use vos_wire::peer::{CreationRecord, NodeNumber, Order, SnapshotAck, SnapshotChunk};
 
 use crate::lock;
-use crate::node::{Inner, Order};
+use crate::node::Inner;
 use crate::raft::EntryReports;
 
 pub(crate) use apply::{DryRun, apply, programs, unpinned};

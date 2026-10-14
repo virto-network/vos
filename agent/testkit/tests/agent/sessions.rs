@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use proptest::prelude::*;
 use vos_wire::Encode;
-use vos_wire::abi::refusal;
+use vos_wire::abi::Refusal;
 use vos_wire::batch::Input;
 use vos_wire::ids::{Session, SessionId, SessionRef};
 use vos_wire::records::{SessionMark, stored};
@@ -39,9 +39,9 @@ fn sessions_refuse_gaps_and_expiry_and_keep_a_reply_window() {
     let session = session(9, 9, 1);
     let request = |sequence: u64| increment_in(&actors, session, sequence);
     let result = node.batch(1, vec![request(2), request(1), request(1), request(2)]);
-    assert_eq!(refused(&result.steps[0]), refusal::SEQUENCE);
+    assert_eq!(refused(&result.steps[0]), Refusal::Sequence);
     assert_eq!(done::<u64>(&result.steps[1]), 1);
-    assert_eq!(refused(&result.steps[2]), refusal::SEQUENCE);
+    assert_eq!(refused(&result.steps[2]), Refusal::Sequence);
     assert_eq!(done::<u64>(&result.steps[3]), 2);
     let (id, _) = node.session(&session).unwrap();
     assert_eq!(
@@ -51,7 +51,7 @@ fn sessions_refuse_gaps_and_expiry_and_keep_a_reply_window() {
 
     let later = 2 + defaults::SESSION_EXPIRY_MS;
     let result = node.batch(later, vec![request(3)]);
-    assert_eq!(refused(&result.steps[0]), refusal::EXPIRED);
+    assert_eq!(refused(&result.steps[0]), Refusal::Expired);
 }
 
 /// A session is its key, name and creation time: accumulate gives each a
@@ -98,11 +98,11 @@ fn sessions_are_named_by_their_client_and_created_by_accumulate() {
     assert_eq!(named(&result.steps[0]), SessionRef::New(Box::new(first)));
     assert_eq!(named(&result.steps[2]), SessionRef::New(Box::new(first)));
     assert_eq!(done::<u64>(&result.steps[2]), 3);
-    assert_eq!(refused(&result.steps[3]), refusal::STALE_SESSION);
-    assert_eq!(refused(&result.steps[4]), refusal::STALE_SESSION);
+    assert_eq!(refused(&result.steps[3]), Refusal::StaleSession);
+    assert_eq!(refused(&result.steps[4]), Refusal::StaleSession);
     assert_eq!(
         refused(&result.steps[5]),
-        refusal::SEQUENCE,
+        Refusal::Sequence,
         "a new session starts at 1"
     );
     assert_eq!(
@@ -241,8 +241,8 @@ fn sessions_are_collected_once_expired_and_moved_while_active() {
             increment_in(&actors, idle, 2),
         ],
     );
-    assert_eq!(refused(&result.steps[0]), refusal::EXPIRED);
-    assert_eq!(refused(&result.steps[1]), refusal::SEQUENCE);
+    assert_eq!(refused(&result.steps[0]), Refusal::Expired);
+    assert_eq!(refused(&result.steps[1]), Refusal::Sequence);
 
     let result = node.batch(due, vec![Input::Sweep]);
     assert_eq!(
@@ -274,8 +274,8 @@ fn sessions_are_collected_once_expired_and_moved_while_active() {
             increment_in(&actors, session(3, 3, due), 1),
         ],
     );
-    assert_eq!(refused(&result.steps[0]), refusal::STALE_SESSION);
-    assert_eq!(refused(&result.steps[1]), refusal::STALE_SESSION);
+    assert_eq!(refused(&result.steps[0]), Refusal::StaleSession);
+    assert_eq!(refused(&result.steps[1]), Refusal::StaleSession);
     assert_eq!(done::<u64>(&result.steps[2]), 5, "the collected ran 2");
     assert_eq!(
         node.session(&session(3, 3, due)).unwrap().0,
@@ -315,14 +315,14 @@ fn session_caps_refuse_new_sessions_until_some_are_collected() {
     for step in &result.steps[..cap] {
         ran(step);
     }
-    assert_eq!(refused(&result.steps[cap]), refusal::KEY_SESSIONS_FULL);
+    assert_eq!(refused(&result.steps[cap]), Refusal::KeySessionsFull);
     ran(&result.steps[cap + 1]);
     assert_eq!(
         node.value::<u64>(&keys::key_sessions(&[4; 32])),
         Some(defaults::MAX_KEY_SESSIONS)
     );
     let result = node.batch(now + 1, vec![increment_in(&actors, one_key(999), 1)]);
-    assert_eq!(refused(&result.steps[0]), refusal::KEY_SESSIONS_FULL);
+    assert_eq!(refused(&result.steps[0]), Refusal::KeySessionsFull);
 
     // The agent's cap, at one session from it.
     let live = cap as u64 + 1;
@@ -339,7 +339,7 @@ fn session_caps_refuse_new_sessions_until_some_are_collected() {
         ],
     );
     ran(&result.steps[0]);
-    assert_eq!(refused(&result.steps[1]), refusal::SESSIONS_FULL);
+    assert_eq!(refused(&result.steps[1]), Refusal::SessionsFull);
     ran(&result.steps[2]);
     node.state
         .insert(keys::live_sessions(), stored(&(live + 1).encode()));
@@ -556,23 +556,23 @@ impl SessionModel {
 
     /// A request's step in a batch at `time`, as refine decides it: run,
     /// or refused with a code.
-    fn refine(&mut self, session: Session, sequence: u64, time: u64) -> Result<(), u32> {
+    fn refine(&mut self, session: Session, sequence: u64, time: u64) -> Result<(), Refusal> {
         match self.sessions.get(&session) {
-            Some(held) if sequence <= held.sequence => return Err(refusal::SEQUENCE),
+            Some(held) if sequence <= held.sequence => return Err(Refusal::Sequence),
             Some(held) if time > held.time + defaults::SESSION_EXPIRY_MS => {
-                return Err(refusal::EXPIRED);
+                return Err(Refusal::Expired);
             }
-            Some(held) if sequence != held.sequence + 1 => return Err(refusal::SEQUENCE),
+            Some(held) if sequence != held.sequence + 1 => return Err(Refusal::Sequence),
             Some(_) => {}
             None if session.t0.abs_diff(time) > defaults::SESSION_SKEW_MS => {
-                return Err(refusal::STALE_SESSION);
+                return Err(Refusal::StaleSession);
             }
-            None if sequence != 1 => return Err(refusal::SEQUENCE),
+            None if sequence != 1 => return Err(Refusal::Sequence),
             None if self.live() >= defaults::MAX_SESSIONS => {
-                return Err(refusal::SESSIONS_FULL);
+                return Err(Refusal::SessionsFull);
             }
             None if self.of_key(&session.key) >= defaults::MAX_KEY_SESSIONS => {
-                return Err(refusal::KEY_SESSIONS_FULL);
+                return Err(Refusal::KeySessionsFull);
             }
             None => {}
         }
@@ -709,7 +709,7 @@ proptest! {
             // Refine decides every step on the state before the batch;
             // accumulate sweeps first, then applies the steps that ran.
             let mut refined = model.clone();
-            let expected: Vec<Result<(), u32>> = requested
+            let expected: Vec<Result<(), Refusal>> = requested
                 .iter()
                 .map(|(session, sequence)| refined.refine(*session, *sequence, time))
                 .collect();

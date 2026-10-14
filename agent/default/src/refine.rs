@@ -6,8 +6,8 @@ use alloc::rc::Rc;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 
-use vos_wire::abi::{self, Kind, cap, code, failure, op, price, refusal};
-use vos_wire::batch::{Admin, Batch, Input, Query, Request, Work};
+use vos_wire::abi::{self, Failure, Kind, Refusal, cap, code, op, price};
+use vos_wire::batch::{Admin, Await, Batch, Body, Input, Message, Query, Request, Work};
 use vos_wire::ids::{
     AgentId, InstanceId, MethodId, Principal, ProgramHash, Session, SessionId, SessionRef,
 };
@@ -50,9 +50,9 @@ pub fn run(arguments: &[u8]) -> Vec<u8> {
 #[derive(Clone, Copy, Debug)]
 struct Corrupt;
 
-impl From<Corrupt> for u32 {
-    fn from(_: Corrupt) -> u32 {
-        failure::TRAPPED
+impl From<Corrupt> for Failure {
+    fn from(_: Corrupt) -> Failure {
+        Failure::Trapped
     }
 }
 
@@ -221,7 +221,7 @@ struct Counts {
 
 impl Counts {
     /// The cap a new session of `key` would pass, if any.
-    fn full(&mut self, key: &[u8; 32]) -> Result<Option<u32>, Corrupt> {
+    fn full(&mut self, key: &[u8; 32]) -> Result<Option<Refusal>, Corrupt> {
         let live = match self.live {
             Some(live) => live,
             None => *self
@@ -229,7 +229,7 @@ impl Counts {
                 .insert(record::<u64>(&keys::live_sessions())?.unwrap_or(0)),
         };
         if live >= defaults::MAX_SESSIONS {
-            return Ok(Some(refusal::SESSIONS_FULL));
+            return Ok(Some(Refusal::SessionsFull));
         }
         let held = match self.keys.get(key) {
             Some(held) => *held,
@@ -239,7 +239,7 @@ impl Counts {
                 held
             }
         };
-        Ok((held >= defaults::MAX_KEY_SESSIONS).then_some(refusal::KEY_SESSIONS_FULL))
+        Ok((held >= defaults::MAX_KEY_SESSIONS).then_some(Refusal::KeySessionsFull))
     }
 
     /// A new session of `key`, which [`Counts::full`] let through.
@@ -269,7 +269,7 @@ fn admit(
     sessions: &BTreeMap<ByName, Held>,
     counts: &mut Counts,
     request: &Request,
-) -> (InputRef, Result<Held, u32>) {
+) -> (InputRef, Result<Held, Refusal>) {
     let held = match sessions.get(&by_name(&request.session)) {
         Some(held) => Ok(*held),
         None => held(&request.session),
@@ -284,27 +284,27 @@ fn admit(
         sequence: request.sequence,
     };
     let Ok(held) = held else {
-        return (input, Err(refusal::UNREADABLE));
+        return (input, Err(Refusal::Unreadable));
     };
     let admitted = match held.mark() {
         // A duplicate first, even in an expired session: the leader
         // answers it from the window.
-        Some(mark) if request.sequence <= mark.sequence => Err(refusal::SEQUENCE),
+        Some(mark) if request.sequence <= mark.sequence => Err(Refusal::Sequence),
         Some(mark) if base.time > mark.time.saturating_add(defaults::SESSION_EXPIRY_MS) => {
-            Err(refusal::EXPIRED)
+            Err(Refusal::Expired)
         }
-        Some(mark) if request.sequence != mark.sequence + 1 => Err(refusal::SEQUENCE),
+        Some(mark) if request.sequence != mark.sequence + 1 => Err(Refusal::Sequence),
         Some(_) => Ok(held),
         None if request.session.t0.abs_diff(base.time) > defaults::SESSION_SKEW_MS => {
-            Err(refusal::STALE_SESSION)
+            Err(Refusal::StaleSession)
         }
-        None if request.sequence != 1 => Err(refusal::SEQUENCE),
+        None if request.sequence != 1 => Err(Refusal::Sequence),
         // Neither held nor created by an earlier step: this one creates
         // it, within the caps.
         None => match counts.full(&request.session.key) {
             Ok(None) => Ok(held),
             Ok(Some(code)) => Err(code),
-            Err(Corrupt) => Err(refusal::UNREADABLE),
+            Err(Corrupt) => Err(Refusal::Unreadable),
         },
     };
     (input, admitted)
@@ -335,8 +335,13 @@ fn run_batch(agent: AgentId, batch: Batch) -> Vec<u8> {
         }
         let limit = match &input {
             Input::Request(request) => limit(&base, request.instance, request.method),
-            Input::Message(message) => limit(&base, message.instance, message.method),
-            Input::Admin(_) | Input::Ack { .. } | Input::Sweep => 0,
+            Input::Message(message) => match &message.body {
+                Body::Call {
+                    instance, method, ..
+                } => limit(&base, *instance, *method),
+                Body::Reply { .. } => 0,
+            },
+            Input::Failed { .. } | Input::Admin(_) | Input::Ack { .. } | Input::Sweep => 0,
         };
         if gas() < limit + reserve {
             break;
@@ -351,7 +356,7 @@ fn run_batch(agent: AgentId, batch: Batch) -> Vec<u8> {
                     if let Held::Absent = held {
                         creates = Some(request.session.key);
                     }
-                    let step = command(
+                    let step = Step::Ran(command(
                         &base,
                         index,
                         input,
@@ -359,7 +364,7 @@ fn run_batch(agent: AgentId, batch: Batch) -> Vec<u8> {
                         request.instance,
                         request.method,
                         &request.arguments,
-                    );
+                    ));
                     let mark = SessionMark {
                         sequence: request.sequence,
                         time: base.time,
@@ -370,37 +375,12 @@ fn run_batch(agent: AgentId, batch: Batch) -> Vec<u8> {
                     )
                 }
             },
-            Input::Message(message) => {
-                let input = InputRef::Message {
-                    from: message.from,
-                    sequence: message.sequence,
-                };
-                let mark = match pairs.get(&message.from) {
-                    Some(mark) => Ok(Some(*mark)),
-                    None => record::<u64>(&keys::pair_in(message.from)),
-                };
-                let refusal = match mark {
-                    Err(Corrupt) => Some(refusal::UNREADABLE),
-                    Ok(mark) if message.sequence != mark.unwrap_or(0) + 1 => {
-                        Some(refusal::SEQUENCE)
-                    }
-                    Ok(_) => None,
-                };
-                if let Some(code) = refusal {
-                    (Step::Refused { input, code }, None)
-                } else {
-                    let step = command(
-                        &base,
-                        index,
-                        input,
-                        Principal::Agent(message.from),
-                        message.instance,
-                        message.method,
-                        &message.arguments,
-                    );
-                    (step, Some(Mark::Pair(message.from, message.sequence)))
-                }
-            }
+            Input::Message(message) => self::message(&base, &pairs, index, message),
+            Input::Failed {
+                from,
+                sequence,
+                awaiting,
+            } => failed_in_refine(&pairs, from, sequence, awaiting),
             Input::Admin(admin) => (self::admin(admin), None),
             Input::Ack { to, sequence } => (acknowledge(to, sequence), None),
             Input::Sweep => (sweep(base.time), None),
@@ -449,6 +429,98 @@ fn limit(base: &Base, instance: InstanceId, method: MethodId) -> u64 {
         })
 }
 
+/// Why a message from `from` at `sequence` is out of its pair's order, if
+/// it is.
+fn out_of_order(pairs: &BTreeMap<AgentId, u64>, from: AgentId, sequence: u64) -> Option<Refusal> {
+    let mark = match pairs.get(&from) {
+        Some(mark) => Ok(Some(*mark)),
+        None => record::<u64>(&keys::pair_in(from)),
+    };
+    match mark {
+        Err(Corrupt) => Some(Refusal::Unreadable),
+        Ok(mark) if sequence != mark.unwrap_or(0) + 1 => Some(Refusal::Sequence),
+        Ok(_) => None,
+    }
+}
+
+/// A message in its pair's order: a call runs as a command of the
+/// sending agent's, and a reply is consumed with no await to resume. A
+/// call that awaits gets its reply among the step's messages, whatever
+/// its outcome.
+fn message(
+    base: &Base,
+    pairs: &BTreeMap<AgentId, u64>,
+    index: u32,
+    message: Message,
+) -> (Step, Option<Mark>) {
+    let (from, sequence) = (message.from, message.sequence);
+    let input = InputRef::Message { from, sequence };
+    if let Some(code) = out_of_order(pairs, from, sequence) {
+        return (Step::Refused { input, code }, None);
+    }
+    let (run, awaiting) = match message.body {
+        Body::Call {
+            instance,
+            method,
+            arguments,
+            awaiting,
+        } => {
+            let caller = Principal::Agent(from);
+            let run = command(base, index, input, caller, instance, method, &arguments);
+            (run, awaiting)
+        }
+        Body::Reply { .. } => (consumed(input, Outcome::Done(Vec::new())), None),
+    };
+    let run = answered(run, from, awaiting);
+    (Step::Ran(run), Some(Mark::Pair(from, sequence)))
+}
+
+/// A message the leader asserts failed in refine, in its pair's order:
+/// consumed as failed without running, and answered when it awaits.
+fn failed_in_refine(
+    pairs: &BTreeMap<AgentId, u64>,
+    from: AgentId,
+    sequence: u64,
+    awaiting: Option<Await>,
+) -> (Step, Option<Mark>) {
+    let input = InputRef::Message { from, sequence };
+    if let Some(code) = out_of_order(pairs, from, sequence) {
+        return (Step::Refused { input, code }, None);
+    }
+    let outcome = Outcome::Failed {
+        code: Failure::InRefine,
+        detail: Vec::new(),
+    };
+    let run = answered(consumed(input, outcome), from, awaiting);
+    (Step::Ran(run), Some(Mark::Pair(from, sequence)))
+}
+
+/// `run`, with the reply to agent `to`'s request awaiting at `awaiting`,
+/// if any, after its own messages: the step's outcome.
+fn answered(mut run: Run, to: AgentId, awaiting: Option<Await>) -> Run {
+    if let Some(awaiting) = awaiting {
+        let answer = run.outcome.clone().into();
+        run.messages.push(Outgoing {
+            to,
+            body: Body::Reply { awaiting, answer },
+        });
+    }
+    run
+}
+
+/// A consumed step that runs nothing.
+fn consumed(input: InputRef, outcome: Outcome) -> Run {
+    Run {
+        input,
+        outcome,
+        instances: Vec::new(),
+        writes: Vec::new(),
+        messages: Vec::new(),
+        attests: Vec::new(),
+        gas_used: 0,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn command(
     base: &Base,
@@ -458,7 +530,7 @@ fn command(
     instance: InstanceId,
     method: MethodId,
     arguments: &[u8],
-) -> Step {
+) -> Run {
     let mut invocation = Invocation::new(base, index, Kind::Command);
     let outcome = invocation.top(caller, instance, method, arguments);
     let Invocation {
@@ -469,7 +541,7 @@ fn command(
         gas_used,
         ..
     } = invocation;
-    let run = match outcome {
+    match outcome {
         Outcome::Done(reply) => {
             let overlay = frames.pop().expect("the step overlay");
             let writes: Vec<Write> = overlay
@@ -495,8 +567,7 @@ fn command(
             attests: Vec::new(),
             gas_used,
         },
-    };
-    Step::Ran(run)
+    }
 }
 
 fn run_query(agent: AgentId, query: Query) -> Outcome {
@@ -514,15 +585,10 @@ fn run_query(agent: AgentId, query: Query) -> Outcome {
 /// An acknowledgement from agent `to`: unsequenced, never refused, and
 /// it runs no actor. Accumulate clears the outbox through `sequence`.
 fn acknowledge(to: AgentId, sequence: u64) -> Step {
-    Step::Ran(Run {
-        input: InputRef::Ack { to, sequence },
-        outcome: Outcome::Done(Vec::new()),
-        instances: Vec::new(),
-        writes: Vec::new(),
-        messages: Vec::new(),
-        attests: Vec::new(),
-        gas_used: 0,
-    })
+    Step::Ran(consumed(
+        InputRef::Ack { to, sequence },
+        Outcome::Done(Vec::new()),
+    ))
 }
 
 /// The expiry rows due at `time`, oldest first, at most
@@ -558,18 +624,13 @@ fn sweep(time: u64) -> Step {
 /// under the step write cap like any step's.
 fn admin(admin: Admin) -> Step {
     let failed = |code| {
-        Step::Ran(Run {
-            input: InputRef::Admin,
-            outcome: Outcome::Failed {
+        Step::Ran(consumed(
+            InputRef::Admin,
+            Outcome::Failed {
                 code,
                 detail: Vec::new(),
             },
-            instances: Vec::new(),
-            writes: Vec::new(),
-            messages: Vec::new(),
-            attests: Vec::new(),
-            gas_used: 0,
-        })
+        ))
     };
     let write = match admin {
         Admin::Install {
@@ -579,7 +640,7 @@ fn admin(admin: Admin) -> Step {
             roles,
         } => {
             let Some(installed) = install(program, attestables, roles) else {
-                return failed(failure::UNKNOWN);
+                return failed(Failure::Unknown);
             };
             Write {
                 key: keys::installed(instance),
@@ -592,7 +653,7 @@ fn admin(admin: Admin) -> Step {
         },
     };
     if write.key.len() + write.value.as_ref().map_or(0, Vec::len) > cap::STEP_WRITES {
-        return failed(failure::CAP);
+        return failed(Failure::Cap);
     }
     Step::Ran(Run {
         input: InputRef::Admin,
@@ -693,19 +754,19 @@ impl<'a> Invocation<'a> {
             detail: Vec::new(),
         };
         if arguments.len() > cap::REQUEST {
-            return failed(failure::CAP);
+            return failed(Failure::Cap);
         }
         let installed = match self.installed(instance) {
             Ok(installed) => installed,
             Err(code) => return failed(code),
         };
         let Some(schema) = installed.schema.method(method) else {
-            return failed(failure::UNKNOWN);
+            return failed(Failure::Unknown);
         };
         if schema.kind == Kind::Attestable
             || (self.entry == Kind::Query && schema.kind != Kind::Query)
         {
-            return failed(failure::UNKNOWN);
+            return failed(Failure::Unknown);
         }
         let gas = schema
             .gas
@@ -717,10 +778,10 @@ impl<'a> Invocation<'a> {
                 match ended {
                     Ended::Replied(reply) => Outcome::Done(reply),
                     Ended::Failed(detail) => Outcome::Failed {
-                        code: failure::HANDLER,
+                        code: Failure::Handler,
                         detail,
                     },
-                    Ended::Forbidden => failed(failure::FORBIDDEN),
+                    Ended::Forbidden => failed(Failure::Forbidden),
                 }
             }
             Err((code, used)) => {
@@ -739,29 +800,29 @@ impl<'a> Invocation<'a> {
         method: MethodId,
         arguments: &[u8],
         gas: u64,
-    ) -> Result<(Ended, u64), (u32, u64)> {
+    ) -> Result<(Ended, u64), (Failure, u64)> {
         let installed = self.installed(instance).map_err(|code| (code, 0))?;
         let schema = installed
             .schema
             .method(method)
-            .ok_or((failure::UNKNOWN, 0))?;
+            .ok_or((Failure::Unknown, 0))?;
         if let Some(role) = &schema.role {
             let required = installed.role(role).expect("checked at install");
-            if self.role(&caller).map_err(|_| (failure::TRAPPED, 0))? != Some(required) {
+            if self.role(&caller).map_err(|_| (Failure::Trapped, 0))? != Some(required) {
                 return Ok((Ended::Forbidden, 0));
             }
         }
         if self.stack.contains(&instance) {
-            return Err((failure::CYCLE, 0));
+            return Err((Failure::Cycle, 0));
         }
         if self.stack.len() >= MAX_DEPTH {
-            return Err((failure::DEPTH, 0));
+            return Err((Failure::Depth, 0));
         }
         let kind = schema.kind;
         let mut machine =
             Machine::acquire(&installed.program.0).map_err(|unavailable| match unavailable {
-                Unavailable::Full => (failure::DEPTH, 0),
-                Unavailable::Missing => (failure::UNKNOWN, 0),
+                Unavailable::Full => (Failure::Depth, 0),
+                Unavailable::Missing => (Failure::Unknown, 0),
             })?;
         machine.set_gas(gas);
         machine.set_register(7, u64::from(method.0));
@@ -794,8 +855,8 @@ impl<'a> Invocation<'a> {
 
     /// An instance's installed record: actors cannot write system keys,
     /// so the refine's committed writes and applied state hold it.
-    fn installed(&self, instance: InstanceId) -> Result<Rc<Installed>, u32> {
-        self.base.installed(instance)?.ok_or(failure::UNKNOWN)
+    fn installed(&self, instance: InstanceId) -> Result<Rc<Installed>, Failure> {
+        self.base.installed(instance)?.ok_or(Failure::Unknown)
     }
 
     fn role(&self, principal: &Principal) -> Result<Option<u8>, Corrupt> {
@@ -812,26 +873,26 @@ impl<'a> Invocation<'a> {
         instance: InstanceId,
         kind: Kind,
         arguments: &[u8],
-    ) -> Result<Ended, u32> {
+    ) -> Result<Ended, Failure> {
         let mut outcome: Option<Ended> = None;
         loop {
             match machine.invoke() {
                 Exit::Halt => return Ok(outcome.unwrap_or(Ended::Replied(Vec::new()))),
-                Exit::OutOfGas => return Err(failure::OUT_OF_GAS),
-                Exit::Panic | Exit::Fault => return Err(failure::TRAPPED),
+                Exit::OutOfGas => return Err(Failure::OutOfGas),
+                Exit::Panic | Exit::Fault => return Err(Failure::Trapped),
                 Exit::Host(id) => {
                     if !known(id) {
                         if !machine.charge(price::OPERATION) {
-                            return Err(failure::OUT_OF_GAS);
+                            return Err(Failure::OutOfGas);
                         }
                         machine.set_register(7, code::WHAT);
                         continue;
                     }
                     if !abi::allowed(kind, id) {
-                        return Err(failure::TRAPPED);
+                        return Err(Failure::Trapped);
                     }
                     if !machine.charge(price::of(id)) {
-                        return Err(failure::OUT_OF_GAS);
+                        return Err(Failure::OutOfGas);
                     }
                     self.operation(
                         machine,
@@ -859,7 +920,7 @@ impl<'a> Invocation<'a> {
         kind: Kind,
         arguments: &[u8],
         outcome: &mut Option<Ended>,
-    ) -> Result<(), u32> {
+    ) -> Result<(), Failure> {
         let r: [u64; 13] = core::array::from_fn(|index| machine.register(index));
         match id {
             op::INPUT => {
@@ -868,7 +929,7 @@ impl<'a> Invocation<'a> {
             }
             op::REPLY | op::FAIL => {
                 if outcome.is_some() {
-                    return Err(failure::TRAPPED);
+                    return Err(Failure::Trapped);
                 }
                 let bytes = read(machine, r[7], r[8], cap::REPLY)?;
                 *outcome = Some(if id == op::REPLY {
@@ -917,7 +978,7 @@ impl<'a> Invocation<'a> {
                 };
                 self.written += key.len() + value.as_ref().map_or(0, Vec::len);
                 if self.written > cap::STEP_WRITES {
-                    return Err(failure::CAP);
+                    return Err(Failure::Cap);
                 }
                 self.frames.last_mut().expect("a frame").insert(key, value);
                 machine.set_register(7, code::OK);
@@ -941,11 +1002,11 @@ impl<'a> Invocation<'a> {
                     .schema
                     .method(method)
                     .map(|schema| schema.kind)
-                    .ok_or(failure::UNKNOWN)?;
+                    .ok_or(Failure::Unknown)?;
                 if callee_kind == Kind::Attestable
                     || (kind == Kind::Query && callee_kind != Kind::Query)
                 {
-                    return Err(failure::TRAPPED);
+                    return Err(Failure::Trapped);
                 }
                 self.frames.push(BTreeMap::new());
                 let effects = (self.messages.len(), self.attests.len(), self.written);
@@ -962,17 +1023,17 @@ impl<'a> Invocation<'a> {
                 let frame = self.frames.pop().expect("the call's frame");
                 *self.nested.last_mut().expect("the caller's entry") += used;
                 if !machine.charge(used) {
-                    return Err(failure::OUT_OF_GAS);
+                    return Err(Failure::OutOfGas);
                 }
-                let (bytes, status) = match ended {
+                let (bytes, failed) = match ended {
                     Ended::Replied(reply) => {
                         self.frames.last_mut().expect("a frame").extend(frame);
-                        (reply, 0)
+                        (reply, None)
                     }
-                    Ended::Failed(detail) => (detail, failure::HANDLER),
-                    Ended::Forbidden => (Vec::new(), failure::FORBIDDEN),
+                    Ended::Failed(detail) => (detail, Some(Failure::Handler)),
+                    Ended::Forbidden => (Vec::new(), Some(Failure::Forbidden)),
                 };
-                if status != 0 {
+                if failed.is_some() {
                     let (messages, attests, written) = effects;
                     self.messages.truncate(messages);
                     self.attests.truncate(attests);
@@ -980,18 +1041,21 @@ impl<'a> Invocation<'a> {
                 }
                 copy_out(machine, &bytes, r[11], 0, r[12])?;
                 machine.set_register(7, bytes.len() as u64);
-                machine.set_register(8, u64::from(status));
+                machine.set_register(8, failed.map_or(0, |code| code.code().into()));
             }
             op::SEND => {
                 let call_arguments = read(machine, r[10], r[11], cap::MESSAGE)?;
                 if self.messages.len() == cap::MESSAGES {
-                    return Err(failure::CAP);
+                    return Err(Failure::Cap);
                 }
                 self.messages.push(Outgoing {
                     to: AgentId(r[7] as u32),
-                    instance: InstanceId(r[8] as u32),
-                    method: MethodId(r[9] as u32),
-                    arguments: call_arguments,
+                    body: Body::Call {
+                        instance: InstanceId(r[8] as u32),
+                        method: MethodId(r[9] as u32),
+                        arguments: call_arguments,
+                        awaiting: None,
+                    },
                 });
                 machine.set_register(7, code::OK);
             }
@@ -999,13 +1063,13 @@ impl<'a> Invocation<'a> {
                 let method = MethodId(r[7] as u32);
                 let call_arguments = read(machine, r[8], r[9], cap::REQUEST)?;
                 if self.attests.len() == cap::ATTESTS {
-                    return Err(failure::CAP);
+                    return Err(Failure::Cap);
                 }
-                let program = installed.attestable(method).ok_or(failure::UNKNOWN)?;
+                let program = installed.attestable(method).ok_or(Failure::Unknown)?;
                 let gas = machine.gas();
                 let (output, used) = attestable(&program, &call_arguments, gas)?;
                 if !machine.charge(used) {
-                    return Err(failure::OUT_OF_GAS);
+                    return Err(Failure::OutOfGas);
                 }
                 self.attests.push(Attest {
                     program,
@@ -1148,13 +1212,17 @@ fn random(seed: &[u8; 32], step: u32, draw: u64) -> [u8; 32] {
 /// Run an attestable program in its own machine: arguments in the standard
 /// window, output by the halt convention, no host calls (the node serves
 /// precompiles in place).
-fn attestable(program: &ProgramHash, arguments: &[u8], gas: u64) -> Result<(Vec<u8>, u64), u32> {
+fn attestable(
+    program: &ProgramHash,
+    arguments: &[u8],
+    gas: u64,
+) -> Result<(Vec<u8>, u64), Failure> {
     let mut machine = Machine::acquire(&program.0).map_err(|unavailable| match unavailable {
-        Unavailable::Full => failure::DEPTH,
-        Unavailable::Missing => failure::UNKNOWN,
+        Unavailable::Full => Failure::Depth,
+        Unavailable::Missing => Failure::Unknown,
     })?;
     if !machine.map_read_only(ARGUMENTS, arguments.len() as u64, arguments) {
-        return Err(failure::TRAPPED);
+        return Err(Failure::Trapped);
     }
     machine.set_gas(gas);
     machine.set_register(7, ARGUMENTS);
@@ -1164,13 +1232,13 @@ fn attestable(program: &ProgramHash, arguments: &[u8], gas: u64) -> Result<(Vec<
             let used = gas - machine.gas();
             let len = machine.register(8) as usize;
             if len > cap::REPLY {
-                return Err(failure::CAP);
+                return Err(Failure::Cap);
             }
-            let output = machine.peek(machine.register(7), len).ok_or(failure::CAP)?;
+            let output = machine.peek(machine.register(7), len).ok_or(Failure::Cap)?;
             Ok((output, used))
         }
-        Exit::OutOfGas => Err(failure::OUT_OF_GAS),
-        _ => Err(failure::TRAPPED),
+        Exit::OutOfGas => Err(Failure::OutOfGas),
+        _ => Err(Failure::Trapped),
     }
 }
 
@@ -1180,35 +1248,35 @@ fn key(
     instance: InstanceId,
     address: u64,
     len: u64,
-) -> Result<Vec<u8>, u32> {
+) -> Result<Vec<u8>, Failure> {
     let relative = read(machine, address, len, cap::KEY)?;
     if relative.is_empty() {
-        return Err(failure::TRAPPED);
+        return Err(Failure::Trapped);
     }
     Ok([keys::instance_prefix(instance), relative].concat())
 }
 
 /// The actor's bytes, at most `limit`: a longer buffer exceeds a cap and
 /// an unreadable one traps.
-fn read(machine: &mut Machine, address: u64, len: u64, limit: usize) -> Result<Vec<u8>, u32> {
-    let len = usize::try_from(len).map_err(|_| failure::CAP)?;
+fn read(machine: &mut Machine, address: u64, len: u64, limit: usize) -> Result<Vec<u8>, Failure> {
+    let len = usize::try_from(len).map_err(|_| Failure::Cap)?;
     if len > limit {
-        return Err(failure::CAP);
+        return Err(Failure::Cap);
     }
     if !machine.charge(len as u64 * price::PER_BYTE) {
-        return Err(failure::OUT_OF_GAS);
+        return Err(Failure::OutOfGas);
     }
-    machine.peek(address, len).ok_or(failure::TRAPPED)
+    machine.peek(address, len).ok_or(Failure::Trapped)
 }
 
-fn write(machine: &mut Machine, address: u64, bytes: &[u8]) -> Result<(), u32> {
+fn write(machine: &mut Machine, address: u64, bytes: &[u8]) -> Result<(), Failure> {
     if !machine.charge(bytes.len() as u64 * price::PER_BYTE) {
-        return Err(failure::OUT_OF_GAS);
+        return Err(Failure::OutOfGas);
     }
     if machine.poke(address, bytes) {
         Ok(())
     } else {
-        Err(failure::TRAPPED)
+        Err(Failure::Trapped)
     }
 }
 
@@ -1218,7 +1286,7 @@ fn copy_out(
     address: u64,
     offset: u64,
     capacity: u64,
-) -> Result<(), u32> {
+) -> Result<(), Failure> {
     let offset = usize::try_from(offset)
         .unwrap_or(usize::MAX)
         .min(bytes.len());

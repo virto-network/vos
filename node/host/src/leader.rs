@@ -1,7 +1,9 @@
 //! An agent's leader loop, while this node leads its group. Per batch, in
 //! order: refine against the applied state, a dry run of accumulate on the
 //! same state, the result proposed, and once this replica has applied it,
-//! the replies, the outbox's deliveries and the acknowledgements.
+//! the replies, the outbox's deliveries and the acknowledgements. Between
+//! batches, the outbox's windows go again: in rounds, or at once when a
+//! receiver finds this agent behind it.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
@@ -9,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use smol::future::FutureExt;
 use vos_raft::Role;
-use vos_wire::abi::refusal;
+use vos_wire::abi::Refusal;
 use vos_wire::batch::{Batch, Message, Request, Work};
 use vos_wire::ids::{AgentId, SessionId};
 use vos_wire::records::{SessionMark, unstored};
@@ -33,11 +35,11 @@ const CLOCK_BOUND: u64 = 10_000;
 /// once: entries, and bytes, at least one entry.
 const WINDOW: usize = 256;
 const WINDOW_BYTES: usize = 1 << 20;
-/// How long a target's acknowledgement may stay behind its outbox before
-/// its window goes again, doubled each time that brings nothing, up to
-/// [`MAX_ROUND`].
-const ROUND: Duration = Duration::from_secs(1);
-const MAX_ROUND: Duration = Duration::from_secs(16);
+/// A round's wait doubles up to this many times its first: the node's
+/// `resend_round`.
+const MAX_ROUNDS: u32 = 16;
+/// How often a receiver's `Behind` may send a target's window again.
+const BEHIND_EVERY: Duration = Duration::from_millis(100);
 /// How often an idle leader looks again at its first expiry row: a clock
 /// stepped forward does not move a timer.
 const SWEEP_RECHECK: Duration = Duration::from_secs(5);
@@ -58,23 +60,30 @@ struct Window {
     since: Instant,
     /// How long after `since` it goes again.
     wait: Duration,
+    /// The first wait, to which an acknowledgement brings it back.
+    round: Duration,
     /// Which replica of the target it goes through, when it goes through
-    /// one: the same for a whole window, another each time it goes again.
+    /// one: the same for a whole window, another each round.
     turn: u64,
+    /// When a receiver's `Behind` last sent it again.
+    behind: Option<Instant>,
 }
 
 impl Window {
-    /// A window from `acked` on, through the replica `turn` picks first:
-    /// each node starts at its own, so senders spread over the replicas.
-    fn new(acked: u64, turn: u64) -> Self {
+    /// A window from `acked` on, through the replica `turn` picks first,
+    /// each node starting at its own so senders spread over the replicas,
+    /// going again after `round` while its acknowledgement stays behind.
+    fn new(acked: u64, turn: u64, round: Duration) -> Self {
         Self {
             acked,
             last: acked,
             sent: VecDeque::new(),
             bytes: 0,
             since: Instant::now(),
-            wait: ROUND,
+            wait: round,
+            round,
             turn,
+            behind: None,
         }
     }
 
@@ -98,7 +107,7 @@ impl Window {
             self.bytes -= size;
         }
         self.since = Instant::now();
-        self.wait = ROUND;
+        self.wait = self.round;
     }
 
     fn full(&self, size: usize) -> bool {
@@ -111,13 +120,35 @@ impl Window {
         (self.last > self.acked).then(|| self.since + self.wait)
     }
 
-    /// Go back to the acknowledgement, waiting longer before the next time.
+    /// Go back to the acknowledgement: what was sent past it goes again.
     fn rewind(&mut self) {
         self.sent.clear();
         self.bytes = 0;
         self.since = Instant::now();
-        self.wait = (self.wait * 2).min(MAX_ROUND);
+    }
+
+    /// A round: rewind, through the next replica, and wait longer before
+    /// the next.
+    fn round(&mut self) {
+        self.rewind();
+        self.wait = (self.wait * 2).min(self.round * MAX_ROUNDS);
         self.turn += 1;
+    }
+
+    /// A receiver's `Behind`: rewind at once, while the outbox holds more
+    /// than was acknowledged, at most once every [`BEHIND_EVERY`]. Whether
+    /// it did. Nothing in the frame moves the window: a stale one only
+    /// sends again what the receiver drops at its mark.
+    fn behind(&mut self, now: Instant) -> bool {
+        let recent = self
+            .behind
+            .is_some_and(|at| now.saturating_duration_since(at) < BEHIND_EVERY);
+        if self.last <= self.acked || recent {
+            return false;
+        }
+        self.behind = Some(now);
+        self.rewind();
+        true
     }
 }
 
@@ -200,6 +231,9 @@ struct Leader {
     marks: HashMap<AgentId, u64>,
     /// What this leadership sent each target.
     windows: HashMap<AgentId, Window>,
+    /// The message that last failed alone, by its sender and sequence:
+    /// failing alone again, it is asserted failed.
+    failing: Option<(AgentId, u64)>,
     max_inputs: usize,
     backoff: Duration,
     /// The inputs the last batch requeued because its result applied as no
@@ -239,6 +273,7 @@ impl Leader {
             trailing: false,
             marks: HashMap::new(),
             windows: HashMap::new(),
+            failing: None,
             max_inputs: inner.settings.max_inputs,
             backoff: BACKOFF,
             skipped: false,
@@ -268,7 +303,7 @@ impl Leader {
                     return false;
                 }
             }
-            self.rounds(inner);
+            self.rounds(inner, agent);
             if !leads(&shared.state(), self.term) {
                 break;
             }
@@ -300,7 +335,8 @@ impl Leader {
                     fault.message()
                 );
                 // A window all the same, whose round reads it again.
-                let mut window = Window::new(0, u64::from(inner.number));
+                let round = inner.settings.resend_round;
+                let mut window = Window::new(0, u64::from(inner.number), round);
                 window.last = 1;
                 self.windows.entry(to).or_insert(window);
             }
@@ -335,6 +371,10 @@ impl Leader {
             if sweep == Some(Duration::ZERO) {
                 smol::future::yield_now().await;
                 return Some(vec![Pending::Sweep]);
+            }
+            // A receiver found this agent behind it: windows go again.
+            if !lock(&agent.queue).behind.is_empty() {
+                return Some(Vec::new());
             }
             let woken = async { Some(Some(agent.woken.recv().await.is_ok())) };
             let term = self.term;
@@ -499,7 +539,7 @@ impl Leader {
         let senders: BTreeSet<AgentId> = pending
             .iter()
             .filter_map(|item| match item {
-                Pending::Message(message) => Some(message.from),
+                Pending::Message(message) | Pending::Failed(message) => Some(message.from),
                 _ => None,
             })
             .collect();
@@ -531,6 +571,7 @@ impl Leader {
             version: self.version,
             time,
             seed: seed(),
+            budget: inner.settings.refine_gas,
             inputs: pending.iter().map(Pending::input).collect(),
         };
         let blobs: Vec<BlobRef> = pending
@@ -599,9 +640,9 @@ impl Leader {
     /// What of `pending` goes into the batch, the marks of its messages'
     /// senders read. A message at or below its pair mark applied already:
     /// it is dropped, and the mark acknowledged instead. One past the next
-    /// is a gap, dropped for the sender's next delivery: only each sender's
-    /// next in turn goes in. Of a target's acknowledgements, the highest
-    /// goes in, if above the one applied.
+    /// is a gap, dropped, and its sender told it is behind: only each
+    /// sender's next in turn goes in. Of a target's acknowledgements, the
+    /// highest goes in, if above the one applied.
     fn filter(&self, inner: &Inner, snapshot: &Snapshot, pending: Vec<Pending>) -> Vec<Pending> {
         let mut acks: HashMap<AgentId, u64> = HashMap::new();
         let mut next: HashMap<AgentId, u64> = HashMap::new();
@@ -610,16 +651,22 @@ impl Leader {
         let mut applied_acks: HashMap<AgentId, u64> = HashMap::new();
         let mut taken_acks: HashMap<AgentId, usize> = HashMap::new();
         let mut kept: Vec<Pending> = Vec::with_capacity(pending.len());
+        let mut behind: BTreeSet<AgentId> = BTreeSet::new();
         for item in pending {
             match &item {
-                Pending::Message(message) => {
+                Pending::Message(message) | Pending::Failed(message) => {
                     let mark = self.marks[&message.from];
                     let expected = next.entry(message.from).or_insert(mark + 1);
                     if message.sequence <= mark {
                         raise(&mut acks, message.from, mark);
                         continue;
                     }
-                    if message.sequence != *expected {
+                    if message.sequence > *expected {
+                        behind.insert(message.from);
+                        continue;
+                    }
+                    // A second copy of one this batch holds.
+                    if message.sequence < *expected {
                         continue;
                     }
                     *expected += 1;
@@ -652,6 +699,9 @@ impl Leader {
             kept.push(item);
         }
         self.acknowledge(inner, acks);
+        for sender in behind {
+            inner.behind(sender, self.id);
+        }
         kept
     }
 
@@ -906,7 +956,10 @@ impl Leader {
     }
 
     /// A batch the agent program failed: requeue it shorter, until one input
-    /// alone fails, which then fails its caller or is reported.
+    /// alone fails. A request or an admin command then fails its caller.
+    /// A message goes again, and failing alone a second time, on the state
+    /// of a later batch, is asserted failed: consumed for good, so a
+    /// transient failure never consumes one. Anything else is dropped.
     fn fail(&mut self, inner: &Inner, agent: &Agent, mut pending: Vec<Pending>, failed: String) {
         if pending.len() > 1 {
             tracing::warn!(
@@ -919,6 +972,30 @@ impl Leader {
             return;
         }
         let input = pending.pop().expect("one input");
+        if let Pending::Message(message) = input {
+            let named = (message.from, message.sequence);
+            let again = if self.failing == Some(named) {
+                self.failing = None;
+                tracing::error!(
+                    agent = self.id.0,
+                    from = message.from.0,
+                    sequence = message.sequence,
+                    "the agent program fails on a message alone again ({failed}); it is consumed as failed"
+                );
+                Pending::Failed(message)
+            } else {
+                self.failing = Some(named);
+                tracing::warn!(
+                    agent = self.id.0,
+                    from = message.from.0,
+                    sequence = message.sequence,
+                    "the agent program fails on a message alone ({failed}); it goes again"
+                );
+                Pending::Message(message)
+            };
+            inner.requeue(agent, vec![again]);
+            return;
+        }
         tracing::error!(
             agent = self.id.0,
             "the agent program fails on one input alone ({failed}); it is dropped"
@@ -956,7 +1033,7 @@ impl Leader {
                 Pending::Request { request, answer } => {
                     let answered = match step {
                         Step::Refused {
-                            code: refusal::SEQUENCE,
+                            code: Refusal::Sequence,
                             ..
                         } => self
                             .duplicate(&snapshot, &request)
@@ -980,23 +1057,23 @@ impl Leader {
                     }));
                 }
                 Pending::Sweep => {}
-                Pending::Message(message) => match step {
+                Pending::Message(message) | Pending::Failed(message) => match step {
                     Step::Ran(_) => {
                         self.marks.insert(message.from, message.sequence);
                         raise(&mut acks, message.from, message.sequence);
                     }
                     Step::Refused {
-                        code: refusal::SEQUENCE,
+                        code: Refusal::Sequence,
                         ..
                     } => {
                         // At or below the mark, a duplicate: acknowledge
-                        // it. Above, a gap: drop it for the sender's next
-                        // delivery.
+                        // it. Above, a gap: drop it, and tell the sender it
+                        // is behind.
                         match self.mark(&snapshot, message.from) {
                             Ok(mark) if message.sequence <= mark => {
                                 raise(&mut acks, message.from, mark);
                             }
-                            Ok(_) => {}
+                            Ok(_) => inner.behind(message.from, self.id),
                             Err(fault) => tracing::error!(
                                 agent = self.id.0,
                                 "a pair mark is unreadable: {}",
@@ -1008,7 +1085,7 @@ impl Leader {
                         agent = self.id.0,
                         from = message.from.0,
                         sequence = message.sequence,
-                        code,
+                        ?code,
                         "a message was refused and dropped"
                     ),
                     Step::Swept { .. } => tracing::error!(
@@ -1100,10 +1177,11 @@ impl Leader {
         let acked = read::<u64>(snapshot, self.id, &keys::acked(to))?.unwrap_or(0);
         let last = read::<u64>(snapshot, self.id, &keys::pair_out(to))?.unwrap_or(0);
         let turn = u64::from(inner.number);
+        let round = inner.settings.resend_round;
         let window = self
             .windows
             .entry(to)
-            .or_insert_with(|| Window::new(acked, turn));
+            .or_insert_with(|| Window::new(acked, turn, round));
         window.ack(acked);
         window.last = window.last.max(last);
         let after = window.through();
@@ -1129,7 +1207,7 @@ impl Leader {
                 );
                 break;
             };
-            let size = outgoing.arguments.len() + 64;
+            let size = outgoing.body.payload_len() + 64;
             let window = self.windows.get_mut(&to).expect("the target's window");
             if window.full(size) {
                 break;
@@ -1137,9 +1215,7 @@ impl Leader {
             let message = Message {
                 from: self.id,
                 sequence,
-                instance: outgoing.instance,
-                method: outgoing.method,
-                arguments: outgoing.arguments,
+                body: outgoing.body,
             };
             // Nowhere to send it now, or a full queue here: it waits in the
             // outbox for the next round.
@@ -1153,23 +1229,33 @@ impl Leader {
     }
 
     /// Send again, from its acknowledgement, the window of each target
-    /// whose acknowledgement stayed behind its outbox for its wait.
-    fn rounds(&mut self, inner: &Inner) {
+    /// whose acknowledgement stayed behind its outbox for its wait, and of
+    /// each that found this agent behind it.
+    fn rounds(&mut self, inner: &Inner, agent: &Agent) {
         let now = Instant::now();
+        let behind = std::mem::take(&mut lock(&agent.queue).behind);
         self.windows
             .retain(|_, window| window.last > window.acked || !window.sent.is_empty());
-        let due: Vec<AgentId> = self
-            .windows
-            .iter()
-            .filter(|(_, window)| window.due().is_some_and(|due| due <= now))
-            .map(|(to, _)| *to)
-            .collect();
-        if due.is_empty() {
+        let mut again = BTreeSet::new();
+        for (to, window) in &mut self.windows {
+            if window.due().is_some_and(|due| due <= now) {
+                window.round();
+                again.insert(*to);
+            }
+        }
+        for to in behind {
+            if !again.contains(&to)
+                && let Some(window) = self.windows.get_mut(&to)
+                && window.behind(now)
+            {
+                again.insert(to);
+            }
+        }
+        if again.is_empty() {
             return;
         }
         let snapshot = inner.store.snapshot();
-        for to in due {
-            self.windows.get_mut(&to).expect("a window due").rewind();
+        for to in again {
             if let Err(fault) = self.deliver(inner, &snapshot, to) {
                 tracing::error!(
                     agent = self.id.0,
@@ -1204,4 +1290,59 @@ fn first_expiry(snapshot: &Snapshot, agent: AgentId) -> Result<Option<(u64, Sess
 fn raise(acks: &mut HashMap<AgentId, u64>, from: AgentId, sequence: u64) {
     let ack = acks.entry(from).or_insert(0);
     *ack = (*ack).max(sequence);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ROUND: Duration = Duration::from_secs(1);
+
+    /// A window with `sent` sent past an acknowledgement of 2, the outbox
+    /// holding through 5.
+    fn window(sent: &[u64]) -> Window {
+        let mut window = Window::new(2, 0, ROUND);
+        window.last = 5;
+        for sequence in sent {
+            window.sent.push_back((*sequence, 10));
+            window.bytes += 10;
+        }
+        window
+    }
+
+    /// A receiver's `Behind` sends the window again from its
+    /// acknowledgement at once, through the same replica and with the same
+    /// wait, and again only once `BEHIND_EVERY` has passed.
+    #[test]
+    fn behind_rewinds_at_most_once_every_interval() {
+        let mut window = window(&[3, 4, 5]);
+        let now = Instant::now();
+        assert!(window.behind(now));
+        assert_eq!(window.through(), 2, "back to the acknowledgement");
+        assert_eq!((window.bytes, window.turn, window.wait), (0, 0, ROUND));
+        window.sent.push_back((3, 10));
+        assert!(!window.behind(now + BEHIND_EVERY / 2));
+        assert_eq!(window.through(), 3, "a second one too soon is ignored");
+        assert!(window.behind(now + BEHIND_EVERY));
+        assert_eq!(window.through(), 2);
+    }
+
+    /// A `Behind` with nothing past the acknowledgement does nothing: a
+    /// stale one.
+    #[test]
+    fn behind_with_everything_acknowledged_does_nothing() {
+        let mut window = window(&[3, 4, 5]);
+        window.ack(5);
+        assert!(!window.behind(Instant::now()));
+        assert_eq!(window.behind, None);
+    }
+
+    /// A round rewinds through the next replica and doubles its wait.
+    #[test]
+    fn a_round_rewinds_through_the_next_replica() {
+        let mut window = window(&[3, 4]);
+        window.round();
+        assert_eq!(window.through(), 2);
+        assert_eq!((window.turn, window.wait), (1, ROUND * 2));
+    }
 }

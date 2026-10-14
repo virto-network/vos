@@ -32,9 +32,11 @@
 
 use alloc::vec::Vec;
 
+use scale::{Decode, Encode};
+
 /// The kind of an invocation, which decides the operations it may use.
 /// Its index is the kind the agent passes in φ8.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, scale::Encode, scale::Decode)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum Kind {
     /// A `&mut self` handler, through the log.
     #[codec(index = 0)]
@@ -52,11 +54,11 @@ pub mod op {
     /// length.
     pub const INPUT: u64 = 0x500;
     /// φ7/φ8 the reply. The handler's outcome: a second `REPLY` or `FAIL`
-    /// fails the invocation with [`super::failure::TRAPPED`]. Halting
+    /// fails the invocation with [`super::Failure::Trapped`]. Halting
     /// without either replies empty.
     pub const REPLY: u64 = 0x501;
     /// φ7/φ8 the handler's encoded error: the step fails with
-    /// [`super::failure::HANDLER`] and this detail.
+    /// [`super::Failure::Handler`] and this detail.
     pub const FAIL: u64 = 0x502;
     /// φ7 level (0 error … 4 trace, as the Gray Paper's `log`), φ8/φ9 the
     /// message.
@@ -91,8 +93,8 @@ pub mod op {
     ///
     /// φ7 instance, φ8 method, φ9/φ10 arguments, φ11 output, φ12 capacity →
     /// φ7 the length of the callee's reply or error detail, φ8 0 when it
-    /// replied, [`super::failure::HANDLER`] when it failed (its writes are
-    /// discarded), or [`super::failure::FORBIDDEN`] when the calling
+    /// replied, [`super::Failure::Handler`] when it failed (its writes are
+    /// discarded), or [`super::Failure::Forbidden`] when the calling
     /// instance lacks the callee's role (the callee never ran). Any other
     /// failure of the callee fails the whole step. A query may call only
     /// queries.
@@ -102,7 +104,7 @@ pub mod op {
     pub const SEND: u64 = 0x521;
     /// φ7 an attestable method of this instance's package, φ8/φ9
     /// arguments, φ10 output, φ11 capacity → φ7 the output's length, φ8 0
-    /// or a [`super::failure`] code. The agent runs the program the package
+    /// or a [`super::Failure`] code. The agent runs the program the package
     /// bound to the method at install, never one the caller names. As with
     /// `CALL`, the output should hold [`super::cap::REPLY`] bytes.
     pub const ATTEST: u64 = 0x522;
@@ -167,7 +169,7 @@ pub mod price {
     pub const RANDOM: u64 = 6_000;
     pub const CALLER: u64 = 6_000;
     pub const LOG: u64 = 4_000;
-    pub const SEND: u64 = 4_000;
+    pub const SEND: u64 = 5_000;
     pub const GET: u64 = 20_000;
     pub const SCAN: u64 = 60_000;
     pub const PUT: u64 = 64_000;
@@ -210,15 +212,17 @@ pub mod cap {
     pub const WORK_RESULT: usize = 4 << 20;
 
     /// The most one step adds to a work result: its input, a new session's
-    /// whole, its reply, writes, messages and attests at their caps, with
-    /// the framing of as many writes and instances as its gas can pay for.
-    /// An install's record is under [`STEP_WRITES`] too.
+    /// whole, its reply, writes, messages and attests at their caps, a
+    /// request's reply to its sender, with the framing of as many writes
+    /// and instances as its gas can pay for. An install's record is under
+    /// [`STEP_WRITES`] too.
     pub const STEP_RESULT: usize = 128
         + REPLY
         + STEP_WRITES
         + (MAX_HANDLER_GAS / price::PUT) as usize * 9
         + (1 + (MAX_HANDLER_GAS / price::MACHINE) as usize) * 12
-        + MESSAGES * (MESSAGE + 16)
+        + MESSAGES * (MESSAGE + 40)
+        + (REPLY + 40)
         + ATTESTS * (REQUEST + REPLY + 40);
 
     // Every step fits an empty result, so a batch always makes progress.
@@ -236,46 +240,99 @@ pub mod code {
     pub const HUH: u64 = u64::MAX - 8;
 }
 
-/// Why a step failed, in [`crate::result::Outcome::Failed`], or why a call
-/// returned an error, in φ8 of `CALL` and `ATTEST`. A failed step consumes
-/// its input.
-pub mod failure {
-    /// The handler failed; the detail is its encoded error.
-    pub const HANDLER: u32 = 1;
-    /// The invocation trapped, faulted, used an operation outside its kind
-    /// or a buffer it could not reach.
-    pub const TRAPPED: u32 = 2;
-    pub const OUT_OF_GAS: u32 = 3;
-    /// A per-step cap was exceeded.
-    pub const CAP: u32 = 4;
-    /// The caller lacks the handler's role.
-    pub const FORBIDDEN: u32 = 5;
-    /// No such instance or method.
-    pub const UNKNOWN: u32 = 6;
-    /// The callee is already on the call stack.
-    pub const CYCLE: u32 = 7;
-    /// No inner machine was left for the callee.
-    pub const DEPTH: u32 = 8;
+/// A closed set of codes, each a `u32` in registers and on the wire.
+macro_rules! codes {
+    (
+        $(#[$meta:meta])*
+        pub enum $name:ident {
+            $($(#[$variant_meta:meta])* $variant:ident = $code:literal,)*
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        #[repr(u32)]
+        pub enum $name {
+            $($(#[$variant_meta])* $variant = $code,)*
+        }
+
+        impl $name {
+            pub const fn code(self) -> u32 {
+                self as u32
+            }
+
+            pub const fn from_code(code: u32) -> Option<Self> {
+                match code {
+                    $($code => Some(Self::$variant),)*
+                    _ => None,
+                }
+            }
+        }
+
+        impl Encode for $name {
+            fn encode_to(&self, buf: &mut Vec<u8>) {
+                self.code().encode_to(buf);
+            }
+        }
+
+        impl Decode for $name {
+            fn decode(data: &[u8]) -> Result<(Self, usize), scale::DecodeError> {
+                let (code, used) = u32::decode(data)?;
+                let value = Self::from_code(code).ok_or(scale::DecodeError::InvalidCode(code))?;
+                Ok((value, used))
+            }
+        }
+    };
 }
 
-/// Why refine refused an input, in [`crate::result::Step::Refused`]. A
-/// refused input is not consumed: no mark advances.
-pub mod refusal {
-    /// Out of its session's or pair's order.
-    pub const SEQUENCE: u32 = 1;
-    /// Its session expired.
-    pub const EXPIRED: u32 = 2;
-    /// Its session's or pair's mark is state the agent cannot read: an
-    /// operator must look, and resending cannot help.
-    pub const UNREADABLE: u32 = 3;
-    /// A new session whose creation time is too far from the agent's:
-    /// start one with a time near it.
-    pub const STALE_SESSION: u32 = 4;
-    /// A new session, while the agent holds as many as it may: none is
-    /// created until some are collected.
-    pub const SESSIONS_FULL: u32 = 5;
-    /// A new session, while its key holds as many as it may at the agent.
-    pub const KEY_SESSIONS_FULL: u32 = 6;
+codes! {
+    /// Why a step failed, in [`crate::result::Outcome::Failed`], or why a
+    /// call returned an error, in φ8 of `CALL` and `ATTEST`. A failed step
+    /// consumes its input.
+    pub enum Failure {
+        /// The handler failed; the detail is its encoded error.
+        Handler = 1,
+        /// The invocation trapped, faulted, used an operation outside its
+        /// kind or a buffer it could not reach.
+        Trapped = 2,
+        OutOfGas = 3,
+        /// A per-step cap was exceeded.
+        Cap = 4,
+        /// The caller lacks the handler's role.
+        Forbidden = 5,
+        /// No such instance or method.
+        Unknown = 6,
+        /// The callee is already on the call stack.
+        Cycle = 7,
+        /// No inner machine was left for the callee.
+        Depth = 8,
+        /// The agent program failed on the message alone, twice, each
+        /// time on fresh state: its leader asserted the failure in the
+        /// batch, and the handler never ran.
+        InRefine = 9,
+    }
+}
+
+codes! {
+    /// Why refine refused an input, in [`crate::result::Step::Refused`]. A
+    /// refused input is not consumed: no mark advances.
+    pub enum Refusal {
+        /// Out of its session's or pair's order.
+        Sequence = 1,
+        /// Its session expired.
+        Expired = 2,
+        /// Its session's or pair's mark is state the agent cannot read: an
+        /// operator must look, and resending cannot help.
+        Unreadable = 3,
+        /// A new session whose creation time is too far from the agent's:
+        /// start one with a time near it.
+        StaleSession = 4,
+        /// A new session, while the agent holds as many as it may: none is
+        /// created until some are collected.
+        SessionsFull = 5,
+        /// A new session, while its key holds as many as it may at the
+        /// agent.
+        KeySessionsFull = 6,
+    }
 }
 
 /// The host calls each kind of program may make, and what a JAM node does

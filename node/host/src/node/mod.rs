@@ -45,7 +45,7 @@ use crate::{lock, seed, timeout};
 
 pub(crate) use config::Settings;
 pub use config::{CallError, Config, Error, Peers, ReplaceError, Reply};
-pub(crate) use directory::{Directory, Order};
+pub(crate) use directory::Directory;
 use open::write_token;
 pub use open::{ADMIN_TOKEN, NODE_KEY, STORE, wall_clock};
 pub(crate) use queue::{Agent, Answered, Pending};

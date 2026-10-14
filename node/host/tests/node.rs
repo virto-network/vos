@@ -16,8 +16,8 @@ use vos_checker::programs::Programs;
 use vos_checker::spaces::IN_PROCESS_WAIT;
 use vos_node::store::EntryKind;
 use vos_node::{CallError, Config, Hooks, Node, Reply};
-use vos_wire::abi::refusal;
-use vos_wire::batch::{Batch, Input, Message, Request};
+use vos_wire::abi::Refusal;
+use vos_wire::batch::{Batch, Body, Input, Message, Request};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session};
 use vos_wire::records::unstored;
 use vos_wire::result::Outcome;
@@ -235,8 +235,8 @@ fn a_failing_refine_isolates_its_input() {
     assert_eq!(done(replies[0].clone()), 1);
     assert_eq!(replies[1], Ok(Reply::Failed));
     // The dropped request leaves a gap in its session.
-    assert_eq!(replies[2], Ok(Reply::Refused(refusal::SEQUENCE)));
-    assert_eq!(replies[3], Ok(Reply::Refused(refusal::SEQUENCE)));
+    assert_eq!(replies[2], Ok(Reply::Refused(Refusal::Sequence)));
+    assert_eq!(replies[3], Ok(Reply::Refused(Refusal::Sequence)));
     assert_eq!(value(&node, &programs, agent), 1);
 }
 
@@ -289,7 +289,7 @@ fn the_leader_answers_a_duplicate_from_the_reply_window() {
     assert_eq!(call(&first), Ok(Reply::TooOld));
     let mut gap = session.request(increment, 1u64);
     gap.sequence += 1;
-    assert_eq!(call(&gap), Ok(Reply::Refused(refusal::SEQUENCE)));
+    assert_eq!(call(&gap), Ok(Reply::Refused(Refusal::Sequence)));
     assert_eq!(
         value(&node, &programs, agent),
         5 + defaults::REPLY_WINDOW,
@@ -546,9 +546,12 @@ fn a_gap_is_dropped_unacknowledged_until_it_fills() {
     let message = |sequence: u64, by: u64| Message {
         from: sender,
         sequence,
-        instance: COUNTER,
-        method: programs.method("increment"),
-        arguments: by.encode(),
+        body: Body::Call {
+            instance: COUNTER,
+            method: programs.method("increment"),
+            arguments: by.encode(),
+            awaiting: None,
+        },
     };
     let before = applied(&node, target);
     node.deliver(target, message(2, 20)).unwrap();

@@ -4,7 +4,7 @@
 
 use vos_testkit::programs::{actor, method, schema};
 use vos_testkit::{InstallError, Testkit, decode, program_hash};
-use vos_wire::abi::failure;
+use vos_wire::abi::Failure;
 use vos_wire::ids::{AgentId, InstanceId, Principal};
 use vos_wire::result::Outcome;
 use vos_wire::{Decode, Encode};
@@ -17,7 +17,7 @@ const ALICE: Principal = Principal::Client([1; 32]);
 fn reply<T: Decode>(outcome: Outcome) -> T {
     match outcome {
         Outcome::Done(bytes) => decode(&bytes).expect("decodes"),
-        Outcome::Failed { code, detail } => panic!("failed with {code}: {detail:?}"),
+        Outcome::Failed { code, detail } => panic!("failed with {code:?}: {detail:?}"),
     }
 }
 
@@ -101,7 +101,7 @@ fn a_counter_keeps_its_state_and_fails_without_effects() {
     assert_eq!(
         overflow.outcome,
         Outcome::Failed {
-            code: failure::HANDLER,
+            code: Failure::Handler,
             detail: vec![0],
         },
         "the handler's own error, encoded"
@@ -131,7 +131,7 @@ fn roles_gate_handlers() {
     assert_eq!(
         denied.outcome,
         Outcome::Failed {
-            code: failure::FORBIDDEN,
+            code: Failure::Forbidden,
             detail: vec![],
         }
     );
@@ -163,7 +163,7 @@ fn a_ledger_moves_balances_in_a_table() {
     assert_eq!(
         short.outcome,
         Outcome::Failed {
-            code: failure::HANDLER,
+            code: Failure::Handler,
             detail: vec![0],
         }
     );
@@ -228,7 +228,7 @@ fn nested_calls_commit_with_their_caller_and_see_it_as_their_principal() {
     assert_eq!(
         refused.outcome,
         Outcome::Failed {
-            code: failure::HANDLER,
+            code: Failure::Handler,
             detail: vec![0],
         }
     );
@@ -245,7 +245,7 @@ fn a_call_cycle_fails_the_step() {
     assert_eq!(
         step.outcome,
         Outcome::Failed {
-            code: failure::CYCLE,
+            code: Failure::Cycle,
             detail: vec![],
         }
     );
@@ -290,7 +290,7 @@ fn an_attestable_program_may_not_make_host_calls() {
     assert_eq!(
         step.outcome,
         Outcome::Failed {
-            code: failure::TRAPPED,
+            code: Failure::Trapped,
             detail: vec![],
         }
     );
