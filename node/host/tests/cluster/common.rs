@@ -385,7 +385,7 @@ impl WithholdBlobs {
 }
 
 impl Hooks for WithholdBlobs {
-    fn serve_blob(&self) -> bool {
+    fn serve_blob(&self, _: NodeNumber, _: &[u8; 32]) -> bool {
         !self.0.load(Ordering::SeqCst)
     }
 }

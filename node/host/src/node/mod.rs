@@ -33,7 +33,7 @@ use vos_wire::records::unstored;
 use vos_wire::result::{Outcome, Step, Write};
 
 use crate::Hooks;
-use crate::blobs::Blobs;
+use crate::blobs::{Blobs, Keep};
 use crate::executor::Executors;
 use crate::group::{self, DryRun, Input as GroupInput, Local, Shared};
 use crate::pvm::{self, Fault};
@@ -73,6 +73,13 @@ const REPLACED: Duration = Duration::from_secs(30);
 /// by the node that took over.
 const REPLACED_ELSEWHERE: Duration = Duration::from_secs(2);
 
+/// A blob groups here asked for: which, and how it is kept once it
+/// arrives.
+struct Wanted {
+    groups: BTreeSet<AgentId>,
+    keep: Keep,
+}
+
 pub(crate) struct Inner {
     pub(crate) store: Fjall,
     pub(crate) blobs: Blobs,
@@ -98,8 +105,8 @@ pub(crate) struct Inner {
     /// The agents this node replicates.
     pub(crate) runs: Mutex<HashMap<AgentId, Arc<Run>>>,
     dry_runs: Mutex<HashMap<AgentId, DryRun>>,
-    /// The groups each blob asked for is wanted by.
-    wanted: Mutex<HashMap<[u8; 32], BTreeSet<AgentId>>>,
+    /// The blobs groups here asked for.
+    wanted: Mutex<HashMap<[u8; 32], Wanted>>,
     pub(crate) drops: crate::peer::Drops,
     /// The low 24 bits of the next agent id this node makes.
     next_agent: smol::lock::Mutex<u32>,
@@ -418,22 +425,31 @@ impl Inner {
             .then_some(kept.writes)
     }
 
-    /// Agent `id`'s group waits for `hashes`: tell it when they arrive.
-    pub(crate) fn want(&self, id: AgentId, hashes: &[[u8; 32]]) {
+    /// Agent `id`'s group waits for `hashes`, to be kept as `keep` says
+    /// (the longer, if another group waits too): tell it when they arrive.
+    pub(crate) fn want(&self, id: AgentId, hashes: &[[u8; 32]], keep: Keep) {
         let mut wanted = lock(&self.wanted);
         for hash in hashes {
-            wanted.entry(*hash).or_default().insert(id);
+            let wanted = wanted.entry(*hash).or_insert(Wanted {
+                groups: BTreeSet::new(),
+                keep,
+            });
+            wanted.groups.insert(id);
+            wanted.keep = wanted.keep.max(keep);
         }
     }
 
-    /// Whether a group here asked for `hash`.
-    pub(crate) fn is_wanted(&self, hash: &[u8; 32]) -> bool {
-        lock(&self.wanted).contains_key(hash)
+    /// How a blob some group here asked for is kept, if one did.
+    pub(crate) fn wanted(&self, hash: &[u8; 32]) -> Option<Keep> {
+        lock(&self.wanted).get(hash).map(|wanted| wanted.keep)
     }
 
     /// The groups that wanted `hash`, which arrived.
     pub(crate) fn arrived(&self, hash: &[u8; 32]) {
-        let waiting = lock(&self.wanted).remove(hash).unwrap_or_default();
+        let waiting = lock(&self.wanted)
+            .remove(hash)
+            .map(|wanted| wanted.groups)
+            .unwrap_or_default();
         for id in waiting {
             if let Some(run) = self.run(id) {
                 let _ = run.inbox.try_send(GroupInput::Blobs);

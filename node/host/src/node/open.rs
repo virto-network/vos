@@ -329,7 +329,7 @@ fn collect_blobs(inner: &Inner, stopped: &mpsc::Receiver<()>) {
         let stopping = || inner.closing.load(Ordering::SeqCst);
         match smol::block_on(inner.blobs.collect(
             &inner.storage,
-            inner.settings.blob_horizon,
+            inner.settings.blob_horizons,
             &stopping,
         )) {
             Ok(collected) => {

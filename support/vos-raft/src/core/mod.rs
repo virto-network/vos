@@ -395,7 +395,12 @@ impl<N: NodeId> Core<N> {
     /// the host's monotonic clock), with a seed for its election jitter.
     pub fn new(cfg: Config<N>, recovered: Recovered<N>, now: u64, seed: u64) -> Self {
         let meta = recovered.meta;
-        let mut log = LogView::new(meta.snap_last_index, meta.snap_last_term, cfg.cache_bytes);
+        let mut log = LogView::new(
+            meta.snap_last_index,
+            meta.snap_last_term,
+            cfg.cache_bytes,
+            cfg.payload_weight,
+        );
         let live: Vec<LogEntry<N>> = recovered
             .entries
             .into_iter()

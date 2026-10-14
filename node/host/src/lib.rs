@@ -46,7 +46,7 @@ use smol::future::FutureExt;
 use vos_wire::Encode;
 use vos_wire::batch::Batch;
 use vos_wire::ids::AgentId;
-use vos_wire::peer::CreationRecord;
+use vos_wire::peer::{CreationRecord, NodeNumber};
 
 /// The identity of the agent `record` creates: its record's hash. Clients
 /// sign for it, and its replica group is named by it.
@@ -119,10 +119,19 @@ pub trait Hooks: Send + Sync {
         false
     }
 
-    /// Before this node serves a peer a blob: false withholds it, as a
-    /// node lacking it would.
-    fn serve_blob(&self) -> bool {
+    /// As a request from node `to` for the blob `hash` arrives: false
+    /// withholds it, as a node lacking it would.
+    fn serve_blob(&self, to: NodeNumber, hash: &[u8; 32]) -> bool {
+        let _ = (to, hash);
         true
+    }
+
+    /// Before a replica reads the blob holding `agent`'s work result at
+    /// `index` to apply it: true reads it as missing, as a store that lost
+    /// it would.
+    fn lose_blob(&self, agent: AgentId, index: u64) -> bool {
+        let _ = (agent, index);
+        false
     }
 
     /// Before a leader sends a snapshot chunk: how long it waits first, as

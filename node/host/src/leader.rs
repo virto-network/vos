@@ -18,7 +18,7 @@ use vos_wire::records::{SessionMark, unstored};
 use vos_wire::result::{Outcome, Outgoing, Step, WorkResult, Write as StateWrite};
 use vos_wire::{expiry, keys};
 
-use crate::blobs::blob_ref;
+use crate::blobs::{Held, Keep, blob_ref};
 use crate::group::{DryRun, Local, Shared, State};
 use crate::node::{Agent, Answered, CallError, Inner, Pending, Reply, ran, read, reply};
 use crate::pvm::{self, Fault};
@@ -756,17 +756,18 @@ impl Leader {
         inner.stats.step_gas.record(step_gas / inputs.max(1));
         // The dry run: a failure here isolates its input off the log. A
         // large result is stored meanwhile, as the blob its entry names.
-        let (payload, writes) = if output.len() >= LARGE_RESULT {
+        let (payload, writes, held) = if output.len() >= LARGE_RESULT {
             let stored = store_result(inner, Arc::new(output.clone()));
             let dried = self.dry_run(inner, shared, snapshot, batch, output);
             let (stored, writes) = smol::future::zip(stored, dried).await;
+            let (blob, held) = stored?;
             let entry = LogEntry {
                 term: 0,
                 kind: EntryKind::LargeResult,
-                blobs: [vec![stored?], blobs].concat(),
+                blobs: [vec![blob], blobs].concat(),
                 body: Vec::new(),
             };
-            (entry.payload(), writes?)
+            (entry.payload(), writes?, Some(held))
         } else {
             let entry = LogEntry {
                 term: 0,
@@ -778,7 +779,7 @@ impl Leader {
             let writes = self
                 .dry_run(inner, shared, snapshot, batch, entry.body)
                 .await?;
-            (payload, writes)
+            (payload, writes, None)
         };
         let version = writes
             .iter()
@@ -811,6 +812,7 @@ impl Leader {
                 term,
                 payload,
                 answer,
+                held,
             },
         );
         if !proposed {
@@ -1291,18 +1293,20 @@ impl Leader {
     }
 }
 
-/// Store a large work result as a blob, hashed on an executor. Its age keeps
-/// it until the entry naming it is written, and that entry's log row from
-/// then on: once the log is compacted past it, it ages out.
-async fn store_result(inner: &Inner, result: Arc<Vec<u8>>) -> Result<BlobRef, Fault> {
+/// Store a large work result as a blob, hashed on an executor, held until
+/// the entry naming it is written. That entry's log row keeps it from then
+/// on, and once the log is compacted past it, it goes within its brief
+/// horizon.
+async fn store_result(inner: &Inner, result: Arc<Vec<u8>>) -> Result<(BlobRef, Held), Fault> {
     let hashed = Arc::clone(&result);
     let blob = ran(inner.executors.run(move || Ok(blob_ref(&hashed))).await)?;
+    let held = inner.blobs.hold(blob.hash);
     inner
         .blobs
-        .put(blob, result)
+        .put_kept(blob, result, Keep::Named)
         .await
         .map_err(|error| Fault::Storage(format!("the blob store failed: {error}")))?;
-    Ok(blob)
+    Ok((blob, held))
 }
 
 /// The first row of `agent`'s expiry index: the oldest bucket, and its

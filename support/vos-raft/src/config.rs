@@ -27,10 +27,18 @@ pub struct Config<N: NodeId> {
     /// what the host applied durably, past the log's start that make a
     /// compaction due. Default: 16.
     pub compact_hysteresis: u64,
-    /// Bytes of those entries, as the cache counts them, that make a
-    /// compaction due. A host that compacts short of the bound keeps well under this,
-    /// or every commit makes one due. Default: 64 MiB.
+    /// Bytes those entries weigh ([`Self::payload_weight`]) that make a
+    /// compaction due. A host that compacts short of the bound keeps well
+    /// under this, or every commit makes one due. Default: 64 MiB.
     pub compact_bytes: u64,
+    /// What a data entry's payload weighs toward `compact_bytes` and in the
+    /// tail a compaction keeps
+    /// ([`Core::compaction_point`](crate::core::Core::compaction_point)),
+    /// besides a fixed overhead per entry. A host whose payloads name data
+    /// it keeps apart, such as a blob, adds that data's length, so its log
+    /// compacts by what it holds. The cache and appends count the payload
+    /// alone. Default: the payload's length.
+    pub payload_weight: fn(&[u8]) -> u64,
     /// Ask for pre-votes before an election, so a flapping partition does
     /// not inflate terms. Default: `true`.
     pub pre_vote: bool,
@@ -75,6 +83,7 @@ impl<N: NodeId> Config<N> {
             heartbeat_interval_ms: 50,
             compact_hysteresis: 16,
             compact_bytes: 64 << 20,
+            payload_weight: |payload| payload.len() as u64,
             pre_vote: true,
             max_pending_reads: 1024,
             pre_candidate_misses_before_revert: 3,

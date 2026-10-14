@@ -30,7 +30,7 @@ use std::time::Duration;
 use vos_checker::Random;
 use vos_checker::crash::{Round, Rounds, tear};
 use vos_node::NoHooks;
-use vos_node::blobs::{Blobs, blob_ref};
+use vos_node::blobs::{Blobs, Horizons, Keep, blob_ref};
 use vos_node::raft::recovery_cut;
 use vos_node::storage::{Change, StorageThread};
 use vos_node::store::{Fjall, LogEntry};
@@ -102,9 +102,9 @@ fn writer(dir: &Path) {
         if index.is_multiple_of(3) {
             // The append arrives ahead of its blob.
             smol::block_on(writer.commit(vec![append])).unwrap();
-            smol::block_on(blobs.put(blob, bytes)).unwrap();
+            smol::block_on(blobs.put_kept(blob, bytes, Keep::Named)).unwrap();
         } else {
-            smol::block_on(blobs.put(blob, bytes)).unwrap();
+            smol::block_on(blobs.put_kept(blob, bytes, Keep::Named)).unwrap();
             smol::block_on(writer.commit(vec![append])).unwrap();
         }
         println!("appended {index}");
@@ -131,7 +131,11 @@ fn writer(dir: &Path) {
                 }]);
                 log_start = through;
             }
-            smol::block_on(blobs.collect(&writer, Duration::ZERO, &|| false)).unwrap();
+            let horizons = Horizons {
+                named: Duration::ZERO,
+                aged: Duration::ZERO,
+            };
+            smol::block_on(blobs.collect(&writer, horizons, &|| false)).unwrap();
         }
     }
 }

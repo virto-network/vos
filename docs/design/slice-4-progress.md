@@ -372,3 +372,55 @@ faster native BLAKE2b in the node is its next lever.
 - Opus: GO with fixes, all in: the scan page bound, the prices with keys
   of zeros, the escape reference test, the build retry, and bounded
   catch-up builds.
+
+## Step 4.4c: result blobs' retention, and a lost blob
+
+**Built:**
+- **Blobs have a keep class** in their index row.
+  - **Named** blobs go 60 s after their last put or touch once nothing
+    names them (`named_blob_horizon`): a result the leader stores, and
+    any blob a follower fetches for an entry, whose row it writes
+    first.
+  - **Aged** blobs keep the 1 h horizon: install programs, and programs
+    staged for a snapshot.
+  - An old or unknown keep reads as Aged.
+- **A result blob is held** in memory from the leader's put until a
+  write reaches its entry, so no timing guards that window. Collection
+  skips a held blob, and the writer checks again before it removes one.
+- **vos-raft weighs data entries** with a host function
+  (`Config::payload_weight`, the payload's length by default) toward
+  its compaction bytes and kept tail. The node weighs a large result by
+  its blob, so blobs no longer pile up behind a log the byte trigger
+  thought small. The default weight leaves the simulation's figures
+  unchanged.
+- **A follower asks for each blob once:** a new blob from the leader,
+  and again only after a second, from the next member.
+- **A blob missing under a written row is lost data:** the node halts.
+  - On restart it never cuts an entry at or below the recovered commit:
+    the entry stays in the log, so this replica never votes without it.
+    Its blobs are fetched again from the members that hold them, and
+    nothing applies past it until they come. If no member holds them,
+    the replica stays there, logged as such.
+  - Above the recovered commit the cut stays, for the common case of a
+    row written whose blob was never fetched or reported. A reported
+    entry lost there is acknowledged data lost on disk, which the trust
+    model excludes (core model §5).
+
+**Tests:**
+- the blob store's keeps and holds;
+- one ask per blob;
+- vos-raft's weighted counts;
+- large results making compaction due;
+- a follower turning from a leader that lacks a blob;
+- a replica that loses a committed entry's blob halts, then fetches it
+  again;
+- the review's scenario: a committed entry whose blob one replica lost
+  stays committed through the old leader's loss.
+  - Both tests fail with the old cut.
+
+**Reviewed:** Opus, GO with fixes. The recovery cut's fix was designed
+with Fable.
+
+**Noted:** counting blobs, the default kept tail holds about 4 to 8 large
+results, and a follower further behind takes a snapshot. 4.10 measures
+it.

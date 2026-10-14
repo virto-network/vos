@@ -105,7 +105,7 @@ async fn apply_one(inner: &Arc<Inner>, shared: &Shared, index: u64) -> Result<()
     let writes = match entry.kind {
         EntryKind::Result | EntryKind::LargeResult => {
             let term = entry.term;
-            let body = body(inner, entry, index).await?;
+            let body = body(inner, agent, entry, index).await?;
             let result = WorkResult::decode(&body).ok().map(|(result, _)| result);
             let writes = if inner.hooks.fail_apply(agent, index, &body) {
                 Vec::new()
@@ -162,17 +162,28 @@ pub(crate) fn unpinned(changes: &[Change]) -> Vec<[u8; 32]> {
 }
 
 /// A result entry's body: inline, or the blob a large one names, read off
-/// the runtime thread. An entry is applied only once its blobs are stored
-/// here, and its log row keeps them.
-async fn body(inner: &Inner, entry: LogEntry, index: u64) -> Result<Vec<u8>, Fault> {
+/// the runtime thread.
+///
+/// The entry was written with its blobs, and its log row keeps them: a blob
+/// missing is data the store lost, which no retry mends, so the node halts.
+/// On its restart the recovery cut keeps a committed entry, its blobs
+/// fetched again from the members, and takes one past the persisted commit,
+/// for the leader to send again ([`crate::raft::recovery_cut`]).
+async fn body(
+    inner: &Inner,
+    agent: AgentId,
+    entry: LogEntry,
+    index: u64,
+) -> Result<Vec<u8>, Fault> {
     let Some(blob) = entry.result_blob().copied() else {
         return Ok(entry.body);
     };
     let blobs = inner.blobs.clone();
+    let lost = inner.hooks.lose_blob(agent, index);
     match inner.offload(move || blobs.get(&blob.hash)).await {
-        Some(Ok(Some(bytes))) => Ok(bytes),
-        Some(Ok(None)) => Err(Fault::Infrastructure(format!(
-            "the result blob of the entry at {index} is missing"
+        Some(Ok(Some(bytes))) if !lost => Ok(bytes),
+        Some(Ok(_)) => Err(Fault::Storage(format!(
+            "the result blob of the entry at {index} is lost"
         ))),
         Some(Err(error)) => Err(Fault::Infrastructure(error.to_string())),
         None => Err(Fault::Infrastructure("a blob read panicked".into())),

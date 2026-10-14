@@ -11,6 +11,7 @@ use vos_wire::result::Outcome;
 
 use super::wall_clock;
 use crate::Hooks;
+use crate::blobs::Horizons;
 use crate::space::Space;
 use crate::tls::IngressTls;
 
@@ -81,13 +82,17 @@ pub struct Config {
     /// are applied durably.
     pub compact_every: u64,
     /// A group's log is compacted once this many bytes of entries past its
-    /// start are applied durably, as its core counts an entry.
+    /// start are applied durably, an entry counting its payload and a large
+    /// result's blob.
     pub compact_bytes: u64,
     /// The most entries a compaction keeps below the point it could
     /// compact to, for a follower a little behind.
     pub compact_tail: u64,
-    /// The most bytes of entries a compaction keeps below that point: well
-    /// under `compact_bytes`, or every commit makes a compaction due.
+    /// The most bytes of entries a compaction keeps below that point,
+    /// counted alike: well under `compact_bytes`, or every commit makes a
+    /// compaction due. Counting large results' blobs, the default keeps
+    /// about four to eight of them, and a follower further behind takes a
+    /// snapshot.
     pub compact_tail_bytes: u64,
     /// How often the node collects its blob store.
     pub blob_collect_every: Duration,
@@ -95,6 +100,12 @@ pub struct Config {
     /// put or touched it within this horizon: long enough for an install's
     /// entry to name the programs its leader alone holds.
     pub blob_horizon: Duration,
+    /// The horizon of a blob a log row names from its first moments: a
+    /// large work result, held from its put until its entry is written, or
+    /// a blob fetched for an entry. A row keeps it from then on, so it goes
+    /// at the first collection this long past its last put or touch once
+    /// the log is compacted past the entry.
+    pub named_blob_horizon: Duration,
     /// About how many bytes of rows one snapshot chunk carries.
     pub snapshot_chunk: usize,
     /// How long a leader waits for a follower to acknowledge a snapshot
@@ -132,6 +143,7 @@ impl Config {
             compact_bytes: 64 << 20,
             blob_collect_every: Duration::from_secs(600),
             blob_horizon: Duration::from_secs(3_600),
+            named_blob_horizon: Duration::from_secs(60),
             compact_tail: 256,
             compact_tail_bytes: 16 << 20,
             snapshot_chunk: 1 << 20,
@@ -160,7 +172,7 @@ pub(crate) struct Settings {
     pub(crate) compact_tail: u64,
     pub(crate) compact_tail_bytes: u64,
     pub(crate) blob_collect_every: Duration,
-    pub(crate) blob_horizon: Duration,
+    pub(crate) blob_horizons: Horizons,
     pub(crate) snapshot_chunk: usize,
     pub(crate) snapshot_timeout_ms: u64,
 }
@@ -184,7 +196,10 @@ impl Settings {
             compact_tail: config.compact_tail,
             compact_tail_bytes: config.compact_tail_bytes,
             blob_collect_every: config.blob_collect_every,
-            blob_horizon: config.blob_horizon,
+            blob_horizons: Horizons {
+                named: config.named_blob_horizon,
+                aged: config.blob_horizon,
+            },
             snapshot_chunk: config.snapshot_chunk,
             snapshot_timeout_ms: config.snapshot_timeout_ms,
         }

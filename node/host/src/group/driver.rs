@@ -17,6 +17,7 @@ use vos_wire::peer::{NodeNumber, PeerMessage, Placement};
 
 use super::snapshot::{INSTALL_IDLE, STREAM_HOLD};
 use super::{Driver, Input, Local, Shared};
+use crate::blobs::Keep;
 use crate::node::Inner;
 use crate::raft::{self, EntryReports};
 use crate::random_u64;
@@ -42,7 +43,8 @@ enum Event {
 impl Driver {
     /// Recover the group from the store, in order: the writer told what is
     /// applied, the log cut at a lost blob, stale epochs dropped, then the
-    /// core.
+    /// core. A committed entry whose blob was lost stays, and waits for it
+    /// as a fresh append would.
     pub(super) async fn start(inner: Arc<Inner>, shared: Arc<Shared>) -> Result<Self, String> {
         let agent = shared.agent;
         let store = &inner.store;
@@ -81,6 +83,7 @@ impl Driver {
         config.heartbeat_interval_ms = settings.heartbeat_ms;
         config.compact_hysteresis = settings.compact_every;
         config.compact_bytes = settings.compact_bytes;
+        config.payload_weight = raft::payload_weight;
         config.snapshot_timeout_ms = settings.snapshot_timeout_ms;
         // The pair heartbeat vouches for an idle group's leader. An idle
         // leader goes round once per check-quorum window, which keeps it
@@ -89,8 +92,26 @@ impl Driver {
         config.check_quorum = true;
         let core = Core::new(config, raft::recovered(rows), 0, random_u64());
         let established = established(&core, inner.number);
+        // The core counts every recovered entry durable, which a committed
+        // one is safe to be; nothing applies past its lost blob meanwhile.
+        let mut reports = EntryReports::default();
+        let mut writes = VecDeque::new();
+        let mut written = last_index;
+        if let Some(&(first, _)) = cut.refetch.first() {
+            tracing::error!(
+                agent = agent.0,
+                index = first,
+                "the store lost the blobs of committed entries from {first}: this replica keeps \
+                 them, so it never votes without them, and fetches the blobs again from its \
+                 members; it applies nothing from {first} on until they come, and stays there \
+                 if no member holds them"
+            );
+            written = first - 1;
+            writes.push_back((raft::RECOVERED, last_index));
+            reports.recovered(cut.refetch);
+        }
         shared.update(|state| {
-            state.written = last_index;
+            state.written = written;
             state.applied = applied;
             state.recovered = recovered;
             state.established = established;
@@ -98,14 +119,16 @@ impl Driver {
         Ok(Self {
             core,
             start: Instant::now(),
-            reports: EntryReports::default(),
-            writes: VecDeque::new(),
+            reports,
+            writes,
             last_index,
             proposals: HashMap::new(),
             reads: HashMap::new(),
             next_token: 0,
-            asked: None,
+            asks: Asks::default(),
             turn: 0,
+            held_proposals: HashMap::new(),
+            held_entries: Vec::new(),
             retired: false,
             handing_over: false,
             shipments: HashMap::new(),
@@ -150,6 +173,8 @@ impl Driver {
         local: smol::channel::Receiver<Local>,
     ) {
         if self.process().await {
+            // Blobs recovery found lost are asked for at once.
+            self.fetch_blobs();
             loop {
                 if self.shared.state().stopped {
                     break;
@@ -164,8 +189,8 @@ impl Driver {
                 let mut sooner = |at: Instant| {
                     wake = Some(wake.map_or(at, |wake| wake.min(at)));
                 };
-                if let Some((asked, _)) = &self.asked {
-                    sooner(*asked + BLOB_RETRY);
+                if let Some(due) = self.asks.due() {
+                    sooner(due);
                 }
                 if let Some(install) = &self.install {
                     sooner(install.since + INSTALL_IDLE);
@@ -302,6 +327,7 @@ impl Driver {
                 term,
                 payload,
                 answer,
+                held,
             } => {
                 if self.core.role() != Role::Leader || self.core.status().current_term != term {
                     let _ = answer.try_send((Err(ProposeError::NotLeader), Instant::now()));
@@ -310,6 +336,9 @@ impl Driver {
                 let token = self.next_token;
                 self.next_token += 1;
                 self.proposals.insert(token, answer);
+                if let Some(held) = held {
+                    self.held_proposals.insert(token, held);
+                }
                 self.core.propose(token, payload);
             }
             Local::Retire => self.retired = true,
@@ -441,6 +470,14 @@ impl Driver {
             }
             Action::SendSnapshot { to, .. } => self.send_snapshot(to),
             Action::Answer(Answer::Propose { token, result }) => {
+                // A held blob stays held until its entry is written, and
+                // touched: its row keeps it from then on.
+                if let Some(held) = self.held_proposals.remove(&token)
+                    && let Ok(index) = result
+                    && index > self.last_index
+                {
+                    self.held_entries.push((index, held));
+                }
                 if let Some(answer) = self.proposals.remove(&token) {
                     let _ = answer.try_send((result, Instant::now()));
                 }
@@ -538,6 +575,12 @@ impl Driver {
             }
         };
         self.reports.written(&write, |hash| stored.contains(hash));
+        // A held blob's entry is written and touched now, or gone in this
+        // write's truncation.
+        let truncated = write.truncate_after;
+        self.held_entries.retain(|(index, _)| {
+            *index > self.last_index && truncated.is_none_or(|after| *index <= after)
+        });
         self.report_ready();
         true
     }
@@ -551,11 +594,20 @@ impl Driver {
         else {
             return;
         };
-        self.core.entries_durable(seq);
+        // The recovered log's entries the core counted durable already.
+        if seq != raft::RECOVERED {
+            self.core.entries_durable(seq);
+        }
         let mut written = None;
         while let Some(&(at, last)) = self.writes.front() {
             if at > seq {
                 break;
+            }
+            if at == raft::RECOVERED {
+                tracing::info!(
+                    agent = self.shared.agent.0,
+                    "the lost blobs of committed entries arrived"
+                );
             }
             written = Some(last);
             self.writes.pop_front();
@@ -623,35 +675,24 @@ impl Driver {
             .spawn(async move { inner.place(agent, placement).await });
     }
 
-    /// Ask for the blobs the group's entries wait for: the leader first,
-    /// then each other member in turn.
+    /// Ask for the blobs the group's entries, or the snapshot it stages,
+    /// wait for: each new one of the leader, which stored any large result
+    /// it proposed, and each one that waited [`BLOB_RETRY`] of the next
+    /// member.
+    ///
+    /// The host never gives up on a blob (vos-raft's `discard_unreported`):
+    /// a replica holding an entry whose blob no member still has waits until
+    /// a restart's recovery cut takes the entry.
     fn fetch_blobs(&mut self) {
-        let mut missing = self.reports.missing();
-        missing.extend(
-            self.install_missing
-                .iter()
-                .filter(|hash| !missing.contains(hash))
-                .copied()
-                .collect::<Vec<_>>(),
-        );
+        let mut missing: BTreeSet<[u8; 32]> = self.reports.missing().into_iter().collect();
+        missing.extend(self.install_missing.iter().copied());
         if missing.is_empty() {
-            self.asked = None;
+            self.asks.clear();
             return;
         }
-        let retry = self
-            .asked
-            .as_ref()
-            .is_some_and(|(at, _)| at.elapsed() >= BLOB_RETRY);
-        let fresh = self
-            .asked
-            .as_ref()
-            .is_none_or(|(_, asked)| missing.iter().any(|hash| !asked.contains(hash)));
-        if !retry && !fresh {
+        if self.inner.network.is_none() {
             return;
         }
-        let Some(network) = &self.inner.network else {
-            return;
-        };
         let me = self.inner.number;
         let others: Vec<NodeNumber> = self
             .inner
@@ -664,34 +705,41 @@ impl Driver {
         if others.is_empty() {
             return;
         }
-        // Blobs not asked for yet go to the leader, which stored any large
-        // result it proposed; a retry turns to the next member.
+        let ask = self.asks.next(&missing, Instant::now());
         let leader = self.shared.state().leader.filter(|leader| *leader != me);
-        let target = match leader {
-            Some(leader) if !retry => leader,
-            _ => {
-                self.turn += 1;
-                others[self.turn % others.len()]
-            }
+        if !ask.fresh.is_empty() {
+            let to = leader.unwrap_or_else(|| self.next_member(&others));
+            self.ask(to, ask.fresh);
+        }
+        if !ask.retry.is_empty() {
+            let to = self.next_member(&others);
+            self.ask(to, ask.retry);
+        }
+    }
+
+    fn next_member(&mut self, others: &[NodeNumber]) -> NodeNumber {
+        self.turn += 1;
+        others[self.turn % others.len()]
+    }
+
+    /// Ask node `to` for `hashes`. A program a staged snapshot waits for is
+    /// kept by its age until the switch pins it; every other blob, by the
+    /// entry naming it.
+    fn ask(&self, to: NodeNumber, hashes: Vec<[u8; 32]>) {
+        let Some(network) = &self.inner.network else {
+            return;
         };
-        // Retries keep their pace while new blobs join the ask.
-        let since = match &self.asked {
-            Some((at, _)) if !retry => *at,
-            _ => Instant::now(),
-        };
-        self.inner.want(self.shared.agent, &missing);
+        let (aged, named): (Vec<[u8; 32]>, Vec<[u8; 32]>) = hashes
+            .iter()
+            .partition(|hash| self.install_missing.contains(hash));
+        self.inner.want(self.shared.agent, &aged, Keep::Aged);
+        self.inner.want(self.shared.agent, &named, Keep::Named);
         let frame = PeerMessage::BlobRequest {
             agent: self.shared.agent,
-            hashes: missing.clone(),
+            hashes,
         }
         .encode();
-        let _ = network.send(
-            target,
-            Class::Requests,
-            u64::from(self.shared.agent.0),
-            frame,
-        );
-        self.asked = Some((since, missing));
+        let _ = network.send(to, Class::Requests, u64::from(self.shared.agent.0), frame);
     }
 }
 
@@ -704,4 +752,93 @@ fn established(core: &Core<NodeNumber>, me: NodeNumber) -> bool {
             .as_ref()
             .is_some_and(|old| old.contains(&me));
     named && status.commit_index >= status.active_config_index.unwrap_or(0)
+}
+
+/// The blobs a group asked for and still waits on, each with when it was
+/// last asked.
+#[derive(Default)]
+pub(super) struct Asks(HashMap<[u8; 32], Instant>);
+
+/// What a group asks for in one round.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct Ask {
+    /// The blobs not asked for yet: of the leader.
+    pub fresh: Vec<[u8; 32]>,
+    /// The blobs that waited the retry interval since they were last asked
+    /// for: of the next member.
+    pub retry: Vec<[u8; 32]>,
+}
+
+impl Asks {
+    /// Of `missing`, what to ask for at `now`, noted as asked then. A blob
+    /// is asked for again only once it waited [`BLOB_RETRY`]: one asked a
+    /// moment ago is not asked again of a member the turn comes back to.
+    pub(super) fn next(&mut self, missing: &BTreeSet<[u8; 32]>, now: Instant) -> Ask {
+        self.0.retain(|hash, _| missing.contains(hash));
+        let mut ask = Ask::default();
+        for hash in missing {
+            match self.0.get(hash) {
+                None => ask.fresh.push(*hash),
+                Some(at) if now.saturating_duration_since(*at) >= BLOB_RETRY => {
+                    ask.retry.push(*hash)
+                }
+                Some(_) => {}
+            }
+        }
+        for hash in ask.fresh.iter().chain(&ask.retry) {
+            self.0.insert(*hash, now);
+        }
+        ask
+    }
+
+    /// When the longest wait comes to the retry interval.
+    pub(super) fn due(&self) -> Option<Instant> {
+        self.0.values().min().map(|at| *at + BLOB_RETRY)
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn set(hashes: &[u8]) -> BTreeSet<[u8; 32]> {
+        hashes.iter().map(|byte| [*byte; 32]).collect()
+    }
+
+    fn ask(fresh: &[u8], retry: &[u8]) -> Ask {
+        let hashes = |bytes: &[u8]| bytes.iter().map(|byte| [*byte; 32]).collect();
+        Ask {
+            fresh: hashes(fresh),
+            retry: hashes(retry),
+        }
+    }
+
+    /// A fresh ask carries only the blobs not asked for yet; a blob asked
+    /// for is asked again only once it waited the retry interval.
+    #[test]
+    fn a_blob_is_asked_for_once_until_a_retry() {
+        let start = Instant::now();
+        let at = |millis: u64| start + Duration::from_millis(millis);
+        let mut asks = Asks::default();
+        assert_eq!(asks.next(&set(&[1, 2]), at(0)), ask(&[1, 2], &[]));
+        assert_eq!(asks.next(&set(&[1, 2]), at(100)), ask(&[], &[]));
+        assert_eq!(asks.next(&set(&[1, 2, 3]), at(200)), ask(&[3], &[]));
+        assert_eq!(asks.due(), Some(at(0) + BLOB_RETRY));
+        // 1 and 2 arrived: 3 waits from its own ask.
+        assert_eq!(asks.next(&set(&[3, 4]), at(1_000)), ask(&[4], &[]));
+        assert_eq!(asks.due(), Some(at(200) + BLOB_RETRY));
+        assert_eq!(asks.next(&set(&[3, 4]), at(1_100)), ask(&[], &[]));
+        assert_eq!(asks.next(&set(&[3, 4, 5]), at(1_200)), ask(&[5], &[3]));
+        assert_eq!(asks.due(), Some(at(1_000) + BLOB_RETRY));
+        assert_eq!(asks.next(&set(&[3, 4, 5]), at(2_000)), ask(&[], &[4]));
+        // A blob that arrived and is missing again is new.
+        assert_eq!(asks.next(&set(&[4]), at(2_100)), ask(&[], &[]));
+        assert_eq!(asks.next(&set(&[3, 4]), at(2_200)), ask(&[3], &[]));
+        asks.clear();
+        assert_eq!(asks.due(), None);
+    }
 }

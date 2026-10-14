@@ -18,6 +18,7 @@ use vos_wire::peer::{
 use vos_wire::{Encode, keys};
 
 use super::{Driver, Local, Shared, programs, unpinned};
+use crate::blobs::Keep;
 use crate::node::Inner;
 use crate::raft;
 use crate::storage::Change;
@@ -347,7 +348,8 @@ impl Driver {
             }
         }
         if !self.install_missing.is_empty() {
-            self.inner.want(self.shared.agent, &self.install_missing);
+            self.inner
+                .want(self.shared.agent, &self.install_missing, Keep::Aged);
             return true;
         }
         let install = self.install.take().expect("an install");

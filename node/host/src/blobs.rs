@@ -14,8 +14,9 @@
 //! segment at the first that is not. The journal recovers a prefix and the
 //! writer indexes in order, so only a segment's tail can be unindexed.
 //!
-//! A blob lives while a log row names it, a pin holds it, or it was put
-//! within a horizon; [`Blobs::collect`] removes the rest.
+//! A blob lives while a log row names it, a pin or a hold keeps it, or it
+//! was put or touched within its horizon; [`Blobs::collect`] removes the
+//! rest. Its horizon is the one for how it is kept ([`Keep`]).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -106,31 +107,129 @@ pub(crate) fn pin_key(hash: &[u8; 32], agent: u32) -> Vec<u8> {
     [&[IndexRow::Pin as u8][..], hash, &agent.to_be_bytes()].concat()
 }
 
-/// Where a blob is.
+/// Which horizon a blob's age keeps it for once no log row names it and no
+/// pin or hold keeps it: blobs differ in how soon a row comes to name them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum Keep {
+    /// A row names it from its first moments: a large work result, held
+    /// from its put until its entry is written, or a blob a replica fetches
+    /// for an entry it wrote first. Its brief horizon lets it go soon after
+    /// the log is compacted past the entry.
+    Named = 0,
+    /// A row comes to name it only later: a program stored for an install
+    /// still queued, or fetched for a snapshot this replica stages.
+    Aged = 1,
+}
+
+impl Keep {
+    /// The keep `byte` names; one this build does not know, the longer.
+    fn from_u8(byte: u8) -> Self {
+        match byte {
+            0 => Self::Named,
+            _ => Self::Aged,
+        }
+    }
+}
+
+/// How long a blob that only its age keeps stays after its last put or
+/// touch, by how it is kept.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Horizons {
+    pub named: Duration,
+    pub aged: Duration,
+}
+
+impl Horizons {
+    /// The times at or before which a blob put or touched has aged out,
+    /// as of `now`.
+    fn cutoffs(self, now: u64) -> Cutoffs {
+        let before = |horizon: Duration| now.saturating_sub(horizon.as_millis() as u64);
+        Cutoffs {
+            named: before(self.named),
+            aged: before(self.aged),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Cutoffs {
+    named: u64,
+    aged: u64,
+}
+
+impl Cutoffs {
+    fn aged_out(self, location: &Location) -> bool {
+        let cutoff = match location.keep {
+            Keep::Named => self.named,
+            Keep::Aged => self.aged,
+        };
+        location.time <= cutoff
+    }
+}
+
+/// Where a blob is, when it was last put or touched, and how it is kept.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Location {
     segment: u64,
     offset: u64,
     len: u64,
     time: u64,
+    keep: Keep,
 }
 
 impl Location {
     fn encode(&self) -> Vec<u8> {
-        [self.segment, self.offset, self.len, self.time]
+        let mut out: Vec<u8> = [self.segment, self.offset, self.len, self.time]
             .iter()
             .flat_map(|field| field.to_be_bytes())
-            .collect()
+            .collect();
+        out.push(self.keep as u8);
+        out
     }
 
+    /// A row of 32 bytes, without its keep, reads as aged: the longer.
     fn decode(bytes: &[u8]) -> Option<Self> {
         let field = |at: usize| Some(u64::from_be_bytes(bytes.get(at..at + 8)?.try_into().ok()?));
+        let keep = bytes
+            .get(32)
+            .map_or(Keep::Aged, |&byte| Keep::from_u8(byte));
         Some(Self {
             segment: field(0)?,
             offset: field(8)?,
             len: field(16)?,
             time: field(24)?,
+            keep,
         })
+    }
+}
+
+/// The blobs held, each with how many holds it has.
+#[derive(Clone, Default)]
+struct Holds(Arc<Mutex<HashMap<[u8; 32], usize>>>);
+
+impl Holds {
+    fn contains(&self, hash: &[u8; 32]) -> bool {
+        lock(&self.0).contains_key(hash)
+    }
+}
+
+/// A hold on a blob: no collection removes it while this lives, whatever
+/// its age.
+pub struct Held {
+    holds: Holds,
+    hash: [u8; 32],
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        let mut holds = lock(&self.holds.0);
+        if let Some(count) = holds.get_mut(&self.hash) {
+            *count -= 1;
+            if *count == 0 {
+                holds.remove(&self.hash);
+            }
+        }
     }
 }
 
@@ -146,6 +245,7 @@ fn sync_dir(dir: &Path) -> Result<()> {
 struct Put {
     blob: BlobRef,
     bytes: Arc<Vec<u8>>,
+    keep: Keep,
     /// Write it again even if it is stored: collection moving it.
     relocate: bool,
     done: smol::channel::Sender<std::result::Result<(), String>>,
@@ -162,10 +262,11 @@ enum Request {
         hashes: Vec<[u8; 32]>,
         done: Answer<Vec<[u8; 32]>>,
     },
-    /// Remove each candidate still not put since `cutoff`, synced: how many.
+    /// Remove each candidate still aged out by `cutoffs` and not held,
+    /// synced: how many.
     Remove {
         candidates: Vec<[u8; 32]>,
-        cutoff: u64,
+        cutoffs: Cutoffs,
         done: Answer<usize>,
     },
 }
@@ -189,6 +290,7 @@ struct Inner {
     collecting: smol::lock::Mutex<()>,
     /// Open segments, for reads.
     files: Mutex<HashMap<u64, Arc<File>>>,
+    holds: Holds,
 }
 
 impl Drop for Inner {
@@ -265,12 +367,14 @@ impl Blobs {
             thread: Mutex::new(None),
             files: Mutex::new(HashMap::new()),
             collecting: smol::lock::Mutex::new(()),
+            holds: Holds::default(),
         });
         let thread = {
             let writer = Writer {
                 dir: inner.dir.clone(),
                 store: store.clone(),
                 index: inner.index.clone(),
+                holds: inner.holds.clone(),
                 segment_bytes,
                 current,
             };
@@ -284,26 +388,50 @@ impl Blobs {
     }
 
     /// Store `bytes`, whose reference the caller computed (on an executor,
-    /// off the writer): answered once the blob is durable and indexed.
+    /// off the writer), kept by its age: answered once the blob is durable
+    /// and indexed.
     pub async fn put(&self, blob: BlobRef, bytes: Arc<Vec<u8>>) -> std::result::Result<(), String> {
-        self.send(blob, bytes, false).await
+        self.put_kept(blob, bytes, Keep::Aged).await
+    }
+
+    /// As [`Self::put`], kept as `keep` says. A blob stored already keeps
+    /// the longer of its keep and this.
+    pub async fn put_kept(
+        &self,
+        blob: BlobRef,
+        bytes: Arc<Vec<u8>>,
+        keep: Keep,
+    ) -> std::result::Result<(), String> {
+        self.send(blob, bytes, keep, false).await
     }
 
     async fn send(
         &self,
         blob: BlobRef,
         bytes: Arc<Vec<u8>>,
+        keep: Keep,
         relocate: bool,
     ) -> std::result::Result<(), String> {
         self.request(|done| {
             Request::Put(Put {
                 blob,
                 bytes,
+                keep,
                 relocate,
                 done,
             })
         })
         .await
+    }
+
+    /// Hold `hash`, stored or about to be: no collection removes it while
+    /// the hold lives.
+    pub fn hold(&self, hash: [u8; 32]) -> Held {
+        *lock(&self.inner.holds.0).entry(hash).or_default() += 1;
+        Held {
+            holds: self.inner.holds.clone(),
+            hash,
+        }
     }
 
     async fn request<T>(
@@ -405,15 +533,16 @@ impl Blobs {
         Ok(out)
     }
 
-    /// Remove what no durable log row names, no pin holds and nobody put
-    /// within `horizon`; delete segments left empty, and move the live
-    /// blobs out of segments under half live, then delete those. `stop`
-    /// ends it early, between its steps, when the node stops: what it did
-    /// by then stands, and the next collection goes on from there.
+    /// Remove what no durable log row names, no pin or hold keeps and
+    /// nobody put or touched within its horizon; delete segments left
+    /// empty, and move the live blobs out of segments under half live,
+    /// then delete those. `stop` ends it early, between its steps, when the
+    /// node stops: what it did by then stands, and the next collection goes
+    /// on from there.
     pub async fn collect(
         &self,
         writer: &StorageThread,
-        horizon: Duration,
+        horizons: Horizons,
         stop: &dyn Fn() -> bool,
     ) -> std::result::Result<Collected, String> {
         let _one = self.inner.collecting.lock().await;
@@ -421,11 +550,11 @@ impl Blobs {
         let store = &self.inner.store;
         let failed = |error: Error| error.to_string();
         let barrier = || writer.commit(vec![Change::Barrier]);
-        // A blob put at or before the cutoff has aged out of the horizon.
-        let cutoff = now().saturating_sub(horizon.as_millis() as u64);
+        // A blob put or touched at or before its cutoff has aged out.
+        let cutoffs = horizons.cutoffs(now());
         let first = store.database().snapshot();
-        // Only a blob aged and unpinned can go: with none, no log row is
-        // read.
+        // Only a blob aged, unpinned and unheld can go: with none, no log
+        // row is read.
         let mut pinned = HashSet::new();
         for row in first.prefix(&self.inner.index, [IndexRow::Pin as u8]) {
             let key = row.key().map_err(failed)?;
@@ -436,7 +565,10 @@ impl Blobs {
             let (key, value) = row.into_inner().map_err(failed)?;
             let hash: [u8; 32] = key[1..].try_into().expect("a location names a hash");
             let location = Location::decode(&value).expect("a location this store wrote");
-            if location.time <= cutoff && !pinned.contains(&hash) {
+            if cutoffs.aged_out(&location)
+                && !pinned.contains(&hash)
+                && !self.inner.holds.contains(&hash)
+            {
                 candidates.push(hash);
             }
         }
@@ -458,12 +590,13 @@ impl Blobs {
             drop(second);
             candidates.retain(|hash| !referenced.contains(hash));
             // The blob writer removes them, synced, in order with puts and
-            // touches: one that refreshed a candidate since keeps it. Dead
-            // blobs leave the index before any segment goes.
+            // touches: one that refreshed a candidate since, or a hold
+            // taken since, keeps it. Dead blobs leave the index before any
+            // segment goes.
             collected.removed = self
                 .request(|done| Request::Remove {
                     candidates,
-                    cutoff,
+                    cutoffs,
                     done,
                 })
                 .await?;
@@ -491,7 +624,8 @@ impl Blobs {
                         hash,
                         len: location.len,
                     };
-                    self.send(blob, Arc::new(bytes), true).await?;
+                    self.send(blob, Arc::new(bytes), location.keep, true)
+                        .await?;
                     collected.moved += 1;
                 }
                 to_delete.push(segment);
@@ -639,11 +773,13 @@ fn recover(
     let time = now();
     while let Some((hash, blob_len)) = record_at(&file, at, len)? {
         if !intact || index.get(location_key(&hash))?.is_none() {
+            // Which keep it had is lost with its row: the longer one.
             let location = Location {
                 segment,
                 offset: at,
                 len: blob_len,
                 time,
+                keep: Keep::Aged,
             };
             batch.insert(index, location_key(&hash), location.encode());
         }
@@ -694,6 +830,7 @@ struct Writer {
     dir: PathBuf,
     store: Fjall,
     index: Keyspace,
+    holds: Holds,
     segment_bytes: u64,
     current: Current,
 }
@@ -726,10 +863,10 @@ impl Writer {
                 }
                 Request::Remove {
                     candidates,
-                    cutoff,
+                    cutoffs,
                     done,
                 } => {
-                    let result = self.remove(&candidates, cutoff);
+                    let result = self.remove(&candidates, cutoffs);
                     let failed = result.is_err();
                     let _ = done.try_send(result.map_err(|error| error.to_string()));
                     if failed {
@@ -782,7 +919,7 @@ impl Writer {
         Ok(stored)
     }
 
-    fn remove(&mut self, candidates: &[[u8; 32]], cutoff: u64) -> Result<usize> {
+    fn remove(&mut self, candidates: &[[u8; 32]], cutoffs: Cutoffs) -> Result<usize> {
         let mut batch = self.store.database().batch();
         let mut removed = 0;
         for hash in candidates {
@@ -790,7 +927,9 @@ impl Writer {
                 .index
                 .get(location_key(hash))?
                 .and_then(|bytes| Location::decode(&bytes));
-            if still.is_some_and(|location| location.time <= cutoff) {
+            if still.is_some_and(|location| cutoffs.aged_out(&location))
+                && !self.holds.contains(hash)
+            {
                 batch.remove(&self.index, location_key(hash));
                 removed += 1;
             }
@@ -809,12 +948,17 @@ impl Writer {
                 .index
                 .get(location_key(&put.blob.hash))?
                 .and_then(|bytes| Location::decode(&bytes));
+            let keep = stored.map_or(put.keep, |stored| stored.keep.max(put.keep));
             if let Some(stored) = stored
                 && !put.relocate
             {
                 // Stored already: a new put refreshes its age, so a
                 // collection running now keeps it.
-                let refreshed = Location { time, ..stored };
+                let refreshed = Location {
+                    time,
+                    keep,
+                    ..stored
+                };
                 batch.insert(
                     &self.index,
                     location_key(&put.blob.hash),
@@ -846,6 +990,7 @@ impl Writer {
                 offset,
                 len: put.bytes.len() as u64,
                 time,
+                keep,
             };
             batch.insert(&self.index, location_key(&put.blob.hash), location.encode());
             wrote = true;
@@ -880,9 +1025,33 @@ mod tests {
     }
 
     fn put(blobs: &Blobs, bytes: &Arc<Vec<u8>>) -> BlobRef {
+        put_kept(blobs, bytes, Keep::Aged)
+    }
+
+    fn put_kept(blobs: &Blobs, bytes: &Arc<Vec<u8>>, keep: Keep) -> BlobRef {
         let blob = blob_ref(bytes);
-        smol::block_on(blobs.put(blob, Arc::clone(bytes))).unwrap();
+        smol::block_on(blobs.put_kept(blob, Arc::clone(bytes), keep)).unwrap();
         blob
+    }
+
+    /// One horizon for every blob.
+    fn horizons(horizon: Duration) -> Horizons {
+        Horizons {
+            named: horizon,
+            aged: horizon,
+        }
+    }
+
+    /// Set `blob`'s last put `ago` before now.
+    fn age(blobs: &Blobs, store: &Fjall, blob: &BlobRef, ago: Duration) {
+        let aged = Location {
+            time: now() - ago.as_millis() as u64,
+            ..blobs.location(&blob.hash).unwrap().unwrap()
+        };
+        store
+            .blobs()
+            .insert(location_key(&blob.hash), aged.encode())
+            .unwrap();
     }
 
     #[test]
@@ -1007,11 +1176,15 @@ mod tests {
 
         // Everything is younger than a day: nothing goes.
         let kept =
-            smol::block_on(blobs.collect(&writer, Duration::from_secs(86_400), &|| false)).unwrap();
+            smol::block_on(
+                blobs.collect(&writer, horizons(Duration::from_secs(86_400)), &|| false),
+            )
+            .unwrap();
         assert_eq!(kept.removed, 0);
         // With no horizon, the unnamed and unpinned blobs go, and segments
         // left empty or sparse are deleted, their live blobs moved.
-        let collected = smol::block_on(blobs.collect(&writer, Duration::ZERO, &|| false)).unwrap();
+        let collected =
+            smol::block_on(blobs.collect(&writer, horizons(Duration::ZERO), &|| false)).unwrap();
         assert_eq!(collected.removed, dead.len());
         assert!(collected.segments_deleted >= 1, "{collected:?}");
         for blob in &dead {
@@ -1057,7 +1230,10 @@ mod tests {
         assert_eq!(touched, vec![kept.hash], "only stored blobs answer");
         let removed = smol::block_on(blobs.request(|done| Request::Remove {
             candidates: vec![kept.hash, dropped.hash],
-            cutoff,
+            cutoffs: Cutoffs {
+                named: cutoff,
+                aged: cutoff,
+            },
             done,
         }))
         .unwrap();
@@ -1085,12 +1261,103 @@ mod tests {
             .unwrap();
         put(&blobs, &data);
         let kept =
-            smol::block_on(blobs.collect(&writer, Duration::from_secs(3_600), &|| false)).unwrap();
+            smol::block_on(blobs.collect(&writer, horizons(Duration::from_secs(3_600)), &|| false))
+                .unwrap();
         assert_eq!(kept.removed, 0);
         assert!(blobs.contains(&blob.hash).unwrap());
         let segment_records = std::fs::metadata(segment_path(&dir.path().join("blobs"), 0))
             .unwrap()
             .len();
         assert_eq!(segment_records, HEADER + 300, "stored once");
+    }
+
+    /// A blob kept as named goes by its own, brief horizon, an aged one by
+    /// the store's; a hold keeps either, whatever its age.
+    #[test]
+    fn each_keep_ages_by_its_horizon_and_a_hold_outlasts_both() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Fjall::open(dir.path().join("store")).unwrap();
+        let writer = StorageThread::spawn(store.clone(), Arc::new(NoHooks));
+        let blobs = Blobs::open(dir.path().join("blobs"), &store).unwrap();
+        let named = put_kept(&blobs, &bytes(1, 300), Keep::Named);
+        let aged = put_kept(&blobs, &bytes(2, 300), Keep::Aged);
+        let held = put_kept(&blobs, &bytes(3, 300), Keep::Named);
+        let hold = blobs.hold(held.hash);
+        for blob in [named, aged, held] {
+            age(&blobs, &store, &blob, Duration::from_secs(60));
+        }
+        let horizons = Horizons {
+            named: Duration::from_secs(10),
+            aged: Duration::from_secs(3_600),
+        };
+        let collect = || smol::block_on(blobs.collect(&writer, horizons, &|| false)).unwrap();
+        assert_eq!(collect().removed, 1);
+        assert!(!blobs.contains(&named.hash).unwrap());
+        assert!(blobs.contains(&aged.hash).unwrap(), "within its horizon");
+        assert!(blobs.contains(&held.hash).unwrap(), "held");
+        // A second hold outlives the first.
+        let again = blobs.hold(held.hash);
+        drop(hold);
+        assert_eq!(collect().removed, 0);
+        drop(again);
+        assert_eq!(collect().removed, 1);
+        assert!(!blobs.contains(&held.hash).unwrap());
+    }
+
+    /// A hold taken once a collection chose its candidates still keeps the
+    /// blob: the writer checks again as it removes.
+    #[test]
+    fn a_hold_keeps_a_candidate_from_a_removal_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Fjall::open(dir.path().join("store")).unwrap();
+        let blobs = Blobs::open(dir.path().join("blobs"), &store).unwrap();
+        let blob = put_kept(&blobs, &bytes(1, 300), Keep::Named);
+        age(&blobs, &store, &blob, Duration::from_secs(60));
+        let cutoff = now() - 1;
+        let remove = || {
+            smol::block_on(blobs.request(|done| Request::Remove {
+                candidates: vec![blob.hash],
+                cutoffs: Cutoffs {
+                    named: cutoff,
+                    aged: cutoff,
+                },
+                done,
+            }))
+            .unwrap()
+        };
+        let hold = blobs.hold(blob.hash);
+        assert_eq!(remove(), 0);
+        drop(hold);
+        assert_eq!(remove(), 1);
+    }
+
+    /// A blob put both ways keeps the longer, and moving it keeps that; a
+    /// row without its keep, or with one this build does not know, reads as
+    /// aged.
+    #[test]
+    fn a_blob_keeps_the_longer_of_its_keeps() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Fjall::open(dir.path().join("store")).unwrap();
+        let blobs = Blobs::open(dir.path().join("blobs"), &store).unwrap();
+        let keep = |blob: &BlobRef| blobs.location(&blob.hash).unwrap().unwrap().keep;
+        let data = bytes(1, 300);
+        let blob = put_kept(&blobs, &data, Keep::Named);
+        assert_eq!(keep(&blob), Keep::Named);
+        put_kept(&blobs, &data, Keep::Aged);
+        assert_eq!(keep(&blob), Keep::Aged);
+        put_kept(&blobs, &data, Keep::Named);
+        assert_eq!(keep(&blob), Keep::Aged);
+        smol::block_on(blobs.send(blob, Arc::clone(&data), Keep::Named, true)).unwrap();
+        assert_eq!(keep(&blob), Keep::Aged, "moved");
+        let location = blobs.location(&blob.hash).unwrap().unwrap();
+        let named = Location {
+            keep: Keep::Named,
+            ..location
+        };
+        let mut unknown = named.encode();
+        unknown[32] = 7;
+        for row in [&named.encode()[..32], &unknown[..]] {
+            assert_eq!(Location::decode(row), Some(location));
+        }
     }
 }

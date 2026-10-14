@@ -137,6 +137,18 @@ impl LogEntry {
         out
     }
 
+    /// The length of the large work result `payload` names, if its entry
+    /// is one, read without copying the body.
+    pub fn result_len(payload: &[u8]) -> Option<u64> {
+        let (&kind, rest) = payload.split_first()?;
+        let (count, rest) = rest.split_first_chunk::<2>()?;
+        if kind != EntryKind::LargeResult as u8 || *count == [0; 2] {
+            return None;
+        }
+        let len = rest.get(32..40)?;
+        Some(u64::from_be_bytes(len.try_into().expect("8 bytes")))
+    }
+
     /// The entry at `term` whose payload is `payload`.
     pub fn from_payload(term: u64, payload: &[u8]) -> Option<Self> {
         let (&kind, rest) = payload.split_first()?;

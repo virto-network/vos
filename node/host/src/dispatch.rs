@@ -214,9 +214,10 @@ impl Inner {
             );
             return;
         }
-        if !self.hooks.serve_blob() {
-            return;
-        }
+        let hashes: Vec<[u8; 32]> = hashes
+            .into_iter()
+            .filter(|hash| self.hooks.serve_blob(from, hash))
+            .collect();
         let inner = Arc::clone(self);
         self.spawn(async move {
             // One at a time, each once the peer's queue has room for it:
@@ -239,18 +240,18 @@ impl Inner {
         });
     }
 
-    /// Store a blob a group asked for, and tell the groups waiting on it.
-    /// One nobody asked for is dropped.
+    /// Store a blob a group asked for, kept as it asked, and tell the
+    /// groups waiting on it. One nobody asked for is dropped.
     async fn take_blob(&self, hash: [u8; 32], bytes: Vec<u8>) {
         // A store that failed takes nothing more.
-        if !self.is_wanted(&hash) || self.storage.failed() {
+        let Some(keep) = self.wanted(&hash).filter(|_| !self.storage.failed()) else {
             return;
-        }
+        };
         let blob = BlobRef {
             hash,
             len: bytes.len() as u64,
         };
-        match self.blobs.put(blob, Arc::new(bytes)).await {
+        match self.blobs.put_kept(blob, Arc::new(bytes), keep).await {
             Ok(()) => self.arrived(&hash),
             Err(error) => tracing::warn!("a blob from a peer was not stored: {error}"),
         }

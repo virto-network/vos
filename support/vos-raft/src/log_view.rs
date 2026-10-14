@@ -50,15 +50,22 @@ pub(crate) struct LogView<N: NodeId> {
     cache_limit: usize,
     /// The configuration of every live configuration entry, by index.
     configs: BTreeMap<u64, ActiveConfigRecord<N>>,
-    /// The log's running byte count at the end of each live entry, in
-    /// order: the entry at `snap_index + 1 + k` ends at `ends[k]`, and the
+    /// The log's running weight at the end of each live entry, in order:
+    /// the entry at `snap_index + 1 + k` ends at `ends[k]`, and the
     /// snapshot at `start`.
     ends: VecDeque<u64>,
     start: u64,
+    /// What a data payload weighs: [`crate::Config::payload_weight`].
+    payload_weight: fn(&[u8]) -> u64,
 }
 
 impl<N: NodeId> LogView<N> {
-    pub(crate) fn new(snap_index: u64, snap_term: u64, cache_limit: usize) -> Self {
+    pub(crate) fn new(
+        snap_index: u64,
+        snap_term: u64,
+        cache_limit: usize,
+        payload_weight: fn(&[u8]) -> u64,
+    ) -> Self {
         Self {
             snap_index,
             snap_term,
@@ -70,6 +77,7 @@ impl<N: NodeId> LogView<N> {
             configs: BTreeMap::new(),
             ends: VecDeque::new(),
             start: 0,
+            payload_weight,
         }
     }
 
@@ -102,13 +110,13 @@ impl<N: NodeId> LogView<N> {
         Some(self.runs[at - 1].1)
     }
 
-    /// The bytes of the live entries through `index`.
+    /// What the live entries through `index` weigh.
     pub(crate) fn bytes_through(&self, index: u64) -> u64 {
         self.end_at(index) - self.start
     }
 
     /// The lowest index from which the entries after it, through `to`,
-    /// take at most `max_bytes`.
+    /// weigh at most `max_bytes`.
     pub(crate) fn point_keeping(&self, to: u64, max_bytes: u64) -> u64 {
         let to = to.clamp(self.snap_index, self.last);
         let floor = self.end_at(to).saturating_sub(max_bytes);
@@ -164,7 +172,7 @@ impl<N: NodeId> LogView<N> {
             }
             self.last = entry.index;
             let end = self.ends.back().map_or(self.start, |&end| end);
-            self.ends.push_back(end + entry_bytes(entry) as u64);
+            self.ends.push_back(end.saturating_add(self.weight(entry)));
             if let Some(config) = ActiveConfigRecord::from_entry(entry) {
                 self.configs.insert(entry.index, config);
             }
@@ -178,6 +186,17 @@ impl<N: NodeId> LogView<N> {
             }
             self.cache_bytes += entry_bytes(entry);
             self.cache.push_back(entry.clone());
+        }
+    }
+
+    /// What `entry` weighs in the log's byte counts: its cost to the cache,
+    /// with a data payload as the host weighs it.
+    fn weight(&self, entry: &LogEntry<N>) -> u64 {
+        match &entry.kind {
+            EntryKind::Data { payload } => {
+                (self.payload_weight)(payload).saturating_add(ENTRY_OVERHEAD as u64)
+            }
+            EntryKind::ConfigChange { .. } => entry_bytes(entry) as u64,
         }
     }
 
@@ -351,12 +370,18 @@ mod tests {
     use super::*;
     use alloc::vec;
 
+    /// An empty log caching up to `cache_limit` bytes, weighing payloads
+    /// by their length.
+    fn view(cache_limit: usize) -> LogView<u16> {
+        LogView::new(0, 0, cache_limit, |payload| payload.len() as u64)
+    }
+
     fn entry(index: u64, term: u64) -> LogEntry<u16> {
         LogEntry::data(index, term, vec![index as u8])
     }
 
     fn log(terms: &[u64]) -> LogView<u16> {
-        let mut log = LogView::new(0, 0, usize::MAX);
+        let mut log = view(usize::MAX);
         let entries: Vec<_> = terms
             .iter()
             .enumerate()
@@ -403,7 +428,7 @@ mod tests {
 
     #[test]
     fn loaded_entries_must_still_match() {
-        let mut log = LogView::new(0, 0, 0);
+        let mut log = view(0);
         log.append(&[entry(1, 1), entry(2, 1), entry(3, 2)]);
         log.evict(4);
         assert!(log.entries(1, 3, usize::MAX).is_none());
@@ -416,7 +441,7 @@ mod tests {
 
     #[test]
     fn eviction_keeps_entries_not_yet_stored() {
-        let mut log = LogView::new(0, 0, 0);
+        let mut log = view(0);
         log.append(&[entry(1, 1), entry(2, 1), entry(3, 1)]);
         log.evict(2);
         assert!(log.entries(1, 1, usize::MAX).is_none());
@@ -429,7 +454,7 @@ mod tests {
 
     #[test]
     fn live_bytes_follow_appends_truncations_and_compactions() {
-        let mut log = LogView::new(0, 0, usize::MAX);
+        let mut log = view(usize::MAX);
         log.append(&[
             sized(1, 1, 100),
             sized(2, 1, 200),
@@ -461,5 +486,35 @@ mod tests {
         log.append(&[sized(6, 3, 100)]);
         assert_eq!(log.bytes_through(6), 100);
         assert_eq!(log.point_keeping(6, 99), 6);
+    }
+
+    /// A host's weight counts toward the live bytes and the kept tail, and
+    /// the cache still counts the payload alone.
+    #[test]
+    fn live_bytes_count_the_hosts_weight() {
+        // A payload's first byte says how many KiB it stands for.
+        let mut log: LogView<u16> = LogView::new(0, 0, usize::MAX, |payload| {
+            payload.len() as u64 + (u64::from(payload[0]) << 10)
+        });
+        let weighing = |index, kib: u8| LogEntry::data(index, 1, vec![kib; 36]);
+        log.append(&[weighing(1, 0), weighing(2, 4), weighing(3, 1)]);
+        // Each entry costs the cache 100 bytes.
+        assert_eq!(log.cache_bytes, 300);
+        assert_eq!(log.bytes_through(1), 100);
+        assert_eq!(log.bytes_through(2), 200 + 4096);
+        assert_eq!(log.bytes_through(3), 300 + 5120);
+        // Entry 3 weighs 1,124 bytes, entries 2 and 3 more than 2 KiB.
+        assert_eq!(log.point_keeping(3, 2048), 2);
+        assert_eq!(log.point_keeping(3, 5320), 1);
+        assert_eq!(log.point_keeping(3, 5420), 0);
+        log.compact_to(2, 1);
+        assert_eq!(log.bytes_through(3), 1124);
+        let configuration = LogEntry::config_change(4, 1, None, vec![1, 2]);
+        log.append(core::slice::from_ref(&configuration));
+        assert_eq!(
+            log.bytes_through(4),
+            1124 + entry_bytes(&configuration) as u64,
+            "a configuration weighs what it costs the cache"
+        );
     }
 }

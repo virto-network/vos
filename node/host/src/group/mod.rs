@@ -16,9 +16,11 @@ use vos_raft::{Message, Role};
 use vos_wire::ids::AgentId;
 use vos_wire::peer::{CreationRecord, NodeNumber, Order, SnapshotAck, SnapshotChunk};
 
+use crate::blobs::Held;
 use crate::lock;
 use crate::node::Inner;
 use crate::raft::EntryReports;
+use driver::Asks;
 
 pub(crate) use apply::{DryRun, apply, programs, unpinned};
 use snapshot::{Install, Shipment};
@@ -55,6 +57,8 @@ pub(crate) enum Local {
         term: u64,
         payload: Vec<u8>,
         answer: Proposed,
+        /// A large result's blob, held until its entry is written.
+        held: Option<Held>,
     },
     /// This replica's leader loop stopped for good: it hands leadership
     /// over and never campaigns again, but goes on applying.
@@ -242,11 +246,15 @@ struct Driver {
     proposals: HashMap<u64, Proposed>,
     reads: HashMap<u64, smol::channel::Sender<Result<u64, ReadIndexError>>>,
     next_token: u64,
-    /// The blobs asked for last, and when the member now asked was first
-    /// asked: past the retry interval, the next member is.
-    asked: Option<(Instant, Vec<[u8; 32]>)>,
+    /// The blobs asked for and still awaited.
+    asks: Asks,
     /// Which member to ask next.
     turn: usize,
+    /// The held blobs of proposals not yet answered, by token.
+    held_proposals: HashMap<u64, Held>,
+    /// The held blobs of entries not yet written, by index: released once
+    /// a write reaches it, or truncates it.
+    held_entries: Vec<(u64, Held)>,
     /// The leader loop stopped for good.
     retired: bool,
     /// The core was last told to hand leadership over and not campaign.

@@ -59,6 +59,14 @@ pub fn to_raft(index: u64, entry: &LogEntry) -> RaftEntry<NodeNumber> {
     }
 }
 
+/// What a Raft payload weighs in its log's byte counts (vos-raft's
+/// `payload_weight`): its bytes, and a large result's blob, which goes once
+/// the log is compacted past the entry. A program an install names stays
+/// pinned while the agent runs it, so it weighs nothing here.
+pub fn payload_weight(payload: &[u8]) -> u64 {
+    (payload.len() as u64).saturating_add(LogEntry::result_len(payload).unwrap_or(0))
+}
+
 /// The writer's changes for one of the core's writes, in its order:
 /// truncate, append, then the hard state and membership. The meta's
 /// snapshot pointer is left out.
@@ -171,44 +179,55 @@ pub fn switch_change(
 /// What recovery must do to `agent`'s log so that no entry is left
 /// without its blob, before its core is recovered: the changes, for the
 /// node log writer (after it was told the agent's recovered applied
-/// index), and the index the log is cut from, if any.
+/// index), the index the log is cut from, if any, and the committed
+/// entries kept without their blobs.
 ///
-/// An entry naming a blob the store does not hold was never reported
-/// durable, so no replica counted it; every agent shares one journal, so
-/// its row can survive a crash its blob did not. The log is cut at the
-/// first such entry.
+/// An entry above the commit this replica recovers (its persisted commit,
+/// or its applied index if higher) whose blob the store does not hold was
+/// never reported durable: every agent shares one journal, so its row can
+/// survive a crash its blob did not. The log is cut at the first such
+/// entry. Had it been reported and its blob lost after, the cut would
+/// forget an entry this replica acknowledged: a disk losing what it said
+/// it wrote, which the trust model excludes (core model, section 5).
 ///
-/// An entry at or below the applied index whose blob is gone (a disk that
-/// lost what it said it wrote) is committed, and the state holds its
-/// effect: the log is compacted through the applied index instead, with
-/// the membership in effect there, so no entry is left without its blob
-/// and the log never ends below it.
+/// An entry at or below that commit is committed, so it is never cut: the
+/// replica would vote without it, and with another member lacking it elect
+/// a leader that lacks it too. Past the applied index, it stays in the log
+/// and its blobs are fetched again from the members holding them, as a
+/// quorum does. At or below it, the state holds its effect: the log is
+/// compacted through the applied index instead, with the membership in
+/// effect there, so the log never ends below it.
 pub fn recovery_cut(store: &Fjall, blobs: &Blobs, agent: AgentId) -> store::Result<Cut> {
     let rows = store.raft(agent)?;
-    let missing = |entry: &LogEntry| -> store::Result<bool> {
+    let missing = |entry: &LogEntry| -> store::Result<Vec<[u8; 32]>> {
+        let mut missing = Vec::new();
         for blob in &entry.blobs {
             if !blobs.contains(&blob.hash)? {
-                return Ok(true);
+                missing.push(blob.hash);
             }
         }
-        Ok(false)
+        Ok(missing)
     };
+    let committed = rows.hard.commit.max(rows.applied);
     let mut cut = Cut::default();
     let mut applied_lost = false;
     for (index, entry) in &rows.log {
-        if !missing(entry)? {
+        let lost = missing(entry)?;
+        if lost.is_empty() {
             continue;
         }
         if *index <= rows.applied {
             applied_lost = true;
-            continue;
+        } else if *index <= committed {
+            cut.refetch.push((*index, lost));
+        } else {
+            cut.changes.push(Change::Truncate {
+                agent,
+                after: index - 1,
+            });
+            cut.from = Some(*index);
+            break;
         }
-        cut.changes.push(Change::Truncate {
-            agent,
-            after: index - 1,
-        });
-        cut.from = Some(*index);
-        break;
     }
     if applied_lost
         && let Some((_, at_applied)) = rows.log.iter().find(|(index, _)| *index == rows.applied)
@@ -248,6 +267,9 @@ pub struct Cut {
     pub changes: Vec<Change>,
     /// The index the log is cut from, if it is.
     pub from: Option<u64>,
+    /// The committed entries past the applied index kept without their
+    /// blobs, by index, with the blobs to fetch again.
+    pub refetch: Vec<(u64, Vec<[u8; 32]>)>,
 }
 
 /// The entry reports one replica owes its core: its writes in order, each
@@ -258,6 +280,10 @@ pub struct EntryReports {
     pending: VecDeque<Pending>,
 }
 
+/// The sequence standing for the log a replica recovered, before its
+/// core's first write.
+pub const RECOVERED: u64 = 0;
+
 struct Pending {
     seq: u64,
     /// The write's entries that still wait, by index, with their blobs.
@@ -265,6 +291,18 @@ struct Pending {
 }
 
 impl EntryReports {
+    /// The recovered log's committed entries kept without their blobs
+    /// ([`Cut::refetch`]): they wait, as [`RECOVERED`], ahead of every
+    /// write.
+    pub fn recovered(&mut self, waiting: Vec<(u64, Vec<[u8; 32]>)>) {
+        if !waiting.is_empty() {
+            self.pending.push_front(Pending {
+                seq: RECOVERED,
+                waiting,
+            });
+        }
+    }
+
     /// `write` is durable. A truncation in it drops the waits of the
     /// entries it removed, from earlier writes too. `stored` answers from a
     /// [`Blobs::touch`] of the write's blobs, so none of them is collected
@@ -401,6 +439,36 @@ mod tests {
         assert!(matches!(to_raft(9, &stored).kind, RaftKind::Data { .. }));
     }
 
+    #[test]
+    fn a_large_results_blob_weighs_in_its_payload() {
+        let blob = BlobRef {
+            hash: [9; 32],
+            len: 3 << 20,
+        };
+        let program = BlobRef {
+            hash: [8; 32],
+            len: 5 << 20,
+        };
+        let large = LogEntry {
+            term: 1,
+            kind: EntryKind::LargeResult,
+            blobs: vec![blob, program],
+            body: Vec::new(),
+        };
+        let payload = large.payload();
+        assert_eq!(payload_weight(&payload), payload.len() as u64 + (3 << 20));
+        // An inline result's programs, and anything else, weigh its bytes.
+        let installs = LogEntry {
+            blobs: vec![program],
+            ..LogEntry::result(1, vec![7; 100])
+        };
+        let payload = installs.payload();
+        assert_eq!(payload_weight(&payload), payload.len() as u64);
+        assert_eq!(payload_weight(&[]), 0);
+        let truncated = &large.payload()[..20];
+        assert_eq!(payload_weight(truncated), 20);
+    }
+
     /// A Raft write of `entries` (index, blobs named), after `truncate`.
     fn write(seq: u64, truncate: Option<u64>, entries: &[(u64, &[[u8; 32]])]) -> Write<NodeNumber> {
         Write {
@@ -515,6 +583,61 @@ mod tests {
                 .changes
                 .is_empty()
         );
+
+        // Committed through 4: the entry at 3 is kept, its blob to fetch
+        // again, and the log is cut at the next entry missing one, past
+        // the commit.
+        let other = AgentId(8);
+        let gone = BlobRef {
+            hash: [5; 32],
+            len: 100,
+        };
+        let mut batch = store.batch();
+        batch.append(other, 1, &LogEntry::result(1, vec![1]));
+        batch.append(other, 2, &naming(held_ref));
+        batch.append(other, 3, &naming(lost));
+        batch.append(other, 4, &LogEntry::result(1, vec![4]));
+        batch.append(other, 5, &naming(gone));
+        batch.append(other, 6, &LogEntry::result(1, vec![6]));
+        batch.apply(other, 0, 1, &[]);
+        batch.hard_state(
+            other,
+            &HardState {
+                term: 1,
+                vote: None,
+                commit: 4,
+            },
+        );
+        batch.commit(crate::store::PersistMode::SyncAll).unwrap();
+        writer.recovered(other, 1);
+        let cut = recovery_cut(&store, &blobs, other).unwrap();
+        assert_eq!(cut.from, Some(5));
+        assert_eq!(cut.refetch, vec![(3, vec![lost.hash])]);
+        smol::block_on(writer.commit(cut.changes)).unwrap();
+        let rows = store.raft(other).unwrap();
+        assert_eq!(
+            rows.log.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        assert_eq!(rows.log_start.0, 0, "nothing applied is compacted");
+    }
+
+    /// The committed entries recovery keeps without their blobs wait ahead
+    /// of every write, and once their blobs come, report as recovered.
+    #[test]
+    fn recovered_entries_wait_for_their_blobs_ahead_of_every_write() {
+        let stored = std::cell::RefCell::new(HashSet::new());
+        let is_stored = |hash: &[u8; 32]| stored.borrow().contains(hash);
+        let mut reports = EntryReports::default();
+        reports.recovered(vec![(3, vec![[7; 32]])]);
+        reports.written(&write(1, None, &[(5, &[])]), is_stored);
+        assert_eq!(reports.missing(), vec![[7; 32]]);
+        assert_eq!(reports.ready(is_stored), None, "the write waits behind");
+        stored.borrow_mut().insert([7; 32]);
+        assert_eq!(reports.ready(is_stored), Some(1));
+        reports.recovered(vec![(9, vec![[8; 32]])]);
+        stored.borrow_mut().insert([8; 32]);
+        assert_eq!(reports.ready(is_stored), Some(RECOVERED));
     }
 
     /// An applied entry whose blob is gone compacts the log through the

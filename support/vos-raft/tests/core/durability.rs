@@ -425,3 +425,41 @@ fn large_entries_make_a_compaction_due_by_their_bytes() {
     // The tail's entry count bounds it as well.
     assert_eq!(core.compaction_point(6, 1, 700), 5);
 }
+
+/// Entries whose small payloads name large data the host keeps apart weigh
+/// what the host says: a compaction is due by their weight, and the tail it
+/// keeps is bounded by it.
+#[test]
+fn a_hosts_payload_weight_counts_toward_compaction() {
+    let mut cfg = config();
+    cfg.compact_hysteresis = 1_000;
+    cfg.compact_bytes = 1_000;
+    // A payload's first byte is the hundreds of bytes it stands for.
+    cfg.payload_weight = |payload| payload.len() as u64 + u64::from(payload[0]) * 100;
+    // Each entry weighs 300 bytes: 64 beyond its payload, which stands for
+    // 200 more than its 36 bytes.
+    let entries = (1..=8)
+        .map(|index| LogEntry::data(index, 1, vec![2; 36]))
+        .collect();
+    let recovered = Recovered {
+        applied: 0,
+        ..recovered(1, 8, entries)
+    };
+    let mut core = Core::new(cfg, recovered, 0, 7);
+    core.take_actions();
+    core.durably_applied(3);
+    assert!(compact_bounds(&core.take_actions()).is_empty(), "900 bytes");
+    core.durably_applied(4);
+    assert_eq!(compact_bounds(&core.take_actions()), [4]);
+    // Entries 3 and 4 weigh 600 bytes; 2 through 4 more than 700.
+    let point = core.compaction_point(4, 10, 700);
+    assert_eq!(point, 2);
+    core.compacted(point);
+    core.durably_applied(5);
+    assert!(
+        compact_bounds(&core.take_actions()).is_empty(),
+        "the tail and entry 5 weigh 900 bytes"
+    );
+    core.durably_applied(6);
+    assert_eq!(compact_bounds(&core.take_actions()), [6]);
+}

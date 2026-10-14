@@ -438,12 +438,14 @@ fn replicas_that_never_took_the_install_pool_the_program_on_first_use() {
 /// another agent still pins, and holds it again once it is pinned and run
 /// again. A restart leaves it as the pins do. The blob store, collected
 /// every 100 ms, drops the program past its horizon (3 s) too, while the
-/// nodes that pin it keep it.
+/// nodes that pin it keep it. The replica fetched it for the install's
+/// entry, so it goes by the horizon of a blob an entry names.
 #[test]
 fn a_program_leaves_the_pool_with_its_last_pin() {
     let mut cluster = Cluster::tuned(4, |_, config| {
         config.blob_collect_every = Duration::from_millis(100);
         config.blob_horizon = Duration::from_secs(3);
+        config.named_blob_horizon = Duration::from_secs(3);
     });
     let agents: Vec<AgentId> = (0..2).map(|_| cluster.counter_agent(&[1, 2, 3])).collect();
     let leaders: Vec<NodeNumber> = agents.iter().map(|agent| cluster.leader(*agent)).collect();

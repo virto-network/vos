@@ -1,13 +1,17 @@
 //! Work results of 64 KiB or more, which travel as blobs their log entries
 //! name: replicated, fetched by followers, applied on every replica alike,
-//! and collected once the log is compacted past them.
+//! weighed toward compaction, and collected soon after the log is compacted
+//! past them.
 
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use vos_checker::calls::done;
-use vos_node::store::{BlobRef, EntryKind, LARGE_RESULT};
+use vos_net::Class;
+use vos_node::blobs::Blobs;
+use vos_node::store::{BlobRef, EntryKind, Fjall, LARGE_RESULT};
 use vos_node::{CallError, Hooks, Node, Reply};
 use vos_wire::batch::{Batch, Request};
 use vos_wire::ids::AgentId;
@@ -198,8 +202,9 @@ fn a_lagging_follower_catches_up_through_a_large_result() {
     assert!(lagging.stores_blob(&blob.hash), "fetched");
 }
 
-/// A large result's blob stays while the log holds its entry, past the
-/// blob store's horizon, and goes once the log is compacted past it.
+/// A large result's blob stays while the log holds its entry, past its
+/// brief horizon, and goes soon after the log is compacted past it: by
+/// that horizon, not the store's hour.
 #[test]
 fn a_large_results_blob_goes_once_the_log_is_compacted_past_it() {
     let hooks = Arc::new(HoldRefines::default());
@@ -207,7 +212,8 @@ fn a_large_results_blob_goes_once_the_log_is_compacted_past_it() {
         compacting(number, config);
         config.compact_every = 32;
         config.blob_collect_every = Duration::from_millis(100);
-        config.blob_horizon = Duration::from_secs(1);
+        config.named_blob_horizon = Duration::from_secs(1);
+        assert_eq!(config.blob_horizon, Duration::from_secs(3_600));
     });
     let agent = cluster.counter_agent(&[1, 2, 3]);
     let leader = cluster.leader(agent);
@@ -239,4 +245,359 @@ fn a_large_results_blob_goes_once_the_log_is_compacted_past_it() {
             .running()
             .all(|(_, node)| blobs.iter().all(|blob| !node.stores_blob(&blob.hash)))
     });
+}
+
+/// Large results make a compaction due by the bytes of their blobs, which
+/// their entries' few bytes alone never would, and the tail a compaction
+/// keeps counts them too.
+#[test]
+fn large_results_make_a_compaction_due_by_their_blobs() {
+    let hooks = Arc::new(HoldRefines::default());
+    let cluster = cluster(&hooks, |_, config| {
+        config.compact_every = 1 << 20;
+        config.compact_bytes = 2 << 20;
+        config.compact_tail_bytes = 1 << 20;
+    });
+    let agent = cluster.counter_agent(&[1, 2, 3]);
+    let leader = cluster.leader(agent);
+    let indices = two_batches(&cluster, &hooks, leader, agent, 1);
+    // Small calls after them sync their applies.
+    for sequence in 12..=14 {
+        assert_eq!(
+            done(cluster.increment(leader, agent, sequence, 1)),
+            sequence - 11
+        );
+    }
+    for number in 1..=3 {
+        // The second result alone weighs past the tail's megabyte, so the
+        // log keeps neither.
+        cluster.compacted_past(number, agent, indices[1] - 1);
+    }
+}
+
+/// Records the blob requests a node takes, and withholds blobs from the
+/// nodes it is told to.
+#[derive(Default)]
+struct Serving {
+    asked: Mutex<Vec<(NodeNumber, [u8; 32], Instant)>>,
+    withheld: Mutex<BTreeSet<NodeNumber>>,
+}
+
+impl Serving {
+    fn withhold(&self, from: &[NodeNumber]) {
+        *self.withheld.lock().unwrap() = from.iter().copied().collect();
+    }
+
+    /// When each blob was asked for by `by`, in order.
+    fn asked_by(&self, by: NodeNumber) -> BTreeMap<[u8; 32], Vec<Instant>> {
+        let mut asked: BTreeMap<[u8; 32], Vec<Instant>> = BTreeMap::new();
+        for (to, hash, at) in self.asked.lock().unwrap().iter() {
+            if *to == by {
+                asked.entry(*hash).or_default().push(*at);
+            }
+        }
+        asked
+    }
+}
+
+impl Hooks for Serving {
+    fn serve_blob(&self, to: NodeNumber, hash: &[u8; 32]) -> bool {
+        self.asked.lock().unwrap().push((to, *hash, Instant::now()));
+        !self.withheld.lock().unwrap().contains(&to)
+    }
+}
+
+/// Three nodes, each with its own [`Serving`].
+fn serving_cluster() -> (Cluster, Vec<Arc<Serving>>) {
+    let hooks: Vec<Arc<Serving>> = (0..3).map(|_| Arc::default()).collect();
+    let each = hooks.clone();
+    let cluster = Cluster::tuned(3, move |number, config| {
+        config.hooks = each[usize::from(number) - 1].clone();
+    });
+    (cluster, hooks)
+}
+
+/// Each large result `node` holds of `agent` past `after`, by index.
+fn large_blobs(node: &Node, agent: AgentId, after: u64) -> Vec<(u64, BlobRef)> {
+    node.store()
+        .raft(agent)
+        .unwrap()
+        .log
+        .into_iter()
+        .filter(|(index, _)| *index > after)
+        .filter_map(|(index, entry)| Some((index, *entry.result_blob()?)))
+        .collect()
+}
+
+/// A follower asks for each blob once, of the leader, as its entry comes,
+/// and again only by a retry, the retry interval later: never of one
+/// member and then another at once. The leader's blobs never reach it
+/// here, so every blob stays in flight while the next results come.
+#[test]
+fn a_blob_is_asked_for_again_only_by_a_retry() {
+    let (cluster, hooks) = serving_cluster();
+    let agent = cluster.counter_agent(&[1, 2, 3]);
+    let (leader, follower) = cluster.leader_and_follower(agent);
+    cluster.hub.cut_class(leader, follower, Class::Bulk);
+    let before = cluster.node(leader).applied(agent).unwrap();
+    for sequence in 1..=5 {
+        filled(smol::block_on(
+            cluster.node(leader).call(agent, fill(&cluster, sequence)),
+        ));
+    }
+    let blobs = large_blobs(cluster.node(leader), agent, before);
+    assert_eq!(blobs.len(), 5, "{blobs:?}");
+    // Each blob's asks, of any member, in order.
+    let asks = || {
+        let mut asks: BTreeMap<[u8; 32], Vec<(Instant, NodeNumber)>> = BTreeMap::new();
+        for (number, serving) in (1..).zip(&hooks) {
+            for (hash, times) in serving.asked_by(follower) {
+                let asked = asks.entry(hash).or_default();
+                asked.extend(times.into_iter().map(|at| (at, number)));
+                asked.sort();
+            }
+        }
+        asks
+    };
+    wait_until("the follower asks for every blob", || {
+        let asks = asks();
+        blobs.iter().all(|(_, blob)| asks.contains_key(&blob.hash))
+    });
+    // Past a retry or two.
+    std::thread::sleep(Duration::from_millis(2_500));
+    let asks = asks();
+    for (index, blob) in &blobs {
+        let asked = &asks[&blob.hash];
+        assert_eq!(
+            asked[0].1, leader,
+            "the blob at {index} is asked of the leader"
+        );
+        for pair in asked.windows(2) {
+            assert!(
+                pair[1].0 - pair[0].0 >= Duration::from_millis(500),
+                "the blob at {index} asked for again after {:?}: {asked:?}",
+                pair[1].0 - pair[0].0
+            );
+        }
+    }
+    cluster.hub.heal();
+    cluster.converged(agent);
+}
+
+/// A follower whose new leader lacks a blob turns to another member that
+/// has it, once its ask of the leader waited past the retry interval.
+#[test]
+fn a_follower_turns_from_a_leader_lacking_a_blob_to_a_member_holding_it() {
+    let (cluster, hooks) = serving_cluster();
+    let agent = cluster.counter_agent(&[1, 2, 3]);
+    let old = cluster.leader(agent);
+    let mut others = (1..=3).filter(|number| *number != old);
+    let (next, follower) = (others.next().unwrap(), others.next().unwrap());
+    wait_until("every replica applies the install", || {
+        let applied = cluster.node(old).applied(agent);
+        cluster
+            .running()
+            .all(|(_, node)| node.applied(agent) >= applied)
+    });
+    let serving = |number: NodeNumber| &hooks[usize::from(number) - 1];
+    // Only `next` takes the large result, and its leader withholds the blob.
+    serving(old).withhold(&[1, 2, 3]);
+    cluster.hub.partition(old, follower);
+    let before = cluster.node(old).applied(agent).unwrap();
+    let call = cluster.node(old).call(agent, fill(&cluster, 1));
+    let mut entry = Vec::new();
+    wait_until("the next leader holds the large result's entry", || {
+        entry = large_blobs(cluster.node(next), agent, before);
+        !entry.is_empty()
+    });
+    let blob = entry[0].1;
+    // It leads, lacking the blob, and the follower takes the entry from it.
+    cluster.hub.isolate(old);
+    wait_until("the next leader leads", || cluster.node(next).leads(agent));
+    wait_until("the follower holds the entry", || {
+        !large_blobs(cluster.node(follower), agent, before).is_empty()
+    });
+    // The old leader serves the follower alone, and the follower nobody.
+    serving(old).withhold(&[next]);
+    serving(follower).withhold(&[1, 2, 3]);
+    cluster.hub.heal();
+    wait_until("the follower fetches the blob", || {
+        cluster.node(follower).stores_blob(&blob.hash)
+    });
+    assert!(
+        serving(next).asked_by(follower).contains_key(&blob.hash),
+        "the follower asked its leader first"
+    );
+    assert!(
+        !cluster.node(next).stores_blob(&blob.hash),
+        "the leader still lacks it"
+    );
+    serving(old).withhold(&[]);
+    serving(follower).withhold(&[]);
+    cluster.converged(agent);
+    drop(call);
+}
+
+/// Loses the result blob of every entry an armed node applies.
+#[derive(Default)]
+struct LoseBlobs(AtomicBool);
+
+impl Hooks for LoseBlobs {
+    fn lose_blob(&self, _: AgentId, _: u64) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// Three nodes, each with its own [`LoseBlobs`].
+fn losing_cluster() -> (Cluster, Vec<Arc<LoseBlobs>>) {
+    let hooks: Vec<Arc<LoseBlobs>> = (0..3).map(|_| Arc::default()).collect();
+    let each = hooks.clone();
+    let cluster = Cluster::tuned(3, move |number, config| {
+        config.hooks = each[usize::from(number) - 1].clone();
+    });
+    (cluster, hooks)
+}
+
+/// A large result proposed at `leader`, which `follower` finds its blob
+/// lost for as it applies it: it halts there. The entry's index and blob.
+fn halted_on_a_large_result(
+    cluster: &Cluster,
+    hooks: &[Arc<LoseBlobs>],
+    leader: NodeNumber,
+    follower: NodeNumber,
+    agent: AgentId,
+) -> (u64, BlobRef) {
+    let losing = &hooks[usize::from(follower) - 1].0;
+    losing.store(true, Ordering::SeqCst);
+    let before = cluster.node(leader).applied(agent).unwrap();
+    filled(smol::block_on(
+        cluster.node(leader).call(agent, fill(cluster, 1)),
+    ));
+    let [(index, blob)] = large_blobs(cluster.node(leader), agent, before)[..] else {
+        panic!("one large result");
+    };
+    wait_until("the follower halts", || {
+        cluster
+            .node(follower)
+            .replica(agent)
+            .is_some_and(|status| status.halted)
+    });
+    assert!(cluster.node(follower).applied(agent).unwrap() < index);
+    losing.store(false, Ordering::SeqCst);
+    (index, blob)
+}
+
+/// Stopped node `number`'s disk loses `blob`, as a torn segment tail
+/// would: the blob of the committed entry at `index`, which it had not
+/// applied, and its segment's last record.
+fn lose_on_disk(cluster: &Cluster, number: NodeNumber, agent: AgentId, index: u64, blob: &BlobRef) {
+    let dir = cluster.dirs[usize::from(number) - 1].path();
+    let open = || {
+        let store = Fjall::open(dir.join("store")).unwrap();
+        let blobs = Blobs::open(dir.join("blobs"), &store).unwrap();
+        (store, blobs)
+    };
+    let (store, blobs) = open();
+    assert!(blobs.contains(&blob.hash).unwrap());
+    let rows = store.raft(agent).unwrap();
+    assert!(
+        rows.applied < index && rows.hard.commit >= index,
+        "applied {} and committed {} around {index}",
+        rows.applied,
+        rows.hard.commit
+    );
+    drop((blobs, store));
+    let segment = std::fs::read_dir(dir.join("blobs"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .max()
+        .unwrap();
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&segment)
+        .unwrap();
+    file.set_len(file.metadata().unwrap().len() - 10).unwrap();
+    drop(file);
+    let (store, blobs) = open();
+    assert!(!blobs.contains(&blob.hash).unwrap(), "the blob is lost");
+    drop((blobs, store));
+}
+
+/// A replica whose store lost the blob of an entry it holds halts rather
+/// than retry the apply. Its disk did lose it: once restarted it keeps the
+/// committed entry, fetches the blob again from a peer, and applies it.
+#[test]
+fn a_replica_that_lost_a_committed_entrys_blob_halts_and_fetches_it_again() {
+    let (mut cluster, hooks) = losing_cluster();
+    let agent = cluster.counter_agent(&[1, 2, 3]);
+    let (leader, follower) = cluster.leader_and_follower(agent);
+    wait_until("the follower applies the install", || {
+        cluster.node(follower).applied(agent) >= cluster.node(leader).applied(agent)
+    });
+    let (index, blob) = halted_on_a_large_result(&cluster, &hooks, leader, follower, agent);
+    assert_eq!(done(cluster.increment(leader, agent, 2, 1)), 1);
+    cluster.stop(follower);
+    lose_on_disk(&cluster, follower, agent, index, &blob);
+    cluster.start(follower);
+    cluster.converged(agent);
+    let restarted = cluster.node(follower);
+    assert!(restarted.stores_blob(&blob.hash), "fetched again");
+    assert_eq!(large_blobs(restarted, agent, index - 1)[0], (index, blob));
+}
+
+/// The leader and one follower commit a large result while the other
+/// follower is cut off; the first follower's disk then loses its blob,
+/// and the leader stops. The two left elect a leader that still holds the
+/// entry, committed: the restarted follower never forgot it. It applies
+/// nothing past it until a member holding the blob, the old leader, is
+/// back.
+#[test]
+fn a_committed_entry_whose_blob_a_replica_lost_stays_committed() {
+    let (mut cluster, hooks) = losing_cluster();
+    let agent = cluster.counter_agent(&[1, 2, 3]);
+    let (leader, follower) = cluster.leader_and_follower(agent);
+    let other = (1..=3)
+        .find(|number| ![leader, follower].contains(number))
+        .unwrap();
+    wait_until("every replica applies the install", || {
+        let applied = cluster.node(leader).applied(agent);
+        cluster
+            .running()
+            .all(|(_, node)| node.applied(agent) >= applied)
+    });
+    cluster.hub.isolate(other);
+    let (index, blob) = halted_on_a_large_result(&cluster, &hooks, leader, follower, agent);
+    cluster.stop(follower);
+    lose_on_disk(&cluster, follower, agent, index, &blob);
+    cluster.stop(leader);
+    cluster.hub.heal();
+    cluster.start(follower);
+    // The one holding the entry leads, and the other takes it from it.
+    let holds = |number: NodeNumber| {
+        large_blobs(cluster.node(number), agent, index - 1).first() == Some(&(index, blob))
+    };
+    wait_until("the follower that kept the entry leads", || {
+        cluster.node(follower).leads(agent) && holds(follower)
+    });
+    let committed = cluster
+        .node(follower)
+        .store()
+        .raft(agent)
+        .unwrap()
+        .hard
+        .commit;
+    assert!(committed >= index, "committed through {committed}");
+    wait_until("the other follower holds the entry", || holds(other));
+    for number in [follower, other] {
+        let node = cluster.node(number);
+        assert!(
+            !node.stores_blob(&blob.hash),
+            "node {number} lacks the blob"
+        );
+        assert!(node.applied(agent).unwrap() < index);
+    }
+    cluster.start(leader);
+    cluster.converged(agent);
+    let leader = cluster.leader(agent);
+    assert_eq!(done(cluster.increment(leader, agent, 2, 1)), 1);
 }
