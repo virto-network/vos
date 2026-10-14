@@ -1,6 +1,8 @@
 # Identity and authority
 
-Draft 1 of a design run: who acts in a space, how a request proves it,
+Draft 2 of a design run. Draft 2 adopts the owner's idea of personal
+spaces: one trust model everywhere, with privacy from operators reached by
+being one's own operator. The design run covers: who acts in a space, how a request proves it,
 what each actor may do, and what anyone outside a space learns. Nothing
 here is decided. Each section offers options and the one this draft
 leans to, for the owner to weigh over several rounds before any slice is
@@ -53,19 +55,14 @@ planned on it. Tags as in the core model.
 |---|---|---|---|---|
 | **S, space-trusted** | everything but what a proof returns | everything but what a proof returns | nothing | most spaces; a community's channels |
 | **X, private across spaces** | as S | as S | nothing | cipher-clerk's first tier: the ledger is plain to its space, and transfers between spaces settle on JAM through proofs |
-| **O, blind to operators** | as S | as S | the member's data and which member acted; operators see commitments, nullifiers and proofs | cipher-clerk's later tier: private payments proven on the user's device |
+| **O, blind to the shared space's operators** | as S | as S | the member's secrets and which member acted; the shared space sees commitments, nullifiers and proofs | cipher-clerk's later tier: private payments proven on the user's device |
 
-**Tier O changes the core model's trust model** (§5) for the actors that
-opt into it:
-- **Execution:** their state is commitments, never plaintext, and their
-  transitions are proven by the member, on a device, not executed by the
-  space.
-- **What the operators still do:** order and store the transitions, and
-  check the proofs at ingress (§11.1 already verifies at ingress).
-- **What they still learn:** timing and network metadata, unless a later
-  layer hides it (mixing, relays). This draft names that layer and
-  leaves it out of scope.
-- **Every other actor** keeps today's model.
+**Tier O needs no trust model of its own** (the owner's idea). A
+space's operators see everything in it, everywhere. Privacy from the
+operators of a shared space comes from keeping one's secrets in a space
+of one's own, a personal space (§8), where one is the operator, and
+sending the shared space only proofs. Tier O is tier X between a
+personal space and a shared one.
 
 ## 4. Concepts, kept apart
 
@@ -172,34 +169,73 @@ an agent, but approving a payment is a member's grant like any other.
 Under tier S an operator can still read state, because it runs it;
 tier O is where that changes.
 
-## 8. Actors blind to their operators (tier O)
+## 8. Personal spaces (tier O)
 
-- **State:** an actor of this tier holds commitments (notes,
-  balances), nullifiers and anchors, never plaintext. A member's device
-  holds their private state and keys.
-- **A transition** is a proof made on the device:
-  - "these notes existed under this anchor";
-  - "I own them";
-  - "the new notes balance them";
-  - "these nullifiers are theirs".
-  - The space checks the proof at ingress, then orders and applies the
-    public effects (new commitments, spent nullifiers) like any input.
-- **Proving on a device** is the hard part:
-  - our general zkPVM proves any PVM program, but needs gigabytes and
-    seconds to minutes per segment (the mobile proving research);
-  - fast payments on a phone probably want a small fixed circuit for the
-    spend statement, proven by a light prover;
-  - the general zkPVM stays for the space's own attestations.
-  - Which prover is a decision of its own.
-- **Composes with JAM:** the actor's anchors are what a space's JAM agent
-  records, so a cross-space settlement can be proven against them.
-- **Metadata** (timing, sizes, network addresses) still leaks to
-  operators. Hiding it is a later layer.
+**A personal space is a person's own pod:**
+- its nodes are their devices;
+- it holds their secrets: notes, spend and viewing keys, credentials;
+- its operator is the person.
+
+**A shared space** holds the public half of a private application. For
+private payments, that is a shielded pool:
+- note commitments;
+- spent nullifiers;
+- anchors;
+- notes waiting for their recipients, encrypted to their viewing keys.
+
+**A private payment is a message between spaces.**
+1. The payer's wallet actor, in their personal space, proves on the
+   device, with an attestable kernel: "I own these notes under anchor
+   A; these are their nullifiers; these new commitments balance them".
+2. The proof goes to the pool's actor in the shared space as a message.
+3. The pool checks the proof at ingress (§11.1), refuses spent
+   nullifiers, and applies the new commitments and the encrypted notes.
+4. The shared space can net-settle with other spaces on JAM, as tier X
+   does.
+
+**Receiving needs no one online.** A recipient's personal space syncs
+the notes encrypted to it from the pool when it next runs, as a wallet
+syncs a chain.
+
+**What makes it work:**
+- **An anonymous sender.**
+  - A message's origin is normally its sending agent, which would name
+    the payer's personal space.
+  - So messages to a pool carry an anonymous origin: the proof is their
+    authority, and the nullifier stops reuse.
+  - The network path leaks too (which node or address submitted it),
+    so submission goes through relays. That relay layer is out of scope
+    here, but this design depends on it.
+- **Cheap personal spaces.** Millions of people means millions of
+  personal spaces, so one must cost almost nothing:
+  - no registry entry, no agent on JAM, no anchors published anywhere;
+  - one device, or a few syncing among themselves;
+  - offline most of the time;
+  - the same actor model, so a wallet is an ordinary actor in a personal
+    agent.
+- **A hosted personal space** serves someone who cannot run their own.
+  Its provider is then their operator: an explicit trust choice, not a
+  hidden one.
+- **Proving on the device:**
+  - the spend kernel is small: a Merkle path, a nullifier, commitment
+    arithmetic and a range check, around 0.2 to 0.5M steps with
+    precompiles by S5's estimate;
+  - proving it on a phone still needs the mobile prover work or a fixed
+    circuit.
+
+**The personal space is also a person's home for identity** (§6, §9).
+It holds their devices as authenticators, their recovery and their
+credentials, and it derives the pseudonym they show each space.
+
+**What the shared space still sees:** the pool's public state and the
+timing of its messages. That is inherent to a shielded pool; hiding
+timing belongs to the relay layer.
 
 ## 9. Across spaces: pseudonyms and credentials
 
-- **Pseudonyms:** a person has an identity in each space they join, and
-  by default no space can link it to another.
+- **Pseudonyms:** a person has an identity in each space they join,
+  derived by their personal space (§8), and by default no space can
+  link it to another.
 - **Credentials:** an actor in one space attests a fact about one of its
   identities, such as "reputation at least 50", "a member since 2025"
   or "a verified human".
@@ -288,8 +324,13 @@ authenticated by whatever carried it.
 **Its tier X** is its first use case, and it fits this design: the
 ledger is plain to its space, and vouchers and settlements carry proofs.
 
-**Its tier O** has the data structures (notes, nullifiers, a note pool)
-but no prover, and its spend check is not yet a circuit.
+**Its tier O** maps onto §8:
+- its notes and keys belong in the payer's personal space;
+- its note pool belongs in a shared space, as the shielded pool;
+- its spend check becomes the wallet actor's attestable kernel.
+
+It has the data structures (notes, nullifiers, a note pool) but no
+prover, and its spend check is not yet a circuit.
 
 **Before an actor is built on it, a design and implementation review
 should settle:**
@@ -326,8 +367,13 @@ This review belongs before slice 5 builds Clerk.
    guardians, a delay, or the registrar?
 4. **Registration:** who registers identities in a new space by
    default: open, invited, or governed?
-5. **Tier O's prover on devices:** a small fixed circuit for spends, or
-   the general zkPVM made to fit phones?
+5. **Personal spaces' prover on devices:** a small fixed circuit for
+   spends, or the general zkPVM made to fit phones?
+9. **Personal spaces:**
+   - should a personal space be a full space that happens to have one
+     operator, or a lighter kind of space (no Raft, devices syncing
+     through the Merge lane)?
+   - should hosted personal spaces be a first-class offering?
 6. **The root space:** should Virto's governance be the registry's only
    governor at first, and what should trigger moving it to a collective
    of spaces?
@@ -351,7 +397,8 @@ This review belongs before slice 5 builds Clerk.
      proving.
 4. **With slice 5's prover:** anchors on JAM, attestable statements,
    credentials, nullifiers, and anonymous origins.
-5. **Tier O,** once a device prover exists, with cipher-clerk's private
-   payments as its first actor.
+5. **Personal spaces and a shielded pool,** once a device prover and
+   anonymous origins exist, with cipher-clerk's private payments as the
+   first application.
 6. **The registry and the root space,** when spaces need to find each
    other, possibly alongside step 4.
