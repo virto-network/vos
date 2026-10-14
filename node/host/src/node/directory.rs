@@ -373,6 +373,12 @@ impl Inner {
                 "applier",
                 Box::pin(group::apply(Arc::clone(self), Arc::clone(&shared))),
             ),
+            // A builder that panics stops the agent, as its other tasks do:
+            // a root built by a bug is worse than none.
+            guarded(
+                "root builder",
+                Box::pin(crate::roots::build(Arc::clone(self), Arc::clone(&shared))),
+            ),
             guarded(
                 "leader",
                 Box::pin(crate::leader::lead(

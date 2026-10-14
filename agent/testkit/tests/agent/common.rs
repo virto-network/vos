@@ -386,9 +386,20 @@ impl Sessions {
         method: MethodId,
         arguments: A,
     ) -> Input {
+        self.request_bytes(caller, instance, method, arguments.encode())
+    }
+
+    /// [`Sessions::request`] with its arguments already encoded.
+    pub fn request_bytes(
+        &mut self,
+        caller: Principal,
+        instance: InstanceId,
+        method: MethodId,
+        arguments: Vec<u8>,
+    ) -> Input {
         let sequence = self.0.entry(caller).or_insert(0);
         *sequence += 1;
-        request(caller, *sequence, instance, method, arguments.encode())
+        request(caller, *sequence, instance, method, arguments)
     }
 }
 
@@ -441,6 +452,7 @@ pub fn ran_step(session: SessionRef, sequence: u64, writes: Vec<Write>) -> Step 
         outcome: Outcome::Done(Vec::new()),
         instances: Vec::new(),
         writes,
+        committed: Vec::new(),
         messages: Vec::new(),
         attests: Vec::new(),
         gas_used: 0,
@@ -452,6 +464,7 @@ pub fn setup() -> (Actors, Node, Testkit, Sessions) {
     let mut node = Node::new();
     let mut kit = Testkit::new(AGENT);
     actors.install(&mut node, &mut kit);
+    kit.version = node.version;
     (actors, node, kit, Sessions::new())
 }
 

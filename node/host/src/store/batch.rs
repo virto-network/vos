@@ -126,6 +126,22 @@ impl Batch {
         index: u64,
         writes: impl IntoIterator<Item = &'a Write>,
     ) {
+        self.rows(agent, epoch, writes);
+        self.batch.insert(
+            self.store.system(),
+            node_row(agent, NodeRow::Applied, &[]),
+            index.to_be_bytes(),
+        );
+    }
+
+    /// Write rows, in order, to the agent's rows under `epoch`: a value,
+    /// or (`None`) a deletion.
+    pub fn rows<'a>(
+        &mut self,
+        agent: AgentId,
+        epoch: u8,
+        writes: impl IntoIterator<Item = &'a Write>,
+    ) {
         for write in writes {
             let partition = self.store.partition(&write.key);
             let key = agent_key(agent, epoch, &write.key);
@@ -134,11 +150,6 @@ impl Batch {
                 None => self.batch.remove(partition, key),
             }
         }
-        self.batch.insert(
-            self.store.system(),
-            node_row(agent, NodeRow::Applied, &[]),
-            index.to_be_bytes(),
-        );
     }
 
     /// Write a snapshot's rows (agent-relative keys) under `epoch`, beside

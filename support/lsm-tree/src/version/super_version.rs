@@ -158,14 +158,25 @@ impl SuperVersions {
     /// and returns a new version.
     ///
     /// The function takes care of persisting the version changes on disk.
+    ///
+    /// The new version's sequence number is not published as visible: a
+    /// write batch may hold a lower one while it inserts its items, and a
+    /// snapshot opened at a seqno past it would see the batch in part.
+    /// Snapshots reach the new version once a later write publishes.
     pub(crate) fn upgrade_version<F: FnOnce(&SuperVersion) -> crate::Result<SuperVersion>>(
         &mut self,
         tree_path: &Path,
         f: F,
         seqno: &SequenceNumberCounter,
-        visible_seqno: &SequenceNumberCounter,
+        _visible_seqno: &SequenceNumberCounter,
     ) -> crate::Result<()> {
-        self.upgrade_version_with_seqno(tree_path, f, seqno.next(), visible_seqno)
+        let mut next_version = f(&self.latest_version())?;
+        next_version.seqno = seqno.next();
+        log::trace!("Next version seqno={}", next_version.seqno);
+
+        persist_version(tree_path, &next_version.version)?;
+        self.append_version(next_version);
+        Ok(())
     }
 
     /// Like `upgrade_version`, but takes an already-allocated sequence number.

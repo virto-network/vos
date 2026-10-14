@@ -3,6 +3,8 @@
 use alloc::vec::Vec;
 use scale::{Decode, Encode};
 
+use crate::keys::Transform;
+
 /// An agent: on JAM, a service, so it shares the service id's width.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
 pub struct AgentId(pub u32);
@@ -15,6 +17,15 @@ pub struct InstanceId(pub u32);
 /// it creates the session, and never reuses one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
 pub struct SessionId(pub u64);
+
+/// A committed map: an instance's field, by its tag, under its key
+/// transform.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
+pub struct MapId {
+    pub instance: InstanceId,
+    pub tag: u32,
+    pub transform: Transform,
+}
 
 /// A client session, named by the client: its key, a random name, and
 /// its creation time in milliseconds since the Unix epoch. The three

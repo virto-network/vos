@@ -273,3 +273,102 @@ agents beside one making about 2.4 MB of results a round:
 **Recorded, rare:** the host never calls vos-raft's
 `discard_unreported`. A replica holding an entry whose blob no member
 still has waits until a restart cuts the entry.
+
+## Step 4.3: tables under key transforms, committed maps, and roots
+
+**Built:**
+- **Every table's rows under a transform.** A row is
+  `instance ‖ part ‖ tag ‖ transform ‖ transform(key)`, and the agent
+  applies the transform itself, so no actor can break the keyspace's
+  prefix-freedom.
+  - **Hashed** (`H128 ‖ escape(key)`) is the default:
+    `pub type DefaultTransform = Hashed;` in `agent/sdk/src/table.rs`.
+  - **Ordered** is `Table<K, V, Ordered>`, with keys of at most 64 bytes.
+  - A scan returns rows in its table's order, with raw keys.
+- **The row ABI:** get, put, delete and scan name their rows with one
+  register (`abi::Rows`: the struct, a table or a committed map, with its
+  tag and transform).
+  - The agent hashes through the precompile, and accumulate hashes
+    nothing.
+  - `cap::STORED_ROW` bounds a scan's page by the largest row a table can
+    hold.
+- **`CommittedMap<K, V, T>`** writes reach the work result apart, in
+  `Run.committed`. At the version a result makes, accumulate writes:
+  - the value row with that version;
+  - a dirty row (version first);
+  - one seed row per version.
+- **The root builder** (`node/host/src/roots`), one task per group:
+  - **Its source:** from a snapshot at the state version V, it reads the
+    dirty rows past the watermark in batches of 10,000 keys, and salts
+    each key with the seed of the version that wrote it.
+  - **Its commits:** each batch is one `Change::Tree`, which the writer
+    refuses once the agent's epoch has moved. A batch deletes the dirty
+    rows it read and the seeds of the versions it has read whole. The
+    last batch finishes every map it touched, or that an interrupted
+    build left part-way, and moves the watermark.
+  - **Recovery:** a failed build is retried, from 50 ms backing off to 5 s.
+  - **Proofs:** `Node::prove` answers a `BatchProof` with its leaves
+    against a map's last complete root, or `Building` while its tree is
+    mid-build.
+- **Prices:**
+  - a get costs 30k (was 20k), a scan 66k (was 60k), plus 90 gas per
+    byte of key, a scan's returned keys included;
+  - the escape is word-at-a-time, and zero bytes are cheap in it, so
+    keys of zeros, its worst case, keep a fifth of their price spare.
+
+**Found and fixed, older than this slice: a store snapshot could see
+part of a commit.**
+- **The bug:** in the vendored lsm-tree, a flush or compaction that
+  finished on a worker published its sequence number as visible while a
+  write batch with a lower one was still inserting.
+  - A snapshot opened then saw the batch in part.
+  - That reaches the Raft snapshot export (a torn state sent to a
+    follower), queries and the root builder, which is how it showed:
+    a value row of version 503 in a snapshot at 502.
+- **The patch** (support/lsm-tree, `super_version.rs`): a version
+  upgrade no longer publishes, so the visible number moves only under
+  the journal writer's lock, after the mover's own inserts.
+  - Bulk ingestion and fjall's meta-keyspace changes still publish the
+    old way, but the node uses neither. `VENDORED.md` and `UPSTREAM.md`
+    say so.
+  - `torn_snapshots` fails without the patch within a second.
+- **For the owner:** a second patch to the vendored lsm-tree, beside
+  the first (edf760e3). Keep it vendored, or file it upstream.
+
+**Tests:**
+- the testkit: committed rows; both transforms' orders, cursors and
+  refills across 300 rows; the ordered key cap; rows at their caps
+  scanning back in a later batch; prices with keys of zeros; the model
+  agreeing;
+- the wire: pins for rows, registers and `Run`; every row key
+  prefix-free;
+- the tree: escape against a byte-loop reference over zero-heavy keys
+  at every alignment. It caught a bug in the first word-at-a-time
+  unescape;
+- the node: three replicas reach the same root as a build from scratch,
+  with every row on the tree, and proofs verify;
+  - a follower caught up by snapshot builds the same root;
+  - an epoch change refuses a stale batch;
+  - a failed build is retried;
+  - a map left part-way is finished;
+  - an untouched map proves while another builds;
+  - `tree_crash`: killed and torn mid-build, it resumes to the root from
+    scratch with no row off the tree;
+- `torn_snapshots`.
+
+**Measured** (1M keys):
+
+| | |
+|---|---|
+| A committed write on the apply path | about 4.3 µs: accumulate 1.05 µs on the JIT, the store's two rows 3.2–3.3 µs (a table write 0.46 + 2.7–3.5) |
+| The builder at 20k committed writes a second for 30 s | 19.9k rows a second built, a median build of 137 ms, at most 14 versions behind, caught up in 162 ms |
+| A build from scratch | 25 µs a key |
+
+Within the 5 µs budget; the builder keeps up near its capacity. A
+faster native BLAKE2b in the node is its next lever.
+
+**Reviewed:**
+- Fable: the patch and the builder hold.
+- Opus: GO with fixes, all in: the scan page bound, the prices with keys
+  of zeros, the escape reference test, the build retry, and bounded
+  catch-up builds.

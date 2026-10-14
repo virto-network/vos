@@ -120,10 +120,14 @@ impl Caller {
         }
         let mut rows = [0u8; 64];
         let mut total = 0;
+        let raw = vos_sdk::abi::Rows::Table {
+            tag: 3,
+            transform: vos_sdk::keys::Transform::Hashed,
+        };
         for index in 0..count {
             total += match kind {
-                0 => u64::from(vos_sdk::host::get(&index.to_be_bytes()).is_some()),
-                _ => vos_sdk::host::scan(&[3], &[], &mut rows),
+                0 => u64::from(vos_sdk::host::get(raw, &index.to_be_bytes()).is_some()),
+                _ => vos_sdk::host::scan(raw, None, &mut rows),
             };
         }
         total

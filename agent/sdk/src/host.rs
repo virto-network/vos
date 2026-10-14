@@ -7,7 +7,7 @@
 
 use alloc::vec::Vec;
 
-use vos_wire::abi::{cap, code, op};
+use vos_wire::abi::{Rows, cap, code, op};
 
 /// An operation's results: φ7 and φ8.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -160,54 +160,75 @@ pub fn self_id() -> (u32, u32) {
     (instance as u32, agent as u32)
 }
 
-pub fn get(key: &[u8]) -> Option<Vec<u8>> {
+/// The value under `key` in `rows`.
+pub fn get(rows: Rows, key: &[u8]) -> Option<Vec<u8>> {
+    get_raw(rows.register(), key)
+}
+
+/// [`get`] with `rows` as its register, any value an actor may pass.
+pub fn get_raw(rows: u64, key: &[u8]) -> Option<Vec<u8>> {
     read_all(128, |out, offset| {
         ecalli!(
             op::GET,
             [
+                rows,
                 ptr(key),
                 key.len() as u64,
                 ptr_mut(out),
                 offset,
-                out.len() as u64,
-                0
+                out.len() as u64
             ]
         )
         .0
     })
 }
 
-pub fn put(key: &[u8], value: &[u8]) {
+pub fn put(rows: Rows, key: &[u8], value: &[u8]) {
+    put_raw(rows.register(), key, value);
+}
+
+/// [`put`] with `rows` as its register.
+pub fn put_raw(rows: u64, key: &[u8], value: &[u8]) {
     ecalli!(
         op::PUT,
         [
+            rows,
             ptr(key),
             key.len() as u64,
             ptr(value),
             value.len() as u64,
-            0,
             0
         ]
     );
 }
 
-pub fn delete(key: &[u8]) {
-    ecalli!(op::DELETE, [ptr(key), key.len() as u64, 0, 0, 0, 0]);
+pub fn delete(rows: Rows, key: &[u8]) {
+    ecalli!(
+        op::DELETE,
+        [rows.register(), ptr(key), key.len() as u64, 0, 0, 0]
+    );
 }
 
-/// Rows under `prefix` after `cursor`, as `E(↕key, ↕value)` back to back,
-/// filling at most `out`; returns the bytes written, 0 at the end, or
+/// The rows of a table or committed map after the key `after`, or from its
+/// first, as `E(↕key, ↕value)` back to back in the table's order, filling
+/// at most `out`; returns the bytes written, 0 at the end, or
 /// [`code::FULL`] when the next row alone does not fit.
-pub fn scan(prefix: &[u8], cursor: &[u8], out: &mut [u8]) -> u64 {
+pub fn scan(rows: Rows, after: Option<&[u8]>, out: &mut [u8]) -> u64 {
+    scan_raw(rows.register(), after, out)
+}
+
+/// [`scan`] with `rows` as its register.
+pub fn scan_raw(rows: u64, after: Option<&[u8]>, out: &mut [u8]) -> u64 {
+    let cursor = after.unwrap_or_default();
     ecalli!(
         op::SCAN,
         [
-            ptr(prefix),
-            prefix.len() as u64,
+            rows,
             ptr(cursor),
             cursor.len() as u64,
             ptr_mut(out),
-            out.len() as u64
+            out.len() as u64,
+            u64::from(after.is_some())
         ]
     )
     .0

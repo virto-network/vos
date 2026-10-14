@@ -15,7 +15,7 @@
 //! written, and synced or not. The writer then takes no more, and the node
 //! halts until a restart reads what is there.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
@@ -129,6 +129,14 @@ pub enum Change {
         time: u64,
         seed: [u8; 32],
     },
+    /// A root build's batch of rows, written to the agent's rows under
+    /// `epoch`: refused if that is no longer its epoch, so a build never
+    /// lands in a snapshot installed or a retirement made meanwhile.
+    Tree {
+        agent: AgentId,
+        epoch: u8,
+        writes: Vec<Write>,
+    },
 }
 
 impl Change {
@@ -136,6 +144,7 @@ impl Change {
     fn synced(&self) -> bool {
         match self {
             Self::Apply { .. }
+            | Self::Tree { .. }
             | Self::LastResult { .. }
             | Self::Compact { .. }
             | Self::Stage { .. }
@@ -148,7 +157,7 @@ impl Change {
     fn bytes(&self) -> usize {
         match self {
             Self::Append { entry, .. } => entry.body.len() + 64,
-            Self::Apply { writes, .. } => writes
+            Self::Apply { writes, .. } | Self::Tree { writes, .. } => writes
                 .iter()
                 .map(|write| write.key.len() + write.value.as_ref().map_or(0, Vec::len))
                 .sum(),
@@ -184,6 +193,9 @@ struct Shared {
     commit_queue: crate::stats::Histogram,
     /// Whether a flush failed: the writer takes no more.
     failed: AtomicBool,
+    /// Agents whose committed writes, or an installed snapshot, left dirty
+    /// rows since their root builder last looked.
+    dirtied: Mutex<HashSet<AgentId>>,
 }
 
 pub struct StorageThread {
@@ -286,6 +298,15 @@ impl Writer {
                     state.applied = *index;
                     after.insert(*agent, state);
                 }
+                Change::Tree { agent, epoch, .. } => {
+                    let state = self.state(&after, *agent)?;
+                    if *epoch != state.epoch {
+                        return Err(format!(
+                            "a root build of agent {} in epoch {epoch} is stale: it is in epoch {}",
+                            agent.0, state.epoch
+                        ));
+                    }
+                }
                 Change::Stage { agent, epoch, .. } | Change::DropEpoch { agent, epoch, .. } => {
                     if *epoch == self.state(&after, *agent)?.epoch {
                         return Err(format!(
@@ -387,6 +408,8 @@ impl Writer {
         let mut synced = false;
         // Applies in this batch: they count only once it commits.
         let mut applied: HashMap<AgentId, u64> = HashMap::new();
+        let dirty = vos_wire::keys::dirty_prefix();
+        let mut dirtied = Vec::new();
         // Agents retired in this batch: nothing of theirs is applied.
         let mut retired = Vec::new();
         // Commits in order, each with its refusal if it has one; a refused
@@ -426,6 +449,9 @@ impl Writer {
                         batch.apply(*agent, *epoch, *index, writes);
                         let entry = applied.entry(*agent).or_insert(*index);
                         *entry = (*entry).max(*index);
+                        if writes.iter().any(|write| write.key.starts_with(&dirty)) {
+                            dirtied.push(*agent);
+                        }
                     }
                     Change::Stage {
                         agent, epoch, rows, ..
@@ -439,6 +465,7 @@ impl Writer {
                         batch.switch(*agent, switch);
                         let entry = applied.entry(*agent).or_insert(switch.index);
                         *entry = (*entry).max(switch.index);
+                        dirtied.push(*agent);
                     }
                     Change::Pin { hash, agent } => batch.pin(hash, *agent),
                     Change::Unpin { hash, agent } => batch.unpin(hash, *agent),
@@ -457,6 +484,11 @@ impl Writer {
                     Change::LastResult { agent, time, seed } => {
                         batch.last_result(*agent, *time, seed)
                     }
+                    Change::Tree {
+                        agent,
+                        epoch,
+                        writes,
+                    } => batch.rows(*agent, *epoch, writes),
                 }
             }
             taken.push((commit, None));
@@ -489,6 +521,10 @@ impl Writer {
             self.shared.failed.store(true, Ordering::SeqCst);
         } else {
             self.agents.extend(pending);
+            // Marked once written and before the commits are answered: the
+            // root builder wakes when the applier, answered, moves the
+            // applied index, so it finds the mark for every row it can see.
+            lock(&self.shared.dirtied).extend(dirtied);
             if !retired.is_empty() {
                 let mut durable = lock(&self.shared.durably_applied);
                 for agent in retired {
@@ -605,6 +641,11 @@ impl StorageThread {
         let mut durable = lock(&self.shared.durably_applied);
         let entry = durable.entry(agent).or_insert(applied);
         *entry = (*entry).max(applied);
+    }
+
+    /// Whether `agent`'s commits left dirty rows since this was last asked.
+    pub fn take_dirtied(&self, agent: AgentId) -> bool {
+        lock(&self.shared.dirtied).remove(&agent)
     }
 
     /// `agent`'s highest applied index a synced flush made durable.

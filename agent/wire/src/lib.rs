@@ -68,7 +68,7 @@ pub mod defaults {
     // created within the skew of t0, so a collected session can never be
     // created again.
     const _: () = assert!(SESSION_EXPIRY_MS >= 2 * SESSION_SKEW_MS);
-    /// A handler's gas limit when its schema declares none: about 500
+    /// A handler's gas limit when its schema declares none: about 330
     /// gets, 150 puts or 5,000 register-only operations, or about 16,000
     /// BLAKE2b compressions.
     pub const HANDLER_GAS: u64 = 10_000_000;

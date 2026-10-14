@@ -1,7 +1,7 @@
 //! The VOS actor SDK's macros.
 //!
-//! - `#[actor]` on the state struct: its encoding, which skips `Table`
-//!   fields, and each table's tag.
+//! - `#[actor]` on the state struct: its encoding, which skips `Table` and
+//!   `CommittedMap` fields, and each one's tag.
 //! - `#[messages]` on the impl block: a message type per handler, the
 //!   dispatcher, the program's entry point and its schema.
 
@@ -88,11 +88,12 @@ fn string_arg(meta: &syn::meta::ParseNestedMeta) -> syn::Result<String> {
 // ===== #[actor] =====
 
 /// The actor's state: a struct whose encoding is stored under the instance,
-/// and whose `Table` fields are handles to rows stored beside it.
+/// and whose `Table` and `CommittedMap` fields are handles to rows stored
+/// beside it.
 ///
 /// A table's tag derives from its field's name, or from
 /// `#[table(name = "...")]`, which keeps rows reachable when the field is
-/// renamed.
+/// renamed. Its key transform is its type's.
 #[proc_macro_attribute]
 pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
     if !attr.is_empty() {
@@ -139,14 +140,14 @@ fn actor_impl(mut input: ItemStruct) -> syn::Result<Tokens> {
             }
         }
         field.attrs = kept;
-        if !(explicit || is_named(&field.ty, "Table")) {
+        if !(explicit || is_named(&field.ty, "Table") || is_named(&field.ty, "CommittedMap")) {
             continue;
         }
         let table_name = table_name.unwrap_or_else(|| ident.to_string());
         let tag = tags.take("vos/table/", &table_name, field.span())?;
         field.attrs.push(syn::parse_quote!(#[codec(skip)]));
         binds.push(quote! {
-            self.#ident = ::vos_sdk::table::Table::new(::vos_sdk::table::Tag(#tag));
+            self.#ident = ::vos_sdk::table::Bind::bound(::vos_sdk::table::Tag(#tag));
         });
     }
     Ok(quote! {

@@ -5,7 +5,7 @@ use scale::{Decode, Encode};
 
 use crate::abi::{Failure, Refusal, cap};
 use crate::batch::Body;
-use crate::ids::{AgentId, InstanceId, ProgramHash, SessionId, SessionRef};
+use crate::ids::{AgentId, InstanceId, MapId, ProgramHash, SessionId, SessionRef};
 
 /// What one refine produced. Steps are in dispatch order; accumulate applies
 /// their writes in that order. Inputs not covered by a step were not
@@ -95,6 +95,9 @@ pub struct Run {
     /// another replica re-runs it.
     pub instances: Vec<InstanceGas>,
     pub writes: Vec<Write>,
+    /// Writes to committed maps, apart: accumulate marks each dirty for
+    /// its map's root.
+    pub committed: Vec<CommittedWrite>,
     pub messages: Vec<Outgoing>,
     pub attests: Vec<Attest>,
     pub gas_used: u64,
@@ -131,6 +134,15 @@ pub struct InstanceGas {
 /// A write to the agent's state: a value, or (`None`) a deletion.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Write {
+    pub key: Vec<u8>,
+    pub value: Option<Vec<u8>>,
+}
+
+/// A write to a committed map: its key already transformed (`key'`, as
+/// the map's tree holds it), and a value, or (`None`) a deletion.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct CommittedWrite {
+    pub map: MapId,
     pub key: Vec<u8>,
     pub value: Option<Vec<u8>>,
 }

@@ -17,16 +17,20 @@ use blake2::digest::consts::U32;
 use blake2::{Blake2b, Digest};
 use vos_pvm::ExitReason;
 use vos_pvm::refine::Machine;
-use vos_wire::abi::{self, Failure, Kind, cap, code, op, price};
+use vos_wire::abi::{self, Failure, Kind, Rows, cap, code, op, price};
 use vos_wire::batch::{Await, Body};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash};
 use vos_wire::keys;
-use vos_wire::result::{Attest, InstanceGas, Outcome, Outgoing, Write};
+use vos_wire::records::{unversioned, versioned};
+use vos_wire::result::{Attest, CommittedWrite, InstanceGas, Outcome, Outgoing, Write};
 use vos_wire::schema::{Schema, SchemaError};
 use vos_wire::{Decode, Encode};
 
 /// Nested invocations a step may hold at once: the agent's inner machines.
 const MAX_DEPTH: usize = 63;
+
+/// Rows of state, each a key and its value, in key order.
+type StateRows = Vec<(Vec<u8>, Vec<u8>)>;
 
 pub fn program_hash(blob: &[u8]) -> ProgramHash {
     ProgramHash(Blake2b::<U32>::digest(blob).into())
@@ -56,6 +60,7 @@ pub struct Step {
     pub outcome: Outcome,
     pub instances: Vec<InstanceGas>,
     pub writes: Vec<Write>,
+    pub committed: Vec<CommittedWrite>,
     pub messages: Vec<Outgoing>,
     pub attests: Vec<Attest>,
     pub gas_used: u64,
@@ -66,6 +71,9 @@ pub struct Testkit {
     /// The batch time and seed operations see.
     pub time: u64,
     pub seed: [u8; 32],
+    /// The agent's state version once the batch applies: its committed
+    /// writes are made at it, as accumulate makes them.
+    pub version: u64,
     /// The gas limit of a handler whose schema requests none, and the most
     /// any handler may request.
     pub default_gas: u64,
@@ -82,6 +90,7 @@ impl Testkit {
             agent,
             time: 0,
             seed: [0; 32],
+            version: 0,
             default_gas: vos_wire::defaults::HANDLER_GAS,
             max_gas: vos_wire::defaults::MAX_HANDLER_GAS,
             instances: BTreeMap::new(),
@@ -133,11 +142,13 @@ impl Testkit {
         Ok(())
     }
 
-    /// Start a batch: its time and seed, and step indices from 0.
+    /// Start a batch: its time and seed, step indices from 0, and the next
+    /// state version.
     pub fn batch(&mut self, time: u64, seed: [u8; 32]) {
         self.time = time;
         self.seed = seed;
         self.steps = 0;
+        self.version += 1;
     }
 
     pub fn set_role(&mut self, principal: Principal, role: Option<u8>) {
@@ -158,7 +169,8 @@ impl Testkit {
             .map(|method| method.id)
     }
 
-    /// Every row of the agent's applied state, in key order.
+    /// Every row of the agent's applied state the model keeps (instances'
+    /// rows, and committed maps' dirty and seed rows), in key order.
     pub fn rows(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
         self.state
             .iter()
@@ -197,20 +209,42 @@ impl Testkit {
             let overlay = run.frames.pop().expect("the step overlay");
             let messages = std::mem::take(&mut run.messages);
             let attests = std::mem::take(&mut run.attests);
-            let writes: Vec<Write> = overlay
-                .into_iter()
-                .map(|(key, value)| Write { key, value })
-                .collect();
+            let mut writes = Vec::new();
+            let mut committed = Vec::new();
+            for (key, value) in overlay {
+                match keys::committed_entry(&key) {
+                    Some((map, transformed)) => committed.push(CommittedWrite {
+                        map,
+                        key: transformed.to_vec(),
+                        value,
+                    }),
+                    None => writes.push(Write { key, value }),
+                }
+            }
             for write in &writes {
                 match &write.value {
                     Some(value) => self.state.insert(write.key.clone(), value.clone()),
                     None => self.state.remove(&write.key),
                 };
             }
+            for write in &committed {
+                let row = keys::committed(&write.map, &write.key);
+                match &write.value {
+                    Some(value) => self.state.insert(row, versioned(self.version, value)),
+                    None => self.state.remove(&row),
+                };
+                let dirty = keys::dirty(self.version, &write.map, &write.key);
+                self.state.insert(dirty, Vec::new());
+            }
+            if !committed.is_empty() {
+                self.state
+                    .insert(keys::seed(self.version), self.seed.to_vec());
+            }
             Step {
                 outcome,
                 instances,
                 writes,
+                committed,
                 messages,
                 attests,
                 gas_used,
@@ -220,6 +254,7 @@ impl Testkit {
                 outcome,
                 instances,
                 writes: Vec::new(),
+                committed: Vec::new(),
                 messages: Vec::new(),
                 attests: Vec::new(),
                 gas_used,
@@ -272,6 +307,7 @@ impl Testkit {
             outcome,
             instances: Vec::new(),
             writes: Vec::new(),
+            committed: Vec::new(),
             messages,
             attests: Vec::new(),
             gas_used: 0,
@@ -553,19 +589,19 @@ impl<'a> Run<'a> {
                 machine.registers_mut()[8] = u64::from(self.kit.agent.0);
             }
             op::GET => {
-                let key = self.key(machine, instance, r[7], r[8])?;
-                match self.read_state(&key) {
+                let key = row(machine, instance, r[7], r[8], r[9])?;
+                match self.read_state(&key)? {
                     Some(value) => {
-                        copy_out(machine, &value, r[9], r[10], r[11])?;
+                        copy_out(machine, &value, r[10], r[11], r[12])?;
                         machine.registers_mut()[7] = value.len() as u64;
                     }
                     None => machine.registers_mut()[7] = code::NONE,
                 }
             }
             op::PUT | op::DELETE => {
-                let key = self.key(machine, instance, r[7], r[8])?;
+                let key = row(machine, instance, r[7], r[8], r[9])?;
                 let value = if id == op::PUT {
-                    Some(read(machine, r[9], r[10], cap::VALUE)?)
+                    Some(read(machine, r[10], r[11], cap::VALUE)?)
                 } else {
                     None
                 };
@@ -577,22 +613,39 @@ impl<'a> Run<'a> {
                 machine.registers_mut()[7] = code::OK;
             }
             op::SCAN => {
-                let prefix = self.key(machine, instance, r[7], r[8])?;
-                let cursor = read(machine, r[9], r[10], cap::KEY)?;
-                let base = keys::instance_prefix(instance);
-                let after = (!cursor.is_empty()).then(|| [base.clone(), cursor].concat());
-                let capacity = (r[12] as usize).min(cap::SCAN);
+                let cursor = match r[12] {
+                    0 => None,
+                    1 => Some(read_key(machine, r[8], r[9])?),
+                    _ => return Err(Failure::Trapped),
+                };
+                let rows = Rows::from_register(r[7]).ok_or(Failure::Trapped)?;
+                let (prefix, transform) =
+                    keys::rows_prefix(instance, rows).ok_or(Failure::Trapped)?;
+                let after = match cursor {
+                    Some(cursor) => Some(keys::row(instance, rows, &cursor)?),
+                    None => None,
+                };
+                let capacity = (r[11] as usize).min(cap::SCAN);
                 let mut out = Vec::new();
                 let mut full = false;
-                for (key, value) in self.rows(&prefix, after.as_deref()) {
-                    let row = (key[base.len()..].to_vec(), value).encode();
+                let mut returned = 0;
+                for (key, value) in self.rows(&prefix, after.as_deref())? {
+                    let raw = transform
+                        .raw(&key[prefix.len()..])
+                        .ok_or(Failure::Trapped)?;
+                    let length = raw.len();
+                    let row = (raw, value).encode();
                     if out.len() + row.len() > capacity {
                         full = out.is_empty();
                         break;
                     }
+                    returned += length;
                     out.extend_from_slice(&row);
                 }
-                write(machine, r[11], &out)?;
+                if !machine.charge(returned as u64 * price::KEY_BYTE) {
+                    return Err(Failure::OutOfGas);
+                }
+                write(machine, r[10], &out)?;
                 machine.registers_mut()[7] = if full { code::FULL } else { out.len() as u64 };
             }
             op::CALL => {
@@ -698,40 +751,31 @@ impl<'a> Run<'a> {
         Ok(())
     }
 
-    /// The agent-relative key for the instance-relative key at
-    /// `address`/`len`.
-    fn key(
-        &self,
-        machine: &mut Machine,
-        instance: InstanceId,
-        address: u64,
-        len: u64,
-    ) -> Result<Vec<u8>, Failure> {
-        let relative = read(machine, address, len, cap::KEY)?;
-        if relative.is_empty() {
-            return Err(Failure::Trapped);
-        }
-        Ok([keys::instance_prefix(instance), relative].concat())
-    }
-
-    fn read_state(&self, key: &[u8]) -> Option<Vec<u8>> {
+    /// A value through the overlays and applied state.
+    fn read_state(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Failure> {
         for frame in self.frames.iter().rev() {
             if let Some(value) = frame.get(key) {
-                return value.clone();
+                return Ok(value.clone());
             }
         }
-        self.kit.state.get(key).cloned()
+        self.kit
+            .state
+            .get(key)
+            .map(|value| held(key, value))
+            .transpose()
     }
 
     /// Rows under `prefix`, after `after` when given, through the overlays.
-    fn rows(&self, prefix: &[u8], after: Option<&[u8]>) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let mut merged: BTreeMap<Vec<u8>, Option<Vec<u8>>> = self
+    fn rows(&self, prefix: &[u8], after: Option<&[u8]>) -> Result<StateRows, Failure> {
+        let mut merged: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
+        for (key, value) in self
             .kit
             .state
             .range(prefix.to_vec()..)
             .take_while(|(key, _)| key.starts_with(prefix))
-            .map(|(key, value)| (key.clone(), Some(value.clone())))
-            .collect();
+        {
+            merged.insert(key.clone(), Some(held(key, value)?));
+        }
         for frame in &self.frames {
             for (key, value) in frame.range(prefix.to_vec()..) {
                 if !key.starts_with(prefix) {
@@ -740,11 +784,45 @@ impl<'a> Run<'a> {
                 merged.insert(key.clone(), value.clone());
             }
         }
-        merged
+        Ok(merged
             .into_iter()
             .filter(|(key, _)| after.is_none_or(|after| key.as_slice() > after))
             .filter_map(|(key, value)| Some((key, value?)))
-            .collect()
+            .collect())
+    }
+}
+
+/// The value applied state holds under `key`: in a committed map's value
+/// row, without the version that wrote it.
+fn held(key: &[u8], value: &[u8]) -> Result<Vec<u8>, Failure> {
+    match keys::is_committed(key) {
+        true => Ok(unversioned(value).ok_or(Failure::Trapped)?.1.to_vec()),
+        false => Ok(value.to_vec()),
+    }
+}
+
+/// The agent-relative key of the row an operation names, by the register
+/// `rows` and the actor's key at `address`/`len`.
+fn row(
+    machine: &mut Machine,
+    instance: InstanceId,
+    rows: u64,
+    address: u64,
+    len: u64,
+) -> Result<Vec<u8>, Failure> {
+    let key = read_key(machine, address, len)?;
+    let rows = Rows::from_register(rows).ok_or(Failure::Trapped)?;
+    keys::row(instance, rows, &key)
+}
+
+/// A row operation's key at `address`: its bytes, with the price of its
+/// transform charged after their copy.
+fn read_key(machine: &mut Machine, address: u64, len: u64) -> Result<Vec<u8>, Failure> {
+    let key = read(machine, address, len, cap::KEY)?;
+    if machine.charge(key.len() as u64 * price::KEY_BYTE) {
+        Ok(key)
+    } else {
+        Err(Failure::OutOfGas)
     }
 }
 

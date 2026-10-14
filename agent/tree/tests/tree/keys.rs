@@ -50,6 +50,52 @@ proptest! {
     }
 }
 
+/// Escaping a byte at a time, as the format defines it.
+fn plain_escape(key: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for &byte in key {
+        out.push(byte);
+        if byte == 0 {
+            out.push(0xFF);
+        }
+    }
+    out.extend_from_slice(&[0, 0]);
+    out
+}
+
+/// Keys of up to 64 bytes, mostly zeros, and a buffer offset that puts them
+/// at every alignment.
+fn zero_heavy() -> impl Strategy<Value = (Vec<u8>, usize)> {
+    let byte = prop_oneof![4 => Just(0u8), 1 => Just(0xFF), 1 => any::<u8>()];
+    (prop::collection::vec(byte, 0..=64), 0usize..8)
+}
+
+/// `key` at `offset` bytes into a buffer.
+fn placed(key: &[u8], offset: usize) -> Vec<u8> {
+    [&vec![7u8; offset][..], key].concat()
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(4096))]
+
+    /// The word-at-a-time escape and unescape agree with a byte loop at
+    /// every alignment, and keep order, prefix-freedom and the round trip.
+    #[test]
+    fn escape_agrees_with_a_byte_loop((a, at) in zero_heavy(), (b, bt) in zero_heavy()) {
+        let (x_buffer, y_buffer) = (placed(&a, at), placed(&b, bt));
+        let (x, y) = (escape(&x_buffer[at..]), escape(&y_buffer[bt..]));
+        prop_assert_eq!(&x, &plain_escape(&a));
+        prop_assert_eq!(x.cmp(&y), a.cmp(&b));
+        if a != b {
+            prop_assert!(!x.starts_with(&y) && !y.starts_with(&x));
+        }
+        let mut tail = placed(&x, bt);
+        tail.extend_from_slice(&y);
+        prop_assert_eq!(unescape(&tail[bt..]), Some((a.clone(), x.len())));
+        prop_assert_eq!(unescape(&x[..x.len() - 1]), None, "cut short");
+    }
+}
+
 #[test]
 fn prefix_end_drops_trailing_ff() {
     assert_eq!(prefix_end(b"a/"), Some(b"a0".to_vec()));

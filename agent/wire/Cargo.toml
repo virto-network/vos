@@ -8,6 +8,8 @@ description = "Wire types shared by the VOS node, the default agent program and 
 [dependencies]
 scale = { package = "vos-pvm-codec", path = "../../pvm/codec", default-features = false }
 vos-pvm-program = { workspace = true }
+# The key transforms every table's rows are keyed by.
+vos-tree = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"

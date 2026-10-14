@@ -6,15 +6,17 @@ use alloc::rc::Rc;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 
-use vos_wire::abi::{self, Failure, Kind, Refusal, cap, code, op, price};
+use vos_wire::abi::{self, Failure, Kind, Refusal, Rows, cap, code, op, price};
 use vos_wire::batch::{Admin, Await, Batch, Body, Input, Message, Query, Request, Work};
 use vos_wire::ids::{
     AgentId, InstanceId, MethodId, Principal, ProgramHash, Session, SessionId, SessionRef,
 };
 use vos_wire::jam::RefineArgs;
-use vos_wire::records::{Installed, SessionMark, unstored};
+use vos_wire::keys::Transform;
+use vos_wire::records::{Installed, SessionMark, unstored, unversioned};
 use vos_wire::result::{
-    Attest, InputRef, InstanceGas, Outcome, Outgoing, ResultWriter, Run, Step, Write,
+    Attest, CommittedWrite, InputRef, InstanceGas, Outcome, Outgoing, ResultWriter, Run, Step,
+    Write,
 };
 use vos_wire::schema::Schema;
 use vos_wire::{Decode, Encode, defaults, expiry, keys};
@@ -25,14 +27,14 @@ use crate::machines::{ARGUMENTS, Exit, Machine, Unavailable};
 /// Nested invocations a step may hold at once.
 const MAX_DEPTH: usize = 63;
 /// Applied rows fetched per `state_scan` at first; a page grows to
-/// [`cap::SCAN`], room for the largest row, when a row needs it.
+/// [`cap::STORED_ROW`], room for the largest row, when a row needs it.
 const SCAN_PAGE: usize = 4096;
 /// Where a program's schema starts: the read-only zone.
 const SCHEMA_AT: u64 = 1 << 16;
 
 type Overlay = BTreeMap<Vec<u8>, Option<Vec<u8>>>;
 /// Rows of state, each a key and its value, in key order.
-type Rows = Vec<(Vec<u8>, Vec<u8>)>;
+type StateRows = Vec<(Vec<u8>, Vec<u8>)>;
 
 pub fn run(arguments: &[u8]) -> Vec<u8> {
     let arguments = RefineArgs::decode(arguments).expect("refine arguments");
@@ -56,10 +58,21 @@ impl From<Corrupt> for Failure {
     }
 }
 
+/// The value stored under `key`: without its format byte, and, in a
+/// committed map's value row, without the version that wrote it.
+fn stored_value<'a>(key: &[u8], bytes: &'a [u8]) -> Result<&'a [u8], Corrupt> {
+    let value = unstored(bytes).ok_or(Corrupt)?;
+    if keys::is_committed(key) {
+        unversioned(value).map(|(_, value)| value).ok_or(Corrupt)
+    } else {
+        Ok(value)
+    }
+}
+
 /// A value of applied state, by agent-relative key.
 fn applied(key: &[u8]) -> Result<Option<Vec<u8>>, Corrupt> {
     state_read(key)
-        .map(|bytes| unstored(&bytes).map(<[u8]>::to_vec).ok_or(Corrupt))
+        .map(|bytes| stored_value(key, &bytes).map(<[u8]>::to_vec))
         .transpose()
 }
 
@@ -83,15 +96,18 @@ fn record<T: Decode>(key: &[u8]) -> Result<Option<T>, Corrupt> {
 }
 
 /// Applied rows under `prefix` after `after`, a page at a time.
-fn applied_rows(prefix: &[u8], after: &[u8]) -> Result<Rows, Corrupt> {
+fn applied_rows(prefix: &[u8], after: &[u8]) -> Result<StateRows, Corrupt> {
     scan_page(prefix, after)
         .into_iter()
-        .map(|(key, value)| Ok((key, unstored(&value).ok_or(Corrupt)?.to_vec())))
+        .map(|(key, value)| {
+            let value = stored_value(&key, &value)?.to_vec();
+            Ok((key, value))
+        })
         .collect()
 }
 
 /// A page of rows under `prefix` after `after`, their values as stored.
-fn scan_page(prefix: &[u8], after: &[u8]) -> Rows {
+fn scan_page(prefix: &[u8], after: &[u8]) -> StateRows {
     let mut capacity = SCAN_PAGE;
     let out = loop {
         let mut out: Vec<u8> = Vec::with_capacity(capacity);
@@ -109,8 +125,8 @@ fn scan_page(prefix: &[u8], after: &[u8]) -> Rows {
         match written {
             code::WHAT => unserved(),
             code::FULL => {
-                assert!(capacity < cap::SCAN, "a stored row larger than a scan");
-                capacity = cap::SCAN;
+                assert!(capacity < cap::STORED_ROW, "a stored row past its cap");
+                capacity = cap::STORED_ROW;
             }
             written => {
                 // SAFETY: the host wrote `written` bytes, at most the
@@ -138,15 +154,16 @@ struct Base {
     time: u64,
     seed: [u8; 32],
     /// Writes of the steps already committed in this refine, in order.
-    committed: Overlay,
+    earlier: Overlay,
     /// Installed records read in this refine. Only admin steps change
     /// them, and they clear it.
     installed: RefCell<BTreeMap<InstanceId, Option<Rc<Installed>>>>,
 }
 
 impl Base {
+    /// A value through this refine's earlier steps and applied state.
     fn read(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Corrupt> {
-        match self.committed.get(key) {
+        match self.earlier.get(key) {
             Some(value) => Ok(value.clone()),
             None => applied(key),
         }
@@ -315,7 +332,7 @@ fn run_batch(agent: AgentId, batch: Batch) -> Vec<u8> {
         agent,
         time: batch.time,
         seed: batch.seed,
-        committed: BTreeMap::new(),
+        earlier: BTreeMap::new(),
         installed: RefCell::new(BTreeMap::new()),
     };
     let mut sessions: BTreeMap<ByName, Held> = BTreeMap::new();
@@ -395,8 +412,11 @@ fn run_batch(agent: AgentId, batch: Batch) -> Vec<u8> {
         }
         if let Step::Ran(run) = &step {
             for write in &run.writes {
-                base.committed
-                    .insert(write.key.clone(), write.value.clone());
+                base.earlier.insert(write.key.clone(), write.value.clone());
+            }
+            for write in &run.committed {
+                let key = keys::committed(&write.map, &write.key);
+                base.earlier.insert(key, write.value.clone());
             }
         }
         if admin {
@@ -515,6 +535,7 @@ fn consumed(input: InputRef, outcome: Outcome) -> Run {
         outcome,
         instances: Vec::new(),
         writes: Vec::new(),
+        committed: Vec::new(),
         messages: Vec::new(),
         attests: Vec::new(),
         gas_used: 0,
@@ -544,15 +565,13 @@ fn command(
     match outcome {
         Outcome::Done(reply) => {
             let overlay = frames.pop().expect("the step overlay");
-            let writes: Vec<Write> = overlay
-                .into_iter()
-                .map(|(key, value)| Write { key, value })
-                .collect();
+            let (writes, committed) = split(overlay);
             Run {
                 input,
                 outcome: Outcome::Done(reply),
                 instances,
                 writes,
+                committed,
                 messages,
                 attests,
                 gas_used,
@@ -563,6 +582,7 @@ fn command(
             outcome: failed,
             instances,
             writes: Vec::new(),
+            committed: Vec::new(),
             messages: Vec::new(),
             attests: Vec::new(),
             gas_used,
@@ -570,12 +590,31 @@ fn command(
     }
 }
 
+/// A step's writes: those to committed maps apart, by map and transformed
+/// key.
+fn split(overlay: Overlay) -> (Vec<Write>, Vec<CommittedWrite>) {
+    let mut writes = Vec::new();
+    let mut committed = Vec::new();
+    for (key, value) in overlay {
+        if let Some((map, transformed)) = keys::committed_entry(&key) {
+            committed.push(CommittedWrite {
+                map,
+                key: transformed.to_vec(),
+                value,
+            });
+        } else {
+            writes.push(Write { key, value });
+        }
+    }
+    (writes, committed)
+}
+
 fn run_query(agent: AgentId, query: Query) -> Outcome {
     let base = Base {
         agent,
         time: query.time,
         seed: query.seed,
-        committed: BTreeMap::new(),
+        earlier: BTreeMap::new(),
         installed: RefCell::new(BTreeMap::new()),
     };
     let mut invocation = Invocation::new(&base, 0, Kind::Query);
@@ -660,6 +699,7 @@ fn admin(admin: Admin) -> Step {
         outcome: Outcome::Done(Vec::new()),
         instances: Vec::new(),
         writes: alloc::vec![write],
+        committed: Vec::new(),
         messages: Vec::new(),
         attests: Vec::new(),
         gas_used: 0,
@@ -960,19 +1000,19 @@ impl<'a> Invocation<'a> {
                 machine.set_register(8, u64::from(self.base.agent.0));
             }
             op::GET => {
-                let key = key(machine, instance, r[7], r[8])?;
+                let key = row(machine, instance, r[7], r[8], r[9])?;
                 match self.read_state(&key)? {
                     Some(value) => {
-                        copy_out(machine, &value, r[9], r[10], r[11])?;
+                        copy_out(machine, &value, r[10], r[11], r[12])?;
                         machine.set_register(7, value.len() as u64);
                     }
                     None => machine.set_register(7, code::NONE),
                 }
             }
             op::PUT | op::DELETE => {
-                let key = key(machine, instance, r[7], r[8])?;
+                let key = row(machine, instance, r[7], r[8], r[9])?;
                 let value = if id == op::PUT {
-                    Some(read(machine, r[9], r[10], cap::VALUE)?)
+                    Some(read(machine, r[10], r[11], cap::VALUE)?)
                 } else {
                     None
                 };
@@ -984,13 +1024,23 @@ impl<'a> Invocation<'a> {
                 machine.set_register(7, code::OK);
             }
             op::SCAN => {
-                let prefix = key(machine, instance, r[7], r[8])?;
-                let cursor = read(machine, r[9], r[10], cap::KEY)?;
-                let base = keys::instance_prefix(instance);
-                let after = (!cursor.is_empty()).then(|| [base.as_slice(), &cursor].concat());
-                let capacity = (r[12] as usize).min(cap::SCAN);
-                let (out, full) = self.scan(&prefix, after, capacity, base.len())?;
-                write(machine, r[11], &out)?;
+                let cursor = match r[12] {
+                    0 => None,
+                    1 => Some(read_key(machine, r[8], r[9])?),
+                    _ => return Err(Failure::Trapped),
+                };
+                let rows = Rows::from_register(r[7]).ok_or(Failure::Trapped)?;
+                let (prefix, transform) =
+                    keys::rows_prefix(instance, rows).ok_or(Failure::Trapped)?;
+                let after = cursor
+                    .map(|cursor| keys::row(instance, rows, &cursor))
+                    .transpose()?;
+                let capacity = (r[11] as usize).min(cap::SCAN);
+                let (out, full, returned) = self.scan(&prefix, after, capacity, transform)?;
+                if !machine.charge(returned as u64 * price::KEY_BYTE) {
+                    return Err(Failure::OutOfGas);
+                }
+                write(machine, r[10], &out)?;
                 machine.set_register(7, if full { code::FULL } else { out.len() as u64 });
             }
             op::CALL => {
@@ -1085,7 +1135,7 @@ impl<'a> Invocation<'a> {
         Ok(())
     }
 
-    /// A value through the call frames, the step's committed writes and
+    /// A value through the call frames, the refine's earlier steps and
     /// applied state.
     fn read_state(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Corrupt> {
         for frame in self.frames.iter().rev() {
@@ -1096,10 +1146,11 @@ impl<'a> Invocation<'a> {
         self.base.read(key)
     }
 
-    /// Rows under `prefix`, after `after` when given, merged through
-    /// every overlay and packed until `capacity`, with keys relative to
-    /// the instance (`strip` bytes off); and whether the first row alone
-    /// did not fit. The sources are walked in key order and the walk stops
+    /// The rows of the table at `prefix`, after `after` when given, merged
+    /// through every overlay and packed until `capacity`, each with the
+    /// key its `transform` was given; whether the first row alone did not
+    /// fit; and the bytes of the keys returned. The sources are walked in
+    /// key order and the walk stops
     /// when the buffer is full, so a scan costs the rows it returns, not
     /// the overlays' size.
     fn scan(
@@ -1107,10 +1158,11 @@ impl<'a> Invocation<'a> {
         prefix: &[u8],
         mut after: Option<Vec<u8>>,
         capacity: usize,
-        strip: usize,
-    ) -> Result<(Vec<u8>, bool), Corrupt> {
+        transform: Transform,
+    ) -> Result<(Vec<u8>, bool, usize), Corrupt> {
         use core::ops::Bound;
         let mut out = Vec::new();
+        let mut returned = 0;
         loop {
             // A page of applied rows bounds which overlay rows join it; an
             // empty page means no applied rows remain, so all of them do.
@@ -1124,9 +1176,9 @@ impl<'a> Invocation<'a> {
             };
             let joins =
                 |key: &[u8]| key.starts_with(prefix) && bound.is_none_or(|bound| key <= bound);
-            // Lowest precedence first: the refine's committed writes, then
-            // each frame up the stack.
-            let mut overlays: Vec<_> = core::iter::once(&self.base.committed)
+            // Lowest precedence first: the refine's earlier steps' writes,
+            // then each frame up the stack.
+            let mut overlays: Vec<_> = core::iter::once(&self.base.earlier)
                 .chain(self.frames.iter())
                 .map(|overlay| {
                     overlay
@@ -1137,43 +1189,47 @@ impl<'a> Invocation<'a> {
                 .collect();
             let mut applied = page.iter().peekable();
             loop {
-                let mut next = applied.peek().map(|(key, _)| key.as_slice());
+                let mut next = applied.peek().copied().map(|(key, _)| key.as_slice());
                 for overlay in &mut overlays {
-                    if let Some((key, _)) = overlay.peek()
+                    if let Some(&(key, _)) = overlay.peek()
                         && next.is_none_or(|next| key.as_slice() < next)
                     {
                         next = Some(key.as_slice());
                     }
                 }
-                let Some(key) = next.map(<[u8]>::to_vec) else {
+                let Some(key) = next else {
                     break;
                 };
+                // The source the key came from holds it without a compare:
+                // keys here run to kilobytes.
+                let holds = |head: &[u8]| core::ptr::eq(head, key) || head == key;
                 // The highest source holding the key decides its value.
                 let mut value: Option<Option<&[u8]>> = None;
                 for overlay in overlays.iter_mut().rev() {
-                    if overlay.peek().is_some_and(|(head, _)| **head == key) {
+                    if overlay.peek().is_some_and(|&(head, _)| holds(head)) {
                         let (_, held) = overlay.next().expect("peeked");
                         value.get_or_insert(held.as_deref());
                     }
                 }
-                if applied.peek().is_some_and(|(head, _)| *head == key) {
+                if applied.peek().is_some_and(|(head, _)| holds(head)) {
                     let (_, held) = applied.next().expect("peeked");
                     value.get_or_insert(Some(held));
                 }
                 let Some(Some(value)) = value else { continue };
-                let relative = &key[strip..];
-                if out.len() + 8 + relative.len() + value.len() > capacity {
+                let raw = transform.raw(&key[prefix.len()..]).ok_or(Corrupt)?;
+                if out.len() + 8 + raw.len() + value.len() > capacity {
                     let full = out.is_empty();
-                    return Ok((out, full));
+                    return Ok((out, full, returned));
                 }
-                (relative.len() as u32).encode_to(&mut out);
-                out.extend_from_slice(relative);
+                returned += raw.len();
+                (raw.len() as u32).encode_to(&mut out);
+                out.extend_from_slice(&raw);
                 (value.len() as u32).encode_to(&mut out);
                 out.extend_from_slice(value);
             }
             match bound {
                 Some(bound) => after = Some(bound.to_vec()),
-                None => return Ok((out, false)),
+                None => return Ok((out, false, returned)),
             }
         }
     }
@@ -1242,18 +1298,27 @@ fn attestable(
     }
 }
 
-/// The agent-relative key for the instance-relative key at `address`.
-fn key(
+/// The agent-relative key of the row an operation names: its rows, by the
+/// register `rows`, and the actor's key at `address`.
+fn row(
     machine: &mut Machine,
     instance: InstanceId,
+    rows: u64,
     address: u64,
     len: u64,
 ) -> Result<Vec<u8>, Failure> {
-    let relative = read(machine, address, len, cap::KEY)?;
-    if relative.is_empty() {
-        return Err(Failure::Trapped);
+    let key = read_key(machine, address, len)?;
+    let rows = Rows::from_register(rows).ok_or(Failure::Trapped)?;
+    keys::row(instance, rows, &key)
+}
+
+/// A row operation's key: its bytes, and the price of transforming them.
+fn read_key(machine: &mut Machine, address: u64, len: u64) -> Result<Vec<u8>, Failure> {
+    let key = read(machine, address, len, cap::KEY)?;
+    if !machine.charge(key.len() as u64 * price::KEY_BYTE) {
+        return Err(Failure::OutOfGas);
     }
-    Ok([keys::instance_prefix(instance), relative].concat())
+    Ok(key)
 }
 
 /// The actor's bytes, at most `limit`: a longer buffer exceeds a cap and

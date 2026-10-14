@@ -11,4 +11,5 @@ mod liveness;
 mod membership;
 mod messages;
 mod replication;
+mod roots;
 mod snapshots;

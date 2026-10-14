@@ -19,37 +19,113 @@ pub fn escape(key: &[u8]) -> Vec<u8> {
 }
 
 /// Append `key` escaped to `out`.
+///
+/// On the PVM every load costs as much, a byte's as a word's, and a small
+/// copy as much as many: runs of nonzero bytes are copied whole, zeros are
+/// read eight at a time where a whole aligned word holds them, and the
+/// buffer is zero-filled, so a zero needs only its `0xFF` stored.
 pub fn escape_into(key: &[u8], out: &mut Vec<u8>) {
-    for &byte in key {
-        out.push(byte);
-        if byte == 0 {
-            out.push(0xFF);
+    let Some(first) = first_zero(key) else {
+        out.reserve(key.len() + 2);
+        out.extend_from_slice(key);
+        out.extend_from_slice(&[0, 0]);
+        return;
+    };
+    let start = out.len();
+    out.resize(start + first + 2 * (key.len() - first) + 2, 0);
+    let buffer = &mut out[start..];
+    let mut written = 0;
+    let mut rest = key;
+    while !rest.is_empty() {
+        let run = first_zero(rest).unwrap_or(rest.len());
+        buffer[written..written + run].copy_from_slice(&rest[..run]);
+        written += run;
+        rest = &rest[run..];
+        loop {
+            if aligned_word(rest) == Some(0) {
+                for pair in buffer[written..written + 16].chunks_exact_mut(2) {
+                    pair[1] = 0xFF;
+                }
+                written += 16;
+                rest = &rest[8..];
+            } else if let Some((&0, after)) = rest.split_first() {
+                buffer[written + 1] = 0xFF;
+                written += 2;
+                rest = after;
+            } else {
+                break;
+            }
         }
     }
-    out.extend_from_slice(&[0, 0]);
+    out.truncate(start + written + 2);
 }
 
 /// The escaped key at the front of `bytes`: the raw key and the bytes its
 /// escaped form takes, or `None` if `bytes` does not start with one.
 pub fn unescape(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
-    let mut key = Vec::new();
+    // Zero-filled, so an escaped zero needs no store; each byte of the key
+    // takes at least one of `bytes`.
+    let mut key = alloc::vec![0; bytes.len()];
+    let mut written = 0;
     let mut at = 0;
     loop {
-        match *bytes.get(at)? {
-            0 => match *bytes.get(at + 1)? {
+        if *bytes.get(at)? != 0 {
+            let run = first_zero(&bytes[at..])?;
+            key[written..written + run].copy_from_slice(&bytes[at..at + run]);
+            written += run;
+            at += run;
+        } else if aligned_word(&bytes[at..]) == Some(ESCAPED_ZEROS) {
+            // Four escaped zeros at once.
+            written += 4;
+            at += 8;
+        } else {
+            match *bytes.get(at + 1)? {
                 0xFF => {
-                    key.push(0);
+                    written += 1;
                     at += 2;
                 }
-                0 => return Some((key, at + 2)),
+                0 => {
+                    key.truncate(written);
+                    return Some((key, at + 2));
+                }
                 _ => return None,
-            },
-            byte => {
-                key.push(byte);
-                at += 1;
             }
         }
     }
+}
+
+/// Four escaped zero bytes, as a word reads them.
+const ESCAPED_ZEROS: u64 = u64::from_ne_bytes([0, 0xFF, 0, 0xFF, 0, 0xFF, 0, 0xFF]);
+
+/// The first eight bytes of `bytes` as a word, when they are aligned as one.
+fn aligned_word(bytes: &[u8]) -> Option<u64> {
+    let aligned = bytes.as_ptr().cast::<u64>().is_aligned();
+    // SAFETY: eight bytes from an address aligned for a `u64`, which every
+    // bit pattern is.
+    (aligned && bytes.len() >= 8).then(|| unsafe { bytes.as_ptr().cast::<u64>().read() })
+}
+
+/// The first zero byte of `bytes`, read a word at a time where the words
+/// are aligned: on the PVM a byte's load costs as much as a word's. A zero
+/// at the very front is the callers' to take without it.
+fn first_zero(bytes: &[u8]) -> Option<usize> {
+    const LOW: u64 = 0x0101_0101_0101_0101;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    // SAFETY: every bit pattern is a `u64`.
+    let (head, words, _) = unsafe { bytes.align_to::<u64>() };
+    if let Some(at) = head.iter().position(|&byte| byte == 0) {
+        return Some(at);
+    }
+    // A word holds a zero byte exactly when this sets one of its high bits.
+    let clear = words
+        .iter()
+        .position(|&word| word.wrapping_sub(LOW) & !word & HIGH != 0)
+        .unwrap_or(words.len());
+    let from = head.len() + clear * 8;
+    bytes[from..]
+        .iter()
+        .position(|&byte| byte == 0)
+        .map(|at| from + at)
 }
 
 /// The ordered transform: a table scans in key order.
@@ -61,11 +137,16 @@ pub fn ordered(key: &[u8]) -> Vec<u8> {
 /// log₂ n deep whatever keys clients choose, and the raw key stays in the
 /// row key for a scan to return.
 pub fn hashed<H: Hasher>(hasher: &H, key: &[u8]) -> Vec<u8> {
-    let digest = hasher.hash(TAG_KEY, &[key]);
     let mut out = Vec::with_capacity(16 + key.len() + 2);
-    out.extend_from_slice(&digest[..16]);
-    escape_into(key, &mut out);
+    hashed_into(hasher, key, &mut out);
     out
+}
+
+/// Append `key` under the hashed transform to `out`.
+pub fn hashed_into<H: Hasher>(hasher: &H, key: &[u8], out: &mut Vec<u8>) {
+    let digest = hasher.hash(TAG_KEY, &[key]);
+    out.extend_from_slice(&digest[..16]);
+    escape_into(key, out);
 }
 
 /// The private transform, `H(key)`: a shared path hides its neighbours' keys,

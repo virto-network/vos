@@ -21,7 +21,7 @@ use crate::common::{AGENT, ALICE, CALLER, COUNTER, LEDGER, Node, install, ran, r
 #[test]
 fn every_operation_pays_for_its_serving() {
     use vos_wire::abi::price::{
-        self, GET, LOG, MACHINE, OPERATION, PER_BYTE, PUT, RANDOM, SCAN, SEND,
+        self, GET, KEY_BYTE, LOG, MACHINE, OPERATION, PER_BYTE, PUT, RANDOM, SCAN, SEND,
     };
     let (actors, node, _, _) = setup();
     let ops = actors.method(COUNTER, "ops");
@@ -49,6 +49,14 @@ fn every_operation_pays_for_its_serving() {
         steps
     };
     let bytes = |count: u64| count * PER_BYTE;
+    // A scan as large as a scan may be returns this many rows of a 1 KiB
+    // key and a byte, each framed by two lengths, and is charged for each
+    // byte it returns.
+    let row = 4 + 1024 + 4 + 1;
+    let rows = (cap::SCAN / row) as u64;
+    let full_scan = rows * row as u64 * PER_BYTE + rows * 1024 * KEY_BYTE;
+    // A row operation's key, copied and transformed.
+    let key = |len: u64| len * (PER_BYTE + KEY_BYTE);
     // (name, steps before in the batch, phases before, kind, count, charge per operation)
     type Case = (&'static str, bool, Vec<(u8, u32, u32)>, u8, u32, u64);
     let cases: Vec<Case> = vec![
@@ -59,21 +67,14 @@ fn every_operation_pays_for_its_serving() {
         ("log", false, vec![], 10, 1000, LOG + bytes(9)),
         ("self_id", false, vec![], 12, 1000, OPERATION),
         ("input", false, vec![], 13, 1000, OPERATION),
-        (
-            "get of an absent key",
-            false,
-            vec![],
-            2,
-            1000,
-            GET + bytes(4),
-        ),
+        ("get of an absent key", false, vec![], 2, 1000, GET + key(4)),
         (
             "get after 1,000 writes",
             false,
             vec![(3, 0, 1000)],
             2,
             1000,
-            GET + bytes(5),
+            GET + key(4) + bytes(1),
         ),
         (
             "get after a batch of writes",
@@ -81,7 +82,7 @@ fn every_operation_pays_for_its_serving() {
             vec![],
             2,
             1000,
-            GET + bytes(4),
+            GET + key(4),
         ),
         (
             "put after 500 writes",
@@ -89,7 +90,7 @@ fn every_operation_pays_for_its_serving() {
             vec![(3, 0, 500)],
             3,
             900,
-            PUT + bytes(5),
+            PUT + key(4) + bytes(1),
         ),
         (
             "put after a batch of writes",
@@ -97,7 +98,7 @@ fn every_operation_pays_for_its_serving() {
             vec![],
             3,
             1400,
-            PUT + bytes(5),
+            PUT + key(4) + bytes(1),
         ),
         (
             "delete after 500 writes",
@@ -105,16 +106,23 @@ fn every_operation_pays_for_its_serving() {
             vec![(3, 0, 500)],
             11,
             500,
-            PUT + bytes(4),
+            PUT + key(4),
         ),
-        ("put of 4 KiB", false, vec![], 7, 60, PUT + bytes(4 + 4096)),
+        (
+            "put of 4 KiB",
+            false,
+            vec![],
+            7,
+            60,
+            PUT + key(4) + bytes(4096),
+        ),
         (
             "get of a 1 KiB key after 240 such writes",
             false,
             vec![(15, 0, 240)],
             14,
             240,
-            GET + bytes(1025),
+            GET + key(1024) + bytes(1),
         ),
         (
             "put of a 1 KiB key",
@@ -122,7 +130,32 @@ fn every_operation_pays_for_its_serving() {
             vec![(15, 0, 120)],
             15,
             120,
-            PUT + bytes(1025),
+            PUT + key(1024) + bytes(1),
+        ),
+        // Escaped, a zero key doubles: a step's write cap holds about 125.
+        (
+            "get of a 1 KiB zero key after 120 such writes",
+            false,
+            vec![(17, 0, 120)],
+            16,
+            120,
+            GET + key(1024) + bytes(1),
+        ),
+        (
+            "put of a 1 KiB zero key",
+            false,
+            vec![(17, 0, 60)],
+            17,
+            60,
+            PUT + key(1024) + bytes(1),
+        ),
+        (
+            "a full scan of 1 KiB zero keys",
+            false,
+            vec![(17, 0, 80)],
+            18,
+            8,
+            SCAN + full_scan,
         ),
         (
             "scan after 1,000 writes",
@@ -130,22 +163,15 @@ fn every_operation_pays_for_its_serving() {
             vec![(3, 0, 1000)],
             4,
             300,
-            SCAN + bytes(1),
+            SCAN,
         ),
-        (
-            "scan after a batch of writes",
-            true,
-            vec![],
-            4,
-            300,
-            SCAN + bytes(1),
-        ),
+        ("scan after a batch of writes", true, vec![], 4, 300, SCAN),
         ("call", false, vec![], 6, 1000, MACHINE),
     ];
     let mut short = Vec::new();
     for (name, batched, before, kind, count, charge) in cases {
         let mut with = before.clone();
-        let start = if matches!(kind, 3 | 15) {
+        let start = if matches!(kind, 3 | 15 | 17) {
             before.iter().map(|phase| phase.2).sum()
         } else {
             0
@@ -179,8 +205,8 @@ fn every_operation_pays_for_its_serving() {
         deep.agent_gas(vec![request(ALICE, 1, InstanceId(100), dive, arguments)])
     };
     for (name, kind, count, charge) in [
-        ("get through 61 frames", 0, 1000, GET + bytes(4)),
-        ("scan through 61 frames", 1, 300, SCAN + bytes(1)),
+        ("get through 61 frames", 0, 1000, GET + key(4)),
+        ("scan through 61 frames", 1, 300, SCAN),
     ] {
         let cost = charge as i64 + (at_depth(kind, count) - at_depth(kind, 0)) / i64::from(count);
         println!("{name}: charged {charge}, costs the agent {cost}");

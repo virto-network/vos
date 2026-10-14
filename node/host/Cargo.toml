@@ -28,6 +28,7 @@ tracing = "0.1"
 vos-net = { workspace = true }
 vos-pvm = { workspace = true }
 vos-raft = { workspace = true }
+vos-tree = { workspace = true }
 vos-wire = { workspace = true }
 webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["alloc", "ring"] }
 
@@ -56,6 +57,10 @@ harness = false
 
 [[test]]
 name = "snapshot_crash"
+harness = false
+
+[[test]]
+name = "tree_crash"
 harness = false
 
 [[bench]]

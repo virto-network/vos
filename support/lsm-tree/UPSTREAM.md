@@ -46,6 +46,36 @@ version's memtables to a thread that frees them. Tables are dropped where
 they are popped, so a deleted table's file is removed when it always was.
 No caller changes.
 
+## Issue: a flush or a compaction makes a write batch visible in part
+
+**Versions:** lsm-tree 3.1.10, fjall 3.1.12.
+
+**What happens:** a write batch takes its sequence number from the
+database's counter, inserts its items, then publishes the number as
+visible (`SnapshotTracker::publish`). A flush or a compaction finishing
+meanwhile on a worker calls `SuperVersions::upgrade_version`, which takes
+the next number from the same counter and publishes it at once
+(`visible_seqno.fetch_max(seqno + 1)`), past the batch still inserting.
+A snapshot opened then has the batch's number below its own: it sees the
+items inserted so far, and the rest as they land.
+
+**Reproduction:** vos's `node/host/tests/torn_snapshots.rs`: commits of a
+thousand rows and an applied index each, against snapshots that read the
+index and scan the rows. Unpatched, a snapshot sees rows of a commit past
+its index within a second.
+
+**The fix here:** `upgrade_version` installs the version without
+publishing its number; the next batch's publish covers it, and until then
+snapshots read the version before, whose data is the same. It rests on
+one invariant: the visible number moves only under the journal writer
+lock, after the mover's own inserts. `upgrade_version_with_seqno`
+(ingestion) and fjall's meta-keyspace (creating or deleting a keyspace)
+still publish outside that lock, so either, run beside writes, can still
+show a batch in part; a fix upstream would take that lock, or a count of
+batches in flight, there too. The cost: on an idle store, the version
+before a flush and the sealed memtable it holds stay referenced until the
+next write.
+
 ## Also worth considering
 
 - **The syncs under the same lock:** `upgrade_version` syncs the new

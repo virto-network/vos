@@ -1,11 +1,19 @@
-//! A counter: struct state, a query, and a command that can fail; and
-//! probes of the agent's enforcement.
+//! A counter: struct state, a query, and a command that can fail; a
+//! committed map; and probes of the agent's enforcement.
 
 #![no_std]
 
 extern crate alloc;
 
+use vos_sdk::abi::Rows;
+use vos_sdk::keys::Transform;
 use vos_sdk::prelude::*;
+
+/// The table the raw operations below reach.
+const RAW: Rows = Rows::Table {
+    tag: 3,
+    transform: Transform::Hashed,
+};
 
 /// Host call `0x5ff`: in the actor block, served by no one.
 fn unserved_call() -> u64 {
@@ -35,6 +43,7 @@ fn unserved_call() -> u64 {
 pub struct Counter {
     value: u64,
     blobs: Table<u32, Vec<u8>>,
+    entries: CommittedMap<u64, u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
@@ -49,6 +58,7 @@ impl Counter {
         Self {
             value: 0,
             blobs: Table::default(),
+            entries: CommittedMap::default(),
         }
     }
 
@@ -80,21 +90,81 @@ impl Counter {
         by
     }
 
-    /// Write `keys`, then scan under `prefix` from `cursor`, any bytes the
-    /// raw ABI allows, and return what the scan wrote.
+    /// Write `keys` into the rows the register `rows` names, then scan them
+    /// after `after`, any bytes the raw ABI allows, and return what the
+    /// scan wrote.
     #[msg]
     pub async fn put_and_scan(
         &mut self,
+        rows: u64,
         keys: Vec<Vec<u8>>,
-        prefix: Vec<u8>,
-        cursor: Vec<u8>,
+        after: Option<Vec<u8>>,
     ) -> Vec<u8> {
         for key in &keys {
-            vos_sdk::host::put(key, &[1]);
+            vos_sdk::host::put_raw(rows, key, &[1]);
         }
         let mut out = [0u8; 1024];
-        let written = vos_sdk::host::scan(&prefix, &cursor, &mut out) as usize;
+        let written = vos_sdk::host::scan_raw(rows, after.as_deref(), &mut out) as usize;
         out.get(..written).unwrap_or_default().to_vec()
+    }
+
+    /// Store a value of `size` bytes under `key` in the rows the register
+    /// `rows` names.
+    #[msg(gas = 50_000_000)]
+    pub async fn store(&mut self, rows: u64, key: Vec<u8>, size: u32) -> u32 {
+        vos_sdk::host::put_raw(rows, &key, &alloc::vec![7u8; size as usize]);
+        size
+    }
+
+    /// Scan the rows the register `rows` names after `after` into an output
+    /// of `capacity` bytes: what the scan returned, and each row it wrote as
+    /// its key, its value's length and its bytes' sum.
+    #[msg(gas = 50_000_000)]
+    pub async fn scan_rows(
+        &self,
+        rows: u64,
+        after: Option<Vec<u8>>,
+        capacity: u32,
+    ) -> (u64, Vec<(Vec<u8>, u32, u64)>) {
+        let mut out = alloc::vec![0u8; capacity as usize];
+        let written = vos_sdk::host::scan_raw(rows, after.as_deref(), &mut out);
+        let mut listed = Vec::new();
+        let mut rest = out.get(..written as usize).unwrap_or_default();
+        while let Ok(((key, value), used)) = <(Vec<u8>, Vec<u8>)>::decode(rest) {
+            let sum = value.iter().map(|&byte| u64::from(byte)).sum();
+            listed.push((key, value.len() as u32, sum));
+            rest = &rest[used..];
+        }
+        (written, listed)
+    }
+
+    /// The keys of `blobs`, a hashed table, in its order.
+    #[msg(gas = 50_000_000)]
+    pub async fn blob_keys(&self) -> Vec<u32> {
+        self.blobs.iter(None).map(|(key, _)| key).collect()
+    }
+
+    /// Put or, with no value, delete each entry of the committed map.
+    #[msg(gas = 100_000_000)]
+    pub async fn set_entries(&mut self, writes: Vec<(u64, Option<u64>)>) -> u64 {
+        for (key, value) in &writes {
+            match value {
+                Some(value) => self.entries.insert(key, value),
+                None => self.entries.remove(key),
+            }
+        }
+        writes.len() as u64
+    }
+
+    #[msg]
+    pub async fn entry(&self, key: u64) -> Option<u64> {
+        self.entries.get(&key)
+    }
+
+    /// The committed map's entries in its order, after `after` when given.
+    #[msg]
+    pub async fn entries(&self, after: Option<u64>) -> Vec<(u64, u64)> {
+        self.entries.iter(after.as_ref()).collect()
     }
 
     /// Its arguments back: a reply as large as a request.
@@ -112,7 +182,7 @@ impl Counter {
     /// A query that writes through the raw ABI: the agent traps it.
     #[msg]
     pub async fn sneaky(&self) -> u64 {
-        vos_sdk::host::put(&[9], &[1]);
+        vos_sdk::host::put(RAW, &[9], &[1]);
         self.value
     }
 
@@ -147,11 +217,14 @@ impl Counter {
 
     /// Phases of operations, to measure what serving them costs at a
     /// handler's limit. A phase `(kind, start, count)` is `count` operations
-    /// of one kind on keys `start..start + count`: 0 an unserved id, 1 `now`, 2 `get`, 3 `put` of one byte,
-    /// 4 a 64-byte `scan` from the start of those keys, 5 a `send`, 6 a
-    /// `call` of `method` on `instance`, 7 a `put` of 4 KiB, 8 `random`, 9
-    /// `caller`, 10 `log`, 11 `delete`, 12 `self_id`, 13 `input`, 14 `get`
-    /// of a 1 KiB key, 15 `put` of one byte at a 1 KiB key.
+    /// of one kind on keys `start..start + count` of a hashed table: 0 an
+    /// unserved id, 1 `now`, 2 `get`, 3 `put` of one byte, 4 a 64-byte
+    /// `scan` from the table's first row, 5 a `send`, 6 a `call` of
+    /// `method` on `instance`, 7 a `put` of 4 KiB, 8 `random`, 9 `caller`,
+    /// 10 `log`, 11 `delete`, 12 `self_id`, 13 `input`, 14 `get` of a 1 KiB
+    /// key, 15 `put` of one byte at a 1 KiB key; and at 1 KiB keys of zero
+    /// bytes but the index, 16 `get`, 17 `put` of one byte, and 18 a `scan`
+    /// as large as a scan may be, from the table's first row.
     #[msg(gas = 100_000_000)]
     pub async fn ops(
         &mut self,
@@ -163,27 +236,30 @@ impl Counter {
         let mut total = 0;
         let mut rows = [0u8; 64];
         let mut long = [8u8; 1024];
+        let mut zeros = [0u8; 1024];
+        let mut full = alloc::vec![0u8; vos_sdk::abi::cap::SCAN];
         for (kind, start, count) in phases {
             for index in start..start + count {
                 let [_, a, b, c] = index.to_be_bytes();
                 let short = [3, a, b, c];
                 long[1..5].copy_from_slice(&index.to_be_bytes());
+                zeros[1..5].copy_from_slice(&index.to_be_bytes());
                 total += match kind {
                     0 => unserved_call(),
                     1 => ctx.now(),
-                    2 => u64::from(vos_sdk::host::get(&short).is_some()),
+                    2 => u64::from(vos_sdk::host::get(RAW, &short).is_some()),
                     3 => {
-                        vos_sdk::host::put(&short, &[1]);
+                        vos_sdk::host::put(RAW, &short, &[1]);
                         0
                     }
-                    4 => vos_sdk::host::scan(&[3], &[], &mut rows),
+                    4 => vos_sdk::host::scan(RAW, None, &mut rows),
                     5 => {
                         vos_sdk::host::send(5, 1, method, &[]);
                         0
                     }
                     6 => vos_sdk::host::call(instance, method, &[]).map_or(1, |_| 0),
                     7 => {
-                        vos_sdk::host::put(&short, &[9u8; 4096]);
+                        vos_sdk::host::put(RAW, &short, &[9u8; 4096]);
                         0
                     }
                     8 => u64::from(ctx.random()[0]),
@@ -193,16 +269,22 @@ impl Counter {
                         0
                     }
                     11 => {
-                        vos_sdk::host::delete(&short);
+                        vos_sdk::host::delete(RAW, &short);
                         0
                     }
                     12 => u64::from(vos_sdk::host::self_id().0),
                     13 => vos_sdk::host::input().len() as u64,
-                    14 => u64::from(vos_sdk::host::get(&long).is_some()),
-                    _ => {
-                        vos_sdk::host::put(&long, &[1]);
+                    14 => u64::from(vos_sdk::host::get(RAW, &long).is_some()),
+                    15 => {
+                        vos_sdk::host::put(RAW, &long, &[1]);
                         0
                     }
+                    16 => u64::from(vos_sdk::host::get(RAW, &zeros).is_some()),
+                    17 => {
+                        vos_sdk::host::put(RAW, &zeros, &[1]);
+                        0
+                    }
+                    _ => vos_sdk::host::scan(RAW, None, &mut full),
                 };
             }
         }

@@ -61,3 +61,29 @@ pub fn unstored(bytes: &[u8]) -> Option<&[u8]> {
         _ => None,
     }
 }
+
+/// A committed map's value as its value row holds it
+/// ([`crate::keys::committed`]): the state version that wrote it, a
+/// little-endian `u64`, then the value.
+pub fn versioned(version: u64, value: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(8 + value.len());
+    bytes.extend_from_slice(&version.to_le_bytes());
+    bytes.extend_from_slice(value);
+    bytes
+}
+
+/// [`stored`] of [`versioned`], in one allocation: a value row as the agent
+/// writes it.
+pub fn stored_versioned(version: u64, value: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(9 + value.len());
+    bytes.push(STORED);
+    bytes.extend_from_slice(&version.to_le_bytes());
+    bytes.extend_from_slice(value);
+    bytes
+}
+
+/// A value row's version and value, or `None` for bytes too short to be one.
+pub fn unversioned(bytes: &[u8]) -> Option<(u64, &[u8])> {
+    let (version, value) = bytes.split_first_chunk::<8>()?;
+    Some((u64::from_le_bytes(*version), value))
+}

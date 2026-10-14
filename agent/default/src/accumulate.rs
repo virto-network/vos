@@ -3,7 +3,10 @@
 //! Each step that ran writes its writes, advances its session or pair mark,
 //! keeps its reply in the session's window and queues its messages in the
 //! outbox with their pair sequences; an acknowledgement clears the outbox
-//! through its sequence. A step's new session is created first, with its
+//! through its sequence. A write to a committed map writes its value row
+//! with the new state version and a dirty row beside it, and the result's
+//! seed is kept under that version, for the node's root builder: nothing
+//! here hashes. A step's new session is created first, with its
 //! row in the expiry index. A refused step applies nothing. A sweep
 //! collects the sessions it lists that have expired, and moves the rows of
 //! those active since. A work result built on another state version, timed
@@ -16,7 +19,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 
 use vos_wire::ids::{Session, SessionId, SessionRef};
 use vos_wire::jam::AccumulateInput;
-use vos_wire::records::{SessionMark, stored, unstored};
+use vos_wire::records::{SessionMark, stored, stored_versioned, unstored};
 use vos_wire::result::{InputRef, Run, Step, WorkResult};
 use vos_wire::{Decode, Encode, defaults, expiry, keys};
 
@@ -137,14 +140,22 @@ fn apply(result: &WorkResult) {
     if result.time > latest {
         put(&keys::batch_time(), &result.time.encode());
     }
+    let next = version + 1;
+    let mut committed = false;
     for step in &result.steps {
         match step {
-            Step::Ran(run) => apply_run(run, result.time),
+            Step::Ran(run) => {
+                apply_run(run, result.time, next);
+                committed |= !run.committed.is_empty();
+            }
             Step::Swept { due } => sweep(due, result.time),
             Step::Refused { .. } => {}
         }
     }
-    put(&keys::version(), &(version + 1).encode());
+    if committed {
+        put(&keys::seed(next), &result.seed);
+    }
+    put(&keys::version(), &next.encode());
 }
 
 /// Take each listed expiry row out of the due range: collect its session
@@ -207,7 +218,8 @@ fn collect(id: SessionId, mark: SessionMark, whole: Option<Session>) {
     }
 }
 
-fn apply_run(run: &Run, time: u64) {
+/// Apply a step's effects, its committed writes made at `version`.
+fn apply_run(run: &Run, time: u64, version: u64) {
     let session = match &run.input {
         InputRef::Request { session: named, .. } => Some(session(named, time)),
         _ => None,
@@ -217,6 +229,14 @@ fn apply_run(run: &Run, time: u64) {
             Some(value) => put(&item.key, value),
             None => delete(&item.key),
         }
+    }
+    for item in &run.committed {
+        let row = keys::committed(&item.map, &item.key);
+        match &item.value {
+            Some(value) => write(&row, &stored_versioned(version, value)),
+            None => delete(&row),
+        }
+        put(&keys::dirty(version, &item.map, &item.key), &[]);
     }
     match run.input {
         InputRef::Request { sequence, .. } => {

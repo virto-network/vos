@@ -183,6 +183,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "vos-pvm-precompiles"
+version = "0.1.0"
+
+[[package]]
 name = "vos-pvm-program"
 version = "0.1.0"
 
@@ -206,9 +210,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "vos-tree"
+version = "0.1.0"
+dependencies = [
+ "vos-pvm-codec",
+ "vos-pvm-precompiles",
+]
+
+[[package]]
 name = "vos-wire"
 version = "0.1.0"
 dependencies = [
  "vos-pvm-codec",
  "vos-pvm-program",
+ "vos-tree",
 ]

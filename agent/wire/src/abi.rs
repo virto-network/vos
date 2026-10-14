@@ -12,12 +12,19 @@
 //! - Outputs copy at most the given capacity and return the whole length
 //!   in φ7, as the Gray Paper's `read` does: an actor whose buffer was short
 //!   calls again with a larger one, or from an offset where there is one.
-//! - Keys are relative to the actor's instance; the agent prefixes them
-//!   with [`crate::keys::instance_prefix`], so an actor reaches only its own
-//!   state. Keys are not empty.
+//! - A row operation names its [`Rows`] and a key, and the agent keys the
+//!   row itself: the struct state at [`crate::keys::instance_struct`], under
+//!   the empty key; a table's or committed map's row at its prefix and the
+//!   key under the table's [`crate::keys::Transform`]. So an actor reaches
+//!   only its own state, and every row key stays prefix-free whatever bytes
+//!   it passes. A [`Rows`] the agent does not know, or a struct key that is
+//!   not empty, fails the invocation; an ordered key longer than
+//!   [`cap::ORDERED_KEY`] exceeds a cap.
 //! - Each operation costs its price ([`price::of`]) plus
-//!   [`price::PER_BYTE`] for every byte copied either way, charged from the
-//!   actor's frame before it is served.
+//!   [`price::PER_BYTE`] for every byte copied either way, and a row
+//!   operation [`price::KEY_BYTE`] more for every byte of a key it
+//!   transforms or a scan returns, charged from the actor's frame before it
+//!   is served (a scan's output, before it is copied).
 //! - An id the agent does not serve, including every Gray Paper id and node
 //!   extension, costs [`price::OPERATION`], answers [`code::WHAT`] and
 //!   execution continues. Precompiles are served as on every machine. A
@@ -34,6 +41,8 @@ use alloc::vec::Vec;
 
 use scale::{Decode, Encode};
 
+use crate::keys::Transform;
+
 /// The kind of an invocation, which decides the operations it may use.
 /// Its index is the kind the agent passes in φ8.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
@@ -47,6 +56,45 @@ pub enum Kind {
     /// An `#[attestable]` method: no operations at all.
     #[codec(index = 2)]
     Attestable,
+}
+
+/// The rows a row operation reaches, in its φ7.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Rows {
+    /// The instance's struct state: one row, under the empty key.
+    Struct,
+    /// A table's rows, by its tag.
+    Table { tag: u32, transform: Transform },
+    /// A committed map's rows: written, they are marked for the map's
+    /// root ([`crate::result::Run::committed`]).
+    Committed { tag: u32, transform: Transform },
+}
+
+impl Rows {
+    /// The register: bits 0..32 the tag, 32..40 the transform's tag, 40..48
+    /// the kind (0 the struct, 1 a table, 2 a committed map), the rest 0.
+    /// The struct's tag and transform are 0.
+    pub const fn register(self) -> u64 {
+        let (kind, tag, transform) = match self {
+            Rows::Struct => (0u64, 0, 0),
+            Rows::Table { tag, transform } => (1, tag, transform.tag()),
+            Rows::Committed { tag, transform } => (2, tag, transform.tag()),
+        };
+        kind << 40 | (transform as u64) << 32 | tag as u64
+    }
+
+    pub const fn from_register(register: u64) -> Option<Self> {
+        let tag = register as u32;
+        let Some(transform) = Transform::from_tag((register >> 32) as u8) else {
+            return None;
+        };
+        match register >> 40 {
+            0 if register == 0 => Some(Rows::Struct),
+            1 => Some(Rows::Table { tag, transform }),
+            2 => Some(Rows::Committed { tag, transform }),
+            _ => None,
+        }
+    }
 }
 
 pub mod op {
@@ -72,19 +120,21 @@ pub mod op {
     /// the step's index in the batch (four bytes, little-endian) and how
     /// many the step drew before (eight bytes, little-endian).
     pub const RANDOM: u64 = 0x506;
-    /// φ7/φ8 key, φ9 output, φ10 offset, φ11 capacity → φ7 the value's
-    /// length, or [`super::code::NONE`].
+    /// φ7 [`super::Rows`], φ8/φ9 key, φ10 output, φ11 offset, φ12
+    /// capacity → φ7 the value's length, or [`super::code::NONE`].
     pub const GET: u64 = 0x510;
-    /// φ7/φ8 key, φ9/φ10 value.
+    /// φ7 [`super::Rows`], φ8/φ9 key, φ10/φ11 value.
     pub const PUT: u64 = 0x511;
-    /// φ7/φ8 key.
+    /// φ7 [`super::Rows`], φ8/φ9 key.
     pub const DELETE: u64 = 0x512;
-    /// φ7/φ8 prefix, φ9/φ10 cursor (rows after it; empty starts at the
-    /// prefix), φ11 output, φ12 capacity → φ7 the bytes written: whole rows
-    /// back to back, each the SCALE encoding of `(key, value)` as two byte
-    /// vectors, keys relative to the instance. 0 when
-    /// no rows remain; [`super::code::FULL`] when the next row alone
-    /// exceeds the capacity.
+    /// φ7 a table's or committed map's [`super::Rows`], φ8/φ9 cursor, φ10
+    /// output, φ11 capacity, φ12 1 for the rows after the cursor (a key) or
+    /// 0 for the table's first rows → φ7 the bytes written: whole rows back
+    /// to back in the table's order (hash order for a hashed table, key
+    /// order for an ordered one), each the SCALE encoding of `(key, value)`
+    /// as two byte vectors, the key as the actor wrote it. 0 when no rows
+    /// remain; [`super::code::FULL`] when the next row alone exceeds the
+    /// capacity.
     pub const SCAN: u64 = 0x513;
     /// The callee runs once: with a smaller output the agent copies what
     /// fits and returns the whole length, and the rest is lost. A caller
@@ -155,8 +205,10 @@ pub const fn allowed(kind: Kind, op: u64) -> bool {
 
 /// Gas an operation costs the actor, charged before it is served: the
 /// operation's price, then [`price::PER_BYTE`] for every byte copied either
-/// way. Each covers what the default agent measurably spends serving it,
-/// so a handler's gas limit bounds the agent's work too.
+/// way, and [`price::KEY_BYTE`] for every byte of a key a row operation
+/// transforms or a scan returns.
+/// Each covers what the default agent measurably spends serving it, so a
+/// handler's gas limit bounds the agent's work too.
 ///
 /// The testkit's `every_operation_pays_for_its_serving` prints each charge
 /// and its cost, and requires a fifth of each charge spare.
@@ -170,12 +222,17 @@ pub mod price {
     pub const CALLER: u64 = 6_000;
     pub const LOG: u64 = 4_000;
     pub const SEND: u64 = 5_000;
-    pub const GET: u64 = 20_000;
-    pub const SCAN: u64 = 60_000;
+    /// A row operation hashes its key under a hashed table's transform,
+    /// and looks it up in the step's overlays at a random place.
+    pub const GET: u64 = 30_000;
+    pub const SCAN: u64 = 66_000;
     pub const PUT: u64 = 64_000;
     /// A nested call or attest acquires a machine.
     pub const MACHINE: u64 = 60_000;
     pub const PER_BYTE: u64 = 24;
+    /// A key's transform, hashing it and escaping it, or its inverse: a
+    /// zero byte doubles under the escape and costs the most.
+    pub const KEY_BYTE: u64 = 90;
 
     /// An operation's price, before its bytes.
     pub const fn of(id: u64) -> u64 {
@@ -201,11 +258,19 @@ pub mod cap {
     pub const REQUEST: usize = 64 << 10;
     pub const REPLY: usize = 64 << 10;
     pub const KEY: usize = 1 << 10;
+    /// An ordered table's key: a tree path through it is then at most
+    /// about 1,040 levels deep.
+    pub const ORDERED_KEY: usize = 64;
     pub const VALUE: usize = 64 << 10;
     pub const STEP_WRITES: usize = 256 << 10;
     /// One scan's output: room for a row at the key and value caps with
     /// both length prefixes.
     pub const SCAN: usize = KEY + VALUE + 16;
+    /// The largest row the agent stores in a table or committed map, framed
+    /// as a state scan returns it: both length prefixes, the table's prefix,
+    /// a hashed key of `KEY` zero bytes escaped and terminated, and a value
+    /// at its cap after the format byte and a committed map's version.
+    pub const STORED_ROW: usize = 8 + crate::keys::TABLE_PREFIX + 16 + 2 * KEY + 2 + 1 + 8 + VALUE;
     pub const MESSAGES: usize = 16;
     pub const MESSAGE: usize = 64 << 10;
     pub const ATTESTS: usize = 16;
@@ -214,12 +279,12 @@ pub mod cap {
     /// The most one step adds to a work result: its input, a new session's
     /// whole, its reply, writes, messages and attests at their caps, a
     /// request's reply to its sender, with the framing of as many writes
-    /// and instances as its gas can pay for. An install's record is under
-    /// [`STEP_WRITES`] too.
+    /// (committed ones, with their map, the larger) and instances as its
+    /// gas can pay for. An install's record is under [`STEP_WRITES`] too.
     pub const STEP_RESULT: usize = 128
         + REPLY
         + STEP_WRITES
-        + (MAX_HANDLER_GAS / price::PUT) as usize * 9
+        + (MAX_HANDLER_GAS / price::PUT) as usize * 18
         + (1 + (MAX_HANDLER_GAS / price::MACHINE) as usize) * 12
         + MESSAGES * (MESSAGE + 40)
         + (REPLY + 40)

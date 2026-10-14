@@ -1,13 +1,13 @@
-//! An instance's struct state, stored encoded at the instance-relative key
-//! `0x00`.
+//! An instance's struct state, stored encoded in its struct row.
 
 use alloc::vec::Vec;
 
+use vos_wire::abi::Rows;
+
 use crate::{Decode, Encode, host};
 
-const STRUCT: &[u8] = &[0x00];
-
-/// Binds an actor's `Table` fields to their tags. `#[actor]` implements it.
+/// Binds an actor's `Table` and `CommittedMap` fields to their tags.
+/// `#[actor]` implements it.
 pub trait Tables {
     fn bind_tables(&mut self);
 }
@@ -21,7 +21,7 @@ pub trait New {
 /// The instance's state, or a new instance's when none is stored. State
 /// that does not decode traps.
 pub fn load<A: Encode + Decode + Tables + New>() -> A {
-    let mut state = match host::get(STRUCT) {
+    let mut state = match host::get(Rows::Struct, &[]) {
         Some(bytes) => match A::decode(&bytes) {
             Ok((state, _)) => state,
             Err(_) => panic!("undecodable state"),
@@ -36,6 +36,6 @@ pub fn load<A: Encode + Decode + Tables + New>() -> A {
 pub fn save<A: Encode>(state: &A, before: &[u8]) {
     let after: Vec<u8> = state.encode();
     if after != before {
-        host::put(STRUCT, &after);
+        host::put(Rows::Struct, &[], &after);
     }
 }

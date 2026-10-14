@@ -4,8 +4,7 @@
 //! [`crate::program_runtime!`] exports this as `memcmp` and `bcmp`.
 
 /// Compare `len` bytes at `a` and `b` as `memcmp` does: words while both
-/// sides share an alignment, as heap allocations do, bytes otherwise and
-/// to find where the first differing word differs.
+/// sides share an alignment, as heap allocations do, and bytes otherwise.
 ///
 /// # Safety
 ///
@@ -27,7 +26,11 @@ pub unsafe fn compare(a: *const u8, b: *const u8, len: usize) -> i32 {
             // SAFETY: both sides are word-aligned here and `at + WORD <= len`.
             let (x, y) = unsafe { (*a.add(at).cast::<u64>(), *b.add(at).cast::<u64>()) };
             if x != y {
-                break;
+                // Read in memory order, the lowest differing byte is the
+                // first.
+                let (x, y) = (u64::from_le(x), u64::from_le(y));
+                let shift = (x ^ y).trailing_zeros() & !7;
+                return i32::from((x >> shift) as u8) - i32::from((y >> shift) as u8);
             }
             at += WORD;
         }

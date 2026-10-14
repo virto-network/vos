@@ -225,7 +225,7 @@ A crate `agent/tree` (`vos-tree`, `no_std + alloc`). Its users:
     `Blake2_128Concat`. Depth stays near log₂ n whatever keys clients
     choose. The table iterates, whole or from a cursor, in hash order,
     and the raw key stays in the row key for the scan to return;
-  - **ordered,** `#[table(ordered)]`: `escape(key)`, as Substrate's
+  - **ordered,** `Table<K, V, Ordered>`: `escape(key)`, as Substrate's
     `Identity`. The table scans in key order, with ranges. Its keys are
     capped at 64 bytes, so a path through it is at most about 1,040
     levels deep: about 5M gas for a witnessed read on JAM at worst;
@@ -355,9 +355,10 @@ A crate `agent/tree` (`vos-tree`, `no_std + alloc`). Its users:
 - **Rows** in the agent's keyspace:
   - **value rows:** `c/<map>/<key'>` → `(version, value)`, the version
     that wrote it, in the tree's order;
-  - **dirty rows:** `d/<map>/<version>/<key'>`, written in accumulate
+  - **dirty rows:** `d/<version>/<map>/<key'>`, written in accumulate
     beside each committed write, under the state version the write
-    makes. One row each, so the apply path stays at table cost (section
+    makes, version first so a build seeks straight past the rows
+    earlier builds deleted. One row each, so the apply path stays at table cost (section
     9.3). The version keeps a later write's row apart from an earlier
     one's, so consuming the rows through one version never deletes a
     newer row;
@@ -366,13 +367,19 @@ A crate `agent/tree` (`vos-tree`, `no_std + alloc`). Its users:
     consumed that version;
   - **the builder's rows,** which accumulate never writes:
     - node rows `n/<map>/<level><prefix>` at branching points;
-    - leaf rows `l/<map>/<key'>` → `(salt, leaf hash)`: what a proof
-      needs once the seed row is gone;
-    - a root row `r/<map>` → `(root, version)`.
+    - leaf rows `l/<map>/<key'>` → `(salt, vh)`: what a proof needs
+      once the seed row is gone;
+    - a root row `r/<map>` → the tree's current top, and its last
+      complete root with the version it is complete through;
+    - one watermark row: the version every map is built through, so one
+      build covers every version past it;
 - **The root builder** runs on every replica:
   - it takes a storage snapshot at the agent's state version V;
-  - it reads the dirty rows through V, in batches of 10,000 keys,
-    deduplicated and sorted by key;
+  - it reads the dirty rows past the watermark through V, in batches of
+    10,000 keys, deduplicated and sorted by key, and holds no more than
+    a batch: each batch deletes the dirty rows it read, and the seeds of
+    the versions it has read whole, so a build's memory and its commits
+    never grow with a backlog;
   - it computes each dirty key's salt from the seed row of the version
     that wrote it;
   - **one invariant carries correctness:** every leaf and node row
@@ -932,7 +939,7 @@ the builder 3,000, the rest 1,000 each or less.
    - one tree format over prefix-free keys, with range proofs;
    - each table chooses its key transform, as a Substrate map chooses
      its hasher. Proposed: hashed (`H128(key) ‖ key`, iterating in hash
-     order, balanced) by default, and ordered (`#[table(ordered)]`,
+     order, balanced) by default, and ordered (`Table<K, V, Ordered>`,
      key order and ranges, keys of at most 64 bytes) by choice;
    - so an actor that scans its tables runs on JAM too.
 

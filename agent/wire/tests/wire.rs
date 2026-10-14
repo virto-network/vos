@@ -1,15 +1,16 @@
 use proptest::prelude::*;
-use vos_wire::abi::{self, Failure, Kind, Refusal, op};
+use vos_wire::abi::{self, Failure, Kind, Refusal, Rows, op};
 use vos_wire::batch::{Admin, Answer, Await, Batch, Body, Input, Message, Request};
 use vos_wire::ids::{
-    AgentId, InstanceId, MethodId, Principal, ProgramHash, Session, SessionId, SessionRef,
+    AgentId, InstanceId, MapId, MethodId, Principal, ProgramHash, Session, SessionId, SessionRef,
     WorkflowId,
 };
 use vos_wire::ingress::Grant;
 use vos_wire::jam::{AccumulateInput, Operand, RefineArgs, Transfer, WorkError};
-use vos_wire::keys;
+use vos_wire::keys::{self, Transform};
 use vos_wire::result::{
-    Attest, InputRef, InstanceGas, Outcome, Outgoing, ResultWriter, Run, Step, WorkResult, Write,
+    Attest, CommittedWrite, InputRef, InstanceGas, Outcome, Outgoing, ResultWriter, Run, Step,
+    WorkResult, Write,
 };
 use vos_wire::{Decode, Encode};
 
@@ -30,6 +31,18 @@ fn session() -> impl Strategy<Value = Session> {
         key,
         name,
         t0,
+    })
+}
+
+fn transform() -> impl Strategy<Value = Transform> {
+    prop_oneof![Just(Transform::Hashed), Just(Transform::Ordered)]
+}
+
+fn map() -> impl Strategy<Value = MapId> {
+    (any::<u32>(), any::<u32>(), transform()).prop_map(|(instance, tag, transform)| MapId {
+        instance: InstanceId(instance),
+        tag,
+        transform,
     })
 }
 
@@ -154,6 +167,8 @@ fn step() -> impl Strategy<Value = Step> {
         gas,
     });
     let write = (bytes(), prop::option::of(bytes())).prop_map(|(key, value)| Write { key, value });
+    let committed = (map(), bytes(), prop::option::of(bytes()))
+        .prop_map(|(map, key, value)| CommittedWrite { map, key, value });
     let outgoing = (any::<u32>(), body()).prop_map(|(to, body)| Outgoing {
         to: AgentId(to),
         body,
@@ -169,17 +184,19 @@ fn step() -> impl Strategy<Value = Step> {
         outcome,
         prop::collection::vec(instance, 0..3),
         prop::collection::vec(write, 0..4),
+        prop::collection::vec(committed, 0..3),
         prop::collection::vec(outgoing, 0..3),
         prop::collection::vec(attest, 0..2),
         any::<u64>(),
     )
         .prop_map(
-            |(input, outcome, instances, writes, messages, attests, gas_used)| {
+            |(input, outcome, instances, writes, committed, messages, attests, gas_used)| {
                 Step::Ran(Run {
                     input,
                     outcome,
                     instances,
                     writes,
+                    committed,
                     messages,
                     attests,
                     gas_used,
@@ -321,6 +338,97 @@ proptest! {
             prop_assert!(!keys::owned_by(key, instance));
         }
         prop_assert!(keys::outbox(AgentId(agent), sequence).starts_with(&keys::outbox_prefix()));
+    }
+
+    /// No row key of any kind is a proper prefix of another, whatever the
+    /// parts an actor or a client chooses: a tree over the whole keyspace
+    /// needs prefix-free keys. Each kind's fixed parts have fixed widths,
+    /// and its one variable part comes last, escaped or hashed.
+    #[test]
+    fn every_row_key_is_prefix_free(
+        parts in prop::collection::vec(
+            (any::<u32>(), any::<u32>(), transform(), bytes(), any::<u64>(), principal(), session(), any::<u16>()),
+            2..5,
+        ),
+    ) {
+        let mut rows = vec![
+            keys::next_session(),
+            keys::live_sessions(),
+            keys::batch_time(),
+            keys::version(),
+        ];
+        for (a, b, transform, key, number, member, triple, level) in parts {
+            let instance = InstanceId(a);
+            let map = MapId { instance, tag: b, transform };
+            let transformed = transform.apply(&key);
+            let level = level % 1024;
+            let prefix = (level > 0)
+                .then(|| transformed.get(..usize::from(level).div_ceil(8)))
+                .flatten()
+                .map(|bytes| bytes.to_vec());
+            rows.extend([
+                keys::instance_struct(instance),
+                [keys::table_rows(instance, b, transform), transformed.clone()].concat(),
+                keys::committed(&map, &transformed),
+                keys::installed(instance),
+                keys::member(&member),
+                keys::session(SessionId(number)),
+                keys::reply(SessionId(number), u64::from(a)),
+                keys::pair_in(AgentId(a)),
+                keys::outbox(AgentId(a), number),
+                keys::pair_out(AgentId(a)),
+                keys::acked(AgentId(a)),
+                keys::session_index(&triple),
+                keys::session_of(SessionId(number)),
+                keys::expiry(number, SessionId(u64::from(b))),
+                keys::key_sessions(&triple.key),
+                keys::dirty(number, &map, &transformed),
+                keys::seed(number),
+                keys::tree_leaf(&map, &transformed),
+                keys::tree_root(&map),
+                keys::built(),
+            ]);
+            if let Some(prefix) = prefix {
+                rows.push(keys::tree_node(&map, level, &prefix));
+            }
+        }
+        for row in &rows {
+            for other in &rows {
+                prop_assert!(
+                    row == other || !other.starts_with(row),
+                    "{row:?} prefixes {other:?}"
+                );
+            }
+        }
+    }
+
+    /// A value row, a dirty row and a seed row name back what made them.
+    #[test]
+    fn committed_rows_name_their_parts(map in map(), key in bytes(), version in any::<u64>()) {
+        let transformed = map.transform.apply(&key);
+        prop_assert_eq!(map.transform.raw(&transformed), Some(key.clone()));
+        let value = keys::committed(&map, &transformed);
+        prop_assert!(value.starts_with(&keys::committed_rows(&map)));
+        prop_assert!(keys::owned_by(&value, map.instance));
+        prop_assert_eq!(keys::committed_entry(&value), Some((map, transformed.as_slice())));
+        let dirty = keys::dirty(version, &map, &transformed);
+        prop_assert!(dirty.starts_with(&keys::dirty_from(version)));
+        prop_assert!(dirty.starts_with(&keys::dirty_prefix()));
+        prop_assert_eq!(keys::dirty_entry(&dirty), Some((version, map, transformed.as_slice())));
+        prop_assert_eq!(keys::committed_entry(&dirty), None);
+        prop_assert!(keys::is_committed(&value) && !keys::is_committed(&dirty));
+        let rows = Rows::Committed { tag: map.tag, transform: map.transform };
+        if map.transform == Transform::Hashed || key.len() <= abi::cap::ORDERED_KEY {
+            prop_assert_eq!(keys::row(map.instance, rows, &key), Ok(value.clone()));
+        } else {
+            prop_assert_eq!(keys::row(map.instance, rows, &key), Err(Failure::Cap));
+        }
+        let root = keys::tree_root(&map);
+        prop_assert!(root.starts_with(&keys::tree_roots()));
+        prop_assert_eq!(keys::tree_root_entry(&root), Some(map));
+        let table = [keys::table_rows(map.instance, map.tag, map.transform), transformed].concat();
+        prop_assert_eq!(keys::committed_entry(&table), None);
+        prop_assert!(!keys::is_committed(&table));
     }
 
     #[test]
@@ -532,6 +640,7 @@ fn a_result_written_step_by_step_is_the_work_result_encoding() {
         outcome: Outcome::Done(vec![0; abi::cap::WORK_RESULT / 3]),
         instances: vec![],
         writes: vec![],
+        committed: vec![],
         messages: vec![],
         attests: vec![],
         gas_used: 0,
@@ -544,8 +653,9 @@ fn a_result_written_step_by_step_is_the_work_result_encoding() {
     assert_eq!(decoded.steps.len(), 2);
 }
 
-/// A step at every cap, with as many writes and instances as its gas pays
-/// for, and a request's reply, stays within `STEP_RESULT`.
+/// A step at every cap, with as many writes (committed ones, the larger)
+/// and instances as its gas pays for, and a request's reply, stays within
+/// `STEP_RESULT`.
 #[test]
 fn the_largest_step_fits_its_bound() {
     use abi::cap;
@@ -573,9 +683,15 @@ fn the_largest_step_fits_its_bound() {
                 gas: 0,
             })
             .collect(),
-        writes: write_bytes
+        writes: vec![],
+        committed: write_bytes
             .into_iter()
-            .map(|len| Write {
+            .map(|len| CommittedWrite {
+                map: MapId {
+                    instance: InstanceId(0),
+                    tag: 0,
+                    transform: Transform::Hashed,
+                },
                 key: vec![0],
                 value: Some(vec![0; len]),
             })
@@ -703,6 +819,192 @@ fn keys_keep_their_bytes() {
     assert_eq!(
         keys::key_sessions(&[0xee; 32]),
         cat(&[&[0x00, 0x10], &[0xee; 32]])
+    );
+}
+
+/// The keys of a table's and a committed map's rows, their builder's rows,
+/// and the dirty and seed rows accumulate leaves, byte for byte.
+#[test]
+fn committed_keys_keep_their_bytes() {
+    let instance = InstanceId(0x1122_3344);
+    let map = MapId {
+        instance,
+        tag: 0xa1b2_c3d4,
+        transform: Transform::Ordered,
+    };
+    let id = [0x11, 0x22, 0x33, 0x44, 0xa1, 0xb2, 0xc3, 0xd4, 0x01];
+    let version = [1, 2, 3, 4, 5, 6, 7, 8];
+    let key = [7, 0, 0xff, 0, 0];
+    let cat = |parts: &[&[u8]]| parts.concat();
+    assert_eq!(Transform::Ordered.apply(&[7, 0]), key);
+    assert_eq!(
+        keys::table_rows(instance, 0xa1b2_c3d4, Transform::Hashed),
+        [
+            0x01, 0x11, 0x22, 0x33, 0x44, 0x01, 0xa1, 0xb2, 0xc3, 0xd4, 0x00
+        ]
+    );
+    assert_eq!(
+        keys::committed_rows(&map),
+        [
+            0x01, 0x11, 0x22, 0x33, 0x44, 0x02, 0xa1, 0xb2, 0xc3, 0xd4, 0x01
+        ]
+    );
+    assert_eq!(
+        keys::committed(&map, &key),
+        cat(&[&keys::committed_rows(&map), &key])
+    );
+    assert_eq!(
+        keys::dirty(0x0102_0304_0506_0708, &map, &key),
+        cat(&[&[0x00, 0x11], &version, &id, &key])
+    );
+    assert_eq!(keys::dirty_prefix(), [0x00, 0x11]);
+    assert_eq!(
+        keys::dirty_from(0x0102_0304_0506_0708),
+        cat(&[&[0x00, 0x11], &version])
+    );
+    assert_eq!(
+        keys::seed(0x0102_0304_0506_0708),
+        cat(&[&[0x00, 0x12], &version])
+    );
+    assert_eq!(keys::seed_prefix(), [0x00, 0x12]);
+    assert_eq!(
+        keys::tree_node(&map, 0x0102, &[0xee, 0xf0]),
+        cat(&[&[0x02, 0x00], &id, &[0x01, 0x02, 0xee, 0xf0]])
+    );
+    assert_eq!(keys::tree_nodes(&map), cat(&[&[0x02, 0x00], &id]));
+    assert_eq!(
+        keys::tree_leaf(&map, &key),
+        cat(&[&[0x02, 0x01], &id, &key])
+    );
+    assert_eq!(keys::tree_leaves(&map), cat(&[&[0x02, 0x01], &id]));
+    assert_eq!(keys::tree_root(&map), cat(&[&[0x02, 0x02], &id]));
+    assert_eq!(keys::built(), [0x02, 0x03]);
+    // The hashed transform: the first 16 bytes of BLAKE2b-256 over
+    // `vos/tree/key` and the key, then the key escaped.
+    let hashed = Transform::Hashed.apply(&[7, 0]);
+    assert_eq!(hashed.len(), 16 + 3 + 2);
+    assert_eq!(&hashed[16..], [7, 0, 0xff, 0, 0]);
+    assert_eq!(Transform::Hashed.raw(&hashed), Some(vec![7, 0]));
+    assert_eq!(
+        Transform::Ordered.raw(&[7, 0, 0, 1]),
+        None,
+        "bytes past the key"
+    );
+}
+
+/// A row operation's row: the struct under the empty key alone, a table's
+/// and a committed map's under their prefix, an ordered key within its cap.
+/// The largest row a state scan returns fits its cap exactly.
+#[test]
+fn rows_are_keyed_by_their_table() {
+    let instance = InstanceId(3);
+    let table = |transform| Rows::Table { tag: 7, transform };
+    assert_eq!(
+        keys::row(instance, Rows::Struct, &[]),
+        Ok(keys::instance_struct(instance))
+    );
+    assert_eq!(
+        keys::row(instance, Rows::Struct, &[1]),
+        Err(Failure::Trapped)
+    );
+    let zeros = vec![0u8; abi::cap::KEY];
+    let hashed = keys::row(instance, table(Transform::Hashed), &zeros).unwrap();
+    assert_eq!(
+        hashed,
+        [
+            keys::table_rows(instance, 7, Transform::Hashed),
+            Transform::Hashed.apply(&zeros)
+        ]
+        .concat()
+    );
+    let long = vec![1u8; abi::cap::ORDERED_KEY + 1];
+    assert_eq!(
+        keys::row(instance, table(Transform::Ordered), &long),
+        Err(Failure::Cap)
+    );
+    assert!(keys::row(instance, table(Transform::Ordered), &long[1..]).is_ok());
+    let value = vos_wire::records::stored_versioned(0, &vec![0; abi::cap::VALUE]);
+    let largest = (hashed, value).encode().len();
+    assert_eq!(largest, abi::cap::STORED_ROW);
+}
+
+/// A row operation's rows register: the tag, the transform's tag, then the
+/// kind; any other value is refused.
+#[test]
+fn rows_registers_keep_their_bits() {
+    let table = Rows::Table {
+        tag: 0xa1b2_c3d4,
+        transform: Transform::Ordered,
+    };
+    let committed = Rows::Committed {
+        tag: 7,
+        transform: Transform::Hashed,
+    };
+    assert_eq!(Rows::Struct.register(), 0);
+    assert_eq!(table.register(), 0x0000_0101_a1b2_c3d4);
+    assert_eq!(committed.register(), 0x0000_0200_0000_0007);
+    for rows in [Rows::Struct, table, committed] {
+        assert_eq!(Rows::from_register(rows.register()), Some(rows));
+    }
+    for refused in [
+        1,
+        1 << 32,
+        2 << 32 | 1 << 40,
+        3 << 40,
+        1 << 48 | 1 << 40,
+        u64::MAX,
+    ] {
+        assert_eq!(Rows::from_register(refused), None, "{refused:#x}");
+    }
+}
+
+/// A run's committed writes follow its writes: each its map (instance, tag,
+/// transform's index), its transformed key and its value. A value row
+/// holds the version that wrote it, little-endian, then the value.
+#[test]
+fn committed_writes_keep_their_bytes() {
+    let run = Run {
+        input: InputRef::Admin,
+        outcome: Outcome::Done(vec![]),
+        instances: vec![],
+        writes: vec![Write {
+            key: vec![0xaa],
+            value: None,
+        }],
+        committed: vec![CommittedWrite {
+            map: MapId {
+                instance: InstanceId(5),
+                tag: 6,
+                transform: Transform::Ordered,
+            },
+            key: vec![0xbb],
+            value: Some(vec![0xcc]),
+        }],
+        messages: vec![],
+        attests: vec![],
+        gas_used: 9,
+    };
+    let bytes = [
+        &[2u8, 0, 0, 0, 0, 0][..],
+        &[0, 0, 0, 0],
+        &[1, 0, 0, 0, 1, 0, 0, 0, 0xaa, 0],
+        &[1, 0, 0, 0],
+        &[5, 0, 0, 0, 6, 0, 0, 0, 1],
+        &[1, 0, 0, 0, 0xbb, 1, 1, 0, 0, 0, 0xcc],
+        &[0, 0, 0, 0, 0, 0, 0, 0],
+        &9u64.to_le_bytes(),
+    ]
+    .concat();
+    assert_eq!(run.encode(), bytes);
+    assert_eq!(Run::decode(&bytes).unwrap().0, run);
+    assert_eq!(Transform::Hashed.encode(), [0]);
+    assert_eq!(
+        vos_wire::records::versioned(0x0102, &[0xdd]),
+        [0x02, 0x01, 0, 0, 0, 0, 0, 0, 0xdd]
+    );
+    assert_eq!(
+        vos_wire::records::unversioned(&[0x02, 0x01, 0, 0, 0, 0, 0, 0, 0xdd]),
+        Some((0x0102, &[0xdd][..]))
     );
 }
 

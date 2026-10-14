@@ -9,7 +9,7 @@ use vos_sdk::prelude::*;
 pub struct Ledger {
     total: u64,
     #[table(name = "balances")]
-    accounts: Table<u64, u64>,
+    accounts: Table<u64, u64, Ordered>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
@@ -34,6 +34,17 @@ impl Ledger {
         self.accounts.insert(&to, &balance);
         self.total += amount;
         balance
+    }
+
+    /// Credit each of `accounts`; only a "minter" may.
+    #[msg(role = "minter", gas = 100_000_000)]
+    pub async fn mint_all(&mut self, accounts: Vec<(u64, u64)>) -> u64 {
+        for (to, amount) in &accounts {
+            let balance = self.accounts.get(to).unwrap_or(0) + amount;
+            self.accounts.insert(to, &balance);
+            self.total += amount;
+        }
+        self.total
     }
 
     #[msg(gas = 2_000_000)]

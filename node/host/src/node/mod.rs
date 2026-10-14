@@ -1042,6 +1042,19 @@ impl Node {
         &self.inner.store
     }
 
+    /// The latest root of `agent`'s committed map `map`, the state version
+    /// it holds, and a proof of `keys` against it, from one storage
+    /// snapshot. Refused as building while a build is part-way through the
+    /// map.
+    pub fn prove<K: AsRef<[u8]>>(
+        &self,
+        agent: AgentId,
+        map: vos_wire::ids::MapId,
+        keys: &[K],
+    ) -> Result<crate::roots::Proven, crate::roots::Error> {
+        crate::roots::prove(&self.inner.store.snapshot(), agent, map, keys)
+    }
+
     /// The blobs some agent keeps here: the programs its instances run.
     pub fn pinned(&self) -> Vec<[u8; 32]> {
         self.inner.blobs.pinned().unwrap_or_default()

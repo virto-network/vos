@@ -1,7 +1,10 @@
 //! The default agent's refine on a real batch, on the interpreter and the
 //! JIT: the time per request in a batch of counter increments, and the
 //! marginal time of one actor ABI operation, which is one exit from the
-//! actor's machine, the agent serving it, and one re-entry.
+//! actor's machine, the agent serving it, and one re-entry. And its
+//! accumulate: the time per write of a work result's table writes, and of
+//! its committed writes, each a value row and a dirty row, against
+//! in-memory storage.
 //!
 //! `cargo bench -p vos-testkit --bench batch` (after `just build-agent
 //! build-test-actors`).
@@ -131,13 +134,21 @@ impl Node {
 
     fn apply(&mut self, inputs: Vec<Input>) {
         let result = self.refine(inputs);
+        let mut state = std::mem::take(&mut self.state);
+        self.accumulate(&result, &mut state);
+        self.state = state;
+        self.version += 1;
+    }
+
+    /// Accumulate `result` onto `state`.
+    fn accumulate(&self, result: &[u8], state: &mut BTreeMap<Vec<u8>, Vec<u8>>) {
         let input = AccumulateInput::Operand(Operand {
             package_hash: [0; 32],
             segment_root: [0; 32],
             authorizer: [0; 32],
             payload_hash: [0; 32],
             gas_limit: 0,
-            result: Ok(result),
+            result: Ok(result.to_vec()),
             auth_trace: Vec::new(),
         })
         .encode();
@@ -145,13 +156,27 @@ impl Node {
         let service = u64::from(AGENT.0);
         let arguments = accumulate_host::arguments(0, service, inputs.len());
         let machine = self.agent.load(ACCUMULATE_ENTRY, &arguments, GAS).unwrap();
-        let invocation =
-            AccumulateContext::new(machine, service, &inputs, &mut Storage(&mut self.state))
-                .try_run()
-                .unwrap();
+        let invocation = AccumulateContext::new(machine, service, &inputs, &mut Storage(state))
+            .try_run()
+            .unwrap();
         assert_eq!(invocation.exit, ExitReason::Halt);
         self.agent.restore(invocation);
-        self.version += 1;
+    }
+
+    /// The median wall time of accumulating `inputs`' result on the
+    /// agent's state, in microseconds.
+    fn accumulate_time(&self, inputs: Vec<Input>) -> f64 {
+        let result = self.refine(inputs);
+        let mut rounds: Vec<f64> = (0..ROUNDS)
+            .map(|_| {
+                let mut state = self.state.clone();
+                let started = Instant::now();
+                self.accumulate(&result, &mut state);
+                started.elapsed().as_secs_f64() * 1e6
+            })
+            .collect();
+        rounds.sort_by(f64::total_cmp);
+        rounds[ROUNDS / 2]
     }
 
     /// The median of a refine's wall time, in microseconds.
@@ -281,6 +306,33 @@ fn main() {
         let per_op = (node.time(&phases(2000)) - node.time(&phases(0))) / 2000.0 * 1000.0;
         println!(
             "{name:>12}: empty refine {empty:.0} µs; {per_request:.1} µs per increment in a batch of 200; {per_op:.0} ns per `now` operation"
+        );
+        // A result of one request writing 500 rows, to a table or to a
+        // committed map, against one writing none.
+        let writes = 500u64;
+        let set = method(&counter, "set_entries");
+        let fill = method(&counter, "fill");
+        let entries = (0..writes)
+            .map(|key| (key * 7919, Some(key)))
+            .collect::<Vec<(u64, Option<u64>)>>();
+        let none = node.accumulate_time(requests(
+            set,
+            COUNTER,
+            |_| Vec::<(u64, Option<u64>)>::new().encode(),
+            1,
+        ));
+        let committed =
+            (node.accumulate_time(requests(set, COUNTER, move |_| entries.encode(), 1)) - none)
+                / writes as f64;
+        let table = (node.accumulate_time(requests(
+            fill,
+            COUNTER,
+            move |_| (writes as u32, 8u32).encode(),
+            1,
+        )) - none)
+            / writes as f64;
+        println!(
+            "{name:>12}: accumulate {table:.2} µs per table write, {committed:.2} µs per committed write (value and dirty rows)"
         );
     }
 }

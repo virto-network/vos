@@ -5,12 +5,12 @@
 use std::collections::BTreeMap;
 
 use proptest::prelude::*;
-use vos_testkit::programs::method;
+use vos_testkit::programs::{method, table_tag};
 use vos_testkit::{Testkit, decode};
-use vos_wire::abi::{Failure, Refusal, cap, code};
+use vos_wire::abi::{Failure, Refusal, Rows, cap, code};
 use vos_wire::batch::{Admin, Input};
-use vos_wire::ids::{AgentId, InstanceId};
-use vos_wire::keys;
+use vos_wire::ids::{AgentId, InstanceId, MethodId};
+use vos_wire::keys::{self, Transform};
 use vos_wire::records::unstored;
 use vos_wire::result::{Outcome, WorkResult};
 use vos_wire::{Decode, Encode};
@@ -110,7 +110,10 @@ fn each_per_step_cap_holds_its_limit_and_fails_one_byte_past() {
     let put_and_scan = actors.method(COUNTER, "put_and_scan");
     // Past 16 KiB, a byte vector encodes with a 4-byte length.
     let bytes = |encoded: usize| encoded - 4;
-    let key = |len: usize| (vec![vec![2u8; len]], vec![2u8], Vec::<u8>::new());
+    let rows = |transform| Rows::Table { tag: 7, transform }.register();
+    let key = |transform, len: usize| (rows(transform), vec![vec![2u8; len]], None::<Vec<u8>>);
+    let hashed = |len| key(Transform::Hashed, len);
+    let ordered = |len| key(Transform::Ordered, len);
     let result = node.batch(
         1,
         vec![
@@ -120,8 +123,10 @@ fn each_per_step_cap_holds_its_limit_and_fails_one_byte_past() {
             sessions.request(ALICE, COUNTER, large, bytes(cap::REPLY) as u32 + 1),
             sessions.request(ALICE, COUNTER, fill, (1u32, bytes(cap::VALUE) as u32)),
             sessions.request(ALICE, COUNTER, fill, (1u32, bytes(cap::VALUE) as u32 + 1)),
-            sessions.request(ALICE, COUNTER, put_and_scan, key(cap::KEY)),
-            sessions.request(ALICE, COUNTER, put_and_scan, key(cap::KEY + 1)),
+            sessions.request(ALICE, COUNTER, put_and_scan, hashed(cap::KEY)),
+            sessions.request(ALICE, COUNTER, put_and_scan, hashed(cap::KEY + 1)),
+            sessions.request(ALICE, COUNTER, put_and_scan, ordered(cap::ORDERED_KEY)),
+            sessions.request(ALICE, COUNTER, put_and_scan, ordered(cap::ORDERED_KEY + 1)),
         ],
     );
     for (at, past, what) in [
@@ -129,6 +134,7 @@ fn each_per_step_cap_holds_its_limit_and_fails_one_byte_past() {
         (2, 3, "a reply"),
         (4, 5, "a value"),
         (6, 7, "a key"),
+        (8, 9, "an ordered table's key"),
     ] {
         assert!(
             matches!(ran(&result.steps[at]).outcome, Outcome::Done(_)),
@@ -332,37 +338,410 @@ fn a_refine_stops_before_its_result_outgrows_the_cap() {
     assert_eq!(done::<Vec<u8>>(&rest.steps[0]), vec![7u8; 64_000]);
 }
 
+/// A table's scan returns its raw keys in the table's order, hash order or
+/// key order, from any cursor, the step's own writes and the batch's
+/// earlier ones included; the testkit agrees.
 #[test]
-fn a_scan_from_any_cursor_sees_the_steps_own_writes() {
+fn a_scan_runs_in_its_tables_order_from_any_cursor() {
     let (actors, mut node, mut kit, mut sessions) = setup();
     let scan = actors.method(COUNTER, "put_and_scan");
-    let keys = vec![vec![4u8, 1], vec![4, 2], vec![5, 1]];
-    let row = |key: &[u8]| (key.to_vec(), vec![1u8]).encode();
-    let both = [row(&[4, 1]), row(&[4, 2])].concat();
-    let cases = [
-        (vec![], both.clone()),
-        (vec![3u8], both.clone()),
-        (vec![4], both),
-        (vec![4, 1], row(&[4, 2])),
-        (vec![4, 9], vec![]),
-        (vec![6], vec![]),
+    let keys = vec![
+        vec![4u8, 1],
+        vec![4, 2],
+        vec![5, 1],
+        vec![],
+        vec![4, 0],
+        vec![0, 0],
     ];
-    let arguments = |cursor: &Vec<u8>| (keys.clone(), vec![4u8], cursor.clone());
+    let row = |key: &[u8]| (key.to_vec(), vec![1u8]).encode();
+    let mut cases = Vec::new();
+    for transform in [Transform::Hashed, Transform::Ordered] {
+        let rows = Rows::Table { tag: 7, transform }.register();
+        let mut ordered = keys.clone();
+        ordered.sort_by_key(|key| transform.apply(key));
+        if transform == Transform::Ordered {
+            assert_eq!(ordered, {
+                let mut sorted = keys.clone();
+                sorted.sort();
+                sorted
+            });
+        }
+        let cursors = [None, Some(vec![4u8, 9]), Some(vec![6])]
+            .into_iter()
+            .chain(keys.iter().cloned().map(Some));
+        for cursor in cursors {
+            let expected: Vec<u8> = ordered
+                .iter()
+                .filter(|key| {
+                    cursor
+                        .as_ref()
+                        .is_none_or(|cursor| transform.apply(key) > transform.apply(cursor))
+                })
+                .flat_map(|key| row(key))
+                .collect();
+            cases.push(((rows, keys.clone(), cursor), expected));
+        }
+    }
     let inputs = cases
         .iter()
-        .map(|(cursor, _)| sessions.request(ALICE, COUNTER, scan, arguments(cursor)))
+        .map(|(arguments, _)| sessions.request(ALICE, COUNTER, scan, arguments.clone()))
         .collect();
     let result = node.batch(1, inputs);
     kit.batch(1, [0; 32]);
-    for ((cursor, expected), step) in cases.iter().zip(&result.steps) {
-        assert_eq!(&done::<Vec<u8>>(step), expected, "cursor {cursor:?}");
-        let reference = kit.command(ALICE, COUNTER, scan, &arguments(cursor).encode());
+    for ((arguments, expected), step) in cases.iter().zip(&result.steps) {
+        assert_eq!(&done::<Vec<u8>>(step), expected, "{arguments:?}");
+        let reference = kit.command(ALICE, COUNTER, scan, &arguments.encode());
         assert_eq!(
             reference.outcome,
             ran(step).outcome,
-            "testkit, cursor {cursor:?}"
+            "testkit, {arguments:?}"
         );
     }
+}
+
+/// An ordered table's key, as a row's or a scan's cursor, holds
+/// `cap::ORDERED_KEY` bytes; one byte past fails the step, where a hashed
+/// table takes it. The testkit agrees.
+#[test]
+fn an_ordered_key_past_its_cap_fails_the_step() {
+    let (actors, mut node, mut kit, mut sessions) = setup();
+    let scan = actors.method(COUNTER, "put_and_scan");
+    let rows = |transform| Rows::Table { tag: 7, transform }.register();
+    let long = vec![9u8; cap::ORDERED_KEY + 1];
+    let cases = [
+        (
+            (rows(Transform::Ordered), vec![long[1..].to_vec()], None),
+            None,
+        ),
+        (
+            (rows(Transform::Ordered), vec![long.clone()], None),
+            Some(Failure::Cap),
+        ),
+        (
+            (rows(Transform::Ordered), vec![], Some(long.clone())),
+            Some(Failure::Cap),
+        ),
+        (
+            (
+                rows(Transform::Hashed),
+                vec![long.clone()],
+                Some(long.clone()),
+            ),
+            None,
+        ),
+    ];
+    let inputs = cases
+        .iter()
+        .map(|(arguments, _)| sessions.request(ALICE, COUNTER, scan, arguments.clone()))
+        .collect();
+    let result = node.batch(1, inputs);
+    kit.batch(1, [0; 32]);
+    for ((arguments, expected), step) in cases.iter().zip(&result.steps) {
+        match expected {
+            Some(code) => assert_eq!(failed(step), *code),
+            None => assert!(matches!(ran(step).outcome, Outcome::Done(_))),
+        }
+        let reference = kit.command(ALICE, COUNTER, scan, &arguments.encode());
+        assert_eq!(reference.outcome, ran(step).outcome);
+        assert_eq!(reference.gas_used, ran(step).gas_used);
+    }
+}
+
+/// Rows at both caps (a key of zero bytes, which doubles escaped, and the
+/// largest value) in a hashed table, a committed map, and an ordered table
+/// at its own key cap, scan back whole in a later batch; an output too
+/// small for one is `FULL`. The testkit agrees.
+#[test]
+fn rows_at_their_caps_scan_back_in_a_later_batch() {
+    let (actors, mut node, mut kit, mut sessions) = setup();
+    let store = actors.method(COUNTER, "store");
+    let scan = actors.method(COUNTER, "scan_rows");
+    let tables = [
+        (
+            Rows::Table {
+                tag: 9,
+                transform: Transform::Hashed,
+            },
+            cap::KEY,
+        ),
+        (
+            Rows::Committed {
+                tag: 9,
+                transform: Transform::Hashed,
+            },
+            cap::KEY,
+        ),
+        (
+            Rows::Table {
+                tag: 9,
+                transform: Transform::Ordered,
+            },
+            cap::ORDERED_KEY,
+        ),
+    ];
+    let stores: Vec<_> = tables
+        .iter()
+        .map(|(rows, key)| (rows.register(), vec![0u8; *key], cap::VALUE as u32))
+        .collect();
+    let scans: Vec<_> = tables
+        .iter()
+        .flat_map(|(rows, _)| {
+            [cap::SCAN as u32, 1024].map(|capacity| (rows.register(), None::<Vec<u8>>, capacity))
+        })
+        .collect();
+    let first = node.batch(
+        1,
+        stores
+            .iter()
+            .map(|arguments| sessions.request(ALICE, COUNTER, store, arguments.clone()))
+            .collect(),
+    );
+    kit.batch(1, [0; 32]);
+    for (arguments, step) in stores.iter().zip(&first.steps) {
+        assert_eq!(done::<u32>(step), cap::VALUE as u32);
+        let reference = kit.command(ALICE, COUNTER, store, &arguments.encode());
+        assert_eq!(reference.outcome, ran(step).outcome);
+    }
+    let second = node.batch(
+        2,
+        scans
+            .iter()
+            .map(|arguments| sessions.request(ALICE, COUNTER, scan, arguments.clone()))
+            .collect(),
+    );
+    kit.batch(2, [0; 32]);
+    for ((arguments, step), (_, key)) in scans
+        .iter()
+        .zip(&second.steps)
+        .zip(tables.iter().flat_map(|table| [table, table]))
+    {
+        let (written, rows) = done::<(u64, Vec<(Vec<u8>, u32, u64)>)>(step);
+        if arguments.2 == 1024 {
+            assert_eq!((written, rows.len()), (code::FULL, 0), "{arguments:?}");
+        } else {
+            let row = (vec![0u8; *key], cap::VALUE as u32, 7 * cap::VALUE as u64);
+            assert_eq!(rows, vec![row], "{arguments:?}");
+            assert_eq!(written as usize, 8 + key + cap::VALUE);
+        }
+        let reference = kit.command(ALICE, COUNTER, scan, &arguments.encode());
+        assert_eq!(
+            reference.outcome,
+            ran(step).outcome,
+            "testkit, {arguments:?}"
+        );
+        assert_eq!(
+            reference.gas_used,
+            ran(step).gas_used,
+            "testkit, {arguments:?}"
+        );
+    }
+}
+
+/// Tables and committed maps iterate across the buffer refills of a scan,
+/// in their order: a hashed table in hash order, an ordered one in key
+/// order, a committed map in its own. The testkit agrees.
+#[test]
+fn rows_iterate_in_order_across_refills() {
+    let (actors, mut node, mut kit, mut sessions) = setup();
+    let count = 300u64;
+    let entries: Vec<(u64, Option<u64>)> = (0..count).map(|key| (key * 7, Some(key))).collect();
+    let accounts: Vec<(u64, u64)> = (0..count).map(|id| (id * 11, id + 1)).collect();
+    let writes = [
+        (
+            COUNTER,
+            actors.method(COUNTER, "fill"),
+            (count as u32, 8u32).encode(),
+        ),
+        (
+            COUNTER,
+            actors.method(COUNTER, "set_entries"),
+            entries.encode(),
+        ),
+        (LEDGER, actors.method(LEDGER, "mint_all"), accounts.encode()),
+    ];
+    let reads = [
+        (COUNTER, actors.method(COUNTER, "blob_keys"), ().encode()),
+        (
+            COUNTER,
+            actors.method(COUNTER, "entries"),
+            None::<u64>.encode(),
+        ),
+        (LEDGER, actors.method(LEDGER, "holders"), ().encode()),
+    ];
+    let request =
+        |sessions: &mut Sessions,
+         (instance, method, arguments): &(InstanceId, MethodId, Vec<u8>)| {
+            sessions.request_bytes(ALICE, *instance, *method, arguments.clone())
+        };
+    let first = node.batch(
+        1,
+        writes
+            .iter()
+            .map(|call| request(&mut sessions, call))
+            .collect(),
+    );
+    kit.batch(1, [0; 32]);
+    for ((instance, method, arguments), step) in writes.iter().zip(&first.steps) {
+        let reference = kit.command(ALICE, *instance, *method, arguments);
+        assert_eq!(reference.outcome, ran(step).outcome);
+        assert!(matches!(ran(step).outcome, Outcome::Done(_)));
+    }
+    let second = node.batch(
+        2,
+        reads
+            .iter()
+            .map(|call| request(&mut sessions, call))
+            .collect(),
+    );
+    kit.batch(2, [0; 32]);
+    for ((instance, method, arguments), step) in reads.iter().zip(&second.steps) {
+        let reference = kit.command(ALICE, *instance, *method, arguments);
+        assert_eq!(reference.outcome, ran(step).outcome);
+    }
+    // Each in its table's order, as the rows' keys carry the transform.
+    let transform_of = |prefix: Vec<u8>| {
+        let key = node
+            .state
+            .keys()
+            .find(|key| key.starts_with(&prefix))
+            .expect("a row of the table");
+        Transform::from_tag(key[prefix.len()]).expect("a transform")
+    };
+    let blobs = transform_of(keys::table_prefix(COUNTER, table_tag("blobs")));
+    let mut expected: Vec<u32> = (0..count as u32).collect();
+    expected.sort_by_key(|key| blobs.apply(&key.to_be_bytes()));
+    assert_eq!(done::<Vec<u32>>(&second.steps[0]), expected);
+    let map = ran(&first.steps[1]).committed[0].map;
+    let mut expected: Vec<(u64, u64)> = (0..count).map(|key| (key * 7, key)).collect();
+    expected.sort_by_key(|(key, _)| map.transform.apply(&key.to_be_bytes()));
+    assert_eq!(done::<Vec<(u64, u64)>>(&second.steps[1]), expected);
+    assert_eq!(
+        done::<Vec<(u64, u64)>>(&second.steps[2]),
+        accounts,
+        "key order"
+    );
+}
+
+/// A register no rows answer to, a struct key that is not empty, or a scan
+/// of the struct fails the invocation; the testkit agrees.
+#[test]
+fn rows_the_agent_does_not_know_fail_the_invocation() {
+    let (actors, mut node, mut kit, mut sessions) = setup();
+    let scan = actors.method(COUNTER, "put_and_scan");
+    let table = Rows::Table {
+        tag: 7,
+        transform: Transform::Hashed,
+    }
+    .register();
+    let cases = [
+        (Rows::Struct.register(), vec![vec![1u8]], "a struct key"),
+        (Rows::Struct.register(), vec![], "a scan of the struct"),
+        (3 << 40, vec![vec![1]], "a fourth kind"),
+        (table | 2 << 32, vec![vec![1]], "a third transform"),
+        (table | 1 << 48, vec![vec![1]], "bits past the kind"),
+        (1, vec![vec![1]], "a struct with a tag"),
+    ];
+    let inputs = cases
+        .iter()
+        .map(|(rows, keys, _)| {
+            sessions.request(ALICE, COUNTER, scan, (*rows, keys.clone(), None::<Vec<u8>>))
+        })
+        .collect();
+    let result = node.batch(1, inputs);
+    kit.batch(1, [0; 32]);
+    for ((rows, keys, what), step) in cases.iter().zip(&result.steps) {
+        assert_eq!(failed(step), Failure::Trapped, "{what}");
+        let arguments = (*rows, keys.clone(), None::<Vec<u8>>).encode();
+        let reference = kit.command(ALICE, COUNTER, scan, &arguments);
+        assert_eq!(reference.outcome, ran(step).outcome, "testkit, {what}");
+        assert_eq!(reference.gas_used, ran(step).gas_used, "testkit, {what}");
+    }
+}
+
+/// A committed map's writes reach accumulate apart, each a value row with
+/// the version that wrote it and a dirty row, with the result's seed kept
+/// under that version; reads see the values alone, in the map's order. The
+/// testkit keeps the same rows.
+#[test]
+fn committed_writes_leave_value_dirty_and_seed_rows() {
+    let (actors, mut node, mut kit, mut sessions) = setup();
+    let set = actors.method(COUNTER, "set_entries");
+    let entry = actors.method(COUNTER, "entry");
+    let entries = actors.method(COUNTER, "entries");
+    let batches = [
+        vec![(1u64, Some(10u64)), (2, Some(20)), (3, Some(30))],
+        vec![(2, None), (3, Some(31)), (4, Some(40))],
+        vec![],
+    ];
+    let mut transform = None;
+    for (writes, at) in batches.iter().zip(1u8..) {
+        let (time, seed) = (&u64::from(at), &[at; 32]);
+        let version = node.version + 1;
+        let input = sessions.request(ALICE, COUNTER, set, writes.clone());
+        let result = node.apply(&node.seeded_work(*time, *seed, vec![input]));
+        kit.batch(*time, *seed);
+        let step = kit.command(ALICE, COUNTER, set, &writes.encode());
+        let run = ran(&result.steps[0]);
+        assert!(
+            run.writes
+                .iter()
+                .all(|write| keys::committed_entry(&write.key).is_none())
+        );
+        assert_eq!(run.committed, step.committed);
+        assert_eq!(run.committed.len(), writes.len());
+        if let Some(write) = run.committed.first() {
+            transform = Some(write.map.transform);
+        }
+        for write in &run.committed {
+            assert!(
+                node.state
+                    .contains_key(&keys::dirty(version, &write.map, &write.key))
+            );
+        }
+        assert_eq!(
+            node.get(&keys::seed(version)),
+            (!writes.is_empty()).then(|| seed.to_vec()),
+            "a seed only for a version that wrote a committed row"
+        );
+    }
+    // Reads through the map: the values, without their versions.
+    let read = |key: u64| node.query(ALICE, COUNTER, entry, key.encode());
+    assert_eq!(read(1), Outcome::Done(Some(10u64).encode()));
+    assert_eq!(read(2), Outcome::Done(None::<u64>.encode()));
+    assert_eq!(read(3), Outcome::Done(Some(31u64).encode()));
+    let mut expected = vec![(1u64, 10u64), (3, 31), (4, 40)];
+    let transform = transform.expect("the map's transform");
+    expected.sort_by_key(|(key, _)| transform.apply(&key.to_be_bytes()));
+    let listed = node.query(ALICE, COUNTER, entries, None::<u64>.encode());
+    assert_eq!(listed, Outcome::Done(expected.encode()));
+    assert_eq!(
+        kit.query(ALICE, COUNTER, entries, &None::<u64>.encode()),
+        listed
+    );
+    // The rows themselves, as the testkit keeps them.
+    let kept = |key: &Vec<u8>| {
+        key.first() == Some(&0x01)
+            || key.starts_with(&keys::dirty_prefix())
+            || key.starts_with(&keys::seed_prefix())
+    };
+    let applied: BTreeMap<Vec<u8>, Vec<u8>> = node
+        .state
+        .iter()
+        .filter(|(key, _)| kept(key))
+        .map(|(key, value)| (key.clone(), unstored(value).unwrap().to_vec()))
+        .collect();
+    let reference: BTreeMap<Vec<u8>, Vec<u8>> = kit.rows().into_iter().collect();
+    assert_eq!(applied, reference);
+    let value_rows = applied
+        .keys()
+        .filter(|key| keys::committed_entry(key).is_some())
+        .count();
+    assert_eq!(value_rows, 3, "a deletion removes its value row");
+    let dirty_rows = applied
+        .keys()
+        .filter(|key| keys::dirty_entry(key).is_some())
+        .count();
+    assert_eq!(dirty_rows, 6, "one per write, deletions included");
 }
 
 #[test]
@@ -421,7 +800,7 @@ fn state_the_agent_did_not_write_fails_only_the_steps_that_read_it() {
 
 /// One random request among the test actors' handlers.
 fn input() -> impl Strategy<Value = (u8, u8, u64, u64)> {
-    (0u8..16, 0u8..2, 0u64..200, 0u64..4)
+    (0u8..19, 0u8..2, 0u64..200, 0u64..4)
 }
 
 /// The request `choice` picks: a handler, its caller, an amount and an
@@ -461,7 +840,15 @@ fn chosen(actors: &Actors, sessions: &mut Sessions, choice: (u8, u8, u64, u64)) 
         12 => sessions.request(caller, CALLER, m(CALLER, "ask"), LEDGER.0),
         13 => sessions.request(caller, CALLER, m(CALLER, "recurse"), ()),
         14 => sessions.request(caller, LEDGER, m(LEDGER, "whoami"), ()),
-        _ => sessions.request(caller, LEDGER, m(LEDGER, "total"), ()),
+        15 => sessions.request(caller, LEDGER, m(LEDGER, "total"), ()),
+        16 => sessions.request(
+            caller,
+            COUNTER,
+            m(COUNTER, "set_entries"),
+            vec![(account, Some(amount)), ((account + 1) % 4, None)],
+        ),
+        17 => sessions.request(caller, COUNTER, m(COUNTER, "entry"), account),
+        _ => sessions.request(caller, COUNTER, m(COUNTER, "entries"), Some(account)),
     }
 }
 
@@ -492,6 +879,7 @@ proptest! {
                 let run = ran(step);
                 prop_assert_eq!(&run.outcome, &expected.outcome);
                 prop_assert_eq!(&run.writes, &expected.writes);
+                prop_assert_eq!(&run.committed, &expected.committed);
                 prop_assert_eq!(&run.messages, &expected.messages);
                 prop_assert_eq!(&run.attests, &expected.attests);
                 prop_assert_eq!(&run.instances, &expected.instances);
@@ -501,7 +889,11 @@ proptest! {
         let applied: BTreeMap<Vec<u8>, Vec<u8>> = node
             .state
             .iter()
-            .filter(|(key, _)| key.first() == Some(&0x01))
+            .filter(|(key, _)| {
+                key.first() == Some(&0x01)
+                    || key.starts_with(&keys::dirty_prefix())
+                    || key.starts_with(&keys::seed_prefix())
+            })
             .map(|(key, value)| (key.clone(), unstored(value).unwrap().to_vec()))
             .collect();
         let reference: BTreeMap<Vec<u8>, Vec<u8>> = kit.rows().into_iter().collect();

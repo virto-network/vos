@@ -25,6 +25,7 @@ pub mod peer;
 mod pvm;
 mod queries;
 pub mod raft;
+pub mod roots;
 pub mod space;
 mod stats;
 pub mod storage;
