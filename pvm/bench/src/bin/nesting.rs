@@ -130,7 +130,7 @@ static ACTOR_POOL: OnceLock<(Arc<MachinePool>, Arc<PoolProgram>)> = OnceLock::ne
 fn pooled_actor(inner: &mut InnerMachines, program: &Arc<PoolProgram>) -> LoadedActor {
     const ZONE: u64 = 0x1_0000;
     const INPUT: u64 = 1 << 24;
-    let id = inner.instantiate(program).expect("instantiate");
+    let id = inner.instantiate(program, 0).expect("instantiate");
     let args_base = (1 << 32) - ZONE - INPUT;
     inner
         .pages(

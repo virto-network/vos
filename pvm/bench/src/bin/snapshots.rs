@@ -293,7 +293,7 @@ fn snapshot_run(spi: &[u8], args: &[u8], prefixes: &[Duration]) -> (String, Vec<
                 let mut inner = InnerMachines::with_backend(backend);
                 inner.set_pool(Arc::clone(&pool));
                 let started = Instant::now();
-                let id = inner.instantiate(&program).unwrap();
+                let id = inner.instantiate(&program, 0).unwrap();
                 for (index, page) in &snapshot.pages {
                     inner.poke(id, index * PAGE as u32, &page[..]).unwrap();
                 }

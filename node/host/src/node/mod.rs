@@ -73,12 +73,6 @@ const REPLACED: Duration = Duration::from_secs(30);
 /// by the node that took over.
 const REPLACED_ELSEWHERE: Duration = Duration::from_secs(2);
 
-// A work result as large as refine allows travels in one append.
-const _: () = assert!(
-    vos_net::Limits::DEFAULT.consensus >= vos_wire::abi::cap::WORK_RESULT + (1 << 20),
-    "a consensus frame must hold the largest work result"
-);
-
 pub(crate) struct Inner {
     pub(crate) store: Fjall,
     pub(crate) blobs: Blobs,

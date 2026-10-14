@@ -18,10 +18,11 @@ use vos_wire::records::{SessionMark, unstored};
 use vos_wire::result::{Outcome, Outgoing, Step, WorkResult, Write as StateWrite};
 use vos_wire::{expiry, keys};
 
+use crate::blobs::blob_ref;
 use crate::group::{DryRun, Local, Shared, State};
 use crate::node::{Agent, Answered, CallError, Inner, Pending, Reply, ran, read, reply};
 use crate::pvm::{self, Fault};
-use crate::store::{BlobRef, EntryKind, LogEntry, Snapshot};
+use crate::store::{BlobRef, EntryKind, LARGE_RESULT, LogEntry, Snapshot};
 use crate::{lock, seed, timeout};
 
 /// The first wait before retrying a batch the node failed, doubled each
@@ -753,17 +754,32 @@ impl Leader {
             .sum();
         inner.stats.refine_gas.record(refine_gas / inputs.max(1));
         inner.stats.step_gas.record(step_gas / inputs.max(1));
-        let entry = LogEntry {
-            term: 0,
-            kind: EntryKind::Result,
-            blobs,
-            body: output,
+        // The dry run: a failure here isolates its input off the log. A
+        // large result is stored meanwhile, as the blob its entry names.
+        let (payload, writes) = if output.len() >= LARGE_RESULT {
+            let stored = store_result(inner, Arc::new(output.clone()));
+            let dried = self.dry_run(inner, shared, snapshot, batch, output);
+            let (stored, writes) = smol::future::zip(stored, dried).await;
+            let entry = LogEntry {
+                term: 0,
+                kind: EntryKind::LargeResult,
+                blobs: [vec![stored?], blobs].concat(),
+                body: Vec::new(),
+            };
+            (entry.payload(), writes?)
+        } else {
+            let entry = LogEntry {
+                term: 0,
+                kind: EntryKind::Result,
+                blobs,
+                body: output,
+            };
+            let payload = entry.payload();
+            let writes = self
+                .dry_run(inner, shared, snapshot, batch, entry.body)
+                .await?;
+            (payload, writes)
         };
-        let payload = entry.payload();
-        // The dry run: a failure here isolates its input off the log.
-        let writes = self
-            .dry_run(inner, shared, snapshot, batch, entry.body)
-            .await?;
         let version = writes
             .iter()
             .find(|write| write.key == keys::version())
@@ -1273,6 +1289,20 @@ impl Leader {
             inner.acknowledge(sender, self.id, sequence);
         }
     }
+}
+
+/// Store a large work result as a blob, hashed on an executor. Its age keeps
+/// it until the entry naming it is written, and that entry's log row from
+/// then on: once the log is compacted past it, it ages out.
+async fn store_result(inner: &Inner, result: Arc<Vec<u8>>) -> Result<BlobRef, Fault> {
+    let hashed = Arc::clone(&result);
+    let blob = ran(inner.executors.run(move || Ok(blob_ref(&hashed))).await)?;
+    inner
+        .blobs
+        .put(blob, result)
+        .await
+        .map_err(|error| Fault::Storage(format!("the blob store failed: {error}")))?;
+    Ok(blob)
 }
 
 /// The first row of `agent`'s expiry index: the oldest bucket, and its

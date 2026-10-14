@@ -242,7 +242,8 @@ struct Driver {
     proposals: HashMap<u64, Proposed>,
     reads: HashMap<u64, smol::channel::Sender<Result<u64, ReadIndexError>>>,
     next_token: u64,
-    /// The blobs asked for last, and when.
+    /// The blobs asked for last, and when the member now asked was first
+    /// asked: past the retry interval, the next member is.
     asked: Option<(Instant, Vec<[u8; 32]>)>,
     /// Which member to ask next.
     turn: usize,

@@ -47,6 +47,19 @@ pub enum HostCallInspectionError {
     UnsupportedHostCall(u64),
 }
 
+/// Whether a machine of `program` may start at `pc`: an instruction's first
+/// byte, with a known opcode. Runtime counters are u32 even on a 64-bit
+/// host, so a larger register is no entry rather than truncated.
+pub(crate) fn is_entry(program: &CodeBlob, pc: u64) -> bool {
+    let Ok(pc) = u32::try_from(pc) else {
+        return false;
+    };
+    let pc = pc as usize;
+    pc < program.code.len()
+        && program.bitmask.get(pc) == Some(&1)
+        && Opcode::from_byte(program.code[pc]).is_some()
+}
+
 /// Validate an executable code blob and its initial instruction counter.
 ///
 /// The external counter is a full PVM register. Values outside the host's
@@ -54,19 +67,7 @@ pub enum HostCallInspectionError {
 pub fn validate_code_blob(program: &CodeBlob, initial_pc: u64) -> bool {
     let code = &program.code;
     let bitmask = &program.bitmask;
-    // Runtime counters are u32 even on a 64-bit host. Establish that domain
-    // here so full Ψ remains total for arbitrarily large caller-provided
-    // registers instead of relying on a later infallible conversion.
-    let Ok(initial_pc) = u32::try_from(initial_pc) else {
-        return false;
-    };
-    let initial_pc = initial_pc as usize;
-    if code.is_empty()
-        || bitmask.len() != code.len()
-        || initial_pc >= code.len()
-        || bitmask[initial_pc] != 1
-        || Opcode::from_byte(code[initial_pc]).is_none()
-    {
+    if code.is_empty() || bitmask.len() != code.len() || !is_entry(program, initial_pc) {
         return false;
     }
 

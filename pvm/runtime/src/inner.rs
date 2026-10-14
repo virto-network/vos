@@ -52,8 +52,8 @@ pub mod host_call {
     pub const INVOKE: u32 = 13;
     pub const EXPUNGE: u32 = 14;
     /// VOS extension: an inner machine from the node's pool, laid out as the
-    /// installed standard program whose code hash φ7 points at, at
-    /// instruction counter 0. On a host without it (JAM), the call answers
+    /// installed standard program whose code hash φ7 points at, at the
+    /// instruction counter φ8. On a host without it (JAM), the call answers
     /// `WHAT` and the guest lays the machine out itself with `machine`, then
     /// `pages` and `poke`.
     pub const INSTANTIATE: u32 = 0x480;
@@ -410,21 +410,29 @@ impl InnerMachines {
     }
 
     /// Lend a machine of an installed `program` from the pool, laid out as
-    /// the standard layout with no arguments. The lowest unused index is
-    /// returned, as for [`Self::create`].
+    /// the standard layout with no arguments, at instruction counter
+    /// `initial_pc`, which must start an instruction as [`Self::create`]'s
+    /// does. Entered mid-block, the machine is charged the whole block, as
+    /// one created there is. The lowest unused index is returned, as for
+    /// [`Self::create`].
     #[cfg(feature = "std")]
     pub fn instantiate(
         &mut self,
         program: &Arc<crate::pool::PoolProgram>,
+        initial_pc: u32,
     ) -> Result<u32, InnerError> {
         if self.machines.len() >= MAX_INNER_MACHINES {
             return Err(InnerError::Full);
         }
         let pool = self.pool.as_ref().ok_or(InnerError::Unknown)?;
-        let (vm, execution, ticket) = pool
+        if !program.enters_at(initial_pc) {
+            return Err(InnerError::Invalid);
+        }
+        let (mut vm, execution, ticket) = pool
             .acquire(program, self.backend)
             .map_err(|_| InnerError::Backend)?
             .into_parts();
+        vm.set_pc(initial_pc);
         let id = (0..MAX_INNER_MACHINES as u32)
             .find(|id| !self.machines.contains_key(id))
             .expect("a free ID exists below the machine limit");
@@ -439,7 +447,7 @@ impl InnerMachines {
                 generation,
                 program_blob: Arc::clone(program.code_blob()),
                 execution,
-                initial_pc: 0,
+                initial_pc,
                 vm: Some(vm),
                 pooled: Some(ticket),
                 backend_failed: false,

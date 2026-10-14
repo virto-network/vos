@@ -638,11 +638,15 @@ impl Driver {
             self.asked = None;
             return;
         }
-        let due = self
+        let retry = self
             .asked
             .as_ref()
-            .is_none_or(|(at, asked)| at.elapsed() >= BLOB_RETRY || *asked != missing);
-        if !due {
+            .is_some_and(|(at, _)| at.elapsed() >= BLOB_RETRY);
+        let fresh = self
+            .asked
+            .as_ref()
+            .is_none_or(|(_, asked)| missing.iter().any(|hash| !asked.contains(hash)));
+        if !retry && !fresh {
             return;
         }
         let Some(network) = &self.inner.network else {
@@ -660,12 +664,21 @@ impl Driver {
         if others.is_empty() {
             return;
         }
+        // Blobs not asked for yet go to the leader, which stored any large
+        // result it proposed; a retry turns to the next member.
         let leader = self.shared.state().leader.filter(|leader| *leader != me);
-        let target = match (self.turn, leader) {
-            (0, Some(leader)) => leader,
-            (turn, _) => others[turn % others.len()],
+        let target = match leader {
+            Some(leader) if !retry => leader,
+            _ => {
+                self.turn += 1;
+                others[self.turn % others.len()]
+            }
         };
-        self.turn += 1;
+        // Retries keep their pace while new blobs join the ask.
+        let since = match &self.asked {
+            Some((at, _)) if !retry => *at,
+            _ => Instant::now(),
+        };
         self.inner.want(self.shared.agent, &missing);
         let frame = PeerMessage::BlobRequest {
             agent: self.shared.agent,
@@ -678,7 +691,7 @@ impl Driver {
             u64::from(self.shared.agent.0),
             frame,
         );
-        self.asked = Some((Instant::now(), missing));
+        self.asked = Some((since, missing));
     }
 }
 

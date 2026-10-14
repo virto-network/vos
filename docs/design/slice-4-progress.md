@@ -216,3 +216,60 @@ faults process tests.
 
 **Reviewed** (Opus): GO with fixes, all in: `Behind` for gaps only,
 the sweep first, the compact failed input, the configurable round.
+
+## Step 4.4a: large results as blobs, and `instantiate` at a counter
+
+**Built:**
+- **A work result of 64 KiB or more travels as a blob.** Its log entry
+  is a new kind, `LargeResult`, whose first reference is the result's
+  blob, with an empty body.
+  - The leader stores the blob durably, beside the dry run, before
+    proposing.
+  - Followers fetch it through the existing references, and apply
+    reads it off the runtime thread.
+  - The dry run's seed check, the apply hooks and `LastResult` use the
+    resolved body.
+- **No pin:** pins mean "a program the agent runs".
+  - The blob is kept by its age until its entry is written, then by the
+    log row naming it, then by its age after compaction.
+  - A follower writes the row before it fetches, and applies nothing
+    past an entry whose blob it lacks.
+- **A fetch bug fixed:** a follower's round-robin turn only ever grew,
+  so after its first fetch every ask went away from the leader, costing
+  a second per large result. Now new blobs go to the leader, and only
+  retries rotate.
+- **`instantiate` takes the starting counter** in φ8, as `machine`
+  does. A counter that starts no instruction answers `HUH`, at the full
+  price. A machine back in the pool resets to 0.
+
+**Tests:**
+- a 2 MiB result applied on every replica;
+- a lagging follower catching up through one;
+- a large result's blob kept while the log names it, and collected
+  after compaction;
+- `instantiate` at a counter resuming a suspended machine exactly, on
+  both backends, charged the whole block again, as on PolkaJam (4.0).
+
+**Measured:** debug build, three replicas in one process, four small
+agents beside one making about 2.4 MB of results a round:
+
+| | Small p50 | Small p99 | Small max |
+|---|---|---|---|
+| No large load | 4.2–5.8 ms | 5.5–9.4 ms | — |
+| Large results as blobs | 5.3–7.3 ms | 8.6–14.9 ms | ≤ 27 ms |
+| Large results inline | 6.7–9.2 ms | 23–31 ms | 0.4–0.6 s |
+
+**Reviewed** (Opus): GO.
+
+**Carried to 4.4b,** before 4.5 puts snapshot pages on this path:
+- **disk:** blobs outlive their entries by the 1 h horizon, and the log's
+  byte trigger counts only the Raft payload. A short horizon for result
+  blobs, and an entry weight vos-raft counts toward `compact_bytes`;
+- **a fresh ask requests only the blobs not yet asked,** and a retry
+  asks the next member for all;
+- **a missing blob under a written row** is lost data, so it halts
+  rather than retrying forever.
+
+**Recorded, rare:** the host never calls vos-raft's
+`discard_unreported`. A replica holding an entry whose blob no member
+still has waits until a restart cuts the entry.

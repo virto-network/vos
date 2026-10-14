@@ -99,9 +99,9 @@ impl Default for Limits {
 impl Limits {
     pub const DEFAULT: Self = Self {
         liveness: 64 << 10,
-        // The largest log entry a node proposes (a 4 MiB work result), in
-        // an append alone, or entries up to the 1 MiB append cap; with
-        // their envelope.
+        // An append: entries up to the 1 MiB append cap, or one larger
+        // entry alone, with their envelope. A work result of 64 KiB or more
+        // travels as a blob, so this leaves room to spare.
         consensus: 5 << 20,
         requests: 1 << 20,
         // A 64 MiB program, with its header.

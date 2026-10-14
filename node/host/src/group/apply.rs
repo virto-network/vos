@@ -103,17 +103,17 @@ async fn apply_one(inner: &Arc<Inner>, shared: &Shared, index: u64) -> Result<()
     let epoch = snapshot.epoch(agent).map_err(infrastructure)?;
     let mut rest = Vec::new();
     let writes = match entry.kind {
-        EntryKind::Result => {
-            let result = WorkResult::decode(&entry.body)
-                .ok()
-                .map(|(result, _)| result);
-            let writes = if inner.hooks.fail_apply(agent, index, &entry.body) {
+        EntryKind::Result | EntryKind::LargeResult => {
+            let term = entry.term;
+            let body = body(inner, entry, index).await?;
+            let result = WorkResult::decode(&body).ok().map(|(result, _)| result);
+            let writes = if inner.hooks.fail_apply(agent, index, &body) {
                 Vec::new()
             } else {
                 let seed = result.as_ref().map(|result| result.seed);
-                match inner.dry_run(agent, index, entry.term, seed) {
+                match inner.dry_run(agent, index, term, seed) {
                     Some(writes) => writes,
-                    None => accumulate(inner, shared, &snapshot, &entry, index).await?,
+                    None => accumulate(inner, shared, &snapshot, body, index).await?,
                 }
             };
             let took = writes.iter().any(|write| write.key == keys::version());
@@ -161,18 +161,35 @@ pub(crate) fn unpinned(changes: &[Change]) -> Vec<[u8; 32]> {
         .collect()
 }
 
+/// A result entry's body: inline, or the blob a large one names, read off
+/// the runtime thread. An entry is applied only once its blobs are stored
+/// here, and its log row keeps them.
+async fn body(inner: &Inner, entry: LogEntry, index: u64) -> Result<Vec<u8>, Fault> {
+    let Some(blob) = entry.result_blob().copied() else {
+        return Ok(entry.body);
+    };
+    let blobs = inner.blobs.clone();
+    match inner.offload(move || blobs.get(&blob.hash)).await {
+        Some(Ok(Some(bytes))) => Ok(bytes),
+        Some(Ok(None)) => Err(Fault::Infrastructure(format!(
+            "the result blob of the entry at {index} is missing"
+        ))),
+        Some(Err(error)) => Err(Fault::Infrastructure(error.to_string())),
+        None => Err(Fault::Infrastructure("a blob read panicked".into())),
+    }
+}
+
 async fn accumulate(
     inner: &Arc<Inner>,
     shared: &Shared,
     snapshot: &Arc<Snapshot>,
-    entry: &LogEntry,
+    result: Vec<u8>,
     index: u64,
 ) -> Result<Vec<StateWrite>, Fault> {
     let program = Arc::clone(&inner.program);
     let state = Arc::clone(snapshot);
     let agent = shared.agent;
     let gas = shared.record.accumulate_gas;
-    let result = entry.body.clone();
     match ran(inner
         .executors
         .run(move || pvm::accumulate(&program, state, agent, result, gas))

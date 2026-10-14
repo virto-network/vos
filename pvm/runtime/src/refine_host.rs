@@ -610,12 +610,14 @@ impl RefineContext {
         Dispatch::Continue
     }
 
-    /// `instantiate`: φ7 points at a 32-byte code hash. φ7 becomes the new
-    /// machine's index, `WHO` for a program the pool does not hold, or
-    /// `FULL` at the machine limit. The call costs `machine`'s base, as a
-    /// failed `machine` does; an installed program then costs the rest of
-    /// its price, what laying it out costs a loader in host calls (never
-    /// less than the base). The machine starts at instruction counter 0.
+    /// `instantiate`: φ7 points at a 32-byte code hash, and φ8 is the
+    /// instruction counter the machine starts at. φ7 becomes the new
+    /// machine's index, `WHO` for a program the pool does not hold, `HUH`
+    /// for a counter that starts no instruction of it, or `FULL` at the
+    /// machine limit. The call costs `machine`'s base, as a failed `machine`
+    /// does; an installed program then costs the rest of its price, what
+    /// laying it out costs a loader in host calls (never less than the
+    /// base), whatever the counter.
     #[cfg(feature = "std")]
     fn instantiate(&mut self) -> Dispatch {
         if let Err(exit) = self.charge(gas::MACHINE_BASE) {
@@ -625,7 +627,8 @@ impl RefineContext {
             self.outer.registers_mut()[7] = result::FULL;
             return Dispatch::Continue;
         }
-        let address = self.outer.registers()[7];
+        let registers = *self.outer.registers();
+        let (address, initial_pc) = (registers[7], registers[8]);
         let Some(hash) = self.read_outer(address, 32, false) else {
             return Dispatch::Exit(ExitReason::Panic);
         };
@@ -648,7 +651,10 @@ impl RefineContext {
                 if let Err(exit) = self.charge(program.price() - gas::MACHINE_BASE) {
                     return exit;
                 }
-                match self.inner.instantiate(&program) {
+                match u32::try_from(initial_pc)
+                    .map_err(|_| InnerError::Invalid)
+                    .and_then(|pc| self.inner.instantiate(&program, pc))
+                {
                     Ok(id) => u64::from(id),
                     Err(InnerError::Full) => result::FULL,
                     Err(InnerError::Backend) => return Dispatch::Backend,
@@ -1351,6 +1357,82 @@ mod tests {
         }
     }
 
+    /// An outer program that calls `instantiate` with the code hash in its
+    /// read-write data and φ8 the counter `pc` (a `load_imm` immediate,
+    /// sign-extended), keeps the answer in φ9, expunges the machine φ7 names
+    /// and halts: φ7 is then the counter `expunge` gave, or `WHO`.
+    #[cfg(feature = "std")]
+    fn instantiating_at_program(hash: [u8; 32], pc: &[u8]) -> Vec<u8> {
+        let [lo, hi] = (crate::inner::host_call::INSTANTIATE as u16).to_le_bytes();
+        let instructions = [
+            alloc::vec![51, 7, 0x00, 0x00, 0x02], // load_imm φ7, 0x2_0000
+            [&[51, 8][..], pc].concat(),          // load_imm φ8, pc
+            alloc::vec![10, lo, hi],              // ecalli instantiate
+            alloc::vec![100, 9 | (7 << 4)],       // move_reg φ9, φ7
+            alloc::vec![10, crate::inner::host_call::EXPUNGE as u8], // ecalli expunge
+            alloc::vec![50, 0],                   // jump_ind φ0 (the halt address)
+        ];
+        let mut code = Vec::new();
+        let mut starts = Vec::new();
+        for instruction in instructions {
+            starts.push(code.len());
+            code.extend(instruction);
+        }
+        standard_program_with_rw(&code, &starts, &hash)
+    }
+
+    /// `instantiate` starts the machine at the counter φ8 names, on either
+    /// backend, at the price it costs at 0; a counter that starts no
+    /// instruction answers `HUH` at the same gas, and lends nothing.
+    #[cfg(feature = "std")]
+    #[test]
+    fn instantiate_starts_at_the_counter_given() {
+        use crate::pool::MachinePool;
+        // Instructions start at 0, 5, 10 and 13; the code is 15 bytes.
+        let installed = compression_program(crate::precompile::BLAKE2B_COMPRESS as u16);
+        let pool = alloc::sync::Arc::new(MachinePool::new());
+        let hash = pool.install(&installed).unwrap();
+
+        let mut backends = alloc::vec![PvmBackend::ForceInterpreter];
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        backends.push(PvmBackend::ForceRecompiler);
+        for &backend in &backends {
+            let run = |pc: &[u8]| {
+                RefineContext::load_with_backend(
+                    &instantiating_at_program(hash.0, pc),
+                    &[],
+                    1_000_000,
+                    crate::refine::MemoryModel::Auto,
+                    backend,
+                )
+                .unwrap()
+                .with_pool(alloc::sync::Arc::clone(&pool))
+                .try_run()
+                .unwrap()
+            };
+            let started = run(&[10]);
+            assert_eq!(started.exit, ExitReason::Halt, "{backend:?}");
+            assert_eq!(started.registers[9], 0, "{backend:?}: the first index");
+            assert_eq!(started.registers[7], 10, "{backend:?}: at its counter");
+            for (pc, why) in [(&[0][..], "the start"), (&[13][..], "the last instruction")] {
+                let other = run(pc);
+                assert_eq!(other.registers[7], u64::from(pc[0]), "{backend:?}: {why}");
+                assert_eq!(other.gas_used, started.gas_used, "{backend:?}: {why}");
+            }
+            for (pc, why) in [
+                (&[1][..], "inside an instruction"),
+                (&[15][..], "past the code"),
+                (&[0xff][..], "outside the counter's domain"),
+            ] {
+                let refused = run(pc);
+                assert_eq!(refused.registers[9], result::HUH, "{backend:?}: {why}");
+                assert_eq!(refused.registers[7], result::WHO, "{backend:?}: {why}");
+                assert_eq!(refused.gas_used, started.gas_used, "{backend:?}: {why}");
+            }
+        }
+        assert_eq!(pool.idle(), backends.len(), "one idle machine per backend");
+    }
+
     #[cfg(feature = "std")]
     #[test]
     fn instantiate_lends_pooled_machines_and_takes_them_back() {
@@ -1425,7 +1507,7 @@ mod tests {
             let program = shared.program(&hash).unwrap();
             let mut machines = crate::inner::InnerMachines::new();
             machines.set_pool(alloc::sync::Arc::clone(&shared));
-            machines.instantiate(&program).unwrap();
+            machines.instantiate(&program, 0).unwrap();
         })
         .join()
         .unwrap();

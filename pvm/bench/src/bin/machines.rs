@@ -83,7 +83,7 @@ fn pooled(
 ) -> (Duration, Duration, Duration) {
     let stack_top = (1u64 << 32) - 2 * (1 << 16) - (1 << 24);
     let started = Instant::now();
-    let id = inner.instantiate(program).expect("instantiate");
+    let id = inner.instantiate(program, 0).expect("instantiate");
     let acquire = started.elapsed();
 
     let started = Instant::now();

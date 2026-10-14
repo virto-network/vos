@@ -47,7 +47,9 @@ pub fn to_store(entry: &RaftEntry<NodeNumber>) -> LogEntry {
 pub fn to_raft(index: u64, entry: &LogEntry) -> RaftEntry<NodeNumber> {
     match entry.kind {
         EntryKind::NoOp => RaftEntry::data(index, entry.term, Vec::new()),
-        EntryKind::Result => RaftEntry::data(index, entry.term, entry.payload()),
+        EntryKind::Result | EntryKind::LargeResult => {
+            RaftEntry::data(index, entry.term, entry.payload())
+        }
         EntryKind::Configuration => match store::decode_configuration(&entry.body) {
             Some((members, joint_old)) => {
                 RaftEntry::config_change(index, entry.term, joint_old, members)

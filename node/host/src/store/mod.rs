@@ -46,6 +46,18 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// A node in an agent's replica set: the 8-bit node part of an agent id.
 pub type NodeNumber = u8;
 
+/// A work result of this many bytes or more is stored as a blob, which its
+/// log entry names: inline, entries this large hold up every agent's small
+/// ones behind their writes.
+pub const LARGE_RESULT: usize = 64 << 10;
+
+// An append carries entries up to vos-raft's 1 MiB cap, or one larger entry
+// alone, and a work result is inline only under `LARGE_RESULT`.
+const _: () = assert!(
+    vos_net::Limits::DEFAULT.consensus >= (1 << 20) + LARGE_RESULT + (64 << 10),
+    "a consensus frame must hold an append"
+);
+
 /// What a log entry holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -56,6 +68,9 @@ pub enum EntryKind {
     Result = 1,
     /// A change to the agent's replica set.
     Configuration = 2,
+    /// A work result of [`LARGE_RESULT`] bytes or more: the entry's first
+    /// blob, its body empty.
+    LargeResult = 3,
 }
 
 impl EntryKind {
@@ -64,13 +79,14 @@ impl EntryKind {
             0 => Self::NoOp,
             1 => Self::Result,
             2 => Self::Configuration,
+            3 => Self::LargeResult,
             _ => return None,
         })
     }
 }
 
-/// A blob an entry depends on: a work result too large to inline, or a
-/// program it installs.
+/// A blob an entry depends on: a large work result, or a program it
+/// installs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct BlobRef {
     pub hash: [u8; 32],
@@ -95,6 +111,14 @@ impl LogEntry {
             kind: EntryKind::Result,
             blobs: Vec::new(),
             body,
+        }
+    }
+
+    /// The blob holding a large work result, if the entry is one.
+    pub fn result_blob(&self) -> Option<&BlobRef> {
+        match self.kind {
+            EntryKind::LargeResult => self.blobs.first(),
+            _ => None,
         }
     }
 

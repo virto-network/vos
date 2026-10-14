@@ -295,6 +295,12 @@ impl PoolProgram {
         self.price
     }
 
+    /// Whether a machine of the program may start at instruction counter
+    /// `pc`, as `machine` checks its counter.
+    pub(crate) fn enters_at(&self, pc: u32) -> bool {
+        crate::spi::is_entry(&self.code, u64::from(pc))
+    }
+
     /// Prepared execution on `backend`, built on first use.
     fn prepared(&self, backend: PvmBackend) -> Result<PreparedExecution, PoolError> {
         let slot = match crate::backend::resolve(backend).map_err(|_| PoolError::Backend)? {
@@ -741,7 +747,7 @@ pub(crate) fn prepared_code(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inner::{InnerExit, InnerMachines, InvokeState, PageMode};
+    use crate::inner::{InnerError, InnerExit, InnerMachines, InvokeState, PageMode};
     use crate::instruction::Opcode;
     use proptest::prelude::*;
 
@@ -793,11 +799,16 @@ mod tests {
     /// The machine a loader builds with `machine`, then `pages` and `poke`:
     /// the reference a pooled machine must equal.
     fn loaded(blob: &[u8], backend: PvmBackend) -> (InnerMachines, u32) {
+        loaded_at(blob, backend, 0)
+    }
+
+    /// As [`loaded`], the machine made at instruction counter `pc`.
+    fn loaded_at(blob: &[u8], backend: PvmBackend, pc: u32) -> (InnerMachines, u32) {
         let program = crate::spi::parse_standard_program(blob).unwrap();
         let layout = program.layout(&[]).unwrap();
         let mut machines = InnerMachines::with_backend(backend);
         let id = machines
-            .create(&program.compact_code().unwrap(), 0)
+            .create(&program.compact_code().unwrap(), pc)
             .unwrap();
         let page = PVM_PAGE_SIZE as u64;
         let pages = |machines: &mut InnerMachines, region: crate::spi::SpiRegion, mode| {
@@ -968,7 +979,10 @@ mod tests {
         }
     }
 
-    fn probe(machines: &mut InnerMachines, id: u32) -> (InnerExit, InvokeState) {
+    /// What [`program`] runs with: h at the read-write data's start, m two
+    /// pages on, a 2-byte store across its first page boundary, and the
+    /// last store 100 bytes in.
+    fn probe_state() -> InvokeState {
         let mut registers = [0; PVM_REGISTER_COUNT];
         registers[7] = u64::from(3 * ZONE);
         registers[8] = u64::from(3 * ZONE + 2 * 4096);
@@ -976,10 +990,14 @@ mod tests {
         registers[10] = u64::from(3 * ZONE + 4095);
         registers[11] = 0xbeef;
         registers[12] = u64::from(3 * ZONE + 100);
-        let mut state = InvokeState {
+        InvokeState {
             gas: 1_000_000,
             registers,
-        };
+        }
+    }
+
+    fn probe(machines: &mut InnerMachines, id: u32) -> (InnerExit, InvokeState) {
+        let mut state = probe_state();
         loop {
             let outcome = machines.invoke(id, state).unwrap();
             state = outcome.state;
@@ -1011,7 +1029,7 @@ mod tests {
         for backend in backends() {
             let mut pooled = InnerMachines::with_backend(backend);
             pooled.set_pool(Arc::clone(&pool));
-            let id = pooled.instantiate(&program).unwrap();
+            let id = pooled.instantiate(&program, 0).unwrap();
             let (mut reference, reference_id) = loaded(&blob, backend);
             assert_eq!(
                 dump(&pooled, id, &[]),
@@ -1051,6 +1069,129 @@ mod tests {
         assert_eq!(program.price(), expected);
     }
 
+    /// A machine suspended at a host call, restored from the counter
+    /// `expunge` gives and the pages it wrote: a pooled machine
+    /// instantiated at that counter, the pages poked back, equals a
+    /// loader's machine made there, and resumes right after the call as it
+    /// does. Entered mid-block, both are charged the whole block again,
+    /// where the machine that never stopped pays nothing more.
+    #[test]
+    fn instantiate_at_a_counter_resumes_a_suspended_machine() {
+        let blob = program();
+        let pool = Arc::new(MachinePool::new());
+        let program = pool.program(&pool.install(&blob).unwrap()).unwrap();
+        // The read-write region's four pages: every page the program writes.
+        let first = 3 * ZONE / 4096;
+        let written: Vec<u32> = (first..first + 4).collect();
+        let state = probe_state();
+        let [h, m, last] = [7, 8, 12].map(|register| state.registers[register] as u32);
+        let half = state.registers[10] as u32;
+        let compression = crate::precompile::price(crate::precompile::BLAKE2B_COMPRESS).unwrap();
+        for backend in backends() {
+            let mut machines = InnerMachines::with_backend(backend);
+            machines.set_pool(Arc::clone(&pool));
+            let to_the_call = |machines: &mut InnerMachines| {
+                let id = machines.instantiate(&program, 0).unwrap();
+                let outcome = machines.invoke(id, probe_state()).unwrap();
+                assert_eq!(outcome.exit, InnerExit::Host(0x77), "{backend:?}");
+                (id, outcome.state)
+            };
+
+            let (stopped, suspended) = to_the_call(&mut machines);
+            let pages: Vec<(u32, Vec<u8>)> = written
+                .iter()
+                .map(|&page| (page, machines.peek(stopped, page * 4096, PAGE).unwrap()))
+                .collect();
+            let pc = machines.expunge(stopped).unwrap();
+            assert_eq!(pc, 9, "{backend:?}: right after the 2-byte call at 7");
+            let block = state.gas - suspended.gas - compression;
+
+            let (going, at_call) = to_the_call(&mut machines);
+            let continued = machines.invoke(going, at_call.clone()).unwrap();
+            assert_eq!(continued.exit, InnerExit::Panic, "{backend:?}");
+            assert_eq!(continued.state.gas, at_call.gas, "{backend:?}: funded");
+            machines.expunge(going).unwrap();
+
+            // Marks where the stores before the call wrote: a resume that
+            // ran them again would overwrite them.
+            let restore = |machines: &mut InnerMachines, id: u32| {
+                for (page, bytes) in &pages {
+                    machines.poke(id, page * 4096, bytes).unwrap();
+                }
+                for (address, len) in [(h, 64), (m, 8), (half, 2)] {
+                    machines.poke(id, address, &vec![0xa5; len]).unwrap();
+                }
+            };
+            let restored = machines.instantiate(&program, pc).unwrap();
+            restore(&mut machines, restored);
+            let (mut reference, reference_id) = loaded_at(&blob, backend, pc);
+            restore(&mut reference, reference_id);
+            assert_eq!(
+                dump(&machines, restored, &[]),
+                dump(&reference, reference_id, &[]),
+                "{backend:?}"
+            );
+
+            let resumed = machines.invoke(restored, suspended.clone()).unwrap();
+            let expected = reference.invoke(reference_id, suspended.clone()).unwrap();
+            assert_eq!(resumed, expected, "{backend:?}");
+            assert_eq!(
+                resumed.exit,
+                InnerExit::Panic,
+                "{backend:?}: no second call"
+            );
+            assert_eq!(
+                suspended.gas - resumed.state.gas,
+                block,
+                "{backend:?}: the whole block again"
+            );
+            assert_eq!(
+                machines.peek(restored, last, 1).unwrap(),
+                [0xef],
+                "{backend:?}: the store after the call landed"
+            );
+            for (address, len) in [(h, 64), (m, 8), (half, 2)] {
+                assert_eq!(
+                    machines.peek(restored, address, len).unwrap(),
+                    vec![0xa5; len],
+                    "{backend:?}: nothing before the call ran again"
+                );
+            }
+            assert_eq!(
+                dump(&machines, restored, &[]),
+                dump(&reference, reference_id, &[]),
+                "{backend:?}"
+            );
+            assert_eq!(machines.expunge(restored), Ok(0), "{backend:?}");
+            assert_eq!(
+                machines
+                    .instantiate(&program, 0)
+                    .map(|id| machines.expunge(id)),
+                Ok(Ok(0)),
+                "{backend:?}: a machine returned to the pool starts at 0"
+            );
+        }
+    }
+
+    #[test]
+    fn instantiate_refuses_a_counter_that_starts_no_instruction() {
+        let blob = program();
+        let pool = Arc::new(MachinePool::new());
+        let program = pool.program(&pool.install(&blob).unwrap()).unwrap();
+        let mut machines = InnerMachines::new();
+        machines.set_pool(Arc::clone(&pool));
+        for pc in [1, 3, 8, 12, u32::MAX] {
+            assert_eq!(
+                machines.instantiate(&program, pc),
+                Err(InnerError::Invalid),
+                "{pc}"
+            );
+        }
+        assert!(machines.is_empty());
+        let id = machines.instantiate(&program, 11).unwrap();
+        assert_eq!(machines.expunge(id), Ok(11));
+    }
+
     #[test]
     fn machines_whose_backend_failed_never_return() {
         let blob = program();
@@ -1058,7 +1199,7 @@ mod tests {
         let program = pool.program(&pool.install(&blob).unwrap()).unwrap();
         let mut machines = InnerMachines::new();
         machines.set_pool(Arc::clone(&pool));
-        let id = machines.instantiate(&program).unwrap();
+        let id = machines.instantiate(&program, 0).unwrap();
         machines.fail_backend_for_test(id);
         machines.expunge(id).unwrap();
         assert_eq!(pool.idle(), 0);
@@ -1072,13 +1213,13 @@ mod tests {
         let program = pool.program(&hash).unwrap();
         let mut machines = InnerMachines::new();
         machines.set_pool(Arc::clone(&pool));
-        let first = machines.instantiate(&program).unwrap();
-        let second = machines.instantiate(&program).unwrap();
+        let first = machines.instantiate(&program, 0).unwrap();
+        let second = machines.instantiate(&program, 0).unwrap();
         machines.expunge(first).unwrap();
         machines.expunge(second).unwrap();
         assert_eq!(pool.idle(), 1, "one idle machine per program");
 
-        let lent = machines.instantiate(&program).unwrap();
+        let lent = machines.instantiate(&program, 0).unwrap();
         pool.uninstall(&hash);
         assert!(pool.program(&hash).is_none());
         machines.expunge(lent).unwrap();
@@ -1110,7 +1251,7 @@ mod tests {
         };
         let mut cleaned = false;
         for _ in 0..4 {
-            let id = machines.instantiate(&program).unwrap();
+            let id = machines.instantiate(&program, 0).unwrap();
             machines
                 .pages(id, base, 400, PageMode::AllocateReadWrite)
                 .unwrap();
@@ -1121,7 +1262,7 @@ mod tests {
             cleaned |= zeroed(&pool) == 0;
         }
         assert!(cleaned, "a deep clean ran");
-        let id = machines.instantiate(&program).unwrap();
+        let id = machines.instantiate(&program, 0).unwrap();
         let (reference, reference_id) = loaded(&blob, PvmBackend::ForceRecompiler);
         let touched: Vec<u32> = (base..base + 400).collect();
         assert_eq!(
@@ -1307,7 +1448,7 @@ mod tests {
             for backend in backends() {
                 let mut pooled = InnerMachines::with_backend(backend);
                 pooled.set_pool(Arc::clone(&pool));
-                let id = pooled.instantiate(&program).unwrap();
+                let id = pooled.instantiate(&program, 0).unwrap();
                 let mut carried = InvokeState { gas: 0, registers: [0; PVM_REGISTER_COUNT] };
                 let mut touched = Vec::new();
                 for op in &ops {
@@ -1316,7 +1457,7 @@ mod tests {
                 pooled.expunge(id).unwrap();
                 prop_assert_eq!(pool.idle(), 1, "the released machine is kept");
 
-                let id = pooled.instantiate(&program).unwrap();
+                let id = pooled.instantiate(&program, 0).unwrap();
                 prop_assert_eq!(pool.idle(), 0, "and lent again");
                 let (mut reference, reference_id) = loaded(&blob, backend);
                 prop_assert_eq!(
