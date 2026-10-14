@@ -1,0 +1,12 @@
+[package]
+name = "vos-jam"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "An agent on JAM, from the builder's side: its whole keyspace under one tree, the recording simulation and witnesses of its work packages, and data availability emulated in process."
+
+[dependencies]
+lz4_flex = "0.13"
+vos-pvm = { workspace = true }
+vos-tree = { workspace = true }
+vos-wire = { workspace = true }

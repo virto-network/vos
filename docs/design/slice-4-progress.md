@@ -725,3 +725,87 @@ re-reads, the checker exact under failures, the read horizon.
 - the service id;
 - the marking decided off the node's thread;
 - the drain paced and triggered by room.
+
+## Step 4.8: JAM mode
+
+**Built:**
+- **Work on JAM** is a `Work::Package`: the batch, the agent's root
+  before, a `StateWitness`, and the imports.
+  - The witness holds a multiproof over every key the refine reads or
+    writes (each opened absent, read with its value, or written with
+    its value's commitment only) and a range proof per scan.
+  - `JamOutput` carries the roots before and after, the time, the seed,
+    the work result's hash and the export counts.
+- **One `apply`** (`vos_wire::apply`) is accumulate's code, run by the
+  VOS accumulate, the JAM refine over its witness and the builder over
+  its store. Only what a page row holds and the root builder's rows
+  differ by host.
+- **The JAM refine:**
+  - verifies the witness once;
+  - serves every read from it and every scan from its range;
+  - runs the batch as on VOS, then applies the result;
+  - computes the root after, salting each written row from the batch's
+    seed;
+  - exports the stored pages raw, then the result.
+  - Anything the witness does not cover traps, so a wrong witness gives
+    the honest transition or none.
+- **On resume, a page is imported,** its length checked, and its hash
+  compared with the snapshot's.
+- **Accumulate on JAM** (told apart by the operand's package hash) swaps
+  the root only from the one it stores, and only for a time within the
+  slot and the session skew.
+- **The JAM-only host** (`refine_host/jam.rs`) serves `fetch`, `export`
+  and scoped preimages at PolkaJam's prices, which CI pins.
+- **`vos-jam` (node/jam):**
+  - the whole-keyspace store;
+  - the recording simulation;
+  - the witness build;
+  - the builder's prepare and accept (accept refuses a package the
+    chain did not accumulate);
+  - DA (a local stand-in for the segment root);
+  - the chain, emulated.
+
+**Tests:**
+- **The comparison:** stateful batches, scans of both transforms,
+  committed maps, and workflows suspended across packages run on VOS
+  and as chained JAM packages, on both backends.
+  - The work results are byte for byte equal and the pages equal by
+    hash.
+  - The roots are continuous, and the builder's rows equal VOS's.
+- **The negatives:** each of these traps or is refused:
+  - an uncovered read;
+  - a tampered value;
+  - a range cut short;
+  - a written-only key read;
+  - unsorted keys or overlapping ranges;
+  - zeroed imports;
+  - an early or late time;
+  - a moved root;
+  - a segment DA lacks.
+
+**Measured** (JAM-only host, PolkaJam's prices; software BLAKE2b runs
+about 20k gas a compression):
+
+| | Gas beyond the VOS run |
+|---|---|
+| A witnessed read alone | about 255k |
+| A read among 64 in one package | about 192k each |
+| A scanned range | about 84–88k a row |
+| A workflow package's own work, at most | about 4.9M |
+
+The core model's 25 × 4,760 gas a row was low. A package's own work
+falls outside the batch's budget, so the builder must leave room for it
+under the refine limit.
+
+**Reviewed:**
+- Fable: go. A wrong witness cannot move the root, and the builder is
+  trusted only for the batch's content.
+- Opus: GO with fixes, all in:
+  - `accept` checks the chain stored the root;
+  - pages hashed once;
+  - `apply` compiled once (the agent's code back to 440 KiB);
+  - the JAM host in its own module;
+  - the negative tests.
+
+**Decided by the owner meanwhile:** tables are hashed by default, and a
+finished workflow's result is kept an hour.

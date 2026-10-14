@@ -513,13 +513,26 @@ pub fn workflow(id: WorkflowId) -> Vec<u8> {
     key(&[&Row::Workflow.prefix(), &id.0.to_be_bytes()])
 }
 
-/// A page a workflow's snapshot stores, LZ4-compressed, by its index.
+/// A page a workflow's snapshot stores, by its index: on a VOS node its
+/// LZ4 bytes, on JAM its hash, the page a segment.
 pub fn page(id: WorkflowId, index: u32) -> Vec<u8> {
     key(&[
         &Row::Page.prefix(),
         &id.0.to_be_bytes(),
         &index.to_be_bytes(),
     ])
+}
+
+/// The workflow and page index a [`page`] key names; `None` for any other
+/// key.
+pub fn page_entry(key: &[u8]) -> Option<(WorkflowId, u32)> {
+    let rest = key.strip_prefix(&Row::Page.prefix())?;
+    let (id, index) = rest.split_first_chunk::<8>()?;
+    let index: [u8; 4] = index.try_into().ok()?;
+    Some((
+        WorkflowId(u64::from_be_bytes(*id)),
+        u32::from_be_bytes(index),
+    ))
 }
 
 /// The id the next workflow gets: ids are never reused.

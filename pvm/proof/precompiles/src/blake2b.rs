@@ -122,6 +122,10 @@ fn compress_inner(h: &[u64; 8], m: &[u64; 16], t: u128, f: bool) -> [u64; 8] {
 /// per 128-byte block.  Matches the `blake2` crate's
 /// `Blake2b<UN>::default()` for output length N (no key, fanout=1,
 /// depth=1, leaf_length=0, ...).
+///
+/// Inlined where it is called, so a caller's known tag and parts fold its
+/// block loop away, however many call it.
+#[inline(always)]
 pub fn blake2b_hash<const OUT_LEN: usize>(domain: &[u8], parts: &[&[u8]]) -> [u8; OUT_LEN] {
     assert!(OUT_LEN >= 1 && OUT_LEN <= 64);
     // Parameter block: byte0 = digest_length, byte2 = fanout(1), byte3 = depth(1).

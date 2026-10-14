@@ -1,7 +1,7 @@
 //! The hosts the agent runs on: a VOS node's, with a pool, applied state
 //! and precompiles computed, and a JAM node's, with none of them and
-//! PolkaJam's price for a call it does not serve; and the host calls every
-//! program makes.
+//! PolkaJam's prices; and the host calls every program makes. A JAM
+//! package, its state witnessed, against a VOS node: `jam`.
 
 use vos_pvm::ExitReason;
 use vos_testkit::programs::agent;
@@ -89,6 +89,26 @@ fn every_program_calls_only_its_surface() {
     }
 }
 
+/// The JAM-only host charges PolkaJam's prices where they differ from the
+/// Gray Paper's base, as the probe in `spikes/sj-jam-b` measured them:
+/// `gas` 48, `log` 1,000 and answering `WHAT`, a call it does not serve
+/// 1,000, a segment's `fetch` 171 and an `export` 3,521. The runtime's
+/// tests measure each charge. Its segments are the agent's.
+#[test]
+fn the_jam_host_charges_polkajams_prices() {
+    use vos_pvm::refine_host::{MAX_EXPORTS, SEGMENT, jam_gas};
+    assert_eq!(
+        (jam_gas::GAS, jam_gas::LOG, jam_gas::UNSERVED),
+        (48, 1_000, 1_000)
+    );
+    assert_eq!(
+        (jam_gas::fetch(SEGMENT as u64), jam_gas::EXPORT),
+        (171, 3_521)
+    );
+    assert_eq!(SEGMENT, vos_wire::package::SEGMENT);
+    assert_eq!(MAX_EXPORTS as usize, vos_wire::package::MAX_SEGMENTS);
+}
+
 /// The agent serves its machines the precompiles a VOS node serves the
 /// agent, each at the node's price; every other id among the precompiles
 /// it leaves unserved, as a JAM node does.
@@ -165,8 +185,8 @@ fn vos_and_jam_hosts_agree_on_batches_that_read_no_state() {
 /// calls, which the agent serves at the same price on both, though their
 /// outer gas differs (in software on JAM); and a batch its budget cuts
 /// short, at the same step on both, since the agent dispatches by its own
-/// accounting. The JAM host reads applied state here, as JAM mode's
-/// witnesses will give it; without them a batch that reads state has no
+/// accounting. The JAM host reads applied state here, as a package's
+/// witness gives it (`jam`); without one a batch that reads state has no
 /// result there (`a_refine_that_cannot_read_state_produces_no_result`).
 #[test]
 fn vos_and_jam_hosts_agree_on_batches_that_run_actors() {

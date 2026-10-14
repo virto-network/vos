@@ -1,5 +1,9 @@
 //! Standard inner-machine host-call dispatcher for Refine programs.
 
+mod jam;
+
+pub use jam::{JamItem, JamRefine, JamRun, MAX_EXPORTS, Preimages, SEGMENT, fetch_kind, jam_gas};
+
 use alloc::vec::Vec;
 
 use crate::inner::{
@@ -113,6 +117,9 @@ pub struct RefineContext {
     outer: Machine,
     inner: InnerMachines,
     state: Option<alloc::sync::Arc<dyn StateReader>>,
+    /// Whether the refine runs on the JAM-only host ([`Self::try_run_jam`]),
+    /// at PolkaJam's prices.
+    jam: bool,
     /// Where `instantiate` finds a program its pool lacks.
     #[cfg(feature = "std")]
     programs: Option<alloc::sync::Arc<dyn ProgramSource>>,
@@ -135,6 +142,7 @@ impl RefineContext {
             outer: Machine::load_with(program, args, gas, model)?,
             inner: InnerMachines::new(),
             state: None,
+            jam: false,
             #[cfg(feature = "std")]
             programs: None,
             precompiles: true,
@@ -158,6 +166,7 @@ impl RefineContext {
             outer,
             inner,
             state: None,
+            jam: false,
             #[cfg(feature = "std")]
             programs: None,
             precompiles: true,
@@ -221,20 +230,11 @@ impl RefineContext {
             outer,
             inner,
             state: None,
+            jam: false,
             #[cfg(feature = "std")]
             programs: None,
             precompiles: true,
         }
-    }
-
-    /// Run as a JAM node would: every call this host does not serve,
-    /// including every VOS extension when no pool or state reader is set,
-    /// answers `WHAT` and execution continues.
-    pub fn try_run_jam(self) -> Result<Invocation, RefineError> {
-        self.try_run_with_host(|_, machine| {
-            machine.registers_mut()[7] = result::WHAT;
-            Ok(())
-        })
     }
 
     /// Run the outer program, transparently servicing host calls 9 through
@@ -429,14 +429,20 @@ impl RefineContext {
                 self.state_scan()
             }
             value if value == u64::from(crate::inner::gp_call::GAS) => self.gas(),
-            value if value == u64::from(crate::inner::gp_call::LOG) => self.log(),
+            // PolkaJam does not serve `log`.
+            value if value == u64::from(crate::inner::gp_call::LOG) && !self.jam => self.log(),
             _ => Dispatch::Exit(ExitReason::HostCall(id)),
         }
     }
 
     /// `gas`: φ7 becomes the gas left after this call's own cost.
     fn gas(&mut self) -> Dispatch {
-        if let Err(exit) = self.charge(BASE_CALL_GAS) {
+        let price = if self.jam {
+            jam_gas::GAS
+        } else {
+            BASE_CALL_GAS
+        };
+        if let Err(exit) = self.charge(price) {
             return exit;
         }
         let left = self.outer.gas_remaining();
@@ -954,7 +960,11 @@ mod tests {
         standard_program_with_rw(args_code, starts, &[])
     }
 
-    fn standard_program_with_rw(args_code: &[u8], starts: &[usize], rw_data: &[u8]) -> Vec<u8> {
+    pub(super) fn standard_program_with_rw(
+        args_code: &[u8],
+        starts: &[usize],
+        rw_data: &[u8],
+    ) -> Vec<u8> {
         let mut packed = alloc::vec![0u8; args_code.len().div_ceil(8)];
         for &i in starts {
             packed[i / 8] |= 1 << (i % 8);
@@ -1505,8 +1515,9 @@ mod tests {
         );
         let jam = RefineContext::load(&instantiating_program(hash.0), &[], 1_000_000)
             .unwrap()
-            .try_run_jam()
-            .unwrap();
+            .try_run_jam(JamRefine::default())
+            .unwrap()
+            .invocation;
         assert_eq!(jam.exit, ExitReason::Halt);
         assert_eq!(
             jam.registers[7],
@@ -1608,8 +1619,9 @@ mod tests {
         );
         let jam = RefineContext::load(&program, &[], 1_000_000)
             .unwrap()
-            .try_run_jam()
-            .unwrap();
+            .try_run_jam(JamRefine::default())
+            .unwrap()
+            .invocation;
         assert_eq!(jam.exit, ExitReason::Halt);
         assert_eq!(jam.registers[7], result::WHAT);
     }

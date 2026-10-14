@@ -8,7 +8,9 @@ use std::sync::Arc;
 use vos_pvm::accumulate_host::{AccumulateContext, ServiceStorage};
 use vos_pvm::pool::{CodeHash, MachinePool};
 use vos_pvm::refine::{Invocation, Machine, MemoryModel, PreparedProgram};
-use vos_pvm::refine_host::{ProgramSource, RefineContext, StateReader};
+use vos_pvm::refine_host::{
+    JamItem, JamRefine, Preimages, ProgramSource, RefineContext, StateReader,
+};
 use vos_pvm::{ExitReason, PvmBackend};
 use vos_testkit::programs::{actor, agent, method};
 use vos_testkit::{Testkit, decode, program_hash};
@@ -90,32 +92,41 @@ impl ServiceStorage for Storage<'_> {
     }
 }
 
-/// What PolkaJam charges for a call it does not serve (step 4.0).
-pub const JAM_UNSERVED_GAS: u64 = 1_000;
-
 /// The agent's report that its state lost data it wrote: a VOS node stops
 /// the refine at it.
 pub const LOST: u64 = 0x483;
 
+/// The agent's preimages on a JAM node: the node's programs, those in
+/// `scope` when it is given, of the agent's own service alone.
+struct Scope {
+    programs: Arc<HashMap<[u8; 32], Vec<u8>>>,
+    scope: Option<Arc<BTreeSet<[u8; 32]>>>,
+}
+
+impl Preimages for Scope {
+    fn preimage(&self, service: u64, hash: &[u8; 32]) -> Option<Vec<u8>> {
+        let scoped = self.scope.as_ref().is_none_or(|scope| scope.contains(hash));
+        (service == u64::from(AGENT.0) && scoped)
+            .then(|| self.programs.get(hash).cloned())
+            .flatten()
+    }
+}
+
 /// `historical_lookup` from the node's programs, those in `scope` when it is
 /// given, in the agent's own preimages alone, as a node scopes them; and
 /// the agent's report of lost state, which stops the refine. Every other
-/// call the host does not serve answers `WHAT`, at `unserved` gas.
+/// call the host does not serve answers `WHAT`.
 fn serve(
     id: u64,
     machine: &mut Machine,
     programs: &HashMap<[u8; 32], Vec<u8>>,
     scope: Option<&BTreeSet<[u8; 32]>>,
-    unserved: u64,
 ) -> Result<(), ExitReason> {
     let registers = *machine.registers();
     if id == LOST {
         return Err(ExitReason::HostCall(LOST));
     }
     if id != 7 {
-        if !machine.charge(unserved) {
-            return Err(ExitReason::OutOfGas);
-        }
         machine.registers_mut()[7] = code::WHAT;
         return Ok(());
     }
@@ -156,8 +167,8 @@ pub struct Node {
     /// Whether the host computes the agent's precompiles; a JAM node does
     /// not.
     precompiles: bool,
-    /// The gas a call the host does not serve costs.
-    unserved: u64,
+    /// Whether the host is a JAM node's: the runtime's JAM-only host.
+    jam: bool,
     programs: Arc<HashMap<[u8; 32], Vec<u8>>>,
     pub state: BTreeMap<Vec<u8>, Vec<u8>>,
     pub version: u64,
@@ -179,7 +190,7 @@ impl Node {
             pool: pool.then(|| Arc::new(MachinePool::new())),
             serves_state,
             precompiles: pool || serves_state,
-            unserved: 0,
+            jam: false,
             programs: Arc::default(),
             state: BTreeMap::new(),
             version: 0,
@@ -215,14 +226,45 @@ impl Node {
         backends
     }
 
-    /// A JAM node's host: no pool, no precompile computed, and PolkaJam's
-    /// price for a call it does not serve. With `serves_state`, it reads
-    /// applied state as the witnesses of JAM mode will give it.
+    /// A JAM node's host, the runtime's JAM-only host: no pool, no
+    /// precompile computed, PolkaJam's prices, and the agent's programs as
+    /// its preimages. With `serves_state`, it reads applied state as a
+    /// package's witness gives it.
     pub fn jam(serves_state: bool) -> Self {
         Self {
             precompiles: false,
-            unserved: JAM_UNSERVED_GAS,
+            jam: true,
             ..Self::with(false, serves_state)
+        }
+    }
+
+    /// The agent's program, prepared.
+    pub fn program(&self) -> Arc<PreparedProgram> {
+        Arc::clone(&self.program)
+    }
+
+    /// The agent's preimages on a JAM node: every program this node holds.
+    pub fn preimages(&self) -> Arc<dyn Preimages> {
+        Arc::new(Scope {
+            programs: Arc::clone(&self.programs),
+            scope: None,
+        })
+    }
+
+    /// What a JAM node gives a refine of `payload`, the agent's preimages
+    /// those in `scope` when it is given.
+    fn jam_refine(&self, payload: Vec<u8>, scope: Option<Arc<BTreeSet<[u8; 32]>>>) -> JamRefine {
+        JamRefine {
+            service: u64::from(AGENT.0),
+            items: vec![JamItem {
+                payload,
+                imports: Vec::new(),
+            }],
+            preimages: Some(Arc::new(Scope {
+                programs: Arc::clone(&self.programs),
+                scope,
+            })),
+            ..JamRefine::default()
         }
     }
 
@@ -301,11 +343,11 @@ impl Node {
     /// batch may take beyond it.
     pub fn run_refine(&self, work: &Work, gas: u64) -> Invocation {
         let arguments = self.arguments(work);
-        let gas = match work {
-            Work::Batch(batch) => {
+        let gas = match work.batch() {
+            Some(batch) => {
                 gas + vos_wire::defaults::refine_start(batch.inputs.len(), arguments.len())
             }
-            Work::Query(_) => gas,
+            None => gas,
         };
         let mut context =
             RefineContext::load_prepared(&self.program, &arguments, gas, MemoryModel::Auto)
@@ -322,13 +364,15 @@ impl Node {
         if self.serves_state {
             context = context.with_state(Arc::new(Snapshot(self.state.clone())));
         }
+        if self.jam {
+            let jam = self.jam_refine(work.encode(), Some(scope));
+            return context.try_run_jam(jam).unwrap().invocation;
+        }
         if !self.precompiles {
             context = context.without_precompiles();
         }
         context
-            .try_run_with_host(|id, machine| {
-                serve(id, machine, &self.programs, Some(&scope), self.unserved)
-            })
+            .try_run_with_host(|id, machine| serve(id, machine, &self.programs, Some(&scope)))
             .unwrap()
     }
 
@@ -350,7 +394,7 @@ impl Node {
             )
             .map(|program| program.0)
             .collect();
-        if let Work::Batch(batch) = work {
+        if let Some(batch) = work.batch() {
             scope.extend(batch.installs().map(|program| program.0));
         }
         scope
@@ -370,13 +414,15 @@ impl Node {
         if let Some(pool) = &self.pool {
             context = context.with_pool(Arc::clone(pool));
         }
+        if self.jam {
+            let jam = self.jam_refine(Vec::new(), None);
+            return context.try_run_jam(jam).unwrap().invocation;
+        }
         if !self.precompiles {
             context = context.without_precompiles();
         }
         context
-            .try_run_with_host(|id, machine| {
-                serve(id, machine, &self.programs, None, self.unserved)
-            })
+            .try_run_with_host(|id, machine| serve(id, machine, &self.programs, None))
             .unwrap()
     }
 

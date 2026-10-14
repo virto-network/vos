@@ -564,9 +564,10 @@ pub mod surface {
         Loader,
         /// A precompile: the software implementation.
         Software,
-        /// Applied state, which a JAM node cannot give until witnesses, or
-        /// the agent's report that its state lost data it wrote: the refine
-        /// traps, so no result is computed on state that is not there.
+        /// Applied state, which on JAM a package's witness gives instead,
+        /// or the agent's report that its state lost data it wrote: a
+        /// refine that reaches one there traps, so no result is computed on
+        /// state that is not there.
         NoResult,
     }
 
@@ -574,9 +575,9 @@ pub mod surface {
     /// `None` when it is outside the surface.
     pub fn agent(id: u64) -> Option<OnJam> {
         match id {
-            // gas, fetch, read, write, historical_lookup, machine..expunge,
-            // log.
-            0 | 2 | 4 | 5 | 7 | 9..=14 | 100 => Some(OnJam::Served),
+            // gas, fetch, read, write, historical_lookup, export,
+            // machine..expunge, log.
+            0 | 2 | 4 | 5 | 7..=14 | 100 => Some(OnJam::Served),
             0x480 => Some(OnJam::Loader),
             // state_read, state_scan, and the report of lost state.
             0x481..=0x483 => Some(OnJam::NoResult),

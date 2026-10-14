@@ -11,7 +11,7 @@ use vos_wire::records::SessionMark;
 use vos_wire::result::InputRef;
 use vos_wire::{defaults, keys};
 
-use super::{Base, Corrupt, record};
+use super::{Base, Corrupt};
 
 /// A request's session as this refine sees it.
 #[derive(Clone, Copy)]
@@ -61,12 +61,12 @@ pub(super) struct Counts {
 
 impl Counts {
     /// The cap a new session of `key` would pass, if any.
-    fn full(&mut self, key: &[u8; 32]) -> Result<Option<Refusal>, Corrupt> {
+    fn full(&mut self, base: &Base, key: &[u8; 32]) -> Result<Option<Refusal>, Corrupt> {
         let live = match self.live {
             Some(live) => live,
             None => *self
                 .live
-                .insert(record::<u64>(&keys::live_sessions())?.unwrap_or(0)),
+                .insert(base.record::<u64>(&keys::live_sessions())?.unwrap_or(0)),
         };
         if live >= defaults::MAX_SESSIONS {
             return Ok(Some(Refusal::SessionsFull));
@@ -74,7 +74,7 @@ impl Counts {
         let held = match self.keys.get(key) {
             Some(held) => *held,
             None => {
-                let held = record::<u64>(&keys::key_sessions(key))?.unwrap_or(0);
+                let held = base.record::<u64>(&keys::key_sessions(key))?.unwrap_or(0);
                 self.keys.insert(*key, held);
                 held
             }
@@ -90,10 +90,12 @@ impl Counts {
 }
 
 /// A session as applied state holds it.
-fn held(session: &Session) -> Result<Held, Corrupt> {
-    match record::<SessionId>(&keys::session_index_key(session))? {
+fn held(base: &Base, session: &Session) -> Result<Held, Corrupt> {
+    match base.record::<SessionId>(&keys::session_index_key(session))? {
         Some(id) => {
-            let mark = record::<SessionMark>(&keys::session(id))?.ok_or(Corrupt)?;
+            let mark = base
+                .record::<SessionMark>(&keys::session(id))?
+                .ok_or(Corrupt)?;
             Ok(Held::Known(id, mark))
         }
         None => Ok(Held::Absent),
@@ -112,7 +114,7 @@ pub(super) fn admit(
 ) -> (InputRef, Result<Held, Refusal>) {
     let held = match sessions.get(&by_name(&request.session)) {
         Some(held) => Ok(*held),
-        None => held(&request.session),
+        None => held(base, &request.session),
     };
     // A session the state does not hold names itself whole.
     let session = match held {
@@ -141,7 +143,7 @@ pub(super) fn admit(
         None if request.sequence != 1 => Err(Refusal::Sequence),
         // Neither held nor created by an earlier step: this one creates
         // it, within the caps.
-        None => match counts.full(&request.session.key) {
+        None => match counts.full(base, &request.session.key) {
             Ok(None) => Ok(held),
             Ok(Some(code)) => Err(code),
             Err(Corrupt) => Err(Refusal::Unreadable),

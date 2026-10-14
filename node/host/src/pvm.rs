@@ -112,9 +112,9 @@ struct AgentPrograms {
 
 impl AgentPrograms {
     fn new(blobs: &Blobs, agent: AgentId, work: &Work) -> Self {
-        let installing = match work {
-            Work::Batch(batch) => batch.installs().map(|program| program.0).collect(),
-            Work::Query(_) => BTreeSet::new(),
+        let installing = match work.batch() {
+            Some(batch) => batch.installs().map(|program| program.0).collect(),
+            None => BTreeSet::new(),
         };
         Self {
             blobs: blobs.clone(),
@@ -183,9 +183,9 @@ pub(crate) fn refine(
         package_hash: [0; 32],
     }
     .encode();
-    let gas = match work {
-        Work::Batch(batch) => gas + defaults::refine_start(batch.inputs.len(), arguments.len()),
-        Work::Query(_) => gas,
+    let gas = match work.batch() {
+        Some(batch) => gas + defaults::refine_start(batch.inputs.len(), arguments.len()),
+        None => gas,
     };
     let programs = Arc::new(AgentPrograms::new(blobs, agent, work));
     let invocation = RefineContext::new(program.load(REFINE_ENTRY, &arguments, gas)?)

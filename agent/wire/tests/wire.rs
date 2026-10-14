@@ -1879,3 +1879,240 @@ fn peer_messages_keep_their_bytes() {
         [&[15][..], &agent_bytes, &4u32.to_le_bytes(), &[1]].concat()
     );
 }
+
+/// JAM mode's payload and output, byte for byte: a package is the work
+/// item's third kind, its batch, root, witness and imports in order; a
+/// witness's keys each opened absent, with a value, or by commitment; a
+/// range its bounds, rows and proof; the output its roots, time, seed,
+/// result hash and export counts.
+#[test]
+fn packages_keep_their_bytes() {
+    use vos_tree::{BatchProof, Entry, RangeProof};
+    use vos_wire::batch::Work;
+    use vos_wire::package::{JamOutput, Opened, Package, Range, Row, StateWitness};
+    let batch = Batch {
+        version: 1,
+        time: 2,
+        seed: [3; 32],
+        budget: 4,
+        inputs: vec![],
+    };
+    let package = Package {
+        batch: batch.clone(),
+        root: [5; 32],
+        witness: StateWitness {
+            keys: vec![
+                (vec![6], Opened::Absent),
+                (
+                    vec![7],
+                    Opened::Value {
+                        salt: [8; 16],
+                        value: vec![9],
+                    },
+                ),
+                (vec![10], Opened::Written([11; 32])),
+            ],
+            proof: BatchProof {
+                entries: vec![Entry::Empty],
+            },
+            ranges: vec![Range {
+                from: vec![12],
+                to: None,
+                rows: vec![Row {
+                    key: vec![13],
+                    salt: [14; 16],
+                    value: vec![15],
+                }],
+                proof: RangeProof {
+                    entries: vec![Entry::Hash([16; 32])],
+                },
+            }],
+        },
+        imports: vec![(WorkflowId(17), 18)],
+    };
+    let bytes = [
+        &batch.encode()[..],
+        &[5; 32],
+        &3u32.to_le_bytes(),
+        &1u32.to_le_bytes(),
+        &[6, 0],
+        &1u32.to_le_bytes(),
+        &[7, 1],
+        &[8; 16],
+        &1u32.to_le_bytes(),
+        &[9],
+        &1u32.to_le_bytes(),
+        &[10, 2],
+        &[11; 32],
+        &1u32.to_le_bytes(),
+        &[3],
+        &1u32.to_le_bytes(),
+        &1u32.to_le_bytes(),
+        &[12, 0],
+        &1u32.to_le_bytes(),
+        &1u32.to_le_bytes(),
+        &[13],
+        &[14; 16],
+        &1u32.to_le_bytes(),
+        &[15],
+        &1u32.to_le_bytes(),
+        &[1],
+        &[16; 32],
+        &1u32.to_le_bytes(),
+        &17u64.to_le_bytes(),
+        &18u32.to_le_bytes(),
+    ]
+    .concat();
+    assert_eq!(package.encode(), bytes);
+    round_trip(&package);
+    let work = Work::Package(package);
+    assert_eq!(work.encode(), [&[2][..], &bytes].concat());
+    assert_eq!(work.batch(), Some(&batch));
+    let output = JamOutput {
+        root_before: [1; 32],
+        root_after: [2; 32],
+        time: 3,
+        seed: [4; 32],
+        work_result_hash: [5; 32],
+        pages: 6,
+        exports: 7,
+    };
+    let bytes = [
+        &[1; 32][..],
+        &[2; 32],
+        &3u64.to_le_bytes(),
+        &[4; 32],
+        &[5; 32],
+        &6u32.to_le_bytes(),
+        &7u32.to_le_bytes(),
+    ]
+    .concat();
+    assert_eq!(output.encode(), bytes);
+    round_trip(&output);
+}
+
+/// A batch's time fits a slot from the slot's start back by the session
+/// skew to its end plus the skew; a work result takes its segments whole.
+#[test]
+fn a_batchs_time_fits_its_slot_within_the_skew() {
+    use vos_wire::defaults::SESSION_SKEW_MS;
+    use vos_wire::package::{EPOCH_MS, SEGMENT, SLOT_MS, result_segments, timely};
+    let slot = 1_000;
+    let start = EPOCH_MS + slot * SLOT_MS;
+    assert!(timely(start, slot));
+    assert!(timely(start - SESSION_SKEW_MS, slot));
+    assert!(!timely(start - SESSION_SKEW_MS - 1, slot));
+    assert!(timely(start + SLOT_MS + SESSION_SKEW_MS, slot));
+    assert!(!timely(start + SLOT_MS + SESSION_SKEW_MS + 1, slot));
+    assert!(!timely(0, slot), "a time before the era");
+    assert_eq!(
+        [0, 1, SEGMENT, SEGMENT + 1].map(result_segments),
+        [0, 1, 1, 2]
+    );
+}
+
+/// A page row's key names its workflow and index, and nothing else does.
+#[test]
+fn page_rows_name_their_page() {
+    let key = keys::page(WorkflowId(7), 9);
+    assert_eq!(keys::page_entry(&key), Some((WorkflowId(7), 9)));
+    assert_eq!(keys::page_entry(&key[..key.len() - 1]), None);
+    assert_eq!(keys::page_entry(&keys::workflow(WorkflowId(7))), None);
+}
+
+/// One apply for both hosts: on a VOS node a page row holds the page's
+/// LZ4 bytes and a committed write leaves its dirty row and its version's
+/// seed; on JAM the page row holds the page's hash, and neither is written.
+/// A result for another version applies nothing.
+#[test]
+fn a_result_applies_to_each_hosts_rows() {
+    use std::collections::BTreeMap;
+    use vos_wire::apply::{Host, State, apply};
+    use vos_wire::records::{stored, stored_versioned};
+    struct Rows(BTreeMap<Vec<u8>, Vec<u8>>);
+    impl State for Rows {
+        fn read(&mut self, key: &[u8]) -> Option<Vec<u8>> {
+            self.0.get(key).cloned()
+        }
+        fn write(&mut self, key: &[u8], value: Option<&[u8]>) {
+            match value {
+                Some(value) => self.0.insert(key.to_vec(), value.to_vec()),
+                None => self.0.remove(key),
+            };
+        }
+    }
+    let map = MapId {
+        instance: InstanceId(1),
+        tag: 2,
+        transform: Transform::Hashed,
+    };
+    let run = Run {
+        input: InputRef::Admin,
+        outcome: Outcome::Done(vec![]),
+        instances: vec![],
+        writes: vec![Write {
+            key: vec![1, 0, 0, 0, 1, 0],
+            value: Some(vec![3]),
+        }],
+        committed: vec![CommittedWrite {
+            map,
+            key: vec![4],
+            value: Some(vec![5]),
+        }],
+        messages: vec![],
+        attests: vec![],
+        pages: vec![Page {
+            workflow: WorkflowId(6),
+            index: 7,
+            hash: Some([8; 32]),
+        }],
+        gas_used: 0,
+    };
+    let result = WorkResult {
+        version: 0,
+        time: 9,
+        seed: [10; 32],
+        steps: vec![Step::Ran(run)],
+    };
+    let page = keys::page(WorkflowId(6), 7);
+    let section = vec![vec![11, 12]];
+    let mut vos = Rows(BTreeMap::new());
+    assert!(apply(&mut vos, &result, Host::Vos { pages: &section }));
+    let mut jam = Rows(BTreeMap::new());
+    assert!(apply(&mut jam, &result, Host::Jam));
+    assert_eq!(vos.0[&page], stored(&[11, 12]));
+    assert_eq!(jam.0[&page], stored(&[8; 32]));
+    let committed = keys::committed(&map, &[4]);
+    assert_eq!(vos.0[&committed], stored_versioned(1, &[5]));
+    assert_eq!(jam.0[&committed], vos.0[&committed]);
+    let only_vos = [keys::dirty(1, &map, &[4]), keys::seed(1)];
+    for key in &only_vos {
+        assert!(vos.0.contains_key(key) && !jam.0.contains_key(key));
+    }
+    let shared: BTreeMap<_, _> = vos
+        .0
+        .iter()
+        .filter(|(key, _)| !only_vos.contains(key) && **key != page)
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    jam.0.remove(&page);
+    assert_eq!(shared, jam.0, "the rows both hosts keep");
+    let before = jam.0.clone();
+    assert!(!apply(&mut jam, &result, Host::Jam), "another version's");
+    assert_eq!(jam.0, before);
+}
+
+/// A page's and a work result's digest is BLAKE2b-256 of the bytes, as the
+/// tree's hasher computes it under no tag, at every block boundary.
+#[test]
+fn digests_are_blake2b_256() {
+    use vos_tree::{Blake2b, Hasher};
+    for len in [0, 1, 127, 128, 129, 4096, 4104] {
+        let bytes: Vec<u8> = (0..len).map(|at| (at * 7) as u8).collect();
+        assert_eq!(
+            vos_wire::result::digest(&bytes),
+            Blake2b.hash(&[], &[&bytes]),
+            "{len} bytes"
+        );
+    }
+}

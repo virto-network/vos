@@ -4,6 +4,7 @@
 
 mod common;
 mod hosts;
+mod jam;
 mod messages;
 mod pricing;
 mod sessions;

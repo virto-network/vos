@@ -45,7 +45,7 @@ fn paid(base: &Base, id: WorkflowId) -> Result<Option<(Workflow, u64)>, Failure>
     let key = keys::workflow(id);
     let len = match base.earlier.get(&key) {
         Some(value) => value.as_ref().map_or(0, |value| value.len() + 1),
-        None => crate::host::state_read_into(&key, &mut []).unwrap_or(0),
+        None => base.stored_len(&key).unwrap_or(0),
     } as u64;
     if !base.meter.take(defaults::RECORD_BYTE * len) {
         return Err(Failure::OutOfGas);
@@ -493,8 +493,7 @@ fn run(
     match ended {
         Ok(Ended::Paused(pause)) => {
             let held = snapshot.map_or(&[][..], |snapshot| &snapshot.pages);
-            let section = &base.section;
-            match capture(&machine, &workflow.program, &header, id, held, section) {
+            match capture(base, &machine, &workflow.program, &header, id, held) {
                 Ok(captured) => {
                     let registers: Vec<u64> =
                         (0..13).map(|index| machine.register(index)).collect();
@@ -506,7 +505,7 @@ fn run(
                         && registers == resumed
                         && counter == resumed_at
                     {
-                        section.borrow_mut().drop_running();
+                        base.section.borrow_mut().drop_running();
                         return Left::Failed(Failure::OutOfGas);
                     }
                     Left::Paused {

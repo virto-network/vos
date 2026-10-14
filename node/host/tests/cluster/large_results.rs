@@ -139,7 +139,9 @@ fn a_large_result_travels_as_a_blob_and_applies_on_every_replica() {
             assert!(node.stores_blob(&blob.hash), "node {number} holds it");
         }
     }
-    // A small result stays inline.
+    // A small result stays inline, at the leader now: under load a
+    // replica may have taken over while the large ones travelled.
+    let leader = cluster.leader(agent);
     assert_eq!(done(cluster.increment(leader, agent, 12, 5)), 5);
     let applied = cluster.node(leader).applied(agent).unwrap();
     assert_eq!(

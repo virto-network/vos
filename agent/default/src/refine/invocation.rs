@@ -18,7 +18,7 @@ use vos_wire::records::{Installed, WorkflowState};
 use vos_wire::result::{Attest, InstanceGas, Outcome, Outgoing};
 use vos_wire::{Encode, defaults, keys};
 
-use super::{Base, Corrupt, Meter, Overlay, applied_rows, has_own_program};
+use super::{Base, Corrupt, Meter, Overlay, has_own_program};
 use crate::machines::{self, ARGUMENTS, Exit, Machine};
 
 /// Machines a step may hold at once: a handler and its nested callees, or
@@ -625,7 +625,9 @@ impl<'a> Invocation<'a> {
         loop {
             // A page of applied rows bounds which overlay rows join it; an
             // empty page means no applied rows remain, so all of them do.
-            let page = applied_rows(prefix, after.as_deref().unwrap_or(&[]))?;
+            let page = self
+                .base
+                .applied_rows(prefix, after.as_deref().unwrap_or(&[]))?;
             let bound = page.last().map(|(key, _)| key.as_slice());
             // A cursor below the prefix starts the scan at the prefix, as
             // the node's applied rows do; one above it leaves no row.

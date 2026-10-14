@@ -228,8 +228,8 @@ A crate `agent/tree` (`vos-tree`, `no_std + alloc`). Its users:
 **Format** (section 9.3):
 - **One tree format over prefix-free key strings.** A row's key in the
   tree is `key' = prefix ‖ transform(key)`, and each table chooses its
-  transform, as a Substrate map chooses its hasher [owner decision 8;
-  the default proposed]:
+  transform, as a Substrate map chooses its hasher [owner decision 8,
+  hashed by default]:
   - **hashed,** the default: `H128(key) ‖ escape(key)`, as Substrate's
     `Blake2_128Concat`. Depth stays near log₂ n whatever keys clients
     choose. The table iterates, whole or from a cursor, in hash order,
@@ -950,10 +950,12 @@ the builder 3,000, the rest 1,000 each or less.
    users to expect:
    - one tree format over prefix-free keys, with range proofs;
    - each table chooses its key transform, as a Substrate map chooses
-     its hasher. Proposed: hashed (`H128(key) ‖ key`, iterating in hash
+     its hasher: hashed (`H128(key) ‖ key`, iterating in hash
      order, balanced) by default, and ordered (`Table<K, V, Ordered>`,
      key order and ranges, keys of at most 64 bytes) by choice;
    - so an actor that scans its tables runs on JAM too.
+9. **A finished workflow's result is kept an hour** for its owner to
+   read, then collected, and it reads `Unknown` like a stranger's id.
 
 **Decision 5: preemption.** Section 8.3's effect-free preemption,
 built on this slice's snapshots instead of on live machines, with the

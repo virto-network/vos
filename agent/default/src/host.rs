@@ -1,4 +1,4 @@
-//! The agent's host calls: Gray Paper calls, and the two VOS refine
+//! The agent's host calls: Gray Paper calls, and the VOS refine
 //! extensions, each of which answers `WHAT` on a JAM node.
 
 use alloc::vec::Vec;
@@ -10,6 +10,7 @@ pub const FETCH: u64 = 2;
 pub const READ: u64 = 4;
 pub const WRITE: u64 = 5;
 pub const HISTORICAL_LOOKUP: u64 = 7;
+pub const EXPORT: u64 = 8;
 pub const MACHINE: u64 = 9;
 pub const PEEK: u64 = 10;
 pub const POKE: u64 = 11;
@@ -107,9 +108,9 @@ pub fn gas() -> u64 {
     ecalli!(GAS, [0; 6]).0
 }
 
-/// Trap the refine: the host serves no applied state (a JAM node until
-/// witnesses), and a result computed as if the state were empty would
-/// overwrite it.
+/// Trap the refine: the host serves no applied state (a JAM node, where a
+/// batch comes as a package with its witness), and a result computed as if
+/// the state were empty would overwrite it.
 pub fn unserved() -> ! {
     panic!("the host serves no applied state")
 }
@@ -181,6 +182,24 @@ pub fn historical_lookup_from(hash: &[u8; 32], offset: u64, buffer: &mut [u8]) -
 /// VOS node's refine host does not serve `fetch`.
 pub fn fetch_input(index: u64) -> Option<Vec<u8>> {
     whole(|out, offset, capacity| ecalli!(FETCH, [out as u64, offset, capacity, 15, index, 0]).0)
+}
+
+/// Import `index` of the running work item, read into `segment`: its
+/// length, `None` when there is none (`fetch` kind 6). Served on JAM only.
+pub fn fetch_import(index: u64, segment: &mut [u8]) -> Option<usize> {
+    let (len, _) = ecalli!(
+        FETCH,
+        [ptr_mut(segment), 0, segment.len() as u64, 6, index, 0]
+    );
+    (len != code::NONE && len != code::WHAT).then_some(len as usize)
+}
+
+/// Export `bytes` as a segment, zero-padded to its length: its index among
+/// the package's exports, or `None` when the package exports no more, or
+/// the host none. Served on JAM only.
+pub fn export(bytes: &[u8]) -> Option<u64> {
+    let (index, _) = ecalli!(EXPORT, [ptr(bytes), bytes.len() as u64, 0, 0, 0, 0]);
+    (index != code::FULL && index != code::WHAT).then_some(index)
 }
 
 /// A value of this service's storage.

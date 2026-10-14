@@ -10,6 +10,8 @@ scale = { package = "vos-pvm-codec", path = "../../pvm/codec", default-features 
 vos-pvm-program = { workspace = true }
 # The key transforms every table's rows are keyed by.
 vos-tree = { workspace = true }
+# BLAKE2b-256 of a whole buffer: pages' and, on JAM, work results' hashes.
+vos-pvm-precompiles = { path = "../../pvm/proof/precompiles", default-features = false, features = ["blake2b"] }
 
 [dev-dependencies]
 proptest = "1"

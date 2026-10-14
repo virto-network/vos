@@ -16,7 +16,9 @@ vos-wire = { workspace = true }
 [dev-dependencies]
 lz4_flex = "0.13"
 proptest = "1"
+vos-jam = { workspace = true }
 vos-pvm-program = { workspace = true }
+vos-tree = { workspace = true }
 
 [[bench]]
 name = "batch"

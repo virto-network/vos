@@ -9,8 +9,8 @@ use crate::ingress::Grant;
 use crate::keys::Due;
 use crate::result::Outcome;
 
-/// A refine's work item payload: a batch through the log, or a query on
-/// applied state.
+/// A refine's work item payload: a batch through the log, a query on
+/// applied state, or a batch on JAM.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum Work {
     /// Refine returns the encoded [`crate::result::WorkResult`].
@@ -20,6 +20,22 @@ pub enum Work {
     /// else: a query never writes.
     #[codec(index = 1)]
     Query(Query),
+    /// A batch on JAM, with the witness of the state it touches: refine
+    /// returns the [`crate::package::JamOutput`], and exports the work
+    /// result and its pages.
+    #[codec(index = 2)]
+    Package(crate::package::Package),
+}
+
+impl Work {
+    /// The batch it runs, if any.
+    pub fn batch(&self) -> Option<&Batch> {
+        match self {
+            Work::Batch(batch) => Some(batch),
+            Work::Package(package) => Some(&package.batch),
+            Work::Query(_) => None,
+        }
+    }
 }
 
 /// A `&self` handler on applied state, outside the log. Its time and seed

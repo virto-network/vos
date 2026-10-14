@@ -27,6 +27,9 @@ pub trait Hasher {
 pub struct Blake2b;
 
 impl Hasher for Blake2b {
+    // Inlined where it is called: a key's transform, on every table
+    // operation's path, then hashes a tag and parts the caller knows.
+    #[inline(always)]
     fn hash(&self, tag: &[u8], parts: &[&[u8]]) -> Hash {
         vos_pvm_precompiles::blake2b_hash::<32>(tag, parts)
     }

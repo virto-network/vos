@@ -1,8 +1,10 @@
 //! Refine: a batch's inputs as steps, each an actor invocation served
 //! against overlays of this refine's writes, or a workflow's step; or a
-//! query on applied state.
+//! query on applied state. On JAM, a batch comes as a package with the
+//! witness of the state it touches ([`jam`]).
 
 mod invocation;
+mod jam;
 mod sessions;
 mod snapshots;
 mod workflows;
@@ -20,7 +22,7 @@ use vos_wire::jam::RefineArgs;
 use vos_wire::keys::Due;
 use vos_wire::records::{Installed, SessionMark, Workflow, unstored, unversioned};
 use vos_wire::result::{
-    CommittedWrite, InputRef, Outcome, Outgoing, PageSection, ResultWriter, Run, Step, Write,
+    CommittedWrite, InputRef, Outcome, Outgoing, PAGE, PageSection, ResultWriter, Run, Step, Write,
 };
 use vos_wire::schema::Schema;
 use vos_wire::{Decode, Encode, defaults, keys};
@@ -28,7 +30,9 @@ use vos_wire::{Decode, Encode, defaults, keys};
 use crate::host::{STATE_SCAN, ecalli, gas, ptr, state_read, state_read_into, unserved};
 use crate::machines::Machine;
 use invocation::Invocation;
+use jam::Witnessed;
 use sessions::{ByName, Counts, Held, admit, by_name};
+use snapshots::Format;
 use workflows::Floor;
 
 /// Applied rows fetched per `state_scan` at first; a page grows to
@@ -46,8 +50,13 @@ pub fn run(arguments: &[u8]) -> Vec<u8> {
     let (work, _) = Work::decode(&arguments.payload).expect("a work item");
     let agent = AgentId(arguments.service as u32);
     match work {
-        Work::Batch(batch) => run_batch(agent, batch),
+        Work::Batch(batch) => {
+            let mut base = Base::new(agent, &batch, Source::Node);
+            let result = run_batch(&mut base, batch);
+            result.finish(base.section.into_inner())
+        }
         Work::Query(query) => run_query(agent, query).encode(),
+        Work::Package(package) => jam::run(agent, package),
     }
 }
 
@@ -113,44 +122,16 @@ fn stored_value<'a>(key: &[u8], bytes: &'a [u8]) -> Result<&'a [u8], Corrupt> {
     }
 }
 
-/// A value of applied state, by agent-relative key.
-fn applied(key: &[u8]) -> Result<Option<Vec<u8>>, Corrupt> {
-    state_read(key)
-        .map(|bytes| stored_value(key, &bytes).map(<[u8]>::to_vec))
-        .transpose()
+/// Where a refine reads applied state.
+enum Source {
+    /// The node, through `state_read` and `state_scan`.
+    Node,
+    /// A JAM package's witness, verified against its root.
+    Witness(Witnessed),
 }
 
-/// An agent record of applied state. A small one, as marks and ids are,
-/// is read and decoded on the stack.
-fn record<T: Decode>(key: &[u8]) -> Result<Option<T>, Corrupt> {
-    let decode = |bytes: &[u8]| {
-        let value = unstored(bytes).ok_or(Corrupt)?;
-        T::decode(value)
-            .map(|(value, _)| Some(value))
-            .map_err(|_| Corrupt)
-    };
-    // Every record refine reads fits, the stored byte included (a session
-    // mark takes 17 bytes); a larger one is read again whole.
-    let mut small = [0u8; 32];
-    match state_read_into(key, &mut small) {
-        None => Ok(None),
-        Some(len) if len <= small.len() => decode(&small[..len]),
-        Some(_) => state_read(key).map_or(Ok(None), |bytes| decode(&bytes)),
-    }
-}
-
-/// Applied rows under `prefix` after `after`, a page at a time.
-fn applied_rows(prefix: &[u8], after: &[u8]) -> Result<StateRows, Corrupt> {
-    scan_page(prefix, after)
-        .into_iter()
-        .map(|(key, value)| {
-            let value = stored_value(&key, &value)?.to_vec();
-            Ok((key, value))
-        })
-        .collect()
-}
-
-/// A page of rows under `prefix` after `after`, their values as stored.
+/// A page of rows under `prefix` after `after` from the node, their values
+/// as stored.
 fn scan_page(prefix: &[u8], after: &[u8]) -> StateRows {
     let mut capacity = SCAN_PAGE;
     let out = loop {
@@ -195,6 +176,7 @@ fn scan_page(prefix: &[u8], after: &[u8]) -> StateRows {
 /// What one refine has committed so far, above applied state.
 struct Base {
     agent: AgentId,
+    source: Source,
     time: u64,
     seed: [u8; 32],
     /// The batch's whole budget, which the meter takes from.
@@ -213,11 +195,105 @@ struct Base {
 }
 
 impl Base {
+    fn new(agent: AgentId, batch: &Batch, source: Source) -> Self {
+        Self {
+            agent,
+            source,
+            time: batch.time,
+            seed: batch.seed,
+            budget: batch.budget,
+            meter: Meter::new(batch.budget),
+            earlier: BTreeMap::new(),
+            installed: RefCell::new(BTreeMap::new()),
+            section: RefCell::new(PageSection::new()),
+            pages: BTreeMap::new(),
+        }
+    }
+
+    /// How this refine's page section, and the node's page rows, hold a
+    /// page: whole on JAM, which exports them as they are.
+    fn format(&self) -> Format {
+        match self.source {
+            Source::Node => Format::Compressed,
+            Source::Witness(_) => Format::Whole,
+        }
+    }
+
+    /// A row of applied state as stored, by agent-relative key; `None`
+    /// when absent.
+    fn stored(&self, key: &[u8]) -> Option<Vec<u8>> {
+        match &self.source {
+            Source::Node => state_read(key),
+            Source::Witness(witnessed) => witnessed.read(key).map(<[u8]>::to_vec),
+        }
+    }
+
+    /// The length of a row of applied state as stored, without reading it.
+    fn stored_len(&self, key: &[u8]) -> Option<usize> {
+        match &self.source {
+            Source::Node => state_read_into(key, &mut []),
+            Source::Witness(witnessed) => witnessed.read(key).map(<[u8]>::len),
+        }
+    }
+
+    /// A value of applied state, by agent-relative key.
+    fn applied(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Corrupt> {
+        self.stored(key)
+            .map(|bytes| stored_value(key, &bytes).map(<[u8]>::to_vec))
+            .transpose()
+    }
+
+    /// An agent record of applied state. A small one, as marks and ids
+    /// are, is read and decoded on the stack.
+    fn record<T: Decode>(&self, key: &[u8]) -> Result<Option<T>, Corrupt> {
+        let decode = |bytes: &[u8]| {
+            let value = unstored(bytes).ok_or(Corrupt)?;
+            T::decode(value)
+                .map(|(value, _)| Some(value))
+                .map_err(|_| Corrupt)
+        };
+        if let Source::Witness(witnessed) = &self.source {
+            return witnessed.read(key).map_or(Ok(None), decode);
+        }
+        // Every record refine reads fits, the stored byte included (a
+        // session mark takes 17 bytes); a larger one is read again whole.
+        let mut small = [0u8; 32];
+        match state_read_into(key, &mut small) {
+            None => Ok(None),
+            Some(len) if len <= small.len() => decode(&small[..len]),
+            Some(_) => state_read(key).map_or(Ok(None), |bytes| decode(&bytes)),
+        }
+    }
+
+    /// Applied rows under `prefix` after `after`, a page at a time.
+    fn applied_rows(&self, prefix: &[u8], after: &[u8]) -> Result<StateRows, Corrupt> {
+        self.scan_page(prefix, after)
+            .into_iter()
+            .map(|(key, value)| {
+                let value = stored_value(&key, &value)?.to_vec();
+                Ok((key, value))
+            })
+            .collect()
+    }
+
+    /// A page of rows under `prefix` after `after`, their values as
+    /// stored: at most [`SCAN_PAGE`] bytes of them, or room for the first
+    /// alone.
+    fn scan_page(&self, prefix: &[u8], after: &[u8]) -> StateRows {
+        if let Source::Witness(witnessed) = &self.source {
+            return witnessed
+                .scan(prefix, after, SCAN_PAGE)
+                .or_else(|| witnessed.scan(prefix, after, cap::STORED_ROW))
+                .expect("a stored row past its cap");
+        }
+        scan_page(prefix, after)
+    }
+
     /// A value through this refine's earlier steps and applied state.
     fn read(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Corrupt> {
         match self.earlier.get(key) {
             Some(value) => Ok(value.clone()),
-            None => applied(key),
+            None => self.applied(key),
         }
     }
 
@@ -231,7 +307,7 @@ impl Base {
         let key = keys::installed(instance);
         let len = match self.earlier.get(&key) {
             Some(value) => value.as_ref().map_or(0, Vec::len),
-            None => state_read_into(&key, &mut []).unwrap_or(0),
+            None => self.stored_len(&key).unwrap_or(0),
         };
         if !self.meter.take(defaults::RECORD_BYTE * len as u64) {
             return Err(Failure::OutOfGas);
@@ -246,19 +322,31 @@ impl Base {
         Ok(installed)
     }
 
-    /// The LZ4 bytes of workflow `id`'s page `index`, given to `read`:
-    /// from the section when a step of this refine stored it, else from
-    /// applied state; `None` when a step dropped it or no row holds it.
-    fn page<T>(
+    /// Workflow `id`'s page `index`, whose snapshot names it by `hash`,
+    /// read into `page`: from the section when a step of this refine
+    /// stored it, else from its row, which on JAM holds the page's hash,
+    /// `hash` itself, and the package an import of the page. False when a
+    /// step dropped it, no row holds it, or what holds it is not a page.
+    fn page(
         &self,
         id: WorkflowId,
         index: u32,
-        read: impl FnOnce(&[u8]) -> T,
-    ) -> Result<Option<T>, Corrupt> {
+        hash: &[u8; 32],
+        page: &mut [u8; PAGE],
+    ) -> Result<bool, Corrupt> {
+        let format = self.format();
         match self.pages.get(&(id, index)) {
-            Some(Some(range)) => Ok(Some(read(self.section.borrow().page(range.clone())))),
-            Some(None) => Ok(None),
-            None => Ok(applied(&keys::page(id, index))?.map(|bytes| read(&bytes))),
+            Some(Some(range)) => Ok(format.unpack(self.section.borrow().page(range.clone()), page)),
+            Some(None) => Ok(false),
+            None => Ok(
+                match (self.applied(&keys::page(id, index))?, &self.source) {
+                    (None, _) => false,
+                    (Some(row), Source::Node) => format.unpack(&row, page),
+                    (Some(row), Source::Witness(witnessed)) => {
+                        row == hash && witnessed.import(id, index, page)
+                    }
+                },
+            ),
         }
     }
 
@@ -267,7 +355,7 @@ impl Base {
     fn holds(&self, key: &[u8]) -> bool {
         match self.earlier.get(key) {
             Some(value) => value.is_some(),
-            None => state_read_into(key, &mut []).is_some(),
+            None => self.stored_len(key).is_some(),
         }
     }
 
@@ -426,7 +514,7 @@ fn plan(base: &Base, pairs: &BTreeMap<AgentId, u64>, input: &Input, handler: boo
             from,
             sequence,
             body: Body::Reply { awaiting, .. },
-        }) if out_of_order(pairs, *from, *sequence).is_none() => {
+        }) if out_of_order(base, pairs, *from, *sequence).is_none() => {
             match workflows::resumed(base, *from, awaiting) {
                 Err(_) => None,
                 Ok(Some((workflow, bytes))) => {
@@ -448,8 +536,9 @@ fn plan(base: &Base, pairs: &BTreeMap<AgentId, u64>, input: &Input, handler: boo
 }
 
 /// Run a batch's inputs as steps, within its budget, each followed by the
-/// steps of the workflows it makes due at once, as far as the budget goes.
-fn run_batch(agent: AgentId, batch: Batch) -> Vec<u8> {
+/// steps of the workflows it makes due at once, as far as the budget goes:
+/// the work result, its pages left in `base`'s section.
+fn run_batch(base: &mut Base, batch: Batch) -> ResultWriter {
     // The one reading of `gas`. A node gives a refine its batch's budget and
     // what decoding the batch may take (`defaults::refine_start`), so the
     // budget is left now; a refine given less traps rather than run out
@@ -458,17 +547,6 @@ fn run_batch(agent: AgentId, batch: Batch) -> Vec<u8> {
         gas() >= batch.budget,
         "the refine's gas does not cover its budget"
     );
-    let mut base = Base {
-        agent,
-        time: batch.time,
-        seed: batch.seed,
-        budget: batch.budget,
-        meter: Meter::new(batch.budget),
-        earlier: BTreeMap::new(),
-        installed: RefCell::new(BTreeMap::new()),
-        section: RefCell::new(PageSection::new()),
-        pages: BTreeMap::new(),
-    };
     // A sweep's due steps leave inputs beside it their floor.
     let beside = batch
         .inputs
@@ -493,7 +571,7 @@ fn run_batch(agent: AgentId, batch: Batch) -> Vec<u8> {
                     ..
                 })
         );
-        let Some(plan) = plan(&base, &batched.pairs, &input, handler) else {
+        let Some(plan) = plan(base, &batched.pairs, &input, handler) else {
             break;
         };
         let kept = plan.reserve + plan.limit + defaults::FINISH_RESERVE;
@@ -508,7 +586,7 @@ fn run_batch(agent: AgentId, batch: Batch) -> Vec<u8> {
         let mut creates = None;
         let stepped = match input {
             Input::Request(request) => {
-                match admit(&base, &batched.sessions, &mut batched.counts, &request) {
+                match admit(base, &batched.sessions, &mut batched.counts, &request) {
                     (input, Err(code)) => Stepped::new(Step::Refused { input, code }, None),
                     (input, Ok(held)) => {
                         if let Held::Absent = held {
@@ -520,7 +598,7 @@ fn run_batch(agent: AgentId, batch: Batch) -> Vec<u8> {
                         };
                         let mark = Mark::Session(request.session, held.advanced(mark));
                         let mut stepped = called(
-                            &base,
+                            base,
                             index,
                             input,
                             request.caller,
@@ -534,18 +612,18 @@ fn run_batch(agent: AgentId, batch: Batch) -> Vec<u8> {
                 }
             }
             Input::Message(message) => {
-                self::message(&base, &batched.pairs, index, message, plan.resumes)
+                self::message(base, &batched.pairs, index, message, plan.resumes)
             }
             Input::Failed {
                 from,
                 sequence,
                 awaiting,
-            } => failed_in_refine(&batched.pairs, from, sequence, awaiting),
+            } => failed_in_refine(base, &batched.pairs, from, sequence, awaiting),
             Input::Admin(admin) => Stepped::new(self::admin(admin), None),
             Input::Ack { to, sequence } => Stepped::new(acknowledge(to, sequence), None),
-            Input::Sweep { due } => sweep(&base, &due),
+            Input::Sweep { due } => sweep(base, &due),
         };
-        let Some(due) = batched.take(&mut base, stepped, plan.reserve, plan.runs) else {
+        let Some(due) = batched.take(base, stepped, plan.reserve, plan.runs) else {
             break;
         };
         if let Some(key) = creates {
@@ -557,12 +635,12 @@ fn run_batch(agent: AgentId, batch: Batch) -> Vec<u8> {
         }
         let mut floor = Floor::new(swept && beside);
         for (at, workflow) in due {
-            if !workflows::due(&mut base, &mut batched, at, workflow, &mut floor) {
+            if !workflows::due(base, &mut batched, at, workflow, &mut floor) {
                 break;
             }
         }
     }
-    batched.result.finish(base.section.into_inner())
+    batched.result
 }
 
 /// A request's or a call's step: a handler's command, or a workflow's
@@ -612,10 +690,15 @@ fn limit(base: &Base, instance: InstanceId, method: MethodId) -> Option<u64> {
 
 /// Why a message from `from` at `sequence` is out of its pair's order, if
 /// it is.
-fn out_of_order(pairs: &BTreeMap<AgentId, u64>, from: AgentId, sequence: u64) -> Option<Refusal> {
+fn out_of_order(
+    base: &Base,
+    pairs: &BTreeMap<AgentId, u64>,
+    from: AgentId,
+    sequence: u64,
+) -> Option<Refusal> {
     let mark = match pairs.get(&from) {
         Some(mark) => Ok(Some(*mark)),
-        None => record::<u64>(&keys::pair_in(from)),
+        None => base.record::<u64>(&keys::pair_in(from)),
     };
     match mark {
         Err(Corrupt) => Some(Refusal::Unreadable),
@@ -638,7 +721,7 @@ fn message(
 ) -> Stepped {
     let (from, sequence) = (message.from, message.sequence);
     let input = InputRef::Message { from, sequence };
-    if let Some(code) = out_of_order(pairs, from, sequence) {
+    if let Some(code) = out_of_order(base, pairs, from, sequence) {
         return Stepped::new(Step::Refused { input, code }, None);
     }
     let mut stepped = match message.body {
@@ -675,13 +758,14 @@ fn message(
 /// A message the leader asserts failed in refine, in its pair's order:
 /// consumed as failed without running, and answered when it awaits.
 fn failed_in_refine(
+    base: &Base,
     pairs: &BTreeMap<AgentId, u64>,
     from: AgentId,
     sequence: u64,
     awaiting: Option<Await>,
 ) -> Stepped {
     let input = InputRef::Message { from, sequence };
-    if let Some(code) = out_of_order(pairs, from, sequence) {
+    if let Some(code) = out_of_order(base, pairs, from, sequence) {
         return Stepped::new(Step::Refused { input, code }, None);
     }
     let outcome = Outcome::Failed {
@@ -782,6 +866,7 @@ fn split_writes(overlay: Overlay) -> (Vec<Write>, Vec<CommittedWrite>) {
 fn run_query(agent: AgentId, query: Query) -> Outcome {
     let base = Base {
         agent,
+        source: Source::Node,
         time: query.time,
         seed: query.seed,
         // One invocation, within its handler's limit: nothing to dispatch.

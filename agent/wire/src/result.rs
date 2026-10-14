@@ -69,12 +69,18 @@ impl ResultWriter {
     }
 
     /// The output: the work result, then the pages `section` took.
-    pub fn finish(mut self, section: PageSection) -> Vec<u8> {
-        self.bytes[self.count_at..self.count_at + 4].copy_from_slice(&self.count.to_le_bytes());
+    pub fn finish(self, section: PageSection) -> Vec<u8> {
+        let mut bytes = self.result();
         let pages = &section.bytes[..section.taken];
-        self.bytes.reserve_exact(4 + pages.len());
-        section.pages.encode_to(&mut self.bytes);
-        self.bytes.extend_from_slice(pages);
+        bytes.reserve_exact(4 + pages.len());
+        section.pages.encode_to(&mut bytes);
+        bytes.extend_from_slice(pages);
+        bytes
+    }
+
+    /// The work result alone: on JAM, where its pages travel apart.
+    pub fn result(mut self) -> Vec<u8> {
+        self.bytes[self.count_at..self.count_at + 4].copy_from_slice(&self.count.to_le_bytes());
         self.bytes
     }
 }
@@ -163,10 +169,29 @@ impl PageSection {
     pub fn page(&self, range: core::ops::Range<usize>) -> &[u8] {
         &self.bytes[range]
     }
+
+    /// The bytes of each page taken, in order.
+    pub fn taken(&self) -> impl Iterator<Item = &[u8]> {
+        let mut at = 0;
+        core::iter::from_fn(move || {
+            let len = self.bytes[..self.taken].get(at..at + 4)?;
+            let len = u32::from_le_bytes(len.try_into().expect("four bytes")) as usize;
+            let page = &self.bytes[at + 4..at + 4 + len];
+            at += 4 + len;
+            Some(page)
+        })
+    }
 }
 
 /// A page's bytes, as a workflow's snapshot holds it.
 pub const PAGE: usize = 4096;
+
+/// BLAKE2b-256 of `bytes`: a page's hash, as a snapshot names it, and on
+/// JAM a work result's, as refine's output names it.
+#[inline]
+pub fn digest(bytes: &[u8]) -> [u8; 32] {
+    vos_pvm_precompiles::blake2b_256(bytes)
+}
 
 /// A refine's output split: the work result, and its page section. A work
 /// result with nothing after it stores no pages.

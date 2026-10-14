@@ -149,6 +149,7 @@ dependencies = [
  "vos-pvm-precompiles",
  "vos-pvm-program",
  "vos-sdk",
+ "vos-tree",
  "vos-wire",
 ]
 
@@ -209,6 +210,7 @@ name = "vos-wire"
 version = "0.1.0"
 dependencies = [
  "vos-pvm-codec",
+ "vos-pvm-precompiles",
  "vos-pvm-program",
  "vos-tree",
 ]

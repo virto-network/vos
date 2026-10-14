@@ -2492,6 +2492,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "vos-jam"
+version = "0.1.0"
+dependencies = [
+ "lz4_flex 0.13.1",
+ "vos-pvm",
+ "vos-tree",
+ "vos-wire",
+]
+
+[[package]]
 name = "vos-net"
 version = "0.1.0"
 dependencies = [
@@ -2682,9 +2692,11 @@ dependencies = [
  "blake2",
  "lz4_flex 0.13.1",
  "proptest",
+ "vos-jam",
  "vos-pvm",
  "vos-pvm-compiler",
  "vos-pvm-program",
+ "vos-tree",
  "vos-wire",
 ]
 
@@ -2704,6 +2716,7 @@ dependencies = [
  "proptest",
  "vos-pvm",
  "vos-pvm-codec",
+ "vos-pvm-precompiles",
  "vos-pvm-program",
  "vos-tree",
 ]

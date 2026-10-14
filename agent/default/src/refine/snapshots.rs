@@ -2,14 +2,17 @@
 //! alone.
 //!
 //! **Restore:** the program's machine at the snapshot's counter, each page
-//! it holds written back from its row and checked against its hash, the
-//! registers set, then its writable pages armed read-only, so the step's
-//! first store to each exits to the agent, which marks it written.
+//! it holds written back from its row, or on JAM from its import, and
+//! checked against its hash, the registers set, then its writable pages
+//! armed read-only, so the step's first store to each exits to the agent,
+//! which marks it written.
 //!
 //! **Capture,** when the step pauses: each page it wrote is stored, by its
 //! hash, when it differs from its base, the program's image or zeros, and
 //! from what was held; it is dropped when written back to its base, so a
-//! restore gives the base again.
+//! restore gives the base again. The page section holds a stored page
+//! LZ4-compressed for a VOS node's row, and whole on JAM, where it is
+//! exported as it is.
 //!
 //! Both are kept out of the step's frame, which the workflow's nested calls
 //! sit on: each holds a page's buffer.
@@ -22,7 +25,7 @@ use vos_pvm_program::StandardHeader;
 use vos_wire::abi::{Failure, cap};
 use vos_wire::ids::{ProgramHash, WorkflowId};
 use vos_wire::records::Workflow;
-use vos_wire::result::{PAGE, Page, PageSection};
+use vos_wire::result::{PAGE, Page, PageSection, digest};
 
 use super::Base;
 use crate::host::{historical_lookup_from, lost};
@@ -32,9 +35,53 @@ const PAGE_BYTES: u64 = PAGE as u64;
 /// The most bytes a page takes, LZ4-compressed.
 const MAX_STORED: usize = lz4_flex::block::get_maximum_output_size(PAGE);
 
-/// A page's hash, as a snapshot names it: BLAKE2b-256 of its bytes.
-fn hash(page: &[u8; PAGE]) -> [u8; 32] {
-    vos_pvm_precompiles::blake2b_256(page)
+/// How the page section, and a VOS node's page rows, hold a page.
+#[derive(Clone, Copy)]
+pub(super) enum Format {
+    /// LZ4-compressed, as a VOS node's rows keep it.
+    Compressed,
+    /// Whole, as JAM exports it.
+    Whole,
+}
+
+impl Format {
+    /// A page held in this format, read into `page`: false when it is not
+    /// a whole page.
+    pub(super) fn unpack(self, held: &[u8], page: &mut [u8; PAGE]) -> bool {
+        match self {
+            Format::Compressed => {
+                matches!(lz4_flex::block::decompress_into(held, page), Ok(PAGE))
+            }
+            Format::Whole => {
+                let whole = held.len() == PAGE;
+                if whole {
+                    page.copy_from_slice(held);
+                }
+                whole
+            }
+        }
+    }
+
+    /// The most bytes a page takes, and `page` put into `out` in this
+    /// format: the bytes it took.
+    fn pack(self, page: &[u8; PAGE], out: &mut [u8]) -> usize {
+        match self {
+            Format::Compressed => {
+                lz4_flex::block::compress_into(page, out).expect("room for a page")
+            }
+            Format::Whole => {
+                out[..PAGE].copy_from_slice(page);
+                PAGE
+            }
+        }
+    }
+
+    fn room(self) -> usize {
+        match self {
+            Format::Compressed => MAX_STORED,
+            Format::Whole => PAGE,
+        }
+    }
 }
 
 /// Workflow `id`'s machine for its next step: at its program's start for
@@ -61,15 +108,11 @@ pub(super) fn restore(
             };
             let mut page = [0u8; PAGE];
             for &(index, hash) in &snapshot.pages {
-                let decompressed = base.page(id, index, |stored| {
-                    lz4_flex::block::decompress_into(stored, &mut page)
-                });
-                let Ok(Some(decompressed)) = decompressed else {
+                let Ok(true) = base.page(id, index, &hash, &mut page) else {
                     lost("a workflow's page row");
                 };
-                match decompressed {
-                    Ok(PAGE) if self::hash(&page) == hash => {}
-                    _ => lost("a workflow's page"),
+                if digest(&page) != hash {
+                    lost("a workflow's page");
                 }
                 machine.write(u64::from(index) * PAGE_BYTES, &page)?;
             }
@@ -96,27 +139,35 @@ pub(super) struct Captured {
 }
 
 /// The pages a paused step wrote, against those the workflow held, each it
-/// stores compressed into `section` as the running step's. Past
-/// [`cap::STEP_PAGES`] written, or [`cap::HELD_PAGES`] held after, the step
-/// fails, its pages dropped from the section; past the section's cap, the
-/// batch cannot take the step, which waits.
+/// stores put into `base`'s section in its format as the running step's. Past [`cap::STEP_PAGES`] written, or [`cap::HELD_PAGES`] held
+/// after, the step fails, its pages dropped from the section; past the
+/// section's cap, the batch cannot take the step, which waits.
 #[inline(never)]
 pub(super) fn capture(
+    base: &Base,
     machine: &Machine,
     program: &ProgramHash,
     header: &StandardHeader,
     id: WorkflowId,
     held: &[(u32, [u8; 32])],
-    section: &RefCell<PageSection>,
 ) -> Result<Captured, Failure> {
-    let captured = pages(machine, program, header, id, held, section);
+    let captured = pages(
+        base.format(),
+        machine,
+        program,
+        header,
+        id,
+        held,
+        &base.section,
+    );
     if captured.is_err() {
-        section.borrow_mut().drop_running();
+        base.section.borrow_mut().drop_running();
     }
     captured
 }
 
 fn pages(
+    format: Format,
     machine: &Machine,
     program: &ProgramHash,
     header: &StandardHeader,
@@ -158,7 +209,7 @@ fn pages(
             }
             continue;
         }
-        let hash = hash(&bytes);
+        let hash = digest(&bytes);
         now.push((index, hash));
         if previous != Some(hash) {
             pages.push(Page {
@@ -166,11 +217,8 @@ fn pages(
                 index,
                 hash: Some(hash),
             });
-            let compress = |out: &mut [u8]| {
-                lz4_flex::block::compress_into(&bytes, out).expect("room for a page")
-            };
             // Past the section's cap the batch will not take the step.
-            stored.extend(section.store(MAX_STORED, compress));
+            stored.extend(section.store(format.room(), |out| format.pack(&bytes, out)));
         }
     }
     now.extend(before);
