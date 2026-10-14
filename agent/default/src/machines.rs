@@ -18,7 +18,7 @@ use vos_wire::abi::{Failure, code, precompile};
 
 use crate::host::{
     EXPUNGE, INSTANTIATE, INVOKE, MACHINE, PAGES, PEEK, POKE, ecalli, historical_lookup,
-    historical_lookup_into, ptr, ptr_mut,
+    historical_lookup_into, lost, ptr, ptr_mut,
 };
 
 const ZONE: u64 = 1 << 16;
@@ -40,8 +40,12 @@ const SET_READ_WRITE: u64 = 4;
 pub enum Unavailable {
     /// Every inner machine is in use.
     Full,
-    /// Neither the pool nor the preimages know the program.
+    /// The preimages do not hold the program: on JAM, where `instantiate`
+    /// is not served and the agent loads the program itself.
     Missing,
+    /// The node, which serves `instantiate`, does not hold the program: on
+    /// VOS, where every program the agent runs is pinned, data it lost.
+    Unknown,
     /// The counter starts no instruction of the program.
     Counter,
 }
@@ -50,10 +54,30 @@ impl From<Unavailable> for Failure {
     fn from(unavailable: Unavailable) -> Failure {
         match unavailable {
             Unavailable::Full => Failure::Depth,
-            Unavailable::Missing => Failure::Unloadable,
+            Unavailable::Missing | Unavailable::Unknown => Failure::Unloadable,
             Unavailable::Counter => Failure::Trapped,
         }
     }
+}
+
+/// A machine of a program the agent's state pins, an installed instance's
+/// or a workflow's, at `counter`. A node that does not hold it lost it: the
+/// refine stops ([`lost`]), rather than fail the step for the node's fault.
+/// On JAM, a program the preimages lack fails the step, `Unloadable`.
+pub fn pinned(program: &[u8; 32], counter: u32) -> Result<Machine, Unavailable> {
+    match Machine::acquire_at(program, counter) {
+        Err(Unavailable::Unknown) => lost("a pinned program"),
+        acquired => acquired,
+    }
+}
+
+/// The header of a program the agent's state pins, held lost, as
+/// [`pinned`] holds it, on a node that lacks it.
+pub fn pinned_header(program: &[u8; 32]) -> Option<StandardHeader> {
+    header(program).or_else(|| {
+        let _ = pinned(program, 0);
+        None
+    })
 }
 
 /// How an invocation stopped. A tracked machine's fault on a page it may
@@ -120,7 +144,9 @@ impl Machine {
         let id = match id {
             code::FULL => return Err(Unavailable::Full),
             code::HUH => return Err(Unavailable::Counter),
-            code::WHAT | code::WHO => {
+            // The node looked in every program it holds.
+            code::WHO => return Err(Unavailable::Unknown),
+            code::WHAT => {
                 let blob = historical_lookup(program).ok_or(Unavailable::Missing)?;
                 load(&blob, counter)?
             }
@@ -206,12 +232,21 @@ impl Machine {
         self.frame[1 + index] = value;
     }
 
-    /// Run until the machine stops. A tracked machine's first store to a
-    /// page it may write marks the page and resumes.
+    /// Run an untracked machine until it stops: a tracked one runs with
+    /// [`Machine::invoke_paying`].
     #[inline]
     pub fn invoke(&mut self) -> Exit {
+        debug_assert!(self.tracking.is_none(), "a tracked machine pays its pages");
+        self.invoke_once()
+    }
+
+    /// Run a tracked machine until it stops. Its first store to a page it
+    /// may write asks `pay` first, then marks the page written, opens it and
+    /// resumes; refused, the run stops at the fault with the page unopened,
+    /// which [`Machine::unwritten`] tells from a trap.
+    pub fn invoke_paying(&mut self, pay: &mut dyn FnMut() -> bool) -> Exit {
         match self.invoke_once() {
-            Exit::Fault(address) if self.tracking.is_some() => self.resume(address),
+            Exit::Fault(address) if self.tracking.is_some() => self.resume(address, pay),
             exit => exit,
         }
     }
@@ -233,17 +268,45 @@ impl Machine {
     }
 
     /// A tracked machine's run from a fault at `address`: while the fault
-    /// is a first store to a page it may write, open the page and resume.
+    /// is a first store to a page it may write, and `pay` pays it, open the
+    /// page and resume.
     #[cold]
     #[inline(never)]
-    fn resume(&mut self, mut address: u64) -> Exit {
-        while self.open(address / PAGE, address / PAGE + 1) {
+    fn resume(&mut self, mut address: u64, pay: &mut dyn FnMut() -> bool) -> Exit {
+        loop {
+            if !self.unwritten(address) || !pay() {
+                return Exit::Fault(address);
+            }
+            let page = address / PAGE;
+            self.open(page, page + 1);
             match self.invoke_once() {
                 Exit::Fault(next) => address = next,
                 exit => return exit,
             }
         }
-        Exit::Fault(address)
+    }
+
+    /// Whether `address` lies in a page the tracked machine may write and
+    /// has not written since it was armed: a fault there is a first store.
+    pub fn unwritten(&self, address: u64) -> bool {
+        self.unwritten_page(address / PAGE)
+    }
+
+    fn unwritten_page(&self, page: u64) -> bool {
+        self.tracking
+            .as_ref()
+            .is_some_and(|tracking| tracking.tracks(page) && !tracking.written.contains(&page))
+    }
+
+    /// The pages of `len` bytes at `address` a write would mark written.
+    pub fn unwritten_in(&self, address: u64, len: u64) -> u64 {
+        if len == 0 {
+            return 0;
+        }
+        let end = address.saturating_add(len).div_ceil(PAGE);
+        (address / PAGE..end)
+            .filter(|&page| self.unwritten_page(page))
+            .count() as u64
     }
 
     /// Mark the tracked pages from `first` to `end` that are not yet

@@ -575,7 +575,8 @@ fn a_workflow_method_is_no_handler() {
     let started = kit.command(ALICE, LEDGER, tally, &vec![1u64, 2].encode());
     assert_eq!(started.outcome, ran(&result.steps[0]).outcome);
     assert_eq!(started.writes, ran(&result.steps[0]).writes);
-    let stepped = kit.due(workflow).expect("due at once");
+    // Due at once, at the batch's time.
+    let stepped = kit.due(1, workflow);
     assert_eq!(stepped.writes, first.writes);
     assert_eq!(stepped.gas_used, first.gas_used);
     assert_eq!(stepped.instances, first.instances);

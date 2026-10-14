@@ -55,19 +55,33 @@ fn every_program_calls_only_its_surface() {
     for call in calls(&actors.tally) {
         assert!(surface::workflow(call), "tally calls {call:#x}");
     }
-    // The shop's workflows, which pause: each calls an operation only a
-    // workflow may use.
+    // The shop's workflows: each that pauses calls an operation only a
+    // workflow may use, and each that compresses calls the precompile.
     let pauses = [abi::op::REQUEST, abi::op::RESULT, abi::op::SLEEP];
-    for name in [
-        "transfer", "saga", "compute", "nap", "fragile", "scratch", "delegate", "hog",
-    ] {
+    let computes = [
+        "chain",
+        "grind",
+        "grind_whole",
+        "settle",
+        "relay",
+        "stuck",
+        "press",
+    ];
+    let compresses = ["digest", "press"];
+    for name in crate::workflows::FLOWS {
         let calls = calls(&vos_testkit::programs::actor(name));
         for call in &calls {
             assert!(surface::workflow(*call), "{name} calls {call:#x}");
         }
-        assert!(
+        assert_eq!(
             calls.iter().any(|call| pauses.contains(call)),
+            !computes.contains(&name),
             "{name} pauses: the check sees its calls"
+        );
+        assert_eq!(
+            calls.contains(&abi::precompile::BLAKE2B_COMPRESS),
+            compresses.contains(&name),
+            "{name} compresses"
         );
     }
     for call in calls(&vos_testkit::programs::actor("shop")) {

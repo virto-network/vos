@@ -307,6 +307,103 @@ impl Shop {
         checksum
     }
 
+    /// `passes` passes over `words` pseudo-random words with no await
+    /// between: a computation the step's share preempts, step after step.
+    /// The words' digest.
+    #[workflow(gas = 20_000_000)]
+    pub async fn grind(ctx: &mut Workflow<Self>, words: u32, passes: u32) -> u64 {
+        let _ = ctx;
+        churn(words, passes)
+    }
+
+    /// `grind` with a limit that holds the whole computation: the run that
+    /// never stops.
+    #[workflow(gas = 100_000_000)]
+    pub async fn grind_whole(ctx: &mut Workflow<Self>, words: u32, passes: u32) -> u64 {
+        let _ = ctx;
+        churn(words, passes)
+    }
+
+    /// Read the batch's time `rounds` times, then count a sale: a unit
+    /// whose first effect, its call, comes after effect-free code costing
+    /// some `price::OPERATION` a round. The shop's sales after it.
+    #[workflow(gas = 50_000_000)]
+    pub async fn settle(ctx: &mut Workflow<Self>, rounds: u32) -> u64 {
+        for _ in 0..rounds {
+            core::hint::black_box(ctx.now());
+        }
+        let (_, me) = ctx.me();
+        let amount = u64::from(rounds % 100 + 1);
+        ctx.call(Ref::<Shop>::new(me), shop::Sell { amount })
+            .await
+            .unwrap_or(0)
+    }
+
+    /// `times` times: read the batch's time `rounds` times, have this
+    /// agent's counter echo `len` bytes, and count a sale of the echo's
+    /// length. Each echo's call may spend what is left of the step's share,
+    /// ending the step at its await. The shop's sales after them.
+    #[workflow(gas = 5_000_000)]
+    pub async fn relay(ctx: &mut Workflow<Self>, rounds: u32, len: u32, times: u32) -> u64 {
+        let (_, me) = ctx.me();
+        let mut sales = 0;
+        for _ in 0..times {
+            for _ in 0..rounds {
+                core::hint::black_box(ctx.now());
+            }
+            let echo = counter::counter::Echo {
+                bytes: vec![7u8; len as usize],
+            };
+            let echoed = ctx
+                .call(Ref::<Counter>::new(InstanceId(1)), echo)
+                .await
+                .map_or(0, |bytes| bytes.len() as u64);
+            sales = ctx
+                .call(Ref::<Shop>::new(me), shop::Sell { amount: echoed })
+                .await
+                .unwrap_or(0);
+        }
+        sales
+    }
+
+    /// `digest` with no await, on a limit of a few hundred compressions:
+    /// steps that end at a compression their share cannot pay, which the
+    /// next serves first. The state's first 32 bytes.
+    #[workflow(gas = 200_000)]
+    pub async fn press(ctx: &mut Workflow<Self>, rounds: u32) -> Vec<u8> {
+        let _ = ctx;
+        // SAFETY: a workflow runs on one thread, and nothing else holds the
+        // page.
+        let state = unsafe { &mut *STATE.0.get() };
+        let (h, _) = state
+            .split_first_chunk_mut::<64>()
+            .expect("a page holds a state");
+        for round in 0..rounds {
+            let block = [round as u8; 128];
+            let counter = u128::from(round + 1) * 128;
+            vos_pvm_precompiles::blake2b_compress(h, &block, counter, round + 1 == rounds);
+        }
+        h[..32].to_vec()
+    }
+
+    /// Nothing, with a limit no block of a program fits: a step that
+    /// cannot move.
+    #[workflow(gas = 1)]
+    pub async fn stuck(ctx: &mut Workflow<Self>) -> u64 {
+        let _ = ctx;
+        0
+    }
+
+    /// Send the risk agent's counter an increment, then fill `bytes` of
+    /// memory and pause: pages written after the unit's first effect.
+    #[workflow(gas = 100_000_000)]
+    pub async fn splurge(ctx: &mut Workflow<Self>, risk: u32, bytes: u32) -> u32 {
+        ctx.send(AgentId(risk), RISK, counter::counter::Increment { by: 1 });
+        let memory = core::hint::black_box(vec![1u8; bytes as usize]);
+        ctx.sleep_until(ctx.now()).await;
+        memory.len() as u32
+    }
+
     /// Encode `len` bytes as the risk agent's counter's echo takes them,
     /// then pause by `kind`: 0 a sleep, 1 a request of the echo, 2 a wait
     /// for the result of the risk agent's workflow 1. Each step writes the
@@ -333,4 +430,31 @@ impl Shop {
         }
         kind
     }
+}
+
+/// `passes` passes over `words` pseudo-random words, each mixed with the
+/// next: their digest.
+fn churn(words: u32, passes: u32) -> u64 {
+    let mut data = vec![0u64; words.max(1) as usize];
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    for value in data.iter_mut() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        *value = state;
+    }
+    let len = data.len();
+    for pass in 0..passes {
+        for index in 0..len {
+            let next = if index + 1 < len {
+                data[index + 1]
+            } else {
+                data[0]
+            };
+            data[index] =
+                data[index].rotate_left(pass % 63 + 1) ^ next.wrapping_mul(0x2545_f491_4f6c_dd1d);
+        }
+    }
+    data.iter()
+        .fold(0, |digest, value| digest.rotate_left(7) ^ value)
 }

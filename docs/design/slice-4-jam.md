@@ -969,25 +969,43 @@ awaits as the pause points:
   the pending call first.
 - **After its first effect, a unit runs to its next await** within the
   step's limit, and is never preempted. Past the limit the step fails.
-- **The share comes from the batch, never from the `gas` host call:**
-  - the batch carries its budget (`Batch.budget`, from 4.1);
-  - the agent accounts for it itself, from the dispatched steps' limits
-    and their use, all of it state;
+- **The share is the step's own limit,** the gas its workflow declares,
+  never the batch's remainder and never the `gas` host call:
+  - dispatch keeps the reserve, that limit and the finish from the
+    batch's budget (`Batch.budget`), by the agent's own accounting;
+  - the agent sets the machine's gas itself at every invoke;
   - so the same batch preempts at the same block on every host, and on
-    JAM. Today refine dispatches by `gas()`, so this accounting is a 4.4
-    prerequisite.
-- **A progress floor:** a step is preempted only after at least one
-  block has run since its resume. Otherwise it gets the step's full
-  limit for this resume, so a share smaller than the first block can
-  never pin a workflow at one counter, committing a snapshot every
-  batch.
+    JAM. A long computation takes one limit a step, not every batch's
+    budget ahead of the inputs behind the sweep.
+  - Each effectful unit gets a fresh limit once the batch covers it.
+- **Fairness: due steps leave a batch's inputs a floor.** When a batch
+  holds inputs beside its sweep:
+  - the head due row's step runs whenever the batch can keep its
+    reserve, restore, limit and finish, so the due index always moves;
+  - from the head's step on, half of what the head leaves stays for
+    the inputs, and the head's pages and every later due step's keep
+    and pages must stay above it;
+  - a due step that cannot waits for the next sweep, with the rows after
+    it;
+  - with only the sweep in a batch, or for a start's first step or a
+    reply's step, which are inputs' own work, there is no floor.
+  - A step fails `Cap` only when even an empty batch could not hold it
+    with two pages of room.
+- **A progress floor:** a step is preempted only after it has moved
+  since its resume. Otherwise it fails out of gas, or, at a page the
+  batch cannot pay, waits or fails as an overrun, so a workflow is never
+  pinned at one counter, committing a snapshot every batch.
+  - At an out-of-gas exit or a call, moving means gas used.
+  - At an unpaid page it means a page paid or a call served. A machine
+    resumed at a page fault re-enters mid-block and pays that block
+    again, so gas used there proves nothing.
 - **The snapshot records how the step exited:** a pending host call
-  (its id, beside the counter, registers and gas), or out of gas, which
+  (its id, beside the counter and registers), or out of gas, which
   needs nothing. The block an out-of-gas exit stopped at is charged
-  once on resume, as a block entered at its start is (4.0).
-- **The gas stored is the agent's to set:** the remaining limit of an
-  effectful unit, never the machine's counter, which is negative after
-  an out-of-gas exit. The agent sets the inner gas at every invoke.
+  once on resume, as a block entered at its start is (4.0 and 4.5's
+  probe).
+- **No gas is stored:** every step starts its unit at the workflow's
+  limit, which the agent sets.
 - **A preempted step still consumes its input:** the `Reply`'s pair
   mark, the `Due` row or the start's session mark moves in that `Run`,
   so the input is never redelivered to a workflow that already holds it

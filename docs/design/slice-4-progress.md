@@ -578,3 +578,63 @@ tick.
 step's gas is the same on every host. If VOS should pay less, the sound
 shape is a price table chosen by a package's declared deployment
 target, stored in the agent's state, so every replica prices alike.
+
+## Step 4.5, part E: preemption at the awaits, and the follow-ups
+
+**Built:**
+- **Units and shares:**
+  - a unit is the code between two awaits;
+  - effect-free code runs on its workflow's limit as its share;
+  - at an out-of-gas exit, which always falls at a block start, the
+    step ends with a snapshot and no effects from that unit, and the
+    share counts as spent, so the figure is the same on every host;
+  - at a unit's first effect (`abi::is_effect`, which the agent and the
+    model share), the batch must cover a fresh limit, or the step ends
+    with that call pending, served first on resume;
+  - pages, and the outputs of calls, inputs, randomness and precompiles,
+    are paid before they open;
+  - from its first effect a unit is never preempted.
+- **The floor:** a step ends early only after it moved since its resume:
+  - gas used, at a call;
+  - a call served or a page paid, at a page;
+  - its counter or registers changed, at an out-of-gas exit.
+  - Otherwise it fails, or waits as an overrun.
+- **Fairness:** the head due row always runs if it fits, and from it on
+  half of what remains stays for the batch's inputs. Requests progress
+  in every batch beside two 3 MiB computations.
+- **The snapshot holds no gas,** only the pending call (format 2).
+- **The page section** is one buffer reserved on first use, with pages
+  compressed straight into it, so a full section fits the agent's heap
+  at any budget.
+- **A missing pinned program is lost data** on VOS (`LOST`); on JAM,
+  where the agent loads programs itself, it fails the step `Unloadable`.
+- **A reply at or after its deadline is dropped.**
+
+**Probes, on both backends:**
+- a machine starved of gas stops at a block start, its gas never
+  negative, and resumes there charged that block once, starved plus
+  resumed equal to the straight run;
+- a machine stopped at a store's fault is charged that block again on
+  re-entry.
+- PolkaJam's check of both waits for 4.9.
+
+**Tests:**
+- a long computation spanning refines on its own at the default budget,
+  equal to the straight run, and resumed on a new leader;
+- a first effect left pending and served once;
+- the floor;
+- a call, a compression and an input left pending;
+- requests beside large computations;
+- a page section near its cap fitting the heap;
+- a lost pinned program halting;
+- the interpreter and the JIT, and VOS and the JAM host, byte for byte
+  across every preemption path;
+- the model agreeing.
+
+**Gates:** `just check` (893 tests), the checker loop, the faults
+process tests and the fault suite.
+
+**Reviewed:**
+- Fable: go. Units are atomic, preemption is deterministic, the floor
+  holds, and a pending call is served once.
+- Opus: GO with fixes, all in, with 3178a486's own follow-ups.

@@ -193,6 +193,18 @@ pub mod op {
     pub const SLEEP: u64 = 0x532;
 }
 
+/// Whether operation `op` is an effect a workflow makes: a call, a send, a
+/// request or a wait for a result, or its result. A workflow's unit, the
+/// code between two awaits, is preempted only before its first effect, and
+/// from it runs to its next await with the step's whole limit. Every other
+/// operation a workflow may use only reads, sets registers or pauses.
+pub const fn is_effect(op: u64) -> bool {
+    matches!(
+        op,
+        op::CALL | op::SEND | op::REQUEST | op::RESULT | op::REPLY | op::FAIL
+    )
+}
+
 /// Whether an invocation of `kind` may use operation `op`. `CALL` from a
 /// query is allowed here; the agent also refuses a query that calls a
 /// command. A workflow holds no state of its own: it reaches state only
@@ -342,9 +354,10 @@ pub mod cap {
     /// writes satisfy `restored × RESTORED_PAGE + written × WRITTEN_PAGE +
     /// limit + reserves ≤ budget`: in a refine of the default budget
     /// (`REFINE_GAS`), a step that restores no page writes about 800, and
-    /// one that restores [`HELD_PAGES`] about 140. A step that would pass it
-    /// waits for the next batch behind a step that ran a handler, or fails
-    /// alone, out of gas.
+    /// one that restores [`HELD_PAGES`] about 140. Effect-free code that
+    /// would pass it ends the step at the first page it cannot pay; once a
+    /// unit has made an effect, the step waits for the next batch behind a
+    /// step that ran a handler, or fails alone, out of gas.
     pub const STEP_PAGES: usize = 8 << 20;
     /// The pages a workflow's snapshot may hold, 3 MiB: a step that would
     /// leave it more fails, so the least budget a node refines with
@@ -358,29 +371,40 @@ pub mod cap {
     /// few dozen bytes.
     pub const OUTPUT: usize = WORK_RESULT + RESULT_PAGES + RESULT_PAGES / 64;
 
-    /// The most one step adds to a work result: its input, a new session's
-    /// whole, its reply, writes, messages and attests at their caps, a
-    /// request's reply to its sender, with the framing of as many writes
-    /// (committed ones, with their map, the larger) and instances as its
-    /// gas can pay for. An install's record is under [`STEP_WRITES`] too.
-    pub const STEP_RESULT: usize = 128
-        + REPLY
-        + STEP_WRITES
-        + (MAX_HANDLER_GAS / price::PUT) as usize * 18
-        + (1 + (MAX_HANDLER_GAS / price::MACHINE) as usize) * 12
-        + MESSAGES * (MESSAGE + 40)
-        + (REPLY + 40)
-        + ATTESTS * (REQUEST + REPLY + 40);
+    /// The most a step of `gas` adds to a work result: its input, a new
+    /// session's whole, its reply, writes, messages and attests at their
+    /// caps, a request's reply to its sender, with the framing of as many
+    /// writes (committed ones, with their map, the larger) and instances as
+    /// `gas` can pay for.
+    pub const fn step_result(gas: u64) -> usize {
+        128 + REPLY
+            + STEP_WRITES
+            + (gas / price::PUT) as usize * 18
+            + (1 + (gas / price::MACHINE) as usize) * 12
+            + MESSAGES * (MESSAGE + 40)
+            + (REPLY + 40)
+            + ATTESTS * (REQUEST + REPLY + 40)
+    }
+
+    /// The most a handler's step adds to a work result. An install's record
+    /// is under [`STEP_WRITES`] too.
+    pub const STEP_RESULT: usize = step_result(MAX_HANDLER_GAS);
 
     /// What a workflow's step adds beyond its calls' effects: its record,
-    /// with its arguments or result and the hash of each page it holds, the
-    /// rows beside it, and an entry for each page it stores, at most those
-    /// it holds after, and drops, at most those it held before.
+    /// with its arguments, last input or result and the hash of each page
+    /// it holds, the rows beside it, and an entry for each page it stores,
+    /// at most those it holds after, and drops, at most those it held
+    /// before.
     pub const WORKFLOW_ROWS: usize = 1024 + REQUEST + HELD_PAGES * 36 + 2 * HELD_PAGES * 48;
 
-    // Every step fits an empty result, so a batch always makes progress: a
-    // workflow's too, whose calls' effects are a handler's at most.
-    const _: () = assert!(STEP_RESULT + WORKFLOW_ROWS + 64 <= WORK_RESULT);
+    /// The most a workflow's step adds to a work result: its calls' effects
+    /// at the gas it may use, its limit for its effect-free code and its
+    /// limit again from a unit's first effect, and its rows.
+    pub const WORKFLOW_STEP_RESULT: usize = step_result(2 * MAX_HANDLER_GAS) + WORKFLOW_ROWS;
+
+    // Every step fits an empty result, so a batch always makes progress.
+    const _: () = assert!(STEP_RESULT + 64 <= WORK_RESULT);
+    const _: () = assert!(WORKFLOW_STEP_RESULT + 64 <= WORK_RESULT);
 }
 
 /// The precompiles the agent serves its machines, each at the price a

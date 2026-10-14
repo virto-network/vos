@@ -302,14 +302,18 @@ pub fn attest(method: u32, arguments: &[u8]) -> Result<Vec<u8>, (u32, Vec<u8>)> 
 
 /// The input a workflow's machine was resumed with, `len` bytes: an
 /// encoded [`vos_wire::batch::Answer`] after an await, nothing after a
-/// sleep.
+/// sleep. Copied by the agent straight into fresh capacity, which nothing
+/// writes first.
 fn resumed(len: u64) -> Vec<u8> {
-    let mut input = alloc::vec![0u8; len as usize];
-    if !input.is_empty() {
+    let len = len as usize;
+    let mut input: Vec<u8> = Vec::with_capacity(len);
+    if len > 0 {
         ecalli!(
             op::INPUT,
-            [ptr_mut(&mut input), 0, input.len() as u64, 0, 0, 0]
+            [input.as_mut_ptr() as u64, 0, len as u64, 0, 0, 0]
         );
+        // SAFETY: the agent wrote all `len` bytes of the input.
+        unsafe { input.set_len(len) };
     }
     input
 }

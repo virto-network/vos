@@ -203,6 +203,17 @@ impl Node {
         }
     }
 
+    /// Lose the program `hash` names, as a node whose store lost it: its
+    /// bytes, to add again.
+    pub fn forget(&mut self, hash: &ProgramHash) -> Vec<u8> {
+        if let Some(pool) = &self.pool {
+            pool.uninstall(&vos_pvm::pool::CodeHash(hash.0));
+        }
+        self.programs
+            .remove(&hash.0)
+            .expect("a program the node holds")
+    }
+
     pub fn add(&mut self, blob: &[u8]) -> ProgramHash {
         let hash = program_hash(blob);
         if let Some(pool) = &self.pool {

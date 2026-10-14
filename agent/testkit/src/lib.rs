@@ -120,6 +120,13 @@ pub struct Testkit {
     /// The batch's budget: a workflow's step that could never run in a
     /// batch of it fails.
     pub budget: u64,
+    /// Whether the batch's refine, by the agent's meter, which the model
+    /// does not keep, lacks the step's limit for a workflow's effectful unit
+    /// beyond what the step used before its first effect: every first
+    /// effect after gas used, in every workflow step of every batch while
+    /// it is set, then ends its step, unserved. A test sets it for the
+    /// batch it builds so, and clears it after.
+    pub uncovered: bool,
     instances: BTreeMap<InstanceId, Installed>,
     members: BTreeMap<Principal, u8>,
     state: BTreeMap<Vec<u8>, Vec<u8>>,
@@ -141,6 +148,7 @@ impl Testkit {
             default_gas: vos_wire::defaults::HANDLER_GAS,
             max_gas: vos_wire::defaults::MAX_HANDLER_GAS,
             budget: u64::MAX,
+            uncovered: false,
             instances: BTreeMap::new(),
             members: BTreeMap::new(),
             state: BTreeMap::new(),
@@ -447,6 +455,13 @@ enum Ended {
     Forbidden,
     /// A workflow paused, in this state.
     Paused(WorkflowState),
+    /// A workflow's step was preempted, before the host call it names when
+    /// it did not serve it; idle when out of gas with no call served since
+    /// it resumed.
+    Preempted {
+        pending: Option<u64>,
+        idle: bool,
+    },
 }
 
 /// One step's execution: the overlays, the call stack and the effects.
@@ -530,7 +545,7 @@ impl<'a> Run<'a> {
                 code: Failure::Forbidden,
                 detail: Vec::new(),
             },
-            Ended::Paused(_) => unreachable!("only a workflow pauses"),
+            Ended::Paused(_) | Ended::Preempted { .. } => unreachable!("only a workflow pauses"),
         })
     }
 
@@ -609,9 +624,6 @@ impl<'a> Run<'a> {
     ) -> Result<Ended, Failure> {
         let mut outcome: Option<Ended> = None;
         loop {
-            if let Some(Ended::Paused(_)) = outcome {
-                return Ok(outcome.take().expect("paused"));
-            }
             match machine.try_resume().map_err(|_| Failure::Trapped)? {
                 ExitReason::Halt => {
                     return Ok(outcome.unwrap_or(Ended::Replied(Vec::new())));
@@ -796,7 +808,9 @@ impl<'a> Run<'a> {
                     }
                     Ended::Failed(detail) => (detail, Some(Failure::Handler)),
                     Ended::Forbidden => (Vec::new(), Some(Failure::Forbidden)),
-                    Ended::Paused(_) => unreachable!("only a workflow pauses"),
+                    Ended::Paused(_) | Ended::Preempted { .. } => {
+                        unreachable!("only a workflow pauses")
+                    }
                 };
                 if failed.is_some() {
                     let (messages, attests, written) = effects;

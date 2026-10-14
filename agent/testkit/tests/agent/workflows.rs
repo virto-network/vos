@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use vos_testkit::programs::{actor, method};
 use vos_testkit::{Step as KitStep, Testkit, decode};
-use vos_wire::abi::{Failure, Kind, cap};
+use vos_wire::abi::{Failure, Kind, cap, op, price};
 use vos_wire::batch::{Admin, Answer, Await, Body, Input, Message};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, WorkflowId};
 use vos_wire::keys::{self, Due};
@@ -18,13 +18,54 @@ use vos_wire::{Encode, defaults};
 
 use crate::common::{ALICE, Actors, COUNTER, LEDGER, Node, SHOP, Sessions, ran};
 
+mod preemption;
+
 /// The shop's workflows, each its own program.
-const FLOWS: [&str; 13] = [
-    "transfer", "saga", "compute", "nap", "fragile", "scratch", "delegate", "hog", "fill",
-    "digest", "chain", "audit", "probe",
+pub const FLOWS: [&str; 20] = [
+    "transfer",
+    "saga",
+    "compute",
+    "nap",
+    "fragile",
+    "scratch",
+    "delegate",
+    "hog",
+    "fill",
+    "digest",
+    "chain",
+    "audit",
+    "probe",
+    "grind",
+    "grind_whole",
+    "settle",
+    "relay",
+    "stuck",
+    "splurge",
+    "press",
 ];
 /// The agent the shop's workflows ask, at its counter, instance 1.
 const RISK: AgentId = AgentId(9);
+
+/// The shop's limits: `settle`'s, `relay`'s, `press`'s and `grind`'s.
+const SETTLE_LIMIT: u64 = 50_000_000;
+const RELAY_LIMIT: u64 = 5_000_000;
+const PRESS_LIMIT: u64 = 200_000;
+const GRIND_LIMIT: u64 = 20_000_000;
+
+/// `settle`'s rounds: nine tenths of its limit in reads of the time, at
+/// their price.
+fn settle_rounds() -> u32 {
+    (9 * SETTLE_LIMIT / 10 / price::OPERATION) as u32
+}
+
+/// `relay`'s arguments for `times` rounds: seven tenths of its limit in
+/// reads of the time, then an echo whose bytes alone, in and out, cost four
+/// tenths more, so each echo's await spends the share.
+fn relayed(times: u32) -> (u32, u32, u32) {
+    let rounds = (7 * RELAY_LIMIT / 10 / price::OPERATION) as u32;
+    let len = (4 * RELAY_LIMIT / 10 / (2 * price::PER_BYTE)) as u32;
+    (rounds, len, times)
+}
 
 /// A node and the model with the test actors and the shop installed, and
 /// what drives them: the client's sessions, other agents' pair sequences,
@@ -178,19 +219,30 @@ impl Flows {
         let (result, _) = split_output(&output).expect("an output");
         self.kit.batch(self.time, [0; 32]);
         self.kit.budget = self.budget;
+        // Each due step's row: as a sweep lists it, or a start's, due at
+        // once.
+        let listed: BTreeMap<WorkflowId, u64> = inputs
+            .iter()
+            .filter_map(|input| match input {
+                Input::Sweep { due } => Some(due),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|&(at, due)| match due {
+                Due::Workflow(workflow) => Some((workflow, at)),
+                Due::Session(_) => None,
+            })
+            .collect();
         let mut inputs = inputs.iter();
         for (index, step) in result.steps.iter().enumerate() {
             let expected = match step {
-                // A row the model's records do not name, the step deletes.
-                Step::Ran(
-                    run @ Run {
-                        input: InputRef::Due { workflow },
-                        ..
-                    },
-                ) => self.kit.due(*workflow).unwrap_or_else(|| {
-                    let (at, _) = keys::due_entry(&run.writes[0].key).expect("a due row");
-                    self.kit.orphan(at, *workflow)
-                }),
+                Step::Ran(Run {
+                    input: InputRef::Due { workflow },
+                    ..
+                }) => {
+                    let at = listed.get(workflow).copied().unwrap_or(self.time);
+                    self.kit.due(at, *workflow)
+                }
                 Step::Ran(_) => match inputs.next().expect("an input") {
                     Input::Request(request) => self.kit.command(
                         request.caller,
@@ -557,8 +609,8 @@ fn replies_from_others_late_or_stale_are_dropped() {
 }
 
 /// An await's deadline is batch time: the step at it answers the await
-/// `TimedOut`, and a reply after is dropped. A timer wakes its workflow in
-/// the first sweep at or past it.
+/// `TimedOut`, and a reply at or after it is dropped, before that step as
+/// after. A timer wakes its workflow in the first sweep at or past it.
 #[test]
 fn deadlines_expire_and_timers_fire_at_batch_time() {
     for backend in Node::backends() {
@@ -586,7 +638,14 @@ fn deadlines_expire_and_timers_fire_at_batch_time() {
 
         let result = flows.sweep(25_000 - 1);
         assert_eq!(result.steps.len(), 1, "the deadline is not yet");
-        let result = flows.sweep(1);
+        // A reply at the deadline, before the deadline's step: dropped, the
+        // deadline being batch time.
+        let at_deadline = flows.reply(RISK, 0, 0, Answer::Done(5u64.encode()));
+        let awaiting = flows.record(0);
+        let result = flows.batch(1, vec![at_deadline]);
+        assert!(ran(&result.steps[0]).writes.is_empty());
+        assert_eq!(flows.record(0), awaiting);
+        let result = flows.sweep(0);
         due(&result, 0);
         // The shop's `ShopError::TimedOut`.
         assert_eq!(
@@ -903,41 +962,93 @@ fn the_caps_hold() {
 type Ran = (Vec<u8>, u64, BTreeMap<Vec<u8>, Vec<u8>>);
 
 /// A scenario of workflows that await, compute and write their memory
-/// back, run on `node`, batch by batch.
+/// back, and are preempted: at the start of a block, at a call of this
+/// agent's once their share is spent, at a first effect a tight batch
+/// cannot cover, and at a page it cannot pay. Run on `node`, batch by
+/// batch.
 fn scenario(node: Node) -> Vec<Ran> {
     let mut flows = Flows::new(node);
     let mut batches = Vec::new();
-    let mut run = |flows: &mut Flows, inputs: Vec<Input>| {
+    let mut run = |flows: &mut Flows, budget: u64, inputs: Vec<Input>| {
         flows.time += 1;
-        let work = flows.node.work(flows.time, inputs);
+        let work = flows
+            .node
+            .budgeted_work(flows.time, [0; 32], budget, inputs);
         let invocation = flows.node.run_refine(&work, crate::common::OUTER_GAS);
         assert_eq!(invocation.exit, vos_pvm::ExitReason::Halt, "refine halts");
         let output = invocation.output_bounded(cap::OUTPUT).unwrap();
         flows.node.accumulate(&output);
         flows.node.version += 1;
+        let result = split_output(&output).unwrap().0;
         batches.push((output, invocation.gas_used, flows.node.state.clone()));
+        result
     };
+    let budget = defaults::REFINE_GAS;
     let starts = vec![
         flows.start("transfer", transfer(0)),
         flows.start("compute", (16_384u32, 2u32)),
         flows.start("scratch", RISK.0),
     ];
-    run(&mut flows, starts);
+    run(&mut flows, budget, starts);
     let answers = vec![
         flows.reply(RISK, 0, 0, Answer::Done(1u64.encode())),
         flows.reply(RISK, 2, 0, Answer::Done(1u64.encode())),
     ];
-    run(&mut flows, answers);
+    run(&mut flows, budget, answers);
     for _ in 0..3 {
         let sweep = flows.node.sweep(flows.time + 1);
-        run(&mut flows, vec![sweep]);
+        run(&mut flows, budget, vec![sweep]);
     }
     let answer = flows.reply(RISK, 2, 1, Answer::Done(1u64.encode()));
-    run(&mut flows, vec![answer]);
-    for workflow in 0..3 {
+    run(&mut flows, budget, vec![answer]);
+
+    // Preempted: at blocks' starts, at calls once the share is spent, at a
+    // first effect a tight batch cannot cover, and at pages one cannot pay.
+    let starts = vec![
+        flows.start("grind", (4096u32, 200u32)),
+        flows.start("relay", relayed(2)),
+    ];
+    run(&mut flows, budget, starts);
+    let start = flows.start("settle", settle_rounds());
+    run(&mut flows, SETTLE_LIMIT + SETTLE_LIMIT / 2, vec![start]);
+    let pending = flows.record(5).snapshot.unwrap().pending;
+    assert_eq!(pending, Some(op::CALL));
+    // Some 200 pages held, restored a step, and room for 25 more.
+    let start = flows.start("grind", (100_000u32, 1u32));
+    let tight = defaults::WORKFLOW_RESERVE
+        + 1100 * defaults::ARM_PAGE
+        + 200 * defaults::RESTORED_PAGE
+        + GRIND_LIMIT
+        + defaults::FINISH_RESERVE
+        + defaults::SWEEP_RESERVE
+        + 25 * defaults::WRITTEN_PAGE;
+    run(&mut flows, tight, vec![start]);
+    let (first, last) = (3, 6);
+    let limit = flows.record(last).gas;
+    assert_eq!(limit, GRIND_LIMIT);
+    let mut short = 0;
+    for _ in 0..40 {
+        if (first..=last).all(|id| matches!(flows.record(id).state, WorkflowState::Ended(_))) {
+            break;
+        }
+        let sweep = flows.node.sweep(flows.time + 1);
+        let result = run(&mut flows, tight, vec![sweep]);
+        let stepped = result.steps.iter().any(|step| {
+            matches!(step, Step::Ran(run) if run.input == InputRef::Due { workflow: WorkflowId(last) }
+                && run.gas_used < limit)
+        });
+        if stepped && matches!(flows.record(last).state, WorkflowState::Preempted(_)) {
+            short += 1;
+        }
+    }
+    assert!(short > 0, "preempted at a page it could not pay");
+    for workflow in 0..=last {
         let record = flows.record(workflow);
         let outcome = ended(&record);
-        assert!(matches!(outcome, Outcome::Done(_)), "{outcome:?}");
+        assert!(
+            matches!(outcome, Outcome::Done(_)),
+            "{workflow}: {outcome:?}"
+        );
     }
     let stored: usize = batches
         .iter()
@@ -1212,9 +1323,12 @@ fn lost_workflow_state_stops_the_refine() {
     }
 }
 
-/// The meter: a step whose pages overrun the budget waits for the next
-/// batch behind a step that ran a handler, and fails alone, out of gas.
-/// One no batch of the budget could hold fails at once, past a cap.
+/// The meter: pages a unit writes after its first effect cannot end the
+/// step there, so a step whose pages overrun the budget then waits for the
+/// next batch behind a step that ran a handler, and fails alone, out of
+/// gas; before any effect, the step ends at the first page it cannot pay,
+/// and is taken. One no batch of the budget could hold fails at once, past
+/// a cap.
 #[test]
 fn the_meter_holds_workflows_steps() {
     let out_of_gas = Outcome::Failed {
@@ -1226,23 +1340,32 @@ fn the_meter_holds_workflows_steps() {
         detail: vec![],
     };
     for backend in Node::backends() {
-        // A reply whose step writes a hundred pages, in a batch of 150M.
+        // A hundred pages after a send, in a batch of 150M.
+        let mut flows = Flows::new(Node::on(backend));
+        flows.budget = 150_000_000;
+        let increment = flows.actors.method(COUNTER, "increment");
+        let handler = flows.sessions.request(ALICE, COUNTER, increment, 1u64);
+        let start = flows.start("splurge", (RISK.0, 100 * 4096u32));
+        let result = flows.unmodelled(1, vec![handler, start]);
+        assert_eq!(result.steps.len(), 2, "the step waits behind the handler");
+        assert!(matches!(flows.record(0).state, WorkflowState::Ready(_)));
+        let sweep = flows.sweeping(1);
+        let result = flows.unmodelled(1, vec![sweep]);
+        assert_eq!(due(&result, 0).outcome, out_of_gas, "alone, it fails");
+        assert!(due(&result, 0).messages.is_empty(), "its send discarded");
+        assert_eq!(ended(&flows.record(0)), &out_of_gas);
+
+        // A hundred pages before any effect: the reply's step is taken,
+        // preempted at the first page the budget cannot pay.
         let mut flows = Flows::new(Node::on(backend));
         flows.budget = 150_000_000;
         let start = flows.start("fill", (RISK.0, vec![4096u32, 100 * 4096]));
         flows.unmodelled(1, vec![start]);
-        let increment = flows.actors.method(COUNTER, "increment");
         let handler = flows.sessions.request(ALICE, COUNTER, increment, 1u64);
         let answer = flows.reply(RISK, 0, 0, Answer::Done(1u64.encode()));
-        let result = flows.unmodelled(1, vec![handler, answer.clone()]);
-        assert_eq!(result.steps.len(), 1, "the reply waits behind the handler");
-        assert!(matches!(
-            flows.record(0).state,
-            WorkflowState::Awaiting { .. }
-        ));
-        let result = flows.unmodelled(1, vec![answer]);
-        assert_eq!(ran(&result.steps[0]).outcome, out_of_gas, "alone, it fails");
-        assert_eq!(ended(&flows.record(0)), &out_of_gas);
+        let result = flows.unmodelled(1, vec![handler, answer]);
+        assert_eq!(result.steps.len(), 2, "the reply's step is taken");
+        assert!(matches!(flows.record(0).state, WorkflowState::Preempted(_)));
 
         // A step no batch of the budget could hold fails at once.
         let mut flows = Flows::new(Node::on(backend));
@@ -1255,8 +1378,9 @@ fn the_meter_holds_workflows_steps() {
 }
 
 /// The pages a step may move, in a refine of the default budget: one that
-/// restores most of what a snapshot may hold and writes a few hundred pages
-/// more passes the budget, and fails alone, out of gas.
+/// restores most of what a snapshot may hold has room left for a few
+/// hundred written, and ends at the first it cannot pay; holding then more
+/// than a snapshot may, it fails past the cap.
 #[test]
 fn restored_and_written_pages_share_the_budget() {
     for backend in Node::backends() {
@@ -1268,11 +1392,11 @@ fn restored_and_written_pages_share_the_budget() {
         assert!((700..=cap::HELD_PAGES).contains(&held), "{held} held");
         let sweep = flows.sweeping(1);
         let result = flows.unmodelled(1, vec![sweep]);
-        let out_of_gas = Outcome::Failed {
-            code: Failure::OutOfGas,
+        let cap = Outcome::Failed {
+            code: Failure::Cap,
             detail: vec![],
         };
-        assert_eq!(due(&result, 0).outcome, out_of_gas);
+        assert_eq!(due(&result, 0).outcome, cap);
     }
 }
 
@@ -1311,4 +1435,75 @@ fn a_result_holds_at_most_its_pages() {
             WorkflowState::Sleeping { .. }
         ));
     }
+}
+
+/// A program the agent's state pins, a workflow's or an installed
+/// instance's, that a VOS node no longer holds is data the node lost: the
+/// refine stops rather than fail the step for the node's fault. A JAM
+/// node's preimages lacking it fail the workflow, `Unloadable`.
+#[test]
+fn a_lost_pinned_program_stops_the_refine() {
+    let mut flows = Flows::new(Node::new());
+    let start = flows.start("transfer", transfer(0));
+    flows.batch(1, vec![start]);
+    let answer = flows.reply(RISK, 0, 0, Answer::Done(7u64.encode()));
+    let program = flows.program("transfer");
+    let blob = flows.node.forget(&program);
+    let refined = flows.refine(1, vec![answer.clone()]);
+    let lost = vos_pvm::ExitReason::HostCall(crate::common::LOST);
+    assert_eq!(refined.exit, lost, "a workflow's program");
+    flows.node.add(&blob);
+    let counter = flows
+        .node
+        .forget(&vos_testkit::program_hash(&flows.actors.counter));
+    let increment = flows.actors.method(COUNTER, "increment");
+    let request = flows.sessions.request(ALICE, COUNTER, increment, 1u64);
+    assert_eq!(flows.refine(1, vec![request]).exit, lost, "a handler's");
+    flows.node.add(&counter);
+    flows.batch(1, vec![answer]);
+    assert_eq!(ended(&flows.record(0)), &Outcome::Done(7u64.encode()));
+
+    let mut flows = Flows::new(Node::jam(true));
+    let start = flows.start("transfer", transfer(0));
+    flows.unmodelled(1, vec![start]);
+    let program = flows.program("transfer");
+    flows.node.forget(&program);
+    let answer = flows.reply(RISK, 0, 0, Answer::Done(7u64.encode()));
+    flows.unmodelled(1, vec![answer]);
+    let unloadable = Outcome::Failed {
+        code: Failure::Unloadable,
+        detail: vec![],
+    };
+    assert_eq!(ended(&flows.record(0)), &unloadable);
+}
+
+/// A page section near its cap, of random pages: seven computations each
+/// store some 514 pages in one batch of a large budget, and the agent's
+/// heap holds the section, reserved once, its pages stored in it as they
+/// are compressed. An eighth's would pass the cap, so its step waits.
+#[test]
+fn a_page_section_near_its_cap_fits_the_heap() {
+    let mut flows = Flows::new(Node::new());
+    flows.budget = 6_000_000_000;
+    let starts = (0..8)
+        .map(|_| flows.start("compute", (262_144u32, 1u32)))
+        .collect();
+    let result = flows.unmodelled(1, starts);
+    let stored: usize = result
+        .steps
+        .iter()
+        .filter_map(|step| match step {
+            Step::Ran(run) => Some(run.pages.len()),
+            _ => None,
+        })
+        .sum();
+    let cap = cap::RESULT_PAGES / vos_wire::result::PAGE;
+    assert!(stored > 3 * cap / 4 && stored <= cap, "{stored} pages");
+    assert!(matches!(flows.record(7).state, WorkflowState::Ready(_)));
+    let sweep = flows.sweeping(1);
+    flows.unmodelled(1, vec![sweep]);
+    assert!(matches!(
+        flows.record(7).state,
+        WorkflowState::Sleeping { .. }
+    ));
 }

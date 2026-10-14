@@ -10,8 +10,8 @@ use vos_wire::jam::{AccumulateInput, Operand, RefineArgs, Transfer, WorkError};
 use vos_wire::keys::{self, Due, Transform};
 use vos_wire::records::{Snapshot, Workflow, WorkflowState};
 use vos_wire::result::{
-    self, Attest, CommittedWrite, InputRef, InstanceGas, Outcome, Outgoing, Page, ResultWriter,
-    Run, Step, WorkResult, Write,
+    self, Attest, CommittedWrite, InputRef, InstanceGas, Outcome, Outgoing, Page, PageSection,
+    ResultWriter, Run, Step, WorkResult, Write,
 };
 use vos_wire::{Decode, Encode};
 
@@ -560,6 +560,41 @@ fn kinds_reach_only_their_operations() {
     assert!(!abi::surface::workflow(op::GET));
 }
 
+/// Every operation a workflow may use is classed: an effect, which a unit
+/// makes only with the step's whole limit, or one that reads, sets
+/// registers or pauses, before which a unit may be preempted. A new
+/// operation must be classed here.
+#[test]
+fn a_workflows_operations_are_effects_or_not() {
+    let effects = [
+        op::CALL,
+        op::SEND,
+        op::REQUEST,
+        op::RESULT,
+        op::REPLY,
+        op::FAIL,
+    ];
+    let others = [
+        op::INPUT,
+        op::LOG,
+        op::NOW,
+        op::RANDOM,
+        op::SELF_ID,
+        op::SLEEP,
+    ];
+    for id in 0..0x1000u64 {
+        if !abi::allowed(Kind::Workflow, id) {
+            continue;
+        }
+        match (effects.contains(&id), others.contains(&id)) {
+            (true, false) => assert!(abi::is_effect(id), "{id:#x}"),
+            (false, true) => assert!(!abi::is_effect(id), "{id:#x}"),
+            _ => panic!("operation {id:#x} is not classed"),
+        }
+    }
+    assert!(!abi::is_effect(abi::precompile::BLAKE2B_COMPRESS));
+}
+
 #[test]
 fn result_codes_are_the_hosts() {
     use vos_pvm::refine_host::result;
@@ -771,15 +806,15 @@ fn a_result_written_step_by_step_is_the_work_result_encoding() {
         code: Refusal::Sequence,
     };
     let mut writer = ResultWriter::new(3, 4, [5; 32]);
-    assert!(writer.push(&step(1), &[]));
-    assert!(writer.push(&step(2), &[]));
+    assert!(writer.push(&step(1)));
+    assert!(writer.push(&step(2)));
     let result = WorkResult {
         version: 3,
         time: 4,
         seed: [5; 32],
         steps: vec![step(1), step(2)],
     };
-    let output = writer.finish();
+    let output = writer.finish(PageSection::new());
     assert_eq!(output, [result.encode(), 0u32.encode()].concat());
     assert_eq!(result::split_output(&output), Some((result, vec![])));
 
@@ -796,42 +831,54 @@ fn a_result_written_step_by_step_is_the_work_result_encoding() {
     };
     let big = Step::Ran(ran(Outcome::Done(vec![0; abi::cap::WORK_RESULT / 3])));
     let mut writer = ResultWriter::new(0, 0, [0; 32]);
-    assert!(writer.push(&big, &[]));
-    assert!(writer.push(&big, &[]));
-    assert!(!writer.push(&big, &[]), "a third would pass the cap");
-    let (decoded, _) = WorkResult::decode(&writer.finish()).unwrap();
+    assert!(writer.push(&big));
+    assert!(writer.push(&big));
+    assert!(!writer.push(&big), "a third would pass the cap");
+    let (decoded, _) = WorkResult::decode(&writer.finish(PageSection::new())).unwrap();
     assert_eq!(decoded.steps.len(), 2);
 
-    // Pages follow the work result proper, in the order their steps list
-    // them; past the section's cap a step waits.
-    let pages = abi::cap::RESULT_PAGES / result::PAGE / 2;
+    // Pages follow the work result proper, in the order their steps store
+    // them; past the section's cap a step's are dropped, and a dropped
+    // step's never reach the output.
+    let pages = PageSection::PAGES / 2;
     let stored: Vec<Vec<u8>> = (0..pages).map(|page| vec![page as u8; 3]).collect();
+    let mut section = PageSection::new();
+    let store = |section: &mut PageSection, pages: &[Vec<u8>]| {
+        pages.iter().all(|page| {
+            let range = section.store(8, |out| {
+                out[..page.len()].copy_from_slice(page);
+                page.len()
+            });
+            range.is_some_and(|range| section.page(range) == page.as_slice())
+        })
+    };
+    assert!(store(&mut section, &stored) && section.take());
+    assert!(store(&mut section, &[vec![9; 5]]));
+    section.drop_running();
+    assert!(store(&mut section, &stored) && section.take());
+    assert!(!store(&mut section, &stored[..1]), "a page past the cap");
+    assert!(!section.take());
+    assert!(section.take(), "with nothing running");
     let small = Step::Ran(ran(Outcome::Done(vec![])));
     let mut writer = ResultWriter::new(0, 0, [0; 32]);
-    assert!(writer.push(&small, &stored));
-    assert!(writer.push(&small, &stored));
-    assert!(!writer.push(&small, &stored[..1]), "a page past the cap");
-    assert!(writer.push(&small, &[]));
-    let (result, section) = result::split_output(&writer.finish()).unwrap();
-    assert_eq!(result.steps.len(), 3);
-    assert_eq!(section, [stored.clone(), stored].concat());
+    assert!(writer.push(&small));
+    let (result, pages) = result::split_output(&writer.finish(section)).unwrap();
+    assert_eq!(result.steps.len(), 1);
+    assert_eq!(pages, [stored.clone(), stored].concat());
 }
 
 /// A step at every cap, with as many writes (committed ones, the larger)
-/// and instances as its gas pays for, and a request's reply, stays within
-/// `STEP_RESULT`.
-#[test]
-fn the_largest_step_fits_its_bound() {
+/// and instances as `gas` pays for, and a request's reply.
+fn largest_step(gas: u64) -> Step {
     use abi::cap;
-    use vos_wire::defaults::MAX_HANDLER_GAS;
     let largest_await = Await {
         workflow: WorkflowId(u64::MAX),
         counter: u64::MAX,
     };
-    let writes = (MAX_HANDLER_GAS / abi::price::PUT) as usize;
+    let writes = (gas / abi::price::PUT) as usize;
     let mut write_bytes = vec![0usize; writes];
     write_bytes[0] = cap::STEP_WRITES - writes;
-    let step = Step::Ran(Run {
+    Step::Ran(Run {
         input: InputRef::Request {
             session: SessionRef::New(Box::new(Session {
                 key: [u8::MAX; 32],
@@ -841,7 +888,7 @@ fn the_largest_step_fits_its_bound() {
             sequence: u64::MAX,
         },
         outcome: Outcome::Done(vec![0; cap::REPLY]),
-        instances: (0..=MAX_HANDLER_GAS / abi::price::MACHINE)
+        instances: (0..=gas / abi::price::MACHINE)
             .map(|instance| InstanceGas {
                 instance: InstanceId(instance as u32),
                 gas: 0,
@@ -890,12 +937,31 @@ fn the_largest_step_fits_its_bound() {
             .collect(),
         pages: vec![],
         gas_used: u64::MAX,
-    });
-    assert!(step.encode().len() <= cap::STEP_RESULT);
+    })
+}
 
-    // A workflow's step: its record, holding its arguments and a hash for
-    // every page it may hold, its rows, and an entry for each page it drops
-    // or stores, in place of a handler's attests.
+/// The largest step of a handler stays within `STEP_RESULT`; a workflow's,
+/// whose calls may use its limit twice, with its record and rows, within
+/// `WORKFLOW_STEP_RESULT`.
+#[test]
+fn the_largest_step_fits_its_bound() {
+    use abi::cap;
+    use vos_wire::defaults::MAX_HANDLER_GAS;
+    let largest_await = Await {
+        workflow: WorkflowId(u64::MAX),
+        counter: u64::MAX,
+    };
+    assert!(largest_step(MAX_HANDLER_GAS).encode().len() <= cap::STEP_RESULT);
+
+    // A workflow's step: its calls' effects, its record, holding its
+    // largest input, a preempted one's answer, and a hash for every page it
+    // may hold, its rows, and an entry for each page it drops or stores.
+    let effects = largest_step(2 * MAX_HANDLER_GAS).encode().len();
+    let largest_answer = Answer::Failed {
+        code: Failure::Handler,
+        detail: vec![0; cap::REPLY],
+    };
+    assert!(largest_answer.encode().len() > cap::REQUEST);
     let workflow = WorkflowId(u64::MAX);
     let record = Workflow {
         format: u8::MAX,
@@ -907,14 +973,14 @@ fn the_largest_step_fits_its_bound() {
         awaits: u64::MAX,
         due: u64::MAX,
         waiter: Some(largest_await),
-        state: WorkflowState::Ready(vec![0; cap::REQUEST]),
+        state: WorkflowState::Preempted(largest_answer.encode()),
         snapshot: Some(Snapshot {
             counter: u32::MAX,
             registers: vec![u64::MAX; 13],
-            gas: u64::MAX,
             pages: (0..cap::HELD_PAGES as u32)
                 .map(|page| (page, [0; 32]))
                 .collect(),
+            pending: Some(u64::MAX),
         }),
     };
     let rows = [
@@ -942,6 +1008,7 @@ fn the_largest_step_fits_its_bound() {
         .collect();
     let rows_bytes = writes.encode().len() + pages.encode().len();
     assert!(rows_bytes <= cap::WORKFLOW_ROWS, "{rows_bytes}");
+    assert!(effects + rows_bytes <= cap::WORKFLOW_STEP_RESULT);
 }
 
 /// Every value falls in a bucket that holds it, and the buckets run in
@@ -1539,8 +1606,8 @@ fn workflows_keep_their_bytes() {
         snapshot: Some(Snapshot {
             counter: 9,
             registers: vec![10],
-            gas: 11,
             pages: vec![(12, [13; 32])],
+            pending: Some(11),
         }),
     };
     let bytes = [
@@ -1560,16 +1627,21 @@ fn workflows_keep_their_bytes() {
         &9u32.to_le_bytes(),
         &1u32.to_le_bytes(),
         &10u64.to_le_bytes(),
-        &11u64.to_le_bytes(),
         &1u32.to_le_bytes(),
         &12u32.to_le_bytes(),
         &[13; 32],
+        &[1],
+        &11u64.to_le_bytes(),
     ]
     .concat();
     assert_eq!(record.encode(), bytes);
     round_trip(&record);
     let ended = WorkflowState::Ended(Outcome::Started(WorkflowId(1)));
     round_trip(&ended);
+    assert_eq!(
+        WorkflowState::Preempted(vec![14]).encode(),
+        [4, 1, 0, 0, 0, 14]
+    );
 }
 
 /// Every frame between nodes starts with its variant's index, the indexes

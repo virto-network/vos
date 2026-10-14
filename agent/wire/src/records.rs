@@ -61,7 +61,9 @@ pub struct Workflow {
     pub instance: InstanceId,
     /// Who started it, a client's key or an agent: who reads its result.
     pub owner: Principal,
-    /// Each step's gas limit.
+    /// Each step's limit: what its effect-free code may spend in all, and
+    /// what each unit may spend from its first effect to its next await. A
+    /// step's `gas_used` may so pass it, to about twice it.
     pub gas: u64,
     /// The pages its program may write, which each step arms.
     pub writable: u32,
@@ -79,8 +81,10 @@ pub struct Workflow {
 }
 
 impl Workflow {
-    /// The record's format.
-    pub const FORMAT: u8 = 1;
+    /// The record's format. The agent reads no other: a record of another
+    /// format is data it lost, which halts the node that reads it, so a
+    /// new format needs the records migrated before any replica runs it.
+    pub const FORMAT: u8 = 2;
 }
 
 /// Where a workflow stands between its steps.
@@ -103,20 +107,28 @@ pub enum WorkflowState {
     /// collects it.
     #[codec(index = 3)]
     Ended(Outcome),
+    /// Due at once: preempted between two awaits, its last await's input
+    /// still the one `INPUT` gives it.
+    #[codec(index = 4)]
+    Preempted(Vec<u8>),
 }
 
 /// A workflow's machine between steps, restored with Gray Paper calls
-/// alone: its program counter, its registers, the gas its next step starts
-/// with, and each page that differs from its base, the program's image or
-/// zeros, by its index and the hash of its bytes, which a row holds. The
-/// gas is the step's limit until preemption leaves a step part of it.
+/// alone: its program counter, its registers, and each page that differs
+/// from its base, the program's image or zeros, by its index and the hash
+/// of its bytes, which a row holds.
+///
+/// The gas is the agent's to set, so none is kept: every step starts a
+/// unit, given the step's limit. A step preempted at a host call it did not
+/// serve keeps the call's id, `pending`, which the next step serves first,
+/// the counter past the call and the registers as the call left them.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Snapshot {
     pub counter: u32,
     /// φ0 to φ12.
     pub registers: Vec<u64>,
-    pub gas: u64,
     pub pages: Vec<(u32, [u8; 32])>,
+    pub pending: Option<u64>,
 }
 
 /// A session's mark, under [`crate::keys::session`]: the last sequence

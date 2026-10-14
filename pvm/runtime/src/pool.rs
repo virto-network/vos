@@ -774,8 +774,35 @@ mod tests {
             9 | (12 << 4),
             Opcode::Trap as u8,
         ];
+        standard(code, &[0, 2, 4, 7, 9, 11])
+    }
+
+    /// A standard program whose code counts φ2 up to 100, storing it at φ8
+    /// each round, then traps: a loop whose body is a block of its own,
+    /// after the fallthrough at 0.
+    fn counting() -> Vec<u8> {
+        let code = vec![
+            Opcode::Fallthrough as u8,
+            Opcode::AddImm64 as u8,
+            2 | (2 << 4),
+            1,
+            Opcode::StoreIndU64 as u8,
+            2 | (8 << 4),
+            Opcode::BranchNeImm as u8,
+            2 | (1 << 4),
+            100,
+            // Back to the body at 1, from 6.
+            (-5i8) as u8,
+            Opcode::Trap as u8,
+        ];
+        standard(code, &[0, 1, 4, 6, 10])
+    }
+
+    /// A standard program of `code`, its instructions starting at
+    /// `starts`, with [`program`]'s regions.
+    fn standard(code: Vec<u8>, starts: &[usize]) -> Vec<u8> {
         let mut bitmask = vec![0; code.len()];
-        for start in [0, 2, 4, 7, 9, 11] {
+        for &start in starts {
             bitmask[start] = 1;
         }
         let code = vos_pvm_program::build_compact_code_blob(&CodeBlob {
@@ -1214,6 +1241,147 @@ mod tests {
                 "{backend:?}: a machine returned to the pool starts at 0"
             );
         }
+    }
+
+    /// A machine out of gas at the start of a block, restored at the
+    /// counter `expunge` gives with the page it wrote, pooled or loaded:
+    /// the block it stopped at is charged once, on resume, so it ends as
+    /// the machine that never stopped, with the same gas in all, on both
+    /// backends.
+    #[test]
+    fn instantiate_at_an_out_of_gas_counter_resumes_a_starved_machine() {
+        let blob = counting();
+        let pool = Arc::new(MachinePool::new());
+        let program = pool.program(&pool.install(&blob).unwrap()).unwrap();
+        let page = 3 * ZONE + 2 * 4096;
+        let start = |gas| {
+            let mut registers = [0; PVM_REGISTER_COUNT];
+            registers[8] = u64::from(page);
+            InvokeState { gas, registers }
+        };
+        const GAS: Gas = 1_000_000;
+        let mut observed = Vec::new();
+        for backend in backends() {
+            let mut stops = Vec::new();
+            let mut machines = InnerMachines::with_backend(backend);
+            machines.set_pool(Arc::clone(&pool));
+            let id = machines.instantiate(&program, 0).unwrap();
+            let straight = machines.invoke(id, start(GAS)).unwrap();
+            assert_eq!(straight.exit, InnerExit::Panic, "{backend:?}");
+            assert_eq!(straight.state.registers[2], 100, "{backend:?}");
+            let used = GAS - straight.state.gas;
+            let stored = machines.peek(id, page, 4096).unwrap();
+            machines.expunge(id).unwrap();
+            for starve in [1, used / 3, used / 2 + 7, used - 1] {
+                let id = machines.instantiate(&program, 0).unwrap();
+                let starved = machines.invoke(id, start(starve)).unwrap();
+                assert_eq!(starved.exit, InnerExit::OutOfGas, "{backend:?}, {starve}");
+                assert!(starved.state.gas <= starve, "{backend:?}: not wrapped");
+                let rounds = starved.state.registers[2];
+                let bytes = machines.peek(id, page, 4096).unwrap();
+                let pc = machines.expunge(id).unwrap();
+                // A block's start: the entry, the loop's body or the trap.
+                assert!([0, 1, 10].contains(&pc), "{backend:?}, {starve}: at {pc}");
+                let pooled = machines.instantiate(&program, pc).unwrap();
+                let (mut loader, loaded) = loaded_at(&blob, backend, pc);
+                for (machines, id) in [(&mut machines, pooled), (&mut loader, loaded)] {
+                    machines.poke(id, page, &bytes).unwrap();
+                    let state = InvokeState {
+                        gas: GAS,
+                        registers: starved.state.registers,
+                    };
+                    let resumed = machines.invoke(id, state).unwrap();
+                    assert_eq!(resumed.exit, InnerExit::Panic, "{backend:?}");
+                    assert_eq!(resumed.state.registers, straight.state.registers);
+                    assert_eq!(machines.peek(id, page, 4096).unwrap(), stored);
+                    assert_eq!(
+                        (starve - starved.state.gas) + (GAS - resumed.state.gas),
+                        used,
+                        "{backend:?}, {starve}: the block it stopped at, charged once"
+                    );
+                    machines.expunge(id).unwrap();
+                }
+                stops.push((starve, rounds, starved.state.gas, pc));
+            }
+            println!("{backend:?}: {used} gas straight; starved at {stops:?}");
+            observed.push(stops);
+        }
+        // Both backends stop at the same block, with the same gas left.
+        assert!(observed.windows(2).all(|pair| pair[0] == pair[1]));
+    }
+
+    /// A machine stopped by a fault at a store, restored at the counter
+    /// `expunge` gives, the faulting store's, with its page made writable,
+    /// pooled or loaded: it re-enters the store's block and is charged that
+    /// block again, so it ends as the machine that never stopped, one
+    /// block's gas the dearer, on both backends.
+    #[test]
+    fn instantiate_at_a_faulting_store_charges_its_block_again() {
+        let blob = counting();
+        let pool = Arc::new(MachinePool::new());
+        let program = pool.program(&pool.install(&blob).unwrap()).unwrap();
+        let page = 3 * ZONE + 2 * 4096;
+        let start = |gas| {
+            let mut registers = [0; PVM_REGISTER_COUNT];
+            registers[8] = u64::from(page);
+            InvokeState { gas, registers }
+        };
+        const GAS: Gas = 1_000_000;
+        let mut observed = Vec::new();
+        for backend in backends() {
+            let mut machines = InnerMachines::with_backend(backend);
+            machines.set_pool(Arc::clone(&pool));
+            let run = |machines: &mut InnerMachines, gas| {
+                let id = machines.instantiate(&program, 0).unwrap();
+                let outcome = machines.invoke(id, start(gas)).unwrap();
+                (id, outcome)
+            };
+            let (id, straight) = run(&mut machines, GAS);
+            let used = GAS - straight.state.gas;
+            let stored = machines.peek(id, page, 4096).unwrap();
+            machines.expunge(id).unwrap();
+            // The loop's body costs what two starved runs differ by a round.
+            let starved: Vec<(Gas, u64)> = [used / 3, used / 2]
+                .into_iter()
+                .map(|gas| {
+                    let (id, outcome) = run(&mut machines, gas);
+                    assert_eq!(machines.expunge(id), Ok(1), "{backend:?}");
+                    (gas - outcome.state.gas, outcome.state.registers[2])
+                })
+                .collect();
+            let body = (starved[1].0 - starved[0].0) / (starved[1].1 - starved[0].1);
+
+            let id = machines.instantiate(&program, 0).unwrap();
+            machines
+                .pages(id, page / 4096, 1, PageMode::SetReadOnly)
+                .unwrap();
+            let fault = machines.invoke(id, start(GAS)).unwrap();
+            assert_eq!(fault.exit, InnerExit::Fault(page), "{backend:?}");
+            assert_eq!(fault.state.registers[2], 1, "{backend:?}: before the store");
+            let pc = machines.expunge(id).unwrap();
+            assert_eq!(pc, 4, "{backend:?}: the store's counter");
+            let pooled = machines.instantiate(&program, pc).unwrap();
+            let (mut loader, loaded) = loaded_at(&blob, backend, pc);
+            for (machines, id) in [(&mut machines, pooled), (&mut loader, loaded)] {
+                let state = InvokeState {
+                    gas: GAS,
+                    registers: fault.state.registers,
+                };
+                let resumed = machines.invoke(id, state).unwrap();
+                assert_eq!(resumed.exit, InnerExit::Panic, "{backend:?}");
+                assert_eq!(resumed.state.registers, straight.state.registers);
+                assert_eq!(machines.peek(id, page, 4096).unwrap(), stored);
+                assert_eq!(
+                    (GAS - fault.state.gas) + (GAS - resumed.state.gas),
+                    used + body,
+                    "{backend:?}: the store's block, charged again"
+                );
+                machines.expunge(id).unwrap();
+            }
+            println!("{backend:?}: {used} gas straight, the body {body}");
+            observed.push((used, body, fault.state.gas));
+        }
+        assert!(observed.windows(2).all(|pair| pair[0] == pair[1]));
     }
 
     #[test]

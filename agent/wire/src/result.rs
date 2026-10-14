@@ -33,8 +33,6 @@ pub struct ResultWriter {
     bytes: Vec<u8>,
     count: u32,
     count_at: usize,
-    pages: Vec<u8>,
-    stored: u32,
 }
 
 impl ResultWriter {
@@ -49,8 +47,6 @@ impl ResultWriter {
             bytes,
             count: 0,
             count_at,
-            pages: Vec::new(),
-            stored: 0,
         }
     }
 
@@ -59,14 +55,9 @@ impl ResultWriter {
         self.count
     }
 
-    /// Add `step`, with the LZ4 bytes of the pages it stores, if the
-    /// result stays within [`cap::WORK_RESULT`] and its pages within
-    /// [`cap::RESULT_PAGES`]; false, with nothing added, if it would not.
-    pub fn push(&mut self, step: &Step, pages: &[Vec<u8>]) -> bool {
-        let stored = self.stored as usize + pages.len();
-        if stored * PAGE > cap::RESULT_PAGES {
-            return false;
-        }
+    /// Add `step` if the result stays within [`cap::WORK_RESULT`]; false,
+    /// with nothing added, if it would not.
+    pub fn push(&mut self, step: &Step) -> bool {
         let before = self.bytes.len();
         step.encode_to(&mut self.bytes);
         if self.bytes.len() > cap::WORK_RESULT {
@@ -74,18 +65,103 @@ impl ResultWriter {
             return false;
         }
         self.count += 1;
-        for page in pages {
-            page.encode_to(&mut self.pages);
-        }
-        self.stored = stored as u32;
         true
     }
 
-    pub fn finish(mut self) -> Vec<u8> {
+    /// The output: the work result, then the pages `section` took.
+    pub fn finish(mut self, section: PageSection) -> Vec<u8> {
         self.bytes[self.count_at..self.count_at + 4].copy_from_slice(&self.count.to_le_bytes());
-        self.stored.encode_to(&mut self.bytes);
-        self.bytes.extend_from_slice(&self.pages);
+        let pages = &section.bytes[..section.taken];
+        self.bytes.reserve_exact(4 + pages.len());
+        section.pages.encode_to(&mut self.bytes);
+        self.bytes.extend_from_slice(pages);
         self.bytes
+    }
+}
+
+/// A refine's page section as its steps fill it: each page a step stores,
+/// framed as an item of `Vec<Vec<u8>>`, in one buffer reserved, at the
+/// first, for the most pages a result holds ([`cap::RESULT_PAGES`]), so it
+/// never grows or copies. The running step's pages lie past those taken,
+/// until the batch takes the step or drops them.
+#[derive(Default)]
+pub struct PageSection {
+    bytes: Vec<u8>,
+    /// The bytes and the pages taken.
+    taken: usize,
+    pages: u32,
+    /// The running step's pages, and whether one would pass the cap.
+    running: u32,
+    full: bool,
+}
+
+impl PageSection {
+    /// The most pages a section holds.
+    pub const PAGES: usize = cap::RESULT_PAGES / PAGE;
+
+    pub const fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            taken: 0,
+            pages: 0,
+            running: 0,
+            full: false,
+        }
+    }
+
+    /// Store a page of the running step: `write` puts its bytes, at most
+    /// `max`, at the start of the slice it is given and returns how many.
+    /// Where they lie, or `None` when the section would pass its cap, which
+    /// keeps the step from being taken.
+    pub fn store(
+        &mut self,
+        max: usize,
+        write: impl FnOnce(&mut [u8]) -> usize,
+    ) -> Option<core::ops::Range<usize>> {
+        if self.full || (self.pages + self.running) as usize >= Self::PAGES {
+            self.full = true;
+            return None;
+        }
+        if self.bytes.capacity() == 0 {
+            self.bytes.reserve_exact(Self::PAGES * (4 + max));
+        }
+        let at = self.bytes.len();
+        self.bytes.resize(at + 4 + max, 0);
+        let len = write(&mut self.bytes[at + 4..]).min(max);
+        self.bytes[at..at + 4].copy_from_slice(&(len as u32).to_le_bytes());
+        self.bytes.truncate(at + 4 + len);
+        self.running += 1;
+        Some(at + 4..at + 4 + len)
+    }
+
+    /// Whether the running step's pages all fit.
+    pub fn fits(&self) -> bool {
+        !self.full
+    }
+
+    /// Take the running step's pages: false, with them dropped, when one
+    /// would have passed the cap.
+    pub fn take(&mut self) -> bool {
+        if self.full {
+            self.drop_running();
+            return false;
+        }
+        self.taken = self.bytes.len();
+        self.pages += self.running;
+        self.running = 0;
+        true
+    }
+
+    /// Drop the running step's pages.
+    pub fn drop_running(&mut self) {
+        self.bytes.truncate(self.taken);
+        self.running = 0;
+        self.full = false;
+    }
+
+    /// The bytes of a page stored at `range`.
+    pub fn page(&self, range: core::ops::Range<usize>) -> &[u8] {
+        &self.bytes[range]
     }
 }
 
@@ -148,6 +224,9 @@ pub struct Run {
     /// from its writes: each stored page's bytes are in the output's page
     /// section ([`ResultWriter`]).
     pub pages: Vec<Page>,
+    /// The gas the step's own machine used, its nested calls' included: a
+    /// handler's at most its limit, a workflow's at most its limit for its
+    /// effect-free code and its limit again from a unit's first effect.
     pub gas_used: u64,
 }
 

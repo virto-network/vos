@@ -15,19 +15,22 @@
 //! sit on: each holds a page's buffer.
 
 use alloc::vec::Vec;
+use core::cell::RefCell;
+use core::ops::Range;
 
 use vos_pvm_program::StandardHeader;
 use vos_wire::abi::{Failure, cap};
 use vos_wire::ids::{ProgramHash, WorkflowId};
-use vos_wire::keys;
 use vos_wire::records::Workflow;
-use vos_wire::result::{PAGE, Page};
+use vos_wire::result::{PAGE, Page, PageSection};
 
 use super::Base;
 use crate::host::{historical_lookup_from, lost};
 use crate::machines::{self, Machine, Unavailable};
 
 const PAGE_BYTES: u64 = PAGE as u64;
+/// The most bytes a page takes, LZ4-compressed.
+const MAX_STORED: usize = lz4_flex::block::get_maximum_output_size(PAGE);
 
 /// A page's hash, as a snapshot names it: BLAKE2b-256 of its bytes.
 fn hash(page: &[u8; PAGE]) -> [u8; 32] {
@@ -36,9 +39,9 @@ fn hash(page: &[u8; PAGE]) -> [u8; 32] {
 
 /// Workflow `id`'s machine for its next step: at its program's start for
 /// its first, else at its snapshot's counter with its pages and registers.
-/// Then its writable pages are armed, so the step's writes are tracked,
-/// and its gas set. A page row gone or not matching its hash is data the
-/// agent lost: the refine stops ([`lost`]).
+/// Then its writable pages are armed, so the step's writes are tracked. A
+/// page row gone or not matching its hash is data the agent lost: the
+/// refine stops ([`lost`]).
 #[inline(never)]
 pub(super) fn restore(
     base: &Base,
@@ -46,23 +49,25 @@ pub(super) fn restore(
     workflow: &Workflow,
 ) -> Result<(Machine, StandardHeader), Failure> {
     let program = &workflow.program.0;
-    let header = machines::header(program).ok_or(Failure::Unloadable)?;
     let mut machine = match &workflow.snapshot {
-        None => Machine::acquire(program)?,
+        None => machines::pinned(program, 0)?,
         Some(snapshot) => {
             if snapshot.registers.len() != 13 {
                 lost("a workflow's registers");
             }
-            let mut machine = match Machine::acquire_at(program, snapshot.counter) {
+            let mut machine = match machines::pinned(program, snapshot.counter) {
                 Err(Unavailable::Counter) => lost("a workflow's counter"),
                 acquired => acquired?,
             };
             let mut page = [0u8; PAGE];
             for &(index, hash) in &snapshot.pages {
-                let Ok(Some(stored)) = base.read(&keys::page(id, index)) else {
+                let decompressed = base.page(id, index, |stored| {
+                    lz4_flex::block::decompress_into(stored, &mut page)
+                });
+                let Ok(Some(decompressed)) = decompressed else {
                     lost("a workflow's page row");
                 };
-                match lz4_flex::block::decompress_into(&stored, &mut page) {
+                match decompressed {
                     Ok(PAGE) if self::hash(&page) == hash => {}
                     _ => lost("a workflow's page"),
                 }
@@ -74,24 +79,27 @@ pub(super) fn restore(
             machine
         }
     };
+    let header = machines::header(program).ok_or(Failure::Unloadable)?;
     if !machine.track(&header) {
         return Err(Failure::Trapped);
     }
-    machine.set_gas(workflow.gas);
     Ok((machine, header))
 }
 
-/// A paused step's pages: the entries its run lists, the LZ4 bytes of those
-/// it stores, and the pages the workflow holds now.
+/// A paused step's pages: the entries its run lists, where in the section
+/// lie the LZ4 bytes of those it stores, and the pages the workflow holds
+/// now.
 pub(super) struct Captured {
     pub(super) pages: Vec<Page>,
-    pub(super) stored: Vec<Vec<u8>>,
+    pub(super) stored: Vec<Range<usize>>,
     pub(super) held: Vec<(u32, [u8; 32])>,
 }
 
-/// The pages a paused step wrote, against those the workflow held. Past
+/// The pages a paused step wrote, against those the workflow held, each it
+/// stores compressed into `section` as the running step's. Past
 /// [`cap::STEP_PAGES`] written, or [`cap::HELD_PAGES`] held after, the step
-/// fails.
+/// fails, its pages dropped from the section; past the section's cap, the
+/// batch cannot take the step, which waits.
 #[inline(never)]
 pub(super) fn capture(
     machine: &Machine,
@@ -99,12 +107,29 @@ pub(super) fn capture(
     header: &StandardHeader,
     id: WorkflowId,
     held: &[(u32, [u8; 32])],
+    section: &RefCell<PageSection>,
+) -> Result<Captured, Failure> {
+    let captured = pages(machine, program, header, id, held, section);
+    if captured.is_err() {
+        section.borrow_mut().drop_running();
+    }
+    captured
+}
+
+fn pages(
+    machine: &Machine,
+    program: &ProgramHash,
+    header: &StandardHeader,
+    id: WorkflowId,
+    held: &[(u32, [u8; 32])],
+    section: &RefCell<PageSection>,
 ) -> Result<Captured, Failure> {
     let written = machine.written().expect("a workflow's machine is tracked");
     if written.len() * PAGE > cap::STEP_PAGES {
         return Err(Failure::Cap);
     }
     let image = Image::of(header).ok_or(Failure::Trapped)?;
+    let mut section = section.borrow_mut();
     let mut pages = Vec::new();
     let mut stored = Vec::new();
     let mut now = Vec::with_capacity(held.len() + written.len());
@@ -141,7 +166,11 @@ pub(super) fn capture(
                 index,
                 hash: Some(hash),
             });
-            stored.push(lz4_flex::block::compress(&bytes));
+            let compress = |out: &mut [u8]| {
+                lz4_flex::block::compress_into(&bytes, out).expect("room for a page")
+            };
+            // Past the section's cap the batch will not take the step.
+            stored.extend(section.store(MAX_STORED, compress));
         }
     }
     now.extend(before);

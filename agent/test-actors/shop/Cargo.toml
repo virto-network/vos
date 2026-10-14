@@ -98,6 +98,48 @@ path = "src/bin/probe.rs"
 test = false
 bench = false
 
+[[bin]]
+name = "grind"
+path = "src/bin/grind.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "grind_whole"
+path = "src/bin/grind_whole.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "settle"
+path = "src/bin/settle.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "relay"
+path = "src/bin/relay.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "stuck"
+path = "src/bin/stuck.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "splurge"
+path = "src/bin/splurge.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "press"
+path = "src/bin/press.rs"
+test = false
+bench = false
+
 [dependencies]
 caller = { path = "../caller" }
 counter = { path = "../counter" }

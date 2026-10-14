@@ -11,6 +11,7 @@ use alloc::collections::BTreeMap;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
+use core::ops::Range;
 
 use vos_wire::abi::{Failure, Kind, Refusal, cap, code};
 use vos_wire::batch::{Admin, Await, Batch, Body, Input, Message, Query, Work};
@@ -19,7 +20,7 @@ use vos_wire::jam::RefineArgs;
 use vos_wire::keys::Due;
 use vos_wire::records::{Installed, SessionMark, Workflow, unstored, unversioned};
 use vos_wire::result::{
-    CommittedWrite, InputRef, Outcome, Outgoing, ResultWriter, Run, Step, Write,
+    CommittedWrite, InputRef, Outcome, Outgoing, PageSection, ResultWriter, Run, Step, Write,
 };
 use vos_wire::schema::Schema;
 use vos_wire::{Decode, Encode, defaults, keys};
@@ -28,6 +29,7 @@ use crate::host::{STATE_SCAN, ecalli, gas, ptr, state_read, state_read_into, uns
 use crate::machines::Machine;
 use invocation::Invocation;
 use sessions::{ByName, Counts, Held, admit, by_name};
+use workflows::Floor;
 
 /// Applied rows fetched per `state_scan` at first; a page grows to
 /// [`cap::STORED_ROW`], room for the largest row, when a row needs it.
@@ -203,6 +205,11 @@ struct Base {
     /// Installed records read in this refine. Only admin steps change
     /// them, and they clear it.
     installed: RefCell<BTreeMap<InstanceId, Option<Rc<Installed>>>>,
+    /// The output's page section, and where in it lies each page the
+    /// steps taken stored, or that they dropped: a later step of the
+    /// workflow restores from there.
+    section: RefCell<PageSection>,
+    pages: BTreeMap<(WorkflowId, u32), Option<Range<usize>>>,
 }
 
 impl Base {
@@ -239,6 +246,22 @@ impl Base {
         Ok(installed)
     }
 
+    /// The LZ4 bytes of workflow `id`'s page `index`, given to `read`:
+    /// from the section when a step of this refine stored it, else from
+    /// applied state; `None` when a step dropped it or no row holds it.
+    fn page<T>(
+        &self,
+        id: WorkflowId,
+        index: u32,
+        read: impl FnOnce(&[u8]) -> T,
+    ) -> Result<Option<T>, Corrupt> {
+        match self.pages.get(&(id, index)) {
+            Some(Some(range)) => Ok(Some(read(self.section.borrow().page(range.clone())))),
+            Some(None) => Ok(None),
+            None => Ok(applied(&keys::page(id, index))?.map(|bytes| read(&bytes))),
+        }
+    }
+
     /// Whether a row is there, through this refine's earlier steps,
     /// whatever its value.
     fn holds(&self, key: &[u8]) -> bool {
@@ -263,13 +286,13 @@ enum Mark {
 }
 
 /// A step as the batch takes it: what the result records, the mark it
-/// advances, the LZ4 bytes of the pages it stores, and the workflows due
-/// after it, a start's or a sweep's, each with the time its row in the due
-/// index lies at.
+/// advances, where in the section lie the pages it stores, and the
+/// workflows due after it, a start's or a sweep's, each with the time its
+/// row in the due index lies at.
 struct Stepped {
     step: Step,
     mark: Option<Mark>,
-    pages: Vec<Vec<u8>>,
+    pages: Vec<Range<usize>>,
     due: Vec<(u64, WorkflowId)>,
 }
 
@@ -305,8 +328,9 @@ impl Batched {
     /// or writing a workflow's pages, waits for the next batch behind a step
     /// that ran a handler. With none before it, only inputs that run none
     /// came first, a sweep or acknowledgements, which leave it as little
-    /// room in any batch: it fails, consumed. A step the result cannot hold
-    /// waits too; one alone always fits (`cap::STEP_RESULT`).
+    /// room in any batch: it fails, consumed. A step the result or its page
+    /// section cannot hold waits too; one alone always fits
+    /// (`cap::STEP_RESULT`, a workflow's `cap::WORKFLOW_STEP_RESULT`).
     fn take(
         &mut self,
         base: &mut Base,
@@ -315,9 +339,12 @@ impl Batched {
         handler: bool,
     ) -> Option<Vec<(u64, WorkflowId)>> {
         let overrun = base.meter.overrun.replace(false);
-        if (overrun && self.handled) || !self.result.push(&stepped.step, &stepped.pages) {
+        let section = base.section.get_mut();
+        if (overrun && self.handled) || !section.fits() || !self.result.push(&stepped.step) {
+            section.drop_running();
             return None;
         }
+        section.take();
         let Step::Ran(run) = &stepped.step else {
             base.meter.left.set(base.meter.left.get() - reserve);
             return Some(stepped.due);
@@ -335,11 +362,10 @@ impl Batched {
         }
         let mut stored = stepped.pages.into_iter();
         for page in &run.pages {
-            let bytes = page
+            let range = page
                 .hash
-                .map(|_| stored.next().expect("a stored page's bytes"));
-            base.earlier
-                .insert(keys::page(page.workflow, page.index), bytes);
+                .map(|_| stored.next().expect("a stored page's place"));
+            base.pages.insert((page.workflow, page.index), range);
         }
         match stepped.mark {
             Some(Mark::Session(session, held)) => {
@@ -355,11 +381,14 @@ impl Batched {
 }
 
 /// What dispatching an input keeps of the meter while it runs: its
-/// reserve, its handler's limit, and for a reply, the workflow it resumes.
+/// reserve, its handler's limit, and for a reply, the workflow it resumes
+/// with what the meter keeps for its step; and whether its step runs a
+/// handler or a workflow.
 struct Plan {
     reserve: u64,
     limit: u64,
-    resumes: Option<Workflow>,
+    resumes: Option<(Workflow, Option<(u64, u64)>)>,
+    runs: bool,
 }
 
 /// An input's plan, its installed record or workflow read and paid above
@@ -382,6 +411,7 @@ fn plan(base: &Base, pairs: &BTreeMap<AgentId, u64>, input: &Input, handler: boo
             reserve,
             limit,
             resumes: None,
+            runs: handler,
         })
     };
     match input {
@@ -399,12 +429,15 @@ fn plan(base: &Base, pairs: &BTreeMap<AgentId, u64>, input: &Input, handler: boo
         }) if out_of_order(pairs, *from, *sequence).is_none() => {
             match workflows::resumed(base, *from, awaiting) {
                 Err(_) => None,
-                Ok(Some(workflow)) => {
-                    let (reserve, limit) = workflows::kept(base, &workflow).unwrap_or((reserve, 0));
+                Ok(Some((workflow, bytes))) => {
+                    // One that could never run fails at once, running none.
+                    let kept = workflows::kept(base, &workflow, bytes);
+                    let (reserve, limit) = kept.unwrap_or((reserve, 0));
                     Some(Plan {
                         reserve,
                         limit,
-                        resumes: Some(workflow),
+                        resumes: Some((workflow, kept)),
+                        runs: kept.is_some(),
                     })
                 }
                 Ok(None) => plain(0),
@@ -433,7 +466,14 @@ fn run_batch(agent: AgentId, batch: Batch) -> Vec<u8> {
         meter: Meter::new(batch.budget),
         earlier: BTreeMap::new(),
         installed: RefCell::new(BTreeMap::new()),
+        section: RefCell::new(PageSection::new()),
+        pages: BTreeMap::new(),
     };
+    // A sweep's due steps leave inputs beside it their floor.
+    let beside = batch
+        .inputs
+        .iter()
+        .any(|input| !matches!(input, Input::Sweep { .. }));
     let mut batched = Batched {
         sessions: BTreeMap::new(),
         pairs: BTreeMap::new(),
@@ -463,7 +503,7 @@ fn run_batch(agent: AgentId, batch: Batch) -> Vec<u8> {
         base.meter.kept.set(kept);
         let index = batched.result.count();
         let admin = matches!(input, Input::Admin(_));
-        let resumes = plan.resumes.is_some();
+        let swept = matches!(input, Input::Sweep { .. });
         // The key of a session this step creates.
         let mut creates = None;
         let stepped = match input {
@@ -505,7 +545,7 @@ fn run_batch(agent: AgentId, batch: Batch) -> Vec<u8> {
             Input::Ack { to, sequence } => Stepped::new(acknowledge(to, sequence), None),
             Input::Sweep { due } => sweep(&base, &due),
         };
-        let Some(due) = batched.take(&mut base, stepped, plan.reserve, handler || resumes) else {
+        let Some(due) = batched.take(&mut base, stepped, plan.reserve, plan.runs) else {
             break;
         };
         if let Some(key) = creates {
@@ -515,11 +555,14 @@ fn run_batch(agent: AgentId, batch: Batch) -> Vec<u8> {
             // An admin step may change installed records.
             base.installed.borrow_mut().clear();
         }
+        let mut floor = Floor::new(swept && beside);
         for (at, workflow) in due {
-            workflows::due(&mut base, &mut batched, at, workflow);
+            if !workflows::due(&mut base, &mut batched, at, workflow, &mut floor) {
+                break;
+            }
         }
     }
-    batched.result.finish()
+    batched.result.finish(base.section.into_inner())
 }
 
 /// A request's or a call's step: a handler's command, or a workflow's
@@ -591,7 +634,7 @@ fn message(
     pairs: &BTreeMap<AgentId, u64>,
     index: u32,
     message: Message,
-    resumes: Option<Workflow>,
+    resumes: Option<(Workflow, Option<(u64, u64)>)>,
 ) -> Stepped {
     let (from, sequence) = (message.from, message.sequence);
     let input = InputRef::Message { from, sequence };
@@ -613,9 +656,10 @@ fn message(
             stepped
         }
         Body::Reply { awaiting, answer } => match resumes {
-            Some(workflow) => {
+            Some((workflow, kept)) => {
+                let id = awaiting.workflow;
                 let resume = answer.encode();
-                workflows::resume_step(base, index, input, awaiting.workflow, workflow, resume)
+                workflows::resume_step(base, index, input, id, workflow, resume, kept, 0)
             }
             None => Stepped::new(Step::Ran(consumed(input, Outcome::Done(Vec::new()))), None),
         },
@@ -745,6 +789,8 @@ fn run_query(agent: AgentId, query: Query) -> Outcome {
         meter: Meter::new(u64::MAX),
         earlier: BTreeMap::new(),
         installed: RefCell::new(BTreeMap::new()),
+        section: RefCell::new(PageSection::new()),
+        pages: BTreeMap::new(),
     };
     let mut invocation = Invocation::new(&base, 0, Kind::Query);
     invocation.top(query.caller, query.instance, query.method, &query.arguments)
@@ -829,6 +875,8 @@ fn install(
     beside: Vec<(MethodId, Kind, ProgramHash)>,
     roles: Vec<(Vec<u8>, u8)>,
 ) -> Option<Installed> {
+    // The program an install names, which its operator may never have
+    // given the node, is not yet pinned: its absence fails the install.
     let machine = Machine::acquire(&program.0).ok()?;
     let header = machine.peek(SCHEMA_AT, 8)?;
     let len = u32::from_le_bytes(header[4..8].try_into().ok()?) as usize;

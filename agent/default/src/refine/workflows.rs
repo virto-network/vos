@@ -20,7 +20,7 @@ use vos_wire::records::{Snapshot, Workflow, WorkflowState};
 use vos_wire::result::{InputRef, Outcome, Outgoing, Page, Run, Step};
 use vos_wire::{Decode, Encode, defaults};
 
-use super::invocation::{Ended, Invocation, Pause};
+use super::invocation::{Ended, Invocation, Pause, Share};
 use super::snapshots::{Captured, capture, restore};
 use super::{Base, Batched, Overlay, Stepped, consumed, split_writes};
 use crate::host::lost;
@@ -38,41 +38,45 @@ fn record(base: &Base, id: WorkflowId) -> Option<Workflow> {
     }
 }
 
-/// [`record`], paid first by its length, as an installed record is: out of
-/// gas when the meter cannot pay it.
-fn paid(base: &Base, id: WorkflowId) -> Result<Option<Workflow>, Failure> {
+/// [`record`], paid first by its stored length, its format byte included,
+/// as an installed record is: with the bytes paid, which a step's keep
+/// counts ([`kept`]); out of gas when the meter cannot pay it.
+fn paid(base: &Base, id: WorkflowId) -> Result<Option<(Workflow, u64)>, Failure> {
     let key = keys::workflow(id);
     let len = match base.earlier.get(&key) {
-        Some(value) => value.as_ref().map_or(0, Vec::len),
+        Some(value) => value.as_ref().map_or(0, |value| value.len() + 1),
         None => crate::host::state_read_into(&key, &mut []).unwrap_or(0),
-    };
-    if !base.meter.take(defaults::RECORD_BYTE * len as u64) {
+    } as u64;
+    if !base.meter.take(defaults::RECORD_BYTE * len) {
         return Err(Failure::OutOfGas);
     }
-    Ok(record(base, id))
+    Ok(record(base, id).map(|workflow| (workflow, len)))
 }
 
-/// The workflow a reply from `from` resumes: the one awaiting it, at the
-/// await it names. A reply for an await that is gone, or from another
-/// agent, resumes none, and is consumed and dropped.
+/// The workflow a reply from `from` resumes, with its record's stored
+/// length: the one awaiting it, at the await it names, before its
+/// deadline. A reply for an await that is gone or past, or from another
+/// agent, resumes none, and is consumed and dropped: the deadline's step
+/// answers the await.
 pub(super) fn resumed(
     base: &Base,
     from: AgentId,
     awaiting: &Await,
-) -> Result<Option<Workflow>, Failure> {
-    Ok(paid(base, awaiting.workflow)?.filter(|workflow| {
-        matches!(workflow.state, WorkflowState::Awaiting { agent, counter, .. }
-            if agent == from && counter == awaiting.counter)
+) -> Result<Option<(Workflow, u64)>, Failure> {
+    Ok(paid(base, awaiting.workflow)?.filter(|(workflow, _)| {
+        matches!(workflow.state, WorkflowState::Awaiting { agent, counter, deadline }
+            if agent == from && counter == awaiting.counter && base.time < deadline)
     }))
 }
 
 /// What the agent keeps of the meter for a step of `workflow`, and takes
 /// for it, beside its gas limit: its own work, arming every page the
 /// program may write, and restoring every page it holds. Each page the step
-/// writes is taken as it is written ([`defaults::WRITTEN_PAGE`]). `None`
-/// when the step could never run in a batch of this budget, behind a
-/// sweep.
-pub(super) fn kept(base: &Base, workflow: &Workflow) -> Option<(u64, u64)> {
+/// writes is taken before it opens ([`defaults::WRITTEN_PAGE`]). `None`
+/// when the step could never run in a batch of this budget: behind a
+/// sweep, its record of `bytes` read, with room for a page past what a
+/// sweep's due steps leave the batch's inputs ([`Floor`]).
+pub(super) fn kept(base: &Base, workflow: &Workflow, bytes: u64) -> Option<(u64, u64)> {
     let held = workflow
         .snapshot
         .as_ref()
@@ -80,8 +84,49 @@ pub(super) fn kept(base: &Base, workflow: &Workflow) -> Option<(u64, u64)> {
     let reserve = defaults::WORKFLOW_RESERVE
         + u64::from(workflow.writable) * defaults::ARM_PAGE
         + held as u64 * defaults::RESTORED_PAGE;
-    let whole = reserve + workflow.gas + defaults::FINISH_RESERVE + defaults::SWEEP_RESERVE;
+    let whole = reserve
+        + workflow.gas
+        + defaults::FINISH_RESERVE
+        + defaults::SWEEP_RESERVE
+        + defaults::RECORD_BYTE * bytes
+        + 2 * defaults::WRITTEN_PAGE;
     (whole <= base.budget).then_some((reserve, workflow.gas))
+}
+
+/// What a sweep's due steps leave the batch's inputs, from the batch alone.
+/// With no input beside the sweep, nothing. Beside inputs, the first row's
+/// step, the head, runs whenever the batch can hold it, so the due index
+/// always moves; from it on, the meter keeps half of what the batch had
+/// past the head's own keep for the inputs, below the head's pages and
+/// every later due step. A due step that cannot run above it waits, and
+/// the sweep's rows after it with it, for the next sweep.
+pub(super) enum Floor {
+    None,
+    Head,
+    At(u64),
+}
+
+impl Floor {
+    pub(super) fn new(beside: bool) -> Self {
+        if beside { Floor::Head } else { Floor::None }
+    }
+
+    /// The floor now: none before the head's step.
+    fn now(&self) -> u64 {
+        match self {
+            Floor::At(floor) => *floor,
+            Floor::None | Floor::Head => 0,
+        }
+    }
+
+    /// The floor for a step keeping `keep`, with `left` of the meter: the
+    /// head's fixes it.
+    fn of(&mut self, left: u64, keep: u64) -> u64 {
+        if let Floor::Head = self {
+            *self = Floor::At(left.saturating_sub(keep) / 2);
+        }
+        self.now()
+    }
 }
 
 /// Whether `method` of `instance` is a workflow, which a request or a
@@ -188,7 +233,7 @@ fn started(
     let program = installed
         .bound(method, Kind::Workflow)
         .ok_or(Failure::Unknown)?;
-    let header = machines::header(&program.0).ok_or(Failure::Unloadable)?;
+    let header = machines::pinned_header(&program.0).ok_or(Failure::Unloadable)?;
     let writable = writable(&header).ok_or(Failure::Unloadable)?;
     if writable > cap::WORKFLOW_PAGES as u64 {
         return Err(Failure::Cap);
@@ -225,33 +270,49 @@ fn started(
 }
 
 /// The step of workflow `id` due in this batch by its row at `at`, run if
-/// the meter keeps what it needs: its first, a deadline's or a timer's, or
-/// its collection. One the budget cannot hold now waits, its row due
-/// still, for a later batch. A row whose workflow is gone, or whose record
-/// lies elsewhere, is deleted.
-pub(super) fn due(base: &mut Base, batched: &mut Batched, at: u64, id: WorkflowId) {
-    base.meter
-        .kept
-        .set(defaults::INPUT_RESERVE + defaults::FINISH_RESERVE);
+/// the meter keeps what it needs above the inputs' `floor`: its first, a
+/// deadline's or a timer's, a preempted step's continuation, or its
+/// collection. False when it waits, its row due still, for a later batch,
+/// as the sweep's rows after it do. A row whose workflow is gone, or whose
+/// record lies elsewhere, is deleted.
+pub(super) fn due(
+    base: &mut Base,
+    batched: &mut Batched,
+    at: u64,
+    id: WorkflowId,
+    floor: &mut Floor,
+) -> bool {
+    let quick = defaults::INPUT_RESERVE + defaults::FINISH_RESERVE;
+    base.meter.kept.set(quick + floor.now());
     if base.meter.left.get() < base.meter.kept.get() {
-        return;
+        return false;
     }
-    let Ok(workflow) = paid(base, id) else {
+    let Ok(read) = paid(base, id) else {
         base.meter.overrun.set(false);
-        return;
+        return false;
+    };
+    // Keep `keep` above the floor, or wait.
+    let keeps = |base: &Base, floor: &mut Floor, keep: u64| {
+        let floor = floor.of(base.meter.left.get(), keep);
+        (base.meter.left.get() >= keep + floor).then(|| {
+            base.meter.kept.set(keep + floor);
+            floor
+        })
     };
     let input = InputRef::Due { workflow: id };
-    let quick = |run| Stepped::new(Step::Ran(run), None);
-    let (stepped, reserve, handler) = match workflow {
-        Some(workflow) if workflow.due == at => match &workflow.state {
-            WorkflowState::Ended(_) => (
-                quick(collect(input, id, &workflow)),
-                defaults::INPUT_RESERVE,
-                false,
-            ),
+    let quick_step = |run| Stepped::new(Step::Ran(run), None);
+    let (stepped, reserve, handler) = match read {
+        Some((workflow, bytes)) if workflow.due == at => match &workflow.state {
+            WorkflowState::Ended(_) => {
+                if keeps(base, floor, quick).is_none() {
+                    return false;
+                }
+                let run = collect(input, id, &workflow);
+                (quick_step(run), defaults::INPUT_RESERVE, false)
+            }
             state => {
                 let resume = match state {
-                    WorkflowState::Ready(arguments) => arguments.clone(),
+                    WorkflowState::Ready(input) | WorkflowState::Preempted(input) => input.clone(),
                     WorkflowState::Awaiting { .. } => Answer::Failed {
                         code: Failure::TimedOut,
                         detail: Vec::new(),
@@ -259,35 +320,34 @@ pub(super) fn due(base: &mut Base, batched: &mut Batched, at: u64, id: WorkflowI
                     .encode(),
                     _ => Vec::new(),
                 };
-                let reserve = match kept(base, &workflow) {
+                let kept = kept(base, &workflow, bytes);
+                let (keep, reserve, handler) = match kept {
                     Some((reserve, limit)) => {
-                        let kept = reserve + limit + defaults::FINISH_RESERVE;
-                        if base.meter.left.get() < kept {
-                            return;
-                        }
-                        base.meter.kept.set(kept);
-                        reserve
+                        (reserve + limit + defaults::FINISH_RESERVE, reserve, true)
                     }
-                    None => defaults::INPUT_RESERVE,
+                    None => (quick, defaults::INPUT_RESERVE, false),
+                };
+                let Some(floor) = keeps(base, floor, keep) else {
+                    return false;
                 };
                 let index = batched.result.count();
-                (
-                    resume_step(base, index, input, id, workflow, resume),
-                    reserve,
-                    true,
-                )
+                let stepped = resume_step(base, index, input, id, workflow, resume, kept, floor);
+                (stepped, reserve, handler)
             }
         },
         // An orphan, or a row the record has moved from.
         _ => {
+            if keeps(base, floor, quick).is_none() {
+                return false;
+            }
             let mut run = consumed(input, Outcome::Done(Vec::new()));
             let mut rows = Overlay::new();
             unfile_due(&mut rows, id, at);
             run.writes = split_writes(rows).0;
-            (quick(run), defaults::INPUT_RESERVE, false)
+            (quick_step(run), defaults::INPUT_RESERVE, false)
         }
     };
-    batched.take(base, stepped, reserve, handler);
+    batched.take(base, stepped, reserve, handler).is_some()
 }
 
 /// An ended workflow's collection, once its result has been kept long
@@ -317,7 +377,7 @@ pub(super) fn wait(
         detail: Vec::new(),
     };
     let answer = match paid(base, id) {
-        Ok(Some(mut workflow)) if workflow.owner == Principal::Agent(from) => {
+        Ok(Some((mut workflow, _))) if workflow.owner == Principal::Agent(from) => {
             match &workflow.state {
                 WorkflowState::Ended(outcome) => Some(outcome.clone().into()),
                 _ => {
@@ -366,8 +426,10 @@ enum Left {
 }
 
 /// A step of workflow `id` resumed by `input`, with `resume` its encoded
-/// input: run, or, when it could never run in a batch of this budget,
-/// failed at once with [`Failure::Cap`].
+/// input, on what the meter `kept` for it ([`kept`]), and `floor` below it
+/// for the batch's inputs: run, or, when it could never run in a batch of
+/// this budget, failed at once with [`Failure::Cap`].
+#[allow(clippy::too_many_arguments)]
 pub(super) fn resume_step(
     base: &Base,
     index: u32,
@@ -375,11 +437,16 @@ pub(super) fn resume_step(
     id: WorkflowId,
     workflow: Workflow,
     resume: Vec<u8>,
+    kept: Option<(u64, u64)>,
+    floor: u64,
 ) -> Stepped {
-    if kept(base, &workflow).is_none() {
-        return unfit(base, input, id, workflow);
+    match kept {
+        Some((reserve, limit)) => {
+            let share = Share::new(reserve + floor, limit);
+            step(base, index, input, id, workflow, resume, share)
+        }
+        None => unfit(base, input, id, workflow),
     }
-    step(base, index, input, id, workflow, resume)
 }
 
 /// Fail a workflow whose step could never run in a batch of this budget.
@@ -396,34 +463,59 @@ fn unfit(base: &Base, input: InputRef, id: WorkflowId, mut workflow: Workflow) -
 }
 
 /// Restore workflow `id`'s machine, run it through its step with `resume`
-/// as its input, and capture it if it paused.
+/// as its input, and capture it if it paused. A machine resumed from a
+/// pause has the input's length in φ7; one preempted resumes as it was, its
+/// unserved call first.
 fn run(
     base: &Base,
     invocation: &mut Invocation,
     id: WorkflowId,
     workflow: &Workflow,
     resume: &[u8],
+    share: &mut Share,
 ) -> Left {
     let (mut machine, header) = match restore(base, id, workflow) {
         Ok(restored) => restored,
         Err(code) => return Left::Failed(code),
     };
-    machine.set_register(7, resume.len() as u64);
-    machine.set_register(8, 0);
-    let ended = invocation.workflow(&mut machine, workflow.owner, workflow.instance, resume);
+    if !matches!(workflow.state, WorkflowState::Preempted(_)) {
+        machine.set_register(7, resume.len() as u64);
+        machine.set_register(8, 0);
+    }
+    let snapshot = workflow.snapshot.as_ref();
+    let pending = snapshot.and_then(|snapshot| snapshot.pending);
+    // Where the machine resumed, against which an idle preemption is
+    // judged.
+    let resumed: Vec<u64> = (0..13).map(|index| machine.register(index)).collect();
+    let resumed_at = snapshot.map_or(0, |snapshot| snapshot.counter);
+    let (owner, instance) = (workflow.owner, workflow.instance);
+    let ended = invocation.workflow(&mut machine, owner, instance, resume, share, pending);
     match ended {
         Ok(Ended::Paused(pause)) => {
-            let held = workflow
-                .snapshot
-                .as_ref()
-                .map_or(&[][..], |snapshot| &snapshot.pages);
-            match capture(&machine, &workflow.program, &header, id, held) {
-                Ok(captured) => Left::Paused {
-                    pause,
-                    captured,
-                    registers: (0..13).map(|index| machine.register(index)).collect(),
-                    counter: machine.expunge() as u32,
-                },
+            let held = snapshot.map_or(&[][..], |snapshot| &snapshot.pages);
+            let section = &base.section;
+            match capture(&machine, &workflow.program, &header, id, held, section) {
+                Ok(captured) => {
+                    let registers: Vec<u64> =
+                        (0..13).map(|index| machine.register(index)).collect();
+                    let counter = machine.expunge() as u32;
+                    // Out of gas with nothing served or written, and its
+                    // registers and counter where they were: it could not
+                    // move.
+                    if let Pause::Preempted { idle: true, .. } = pause
+                        && registers == resumed
+                        && counter == resumed_at
+                    {
+                        section.borrow_mut().drop_running();
+                        return Left::Failed(Failure::OutOfGas);
+                    }
+                    Left::Paused {
+                        pause,
+                        captured,
+                        registers,
+                        counter,
+                    }
+                }
                 Err(code) => Left::Failed(code),
             }
         }
@@ -438,9 +530,11 @@ fn run(
 }
 
 /// A step of workflow `id`, resumed by `input` with `resume`, its encoded
-/// input: restored, run until it pauses, ends or fails, and captured.
+/// input: restored, run on its `share` until it pauses, is preempted, ends
+/// or fails, and captured.
 ///
-/// Its calls' effects, its messages and its snapshot commit together. A
+/// Its calls' effects, its messages and its snapshot commit together; a
+/// preempted step's are its earlier units', as its last unit made none. A
 /// step that traps, runs out of gas or exceeds a cap fails the workflow:
 /// its effects are discarded, its input is still consumed, and the
 /// workflow ends as failed, its pin and pages gone and its owner told. A
@@ -453,13 +547,14 @@ fn step(
     id: WorkflowId,
     mut workflow: Workflow,
     resume: Vec<u8>,
+    mut share: Share,
 ) -> Stepped {
     let mut invocation = Invocation::new(base, index, Kind::Workflow);
     invocation.awaits = Some(Await {
         workflow: id,
         counter: workflow.awaits,
     });
-    let left = run(base, &mut invocation, id, &workflow, &resume);
+    let left = run(base, &mut invocation, id, &workflow, &resume, &mut share);
     let mut run = consumed(input, Outcome::Done(Vec::new()));
     run.instances = core::mem::take(&mut invocation.instances);
     run.gas_used = invocation.gas_used;
@@ -488,13 +583,14 @@ fn step(
             if let Pause::Await { .. } = pause {
                 workflow.awaits += 1;
             }
-            move_due(&mut rows, id, &mut workflow, pause.due());
-            workflow.state = pause.state();
+            move_due(&mut rows, id, &mut workflow, pause.due(base.time));
+            let pending = pause.pending();
+            workflow.state = pause.state(&resume);
             workflow.snapshot = Some(Snapshot {
                 counter,
                 registers,
-                gas: workflow.gas,
                 pages: captured.held,
+                pending,
             });
             rows.insert(keys::workflow(id), Some(workflow.encode()));
             run.pages = captured.pages;

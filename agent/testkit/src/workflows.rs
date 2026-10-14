@@ -1,19 +1,23 @@
 //! The model's workflows: started by a request or a call, stepped by the
-//! input that resumes each, and snapshotted between steps as the default
-//! agent snapshots them: the counter after the pausing call, the registers,
-//! and each page the step wrote that differs from its base.
+//! input that resumes each, a unit at a time, and snapshotted between steps
+//! as the default agent snapshots them: the counter after the pausing call,
+//! or where the step was preempted, the registers, each page the step wrote
+//! that differs from its base, and the call it left unserved.
 //!
 //! It shares nothing with the agent's capture and restore: the written
 //! pages are the interpreter's dirty pages, and a page's base is read from
 //! the parsed program. It keeps no meter: of the budget, it knows only a
-//! step that could never run in a batch of it.
+//! step that could never run in a batch of it, and a batch a test marks as
+//! unable to cover a first effect ([`Testkit::uncovered`]); a step ended
+//! at a page the meter cannot pay it does not model.
 
 use std::collections::BTreeMap;
 
 use blake2::digest::consts::U32;
 use blake2::{Blake2b, Digest};
+use vos_pvm::ExitReason;
 use vos_pvm::refine::{Machine, MemoryModel, PreparedProgram};
-use vos_wire::abi::{Failure, Kind, cap};
+use vos_wire::abi::{self, Failure, Kind, cap, code, op, price};
 use vos_wire::batch::{Answer, Await, Body};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, WorkflowId};
 use vos_wire::keys::{self, Due};
@@ -21,7 +25,7 @@ use vos_wire::records::{Snapshot, Workflow, WorkflowState};
 use vos_wire::result::{InstanceGas, Outcome, Outgoing, PAGE, Page, Write};
 use vos_wire::{Decode, Encode, defaults};
 
-use crate::{Ended, Run, Step, Testkit, program_hash, split};
+use crate::{Ended, Run, Step, Testkit, known, precompile, program_hash, split};
 
 /// Where a machine returns to halt, and the top of its stack.
 const HALT: u64 = (1 << 32) - (1 << 16);
@@ -83,7 +87,8 @@ impl Testkit {
 
     /// Whether a step of `workflow` could run in a batch of the budget,
     /// behind a sweep: its reserve, arming its pages and restoring those it
-    /// holds, its limit and the finish.
+    /// holds, its limit and the finish, its record read, and room for a page
+    /// past what a sweep leaves the batch's inputs.
     fn fits(&self, workflow: &Workflow) -> bool {
         let held = workflow
             .snapshot
@@ -95,6 +100,8 @@ impl Testkit {
             + workflow.gas
             + defaults::FINISH_RESERVE
             + defaults::SWEEP_RESERVE
+            + defaults::RECORD_BYTE * (workflow.encode().len() as u64 + 1)
+            + 2 * defaults::WRITTEN_PAGE
             <= self.budget
     }
 
@@ -180,22 +187,22 @@ impl Testkit {
         Ok((id, rows))
     }
 
-    /// The step of workflow `id` due at the batch's time: its first, its
-    /// deadline's or timer's, or its collection once ended; `None` when it
-    /// is not due.
-    pub fn due(&mut self, id: WorkflowId) -> Option<Step> {
-        let workflow = self.workflow(id)?;
-        if workflow.due > self.time {
-            return None;
-        }
+    /// The step a row of the due index at `at` makes for workflow `id`:
+    /// its first, its deadline's or timer's, its continuation once
+    /// preempted, or its collection once ended; the row deleted when the
+    /// workflow is gone or its record lies elsewhere.
+    pub fn due(&mut self, at: u64, id: WorkflowId) -> Step {
+        let Some(workflow) = self.workflow(id).filter(|workflow| workflow.due == at) else {
+            return self.orphan(at, id);
+        };
         let resume = match &workflow.state {
             WorkflowState::Ended(_) => {
                 let mut rows = Rows::new();
                 Self::unfile_due(&mut rows, id, workflow.due);
                 rows.insert(keys::workflow(id), None);
-                return Some(self.quick(rows));
+                return self.quick(rows);
             }
-            WorkflowState::Ready(arguments) => arguments.clone(),
+            WorkflowState::Ready(input) | WorkflowState::Preempted(input) => input.clone(),
             WorkflowState::Awaiting { .. } => Answer::Failed {
                 code: Failure::TimedOut,
                 detail: Vec::new(),
@@ -203,13 +210,13 @@ impl Testkit {
             .encode(),
             WorkflowState::Sleeping { .. } => Vec::new(),
         };
-        Some(self.step(id, workflow, resume))
+        self.step(id, workflow, resume)
     }
 
     /// The step a row of the due index makes at `at` when it names a
     /// workflow that is gone, or whose record lies elsewhere: the row
     /// deleted.
-    pub fn orphan(&mut self, at: u64, id: WorkflowId) -> Step {
+    fn orphan(&mut self, at: u64, id: WorkflowId) -> Step {
         let mut rows = Rows::new();
         Self::unfile_due(&mut rows, id, at);
         self.quick(rows)
@@ -233,8 +240,8 @@ impl Testkit {
         answer: &Answer,
     ) -> Option<Step> {
         let workflow = self.workflow(awaiting.workflow).filter(|workflow| {
-            matches!(workflow.state, WorkflowState::Awaiting { agent, counter, .. }
-                if agent == from && counter == awaiting.counter)
+            matches!(workflow.state, WorkflowState::Awaiting { agent, counter, deadline }
+                if agent == from && counter == awaiting.counter && self.time < deadline)
         })?;
         Some(self.step(awaiting.workflow, workflow, answer.encode()))
     }
@@ -312,7 +319,9 @@ impl Testkit {
                 let at = match state {
                     WorkflowState::Awaiting { deadline, .. } => deadline,
                     WorkflowState::Sleeping { until } => until,
-                    _ => unreachable!("a step pauses awaiting or asleep"),
+                    // Due in the next millisecond, so its row moves.
+                    WorkflowState::Preempted(_) => self.time + 1,
+                    _ => unreachable!("a step pauses awaiting, asleep or preempted"),
                 };
                 if let WorkflowState::Awaiting { .. } = state {
                     workflow.awaits += 1;
@@ -428,21 +437,20 @@ impl Testkit {
                 );
             }
         }
-        machine.registers_mut()[7] = resume.len() as u64;
-        machine.registers_mut()[8] = 0;
+        // A machine preempted resumes as it was; one paused learns its
+        // input's length.
+        if !matches!(workflow.state, WorkflowState::Preempted(_)) {
+            machine.registers_mut()[7] = resume.len() as u64;
+            machine.registers_mut()[8] = 0;
+        }
         machine.memory_mut().take_dirty_pages();
-        let ended = run.workflow(&mut machine, workflow.owner, workflow.instance, resume)?;
-        let state = match ended {
-            Ended::Paused(state) => state,
-            Ended::Replied(result) => return Ok(Left::Ended(Outcome::Done(result))),
-            Ended::Failed(detail) => {
-                return Ok(Left::Ended(Outcome::Failed {
-                    code: Failure::Handler,
-                    detail,
-                }));
-            }
-            Ended::Forbidden => unreachable!("a workflow is never refused"),
-        };
+        let pending = workflow
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.pending);
+        let (owner, instance) = (workflow.owner, workflow.instance);
+        let resumed = *machine.registers();
+        let ended = run.workflow(&mut machine, owner, instance, resume, workflow.gas, pending)?;
         // The pages the step wrote, among those the program may write.
         let runs = [layout.rw, layout.stack]
             .map(|region| region.base / PAGE as u64..(region.base + region.size) / PAGE as u64);
@@ -453,6 +461,29 @@ impl Testkit {
             .flat_map(|range| u64::from(range.start)..u64::from(range.end))
             .filter(|page| runs.iter().any(|run| run.contains(page)))
             .collect();
+        let (state, pending) = match ended {
+            Ended::Paused(state) => (state, None),
+            Ended::Preempted { pending, idle } => {
+                // Out of gas with nothing served or written, its registers
+                // and counter where they were: it could not move.
+                if idle
+                    && written.is_empty()
+                    && machine.registers()[..] == resumed[..]
+                    && machine.interpreter().pc == counter
+                {
+                    return Err(Failure::OutOfGas);
+                }
+                (WorkflowState::Preempted(resume.to_vec()), pending)
+            }
+            Ended::Replied(result) => return Ok(Left::Ended(Outcome::Done(result))),
+            Ended::Failed(detail) => {
+                return Ok(Left::Ended(Outcome::Failed {
+                    code: Failure::Handler,
+                    detail,
+                }));
+            }
+            Ended::Forbidden => unreachable!("a workflow is never refused"),
+        };
         if written.len() * PAGE > cap::STEP_PAGES {
             return Err(Failure::Cap);
         }
@@ -505,37 +536,188 @@ impl Testkit {
         if now.len() > cap::HELD_PAGES {
             return Err(Failure::Cap);
         }
-        let pending = machine
-            .interpreter()
+        // Past the call it stopped at, or where it ran out of gas, or where
+        // it was restored when it stopped before running.
+        let interpreter = machine.interpreter();
+        let counter = interpreter
             .pending_host_call()
-            .expect("paused at a host call");
+            .map_or(interpreter.pc, |call| call.resume_pc);
         let snapshot = Snapshot {
-            counter: pending.resume_pc,
+            counter,
             registers: machine.registers().to_vec(),
-            gas: workflow.gas,
             pages: now.into_iter().collect(),
+            pending,
         };
         Ok(Left::Paused(state, pages, stored, snapshot))
     }
 }
 
+/// What a workflow's step may spend: its limit, the effect-free code's
+/// share in all and each effectful unit's own; the gas its machine has been
+/// given; whether the running unit has made an effect; and whether the
+/// machine has served a call since it resumed.
+struct Share {
+    limit: u64,
+    allotted: u64,
+    effectful: bool,
+    served: bool,
+}
+
+impl Share {
+    fn used(&self, machine: &Machine) -> u64 {
+        self.allotted - machine.gas_remaining()
+    }
+}
+
+/// Set a machine's gas.
+fn set_gas(machine: &mut Machine, gas: u64) {
+    machine.charge(machine.gas_remaining());
+    machine.credit(gas);
+}
+
+/// The step's end between two awaits, before the call `pending` when
+/// given: only effect-free, and once the machine has `moved` since it
+/// resumed; else it fails, out of gas.
+fn preempt_or_fail(
+    share: &Share,
+    moved: bool,
+    pending: Option<u64>,
+    idle: bool,
+) -> Result<Ended, Failure> {
+    if share.effectful || !moved {
+        return Err(Failure::OutOfGas);
+    }
+    Ok(Ended::Preempted { pending, idle })
+}
+
 impl Run<'_> {
     /// Run a workflow's machine, of `instance`'s workflow method, through
-    /// its step. Its own gas goes to its instance, as a handler's.
+    /// its step a unit at a time, the call `pending` first: effect-free
+    /// code on the share of `limit`, each effectful unit from its first
+    /// effect with the whole limit, a call of this agent's an await. Its own
+    /// gas goes to its instance, as a handler's.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn workflow(
         &mut self,
         machine: &mut Machine,
         owner: Principal,
         instance: InstanceId,
         input: &[u8],
+        limit: u64,
+        pending: Option<u64>,
     ) -> Result<Ended, Failure> {
-        let gas = machine.gas_remaining();
+        set_gas(machine, limit);
+        let mut share = Share {
+            limit,
+            allotted: limit,
+            effectful: false,
+            served: false,
+        };
         self.instances.push(InstanceGas { instance, gas: 0 });
         self.nested.push(0);
-        let ended = self.serve(machine, owner, instance, Kind::Workflow, input);
+        let ended = self.units(machine, owner, instance, input, &mut share, pending);
         let nested = self.nested.pop().expect("the workflow's entry");
-        self.gas_used = gas - machine.gas_remaining();
+        self.gas_used = share.used(machine);
         self.instances[0].gas += self.gas_used - nested;
         ended
+    }
+
+    fn units(
+        &mut self,
+        machine: &mut Machine,
+        owner: Principal,
+        instance: InstanceId,
+        input: &[u8],
+        share: &mut Share,
+        pending: Option<u64>,
+    ) -> Result<Ended, Failure> {
+        let mut outcome: Option<Ended> = None;
+        let mut next = pending.map(ExitReason::HostCall);
+        loop {
+            if let Some(Ended::Paused(_) | Ended::Preempted { .. }) = outcome {
+                return Ok(outcome.take().expect("paused"));
+            }
+            let exit = match next.take() {
+                Some(exit) => exit,
+                None => machine.try_resume().map_err(|_| Failure::Trapped)?,
+            };
+            match exit {
+                ExitReason::Halt => return Ok(outcome.unwrap_or(Ended::Replied(Vec::new()))),
+                // The share is spent: the gas a host leaves after an
+                // out-of-gas exit is its own.
+                ExitReason::OutOfGas => {
+                    set_gas(machine, 0);
+                    return preempt_or_fail(share, true, None, !share.served);
+                }
+                ExitReason::HostCall(id) => {
+                    self.unit_call(machine, owner, instance, input, share, id, &mut outcome)?;
+                }
+                _ => return Err(Failure::Trapped),
+            }
+        }
+    }
+
+    /// Serve host call `id` in its unit, or end the step at it unserved,
+    /// or at the await it is, setting `outcome`.
+    #[allow(clippy::too_many_arguments)]
+    fn unit_call(
+        &mut self,
+        machine: &mut Machine,
+        owner: Principal,
+        instance: InstanceId,
+        input: &[u8],
+        share: &mut Share,
+        id: u64,
+        outcome: &mut Option<Ended>,
+    ) -> Result<(), Failure> {
+        if known(id) && !abi::allowed(Kind::Workflow, id) {
+            return Err(Failure::Trapped);
+        }
+        let used = share.used(machine);
+        if abi::is_effect(id) && !share.effectful {
+            if self.kit.uncovered && used > 0 {
+                *outcome = Some(preempt_or_fail(share, true, Some(id), false)?);
+                return Ok(());
+            }
+            share.allotted = used + share.limit;
+            set_gas(machine, share.limit);
+            share.effectful = true;
+        }
+        let result = if vos_pvm::precompile::is_precompile(id) {
+            precompile(machine, id)
+        } else if !known(id) {
+            if machine.charge(price::OPERATION) {
+                machine.registers_mut()[7] = code::WHAT;
+                Ok(())
+            } else {
+                Err(Failure::OutOfGas)
+            }
+        } else if machine.charge(price::of(id)) {
+            self.operation(machine, id, owner, instance, Kind::Workflow, input, outcome)
+        } else {
+            Err(Failure::OutOfGas)
+        };
+        match result {
+            Ok(()) => share.served = true,
+            Err(Failure::OutOfGas) if !share.effectful => {
+                *outcome = Some(preempt_or_fail(share, used > 0, Some(id), false)?);
+                return Ok(());
+            }
+            Err(code) => return Err(code),
+        }
+        if id == op::CALL && outcome.is_none() {
+            share.effectful = false;
+            let used = share.used(machine);
+            if used >= share.limit {
+                *outcome = Some(Ended::Preempted {
+                    pending: None,
+                    idle: false,
+                });
+                return Ok(());
+            }
+            set_gas(machine, share.limit - used);
+            share.allotted = share.limit;
+        }
+        Ok(())
     }
 }

@@ -486,8 +486,10 @@ Why handlers run to completion:
 
 ### 8.3 Snapshots and preemption [decided: snapshots are the only continuation mechanism]
 
-- A snapshot is: program hash, program counter, registers, gas, and the page
-  table (page index → page). Pages are 4 KiB. Zero pages and pages
+- A snapshot is: program hash, program counter, registers, and the page
+  table (page index → page), with the host call a step ended at when it
+  ended before serving one. It holds no gas: every step starts a unit at
+  its workflow's limit, which the agent sets (slice 4). Pages are 4 KiB. Zero pages and pages
   unchanged from the program image are not stored.
 - On VOS, a snapshot is taken when a workflow step ends.
 - **Preemption** [proposed]. A step's atomicity never depends on gas:

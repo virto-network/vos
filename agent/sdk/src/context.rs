@@ -272,6 +272,12 @@ fn millis(within: Option<Duration>) -> u64 {
 /// at which it pauses. Every `.await` may pause: the code between two of
 /// them runs atomically, its effects committing with the snapshot taken at
 /// the next pause.
+///
+/// Code with no effect yet may pause anywhere: when the step's share of
+/// the batch's gas is spent, the workflow is snapshotted and goes on in the
+/// next batch, so a long computation needs no await. From its first effect
+/// (a call, a send, a request, a wait or the result) to its next await, the
+/// code has the workflow's whole gas limit, and never pauses.
 pub struct Workflow<A> {
     _actor: PhantomData<fn() -> A>,
 }
@@ -306,7 +312,8 @@ impl<A> Workflow<A> {
     }
 
     /// Call any handler of an instance of this agent, as the workflow's
-    /// instance. The callee runs nested and completes before this returns.
+    /// instance. The callee runs nested and completes before this returns;
+    /// the step may pause here once its share of the batch's gas is spent.
     pub async fn call<M: Method>(
         &mut self,
         to: Ref<M::Actor>,

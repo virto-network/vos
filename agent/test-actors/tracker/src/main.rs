@@ -102,7 +102,8 @@ fn run(probe: Probe) -> Report {
     machine.set_gas(probe.gas);
     let mut served = 0;
     let (status, detail) = loop {
-        match machine.invoke() {
+        // Every page the machine first writes is paid.
+        match machine.invoke_paying(&mut || true) {
             Exit::Host(id) if precompile::price(id).is_some() => match machine.precompile(id) {
                 Ok(()) => served += 1,
                 Err(_) => break (1, 0),

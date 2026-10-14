@@ -17,9 +17,27 @@ use crate::common::{ALICE, Cluster, compacting, log_start, replaced, retired, wa
 
 const SHOP: InstanceId = InstanceId(4);
 /// The shop's workflows, each its own program.
-const FLOWS: [&str; 13] = [
-    "transfer", "saga", "compute", "nap", "fragile", "scratch", "delegate", "hog", "fill",
-    "digest", "chain", "audit", "probe",
+const FLOWS: [&str; 20] = [
+    "transfer",
+    "saga",
+    "compute",
+    "nap",
+    "fragile",
+    "scratch",
+    "delegate",
+    "hog",
+    "fill",
+    "digest",
+    "chain",
+    "audit",
+    "probe",
+    "grind",
+    "grind_whole",
+    "settle",
+    "relay",
+    "stuck",
+    "splurge",
+    "press",
 ];
 
 /// The shop's program and those of the workflows a test binds, by name.
@@ -137,6 +155,40 @@ fn a_workflows_snapshots_ride_the_result_blob_path() {
         large >= 1,
         "a result with the first pause's pages is a blob"
     );
+}
+
+/// A long computation with no await, preempted step after step: its
+/// leader stops in the middle of it, and a new leader resumes it from its
+/// committed snapshot, the due index bringing its next step, until it ends
+/// on every running replica with the result the same computation has under
+/// a limit five times its own.
+#[test]
+fn a_preempted_computation_resumes_on_a_new_leader() {
+    let mut cluster = Cluster::new(3);
+    let shop = Shop::load();
+    let agent = cluster.counter_agent(&[1, 2, 3]);
+    shop.install(&cluster, agent, &[]);
+    let arguments = (4096u32, 5000u32);
+    let whole = shop.start(&cluster, agent, 1, "grind_whole", arguments);
+    let expected = ended(&cluster, agent, whole);
+    assert!(matches!(expected, Outcome::Done(_)), "{expected:?}");
+
+    let workflow = shop.start(&cluster, agent, 2, "grind", arguments);
+    let leader = cluster.leader(agent);
+    wait_until("the leader preempts the computation", || {
+        let state = record(cluster.node(leader), agent, workflow).map(|record| record.state);
+        matches!(state, Some(WorkflowState::Preempted(_)))
+    });
+    cluster.stop(leader);
+    let preempted = cluster
+        .running()
+        .filter_map(|(_, node)| record(node, agent, workflow))
+        .all(|record| !matches!(record.state, WorkflowState::Ended(_)));
+    assert!(preempted, "unfinished when its leader stopped");
+    let next = cluster.leader(agent);
+    assert_ne!(next, leader);
+    assert_eq!(ended(&cluster, agent, workflow), expected);
+    cluster.converged(agent);
 }
 
 /// A workflow awaits another agent's counter twice, each reply resuming

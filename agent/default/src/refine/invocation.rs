@@ -2,6 +2,10 @@
 //! against the step's overlays, with its nested calls, and every operation
 //! of the actor ABI served.
 
+mod units;
+
+pub(super) use units::Share;
+
 use alloc::collections::BTreeMap;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
@@ -15,10 +19,12 @@ use vos_wire::result::{Attest, InstanceGas, Outcome, Outgoing};
 use vos_wire::{Encode, defaults, keys};
 
 use super::{Base, Corrupt, Meter, Overlay, applied_rows, has_own_program};
-use crate::machines::{ARGUMENTS, Exit, Machine};
+use crate::machines::{self, ARGUMENTS, Exit, Machine};
 
 /// Machines a step may hold at once: a handler and its nested callees, or
-/// a workflow's and its callees.
+/// a workflow's and its callees. A host's own limit is the same on VOS, so
+/// either refuses the 64th; an attest at the deepest level needs a 64th,
+/// which the host refuses, as `Depth`.
 const MAX_DEPTH: usize = 63;
 
 /// How an invocation ended, short of failing the whole step.
@@ -31,7 +37,11 @@ pub(super) enum Ended {
 }
 
 /// Where a workflow's step paused: awaiting another agent's answer to
-/// await `counter` until a deadline, or asleep until a time.
+/// await `counter` until a deadline, asleep until a time, or preempted
+/// between two awaits, before the host call `pending` when it was not
+/// served. A step preempted out of gas `idle`, having served no call and
+/// written no page since it resumed, moved only if its registers or its
+/// counter did.
 pub(super) enum Pause {
     Await {
         agent: AgentId,
@@ -41,19 +51,34 @@ pub(super) enum Pause {
     Sleep {
         until: u64,
     },
+    Preempted {
+        pending: Option<u64>,
+        idle: bool,
+    },
 }
 
 impl Pause {
-    /// The batch time its row in the due index lies at.
-    pub(super) fn due(&self) -> u64 {
+    /// The batch time its row in the due index lies at, in a batch at
+    /// `time`: a preempted workflow's is the next millisecond's, so its row
+    /// moves and the next batch continues it.
+    pub(super) fn due(&self, time: u64) -> u64 {
         match self {
             Pause::Await { deadline, .. } => *deadline,
             Pause::Sleep { until } => *until,
+            Pause::Preempted { .. } => time.saturating_add(1),
         }
     }
 
-    /// The workflow's state while it pauses.
-    pub(super) fn state(self) -> WorkflowState {
+    /// The host call a preempted step left unserved.
+    pub(super) fn pending(&self) -> Option<u64> {
+        match self {
+            Pause::Preempted { pending, .. } => *pending,
+            _ => None,
+        }
+    }
+
+    /// The workflow's state while it pauses, `input` the step's.
+    pub(super) fn state(self, input: &[u8]) -> WorkflowState {
         match self {
             Pause::Await {
                 agent,
@@ -65,6 +90,7 @@ impl Pause {
                 deadline,
             },
             Pause::Sleep { until } => WorkflowState::Sleeping { until },
+            Pause::Preempted { .. } => WorkflowState::Preempted(input.to_vec()),
         }
     }
 }
@@ -192,7 +218,7 @@ impl<'a> Invocation<'a> {
             return Err((Failure::Depth, 0));
         }
         let kind = schema.kind;
-        let mut machine = Machine::acquire(&installed.program.0)
+        let mut machine = machines::pinned(&installed.program.0, 0)
             .map_err(|unavailable| (unavailable.into(), 0))?;
         machine.set_gas(gas);
         machine.set_register(7, u64::from(method.0));
@@ -207,7 +233,7 @@ impl<'a> Invocation<'a> {
         }
         self.stack.push(instance);
         self.nested.push(0);
-        let ended = self.serve::<false>(
+        let ended = self.serve(
             &mut machine,
             Some(&installed),
             caller,
@@ -242,32 +268,11 @@ impl<'a> Invocation<'a> {
             .and_then(|bytes| bytes.first().copied()))
     }
 
-    /// Run a workflow's machine, of `instance`'s workflow method, through
-    /// its step: until it pauses, ends or fails. Its own gas goes to its
-    /// instance, as a handler's.
-    pub(super) fn workflow(
-        &mut self,
-        machine: &mut Machine,
-        owner: Principal,
-        instance: InstanceId,
-        input: &[u8],
-    ) -> Result<Ended, Failure> {
-        let gas = machine.gas();
-        self.instances.push(InstanceGas { instance, gas: 0 });
-        self.nested.push(0);
-        let ended = self.serve::<true>(machine, None, owner, instance, Kind::Workflow, input);
-        let nested = self.nested.pop().expect("the workflow's entry");
-        self.gas_used = gas - machine.gas();
-        self.instances[0].gas += self.gas_used - nested;
-        ended
-    }
-
-    /// Serve a machine's exits until it halts, fails or pauses: a
-    /// workflow's (`TRACKED`) pays each page it writes as it writes it.
-    /// Inlined, as a call is into it: a nested call holds one frame of the
-    /// agent's stack a level, sixty-three levels deep.
+    /// Serve a handler's machine's exits until it halts or fails. Inlined,
+    /// as a call is into it: a nested call holds one frame of the agent's
+    /// stack a level, sixty-three levels deep.
     #[inline(always)]
-    fn serve<const TRACKED: bool>(
+    fn serve(
         &mut self,
         machine: &mut Machine,
         installed: Option<&Installed>,
@@ -278,43 +283,13 @@ impl<'a> Invocation<'a> {
     ) -> Result<Ended, Failure> {
         let mut outcome: Option<Ended> = None;
         loop {
-            // Only a workflow writes pages it pays for, and pauses.
-            if TRACKED {
-                self.pay_pages(machine)?;
-                if let Some(Ended::Paused(_)) = outcome {
-                    return Ok(outcome.take().expect("paused"));
-                }
-            }
-            let exit = machine.invoke();
-            if TRACKED {
-                self.pay_pages(machine)?;
-            }
-            match exit {
+            match machine.invoke() {
                 Exit::Halt => return Ok(outcome.unwrap_or(Ended::Replied(Vec::new()))),
                 Exit::OutOfGas => return Err(Failure::OutOfGas),
                 Exit::Panic | Exit::Fault(_) => return Err(Failure::Trapped),
-                // The operations that only set registers, which every kind
-                // served here may use, first: they cost the agent least.
-                Exit::Host(id @ (op::NOW | op::SELF_ID)) => {
-                    if !machine.charge(price::OPERATION) {
-                        return Err(Failure::OutOfGas);
-                    }
-                    if id == op::NOW {
-                        machine.set_register(7, self.base.time);
-                    } else {
-                        machine.set_register(7, u64::from(instance.0));
-                        machine.set_register(8, u64::from(self.base.agent.0));
-                    }
-                }
-                Exit::Host(id) if precompile::price(id).is_some() => {
-                    serve_precompile(&self.base.meter, machine, id)?;
-                }
                 Exit::Host(id) => {
-                    if !known(id) {
-                        if !machine.charge(price::OPERATION) {
-                            return Err(Failure::OutOfGas);
-                        }
-                        machine.set_register(7, code::WHAT);
+                    if let Some(served) = self.plain(machine, id, instance) {
+                        served?;
                         continue;
                     }
                     if !abi::allowed(kind, id) {
@@ -341,17 +316,34 @@ impl<'a> Invocation<'a> {
         }
     }
 
-    /// Take the pages a workflow's machine has written since the last take
-    /// from the meter, before they are captured: out of gas, the budget
-    /// overrun, when it cannot pay them.
-    fn pay_pages(&mut self, machine: &Machine) -> Result<(), Failure> {
-        let written = machine.written().map_or(0, |pages| pages.len());
-        let new = (written - self.pages_paid) as u64;
-        self.pages_paid = written;
-        if new > 0 && !self.base.meter.take(new * defaults::WRITTEN_PAGE) {
-            return Err(Failure::OutOfGas);
+    /// Serve an operation every kind may use that only sets registers, a
+    /// precompile, or an id the agent does not serve, answered `WHAT`:
+    /// `None` for the others. They cost the agent least, so come first.
+    #[inline(always)]
+    fn plain(
+        &self,
+        machine: &mut Machine,
+        id: u64,
+        instance: InstanceId,
+    ) -> Option<Result<(), Failure>> {
+        if precompile::price(id).is_some() {
+            return Some(serve_precompile(&self.base.meter, machine, id));
         }
-        Ok(())
+        if known(id) && !matches!(id, op::NOW | op::SELF_ID) {
+            return None;
+        }
+        if !machine.charge(price::OPERATION) {
+            return Some(Err(Failure::OutOfGas));
+        }
+        match id {
+            op::NOW => machine.set_register(7, self.base.time),
+            op::SELF_ID => {
+                machine.set_register(7, u64::from(instance.0));
+                machine.set_register(8, u64::from(self.base.agent.0));
+            }
+            _ => machine.set_register(7, code::WHAT),
+        }
+        Some(Ok(()))
     }
 
     /// A nested call of a handler of this agent's: the callee runs, and
@@ -735,13 +727,20 @@ fn random(seed: &[u8; 32], step: u32, draw: u64) -> [u8; 32] {
     )
 }
 
-/// Serve a machine's precompile call, accounting for the agent's serving
-/// on the meter first.
+/// Serve a machine's precompile call: its price checked first, so a call
+/// the machine cannot pay takes nothing of the meter, as a failed charge
+/// leaving the machine no gas; then the agent's serving taken from the
+/// meter, and the call served.
 pub(super) fn serve_precompile(
     meter: &Meter,
     machine: &mut Machine,
     id: u64,
 ) -> Result<(), Failure> {
+    let price = precompile::price(id).ok_or(Failure::Trapped)?;
+    if machine.gas() < price {
+        machine.set_gas(0);
+        return Err(Failure::OutOfGas);
+    }
     if !meter.take(defaults::PRECOMPILE_SERVING) {
         return Err(Failure::OutOfGas);
     }
@@ -757,7 +756,7 @@ fn attestable(
     arguments: &[u8],
     gas: u64,
 ) -> Result<(Vec<u8>, u64), Failure> {
-    let mut machine = Machine::acquire(&program.0)?;
+    let mut machine = machines::pinned(&program.0, 0)?;
     if !machine.map_read_only(ARGUMENTS, arguments.len() as u64, arguments) {
         return Err(Failure::Trapped);
     }
@@ -836,11 +835,18 @@ fn copy_out(
     offset: u64,
     capacity: u64,
 ) -> Result<(), Failure> {
-    let offset = usize::try_from(offset)
+    write(
+        machine,
+        address,
+        &bytes[window(bytes.len(), offset, capacity)],
+    )
+}
+
+/// What a copy out of `len` bytes takes, from `offset`, at most `capacity`.
+fn window(len: usize, offset: u64, capacity: u64) -> core::ops::Range<usize> {
+    let offset = usize::try_from(offset).unwrap_or(usize::MAX).min(len);
+    let taken = usize::try_from(capacity)
         .unwrap_or(usize::MAX)
-        .min(bytes.len());
-    let len = usize::try_from(capacity)
-        .unwrap_or(usize::MAX)
-        .min(bytes.len() - offset);
-    write(machine, address, &bytes[offset..offset + len])
+        .min(len - offset);
+    offset..offset + taken
 }

@@ -137,16 +137,18 @@ pub mod defaults {
     /// the rest of the batch's plain inputs, then the input's own reserve,
     /// its record at the most an install writes, and the most a handler may
     /// request; or an install; or a workflow's step, restoring the most
-    /// pages a snapshot holds, its record at its largest; and the finish. A
-    /// node refines with no less, so every batch makes progress, and every
-    /// workflow's step can run.
+    /// pages a snapshot holds, its record at its largest, with room for a
+    /// page past what a sweep leaves inputs; and the finish. A node refines
+    /// with no less, so every batch makes progress, and every workflow's
+    /// step can run.
     pub const fn min_refine_gas(max_inputs: usize) -> u64 {
         use crate::abi::cap;
         let handler = STEP_RESERVE + RECORD_BYTE * cap::STEP_WRITES as u64;
         let workflow = WORKFLOW_RESERVE
             + ARM_PAGE * cap::WORKFLOW_PAGES as u64
             + RESTORED_PAGE * cap::HELD_PAGES as u64
-            + RECORD_BYTE * cap::WORKFLOW_ROWS as u64;
+            + RECORD_BYTE * cap::WORKFLOW_ROWS as u64
+            + 2 * WRITTEN_PAGE;
         let mut first = INSTALL_RESERVE;
         if handler > first {
             first = handler;
@@ -190,6 +192,21 @@ pub mod defaults {
     // A node's default batch restores any workflow's snapshot.
     const _: () = assert!(min_refine_gas(256) <= REFINE_GAS);
 
+    // What a workflow's step takes of its batch's budget:
+    // - kept before it runs: `WORKFLOW_RESERVE`, `ARM_PAGE` for each page
+    //   its program may write and `RESTORED_PAGE` for each its snapshot
+    //   holds, every step, and its gas limit;
+    // - its machine's gas: its effect-free code's share, the limit, and the
+    //   limit again for each unit from its first effect, when the refine
+    //   has it beyond what the step used, or the step ends at that effect;
+    // - `WRITTEN_PAGE` for each page it writes, before the page opens,
+    //   again in every step that writes it.
+    // Effect-free code ends the step at the first page the meter cannot
+    // pay, once its machine has moved: a step writes what the budget left
+    // past its restore pays for, some 140 pages in a default batch when it
+    // restores `cap::HELD_PAGES`, and a computation larger than a step
+    // moves on, a step a batch.
+
     /// The agent's own work on a workflow's step beyond its handler's
     /// gas and its pages: reading its record and its program's header,
     /// acquiring its machine at its counter, and writing its record and
@@ -199,12 +216,13 @@ pub mod defaults {
     /// The same per page its program may write, which every step arms
     /// read-only and a pool prices a machine by.
     pub const ARM_PAGE: u64 = 200;
-    /// The same per page a step writes, taken as it is written: the exit
+    /// The same per page a step writes, taken before it opens: the exit
     /// and repair of its first store, then its capture, compared with its
     /// base, hashed, in software on JAM, and compressed. About 340,000 on
     /// a VOS node and 830,000 on JAM for a page of random bytes, which
-    /// compress the slowest; so a refine of the default budget writes
-    /// about a thousand pages, whatever its host.
+    /// compress the slowest; so a step beside the largest limit, restoring
+    /// none, writes about 800 pages in a refine of the default budget,
+    /// whatever its host ([`crate::abi::cap::STEP_PAGES`]).
     pub const WRITTEN_PAGE: u64 = 1_100_000;
     /// The same per page a step restores: read, decompressed, hashed, in
     /// software on JAM, and written back. About 230,000 on a VOS node and
