@@ -102,3 +102,62 @@ Instruction gas agrees.
 
 **Run it again:** `spikes/sj-jam-b/probe.sh` (`build`, `testnet`,
 `create`, `item`, `get`, `compare`, `local`), as its usage lists.
+
+## Step 4.2: the compressed tree
+
+**Built:** `vos-tree` (`agent/tree`), `#![no_std]` + `alloc`, building
+for the PVM target. Its crate doc is the format's spec.
+- **Hashing:** BLAKE2b-256 behind a `Hasher` trait, natively through
+  the precompiles crate's software BLAKE2b, which is the precompile on
+  the PVM. Tags `vos/tree/{key,leaf,branch,empty,salt,value}`.
+- **A leaf** is `H(leaf ‖ u16 len ‖ key' ‖ vh)`, with
+  `vh = H(value ‖ salt ‖ value bytes)`. A proof opens leaves as
+  `(key', vh)` and never carries a salt, so an opened neighbour shows
+  nothing a low-entropy guess could match.
+- **A branch** is `H(branch ‖ u16 level ‖ left ‖ right)`. The empty
+  tree's root is `H(empty)`.
+- **Keys:** `escape`, `ordered`, `hashed` (H128 ‖ escaped key),
+  `private`; scan bounds `prefix_end` and `after`. Keys are at most
+  8,192 bytes, so every level fits a `u16`.
+- **The store:** `NodeStore`.
+  - A branch row holds both children's references with their hashes; a
+    leaf row holds `(salt, vh)`; there is a top reference.
+  - `update` reads every row before writing any, refuses a bad batch
+    before its first write, and returns errors rather than panicking.
+  - `reachable` lists the rows on the tree, for "no row off the tree"
+    checks.
+- **Proofs:**
+  - `BatchProof` and `RangeProof` are pruned trees in pre-order.
+  - A range proof's boundaries are the leaves around it, or the tree's
+    edges.
+  - `update` from either proof, and `Witness::update` after `verify`, so
+    a JAM refine hashes a proof once.
+  - A key that prefixes a tree key, or is prefixed by one, is refused,
+    since it could never be put.
+
+**Tests:** 23, in one binary.
+- Property tests: incremental roots equal a build from scratch, with no
+  row off the tree after every batch; proofs verify and every tamper
+  fails; updates from proofs equal the store's; `escape` keeps order
+  and is prefix-free.
+- Named cases: ranges at edges and empty ranges, bounded scans, ordered
+  chains growing a level per key, adversarial keys staying shallow when
+  hashed, a 1,040-branch path, absent keys ending above a branch.
+- Known answers, computed independently from the spec.
+
+**Measured against S4** (hashed `u64` keys, the in-memory store):
+
+| Keys, batch | Hashes per update (S4) | Node rows per update (S4) | µs per update (S4) |
+|---|---|---|---|
+| 1M, single | 21.3 (21) | 20.3 (20–24) | 21.5 (5.7) |
+| 1M, batches of 10,000 | 8.1 (8.1) | 7.1 (7–10) | 10.6 (3.4) |
+| 10M, single | 24.6 (25) | 23.6 (20–24) | 34.8 (8.3) |
+| 10M, batches of 10,000 | 11.4 (11) | 10.4 (7–10) | 21.7 (6.6) |
+
+The hash counts match S4. The time is mostly the test store's
+allocation; outside it, the tree's own time matches S4's pointer tree.
+4.3 measures it on the node's rows.
+
+**Reviewed** for soundness (Fable): the format and the three proof
+algorithms hold. The fixes it asked for are in: the salted value
+commitment, and errors on the store path.

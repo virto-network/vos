@@ -5,6 +5,7 @@ members = [
     "agent/sdk",
     "agent/sdk-macros",
     "agent/testkit",
+    "agent/tree",
     "node/host",
     "node/net",
     "node/cli",

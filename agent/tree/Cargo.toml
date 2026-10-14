@@ -1,0 +1,19 @@
+[package]
+name = "vos-tree"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The compressed Merkle tree of committed maps: its format, roots, proofs and updates."
+
+[dependencies]
+scale = { package = "vos-pvm-codec", path = "../../pvm/codec", default-features = false }
+# The software BLAKE2b the PVM programs share: on the PVM it calls the
+# compression precompile and falls back to software where it is not served.
+vos-pvm-precompiles = { path = "../../pvm/proof/precompiles", default-features = false, features = ["blake2b"] }
+
+[dev-dependencies]
+proptest = "1"
+
+[[bench]]
+name = "update"
+harness = false

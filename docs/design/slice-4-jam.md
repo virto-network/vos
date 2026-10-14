@@ -161,8 +161,9 @@ already in the sender's outbox, so the receiver keeps no reply cache.
 - Today the leader bisects a failing batch until one input fails alone,
   answers a client request, and drops a message without acknowledging
   it. The sender then resends that message every round, forever.
-- Instead, the leader proposes it as `Input::Failed(message)`. Refine
-  does not run it. It records a consuming step, as section 8.1 requires
+- Instead, the leader proposes it as `Input::Failed { from, sequence,
+  awaiting }`, never the body, which is never run. Refine does not run
+  it. It records a consuming step, as section 8.1 requires
   of a failed step:
   `Step::Ran(Run { outcome: Failed { code: FAILED }, writes: [], .. })`,
   with an error `Reply` among its messages when the message awaited one.
@@ -179,8 +180,12 @@ already in the sender's outbox, so the receiver keeps no reply cache.
   `Failed` and not consumed, so the client decides whether to retry.
 
 **Fast retransmit** (carried):
-- A receiver that refuses a gap, or drops a message past its queue's
-  cap, answers the sender with `Behind`.
+- A receiver that refuses a gap answers the sender with `Behind`.
+- **A message dropped past a full queue gets no `Behind`:** a rewind per
+  drop would remove the rounds' backoff exactly when the receiver is
+  overloaded. Its recovery stays with the rounds, and 4.7's fan-in
+  bench decides whether it needs more, such as one `Behind` per dropped
+  sender once the queue drains.
 - **`Behind` is a trigger, not a cursor:**
   - the sender rewinds its window to the acknowledgement at once, as a
     due round does (`Window::rewind`), instead of waiting for the round;
@@ -235,6 +240,10 @@ A crate `agent/tree` (`vos-tree`, `no_std + alloc`). Its users:
 - **The same order on both hosts:** a table's value rows on VOS are
   keyed by the same `key'`, so a scan returns rows in the same order on
   VOS and JAM, and the refines agree byte for byte.
+- **Every row key is prefix-free,** which JAM's whole-keyspace tree
+  needs: every table's rows move from `prefix ‖ raw key` to
+  `prefix ‖ transform(key)` in 4.3, not only committed maps', and every
+  system row's key under its prefix is fixed-width or escaped.
 - **Refine computes `key'`,** through the precompile on VOS and in
   software on JAM, so accumulate writes rows by the keys the work result
   names and never hashes.
@@ -248,8 +257,11 @@ A crate `agent/tree` (`vos-tree`, `no_std + alloc`). Its users:
     below both continuations of the longer key.
 - **Ordered scans** on VOS read the value rows, in the tree's order. The
   tree serves roots and proofs.
-- **A leaf:** `H(TAG_LEAF ‖ key' ‖ salt ‖ H(value))`. It does not depend
-  on its depth.
+- **A leaf:** `H(TAG_LEAF ‖ len(key') ‖ key' ‖ vh)`, with the value
+  committed as `vh = H(TAG_VALUE ‖ salt ‖ value)`. It does not depend on
+  its depth. The salt sits inside `vh`, so a proof that opens a
+  neighbour's leaf (every absence and range proof does) shows `vh`,
+  never a hash of the bare value that a low-entropy guess could match.
 - **A branch:** `H(TAG_BRANCH ‖ level ‖ left ‖ right)`. `level` is the
   first bit where its two subtrees' keys differ, a big-endian `u16`.
   Empty levels are never hashed.
@@ -492,7 +504,9 @@ impl Shop {
     the deadlines behind it.
 - **A step:**
   - **Resuming input:** a start, a `Reply` for its await, or `Due` for
-    its deadline or timer.
+    its deadline or timer. An await records the agent it awaits, and a
+    `Reply` from any other agent is consumed and dropped, so no agent
+    answers another's await.
   - **Machine:** the agent restores the workflow's machine and passes
     the input in.
   - **Run:** it runs until it pauses at an await, is preempted,
@@ -790,6 +804,9 @@ on it.
   listing due rows, and `Due` steps.
 - Fault-tracked snapshots and restore, deadlines and timers, failure,
   results by id.
+- A failure code of its own for a callee program that cannot be loaded,
+  a node's fault, which `Unknown` (no such method) covers today, so a
+  workflow tells them apart.
 - **The testkit's reference model and tests on one node:**
   - S1's three workflows (transfer, saga, compute);
   - replies consumed, and late ones dropped;

@@ -2686,6 +2686,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "vos-tree"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "vos-pvm-codec",
+ "vos-pvm-precompiles",
+]
+
+[[package]]
 name = "vos-wire"
 version = "0.1.0"
 dependencies = [
