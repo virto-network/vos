@@ -1,6 +1,6 @@
 # Identity and authority
 
-Draft 4 of a design run on who acts in a space, how a request proves
+Draft 5 of a design run on who acts in a space, how a request proves
 it, what each actor may do, and what anyone outside a space learns.
 - Draft 2 adopted the owner's idea of personal spaces.
 - Draft 3 folded a second opinion (Fable): two axes, one attestation
@@ -14,6 +14,12 @@ it, what each actor may do, and what anyone outside a space learns.
   - full privacy (a shared shielded pool, personal spaces, a relay
     layer such as Tor or Arti bundled in the node) is postponed;
   - the review of cipher-clerk is folded into §13.
+- **Draft 5 folds the second opinion on draft 4** (Fable):
+  - the trust-boundary rule per executor, a space or a public JAM agent;
+  - the identity replica's consistency contract;
+  - the input kinds and the full origin ABI reserved in the first build;
+  - a size rule for authority sets;
+  - the path-fetch leak of credentials.
 
 Tags as in the core model. **[decided]** marks the owner's answers;
 the rest is still proposed.
@@ -86,6 +92,12 @@ primitives that serve it.
 - **Across spaces,** every cell discloses only what a proof returns.
 - **Metadata** (network addresses, timing, sizes) leaks in every cell.
   The relay layer (§8) addresses it; spaces that need it opt in.
+- **When each cell arrives:**
+  - the first build delivers the top-left cell, and with the
+    messenger, the bottom-left;
+  - the anonymous column needs the membership credential, so it
+    arrives with §15 step 3;
+  - the bottom-right is postponed.
 
 ## 4. Five concepts
 
@@ -104,11 +116,10 @@ primitives that serve it.
 
 ## 5. Authority: origins, attestations and guards
 
-**Verification happens where the executor's trust boundary is**
-[decided]:
-- **Authority from a party the executor already trusts** is checked
-  where the request enters. Such parties are a space's own members,
-  through its nodes, and a JAM agent's own builder.
+**Authority is verified at the executor's trust boundary** [decided],
+and there are two kinds of executor:
+- **A space** trusts its nodes. This includes the space's own agents
+  deployed on JAM, whose builder is one of its nodes.
   - At ingress, a request's evidence (its device's signature, the
     attestations it presents) is reduced to an origin plus an authority
     set: the claims it was shown to hold, narrowed.
@@ -116,17 +127,49 @@ primitives that serve it.
     evidence.
   - A guard reads only the logged origin, the authority set and state.
     So every replica, and a JAM witness, evaluates the same bytes.
-  - Guests never verify signatures: on JAM there is no signature
+  - Its guests never verify signatures. On JAM there is no signature
     precompile, and a software verification would be paid by every
     replica.
-- **A claim that strangers must be able to check** is a proof, and the
-  agent that relies on it verifies it in its guest. Examples are a
-  settlement claim between spaces, a spend into a shielded pool, and
-  a credential.
+- **A public JAM agent,** such as the registry (§12) or a shared pool
+  (§8), trusts only the chain and proofs. Its builder is anyone.
+  - Its inputs are:
+    - `Jam { service }` origins, which the chain authenticates, such as
+      a transfer from a registered space's representative;
+    - proofs it verifies in its guest;
+    - anonymous inputs whose proof is their authority.
+  - **It never takes an origin from its builder,** which could
+    otherwise log an invented one that no witness would catch: the
+    witness covers state, not evidence.
+  - So registration and votes arrive as transfers from the registering
+    space's representative.
+- **A claim that strangers must be able to check** is a proof, verified
+  in the guest of the agent that relies on it. Examples are a
+  settlement claim between spaces, a spend into a shielded pool, and a
+  credential.
 - **No signatures in the log** means an operator cannot prove to an
-  outsider what a member did: deniability for members. A space that
-  needs non-repudiation, for disputes, keeps the request signatures
-  in a side store under its own policy.
+  outsider what a member did: deniability for members. Spaces that need
+  non-repudiation for disputes can turn on an ingress option, off by
+  default, that keeps request signatures in a side store.
+
+**The rule, as the core model will state it:**
+
+> Authority is verified at the executor's trust boundary. A space's
+> boundary is its nodes' ingress, which reduces evidence to an origin
+> and an authority set that the log carries; guards read only those and
+> state. A public JAM agent's boundary is the chain: its origins are
+> chain-authenticated services, proofs it verifies in its guest, and
+> anonymous inputs whose proof is their authority; it takes no origin
+> from its builder. Evidence is never logged; non-repudiation is a
+> side store.
+
+**What an authority set carries:**
+- the ids (hashes) of attestations already installed in the agent's
+  state, such as roles and standing grants;
+- inline, only ad-hoc delegations, narrowed at ingress to their
+  intersection with what the delegator holds.
+
+It has a deterministic encoding, since every replica and the witness
+compare it, and on JAM its size is paid as payload.
 
 **Four kinds of origin:**
 - `Identity { id }`: a person or service in this space, through a
@@ -165,6 +208,9 @@ wants one says "from agent G, with claim `decision(d)`".
   ingress;
 - a device's epoch revokes a lost phone without touching the person's
   other devices;
+- **a bump also voids long-lived grants issued before it,**
+  deliberately. Roles the space grants come from a system identity
+  whose epoch rarely moves, so the common case is unaffected;
 - short expiries, in batch time (monotone, core model §8.4), cover the
   rest;
 - a list is kept inside a space only to revoke one particular grant;
@@ -190,9 +236,35 @@ origin is the sending service or space, and the authority is a proof
   - a revocation reaches every node within replication lag and is
     checked on every request, not only when a session opens;
   - ingress keeps working while the identity agent's leader is
-    unreachable;
-  - a method whose risk warrants it requires a linearizable read of the
-    epoch.
+    unreachable.
+- **The replica's contract:**
+  - **Its shape.** Not every node is a voter: quorum and commit latency
+    would grow with the space, and vos-raft has only voters today. A
+    node outside the quorum holds a read-only follower: a snapshot,
+    then the log's tail. That is either a non-voting role added to
+    vos-raft, or the identity agent's applied state shipped to
+    non-members (§14).
+  - **Bootstrap.** A node serves ingress only once its replica has
+    applied a snapshot no older than the leader's commit at its join.
+    Until then it forwards the request (`PeerMessage::Forward`) or
+    refuses with "warming up". It never resolves against an empty
+    table.
+  - **Lag, unknown devices.** A device registered or re-enabled
+    recently can be unknown to a lagging replica. It is refused with a
+    retryable code, and the client retries elsewhere. The identity
+    agent's own writes always go through its leader.
+  - **Lag, revoked devices.** A device revoked recently is accepted
+    within the lag. The log entry records the identity epoch ingress
+    read, so the window is auditable.
+  - **Linearizable epochs.** A method can declare in its schema that it
+    needs a linearizable epoch, and ingress then reads it with
+    `ReadIndex` against the identity leader. This is an ingress policy
+    the schema names, not a guard: a guard cannot re-check another
+    agent's state, and on JAM the witness covers only the agent's own
+    keyspace.
+  - **Monotone epochs.** A node never resolves against an epoch older
+    than one it has applied, across restarts too. A replica reloading
+    an older snapshot would otherwise re-admit a revoked device.
 - **Authenticators:**
   - ed25519 keys, as today;
   - SSH keys, signing through an agent without exposing the key;
@@ -236,6 +308,11 @@ origin is the sending service or space, and the authority is a proof
 - **Freshness:** a verifier demands a root within N windows, and the
   issuer drops a revoked leaf, so a credential lapses within N windows
   of its revocation.
+- **Fetching paths leaks timing.** A holder needs a fresh path every
+  window, and asking the issuing space for one on demand tells the
+  issuer when the holder proves. So the holder syncs the committed map
+  its leaf sits in (the syncing axis, §9), or fetches paths
+  anonymously.
 
 **Opt-in linking:** a holder can prove "the same person as identity X in
 space A", and only to whom they choose.
@@ -262,6 +339,12 @@ primitives built first don't preclude them. A space opts in.
   in its guest.
 - **One pool shared by many spaces,** not one per space. The anonymity
   set is everyone who uses it.
+- **Its costs on JAM:**
+  - a pool on JAM verifies every spend in refine, about 10.7M cycles
+    each today, so about 90 spends fit a package of 1e9 gas until
+    proofs aggregate;
+  - scanning notes held on JAM needs the JAM light client in the
+    personal space.
 - **An anonymous input** travels the client path without a session:
   - self-authenticating, deduplicated by its nullifier;
   - no acknowledgement;
@@ -328,6 +411,10 @@ an agent, but approving a payment is a member's grant like any other.
     roots, per window.
 - **Windows** run at a fixed cadence, minutes apart. A root that moved
   only on activity would leak activity.
+- **What an anchor gives an outsider:**
+  - the space's own builder submits its space-level root, so the anchor
+    gives outsiders ordering;
+  - integrity comes only from a proof that names the anchor.
 - **Cost:**
   - an anchor is a work package per window per space, a few million gas;
   - a claim verified on chain also pays its verifier, about 10.7M cycles
@@ -369,7 +456,9 @@ an agent, but approving a payment is a member's grant like any other.
 - **A space's own keys** (its builder's signing key, behind
   `package::identity(service)`) rotate by a governance decision applied
   in accumulate.
-- **Exit and disputes** need rules, not yet designed.
+- **Exit and disputes** need rules, not yet designed. A space's name on
+  exit is released only after its deposit's delay, so exit cannot be
+  used to squat.
 - **Policy stays mechanical:** fees, names, accepted versions, disputes.
   It never reaches into a space's internals.
 
@@ -405,8 +494,14 @@ A design and implementation review (2026-10-15) found:
 ## 14. Decisions and what remains open
 
 **Taken** [decided], subject to the reviewer's check:
-- **The trust boundary rule:** ingress for trusted parties, proofs in
-  the guest for claims strangers check (§5).
+- **The trust-boundary rule, per executor (§5):**
+  - a space verifies at ingress;
+  - a public JAM agent takes only chain-authenticated origins and
+    proofs;
+  - non-repudiation is an ingress option, off by default.
+- **The identity replica's contract (§6):** bootstrap, two-sided lag,
+  schema-declared linearizable epochs, monotone epochs.
+- **The origin ABI and input kinds reserved in step 0 (§15).**
 - **One attestation primitive** (§5).
 - **Two axes and primitives per cell;** spaces choose (§3).
 - **The identity agent replicated on every node** (§6).
@@ -427,20 +522,26 @@ A design and implementation review (2026-10-15) found:
   - registered spaces: a deposit plus fees.
 
 **Open:**
-1. **The ingress replica's consistency:** which methods warrant a
-   linearizable epoch read, and is replication lag on revocation
-   acceptable for the rest?
-2. **Non-repudiation:** should the platform offer the side store of
-   request signatures, or leave it to spaces?
-3. **The handover triggers' numbers** for the registry's governance.
-4. **Where the shared pool first runs,** once unpostponed: a JAM agent,
+1. **The identity replica's shape:** a non-voting role added to
+   vos-raft, or the applied state shipped to non-members as a
+   read-only follower (§6). Decided when the first build is planned.
+2. **The handover triggers' numbers** for the registry's governance.
+3. **Where the shared pool first runs,** once unpostponed: a JAM agent,
    or a proving space run by the root space.
 
 ## 15. Proposed staging
 
-0. **Write the attestation primitive and the origin ABI** into the core
-   model (§5, §6.5), with the trust boundary rule stated.
-1. **A second opinion on this draft** (Fable).
+0. **Into the core model** (§5, §6.5):
+   - the attestation primitive;
+   - the trust-boundary rule, as quoted in §5;
+   - the origin ABI with all four kinds and their codec indexes, with
+     `Anonymous` reserved and refused by every guard until step 3;
+   - the input kinds: `Call { session, .. }` and a reserved kind
+     without a session, so the ingress format and the log's input
+     encoding do not change when anonymous inputs arrive;
+   - rate limiting keyed by origin kind.
+1. **Second opinions on each draft** (Fable): draft 4's are folded
+   here.
 2. **First build** (the operator-readable row, independent of proving):
    - the identity agent replicated on every node;
    - authenticators and signature verification at ingress (ed25519,
