@@ -1,0 +1,17 @@
+[workspace]
+
+[package]
+name = "sj-probe-tool"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+vos-pvm = { path = "../../../pvm/runtime" }
+vos-pvm-compiler = { path = "../../../pvm/compiler" }
+vos-pvm-program = { path = "../../../pvm/program" }
+
+[profile.dev.package.vos-pvm]
+opt-level = 3
+[profile.dev.package.vos-pvm-compiler]
+opt-level = 3

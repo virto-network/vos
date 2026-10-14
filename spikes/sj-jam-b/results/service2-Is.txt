@@ -1,0 +1,48 @@
+== PolkaJam
+package hash  47ef2a3eea532b47f6f38c855d45969b3f4ee747a0cf4744f9a099a1e55be7d0
+segment root  0000000000000000000000000000000000000000000000000000000000000000
+gas limit     10000000
+payload       "Is"
+  start (gas left)       999997879
+  calibrate (gas)        diff=96 (gas call=48)
+  fetch our import       φ7=0x1008 arg=0xe0c1a28330474553 extra=1 diff=219 charge=171
+  imported page hash     fnv=0x51860886e594f82a index=0
+  fetch our import       φ7=0x1008 arg=0xba9bf8d931474553 extra=1 diff=219 charge=171
+  imported page hash     fnv=0xc98f136eb9aad8f5 index=1
+  fetch our import       φ7=NONE arg=0xeeeeeeeeeeeeeeee extra=0 diff=219 charge=171
+  fetch any import       φ7=0x1008 arg=0xba9bf8d931474553 extra=0xc98f136eb9aad8f5 diff=219 charge=171
+  done
+== VOS JAM-only host, interpreter (gas used 164470): 1 of 9 records agree in results and own charge; the others:
+  #1  PolkaJam: calibrate (gas)        diff=96 (gas call=48)
+      VOS:      calibrate (gas)        diff=20 (gas call=10)
+  #2  PolkaJam: fetch our import       φ7=0x1008 arg=0xe0c1a28330474553 extra=1 diff=219 charge=171
+      VOS:      fetch our import       φ7=WHAT arg=0xeeeeeeeeeeeeeeee extra=0 diff=10 charge=0
+  #3  PolkaJam: imported page hash     fnv=0x51860886e594f82a index=0
+      VOS:      fetch our import       φ7=WHAT arg=0xeeeeeeeeeeeeeeee extra=0 diff=10 charge=0
+  #4  PolkaJam: fetch our import       φ7=0x1008 arg=0xba9bf8d931474553 extra=1 diff=219 charge=171
+      VOS:      fetch our import       φ7=WHAT arg=0xeeeeeeeeeeeeeeee extra=0 diff=10 charge=0
+  #5  PolkaJam: imported page hash     fnv=0xc98f136eb9aad8f5 index=1
+      VOS:      fetch any import       φ7=WHAT arg=0xeeeeeeeeeeeeeeee extra=0x4791325bcc2a6325 diff=10 charge=0
+  #6  PolkaJam: fetch our import       φ7=NONE arg=0xeeeeeeeeeeeeeeee extra=0 diff=219 charge=171
+      VOS:      done
+  #7  PolkaJam: fetch any import       φ7=0x1008 arg=0xba9bf8d931474553 extra=0xc98f136eb9aad8f5 diff=219 charge=171
+      VOS:      -
+  #8  PolkaJam: done
+      VOS:      -
+== VOS JAM-only host, recompiler (gas used 164470): 1 of 9 records agree in results and own charge; the others:
+  #1  PolkaJam: calibrate (gas)        diff=96 (gas call=48)
+      VOS:      calibrate (gas)        diff=20 (gas call=10)
+  #2  PolkaJam: fetch our import       φ7=0x1008 arg=0xe0c1a28330474553 extra=1 diff=219 charge=171
+      VOS:      fetch our import       φ7=WHAT arg=0xeeeeeeeeeeeeeeee extra=0 diff=10 charge=0
+  #3  PolkaJam: imported page hash     fnv=0x51860886e594f82a index=0
+      VOS:      fetch our import       φ7=WHAT arg=0xeeeeeeeeeeeeeeee extra=0 diff=10 charge=0
+  #4  PolkaJam: fetch our import       φ7=0x1008 arg=0xba9bf8d931474553 extra=1 diff=219 charge=171
+      VOS:      fetch our import       φ7=WHAT arg=0xeeeeeeeeeeeeeeee extra=0 diff=10 charge=0
+  #5  PolkaJam: imported page hash     fnv=0xc98f136eb9aad8f5 index=1
+      VOS:      fetch any import       φ7=WHAT arg=0xeeeeeeeeeeeeeeee extra=0x4791325bcc2a6325 diff=10 charge=0
+  #6  PolkaJam: fetch our import       φ7=NONE arg=0xeeeeeeeeeeeeeeee extra=0 diff=219 charge=171
+      VOS:      done
+  #7  PolkaJam: fetch any import       φ7=0x1008 arg=0xba9bf8d931474553 extra=0xc98f136eb9aad8f5 diff=219 charge=171
+      VOS:      -
+  #8  PolkaJam: done
+      VOS:      -

@@ -1,0 +1,927 @@
+# Slice 4: Workflows, committed state and JAM
+
+Plan v2 for build step 4 of `core-model.md` (section 16):
+- the compressed root format and witnessed state reads (item 17);
+- workflows and their snapshots (sections 8.2 and 8.3, item 21);
+- the first JAM milestone (section 12).
+
+It also takes the items slice 3 carried to it. It builds on slice 3's
+replicated node (`slice-3-replication.md`) and on S1 and SJ
+(`spikes.md`). v1 was reviewed for soundness (Fable) and against the
+code (Opus); v2 folds both. Tags as in the core model.
+
+## Goal
+
+1. **A workflow runs end to end on a replicated agent:**
+   - a client starts it;
+   - it calls an actor of its own agent, then asks another agent and
+     awaits the reply;
+   - meanwhile its leader is killed. The new leader resumes it from its
+     snapshot;
+   - it completes, and the client reads its result.
+   - Every effect happens exactly once.
+2. **An agent's committed map yields a root and proofs:**
+   - accumulate records only which keys changed;
+   - each replica builds the same root in the background.
+3. **On a JAM testnet,** the default agent and one actor run as a
+   service. A workflow suspends in one work package and resumes in a
+   later one, and every state read is witnessed against the root on
+   chain.
+
+The slice delivers:
+
+1. **Requests and replies between agents.** Today a message is sent and
+   forgotten.
+2. **The compressed tree:** the format, proofs and updates, in a
+   `no_std` crate.
+3. **`CommittedMap<K, V>`:** in the SDK, its rows, dirty keys recorded
+   in accumulate, and the node's background root builder.
+4. **Workflows:** the SDK's `#[workflow]`, the default agent's workflow
+   table, snapshots captured and restored with Gray Paper calls alone,
+   and deadlines and timers. Under them: the work result's blob path,
+   `instantiate` at a counter, and the agent's tracked writes.
+5. **JAM mode in the default agent:** witnessed reads, the root before
+   and after, and snapshot pages through export and import segments.
+6. **A builder,** which prepares and submits the agent's work packages
+   to a JAM node.
+7. **The carried items:**
+   - a message that fails in refine;
+   - fast retransmit;
+   - fan-in, measured;
+   - `#[msg(linearizable)]`;
+   - the agent serving its machines' precompiles.
+
+Out of scope:
+
+- **Proving.** Attestable methods reading committed fields, and
+  cipher-clerk's move to the new format, go to slice 5 with the prover
+  track [owner decision 1].
+- **Messages between agents on JAM** (transfers and their memos), and
+  re-exporting pages before DA retention ends.
+- The Merge lane (step 6), the catalog, pipelined refines.
+
+## What earlier slices leave
+
+- **The loader** (`agent/default/src/machines.rs`):
+  - it acquires a pooled machine with `instantiate`;
+  - where that is not served, it builds the machine with `machine`,
+    `pages` and `poke` from `historical_lookup`, as a JAM node would.
+- **Inner machines** (`pvm/runtime/src/inner.rs`) follow Gray Paper
+  0.8.0:
+  - `pages` allocates, frees, and sets read-only or read-write;
+  - a read from an unmapped page exits `Fault(address)`, and the machine
+    resumes once the page is allocated (tested on both backends). A
+    write to a read-only page repaired by `SetReadWrite`, the loop this
+    plan uses, looks supported on both backends but is untested;
+  - `poke` into a read-only page fails, as Gray Paper requires;
+  - `expunge` returns the program counter;
+  - `instantiate` always starts a pooled machine at counter 0, where
+    `machine` takes a counter.
+- **Dirty-page tracking** exists in the runtime on both backends
+  (`take_dirty_pages`), but nothing exposes it to an agent program.
+- **The JAM-only host** (`RefineContext::try_run_jam`) and the CI
+  surface check (`agent/testkit/tests/agent/hosts.rs`):
+  - VOS and JAM refines agree, byte for byte, on batches that read no
+    state;
+  - `state_read` and `state_scan` are `NoResult` on JAM, so a refine
+    that reads state traps;
+  - in refine, `fetch`, `export` and imports are served nowhere
+    (accumulate serves `fetch`);
+  - an inner machine's precompile writes its output in place, and the
+    agent answers `WHAT` on JAM.
+- **Messages between agents:**
+  - `Command::send` is fire-and-forget;
+  - pair sequences, the outbox, acknowledgements and resend windows
+    exist (`leader.rs`: 256 entries or 1 MiB a window, a round of 1 s
+    doubling to 16 s);
+  - no reply exists.
+- **The sweep:** the node puts `Input::Sweep` first in a batch when the
+  first expiry row is due. This is the one place where time alone
+  starts a batch. It is the node's as much as the agent's: the leader
+  decodes the expiry keys to time it (`leader.rs`), and refine scans
+  the expiry index.
+- **Blobs carry only programs.** A work result always travels inline in
+  its log entry, whatever its size; the consensus frames are sized for
+  a 4 MiB result. Step 3.1 found an inline 4 MiB entry beside small ones
+  costs the small ones' p99 (263 ms against 15 ms), so large snapshots
+  need the result's blob path, which this slice builds.
+- **Programs beside an actor's** come from a crate of their own: an
+  attestable is compiled by `attestable_program!` in a separate crate,
+  and installed as `(MethodId, ProgramHash)` beside the actor.
+- **Prototypes:**
+  - S1's workflows (`pvm/bench/guests/workflows`, the `snapshots` bench
+    binary) with LZ4;
+  - S4's two radix trees (`spikes/s4-tables`);
+  - SJ's echo service and its metadata tool (`spikes/sj-jam`);
+  - PolkaJam binaries in `~/bin/polkajam/`, but 0.1.27 on Gray Paper
+    0.7.2: SJ's 0.8.0 nightly is gone, so 4.0 fetches a current one.
+- **On `master`, the committed map to port:**
+  - `vos/src/actors/storage/committed.rs` (value rows, node rows at
+    branching points, a root row);
+  - `vos/src/zk/state.rs` (`BatchProof`);
+  - both on the fixed-depth format this slice replaces.
+- **Open from slice 2 (step 2.7):** an inner machine's precompiles reach
+  the agent, which answers `WHAT` on JAM, so the actor's software
+  fallback spends different gas there. Batches that run actors cannot be
+  compared across hosts until the agent serves the precompiles itself.
+
+## Design
+
+### Messages between agents: requests and replies [proposed]
+
+A workflow awaits other agents, so a message needs a reply. Section 8.4
+fixes the mechanism: a reply is a sequenced message on the reverse pair,
+already in the sender's outbox, so the receiver keeps no reply cache.
+
+- **Wire:** a `Message` carries a body:
+  - `Call { instance, method, arguments, awaiting: Option<Await> }`;
+  - `Reply { awaiting: Await, outcome }`.
+  - `Await` names the awaiting workflow and its await counter.
+- **The receiver** runs a `Call` like today's message. When the call
+  carries `awaiting`, its step adds a `Reply` with the handler's outcome
+  to the sender's outbox, whether the handler succeeded or failed. A
+  refusal (no such method, the caller lacks the role) replies too.
+- **The sender** consumes a `Reply` in its pair sequence like any
+  message:
+  - it resumes the awaiting workflow;
+  - if the await is gone (its deadline passed, or the workflow failed),
+    the reply is consumed and dropped (section 8.1).
+- `Command::send` keeps its form and never awaits. Only a workflow
+  requests.
+- **A request to a workflow** answers twice:
+  - at once, with `Reply::Started(id)` to the request's await;
+  - on completion, with its result, to a second await the starter
+    names when it waits for the result.
+  - A starter's deadline then bounds each wait, never the callee's
+    whole run.
+
+**A message that fails in refine** (carried):
+- Today the leader bisects a failing batch until one input fails alone,
+  answers a client request, and drops a message without acknowledging
+  it. The sender then resends that message every round, forever.
+- Instead, the leader proposes it as `Input::Failed(message)`. Refine
+  does not run it. It records a consuming step, as section 8.1 requires
+  of a failed step:
+  `Step::Ran(Run { outcome: Failed { code: FAILED }, writes: [], .. })`,
+  with an error `Reply` among its messages when the message awaited one.
+  `Step::Refused` would not do: accumulate applies nothing for it, so
+  the pair mark would stay. Through that `Run`:
+  - accumulate advances the pair mark;
+  - the leader acknowledges it, as any `Ran` step;
+  - an awaiting sender gets the error reply.
+- Deterministic, because the batch itself says the input failed.
+- **Once in the log, the message is consumed for good,** so the leader
+  asserts it only when the message fails alone twice, each on a fresh
+  storage snapshot. A transient failure then never consumes a message.
+- **A client request that fails alone stays as it is:** answered
+  `Failed` and not consumed, so the client decides whether to retry.
+
+**Fast retransmit** (carried):
+- A receiver that refuses a gap, or drops a message past its queue's
+  cap, answers the sender with `Behind`.
+- **`Behind` is a trigger, not a cursor:**
+  - the sender rewinds its window to the acknowledgement at once, as a
+    due round does (`Window::rewind`), instead of waiting for the round;
+  - it never moves to a sequence the frame names. A stale `Behind`
+    therefore only resends what the receiver drops at its mark;
+  - it is accepted only from a replica of the receiving agent, as
+    `Deliver` and `Acknowledge` are;
+  - one rewind per window per 100 ms at most, so a receiver that keeps
+    refusing cannot make the sender resend a whole window per message.
+- Rounds stay as the fallback when `Behind` itself is lost.
+
+**Fan-in and batching across agents** (carried): measured first.
+- A bench: N agents on two nodes send to one agent on a third, and to
+  each other in pairs.
+- Combining the deliveries of several agent pairs to one node into one
+  frame is built only if the bench shows frames, not refine, bound it.
+
+### The compressed tree [decided format; proposed details]
+
+A crate `agent/tree` (`vos-tree`, `no_std + alloc`). Its users:
+- the node's root builder;
+- the default agent on JAM;
+- the builder;
+- in slice 5, the attestable kernels and cipher-clerk.
+
+**Hashing:** BLAKE2b-256, through a `Hasher` trait:
+- natively on the node;
+- through the precompile shim in PVM programs, which falls back to
+  software on JAM.
+
+**Format** (section 9.3):
+- **Keys enter the tree in one of two modes,** chosen per tree; the
+  format is otherwise the same:
+  - **hashed:** `key' = H(TAG_KEY ‖ tree ‖ encoded key)`, 32 bytes.
+    Depth stays near log₂ n whatever keys an actor chooses, and a
+    shared path hides its neighbours' keys. No range proofs. Each
+    `CommittedMap`'s own root on VOS uses it;
+  - **ordered** [owner decision 8]: `key'` is the key itself, made
+    prefix-free while keeping byte order (each `0x00` byte escaped as
+    `0x00 0xFF`, then a terminator `0x00 0x00`). The tree's order is
+    then the keys' order, so the leaves of a range are adjacent and a
+    proof can show the range complete. JAM's whole-keyspace tree uses
+    it, because a JAM refine's scans must be witnessed.
+  - **Ordered depth is not log₂ n:** a path is at most as deep as its
+    key has bits (the ABI caps keys at 1 KiB), and at most as deep as
+    the tree has keys, since each level is a branch where another key
+    diverges. So deep paths cost whoever makes them one insert per
+    level, and a witness for them pays in gas. Sequential and
+    structured keys stay near log₂ n, because empty levels are never
+    hashed.
+- **Ordered scans** stay on the value rows on VOS. The tree serves
+  roots and proofs.
+- **A leaf:** `H(TAG_LEAF ‖ key' ‖ salt ‖ H(value))`. It does not depend
+  on its depth.
+- **A branch:** `H(TAG_BRANCH ‖ level ‖ left ‖ right)`. `level` is the
+  first bit where its two subtrees' keys differ. Empty levels are never
+  hashed.
+- **The empty tree's root:** `H(TAG_EMPTY)`.
+- **Deleting a leaf** replaces its parent branch with the sibling. A
+  leaf's hash does not depend on its depth, and a branch's commits its
+  own level, so the sibling's hash does not change.
+
+**Proofs:**
+- `BatchProof` is a multiproof for a set of keys. Each key is proven:
+  - present (its leaf);
+  - or absent, by the leaf for another key that its path reaches. A tree
+    of branching nodes has no empty child, so only the empty tree proves
+    absence by `H(TAG_EMPTY)`.
+- The proof holds the sibling hashes the paths need, each once, in a
+  canonical order.
+- `verify(root, proof, claims)` checks the claims. Along each path the
+  verifier checks:
+  - that levels increase strictly and stay below 256;
+  - that at each branch, the key's bit at that branch's level selects
+    the child taken.
+- **Range proofs** (ordered mode): `RangeProof` shows that the leaves
+  it holds are every key in `[from, to)`:
+  - the paths to the boundaries, with the siblings outside them as
+    hashes;
+  - every subtree between the two paths given in full, down to its
+    leaves.
+  - The verifier rebuilds the root from them, so a leaf left out of the
+    range changes the root. A bounded scan (from a cursor, at most
+    `limit` rows) is proven as the range from the cursor to the last
+    row returned, or to the end of the scanned prefix when fewer than
+    `limit` came back.
+- `update(proof, writes) -> root` computes the root after inserting,
+  changing and deleting the proven keys. It needs nothing beyond the
+  proof: an insert's path ends at the leaf (or the empty root) that
+  proved the key absent. This is the witness math that JAM refine and
+  attestable runs both use.
+
+**Salts** [owner decision 2]:
+- `salt` = the first 16 bytes of `H(TAG_SALT ‖ seed ‖ key')`, from the
+  work result's seed: 16 bytes, as section 9.3 has it.
+- One function, computed where the leaf is built: by the root builder on
+  VOS, from the seed of the version that wrote the row; in refine on
+  JAM, where `update` needs it and the batch carries the seed.
+- The builder stores the salt in the key's leaf row, so a later proof
+  needs no old seed.
+- Every replica derives the same salt, and so does a re-apply.
+- The salt changes on every write, so equal values in different rows or
+  versions never share a leaf hash.
+- No space secret is needed. The work result carries the seed and stays
+  inside the space, so salts hide values exactly as far as the seed is
+  kept: inside the space. A leader can bias the seed (section 8.5); a
+  biased salt is still a salt, and nothing rests on its entropy beyond
+  the space.
+
+**Tests:**
+- property tests over random sequences of inserts, changes and deletes;
+- every root checked against a from-scratch build of the same set;
+- every proof verified, and every tampered proof refused;
+- `update` from proofs agreeing with direct updates;
+- the in-PVM build (precompile, and the software fallback) agreeing
+  with the native one.
+
+### `CommittedMap<K, V>` [decided type; proposed rows]
+
+- **In the SDK:** a field type like `Table<K, V>`, with the same point
+  reads, writes and ordered scans. A handler never sees a root: on VOS
+  the root is built after commit.
+- **The ABI marks its writes as committed,** so the step's `Run` carries
+  them apart and accumulate knows which rows to mark dirty.
+- **No hashing on the apply path.** The accumulate host serves no
+  precompile, so two software hashes a write (`key'` and the salt)
+  would break the budget. Accumulate writes rows only; the native
+  builder hashes.
+- **Rows** in the agent's keyspace:
+  - **value rows:** `c/<map>/<key>` → `(version, value)`, the version
+    that wrote it;
+  - **dirty rows:** `d/<map>/<version>/<key>`, written in accumulate
+    beside each committed write, under the state version the write
+    makes, with the raw key so the builder finds the value row. One row
+    each, so the apply path stays at table cost (section 9.3). The
+    version keeps a later write's row apart from an earlier one's, so
+    consuming the rows through one version never deletes a newer row;
+  - **seed rows:** `s/<version>` → the work result's seed, one per
+    version that wrote a committed row, kept until the builder has
+    consumed that version;
+  - **the builder's rows,** which accumulate never writes:
+    - node rows `n/<map>/<level><prefix>` at branching points;
+    - leaf rows `l/<map>/<key'>` → `(key, salt, leaf hash)`: the
+      present keys in the tree's order, which the value rows (in key
+      order) cannot give, and what a proof needs once the seed row is
+      gone;
+    - a root row `r/<map>` → `(root, version)`.
+- **The root builder** runs on every replica:
+  - it takes a storage snapshot at the agent's state version V;
+  - it reads the dirty rows through V, in batches of 10,000 keys,
+    deduplicated and sorted by key;
+  - it computes each dirty key's `key'`, and its salt from the seed row
+    of the version that wrote it;
+  - **one invariant carries correctness:** every leaf and node row
+    whose subtree holds no dirty key matches the value rows;
+  - each batch recomputes the whole path of each of its dirty keys,
+    from the key's value row at V and the stored hashes of the
+    subtrees beside the path, which hold no dirty key or are
+    recomputed in a later batch for V;
+  - every row on a recomputed path is overwritten, or deleted where an
+    insert or delete moved the branching point, and a deleted key's leaf
+    row goes with it, so no row is left off the tree for a proof to walk
+    into;
+  - each batch is one commit through the node's writer. The root row
+    for V, and the deletion of exactly the dirty and seed rows through
+    V, go with the last batch for V. Apply never touches node rows, so
+    the commits race nothing.
+  - **Each commit carries the epoch it read,** and the writer refuses it
+    once the agent's epoch has moved (a snapshot switch or a
+    retirement). So node rows built on an old epoch never land in a new
+    one.
+  - It is deterministic: the state at V is the same on every replica,
+    so the root is too.
+  - **After a crash** it catches up at some V' ≥ V. A key stays dirty
+    until the last batch for its version commits, so the keys an
+    interrupted build touched are still dirty through V', the invariant
+    still holds, and the catch-up rewrites every row that build may
+    have left.
+  - It runs on the executor, off the apply path.
+  - A Raft snapshot carries the builder's, dirty and seed rows with the
+    rest of the keyspace. The builder restarts on a new epoch.
+- **Proofs on VOS:** `Node::prove(agent, map, keys)` answers a
+  `BatchProof` against the latest root and its version. Slice 5's attests
+  wait for the root at their window's index (section 9.3).
+- **Budget** (section 14): a committed write costs at most 5 µs on the
+  apply path, its value row and its dirty row included (two rows at
+  about 1.5 µs each, so the margin is thin), and the builder keeps up
+  with apply at the replicated row's rate.
+
+### Workflows [decided semantics (8.2, 8.3); proposed shape]
+
+**In the SDK:**
+
+```rust
+#[workflows]
+impl Shop {
+    #[workflow]
+    async fn checkout(ctx: &mut Workflow<Self>, order: Order) -> Result<Receipt, Error> {
+        let held = ctx.call(stock, stock::Hold { items: order.items }).await?;
+        let paid = ctx
+            .request(bank_agent, bank_ref, bank::Charge { amount: held.total })
+            .within(Duration::from_secs(30))
+            .await?;
+        ctx.checkpoint().await;
+        Ok(Receipt { paid })
+    }
+}
+```
+
+- **A workflow takes no `self`:** it holds no shared state, only its
+  own memory (section 8.2).
+- **Its own program,** built as attestables are: the macro emits the
+  workflow's entry, a crate of its own builds it (`workflow_program!`,
+  as `attestable_program!`), and the install carries it in the list of
+  programs beside the actor, `(MethodId, ProgramHash)`, with a workflow
+  kind. It is pinned with the install's other programs.
+- **`Workflow<A>`:**
+  - `call`: a same-agent instance, nested and synchronous, as in a
+    command;
+  - `send`;
+  - `request(..).within(d)`: another agent. It ends the step and awaits
+    the reply until the deadline;
+  - `start(..)` and `result(id).within(d)`: a workflow of another agent,
+    started, then its result awaited;
+  - `sleep_until(t)`;
+  - `checkpoint()`;
+  - `now`, `random`, `log`.
+- **`.await` stays in the API** (the owner's decision in draft 4). A
+  suspending call is a host call that does not return until the agent
+  resumes the machine, possibly in another process after a restore. So
+  the guest needs no executor: `block_on`'s single poll completes.
+- **Starting** [owner decision 3, for clients and agents alike]:
+  - a client request or an agent's `Call` naming a workflow starts one;
+  - the start answers `Started(id)` at once: a client's reply, or an
+    agent's first `Reply` (section "Requests and replies");
+  - its result is read by id, with an optional wait: by the client that
+    started it (its session's key is the workflow's owner), or by the
+    starting workflow, which awaits the result as a second await;
+  - a command's `send` that starts a workflow gets no reply.
+
+**In the default agent:**
+- **The workflow table** (system rows):
+  - `w/<id>` → `Workflow { program, owner, state, snapshot }`:
+    - `state`: running, awaiting an await with its deadline, sleeping
+      until a time, done with its result, or failed;
+    - `snapshot`: program counter, registers, gas, and the pages it
+      holds, each with its hash;
+  - `p/<id>/<page>` → the page, LZ4-compressed.
+- **A live workflow pins its program,** one pin per workflow, counted
+  with the install's pins and released at completion or failure. A
+  snapshot's counter and registers mean nothing on other code, so a
+  workflow resumes on the program it started on, whatever an upgrade
+  or uninstall does meanwhile.
+- **One due index for all timed rows:** session expiry, await
+  deadlines, timers, under one key format the leader and the agent
+  share. An expired deadline or a due timer starts a batch the way an
+  expired session does today.
+- **The node lists the due rows in the batch,** and refine reads each
+  by its key instead of scanning the index:
+  - the leader already reads the index natively to time the sweep, so
+    it puts up to `SWEEP_LIMIT` due rows into `Input::Sweep`;
+  - refine checks each named row exists and is due at the batch's time,
+    and ignores any that is not;
+  - so refine never scans, which JAM needs: a tree over hashed keys
+    proves single keys, never that a range holds nothing else.
+- **Due rows become steps, not sweep work:**
+  - session rows are collected as today (`Step::Swept`);
+  - a workflow's row becomes `InputRef::Due { workflow }`, a dispatched
+    step, which restores the machine and runs with the step's own gas
+    limit and instances, within the refine's gas, and waits for the next
+    batch like any step when the gas is not there;
+  - a `Due` step that traps fails its workflow, which removes its due
+    row, so no workflow row sticks at the head of the index and holds
+    the deadlines behind it.
+- **A step:**
+  - **Resuming input:** a start, a `Reply` for its await, or `Due` for
+    its deadline or timer.
+  - **Machine:** the agent restores the workflow's machine and passes
+    the input in.
+  - **Run:** it runs until the next suspending call, completion, a
+    trap or the step's gas limit.
+  - **Commit:** the step's synchronous calls' effects, its messages and
+    its snapshot commit together as one `Run`.
+  - **On a trap or the gas limit:** the step's effects are discarded,
+    and the step still consumes its input, as section 8.1 has it: the
+    workflow is marked failed, its pin and due row go, and its owner
+    learns of it. Earlier steps stay.
+- **Gas:** each step has a fixed limit, declared per workflow, with the
+  agent's default. A step is dispatched only if the refine's remaining
+  gas covers it, as handlers are (section 8.1). Preemption, if decision
+  5 takes it, lets a step's effect-free phase span refines.
+
+**Snapshots with Gray Paper calls alone,** the same calls on VOS and
+JAM, so a step's `gas_used` is the same on both hosts:
+- **Written pages, by faults:**
+  - a restored machine maps its writable pages read-only;
+  - its first write to a page exits `Fault(address)`;
+  - the agent marks the page written, sets it read-write and resumes.
+  - So the agent knows a step's written pages exactly, with no host
+    extension, and JAM charges the same calls.
+  - **The agent's own writes into the machine are tracked too.** It
+    pokes inputs, replies, reads and `random` into the workflow's
+    memory, and `poke` into a read-only page fails, so each such write
+    marks its pages written and sets them read-write first.
+  - **An inner precompile writes its output in place,** which a
+    read-only page refuses (the machine panics). So a workflow's
+    precompiles are served by the agent (the carried item, needed from
+    4.5 on): the inner machine exits, the agent computes and writes the
+    output through its tracked write.
+  - **The writable ranges** to arm come from the program's layout,
+    which the loader parses already.
+  - **Cost:**
+    - arming: the read-only mapping at restore, paid every step, in
+      proportion to the writable pages (4.0 measures it);
+    - one exit and one `pages` call per page written in a step: three
+      for a typical suspension (S1), 514 for a long computation's first
+      checkpoint.
+- **The program counter:** from `expunge`, at the step's end, on both
+  hosts. A machine is never kept past its step (decision 4), so nothing
+  is lost, and no VOS-only call changes the gas between hosts. If the
+  live-machine cache is ever built, the call that reads the counter
+  without ending the machine is priced as `expunge`.
+- **The snapshot:** the program counter, registers and gas, and for
+  each written page its index and hash, in a `pages` field of the step's
+  `Run`, apart from its writes.
+- **A page is stored when it differs from its base:** the program image
+  for image pages, zeros otherwise. A page written back to its base
+  deletes its row, so a restore gives the base again.
+- **The page bytes travel beside the work result,** not in it:
+  - on VOS, in the result's page section, LZ4-compressed per page;
+  - **a work result of 64 KiB or more travels as a blob,** its log
+    entry carrying the hash, as programs do since step 3.1. This
+    slice builds that path (4.4), on the program blobs' fetch and the
+    entry reports, so a 2 MiB checkpoint never rides inline beside
+    small entries;
+  - on JAM, as exported segments, one raw page each (see JAM mode).
+  - So the work result proper is the same on both hosts, and the pages
+    compare by their hashes.
+- **Caps:**
+  - 8 MiB raw of pages a step; past it the step fails;
+  - 16 MiB a result's page section; a step that would pass it waits for
+    the next batch, as the other caps do.
+  - Pages count apart from `STEP_WRITES` (256 KiB) and `WORK_RESULT`
+    (4 MiB), which stay as they are. S1's long computation ships 2 MiB
+    on its first checkpoint, which neither would hold.
+- **Accumulate** overwrites the page rows in place. A workflow owns its
+  pages, and only its latest snapshot is kept, so pages need no
+  reference counts until XOR deltas share them (section 8.3, later).
+  Completion deletes them.
+- **Restore:**
+  - acquire a machine for the program from the pool, at the snapshot's
+    counter: `instantiate` gains the counter that `machine` already
+    takes. A machine entered mid-block is charged that block's gas
+    again, the same on both of our backends; 4.0 checks PolkaJam does
+    the same;
+  - write the page rows into it with `pages` and `poke`, checking each
+    against its hash;
+  - set the counter, registers and gas.
+- **The leader's cache of live machines** (section 8.3) is built only
+  if restoring misses the budget: capture plus restore of 50 KB within
+  1 ms (section 14) [owner decision 4]. S1 measured restore at 0.11 ms
+  on the JIT; slice 1's pool makes acquiring a machine a few
+  microseconds.
+
+**Failover:**
+- A new leader resumes every workflow from its committed snapshot, on
+  the program the workflow pins.
+- Replies arrive in pair sequences, so a reply is never applied twice.
+- An await's deadline is batch time, never a local clock.
+
+### JAM mode [decided direction (section 12); proposed details]
+
+- **Work on JAM:** the work item's payload is `Work::Package { batch,
+  witness, root }`, with:
+  - `root`: the agent's root before;
+  - `witness`: a `BatchProof` over every key the refine reads or writes,
+    with their values.
+- **Refine serves its own state reads from the witness.** The witness is
+  verified once against `root`, and a key it does not cover traps.
+- **Refine also applies the work result,** as accumulate does on VOS:
+  the same `apply` code, run over the witness, writing session marks,
+  replies, the outbox, pair marks, due rows, workflow rows and page
+  rows. The root after covers every row it writes, so the witness
+  covers every key `apply` reads or writes, beside the handlers' keys.
+- **The whole keyspace is one tree:** system rows, actor tables,
+  committed maps, workflows and their pages (section 12). Every row
+  written on JAM is a salted leaf.
+- **Scans on JAM are witnessed** [owner decision 8]:
+  - the whole-keyspace tree is ordered, so the builder's simulation
+    records each scan's range and the witness proves it complete with
+    a `RangeProof`;
+  - refine serves `state_scan` from the witness, and a scan past what
+    the witness covers traps;
+  - the sweep stays scan-free (the batch names its due rows), so the
+    common path pays no range proof.
+- **Refine's output** is capped on JAM, so it holds only:
+  - `root`, and the root after (`update` over every write, salts
+    computed in refine from the batch's seed);
+  - the batch's time and seed;
+  - the work result's hash.
+  The work result itself is exported to DA with the pages, and the
+  builder keeps it.
+- **Accumulate on JAM:**
+  - checks `root` against the root it stores, and refuses the result on
+    a mismatch;
+  - checks the time against the slot, within the session skew;
+  - stores the root after;
+  - stores nothing else, so state data lives in DA and with the
+    builder.
+  - It verifies nothing else about the work result: the builder is
+    trusted for its content. That is section 12's model, in which JAM
+    agents verify proofs from spaces and produce none. A space's own
+    agent on JAM is as trustworthy as its builder until slice 5's
+    proofs.
+- **Root continuity serializes an agent's packages.** The builder chains
+  them with prerequisites.
+- **Snapshot pages:**
+  - each written page is exported as one segment (4,104 bytes: the
+    page, then 8 zero bytes);
+  - the page's row holds its hash, the exporting package's segment root
+    and the segment's index. An import by package hash works only while
+    that package is in recent history (8 blocks), and by segment root
+    for as long as DA holds it (4.0);
+  - the package that resumes the workflow imports those segments, and
+    refine checks each page against its hash. A segment exported as
+    zeros by a failed package fails that check;
+  - a package holds at most 3,072 imports and 3,072 exports (12 MiB),
+    so the builder schedules workflows' pages within them, and a
+    workflow whose pages do not fit waits for the next package.
+- **The default agent detects the mode from its work.** A
+  `Work::Package` brings its own witness, so no host flag exists.
+- **The JAM-only host in CI** learns `fetch` (payload, parameters and
+  imports), `export` with its offset, and import segments supplied by
+  the test. Its prices become PolkaJam's where they differ (4.0): `gas`
+  48, `log` 1,000 and answering `WHAT`, an unserved call 1,000.
+- **A work result never depends on the outer machine's gas readings:**
+  the agent dispatches by its own accounting of step limits against the
+  batch's budget. Host-call prices differ between hosts (the loader's
+  `instantiate` attempt costs 1,000 on JAM and nothing on VOS), and
+  must not change which steps run.
+- **The dynamic comparison grows** to batches that read state, batches
+  that run actors and workflows suspended across packages. The work
+  result must match the VOS run byte for byte. Only the JAM output's
+  roots and exports are extra.
+- **Time and the seed:** the builder supplies them in the batch, and
+  refine passes them to accumulate in its output.
+
+**The builder** (`node/jam`, a library and `vos jam` commands):
+- it holds the agent's full state in a node store, with one root over
+  the whole keyspace;
+- it assembles a batch from its own queue;
+- it simulates refine on the JAM-only host, recording every key read
+  or written, then builds the witness and the package (imports of the
+  pages it resumes);
+- it submits the package and waits for its accumulation;
+- it applies the work result to its store, whose root must equal the
+  root after.
+- **Deployment** waits until the code preimage is available at the
+  package's lookup anchor, checked by the builder itself: `jamt`'s
+  wait did not prevent SJ's race in 4.0, where a package declaring
+  exports failed with an export-count error and left zero segments.
+- **Imports name segment roots,** never package hashes, which expire
+  after 8 blocks of history.
+- **The service blob's metadata prefix** moves from SJ's tool into the
+  compiler's linker.
+
+### The carried smaller items [proposed]
+
+- **The agent serves its inner machines' precompiles:**
+  - itself, at the fixed price on every host;
+  - natively through the outer host's precompile on VOS;
+  - in software inside the agent on JAM.
+  - Then actor-running batches compare across hosts, and a workflow's
+    precompiles write through the agent's tracked writes (4.4).
+- **`#[msg(linearizable)]`:** the handler always reads after a read
+  index, whatever the client asked.
+- **`historical_lookup` answers only programs the agent pins**
+  [owner decision 6]: as JAM scopes a lookup to the service's
+  preimages, and as `instantiate` already does.
+
+## Steps
+
+### 4.0 JAM probe [done]
+
+Recorded in `slice-4-progress.md`: all three behaviours hold on
+PolkaJam and on both of our backends, with identical gas for every
+inner-machine call.
+
+The plan rests on Gray Paper behaviours that PolkaJam and our runtime
+must both show. A probe service on the testnet (from SJ's guest) and the
+same checks on our two backends:
+- **fault tracking:** a write to a read-only page exits
+  `Fault(address)`; after `SetReadWrite` the machine resumes and the
+  write lands; `poke` into a read-only page fails;
+- **the counter:** `expunge` at a host-call exit returns the counter
+  after the call, and a machine created there (`machine(code, pc)`)
+  resumes correctly, charged the same gas for entering mid-block;
+- **segments:** two pages exported by one package, imported by a later
+  one and read back with `fetch`.
+
+It also records:
+- each call's gas on PolkaJam against our JAM-only host, including the
+  arming: `pages` setting a whole writable region (2,048 pages for an
+  8 MiB arena) read-only;
+- PolkaJam's refine gas budget per work item;
+- how imports are named when a package is submitted;
+- the PolkaJam build in use, and how the testnet starts here;
+- the fault loop on both PolkaVM backends: the interpreter, and the
+  recompiler, which needs `vm.unprivileged_userfaultfd=1`. That setting
+  is 0 here, and the kernel is the owner's, so the recompiler run waits
+  for the owner's word. The milestone runs on the backend the probe
+  proves.
+
+### 4.1 The wire, and requests and replies between agents
+
+- **The slice's wire changes, at once:**
+  - `Message`'s body, `Input::Failed`, `Behind`, the `Due` input, the
+    due rows in `Input::Sweep`, `Run`'s `pages`, the committed-write
+    flag, a workflow kind beside the install's attestables;
+  - the owner's three wire-format items, if taken [owner decision 7].
+  - Later steps then only use them.
+- **The receiver's side of a request:** a `Call` that awaits gets its
+  `Reply` in the sender's outbox, its outcome whatever it was.
+- **The failed message** as `Input::Failed`, asserted after two lone
+  failures.
+- **`Behind`** for fast retransmit.
+- **Tests:**
+  - a failing message acknowledged once, never resent;
+  - a gap recovered within one round trip;
+  - a stale `Behind` changing nothing;
+  - a `Call` with an await answered by a `Reply` in the outbox, after a
+    leader kill too.
+  - Consuming replies waits for 4.5, which has something that awaits.
+
+### 4.2 The compressed tree
+
+`agent/tree`, with the property tests, and S4's update costs reproduced
+on it.
+
+### 4.3 `CommittedMap` and the root builder
+
+- The SDK type, the rows, accumulate's dirty and seed rows, the builder
+  in the node with the epoch-checked commit, and `Node::prove`.
+- **A crash test:** the builder killed mid-build resumes to the same
+  root, with no node or leaf row left off the tree.
+- The section 14 row: the committed write on the apply path (value and
+  dirty rows), and the builder at the replicated rate.
+- It shares nothing with 4.4 to 4.6, so it can run beside them.
+
+### 4.4 What workflows need underneath
+
+- **The result's blob path:** a work result of 64 KiB or more as a
+  blob, with its page section.
+- **`instantiate` with a counter.**
+- **The agent's tracked writes into a machine.**
+- **The agent serving its machines' precompiles,** at the fixed price
+  on every host, with each call's bounce counted. Actor-running batches
+  then compare across hosts.
+- **Programs beside an actor:** the workflow kind in installs, and
+  `workflow_program!`.
+
+### 4.5 Workflows in the agent
+
+- `#[workflow]`, `Workflow<A>` and the ABI operations.
+- The workflow table and pins, the shared due index with the node
+  listing due rows, and `Due` steps.
+- Fault-tracked snapshots and restore, deadlines and timers, failure,
+  results by id.
+- **The testkit's reference model and tests on one node:**
+  - S1's three workflows (transfer, saga, compute);
+  - replies consumed, and late ones dropped;
+  - the interpreter and the JIT agree on every step's `gas_used` and
+    snapshot.
+
+### 4.6 Workflows in the replicated node
+
+- Ingress: `Started(id)`, and a workflow's status and result by id for
+  its owner, with an optional wait.
+- **The checker's workflows:**
+  - started, killed mid-await, and resumed from their snapshots;
+  - their effects counted exactly once;
+  - requests between agents with replies.
+- A fault-suite case across processes.
+- The snapshot row of section 14 measured through the agent, and the
+  live-machine cache built only if that row misses.
+
+### 4.7 The carried smaller items
+
+- `#[msg(linearizable)]`;
+- `historical_lookup` scoped to the agent's programs;
+- the fan-in bench, and batching across agents only if the bench shows
+  frames, not refine, bound it.
+
+### 4.8 JAM mode
+
+- `Work::Package`, witnessed reads, roots before and after, salts in
+  refine, pages through segments, `state_scan` trapping.
+- The JAM-only host's `fetch`, `export` and imports, with DA emulated
+  in process.
+- **The recording simulation and the witness build,** which the
+  builder reuses in 4.9, so `ci` can chain packages without a JAM node.
+- **The dynamic comparison:** stateful batches, actor batches and
+  workflows suspended across packages, the work result equal byte for
+  byte and the pages equal by hash.
+
+### 4.9 The builder and the milestone
+
+- `node/jam` and `vos jam`: the store with one root over the whole
+  keyspace, submission, waiting for code availability, the service's
+  metadata in the compiler's linker.
+- **On a local PolkaJam testnet:**
+  - the default agent and one actor deployed;
+  - a workflow suspended in one package and resumed in a later one,
+    every read witnessed.
+- A recipe, `just jam-milestone`. It is outside `ci`, because it needs
+  the PolkaJam binaries.
+
+### 4.10 Acceptance
+
+- The section 14 rows: committed writes and the builder keeping up,
+  snapshot capture and restore, the cross-node messaging bench.
+- **New rows measured:**
+  - a workflow's resume latency: a reply in, the workflow resumed, on
+    three processes;
+  - a witnessed JAM read's gas.
+- Then:
+  - `just ci-full`;
+  - the checker loop with workflows;
+  - the end review (Fable);
+  - the code-quality review (Opus);
+  - each carried item closed or carried to a named slice.
+
+**Size:** about 16,000–23,000 lines of code and tests (the code check's
+estimate): the tree 2,000, workflows in the agent 3,000, JAM mode 2,500,
+the builder 3,000, the rest 1,000 each or less.
+
+## Gates
+
+| Gate | Threshold |
+|---|---|
+| Slices 1 to 3 | `just ci-full` stays green |
+| The tree | the property tests: roots equal a from-scratch build; proofs verify and tampered ones fail; `update` agrees with direct updates; PVM and native agree |
+| Roots | every replica's root at a version is the same; a crash mid-build resumes to it, with no node or leaf row left off the tree |
+| Workflows | the exactly-once checker with workflows across leader kills; the interpreter and the JIT agree on every step's snapshot and `gas_used` |
+| JAM | VOS and JAM refines agree on every comparable batch in `ci`; the milestone on a PolkaJam testnet |
+| Budgets | as in 4.10 |
+
+## Risks
+
+- **PolkaJam may differ from our runtime** on faults, `expunge`, mid-block
+  entry gas or segments, and our own runtime has never run the
+  read-only write loop. Step 4.0 finds out on both before anything
+  builds on them.
+- **PolkaJam is a nightly.** The milestone pins one build and records
+  how to start it.
+- **The witness covers every key a refine touches.** A JAM refine that
+  reads a key the builder's simulation did not see traps. So the
+  builder's simulation and the refine must run the same code on the
+  same host interface; the dynamic comparison guards that.
+- **Fault tracking costs an exit per written page.** A long computation's
+  first checkpoint pays 514 of them, and every step pays the arming;
+  measured in 4.5 against the snapshot row.
+- **The slice is the widest so far:** messages, storage, the SDK, the
+  agent, the node and JAM. Each step stands alone and is checked
+  alone, in the order above.
+
+## Decisions [decided by the owner, except 5]
+
+1. **Proving stays in slice 5:** attestable methods reading committed
+   fields, and cipher-clerk on the new format, move there with the
+   prover track. This slice builds the tree, the map, the roots and
+   JAM's witnessed reads.
+2. **Salts from the work result:** the first 16 bytes of
+   `H(tag ‖ seed ‖ key')`, not from a space secret, which needs key
+   management no slice has yet.
+3. **A started workflow answers `Started(id)` at once,** to a client or
+   to a starting workflow, and its result is read by id, with an
+   optional wait.
+4. **The leader's live-machine cache only if the budget needs it,**
+   restoring from rows otherwise.
+5. **Preemption** [under discussion]: proposed as an implicit
+   checkpoint, below.
+6. **`historical_lookup` scoped to the agent's pinned programs,** as on
+   JAM.
+7. **The wire-format items now,** with this slice's other wire changes
+   in 4.1:
+   - the refusal and failure codes as enums;
+   - the `PeerMessage` index gap;
+   - the directory acknowledgement's order tuple.
+8. **Scans on JAM in this slice:** the tree gains an ordered mode with
+   range proofs, which JAM's whole-keyspace tree uses, so an actor that
+   scans its tables runs on JAM too.
+
+**Decision 5, preemption as an implicit checkpoint** [proposed]. Section
+8.3's effect-free preemption, built on this slice's snapshots instead
+of on live machines:
+- **The effect-free phase** runs from a step's resume to its first
+  effect (a call, send, request or start). The workflow's machine runs
+  on the refine's gas share for it, by the agent's own accounting.
+- **If the share runs out there,** the machine exits out of gas at the
+  start of a block, having done nothing of it. The agent ends the step
+  with a snapshot and no effects: an implicit `checkpoint()`. The
+  workflow is due at once, so the next batch continues it, and a
+  failover resumes from that snapshot as from any.
+- **At the first effect,** the workflow exits to the agent for it.
+  Before serving it, the agent checks that the refine's remaining gas
+  covers the step's limit. If not, it ends the step there, snapshotted
+  at that call, still effect-free, and the resumed step serves the
+  pending call first.
+- **The effectful phase,** from the first effect to the step's end,
+  runs within the step's limit and is never preempted. Past the limit
+  the step fails.
+- **What it adds:**
+  - a snapshot per preemption;
+  - resuming at a pending host call;
+  - resuming after an out-of-gas exit, which the probe is extended to
+    check on PolkaJam and on ours before 4.5 builds on it.
+- **What it gives:** a long computation spans refines with no explicit
+  `checkpoint()`, and a heavy workflow never holds a batch past its
+  share.
+- **Recommended: in this slice,** in 4.5, since it is a small addition
+  on the snapshots 4.5 builds anyway.
+
+**Core-model edits these decisions make,** amended with the plan:
+- §8.2 "Its result is sent to whoever started it" becomes: answered
+  `Started(id)`, the result read by id (decision 3).
+- §8.3 "The leader caches live machines" becomes conditional on the
+  budget (decision 4); "Pages are reference-counted by snapshots"
+  waits for XOR deltas, since a workflow owns its pages.
+- §8.3 preemption: as decision 5 settles it.
+- §9.3: the salt source is the work result's seed (decision 2); keys
+  enter a tree hashed or ordered, chosen per tree (decision 8).
+- §12: JAM's whole-keyspace tree is ordered, and scans are witnessed by
+  range proofs (decision 8).
+
+**Defaults** (engineering, recorded rather than asked):
+
+| Setting | Value |
+|---|---|
+| Await deadline | 60 s by default, set per call with `within` |
+| Workflow step gas | the handler default, 10M |
+| Snapshot per step | 8 MiB raw at most; 16 MiB of pages a result |
+| `Behind` | one rewind per window per 100 ms |
+| Live workflows | 65,536 per agent, refusing new ones past it |
+| Root builder batch | 10,000 dirty keys |
+| Tree hash | BLAKE2b-256, keys hashed to 32 bytes, 16-byte salts |
