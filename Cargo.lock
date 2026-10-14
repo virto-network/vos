@@ -2530,6 +2530,7 @@ dependencies = [
  "vos-pvm",
  "vos-pvm-compiler",
  "vos-raft",
+ "vos-tree",
  "vos-wire",
 ]
 
@@ -2702,6 +2703,7 @@ dependencies = [
  "vos-pvm",
  "vos-pvm-codec",
  "vos-pvm-program",
+ "vos-tree",
 ]
 
 [[package]]
