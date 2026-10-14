@@ -1,12 +1,17 @@
 # Identity and authority
 
-Draft 2 of a design run. Draft 2 adopts the owner's idea of personal
-spaces: one trust model everywhere, with privacy from operators reached by
-being one's own operator. The design run covers: who acts in a space, how a request proves it,
-what each actor may do, and what anyone outside a space learns. Nothing
-here is decided. Each section offers options and the one this draft
-leans to, for the owner to weigh over several rounds before any slice is
-planned on it. Tags as in the core model.
+Draft 3 of a design run on who acts in a space, how a request proves
+it, what each actor may do, and what anyone outside a space learns.
+- Draft 2 adopted the owner's idea of personal spaces.
+- Draft 3 folds a second opinion (Fable):
+  - secrecy and anonymity as two axes;
+  - one primitive for grants and credentials;
+  - ingress verifying, so guests never check signatures;
+  - personal spaces as device-local runtimes;
+  - the transport an anonymous sender needs.
+
+Nothing here is decided: the owner weighs it over several rounds before
+any slice is planned on it. Tags as in the core model.
 
 ## 1. What the owner asks for
 
@@ -20,9 +25,13 @@ planned on it. Tags as in the core model.
   - or a proof of membership that does not reveal which member acts.
   - VOS identity stands alone; Kreivo may move onto the agents-on-JAM
     model.
-- **Privacy in tiers.** Most spaces trust their own operators. Some
-  actions must be hidden even from them, as cipher-clerk's fully
+- **Privacy where it is needed.** Most spaces trust their operators.
+  Some actions must be hidden even from them, as cipher-clerk's fully
   private payments, proven on the user's device, intend.
+- **One trust model** (the owner's idea): a space's operators see
+  everything in it. Privacy from operators comes from keeping secrets in
+  a space of one's own, a personal space, and sending a shared space
+  only proofs.
 - **Portable standing, not a portable handle.** Reputation, financial
   standing or other facts held privately in one space may be useful to
   another. Carrying them across is wanted; a global identifier that
@@ -39,278 +48,327 @@ planned on it. Tags as in the core model.
 ## 2. What exists today
 
 - **A caller is a principal:** a client's key or another agent.
-- **Each agent keeps a table** from principals to role bytes, set by
-  the operator's CLI, and a handler names the role it needs
-  (`#[msg(role = ..)]`). A workflow's role is checked at its start.
+- **Each agent keeps a table** from principals to role bytes, set by the
+  operator's CLI, and a handler names the role it needs. A workflow's
+  role is checked at its start.
 - **Clients sign each request** with their key, inside a session the
   client names (slice 3).
-- **Nodes** have keys of their own, and a space's nodes trust each other
-  (core model §5): the trust model is crash faults only.
-- **No identities, no devices, no tiers, no delegation, no anonymous
-  callers.**
+- **Ingress authenticates clients into principals,** and the agent
+  receives the authenticated origin. Guests never check signatures
+  (core model §5).
+- **Nodes** have keys of their own, and a space's nodes trust each other:
+  the trust model is crash faults only.
+- **No identities, devices, delegation or anonymous callers.**
 
-## 3. Threat models: tiers of privacy
+## 3. Two axes: who can read the data, and who is known to act
 
-| Tier | Hidden from the public | Hidden from other spaces | Hidden from the space's operators | Example |
-|---|---|---|---|---|
-| **S, space-trusted** | everything but what a proof returns | everything but what a proof returns | nothing | most spaces; a community's channels |
-| **X, private across spaces** | as S | as S | nothing | cipher-clerk's first tier: the ledger is plain to its space, and transfers between spaces settle on JAM through proofs |
-| **O, blind to the shared space's operators** | as S | as S | the member's secrets and which member acted; the shared space sees commitments, nullifiers and proofs | cipher-clerk's later tier: private payments proven on the user's device |
+Secrecy and anonymity are different things, so they are two axes, not
+one tier:
 
-**Tier O needs no trust model of its own** (the owner's idea). A
-space's operators see everything in it, everywhere. Privacy from the
-operators of a shared space comes from keeping one's secrets in a space
-of one's own, a personal space (§8), where one is the operator, and
-sending the shared space only proofs. Tier O is tier X between a
-personal space and a shared one.
+| | **Actor named** | **Actor anonymous** |
+|---|---|---|
+| **Data the operators can read** | plain actor state, signed origins: most spaces | proof origins with a nullifier: anonymous votes, polls, rate-limited posting |
+| **Data hidden from the operators** | data encrypted to its members, as the messenger's end-to-end encryption does, or held in a personal space | a personal space plus a shared shielded pool: private payments |
 
-## 4. Concepts, kept apart
+- **Every cell keeps one trust model:** a space's operators see what is
+  in it. What they cannot read was never given to them in clear: it
+  was encrypted to its members, or kept in a personal space.
+- **Facts proven about oneself** (credentials, §7) sit in the anonymous
+  column with no secret state at all: the prover shows a fact and stays
+  unlinkable.
+- **Across spaces,** every cell discloses only what a proof returns.
+- **A personal space** (§8) is a topology that serves the "hidden from
+  the operators" row, not a tier of its own.
 
-Most systems tangle these. Keeping them apart is what keeps the
-primitives small.
+## 4. Five concepts
 
 | Concept | Answers | Lives in |
 |---|---|---|
-| **Identity** | who, stably, in this space | the space's identity agent |
-| **Authenticator** | how a request proves it speaks for an identity | a device key, a passkey, an SSH key, a hardware token, a membership proof |
-| **Membership** | what relation a principal has to the space: hosting, syncing, using | the space's roster |
-| **Origin** | who a running call acts for, as the agent sees it | every request and message |
-| **Authority** | what an origin may do here, and why | grants, roles, guards on methods |
-| **Credential** | a fact one actor attests about an identity, that another may check | issued by actors, proven by their holder |
-| **Pseudonym** | the identifier a space sees for a person | per space, unlinkable by default |
+| **Identity** | who, stably, in one space | the space's identity agent |
+| **Authenticator** | how a request proves it speaks for an identity | a device key, a passkey, an SSH key, a hardware token |
+| **Origin** | who a running call acts for, as the agent sees it | every logged input |
+| **Attestation** | a claim an issuer makes about a subject, valid until a time, revocable by its issuer | issued by actors; shown in clear as a grant, or proven in zero knowledge as a credential |
+| **Membership** | a principal's relation to a space, on independent axes | the space's roster |
 
-## 5. Authority: three candidate shapes
+- **A pseudonym** is just an identity in another space (§7).
+- **A scope** is a field of an attestation.
+- **An anonymous membership proof** authenticates no identity, so it is
+  not an authenticator: it is an origin (§5).
 
-**A. Roles, extended.** Today's tables, with identities in place of keys
-and a role for each tier.
-- Simple, and what developers already know.
-- No delegation, so a device or app holds a member's full power.
-- Authority from a collective decision has no place in it.
+## 5. Authority: origins, attestations and guards
 
-**B. Origins and capabilities** [this draft's leaning].
-- **Origins:** a call carries an origin, the authenticated subject:
-  - an identity;
-  - an agent;
-  - a collective decision, which a governance actor produces when a vote
-    passes;
-  - an anonymous member, a proof with a nullifier for its scope.
-  - This is Substrate's real insight: authority can be *derived*, not
-    only held by a key.
-- **Capabilities:** authority is granted as signed grants that can be
-  narrowed and delegated, offline, without asking the space. For
-  example: "identity X lets this app call `transfer` on actor A, up to
-  100, until Friday". The grant chain rides with the request, and the
-  agent checks it.
-- **Roles become sugar:** a named bundle of capabilities granted to
-  identities by the space.
-- **Guards on methods:** a method states what it requires as a guard
-  over the origin and its capabilities. `#[msg(role = ..)]` becomes one
-  kind of guard, alongside others such as requiring a collective's
-  decision or an anonymous member of a set.
-- **The cost:** revocation. A delegated grant lives until it expires,
-  unless the space keeps a revocation list that guards consult. Short
-  expiries plus revocation by the grant's issuer is the usual answer.
+**Ingress verifies; the log carries the result; guards read state.**
+This keeps the decided principle that guests never check signatures:
+- verifying ed25519 or P-256 signatures in refine would be paid on every
+  replica;
+- on JAM it would be paid in software, with no signature precompile and
+  BLAKE2b alone at about 20k gas a compression.
+- **At ingress** (the node), a request's evidence is checked: its
+  device's signature, the attestations it presents, a proof. It is
+  reduced to an origin plus an authority set: the claims it was shown
+  to hold, narrowed.
+- **The log entry carries** that origin and authority set, never the
+  evidence.
+- **A guard on a method** reads only the logged origin, the authority set
+  and state (roles, grants, epochs). So every replica, and a JAM
+  witness, evaluates the same bytes.
 
-**C. Object capabilities only.** No ambient identity in authorization at
-all: whoever holds a reference to a method may call it, and identities
-serve only accounting and audit.
-- The cleanest model in theory.
-- It fights the actor framework, where methods are named on an
-  instance, and makes "who did this" a separate question.
+**Four kinds of origin:**
+- `Identity { id }`: a person or service in this space, through a
+  device;
+- `Agent { id }`: another agent of this space;
+- `Jam { service }`: a JAM service, authenticated by the chain or a
+  light client;
+- `Anonymous { scope, nullifier }`: a proof that the sender holds a
+  claim, once in this scope.
 
-| | A | B | C |
-|---|---|---|---|
-| Delegation to devices and apps | no | yes, narrowed | yes |
-| Authority from collective decisions | no | yes (origins) | awkward |
-| Anonymous callers | bolted on | an origin like any | natural |
-| Revocation | the table | expiry plus a list | hard |
-| Developer model | familiar | guards on methods | unfamiliar |
-| Same on VOS and JAM | yes | yes | yes |
+**A collective decision is not an origin kind.** It is a message from a
+governance agent carrying an attestation (`decision(d)`). A guard that
+wants one says "from agent G, with claim `decision(d)`". Substrate's
+collective origins become a shorthand for that guard.
+
+**Attestations, used two ways:**
+- **Grants,** shown in clear inside a space. An identity delegates a
+  narrowed grant to a device or an app, for example: "this app may call
+  `transfer` on actor A, up to 100, until Friday".
+- **Roles** are named claim sets an issuer grants. `#[msg(role = ..)]`
+  stays, as one kind of guard.
+- **Credentials,** proven in zero knowledge against the issuer's anchored
+  root (§7).
+
+**Object capabilities are the special case** where a grant names one
+instance and one method, so this design subsumes them; it need not argue
+against them.
+
+**Revocation by epochs:**
+- each identity, and each device under it, has a revocation epoch in
+  the identity agent;
+- a grant carries its issuer's epoch at issue;
+- bumping the epoch voids every earlier grant, at the cost of one state
+  read at ingress;
+- short expiries, in batch time (monotone, core model §8.4), cover the
+  rest;
+- a list is for selective revocation only;
+- credentials are revoked by freshness (§7).
+
+**On VOS and JAM: the same guards, different evidence.**
+- Inside a space the evidence is signatures and grants, checked at
+  ingress.
+- Across the boundary the origin is the sending service or space, and the
+  authority is a proof (§10).
 
 ## 6. Identity in a space
 
-- **An identity agent per space,** a system agent:
-  - an identity has an id, a set of authenticators with a policy, and
-    recovery;
-  - **the policy:** any one device, a threshold of them, or one device
-    within limits;
-  - **recovery:** guardians, a delay, a registrar.
-  - Requests are signed by a device; the node or agent resolves the
-    device to its identity, and the origin is the identity.
-  - **Sessions** (slice 3) are opened by a device and act for its
-    identity.
+- **The identity agent:** a system agent per space.
+  - **An identity's id** is the hash of its creation record, as agent ids
+    are, never a key.
+  - **It holds** a set of authenticators with a policy (any one device, a
+    threshold, one device within limits), a revocation epoch, and
+    recovery.
 - **Authenticators:**
   - ed25519 keys, as today;
   - SSH keys, signing through an agent without exposing the key;
-  - passkeys (WebAuthn, P-256), which need P-256 verification: a
-    precompile, as BLAKE2b has;
-  - hardware tokens;
-  - an anonymous membership proof, which proves "a member of this set"
-    and nothing more.
+  - passkeys (WebAuthn, P-256);
+  - hardware tokens.
+  - Ingress verifies them all, so this needs signature checks at
+    ingress, not precompiles inside guests.
+- **Ingress needs the identity agent's table:**
+  - a device must resolve to its identity and epoch before the request
+    is logged;
+  - but roles live per agent, and ingress has no read across agents.
+  - **Two shapes:**
+    - the identity table is a read-only view every node keeps synced (a
+      Merge scope fits);
+    - or ingress asks the identity agent, a round trip per request.
+  - This decides how a session opens, so it comes early (§14).
 - **Operators are identities too:** a node's key is bound to its
-  operator's identity, so hosting and acting are one person in two
-  roles, never one key for both.
-- **The registrar of identities** is the space's choice: open
+  operator's identity, so hosting and acting are two grants, never one
+  key for both.
+- **Registration of identities** is the space's choice: open
   self-registration, invitation (the onboarding tokens master had),
   or a governance decision.
 
-## 7. Membership, as axes rather than a ladder
+## 7. Credentials: facts proven about oneself
 
-- **Hosting:** runs a node in the consensus of some agents. A space
-  grants it per agent, and it is what placement already uses.
-- **Syncing:** a light node or device that replicates only some agents,
-  or some Merge scopes (§9.4), for reading and local use. It needs read
-  authority per agent or scope, never write.
+**What it is:**
+- An actor in one space attests a fact about one of its identities,
+  such as "reputation at least 50", "a member since 2025" or "a verified
+  human". The attestation is a leaf under the issuer's committed root.
+- The holder proves the fact to another space, or to JAM, in zero
+  knowledge against the issuer's anchored root (§11), without revealing
+  the identity or anything beyond the fact.
+- This is the portable standing the owner described, with no global
+  handle.
+- A Kreivo pass becomes a credential proven against Kreivo's state, not
+  an authenticator of its own.
+
+**Pitfalls to design for:**
+- **The issuer gives the holder the leaf's salt and path.** Salts derive
+  from a version's seed the holder never sees (core model §9.3).
+- **Timing links:** a credential issued in A and proven in B within one
+  window links by time, so proofs should wait or batch.
+- **A nullifier is scoped,** "once in this scope", and never global, or
+  it becomes the global handle the owner refuses.
+- **A leaf is keyed by the identity and its revocation epoch,** so an
+  identity revoked in A cannot keep proving old facts in B.
+- **Freshness:** a verifier demands a root within N windows, and the
+  issuer drops a revoked leaf, so a credential lapses within N windows
+  of its revocation.
+
+**Opt-in linking:** a holder can prove "the same person as identity X in
+space A", and only to whom they choose.
+
+## 8. Personal spaces
+
+**What it is** (the owner's idea):
+- A personal space is the VOS runtime inside the person's wallet app: a
+  space with one node, a Raft group of one (the node already runs
+  groups of one replica), whose state lives on the device.
+- It holds the person's secrets: notes, spend and viewing keys,
+  credentials, and the master secret their pseudonyms derive from.
+- It is a full space with one node, not a lighter kind. A note set and
+  its spent marks need linearizable updates across one person's
+  devices, or the person double-spends against themselves.
+
+**Durability is the threat, not the operators.**
+- A lost phone is lost notes, keys and credentials. A Raft group across
+  phones does not help, because phones are offline and a quorum is
+  rare.
+- **The shape is one primary device plus encrypted snapshot replicas:**
+  other devices, or a hosted store.
+- **A hosted personal space is an encrypted replica that holds no keys,**
+  not an operator; otherwise it is custody under a nicer name.
+- **Recovery** (guardians, a delay, a seed) is the base case here, not
+  an option.
+- **Pseudonyms derive deterministically** from the master secret and the
+  space's id, so a seed recovers every one of them.
+
+**Private payments: a message between spaces, but not on the pair
+transport.**
+- **The shared space holds the shielded pool:** note commitments, spent
+  nullifiers, anchors, and the notes waiting for their recipients.
+- **The payer's wallet actor proves, on the device:** "I own these notes
+  under anchor A; these are their nullifiers; these new commitments
+  balance them".
+- **An anonymous message cannot use the agent-pair transport,** because
+  pairs, acknowledgements and `Behind` all name the sender agent and get
+  exactly-once by its sequence. So the proof travels the client path
+  without a session:
+  - a self-authenticating input, deduplicated by its nullifier (the
+    proof is the idempotency key);
+  - no acknowledgement and no reply: the sender learns of its success by
+    watching the pool's public state, as a wallet watches a chain.
+- **Anonymous inputs need a cost,** probably a fee note inside the proof,
+  or spam is free.
+- **The pool checks the proof at ingress,** applies the new commitments
+  and the notes, and can net-settle with other spaces on JAM.
+
+**Two dependencies that are the actual privacy work:**
+- **A relay layer.** Which node and network address submitted an input,
+  and when, links the payer as surely as a name would. It needs a track
+  of its own, with an owner.
+- **Note discovery.** Notes encrypted to a recipient's viewing key can be
+  found in two ways, and one must be chosen and costed:
+  - the recipient scans the whole pool, at a cost that grows with it
+    (the light-client problem shielded chains have);
+  - or detection keys flag candidate notes, as cipher-clerk's fuzzy
+    message detection does, which is experimental today.
+  - "Receiving needs no one online" depends on this choice.
+
+**Proving on the device:**
+- the spend kernel is small, around 0.2 to 0.5M steps with precompiles
+  by S5's estimate;
+- proving it on a phone needs the mobile prover work, or a fixed
+  circuit (§14).
+
+## 9. Membership, as axes
+
+- **Hosting:** runs a node in the consensus of some agents, granted per
+  agent; placement already uses it.
+- **Syncing:** a light node or device replicating some agents, or some
+  Merge scopes, for reading and local use. It needs read authority per
+  agent or scope, never write.
 - **Using:** acts on actors through any node, with no node of its own.
 - **Guests:** public methods only.
 
-Hosting grants no application authority. An operator can stop serving
+Hosting grants no application authority: an operator can stop serving
 an agent, but approving a payment is a member's grant like any other.
-Under tier S an operator can still read state, because it runs it;
-tier O is where that changes.
 
-## 8. Personal spaces (tier O)
+## 10. VOS and JAM: origins carried by their transport
 
-**A personal space is a person's own pod:**
-- its nodes are their devices;
-- it holds their secrets: notes, spend and viewing keys, credentials;
-- its operator is the person.
-
-**A shared space** holds the public half of a private application. For
-private payments, that is a shielded pool:
-- note commitments;
-- spent nullifiers;
-- anchors;
-- notes waiting for their recipients, encrypted to their viewing keys.
-
-**A private payment is a message between spaces.**
-1. The payer's wallet actor, in their personal space, proves on the
-   device, with an attestable kernel: "I own these notes under anchor
-   A; these are their nullifiers; these new commitments balance them".
-2. The proof goes to the pool's actor in the shared space as a message.
-3. The pool checks the proof at ingress (§11.1), refuses spent
-   nullifiers, and applies the new commitments and the encrypted notes.
-4. The shared space can net-settle with other spaces on JAM, as tier X
-   does.
-
-**Receiving needs no one online.** A recipient's personal space syncs
-the notes encrypted to it from the pool when it next runs, as a wallet
-syncs a chain.
-
-**What makes it work:**
-- **An anonymous sender.**
-  - A message's origin is normally its sending agent, which would name
-    the payer's personal space.
-  - So messages to a pool carry an anonymous origin: the proof is their
-    authority, and the nullifier stops reuse.
-  - The network path leaks too (which node or address submitted it),
-    so submission goes through relays. That relay layer is out of scope
-    here, but this design depends on it.
-- **Cheap personal spaces.** Millions of people means millions of
-  personal spaces, so one must cost almost nothing:
-  - no registry entry, no agent on JAM, no anchors published anywhere;
-  - one device, or a few syncing among themselves;
-  - offline most of the time;
-  - the same actor model, so a wallet is an ordinary actor in a personal
-    agent.
-- **A hosted personal space** serves someone who cannot run their own.
-  Its provider is then their operator: an explicit trust choice, not a
-  hidden one.
-- **Proving on the device:**
-  - the spend kernel is small: a Merkle path, a nullifier, commitment
-    arithmetic and a range check, around 0.2 to 0.5M steps with
-    precompiles by S5's estimate;
-  - proving it on a phone still needs the mobile prover work or a fixed
-    circuit.
-
-**The personal space is also a person's home for identity** (§6, §9).
-It holds their devices as authenticators, their recovery and their
-credentials, and it derives the pseudonym they show each space.
-
-**What the shared space still sees:** the pool's public state and the
-timing of its messages. That is inherent to a shielded pool; hiding
-timing belongs to the relay layer.
-
-## 9. Across spaces: pseudonyms and credentials
-
-- **Pseudonyms:** a person has an identity in each space they join,
-  derived by their personal space (§8), and by default no space can
-  link it to another.
-- **Credentials:** an actor in one space attests a fact about one of its
-  identities, such as "reputation at least 50", "a member since 2025"
-  or "a verified human".
-  - The holder carries the credential.
-  - To another space, they prove the fact *about themselves*, with an
-    attestable proof against the issuing space's anchored root, without
-    revealing their identity there or anything beyond the fact.
-- **Linking is opt-in:** a holder can prove "the same person as identity
-  X in space A" when they choose to, and only to whom they choose.
-- **This is the portable standing the owner described,** without a
-  global handle that links a person everywhere.
-
-## 10. The root space and the registry of spaces
-
-- **A registry agent on JAM,** public:
-  - spaces register a name, their representative agent and their
-    policy declaration;
-  - it records fees or deposits;
-  - it holds what spaces must agree on, such as the transpiler versions
-    whose kernel hashes the verifiers accept.
-- **Who governs it:**
-  - **at first,** the root space (Virto) governs it, as a DAO of its
-    members, and its decisions reach the registry as collective origins;
-  - **later,** governance can move to a collective of registered spaces,
-    each voting through its representative agent (core model §12). The
-    registry is designed so this move is a governance decision, not a
-    migration.
-- **Policy stays mechanical:** fees, names, dispute rules, accepted
-  versions. It never reaches into a space's internals.
-- **A space's own identity:** a space has keys of its own and a
-  representative agent on JAM, through which it settles, votes and
-  publishes anchors.
-
-## 11. VOS and JAM: origins carried by their transport
-
-**One rule:** a message's origin is the agent that sent it,
-authenticated by whatever carried it.
+**One rule:** an input's origin is what its transport authenticates.
 - **Within a space:** the log and the placement, as today.
 - **From a space to JAM:** the chain authenticates the sending service,
-  which is the space's representative agent. Claims ride with proofs.
-- **From JAM to a space:** a JAM agent's outbox is public state. The
-  space reads it through a light client, with proofs of inclusion
-  against JAM's state root, and the message enters the space with the
-  origin `Jam { service }`.
+  which is the space's representative agent. Its authority is a proof.
+- **From JAM to a space:**
+  - a JAM agent's outbox is public state;
+  - the space reads it through a JAM light client, with proofs of
+    inclusion against JAM's state root, and the input enters with the
+    origin `Jam { service }`.
+  - **The light client** (header finality tracking) is a slice of its
+    own.
 - **Guards are the same on both sides:**
-  - a VOS actor can require a message from a given JAM agent;
+  - a VOS actor can require an input from a given JAM service;
   - a JAM agent can require one from a registered space's
     representative, carrying a valid proof.
-- Calls across the boundary are messages, never synchronous calls.
-  JAM's hops take blocks.
+- Crossing the boundary is a message, never a synchronous call. JAM's
+  hops take blocks.
 
-## 12. Minimal disclosure: private state, public claim
+## 11. Anchors: the root chain, per space
 
-- **Anchors:** a space's representative agent on JAM records an
-  ordered sequence of the space's commitments, a root per window, each
-  extending the last.
-  - A proof's statement names the root it is about, and the verifier
-    checks that root is in the sequence.
-  - An ordered sequence is what stops a space proving two different
-    transitions from one root to two different parties, a gap
-  cipher-clerk has today (§13).
+- **The ordered root sequence already exists:** JAM mode's root chain,
+  in which each package's accumulate swaps one root for the next, in
+  order (slice 4). It stops a space proving two transitions from one
+  root to two parties, a gap cipher-clerk has today (§13).
+- **Missing is a root for the space,** not just for each agent:
+  - a space has many agents, each with its committed root;
+  - its representative agent keeps a space-level root over its agents'
+    roots, per window.
+- **Windows** run at a fixed cadence, minutes apart. A root that moved
+  only on activity would leak activity.
+- **Cost:**
+  - an anchor is a work package per window per space, a few million gas;
+  - a claim verified on chain also pays its verifier, about 10.7M cycles
+    for the settlement verifier measured in slice 1;
+  - "this root is in the sequence" is a witnessed read in the
+    representative agent's state, which slice 4 makes cheap.
 - **Statements disclose only their return value:**
   - "this window's net settlement with space B is X";
   - "this account's balance is at least Y";
-  - "a member of set S, once in this scope" (a nullifier).
-- **Nullifiers** are recorded where double use must be refused: in the
-  space for its own scopes, on JAM for scopes that span spaces.
-- **Prerequisites,** on the prover and privacy track (core model §11.4,
-  slice 5):
+  - "a member of set S, once in this scope".
+- **Prerequisites,** on the prover and privacy track (core model §11.4):
   - zero-knowledge masking (the pinned Stwo has none);
   - hiding commitments for public outputs;
   - fixed proof shapes;
-  - aggregation, so on-chain verification is affordable.
+  - aggregation.
 
-## 13. cipher-clerk against these tiers
+## 12. The root space and the registry of spaces
+
+- **A registry agent on JAM,** public:
+  - spaces register a name, their representative agent and their policy
+    declaration;
+  - it records fees or deposits, which also answer spam;
+  - it holds what spaces must agree on: the transpiler versions and
+    agent program hashes the verifiers accept, so upgrades are a
+    registry decision.
+- **Who governs it:**
+  - at first the root space (Virto), as a DAO of its members, whose
+    decisions reach the registry as messages from its governance agent;
+  - later, a collective of registered spaces, each voting through its
+    representative.
+  - Moving governance is a decision, not a migration.
+- **A space's own keys** (its builder's signing key, behind
+  `package::identity(service)`) rotate by a governance decision applied
+  in accumulate.
+- **Who pays on JAM:**
+  - a space's representative agent holds a balance;
+  - a personal space has none, so the pool's space sponsors its
+    cross-space payments.
+- **Exit and disputes** need rules, not yet designed.
+- **Policy stays mechanical:** fees, names, accepted versions, disputes.
+  It never reaches into a space's internals.
+
+## 13. cipher-clerk against this design
 
 **What it has:**
 - a double-entry ledger with Pedersen-committed amounts;
@@ -321,16 +379,16 @@ authenticated by whatever carried it.
 - experimental fuzzy message detection and stealth addresses;
 - a state root over six depth-128 trees.
 
-**Its tier X** is its first use case, and it fits this design: the
-ledger is plain to its space, and vouchers and settlements carry proofs.
-
-**Its tier O** maps onto §8:
-- its notes and keys belong in the payer's personal space;
-- its note pool belongs in a shared space, as the shielded pool;
-- its spend check becomes the wallet actor's attestable kernel.
-
-It has the data structures (notes, nullifiers, a note pool) but no
-prover, and its spend check is not yet a circuit.
+**Where its pieces land:**
+- **Its first use case** is the named, operator-readable cell, with
+  proofs across spaces. It fits as is, once its proofs bind what they
+  claim.
+- **Its private payments** are the personal space plus shielded pool
+  cell (§8):
+  - its notes and keys belong in the personal space;
+  - its note pool belongs in the shared space;
+  - its spend check becomes the wallet actor's kernel.
+  - It has no prover yet, and its spend check is not yet a circuit.
 
 **Before an actor is built on it, a design and implementation review
 should settle:**
@@ -344,61 +402,72 @@ should settle:**
     authority;
 - **one key** serving for signing, viewing, nullifiers and detection,
   with no rotation;
-- **ordered roots:** a clerk can prove two transitions from one root to
-  two peers, which §12's anchors answer;
+- **ordered roots:** a clerk can prove two transitions from one root,
+  which §11's anchors answer;
 - **the voucher statement:** it names neither the recipient nor the
-  issuer in what it proves;
-- **proofs that bind nothing:** the disclosure and settlement proofs
-  are not tied to state;
+  issuer;
+- **proofs that bind nothing:** disclosure and settlement are not tied
+  to state, and `disclosure::transfer_existed::check` is empty;
 - **the single registrar key** and the operator's custody of pooled
   funds;
-- the move to the compressed tree (slice 4's `vos-tree`), and docs
-  that have fallen behind the code.
+- the move to the compressed tree, and docs that have fallen behind.
 
 This review belongs before slice 5 builds Clerk.
 
 ## 14. Questions for the owner
 
-1. **Authority's shape:** does B (origins and capabilities, roles as
-   sugar) match your intent, or do you lean to A's simplicity for v1?
-2. **Revocation:** short-lived grants with a revocation list held by the
-   issuer, or a space-wide list every guard consults?
-3. **Recovery:** which recovery should identities offer by default:
-   guardians, a delay, or the registrar?
-4. **Registration:** who registers identities in a new space by
-   default: open, invited, or governed?
-5. **Personal spaces' prover on devices:** a small fixed circuit for
-   spends, or the general zkPVM made to fit phones?
-9. **Personal spaces:**
-   - should a personal space be a full space that happens to have one
-     operator, or a lighter kind of space (no Raft, devices syncing
-     through the Merge lane)?
-   - should hosted personal spaces be a first-class offering?
-6. **The root space:** should Virto's governance be the registry's only
-   governor at first, and what should trigger moving it to a collective
-   of spaces?
-7. **Credentials:** which facts matter most to carry across spaces
-   first (reputation, balances, membership, humanity)? They shape the
-   first attestable kernels.
-8. **Kreivo:** should a Kreivo pass holder be able to bring their pass
-   into a VOS space (an authenticator that proves control of a pass), or
-   start fresh?
+In the order their answers are needed:
+1. **The ingress principle:** keep "guests never check signatures:
+   ingress verifies, the log carries the origin and its authority"? This
+   draft depends on it.
+2. **One primitive:** grants and credentials as one attestation, shown
+   in clear or proven?
+3. **Secrecy and anonymity as two axes** (§3), each cell with its
+   mechanism?
+4. **Identity at ingress:** a synced read-only view of the identity
+   table on every node, or a round trip to the identity agent per
+   session?
+5. **Revocation by epochs** plus short expiries, with lists only for
+   selective revocation?
+6. **Personal spaces:**
+   - a full space with one node inside the wallet app;
+   - recovery as a requirement;
+   - a hosted replica that holds no keys.
+   Agreed?
+7. **The relay layer:** in this design's scope, or a dependency track
+   with its own owner?
+8. **Note discovery:** scanning, or detection keys?
+9. **Who pays,** per origin kind, and the fee for anonymous inputs?
+10. **The device prover:** a fixed spend circuit, or the general zkPVM
+    fitted to phones?
+11. **The root space:** Virto governing the registry first, and what
+    triggers moving it to a collective?
+12. **Credentials:** which facts first? They shape the first kernels.
 
 ## 15. Proposed staging
 
-1. **This design, over a few rounds,** with a second opinion (Fable)
-   on each draft.
+0. **Write the attestation primitive and the origin ABI** into the core
+   model (§5, §6.5), with the ingress principle stated.
+1. **This design,** over more rounds with the owner, with a second
+   opinion on each draft.
 2. **A review of cipher-clerk** against §13, before slice 5.
 3. **First build:**
-   - identities, authenticators and origins in a space;
-   - guards on methods, with today's roles as one kind;
-   - device-signed sessions.
-   - It gives tiers S and X their everyday authority, independent of
-     proving.
-4. **With slice 5's prover:** anchors on JAM, attestable statements,
-   credentials, nullifiers, and anonymous origins.
-5. **Personal spaces and a shielded pool,** once a device prover and
-   anonymous origins exist, with cipher-clerk's private payments as the
-   first application.
-6. **The registry and the root space,** when spaces need to find each
-   other, possibly alongside step 4.
+   - the identity agent, authenticators, origins and guards;
+   - grants with epochs;
+   - device-signed sessions;
+   - the identity view at ingress.
+   - It covers the operator-readable row, independent of proving.
+4. **With slice 5's prover:** space-level anchors, credentials, scoped
+   nullifiers, anonymous origins on the client path.
+5. **Personal spaces and a shielded pool,** once a device prover, the
+   relay layer and note discovery exist, with cipher-clerk's private
+   payments as the first application.
+6. **The registry and the root space,** with the JAM light client.
+
+**Dependencies, by name:**
+- the relay layer;
+- the JAM light client;
+- the device prover;
+- signature verification at ingress (ed25519, P-256);
+- the identity view at ingress;
+- zero-knowledge masking and aggregation (the prover track).
