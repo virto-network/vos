@@ -9,7 +9,7 @@ use smol::future::FutureExt;
 use vos_checker::calls::{done, install_at_leader};
 use vos_checker::programs::Programs;
 pub use vos_checker::spaces::wait_in_process as wait_until;
-use vos_checker::spaces::{open_node, space};
+use vos_checker::spaces::{HeldPort, open_node, space};
 use vos_net::memory::{Endpoint, Hub};
 use vos_net::{Arrivals, Class, Network};
 use vos_node::{CallError, Config, Hooks, Node, Peers, Reply, Space};
@@ -33,6 +33,8 @@ pub struct Cluster {
     pub programs: Arc<Programs>,
     pub dirs: Vec<tempfile::TempDir>,
     nodes: Vec<Option<Node>>,
+    /// Over QUIC, each stopped node's peer port, held until it starts.
+    held: Vec<Option<HeldPort>>,
     tuning: Tuning,
     /// Alice's session, for the calls the test makes.
     pub session: Session,
@@ -90,6 +92,7 @@ impl Cluster {
             programs,
             dirs,
             nodes: (0..count).map(|_| None).collect(),
+            held: (0..count).map(|_| None).collect(),
             tuning,
             session: Session {
                 key: [1; 32],
@@ -122,14 +125,21 @@ impl Cluster {
     }
 
     pub fn start(&mut self, number: NodeNumber) {
-        let dir = self.dirs[usize::from(number) - 1].path().to_path_buf();
+        let at = usize::from(number) - 1;
+        let dir = self.dirs[at].path().to_path_buf();
+        drop(self.held[at].take());
         let node = open_node(number, &dir, || self.config(number));
-        self.nodes[usize::from(number) - 1] = Some(node);
+        self.nodes[at] = Some(node);
     }
 
     pub fn stop(&mut self, number: NodeNumber) {
-        if let Some(node) = self.nodes[usize::from(number) - 1].take() {
+        let at = usize::from(number) - 1;
+        if let Some(node) = self.nodes[at].take() {
             node.shutdown();
+            if self.quic {
+                let node = self.space.nodes().iter().find(|node| node.number == number);
+                self.held[at] = Some(HeldPort::udp(node.expect("in the space").peer));
+            }
         }
     }
 

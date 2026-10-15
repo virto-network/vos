@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use vos_checker::calls::install_of;
 use vos_checker::processes::{self, Running, first_run, read_log};
-use vos_checker::spaces::{free_tcp_port, free_udp_port};
+use vos_checker::spaces::{HeldPort, free_tcp_port, free_udp_port};
 use vos_node::client::{Operator, Target};
 use vos_wire::ids::AgentId;
 use vos_wire::ingress::Response;
@@ -180,6 +180,9 @@ pub struct Process {
     args: Vec<String>,
     cpus: Option<String>,
     log: PathBuf,
+    /// Its ingress and peer addresses, held from its kill to its restart.
+    addresses: (SocketAddr, SocketAddr),
+    held: Mutex<Vec<HeldPort>>,
 }
 
 impl Drop for Process {
@@ -207,13 +210,16 @@ impl Process {
         Operator::new(&self.target, &token)
     }
 
-    /// Kill it (SIGKILL).
+    /// Kill it (SIGKILL), holding its ports until it restarts.
     pub fn kill(&self) {
         self.running.lock().unwrap().kill();
+        let (ingress, peer) = self.addresses;
+        *self.held.lock().unwrap() = vec![HeldPort::tcp(ingress), HeldPort::udp(peer)];
     }
 
     /// Start it again: how long until it listens.
     pub fn restart(&self) -> Duration {
+        self.held.lock().unwrap().clear();
         let started = Instant::now();
         let args: Vec<&str> = self.args.iter().map(String::as_str).collect();
         let (running, _) = launch(&args, self.cpus.as_deref(), &self.log);
@@ -361,6 +367,11 @@ impl Space {
                     args,
                     cpus: pinning,
                     log,
+                    addresses: (
+                        SocketAddr::from(([127, 0, 0, 1], ingress[at])),
+                        SocketAddr::from(([127, 0, 0, 1], peers[at])),
+                    ),
+                    held: Mutex::new(Vec::new()),
                 }
             })
             .collect();

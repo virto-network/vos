@@ -21,7 +21,7 @@ use vos_wire::ingress::{ReplicaStatus, Response};
 use vos_wire::peer::NodeNumber;
 
 use crate::programs::agent_elf;
-use crate::spaces::{free_tcp_port, free_udp_port};
+use crate::spaces::{HeldPort, free_tcp_port, free_udp_port};
 use crate::{Log, Nodes, wait_until};
 use relay::Relay;
 
@@ -212,6 +212,8 @@ struct Slot {
     /// Its operator, with the token of the run it was made for: kept, so
     /// that what polls the node goes on one connection.
     operator: Mutex<Option<(String, Arc<Operator>)>>,
+    /// Its ports, held from its kill to its restart.
+    held: Mutex<Vec<HeldPort>>,
 }
 
 /// Nodes 1..=count of one space, each its own process, their peers
@@ -390,6 +392,7 @@ impl Processes {
         if self.options.tls {
             args.extend(["--tls", "--tls-name", "127.0.0.1"]);
         }
+        self.slot(number).held.lock().unwrap().clear();
         let started = run(
             &self.vos,
             &args,
@@ -403,10 +406,14 @@ impl Processes {
 
     /// Kill node `number` with SIGKILL, clearing its own faults: a fault
     /// left in place would meet its restart. Every node's clock offset
-    /// stays.
+    /// stays, and its ports are held until it restarts.
     pub fn kill(&self, number: usize) {
         self.end(number);
         let slot = self.slot(number);
+        *slot.held.lock().unwrap() = vec![
+            HeldPort::tcp(SocketAddr::from(([127, 0, 0, 1], self.ingress[number - 1]))),
+            HeldPort::udp(self.bound[number - 1]),
+        ];
         slot.paused.store(false, Ordering::SeqCst);
         slot.faults.lock().unwrap().clear();
         slot.jump.store(0, Ordering::SeqCst);

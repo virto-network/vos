@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use vos_checker::hooks::Gate;
 use vos_checker::programs::agent;
-use vos_checker::spaces::{free_tcp_port, space};
+use vos_checker::spaces::{HeldPort, free_tcp_port, space};
 use vos_checker::{Log, Nodes};
 use vos_net::memory::Hub;
 use vos_node::client::Target;
@@ -53,10 +53,11 @@ impl Hooks for Trip {
     }
 }
 
-/// One node's slot: its node while it runs, how often it started, its
-/// hook and its clock's offset.
+/// One node's slot: its node while it runs, its ingress port held while
+/// it does not, how often it started, its hook and its clock's offset.
 pub struct Slot {
     node: Mutex<Option<Arc<Node>>>,
+    held: Mutex<Option<HeldPort>>,
     starts: AtomicU64,
     /// Messages its earlier runs sent across nodes.
     pub sent_across: AtomicU64,
@@ -104,6 +105,7 @@ impl Cluster {
             .zip(ingresses)
             .map(|(dir, ingress)| Slot {
                 node: Mutex::new(None),
+                held: Mutex::new(None),
                 starts: AtomicU64::new(0),
                 sent_across: AtomicU64::new(0),
                 installed: AtomicU64::new(0),
@@ -171,7 +173,10 @@ impl Cluster {
             )
         });
         let node = Node::open(slot.dir.path(), config).unwrap();
-        // The address the last run served is let go of with it.
+        // Its port, held while it was down, let go of just before it binds
+        // it: only a moment's bind elsewhere, as another process's probe
+        // for a free port, still waits.
+        drop(slot.held.lock().unwrap().take());
         let until = Instant::now() + Duration::from_secs(5);
         while let Err(error) = node.serve(slot.ingress) {
             assert!(Instant::now() < until, "node {number}: {error:?}");
@@ -181,8 +186,11 @@ impl Cluster {
         *slot.node.lock().unwrap() = Some(Arc::new(node));
     }
 
+    /// Stop node `number`, holding its ingress port until it starts
+    /// again.
     pub fn stop(&self, number: NodeNumber) {
-        let Some(mut node) = self.slot(number).node.lock().unwrap().take() else {
+        let slot = self.slot(number);
+        let Some(mut node) = slot.node.lock().unwrap().take() else {
             return;
         };
         // A check may hold it a moment.
@@ -195,13 +203,17 @@ impl Cluster {
                 }
             }
         };
-        self.slot(number)
-            .sent_across
+        slot.sent_across
             .fetch_add(node.messages_sent_across(), Ordering::SeqCst);
-        self.slot(number)
-            .installed
+        slot.installed
             .fetch_add(node.snapshots_installed(), Ordering::SeqCst);
         node.shutdown();
+        *slot.held.lock().unwrap() = Some(HeldPort::tcp(slot.ingress));
+    }
+
+    /// Node `number`'s ingress address.
+    pub fn ingress(&self, number: NodeNumber) -> SocketAddr {
+        self.slot(number).ingress
     }
 
     pub fn node(&self, number: NodeNumber) -> Option<Arc<Node>> {
@@ -342,4 +354,23 @@ pub fn query(
         method,
         Vec::new(),
     ))
+}
+
+/// While a node is down its ingress port is held: no other listener takes
+/// it, and a request there fails at once rather than waiting out its
+/// answer's deadline. Started again, the node serves there.
+#[test]
+fn a_down_nodes_port_takes_no_other_listener() {
+    let cluster = Cluster::new(1);
+    cluster.stop(3);
+    assert!(std::net::TcpListener::bind(cluster.ingress(3)).is_err());
+    let asked = Instant::now();
+    assert!(vos_node::client::node_id(cluster.target(3)).is_err());
+    assert!(
+        asked.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        asked.elapsed()
+    );
+    cluster.start(3);
+    vos_node::client::node_id(cluster.target(3)).unwrap();
 }
