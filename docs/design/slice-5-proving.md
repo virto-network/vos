@@ -1,11 +1,17 @@
 # Slice 5: proving
 
-Plan, draft 4. The owner chose **proving first**: slice 5 builds proving,
+Plan, draft 5. The owner chose **proving first**: slice 5 builds proving,
 and the Clerk across spaces is slice 6 (`slice-6-clerk.md`, draft 2,
 with Fable's review folded in).
 - **The approach:** this plan proves the general mechanism, any
   attestable kernel reading committed state, with two targets:
   cipher-clerk's settlement window and a solvency predicate.
+- **Draft 5 takes the owner's answers:**
+  - arguments are private by default, `#[public]` marks the public ones,
+    and the return value is public;
+  - attestable methods may read state through `&self`;
+  - no unmasked proof ever exists outside tests, so masking comes before
+    wiring.
 - **Draft 4 folds Fable's review of draft 3:**
   - private arguments never in clear;
   - kernels proved on the chain path, without replay;
@@ -47,8 +53,8 @@ with Fable's review folded in).
 ## The public-input model
 
 This is the design 5.1 builds and reviews.
-- **A kernel declares its public and private arguments** in
-  `#[attestable]`:
+- **Arguments are private unless marked `#[public]`; the return value
+  is public, as the claim** (the owner's decision). In `#[attestable]`:
   - the window kernel's window, spaces, currency and cut points are
     public, while its rows and paths are private;
   - the predicate's threshold is public, while its account row is
@@ -131,8 +137,16 @@ This is the design 5.1 builds and reviews.
 - **The legacy tracer's fate:** retired, or kept as the chain path's
   tracer. If retired, slice 1's exception to the allow-set closes here.
 
-### 5.2 Kernels read committed state
+### 5.2 Kernels read committed state, through `&self`
 
+- **Read-only `&self`** (the owner's decision): an attestable method may
+  take `&self`, and its table and field reads become witnessed reads
+  automatically.
+  - The live run records the rows it read and their paths.
+  - The prover re-runs with them as the witness.
+  - The root they are checked against is published.
+  - `&mut self` is refused at compile time: a proof states a fact about a
+    state, and the handler that receives the output makes any change.
 - **Witnesses:**
   - a list of `(root kind, root, BatchProof)`, absence shown by boundary
     leaves, from the start rather than a single root;
@@ -154,7 +168,19 @@ This is the design 5.1 builds and reviews.
   through the result-blob path (4.4a), not inside the log entry.
 - **vos-tree's hasher** moves to the compress level.
 
-### 5.3 Proving wired into VOS
+### 5.3 Zero-knowledge (masking), before any proof leaves a test
+
+- **Built to spike 2's design,** in the pinned Stwo or after a move
+  upstream.
+- **Gates:**
+  - leakage: a simulator test where feasible, and hidden segment states
+    checked;
+  - soundness: tests for every masked component.
+- **Measured:** prover time and memory with masking.
+- **Proofs made while masking is built** exist only inside tests: they
+  are never stored or sent.
+
+### 5.4 Proving wired into VOS, masked
 
 - **The prover worker:**
   - a node role inside the space's trust domain;
@@ -163,9 +189,8 @@ This is the design 5.1 builds and reviews.
   - the `Attest` record names its proof.
 - **Verification without replay** wherever a proof arrives: at ingress,
   or by a peer.
-- **Unmasked proofs carry a format tag** that only the producing space's
-  own verifier accepts, so none can leave the space before 5.4,
-  enforced by construction.
+- **The prover emits only masked proofs.** The format has no unmasked
+  variant outside tests (the owner's decision).
 - **Tests:**
   - **live ≡ proved:** the prover's standalone re-run produces the live
     run's output and io-hash. This pins the kernel's memory layout, so
@@ -175,20 +200,9 @@ This is the design 5.1 builds and reviews.
   - the Poseidon2 channel's soundness gates run on the proving path;
   - the prover's memory under the 24 GiB cap.
 
-### 5.4 Zero-knowledge (masking)
-
-- **Built to spike 2's design,** in the pinned Stwo or after a move
-  upstream.
-- **Gates:**
-  - leakage: a simulator test where feasible, and hidden segment states
-    checked;
-  - soundness: tests for every masked component.
-- **Measured:** prover time and memory with masking.
-- **Then** masked proofs drop the in-space format tag.
-
 ### 5.5 Verification at its venue (decided on masked proofs)
 
-- **Spike 1 re-run masked,** then the venue:
+- **Spike 1 re-run masked** (5.3 is done by then), then the venue:
   - **JAM:** a public verifier agent, with its gas per proof measured;
     the set of accepted kernel ids is pinned as constants (the owner
     named; redeploy to change), and the registry takes it over later;
@@ -233,16 +247,16 @@ This is the design 5.1 builds and reviews.
 
 ## Decisions
 
-**For the owner now:**
-1. **The attestable ABI's public/private argument split:** what the
-   developer writes.
-2. **Unmasked proofs inside a space** before masking: allowed under the
-   format tag, or never.
+**Taken by the owner:**
+- arguments are private by default, `#[public]` marks the public ones,
+  and the return value is public;
+- read-only `&self` for attestable methods, with witnessed reads;
+- no unmasked proof outside tests: masking (5.3) before wiring (5.4).
 
 **For the owner after the spikes:**
-3. **Masking:** in the pinned Stwo ourselves, or move upstream.
-4. **The venue:** JAM or peers, on masked proofs.
-5. **Aggregation.**
+1. **Masking:** in the pinned Stwo ourselves, or move upstream.
+2. **The venue:** JAM or peers, on masked proofs.
+3. **Aggregation.**
 
 **Decided in this draft on the review's advice, and the owner's to
 override:**
@@ -250,7 +264,6 @@ override:**
 - Poseidon2-M31 as the one published channel;
 - reads as of the latest complete root W ≤ V;
 - shape classes pinned per kernel;
-- unmasked proofs confined by a format tag.
 
 ## Risks
 
