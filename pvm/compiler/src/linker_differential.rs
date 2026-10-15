@@ -7,8 +7,6 @@
 //! meets forward and backward branch targets the way compiled code arranges
 //! them.
 
-use std::collections::{HashMap, HashSet};
-
 use proptest::prelude::*;
 use vos_pvm::{ExitReason, refine};
 
@@ -276,38 +274,11 @@ fn assemble(body: &[Inst]) -> Vec<u8> {
     words.iter().flat_map(|word| word.to_le_bytes()).collect()
 }
 
+/// `text` linked as the production linker links a compiled function: its
+/// entry and every direct branch's and jump's target are control-flow
+/// targets.
 fn link(text: &[u8]) -> Vec<u8> {
-    let elf = LinkedElf {
-        is_64bit: true,
-        code_sections: vec![(0, TEXT, text.to_vec())],
-        ro_data: Vec::new(),
-        ro_base: 0x1_0000,
-        rw_data: Vec::new(),
-        rw_base: 0x2_0000,
-        rw_min: 0x2_0000,
-        rw_len: 0,
-        stack_size: 0x1_0000,
-        heap_pages: 0,
-        symbols: Vec::new(),
-        names: Vec::new(),
-        data_relocs: Vec::new(),
-        symbol_refs: Vec::new(),
-        relocations: 0,
-        unknown_relocation: None,
-        schema: None,
-        hi20_targets: HashMap::new(),
-        lo12_targets: HashMap::new(),
-        call_targets: HashMap::new(),
-        abs_code_ptrs: Vec::new(),
-        sub32_relocs: Vec::new(),
-        data_relocation_ranges: Vec::new(),
-        code_ranges: vec![(TEXT, TEXT + text.len() as u64)],
-        // As the production linker sees a compiled function: its entry is a
-        // symbol; branch targets inside it are not.
-        control_flow_targets: HashSet::from([TEXT]),
-        entry_vaddr: TEXT,
-        accumulate_vaddr: None,
-    };
+    let elf = LinkedElf::text(TEXT, text.to_vec());
     spi_blob(transpile_linked(&elf).expect("translates")).expect("links")
 }
 

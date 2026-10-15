@@ -55,11 +55,6 @@ pub const MAX_ELF: usize = 64 << 20;
 /// The most attestable methods an actor may have: a schema's methods.
 const MAX_ATTESTABLES: usize = 1024;
 
-/// The relocation types a derivation follows, in sections the program
-/// loads: `R_RISCV_32` and `_64`, `_BRANCH` and `_JAL`, `_CALL_PLT`, the
-/// PC-relative pairs, and `_ADD32` and `_SUB32`.
-const FOLLOWED: [u32; 10] = [1, 2, 16, 17, 19, 23, 24, 25, 35, 39];
-
 /// What an ELF derives: its actor's program, a kernel per attestable
 /// method by its id in ascending order, the schema's section as the ELF's
 /// `.vos_schema` holds it, and the version that derived them.
@@ -109,10 +104,7 @@ pub fn derive(elf: &[u8]) -> Result<Derived, DeriveError> {
     if linked.relocations == 0 {
         return Err(DeriveError::NoRelocations);
     }
-    if let Some(kind) = linked
-        .unknown_relocation
-        .filter(|kind| !FOLLOWED.contains(kind))
-    {
+    if let Some(kind) = linked.unknown_relocation {
         return Err(DeriveError::Relocation(kind));
     }
     if linked.code_sections.len() > 1 {
@@ -198,8 +190,8 @@ struct Graph<'a> {
     /// Calls and PC-relative pairs: where in code, and what they name.
     calls: BTreeMap<u64, u64>,
     pairs: BTreeMap<u64, u64>,
-    /// The second halves of PC-relative pairs: where, and what they name.
-    lows: BTreeMap<u64, u64>,
+    /// The second halves of PC-relative pairs, where they lie.
+    lows: BTreeSet<u64>,
     /// Relocations placing an address in data: where, and what.
     data: Vec<(u64, u64)>,
     /// Relocations naming an address by a symbol: where, and the symbol's
@@ -242,7 +234,7 @@ impl<'a> Graph<'a> {
             objects: blocks(elf, &objects),
             calls: sorted(&elf.call_targets),
             pairs: sorted(&elf.hi20_targets),
-            lows: sorted(&elf.lo12_targets),
+            lows: elf.lo12_sites.iter().copied().collect(),
             data,
             symbols,
             targets: elf.control_flow_targets.iter().copied().collect(),
@@ -629,7 +621,6 @@ fn kernel(graph: &Graph, method: u32, entry: u64) -> Result<Vec<u8>, DeriveError
         .collect();
     let data_relocation_ranges = overlapping(&elf.data_relocation_ranges, &objects);
     let kernel = LinkedElf {
-        is_64bit: elf.is_64bit,
         code_sections,
         ro_data,
         ro_base: elf.ro_base,
@@ -637,17 +628,13 @@ fn kernel(graph: &Graph, method: u32, entry: u64) -> Result<Vec<u8>, DeriveError
         rw_base: elf.rw_base,
         rw_min: elf.rw_min,
         rw_len: elf.rw_len,
-        stack_size: elf.stack_size,
         heap_pages: elf.heap_pages,
-        symbols: Vec::new(),
-        names: Vec::new(),
-        data_relocs: Vec::new(),
-        symbol_refs: Vec::new(),
         relocations: elf.relocations,
-        unknown_relocation: None,
-        schema: None,
         hi20_targets: pairs(&graph.pairs),
-        lo12_targets: pairs(&graph.lows),
+        lo12_sites: spans
+            .iter()
+            .flat_map(|&(start, end)| graph.lows.range(start..end).copied())
+            .collect(),
         call_targets,
         abs_code_ptrs,
         sub32_relocs,
@@ -655,7 +642,7 @@ fn kernel(graph: &Graph, method: u32, entry: u64) -> Result<Vec<u8>, DeriveError
         code_ranges: elf.code_ranges.clone(),
         control_flow_targets,
         entry_vaddr: prologue,
-        accumulate_vaddr: None,
+        ..LinkedElf::default()
     };
 
     let (transpiled, host_calls) = transpile_with(&kernel, Link::Kernel)?;

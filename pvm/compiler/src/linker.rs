@@ -66,12 +66,13 @@ pub(crate) struct Symbol {
 }
 
 /// Parsed ELF with relocation info for linking.
+#[derive(Default)]
 pub(crate) struct LinkedElf {
-    pub(crate) is_64bit: bool,
     /// All code sections: (file_offset, vaddr, data)
     pub(crate) code_sections: Vec<(u64, u64, Vec<u8>)>,
-    /// RO data blob and the vaddr its first byte is linked at
-    /// (`stack_size`, the page-floored lowest ro section address).
+    /// RO data blob and the vaddr its first byte is linked at: the
+    /// page-floored lowest ro section address, or 16 KiB without one. It
+    /// is also the stack's size, so RO data is at the right PVM address.
     pub(crate) ro_data: Vec<u8>,
     pub(crate) ro_base: u64,
     /// RW data blob, its initialized part, and the vaddr its first byte is
@@ -82,8 +83,6 @@ pub(crate) struct LinkedElf {
     pub(crate) rw_min: u64,
     /// The rw span from `rw_base`, NOBITS included: zeros past `rw_data`.
     pub(crate) rw_len: u64,
-    /// Stack size in bytes (= ro_base, so RO data is at the right PVM address)
-    pub(crate) stack_size: u32,
     /// Heap pages
     pub(crate) heap_pages: u32,
     /// Every defined symbol, in the table's order.
@@ -106,9 +105,9 @@ pub(crate) struct LinkedElf {
     /// PCREL_HI20: AUIPC instruction vaddr → resolved data address.
     /// The AUIPC itself should emit load_imm with this address.
     pub(crate) hi20_targets: HashMap<u64, u64>,
-    /// PCREL_LO12: instruction vaddr → resolved data address (looked up from paired HI20).
-    /// These instructions should use the already-loaded address (from AUIPC/load_imm).
-    pub(crate) lo12_targets: HashMap<u64, u64>,
+    /// PCREL_LO12 instruction vaddrs whose paired HI20 is known. These
+    /// instructions use the address already loaded by the AUIPC.
+    pub(crate) lo12_sites: HashSet<u64>,
     /// CALL_PLT: AUIPC instruction vaddr → target function RISC-V vaddr.
     pub(crate) call_targets: HashMap<u64, u64>,
     /// Absolute code pointers in data sections: (data_vaddr, target_code_vaddr, entry_size).
@@ -135,6 +134,28 @@ pub(crate) struct LinkedElf {
     pub(crate) accumulate_vaddr: Option<u64>,
 }
 
+#[cfg(test)]
+impl LinkedElf {
+    /// A linked ELF of `code` alone at `vaddr`, its entry, with the
+    /// read-only base at 0x1_0000 and the read-write one at 0x2_0000. Its
+    /// control-flow targets are the entry and what its direct branches and
+    /// jumps reach, as [`parse_linked_elf`] finds them.
+    pub(crate) fn text(vaddr: u64, code: Vec<u8>) -> Self {
+        let len = code.len() as u64;
+        let code_sections = vec![(0, vaddr, code)];
+        Self {
+            control_flow_targets: direct_targets(&code_sections).chain([vaddr]).collect(),
+            code_sections,
+            code_ranges: vec![(vaddr, vaddr + len)],
+            ro_base: 0x1_0000,
+            rw_base: 0x2_0000,
+            rw_min: 0x2_0000,
+            entry_vaddr: vaddr,
+            ..Self::default()
+        }
+    }
+}
+
 /// The result of transpiling an ELF: the code in GP instruction encoding
 /// (plus bitmask and jump table) and the memory-section blobs at their linked
 /// base addresses. [`link_elf_spi`] serializes exactly these fields.
@@ -142,7 +163,8 @@ pub(crate) struct TranspiledElf {
     code: Vec<u8>,
     bitmask: Vec<u8>,
     jump_table: Vec<u32>,
-    /// RO data blob; its first byte is linked at `ro_base`.
+    /// RO data blob; its first byte is linked at `ro_base`, which is also
+    /// the stack's byte capacity.
     ro_data: Vec<u8>,
     ro_base: u64,
     /// RW data blob, its initialized part; its first byte is linked at
@@ -154,13 +176,14 @@ pub(crate) struct TranspiledElf {
     rw_min: u64,
     /// The rw span from `rw_base`: zeros past `rw_data`.
     rw_len: u64,
-    /// Stack byte capacity (= the page-floored lowest ro vaddr, min 16 KiB).
-    stack_size: u32,
     /// Zeroed heap pages beyond `rw_data`.
     heap_pages: u32,
     /// Each function's first PVM instruction, and its name, by offset.
     functions: crate::Functions,
 }
+
+/// Zeroed heap pages a linked program has past its data: 64 KiB.
+const HEAP_PAGES: u32 = 16;
 
 /// `Z_Z` — the GP initialization zone size (2¹⁶).
 pub(crate) const Z_Z: u64 = vos_pvm::PVM_ZONE_SIZE as u64;
@@ -289,10 +312,10 @@ pub(crate) fn spi_blob(t: TranspiledElf) -> Result<Vec<u8>, TranspileError> {
             )));
         }
     }
-    if t.stack_size >= 1 << 24 {
+    let stack_size = t.ro_base as u32;
+    if stack_size >= 1 << 24 {
         return Err(TranspileError::InvalidSection(format!(
-            "SPI: stack size {:#x} exceeds the E3 field width",
-            t.stack_size,
+            "SPI: stack size {stack_size:#x} exceeds the E3 field width",
         )));
     }
     let heap_pages = u16::try_from(heap_pages).map_err(|_| {
@@ -305,7 +328,7 @@ pub(crate) fn spi_blob(t: TranspiledElf) -> Result<Vec<u8>, TranspileError> {
         &ro_data,
         &rw_data,
         heap_pages,
-        t.stack_size,
+        stack_size,
         &t.code,
         &t.bitmask,
         &t.jump_table,
@@ -363,7 +386,7 @@ pub(crate) fn transpile_with(
     link: Link,
 ) -> Result<(TranspiledElf, Vec<(u64, u32)>), TranspileError> {
     let kernel = link == Link::Kernel;
-    let mut ctx = TranslationContext::new(elf.is_64bit);
+    let mut ctx = TranslationContext::default();
     ctx.code_ranges = elf.code_ranges.clone();
     ctx.trap_unresolved = kernel;
 
@@ -393,13 +416,8 @@ pub(crate) fn transpile_with(
         }
     }
 
-    let targets: HashSet<u64> = elf
-        .control_flow_targets
-        .union(&direct_targets(elf))
-        .copied()
-        .collect();
     for (_file_off, vaddr, data) in &elf.code_sections {
-        translate_section_linked(&mut ctx, data, *vaddr, elf, &targets)?;
+        translate_section_linked(&mut ctx, data, *vaddr, elf, &elf.control_flow_targets)?;
         if kernel {
             ctx.emit_inst(0);
         }
@@ -451,7 +469,6 @@ pub(crate) fn transpile_with(
         rw_base: elf.rw_base,
         rw_min: elf.rw_min,
         rw_len: elf.rw_len,
-        stack_size: elf.stack_size,
         heap_pages: elf.heap_pages,
         functions,
     };
@@ -541,16 +558,14 @@ pub(crate) fn parse_linked_elf(data: &[u8]) -> Result<LinkedElf, TranspileError>
         return Err(TranspileError::ElfParse("not an ELF file".into()));
     }
 
-    let is_64bit = match data[4] {
-        1 => false,
-        2 => true,
+    match data[4] {
+        2 => {}
+        1 => {
+            return Err(TranspileError::ElfParse(
+                "linker requires 64-bit ELF (rv64em)".into(),
+            ));
+        }
         _ => return Err(TranspileError::ElfParse("unsupported ELF class".into())),
-    };
-
-    if !is_64bit {
-        return Err(TranspileError::ElfParse(
-            "linker requires 64-bit ELF (rv64em)".into(),
-        ));
     }
 
     // ELF64 header fields
@@ -723,7 +738,7 @@ pub(crate) fn parse_linked_elf(data: &[u8]) -> Result<LinkedElf, TranspileError>
 
     // Round ro_min down to page boundary for stack_size.
     // Minimum 4 pages (16KB) so the stack is usable even without rodata.
-    let page_size: u64 = 4096;
+    let page_size = u64::from(vos_pvm::PVM_PAGE_SIZE);
     let stack_size = if ro_min > 0 {
         (ro_min / page_size) * page_size
     } else {
@@ -792,7 +807,7 @@ pub(crate) fn parse_linked_elf(data: &[u8]) -> Result<LinkedElf, TranspileError>
     // Pass 1: collect HI20 targets and CALL_PLT targets
     // Pass 2: resolve LO12 by looking up their paired HI20
     let mut hi20_targets: HashMap<u64, u64> = HashMap::new();
-    let mut lo12_targets: HashMap<u64, u64> = HashMap::new();
+    let mut lo12_sites = HashSet::new();
     let mut call_targets: HashMap<u64, u64> = HashMap::new();
 
     // Temporary: collect LO12 entries for pass 2
@@ -919,8 +934,8 @@ pub(crate) fn parse_linked_elf(data: &[u8]) -> Result<LinkedElf, TranspileError>
 
     // Pass 2: resolve LO12 targets by looking up paired HI20
     for (lo12_addr, hi20_addr) in lo12_entries {
-        if let Some(&data_addr) = hi20_targets.get(&hi20_addr) {
-            lo12_targets.insert(lo12_addr, data_addr);
+        if hi20_targets.contains_key(&hi20_addr) {
+            lo12_sites.insert(lo12_addr);
         }
     }
 
@@ -1023,30 +1038,15 @@ pub(crate) fn parse_linked_elf(data: &[u8]) -> Result<LinkedElf, TranspileError>
                     }
                 }
             }
-            match instruction & 0x7f {
-                0x6f => {
-                    control_flow_targets
-                        .insert(address.wrapping_add_signed(i64::from(decode_j_imm(instruction))));
-                    if (instruction >> 7) & 0x1f != 0 {
-                        control_flow_targets.insert(address + 4);
-                    }
-                }
-                0x63 => {
-                    control_flow_targets
-                        .insert(address.wrapping_add_signed(i64::from(decode_b_imm(instruction))));
-                }
-                0x67 if (instruction >> 7) & 0x1f != 0 => {
-                    control_flow_targets.insert(address + 4);
-                }
-                _ => {}
+            // A call returns to the instruction after it.
+            if matches!(instruction & 0x7f, 0x6f | 0x67) && (instruction >> 7) & 0x1f != 0 {
+                control_flow_targets.insert(address + 4);
             }
         }
     }
-
-    let heap_pages = 16u32; // 64KB heap
+    control_flow_targets.extend(direct_targets(&code_sections));
 
     Ok(LinkedElf {
-        is_64bit,
         code_sections,
         ro_data,
         ro_base: stack_size,
@@ -1054,8 +1054,7 @@ pub(crate) fn parse_linked_elf(data: &[u8]) -> Result<LinkedElf, TranspileError>
         rw_base,
         rw_min,
         rw_len,
-        stack_size: stack_size as u32,
-        heap_pages,
+        heap_pages: HEAP_PAGES,
         symbols,
         names,
         data_relocs,
@@ -1064,7 +1063,7 @@ pub(crate) fn parse_linked_elf(data: &[u8]) -> Result<LinkedElf, TranspileError>
         unknown_relocation,
         schema,
         hi20_targets,
-        lo12_targets,
+        lo12_sites,
         call_targets,
         abs_code_ptrs: abs64_relocs,
         sub32_relocs,
@@ -1255,23 +1254,26 @@ fn rewrite_data_code_ptrs(
     }
 }
 
-/// Addresses that direct branches and jumps reach. Translation must not
-/// carry fusion state into them: an incoming edge brings its own registers.
-fn direct_targets(elf: &LinkedElf) -> HashSet<u64> {
-    let mut targets = HashSet::new();
-    for (_, base, data) in &elf.code_sections {
-        for (index, word) in data.chunks_exact(4).enumerate() {
-            let inst = u32::from_le_bytes(word.try_into().expect("four-byte chunk"));
-            let offset = match inst & 0x7f {
-                0x63 => crate::riscv::decode_b_imm(inst),
-                0x6f => crate::riscv::decode_j_imm(inst),
-                _ => continue,
-            };
-            let address = base + 4 * index as u64;
-            targets.insert(address.wrapping_add_signed(i64::from(offset)));
-        }
-    }
-    targets
+/// Addresses that direct branches and jumps in `code_sections` reach.
+/// Translation must not carry fusion state into them: an incoming edge
+/// brings its own registers.
+pub(crate) fn direct_targets(
+    code_sections: &[(u64, u64, Vec<u8>)],
+) -> impl Iterator<Item = u64> + '_ {
+    code_sections.iter().flat_map(|(_, base, data)| {
+        data.chunks_exact(4)
+            .enumerate()
+            .filter_map(move |(index, word)| {
+                let inst = u32::from_le_bytes(word.try_into().expect("four-byte chunk"));
+                let offset = match inst & 0x7f {
+                    0x63 => decode_b_imm(inst),
+                    0x6f => decode_j_imm(inst),
+                    _ => return None,
+                };
+                let address = base + 4 * index as u64;
+                Some(address.wrapping_add_signed(i64::from(offset)))
+            })
+    })
 }
 
 /// Translate one code section. `targets` holds every address another
@@ -1355,9 +1357,7 @@ fn translate_section_linked(
                 // skip it and set pending_load_imm to enable cascading fusion
                 // with the instruction after (load_ind, store_ind, ALU, branch).
                 let next_addr = rv_addr + 4;
-                if offset + 8 <= data.len()
-                    && let Some(&_) = elf.lo12_targets.get(&next_addr)
-                {
+                if offset + 8 <= data.len() && elf.lo12_sites.contains(&next_addr) {
                     if elf.control_flow_targets.contains(&next_addr) {
                         return Err(TranspileError::InvalidSection(
                             "control-flow target splits a relocated HI20+LO12 pair".into(),
@@ -1423,7 +1423,7 @@ fn translate_section_linked(
         // (loaded by the paired AUIPC/HI20 above). Override immediate to 0
         // and route through translate_load/translate_store to enable fusion
         // with the pending_load_imm set by the HI20 handler above.
-        if let Some(&_data_addr) = elf.lo12_targets.get(&rv_addr) {
+        if elf.lo12_sites.contains(&rv_addr) {
             let rd = ((inst >> 7) & 0x1f) as u8;
             let rs1 = ((inst >> 15) & 0x1f) as u8;
             let funct3 = (inst >> 12) & 0x7;
@@ -1544,33 +1544,11 @@ mod tests {
     fn pruned(text: &[u8], ro_data: Vec<u8>, pointers: Vec<(u64, u64, u8)>) -> LinkedElf {
         let len = text.len() as u64;
         LinkedElf {
-            is_64bit: true,
-            code_sections: vec![(0, TEXT_VADDR, text.to_vec())],
             ro_data,
-            ro_base: 0x1_0000,
-            rw_data: Vec::new(),
-            rw_base: 0x2_0000,
-            rw_min: 0x2_0000,
-            rw_len: 0,
-            stack_size: 0x1_0000,
-            heap_pages: 0,
-            symbols: Vec::new(),
-            names: Vec::new(),
-            data_relocs: Vec::new(),
-            symbol_refs: Vec::new(),
             relocations: pointers.len(),
-            unknown_relocation: None,
-            schema: None,
-            hi20_targets: HashMap::new(),
-            lo12_targets: HashMap::new(),
-            call_targets: HashMap::new(),
             abs_code_ptrs: pointers,
-            sub32_relocs: Vec::new(),
-            data_relocation_ranges: Vec::new(),
             code_ranges: vec![(TEXT_VADDR, TEXT_VADDR + 2 * len + 0x1000)],
-            control_flow_targets: HashSet::from([TEXT_VADDR]),
-            entry_vaddr: TEXT_VADDR,
-            accumulate_vaddr: None,
+            ..LinkedElf::text(TEXT_VADDR, text.to_vec())
         }
     }
 
@@ -1643,37 +1621,14 @@ mod tests {
             jalr(0, RA), // callee return
         ]);
 
-        let elf = LinkedElf {
-            is_64bit: true,
-            code_sections: vec![(0, TEXT_VADDR, text.clone())],
-            ro_data: Vec::new(),
-            ro_base: 0x1_0000,
-            rw_data: Vec::new(),
-            rw_base: 0x2_0000,
-            rw_min: 0x2_0000,
-            rw_len: 0,
-            stack_size: 0x1_0000,
-            heap_pages: 0,
-            symbols: Vec::new(),
-            names: Vec::new(),
-            data_relocs: Vec::new(),
-            symbol_refs: Vec::new(),
+        let mut elf = LinkedElf {
             relocations: 1,
-            unknown_relocation: None,
-            schema: None,
-            hi20_targets: HashMap::new(),
-            lo12_targets: HashMap::new(),
             call_targets: HashMap::from([(CALL_SITE, CALLEE)]),
-            abs_code_ptrs: Vec::new(),
-            sub32_relocs: Vec::new(),
-            data_relocation_ranges: Vec::new(),
-            code_ranges: vec![(TEXT_VADDR, TEXT_VADDR + text.len() as u64)],
-            control_flow_targets: HashSet::from([TEXT_VADDR, RETURN_ADDR, CALLEE]),
-            entry_vaddr: TEXT_VADDR,
-            accumulate_vaddr: None,
+            ..LinkedElf::text(TEXT_VADDR, text.clone())
         };
+        elf.control_flow_targets.extend([RETURN_ADDR, CALLEE]);
 
-        let mut ctx = TranslationContext::new(true);
+        let mut ctx = TranslationContext::default();
         ctx.code_ranges = elf.code_ranges.clone();
         ctx.emit_jump(elf.entry_vaddr);
         ctx.emit_inst(0); // unused accumulate entry
@@ -1693,7 +1648,7 @@ mod tests {
             &[],
             &[],
             elf.heap_pages as u16,
-            elf.stack_size,
+            elf.ro_base as u32,
             &ctx.code,
             &ctx.bitmask,
             &ctx.jump_table,

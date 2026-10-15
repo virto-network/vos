@@ -1,6 +1,6 @@
 //! RISC-V instruction decoder and PVM instruction translator.
 //!
-//! Decodes rv32em/rv64em instructions and translates them to equivalent
+//! Decodes rv64em instructions and translates them to equivalent
 //! PVM bytecode sequences.
 
 use crate::TranspileError;
@@ -56,6 +56,7 @@ fn encode_var_imm(imm: i32) -> (u8, Vec<u8>) {
 }
 
 /// Translation context for converting RISC-V to PVM.
+#[derive(Default)]
 pub struct TranslationContext {
     /// Emitted PVM code bytes.
     pub code: Vec<u8>,
@@ -63,8 +64,6 @@ pub struct TranslationContext {
     pub bitmask: Vec<u8>,
     /// Jump table entries.
     pub jump_table: Vec<u32>,
-    /// Whether translating 64-bit RISC-V.
-    pub is_64bit: bool,
     /// Map from RISC-V address to PVM code offset.
     pub address_map: std::collections::HashMap<u64, u32>,
     /// Pending branch fixups: (pvm_imm_offset, target_rv_address, fixup_size)
@@ -100,27 +99,6 @@ pub struct TranslationContext {
 }
 
 impl TranslationContext {
-    pub fn new(is_64bit: bool) -> Self {
-        Self {
-            code: Vec::new(),
-            bitmask: Vec::new(),
-            jump_table: Vec::new(),
-            is_64bit,
-            address_map: std::collections::HashMap::new(),
-            fixups: Vec::new(),
-            fixup_pcs: std::collections::HashMap::new(),
-            return_fixups: Vec::new(),
-            pending_auipc: None,
-            pending_lui: None,
-            pending_load_imm: None,
-            last_t0_imm: None,
-            ecalli_marked: false,
-            code_ranges: Vec::new(),
-            host_calls: Vec::new(),
-            trap_unresolved: false,
-        }
-    }
-
     /// Flush any pending buffered instructions (LUI, AUIPC) at section boundaries.
     pub(crate) fn flush_pending(&mut self) -> Result<(), TranspileError> {
         if let Some((auipc_rd, auipc_val)) = self.pending_auipc.take() {
@@ -130,9 +108,7 @@ impl TranslationContext {
             self.emit_load_imm(lui_rd, lui_val)?;
         }
         // pending_load_imm is already emitted — just clear the tracking
-        if self.pending_load_imm.is_some() {
-            self.pending_load_imm = None;
-        }
+        self.pending_load_imm = None;
         Ok(())
     }
 
@@ -882,41 +858,16 @@ impl TranslationContext {
         let pvm_rd = self.require_reg(rd)?;
         let pvm_rs1 = self.require_reg(rs1)?;
 
-        // RV32 uses 32-bit PVM ops; RV64 uses 64-bit PVM ops
         let pvm_opcode = match funct3 {
-            0 => {
-                if self.is_64bit {
-                    149
-                } else {
-                    131
-                }
-            } // ADDI → add_imm_64/32
+            0 => 149, // ADDI → add_imm_64/32
             1 => {
                 if funct7 == 0x30 {
                     // Zbb unary: clz/ctz/cpop/sext.b/sext.h
                     let rs2 = (imm & 0x1F) as u8;
                     let opc = match rs2 {
-                        0 => {
-                            if self.is_64bit {
-                                103
-                            } else {
-                                104
-                            }
-                        }
-                        1 => {
-                            if self.is_64bit {
-                                105
-                            } else {
-                                106
-                            }
-                        }
-                        2 => {
-                            if self.is_64bit {
-                                101
-                            } else {
-                                102
-                            }
-                        }
+                        0 => 103,
+                        1 => 105,
+                        2 => 101,
                         4 => 107,
                         5 => 108,
                         _ => {
@@ -931,8 +882,8 @@ impl TranslationContext {
                     return Ok(());
                 }
                 // SLLI (funct7=0x00)
-                let shamt = imm & if self.is_64bit { 0x3F } else { 0x1F };
-                self.emit_inst(if self.is_64bit { 151 } else { 138 });
+                let shamt = imm & 0x3F;
+                self.emit_inst(151);
                 self.emit_data(pvm_rd | (pvm_rs1 << 4));
                 self.emit_var_imm(shamt);
                 return Ok(());
@@ -950,8 +901,8 @@ impl TranslationContext {
                 if funct7 == 0x30 || funct7 == 0x31 {
                     // Zbb RORI: funct6=0x18 (bits 31:26).
                     // funct7=0x30 when shamt<32, funct7=0x31 when shamt>=32 (bit 25 set).
-                    let shamt = imm & if self.is_64bit { 0x3F } else { 0x1F };
-                    self.emit_inst(if self.is_64bit { 158 } else { 160 });
+                    let shamt = imm & 0x3F;
+                    self.emit_inst(158);
                     self.emit_data(pvm_rd | (pvm_rs1 << 4));
                     self.emit_var_imm(shamt);
                     return Ok(());
@@ -965,11 +916,11 @@ impl TranslationContext {
                     });
                 }
                 // SRLI (funct7=0x00) / SRAI (funct7=0x20+)
-                let shamt = imm & if self.is_64bit { 0x3F } else { 0x1F };
+                let shamt = imm & 0x3F;
                 if funct7 & 0x20 != 0 {
-                    self.emit_inst(if self.is_64bit { 153 } else { 140 }); // shar_r_imm
+                    self.emit_inst(153); // shar_r_imm
                 } else {
-                    self.emit_inst(if self.is_64bit { 152 } else { 139 }); // shlo_r_imm
+                    self.emit_inst(152); // shlo_r_imm
                 }
                 self.emit_data(pvm_rd | (pvm_rs1 << 4));
                 self.emit_var_imm(shamt);
@@ -1025,7 +976,7 @@ impl TranslationContext {
                 (0, 0) | (0, 4) | (0, 6) => mov(self, rs2)?,
                 // SUB rd, x0, rs2 → 0 - rs2
                 (0x20, 0) => {
-                    let neg_op = if self.is_64bit { 154 } else { 141 }; // neg_add_imm
+                    let neg_op = 154; // neg_add_imm
                     self.emit_inst(neg_op);
                     self.emit_data(pvm_rd | (pvm_rs2 << 4));
                     self.emit_var_imm(0);
@@ -1056,7 +1007,7 @@ impl TranslationContext {
                     self.emit_inst(136); // set_lt_u_imm
                     self.emit_data(pvm_rd | (pvm_rs2 << 4));
                     self.emit_var_imm(1);
-                    let neg_op = if self.is_64bit { 154 } else { 141 }; // neg_add_imm
+                    let neg_op = 154; // neg_add_imm
                     self.emit_inst(neg_op);
                     self.emit_data(pvm_rd | (pvm_rd << 4));
                     self.emit_var_imm(0);
@@ -1139,13 +1090,13 @@ impl TranslationContext {
 
             if let Some(base) = fuse_base {
                 let pvm_imm_opcode = match (funct7, funct3) {
-                    (0, 0) => Some(if self.is_64bit { 149 } else { 131 }), // ADD → add_imm
-                    (0, 7) => Some(132),                                   // AND → and_imm
-                    (0, 6) => Some(134),                                   // OR → or_imm
-                    (0, 4) => Some(133),                                   // XOR → xor_imm
-                    (1, 0) => Some(if self.is_64bit { 150 } else { 135 }), // MUL → mul_imm
-                    (0, 2) => Some(137),                                   // SLT → set_lt_s_imm
-                    (0, 3) => Some(136),                                   // SLTU → set_lt_u_imm
+                    (0, 0) => Some(149), // ADD → add_imm
+                    (0, 7) => Some(132), // AND → and_imm
+                    (0, 6) => Some(134), // OR → or_imm
+                    (0, 4) => Some(133), // XOR → xor_imm
+                    (1, 0) => Some(150), // MUL → mul_imm
+                    (0, 2) => Some(137), // SLT → set_lt_s_imm
+                    (0, 3) => Some(136), // SLTU → set_lt_u_imm
                     _ => None,
                 };
 
@@ -1171,27 +1122,9 @@ impl TranslationContext {
                 && matches!((funct7, funct3), (0, 1) | (0, 5) | (0x20, 5))
             {
                 let pvm_imm_opcode = match (funct7, funct3) {
-                    (0, 1) => {
-                        if self.is_64bit {
-                            151
-                        } else {
-                            138
-                        }
-                    } // SLL → shlo_l_imm
-                    (0, 5) => {
-                        if self.is_64bit {
-                            152
-                        } else {
-                            139
-                        }
-                    } // SRL → shlo_r_imm
-                    (0x20, 5) => {
-                        if self.is_64bit {
-                            153
-                        } else {
-                            140
-                        }
-                    } // SRA → shar_r_imm
+                    (0, 1) => 151,    // SLL → shlo_l_imm
+                    (0, 5) => 152,    // SRL → shlo_r_imm
+                    (0x20, 5) => 153, // SRA → shar_r_imm
                     _ => unreachable!(),
                 };
                 self.drop_dead_load(rd, load_rd, undo_pos, addr);
@@ -1209,7 +1142,7 @@ impl TranslationContext {
             if (funct7, funct3) == (0x20, 0) && rs2 == load_rd && rs1 != load_rd {
                 let neg_imm = (-(load_val as i32) as i64) as i32;
                 // Use add_imm with negated immediate (avoids neg_add_imm)
-                let pvm_opcode = if self.is_64bit { 149 } else { 131 }; // add_imm
+                let pvm_opcode = 149; // add_imm
                 self.drop_dead_load(rd, load_rd, undo_pos, addr);
                 let pvm_rd = self.require_reg(rd)?;
                 let pvm_rs1 = self.require_reg(rs1)?;
@@ -1231,66 +1164,23 @@ impl TranslationContext {
         let pvm_rs1 = self.require_reg(rs1)?;
         let pvm_rs2 = self.require_reg(rs2)?;
 
-        // RV32 uses 32-bit PVM ops; RV64 uses 64-bit PVM ops
         let pvm_opcode = if funct7 == 1 {
             // M extension (multiply/divide)
             match funct3 {
-                0 => {
-                    if self.is_64bit {
-                        202
-                    } else {
-                        192
-                    }
-                } // MUL
+                0 => 202, // MUL
                 1 => 213, // MULH → mul_upper_ss (always 64-bit, gives upper bits)
                 2 => 215, // MULHSU → mul_upper_su
                 3 => 214, // MULHU → mul_upper_uu
-                4 => {
-                    if self.is_64bit {
-                        204
-                    } else {
-                        194
-                    }
-                } // DIV
-                5 => {
-                    if self.is_64bit {
-                        203
-                    } else {
-                        193
-                    }
-                } // DIVU
-                6 => {
-                    if self.is_64bit {
-                        206
-                    } else {
-                        196
-                    }
-                } // REM
-                7 => {
-                    if self.is_64bit {
-                        205
-                    } else {
-                        195
-                    }
-                } // REMU
+                4 => 204, // DIV
+                5 => 203, // DIVU
+                6 => 206, // REM
+                7 => 205, // REMU
                 _ => unreachable!(),
             }
         } else if funct7 == 0x20 {
             match funct3 {
-                0 => {
-                    if self.is_64bit {
-                        201
-                    } else {
-                        191
-                    }
-                } // SUB
-                5 => {
-                    if self.is_64bit {
-                        209
-                    } else {
-                        199
-                    }
-                } // SRA
+                0 => 201, // SUB
+                5 => 209, // SRA
                 7 | 6 | 4 => {
                     // Zbb ANDN/ORN/XNOR: rd = rs1 OP ~rs2
                     if rd == rs1 && rd == rs2 {
@@ -1347,20 +1237,8 @@ impl TranslationContext {
         } else if funct7 == 0x30 {
             // Zbb rotations — emit and return early
             let opc = match funct3 {
-                1 => {
-                    if self.is_64bit {
-                        220
-                    } else {
-                        221
-                    }
-                }
-                5 => {
-                    if self.is_64bit {
-                        222
-                    } else {
-                        223
-                    }
-                }
+                1 => 220,
+                5 => 222,
                 _ => {
                     return Err(TranspileError::UnsupportedInstruction {
                         offset: 0,
@@ -1374,30 +1252,12 @@ impl TranslationContext {
             return Ok(());
         } else if funct7 == 0 {
             match funct3 {
-                0 => {
-                    if self.is_64bit {
-                        200
-                    } else {
-                        190
-                    }
-                } // ADD
-                1 => {
-                    if self.is_64bit {
-                        207
-                    } else {
-                        197
-                    }
-                } // SLL
+                0 => 200, // ADD
+                1 => 207, // SLL
                 2 => 217,
                 3 => 216,
                 4 => 211,
-                5 => {
-                    if self.is_64bit {
-                        208
-                    } else {
-                        198
-                    }
-                }
+                5 => 208,
                 6 => 212,
                 7 => 210,
                 _ => unreachable!(),
@@ -2195,7 +2055,7 @@ mod tests {
         //   rs1 = x0
         //   rs2 = x11 (a1)
         //   funct3 = 2 (SLT), funct7 = 0
-        let mut ctx = TranslationContext::new(true);
+        let mut ctx = TranslationContext::default();
         let result = ctx.translate_op(
             /* funct3 */ 2, /* funct7 */ 0, /* rd */ 10, /* rs1 */ 0,
             /* rs2 */ 11, /* addr */ 0,
@@ -2226,7 +2086,7 @@ mod tests {
         // SLLI a2, x0, 3:  funct3=1, funct7=0, rd=x12(a2), rs1=x0, imm=shamt=3.
         // Must emit `load_imm a2, 0` → [51, 9] (a2 → PVM reg 9; zero imm omitted).
         for (funct3, funct7, what) in [(1u32, 0u32, "SLLI"), (5, 0, "SRLI"), (5, 0x20, "SRAI")] {
-            let mut ctx = TranslationContext::new(true);
+            let mut ctx = TranslationContext::default();
             let r = ctx.translate_op_imm(
                 funct3, funct7, /* rd */ 12, /* rs1 */ 0, /* imm */ 3,
             );
@@ -2244,7 +2104,7 @@ mod tests {
     fn translates_op_imm_32_x0_directly() {
         // Same x0-as-rs1 class for the RV64-W ops (addiw/slliw/srliw/sraiw).
         // ADDIW a2, x0, 7 = sext32(7) → load_imm a2, 7 = [51, 9, 7].
-        let mut ctx = TranslationContext::new(true);
+        let mut ctx = TranslationContext::default();
         ctx.translate_op_imm_32(0, 0, 12, 0, 7).unwrap();
         assert_eq!(
             ctx.code.as_slice(),
@@ -2252,7 +2112,7 @@ mod tests {
             "addiw a2,x0,7 = load_imm 7"
         );
         // SLLIW a2, x0, 3 = 0 → load_imm a2, 0 = [51, 9].
-        let mut ctx = TranslationContext::new(true);
+        let mut ctx = TranslationContext::default();
         ctx.translate_op_imm_32(1, 0, 12, 0, 3).unwrap();
         assert_eq!(
             ctx.code.as_slice(),
@@ -2270,7 +2130,7 @@ mod tests {
         // exactly this at -Os (`sltu a0, 8160, len`); the fused form flipped it
         // to `len < 8160`, so every HKDF-expand spuriously returned InvalidLength.
         for (funct3, what) in [(2u32, "SLT"), (3, "SLTU")] {
-            let mut ctx = TranslationContext::new(true);
+            let mut ctx = TranslationContext::default();
             // `load_imm a0, 8160`, tracked as pending (as translate_op_imm would).
             let undo = ctx.code.len();
             ctx.emit_load_imm(10, 8160).unwrap();
@@ -2300,7 +2160,7 @@ mod tests {
         // Fallthrough computes a stack offset in a0, while another arm jumps
         // directly to the shared ADD with its own a0. Fusing the fallthrough
         // load into the targeted ADD would overwrite the incoming arm's value.
-        let mut ctx = TranslationContext::new(true);
+        let mut ctx = TranslationContext::default();
         let lui_a0_0x4000 = 0x0000_4537_u32;
         let addi_a0_a0_0x1e0 = (0x1e0_u32 << 20) | (10 << 15) | (10 << 7) | 0x13;
         let add_a0_sp_a0 = (10_u32 << 20) | (2 << 15) | (10 << 7) | 0x33;
@@ -2332,7 +2192,7 @@ mod tests {
 
     #[test]
     fn store_preserves_a_constant_base_for_later_memory_operations() {
-        let mut ctx = TranslationContext::new(true);
+        let mut ctx = TranslationContext::default();
         let undo = ctx.code.len();
         ctx.emit_load_imm(10, 0x21ba0).unwrap();
         let address_load = ctx.code.clone();
@@ -2356,7 +2216,7 @@ mod tests {
 
     #[test]
     fn unmarked_ecall_traps_instead_of_calling_a_capability() {
-        let mut ctx = TranslationContext::new(true);
+        let mut ctx = TranslationContext::default();
         ctx.translate_instruction(&0x0000_0073_u32.to_le_bytes(), 0, 0)
             .unwrap();
         assert_eq!(ctx.code, [0], "unmarked ECALL must compile to trap");

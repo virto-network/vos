@@ -50,12 +50,8 @@ pub enum TranspileError {
     ElfParse(String),
     #[error("unsupported RISC-V instruction at offset {offset:#x}: {detail}")]
     UnsupportedInstruction { offset: usize, detail: String },
-    #[error("unsupported relocation: {0}")]
-    UnsupportedRelocation(String),
     #[error("register mapping error: RISC-V register {0} has no PVM equivalent")]
     RegisterMapping(u8),
-    #[error("code too large: {0} bytes")]
-    CodeTooLarge(usize),
     #[error("invalid section: {0}")]
     InvalidSection(String),
 }
@@ -696,59 +692,7 @@ fn ensure_branch_targets_with_pc_map(
     offset_map[len] = new_code.len() as u32;
     remap(&offset_map);
 
-    // Pass 3: fix all PC-relative branch offsets in the new code.
-    // Scan for branch instructions and recalculate their offsets.
-    {
-        let mut i = 0;
-        while i < new_code.len() {
-            if i >= new_bitmask.len() || new_bitmask[i] != 1 {
-                i += 1;
-                continue;
-            }
-            let op = new_code[i];
-            let s = {
-                let mut s = 0;
-                for j in 0..25 {
-                    let idx = i + 1 + j;
-                    if idx >= new_bitmask.len() || new_bitmask[idx] == 1 {
-                        s = j;
-                        break;
-                    }
-                }
-                s
-            };
-
-            // OneOffset with fixed 4-byte immediate: opcode 40 (jump)
-            if op == 40 && i + 5 <= new_code.len() {
-                let _old_off = i32::from_le_bytes([
-                    new_code[i + 1],
-                    new_code[i + 2],
-                    new_code[i + 3],
-                    new_code[i + 4],
-                ]);
-                // Find old PC for this instruction
-                // The instruction at new_pc=i maps back to some old_pc.
-                // old_target = old_pc + old_off. new_target = offset_map[old_target].
-                // new_off = new_target - new_pc = offset_map[old_target] - i.
-                // But we need old_pc. We can compute: old_target was in the original code.
-                // Since new code has extra bytes, old_off referenced old positions.
-                // Actually, the offset was already resolved in the old code. old_target = old_inst_pc + old_off.
-                // We need to map old_inst_pc back. But that's complex.
-                // Simpler: compute old target from old offset, then remap.
-                // We need to find which old_pc maps to this new i.
-                // Build reverse map:
-                // Actually let's just do this with a reverse lookup.
-            }
-
-            i += 1 + s;
-        }
-    }
-
-    // This approach is getting complex. Use a simpler strategy:
-    // rebuild fixups from scratch by scanning old code, computing old targets,
-    // and patching new code with remapped offsets.
-
-    // Actually, let's use the offset_map directly on the old code's branch instructions.
+    // Pass 3: re-point every branch offset through `offset_map`.
     {
         let mut old_i = 0;
         while old_i < len {

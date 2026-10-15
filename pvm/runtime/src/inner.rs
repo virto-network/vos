@@ -537,7 +537,7 @@ impl InnerMachines {
         &mut self,
         id: u32,
         state: InvokeState,
-        observer: Option<&mut dyn for<'a> FnMut(InnerMachineObservation<'a>)>,
+        mut observer: Option<&mut dyn for<'a> FnMut(InnerMachineObservation<'a>)>,
     ) -> Result<InvokeOutcome, InnerError> {
         let machine = self.machines.get_mut(&id).ok_or(InnerError::Unknown)?;
         let identity = InnerMachineIdentity {
@@ -557,8 +557,6 @@ impl InnerMachines {
         let vm = vm.as_mut().expect("laid out above");
         vm.gas = state.gas;
         vm.registers = state.registers;
-        let mut observer = observer;
-        let mut backend_failed = false;
         // Every exit returns to the outer machine, a precompile call's too:
         // the agent serves an inner machine's precompiles, on every host.
         let exit = match observer.as_deref_mut() {
@@ -578,15 +576,11 @@ impl InnerMachines {
             None => match execution.run(vm) {
                 Ok(exit) => exit,
                 Err(_) => {
-                    backend_failed = true;
-                    ExitReason::Panic
+                    *failed = true;
+                    return Err(InnerError::Backend);
                 }
             },
         };
-        if backend_failed {
-            *failed = true;
-            return Err(InnerError::Backend);
-        }
         let exit = match exit {
             ExitReason::Halt => {
                 vm.pc = 0;
