@@ -5,11 +5,10 @@
 //! a sustained rate. Accumulate's own time per write is the testkit's
 //! `batch` bench's.
 //!
-//! `tree-bench <keys> [rate] [seconds]`: a map of `keys` keys, then writes
-//! at `rate` committed writes a second (20,000) for `seconds` (30) while the
-//! builder runs as the node's does, one build after another at the latest
-//! version. Data goes under `target/`: on the reference laptop `/tmp` is
-//! tmpfs.
+//! `cargo bench -p vos-node --bench tree -- <keys> [rate] [seconds]`: a
+//! map of `keys` keys, then writes at `rate` committed writes a second
+//! (20,000) for `seconds` (30) while the builder runs as the node's does,
+//! one build after another at the latest version.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -123,7 +122,7 @@ fn main() {
     let args = support::args();
     let keys: u64 = args
         .first()
-        .expect("tree-bench <keys> [rate] [seconds]")
+        .expect("tree -- <keys> [rate] [seconds]")
         .parse()
         .unwrap();
     let rate: u64 = args.get(1).map_or(20_000, |rate| rate.parse().unwrap());

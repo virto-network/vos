@@ -2,8 +2,8 @@
 //! for the log, and every program.
 //!
 //! Blobs are appended to segment files by the blob writer, its own thread,
-//! a group at a time with one data sync, then indexed. A segment closes at
-//! [`SEGMENT_BYTES`]; a new one is created with a directory sync, once per
+//! a group at a time with one data sync, then indexed. A segment closes
+//! once full; a new one is created with a directory sync, once per
 //! segment. A record is a header (magic, length, hash) and the bytes.
 //!
 //! The index (hash to segment, offset, length and when it was last put) is
@@ -289,7 +289,6 @@ impl Blobs {
         self.request(|done| Request::Touch { hashes, done }).await
     }
 
-    /// The blob store's index.
     fn index(&self) -> &Keyspace {
         self.inner.store.blobs()
     }

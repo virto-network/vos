@@ -2,10 +2,10 @@
 //! misses), updated and scanned through the node's `Store`, with the agent
 //! key layout, at a given row count and tuning.
 //!
-//! `store-bench <rows> [variant...]`; variants are `default`, `filters`
-//! (last-level filters kept), and on top of the default `hash` (in-block
-//! hash index), `pin` (filters and indexes pinned) and `cache2g`. Data goes
-//! under `target/`: on the reference laptop `/tmp` is tmpfs.
+//! `cargo bench -p vos-node --bench store -- <rows> [variant...]`; variants
+//! are `default`, `filters` (last-level filters kept), and on top of the
+//! default `hash` (in-block hash index), `pin` (filters and indexes pinned)
+//! and `cache2g`.
 //!
 //! The variant `writes` times point reads on the table alone, then while
 //! 64 other agents write as the 64-agent run's do, at `WRITE_RATE` inputs
@@ -438,7 +438,7 @@ fn main() {
     let args = support::args();
     let rows: u64 = args
         .first()
-        .expect("store-bench <rows> [variant...]")
+        .expect("store -- <rows> [variant...]")
         .parse()
         .unwrap();
     let variants: Vec<&str> = if args.len() > 1 {

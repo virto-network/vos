@@ -38,7 +38,7 @@ const RENEWALS: usize = 2;
 
 impl Client {
     /// Call the replica of `agent` after the one this client calls: false
-    /// when it knows no other, or cannot reach the one it knows.
+    /// when it knows no other, or no address of it this client can call.
     fn fail_over(&mut self, agent: AgentId) -> bool {
         let Some(next) = self.other_replicas(agent).into_iter().next() else {
             return false;

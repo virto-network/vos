@@ -288,9 +288,9 @@ impl Refusal {
     ];
 }
 
-/// That `from` replicates the agent whose replicas are `replicas`, as a
-/// forwarded call's sender must: replicas are trusted to have checked the
-/// call's signature.
+/// That `from` replicates the agent `placement` places, as a forwarded
+/// call's sender must: replicas are trusted to have checked the call's
+/// signature.
 pub fn check_replica(placement: Option<&Placement>, from: NodeNumber) -> Result<(), Refusal> {
     match placement {
         Some(placement) if placement.admits(from) => Ok(()),

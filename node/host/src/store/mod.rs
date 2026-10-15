@@ -177,7 +177,6 @@ impl Fjall {
         &self.0.db
     }
 
-    /// The blob store's partition.
     pub(crate) fn blobs(&self) -> &Keyspace {
         &self.0.blobs
     }

@@ -4,10 +4,12 @@
 //! in for a leader and two followers: an entry commits once two of the
 //! three writers made it durable.
 //!
-//! - `log-bench sizes [nodes] [cap]`: entries of 1 KiB to 4 MiB from
-//!   closed-loop proposers: commits per second, MiB per second, p50 and p99.
-//! - `log-bench mixed <large bytes> [cap]`: 15 agents of 1 KiB entries
-//!   beside one agent of large entries: the small entries' p50 and p99.
+//! `cargo bench -p vos-node --bench log --`, then:
+//!
+//! - `sizes [nodes] [cap]`: entries of 1 KiB to 4 MiB from closed-loop
+//!   proposers: commits per second, MiB per second, p50 and p99.
+//! - `mixed <large bytes> [cap]`: 15 agents of 1 KiB entries beside one
+//!   agent of large entries: the small entries' p50 and p99.
 //!
 //! `BLOBS=<bytes>` writes entries at least that large to the node's blob
 //! writer, with its own syncs, and logs a 40-byte reference once the blob
@@ -22,8 +24,6 @@
 //!   and key-value separation, one synced batch per group.
 //!
 //! `ONLY=<KiB>` runs one size of `sizes`.
-//!
-//! Data goes under `target/`: on the reference laptop `/tmp` is tmpfs.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -346,6 +346,6 @@ fn main() {
     match args.first().map(String::as_str) {
         Some("sizes") => sizes(number(1, 3), number(2, usize::MAX)),
         Some("mixed") => mixed(number(1, 4 << 20), number(2, usize::MAX)),
-        _ => eprintln!("usage: log-bench sizes [nodes] [cap] | mixed <large bytes> [cap]"),
+        _ => eprintln!("usage: log -- sizes [nodes] [cap] | mixed <large bytes> [cap]"),
     }
 }

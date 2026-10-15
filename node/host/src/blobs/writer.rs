@@ -43,7 +43,8 @@ pub(super) enum Request {
     },
 }
 
-/// The blob writer's loop.
+/// The blob writer, on its thread: the segment it appends to, and the
+/// index it writes.
 pub(super) struct Writer {
     pub(super) dir: PathBuf,
     pub(super) store: Fjall,
@@ -119,7 +120,6 @@ impl Writer {
         result.is_err()
     }
 
-    /// The blob store's index.
     fn index(&self) -> &Keyspace {
         self.store.blobs()
     }
