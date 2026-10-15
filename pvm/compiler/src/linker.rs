@@ -25,7 +25,7 @@ use crate::riscv::TranslationContext;
 pub(crate) use elf::{name_at, name_is};
 pub(crate) use layout::{Z_Z, spi_blob, zone_round};
 pub(crate) use relocs::{in_ranges, merge_ranges, range_at};
-pub(crate) use targets::raw_code_pointers;
+pub(crate) use targets::{direct_targets, raw_code_pointers};
 
 use elf::sections;
 use layout::{HEAP_PAGES, layout};

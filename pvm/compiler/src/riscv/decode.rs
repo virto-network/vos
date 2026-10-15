@@ -14,7 +14,7 @@ use crate::TranspileError;
 ///   7=A0, 8=A1, 9=A2, 10=A3, 11=A4, 12=A5
 ///
 /// Mapping: x0 → zero (special), x1 → 0, x2 → 1, x5-x15 → 2-12
-/// x3 (gp) and x4 (tp) have no direct mapping and must be spilled.
+/// x3 (gp) and x4 (tp) have none: translation refuses them.
 pub(super) fn map_register(rv_reg: u8) -> Result<Option<u8>, TranspileError> {
     match rv_reg {
         0 => Ok(None),                                         // x0 = zero register (always 0)

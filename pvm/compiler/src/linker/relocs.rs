@@ -72,7 +72,7 @@ pub(super) struct Relocations {
     pub(super) ranges: Vec<(u64, u64)>,
 }
 
-/// Read every relocation section of `elf`, `data`'s, whose code lies in
+/// Read the relocations of `elf`, the ELF `data` holds, whose code lies in
 /// `code_ranges`.
 pub(super) fn relocations(
     data: &[u8],

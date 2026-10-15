@@ -1,7 +1,8 @@
 //! A derivation's work stays bounded however an ELF is shaped within its
 //! limits: a crafted package of megabytes of code-like data and of a jump
 //! table of hundreds of thousands of relative entries derives in seconds,
-//! where a search per entry would take minutes.
+//! where a search per entry would take minutes. And a crafted kernel that
+//! jumps into the prologue its derivation adds is refused.
 
 use std::time::{Duration, Instant};
 
@@ -21,6 +22,17 @@ const A0: u32 = 10;
 
 fn i_type(opcode: u32, funct3: u32, rd: u32, rs1: u32, imm: i32) -> u32 {
     ((imm as u32 & 0xfff) << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | opcode
+}
+
+/// `jal rd, offset`.
+fn jal(rd: u32, offset: i32) -> u32 {
+    let o = offset as u32;
+    (((o >> 20) & 1) << 31)
+        | (((o >> 1) & 0x3ff) << 21)
+        | (((o >> 11) & 1) << 20)
+        | (((o >> 12) & 0xff) << 12)
+        | (rd << 7)
+        | 0x6f
 }
 
 /// Section types: program bits, a symbol table, a string table, and
@@ -235,5 +247,56 @@ fn a_crafted_package_derives_in_bounded_time() {
         took < Duration::from_secs(30),
         "{} MiB package, {WORDS} code-like words, {ENTRIES} jump table entries: derived in {took:?}",
         elf.len() >> 20
+    );
+}
+
+/// A kernel's prologue, which its derivation places at the first 16-byte
+/// boundary past the code, calls the entry by an AUIPC and JALR pair. Code
+/// of the kernel that jumps between the two would split the pair, so the
+/// derivation refuses it, as it does any target that splits one.
+#[test]
+fn a_kernel_jumping_into_its_prologue_is_refused() {
+    // `_start` returns; the entry jumps to the prologue's JALR, at the
+    // prologue (TEXT + 16) plus 8.
+    let start = TEXT;
+    let entry = TEXT + 4;
+    let code: Vec<u8> = [
+        i_type(0x67, 0, 0, RA, 0), // _start: ret
+        jal(0, 20),                // entry: j TEXT + 24
+        i_type(0x67, 0, 0, RA, 0),
+        i_type(0x67, 0, 0, RA, 0),
+    ]
+    .into_iter()
+    .flat_map(u32::to_le_bytes)
+    .collect();
+    let schema = [b"VOSS".as_slice(), &0u32.to_le_bytes()].concat();
+    let attest = SCHEMA + 8;
+    let rodata = [1u64.to_le_bytes(), entry.to_le_bytes()].concat();
+    let strtab = b"\0entry\0_start\0VOS_ATTEST\0".to_vec();
+    let symtab = [
+        symbol(0, 0, 0, 0),
+        symbol(1, 2, entry, 4),
+        symbol(7, 2, start, 4),
+        symbol(14, 1, attest, 16),
+    ]
+    .concat();
+    let elf = elf(
+        start,
+        vec![
+            Section::loaded(".vos_schema", 0, SCHEMA, schema),
+            Section::loaded(".rodata", 0, attest, rodata),
+            Section::loaded(".text", EXECUTE, TEXT, code),
+            Section::table(".symtab", SYMTAB, symtab, 5, 0),
+            Section::table(".strtab", STRTAB, strtab, 0, 0),
+            // R_RISCV_64 of the entry, in the attestables' table.
+            Section::table(".rela.rodata", RELA, relocation(attest + 8, 1, 2, 0), 4, 2),
+        ],
+    );
+    let refused = derive(&elf).expect_err("a split call pair is refused");
+    assert!(
+        refused
+            .to_string()
+            .contains("splits a relocated AUIPC+JALR call pair"),
+        "{refused}"
     );
 }

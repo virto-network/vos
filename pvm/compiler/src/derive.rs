@@ -40,8 +40,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use crate::TranspileError;
 use crate::linker::{
-    Link, LinkedElf, STT_FUNC, Z_Z, in_ranges, merge_ranges, name_at, name_is, parse_linked_elf,
-    range_at, raw_code_pointers, spi_blob, transpile_with, zone_round,
+    Link, LinkedElf, STT_FUNC, Z_Z, direct_targets, in_ranges, merge_ranges, name_at, name_is,
+    parse_linked_elf, range_at, raw_code_pointers, spi_blob, transpile_with, zone_round,
 };
 use crate::riscv::{self, decode_b_imm, decode_j_imm, op};
 
@@ -584,10 +584,14 @@ fn kernel(graph: &Graph, method: u32, entry: u64) -> Result<Vec<u8>, DeriveError
     };
     let mut call_targets = pairs(&elf.call_targets);
     call_targets.insert(prologue + CALL_AT, entry);
+    // The ELF's targets in the spans, the prologue's own, and where the
+    // kernel's branches and jumps land, the prologue included, which the
+    // ELF's targets cannot name: it lies past the ELF's code.
     let control_flow_targets: HashSet<u64> = spans
         .iter()
         .flat_map(|&(start, end)| graph.targets.range(start..end).copied())
         .chain([prologue, prologue + RETURN_AT])
+        .chain(direct_targets(&code_sections))
         .collect();
     let abs_code_ptrs = within(&graph.pointers, |&(at, _, _)| at, &objects)
         .into_iter()

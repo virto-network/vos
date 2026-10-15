@@ -512,33 +512,32 @@ fn instantiate_at_a_counter_resumes_a_suspended_machine() {
 #[test]
 fn instantiate_at_an_out_of_gas_counter_resumes_a_starved_machine() {
     let (blob, pool, program) = counting_in_a_pool();
-    let (page, start) = (COUNTED, counting_from);
     let mut observed = Vec::new();
     for backend in crate::test_support::backends() {
         let mut stops = Vec::new();
         let mut machines = InnerMachines::with_backend(backend);
         machines.set_pool(Arc::clone(&pool));
         let id = machines.instantiate(&program, 0).unwrap();
-        let straight = machines.invoke(id, start(GAS)).unwrap();
+        let straight = machines.invoke(id, counting_from(GAS)).unwrap();
         assert_eq!(straight.exit, InnerExit::Panic, "{backend:?}");
         assert_eq!(straight.state.registers[2], 100, "{backend:?}");
         let used = GAS - straight.state.gas;
-        let stored = machines.peek(id, page, 4096).unwrap();
+        let stored = machines.peek(id, COUNTED, 4096).unwrap();
         machines.expunge(id).unwrap();
         for starve in [1, used / 3, used / 2 + 7, used - 1] {
             let id = machines.instantiate(&program, 0).unwrap();
-            let starved = machines.invoke(id, start(starve)).unwrap();
+            let starved = machines.invoke(id, counting_from(starve)).unwrap();
             assert_eq!(starved.exit, InnerExit::OutOfGas, "{backend:?}, {starve}");
             assert!(starved.state.gas <= starve, "{backend:?}: not wrapped");
             let rounds = starved.state.registers[2];
-            let bytes = machines.peek(id, page, 4096).unwrap();
+            let bytes = machines.peek(id, COUNTED, 4096).unwrap();
             let pc = machines.expunge(id).unwrap();
             // A block's start: the entry, the loop's body or the trap.
             assert!([0, 1, 10].contains(&pc), "{backend:?}, {starve}: at {pc}");
             let pooled = machines.instantiate(&program, pc).unwrap();
             let (mut loader, loaded) = loaded_at(&blob, backend, pc);
             for (machines, id) in [(&mut machines, pooled), (&mut loader, loaded)] {
-                machines.poke(id, page, &bytes).unwrap();
+                machines.poke(id, COUNTED, &bytes).unwrap();
                 let state = InvokeState {
                     gas: GAS,
                     registers: starved.state.registers,
@@ -546,7 +545,7 @@ fn instantiate_at_an_out_of_gas_counter_resumes_a_starved_machine() {
                 let resumed = machines.invoke(id, state).unwrap();
                 assert_eq!(resumed.exit, InnerExit::Panic, "{backend:?}");
                 assert_eq!(resumed.state.registers, straight.state.registers);
-                assert_eq!(machines.peek(id, page, 4096).unwrap(), stored);
+                assert_eq!(machines.peek(id, COUNTED, 4096).unwrap(), stored);
                 assert_eq!(
                     (starve - starved.state.gas) + (GAS - resumed.state.gas),
                     used,
@@ -573,19 +572,18 @@ fn instantiate_at_an_out_of_gas_counter_resumes_a_starved_machine() {
 #[test]
 fn instantiate_at_a_faulting_store_charges_its_block_again() {
     let (blob, pool, program) = counting_in_a_pool();
-    let (page, start) = (COUNTED, counting_from);
     let mut observed = Vec::new();
     for backend in crate::test_support::backends() {
         let mut machines = InnerMachines::with_backend(backend);
         machines.set_pool(Arc::clone(&pool));
         let run = |machines: &mut InnerMachines, gas| {
             let id = machines.instantiate(&program, 0).unwrap();
-            let outcome = machines.invoke(id, start(gas)).unwrap();
+            let outcome = machines.invoke(id, counting_from(gas)).unwrap();
             (id, outcome)
         };
         let (id, straight) = run(&mut machines, GAS);
         let used = GAS - straight.state.gas;
-        let stored = machines.peek(id, page, 4096).unwrap();
+        let stored = machines.peek(id, COUNTED, 4096).unwrap();
         machines.expunge(id).unwrap();
         // The loop's body costs what two starved runs differ by a round.
         let starved: Vec<(Gas, u64)> = [used / 3, used / 2]
@@ -600,10 +598,10 @@ fn instantiate_at_a_faulting_store_charges_its_block_again() {
 
         let id = machines.instantiate(&program, 0).unwrap();
         machines
-            .pages(id, page / 4096, 1, PageMode::SetReadOnly)
+            .pages(id, COUNTED / 4096, 1, PageMode::SetReadOnly)
             .unwrap();
-        let fault = machines.invoke(id, start(GAS)).unwrap();
-        assert_eq!(fault.exit, InnerExit::Fault(page), "{backend:?}");
+        let fault = machines.invoke(id, counting_from(GAS)).unwrap();
+        assert_eq!(fault.exit, InnerExit::Fault(COUNTED), "{backend:?}");
         assert_eq!(fault.state.registers[2], 1, "{backend:?}: before the store");
         let pc = machines.expunge(id).unwrap();
         assert_eq!(pc, 4, "{backend:?}: the store's counter");
@@ -617,7 +615,7 @@ fn instantiate_at_a_faulting_store_charges_its_block_again() {
             let resumed = machines.invoke(id, state).unwrap();
             assert_eq!(resumed.exit, InnerExit::Panic, "{backend:?}");
             assert_eq!(resumed.state.registers, straight.state.registers);
-            assert_eq!(machines.peek(id, page, 4096).unwrap(), stored);
+            assert_eq!(machines.peek(id, COUNTED, 4096).unwrap(), stored);
             assert_eq!(
                 (GAS - fault.state.gas) + (GAS - resumed.state.gas),
                 used + body,

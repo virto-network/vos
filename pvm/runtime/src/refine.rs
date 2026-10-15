@@ -490,7 +490,7 @@ impl Machine {
     /// The `len` bytes at `address`, if all of them are readable; none
     /// always are. Readability is checked before allocating, so a length is
     /// bounded by the machine's own mapped memory.
-    pub fn read_range(&self, address: u64, len: u64) -> Option<Vec<u8>> {
+    pub(crate) fn read_range(&self, address: u64, len: u64) -> Option<Vec<u8>> {
         let len = usize::try_from(len).ok()?;
         if len == 0 {
             return Some(Vec::new());
@@ -507,7 +507,7 @@ impl Machine {
 
     /// The 32-bit address and the length of `len` bytes at `address`, if all
     /// of them are writable; none always are, at 0.
-    pub fn writable_range(&self, address: u64, len: u64) -> Option<(u32, usize)> {
+    pub(crate) fn writable_range(&self, address: u64, len: u64) -> Option<(u32, usize)> {
         let len = usize::try_from(len).ok()?;
         if len == 0 {
             return Some((0, 0));

@@ -35,9 +35,10 @@ fn skip_for(bitmask: &[u8], pc: usize) -> usize {
     0
 }
 
-/// Each instruction of PVM code, by its bitmask: where it starts, and how
+/// Each instruction of PVM `code`, by its bitmask: where it starts, and how
 /// many continuation bytes follow it.
-fn instructions(bitmask: &[u8]) -> impl Iterator<Item = (usize, usize)> + '_ {
+fn instructions<'a>(code: &[u8], bitmask: &'a [u8]) -> impl Iterator<Item = (usize, usize)> + 'a {
+    debug_assert_eq!(bitmask.len(), code.len());
     let mut pc = 0;
     std::iter::from_fn(move || {
         while pc < bitmask.len() && bitmask[pc] != 1 {
@@ -108,7 +109,7 @@ fn branch_offset(code: &[u8], pc: usize, skip: usize) -> Option<Offset> {
 fn collect_branch_targets(code: &[u8], bitmask: &[u8], jump_table: &[u32]) -> HashSet<usize> {
     let len = code.len();
     let mut targets = HashSet::new();
-    for (pc, skip) in instructions(bitmask) {
+    for (pc, skip) in instructions(code, bitmask) {
         if let Some(offset) = branch_offset(code, pc, skip) {
             let t = (pc as i64 + offset.value as i64) as usize;
             if t < len {
@@ -512,7 +513,7 @@ pub(crate) fn ensure_branch_targets_are_block_starts(
 
     // The instructions a terminator precedes, and the first.
     let mut post_term = HashSet::from([0usize]);
-    for (pc, skip) in instructions(bitmask) {
+    for (pc, skip) in instructions(code, bitmask) {
         if is_terminator(code[pc]) && starts(pc + 1 + skip) {
             post_term.insert(pc + 1 + skip);
         }
@@ -521,7 +522,7 @@ pub(crate) fn ensure_branch_targets_are_block_starts(
     // The branch targets and jump table entries no terminator precedes:
     // PVM offsets to insert a fallthrough before.
     let mut insert_positions = BTreeSet::new();
-    for (pc, skip) in instructions(bitmask) {
+    for (pc, skip) in instructions(code, bitmask) {
         if let Some(offset) = branch_offset(code, pc, skip) {
             let t = (pc as i64 + offset.value as i64) as usize;
             if starts(t) && !post_term.contains(&t) {
@@ -562,7 +563,7 @@ pub(crate) fn ensure_branch_targets_are_block_starts(
     remap(&offset_map);
 
     // Pass 3: re-point every branch offset through `offset_map`.
-    for (old_pc, skip) in instructions(bitmask) {
+    for (old_pc, skip) in instructions(code, bitmask) {
         let Some(offset) = branch_offset(code, old_pc, skip) else {
             continue;
         };
