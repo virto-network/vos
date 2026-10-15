@@ -8,7 +8,6 @@ default:
 # agent, so it is tested with it.
 test:
     cargo test -p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam
-    cargo test --manifest-path support/lsm-tree/Cargo.toml --target-dir target
     cargo test -p vos-pvm-proof --lib
 
 # Bench guests, built with the guest toolchain in `pvm/guest`.
@@ -50,8 +49,7 @@ build-settle:
 # transparent huge pages off.
 export MIMALLOC_ALLOW_THP := "0"
 
-# Formatting: the workspace's, and each crate's it excludes but
-# support/lsm-tree, kept as published.
+# Formatting: the workspace's, and each crate's it excludes.
 fmt-check:
     cargo fmt --all -- --check
     for manifest in ([agent/default agent/test-actors pvm/bench/guests pvm/proof/fuzz pvm/proof/settlement-verifier pvm/proof/verifier-wasm-bench spikes] | each {|dir| glob $'($dir)/**/Cargo.toml' --exclude ['**/target/**'] } | flatten | where {|manifest| open --raw $manifest | str contains '[package]' }) { cargo fmt --manifest-path $manifest -- --check }
@@ -114,7 +112,7 @@ check-no-std:
 # the crates under them.
 # Left to `just ci`: the slow fault runs (the five-process fault suite, the
 # fault build's process tests), the PVM vectors, the bench and prover
-# library tests, lsm-tree's own, and the lints of other feature sets.
+# library tests, and the lints of other feature sets.
 check: fmt-check doc-check build-test-actors build-agent
     cargo clippy --workspace --all-targets --quiet -- -D warnings
     cargo test -p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam

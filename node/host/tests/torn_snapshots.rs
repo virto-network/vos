@@ -1,7 +1,7 @@
 //! A store snapshot sees each commit whole or not at all, while flushes and
 //! compactions run beside the commits: neither makes a sequence number
 //! visible while a commit holding a lower one still inserts its rows,
-//! which `support/lsm-tree` keeps.
+//! which the workspace's patched lsm-tree (`Cargo.toml`) keeps.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

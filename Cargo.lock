@@ -1244,6 +1244,7 @@ checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 [[package]]
 name = "lsm-tree"
 version = "3.1.10"
+source = "git+https://github.com/olanod/lsm-tree?rev=d0791931a96ff2be9b23af4e0d1ef17a330ed9f2#d0791931a96ff2be9b23af4e0d1ef17a330ed9f2"
 dependencies = [
  "byteorder-lite",
  "byteview",

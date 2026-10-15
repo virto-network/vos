@@ -35,13 +35,16 @@ exclude = [
     "pvm/proof/settlement-verifier",
     # Throwaway measurement code from the design runs.
     "spikes",
-    # A dependency's published source, patched (see its VENDORED.md): kept
-    # as published, outside the workspace's formatting and lints.
-    "support/lsm-tree",
 ]
 
+# fjall's lsm-tree: 3.1.10 with three fixes, each on a branch of the fork:
+# a popped memtable is freed outside the version history's write lock
+# (`free-popped-memtables-off-lock`), a flush or a compaction no longer
+# makes a write batch visible in part (`batch-visible-whole`), and its
+# tests' clock is per thread (`per-thread-test-clock`). This is the fork's
+# `vos` branch, which merges the three.
 [patch.crates-io]
-lsm-tree = { path = "support/lsm-tree" }
+lsm-tree = { git = "https://github.com/olanod/lsm-tree", rev = "d0791931a96ff2be9b23af4e0d1ef17a330ed9f2" }
 
 [workspace.package]
 version = "0.1.0"
