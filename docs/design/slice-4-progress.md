@@ -989,3 +989,95 @@ with its software fallback.
   - unknown relocations refused;
   - one section rule;
   - one `Derivation` constructor.
+
+## Step 4.10: acceptance, the end review's fixes, and the closing cleanup
+
+**Acceptance on the slice's code (145c893c):**
+- `just ci-full` green: 127 test binaries, 1,281 s.
+- **The checker loop with workflows:** seeds 601–612 across the three exactly-once tests (one request at a time, pipelined, workflows), with leader kills. All 36 runs green, 949 s.
+
+**The end review (Fable): "close with named fixes first".** Each finding:
+- **F1, the record and the core model:**
+  - §9.3, §12 and §14 brought to what was built and measured (fd618865);
+  - this entry;
+  - §8.2 and §8.3 rid of the explicit `checkpoint()` the owner replaced with "every `.await` may pause".
+- **F2, workflows whose pages DA lacks:** found in one pass before the first simulation, with pages fetched once per package (4.10a). Re-export before retention, or a deterministic pages-lost failure, is carried to slice 5.
+- **F3, the builder's budget below the VOS floor** (4.10a):
+  - a batch starts at the refine gas less a pinned bound on the package's own work, 900M of PolkaJam's 1e9;
+  - it never drops below `min_refine_gas`'s floor while it can shrink;
+  - a lone input is retried at the floor;
+  - a chain whose refine gas gives less is refused.
+  - `HELD_PAGES` went from 768 to 576 pages (2.25 MiB), so the step ending a workflow at the cap fits a package. That is const-asserted (about 913M of 950M usable).
+- **F4:** `vos-checker`'s tests run in `test-agent`, and the loop was rerun on the final code.
+- **F5, PolkaJam's re-probe on upgrade and the recompiler run:** carried to the owner.
+- **F6:** the 4.4a note on a replica waiting for a blob no member has is corrected. It waits for good, logged, which the crash-fault trust model (core model §5) accepts.
+
+**Also in 4.10a:**
+- **An ingress bug, reachable without a token:** a 64-byte non-ASCII bearer token sliced inside a character and panicked, and each panic leaked a connection slot until the ingress refused everyone. `hex32` now refuses such tokens, and a drop guard releases the slot.
+- **One refine-host lookup** (`serve_lookup`) serves the node, vos-jam, the JAM reference and the testkit, so the reference charges the node's lookup gas.
+
+**The code-quality cleanup (4.10b–f),** behaviour-preserving, each step reviewed by Opus with its fixes folded in:
+- **4.10b, the agent crates:**
+  - the definitions the agent and its model share move into the wire (an `Op` enum, `Outcome::failed`, `ids::derive_id`, pinned by known answers);
+  - the large files are split;
+  - the meter is encapsulated;
+  - one `Call` struct travels through invocations.
+- **4.10c, the PVM and support crates:**
+  - every emitted program byte-identical, with derive's pinned hashes unchanged;
+  - dead RV32 paths, a dead pass and duplicate scans removed;
+  - the linker split into phases;
+  - the refine host's handlers use `?`, with one dispatcher;
+  - the review restored a refusal derive had lost, for a kernel jumping into its own prologue.
+- **4.10d, the node's core:**
+  - the leader, node, driver, raft and storage split;
+  - one `send` that derives its class;
+  - `Change::synced` lists every variant;
+  - the leader's outbox recovery is retried under backoff.
+- **4.10e, the node's edges and storage:**
+  - blobs, client and store split;
+  - the blob collector reads references without decoding bodies;
+  - one client lock with no lock held over I/O;
+  - the benches moved to `benches/`.
+- **4.10f, jam, cli, checker, net and the test harnesses:**
+  - shared helpers in `vos_checker`;
+  - `vos jam milestone` is now `vos jam testnet` (`just jam-testnet`);
+  - clap value parsers;
+  - signed-call construction in one place.
+- **New gates:**
+  - `just doc-check` (broken and private intra-doc links, in `check`), which fixed 153 links;
+  - `fmt-check` over the crates the workspace excludes.
+- **Test flakes fixed, each guarding what it did:**
+  - a down node's port taken by another listener (the harnesses hold it);
+  - the snapshot stream outlasting the leader's deadline;
+  - head-of-line blocking bounded by a bulk frame's time;
+  - the restarted follower's probe;
+  - test installs following the leader on `NotLeader`.
+- **Lines:** the steps moved about 25,000 lines into new modules. The net count barely moved: the module headers and the named helpers ate the removed duplicates.
+
+**Final gates on the cleaned code (83775f0f):**
+- `just ci-full` green: 126 test binaries, 1,464 s.
+- The checker loop with workflows: 36 runs green, 878 s.
+- An earlier full run, on 7745cdab, failed once: a restarted node in the
+  served suite found its port taken while it was down, under heavy load.
+  The harnesses now hold a down node's ports, and `free_port` never
+  hands one out twice. The rerun is the one above.
+
+**Open for the owner:**
+- **A step's own effects on JAM.**
+  - At the agent's per-step caps (writes, 16 messages, 16 attests), a step's effects cost up to about 1.15e9 of a package's own work, and the worst step about 2.06e9.
+  - A lone step whose effects pass what its keep leaves fails `Cap` on JAM only.
+  - One past the usable gas leaves the builder no package to make.
+  - A request's step is left undispatched instead.
+  - Closing it needs per-step effect caps about 31 times lower for agents on JAM.
+- PolkaJam's re-probe on an upgrade, and its recompiler, which needs `vm.unprivileged_userfaultfd`.
+- VOS paying JAM's page prices.
+- The lsm-tree patch: kept vendored, or offered upstream, before master.
+
+**Carried, each to a named slice:**
+- **Slice 5:**
+  - DA re-export before retention, or a deterministic pages-lost failure;
+  - a workflow's resume latency on three processes, and 4.4c's follower catch-up figure;
+  - a heap mapped per kind of invocation (a bump allocator over the header's heap region);
+  - the private key transform;
+  - the per-step effect caps for JAM agents, with the owner's decision.
+- **Before master (the owner's "very end"):** the spikes, the vendored lsm-tree and the rest of the cleanup list.
