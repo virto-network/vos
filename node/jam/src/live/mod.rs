@@ -24,11 +24,11 @@ use base64::engine::general_purpose::STANDARD;
 use serde_json::json;
 use vos_tree::Hash;
 use vos_wire::defaults::SESSION_SKEW_MS;
-use vos_wire::package::{EPOCH_MS, EXPORTS, ROOT, SLOT_MS};
+use vos_wire::package::{EPOCH_MS, EXPORTS, MAX_SEGMENTS, ROOT, SLOT_MS};
 
 use crate::Error;
-use crate::builder::Prepared;
-use crate::chain::{Chain, Landed};
+use crate::builder::{MAX_INPUT, Prepared};
+use crate::chain::{Chain, Landed, MAX_REFINE_OUTPUT};
 use crate::da::Segments;
 use crate::simulate::Runner;
 use rpc::decoded;
@@ -60,6 +60,27 @@ pub struct Parameters {
     pub max_report_elective_data: u64,
 }
 
+impl Parameters {
+    /// What of the agent's and its builder's limits these parameters do
+    /// not hold, by name: none when they agree.
+    pub fn disagreements(&self) -> Vec<&'static str> {
+        [
+            ("slot period", self.slot_period_sec * 1000 == SLOT_MS),
+            (
+                "refine output",
+                self.max_report_elective_data as usize == MAX_REFINE_OUTPUT,
+            ),
+            ("imports", self.max_imports as usize == MAX_SEGMENTS),
+            ("exports", self.max_exports as usize == MAX_SEGMENTS),
+            ("input", self.max_input as usize >= MAX_INPUT),
+        ]
+        .into_iter()
+        .filter(|(_, agree)| !agree)
+        .map(|(what, _)| what)
+        .collect()
+    }
+}
+
 fn failed(what: impl std::fmt::Display) -> Error {
     Error::Node(what.to_string())
 }
@@ -83,15 +104,10 @@ impl Node {
         })
     }
 
-    /// The best block, or the finalized one: its header hash, as the RPC
-    /// names it, and its slot.
-    pub fn head(&self, finalized: bool) -> Result<(String, u64), Error> {
-        let method = if finalized {
-            "finalizedBlock"
-        } else {
-            "bestBlock"
-        };
-        let answer = self.call(method, json!([]))?;
+    /// The finalized block: its header hash, as the RPC names it, and its
+    /// slot.
+    pub fn finalized(&self) -> Result<(String, u64), Error> {
+        let answer = self.call("finalizedBlock", json!([]))?;
         let hash = answer["header_hash"]
             .as_str()
             .ok_or_else(|| failed("a head without a hash"))?;
@@ -108,10 +124,14 @@ impl Node {
     }
 
     /// The slots at which `service`'s request for the preimage of `hash`,
-    /// `len` bytes long, changed, at the finalized block; `None` when it
-    /// has none.
-    pub fn request(&self, service: u64, hash: &Hash, len: u64) -> Result<Option<Vec<u64>>, Error> {
-        let (head, _) = self.head(true)?;
+    /// `len` bytes long, changed, at block `head`; `None` when it has none.
+    pub fn request(
+        &self,
+        head: &str,
+        service: u64,
+        hash: &Hash,
+        len: u64,
+    ) -> Result<Option<Vec<u64>>, Error> {
         let answer = self.call(
             "serviceRequest",
             json!([head, service, STANDARD.encode(hash), len]),
@@ -143,7 +163,7 @@ impl Node {
     /// The agent `service` as the finalized block holds it, both its keys
     /// read there; and that block's slot.
     pub fn landed(&self, service: u64) -> Result<(Landed, u64), Error> {
-        let (head, slot) = self.head(true)?;
+        let (head, slot) = self.finalized()?;
         let landed = Landed::read(
             self.value(&head, service, ROOT)?.as_deref(),
             self.value(&head, service, EXPORTS)?.as_deref(),
@@ -164,11 +184,12 @@ impl Node {
     ) -> Result<u64, Error> {
         let until = Instant::now() + timeout;
         loop {
+            let (head, slot) = self.finalized()?;
             let since = self
-                .request(service, hash, len)?
+                .request(&head, service, hash, len)?
                 .and_then(|slots| available(&slots));
             if let Some(since) = since
-                && self.head(true)?.1 >= since + ANCHOR_MARGIN
+                && slot >= since + ANCHOR_MARGIN
             {
                 return Ok(since);
             }

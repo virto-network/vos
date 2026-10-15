@@ -13,21 +13,16 @@
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
-use vos_checker::calls::{Total, call, increment, served_method, signed_query};
-use vos_checker::processes::{Options, PROCESS_WAIT, Processes, converged, counter_agent};
+use vos_checker::calls::{Total, call, increment, query_at, served_method};
+use vos_checker::processes::{Options, PROCESS_WAIT, Processes};
 use vos_checker::programs::package;
 use vos_checker::rounds::{ASKED, ROUNDS, Rounds, TOLD, Tour};
-use vos_checker::wait_until;
+use vos_checker::{COUNTER, INBOX, mark, wait_until};
 use vos_node::client::Client;
 use vos_wire::ids::{AgentId, InstanceId};
 use vos_wire::ingress::{Consistency, Response, WorkflowStatus};
-use vos_wire::records::unstored;
 use vos_wire::result::Outcome;
 use vos_wire::{Decode, Encode, keys};
-
-const COUNTER: InstanceId = InstanceId(1);
-/// The counter instance the other agent's messages increment.
-const INBOX: InstanceId = InstanceId(2);
 
 /// Three nodes, in the clear.
 fn start() -> Processes {
@@ -37,7 +32,7 @@ fn start() -> Processes {
 #[test]
 fn a_leader_cut_off_by_the_relay_is_replaced_and_catches_up() {
     let space = start();
-    let agent = counter_agent(&space, COUNTER);
+    let agent = space.counter_agent(COUNTER);
     let mut client = Client::new(space.target(1), SigningKey::from_bytes(&[31; 32]));
     let add = served_method(&mut client, agent, COUNTER, "increment");
     let mut total = 0;
@@ -46,20 +41,14 @@ fn a_leader_cut_off_by_the_relay_is_replaced_and_catches_up() {
         assert_eq!(increment(&mut client, agent, COUNTER, add, by), total);
     }
     let cut = space.leader(agent);
-    space.relay.isolate(cut, 3);
-    wait_until("another node leads", PROCESS_WAIT, || {
-        (1..=3).filter(|number| *number != cut).any(|number| {
-            space
-                .status(number, agent)
-                .is_some_and(|status| status.leads)
-        })
-    });
+    space.relay.isolate(cut);
+    space.led_elsewhere(agent, cut, 0);
     for by in 6..=10 {
         total += by;
         assert_eq!(increment(&mut client, agent, COUNTER, add, by), total);
     }
     space.relay.heal();
-    converged(&space, agent);
+    space.converged(agent);
     let status = space.status(cut, agent).expect("the cut node's replica");
     assert!(!status.leads, "the cut leader stepped down");
     assert_eq!(
@@ -123,23 +112,18 @@ fn three_processes_apply_every_call_once_through_a_kill() {
     ];
     for number in 1..=3 {
         let read = |agent: AgentId, instance: InstanceId| {
-            let identity = identities
-                .iter()
-                .find(|(id, _)| *id == agent)
-                .map(|(_, identity)| *identity)
-                .unwrap();
-            let query = signed_query(
+            let identity = identities.iter().find(|(id, _)| *id == agent).unwrap().1;
+            let linearizable = Consistency::Linearizable;
+            query_at(
+                space.target(number),
+                agent,
                 &identity,
                 &key,
-                vos_node::wall_clock() + 60_000,
-                Consistency::Linearizable,
+                linearizable,
                 instance,
                 value,
-            );
-            let path = format!("/agents/{}/queries", agent.0);
-            let (_, body) = vos_node::client::post(space.target(number), &path, &query).ok()?;
-            let (answer, _) = Response::decode(&body).ok()?;
-            answer.total()
+            )?
+            .total()
         };
         wait_until("every node converges", PROCESS_WAIT, || {
             read(sender, COUNTER) == Some(total) && read(receiver, INBOX) == Some(forwarded)
@@ -151,10 +135,7 @@ fn three_processes_apply_every_call_once_through_a_kill() {
         .filter(|request| request.is_multiple_of(4))
         .count() as u64;
     for store in space.stop_all() {
-        let mark = |agent: AgentId, key: &[u8]| {
-            let bytes = store.snapshot().get(agent, key).unwrap().unwrap();
-            u64::decode(unstored(&bytes).unwrap()).unwrap().0
-        };
+        let mark = |agent, key: &[u8]| mark(&store, agent, key);
         assert_eq!(mark(receiver, &keys::pair_in(sender)), forwards);
         assert_eq!(mark(sender, &keys::pair_out(receiver)), forwards);
     }
@@ -182,15 +163,9 @@ fn a_workflow_mid_await_completes_once_through_a_kill_and_a_partition() {
     // One of its nodes cut off: it holds no quorum, and the tour's first
     // round awaits.
     let (cut, other) = (asked_on[0], asked_on[1]);
-    space.relay.isolate(cut, 3);
+    space.relay.isolate(cut);
     let mut client = Client::new(space.target(other), SigningKey::from_bytes(&[41; 32]));
-    let tour = Tour {
-        other: asked,
-        amounts: vec![2, 3, 4],
-        nap: 0,
-        words: 64,
-        passes: 4,
-    };
+    let tour = Tour::light(asked, vec![2, 3, 4], 0);
     let started = client
         .call(touring, ROUNDS, methods.tour, &tour.arguments())
         .unwrap();
@@ -237,17 +212,16 @@ fn a_workflow_mid_await_completes_once_through_a_kill_and_a_partition() {
     ];
     let read = |number: usize, agent: AgentId, instance: InstanceId| {
         let identity = identities.iter().find(|(id, _)| *id == agent).unwrap().1;
-        let query = signed_query(
+        let (target, linearizable) = (space.target(number), Consistency::Linearizable);
+        match query_at(
+            target,
+            agent,
             &identity,
             &key,
-            vos_node::wall_clock() + 60_000,
-            Consistency::Linearizable,
+            linearizable,
             instance,
             methods.tallies,
-        );
-        let path = format!("/agents/{}/queries", agent.0);
-        let (_, body) = vos_node::client::post(space.target(number), &path, &query).ok()?;
-        match Response::decode(&body).ok()?.0 {
+        )? {
             Response::Ran {
                 outcome: Outcome::Done(tallies),
                 ..
@@ -281,10 +255,7 @@ fn a_workflow_mid_await_completes_once_through_a_kill_and_a_partition() {
     // each request answered once: the pairs' marks, on disk.
     let rounds = tour.amounts.len() as u64;
     for (number, store) in (1..=3).zip(space.stop_all()) {
-        let mark = |agent: AgentId, key: &[u8]| {
-            let bytes = store.snapshot().get(agent, key).unwrap().unwrap();
-            u64::decode(unstored(&bytes).unwrap()).unwrap().0
-        };
+        let mark = |agent, key: &[u8]| mark(&store, agent, key);
         assert_eq!(mark(touring, &keys::pair_out(asked)), 2 * rounds);
         assert_eq!(mark(touring, &keys::pair_in(asked)), rounds);
         if number != leader {
@@ -310,7 +281,7 @@ mod faults {
     #[test]
     fn a_leader_whose_disk_stalls_hands_its_group_over() {
         let space = start();
-        let agent = counter_agent(&space, COUNTER);
+        let agent = space.counter_agent(COUNTER);
         let stalled = space.leader(agent);
         let mut client = Client::new(space.target(stalled), SigningKey::from_bytes(&[32; 32]));
         let add = served_method(&mut client, agent, COUNTER, "increment");
@@ -323,16 +294,10 @@ mod faults {
             "a call at a stalled leader waited {:?}",
             started.elapsed()
         );
-        wait_until("another node leads", PROCESS_WAIT, || {
-            (1..=3).filter(|number| *number != stalled).any(|number| {
-                space
-                    .status(number, agent)
-                    .is_some_and(|status| status.leads)
-            })
-        });
+        space.led_elsewhere(agent, stalled, 0);
         space.set_faults(stalled, "");
         assert_eq!(increment(&mut client, agent, COUNTER, add, 3), 6);
-        converged(&space, agent);
+        space.converged(agent);
     }
 
     /// A leader whose syncs fail, its batches written but not synced, halts
@@ -341,7 +306,7 @@ mod faults {
     #[test]
     fn a_leader_whose_disk_fails_halts_and_a_restart_recovers() {
         let space = start();
-        let agent = counter_agent(&space, COUNTER);
+        let agent = space.counter_agent(COUNTER);
         let failing = space.leader(agent);
         let other = (1..=3).find(|number| *number != failing).unwrap();
         let mut client = Client::new(space.target(other), SigningKey::from_bytes(&[34; 32]));
@@ -370,7 +335,7 @@ mod faults {
         space.kill(failing);
         space.restart(failing);
         assert_eq!(increment(&mut client, agent, COUNTER, add, 3), 6);
-        converged(&space, agent);
+        space.converged(agent);
     }
 
     /// A leader whose Raft frames are lost, its node alive and heard, steps
@@ -378,7 +343,7 @@ mod faults {
     #[test]
     fn a_gray_failure_deposes_its_leader() {
         let space = start();
-        let agent = counter_agent(&space, COUNTER);
+        let agent = space.counter_agent(COUNTER);
         let mut client = Client::new(space.target(1), SigningKey::from_bytes(&[33; 32]));
         let add = served_method(&mut client, agent, COUNTER, "increment");
         assert_eq!(increment(&mut client, agent, COUNTER, add, 1), 1);
@@ -387,19 +352,13 @@ mod faults {
         let at_fault = space.status(gray, agent).expect("the gray replica");
         assert!(at_fault.leads, "it led when its frames began to be lost");
         assert_eq!(increment(&mut client, agent, COUNTER, add, 2), 3);
-        wait_until("another node leads, at a later term", PROCESS_WAIT, || {
-            (1..=3).filter(|number| *number != gray).any(|number| {
-                space
-                    .status(number, agent)
-                    .is_some_and(|status| status.leads && status.term > at_fault.term)
-            })
-        });
+        space.led_elsewhere(agent, gray, at_fault.term);
         assert!(
             !space.status(gray, agent).is_some_and(|status| status.leads),
             "the gray leader stepped down"
         );
         space.set_faults(gray, "");
-        converged(&space, agent);
+        space.converged(agent);
         assert!(space.troubles().is_empty(), "{:?}", space.troubles());
     }
 }

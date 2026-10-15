@@ -38,14 +38,7 @@ use vos_wire::ids::AgentId;
 
 const AGENT: AgentId = AgentId(1);
 /// Twelve rounds, the last six tearing a tail before reopening.
-const ROUNDS: Rounds = Rounds {
-    writer: "VOS_BLOB_CRASH_WRITER",
-    rounds: 12,
-    torn_from: 6,
-    report: "appended ",
-    reports: 40,
-    kill_within: Duration::from_millis(3),
-};
+const ROUNDS: Rounds = Rounds::twelve("VOS_BLOB_CRASH_WRITER", "appended ", 40);
 /// At most this many bytes of a blob segment are torn: less than one blob.
 const BLOB_TEAR: u64 = 1024;
 /// At most this many bytes of the journal are torn: less than one append.
@@ -57,7 +50,7 @@ const SEGMENT: u64 = 16 << 10;
 
 /// Entry `index`'s blob.
 fn blob_bytes(index: u64) -> Vec<u8> {
-    let mut random = Random(index.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+    let mut random = Random::new(index.wrapping_mul(0x9e37_79b9_7f4a_7c15));
     (0..BLOB).map(|_| random.draw() as u8).collect()
 }
 

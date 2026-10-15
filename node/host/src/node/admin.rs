@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use vos_raft::Role;
 use vos_wire::batch::Admin;
-use vos_wire::ids::{AgentId, InstanceId, MethodId, ProgramHash};
+use vos_wire::ids::{AgentId, InstanceId, ProgramHash};
 use vos_wire::ingress::Unplaced;
 use vos_wire::peer::{CreationRecord, NodeNumber, Placement};
 use vos_wire::records::Derivation;
@@ -210,10 +210,7 @@ impl Inner {
                 let derivation = Derivation::new(
                     &elf,
                     &derived.actor,
-                    derived
-                        .kernels
-                        .iter()
-                        .map(|(method, kernel)| (MethodId(*method), kernel.as_slice())),
+                    &derived.kernels,
                     derived.transpiler_version,
                 );
                 pooled(derived.actor)?;

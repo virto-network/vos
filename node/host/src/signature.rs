@@ -4,7 +4,7 @@ use std::sync::LazyLock;
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use vos_wire::defaults;
-use vos_wire::ingress::{Call, call_message};
+use vos_wire::ingress::Call;
 
 pub(crate) fn verify(key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
     verify_in(&KEYS, key, message, signature)
@@ -43,15 +43,7 @@ fn verifying_key_in(keys: &Keys, bytes: &[u8; 32]) -> Option<VerifyingKey> {
 /// Whether `call` is signed by its session's key, for the agent whose
 /// identity is `identity`.
 pub(crate) fn signed(identity: &[u8; 32], call: &Call) -> bool {
-    let message = call_message(
-        identity,
-        &call.session,
-        call.sequence,
-        call.instance,
-        call.method,
-        &call.arguments,
-    );
-    verify(&call.session.key, &message, &call.signature)
+    verify(&call.session.key, &call.message(identity), &call.signature)
 }
 
 #[cfg(test)]

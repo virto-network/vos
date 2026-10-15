@@ -35,6 +35,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use vos_checker::calls::installed;
 use vos_checker::programs::{Programs, method};
 use vos_checker::spaces::{open_node, space};
 use vos_net::Class;
@@ -44,9 +45,8 @@ use vos_wire::batch::Request;
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session};
 use vos_wire::ingress::Stats;
 use vos_wire::peer::NodeNumber;
-use vos_wire::records::unstored;
 use vos_wire::result::Outcome;
-use vos_wire::{Decode, Encode, keys};
+use vos_wire::{Encode, keys};
 
 const COUNTER: InstanceId = InstanceId(1);
 const NODES: u8 = 3;
@@ -85,11 +85,12 @@ fn node(nodes: &Nodes, number: NodeNumber) -> &Node {
 fn agent(nodes: &Nodes, at: NodeNumber, counter: &[u8]) -> AgentId {
     let node = node(nodes, at);
     let agent = node.create_agent().unwrap();
-    let installed = smol::block_on(node.install(agent, COUNTER, counter, vec![]));
-    assert!(
-        matches!(installed, Ok(Reply::Ran(Outcome::Done(_)))),
-        "{installed:?}"
-    );
+    installed(smol::block_on(node.install(
+        agent,
+        COUNTER,
+        counter,
+        vec![],
+    )));
     agent
 }
 
@@ -103,12 +104,7 @@ struct Pair {
 
 /// A `u64` of `agent`'s applied state on `node`, 0 when absent.
 fn mark(node: &Node, agent: AgentId, key: &[u8]) -> u64 {
-    node.store()
-        .snapshot()
-        .get(agent, key)
-        .unwrap()
-        .and_then(|bytes| u64::decode(unstored(&bytes)?).ok())
-        .map_or(0, |(value, _)| value)
+    vos_checker::mark(node.store(), agent, key)
 }
 
 /// The messages `pair` sent, those its receiver applied, and those its

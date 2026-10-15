@@ -2,29 +2,25 @@
 
 use std::ops::RangeInclusive;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use smol::future::FutureExt;
 use vos_checker::calls::{done, install_at_leader};
 use vos_checker::programs::Programs;
-use vos_checker::spaces::{IN_PROCESS_WAIT, open_node, space};
+pub use vos_checker::spaces::wait_in_process as wait_until;
+use vos_checker::spaces::{open_node, space};
 use vos_net::memory::{Endpoint, Hub};
 use vos_net::{Arrivals, Class, Network};
 use vos_node::{CallError, Config, Hooks, Node, Peers, Reply, Space};
-use vos_wire::batch::{Batch, Request};
-use vos_wire::ids::{AgentId, InstanceId, Principal, Session};
+use vos_wire::batch::Request;
+use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session};
 use vos_wire::peer::{NodeNumber, PeerMessage};
 use vos_wire::result::Outcome;
 use vos_wire::{Decode, Encode};
 
 pub const COUNTER: InstanceId = InstanceId(1);
 pub const ALICE: Principal = Principal::Client([1; 32]);
-
-#[track_caller]
-pub fn wait_until(what: &str, done: impl FnMut() -> bool) {
-    vos_checker::wait_until(what, IN_PROCESS_WAIT, done);
-}
 
 /// What a test sets in node `number`'s config, past the harness's own.
 type Tuning = Box<dyn Fn(NodeNumber, &mut Config) + Send + Sync>;
@@ -62,6 +58,22 @@ impl Cluster {
         tuning: impl Fn(NodeNumber, &mut Config) + Send + Sync + 'static,
     ) -> Self {
         Self::build(count, false, Box::new(tuning))
+    }
+
+    /// Nodes 1..=count on the hub, each with hooks of its own: the
+    /// cluster, and the hooks by node.
+    pub fn with_hooks<H: Hooks + Default + 'static>(count: u8) -> (Self, Vec<Arc<H>>) {
+        let hooks: Vec<Arc<H>> = (0..count).map(|_| Arc::default()).collect();
+        let each = hooks.clone();
+        let cluster = Self::tuned(count, move |number, config| {
+            config.hooks = each[usize::from(number) - 1].clone();
+        });
+        (cluster, hooks)
+    }
+
+    /// Nodes 1..=count on the hub, every one with `hooks`.
+    pub fn hooked(count: u8, hooks: Arc<dyn Hooks>) -> Self {
+        Self::tuned(count, move |_, config| config.hooks = hooks.clone())
     }
 
     fn build(count: u8, quic: bool, tuning: Tuning) -> Self {
@@ -179,9 +191,35 @@ impl Cluster {
         install_at_leader(|| self.node(self.leader(agent)), agent, instance, elf);
     }
 
-    /// An agent on `replicas`, created at the first of them, with the
-    /// counter installed once every replica runs its group.
-    pub fn counter_agent(&self, replicas: &[NodeNumber]) -> AgentId {
+    /// Node `at` replaces `out` by `inn` among `agent`'s replicas,
+    /// `before`: answered with the replicas after, in order, which this
+    /// gives back.
+    #[track_caller]
+    pub fn replace(
+        &self,
+        at: NodeNumber,
+        agent: AgentId,
+        before: &[NodeNumber],
+        out: NodeNumber,
+        inn: NodeNumber,
+    ) -> Vec<NodeNumber> {
+        let after = replaced(before, out, inn);
+        assert_eq!(self.node(at).replace(agent, out, inn).unwrap(), after);
+        after
+    }
+
+    /// Node `number` has applied `agent` as far as node `ahead` had when
+    /// it last looked.
+    #[track_caller]
+    pub fn caught_up(&self, number: NodeNumber, agent: AgentId, ahead: NodeNumber) {
+        wait_until(&format!("node {number} applies as far as {ahead}"), || {
+            self.node(number).applied(agent) >= self.node(ahead).applied(agent)
+        });
+    }
+
+    /// An agent on `replicas`, created at the first of them, once every
+    /// replica runs its group.
+    pub fn agent(&self, replicas: &[NodeNumber]) -> AgentId {
         let agent = self
             .node(replicas[0])
             .create_replicated(replicas.to_vec())
@@ -191,6 +229,13 @@ impl Cluster {
                 .iter()
                 .all(|number| self.node(*number).applied(agent).is_some())
         });
+        agent
+    }
+
+    /// An agent on `replicas`, as [`Cluster::agent`] makes it, with the
+    /// counter installed.
+    pub fn counter_agent(&self, replicas: &[NodeNumber]) -> AgentId {
+        let agent = self.agent(replicas);
         self.install(agent);
         agent
     }
@@ -205,6 +250,16 @@ impl Cluster {
             instance: COUNTER,
             method: self.programs.method("increment"),
             arguments: by.encode(),
+        }
+    }
+
+    /// Alice's request of the counter's `method` with `arguments`, at
+    /// `sequence` of the test's session.
+    pub fn request_of(&self, sequence: u64, method: MethodId, arguments: Vec<u8>) -> Request {
+        Request {
+            method,
+            arguments,
+            ..self.request(sequence, 0)
         }
     }
 
@@ -374,40 +429,6 @@ pub fn compacting(_: NodeNumber, config: &mut Config) {
     config.snapshot_chunk = 64;
 }
 
-/// Holds every refine while armed, counting those it held.
-#[derive(Default)]
-pub struct HoldRefines {
-    armed: AtomicBool,
-    held: AtomicUsize,
-}
-
-impl HoldRefines {
-    pub fn arm(&self) {
-        self.armed.store(true, Ordering::SeqCst);
-    }
-
-    pub fn release(&self) {
-        self.armed.store(false, Ordering::SeqCst);
-    }
-
-    /// How many refines it held.
-    pub fn held(&self) -> usize {
-        self.held.load(Ordering::SeqCst)
-    }
-}
-
-impl Hooks for HoldRefines {
-    fn fail_refine(&self, _: AgentId, _: &Batch) -> bool {
-        if self.armed.load(Ordering::SeqCst) {
-            self.held.fetch_add(1, Ordering::SeqCst);
-            while self.armed.load(Ordering::SeqCst) {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        }
-        false
-    }
-}
-
 /// Withholds every blob this node is asked for, while told to.
 #[derive(Default)]
 pub struct WithholdBlobs(AtomicBool);
@@ -452,6 +473,12 @@ pub fn retired(node: &Node, agent: AgentId) {
             && rows(node, agent).is_empty()
             && node.store().raft(agent).unwrap().log.is_empty()
     });
+}
+
+/// The hub loses `class`'s frames between nodes `a` and `b`, both ways.
+pub fn cut_both(hub: &Hub, a: NodeNumber, b: NodeNumber, class: Class) {
+    hub.cut_class(a, b, class);
+    hub.cut_class(b, a, class);
 }
 
 /// `replicas` with `out` replaced by `inn`, in order.

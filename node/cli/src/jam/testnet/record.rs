@@ -3,8 +3,8 @@
 
 use std::fmt::Write as _;
 
-use vos_jam::chain::slot_of;
-use vos_jam::{Attempt, Fate};
+use vos_jam::{Attempt, Fate, Taken};
+use vos_wire::package::slot_of;
 
 use super::Testnet;
 
@@ -36,6 +36,68 @@ impl Testnet {
                 attempt.submitted
             ));
         }
+    }
+
+    /// What `taken`'s package did, of `offered` inputs: the roots
+    /// before and after it, its inputs and witness, what it left out,
+    /// imported and exported, its work result, and its refine's gas,
+    /// `gas_used` on the JAM-only host against what the builder gave.
+    pub(super) fn note_package(
+        &mut self,
+        taken: &Taken,
+        offered: usize,
+        (before, after): ([u8; 32], [u8; 32]),
+        gas_used: u64,
+    ) {
+        let Taken {
+            prepared,
+            encoded,
+            exports,
+            ..
+        } = taken;
+        let witness = &prepared.package.witness;
+        self.note(format!(
+            "  root {} -> {}",
+            hex::encode(before),
+            hex::encode(after)
+        ));
+        self.note(format!(
+            "  {} of {offered} inputs; witness {} keys, {} ranges of {} rows; payload {} bytes",
+            prepared.package.batch.inputs.len(),
+            witness.keys.len(),
+            witness.ranges.len(),
+            witness
+                .ranges
+                .iter()
+                .map(|range| range.rows.len())
+                .sum::<usize>(),
+            prepared.payload.len(),
+        ));
+        if !prepared.skipped.is_empty() {
+            self.note(format!(
+                "  left out, their pages gone from DA: workflows {:?}",
+                prepared.skipped
+            ));
+        }
+        self.note(format!(
+            "  imports {}, exports {} ({} pages) at segment root {}",
+            prepared.segments.len(),
+            exports.segments,
+            exports.pages,
+            hex::encode(exports.root),
+        ));
+        self.note(format!(
+            "  work result {} bytes, read back from DA: the one simulated, and the VOS node's, byte for byte",
+            encoded.len()
+        ));
+        let simulations = match prepared.simulations {
+            1 => "1 simulation".to_string(),
+            count => format!("{count} simulations"),
+        };
+        self.note(format!(
+            "  refine {gas_used} gas, measured on our JAM-only host (PolkaJam reports none); the builder gave {}: the batch's budget {}, {} for the package's own work, after {simulations}",
+            prepared.gas, prepared.package.batch.budget, prepared.own,
+        ));
     }
 
     /// Whether each package, the first among them, landed first time.

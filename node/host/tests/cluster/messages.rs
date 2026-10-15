@@ -10,20 +10,20 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use vos_checker::hooks::{Holds, carries};
 use vos_net::Class;
 use vos_node::peer::Refusal;
 use vos_node::store::EntryKind;
 use vos_node::{CallError, Hooks, Reply};
 use vos_wire::abi::Failure;
-use vos_wire::batch::{Answer, Await, Batch, Body, Input, Message, Request};
+use vos_wire::batch::{Answer, Await, Batch, Body, Message};
 use vos_wire::ids::{AgentId, WorkflowId};
 use vos_wire::keys;
 use vos_wire::peer::{NodeNumber, PeerMessage};
-use vos_wire::records::unstored;
 use vos_wire::result::{InputRef, Outcome, Run, Step, WorkResult};
 use vos_wire::{Decode, Encode};
 
-use crate::common::{COUNTER, Cluster, HoldRefines, wait_until};
+use crate::common::{COUNTER, Cluster, wait_until};
 
 impl Cluster {
     /// `from`'s forward of `by` to `to`'s counter, called at node `at`.
@@ -35,11 +35,8 @@ impl Cluster {
         to: AgentId,
         by: u64,
     ) -> Result<Reply, CallError> {
-        let request = Request {
-            method: self.programs.method("forward"),
-            arguments: (to.0, COUNTER.0, by).encode(),
-            ..self.request(sequence, by)
-        };
+        let forward = self.programs.method("forward");
+        let request = self.request_of(sequence, forward, (to.0, COUNTER.0, by).encode());
         smol::block_on(self.node(at).call(from, request))
     }
 
@@ -66,8 +63,7 @@ impl Cluster {
 
     /// A value of `agent`'s applied state at node `at`.
     fn read<T: Decode>(&self, at: NodeNumber, agent: AgentId, key: &[u8]) -> Option<T> {
-        let bytes = self.node(at).store().snapshot().get(agent, key).unwrap()?;
-        Some(T::decode(unstored(&bytes)?).unwrap().0)
+        vos_checker::applied(self.node(at).store(), agent, key)
     }
 
     /// The runs of the steps `agent` applied at node `at` for `input`.
@@ -273,15 +269,7 @@ struct PoisonedMessage {
 
 impl Hooks for PoisonedMessage {
     fn fail_refine(&self, _: AgentId, batch: &Batch) -> bool {
-        let poisoned = batch.inputs.iter().any(|input| {
-            matches!(
-                input,
-                Input::Message(Message {
-                    body: Body::Call { arguments, .. },
-                    ..
-                }) if *arguments == self.poison
-            )
-        });
+        let poisoned = carries(batch, &self.poison);
         if poisoned {
             self.failed.fetch_add(1, Ordering::SeqCst);
         }
@@ -298,8 +286,7 @@ fn a_message_failing_refine_is_consumed_once_and_never_sent_again() {
         poison: 666u64.encode(),
         failed: AtomicU64::new(0),
     });
-    let hooks = Arc::clone(&hook);
-    let cluster = Cluster::tuned(3, move |_, config| config.hooks = hooks.clone());
+    let cluster = Cluster::hooked(3, hook.clone());
     let sender = cluster.counter_agent(&[1]);
     let target = cluster.counter_agent(&[2, 3]);
     cluster.forward_once(sender, 1, target, 666);
@@ -366,7 +353,7 @@ fn a_gap_is_filled_within_a_round_trip() {
 
 /// Two nodes with a resend round of `ROUND`, the second's queues capped at
 /// `queue` and its refines held while `hold` is armed.
-fn held_receiver(queue: usize, hold: &Arc<HoldRefines>) -> Cluster {
+fn held_receiver(queue: usize, hold: &Arc<Holds>) -> Cluster {
     let hold = Arc::clone(hold);
     Cluster::tuned(2, move |number, config| {
         config.resend_round = ROUND;
@@ -385,11 +372,9 @@ const ROUND: Duration = Duration::from_secs(20);
 fn forwarded(cluster: &Cluster, sender: AgentId, target: AgentId, sequences: RangeInclusive<u64>) {
     let forwards: Vec<_> = sequences
         .map(|sequence| {
-            let request = Request {
-                method: cluster.programs.method("forward"),
-                arguments: (target.0, COUNTER.0, 1u64).encode(),
-                ..cluster.request(sequence, 1)
-            };
+            let forward = cluster.programs.method("forward");
+            let request =
+                cluster.request_of(sequence, forward, (target.0, COUNTER.0, 1u64).encode());
             cluster.node(1).call(sender, request)
         })
         .collect();
@@ -406,19 +391,19 @@ fn forwarded(cluster: &Cluster, sender: AgentId, target: AgentId, sequences: Ran
 /// their sender it is behind, long before its next round.
 #[test]
 fn a_full_queues_drops_go_again_once_it_drained() {
-    let hold = Arc::new(HoldRefines::default());
+    let hold = Arc::new(Holds::default());
     let cluster = held_receiver(2, &hold);
     let sender = cluster.counter_agent(&[1]);
     let target = cluster.counter_agent(&[2]);
     cluster.forward_once(sender, 1, target, 1);
     cluster.delivered((sender, &[1]), (target, &[2]), 1);
-    hold.arm();
+    let closed = hold.refines.close();
     forwarded(&cluster, sender, target, 2..=11);
     wait_until("the receiver's full queue drops some", || {
-        hold.held() > 0 && cluster.node(2).dropped(Refusal::Full) > 0
+        hold.refines.reached() > 0 && cluster.node(2).dropped(Refusal::Full) > 0
     });
     let released = Instant::now();
-    hold.release();
+    drop(closed);
     cluster.delivered((sender, &[1]), (target, &[2]), 11);
     let took = released.elapsed();
     assert!(
@@ -433,7 +418,7 @@ fn a_full_queues_drops_go_again_once_it_drained() {
 #[test]
 fn a_full_queues_drops_go_again_beside_a_steady_sender() {
     const LAST: u64 = 301;
-    let hold = Arc::new(HoldRefines::default());
+    let hold = Arc::new(Holds::default());
     let cluster = held_receiver(300, &hold);
     let steady = cluster.counter_agent(&[1]);
     let bulk = [cluster.counter_agent(&[1]), cluster.counter_agent(&[1])];
@@ -442,7 +427,7 @@ fn a_full_queues_drops_go_again_beside_a_steady_sender() {
         cluster.forward_once(sender, 1, target, 1);
     }
     cluster.delivered((steady, &[1]), (target, &[2]), 3);
-    hold.arm();
+    let closed = hold.refines.close();
     std::thread::scope(|scope| {
         for sender in bulk {
             let cluster = &cluster;
@@ -450,7 +435,7 @@ fn a_full_queues_drops_go_again_beside_a_steady_sender() {
         }
     });
     wait_until("the receiver's full queue drops some", || {
-        hold.held() > 0 && cluster.node(2).dropped(Refusal::Full) > 0
+        hold.refines.reached() > 0 && cluster.node(2).dropped(Refusal::Full) > 0
     });
     let stop = AtomicBool::new(false);
     std::thread::scope(|scope| {
@@ -462,7 +447,7 @@ fn a_full_queues_drops_go_again_beside_a_steady_sender() {
             }
         });
         let released = Instant::now();
-        hold.release();
+        drop(closed);
         wait_until("every bulk message applies", || {
             bulk.iter()
                 .all(|sender| cluster.read::<u64>(2, target, &keys::pair_in(*sender)) == Some(LAST))

@@ -21,7 +21,7 @@ use vos_wire::abi::{Rows, cap};
 use vos_wire::batch::{Admin, Answer, Await, Body, Input, Message, Request, Work};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, Session, WorkflowId};
 use vos_wire::keys::{self, Transform};
-use vos_wire::package::{EPOCH_MS, SLOT_MS};
+use vos_wire::package::slot_of;
 use vos_wire::package::{Opened, Package};
 use vos_wire::records::{Workflow, WorkflowState, stored, unstored};
 use vos_wire::result::{Outcome, Outgoing, PAGE, Step, WorkResult, digest, split_output};
@@ -165,19 +165,18 @@ impl Paired {
         assert_eq!(prepared.package.root, root);
         assert!(shows(&prepared.package), "the witness verifies");
         assert!(prepared.gas <= self.builder.refine_gas());
-        let imports = self
-            .builder
-            .imports(&prepared, self.chain.segments().as_ref())
+        let imports = prepared
+            .imports(self.chain.segments().as_ref())
             .expect("the pages in DA");
         let refined = self
             .chain
-            .refine(&self.runner, &prepared.package, imports, prepared.gas)
+            .refine(&self.runner, &prepared.payload, imports, prepared.gas)
             .expect("the package refines within the gas the builder gives it");
         let output = &refined.output;
         assert_eq!(output.root_before, root);
         assert_eq!(output.root_after, prepared.pending.root);
         assert_eq!((output.time, output.seed), (time, seed));
-        let slot = (time - EPOCH_MS) / SLOT_MS + 1;
+        let slot = slot_of(time) + 1;
         let stored = self
             .chain
             .accumulate(&self.runner, &refined, slot)

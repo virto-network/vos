@@ -5,6 +5,7 @@ mod call;
 mod http;
 mod operator;
 mod read;
+mod signed;
 mod target;
 
 use std::collections::{HashMap, HashSet};
@@ -21,6 +22,7 @@ use crate::tls::Trust;
 use http::Http;
 pub use operator::Operator;
 pub use read::schema;
+pub use signed::{signed_call, signed_query, signed_workflow_read, workflow_read_not_after};
 pub use target::Target;
 use target::authority;
 

@@ -9,6 +9,7 @@ use std::time::Duration;
 use vos_node::client::Target;
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Session};
 use vos_wire::peer::NodeNumber;
+use vos_wire::schema::Schema;
 
 /// The counter instance a client forwarding to the next agent increments.
 pub const COUNTER: InstanceId = InstanceId(1);
@@ -126,4 +127,20 @@ pub struct Methods {
     pub value: MethodId,
     /// Sends its amount to another agent's counter, as a message.
     pub forward: MethodId,
+}
+
+impl Methods {
+    /// The counter's methods, by their names in its `schema`.
+    pub fn of(schema: &Schema) -> Self {
+        let method = |name: &str| {
+            schema
+                .method_id(name)
+                .unwrap_or_else(|| panic!("no method {name}"))
+        };
+        Self {
+            increment: method("increment"),
+            value: method("value"),
+            forward: method("forward"),
+        }
+    }
 }

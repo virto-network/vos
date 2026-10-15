@@ -75,7 +75,7 @@ use vos_wire::keys::Due;
 use vos_wire::package::{MAX_SEGMENTS, Package, SEGMENT, result_segments};
 use vos_wire::records::{Workflow, WorkflowState};
 use vos_wire::result::{PAGE, digest};
-use vos_wire::{Encode, defaults, keys};
+use vos_wire::{defaults, keys};
 
 use super::{Builder, record};
 use crate::da::Segments;
@@ -164,6 +164,20 @@ impl Prepared {
     pub fn exports(&self) -> u32 {
         (self.simulation.pages + result_segments(self.simulation.encoded.len())) as u32
     }
+
+    /// The segments the package imports, from `segments`.
+    pub fn imports(&self, segments: &dyn Segments) -> Result<Vec<Vec<u8>>, Error> {
+        self.package
+            .imports
+            .iter()
+            .zip(&self.segments)
+            .map(|(&(workflow, index), (root, at))| {
+                segments
+                    .segment(root, *at)
+                    .ok_or(Error::Page(workflow, index))
+            })
+            .collect()
+    }
 }
 
 impl Builder {
@@ -217,16 +231,13 @@ impl Builder {
                 }
                 prepared => prepared?,
             };
-            let start = defaults::refine_start(inputs.len(), prepared.payload.len() + 64);
-            let own = gas::own(&prepared.package, &prepared.simulation);
             let fits = prepared.exports() as usize <= MAX_SEGMENTS
                 && prepared.segments.len() <= MAX_SEGMENTS
                 && prepared.payload.len() + prepared.segments.len() * SEGMENT <= MAX_INPUT;
-            match fitting.next(fits, own + start, shrinks(&inputs)) {
+            let beyond = prepared.gas - fitting.budget;
+            match fitting.next(fits, beyond, shrinks(&inputs)) {
                 Next::Take => {
                     return Ok(Prepared {
-                        gas: fitting.budget + start + own,
-                        own,
                         skipped,
                         simulations,
                         ..prepared
@@ -269,13 +280,16 @@ impl Builder {
             imports: simulation.imports.clone(),
             solicit: solicit.to_vec(),
         };
+        let payload = Work::encode_package(&package);
+        let start = defaults::refine_start(package.batch.inputs.len(), payload.len() + 64);
+        let own = gas::own(&package, &simulation);
         Ok(Prepared {
-            payload: Work::Package(package.clone()).encode(),
+            gas: package.batch.budget + start + own,
+            own,
+            payload,
             simulation,
             package,
             segments,
-            gas: 0,
-            own: 0,
             pending,
             skipped: Vec::new(),
             simulations: 0,

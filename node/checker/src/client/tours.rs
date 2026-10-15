@@ -6,26 +6,15 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
-use vos_node::client::post_within;
+use vos_node::client::{post_within, workflow_read_not_after};
 use vos_wire::Decode;
 use vos_wire::ids::WorkflowId;
-use vos_wire::ingress::{
-    Consistency, Rejection, Response, WORKFLOW_READ_HORIZON_MS, WorkflowStatus,
-    workflow_read_horizon,
-};
-use vos_wire::peer::NodeNumber;
+use vos_wire::ingress::{Consistency, Rejection, Response, WorkflowStatus};
 use vos_wire::result::Outcome;
 
 use super::Client;
 use crate::model::Nodes;
 use crate::rounds::{ROUNDS_A_TOUR, TourMethods, signed_read, tour};
-
-/// How long past the agents' time a read waiting `wait_ms` is signed to
-/// be good: half the horizon a node allows, so a node whose clock jumps
-/// either way takes it.
-fn signed_for(wait_ms: u64) -> u64 {
-    workflow_read_horizon(wait_ms) - WORKFLOW_READ_HORIZON_MS / 2
-}
 
 /// How long a tour may take to end once started, through every failure.
 pub const TOUR_ENDS: Duration = Duration::from_secs(120);
@@ -171,7 +160,7 @@ impl Client {
         let path = format!("/agents/{}/workflows", self.agent.0);
         let until = Instant::now() + TOUR_ENDS;
         let count = nodes.count();
-        let mut at = 1 + ((request + u64::from(self.number)) % u64::from(count)) as NodeNumber;
+        let mut at = super::node_at(request + u64::from(self.number), count);
         let mut turn = 0u64;
         let outcome = loop {
             assert!(
@@ -188,7 +177,7 @@ impl Client {
                 Consistency::Applied { at: floor }
             };
             let wait = READ_WAIT.as_millis() as u64;
-            let not_after = nodes.time() + signed_for(wait);
+            let not_after = workflow_read_not_after(nodes.time(), wait);
             let body = signed_read(&self.identity, &key, not_after, consistency, workflow, wait);
             match post_within(nodes.target(at), &path, &body, crate::ATTEMPT + READ_WAIT) {
                 Ok(Response::Workflow {
@@ -236,14 +225,12 @@ impl Client {
             let body = signed_read(
                 &self.identity,
                 &stranger,
-                nodes.time() + signed_for(0),
+                workflow_read_not_after(nodes.time(), 0),
                 consistency,
                 workflow,
                 0,
             );
-            if let Ok(Response::Workflow { status, .. }) =
-                post_within(nodes.target(at), &path, &body, crate::ATTEMPT)
-            {
+            if let Ok(Response::Workflow { status, .. }) = super::post(nodes, at, &path, &body) {
                 assert_eq!(
                     status,
                     WorkflowStatus::Unknown,

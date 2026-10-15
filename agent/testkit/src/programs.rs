@@ -66,10 +66,7 @@ pub fn derivation(elf: &[u8], derived: &Derived) -> Derivation {
     Derivation::new(
         elf,
         &derived.actor,
-        derived
-            .kernels
-            .iter()
-            .map(|(method, kernel)| (MethodId(*method), kernel.as_slice())),
+        &derived.kernels,
         derived.transpiler_version,
     )
 }

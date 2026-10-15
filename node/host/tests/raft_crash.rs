@@ -25,9 +25,8 @@ static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
-use vos_checker::crash::{Round, Rounds, tear};
+use vos_checker::crash::{Round, Rounds, journal, slot_key};
 use vos_node::NoHooks;
 use vos_node::storage::{Change, StorageThread};
 use vos_node::store::{Fjall, HardState, LogEntry};
@@ -38,25 +37,9 @@ use vos_wire::result::Write;
 const AGENT: AgentId = AgentId(1);
 const WRITES: u64 = 50;
 const SLOTS: u64 = 1_000;
-/// Twelve rounds, the last six tearing the journal before reopening.
-const ROUNDS: Rounds = Rounds {
-    writer: "VOS_RAFT_CRASH_WRITER",
-    rounds: 12,
-    torn_from: 6,
-    report: "appended ",
-    reports: 60,
-    kill_within: Duration::from_millis(3),
-};
+const ROUNDS: Rounds = Rounds::twelve("VOS_RAFT_CRASH_WRITER", "appended ", 60);
 /// At most this many bytes are torn: less than one entry's batches.
 const TEAR: u64 = 1024;
-
-fn slot_key(slot: u64) -> Vec<u8> {
-    [
-        keys::table_prefix(InstanceId(0), 1),
-        slot.to_be_bytes().to_vec(),
-    ]
-    .concat()
-}
 
 /// Entry `index` writes `index` into `WRITES` slots.
 fn writes(index: u64) -> Vec<Write> {
@@ -159,11 +142,7 @@ fn writer(dir: &Path) {
 }
 
 fn main() {
-    ROUNDS.run(
-        writer,
-        |round, dir, random| tear(dir, Some("jnl"), TEAR, round.is_multiple_of(2), random),
-        check,
-    );
+    ROUNDS.run(writer, journal(TEAR), check);
     println!(
         "raft_crash: {} rounds recovered a state Raft can trust",
         ROUNDS.rounds
@@ -171,13 +150,11 @@ fn main() {
 }
 
 fn check(round: Round) {
+    let reported = round.reported.unwrap_or(0);
+    let (floor, how) = (round.floor(reported, 1), round.how());
     let Round {
-        number: round,
-        dir,
-        reported,
-        torn,
+        number: round, dir, ..
     } = round;
-    let reported = reported.unwrap_or(0);
     let store = Fjall::open(dir).unwrap();
     let rows = store.raft(AGENT).unwrap();
     let applied = store.snapshot().applied(AGENT).unwrap().unwrap_or(0);
@@ -216,11 +193,6 @@ fn check(round: Round) {
         assert_eq!(entry.body, index.to_be_bytes().to_vec());
     }
     // Synced appends and terms survive, but for a tear's reach.
-    let floor = if torn {
-        reported.saturating_sub(1)
-    } else {
-        reported
-    };
     assert!(
         last >= floor,
         "round {round}: the log ends at {last}, but {reported} was reported synced"
@@ -232,7 +204,6 @@ fn check(round: Round) {
         "round {round}: term {} after {reported} was reported",
         rows.hard.term
     );
-    let how = if torn { "killed and torn" } else { "killed" };
     println!(
         "round {round}: {how} after {reported}; log {}..={last}, applied {applied}",
         rows.log_start.0 + 1

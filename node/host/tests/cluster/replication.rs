@@ -7,12 +7,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use vos_checker::calls::done;
+use vos_checker::hooks::carries;
 use vos_checker::programs::actor;
 use vos_node::store::EntryKind;
 use vos_node::{CallError, Hooks, Node, Reply};
 use vos_wire::Encode;
 use vos_wire::abi::Refusal;
-use vos_wire::batch::{Batch, Input};
+use vos_wire::batch::Batch;
 use vos_wire::ids::AgentId;
 use vos_wire::ingress::{Call, Contact, NodeId, Response};
 use vos_wire::peer::{NodeNumber, PeerMessage};
@@ -169,11 +170,8 @@ fn a_new_leader_serves_after_the_old_one_stops_and_the_old_one_catches_up() {
 #[test]
 fn a_partitioned_follower_catches_up_and_runs_the_program_it_missed() {
     let cluster = Cluster::new(3);
-    let agent = cluster.node(1).create_replicated(vec![1, 2, 3]).unwrap();
+    let agent = cluster.agent(&[1, 2, 3]);
     let (leader, follower) = cluster.leader_and_follower(agent);
-    wait_until("the follower runs the group", || {
-        cluster.node(follower).applied(agent).is_some()
-    });
     cluster.hub.isolate(follower);
     cluster.install(agent);
     assert_eq!(done(cluster.increment(leader, agent, 1, 3)), 3);
@@ -248,18 +246,14 @@ struct PoisonDryRun(Vec<u8>);
 
 impl Hooks for PoisonDryRun {
     fn fail_dry_run(&self, _: AgentId, batch: &Batch) -> bool {
-        batch.inputs.iter().any(|input| match input {
-            Input::Request(request) => request.arguments == self.0,
-            _ => false,
-        })
+        carries(batch, &self.0)
     }
 }
 
 #[test]
 fn an_input_whose_accumulate_fails_is_isolated_before_the_log() {
     let poisoned = 666u64.encode();
-    let poison = Arc::new(PoisonDryRun(poisoned.clone()));
-    let cluster = Cluster::tuned(3, move |_, config| config.hooks = poison.clone());
+    let cluster = Cluster::hooked(3, Arc::new(PoisonDryRun(poisoned.clone())));
     let agent = cluster.counter_agent(&[1, 2, 3]);
     let leader = cluster.leader(agent);
     let node = cluster.node(leader);
@@ -344,8 +338,7 @@ fn a_result_that_applies_as_no_writes_is_retried_not_answered() {
         mark: by.encode(),
         first: Default::default(),
     });
-    let shared = Arc::clone(&hooks);
-    let cluster = Cluster::tuned(3, move |_, config| config.hooks = shared.clone());
+    let cluster = Cluster::hooked(3, hooks.clone());
     let agent = cluster.counter_agent(&[1, 2, 3]);
     let leader = cluster.leader(agent);
     // The first entry carrying it applies as no writes everywhere; the
@@ -367,16 +360,9 @@ fn a_result_that_applies_as_no_writes_is_retried_not_answered() {
 
 #[test]
 fn a_follower_fetches_a_blob_from_another_member_when_the_leader_withholds_it() {
-    let hooks: Vec<Arc<WithholdBlobs>> = (0..3).map(|_| Arc::default()).collect();
-    let each = hooks.clone();
-    let cluster = Cluster::tuned(3, move |number, config| {
-        config.hooks = each[usize::from(number) - 1].clone();
-    });
-    let agent = cluster.node(1).create_replicated(vec![1, 2, 3]).unwrap();
+    let (cluster, hooks) = Cluster::with_hooks::<WithholdBlobs>(3);
+    let agent = cluster.agent(&[1, 2, 3]);
     let (leader, follower) = cluster.leader_and_follower(agent);
-    wait_until("the follower runs the group", || {
-        cluster.node(follower).applied(agent).is_some()
-    });
     cluster.hub.isolate(follower);
     cluster.install(agent);
     assert_eq!(done(cluster.increment(leader, agent, 1, 3)), 3);
@@ -424,9 +410,7 @@ fn replicas_that_never_took_the_install_pool_the_program_on_first_use() {
         .find(|number| *number != first && *number != second)
         .unwrap();
     assert!(!cluster.node(follower).pooled(&program));
-    wait_until("the follower applies the call", || {
-        cluster.node(follower).applied(agent) >= cluster.node(second).applied(agent)
-    });
+    cluster.caught_up(follower, agent, second);
     assert_eq!(cluster.value(follower, agent), 5);
     assert!(
         cluster.node(follower).pooled(&program),

@@ -6,15 +6,14 @@
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::SigningKey;
 use vos_checker::calls::{Total, install_at_leader, signed_query};
 use vos_checker::programs::{actor, method, package};
 use vos_checker::{ANSWERED, ATTEMPT, COUNTER, Nodes, wait_until};
-use vos_node::client::{Client, post_within};
+use vos_node::client::{Client, post_within, signed_call};
 use vos_wire::ids::{AgentId, MethodId, Session};
-use vos_wire::ingress::{Call, Consistency, Rejection, Response, call_message};
+use vos_wire::ingress::{Call, Consistency, Rejection, Response};
 use vos_wire::peer::NodeNumber;
-use vos_wire::records::unstored;
 use vos_wire::result::Outcome;
 use vos_wire::{Decode, Encode, keys};
 
@@ -41,7 +40,7 @@ fn counter_agent(cluster: &Cluster, replicas: Vec<NodeNumber>) -> (AgentId, Meth
 }
 
 /// A signed call: `by` added in `session`, at `sequence`.
-fn signed_call(
+fn signed_increment(
     identity: &[u8; 32],
     key: &SigningKey,
     session: Session,
@@ -50,15 +49,9 @@ fn signed_call(
     by: u64,
 ) -> Vec<u8> {
     let arguments = by.encode();
-    let message = call_message(identity, &session, sequence, COUNTER, increment, &arguments);
-    Call {
-        session,
-        sequence,
-        instance: COUNTER,
-        method: increment,
-        arguments,
-        signature: key.sign(&message).to_bytes(),
-    }
+    signed_call(
+        identity, key, session, sequence, COUNTER, increment, arguments,
+    )
     .encode()
 }
 
@@ -161,13 +154,7 @@ fn a_leader_whose_clock_trails_times_its_batches_at_the_agents() {
     let mut client = Client::new(cluster.target(leader), SigningKey::from_bytes(&[8; 32]));
     let batch_time = || {
         let node = cluster.node(leader).unwrap();
-        let bytes = node
-            .store()
-            .snapshot()
-            .get(agent, &keys::batch_time())
-            .unwrap()
-            .unwrap();
-        u64::decode(unstored(&bytes).unwrap()).unwrap().0
+        vos_checker::applied::<u64>(node.store(), agent, &keys::batch_time()).unwrap()
     };
     let offset = &cluster.slot(leader).offset;
     offset.store(30_000, Ordering::SeqCst);
@@ -207,7 +194,7 @@ fn a_resend_of_a_queued_first_call_joins_it_past_the_skew() {
         name: [11; 16],
         t0: vos_node::wall_clock() - (vos_wire::defaults::SESSION_SKEW_MS - 1_500),
     };
-    let body = signed_call(&identity, &key, session, 1, increment, 5);
+    let body = signed_increment(&identity, &key, session, 1, increment, 5);
     let path = format!("/agents/{}/calls", agent.0);
     let target = cluster.target(leader);
     let refines = &cluster.slot(leader).trip.refines;
@@ -287,7 +274,7 @@ fn a_follower_reads_a_write_once_it_has_applied_it() {
     for (sequence, consistency) in [(1, None), (2, Some(Consistency::Linearizable))] {
         std::thread::scope(|scope| {
             let closed = commits.close();
-            let call = signed_call(&identity, &key, session, sequence, increment, 4);
+            let call = signed_increment(&identity, &key, session, sequence, increment, 4);
             let calls = format!("/agents/{}/calls", agent.0);
             let answer = post_within(cluster.target(leader), &calls, &call, ANSWERED).unwrap();
             let Response::Ran { at, .. } = answer else {

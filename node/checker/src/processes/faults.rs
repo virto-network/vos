@@ -8,22 +8,33 @@ use super::{PROCESS_WAIT, Processes, Running, read_log};
 use crate::wait_until;
 
 impl Processes {
-    /// Pause node `number` (SIGSTOP), or let it go on (SIGCONT), once it
-    /// takes the faults written while it was paused.
-    pub fn pause(&self, number: usize, paused: bool) {
+    /// Pause node `number` (SIGSTOP).
+    pub fn stop(&self, number: usize) {
+        if self.signal(number, "-STOP") {
+            self.slot(number).paused.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Let node `number` go on (SIGCONT), once it takes the faults written
+    /// while it was paused.
+    pub fn resume(&self, number: usize) {
+        if self.signal(number, "-CONT") {
+            self.slot(number).paused.store(false, Ordering::SeqCst);
+            self.taken(number, self.slot(number).written.load(Ordering::SeqCst));
+        }
+    }
+
+    /// Send node `number` `signal`, as `kill` names it: whether it runs.
+    pub(super) fn signal(&self, number: usize, signal: &str) -> bool {
         let running = self.slot(number).running.lock().unwrap();
         let Some(pid) = running.as_ref().map(Running::pid) else {
-            return;
+            return false;
         };
         drop(running);
-        let signal = if paused { "-STOP" } else { "-CONT" };
         let _ = Command::new("kill")
             .args([signal, &pid.to_string()])
             .status();
-        self.slot(number).paused.store(paused, Ordering::SeqCst);
-        if !paused {
-            self.taken(number, self.slot(number).written.load(Ordering::SeqCst));
-        }
+        true
     }
 
     /// Node `number`'s own faults, as lines of its faults file: in force

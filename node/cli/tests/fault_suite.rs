@@ -34,15 +34,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use vos_checker::processes::relay::Link;
-use vos_checker::processes::{Options, PROCESS_WAIT, Processes, methods};
+use vos_checker::processes::{Options, PROCESS_WAIT, Processes};
 use vos_checker::programs::package;
-use vos_checker::{ANSWERED, COUNTER, Client, INBOX, Mode, Nodes, Random, SECOND, wait_until};
+use vos_checker::{
+    ANSWERED, COUNTER, Client, INBOX, Mode, Nodes, Random, SECOND, mark, wait_until,
+};
 use vos_node::store::Fjall;
 use vos_wire::ids::AgentId;
 use vos_wire::ingress::{Consistency, Response, Unplaced};
 use vos_wire::peer::NodeNumber;
-use vos_wire::records::unstored;
-use vos_wire::{Decode, defaults, keys};
+use vos_wire::{defaults, keys};
 
 const NODES: usize = 5;
 /// Agents the clients call, each on three nodes.
@@ -170,9 +171,9 @@ fn fault(run: &Run) {
         }
         2 => {
             run.saw("fault: a node paused");
-            space.pause(node, true);
+            space.stop(node);
             run.pause(1000, 5000);
-            space.pause(node, false);
+            space.resume(node);
         }
         3 => {
             run.saw("fault: a connection cut");
@@ -190,7 +191,7 @@ fn fault(run: &Run) {
         }
         5 => {
             run.saw("fault: a leader cut off");
-            space.relay.isolate(run.leader_of(agent), NODES);
+            space.relay.isolate(run.leader_of(agent));
             run.pause(2000, 10_000);
             space.relay.heal();
         }
@@ -540,16 +541,6 @@ fn stores_agree(stores: &[(usize, &Fjall)], agent: AgentId, settled: u64) {
     }
 }
 
-/// A counter's mark on disk: the messages a pair sent or applied.
-fn mark(store: &Fjall, agent: AgentId, key: &[u8]) -> u64 {
-    store
-        .snapshot()
-        .get(agent, key)
-        .unwrap()
-        .map(|bytes| u64::decode(unstored(&bytes).unwrap()).unwrap().0)
-        .unwrap_or(0)
-}
-
 #[test]
 fn five_processes_apply_once_through_faults() {
     let seed = std::env::var("FAULTS_SEED")
@@ -577,7 +568,7 @@ fn five_processes_apply_once_through_faults() {
         space,
         // Never zero, as the generator needs, and a different one for
         // each seed.
-        random: Mutex::new(Random(seed.wrapping_mul(2) | 1)),
+        random: Mutex::new(Random::new(seed.wrapping_mul(2))),
         placements: Mutex::new(BTreeMap::new()),
         failed_disks: Mutex::new(Vec::new()),
     };
@@ -611,33 +602,17 @@ fn five_processes_apply_once_through_faults() {
             });
         }
     });
-    let methods = methods(space, agents[0], COUNTER);
-    let identities: Vec<[u8; 32]> = agents.iter().map(|agent| space.identity(*agent)).collect();
+    let methods = space.methods(agents[0], COUNTER);
+    let agents: Vec<(AgentId, [u8; 32])> = agents
+        .iter()
+        .map(|agent| (*agent, space.identity(*agent)))
+        .collect();
     // At each agent, one client forwarding to the next agent's inbox and a
     // second incrementing a counter of its own.
-    let clients: Vec<Client> = (1..=2 * AGENTS as u8)
-        .map(|number| {
-            let at = usize::from(number - 1) % AGENTS;
-            let forwarding = usize::from(number) <= AGENTS;
-            let rotate = if forwarding {
-                32 + 4 * run.below(8)
-            } else {
-                4 + 4 * run.below(2)
-            };
-            Client::new(
-                number,
-                agents[at],
-                identities[at],
-                methods,
-                forwarding,
-                rotate,
-            )
-        })
-        .collect();
+    let clients = vos_checker::clients(&agents, 2 * AGENTS as u8, methods, None, |bound| {
+        run.below(bound)
+    });
     let forwarding = &clients[..AGENTS];
-    for (at, client) in forwarding.iter().enumerate() {
-        client.forward_to(forwarding[(at + 1) % AGENTS].agent);
-    }
     let done = AtomicBool::new(false);
     let sent: Vec<u64> = std::thread::scope(|scope| {
         let running: Vec<_> = clients

@@ -27,6 +27,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use vos_checker::calls::install_at_leader;
 use vos_checker::percentiles;
 use vos_checker::programs::{Programs, method};
 use vos_checker::spaces::{open_node, space};
@@ -137,11 +138,12 @@ fn node(nodes: &Nodes, number: NodeNumber) -> &Arc<Node> {
 }
 
 fn create(nodes: &Nodes) -> AgentId {
+    let until = Instant::now() + Duration::from_secs(60);
     loop {
         match nodes[0].1.create_replicated(vec![1, 2, 3]) {
-            Ok(agent) => return agent,
-            Err(CallError::Unconfirmed(agent)) => return agent,
+            Ok(agent) | Err(CallError::Unconfirmed(agent)) => return agent,
             Err(error) => {
+                assert!(Instant::now() < until, "no agent created: {error:?}");
                 eprintln!("creation: {error:?}");
                 std::thread::sleep(Duration::from_millis(50));
             }
@@ -285,13 +287,8 @@ fn main() {
     let started = Instant::now();
     let active: Vec<AgentId> = (0..agents).map(|_| create(&nodes)).collect();
     for &agent in &active {
-        let at = leader(&nodes, agent);
-        let installed =
-            smol::block_on(node(&nodes, at).install(agent, COUNTER, &counter_elf, vec![]));
-        assert!(
-            matches!(installed, Ok(Reply::Ran(Outcome::Done(_)))),
-            "{installed:?}"
-        );
+        let leading = || Arc::clone(node(&nodes, leader(&nodes, agent)));
+        install_at_leader(leading, agent, COUNTER, &counter_elf);
     }
     let mut leading = [0; NODES as usize];
     for &agent in &active {

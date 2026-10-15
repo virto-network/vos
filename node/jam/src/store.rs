@@ -14,9 +14,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, Readable, Snapshot};
-use vos_tree::{
-    Blake2b, Child, Hash, Leaf, Node, NodeStore, salt, stored_root, update, value_hash,
-};
+use vos_tree::{Blake2b, Child, Hash, Leaf, Node, NodeStore, stored_root, update};
 use vos_wire::apply::{Host, State, apply};
 use vos_wire::ids::WorkflowId;
 use vos_wire::result::WorkResult;
@@ -112,25 +110,24 @@ impl Store {
             return Err(Error::Root);
         }
         let mut batch = self.db.batch();
+        let mut write = |keyspace: &Keyspace, key: Vec<u8>, value: Option<Vec<u8>>| match value {
+            Some(value) => batch.insert(keyspace, key, value),
+            None => batch.remove(keyspace, key),
+        };
         for (key, value) in pending.rows {
-            match value {
-                Some(value) => batch.insert(&self.rows, key, value),
-                None => batch.remove(&self.rows, key),
-            }
+            write(&self.rows, key, value);
         }
         for (key, value) in pending.tree {
-            match value {
-                Some(value) => batch.insert(&self.tree, key, value),
-                None => batch.remove(&self.tree, key),
-            }
+            write(&self.tree, key, value);
         }
-        batch.insert(&self.tree, [TreeRow::Top as u8], pending.top.encode());
+        write(
+            &self.tree,
+            vec![TreeRow::Top as u8],
+            Some(pending.top.encode()),
+        );
         for ((workflow, index), exported) in pending.pages {
-            let key = page_key(workflow, index);
-            match exported {
-                Some(exported) => batch.insert(&self.pages, key, exported.encode()),
-                None => batch.remove(&self.pages, key),
-            }
+            let exported = exported.map(|exported| exported.encode());
+            write(&self.pages, page_key(workflow, index), exported);
         }
         batch
             .durability(Some(fjall::PersistMode::SyncAll))
@@ -194,10 +191,9 @@ impl View {
         let Some(bytes) = self.snapshot.get(&self.pages, page_key(workflow, index))? else {
             return Ok(None);
         };
-        match Exported::decode(&bytes) {
-            Ok((exported, used)) if used == bytes.len() => Ok(Some(exported)),
-            _ => Err(Error::Corrupt("a page's place")),
-        }
+        Exported::decode_exact(&bytes)
+            .map(Some)
+            .ok_or(Error::Corrupt("a page's place"))
     }
 
     /// The rows applying `result` writes, each row it reads put in
@@ -226,13 +222,9 @@ impl View {
         let leaves: Vec<(&[u8], Option<Leaf>)> = writes
             .iter()
             .map(|(key, value)| {
-                let leaf = value.as_ref().map(|value| {
-                    let salt = salt(&Blake2b, seed, key);
-                    Leaf {
-                        salt,
-                        value_hash: value_hash(&Blake2b, &salt, value),
-                    }
-                });
+                let leaf = value
+                    .as_ref()
+                    .map(|value| Leaf::salted(&Blake2b, seed, key, value));
                 (key.as_slice(), leaf)
             })
             .collect();
@@ -292,10 +284,7 @@ impl Staged<'_> {
                 .map(|value| value.to_vec()),
         };
         bytes
-            .map(|bytes| match T::decode(&bytes) {
-                Ok((value, used)) if used == bytes.len() => Ok(value),
-                _ => Err(Error::Corrupt(what)),
-            })
+            .map(|bytes| T::decode_exact(&bytes).ok_or(Error::Corrupt(what)))
             .transpose()
     }
 }

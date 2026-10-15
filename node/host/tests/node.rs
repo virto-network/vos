@@ -11,16 +11,15 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
-use vos_checker::calls::done;
-use vos_checker::hooks::Gate;
+use vos_checker::calls::{done, installed};
+use vos_checker::hooks::{Gate, carries};
 use vos_checker::programs::Programs;
-use vos_checker::spaces::IN_PROCESS_WAIT;
+use vos_checker::spaces::wait_in_process as wait_until;
 use vos_node::store::EntryKind;
 use vos_node::{CallError, Config, Hooks, Node, Reply};
 use vos_wire::abi::Refusal;
-use vos_wire::batch::{Batch, Body, Input, Message, Request};
+use vos_wire::batch::{Batch, Body, Message, Request};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session};
-use vos_wire::records::unstored;
 use vos_wire::result::Outcome;
 use vos_wire::{Decode, Encode, defaults, keys};
 
@@ -67,14 +66,20 @@ fn config(programs: &Programs, hooks: Arc<dyn Hooks>) -> Config {
     config
 }
 
+/// A node at `dir`, with no hooks.
+fn open(dir: &std::path::Path, programs: &Programs) -> Node {
+    Node::open(dir, config(programs, Arc::new(vos_node::NoHooks))).unwrap()
+}
+
 /// An agent with the counter installed at [`COUNTER`].
 fn counter_agent(node: &Node, programs: &Programs) -> AgentId {
     let agent = node.create_agent().unwrap();
-    let installed = smol::block_on(node.install(agent, COUNTER, &programs.counter_elf, vec![]));
-    assert!(
-        matches!(installed, Ok(Reply::Ran(Outcome::Done(_)))),
-        "{installed:?}"
-    );
+    installed(smol::block_on(node.install(
+        agent,
+        COUNTER,
+        &programs.counter_elf,
+        vec![],
+    )));
     agent
 }
 
@@ -104,22 +109,13 @@ fn results(node: &Node, agent: AgentId) -> usize {
         .count()
 }
 
-/// A value of `agent`'s applied state.
-fn get<T: Decode>(node: &Node, agent: AgentId, key: &[u8]) -> Option<T> {
-    let bytes = node.store().snapshot().get(agent, key).unwrap()?;
-    Some(T::decode(unstored(&bytes)?).unwrap().0)
-}
-
-#[track_caller]
-fn wait_until(what: &str, done: impl FnMut() -> bool) {
-    vos_checker::wait_until(what, IN_PROCESS_WAIT, done);
-}
-
 /// `agent` has no unacknowledged message to `to`, and acknowledged `sent`.
 fn outbox_cleared(node: &Node, agent: AgentId, to: AgentId, sent: u64) -> bool {
-    get::<u64>(node, agent, &keys::acked(to)) == Some(sent)
-        && (1..=sent)
-            .all(|sequence| get::<Vec<u8>>(node, agent, &keys::outbox(to, sequence)).is_none())
+    vos_checker::applied::<u64>(node.store(), agent, &keys::acked(to)) == Some(sent)
+        && (1..=sent).all(|sequence| {
+            vos_checker::applied::<Vec<u8>>(node.store(), agent, &keys::outbox(to, sequence))
+                .is_none()
+        })
 }
 
 #[test]
@@ -129,7 +125,7 @@ fn calls_apply_and_survive_a_restart() {
     let increment = programs.method("increment");
     let mut session = Requests::new();
     let agent = {
-        let node = Node::open(dir.path(), config(&programs, Arc::new(vos_node::NoHooks))).unwrap();
+        let node = open(dir.path(), &programs);
         let agent = counter_agent(&node, &programs);
         assert_eq!(
             done(smol::block_on(
@@ -146,7 +142,7 @@ fn calls_apply_and_survive_a_restart() {
         node.shutdown();
         agent
     };
-    let node = Node::open(dir.path(), config(&programs, Arc::new(vos_node::NoHooks))).unwrap();
+    let node = open(dir.path(), &programs);
     assert_eq!(
         done(smol::block_on(
             node.call(agent, session.request(increment, 1u64))
@@ -211,10 +207,7 @@ struct Poison(Vec<u8>);
 
 impl Hooks for Poison {
     fn fail_refine(&self, _: AgentId, batch: &Batch) -> bool {
-        batch.inputs.iter().any(|input| match input {
-            Input::Request(request) => request.arguments == self.0,
-            _ => false,
-        })
+        carries(batch, &self.0)
     }
 }
 
@@ -277,7 +270,7 @@ fn the_leader_answers_a_duplicate_from_the_reply_window() {
     let programs = Programs::load();
     let increment = programs.method("increment");
     let dir = tempfile::tempdir().unwrap();
-    let node = Node::open(dir.path(), config(&programs, Arc::new(vos_node::NoHooks))).unwrap();
+    let node = open(dir.path(), &programs);
     let agent = counter_agent(&node, &programs);
     let call = |request: &Request| smol::block_on(node.call(agent, request.clone()));
     let mut session = Requests::new();
@@ -352,7 +345,7 @@ fn a_failed_commit_stops_the_node_and_a_restart_recovers() {
         node.shutdown();
         agent
     };
-    let node = Node::open(dir.path(), config(&programs, Arc::new(vos_node::NoHooks))).unwrap();
+    let node = open(dir.path(), &programs);
     assert_eq!(value(&node, &programs, agent), 0);
     assert_eq!(results(&node, agent), 1, "only the install applied");
     let mut session = Requests::new();
@@ -368,7 +361,7 @@ fn a_failed_commit_stops_the_node_and_a_restart_recovers() {
 fn agents_exchange_messages_and_acks_clear_outboxes() {
     let programs = Programs::load();
     let dir = tempfile::tempdir().unwrap();
-    let node = Node::open(dir.path(), config(&programs, Arc::new(vos_node::NoHooks))).unwrap();
+    let node = open(dir.path(), &programs);
     let sender = counter_agent(&node, &programs);
     let target = counter_agent(&node, &programs);
     let forward = programs.method("forward");
@@ -383,7 +376,10 @@ fn agents_exchange_messages_and_acks_clear_outboxes() {
     wait_until("acks clear the outbox", || {
         outbox_cleared(&node, sender, target, 2)
     });
-    assert_eq!(get::<u64>(&node, target, &keys::pair_in(sender)), Some(2));
+    assert_eq!(
+        vos_checker::applied::<u64>(node.store(), target, &keys::pair_in(sender)),
+        Some(2)
+    );
 }
 
 /// Stops `agent`'s leader after its commit of log index `index`, before it
@@ -446,7 +442,7 @@ fn a_stop_before_delivery_delivers_on_restart() {
         assert_eq!(value(&node, &programs, TARGET), 0, "nothing was delivered");
         node.shutdown();
     }
-    let node = Node::open(dir.path(), config(&programs, Arc::new(vos_node::NoHooks))).unwrap();
+    let node = open(dir.path(), &programs);
     wait_until("recovery delivers", || value(&node, &programs, TARGET) == 5);
     wait_until("and the ack clears the outbox", || {
         outbox_cleared(&node, SENDER, TARGET, 1)
@@ -477,7 +473,7 @@ fn a_stop_before_the_ack_redelivers_and_applies_once() {
         assert!(!outbox_cleared(&node, SENDER, TARGET, 1), "no ack yet");
         node.shutdown();
     }
-    let node = Node::open(dir.path(), config(&programs, Arc::new(vos_node::NoHooks))).unwrap();
+    let node = open(dir.path(), &programs);
     wait_until("the duplicate is acknowledged", || {
         outbox_cleared(&node, SENDER, TARGET, 1)
     });
@@ -514,7 +510,7 @@ fn redelivery_while_the_sender_sends_more_applies_each_once() {
         wait_until("the target stops", || stop.fired.load(Ordering::SeqCst));
         node.shutdown();
     }
-    let node = Node::open(dir.path(), config(&programs, Arc::new(vos_node::NoHooks))).unwrap();
+    let node = open(dir.path(), &programs);
     let call = node.call(
         SENDER,
         session.request(forward, (TARGET.0, COUNTER.0, 10u64)),
@@ -526,7 +522,10 @@ fn redelivery_while_the_sender_sends_more_applies_each_once() {
     wait_until("and is acknowledged", || {
         outbox_cleared(&node, SENDER, TARGET, 4)
     });
-    assert_eq!(get::<u64>(&node, TARGET, &keys::pair_in(SENDER)), Some(4));
+    assert_eq!(
+        vos_checker::applied::<u64>(node.store(), TARGET, &keys::pair_in(SENDER)),
+        Some(4)
+    );
 }
 
 /// A message past the next of its pair is a gap: dropped before any batch,
@@ -536,7 +535,7 @@ fn redelivery_while_the_sender_sends_more_applies_each_once() {
 fn a_gap_is_dropped_unacknowledged_until_it_fills() {
     let programs = Programs::load();
     let dir = tempfile::tempdir().unwrap();
-    let node = Node::open(dir.path(), config(&programs, Arc::new(vos_node::NoHooks))).unwrap();
+    let node = open(dir.path(), &programs);
     let target = counter_agent(&node, &programs);
     // A sender with no batches of its own: an ack would be its first.
     let sender = node.create_agent().unwrap();
@@ -566,7 +565,7 @@ fn a_gap_is_dropped_unacknowledged_until_it_fills() {
         value(&node, &programs, target) == 21
     });
     wait_until("and are acknowledged", || {
-        get::<u64>(&node, sender, &keys::acked(target)).is_some()
+        vos_checker::applied::<u64>(node.store(), sender, &keys::acked(target)).is_some()
             || applied(&node, sender) > leading
     });
 }

@@ -13,31 +13,31 @@
 //!   and after. Forgetting the programs nothing names any more is left for
 //!   a later slice.
 
-use vos_wire::ids::MethodId;
 use vos_wire::records::Derivation;
+use vos_wire::schema::Schema;
 
 use crate::Error;
 
 /// What an install takes of a package: its programs, to provide as
-/// preimages, and the derivation that names them.
+/// preimages, the derivation that names them, and the actor's schema.
 #[derive(Clone, Debug)]
 pub struct Installable {
     pub derivation: Derivation,
     /// The actor's program, then each kernel, by method.
     pub programs: Vec<Vec<u8>>,
+    pub schema: Schema,
 }
 
 /// Derive package `elf`'s programs, as a VOS node derives them.
 pub fn derive(elf: &[u8]) -> Result<Installable, Error> {
     let derived =
         vos_pvm_compiler::derive(elf).map_err(|error| Error::Package(error.to_string()))?;
+    let schema = Schema::read(&derived.schema)
+        .map_err(|error| Error::Package(format!("its schema: {error:?}")))?;
     let derivation = Derivation::new(
         elf,
         &derived.actor,
-        derived
-            .kernels
-            .iter()
-            .map(|(method, kernel)| (MethodId(*method), kernel.as_slice())),
+        &derived.kernels,
         derived.transpiler_version,
     );
     let programs = core::iter::once(derived.actor)
@@ -46,5 +46,6 @@ pub fn derive(elf: &[u8]) -> Result<Installable, Error> {
     Ok(Installable {
         derivation,
         programs,
+        schema,
     })
 }

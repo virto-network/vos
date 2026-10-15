@@ -194,14 +194,13 @@ pub fn own(package: &Package, simulation: &Simulation) -> u64 {
         .iter()
         .filter(|entry| matches!(entry, Entry::Branch(_)))
         .count() as u64;
-    let mut writes = 0;
     for (key, value) in &simulation.writes {
         hashes += rewrite(key.len());
         if let Some(value) = value {
             hashes += commitment(value.len());
         }
-        writes += 1;
     }
+    let writes = simulation.writes.len() as u64;
     hashes += branches;
     let exported = (simulation.pages * SEGMENT) as u64 + EXPORT * simulation.pages as u64;
     FIXED

@@ -13,7 +13,7 @@ use vos_wire::batch::Admin;
 use vos_wire::ids::{AgentId, InstanceId, Principal};
 use vos_wire::ingress::{
     AgentInfo, Create, Install, QueryCall, Rejection, Replace, Response, WorkflowRead,
-    query_message, workflow_message, workflow_read_horizon,
+    workflow_read_horizon,
 };
 use vos_wire::records::{Installed, unstored};
 use vos_wire::{Decode, Encode, keys};
@@ -288,15 +288,7 @@ impl Ingress {
             Ok(run) => run,
             Err(error) => return error.into(),
         };
-        let message = query_message(
-            &run.shared.identity,
-            &query.key,
-            query.not_after,
-            query.consistency,
-            query.instance,
-            query.method,
-            &query.arguments,
-        );
+        let message = query.message(&run.shared.identity);
         if let Err(answer) = self
             .signed(
                 query.key,
@@ -328,14 +320,7 @@ impl Ingress {
             Ok(run) => run,
             Err(error) => return error.into(),
         };
-        let message = workflow_message(
-            &run.shared.identity,
-            &read.key,
-            read.not_after,
-            read.consistency,
-            read.workflow,
-            read.wait_ms,
-        );
+        let message = read.message(&run.shared.identity);
         let horizon = workflow_read_horizon(read.wait_ms);
         if let Err(answer) = self
             .signed(read.key, message, read.signature, read.not_after, horizon)

@@ -24,7 +24,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use vos_checker::crash::{Round, Rounds, tear};
+use vos_checker::crash::{Round, Rounds, journal, slot_key};
 use vos_node::NoHooks;
 use vos_node::storage::{Change, StorageThread};
 use vos_node::store::{Fjall, HardState, Membership, Switch, next_epoch};
@@ -40,23 +40,11 @@ const APPLIES: u64 = 3;
 const CHUNK: usize = 100;
 /// Twelve rounds, the last six tearing the journal before reopening.
 const ROUNDS: Rounds = Rounds {
-    writer: "VOS_SNAPSHOT_CRASH_WRITER",
-    rounds: 12,
-    torn_from: 6,
-    report: "installed ",
-    reports: 6,
     kill_within: Duration::from_millis(20),
+    ..Rounds::twelve("VOS_SNAPSHOT_CRASH_WRITER", "installed ", 6)
 };
 /// At most this many bytes of the journal are torn: about one batch.
 const TEAR: u64 = 64;
-
-fn key(slot: u64) -> Vec<u8> {
-    [
-        keys::table_prefix(InstanceId(0), 1),
-        slot.to_be_bytes().to_vec(),
-    ]
-    .concat()
-}
 
 /// The keys snapshot `at` holds: a window that moves with `at`, so a row
 /// an install leaked (left staged, or not dropped) would show.
@@ -68,7 +56,7 @@ fn slots(at: u64) -> std::ops::Range<u64> {
 /// Snapshot `at`'s rows: every key of its window holds `at`.
 fn snapshot(at: u64) -> Vec<(Vec<u8>, Vec<u8>)> {
     slots(at)
-        .map(|slot| (key(slot), at.to_be_bytes().to_vec()))
+        .map(|slot| (slot_key(slot), at.to_be_bytes().to_vec()))
         .collect()
 }
 
@@ -77,7 +65,7 @@ fn snapshot(at: u64) -> Vec<(Vec<u8>, Vec<u8>)> {
 fn apply_writes(index: u64) -> Vec<Write> {
     let window = slots(index - index % EVERY);
     vec![Write {
-        key: key(window.start + index % KEYS),
+        key: slot_key(window.start + index % KEYS),
         value: Some(index.to_be_bytes().to_vec()),
     }]
 }
@@ -168,11 +156,7 @@ fn writer(dir: &Path) {
 }
 
 fn main() {
-    ROUNDS.run(
-        writer,
-        |round, dir, random| tear(dir, Some("jnl"), TEAR, round.is_multiple_of(2), random),
-        check,
-    );
+    ROUNDS.run(writer, journal(TEAR), check);
     println!(
         "snapshot_crash: {} rounds held one snapshot each",
         ROUNDS.rounds
@@ -180,13 +164,11 @@ fn main() {
 }
 
 fn check(round: Round) {
+    let reported = round.reported.unwrap_or(0);
+    let (floor, how) = (round.floor(reported, EVERY), round.how());
     let Round {
-        number: round,
-        dir,
-        reported,
-        torn,
+        number: round, dir, ..
     } = round;
-    let reported = reported.unwrap_or(0);
     let store = Fjall::open(dir).unwrap();
     let view = store.snapshot();
     let applied = view.applied(AGENT).unwrap().unwrap_or(0);
@@ -199,16 +181,10 @@ fn check(round: Round) {
         "round {round}: the rows are not snapshot {} with applies through {applied}",
         applied - applied % EVERY
     );
-    let floor = if torn {
-        reported.saturating_sub(EVERY)
-    } else {
-        reported
-    };
     assert!(
         applied >= floor,
         "round {round}: applied {applied}, but {reported} was reported installed"
     );
-    let how = if torn { "killed and torn" } else { "killed" };
     println!(
         "round {round}: {how} after {reported}; at {applied} in epoch {}, stale {:?}",
         view.epoch(AGENT).unwrap(),

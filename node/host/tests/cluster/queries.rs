@@ -1,7 +1,6 @@
 //! Clients' queries at a follower: a method its schema marks linearizable
 //! reads after a read index, whatever consistency its client asks.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
@@ -13,7 +12,7 @@ use vos_wire::ingress::{Consistency, Response};
 use crate::common::{COUNTER, Cluster};
 
 /// How long a query may take to be answered.
-const ANSWERED: Duration = Duration::from_secs(30);
+const QUERY_ANSWERED: Duration = Duration::from_secs(30);
 
 /// A follower whose commits are held answers a query of `value` from the
 /// state it applied, before the write its leader answered; a query of
@@ -21,13 +20,7 @@ const ANSWERED: Duration = Duration::from_secs(30);
 /// its client asked for no floor.
 #[test]
 fn a_linearizable_method_reads_a_write_its_follower_has_not_applied() {
-    let gates: Vec<Arc<Gate>> = (0..3).map(|_| Arc::default()).collect();
-    let cluster = {
-        let gates = gates.clone();
-        Cluster::tuned(3, move |number, config| {
-            config.hooks = gates[usize::from(number) - 1].clone();
-        })
-    };
+    let (cluster, gates) = Cluster::with_hooks::<Gate>(3);
     let agent = cluster.counter_agent(&[1, 2, 3]);
     cluster.converged(agent);
     let (leader, follower) = cluster.leader_and_follower(agent);
@@ -49,13 +42,13 @@ fn a_linearizable_method_reads_a_write_its_follower_has_not_applied() {
 
     let closed = gates[usize::from(follower) - 1].close();
     assert_eq!(done(cluster.increment(leader, agent, 1, 5)), 5);
-    let stale = post_within(&target, &path, &query("value"), ANSWERED).unwrap();
+    let stale = post_within(&target, &path, &query("value"), QUERY_ANSWERED).unwrap();
     assert_eq!(stale.total(), Some(0), "{stale:?}");
     std::thread::scope(|scope| {
         let (answered, read) = std::sync::mpsc::channel();
         let (target, path, latest) = (&target, &path, query("latest"));
         scope.spawn(move || {
-            let _ = answered.send(post_within(target, path, &latest, ANSWERED));
+            let _ = answered.send(post_within(target, path, &latest, QUERY_ANSWERED));
         });
         std::thread::sleep(Duration::from_millis(300));
         let early: Option<Response> = read.try_recv().ok().map(Result::unwrap);

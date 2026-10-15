@@ -17,26 +17,23 @@ mod record;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-use ed25519_dalek::SigningKey;
-use vos_jam::builder::MAX_INPUT;
-use vos_jam::chain::{MAX_REFINE_OUTPUT, slot_of};
-use vos_jam::live::{Live, Node, Parameters};
+use vos_jam::live::{Live, Node};
+use vos_jam::programs::Installable;
 use vos_jam::{Builder, Chain, Emulated, Error, Runner, Store, Taken};
 use vos_pvm::refine::PreparedProgram;
-use vos_pvm_compiler::service_blob;
 use vos_wire::batch::{Admin, Input};
-use vos_wire::ids::{InstanceId, MethodId, Principal, ProgramHash, Session};
-use vos_wire::package::{MAX_SEGMENTS, SLOT_MS};
+use vos_wire::ids::{InstanceId, MethodId, ProgramHash};
+use vos_wire::package::slot_of;
 use vos_wire::records::{Workflow, WorkflowState, unstored};
 use vos_wire::result::{Outcome, Step, WorkResult, digest};
-use vos_wire::schema::Schema;
 use vos_wire::{Decode, Encode, keys};
 
-use super::METADATA;
 use super::reference::Vos;
+use super::{METADATA, write_service};
 use crate::{at, link};
+use alice::Alice;
 
 #[derive(clap::Args)]
 pub struct TestnetArgs {
@@ -67,10 +64,13 @@ const PREIMAGE_TIMEOUT: Duration = Duration::from_secs(180);
 /// The sweeps the computation may take to end.
 const SWEEPS: u32 = 12;
 
+/// Why a run failed, said at the end.
+type Failed = Box<dyn std::error::Error>;
+
 /// Run the agent on the testnet and write the run's record.
 pub fn run(args: TestnetArgs) -> Result<(), String> {
     let mut testnet = Testnet::new(args)?;
-    let outcome = testnet.run();
+    let outcome = testnet.run().map_err(|error| error.to_string());
     if let Err(error) = &outcome {
         testnet.note(format!("the run fails: {error}"));
     }
@@ -83,8 +83,8 @@ pub fn run(args: TestnetArgs) -> Result<(), String> {
 /// The test actors the agent runs, each derived once from its ELF, as a VOS
 /// node derives it: the counter and the shop, its workflows in its program.
 struct Actors {
-    counter: vos_jam::programs::Installable,
-    shop: vos_jam::programs::Installable,
+    counter: Installable,
+    shop: Installable,
 }
 
 impl Actors {
@@ -108,6 +108,19 @@ impl Actors {
             .map(|program| (digest(program), program.clone()))
             .collect()
     }
+
+    /// The counter's install, and the shop's, each naming the programs
+    /// derived from its ELF.
+    fn installs(&self) -> Vec<Input> {
+        let install = |instance, package: &Installable| {
+            Input::Admin(Admin::Install {
+                instance,
+                derivation: package.derivation.clone(),
+                roles: vec![],
+            })
+        };
+        vec![install(COUNTER, &self.counter), install(SHOP, &self.shop)]
+    }
 }
 
 /// What each step drives: the builder, its chain, the agent as both run
@@ -119,16 +132,14 @@ struct Rig {
     vos: Vos,
 }
 
-/// A run on the testnet: its node, the agent and the actors,
-/// Alice's client, the attempts each package took, and the record.
+/// A run on the testnet: its node, the agent and the actors, Alice, the
+/// attempts each package took, and the record.
 struct Testnet {
     args: TestnetArgs,
     node: Node,
     agent: Vec<u8>,
     actors: Actors,
-    alice: SigningKey,
-    session: Option<Session>,
-    sequence: u64,
+    alice: Alice,
     attempts: Vec<(String, usize)>,
     record: String,
 }
@@ -147,52 +158,50 @@ impl Testnet {
             jamt: args.polkajam.join("jamt"),
             files: args.data.join("files"),
         };
-        let mut seed = [0u8; 32];
-        getrandom::getrandom(&mut seed).map_err(said)?;
         Ok(Self {
             agent: link(&args.agent)?,
             actors: Actors::derive(&args.actors)?,
             args,
             node,
-            alice: SigningKey::from_bytes(&seed),
-            session: None,
-            sequence: 0,
+            alice: Alice::new()?,
             attempts: Vec::new(),
             record: String::new(),
         })
     }
 
-    fn run(&mut self) -> Result<(), String> {
+    fn run(&mut self) -> Result<(), Failed> {
         std::fs::create_dir_all(&self.args.data).map_err(at(&self.args.data))?;
-        let parameters = self.node.parameters().map_err(said)?;
+        let parameters = self.node.parameters()?;
         self.note(format!("testnet: {parameters:?}"));
-        check(&parameters)?;
-        let blob = service_blob(&self.agent, &METADATA);
+        let differ = parameters.disagreements();
+        if !differ.is_empty() {
+            let differ = differ.join(", ");
+            return Err(format!("the testnet's {differ} differ from the agent's").into());
+        }
         let code = self.args.data.join("agent.jam");
-        std::fs::write(&code, &blob).map_err(at(&code))?;
-        let service = self.node.create_service(&code, ENDOWMENT).map_err(said)?;
+        let blob = write_service(&self.agent, &METADATA, &code)?;
+        let service = self.node.create_service(&code, ENDOWMENT)?;
         self.note(format!(
             "service {service}: the agent, {} bytes, code hash {}",
             blob.len(),
             hex::encode(digest(&blob))
         ));
-        let since = self
-            .node
-            .await_preimage(service, &digest(&blob), blob.len() as u64, PREIMAGE_TIMEOUT)
-            .map_err(said)?;
+        let since = self.node.await_preimage(
+            service,
+            &digest(&blob),
+            blob.len() as u64,
+            PREIMAGE_TIMEOUT,
+        )?;
         self.note(format!("its code available since slot {since}"));
 
         let store = self.args.data.join("store");
         let _ = std::fs::remove_dir_all(&store);
         let prepared =
             Arc::new(PreparedProgram::new(&self.agent).map_err(|error| format!("{error:?}"))?);
-        let runner = Runner::new(prepared, service, self.actors.programs().into_values());
+        let programs = self.actors.programs();
+        let runner = Runner::new(prepared, service, programs.values().cloned());
         let mut rig = Rig {
-            builder: Builder::new(
-                Store::open(&store).map_err(said)?,
-                parameters.max_refine_gas,
-            )
-            .map_err(said)?,
+            builder: Builder::new(Store::open(&store)?, parameters.max_refine_gas)?,
             chain: Live {
                 node: self.node.clone(),
                 service,
@@ -204,7 +213,6 @@ impl Testnet {
         // The programs the agent runs, solicited, then provided.
         let mut solicit = Vec::new();
         let mut files = Vec::new();
-        let programs = self.actors.programs();
         let mut programs: Vec<&Vec<u8>> = programs.values().collect();
         programs.sort();
         for program in programs {
@@ -219,47 +227,51 @@ impl Testnet {
         }
         self.step(&mut rig, "solicit the programs", vec![], &solicit)?;
         for file in &files {
-            self.node.provide(service, file).map_err(said)?;
+            self.node.provide(service, file)?;
         }
         for (hash, len) in &solicit {
-            let since = self
-                .node
-                .await_preimage(service, &hash.0, u64::from(*len), PREIMAGE_TIMEOUT)
-                .map_err(said)?;
+            let since =
+                self.node
+                    .await_preimage(service, &hash.0, u64::from(*len), PREIMAGE_TIMEOUT)?;
             self.note(format!(
                 "program {} available since slot {since}",
                 hex::encode(hash.0)
             ));
         }
 
-        let installs = self.installs()?;
+        let installs = self.actors.installs();
         self.step(&mut rig, "install the counter and the shop", installs, &[])?;
-        let increment = method(&self.actors.counter.programs[0], "increment")?;
-        let fill = method(&self.actors.counter.programs[0], "fill")?;
+        let increment = method(&self.actors.counter, "increment")?;
+        let fill = method(&self.actors.counter, "fill")?;
         let calls = vec![
-            self.call(service, COUNTER, increment, 5u64.encode())?,
-            self.call(service, COUNTER, fill, (12u32, 8u32).encode())?,
+            self.alice
+                .call(service, COUNTER, increment, 5u64.encode())?,
+            self.alice
+                .call(service, COUNTER, fill, (12u32, 8u32).encode())?,
         ];
         let ran = self.step(&mut rig, "write state", calls, &[])?;
         expect_done(&ran.result)?;
-        let start = method(&self.actors.shop.programs[0], "compute")?;
-        let call = self.call(service, SHOP, start, (16_000u32, 2u32).encode())?;
+        let start = method(&self.actors.shop, "compute")?;
+        let call = self
+            .alice
+            .call(service, SHOP, start, (16_000u32, 2u32).encode())?;
         let ran = self.step(&mut rig, "start the computation", vec![call], &[])?;
         // The start's step, then, as the budget allows, the workflow's first.
         let workflow = match ran.result.steps.first() {
             Some(Step::Ran(run)) => match run.outcome {
                 Outcome::Started(id) => id,
-                ref other => return Err(format!("the computation did not start: {other:?}")),
+                ref other => {
+                    return Err(format!("the computation did not start: {other:?}").into());
+                }
             },
             _ => return Err("the start did not run".into()),
         };
-        let owner = Principal::Client(self.alice.verifying_key().to_bytes());
+        let owner = self.alice.principal();
         let (mut exported, mut imported) = (ran.exports, ran.imports);
         for round in 1.. {
             let record = rig
                 .builder
-                .workflow(&owner, workflow)
-                .map_err(said)?
+                .workflow(&owner, workflow)?
                 .ok_or("the workflow is gone")?;
             if let WorkflowState::Ended(_) = record.state {
                 break;
@@ -267,26 +279,24 @@ impl Testnet {
             if round > SWEEPS {
                 return Err("the computation never ended".into());
             }
-            wait_until(record.due);
+            sleep_until(record.due);
             let sweep = rig
                 .builder
-                .sweep(now())
-                .map_err(said)?
+                .sweep(vos_node::wall_clock())?
                 .ok_or("no sweep due")?;
             let ran = self.step(&mut rig, &format!("sweep {round}"), vec![sweep], &[])?;
             exported += ran.exports;
             imported += ran.imports;
         }
-        let keys_of = method(&self.actors.counter.programs[0], "blob_keys")?;
-        let call = self.call(service, COUNTER, keys_of, ().encode())?;
+        let keys_of = method(&self.actors.counter, "blob_keys")?;
+        let call = self.alice.call(service, COUNTER, keys_of, ().encode())?;
         let ran = self.step(&mut rig, "scan the table", vec![call], &[])?;
         expect_done(&ran.result)?;
 
         // The owner's read, through the builder, against the VOS node's.
         let record = rig
             .builder
-            .workflow(&owner, workflow)
-            .map_err(said)?
+            .workflow(&owner, workflow)?
             .ok_or("the workflow is gone")?;
         let on_vos = rig
             .vos
@@ -297,13 +307,11 @@ impl Testnet {
             .map(|(record, _)| record.state)
             .ok_or("the VOS node lacks the workflow")?;
         if record.state != on_vos {
-            return Err(format!(
-                "the result differs: {:?} on JAM, {on_vos:?} on VOS",
-                record.state
-            ));
+            let on_jam = &record.state;
+            return Err(format!("the result differs: {on_jam:?} on JAM, {on_vos:?} on VOS").into());
         }
         let WorkflowState::Ended(Outcome::Done(bytes)) = &record.state else {
-            return Err(format!("the computation failed: {:?}", record.state));
+            return Err(format!("the computation failed: {:?}", record.state).into());
         };
         let digest = u64::decode(bytes)
             .map_err(|_| "a result that is no digest")?
@@ -312,8 +320,8 @@ impl Testnet {
             "the owner reads workflow {}: done, digest {digest:#x}, as on VOS; its pages: {exported} exported, {imported} imported",
             workflow.0
         ));
-        let landed = rig.chain.landed().map_err(said)?;
-        if landed.root != rig.builder.store.root().map_err(said)? {
+        let landed = rig.chain.landed()?;
+        if landed.root != rig.builder.store.root()? {
             return Err("the chain's root is not the builder's".into());
         }
         self.note(format!(
@@ -332,10 +340,10 @@ impl Testnet {
         name: &str,
         inputs: Vec<Input>,
         solicit: &[(ProgramHash, u32)],
-    ) -> Result<Ran, String> {
-        let before = rig.builder.store.root().map_err(said)?;
+    ) -> Result<Ran, Failed> {
+        let before = rig.builder.store.root()?;
         let mut clock = || {
-            let time = now();
+            let time = vos_node::wall_clock();
             (time, digest(&time.to_le_bytes()))
         };
         let taken = match rig
@@ -346,165 +354,55 @@ impl Testnet {
             Err(Error::Attempts(attempts)) => {
                 self.note(format!("{name}: no package landed"));
                 self.note_attempts(&attempts);
-                return Err(format!("{name}: {}", Error::Attempts(attempts)));
+                return Err(format!("{name}: {}", Error::Attempts(attempts)).into());
             }
-            Err(error) => return Err(format!("{name}: {error}")),
+            Err(error) => return Err(format!("{name}: {error}").into()),
         };
         let Taken {
             prepared,
-            result,
-            encoded,
             exports,
             attempts,
-        } = taken;
+            ..
+        } = &taken;
         self.note(format!(
             "{name}: package {}, slot {}",
             hex::encode(exports.package),
             slot_of(prepared.package.batch.time),
         ));
-        self.note_attempts(&attempts);
+        self.note_attempts(attempts);
         self.attempts.push((name.to_string(), attempts.len()));
-        let after = rig.builder.store.root().map_err(said)?;
-        let landed = rig.chain.landed().map_err(said)?;
+        let after = rig.builder.store.root()?;
+        let landed = rig.chain.landed()?;
         if prepared.package.root != before
             || landed.root != after
-            || landed.exports != Some(exports)
+            || landed.exports != Some(*exports)
         {
-            return Err(format!("{name}: the roots do not continue the chain's"));
+            return Err(format!("{name}: the roots do not continue the chain's").into());
         }
         // The chain's work result, as its exports hold it, against VOS's.
-        let on_vos = rig
-            .vos
-            .batch(&prepared.package.batch)
-            .map_err(said)?
-            .encode();
-        if on_vos != encoded {
-            return Err(format!(
-                "{name}: the chain's work result is not the VOS node's"
-            ));
+        let on_vos = rig.vos.batch(&prepared.package.batch)?.encode();
+        if on_vos != taken.encoded {
+            return Err(format!("{name}: the chain's work result is not the VOS node's").into());
         }
         // PolkaJam reports no refine gas: this is the refine's on the
-        // JAM-only host, which agrees with PolkaJam's at every host call
-        // the probe measured.
-        let imports = rig
-            .builder
-            .imports(&prepared, rig.chain.segments().as_ref())
-            .map_err(said)?;
+        // JAM-only host, which charges PolkaJam's prices at every host call
+        // (testkit's `the_jam_host_charges_polkajams_prices`).
+        let imports = prepared.imports(rig.chain.segments().as_ref())?;
         let refined = Emulated::default()
-            .refine(&rig.runner, &prepared.package, imports, prepared.gas)
+            .refine(&rig.runner, &prepared.payload, imports, prepared.gas)
             .map_err(|error| format!("{name}: refined here: {error}"))?;
-        let witness = &prepared.package.witness;
-        self.note(format!(
-            "  root {} -> {}",
-            hex::encode(before),
-            hex::encode(after)
-        ));
-        self.note(format!(
-            "  {} of {} inputs; witness {} keys, {} ranges of {} rows; payload {} bytes",
-            prepared.package.batch.inputs.len(),
-            inputs.len(),
-            witness.keys.len(),
-            witness.ranges.len(),
-            witness
-                .ranges
-                .iter()
-                .map(|range| range.rows.len())
-                .sum::<usize>(),
-            prepared.payload.len(),
-        ));
-        if !prepared.skipped.is_empty() {
-            self.note(format!(
-                "  left out, their pages gone from DA: workflows {:?}",
-                prepared.skipped
-            ));
-        }
-        self.note(format!(
-            "  imports {}, exports {} ({} pages) at segment root {}",
-            prepared.segments.len(),
-            exports.segments,
-            exports.pages,
-            hex::encode(exports.root),
-        ));
-        self.note(format!(
-            "  work result {} bytes, read back from DA: the one simulated, and the VOS node's, byte for byte",
-            encoded.len()
-        ));
-        let simulations = match prepared.simulations {
-            1 => "1 simulation".to_string(),
-            count => format!("{count} simulations"),
-        };
-        self.note(format!(
-            "  refine {} gas, measured on our JAM-only host (PolkaJam reports none); the builder gave {}: the batch's budget {}, {} for the package's own work, after {simulations}",
-            refined.gas_used,
-            prepared.gas,
-            prepared.package.batch.budget,
-            prepared.own,
-        ));
+        self.note_package(&taken, inputs.len(), (before, after), refined.gas_used);
         Ok(Ran {
-            result,
-            imports: prepared.segments.len(),
-            exports: exports.pages,
+            imports: taken.prepared.segments.len(),
+            exports: taken.exports.pages,
+            result: taken.result,
         })
     }
-
-    /// The counter's install, and the shop's, each naming the programs
-    /// derived from its ELF.
-    fn installs(&self) -> Result<Vec<Input>, String> {
-        let install = |instance, package: &vos_jam::programs::Installable| {
-            Input::Admin(Admin::Install {
-                instance,
-                derivation: package.derivation.clone(),
-                roles: vec![],
-            })
-        };
-        Ok(vec![
-            install(COUNTER, &self.actors.counter),
-            install(SHOP, &self.actors.shop),
-        ])
-    }
-}
-
-/// The testnet's parameters, against the agent's and its builder's.
-fn check(parameters: &Parameters) -> Result<(), String> {
-    let checks = [
-        ("slot period", parameters.slot_period_sec * 1000 == SLOT_MS),
-        (
-            "refine output",
-            parameters.max_report_elective_data as usize == MAX_REFINE_OUTPUT,
-        ),
-        ("imports", parameters.max_imports as usize == MAX_SEGMENTS),
-        ("exports", parameters.max_exports as usize == MAX_SEGMENTS),
-        ("input", parameters.max_input as usize >= MAX_INPUT),
-    ];
-    let differ: Vec<&str> = checks
-        .iter()
-        .filter(|(_, agree)| !agree)
-        .map(|(what, _)| *what)
-        .collect();
-    match differ.is_empty() {
-        true => Ok(()),
-        false => Err(format!(
-            "the testnet's {} differ from the agent's",
-            differ.join(", ")
-        )),
-    }
-}
-
-fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("after the epoch")
-        .as_millis() as u64
-}
-
-/// An error, said.
-fn said(error: impl std::fmt::Display) -> String {
-    error.to_string()
 }
 
 /// Wait until `time`, in milliseconds since the Unix epoch, has passed.
-fn wait_until(time: u64) {
-    let now = now();
+fn sleep_until(time: u64) {
+    let now = vos_node::wall_clock();
     if time >= now {
         std::thread::sleep(Duration::from_millis(time - now + 1));
     }
@@ -522,14 +420,10 @@ fn expect_done(result: &WorkResult) -> Result<(), String> {
     Ok(())
 }
 
-fn schema(program: &[u8]) -> Result<Schema, String> {
-    let parsed = vos_pvm::spi::parse_standard_program(program).ok_or("not a standard program")?;
-    Schema::read(&parsed.ro_data).map_err(|error| format!("{error:?}"))
-}
-
-/// The id of `program`'s method `name`.
-fn method(program: &[u8], name: &str) -> Result<MethodId, String> {
-    schema(program)?
+/// The id of `package`'s method `name`.
+fn method(package: &Installable, name: &str) -> Result<MethodId, String> {
+    package
+        .schema
         .method_id(name)
         .ok_or_else(|| format!("no method {name}"))
 }

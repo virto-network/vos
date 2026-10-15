@@ -5,11 +5,11 @@ use std::fmt::Debug;
 use std::ops::Deref;
 use std::time::{Duration, Instant};
 
-use ed25519_dalek::{Signer, SigningKey};
-use vos_node::client::Client;
+use ed25519_dalek::SigningKey;
+use vos_node::client::{Client, Target};
 use vos_node::{CallError, Node, Reply};
 use vos_wire::ids::{AgentId, InstanceId, MethodId};
-use vos_wire::ingress::{Consistency, QueryCall, Response, query_message};
+use vos_wire::ingress::{Consistency, Install, Response};
 use vos_wire::result::Outcome;
 use vos_wire::{Decode, Encode};
 
@@ -44,6 +44,36 @@ impl Total for Response {
     }
 }
 
+/// An answer that says whether its call ran to completion: a node's
+/// reply, or its ingress's answer.
+pub trait Ran: Debug {
+    fn ran(&self) -> bool;
+}
+
+impl Ran for Result<Reply, CallError> {
+    fn ran(&self) -> bool {
+        matches!(self, Ok(Reply::Ran(Outcome::Done(_))))
+    }
+}
+
+impl Ran for Response {
+    fn ran(&self) -> bool {
+        matches!(
+            self,
+            Response::Ran {
+                outcome: Outcome::Done(_),
+                ..
+            }
+        )
+    }
+}
+
+/// `answer`'s install must have run to completion.
+#[track_caller]
+pub fn installed(answer: impl Ran) {
+    assert!(answer.ran(), "the install: {answer:?}");
+}
+
 /// The counter's total `answer` carries: its call must have run to
 /// completion.
 #[track_caller]
@@ -51,6 +81,16 @@ pub fn done(answer: impl Total) -> u64 {
     match answer.total() {
         Some(total) => total,
         None => panic!("not done: {answer:?}"),
+    }
+}
+
+/// An operator's install of package `elf` as `instance`, granting no
+/// roles.
+pub fn install_of(instance: InstanceId, elf: &[u8]) -> Install {
+    Install {
+        instance,
+        elf: elf.to_vec(),
+        roles: Vec::new(),
     }
 }
 
@@ -68,13 +108,31 @@ pub fn install_at_leader<N: Deref<Target = Node>>(
     let until = Instant::now() + crate::spaces::IN_PROCESS_WAIT;
     loop {
         match smol::block_on(leader().install(agent, instance, elf, Vec::new())) {
-            Ok(Reply::Ran(Outcome::Done(_))) => return,
             Err(CallError::NotLeader(_)) if Instant::now() < until => {
                 std::thread::sleep(Duration::from_millis(10));
             }
-            other => panic!("the install: {other:?}"),
+            answer => return installed(answer),
         }
     }
+}
+
+/// A query of `agent`'s `instance`'s `method`, without arguments, at the
+/// node `target` reaches and nowhere else: by `key`, at the agent whose
+/// identity is `identity`, good for a minute. Its answer, if it gave one.
+pub fn query_at(
+    target: &Target,
+    agent: AgentId,
+    identity: &[u8; 32],
+    key: &SigningKey,
+    consistency: Consistency,
+    instance: InstanceId,
+    method: MethodId,
+) -> Option<Response> {
+    let not_after = vos_node::wall_clock() + 60_000;
+    let query = signed_query(identity, key, not_after, consistency, instance, method);
+    let path = format!("/agents/{}/queries", agent.0);
+    let (_, body) = vos_node::client::post(target, &path, &query).ok()?;
+    Response::decode(&body).ok().map(|(answer, _)| answer)
 }
 
 /// A query of `instance`'s `method`, without arguments, at the agent
@@ -87,25 +145,16 @@ pub fn signed_query(
     instance: InstanceId,
     method: MethodId,
 ) -> Vec<u8> {
-    let public = key.verifying_key().to_bytes();
-    let message = query_message(
+    let arguments = Vec::new();
+    vos_node::client::signed_query(
         identity,
-        &public,
+        key,
         not_after,
         consistency,
         instance,
         method,
-        &[],
-    );
-    QueryCall {
-        key: public,
-        not_after,
-        consistency,
-        instance,
-        method,
-        arguments: Vec::new(),
-        signature: key.sign(&message).to_bytes(),
-    }
+        arguments,
+    )
     .encode()
 }
 

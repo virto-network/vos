@@ -22,12 +22,12 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use vos_checker::crash::{Round, Rounds, tear};
+use vos_checker::crash::{Round, Rounds, journal};
 use vos_node::NoHooks;
 use vos_node::roots::{self, Build};
 use vos_node::storage::{Change, StorageThread};
 use vos_node::store::Fjall;
-use vos_tree::{Blake2b, Hash, Hasher, salt, value_hash};
+use vos_tree::{Blake2b, Hash, Hasher, Leaf};
 use vos_wire::Encode;
 use vos_wire::ids::{AgentId, InstanceId, MapId};
 use vos_wire::keys::{self, Transform};
@@ -54,12 +54,8 @@ const BUILD_EVERY: u64 = 4;
 const BATCH: usize = 64;
 /// Twelve rounds, the last six tearing the journal before reopening.
 const ROUNDS: Rounds = Rounds {
-    writer: "VOS_TREE_CRASH_WRITER",
-    rounds: 12,
-    torn_from: 6,
-    report: "",
-    reports: 12,
     kill_within: Duration::from_millis(30),
+    ..Rounds::twelve("VOS_TREE_CRASH_WRITER", "", 12)
 };
 /// At most this many bytes of the journal are torn: less than a build's
 /// batch, so a tear reaches at most the last apply.
@@ -163,11 +159,9 @@ fn values(version: u64) -> BTreeMap<MapId, Values> {
 fn main() {
     let mut last = 0;
     let mut cut = 0;
-    ROUNDS.run(
-        writer,
-        |round, dir, random| tear(dir, Some("jnl"), TEAR, round.is_multiple_of(2), random),
-        |round| cut += usize::from(check(round, &mut last)),
-    );
+    ROUNDS.run(writer, journal(TEAR), |round| {
+        cut += usize::from(check(round, &mut last))
+    });
     assert!(cut > 0, "no round was killed between a build's batches");
     println!(
         "tree crash: {} rounds resumed to the root from scratch, {cut} of them cut mid-build",
@@ -177,20 +171,13 @@ fn main() {
 
 /// Check a round, and say whether it was cut between a build's batches.
 fn check(round: Round, last: &mut u64) -> bool {
+    let reported = round.reported.unwrap_or(*last);
+    let (floor, how) = (round.floor(reported, 1), round.how());
     let Round {
-        number: round,
-        dir,
-        reported,
-        torn,
+        number: round, dir, ..
     } = round;
-    let reported = reported.unwrap_or(*last);
     let store = Fjall::open(dir).unwrap();
     let version = store.snapshot().applied(AGENT).unwrap().unwrap_or(0);
-    let floor = if torn {
-        reported.saturating_sub(1)
-    } else {
-        reported
-    };
     assert!(
         version >= floor,
         "round {round}: at {version}, but {reported} was reported applied"
@@ -211,8 +198,8 @@ fn check(round: Round, last: &mut u64) -> bool {
         let leaves: Vec<(Vec<u8>, Hash)> = expected[&map]
             .iter()
             .map(|(key, (at, value))| {
-                let salt = salt(&Blake2b, &seed(*at), key);
-                (key.clone(), value_hash(&Blake2b, &salt, value))
+                let leaf = Leaf::salted(&Blake2b, &seed(*at), key, value);
+                (key.clone(), leaf.value_hash)
             })
             .collect();
         assert_eq!(
@@ -231,7 +218,6 @@ fn check(round: Round, last: &mut u64) -> bool {
             "round {round}: dirty or seed rows left"
         );
     }
-    let how = if torn { "killed and torn" } else { "killed" };
     let mid = if cut { ", mid-build" } else { "" };
     println!("round {round}: {how} after {reported}{mid}, resumed at {version}");
     *last = version;

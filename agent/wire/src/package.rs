@@ -148,6 +148,11 @@ pub const fn result_segments(len: usize) -> usize {
     len.div_ceil(SEGMENT)
 }
 
+/// The slot `time`, in milliseconds since the Unix epoch, falls in.
+pub fn slot_of(time: u64) -> u64 {
+    time.saturating_sub(EPOCH_MS) / SLOT_MS
+}
+
 /// Whether a batch at `time`, in milliseconds since the Unix epoch, may be
 /// accumulated at `slot`: within the session skew of the slot, from its
 /// start back to past its end. The builder chooses the time; the slot is

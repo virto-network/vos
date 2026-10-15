@@ -231,7 +231,9 @@ fn committed_writes_keep_their_bytes() {
 /// then the bytes).
 #[test]
 fn signed_messages_keep_their_bytes() {
-    use vos_wire::ingress::{Consistency, call_message, query_message, workflow_message};
+    use vos_wire::ingress::{
+        Call, Consistency, QueryCall, WorkflowRead, call_message, query_message, workflow_message,
+    };
     let identity = [7; 32];
     let session = Session {
         key: [1; 32],
@@ -297,6 +299,46 @@ fn signed_messages_keep_their_bytes() {
         workflow_message(&identity, &[9; 32], 10, consistency, WorkflowId(11), 12),
         read
     );
+    // Each signed request's own message is its fields'.
+    let signed = Call {
+        session,
+        sequence: 4,
+        instance,
+        method,
+        arguments: vec![0xaa, 0xbb],
+        signature: [0; 64],
+    };
+    assert_eq!(signed.message(&identity), call);
+    let query = QueryCall {
+        key: [9; 32],
+        not_after: 10,
+        consistency,
+        instance,
+        method,
+        arguments: vec![0xaa, 0xbb],
+        signature: [0; 64],
+    };
+    assert_eq!(
+        query.message(&identity),
+        query_message(
+            &identity,
+            &[9; 32],
+            10,
+            consistency,
+            instance,
+            method,
+            &[0xaa, 0xbb]
+        )
+    );
+    let workflow = WorkflowRead {
+        key: [9; 32],
+        not_after: 10,
+        consistency,
+        workflow: WorkflowId(11),
+        wait_ms: 12,
+        signature: [0; 64],
+    };
+    assert_eq!(workflow.message(&identity), read);
 }
 
 /// A workflow's status as its owner reads it: after the answer's index,
@@ -782,9 +824,15 @@ fn packages_keep_their_bytes() {
     .concat();
     assert_eq!(package.encode(), bytes);
     round_trip(&package);
+    let borrowed = Work::encode_package(&package);
     let work = Work::Package(package);
     assert_eq!(work.encode(), [&[2][..], &bytes].concat());
+    assert_eq!(borrowed, work.encode());
     assert_eq!(work.batch(), Some(&batch));
+    assert_eq!(
+        Work::encode_batch(&batch),
+        Work::Batch(batch.clone()).encode()
+    );
     let output = JamOutput {
         root_before: [1; 32],
         root_after: [2; 32],

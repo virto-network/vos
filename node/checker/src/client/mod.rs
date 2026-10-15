@@ -9,17 +9,57 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use ed25519_dalek::{Signer, SigningKey};
-use vos_node::client::{ClientError, post_within};
+use ed25519_dalek::SigningKey;
+use vos_node::client::{ClientError, post_within, signed_call};
 use vos_wire::abi::Refusal;
 use vos_wire::ids::{AgentId, InstanceId, Session};
-use vos_wire::ingress::{Call, Rejection, Response, call_message};
+use vos_wire::ingress::{Rejection, Response};
 use vos_wire::peer::NodeNumber;
 use vos_wire::result::Outcome;
 use vos_wire::{Decode, Encode};
 
 use crate::model::{ANSWERED, ATTEMPT, COUNTER, INBOX, Methods, Mode, Nodes, SECOND};
 use crate::rounds;
+
+/// The suite's clients: `count` of them, client `number` at agent
+/// `(number - 1) % agents.len()` of `agents`, each with its identity. The
+/// first at each agent forwards every fifth request to the next agent's
+/// inbox; the second increments a counter of its own; with `tours`, a
+/// third tours the next agent. Each draws how many requests a session of
+/// its takes from `below`, in turn.
+pub fn clients(
+    agents: &[(AgentId, [u8; 32])],
+    count: u8,
+    methods: Methods,
+    tours: Option<rounds::TourMethods>,
+    mut below: impl FnMut(u64) -> u64,
+) -> Vec<Client> {
+    let at_each = agents.len();
+    let clients: Vec<Client> = (1..=count)
+        .map(|number| {
+            let (agent, identity) = agents[usize::from(number - 1) % at_each];
+            let forwarding = usize::from(number) <= at_each;
+            // The second clients start sessions often: first requests meet
+            // every fault.
+            let rotate = if forwarding {
+                32 + 4 * below(8)
+            } else {
+                4 + 4 * below(2)
+            };
+            match tours {
+                Some(tours) if usize::from(number) > 2 * at_each => {
+                    Client::touring(number, agent, identity, methods, tours, rotate)
+                }
+                _ => Client::new(number, agent, identity, methods, forwarding, rotate),
+            }
+        })
+        .collect();
+    let touring = clients.get(2 * at_each..).unwrap_or_default();
+    for (at, client) in clients[..at_each].iter().chain(touring).enumerate() {
+        client.forward_to(agents[(at + 1) % at_each].0);
+    }
+    clients
+}
 
 /// The most sessions a client starts with one key: well within the
 /// agent's cap on one key's live sessions, which a long run would reach.
@@ -34,6 +74,11 @@ fn post(
     body: &[u8],
 ) -> Result<Response, ClientError> {
     post_within(nodes.target(at), path, body, ATTEMPT)
+}
+
+/// The node of `count` whose turn `turn` is, numbered from 1.
+fn node_at(turn: u64, count: NodeNumber) -> NodeNumber {
+    1 + (turn % u64::from(count)) as NodeNumber
 }
 
 /// One client at an agent, whose counter instance only it increments, so
@@ -194,45 +239,34 @@ impl Client {
         if self.forwarding { request / 5 } else { 0 }
     }
 
+    /// The amounts of requests 1 through `request` that forward, or
+    /// (`forwarded` false) that add to this client's counter.
+    fn amounts(&self, request: u64, forwarded: bool) -> impl Iterator<Item = u64> + '_ {
+        (1..=request)
+            .filter(move |request| self.forwards(*request) == forwarded)
+            .map(|request| self.amount(request))
+    }
+
     /// The counter after requests 1 through `request`.
     pub fn total(&self, request: u64) -> u64 {
-        (1..=request)
-            .filter(|request| !self.forwards(*request))
-            .map(|request| self.amount(request))
-            .sum()
-    }
-
-    /// Whether `value` is the counter after requests 1 through some
-    /// request up to `sent`.
-    fn is_total_prefix(&self, sent: u64, value: u64) -> bool {
-        let mut total = 0;
-        (0..=sent).any(|request| {
-            if request > 0 && !self.forwards(request) {
-                total += self.amount(request);
-            }
-            total == value
-        })
-    }
-
-    /// Whether `value` is the next agent's inbox after this client's
-    /// requests 1 through some request up to `sent`.
-    fn is_forwarded_prefix(&self, sent: u64, value: u64) -> bool {
-        let mut total = 0;
-        (0..=sent).any(|request| {
-            if request > 0 && self.forwards(request) {
-                total += self.amount(request);
-            }
-            total == value
-        })
+        self.amounts(request, false).sum()
     }
 
     /// The next agent's inbox after this client's requests 1 through
     /// `request` applied there.
     pub fn forwarded(&self, request: u64) -> u64 {
-        (1..=request)
-            .filter(|request| self.forwards(*request))
-            .map(|request| self.amount(request))
-            .sum()
+        self.amounts(request, true).sum()
+    }
+
+    /// Whether `value` is the counter, or (`forwarded`) the next agent's
+    /// inbox, after requests 1 through some request up to `sent`.
+    fn is_prefix(&self, sent: u64, value: u64, forwarded: bool) -> bool {
+        let mut total = 0;
+        value == 0
+            || self.amounts(sent, forwarded).any(|amount| {
+                total += amount;
+                total == value
+            })
     }
 
     /// A new session from request `first` on, timed by the nodes' clock.
@@ -322,24 +356,16 @@ impl Client {
         } else {
             (self.methods.increment, self.amount(request).encode())
         };
-        let message = call_message(
+        let key = SigningKey::from_bytes(&timed.secret);
+        signed_call(
             &self.identity,
-            session,
+            &key,
+            *session,
             sequence,
             self.instance,
             method,
-            &arguments,
-        );
-        Call {
-            session: *session,
-            sequence,
-            instance: self.instance,
-            method,
             arguments,
-            signature: SigningKey::from_bytes(&timed.secret)
-                .sign(&message)
-                .to_bytes(),
-        }
+        )
         .encode()
     }
 
@@ -352,8 +378,7 @@ impl Client {
         self.sent.fetch_max(request, Ordering::SeqCst);
         // Requests take turns at every node, followers forwarding to the
         // leader and other nodes naming the replicas.
-        *self.calling.lock().unwrap() =
-            1 + ((request + u64::from(self.number)) % u64::from(count)) as NodeNumber;
+        *self.calling.lock().unwrap() = node_at(request + u64::from(self.number), count);
         let mut tries = 0usize;
         loop {
             assert!(

@@ -1,8 +1,9 @@
 //! The `vos` command end to end: a node, an operator and a client, as
 //! separate processes.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 use std::time::Duration;
 
 use vos_checker::processes::{Running, Started, read_log, run};
@@ -11,14 +12,83 @@ use vos_checker::wait_until;
 
 const VOS: &str = env!("CARGO_BIN_EXE_vos");
 
-fn vos(args: &[&str]) -> String {
-    let output = Command::new(VOS).args(args).output().expect("vos runs");
+/// `vos` with `args`, and the arguments as it was given them.
+fn vos_run(args: impl IntoIterator<Item: AsRef<OsStr>>) -> (Output, Vec<String>) {
+    let args: Vec<String> = args
+        .into_iter()
+        .map(|arg| arg.as_ref().to_string_lossy().into_owned())
+        .collect();
+    let output = Command::new(VOS).args(&args).output().expect("vos runs");
+    (output, args)
+}
+
+/// `vos` that should succeed: what it printed.
+fn vos(args: impl IntoIterator<Item: AsRef<OsStr>>) -> String {
+    let (output, args) = vos_run(args);
     assert!(
         output.status.success(),
         "vos {args:?}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+/// `vos` that should fail: its error.
+fn vos_fails(args: impl IntoIterator<Item: AsRef<OsStr>>) -> String {
+    let (output, args) = vos_run(args);
+    assert!(!output.status.success(), "vos {args:?} succeeded");
+    String::from_utf8_lossy(&output.stderr).to_string()
+}
+
+/// `vos install` of `elf` as `agent`'s `instance`, at the node at `url`
+/// whose data directory is `data`.
+fn install(url: &str, data: &str, agent: &str, instance: &str, elf: &Path) -> Vec<String> {
+    let elf = elf.to_str().unwrap();
+    [
+        "install",
+        "--node",
+        url,
+        "--data",
+        data,
+        "--agent",
+        agent,
+        "--instance",
+        instance,
+        "--elf",
+        elf,
+    ]
+    .map(str::to_string)
+    .to_vec()
+}
+
+/// A client of `agent` at `url`, by the key whose seed is at `key`.
+struct Client<'a> {
+    url: &'a str,
+    key: &'a str,
+    agent: &'a str,
+}
+
+impl Client<'_> {
+    /// `vos command` of `instance`'s `method`, with `args` in hex.
+    fn invoke(&self, command: &str, instance: &str, method: &str, args: &str) -> Vec<String> {
+        [
+            command,
+            "--node",
+            self.url,
+            "--key",
+            self.key,
+            "--agent",
+            self.agent,
+            "--instance",
+            instance,
+            "--method",
+            method,
+            "--args",
+            args,
+        ]
+        .map(str::to_string)
+        .to_vec()
+    }
 }
 
 /// A node `vos node run` started, killed when dropped; a failing test
@@ -56,76 +126,54 @@ fn node_run(dir: &Path, args: &[&str]) -> Node {
     }
 }
 
+/// A node of its own in `dir`, its data directory `dir/node`: the node,
+/// its data directory and its URL.
+fn single_node(dir: &Path) -> (Node, String, String) {
+    let data = dir.join("node").to_str().unwrap().to_string();
+    let node = node_run(dir, &["--data", &data, "--listen", "127.0.0.1:0"]);
+    let url = format!("http://{}", node.address);
+    (node, data, url)
+}
+
+/// A new client key at `dir/name`: its path.
+fn new_key(dir: &Path, name: &str) -> String {
+    let path = dir.join(name).to_str().unwrap().to_string();
+    vos(["key", "new", "--out", &path]);
+    path
+}
+
 #[test]
 fn a_client_calls_an_agent_the_operator_installed() {
     let dir = tempfile::tempdir().unwrap();
-    let data = dir.path().join("node");
-    let data = data.to_str().unwrap();
-    let node = node_run(dir.path(), &["--data", data, "--listen", "127.0.0.1:0"]);
-    let url = format!("http://{}", node.address);
-    assert_eq!(vos(&["node", "info", "--node", &url]), node.key);
+    let (node, data, url) = single_node(dir.path());
+    assert_eq!(vos(["node", "info", "--node", &url]), node.key);
 
-    let key = dir.path().join("client.key");
-    let public = vos(&["key", "new", "--out", key.to_str().unwrap()]);
+    let key = dir.path().join("client.key").to_str().unwrap().to_string();
+    let public = vos(["key", "new", "--out", &key]);
     assert_eq!(public.len(), 64);
-    let agent = vos(&["agent", "create", "--node", &url, "--data", data]);
-    let counter = actor_elf("counter");
-    let installed = vos(&[
-        "install",
-        "--node",
-        &url,
-        "--data",
-        data,
-        "--agent",
-        &agent,
-        "--instance",
-        "1",
-        "--elf",
-        counter.to_str().unwrap(),
-    ]);
+    let agent = vos(["agent", "create", "--node", &url, "--data", &data]);
+    let installed = vos(install(&url, &data, &agent, "1", &actor_elf("counter")));
     assert!(installed.starts_with("done"), "{installed}");
-    let client = |command: &str, method: &str, args: &str| {
-        vos(&[
-            command,
-            "--node",
-            &url,
-            "--key",
-            key.to_str().unwrap(),
-            "--agent",
-            &agent,
-            "--instance",
-            "1",
-            "--method",
-            method,
-            "--args",
-            args,
-        ])
+    let client = Client {
+        url: &url,
+        key: &key,
+        agent: &agent,
     };
+    let invoke =
+        |command: &str, method: &str, args: &str| vos(client.invoke(command, "1", method, args));
     assert_eq!(
-        client("call", "increment", "0500000000000000"),
+        invoke("call", "increment", "0500000000000000"),
         "done 0500000000000000"
     );
     let kept = std::fs::read_to_string(dir.path().join("client.key.session")).unwrap();
     assert_eq!(
-        client("call", "increment", "0200000000000000"),
+        invoke("call", "increment", "0200000000000000"),
         "done 0700000000000000"
     );
-    assert_eq!(client("query", "value", ""), "done 0700000000000000");
-    let linearizable = vos(&[
-        "query",
-        "--linearizable",
-        "--node",
-        &url,
-        "--key",
-        key.to_str().unwrap(),
-        "--agent",
-        &agent,
-        "--instance",
-        "1",
-        "--method",
-        "value",
-    ]);
-    assert_eq!(linearizable, "done 0700000000000000");
+    assert_eq!(invoke("query", "value", ""), "done 0700000000000000");
+    let mut linearizable = client.invoke("query", "1", "value", "");
+    linearizable.push("--linearizable".into());
+    assert_eq!(vos(linearizable), "done 0700000000000000");
     // One session for the agent, kept next to the key, whose sequence
     // went on; and the agent's identity, fetched once.
     let session = |text: &str| -> Vec<String> {
@@ -152,40 +200,21 @@ fn a_client_calls_an_agent_the_operator_installed() {
 #[test]
 fn an_operator_installs_a_package() {
     let dir = tempfile::tempdir().unwrap();
-    let data = dir.path().join("node");
-    let data = data.to_str().unwrap();
-    let node = node_run(dir.path(), &["--data", data, "--listen", "127.0.0.1:0"]);
-    let url = format!("http://{}", node.address);
-    let key = dir.path().join("client.key");
-    vos(&["key", "new", "--out", key.to_str().unwrap()]);
-    let agent = vos(&["agent", "create", "--node", &url, "--data", data]);
-    let ledger = actor_elf("ledger").to_str().unwrap().to_string();
-    let install = |elf: &str, roles: &[&str]| -> Vec<String> {
-        let mut args: Vec<String> = [
-            "install",
-            "--node",
-            &url,
-            "--data",
-            data,
-            "--agent",
-            &agent,
-            "--instance",
-            "2",
-            "--elf",
-            elf,
-        ]
-        .map(str::to_string)
-        .to_vec();
-        args.extend(roles.iter().map(|arg| arg.to_string()));
-        args
-    };
+    let (_node, data, url) = single_node(dir.path());
+    let key = new_key(dir.path(), "client.key");
+    let agent = vos(["agent", "create", "--node", &url, "--data", &data]);
+    let ledger = actor_elf("ledger");
+    let instance_2 = |elf: &Path| install(&url, &data, &agent, "2", elf);
 
-    let agent_elf = agent_elf();
-    let refused = vos_fails(&strs(&install(agent_elf.to_str().unwrap(), &[])));
+    let refused = vos_fails(instance_2(&agent_elf()));
     assert!(refused.contains("vos_schema"), "{refused}");
-    let unmapped = vos(&strs(&install(&ledger, &[])));
+    let unmapped = vos(instance_2(&ledger));
     assert!(unmapped.starts_with("failed 6"), "unknown: {unmapped}");
-    let installed = vos(&strs(&install(&ledger, &["--role", "minter=1"])));
+    let installed = vos([
+        instance_2(&ledger),
+        vec!["--role".into(), "minter=1".into()],
+    ]
+    .concat());
     // The node's derivation is the one a JAM builder makes of the same ELF.
     let elf = std::fs::read(&ledger).unwrap();
     let jam = vos_jam::programs::derive(&elf).unwrap().derivation;
@@ -201,21 +230,12 @@ fn an_operator_installs_a_package() {
     );
     // The attestable runs as the kernel derived from the ledger's ELF: the
     // checksum of no values is its offset basis.
-    let audited = vos(&[
-        "call",
-        "--node",
-        &url,
-        "--key",
-        key.to_str().unwrap(),
-        "--agent",
-        &agent,
-        "--instance",
-        "2",
-        "--method",
-        "audit",
-        "--args",
-        "00000000",
-    ]);
+    let client = Client {
+        url: &url,
+        key: &key,
+        agent: &agent,
+    };
+    let audited = vos(client.invoke("call", "2", "audit", "00000000"));
     assert_eq!(audited, "done 25232284e49cf2cb");
 }
 
@@ -225,51 +245,23 @@ fn an_operator_installs_a_package() {
 #[test]
 fn a_client_reads_the_workflow_it_started() {
     let dir = tempfile::tempdir().unwrap();
-    let data = dir.path().join("node");
-    let data = data.to_str().unwrap();
-    let node = node_run(dir.path(), &["--data", data, "--listen", "127.0.0.1:0"]);
-    let url = format!("http://{}", node.address);
-    let agent = vos(&["agent", "create", "--node", &url, "--data", data]);
-    let elf = |name: &str| actor_elf(name).to_str().unwrap().to_string();
-    let installed = vos(&[
-        "install",
-        "--node",
-        &url,
-        "--data",
-        data,
-        "--agent",
-        &agent,
-        "--instance",
-        "2",
-        "--elf",
-        &elf("ledger"),
-        "--role",
-        "minter=1",
-    ]);
+    let (_node, data, url) = single_node(dir.path());
+    let agent = vos(["agent", "create", "--node", &url, "--data", &data]);
+    let ledger = install(&url, &data, &agent, "2", &actor_elf("ledger"));
+    let installed = vos([ledger, vec!["--role".into(), "minter=1".into()]].concat());
     assert!(installed.starts_with("done"), "{installed}");
-    let key = |name: &str| {
-        let path = dir.path().join(name);
-        vos(&["key", "new", "--out", path.to_str().unwrap()]);
-        path.to_str().unwrap().to_string()
-    };
-    let (owner, stranger) = (key("owner.key"), key("stranger.key"));
+    let (owner, stranger) = (
+        new_key(dir.path(), "owner.key"),
+        new_key(dir.path(), "stranger.key"),
+    );
     // The amounts 1 and 2.
     let amounts = "0200000001000000000000000200000000000000";
-    let started = vos(&[
-        "call",
-        "--node",
-        &url,
-        "--key",
-        &owner,
-        "--agent",
-        &agent,
-        "--instance",
-        "2",
-        "--method",
-        "tally",
-        "--args",
-        amounts,
-    ]);
+    let client = Client {
+        url: &url,
+        key: &owner,
+        agent: &agent,
+    };
+    let started = vos(client.invoke("call", "2", "tally", amounts));
     let id = started
         .strip_prefix("started ")
         .unwrap_or_else(|| panic!("{started}"));
@@ -279,23 +271,12 @@ fn a_client_reads_the_workflow_it_started() {
         ]
         .map(str::to_string)
     };
-    assert_eq!(vos(&strs(&read(&owner))), "done 0300000000000000");
-    let unknown = vos_fails(&strs(&read(&stranger)));
+    assert_eq!(vos(read(&owner)), "done 0300000000000000");
+    let unknown = vos_fails(read(&stranger));
     assert!(
         unknown.contains(&format!("holds no workflow {id} this key started")),
         "{unknown}"
     );
-}
-
-fn strs(args: &[String]) -> Vec<&str> {
-    args.iter().map(String::as_str).collect()
-}
-
-/// `vos` that should fail: its error.
-fn vos_fails(args: &[&str]) -> String {
-    let output = Command::new(VOS).args(args).output().expect("vos runs");
-    assert!(!output.status.success(), "vos {args:?} succeeded");
-    String::from_utf8_lossy(&output.stderr).to_string()
 }
 
 #[test]
@@ -306,7 +287,7 @@ fn an_operator_reaches_a_tls_node_by_its_key() {
     let agent = agent_elf();
 
     // Without TLS, a node listens on a loopback address only.
-    let refused = vos_fails(&[
+    let refused = vos_fails([
         "node",
         "run",
         "--data",
@@ -326,10 +307,10 @@ fn an_operator_reaches_a_tls_node_by_its_key() {
     let url = format!("https://{address}");
 
     assert_eq!(
-        vos(&["node", "info", "--node", &url, "--node-key", &key]),
+        vos(["node", "info", "--node", &url, "--node-key", &key]),
         key
     );
-    let created = vos(&[
+    let created = vos([
         "agent",
         "create",
         "--node",
@@ -342,13 +323,13 @@ fn an_operator_reaches_a_tls_node_by_its_key() {
     assert!(created.parse::<u32>().is_ok(), "{created}");
     // On the node's host, operator commands pin the key the node keeps in
     // its data directory.
-    let created = vos(&["agent", "create", "--node", &url, "--data", data]);
+    let created = vos(["agent", "create", "--node", &url, "--data", data]);
     assert!(created.parse::<u32>().is_ok(), "{created}");
     // Another key, no key, or plain HTTP: refused.
     let other = "11".repeat(32);
-    vos_fails(&["node", "info", "--node", &url, "--node-key", &other]);
-    vos_fails(&["node", "info", "--node", &url]);
-    vos_fails(&["node", "info", "--node", &format!("http://{address}")]);
+    vos_fails(["node", "info", "--node", &url, "--node-key", &other]);
+    vos_fails(["node", "info", "--node", &url]);
+    vos_fails(["node", "info", "--node", &format!("http://{address}")]);
 }
 
 /// Stops the leader loop once, after the commit it is armed for and before
@@ -378,7 +359,7 @@ impl vos_node::Hooks for LoseAnswer {
 fn a_pending_call_whose_session_was_collected_is_lost() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use vos_wire::{Decode, defaults, expiry, keys};
+    use vos_wire::{defaults, expiry, keys};
 
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("node");
@@ -399,52 +380,25 @@ fn a_pending_call_whose_session_was_collected_is_lost() {
     };
     let (node, url) = open();
     let data = data.to_str().unwrap();
-    let key = dir.path().join("client.key");
-    vos(&["key", "new", "--out", key.to_str().unwrap()]);
-    let agent = vos(&["agent", "create", "--node", &url, "--data", data]);
-    let counter = actor_elf("counter");
-    let installed = vos(&[
-        "install",
-        "--node",
-        &url,
-        "--data",
-        data,
-        "--agent",
-        &agent,
-        "--instance",
-        "1",
-        "--elf",
-        counter.to_str().unwrap(),
-    ]);
+    let key = new_key(dir.path(), "client.key");
+    let agent = vos(["agent", "create", "--node", &url, "--data", data]);
+    let installed = vos(install(&url, data, &agent, "1", &actor_elf("counter")));
     assert!(installed.starts_with("done"), "{installed}");
     let client = |url: &str, command: &str, method: &str, args: &str| {
-        [
-            command,
-            "--node",
+        let client = Client {
             url,
-            "--key",
-            key.to_str().unwrap(),
-            "--agent",
-            &agent,
-            "--instance",
-            "1",
-            "--method",
-            method,
-            "--args",
-            args,
-        ]
-        .map(str::to_string)
+            key: &key,
+            agent: &agent,
+        };
+        client.invoke(command, "1", method, args)
     };
-    let run = |args: [String; 13]| vos(&args.iter().map(String::as_str).collect::<Vec<_>>());
-    let fails =
-        |args: [String; 13]| vos_fails(&args.iter().map(String::as_str).collect::<Vec<_>>());
     assert_eq!(
-        run(client(&url, "call", "increment", "0100000000000000")),
+        vos(client(&url, "call", "increment", "0100000000000000")),
         "done 0100000000000000"
     );
     lose.armed.store(true, Ordering::SeqCst);
     let unanswered = std::thread::scope(|scope| {
-        let call = scope.spawn(|| fails(client(&url, "call", "increment", "0200000000000000")));
+        let call = scope.spawn(|| vos_fails(client(&url, "call", "increment", "0200000000000000")));
         wait_until("the call commits", Duration::from_secs(20), || {
             lose.tripped.load(Ordering::SeqCst)
         });
@@ -462,7 +416,7 @@ fn a_pending_call_whose_session_was_collected_is_lost() {
     // A line it does not know: the file is refused, and kept as it is.
     let kept = std::fs::read_to_string(&session_file).unwrap();
     std::fs::write(&session_file, format!("{kept}something else\n")).unwrap();
-    let refused = fails(client(&url, "call", "increment", "0200000000000000"));
+    let refused = vos_fails(client(&url, "call", "increment", "0200000000000000"));
     assert!(refused.contains("cannot read"), "{refused}");
     assert!(
         std::fs::read_to_string(&session_file)
@@ -476,16 +430,9 @@ fn a_pending_call_whose_session_was_collected_is_lost() {
     let (node, url) = open();
     let id = vos_wire::ids::AgentId(agent.parse().unwrap());
     wait_until("the session is collected", Duration::from_secs(20), || {
-        let live = node
-            .store()
-            .snapshot()
-            .get(id, &keys::live_sessions())
-            .unwrap()
-            .and_then(|bytes| u64::decode(vos_wire::records::unstored(&bytes)?).ok())
-            .map(|(live, _)| live);
-        live == Some(0)
+        vos_checker::applied::<u64>(node.store(), id, &keys::live_sessions()) == Some(0)
     });
-    let lost = fails(client(&url, "call", "increment", "0200000000000000"));
+    let lost = vos_fails(client(&url, "call", "increment", "0200000000000000"));
     assert!(lost.contains("lost"), "{lost}");
     assert!(
         !std::fs::read_to_string(&session_file)
@@ -494,7 +441,7 @@ fn a_pending_call_whose_session_was_collected_is_lost() {
         "forgotten"
     );
     assert_eq!(
-        run(client(&url, "query", "value", "")),
+        vos(client(&url, "query", "value", "")),
         "done 0300000000000000",
         "the lost call ran once"
     );

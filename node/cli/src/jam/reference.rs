@@ -14,9 +14,9 @@ use vos_pvm::refine_host::{RefineContext, StateReader, serve_lookup};
 use vos_wire::abi::surface::LOST;
 use vos_wire::abi::{cap, code};
 use vos_wire::batch::{Batch, Work};
+use vos_wire::defaults;
 use vos_wire::jam::{AccumulateInput, Operand};
 use vos_wire::result::{WorkResult, split_output};
-use vos_wire::{Encode, defaults};
 
 use vos_jam::{Error, Runner};
 
@@ -39,7 +39,7 @@ impl Vos {
     /// output holds it.
     pub fn batch(&mut self, batch: &Batch) -> Result<WorkResult, Error> {
         let runner = &self.runner;
-        let arguments = runner.arguments(&Work::Batch(batch.clone()).encode(), [0; 32]);
+        let arguments = runner.arguments(&Work::encode_batch(batch), [0; 32]);
         let gas = batch.budget + defaults::refine_start(batch.inputs.len(), arguments.len());
         let reader: Arc<dyn StateReader> = Arc::new(self.state.clone());
         let invocation =

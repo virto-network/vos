@@ -3,7 +3,7 @@
 use ed25519_dalek::{Signature, VerifyingKey};
 use vos_wire::batch::{Input, Request};
 use vos_wire::ids::Principal;
-use vos_wire::ingress::{Call, call_message};
+use vos_wire::ingress::Call;
 
 use crate::Error;
 
@@ -11,14 +11,7 @@ use crate::Error;
 /// takes it: signed by its session's key, as a VOS node's ingress checks
 /// it, else `Error::Signature`.
 pub fn admit(service: u64, call: Call) -> Result<Input, Error> {
-    let message = call_message(
-        &vos_wire::package::identity(service),
-        &call.session,
-        call.sequence,
-        call.instance,
-        call.method,
-        &call.arguments,
-    );
+    let message = call.message(&vos_wire::package::identity(service));
     let signed = VerifyingKey::from_bytes(&call.session.key).is_ok_and(|key| {
         key.verify_strict(&message, &Signature::from_bytes(&call.signature))
             .is_ok()
@@ -55,22 +48,17 @@ mod tests {
             t0: 5,
         };
         let signed = |service: u64, key: &SigningKey| {
-            let message = call_message(
-                &vos_wire::package::identity(service),
-                &session,
-                6,
-                InstanceId(7),
-                MethodId(8),
-                &[9],
-            );
-            Call {
+            let mut call = Call {
                 session,
                 sequence: 6,
                 instance: InstanceId(7),
                 method: MethodId(8),
                 arguments: vec![9],
-                signature: key.sign(&message).to_bytes(),
-            }
+                signature: [0; 64],
+            };
+            let message = call.message(&vos_wire::package::identity(service));
+            call.signature = key.sign(&message).to_bytes();
+            call
         };
         let Ok(Input::Request(request)) = admit(1, signed(1, &key)) else {
             panic!("admitted");

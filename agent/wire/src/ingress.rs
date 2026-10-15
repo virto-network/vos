@@ -352,6 +352,52 @@ fn message(domain: &[u8], identity: &[u8; 32], fields: impl FnOnce(&mut Vec<u8>)
     bytes
 }
 
+impl Call {
+    /// What its session's key signs for the agent whose identity is
+    /// `identity`: [`call_message`] of its fields.
+    pub fn message(&self, identity: &[u8; 32]) -> Vec<u8> {
+        call_message(
+            identity,
+            &self.session,
+            self.sequence,
+            self.instance,
+            self.method,
+            &self.arguments,
+        )
+    }
+}
+
+impl QueryCall {
+    /// What its key signs for the agent whose identity is `identity`:
+    /// [`query_message`] of its fields.
+    pub fn message(&self, identity: &[u8; 32]) -> Vec<u8> {
+        query_message(
+            identity,
+            &self.key,
+            self.not_after,
+            self.consistency,
+            self.instance,
+            self.method,
+            &self.arguments,
+        )
+    }
+}
+
+impl WorkflowRead {
+    /// What its key signs for the agent whose identity is `identity`:
+    /// [`workflow_message`] of its fields.
+    pub fn message(&self, identity: &[u8; 32]) -> Vec<u8> {
+        workflow_message(
+            identity,
+            &self.key,
+            self.not_after,
+            self.consistency,
+            self.workflow,
+            self.wait_ms,
+        )
+    }
+}
+
 /// What a client signs for a call to the agent whose identity is
 /// `identity`.
 pub fn call_message(

@@ -5,7 +5,7 @@ use super::*;
 
 #[test]
 fn calls_follow_their_session_sequence() {
-    let served = Served::start(Arc::new(vos_node::NoHooks));
+    let served = Served::plain();
     let client = served.client(1);
     assert_eq!(done(served.increment(&client, 1, 5)), 5);
     assert_eq!(
@@ -45,7 +45,7 @@ fn calls_follow_their_session_sequence() {
 
 #[test]
 fn signatures_sessions_and_staleness_are_checked() {
-    let served = Served::start(Arc::new(vos_node::NoHooks));
+    let served = Served::plain();
     let client = served.client(1);
     let agent = served.agent;
     let path = format!("/agents/{}/calls", agent.0);
@@ -106,15 +106,7 @@ fn signatures_sessions_and_staleness_are_checked() {
         .0;
         call.session.t0 = t0;
         let key = SigningKey::from_bytes(&[1; 32]);
-        let identity = client.identity(agent).unwrap();
-        let message = vos_wire::ingress::call_message(
-            &identity,
-            &call.session,
-            call.sequence,
-            call.instance,
-            call.method,
-            &call.arguments,
-        );
+        let message = call.message(&client.identity(agent).unwrap());
         call.signature = ed25519_dalek::Signer::sign(&key, &message).to_bytes();
         served.post(&path, &call.encode())
     };
@@ -159,7 +151,7 @@ fn signatures_sessions_and_staleness_are_checked() {
 /// refusal gives.
 #[test]
 fn an_expired_session_is_refused_and_the_client_starts_another() {
-    let served = Served::start(Arc::new(vos_node::NoHooks));
+    let served = Served::plain();
     let mut client = served.client(1);
     assert_eq!(done(served.call(&mut client, 5)), 5);
     let first = client.session(served.agent);
@@ -189,7 +181,7 @@ fn an_expired_session_is_refused_and_the_client_starts_another() {
 /// collected.
 #[test]
 fn a_call_whose_answer_was_lost_is_answered_once_or_lost() {
-    let served = Served::start(Arc::new(vos_node::NoHooks));
+    let served = Served::plain();
     let start = served.at_bucket_start();
     let mut client = served.client(1);
     assert_eq!(done(served.call(&mut client, 1)), 1);

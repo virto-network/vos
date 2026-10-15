@@ -9,6 +9,9 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime};
 
+use vos_wire::ids::InstanceId;
+use vos_wire::keys;
+
 use crate::Random;
 
 /// How a crash test's rounds go.
@@ -30,6 +33,7 @@ pub struct Rounds {
 }
 
 /// A round, its writer killed, for the test to check.
+#[derive(Clone, Copy)]
 pub struct Round<'a> {
     pub number: usize,
     pub dir: &'a Path,
@@ -40,7 +44,42 @@ pub struct Round<'a> {
     pub torn: bool,
 }
 
+impl Round<'_> {
+    /// The least of `reported` a reopened store holds: all of it, or,
+    /// after a tear, all but the `reach` a tear may take.
+    pub fn floor(&self, reported: u64, reach: u64) -> u64 {
+        if self.torn {
+            reported.saturating_sub(reach)
+        } else {
+            reported
+        }
+    }
+
+    /// How the round ended, as its line says.
+    pub fn how(&self) -> &'static str {
+        if self.torn {
+            "killed and torn"
+        } else {
+            "killed"
+        }
+    }
+}
+
 impl Rounds {
+    /// Twelve rounds, the last six torn, by the writer `writer` names,
+    /// which prints `report` before each index it reports: fewer than
+    /// `reports` read before the kill, which comes within 3 ms.
+    pub const fn twelve(writer: &'static str, report: &'static str, reports: u64) -> Self {
+        Self {
+            writer,
+            rounds: 12,
+            torn_from: 6,
+            report,
+            reports,
+            kill_within: Duration::from_millis(3),
+        }
+    }
+
     /// The test binary's `main`: `writer` in the child, writing in its
     /// directory until killed; otherwise the rounds, on a seed of the
     /// clock, `tear` tearing the directory of a torn round (whether it
@@ -66,7 +105,7 @@ impl Rounds {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_nanos() as u64;
-        let mut random = Random(seed | 1);
+        let mut random = Random::new(seed);
         let mut tore = 0;
         for number in 0..self.rounds {
             let mut child = Command::new(std::env::current_exe().unwrap())
@@ -105,6 +144,21 @@ impl Rounds {
         }
         assert!(tore > 0, "no torn round reached data");
     }
+}
+
+/// A torn round's tear of the journal: its newest file, by up to `most`
+/// bytes, truncated in even rounds and zeroed in odd ones.
+pub fn journal(most: u64) -> impl FnMut(usize, &Path, &mut Random) -> bool {
+    move |round, dir, random| tear(dir, Some("jnl"), most, round.is_multiple_of(2), random)
+}
+
+/// The key of slot `slot` of the writers' table: instance 0's first.
+pub fn slot_key(slot: u64) -> Vec<u8> {
+    [
+        keys::table_prefix(InstanceId(0), 1),
+        slot.to_be_bytes().to_vec(),
+    ]
+    .concat()
 }
 
 /// Tear the newest file under `dir`, numbered by its name, with

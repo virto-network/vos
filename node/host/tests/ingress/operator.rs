@@ -4,7 +4,7 @@ use super::*;
 
 #[test]
 fn operator_commands_need_the_token() {
-    let served = Served::start(Arc::new(vos_node::NoHooks));
+    let served = Served::plain();
     let stranger = Operator::new(&served.target, &"00".repeat(32));
     assert_eq!(
         stranger.create_agent(Vec::new()).unwrap(),

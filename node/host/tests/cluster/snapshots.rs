@@ -57,11 +57,8 @@ fn a_log_compacts_on_its_bytes_and_keeps_a_tail_within_them() {
 #[test]
 fn a_follower_behind_the_log_catches_up_by_a_snapshot() {
     let mut cluster = Cluster::tuned(3, compacting);
-    let agent = cluster.node(1).create_replicated(vec![1, 2, 3]).unwrap();
+    let agent = cluster.agent(&[1, 2, 3]);
     let (leader, follower) = cluster.leader_and_follower(agent);
-    wait_until("the follower runs the group", || {
-        cluster.node(follower).applied(agent).is_some()
-    });
     cluster.stop(follower);
     cluster.install(agent);
     cluster.increments(leader, agent, 1..=30);
@@ -109,11 +106,8 @@ fn a_snapshot_stream_outlasting_the_leaders_deadline_goes_on() {
         config.snapshot_timeout_ms = 300;
         config.hooks = slow.clone();
     });
-    let agent = cluster.node(1).create_replicated(vec![1, 2, 3]).unwrap();
+    let agent = cluster.agent(&[1, 2, 3]);
     let (leader, follower) = cluster.leader_and_follower(agent);
-    wait_until("the follower runs the group", || {
-        cluster.node(follower).applied(agent).is_some()
-    });
     cluster.stop(follower);
     cluster.install(agent);
     let total = cluster.increments(leader, agent, 1..=30);
@@ -210,11 +204,8 @@ fn a_snapshot_waits_for_the_programs_it_names() {
         compacting(number, config);
         config.hooks = hooks.clone();
     });
-    let agent = cluster.node(1).create_replicated(vec![1, 2, 3]).unwrap();
+    let agent = cluster.agent(&[1, 2, 3]);
     let (leader, follower) = cluster.leader_and_follower(agent);
-    wait_until("the follower runs the group", || {
-        cluster.node(follower).applied(agent).is_some()
-    });
     cluster.stop(follower);
     cluster.install(agent);
     cluster.increments(leader, agent, 1..=30);

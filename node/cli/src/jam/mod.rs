@@ -3,7 +3,7 @@
 mod reference;
 mod testnet;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Subcommand;
 use vos_pvm_compiler::{ServiceMetadata, service_blob};
@@ -43,8 +43,7 @@ impl JamCommand {
                     name: &name,
                     ..METADATA
                 };
-                let blob = service_blob(&link(&elf)?, &metadata);
-                std::fs::write(&out, &blob).map_err(at(&out))?;
+                let blob = write_service(&link(&elf)?, &metadata, &out)?;
                 println!(
                     "{}: {} bytes, code hash {}",
                     out.display(),
@@ -56,4 +55,12 @@ impl JamCommand {
             JamCommand::Testnet(args) => testnet::run(args),
         }
     }
+}
+
+/// `code` linked as a JAM service's code blob, its metadata first,
+/// written to `out`: the blob.
+fn write_service(code: &[u8], metadata: &ServiceMetadata, out: &Path) -> Result<Vec<u8>, String> {
+    let blob = service_blob(code, metadata);
+    std::fs::write(out, &blob).map_err(at(out))?;
+    Ok(blob)
 }

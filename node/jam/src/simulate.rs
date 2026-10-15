@@ -114,7 +114,7 @@ pub fn simulate(
     pages: Pages,
     batch: &Batch,
 ) -> Result<Simulation, Error> {
-    let payload = Work::Batch(batch.clone()).encode();
+    let payload = Work::encode_batch(batch);
     let arguments = runner.arguments(&payload, [0; 32]);
     let gas = batch.budget + defaults::refine_start(batch.inputs.len(), arguments.len());
     let recorder = Arc::new(Recorder {

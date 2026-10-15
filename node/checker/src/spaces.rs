@@ -12,7 +12,14 @@ use vos_wire::peer::NodeNumber;
 use crate::Random;
 
 /// How long a test of nodes in one process waits for them to settle.
-pub const IN_PROCESS_WAIT: Duration = Duration::from_secs(20);
+pub(crate) const IN_PROCESS_WAIT: Duration = Duration::from_secs(20);
+
+/// Wait until `done`, as long as a test of nodes in one process waits for
+/// them to settle.
+#[track_caller]
+pub fn wait_in_process(what: &str, done: impl FnMut() -> bool) {
+    crate::wait_until(what, IN_PROCESS_WAIT, done);
+}
 
 /// The key a node's first open at `dir` makes.
 fn node_key(dir: &Path, agent: &[u8]) -> [u8; 32] {

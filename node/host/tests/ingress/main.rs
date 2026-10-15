@@ -20,19 +20,19 @@ use std::time::Duration;
 use ed25519_dalek::SigningKey;
 use std::collections::HashMap;
 
-use vos_checker::calls::done;
-use vos_checker::hooks::{FailNextSync, Gate};
+use vos_checker::calls::{done, install_of, installed};
+use vos_checker::hooks::{FailNextSync, Gate, carries};
 use vos_checker::programs::Programs;
 use vos_checker::rounds::{ASKED, ROUNDS, Rounds, TOLD, Tour, TourMethods, signed_read};
-use vos_checker::spaces::IN_PROCESS_WAIT;
+use vos_checker::spaces::wait_in_process as wait_until;
 use vos_node::client::{self, Client, ClientError, Operator, Target};
 use vos_node::{ADMIN_TOKEN, Config, Hooks, Node};
 use vos_wire::abi::Refusal;
-use vos_wire::batch::{Batch, Input};
+use vos_wire::batch::Batch;
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Session, WorkflowId};
 use vos_wire::ingress::{
-    Call, Consistency, Install, MAX_WORKFLOW_WAIT_MS, Rejection, Response, WorkflowRead,
-    WorkflowStatus, workflow_read_horizon,
+    Call, Consistency, MAX_WORKFLOW_WAIT_MS, Rejection, Response, WorkflowRead, WorkflowStatus,
+    workflow_read_horizon,
 };
 use vos_wire::result::Outcome;
 use vos_wire::{Decode, Encode};
@@ -54,6 +54,11 @@ struct Served {
 }
 
 impl Served {
+    /// A node with no hooks.
+    fn plain() -> Self {
+        Self::start(Arc::new(vos_node::NoHooks))
+    }
+
     fn start(hooks: Arc<dyn Hooks>) -> Self {
         Self::start_with(hooks, |_| {})
     }
@@ -80,22 +85,8 @@ impl Served {
         let Ok(Response::Created(agent)) = operator.create_agent(Vec::new()) else {
             panic!("an agent")
         };
-        let install = Install {
-            instance: COUNTER,
-            elf: programs.counter_elf.clone(),
-            roles: Vec::new(),
-        };
-        let installed = operator.install(agent, &install).unwrap();
-        assert!(
-            matches!(
-                installed,
-                Response::Ran {
-                    outcome: Outcome::Done(_),
-                    ..
-                }
-            ),
-            "{installed:?}"
-        );
+        let install = install_of(COUNTER, &programs.counter_elf);
+        installed(operator.install(agent, &install).unwrap());
         let schema = vos_node::client::schema(&target, agent, COUNTER)
             .unwrap()
             .expect("an installed schema");
@@ -169,11 +160,6 @@ impl Served {
         let (_, body) = vos_node::client::post(&self.target, path, body).unwrap();
         Response::decode(&body).unwrap().0
     }
-}
-
-#[track_caller]
-fn wait_until(what: &str, done: impl FnMut() -> bool) {
-    vos_checker::wait_until(what, IN_PROCESS_WAIT, done);
 }
 
 /// The status line a raw request gets.

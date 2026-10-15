@@ -11,10 +11,12 @@
 //! starts while none has failed: the totals after each of its amounts, and
 //! its computations' digest.
 
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::SigningKey;
+use vos_node::client::signed_workflow_read;
 use vos_wire::Encode;
 use vos_wire::ids::{AgentId, InstanceId, MethodId, WorkflowId};
-use vos_wire::ingress::{Consistency, Install, WorkflowRead, workflow_message};
+use vos_wire::ingress::{Consistency, Install};
+use vos_wire::schema::Schema;
 
 /// The rounds instance at each agent whose tours start there, and which
 /// tallies their amounts.
@@ -36,8 +38,13 @@ pub struct TourMethods {
 }
 
 impl TourMethods {
-    pub fn of(rounds: &[u8]) -> Self {
-        let method = |name| crate::programs::method(rounds, name);
+    /// The rounds actor's methods, by their names in its `schema`.
+    pub fn of(schema: &Schema) -> Self {
+        let method = |name: &str| {
+            schema
+                .method_id(name)
+                .unwrap_or_else(|| panic!("no method {name}"))
+        };
         Self {
             tour: method("tour"),
             rewrite: method("rewrite"),
@@ -61,18 +68,14 @@ impl Rounds {
         let program = crate::programs::actor("rounds");
         Self {
             elf: crate::programs::package("rounds"),
-            methods: TourMethods::of(&program),
+            methods: TourMethods::of(&crate::programs::schema(&program)),
             program,
         }
     }
 
     /// An operator's install of it as `instance`.
     pub fn install(&self, instance: InstanceId) -> Install {
-        Install {
-            instance,
-            elf: self.elf.clone(),
-            roles: Vec::new(),
-        }
+        crate::calls::install_of(instance, &self.elf)
     }
 }
 
@@ -89,6 +92,18 @@ pub struct Tour {
 }
 
 impl Tour {
+    /// A tour asking and telling `other` `amounts`, each round sleeping
+    /// `nap` milliseconds of batch time, with little to compute.
+    pub fn light(other: AgentId, amounts: Vec<u64>, nap: u64) -> Self {
+        Self {
+            other,
+            amounts,
+            nap,
+            words: 64,
+            passes: 4,
+        }
+    }
+
     /// Its arguments as a request carries them: each field's encoding in
     /// turn.
     pub fn arguments(&self) -> Vec<u8> {
@@ -155,17 +170,7 @@ pub fn signed_read(
     workflow: WorkflowId,
     wait_ms: u64,
 ) -> Vec<u8> {
-    let public = key.verifying_key().to_bytes();
-    let message = workflow_message(identity, &public, not_after, consistency, workflow, wait_ms);
-    WorkflowRead {
-        key: public,
-        not_after,
-        consistency,
-        workflow,
-        wait_ms,
-        signature: key.sign(&message).to_bytes(),
-    }
-    .encode()
+    signed_workflow_read(identity, key, not_after, consistency, workflow, wait_ms).encode()
 }
 
 /// The tour request `request` of a touring client starts, asking and

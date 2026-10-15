@@ -25,11 +25,10 @@ impl Client {
         // The most any read showed.
         let mut seen = 0;
         let mut turn = u64::from(self.number);
-        let count = u64::from(nodes.count());
         while !done.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(20));
             turn += 1;
-            let at = 1 + (turn % count) as NodeNumber;
+            let at = super::node_at(turn, nodes.count());
             let (prefix, prefix_at) = {
                 let acked = self.acked.lock().unwrap();
                 (acked.prefix, acked.at)
@@ -51,7 +50,7 @@ impl Client {
                     // this one raises.
                     floor = floor.max(answered_at);
                     assert!(
-                        previous.is_forwarded_prefix(sent, value),
+                        previous.is_prefix(sent, value, true),
                         "client {}: its inbox at node {at} holds {value}, no prefix of what was forwarded",
                         self.number
                     );
@@ -92,7 +91,7 @@ impl Client {
             // the total of one. A forward leaves the total as it was, so
             // reads compare totals.
             assert!(
-                self.is_total_prefix(sent, value),
+                self.is_prefix(sent, value, false),
                 "client {}: read {value} at node {at}, no total of up to {sent} requests",
                 self.number
             );

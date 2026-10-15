@@ -157,7 +157,6 @@ mod tests {
         let (node, served) = canned(vec![
             sent(parameters),
             chunked(head),
-            sent(head),
             sent(request),
             sent(segments),
             sent(error),
@@ -173,19 +172,20 @@ mod tests {
                 max_report_elective_data: 49_152,
             }
         );
-        assert_eq!(node.head(false).unwrap(), ("aGVhZA==".into(), 9));
-        assert_eq!(node.request(1, &[2; 32], 3).unwrap(), Some(vec![7]));
+        let (head, slot) = node.finalized().unwrap();
+        assert_eq!((&*head, slot), ("aGVhZA==", 9));
+        assert_eq!(node.request(&head, 1, &[2; 32], 3).unwrap(), Some(vec![7]));
         let fetched = node.fetch(&[4; 32], &[0, 1]);
         assert!(fetched.is_err(), "a missing segment: {fetched:?}");
         let error = node.call("parameters", json!([])).unwrap_err();
         assert!(matches!(&error, Error::Node(said) if said.contains("Invalid params")));
         let calls = served.join().unwrap();
         assert_eq!(calls[0]["method"], "parameters");
-        assert_eq!(calls[1]["method"], "bestBlock");
-        assert_eq!(calls[3]["method"], "serviceRequest");
-        assert_eq!(calls[3]["params"][0], "aGVhZA==", "at the finalized block");
-        assert_eq!(calls[3]["params"][3], 3);
-        assert_eq!(calls[4]["params"][1], json!([0, 1]));
+        assert_eq!(calls[1]["method"], "finalizedBlock");
+        assert_eq!(calls[2]["method"], "serviceRequest");
+        assert_eq!(calls[2]["params"][0], "aGVhZA==", "at the finalized block");
+        assert_eq!(calls[2]["params"][3], 3);
+        assert_eq!(calls[3]["params"][1], json!([0, 1]));
     }
 
     #[test]

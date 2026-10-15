@@ -24,20 +24,16 @@ pub struct Derivation {
 
 impl Derivation {
     /// The derivation of package `elf`: its actor's program and each
-    /// attestable method's kernel, as version `transpiler` derived them,
-    /// each named by its hash. The one constructor of a VOS node's install
-    /// and of a JAM builder's, so the two agree.
-    pub fn new<'a>(
-        elf: &[u8],
-        actor: &[u8],
-        kernels: impl IntoIterator<Item = (MethodId, &'a [u8])>,
-        transpiler: u32,
-    ) -> Self {
+    /// attestable method's kernel, by the method's id, as version
+    /// `transpiler` derived them, each named by its hash. The one
+    /// constructor of a VOS node's install and of a JAM builder's, so the
+    /// two agree.
+    pub fn new(elf: &[u8], actor: &[u8], kernels: &[(u32, Vec<u8>)], transpiler: u32) -> Self {
         Self {
             program: ProgramHash::of(actor),
             kernels: kernels
-                .into_iter()
-                .map(|(method, kernel)| (method, ProgramHash::of(kernel)))
+                .iter()
+                .map(|(method, kernel)| (MethodId(*method), ProgramHash::of(kernel)))
                 .collect(),
             elf: crate::result::digest(elf),
             transpiler,

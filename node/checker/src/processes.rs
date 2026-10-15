@@ -25,8 +25,6 @@ use crate::spaces::{free_tcp_port, free_udp_port};
 use crate::{Log, Nodes, wait_until};
 use relay::Relay;
 
-pub use space::{converged, counter_agent, methods};
-
 /// How long the harness waits for what it waits on: a node to listen or
 /// to take its faults, a leader, an operator's command, a call's answer.
 pub const PROCESS_WAIT: Duration = Duration::from_secs(60);
@@ -162,6 +160,29 @@ pub fn first_run(vos: &Path, data: &Path, log: &Path) -> String {
 /// What a node logged to `log`, if anything.
 pub fn read_log(log: &Path) -> String {
     std::fs::read_to_string(log).unwrap_or_default()
+}
+
+/// A space file's text: a line for each of `nodes`, numbered from 1, of
+/// its key in hex, its peer address and its ingress URL.
+pub fn space_file<'a>(nodes: impl IntoIterator<Item = (&'a str, SocketAddr, &'a str)>) -> String {
+    nodes
+        .into_iter()
+        .zip(1..)
+        .map(|((key, peer, url), number)| format!("{number} {key} {peer} {url}\n"))
+        .collect()
+}
+
+/// Where the node at `url` is reached: pinned to its key, `key` in hex,
+/// over `tls`; else on a loopback address in the clear.
+pub fn target(url: &str, key: &str, tls: bool) -> Target {
+    let trust = if tls {
+        let mut pinned = [0; 32];
+        hex::decode_to_slice(key, &mut pinned).unwrap();
+        Trust::NodeKey(pinned)
+    } else {
+        Trust::Loopback
+    };
+    Target::new(url, trust).unwrap()
 }
 
 /// How the nodes run.
@@ -306,30 +327,14 @@ impl Processes {
                 .collect();
             let relay = Relay::start(&bound).expect("the relay starts");
             let scheme = if options.tls { "https" } else { "http" };
-            let text: String = (0..count)
-                .map(|at| {
-                    format!(
-                        "{} {} {} {scheme}://127.0.0.1:{}\n",
-                        at + 1,
-                        keys[at],
-                        relay.listed(at + 1),
-                        ingress[at]
-                    )
-                })
+            let urls: Vec<String> = ingress
+                .iter()
+                .map(|port| format!("{scheme}://127.0.0.1:{port}"))
                 .collect();
-            std::fs::write(dir.path().join("space"), text).unwrap();
+            let nodes = (0..count).map(|at| (&*keys[at], relay.listed(at + 1), &*urls[at]));
+            std::fs::write(dir.path().join("space"), space_file(nodes)).unwrap();
             let targets = (0..count)
-                .map(|at| {
-                    let url = format!("{scheme}://127.0.0.1:{}", ingress[at]);
-                    let trust = if options.tls {
-                        let mut key = [0; 32];
-                        hex::decode_to_slice(&keys[at], &mut key).unwrap();
-                        Trust::NodeKey(key)
-                    } else {
-                        Trust::Loopback
-                    };
-                    Target::new(&url, trust).unwrap()
-                })
+                .map(|at| target(&urls[at], &keys[at], options.tls))
                 .collect();
             let processes = Processes {
                 vos: vos.to_path_buf(),
@@ -531,12 +536,7 @@ impl Processes {
     /// is killed, then kill them (SIGKILL) and open each one's store.
     pub fn stop_all(&self) -> Vec<vos_node::store::Fjall> {
         for number in 1..=self.count {
-            let running = self.slot(number).running.lock().unwrap();
-            if let Some(pid) = running.as_ref().map(Running::pid) {
-                let _ = Command::new("kill")
-                    .args(["-STOP", &pid.to_string()])
-                    .status();
-            }
+            self.signal(number, "-STOP");
         }
         for number in 1..=self.count {
             self.end(number);

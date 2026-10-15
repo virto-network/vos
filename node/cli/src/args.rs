@@ -157,8 +157,8 @@ pub struct InstallArgs {
     #[arg(long)]
     pub elf: PathBuf,
     /// A role name's byte: `NAME=BYTE`.
-    #[arg(long = "role")]
-    pub roles: Vec<String>,
+    #[arg(long = "role", value_parser = named_role)]
+    pub roles: Vec<(Vec<u8>, u8)>,
 }
 
 #[derive(clap::Args)]
@@ -171,8 +171,8 @@ pub struct RoleArgs {
     #[arg(long)]
     pub principal: String,
     /// The role's byte, or `none` to revoke.
-    #[arg(long)]
-    pub role: String,
+    #[arg(long, value_parser = granted)]
+    pub role: Granted,
 }
 
 /// TLS on a node's ingress.
@@ -291,6 +291,40 @@ pub struct CallArgs {
     #[arg(long)]
     pub method: String,
     /// The arguments, SCALE-encoded, in hex.
-    #[arg(long, default_value = "")]
-    pub args: String,
+    #[arg(long, default_value = "", value_parser = hex_bytes)]
+    pub args: Hex,
+}
+
+/// The role a grant gives, or (`None`) its revocation.
+#[derive(Clone, Copy)]
+pub struct Granted(pub Option<u8>);
+
+/// Bytes given in hex.
+#[derive(Clone)]
+pub struct Hex(pub Vec<u8>);
+
+fn role_byte(byte: &str) -> Result<u8, String> {
+    byte.parse().map_err(|_| format!("a role byte: {byte}"))
+}
+
+/// `NAME=BYTE`: a role's name and its byte.
+fn named_role(pair: &str) -> Result<(Vec<u8>, u8), String> {
+    let (name, byte) = pair
+        .split_once('=')
+        .ok_or_else(|| format!("expected NAME=VALUE: {pair}"))?;
+    Ok((name.as_bytes().to_vec(), role_byte(byte)?))
+}
+
+/// A role's byte, or `none`.
+fn granted(text: &str) -> Result<Granted, String> {
+    match text {
+        "none" => Ok(Granted(None)),
+        byte => role_byte(byte).map(|byte| Granted(Some(byte))),
+    }
+}
+
+fn hex_bytes(text: &str) -> Result<Hex, String> {
+    hex::decode(text.trim())
+        .map(Hex)
+        .map_err(|error| error.to_string())
 }

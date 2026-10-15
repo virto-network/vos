@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use vos_checker::calls::done;
+use vos_checker::hooks::Holds;
 use vos_net::Class;
 use vos_node::blobs::Blobs;
 use vos_node::store::{BlobRef, EntryKind, Fjall, LARGE_RESULT};
@@ -19,7 +20,7 @@ use vos_wire::peer::NodeNumber;
 use vos_wire::result::Outcome;
 use vos_wire::{Decode, Encode};
 
-use crate::common::{Cluster, HoldRefines, compacting, log_start, wait_until};
+use crate::common::{Cluster, compacting, log_start, wait_until};
 
 /// Rows each call writes, of [`ROW`] bytes: within a step's 256 KiB.
 const ROWS: u32 = 4;
@@ -30,7 +31,7 @@ const CALLS: u64 = 10;
 /// Three nodes whose refines `hooks` can hold, each tuned further by
 /// `tuning`.
 fn cluster(
-    hooks: &Arc<HoldRefines>,
+    hooks: &Arc<Holds>,
     tuning: impl Fn(NodeNumber, &mut vos_node::Config) + Send + Sync + 'static,
 ) -> Cluster {
     let hooks = Arc::clone(hooks);
@@ -43,11 +44,11 @@ fn cluster(
 /// Alice's request filling the counter's rows, at `sequence` of the test's
 /// session.
 fn fill(cluster: &Cluster, sequence: u64) -> Request {
-    Request {
-        method: cluster.programs.method("fill"),
-        arguments: (ROWS, ROW).encode(),
-        ..cluster.request(sequence, 0)
-    }
+    cluster.request_of(
+        sequence,
+        cluster.programs.method("fill"),
+        (ROWS, ROW).encode(),
+    )
 }
 
 #[track_caller]
@@ -63,21 +64,23 @@ fn filled(reply: Result<Reply, CallError>) {
 /// passes 2 MiB. The index of each batch's entry.
 fn two_batches(
     cluster: &Cluster,
-    hooks: &HoldRefines,
+    hooks: &Holds,
     leader: NodeNumber,
     agent: AgentId,
     first: u64,
 ) -> Vec<u64> {
     let node = cluster.node(leader);
     let before = node.applied(agent).unwrap();
-    hooks.arm();
-    let held = hooks.held();
+    let closed = hooks.refines.close();
+    let held = hooks.refines.reached();
     let alone = node.call(agent, fill(cluster, first));
-    wait_until("the first batch's refine is held", || hooks.held() > held);
+    wait_until("the first batch's refine is held", || {
+        hooks.refines.reached() > held
+    });
     let together: Vec<_> = (first + 1..=first + CALLS)
         .map(|sequence| node.call(agent, fill(cluster, sequence)))
         .collect();
-    hooks.release();
+    drop(closed);
     filled(smol::block_on(alone));
     for call in together {
         filled(smol::block_on(call));
@@ -120,7 +123,7 @@ fn blob_at(node: &Node, agent: AgentId, index: u64) -> BlobRef {
 
 #[test]
 fn a_large_result_travels_as_a_blob_and_applies_on_every_replica() {
-    let hooks = Arc::new(HoldRefines::default());
+    let hooks = Arc::new(Holds::default());
     let cluster = cluster(&hooks, |_, _| {});
     let agent = cluster.counter_agent(&[1, 2, 3]);
     let leader = cluster.leader(agent);
@@ -154,13 +157,11 @@ fn a_large_result_travels_as_a_blob_and_applies_on_every_replica() {
 /// from the log, fetching their blobs.
 #[test]
 fn a_lagging_follower_catches_up_through_a_large_result() {
-    let hooks = Arc::new(HoldRefines::default());
+    let hooks = Arc::new(Holds::default());
     let cluster = cluster(&hooks, |_, _| {});
     let agent = cluster.counter_agent(&[1, 2, 3]);
     let (leader, follower) = cluster.leader_and_follower(agent);
-    wait_until("the follower applies the install", || {
-        cluster.node(follower).applied(agent) >= cluster.node(leader).applied(agent)
-    });
+    cluster.caught_up(follower, agent, leader);
     cluster.hub.isolate(follower);
     let indices = two_batches(&cluster, &hooks, leader, agent, 1);
     let lagging = cluster.node(follower);
@@ -178,7 +179,7 @@ fn a_lagging_follower_catches_up_through_a_large_result() {
 /// that horizon, not the store's hour.
 #[test]
 fn a_large_results_blob_goes_once_the_log_is_compacted_past_it() {
-    let hooks = Arc::new(HoldRefines::default());
+    let hooks = Arc::new(Holds::default());
     let cluster = cluster(&hooks, |number, config| {
         compacting(number, config);
         config.compact_every = 32;
@@ -223,7 +224,7 @@ fn a_large_results_blob_goes_once_the_log_is_compacted_past_it() {
 /// keeps counts them too.
 #[test]
 fn large_results_make_a_compaction_due_by_their_blobs() {
-    let hooks = Arc::new(HoldRefines::default());
+    let hooks = Arc::new(Holds::default());
     let cluster = cluster(&hooks, |_, config| {
         config.compact_every = 1 << 20;
         config.compact_bytes = 2 << 20;
@@ -287,12 +288,7 @@ impl Hooks for Serving {
 
 /// Three nodes, each with its own [`Serving`].
 fn serving_cluster() -> (Cluster, Vec<Arc<Serving>>) {
-    let hooks: Vec<Arc<Serving>> = (0..3).map(|_| Arc::default()).collect();
-    let each = hooks.clone();
-    let cluster = Cluster::tuned(3, move |number, config| {
-        config.hooks = each[usize::from(number) - 1].clone();
-    });
-    (cluster, hooks)
+    Cluster::with_hooks(3)
 }
 
 /// Each large result `node` holds of `agent` past `after`, by index.
@@ -428,12 +424,7 @@ impl Hooks for LoseBlobs {
 
 /// Three nodes, each with its own [`LoseBlobs`].
 fn losing_cluster() -> (Cluster, Vec<Arc<LoseBlobs>>) {
-    let hooks: Vec<Arc<LoseBlobs>> = (0..3).map(|_| Arc::default()).collect();
-    let each = hooks.clone();
-    let cluster = Cluster::tuned(3, move |number, config| {
-        config.hooks = each[usize::from(number) - 1].clone();
-    });
-    (cluster, hooks)
+    Cluster::with_hooks(3)
 }
 
 /// A large result proposed at `leader`, which `follower` finds its blob
@@ -509,9 +500,7 @@ fn a_replica_that_lost_a_committed_entrys_blob_halts_and_fetches_it_again() {
     let (mut cluster, hooks) = losing_cluster();
     let agent = cluster.counter_agent(&[1, 2, 3]);
     let (leader, follower) = cluster.leader_and_follower(agent);
-    wait_until("the follower applies the install", || {
-        cluster.node(follower).applied(agent) >= cluster.node(leader).applied(agent)
-    });
+    cluster.caught_up(follower, agent, leader);
     let (index, blob) = halted_on_a_large_result(&cluster, &hooks, leader, follower, agent);
     assert_eq!(done(cluster.increment(leader, agent, 2, 1)), 1);
     cluster.stop(follower);

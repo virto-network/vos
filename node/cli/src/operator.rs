@@ -4,7 +4,7 @@
 use vos_node::client::Operator;
 use vos_node::{ADMIN_TOKEN, NODE_KEY};
 use vos_wire::Decode;
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal};
+use vos_wire::ids::{AgentId, InstanceId, Principal};
 use vos_wire::ingress::{Install, Response};
 use vos_wire::records::Derivation;
 use vos_wire::result::Outcome;
@@ -66,18 +66,16 @@ impl InstallArgs {
         let derived = vos_pvm_compiler::derive(&elf).map_err(at(&self.elf))?;
         let schema = Schema::read(&derived.schema)
             .map_err(|error| format!("{}: its schema: {error:?}", self.elf.display()))?;
-        let roles = self
-            .roles
-            .iter()
-            .map(|pair| {
-                let (name, byte) = split(pair)?;
-                Ok((name.as_bytes().to_vec(), role_byte(byte)?))
-            })
-            .collect::<Result<Vec<_>, String>>()?;
+        let local = Derivation::new(
+            &elf,
+            &derived.actor,
+            &derived.kernels,
+            derived.transpiler_version,
+        );
         let install = Install {
             instance: InstanceId(self.instance),
-            elf: elf.clone(),
-            roles,
+            elf,
+            roles: self.roles,
         };
         let answer = operator_of(&self.operator)?
             .install(AgentId(self.agent), &install)
@@ -92,15 +90,6 @@ impl InstallArgs {
         let derivation = Derivation::decode(reply)
             .map(|(derivation, _)| derivation)
             .map_err(|_| format!("an install answered {}", hex::encode(reply)))?;
-        let local = Derivation::new(
-            &elf,
-            &derived.actor,
-            derived
-                .kernels
-                .iter()
-                .map(|(method, kernel)| (MethodId(*method), kernel.as_slice())),
-            derived.transpiler_version,
-        );
         if local != derivation {
             eprintln!(
                 "warning: the node derived other programs than this vos, with transpiler {} \
@@ -136,19 +125,11 @@ fn derived_lines(derivation: &Derivation, schema: &Schema) -> String {
 impl RoleArgs {
     pub fn run(self) -> Result<(), String> {
         let key = key_bytes(&self.principal)?;
-        let role = match self.role.as_str() {
-            "none" => None,
-            byte => Some(role_byte(byte)?),
-        };
         let answer = operator_of(&self.operator)?
-            .grant(AgentId(self.agent), Principal::Client(key), role)
+            .grant(AgentId(self.agent), Principal::Client(key), self.role.0)
             .map_err(failed)?;
         print_admin_answer(&answer)
     }
-}
-
-fn role_byte(byte: &str) -> Result<u8, String> {
-    byte.parse().map_err(|_| format!("a role byte: {byte}"))
 }
 
 fn operator_of(args: &OperatorArgs) -> Result<Operator, String> {
@@ -157,9 +138,4 @@ fn operator_of(args: &OperatorArgs) -> Result<Operator, String> {
     // On the node's host, its data directory holds its key.
     let target = args.node.target_or(Some(&args.data.join(NODE_KEY)))?;
     Ok(Operator::new(&target, &token))
-}
-
-fn split(pair: &str) -> Result<(&str, &str), String> {
-    pair.split_once('=')
-        .ok_or_else(|| format!("expected NAME=VALUE: {pair}"))
 }

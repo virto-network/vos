@@ -315,7 +315,7 @@ fn the_builder_takes_a_package_that_landed_first() {
     let mut second = Builder::new(Store::temporary().unwrap(), POLKAJAM_REFINE_GAS).unwrap();
     let landed = first.chain.landed().unwrap();
     second
-        .resync(&first.chain, &landed)
+        .resync(&first.chain.da, &landed)
         .expect("one package behind");
     assert_eq!(second.store.root().unwrap(), landed.root);
     // The second lands a package of Bob's.
@@ -356,7 +356,10 @@ fn the_builder_takes_a_package_that_landed_first() {
     first.run(vec![third]);
     let before = second.store.root().unwrap();
     let landed = first.chain.landed().unwrap();
-    assert_eq!(second.resync(&first.chain, &landed), Err(Error::Diverged));
+    assert_eq!(
+        second.resync(&first.chain.da, &landed),
+        Err(Error::Diverged)
+    );
     assert_eq!(second.store.root().unwrap(), before);
 }
 
@@ -394,7 +397,7 @@ fn the_builder_fits_a_batch_to_a_packages_segments() {
     );
     let refined = driven
         .chain
-        .refine(&driven.runner, &prepared.package, vec![], prepared.gas)
+        .refine(&driven.runner, &prepared.payload, vec![], prepared.gas)
         .expect("the package refines within its gas");
     assert!(refined.gas_used <= prepared.gas);
     println!(

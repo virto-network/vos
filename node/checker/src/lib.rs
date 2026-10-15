@@ -30,16 +30,26 @@ pub mod spaces;
 
 pub use vos_testkit::programs;
 
-pub use client::Client;
 pub use client::tours::{Touring, check_tallies};
+pub use client::{Client, clients};
 pub use model::{ANSWERED, ATTEMPT, COUNTER, INBOX, Log, Methods, Mode, Nodes, SECOND};
 
 use std::time::{Duration, Instant};
+
+use vos_node::store::Fjall;
+use vos_wire::Decode;
+use vos_wire::ids::AgentId;
+use vos_wire::records::unstored;
 
 /// A small seeded generator, so a failing run can be run again.
 pub struct Random(pub u64);
 
 impl Random {
+    /// The generator from `seed`, made odd: a state of zero never moves.
+    pub fn new(seed: u64) -> Self {
+        Self(seed | 1)
+    }
+
     pub fn draw(&mut self) -> u64 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;
@@ -52,14 +62,41 @@ impl Random {
     }
 }
 
-/// Wait until `done`, checking every 5 ms, for at most `within`.
-#[track_caller]
-pub fn wait_until(what: &str, within: Duration, mut done: impl FnMut() -> bool) {
+/// Whether `done` holds within `within`, checking every 5 ms.
+pub fn poll(within: Duration, mut done: impl FnMut() -> bool) -> bool {
     let until = Instant::now() + within;
-    while !done() {
-        assert!(Instant::now() < until, "timed out: {what}");
+    loop {
+        if done() {
+            return true;
+        }
+        if Instant::now() >= until {
+            return false;
+        }
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+/// Wait until `done`, checking every 5 ms, for at most `within`.
+#[track_caller]
+pub fn wait_until(what: &str, within: Duration, done: impl FnMut() -> bool) {
+    assert!(poll(within, done), "timed out: {what}");
+}
+
+/// A value of `agent`'s applied state in `store`, decoded: `None` while
+/// it holds none.
+pub fn applied<T: Decode>(store: &Fjall, agent: AgentId, key: &[u8]) -> Option<T> {
+    let bytes = store.snapshot().get(agent, key).unwrap()?;
+    Some(
+        T::decode(unstored(&bytes).expect("a stored value"))
+            .unwrap()
+            .0,
+    )
+}
+
+/// A pair's mark, or any count `agent`'s applied state in `store` keeps:
+/// 0 while it holds none.
+pub fn mark(store: &Fjall, agent: AgentId, key: &[u8]) -> u64 {
+    applied(store, agent, key).unwrap_or(0)
 }
 
 /// The median and the 99th percentile of `samples`, by nearest rank, in

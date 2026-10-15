@@ -6,12 +6,11 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use vos_checker::calls::done;
+use vos_checker::calls::{Ran, done};
 use vos_checker::hooks::{FailNextSync, Gate};
-use vos_node::{CallError, Reply};
+use vos_node::CallError;
 use vos_wire::ids::AgentId;
 use vos_wire::peer::NodeNumber;
-use vos_wire::result::Outcome;
 
 use crate::common::{COUNTER, Cluster, wait_until};
 
@@ -51,11 +50,7 @@ fn terms(cluster: &Cluster, agents: &[AgentId]) -> Vec<u64> {
 /// while idle elects a leader elsewhere.
 #[test]
 fn a_flush_failing_outside_any_log_halts_the_node() {
-    let hooks: Vec<Arc<FailNextSync>> = (0..3).map(|_| Arc::default()).collect();
-    let each = hooks.clone();
-    let cluster = Cluster::tuned(3, move |number, config| {
-        config.hooks = each[usize::from(number) - 1].clone();
-    });
+    let (cluster, hooks) = Cluster::with_hooks::<FailNextSync>(3);
     let agent = cluster.counter_agent(&[1, 2, 3]);
     let leader = cluster.leader(agent);
     hooks[usize::from(leader) - 1].arm();
@@ -208,25 +203,18 @@ fn a_restarted_follower_catches_up_its_quiet_groups() {
     let follower = (1..=3)
         .min_by_key(|number| leaders.iter().filter(|leader| *leader == number).count())
         .unwrap();
-    let installed: Vec<AgentId> = installed
+    let led: Vec<(AgentId, NodeNumber)> = installed
         .iter()
-        .zip(&leaders)
-        .filter(|(_, leader)| **leader != follower)
-        .map(|(agent, _)| *agent)
+        .copied()
+        .zip(leaders)
+        .filter(|(_, leader)| *leader != follower)
         .collect();
-    let leaders: Vec<NodeNumber> = leaders
-        .into_iter()
-        .filter(|leader| *leader != follower)
-        .collect();
-    let installed = &installed[..];
     cluster.stop(follower);
-    for (&agent, &leader) in installed.iter().zip(&leaders) {
-        if leader != follower {
-            assert_eq!(done(cluster.increment(leader, agent, 1, 2)), 2);
-        }
+    for &(agent, leader) in &led {
+        assert_eq!(done(cluster.increment(leader, agent, 1, 2)), 2);
     }
     cluster.start(follower);
-    for &agent in installed {
+    for &(agent, _) in &led {
         cluster.converged(agent);
     }
 }
@@ -270,17 +258,15 @@ fn the_groups_of_a_node_whose_writer_stalls_elect_elsewhere() {
         cluster.install(agent);
     }
     // Node 1 leads some; one of them takes a call its writer holds.
-    let led: Vec<AgentId> = loop {
-        let led: Vec<AgentId> = agents
+    let mut led = Vec::new();
+    wait_until("node 1 leads some", || {
+        led = agents
             .iter()
             .copied()
             .filter(|&agent| cluster.leader(agent) == 1)
             .collect();
-        if !led.is_empty() {
-            break led;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    };
+        !led.is_empty()
+    });
     std::thread::scope(|scope| {
         // Inside the scope: a failure opens it before the scope waits.
         let closed = commits.close();
@@ -340,7 +326,7 @@ fn an_install_at_a_stalled_leader_times_out() {
         let leader = cluster.node(cluster.leader(agent));
         let installed =
             smol::block_on(leader.install(agent, COUNTER, &cluster.programs.counter_elf, vec![]));
-        matches!(installed, Ok(Reply::Ran(Outcome::Done(_))))
+        installed.ran()
     });
     let leader = cluster.leader(agent);
     assert_eq!(done(cluster.increment(leader, agent, 1, 2)), 2);

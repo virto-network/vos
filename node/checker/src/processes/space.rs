@@ -8,6 +8,7 @@ use vos_wire::ingress::{Install, ReplicaStatus, Response};
 use vos_wire::peer::NodeNumber;
 
 use super::{PROCESS_WAIT, Processes};
+use crate::calls::install_of;
 use crate::programs::package;
 use crate::{Methods, wait_until};
 
@@ -40,11 +41,7 @@ impl Processes {
     ) -> AgentId {
         let installs: Vec<Install> = instances
             .iter()
-            .map(|instance| Install {
-                instance: *instance,
-                elf: elf.to_vec(),
-                roles: Vec::new(),
-            })
+            .map(|instance| install_of(*instance, elf))
             .collect();
         self.agent_installing(replicas, &installs)
     }
@@ -75,6 +72,19 @@ impl Processes {
         agent
     }
 
+    /// Wait until a node other than `deposed` leads `agent`, at a term
+    /// past `after`.
+    pub fn led_elsewhere(&self, agent: AgentId, deposed: usize, after: u64) {
+        wait_until("another node leads", PROCESS_WAIT, || {
+            (1..=self.count)
+                .filter(|number| *number != deposed)
+                .any(|number| {
+                    self.status(number, agent)
+                        .is_some_and(|status| status.leads && status.term > after)
+                })
+        });
+    }
+
     /// Agent `agent`'s identity, the hash of its creation record.
     pub fn identity(&self, agent: AgentId) -> [u8; 32] {
         let mut identity = None;
@@ -91,59 +101,51 @@ impl Processes {
         });
         identity.unwrap()
     }
-}
 
-/// The counter's methods, by its schema at `agent`'s `instance`.
-pub fn methods(processes: &Processes, agent: AgentId, instance: InstanceId) -> Methods {
-    let mut schema = None;
-    wait_until("the schema is served", PROCESS_WAIT, || {
-        schema = (1..=processes.count)
-            .filter(|number| processes.is_running(*number))
-            .find_map(|number| {
-                vos_node::client::schema(processes.target(number), agent, instance)
-                    .ok()
-                    .flatten()
-            });
-        schema.is_some()
-    });
-    let schema = schema.unwrap();
-    let method = |name: &str| {
-        schema
-            .method_id(name)
-            .unwrap_or_else(|| panic!("no method {name}"))
-    };
-    Methods {
-        increment: method("increment"),
-        value: method("value"),
-        forward: method("forward"),
+    /// The counter's methods, by its schema at `agent`'s `instance`, once
+    /// a running node serves it.
+    pub fn methods(&self, agent: AgentId, instance: InstanceId) -> Methods {
+        let mut schema = None;
+        wait_until("the schema is served", PROCESS_WAIT, || {
+            schema = (1..=self.count)
+                .filter(|number| self.is_running(*number))
+                .find_map(|number| {
+                    vos_node::client::schema(self.target(number), agent, instance)
+                        .ok()
+                        .flatten()
+                });
+            schema.is_some()
+        });
+        Methods::of(&schema.unwrap())
     }
-}
 
-/// An agent created on nodes 1 to 3, with the test counter installed as
-/// `instance`, through whichever node takes the operator's commands.
-pub fn counter_agent(processes: &Processes, instance: InstanceId) -> AgentId {
-    processes.agent_with(vec![1, 2, 3], &package("counter"), &[instance])
-}
+    /// An agent created on nodes 1 to 3, with the test counter installed
+    /// as `instance`, through whichever node takes the operator's commands.
+    pub fn counter_agent(&self, instance: InstanceId) -> AgentId {
+        self.agent_with(vec![1, 2, 3], &package("counter"), &[instance])
+    }
 
-/// Wait until the three replicas of `agent` applied through the commit
-/// of its leader at the highest term: their statuses, read at each node.
-pub fn converged(processes: &Processes, agent: AgentId) {
-    wait_until(
-        "every replica applies through the commit",
-        PROCESS_WAIT,
-        || {
-            let statuses: Vec<ReplicaStatus> = (1..=processes.count)
-                .filter_map(|number| processes.status(number, agent))
-                .collect();
-            let Some(commit) = statuses
-                .iter()
-                .filter(|status| status.leads)
-                .max_by_key(|status| status.term)
-                .map(|status| status.commit)
-            else {
-                return false;
-            };
-            statuses.len() == 3 && statuses.iter().all(|status| status.applied >= commit)
-        },
-    );
+    /// Wait until the three replicas of `agent` applied through the commit
+    /// of its leader at the highest term: their statuses, read at each
+    /// node.
+    pub fn converged(&self, agent: AgentId) {
+        wait_until(
+            "every replica applies through the commit",
+            PROCESS_WAIT,
+            || {
+                let statuses: Vec<ReplicaStatus> = (1..=self.count)
+                    .filter_map(|number| self.status(number, agent))
+                    .collect();
+                let Some(commit) = statuses
+                    .iter()
+                    .filter(|status| status.leads)
+                    .max_by_key(|status| status.term)
+                    .map(|status| status.commit)
+                else {
+                    return false;
+                };
+                statuses.len() == 3 && statuses.iter().all(|status| status.applied >= commit)
+            },
+        );
+    }
 }

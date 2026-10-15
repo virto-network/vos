@@ -268,6 +268,10 @@ impl Relay {
         })
     }
 
+    fn faults(&self) -> std::sync::MutexGuard<'_, Faults> {
+        self.shared.faults.lock().unwrap()
+    }
+
     /// The address peers dial node `number` at.
     pub fn listed(&self, number: usize) -> SocketAddr {
         self.listed[number - 1]
@@ -276,23 +280,17 @@ impl Relay {
     /// Lose every datagram of the connection `dialer` dialed to `peer`,
     /// both ways.
     pub fn cut_connection(&self, dialer: usize, peer: usize) {
-        let mut faults = self.shared.faults.lock().unwrap();
-        faults.cut_connections.insert((dialer, peer));
+        self.faults().cut_connections.insert((dialer, peer));
     }
 
     /// Lose every datagram node `from` sends node `to`.
     pub fn cut_link(&self, from: usize, to: usize) {
-        self.shared
-            .faults
-            .lock()
-            .unwrap()
-            .cut_links
-            .insert((from, to));
+        self.faults().cut_links.insert((from, to));
     }
 
     /// Cut node `number` off from every other, both ways.
-    pub fn isolate(&self, number: usize, count: usize) {
-        for other in (1..=count).filter(|other| *other != number) {
+    pub fn isolate(&self, number: usize) {
+        for other in (1..=self.listed.len()).filter(|other| *other != number) {
             self.cut_link(number, other);
             self.cut_link(other, number);
         }
@@ -300,17 +298,12 @@ impl Relay {
 
     /// Thin or delay what node `from` sends node `to`.
     pub fn set_link(&self, from: usize, to: usize, link: Link) {
-        self.shared
-            .faults
-            .lock()
-            .unwrap()
-            .links
-            .insert((from, to), link);
+        self.faults().links.insert((from, to), link);
     }
 
     /// Every link and connection restored.
     pub fn heal(&self) {
-        let mut faults = self.shared.faults.lock().unwrap();
+        let mut faults = self.faults();
         faults.cut_connections.clear();
         faults.cut_links.clear();
         faults.links.clear();

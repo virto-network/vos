@@ -1,10 +1,13 @@
 //! Hooks a test gives a node: a gate that holds what passes it, its
-//! commits by default, and a sync that fails once.
+//! commits by default; a gate for its refines and another for its commits;
+//! a sync that fails once; and the batches that carry an input.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 
 use vos_node::Hooks;
+use vos_wire::batch::{Batch, Body, Input, Message};
+use vos_wire::ids::AgentId;
 
 /// Holds whoever passes while it is closed, counting them. As a node's
 /// hooks, it holds the node's commits.
@@ -58,6 +61,40 @@ impl Drop for Closed<'_> {
     fn drop(&mut self) {
         self.0.open();
     }
+}
+
+/// Holds a node's refines at one gate and its commits at the other, each
+/// while it is closed.
+#[derive(Default)]
+pub struct Holds {
+    pub refines: Gate,
+    pub commits: Gate,
+}
+
+impl Hooks for Holds {
+    fn fail_refine(&self, _: AgentId, _: &Batch) -> bool {
+        self.refines.pass();
+        false
+    }
+
+    fn before_commit(&self) {
+        self.commits.pass();
+    }
+}
+
+/// Whether `batch` holds an input carrying `arguments`: a client's
+/// request, or another agent's call.
+pub fn carries(batch: &Batch, arguments: &[u8]) -> bool {
+    batch.inputs.iter().any(|input| match input {
+        Input::Request(request) => request.arguments == arguments,
+        Input::Message(Message {
+            body: Body::Call {
+                arguments: called, ..
+            },
+            ..
+        }) => called == arguments,
+        _ => false,
+    })
 }
 
 /// Fails the sync of the next synced flush once armed, as a failed fsync

@@ -8,7 +8,7 @@ use super::*;
 /// expired session is gone once the next call is answered.
 #[test]
 fn a_busy_leader_sweeps_in_its_batches() {
-    let served = Served::start(Arc::new(vos_node::NoHooks));
+    let served = Served::plain();
     let start = served.at_bucket_start();
     let mut first = served.client(1);
     let mut second = served.client(2);
@@ -29,7 +29,7 @@ fn a_busy_leader_sweeps_in_its_batches() {
 
 #[test]
 fn pipelined_requests_recover_their_lost_replies() {
-    let served = Served::start(Arc::new(vos_node::NoHooks));
+    let served = Served::plain();
     let client = served.client(1);
     let address: SocketAddr = served.base.trim_start_matches("http://").parse().unwrap();
     let mut stream = TcpStream::connect(address).unwrap();
@@ -96,10 +96,7 @@ struct GatedPoison {
 
 impl Hooks for GatedPoison {
     fn fail_refine(&self, _: AgentId, batch: &Batch) -> bool {
-        let poisoned = batch.inputs.iter().any(
-            |input| matches!(input, Input::Request(request) if request.arguments == self.poison),
-        );
-        if !poisoned || !self.armed.load(Ordering::SeqCst) {
+        if !carries(batch, &self.poison) || !self.armed.load(Ordering::SeqCst) {
             return false;
         }
         self.refines.pass();
@@ -157,7 +154,7 @@ fn a_request_not_consumed_is_resent_with_its_sequence() {
 
 #[test]
 fn bodies_past_the_limit_or_without_a_length_are_refused_with_a_reason() {
-    let served = Served::start(Arc::new(vos_node::NoHooks));
+    let served = Served::plain();
     let calls = format!("/agents/{}/calls", served.agent.0);
     let large = format!("POST {calls} HTTP/1.1\r\nContent-Length: 10000000\r\n\r\n");
     assert_eq!(

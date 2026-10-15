@@ -3,14 +3,13 @@
 
 use std::time::Duration;
 
-use ed25519_dalek::Signer;
 use vos_wire::Encode;
 use vos_wire::abi::Refusal;
 use vos_wire::defaults;
 use vos_wire::ids::{AgentId, InstanceId, MethodId};
-use vos_wire::ingress::{Call, Contact, Rejection, Response, call_message};
+use vos_wire::ingress::{Contact, Rejection, Response};
 
-use super::{Client, ClientError, Http, decode_answer};
+use super::{Client, ClientError, Http, decode_answer, signed_call};
 
 /// What became of a call whose fate was unknown, once its session was
 /// refused.
@@ -233,15 +232,15 @@ impl Client {
     ) -> Result<Vec<u8>, ClientError> {
         let identity = self.identity(agent)?;
         let session = self.session(agent);
-        let message = call_message(&identity, &session, sequence, instance, method, arguments);
-        Ok(Call {
+        Ok(signed_call(
+            &identity,
+            &self.key,
             session,
             sequence,
             instance,
             method,
-            arguments: arguments.to_vec(),
-            signature: self.key.sign(&message).to_bytes(),
-        }
+            arguments.to_vec(),
+        )
         .encode())
     }
 }

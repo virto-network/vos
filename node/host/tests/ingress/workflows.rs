@@ -20,17 +20,7 @@ impl Served {
         };
         let rounds = Rounds::load();
         for (agent, instance) in [(other, ASKED), (other, TOLD), (self.agent, ROUNDS)] {
-            let installed = operator.install(agent, &rounds.install(instance)).unwrap();
-            assert!(
-                matches!(
-                    installed,
-                    Response::Ran {
-                        outcome: Outcome::Done(_),
-                        ..
-                    }
-                ),
-                "{installed:?}"
-            );
+            installed(operator.install(agent, &rounds.install(instance)).unwrap());
         }
         Tours {
             other,
@@ -41,13 +31,7 @@ impl Served {
     /// A tour of one round that then sleeps ten minutes of batch time,
     /// started as `client`, once it sleeps: its id.
     fn napping(&self, client: &mut Client, tours: &Tours) -> WorkflowId {
-        let tour = Tour {
-            other: tours.other,
-            amounts: vec![7],
-            nap: 600_000,
-            words: 64,
-            passes: 4,
-        };
+        let tour = Tour::light(tours.other, vec![7], 600_000);
         let workflow = self.start_tour(client, tours, &tour);
         wait_until("the tour sleeps", || {
             matches!(
@@ -91,16 +75,10 @@ fn status(answer: Response) -> WorkflowStatus {
 /// workflow has, read nothing, at once.
 #[test]
 fn a_started_workflows_owner_reads_its_result_by_its_id() {
-    let served = Served::start(Arc::new(vos_node::NoHooks));
+    let served = Served::plain();
     let tours = served.tours();
     let mut client = served.client(1);
-    let tour = Tour {
-        other: tours.other,
-        amounts: vec![3, 4, 5],
-        nap: 0,
-        words: 64,
-        passes: 4,
-    };
+    let tour = Tour::light(tours.other, vec![3, 4, 5], 0);
     let workflow = served.start_tour(&mut client, &tours, &tour);
     assert_eq!(
         status(
@@ -168,16 +146,10 @@ fn a_started_workflows_owner_reads_its_result_by_its_id() {
 /// time.
 #[test]
 fn a_read_waits_for_its_workflow_within_its_bound() {
-    let served = Served::start(Arc::new(vos_node::NoHooks));
+    let served = Served::plain();
     let tours = served.tours();
     let mut client = served.client(1);
-    let tour = Tour {
-        other: tours.other,
-        amounts: vec![7],
-        nap: 600_000,
-        words: 64,
-        passes: 4,
-    };
+    let tour = Tour::light(tours.other, vec![7], 600_000);
     let workflow = served.start_tour(&mut client, &tours, &tour);
     let asked = std::time::Instant::now();
     let sleeping = loop {
@@ -316,7 +288,7 @@ fn reads_wait_within_the_nodes_bounds() {
 /// bound.
 #[test]
 fn a_read_waiting_ends_when_its_node_stops() {
-    let served = Served::start(Arc::new(vos_node::NoHooks));
+    let served = Served::plain();
     let tours = served.tours();
     let mut client = served.client(1);
     let workflow = served.napping(&mut client, &tours);
@@ -347,16 +319,10 @@ fn a_read_waiting_ends_when_its_node_stops() {
 /// collected: its owner reads it unknown, as a stranger does.
 #[test]
 fn a_collected_workflow_reads_unknown() {
-    let served = Served::start(Arc::new(vos_node::NoHooks));
+    let served = Served::plain();
     let tours = served.tours();
     let mut client = served.client(1);
-    let tour = Tour {
-        other: tours.other,
-        amounts: vec![2],
-        nap: 0,
-        words: 64,
-        passes: 4,
-    };
+    let tour = Tour::light(tours.other, vec![2], 0);
     let workflow = served.start_tour(&mut client, &tours, &tour);
     let ended = client
         .workflow(served.agent, workflow, Duration::from_secs(20))

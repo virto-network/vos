@@ -29,6 +29,16 @@ pub enum Work {
 }
 
 impl Work {
+    /// `Work::Batch(batch)`, encoded, `batch` neither moved nor copied.
+    pub fn encode_batch(batch: &Batch) -> Vec<u8> {
+        tagged(0, batch)
+    }
+
+    /// `Work::Package(package)`, encoded, as [`Work::encode_batch`].
+    pub fn encode_package(package: &crate::package::Package) -> Vec<u8> {
+        tagged(2, package)
+    }
+
     /// The batch it runs, if any.
     pub fn batch(&self) -> Option<&Batch> {
         match self {
@@ -37,6 +47,13 @@ impl Work {
             Work::Query(_) => None,
         }
     }
+}
+
+/// A variant of index `index`, encoded with its field `value`.
+fn tagged(index: u8, value: &impl Encode) -> Vec<u8> {
+    let mut bytes = Vec::from([index]);
+    value.encode_to(&mut bytes);
+    bytes
 }
 
 /// A `&self` handler on applied state, outside the log. Its time and seed

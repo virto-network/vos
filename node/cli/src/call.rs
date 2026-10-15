@@ -9,7 +9,7 @@ use ed25519_dalek::SigningKey;
 use vos_node::client::{Client, ClientError};
 use vos_wire::Encode;
 use vos_wire::abi::Refusal;
-use vos_wire::ids::{AgentId, InstanceId, WorkflowId};
+use vos_wire::ids::{AgentId, InstanceId, MethodId, WorkflowId};
 use vos_wire::ingress::{Consistency, Response, WorkflowStatus};
 use vos_wire::result::Outcome;
 
@@ -45,76 +45,124 @@ fn keep(client: &Client, mut kept: Kept, key: &Path) -> Result<(), String> {
     kept.save(key)
 }
 
-/// A call, or (`Some(linearizable)`) a query.
-pub fn invoke(call: &CallArgs, query: Option<bool>) -> Result<(), String> {
-    let arguments = hex::decode(call.args.trim()).map_err(|error| error.to_string())?;
-    let agent = AgentId(call.agent);
-    let instance = InstanceId(call.instance);
-    let (mut client, mut kept) = resume(&call.node, &call.key)?;
-    let schema = client
-        .schema(agent, instance)
-        .map_err(failed)?
-        .ok_or_else(|| format!("nothing is installed as instance {}", call.instance))?;
-    let method = method_named(&schema, &call.method)?;
-    let answer = if let Some(linearizable) = query {
-        let not_after = vos_node::wall_clock() + 60_000;
-        let consistency = if linearizable {
-            Consistency::Linearizable
-        } else {
-            Consistency::Applied {
-                at: client.floor(agent),
-            }
-        };
-        client.query_with(agent, instance, method, &arguments, not_after, consistency)
-    } else {
-        // A call that failed before its answer goes again with its
-        // sequence, and is answered once. Another call leaves that session
-        // first, so the earlier one's answer is never taken for its own.
-        let digest =
-            vos_pvm::precompile::blake2b_256(&(instance, method, arguments.clone()).encode());
-        match kept.pending.remove(&agent) {
-            Some(pending) if pending != digest => {
-                eprintln!(
-                    "an earlier call to agent {} was never answered: whether it ran stays unknown",
-                    agent.0
-                );
-                client.renew(agent);
-            }
-            // A refusal of its session proves nothing of the first: copies
-            // may be on their way, or its session collected.
-            Some(_) => client.repeats_unknown(agent),
-            None => {}
+/// What a call or a query invokes: the client and what its key kept, the
+/// agent, the instance, the method by its name in the installed schema,
+/// and the arguments.
+struct Invocation {
+    client: Client,
+    kept: Kept,
+    agent: AgentId,
+    instance: InstanceId,
+    method: MethodId,
+    arguments: Vec<u8>,
+}
+
+impl Invocation {
+    fn of(call: &CallArgs) -> Result<Self, String> {
+        let (agent, instance) = (AgentId(call.agent), InstanceId(call.instance));
+        let (client, kept) = resume(&call.node, &call.key)?;
+        let schema = client
+            .schema(agent, instance)
+            .map_err(failed)?
+            .ok_or_else(|| format!("nothing is installed as instance {}", call.instance))?;
+        Ok(Self {
+            method: method_named(&schema, &call.method)?,
+            client,
+            kept,
+            agent,
+            instance,
+            arguments: call.args.0.clone(),
+        })
+    }
+}
+
+/// A call, sent again with its sequence until it is answered once.
+pub fn call(call: &CallArgs) -> Result<(), String> {
+    let Invocation {
+        mut client,
+        mut kept,
+        agent,
+        instance,
+        method,
+        arguments,
+    } = Invocation::of(call)?;
+    // A call that failed before its answer goes again with its sequence,
+    // and is answered once. Another call leaves that session first, so the
+    // earlier one's answer is never taken for its own.
+    let mut invoked = (instance, method).encode();
+    arguments.encode_to(&mut invoked);
+    let digest = vos_pvm::precompile::blake2b_256(&invoked);
+    match kept.pending.remove(&agent) {
+        Some(pending) if pending != digest => {
+            eprintln!(
+                "an earlier call to agent {} was never answered: whether it ran stays unknown",
+                agent.0
+            );
+            client.renew(agent);
         }
-        let answer = client.call(agent, instance, method, &arguments);
-        // Unanswered: the call may have run, or may yet. A lost one can be
-        // answered no more.
-        let unanswered = match &answer {
-            Err(ClientError::Lost) => false,
-            Err(_) => true,
-            Ok(answer) => matches!(
-                answer,
-                Response::Stopped
-                    | Response::NotLeader { .. }
-                    | Response::Unavailable
-                    | Response::TimedOut
-            ),
-        };
-        if unanswered {
-            kept.pending.insert(agent, digest);
-        }
-        answer
+        // A refusal of its session proves nothing of the first: copies
+        // may be on their way, or its session collected.
+        Some(_) => client.repeats_unknown(agent),
+        None => {}
+    }
+    let answer = client.call(agent, instance, method, &arguments);
+    // Unanswered: the call may have run, or may yet. A lost one can be
+    // answered no more.
+    let unanswered = match &answer {
+        Err(ClientError::Lost) => false,
+        Err(_) => true,
+        Ok(answer) => matches!(
+            answer,
+            Response::Stopped
+                | Response::NotLeader { .. }
+                | Response::Unavailable
+                | Response::TimedOut
+        ),
     };
+    if unanswered {
+        kept.pending.insert(agent, digest);
+    }
     keep(&client, kept, &call.key)?;
     match answer {
         Ok(answer) => print_answer(&answer),
         Err(ClientError::Lost) => Err(
             "the call may have run, and its session is gone: its answer is lost for good".into(),
         ),
-        Err(error) if query.is_none() => Err(format!(
+        Err(error) => Err(format!(
             "{}; the call may have run: run it again to learn its answer",
             failed(error)
         )),
-        Err(error) => Err(failed(error)),
+    }
+}
+
+/// A query, on state that holds every answer the key was given for the
+/// agent, or (`linearizable`) every call answered anywhere before it.
+pub fn query(call: &CallArgs, linearizable: bool) -> Result<(), String> {
+    let Invocation {
+        client,
+        kept,
+        agent,
+        instance,
+        method,
+        arguments,
+    } = Invocation::of(call)?;
+    let not_after = vos_node::wall_clock() + 60_000;
+    let consistency = consistency(&client, agent, linearizable);
+    let answer = client.query_with(agent, instance, method, &arguments, not_after, consistency);
+    keep(&client, kept, &call.key)?;
+    print_answer(&answer.map_err(failed)?)
+}
+
+/// The state a read by `client` of `agent` asks for: what holds every
+/// answer the client was given for the agent, or (`linearizable`) every
+/// call answered anywhere before it.
+fn consistency(client: &Client, agent: AgentId, linearizable: bool) -> Consistency {
+    if linearizable {
+        Consistency::Linearizable
+    } else {
+        Consistency::Applied {
+            at: client.floor(agent),
+        }
     }
 }
 
@@ -151,13 +199,7 @@ pub fn said(answer: &Response) -> Result<String, String> {
 pub fn read_workflow(read: &WorkflowArgs) -> Result<(), String> {
     let agent = AgentId(read.agent);
     let (client, kept) = resume(&read.node, &read.key)?;
-    let consistency = if read.linearizable {
-        Consistency::Linearizable
-    } else {
-        Consistency::Applied {
-            at: client.floor(agent),
-        }
-    };
+    let consistency = consistency(&client, agent, read.linearizable);
     let wait = Duration::from_secs(read.wait);
     let answer = client.workflow_with(agent, WorkflowId(read.id), wait, consistency);
     keep(&client, kept, &read.key)?;

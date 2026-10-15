@@ -10,7 +10,9 @@ use vos_node::store::{Fjall, PersistMode};
 use vos_wire::ingress::Unplaced;
 use vos_wire::peer::{NodeNumber, PeerMessage};
 
-use crate::common::{Cluster, compacting, log_start, replaced, retired, wait_until};
+use vos_net::Class;
+
+use crate::common::{Cluster, compacting, cut_both, log_start, replaced, retired, wait_until};
 
 /// One replica replaced by another node while calls go on: the new one
 /// catches up, every node holds the new placement, the old replica keeps
@@ -21,15 +23,11 @@ fn a_replica_is_replaced_under_load() {
     let agent = cluster.counter_agent(&[1, 2, 3]);
     let (leader, removed) = cluster.leader_and_follower(agent);
     cluster.increments(leader, agent, 1..=30);
-    let replicas = replaced(&[1, 2, 3], removed, 4);
-    let total = std::thread::scope(|scope| {
+    let (total, replicas) = std::thread::scope(|scope| {
         let cluster = &cluster;
         let calls = scope.spawn(move || cluster.increments(leader, agent, 31..=60));
-        assert_eq!(
-            cluster.node(leader).replace(agent, removed, 4).unwrap(),
-            replicas
-        );
-        calls.join().unwrap()
+        let replicas = cluster.replace(leader, agent, &[1, 2, 3], removed, 4);
+        (calls.join().unwrap(), replicas)
     });
     cluster.placed(agent, &replicas);
     retired(cluster.node(removed), agent);
@@ -57,11 +55,7 @@ fn a_replacement_leaves_the_group_free_to_change_and_compact() {
     let agent = cluster.counter_agent(&[1, 2, 3]);
     let leader = cluster.leader(agent);
     cluster.increments(leader, agent, 1..=10);
-    let replicas = replaced(&[1, 2, 3], leader, 4);
-    assert_eq!(
-        cluster.node(leader).replace(agent, leader, 4).unwrap(),
-        replicas
-    );
+    let replicas = cluster.replace(leader, agent, &[1, 2, 3], leader, 4);
     retired(cluster.node(leader), agent);
     let next = cluster.leader(agent);
     let start = log_start(cluster.node(next), agent);
@@ -71,11 +65,7 @@ fn a_replacement_leaves_the_group_free_to_change_and_compact() {
         "compacting again"
     );
     let removed = *replicas.iter().find(|number| **number != next).unwrap();
-    let after = replaced(&replicas, removed, 5);
-    assert_eq!(
-        cluster.node(next).replace(agent, removed, 5).unwrap(),
-        after
-    );
+    let after = cluster.replace(next, agent, &replicas, removed, 5);
     cluster.placed(agent, &after);
     cluster.converged(agent);
 }
@@ -90,15 +80,11 @@ fn a_replica_replaced_while_down_holds_nothing_up() {
     let mut followers = (1..=3).filter(|number| *number != leader);
     let (gone, other) = (followers.next().unwrap(), followers.next().unwrap());
     cluster.stop(gone);
-    cluster.node(leader).replace(agent, gone, 4).unwrap();
+    let replicas = cluster.replace(leader, agent, &[1, 2, 3], gone, 4);
     let start = log_start(cluster.node(leader), agent);
     cluster.increments(leader, agent, 1..=30);
     assert!(log_start(cluster.node(leader), agent) > start);
-    let after = replaced(&replaced(&[1, 2, 3], gone, 4), other, 5);
-    assert_eq!(
-        cluster.node(leader).replace(agent, other, 5).unwrap(),
-        after
-    );
+    let after = cluster.replace(leader, agent, &replicas, other, 5);
     cluster.placed(agent, &after);
 }
 
@@ -170,11 +156,7 @@ fn the_leader_replaces_itself() {
     let agent = cluster.counter_agent(&[1, 2, 3]);
     let leader = cluster.leader(agent);
     assert_eq!(done(cluster.increment(leader, agent, 1, 5)), 5);
-    let replicas = replaced(&[1, 2, 3], leader, 4);
-    assert_eq!(
-        cluster.node(leader).replace(agent, leader, 4).unwrap(),
-        replicas
-    );
+    let replicas = cluster.replace(leader, agent, &[1, 2, 3], leader, 4);
     cluster.placed(agent, &replicas);
     retired(cluster.node(leader), agent);
     let next = cluster.leader(agent);
@@ -193,11 +175,7 @@ fn a_leader_replacing_itself_is_answered_before_the_next_election() {
     });
     let agent = cluster.counter_agent(&[1, 2, 3]);
     let leader = cluster.leader(agent);
-    let replicas = replaced(&[1, 2, 3], leader, 4);
-    assert_eq!(
-        cluster.node(leader).replace(agent, leader, 4).unwrap(),
-        replicas
-    );
+    let replicas = cluster.replace(leader, agent, &[1, 2, 3], leader, 4);
     cluster.placed(agent, &replicas);
     retired(cluster.node(leader), agent);
 }
@@ -261,19 +239,14 @@ fn a_phantom_placement_gives_way_to_the_next_leader() {
         });
         assert!(replacing.join().unwrap().is_err(), "never committed");
     });
-    let next = loop {
-        let next = cluster.leader(agent);
-        if next != leader {
-            break next;
-        }
-    };
+    let mut next = leader;
+    wait_until("another node leads", || {
+        next = cluster.leader(agent);
+        next != leader
+    });
     retired(cluster.node(4), agent);
     cluster.hub.heal();
-    let replicas = replaced(&[1, 2, 3], followers[1], 4);
-    assert_eq!(
-        cluster.node(next).replace(agent, followers[1], 4).unwrap(),
-        replicas
-    );
+    let replicas = cluster.replace(next, agent, &[1, 2, 3], followers[1], 4);
     cluster.placed(agent, &replicas);
     cluster.converged(agent);
 }
@@ -328,11 +301,7 @@ fn a_removed_replica_back_with_its_old_log_disturbs_nothing() {
     assert_eq!(done(cluster.increment(leader, agent, 1, 3)), 3);
     cluster.converged(agent);
     cluster.stop(removed);
-    let replicas = replaced(&[1, 2, 3], removed, 4);
-    assert_eq!(
-        cluster.node(leader).replace(agent, removed, 4).unwrap(),
-        replicas
-    );
+    let replicas = cluster.replace(leader, agent, &[1, 2, 3], removed, 4);
     let term = |cluster: &Cluster| cluster.node(leader).store().raft(agent).unwrap().hard.term;
     let before = term(&cluster);
     cluster.start(removed);
@@ -424,36 +393,28 @@ fn a_stale_leader_left_out_of_the_configuration_retires() {
     let stale = cluster.leader(agent);
     let followers: Vec<NodeNumber> = (1..=3).filter(|number| *number != stale).collect();
     for &follower in &followers {
-        cluster
-            .hub
-            .cut_class(stale, follower, vos_net::Class::Consensus);
-        cluster
-            .hub
-            .cut_class(follower, stale, vos_net::Class::Consensus);
-        cluster
-            .hub
-            .cut_class(stale, follower, vos_net::Class::Liveness);
+        cut_both(&cluster.hub, stale, follower, Class::Consensus);
+        cluster.hub.cut_class(stale, follower, Class::Liveness);
     }
-    let next = loop {
+    let mut next = None;
+    wait_until("a follower leads", || {
         let leading: Vec<NodeNumber> = followers
             .iter()
             .copied()
             .filter(|number| cluster.node(*number).leads(agent))
             .collect();
-        if let [next] = leading[..] {
-            break next;
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    };
+        next = match leading[..] {
+            [next] => Some(next),
+            _ => None,
+        };
+        next.is_some()
+    });
+    let next = next.unwrap();
     assert!(
         cluster.node(stale).leads(agent),
         "the stale one still leads"
     );
-    let replicas = replaced(&[1, 2, 3], stale, 4);
-    assert_eq!(
-        cluster.node(next).replace(agent, stale, 4).unwrap(),
-        replicas
-    );
+    cluster.replace(next, agent, &[1, 2, 3], stale, 4);
     cluster.hub.heal();
     retired(cluster.node(stale), agent);
 }
@@ -468,12 +429,9 @@ fn a_replica_retired_twice_keeps_its_first_floor() {
     let agent = cluster.counter_agent(&[1, 2, 3]);
     let (leader, gone) = cluster.leader_and_follower(agent);
     cluster.increments(leader, agent, 1..=5);
-    wait_until("the replica holds every entry", || {
-        cluster.node(gone).applied(agent) >= cluster.node(leader).applied(agent)
-    });
+    cluster.caught_up(gone, agent, leader);
     let held = cluster.node(gone).applied(agent).unwrap();
-    let first = replaced(&[1, 2, 3], gone, 4);
-    assert_eq!(cluster.node(leader).replace(agent, gone, 4).unwrap(), first);
+    let first = cluster.replace(leader, agent, &[1, 2, 3], gone, 4);
     retired(cluster.node(gone), agent);
     let floor = cluster
         .node(gone)
@@ -486,16 +444,10 @@ fn a_replica_retired_twice_keeps_its_first_floor() {
 
     // Added again with no entry reaching it: its directory still learns.
     for number in (1..=4).filter(|number| *number != gone) {
-        cluster
-            .hub
-            .cut_class(gone, number, vos_net::Class::Consensus);
-        cluster
-            .hub
-            .cut_class(number, gone, vos_net::Class::Consensus);
+        cut_both(&cluster.hub, gone, number, Class::Consensus);
     }
     let leader = cluster.leader(agent);
-    let again = replaced(&first, 4, gone);
-    assert_eq!(cluster.node(leader).replace(agent, 4, gone).unwrap(), again);
+    let again = cluster.replace(leader, agent, &first, 4, gone);
     wait_until("the replica runs the group again", || {
         cluster.node(gone).applied(agent).is_some()
     });
@@ -511,7 +463,7 @@ fn a_replica_retired_twice_keeps_its_first_floor() {
     // The retirement's batch moves the state to a new, empty epoch: once
     // the epoch moves, its floor is written.
     let epoch = cluster.node(gone).store().snapshot().epoch(agent).unwrap();
-    assert_eq!(cluster.node(leader).replace(agent, gone, 4).unwrap(), first);
+    cluster.replace(leader, agent, &again, gone, 4);
     retired(cluster.node(gone), agent);
     wait_until("the retirement is written", || {
         cluster.node(gone).store().snapshot().epoch(agent).unwrap() != epoch

@@ -19,7 +19,7 @@ use vos_wire::ids::MethodId;
 use vos_wire::schema::Schema;
 
 use args::{Cli, Command, KeyCommand, NodeCommand, RunArgs};
-use call::{invoke, read_workflow};
+use call::read_workflow;
 
 /// mimalloc, unless built without it: a thread frees memory another thread
 /// allocated without taking that thread's lock, as the node's executors,
@@ -76,8 +76,8 @@ fn run(cli: Cli) -> Result<(), String> {
         Command::Agent { command } => command.run(),
         Command::Install(install) => install.run(),
         Command::Role(role) => role.run(),
-        Command::Call(call) => invoke(&call, None),
-        Command::Query { call, linearizable } => invoke(&call, Some(linearizable)),
+        Command::Call(arguments) => call::call(&arguments),
+        Command::Query { call, linearizable } => call::query(&call, linearizable),
         Command::Workflow(read) => read_workflow(&read),
         Command::Jam { command } => command.run(),
     }
@@ -191,7 +191,7 @@ fn method_named(schema: &Schema, name: &str) -> Result<MethodId, String> {
 }
 
 fn failed(error: ClientError) -> String {
-    format!("{error:?}")
+    error.to_string()
 }
 
 /// An error with the file at `path`, as `map_err` takes it.

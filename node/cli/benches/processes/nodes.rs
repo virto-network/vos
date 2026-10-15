@@ -2,17 +2,18 @@
 //! what `/proc` says of them and of the machine as a whole.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use vos_checker::calls::install_of;
 use vos_checker::processes::{self, Running, first_run, read_log};
 use vos_checker::spaces::{free_tcp_port, free_udp_port};
 use vos_node::client::{Operator, Target};
-use vos_node::tls::Trust;
 use vos_wire::ids::AgentId;
-use vos_wire::ingress::{Install, Response};
+use vos_wire::ingress::Response;
 
 use crate::{COUNTER, NODES};
 
@@ -316,19 +317,16 @@ impl Space {
         let peers: Vec<u16> = (0..NODES).map(|_| free_udp_port()).collect();
         let tls = std::env::var("TLS").is_ok_and(|tls| tls == "1");
         let scheme = if tls { "https" } else { "http" };
-        let space: String = (0..NODES)
-            .map(|at| {
-                format!(
-                    "{} {} 127.0.0.1:{} {scheme}://127.0.0.1:{}\n",
-                    at + 1,
-                    keys[at],
-                    peers[at],
-                    ingress[at]
-                )
-            })
+        let urls: Vec<String> = ingress
+            .iter()
+            .map(|port| format!("{scheme}://127.0.0.1:{port}"))
             .collect();
+        let nodes = (0..NODES).map(|at| {
+            let peer = SocketAddr::from(([127, 0, 0, 1], peers[at]));
+            (&*keys[at], peer, &*urls[at])
+        });
         let space_file = dir.path().join("space");
-        std::fs::write(&space_file, space).unwrap();
+        std::fs::write(&space_file, processes::space_file(nodes)).unwrap();
         let processes = (1..=NODES as u8)
             .map(|number| {
                 let at = usize::from(number) - 1;
@@ -354,17 +352,10 @@ impl Space {
                 let (running, key) = launch(&borrowed, pinning.as_deref(), &log);
                 assert_eq!(key, keys[at]);
                 let url = format!("{scheme}://{listen}");
-                let trust = if tls {
-                    let mut pinned = [0u8; 32];
-                    hex::decode_to_slice(&key, &mut pinned).unwrap();
-                    Trust::NodeKey(pinned)
-                } else {
-                    Trust::Loopback
-                };
                 Process {
                     running: Mutex::new(running),
                     number,
-                    target: Target::new(&url, trust).unwrap(),
+                    target: processes::target(&url, &key, tls),
                     url,
                     data,
                     args,
@@ -422,11 +413,7 @@ impl Space {
     /// An agent on every node, with the counter's package installed.
     pub fn counter_agent(&self, counter: &[u8]) -> AgentId {
         let agent = self.create_agent();
-        let install = Install {
-            instance: COUNTER,
-            elf: counter.to_vec(),
-            roles: Vec::new(),
-        };
+        let install = install_of(COUNTER, counter);
         self.operate(
             |operator| {
                 operator

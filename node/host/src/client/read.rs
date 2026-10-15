@@ -4,16 +4,15 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use ed25519_dalek::Signer;
 use vos_wire::ids::{AgentId, InstanceId, MethodId, WorkflowId};
-use vos_wire::ingress::{
-    Consistency, QueryCall, Rejection, Response, WORKFLOW_READ_HORIZON_MS, WorkflowRead,
-    query_message, workflow_message, workflow_read_horizon,
-};
+use vos_wire::ingress::{Consistency, Rejection, Response};
 use vos_wire::schema::Schema;
 use vos_wire::{Decode, Encode};
 
-use super::{Client, ClientError, Http, Target, decode_answer};
+use super::{
+    Client, ClientError, Http, Target, decode_answer, signed_query, signed_workflow_read,
+    workflow_read_not_after,
+};
 
 impl Client {
     /// Run query `method` on `agent`'s `instance`, good until `not_after`,
@@ -46,28 +45,17 @@ impl Client {
         consistency: Consistency,
     ) -> Result<Response, ClientError> {
         let identity = self.identity(agent)?;
-        let key = self.key.verifying_key().to_bytes();
         let path = format!("/agents/{}/queries", agent.0);
         self.with_learned_time(|offset| {
-            let not_after = not_after.saturating_add_signed(offset);
-            let message = query_message(
+            let query = signed_query(
                 &identity,
-                &key,
-                not_after,
+                &self.key,
+                not_after.saturating_add_signed(offset),
                 consistency,
                 instance,
                 method,
-                arguments,
+                arguments.to_vec(),
             );
-            let query = QueryCall {
-                key,
-                not_after,
-                consistency,
-                instance,
-                method,
-                arguments: arguments.to_vec(),
-                signature: self.key.sign(&message).to_bytes(),
-            };
             self.read(agent, &path, &query.encode())
         })
     }
@@ -100,25 +88,17 @@ impl Client {
     ) -> Result<Response, ClientError> {
         let identity = self.identity(agent)?;
         let wait_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
-        let key = self.key.verifying_key().to_bytes();
         let path = format!("/agents/{}/workflows", agent.0);
         self.with_learned_time(|offset| {
-            // Good past the wait, by the agents' time, within half the
-            // horizon a node allows: room for clocks off by as much either
-            // way.
-            let not_after = crate::wall_clock()
-                .saturating_add(workflow_read_horizon(wait_ms) - WORKFLOW_READ_HORIZON_MS / 2)
-                .saturating_add_signed(offset);
-            let message =
-                workflow_message(&identity, &key, not_after, consistency, workflow, wait_ms);
-            let read = WorkflowRead {
-                key,
-                not_after,
+            let now = crate::wall_clock().saturating_add_signed(offset);
+            let read = signed_workflow_read(
+                &identity,
+                &self.key,
+                workflow_read_not_after(now, wait_ms),
                 consistency,
                 workflow,
                 wait_ms,
-                signature: self.key.sign(&message).to_bytes(),
-            };
+            );
             self.read(agent, &path, &read.encode())
         })
     }

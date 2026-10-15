@@ -12,12 +12,12 @@ use vos_node::Node;
 use vos_node::roots::{self, MapStore};
 use vos_node::store::PersistMode;
 use vos_tree::{Blake2b, Hash, value_hash};
+use vos_wire::Encode;
 use vos_wire::batch::Request;
 use vos_wire::ids::{AgentId, MapId};
 use vos_wire::keys;
 use vos_wire::records::{unstored, unversioned};
 use vos_wire::result::Write;
-use vos_wire::{Decode, Encode};
 
 use crate::common::{ALICE, COUNTER, Cluster, compacting, log_start, wait_until};
 
@@ -66,11 +66,7 @@ fn write(cluster: &Cluster, at: u8, agent: AgentId, sequences: std::ops::RangeIn
 
 /// The agent's state version on `node`.
 fn version(node: &Node, agent: AgentId) -> u64 {
-    node.store()
-        .snapshot()
-        .get(agent, &keys::version())
-        .unwrap()
-        .map_or(0, |bytes| u64::decode(unstored(&bytes).unwrap()).unwrap().0)
+    vos_checker::applied(node.store(), agent, &keys::version()).unwrap_or(0)
 }
 
 /// The map's root on `node`, once built at the agent's version with no key

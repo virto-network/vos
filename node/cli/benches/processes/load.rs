@@ -7,11 +7,11 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::SigningKey;
 use smol::io::{AsyncReadExt, AsyncWriteExt};
-use vos_node::client::Target;
+use vos_node::client::{Target, signed_call};
 use vos_wire::ids::{AgentId, MethodId, Session};
-use vos_wire::ingress::{Call, Response, call_message};
+use vos_wire::ingress::Response;
 use vos_wire::result::Outcome;
 use vos_wire::{Decode, Encode};
 
@@ -141,22 +141,15 @@ impl SessionKey {
     /// The increment at `sequence`, signed.
     fn sign(&self, sequence: u64) -> Vec<u8> {
         let arguments = 1u64.encode();
-        let message = call_message(
+        signed_call(
             &self.identity,
-            &self.session,
+            &self.key,
+            self.session,
             sequence,
             COUNTER,
             self.increment,
-            &arguments,
-        );
-        Call {
-            session: self.session,
-            sequence,
-            instance: COUNTER,
-            method: self.increment,
             arguments,
-            signature: self.key.sign(&message).to_bytes(),
-        }
+        )
         .encode()
     }
 }

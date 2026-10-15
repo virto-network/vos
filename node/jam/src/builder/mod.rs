@@ -100,25 +100,6 @@ impl Builder {
         record(&self.store.view(), &keys::version()).map(|version| version.unwrap_or(0))
     }
 
-    /// The segments `prepared`'s package imports, from `segments`.
-    pub fn imports(
-        &self,
-        prepared: &Prepared,
-        segments: &dyn Segments,
-    ) -> Result<Vec<Vec<u8>>, Error> {
-        prepared
-            .package
-            .imports
-            .iter()
-            .zip(&prepared.segments)
-            .map(|(&(workflow, index), (root, at))| {
-                segments
-                    .segment(root, *at)
-                    .ok_or(Error::Page(workflow, index))
-            })
-            .collect()
-    }
-
     /// Take `prepared`'s package once the chain holds `landed`: the work
     /// result its exports hold, read from `segments`, which must be the one
     /// simulated, as it encodes it; its rows; and its pages, where `landed`
@@ -207,7 +188,7 @@ impl Builder {
             let fate = if landed.root == root {
                 Fate::Refused
             } else {
-                self.resync(chain, &landed)?;
+                self.resync(segments.as_ref(), &landed)?;
                 tried.clear();
                 Fate::Overtaken
             };
@@ -224,10 +205,13 @@ impl Builder {
     /// exports: when its work result leads from the store's root to the
     /// chain's. Otherwise the store has fallen behind by more than one
     /// package, or holds another history: `Error::Diverged`.
-    pub fn resync(&mut self, chain: &dyn Chain, landed: &Landed) -> Result<WorkResult, Error> {
+    pub fn resync(
+        &mut self,
+        segments: &dyn Segments,
+        landed: &Landed,
+    ) -> Result<WorkResult, Error> {
         let exports = landed.exports.ok_or(Error::Diverged)?;
-        let (result, _) =
-            exported_result(chain.segments().as_ref(), &exports).map_err(|_| Error::Diverged)?;
+        let (result, _) = exported_result(segments, &exports).map_err(|_| Error::Diverged)?;
         let view = self.store.view();
         let writes = view
             .writes(&result, &mut Default::default())?
@@ -245,23 +229,11 @@ impl Builder {
     /// due by then, the earliest first, at most a sweep's, as a VOS leader
     /// lists them; `None` when none is due.
     pub fn sweep(&self, time: u64) -> Result<Option<Input>, Error> {
-        let prefix = keys::due_prefix();
-        let mut due = Vec::new();
-        for row in self.store.view().rows_from(&prefix) {
-            let (key, _) = row?;
-            if !key.starts_with(&prefix) {
-                break;
-            }
-            // A key that names no row of the index is passed over, as a VOS
-            // leader passes it.
-            match keys::due_entry(&key) {
-                Some((at, entry)) if at <= time && due.len() < defaults::SWEEP_LIMIT => {
-                    due.push((at, entry));
-                }
-                Some(_) => break,
-                None => {}
-            }
-        }
+        let view = self.store.view();
+        let rows = view
+            .rows_from(&keys::due_prefix())
+            .map(|row| row.map(|(key, _)| key));
+        let due = keys::due_rows(rows, time, defaults::SWEEP_LIMIT)?;
         Ok((!due.is_empty()).then_some(Input::Sweep { due }))
     }
 

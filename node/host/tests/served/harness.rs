@@ -217,7 +217,7 @@ impl Cluster {
     #[track_caller]
     pub fn leading(&self, agent: AgentId) -> Arc<Node> {
         let mut leading = None;
-        vos_checker::wait_until("a leader", Duration::from_secs(20), || {
+        vos_checker::spaces::wait_in_process("a leader", || {
             leading = self.leader(agent).and_then(|number| self.node(number));
             leading.is_some()
         });

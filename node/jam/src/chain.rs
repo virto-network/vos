@@ -11,10 +11,9 @@ use vos_pvm::accumulate_host::{AccumulateContext, ServiceStorage};
 use vos_pvm::refine::MemoryModel;
 use vos_pvm::refine_host::RefineContext;
 use vos_tree::{Blake2b, Hash, Hasher};
-use vos_wire::batch::Work;
+use vos_wire::Decode;
 use vos_wire::jam::{AccumulateInput, Operand};
-use vos_wire::package::{EPOCH_MS, EXPORTS, Exports, JamOutput, Package, ROOT, SLOT_MS};
-use vos_wire::{Decode, Encode};
+use vos_wire::package::{EXPORTS, Exports, JamOutput, ROOT, slot_of};
 
 use crate::Error;
 use crate::builder::Prepared;
@@ -37,10 +36,7 @@ impl Landed {
             None => vos_tree::empty_root(&Blake2b),
         };
         let exports = exports
-            .map(|bytes| match Exports::decode(bytes) {
-                Ok((exports, used)) if used == bytes.len() => Ok(exports),
-                _ => Err(Error::Corrupt("the last exports")),
-            })
+            .map(|bytes| Exports::decode_exact(bytes).ok_or(Error::Corrupt("the last exports")))
             .transpose()?;
         Ok(Self { root, exports })
     }
@@ -57,11 +53,6 @@ pub trait Chain {
     fn wait(&mut self, prepared: &Prepared) -> Result<Landed, Error>;
     /// What the chain holds now.
     fn landed(&self) -> Result<Landed, Error>;
-}
-
-/// The slot a time falls in.
-pub fn slot_of(time: u64) -> u64 {
-    time.saturating_sub(EPOCH_MS) / SLOT_MS
 }
 
 /// The most a work report's outputs take, the Gray Paper's `W_R`
@@ -104,21 +95,21 @@ pub struct Refined {
 }
 
 impl Emulated {
-    /// Refine `package` on the JAM-only host with `gas`, its imports'
-    /// segments `imports`, as a guarantor does; its exports kept in DA.
+    /// Refine the package `payload` encodes on the JAM-only host with
+    /// `gas`, its imports' segments `imports`, as a guarantor does; its
+    /// exports kept in DA.
     pub fn refine(
         &mut self,
         runner: &Runner,
-        package: &Package,
+        payload: &[u8],
         imports: Vec<Vec<u8>>,
         gas: u64,
     ) -> Result<Refined, Error> {
-        let payload = Work::Package(package.clone()).encode();
-        let package_hash = Blake2b.hash(b"vos/jam/package", &[&payload]);
-        let arguments = runner.arguments(&payload, package_hash);
+        let package_hash = Blake2b.hash(b"vos/jam/package", &[payload]);
+        let arguments = runner.arguments(payload, package_hash);
         let run = RefineContext::load_prepared(&runner.program, &arguments, gas, MemoryModel::Auto)
             .map_err(Error::Load)?
-            .try_run_jam(runner.jam(payload, imports))
+            .try_run_jam(runner.jam(payload.to_vec(), imports))
             .map_err(Error::Load)?;
         let invocation = run.invocation;
         if invocation.exit != ExitReason::Halt {
@@ -127,8 +118,8 @@ impl Emulated {
         let bytes = invocation
             .output_bounded(MAX_REFINE_OUTPUT)
             .ok_or(Error::Output)?;
-        let (output, used) = JamOutput::decode(&bytes).map_err(|_| Error::Output)?;
-        if used != bytes.len() || output.exports as usize != run.exports.len() {
+        let output = JamOutput::decode_exact(&bytes).ok_or(Error::Output)?;
+        if output.exports as usize != run.exports.len() {
             return Err(Error::Output);
         }
         let segment_root = self.da.put(run.exports);
@@ -203,7 +194,7 @@ impl Chain for Emulated {
             Some(Fault::Starved) => prepared.gas / 10,
             _ => prepared.gas,
         };
-        let refined = match self.refine(runner, &prepared.package, imports, gas) {
+        let refined = match self.refine(runner, &prepared.payload, imports, gas) {
             Ok(refined) => refined,
             Err(Error::Refine(exit)) => return Ok(format!("refine stopped: {exit:?}")),
             Err(error) => return Err(error),
@@ -240,8 +231,8 @@ impl ServiceStorage for Storage<'_> {
 
     fn write(&mut self, key: &[u8], value: Option<&[u8]>) -> Option<usize> {
         let previous = match value {
-            Some(value) if !value.is_empty() => self.values.insert(key.to_vec(), value.to_vec()),
-            _ => self.values.remove(key),
+            Some(value) => self.values.insert(key.to_vec(), value.to_vec()),
+            None => self.values.remove(key),
         };
         previous.map(|value| value.len())
     }

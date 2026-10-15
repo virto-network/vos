@@ -21,7 +21,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use vos_checker::calls::done;
+use vos_checker::calls::{done, installed};
 use vos_checker::percentiles;
 use vos_checker::programs::{Programs, method};
 use vos_checker::rounds::{ROUNDS, Rounds, Tour};
@@ -29,9 +29,9 @@ use vos_node::{Config, Hooks, Node, Reply};
 use vos_wire::batch::{Answer, Await, Batch, Body, Message, Request};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session, WorkflowId};
 use vos_wire::ingress::Stats;
-use vos_wire::records::{Workflow, WorkflowState, unstored};
+use vos_wire::records::{Workflow, WorkflowState};
 use vos_wire::result::Outcome;
-use vos_wire::{Decode, Encode, keys};
+use vos_wire::{Encode, keys};
 
 const COUNTER: InstanceId = InstanceId(1);
 const ALICE: Principal = Principal::Client([1; 32]);
@@ -77,13 +77,9 @@ fn request(
 
 /// Workflow `id`'s state, as `node` applied it.
 fn state(node: &Node, agent: AgentId, id: WorkflowId) -> WorkflowState {
-    let bytes = node
-        .store()
-        .snapshot()
-        .get(agent, &keys::workflow(id))
-        .unwrap()
-        .expect("the workflow's record");
-    Workflow::decode(unstored(&bytes).unwrap()).unwrap().0.state
+    vos_checker::applied::<Workflow>(node.store(), agent, &keys::workflow(id))
+        .expect("the workflow's record")
+        .state
 }
 
 /// A tour's resumes at `agent`, which runs the rounds actor: each the time
@@ -92,19 +88,13 @@ fn state(node: &Node, agent: AgentId, id: WorkflowId) -> WorkflowState {
 fn resumes(node: &Node, agent: AgentId, session: u64) -> Vec<Duration> {
     let rounds = Rounds::load();
     let methods = rounds.methods;
-    let install = node.install(agent, ROUNDS, &rounds.elf, vec![]);
-    let installed = smol::block_on(install);
-    assert!(
-        matches!(installed, Ok(Reply::Ran(Outcome::Done(_)))),
-        "{installed:?}"
-    );
-    let tour = Tour {
-        other: ASKED,
-        amounts: (1..=RESUMES).collect(),
-        nap: 0,
-        words: 64,
-        passes: 4,
-    };
+    installed(smol::block_on(node.install(
+        agent,
+        ROUNDS,
+        &rounds.elf,
+        vec![],
+    )));
+    let tour = Tour::light(ASKED, (1..=RESUMES).collect(), 0);
     let start = request(session, 1, ROUNDS, methods.tour, tour.arguments());
     let id = match smol::block_on(node.call(agent, start)) {
         Ok(Reply::Ran(Outcome::Started(id))) => id,
@@ -263,11 +253,12 @@ fn main() {
     let executors = config.executors;
     let node = Arc::new(Node::open(dir.path(), config).unwrap());
     let agent = node.create_agent().unwrap();
-    let installed = smol::block_on(node.install(agent, COUNTER, &counter_elf, vec![]));
-    assert!(
-        matches!(installed, Ok(Reply::Ran(Outcome::Done(_)))),
-        "{installed:?}"
-    );
+    installed(smol::block_on(node.install(
+        agent,
+        COUNTER,
+        &counter_elf,
+        vec![],
+    )));
 
     // Warm the machines, the store and the queues once.
     load(&node, agent, increment_method, 1, SESSIONS, 10);

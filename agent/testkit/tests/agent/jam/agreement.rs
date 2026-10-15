@@ -391,9 +391,12 @@ fn a_package_refines_and_accumulates_only_on_what_it_shows() {
     paired.batch(T0 + 1_000, vec![fill, compute]);
 
     let refines = |paired: &mut Paired, package: &Package, imports| {
-        paired
-            .chain
-            .refine(&paired.runner, package, imports, POLKAJAM_REFINE_GAS)
+        paired.chain.refine(
+            &paired.runner,
+            &Work::encode_package(package),
+            imports,
+            POLKAJAM_REFINE_GAS,
+        )
     };
     let prepare = |paired: &Paired, inputs: Vec<Input>, time: u64| {
         let segments = paired.chain.segments();
@@ -504,7 +507,7 @@ fn a_package_refines_and_accumulates_only_on_what_it_shows() {
     assert!(missing.package.batch.inputs.is_empty());
     let prepared = prepare(&paired, vec![sweep], time);
     assert!(matches!(
-        paired.builder.imports(&prepared, &empty),
+        prepared.imports(&empty),
         Err(Error::Page(WorkflowId(0), _))
     ));
     assert!(!prepared.segments.is_empty(), "the computation's pages");
@@ -517,15 +520,12 @@ fn a_package_refines_and_accumulates_only_on_what_it_shows() {
     // The package as built refines. Accumulated where its time is too
     // early for the slot, or too late, the chain keeps its root, and the
     // builder its store.
-    let imports = paired
-        .builder
-        .imports(&prepared, &paired.chain.da)
-        .expect("the pages in DA");
+    let imports = prepared.imports(&paired.chain.da).expect("the pages in DA");
     let refined = refines(&mut paired, &prepared.package, imports).expect("it refines");
     let before = (paired.chain.root(), paired.builder.store.root().unwrap());
     let skew = defaults::SESSION_SKEW_MS;
-    let late = (time + skew - EPOCH_MS) / SLOT_MS + 2;
-    let early = (time - skew - EPOCH_MS) / SLOT_MS - 2;
+    let late = slot_of(time + skew) + 2;
+    let early = slot_of(time - skew) - 2;
     for (slot, what) in [
         (late, "a time too early for its slot"),
         (early, "a time ahead of its slot"),
@@ -542,7 +542,7 @@ fn a_package_refines_and_accumulates_only_on_what_it_shows() {
     }
     // Accumulated in its slot, then taken, its pages where it exported
     // them.
-    let slot = (time - EPOCH_MS) / SLOT_MS;
+    let slot = slot_of(time);
     let stored = paired
         .chain
         .accumulate(&paired.runner, &refined, slot)
