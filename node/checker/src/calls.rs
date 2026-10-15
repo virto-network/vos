@@ -1,11 +1,13 @@
-//! Calls and queries as the tests make them: a call's total, and a signed
-//! query.
+//! Calls and queries as the tests make them: a call's total, an install
+//! at the leader, and a signed query.
 
 use std::fmt::Debug;
+use std::ops::Deref;
+use std::time::{Duration, Instant};
 
 use ed25519_dalek::{Signer, SigningKey};
-use vos_node::{CallError, Reply};
-use vos_wire::ids::{InstanceId, MethodId};
+use vos_node::{CallError, Node, Reply};
+use vos_wire::ids::{AgentId, InstanceId, MethodId};
 use vos_wire::ingress::{Consistency, QueryCall, Response, query_message};
 use vos_wire::result::Outcome;
 use vos_wire::{Decode, Encode};
@@ -45,6 +47,29 @@ pub fn done(answer: impl Total) -> u64 {
     match answer.total() {
         Some(total) => total,
         None => panic!("not done: {answer:?}"),
+    }
+}
+
+/// Package `elf` installed as `instance` of `agent` at the node `leader`
+/// names on each try: sent again while the node it reached no longer
+/// leads, as a client follows its leader. An install sent again
+/// overwrites. It must run.
+#[track_caller]
+pub fn install_at_leader<N: Deref<Target = Node>>(
+    leader: impl Fn() -> N,
+    agent: AgentId,
+    instance: InstanceId,
+    elf: &[u8],
+) {
+    let until = Instant::now() + crate::spaces::IN_PROCESS_WAIT;
+    loop {
+        match smol::block_on(leader().install(agent, instance, elf, Vec::new())) {
+            Ok(Reply::Ran(Outcome::Done(_))) => return,
+            Err(CallError::NotLeader(_)) if Instant::now() < until => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            other => panic!("the install: {other:?}"),
+        }
     }
 }
 

@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use ed25519_dalek::{Signer, SigningKey};
-use vos_checker::calls::{Total, signed_query};
+use vos_checker::calls::{Total, install_at_leader, signed_query};
 use vos_checker::programs::{actor, method, package};
 use vos_checker::{ANSWERED, ATTEMPT, COUNTER, Nodes, wait_until};
 use vos_node::client::{Client, post_within};
@@ -32,15 +32,7 @@ fn counter_agent(cluster: &Cluster, replicas: Vec<NodeNumber>) -> (AgentId, Meth
         .unwrap()
         .create_replicated(replicas)
         .unwrap();
-    wait_until("a leader", Duration::from_secs(20), || {
-        cluster.leader(agent).is_some()
-    });
-    let leader = cluster.node(cluster.leader(agent).unwrap()).unwrap();
-    let installed = smol::block_on(leader.install(agent, COUNTER, &counter, vec![]));
-    assert!(
-        matches!(installed, Ok(vos_node::Reply::Ran(Outcome::Done(_)))),
-        "{installed:?}"
-    );
+    install_at_leader(|| cluster.leading(agent), agent, COUNTER, &counter);
     (
         agent,
         method(&actor("counter"), "increment"),

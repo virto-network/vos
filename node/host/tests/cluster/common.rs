@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use smol::future::FutureExt;
-use vos_checker::calls::done;
+use vos_checker::calls::{done, install_at_leader};
 use vos_checker::programs::Programs;
 use vos_checker::spaces::{IN_PROCESS_WAIT, open_node, space};
 use vos_net::memory::{Endpoint, Hub};
@@ -170,13 +170,13 @@ impl Cluster {
 
     /// The counter installed at `agent`'s leader.
     pub fn install(&self, agent: AgentId) {
-        let leader = self.node(self.leader(agent));
-        let installed =
-            smol::block_on(leader.install(agent, COUNTER, &self.programs.counter_elf, vec![]));
-        assert!(
-            matches!(installed, Ok(Reply::Ran(Outcome::Done(_)))),
-            "{installed:?}"
-        );
+        self.install_package(agent, COUNTER, &self.programs.counter_elf);
+    }
+
+    /// Package `elf` installed as `instance` at `agent`'s leader, followed
+    /// as leadership moves.
+    pub fn install_package(&self, agent: AgentId, instance: InstanceId, elf: &[u8]) {
+        install_at_leader(|| self.node(self.leader(agent)), agent, instance, elf);
     }
 
     /// An agent on `replicas`, created at the first of them, with the

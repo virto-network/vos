@@ -213,6 +213,17 @@ impl Cluster {
         (1..=NODES).find(|number| self.node(*number).is_some_and(|node| node.leads(agent)))
     }
 
+    /// The running node leading `agent`, once one does.
+    #[track_caller]
+    pub fn leading(&self, agent: AgentId) -> Arc<Node> {
+        let mut leading = None;
+        vos_checker::wait_until("a leader", Duration::from_secs(20), || {
+            leading = self.leader(agent).and_then(|number| self.node(number));
+            leading.is_some()
+        });
+        leading.unwrap()
+    }
+
     /// `agent`'s identity, from the record node `at` serves.
     pub fn identity(&self, at: NodeNumber, agent: AgentId) -> [u8; 32] {
         let record = vos_node::client::agent_info(self.target(at), agent)

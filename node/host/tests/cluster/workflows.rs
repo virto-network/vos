@@ -49,13 +49,7 @@ impl Shop {
     /// Install the shop at `agent`'s leader, or once `upgraded` its
     /// upgrade.
     fn install(&self, cluster: &Cluster, agent: AgentId, upgraded: bool) {
-        let leader = cluster.node(cluster.leader(agent));
-        let elf = self.package(upgraded);
-        let installed = smol::block_on(leader.install(agent, SHOP, &elf, vec![]));
-        assert!(
-            matches!(installed, Ok(Reply::Ran(Outcome::Done(_)))),
-            "{installed:?}"
-        );
+        cluster.install_package(agent, SHOP, &self.package(upgraded));
     }
 
     /// Alice's request starting workflow `name`, at `sequence` of the
