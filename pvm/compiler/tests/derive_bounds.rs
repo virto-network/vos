@@ -23,6 +23,16 @@ fn i_type(opcode: u32, funct3: u32, rd: u32, rs1: u32, imm: i32) -> u32 {
     ((imm as u32 & 0xfff) << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | opcode
 }
 
+/// Section types: program bits, a symbol table, a string table, and
+/// relocations with addends.
+const PROGBITS: u32 = 1;
+const SYMTAB: u32 = 2;
+const STRTAB: u32 = 3;
+const RELA: u32 = 4;
+/// Section flags: loaded, and executed.
+const ALLOC: u64 = 2;
+const EXECUTE: u64 = 4;
+
 /// A section: its name, type, flags, address, contents, link and info.
 struct Section {
     name: &'static str,
@@ -32,6 +42,50 @@ struct Section {
     bytes: Vec<u8>,
     link: u32,
     info: u32,
+}
+
+impl Section {
+    /// Loaded bytes at `address`, with `flags` beside `ALLOC`.
+    fn loaded(name: &'static str, flags: u64, address: u64, bytes: Vec<u8>) -> Self {
+        Self {
+            name,
+            kind: PROGBITS,
+            flags: ALLOC | flags,
+            address,
+            bytes,
+            link: 0,
+            info: 0,
+        }
+    }
+
+    /// A table the program does not load: of `kind`, linked to section
+    /// `link`, and applying to section `info`.
+    fn table(name: &'static str, kind: u32, bytes: Vec<u8>, link: u32, info: u32) -> Self {
+        Self {
+            name,
+            kind,
+            flags: 0,
+            address: 0,
+            bytes,
+            link,
+            info,
+        }
+    }
+}
+
+/// A section header for `section`, its name at `name` of the names' table
+/// and its bytes at `at` of the file.
+fn header(file: &mut Vec<u8>, section: &Section, name: u32, at: u64) {
+    let mut h = [0u8; 64];
+    h[0..4].copy_from_slice(&name.to_le_bytes());
+    h[4..8].copy_from_slice(&section.kind.to_le_bytes());
+    h[8..16].copy_from_slice(&section.flags.to_le_bytes());
+    h[16..24].copy_from_slice(&section.address.to_le_bytes());
+    h[24..32].copy_from_slice(&at.to_le_bytes());
+    h[32..40].copy_from_slice(&(section.bytes.len() as u64).to_le_bytes());
+    h[40..44].copy_from_slice(&section.link.to_le_bytes());
+    h[44..48].copy_from_slice(&section.info.to_le_bytes());
+    file.extend_from_slice(&h);
 }
 
 /// An ELF64 of `sections`, a NULL section before them and the names'
@@ -57,51 +111,12 @@ fn elf(entry: u64, sections: Vec<Section>) -> Vec<u8> {
         file.push(0);
     }
     let table_at = file.len() as u64;
-    let header = |file: &mut Vec<u8>,
-                  name: u32,
-                  kind: u32,
-                  flags: u64,
-                  address: u64,
-                  at: u64,
-                  size: u64,
-                  link: u32,
-                  info: u32| {
-        let mut h = [0u8; 64];
-        h[0..4].copy_from_slice(&name.to_le_bytes());
-        h[4..8].copy_from_slice(&kind.to_le_bytes());
-        h[8..16].copy_from_slice(&flags.to_le_bytes());
-        h[16..24].copy_from_slice(&address.to_le_bytes());
-        h[24..32].copy_from_slice(&at.to_le_bytes());
-        h[32..40].copy_from_slice(&size.to_le_bytes());
-        h[40..44].copy_from_slice(&link.to_le_bytes());
-        h[44..48].copy_from_slice(&info.to_le_bytes());
-        file.extend_from_slice(&h);
-    };
-    header(&mut file, 0, 0, 0, 0, 0, 0, 0, 0);
+    header(&mut file, &Section::table("", 0, Vec::new(), 0, 0), 0, 0);
     for (section, (name, at)) in sections.iter().zip(&offsets) {
-        header(
-            &mut file,
-            *name,
-            section.kind,
-            section.flags,
-            section.address,
-            *at,
-            section.bytes.len() as u64,
-            section.link,
-            section.info,
-        );
+        header(&mut file, section, *name, *at);
     }
-    header(
-        &mut file,
-        names_name,
-        3,
-        0,
-        0,
-        names_at,
-        names.len() as u64,
-        0,
-        0,
-    );
+    let shstrtab = Section::table(".shstrtab", STRTAB, names, 0, 0);
+    header(&mut file, &shstrtab, names_name, names_at);
     let count = sections.len() as u16 + 2;
     file[0..4].copy_from_slice(b"\x7fELF");
     file[4] = 2;
@@ -194,69 +209,13 @@ fn crafted() -> Vec<u8> {
     elf(
         start,
         vec![
-            Section {
-                name: ".vos_schema",
-                kind: 1,
-                flags: 2,
-                address: SCHEMA,
-                bytes: schema,
-                link: 0,
-                info: 0,
-            },
-            Section {
-                name: ".rodata",
-                kind: 1,
-                flags: 2,
-                address: rodata_at,
-                bytes: rodata,
-                link: 0,
-                info: 0,
-            },
-            Section {
-                name: ".text",
-                kind: 1,
-                flags: 6,
-                address: TEXT,
-                bytes: code,
-                link: 0,
-                info: 0,
-            },
-            Section {
-                name: ".symtab",
-                kind: 2,
-                flags: 0,
-                address: 0,
-                bytes: symtab,
-                link: 5,
-                info: 0,
-            },
-            Section {
-                name: ".strtab",
-                kind: 3,
-                flags: 0,
-                address: 0,
-                bytes: strtab,
-                link: 0,
-                info: 0,
-            },
-            Section {
-                name: ".rela.text",
-                kind: 4,
-                flags: 0,
-                address: 0,
-                bytes: text_relocations,
-                link: 4,
-                info: 3,
-            },
-            Section {
-                name: ".rela.rodata",
-                kind: 4,
-                flags: 0,
-                address: 0,
-                bytes: data_relocations,
-                link: 4,
-                info: 2,
-            },
+            Section::loaded(".vos_schema", 0, SCHEMA, schema),
+            Section::loaded(".rodata", 0, rodata_at, rodata),
+            Section::loaded(".text", EXECUTE, TEXT, code),
+            Section::table(".symtab", SYMTAB, symtab, 5, 0),
+            Section::table(".strtab", STRTAB, strtab, 0, 0),
+            Section::table(".rela.text", RELA, text_relocations, 4, 3),
+            Section::table(".rela.rodata", RELA, data_relocations, 4, 2),
         ],
     )
 }
@@ -267,14 +226,14 @@ fn a_crafted_package_derives_in_bounded_time() {
     let started = Instant::now();
     let derived = derive(&elf).expect("derives");
     let took = started.elapsed();
-    println!(
-        "{} MiB package, {WORDS} code-like words, {ENTRIES} jump table entries: derived in {took:?}",
-        elf.len() >> 20
-    );
     assert_eq!(derived.kernels.len(), 1);
     assert!(
         derived.kernels[0].1.len() > 8 * WORDS,
         "the kernel holds the words its entry reads"
     );
-    assert!(took < Duration::from_secs(30), "{took:?}");
+    assert!(
+        took < Duration::from_secs(30),
+        "{} MiB package, {WORDS} code-like words, {ENTRIES} jump table entries: derived in {took:?}",
+        elf.len() >> 20
+    );
 }

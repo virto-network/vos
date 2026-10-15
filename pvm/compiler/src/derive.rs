@@ -40,10 +40,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use crate::TranspileError;
 use crate::linker::{
-    Link, LinkedElf, STT_FUNC, Z_Z, in_ranges, merge_ranges, name_at, name_is,
-    overlaps_data_relocation, parse_linked_elf, spi_blob, transpile_with, zone_round,
+    Link, LinkedElf, STT_FUNC, Z_Z, in_ranges, merge_ranges, name_at, name_is, parse_linked_elf,
+    range_at, raw_code_pointers, spi_blob, transpile_with, zone_round,
 };
-use crate::riscv::{decode_b_imm, decode_j_imm};
+use crate::riscv::{self, decode_b_imm, decode_j_imm, op};
 
 /// The derivation's version: it changes whenever the bytes it derives from
 /// the same ELF may, so a derived program's hash is pinned per version.
@@ -54,6 +54,10 @@ pub const MAX_ELF: usize = 64 << 20;
 
 /// The most attestable methods an actor may have: a schema's methods.
 const MAX_ATTESTABLES: usize = 1024;
+
+/// A `VOS_ATTEST` entry's length: a method's id, then its entry's address,
+/// eight bytes each.
+const ATTEST_ENTRY: u64 = 16;
 
 /// What an ELF derives: its actor's program, a kernel per attestable
 /// method by its id in ascending order, the schema's section as the ELF's
@@ -100,7 +104,7 @@ pub fn derive(elf: &[u8]) -> Result<Derived, DeriveError> {
     if elf.len() > MAX_ELF {
         return Err(DeriveError::TooLarge(elf.len()));
     }
-    let linked = parse_linked_elf(elf)?;
+    let mut linked = parse_linked_elf(elf)?;
     if linked.relocations == 0 {
         return Err(DeriveError::NoRelocations);
     }
@@ -110,9 +114,8 @@ pub fn derive(elf: &[u8]) -> Result<Derived, DeriveError> {
     if linked.code_sections.len() > 1 {
         return Err(DeriveError::CodeSections(linked.code_sections.len()));
     }
-    let schema = linked.schema.clone().ok_or(DeriveError::NoSchema)?;
-    let (actor, _) = transpile_with(&linked, Link::Whole)?;
-    let actor = spi_blob(actor)?;
+    let schema = linked.schema.take().ok_or(DeriveError::NoSchema)?;
+    let actor = spi_blob(transpile_with(&linked, Link::Whole)?)?;
     let graph = Graph::new(&linked);
     let kernels = attestables(&linked)?
         .into_iter()
@@ -137,13 +140,13 @@ fn attestables(elf: &LinkedElf) -> Result<Vec<(u32, u64)>, DeriveError> {
     else {
         return Ok(Vec::new());
     };
-    if !symbol.size.is_multiple_of(16) {
+    if !symbol.size.is_multiple_of(ATTEST_ENTRY) {
         return Err(table("its size is no whole number of entries"));
     }
-    if symbol.size / 16 > MAX_ATTESTABLES as u64 {
+    if symbol.size / ATTEST_ENTRY > MAX_ATTESTABLES as u64 {
         return Err(table(&format!(
             "{} entries, past {MAX_ATTESTABLES}",
-            symbol.size / 16
+            symbol.size / ATTEST_ENTRY
         )));
     }
     let start = symbol
@@ -155,15 +158,16 @@ fn attestables(elf: &LinkedElf) -> Result<Vec<(u32, u64)>, DeriveError> {
         .checked_add(symbol.size as usize)
         .and_then(|end| elf.ro_data.get(start..end))
         .ok_or_else(|| table("it lies outside the read-only data"))?;
-    let entry_at = |index: usize| symbol.value + index as u64 * 16 + 8;
+    let entry_at = |index: usize| symbol.value + index as u64 * ATTEST_ENTRY + 8;
+    let count = bytes.len() / ATTEST_ENTRY as usize;
     let relocated: HashMap<u64, u64> = elf
         .data_relocs
         .iter()
         .copied()
-        .filter(|&(at, _)| (entry_at(0)..entry_at(bytes.len() / 16)).contains(&at))
+        .filter(|&(at, _)| (entry_at(0)..entry_at(count)).contains(&at))
         .collect();
     let mut entries = BTreeMap::new();
-    for (index, entry) in bytes.chunks_exact(16).enumerate() {
+    for (index, entry) in bytes.chunks_exact(ATTEST_ENTRY as usize).enumerate() {
         let method = u64::from_le_bytes(entry[..8].try_into().expect("eight bytes"));
         let raw = u64::from_le_bytes(entry[8..].try_into().expect("eight bytes"));
         let address = relocated.get(&entry_at(index)).copied().unwrap_or(raw);
@@ -187,11 +191,6 @@ struct Graph<'a> {
     functions: BTreeMap<u64, u64>,
     /// The data objects, sorted and disjoint, covering each data region.
     objects: Vec<(u64, u64)>,
-    /// Calls and PC-relative pairs: where in code, and what they name.
-    calls: BTreeMap<u64, u64>,
-    pairs: BTreeMap<u64, u64>,
-    /// The second halves of PC-relative pairs, where they lie.
-    lows: BTreeSet<u64>,
     /// Relocations placing an address in data: where, and what.
     data: Vec<(u64, u64)>,
     /// Relocations naming an address by a symbol: where, and the symbol's
@@ -219,7 +218,6 @@ impl<'a> Graph<'a> {
                 *size = (*size).max(symbol.size);
             }
         }
-        let sorted = |pairs: &HashMap<u64, u64>| pairs.iter().map(|(&at, &to)| (at, to)).collect();
         let mut data = elf.data_relocs.clone();
         data.sort_unstable();
         let mut symbols = elf.symbol_refs.clone();
@@ -232,9 +230,6 @@ impl<'a> Graph<'a> {
             elf,
             functions,
             objects: blocks(elf, &objects),
-            calls: sorted(&elf.call_targets),
-            pairs: sorted(&elf.hi20_targets),
-            lows: elf.lo12_sites.iter().copied().collect(),
             data,
             symbols,
             targets: elf.control_flow_targets.iter().copied().collect(),
@@ -245,10 +240,7 @@ impl<'a> Graph<'a> {
 
     /// The code section holding `address`.
     fn section(&self, address: u64) -> Option<(u64, u64)> {
-        let ranges = &self.elf.code_ranges;
-        let index = ranges.partition_point(|&(lo, _)| lo <= address);
-        let (lo, hi) = *ranges.get(index.checked_sub(1)?)?;
-        (address < hi).then_some((lo, hi))
+        range_at(&self.elf.code_ranges, address)
     }
 
     /// The function holding `address`: the function symbol at or before
@@ -275,9 +267,7 @@ impl<'a> Graph<'a> {
 
     /// The data object holding `address`.
     fn object(&self, address: u64) -> Option<(u64, u64)> {
-        let index = self.objects.partition_point(|&(start, _)| start <= address);
-        let (start, end) = *self.objects.get(index.checked_sub(1)?)?;
-        (address < end).then_some((start, end))
+        range_at(&self.objects, address)
     }
 
     /// The function's name as the symbol table spells it, demangled.
@@ -308,25 +298,22 @@ impl<'a> Graph<'a> {
     /// the call and address pairs no relocation names, which the scan
     /// finds.
     fn named_by_code(&self, (start, end): (u64, u64)) -> Vec<u64> {
-        let mut named: Vec<u64> = self
-            .calls
+        let elf = self.elf;
+        let mut named: Vec<u64> = elf
+            .call_targets
             .range(start..end)
-            .chain(self.pairs.range(start..end))
+            .chain(elf.hi20_targets.range(start..end))
             .map(|(_, &to)| to)
             .chain(Self::named_in(&self.symbols, start, end))
             .collect();
         let Some(code) = self.code(start, end) else {
             return named;
         };
-        let words: Vec<u32> = code
-            .chunks_exact(4)
-            .map(|word| u32::from_le_bytes(word.try_into().expect("four bytes")))
-            .collect();
-        for (index, &word) in words.iter().enumerate() {
+        for (index, word) in riscv::words(code).enumerate() {
             let address = start + index as u64 * 4;
-            let offset = match word & 0x7f {
-                0x6f => Some(i64::from(decode_j_imm(word))),
-                0x63 => Some(i64::from(decode_b_imm(word))),
+            let offset = match riscv::opcode(word) {
+                op::JAL => Some(i64::from(decode_j_imm(word))),
+                op::BRANCH => Some(i64::from(decode_b_imm(word))),
                 _ => None,
             };
             if let Some(offset) = offset {
@@ -334,14 +321,13 @@ impl<'a> Graph<'a> {
             }
             // AUIPC then JALR or ADDI on its register: a call or an address
             // the scan finds.
-            if word & 0x7f == 0x17
-                && let Some(&next) = words.get(index + 1)
-                && (next >> 15) & 0x1f == (word >> 7) & 0x1f
-                && matches!(next & 0x707f, 0x67 | 0x13)
+            if riscv::opcode(word) == op::AUIPC
+                && let Some(next) = riscv::word_at(code, index * 4 + 4)
+                && riscv::rs1(next) == riscv::rd(word)
+                && riscv::funct3(next) == 0
+                && matches!(riscv::opcode(next), op::JALR | op::OP_IMM)
             {
-                let upper = i64::from((word & 0xffff_f000) as i32);
-                let lower = i64::from((next as i32) >> 20);
-                named.push(address.wrapping_add_signed(upper + lower));
+                named.push(riscv::auipc_pair_target(address, word, next));
             }
         }
         named
@@ -357,23 +343,22 @@ impl<'a> Graph<'a> {
         let Some((base, bytes)) = self.bytes(start) else {
             return named;
         };
-        let end = end.min(base + bytes.len() as u64);
-        let mut at = (start - base).div_ceil(8) * 8;
-        while base + at + 8 <= end {
-            let address = base + at;
-            let word = usize::try_from(at)
-                .ok()
-                .and_then(|at| bytes.get(at..at + 8))
-                .map(|word| u64::from_le_bytes(word.try_into().expect("eight bytes")));
-            let covered = overlaps_data_relocation(&self.elf.data_relocation_ranges, address, 8);
-            if let Some(word) = word
-                && !covered
-                && in_ranges(&self.elf.code_ranges, word)
-            {
-                named.push(word);
-            }
-            at += 8;
-        }
+        // The object's words, eight-byte aligned from its region's base.
+        let first = (start - base).div_ceil(8) * 8;
+        let last = end.min(base + bytes.len() as u64) - base;
+        let words = usize::try_from(first)
+            .ok()
+            .zip(usize::try_from(last).ok())
+            .and_then(|(first, last)| bytes.get(first..last))
+            .unwrap_or(&[]);
+        named.extend(
+            raw_code_pointers(
+                [(base + first, words)],
+                &self.elf.data_relocation_ranges,
+                &self.elf.code_ranges,
+            )
+            .map(|(_, target)| target),
+        );
         named
     }
 
@@ -389,11 +374,10 @@ impl<'a> Graph<'a> {
 
     /// The initialized data region holding `address`: its base and bytes.
     fn bytes(&self, address: u64) -> Option<(u64, &'a [u8])> {
-        let elf = self.elf;
-        [(elf.ro_base, &elf.ro_data), (elf.rw_base, &elf.rw_data)]
+        self.elf
+            .initialized()
             .into_iter()
             .find(|(base, bytes)| (*base..*base + bytes.len() as u64).contains(&address))
-            .map(|(base, bytes)| (base, bytes.as_slice()))
     }
 }
 
@@ -449,7 +433,8 @@ struct Reached {
 }
 
 impl Reached {
-    fn from(graph: &Graph, entry: u64) -> Self {
+    /// Walk what `entry` reaches in `graph`.
+    fn walk(graph: &Graph, entry: u64) -> Self {
         let mut reached = Reached {
             functions: BTreeMap::new(),
             objects: BTreeSet::new(),
@@ -533,17 +518,11 @@ fn overlapping(sorted: &[(u64, u64)], ranges: &[(u64, u64)]) -> Vec<(u64, u64)> 
 /// that calls it.
 fn kernel(graph: &Graph, method: u32, entry: u64) -> Result<Vec<u8>, DeriveError> {
     let elf = graph.elf;
-    let reached = Reached::from(graph, entry);
+    let reached = Reached::walk(graph, entry);
 
     // The functions reached, adjacent ones as one span, so code that falls
     // from one into the next still does; then the prologue.
-    let mut spans: Vec<(u64, u64)> = Vec::new();
-    for &(start, end) in reached.functions.keys() {
-        match spans.last_mut() {
-            Some(last) if last.1 >= start => last.1 = last.1.max(end),
-            _ => spans.push((start, end)),
-        }
-    }
+    let spans = merge_ranges(reached.functions.keys().copied().collect());
     let mut code_sections = Vec::with_capacity(spans.len() + 1);
     for &(start, end) in &spans {
         let code = graph
@@ -566,8 +545,7 @@ fn kernel(graph: &Graph, method: u32, entry: u64) -> Result<Vec<u8>, DeriveError
     // far as its last object reaches.
     let objects = merge_ranges(reached.objects.iter().copied().collect());
     let kept = |address: u64, len: u64| {
-        let index = objects.partition_point(|&(start, _)| start <= address);
-        index != 0 && address.saturating_add(len) <= objects[index - 1].1
+        range_at(&objects, address).is_some_and(|(_, end)| address.saturating_add(len) <= end)
     };
     let masked = |base: u64, original: &[u8], least: u64| {
         let last = objects
@@ -598,18 +576,18 @@ fn kernel(graph: &Graph, method: u32, entry: u64) -> Result<Vec<u8>, DeriveError
     let rw_data = masked(elf.rw_base, &elf.rw_data, 0);
 
     // What the kernel's linking needs of the ELF's relocations, its own.
-    let pairs = |map: &BTreeMap<u64, u64>| -> HashMap<u64, u64> {
+    let pairs = |map: &BTreeMap<u64, u64>| -> BTreeMap<u64, u64> {
         spans
             .iter()
             .flat_map(|&(start, end)| map.range(start..end).map(|(&at, &to)| (at, to)))
             .collect()
     };
-    let mut call_targets = pairs(&graph.calls);
-    call_targets.insert(prologue + 4, entry);
+    let mut call_targets = pairs(&elf.call_targets);
+    call_targets.insert(prologue + CALL_AT, entry);
     let control_flow_targets: HashSet<u64> = spans
         .iter()
         .flat_map(|&(start, end)| graph.targets.range(start..end).copied())
-        .chain([prologue, prologue + 12])
+        .chain([prologue, prologue + RETURN_AT])
         .collect();
     let abs_code_ptrs = within(&graph.pointers, |&(at, _, _)| at, &objects)
         .into_iter()
@@ -630,10 +608,10 @@ fn kernel(graph: &Graph, method: u32, entry: u64) -> Result<Vec<u8>, DeriveError
         rw_len: elf.rw_len,
         heap_pages: elf.heap_pages,
         relocations: elf.relocations,
-        hi20_targets: pairs(&graph.pairs),
+        hi20_targets: pairs(&elf.hi20_targets),
         lo12_sites: spans
             .iter()
-            .flat_map(|&(start, end)| graph.lows.range(start..end).copied())
+            .flat_map(|&(start, end)| elf.lo12_sites.range(start..end).copied())
             .collect(),
         call_targets,
         abs_code_ptrs,
@@ -645,8 +623,9 @@ fn kernel(graph: &Graph, method: u32, entry: u64) -> Result<Vec<u8>, DeriveError
         ..LinkedElf::default()
     };
 
-    let (transpiled, host_calls) = transpile_with(&kernel, Link::Kernel)?;
-    if let Some(&(address, id)) = host_calls
+    let transpiled = transpile_with(&kernel, Link::Kernel)?;
+    if let Some(&(address, id)) = transpiled
+        .host_calls
         .iter()
         .find(|&&(_, id)| !vos_pvm::precompile::is_precompile(u64::from(id)))
     {
@@ -659,18 +638,23 @@ fn kernel(graph: &Graph, method: u32, entry: u64) -> Result<Vec<u8>, DeriveError
     Ok(spi_blob(transpiled)?)
 }
 
+/// Where [`prologue_code`]'s call to the entry lies, and where the entry
+/// returns to.
+const CALL_AT: u64 = 4;
+const RETURN_AT: u64 = 12;
+
 /// The prologue at a kernel's instruction 0, as an attestable program's
 /// `_start`: keep the halt address, call the entry, and return to it.
 fn prologue_code() -> Vec<u8> {
     const RA: u32 = 1;
     const S0: u32 = 8;
-    let addi = |rd: u32, rs1: u32| (rs1 << 15) | (rd << 7) | 0x13;
-    let jalr = |rd: u32, rs1: u32| (rs1 << 15) | (rd << 7) | 0x67;
+    let addi = |rd: u32, rs1: u32| (rs1 << 15) | (rd << 7) | op::OP_IMM;
+    let jalr = |rd: u32, rs1: u32| (rs1 << 15) | (rd << 7) | op::JALR;
     [
         addi(S0, RA),
-        (RA << 7) | 0x17, // auipc ra, 0: the call to the entry
+        (RA << 7) | op::AUIPC, // auipc ra, 0: the call to the entry, at CALL_AT
         jalr(RA, RA),
-        addi(RA, S0),
+        addi(RA, S0), // RETURN_AT
         jalr(0, RA),
     ]
     .into_iter()

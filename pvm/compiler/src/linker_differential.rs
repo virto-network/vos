@@ -10,7 +10,7 @@
 use proptest::prelude::*;
 use vos_pvm::{ExitReason, refine};
 
-use super::{LinkedElf, spi_blob, transpile_linked};
+use super::{Link, LinkedElf, spi_blob, transpile_with};
 
 const TEXT: u64 = 0x40_0000;
 /// The registers a program may read and write besides x0: t0..a5. ra holds
@@ -279,7 +279,7 @@ fn assemble(body: &[Inst]) -> Vec<u8> {
 /// targets.
 fn link(text: &[u8]) -> Vec<u8> {
     let elf = LinkedElf::text(TEXT, text.to_vec());
-    spi_blob(transpile_linked(&elf).expect("translates")).expect("links")
+    spi_blob(transpile_with(&elf, Link::Whole).expect("translates")).expect("links")
 }
 
 /// RV64IM semantics for the generated subset.

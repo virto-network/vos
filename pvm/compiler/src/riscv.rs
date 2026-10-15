@@ -3,6 +3,10 @@
 //! Decodes rv64em instructions and translates them to equivalent
 //! PVM bytecode sequences.
 
+use std::collections::{BTreeSet, HashMap};
+
+use vos_pvm::instruction::Opcode;
+
 use crate::TranspileError;
 
 /// RISC-V register to PVM register mapping.
@@ -57,22 +61,23 @@ fn encode_var_imm(imm: i32) -> (u8, Vec<u8>) {
 
 /// Translation context for converting RISC-V to PVM.
 #[derive(Default)]
-pub struct TranslationContext {
+pub(crate) struct TranslationContext {
     /// Emitted PVM code bytes.
-    pub code: Vec<u8>,
+    pub(crate) code: Vec<u8>,
     /// Bitmask: 1 for instruction start, 0 for continuation.
-    pub bitmask: Vec<u8>,
+    pub(crate) bitmask: Vec<u8>,
     /// Jump table entries.
-    pub jump_table: Vec<u32>,
+    pub(crate) jump_table: Vec<u32>,
     /// Map from RISC-V address to PVM code offset.
-    pub address_map: std::collections::HashMap<u64, u32>,
+    pub(crate) address_map: HashMap<u64, u32>,
     /// Pending branch fixups: (pvm_imm_offset, target_rv_address, fixup_size)
     fixups: Vec<(usize, u64, u8)>,
     /// Map from fixup imm offset → instruction PC (for PC-relative encoding)
-    fixup_pcs: std::collections::HashMap<usize, u32>,
-    /// Return-address fixups: (jump_table_index, risc-v return address).
+    fixup_pcs: HashMap<usize, u32>,
+    /// Jump-table fixups: (jump_table_index, RISC-V address its entry
+    /// names), a return address or a code address loaded as a value.
     /// Resolved during `apply_fixups` to patch jump table entries.
-    pub(crate) return_fixups: Vec<(usize, u64)>,
+    return_fixups: Vec<(usize, u64)>,
     /// Pending AUIPC: (rd, computed_address). Used to pair with the next JALR.
     pending_auipc: Option<(u8, u64)>,
     /// Pending LUI: (rd, upper_imm). Used to fuse LUI+ADDI into single load_imm.
@@ -89,7 +94,7 @@ pub struct TranslationContext {
     /// RISC-V code address ranges (lo, hi), sorted and merged — used to
     /// detect function pointers loaded via auipc+addi that need jump table
     /// entries.
-    pub code_ranges: Vec<(u64, u64)>,
+    pub(crate) code_ranges: Vec<(u64, u64)>,
     /// Each `ecalli` emitted: the RISC-V address of its `ecall`, and its id.
     pub(crate) host_calls: Vec<(u64, u32)>,
     /// Point a branch whose target was never translated at a trap, rather
@@ -131,238 +136,172 @@ impl TranslationContext {
         Ok(())
     }
 
-    /// Translate one or more 32-bit RISC-V instructions starting at `offset`.
-    /// Returns the number of bytes consumed (always 4).
-    pub(crate) fn translate_instruction(
-        &mut self,
-        section: &[u8],
-        offset: usize,
-        base: u64,
-    ) -> Result<usize, TranspileError> {
-        let inst = u32::from_le_bytes([
-            section[offset],
-            section[offset + 1],
-            section[offset + 2],
-            section[offset + 3],
-        ]);
-        let addr = base + offset as u64;
-        self.translate_one(inst, addr)?;
-        Ok(4)
-    }
-
-    /// Translate a single 32-bit RISC-V instruction.
-    fn translate_one(&mut self, inst: u32, addr: u64) -> Result<(), TranspileError> {
-        let opcode = inst & 0x7F;
-        let rd = ((inst >> 7) & 0x1F) as u8;
-        let funct3 = (inst >> 12) & 0x7;
-        let rs1 = ((inst >> 15) & 0x1F) as u8;
-        let rs2 = ((inst >> 20) & 0x1F) as u8;
-        let funct7 = (inst >> 25) & 0x7F;
+    /// Translate the 32-bit RISC-V instruction `inst` at `addr`.
+    pub(crate) fn translate_one(&mut self, inst: u32, addr: u64) -> Result<(), TranspileError> {
+        let opcode = opcode(inst);
+        let rd = rd(inst);
+        let funct3 = funct3(inst);
+        let rs1 = rs1(inst);
+        let rs2 = rs2(inst);
+        let funct7 = funct7(inst);
 
         // Flush pending auipc if this isn't a JALR or OP-IMM (ADDI) that consumes it.
-        if opcode != 0x67
-            && opcode != 0x13
+        if opcode != op::JALR
+            && opcode != op::OP_IMM
             && let Some((auipc_rd, auipc_val)) = self.pending_auipc.take()
         {
             self.emit_load_imm(auipc_rd, auipc_val as i64)?;
         }
 
         // Flush pending LUI if this isn't an OP-IMM (ADDI) that consumes it.
-        if opcode != 0x13
+        if opcode != op::OP_IMM
             && let Some((lui_rd, lui_val)) = self.pending_lui.take()
         {
             self.emit_load_imm(lui_rd, lui_val)?;
         }
 
         // Clear pending_load_imm if this isn't an instruction that can consume it.
-        // OP (0x33), OP-32 (0x3B), Branch (0x63), Store (0x23), and Load (0x03)
-        // handlers check and potentially fuse.
-        if opcode != 0x33 && opcode != 0x3B && opcode != 0x63 && opcode != 0x23 && opcode != 0x03 {
+        // The OP, OP-32, branch, store and load handlers check and potentially fuse.
+        if !matches!(
+            opcode,
+            op::OP | op::OP_32 | op::BRANCH | op::STORE | op::LOAD
+        ) {
             self.pending_load_imm = None; // already emitted, just clear tracking
         }
 
         match opcode {
-            0x37 => {
-                // LUI — buffer for potential LUI+ADDI fusion
-                let imm = (inst & 0xFFFFF000) as i32;
+            op::LUI => {
+                // Buffered for potential LUI+ADDI fusion
+                let imm = u_imm(inst);
                 // Flush any previous pending LUI (consecutive LUIs)
                 if let Some((prev_rd, prev_val)) = self.pending_lui.take() {
                     self.emit_load_imm(prev_rd, prev_val)?;
                 }
                 self.pending_lui = Some((rd, imm as i64));
             }
-            0x17 => {
-                // AUIPC — PC + upper immediate
-                let imm = (inst & 0xFFFFF000) as i32;
-                let computed = (addr as i64 + imm as i64) as u64;
-                // Record for pairing with the next JALR instruction.
-                // Don't emit anything yet — the JALR handler will use this.
+            op::AUIPC => {
+                // PC + upper immediate, recorded for pairing with the next
+                // JALR. Nothing is emitted yet: the JALR handler uses it.
+                let computed = (addr as i64 + u_imm(inst) as i64) as u64;
                 self.pending_auipc = Some((rd, computed));
             }
-            0x6F => {
-                // JAL
+            op::JAL => {
                 let imm = decode_j_imm(inst);
                 let target = (addr as i64 + imm as i64) as u64;
                 if rd == 0 {
                     // Plain jump (tail call / goto)
                     self.emit_jump(target);
                 } else {
-                    // Function call: fused load_imm_jump (opcode 80)
+                    // Function call: fused load_imm_jump
                     let rv_return_addr = addr + 4;
                     self.emit_call(rd, rv_return_addr, target)?;
                 }
             }
-            0x67 => {
-                // JALR
-                match funct3 {
-                    0 => {
-                        let imm = (inst as i32) >> 20;
-                        self.translate_jalr(rd, rs1, imm, addr)?;
-                    }
-                    _ => {
-                        return Err(TranspileError::UnsupportedInstruction {
-                            offset: addr as usize,
-                            detail: format!("JALR funct3={funct3}"),
-                        });
-                    }
+            op::JALR => {
+                if funct3 != 0 {
+                    return Err(TranspileError::UnsupportedInstruction {
+                        offset: addr as usize,
+                        detail: format!("JALR funct3={funct3}"),
+                    });
                 }
+                self.translate_jalr(rd, rs1, i_imm(inst), addr)?;
             }
-            0x63 => {
-                // Branch
+            op::BRANCH => {
                 let imm = decode_b_imm(inst);
                 let target = (addr as i64 + imm as i64) as u64;
                 self.translate_branch(funct3, rs1, rs2, target, addr)?;
             }
-            0x03 => {
-                // Load
-                let imm = (inst as i32) >> 20;
-                self.translate_load(funct3, rd, rs1, imm, addr)?;
-            }
-            0x23 => {
-                // Store
-                let imm = decode_s_imm(inst);
-                self.translate_store(funct3, rs1, rs2, imm, addr)?;
-            }
-            0x13 => {
-                // OP-IMM (add_i, xor_i, etc.)
-                let imm = (inst as i32) >> 20;
-                self.translate_op_imm(funct3, funct7, rd, rs1, imm)?;
-            }
-            0x33 => {
-                // OP (add, sub, mul, etc.)
-                self.translate_op(funct3, funct7, rd, rs1, rs2, addr)?;
-            }
-            0x1B => {
-                // OP-IMM-32 (addiw, slliw, etc.) — RV64 only
-                let imm = (inst as i32) >> 20;
-                self.translate_op_imm_32(funct3, funct7, rd, rs1, imm)?;
-            }
-            0x3B => {
-                // OP-32 (addw, subw, etc.) — RV64 only
-                self.translate_op_32(funct3, funct7, rd, rs1, rs2, addr)?;
-            }
-            0x73 => {
-                // SYSTEM
-                match funct3 {
-                    0 => {
-                        let csr = (inst >> 20) & 0xFFF;
-                        match csr {
-                            0 => {
-                                // ECALL: a marked one becomes `ecalli`; an
-                                // unmarked one traps.
-                                if std::mem::take(&mut self.ecalli_marked) {
-                                    let id = self.last_t0_imm.unwrap_or(0) as u32;
-                                    self.emit_ecalli(id);
-                                    self.host_calls.push((addr, id));
-                                    self.last_t0_imm = None;
-                                } else {
-                                    self.emit_inst(0);
-                                }
-                            }
-                            1 => self.emit_inst(0), // EBREAK → trap
-                            _ => self.emit_inst(0), // unimp/unknown CSR → trap
-                        }
+            op::LOAD => self.translate_load(funct3, rd, rs1, i_imm(inst), addr)?,
+            op::STORE => self.translate_store(funct3, rs1, rs2, decode_s_imm(inst), addr)?,
+            // add_i, xor_i, etc.
+            op::OP_IMM => self.translate_op_imm(funct3, funct7, rd, rs1, i_imm(inst))?,
+            // add, sub, mul, etc.
+            op::OP => self.translate_op(funct3, funct7, rd, rs1, rs2, addr)?,
+            // addiw, slliw, etc.
+            op::OP_IMM_32 => self.translate_op_imm_32(funct3, funct7, rd, rs1, i_imm(inst))?,
+            // addw, subw, etc.
+            op::OP_32 => self.translate_op_32(funct3, funct7, rd, rs1, rs2, addr)?,
+            op::SYSTEM => match (funct3, csr(inst)) {
+                // ECALL: a marked one becomes `ecalli`; an unmarked one traps.
+                (0, 0) => {
+                    if std::mem::take(&mut self.ecalli_marked) {
+                        let id = self.last_t0_imm.unwrap_or(0) as u32;
+                        self.emit_ecalli(id);
+                        self.host_calls.push((addr, id));
+                        self.last_t0_imm = None;
+                    } else {
+                        self.emit_op(Opcode::Trap);
                     }
-                    1 => {
-                        // CSRRW: CSR 0x801 marks the next ecall as `ecalli`
-                        // and emits no PVM instruction itself.
-                        let csr = (inst >> 20) & 0xFFF;
-                        if csr == 0x801 {
-                            self.ecalli_marked = true;
-                        } else {
-                            self.emit_inst(0); // unknown CSR → trap
-                        }
-                    }
-                    _ => self.emit_inst(0), // other CSR ops → trap
                 }
-            }
-            0x0F => {
-                // FENCE
-                self.emit_inst(1); // → fallthrough (nop)
-            }
-            0x0B => {
-                // CUSTOM-0 — T-Head extensions
-                match (funct7, funct3) {
-                    (0x20, 1) => {
-                        // th.mveqz rd, rs1, rs2: if rs2 == 0 then rd = rs1
-                        if rd == 0 { /* nop */
-                        } else if rs2 == 0 {
-                            // Condition is x0 (always 0) → always execute: rd = rs1
-                            if rs1 == 0 {
-                                self.emit_load_imm(rd, 0)?;
-                            } else if rd == rs1 {
-                                // Self-move is a nop
-                                self.emit_inst(1); // fallthrough
-                            } else {
-                                let pvm_rd = self.require_reg(rd)?;
-                                let pvm_rs1 = self.require_reg(rs1)?;
-                                self.emit_inst(100); // move_reg
-                                self.emit_data(pvm_rd | (pvm_rs1 << 4));
-                            }
-                        } else if rs1 == 0 {
-                            // Source is x0 (always 0): if rs2 == 0 then rd = 0
-                            let pvm_rd = self.require_reg(rd)?;
-                            let pvm_rs2 = self.require_reg(rs2)?;
-                            self.emit_inst(147); // CmovIzImm
-                            self.emit_data(pvm_rd | (pvm_rs2 << 4));
-                            self.emit_var_imm(0);
+                // CSRRW: CSR 0x801 marks the next ecall as `ecalli` and
+                // emits no PVM instruction itself.
+                (1, 0x801) => self.ecalli_marked = true,
+                // EBREAK, unimp, and every other CSR operation trap.
+                _ => self.emit_op(Opcode::Trap),
+            },
+            // FENCE is a no-op.
+            op::MISC_MEM => self.emit_op(Opcode::Fallthrough),
+            // T-Head extensions
+            op::CUSTOM_0 => match (funct7, funct3) {
+                (0x20, 1) => {
+                    // th.mveqz rd, rs1, rs2: if rs2 == 0 then rd = rs1
+                    if rd == 0 { /* nop */
+                    } else if rs2 == 0 {
+                        // Condition is x0 (always 0) → always execute: rd = rs1
+                        if rs1 == 0 {
+                            self.emit_load_imm(rd, 0)?;
+                        } else if rd == rs1 {
+                            // Self-move is a nop
+                            self.emit_op(Opcode::Fallthrough);
                         } else {
                             let pvm_rd = self.require_reg(rd)?;
                             let pvm_rs1 = self.require_reg(rs1)?;
-                            let pvm_rs2 = self.require_reg(rs2)?;
-                            self.emit_inst(218); // CmovIz
-                            self.emit_data(pvm_rs1 | (pvm_rs2 << 4));
-                            self.emit_data(pvm_rd);
+                            self.emit_op(Opcode::MoveReg);
+                            self.emit_data(pvm_rd | (pvm_rs1 << 4));
                         }
-                    }
-                    (0x21, 1) => {
-                        // th.mvnez rd, rs1, rs2: if rs2 != 0 then rd = rs1
-                        if rd == 0 || rs2 == 0 {
-                            // rd==0: nop. rs2==x0: condition "x0 != 0" is always false → nop
-                            self.emit_inst(1); // fallthrough
-                        } else if rs1 == 0 {
-                            let pvm_rd = self.require_reg(rd)?;
-                            let pvm_rs2 = self.require_reg(rs2)?;
-                            self.emit_inst(148); // CmovNzImm
-                            self.emit_data(pvm_rd | (pvm_rs2 << 4));
-                            self.emit_var_imm(0);
-                        } else {
-                            let pvm_rd = self.require_reg(rd)?;
-                            let pvm_rs1 = self.require_reg(rs1)?;
-                            let pvm_rs2 = self.require_reg(rs2)?;
-                            self.emit_inst(219); // CmovNz
-                            self.emit_data(pvm_rs1 | (pvm_rs2 << 4));
-                            self.emit_data(pvm_rd);
-                        }
-                    }
-                    _ => {
-                        return Err(TranspileError::UnsupportedInstruction {
-                            offset: addr as usize,
-                            detail: format!("custom-0 funct7={funct7:#x} funct3={funct3}"),
-                        });
+                    } else if rs1 == 0 {
+                        // Source is x0 (always 0): if rs2 == 0 then rd = 0
+                        let pvm_rd = self.require_reg(rd)?;
+                        let pvm_rs2 = self.require_reg(rs2)?;
+                        self.emit_op(Opcode::CmovIzImm);
+                        self.emit_data(pvm_rd | (pvm_rs2 << 4));
+                        self.emit_var_imm(0);
+                    } else {
+                        let pvm_rd = self.require_reg(rd)?;
+                        let pvm_rs1 = self.require_reg(rs1)?;
+                        let pvm_rs2 = self.require_reg(rs2)?;
+                        self.emit_op(Opcode::CmovIz);
+                        self.emit_data(pvm_rs1 | (pvm_rs2 << 4));
+                        self.emit_data(pvm_rd);
                     }
                 }
-            }
+                (0x21, 1) => {
+                    // th.mvnez rd, rs1, rs2: if rs2 != 0 then rd = rs1
+                    if rd == 0 || rs2 == 0 {
+                        // rd==0: nop. rs2==x0: condition "x0 != 0" is always false → nop
+                        self.emit_op(Opcode::Fallthrough);
+                    } else if rs1 == 0 {
+                        let pvm_rd = self.require_reg(rd)?;
+                        let pvm_rs2 = self.require_reg(rs2)?;
+                        self.emit_op(Opcode::CmovNzImm);
+                        self.emit_data(pvm_rd | (pvm_rs2 << 4));
+                        self.emit_var_imm(0);
+                    } else {
+                        let pvm_rd = self.require_reg(rd)?;
+                        let pvm_rs1 = self.require_reg(rs1)?;
+                        let pvm_rs2 = self.require_reg(rs2)?;
+                        self.emit_op(Opcode::CmovNz);
+                        self.emit_data(pvm_rs1 | (pvm_rs2 << 4));
+                        self.emit_data(pvm_rd);
+                    }
+                }
+                _ => {
+                    return Err(TranspileError::UnsupportedInstruction {
+                        offset: addr as usize,
+                        detail: format!("custom-0 funct7={funct7:#x} funct3={funct3}"),
+                    });
+                }
+            },
             _ => {
                 return Err(TranspileError::UnsupportedInstruction {
                     offset: addr as usize,
@@ -390,7 +329,7 @@ impl TranslationContext {
                     // Tail call: just jump, no return address
                     self.emit_jump(target);
                 } else {
-                    // Function call: fused load_imm_jump (opcode 80)
+                    // Function call: fused load_imm_jump
                     let rv_return_addr = addr + 4;
                     self.emit_call(rd, rv_return_addr, target)?;
                 }
@@ -407,7 +346,7 @@ impl TranslationContext {
             let target = i64::from(imm) as u64;
             let is_code = self.is_code_addr(target);
             if !is_code {
-                self.emit_inst(0); // trap
+                self.emit_op(Opcode::Trap);
             } else if rd == 0 {
                 self.emit_jump(target);
             } else {
@@ -421,23 +360,19 @@ impl TranslationContext {
             // Tail call or return: jump_ind without saving return address.
             // Handles ret (rs1=ra, imm=0) and tail calls through any register.
             let pvm_rs1 = self.require_reg(rs1)?;
-            self.emit_inst(50); // jump_ind
+            self.emit_op(Opcode::JumpInd);
             self.emit_data(pvm_rs1);
             self.emit_var_imm(imm);
         } else {
             // Indirect call (e.g. vtable dispatch): save return address then jump.
-            // Use load_imm_jump_ind (opcode 180): rd = return_addr, jump via rs1+imm.
-            let rv_return_addr = addr + 4;
-            let jt_idx = self.jump_table.len();
-            self.jump_table.push(0); // placeholder
-            self.return_fixups.push((jt_idx, rv_return_addr));
-            let jt_addr = ((jt_idx + 1) * 2) as i32;
+            // load_imm_jump_ind: rd = return_addr, jump via rs1+imm.
+            let jt_addr = self.jump_table_slot(addr + 4) as i32;
 
             let pvm_rd = self.require_reg(rd)?;
             let pvm_rs1 = self.require_reg(rs1)?;
             let lx = Self::var_imm_byte_count(jt_addr);
 
-            self.emit_inst(180); // load_imm_jump_ind
+            self.emit_op(Opcode::LoadImmJumpInd);
             self.emit_data(pvm_rd | (pvm_rs1 << 4)); // reg_byte: ra=rd, rb=rs1
             self.emit_data(lx as u8); // lx: byte count for imm_x (return addr)
             self.emit_var_imm(jt_addr); // imm_x: jump table return address
@@ -482,12 +417,12 @@ impl TranslationContext {
         if rs2 == 0 {
             let pvm_rs1 = self.require_reg(rs1)?;
             let pvm_opcode = match funct3 {
-                0 => 81, // BEQ x, x0 → branch_eq_imm x, 0
-                1 => 82, // BNE x, x0 → branch_ne_imm x, 0
-                4 => 87, // BLT x, x0 → branch_lt_s_imm x, 0
-                5 => 89, // BGE x, x0 → branch_ge_s_imm x, 0
-                6 => 83, // BLTU x, x0 → branch_lt_u_imm x, 0
-                7 => 85, // BGEU x, x0 → branch_ge_u_imm x, 0
+                0 => Opcode::BranchEqImm,  // BEQ x, x0
+                1 => Opcode::BranchNeImm,  // BNE x, x0
+                4 => Opcode::BranchLtSImm, // BLT x, x0
+                5 => Opcode::BranchGeSImm, // BGE x, x0
+                6 => Opcode::BranchLtUImm, // BLTU x, x0
+                7 => Opcode::BranchGeUImm, // BGEU x, x0
                 _ => {
                     return Err(TranspileError::UnsupportedInstruction {
                         offset: 0,
@@ -503,12 +438,18 @@ impl TranslationContext {
             // Compare x0 against rs2: flip the condition
             let pvm_rs2 = self.require_reg(rs2)?;
             match funct3 {
-                0 => self.emit_branch_imm(81, pvm_rs2, 0, target), // BEQ x0, y → branch_eq_imm y, 0
-                1 => self.emit_branch_imm(82, pvm_rs2, 0, target), // BNE x0, y → branch_ne_imm y, 0
-                4 => self.emit_branch_imm(89, pvm_rs2, 1, target), // BLT x0, rs2 → rs2 >= 1 (signed)
-                5 => self.emit_branch_imm(87, pvm_rs2, 1, target), // BGE x0, rs2 → rs2 < 1 (signed)
-                6 => self.emit_branch_imm(82, pvm_rs2, 0, target), // BLTU x0, rs2 → rs2 != 0
-                7 => self.emit_branch_imm(81, pvm_rs2, 0, target), // BGEU x0, rs2 → rs2 == 0
+                // BEQ x0, y → y == 0
+                0 => self.emit_branch_imm(Opcode::BranchEqImm, pvm_rs2, 0, target),
+                // BNE x0, y → y != 0
+                1 => self.emit_branch_imm(Opcode::BranchNeImm, pvm_rs2, 0, target),
+                // BLT x0, rs2 → rs2 >= 1 (signed)
+                4 => self.emit_branch_imm(Opcode::BranchGeSImm, pvm_rs2, 1, target),
+                // BGE x0, rs2 → rs2 < 1 (signed)
+                5 => self.emit_branch_imm(Opcode::BranchLtSImm, pvm_rs2, 1, target),
+                // BLTU x0, rs2 → rs2 != 0
+                6 => self.emit_branch_imm(Opcode::BranchNeImm, pvm_rs2, 0, target),
+                // BGEU x0, rs2 → rs2 == 0
+                7 => self.emit_branch_imm(Opcode::BranchEqImm, pvm_rs2, 0, target),
                 _ => {
                     return Err(TranspileError::UnsupportedInstruction {
                         offset: 0,
@@ -522,14 +463,14 @@ impl TranslationContext {
         let pvm_rs1 = self.require_reg(rs1)?;
         let pvm_rs2 = self.require_reg(rs2)?;
 
-        // Two register + one offset: opcodes 170-175
+        // Two register + one offset
         let pvm_opcode = match funct3 {
-            0 => 170, // BEQ → branch_eq
-            1 => 171, // BNE → branch_ne
-            4 => 173, // BLT → branch_lt_s
-            5 => 175, // BGE → branch_ge_s
-            6 => 172, // BLTU → branch_lt_u
-            7 => 174, // BGEU → branch_ge_u
+            0 => Opcode::BranchEq,  // BEQ
+            1 => Opcode::BranchNe,  // BNE
+            4 => Opcode::BranchLtS, // BLT
+            5 => Opcode::BranchGeS, // BGE
+            6 => Opcode::BranchLtU, // BLTU
+            7 => Opcode::BranchGeU, // BGEU
             _ => {
                 return Err(TranspileError::UnsupportedInstruction {
                     offset: 0,
@@ -539,7 +480,7 @@ impl TranslationContext {
         };
 
         let inst_pc = self.code.len() as u32;
-        self.emit_inst(pvm_opcode);
+        self.emit_op(pvm_opcode);
         self.emit_data(pvm_rs1 | (pvm_rs2 << 4));
         // Fixup target offset (PC-relative)
         let fixup_pos = self.code.len();
@@ -578,53 +519,34 @@ impl TranslationContext {
             && rd == rs1
         {
             let combined = load_val.wrapping_add(imm as i64);
-            if combined >= i32::MIN as i64 && combined <= i32::MAX as i64 {
-                let direct_opcode = match funct3 {
-                    0 => Some(53), // LB → load_i8
-                    1 => Some(55), // LH → load_i16
-                    2 => Some(57), // LW → load_i32
-                    3 => Some(58), // LD → load_u64
-                    4 => Some(52), // LBU → load_u8
-                    5 => Some(54), // LHU → load_u16
-                    6 => Some(56), // LWU → load_u32
-                    _ => None,
-                };
-                if let Some(opc) = direct_opcode {
-                    // The load overwrites its base, so the load_imm is dead:
-                    // truncate it and repoint this instruction's address_map
-                    // entry to the fused load, else a branch targeting this load
-                    // resolves past the removed load_imm — into the middle of an
-                    // instruction (cf. translate_op, which does the same).
-                    self.drop_dead_load(rd, load_rd, undo_pos, addr);
-                    let pvm_rd = self.require_reg(rd)?;
-                    self.emit_inst(opc);
-                    self.emit_data(pvm_rd);
-                    self.emit_var_imm(combined as i32);
-                    return Ok(());
-                }
+            if combined >= i32::MIN as i64
+                && combined <= i32::MAX as i64
+                && let Some(opc) = direct_load(funct3)
+            {
+                // The load overwrites its base, so the load_imm is dead:
+                // truncate it and repoint this instruction's address_map
+                // entry to the fused load, else a branch targeting this load
+                // resolves past the removed load_imm — into the middle of an
+                // instruction (cf. translate_op, which does the same).
+                self.drop_dead_load(rd, load_rd, undo_pos, addr);
+                let pvm_rd = self.require_reg(rd)?;
+                self.emit_op(opc);
+                self.emit_data(pvm_rd);
+                self.emit_var_imm(combined as i32);
+                return Ok(());
             }
         }
         // Couldn't fuse — load_imm already emitted, just proceed
 
         // Base x0: a load from the absolute address `imm`.
         if rs1 == 0 {
-            let opcode = match funct3 {
-                0 => 53, // LB → load_i8
-                1 => 55, // LH → load_i16
-                2 => 57, // LW → load_i32
-                3 => 58, // LD → load_u64
-                4 => 52, // LBU → load_u8
-                5 => 54, // LHU → load_u16
-                6 => 56, // LWU → load_u32
-                _ => {
-                    return Err(TranspileError::UnsupportedInstruction {
-                        offset: addr as usize,
-                        detail: format!("load funct3={funct3}"),
-                    });
-                }
-            };
+            let opcode =
+                direct_load(funct3).ok_or_else(|| TranspileError::UnsupportedInstruction {
+                    offset: addr as usize,
+                    detail: format!("load funct3={funct3}"),
+                })?;
             let pvm_rd = self.require_reg(rd)?;
-            self.emit_inst(opcode);
+            self.emit_op(opcode);
             self.emit_data(pvm_rd);
             self.emit_var_imm(imm);
             return Ok(());
@@ -633,15 +555,15 @@ impl TranslationContext {
         let pvm_rd = self.require_reg(rd)?;
         let pvm_rs1 = self.require_reg(rs1)?;
 
-        // Two register + one immediate: load_ind_*
+        // Two register + one immediate
         let pvm_opcode = match funct3 {
-            0 => 125, // LB → load_ind_i8
-            1 => 127, // LH → load_ind_i16
-            2 => 129, // LW → load_ind_i32
-            3 => 130, // LD → load_ind_u64
-            4 => 124, // LBU → load_ind_u8
-            5 => 126, // LHU → load_ind_u16
-            6 => 128, // LWU → load_ind_u32
+            0 => Opcode::LoadIndI8,  // LB
+            1 => Opcode::LoadIndI16, // LH
+            2 => Opcode::LoadIndI32, // LW
+            3 => Opcode::LoadIndU64, // LD
+            4 => Opcode::LoadIndU8,  // LBU
+            5 => Opcode::LoadIndU16, // LHU
+            6 => Opcode::LoadIndU32, // LWU
             _ => {
                 return Err(TranspileError::UnsupportedInstruction {
                     offset: 0,
@@ -650,7 +572,7 @@ impl TranslationContext {
             }
         };
 
-        self.emit_inst(pvm_opcode);
+        self.emit_op(pvm_opcode);
         self.emit_data(pvm_rd | (pvm_rs1 << 4));
         self.emit_var_imm(imm);
 
@@ -680,14 +602,14 @@ impl TranslationContext {
             if rs2 == 0 {
                 // store_imm_u* [imm], 0: TwoImm, the address first.
                 let opcode = match funct3 {
-                    0 => 30,
-                    1 => 31,
-                    2 => 32,
-                    3 => 33,
+                    0 => Opcode::StoreImmU8,
+                    1 => Opcode::StoreImmU16,
+                    2 => Opcode::StoreImmU32,
+                    3 => Opcode::StoreImmU64,
                     _ => return Err(unsupported()),
                 };
                 let (lx, address) = encode_var_imm(imm);
-                self.emit_inst(opcode);
+                self.emit_op(opcode);
                 self.emit_data(lx);
                 for byte in address {
                     self.emit_data(byte);
@@ -695,14 +617,14 @@ impl TranslationContext {
             } else {
                 // store_u* [imm], rs2
                 let opcode = match funct3 {
-                    0 => 59,
-                    1 => 60,
-                    2 => 61,
-                    3 => 62,
+                    0 => Opcode::StoreU8,
+                    1 => Opcode::StoreU16,
+                    2 => Opcode::StoreU32,
+                    3 => Opcode::StoreU64,
                     _ => return Err(unsupported()),
                 };
                 let pvm_rs2 = self.require_reg(rs2)?;
-                self.emit_inst(opcode);
+                self.emit_op(opcode);
                 self.emit_data(pvm_rs2);
                 self.emit_var_imm(imm);
             }
@@ -714,10 +636,10 @@ impl TranslationContext {
         if rs2 == 0 {
             let pvm_rs1 = self.require_reg(rs1)?;
             let pvm_opcode = match funct3 {
-                0 => 70, // store_imm_ind_u8
-                1 => 71, // store_imm_ind_u16
-                2 => 72, // store_imm_ind_u32
-                3 => 73, // store_imm_ind_u64
+                0 => Opcode::StoreImmIndU8,
+                1 => Opcode::StoreImmIndU16,
+                2 => Opcode::StoreImmIndU32,
+                3 => Opcode::StoreImmIndU64,
                 _ => {
                     return Err(TranspileError::UnsupportedInstruction {
                         offset: 0,
@@ -729,7 +651,7 @@ impl TranslationContext {
             // reg_byte = ra | (lx << 4)
             // imm_y has length 0, which decodes as 0 (the value we want to store)
             let (lx, imm_bytes) = encode_var_imm(imm);
-            self.emit_inst(pvm_opcode);
+            self.emit_op(pvm_opcode);
             self.emit_data(pvm_rs1 | (lx << 4));
             for b in &imm_bytes {
                 self.emit_data(*b);
@@ -741,10 +663,10 @@ impl TranslationContext {
         let pvm_rs1 = self.require_reg(rs1)?; // base register → rA
 
         let pvm_opcode = match funct3 {
-            0 => 120, // SB → store_ind_u8
-            1 => 121, // SH → store_ind_u16
-            2 => 122, // SW → store_ind_u32
-            3 => 123, // SD → store_ind_u64
+            0 => Opcode::StoreIndU8,  // SB
+            1 => Opcode::StoreIndU16, // SH
+            2 => Opcode::StoreIndU32, // SW
+            3 => Opcode::StoreIndU64, // SD
             _ => {
                 return Err(TranspileError::UnsupportedInstruction {
                     offset: 0,
@@ -753,7 +675,7 @@ impl TranslationContext {
             }
         };
 
-        self.emit_inst(pvm_opcode);
+        self.emit_op(pvm_opcode);
         self.emit_data(pvm_rs2 | (pvm_rs1 << 4));
         self.emit_var_imm(imm);
 
@@ -773,26 +695,12 @@ impl TranslationContext {
             self.last_t0_imm = Some(imm);
         }
 
-        // AUIPC+ADDI fusion: compute full address. If it's a code address (function
-        // pointer), emit a jump table entry so indirect calls via djump work.
+        // AUIPC+ADDI fusion: the full address, a jump-table address when it
+        // is code (a function pointer), so indirect calls via djump work.
         if let Some((auipc_rd, auipc_val)) = self.pending_auipc.take() {
             if funct3 == 0 && rd == auipc_rd && rs1 == auipc_rd && rd != 0 {
                 let full_addr = (auipc_val as i64 + imm as i64) as u64;
-                if self.is_code_addr(full_addr) {
-                    let jt_idx = self.jump_table.len();
-                    self.jump_table.push(0); // placeholder, resolved by apply_fixups
-                    self.return_fixups.push((jt_idx, full_addr));
-                    let jt_addr = ((jt_idx + 1) * 2) as i64;
-                    let pos = self.code.len();
-                    self.emit_load_imm(rd, jt_addr)?;
-                    self.pending_load_imm = Some((rd, jt_addr, pos));
-                } else {
-                    let combined = auipc_val as i64 + imm as i64;
-                    let pos = self.code.len();
-                    self.emit_load_imm(rd, combined)?;
-                    self.pending_load_imm = Some((rd, combined, pos));
-                }
-                return Ok(());
+                return self.load_address(rd, full_addr);
             }
             // Not a matching ADDI — flush the pending AUIPC
             self.emit_load_imm(auipc_rd, auipc_val as i64)?;
@@ -822,12 +730,12 @@ impl TranslationContext {
         if funct3 == 0 && imm == 0 && rs1 != 0 {
             if rd == rs1 {
                 // ADDI rd, rd, 0 is a NOP
-                self.emit_inst(1); // fallthrough
+                self.emit_op(Opcode::Fallthrough);
                 return Ok(());
             }
             let pvm_rd = self.require_reg(rd)?;
             let pvm_rs1 = self.require_reg(rs1)?;
-            self.emit_inst(100); // move_reg
+            self.emit_op(Opcode::MoveReg);
             self.emit_data(pvm_rd | (pvm_rs1 << 4));
             return Ok(());
         }
@@ -859,17 +767,17 @@ impl TranslationContext {
         let pvm_rs1 = self.require_reg(rs1)?;
 
         let pvm_opcode = match funct3 {
-            0 => 149, // ADDI → add_imm_64/32
+            0 => Opcode::AddImm64, // ADDI
             1 => {
                 if funct7 == 0x30 {
                     // Zbb unary: clz/ctz/cpop/sext.b/sext.h
                     let rs2 = (imm & 0x1F) as u8;
                     let opc = match rs2 {
-                        0 => 103,
-                        1 => 105,
-                        2 => 101,
-                        4 => 107,
-                        5 => 108,
+                        0 => Opcode::LeadingZeroBits64,
+                        1 => Opcode::TrailingZeroBits64,
+                        2 => Opcode::CountSetBits64,
+                        4 => Opcode::SignExtend8,
+                        5 => Opcode::SignExtend16,
                         _ => {
                             return Err(TranspileError::UnsupportedInstruction {
                                 offset: 0,
@@ -877,24 +785,24 @@ impl TranslationContext {
                             });
                         }
                     };
-                    self.emit_inst(opc);
+                    self.emit_op(opc);
                     self.emit_data(pvm_rd | (pvm_rs1 << 4));
                     return Ok(());
                 }
                 // SLLI (funct7=0x00)
                 let shamt = imm & 0x3F;
-                self.emit_inst(151);
+                self.emit_op(Opcode::ShloLImm64);
                 self.emit_data(pvm_rd | (pvm_rs1 << 4));
                 self.emit_var_imm(shamt);
                 return Ok(());
             }
-            2 => 137, // SLTI → set_lt_s_imm
-            3 => 136, // SLTIU → set_lt_u_imm
-            4 => 133, // XORI → xor_imm
+            2 => Opcode::SetLtSImm, // SLTI
+            3 => Opcode::SetLtUImm, // SLTIU
+            4 => Opcode::XorImm,    // XORI
             5 => {
                 if (funct7 == 0x35 || funct7 == 0x34) && (imm & 0x1F) == 0x18 {
                     // Zbb rev8 (RV64: 0x35, RV32: 0x34)
-                    self.emit_inst(110);
+                    self.emit_op(Opcode::ReverseBytes);
                     self.emit_data(pvm_rd | (pvm_rs1 << 4));
                     return Ok(());
                 }
@@ -902,7 +810,7 @@ impl TranslationContext {
                     // Zbb RORI: funct6=0x18 (bits 31:26).
                     // funct7=0x30 when shamt<32, funct7=0x31 when shamt>=32 (bit 25 set).
                     let shamt = imm & 0x3F;
-                    self.emit_inst(158);
+                    self.emit_op(Opcode::RotR64Imm);
                     self.emit_data(pvm_rd | (pvm_rs1 << 4));
                     self.emit_var_imm(shamt);
                     return Ok(());
@@ -918,20 +826,20 @@ impl TranslationContext {
                 // SRLI (funct7=0x00) / SRAI (funct7=0x20+)
                 let shamt = imm & 0x3F;
                 if funct7 & 0x20 != 0 {
-                    self.emit_inst(153); // shar_r_imm
+                    self.emit_op(Opcode::SharRImm64);
                 } else {
-                    self.emit_inst(152); // shlo_r_imm
+                    self.emit_op(Opcode::ShloRImm64);
                 }
                 self.emit_data(pvm_rd | (pvm_rs1 << 4));
                 self.emit_var_imm(shamt);
                 return Ok(());
             }
-            6 => 134, // ORI → or_imm
-            7 => 132, // ANDI → and_imm
+            6 => Opcode::OrImm,  // ORI
+            7 => Opcode::AndImm, // ANDI
             _ => unreachable!(),
         };
 
-        self.emit_inst(pvm_opcode);
+        self.emit_op(pvm_opcode);
         self.emit_data(pvm_rd | (pvm_rs1 << 4));
         self.emit_var_imm(imm);
 
@@ -957,7 +865,7 @@ impl TranslationContext {
         let pvm_rd = self.require_reg(rd)?;
         let mov = |this: &mut Self, from: u8| -> Result<(), TranspileError> {
             let pvm_from = this.require_reg(from)?;
-            this.emit_inst(100); // move_reg
+            this.emit_op(Opcode::MoveReg);
             this.emit_data(pvm_rd | (pvm_from << 4));
             Ok(())
         };
@@ -976,8 +884,7 @@ impl TranslationContext {
                 (0, 0) | (0, 4) | (0, 6) => mov(self, rs2)?,
                 // SUB rd, x0, rs2 → 0 - rs2
                 (0x20, 0) => {
-                    let neg_op = 154; // neg_add_imm
-                    self.emit_inst(neg_op);
+                    self.emit_op(Opcode::NegAddImm64);
                     self.emit_data(pvm_rd | (pvm_rs2 << 4));
                     self.emit_var_imm(0);
                 }
@@ -988,7 +895,7 @@ impl TranslationContext {
                 }
                 // SLT rd, x0, rs2 → rs2 > 0 (signed)
                 (0, 2) => {
-                    self.emit_inst(143); // set_gt_s_imm
+                    self.emit_op(Opcode::SetGtSImm);
                     self.emit_data(pvm_rd | (pvm_rs2 << 4));
                     self.emit_var_imm(0);
                 }
@@ -997,18 +904,18 @@ impl TranslationContext {
                     if pvm_rd != pvm_rs2 {
                         self.emit_load_imm(rd, 0)?;
                     }
-                    self.emit_inst(148); // cmov_nz_imm: if rs2 != 0 then rd = imm
+                    // if rs2 != 0 then rd = imm
+                    self.emit_op(Opcode::CmovNzImm);
                     self.emit_data(pvm_rd | (pvm_rs2 << 4));
                     self.emit_var_imm(1);
                 }
                 // DIV/DIVU rd, x0, rs2 → all ones when rs2 is zero, else 0:
                 // rd = 0 - (rs2 <u 1).
                 (1, 4) | (1, 5) => {
-                    self.emit_inst(136); // set_lt_u_imm
+                    self.emit_op(Opcode::SetLtUImm);
                     self.emit_data(pvm_rd | (pvm_rs2 << 4));
                     self.emit_var_imm(1);
-                    let neg_op = 154; // neg_add_imm
-                    self.emit_inst(neg_op);
+                    self.emit_op(Opcode::NegAddImm64);
                     self.emit_data(pvm_rd | (pvm_rd << 4));
                     self.emit_var_imm(0);
                 }
@@ -1032,7 +939,7 @@ impl TranslationContext {
             }
             // SLT rd, rs1, x0 → rs1 < 0 (signed); SLTU is always 0.
             (0, 2) => {
-                self.emit_inst(137); // set_lt_s_imm
+                self.emit_op(Opcode::SetLtSImm);
                 self.emit_data(pvm_rd | (pvm_rs1 << 4));
                 self.emit_var_imm(0);
             }
@@ -1069,8 +976,8 @@ impl TranslationContext {
         {
             let imm = load_val as i32;
             // Check if rs2 is the loaded register (ADD/AND/OR/XOR rd, rs1, load_rd)
-            let (fuse_base, _commutative) = if rs2 == load_rd && rs1 != load_rd {
-                (Some(rs1), true)
+            let fuse_base = if rs2 == load_rd && rs1 != load_rd {
+                Some(rs1)
             } else if rs1 == load_rd
                 && rs2 != load_rd
                 // The imm sits on the LEFT operand here, so the fused form must be
@@ -1083,20 +990,20 @@ impl TranslationContext {
                 && (funct7, funct3) != (0, 3)
             // SLTU
             {
-                (Some(rs2), true)
+                Some(rs2)
             } else {
-                (None, false)
+                None
             };
 
             if let Some(base) = fuse_base {
                 let pvm_imm_opcode = match (funct7, funct3) {
-                    (0, 0) => Some(149), // ADD → add_imm
-                    (0, 7) => Some(132), // AND → and_imm
-                    (0, 6) => Some(134), // OR → or_imm
-                    (0, 4) => Some(133), // XOR → xor_imm
-                    (1, 0) => Some(150), // MUL → mul_imm
-                    (0, 2) => Some(137), // SLT → set_lt_s_imm
-                    (0, 3) => Some(136), // SLTU → set_lt_u_imm
+                    (0, 0) => Some(Opcode::AddImm64),  // ADD
+                    (0, 7) => Some(Opcode::AndImm),    // AND
+                    (0, 6) => Some(Opcode::OrImm),     // OR
+                    (0, 4) => Some(Opcode::XorImm),    // XOR
+                    (1, 0) => Some(Opcode::MulImm64),  // MUL
+                    (0, 2) => Some(Opcode::SetLtSImm), // SLT
+                    (0, 3) => Some(Opcode::SetLtUImm), // SLTU
                     _ => None,
                 };
 
@@ -1106,7 +1013,7 @@ impl TranslationContext {
                     self.drop_dead_load(rd, load_rd, undo_pos, addr);
                     let pvm_rd = self.require_reg(rd)?;
                     let pvm_base = self.require_reg(base)?;
-                    self.emit_inst(pvm_opcode);
+                    self.emit_op(pvm_opcode);
                     self.emit_data(pvm_rd | (pvm_base << 4));
                     self.emit_var_imm(imm);
                     return Ok(());
@@ -1122,15 +1029,15 @@ impl TranslationContext {
                 && matches!((funct7, funct3), (0, 1) | (0, 5) | (0x20, 5))
             {
                 let pvm_imm_opcode = match (funct7, funct3) {
-                    (0, 1) => 151,    // SLL → shlo_l_imm
-                    (0, 5) => 152,    // SRL → shlo_r_imm
-                    (0x20, 5) => 153, // SRA → shar_r_imm
+                    (0, 1) => Opcode::ShloLImm64,    // SLL
+                    (0, 5) => Opcode::ShloRImm64,    // SRL
+                    (0x20, 5) => Opcode::SharRImm64, // SRA
                     _ => unreachable!(),
                 };
                 self.drop_dead_load(rd, load_rd, undo_pos, addr);
                 let pvm_rd = self.require_reg(rd)?;
                 let pvm_rs1 = self.require_reg(rs1)?;
-                self.emit_inst(pvm_imm_opcode);
+                self.emit_op(pvm_imm_opcode);
                 self.emit_data(pvm_rd | (pvm_rs1 << 4));
                 self.emit_var_imm(imm);
                 return Ok(());
@@ -1142,11 +1049,10 @@ impl TranslationContext {
             if (funct7, funct3) == (0x20, 0) && rs2 == load_rd && rs1 != load_rd {
                 let neg_imm = (-(load_val as i32) as i64) as i32;
                 // Use add_imm with negated immediate (avoids neg_add_imm)
-                let pvm_opcode = 149; // add_imm
                 self.drop_dead_load(rd, load_rd, undo_pos, addr);
                 let pvm_rd = self.require_reg(rd)?;
                 let pvm_rs1 = self.require_reg(rs1)?;
-                self.emit_inst(pvm_opcode);
+                self.emit_op(Opcode::AddImm64);
                 self.emit_data(pvm_rd | (pvm_rs1 << 4));
                 self.emit_var_imm(neg_imm);
                 return Ok(());
@@ -1167,47 +1073,47 @@ impl TranslationContext {
         let pvm_opcode = if funct7 == 1 {
             // M extension (multiply/divide)
             match funct3 {
-                0 => 202, // MUL
-                1 => 213, // MULH → mul_upper_ss (always 64-bit, gives upper bits)
-                2 => 215, // MULHSU → mul_upper_su
-                3 => 214, // MULHU → mul_upper_uu
-                4 => 204, // DIV
-                5 => 203, // DIVU
-                6 => 206, // REM
-                7 => 205, // REMU
+                0 => Opcode::Mul64,      // MUL
+                1 => Opcode::MulUpperSS, // MULH (always 64-bit, gives upper bits)
+                2 => Opcode::MulUpperSU, // MULHSU
+                3 => Opcode::MulUpperUU, // MULHU
+                4 => Opcode::DivS64,     // DIV
+                5 => Opcode::DivU64,     // DIVU
+                6 => Opcode::RemS64,     // REM
+                7 => Opcode::RemU64,     // REMU
                 _ => unreachable!(),
             }
         } else if funct7 == 0x20 {
             match funct3 {
-                0 => 201, // SUB
-                5 => 209, // SRA
+                0 => Opcode::Sub64,   // SUB
+                5 => Opcode::SharR64, // SRA
                 7 | 6 | 4 => {
                     // Zbb ANDN/ORN/XNOR: rd = rs1 OP ~rs2
                     if rd == rs1 && rd == rs2 {
                         return self.emit_load_imm(rd, if funct3 == 7 { 0 } else { -1i64 });
                     }
-                    let alu: u8 = match funct3 {
-                        7 => 210,
-                        6 => 212,
-                        _ => 211,
+                    let alu = match funct3 {
+                        7 => Opcode::And,
+                        6 => Opcode::Or,
+                        _ => Opcode::Xor,
                     };
                     if rd != rs1 {
                         // use rd as temp for ~rs2
-                        self.emit_inst(133);
+                        self.emit_op(Opcode::XorImm);
                         self.emit_data(pvm_rd | (pvm_rs2 << 4));
                         self.emit_var_imm(-1);
-                        self.emit_inst(alu);
+                        self.emit_op(alu);
                         self.emit_data(pvm_rs1 | (pvm_rd << 4));
                         self.emit_data(pvm_rd);
                     } else {
                         // rd==rs1: NOT rs2 in-place, OP, restore
-                        self.emit_inst(133);
+                        self.emit_op(Opcode::XorImm);
                         self.emit_data(pvm_rs2 | (pvm_rs2 << 4));
                         self.emit_var_imm(-1);
-                        self.emit_inst(alu);
+                        self.emit_op(alu);
                         self.emit_data(pvm_rd | (pvm_rs2 << 4));
                         self.emit_data(pvm_rd);
-                        self.emit_inst(133);
+                        self.emit_op(Opcode::XorImm);
                         self.emit_data(pvm_rs2 | (pvm_rs2 << 4));
                         self.emit_var_imm(-1);
                     }
@@ -1223,10 +1129,10 @@ impl TranslationContext {
         } else if funct7 == 0x05 {
             // Zbb min/max
             match funct3 {
-                4 => 229,
-                5 => 230,
-                6 => 227,
-                7 => 228,
+                4 => Opcode::Min,
+                5 => Opcode::MinU,
+                6 => Opcode::Max,
+                7 => Opcode::MaxU,
                 _ => {
                     return Err(TranspileError::UnsupportedInstruction {
                         offset: 0,
@@ -1237,8 +1143,8 @@ impl TranslationContext {
         } else if funct7 == 0x30 {
             // Zbb rotations — emit and return early
             let opc = match funct3 {
-                1 => 220,
-                5 => 222,
+                1 => Opcode::RotL64,
+                5 => Opcode::RotR64,
                 _ => {
                     return Err(TranspileError::UnsupportedInstruction {
                         offset: 0,
@@ -1246,20 +1152,20 @@ impl TranslationContext {
                     });
                 }
             };
-            self.emit_inst(opc);
+            self.emit_op(opc);
             self.emit_data(pvm_rs1 | (pvm_rs2 << 4));
             self.emit_data(pvm_rd);
             return Ok(());
         } else if funct7 == 0 {
             match funct3 {
-                0 => 200, // ADD
-                1 => 207, // SLL
-                2 => 217,
-                3 => 216,
-                4 => 211,
-                5 => 208,
-                6 => 212,
-                7 => 210,
+                0 => Opcode::Add64,   // ADD
+                1 => Opcode::ShloL64, // SLL
+                2 => Opcode::SetLtS,  // SLT
+                3 => Opcode::SetLtU,  // SLTU
+                4 => Opcode::Xor,     // XOR
+                5 => Opcode::ShloR64, // SRL
+                6 => Opcode::Or,      // OR
+                7 => Opcode::And,     // AND
                 _ => unreachable!(),
             }
         } else {
@@ -1270,7 +1176,7 @@ impl TranslationContext {
         };
 
         // ThreeReg encoding: byte1 = rA | (rB << 4), byte2 = rD
-        self.emit_inst(pvm_opcode);
+        self.emit_op(pvm_opcode);
         self.emit_data(pvm_rs1 | (pvm_rs2 << 4));
         self.emit_data(pvm_rd);
 
@@ -1306,8 +1212,8 @@ impl TranslationContext {
 
         match funct3 {
             0 => {
-                // ADDIW → add_imm_32
-                self.emit_inst(131);
+                // ADDIW
+                self.emit_op(Opcode::AddImm32);
                 self.emit_data(pvm_rd | (pvm_rs1 << 4));
                 self.emit_var_imm(imm);
             }
@@ -1316,9 +1222,9 @@ impl TranslationContext {
                     // Zbb: clzw(rs2=0), ctzw(rs2=1), cpopw(rs2=2)
                     let rs2 = (imm & 0x1F) as u8;
                     let opc = match rs2 {
-                        0 => 104,
-                        1 => 106,
-                        2 => 102,
+                        0 => Opcode::LeadingZeroBits32,
+                        1 => Opcode::TrailingZeroBits32,
+                        2 => Opcode::CountSetBits32,
                         _ => {
                             return Err(TranspileError::UnsupportedInstruction {
                                 offset: 0,
@@ -1326,36 +1232,30 @@ impl TranslationContext {
                             });
                         }
                     };
-                    self.emit_inst(opc);
+                    self.emit_op(opc);
                     self.emit_data(pvm_rd | (pvm_rs1 << 4));
                 } else {
                     // SLLIW (funct7=0x00)
                     let shamt = imm & 0x1F;
-                    self.emit_inst(138);
+                    self.emit_op(Opcode::ShloLImm32);
                     self.emit_data(pvm_rd | (pvm_rs1 << 4));
                     self.emit_var_imm(shamt);
                 }
             }
             5 => {
+                let shamt = imm & 0x1F;
                 if funct7 == 0x30 {
                     // Zbb roriw
-                    let shamt = imm & 0x1F;
-                    self.emit_inst(160);
-                    self.emit_data(pvm_rd | (pvm_rs1 << 4));
-                    self.emit_var_imm(shamt);
+                    self.emit_op(Opcode::RotR32Imm);
                 } else if funct7 & 0x20 != 0 {
                     // SRAIW (funct7=0x20)
-                    let shamt = imm & 0x1F;
-                    self.emit_inst(140);
-                    self.emit_data(pvm_rd | (pvm_rs1 << 4));
-                    self.emit_var_imm(shamt);
+                    self.emit_op(Opcode::SharRImm32);
                 } else {
                     // SRLIW (funct7=0x00)
-                    let shamt = imm & 0x1F;
-                    self.emit_inst(139);
-                    self.emit_data(pvm_rd | (pvm_rs1 << 4));
-                    self.emit_var_imm(shamt);
+                    self.emit_op(Opcode::ShloRImm32);
                 }
+                self.emit_data(pvm_rd | (pvm_rs1 << 4));
+                self.emit_var_imm(shamt);
             }
             _ => {
                 return Err(TranspileError::UnsupportedInstruction {
@@ -1387,7 +1287,7 @@ impl TranslationContext {
         // rd = sign-extended low 32 bits of `from`.
         let sext = |this: &mut Self, from: u8| -> Result<(), TranspileError> {
             let pvm_from = this.require_reg(from)?;
-            this.emit_inst(131); // add_imm_32
+            this.emit_op(Opcode::AddImm32);
             this.emit_data(pvm_rd | (pvm_from << 4));
             this.emit_var_imm(0);
             Ok(())
@@ -1407,7 +1307,7 @@ impl TranslationContext {
                 (0, 0) => sext(self, rs2)?, // ADDW rd, x0, rs2
                 (0x20, 0) => {
                     // SUBW rd, x0, rs2 → negw
-                    self.emit_inst(141); // neg_add_imm_32
+                    self.emit_op(Opcode::NegAddImm32);
                     self.emit_data(pvm_rd | (pvm_rs2 << 4));
                     self.emit_var_imm(0);
                 }
@@ -1418,10 +1318,10 @@ impl TranslationContext {
                 // zero, else 0.
                 (1, 4) | (1, 5) => {
                     sext(self, rs2)?;
-                    self.emit_inst(136); // set_lt_u_imm
+                    self.emit_op(Opcode::SetLtUImm);
                     self.emit_data(pvm_rd | (pvm_rd << 4));
                     self.emit_var_imm(1);
-                    self.emit_inst(154); // neg_add_imm_64
+                    self.emit_op(Opcode::NegAddImm64);
                     self.emit_data(pvm_rd | (pvm_rd << 4));
                     self.emit_var_imm(0);
                 }
@@ -1437,7 +1337,7 @@ impl TranslationContext {
             (1, 4) | (1, 5) => self.emit_load_imm(rd, -1)?,
             (0x04, 4) => {
                 // PACKW rd, rs1, x0 = ZEXT.H rd, rs1 (Zbb)
-                self.emit_inst(132); // and_imm
+                self.emit_op(Opcode::AndImm);
                 self.emit_data(pvm_rd | (pvm_rs1 << 4));
                 self.emit_var_imm(0xFFFF);
             }
@@ -1468,25 +1368,25 @@ impl TranslationContext {
             && load_val <= i32::MAX as i64
         {
             let imm = load_val as i32;
-            let (fuse_base, _comm) = if rs2 == load_rd && rs1 != load_rd {
-                (Some(rs1), true)
+            let fuse_base = if rs2 == load_rd && rs1 != load_rd {
+                Some(rs1)
             } else if rs1 == load_rd && rs2 != load_rd && (funct7, funct3) != (0x20, 0) {
-                (Some(rs2), true)
+                Some(rs2)
             } else {
-                (None, false)
+                None
             };
 
             if let Some(base) = fuse_base {
                 let pvm_imm_opcode = match (funct7, funct3) {
-                    (0, 0) => Some(131), // ADDW → add_imm_32
-                    (1, 0) => Some(135), // MULW → mul_imm_32
+                    (0, 0) => Some(Opcode::AddImm32), // ADDW
+                    (1, 0) => Some(Opcode::MulImm32), // MULW
                     _ => None,
                 };
                 if let Some(pvm_opcode) = pvm_imm_opcode {
                     self.drop_dead_load(rd, load_rd, undo_pos, addr);
                     let pvm_rd = self.require_reg(rd)?;
                     let pvm_base = self.require_reg(base)?;
-                    self.emit_inst(pvm_opcode);
+                    self.emit_op(pvm_opcode);
                     self.emit_data(pvm_rd | (pvm_base << 4));
                     self.emit_var_imm(imm);
                     return Ok(());
@@ -1501,15 +1401,15 @@ impl TranslationContext {
                 && matches!((funct7, funct3), (0, 1) | (0, 5) | (0x20, 5))
             {
                 let pvm_imm_opcode = match (funct7, funct3) {
-                    (0, 1) => 138,    // SLLW → shlo_l_imm_32
-                    (0, 5) => 139,    // SRLW → shlo_r_imm_32
-                    (0x20, 5) => 140, // SRAW → shar_r_imm_32
+                    (0, 1) => Opcode::ShloLImm32,    // SLLW
+                    (0, 5) => Opcode::ShloRImm32,    // SRLW
+                    (0x20, 5) => Opcode::SharRImm32, // SRAW
                     _ => unreachable!(),
                 };
                 self.drop_dead_load(rd, load_rd, undo_pos, addr);
                 let pvm_rd = self.require_reg(rd)?;
                 let pvm_rs1 = self.require_reg(rs1)?;
-                self.emit_inst(pvm_imm_opcode);
+                self.emit_op(pvm_imm_opcode);
                 self.emit_data(pvm_rd | (pvm_rs1 << 4));
                 self.emit_var_imm(imm);
                 return Ok(());
@@ -1521,7 +1421,7 @@ impl TranslationContext {
                 self.drop_dead_load(rd, load_rd, undo_pos, addr);
                 let pvm_rd = self.require_reg(rd)?;
                 let pvm_rs1 = self.require_reg(rs1)?;
-                self.emit_inst(131); // add_imm_32
+                self.emit_op(Opcode::AddImm32);
                 self.emit_data(pvm_rd | (pvm_rs1 << 4));
                 self.emit_var_imm(neg_imm);
                 return Ok(());
@@ -1541,11 +1441,11 @@ impl TranslationContext {
 
         let pvm_opcode = if funct7 == 1 {
             match funct3 {
-                0 => 192, // MULW → mul_32
-                4 => 194, // DIVW → div_s_32
-                5 => 193, // DIVUW → div_u_32
-                6 => 196, // REMW → rem_s_32
-                7 => 195, // REMUW → rem_u_32
+                0 => Opcode::Mul32,  // MULW
+                4 => Opcode::DivS32, // DIVW
+                5 => Opcode::DivU32, // DIVUW
+                6 => Opcode::RemS32, // REMW
+                7 => Opcode::RemU32, // REMUW
                 _ => {
                     return Err(TranspileError::UnsupportedInstruction {
                         offset: 0,
@@ -1555,8 +1455,8 @@ impl TranslationContext {
             }
         } else if funct7 == 0x20 {
             match funct3 {
-                0 => 191, // SUBW → sub_32
-                5 => 199, // SRAW → shar_r_32
+                0 => Opcode::Sub32,   // SUBW
+                5 => Opcode::SharR32, // SRAW
                 _ => {
                     return Err(TranspileError::UnsupportedInstruction {
                         offset: 0,
@@ -1567,8 +1467,8 @@ impl TranslationContext {
         } else if funct7 == 0x30 {
             // Zbb rolw/rorw
             let opc = match funct3 {
-                1 => 221,
-                5 => 223,
+                1 => Opcode::RotL32,
+                5 => Opcode::RotR32,
                 _ => {
                     return Err(TranspileError::UnsupportedInstruction {
                         offset: 0,
@@ -1576,20 +1476,20 @@ impl TranslationContext {
                     });
                 }
             };
-            self.emit_inst(opc);
+            self.emit_op(opc);
             self.emit_data(pvm_rs1 | (pvm_rs2 << 4));
             self.emit_data(pvm_rd);
             return Ok(());
         } else if funct7 == 0x04 && funct3 == 4 {
             // Zbb zext.h
-            self.emit_inst(109);
+            self.emit_op(Opcode::ZeroExtend16);
             self.emit_data(pvm_rd | (pvm_rs1 << 4));
             return Ok(());
         } else if funct7 == 0 {
             match funct3 {
-                0 => 190, // ADDW → add_32
-                1 => 197, // SLLW → shlo_l_32
-                5 => 198, // SRLW → shlo_r_32
+                0 => Opcode::Add32,   // ADDW
+                1 => Opcode::ShloL32, // SLLW
+                5 => Opcode::ShloR32, // SRLW
                 _ => {
                     return Err(TranspileError::UnsupportedInstruction {
                         offset: 0,
@@ -1605,7 +1505,7 @@ impl TranslationContext {
         };
 
         // ThreeReg encoding: byte1 = rA | (rB << 4), byte2 = rD
-        self.emit_inst(pvm_opcode);
+        self.emit_op(pvm_opcode);
         self.emit_data(pvm_rs1 | (pvm_rs2 << 4));
         self.emit_data(pvm_rd);
 
@@ -1640,8 +1540,9 @@ impl TranslationContext {
         map_register(rv_reg)?.ok_or(TranspileError::RegisterMapping(rv_reg))
     }
 
-    pub(crate) fn emit_inst(&mut self, opcode: u8) {
-        self.code.push(opcode);
+    /// Emit an instruction's opcode, which starts it.
+    pub(crate) fn emit_op(&mut self, opcode: Opcode) {
+        self.code.push(opcode as u8);
         self.bitmask.push(1);
     }
 
@@ -1699,13 +1600,11 @@ impl TranslationContext {
         let pvm_rd = self.require_reg(rd)?;
 
         if imm >= i32::MIN as i64 && imm <= i32::MAX as i64 {
-            // load_imm (opcode 51)
-            self.emit_inst(51);
+            self.emit_op(Opcode::LoadImm);
             self.emit_data(pvm_rd);
             self.emit_var_imm(imm as i32);
         } else {
-            // load_imm_64 (opcode 20)
-            self.emit_inst(20);
+            self.emit_op(Opcode::LoadImm64);
             self.emit_data(pvm_rd);
             let bytes = (imm as u64).to_le_bytes();
             for b in &bytes {
@@ -1715,9 +1614,34 @@ impl TranslationContext {
         Ok(())
     }
 
+    /// Reserve a jump-table entry that [`Self::apply_fixups`] points at the
+    /// translation of RISC-V address `target`, and return the address a
+    /// djump to it takes.
+    fn jump_table_slot(&mut self, target: u64) -> u32 {
+        let index = self.jump_table.len();
+        self.jump_table.push(0);
+        self.return_fixups.push((index, target));
+        jump_table_address(index)
+    }
+
+    /// Load `address` into `rd`, or its jump-table address when it is code
+    /// (a function pointer), and keep the load pending for fusion with the
+    /// instruction after it.
+    pub(crate) fn load_address(&mut self, rd: u8, address: u64) -> Result<(), TranspileError> {
+        let value = if self.is_code_addr(address) {
+            i64::from(self.jump_table_slot(address))
+        } else {
+            address as i64
+        };
+        let at = self.code.len();
+        self.emit_load_imm(rd, value)?;
+        self.pending_load_imm = Some((rd, value, at));
+        Ok(())
+    }
+
     pub(crate) fn emit_jump(&mut self, target: u64) {
         let inst_pc = self.code.len() as u32;
-        self.emit_inst(40); // jump
+        self.emit_op(Opcode::Jump);
         let fixup_pos = self.code.len();
         self.fixups.push((fixup_pos, target, 4));
         self.fixup_pcs.insert(fixup_pos, inst_pc);
@@ -1725,13 +1649,13 @@ impl TranslationContext {
     }
 
     /// Emit load_imm_jump: fuse load_imm + jump into a single PVM instruction.
-    /// Opcode 80: OneRegImmOffset format — sets register and jumps in one step.
+    /// OneRegImmOffset format — sets register and jumps in one step.
     /// Saves one instruction (and one gas block boundary) per function call.
     fn emit_load_imm_jump(&mut self, rd: u8, imm: i64, target: u64) -> Result<(), TranspileError> {
         let pvm_rd = self.require_reg(rd)?;
 
         let inst_pc = self.code.len() as u32;
-        self.emit_inst(80); // load_imm_jump
+        self.emit_op(Opcode::LoadImmJump);
 
         // OneRegImmOffset encoding: reg_byte (rd + lX), then imm bytes, then offset bytes.
         // Use variable-length encoding for the immediate.
@@ -1749,8 +1673,8 @@ impl TranslationContext {
     }
 
     /// Emit a function call: load return address into rd and jump to target.
-    /// Uses load_imm_jump (opcode 80) to fuse into a single PVM instruction,
-    /// saving one instruction per call site.
+    /// Uses load_imm_jump to fuse into a single PVM instruction, saving one
+    /// instruction per call site.
     pub(crate) fn emit_call(
         &mut self,
         rd: u8,
@@ -1762,15 +1686,12 @@ impl TranslationContext {
             self.emit_jump(target);
             return Ok(());
         }
-        let jt_idx = self.jump_table.len();
-        self.jump_table.push(0); // placeholder
-        self.return_fixups.push((jt_idx, rv_ret_addr));
-        let jt_addr = ((jt_idx + 1) * 2) as i64;
-        self.emit_load_imm_jump(rd, jt_addr, target)
+        let jt_addr = self.jump_table_slot(rv_ret_addr);
+        self.emit_load_imm_jump(rd, i64::from(jt_addr), target)
     }
 
     pub(crate) fn emit_ecalli(&mut self, id: u32) {
-        self.emit_inst(10);
+        self.emit_op(Opcode::Ecalli);
         self.emit_var_imm(id as i32);
     }
 
@@ -1778,9 +1699,9 @@ impl TranslationContext {
     ///
     /// PVM encoding: [opcode][ra | (lx << 4)][imm (lx bytes LE)][offset (4 bytes LE)]
     /// where lx = minimum bytes to represent the signed immediate.
-    fn emit_branch_imm(&mut self, opcode: u8, ra: u8, imm: i32, target: u64) {
+    fn emit_branch_imm(&mut self, opcode: Opcode, ra: u8, imm: i32, target: u64) {
         let inst_pc = self.code.len() as u32;
-        self.emit_inst(opcode);
+        self.emit_op(opcode);
 
         let (lx, imm_bytes) = encode_var_imm(imm);
 
@@ -1804,7 +1725,7 @@ impl TranslationContext {
     /// Only creates jump table entries for the given `targets` — the set of
     /// RISC-V addresses actually referenced as function pointers (e.g. from
     /// Check whether an address falls within any RISC-V code section.
-    pub fn is_code_addr(&self, addr: u64) -> bool {
+    pub(crate) fn is_code_addr(&self, addr: u64) -> bool {
         crate::linker::in_ranges(&self.code_ranges, addr)
     }
 
@@ -1814,40 +1735,39 @@ impl TranslationContext {
     /// This is needed to fix indirect calls through function pointers stored in
     /// data sections (vtables, callbacks, etc.). The PVM's `jump_ind` instruction
     /// expects jump table addresses, not raw code offsets.
-    pub fn build_function_pointer_map(
+    pub(crate) fn build_function_pointer_map(
         &mut self,
-        targets: &std::collections::HashSet<u64>,
-    ) -> std::collections::HashMap<u64, u32> {
-        let mut rv_to_jt: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
-
-        let mut target_addrs: Vec<u64> = targets.iter().copied().collect();
-        target_addrs.sort();
-
-        for rv_addr in &target_addrs {
+        targets: &BTreeSet<u64>,
+    ) -> HashMap<u64, u32> {
+        let mut rv_to_jt = HashMap::new();
+        for rv_addr in targets {
             if let Some(&pvm_offset) = self.address_map.get(rv_addr) {
                 let jt_idx = self.jump_table.len();
                 self.jump_table.push(pvm_offset);
-                let jt_addr = ((jt_idx + 1) * 2) as u32;
-                rv_to_jt.insert(*rv_addr, jt_addr);
+                rv_to_jt.insert(*rv_addr, jump_table_address(jt_idx));
             }
         }
-
         rv_to_jt
+    }
+
+    /// The trap the unresolved targets share, emitted on first use.
+    fn shared_trap(&mut self, trap: &mut Option<u32>) -> u32 {
+        *trap.get_or_insert_with(|| {
+            let at = self.code.len() as u32;
+            self.emit_op(Opcode::Trap);
+            at
+        })
     }
 
     pub(crate) fn apply_fixups(&mut self) {
         let mut trap = None;
         // PC-relative fixups (branches, jumps)
         for (pvm_offset, rv_target, size) in self.fixups.drain(..).collect::<Vec<_>>() {
-            let target = self.address_map.get(&rv_target).copied().or_else(|| {
-                self.trap_unresolved.then(|| {
-                    *trap.get_or_insert_with(|| {
-                        let at = self.code.len() as u32;
-                        self.emit_inst(0);
-                        at
-                    })
-                })
-            });
+            let target = match self.address_map.get(&rv_target) {
+                Some(&pvm_target) => Some(pvm_target),
+                None if self.trap_unresolved => Some(self.shared_trap(&mut trap)),
+                None => None,
+            };
             if let Some(pvm_target) = target {
                 let inst_pc = self
                     .fixup_pcs
@@ -1876,18 +1796,109 @@ impl TranslationContext {
         for (jt_idx, rv_addr) in self.return_fixups.drain(..).collect::<Vec<_>>() {
             let target = match self.address_map.get(&rv_addr) {
                 Some(&pvm_target) => pvm_target,
-                None => *trap.get_or_insert_with(|| {
-                    let at = self.code.len() as u32;
-                    self.emit_inst(0);
-                    at
-                }),
+                None => self.shared_trap(&mut trap),
             };
             self.jump_table[jt_idx] = target;
         }
     }
 }
 
-// ===== RISC-V immediate decoders =====
+/// The address a djump takes to jump-table entry `index`.
+pub(crate) fn jump_table_address(index: usize) -> u32 {
+    ((index + 1) * 2) as u32
+}
+
+/// A direct load's opcode for a RISC-V load's `funct3`.
+fn direct_load(funct3: u32) -> Option<Opcode> {
+    match funct3 {
+        0 => Some(Opcode::LoadI8),  // LB
+        1 => Some(Opcode::LoadI16), // LH
+        2 => Some(Opcode::LoadI32), // LW
+        3 => Some(Opcode::LoadU64), // LD
+        4 => Some(Opcode::LoadU8),  // LBU
+        5 => Some(Opcode::LoadU16), // LHU
+        6 => Some(Opcode::LoadU32), // LWU
+        _ => None,
+    }
+}
+
+// ===== RISC-V instruction decoding =====
+
+/// The RISC-V major opcodes the translation reads, an instruction's low
+/// seven bits.
+pub(crate) mod op {
+    pub(crate) const LOAD: u32 = 0x03;
+    pub(crate) const CUSTOM_0: u32 = 0x0b;
+    pub(crate) const MISC_MEM: u32 = 0x0f;
+    pub(crate) const OP_IMM: u32 = 0x13;
+    pub(crate) const AUIPC: u32 = 0x17;
+    pub(crate) const OP_IMM_32: u32 = 0x1b;
+    pub(crate) const STORE: u32 = 0x23;
+    pub(crate) const OP: u32 = 0x33;
+    pub(crate) const LUI: u32 = 0x37;
+    pub(crate) const OP_32: u32 = 0x3b;
+    pub(crate) const BRANCH: u32 = 0x63;
+    pub(crate) const JALR: u32 = 0x67;
+    pub(crate) const JAL: u32 = 0x6f;
+    pub(crate) const SYSTEM: u32 = 0x73;
+}
+
+pub(crate) fn opcode(inst: u32) -> u32 {
+    inst & 0x7f
+}
+
+pub(crate) fn rd(inst: u32) -> u8 {
+    ((inst >> 7) & 0x1f) as u8
+}
+
+pub(crate) fn funct3(inst: u32) -> u32 {
+    (inst >> 12) & 0x7
+}
+
+pub(crate) fn rs1(inst: u32) -> u8 {
+    ((inst >> 15) & 0x1f) as u8
+}
+
+pub(crate) fn rs2(inst: u32) -> u8 {
+    ((inst >> 20) & 0x1f) as u8
+}
+
+pub(crate) fn funct7(inst: u32) -> u32 {
+    (inst >> 25) & 0x7f
+}
+
+/// A SYSTEM instruction's CSR.
+fn csr(inst: u32) -> u32 {
+    (inst >> 20) & 0xfff
+}
+
+/// An I-type instruction's immediate, sign-extended.
+pub(crate) fn i_imm(inst: u32) -> i32 {
+    (inst as i32) >> 20
+}
+
+/// A U-type instruction's immediate, its upper twenty bits in place.
+pub(crate) fn u_imm(inst: u32) -> i32 {
+    (inst & 0xffff_f000) as i32
+}
+
+/// The instructions of a code section, in order.
+pub(crate) fn words(code: &[u8]) -> impl Iterator<Item = u32> + '_ {
+    code.chunks_exact(4)
+        .map(|word| u32::from_le_bytes(word.try_into().expect("four bytes")))
+}
+
+/// The instruction at `offset` of a code section, if four bytes lie there.
+pub(crate) fn word_at(code: &[u8], offset: usize) -> Option<u32> {
+    code.get(offset..offset.checked_add(4)?)
+        .map(|word| u32::from_le_bytes(word.try_into().expect("four bytes")))
+}
+
+/// What an AUIPC at `address` and the JALR or ADDI after it, `next`, name
+/// together: the AUIPC's upper immediate plus the next one's lower.
+pub(crate) fn auipc_pair_target(address: u64, auipc: u32, next: u32) -> u64 {
+    address.wrapping_add_signed(i64::from(u_imm(auipc)) + i64::from(i_imm(next)))
+}
 
 pub(crate) fn decode_j_imm(inst: u32) -> i32 {
     let imm20 = (inst >> 31) & 1;
@@ -2166,11 +2177,9 @@ mod tests {
         let add_a0_sp_a0 = (10_u32 << 20) | (2 << 15) | (10 << 7) | 0x33;
 
         ctx.begin_instruction(0, false).unwrap();
-        ctx.translate_instruction(&lui_a0_0x4000.to_le_bytes(), 0, 0)
-            .unwrap();
+        ctx.translate_one(lui_a0_0x4000, 0).unwrap();
         ctx.begin_instruction(4, false).unwrap();
-        ctx.translate_instruction(&addi_a0_a0_0x1e0.to_le_bytes(), 0, 4)
-            .unwrap();
+        ctx.translate_one(addi_a0_a0_0x1e0, 4).unwrap();
         let load_len = ctx.code.len();
         assert_eq!(ctx.code[0], 51, "fallthrough materializes load_imm");
 
@@ -2180,8 +2189,7 @@ mod tests {
             target, load_len,
             "the target starts after the predecessor load"
         );
-        ctx.translate_instruction(&add_a0_sp_a0.to_le_bytes(), 0, 8)
-            .unwrap();
+        ctx.translate_one(add_a0_sp_a0, 8).unwrap();
 
         assert_eq!(ctx.code[0], 51, "targeted fusion must not remove load_imm");
         assert_eq!(
@@ -2217,8 +2225,7 @@ mod tests {
     #[test]
     fn unmarked_ecall_traps_instead_of_calling_a_capability() {
         let mut ctx = TranslationContext::default();
-        ctx.translate_instruction(&0x0000_0073_u32.to_le_bytes(), 0, 0)
-            .unwrap();
+        ctx.translate_one(0x0000_0073_u32, 0).unwrap();
         assert_eq!(ctx.code, [0], "unmarked ECALL must compile to trap");
     }
 }

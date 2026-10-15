@@ -3,14 +3,14 @@
 mod jam;
 mod lookup;
 
-pub use jam::{JamItem, JamRefine, JamRun, MAX_EXPORTS, Preimages, SEGMENT, fetch_kind, jam_gas};
+pub use jam::{JamItem, JamRefine, JamRun, MAX_EXPORTS, Preimages, SEGMENT, jam_gas};
 pub use lookup::{LOOKUP_GAS, serve_lookup};
 
 use alloc::vec::Vec;
 
 use crate::inner::{
     InnerError, InnerExit, InnerMachineIdentity, InnerMachineObservation, InnerMachines,
-    InvokeState, MAX_INNER_MACHINES, PageMode, gas, host_call,
+    InvokeState, MAX_INNER_MACHINES, PageMode, gas, gp_call, host_call,
 };
 use crate::refine::{Invocation, Machine, MachineObservation, MemoryModel, RefineError};
 use crate::{ExitReason, Gas, PVM_REGISTER_COUNT, PvmBackend};
@@ -26,11 +26,17 @@ pub mod result {
     pub const HUH: u64 = u64::MAX - 8;
 }
 
-enum Dispatch {
-    Continue,
+/// Why a host call stops the outer machine.
+enum Stop {
+    /// The run ends with this exit; a host call the context does not serve
+    /// reaches the embedder.
     Exit(ExitReason),
+    /// The execution backend failed: a host error, never a guest outcome.
     Backend,
 }
+
+/// A host call stopping the machine on a panic.
+const PANIC: Stop = Stop::Exit(ExitReason::Panic);
 
 /// Stable identity of a machine participating in one nested Refine run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -79,6 +85,9 @@ pub enum RefineObservation<'a> {
         inner: &'a InnerMachines,
     },
 }
+
+/// What observes an observed run.
+type Observer<'o> = &'o mut dyn for<'a> FnMut(RefineObservation<'a>);
 
 /// The agent's applied state, as the node reads it for `state_read`.
 pub trait StateReader: Send + Sync {
@@ -132,21 +141,28 @@ pub trait ProgramSource: Send + Sync {
 /// Gas for a host call the Gray Paper prices at its base cost.
 const BASE_CALL_GAS: Gas = 10;
 /// `state_read`'s price per byte copied, on top of the base price.
-pub const STATE_READ_BYTE_GAS: Gas = 1;
+pub(crate) const STATE_READ_BYTE_GAS: Gas = 1;
+
+/// Which host serves a refine.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Host {
+    /// A VOS node, computing the outer machine's precompiles in place when
+    /// `precompiles` is set.
+    Node { precompiles: bool },
+    /// The JAM-only host ([`RefineContext::try_run_jam`]), at PolkaJam's
+    /// prices: it computes no precompile.
+    Jam,
+}
 
 /// A standard outer PVM plus its per-invocation inner-machine dictionary.
 pub struct RefineContext {
     outer: Machine,
     inner: InnerMachines,
     state: Option<alloc::sync::Arc<dyn StateReader>>,
-    /// Whether the refine runs on the JAM-only host ([`Self::try_run_jam`]),
-    /// at PolkaJam's prices.
-    jam: bool,
+    host: Host,
     /// Where `instantiate` finds a program its pool lacks.
     #[cfg(feature = "std")]
     programs: Option<alloc::sync::Arc<dyn ProgramSource>>,
-    /// Whether the outer machine's precompiles are computed in place.
-    precompiles: bool,
 }
 
 impl RefineContext {
@@ -160,15 +176,7 @@ impl RefineContext {
         gas: Gas,
         model: MemoryModel,
     ) -> Result<Self, RefineError> {
-        Ok(Self {
-            outer: Machine::load_with(program, args, gas, model)?,
-            inner: InnerMachines::new(),
-            state: None,
-            jam: false,
-            #[cfg(feature = "std")]
-            programs: None,
-            precompiles: true,
-        })
+        Ok(Self::new(Machine::load_with(program, args, gas, model)?))
     }
 
     /// Explicit execution backend for both the outer runtime and its inner
@@ -182,24 +190,16 @@ impl RefineContext {
         model: MemoryModel,
         backend: PvmBackend,
     ) -> Result<Self, RefineError> {
-        let outer = Machine::load_with_backend(program, args, gas, model, backend)?;
-        let inner = InnerMachines::with_backend(outer.backend());
-        Ok(Self {
-            outer,
-            inner,
-            state: None,
-            jam: false,
-            #[cfg(feature = "std")]
-            programs: None,
-            precompiles: true,
-        })
+        Ok(Self::new(Machine::load_with_backend(
+            program, args, gas, model, backend,
+        )?))
     }
 
     /// Compute no precompile, as a JAM node does: the outer machine's
     /// reach the embedder. An inner machine's return to the outer machine
     /// as host calls on every host, for its agent to serve.
     pub fn without_precompiles(mut self) -> Self {
-        self.precompiles = false;
+        self.host = Host::Node { precompiles: false };
         self
     }
 
@@ -252,10 +252,9 @@ impl RefineContext {
             outer,
             inner,
             state: None,
-            jam: false,
+            host: Host::Node { precompiles: true },
             #[cfg(feature = "std")]
             programs: None,
-            precompiles: true,
         }
     }
 
@@ -298,15 +297,15 @@ impl RefineContext {
             let ExitReason::HostCall(id) = exit else {
                 return Ok(self.outer.finish(exit));
             };
-            match self.dispatch(id) {
-                Dispatch::Continue => {}
-                Dispatch::Exit(ExitReason::HostCall(call)) => {
+            match self.dispatch(id, None) {
+                Ok(()) => {}
+                Err(Stop::Exit(ExitReason::HostCall(call))) => {
                     if let Err(exit) = host(call, &mut self.outer) {
                         return Ok(self.outer.finish(exit));
                     }
                 }
-                Dispatch::Exit(exit) => return Ok(self.outer.finish(exit)),
-                Dispatch::Backend => return Err(RefineError::Backend),
+                Err(Stop::Exit(exit)) => return Ok(self.outer.finish(exit)),
+                Err(Stop::Backend) => return Err(RefineError::Backend),
             }
         }
     }
@@ -326,10 +325,7 @@ impl RefineContext {
         self.run_with_observer(&mut observer)
     }
 
-    fn run_with_observer(
-        mut self,
-        observer: &mut dyn for<'a> FnMut(RefineObservation<'a>),
-    ) -> Invocation {
+    fn run_with_observer(mut self, observer: Observer<'_>) -> Invocation {
         // A traced run must execute exactly like a live one, and tracing
         // cannot follow a pooled machine or the node's state yet.
         #[cfg(feature = "std")]
@@ -358,7 +354,7 @@ impl RefineContext {
             });
             // Precompiles are served in place; the slice continues.
             while let ExitReason::HostCall(id) = exit {
-                if !self.precompiles || !crate::precompile::is_precompile(id) {
+                if !self.computes_precompiles() || !crate::precompile::is_precompile(id) {
                     break;
                 }
                 if !self.outer.charge(crate::precompile::price(id).unwrap_or(0)) {
@@ -397,7 +393,7 @@ impl RefineContext {
                 outer: &self.outer,
                 inner: &self.inner,
             });
-            let dispatch = self.dispatch_observed(id, observer);
+            let dispatch = self.dispatch(id, Some(&mut *observer));
             observer(RefineObservation::HostCall {
                 phase: RefineHostPhase::After,
                 id,
@@ -405,9 +401,9 @@ impl RefineContext {
                 inner: &self.inner,
             });
             match dispatch {
-                Dispatch::Continue => {}
-                Dispatch::Exit(exit) => return self.outer.finish(exit),
-                Dispatch::Backend => {
+                Ok(()) => {}
+                Err(Stop::Exit(exit)) => return self.outer.finish(exit),
+                Err(Stop::Backend) => {
                     panic!("observed Refine execution requires the reference backend")
                 }
             }
@@ -418,71 +414,89 @@ impl RefineContext {
         &self.inner
     }
 
-    fn precompile(&mut self, id: u64) -> Dispatch {
-        if let Err(exit) = self.charge(crate::precompile::price(id).unwrap_or(0)) {
-            return exit;
-        }
-        let registers = *self.outer.registers();
-        match crate::precompile::execute(id, &registers, self.outer.memory_mut()) {
-            Some(_) => Dispatch::Continue,
-            None => Dispatch::Exit(ExitReason::Panic),
+    /// Whether the outer machine's precompiles are computed in place.
+    fn computes_precompiles(&self) -> bool {
+        self.host == (Host::Node { precompiles: true })
+    }
+
+    /// Serve host call `id`, or stop the machine. An observed run serves
+    /// its precompiles before dispatching, and has no pool or state, so
+    /// only the arms it reaches see `observer`.
+    fn dispatch(&mut self, id: u64, observer: Option<Observer<'_>>) -> Result<(), Stop> {
+        match u32::try_from(id) {
+            _ if self.computes_precompiles() && crate::precompile::is_precompile(id) => {
+                self.precompile(id)
+            }
+            Ok(host_call::MACHINE) => self.machine(),
+            Ok(host_call::PEEK) => self.peek(),
+            Ok(host_call::POKE) => self.poke(),
+            Ok(host_call::PAGES) => self.pages(),
+            Ok(host_call::INVOKE) => self.invoke(observer),
+            Ok(host_call::EXPUNGE) => self.expunge(),
+            #[cfg(feature = "std")]
+            Ok(host_call::INSTANTIATE) if self.inner.pool().is_some() => self.instantiate(),
+            Ok(host_call::STATE_READ) if self.state.is_some() => self.state_read(),
+            Ok(host_call::STATE_SCAN) if self.state.is_some() => self.state_scan(),
+            Ok(gp_call::GAS) => self.gas(),
+            // PolkaJam does not serve `log`.
+            Ok(gp_call::LOG) if self.host != Host::Jam => self.log(),
+            _ => Err(Stop::Exit(ExitReason::HostCall(id))),
         }
     }
 
-    fn dispatch(&mut self, id: u64) -> Dispatch {
-        match id {
-            value if self.precompiles && crate::precompile::is_precompile(value) => {
-                self.precompile(value)
-            }
-            value if value == u64::from(host_call::MACHINE) => self.machine(),
-            value if value == u64::from(host_call::PEEK) => self.peek(),
-            value if value == u64::from(host_call::POKE) => self.poke(),
-            value if value == u64::from(host_call::PAGES) => self.pages(),
-            value if value == u64::from(host_call::INVOKE) => self.invoke(None),
-            value if value == u64::from(host_call::EXPUNGE) => self.expunge(),
-            #[cfg(feature = "std")]
-            value if value == u64::from(host_call::INSTANTIATE) && self.inner.pool().is_some() => {
-                self.instantiate()
-            }
-            value if value == u64::from(host_call::STATE_READ) && self.state.is_some() => {
-                self.state_read()
-            }
-            value if value == u64::from(host_call::STATE_SCAN) && self.state.is_some() => {
-                self.state_scan()
-            }
-            value if value == u64::from(crate::inner::gp_call::GAS) => self.gas(),
-            // PolkaJam does not serve `log`.
-            value if value == u64::from(crate::inner::gp_call::LOG) && !self.jam => self.log(),
-            _ => Dispatch::Exit(ExitReason::HostCall(id)),
+    fn charge(&mut self, amount: Gas) -> Result<(), Stop> {
+        if self.outer.charge(amount) {
+            Ok(())
+        } else {
+            Err(Stop::Exit(ExitReason::OutOfGas))
         }
+    }
+
+    /// Answer the call: φ7 becomes `value`.
+    fn answer(&mut self, value: u64) -> Result<(), Stop> {
+        self.outer.registers_mut()[7] = value;
+        Ok(())
+    }
+
+    /// The outer machine's `len` bytes at `address`: a panic when any is
+    /// unreadable.
+    fn read_outer(&self, address: u64, len: u64) -> Result<Vec<u8>, Stop> {
+        self.outer.read_range(address, len).ok_or(PANIC)
+    }
+
+    /// Where the outer machine's `len` bytes at `address` lie: a panic when
+    /// any is not writable.
+    fn outer_range(&self, address: u64, len: u64) -> Result<(u32, usize), Stop> {
+        self.outer.writable_range(address, len).ok_or(PANIC)
+    }
+
+    fn precompile(&mut self, id: u64) -> Result<(), Stop> {
+        self.charge(crate::precompile::price(id).unwrap_or(0))?;
+        let registers = *self.outer.registers();
+        crate::precompile::execute(id, &registers, self.outer.memory_mut())
+            .map(|_| ())
+            .ok_or(PANIC)
     }
 
     /// `gas`: φ7 becomes the gas left after this call's own cost.
-    fn gas(&mut self) -> Dispatch {
-        let price = if self.jam {
-            jam_gas::GAS
-        } else {
-            BASE_CALL_GAS
-        };
-        if let Err(exit) = self.charge(price) {
-            return exit;
-        }
+    fn gas(&mut self) -> Result<(), Stop> {
+        self.charge(match self.host {
+            Host::Jam => jam_gas::GAS,
+            Host::Node { .. } => BASE_CALL_GAS,
+        })?;
         let left = self.outer.gas_remaining();
-        self.outer.registers_mut()[7] = left;
-        Dispatch::Continue
+        self.answer(left)
     }
 
     /// `log` (JIP-1): φ7 level, φ8/φ9 target, φ10/φ11 message. The node
     /// records it; the guest's registers are unchanged.
-    fn log(&mut self) -> Dispatch {
-        if let Err(exit) = self.charge(BASE_CALL_GAS) {
-            return exit;
-        }
+    fn log(&mut self) -> Result<(), Stop> {
+        self.charge(BASE_CALL_GAS)?;
         #[cfg(feature = "std")]
         {
             let registers = *self.outer.registers();
             let text = |address: u64, len: u64| {
-                self.read_outer(address, len.min(4096), false)
+                self.read_outer(address, len.min(4096))
                     .map(|bytes| alloc::string::String::from_utf8_lossy(&bytes).into_owned())
                     .unwrap_or_default()
             };
@@ -493,7 +507,7 @@ impl RefineContext {
                 "guest log"
             );
         }
-        Dispatch::Continue
+        Ok(())
     }
 
     /// `state_read`: copy part of the value under the key at φ7/φ8 to φ9,
@@ -501,41 +515,26 @@ impl RefineContext {
     /// length, or `NONE` when the key has no value. Costs the base price
     /// and [`STATE_READ_BYTE_GAS`] per byte copied, so a refine's gas also
     /// bounds the node's copying.
-    fn state_read(&mut self) -> Dispatch {
-        if let Err(exit) = self.charge(BASE_CALL_GAS) {
-            return exit;
-        }
+    fn state_read(&mut self) -> Result<(), Stop> {
+        self.charge(BASE_CALL_GAS)?;
         let registers = *self.outer.registers();
-        let Some(key) = self.read_outer(registers[7], registers[8], false) else {
-            return Dispatch::Exit(ExitReason::Panic);
-        };
+        let key = self.read_outer(registers[7], registers[8])?;
         let reader = self.state.as_ref().expect("dispatched only with a reader");
         let Some(value) = reader.read(&key) else {
-            self.outer.registers_mut()[7] = result::NONE;
-            return Dispatch::Continue;
+            return self.answer(result::NONE);
         };
-        let offset = usize::try_from(registers[10])
-            .unwrap_or(usize::MAX)
-            .min(value.len());
-        let len = usize::try_from(registers[11])
-            .unwrap_or(usize::MAX)
-            .min(value.len() - offset);
-        let Some((address, len)) = self.outer_range(registers[9], len as u64, true) else {
-            return Dispatch::Exit(ExitReason::Panic);
-        };
-        if let Err(exit) = self.charge(len as u64 * STATE_READ_BYTE_GAS) {
-            return exit;
-        }
+        let window = crate::refine::window(value.len(), registers[10], registers[11]);
+        let (address, len) = self.outer_range(registers[9], window.len() as u64)?;
+        self.charge(len as u64 * STATE_READ_BYTE_GAS)?;
         if len > 0
             && !self
                 .outer
                 .memory_mut()
-                .write_bytes_checked(address, &value[offset..offset + len])
+                .write_bytes_checked(address, &value[window])
         {
-            return Dispatch::Exit(ExitReason::Panic);
+            return Err(PANIC);
         }
-        self.outer.registers_mut()[7] = value.len() as u64;
-        Dispatch::Continue
+        self.answer(value.len() as u64)
     }
 
     /// `state_scan`: rows whose key starts with the prefix at φ7/φ8, after
@@ -545,17 +544,11 @@ impl RefineContext {
     /// written, 0 when no rows remain, or `FULL` when the next row alone
     /// exceeds φ12. Costs the base price and [`STATE_READ_BYTE_GAS`] per
     /// byte written.
-    fn state_scan(&mut self) -> Dispatch {
-        if let Err(exit) = self.charge(BASE_CALL_GAS) {
-            return exit;
-        }
+    fn state_scan(&mut self) -> Result<(), Stop> {
+        self.charge(BASE_CALL_GAS)?;
         let registers = *self.outer.registers();
-        let Some(prefix) = self.read_outer(registers[7], registers[8], false) else {
-            return Dispatch::Exit(ExitReason::Panic);
-        };
-        let Some(cursor) = self.read_outer(registers[9], registers[10], false) else {
-            return Dispatch::Exit(ExitReason::Panic);
-        };
+        let prefix = self.read_outer(registers[7], registers[8])?;
+        let cursor = self.read_outer(registers[9], registers[10])?;
         let capacity = usize::try_from(registers[12]).unwrap_or(usize::MAX);
         let reader = self.state.as_ref().expect("dispatched only with a reader");
         let after = (!cursor.is_empty()).then_some(cursor.as_slice());
@@ -572,74 +565,36 @@ impl RefineContext {
             out.extend_from_slice(&(value.len() as u32).to_le_bytes());
             out.extend_from_slice(&value);
         }
-        let Some((address, len)) = self.outer_range(registers[11], out.len() as u64, true) else {
-            return Dispatch::Exit(ExitReason::Panic);
-        };
-        if let Err(exit) = self.charge(len as u64 * STATE_READ_BYTE_GAS) {
-            return exit;
-        }
+        let (address, len) = self.outer_range(registers[11], out.len() as u64)?;
+        self.charge(len as u64 * STATE_READ_BYTE_GAS)?;
         if len > 0 && !self.outer.memory_mut().write_bytes_checked(address, &out) {
-            return Dispatch::Exit(ExitReason::Panic);
+            return Err(PANIC);
         }
-        self.outer.registers_mut()[7] = if full { result::FULL } else { len as u64 };
-        Dispatch::Continue
+        self.answer(if full { result::FULL } else { len as u64 })
     }
 
-    fn dispatch_observed(
-        &mut self,
-        id: u64,
-        observer: &mut dyn for<'a> FnMut(RefineObservation<'a>),
-    ) -> Dispatch {
-        match id {
-            value if value == u64::from(host_call::MACHINE) => self.machine(),
-            value if value == u64::from(host_call::PEEK) => self.peek(),
-            value if value == u64::from(host_call::POKE) => self.poke(),
-            value if value == u64::from(host_call::PAGES) => self.pages(),
-            value if value == u64::from(host_call::INVOKE) => self.invoke(Some(observer)),
-            value if value == u64::from(host_call::EXPUNGE) => self.expunge(),
-            value if value == u64::from(crate::inner::gp_call::GAS) => self.gas(),
-            value if value == u64::from(crate::inner::gp_call::LOG) => self.log(),
-            _ => Dispatch::Exit(ExitReason::HostCall(id)),
-        }
-    }
-
-    fn charge(&mut self, amount: Gas) -> Result<(), Dispatch> {
-        if self.outer.charge(amount) {
-            Ok(())
-        } else {
-            Err(Dispatch::Exit(ExitReason::OutOfGas))
-        }
-    }
-
-    fn machine(&mut self) -> Dispatch {
+    fn machine(&mut self) -> Result<(), Stop> {
         let registers = *self.outer.registers();
         let (address, len, initial_pc) = (registers[7], registers[8], registers[9]);
-        let cost = gas::MACHINE_BASE.saturating_add(gas::memory(gas::MACHINE_PER_KIB, len));
-        if let Err(exit) = self.charge(cost) {
-            return exit;
-        }
+        self.charge(gas::MACHINE_BASE.saturating_add(gas::memory(gas::MACHINE_PER_KIB, len)))?;
         // Gray Paper v0.8.0 checks the invocation-wide machine limit before
         // inspecting the caller-supplied program range. At capacity even an
         // unreadable outer pointer therefore returns FULL, rather than
         // panicking while trying to read a program that cannot be installed.
         if self.inner.len() >= MAX_INNER_MACHINES {
-            self.outer.registers_mut()[7] = result::FULL;
-            return Dispatch::Continue;
+            return self.answer(result::FULL);
         }
-        let Some(program) = self.read_outer(address, len, false) else {
-            return Dispatch::Exit(ExitReason::Panic);
-        };
+        let program = self.read_outer(address, len)?;
         let result = match u32::try_from(initial_pc) {
             Ok(pc) => match self.inner.create(&program, pc) {
                 Ok(id) => id as u64,
                 Err(InnerError::Full) => result::FULL,
-                Err(InnerError::Backend) => return Dispatch::Backend,
+                Err(InnerError::Backend) => return Err(Stop::Backend),
                 Err(_) => result::HUH,
             },
             Err(_) => result::HUH,
         };
-        self.outer.registers_mut()[7] = result;
-        Dispatch::Continue
+        self.answer(result)
     }
 
     /// `instantiate`: φ7 points at a 32-byte code hash, and φ8 is the
@@ -651,19 +606,14 @@ impl RefineContext {
     /// laying it out costs a loader in host calls (never less than the
     /// base), whatever the counter.
     #[cfg(feature = "std")]
-    fn instantiate(&mut self) -> Dispatch {
-        if let Err(exit) = self.charge(gas::MACHINE_BASE) {
-            return exit;
-        }
+    fn instantiate(&mut self) -> Result<(), Stop> {
+        self.charge(gas::MACHINE_BASE)?;
         if self.inner.len() >= MAX_INNER_MACHINES {
-            self.outer.registers_mut()[7] = result::FULL;
-            return Dispatch::Continue;
+            return self.answer(result::FULL);
         }
         let registers = *self.outer.registers();
         let (address, initial_pc) = (registers[7], registers[8]);
-        let Some(hash) = self.read_outer(address, 32, false) else {
-            return Dispatch::Exit(ExitReason::Panic);
-        };
+        let hash = self.read_outer(address, 32)?;
         let hash = crate::pool::CodeHash(hash.try_into().expect("32 bytes read"));
         let owned = self
             .programs
@@ -681,38 +631,28 @@ impl RefineContext {
                 pool.program(&hash)
             })
         });
-        let result = match program {
-            None => result::WHO,
-            Some(program) => {
-                if let Err(exit) = self.charge(program.price() - gas::MACHINE_BASE) {
-                    return exit;
-                }
-                match u32::try_from(initial_pc)
-                    .map_err(|_| InnerError::Invalid)
-                    .and_then(|pc| self.inner.instantiate(&program, pc))
-                {
-                    Ok(id) => u64::from(id),
-                    Err(InnerError::Full) => result::FULL,
-                    Err(InnerError::Backend) => return Dispatch::Backend,
-                    Err(_) => result::HUH,
-                }
-            }
+        let Some(program) = program else {
+            return self.answer(result::WHO);
         };
-        self.outer.registers_mut()[7] = result;
-        Dispatch::Continue
+        self.charge(program.price() - gas::MACHINE_BASE)?;
+        let result = match u32::try_from(initial_pc)
+            .map_err(|_| InnerError::Invalid)
+            .and_then(|pc| self.inner.instantiate(&program, pc))
+        {
+            Ok(id) => u64::from(id),
+            Err(InnerError::Full) => result::FULL,
+            Err(InnerError::Backend) => return Err(Stop::Backend),
+            Err(_) => result::HUH,
+        };
+        self.answer(result)
     }
 
-    fn peek(&mut self) -> Dispatch {
+    fn peek(&mut self) -> Result<(), Stop> {
         let registers = *self.outer.registers();
         let (id, outer_address, inner_address, len) =
             (registers[7], registers[8], registers[9], registers[10]);
-        let cost = gas::PEEK_BASE.saturating_add(gas::memory(gas::PEEK_PER_KIB, len));
-        if let Err(exit) = self.charge(cost) {
-            return exit;
-        }
-        let Some((outer_address, len)) = self.outer_range(outer_address, len, true) else {
-            return Dispatch::Exit(ExitReason::Panic);
-        };
+        self.charge(gas::PEEK_BASE.saturating_add(gas::memory(gas::PEEK_PER_KIB, len)))?;
+        let (outer_address, len) = self.outer_range(outer_address, len)?;
         let status = match u32::try_from(id) {
             Ok(id) if self.inner.contains(id) => match (len == 0)
                 .then_some(0)
@@ -725,34 +665,28 @@ impl RefineContext {
                             .memory_mut()
                             .write_bytes_checked(outer_address, &bytes)
                         {
-                            return Dispatch::Exit(ExitReason::Panic);
+                            return Err(PANIC);
                         }
                         result::OK
                     }
                     Err(InnerError::Unknown) => result::WHO,
                     Err(InnerError::OutOfBounds) => result::OOB,
-                    Err(InnerError::Backend) => return Dispatch::Backend,
+                    Err(InnerError::Backend) => return Err(Stop::Backend),
                     Err(_) => result::HUH,
                 },
                 None => result::OOB,
             },
             _ => result::WHO,
         };
-        self.outer.registers_mut()[7] = status;
-        Dispatch::Continue
+        self.answer(status)
     }
 
-    fn poke(&mut self) -> Dispatch {
+    fn poke(&mut self) -> Result<(), Stop> {
         let registers = *self.outer.registers();
         let (id, outer_address, inner_address, len) =
             (registers[7], registers[8], registers[9], registers[10]);
-        let cost = gas::POKE_BASE.saturating_add(gas::memory(gas::POKE_PER_KIB, len));
-        if let Err(exit) = self.charge(cost) {
-            return exit;
-        }
-        let Some(bytes) = self.read_outer(outer_address, len, false) else {
-            return Dispatch::Exit(ExitReason::Panic);
-        };
+        self.charge(gas::POKE_BASE.saturating_add(gas::memory(gas::POKE_PER_KIB, len)))?;
+        let bytes = self.read_outer(outer_address, len)?;
         let status = match u32::try_from(id) {
             Ok(id) if self.inner.contains(id) => match bytes
                 .is_empty()
@@ -763,21 +697,20 @@ impl RefineContext {
                     Ok(()) => result::OK,
                     Err(InnerError::Unknown) => result::WHO,
                     Err(InnerError::OutOfBounds) => result::OOB,
-                    Err(InnerError::Backend) => return Dispatch::Backend,
+                    Err(InnerError::Backend) => return Err(Stop::Backend),
                     Err(_) => result::HUH,
                 },
                 None => result::OOB,
             },
             _ => result::WHO,
         };
-        self.outer.registers_mut()[7] = status;
-        Dispatch::Continue
+        self.answer(status)
     }
 
-    fn pages(&mut self) -> Dispatch {
+    fn pages(&mut self) -> Result<(), Stop> {
         let registers = *self.outer.registers();
         let (id, first, count, mode) = (registers[7], registers[8], registers[9], registers[10]);
-        let cost = match mode {
+        self.charge(match mode {
             0 => {
                 gas::PAGES_FREE_BASE.saturating_add(count.saturating_mul(gas::PAGES_FREE_PER_PAGE))
             }
@@ -786,10 +719,7 @@ impl RefineContext {
             3 | 4 => gas::PAGES_SET_MODE_BASE
                 .saturating_add(count.saturating_mul(gas::PAGES_SET_MODE_PER_PAGE)),
             _ => gas::PAGES_INVALID,
-        };
-        if let Err(exit) = self.charge(cost) {
-            return exit;
-        }
+        })?;
         let status = match u32::try_from(id) {
             Ok(id) if self.inner.contains(id) => match (
                 u32::try_from(first),
@@ -800,7 +730,7 @@ impl RefineContext {
                     match self.inner.pages(id, first, count, mode) {
                         Ok(()) => result::OK,
                         Err(InnerError::Unknown) => result::WHO,
-                        Err(InnerError::Backend) => return Dispatch::Backend,
+                        Err(InnerError::Backend) => return Err(Stop::Backend),
                         Err(_) => result::HUH,
                     }
                 }
@@ -808,21 +738,15 @@ impl RefineContext {
             },
             _ => result::WHO,
         };
-        self.outer.registers_mut()[7] = status;
-        Dispatch::Continue
+        self.answer(status)
     }
 
-    fn invoke(
-        &mut self,
-        observer: Option<&mut dyn for<'a> FnMut(RefineObservation<'a>)>,
-    ) -> Dispatch {
+    fn invoke(&mut self, observer: Option<Observer<'_>>) -> Result<(), Stop> {
         let registers = *self.outer.registers();
         let (id, frame_address) = (registers[7], registers[8]);
-        let Some((frame_address, _)) = self.outer_range(frame_address, 112, true) else {
-            if let Err(exit) = self.charge(gas::INVOKE_BASE) {
-                return exit;
-            }
-            return Dispatch::Exit(ExitReason::Panic);
+        let Ok((frame_address, _)) = self.outer_range(frame_address, 112) else {
+            self.charge(gas::INVOKE_BASE)?;
+            return Err(PANIC);
         };
         let mut frame = [0u8; 112];
         if !self
@@ -830,13 +754,10 @@ impl RefineContext {
             .memory()
             .read_bytes_checked(frame_address, &mut frame)
         {
-            return Dispatch::Exit(ExitReason::Panic);
+            return Err(PANIC);
         }
         let requested_gas = u64::from_le_bytes(frame[..8].try_into().expect("eight bytes"));
-        let total = gas::INVOKE_BASE.saturating_add(requested_gas);
-        if let Err(exit) = self.charge(total) {
-            return exit;
-        }
+        self.charge(gas::INVOKE_BASE.saturating_add(requested_gas))?;
         let mut inner_registers = [0u64; PVM_REGISTER_COUNT];
         for (i, register) in inner_registers.iter_mut().enumerate() {
             let start = 8 + i * 8;
@@ -847,8 +768,7 @@ impl RefineContext {
             );
         }
         let Ok(id) = u32::try_from(id) else {
-            self.outer.registers_mut()[7] = result::WHO;
-            return Dispatch::Continue;
+            return self.answer(result::WHO);
         };
         let state = InvokeState {
             gas: requested_gas,
@@ -887,15 +807,9 @@ impl RefineContext {
         };
         let outcome = match outcome {
             Ok(outcome) => outcome,
-            Err(InnerError::Unknown) => {
-                self.outer.registers_mut()[7] = result::WHO;
-                return Dispatch::Continue;
-            }
-            Err(InnerError::Backend) => return Dispatch::Backend,
-            Err(_) => {
-                self.outer.registers_mut()[7] = result::HUH;
-                return Dispatch::Continue;
-            }
+            Err(InnerError::Unknown) => return self.answer(result::WHO),
+            Err(InnerError::Backend) => return Err(Stop::Backend),
+            Err(_) => return self.answer(result::HUH),
         };
         self.outer.credit(outcome.state.gas);
         frame[..8].copy_from_slice(&outcome.state.gas.to_le_bytes());
@@ -908,7 +822,7 @@ impl RefineContext {
             .memory_mut()
             .write_bytes_checked(frame_address, &frame)
         {
-            return Dispatch::Exit(ExitReason::Panic);
+            return Err(PANIC);
         }
         let (status, detail) = match outcome.exit {
             InnerExit::Halt => (0, None),
@@ -922,44 +836,17 @@ impl RefineContext {
         if let Some(detail) = detail {
             registers[8] = detail;
         }
-        Dispatch::Continue
+        Ok(())
     }
 
-    fn expunge(&mut self) -> Dispatch {
-        if let Err(exit) = self.charge(gas::EXPUNGE) {
-            return exit;
-        }
+    fn expunge(&mut self) -> Result<(), Stop> {
+        self.charge(gas::EXPUNGE)?;
         let id = self.outer.registers()[7];
         let result = u32::try_from(id)
             .ok()
             .and_then(|id| self.inner.expunge(id).ok())
             .map_or(result::WHO, u64::from);
-        self.outer.registers_mut()[7] = result;
-        Dispatch::Continue
-    }
-
-    fn read_outer(&self, address: u64, len: u64, writable: bool) -> Option<Vec<u8>> {
-        let (address, len) = self.outer_range(address, len, writable)?;
-        let mut bytes = alloc::vec![0u8; len];
-        if self.outer.memory().read_bytes_checked(address, &mut bytes) {
-            Some(bytes)
-        } else {
-            None
-        }
-    }
-
-    fn outer_range(&self, address: u64, len: u64, writable: bool) -> Option<(u32, usize)> {
-        let len = usize::try_from(len).ok()?;
-        if len == 0 {
-            return Some((0, 0));
-        }
-        let address = u32::try_from(address).ok()?;
-        let accessible = if writable {
-            self.outer.memory().is_writable(address, len)
-        } else {
-            self.outer.memory().is_readable(address, len)
-        };
-        accessible.then_some((address, len))
+        self.answer(result)
     }
 }
 
@@ -1178,13 +1065,13 @@ mod tests {
     /// φ7 ← the rw base (h), φ8 ← rw base + 64 (m), `ecalli id`, halt.
     fn compression_program(id: u16) -> Vec<u8> {
         let [id_lo, id_hi] = id.to_le_bytes();
-        let code = [
-            51, 7, 0x00, 0x00, 0x02, // load_imm φ7, 0x2_0000
-            51, 8, 0x40, 0x00, 0x02, // load_imm φ8, 0x2_0040
-            10, id_lo, id_hi, // ecalli id
-            50, 0, // jump_ind φ0 (the halt address)
-        ];
-        standard_program_with_rw(&code, &[0, 5, 10, 13], &[0x5a; 192])
+        let (code, starts) = crate::test_support::code(&[
+            &[51, 7, 0x00, 0x00, 0x02], // load_imm φ7, 0x2_0000
+            &[51, 8, 0x40, 0x00, 0x02], // load_imm φ8, 0x2_0040
+            &[10, id_lo, id_hi],        // ecalli id
+            &[50, 0],                   // jump_ind φ0 (the halt address)
+        ]);
+        standard_program_with_rw(&code, &starts, &[0x5a; 192])
     }
 
     fn compressed_h() -> [u8; 64] {
@@ -1317,12 +1204,12 @@ mod tests {
     #[cfg(feature = "std")]
     fn instantiating_program(hash: [u8; 32]) -> Vec<u8> {
         let [lo, hi] = (crate::inner::host_call::INSTANTIATE as u16).to_le_bytes();
-        let code = [
-            51, 7, 0x00, 0x00, 0x02, // load_imm φ7, 0x2_0000
-            10, lo, hi, // ecalli instantiate
-            50, 0, // jump_ind φ0 (the halt address)
-        ];
-        standard_program_with_rw(&code, &[0, 5, 8], &hash)
+        let (code, starts) = crate::test_support::code(&[
+            &[51, 7, 0x00, 0x00, 0x02], // load_imm φ7, 0x2_0000
+            &[10, lo, hi],              // ecalli instantiate
+            &[50, 0],                   // jump_ind φ0 (the halt address)
+        ]);
+        standard_program_with_rw(&code, &starts, &hash)
     }
 
     /// A program the pool lacks, given by the run's source, is installed and
@@ -1409,20 +1296,15 @@ mod tests {
     #[cfg(feature = "std")]
     fn instantiating_at_program(hash: [u8; 32], pc: &[u8]) -> Vec<u8> {
         let [lo, hi] = (crate::inner::host_call::INSTANTIATE as u16).to_le_bytes();
-        let instructions = [
-            alloc::vec![51, 7, 0x00, 0x00, 0x02], // load_imm φ7, 0x2_0000
-            [&[51, 8][..], pc].concat(),          // load_imm φ8, pc
-            alloc::vec![10, lo, hi],              // ecalli instantiate
-            alloc::vec![100, 9 | (7 << 4)],       // move_reg φ9, φ7
-            alloc::vec![10, crate::inner::host_call::EXPUNGE as u8], // ecalli expunge
-            alloc::vec![50, 0],                   // jump_ind φ0 (the halt address)
-        ];
-        let mut code = Vec::new();
-        let mut starts = Vec::new();
-        for instruction in instructions {
-            starts.push(code.len());
-            code.extend(instruction);
-        }
+        let load_pc = [&[51, 8][..], pc].concat();
+        let (code, starts) = crate::test_support::code(&[
+            &[51, 7, 0x00, 0x00, 0x02],                    // load_imm φ7, 0x2_0000
+            &load_pc,                                      // load_imm φ8, pc
+            &[10, lo, hi],                                 // ecalli instantiate
+            &[100, 9 | (7 << 4)],                          // move_reg φ9, φ7
+            &[10, crate::inner::host_call::EXPUNGE as u8], // ecalli expunge
+            &[50, 0],                                      // jump_ind φ0 (the halt address)
+        ]);
         standard_program_with_rw(&code, &starts, &hash)
     }
 
@@ -1438,9 +1320,7 @@ mod tests {
         let pool = alloc::sync::Arc::new(MachinePool::new());
         let hash = pool.install(&installed).unwrap();
 
-        let mut backends = alloc::vec![PvmBackend::ForceInterpreter];
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-        backends.push(PvmBackend::ForceRecompiler);
+        let backends = crate::test_support::backends();
         for &backend in &backends {
             let run = |pc: &[u8]| {
                 RefineContext::load_with_backend(
@@ -1487,10 +1367,7 @@ mod tests {
         let hash = pool.install(&installed).unwrap();
         let price = pool.program(&hash).unwrap().price();
 
-        let mut backends = vec![PvmBackend::ForceInterpreter];
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-        backends.push(PvmBackend::ForceRecompiler);
-        for backend in backends {
+        for backend in crate::test_support::backends() {
             let run = |hash: CodeHash| {
                 RefineContext::load_with_backend(
                     &instantiating_program(hash.0),
@@ -1564,19 +1441,18 @@ mod tests {
     /// halts with φ7 holding the call's result.
     fn state_reading_program() -> Vec<u8> {
         let [lo, hi] = (crate::inner::host_call::STATE_READ as u16).to_le_bytes();
-        #[rustfmt::skip]
-        let code = [
-            51, 7, 0x00, 0x00, 0x02,      // load_imm φ7, 0x2_0000 (key)
-            51, 8, 3,                     // load_imm φ8, 3
-            51, 9, 0x10, 0x00, 0x02,      // load_imm φ9, 0x2_0010 (output)
-            51, 10, 1,                    // load_imm φ10, 1 (offset)
-            51, 11, 64,                   // load_imm φ11, 64
-            10, lo, hi,                   // ecalli state_read
-            50, 0,                        // jump_ind φ0 (halt)
-        ];
+        let (code, starts) = crate::test_support::code(&[
+            &[51, 7, 0x00, 0x00, 0x02], // load_imm φ7, 0x2_0000 (key)
+            &[51, 8, 3],                // load_imm φ8, 3
+            &[51, 9, 0x10, 0x00, 0x02], // load_imm φ9, 0x2_0010 (output)
+            &[51, 10, 1],               // load_imm φ10, 1 (offset)
+            &[51, 11, 64],              // load_imm φ11, 64
+            &[10, lo, hi],              // ecalli state_read
+            &[50, 0],                   // jump_ind φ0 (halt)
+        ]);
         let mut rw = b"abc".to_vec();
         rw.resize(0x60, 0);
-        standard_program_with_rw(&code, &[0, 5, 8, 13, 16, 19, 22], &rw)
+        standard_program_with_rw(&code, &starts, &rw)
     }
 
     struct Fixed;
@@ -1705,13 +1581,10 @@ mod tests {
     }
 
     /// Run an inner machine whose program is `ecalli id; trap` with `gas` in
-    /// its invocation frame. Returns the outcome code in φ7 and the gas left
+    /// its invocation frame, the host computing the outer machine's
+    /// precompiles or not. Returns the outcome code in φ7 and the gas left
     /// in the frame.
-    fn invoke_inner_call(id: u16, gas: u64) -> (u64, u64) {
-        invoke_inner_call_on(id, gas, true)
-    }
-
-    fn invoke_inner_call_on(id: u16, gas: u64, precompiles: bool) -> (u64, u64) {
+    fn invoke_inner_call(id: u16, gas: u64, precompiles: bool) -> (u64, u64) {
         const RW_BASE: u32 = 2 * crate::PVM_ZONE_SIZE;
         let mut frame = [0u8; 112];
         frame[..8].copy_from_slice(&gas.to_le_bytes());
@@ -1742,10 +1615,10 @@ mod tests {
     fn an_inner_machines_precompile_reaches_its_agent() {
         const HOST: u64 = 3;
         let id = crate::precompile::BLAKE2B_COMPRESS as u16;
-        let (_, unknown) = invoke_inner_call(0x4ff, 100_000);
+        let (_, unknown) = invoke_inner_call(0x4ff, 100_000, true);
         for precompiles in [true, false] {
             assert_eq!(
-                invoke_inner_call_on(id, 100_000, precompiles),
+                invoke_inner_call(id, 100_000, precompiles),
                 (HOST, unknown),
                 "precompiles {precompiles}"
             );
@@ -1879,7 +1752,7 @@ mod tests {
         registers[8] = 1;
         registers[9] = 0;
 
-        assert!(matches!(context.machine(), Dispatch::Continue));
+        assert!(context.machine().is_ok());
         assert_eq!(context.outer.registers()[7], result::FULL);
     }
 
@@ -1896,7 +1769,7 @@ mod tests {
             registers[9] = u64::MAX;
             registers[10] = 1;
 
-            assert!(matches!(operation(&mut context), Dispatch::Continue));
+            assert!(operation(&mut context).is_ok());
             assert_eq!(context.outer.registers()[7], result::WHO);
         }
     }
@@ -1914,7 +1787,7 @@ mod tests {
             registers[9] = u64::from(u32::MAX) + 1;
             registers[10] = 0;
 
-            assert!(matches!(operation(&mut context), Dispatch::Continue));
+            assert!(operation(&mut context).is_ok());
             assert_eq!(context.outer.registers()[7], result::OK);
         }
     }

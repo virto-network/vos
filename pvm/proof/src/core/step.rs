@@ -180,6 +180,15 @@ impl CompactStep {
 
 #[cfg(feature = "prover")]
 impl PvmStep {
+    /// The id this step's `ecalli` called, when the proof runtime served it
+    /// as a precompile. Only an acknowledged call reads its operands and
+    /// selects a relation: an unacknowledged one ends its slice at a host
+    /// exit, as an inner machine's precompile call does for its agent to
+    /// serve, and selects none.
+    pub(crate) fn served_ecall(&self) -> Option<u64> {
+        (self.host_call_acknowledged && self.opcode == Opcode::Ecalli).then_some(self.imm)
+    }
+
     /// The compact form of this step. Panics if the snapshots' delta is not
     /// representable — `regs_after` differing from `regs_before` anywhere
     /// other than `reg_write` — which the tracer never records (one

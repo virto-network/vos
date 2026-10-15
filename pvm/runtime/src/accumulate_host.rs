@@ -136,40 +136,15 @@ impl<'a, S: ServiceStorage> AccumulateContext<'a, S> {
     /// `address`, and return the whole length. False when the output is
     /// not writable.
     fn copy_out(&mut self, bytes: &[u8], address: u64, offset: u64, len: u64) -> bool {
-        let offset = usize::try_from(offset)
-            .unwrap_or(usize::MAX)
-            .min(bytes.len());
-        let len = usize::try_from(len)
-            .unwrap_or(usize::MAX)
-            .min(bytes.len() - offset);
-        if len == 0 {
-            return true;
+        let window = crate::refine::window(bytes.len(), offset, len);
+        match self.machine.writable_range(address, window.len() as u64) {
+            Some((_, 0)) => true,
+            Some((address, _)) => self
+                .machine
+                .memory_mut()
+                .write_bytes_checked(address, &bytes[window]),
+            None => false,
         }
-        let Ok(address) = u32::try_from(address) else {
-            return false;
-        };
-        self.machine
-            .memory_mut()
-            .write_bytes_checked(address, &bytes[offset..offset + len])
-    }
-
-    /// The guest's bytes at `address`, or `None` when any is unreadable.
-    /// Readability is checked before allocating, so a length is bounded by
-    /// the guest's own mapped memory.
-    fn read_guest(&self, address: u64, len: u64) -> Option<Vec<u8>> {
-        let len = usize::try_from(len).ok()?;
-        if len == 0 {
-            return Some(Vec::new());
-        }
-        let address = u32::try_from(address).ok()?;
-        if !self.machine.memory().is_readable(address, len) {
-            return None;
-        }
-        let mut bytes = alloc::vec![0; len];
-        self.machine
-            .memory()
-            .read_bytes_checked(address, &mut bytes)
-            .then_some(bytes)
     }
 
     /// `log`: φ7 level, φ8/φ9 target, φ10/φ11 message. Unreadable text is
@@ -179,7 +154,8 @@ impl<'a, S: ServiceStorage> AccumulateContext<'a, S> {
         {
             let registers = *self.machine.registers();
             let text = |address: u64, len: u64| {
-                self.read_guest(address, len.min(4096))
+                self.machine
+                    .read_range(address, len.min(4096))
                     .map(|bytes| alloc::string::String::from_utf8_lossy(&bytes).into_owned())
                     .unwrap_or_default()
             };
@@ -231,7 +207,7 @@ impl<'a, S: ServiceStorage> AccumulateContext<'a, S> {
             self.machine.registers_mut()[7] = result::NONE;
             return true;
         }
-        let Some(key) = self.read_guest(registers[8], registers[9]) else {
+        let Some(key) = self.machine.read_range(registers[8], registers[9]) else {
             return false;
         };
         let Some(value) = self.storage.read(&key) else {
@@ -249,7 +225,7 @@ impl<'a, S: ServiceStorage> AccumulateContext<'a, S> {
     /// the store refuses, or `WHAT` when it serves none.
     fn solicit(&mut self) -> bool {
         let registers = *self.machine.registers();
-        let Some(hash) = self.read_guest(registers[7], 32) else {
+        let Some(hash) = self.machine.read_range(registers[7], 32) else {
             return false;
         };
         let hash: [u8; 32] = hash.try_into().expect("32 bytes");
@@ -265,13 +241,13 @@ impl<'a, S: ServiceStorage> AccumulateContext<'a, S> {
     /// previous value's length, or `NONE`.
     fn write(&mut self) -> bool {
         let registers = *self.machine.registers();
-        let Some(key) = self.read_guest(registers[7], registers[8]) else {
+        let Some(key) = self.machine.read_range(registers[7], registers[8]) else {
             return false;
         };
         let value = if registers[10] == 0 {
             None
         } else {
-            match self.read_guest(registers[9], registers[10]) {
+            match self.machine.read_range(registers[9], registers[10]) {
                 Some(value) => Some(value),
                 None => return false,
             }

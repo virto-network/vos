@@ -111,15 +111,15 @@ impl<N: NodeId> LogView<N> {
     }
 
     /// What the live entries through `index` weigh.
-    pub(crate) fn bytes_through(&self, index: u64) -> u64 {
+    pub(crate) fn weight_through(&self, index: u64) -> u64 {
         self.end_at(index) - self.start
     }
 
     /// The lowest index from which the entries after it, through `to`,
-    /// weigh at most `max_bytes`.
-    pub(crate) fn point_keeping(&self, to: u64, max_bytes: u64) -> u64 {
+    /// weigh at most `max_weight`.
+    pub(crate) fn point_keeping(&self, to: u64, max_weight: u64) -> u64 {
         let to = to.clamp(self.snap_index, self.last);
-        let floor = self.end_at(to).saturating_sub(max_bytes);
+        let floor = self.end_at(to).saturating_sub(max_weight);
         if self.start >= floor {
             return self.snap_index;
         }
@@ -373,7 +373,7 @@ mod tests {
     /// An empty log caching up to `cache_limit` bytes, weighing payloads
     /// by their length.
     fn view(cache_limit: usize) -> LogView<u16> {
-        LogView::new(0, 0, cache_limit, |payload| payload.len() as u64)
+        LogView::new(0, 0, cache_limit, crate::config::payload_len)
     }
 
     fn entry(index: u64, term: u64) -> LogEntry<u16> {
@@ -461,30 +461,30 @@ mod tests {
             sized(3, 1, 300),
             sized(4, 1, 400),
         ]);
-        assert_eq!(log.bytes_through(4), 1000);
-        assert_eq!(log.bytes_through(2), 300);
-        assert_eq!(log.bytes_through(9), 1000);
+        assert_eq!(log.weight_through(4), 1000);
+        assert_eq!(log.weight_through(2), 300);
+        assert_eq!(log.weight_through(9), 1000);
         // Entries 3 and 4 take 700 bytes; 2 through 4 take more.
         assert_eq!(log.point_keeping(4, 700), 2);
         assert_eq!(log.point_keeping(4, 699), 3);
         assert_eq!(log.point_keeping(4, 0), 4);
         assert_eq!(log.point_keeping(4, u64::MAX), 0);
         log.truncate_after(2);
-        assert_eq!(log.bytes_through(4), 300);
+        assert_eq!(log.weight_through(4), 300);
         log.append(&[sized(3, 2, 1000)]);
-        assert_eq!(log.bytes_through(3), 1300);
+        assert_eq!(log.weight_through(3), 1300);
         log.compact_to(1, 1);
-        assert_eq!(log.bytes_through(1), 0);
-        assert_eq!(log.bytes_through(3), 1200);
+        assert_eq!(log.weight_through(1), 0);
+        assert_eq!(log.weight_through(3), 1200);
         assert_eq!(log.point_keeping(3, 1000), 2);
         assert_eq!(log.point_keeping(3, u64::MAX), 1);
         // A snapshot the log does not match leaves nothing live.
         log.compact_to(5, 3);
-        assert_eq!(log.bytes_through(5), 0);
-        assert_eq!(log.bytes_through(9), 0);
+        assert_eq!(log.weight_through(5), 0);
+        assert_eq!(log.weight_through(9), 0);
         assert_eq!(log.point_keeping(9, 0), 5);
         log.append(&[sized(6, 3, 100)]);
-        assert_eq!(log.bytes_through(6), 100);
+        assert_eq!(log.weight_through(6), 100);
         assert_eq!(log.point_keeping(6, 99), 6);
     }
 
@@ -500,19 +500,19 @@ mod tests {
         log.append(&[weighing(1, 0), weighing(2, 4), weighing(3, 1)]);
         // Each entry costs the cache 100 bytes.
         assert_eq!(log.cache_bytes, 300);
-        assert_eq!(log.bytes_through(1), 100);
-        assert_eq!(log.bytes_through(2), 200 + 4096);
-        assert_eq!(log.bytes_through(3), 300 + 5120);
+        assert_eq!(log.weight_through(1), 100);
+        assert_eq!(log.weight_through(2), 200 + 4096);
+        assert_eq!(log.weight_through(3), 300 + 5120);
         // Entry 3 weighs 1,124 bytes, entries 2 and 3 more than 2 KiB.
         assert_eq!(log.point_keeping(3, 2048), 2);
         assert_eq!(log.point_keeping(3, 5320), 1);
         assert_eq!(log.point_keeping(3, 5420), 0);
         log.compact_to(2, 1);
-        assert_eq!(log.bytes_through(3), 1124);
+        assert_eq!(log.weight_through(3), 1124);
         let configuration = LogEntry::config_change(4, 1, None, vec![1, 2]);
         log.append(core::slice::from_ref(&configuration));
         assert_eq!(
-            log.bytes_through(4),
+            log.weight_through(4),
             1124 + entry_bytes(&configuration) as u64,
             "a configuration weighs what it costs the cache"
         );

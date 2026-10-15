@@ -487,6 +487,37 @@ impl Machine {
         self.interp.memory_mut()
     }
 
+    /// The `len` bytes at `address`, if all of them are readable; none
+    /// always are. Readability is checked before allocating, so a length is
+    /// bounded by the machine's own mapped memory.
+    pub fn read_range(&self, address: u64, len: u64) -> Option<Vec<u8>> {
+        let len = usize::try_from(len).ok()?;
+        if len == 0 {
+            return Some(Vec::new());
+        }
+        let address = u32::try_from(address).ok()?;
+        if !self.memory().is_readable(address, len) {
+            return None;
+        }
+        let mut bytes = vec![0; len];
+        self.memory()
+            .read_bytes_checked(address, &mut bytes)
+            .then_some(bytes)
+    }
+
+    /// The 32-bit address and the length of `len` bytes at `address`, if all
+    /// of them are writable; none always are, at 0.
+    pub fn writable_range(&self, address: u64, len: u64) -> Option<(u32, usize)> {
+        let len = usize::try_from(len).ok()?;
+        if len == 0 {
+            return Some((0, 0));
+        }
+        let address = u32::try_from(address).ok()?;
+        self.memory()
+            .is_writable(address, len)
+            .then_some((address, len))
+    }
+
     /// Consume the machine and retain its final state for inspection.
     pub fn finish(mut self, exit: ExitReason) -> Invocation {
         // Machine-produced Halt/Panic exits have already applied full Ψ's
@@ -562,6 +593,14 @@ impl Invocation {
     pub(crate) fn into_lent(self) -> Option<(Memory, crate::pool::PoolTicket)> {
         Some((self.mem, self.lent?))
     }
+}
+
+/// The part of a value `len` bytes long the Gray Paper's host calls copy
+/// out: from `offset`, at most `max` bytes, both clamped to the value.
+pub(crate) fn window(len: usize, offset: u64, max: u64) -> core::ops::Range<usize> {
+    let start = usize::try_from(offset).unwrap_or(usize::MAX).min(len);
+    let end = start + usize::try_from(max).unwrap_or(usize::MAX).min(len - start);
+    start..end
 }
 
 /// Execute a GP standard-program blob as a pure refine-style invocation,

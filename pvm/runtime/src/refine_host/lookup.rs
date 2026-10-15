@@ -39,18 +39,13 @@ pub fn serve_lookup<P: AsRef<[u8]>>(
         return Ok(());
     };
     let program = program.as_ref();
-    let offset = usize::try_from(registers[10])
-        .unwrap_or(usize::MAX)
-        .min(program.len());
-    let len = usize::try_from(registers[11])
-        .unwrap_or(usize::MAX)
-        .min(program.len() - offset);
-    if !machine.charge(LOOKUP_GAS + len as u64) {
+    let window = crate::refine::window(program.len(), registers[10], registers[11]);
+    if !machine.charge(LOOKUP_GAS + window.len() as u64) {
         return Err(ExitReason::OutOfGas);
     }
     if !machine
         .memory_mut()
-        .write_bytes_checked(registers[9] as u32, &program[offset..offset + len])
+        .write_bytes_checked(registers[9] as u32, &program[window])
     {
         return Err(ExitReason::Panic);
     }

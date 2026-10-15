@@ -489,6 +489,66 @@ mod tests {
         assert!(parse_compact_code_blob(&bytes).is_none());
     }
 
+    /// Every length class of a natural (GP eq C.1) round-trips at its
+    /// boundaries, on both sides.
+    #[test]
+    fn naturals_round_trip_at_class_boundaries() {
+        let cases: Vec<u64> = (1..=7u32)
+            .flat_map(|l| [(1u64 << (7 * l)) - 1, 1u64 << (7 * l)])
+            .chain([0, 1, (1 << 56) - 1, 1 << 56, u64::MAX])
+            .collect();
+        for x in cases {
+            let mut buf = Vec::new();
+            encode_nat(x, &mut buf);
+            assert_eq!(
+                read_nat(&buf, 0),
+                Some((x, buf.len())),
+                "round-trip failed for {x}"
+            );
+        }
+    }
+
+    /// Every header field, both data sections and the code survive a
+    /// round trip, with a jump table wide enough for 2-byte entries and a
+    /// code section long enough for a multi-byte length.
+    #[test]
+    fn a_long_program_with_wide_jump_entries_round_trips() {
+        // 300 one-byte instructions (> 127 forces a 2-byte code length):
+        // trap and fallthrough. Entries above 0xFF force 2-byte entries.
+        let code: Vec<u8> = (0..300).map(|i| (i % 2) as u8).collect();
+        let program = StandardProgram {
+            ro_data: (0..300u32).map(|i| i as u8).collect(),
+            rw_data: vec![0xbb; 77],
+            heap_pages: 3,
+            stack_size: 8192,
+            code: CodeBlob {
+                jump_table: (0..40).map(|i| 10 + i * 12).collect(),
+                bitmask: vec![1; code.len()],
+                code,
+            },
+        };
+        let bytes = build_standard_program(&program).unwrap();
+        assert_eq!(parse_standard_program(&bytes), Some(program));
+    }
+
+    /// No data, no jump table, one instruction.
+    #[test]
+    fn empty_sections_round_trip() {
+        let program = StandardProgram {
+            ro_data: Vec::new(),
+            rw_data: Vec::new(),
+            heap_pages: 0,
+            stack_size: 0,
+            code: CodeBlob {
+                jump_table: Vec::new(),
+                code: vec![0],
+                bitmask: vec![1],
+            },
+        };
+        let bytes = build_standard_program(&program).unwrap();
+        assert_eq!(parse_standard_program(&bytes), Some(program));
+    }
+
     proptest! {
         #[test]
         fn naturals_round_trip(value: u64) {

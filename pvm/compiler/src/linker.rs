@@ -11,9 +11,13 @@
 //! 4. Translate RISC-V instructions, using relocation info to replace
 //!    AUIPC+LO12 pairs with direct load_imm of the final PVM address
 
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+
+use vos_pvm::instruction::Opcode;
+use vos_pvm_program::{CodeBlob, StandardProgram};
+
 use crate::TranspileError;
-use crate::riscv::{TranslationContext, decode_b_imm, decode_j_imm};
-use std::collections::{HashMap, HashSet};
+use crate::riscv::{self, TranslationContext, decode_b_imm, decode_j_imm, op};
 
 /// RISC-V relocation types we care about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,7 +54,18 @@ impl RelocType {
             _ => None,
         }
     }
+
+    /// The bytes a relocation placing an address in data covers: eight for
+    /// `R_RISCV_64`, four for `R_RISCV_32` and `_ADD32`.
+    fn width(self) -> u8 {
+        if self == Self::Abs64 { 8 } else { 4 }
+    }
 }
+
+/// `R_RISCV_BRANCH` and `R_RISCV_JAL`: branches and jumps, which resolve
+/// within the code as linked.
+const R_RISCV_BRANCH: u32 = 16;
+const R_RISCV_JAL: u32 = 17;
 
 /// A symbol's type: a function.
 pub(crate) const STT_FUNC: u8 = 2;
@@ -104,12 +119,12 @@ pub(crate) struct LinkedElf {
     pub(crate) schema: Option<Vec<u8>>,
     /// PCREL_HI20: AUIPC instruction vaddr → resolved data address.
     /// The AUIPC itself should emit load_imm with this address.
-    pub(crate) hi20_targets: HashMap<u64, u64>,
+    pub(crate) hi20_targets: BTreeMap<u64, u64>,
     /// PCREL_LO12 instruction vaddrs whose paired HI20 is known. These
     /// instructions use the address already loaded by the AUIPC.
-    pub(crate) lo12_sites: HashSet<u64>,
+    pub(crate) lo12_sites: BTreeSet<u64>,
     /// CALL_PLT: AUIPC instruction vaddr → target function RISC-V vaddr.
-    pub(crate) call_targets: HashMap<u64, u64>,
+    pub(crate) call_targets: BTreeMap<u64, u64>,
     /// Absolute code pointers in data sections: (data_vaddr, target_code_vaddr, entry_size).
     /// entry_size is 4 for 32-bit or 8 for 64-bit entries.
     pub(crate) abs_code_ptrs: Vec<(u64, u64, u8)>,
@@ -132,6 +147,15 @@ pub(crate) struct LinkedElf {
     /// defines one (the accumulate entry). `None` for refine-only blobs, whose
     /// IC-5 prologue slot becomes a trap.
     pub(crate) accumulate_vaddr: Option<u64>,
+}
+
+impl LinkedElf {
+    /// The initialized data, each region by the address its first byte is
+    /// linked at: the read-only data, then the read-write data's
+    /// initialized part.
+    pub(crate) fn initialized(&self) -> [(u64, &[u8]); 2] {
+        [(self.ro_base, &self.ro_data), (self.rw_base, &self.rw_data)]
+    }
 }
 
 #[cfg(test)]
@@ -180,6 +204,8 @@ pub(crate) struct TranspiledElf {
     heap_pages: u32,
     /// Each function's first PVM instruction, and its name, by offset.
     functions: crate::Functions,
+    /// Each `ecalli` emitted, by the address of its `ecall`, and its id.
+    pub(crate) host_calls: Vec<(u64, u32)>,
 }
 
 /// Zeroed heap pages a linked program has past its data: 64 KiB.
@@ -225,7 +251,7 @@ pub(crate) fn zone_round(x: u64) -> u64 {
 /// placement need no linker cooperation (code addresses are translated;
 /// the stack is SP-relative).
 pub fn link_elf_spi(elf_data: &[u8]) -> Result<Vec<u8>, TranspileError> {
-    spi_blob(transpile_elf(elf_data, Link::Whole)?)
+    spi_blob(transpile_with(&parse_linked_elf(elf_data)?, Link::Whole)?)
 }
 
 /// [`link_elf_spi`], and each function's first PVM instruction in the
@@ -234,8 +260,8 @@ pub fn link_elf_spi(elf_data: &[u8]) -> Result<Vec<u8>, TranspileError> {
 pub fn link_elf_spi_with_symbols(
     elf_data: &[u8],
 ) -> Result<(Vec<u8>, crate::Functions), TranspileError> {
-    let transpiled = transpile_elf(elf_data, Link::Named)?;
-    let functions = transpiled.functions.clone();
+    let mut transpiled = transpile_with(&parse_linked_elf(elf_data)?, Link::Named)?;
+    let functions = std::mem::take(&mut transpiled.functions);
     Ok((spi_blob(transpiled)?, functions))
 }
 
@@ -304,35 +330,20 @@ pub(crate) fn spi_blob(t: TranspiledElf) -> Result<Vec<u8>, TranspileError> {
         .and_then(|reclaimed| t.heap_pages.checked_add(reclaimed))
         .ok_or_else(|| TranspileError::InvalidSection("SPI: heap page count overflow".into()))?;
 
-    // Wire-width guards: |o|, |w|, s are E₃-encoded; z is E₂-encoded.
-    for (what, len) in [("read-only", ro_data.len()), ("read-write", rw_data.len())] {
-        if len >= 1 << 24 {
-            return Err(TranspileError::InvalidSection(format!(
-                "SPI: {what} data spans {len:#x} bytes, exceeding the E3 field width",
-            )));
-        }
-    }
-    let stack_size = t.ro_base as u32;
-    if stack_size >= 1 << 24 {
-        return Err(TranspileError::InvalidSection(format!(
-            "SPI: stack size {stack_size:#x} exceeds the E3 field width",
-        )));
-    }
-    let heap_pages = u16::try_from(heap_pages).map_err(|_| {
-        TranspileError::InvalidSection(format!(
-            "SPI: heap page count {heap_pages} exceeds the E2 field width",
-        ))
-    })?;
-
-    let blob = crate::spi::build_spi_blob(
-        &ro_data,
-        &rw_data,
+    // |o|, |w| and s are E₃-encoded, z E₂-encoded: a field past its width
+    // builds no program.
+    let blob = vos_pvm_program::build_standard_program(&StandardProgram {
+        ro_data,
+        rw_data,
         heap_pages,
-        stack_size,
-        &t.code,
-        &t.bitmask,
-        &t.jump_table,
-    );
+        stack_size: t.ro_base as u32,
+        code: CodeBlob {
+            jump_table: t.jump_table,
+            code: t.code,
+            bitmask: t.bitmask,
+        },
+    })
+    .ok_or_else(|| TranspileError::InvalidSection("SPI: a field exceeds its wire width".into()))?;
 
     // Fail-early self-check: the blob must re-parse and its layout must fit
     // the 32-bit guest address space (GP eq A.42's total-size guard).
@@ -346,18 +357,6 @@ pub(crate) fn spi_blob(t: TranspiledElf) -> Result<Vec<u8>, TranspileError> {
     })?;
 
     Ok(blob)
-}
-
-/// Translate an ELF into a GP-encoded program and its data sections.
-fn transpile_elf(elf_data: &[u8], link: Link) -> Result<TranspiledElf, TranspileError> {
-    transpile_with(&parse_linked_elf(elf_data)?, link).map(|(transpiled, _)| transpiled)
-}
-
-/// Translate a parsed ELF's code into PVM code with the GP entry prologue,
-/// and rewrite its data's code pointers.
-#[cfg(test)]
-fn transpile_linked(elf: &LinkedElf) -> Result<TranspiledElf, TranspileError> {
-    transpile_with(elf, Link::Whole).map(|(transpiled, _)| transpiled)
 }
 
 /// A djump address no jump table reaches, even, and not the halt address:
@@ -380,11 +379,8 @@ pub(crate) enum Link {
 
 /// Translate a parsed ELF's code into PVM code with the GP entry prologue,
 /// and rewrite its data's code pointers, as `link` links it: the program,
-/// and each `ecalli` it emitted, by the address of its `ecall`.
-pub(crate) fn transpile_with(
-    elf: &LinkedElf,
-    link: Link,
-) -> Result<(TranspiledElf, Vec<(u64, u32)>), TranspileError> {
+/// with each `ecalli` it emitted, by the address of its `ecall`.
+pub(crate) fn transpile_with(elf: &LinkedElf, link: Link) -> Result<TranspiledElf, TranspileError> {
     let kernel = link == Link::Kernel;
     let mut ctx = TranslationContext::default();
     ctx.code_ranges = elf.code_ranges.clone();
@@ -411,15 +407,13 @@ pub(crate) fn transpile_with(
     // through into the refine body).
     match elf.accumulate_vaddr {
         Some(vaddr) => ctx.emit_jump(vaddr),
-        None => {
-            ctx.emit_inst(0); // trap
-        }
+        None => ctx.emit_op(Opcode::Trap),
     }
 
     for (_file_off, vaddr, data) in &elf.code_sections {
-        translate_section_linked(&mut ctx, data, *vaddr, elf, &elf.control_flow_targets)?;
+        translate_section_linked(&mut ctx, data, *vaddr, elf)?;
         if kernel {
-            ctx.emit_inst(0);
+            ctx.emit_op(Opcode::Trap);
         }
     }
     ctx.apply_fixups();
@@ -433,7 +427,7 @@ pub(crate) fn transpile_with(
     crate::peephole_fuse_load_imm_memory(&mut ctx.code, &mut ctx.bitmask, &ctx.jump_table);
     // The pass may insert instructions: the functions' offsets move with it.
     let mut moved: Option<Vec<u32>> = None;
-    crate::ensure_branch_targets_with_pc_map(
+    crate::ensure_branch_targets_are_block_starts(
         &mut ctx.code,
         &mut ctx.bitmask,
         &mut ctx.jump_table,
@@ -457,9 +451,8 @@ pub(crate) fn transpile_with(
         Link::Whole | Link::Kernel => Vec::new(),
     };
     functions.sort();
-    let host_calls = std::mem::take(&mut ctx.host_calls);
 
-    let transpiled = TranspiledElf {
+    Ok(TranspiledElf {
         code: ctx.code,
         bitmask: ctx.bitmask,
         jump_table: ctx.jump_table,
@@ -471,23 +464,88 @@ pub(crate) fn transpile_with(
         rw_len: elf.rw_len,
         heap_pages: elf.heap_pages,
         functions,
+        host_calls: ctx.host_calls,
+    })
+}
+
+/// Parse ELF with full relocation info. Every field the bytes claim is
+/// checked against the file and [`limits`]: a malformed ELF is refused,
+/// never read out of bounds.
+pub(crate) fn parse_linked_elf(data: &[u8]) -> Result<LinkedElf, TranspileError> {
+    let elf = sections(data)?;
+    let layout = layout(&elf.ro, &elf.rw)?;
+    // Code address ranges for detecting code pointers, sorted and merged.
+    let code_ranges = merge_ranges(
+        elf.code
+            .iter()
+            .map(|(_, vaddr, data)| (*vaddr, *vaddr + data.len() as u64))
+            .collect(),
+    );
+    let relocations = relocations(data, &elf, &code_ranges)?;
+    let mut linked = LinkedElf {
+        code_sections: elf.code,
+        ro_data: layout.ro_data,
+        ro_base: layout.ro_base,
+        rw_data: layout.rw_data,
+        rw_base: layout.rw_base,
+        rw_min: layout.rw_min,
+        rw_len: layout.rw_len,
+        heap_pages: HEAP_PAGES,
+        symbols: elf.symbols,
+        names: elf.names,
+        data_relocs: relocations.data_relocs,
+        symbol_refs: relocations.symbol_refs,
+        relocations: relocations.count,
+        unknown_relocation: relocations.unknown,
+        schema: elf.schema,
+        hi20_targets: relocations.hi20_targets,
+        lo12_sites: relocations.lo12_sites,
+        call_targets: relocations.call_targets,
+        abs_code_ptrs: relocations.abs_code_ptrs,
+        sub32_relocs: relocations.sub32_relocs,
+        data_relocation_ranges: relocations.ranges,
+        code_ranges,
+        control_flow_targets: HashSet::new(),
+        entry_vaddr: elf.entry,
+        accumulate_vaddr: elf.accumulate,
     };
-    Ok((transpiled, host_calls))
+    linked.control_flow_targets = control_flow_targets(&linked, &elf.values);
+    Ok(linked)
 }
 
 /// The most sections, symbols and relocations an ELF may hold, and the
 /// address space its loaded sections must lie in: a parse is bounded by
 /// them whatever the bytes claim.
-pub mod limits {
-    pub const SECTIONS: usize = 1 << 12;
-    pub const SYMBOLS: usize = 1 << 20;
-    pub const RELOCATIONS: usize = 1 << 22;
+pub(crate) mod limits {
+    pub(crate) const SECTIONS: usize = 1 << 12;
+    pub(crate) const SYMBOLS: usize = 1 << 20;
+    pub(crate) const RELOCATIONS: usize = 1 << 22;
     /// Loaded sections lie below this: the PVM's addresses are 32 bits.
-    pub const ADDRESS_SPACE: u64 = 1 << 32;
+    pub(crate) const ADDRESS_SPACE: u64 = 1 << 32;
     /// The most bytes of read-only or initialized read-write data: what a
     /// standard program's `E3` fields encode.
-    pub const DATA: u64 = 1 << 24;
+    pub(crate) const DATA: u64 = 1 << 24;
 }
+
+/// The ELF header's length, and the least a section header's.
+const ELF_HEADER: usize = 64;
+const SECTION_HEADER: usize = 64;
+/// The ELF classes: 32- and 64-bit.
+const ELFCLASS32: u8 = 1;
+const ELFCLASS64: u8 = 2;
+/// Section types: an unused header, a symbol table, relocations with
+/// addends, and a section the file holds no bytes of.
+const SHT_NULL: u32 = 0;
+const SHT_SYMTAB: u32 = 2;
+const SHT_RELA: u32 = 4;
+const SHT_NOBITS: u32 = 8;
+/// Section flags: written, loaded and executed.
+const SHF_WRITE: u64 = 1;
+const SHF_ALLOC: u64 = 2;
+const SHF_EXECINSTR: u64 = 4;
+/// An `Elf64_Sym`'s and an `Elf64_Rela`'s length.
+const SYMBOL_ENTRY: usize = 24;
+const RELA_ENTRY: usize = 24;
 
 /// `N` bytes of `data` at `at`, or an error naming `what`.
 fn field<const N: usize>(data: &[u8], at: usize, what: &str) -> Result<[u8; N], TranspileError> {
@@ -550,17 +608,40 @@ struct SectionInfo {
     info: usize,
 }
 
-/// Parse ELF with full relocation info. Every field the bytes claim is
-/// checked against the file and [`limits`]: a malformed ELF is refused,
-/// never read out of bounds.
-pub(crate) fn parse_linked_elf(data: &[u8]) -> Result<LinkedElf, TranspileError> {
-    if data.len() < 64 || data[0..4] != [0x7F, b'E', b'L', b'F'] {
+/// What an ELF's header, section table and symbol table give the linker.
+struct Sections {
+    /// The entry point, `e_entry`: refine's.
+    entry: u64,
+    /// The section headers, by index.
+    headers: Vec<SectionInfo>,
+    /// The code sections: file offset, vaddr and bytes.
+    code: Vec<(u64, u64, Vec<u8>)>,
+    /// The read-only sections: vaddr, size and bytes.
+    ro: Vec<(u64, usize, Vec<u8>)>,
+    /// The read-write sections: vaddr, size, and bytes but for NOBITS.
+    rw: Vec<(u64, usize, Option<Vec<u8>>)>,
+    /// The relocation sections, by index.
+    relas: Vec<usize>,
+    /// The `.vos_schema` section's bytes.
+    schema: Option<Vec<u8>>,
+    /// Each symbol's value, by its index.
+    values: Vec<u64>,
+    /// The defined symbols, in the table's order, and their names' table.
+    symbols: Vec<Symbol>,
+    names: Vec<u8>,
+    /// The exported `accumulate` symbol's address.
+    accumulate: Option<u64>,
+}
+
+/// Read the ELF header, the section table, and the symbol table.
+fn sections(data: &[u8]) -> Result<Sections, TranspileError> {
+    if data.len() < ELF_HEADER || data[0..4] != [0x7F, b'E', b'L', b'F'] {
         return Err(TranspileError::ElfParse("not an ELF file".into()));
     }
 
     match data[4] {
-        2 => {}
-        1 => {
+        ELFCLASS64 => {}
+        ELFCLASS32 => {
             return Err(TranspileError::ElfParse(
                 "linker requires 64-bit ELF (rv64em)".into(),
             ));
@@ -580,7 +661,7 @@ pub(crate) fn parse_linked_elf(data: &[u8]) -> Result<LinkedElf, TranspileError>
             limits::SECTIONS
         )));
     }
-    if e_shnum > 0 && e_shentsize < 64 {
+    if e_shnum > 0 && e_shentsize < SECTION_HEADER {
         return Err(TranspileError::ElfParse(format!(
             "a section header of {e_shentsize} bytes"
         )));
@@ -593,9 +674,10 @@ pub(crate) fn parse_linked_elf(data: &[u8]) -> Result<LinkedElf, TranspileError>
     };
     let mut sections = Vec::with_capacity(e_shnum);
     for i in 0..e_shnum {
-        let Some(sh) =
-            header(i).filter(|sh| sh.checked_add(64).is_some_and(|end| end <= data.len()))
-        else {
+        let Some(sh) = header(i).filter(|sh| {
+            sh.checked_add(SECTION_HEADER)
+                .is_some_and(|end| end <= data.len())
+        }) else {
             break;
         };
         sections.push(SectionInfo {
@@ -627,19 +709,17 @@ pub(crate) fn parse_linked_elf(data: &[u8]) -> Result<LinkedElf, TranspileError>
 
     for (i, s) in sections.iter().enumerate() {
         let name = get_name(s.name_off);
-        let is_alloc = s.flags & 2 != 0;
-        let is_exec = s.flags & 4 != 0;
-        let is_write = s.flags & 1 != 0;
+        let is_alloc = s.flags & SHF_ALLOC != 0;
+        let is_exec = s.flags & SHF_EXECINSTR != 0;
+        let is_write = s.flags & SHF_WRITE != 0;
 
-        if s.sh_type == 2 {
-            // SYMTAB
+        if s.sh_type == SHT_SYMTAB {
             symtab_idx = Some(i);
         }
-        if s.sh_type == 4 {
-            // RELA
+        if s.sh_type == SHT_RELA {
             rela_section_indices.push(i);
         }
-        if !is_alloc || s.sh_type == 0 {
+        if !is_alloc || s.sh_type == SHT_NULL {
             continue;
         }
         if s.addr
@@ -670,8 +750,7 @@ pub(crate) fn parse_linked_elf(data: &[u8]) -> Result<LinkedElf, TranspileError>
                 ro_sections.push((s.addr, size, bytes.to_vec()));
             }
         } else if is_write {
-            if s.sh_type == 8 {
-                // NOBITS (.bss)
+            if s.sh_type == SHT_NOBITS {
                 rw_sections.push((s.addr, size, None));
             } else if let Some(bytes) = bytes {
                 rw_sections.push((s.addr, size, Some(bytes.to_vec())));
@@ -692,8 +771,7 @@ pub(crate) fn parse_linked_elf(data: &[u8]) -> Result<LinkedElf, TranspileError>
             .get(s.link)
             .and_then(|names| span(data, names.file_off, names.size))
             .ok_or_else(|| TranspileError::ElfParse("no symbol names".into()))?;
-        // ELF64 symbol = 24 bytes
-        let count = (s.size / 24) as usize;
+        let count = (s.size / SYMBOL_ENTRY as u64) as usize;
         if count > limits::SYMBOLS {
             return Err(TranspileError::ElfParse(format!(
                 "{count} symbols, past {}",
@@ -701,7 +779,7 @@ pub(crate) fn parse_linked_elf(data: &[u8]) -> Result<LinkedElf, TranspileError>
             )));
         }
         let table = span(data, s.file_off, s.size).unwrap_or(&[]);
-        for entry in table.chunks_exact(24) {
+        for entry in table.chunks_exact(SYMBOL_ENTRY) {
             let st_name = u32::from_le_bytes(entry[0..4].try_into().expect("four bytes")) as usize;
             let st_info = entry[4];
             let st_value = u64::from_le_bytes(entry[8..16].try_into().expect("eight bytes"));
@@ -726,6 +804,37 @@ pub(crate) fn parse_linked_elf(data: &[u8]) -> Result<LinkedElf, TranspileError>
         names = sym_strtab.to_vec();
     }
 
+    Ok(Sections {
+        entry: e_entry,
+        headers: sections,
+        code: code_sections,
+        ro: ro_sections,
+        rw: rw_sections,
+        relas: rela_section_indices,
+        schema,
+        values,
+        symbols,
+        names,
+        accumulate: accumulate_vaddr,
+    })
+}
+
+/// Where an ELF's data lies once linked: the read-only blob and the
+/// read-write one, each by the address its first byte is linked at.
+struct Layout {
+    ro_data: Vec<u8>,
+    ro_base: u64,
+    rw_data: Vec<u8>,
+    rw_base: u64,
+    rw_min: u64,
+    rw_len: u64,
+}
+
+/// Lay the read-only and read-write sections out as their blobs.
+fn layout(
+    ro_sections: &[(u64, usize, Vec<u8>)],
+    rw_sections: &[(u64, usize, Option<Vec<u8>>)],
+) -> Result<Layout, TranspileError> {
     // Compute PVM memory layout
     // PVM linear memory: [stack: 0..s) [ro: s..s+|o|) [rw: s+P(|o|)..] [heap...]
     // We set stack_size = minimum power-of-2 page boundary that contains all ro section addrs.
@@ -753,7 +862,7 @@ pub(crate) fn parse_linked_elf(data: &[u8]) -> Result<LinkedElf, TranspileError>
         )));
     }
     let mut ro_data = vec![0u8; ro_blob_size as usize];
-    for (addr, sz, d) in &ro_sections {
+    for (addr, sz, d) in ro_sections {
         let Some(off) = addr.checked_sub(stack_size) else {
             continue;
         };
@@ -793,7 +902,7 @@ pub(crate) fn parse_linked_elf(data: &[u8]) -> Result<LinkedElf, TranspileError>
             )));
         }
         rw_data = vec![0u8; initialized as usize];
-        for (addr, sz, d) in &rw_sections {
+        for (addr, sz, d) in rw_sections {
             let off = (*addr - rw_base) as usize;
             if let Some(d) = d
                 && off + sz <= rw_data.len()
@@ -803,35 +912,51 @@ pub(crate) fn parse_linked_elf(data: &[u8]) -> Result<LinkedElf, TranspileError>
         }
     }
 
-    // Parse relocations in two passes:
-    // Pass 1: collect HI20 targets and CALL_PLT targets
-    // Pass 2: resolve LO12 by looking up their paired HI20
-    let mut hi20_targets: HashMap<u64, u64> = HashMap::new();
-    let mut lo12_sites = HashSet::new();
-    let mut call_targets: HashMap<u64, u64> = HashMap::new();
+    Ok(Layout {
+        ro_data,
+        ro_base: stack_size,
+        rw_data,
+        rw_base,
+        rw_min,
+        rw_len,
+    })
+}
 
-    // Temporary: collect LO12 entries for pass 2
-    let mut lo12_entries: Vec<(u64, u64)> = Vec::new(); // (lo12_addr, hi20_addr)
-    let mut abs64_relocs: Vec<(u64, u64, u8)> = Vec::new(); // (offset, target, entry_size)
-    let mut sub32_relocs: Vec<(u64, u64)> = Vec::new();
-    let mut data_relocs: Vec<(u64, u64)> = Vec::new();
-    let mut symbol_refs: Vec<(u64, u64)> = Vec::new();
-    let mut unknown_relocation = None;
-    let mut data_relocation_ranges = Vec::new();
-    let mut relocations = 0usize;
-    // Code address ranges for detecting code pointers, sorted and merged.
-    let code_ranges = merge_ranges(
-        code_sections
-            .iter()
-            .map(|(_, vaddr, data)| (*vaddr, *vaddr + data.len() as u64))
-            .collect(),
-    );
+/// What an ELF's relocations give the linker; the names are
+/// [`LinkedElf`]'s.
+#[derive(Default)]
+struct Relocations {
+    count: usize,
+    unknown: Option<u32>,
+    hi20_targets: BTreeMap<u64, u64>,
+    lo12_sites: BTreeSet<u64>,
+    call_targets: BTreeMap<u64, u64>,
+    abs_code_ptrs: Vec<(u64, u64, u8)>,
+    sub32_relocs: Vec<(u64, u64)>,
+    data_relocs: Vec<(u64, u64)>,
+    symbol_refs: Vec<(u64, u64)>,
+    /// The bytes relocations in data cover, merged.
+    ranges: Vec<(u64, u64)>,
+}
 
-    for &ri in &rela_section_indices {
-        let rs = &sections[ri];
-        let count = (rs.size / 24) as usize;
-        relocations = relocations.saturating_add(count);
-        if relocations > limits::RELOCATIONS {
+/// Read every relocation section of `elf`, `data`'s, whose code lies in
+/// `code_ranges`.
+fn relocations(
+    data: &[u8],
+    elf: &Sections,
+    code_ranges: &[(u64, u64)],
+) -> Result<Relocations, TranspileError> {
+    let mut found = Relocations::default();
+    // Each LO12's address, and its paired HI20's: kept once every HI20 is
+    // known.
+    let mut lo12_entries: Vec<(u64, u64)> = Vec::new();
+    let mut ranges = Vec::new();
+
+    for &ri in &elf.relas {
+        let rs = &elf.headers[ri];
+        let count = (rs.size / RELA_ENTRY as u64) as usize;
+        found.count = found.count.saturating_add(count);
+        if found.count > limits::RELOCATIONS {
             return Err(TranspileError::ElfParse(format!(
                 "past {} relocations",
                 limits::RELOCATIONS
@@ -839,239 +964,187 @@ pub(crate) fn parse_linked_elf(data: &[u8]) -> Result<LinkedElf, TranspileError>
         }
         // The section the relocations apply to: one not loaded, as debug
         // information, places no pointer in the program.
-        let applies = sections
+        let applies = elf
+            .headers
             .get(rs.info)
-            .is_some_and(|target| target.flags & 2 != 0);
+            .is_some_and(|target| target.flags & SHF_ALLOC != 0);
         let table = span(data, rs.file_off, rs.size).unwrap_or(&[]);
-        for entry in table.chunks_exact(24) {
+        for entry in table.chunks_exact(RELA_ENTRY) {
             let r_offset = u64::from_le_bytes(entry[0..8].try_into().expect("eight bytes"));
             let r_info = u64::from_le_bytes(entry[8..16].try_into().expect("eight bytes"));
             let r_addend = i64::from_le_bytes(entry[16..24].try_into().expect("eight bytes"));
             let r_type = (r_info & 0xFFFFFFFF) as u32;
             let r_sym = (r_info >> 32) as usize;
 
-            let rtype = match RelocType::from_raw(r_type) {
-                Some(t) => t,
-                None => {
-                    // Branches and jumps resolve within the code as linked.
-                    if applies && !matches!(r_type, 16 | 17) {
-                        unknown_relocation.get_or_insert(r_type);
-                    }
-                    continue;
+            let Some(rtype) = RelocType::from_raw(r_type) else {
+                if applies && !matches!(r_type, R_RISCV_BRANCH | R_RISCV_JAL) {
+                    found.unknown.get_or_insert(r_type);
                 }
+                continue;
             };
 
-            let sym_value = values.get(r_sym).copied().unwrap_or(0);
-
-            let target_addr = (sym_value as i64).wrapping_add(r_addend) as u64;
-
-            match rtype {
-                RelocType::Abs32 | RelocType::Add32 | RelocType::Sub32 => {
-                    data_relocation_ranges.push((r_offset, r_offset.saturating_add(4)));
-                }
-                RelocType::Abs64 => {
-                    data_relocation_ranges.push((r_offset, r_offset.saturating_add(8)))
-                }
-                _ => {}
-            }
-            if applies
-                && matches!(
-                    rtype,
-                    RelocType::Abs32 | RelocType::Abs64 | RelocType::Add32
-                )
-            {
-                data_relocs.push((r_offset, target_addr));
-            }
-            if applies
-                && matches!(
-                    rtype,
-                    RelocType::Abs32 | RelocType::Abs64 | RelocType::Add32 | RelocType::PcrelHi20
-                )
-            {
-                symbol_refs.push((r_offset, sym_value));
-            }
+            let sym_value = elf.values.get(r_sym).copied().unwrap_or(0);
+            let target = (sym_value as i64).wrapping_add(r_addend) as u64;
 
             match rtype {
-                RelocType::Abs32 => {
-                    let is_code_ptr = in_ranges(&code_ranges, target_addr);
-                    if is_code_ptr {
-                        abs64_relocs.push((r_offset, target_addr, 4));
+                RelocType::Abs32 | RelocType::Abs64 | RelocType::Add32 => {
+                    let width = rtype.width();
+                    ranges.push((r_offset, r_offset.saturating_add(width.into())));
+                    if applies {
+                        found.data_relocs.push((r_offset, target));
+                        found.symbol_refs.push((r_offset, sym_value));
                     }
-                }
-                RelocType::Abs64 => {
-                    let is_code_ptr = in_ranges(&code_ranges, target_addr);
-                    if is_code_ptr {
-                        abs64_relocs.push((r_offset, target_addr, 8));
-                    }
-                }
-                RelocType::Add32 => {
-                    let is_code_ptr = in_ranges(&code_ranges, target_addr);
-                    if is_code_ptr {
-                        abs64_relocs.push((r_offset, target_addr, 4));
+                    if in_ranges(code_ranges, target) {
+                        found.abs_code_ptrs.push((r_offset, target, width));
                     }
                 }
                 RelocType::Sub32 => {
-                    // R_RISCV_SUB32: the subtracted address (typically table base).
-                    sub32_relocs.push((r_offset, target_addr));
-                }
-                RelocType::CallPlt => {
-                    call_targets.insert(r_offset, target_addr);
+                    ranges.push((r_offset, r_offset.saturating_add(4)));
+                    // The subtracted address, typically a table's base.
+                    found.sub32_relocs.push((r_offset, target));
                 }
                 RelocType::PcrelHi20 => {
-                    // target_addr is the resolved data/function address
-                    hi20_targets.insert(r_offset, target_addr);
+                    if applies {
+                        found.symbol_refs.push((r_offset, sym_value));
+                    }
+                    // The resolved data or function address.
+                    found.hi20_targets.insert(r_offset, target);
                 }
+                RelocType::CallPlt => {
+                    found.call_targets.insert(r_offset, target);
+                }
+                // The symbol is the paired HI20 instruction.
                 RelocType::PcrelLo12I | RelocType::PcrelLo12S => {
-                    // sym_value is the address of the paired HI20 instruction.
-                    // r_offset is the address of this LO12 instruction.
                     lo12_entries.push((r_offset, sym_value));
                 }
             }
         }
     }
 
-    let data_relocation_ranges = merge_ranges(data_relocation_ranges);
+    found.ranges = merge_ranges(ranges);
+    found.lo12_sites = lo12_entries
+        .into_iter()
+        .filter(|(_, hi20)| found.hi20_targets.contains_key(hi20))
+        .map(|(lo12, _)| lo12)
+        .collect();
+    Ok(found)
+}
 
-    // Pass 2: resolve LO12 targets by looking up paired HI20
-    for (lo12_addr, hi20_addr) in lo12_entries {
-        if hi20_targets.contains_key(&hi20_addr) {
-            lo12_sites.insert(lo12_addr);
-        }
-    }
-
-    let mut control_flow_targets = HashSet::new();
-    control_flow_targets.insert(e_entry);
-    control_flow_targets.extend(accumulate_vaddr);
-    control_flow_targets.extend(
+/// Every statically reachable instruction address of `elf`, whose symbols'
+/// values by index are `values`: its entries, its symbols in code, its
+/// relocations' code targets and the returns of their calls, the code
+/// pointers its data's rewrite accepts, the code an AUIPC pair names, and
+/// direct branches' and jumps' targets with the returns of calls.
+fn control_flow_targets(elf: &LinkedElf, values: &[u64]) -> HashSet<u64> {
+    let is_code_target = |target: u64| in_ranges(&elf.code_ranges, target);
+    let mut targets = HashSet::new();
+    targets.insert(elf.entry_vaddr);
+    targets.extend(elf.accumulate_vaddr);
+    targets.extend(
         values
             .iter()
             .copied()
-            .filter(|value| in_ranges(&code_ranges, *value)),
+            .filter(|value| is_code_target(*value)),
     );
-    for (&call_site, &target) in &call_targets {
-        control_flow_targets.insert(target);
+    for (&call_site, &target) in &elf.call_targets {
+        targets.insert(target);
         // CALL_PLT occupies AUIPC+JALR; execution resumes after both.
-        control_flow_targets.insert(call_site.wrapping_add(8));
+        targets.insert(call_site.wrapping_add(8));
     }
-    control_flow_targets.extend(abs64_relocs.iter().map(|(_, target, _)| *target));
-    control_flow_targets.extend(
-        hi20_targets
+    targets.extend(elf.abs_code_ptrs.iter().map(|(_, target, _)| *target));
+    targets.extend(
+        elf.hi20_targets
             .values()
             .copied()
-            .filter(|target| in_ranges(&code_ranges, *target)),
+            .filter(|target| is_code_target(*target)),
     );
-    let is_code_target = |target: u64| in_ranges(&code_ranges, target);
 
-    // The data-pointer rewriter below accepts stripped linked ELFs whose only
+    // The data-pointer rewrite accepts stripped linked ELFs whose only
     // reference to a function entry is a raw pointer or an orphan SUB32 table
     // value. Collect those exact accepted targets before translating code so
     // they receive the same predecessor-fusion barrier as symbolic entries.
-    let absolute: HashSet<u64> = abs64_relocs.iter().map(|(vaddr, _, _)| *vaddr).collect();
-    for &(data_vaddr, base_addr) in &sub32_relocs {
-        if absolute.contains(&data_vaddr) {
-            continue;
-        }
-        let bytes = data_vaddr
-            .checked_sub(stack_size)
-            .and_then(|offset| usize::try_from(offset).ok())
-            .and_then(|offset| offset.checked_add(4).map(|end| (offset, end)))
-            .and_then(|(offset, end)| ro_data.get(offset..end))
-            .or_else(|| {
-                let offset = usize::try_from(data_vaddr.checked_sub(rw_base)?).ok()?;
-                let end = offset.checked_add(4)?;
-                rw_data.get(offset..end)
-            });
-        if let Some(bytes) = bytes {
-            let relative = i32::from_le_bytes(bytes.try_into().expect("four-byte slice"));
-            let target = (base_addr as i64).wrapping_add(i64::from(relative)) as u64;
-            if is_code_target(target) {
-                control_flow_targets.insert(target);
-            }
+    let absolute: HashSet<u64> = elf
+        .abs_code_ptrs
+        .iter()
+        .map(|(vaddr, _, _)| *vaddr)
+        .collect();
+    for &(data_vaddr, base) in &elf.sub32_relocs {
+        if !absolute.contains(&data_vaddr)
+            && let Some(target) = relative_target(elf.initialized(), data_vaddr, base)
+            && is_code_target(target)
+        {
+            targets.insert(target);
         }
     }
-    for (base, data) in [(stack_size, &ro_data), (rw_base, &rw_data)] {
-        for (index, bytes) in data.chunks_exact(8).enumerate() {
-            if overlaps_data_relocation(&data_relocation_ranges, base + index as u64 * 8, 8) {
-                continue;
-            }
-            let target = u64::from_le_bytes(bytes.try_into().expect("eight-byte chunk"));
-            if is_code_target(target) {
-                control_flow_targets.insert(target);
-            }
-        }
-    }
+    targets.extend(
+        raw_code_pointers(
+            elf.initialized(),
+            &elf.data_relocation_ranges,
+            &elf.code_ranges,
+        )
+        .map(|(_, target)| target),
+    );
 
-    for (_, base, code) in &code_sections {
-        for (index, bytes) in code.chunks_exact(4).enumerate() {
+    for (_, base, code) in &elf.code_sections {
+        for (index, instruction) in riscv::words(code).enumerate() {
             let address = *base + (index * 4) as u64;
-            let instruction = u32::from_le_bytes(bytes.try_into().expect("four-byte chunk"));
-            if instruction & 0x7f == 0x17
-                && let Some(next_bytes) = code.get(index * 4 + 4..index * 4 + 8)
+            if riscv::opcode(instruction) == op::AUIPC
+                && let Some(next) = riscv::word_at(code, index * 4 + 4)
             {
-                let next = u32::from_le_bytes(
-                    next_bytes
-                        .try_into()
-                        .expect("adjacent four-byte instruction"),
-                );
-                let auipc_rd = (instruction >> 7) & 0x1f;
-                let jalr_rs1 = (next >> 15) & 0x1f;
-                if next & 0x7f == 0x67 && (next >> 12) & 0x7 == 0 && auipc_rd == jalr_rs1 {
-                    let upper = (instruction & 0xffff_f000) as i32;
-                    let lower = (next as i32) >> 20;
-                    let target = address.wrapping_add_signed(i64::from(upper) + i64::from(lower));
-                    if is_code_target(target) {
-                        control_flow_targets.insert(target);
-                    }
-                }
-                let addi_rd = (next >> 7) & 0x1f;
-                if next & 0x7f == 0x13
-                    && (next >> 12) & 0x7 == 0
+                let auipc_rd = riscv::rd(instruction);
+                let paired = riscv::rs1(next) == auipc_rd && riscv::funct3(next) == 0;
+                // A call or a jump through the AUIPC's register, or an
+                // address it completes there.
+                let call = riscv::opcode(next) == op::JALR;
+                let address_load = riscv::opcode(next) == op::OP_IMM
                     && auipc_rd != 0
-                    && addi_rd == auipc_rd
-                    && jalr_rs1 == auipc_rd
-                {
-                    let upper = (instruction & 0xffff_f000) as i32;
-                    let lower = (next as i32) >> 20;
-                    let target = address.wrapping_add_signed(i64::from(upper) + i64::from(lower));
-                    if is_code_target(target) {
-                        control_flow_targets.insert(target);
-                    }
+                    && riscv::rd(next) == auipc_rd;
+                let target = riscv::auipc_pair_target(address, instruction, next);
+                if paired && (call || address_load) && is_code_target(target) {
+                    targets.insert(target);
                 }
             }
             // A call returns to the instruction after it.
-            if matches!(instruction & 0x7f, 0x6f | 0x67) && (instruction >> 7) & 0x1f != 0 {
-                control_flow_targets.insert(address + 4);
+            if matches!(riscv::opcode(instruction), op::JAL | op::JALR)
+                && riscv::rd(instruction) != 0
+            {
+                targets.insert(address + 4);
             }
         }
     }
-    control_flow_targets.extend(direct_targets(&code_sections));
+    targets.extend(direct_targets(&elf.code_sections));
+    targets
+}
 
-    Ok(LinkedElf {
-        code_sections,
-        ro_data,
-        ro_base: stack_size,
-        rw_data,
-        rw_base,
-        rw_min,
-        rw_len,
-        heap_pages: HEAP_PAGES,
-        symbols,
-        names,
-        data_relocs,
-        symbol_refs,
-        relocations,
-        unknown_relocation,
-        schema,
-        hi20_targets,
-        lo12_sites,
-        call_targets,
-        abs_code_ptrs: abs64_relocs,
-        sub32_relocs,
-        data_relocation_ranges,
-        code_ranges,
-        control_flow_targets,
-        entry_vaddr: e_entry,
-        accumulate_vaddr,
+/// What the SUB32 slot at `vaddr` names, read in the first of `regions`
+/// that holds it: `base` plus the signed word there.
+fn relative_target(regions: [(u64, &[u8]); 2], vaddr: u64, base: u64) -> Option<u64> {
+    let bytes = regions.into_iter().find_map(|(start, data)| {
+        let offset = usize::try_from(vaddr.checked_sub(start)?).ok()?;
+        data.get(offset..offset.checked_add(4)?)
+    })?;
+    let relative = i32::from_le_bytes(bytes.try_into().expect("four bytes"));
+    Some((base as i64).wrapping_add(i64::from(relative)) as u64)
+}
+
+/// The eight-byte words of `regions`, each a base address and its bytes,
+/// that no relocation (`covered`) defines and that hold an address in
+/// `code`: where each lies, and that address. Relocations normally name
+/// these; the scan also supports stripped-but-still-linked inputs.
+pub(crate) fn raw_code_pointers<'a>(
+    regions: impl IntoIterator<Item = (u64, &'a [u8])> + 'a,
+    covered: &'a [(u64, u64)],
+    code: &'a [(u64, u64)],
+) -> impl Iterator<Item = (u64, u64)> + 'a {
+    regions.into_iter().flat_map(move |(base, data)| {
+        data.chunks_exact(8)
+            .enumerate()
+            .filter_map(move |(index, bytes)| {
+                let at = base + index as u64 * 8;
+                let target = u64::from_le_bytes(bytes.try_into().expect("eight bytes"));
+                (!overlaps_data_relocation(covered, at, 8) && in_ranges(code, target))
+                    .then_some((at, target))
+            })
     })
 }
 
@@ -1094,16 +1167,44 @@ pub(crate) fn merge_ranges(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
     merged
 }
 
+/// The one of `ranges`, sorted and merged, holding `address`.
+pub(crate) fn range_at(ranges: &[(u64, u64)], address: u64) -> Option<(u64, u64)> {
+    let index = ranges.partition_point(|&(start, _)| start <= address);
+    let (start, end) = *ranges.get(index.checked_sub(1)?)?;
+    (address < end).then_some((start, end))
+}
+
 /// Whether `address` lies in one of `ranges`, sorted and merged.
 pub(crate) fn in_ranges(ranges: &[(u64, u64)], address: u64) -> bool {
-    let index = ranges.partition_point(|&(start, _)| start <= address);
-    index != 0 && address < ranges[index - 1].1
+    range_at(ranges, address).is_some()
 }
 
 pub(crate) fn overlaps_data_relocation(ranges: &[(u64, u64)], address: u64, size: u8) -> bool {
     let end = address.saturating_add(u64::from(size));
     let index = ranges.partition_point(|&(start, _)| start < end);
     index != 0 && ranges[index - 1].1 > address
+}
+
+/// How a code pointer in data is written.
+#[derive(Clone, Copy)]
+enum Slot {
+    /// A 64-bit address.
+    Abs64,
+    /// A 32-bit address.
+    Abs32,
+    /// A 32-bit offset from a table's base: an LLVM relative jump table's
+    /// entry, which code reads as `lw off, table(idx); add target, off,
+    /// base; jr target`.
+    Rel32 { base: u64 },
+}
+
+/// The `len` bytes at `vaddr` in the first of `regions`, each a base
+/// address and its bytes, that holds them.
+fn slot_mut(regions: [(u64, &mut [u8]); 2], vaddr: u64, len: usize) -> Option<&mut [u8]> {
+    regions.into_iter().find_map(|(base, data)| {
+        let offset = usize::try_from(vaddr.checked_sub(base)?).ok()?;
+        data.get_mut(offset..offset.checked_add(len)?)
+    })
 }
 
 /// Rewrite code pointers in data sections (LLVM switch/jump tables, vtables).
@@ -1131,8 +1232,7 @@ fn rewrite_data_code_ptrs(
     struct Entry {
         data_vaddr: u64,
         rv_target: u64,
-        size: u8,
-        table_base_rv: Option<u64>,
+        slot: Slot,
     }
     let mut entries: Vec<Entry> = Vec::new();
 
@@ -1145,66 +1245,53 @@ fn rewrite_data_code_ptrs(
         bases.entry(vaddr).or_insert(base);
     }
     for &(vaddr, target, size) in &elf.abs_code_ptrs {
-        let table_base = bases.get(&vaddr).copied();
+        let slot = match (size, bases.get(&vaddr)) {
+            (8, _) => Slot::Abs64,
+            (_, None) => Slot::Abs32,
+            (_, Some(&base)) => Slot::Rel32 { base },
+        };
         entries.push(Entry {
             data_vaddr: vaddr,
             rv_target: target,
-            size,
-            table_base_rv: table_base,
+            slot,
         });
     }
 
     // The data addresses entries already rewrite.
     let mut seen: HashSet<u64> = entries.iter().map(|entry| entry.data_vaddr).collect();
-    // SUB32 entries without matching ADD32 (shouldn't happen, but handle gracefully).
-    for &(data_vaddr, base_addr) in &elf.sub32_relocs {
+    // A SUB32 no ADD32 pairs with: its word in data is the entry.
+    for &(data_vaddr, base) in &elf.sub32_relocs {
         if seen.contains(&data_vaddr) {
-            continue; // Already handled via ADD32 pairing above
+            continue;
         }
-        let at = |base: u64, data: &'_ [u8]| -> Option<[u8; 4]> {
-            let off = usize::try_from(data_vaddr.checked_sub(base)?).ok()?;
-            data.get(off..off.checked_add(4)?)?.try_into().ok()
-        };
-        let bytes = at(ro_base, ro_data).or_else(|| at(rw_base, rw_data));
-        if let Some(bytes) = bytes {
-            let val = i32::from_le_bytes(bytes);
-            let target = (base_addr as i64).wrapping_add(i64::from(val)) as u64;
-            if is_code_addr(target) {
-                seen.insert(data_vaddr);
-                entries.push(Entry {
-                    data_vaddr,
-                    rv_target: target,
-                    size: 4,
-                    table_base_rv: Some(base_addr),
-                });
-            }
+        if let Some(target) = relative_target(
+            [(ro_base, &*ro_data), (rw_base, &*rw_data)],
+            data_vaddr,
+            base,
+        ) && is_code_addr(target)
+        {
+            seen.insert(data_vaddr);
+            entries.push(Entry {
+                data_vaddr,
+                rv_target: target,
+                slot: Slot::Rel32 { base },
+            });
         }
     }
 
     // Heuristic: 8-byte values in either initialized region that are code
-    // addresses. Relocations normally cover these; the scan also supports
-    // stripped-but-still-linked inputs.
-    let initialized_regions = [(ro_base, &*ro_data), (rw_base, &*rw_data)];
-    for (base, data) in initialized_regions {
-        let mut off = 0;
-        while off + 8 <= data.len() {
-            if overlaps_data_relocation(&elf.data_relocation_ranges, base + off as u64, 8) {
-                off += 8;
-                continue;
-            }
-            let val = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
-            if is_code_addr(val) {
-                let vaddr = base + off as u64;
-                if seen.insert(vaddr) {
-                    entries.push(Entry {
-                        data_vaddr: vaddr,
-                        rv_target: val,
-                        size: 8,
-                        table_base_rv: None,
-                    });
-                }
-            }
-            off += 8;
+    // addresses.
+    for (vaddr, target) in raw_code_pointers(
+        [(ro_base, &*ro_data), (rw_base, &*rw_data)],
+        &elf.data_relocation_ranges,
+        &elf.code_ranges,
+    ) {
+        if seen.insert(vaddr) {
+            entries.push(Entry {
+                data_vaddr: vaddr,
+                rv_target: target,
+                slot: Slot::Abs64,
+            });
         }
     }
 
@@ -1212,44 +1299,28 @@ fn rewrite_data_code_ptrs(
         return;
     }
 
-    let targets: std::collections::HashSet<u64> = entries.iter().map(|e| e.rv_target).collect();
+    let targets: BTreeSet<u64> = entries.iter().map(|e| e.rv_target).collect();
     let rv_to_jt = ctx.build_function_pointer_map(&targets);
 
     for entry in &entries {
         let Some(jt_addr) = rv_to_jt.get(&entry.rv_target).copied().or(pruned) else {
             continue;
         };
-        let replacement = match (entry.size, entry.table_base_rv) {
-            (8, _) => (jt_addr as u64).to_le_bytes().to_vec(),
-            (4, None) => jt_addr.to_le_bytes().to_vec(),
-            (4, Some(rv_base)) => {
-                // Relative entry: code does `lw off, table(idx); add target,
-                // off, base; jr target`.
-                let pvm_base = ctx
-                    .address_map
-                    .get(&rv_base)
-                    .copied()
-                    .unwrap_or(rv_base as u32);
+        let (bytes, len) = match entry.slot {
+            Slot::Abs64 => (u64::from(jt_addr).to_le_bytes(), 8),
+            Slot::Abs32 => (u64::from(jt_addr).to_le_bytes(), 4),
+            Slot::Rel32 { base } => {
+                let pvm_base = ctx.address_map.get(&base).copied().unwrap_or(base as u32);
                 let value = (jt_addr as i64 - pvm_base as i64) as i32;
-                value.to_le_bytes().to_vec()
+                (i64::from(value).to_le_bytes(), 4)
             }
-            _ => continue,
         };
-        let size = replacement.len();
-        if let Some(off) = entry
-            .data_vaddr
-            .checked_sub(ro_base)
-            .and_then(|off| usize::try_from(off).ok())
-            .filter(|off| off.saturating_add(size) <= ro_data.len())
-        {
-            ro_data[off..off + size].copy_from_slice(&replacement);
-        } else if let Some(off) = entry
-            .data_vaddr
-            .checked_sub(rw_base)
-            .and_then(|off| usize::try_from(off).ok())
-            .filter(|off| off.saturating_add(size) <= rw_data.len())
-        {
-            rw_data[off..off + size].copy_from_slice(&replacement);
+        if let Some(slot) = slot_mut(
+            [(ro_base, &mut *ro_data), (rw_base, &mut *rw_data)],
+            entry.data_vaddr,
+            len,
+        ) {
+            slot.copy_from_slice(&bytes[..len]);
         }
     }
 }
@@ -1261,13 +1332,12 @@ pub(crate) fn direct_targets(
     code_sections: &[(u64, u64, Vec<u8>)],
 ) -> impl Iterator<Item = u64> + '_ {
     code_sections.iter().flat_map(|(_, base, data)| {
-        data.chunks_exact(4)
+        riscv::words(data)
             .enumerate()
-            .filter_map(move |(index, word)| {
-                let inst = u32::from_le_bytes(word.try_into().expect("four-byte chunk"));
-                let offset = match inst & 0x7f {
-                    0x63 => decode_b_imm(inst),
-                    0x6f => decode_j_imm(inst),
+            .filter_map(move |(index, inst)| {
+                let offset = match riscv::opcode(inst) {
+                    op::BRANCH => decode_b_imm(inst),
+                    op::JAL => decode_j_imm(inst),
                     _ => return None,
                 };
                 let address = base + 4 * index as u64;
@@ -1276,79 +1346,56 @@ pub(crate) fn direct_targets(
     })
 }
 
-/// Translate one code section. `targets` holds every address another
-/// control-flow edge may enter.
+/// Translate one code section. The ELF's control-flow targets are every
+/// address another control-flow edge may enter.
 fn translate_section_linked(
     ctx: &mut TranslationContext,
     data: &[u8],
     base_addr: u64,
     elf: &LinkedElf,
-    targets: &HashSet<u64>,
 ) -> Result<(), TranspileError> {
+    let targets = &elf.control_flow_targets;
     let mut offset = 0;
     while offset < data.len() {
         let rv_addr = base_addr + offset as u64;
         ctx.begin_instruction(rv_addr, targets.contains(&rv_addr))?;
 
-        if offset + 4 > data.len() {
+        let Some(inst) = riscv::word_at(data, offset) else {
             break;
-        }
+        };
 
-        let inst = u32::from_le_bytes([
-            data[offset],
-            data[offset + 1],
-            data[offset + 2],
-            data[offset + 3],
-        ]);
-
-        // Skip non-instruction bytes
+        // A compressed instruction: rv64em has none.
         if inst & 0x3 != 0x3 {
-            // Compressed instruction — not supported for rv64em
             return Err(TranspileError::UnsupportedInstruction {
                 offset: rv_addr as usize,
                 detail: "compressed instruction in rv64em ELF".into(),
             });
         }
 
-        let opcode = inst & 0x7f;
+        if riscv::opcode(inst) == op::AUIPC {
+            let rd = riscv::rd(inst);
 
-        // Check for relocation overrides
-        if opcode == 0x17 {
-            // AUIPC
-            let rd = ((inst >> 7) & 0x1f) as u8;
-
-            if let Some(&target_addr) = elf.call_targets.get(&rv_addr) {
-                // CALL_PLT: AUIPC+JALR pair for function call
-                // Peek at JALR to get link register
-                if offset + 8 <= data.len() {
-                    if targets.contains(&(rv_addr + 4)) {
-                        return Err(TranspileError::InvalidSection(format!(
-                            "control-flow target {:#x} splits a relocated AUIPC+JALR call pair at {rv_addr:#x}",
-                            rv_addr + 4
-                        )));
-                    }
-                    let jalr = u32::from_le_bytes([
-                        data[offset + 4],
-                        data[offset + 5],
-                        data[offset + 6],
-                        data[offset + 7],
-                    ]);
-                    let jalr_rd = ((jalr >> 7) & 0x1f) as u8;
-                    let ret_addr = rv_addr + 8;
-
-                    // This relocation override bypasses `translate_one`, so flush
-                    // any LUI/AUIPC buffered by the linear predecessor before the
-                    // call can transfer control. This also clears load-immediate
-                    // fusion state: a later consumer must not fuse backwards across
-                    // the emitted call and truncate its bytes.
-                    ctx.flush_pending()?;
-                    // Fused load_imm_jump: set return address and jump in one instruction
-                    ctx.emit_call(jalr_rd, ret_addr, target_addr)?;
-                    // Map the JALR address too
-                    ctx.address_map.insert(rv_addr + 4, ctx.code.len() as u32);
-                    offset += 8; // skip both AUIPC and JALR
-                    continue;
+            // CALL_PLT: an AUIPC+JALR pair calling a function.
+            if let Some(&target_addr) = elf.call_targets.get(&rv_addr)
+                && let Some(jalr) = riscv::word_at(data, offset + 4)
+            {
+                if targets.contains(&(rv_addr + 4)) {
+                    return Err(TranspileError::InvalidSection(format!(
+                        "control-flow target {:#x} splits a relocated AUIPC+JALR call pair at {rv_addr:#x}",
+                        rv_addr + 4
+                    )));
                 }
+                // This relocation override bypasses `translate_one`, so flush
+                // any LUI/AUIPC buffered by the linear predecessor before the
+                // call can transfer control. This also clears load-immediate
+                // fusion state: a later consumer must not fuse backwards across
+                // the emitted call and truncate its bytes.
+                ctx.flush_pending()?;
+                // Fused load_imm_jump: set return address and jump in one instruction
+                ctx.emit_call(riscv::rd(jalr), rv_addr + 8, target_addr)?;
+                ctx.address_map.insert(rv_addr + 4, ctx.code.len() as u32);
+                offset += 8;
+                continue;
             }
 
             if let Some(&target_addr) = elf.hi20_targets.get(&rv_addr) {
@@ -1357,114 +1404,69 @@ fn translate_section_linked(
                 // skip it and set pending_load_imm to enable cascading fusion
                 // with the instruction after (load_ind, store_ind, ALU, branch).
                 let next_addr = rv_addr + 4;
-                if offset + 8 <= data.len() && elf.lo12_sites.contains(&next_addr) {
-                    if elf.control_flow_targets.contains(&next_addr) {
+                if let Some(next_inst) = riscv::word_at(data, offset + 4)
+                    && elf.lo12_sites.contains(&next_addr)
+                {
+                    if targets.contains(&next_addr) {
                         return Err(TranspileError::InvalidSection(
                             "control-flow target splits a relocated HI20+LO12 pair".into(),
                         ));
                     }
-                    let next_inst = u32::from_le_bytes([
-                        data[offset + 4],
-                        data[offset + 5],
-                        data[offset + 6],
-                        data[offset + 7],
-                    ]);
-                    let next_opcode = next_inst & 0x7f;
-                    let next_funct3 = (next_inst >> 12) & 0x7;
-                    let next_rd = ((next_inst >> 7) & 0x1f) as u8;
-                    let next_rs1 = ((next_inst >> 15) & 0x1f) as u8;
-
-                    if next_opcode == 0x13 && next_funct3 == 0 && next_rs1 == rd {
+                    if riscv::opcode(next_inst) == op::OP_IMM
+                        && riscv::funct3(next_inst) == 0
+                        && riscv::rs1(next_inst) == rd
+                    {
                         // LO12 ADDI: address is already complete from HI20.
-                        // Emit load_imm into the ADDI's destination register
-                        // and set pending_load_imm for cascading fusion.
+                        // Load it into the ADDI's destination register,
+                        // pending for cascading fusion.
+                        let next_rd = riscv::rd(next_inst);
                         let dest = if next_rd != 0 { next_rd } else { rd };
-                        let pos = ctx.code.len();
-                        // If target is a code address (function pointer), load
-                        // a jump table address instead of the raw RISC-V address.
-                        let load_val = if ctx.is_code_addr(target_addr) {
-                            let jt_idx = ctx.jump_table.len();
-                            ctx.jump_table.push(0);
-                            ctx.return_fixups.push((jt_idx, target_addr));
-                            ((jt_idx + 1) * 2) as i64
-                        } else {
-                            target_addr as i64
-                        };
-                        ctx.emit_load_imm(dest, load_val)?;
-                        ctx.pending_load_imm = Some((dest, load_val, pos));
+                        ctx.load_address(dest, target_addr)?;
                         ctx.address_map.insert(next_addr, ctx.code.len() as u32);
-                        offset += 8; // skip both AUIPC and ADDI
+                        offset += 8;
                         continue;
                     }
                 }
 
-                // No paired LO12 ADDI next — emit load_imm with pending tracking.
-                // This enables fusion with the next load/store/ALU/branch via
-                // pending_load_imm even when the LO12 is a LOAD or STORE directly.
-                let pos = ctx.code.len();
-                // If target is a code address, use jump table address.
-                let load_val = if ctx.is_code_addr(target_addr) {
-                    let jt_idx = ctx.jump_table.len();
-                    ctx.jump_table.push(0);
-                    ctx.return_fixups.push((jt_idx, target_addr));
-                    ((jt_idx + 1) * 2) as i64
-                } else {
-                    target_addr as i64
-                };
-                ctx.emit_load_imm(rd, load_val)?;
-                ctx.pending_load_imm = Some((rd, load_val, pos));
+                // No paired LO12 ADDI next — load it pending, which fuses
+                // with the next load/store/ALU/branch even when the LO12 is a
+                // LOAD or STORE directly.
+                ctx.load_address(rd, target_addr)?;
                 offset += 4;
                 continue;
             }
         }
 
-        // Check if this instruction has a PCREL_LO12 relocation.
-        // If so, the rs1 register already contains the full resolved address
-        // (loaded by the paired AUIPC/HI20 above). Override immediate to 0
-        // and route through translate_load/translate_store to enable fusion
-        // with the pending_load_imm set by the HI20 handler above.
-        if elf.lo12_sites.contains(&rv_addr) {
-            let rd = ((inst >> 7) & 0x1f) as u8;
-            let rs1 = ((inst >> 15) & 0x1f) as u8;
-            let funct3 = (inst >> 12) & 0x7;
-
-            if opcode == 0x13 && funct3 == 0 {
-                // ADDI rd, rs1, lo12 → address already loaded by HI20.
-                // This path is reached when the HI20 peek-ahead didn't consume
-                // this ADDI (e.g., non-adjacent HI20/LO12 pair).
+        // A PCREL_LO12 instruction's rs1 already holds the full resolved
+        // address, loaded by the paired AUIPC above: its immediate is 0, and
+        // a load or store goes through translate_load/translate_store to fuse
+        // with the pending_load_imm the HI20 set.
+        let lo12 = elf.lo12_sites.contains(&rv_addr);
+        let (rd, rs1, funct3) = (riscv::rd(inst), riscv::rs1(inst), riscv::funct3(inst));
+        match riscv::opcode(inst) {
+            // ADDI rd, rs1, lo12 → address already loaded by HI20, reached
+            // when the HI20 peek-ahead didn't consume this ADDI (e.g. a
+            // non-adjacent HI20/LO12 pair).
+            op::OP_IMM if lo12 && funct3 == 0 => {
                 if rd != rs1 && rd != 0 {
                     let pvm_src = ctx.require_reg(rs1)?;
                     let pvm_dst = ctx.require_reg(rd)?;
-                    ctx.emit_inst(100); // move_reg
+                    ctx.emit_op(Opcode::MoveReg);
                     ctx.emit_data(pvm_dst | (pvm_src << 4));
                 } else {
-                    ctx.emit_inst(1); // fallthrough
+                    ctx.emit_op(Opcode::Fallthrough);
                 }
-                offset += 4;
-                continue;
-            } else if opcode == 0x03 {
-                // LOAD rd, lo12(rs1) → route through translate_load with imm=0.
-                // If pending_load_imm is set (from HI20), this fuses into a
-                // direct load (load_* rd, addr) — saving one instruction.
-                ctx.translate_load(funct3, rd, rs1, 0, rv_addr)?;
-                offset += 4;
-                continue;
-            } else if opcode == 0x23 {
-                // STORE rs2, lo12(rs1) → route through translate_store with imm=0.
-                let rs2 = ((inst >> 20) & 0x1f) as u8;
-                ctx.translate_store(funct3, rs1, rs2, 0, rv_addr)?;
-                offset += 4;
-                continue;
             }
-            // Fallthrough: translate normally (shouldn't happen for well-formed code)
+            // LOAD rd, lo12(rs1): with the HI20's load pending, a direct
+            // load (load_* rd, addr), which saves an instruction.
+            op::LOAD if lo12 => ctx.translate_load(funct3, rd, rs1, 0, rv_addr)?,
+            // STORE rs2, lo12(rs1)
+            op::STORE if lo12 => ctx.translate_store(funct3, rs1, riscv::rs2(inst), 0, rv_addr)?,
+            _ => ctx.translate_one(inst, rv_addr)?,
         }
-
-        // Normal instruction translation
-        let consumed = ctx.translate_instruction(data, offset, base_addr)?;
-        offset += consumed;
+        offset += 4;
     }
 
-    // Flush any pending LUI/AUIPC at section boundary
     ctx.flush_pending()?;
 
     Ok(())
@@ -1569,14 +1571,14 @@ mod tests {
             target.to_le_bytes().to_vec(),
             vec![(0x1_0000, target, 8)],
         );
-        let (kernel, _) = transpile_with(&elf, Link::Kernel).expect("translates");
+        let kernel = transpile_with(&elf, Link::Kernel).expect("translates");
         assert_eq!(kernel.ro_data, u64::from(PRUNED).to_le_bytes());
         assert!(kernel.jump_table.len() * 2 < PRUNED as usize);
         let blob = spi_blob(kernel).expect("links");
         let invocation = refine::execute(&blob, &[], 10_000_000).expect("executes");
         assert_eq!(invocation.exit, ExitReason::Panic);
         // Linked whole, the pointer is left as it was.
-        let (whole, _) = transpile_with(&elf, Link::Whole).expect("translates");
+        let whole = transpile_with(&elf, Link::Whole).expect("translates");
         assert_eq!(whole.ro_data, target.to_le_bytes());
     }
 
@@ -1586,12 +1588,12 @@ mod tests {
     fn a_branch_into_pruned_code_traps() {
         let text = assemble(&[jal(0, 0x1000)]);
         let elf = pruned(&text, Vec::new(), Vec::new());
-        let (kernel, _) = transpile_with(&elf, Link::Kernel).expect("translates");
+        let kernel = transpile_with(&elf, Link::Kernel).expect("translates");
         let blob = spi_blob(kernel).expect("links");
         let invocation = refine::execute(&blob, &[], 10_000_000).expect("executes");
         assert_eq!(invocation.exit, ExitReason::Panic);
         let falls = pruned(&assemble(&[addi(A0, A0, 1)]), Vec::new(), Vec::new());
-        let (kernel, _) = transpile_with(&falls, Link::Kernel).expect("translates");
+        let kernel = transpile_with(&falls, Link::Kernel).expect("translates");
         let blob = spi_blob(kernel).expect("links");
         let invocation = refine::execute(&blob, &[], 10_000_000).expect("executes");
         assert_eq!(invocation.exit, ExitReason::Panic);
@@ -1623,36 +1625,11 @@ mod tests {
 
         let mut elf = LinkedElf {
             relocations: 1,
-            call_targets: HashMap::from([(CALL_SITE, CALLEE)]),
-            ..LinkedElf::text(TEXT_VADDR, text.clone())
+            call_targets: BTreeMap::from([(CALL_SITE, CALLEE)]),
+            ..LinkedElf::text(TEXT_VADDR, text)
         };
         elf.control_flow_targets.extend([RETURN_ADDR, CALLEE]);
-
-        let mut ctx = TranslationContext::default();
-        ctx.code_ranges = elf.code_ranges.clone();
-        ctx.emit_jump(elf.entry_vaddr);
-        ctx.emit_inst(0); // unused accumulate entry
-        translate_section_linked(&mut ctx, &text, TEXT_VADDR, &elf, &elf.control_flow_targets)
-            .expect("translates");
-        ctx.apply_fixups();
-
-        crate::peephole_fuse_load_imm_alu(&mut ctx.code, &mut ctx.bitmask, &ctx.jump_table);
-        crate::peephole_fuse_load_imm_memory(&mut ctx.code, &mut ctx.bitmask, &ctx.jump_table);
-        crate::ensure_branch_targets_are_block_starts(
-            &mut ctx.code,
-            &mut ctx.bitmask,
-            &mut ctx.jump_table,
-        );
-
-        let blob = crate::spi::build_spi_blob(
-            &[],
-            &[],
-            elf.heap_pages as u16,
-            elf.ro_base as u32,
-            &ctx.code,
-            &ctx.bitmask,
-            &ctx.jump_table,
-        );
+        let blob = spi_blob(transpile_with(&elf, Link::Whole).expect("translates")).expect("links");
         let invocation = refine::execute(&blob, &[], 10_000_000).expect("executes");
 
         assert_eq!(invocation.exit, ExitReason::Halt);

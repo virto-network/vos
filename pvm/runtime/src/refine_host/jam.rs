@@ -3,7 +3,7 @@
 
 use alloc::vec::Vec;
 
-use super::{RefineContext, result};
+use super::{Host, RefineContext, result};
 use crate::refine::{Invocation, Machine, RefineError};
 use crate::{ExitReason, Gas};
 
@@ -50,15 +50,15 @@ pub const SEGMENT: usize = 4104;
 pub const MAX_EXPORTS: u64 = 3072;
 
 /// `fetch` kinds the JAM-only host serves in refine.
-pub mod fetch_kind {
+mod fetch_kind {
     /// The protocol's parameters, encoded.
-    pub const PARAMETERS: u64 = 0;
+    pub(super) const PARAMETERS: u64 = 0;
     /// Import φ12 of work item φ11.
-    pub const ANY_IMPORT: u64 = 5;
+    pub(super) const ANY_IMPORT: u64 = 5;
     /// Import φ11 of the running work item.
-    pub const OUR_IMPORT: u64 = 6;
+    pub(super) const OUR_IMPORT: u64 = 6;
     /// Work item φ11's payload.
-    pub const PAYLOAD: u64 = 13;
+    pub(super) const PAYLOAD: u64 = 13;
 }
 
 /// A service's preimages, as `historical_lookup` reads them at a work
@@ -108,8 +108,7 @@ impl RefineContext {
     /// VOS extension when no pool or state reader is set among them,
     /// answering `WHAT` while execution continues.
     pub fn try_run_jam(mut self, jam: JamRefine) -> Result<JamRun, RefineError> {
-        self.precompiles = false;
-        self.jam = true;
+        self.host = Host::Jam;
         let mut exports = Vec::new();
         let invocation =
             self.try_run_with_host(|id, machine| serve_jam(&jam, &mut exports, id, machine))?;
@@ -157,17 +156,10 @@ fn serve_jam(
         }
         Ok(gp_call::EXPORT) => {
             charge(machine, jam_gas::EXPORT)?;
-            let len = r[8].min(SEGMENT as u64) as usize;
-            let mut segment = alloc::vec![0u8; SEGMENT];
-            let readable = len == 0
-                || u32::try_from(r[7]).is_ok_and(|address| {
-                    machine
-                        .memory()
-                        .read_bytes_checked(address, &mut segment[..len])
-                });
-            if !readable {
-                return Err(ExitReason::Panic);
-            }
+            let mut segment = machine
+                .read_range(r[7], r[8].min(SEGMENT as u64))
+                .ok_or(ExitReason::Panic)?;
+            segment.resize(SEGMENT, 0);
             let index = jam.export_offset + exports.len() as u64;
             if index >= MAX_EXPORTS {
                 result::FULL
@@ -178,12 +170,11 @@ fn serve_jam(
         }
         Ok(gp_call::HISTORICAL_LOOKUP) => {
             charge(machine, jam_gas::historical_lookup(r[11]))?;
-            let mut hash = [0u8; 32];
-            let readable = u32::try_from(r[8])
-                .is_ok_and(|address| machine.memory().read_bytes_checked(address, &mut hash));
-            if !readable {
-                return Err(ExitReason::Panic);
-            }
+            let hash: [u8; 32] = machine
+                .read_range(r[8], 32)
+                .ok_or(ExitReason::Panic)?
+                .try_into()
+                .expect("32 bytes read");
             let service = match r[7] {
                 u64::MAX => jam.service,
                 service => service,
@@ -221,21 +212,18 @@ fn copy_out(
     let Some(value) = value else {
         return Ok(result::NONE);
     };
-    let offset = usize::try_from(offset)
-        .unwrap_or(usize::MAX)
-        .min(value.len());
-    let len = usize::try_from(len)
-        .unwrap_or(usize::MAX)
-        .min(value.len() - offset);
-    let written = len == 0
-        || u32::try_from(address).is_ok_and(|address| {
-            machine
-                .memory_mut()
-                .write_bytes_checked(address, &value[offset..offset + len])
-        });
-    written
-        .then_some(value.len() as u64)
-        .ok_or(ExitReason::Panic)
+    let window = crate::refine::window(value.len(), offset, len);
+    let (address, len) = machine
+        .writable_range(address, window.len() as u64)
+        .ok_or(ExitReason::Panic)?;
+    if len > 0
+        && !machine
+            .memory_mut()
+            .write_bytes_checked(address, &value[window])
+    {
+        return Err(ExitReason::Panic);
+    }
+    Ok(value.len() as u64)
 }
 
 #[cfg(test)]

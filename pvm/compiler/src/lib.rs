@@ -18,12 +18,18 @@
 //!   bytes cannot change.
 
 pub mod assembler;
-pub mod derive;
-pub mod linker;
-pub mod riscv;
-pub mod spi;
+mod derive;
+mod linker;
+mod riscv;
+mod spi;
+
+use std::collections::{BTreeSet, HashSet};
 
 use thiserror::Error;
+use vos_pvm::instruction::{InstructionCategory, Opcode};
+
+pub use derive::{DeriveError, Derived, MAX_ELF, TRANSPILER_VERSION, derive};
+pub use linker::{link_elf_spi, link_elf_spi_with_symbols};
 
 /// Parse a signed variable-length immediate from PVM bytecode.
 ///
@@ -55,17 +61,6 @@ pub enum TranspileError {
     #[error("invalid section: {0}")]
     InvalidSection(String),
 }
-
-/// Link a RISC-V rv64em ELF binary into a GP standard-program (SPI) blob —
-/// the format `vos_pvm::spi::parse_standard_program` consumes and
-/// `vos_pvm::refine::execute_with` runs. See [`linker::link_elf_spi`] for the
-/// standard-program data-pointer rules, field derivation, and guest
-/// link-address requirements.
-pub fn link_elf_spi(elf_data: &[u8]) -> Result<Vec<u8>, TranspileError> {
-    linker::link_elf_spi(elf_data)
-}
-
-pub use derive::{DeriveError, Derived, MAX_ELF, TRANSPILER_VERSION, derive};
 
 /// A JAM service's metadata, which its code blob carries before its
 /// program, as PolkaJam's own services do: a version (0), then its name,
@@ -110,12 +105,6 @@ fn encode_bytes(bytes: &[u8], out: &mut Vec<u8>) {
 /// its name (demangled), by offset.
 pub type Functions = Vec<(u32, String)>;
 
-/// [`link_elf_spi`], with the blob's [`Functions`]: what a profiler names
-/// compiled code by.
-pub fn link_elf_spi_with_symbols(elf_data: &[u8]) -> Result<(Vec<u8>, Functions), TranspileError> {
-    linker::link_elf_spi_with_symbols(elf_data)
-}
-
 /// Compute skip distance from bitmask: number of continuation bytes after position `pc`.
 fn skip_for(bitmask: &[u8], pc: usize) -> usize {
     for j in 0..25 {
@@ -127,74 +116,95 @@ fn skip_for(bitmask: &[u8], pc: usize) -> usize {
     0
 }
 
+/// Each instruction of PVM code, by its bitmask: where it starts, and how
+/// many continuation bytes follow it.
+fn instructions(bitmask: &[u8]) -> impl Iterator<Item = (usize, usize)> + '_ {
+    let mut pc = 0;
+    std::iter::from_fn(move || {
+        while pc < bitmask.len() && bitmask[pc] != 1 {
+            pc += 1;
+        }
+        if pc >= bitmask.len() {
+            return None;
+        }
+        let (at, skip) = (pc, skip_for(bitmask, pc));
+        pc = at + 1 + skip;
+        Some((at, skip))
+    })
+}
+
+/// A jump's or a branch's offset in PVM code: where its bytes lie, how
+/// many there are, and its value, relative to the instruction's start.
+struct Offset {
+    at: usize,
+    width: usize,
+    value: i32,
+}
+
+/// The offset of the instruction at `pc`, `skip` continuation bytes long,
+/// when it jumps or branches to a fixed target: `jump`'s four bytes, a
+/// two-register branch's four after its registers, or as many as a
+/// register-immediate branch or `load_imm_jump` leaves after its
+/// immediate, at most four, sign-extended.
+fn branch_offset(code: &[u8], pc: usize, skip: usize) -> Option<Offset> {
+    let len = code.len();
+    let four = |at: usize| Offset {
+        at,
+        width: 4,
+        value: i32::from_le_bytes(code[at..at + 4].try_into().expect("four bytes")),
+    };
+    match Opcode::from_byte(code[pc])?.category() {
+        InstructionCategory::OneOffset => (pc + 5 <= len).then(|| four(pc + 1)),
+        InstructionCategory::TwoRegOneOffset => (pc + 6 <= len).then(|| four(pc + 2)),
+        InstructionCategory::OneRegImmOffset if pc + 2 <= len => {
+            let lx = ((code[pc + 1] as usize / 16) % 8).min(4);
+            let ly = if skip > lx + 1 {
+                (skip - lx - 1).min(4)
+            } else {
+                0
+            };
+            let at = pc + 2 + lx;
+            if ly == 0 || at + ly > len {
+                return None;
+            }
+            let mut buf = [0u8; 4];
+            buf[..ly].copy_from_slice(&code[at..at + ly]);
+            if ly < 4 && buf[ly - 1] & 0x80 != 0 {
+                buf[ly..].fill(0xFF);
+            }
+            Some(Offset {
+                at,
+                width: ly,
+                value: i32::from_le_bytes(buf),
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Collect all branch targets and jump table entries from PVM code.
 ///
 /// Returns a set of byte offsets that are branch/jump destinations.
 /// Used by peephole passes to avoid fusing across branch boundaries.
-fn collect_branch_targets(
-    code: &[u8],
-    bitmask: &[u8],
-    jump_table: &[u32],
-) -> std::collections::HashSet<usize> {
+fn collect_branch_targets(code: &[u8], bitmask: &[u8], jump_table: &[u32]) -> HashSet<usize> {
     let len = code.len();
-    let mut targets = std::collections::HashSet::new();
-    let mut i = 0;
-    while i < len {
-        if i >= bitmask.len() || bitmask[i] != 1 {
-            i += 1;
-            continue;
-        }
-        let op = code[i];
-        let s = skip_for(bitmask, i);
-        // jump (40): 4-byte offset
-        if op == 40 && i + 5 <= len {
-            let off = i32::from_le_bytes([code[i + 1], code[i + 2], code[i + 3], code[i + 4]]);
-            let t = (i as i64 + off as i64) as usize;
+    let mut targets = HashSet::new();
+    for (pc, skip) in instructions(bitmask) {
+        if let Some(offset) = branch_offset(code, pc, skip) {
+            let t = (pc as i64 + offset.value as i64) as usize;
             if t < len {
                 targets.insert(t);
             }
         }
-        // branch_eq..branch_ge_u (170-175): 4-byte offset at +2
-        if (170..=175).contains(&op) && i + 6 <= len {
-            let off = i32::from_le_bytes([code[i + 2], code[i + 3], code[i + 4], code[i + 5]]);
-            let t = (i as i64 + off as i64) as usize;
-            if t < len {
-                targets.insert(t);
-            }
-        }
-        // branch_*_imm (80-90): variable-length offset
-        if (80..=90).contains(&op) && i + 2 <= len {
-            let reg_byte = code[i + 1];
-            let lx = ((reg_byte as usize / 16) % 8).min(4);
-            let ly = if s > lx + 1 { (s - lx - 1).min(4) } else { 0 };
-            let off_start = i + 2 + lx;
-            if ly > 0 && off_start + ly <= len {
-                let mut buf = [0u8; 4];
-                buf[..ly].copy_from_slice(&code[off_start..off_start + ly]);
-                if ly < 4 && buf[ly - 1] & 0x80 != 0 {
-                    for b in &mut buf[ly..4] {
-                        *b = 0xFF;
-                    }
-                }
-                let off = i32::from_le_bytes(buf);
-                let t = (i as i64 + off as i64) as usize;
-                if t < len {
-                    targets.insert(t);
-                }
-            }
-        }
-        i += 1 + s;
     }
-    for &jt in jump_table {
-        targets.insert(jt as usize);
-    }
+    targets.extend(jump_table.iter().map(|&jt| jt as usize));
     targets
 }
 
-/// Peephole pass: fuse `load_imm(51) + ThreeReg ALU` into `TwoRegOneImm` immediate form.
+/// Peephole pass: fuse `load_imm` + ThreeReg ALU into `TwoRegOneImm` immediate form.
 ///
 /// Scans the PVM code for consecutive pairs where:
-/// 1. First instruction is `load_imm` (opcode 51)
+/// 1. First instruction is `load_imm`
 /// 2. Second instruction is a ThreeReg ALU op with an immediate-form equivalent
 /// 3. The load destination register equals the ALU output register (dead after ALU)
 /// 4. The load value fits in i32 (4-byte immediate)
@@ -203,7 +213,7 @@ fn collect_branch_targets(
 /// When fusable, rewrites the pair in-place: the first instruction becomes the
 /// TwoRegOneImm form with a 4-byte immediate, and all remaining bytes through
 /// the end of the second instruction become bitmask=0 continuation bytes.
-pub fn peephole_fuse_load_imm_alu(
+pub(crate) fn peephole_fuse_load_imm_alu(
     code: &mut [u8],
     bitmask: &mut [u8],
     jump_table: &[u32],
@@ -216,17 +226,17 @@ pub fn peephole_fuse_load_imm_alu(
     let targets = collect_branch_targets(code, bitmask, jump_table);
 
     // ThreeReg ALU → TwoRegOneImm immediate form mapping
-    let imm_opcode = |three_reg_op: u8| -> Option<u8> {
+    let imm_opcode = |three_reg_op: Opcode| -> Option<Opcode> {
         match three_reg_op {
-            200 => Some(149), // add_64 → add_imm_64
-            202 => Some(150), // mul_64 → mul_imm_64
-            207 => Some(151), // shl_64 → shl_imm_64
-            208 => Some(152), // shr_64 → shr_imm_64
-            209 => Some(153), // sar_64 → sar_imm_64
-            210 => Some(132), // and → and_imm
-            211 => Some(133), // xor → xor_imm
-            212 => Some(134), // or → or_imm
-            // set_lt_u (216) and set_lt_s (217) are non-commutative — handled below
+            Opcode::Add64 => Some(Opcode::AddImm64),
+            Opcode::Mul64 => Some(Opcode::MulImm64),
+            Opcode::ShloL64 => Some(Opcode::ShloLImm64),
+            Opcode::ShloR64 => Some(Opcode::ShloRImm64),
+            Opcode::SharR64 => Some(Opcode::SharRImm64),
+            Opcode::And => Some(Opcode::AndImm),
+            Opcode::Xor => Some(Opcode::XorImm),
+            Opcode::Or => Some(Opcode::OrImm),
+            // set_lt_u and set_lt_s are non-commutative — handled below
             _ => None,
         }
     };
@@ -242,18 +252,23 @@ pub fn peephole_fuse_load_imm_alu(
         let s = skip_for(bitmask, i);
         let next_i = i + 1 + s;
 
-        // Look for load_imm (51) followed by a ThreeReg ALU
-        if op == 51 && next_i < len && bitmask[next_i] == 1 && !targets.contains(&next_i) {
-            let alu_op = code[next_i];
+        // Look for load_imm followed by a ThreeReg ALU
+        if op == Opcode::LoadImm as u8
+            && next_i < len
+            && bitmask[next_i] == 1
+            && !targets.contains(&next_i)
+        {
+            let alu_op = Opcode::from_byte(code[next_i]);
             let alu_s = skip_for(bitmask, next_i);
+            let set_lt = matches!(alu_op, Some(Opcode::SetLtU | Opcode::SetLtS));
 
             // Check if the following instruction is a ThreeReg ALU we can fuse with.
             // Covers: commutative ops (add, mul, shift, logic), sub_64, set_lt.
             let is_fusable_alu =
-                imm_opcode(alu_op).is_some() || alu_op == 201 || alu_op == 216 || alu_op == 217;
+                alu_op.and_then(imm_opcode).is_some() || alu_op == Some(Opcode::Sub64) || set_lt;
 
             if is_fusable_alu && i + 1 < len && next_i + 2 < len {
-                // Parse load_imm: [51, reg_byte, imm...] — OneRegOneImm
+                // Parse load_imm: [load_imm, reg_byte, imm...] — OneRegOneImm
                 let load_reg_byte = code[i + 1];
                 let load_rd = load_reg_byte & 0x0F;
                 let lx = s.saturating_sub(1);
@@ -277,12 +292,12 @@ pub fn peephole_fuse_load_imm_alu(
                     bitmask: &mut [u8],
                     i: usize,
                     end: usize,
-                    fused_op: u8,
+                    fused_op: Opcode,
                     reg_byte: u8,
                     imm: i32,
                 ) -> bool {
                     if end >= i + 6 {
-                        code[i] = fused_op;
+                        code[i] = fused_op as u8;
                         code[i + 1] = reg_byte;
                         let imm_bytes = imm.to_le_bytes();
                         code[i + 2] = imm_bytes[0];
@@ -301,18 +316,23 @@ pub fn peephole_fuse_load_imm_alu(
                     }
                 }
 
-                // Non-commutative: set_lt_u (216) and set_lt_s (217).
+                // Non-commutative: set_lt_u and set_lt_s.
                 // rd = ra < rb: constant as rb → set_lt_imm, constant as ra → set_gt_imm
-                if (alu_op == 216 || alu_op == 217)
-                    && fits_i32
-                    && load_rd == alu_rd
-                    && (matches_ra != matches_rb)
-                {
+                if set_lt && fits_i32 && load_rd == alu_rd && (matches_ra != matches_rb) {
+                    let unsigned = alu_op == Some(Opcode::SetLtU);
                     let (cmp_imm_op, base) = if matches_rb {
-                        let op = if alu_op == 216 { 136u8 } else { 137u8 };
+                        let op = if unsigned {
+                            Opcode::SetLtUImm
+                        } else {
+                            Opcode::SetLtSImm
+                        };
                         (op, alu_ra)
                     } else {
-                        let op = if alu_op == 216 { 142u8 } else { 143u8 };
+                        let op = if unsigned {
+                            Opcode::SetGtUImm
+                        } else {
+                            Opcode::SetGtSImm
+                        };
                         (op, alu_rb)
                     };
                     if emit_fused(
@@ -330,20 +350,24 @@ pub fn peephole_fuse_load_imm_alu(
                     }
                 }
 
-                // Special case: sub_64 (201) is non-commutative.
+                // Special case: sub_64 is non-commutative.
                 // load_imm rd, K; sub_64 rd, ra, rb (rd = ra - rb):
                 //   rd==rb (constant subtrahend): rd = ra - K → add_imm_64(rd, ra, -K)
                 //   rd==ra (constant minuend):    rd = K - rb → neg_add_imm_64(rd, rb, K)
-                if alu_op == 201 && fits_i32 && load_rd == alu_rd && (matches_ra != matches_rb) {
+                if alu_op == Some(Opcode::Sub64)
+                    && fits_i32
+                    && load_rd == alu_rd
+                    && (matches_ra != matches_rb)
+                {
                     let result = if matches_rb {
                         let neg_k = -(load_val as i32) as i64;
                         if neg_k >= i32::MIN as i64 && neg_k <= i32::MAX as i64 {
-                            Some((149u8, alu_ra, neg_k as i32))
+                            Some((Opcode::AddImm64, alu_ra, neg_k as i32))
                         } else {
                             None
                         }
                     } else {
-                        Some((154u8, alu_rb, load_val as i32))
+                        Some((Opcode::NegAddImm64, alu_rb, load_val as i32))
                     };
                     if let Some((sub_imm_op, base, imm32)) = result
                         && emit_fused(
@@ -367,15 +391,18 @@ pub fn peephole_fuse_load_imm_alu(
                 //  • the surviving operand `base` must NOT be the loaded register
                 //    — folding the load away would make `op Rd, Rd, Rd` read the
                 //    stale pre-load value of Rd instead of the immediate;
-                //  • shifts (shl/shr/sar, 207/208/209) are non-commutative, so the
+                //  • shifts (shl/shr/sar) are non-commutative, so the
                 //    constant may only fold in as the shift *amount* (the `rb`
                 //    operand), never as the value being shifted (`ra`) — otherwise
                 //    `K << Rb` would be miscompiled to `Rb << K`.
-                if let Some(imm_op) = imm_opcode(alu_op)
+                if let Some(imm_op) = alu_op.and_then(imm_opcode)
                     && fits_i32
                     && load_rd == alu_rd
                 {
-                    let is_shift = matches!(alu_op, 207..=209);
+                    let is_shift = matches!(
+                        alu_op,
+                        Some(Opcode::ShloL64 | Opcode::ShloR64 | Opcode::SharR64)
+                    );
                     let usable = if is_shift {
                         matches_rb
                     } else {
@@ -412,7 +439,7 @@ pub fn peephole_fuse_load_imm_alu(
 /// or `store_ind_X [rd + offset], val`, and `K + offset` fits in i32, the pair is
 /// replaced by the direct `load_X dest, K+offset` or `store_X [K+offset], val`.
 /// This eliminates the intermediate address register load.
-pub fn peephole_fuse_load_imm_memory(
+pub(crate) fn peephole_fuse_load_imm_memory(
     code: &mut [u8],
     bitmask: &mut [u8],
     jump_table: &[u32],
@@ -425,19 +452,19 @@ pub fn peephole_fuse_load_imm_memory(
     let targets = collect_branch_targets(code, bitmask, jump_table);
 
     // Map indirect opcode → direct opcode
-    let direct_opcode = |ind_op: u8| -> Option<u8> {
+    let direct_opcode = |ind_op: Opcode| -> Option<Opcode> {
         match ind_op {
-            124 => Some(52), // load_ind_u8  → load_u8
-            125 => Some(53), // load_ind_i8  → load_i8
-            126 => Some(54), // load_ind_u16 → load_u16
-            127 => Some(55), // load_ind_i16 → load_i16
-            128 => Some(56), // load_ind_u32 → load_u32
-            129 => Some(57), // load_ind_i32 → load_i32
-            130 => Some(58), // load_ind_u64 → load_u64
-            120 => Some(59), // store_ind_u8  → store_u8
-            121 => Some(60), // store_ind_u16 → store_u16
-            122 => Some(61), // store_ind_u32 → store_u32
-            123 => Some(62), // store_ind_u64 → store_u64
+            Opcode::LoadIndU8 => Some(Opcode::LoadU8),
+            Opcode::LoadIndI8 => Some(Opcode::LoadI8),
+            Opcode::LoadIndU16 => Some(Opcode::LoadU16),
+            Opcode::LoadIndI16 => Some(Opcode::LoadI16),
+            Opcode::LoadIndU32 => Some(Opcode::LoadU32),
+            Opcode::LoadIndI32 => Some(Opcode::LoadI32),
+            Opcode::LoadIndU64 => Some(Opcode::LoadU64),
+            Opcode::StoreIndU8 => Some(Opcode::StoreU8),
+            Opcode::StoreIndU16 => Some(Opcode::StoreU16),
+            Opcode::StoreIndU32 => Some(Opcode::StoreU32),
+            Opcode::StoreIndU64 => Some(Opcode::StoreU64),
             _ => None,
         }
     };
@@ -446,7 +473,18 @@ pub fn peephole_fuse_load_imm_memory(
     // overwrites its own base, proving that the address register is dead.
     // Stores never overwrite their base, so this local pass cannot prove it is
     // dead and must retain the preceding load_imm.
-    let is_load_ind = |op: u8| -> bool { (124..=130).contains(&op) };
+    let is_load_ind = |op: Opcode| -> bool {
+        matches!(
+            op,
+            Opcode::LoadIndU8
+                | Opcode::LoadIndI8
+                | Opcode::LoadIndU16
+                | Opcode::LoadIndI16
+                | Opcode::LoadIndU32
+                | Opcode::LoadIndI32
+                | Opcode::LoadIndU64
+        )
+    };
 
     let mut fused = 0;
     let mut i = 0;
@@ -459,12 +497,17 @@ pub fn peephole_fuse_load_imm_memory(
         let s = skip_for(bitmask, i);
         let next_i = i + 1 + s;
 
-        // Look for load_imm (51) followed by load_ind or store_ind
-        if op == 51 && next_i < len && bitmask[next_i] == 1 && !targets.contains(&next_i) {
-            let mem_op = code[next_i];
+        // Look for load_imm followed by load_ind or store_ind
+        if op == Opcode::LoadImm as u8
+            && next_i < len
+            && bitmask[next_i] == 1
+            && !targets.contains(&next_i)
+        {
             let mem_s = skip_for(bitmask, next_i);
-            if let Some(dir_op) = direct_opcode(mem_op) {
-                // Parse load_imm: [51, reg_byte, imm...]
+            if let Some(mem_op) = Opcode::from_byte(code[next_i])
+                && let Some(dir_op) = direct_opcode(mem_op)
+            {
+                // Parse load_imm: [load_imm, reg_byte, imm...]
                 if i + 1 < len {
                     let load_rd = code[i + 1] & 0x0F;
                     let lx = s.saturating_sub(1);
@@ -499,7 +542,7 @@ pub fn peephole_fuse_load_imm_memory(
                             // load_imm runs the fused load, which leaves the
                             // registers as the pair did.
                             let addr_bytes = (combined as u32).to_le_bytes();
-                            code[i] = dir_op;
+                            code[i] = dir_op as u8;
                             code[i + 1] = mem_rd;
                             code[i + 2..i + 6].copy_from_slice(&addr_bytes);
                             for byte in &mut code[i + 6..end_of_pair] {
@@ -525,150 +568,58 @@ pub fn peephole_fuse_load_imm_memory(
 /// Post-pass: ensure all PVM branch targets are basic block starts (ϖ).
 ///
 /// Scans the PVM code for branch/jump instructions, extracts their targets,
-/// and inserts `fallthrough` (opcode 1) before any target not preceded by a
+/// and inserts `fallthrough` before any target not preceded by a
 /// terminator. Adjusts all branch offsets and jump table entries to account
 /// for the inserted bytes.
 ///
 /// This guarantees the JAM spec invariant: all branch targets ∈ ϖ.
-pub fn ensure_branch_targets_are_block_starts(
-    code: &mut Vec<u8>,
-    bitmask: &mut Vec<u8>,
-    jump_table: &mut [u32],
-) {
-    ensure_branch_targets_with_pc_map(code, bitmask, jump_table, |_| {});
-}
-
-// The diagnostic linker must apply the same final offset relocation as code
-// and jump-table emission. Observing the map must not affect generated bytes.
-fn ensure_branch_targets_with_pc_map(
+///
+/// When it inserts, `remap` sees where each old offset moved, the code's
+/// end included, so a caller can move what it keeps by offset alike;
+/// observing it changes no byte.
+pub(crate) fn ensure_branch_targets_are_block_starts(
     code: &mut Vec<u8>,
     bitmask: &mut Vec<u8>,
     jump_table: &mut [u32],
     remap: impl FnOnce(&[u32]),
 ) {
-    // Gray Paper v0.8.0 set T, plus opcode 3 for the VOS capability-runtime
-    // extension. `unlikely` (2) and `ecalli` (10) stay inside their block.
-    let terminators: &[u8] = &[0, 1, 3, 40, 50, 80, 180];
-    let is_terminator = |op: u8| -> bool {
-        terminators.contains(&op) || (81..=90).contains(&op) || (170..=175).contains(&op)
-    };
-
-    // Helper: compute skip from bitmask (next instruction start after pc)
-    let skip_for = |bm: &[u8], pc: usize| -> usize {
-        for j in 0..25 {
-            let idx = pc + 1 + j;
-            if idx >= bm.len() || bm[idx] == 1 {
-                return j;
-            }
-        }
-        0
-    };
+    // Gray Paper v0.8.0 set T. `unlikely` and `ecalli` stay inside their
+    // block.
+    let is_terminator = |op: u8| Opcode::from_byte(op).is_some_and(Opcode::is_terminator);
 
     // Pass 1: find all branch target PCs and check which need fallthrough.
     let len = code.len();
-    let mut insert_positions: Vec<usize> = Vec::new(); // PVM offsets to insert fallthrough BEFORE
+    let starts = |pc: usize| pc < len && pc < bitmask.len() && bitmask[pc] == 1;
 
-    // Build post-terminator set for checking
-    let mut post_term = std::collections::HashSet::new();
-    post_term.insert(0usize);
-    {
-        let mut i = 0;
-        while i < len {
-            if i >= bitmask.len() || bitmask[i] != 1 {
-                i += 1;
-                continue;
-            }
-            let op = code[i];
-            let s = skip_for(bitmask, i);
-            if is_terminator(op) {
-                let nxt = i + 1 + s;
-                if nxt < len && nxt < bitmask.len() && bitmask[nxt] == 1 {
-                    post_term.insert(nxt);
-                }
-            }
-            i += 1 + s;
+    // The instructions a terminator precedes, and the first.
+    let mut post_term = HashSet::from([0usize]);
+    for (pc, skip) in instructions(bitmask) {
+        if is_terminator(code[pc]) && starts(pc + 1 + skip) {
+            post_term.insert(pc + 1 + skip);
         }
     }
 
-    // Collect branch targets
-    let mut branch_targets = std::collections::HashSet::new();
-    {
-        let mut i = 0;
-        while i < len {
-            if i >= bitmask.len() || bitmask[i] != 1 {
-                i += 1;
-                continue;
+    // The branch targets and jump table entries no terminator precedes:
+    // PVM offsets to insert a fallthrough before.
+    let mut insert_positions = BTreeSet::new();
+    for (pc, skip) in instructions(bitmask) {
+        if let Some(offset) = branch_offset(code, pc, skip) {
+            let t = (pc as i64 + offset.value as i64) as usize;
+            if starts(t) && !post_term.contains(&t) {
+                insert_positions.insert(t);
             }
-            let op = code[i];
-            let s = skip_for(bitmask, i);
-
-            // OneOffset: opcode 40 (jump), 80 (load_imm_jump)
-            if op == 40 && i + 5 <= len {
-                let off = i32::from_le_bytes([code[i + 1], code[i + 2], code[i + 3], code[i + 4]]);
-                let t = (i as i64 + off as i64) as usize;
-                if t < len && t < bitmask.len() && bitmask[t] == 1 {
-                    branch_targets.insert(t);
-                }
-            }
-            // TwoRegOneOffset: opcodes 170-175
-            if (170..=175).contains(&op) && i + 6 <= len {
-                let off = i32::from_le_bytes([code[i + 2], code[i + 3], code[i + 4], code[i + 5]]);
-                let t = (i as i64 + off as i64) as usize;
-                if t < len && t < bitmask.len() && bitmask[t] == 1 {
-                    branch_targets.insert(t);
-                }
-            }
-            // OneRegImmOffset: opcodes 80-90
-            if (80..=90).contains(&op) && i + 2 <= len {
-                let reg_byte = code[i + 1];
-                let lx = ((reg_byte as usize / 16) % 8).min(4);
-                let ly = if s > lx + 1 { (s - lx - 1).min(4) } else { 0 };
-                let off_start = i + 2 + lx;
-                if ly > 0 && off_start + ly <= len {
-                    let mut buf = [0u8; 4];
-                    buf[..ly].copy_from_slice(&code[off_start..off_start + ly]);
-                    if ly < 4 && buf[ly - 1] & 0x80 != 0 {
-                        for b in &mut buf[ly..4] {
-                            *b = 0xFF;
-                        }
-                    }
-                    let off = i32::from_le_bytes(buf);
-                    let t = (i as i64 + off as i64) as usize;
-                    if t < len && t < bitmask.len() && bitmask[t] == 1 {
-                        branch_targets.insert(t);
-                    }
-                }
-            }
-            i += 1 + s;
         }
     }
-
-    // Find branch targets not in post_term
-    for &t in &branch_targets {
-        if !post_term.contains(&t) {
-            insert_positions.push(t);
-        }
-    }
-    // Also check jump table entries
-    let mut inserted: std::collections::HashSet<usize> = insert_positions.iter().copied().collect();
-    for &jt_entry in jump_table.iter() {
-        let t = jt_entry as usize;
-        if t < len
-            && t < bitmask.len()
-            && bitmask[t] == 1
-            && !post_term.contains(&t)
-            && inserted.insert(t)
-        {
-            insert_positions.push(t);
-        }
-    }
+    insert_positions.extend(
+        jump_table
+            .iter()
+            .map(|&entry| entry as usize)
+            .filter(|&t| starts(t) && !post_term.contains(&t)),
+    );
 
     if insert_positions.is_empty() {
         return;
     }
-
-    insert_positions.sort();
-    insert_positions.dedup();
 
     // Pass 2: build new code/bitmask with fallthroughs inserted.
     // Also build an offset map: old_pc → new_pc.
@@ -677,13 +628,12 @@ fn ensure_branch_targets_with_pc_map(
     let mut new_bitmask = Vec::with_capacity(new_len);
     let mut offset_map = vec![0u32; len + 1]; // old_pc → new_pc
 
-    let mut insert_idx = 0;
+    let mut inserts = insert_positions.into_iter().peekable();
     for old_pc in 0..len {
         // Insert fallthrough before this PC if needed
-        while insert_idx < insert_positions.len() && insert_positions[insert_idx] == old_pc {
-            new_code.push(1); // fallthrough opcode
+        while inserts.next_if_eq(&old_pc).is_some() {
+            new_code.push(Opcode::Fallthrough as u8);
             new_bitmask.push(1); // instruction start
-            insert_idx += 1;
         }
         offset_map[old_pc] = new_code.len() as u32;
         new_code.push(code[old_pc]);
@@ -693,76 +643,17 @@ fn ensure_branch_targets_with_pc_map(
     remap(&offset_map);
 
     // Pass 3: re-point every branch offset through `offset_map`.
-    {
-        let mut old_i = 0;
-        while old_i < len {
-            if old_i >= bitmask.len() || bitmask[old_i] != 1 {
-                old_i += 1;
-                continue;
-            }
-            let op = code[old_i];
-            let s = skip_for(bitmask, old_i);
-            let new_i = offset_map[old_i] as usize;
-
-            // Fix OneOffset: opcode 40
-            if op == 40 && old_i + 5 <= len {
-                let old_off = i32::from_le_bytes([
-                    code[old_i + 1],
-                    code[old_i + 2],
-                    code[old_i + 3],
-                    code[old_i + 4],
-                ]);
-                let old_target = (old_i as i64 + old_off as i64) as usize;
-                if old_target <= len {
-                    let new_target = offset_map[old_target] as i64;
-                    let new_off = (new_target - new_i as i64) as i32;
-                    new_code[new_i + 1..new_i + 5].copy_from_slice(&new_off.to_le_bytes());
-                }
-            }
-            // Fix TwoRegOneOffset: opcodes 170-175
-            if (170..=175).contains(&op) && old_i + 6 <= len {
-                let old_off = i32::from_le_bytes([
-                    code[old_i + 2],
-                    code[old_i + 3],
-                    code[old_i + 4],
-                    code[old_i + 5],
-                ]);
-                let old_target = (old_i as i64 + old_off as i64) as usize;
-                if old_target <= len {
-                    let new_target = offset_map[old_target] as i64;
-                    let new_off = (new_target - new_i as i64) as i32;
-                    new_code[new_i + 2..new_i + 6].copy_from_slice(&new_off.to_le_bytes());
-                }
-            }
-            // Fix OneRegImmOffset: opcodes 80-90
-            if (80..=90).contains(&op) && old_i + 2 <= len {
-                let reg_byte = code[old_i + 1];
-                let lx = ((reg_byte as usize / 16) % 8).min(4);
-                let ly = if s > lx + 1 { (s - lx - 1).min(4) } else { 0 };
-                let off_start_old = old_i + 2 + lx;
-                if ly > 0 && off_start_old + ly <= len {
-                    let mut buf = [0u8; 4];
-                    buf[..ly].copy_from_slice(&code[off_start_old..off_start_old + ly]);
-                    if ly < 4 && buf[ly - 1] & 0x80 != 0 {
-                        for b in &mut buf[ly..4] {
-                            *b = 0xFF;
-                        }
-                    }
-                    let old_off = i32::from_le_bytes(buf);
-                    let old_target = (old_i as i64 + old_off as i64) as usize;
-                    if old_target <= len {
-                        let new_target = offset_map[old_target] as i64;
-                        let new_off = (new_target - new_i as i64) as i32;
-                        // Write back with same length ly
-                        let new_bytes = new_off.to_le_bytes();
-                        let off_start_new = new_i + 2 + lx;
-                        new_code[off_start_new..off_start_new + ly]
-                            .copy_from_slice(&new_bytes[..ly]);
-                    }
-                }
-            }
-
-            old_i += 1 + s;
+    for (old_pc, skip) in instructions(bitmask) {
+        let Some(offset) = branch_offset(code, old_pc, skip) else {
+            continue;
+        };
+        let old_target = (old_pc as i64 + offset.value as i64) as usize;
+        if old_target <= len {
+            let new_pc = offset_map[old_pc] as usize;
+            let new_off = (offset_map[old_target] as i64 - new_pc as i64) as i32;
+            // Written back at the same width.
+            let at = new_pc + (offset.at - old_pc);
+            new_code[at..at + offset.width].copy_from_slice(&new_off.to_le_bytes()[..offset.width]);
         }
     }
 
@@ -825,9 +716,10 @@ mod tests {
             &mut expected_code,
             &mut expected_mask,
             &mut expected_jumps,
+            |_| {},
         );
         let mut observed = Vec::new();
-        ensure_branch_targets_with_pc_map(&mut code, &mut bitmask, &mut jumps, |offsets| {
+        ensure_branch_targets_are_block_starts(&mut code, &mut bitmask, &mut jumps, |offsets| {
             observed.extend_from_slice(offsets);
         });
         assert_eq!(observed, vec![0, 1, 2, 4, 5, 6, 7, 8]);
@@ -844,7 +736,7 @@ mod tests {
         let mut code = vec![0];
         let mut bitmask = vec![1];
         let mut jumps = vec![0];
-        ensure_branch_targets_with_pc_map(&mut code, &mut bitmask, &mut jumps, |_| {
+        ensure_branch_targets_are_block_starts(&mut code, &mut bitmask, &mut jumps, |_| {
             panic!("no relocation should be observed");
         });
         assert_eq!((code, bitmask, jumps), (vec![0], vec![1], vec![0]));

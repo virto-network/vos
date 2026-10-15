@@ -1312,41 +1312,22 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         // semantics) to avoid renaming across files, at the cost of a
         // little local confusion (the column comments below carry the
         // slot's actual semantic meaning).
-        let precompile_continues = step.host_call_acknowledged;
-        let is_blake_ecall = precompile_continues
-            && matches!(step.opcode, crate::core::opcode::Opcode::Ecalli)
-            && step.imm == ECALL_BLAKE2B_COMPRESS as u64;
+        // Only a served call selects a relation (`PvmStep::served_ecall`).
+        let ecall = step.served_ecall();
+        let is_blake_ecall = ecall == Some(ECALL_BLAKE2B_COMPRESS as u64);
         trace.fill_columns(row, is_blake_ecall, Column::IsBlakeEcall);
         // Ristretto ECALL gates: one boolean per id.
         // Same imm-match shape as IsBlakeEcall; the operand pointers reuse the
         // Phi10/Phi11/Phi12 slots (= regs_before[7,8,9]) filled below.
-        let is_ecall =
-            precompile_continues && matches!(step.opcode, crate::core::opcode::Opcode::Ecalli);
-        trace.fill_columns(
-            row,
-            is_ecall && step.imm == ECALL_RISTRETTO_SCALAR_MULT as u64,
-            Column::Is110Ecall,
-        );
-        trace.fill_columns(
-            row,
-            is_ecall && step.imm == ECALL_RISTRETTO_POINT_ADD as u64,
-            Column::Is111Ecall,
-        );
-        trace.fill_columns(
-            row,
-            is_ecall && step.imm == ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE as u64,
-            Column::Is112Ecall,
-        );
-        trace.fill_columns(
-            row,
-            is_ecall && step.imm == ECALL_SCALAR_MUL_MOD_L as u64,
-            Column::Is113Ecall,
-        );
-        trace.fill_columns(
-            row,
-            is_ecall && step.imm == ECALL_SCALAR_ADD_MOD_L as u64,
-            Column::Is114Ecall,
-        );
+        for (id, column) in [
+            (ECALL_RISTRETTO_SCALAR_MULT, Column::Is110Ecall),
+            (ECALL_RISTRETTO_POINT_ADD, Column::Is111Ecall),
+            (ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE, Column::Is112Ecall),
+            (ECALL_SCALAR_MUL_MOD_L, Column::Is113Ecall),
+            (ECALL_SCALAR_ADD_MOD_L, Column::Is114Ecall),
+        ] {
+            trace.fill_columns(row, ecall == Some(u64::from(id)), column);
+        }
         // Phi10 slot ← h_ptr (a0 = x10 = PVM φ[7]).
         trace.fill_columns(row, step.regs_before[7], Column::Phi10);
         // Phi11 slot ← m_ptr (a1 = x11 = PVM φ[8]).

@@ -251,7 +251,7 @@ mod tests {
     }
 
     #[test]
-    fn blake2b_256_matches_blake2_crate() {
+    fn blake2b_hash_of_32_bytes_matches_blake2_crate() {
         use blake2::digest::{Digest, consts::U32};
         type Blake2b256 = blake2::Blake2b<U32>;
 

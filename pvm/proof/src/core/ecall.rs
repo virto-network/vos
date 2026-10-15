@@ -82,6 +82,29 @@ pub const ECALL_SCALAR_MUL_MOD_L: u32 = 113;
 /// `Scalar + Scalar` public API.  Same convention as MUL above.
 pub const ECALL_SCALAR_ADD_MOD_L: u32 = 114;
 
+/// The Ristretto and scalar calls, which the RistrettoEcallChip serves.
+pub(crate) const ECALL_RISTRETTO: [u32; 5] = [
+    ECALL_RISTRETTO_SCALAR_MULT,
+    ECALL_RISTRETTO_POINT_ADD,
+    ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE,
+    ECALL_SCALAR_MUL_MOD_L,
+    ECALL_SCALAR_ADD_MOD_L,
+];
+
+/// The Ristretto and scalar calls that read three operands, φ7 to φ9: all
+/// but the wide reduction, which reads two.
+pub(crate) const ECALL_RISTRETTO_THREE_OPERANDS: [u32; 4] = [
+    ECALL_RISTRETTO_SCALAR_MULT,
+    ECALL_RISTRETTO_POINT_ADD,
+    ECALL_SCALAR_MUL_MOD_L,
+    ECALL_SCALAR_ADD_MOD_L,
+];
+
+/// Whether host call `id` is one of `ids`.
+pub(crate) fn is_one_of(id: u64, ids: &[u32]) -> bool {
+    ids.iter().any(|&listed| u64::from(listed) == id)
+}
+
 /// Whether the proof runtime has a deterministic handler for this `ecalli`
 /// identifier: exactly the cryptographic precompiles handled by
 /// [`crate::core::tracing::TracingPvm`].

@@ -27,6 +27,8 @@ pub mod precompile;
 pub mod refine;
 pub mod refine_host;
 pub mod spi;
+#[cfg(test)]
+mod test_support;
 // Real JIT recompiler on Linux x86-64.
 #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
 pub mod recompiler;

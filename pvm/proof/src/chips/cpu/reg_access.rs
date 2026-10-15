@@ -8,8 +8,8 @@
 
 use super::classify::{classify_opcode, uses_immediate};
 use crate::core::ecall::{
-    ECALL_BLAKE2B_COMPRESS, ECALL_RISTRETTO_POINT_ADD, ECALL_RISTRETTO_SCALAR_MULT,
-    ECALL_SCALAR_ADD_MOD_L, ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE, ECALL_SCALAR_MUL_MOD_L,
+    ECALL_BLAKE2B_COMPRESS, ECALL_RISTRETTO_THREE_OPERANDS, ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE,
+    is_one_of,
 };
 #[allow(unused_imports)]
 use alloc::{boxed::Box, vec, vec::Vec};
@@ -108,19 +108,12 @@ pub(crate) fn step_reg_accesses(step: &crate::core::step::PvmStep) -> StepRegAcc
     //   blake2b: φ[7,8,9,10] (h_ptr/m_ptr/t_low/f_flag).
     //   ristretto scalar_mult/point_add/scalar_binop: φ[7,8,9].
     //   ristretto reduce_wide (112): φ[7,8] only.
-    // Only an acknowledged call reads them: one that ends its slice at a
-    // host exit, as an inner machine's precompile call does for its agent
-    // to serve, selects no relation, so the CpuChip emits no producer.
-    let is_ecall =
-        step.host_call_acknowledged && matches!(step.opcode, crate::core::opcode::Opcode::Ecalli);
-    let imm = step.imm;
-    let is_blake_ecall = is_ecall && imm == ECALL_BLAKE2B_COMPRESS as u64;
-    let is_ristretto_reduce = is_ecall && imm == ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE as u64;
-    let is_ristretto_three = is_ecall
-        && (imm == ECALL_RISTRETTO_SCALAR_MULT as u64
-            || imm == ECALL_RISTRETTO_POINT_ADD as u64
-            || imm == ECALL_SCALAR_MUL_MOD_L as u64
-            || imm == ECALL_SCALAR_ADD_MOD_L as u64);
+    // Only a served call reads them (`PvmStep::served_ecall`): for any
+    // other the CpuChip emits no producer.
+    let ecall = step.served_ecall();
+    let is_blake_ecall = ecall == Some(ECALL_BLAKE2B_COMPRESS as u64);
+    let is_ristretto_reduce = ecall == Some(ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE as u64);
+    let is_ristretto_three = ecall.is_some_and(|id| is_one_of(id, &ECALL_RISTRETTO_THREE_OPERANDS));
     let ecall_reads = if is_blake_ecall {
         vec![
             (7u8, step.regs_before[7]),

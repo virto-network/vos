@@ -612,7 +612,7 @@ impl<N: NodeId> Core<N> {
     pub(super) fn update_compact_bound(&mut self) {
         let bound = self.commit.min(self.durably_applied);
         let due = bound.saturating_sub(self.log.snap_index()) >= self.cfg.compact_hysteresis
-            || self.log.bytes_through(bound) >= self.cfg.compact_bytes;
+            || self.log.weight_through(bound) >= self.cfg.compact_bytes;
         if bound > self.compact_bound && due {
             self.compact_bound = bound;
             self.actions.push(Action::CompactBound {

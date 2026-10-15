@@ -371,42 +371,26 @@ pub fn active_components(
 #[cfg(feature = "prover")]
 fn activity_from_steps(side_note: &side_note::SideNote) -> ChipActivity {
     use crate::chips::cpu::classify::classify_opcode as classify;
-    use crate::core::ecall::{
-        ECALL_BLAKE2B_COMPRESS, ECALL_RISTRETTO_POINT_ADD, ECALL_RISTRETTO_SCALAR_MULT,
-        ECALL_SCALAR_ADD_MOD_L, ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE, ECALL_SCALAR_MUL_MOD_L,
-    };
-    use crate::core::opcode::Opcode;
+    use crate::core::ecall::{ECALL_BLAKE2B_COMPRESS, ECALL_RISTRETTO, is_one_of};
     let mut a = ChipActivity::default();
     for step in &side_note.steps {
-        // A precompile call counts only when acknowledged: an unacknowledged
-        // one ends its slice at a host exit, as an inner machine's does for
-        // its agent to serve, and selects no relation (trace_fill.rs's
-        // IsBlakeEcall and Is11*Ecall fills).
-        let ecall = matches!(step.opcode, Opcode::Ecalli) && step.host_call_acknowledged;
-        if ecall && step.imm == ECALL_BLAKE2B_COMPRESS as u64 {
+        // A precompile call counts only when served
+        // (`PvmStep::served_ecall`).
+        let ecall = step.served_ecall();
+        if ecall == Some(ECALL_BLAKE2B_COMPRESS as u64) {
             a.blake2b = true;
         }
-        // Ristretto scalar-mult ECALL gates RistrettoEcallChip. Whether
-        // RistrettoChip itself is active depends on the *kind* of the
-        // recorded call: Variable scalar mults populate
+        // Every Ristretto and scalar ECALL gates RistrettoEcallChip.
+        // Whether RistrettoChip itself is active depends on the *kind* of
+        // the recorded call: Variable scalar mults populate
         // `ristretto_field_rows` and are handled below; FixedBasepoint
         // calls route to the comb-method chips (21..=26) and bypass
-        // RistrettoChip. We can't tell the kind from `step.imm` alone,
+        // RistrettoChip, and the point-add and scalar ECALLs fire no
+        // field-op rows. We can't tell the kind from `step.imm` alone,
         // so activate RistrettoChip only via the `ristretto_field_rows`
         // post-ingest check; this avoids activating an empty chip when
         // every scalar mult in the trace was FixedBase.
-        if ecall && step.imm == ECALL_RISTRETTO_SCALAR_MULT as u64 {
-            a.ristretto_ecall = true;
-        }
-        // The point-add and scalar-reduce-wide ECALLs
-        // activate the RistrettoEcallChip but not RistrettoChip
-        // (those don't fire field-op rows).
-        if ecall
-            && (step.imm == ECALL_RISTRETTO_POINT_ADD as u64
-                || step.imm == ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE as u64
-                || step.imm == ECALL_SCALAR_MUL_MOD_L as u64
-                || step.imm == ECALL_SCALAR_ADD_MOD_L as u64)
-        {
+        if ecall.is_some_and(|id| is_one_of(id, &ECALL_RISTRETTO)) {
             a.ristretto_ecall = true;
         }
         let f = classify(step.opcode);

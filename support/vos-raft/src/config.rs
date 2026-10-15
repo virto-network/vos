@@ -73,6 +73,11 @@ pub struct Config<N: NodeId> {
     pub idle_heartbeats: bool,
 }
 
+/// What a payload weighs by default: its length.
+pub(crate) fn payload_len(payload: &[u8]) -> u64 {
+    payload.len() as u64
+}
+
 impl<N: NodeId> Config<N> {
     /// A configuration with every default.
     pub fn new(me: N, members: Vec<N>) -> Self {
@@ -83,7 +88,7 @@ impl<N: NodeId> Config<N> {
             heartbeat_interval_ms: 50,
             compact_hysteresis: 16,
             compact_bytes: 64 << 20,
-            payload_weight: |payload| payload.len() as u64,
+            payload_weight: payload_len,
             pre_vote: true,
             max_pending_reads: 1024,
             pre_candidate_misses_before_revert: 3,

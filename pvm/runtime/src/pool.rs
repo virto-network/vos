@@ -1078,12 +1078,27 @@ mod tests {
         }
     }
 
-    fn backends() -> Vec<PvmBackend> {
-        let mut backends = vec![PvmBackend::ForceInterpreter];
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-        backends.push(PvmBackend::ForceRecompiler);
-        backends
+    /// The counting program, installed in a pool, the page its loop writes,
+    /// and the state that starts it with `gas`.
+    fn counting_in_a_pool() -> (Vec<u8>, Arc<MachinePool>, Arc<PoolProgram>) {
+        let blob = counting();
+        let pool = Arc::new(MachinePool::new());
+        let program = pool.program(&pool.install(&blob).unwrap()).unwrap();
+        (blob, pool, program)
     }
+
+    /// The page [`counting`] writes.
+    const COUNTED: u32 = 3 * ZONE + 2 * 4096;
+
+    /// The state [`counting`] starts in, with `gas`.
+    fn counting_from(gas: Gas) -> InvokeState {
+        let mut registers = [0; PVM_REGISTER_COUNT];
+        registers[8] = u64::from(COUNTED);
+        InvokeState { gas, registers }
+    }
+
+    /// The gas a starved or faulting [`counting`] resumes with.
+    const GAS: Gas = 1_000_000;
 
     #[test]
     fn instantiate_lays_out_what_a_loader_builds() {
@@ -1097,7 +1112,7 @@ mod tests {
             "installing again is a no-op"
         );
         let program = pool.program(&hash).unwrap();
-        for backend in backends() {
+        for backend in crate::test_support::backends() {
             let mut pooled = InnerMachines::with_backend(backend);
             pooled.set_pool(Arc::clone(&pool));
             let id = pooled.instantiate(&program, 0).unwrap();
@@ -1157,7 +1172,7 @@ mod tests {
         let state = probe_state();
         let [h, m, last] = [7, 8, 12].map(|register| state.registers[register] as u32);
         let half = state.registers[10] as u32;
-        for backend in backends() {
+        for backend in crate::test_support::backends() {
             let mut machines = InnerMachines::with_backend(backend);
             machines.set_pool(Arc::clone(&pool));
             let to_the_call = |machines: &mut InnerMachines| {
@@ -1250,18 +1265,10 @@ mod tests {
     /// backends.
     #[test]
     fn instantiate_at_an_out_of_gas_counter_resumes_a_starved_machine() {
-        let blob = counting();
-        let pool = Arc::new(MachinePool::new());
-        let program = pool.program(&pool.install(&blob).unwrap()).unwrap();
-        let page = 3 * ZONE + 2 * 4096;
-        let start = |gas| {
-            let mut registers = [0; PVM_REGISTER_COUNT];
-            registers[8] = u64::from(page);
-            InvokeState { gas, registers }
-        };
-        const GAS: Gas = 1_000_000;
+        let (blob, pool, program) = counting_in_a_pool();
+        let (page, start) = (COUNTED, counting_from);
         let mut observed = Vec::new();
-        for backend in backends() {
+        for backend in crate::test_support::backends() {
             let mut stops = Vec::new();
             let mut machines = InnerMachines::with_backend(backend);
             machines.set_pool(Arc::clone(&pool));
@@ -1303,11 +1310,13 @@ mod tests {
                 }
                 stops.push((starve, rounds, starved.state.gas, pc));
             }
-            println!("{backend:?}: {used} gas straight; starved at {stops:?}");
             observed.push(stops);
         }
         // Both backends stop at the same block, with the same gas left.
-        assert!(observed.windows(2).all(|pair| pair[0] == pair[1]));
+        assert!(
+            observed.windows(2).all(|pair| pair[0] == pair[1]),
+            "starved at {observed:?}"
+        );
     }
 
     /// A machine stopped by a fault at a store, restored at the counter
@@ -1317,18 +1326,10 @@ mod tests {
     /// block's gas the dearer, on both backends.
     #[test]
     fn instantiate_at_a_faulting_store_charges_its_block_again() {
-        let blob = counting();
-        let pool = Arc::new(MachinePool::new());
-        let program = pool.program(&pool.install(&blob).unwrap()).unwrap();
-        let page = 3 * ZONE + 2 * 4096;
-        let start = |gas| {
-            let mut registers = [0; PVM_REGISTER_COUNT];
-            registers[8] = u64::from(page);
-            InvokeState { gas, registers }
-        };
-        const GAS: Gas = 1_000_000;
+        let (blob, pool, program) = counting_in_a_pool();
+        let (page, start) = (COUNTED, counting_from);
         let mut observed = Vec::new();
-        for backend in backends() {
+        for backend in crate::test_support::backends() {
             let mut machines = InnerMachines::with_backend(backend);
             machines.set_pool(Arc::clone(&pool));
             let run = |machines: &mut InnerMachines, gas| {
@@ -1378,10 +1379,14 @@ mod tests {
                 );
                 machines.expunge(id).unwrap();
             }
-            println!("{backend:?}: {used} gas straight, the body {body}");
             observed.push((used, body, fault.state.gas));
         }
-        assert!(observed.windows(2).all(|pair| pair[0] == pair[1]));
+        // Both backends: the gas straight, the body's, and the gas left at
+        // the fault.
+        assert!(
+            observed.windows(2).all(|pair| pair[0] == pair[1]),
+            "{observed:?}"
+        );
     }
 
     #[test]
@@ -1615,7 +1620,7 @@ mod tests {
             runs in proptest::collection::vec(scribe_run(), 1..8),
         ) {
             let blob = scribe();
-            for backend in backends() {
+            for backend in crate::test_support::backends() {
                 let outer = OuterMachines::new(&blob, backend).unwrap();
                 let prepared =
                     crate::refine::PreparedProgram::new_with_backend(&blob, backend).unwrap();
@@ -1656,7 +1661,7 @@ mod tests {
             let blob = program();
             let pool = Arc::new(MachinePool::new());
             let program = pool.program(&pool.install(&blob).unwrap()).unwrap();
-            for backend in backends() {
+            for backend in crate::test_support::backends() {
                 let mut pooled = InnerMachines::with_backend(backend);
                 pooled.set_pool(Arc::clone(&pool));
                 let id = pooled.instantiate(&program, 0).unwrap();
