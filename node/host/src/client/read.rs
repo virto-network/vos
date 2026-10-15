@@ -13,8 +13,7 @@ use vos_wire::ingress::{
 use vos_wire::schema::Schema;
 use vos_wire::{Decode, Encode};
 
-use super::{Client, ClientError, Http, Target, answer};
-use crate::lock;
+use super::{Client, ClientError, Http, Target, decode_answer};
 
 impl Client {
     /// Run query `method` on `agent`'s `instance`, good until `not_after`,
@@ -132,13 +131,13 @@ impl Client {
         &self,
         read: impl Fn(i64) -> Result<Response, ClientError>,
     ) -> Result<Response, ClientError> {
-        let offset = *lock(&self.offset);
+        let offset = self.state().offset;
         let answer = read(offset)?;
         let Response::Rejected(Rejection::StaleQuery { now }) = answer else {
             return Ok(answer);
         };
         self.learn_time(now);
-        let offset = *lock(&self.offset);
+        let offset = self.state().offset;
         read(offset)
     }
 
@@ -148,7 +147,7 @@ impl Client {
     fn read(&self, agent: AgentId, path: &str, body: &[u8]) -> Result<Response, ClientError> {
         let ask = |http: &Http| -> Result<Response, ClientError> {
             let (status, answered) = http.post_repeatable(path, body)?;
-            answer(status, &answered)
+            decode_answer(status, &answered)
         };
         let unanswered = |answer: &Result<Response, ClientError>| {
             matches!(
@@ -184,20 +183,18 @@ impl Client {
     /// The highest applied index an answer for `agent` reflected: the
     /// floor its queries ask a replica to have reached.
     pub fn floor(&self, agent: AgentId) -> u64 {
-        lock(&self.floors).get(&agent).copied().unwrap_or(0)
+        self.state().floors.get(&agent).copied().unwrap_or(0)
     }
 
     /// Each agent's floor, to keep.
     pub fn floors(&self) -> HashMap<AgentId, u64> {
-        lock(&self.floors).clone()
+        self.state().floors.clone()
     }
 
     /// Raise `agent`'s floor to `at`, as an answer, or one kept from
     /// before, reflected.
     pub fn raise_floor(&self, agent: AgentId, at: u64) {
-        let mut floors = lock(&self.floors);
-        let floor = floors.entry(agent).or_insert(0);
-        *floor = (*floor).max(at);
+        crate::raise(&mut self.state().floors, agent, at);
     }
 
     /// The schema installed as `agent`'s `instance`.
@@ -206,7 +203,7 @@ impl Client {
         agent: AgentId,
         instance: InstanceId,
     ) -> Result<Option<Schema>, ClientError> {
-        schema_from(&self.http, agent, instance)
+        self.http.schema(agent, instance)
     }
 }
 
@@ -216,20 +213,18 @@ pub fn schema(
     agent: AgentId,
     instance: InstanceId,
 ) -> Result<Option<Schema>, ClientError> {
-    schema_from(&Http::new(target), agent, instance)
+    Http::new(target).schema(agent, instance)
 }
 
-fn schema_from(
-    http: &Http,
-    agent: AgentId,
-    instance: InstanceId,
-) -> Result<Option<Schema>, ClientError> {
-    let path = format!("/agents/{}/instances/{}/schema", agent.0, instance.0);
-    let (status, body) = http.get(&path, None)?;
-    if status == 404 {
-        return Ok(None);
+impl Http {
+    fn schema(&self, agent: AgentId, instance: InstanceId) -> Result<Option<Schema>, ClientError> {
+        let path = format!("/agents/{}/instances/{}/schema", agent.0, instance.0);
+        let (status, body) = self.get(&path, None)?;
+        if status == 404 {
+            return Ok(None);
+        }
+        Schema::decode(&body)
+            .map(|(schema, _)| Some(schema))
+            .map_err(|_| ClientError::Undecodable(status))
     }
-    Schema::decode(&body)
-        .map(|(schema, _)| Some(schema))
-        .map_err(|_| ClientError::Undecodable(status))
 }

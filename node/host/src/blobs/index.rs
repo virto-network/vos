@@ -93,18 +93,14 @@ impl Location {
         out
     }
 
-    /// A row of 32 bytes, without its keep, reads as aged: the longer.
     pub(super) fn decode(bytes: &[u8]) -> Option<Self> {
         let field = |at: usize| Some(u64::from_be_bytes(bytes.get(at..at + 8)?.try_into().ok()?));
-        let keep = bytes
-            .get(32)
-            .map_or(Keep::Aged, |&byte| Keep::from_u8(byte));
         Some(Self {
             segment: field(0)?,
             offset: field(8)?,
             len: field(16)?,
             time: field(24)?,
-            keep,
+            keep: Keep::from_u8(*bytes.get(32)?),
         })
     }
 }

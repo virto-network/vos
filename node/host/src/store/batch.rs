@@ -246,12 +246,10 @@ impl Batch {
         );
     }
 
-    /// Record the node's secret seed, and delete the retired public id.
+    /// Record the node's secret seed.
     pub fn node_secret(&mut self, seed: &[u8; 32]) {
         self.batch
             .insert(self.store.system(), node_record(NodeRow::Secret, &[]), seed);
-        self.batch
-            .remove(self.store.system(), node_record(NodeRow::RetiredId, &[]));
     }
 
     /// Write the node's `row` for the agent.

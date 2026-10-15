@@ -45,7 +45,7 @@ use segment::{Current, create_segment, forget_missing_segments, recover, segment
 use writer::{Put, Reply, Request, Writer};
 
 /// A segment closes once a record would take it past this many bytes.
-pub const SEGMENT_BYTES: u64 = 256 << 20;
+const SEGMENT_BYTES: u64 = 256 << 20;
 /// What a put waits behind at most: a guard, as the log writer's cap is.
 const GROUP_BYTES: usize = 64 << 20;
 const MAGIC: [u8; 4] = *b"VOSB";
@@ -129,8 +129,10 @@ impl Drop for Held {
 struct Inner {
     dir: PathBuf,
     store: Fjall,
-    sender: Mutex<Option<mpsc::Sender<Request>>>,
-    thread: Mutex<Option<JoinHandle<()>>>,
+    /// The blob writer's requests and its thread: taken only as the store
+    /// closes, to stop the writer and wait for it.
+    sender: Option<mpsc::Sender<Request>>,
+    thread: Option<JoinHandle<()>>,
     /// One collection at a time.
     collecting: smol::lock::Mutex<()>,
     /// Open segments, for reads.
@@ -140,8 +142,8 @@ struct Inner {
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        lock(&self.sender).take();
-        if let Some(thread) = lock(&self.thread).take() {
+        self.sender.take();
+        if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
     }
@@ -199,31 +201,31 @@ impl Blobs {
             }
             None => create_segment(&dir, 0)?,
         };
+        let holds = Holds::default();
+        let writer = Writer {
+            dir: dir.clone(),
+            store: store.clone(),
+            holds: holds.clone(),
+            segment_bytes,
+            current,
+        };
         let (sender, receiver) = mpsc::channel();
-        let inner = Arc::new(Inner {
+        let thread = std::thread::Builder::new()
+            .name("vos-blobs".into())
+            .spawn(move || writer.run(receiver))
+            .expect("the blob writer starts");
+        let inner = Inner {
             dir,
             store: store.clone(),
-            sender: Mutex::new(Some(sender)),
-            thread: Mutex::new(None),
+            sender: Some(sender),
+            thread: Some(thread),
             files: Mutex::new(HashMap::new()),
             collecting: smol::lock::Mutex::new(()),
-            holds: Holds::default(),
-        });
-        let thread = {
-            let writer = Writer {
-                dir: inner.dir.clone(),
-                store: store.clone(),
-                holds: inner.holds.clone(),
-                segment_bytes,
-                current,
-            };
-            std::thread::Builder::new()
-                .name("vos-blobs".into())
-                .spawn(move || writer.run(receiver))
-                .expect("the blob writer starts")
+            holds,
         };
-        *lock(&inner.thread) = Some(thread);
-        Ok(Self { inner })
+        Ok(Self {
+            inner: Arc::new(inner),
+        })
     }
 
     /// Store `bytes`, whose reference the caller computed (on an executor,
@@ -271,7 +273,8 @@ impl Blobs {
 
     async fn request<T>(&self, make: impl FnOnce(Reply<T>) -> Request) -> Result<T, String> {
         let (done, wait) = smol::channel::bounded(1);
-        lock(&self.inner.sender)
+        self.inner
+            .sender
             .as_ref()
             .ok_or(STOPPED)?
             .send(make(done))

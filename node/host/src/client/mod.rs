@@ -8,7 +8,7 @@ mod read;
 mod target;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
@@ -41,7 +41,23 @@ pub enum ClientError {
     Lost,
 }
 
-fn answer(status: u16, body: &[u8]) -> Result<Response, ClientError> {
+impl std::fmt::Display for ClientError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Http(why) => write!(f, "{why}"),
+            Self::Undecodable(status) => write!(f, "an answer it cannot read (status {status})"),
+            Self::NoAgent => write!(f, "the node knows no such agent"),
+            Self::OtherAgent => write!(f, "the node's record of the agent is another"),
+            Self::NotTheNode => write!(f, "the node names itself by another key"),
+            Self::Lost => write!(f, "the call may have run, and nothing can say"),
+        }
+    }
+}
+
+impl std::error::Error for ClientError {}
+
+/// The answer in a body the node sent with `status`.
+fn decode_answer(status: u16, body: &[u8]) -> Result<Response, ClientError> {
     Response::decode(body)
         .map(|(answer, _)| answer)
         .map_err(|_| ClientError::Undecodable(status))
@@ -65,40 +81,42 @@ pub fn post_within(
     within: Duration,
 ) -> Result<Response, ClientError> {
     let (status, body) = Http::within(target, within).post_once(path, None, body)?;
-    answer(status, &body)
+    decode_answer(status, &body)
 }
 
 /// The node's identity, its key, which its TLS presents. A pinned node
 /// must name itself by the key it was pinned by.
 pub fn node_id(target: &Target) -> Result<NodeId, ClientError> {
-    fetch_node_id(&Http::new(target))
-}
-
-fn fetch_node_id(http: &Http) -> Result<NodeId, ClientError> {
-    let (status, body) = http.get("/", None)?;
-    let id = NodeId::decode(&body)
-        .map(|(id, _)| id)
-        .map_err(|_| ClientError::Undecodable(status))?;
-    match http.target.trust {
-        Trust::NodeKey(key) if key != id.0 => Err(ClientError::NotTheNode),
-        _ => Ok(id),
-    }
+    Http::new(target).node_id()
 }
 
 /// Agent `agent`'s creation record and replicas, as the node knows them:
 /// `None` when it knows no such agent.
 pub fn agent_info(target: &Target, agent: AgentId) -> Result<Option<AgentInfo>, ClientError> {
-    agent_info_from(&Http::new(target), agent)
+    Http::new(target).agent_info(agent)
 }
 
-fn agent_info_from(http: &Http, agent: AgentId) -> Result<Option<AgentInfo>, ClientError> {
-    let (status, body) = http.get(&format!("/agents/{}", agent.0), None)?;
-    if status == 404 {
-        return Ok(None);
+impl Http {
+    fn node_id(&self) -> Result<NodeId, ClientError> {
+        let (status, body) = self.get("/", None)?;
+        let id = NodeId::decode(&body)
+            .map(|(id, _)| id)
+            .map_err(|_| ClientError::Undecodable(status))?;
+        match self.target.trust {
+            Trust::NodeKey(key) if key != id.0 => Err(ClientError::NotTheNode),
+            _ => Ok(id),
+        }
     }
-    match AgentInfo::decode(&body) {
-        Ok((info, _)) if info.record.agent == agent => Ok(Some(info)),
-        _ => Err(ClientError::Undecodable(status)),
+
+    fn agent_info(&self, agent: AgentId) -> Result<Option<AgentInfo>, ClientError> {
+        let (status, body) = self.get(&format!("/agents/{}", agent.0), None)?;
+        if status == 404 {
+            return Ok(None);
+        }
+        match AgentInfo::decode(&body) {
+            Ok((info, _)) if info.record.agent == agent => Ok(Some(info)),
+            _ => Err(ClientError::Undecodable(status)),
+        }
     }
 }
 
@@ -123,17 +141,34 @@ pub struct Kept {
 pub struct Client {
     http: Http,
     key: SigningKey,
-    sessions: Mutex<HashMap<AgentId, Kept>>,
-    identities: Mutex<HashMap<AgentId, [u8; 32]>>,
+    state: Mutex<State>,
+}
+
+/// What a client keeps of the agents it calls.
+#[derive(Default)]
+struct State {
+    sessions: HashMap<AgentId, Kept>,
+    identities: HashMap<AgentId, [u8; 32]>,
     /// Each agent's replicas, learned with its identity.
-    replicas: Mutex<HashMap<AgentId, Vec<Contact>>>,
+    replicas: HashMap<AgentId, Vec<Contact>>,
     /// Agents whose next call repeats one whose fate is unknown.
-    unknown: Mutex<HashSet<AgentId>>,
+    unknown: HashSet<AgentId>,
     /// Each agent's floor: the highest applied index an answer reflected.
-    floors: Mutex<HashMap<AgentId, u64>>,
+    floors: HashMap<AgentId, u64>,
     /// How far the agents' time is ahead of this client's clock, as a
     /// node last reported it: a new session starts at that time.
-    offset: Mutex<i64>,
+    offset: i64,
+}
+
+/// A new session, started at the agents' time as `offset` from this
+/// client's clock puts it.
+fn start(offset: i64) -> Kept {
+    let t0 = crate::wall_clock().saturating_add_signed(offset);
+    Kept {
+        name: crate::random(),
+        t0,
+        next: 1,
+    }
 }
 
 impl Client {
@@ -150,26 +185,30 @@ impl Client {
         sessions: HashMap<AgentId, Kept>,
         identities: HashMap<AgentId, [u8; 32]>,
     ) -> Self {
+        let state = State {
+            sessions,
+            identities,
+            ..State::default()
+        };
         Self {
             http: Http::new(target),
             key,
-            sessions: Mutex::new(sessions),
-            identities: Mutex::new(identities),
-            replicas: Mutex::new(HashMap::new()),
-            unknown: Mutex::new(HashSet::new()),
-            floors: Mutex::new(HashMap::new()),
-            offset: Mutex::new(0),
+            state: Mutex::new(state),
         }
+    }
+
+    fn state(&self) -> MutexGuard<'_, State> {
+        lock(&self.state)
     }
 
     /// Each agent's session, to keep.
     pub fn sessions(&self) -> HashMap<AgentId, Kept> {
-        lock(&self.sessions).clone()
+        self.state().sessions.clone()
     }
 
     /// Each agent's identity learned, to keep.
     pub fn identities(&self) -> HashMap<AgentId, [u8; 32]> {
-        lock(&self.identities).clone()
+        self.state().identities.clone()
     }
 
     /// Say that the next call to `agent` repeats one whose fate is unknown,
@@ -178,7 +217,7 @@ impl Client {
     /// may be on their way, and once the session may be collected, the
     /// call ends [`ClientError::Lost`].
     pub fn repeats_unknown(&self, agent: AgentId) {
-        lock(&self.unknown).insert(agent);
+        self.state().unknown.insert(agent);
     }
 
     /// The node this client calls: the one it was given, or the last a
@@ -193,26 +232,26 @@ impl Client {
 
     /// The session this client calls `agent` in, started if there is none.
     pub fn session(&self, agent: AgentId) -> Session {
-        let kept = *lock(&self.sessions)
-            .entry(agent)
-            .or_insert_with(|| self.start());
-        self.whole(kept)
+        self.session_of(self.kept(agent))
+    }
+
+    /// `agent`'s session as this client keeps it, started if there is
+    /// none.
+    fn kept(&self, agent: AgentId) -> Kept {
+        let mut state = self.state();
+        let offset = state.offset;
+        *state.sessions.entry(agent).or_insert_with(|| start(offset))
     }
 
     /// Start another session for `agent`: the one before is done with.
     pub fn renew(&self, agent: AgentId) {
-        let kept = self.start();
-        lock(&self.sessions).insert(agent, kept);
+        let mut state = self.state();
+        let kept = start(state.offset);
+        state.sessions.insert(agent, kept);
     }
 
-    fn start(&self) -> Kept {
-        let name = crate::random();
-        let offset = *lock(&self.offset);
-        let t0 = crate::wall_clock().saturating_add_signed(offset);
-        Kept { name, t0, next: 1 }
-    }
-
-    fn whole(&self, kept: Kept) -> Session {
+    /// The session `kept` names, this client's key's.
+    fn session_of(&self, kept: Kept) -> Session {
         Session {
             key: self.key.verifying_key().to_bytes(),
             name: kept.name,
@@ -224,29 +263,31 @@ impl Client {
     /// of its creation record, fetched from the node once, with the agent's
     /// replicas.
     pub fn identity(&self, agent: AgentId) -> Result<[u8; 32], ClientError> {
-        if let Some(identity) = lock(&self.identities).get(&agent) {
-            return Ok(*identity);
+        let learned = self.state().identities.get(&agent).copied();
+        match learned {
+            Some(identity) => Ok(identity),
+            None => self.learn(agent),
         }
-        self.learn(agent)
     }
 
     /// Fetch `agent`'s record and replicas from the node. An identity kept
     /// from before stands: a node that names another is refused.
     fn learn(&self, agent: AgentId) -> Result<[u8; 32], ClientError> {
-        let info = agent_info_from(&self.http, agent)?.ok_or(ClientError::NoAgent)?;
+        let info = self.http.agent_info(agent)?.ok_or(ClientError::NoAgent)?;
         let identity = crate::identity(&info.record);
-        let kept = *lock(&self.identities).entry(agent).or_insert(identity);
-        if kept != identity {
+        let mut state = self.state();
+        if *state.identities.entry(agent).or_insert(identity) != identity {
             return Err(ClientError::OtherAgent);
         }
-        lock(&self.replicas).insert(agent, info.replicas);
+        state.replicas.insert(agent, info.replicas);
         Ok(identity)
     }
 
     /// Learn `agent`'s replicas, unless this client knows them: an
     /// identity kept from before comes without them.
     fn ensure_replicas(&self, agent: AgentId) {
-        if !lock(&self.replicas).contains_key(&agent) {
+        let known = self.state().replicas.contains_key(&agent);
+        if !known {
             let _ = self.learn(agent);
         }
     }
@@ -255,7 +296,9 @@ impl Client {
     /// first if need be: from the one after it on, in turn.
     fn other_replicas(&self, agent: AgentId) -> Vec<Contact> {
         self.ensure_replicas(agent);
-        let replicas = lock(&self.replicas)
+        let replicas = self
+            .state()
+            .replicas
             .get(&agent)
             .cloned()
             .unwrap_or_default();
@@ -273,7 +316,7 @@ impl Client {
     /// from this client's clock.
     fn learn_time(&self, now: u64) {
         let offset = i128::from(now) - i128::from(crate::wall_clock());
-        *lock(&self.offset) = offset.clamp(i64::MIN.into(), i64::MAX.into()) as i64;
+        self.state().offset = offset.clamp(i64::MIN.into(), i64::MAX.into()) as i64;
     }
 
     /// The node `contact` names, trusted as this client trusts nodes.

@@ -10,8 +10,7 @@ use vos_wire::defaults;
 use vos_wire::ids::{AgentId, InstanceId, MethodId};
 use vos_wire::ingress::{Call, Contact, Rejection, Response, call_message};
 
-use super::{Client, ClientError, Http, answer};
-use crate::lock;
+use super::{Client, ClientError, Http, decode_answer};
 
 /// What became of a call whose fate was unknown, once its session was
 /// refused.
@@ -39,13 +38,12 @@ const RENEWALS: usize = 2;
 
 impl Client {
     /// Call the replica of `agent` after the one this client calls: false
-    /// when it knows no other.
-    fn fail_over(&mut self, agent: AgentId) -> Result<bool, ClientError> {
+    /// when it knows no other, or cannot reach the one it knows.
+    fn fail_over(&mut self, agent: AgentId) -> bool {
         let Some(next) = self.other_replicas(agent).into_iter().next() else {
-            return Ok(false);
+            return false;
         };
-        self.follow(&next)?;
-        Ok(true)
+        self.follow(&next).is_ok()
     }
 
     /// Call `method` on `agent`'s `instance`, at the session's next
@@ -72,15 +70,14 @@ impl Client {
         let mut busy = BUSY;
         // An attempt that may have run, or may yet: later refusals that
         // say it never ran no longer prove it for the call.
-        let mut inconclusive = lock(&self.unknown).remove(&agent);
+        let mut inconclusive = self.state().unknown.remove(&agent);
         loop {
-            self.session(agent);
-            let sequence = lock(&self.sessions)[&agent].next;
+            let sequence = self.kept(agent).next;
             let answer = match self.call_at(agent, sequence, instance, method, arguments) {
                 Ok(answer) => answer,
                 Err(error) => {
                     inconclusive = true;
-                    if failovers < FAILOVERS && self.fail_over(agent).unwrap_or(false) {
+                    if failovers < FAILOVERS && self.fail_over(agent) {
                         failovers += 1;
                         continue;
                     }
@@ -89,7 +86,7 @@ impl Client {
             };
             match &answer {
                 Response::Ran { at, .. } => {
-                    if let Some(kept) = lock(&self.sessions).get_mut(&agent) {
+                    if let Some(kept) = self.state().sessions.get_mut(&agent) {
                         kept.next = sequence + 1;
                     }
                     self.raise_floor(agent, *at);
@@ -158,7 +155,7 @@ impl Client {
                 {
                     inconclusive = true;
                     failovers += 1;
-                    let _ = self.fail_over(agent);
+                    self.fail_over(agent);
                 }
                 // Every replica forwards to the same leader: wait.
                 Response::Busy if failovers < FAILOVERS => {
@@ -179,7 +176,7 @@ impl Client {
     /// What a call whose fate is unknown can be, its session refused as one
     /// the agent does not hold at the agent's time `now`.
     fn unknown_fate(&self, agent: AgentId, now: u64) -> Fate {
-        let Some(kept) = lock(&self.sessions).get(&agent).copied() else {
+        let Some(kept) = self.state().sessions.get(&agent).copied() else {
             return Fate::InTransit;
         };
         // Answered in, the session was created, and is gone.
@@ -222,7 +219,7 @@ impl Client {
         let body = self.call_body(agent, sequence, instance, method, arguments)?;
         let path = format!("/agents/{}/calls", agent.0);
         let (status, body) = self.http.post_repeatable(&path, &body)?;
-        answer(status, &body)
+        decode_answer(status, &body)
     }
 
     /// A signed call's body in the agent's session, to send by other means.

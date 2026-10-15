@@ -232,12 +232,17 @@ impl Faults {
             return false;
         };
         // A xorshift step: frames lost at about the rate asked.
-        let mut x = self.random.load(Ordering::Relaxed);
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.random.store(x, Ordering::Relaxed);
-        x % 1_000_000 < u64::from(loss.per_million)
+        let step = |mut x: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let last = self
+            .random
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| Some(step(x)))
+            .expect("a step always");
+        step(last) % 1_000_000 < u64::from(loss.per_million)
     }
 }
 

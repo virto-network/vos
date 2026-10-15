@@ -298,8 +298,7 @@ fn a_hold_keeps_a_candidate_from_a_removal_after_it() {
 }
 
 /// A blob put both ways keeps the longer, and moving it keeps that; a
-/// row without its keep, or with one this build does not know, reads as
-/// aged.
+/// row with a keep this build does not know reads as aged.
 #[test]
 fn a_blob_keeps_the_longer_of_its_keeps() {
     let dir = tempfile::tempdir().unwrap();
@@ -321,7 +320,5 @@ fn a_blob_keeps_the_longer_of_its_keeps() {
     };
     let mut unknown = named.encode();
     unknown[32] = 7;
-    for row in [&named.encode()[..32], &unknown[..]] {
-        assert_eq!(Location::decode(row), Some(location));
-    }
+    assert_eq!(Location::decode(&unknown), Some(location));
 }

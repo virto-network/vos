@@ -16,7 +16,7 @@ mod fault;
 #[cfg(feature = "faults")]
 pub mod faults;
 mod group;
-pub mod http;
+mod http;
 mod ingress;
 mod leader;
 mod liveness;
@@ -28,7 +28,7 @@ mod queries;
 pub mod raft;
 pub mod roots;
 mod signature;
-pub mod space;
+mod space;
 mod stats;
 pub mod storage;
 pub mod store;

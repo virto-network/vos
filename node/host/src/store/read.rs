@@ -58,7 +58,7 @@ impl Fjall {
             applied,
             term,
             last_result,
-            cursor: Some((true, None)),
+            cursor: Cursor::System(None),
         })
     }
 }
@@ -76,8 +76,15 @@ pub struct Export {
     /// The time and seed of the last work result applied, as of the same
     /// store snapshot.
     pub last_result: Option<(u64, [u8; 32])>,
-    /// The partition read next (system, then state), and the last key read.
-    cursor: Option<(bool, Option<Vec<u8>>)>,
+    cursor: Cursor,
+}
+
+/// Where an export reads next: the system partition, then the state
+/// partition, each after the last key read there, or from its start.
+enum Cursor {
+    System(Option<Vec<u8>>),
+    State(Option<Vec<u8>>),
+    Done,
 }
 
 impl Export {
@@ -87,13 +94,13 @@ impl Export {
         let mut chunk = Vec::new();
         let mut size = 0;
         let prefix = agent_key(self.agent, self.epoch, &[]);
-        while let Some((system, after)) = self.cursor.clone() {
-            let partition = if system {
-                self.store.system()
-            } else {
-                self.store.state()
+        loop {
+            let (partition, after) = match &self.cursor {
+                Cursor::System(after) => (self.store.system(), after),
+                Cursor::State(after) => (self.store.state(), after),
+                Cursor::Done => break,
             };
-            let start = match &after {
+            let start = match after {
                 Some(after) => Bound::Excluded(after.clone()),
                 None => Bound::Included(prefix.clone()),
             };
@@ -113,9 +120,16 @@ impl Export {
                 last = Some(key.to_vec());
             }
             if done {
-                self.cursor = system.then_some((false, None));
+                self.cursor = match self.cursor {
+                    Cursor::System(_) => Cursor::State(None),
+                    _ => Cursor::Done,
+                };
             } else {
-                self.cursor = Some((system, last.or(after)));
+                if let (Cursor::System(after) | Cursor::State(after), Some(last)) =
+                    (&mut self.cursor, last)
+                {
+                    *after = Some(last);
+                }
                 break;
             }
         }

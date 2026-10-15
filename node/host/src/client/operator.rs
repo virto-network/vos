@@ -6,7 +6,7 @@ use vos_wire::Encode;
 use vos_wire::ids::{AgentId, Principal};
 use vos_wire::ingress::{Create, Grant, Install, Replace, Response};
 
-use super::{ClientError, Http, Target, answer};
+use super::{ClientError, Http, Target, decode_answer};
 
 /// The node's operator, by its admin token.
 pub struct Operator {
@@ -35,12 +35,12 @@ impl Operator {
     fn post(&self, path: &str, body: &[u8]) -> Result<Response, ClientError> {
         // An operator's command may not be idempotent: never sent twice.
         let (status, body) = self.http.post_once(path, Some(&self.token), body)?;
-        answer(status, &body)
+        decode_answer(status, &body)
     }
 
     fn get(&self, path: &str) -> Result<Response, ClientError> {
         let (status, body) = self.http.get(path, Some(&self.token))?;
-        answer(status, &body)
+        decode_answer(status, &body)
     }
 
     /// Create an agent replicated on `replicas` (the node alone when

@@ -25,10 +25,7 @@ pub const NODE_AGENT: AgentId = AgentId(u32::MAX);
 pub(super) enum NodeRow {
     Applied = 0x00,
     Agent = 0x01,
-    /// Retired: it held a public node id, which must never be read as the
-    /// secret. Deleted when the secret is made.
-    RetiredId = 0x02,
-    // 0x03 to 0x05 are unused.
+    // 0x02 to 0x05 are unused.
     Hard = 0x06,
     LogStart = 0x07,
     Membership = 0x08,
