@@ -195,10 +195,13 @@ impl Endpoint {
             .collect();
     }
 
-    /// The delivery task to `to`. Each frame goes, when due, to whichever
-    /// run of `to` is up then, if it lists this node.
-    fn delayed(&self, to: NodeNumber) -> smol::channel::Sender<(Instant, Class, Incoming)> {
-        let mut delayed = self.delayed.lock().expect("the delayed links");
+    /// The delivery task to `to`, among `delayed`. Each frame goes, when
+    /// due, to whichever run of `to` is up then, if it lists this node.
+    fn delayed<'a>(
+        &self,
+        delayed: &'a mut HashMap<NodeNumber, Delayed>,
+        to: NodeNumber,
+    ) -> &'a smol::channel::Sender<(Instant, Class, Incoming)> {
         let link = delayed.entry(to).or_insert_with(|| {
             let (frames, pending) = smol::channel::unbounded::<(Instant, Class, Incoming)>();
             let hub = self.hub.clone();
@@ -229,7 +232,7 @@ impl Endpoint {
                 _task: task,
             }
         });
-        link.frames.clone()
+        &link.frames
     }
 }
 
@@ -291,13 +294,9 @@ impl Network for Endpoint {
         let delay = state.delay;
         let deliver = state.deliver(self.number, to);
         drop(state);
-        if delay.is_zero()
-            && !self
-                .delayed
-                .lock()
-                .expect("the delayed links")
-                .contains_key(&to)
-        {
+        let mut delayed = self.delayed.lock().expect("the delayed links");
+        if delay.is_zero() && !delayed.contains_key(&to) {
+            drop(delayed);
             let Some(deliver) = deliver else {
                 return Ok(());
             };
@@ -310,7 +309,7 @@ impl Network for Endpoint {
         // Once delayed, a link stays on its delivery task, so a later
         // frame never passes an earlier one.
         let _ = self
-            .delayed(to)
+            .delayed(&mut delayed, to)
             .try_send((Instant::now() + delay, class, incoming));
         Ok(())
     }

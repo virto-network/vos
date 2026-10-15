@@ -32,13 +32,7 @@ async fn serve(inner: Arc<Inner>, incoming: quinn::Incoming) {
     let Some(key) = tls::peer_key(&connection) else {
         return;
     };
-    let Some(from) = inner
-        .table
-        .read()
-        .expect("the peer table")
-        .get(&key)
-        .copied()
-    else {
+    let Some(from) = inner.peer_number(&key) else {
         connection.close(code::UNCONFIGURED, b"");
         return;
     };
@@ -121,9 +115,10 @@ async fn frames(peer: &Reading, mut stream: quinn::RecvStream, class: Class, id:
             let _ = stream.stop(code::TOO_LARGE);
             return;
         }
-        let _permit = match class.stream_per_frame() {
-            true => Some(peer.bulk.acquire().await),
-            false => None,
+        let _permit = if class.stream_per_frame() {
+            Some(peer.bulk.acquire().await)
+        } else {
+            None
         };
         let Some(frame) = read_frame(&mut stream, length).await else {
             return;

@@ -97,7 +97,7 @@ impl Link {
         };
         let task = inner
             .spawner
-            .spawn(dial(dialing, queued, Arc::clone(&shared)))
+            .spawn(dialing.run(queued, Arc::clone(&shared)))
             .expect("the network's executor runs while it is open");
         Self {
             peer,
@@ -119,56 +119,157 @@ struct Dialing {
     spawner: Spawner,
 }
 
-/// Dial the peer whenever there is something to send, and write to it
-/// until the connection closes.
-async fn dial(dialing: Dialing, queued: smol::channel::Receiver<Outgoing>, shared: Arc<Shared>) {
-    let Dialing {
-        endpoint,
-        client,
-        address,
-        name,
-        quiet,
-        spawner,
-    } = dialing;
-    let mut next = None;
-    let mut backoff = MIN_BACKOFF;
-    loop {
-        if next.is_none() {
-            match queued.recv().await {
-                Ok(frame) => next = Some(frame),
-                Err(_) => return,
+impl Dialing {
+    /// Dial the peer whenever there is something to send, and write to it
+    /// until the connection closes.
+    async fn run(self, queued: smol::channel::Receiver<Outgoing>, shared: Arc<Shared>) {
+        let address = self.address;
+        let mut next = None;
+        let mut backoff = MIN_BACKOFF;
+        loop {
+            if next.is_none() {
+                match queued.recv().await {
+                    Ok(frame) => next = Some(frame),
+                    Err(_) => return,
+                }
+            }
+            let dialed = self
+                .endpoint
+                .connect_with(self.client.clone(), address, &self.name);
+            let connecting = match dialed {
+                Ok(connecting) => connecting,
+                Err(error) => {
+                    tracing::warn!(%address, %error, "cannot dial a peer");
+                    return;
+                }
+            };
+            let timeout = async {
+                smol::Timer::after(DIAL).await;
+                Err(quinn::ConnectionError::TimedOut)
+            };
+            let connection = match connecting.or(timeout).await {
+                Ok(connection) => connection,
+                Err(error) => {
+                    tracing::debug!(%address, %error, "dial failed");
+                    back_off(&mut backoff).await;
+                    continue;
+                }
+            };
+            *shared.connection.lock().expect("the connection") = Some(connection.clone());
+            self.write(&connection, &mut next, &queued).await;
+            *shared.connection.lock().expect("the connection") = None;
+            if refused(&connection) {
+                // The peer took the handshake, then refused this node:
+                // dialing again at once would only be refused again.
+                tracing::debug!(%address, "a peer refused this node");
+                back_off(&mut backoff).await;
+            } else {
+                backoff = MIN_BACKOFF;
             }
         }
-        let connecting = match endpoint.connect_with(client.clone(), address, &name) {
-            Ok(connecting) => connecting,
-            Err(error) => {
-                tracing::warn!(%address, %error, "cannot dial a peer");
-                return;
+    }
+
+    /// Write queued frames on `connection`, just made, until it closes. A
+    /// frame taken but not yet handed to a stream stays in `next`, for the
+    /// next connection. A liveness frame queued before the connection was
+    /// made is dropped: it would say, late, that its sender was alive
+    /// then. One handed to a connection that outlives a cut is QUIC's to
+    /// deliver, and may still arrive late, after the cut heals.
+    async fn write(
+        &self,
+        connection: &quinn::Connection,
+        next: &mut Option<Outgoing>,
+        queued: &smol::channel::Receiver<Outgoing>,
+    ) {
+        let connected = Instant::now();
+        enum Event {
+            Frame(Outgoing),
+            Sweep,
+            Done,
+        }
+        let mut streams: HashMap<(Class, u64), Writer> = HashMap::new();
+        // Writers finishing their quiet streams. A new stream for the same
+        // id opens only once its old one is finished and the peer has it
+        // all.
+        let mut retiring: HashMap<(Class, u64), smol::Task<()>> = HashMap::new();
+        let every = (self.quiet / 2).max(Duration::from_millis(1));
+        let mut sweep = smol::Timer::interval(every);
+        let mut swept = Instant::now();
+        let bulk = Arc::new(smol::lock::Semaphore::new(BULK_STREAMS));
+        let mut sending = Tasks::default();
+        loop {
+            // Swept on time even while frames never stop coming.
+            if swept.elapsed() >= every {
+                retire(&mut streams, &mut retiring, self.quiet);
+                swept = Instant::now();
             }
-        };
-        let timeout = async {
-            smol::Timer::after(DIAL).await;
-            Err(quinn::ConnectionError::TimedOut)
-        };
-        let connection = match connecting.or(timeout).await {
-            Ok(connection) => connection,
-            Err(error) => {
-                tracing::debug!(%address, %error, "dial failed");
-                back_off(&mut backoff).await;
+            let frame = match next.take() {
+                Some(frame) => frame,
+                None => {
+                    let frame = async {
+                        match queued.recv().await {
+                            Ok(frame) => Event::Frame(frame),
+                            Err(_) => Event::Done,
+                        }
+                    };
+                    let closed = async {
+                        connection.closed().await;
+                        Event::Done
+                    };
+                    let swept = async {
+                        sweep.next().await;
+                        Event::Sweep
+                    };
+                    match frame.or(closed).or(swept).await {
+                        Event::Frame(frame) => frame,
+                        Event::Sweep => continue,
+                        Event::Done => return,
+                    }
+                }
+            };
+            if frame.class == Class::Liveness && frame.queued < connected {
                 continue;
             }
-        };
-        *shared.connection.lock().expect("the connection") = Some(connection.clone());
-        let connected = Instant::now();
-        write(&connection, &mut next, &queued, quiet, &spawner, connected).await;
-        *shared.connection.lock().expect("the connection") = None;
-        if refused(&connection) {
-            // The peer took the handshake, then refused this node: dialing
-            // again at once would only be refused again.
-            tracing::debug!(%address, "a peer refused this node");
-            back_off(&mut backoff).await;
-        } else {
-            backoff = MIN_BACKOFF;
+            if connection.close_reason().is_some() {
+                *next = Some(frame);
+                return;
+            }
+            if frame.class.stream_per_frame() {
+                let connection = connection.clone();
+                let bulk = Arc::clone(&bulk);
+                let sent = async move {
+                    let _permit = bulk.acquire().await;
+                    let _ = write_bulk(&connection, frame).await;
+                };
+                if !sending.spawn(&self.spawner, sent) {
+                    return;
+                }
+                continue;
+            }
+            let key = (frame.class, frame.stream);
+            let frame = match streams.get_mut(&key) {
+                Some(writer) => match writer.frames.try_send(frame) {
+                    Ok(()) => {
+                        writer.last = Instant::now();
+                        continue;
+                    }
+                    // The stream failed: the frame goes on a new one.
+                    Err(error) => error.into_inner(),
+                },
+                None => frame,
+            };
+            let previous = retiring.remove(&key);
+            let Some(writer) = Writer::spawn(
+                &self.spawner,
+                connection.clone(),
+                frame.class,
+                frame.stream,
+                previous,
+            ) else {
+                return;
+            };
+            let _ = writer.frames.try_send(frame);
+            streams.insert(key, writer);
         }
     }
 }
@@ -193,110 +294,6 @@ fn refused(connection: &quinn::Connection) -> bool {
     }
 }
 
-/// Write queued frames on `connection` until it closes. A frame taken but
-/// not yet handed to a stream stays in `next`, for the next connection. A
-/// liveness frame queued before the connection was made (`connected`) is
-/// dropped: it would say, late, that its sender was alive then. One handed
-/// to a connection that outlives a cut is QUIC's to deliver, and may still
-/// arrive late, after the cut heals.
-async fn write(
-    connection: &quinn::Connection,
-    next: &mut Option<Outgoing>,
-    queued: &smol::channel::Receiver<Outgoing>,
-    quiet: Duration,
-    spawner: &Spawner,
-    connected: Instant,
-) {
-    enum Event {
-        Frame(Outgoing),
-        Sweep,
-        Done,
-    }
-    let mut streams: HashMap<(Class, u64), Writer> = HashMap::new();
-    // Writers finishing their quiet streams. A new stream for the same id
-    // opens only once its old one is finished and the peer has it all.
-    let mut retiring: HashMap<(Class, u64), smol::Task<()>> = HashMap::new();
-    let every = (quiet / 2).max(Duration::from_millis(1));
-    let mut sweep = smol::Timer::interval(every);
-    let mut swept = Instant::now();
-    let bulk = Arc::new(smol::lock::Semaphore::new(BULK_STREAMS));
-    let mut sending = Tasks::default();
-    loop {
-        // Swept on time even while frames never stop coming.
-        if swept.elapsed() >= every {
-            retire(&mut streams, &mut retiring, quiet);
-            swept = Instant::now();
-        }
-        let frame = match next.take() {
-            Some(frame) => frame,
-            None => {
-                let frame = async {
-                    match queued.recv().await {
-                        Ok(frame) => Event::Frame(frame),
-                        Err(_) => Event::Done,
-                    }
-                };
-                let closed = async {
-                    connection.closed().await;
-                    Event::Done
-                };
-                let swept = async {
-                    sweep.next().await;
-                    Event::Sweep
-                };
-                match frame.or(closed).or(swept).await {
-                    Event::Frame(frame) => frame,
-                    Event::Sweep => continue,
-                    Event::Done => return,
-                }
-            }
-        };
-        if frame.class == Class::Liveness && frame.queued < connected {
-            continue;
-        }
-        if connection.close_reason().is_some() {
-            *next = Some(frame);
-            return;
-        }
-        if frame.class.stream_per_frame() {
-            let connection = connection.clone();
-            let bulk = Arc::clone(&bulk);
-            let sent = async move {
-                let _permit = bulk.acquire().await;
-                let _ = write_bulk(&connection, frame).await;
-            };
-            if !sending.spawn(spawner, sent) {
-                return;
-            }
-            continue;
-        }
-        let key = (frame.class, frame.stream);
-        let frame = match streams.get_mut(&key) {
-            Some(writer) => match writer.frames.try_send(frame) {
-                Ok(()) => {
-                    writer.last = Instant::now();
-                    continue;
-                }
-                // The stream failed: the frame goes on a new one.
-                Err(error) => error.into_inner(),
-            },
-            None => frame,
-        };
-        let previous = retiring.remove(&key);
-        let Some(writer) = Writer::spawn(
-            spawner,
-            connection.clone(),
-            frame.class,
-            frame.stream,
-            previous,
-        ) else {
-            return;
-        };
-        let _ = writer.frames.try_send(frame);
-        streams.insert(key, writer);
-    }
-}
-
 /// Retire the writers of streams quiet for `quiet`: each writes what it
 /// still holds, then finishes its stream, so the peer can grant another.
 fn retire(
@@ -306,16 +303,9 @@ fn retire(
 ) {
     retiring.retain(|_, task| !task.is_finished());
     let now = Instant::now();
-    let quiet: Vec<_> = streams
-        .iter()
-        .filter(|(_, writer)| now.duration_since(writer.last) >= quiet)
-        .map(|(key, _)| *key)
-        .collect();
-    for key in quiet {
-        let writer = streams.remove(&key).expect("a quiet writer");
-        // Dropping its sender ends its queue once drained.
-        retiring.insert(key, writer.task);
-    }
+    let quieted = streams.extract_if(|_, writer| now.duration_since(writer.last) >= quiet);
+    // Dropping its sender ends a writer's queue once drained.
+    retiring.extend(quieted.map(|(key, writer)| (key, writer.task)));
 }
 
 /// A long-lived stream's writer, and when it was last handed a frame.

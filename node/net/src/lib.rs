@@ -107,9 +107,7 @@ impl Limits {
         // A 64 MiB program, with its header.
         bulk: (64 << 20) + (64 << 10),
     };
-}
 
-impl Limits {
     fn of(&self, class: Class) -> usize {
         let limit = match class {
             Class::Liveness => self.liveness,

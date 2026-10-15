@@ -227,10 +227,7 @@ impl Drop for Quic {
     fn drop(&mut self) {
         self.inner.close();
         // Let the peers hear the close, briefly, before the thread stops.
-        let told = async {
-            self.inner.endpoint.wait_idle().await;
-        };
-        smol::block_on(told.or(async {
+        smol::block_on(self.inner.endpoint.wait_idle().or(async {
             smol::Timer::after(CLOSING).await;
         }));
     }
@@ -283,8 +280,13 @@ impl Inner {
         *seen = name;
     }
 
+    /// The configured peer whose key is `key`.
+    fn peer_number(&self, key: &NodeKey) -> Option<NodeNumber> {
+        self.table.read().expect("the peer table").get(key).copied()
+    }
+
     fn configured(&self, key: &NodeKey, from: NodeNumber) -> bool {
-        self.table.read().expect("the peer table").get(key) == Some(&from)
+        self.peer_number(key) == Some(from)
     }
 }
 
