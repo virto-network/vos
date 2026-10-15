@@ -9,9 +9,8 @@ use std::time::Instant;
 use vos_wire::ids::AgentId;
 
 use super::{Change, Commit, Shared};
-use crate::Hooks;
-use crate::lock;
-use crate::store::{Fjall, PersistMode};
+use crate::store::{Batch, Fjall, PersistMode};
+use crate::{Hooks, lock, raise};
 
 /// The writer's loop: one group of commits at a time.
 pub(super) struct Writer {
@@ -223,13 +222,7 @@ impl Writer {
             }
         }
         let mut batch = self.store.batch();
-        let mut synced = false;
-        // Applies in this batch: they count only once it commits.
-        let mut applied: HashMap<AgentId, u64> = HashMap::new();
-        let dirty = vos_wire::keys::dirty_prefix();
-        let mut dirtied = Vec::new();
-        // Agents retired in this batch: nothing of theirs is applied.
-        let mut retired = Vec::new();
+        let mut staged = Staged::new();
         // Commits in order, each with its refusal if it has one; a refused
         // commit writes nothing, and is answered in its turn.
         let mut taken = Vec::with_capacity(group.len());
@@ -240,77 +233,11 @@ impl Writer {
                 continue;
             }
             for change in &commit.changes {
-                synced |= change.synced();
-                match change {
-                    Change::Append {
-                        agent,
-                        index,
-                        entry,
-                    } => batch.append(*agent, *index, entry),
-                    Change::Truncate { agent, after } => batch.truncate(*agent, *after),
-                    Change::Compact {
-                        agent,
-                        through,
-                        term,
-                        membership,
-                    } => batch.compact(*agent, *through, *term, membership.as_ref()),
-                    Change::Hard { agent, hard, .. } => batch.hard_state(*agent, hard),
-                    Change::Membership { agent, membership } => {
-                        batch.membership(*agent, membership)
-                    }
-                    Change::Apply {
-                        agent,
-                        epoch,
-                        index,
-                        writes,
-                    } => {
-                        batch.apply(*agent, *epoch, *index, writes);
-                        let entry = applied.entry(*agent).or_insert(*index);
-                        *entry = (*entry).max(*index);
-                        if writes.iter().any(|write| write.key.starts_with(&dirty)) {
-                            dirtied.push(*agent);
-                        }
-                    }
-                    Change::Stage {
-                        agent, epoch, rows, ..
-                    } => batch.stage(*agent, *epoch, rows),
-                    Change::DropEpoch {
-                        agent,
-                        epoch,
-                        limit,
-                    } => batch.drop_epoch(*agent, *epoch, *limit),
-                    Change::Switch { agent, switch } => {
-                        batch.switch(*agent, switch);
-                        let entry = applied.entry(*agent).or_insert(switch.index);
-                        *entry = (*entry).max(switch.index);
-                        dirtied.push(*agent);
-                    }
-                    Change::Pin { hash, agent } => batch.pin(hash, *agent),
-                    Change::Unpin { hash, agent } => batch.unpin(hash, *agent),
-                    Change::Barrier => {}
-                    Change::Agent(record) => batch.agent(record),
-                    Change::Placement { agent, placement } => batch.placement(*agent, placement),
-                    Change::Retire {
-                        agent,
-                        epoch,
-                        hard,
-                        floor,
-                    } => {
-                        batch.retire(*agent, *epoch, hard, *floor);
-                        retired.push(*agent);
-                    }
-                    Change::LastResult { agent, time, seed } => {
-                        batch.last_result(*agent, *time, seed)
-                    }
-                    Change::Tree {
-                        agent,
-                        epoch,
-                        writes,
-                    } => batch.rows(*agent, *epoch, writes),
-                }
+                staged.stage(&mut batch, change);
             }
             taken.push((commit, None));
         }
+        let synced = staged.synced;
         let durability = if synced {
             PersistMode::SyncAll
         } else {
@@ -338,32 +265,7 @@ impl Writer {
             self.failed = Some(failure.clone());
             self.shared.failed.store(true, Ordering::SeqCst);
         } else {
-            self.agents.extend(pending);
-            // Marked once written and before the commits are answered: the
-            // root builder wakes when the applier, answered, moves the
-            // applied index, so it finds the mark for every row it can see.
-            lock(&self.shared.dirtied).extend(dirtied);
-            if !retired.is_empty() {
-                let mut durable = lock(&self.shared.durably_applied);
-                for agent in retired {
-                    self.unsynced_applied.remove(&agent);
-                    applied.remove(&agent);
-                    durable.remove(&agent);
-                }
-            }
-            for (agent, index) in applied {
-                let entry = self.unsynced_applied.entry(agent).or_insert(index);
-                *entry = (*entry).max(index);
-            }
-            if synced {
-                // Every batch before this one shares the journal, so it is
-                // durable now too.
-                let mut durable = lock(&self.shared.durably_applied);
-                for (agent, index) in self.unsynced_applied.drain() {
-                    let entry = durable.entry(agent).or_insert(index);
-                    *entry = (*entry).max(index);
-                }
-            }
+            self.settle(pending, staged);
         }
         for (commit, refusal) in taken {
             let answer = match refusal {
@@ -374,8 +276,135 @@ impl Writer {
         }
     }
 
+    /// Once `staged`'s batch is written: the agents' states as it left
+    /// them, the rows it dirtied, and the applies it made durable.
+    fn settle(&mut self, pending: HashMap<AgentId, AgentState>, staged: Staged) {
+        self.agents.extend(pending);
+        // Marked once written and before the commits are answered: the
+        // root builder wakes when the applier, answered, moves the
+        // applied index, so it finds the mark for every row it can see.
+        lock(&self.shared.dirtied).extend(staged.dirtied);
+        let mut applied = staged.applied;
+        if !staged.retired.is_empty() {
+            let mut durable = lock(&self.shared.durably_applied);
+            for agent in staged.retired {
+                self.unsynced_applied.remove(&agent);
+                applied.remove(&agent);
+                durable.remove(&agent);
+            }
+        }
+        for (agent, index) in applied {
+            raise(&mut self.unsynced_applied, agent, index);
+        }
+        if staged.synced {
+            // Every batch before this one shares the journal, so it is
+            // durable now too.
+            let mut durable = lock(&self.shared.durably_applied);
+            for (agent, index) in self.unsynced_applied.drain() {
+                raise(&mut durable, agent, index);
+            }
+        }
+    }
+
     fn answer(&self, commit: Commit, result: Result<(), String>) {
         lock(&self.shared.pending).remove(&commit.id);
         let _ = commit.done.try_send(result);
+    }
+}
+
+/// What a group's changes leave for the writer once their batch is
+/// written.
+struct Staged {
+    /// Some change must be synced.
+    synced: bool,
+    /// Each agent's highest index applied: it counts only once the batch
+    /// is written.
+    applied: HashMap<AgentId, u64>,
+    /// The agents whose rows the batch left dirty.
+    dirtied: Vec<AgentId>,
+    /// The agents the batch retired: nothing of theirs is applied.
+    retired: Vec<AgentId>,
+    /// The prefix of the dirty rows a root build reads.
+    dirty: Vec<u8>,
+}
+
+impl Staged {
+    fn new() -> Self {
+        Self {
+            synced: false,
+            applied: HashMap::new(),
+            dirtied: Vec::new(),
+            retired: Vec::new(),
+            dirty: vos_wire::keys::dirty_prefix(),
+        }
+    }
+
+    /// Write `change` into `batch`.
+    fn stage(&mut self, batch: &mut Batch, change: &Change) {
+        self.synced |= change.synced();
+        match change {
+            Change::Append {
+                agent,
+                index,
+                entry,
+            } => batch.append(*agent, *index, entry),
+            Change::Truncate { agent, after } => batch.truncate(*agent, *after),
+            Change::Compact {
+                agent,
+                through,
+                term,
+                membership,
+            } => batch.compact(*agent, *through, *term, membership.as_ref()),
+            Change::Hard { agent, hard, .. } => batch.hard_state(*agent, hard),
+            Change::Membership { agent, membership } => batch.membership(*agent, membership),
+            Change::Apply {
+                agent,
+                epoch,
+                index,
+                writes,
+            } => {
+                batch.apply(*agent, *epoch, *index, writes);
+                raise(&mut self.applied, *agent, *index);
+                if writes
+                    .iter()
+                    .any(|write| write.key.starts_with(&self.dirty))
+                {
+                    self.dirtied.push(*agent);
+                }
+            }
+            Change::Stage {
+                agent, epoch, rows, ..
+            } => batch.stage(*agent, *epoch, rows),
+            Change::DropEpoch {
+                agent,
+                epoch,
+                limit,
+            } => batch.drop_epoch(*agent, *epoch, *limit),
+            Change::Switch { agent, switch } => {
+                batch.switch(*agent, switch);
+                raise(&mut self.applied, *agent, switch.index);
+                self.dirtied.push(*agent);
+            }
+            Change::Pin { hash, agent } => batch.pin(hash, *agent),
+            Change::Unpin { hash, agent } => batch.unpin(hash, *agent),
+            Change::Barrier => {}
+            Change::Agent(record) => batch.agent(record),
+            Change::Placement { agent, placement } => batch.placement(*agent, placement),
+            Change::Retire {
+                agent,
+                epoch,
+                hard,
+                floor,
+            } => {
+                batch.retire(*agent, *epoch, hard, *floor);
+                self.retired.push(*agent);
+            }
+            Change::LastResult { agent, time, seed } => batch.last_result(*agent, *time, seed),
+            Change::Tree {
+                agent,
+                epoch,
+                writes,
+            } => batch.rows(*agent, *epoch, writes),
+        }
     }
 }

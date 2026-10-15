@@ -41,7 +41,9 @@ pub use node::{
 };
 pub use space::{Space, SpaceNode};
 
+use std::collections::HashMap;
 use std::future::Future;
+use std::hash::Hash;
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -89,6 +91,44 @@ pub(crate) fn hex32(text: &str) -> Option<[u8; 32]> {
         *byte = u8::from_str_radix(pair, 16).ok()?;
     }
     Some(out)
+}
+
+/// `bytes` in lowercase hex.
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Raise `key`'s value in `map` to `value`, if that is higher.
+pub(crate) fn raise<K: Eq + Hash>(map: &mut HashMap<K, u64>, key: K, value: u64) {
+    let raised = map.entry(key).or_insert(value);
+    *raised = (*raised).max(value);
+}
+
+/// The wait before trying again what the node failed: [`Backoff::FIRST`]
+/// at first, doubled at each try up to five seconds.
+pub(crate) struct Backoff(Duration);
+
+impl Backoff {
+    pub(crate) const FIRST: Duration = Duration::from_millis(50);
+    const MOST: Duration = Duration::from_secs(5);
+
+    /// The wait before this try, the next one's doubled.
+    pub(crate) fn next(&mut self) -> Duration {
+        let wait = self.0;
+        self.0 = (wait * 2).min(Self::MOST);
+        wait
+    }
+
+    /// Back to the first wait, once a try succeeded.
+    pub(crate) fn reset(&mut self) {
+        self.0 = Self::FIRST;
+    }
+}
+
+impl Default for Backoff {
+    fn default() -> Self {
+        Self(Self::FIRST)
+    }
 }
 
 /// 32 random bytes, from the operating system's randomness.

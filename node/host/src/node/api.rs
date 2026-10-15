@@ -18,6 +18,7 @@ use vos_wire::result::Outcome;
 
 use super::open::write_token;
 use super::{ADMIN_TOKEN, CallError, Error, Inner, Node, Pending, ReplaceError, Reply};
+use crate::queries::Asked;
 use crate::store::Fjall;
 use crate::{lock, seed};
 
@@ -75,29 +76,29 @@ impl Node {
 
     /// Snapshots this node's groups switched to.
     pub fn snapshots_installed(&self) -> u64 {
-        self.inner.installed.load(Ordering::Relaxed)
+        self.inner.counters.installed.load(Ordering::Relaxed)
     }
 
     /// Snapshot streams this node started to its followers.
     pub fn snapshots_streamed(&self) -> u64 {
-        self.inner.streamed.load(Ordering::Relaxed)
+        self.inner.counters.streamed.load(Ordering::Relaxed)
     }
 
     /// Messages this node sent toward agents on other nodes, again on
     /// rounds included.
     pub fn messages_sent_across(&self) -> u64 {
-        self.inner.sent_across.load(Ordering::Relaxed)
+        self.inner.counters.sent_across.load(Ordering::Relaxed)
     }
 
     /// Messages this node relayed to their agent's leader.
     pub fn messages_relayed(&self) -> u64 {
-        self.inner.relayed.load(Ordering::Relaxed)
+        self.inner.counters.relayed.load(Ordering::Relaxed)
     }
 
     /// Frames of `class` that arrived here from other nodes; none of
     /// liveness, which are not counted.
     pub fn frames_arrived(&self, class: vos_net::Class) -> u64 {
-        self.inner.arrived[class as usize].load(Ordering::Relaxed)
+        self.inner.counters.arrived[class as usize].load(Ordering::Relaxed)
     }
 
     /// Arrivals this node dropped for `refusal`.
@@ -228,12 +229,13 @@ impl Node {
         arguments: Vec<u8>,
     ) -> impl Future<Output = Result<Outcome, CallError>> + use<> {
         let inner = Arc::clone(&self.inner);
-        async move {
-            inner
-                .query(agent, caller, instance, method, arguments)
-                .await
-                .map(|(outcome, _)| outcome)
-        }
+        let asked = Asked {
+            caller,
+            instance,
+            method,
+            arguments,
+        };
+        async move { inner.query(agent, asked).await }
     }
 
     /// Queue a message for `target` as delivery from its sender would.
@@ -280,7 +282,11 @@ impl Node {
     /// Whether the machine pool holds `program`: instances of it run
     /// without loading it first.
     pub fn pooled(&self, program: &[u8; 32]) -> bool {
-        self.inner.pool.program(&CodeHash(*program)).is_some()
+        self.inner
+            .machines
+            .pool
+            .program(&CodeHash(*program))
+            .is_some()
     }
 
     /// Serve the HTTP ingress on `address` (`127.0.0.1:0` picks a port):

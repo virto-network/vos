@@ -4,8 +4,6 @@
 use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 
-use vos_net::Class;
-use vos_wire::Encode;
 use vos_wire::peer::{NodeNumber, PeerMessage};
 
 use super::Driver;
@@ -14,6 +12,28 @@ use crate::blobs::Keep;
 /// How long a group waits for blobs it asked for before asking again,
 /// another member.
 const BLOB_RETRY: Duration = Duration::from_secs(1);
+
+/// The blobs a group asked for and still waits on, and the member it asks
+/// next.
+#[derive(Default)]
+pub(super) struct Fetch {
+    asks: Asks,
+    /// Which member to ask next.
+    turn: usize,
+}
+
+impl Fetch {
+    /// When the longest wait comes to the retry interval.
+    pub(super) fn due(&self) -> Option<Instant> {
+        self.asks.due()
+    }
+
+    /// The next of `others` to ask.
+    fn next_member(&mut self, others: &[NodeNumber]) -> NodeNumber {
+        self.turn += 1;
+        others[self.turn % others.len()]
+    }
+}
 
 impl Driver {
     /// Ask for the blobs the group's entries, or the snapshot it stages,
@@ -33,9 +53,9 @@ impl Driver {
     /// and such a replica is one crashed, while the quorum goes on.
     pub(super) fn fetch_blobs(&mut self) {
         let mut missing: BTreeSet<[u8; 32]> = self.reports.missing().into_iter().collect();
-        missing.extend(self.install_missing.iter().copied());
+        missing.extend(self.snapshots.missing.iter().copied());
         if missing.is_empty() {
-            self.asks.clear();
+            self.fetch.asks.clear();
             return;
         }
         if self.inner.network.is_none() {
@@ -53,64 +73,53 @@ impl Driver {
         if others.is_empty() {
             return;
         }
-        let ask = self.asks.next(&missing, Instant::now());
+        let ask = self.fetch.asks.next(&missing, Instant::now());
         let leader = self.shared.state().leader.filter(|leader| *leader != me);
         if !ask.fresh.is_empty() {
-            let to = leader.unwrap_or_else(|| self.next_member(&others));
+            let to = leader.unwrap_or_else(|| self.fetch.next_member(&others));
             self.ask(to, ask.fresh);
         }
         if !ask.retry.is_empty() {
-            let to = self.next_member(&others);
+            let to = self.fetch.next_member(&others);
             self.ask(to, ask.retry);
         }
-    }
-
-    fn next_member(&mut self, others: &[NodeNumber]) -> NodeNumber {
-        self.turn += 1;
-        others[self.turn % others.len()]
     }
 
     /// Ask node `to` for `hashes`. A program a staged snapshot waits for is
     /// kept by its age until the switch pins it; every other blob, by the
     /// entry naming it.
     fn ask(&self, to: NodeNumber, hashes: Vec<[u8; 32]>) {
-        let Some(network) = &self.inner.network else {
-            return;
-        };
         let (aged, named): (Vec<[u8; 32]>, Vec<[u8; 32]>) = hashes
             .iter()
-            .partition(|hash| self.install_missing.contains(hash));
+            .partition(|hash| self.snapshots.missing.contains(hash));
         self.inner.want(self.shared.agent, &aged, Keep::Aged);
         self.inner.want(self.shared.agent, &named, Keep::Named);
-        let frame = PeerMessage::BlobRequest {
-            agent: self.shared.agent,
-            hashes,
-        }
-        .encode();
-        let _ = network.send(to, Class::Requests, u64::from(self.shared.agent.0), frame);
+        let agent = self.shared.agent;
+        self.inner
+            .send(to, &PeerMessage::BlobRequest { agent, hashes });
     }
 }
 
 /// The blobs a group asked for and still waits on, each with when it was
 /// last asked.
 #[derive(Default)]
-pub(super) struct Asks(HashMap<[u8; 32], Instant>);
+struct Asks(HashMap<[u8; 32], Instant>);
 
 /// What a group asks for in one round.
 #[derive(Debug, Default, PartialEq, Eq)]
-pub(super) struct Ask {
+struct Ask {
     /// The blobs not asked for yet: of the leader.
-    pub fresh: Vec<[u8; 32]>,
+    fresh: Vec<[u8; 32]>,
     /// The blobs that waited the retry interval since they were last asked
     /// for: of the next member.
-    pub retry: Vec<[u8; 32]>,
+    retry: Vec<[u8; 32]>,
 }
 
 impl Asks {
     /// Of `missing`, what to ask for at `now`, noted as asked then. A blob
     /// is asked for again only once it waited [`BLOB_RETRY`]: one asked a
     /// moment ago is not asked again of a member the turn comes back to.
-    pub(super) fn next(&mut self, missing: &BTreeSet<[u8; 32]>, now: Instant) -> Ask {
+    fn next(&mut self, missing: &BTreeSet<[u8; 32]>, now: Instant) -> Ask {
         self.0.retain(|hash, _| missing.contains(hash));
         let mut ask = Ask::default();
         for hash in missing {
@@ -129,11 +138,11 @@ impl Asks {
     }
 
     /// When the longest wait comes to the retry interval.
-    pub(super) fn due(&self) -> Option<Instant> {
+    fn due(&self) -> Option<Instant> {
         self.0.values().min().map(|at| *at + BLOB_RETRY)
     }
 
-    pub(super) fn clear(&mut self) {
+    fn clear(&mut self) {
         self.0.clear();
     }
 }

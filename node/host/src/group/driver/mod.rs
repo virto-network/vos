@@ -7,27 +7,25 @@ use std::sync::{Arc, PoisonError};
 use std::time::{Duration, Instant};
 
 use smol::future::FutureExt;
-use vos_net::Class;
 use vos_raft::core::{
     Action, Answer, ChangeMembershipError, Core, ProposeError, ReadIndexError, Write,
 };
 use vos_raft::{Config as RaftConfig, Role};
-use vos_wire::Encode;
-use vos_wire::peer::{NodeNumber, Order, PeerMessage, SnapshotChunk};
+use vos_wire::peer::{NodeNumber, Order, PeerMessage};
 
 mod fetch;
 mod membership;
 mod snapshot;
 
-use super::{Input, Local, Proposed, Shared};
+use super::{Input, Local, MembershipChanged, Proposed, ReadIndexed, Shared};
 use crate::blobs::Held;
 use crate::node::Inner;
 use crate::raft::{self, EntryReports};
 use crate::random_u64;
 use crate::storage::Change;
-use fetch::Asks;
+use fetch::Fetch;
 use membership::established;
-use snapshot::{INSTALL_IDLE, Install, STREAM_HOLD, Shipment};
+use snapshot::{INSTALL_IDLE, STREAM_HOLD, Snapshots};
 
 /// Inputs a driver takes in one round, so the core joins them in one
 /// write.
@@ -75,13 +73,8 @@ struct Driver {
     /// The log's last index as written to the store. [`State::written`]
     /// reaches it only once the entries' blobs are stored too.
     last_index: u64,
-    proposals: HashMap<u64, Proposed>,
-    reads: HashMap<u64, smol::channel::Sender<Result<u64, ReadIndexError>>>,
-    next_token: u64,
-    /// The blobs asked for and still awaited.
-    asks: Asks,
-    /// Which member to ask next.
-    turn: usize,
+    answers: Answers,
+    fetch: Fetch,
     /// The held blobs of proposals not yet answered, by token.
     held_proposals: HashMap<u64, Held>,
     /// The held blobs of entries not yet written, by index: released once
@@ -91,24 +84,47 @@ struct Driver {
     retired: bool,
     /// The core was last told to hand leadership over and not campaign.
     handing_over: bool,
-    /// The snapshot streams this replica runs as leader, by follower.
-    shipments: HashMap<NodeNumber, Shipment>,
-    /// The snapshot this replica stages, from the leader it follows.
-    install: Option<Install>,
-    /// The programs a staged snapshot waits for before its switch.
-    install_missing: Vec<[u8; 32]>,
-    /// Snapshot chunks taken this round, staged once it is processed.
-    chunks: VecDeque<(NodeNumber, SnapshotChunk)>,
+    snapshots: Snapshots,
     /// The highest compaction bound the core gave.
     compact_bound: u64,
     /// A compaction is due at the next chance.
     compact_due: bool,
-    memberships: HashMap<u64, smol::channel::Sender<Result<u64, ChangeMembershipError>>>,
     /// The order of the placement this replica last announced as leader,
     /// since it last stepped down: set as it goes to the directory, in a
     /// task of its own, as the driver never waits on the node-wide lock a
     /// placement takes.
     announced: Option<Order>,
+}
+
+/// Where the core's answers go, by the token each request took.
+#[derive(Default)]
+struct Answers {
+    proposals: HashMap<u64, Proposed>,
+    reads: HashMap<u64, ReadIndexed>,
+    memberships: HashMap<u64, MembershipChanged>,
+    next_token: u64,
+}
+
+impl Answers {
+    /// A token no request took.
+    fn token(&mut self) -> u64 {
+        let token = self.next_token;
+        self.next_token += 1;
+        token
+    }
+
+    /// Answer every request waiting that the group stopped.
+    fn stop(&mut self) {
+        for (_, answer) in self.proposals.drain() {
+            let _ = answer.try_send((Err(ProposeError::Stopped), Instant::now()));
+        }
+        for (_, answer) in self.reads.drain() {
+            let _ = answer.try_send(Err(ReadIndexError::Stopped));
+        }
+        for (_, answer) in self.memberships.drain() {
+            let _ = answer.try_send(Err(ChangeMembershipError::Stopped));
+        }
+    }
 }
 
 impl Driver {
@@ -198,22 +214,15 @@ impl Driver {
             reports,
             writes,
             last_index,
-            proposals: HashMap::new(),
-            reads: HashMap::new(),
-            next_token: 0,
-            asks: Asks::default(),
-            turn: 0,
+            answers: Answers::default(),
+            fetch: Fetch::default(),
             held_proposals: HashMap::new(),
             held_entries: Vec::new(),
             retired: false,
             handing_over: false,
-            shipments: HashMap::new(),
-            install: None,
-            install_missing: Vec::new(),
-            chunks: VecDeque::new(),
+            snapshots: Snapshots::default(),
             compact_bound: 0,
             compact_due: false,
-            memberships: HashMap::new(),
             announced: None,
             inner,
             shared,
@@ -268,13 +277,14 @@ impl Driver {
                 let mut sooner = |at: Instant| {
                     wake = Some(wake.map_or(at, |wake| wake.min(at)));
                 };
-                if let Some(due) = self.asks.due() {
+                if let Some(due) = self.fetch.due() {
                     sooner(due);
                 }
-                if let Some(install) = &self.install {
+                if let Some(install) = &self.snapshots.install {
                     sooner(install.since + INSTALL_IDLE);
                 }
                 for staged in self
+                    .snapshots
                     .shipments
                     .values()
                     .filter_map(|shipment| shipment.staged)
@@ -351,28 +361,9 @@ impl Driver {
         });
         local.close();
         while let Ok(local) = local.try_recv() {
-            match local {
-                Local::Propose { answer, .. } => {
-                    let _ = answer.try_send((Err(ProposeError::Stopped), Instant::now()));
-                }
-                Local::ReadIndex { answer } => {
-                    let _ = answer.try_send(Err(ReadIndexError::Stopped));
-                }
-                Local::ChangeMembership { answer, .. } => {
-                    let _ = answer.try_send(Err(ChangeMembershipError::Stopped));
-                }
-                Local::Retire | Local::StreamEnded { .. } | Local::Probe(_) | Local::Wake => {}
-            }
+            local.refuse_stopped();
         }
-        for (_, answer) in self.proposals.drain() {
-            let _ = answer.try_send((Err(ProposeError::Stopped), Instant::now()));
-        }
-        for (_, answer) in self.reads.drain() {
-            let _ = answer.try_send(Err(ReadIndexError::Stopped));
-        }
-        for (_, answer) in self.memberships.drain() {
-            let _ = answer.try_send(Err(ChangeMembershipError::Stopped));
-        }
+        self.answers.stop();
     }
 
     fn take(&mut self, input: Input) {
@@ -387,9 +378,9 @@ impl Driver {
                 self.core.receive(from, message)
             }
             Input::Blobs => self.report_ready(),
-            Input::Chunk { from, chunk } => self.chunks.push_back((from, chunk)),
+            Input::Chunk { from, chunk } => self.snapshots.chunks.push_back((from, chunk)),
             Input::ChunkAck { from, ack } => {
-                if let Some(shipment) = self.shipments.get(&from)
+                if let Some(shipment) = self.snapshots.shipments.get(&from)
                     && (ack.agent, ack.term, ack.index)
                         == (self.shared.agent, shipment.term, shipment.index)
                 {
@@ -412,9 +403,8 @@ impl Driver {
                     let _ = answer.try_send((Err(ProposeError::NotLeader), Instant::now()));
                     return;
                 }
-                let token = self.next_token;
-                self.next_token += 1;
-                self.proposals.insert(token, answer);
+                let token = self.answers.token();
+                self.answers.proposals.insert(token, answer);
                 if let Some(held) = held {
                     self.held_proposals.insert(token, held);
                 }
@@ -424,9 +414,8 @@ impl Driver {
             Local::Probe(node) => self.core.probe(node),
             Local::Wake => {}
             Local::ReadIndex { answer } => {
-                let token = self.next_token;
-                self.next_token += 1;
-                self.reads.insert(token, answer);
+                let token = self.answers.token();
+                self.answers.reads.insert(token, answer);
                 self.core.read_index(token, Some(READ_INDEX_MS));
             }
             Local::ChangeMembership {
@@ -443,9 +432,8 @@ impl Driver {
                     let _ = answer.try_send(Err(ChangeMembershipError::InProgress));
                     return;
                 }
-                let token = self.next_token;
-                self.next_token += 1;
-                self.memberships.insert(token, answer);
+                let token = self.answers.token();
+                self.answers.memberships.insert(token, answer);
                 self.core.change_membership(token, members);
             }
             Local::StreamEnded {
@@ -455,6 +443,7 @@ impl Driver {
                 done,
             } => {
                 let Some(shipment) = self
+                    .snapshots
                     .shipments
                     .get_mut(&to)
                     .filter(|shipment| (shipment.term, shipment.index) == (term, index))
@@ -466,7 +455,7 @@ impl Driver {
                     // entries after it, and no other stream displaces it.
                     shipment.staged = Some(Instant::now());
                 } else {
-                    self.shipments.remove(&to);
+                    self.snapshots.shipments.remove(&to);
                     self.core.snapshot_failed(to);
                     self.compact_due = true;
                 }
@@ -513,25 +502,20 @@ impl Driver {
     async fn act(&mut self, action: Action<NodeNumber>) -> bool {
         match action {
             Action::Write(write) => return self.write(write).await,
-            Action::Send { to, message } => {
-                if let Some(network) = &self.inner.network {
-                    let frame = PeerMessage::Raft {
-                        agent: self.shared.agent,
-                        message: crate::peer::to_wire(&message),
-                    }
-                    .encode();
-                    // Refused, it is dropped: Raft sends again.
-                    let _ =
-                        network.send(to, Class::Consensus, u64::from(self.shared.agent.0), frame);
-                }
-            }
+            // Refused, it is dropped: Raft sends again.
+            Action::Send { to, message } => self.inner.send(
+                to,
+                &PeerMessage::Raft {
+                    agent: self.shared.agent,
+                    message: crate::peer::to_wire(&message),
+                },
+            ),
             Action::LoadEntries(load) => {
                 let store = self.inner.store.clone();
                 let agent = self.shared.agent;
-                let request = load;
                 let loaded = self
                     .inner
-                    .offload(move || raft::load(&store, agent, &request))
+                    .offload(move || raft::load(&store, agent, &load))
                     .await;
                 match loaded {
                     Some(Ok(entries)) => self.core.loaded(load, entries),
@@ -561,24 +545,24 @@ impl Driver {
                 {
                     self.held_entries.push((index, held));
                 }
-                if let Some(answer) = self.proposals.remove(&token) {
+                if let Some(answer) = self.answers.proposals.remove(&token) {
                     let _ = answer.try_send((result, Instant::now()));
                 }
             }
             Action::Answer(Answer::ReadIndex { token, result }) => {
-                if let Some(answer) = self.reads.remove(&token) {
+                if let Some(answer) = self.answers.reads.remove(&token) {
                     let _ = answer.try_send(result);
                 }
             }
             Action::Answer(Answer::ChangeMembership { token, result }) => {
-                if let Some(answer) = self.memberships.remove(&token) {
+                if let Some(answer) = self.answers.memberships.remove(&token) {
                     let _ = answer.try_send(result);
                 }
             }
             Action::Changed { term, role, leader } => {
                 // A leadership's streams end with it.
                 if role != Role::Leader {
-                    self.shipments.clear();
+                    self.snapshots.shipments.clear();
                 }
                 // Becoming leader, the core appended its term's no-op last.
                 let leading_from =
@@ -616,6 +600,7 @@ impl Driver {
 
     async fn write(&mut self, write: Write<NodeNumber>) -> bool {
         let changes = raft::changes(self.shared.agent, &write);
+        let named = raft::named(&changes);
         if let Err(error) = self.inner.storage.commit(changes).await {
             tracing::error!(
                 agent = self.shared.agent.0,
@@ -639,17 +624,15 @@ impl Driver {
             self.last_index = last.index;
         }
         self.writes.push_back((write.seq, self.last_index));
-        let named: Vec<[u8; 32]> = write
-            .entries
+        let hashes: Vec<[u8; 32]> = named
             .iter()
-            .flat_map(|entry| raft::to_store(entry).blobs)
-            .map(|blob| blob.hash)
+            .flat_map(|(_, hashes)| hashes.iter().copied())
             .collect();
-        let stored: BTreeSet<[u8; 32]> = if named.is_empty() {
+        let stored: BTreeSet<[u8; 32]> = if hashes.is_empty() {
             BTreeSet::new()
         } else {
             // Touched, a blob stays while an entry comes to rely on it.
-            match self.inner.blobs.touch(named).await {
+            match self.inner.blobs.touch(hashes).await {
                 Ok(stored) => stored.into_iter().collect(),
                 Err(error) => {
                     tracing::warn!(agent = self.shared.agent.0, "a blob touch failed: {error}");
@@ -657,7 +640,8 @@ impl Driver {
                 }
             }
         };
-        self.reports.written(&write, |hash| stored.contains(hash));
+        self.reports
+            .written(&write, named, |hash| stored.contains(hash));
         // A held blob's entry is written and touched now, or gone in this
         // write's truncation.
         let truncated = write.truncate_after;

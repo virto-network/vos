@@ -20,25 +20,20 @@ use smol::future::FutureExt;
 use vos_raft::Role;
 use vos_wire::ids::AgentId;
 use vos_wire::keys;
-use vos_wire::keys::Due;
-use vos_wire::result::WorkResult;
+use vos_wire::result::{InputRef, Run, Step, WorkResult};
 
 use crate::fault::{Fault, read};
 use crate::group::{Local, Shared, State};
 use crate::node::{Agent, Inner, Pending};
 use crate::store::Snapshot;
-use crate::{lock, timeout};
+use crate::{Backoff, lock, timeout};
+use sweep::Sweeps;
 use window::{BEHIND_EVERY, WINDOW, Window};
-
-/// The first wait before retrying a batch the node failed, doubled each
-/// time up to [`MAX_BACKOFF`].
-const BACKOFF: Duration = Duration::from_millis(50);
-const MAX_BACKOFF: Duration = Duration::from_secs(5);
 
 /// Lead `agent` whenever this node's replica leads its group, until the
 /// group stops.
 pub(crate) async fn lead(inner: Arc<Inner>, agent: Arc<Agent>, shared: Arc<Shared>) {
-    let mut backoff = BACKOFF;
+    let mut backoff = Backoff::default();
     loop {
         let state = shared
             .wait(|state| state.stopped || state.leading_from.is_some())
@@ -61,10 +56,10 @@ pub(crate) async fn lead(inner: Arc<Inner>, agent: Arc<Agent>, shared: Arc<Share
             return;
         }
         if leads(&state, term) {
-            match Leader::open(&inner, &shared, term) {
+            match Leader::open(&inner, &agent, &shared, term) {
                 Ok(mut leader) => {
-                    backoff = BACKOFF;
-                    if !leader.lead(&inner, &agent, &shared).await {
+                    backoff.reset();
+                    if !leader.lead().await {
                         // A hook, or a broken invariant, stopped the
                         // leader for good: its replica hands leadership
                         // over and goes on applying, and callers go to
@@ -76,13 +71,13 @@ pub(crate) async fn lead(inner: Arc<Inner>, agent: Arc<Agent>, shared: Arc<Share
                 }
                 Err(fault) => {
                     // The node failed a read: try again while leading.
+                    let wait = backoff.next();
                     tracing::error!(
                         agent = shared.agent.0,
-                        "the leader cannot start ({}); retrying in {backoff:?}",
+                        "the leader cannot start ({}); retrying in {wait:?}",
                         fault.message()
                     );
-                    timeout(backoff, shared.wait(|state| !leads(state, term))).await;
-                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                    timeout(wait, shared.wait(|state| !leads(state, term))).await;
                     if leads(&shared.state(), term) {
                         continue;
                     }
@@ -102,7 +97,21 @@ fn leads(state: &State, term: u64) -> bool {
     state.role == Role::Leader && state.term == term && !state.stopped
 }
 
+/// Whether `step` is a workflow's due step: one no input made.
+fn is_due(step: &Step) -> bool {
+    matches!(
+        step,
+        Step::Ran(Run {
+            input: InputRef::Due { .. },
+            ..
+        })
+    )
+}
+
 struct Leader {
+    inner: Arc<Inner>,
+    agent: Arc<Agent>,
+    shared: Arc<Shared>,
     id: AgentId,
     term: u64,
     version: u64,
@@ -118,17 +127,13 @@ struct Leader {
     /// failing alone again, it is asserted failed.
     failing: Option<(AgentId, u64)>,
     max_inputs: usize,
-    backoff: Duration,
+    backoff: Backoff,
     /// The inputs the last batch requeued because its result applied as no
     /// writes: a second time, the batch is shortened as a failing one is.
     skipped: bool,
-    /// The first row of the due index when the last sweep applied, or
-    /// failed alone, and when.
-    swept: Option<((u64, Due), Instant)>,
+    sweeps: Sweeps,
     /// When the last batch ended.
     ended: Option<Instant>,
-    /// That a sweep left its first due row in place, said once.
-    stuck: bool,
     /// When it last told senders whose messages the queue dropped full
     /// that they are behind.
     told: Option<Instant>,
@@ -145,13 +150,20 @@ enum Ran {
 }
 
 impl Leader {
-    fn open(inner: &Inner, shared: &Shared, term: u64) -> Result<Self, Fault> {
+    fn open(
+        inner: &Arc<Inner>,
+        agent: &Arc<Agent>,
+        shared: &Arc<Shared>,
+        term: u64,
+    ) -> Result<Self, Fault> {
         let id = shared.agent;
-        let infrastructure = |error: fjall::Error| Fault::Infrastructure(error.to_string());
         let snapshot = inner.store.snapshot();
-        let applied = snapshot.applied(id).map_err(infrastructure)?.unwrap_or(0);
+        let applied = snapshot.applied(id)?.unwrap_or(0);
         let version = read::<u64>(&snapshot, id, &keys::version())?.unwrap_or(0);
         Ok(Self {
+            inner: Arc::clone(inner),
+            agent: Arc::clone(agent),
+            shared: Arc::clone(shared),
             id,
             term,
             version,
@@ -161,37 +173,36 @@ impl Leader {
             windows: HashMap::new(),
             failing: None,
             max_inputs: inner.settings.max_inputs,
-            backoff: BACKOFF,
+            backoff: Backoff::default(),
             skipped: false,
-            swept: None,
+            sweeps: Sweeps::default(),
             ended: None,
-            stuck: false,
             told: None,
         })
     }
 
     /// Lead until leadership ends. False when a hook stops the leader.
-    async fn lead(&mut self, inner: &Inner, agent: &Agent, shared: &Shared) -> bool {
-        if let Err(fault) = self.recover(inner).await {
+    async fn lead(&mut self) -> bool {
+        if let Err(fault) = self.recover().await {
             tracing::error!(agent = self.id.0, "recovery failed: {}", fault.message());
         }
-        while let Some(pending) = self.take(inner, agent, shared).await {
+        while let Some(pending) = self.take().await {
             // Woken for a round, or between batches: windows due go again.
             if pending.is_empty() {
                 // Woken by a timer alone: let the node's other tasks run.
                 smol::future::yield_now().await;
             } else {
                 if let Some(ended) = self.ended {
-                    inner.stats.between.took(ended.elapsed());
+                    self.inner.stats.between.took(ended.elapsed());
                 }
-                let ran = self.run(inner, agent, shared, pending).await;
+                let ran = self.run(pending).await;
                 self.ended = Some(Instant::now());
                 if !ran {
                     return false;
                 }
             }
-            self.rounds(inner, agent);
-            if !leads(&shared.state(), self.term) {
+            self.rounds();
+            if !leads(&self.shared.state(), self.term) {
                 break;
             }
         }
@@ -200,16 +211,11 @@ impl Leader {
 
     /// The next inputs, once there are any; `None` once leadership ends or
     /// the agent stops.
-    async fn take(
-        &mut self,
-        inner: &Inner,
-        agent: &Agent,
-        shared: &Shared,
-    ) -> Option<Vec<Pending>> {
+    async fn take(&mut self) -> Option<Vec<Pending>> {
         let mut waited = false;
         loop {
             let (told, queued, untold) = {
-                let mut queue = lock(&agent.queue);
+                let mut queue = lock(&self.agent.queue);
                 if queue.stopped {
                     return None;
                 }
@@ -221,38 +227,38 @@ impl Leader {
                     .told
                     .is_none_or(|at| now.saturating_duration_since(at) >= BEHIND_EVERY)
                 {
-                    queue.untold(inner.settings.queue_cap, WINDOW)
+                    queue.untold(self.inner.settings.queue_cap, WINDOW)
                 } else {
                     Vec::new()
                 };
                 if !told.is_empty() {
                     self.told = Some(now);
                 }
-                (told, !queue.inputs.is_empty(), !queue.dropped.is_empty())
+                (told, !queue.is_empty(), !queue.dropped.is_empty())
             };
             for sender in told {
-                inner.behind(sender, self.id);
+                self.inner.behind(sender, self.id);
             }
             if queued {
                 break;
             }
-            if !leads(&shared.state(), self.term) {
+            if !leads(&self.shared.state(), self.term) {
                 return None;
             }
             // Idle: a sweep due runs alone, after the node's other tasks.
-            let sweep = self.sweep_wait(inner);
+            let sweep = self.sweep_wait();
             if sweep == Some(Duration::ZERO) {
                 smol::future::yield_now().await;
                 return Some(vec![Pending::Sweep(Vec::new())]);
             }
             // A receiver found this agent behind it: windows go again.
-            if !lock(&agent.queue).behind.is_empty() {
+            if !lock(&self.agent.queue).behind.is_empty() {
                 return Some(Vec::new());
             }
-            let woken = async { Some(Some(agent.woken.recv().await.is_ok())) };
+            let woken = async { Some(Some(self.agent.woken.recv().await.is_ok())) };
             let term = self.term;
             let lost = async {
-                shared.wait(|state| !leads(state, term)).await;
+                self.shared.wait(|state| !leads(state, term)).await;
                 Some(Some(false))
             };
             let next = self.windows.values().filter_map(Window::next).min();
@@ -290,34 +296,26 @@ impl Leader {
             waited = true;
         }
         if waited {
-            smol::Timer::after(inner.settings.linger).await;
+            smol::Timer::after(self.inner.settings.linger).await;
         }
-        let mut queue = lock(&agent.queue);
+        let mut queue = lock(&self.agent.queue);
         if queue.stopped {
             return None;
         }
         let mut taken = Vec::new();
         let mut bytes = 0;
         let now = Instant::now();
+        let max_bytes = self.inner.settings.max_bytes;
         while taken.len() < self.max_inputs {
-            let Some((next, _)) = queue.inputs.front() else {
+            let fits = |next: &Pending| taken.is_empty() || bytes + next.bytes() <= max_bytes;
+            let Some((next, queued)) = queue.pop_front_if(fits) else {
                 break;
             };
-            if !taken.is_empty() && bytes + next.bytes() > inner.settings.max_bytes {
-                break;
-            }
-            let (next, queued) = queue.inputs.pop_front().expect("a front input");
-            inner
+            self.inner
                 .stats
                 .queued
                 .took(now.saturating_duration_since(queued));
             bytes += next.bytes();
-            if next.capped() {
-                queue.capped -= 1;
-            }
-            if next.agents_sent() {
-                queue.from_agents -= 1;
-            }
             taken.push(next);
         }
         Some(taken)
@@ -332,9 +330,4 @@ impl Leader {
         self.marks.insert(from, mark);
         Ok(mark)
     }
-}
-
-fn raise(acks: &mut HashMap<AgentId, u64>, from: AgentId, sequence: u64) {
-    let ack = acks.entry(from).or_insert(0);
-    *ack = (*ack).max(sequence);
 }

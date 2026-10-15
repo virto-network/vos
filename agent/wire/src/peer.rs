@@ -154,6 +154,17 @@ impl CreationRecord {
     pub fn creator_of(agent: AgentId) -> NodeNumber {
         (agent.0 >> 24) as NodeNumber
     }
+
+    /// The id of node `creator`'s agent `serial`, below `1 << 24`, in its
+    /// range.
+    pub fn agent_id(creator: NodeNumber, serial: u32) -> AgentId {
+        AgentId(u32::from(creator) << 24 | serial)
+    }
+
+    /// Which of its creator's agents `agent` is.
+    pub fn serial_of(agent: AgentId) -> u32 {
+        agent.0 & 0x00ff_ffff
+    }
 }
 
 /// Where an agent runs: its group's configuration, as the leader that

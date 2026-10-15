@@ -23,14 +23,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use smol::future::FutureExt;
-use vos_net::Class;
 use vos_wire::ids::AgentId;
 use vos_wire::peer::{CreationRecord, NodeNumber, Order, PeerMessage, Placement};
 
 use super::{Agent, Inner, Run};
-use crate::group::{self, Shared};
+use crate::group::{self, Shared, pin_changes};
 use crate::lock;
 use crate::storage::Change;
+use crate::store::HardState;
 
 /// How often unacknowledged records are sent again.
 const RESEND: Duration = Duration::from_secs(1);
@@ -43,11 +43,31 @@ const ASKS_KEPT: usize = 1024;
 /// A group's inbox: Raft messages beyond it are dropped, and resent.
 const GROUP_INBOX: usize = 1024;
 
+/// What an agent's retirement reads of it.
+struct Retiring {
+    /// The programs it pins.
+    programs: BTreeSet<[u8; 32]>,
+    hard: HardState,
+    /// The last log position it held: the log's end, else where it starts,
+    /// and no lower than a floor an earlier retirement left.
+    floor: (u64, u64),
+}
+
 /// What a node knows of an agent: its record, and where it runs.
 #[derive(Clone, Debug)]
 pub(crate) struct Known {
     pub(crate) record: CreationRecord,
     pub(crate) placement: Placement,
+}
+
+impl Known {
+    /// It, as the directory sends it.
+    fn message(&self) -> PeerMessage {
+        PeerMessage::Directory {
+            record: self.record.clone(),
+            placement: self.placement.clone(),
+        }
+    }
 }
 
 /// What this node knows of where agents run, and the placements it sends
@@ -140,12 +160,9 @@ pub(crate) async fn resend_records(inner: Arc<Inner>) {
                 continue;
             }
             if let Some(known) = known {
-                let message = PeerMessage::Directory {
-                    record: known.record.clone(),
-                    placement: known.placement.clone(),
-                };
+                let message = known.message();
                 for node in nodes {
-                    inner.send(node, Class::Requests, &message);
+                    inner.send(node, &message);
                 }
             }
         }
@@ -213,16 +230,10 @@ impl Inner {
             run
         };
         tracing::info!(agent = agent.0, "this node no longer replicates the agent");
-        run.agent.stop();
-        run.shared.stop();
-        run.inbox.close();
-        run.local.close();
+        run.close();
         let inner = Arc::clone(self);
         self.spawn(async move {
-            let tasks = std::mem::take(&mut *lock(&run.tasks));
-            for task in tasks {
-                task.await;
-            }
+            run.join().await;
             inner.finish_retirement(agent).await;
         });
     }
@@ -240,24 +251,11 @@ impl Inner {
     /// snapshot was staged in), the programs it named are unpinned, and
     /// every stale epoch is dropped.
     async fn write_retirement(&self, agent: AgentId) {
-        let read = (|| {
-            let snapshot = self.store.snapshot();
-            let programs = group::pinned(&snapshot, agent)?;
-            let rows = self.store.raft(agent)?;
-            // The last log position held: the log's end, else where it
-            // starts, and no lower than a floor an earlier retirement left.
-            let mut floor = rows
-                .log
-                .last()
-                .map_or(rows.log_start, |(index, entry)| (*index, entry.term));
-            if let Some(earlier) = rows.vote_floor
-                && (earlier.1, earlier.0) > (floor.1, floor.0)
-            {
-                floor = earlier;
-            }
-            Ok::<_, fjall::Error>((programs, rows.hard, floor))
-        })();
-        let (programs, hard, floor) = match read {
+        let Retiring {
+            programs,
+            hard,
+            floor,
+        } = match self.retirement(agent) {
             Ok(read) => read,
             Err(error) => {
                 tracing::error!(agent = agent.0, "a retiring agent is unreadable: {error}");
@@ -271,21 +269,35 @@ impl Inner {
         let mut changes = vec![Change::Retire {
             agent,
             epoch,
-            hard: crate::store::HardState { commit: 0, ..hard },
+            hard: HardState { commit: 0, ..hard },
             floor,
         }];
-        changes.extend(
-            programs
-                .into_iter()
-                .map(|hash| Change::Unpin { hash, agent }),
-        );
-        let unpinned = group::unpinned(&changes);
-        if let Err(error) = self.storage.commit(changes).await {
+        changes.extend(pin_changes(agent, &programs, &BTreeSet::new()));
+        if let Err(error) = self.commit_unpinning(changes).await {
             tracing::error!(agent = agent.0, "an agent did not retire: {error}");
             return;
         }
-        self.evict(&unpinned);
         group::drop_stale_epochs(self, agent).await;
+    }
+
+    /// What `agent`'s retirement reads of it.
+    fn retirement(&self, agent: AgentId) -> Result<Retiring, fjall::Error> {
+        let programs = group::pinned(&self.store.snapshot(), agent)?;
+        let rows = self.store.raft(agent)?;
+        let mut floor = rows
+            .log
+            .last()
+            .map_or(rows.log_start, |(index, entry)| (*index, entry.term));
+        if let Some(earlier) = rows.vote_floor
+            && (earlier.1, earlier.0) > (floor.1, floor.0)
+        {
+            floor = earlier;
+        }
+        Ok(Retiring {
+            programs,
+            hard: rows.hard,
+            floor,
+        })
     }
 
     /// Whether this node's store holds anything of `agent`'s replica: a
@@ -443,7 +455,6 @@ impl Inner {
         drop(recording);
         self.send(
             from,
-            Class::Requests,
             &PeerMessage::DirectoryAck {
                 agent,
                 order,
@@ -470,11 +481,7 @@ impl Inner {
             asked.insert((agent, from), now);
             trim_asks(&mut asked, now);
         }
-        self.send(
-            from,
-            Class::Requests,
-            &PeerMessage::DirectoryRequest { agent },
-        );
+        self.send(from, &PeerMessage::DirectoryRequest { agent });
     }
 
     /// Answer `from`'s request for `agent`'s record with the record and
@@ -484,17 +491,9 @@ impl Inner {
         let Some(known) = self.directory.get(agent) else {
             return;
         };
-        if !should_answer(&known.placement, from, self.number) {
-            return;
+        if should_answer(&known.placement, from, self.number) {
+            self.send(from, &known.message());
         }
-        self.send(
-            from,
-            Class::Requests,
-            &PeerMessage::Directory {
-                record: known.record.clone(),
-                placement: known.placement.clone(),
-            },
-        );
     }
 
     pub(crate) fn on_ack(&self, from: NodeNumber, agent: AgentId, order: Order, runs: bool) {
@@ -527,11 +526,9 @@ impl Inner {
             return;
         };
         let others: BTreeSet<NodeNumber> = self
-            .space
-            .as_ref()
-            .map(|space| space.numbers())
-            .unwrap_or_default()
-            .into_iter()
+            .numbers
+            .iter()
+            .copied()
             .filter(|node| *node != self.number)
             .collect();
         if !others.is_empty() {
@@ -543,12 +540,9 @@ impl Inner {
     /// [`RESEND`] until each holds it, or one newer: they join those yet to
     /// hold it, and those of an older placement are no longer sent theirs.
     fn send_until_held(&self, agent: AgentId, known: &Known, nodes: BTreeSet<NodeNumber>) {
-        let message = PeerMessage::Directory {
-            record: known.record.clone(),
-            placement: known.placement.clone(),
-        };
+        let message = known.message();
         for node in &nodes {
-            self.send(*node, Class::Requests, &message);
+            self.send(*node, &message);
         }
         let order = known.placement.order();
         let mut unacknowledged = lock(&self.directory.unacknowledged);

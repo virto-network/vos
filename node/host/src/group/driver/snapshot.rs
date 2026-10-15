@@ -3,7 +3,7 @@
 //! old epochs dropped after, and the log's compaction, which a stream
 //! holds back.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -19,7 +19,7 @@ use vos_wire::peer::{
 use super::Driver;
 use crate::blobs::Keep;
 use crate::group::epochs::{drop_epoch, empty_epoch};
-use crate::group::{Local, Shared, pinned, programs, unpinned};
+use crate::group::{Local, Shared, pin_changes, pinned, programs};
 use crate::node::Inner;
 use crate::raft;
 use crate::storage::Change;
@@ -38,6 +38,19 @@ const STREAM_SILENCE: Duration = Duration::from_secs(10);
 pub(super) const STREAM_HOLD: Duration = Duration::from_secs(60);
 /// How long a follower keeps a snapshot it stages without a new chunk.
 pub(super) const INSTALL_IDLE: Duration = Duration::from_secs(30);
+
+/// The snapshots a replica streams, as leader, and stages, as follower.
+#[derive(Default)]
+pub(super) struct Snapshots {
+    /// The snapshot streams this replica runs as leader, by follower.
+    pub(super) shipments: HashMap<NodeNumber, Shipment>,
+    /// The snapshot this replica stages, from the leader it follows.
+    pub(super) install: Option<Install>,
+    /// The programs a staged snapshot waits for before its switch.
+    pub(super) missing: Vec<[u8; 32]>,
+    /// Snapshot chunks taken this round, staged once it is processed.
+    pub(super) chunks: VecDeque<(NodeNumber, SnapshotChunk)>,
+}
 
 /// A snapshot stream this replica runs to a follower, as leader.
 pub(super) struct Shipment {
@@ -76,22 +89,24 @@ impl Driver {
     pub(super) fn settle_streams(&mut self) {
         let core = &self.core;
         let mut unswitched = Vec::new();
-        let before = self.shipments.len();
-        self.shipments.retain(|to, shipment| match shipment.staged {
-            Some(staged) => {
-                let switched = core.match_index(*to).unwrap_or(0) >= shipment.index;
-                let held = !switched && staged.elapsed() < STREAM_HOLD;
-                if !switched && !held {
-                    unswitched.push(*to);
+        let before = self.snapshots.shipments.len();
+        self.snapshots
+            .shipments
+            .retain(|to, shipment| match shipment.staged {
+                Some(staged) => {
+                    let switched = core.match_index(*to).unwrap_or(0) >= shipment.index;
+                    let held = !switched && staged.elapsed() < STREAM_HOLD;
+                    if !switched && !held {
+                        unswitched.push(*to);
+                    }
+                    held
                 }
-                held
-            }
-            None => true,
-        });
+                None => true,
+            });
         for to in unswitched {
             self.core.snapshot_failed(to);
         }
-        if self.shipments.len() < before {
+        if self.snapshots.shipments.len() < before {
             self.compact_due = true;
         }
     }
@@ -109,7 +124,13 @@ impl Driver {
             self.inner.settings.compact_tail,
             self.inner.settings.compact_tail_bytes,
         );
-        if let Some(lowest) = self.shipments.values().map(|shipment| shipment.index).min() {
+        if let Some(lowest) = self
+            .snapshots
+            .shipments
+            .values()
+            .map(|shipment| shipment.index)
+            .min()
+        {
             point = point.min(lowest);
         }
         if point <= self.core.status().snap_last_index {
@@ -149,7 +170,7 @@ impl Driver {
     /// in effect there. One stream per follower: the core asks again while
     /// one runs, and is not heard.
     pub(super) fn send_snapshot(&mut self, to: NodeNumber) {
-        if self.shipments.contains_key(&to) {
+        if self.snapshots.shipments.contains_key(&to) {
             return;
         }
         let export = match self.inner.store.export(self.shared.agent) {
@@ -178,7 +199,7 @@ impl Driver {
         let term = self.core.status().current_term;
         let index = export.applied;
         let (acks, acked) = smol::channel::unbounded();
-        self.shipments.insert(
+        self.snapshots.shipments.insert(
             to,
             Shipment {
                 term,
@@ -187,7 +208,7 @@ impl Driver {
                 staged: None,
             },
         );
-        self.inner.streamed.fetch_add(1, Ordering::Relaxed);
+        self.inner.counters.streamed.fetch_add(1, Ordering::Relaxed);
         let inner = Arc::clone(&self.inner);
         let shared = Arc::clone(&self.shared);
         let agent = self.shared.agent;
@@ -210,14 +231,15 @@ impl Driver {
     /// node must halt.
     pub(super) async fn stage(&mut self) -> bool {
         if self.core.role() == Role::Leader {
-            self.chunks.clear();
+            self.snapshots.chunks.clear();
             self.abandon().await;
             return true;
         }
-        while let Some((from, chunk)) = self.chunks.pop_front() {
+        while let Some((from, chunk)) = self.snapshots.chunks.pop_front() {
             self.stage_chunk(from, chunk).await;
         }
         if self
+            .snapshots
             .install
             .as_ref()
             .is_some_and(|install| install.since.elapsed() >= INSTALL_IDLE)
@@ -228,7 +250,12 @@ impl Driver {
             );
             self.abandon().await;
         }
-        if self.install.as_ref().is_some_and(|install| install.staged) {
+        if self
+            .snapshots
+            .install
+            .as_ref()
+            .is_some_and(|install| install.staged)
+        {
             return self.switch().await;
         }
         true
@@ -242,6 +269,7 @@ impl Driver {
             return;
         }
         let current = self
+            .snapshots
             .install
             .as_ref()
             .map(|install| (install.term, install.index));
@@ -252,7 +280,12 @@ impl Driver {
         if current != Some(name) {
             // A snapshot staged whole switches, or is dropped once idle,
             // before a newer stream takes its place.
-            if self.install.as_ref().is_some_and(|install| install.staged) {
+            if self
+                .snapshots
+                .install
+                .as_ref()
+                .is_some_and(|install| install.staged)
+            {
                 return;
             }
             // A newer stream, from its first chunk: the follower wants that.
@@ -261,10 +294,12 @@ impl Driver {
                 return;
             }
             self.abandon().await;
-            let Some(epoch) = self.empty_epoch() else {
+            // Never one an earlier install left: that one is dropped in the
+            // background, and a stream does not wait for it.
+            let Some(epoch) = empty_epoch(&self.inner, self.shared.agent) else {
                 return;
             };
-            self.install = Some(Install {
+            self.snapshots.install = Some(Install {
                 term: chunk.term,
                 index: chunk.index,
                 snapshot_term: chunk.snapshot_term,
@@ -279,7 +314,7 @@ impl Driver {
                 since: Instant::now(),
             });
         }
-        let install = self.install.as_mut().expect("an install");
+        let install = self.snapshots.install.as_mut().expect("an install");
         if install.staged || chunk.sequence != install.next {
             let next = install.next;
             self.ack(from, name, next);
@@ -302,7 +337,7 @@ impl Driver {
             self.abandon().await;
             return;
         }
-        let install = self.install.as_mut().expect("an install");
+        let install = self.snapshots.install.as_mut().expect("an install");
         install.next += 1;
         install.since = Instant::now();
         install.staged = chunk.last;
@@ -314,12 +349,12 @@ impl Driver {
     /// rows, its last result and its programs' pins, once those programs
     /// are here.
     async fn switch(&mut self) -> bool {
-        let Some(install) = self.install.as_ref() else {
+        let Some(install) = self.snapshots.install.as_ref() else {
             return true;
         };
         let named: Vec<[u8; 32]> = install.programs.iter().copied().collect();
         let blobs = &self.inner.blobs;
-        self.install_missing = named
+        self.snapshots.missing = named
             .iter()
             .filter(|hash| !blobs.contains(hash).unwrap_or(false))
             .copied()
@@ -327,10 +362,10 @@ impl Driver {
         // Once every program is here, each is touched: it stays while the
         // switch comes to pin it, as the blob writer orders the touch with
         // a collection's removals. One removed meanwhile is wanted again.
-        if self.install_missing.is_empty() && !named.is_empty() {
+        if self.snapshots.missing.is_empty() && !named.is_empty() {
             match blobs.touch(named.clone()).await {
                 Ok(stored) => {
-                    self.install_missing = named
+                    self.snapshots.missing = named
                         .into_iter()
                         .filter(|hash| !stored.contains(hash))
                         .collect();
@@ -341,12 +376,12 @@ impl Driver {
                 }
             }
         }
-        if !self.install_missing.is_empty() {
+        if !self.snapshots.missing.is_empty() {
             self.inner
-                .want(self.shared.agent, &self.install_missing, Keep::Aged);
+                .want(self.shared.agent, &self.snapshots.missing, Keep::Aged);
             return true;
         }
-        let install = self.install.take().expect("an install");
+        let install = self.snapshots.install.take().expect("an install");
         let configuration =
             install
                 .manifest
@@ -372,7 +407,7 @@ impl Driver {
                     agent = self.shared.agent.0,
                     "the state before a switch is unreadable: {error}"
                 );
-                self.install = Some(install);
+                self.snapshots.install = Some(install);
                 return true;
             }
         };
@@ -390,21 +425,9 @@ impl Driver {
                 seed,
             });
         }
-        let agent = self.shared.agent;
-        changes.extend(
-            install
-                .programs
-                .difference(&before)
-                .map(|hash| Change::Pin { hash: *hash, agent }),
-        );
-        changes.extend(
-            before
-                .difference(&install.programs)
-                .map(|hash| Change::Unpin { hash: *hash, agent }),
-        );
+        changes.extend(pin_changes(self.shared.agent, &before, &install.programs));
         let applying = self.shared.applying.lock().await;
-        let unpinned = unpinned(&changes);
-        if let Err(error) = self.inner.storage.commit(changes).await {
+        if let Err(error) = self.inner.commit_unpinning(changes).await {
             drop(applying);
             // A failed flush may have written the switch: the staged epoch
             // may be the store's now, and is not to be dropped.
@@ -420,11 +443,10 @@ impl Driver {
                 agent = self.shared.agent.0,
                 "a snapshot switch was refused: {error}"
             );
-            self.install = Some(install);
+            self.snapshots.install = Some(install);
             self.abandon().await;
             return true;
         }
-        self.inner.evict(&unpinned);
         let index = install.index;
         self.core
             .snapshot_installed(index, install.snapshot_term, configuration);
@@ -447,25 +469,21 @@ impl Driver {
             };
         });
         drop(applying);
-        self.inner.installed.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .counters
+            .installed
+            .fetch_add(1, Ordering::Relaxed);
         self.drop_epoch(old_epoch);
         true
     }
 
     /// Drop the snapshot being staged, if any, in the background.
     async fn abandon(&mut self) {
-        let Some(install) = self.install.take() else {
+        let Some(install) = self.snapshots.install.take() else {
             return;
         };
-        self.install_missing.clear();
+        self.snapshots.missing.clear();
         self.drop_epoch(install.epoch);
-    }
-
-    /// An epoch past the current one that holds no rows, for a snapshot to
-    /// be staged under: one an earlier install left is being dropped in the
-    /// background, and a stream never waits for it.
-    fn empty_epoch(&self) -> Option<u8> {
-        empty_epoch(&self.inner, self.shared.agent)
     }
 
     /// Remove an epoch a switch, or an abandoned install, left behind, in
@@ -485,7 +503,6 @@ impl Driver {
     fn ack(&self, to: NodeNumber, (term, index): (u64, u64), next: u64) {
         self.inner.send(
             to,
-            Class::Consensus,
             &PeerMessage::SnapshotAck(SnapshotAck {
                 agent: self.shared.agent,
                 term,

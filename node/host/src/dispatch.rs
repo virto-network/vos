@@ -36,32 +36,58 @@ async fn take(arrivals: &Arrivals) -> Option<(Class, Incoming)> {
     if let Ok(incoming) = arrivals.consensus.try_recv() {
         return Some((Class::Consensus, incoming));
     }
-    let on = |class: Class, queue: &smol::channel::Receiver<Incoming>| {
-        let queue = queue.clone();
-        async move { queue.recv().await.ok().map(|incoming| (class, incoming)) }
-    };
-    on(Class::Consensus, &arrivals.consensus)
-        .or(on(Class::Requests, &arrivals.requests))
-        .or(on(Class::Bulk, &arrivals.bulk))
+    next(Class::Consensus, &arrivals.consensus)
+        .or(next(Class::Requests, &arrivals.requests))
+        .or(next(Class::Bulk, &arrivals.bulk))
         .await
 }
 
+/// The next arrival on `queue`, of `class`.
+async fn next(
+    class: Class,
+    queue: &smol::channel::Receiver<Incoming>,
+) -> Option<(Class, Incoming)> {
+    queue.recv().await.ok().map(|incoming| (class, incoming))
+}
+
 impl Inner {
-    pub(crate) fn send(&self, to: NodeNumber, class: Class, message: &PeerMessage) {
+    /// Send `message` to node `to`, on the class and the stream it travels
+    /// on. Refused, it is dropped, as the network may drop it.
+    pub(crate) fn send(&self, to: NodeNumber, message: &PeerMessage) {
         if let Some(network) = &self.network {
-            let _ = network.send(to, class, peer::stream(message), message.encode());
+            let _ = network.send(
+                to,
+                peer::class(message),
+                peer::stream(message),
+                message.encode(),
+            );
         }
     }
 
-    /// Give `agent`'s group `input`: dropped, and counted, when no group
-    /// here runs it or its inbox is full; the sender sends again.
-    fn to_group(&self, agent: AgentId, input: Input) {
+    /// Whether `from` replicates `agent`, as a node relaying, forwarding or
+    /// asking for the agent must: an arrival from any other node is
+    /// dropped, and counted.
+    pub(crate) fn admit(&self, agent: AgentId, from: NodeNumber) -> bool {
+        let known = self.directory.get(agent);
+        match peer::check_replica(known.as_ref().map(|known| &known.placement), from) {
+            Ok(()) => true,
+            Err(refusal) => {
+                self.drops.count(refusal);
+                false
+            }
+        }
+    }
+
+    /// Give `agent`'s group `input`: false, and counted, when no group here
+    /// runs it or its inbox is full; the sender sends again.
+    fn to_group(&self, agent: AgentId, input: Input) -> bool {
         let routed = self
             .run(agent)
             .is_some_and(|run| run.inbox.try_send(input).is_ok());
         if !routed {
             self.drops.count(peer::Refusal::Unrouted);
         }
+        routed
     }
 
     /// The leader `agent`'s replica here follows, and its term.
@@ -74,7 +100,7 @@ impl Inner {
     /// blob (hashed) and a creation record (committed) run in tasks of
     /// their own, so no group's consensus waits behind them.
     async fn arrive(self: &Arc<Self>, class: Class, incoming: Incoming) {
-        self.arrived[class as usize].fetch_add(1, Ordering::Relaxed);
+        self.counters.arrived[class as usize].fetch_add(1, Ordering::Relaxed);
         let Incoming {
             from,
             stream,
@@ -87,16 +113,12 @@ impl Inner {
                 return;
             }
         };
-        let space = self
-            .space
-            .as_ref()
-            .map(|space| space.numbers())
-            .unwrap_or_default();
         if matches!(
             message,
             PeerMessage::Blob { .. } | PeerMessage::Directory { .. }
         ) {
             let inner = Arc::clone(self);
+            let space = Arc::clone(&self.numbers);
             self.spawn(async move {
                 let checked = inner
                     .offload(move || {
@@ -122,7 +144,7 @@ impl Inner {
             });
             return;
         }
-        let checked = peer::check(&space, from, (class, stream), &message, |agent| {
+        let checked = peer::check(&self.numbers, from, (class, stream), &message, |agent| {
             self.followed(agent)
         });
         if let Err(refusal) = checked {
@@ -132,19 +154,13 @@ impl Inner {
         }
         match message {
             PeerMessage::Raft { agent, message } => {
-                let run = self.run(agent);
-                let routed = run.as_ref().is_some_and(|run| {
-                    run.inbox
-                        .try_send(Input::Raft {
-                            from,
-                            message: peer::from_wire(message),
-                        })
-                        .is_ok()
-                });
-                if !routed {
-                    // No group here, or its inbox is full: Raft sends again.
-                    self.drops.count(peer::Refusal::Unrouted);
-                    self.ask_for_record(from, agent, run.is_some());
+                let input = Input::Raft {
+                    from,
+                    message: peer::from_wire(message),
+                };
+                // No group here, or its inbox is full: Raft sends again.
+                if !self.to_group(agent, input) {
+                    self.ask_for_record(from, agent, self.run(agent).is_some());
                 }
             }
             PeerMessage::BlobRequest { agent, hashes } => self.serve_blobs(from, agent, hashes),
@@ -236,7 +252,7 @@ impl Inner {
                 let read = inner.offload(move || blobs.get(&hash)).await;
                 if let Some(Ok(Some(bytes))) = read {
                     // Refused, it is dropped: the replica asks again.
-                    inner.send(from, Class::Bulk, &PeerMessage::Blob { hash, bytes });
+                    inner.send(from, &PeerMessage::Blob { hash, bytes });
                 }
             }
         });

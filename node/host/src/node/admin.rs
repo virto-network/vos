@@ -135,7 +135,7 @@ impl Inner {
             )));
         }
         let mut next = self.next_agent.lock().await;
-        let agent = AgentId(u32::from(self.number) << 24 | *next);
+        let agent = CreationRecord::agent_id(self.number, *next);
         if *next >= 1 << 24 || agent == crate::store::NODE_AGENT {
             return Err(CallError::Failed(
                 "this node's agent ids are exhausted".into(),
@@ -184,11 +184,11 @@ impl Inner {
     ) -> Result<Answered, CallError> {
         // A follower refuses before deriving anything.
         self.settled(agent).await?;
-        let run = self.run(agent).ok_or_else(|| self.absent(agent))?;
+        let run = self.present(agent)?;
         if run.shared.state().role != Role::Leader {
             return Err(self.not_leader(&run.shared));
         }
-        let pool = Arc::clone(&self.pool);
+        let pool = Arc::clone(&self.machines.pool);
         let pooled = self
             .executors
             .run(move || {

@@ -19,13 +19,18 @@ use vos_wire::peer::{CreationRecord, NodeNumber, SnapshotAck, SnapshotChunk};
 use crate::blobs::Held;
 use crate::lock;
 
-pub(crate) use apply::{DryRun, apply, pinned, programs, unpinned};
+pub(crate) use apply::{DryRun, apply, pin_changes, pinned, programs};
 pub(crate) use driver::drive;
 pub(crate) use epochs::{drop_stale_epochs, empty_epoch};
 
 /// Where a proposal's answer goes: the index it took, or why not, and
 /// when the driver answered.
 pub(crate) type Proposed = smol::channel::Sender<(Result<u64, ProposeError>, Instant)>;
+/// Where a read index's answer goes.
+pub(crate) type ReadIndexed = smol::channel::Sender<Result<u64, ReadIndexError>>;
+/// Where a membership change's answer goes: the index of its joint
+/// configuration, or why not.
+pub(crate) type MembershipChanged = smol::channel::Sender<Result<u64, ChangeMembershipError>>;
 
 /// What a group hears from the network and the node: bounded, and
 /// dropped when full.
@@ -62,9 +67,7 @@ pub(crate) enum Local {
     Retire,
     /// A read index: an index to apply through before reading, once a
     /// quorum has confirmed this replica still leads.
-    ReadIndex {
-        answer: smol::channel::Sender<Result<u64, ReadIndexError>>,
-    },
+    ReadIndex { answer: ReadIndexed },
     /// Replace the group's members, `current` as the caller saw them, by
     /// `members`: answered with the index of the joint configuration,
     /// which the core finalizes once it commits; refused as in progress
@@ -72,7 +75,7 @@ pub(crate) enum Local {
     ChangeMembership {
         current: Vec<NodeNumber>,
         members: Vec<NodeNumber>,
-        answer: smol::channel::Sender<Result<u64, ChangeMembershipError>>,
+        answer: MembershipChanged,
     },
     /// `node` came back, by the pair heartbeat: a leader sends it a
     /// heartbeat at once ([`vos_raft::core::Core::probe`]).
@@ -88,6 +91,24 @@ pub(crate) enum Local {
         index: u64,
         done: bool,
     },
+}
+
+impl Local {
+    /// Answer that the group stopped, when it carries an answer.
+    fn refuse_stopped(self) {
+        match self {
+            Local::Propose { answer, .. } => {
+                let _ = answer.try_send((Err(ProposeError::Stopped), Instant::now()));
+            }
+            Local::ReadIndex { answer } => {
+                let _ = answer.try_send(Err(ReadIndexError::Stopped));
+            }
+            Local::ChangeMembership { answer, .. } => {
+                let _ = answer.try_send(Err(ChangeMembershipError::Stopped));
+            }
+            Local::Retire | Local::StreamEnded { .. } | Local::Probe(_) | Local::Wake => {}
+        }
+    }
 }
 
 /// How many results' outcomes a group remembers, for its leader loop to

@@ -50,6 +50,13 @@ fn keys_keep_their_bytes() {
         cat(&[&[0x00, 0x06, 0x0a, 0x0b, 0x0c, 0x0d], &at])
     );
     assert_eq!(keys::outbox_prefix(), [0x00, 0x06]);
+    assert_eq!(keys::outbox_to(agent), [0x00, 0x06, 0x0a, 0x0b, 0x0c, 0x0d]);
+    assert_eq!(
+        keys::outbox_entry(&keys::outbox(agent, sequence)),
+        Some((agent, sequence))
+    );
+    assert_eq!(keys::outbox_entry(&keys::outbox_to(agent)), None);
+    assert_eq!(keys::outbox_entry(&keys::pair_out(agent)), None);
     assert_eq!(keys::pair_out(agent), [0x00, 0x07, 0x0a, 0x0b, 0x0c, 0x0d]);
     assert_eq!(keys::acked(agent), [0x00, 0x08, 0x0a, 0x0b, 0x0c, 0x0d]);
     assert_eq!(keys::version(), [0x00, 0x09]);
@@ -103,6 +110,35 @@ fn keys_keep_their_bytes() {
         Some(ProgramHash([0xcc; 32]))
     );
     assert_eq!(keys::workflow_pins_entry(&keys::workflow(workflow)), None);
+}
+
+/// A sweep's rows: those due by its time, earliest first, as many as it
+/// lists, past a key under the index that names no row, and none past the
+/// index.
+#[test]
+fn a_sweep_lists_the_rows_due_by_its_time() {
+    let session = |id| Due::Session(SessionId(id));
+    let mut stray = keys::due_prefix();
+    stray.push(0xff);
+    let rows = [
+        keys::due(5, session(1)),
+        stray,
+        keys::due(7, Due::Workflow(WorkflowId(2))),
+        keys::due(9, session(3)),
+        keys::batch_time(),
+    ];
+    let due = |time, limit| keys::due_rows(rows.iter().map(Ok::<_, ()>), time, limit).unwrap();
+    assert_eq!(
+        due(8, 10),
+        [(5, session(1)), (7, Due::Workflow(WorkflowId(2)))]
+    );
+    assert_eq!(due(9, 1), [(5, session(1))]);
+    assert_eq!(due(4, 10), []);
+    assert_eq!(due(u64::MAX, 10).len(), 3, "none past the index");
+    assert_eq!(
+        keys::due_rows([Err::<Vec<u8>, _>("unread")], 9, 10),
+        Err("unread")
+    );
 }
 
 /// The keys of a table's and a committed map's rows, their builder's rows,

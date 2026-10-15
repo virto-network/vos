@@ -17,9 +17,10 @@ use vos_wire::ids::ProgramHash;
 use vos_wire::ingress::NodeId;
 use vos_wire::peer::{CreationRecord, Placement};
 
-use super::{Config, Directory, Error, Inner, Node, Peers, Run, Settings, Tasks};
+use super::{Config, Counters, Directory, Error, Inner, Node, Peers, Run, Settings, Tasks};
 use crate::blobs::Blobs;
 use crate::executor::Executors;
+use crate::pvm::Machines;
 use crate::storage::StorageThread;
 use crate::store::{Fjall, PersistMode};
 use crate::{lock, seed};
@@ -60,7 +61,7 @@ impl Node {
         batch.incarnation(incarnation);
         batch.commit(PersistMode::SyncAll)?;
         let node_id = NodeId(SigningKey::from_bytes(&secret).verifying_key().to_bytes());
-        let hex: String = node_id.0.iter().map(|byte| format!("{byte:02x}")).collect();
+        let hex = crate::hex(&node_id.0);
         std::fs::write(data.join(NODE_KEY), &hex)
             .map_err(|error| Error::Data(error.to_string()))?;
         let number = match &config.space {
@@ -136,23 +137,31 @@ impl Node {
         let next = records
             .iter()
             .filter(|record| CreationRecord::creator_of(record.agent) == number)
-            .map(|record| (record.agent.0 & 0x00ff_ffff) + 1)
+            .map(|record| CreationRecord::serial_of(record.agent) + 1)
             .max()
             .unwrap_or(1);
         let settings = Settings::of(&config);
         let inner = Arc::new(Inner {
             storage: StorageThread::spawn(store.clone(), Arc::clone(&config.hooks)),
             store,
+            machines: Machines {
+                program: Arc::new(program),
+                pool,
+                blobs: blobs.clone(),
+            },
             blobs,
             executors: Executors::spawn(config.executors),
-            pool,
-            program: Arc::new(program),
             program_hash,
             settings,
             hooks: config.hooks,
             clock: config.clock,
             node_id,
             number,
+            numbers: config
+                .space
+                .as_ref()
+                .map(|space| space.numbers().into())
+                .unwrap_or_default(),
             space: config.space,
             network,
             directory: Directory::default(),
@@ -168,16 +177,12 @@ impl Node {
             calls: crate::calls::Calls::default(),
             reads: crate::asking::Waits::default(),
             turn: AtomicU64::new(0),
-            sent_across: AtomicU64::new(0),
-            installed: AtomicU64::new(0),
-            streamed: AtomicU64::new(0),
+            counters: Counters::default(),
             stats: Arc::default(),
             closing: AtomicBool::new(false),
             retiring: Mutex::new(HashSet::new()),
             halted: AtomicBool::new(false),
             liveness: crate::liveness::Liveness::new(incarnation),
-            relayed: AtomicU64::new(0),
-            arrived: Default::default(),
         });
         for record in records {
             let agent = record.agent;
@@ -283,20 +288,14 @@ impl Node {
         let tasks = std::mem::take(&mut lock(&self.inner.tasks).list);
         let runs: Vec<Arc<Run>> = lock(&self.inner.runs).drain().map(|(_, run)| run).collect();
         for run in &runs {
-            run.agent.stop();
-            run.shared.stop();
-            run.inbox.close();
-            run.local.close();
+            run.close();
         }
         smol::block_on(async {
             for task in tasks {
                 task.cancel().await;
             }
             for run in runs {
-                let tasks = std::mem::take(&mut *lock(&run.tasks));
-                for task in tasks {
-                    task.await;
-                }
+                run.join().await;
             }
         });
         if let Some(stop) = self.stop.take() {
@@ -349,7 +348,7 @@ fn collect_blobs(inner: &Inner, stopped: &mpsc::Receiver<()>) {
 pub(super) fn write_token(path: &Path, token: &[u8; 32]) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    let hex: String = token.iter().map(|byte| format!("{byte:02x}")).collect();
+    let hex = crate::hex(token);
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)

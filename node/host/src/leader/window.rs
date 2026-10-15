@@ -17,12 +17,12 @@ pub(super) const BEHIND_EVERY: Duration = Duration::from_millis(100);
 /// What this leadership sent a target past its acknowledgement.
 pub(super) struct Window {
     /// The highest acknowledgement taken, from the queue or applied.
-    pub(super) acked: u64,
+    acked: u64,
     /// The last sequence the outbox holds for the target, as last read.
-    pub(super) last: u64,
+    last: u64,
     /// The sequences sent past `acked`, with their sizes.
-    pub(super) sent: VecDeque<(u64, usize)>,
-    pub(super) bytes: usize,
+    sent: VecDeque<(u64, usize)>,
+    bytes: usize,
     /// When the acknowledgement last moved, or the window last went again.
     since: Instant,
     /// How long after `since` it goes again.
@@ -31,7 +31,7 @@ pub(super) struct Window {
     round: Duration,
     /// Which replica of the target it goes through, when it goes through
     /// one: the same for a whole window, another each round.
-    pub(super) turn: u64,
+    turn: u64,
     /// When a receiver's `Behind` last sent it again.
     behind: Option<Instant>,
     /// A `Behind` came too soon after that: it sends again once
@@ -56,6 +56,28 @@ impl Window {
             behind: None,
             deferred: false,
         }
+    }
+
+    /// The outbox holds the target's messages through `last`.
+    pub(super) fn holds(&mut self, last: u64) {
+        self.last = self.last.max(last);
+    }
+
+    /// `sequence`, of `size`, sent past the acknowledgement.
+    pub(super) fn push(&mut self, sequence: u64, size: usize) {
+        self.sent.push_back((sequence, size));
+        self.bytes += size;
+    }
+
+    /// Whether the target acknowledged all the outbox holds for it, as
+    /// last read, and nothing waits for an acknowledgement.
+    pub(super) fn idle(&self) -> bool {
+        self.last <= self.acked && self.sent.is_empty()
+    }
+
+    /// The replica of the target it goes through.
+    pub(super) fn turn(&self) -> u64 {
+        self.turn
     }
 
     /// The last sequence sent, or acknowledged.
@@ -156,10 +178,9 @@ mod tests {
     /// holding through 5.
     fn window(sent: &[u64]) -> Window {
         let mut window = Window::new(2, 0, ROUND);
-        window.last = 5;
+        window.holds(5);
         for sequence in sent {
-            window.sent.push_back((*sequence, 10));
-            window.bytes += 10;
+            window.push(*sequence, 10);
         }
         window
     }
@@ -174,7 +195,7 @@ mod tests {
         assert!(window.behind(now));
         assert_eq!(window.through(), 2, "back to the acknowledgement");
         assert_eq!((window.bytes, window.turn, window.wait), (0, 0, ROUND));
-        window.sent.push_back((3, 10));
+        window.push(3, 10);
         assert!(!window.behind(now + BEHIND_EVERY / 2));
         assert_eq!(window.through(), 3, "a second one too soon waits");
         assert_eq!(window.deferred(), Some(now + BEHIND_EVERY));
@@ -191,8 +212,7 @@ mod tests {
         let mut window = window(&[3, 4, 5]);
         let now = Instant::now();
         assert!(window.behind(now));
-        window.sent.push_back((3, 10));
-        window.bytes += 10;
+        window.push(3, 10);
         assert!(!window.behind(now));
         assert!(window.deferred().is_some());
         window.ack(3);

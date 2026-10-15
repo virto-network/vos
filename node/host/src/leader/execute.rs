@@ -8,14 +8,15 @@ use smol::future::FutureExt;
 use vos_wire::batch::{Batch, Work};
 use vos_wire::keys;
 use vos_wire::records::unstored;
-use vos_wire::result::{InputRef, Run, Step, WorkResult, Write as StateWrite};
+use vos_wire::result::{Step, WorkResult, Write as StateWrite};
 
-use super::{Leader, Ran, leads};
+use super::{Leader, Ran, is_due, leads};
 use crate::blobs::{Held, Keep, blob_ref};
-use crate::fault::{Fault, ran};
-use crate::group::{DryRun, Local, Shared};
+use crate::fault::Fault;
+use crate::group::{DryRun, Local};
 use crate::node::Inner;
 use crate::pvm;
+use crate::stats::Histogram;
 use crate::store::{BlobRef, EntryKind, LARGE_RESULT, LogEntry, Snapshot};
 
 impl Leader {
@@ -23,8 +24,6 @@ impl Leader {
     /// result, and wait until this replica applied it.
     pub(super) async fn execute(
         &mut self,
-        inner: &Inner,
-        shared: &Shared,
         snapshot: Arc<Snapshot>,
         batch: Batch,
         blobs: Vec<BlobRef>,
@@ -32,29 +31,30 @@ impl Leader {
         let id = self.id;
         let started = Instant::now();
         let inputs = batch.inputs.len() as u64;
-        inner.stats.batch_inputs.record(inputs);
-        let (output, refine_gas, batch) = self.refine(inner, Arc::clone(&snapshot), batch).await?;
+        let stats = &self.inner.stats;
+        stats.batch_inputs.record(inputs);
+        let work = Arc::new(Work::Batch(batch));
+        let (output, refine_gas) = self
+            .refine(Arc::clone(&snapshot), Arc::clone(&work))
+            .await?;
         let result: WorkResult = pvm::decode(&output)?;
         // The inputs' steps' gas: a workflow's due step is no input's.
         let step_gas: u64 = result
             .steps
             .iter()
             .map(|step| match step {
-                Step::Ran(Run {
-                    input: InputRef::Due { .. },
-                    ..
-                }) => 0,
-                Step::Ran(run) => run.gas_used,
-                Step::Refused { .. } | Step::Swept { .. } => 0,
+                Step::Ran(run) if !is_due(step) => run.gas_used,
+                _ => 0,
             })
             .sum();
-        inner.stats.refine_gas.record(refine_gas / inputs.max(1));
-        inner.stats.step_gas.record(step_gas / inputs.max(1));
+        stats.refine_gas.record(refine_gas / inputs.max(1));
+        stats.step_gas.record(step_gas / inputs.max(1));
         // The dry run: a failure here isolates its input off the log. A
         // large result is stored meanwhile, as the blob its entry names.
         let (payload, writes, held) = if output.len() >= LARGE_RESULT {
-            let stored = store_result(inner, Arc::new(output.clone()));
-            let dried = self.dry_run(inner, shared, snapshot, batch, output);
+            let output = Arc::new(output);
+            let stored = store_result(&self.inner, Arc::clone(&output));
+            let dried = self.dry_run(snapshot, work, output);
             let (stored, writes) = smol::future::zip(stored, dried).await;
             let (blob, held) = stored?;
             let entry = LogEntry {
@@ -72,9 +72,7 @@ impl Leader {
                 body: output,
             };
             let payload = entry.payload();
-            let writes = self
-                .dry_run(inner, shared, snapshot, batch, entry.body)
-                .await?;
+            let writes = self.dry_run(snapshot, work, Arc::new(entry.body)).await?;
             (payload, writes, None)
         };
         let version = writes
@@ -90,7 +88,7 @@ impl Leader {
                 self.version
             )));
         }
-        inner.keep_dry_run(
+        self.inner.keep_dry_run(
             id,
             DryRun {
                 applied: self.applied,
@@ -102,7 +100,7 @@ impl Leader {
         let (answer, answered) = smol::channel::bounded(1);
         let term = self.term;
         let proposing = Instant::now();
-        let proposed = inner.propose(
+        let proposed = self.inner.propose(
             id,
             Local::Propose {
                 term,
@@ -116,19 +114,16 @@ impl Leader {
         }
         let answer = async { Some(answered.recv().await) };
         let stopped = async {
-            shared.wait(|state| state.stopped).await;
+            self.shared.wait(|state| state.stopped).await;
             None
         };
         let (index, taken) = match answer.or(stopped).await {
             Some(Ok((Ok(index), taken))) => (index, taken),
             _ => return Ok(Ran::Lost),
         };
-        inner
-            .stats
-            .propose
-            .took(taken.saturating_duration_since(proposing));
-        inner.stats.resume.took(taken.elapsed());
-        let state = shared
+        stats.ran(&stats.propose, proposing, taken);
+        let state = self
+            .shared
             .wait(|state| state.stopped || !leads(state, term) || state.commit >= index)
             .await;
         if state.commit < index {
@@ -138,114 +133,103 @@ impl Leader {
         // saw them: the time this task took to be polled again is the
         // runtime's, apart.
         let committed = state.commit_at.unwrap_or_else(Instant::now);
-        inner
-            .stats
-            .commit
-            .took(committed.saturating_duration_since(taken));
-        inner.stats.resume.took(committed.elapsed());
-        let state = shared
+        stats.ran(&stats.commit, taken, committed);
+        let state = self
+            .shared
             .wait(|state| state.stopped || !leads(state, term) || state.applied >= index)
             .await;
         if state.applied < index {
             return Ok(Ran::Lost);
         }
         let applied = state.applied_at.unwrap_or_else(Instant::now);
-        inner
-            .stats
-            .apply
-            .took(applied.saturating_duration_since(committed));
-        inner.stats.resume.took(applied.elapsed());
-        inner.stats.batch.took(started.elapsed());
+        stats.ran(&stats.apply, committed, applied);
+        stats.batch.took(started.elapsed());
         // The entry at its index is this leader's, of its term.
-        let ours = inner
+        let ours = self
+            .inner
             .store
-            .log_entry(id, index)
-            .map_err(|error| Fault::Infrastructure(error.to_string()))?
+            .log_entry(id, index)?
             .is_some_and(|entry| entry.term == term);
         if !ours {
             return Ok(Ran::Lost);
         }
         self.applied = index;
-        match shared.outcome(index) {
+        match self.shared.outcome(index) {
             Some(true) => Ok(Ran::Done(result)),
             _ => Ok(Ran::Skipped),
         }
     }
 
-    /// Refine `batch` on an executor, unless the refine hook fails it: its
-    /// output and gas, with the batch back for the dry run's hook.
+    /// Refine `work`, a batch's, on an executor, unless the refine hook
+    /// fails the batch: its output and gas.
     async fn refine(
         &self,
-        inner: &Inner,
         snapshot: Arc<Snapshot>,
-        batch: Batch,
-    ) -> Result<(Vec<u8>, u64, Batch), Fault> {
+        work: Arc<Work>,
+    ) -> Result<(Vec<u8>, u64), Fault> {
         let id = self.id;
-        let program = Arc::clone(&inner.program);
-        let pool = Arc::clone(&inner.pool);
-        let blobs = inner.blobs.clone();
-        let hooks = Arc::clone(&inner.hooks);
-        let gas = inner.settings.refine_gas;
-        let queued = Instant::now();
-        let refined = inner
-            .executors
-            .run(move || {
-                let running = Instant::now();
-                if hooks.fail_refine(id, &batch) {
-                    let failed = Err(Fault::Agent("a hook failed the refine".into()));
-                    return (failed, [queued, running, Instant::now()]);
-                }
-                let work = Work::Batch(batch);
-                let output = pvm::refine(&program, &pool, &blobs, snapshot, id, &work, gas);
-                let Work::Batch(batch) = work else {
-                    unreachable!("a batch's work")
-                };
-                let output = output.map(|(output, gas)| (output, gas, batch));
-                (output, [queued, running, Instant::now()])
-            })
-            .await;
-        ran(refined.map(|(output, [queued, running, finished])| {
-            inner.stats.refine_queue.took(running - queued);
-            inner.stats.refine.took(finished - running);
-            inner.stats.resume.took(finished.elapsed());
-            output
-        }))
+        let hooks = Arc::clone(&self.inner.hooks);
+        let machines = self.inner.machines.clone();
+        let gas = self.inner.settings.refine_gas;
+        let stats = &self.inner.stats;
+        self.timed(&stats.refine_queue, &stats.refine, move || {
+            if hooks.fail_refine(id, batch(&work)) {
+                return Err(Fault::Agent("a hook failed the refine".into()));
+            }
+            machines.refine(snapshot, id, &work, gas)
+        })
+        .await
     }
 
     /// Accumulate `result` on `snapshot` on an executor, unless the dry
-    /// run's hook fails `batch`: the writes applying it would make.
+    /// run's hook fails `work`'s batch: the writes applying it would make.
     async fn dry_run(
         &self,
-        inner: &Inner,
-        shared: &Shared,
         snapshot: Arc<Snapshot>,
-        batch: Batch,
-        result: Vec<u8>,
+        work: Arc<Work>,
+        result: Arc<Vec<u8>>,
     ) -> Result<Vec<StateWrite>, Fault> {
         let id = self.id;
-        let program = Arc::clone(&inner.program);
-        let hooks = Arc::clone(&inner.hooks);
-        let gas = shared.record.accumulate_gas;
+        let hooks = Arc::clone(&self.inner.hooks);
+        let machines = self.inner.machines.clone();
+        let gas = self.shared.record.accumulate_gas;
+        let stats = &self.inner.stats;
+        self.timed(&stats.dry_run_queue, &stats.dry_run, move || {
+            if hooks.fail_dry_run(id, batch(&work)) {
+                return Err(Fault::Agent("a hook failed accumulate".into()));
+            }
+            machines.accumulate(snapshot, id, Arc::unwrap_or_clone(result), gas)
+        })
+        .await
+    }
+
+    /// Run `work` on an executor: its wait for one recorded in `queue`, and
+    /// its run in `stage`.
+    async fn timed<T: Send + 'static>(
+        &self,
+        queue: &Histogram,
+        stage: &Histogram,
+        work: impl FnOnce() -> Result<T, Fault> + Send + 'static,
+    ) -> Result<T, Fault> {
         let queued = Instant::now();
-        let dried = inner
+        let (output, running, finished) = self
+            .inner
             .executors
             .run(move || {
                 let running = Instant::now();
-                if hooks.fail_dry_run(id, &batch) {
-                    let failed = Err(Fault::Agent("a hook failed accumulate".into()));
-                    return (failed, [queued, running, Instant::now()]);
-                }
-                let writes = pvm::accumulate(&program, snapshot, id, result, gas);
-                (writes, [queued, running, Instant::now()])
+                let output = work();
+                (output, running, Instant::now())
             })
-            .await;
-        ran(dried.map(|(writes, [queued, running, finished])| {
-            inner.stats.dry_run_queue.took(running - queued);
-            inner.stats.dry_run.took(finished - running);
-            inner.stats.resume.took(finished.elapsed());
-            writes
-        }))
+            .await?;
+        queue.took(running - queued);
+        self.inner.stats.ran(stage, running, finished);
+        output
     }
+}
+
+/// The batch `work` carries.
+fn batch(work: &Work) -> &Batch {
+    work.batch().expect("a batch's work")
 }
 
 /// Store a large work result as a blob, hashed on an executor, held until
@@ -254,7 +238,7 @@ impl Leader {
 /// horizon.
 async fn store_result(inner: &Inner, result: Arc<Vec<u8>>) -> Result<(BlobRef, Held), Fault> {
     let hashed = Arc::clone(&result);
-    let blob = ran(inner.executors.run(move || Ok(blob_ref(&hashed))).await)?;
+    let blob = inner.executors.run(move || blob_ref(&hashed)).await?;
     let held = inner.blobs.hold(blob.hash);
     inner
         .blobs

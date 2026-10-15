@@ -108,7 +108,7 @@ impl AgentPrograms {
         if program.is_none() {
             tracing::warn!(
                 agent = self.agent.0,
-                program = %hex_prefix(hash),
+                program = %crate::hex(&hash[..4]),
                 "a program of the agent's is not stored"
             );
         }
@@ -126,18 +126,55 @@ impl ProgramSource for AgentPrograms {
     }
 }
 
-/// Run the agent's refine on `work` for `agent` with `gas`, and a batch's
-/// decoding beyond it (`defaults::refine_start`): its output, if it halts,
-/// and the gas the run used.
-pub(crate) fn refine(
-    program: &OuterMachines,
-    pool: &Arc<MachinePool>,
-    blobs: &Blobs,
+/// What runs the agent program: its machines, the pool of the programs
+/// agents install, and the blob store those come from. Cheap to clone, for
+/// an executor's job.
+#[derive(Clone)]
+pub(crate) struct Machines {
+    pub(crate) program: Arc<OuterMachines>,
+    pub(crate) pool: Arc<MachinePool>,
+    pub(crate) blobs: Blobs,
+}
+
+impl Machines {
+    /// Run the agent's refine on `work` for `agent` with `gas`, and a
+    /// batch's decoding beyond it (`defaults::refine_start`): its output,
+    /// if it halts, and the gas the run used.
+    pub(crate) fn refine(
+        &self,
+        snapshot: Arc<Snapshot>,
+        agent: AgentId,
+        work: &Work,
+        gas: u64,
+    ) -> Result<(Vec<u8>, u64), Fault> {
+        refine(self, snapshot, agent, work, gas)
+    }
+
+    /// Run the agent's accumulate on one work result: the writes to apply,
+    /// one per key, if it halts.
+    pub(crate) fn accumulate(
+        &self,
+        snapshot: Arc<Snapshot>,
+        agent: AgentId,
+        result: Vec<u8>,
+        gas: u64,
+    ) -> Result<Vec<Write>, Fault> {
+        accumulate(&self.program, snapshot, agent, result, gas)
+    }
+}
+
+fn refine(
+    machines: &Machines,
     snapshot: Arc<Snapshot>,
     agent: AgentId,
     work: &Work,
     gas: u64,
 ) -> Result<(Vec<u8>, u64), Fault> {
+    let Machines {
+        program,
+        pool,
+        blobs,
+    } = machines;
     let arguments = RefineArgs::new(u64::from(agent.0), work.encode(), [0; 32]).encode();
     let gas = match work.batch() {
         Some(batch) => gas + defaults::refine_start(batch.inputs.len(), arguments.len()),
@@ -178,11 +215,6 @@ pub(crate) fn refine(
     output.map(|output| (output, used))
 }
 
-/// A hash's first bytes, for a log line.
-fn hex_prefix(hash: &[u8; 32]) -> String {
-    hash[..4].iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
 /// The calls refine leaves to the node: `historical_lookup` from the
 /// agent's programs ([`serve_lookup`]), and the agent's report of lost
 /// state, which stops the refine; every other answers `WHAT`.
@@ -216,15 +248,20 @@ impl ServiceStorage for Overlay {
     }
 
     fn write(&mut self, key: &[u8], value: Option<&[u8]>) -> Option<usize> {
-        let previous = self.read(key).map(|value| value.len());
+        let previous = match self.written.get(key) {
+            Some(value) => value.as_ref().map(Vec::len),
+            None => self
+                .snapshot
+                .get(self.agent, key)
+                .expect("a store read")
+                .map(|value| value.len()),
+        };
         self.written.insert(key.to_vec(), value.map(<[u8]>::to_vec));
         previous
     }
 }
 
-/// Run the agent's accumulate on one work result: the writes to apply,
-/// one per key, if it halts.
-pub(crate) fn accumulate(
+fn accumulate(
     program: &OuterMachines,
     snapshot: Arc<Snapshot>,
     agent: AgentId,

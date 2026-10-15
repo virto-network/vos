@@ -5,7 +5,6 @@ use std::collections::VecDeque;
 
 use vos_raft::core::Write;
 
-use super::to_store;
 use crate::store::NodeNumber;
 
 /// The entry reports one replica owes its core: its writes in order, each
@@ -46,27 +45,28 @@ impl EntryReports {
             .is_some_and(|pending| pending.seq == RECOVERED)
     }
 
-    /// `write` is durable. A truncation in it drops the waits of the
+    /// `write` is durable, its entries naming the blobs `named` lists
+    /// ([`super::named`]). A truncation in it drops the waits of the
     /// entries it removed, from earlier writes too. `stored` answers from a
-    /// [`Blobs::touch`] of the write's blobs, so none of them is collected
+    /// [`crate::blobs::Blobs::touch`] of the write's blobs, so none of them is collected
     /// while the entry comes to rely on it.
-    pub fn written(&mut self, write: &Write<NodeNumber>, stored: impl Fn(&[u8; 32]) -> bool) {
+    pub fn written(
+        &mut self,
+        write: &Write<NodeNumber>,
+        named: Vec<(u64, Vec<[u8; 32]>)>,
+        stored: impl Fn(&[u8; 32]) -> bool,
+    ) {
         if let Some(after) = write.truncate_after {
             for pending in &mut self.pending {
                 pending.waiting.retain(|(index, _)| *index <= after);
             }
         }
-        let waiting = write
-            .entries
-            .iter()
-            .filter_map(|entry| {
-                let missing: Vec<[u8; 32]> = to_store(entry)
-                    .blobs
-                    .iter()
-                    .map(|blob| blob.hash)
-                    .filter(|hash| !stored(hash))
-                    .collect();
-                (!missing.is_empty()).then_some((entry.index, missing))
+        let waiting = named
+            .into_iter()
+            .filter_map(|(index, blobs)| {
+                let missing: Vec<[u8; 32]> =
+                    blobs.into_iter().filter(|hash| !stored(hash)).collect();
+                (!missing.is_empty()).then_some((index, missing))
             })
             .collect();
         self.pending.push_back(Pending {

@@ -1,7 +1,7 @@
 //! The leader's sweep of its agent's due index: expired sessions, and
 //! workflows' steps.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use vos_wire::ids::AgentId;
 use vos_wire::keys::Due;
@@ -9,7 +9,6 @@ use vos_wire::{defaults, keys};
 
 use super::Leader;
 use crate::fault::{Fault, read};
-use crate::node::Inner;
 use crate::store::Snapshot;
 
 /// How often an idle leader looks again at its first due row: a clock
@@ -19,11 +18,29 @@ const SWEEP_RECHECK: Duration = Duration::from_secs(5);
 /// place.
 const SWEEP_PAUSE: Duration = Duration::from_secs(60);
 
+/// The leader's last sweeps, which pace its next.
+#[derive(Default)]
+pub(super) struct Sweeps {
+    /// The first row of the due index when the last sweep applied, or
+    /// failed alone, and when.
+    swept: Option<((u64, Due), Instant)>,
+    /// That a sweep left its first due row in place, said once.
+    stuck: bool,
+}
+
+impl Sweeps {
+    /// A sweep that found `first` the first row of the due index applied,
+    /// or failed alone: the next waits while it left that row in place.
+    pub(super) fn swept(&mut self, first: (u64, Due)) {
+        self.swept = Some((first, Instant::now()));
+    }
+}
+
 impl Leader {
     /// How long until an idle leader sweeps, or looks again: zero when a
     /// sweep is due now, none when the agent holds no session.
-    pub(super) fn sweep_wait(&mut self, inner: &Inner) -> Option<Duration> {
-        let snapshot = inner.store.snapshot();
+    pub(super) fn sweep_wait(&mut self) -> Option<Duration> {
+        let snapshot = self.inner.store.snapshot();
         let first = match first_due(&snapshot, self.id) {
             Ok(Some(first)) => first,
             Ok(None) => return None,
@@ -33,11 +50,11 @@ impl Leader {
             .ok()
             .flatten()
             .unwrap_or(0);
-        let now = (inner.clock)().max(floor);
+        let now = (self.inner.clock)().max(floor);
         if self.sweeps(first, now) {
             return Some(Duration::ZERO);
         }
-        let wait = match self.swept {
+        let wait = match self.sweeps.swept {
             // Paused on this row: until the pause ends.
             Some((left, at)) if left == first && first.0 <= now => {
                 SWEEP_PAUSE.saturating_sub(at.elapsed())
@@ -54,10 +71,11 @@ impl Leader {
         if first.0 > time {
             return false;
         }
-        match self.swept {
+        let sweeps = &mut self.sweeps;
+        match sweeps.swept {
             Some((left, at)) if left == first && at.elapsed() < SWEEP_PAUSE => {
-                if !self.stuck {
-                    self.stuck = true;
+                if !sweeps.stuck {
+                    sweeps.stuck = true;
                     tracing::warn!(
                         agent = self.id.0,
                         "a sweep left its first due row in place; sweeps pause"
@@ -66,7 +84,7 @@ impl Leader {
                 false
             }
             _ => {
-                self.stuck = false;
+                sweeps.stuck = false;
                 true
             }
         }
@@ -89,23 +107,16 @@ pub(super) fn due_rows(
 }
 
 /// At most `limit` rows of `agent`'s due index due at `time`, earliest
-/// first; a key under the index that names no entry is passed over.
+/// first ([`keys::due_rows`]).
 fn due_rows_until(
     snapshot: &Snapshot,
     agent: AgentId,
     time: u64,
     limit: usize,
 ) -> Result<Vec<(u64, Due)>, Fault> {
-    let mut due = Vec::new();
-    for row in snapshot.scan(agent, &keys::due_prefix(), None) {
-        let (key, _) = row.map_err(|error| Fault::Infrastructure(error.to_string()))?;
-        let Some((at, entry)) = keys::due_entry(&key) else {
-            continue;
-        };
-        if at > time || due.len() == limit {
-            break;
-        }
-        due.push((at, entry));
-    }
-    Ok(due)
+    let prefix = keys::due_prefix();
+    let keys = snapshot
+        .scan(agent, &prefix, None)
+        .map(|row| row.map(|(key, _)| key));
+    Ok(keys::due_rows(keys, time, limit)?)
 }

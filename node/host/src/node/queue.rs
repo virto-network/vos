@@ -91,22 +91,27 @@ impl Pending {
         matches!(self, Pending::Message(_) | Pending::Failed(_))
     }
 
+    /// Answer the input's caller, when it has one.
+    pub(crate) fn answer(self, answered: Result<Answered, CallError>) {
+        if let Pending::Request { answer, .. } | Pending::Admin { answer, .. } = self {
+            let _ = answer.try_send(answered);
+        }
+    }
+
     /// Answer that this node does not lead, when the input has a caller.
     pub(crate) fn refuse(self, hint: &CallError) {
-        if let Pending::Request { answer, .. } | Pending::Admin { answer, .. } = self {
-            let _ = answer.try_send(Err(hint.clone()));
-        }
+        self.answer(Err(hint.clone()));
     }
 }
 
 #[derive(Default)]
 pub(crate) struct Queue {
     /// Each with when it was queued.
-    pub(crate) inputs: VecDeque<(Pending, Instant)>,
+    inputs: VecDeque<(Pending, Instant)>,
     /// Capped inputs queued.
-    pub(crate) capped: usize,
+    capped: usize,
     /// Messages from other agents queued.
-    pub(crate) from_agents: usize,
+    from_agents: usize,
     /// The agents that refused this agent's messages past a gap since the
     /// leader loop last looked: it sends them again.
     pub(crate) behind: BTreeSet<AgentId>,
@@ -122,6 +127,79 @@ pub(crate) struct Queue {
 }
 
 impl Queue {
+    /// Queue `pending` last, unless the queue holds `cap` of its kind
+    /// already: then false, and a message's sender is told once it has
+    /// room.
+    fn push_back(&mut self, pending: Pending, cap: usize) -> bool {
+        if pending.capped() && self.capped >= cap {
+            return false;
+        }
+        // Past the cap, the sender sends it again.
+        if pending.agents_sent() && self.from_agents >= cap {
+            if let Pending::Message(message) = &pending {
+                self.dropped.insert(message.from, cap);
+            }
+            return false;
+        }
+        if let Some(count) = self.count_of(&pending) {
+            *count += 1;
+        }
+        self.inputs.push_back((pending, Instant::now()));
+        true
+    }
+
+    /// Put `inputs` back at the front, in order, as queued now.
+    fn push_front(&mut self, inputs: Vec<Pending>) {
+        for pending in inputs.into_iter().rev() {
+            if let Some(count) = self.count_of(&pending) {
+                *count += 1;
+            }
+            self.inputs.push_front((pending, Instant::now()));
+        }
+    }
+
+    /// The first input, with when it was queued, if it `fits`.
+    pub(crate) fn pop_front_if(
+        &mut self,
+        fits: impl FnOnce(&Pending) -> bool,
+    ) -> Option<(Pending, Instant)> {
+        if !fits(&self.inputs.front()?.0) {
+            return None;
+        }
+        let (pending, queued) = self.inputs.pop_front()?;
+        if let Some(count) = self.count_of(&pending) {
+            *count -= 1;
+        }
+        Some((pending, queued))
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.inputs.is_empty()
+    }
+
+    /// Every input, taken; the senders to send again, and to tell, are
+    /// forgotten.
+    fn take_all(&mut self) -> VecDeque<(Pending, Instant)> {
+        self.capped = 0;
+        self.from_agents = 0;
+        self.behind.clear();
+        self.dropped.clear();
+        std::mem::take(&mut self.inputs)
+    }
+
+    /// The count `pending` is in: of the inputs clients queued, or of the
+    /// messages other agents did. Acknowledgements and sweeps count in
+    /// neither.
+    fn count_of(&mut self, pending: &Pending) -> Option<&mut usize> {
+        if pending.capped() {
+            Some(&mut self.capped)
+        } else if pending.agents_sent() {
+            Some(&mut self.from_agents)
+        } else {
+            None
+        }
+    }
+
     /// The first senders whose messages it dropped full, as many as its
     /// room under `cap` fits a `window` of each's: to be told they are
     /// behind.
@@ -189,11 +267,7 @@ impl Agent {
         let dropped = {
             let mut queue = lock(&self.queue);
             queue.stopped = true;
-            queue.capped = 0;
-            queue.from_agents = 0;
-            queue.behind.clear();
-            queue.dropped.clear();
-            std::mem::take(&mut queue.inputs)
+            queue.take_all()
         };
         drop(dropped);
         let _ = self.wake.try_send(());
@@ -204,14 +278,24 @@ impl Agent {
         let refused = {
             let mut queue = lock(&self.queue);
             queue.leading = false;
-            queue.capped = 0;
-            queue.from_agents = 0;
-            queue.behind.clear();
-            queue.dropped.clear();
-            std::mem::take(&mut queue.inputs)
+            queue.take_all()
         };
         for (pending, _) in refused {
             pending.refuse(error);
+        }
+    }
+
+    /// Whether the leader loop takes inputs.
+    pub(crate) fn leading(&self) -> bool {
+        lock(&self.queue).leading
+    }
+
+    /// Put `inputs` back at the front of the queue, in order, as queued
+    /// now, unless the agent stopped.
+    pub(crate) fn requeue(&self, inputs: Vec<Pending>) {
+        let mut queue = lock(&self.queue);
+        if !queue.stopped {
+            queue.push_front(inputs);
         }
     }
 }
@@ -220,7 +304,7 @@ impl Inner {
     /// Queue `pending` for agent `id`, whose leader loop this node must
     /// run. Checked under the queue's lock, from any thread.
     pub(crate) fn push(&self, id: AgentId, pending: Pending) -> Result<(), CallError> {
-        let run = self.run(id).ok_or_else(|| self.absent(id))?;
+        let run = self.present(id)?;
         let mut queue = lock(&run.agent.queue);
         if queue.stopped || run.shared.state().stopped {
             return Err(CallError::Stopped);
@@ -229,23 +313,9 @@ impl Inner {
             drop(queue);
             return Err(self.not_leader(&run.shared));
         }
-        if pending.capped() {
-            if queue.capped >= self.settings.queue_cap {
-                return Err(CallError::Busy);
-            }
-            queue.capped += 1;
+        if !queue.push_back(pending, self.settings.queue_cap) {
+            return Err(CallError::Busy);
         }
-        // Past the cap, the sender sends it again.
-        if pending.agents_sent() {
-            if queue.from_agents >= self.settings.queue_cap {
-                if let Pending::Message(message) = &pending {
-                    queue.dropped.insert(message.from, self.settings.queue_cap);
-                }
-                return Err(CallError::Busy);
-            }
-            queue.from_agents += 1;
-        }
-        queue.inputs.push_back((pending, Instant::now()));
         drop(queue);
         let _ = run.agent.wake.try_send(());
         Ok(())
@@ -265,24 +335,6 @@ impl Inner {
         drop(queue);
         let _ = run.agent.wake.try_send(());
         true
-    }
-
-    /// Put inputs back at the front of agent `id`'s queue, in order, as
-    /// queued now.
-    pub(crate) fn requeue(&self, agent: &Agent, inputs: Vec<Pending>) {
-        let mut queue = lock(&agent.queue);
-        if queue.stopped {
-            return;
-        }
-        for pending in inputs.into_iter().rev() {
-            if pending.capped() {
-                queue.capped += 1;
-            }
-            if pending.agents_sent() {
-                queue.from_agents += 1;
-            }
-            queue.inputs.push_front((pending, Instant::now()));
-        }
     }
 }
 

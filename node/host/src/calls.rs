@@ -21,16 +21,15 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use vos_net::Class;
 use vos_wire::batch::Request;
-use vos_wire::ids::{AgentId, Principal, Session, SessionId};
+use vos_wire::ids::{AgentId, Principal, Session};
 use vos_wire::ingress::{Call, Rejection, Response};
 use vos_wire::peer::{NodeNumber, PeerMessage};
-use vos_wire::records::{SessionMark, unstored};
 use vos_wire::result::Outcome;
-use vos_wire::{Decode, defaults, keys};
+use vos_wire::{defaults, keys};
 
-use crate::asking::{Waits, pause};
+use crate::asking::{PAUSE, REASK, Waits, pause};
+use crate::fault::{Fault, read, session_mark};
 use crate::node::{Answered, CallError, Inner, Reply, Run};
 use crate::signature::signed;
 use crate::{lock, timeout};
@@ -38,11 +37,6 @@ use crate::{lock, timeout};
 /// How long a forwarded call may take: its re-forwards, and the wait for
 /// this replica's own apply.
 const FORWARDING: Duration = Duration::from_secs(30);
-/// How long a forward waits for its answer before it goes again.
-const REFORWARD: Duration = Duration::from_secs(2);
-/// How long a forwarder waits, for a change of leader, before it forwards
-/// again to a leader that could not take the call.
-const PAUSE: Duration = Duration::from_millis(100);
 /// Forwarded calls the leader runs at once for one forwarding replica.
 const FORWARDED: usize = 1024;
 
@@ -100,6 +94,20 @@ struct Applied {
     at: u64,
 }
 
+impl Applied {
+    /// The answer to a call at `sequence`, if the session consumed it: the
+    /// reply kept for it, or `TooOld` once the window let it go.
+    fn consumed(&mut self, sequence: u64) -> Option<Response> {
+        (sequence <= self.mark).then(|| match self.reply.take() {
+            Some(outcome) => Response::Ran {
+                outcome,
+                at: self.at,
+            },
+            None => Response::Rejected(Rejection::TooOld),
+        })
+    }
+}
+
 enum Next {
     Response(Response),
     Wait(smol::channel::Receiver<Response>),
@@ -109,6 +117,7 @@ enum Next {
 /// What a client is answered for the node's reply.
 pub(crate) fn answer_of(reply: Result<Answered, CallError>) -> Response {
     match reply {
+        Err(error) => error.into(),
         Ok(Answered {
             reply: Reply::Ran(outcome),
             at,
@@ -125,14 +134,22 @@ pub(crate) fn answer_of(reply: Result<Answered, CallError>) -> Response {
             reply: Reply::TooOld,
             ..
         }) => Response::Rejected(Rejection::TooOld),
-        Err(CallError::Failed(_)) => Response::Unavailable,
-        Err(CallError::Busy) => Response::Busy,
-        Err(CallError::NoAgent) => Response::NoAgent,
-        Err(CallError::Stopped) => Response::Stopped,
-        Err(CallError::NotLeader(leader)) => Response::NotLeader { leader },
-        Err(CallError::Elsewhere(replicas)) => Response::Elsewhere { replicas },
-        Err(CallError::Unconfirmed(agent)) => Response::Unconfirmed(agent),
-        Err(CallError::TimedOut) => Response::TimedOut,
+    }
+}
+
+/// What a client is answered when its call has no reply.
+impl From<CallError> for Response {
+    fn from(error: CallError) -> Self {
+        match error {
+            CallError::Failed(_) => Response::Unavailable,
+            CallError::Busy => Response::Busy,
+            CallError::NoAgent => Response::NoAgent,
+            CallError::Stopped => Response::Stopped,
+            CallError::NotLeader(leader) => Response::NotLeader { leader },
+            CallError::Elsewhere(replicas) => Response::Elsewhere { replicas },
+            CallError::Unconfirmed(agent) => Response::Unconfirmed(agent),
+            CallError::TimedOut => Response::TimedOut,
+        }
     }
 }
 
@@ -141,8 +158,9 @@ impl Inner {
     /// executor, then run here if this replica leads the agent, else
     /// forwarded to the leader.
     pub(crate) async fn client_call(self: &Arc<Self>, agent: AgentId, call: Call) -> Response {
-        let Some(run) = self.run(agent) else {
-            return answer_of(Err(self.absent(agent)));
+        let run = match self.present(agent) {
+            Ok(run) => run,
+            Err(error) => return error.into(),
         };
         let identity = run.shared.identity;
         let stats = Arc::clone(&self.stats);
@@ -160,9 +178,9 @@ impl Inner {
             None => return Response::Unavailable,
         };
         if let Err(error) = self.settled(agent).await {
-            return answer_of(Err(error));
+            return error.into();
         }
-        if lock(&run.agent.queue).leading {
+        if run.agent.leading() {
             self.lane_call(agent, call).await
         } else {
             self.forward(&run, agent, call).await
@@ -171,9 +189,9 @@ impl Inner {
 
     /// Run a call whose signature was checked in its lane: this replica
     /// must lead the agent, else the answer says where the leader is.
-    pub(crate) async fn lane_call(self: &Arc<Self>, agent: AgentId, call: Call) -> Response {
+    async fn lane_call(self: &Arc<Self>, agent: AgentId, call: Call) -> Response {
         if let Err(error) = self.leading(agent).await {
-            return answer_of(Err(error));
+            return error.into();
         }
         let mut confirmed = false;
         let next = loop {
@@ -185,7 +203,7 @@ impl Inner {
                     Rejection::Gap { .. } | Rejection::Ahead | Rejection::StaleSession { .. },
                 )) if !confirmed => {
                     if let Err(error) = self.read_index(agent).await {
-                        return answer_of(Err(error));
+                        return error.into();
                     }
                     confirmed = true;
                 }
@@ -194,11 +212,7 @@ impl Inner {
         };
         match next {
             Next::Response(answer) => answer,
-            Next::Wait(wait) => timeout(self.settings.answered, wait.recv())
-                .await
-                .map_or(Response::TimedOut, |answer| {
-                    answer.unwrap_or(Response::Stopped)
-                }),
+            Next::Wait(wait) => self.answered(wait).await,
             Next::Queue => {
                 let (session, sequence) = (call.session, call.sequence);
                 let request = Request {
@@ -218,13 +232,18 @@ impl Inner {
                     let settled = inner.queued_call(agent, session, sequence, running).await;
                     let _ = answered.try_send(settled);
                 });
-                timeout(self.settings.answered, answer.recv())
-                    .await
-                    .map_or(Response::TimedOut, |answer| {
-                        answer.unwrap_or(Response::Stopped)
-                    })
+                self.answered(answer).await
             }
         }
+    }
+
+    /// The answer `answer` gives, within the node's deadline.
+    async fn answered(&self, answer: smol::channel::Receiver<Response>) -> Response {
+        timeout(self.settings.answered, answer.recv())
+            .await
+            .map_or(Response::TimedOut, |answer| {
+                answer.unwrap_or(Response::Stopped)
+            })
     }
 
     /// The answer to a call its lane queued, once `running` ends; then
@@ -243,19 +262,10 @@ impl Inner {
             // lead, its state says whether the call ran after all.
             Response::NotConsumed => match self.read_index(agent).await {
                 Ok(_) => match self.applied_session(agent, &session, sequence) {
-                    Ok(Applied {
-                        mark,
-                        reply: Some(outcome),
-                        at,
-                        ..
-                    }) if sequence <= mark => Response::Ran { outcome, at },
-                    Ok(Applied { mark, .. }) if sequence <= mark => {
-                        Response::Rejected(Rejection::TooOld)
-                    }
-                    Ok(_) => Response::NotConsumed,
+                    Ok(mut applied) => applied.consumed(sequence).unwrap_or(Response::NotConsumed),
                     Err(answer) => answer,
                 },
-                Err(error) => answer_of(Err(error)),
+                Err(error) => error.into(),
             },
             answer => answer,
         };
@@ -284,15 +294,11 @@ impl Inner {
         let mut lanes = lock(&self.calls.lanes);
         // Read under the lock: an answered call's commit is durable before
         // its lane changes, so the mark read here includes it.
-        let Applied {
-            mark,
-            reply,
-            time,
-            at,
-        } = match self.applied_session(agent, &call.session, sequence) {
+        let mut applied = match self.applied_session(agent, &call.session, sequence) {
             Ok(applied) => applied,
             Err(answer) => return Next::Response(answer),
         };
+        let mark = applied.mark;
         let key = (agent, call.session);
         let lane = lanes.entry(key).or_default();
         lane.queued = lane.queued.max(mark);
@@ -300,7 +306,10 @@ impl Inner {
         // check: the client learns the time it should use. Only for a
         // session this leader holds nothing of: a call already queued was
         // timed when its batch formed, and a resend of it joins it.
-        if let Some(time) = time.filter(|_| lane.queued == 0 && lane.inflight.is_empty()) {
+        if let Some(time) = applied
+            .time
+            .filter(|_| lane.queued == 0 && lane.inflight.is_empty())
+        {
             let now = (self.clock)().max(time);
             if call.session.t0.abs_diff(now) > defaults::SESSION_SKEW_MS {
                 lanes.remove(&key);
@@ -309,11 +318,8 @@ impl Inner {
         }
         let next = if sequence == 0 {
             Next::Response(Response::Rejected(Rejection::Gap { expected: mark + 1 }))
-        } else if sequence <= mark {
-            Next::Response(match reply {
-                Some(outcome) => Response::Ran { outcome, at },
-                None => Response::Rejected(Rejection::TooOld),
-            })
+        } else if let Some(answer) = applied.consumed(sequence) {
+            Next::Response(answer)
         } else if sequence > mark + defaults::REPLY_WINDOW {
             Next::Response(Response::Rejected(Rejection::Ahead))
         } else if let Some(waiting) = lane.inflight.get_mut(&sequence) {
@@ -348,24 +354,16 @@ impl Inner {
         session: &Session,
         sequence: u64,
     ) -> Result<Applied, Response> {
+        let unavailable = |_: Fault| Response::Unavailable;
         let snapshot = self.store.snapshot();
         let at = snapshot
             .applied(agent)
             .map_err(|_| Response::Unavailable)?
             .unwrap_or(0);
-        let stored = |key: &[u8]| -> Result<Option<Vec<u8>>, Response> {
-            let bytes = snapshot
-                .get(agent, key)
-                .map_err(|_| Response::Unavailable)?;
-            Ok(bytes.and_then(|bytes| unstored(&bytes).map(<[u8]>::to_vec)))
-        };
-        let Some(id) = stored(&keys::session_index(session))?
-            .and_then(|bytes| SessionId::decode(&bytes).ok())
-            .map(|(id, _)| id)
-        else {
-            let time = stored(&keys::batch_time())?
-                .and_then(|bytes| u64::decode(&bytes).ok())
-                .map_or(0, |(time, _)| time);
+        let Some((id, mark)) = session_mark(&snapshot, agent, session).map_err(unavailable)? else {
+            let time = read::<u64>(&snapshot, agent, &keys::batch_time())
+                .map_err(unavailable)?
+                .unwrap_or(0);
             return Ok(Applied {
                 mark: 0,
                 reply: None,
@@ -373,13 +371,9 @@ impl Inner {
                 at,
             });
         };
-        let mark = stored(&keys::session(id))?
-            .and_then(|bytes| SessionMark::decode(&bytes).ok())
-            .map_or(0, |(mark, _)| mark.sequence);
+        let mark = mark.map_or(0, |mark| mark.sequence);
         let reply = if sequence <= mark {
-            stored(&keys::reply(id, sequence))?
-                .and_then(|bytes| Outcome::decode(&bytes).ok())
-                .map(|(outcome, _)| outcome)
+            read::<Outcome>(&snapshot, agent, &keys::reply(id, sequence)).map_err(unavailable)?
         } else {
             None
         };
@@ -412,7 +406,7 @@ impl Inner {
                 return Response::Stopped;
             }
             // This replica leads now: the call runs in its own lane.
-            if lock(&run.agent.queue).leading {
+            if run.agent.leading() {
                 return self.lane_call(agent, call).await;
             }
             // The leader this replica follows, or one named at a later term
@@ -438,7 +432,6 @@ impl Inner {
             sent += 1;
             self.send(
                 to,
-                Class::Requests,
                 &PeerMessage::Forward {
                     agent,
                     token: wait.token,
@@ -446,10 +439,7 @@ impl Inner {
                     call: call.clone(),
                 },
             );
-            match wait
-                .within(REFORWARD.min(left), run.shared.wait(changed))
-                .await
-            {
+            match wait.within(REASK.min(left), run.shared.wait(changed)).await {
                 // A node that leads at a later term than this replica
                 // knows, or knows who does: there, at once. One at an
                 // earlier term is behind: this replica waits for its own
@@ -499,7 +489,7 @@ impl Inner {
                 // the client may wait and send again. After that, an
                 // earlier send may be running elsewhere: wait here.
                 Some((_, Response::Busy)) if sent == 1 => return Response::Busy,
-                Some((_, Response::Busy)) => pause(run, REFORWARD, until, changed).await,
+                Some((_, Response::Busy)) => pause(run, REASK, until, changed).await,
                 // Answers that say the call did not run, about one send of
                 // several: another may still run it.
                 Some((
@@ -528,37 +518,24 @@ impl Inner {
         term: u64,
         call: Call,
     ) {
-        if let Err(refusal) = self.check_replica(agent, from) {
-            self.drops.count(refusal);
+        if !self.admit(agent, from) {
             return;
         }
         let Some(run) = self.run(agent) else {
             // No group here: the forwarder goes again soon, to whoever its
             // own core names.
-            self.send(
-                from,
-                Class::Requests,
-                &PeerMessage::Forwarded {
-                    agent,
-                    token,
-                    term: 0,
-                    answer: Response::NotLeader { leader: None },
-                },
-            );
+            self.answer_forward(from, agent, token, 0, Response::NotLeader { leader: None });
             return;
         };
         let state = run.shared.state();
         if state.term != term || state.role != vos_raft::Role::Leader {
             let leader = state.leader.and_then(|leader| self.contact(leader));
-            self.send(
+            self.answer_forward(
                 from,
-                Class::Requests,
-                &PeerMessage::Forwarded {
-                    agent,
-                    token,
-                    term: state.term,
-                    answer: Response::NotLeader { leader },
-                },
+                agent,
+                token,
+                state.term,
+                Response::NotLeader { leader },
             );
             return;
         }
@@ -572,16 +549,7 @@ impl Inner {
             running.len() < FORWARDED && running.insert(token)
         };
         if !admitted {
-            self.send(
-                from,
-                Class::Requests,
-                &PeerMessage::Forwarded {
-                    agent,
-                    token,
-                    term,
-                    answer: Response::Busy,
-                },
-            );
+            self.answer_forward(from, agent, token, term, Response::Busy);
             return;
         }
         let inner = Arc::clone(self);
@@ -594,16 +562,27 @@ impl Inner {
             let answer = inner.lane_call(agent, call).await;
             drop(running);
             let term = inner.run(agent).map_or(term, |run| run.shared.state().term);
-            inner.send(
-                from,
-                Class::Requests,
-                &PeerMessage::Forwarded {
-                    agent,
-                    token,
-                    term,
-                    answer,
-                },
-            );
+            inner.answer_forward(from, agent, token, term, answer);
         });
+    }
+
+    /// Answer node `from`'s call forwarded under `token`, as of `term`.
+    fn answer_forward(
+        &self,
+        from: NodeNumber,
+        agent: AgentId,
+        token: u64,
+        term: u64,
+        answer: Response,
+    ) {
+        self.send(
+            from,
+            &PeerMessage::Forwarded {
+                agent,
+                token,
+                term,
+                answer,
+            },
+        );
     }
 }

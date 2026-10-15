@@ -19,7 +19,6 @@ use vos_wire::ingress::{Consistency, Response, WorkflowStatus};
 use vos_wire::keys;
 use vos_wire::records::{Workflow, WorkflowHead, WorkflowState, unstored};
 
-use crate::calls::answer_of;
 use crate::node::Inner;
 use crate::store::Snapshot;
 use crate::timeout;
@@ -37,14 +36,11 @@ impl Inner {
         consistency: Consistency,
         wait: Duration,
     ) -> Response {
-        let Some(run) = self.run(agent) else {
-            return answer_of(Err(self.absent(agent)));
+        let run = match self.present(agent) {
+            Ok(run) => run,
+            Err(error) => return error.into(),
         };
-        let read = match consistency {
-            Consistency::Applied { at } => self.snapshot_through(&run, at).await,
-            Consistency::Linearizable => self.after_read_index(&run, agent).await,
-        };
-        let mut snapshot = match read {
+        let mut snapshot = match self.snapshot_at(&run, agent, consistency).await {
             Ok(snapshot) => Some(snapshot),
             Err(answer) => return answer,
         };

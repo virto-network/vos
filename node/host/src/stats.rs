@@ -113,6 +113,13 @@ pub(crate) fn stage(name: &str, histogram: &Histogram) -> Stage {
 }
 
 impl Stats {
+    /// A stage of a leader's batch, from `from` to `to`, and the leader
+    /// loop's wait since `to` to be polled again.
+    pub(crate) fn ran(&self, stage: &Histogram, from: Instant, to: Instant) {
+        stage.took(to.saturating_duration_since(from));
+        self.resume.took(to.elapsed());
+    }
+
     /// Its stages, and `more` after them.
     pub(crate) fn wire(&self, more: Vec<Stage>) -> Wire {
         let mut stages = vec![

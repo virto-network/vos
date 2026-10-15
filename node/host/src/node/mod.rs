@@ -24,7 +24,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use vos_net::Network;
-use vos_pvm::pool::{CodeHash, MachinePool, OuterMachines};
+use vos_pvm::pool::CodeHash;
 use vos_wire::batch::Request;
 use vos_wire::ids::{AgentId, ProgramHash};
 use vos_wire::ingress::{Contact, NodeId};
@@ -34,6 +34,7 @@ use crate::Hooks;
 use crate::blobs::{Blobs, Keep};
 use crate::executor::Executors;
 use crate::group::{self, DryRun, Input as GroupInput, Local, Shared};
+use crate::pvm::Machines;
 use crate::space::Space;
 use crate::storage::StorageThread;
 use crate::store::Fjall;
@@ -58,6 +59,29 @@ pub(crate) struct Run {
     tasks: Mutex<Vec<smol::Task<()>>>,
 }
 
+impl Run {
+    /// Stop the agent's leader after its batch in flight, and its group.
+    pub(crate) fn stop(&self) {
+        self.agent.stop();
+        self.shared.stop();
+    }
+
+    /// Stop it, and close its group's inboxes.
+    pub(crate) fn close(&self) {
+        self.stop();
+        self.inbox.close();
+        self.local.close();
+    }
+
+    /// Wait for its tasks to end.
+    pub(crate) async fn join(&self) {
+        let tasks = std::mem::take(&mut *lock(&self.tasks));
+        for task in tasks {
+            task.await;
+        }
+    }
+}
+
 /// How long a call waits for a new leader to apply what it took over.
 pub(crate) const CATCH_UP: Duration = Duration::from_secs(10);
 
@@ -73,8 +97,7 @@ pub(crate) struct Inner {
     pub(crate) blobs: Blobs,
     pub(crate) storage: StorageThread,
     pub(crate) executors: Executors,
-    pub(crate) pool: Arc<MachinePool>,
-    pub(crate) program: Arc<OuterMachines>,
+    pub(crate) machines: Machines,
     pub(crate) program_hash: ProgramHash,
     pub(crate) settings: Settings,
     pub(crate) hooks: Arc<dyn Hooks>,
@@ -83,6 +106,8 @@ pub(crate) struct Inner {
     /// This node's number in its space.
     pub(crate) number: NodeNumber,
     pub(crate) space: Option<Space>,
+    /// The numbers of its space's nodes: none in a space of one.
+    pub(crate) numbers: Arc<[NodeNumber]>,
     pub(crate) network: Option<Arc<dyn Network>>,
     /// Where each agent runs, and the placements this node sends.
     pub(crate) directory: Directory,
@@ -108,12 +133,7 @@ pub(crate) struct Inner {
     pub(crate) recording: smol::lock::Mutex<()>,
     /// Turns through an agent's replicas, for what goes to one of them.
     pub(crate) turn: AtomicU64,
-    /// Messages sent toward other nodes.
-    pub(crate) sent_across: AtomicU64,
-    /// Snapshots this node's groups switched to.
-    pub(crate) installed: AtomicU64,
-    /// Snapshot streams this node's groups started to their followers.
-    pub(crate) streamed: AtomicU64,
+    pub(crate) counters: Counters,
     /// How long its leaders' batches spend in each stage.
     pub(crate) stats: Arc<crate::stats::Stats>,
     /// The node is shutting down: no group starts or retires.
@@ -126,20 +146,32 @@ pub(crate) struct Inner {
     pub(crate) halted: AtomicBool,
     /// The pair heartbeat this node sends, and what it hears.
     pub(crate) liveness: crate::liveness::Liveness,
-    /// Messages relayed to their agent's leader.
-    pub(crate) relayed: AtomicU64,
-    /// Frames that arrived from other nodes, by class: every class but
-    /// liveness, which the pair heartbeat takes.
-    pub(crate) arrived: [AtomicU64; vos_net::Class::ALL.len()],
     /// Clients' calls: their lanes, and the calls forwarded both ways.
     pub(crate) calls: crate::calls::Calls,
     /// The read indexes this replica asked its leaders for.
     pub(crate) reads: crate::asking::Waits<Option<u64>>,
 }
 
+/// What the node counts, as [`Node`]'s getters report it.
+#[derive(Default)]
+pub(crate) struct Counters {
+    pub(crate) sent_across: AtomicU64,
+    pub(crate) installed: AtomicU64,
+    pub(crate) streamed: AtomicU64,
+    pub(crate) relayed: AtomicU64,
+    /// By class; none of liveness, which the pair heartbeat takes.
+    pub(crate) arrived: [AtomicU64; vos_net::Class::ALL.len()],
+}
+
 impl Inner {
     pub(crate) fn run(&self, id: AgentId) -> Option<Arc<Run>> {
         lock(&self.runs).get(&id).cloned()
+    }
+
+    /// Agent `id`'s replica here, or why a call to it cannot be served
+    /// here.
+    pub(crate) fn present(&self, id: AgentId) -> Result<Arc<Run>, CallError> {
+        self.run(id).ok_or_else(|| self.absent(id))
     }
 
     /// Why a call to `id` cannot be served here: a replica with no group
@@ -206,7 +238,7 @@ impl Inner {
     /// Applied that far, the replica's marks hold every request an earlier
     /// leader answered, so ingress reads no gap after one.
     pub(crate) async fn leading(&self, id: AgentId) -> Result<Arc<Run>, CallError> {
-        let run = self.run(id).ok_or_else(|| self.absent(id))?;
+        let run = self.present(id)?;
         let state = run.shared.state();
         if !state.stopped && !self.knows_leader(&run, &state) {
             self.settled(id).await?;
@@ -225,7 +257,7 @@ impl Inner {
         if run.shared.state().stopped || lock(&run.agent.queue).stopped {
             return Err(CallError::Stopped);
         }
-        if !lock(&run.agent.queue).leading {
+        if !run.agent.leading() {
             return Err(self.not_leader(&run.shared));
         }
         Ok(run)
@@ -235,7 +267,7 @@ impl Inner {
     /// election timeouts at most: a call to a group just created, or one
     /// electing, then goes where it should.
     pub(crate) async fn settled(&self, id: AgentId) -> Result<(), CallError> {
-        let run = self.run(id).ok_or_else(|| self.absent(id))?;
+        let run = self.present(id)?;
         let electing = run
             .shared
             .wait(|state| state.stopped || self.knows_leader(&run, state));
@@ -251,7 +283,7 @@ impl Inner {
     /// this replica's leader loop taking inputs.
     pub(crate) fn knows_leader(&self, run: &Run, state: &group::State) -> bool {
         match state.leader {
-            Some(leader) if leader == self.number => lock(&run.agent.queue).leading,
+            Some(leader) if leader == self.number => run.agent.leading(),
             Some(_) => true,
             None => false,
         }
@@ -263,7 +295,7 @@ impl Inner {
     pub(crate) fn evict(&self, unpinned: &[[u8; 32]]) {
         for hash in unpinned {
             match self.blobs.pinned_by_any(hash) {
-                Ok(false) => self.pool.uninstall(&CodeHash(*hash)),
+                Ok(false) => self.machines.pool.uninstall(&CodeHash(*hash)),
                 Ok(true) => {}
                 Err(error) => tracing::warn!("a pin read failed: {error}"),
             }
@@ -286,8 +318,7 @@ impl Inner {
         self.halted.store(true, Ordering::SeqCst);
         let runs: Vec<Arc<Run>> = lock(&self.runs).values().cloned().collect();
         for run in runs {
-            run.agent.stop();
-            run.shared.stop();
+            run.stop();
         }
     }
 
@@ -426,18 +457,23 @@ mod tests {
     use super::{Config, Node, Tasks};
     use std::sync::Arc;
 
+    /// The default agent program, linked.
+    fn agent_program() -> Vec<u8> {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../agent/default/target/riscv64em-vos/release/vos-agent.elf"
+        );
+        let elf = std::fs::read(path).expect("run `just build-agent`");
+        vos_pvm_compiler::link_elf_spi(&elf).expect("links")
+    }
+
     /// A node stopped while an executor runs a job holding its state (as
     /// a signature check did, and any job may) is gone once its stop
     /// returns, its store and the store's lock with it: it opens again on
     /// the same directory at once.
     #[test]
     fn a_node_stopped_while_a_job_holds_it_opens_again_at_once() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../agent/default/target/riscv64em-vos/release/vos-agent.elf"
-        );
-        let elf = std::fs::read(path).expect("run `just build-agent`");
-        let agent = vos_pvm_compiler::link_elf_spi(&elf).expect("links");
+        let agent = agent_program();
         let dir = tempfile::tempdir().unwrap();
         let node = Node::open(dir.path(), Config::new(agent.clone())).unwrap();
         let (started, start) = std::sync::mpsc::channel();
@@ -462,14 +498,8 @@ mod tests {
         use crate::group::empty_epoch;
         use crate::storage::Change;
         use vos_wire::ids::AgentId;
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../agent/default/target/riscv64em-vos/release/vos-agent.elf"
-        );
-        let elf = std::fs::read(path).expect("run `just build-agent`");
-        let agent_program = vos_pvm_compiler::link_elf_spi(&elf).expect("links");
         let dir = tempfile::tempdir().unwrap();
-        let node = Node::open(dir.path(), Config::new(agent_program)).unwrap();
+        let node = Node::open(dir.path(), Config::new(agent_program())).unwrap();
         let inner = &node.inner;
         let agent = AgentId(9);
         let commit = |change: Change| smol::block_on(inner.storage.commit(vec![change])).unwrap();

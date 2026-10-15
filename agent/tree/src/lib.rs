@@ -139,6 +139,17 @@ pub struct Leaf {
     pub value_hash: Hash,
 }
 
+impl Leaf {
+    /// The leaf of `value` at `key`, salted from `seed`.
+    pub fn salted<H: Hasher>(hasher: &H, seed: &[u8; 32], key: &[u8], value: &[u8]) -> Self {
+        let salt = salt(hasher, seed, key);
+        Self {
+            salt,
+            value_hash: value_hash(hasher, &salt, value),
+        }
+    }
+}
+
 /// Why a proof, or an update from one, was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {

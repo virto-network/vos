@@ -26,17 +26,15 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
-use std::time::Duration;
 
-use vos_tree::{
-    BatchProof, Blake2b, Child, Hash, Leaf, Node, NodeStore, empty_root, salt, value_hash,
-};
+use vos_tree::{BatchProof, Blake2b, Child, Hash, Leaf, Node, NodeStore, empty_root};
 use vos_wire::ids::{AgentId, MapId};
 use vos_wire::keys;
 use vos_wire::records::{unstored, unversioned};
 use vos_wire::result::Write;
 use vos_wire::{Decode, Encode, scale};
 
+use crate::Backoff;
 use crate::group::Shared;
 use crate::node::Inner;
 use crate::storage::Change;
@@ -567,18 +565,9 @@ impl Build {
                 *seeds.entry(version).or_insert(seed)
             }
         };
-        let salt = salt(&Blake2b, &seed, key);
-        Ok(Some(Leaf {
-            salt,
-            value_hash: value_hash(&Blake2b, &salt, value),
-        }))
+        Ok(Some(Leaf::salted(&Blake2b, &seed, key, value)))
     }
 }
-
-/// The first wait before a failed build is tried again, doubled each time
-/// up to [`MAX_BACKOFF`].
-const BACKOFF: Duration = Duration::from_millis(50);
-const MAX_BACKOFF: Duration = Duration::from_secs(5);
 
 /// Build `shared`'s agent's roots after its applies that leave dirty rows,
 /// until its group stops: one build at a time, each at the latest state
@@ -590,7 +579,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(5);
 pub(crate) async fn build(inner: Arc<Inner>, shared: Arc<Shared>) {
     let agent = shared.agent;
     let mut seen = None;
-    let mut backoff = BACKOFF;
+    let mut backoff = Backoff::default();
     // A build is due whatever the writer says: at the start, and after one
     // failed.
     let mut due = true;
@@ -606,17 +595,17 @@ pub(crate) async fn build(inner: Arc<Inner>, shared: Arc<Shared>) {
             continue;
         }
         match run(&inner, &shared).await {
-            Ok(()) => backoff = BACKOFF,
+            Ok(()) => backoff.reset(),
             // The new epoch's switch marks it dirty, and its state wakes
             // the next build.
             Err(Error::Moved) => {}
             Err(error) => {
+                let wait = backoff.next();
                 tracing::warn!(
                     agent = agent.0,
-                    "a root build failed ({error}); trying again in {backoff:?}"
+                    "a root build failed ({error}); trying again in {wait:?}"
                 );
-                crate::timeout(backoff, shared.wait(|state| state.stopped)).await;
-                backoff = (backoff * 2).min(MAX_BACKOFF);
+                crate::timeout(wait, shared.wait(|state| state.stopped)).await;
                 due = true;
             }
         }

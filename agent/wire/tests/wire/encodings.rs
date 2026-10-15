@@ -538,6 +538,16 @@ fn workflows_keep_their_bytes() {
     );
 }
 
+/// An agent's id is its creator's number over 24 bits of its serial.
+#[test]
+fn an_agent_id_holds_its_creator_and_serial() {
+    use vos_wire::peer::CreationRecord;
+    let agent = CreationRecord::agent_id(0x0a, 0x0b_0c0d);
+    assert_eq!(agent, AgentId(0x0a0b_0c0d));
+    assert_eq!(CreationRecord::creator_of(agent), 0x0a);
+    assert_eq!(CreationRecord::serial_of(agent), 0x0b_0c0d);
+}
+
 /// Every frame between nodes starts with its variant's index, the indexes
 /// running from 0 without a gap. A directory acknowledgement's order is
 /// its term, index and commitment, and a `Behind` names its pair alone.

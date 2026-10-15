@@ -194,7 +194,7 @@ async fn beat(inner: Arc<Inner>) -> Ended {
                 .map(|(leading, ..)| *leading)
                 .collect();
             for frame in frames(inner.liveness.incarnation, round, &listed, LISTED) {
-                inner.send(peer, Class::Liveness, &frame);
+                inner.send(peer, &frame);
             }
         }
         if round.is_multiple_of(100)

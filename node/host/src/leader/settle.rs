@@ -5,14 +5,14 @@ use std::collections::{BTreeSet, HashMap};
 
 use vos_wire::abi::Refusal;
 use vos_wire::batch::Request;
-use vos_wire::ids::{AgentId, SessionId};
+use vos_wire::ids::AgentId;
 use vos_wire::keys;
-use vos_wire::records::SessionMark;
-use vos_wire::result::{InputRef, Outcome, Run, Step, WorkResult};
+use vos_wire::result::{Outcome, Step, WorkResult};
 
-use super::{Leader, raise};
-use crate::fault::{Fault, read};
-use crate::node::{Agent, Answered, CallError, Inner, Pending, Reply};
+use super::{Leader, is_due};
+use crate::fault::{Fault, read, session_mark};
+use crate::node::{Answered, CallError, Pending, Reply};
+use crate::raise;
 use crate::store::Snapshot;
 
 impl Leader {
@@ -22,26 +22,16 @@ impl Leader {
     /// start or the sweep, pairs with no input.
     pub(super) fn dispatch(
         &mut self,
-        inner: &Inner,
-        agent: &Agent,
         pending: Vec<Pending>,
         result: &WorkResult,
         before: &Snapshot,
     ) {
-        let snapshot = inner.store.snapshot();
+        let snapshot = self.inner.store.snapshot();
         let mut acks: HashMap<AgentId, u64> = HashMap::new();
         let mut rest = Vec::new();
         let mut again = Vec::new();
         let mut acked = BTreeSet::new();
-        let mut steps = result.steps.iter().filter(|step| {
-            !matches!(
-                step,
-                Step::Ran(Run {
-                    input: InputRef::Due { .. },
-                    ..
-                })
-            )
-        });
+        let mut steps = result.steps.iter().filter(|step| !is_due(step));
         for item in pending {
             let Some(step) = steps.next() else {
                 rest.push(item);
@@ -68,12 +58,10 @@ impl Leader {
                     let at = self.applied;
                     let _ = answer.try_send(answered.map(|reply| Answered { reply, at }));
                 }
-                Pending::Admin { answer, .. } => {
-                    let _ = answer.try_send(Ok(Answered {
-                        reply: reply(step),
-                        at: self.applied,
-                    }));
-                }
+                admin @ Pending::Admin { .. } => admin.answer(Ok(Answered {
+                    reply: reply(step),
+                    at: self.applied,
+                })),
                 Pending::Sweep(_) => {}
                 Pending::Message(message) | Pending::Failed(message) => match step {
                     Step::Ran(_) => {
@@ -91,7 +79,7 @@ impl Leader {
                             Ok(mark) if message.sequence <= mark => {
                                 raise(&mut acks, message.from, mark);
                             }
-                            Ok(_) => inner.behind(message.from, self.id),
+                            Ok(_) => self.inner.behind(message.from, self.id),
                             Err(fault) => tracing::error!(
                                 agent = self.id.0,
                                 "a pair mark is unreadable: {}",
@@ -135,9 +123,9 @@ impl Leader {
                 }
             }
         }
-        inner.requeue(agent, rest);
+        self.agent.requeue(rest);
         for pending in again {
-            let _ = inner.push(self.id, pending);
+            let _ = self.inner.push(self.id, pending);
         }
         // The targets of new messages, and those whose acknowledgements
         // opened their windows.
@@ -152,18 +140,9 @@ impl Leader {
             .collect();
         targets.extend(acked);
         for to in targets {
-            if let Err(fault) = self.deliver(inner, &snapshot, to) {
-                // The outbox keeps them: the next send to `to`, or a
-                // restart, delivers them.
-                tracing::error!(
-                    agent = self.id.0,
-                    to = to.0,
-                    "delivery failed: {}",
-                    fault.message()
-                );
-            }
+            self.deliver(&snapshot, to);
         }
-        self.acknowledge(inner, acks);
+        self.acknowledge(acks);
     }
 
     /// The reply to `request`, refused out of its session's sequence, if it
@@ -174,12 +153,7 @@ impl Leader {
     /// replica applied the original, as a new leader's does while it
     /// catches up: this answers it.
     fn duplicate(&self, snapshot: &Snapshot, request: &Request) -> Result<Option<Reply>, Fault> {
-        let Some(id) =
-            read::<SessionId>(snapshot, self.id, &keys::session_index(&request.session))?
-        else {
-            return Ok(None);
-        };
-        let Some(mark) = read::<SessionMark>(snapshot, self.id, &keys::session(id))? else {
+        let Some((id, Some(mark))) = session_mark(snapshot, self.id, &request.session)? else {
             return Ok(None);
         };
         if request.sequence > mark.sequence {
@@ -191,7 +165,7 @@ impl Leader {
 }
 
 /// The reply a step gives its request.
-pub(crate) fn reply(step: &Step) -> Reply {
+fn reply(step: &Step) -> Reply {
     match step {
         Step::Ran(run) => Reply::Ran(run.outcome.clone()),
         Step::Refused { code, .. } => Reply::Refused(*code),

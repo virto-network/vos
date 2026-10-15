@@ -27,10 +27,7 @@ impl Driver {
     pub(super) async fn announce_placement(&mut self) {
         let status = self.core.status();
         let index = status.active_config_index.unwrap_or(0);
-        let mut replicas = status.members.clone();
-        replicas.extend(status.joint_old.iter().flatten().copied());
-        replicas.sort_unstable();
-        replicas.dedup();
+        let replicas = nodes(status.members, status.joint_old.clone());
         // The configuration before, or, once that is compacted away, the
         // log's first, which may be this one. It matters while a placement
         // is uncommitted, and names a leader the change removed, which
@@ -40,13 +37,7 @@ impl Driver {
         } else {
             self.core
                 .config_at(index - 1)
-                .map(|record| {
-                    let mut nodes = record.current;
-                    nodes.extend(record.joint_old.unwrap_or_default());
-                    nodes.sort_unstable();
-                    nodes.dedup();
-                    nodes
-                })
+                .map(|record| nodes(record.current, record.joint_old))
                 .unwrap_or_default()
         };
         let placement = Placement {
@@ -67,6 +58,15 @@ impl Driver {
         self.inner
             .spawn(async move { inner.place(agent, placement).await });
     }
+}
+
+/// The nodes of a configuration, both sets while it is joint, in order.
+fn nodes(members: Vec<NodeNumber>, joint_old: Option<Vec<NodeNumber>>) -> Vec<NodeNumber> {
+    let mut nodes = members;
+    nodes.extend(joint_old.unwrap_or_default());
+    nodes.sort_unstable();
+    nodes.dedup();
+    nodes
 }
 
 /// Whether `core` holds a committed configuration naming `me`.

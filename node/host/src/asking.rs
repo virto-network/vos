@@ -16,6 +16,12 @@ use crate::node::{Inner, Run};
 use crate::peer::Refusal;
 use crate::{lock, random_u64, timeout};
 
+/// How long an ask waits for its answer before it asks again.
+pub(crate) const REASK: Duration = Duration::from_secs(2);
+/// How long an ask waits, for a change of leader, before it asks again a
+/// leader that could not answer it.
+pub(crate) const PAUSE: Duration = Duration::from_millis(100);
+
 /// The asks of one kind waiting for their answers, `A`.
 pub(crate) struct Waits<A> {
     waiting: Mutex<HashMap<u64, (AgentId, smol::channel::Sender<A>)>>,
@@ -119,11 +125,7 @@ impl Inner {
         token: u64,
         answer: A,
     ) {
-        if let Err(refusal) = self.check_replica(agent, from) {
-            self.drops.count(refusal);
-            return;
-        }
-        if !waits.answer(agent, token, answer) {
+        if self.admit(agent, from) && !waits.answer(agent, token, answer) {
             self.drops.count(Refusal::Unmatched);
         }
     }

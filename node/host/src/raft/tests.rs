@@ -70,6 +70,16 @@ fn a_large_results_blob_weighs_in_its_payload() {
     assert_eq!(payload_weight(truncated), 20);
 }
 
+/// `reports` told `write` is durable, its entries naming the blobs their
+/// appends name.
+fn written(
+    reports: &mut EntryReports,
+    write: &Write<NodeNumber>,
+    stored: impl Fn(&[u8; 32]) -> bool,
+) {
+    reports.written(write, named(&changes(AGENT, write)), stored);
+}
+
 /// A Raft write of `entries` (index, blobs named), after `truncate`.
 fn write(seq: u64, truncate: Option<u64>, entries: &[(u64, &[[u8; 32]])]) -> Write<NodeNumber> {
     Write {
@@ -102,8 +112,8 @@ fn entry_reports_wait_for_blobs_in_write_order() {
     let stored = std::cell::RefCell::new(HashSet::new());
     let is_stored = |hash: &[u8; 32]| stored.borrow().contains(hash);
     let mut reports = EntryReports::default();
-    reports.written(&write(1, None, &[(1, &[[7; 32]])]), is_stored);
-    reports.written(&write(2, None, &[(2, &[])]), is_stored);
+    written(&mut reports, &write(1, None, &[(1, &[[7; 32]])]), is_stored);
+    written(&mut reports, &write(2, None, &[(2, &[])]), is_stored);
     assert_eq!(
         reports.ready(is_stored),
         None,
@@ -119,9 +129,13 @@ fn entry_reports_wait_for_blobs_in_write_order() {
 fn a_truncation_drops_the_waits_it_removes() {
     let is_stored = |_: &[u8; 32]| false;
     let mut reports = EntryReports::default();
-    reports.written(&write(1, None, &[(11, &[[7; 32]])]), is_stored);
+    written(
+        &mut reports,
+        &write(1, None, &[(11, &[[7; 32]])]),
+        is_stored,
+    );
     // A new leader replaces 11, with an entry naming no blob.
-    reports.written(&write(2, Some(10), &[(11, &[])]), is_stored);
+    written(&mut reports, &write(2, Some(10), &[(11, &[])]), is_stored);
     assert_eq!(reports.ready(is_stored), Some(2));
 }
 
@@ -129,8 +143,9 @@ fn a_truncation_drops_the_waits_it_removes() {
 fn every_awaited_blob_is_listed_and_a_switch_releases_its_waits() {
     let is_stored = |_: &[u8; 32]| false;
     let mut reports = EntryReports::default();
-    reports.written(&write(1, None, &[(1, &[[7; 32]])]), is_stored);
-    reports.written(
+    written(&mut reports, &write(1, None, &[(1, &[[7; 32]])]), is_stored);
+    written(
+        &mut reports,
         &write(2, None, &[(2, &[[8; 32], [7; 32]]), (3, &[[9; 32]])]),
         is_stored,
     );
@@ -231,7 +246,7 @@ fn recovered_entries_wait_for_their_blobs_ahead_of_every_write() {
     let is_stored = |hash: &[u8; 32]| stored.borrow().contains(hash);
     let mut reports = EntryReports::default();
     reports.recovered(vec![(3, vec![[7; 32]])]);
-    reports.written(&write(1, None, &[(5, &[])]), is_stored);
+    written(&mut reports, &write(1, None, &[(5, &[])]), is_stored);
     assert_eq!(reports.missing(), vec![[7; 32]]);
     assert_eq!(reports.ready(is_stored), None, "the write waits behind");
     stored.borrow_mut().insert([7; 32]);

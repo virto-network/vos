@@ -21,6 +21,7 @@ use vos_wire::{Decode, Encode, keys};
 use crate::calls::answer_of;
 use crate::http::{self, Handler, Limits};
 use crate::node::{Inner, ReplaceError};
+use crate::queries::Asked;
 use crate::signature::verify;
 
 /// How far ahead a query's `not_after` may be.
@@ -314,15 +315,14 @@ impl Ingress {
         {
             return answer;
         }
+        let asked = Asked {
+            caller: Principal::Client(query.key),
+            instance: query.instance,
+            method: query.method,
+            arguments: query.arguments,
+        };
         self.inner
-            .client_query(
-                agent,
-                Principal::Client(query.key),
-                query.instance,
-                query.method,
-                query.arguments,
-                query.consistency,
-            )
+            .client_query(agent, asked, query.consistency)
             .await
     }
 

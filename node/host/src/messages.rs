@@ -10,12 +10,10 @@
 
 use std::sync::atomic::Ordering;
 
-use vos_net::Class;
 use vos_wire::batch::Message;
 use vos_wire::ids::AgentId;
 use vos_wire::peer::{NodeNumber, PeerMessage};
 
-use crate::lock;
 use crate::node::{CallError, Inner, Pending};
 use crate::peer::Refusal;
 
@@ -29,13 +27,21 @@ enum Route {
     Nowhere,
 }
 
+/// Where an arrival from another node goes.
+enum Hop {
+    /// Into its agent's queue: this node leads it.
+    Here,
+    /// To the agent's leader, from this replica of it.
+    Relay(NodeNumber),
+}
+
 impl Inner {
     /// Where `agent`'s input goes. Through a replica, `turn` picks which:
     /// the same turn, the same replica, so one sender's messages keep their
     /// order on one stream.
     fn route(&self, agent: AgentId, turn: u64) -> Route {
         if let Some(run) = self.run(agent) {
-            if lock(&run.agent.queue).leading {
+            if run.agent.leading() {
                 return Route::Here;
             }
             // Never to itself: a group naming this node leader before its
@@ -45,17 +51,40 @@ impl Inner {
                 _ => Route::Nowhere,
             };
         }
-        let replicas: Vec<NodeNumber> = self
-            .placement(agent)
-            .map(|placement| placement.replicas)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|replica| *replica != self.number)
-            .collect();
-        if replicas.is_empty() {
+        let Some(known) = self.directory.get(agent) else {
             return Route::Nowhere;
+        };
+        let others = || {
+            known
+                .placement
+                .replicas
+                .iter()
+                .filter(|replica| **replica != self.number)
+        };
+        match others().count() as u64 {
+            0 => Route::Nowhere,
+            count => Route::To(*others().nth((turn % count) as usize).expect("a replica")),
         }
-        Route::To(replicas[(turn % replicas.len() as u64) as usize])
+    }
+
+    /// Where an arrival for `agent` from node `from` goes: into the queue
+    /// here, or to the agent's leader, which a direct hop is relayed to
+    /// once. A direct hop must come from a replica of `origin`, the agent
+    /// at its other end, and a relayed one from a replica of `agent`;
+    /// anything else, or anything a node cannot place, is dropped and
+    /// counted.
+    fn hop(&self, from: NodeNumber, agent: AgentId, origin: AgentId, relayed: bool) -> Option<Hop> {
+        if !self.admit(if relayed { agent } else { origin }, from) {
+            return None;
+        }
+        match self.route(agent, 0) {
+            Route::Here => Some(Hop::Here),
+            Route::To(leader) if !relayed && self.run(agent).is_some() => Some(Hop::Relay(leader)),
+            _ => {
+                self.drops.count(Refusal::Unplaced);
+                None
+            }
+        }
     }
 
     /// Send `message` toward agent `to`, through the replica `turn` picks
@@ -65,10 +94,9 @@ impl Inner {
         match self.route(to, turn) {
             Route::Here => self.push(to, Pending::Message(message)).is_ok(),
             Route::To(node) => {
-                self.sent_across.fetch_add(1, Ordering::Relaxed);
+                self.counters.sent_across.fetch_add(1, Ordering::Relaxed);
                 self.send(
                     node,
-                    Class::Requests,
                     &PeerMessage::Deliver {
                         to,
                         message,
@@ -102,7 +130,6 @@ impl Inner {
             }
             Route::To(node) => self.send(
                 node,
-                Class::Requests,
                 &PeerMessage::Acknowledge {
                     sender,
                     receiver,
@@ -127,7 +154,6 @@ impl Inner {
             }
             Route::To(node) => self.send(
                 node,
-                Class::Requests,
                 &PeerMessage::Behind {
                     sender,
                     receiver,
@@ -138,8 +164,8 @@ impl Inner {
         }
     }
 
-    /// A message for agent `to` from node `from`: a direct hop must come
-    /// from a replica of its sender, a relayed one from a replica of `to`.
+    /// A message for agent `to` from node `from`. Dropped, the sender's
+    /// leader sends it again.
     pub(crate) fn on_deliver(
         &self,
         from: NodeNumber,
@@ -147,22 +173,16 @@ impl Inner {
         message: Message,
         relayed: bool,
     ) {
-        let origin = if relayed { to } else { message.from };
-        if let Err(refusal) = self.check_replica(origin, from) {
-            self.drops.count(refusal);
-            return;
-        }
-        match self.route(to, 0) {
-            Route::Here => match self.push(to, Pending::Message(message)) {
+        match self.hop(from, to, message.from, relayed) {
+            Some(Hop::Here) => match self.push(to, Pending::Message(message)) {
                 Ok(()) => {}
                 Err(CallError::Busy) => self.drops.count(Refusal::Full),
                 Err(_) => self.drops.count(Refusal::Unplaced),
             },
-            Route::To(leader) if !relayed && self.run(to).is_some() => {
-                self.relayed.fetch_add(1, Ordering::Relaxed);
+            Some(Hop::Relay(leader)) => {
+                self.counters.relayed.fetch_add(1, Ordering::Relaxed);
                 self.send(
                     leader,
-                    Class::Requests,
                     &PeerMessage::Deliver {
                         to,
                         message,
@@ -170,14 +190,12 @@ impl Inner {
                     },
                 );
             }
-            // The sender's leader sends it again.
-            _ => self.drops.count(Refusal::Unplaced),
+            None => {}
         }
     }
 
-    /// An acknowledgement for agent `sender` from node `from`: a direct hop
-    /// must come from a replica of its receiver, a relayed one from a
-    /// replica of `sender`.
+    /// An acknowledgement for agent `sender` from node `from`. Dropped, the
+    /// receiver acknowledges again, with the next delivery.
     pub(crate) fn on_acknowledge(
         &self,
         from: NodeNumber,
@@ -186,13 +204,8 @@ impl Inner {
         sequence: u64,
         relayed: bool,
     ) {
-        let origin = if relayed { sender } else { receiver };
-        if let Err(refusal) = self.check_replica(origin, from) {
-            self.drops.count(refusal);
-            return;
-        }
-        match self.route(sender, 0) {
-            Route::Here => {
+        match self.hop(from, sender, receiver, relayed) {
+            Some(Hop::Here) => {
                 let ack = Pending::Ack {
                     to: receiver,
                     sequence,
@@ -201,9 +214,8 @@ impl Inner {
                     self.drops.count(Refusal::Unplaced);
                 }
             }
-            Route::To(leader) if !relayed && self.run(sender).is_some() => self.send(
+            Some(Hop::Relay(leader)) => self.send(
                 leader,
-                Class::Requests,
                 &PeerMessage::Acknowledge {
                     sender,
                     receiver,
@@ -211,14 +223,13 @@ impl Inner {
                     relayed: true,
                 },
             ),
-            // The receiver acknowledges again, with the next delivery.
-            _ => self.drops.count(Refusal::Unplaced),
+            None => {}
         }
     }
 
-    /// A `Behind` for agent `sender` from node `from`: a direct hop must
-    /// come from a replica of its receiver, a relayed one from a replica of
-    /// `sender`.
+    /// A `Behind` for agent `sender` from node `from`. Dropped, the receiver
+    /// says so again at its next refusal, and the sender's rounds send
+    /// again meanwhile.
     pub(crate) fn on_behind(
         &self,
         from: NodeNumber,
@@ -226,29 +237,21 @@ impl Inner {
         receiver: AgentId,
         relayed: bool,
     ) {
-        let origin = if relayed { sender } else { receiver };
-        if let Err(refusal) = self.check_replica(origin, from) {
-            self.drops.count(refusal);
-            return;
-        }
-        match self.route(sender, 0) {
-            Route::Here => {
+        match self.hop(from, sender, receiver, relayed) {
+            Some(Hop::Here) => {
                 if !self.note_behind(sender, receiver) {
                     self.drops.count(Refusal::Unplaced);
                 }
             }
-            Route::To(leader) if !relayed && self.run(sender).is_some() => self.send(
+            Some(Hop::Relay(leader)) => self.send(
                 leader,
-                Class::Requests,
                 &PeerMessage::Behind {
                     sender,
                     receiver,
                     relayed: true,
                 },
             ),
-            // The receiver says so again at its next refusal, and the
-            // sender's rounds send again meanwhile.
-            _ => self.drops.count(Refusal::Unplaced),
+            None => {}
         }
     }
 }

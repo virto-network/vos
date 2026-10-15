@@ -100,6 +100,20 @@ pub fn changes(agent: AgentId, write: &Write<NodeNumber>) -> Vec<Change> {
     changes
 }
 
+/// The blobs each entry `changes` append names, by its index: none for an
+/// entry that names none.
+pub fn named(changes: &[Change]) -> Vec<(u64, Vec<[u8; 32]>)> {
+    changes
+        .iter()
+        .filter_map(|change| match change {
+            Change::Append { index, entry, .. } if !entry.blobs.is_empty() => {
+                Some((*index, entry.blobs.iter().map(|blob| blob.hash).collect()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// The entries a load asks for, within its bytes.
 pub fn load(
     store: &Fjall,

@@ -509,6 +509,33 @@ pub fn due_entry(key: &[u8]) -> Option<(u64, Due)> {
     Some((at, entry))
 }
 
+/// Of the due index's keys in order, from its start, the rows due at
+/// `time`, earliest first, at most `limit`: a key under the index that
+/// names no row of it is passed over, and the keys end at the first past
+/// the index.
+pub fn due_rows<K: AsRef<[u8]>, E>(
+    keys: impl IntoIterator<Item = Result<K, E>>,
+    time: u64,
+    limit: usize,
+) -> Result<Vec<(u64, Due)>, E> {
+    let prefix = Row::Due.prefix();
+    let mut due = Vec::new();
+    for key in keys {
+        let key = key?;
+        if !key.as_ref().starts_with(&prefix) {
+            break;
+        }
+        let Some((at, entry)) = due_entry(key.as_ref()) else {
+            continue;
+        };
+        if at > time || due.len() == limit {
+            break;
+        }
+        due.push((at, entry));
+    }
+    Ok(due)
+}
+
 /// A workflow's record ([`crate::records::Workflow`]).
 pub fn workflow(id: WorkflowId) -> Vec<u8> {
     key(&[&Row::Workflow.prefix(), &id.0.to_be_bytes()])
@@ -610,6 +637,23 @@ pub fn outbox(to: AgentId, sequence: u64) -> Vec<u8> {
 /// The prefix of the outbox, for the node to send after apply.
 pub fn outbox_prefix() -> Vec<u8> {
     Row::Outbox.prefix().to_vec()
+}
+
+/// The prefix of the outbox's messages to `to`.
+pub fn outbox_to(to: AgentId) -> Vec<u8> {
+    key(&[&Row::Outbox.prefix(), &to.0.to_be_bytes()])
+}
+
+/// The target and sequence an [`outbox`] key names; `None` for any other
+/// key.
+pub fn outbox_entry(key: &[u8]) -> Option<(AgentId, u64)> {
+    let rest = key.strip_prefix(&Row::Outbox.prefix())?;
+    if rest.len() != 12 {
+        return None;
+    }
+    let to = u32::from_be_bytes(rest[..4].try_into().ok()?);
+    let sequence = u64::from_be_bytes(rest[4..].try_into().ok()?);
+    Some((AgentId(to), sequence))
 }
 
 /// The next sequence number for messages to an agent.

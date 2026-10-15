@@ -25,9 +25,8 @@ use vos_wire::ids::AgentId;
 use vos_wire::peer::{CreationRecord, Placement};
 use vos_wire::result::Write;
 
-use crate::Hooks;
-use crate::lock;
 use crate::store::{Fjall, HardState, LogEntry, Membership, Row, Switch};
+use crate::{Hooks, lock, raise};
 
 /// How long the oldest pending commit may wait before the writer counts as
 /// stalled.
@@ -275,9 +274,7 @@ impl StorageThread {
     /// `agent` recovered with `applied` as its applied index, before any of
     /// its commits: the store synced what it recovered, so that is durable.
     pub fn recovered(&self, agent: AgentId, applied: u64) {
-        let mut durable = lock(&self.shared.durably_applied);
-        let entry = durable.entry(agent).or_insert(applied);
-        *entry = (*entry).max(applied);
+        raise(&mut lock(&self.shared.durably_applied), agent, applied);
     }
 
     /// Whether `agent`'s commits left dirty rows since this was last asked.

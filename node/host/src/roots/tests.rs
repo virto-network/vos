@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use vos_tree::{Blake2b, Leaf, salt, value_hash};
+use vos_tree::{Blake2b, Leaf, value_hash};
 use vos_wire::Encode;
 use vos_wire::ids::{AgentId, InstanceId, MapId};
 use vos_wire::keys::{self, Transform};
@@ -126,9 +126,8 @@ impl Agent {
             .filter(|((at, _), _)| *at == map)
             .map(|((_, key), (version, value))| {
                 let key = map.transform.apply(key);
-                let salt = salt(&Blake2b, &seed(*version), &key);
-                let commitment = value_hash(&Blake2b, &salt, value);
-                (key, commitment)
+                let leaf = Leaf::salted(&Blake2b, &seed(*version), &key, value);
+                (key, leaf.value_hash)
             })
             .collect();
         let leaves: Vec<_> = leaves.into_iter().collect();
