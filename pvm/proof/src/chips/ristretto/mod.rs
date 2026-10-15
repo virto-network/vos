@@ -511,7 +511,7 @@ impl BuiltInComponent for RistrettoChip {
                 eval.add_to_relation(RelationEntry::new(
                     lookup_elements,
                     is_real[0].clone().into(),
-                    std::slice::from_ref(byte),
+                    core::slice::from_ref(byte),
                 ));
             }
         }
@@ -521,7 +521,7 @@ impl BuiltInComponent for RistrettoChip {
                 eval.add_to_relation(RelationEntry::new(
                     lookup_elements,
                     is_real[0].clone().into(),
-                    std::slice::from_ref(byte),
+                    core::slice::from_ref(byte),
                 ));
             }
         }
@@ -540,7 +540,7 @@ impl BuiltInComponent for RistrettoChip {
                 eval.add_to_relation(RelationEntry::new(
                     lookup_elements,
                     is_real[0].clone().into(),
-                    std::slice::from_ref(byte),
+                    core::slice::from_ref(byte),
                 ));
             }
         }
@@ -549,7 +549,7 @@ impl BuiltInComponent for RistrettoChip {
             eval.add_to_relation(RelationEntry::new(
                 lookup_elements,
                 is_real[0].clone().into(),
-                std::slice::from_ref(byte),
+                core::slice::from_ref(byte),
             ));
         }
 
@@ -851,7 +851,7 @@ impl BuiltInProverComponent for RistrettoChip {
                     range256,
                     [is_real[0].clone()],
                     |[real]| real.into(),
-                    std::slice::from_ref(col),
+                    core::slice::from_ref(col),
                 );
             }
         }
@@ -862,7 +862,7 @@ impl BuiltInProverComponent for RistrettoChip {
                     range256,
                     [is_real[0].clone()],
                     |[real]| real.into(),
-                    std::slice::from_ref(col),
+                    core::slice::from_ref(col),
                 );
             }
         }
@@ -873,7 +873,7 @@ impl BuiltInProverComponent for RistrettoChip {
                     range256,
                     [is_real[0].clone()],
                     |[real]| real.into(),
-                    std::slice::from_ref(col),
+                    core::slice::from_ref(col),
                 );
             }
         }
@@ -883,7 +883,7 @@ impl BuiltInProverComponent for RistrettoChip {
                 range256,
                 [is_real[0].clone()],
                 |[real]| real.into(),
-                std::slice::from_ref(col),
+                core::slice::from_ref(col),
             );
         }
 

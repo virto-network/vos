@@ -101,26 +101,33 @@ check-no-faults:
     cargo build -p vos-cli
     if ((^target/debug/vos --version) | str contains "faults") { error make { msg: "a plain build of vos injects faults" } } else { print "no faults in a plain build of vos" }
 
-# vos-raft builds for an embedded target, on core and alloc alone. Needs
-# `rustup target add thumbv7em-none-eabihf`.
+# The builds without std. vos-raft for an embedded target, on core and alloc
+# alone, built from the toolchain's source. The proof verifier on each
+# channel, with the proof crate's verifier path under it: both are `no_std`
+# crates, so a `std` path in either fails the build. Their target is wasm32,
+# which still has std for their dependencies: the pinned Stwo's verifier path
+# depends on dashmap, which needs std. Needs `rustup target add
+# wasm32-unknown-unknown`.
 check-no-std:
-    cargo build -p vos-raft --target thumbv7em-none-eabihf
+    cargo build -p vos-raft --target thumbv7em-none-eabihf -Zbuild-std=core,alloc
+    cargo build -p vos-pvm-proof-verifier --target wasm32-unknown-unknown
+    cargo build -p vos-pvm-proof-verifier --features poseidon2-channel --target wasm32-unknown-unknown
 
 # Checks before pushing: everything except proving.
 # The quick gate, after each change: formatting, the docs' links, the
-# workspace's lints, and the suites of the node, the agent, vos-raft and
-# the crates under them.
+# builds without std, the workspace's lints, and the suites of the node, the
+# agent, vos-raft and the crates under them.
 # Left to `just ci`: the slow fault runs (the five-process fault suite, the
 # fault build's process tests), the PVM vectors, the bench and prover
 # library tests, and the lints of other feature sets.
-check: fmt-check doc-check build-test-actors build-agent
+check: fmt-check doc-check check-no-std build-test-actors build-agent
     cargo clippy --workspace --all-targets --quiet -- -D warnings
     cargo test -p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam
     cargo test -p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-checker -p vos-node -p vos-net -p vos-cli
 
 # Everything but the prover suites: before a merge, and at the end of each
 # planned stage of work.
-ci: fmt-check doc-check clippy jar-check test vectors test-bench test-agent check-no-faults
+ci: fmt-check doc-check check-no-std clippy jar-check test vectors test-bench test-agent check-no-faults
 
 # The gate before merging: `ci` plus the prover suites, the soundness gates
 # and the bench tests that prove. Run it under a memory limit.
