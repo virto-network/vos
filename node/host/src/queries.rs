@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use vos_net::Class;
 use vos_wire::Decode;
+use vos_wire::batch::{Query, Work};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal};
 use vos_wire::ingress::{Consistency, Rejection, Response};
 use vos_wire::keys;
@@ -18,8 +19,11 @@ use vos_wire::result::Outcome;
 
 use crate::asking::pause;
 use crate::calls::answer_of;
-use crate::node::{CallError, Inner, Run};
+use crate::fault::{Fault, ran};
+use crate::group::Local;
+use crate::node::{CATCH_UP, CallError, Inner, Run};
 use crate::peer::{self, Refusal};
+use crate::pvm;
 use crate::store::Snapshot;
 use crate::timeout;
 
@@ -191,6 +195,130 @@ impl Inner {
     /// That `from` replicates `agent`.
     pub(crate) fn check_replica(&self, agent: AgentId, from: NodeNumber) -> Result<(), Refusal> {
         peer::check_replica(self.placement(agent).as_ref(), from)
+    }
+
+    /// Confirm that this replica leads agent `id`'s group, by a read
+    /// index, and wait until it has applied through that index: its
+    /// applied state then holds everything committed before the call.
+    pub(crate) async fn read_index(&self, id: AgentId) -> Result<u64, CallError> {
+        let run = self.run(id).ok_or_else(|| self.absent(id))?;
+        let index = self.confirm(id).await?;
+        self.applied_through(&run, index).await?;
+        Ok(index)
+    }
+
+    /// A read index from this replica's core: it leads, as a quorum has
+    /// confirmed, and its applied state, through the index, holds every
+    /// call answered before.
+    pub(crate) async fn confirm(&self, id: AgentId) -> Result<u64, CallError> {
+        let run = self.run(id).ok_or_else(|| self.absent(id))?;
+        let (answer, answered) = smol::channel::bounded(1);
+        if !self.propose(id, Local::ReadIndex { answer }) {
+            return Err(CallError::Stopped);
+        }
+        let index = match answered.recv().await {
+            Ok(Ok(index)) => index,
+            Ok(Err(
+                vos_raft::core::ReadIndexError::Backpressure
+                | vos_raft::core::ReadIndexError::TimedOut,
+            )) => {
+                return Err(CallError::Failed(
+                    "leadership was not confirmed in time".into(),
+                ));
+            }
+            Ok(Err(_)) | Err(_) => return Err(self.not_leader(&run.shared)),
+        };
+        Ok(index)
+    }
+
+    /// Wait until `run`'s replica has applied through `index`, for
+    /// [`CATCH_UP`] at most.
+    pub(crate) async fn applied_through(&self, run: &Run, index: u64) -> Result<(), CallError> {
+        let applied = run
+            .shared
+            .wait(|state| state.stopped || state.applied >= index);
+        match timeout(CATCH_UP, applied).await {
+            Some(state) if !state.stopped => Ok(()),
+            Some(_) => Err(CallError::Stopped),
+            None => Err(CallError::Failed(
+                "the replica has not applied through its read index".into(),
+            )),
+        }
+    }
+
+    /// Run a query on this replica's applied state, once it has applied
+    /// what it recovered.
+    pub(crate) async fn query(
+        self: &Arc<Self>,
+        agent: AgentId,
+        caller: Principal,
+        instance: InstanceId,
+        method: MethodId,
+        arguments: Vec<u8>,
+    ) -> Result<(Outcome, u64), CallError> {
+        let run = self.run(agent).ok_or_else(|| self.absent(agent))?;
+        let state = run
+            .shared
+            .wait(|state| state.stopped || state.applied >= state.recovered)
+            .await;
+        if state.stopped {
+            return Err(CallError::Stopped);
+        }
+        let snapshot = self.store.snapshot();
+        match self
+            .query_on(snapshot, agent, caller, instance, method, arguments, true)
+            .await?
+        {
+            Queried::Ran(outcome, at) => Ok((outcome, at)),
+            Queried::Linearizable(_) => unreachable!("a query read as it stands runs"),
+        }
+    }
+
+    /// Run a query on `snapshot` of `agent`'s applied state, on an
+    /// executor. Unless `linearized`, a method its schema marks
+    /// linearizable does not run there: the snapshot was not read after a
+    /// read index.
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) async fn query_on(
+        &self,
+        snapshot: Snapshot,
+        agent: AgentId,
+        caller: Principal,
+        instance: InstanceId,
+        method: MethodId,
+        arguments: Vec<u8>,
+        linearized: bool,
+    ) -> Result<Queried, CallError> {
+        let program = Arc::clone(&self.program);
+        let pool = Arc::clone(&self.pool);
+        let blobs = self.blobs.clone();
+        let gas = self.settings.refine_gas;
+        let run = move || {
+            let read = |error: fjall::Error| Fault::Infrastructure(error.to_string());
+            if !linearized
+                && crate::queries::linearizable(&snapshot, agent, instance, method).map_err(read)?
+            {
+                return Ok(Queried::Linearizable(arguments));
+            }
+            let at = snapshot.applied(agent).map_err(read)?.unwrap_or(0);
+            let (time, seed) = snapshot
+                .last_result(agent)
+                .map_err(read)?
+                .unwrap_or((0, [0; 32]));
+            let work = Work::Query(Query {
+                time,
+                seed,
+                caller,
+                instance,
+                method,
+                arguments,
+            });
+            let snapshot = Arc::new(snapshot);
+            let (output, _) = pvm::refine(&program, &pool, &blobs, snapshot, agent, &work, gas)?;
+            Ok(Queried::Ran(pvm::decode::<Outcome>(&output)?, at))
+        };
+        ran(self.executors.run(run).await)
+            .map_err(|fault| CallError::Failed(fault.message().to_string()))
     }
 }
 

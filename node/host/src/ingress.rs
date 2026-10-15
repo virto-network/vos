@@ -18,9 +18,10 @@ use vos_wire::ingress::{
 use vos_wire::records::{Installed, unstored};
 use vos_wire::{Decode, Encode, keys};
 
-use crate::calls::{answer_of, verify};
+use crate::calls::answer_of;
 use crate::http::{self, Handler, Limits};
 use crate::node::{Inner, ReplaceError};
+use crate::signature::verify;
 
 /// How far ahead a query's `not_after` may be.
 const QUERY_HORIZON_MS: u64 = 300_000;

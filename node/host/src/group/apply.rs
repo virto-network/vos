@@ -11,11 +11,12 @@ use vos_wire::result::{WorkResult, Write as StateWrite};
 use vos_wire::{Decode, keys};
 
 use super::Shared;
-use crate::node::{Inner, ran};
-use crate::pvm::{self, Fault};
+use crate::fault::{Fault, ran};
+use crate::node::Inner;
+use crate::pvm;
 use crate::storage::Change;
 use crate::store::{EntryKind, LogEntry, Snapshot};
-use crate::timeout;
+use crate::{lock, timeout};
 
 /// The first wait before retrying an apply the node failed, doubled each
 /// time up to [`MAX_BACKOFF`].
@@ -35,6 +36,27 @@ pub(crate) struct DryRun {
     /// The seed of the batch the result is of.
     pub seed: [u8; 32],
     pub writes: Vec<StateWrite>,
+}
+
+impl Inner {
+    pub(crate) fn keep_dry_run(&self, id: AgentId, dry_run: DryRun) {
+        lock(&self.dry_runs).insert(id, dry_run);
+    }
+
+    /// The writes of the leader's dry run of the result entry at `index`,
+    /// of `term` and the batch `seed`, if it ran on the state that entry
+    /// applies to.
+    pub(crate) fn dry_run(
+        &self,
+        id: AgentId,
+        index: u64,
+        term: u64,
+        seed: Option<[u8; 32]>,
+    ) -> Option<Vec<StateWrite>> {
+        let kept = lock(&self.dry_runs).remove(&id)?;
+        (kept.applied + 1 == index && kept.term == term && Some(kept.seed) == seed)
+            .then_some(kept.writes)
+    }
 }
 
 /// Apply `shared`'s committed log in order until the group stops.

@@ -19,6 +19,7 @@ use vos_wire::result::Write;
 use vos_wire::{Decode, Encode, defaults};
 
 use crate::blobs::Blobs;
+use crate::fault::Fault;
 use crate::lock;
 use crate::store::Snapshot;
 
@@ -29,39 +30,6 @@ const REFINE_ENTRY: u32 = 0;
 const HISTORICAL_LOOKUP: u64 = vos_pvm::inner::gp_call::HISTORICAL_LOOKUP as u64;
 /// The most of the agent's account of what it lost that a log line keeps.
 const LOST_WHAT: usize = 256;
-
-/// Why a batch produced nothing.
-#[derive(Debug)]
-pub(crate) enum Fault {
-    /// The agent program trapped, ran out of gas or answered nonsense:
-    /// something in the batch may cause it.
-    Agent(String),
-    /// The node failed: a read, a backend or an executor. No input causes
-    /// it, and it may pass.
-    Infrastructure(String),
-    /// A commit failed. fjall then refuses every later commit, so the node
-    /// stops.
-    Storage(String),
-    /// The agent's state disagrees with its leader's: that agent stops.
-    Invariant(String),
-}
-
-impl Fault {
-    pub(crate) fn message(&self) -> &str {
-        match self {
-            Fault::Agent(message)
-            | Fault::Infrastructure(message)
-            | Fault::Storage(message)
-            | Fault::Invariant(message) => message,
-        }
-    }
-}
-
-impl From<vos_pvm::refine::RefineError> for Fault {
-    fn from(error: vos_pvm::refine::RefineError) -> Self {
-        Fault::Infrastructure(format!("{error:?}"))
-    }
-}
 
 /// One agent's applied state, as refine reads it.
 struct AgentState {

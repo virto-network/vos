@@ -4,27 +4,24 @@
 
 mod apply;
 mod driver;
-mod snapshot;
+mod epochs;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use vos_raft::core::{ChangeMembershipError, Core, ProposeError, ReadIndexError};
+use vos_raft::core::{ChangeMembershipError, ProposeError, ReadIndexError};
 use vos_raft::{Message, Role};
 use vos_wire::ids::AgentId;
-use vos_wire::peer::{CreationRecord, NodeNumber, Order, SnapshotAck, SnapshotChunk};
+use vos_wire::peer::{CreationRecord, NodeNumber, SnapshotAck, SnapshotChunk};
 
 use crate::blobs::Held;
 use crate::lock;
-use crate::node::Inner;
-use crate::raft::EntryReports;
-use driver::Asks;
 
 pub(crate) use apply::{DryRun, apply, pinned, programs, unpinned};
-use snapshot::{Install, Shipment};
-pub(crate) use snapshot::{drop_stale_epochs, empty_epoch};
+pub(crate) use driver::drive;
+pub(crate) use epochs::{drop_stale_epochs, empty_epoch};
 
 /// Where a proposal's answer goes: the index it took, or why not, and
 /// when the driver answered.
@@ -209,72 +206,4 @@ impl Shared {
     pub fn stop(&self) {
         self.update(|state| state.stopped = true);
     }
-}
-
-/// Drive `shared`'s group until it stops, its inboxes close, or storage
-/// fails.
-pub(crate) async fn drive(
-    inner: Arc<Inner>,
-    shared: Arc<Shared>,
-    inbox: smol::channel::Receiver<Input>,
-    local: smol::channel::Receiver<Local>,
-) {
-    match Driver::start(Arc::clone(&inner), Arc::clone(&shared)).await {
-        Ok(driver) => driver.run(inbox, local).await,
-        Err(error) => {
-            tracing::error!(
-                agent = shared.agent.0,
-                "the group cannot start: {error}; it stops"
-            );
-            shared.stop();
-        }
-    }
-}
-
-struct Driver {
-    inner: Arc<Inner>,
-    shared: Arc<Shared>,
-    core: Core<NodeNumber>,
-    start: Instant,
-    reports: EntryReports,
-    /// Each write not yet reported with its blobs, by sequence, with the
-    /// log's last index after it.
-    writes: VecDeque<(u64, u64)>,
-    /// The log's last index as written to the store. [`State::written`]
-    /// reaches it only once the entries' blobs are stored too.
-    last_index: u64,
-    proposals: HashMap<u64, Proposed>,
-    reads: HashMap<u64, smol::channel::Sender<Result<u64, ReadIndexError>>>,
-    next_token: u64,
-    /// The blobs asked for and still awaited.
-    asks: Asks,
-    /// Which member to ask next.
-    turn: usize,
-    /// The held blobs of proposals not yet answered, by token.
-    held_proposals: HashMap<u64, Held>,
-    /// The held blobs of entries not yet written, by index: released once
-    /// a write reaches it, or truncates it.
-    held_entries: Vec<(u64, Held)>,
-    /// The leader loop stopped for good.
-    retired: bool,
-    /// The core was last told to hand leadership over and not campaign.
-    handing_over: bool,
-    /// The snapshot streams this replica runs as leader, by follower.
-    shipments: HashMap<NodeNumber, Shipment>,
-    /// The snapshot this replica stages, from the leader it follows.
-    install: Option<Install>,
-    /// The programs a staged snapshot waits for before its switch.
-    install_missing: Vec<[u8; 32]>,
-    /// Snapshot chunks taken this round, staged once it is processed.
-    chunks: VecDeque<(NodeNumber, SnapshotChunk)>,
-    /// The highest compaction bound the core gave.
-    compact_bound: u64,
-    /// A compaction is due at the next chance.
-    compact_due: bool,
-    memberships: HashMap<u64, smol::channel::Sender<Result<u64, ChangeMembershipError>>>,
-    /// The order of the placement this replica last announced as leader,
-    /// since it last stepped down: set as it goes to the directory, in a
-    /// task of its own, as the driver never waits on the node-wide lock a
-    /// placement takes.
-    announced: Option<Order>,
 }

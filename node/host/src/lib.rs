@@ -12,6 +12,7 @@ mod calls;
 pub mod client;
 mod dispatch;
 mod executor;
+mod fault;
 #[cfg(feature = "faults")]
 pub mod faults;
 mod group;
@@ -26,6 +27,7 @@ mod pvm;
 mod queries;
 pub mod raft;
 pub mod roots;
+mod signature;
 pub mod space;
 mod stats;
 pub mod storage;

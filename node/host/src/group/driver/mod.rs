@@ -13,19 +13,22 @@ use vos_raft::core::{
 };
 use vos_raft::{Config as RaftConfig, Role};
 use vos_wire::Encode;
-use vos_wire::peer::{NodeNumber, PeerMessage, Placement};
+use vos_wire::peer::{NodeNumber, Order, PeerMessage, SnapshotChunk};
 
-use super::snapshot::{INSTALL_IDLE, STREAM_HOLD};
-use super::{Driver, Input, Local, Shared};
-use crate::blobs::Keep;
+mod fetch;
+mod membership;
+mod snapshot;
+
+use super::{Input, Local, Proposed, Shared};
+use crate::blobs::Held;
 use crate::node::Inner;
 use crate::raft::{self, EntryReports};
 use crate::random_u64;
 use crate::storage::Change;
+use fetch::Asks;
+use membership::established;
+use snapshot::{INSTALL_IDLE, Install, STREAM_HOLD, Shipment};
 
-/// How long a group waits for blobs it asked for before asking again,
-/// another member.
-const BLOB_RETRY: Duration = Duration::from_secs(1);
 /// Inputs a driver takes in one round, so the core joins them in one
 /// write.
 const ROUND: usize = 1024;
@@ -38,6 +41,74 @@ enum Event {
     Local(Local),
     Closed,
     Timer,
+}
+
+/// Drive `shared`'s group until it stops, its inboxes close, or storage
+/// fails.
+pub(crate) async fn drive(
+    inner: Arc<Inner>,
+    shared: Arc<Shared>,
+    inbox: smol::channel::Receiver<Input>,
+    local: smol::channel::Receiver<Local>,
+) {
+    match Driver::start(Arc::clone(&inner), Arc::clone(&shared)).await {
+        Ok(driver) => driver.run(inbox, local).await,
+        Err(error) => {
+            tracing::error!(
+                agent = shared.agent.0,
+                "the group cannot start: {error}; it stops"
+            );
+            shared.stop();
+        }
+    }
+}
+
+struct Driver {
+    inner: Arc<Inner>,
+    shared: Arc<Shared>,
+    core: Core<NodeNumber>,
+    start: Instant,
+    reports: EntryReports,
+    /// Each write not yet reported with its blobs, by sequence, with the
+    /// log's last index after it.
+    writes: VecDeque<(u64, u64)>,
+    /// The log's last index as written to the store. [`State::written`]
+    /// reaches it only once the entries' blobs are stored too.
+    last_index: u64,
+    proposals: HashMap<u64, Proposed>,
+    reads: HashMap<u64, smol::channel::Sender<Result<u64, ReadIndexError>>>,
+    next_token: u64,
+    /// The blobs asked for and still awaited.
+    asks: Asks,
+    /// Which member to ask next.
+    turn: usize,
+    /// The held blobs of proposals not yet answered, by token.
+    held_proposals: HashMap<u64, Held>,
+    /// The held blobs of entries not yet written, by index: released once
+    /// a write reaches it, or truncates it.
+    held_entries: Vec<(u64, Held)>,
+    /// The leader loop stopped for good.
+    retired: bool,
+    /// The core was last told to hand leadership over and not campaign.
+    handing_over: bool,
+    /// The snapshot streams this replica runs as leader, by follower.
+    shipments: HashMap<NodeNumber, Shipment>,
+    /// The snapshot this replica stages, from the leader it follows.
+    install: Option<Install>,
+    /// The programs a staged snapshot waits for before its switch.
+    install_missing: Vec<[u8; 32]>,
+    /// Snapshot chunks taken this round, staged once it is processed.
+    chunks: VecDeque<(NodeNumber, SnapshotChunk)>,
+    /// The highest compaction bound the core gave.
+    compact_bound: u64,
+    /// A compaction is due at the next chance.
+    compact_due: bool,
+    memberships: HashMap<u64, smol::channel::Sender<Result<u64, ChangeMembershipError>>>,
+    /// The order of the placement this replica last announced as leader,
+    /// since it last stepped down: set as it goes to the directory, in a
+    /// task of its own, as the driver never waits on the node-wide lock a
+    /// placement takes.
+    announced: Option<Order>,
 }
 
 impl Driver {
@@ -627,237 +698,5 @@ impl Driver {
         if let Some(written) = written {
             self.shared.update(|state| state.written = written);
         }
-    }
-
-    /// Note when this replica holds a committed configuration naming it,
-    /// and, leading, announce where the agent runs whenever that changes.
-    async fn settle_membership(&mut self) {
-        if established(&self.core, self.inner.number) && !self.shared.state().established {
-            self.shared.update(|state| state.established = true);
-        }
-        if self.core.role() != Role::Leader {
-            return;
-        }
-        self.announce_placement().await;
-    }
-
-    /// Announce where the agent runs, as this replica's core has it, when
-    /// that changed since it last did.
-    async fn announce_placement(&mut self) {
-        let status = self.core.status();
-        let index = status.active_config_index.unwrap_or(0);
-        let mut replicas = status.members.clone();
-        replicas.extend(status.joint_old.iter().flatten().copied());
-        replicas.sort_unstable();
-        replicas.dedup();
-        // The configuration before, or, once that is compacted away, the
-        // log's first, which may be this one. It matters while a placement
-        // is uncommitted, and names a leader the change removed, which
-        // leads until the configuration without it commits.
-        let before = if index == 0 {
-            Vec::new()
-        } else {
-            self.core
-                .config_at(index - 1)
-                .map(|record| {
-                    let mut nodes = record.current;
-                    nodes.extend(record.joint_old.unwrap_or_default());
-                    nodes.sort_unstable();
-                    nodes.dedup();
-                    nodes
-                })
-                .unwrap_or_default()
-        };
-        let placement = Placement {
-            replicas,
-            before,
-            term: status.current_term,
-            index,
-            joint: status.joint_old.is_some(),
-            committed: status.commit_index >= index,
-        };
-        let order = placement.order();
-        if self.announced == Some(order) {
-            return;
-        }
-        self.announced = Some(order);
-        let inner = Arc::clone(&self.inner);
-        let agent = self.shared.agent;
-        self.inner
-            .spawn(async move { inner.place(agent, placement).await });
-    }
-
-    /// Ask for the blobs the group's entries, or the snapshot it stages,
-    /// wait for: each new one of the leader, which stored any large result
-    /// it proposed, and each one that waited [`BLOB_RETRY`] of the next
-    /// member.
-    ///
-    /// The host never gives up on a blob (vos-raft's `discard_unreported`
-    /// is never called). A restart's recovery cuts an entry missing its
-    /// blob only above the commit it recovers ([`raft::recovery_cut`]); one
-    /// at or below it is committed and never cut: past the applied index
-    /// it is kept, its blobs fetched again, and recovery logs that it
-    /// waits; at or below it, the log is compacted through the applied
-    /// index. So a replica holding a committed entry whose blob no member
-    /// still has waits for it for good, applying nothing past it. The
-    /// trust model accepts that (core model, section 5): nodes may crash,
-    /// and such a replica is one crashed, while the quorum goes on.
-    fn fetch_blobs(&mut self) {
-        let mut missing: BTreeSet<[u8; 32]> = self.reports.missing().into_iter().collect();
-        missing.extend(self.install_missing.iter().copied());
-        if missing.is_empty() {
-            self.asks.clear();
-            return;
-        }
-        if self.inner.network.is_none() {
-            return;
-        }
-        let me = self.inner.number;
-        let others: Vec<NodeNumber> = self
-            .inner
-            .placement(self.shared.agent)
-            .map(|placement| placement.replicas)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|node| *node != me)
-            .collect();
-        if others.is_empty() {
-            return;
-        }
-        let ask = self.asks.next(&missing, Instant::now());
-        let leader = self.shared.state().leader.filter(|leader| *leader != me);
-        if !ask.fresh.is_empty() {
-            let to = leader.unwrap_or_else(|| self.next_member(&others));
-            self.ask(to, ask.fresh);
-        }
-        if !ask.retry.is_empty() {
-            let to = self.next_member(&others);
-            self.ask(to, ask.retry);
-        }
-    }
-
-    fn next_member(&mut self, others: &[NodeNumber]) -> NodeNumber {
-        self.turn += 1;
-        others[self.turn % others.len()]
-    }
-
-    /// Ask node `to` for `hashes`. A program a staged snapshot waits for is
-    /// kept by its age until the switch pins it; every other blob, by the
-    /// entry naming it.
-    fn ask(&self, to: NodeNumber, hashes: Vec<[u8; 32]>) {
-        let Some(network) = &self.inner.network else {
-            return;
-        };
-        let (aged, named): (Vec<[u8; 32]>, Vec<[u8; 32]>) = hashes
-            .iter()
-            .partition(|hash| self.install_missing.contains(hash));
-        self.inner.want(self.shared.agent, &aged, Keep::Aged);
-        self.inner.want(self.shared.agent, &named, Keep::Named);
-        let frame = PeerMessage::BlobRequest {
-            agent: self.shared.agent,
-            hashes,
-        }
-        .encode();
-        let _ = network.send(to, Class::Requests, u64::from(self.shared.agent.0), frame);
-    }
-}
-
-/// Whether `core` holds a committed configuration naming `me`.
-fn established(core: &Core<NodeNumber>, me: NodeNumber) -> bool {
-    let status = core.status();
-    let named = status.members.contains(&me)
-        || status
-            .joint_old
-            .as_ref()
-            .is_some_and(|old| old.contains(&me));
-    named && status.commit_index >= status.active_config_index.unwrap_or(0)
-}
-
-/// The blobs a group asked for and still waits on, each with when it was
-/// last asked.
-#[derive(Default)]
-pub(super) struct Asks(HashMap<[u8; 32], Instant>);
-
-/// What a group asks for in one round.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(super) struct Ask {
-    /// The blobs not asked for yet: of the leader.
-    pub fresh: Vec<[u8; 32]>,
-    /// The blobs that waited the retry interval since they were last asked
-    /// for: of the next member.
-    pub retry: Vec<[u8; 32]>,
-}
-
-impl Asks {
-    /// Of `missing`, what to ask for at `now`, noted as asked then. A blob
-    /// is asked for again only once it waited [`BLOB_RETRY`]: one asked a
-    /// moment ago is not asked again of a member the turn comes back to.
-    pub(super) fn next(&mut self, missing: &BTreeSet<[u8; 32]>, now: Instant) -> Ask {
-        self.0.retain(|hash, _| missing.contains(hash));
-        let mut ask = Ask::default();
-        for hash in missing {
-            match self.0.get(hash) {
-                None => ask.fresh.push(*hash),
-                Some(at) if now.saturating_duration_since(*at) >= BLOB_RETRY => {
-                    ask.retry.push(*hash)
-                }
-                Some(_) => {}
-            }
-        }
-        for hash in ask.fresh.iter().chain(&ask.retry) {
-            self.0.insert(*hash, now);
-        }
-        ask
-    }
-
-    /// When the longest wait comes to the retry interval.
-    pub(super) fn due(&self) -> Option<Instant> {
-        self.0.values().min().map(|at| *at + BLOB_RETRY)
-    }
-
-    pub(super) fn clear(&mut self) {
-        self.0.clear();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn set(hashes: &[u8]) -> BTreeSet<[u8; 32]> {
-        hashes.iter().map(|byte| [*byte; 32]).collect()
-    }
-
-    fn ask(fresh: &[u8], retry: &[u8]) -> Ask {
-        let hashes = |bytes: &[u8]| bytes.iter().map(|byte| [*byte; 32]).collect();
-        Ask {
-            fresh: hashes(fresh),
-            retry: hashes(retry),
-        }
-    }
-
-    /// A fresh ask carries only the blobs not asked for yet; a blob asked
-    /// for is asked again only once it waited the retry interval.
-    #[test]
-    fn a_blob_is_asked_for_once_until_a_retry() {
-        let start = Instant::now();
-        let at = |millis: u64| start + Duration::from_millis(millis);
-        let mut asks = Asks::default();
-        assert_eq!(asks.next(&set(&[1, 2]), at(0)), ask(&[1, 2], &[]));
-        assert_eq!(asks.next(&set(&[1, 2]), at(100)), ask(&[], &[]));
-        assert_eq!(asks.next(&set(&[1, 2, 3]), at(200)), ask(&[3], &[]));
-        assert_eq!(asks.due(), Some(at(0) + BLOB_RETRY));
-        // 1 and 2 arrived: 3 waits from its own ask.
-        assert_eq!(asks.next(&set(&[3, 4]), at(1_000)), ask(&[4], &[]));
-        assert_eq!(asks.due(), Some(at(200) + BLOB_RETRY));
-        assert_eq!(asks.next(&set(&[3, 4]), at(1_100)), ask(&[], &[]));
-        assert_eq!(asks.next(&set(&[3, 4, 5]), at(1_200)), ask(&[5], &[3]));
-        assert_eq!(asks.due(), Some(at(1_000) + BLOB_RETRY));
-        assert_eq!(asks.next(&set(&[3, 4, 5]), at(2_000)), ask(&[], &[4]));
-        // A blob that arrived and is missing again is new.
-        assert_eq!(asks.next(&set(&[4]), at(2_100)), ask(&[], &[]));
-        assert_eq!(asks.next(&set(&[3, 4]), at(2_200)), ask(&[3], &[]));
-        asks.clear();
-        assert_eq!(asks.due(), None);
     }
 }
