@@ -26,7 +26,8 @@ pub struct Config {
     pub agent: Vec<u8>,
     /// Executor threads for PVM work.
     pub executors: usize,
-    /// Client requests an agent queues before a call answers busy.
+    /// Client requests an agent queues before a call answers busy, and
+    /// messages from other agents before they are dropped.
     pub queue: usize,
     /// The most inputs in one batch.
     pub max_inputs: usize,
@@ -87,9 +88,7 @@ pub struct Config {
     pub compact_tail: u64,
     /// The most bytes of entries a compaction keeps below that point,
     /// counted alike: well under `compact_bytes`, or every commit makes a
-    /// compaction due. Counting large results' blobs, the default keeps
-    /// about four to eight of them, and a follower further behind takes a
-    /// snapshot.
+    /// compaction due.
     pub compact_tail_bytes: u64,
     /// How often the node collects its blob store.
     pub blob_collect_every: Duration,
@@ -111,9 +110,7 @@ pub struct Config {
     pub snapshot_timeout_ms: u64,
     /// How many owners' reads of workflows may wait at once at the node's
     /// ingress, each read again at every apply: one past them answers
-    /// where its workflow stands at once. The node cannot tell a client
-    /// that hung up mid-wait, whose read holds its place until its wait
-    /// ends; the bound keeps what such reads cost small.
+    /// where its workflow stands at once.
     pub workflow_waits: usize,
     /// The longest a read of a workflow waits for it to end: at most
     /// [`vos_wire::ingress::MAX_WORKFLOW_WAIT_MS`].

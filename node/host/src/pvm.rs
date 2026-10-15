@@ -23,7 +23,6 @@ use crate::fault::Fault;
 use crate::lock;
 use crate::store::Snapshot;
 
-/// The refine entry point.
 const REFINE_ENTRY: u32 = 0;
 
 /// `historical_lookup`, which refine answers from the agent's programs.
@@ -61,10 +60,6 @@ impl StateReader for AgentState {
 /// these alone, and `instantiate` lends no other, though the node's pool
 /// holds every agent's. A store that cannot be read faults the run, as
 /// refine's other reads do.
-///
-/// A program a batch installs is the agent's in that batch on VOS, its
-/// blob stored before the batch; on JAM its preimage must be provided
-/// before the package's lookup anchor.
 struct AgentPrograms {
     blobs: Blobs,
     agent: AgentId,

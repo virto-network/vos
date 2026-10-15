@@ -6,6 +6,16 @@
 //! entry is vos-raft's own. The snapshot pointer in the core's meta is not
 //! the host's: the log start moves only by compaction and a snapshot
 //! switch, in their own row.
+//!
+//! Recovery leaves no entry without its blob ([`recovery_cut`]). An entry
+//! above the commit missing its blob was never reported durable: every
+//! agent shares one journal, so its row can survive a crash its blob did
+//! not, and cutting it forgets nothing this replica acknowledged (a disk
+//! losing what it said it wrote is outside the trust model, core model,
+//! section 5). A committed entry is never cut: the replica would vote
+//! without it, and with another member lacking it elect a leader lacking
+//! it too. At or below the applied index the state holds its effect, so
+//! the log is compacted past it rather than left ending below it.
 
 use vos_raft::core::{Load, Recovered, SnapshotSwitch, Write};
 use vos_raft::{ActiveConfigRecord, EntryKind as RaftKind, LogEntry as RaftEntry, Meta};
@@ -189,26 +199,12 @@ pub(crate) fn switch_change(
 }
 
 /// What recovery must do to `agent`'s log so that no entry is left
-/// without its blob, before its core is recovered: the changes, for the
-/// node log writer (after it was told the agent's recovered applied
-/// index), the index the log is cut from, if any, and the committed
-/// entries kept without their blobs.
-///
-/// An entry above the commit this replica recovers (its persisted commit,
-/// or its applied index if higher) whose blob the store does not hold was
-/// never reported durable: every agent shares one journal, so its row can
-/// survive a crash its blob did not. The log is cut at the first such
-/// entry. Had it been reported and its blob lost after, the cut would
-/// forget an entry this replica acknowledged: a disk losing what it said
-/// it wrote, which the trust model excludes (core model, section 5).
-///
-/// An entry at or below that commit is committed, so it is never cut: the
-/// replica would vote without it, and with another member lacking it elect
-/// a leader that lacks it too. Past the applied index, it stays in the log
-/// and its blobs are fetched again from the members holding them, as a
-/// quorum does. At or below it, the state holds its effect: the log is
-/// compacted through the applied index instead, with the membership in
-/// effect there, so the log never ends below it.
+/// without its blob, before its core is recovered and once the writer knows
+/// its applied index: above the commit it recovers (its persisted commit,
+/// or its applied index if higher), the log is cut at the first entry
+/// missing a blob; a committed entry past the applied index stays, its
+/// blobs to fetch again; at or below the applied index, the log is
+/// compacted through it instead, with the membership in effect there.
 pub fn recovery_cut(store: &Fjall, blobs: &Blobs, agent: AgentId) -> store::Result<Cut> {
     let rows = store.raft(agent)?;
     let missing = |entry: &LogEntry| -> store::Result<Vec<[u8; 32]>> {

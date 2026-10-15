@@ -12,7 +12,7 @@ use super::{Change, Commit, Shared};
 use crate::store::{Batch, Fjall, PersistMode};
 use crate::{Hooks, lock, raise};
 
-/// The writer's loop: one group of commits at a time.
+/// The writer, on its thread: one group of commits at a time.
 pub(super) struct Writer {
     store: Fjall,
     hooks: Arc<dyn Hooks>,

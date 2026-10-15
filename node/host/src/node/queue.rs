@@ -84,7 +84,7 @@ impl Pending {
     }
 
     /// Counts against the cap on the messages other agents queue, which
-    /// other nodes now fill. Acknowledgements do not: they open this
+    /// other nodes fill. Acknowledgements do not: they open this
     /// agent's own windows, and the batch takes one per target.
     pub(crate) fn agents_sent(&self) -> bool {
         matches!(self, Pending::Message(_) | Pending::Failed(_))

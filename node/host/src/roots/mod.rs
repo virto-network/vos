@@ -4,7 +4,7 @@
 //!
 //! A [`Build`] runs at the agent's state version V, from one store snapshot
 //! at V, over every version past the last complete build's, W. It reads
-//! the dirty rows of those versions in batches of at most [`BATCH`] keys,
+//! the dirty rows of those versions in batches of at most `BATCH` keys,
 //! and gives each key's leaf the value its row holds at V, salted from the
 //! seed of the version that wrote it. Each batch rewrites its keys' paths,
 //! map by map, with [`vos_tree::update`], reading the trees' rows from a

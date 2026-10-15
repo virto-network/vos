@@ -178,10 +178,8 @@ async fn apply_one(inner: &Inner, shared: &Shared, index: u64) -> Result<(), Fau
 /// the runtime thread.
 ///
 /// The entry was written with its blobs, and its log row keeps them: a blob
-/// missing is data the store lost, which no retry mends, so the node halts.
-/// On its restart the recovery cut keeps a committed entry, its blobs
-/// fetched again from the members, and takes one past the persisted commit,
-/// for the leader to send again ([`crate::raft::recovery_cut`]).
+/// missing is data the store lost, which no retry mends, so the node halts,
+/// and its restart's recovery mends it ([`crate::raft::recovery_cut`]).
 async fn body(
     inner: &Inner,
     agent: AgentId,

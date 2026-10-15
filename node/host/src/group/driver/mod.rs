@@ -70,8 +70,9 @@ struct Driver {
     /// Each write not yet reported with its blobs, by sequence, with the
     /// log's last index after it.
     writes: VecDeque<(u64, u64)>,
-    /// The log's last index as written to the store. [`State::written`]
-    /// reaches it only once the entries' blobs are stored too.
+    /// The log's last index as written to the store.
+    /// [`super::State::written`] reaches it only once the entries' blobs
+    /// are stored too.
     last_index: u64,
     answers: Answers,
     fetch: Fetch,
@@ -180,12 +181,9 @@ impl Driver {
         let core = Core::new(config, raft::recovered(rows), 0, random_u64());
         let established = established(&core, inner.number);
         // The core counts every recovered entry durable, which a committed
-        // one is safe to be; nothing applies past its lost blob meanwhile.
-        // A leader that still holds this replica's next entries keeps
-        // appending rather than sending a snapshot, so if every member has
-        // collected the blobs, this replica waits until the leader's log
-        // compacts past its own: seconds on a busy group, longer on an idle
-        // one.
+        // one is safe to be: nothing applies past a lost blob until a
+        // member sends it, or the leader's log compacts past this one's and
+        // a snapshot comes.
         let mut reports = EntryReports::default();
         let mut writes = VecDeque::new();
         let mut written = last_index;
@@ -193,10 +191,8 @@ impl Driver {
             tracing::error!(
                 agent = agent.0,
                 index = first,
-                "the store lost the blobs of committed entries from {first}: this replica keeps \
-                 them, so it never votes without them, and fetches the blobs again from its \
-                 members; it applies nothing from {first} on until they come, never campaigns \
-                 or leads meanwhile, and stays there if no member holds them"
+                "the store lost the blobs of committed entries from {first}: this replica fetches \
+                 them again, and applies nothing from {first} on, nor leads, until they come"
             );
             written = first - 1;
             writes.push_back((raft::RECOVERED, last_index));

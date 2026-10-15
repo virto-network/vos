@@ -475,10 +475,10 @@ mod tests {
         vos_pvm_compiler::link_elf_spi(&elf).expect("links")
     }
 
-    /// A node stopped while an executor runs a job holding its state (as
-    /// a signature check did, and any job may) is gone once its stop
-    /// returns, its store and the store's lock with it: it opens again on
-    /// the same directory at once.
+    /// A node stopped while an executor runs a job holding its state (a
+    /// signature check, or any job) is gone once its stop returns, its
+    /// store and the store's lock with it: it opens again on the same
+    /// directory at once.
     #[test]
     fn a_node_stopped_while_a_job_holds_it_opens_again_at_once() {
         let agent = agent_program();

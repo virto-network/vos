@@ -43,14 +43,15 @@ impl Driver {
     ///
     /// The host never gives up on a blob (vos-raft's `discard_unreported`
     /// is never called). A restart's recovery cuts an entry missing its
-    /// blob only above the commit it recovers ([`raft::recovery_cut`]); one
-    /// at or below it is committed and never cut: past the applied index
-    /// it is kept, its blobs fetched again, and recovery logs that it
-    /// waits; at or below it, the log is compacted through the applied
-    /// index. So a replica holding a committed entry whose blob no member
-    /// still has waits for it for good, applying nothing past it. The
-    /// trust model accepts that (core model, section 5): nodes may crash,
-    /// and such a replica is one crashed, while the quorum goes on.
+    /// blob only above the commit it recovers
+    /// ([`crate::raft::recovery_cut`]); one at or below it is committed and
+    /// never cut: past the applied index it is kept, its blobs fetched
+    /// again, and recovery logs that it waits; at or below it, the log is
+    /// compacted through the applied index. So a replica holding a
+    /// committed entry whose blob no member still has waits for it for
+    /// good, applying nothing past it. The trust model accepts that (core
+    /// model, section 5): nodes may crash, and such a replica is one
+    /// crashed, while the quorum goes on.
     pub(super) fn fetch_blobs(&mut self) {
         let mut missing: BTreeSet<[u8; 32]> = self.reports.missing().into_iter().collect();
         missing.extend(self.snapshots.missing.iter().copied());

@@ -141,7 +141,6 @@ impl Leader {
         }
     }
 
-    /// Acknowledge each sender's messages through the sequence given.
     pub(super) fn acknowledge(&self, acks: HashMap<AgentId, u64>) {
         for (sender, sequence) in acks {
             self.inner.acknowledge(sender, self.id, sequence);

@@ -27,7 +27,7 @@ struct Pending {
 
 impl EntryReports {
     /// The recovered log's committed entries kept without their blobs
-    /// ([`Cut::refetch`]): they wait, as [`RECOVERED`], ahead of every
+    /// ([`super::Cut::refetch`]): they wait, as [`RECOVERED`], ahead of every
     /// write.
     pub(crate) fn recovered(&mut self, waiting: Vec<(u64, Vec<[u8; 32]>)>) {
         if !waiting.is_empty() {
@@ -48,8 +48,8 @@ impl EntryReports {
     /// `write` is durable, its entries naming the blobs `named` lists
     /// ([`super::named`]). A truncation in it drops the waits of the
     /// entries it removed, from earlier writes too. `stored` answers from a
-    /// [`crate::blobs::Blobs::touch`] of the write's blobs, so none of them is collected
-    /// while the entry comes to rely on it.
+    /// [`crate::blobs::Blobs::touch`] of the write's blobs, so none of them
+    /// is collected while the entry comes to rely on it.
     pub(crate) fn written(
         &mut self,
         write: &Write<NodeNumber>,
