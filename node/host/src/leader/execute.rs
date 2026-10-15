@@ -10,7 +10,7 @@ use vos_wire::keys;
 use vos_wire::records::unstored;
 use vos_wire::result::{Step, WorkResult, Write as StateWrite};
 
-use super::{Leader, Ran, is_due, leads};
+use super::{Ended, Leader, is_due, leads};
 use crate::blobs::{Held, Keep, blob_ref};
 use crate::fault::Fault;
 use crate::group::{DryRun, Local};
@@ -27,10 +27,10 @@ impl Leader {
         snapshot: Arc<Snapshot>,
         batch: Batch,
         blobs: Vec<BlobRef>,
-    ) -> Result<Ran, Fault> {
+    ) -> Result<Ended, Fault> {
         let id = self.id;
         let started = Instant::now();
-        let inputs = batch.inputs.len() as u64;
+        let (version, inputs) = (batch.version, batch.inputs.len() as u64);
         let stats = &self.inner.stats;
         stats.batch_inputs.record(inputs);
         let work = Arc::new(Work::Batch(batch));
@@ -75,17 +75,16 @@ impl Leader {
             let writes = self.dry_run(snapshot, work, Arc::new(entry.body)).await?;
             (payload, writes, None)
         };
-        let version = writes
+        let written = writes
             .iter()
             .find(|write| write.key == keys::version())
             .and_then(|write| write.value.as_deref())
             .and_then(unstored)
             .and_then(|bytes| vos_wire::Decode::decode(bytes).ok())
             .map(|(version, _): (u64, usize)| version);
-        if version != Some(self.version + 1) {
+        if written != Some(version + 1) {
             return Err(Fault::Invariant(format!(
-                "accumulate skipped the work result: the agent's state is not at version {}",
-                self.version
+                "accumulate skipped the work result: the agent's state is not at version {version}"
             )));
         }
         self.inner.keep_dry_run(
@@ -100,7 +99,7 @@ impl Leader {
         let (answer, answered) = smol::channel::bounded(1);
         let term = self.term;
         let proposing = Instant::now();
-        let proposed = self.inner.propose(
+        let proposed = self.inner.to_group(
             id,
             Local::Propose {
                 term,
@@ -110,7 +109,7 @@ impl Leader {
             },
         );
         if !proposed {
-            return Ok(Ran::Lost);
+            return Ok(Ended::Lost);
         }
         let answer = async { Some(answered.recv().await) };
         let stopped = async {
@@ -119,7 +118,7 @@ impl Leader {
         };
         let (index, taken) = match answer.or(stopped).await {
             Some(Ok((Ok(index), taken))) => (index, taken),
-            _ => return Ok(Ran::Lost),
+            _ => return Ok(Ended::Lost),
         };
         stats.ran(&stats.propose, proposing, taken);
         let state = self
@@ -127,7 +126,7 @@ impl Leader {
             .wait(|state| state.stopped || !leads(state, term) || state.commit >= index)
             .await;
         if state.commit < index {
-            return Ok(Ran::Lost);
+            return Ok(Ended::Lost);
         }
         // The commit's and the apply's ends as the driver and the applier
         // saw them: the time this task took to be polled again is the
@@ -139,7 +138,7 @@ impl Leader {
             .wait(|state| state.stopped || !leads(state, term) || state.applied >= index)
             .await;
         if state.applied < index {
-            return Ok(Ran::Lost);
+            return Ok(Ended::Lost);
         }
         let applied = state.applied_at.unwrap_or_else(Instant::now);
         stats.ran(&stats.apply, committed, applied);
@@ -151,12 +150,12 @@ impl Leader {
             .log_entry(id, index)?
             .is_some_and(|entry| entry.term == term);
         if !ours {
-            return Ok(Ran::Lost);
+            return Ok(Ended::Lost);
         }
         self.applied = index;
         match self.shared.outcome(index) {
-            Some(true) => Ok(Ran::Done(result)),
-            _ => Ok(Ran::Skipped),
+            Some(true) => Ok(Ended::Done(result)),
+            _ => Ok(Ended::Skipped),
         }
     }
 

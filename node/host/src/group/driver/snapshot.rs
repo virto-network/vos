@@ -18,7 +18,7 @@ use vos_wire::peer::{
 
 use super::Driver;
 use crate::blobs::Keep;
-use crate::group::epochs::{drop_epoch, empty_epoch};
+use crate::group::epochs::{drop_rows, empty_epoch};
 use crate::group::{Local, Shared, pin_changes, pinned, programs};
 use crate::node::Inner;
 use crate::raft;
@@ -115,9 +115,9 @@ impl Driver {
     /// follower a little behind still gets entries from, and never past a
     /// snapshot being streamed: its follower needs the entries after it.
     /// The configuration recorded is the one in effect where it stops.
-    pub(super) async fn compact(&mut self) -> bool {
+    pub(super) async fn compact(&mut self) {
         if !std::mem::take(&mut self.compact_due) {
-            return true;
+            return;
         }
         let mut point = self.core.compaction_point(
             self.compact_bound,
@@ -134,7 +134,7 @@ impl Driver {
             point = point.min(lowest);
         }
         if point <= self.core.status().snap_last_index {
-            return true;
+            return;
         }
         let configuration = self.core.config_at(point);
         let change = match raft::compaction(
@@ -144,13 +144,13 @@ impl Driver {
             configuration.as_ref(),
         ) {
             Ok(Some(change)) => change,
-            Ok(None) => return true,
+            Ok(None) => return,
             Err(error) => {
                 tracing::warn!(
                     agent = self.shared.agent.0,
                     "a compaction read failed: {error}"
                 );
-                return true;
+                return;
             }
         };
         // A compaction is never needed: refused, the log stays longer.
@@ -159,10 +159,9 @@ impl Driver {
                 agent = self.shared.agent.0,
                 "a compaction was refused: {error}"
             );
-            return true;
+            return;
         }
         self.core.compacted(point);
-        true
     }
 
     /// Stream this replica's state to `to`, which needs entries the log no
@@ -214,7 +213,7 @@ impl Driver {
         let agent = self.shared.agent;
         self.inner.spawn(async move {
             let done = stream(&inner, &shared, (to, term), export, manifest, acked).await;
-            inner.propose(
+            inner.to_group(
                 agent,
                 Local::StreamEnded {
                     to,
@@ -232,7 +231,7 @@ impl Driver {
     pub(super) async fn stage(&mut self) -> bool {
         if self.core.role() == Role::Leader {
             self.snapshots.chunks.clear();
-            self.abandon().await;
+            self.abandon();
             return true;
         }
         while let Some((from, chunk)) = self.snapshots.chunks.pop_front() {
@@ -248,7 +247,7 @@ impl Driver {
                 agent = self.shared.agent.0,
                 "a snapshot stopped arriving; dropped"
             );
-            self.abandon().await;
+            self.abandon();
         }
         if self
             .snapshots
@@ -293,7 +292,7 @@ impl Driver {
                 self.ack(from, name, 0);
                 return;
             }
-            self.abandon().await;
+            self.abandon();
             // Never one an earlier install left: that one is dropped in the
             // background, and a stream does not wait for it.
             let Some(epoch) = empty_epoch(&self.inner, self.shared.agent) else {
@@ -334,7 +333,7 @@ impl Driver {
                 agent = self.shared.agent.0,
                 "a snapshot chunk was not staged: {error}"
             );
-            self.abandon().await;
+            self.abandon();
             return;
         }
         let install = self.snapshots.install.as_mut().expect("an install");
@@ -444,7 +443,7 @@ impl Driver {
                 "a snapshot switch was refused: {error}"
             );
             self.snapshots.install = Some(install);
-            self.abandon().await;
+            self.abandon();
             return true;
         }
         let index = install.index;
@@ -478,7 +477,7 @@ impl Driver {
     }
 
     /// Drop the snapshot being staged, if any, in the background.
-    async fn abandon(&mut self) {
+    fn abandon(&mut self) {
         let Some(install) = self.snapshots.install.take() else {
             return;
         };
@@ -493,7 +492,7 @@ impl Driver {
         let agent = self.shared.agent;
         self.inner.dropping(agent, epoch);
         self.inner.spawn(async move {
-            drop_epoch(&inner, agent, epoch).await;
+            drop_rows(&inner, agent, epoch).await;
             inner.dropped(agent, epoch);
         });
     }

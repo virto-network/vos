@@ -100,7 +100,7 @@ impl Directory {
 /// every [`ASK_EVERY`] per agent and peer. A group's full inbox does not
 /// ask, and nor does a replica whose placement names it but which runs no
 /// group (one refused for another agent program).
-pub(crate) fn should_ask(
+fn should_ask(
     held: Option<&Placement>,
     has_group: bool,
     me: NodeNumber,
@@ -116,13 +116,13 @@ pub(crate) fn should_ask(
 /// the agent's record: when it names the asker (a creation's placement is
 /// its record's replicas, committed), and `me` is one the asker takes a
 /// placement from, a node of it or of the configuration before.
-pub(crate) fn should_answer(placement: &Placement, asker: NodeNumber, me: NodeNumber) -> bool {
+fn should_answer(placement: &Placement, asker: NodeNumber, me: NodeNumber) -> bool {
     placement.admits(asker) && (placement.replicas.contains(&me) || placement.before.contains(&me))
 }
 
 /// Forget the asks older than [`ASK_EVERY`], once more than [`ASKS_KEPT`]
 /// are kept.
-pub(crate) fn trim_asks(asked: &mut HashMap<(AgentId, NodeNumber), Instant>, now: Instant) {
+fn trim_asks(asked: &mut HashMap<(AgentId, NodeNumber), Instant>, now: Instant) {
     if asked.len() > ASKS_KEPT {
         asked.retain(|_, at| now.saturating_duration_since(*at) < ASK_EVERY);
     }
@@ -353,48 +353,29 @@ impl Inner {
         let agent = Arc::new(Agent::new());
         let (inbox, inputs) = smol::channel::bounded(GROUP_INBOX);
         let (local, locals) = smol::channel::unbounded();
-        let guarded =
-            |name: &'static str, work: std::pin::Pin<Box<dyn Future<Output = ()> + Send>>| {
-                let shared = Arc::clone(&shared);
-                let agent = Arc::clone(&agent);
-                self.runtime.spawn(async move {
-                    if AssertUnwindSafe(work).catch_unwind().await.is_err() {
-                        tracing::error!(
-                            agent = id.0,
-                            "the agent's {name} panicked; the agent stops"
-                        );
-                        agent.stop();
-                        shared.stop();
-                    }
-                })
-            };
+        let (inner, run) = (Arc::clone(self), (&agent, &shared));
         let tasks = vec![
-            guarded(
+            self.guarded(
+                run,
                 "group",
-                Box::pin(group::drive(
-                    Arc::clone(self),
-                    Arc::clone(&shared),
-                    inputs,
-                    locals,
-                )),
+                group::drive(Arc::clone(&inner), Arc::clone(&shared), inputs, locals),
             ),
-            guarded(
+            self.guarded(
+                run,
                 "applier",
-                Box::pin(group::apply(Arc::clone(self), Arc::clone(&shared))),
+                group::apply(Arc::clone(&inner), Arc::clone(&shared)),
             ),
             // A builder that panics stops the agent, as its other tasks do:
             // a root built by a bug is worse than none.
-            guarded(
+            self.guarded(
+                run,
                 "root builder",
-                Box::pin(crate::roots::build(Arc::clone(self), Arc::clone(&shared))),
+                crate::roots::build(Arc::clone(&inner), Arc::clone(&shared)),
             ),
-            guarded(
+            self.guarded(
+                run,
                 "leader",
-                Box::pin(crate::leader::lead(
-                    Arc::clone(self),
-                    Arc::clone(&agent),
-                    Arc::clone(&shared),
-                )),
+                crate::leader::lead(inner, Arc::clone(&agent), Arc::clone(&shared)),
             ),
         ];
         runs.insert(
@@ -407,6 +388,27 @@ impl Inner {
                 tasks: Mutex::new(tasks),
             }),
         );
+    }
+
+    /// Spawn `work`, the `name` task of the agent whose queue and group
+    /// are `run`: a panic in it stops the agent.
+    fn guarded(
+        &self,
+        (agent, shared): (&Arc<Agent>, &Arc<Shared>),
+        name: &'static str,
+        work: impl Future<Output = ()> + Send + 'static,
+    ) -> smol::Task<()> {
+        let (agent, shared) = (Arc::clone(agent), Arc::clone(shared));
+        self.runtime.spawn(async move {
+            if AssertUnwindSafe(work).catch_unwind().await.is_err() {
+                tracing::error!(
+                    agent = shared.agent.0,
+                    "the agent's {name} panicked; the agent stops"
+                );
+                agent.stop();
+                shared.stop();
+            }
+        })
     }
 
     /// Keep a placement newer than the one held, with its record, durably,

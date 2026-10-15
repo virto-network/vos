@@ -3,8 +3,7 @@
 
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Mutex, PoisonError};
 use std::thread::JoinHandle;
 
 type Job = Box<dyn FnOnce() + Send>;
@@ -14,36 +13,28 @@ type Job = Box<dyn FnOnce() + Send>;
 pub(crate) struct Panicked(pub String);
 
 pub(crate) struct Executors {
-    sender: Mutex<Option<mpsc::Sender<Job>>>,
+    jobs: smol::channel::Sender<Job>,
     threads: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl Executors {
     pub(crate) fn spawn(count: usize) -> Self {
-        let (sender, receiver) = mpsc::channel::<Job>();
-        let receiver = Arc::new(Mutex::new(receiver));
+        let (jobs, taken) = smol::channel::unbounded::<Job>();
         let threads = (0..count.max(1))
             .map(|index| {
-                let receiver = Arc::clone(&receiver);
+                let taken = taken.clone();
                 std::thread::Builder::new()
                     .name(format!("vos-executor-{index}"))
                     .spawn(move || {
-                        loop {
-                            let job = receiver
-                                .lock()
-                                .unwrap_or_else(PoisonError::into_inner)
-                                .recv();
-                            match job {
-                                Ok(job) => job(),
-                                Err(_) => break,
-                            }
+                        while let Ok(job) = taken.recv_blocking() {
+                            job();
                         }
                     })
                     .expect("an executor thread starts")
             })
             .collect();
         Self {
-            sender: Mutex::new(Some(sender)),
+            jobs,
             threads: Mutex::new(threads),
         }
     }
@@ -53,10 +44,7 @@ impl Executors {
     /// waited for: the executors' last owner can go with a job one of them
     /// runs, and that thread ends on its own once the job returns.
     pub(crate) fn close(&self) {
-        self.sender
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
+        self.jobs.close();
         let threads =
             std::mem::take(&mut *self.threads.lock().unwrap_or_else(PoisonError::into_inner));
         let current = std::thread::current().id();
@@ -86,13 +74,7 @@ impl Executors {
             });
             let _ = done.try_send(result);
         });
-        let sent = self
-            .sender
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-            .map(|sender| sender.send(job).is_ok())
-            .unwrap_or(false);
+        let sent = self.jobs.try_send(job).is_ok();
         async move {
             if !sent {
                 return Err(Panicked("the executors stopped".into()));
@@ -112,6 +94,8 @@ impl Drop for Executors {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, mpsc};
+
     use super::*;
 
     /// Closing waits for the jobs already taken, so what they hold is gone

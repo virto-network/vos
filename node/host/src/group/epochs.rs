@@ -39,7 +39,7 @@ impl Inner {
 /// until it holds none. Its caller marks the epoch as dropped first
 /// (`Inner::dropping`): an epoch emptied by one pass, and chosen for a new
 /// install before the next, would lose the install's rows.
-pub(super) async fn drop_epoch(inner: &Inner, agent: AgentId, epoch: u8) {
+pub(super) async fn drop_rows(inner: &Inner, agent: AgentId, epoch: u8) {
     loop {
         let drop = Change::DropEpoch {
             agent,
@@ -81,7 +81,7 @@ pub(crate) fn empty_epoch(inner: &Inner, agent: AgentId) -> Option<u8> {
     Some(epoch)
 }
 
-/// Remove every stale epoch of `agent`'s, as [`drop_epoch`] does.
+/// Remove every stale epoch of `agent`'s, as [`drop_rows`] does.
 pub(crate) async fn drop_stale_epochs(inner: &Inner, agent: AgentId) {
     let Ok(stale) = inner.store.stale_epochs(agent) else {
         return;
@@ -90,7 +90,7 @@ pub(crate) async fn drop_stale_epochs(inner: &Inner, agent: AgentId) {
         inner.dropping(agent, epoch);
     }
     for epoch in stale {
-        drop_epoch(inner, agent, epoch).await;
+        drop_rows(inner, agent, epoch).await;
         inner.dropped(agent, epoch);
     }
 }

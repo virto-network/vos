@@ -341,14 +341,14 @@ impl Driver {
                 self.core
                     .durably_applied(self.inner.storage.durably_applied(self.shared.agent));
                 self.settle_streams();
-                if !self.process().await
-                    || !self.stage().await
-                    || !self.compact().await
-                    || !self.process().await
-                {
+                if !self.process().await || !self.stage().await {
                     break;
                 }
-                self.settle_membership().await;
+                self.compact().await;
+                if !self.process().await {
+                    break;
+                }
+                self.settle_membership();
                 self.fetch_blobs();
             }
         }
@@ -584,7 +584,7 @@ impl Driver {
                         && !status.members.contains(&me)
                         && status.commit_index >= status.active_config_index.unwrap_or(0);
                     if removed {
-                        self.announce_placement().await;
+                        self.announce_placement();
                     }
                     self.announced = None;
                     // It retires once it steps down; a group stopping does

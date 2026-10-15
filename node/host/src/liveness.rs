@@ -262,7 +262,7 @@ impl Inner {
             let admitted = member
                 .is_none_or(|member| placement.is_none_or(|placement| placement.admits(member)));
             if admitted {
-                self.propose(leading.agent, local());
+                self.to_group(leading.agent, local());
             }
         }
     }

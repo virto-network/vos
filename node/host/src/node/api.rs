@@ -106,11 +106,6 @@ impl Node {
         self.inner.drops.get(refusal)
     }
 
-    /// The node's number in its space.
-    pub fn number(&self) -> NodeNumber {
-        self.inner.number
-    }
-
     /// Create an agent running the node's agent program, replicated on
     /// this node alone. Blocks until its record is durable.
     pub fn create_agent(&self) -> Result<AgentId, CallError> {

@@ -18,7 +18,7 @@ use crate::store::{
 };
 
 /// The store's entry for a Raft entry.
-pub fn to_store(entry: &RaftEntry<NodeNumber>) -> LogEntry {
+pub(crate) fn to_store(entry: &RaftEntry<NodeNumber>) -> LogEntry {
     match &entry.kind {
         RaftKind::Data { payload } if payload.is_empty() => LogEntry {
             term: entry.term,
@@ -42,7 +42,7 @@ pub fn to_store(entry: &RaftEntry<NodeNumber>) -> LogEntry {
 }
 
 /// The Raft entry for the store's entry at `index`.
-pub fn to_raft(index: u64, entry: &LogEntry) -> RaftEntry<NodeNumber> {
+pub(crate) fn to_raft(index: u64, entry: &LogEntry) -> RaftEntry<NodeNumber> {
     match entry.kind {
         EntryKind::NoOp => RaftEntry::data(index, entry.term, Vec::new()),
         EntryKind::Result | EntryKind::LargeResult => {
@@ -61,14 +61,14 @@ pub fn to_raft(index: u64, entry: &LogEntry) -> RaftEntry<NodeNumber> {
 /// `payload_weight`): its bytes, and a large result's blob, which goes once
 /// the log is compacted past the entry. A program an install names stays
 /// pinned while the agent runs it, so it weighs nothing here.
-pub fn payload_weight(payload: &[u8]) -> u64 {
+pub(crate) fn payload_weight(payload: &[u8]) -> u64 {
     (payload.len() as u64).saturating_add(LogEntry::result_len(payload).unwrap_or(0))
 }
 
 /// The writer's changes for one of the core's writes, in its order:
 /// truncate, append, then the hard state and membership. The meta's
 /// snapshot pointer is left out.
-pub fn changes(agent: AgentId, write: &Write<NodeNumber>) -> Vec<Change> {
+pub(crate) fn changes(agent: AgentId, write: &Write<NodeNumber>) -> Vec<Change> {
     let mut changes = Vec::with_capacity(write.entries.len() + 3);
     if let Some(after) = write.truncate_after {
         changes.push(Change::Truncate { agent, after });
@@ -102,7 +102,7 @@ pub fn changes(agent: AgentId, write: &Write<NodeNumber>) -> Vec<Change> {
 
 /// The blobs each entry `changes` append names, by its index: none for an
 /// entry that names none.
-pub fn named(changes: &[Change]) -> Vec<(u64, Vec<[u8; 32]>)> {
+pub(crate) fn named(changes: &[Change]) -> Vec<(u64, Vec<[u8; 32]>)> {
     changes
         .iter()
         .filter_map(|change| match change {
@@ -115,7 +115,7 @@ pub fn named(changes: &[Change]) -> Vec<(u64, Vec<[u8; 32]>)> {
 }
 
 /// The entries a load asks for, within its bytes.
-pub fn load(
+pub(crate) fn load(
     store: &Fjall,
     agent: AgentId,
     load: &Load,
@@ -129,7 +129,7 @@ pub fn load(
 
 /// The compaction of the log through `through`, if the log still holds it,
 /// with `configuration` in effect there, when the core knows it.
-pub fn compaction(
+pub(crate) fn compaction(
     store: &Fjall,
     agent: AgentId,
     through: u64,
@@ -163,7 +163,7 @@ fn record(membership: Membership) -> ActiveConfigRecord<NodeNumber> {
 
 /// The writer's switch to a snapshot staged under `epoch`, at `index` and
 /// `term`, with the rows vos-raft's core computed for it: one synced batch.
-pub fn switch_change(
+pub(crate) fn switch_change(
     agent: AgentId,
     epoch: u8,
     index: u64,
@@ -285,7 +285,7 @@ pub struct Cut {
 }
 
 /// What the core recovers from the store's rows.
-pub fn recovered(rows: RaftRows) -> Recovered<NodeNumber> {
+pub(crate) fn recovered(rows: RaftRows) -> Recovered<NodeNumber> {
     Recovered {
         meta: Meta {
             current_term: rows.hard.term,
@@ -307,7 +307,7 @@ pub fn recovered(rows: RaftRows) -> Recovered<NodeNumber> {
 }
 
 mod reports;
-pub use reports::{EntryReports, RECOVERED};
+pub(crate) use reports::{EntryReports, RECOVERED};
 
 #[cfg(test)]
 mod tests;

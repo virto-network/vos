@@ -10,7 +10,7 @@ use vos_wire::ids::AgentId;
 use vos_wire::keys;
 
 use super::sweep::{due_rows, first_due};
-use super::{Leader, Ran};
+use super::{Ended, Leader};
 use crate::fault::{Fault, read};
 use crate::node::{Answered, Pending, Reply};
 use crate::store::{BlobRef, Snapshot};
@@ -37,11 +37,10 @@ impl Leader {
             let first = first_due(&snapshot, self.id)?;
             Ok((version, applied, floor, first))
         });
-        let (floor, first) = match read_state {
+        let (version, floor, first) = match read_state {
             Ok((version, applied, floor, first)) => {
-                self.version = version.unwrap_or(0);
                 self.applied = applied.unwrap_or(0);
-                (floor.unwrap_or(0), first)
+                (version.unwrap_or(0), floor.unwrap_or(0), first)
             }
             Err(fault) => {
                 self.retry(pending, fault).await;
@@ -80,7 +79,7 @@ impl Leader {
             return true;
         }
         let batch = Batch {
-            version: self.version,
+            version,
             time,
             seed: seed(),
             budget: self.inner.settings.refine_gas,
@@ -95,9 +94,8 @@ impl Leader {
             .collect();
         self.inner.stats.prepare.took(taken.elapsed());
         match self.execute(snapshot, batch, blobs).await {
-            Ok(Ran::Done(result)) => {
+            Ok(Ended::Done(result)) => {
                 self.skipped = false;
-                self.version += 1;
                 self.max_inputs = self.inner.settings.max_inputs;
                 self.backoff.reset();
                 if let Some(first) = sweeping {
@@ -107,20 +105,20 @@ impl Leader {
                     return false;
                 }
                 let dispatching = Instant::now();
-                self.dispatch(pending, &result, &before);
+                self.settle(pending, &result, &before);
                 self.inner.stats.dispatch.took(dispatching.elapsed());
             }
-            Ok(Ran::Lost) => {
+            Ok(Ended::Lost) => {
                 let hint = self.inner.not_leader(&self.shared);
                 for item in pending {
                     item.refuse(&hint);
                 }
             }
-            Ok(Ran::Skipped) if self.skipped => {
+            Ok(Ended::Skipped) if self.skipped => {
                 self.skipped = false;
                 self.fail(pending, "applied as no writes again".into());
             }
-            Ok(Ran::Skipped) => {
+            Ok(Ended::Skipped) => {
                 tracing::warn!(
                     agent = self.id.0,
                     "a result applied as no writes; its inputs go again"

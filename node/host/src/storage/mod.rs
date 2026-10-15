@@ -30,7 +30,7 @@ use crate::{Hooks, lock, raise};
 
 /// How long the oldest pending commit may wait before the writer counts as
 /// stalled.
-pub const STALL_AFTER: Duration = Duration::from_secs(1);
+const STALL_AFTER: Duration = Duration::from_secs(1);
 
 /// The most bytes of entries and writes one flush takes, once it has any:
 /// a guard, so one large commit cannot hold back every agent for long.
@@ -149,7 +149,16 @@ impl Change {
             | Self::Stage { .. }
             | Self::DropEpoch { .. } => false,
             Self::Hard { sync, .. } => *sync,
-            _ => true,
+            Self::Append { .. }
+            | Self::Truncate { .. }
+            | Self::Membership { .. }
+            | Self::Switch { .. }
+            | Self::Pin { .. }
+            | Self::Unpin { .. }
+            | Self::Barrier
+            | Self::Agent(_)
+            | Self::Placement { .. }
+            | Self::Retire { .. } => true,
         }
     }
 
@@ -210,7 +219,7 @@ impl StorageThread {
         Self::spawn_with(store, hooks, STALL_AFTER)
     }
 
-    pub fn spawn_with(store: Fjall, hooks: Arc<dyn Hooks>, stall_after: Duration) -> Self {
+    fn spawn_with(store: Fjall, hooks: Arc<dyn Hooks>, stall_after: Duration) -> Self {
         let (sender, receiver) = mpsc::channel::<Commit>();
         let shared = Arc::new(Shared::default());
         let mut writer = Writer::new(store, hooks, Arc::clone(&shared));
@@ -278,7 +287,7 @@ impl StorageThread {
     }
 
     /// Whether `agent`'s commits left dirty rows since this was last asked.
-    pub fn take_dirtied(&self, agent: AgentId) -> bool {
+    pub(crate) fn take_dirtied(&self, agent: AgentId) -> bool {
         lock(&self.shared.dirtied).remove(&agent)
     }
 
@@ -302,12 +311,12 @@ impl StorageThread {
 
     /// Whether a flush failed: every commit since is refused, and the node
     /// must halt.
-    pub fn failed(&self) -> bool {
+    pub(crate) fn failed(&self) -> bool {
         self.shared.failed.load(Ordering::SeqCst)
     }
 
     /// Whether a commit has waited longer than the stall bound.
-    pub fn stalled(&self) -> bool {
+    pub(crate) fn stalled(&self) -> bool {
         lock(&self.shared.pending)
             .values()
             .next()

@@ -20,12 +20,7 @@ impl Leader {
     /// result did not cover, deliver the outbox and acknowledge applied
     /// messages. A step no input made, a workflow's due step after its
     /// start or the sweep, pairs with no input.
-    pub(super) fn dispatch(
-        &mut self,
-        pending: Vec<Pending>,
-        result: &WorkResult,
-        before: &Snapshot,
-    ) {
+    pub(super) fn settle(&mut self, pending: Vec<Pending>, result: &WorkResult, before: &Snapshot) {
         let snapshot = self.inner.store.snapshot();
         let mut acks: HashMap<AgentId, u64> = HashMap::new();
         let mut rest = Vec::new();

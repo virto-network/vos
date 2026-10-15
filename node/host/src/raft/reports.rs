@@ -11,13 +11,13 @@ use crate::store::NodeNumber;
 /// with the blobs its entries name that were missing. A write's entries
 /// are reported once its blobs, and every earlier write's, are stored.
 #[derive(Default)]
-pub struct EntryReports {
+pub(crate) struct EntryReports {
     pending: VecDeque<Pending>,
 }
 
 /// The sequence standing for the log a replica recovered, before its
 /// core's first write.
-pub const RECOVERED: u64 = 0;
+pub(crate) const RECOVERED: u64 = 0;
 
 struct Pending {
     seq: u64,
@@ -29,7 +29,7 @@ impl EntryReports {
     /// The recovered log's committed entries kept without their blobs
     /// ([`Cut::refetch`]): they wait, as [`RECOVERED`], ahead of every
     /// write.
-    pub fn recovered(&mut self, waiting: Vec<(u64, Vec<[u8; 32]>)>) {
+    pub(crate) fn recovered(&mut self, waiting: Vec<(u64, Vec<[u8; 32]>)>) {
         if !waiting.is_empty() {
             self.pending.push_front(Pending {
                 seq: RECOVERED,
@@ -39,7 +39,7 @@ impl EntryReports {
     }
 
     /// Whether recovered entries still wait for their blobs.
-    pub fn recovering(&self) -> bool {
+    pub(crate) fn recovering(&self) -> bool {
         self.pending
             .front()
             .is_some_and(|pending| pending.seq == RECOVERED)
@@ -50,7 +50,7 @@ impl EntryReports {
     /// entries it removed, from earlier writes too. `stored` answers from a
     /// [`crate::blobs::Blobs::touch`] of the write's blobs, so none of them is collected
     /// while the entry comes to rely on it.
-    pub fn written(
+    pub(crate) fn written(
         &mut self,
         write: &Write<NodeNumber>,
         named: Vec<(u64, Vec<[u8; 32]>)>,
@@ -76,7 +76,7 @@ impl EntryReports {
     }
 
     /// The last write whose entries can now be reported, if any.
-    pub fn ready(&mut self, stored: impl Fn(&[u8; 32]) -> bool) -> Option<u64> {
+    pub(crate) fn ready(&mut self, stored: impl Fn(&[u8; 32]) -> bool) -> Option<u64> {
         let mut last = None;
         while let Some(front) = self.pending.front_mut() {
             front
@@ -93,7 +93,7 @@ impl EntryReports {
 
     /// Every blob a waiting write still needs, each once: the host fetches
     /// them together.
-    pub fn missing(&self) -> Vec<[u8; 32]> {
+    pub(crate) fn missing(&self) -> Vec<[u8; 32]> {
         let mut missing: Vec<[u8; 32]> = self
             .pending
             .iter()
@@ -107,7 +107,7 @@ impl EntryReports {
 
     /// A snapshot switch at `index`: the entries at or below it are covered,
     /// and with them every entry above if the log's suffix went.
-    pub fn switched(&mut self, index: u64, keeps_suffix: bool) {
+    pub(crate) fn switched(&mut self, index: u64, keeps_suffix: bool) {
         for pending in &mut self.pending {
             pending
                 .waiting

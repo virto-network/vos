@@ -12,19 +12,19 @@ use super::Driver;
 impl Driver {
     /// Note when this replica holds a committed configuration naming it,
     /// and, leading, announce where the agent runs whenever that changes.
-    pub(super) async fn settle_membership(&mut self) {
+    pub(super) fn settle_membership(&mut self) {
         if established(&self.core, self.inner.number) && !self.shared.state().established {
             self.shared.update(|state| state.established = true);
         }
         if self.core.role() != Role::Leader {
             return;
         }
-        self.announce_placement().await;
+        self.announce_placement();
     }
 
     /// Announce where the agent runs, as this replica's core has it, when
     /// that changed since it last did.
-    pub(super) async fn announce_placement(&mut self) {
+    pub(super) fn announce_placement(&mut self) {
         let status = self.core.status();
         let index = status.active_config_index.unwrap_or(0);
         let replicas = nodes(status.members, status.joint_old.clone());

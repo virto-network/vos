@@ -80,7 +80,7 @@ impl Inner {
 
     /// Give `agent`'s group `input`: false, and counted, when no group here
     /// runs it or its inbox is full; the sender sends again.
-    fn to_group(&self, agent: AgentId, input: Input) -> bool {
+    fn to_inbox(&self, agent: AgentId, input: Input) -> bool {
         let routed = self
             .run(agent)
             .is_some_and(|run| run.inbox.try_send(input).is_ok());
@@ -159,7 +159,7 @@ impl Inner {
                     message: peer::from_wire(message),
                 };
                 // No group here, or its inbox is full: Raft sends again.
-                if !self.to_group(agent, input) {
+                if !self.to_inbox(agent, input) {
                     self.ask_for_record(from, agent, self.run(agent).is_some());
                 }
             }
@@ -207,11 +207,11 @@ impl Inner {
             }
             PeerMessage::SnapshotChunk(chunk) => {
                 let agent = chunk.agent;
-                self.to_group(agent, Input::Chunk { from, chunk });
+                self.to_inbox(agent, Input::Chunk { from, chunk });
             }
             PeerMessage::SnapshotAck(ack) => {
                 let agent = ack.agent;
-                self.to_group(agent, Input::ChunkAck { from, ack });
+                self.to_inbox(agent, Input::ChunkAck { from, ack });
             }
             // Taken on the pair heartbeat's own thread; none arrives here.
             PeerMessage::Liveness { .. } => {}

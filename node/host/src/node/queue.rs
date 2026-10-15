@@ -43,8 +43,7 @@ pub(crate) enum Pending {
         sequence: u64,
     },
     /// The leader's sweep of the rows of the due index due at its batch's
-    /// time, which it lists: expired sessions, and workflows' steps. Empty,
-    /// an idle leader's mark that a sweep may be due.
+    /// time, which it lists: expired sessions, and workflows' steps.
     Sweep(Vec<(u64, Due)>),
 }
 

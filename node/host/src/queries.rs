@@ -235,7 +235,7 @@ impl Inner {
     async fn confirm(&self, id: AgentId) -> Result<u64, CallError> {
         let run = self.present(id)?;
         let (answer, answered) = smol::channel::bounded(1);
-        if !self.propose(id, Local::ReadIndex { answer }) {
+        if !self.to_group(id, Local::ReadIndex { answer }) {
             return Err(CallError::Stopped);
         }
         match answered.recv().await {

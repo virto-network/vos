@@ -77,7 +77,7 @@ impl Inner {
             members,
             answer,
         };
-        if !self.propose(agent, change) {
+        if !self.to_group(agent, change) {
             return Err(ReplaceError::Call(CallError::Stopped));
         }
         let joint = match answered.recv().await {

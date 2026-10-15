@@ -219,12 +219,12 @@ impl Inner {
     /// That this node does not lead `shared`'s group, with its leader's
     /// address when known; or that the group stopped.
     pub(crate) fn not_leader(&self, shared: &Shared) -> CallError {
-        if shared.state().stopped {
+        let state = shared.state();
+        if state.stopped {
             return CallError::Stopped;
         }
         CallError::NotLeader(
-            shared
-                .state()
+            state
                 .leader
                 .filter(|leader| *leader != self.number)
                 .and_then(|leader| self.contact(leader)),
@@ -254,10 +254,14 @@ impl Inner {
                 "the leader has not applied what it took over".into(),
             ));
         }
-        if run.shared.state().stopped || lock(&run.agent.queue).stopped {
+        let (stopped, leading) = {
+            let queue = lock(&run.agent.queue);
+            (queue.stopped, queue.leading)
+        };
+        if run.shared.state().stopped || stopped {
             return Err(CallError::Stopped);
         }
-        if !run.agent.leading() {
+        if !leading {
             return Err(self.not_leader(&run.shared));
         }
         Ok(run)
@@ -328,9 +332,9 @@ impl Inner {
         self.stats.wire(self.storage.stages())
     }
 
-    /// Hand the leader loop's `local` to agent `id`'s group. False when it
-    /// has none here, or it stopped.
-    pub(crate) fn propose(&self, id: AgentId, local: Local) -> bool {
+    /// Hand `local` to agent `id`'s group, never dropped. False when it has
+    /// none here, or it stopped.
+    pub(crate) fn to_group(&self, id: AgentId, local: Local) -> bool {
         self.run(id)
             .is_some_and(|run| run.local.try_send(local).is_ok())
     }
@@ -383,19 +387,23 @@ impl Inner {
         request: Request,
     ) -> impl Future<Output = Result<Answered, CallError>> + use<> {
         let (answer, reply) = smol::channel::bounded(1);
-        let mut pending = Some(Pending::Request { request, answer });
+        let pending = Pending::Request { request, answer };
         let known = self.run(agent).is_some_and(|run| {
             let state = run.shared.state();
             state.stopped || self.knows_leader(&run, &state)
         });
-        let queued = known.then(|| self.push(agent, pending.take().expect("a pending call")));
+        let queued = if known {
+            Ok(self.push(agent, pending))
+        } else {
+            Err(pending)
+        };
         let inner = Arc::clone(self);
         async move {
             match queued {
-                Some(queued) => queued?,
-                None => {
+                Ok(queued) => queued?,
+                Err(pending) => {
                     inner.settled(agent).await?;
-                    inner.push(agent, pending.take().expect("a pending call"))?;
+                    inner.push(agent, pending)?;
                 }
             }
             reply.recv().await.map_err(|_| CallError::Stopped)?
@@ -445,7 +453,7 @@ pub struct Node {
     /// The ingress, and what stops it.
     ingress: Mutex<Option<(smol::Task<()>, smol::channel::Sender<()>)>>,
     stop: Option<smol::channel::Sender<()>>,
-    runtime: Vec<JoinHandle<()>>,
+    runtime: Option<JoinHandle<()>>,
     /// The pair heartbeat's thread, and what stops it.
     liveness: Option<(smol::channel::Sender<()>, JoinHandle<()>)>,
     /// The blob collector's thread, and what stops it.

@@ -41,7 +41,7 @@ use crate::storage::Change;
 use crate::store::{Fjall, Snapshot};
 
 /// The most distinct keys one batch rebuilds.
-pub const BATCH: usize = 10_000;
+pub(crate) const BATCH: usize = 10_000;
 
 /// The most dirty rows one batch reads, per key it may rebuild: a key
 /// written at many versions has a row for each.
@@ -95,9 +95,9 @@ impl From<vos_tree::Error> for Error {
 /// left. Between a build's batches the top has moved on and the root has
 /// not.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub struct RootRow {
-    pub top: Option<Child>,
-    pub root: Hash,
+pub(crate) struct RootRow {
+    pub(crate) top: Option<Child>,
+    pub(crate) root: Hash,
 }
 
 impl RootRow {
@@ -116,7 +116,7 @@ impl RootRow {
 }
 
 /// A map's root row, as `snapshot` holds it.
-pub fn root_row(
+pub(crate) fn root_row(
     snapshot: &Snapshot,
     agent: AgentId,
     map: &MapId,
@@ -157,9 +157,10 @@ pub fn root(snapshot: &Snapshot, agent: AgentId, map: &MapId) -> Result<(Hash, u
             }
         }
     };
-    let version = match waits {
-        true => built,
-        false => state_version(snapshot, agent)?,
+    let version = if waits {
+        built
+    } else {
+        state_version(snapshot, agent)?
     };
     Ok((root, version))
 }
@@ -221,7 +222,7 @@ pub struct Proven {
 
 /// The proof of `keys`, raw as the map's handler wrote them, from one
 /// storage snapshot.
-pub fn prove<K: AsRef<[u8]>>(
+pub(crate) fn prove<K: AsRef<[u8]>>(
     snapshot: &Snapshot,
     agent: AgentId,
     map: MapId,
@@ -332,7 +333,7 @@ impl NodeStore for MapStore<'_> {
 }
 
 /// Keys to rebuild, by map, each map's sorted.
-type Keys = BTreeMap<MapId, Vec<Vec<u8>>>;
+type Keys = BTreeMap<MapId, BTreeSet<Vec<u8>>>;
 
 /// A build of an agent's roots at its state version, a batch at a time.
 pub struct Build {
@@ -394,11 +395,6 @@ impl Build {
         self
     }
 
-    /// The state version the build is at.
-    pub fn version(&self) -> u64 {
-        self.version
-    }
-
     /// The agent's epoch the build reads and writes.
     pub fn epoch(&self) -> u8 {
         self.epoch
@@ -421,11 +417,11 @@ impl Build {
         }
         let mut seeds = HashMap::new();
         let mut writes = BTreeMap::new();
-        for (map, keys) in batch {
+        for (map, rebuilt) in batch {
             let before = root_row(&fresh, self.agent, &map)?;
             let top = before.as_ref().and_then(|row| row.top.clone());
             let mut tree = MapStore::new(&fresh, self.agent, map, top);
-            let leaves = keys
+            let leaves = rebuilt
                 .into_iter()
                 .map(|key| {
                     let leaf = self.leaf(&mut seeds, &map, &key)?;
@@ -449,13 +445,12 @@ impl Build {
         // version's rows are read: an interrupted build then always leaves
         // a seed past the watermark, so the next build starts and finishes
         // the maps it left part-way.
-        let through = match last {
-            true => self.version,
-            false => {
-                let (version, _, _) =
-                    keys::dirty_entry(&self.cursor).ok_or(Error::Corrupt("a dirty row"))?;
-                version.saturating_sub(1)
-            }
+        let through = if last {
+            self.version
+        } else {
+            let (version, _, _) =
+                keys::dirty_entry(&self.cursor).ok_or(Error::Corrupt("a dirty row"))?;
+            version.saturating_sub(1)
         };
         let after = keys::seed(self.seeds_through);
         for row in self.at.scan(self.agent, &keys::seed_prefix(), Some(&after)) {
@@ -511,7 +506,7 @@ impl Build {
     /// [`ROWS_PER_KEY`] allows them, or none remain; and whether none
     /// remains.
     fn read_batch(&mut self) -> Result<(Keys, Vec<Vec<u8>>, bool), Error> {
-        let mut batch: BTreeMap<MapId, BTreeSet<Vec<u8>>> = BTreeMap::new();
+        let mut batch = Keys::new();
         let mut found = 0;
         let mut rows = Vec::new();
         let prefix = keys::dirty_prefix();
@@ -533,10 +528,6 @@ impl Build {
             rows.push(row);
         };
         self.read += rows.len() as u64;
-        let batch = batch
-            .into_iter()
-            .map(|(map, keys)| (map, keys.into_iter().collect()))
-            .collect();
         Ok((batch, rows, last))
     }
 

@@ -10,11 +10,24 @@ fn writer(dir: &std::path::Path) -> StorageThread {
 }
 
 fn apply(index: u64) -> Change {
+    apply_at(0, index)
+}
+
+fn apply_at(epoch: u8, index: u64) -> Change {
     Change::Apply {
         agent: A,
-        epoch: 0,
+        epoch,
         index,
         writes: Vec::new(),
+    }
+}
+
+fn compact(through: u64) -> Change {
+    Change::Compact {
+        agent: A,
+        through,
+        term: 1,
+        membership: None,
     }
 }
 
@@ -110,12 +123,6 @@ fn a_failed_flush_stops_the_writer_for_good() {
 fn compaction_past_the_durably_applied_index_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let writer = writer(dir.path());
-    let compact = |through| Change::Compact {
-        agent: A,
-        through,
-        term: 1,
-        membership: None,
-    };
     smol::block_on(writer.commit((1..=5).map(apply).collect())).unwrap();
     assert!(smol::block_on(writer.commit(vec![compact(3)])).is_err());
     smol::block_on(writer.commit(vec![hard(1, true)])).unwrap();
@@ -128,12 +135,6 @@ fn stale_applies_stagings_and_switches_are_refused() {
     let dir = tempfile::tempdir().unwrap();
     let writer = writer(dir.path());
     let commit = |change| smol::block_on(writer.commit(vec![change]));
-    let apply_at = |epoch, index| Change::Apply {
-        agent: A,
-        epoch,
-        index,
-        writes: Vec::new(),
-    };
     let switch = |epoch, index| Change::Switch {
         agent: A,
         switch: Switch {
@@ -197,12 +198,6 @@ fn stale_applies_stagings_and_switches_are_refused() {
         .is_err(),
         "not cleared"
     );
-    let compact = |through| Change::Compact {
-        agent: A,
-        through,
-        term: 1,
-        membership: None,
-    };
     assert!(
         commit(compact(5)).is_err(),
         "at the log start the switch set"

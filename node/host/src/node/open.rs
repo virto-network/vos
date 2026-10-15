@@ -9,13 +9,14 @@ use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::SigningKey;
-use vos_net::Network;
+use vos_net::{Arrivals, Network};
 use vos_pvm::PvmBackend;
 use vos_pvm::pool::{CodeHash, MachinePool, OuterMachines};
 use vos_wire::defaults;
+use vos_wire::ids::AgentId;
 use vos_wire::ids::ProgramHash;
 use vos_wire::ingress::NodeId;
-use vos_wire::peer::{CreationRecord, Placement};
+use vos_wire::peer::{CreationRecord, NodeNumber, Placement};
 
 use super::{Config, Counters, Directory, Error, Inner, Node, Peers, Run, Settings, Tasks};
 use crate::blobs::Blobs;
@@ -44,16 +45,7 @@ impl Node {
         let data = data.as_ref().to_path_buf();
         private_dir(&data).map_err(Error::Data)?;
         let store = Fjall::open(data.join(STORE))?;
-        let secret = match store.node_secret()? {
-            Some(secret) => secret,
-            None => {
-                let secret = seed();
-                let mut batch = store.batch();
-                batch.node_secret(&secret);
-                batch.commit(PersistMode::SyncAll)?;
-                secret
-            }
-        };
+        let secret = node_secret(&store)?;
         // Each run's pair heartbeat outranks the last run's, whatever the
         // clock did between them.
         let incarnation = crate::liveness::next_incarnation(store.incarnation()?);
@@ -76,14 +68,7 @@ impl Node {
             None => 0,
         };
         let blobs = Blobs::open(data.join(BLOBS), &store)?;
-        let pool = Arc::new(MachinePool::new());
-        for hash in blobs.pinned()? {
-            let blob = blobs
-                .get(&hash)?
-                .ok_or_else(|| Error::Program("a pinned program's blob is missing".into()))?;
-            pool.install(&blob)
-                .map_err(|error| Error::Program(format!("{error:?}")))?;
-        }
+        let pool = load_pool(&blobs)?;
         // Agent programs run only on executors, one at a time on each: keep
         // as many machines idle as can run at once.
         let program =
@@ -91,49 +76,20 @@ impl Node {
                 .map_err(|error| Error::Program(format!("{error:?}")))?;
         let program_hash = ProgramHash(CodeHash::of(&config.agent).0);
         let records = store.agents()?;
-        let mut placements = store.placements()?;
-        let (network, arrivals): (Option<Arc<dyn Network>>, _) =
-            match (&config.space, &config.peers) {
-                (Some(space), Peers::Quic) if space.nodes().len() > 1 => {
-                    let listen = config
-                        .peer_bind
-                        .unwrap_or(space.node(number).expect("this node is in its space").peer);
-                    let (quic, arrivals) = vos_net::quic::Quic::bind(vos_net::quic::Config {
-                        peers: space.peers(),
-                        idle: config.quic_idle,
-                        ..vos_net::quic::Config::new(number, secret, listen)
-                    })
-                    .map_err(|error| Error::Data(format!("{listen}: {error}")))?;
-                    (Some(Arc::new(quic)), Some(arrivals))
-                }
-                (Some(space), Peers::Hub(hub)) => {
-                    let (endpoint, arrivals) = hub.join(number);
-                    endpoint.set_peers(space.peers());
-                    (Some(Arc::new(endpoint)), Some(arrivals))
-                }
-                _ => (None, None),
-            };
-        // Frames of a class a test loses go before they reach the network.
-        #[cfg(feature = "faults")]
-        let network = match (network, &config.faults) {
-            (Some(network), Some(faults)) => Some(Arc::new(crate::faults::Lossy {
-                network,
-                faults: Arc::clone(faults),
-            }) as Arc<dyn Network>),
-            (network, _) => network,
-        };
+        let placements = store.placements()?;
+        let (network, arrivals) = connect(&config, number, secret)?.unzip();
         let runtime = Arc::new(smol::Executor::new());
         let (stop, stopped) = smol::channel::bounded::<()>(1);
         // One thread runs the node's tasks: its groups' drivers, leader and
         // apply loops, its ingress and its peers' messages. Calls keep their
         // lane's order by it (see `calls`).
-        let threads: Vec<JoinHandle<()>> = vec![{
+        let thread = {
             let runtime = Arc::clone(&runtime);
             std::thread::Builder::new()
                 .name("vos-node".into())
                 .spawn(move || smol::block_on(runtime.run(stopped.recv())).unwrap_or(()))
                 .expect("the node's thread starts")
-        }];
+        };
         let next = records
             .iter()
             .filter(|record| CreationRecord::creator_of(record.agent) == number)
@@ -184,61 +140,11 @@ impl Node {
             halted: AtomicBool::new(false),
             liveness: crate::liveness::Liveness::new(incarnation),
         });
-        for record in records {
-            let agent = record.agent;
-            let placement = match placements.remove(&agent) {
-                Some(Some(placement)) => placement,
-                Some(None) => {
-                    tracing::error!(
-                        agent = agent.0,
-                        "an unreadable placement; its agent is not run until a placement comes"
-                    );
-                    continue;
-                }
-                None => Placement::created(&record),
-            };
-            let created = record.creator == number && placement.term == 0;
-            // A retirement a crash cut short is finished: no group starts
-            // for an agent its placement no longer names.
-            let unfinished =
-                !placement.admits(number) && inner.holds_replica(agent).unwrap_or(false);
-            if unfinished {
-                lock(&inner.retiring).insert(agent);
-            }
-            inner.learn(record, placement);
-            if created {
-                inner.announce(agent);
-            }
-            if unfinished {
-                let retiring = Arc::clone(&inner);
-                inner.spawn(async move { retiring.finish_retirement(agent).await });
-            }
-        }
-        let mut liveness = None;
-        if let Some(arrivals) = arrivals {
-            let (stop, stopped) = smol::channel::bounded::<()>(1);
-            let heard = arrivals.liveness.clone();
-            let thread = {
-                let inner = Arc::clone(&inner);
-                std::thread::Builder::new()
-                    .name("vos-liveness".into())
-                    .spawn(move || crate::liveness::supervise(inner, heard, stopped))
-                    .expect("the liveness thread starts")
-            };
-            liveness = Some((stop, thread));
-            inner.spawn(crate::dispatch::dispatch(Arc::clone(&inner), arrivals));
-        }
+        inner.resume(records, placements);
+        let liveness = arrivals.map(|arrivals| start_liveness(&inner, arrivals));
         inner.spawn(super::directory::resend_records(Arc::clone(&inner)));
         inner.spawn(crate::stats::probe(Arc::clone(&inner)));
-        let collector = {
-            let (stop, stopped) = mpsc::channel::<()>();
-            let inner = Arc::clone(&inner);
-            let thread = std::thread::Builder::new()
-                .name("vos-blob-collect".into())
-                .spawn(move || collect_blobs(&inner, &stopped))
-                .expect("the blob collector's thread starts");
-            Some((stop, thread))
-        };
+        let collector = Some(start_collector(&inner));
         Ok(Self {
             inner,
             data,
@@ -246,7 +152,7 @@ impl Node {
             ingress_tls: config.ingress_tls,
             ingress: Mutex::new(None),
             stop: Some(stop),
-            runtime: threads,
+            runtime: Some(thread),
             liveness,
             collector,
         })
@@ -262,7 +168,7 @@ impl Node {
     fn stop_all(&mut self) {
         // Once is enough: the runtime is gone after it, and nothing it
         // never ran could be awaited.
-        if self.runtime.is_empty() {
+        if self.runtime.is_none() {
             return;
         }
         {
@@ -301,7 +207,7 @@ impl Node {
         if let Some(stop) = self.stop.take() {
             stop.close();
         }
-        for runtime in self.runtime.drain(..) {
+        if let Some(runtime) = self.runtime.take() {
             let _ = runtime.join();
         }
         // The jobs left finish here, and what they hold goes with them: no
@@ -314,6 +220,147 @@ impl Drop for Node {
     fn drop(&mut self) {
         self.stop_all();
     }
+}
+
+impl Inner {
+    /// Learn every agent the store records, and act on each: its group
+    /// started where its placement names this node, its placement
+    /// announced if this node created it and it never moved, and a
+    /// retirement a crash cut short finished.
+    fn resume(
+        self: &Arc<Self>,
+        records: Vec<CreationRecord>,
+        mut placements: HashMap<AgentId, Option<Placement>>,
+    ) {
+        for record in records {
+            let agent = record.agent;
+            let placement = match placements.remove(&agent) {
+                Some(Some(placement)) => placement,
+                Some(None) => {
+                    tracing::error!(
+                        agent = agent.0,
+                        "an unreadable placement; its agent is not run until a placement comes"
+                    );
+                    continue;
+                }
+                None => Placement::created(&record),
+            };
+            let created = record.creator == self.number && placement.term == 0;
+            // A retirement a crash cut short is finished: no group starts
+            // for an agent its placement no longer names.
+            let unfinished =
+                !placement.admits(self.number) && self.holds_replica(agent).unwrap_or(false);
+            if unfinished {
+                lock(&self.retiring).insert(agent);
+            }
+            self.learn(record, placement);
+            if created {
+                self.announce(agent);
+            }
+            if unfinished {
+                let retiring = Arc::clone(self);
+                self.spawn(async move { retiring.finish_retirement(agent).await });
+            }
+        }
+    }
+}
+
+/// The node's secret, the seed of its key: made, and kept durably, at its
+/// first start.
+fn node_secret(store: &Fjall) -> Result<[u8; 32], Error> {
+    if let Some(secret) = store.node_secret()? {
+        return Ok(secret);
+    }
+    let secret = seed();
+    let mut batch = store.batch();
+    batch.node_secret(&secret);
+    batch.commit(PersistMode::SyncAll)?;
+    Ok(secret)
+}
+
+/// A machine pool that holds every program an agent here pins.
+fn load_pool(blobs: &Blobs) -> Result<Arc<MachinePool>, Error> {
+    let pool = Arc::new(MachinePool::new());
+    for hash in blobs.pinned()? {
+        let blob = blobs
+            .get(&hash)?
+            .ok_or_else(|| Error::Program("a pinned program's blob is missing".into()))?;
+        pool.install(&blob)
+            .map_err(|error| Error::Program(format!("{error:?}")))?;
+    }
+    Ok(pool)
+}
+
+/// The network to the other nodes of the space, and what arrives on it.
+type Connection = (Arc<dyn Network>, Arrivals);
+
+/// The node's connection to the other nodes of its space, as node
+/// `number`: none in a space of one.
+fn connect(
+    config: &Config,
+    number: NodeNumber,
+    secret: [u8; 32],
+) -> Result<Option<Connection>, Error> {
+    let (network, arrivals): (Arc<dyn Network>, _) = match (&config.space, &config.peers) {
+        (Some(space), Peers::Quic) if space.nodes().len() > 1 => {
+            let listen = config
+                .peer_bind
+                .unwrap_or_else(|| space.node(number).expect("this node is in its space").peer);
+            let (quic, arrivals) = vos_net::quic::Quic::bind(vos_net::quic::Config {
+                peers: space.peers(),
+                idle: config.quic_idle,
+                ..vos_net::quic::Config::new(number, secret, listen)
+            })
+            .map_err(|error| Error::Data(format!("{listen}: {error}")))?;
+            (Arc::new(quic), arrivals)
+        }
+        (Some(space), Peers::Hub(hub)) => {
+            let (endpoint, arrivals) = hub.join(number);
+            endpoint.set_peers(space.peers());
+            (Arc::new(endpoint), arrivals)
+        }
+        _ => return Ok(None),
+    };
+    // Frames of a class a test loses go before they reach the network.
+    #[cfg(feature = "faults")]
+    let network = match &config.faults {
+        Some(faults) => Arc::new(crate::faults::Lossy {
+            network,
+            faults: Arc::clone(faults),
+        }) as Arc<dyn Network>,
+        None => network,
+    };
+    Ok(Some((network, arrivals)))
+}
+
+/// The pair heartbeat's thread, and what stops it; and the dispatch of
+/// every other arrival, on the node's thread.
+fn start_liveness(
+    inner: &Arc<Inner>,
+    arrivals: Arrivals,
+) -> (smol::channel::Sender<()>, JoinHandle<()>) {
+    let (stop, stopped) = smol::channel::bounded::<()>(1);
+    let heard = arrivals.liveness.clone();
+    let thread = {
+        let inner = Arc::clone(inner);
+        std::thread::Builder::new()
+            .name("vos-liveness".into())
+            .spawn(move || crate::liveness::supervise(inner, heard, stopped))
+            .expect("the liveness thread starts")
+    };
+    inner.spawn(crate::dispatch::dispatch(Arc::clone(inner), arrivals));
+    (stop, thread)
+}
+
+/// The blob collector's thread, and what stops it.
+fn start_collector(inner: &Arc<Inner>) -> (mpsc::Sender<()>, JoinHandle<()>) {
+    let (stop, stopped) = mpsc::channel::<()>();
+    let inner = Arc::clone(inner);
+    let thread = std::thread::Builder::new()
+        .name("vos-blob-collect".into())
+        .spawn(move || collect_blobs(&inner, &stopped))
+        .expect("the blob collector's thread starts");
+    (stop, thread)
 }
 
 /// Collect the blob store every `blob_collect_every` until stopped, on a
