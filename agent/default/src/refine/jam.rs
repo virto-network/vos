@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 use vos_tree::{Blake2b, Hash, PartialTree, salt, value_hash};
 use vos_wire::apply::{Host, State, apply};
 use vos_wire::ids::{AgentId, WorkflowId};
-use vos_wire::package::{JamOutput, Opened, Package, ScannedRange, SEGMENT, StateWitness};
+use vos_wire::package::{JamOutput, Opened, Package, SEGMENT, ScannedRange, StateWitness};
 use vos_wire::result::{PAGE, WorkResult, digest};
 use vos_wire::{Decode, Encode};
 

@@ -5,6 +5,7 @@ use vos_wire::abi::Failure;
 use vos_wire::batch::{Admin, Answer, Await, Batch, Body, Input, Message};
 use vos_wire::ids::{
     AgentId, InstanceId, MapId, MethodId, Principal, ProgramHash, Session, SessionId, WorkflowId,
+    derive_id,
 };
 use vos_wire::ingress::Grant;
 use vos_wire::jam::{AccumulateInput, RefineArgs, WorkError};
@@ -14,6 +15,15 @@ use vos_wire::result::{CommittedWrite, InputRef, Outcome, Outgoing, Page, Run, W
 use vos_wire::{Decode, Encode};
 
 use crate::strategies::{hex, round_trip};
+
+/// Every stored table and every method is keyed by these ids, so a change
+/// to their derivation would re-key them all. The values are BLAKE2b-256
+/// computed by an implementation independent of the agent's.
+#[test]
+fn derived_ids_keep_their_values() {
+    assert_eq!(derive_id("vos/method/", "increment"), 0xf251_d1d4);
+    assert_eq!(derive_id("vos/table/", "counts"), 0xb6e2_e00c);
+}
 
 #[test]
 fn natural_widths_follow_the_gray_paper() {

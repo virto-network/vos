@@ -12,11 +12,11 @@ use vos_wire::records::Workflow;
 use vos_wire::result::{CommittedWrite, InputRef, Outcome, Outgoing, Run, Step, Write};
 use vos_wire::{Encode, defaults, keys};
 
-use super::{Call, Overlay};
 use super::base::{Base, Corrupt};
 use super::batch::{Mark, Stepped};
 use super::invocation::Invocation;
 use super::workflows;
+use super::{Call, Overlay};
 
 /// A request's or a call's step: a handler's command, or a workflow's
 /// start, which its first step follows when the budget allows.

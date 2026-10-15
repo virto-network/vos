@@ -178,7 +178,7 @@ impl Invocation<'_> {
                 self.base.meter.kept()
             };
             if self.base.meter.left() < keep + pages + serving {
-                self.base.meter.overrun();
+                self.base.meter.mark_overrun();
                 *outcome = Some(self.preempt_or_fail(share, used > 0, Some(id), false)?);
                 return Ok(());
             }

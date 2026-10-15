@@ -53,7 +53,7 @@ impl Meter {
 
     /// Keep `gas` for the running step, if what is left covers it: whether
     /// it does.
-    pub(crate) fn keeps(&self, gas: u64) -> bool {
+    pub(crate) fn try_keep(&self, gas: u64) -> bool {
         let covered = self.left.get() >= gas;
         if covered {
             self.kept.set(gas);
@@ -89,12 +89,12 @@ impl Meter {
 
     /// Mark the running step overrun: what it would take lies past what is
     /// left.
-    pub(crate) fn overrun(&self) {
+    pub(crate) fn mark_overrun(&self) {
         self.overrun.set(true);
     }
 
     /// Whether the running step overran, the mark cleared.
-    pub(crate) fn overran(&self) -> bool {
+    pub(crate) fn take_overrun(&self) -> bool {
         self.overrun.replace(false)
     }
 
@@ -157,7 +157,13 @@ pub(crate) struct Base {
 }
 
 impl Base {
-    pub(crate) fn new(agent: AgentId, source: Source, time: u64, seed: [u8; 32], budget: u64) -> Self {
+    pub(crate) fn new(
+        agent: AgentId,
+        source: Source,
+        time: u64,
+        seed: [u8; 32],
+        budget: u64,
+    ) -> Self {
         Self {
             agent,
             source,

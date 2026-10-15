@@ -12,8 +12,8 @@ use vos_wire::records::{SessionMark, Workflow};
 use vos_wire::result::{ResultWriter, Run, Step};
 use vos_wire::{defaults, keys};
 
-use super::admin::admin;
 use super::Call;
+use super::admin::admin;
 use super::base::Base;
 use super::inputs::{acknowledge, called, failed_in_refine, message, out_of_order, sweep};
 use super::sessions::{ByName, Counts, Held, admit, by_name};
@@ -84,7 +84,7 @@ impl Batched {
         reserve: u64,
         handler: bool,
     ) -> Option<Vec<(u64, WorkflowId)>> {
-        let overrun = base.meter.overran();
+        let overrun = base.meter.take_overrun();
         let section = base.section.get_mut();
         if (overrun && self.handled) || !section.fits() || !self.result.push(&stepped.step) {
             section.drop_running();
@@ -146,7 +146,7 @@ fn plan(base: &Base, pairs: &BTreeMap<AgentId, u64>, input: &Input, handler: boo
         Input::Sweep { .. } => defaults::SWEEP_RESERVE,
         _ => defaults::INPUT_RESERVE,
     };
-    if !base.meter.keeps(reserve + defaults::FINISH_RESERVE) {
+    if !base.meter.try_keep(reserve + defaults::FINISH_RESERVE) {
         return None;
     }
     let plain = |limit| {
@@ -230,7 +230,7 @@ pub(crate) fn run_batch(base: &mut Base, batch: Batch) -> ResultWriter {
             break;
         };
         let kept = plan.reserve + plan.limit + defaults::FINISH_RESERVE;
-        if !base.meter.keeps(kept) {
+        if !base.meter.try_keep(kept) {
             break;
         }
         let index = batched.result.count();

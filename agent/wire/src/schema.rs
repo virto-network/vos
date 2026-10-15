@@ -43,8 +43,9 @@ pub struct MethodSchema {
 }
 
 impl MethodSchema {
-    /// The gas limit a handler runs with: the one it requests, or
-    /// [`HANDLER_GAS`], capped at [`MAX_HANDLER_GAS`] by policy.
+    /// The gas limit a handler, or a workflow's step, runs with: the one it
+    /// requests, or [`HANDLER_GAS`], capped at [`MAX_HANDLER_GAS`] by
+    /// policy.
     pub fn gas_limit(&self) -> u64 {
         self.gas.unwrap_or(HANDLER_GAS).min(MAX_HANDLER_GAS)
     }

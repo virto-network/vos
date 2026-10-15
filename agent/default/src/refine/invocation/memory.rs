@@ -34,7 +34,12 @@ pub(crate) fn read_key(machine: &mut Machine, address: u64, len: u64) -> Result<
 
 /// The actor's bytes, at most `limit`: a longer buffer exceeds a cap and
 /// an unreadable one traps.
-pub(crate) fn read(machine: &mut Machine, address: u64, len: u64, limit: usize) -> Result<Vec<u8>, Failure> {
+pub(crate) fn read(
+    machine: &mut Machine,
+    address: u64,
+    len: u64,
+    limit: usize,
+) -> Result<Vec<u8>, Failure> {
     let len = usize::try_from(len).map_err(|_| Failure::Cap)?;
     if len > limit {
         return Err(Failure::Cap);

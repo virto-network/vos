@@ -22,8 +22,8 @@ use vos_wire::records::Installed;
 use vos_wire::result::{Attest, InstanceGas, Outcome, Outgoing};
 use vos_wire::{Encode, defaults, keys};
 
-use super::{Call, Overlay};
 use super::base::{Base, Corrupt, Meter, role_byte};
+use super::{Call, Overlay};
 use crate::machines::{self, Exit, Machine};
 use kernel::{kernel, random, serve_precompile};
 use memory::{copy_out, read, read_key, row, window, write};
@@ -98,8 +98,7 @@ impl<'a> Invocation<'a> {
         let Some(schema) = installed.schema.method(method) else {
             return Outcome::failed(Failure::Unknown);
         };
-        if !schema.kind.is_handler() || (self.entry == Kind::Query && schema.kind != Kind::Query)
-        {
+        if !schema.kind.is_handler() || (self.entry == Kind::Query && schema.kind != Kind::Query) {
             return Outcome::failed(Failure::Unknown);
         }
         let gas = schema.gas_limit();

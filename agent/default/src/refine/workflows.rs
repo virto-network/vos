@@ -22,12 +22,12 @@ use vos_wire::records::{Snapshot, Workflow, WorkflowState};
 use vos_wire::result::{InputRef, Outcome, Outgoing, Page, Run};
 use vos_wire::{Decode, Encode, defaults};
 
-use super::invocation::{Ended, Invocation, Pause, Share};
-use super::snapshots::{Captured, capture, restore};
-use super::{Call, Overlay};
 use super::base::Base;
 use super::batch::{Batched, Stepped};
 use super::inputs::{consumed, split_writes};
+use super::invocation::{Ended, Invocation, Pause, Share};
+use super::snapshots::{Captured, capture, restore};
+use super::{Call, Overlay};
 use crate::host::lost;
 use crate::machines;
 
@@ -113,7 +113,11 @@ pub(crate) enum Floor {
 
 impl Floor {
     pub(crate) fn new(with_inputs: bool) -> Self {
-        if with_inputs { Floor::Head } else { Floor::None }
+        if with_inputs {
+            Floor::Head
+        } else {
+            Floor::None
+        }
     }
 
     /// The floor now: none before the head's step.
@@ -192,9 +196,9 @@ fn writable(header: &vos_pvm_program::StandardHeader) -> Option<u64> {
 }
 
 /// A request's or a call's start of a workflow, `call`'s method by its
-/// caller, its owner: the workflow recorded, due at once, its program pinned, and the step
-/// answered `Started` with its id; or failed, as a handler's step that
-/// could not run fails.
+/// caller, its owner: the workflow recorded, due at once, its program
+/// pinned, and the step answered `Started` with its id; or failed, as a
+/// handler's step that could not run fails.
 pub(crate) fn start(base: &Base, input: InputRef, call: Call) -> (Run, Option<WorkflowId>) {
     match started(base, call) {
         Ok((id, rows)) => {
@@ -276,7 +280,7 @@ pub(crate) fn due(
     floor: &mut Floor,
 ) -> bool {
     let quick = defaults::INPUT_RESERVE + defaults::FINISH_RESERVE;
-    if !base.meter.keeps(quick + floor.now()) {
+    if !base.meter.try_keep(quick + floor.now()) {
         return false;
     }
     let Ok(read) = paid(base, id) else {
@@ -286,7 +290,7 @@ pub(crate) fn due(
     // Keep `keep` above the floor, or wait.
     let keeps = |base: &Base, floor: &mut Floor, keep: u64| {
         let floor = floor.of(base.meter.left(), keep);
-        base.meter.keeps(keep + floor).then_some(floor)
+        base.meter.try_keep(keep + floor).then_some(floor)
     };
     let input = InputRef::Due { workflow: id };
     let (stepped, reserve, handler) = match read {
@@ -634,7 +638,8 @@ fn end(
     let collected = base.time.saturating_add(defaults::WORKFLOW_KEPT_MS);
     move_due(rows, id, workflow, collected);
     if let (Some(awaiting), Principal::Agent(owner)) = (workflow.waiter.take(), workflow.owner) {
-        run.messages.push(Outgoing::reply(owner, awaiting, outcome.clone().into()));
+        run.messages
+            .push(Outgoing::reply(owner, awaiting, outcome.clone().into()));
     }
     workflow.state = WorkflowState::Ended(outcome);
     rows.insert(keys::workflow(id), Some(workflow.encode()));
