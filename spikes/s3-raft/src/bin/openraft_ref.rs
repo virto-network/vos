@@ -20,9 +20,9 @@ use openraft::raft::{
 };
 use openraft::storage::{LogFlushed, RaftLogStorage, RaftStateMachine};
 use openraft::{
-    BasicNode, Config, Entry, EntryPayload, LogId, LogState, Raft, RaftLogReader,
-    RaftNetwork, RaftNetworkFactory, RaftSnapshotBuilder, ServerState, Snapshot, SnapshotMeta,
-    StorageError, StoredMembership, Vote,
+    BasicNode, Config, Entry, EntryPayload, LogId, LogState, Raft, RaftLogReader, RaftNetwork,
+    RaftNetworkFactory, RaftSnapshotBuilder, ServerState, Snapshot, SnapshotMeta, StorageError,
+    StoredMembership, Vote,
 };
 use redb::{Database, Durability, TableDefinition};
 
@@ -55,7 +55,9 @@ struct LogStore {
 
 /// Background flusher: drains queued appends, writes them in one transaction
 /// with one fsync, then completes their callbacks in order.
-fn spawn_flusher(db: Arc<Database>) -> std::sync::mpsc::Sender<(Vec<(u64, Vec<u8>)>, LogFlushed<TC>)> {
+fn spawn_flusher(
+    db: Arc<Database>,
+) -> std::sync::mpsc::Sender<(Vec<(u64, Vec<u8>)>, LogFlushed<TC>)> {
     let (tx, rx) = std::sync::mpsc::channel::<(Vec<(u64, Vec<u8>)>, LogFlushed<TC>)>();
     std::thread::spawn(move || {
         while let Ok(first) = rx.recv() {
@@ -92,7 +94,11 @@ impl LogStore {
     fn write(&self, durable: bool, f: impl FnOnce(&redb::WriteTransaction)) {
         let Some(db) = &self.db else { return };
         let mut txn = db.begin_write().unwrap();
-        txn.set_durability(if durable { Durability::Immediate } else { Durability::None });
+        txn.set_durability(if durable {
+            Durability::Immediate
+        } else {
+            Durability::None
+        });
         f(&txn);
         txn.commit().unwrap();
     }
@@ -121,7 +127,11 @@ impl RaftLogStorage<TC> for LogStore {
 
     async fn get_log_state(&mut self) -> Result<LogState<TC>, StorageError<NodeId>> {
         let inner = self.inner.lock().unwrap();
-        let last = inner.log.last_key_value().map(|(_, e)| e.log_id).or(inner.purged);
+        let last = inner
+            .log
+            .last_key_value()
+            .map(|(_, e)| e.log_id)
+            .or(inner.purged);
         Ok(LogState {
             last_purged_log_id: inner.purged,
             last_log_id: last,
@@ -135,7 +145,8 @@ impl RaftLogStorage<TC> for LogStore {
     async fn save_vote(&mut self, vote: &Vote<NodeId>) -> Result<(), StorageError<NodeId>> {
         self.write(true, |txn| {
             let mut t = txn.open_table(META).unwrap();
-            t.insert(0, vote.leader_id.term.to_le_bytes().as_slice()).unwrap();
+            t.insert(0, vote.leader_id.term.to_le_bytes().as_slice())
+                .unwrap();
         });
         self.inner.lock().unwrap().vote = Some(*vote);
         Ok(())
@@ -145,14 +156,21 @@ impl RaftLogStorage<TC> for LogStore {
         Ok(self.inner.lock().unwrap().vote)
     }
 
-    async fn append<I>(&mut self, entries: I, callback: LogFlushed<TC>) -> Result<(), StorageError<NodeId>>
+    async fn append<I>(
+        &mut self,
+        entries: I,
+        callback: LogFlushed<TC>,
+    ) -> Result<(), StorageError<NodeId>>
     where
         I: IntoIterator<Item = Entry<TC>> + Send,
         I::IntoIter: Send,
     {
         let entries: Vec<Entry<TC>> = entries.into_iter().collect();
         if let Some(flusher) = &self.flusher {
-            let rows = entries.iter().map(|e| (e.log_id.index, encode(e))).collect();
+            let rows = entries
+                .iter()
+                .map(|e| (e.log_id.index, encode(e)))
+                .collect();
             let mut inner = self.inner.lock().unwrap();
             for entry in entries {
                 inner.log.insert(entry.log_id.index, entry);
@@ -164,7 +182,8 @@ impl RaftLogStorage<TC> for LogStore {
         self.write(true, |txn| {
             let mut t = txn.open_table(LOG).unwrap();
             for entry in &entries {
-                t.insert(entry.log_id.index, encode(entry).as_slice()).unwrap();
+                t.insert(entry.log_id.index, encode(entry).as_slice())
+                    .unwrap();
             }
         });
         let mut inner = self.inner.lock().unwrap();
@@ -236,7 +255,8 @@ impl RaftStateMachine<TC> for StateMachine {
 
     async fn applied_state(
         &mut self,
-    ) -> Result<(Option<LogId<NodeId>>, StoredMembership<NodeId, BasicNode>), StorageError<NodeId>> {
+    ) -> Result<(Option<LogId<NodeId>>, StoredMembership<NodeId, BasicNode>), StorageError<NodeId>>
+    {
         Ok(self.inner.lock().unwrap().clone())
     }
 
@@ -261,7 +281,9 @@ impl RaftStateMachine<TC> for StateMachine {
         self.clone()
     }
 
-    async fn begin_receiving_snapshot(&mut self) -> Result<Box<Cursor<Vec<u8>>>, StorageError<NodeId>> {
+    async fn begin_receiving_snapshot(
+        &mut self,
+    ) -> Result<Box<Cursor<Vec<u8>>>, StorageError<NodeId>> {
         Ok(Box::new(Cursor::new(Vec::new())))
     }
 
@@ -388,8 +410,10 @@ async fn spawn_group(
         rafts.insert(*id, raft);
     }
     let _ = router.rafts.set(rafts.clone());
-    let nodes: BTreeMap<NodeId, BasicNode> =
-        members.iter().map(|id| (*id, BasicNode::default())).collect();
+    let nodes: BTreeMap<NodeId, BasicNode> = members
+        .iter()
+        .map(|id| (*id, BasicNode::default()))
+        .collect();
     rafts[&members[0]].initialize(nodes).await.unwrap();
     members.iter().map(|id| rafts[id].clone()).collect()
 }
@@ -449,7 +473,10 @@ fn throughput(storage: &str, payload: usize, concurrency: usize, seconds: u64) {
                 let mut samples = Vec::new();
                 while Instant::now() < stop_at {
                     let started = Instant::now();
-                    leader.client_write(vec![0xa5; payload]).await.expect("write");
+                    leader
+                        .client_write(vec![0xa5; payload])
+                        .await
+                        .expect("write");
                     samples.push(started.elapsed());
                 }
                 samples
@@ -476,7 +503,12 @@ fn throughput(storage: &str, payload: usize, concurrency: usize, seconds: u64) {
 
 fn cpu_seconds() -> f64 {
     let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
-    let fields: Vec<&str> = stat.rsplit(')').next().unwrap().split_whitespace().collect();
+    let fields: Vec<&str> = stat
+        .rsplit(')')
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .collect();
     (fields[11].parse::<f64>().unwrap() + fields[12].parse::<f64>().unwrap()) / 100.0
 }
 
@@ -500,7 +532,16 @@ fn groups(count: usize, heartbeat_ms: u64) {
     let all: Vec<Vec<Raft<TC>>> = rt.block_on(async {
         let mut all = Vec::new();
         for g in 0..count as NodeId {
-            all.push(spawn_group([g * 3 + 1, g * 3 + 2, g * 3 + 3], None, false, heartbeat_ms, &rpcs).await);
+            all.push(
+                spawn_group(
+                    [g * 3 + 1, g * 3 + 2, g * 3 + 3],
+                    None,
+                    false,
+                    heartbeat_ms,
+                    &rpcs,
+                )
+                .await,
+            );
         }
         all
     });
@@ -546,8 +587,14 @@ fn main() {
             }
         }
         "groups" => {
-            let count = std::env::args().nth(2).and_then(|g| g.parse().ok()).unwrap_or(1000);
-            let heartbeat = std::env::args().nth(3).and_then(|h| h.parse().ok()).unwrap_or(50);
+            let count = std::env::args()
+                .nth(2)
+                .and_then(|g| g.parse().ok())
+                .unwrap_or(1000);
+            let heartbeat = std::env::args()
+                .nth(3)
+                .and_then(|h| h.parse().ok())
+                .unwrap_or(50);
             groups(count, heartbeat);
         }
         _ => eprintln!("usage: openraft_ref throughput | groups <count> [heartbeat_ms]"),

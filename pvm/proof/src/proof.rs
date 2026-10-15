@@ -111,7 +111,7 @@ use crate::recursion_pcs::ProverMerkleHasher;
 ///       money-path ts-forgery gap where the three ristretto memory producers
 ///       set `ts` as a free witness). CpuChip gains five `Is{110..114}Ecall`
 ///       gates that emit a `RistrettoCall` (RELATION A) producer + register
-///       reads (φ[7,8,9]) per ristretto ECALL step; RistrettoEcallChip moves
+///       reads (φ\[7,8,9\]) per ristretto ECALL step; RistrettoEcallChip moves
 ///       to a uniform 96-row preprocessed period that consumes RELATION A at a
 ///       preprocessed-pinned `InitGate` (so its block `ts` == the chained CpuChip
 ///       step ts ∈ [initial_ts, final_ts), excluding 0 and `closing_ts`) and
@@ -341,7 +341,7 @@ impl Proof {
     /// be checked without validity.
     ///
     /// Decoding is the exact inverse of the guest-side encoding: word
-    /// φ[9] → bytes 0..8, φ[10] → 8..16, φ[11] → 16..24, φ[12] → 24..32,
+    /// φ\[9\] → bytes 0..8, φ\[10\] → 8..16, φ\[11\] → 16..24, φ\[12\] → 24..32,
     /// each little-endian.  `registers[9..13]` is statically in bounds
     /// (registers is `[u64; 13]`).
     ///

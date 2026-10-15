@@ -4,9 +4,11 @@
 //! to a phone for the ARM bring-up numbers (reference x86 point:
 //! log14 MOBILE ≈ 1.5 s with target-cpu=native).
 //!
-//!     cargo build --release -p vos-pvm-proof --bin mobile_bench \
-//!         --target aarch64-unknown-linux-gnu
-//!     ./mobile_bench [log2-steps]     # default 14
+//! ```text
+//! cargo build --release -p vos-pvm-proof --bin mobile_bench \
+//!     --target aarch64-unknown-linux-gnu
+//! ./mobile_bench [log2-steps]     # default 14
+//! ```
 //!
 //! A `[[bin]]` rather than an example so a cross-build pulls only the
 //! prover's own dependency tree (examples build against dev-deps).

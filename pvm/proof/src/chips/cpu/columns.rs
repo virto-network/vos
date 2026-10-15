@@ -111,7 +111,7 @@ pub enum Column {
     #[size = 1]
     IsSetLtS,
     /// Swap modifier for SetGtSImm/SetGtUImm: when 1, val_b ← imm and
-    /// val_d ← regs[rb] (so the SetLt comparison yields the GT result).
+    /// val_d ← regs\[rb\] (so the SetLt comparison yields the GT result).
     /// Not a compare-partition sub-flag; co-occurs with IsSetLtS/IsSetLtU.
     #[size = 1]
     IsSetGt,
@@ -120,7 +120,7 @@ pub enum Column {
     #[size = 1]
     IsCmovNz,
     /// CmovIzImm/CmovNzImm operand-swap modifier: val_b ← imm (the moved
-    /// value, pinned to ImmBytes), val_d ← regs[rb] (the condition).
+    /// value, pinned to ImmBytes), val_d ← regs\[rb\] (the condition).
     /// Not a compare-partition sub-flag; co-occurs with IsCmovIz/IsCmovNz.
     #[size = 1]
     IsCmovImm,
@@ -313,20 +313,20 @@ pub enum Column {
     // `chips/cpu/{mod,interaction}.rs::ECALL_REG_IDXS` for the canonical
     // slot ↔ register mapping.
     //
-    /// h_ptr slot (sourced from φ[7]; low 4 bytes flow into the
+    /// h_ptr slot (sourced from φ\[7\]; low 4 bytes flow into the
     /// Blake2bCall tuple as h_ptr).  Full u64 witnessed so the upper
-    /// 32 bits can hold whatever regs_before[7] held.
+    /// 32 bits can hold whatever regs_before\[7\] held.
     #[size = 8]
     Phi10,
-    /// m_ptr slot (sourced from φ[8]).  Low 4 bytes flow into the
+    /// m_ptr slot (sourced from φ\[8\]).  Low 4 bytes flow into the
     /// Blake2bCall tuple as m_ptr.
     #[size = 8]
     Phi11,
-    /// t_low slot (sourced from φ[9]).  Full 8 bytes flow into the
+    /// t_low slot (sourced from φ\[9\]).  Full 8 bytes flow into the
     /// Blake2bCall tuple as T.
     #[size = 8]
     Phi12,
-    /// f_flag slot (sourced from φ[10] = a3).  Full u64 of regs_before[10].
+    /// f_flag slot (sourced from φ\[10\] = a3).  Full u64 of regs_before\[10\].
     /// Phi7Bool below is the boolean form `(regs_before[10] != 0)`,
     /// which is what flows into the Blake2bCall tuple as F.
     #[size = 8]
@@ -336,7 +336,7 @@ pub enum Column {
     /// constrain Phi7Bool = (Phi7 != 0) in-circuit.
     #[size = 8]
     Phi7Inv,
-    /// Boolean form of the f_flag slot: 1 if regs_before[10] != 0.
+    /// Boolean form of the f_flag slot: 1 if regs_before\[10\] != 0.
     /// The prover fills this and the lookup balance keeps it tied to
     /// the Blake2bChip.F column at the matching compression.
     #[size = 1]
@@ -389,7 +389,7 @@ pub enum Column {
     #[size = 1]
     ResultRegIdx,
     // ── BitManip permutation/zero-extend ──
-    /// 1 iff this step is `ReverseBytes` (result[i] = val_d[7-i]).
+    /// 1 iff this step is `ReverseBytes` (result\[i\] = val_d[7-i]).
     #[size = 1]
     IsReverseBytes,
     /// 1 iff this step is `ZeroExtend16` (result[0..1] = val_d[0..1]; result[2..7] = 0).
@@ -465,7 +465,7 @@ pub enum Column {
     IsMulUpperSU,
     #[size = 1]
     IsMulUpperSS,
-    /// Sign bit (bit 7) of the sign-source byte (val_d[0] for SE8, val_d[1] for SE16).
+    /// Sign bit (bit 7) of the sign-source byte (val_d\[0\] for SE8, val_d\[1\] for SE16).
     /// Pinned by a nibble-AND lookup against (SignExtSrcHiNib, 8, 8·SignExtBit).
     #[size = 1]
     SignExtBit,
@@ -543,9 +543,9 @@ pub enum Column {
     // sign bits, and the constraint `result[i] = 0xFF · SignBitResult`
     // for `i ∈ 4..8` holds on 32-bit ALU rows.
     /// Bit 7 of `result[3]`.  Pinned via the (HiNib, 8, 8·SignBitResult)
-    /// lookup; equals 0 on rows where result[3] < 0x80, equals 1 on
+    /// lookup; equals 0 on rows where result\[3\] < 0x80, equals 1 on
     /// 32-bit ALU rows whose signed result is negative.  On non-real
-    /// rows (padding) result[3] = 0 so SignBitResult = 0.
+    /// rows (padding) result\[3\] = 0 so SignBitResult = 0.
     #[size = 1]
     SignBitResult,
     /// High nibble of `result[3]`, paired with the (lo, 0xF, lo)
@@ -619,7 +619,7 @@ pub enum Column {
     /// Per-byte carry chain for the MemAddr indirect-
     /// addressing add `MemAddr = (val_b + ImmBytes) mod 2^32`.
     /// Carry-out at byte 3 is the 32-bit overflow, discarded.
-    /// Boolean-constrained (val_b[i] + ImmBytes[i] + carry_in ≤ 511,
+    /// Boolean-constrained (val_b\[i\] + ImmBytes\[i\] + carry_in ≤ 511,
     /// carry_out ≤ 1).
     #[size = 4]
     MemAddrCarry,
@@ -639,7 +639,7 @@ pub enum Column {
     /// 1 iff this opcode is `StoreInd[U][8/16/32/64]`
     /// (TwoRegOneImm — *register-source* indirect store).  For
     /// these the value written to memory is `regs[ra]`, which val_b
-    /// doesn't carry on TwoRegOneImm rows (val_b holds regs[rb]
+    /// doesn't carry on TwoRegOneImm rows (val_b holds regs\[rb\]
     /// = the base).  Drives the `MemValue = RegValA` per-byte
     /// binding plus the producer emission to the register-memory
     /// ledger.
@@ -657,19 +657,19 @@ pub enum Column {
     // ValDIsZero is pinned in both directions (`val_d_is_zero=1 ⇒ val_d=0`
     // and `val_d=0 ⇒ val_d_is_zero=1`), and DivByZero likewise, via
     // byte-wise inversion witnesses + cumulative OR.
-    /// Per-byte inverse witness.  When `val_d[i] ≠ 0`, ByteInv[i]
+    /// Per-byte inverse witness.  When `val_d[i] ≠ 0`, ByteInv\[i\]
     /// must equal `1/val_d[i]` (in the field) so that
     /// `val_d[i] · ByteInv[i] = 1` (the byte indicator).  When
-    /// `val_d[i] = 0`, ByteInv[i] is unconstrained (the indicator
+    /// `val_d[i] = 0`, ByteInv\[i\] is unconstrained (the indicator
     /// degenerates to 0).  Constrained by
     ///   `val_d[i] · (val_d[i] · ByteInv[i] − 1) = 0`
-    /// which is satisfied iff val_d[i]=0 OR (ByteInv[i] is the inverse).
+    /// which is satisfied iff val_d\[i\]=0 OR (ByteInv\[i\] is the inverse).
     #[size = 8]
     ValDByteInv,
     /// Cumulative OR of byte-indicators.  Recurrence (degree 3):
-    ///   PartialNZ[0] = val_d[0] · ByteInv[0]
-    ///   PartialNZ[i] = PartialNZ[i-1] + ByteIndicator[i]
-    ///                  − PartialNZ[i-1] · ByteIndicator[i]
+    ///   PartialNZ\[0\] = val_d\[0\] · ByteInv\[0\]
+    ///   PartialNZ\[i\] = PartialNZ[i-1] + ByteIndicator\[i\]
+    ///                  − PartialNZ[i-1] · ByteIndicator\[i\]
     /// where `ByteIndicator[i] = val_d[i] · ByteInv[i] ∈ {0, 1}`.
     /// `PartialNZ[7] = 1 ↔ val_d ≠ 0`.  ValDIsZero is then pinned
     /// to `1 − PartialNZ[7]`.
@@ -697,7 +697,7 @@ pub enum Column {
     #[size = 8]
     ValRByteInv,
     /// Cumulative OR of div_remainder's byte-indicators.  Same
-    /// recurrence as ValDPartialNZ.  PartialNZ[7] = 1
+    /// recurrence as ValDPartialNZ.  PartialNZ\[7\] = 1
     /// ↔ div_remainder ≠ 0.
     #[size = 8]
     ValRPartialNZ,
@@ -739,13 +739,13 @@ pub enum Column {
     #[size = 1]
     IsTzb,
     /// Per-byte leading-zeros witnesses for the 8 bytes of `val_d`.
-    /// `BitOpLzByte[i] = val_d[i].leading_zeros()` (8 if val_d[i] = 0)
+    /// `BitOpLzByte[i] = val_d[i].leading_zeros()` (8 if val_d\[i\] = 0)
     /// enforced via the BitcountChip lookup.  Used for both LZ32 and LZ64
     /// rows; only the relevant prefix participates in the result formula.
     #[size = 8]
     BitOpLzByte,
     /// Per-byte trailing-zeros witnesses for the 8 bytes of `val_d`.
-    /// `BitOpTzByte[i] = val_d[i].trailing_zeros()` (8 if val_d[i] = 0).
+    /// `BitOpTzByte[i] = val_d[i].trailing_zeros()` (8 if val_d\[i\] = 0).
     #[size = 8]
     BitOpTzByte,
     /// Cumulative-OR of byte_indicator[i..7] (MSB-direction
@@ -917,7 +917,7 @@ pub enum Column {
 
     // ValDIsZero / PartialNZ recurrence + DivByZero result binding.
     /// `ValD[i] · ValDByteInv[i]` — per-byte ValD nonzero indicator
-    /// (1 when ValD[i] != 0, else 0).  Lifts the deg-2 product into a
+    /// (1 when ValD\[i\] != 0, else 0).  Lifts the deg-2 product into a
     /// deg-1 column for the recurrence.
     #[size = 8]
     ValDByteIndicatorH,
@@ -928,8 +928,8 @@ pub enum Column {
     ValDByteIndMinus1H,
     /// `ValDPartialNZ[i-1] · ValDByteIndicatorH[i]` for i = 1..8 — used
     /// in the OR-recurrence `PartialNZ[i] = PartialNZ[i-1] + Ind[i] -
-    /// PartialNZ[i-1]·Ind[i]`.  Index 0 is unused (PartialNZ[0] is set
-    /// directly to ValDByteIndicatorH[0]).
+    /// PartialNZ[i-1]·Ind[i]`.  Index 0 is unused (PartialNZ\[0\] is set
+    /// directly to ValDByteIndicatorH\[0\]).
     #[size = 8]
     PartNZTimesIndH,
     /// `IsDivRem · ValDIsZero` — pins DivByZero on divrem rows.
@@ -956,16 +956,16 @@ pub enum Column {
     PartNZMsbLoTimesIndH,
 
     // TZ / LZ result binding.
-    /// Sum_{i=0..4} (PartialNZ[i] - PartialNZ[i-1]) · (8i + TzByte[i]).
+    /// Sum_{i=0..4} (PartialNZ\[i\] - PartialNZ[i-1]) · (8i + TzByte\[i\]).
     #[size = 1]
     TzLo4H,
-    /// Sum_{i=4..8} (PartialNZ[i] - PartialNZ[i-1]) · (8i + TzByte[i]).
+    /// Sum_{i=4..8} (PartialNZ\[i\] - PartialNZ[i-1]) · (8i + TzByte\[i\]).
     #[size = 1]
     TzHi4H,
-    /// Sum_{i=0..8} (PartialNZMsb[i] - PartialNZMsb[i+1]) · (8(7-i) + LzByte[i]).
+    /// Sum_{i=0..8} (PartialNZMsb\[i\] - PartialNZMsb[i+1]) · (8(7-i) + LzByte\[i\]).
     #[size = 1]
     Lz64H,
-    /// Sum_{i=0..4} (PartialNZMsbLo[i] - PartialNZMsbLo[i+1]) · (8(3-i) + LzByte[i]).
+    /// Sum_{i=0..4} (PartialNZMsbLo\[i\] - PartialNZMsbLo[i+1]) · (8(3-i) + LzByte\[i\]).
     #[size = 1]
     Lz32H,
     /// `IsTzb · Is64Bit`, `IsTzb · Is32Bit`, mirror for IsLzb.

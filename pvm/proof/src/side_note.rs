@@ -252,7 +252,7 @@ impl CompactTrace {
     }
 }
 
-/// One listed page's entering and exit byte images (each [`PAGE_SIZE`] bytes).
+/// One listed page's entering and exit byte images (each `PAGE_SIZE` bytes).
 #[cfg(feature = "prover")]
 #[derive(Clone, Debug)]
 pub struct MemoryPageImage {
@@ -376,7 +376,7 @@ pub struct MulEntry {
     /// Per-byte carry chain for `result + term_a + term_b ≡
     /// unsigned_product_hi (mod 2^64)` on is_mul_upper rows.
     pub mul_corr_carry: [u8; 8],
-    /// Bit 7 of val_b's MSB (val_b[7] for 64-bit, val_b[3]
+    /// Bit 7 of val_b's MSB (val_b\[7\] for 64-bit, val_b\[3\]
     /// for 32-bit).  Used by sign correction.
     pub sign_bit_b: u8,
     pub sign_bit_d: u8,

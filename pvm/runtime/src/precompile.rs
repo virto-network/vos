@@ -3,9 +3,9 @@
 //!
 //! Precompile ids live in `0x400..=0x4ff`, outside every id JAM assigns
 //! (the Gray Paper host calls and JIP-1 `log` at 100). A JAM node answers an
-//! unknown id with `WHAT` in φ[7] and continues, so a guest that falls back
+//! unknown id with `WHAT` in φ\[7\] and continues, so a guest that falls back
 //! to software on `WHAT` computes identical results everywhere. A precompile
-//! leaves every register unchanged; φ[7] holds an input pointer, never
+//! leaves every register unchanged; φ\[7\] holds an input pointer, never
 //! `WHAT`, so the guest can tell the two apart.
 //!
 //! The refine host serves the outer machine's precompiles in place, inside
@@ -15,9 +15,9 @@
 //! at the same price, natively through its own call here or in software on
 //! JAM, and writes its output through the agent's tracked writes.
 
-/// One BLAKE2b compression: φ[7] = h pointer (64 bytes, read and written),
-/// φ[8] = m pointer (128 bytes, read), φ[9] = counter low 64 bits,
-/// φ[10] = finalize flag (non-zero = last block).
+/// One BLAKE2b compression: φ\[7\] = h pointer (64 bytes, read and written),
+/// φ\[8\] = m pointer (128 bytes, read), φ\[9\] = counter low 64 bits,
+/// φ\[10\] = finalize flag (non-zero = last block).
 pub const BLAKE2B_COMPRESS: u64 = 0x400;
 
 /// Gas for one BLAKE2b compression, on top of its `ecalli`'s block gas.

@@ -38,7 +38,11 @@ unsafe impl GlobalAlloc for Bump {
         let base = (*self.arena.get()).0.as_mut_ptr();
         let off = *self.next.get();
         let misalign = base.add(off) as usize & (layout.align() - 1);
-        let pad = if misalign == 0 { 0 } else { layout.align() - misalign };
+        let pad = if misalign == 0 {
+            0
+        } else {
+            layout.align() - misalign
+        };
         let start = off + pad;
         let end = start + layout.size();
         if end > ARENA_BYTES {
@@ -80,7 +84,7 @@ pub extern "C" fn _start() -> ! {
     // Deserialize the embedded proof and run the full Poseidon2-M31 verify
     // (FRI + Merkle decommit + OODS) on the PVM.
     match vos_pvm_settlement_verifier::verify_settlement_proof(FIXTURE) {
-        Ok(()) => halt(0xACCE),  // accepted
-        Err(()) => halt(0x5E5),  // rejected
+        Ok(()) => halt(0xACCE), // accepted
+        Err(()) => halt(0x5E5), // rejected
     }
 }

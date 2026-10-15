@@ -1,4 +1,4 @@
-//! Trace segmentation: slice a fully-traced [`SideNote`] into bounded
+//! Trace segmentation: slice a fully-traced `SideNote` into bounded
 //! step-range segments that prove independently in bounded memory and chain
 //! via [`crate::verify_chain`].
 //!
@@ -686,7 +686,7 @@ mod prover {
     /// write exactly once, so a full pass over a chain's windows costs O(N)
     /// replay work in the trace length.
     ///
-    /// Equivalence: the segment assembly is [`build_segment`], the same
+    /// Equivalence: the segment assembly is `build_segment`, the same
     /// code `segment_side_note` runs; only the entering image's provenance
     /// differs. The threaded image equals the per-call replay because
     /// advancing to a window start `ts_lo` applies exactly the writes with
@@ -857,11 +857,11 @@ mod prover {
     /// Equivalence: the yielded `SideNote` equals
     /// `segment_side_note(&full_side_note, a, b)` field for field (unit-
     /// pinned by `compact_cursor_matches_segment_side_note`) — the memory
-    /// threading is [`StreamCursors`] + the same step-write enumeration
+    /// threading is `StreamCursors` + the same step-write enumeration
     /// (both step forms carry identical `mem_write`s), the register file
     /// is exact because a step's whole register delta is its
     /// [`crate::core::step::RegWrite`] (tracer-verified), and the assembly
-    /// is [`assemble_segment`], the same path the full holder runs.
+    /// is `assemble_segment`, the same path the full holder runs.
     ///
     /// Same visiting contract as [`SegmentCursor`]: ascending window
     /// starts, skipped windows advance the state without building them.
@@ -1221,7 +1221,7 @@ mod prover {
 
     /// The streaming chain driver: runs a [`StepSource`] (production: a
     /// live [`TracingPvm`] via [`TracingSource`]) and cuts windows ONLINE
-    /// with the same [`BudgetedCutter`] decisions the offline
+    /// with the same `BudgetedCutter` decisions the offline
     /// [`segment_bounds_budgeted`] walk makes, yielding each window's
     /// `SideNote` as the tracer completes it and dropping it before the
     /// next — so a multi-million-step chain is NEVER resident: peak step
@@ -1232,8 +1232,8 @@ mod prover {
     /// Equivalence: the cut shares the offline cutter's decision path
     /// (bit-identical bounds); the entering memory image and register
     /// file are threaded forward with the same write enumeration
-    /// [`CompactSegmentCursor::advance_to`] performs (batched per window);
-    /// and the assembly is [`assemble_segment`] — so every yielded window
+    /// `CompactSegmentCursor::advance_to` performs (batched per window);
+    /// and the assembly is `assemble_segment` — so every yielded window
     /// is field-identical to the compact cursor's over the same traced
     /// run (unit-pinned by the `trace_stream_*` equivalence tests).
     ///
@@ -1364,7 +1364,7 @@ mod prover {
 
         /// Assemble the current window's `SideNote` — field-identical to
         /// [`CompactSegmentCursor::side_note`] over the same traced run
-        /// (same entering state threading, same [`assemble_segment`]).
+        /// (same entering state threading, same `assemble_segment`).
         /// The expansion is window-local and dropped with the returned
         /// `SideNote`. Panics with no current window.
         pub fn side_note(&mut self) -> SideNote {

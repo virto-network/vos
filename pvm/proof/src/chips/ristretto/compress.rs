@@ -118,7 +118,7 @@ pub fn invsqrt_a_minus_d() -> &'static Bytes {
 }
 
 /// Sign convention: a canonical (in-range) field element is "negative"
-/// iff its low bit (byte[0] & 1) is 1.  Mirrors dalek's
+/// iff its low bit (byte\[0\] & 1) is 1.  Mirrors dalek's
 /// `FieldElement::is_negative()`.
 pub fn is_negative(a: &Bytes) -> u8 {
     a[0] & 1

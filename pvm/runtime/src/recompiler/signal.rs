@@ -7,7 +7,7 @@
 //!
 //! A write to a guest-writable page of a slot that does not track writes
 //! yet is not a guest fault: the handler starts tracking the slot and
-//! returns, so the store retries ([`Activation`]).
+//! returns, so the store retries (`Activation`).
 
 use std::cell::Cell;
 use std::ptr::null_mut;

@@ -32,7 +32,7 @@ use vos_pvm::interpreter::Interpreter;
 use vos_pvm::PVM_REGISTER_COUNT;
 
 use vos_pvm_proof::core::tracing::TracingPvm;
-use vos_pvm_proof::{prove, program_commitment_of_proof, SideNote};
+use vos_pvm_proof::{program_commitment_of_proof, prove, SideNote};
 use vos_pvm_proof_verifier::verify_standalone;
 
 /// Bounds for fuzz input — keep proving fast (single-digit seconds

@@ -31,7 +31,7 @@ use crate::{framework::BuiltInComponent, lookups::RegisterMemoryLookupElements};
 
 /// RegisterMemoryBoundaryChip: produces 13 register-memory logup entries for
 /// the initial register state at ts=0.  Mirrors MemoryBoundaryChip but for
-/// the PVM register file: (reg_addr[1], reg_val[8], reg_ts[8]=0) with
+/// the PVM register file: (reg_addr\[1\], reg_val\[8\], reg_ts\[8\]=0) with
 /// positive multiplicity.  The matching consumers live in RegisterMemoryChip
 /// (the ledger).
 pub struct RegisterMemoryBoundaryChip;

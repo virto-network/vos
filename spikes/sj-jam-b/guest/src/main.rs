@@ -127,7 +127,7 @@ static BLOCKS: [u8; 27] = [
     0x00, 0x01, 21, //
     51, 0x01, 0x01, //
     51, 0x02, 0x02, //
-    1, //
+    1,    //
     51, 0x03, 0x03, //
     51, 0x04, 0x04, //
     51, 0x00, 0x00, 0x00, 0xff, 0xff, //
@@ -633,10 +633,7 @@ extern "C" fn probe_refine(arguments: *const u8, len: u64) -> Output {
     let tag = payload.len().min(32);
     out[0] = tag as u8;
     out[1..1 + tag].copy_from_slice(&payload[..tag]);
-    let mut records = Records {
-        out,
-        len: 1 + tag,
-    };
+    let mut records = Records { out, len: 1 + tag };
     let start = hostcall!(GAS, 0, 0, 0, 0, 0);
     records.push(step::START, start, 0, 0, 0);
     let (_, _, gas) = timed!(GAS, 0, 0, 0, 0, 0, 0);
@@ -721,7 +718,14 @@ extern "C" fn probe_accumulate(arguments: *const u8, len: u64) -> Output {
         .map_or(1, |(count, _)| count);
     let input = &mut buffers().input;
     for index in 0..count {
-        let length = hostcall!(FETCH, input.as_mut_ptr(), 0u64, input.len(), FETCH_INPUT, index);
+        let length = hostcall!(
+            FETCH,
+            input.as_mut_ptr(),
+            0u64,
+            input.len(),
+            FETCH_INPUT,
+            index
+        );
         if length == NONE {
             log(b"no input");
             continue;

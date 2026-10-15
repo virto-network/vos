@@ -151,7 +151,11 @@ fn describe(records: &[Record]) -> Vec<String> {
         .map(|record| {
             let charge = record.gas.wrapping_sub(gas_call);
             match record.step {
-                1 => format!("{:<22} diff={} (gas call={gas_call})", step_name(1), record.gas),
+                1 => format!(
+                    "{:<22} diff={} (gas call={gas_call})",
+                    step_name(1),
+                    record.gas
+                ),
                 5 => format!(
                     "{:<22} exit={}({}) φ8={} diff={} inner-used={} invoke-charge={}",
                     step_name(5),
@@ -439,8 +443,8 @@ mod tests {
     //! `SetReadWrite` repairs it, the resumed write lands, and `poke` into a
     //! read-only page is refused.
 
-    use vos_pvm::inner::{InnerError, InnerExit, InnerMachines, InvokeState, PageMode};
     use vos_pvm::PvmBackend;
+    use vos_pvm::inner::{InnerError, InnerExit, InnerMachines, InvokeState, PageMode};
     use vos_pvm_program::{CodeBlob, build_compact_code_blob, parse_compact_code_blob};
 
     /// The guest's inner program (see `guest/src/main.rs`).
@@ -460,11 +464,25 @@ mod tests {
         [PvmBackend::ForceInterpreter, PvmBackend::ForceRecompiler]
     }
 
-    fn invoke(machines: &mut InnerMachines, id: u32, registers: [u64; 13]) -> (InnerExit, u64, [u64; 13]) {
+    fn invoke(
+        machines: &mut InnerMachines,
+        id: u32,
+        registers: [u64; 13],
+    ) -> (InnerExit, u64, [u64; 13]) {
         let outcome = machines
-            .invoke(id, InvokeState { gas: GAS, registers })
+            .invoke(
+                id,
+                InvokeState {
+                    gas: GAS,
+                    registers,
+                },
+            )
             .unwrap();
-        (outcome.exit, GAS - outcome.state.gas, outcome.state.registers)
+        (
+            outcome.exit,
+            GAS - outcome.state.gas,
+            outcome.state.registers,
+        )
     }
 
     #[test]
@@ -479,7 +497,9 @@ mod tests {
         for backend in backends() {
             let mut machines = InnerMachines::with_backend(backend);
             let id = machines.create(&INNER, 0).unwrap();
-            machines.pages(id, 16, 2, PageMode::AllocateReadWrite).unwrap();
+            machines
+                .pages(id, 16, 2, PageMode::AllocateReadWrite)
+                .unwrap();
             machines.pages(id, 16, 2, PageMode::SetReadOnly).unwrap();
             assert_eq!(
                 machines.poke(id, 0x10000, &[1, 2, 3, 4]),
@@ -488,15 +508,25 @@ mod tests {
             );
             let registers = [0; 13];
             let (exit, used, registers) = invoke(&mut machines, id, registers);
-            assert_eq!((exit, used), (InnerExit::Fault(0x10000), 101), "{backend:?}");
+            assert_eq!(
+                (exit, used),
+                (InnerExit::Fault(0x10000), 101),
+                "{backend:?}"
+            );
             machines.pages(id, 16, 1, PageMode::SetReadWrite).unwrap();
             let (exit, used, registers) = invoke(&mut machines, id, registers);
             assert_eq!((exit, used), (InnerExit::Fault(0x11000), 0), "{backend:?}");
             machines.pages(id, 17, 1, PageMode::SetReadWrite).unwrap();
             let (exit, used, registers) = invoke(&mut machines, id, registers);
             assert_eq!((exit, used), (InnerExit::Host(7), 0), "{backend:?}");
-            assert_eq!(machines.peek(id, 0x10000, 4).unwrap(), [0xdd, 0xcc, 0xbb, 0xaa]);
-            assert_eq!(machines.peek(id, 0x11008, 4).unwrap(), [0x44, 0x33, 0x22, 0x11]);
+            assert_eq!(
+                machines.peek(id, 0x10000, 4).unwrap(),
+                [0xdd, 0xcc, 0xbb, 0xaa]
+            );
+            assert_eq!(
+                machines.peek(id, 0x11008, 4).unwrap(),
+                [0x44, 0x33, 0x22, 0x11]
+            );
             let (exit, _, _) = invoke(&mut machines, id, registers);
             assert_eq!(exit, InnerExit::Halt, "{backend:?}");
             assert_eq!(
@@ -521,22 +551,30 @@ mod tests {
         for backend in backends() {
             let mut machines = InnerMachines::with_backend(backend);
             let id = machines.create(&INNER, 0).unwrap();
-            machines.pages(id, 16, 2, PageMode::AllocateReadWrite).unwrap();
+            machines
+                .pages(id, 16, 2, PageMode::AllocateReadWrite)
+                .unwrap();
             let (exit, whole, registers) = invoke(&mut machines, id, [0; 13]);
             assert_eq!(exit, InnerExit::Host(7));
             assert_eq!(machines.expunge(id), Ok(20));
 
             let id = machines.create(&INNER, 20).unwrap();
-            machines.pages(id, 16, 2, PageMode::AllocateReadWrite).unwrap();
+            machines
+                .pages(id, 16, 2, PageMode::AllocateReadWrite)
+                .unwrap();
             let (exit, restored, _) = invoke(&mut machines, id, registers);
             assert_eq!(exit, InnerExit::Halt);
             machines.expunge(id).unwrap();
 
             let id = machines.create(&tail, 0).unwrap();
-            machines.pages(id, 16, 2, PageMode::AllocateReadWrite).unwrap();
+            machines
+                .pages(id, 16, 2, PageMode::AllocateReadWrite)
+                .unwrap();
             let (exit, alone, _) = invoke(&mut machines, id, [0; 13]);
             assert_eq!(exit, InnerExit::Halt);
-            println!("{backend:?}: block from 0 = {whole}, restored at 20 = {restored}, tail alone = {alone}");
+            println!(
+                "{backend:?}: block from 0 = {whole}, restored at 20 = {restored}, tail alone = {alone}"
+            );
             assert_eq!(restored, whole, "{backend:?}");
             assert!(alone < whole, "{backend:?}");
         }

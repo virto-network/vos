@@ -25,8 +25,8 @@ pub const ECALL_SCALAR_ADD_MOD_L: u32 = 114;
 
 /// One blake2b compression per call.
 /// Mirrors `vos_pvm_proof::core::ecall::ECALL_BLAKE2B_COMPRESS`.
-/// Convention: φ[7]=h_ptr (64B in/out), φ[8]=m_ptr (128B in),
-/// φ[9]=t_low (counter low 64 bits), φ[10]=f (finalize flag).
+/// Convention: φ\[7\]=h_ptr (64B in/out), φ\[8\]=m_ptr (128B in),
+/// φ\[9\]=t_low (counter low 64 bits), φ\[10\]=f (finalize flag).
 pub const ECALL_BLAKE2B_COMPRESS: u32 = 0x400;
 
 /// Gray Paper `WHAT`: the host does not know this call.

@@ -11,7 +11,7 @@
 //!
 //! This module is the single host-side source of truth for that tree.  It is
 //! intentionally independent of any external blake2b crate: it hashes via the
-//! same [`blake2b_compress`](crate::chips::blake2b_compress) software core the
+//! same [`crate::chips::blake2b_compress`] software core the
 //! in-AIR Blake2bBoundaryChip uses, so the host root and the circuit root are
 //! identical by construction.
 //!

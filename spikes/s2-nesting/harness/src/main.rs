@@ -45,7 +45,10 @@ struct Spi {
 }
 
 fn le(bytes: &[u8]) -> u64 {
-    bytes.iter().rev().fold(0, |acc, b| acc << 8 | u64::from(*b))
+    bytes
+        .iter()
+        .rev()
+        .fold(0, |acc, b| acc << 8 | u64::from(*b))
 }
 
 fn parse_spi(spi: &[u8]) -> Spi {
@@ -96,7 +99,12 @@ fn native_load(inner: &mut InnerMachines, spi: &Spi) -> NativeActor {
     }
     let stack_top = (1 << 32) - 2 * ZONE - INPUT;
     let stack_size = spi.stack.div_ceil(PAGE) * PAGE;
-    pages(inner, stack_top - stack_size, stack_size, PageMode::AllocateReadWrite);
+    pages(
+        inner,
+        stack_top - stack_size,
+        stack_size,
+        PageMode::AllocateReadWrite,
+    );
     let args_base = (1 << 32) - ZONE - INPUT;
     pages(inner, args_base, PAGE, PageMode::AllocateReadWrite);
     NativeActor {
@@ -113,12 +121,20 @@ fn native_load(inner: &mut InnerMachines, spi: &Spi) -> NativeActor {
 fn native_reset(inner: &mut InnerMachines, actor: &NativeActor) {
     static ZEROS: [u8; 1 << 20] = [0; 1 << 20];
     for (base, size) in &actor.writable {
-        inner.poke(actor.id, *base as u32, &ZEROS[..*size as usize]).expect("reset");
+        inner
+            .poke(actor.id, *base as u32, &ZEROS[..*size as usize])
+            .expect("reset");
     }
 }
 
 fn peek_u64(inner: &mut InnerMachines, id: u32, address: u64) -> u64 {
-    u64::from_le_bytes(inner.peek(id, address as u32, 8).expect("peek").try_into().unwrap())
+    u64::from_le_bytes(
+        inner
+            .peek(id, address as u32, 8)
+            .expect("peek")
+            .try_into()
+            .unwrap(),
+    )
 }
 
 #[derive(Default)]
@@ -129,8 +145,16 @@ struct Batch {
     checksum: u64,
 }
 
-fn native_call(inner: &mut InnerMachines, actor: &NativeActor, request: &[u8], state: &State, batch: &mut Batch) {
-    inner.poke(actor.id, actor.args_base as u32, request).expect("poke request");
+fn native_call(
+    inner: &mut InnerMachines,
+    actor: &NativeActor,
+    request: &[u8],
+    state: &State,
+    batch: &mut Batch,
+) {
+    inner
+        .poke(actor.id, actor.args_base as u32, request)
+        .expect("poke request");
     let mut registers = [0u64; 13];
     registers[0] = HALT;
     registers[1] = actor.stack_top;
@@ -138,7 +162,9 @@ fn native_call(inner: &mut InnerMachines, actor: &NativeActor, request: &[u8], s
     registers[8] = request.len() as u64;
     let mut gas = ACTOR_GAS;
     loop {
-        let outcome = inner.invoke(actor.id, InvokeState { gas, registers }).expect("invoke");
+        let outcome = inner
+            .invoke(actor.id, InvokeState { gas, registers })
+            .expect("invoke");
         registers = outcome.state.registers;
         gas = outcome.state.gas;
         match outcome.exit {
@@ -158,7 +184,9 @@ fn native_call(inner: &mut InnerMachines, actor: &NativeActor, request: &[u8], s
                     .or_else(|| state.get(&key))
                     .copied()
                     .unwrap_or(0);
-                inner.poke(actor.id, registers[9] as u32, &value.to_le_bytes()).expect("poke");
+                inner
+                    .poke(actor.id, registers[9] as u32, &value.to_le_bytes())
+                    .expect("poke");
                 registers[7] = 8;
             }
             InnerExit::Host(ACTOR_PUT) => {
@@ -181,7 +209,13 @@ enum Reuse {
     Reset,
 }
 
-fn native_batch(backend: PvmBackend, spi: &Spi, requests: &[Request], state: &State, reuse: Reuse) -> (Batch, Duration) {
+fn native_batch(
+    backend: PvmBackend,
+    spi: &Spi,
+    requests: &[Request],
+    state: &State,
+    reuse: Reuse,
+) -> (Batch, Duration) {
     let started = Instant::now();
     let mut inner = InnerMachines::with_backend(backend);
     let mut batch = Batch::default();
@@ -217,7 +251,8 @@ fn run_agent(
     host: impl FnMut(u64, &mut Machine) -> Result<(), ExitReason>,
 ) -> (Invocation, Duration) {
     let started = Instant::now();
-    let context = RefineContext::load_prepared(prepared, args, AGENT_GAS, model).expect("load agent");
+    let context =
+        RefineContext::load_prepared(prepared, args, AGENT_GAS, model).expect("load agent");
     let invocation = context.try_run_with_host(host).expect("backend");
     let elapsed = started.elapsed();
     assert_eq!(invocation.exit, ExitReason::Halt, "agent did not halt");
@@ -239,22 +274,32 @@ fn nested_batch(
             INPUT_NEXT => match requests.get(next) {
                 Some(request) => {
                     next += 1;
-                    assert!(machine.memory_mut().write_bytes_checked(registers[7] as u32, request));
+                    assert!(
+                        machine
+                            .memory_mut()
+                            .write_bytes_checked(registers[7] as u32, request)
+                    );
                     request.len() as u64
                 }
                 None => u64::MAX,
             },
             STATE_GET => match state.get(&read_u64(machine, registers[7])) {
                 Some(value) => {
-                    assert!(machine
-                        .memory_mut()
-                        .write_bytes_checked(registers[9] as u32, &value.to_le_bytes()));
+                    assert!(
+                        machine
+                            .memory_mut()
+                            .write_bytes_checked(registers[9] as u32, &value.to_le_bytes())
+                    );
                     8
                 }
                 None => u64::MAX,
             },
             PROGRAM => {
-                assert!(machine.memory_mut().write_bytes_checked(registers[7] as u32, actor_spi));
+                assert!(
+                    machine
+                        .memory_mut()
+                        .write_bytes_checked(registers[7] as u32, actor_spi)
+                );
                 actor_spi.len() as u64
             }
             _ => return Err(ExitReason::Panic),
@@ -262,10 +307,18 @@ fn nested_batch(
         machine.registers_mut()[7] = result;
         Ok(())
     });
-    (invocation.output_bounded(1 << 24).expect("work result"), elapsed)
+    (
+        invocation.output_bounded(1 << 24).expect("work result"),
+        elapsed,
+    )
 }
 
-fn nested_accumulate(prepared: &PreparedProgram, model: MemoryModel, result: &[u8], state: &mut State) -> Duration {
+fn nested_accumulate(
+    prepared: &PreparedProgram,
+    model: MemoryModel,
+    result: &[u8],
+    state: &mut State,
+) -> Duration {
     let mut args = vec![b'A'];
     args.extend_from_slice(result);
     run_agent(prepared, model, &args, |id, machine| {
@@ -273,7 +326,10 @@ fn nested_accumulate(prepared: &PreparedProgram, model: MemoryModel, result: &[u
             return Err(ExitReason::Panic);
         }
         let registers = *machine.registers();
-        state.insert(read_u64(machine, registers[7]), read_u64(machine, registers[9]));
+        state.insert(
+            read_u64(machine, registers[7]),
+            read_u64(machine, registers[9]),
+        );
         Ok(())
     })
     .1
@@ -282,10 +338,19 @@ fn nested_accumulate(prepared: &PreparedProgram, model: MemoryModel, result: &[u
 fn decode_result(result: &[u8]) -> (Vec<(u64, u64)>, u32, u64) {
     let writes = le(&result[0..4]) as usize;
     let list = (0..writes)
-        .map(|i| (le(&result[4 + i * 16..12 + i * 16]), le(&result[12 + i * 16..20 + i * 16])))
+        .map(|i| {
+            (
+                le(&result[4 + i * 16..12 + i * 16]),
+                le(&result[12 + i * 16..20 + i * 16]),
+            )
+        })
         .collect();
     let at = 4 + writes * 16;
-    (list, le(&result[at..at + 4]) as u32, le(&result[at + 4..at + 12]))
+    (
+        list,
+        le(&result[at..at + 4]) as u32,
+        le(&result[at + 4..at + 12]),
+    )
 }
 
 // ── Workload and measurement ────────────────────────────────
@@ -328,16 +393,26 @@ fn split(one: Duration, many: Duration, n: usize) -> (f64, f64) {
 
 fn backends() -> [(&'static str, PvmBackend, MemoryModel); 2] {
     [
-        ("interpreter", PvmBackend::ForceInterpreter, MemoryModel::Sparse),
+        (
+            "interpreter",
+            PvmBackend::ForceInterpreter,
+            MemoryModel::Sparse,
+        ),
         ("JIT", PvmBackend::ForceRecompiler, MemoryModel::Auto),
     ]
 }
 
 fn main() {
-    let agent_elf = std::env::args().nth(1).expect("usage: s2-harness <agent.elf> <actor.elf>");
-    let actor_elf = std::env::args().nth(2).expect("usage: s2-harness <agent.elf> <actor.elf>");
-    let agent_spi = vos_pvm_compiler::link_elf_spi(&std::fs::read(agent_elf).unwrap()).expect("link agent");
-    let actor_spi = vos_pvm_compiler::link_elf_spi(&std::fs::read(actor_elf).unwrap()).expect("link actor");
+    let agent_elf = std::env::args()
+        .nth(1)
+        .expect("usage: s2-harness <agent.elf> <actor.elf>");
+    let actor_elf = std::env::args()
+        .nth(2)
+        .expect("usage: s2-harness <agent.elf> <actor.elf>");
+    let agent_spi =
+        vos_pvm_compiler::link_elf_spi(&std::fs::read(agent_elf).unwrap()).expect("link agent");
+    let actor_spi =
+        vos_pvm_compiler::link_elf_spi(&std::fs::read(actor_elf).unwrap()).expect("link actor");
     let actor = parse_spi(&actor_spi);
     println!(
         "agent {} bytes; actor {} bytes (code {}, ro {}, rw {}, heap pages {}, stack {})",
@@ -359,57 +434,87 @@ fn main() {
         let (backend_name, scenario) = profile.split_once(':').expect("backend:scenario");
         let (_, backend, model) = backends()
             .into_iter()
-            .find(|(name, ..)| name.eq_ignore_ascii_case(backend_name) || (backend_name == "interp" && *name == "interpreter"))
+            .find(|(name, ..)| {
+                name.eq_ignore_ascii_case(backend_name)
+                    || (backend_name == "interp" && *name == "interpreter")
+            })
             .expect("backend");
         let agent = PreparedProgram::new_with_backend(&agent_spi, backend).unwrap();
         let started = Instant::now();
         let rounds = 2000;
         for _ in 0..rounds {
             match scenario {
-                "nested" => drop(nested_batch(&agent, model, &actor_spi, &transfers[..1], &state, true)),
-                "fresh" => drop(native_batch(backend, &actor, &transfers[..1], &state, Reuse::Fresh)),
-                "agent" => drop(RefineContext::load_prepared(&agent, &[b'N', 1], AGENT_GAS, model).unwrap()),
+                "nested" => drop(nested_batch(
+                    &agent,
+                    model,
+                    &actor_spi,
+                    &transfers[..1],
+                    &state,
+                    true,
+                )),
+                "fresh" => drop(native_batch(
+                    backend,
+                    &actor,
+                    &transfers[..1],
+                    &state,
+                    Reuse::Fresh,
+                )),
+                "agent" => drop(
+                    RefineContext::load_prepared(&agent, &[b'N', 1], AGENT_GAS, model).unwrap(),
+                ),
                 "phases" => {
                     // Timestamps at the node calls the agent makes during a
                     // one-transfer refine.
                     let mut marks = vec![("start", Instant::now())];
-                    let context = RefineContext::load_prepared(&agent, &[b'N', 1], AGENT_GAS, model).unwrap();
+                    let context =
+                        RefineContext::load_prepared(&agent, &[b'N', 1], AGENT_GAS, model).unwrap();
                     marks.push(("agent loaded", Instant::now()));
                     let mut served = 0;
-                    let invocation = context
-                        .try_run_with_host(|id, machine| {
-                            let registers = *machine.registers();
-                            let label = match id {
-                                PROGRAM => "agent started (PROGRAM)",
-                                INPUT_NEXT if served == 0 => "first INPUT_NEXT",
-                                STATE_GET => "actor built and run to its first GET",
-                                INPUT_NEXT => "transfer done",
-                                _ => "other",
-                            };
-                            if !(id == STATE_GET && marks.iter().any(|(l, _)| *l == label)) {
-                                marks.push((label, Instant::now()));
-                            }
-                            let result = match id {
-                                INPUT_NEXT if served == 0 => {
-                                    served += 1;
-                                    assert!(machine.memory_mut().write_bytes_checked(registers[7] as u32, &transfers[0]));
-                                    32
+                    let invocation =
+                        context
+                            .try_run_with_host(|id, machine| {
+                                let registers = *machine.registers();
+                                let label = match id {
+                                    PROGRAM => "agent started (PROGRAM)",
+                                    INPUT_NEXT if served == 0 => "first INPUT_NEXT",
+                                    STATE_GET => "actor built and run to its first GET",
+                                    INPUT_NEXT => "transfer done",
+                                    _ => "other",
+                                };
+                                if !(id == STATE_GET && marks.iter().any(|(l, _)| *l == label)) {
+                                    marks.push((label, Instant::now()));
                                 }
-                                INPUT_NEXT => u64::MAX,
-                                STATE_GET => {
-                                    assert!(machine.memory_mut().write_bytes_checked(registers[9] as u32, &1_000_000u64.to_le_bytes()));
-                                    8
-                                }
-                                PROGRAM => {
-                                    assert!(machine.memory_mut().write_bytes_checked(registers[7] as u32, &actor_spi));
-                                    actor_spi.len() as u64
-                                }
-                                _ => return Err(ExitReason::Panic),
-                            };
-                            machine.registers_mut()[7] = result;
-                            Ok(())
-                        })
-                        .unwrap();
+                                let result =
+                                    match id {
+                                        INPUT_NEXT if served == 0 => {
+                                            served += 1;
+                                            assert!(machine.memory_mut().write_bytes_checked(
+                                                registers[7] as u32,
+                                                &transfers[0]
+                                            ));
+                                            32
+                                        }
+                                        INPUT_NEXT => u64::MAX,
+                                        STATE_GET => {
+                                            assert!(machine.memory_mut().write_bytes_checked(
+                                                registers[9] as u32,
+                                                &1_000_000u64.to_le_bytes()
+                                            ));
+                                            8
+                                        }
+                                        PROGRAM => {
+                                            assert!(machine.memory_mut().write_bytes_checked(
+                                                registers[7] as u32,
+                                                &actor_spi
+                                            ));
+                                            actor_spi.len() as u64
+                                        }
+                                        _ => return Err(ExitReason::Panic),
+                                    };
+                                machine.registers_mut()[7] = result;
+                                Ok(())
+                            })
+                            .unwrap();
                     marks.push(("agent halted", Instant::now()));
                     drop(invocation);
                     marks.push(("dropped", Instant::now()));
@@ -421,13 +526,20 @@ fn main() {
                     }
                     PHASES_PRINTED.store(true, std::sync::atomic::Ordering::Relaxed);
                     for pair in marks.windows(2) {
-                        println!("   {:>40}: {:>8.1} µs", pair[1].0, us(pair[1].1 - pair[0].1));
+                        println!(
+                            "   {:>40}: {:>8.1} µs",
+                            pair[1].0,
+                            us(pair[1].1 - pair[0].1)
+                        );
                     }
                 }
                 _ => panic!("scenario"),
             }
         }
-        println!("{profile}: {:.1} µs per round", us(started.elapsed()) / rounds as f64);
+        println!(
+            "{profile}: {:.1} µs per round",
+            us(started.elapsed()) / rounds as f64
+        );
         return;
     }
 
@@ -440,7 +552,11 @@ fn main() {
         let (writes, replies, checksum) = decode_result(&result);
         let (native, _) = native_batch(backend, &actor, &transfers, &state, Reuse::Warm);
         assert_eq!(writes, native.writes, "writes differ");
-        assert_eq!((replies, checksum), (native.replies, native.checksum), "replies differ");
+        assert_eq!(
+            (replies, checksum),
+            (native.replies, native.checksum),
+            "replies differ"
+        );
         let (fresh_result, _) = nested_batch(&agent, model, &actor_spi, &transfers, &state, false);
         assert_eq!(fresh_result, result, "fresh and warm nested runs differ");
         let mut applied = state.clone();
@@ -448,14 +564,22 @@ fn main() {
         let mut expected = state.clone();
         expected.extend(native.writes.iter().copied());
         assert_eq!(applied, expected, "accumulated state differs");
-        println!("   check: {} transfers, {} writes, nested = native, accumulate applied", n, writes.len());
+        println!(
+            "   check: {} transfers, {} writes, nested = native, accumulate applied",
+            n,
+            writes.len()
+        );
 
         // Primitives.
         let count: u64 = 200_000;
         let nop = |k: u64| {
             let mut args = vec![b'H'];
             args.extend_from_slice(&k.to_le_bytes());
-            median((0..REPEATS).map(|_| run_agent(&agent, model, &args, |_, _| Ok(())).1).collect())
+            median(
+                (0..REPEATS)
+                    .map(|_| run_agent(&agent, model, &args, |_, _| Ok(())).1)
+                    .collect(),
+            )
         };
         let per_call = (us(nop(count)) - us(nop(0))) / count as f64;
         let yields = |k: u64| {
@@ -491,7 +615,15 @@ fn main() {
             registers[8] = 1;
             let started = Instant::now();
             for _ in 0..count {
-                let out = inner.invoke(a.id, InvokeState { gas: ACTOR_GAS, registers }).unwrap();
+                let out = inner
+                    .invoke(
+                        a.id,
+                        InvokeState {
+                            gas: ACTOR_GAS,
+                            registers,
+                        },
+                    )
+                    .unwrap();
                 assert_eq!(out.exit, InnerExit::Host(ACTOR_YIELD));
                 registers = out.state.registers;
             }
@@ -526,7 +658,8 @@ fn main() {
             (0..REPEATS)
                 .map(|_| {
                     let started = Instant::now();
-                    let context = RefineContext::load_prepared(&agent, &[b'N', 1], AGENT_GAS, model).unwrap();
+                    let context =
+                        RefineContext::load_prepared(&agent, &[b'N', 1], AGENT_GAS, model).unwrap();
                     let elapsed = started.elapsed();
                     drop(context);
                     elapsed
@@ -584,12 +717,25 @@ fn main() {
                 let nested = |k: usize| {
                     median(
                         (0..REPEATS)
-                            .map(|_| nested_batch(&agent, model, &actor_spi, &op_requests[..k], &state, warm).1)
+                            .map(|_| {
+                                nested_batch(
+                                    &agent,
+                                    model,
+                                    &actor_spi,
+                                    &op_requests[..k],
+                                    &state,
+                                    warm,
+                                )
+                                .1
+                            })
                             .collect(),
                     )
                 };
                 let (fixed, marginal) = split(nested(1), nested(n), n);
-                println!("   {:<28} {fixed:>14.1} {marginal:>16.2}", format!("nested {label} {mode}"));
+                println!(
+                    "   {:<28} {fixed:>14.1} {marginal:>16.2}",
+                    format!("nested {label} {mode}")
+                );
                 let reuses: &[(Reuse, &str)] = match (label, warm) {
                     ("transfer", true) => &[(Reuse::Warm, "warm"), (Reuse::Reset, "warm + reset")],
                     (_, true) => &[(Reuse::Warm, "warm")],
@@ -599,12 +745,18 @@ fn main() {
                     let native = |k: usize| {
                         median(
                             (0..REPEATS)
-                                .map(|_| native_batch(backend, &actor, &op_requests[..k], &state, *reuse).1)
+                                .map(|_| {
+                                    native_batch(backend, &actor, &op_requests[..k], &state, *reuse)
+                                        .1
+                                })
                                 .collect(),
                         )
                     };
                     let (fixed, marginal) = split(native(1), native(n), n);
-                    println!("   {:<28} {fixed:>14.1} {marginal:>16.2}", format!("native {label} {mode}"));
+                    println!(
+                        "   {:<28} {fixed:>14.1} {marginal:>16.2}",
+                        format!("native {label} {mode}")
+                    );
                 }
             }
         }

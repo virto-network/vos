@@ -31,9 +31,14 @@ fn steps(spi: &[u8], n: u64) -> usize {
 }
 
 fn main() {
-    let elf = std::env::args().nth(1).expect("usage: s5-attestable <guest.elf> steps|prove <n>...");
+    let elf = std::env::args()
+        .nth(1)
+        .expect("usage: s5-attestable <guest.elf> steps|prove <n>...");
     let mode = std::env::args().nth(2).expect("mode");
-    let ns: Vec<u64> = std::env::args().skip(3).map(|a| a.parse().unwrap()).collect();
+    let ns: Vec<u64> = std::env::args()
+        .skip(3)
+        .map(|a| a.parse().unwrap())
+        .collect();
     let spi = vos_pvm_compiler::link_elf_spi(&std::fs::read(elf).unwrap()).expect("link");
     match mode.as_str() {
         "steps" => {

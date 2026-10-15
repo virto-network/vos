@@ -49,7 +49,9 @@ use stwo::core::proof::StarkProof;
 use stwo::core::vcs::hash::Hash;
 use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 use stwo::core::verifier::{verify, VerificationError};
-use stwo_constraint_framework::{EvalAtRow, FrameworkComponent, FrameworkEval, TraceLocationAllocator};
+use stwo_constraint_framework::{
+    EvalAtRow, FrameworkComponent, FrameworkEval, TraceLocationAllocator,
+};
 
 // ── Poseidon2-over-M31 parameters (width 16; eprint 2023/323 §5) ──────────
 

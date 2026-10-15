@@ -25,7 +25,12 @@ type Page = Box<[u8; PAGE]>;
 /// Bare code blob `c` from a standard program
 /// `E3(|o|) E3(|w|) E2(z) E3(s) o w E4(|c|) c`.
 fn code_blob(spi: &[u8]) -> Vec<u8> {
-    let le = |bytes: &[u8]| bytes.iter().rev().fold(0usize, |acc, b| acc << 8 | *b as usize);
+    let le = |bytes: &[u8]| {
+        bytes
+            .iter()
+            .rev()
+            .fold(0usize, |acc, b| acc << 8 | *b as usize)
+    };
     let ro = le(&spi[0..3]);
     let rw = le(&spi[3..6]);
     let offset = 11 + ro + rw;
@@ -69,7 +74,9 @@ fn serve(machine: &mut Machine, call: u64, ordinal: usize) -> bool {
         return true;
     }
     let mut message = vec![0u8; registers[8] as usize];
-    machine.memory().read_bytes(registers[7] as u32, &mut message);
+    machine
+        .memory()
+        .read_bytes(registers[7] as u32, &mut message);
     let answer = reply(call, &message, ordinal);
     let len = answer.len().min(registers[10] as usize);
     assert!(
@@ -89,7 +96,11 @@ fn output(machine: &Machine) -> String {
 }
 
 /// Run straight through, recording elapsed time at each suspension point.
-fn reference(prepared: &PreparedProgram, args: &[u8], model: MemoryModel) -> (String, Vec<Duration>, Duration) {
+fn reference(
+    prepared: &PreparedProgram,
+    args: &[u8],
+    model: MemoryModel,
+) -> (String, Vec<Duration>, Duration) {
     let mut machine = Machine::load_prepared(prepared, args, GAS, model).expect("load");
     let started = Instant::now();
     let mut prefixes = Vec::new();
@@ -136,11 +147,7 @@ fn median(mut values: Vec<f64>) -> f64 {
     values[values.len() / 2]
 }
 
-fn snapshot_run(
-    spi: &[u8],
-    args: &[u8],
-    prefixes: &[Duration],
-) -> (String, Vec<Row>) {
+fn snapshot_run(spi: &[u8], args: &[u8], prefixes: &[Duration]) -> (String, Vec<Row>) {
     let code = code_blob(spi);
     let interp = PreparedProgram::new_with_backend(spi, PvmBackend::ForceInterpreter).unwrap();
     let jit = PreparedProgram::new_with_backend(spi, PvmBackend::ForceRecompiler).unwrap();
@@ -167,7 +174,10 @@ fn snapshot_run(
         }
 
         // Capture at the suspension point, before any reply exists.
-        let pending = machine.interpreter().pending_host_call().expect("pending host call");
+        let pending = machine
+            .interpreter()
+            .pending_host_call()
+            .expect("pending host call");
         let memory = machine.memory();
         let scan_started = Instant::now();
         let mut dirty = BTreeMap::new();
@@ -244,7 +254,9 @@ fn snapshot_run(
             tracked_us,
             restore_interp_us: median(restore_interp),
             restore_jit_us: median(restore_jit),
-            prefix_us: prefixes.get(rows.len()).map_or(0.0, |d| d.as_secs_f64() * 1e6),
+            prefix_us: prefixes
+                .get(rows.len())
+                .map_or(0.0, |d| d.as_secs_f64() * 1e6),
         });
         previous = snapshot.pages;
 
@@ -257,13 +269,18 @@ fn snapshot_run(
 }
 
 fn main() {
-    let elf_path = std::env::args().nth(1).expect("usage: s1-harness <workflows.elf>");
+    let elf_path = std::env::args()
+        .nth(1)
+        .expect("usage: s1-harness <workflows.elf>");
     let elf = std::fs::read(&elf_path).unwrap();
     let spi = vos_pvm_compiler::link_elf_spi(&elf).expect("link");
     println!("program: {} bytes", spi.len());
 
     let workloads: [(&str, Vec<u8>); 3] = [
-        ("transfer", b"Talice|bob|1250|rent october|household|recurring".to_vec()),
+        (
+            "transfer",
+            b"Talice|bob|1250|rent october|household|recurring".to_vec(),
+        ),
         ("saga", b"Sorder-7731 customer=4411 items=3".to_vec()),
         ("compute", b"C".to_vec()),
     ];
@@ -279,14 +296,29 @@ fn main() {
             expected,
             interp_total.as_secs_f64() * 1e6,
             jit_total.as_secs_f64() * 1e6,
-            if restored_output == expected { "MATCHES" } else { "DIFFERS" },
+            if restored_output == expected {
+                "MATCHES"
+            } else {
+                "DIFFERS"
+            },
         );
         println!(
             "   {:>3} {:>6} {:>6} {:>9} {:>9} {:>9} {:>10} {:>10} {:>10} {:>10}",
-            "#", "dirty", "delta", "delta KiB", "lz4 KiB", "scan µs", "track µs", "rst-int µs", "rst-jit µs", "replay µs"
+            "#",
+            "dirty",
+            "delta",
+            "delta KiB",
+            "lz4 KiB",
+            "scan µs",
+            "track µs",
+            "rst-int µs",
+            "rst-jit µs",
+            "replay µs"
         );
         for (index, row) in rows.iter().enumerate() {
-            let jit_prefix = jit_prefixes.get(index).map_or(0.0, |d| d.as_secs_f64() * 1e6);
+            let jit_prefix = jit_prefixes
+                .get(index)
+                .map_or(0.0, |d| d.as_secs_f64() * 1e6);
             println!(
                 "   {:>3} {:>6} {:>6} {:>9.1} {:>9.1} {:>9.0} {:>10.0} {:>10.0} {:>10.0} {:>4.0}/{:<5.0}",
                 index,

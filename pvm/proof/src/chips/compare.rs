@@ -3,10 +3,10 @@
 //! CpuChip emits one CompareLookup producer per `is_compare + is_branch`
 //! row; CompareChip consumes once per real row.  CompareChip witnesses
 //! the byte-wise subtraction carry chain (val_b + ~val_d + 1) and pins
-//! cmp_lt_flag = 1 - cmp_carry[7].  Per-byte Range256 lookups on
+//! cmp_lt_flag = 1 - cmp_carry\[7\].  Per-byte Range256 lookups on
 //! cmp_sub_result emit from here too.
 //!
-//! Lookup tuple (17 limbs): val_b[8] + val_d[8] + cmp_lt_flag.
+//! Lookup tuple (17 limbs): val_b\[8\] + val_d\[8\] + cmp_lt_flag.
 
 #[allow(unused_imports)]
 use alloc::{boxed::Box, vec, vec::Vec};

@@ -47,7 +47,7 @@ pub struct NonZeroPage {
 /// Deterministic sparse value image of guest memory.
 ///
 /// Permissions are intentionally not part of the value image. Callers that
-/// commit complete architectural state must bind [`Memory::page_perms`]
+/// commit complete architectural state must bind `Memory::page_perms`
 /// separately.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SparseMemoryImage {

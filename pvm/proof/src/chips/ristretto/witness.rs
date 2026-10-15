@@ -58,8 +58,8 @@ pub struct FieldOpRow {
     /// half.  Zero throughout on is_add / is_sub rows.
     pub mul_product: [u8; 64],
     /// Per-position carry chain split into 3 bytes (lo, mid,
-    /// hi) per position.  full_carry[k] = mul_carry[k] + 256·mul_carry_mid[k]
-    /// + 65536·mul_carry_hi[k].  At most ~21 bits / position — the
+    /// hi) per position.  full_carry\[k\] = mul_carry\[k\] + 256·mul_carry_mid\[k\]
+    /// + 65536·mul_carry_hi\[k\].  At most ~21 bits / position — the
     /// hi byte is usually 0 but reserved for the maximum-density
     /// schoolbook column near k = 31.
     pub mul_carry: [u8; 64],
@@ -78,7 +78,7 @@ pub struct FieldOpRow {
     pub pass2_carry_out: u8,
     /// Per-position pass-2 carry chain.
     pub pass2_carry: [u8; 32],
-    /// Top bit of pass2_lo[31] before the +19 step.
+    /// Top bit of pass2_lo\[31\] before the +19 step.
     pub pass2_top_bit: u8,
     /// Pass-2 result with bit 255 cleared and +19 folded
     /// in if pass2_carry_out + pass2_top_bit indicates the value

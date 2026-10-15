@@ -339,7 +339,7 @@ mod tests {
 
 /// Dedup-feasibility report — counts how many byte entries in the
 /// (address, ts)-sorted memory ledger fall into "byte-flood" groups
-/// (consecutive entries with addr[i+1] = addr[i]+1, same ts, same is_write),
+/// (consecutive entries with addr[i+1] = addr\[i\]+1, same ts, same is_write),
 /// and what the resulting `log_size` would be if every such group were
 /// merged into a single multi-byte row up to a per-row cap M.  Used as a
 /// feasibility check for a potential merged-row chip-shrink.

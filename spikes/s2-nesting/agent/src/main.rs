@@ -104,11 +104,16 @@ static INPUT_BUF: Static<[u8; 4096]> = Static(UnsafeCell::new([0; 4096]));
 static FRAME: Static<[u64; 14]> = Static(UnsafeCell::new([0; 14]));
 static WRITES: Static<[(u64, u64); MAX_WRITES]> = Static(UnsafeCell::new([(0, 0); MAX_WRITES]));
 /// Open-addressing map of this refine's writes: key + 1 (0 = empty), value.
-static OVERLAY: Static<[(u64, u64); OVERLAY_SLOTS]> = Static(UnsafeCell::new([(0, 0); OVERLAY_SLOTS]));
-static OUTPUT: Static<[u8; 16 * MAX_WRITES + 16]> = Static(UnsafeCell::new([0; 16 * MAX_WRITES + 16]));
+static OVERLAY: Static<[(u64, u64); OVERLAY_SLOTS]> =
+    Static(UnsafeCell::new([(0, 0); OVERLAY_SLOTS]));
+static OUTPUT: Static<[u8; 16 * MAX_WRITES + 16]> =
+    Static(UnsafeCell::new([0; 16 * MAX_WRITES + 16]));
 
 fn le(bytes: &[u8]) -> u64 {
-    bytes.iter().rev().fold(0, |acc, b| acc << 8 | u64::from(*b))
+    bytes
+        .iter()
+        .rev()
+        .fold(0, |acc, b| acc << 8 | u64::from(*b))
 }
 
 fn page_round(x: u64) -> u64 {
@@ -224,7 +229,13 @@ fn read_inner_u64(actor: &Actor, address: u64) -> u64 {
 
 /// Run one request to completion, serving the actor's calls.
 fn call_actor(actor: &Actor, request: &[u8], batch: &mut Batch) {
-    let (status, _) = hostcall!(POKE, actor.id, request.as_ptr(), actor.args_base, request.len());
+    let (status, _) = hostcall!(
+        POKE,
+        actor.id,
+        request.as_ptr(),
+        actor.args_base,
+        request.len()
+    );
     assert!(status == 0);
     let frame = FRAME.get();
     *frame = [0; 14];
@@ -253,9 +264,18 @@ fn call_actor(actor: &Actor, request: &[u8], batch: &mut Batch) {
                     None => {
                         let mut bytes = [0u8; 8];
                         let key_bytes = key.to_le_bytes();
-                        let (len, _) =
-                            hostcall!(STATE_GET, key_bytes.as_ptr(), 8u64, bytes.as_mut_ptr(), 8u64);
-                        if len == NONE { 0 } else { u64::from_le_bytes(bytes) }
+                        let (len, _) = hostcall!(
+                            STATE_GET,
+                            key_bytes.as_ptr(),
+                            8u64,
+                            bytes.as_mut_ptr(),
+                            8u64
+                        );
+                        if len == NONE {
+                            0
+                        } else {
+                            u64::from_le_bytes(bytes)
+                        }
                     }
                 };
                 let bytes = value.to_le_bytes();

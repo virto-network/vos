@@ -11,14 +11,21 @@ use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 
 use merkle_crdt::sync::fetch_missing;
-use merkle_crdt::{Cid, DagNode, Encode, Hasher, MemStore, MerkleClock, MerkleCrdt, Payload, Store};
+use merkle_crdt::{
+    Cid, DagNode, Encode, Hasher, MemStore, MerkleClock, MerkleCrdt, Payload, Store,
+};
 
 struct Blake2b;
 
 impl Hasher for Blake2b {
     type Output = [u8; 32];
     fn hash(data: &[u8]) -> [u8; 32] {
-        blake2b_simd::Params::new().hash_length(32).hash(data).as_bytes().try_into().unwrap()
+        blake2b_simd::Params::new()
+            .hash_length(32)
+            .hash(data)
+            .as_bytes()
+            .try_into()
+            .unwrap()
     }
 }
 
@@ -93,7 +100,12 @@ impl Incremental {
 
 fn op(i: u64, replica: u8) -> Put {
     let key = i.wrapping_mul(0x9e37_79b9_7f4a_7c15) % 100_000;
-    Put { key, value: i, time: i + 1, replica }
+    Put {
+        key,
+        value: i,
+        time: i + 1,
+        replica,
+    }
 }
 
 /// A history of `h` operations, as a chain with a concurrent branch merged
@@ -165,18 +177,27 @@ fn main() {
         .skip(1)
         .map(|a| a.parse().unwrap())
         .collect();
-    let sizes = if sizes.is_empty() { vec![1_000, 10_000, 100_000, 1_000_000] } else { sizes };
+    let sizes = if sizes.is_empty() {
+        vec![1_000, 10_000, 100_000, 1_000_000]
+    } else {
+        sizes
+    };
     println!(
         "{:>9} {:>22} {:>22} {:>20} {:>22} {:>22}",
-        "history", "current: sync 1 op", "current: sync 100 ops", "current: local op",
-        "incremental: sync 1", "incremental: sync 100"
+        "history",
+        "current: sync 1 op",
+        "current: sync 100 ops",
+        "current: local op",
+        "incremental: sync 1",
+        "incremental: sync 100"
     );
     for h in sizes {
         let (store, roots, state) = history(h);
 
         // Current library: recovering a replica materializes once; every
         // sync re-validates and re-materializes.
-        let mut current = Current::from_roots(copy_store(&store, &roots), roots.iter().cloned()).unwrap();
+        let mut current =
+            Current::from_roots(copy_store(&store, &roots), roots.iter().cloned()).unwrap();
         assert_eq!(current.state(), &state);
         let samples = if h >= 1_000_000 { 2 } else { 5 };
         let mut sync_1 = Vec::new();
@@ -203,7 +224,11 @@ fn main() {
         }
 
         // Incremental replica on the same history.
-        let mut inc = Incremental { store: copy_store(&store, &roots), roots: roots.clone(), state: state.clone() };
+        let mut inc = Incremental {
+            store: copy_store(&store, &roots),
+            roots: roots.clone(),
+            state: state.clone(),
+        };
         let mut inc_1 = Vec::new();
         let mut inc_100 = Vec::new();
         let mut next = h + 10;
@@ -223,8 +248,16 @@ fn main() {
         }
         // Both replicas saw the same peer operations in the same order for the
         // first `samples` rounds; check convergence against a rebuild.
-        let rebuilt = Current::from_roots(copy_store(&inc.store, &inc.roots), inc.roots.iter().cloned()).unwrap();
-        assert_eq!(rebuilt.state(), &inc.state, "incremental state diverged from a full rebuild");
+        let rebuilt = Current::from_roots(
+            copy_store(&inc.store, &inc.roots),
+            inc.roots.iter().cloned(),
+        )
+        .unwrap();
+        assert_eq!(
+            rebuilt.state(),
+            &inc.state,
+            "incremental state diverged from a full rebuild"
+        );
 
         let median = |mut v: Vec<Duration>| {
             v.sort();

@@ -202,7 +202,7 @@ pub enum Column {
     #[size = 32]
     Pass2Carry,
 
-    /// Top bit of pass2_lo[31] (= bit 255 of the value).
+    /// Top bit of pass2_lo\[31\] (= bit 255 of the value).
     /// If set, the value is in `[2²⁵⁵, 2²⁵⁶)` and reduces by adding
     /// 19 after clearing bit 255.
     #[size = 1]
@@ -253,7 +253,7 @@ pub enum Column {
 
     /// Row-id (low byte) of the row that produced this
     /// row's `a` input.  The chip emits a CONSUMER lookup keyed
-    /// on (a_source_row, byte_index, a[byte]) — closes the
+    /// on (a_source_row, byte_index, a\[byte\]) — closes the
     /// inter-row binding gap by forcing every input to come from a
     /// prior row's `out` (or from a boundary producer).
     #[size = 1]
@@ -339,7 +339,7 @@ pub enum PreprocessedColumn {
     /// a 32-cell preprocessed column.  Used to inject the byte_idx
     /// element of producer/consumer lookup tuples without requiring
     /// per-emission constant materialization in the interaction
-    /// trace.  At every row, ByteIdx[k] = k.
+    /// trace.  At every row, ByteIdx\[k\] = k.
     #[size = 32]
     ByteIdx,
 }

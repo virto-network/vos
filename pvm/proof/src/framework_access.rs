@@ -87,7 +87,7 @@ pub fn draw_all_lookup_elements(
 }
 
 /// Re-evaluate one canonical chip's constraints through a caller-supplied
-/// [`EvalAtRow`] — the recursion OODS-embed seam.
+/// `EvalAtRow` — the recursion OODS-embed seam.
 ///
 /// `BuiltInComponentEval` and the per-chip lookup-element tuples are
 /// crate-private, so a chip's `add_constraints` can only be driven with an
@@ -198,7 +198,7 @@ pub mod create_verifier_components {
         (trace_sizes, preprocessed_sizes)
     }
 
-    /// Create verifier components (Box<dyn Component>) from proof data.
+    /// Create verifier components (`Box<dyn Component>`) from proof data.
     pub fn components<'a>(
         tree_span_provider: &mut TraceLocationAllocator,
         lookup_elements: &AllLookupElements,

@@ -22,8 +22,8 @@
 //! on signed-div rows.  Per-byte Range256 emissions on DivCmpDiff
 //! and AbsCmpDiff enforce byte range.
 //!
-//! Lookup tuple (40 limbs): val_b[8] + val_d[8] + div_quotient[8] +
-//! div_remainder[8] + sign_bit_b + sign_bit_d + sign_bit_q +
+//! Lookup tuple (40 limbs): val_b\[8\] + val_d\[8\] + div_quotient\[8\] +
+//! div_remainder\[8\] + sign_bit_b + sign_bit_d + sign_bit_q +
 //! sign_bit_r + is_div_rem + div_by_zero + is_32bit + is_div_s.
 
 #[allow(unused_imports)]

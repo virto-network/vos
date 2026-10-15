@@ -5,8 +5,8 @@
 //! (via MulCarry/MulCarryHi); and the MulUpper SS/SU sign-correction
 //! (via UnsignedProductHi/MulCorrTermA/B/Carry).
 //!
-//! Lookup tuple (47 limbs): val_b[8] + val_d[8] + result[8] +
-//! mul_high[8] + unsigned_product_low[8] + sign_bit_b + sign_bit_d +
+//! Lookup tuple (47 limbs): val_b\[8\] + val_d\[8\] + result\[8\] +
+//! mul_high\[8\] + unsigned_product_low\[8\] + sign_bit_b + sign_bit_d +
 //! 5 flags.  CpuChip witnesses val_b/val_d/result/mul_high/
 //! unsigned_product_low + sign_bit_b/d (the latter two pinned by
 //! CpuChip's existing nibble-AND lookups); MulChip's AIR pins them all

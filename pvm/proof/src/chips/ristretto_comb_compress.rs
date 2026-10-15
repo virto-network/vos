@@ -32,7 +32,7 @@
 //! (`RistrettoCombCompressRegFileLookupElements`) — same shape as
 //! the consumer chip's, but a distinct relation type so chip-local
 //! row IDs don't collide.  Producer per real row: 32 (row_lo, row_hi,
-//! byte_idx, out[k]) tuples.  Consumer A/B per algebra row: 32 each
+//! byte_idx, out\[k\]) tuples.  Consumer A/B per algebra row: 32 each
 //! for `a` / `b` keyed on the source row's ID.
 //!
 //! Integrity checks:

@@ -62,7 +62,11 @@ fn get(account: u64) -> u64 {
     let key = account.to_le_bytes();
     let mut value = [0u8; 8];
     let len = hostcall!(GET, key.as_ptr(), 8, value.as_mut_ptr(), 8);
-    if len == 8 { u64::from_le_bytes(value) } else { 0 }
+    if len == 8 {
+        u64::from_le_bytes(value)
+    } else {
+        0
+    }
 }
 
 fn put(account: u64, balance: u64) {

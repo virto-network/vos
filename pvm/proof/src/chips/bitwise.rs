@@ -7,7 +7,7 @@
 //! BitwiseLookupChip's table — all on BitwiseChip's narrower trace
 //! rather than CpuChip's wide one.
 //!
-//! Lookup tuple (30 limbs): val_b[8] + val_d[8] + result[8] +
+//! Lookup tuple (30 limbs): val_b\[8\] + val_d\[8\] + result\[8\] +
 //! is_and + is_or + is_xor + is_and_inv + is_or_inv + is_xnor.
 
 #[allow(unused_imports)]

@@ -3659,7 +3659,11 @@ where
             continue;
         }
 
-        if !state.leader.as_mut().is_some_and(|l| l.inflight.insert(peer)) {
+        if !state
+            .leader
+            .as_mut()
+            .is_some_and(|l| l.inflight.insert(peer))
+        {
             continue;
         }
         let prev_log_index = next_idx.saturating_sub(1);
@@ -3667,7 +3671,10 @@ where
         let entries = if next_idx <= leader_last_index {
             state
                 .storage
-                .entries(next_idx, leader_last_index.min(next_idx + MAX_APPEND_ENTRIES - 1))
+                .entries(
+                    next_idx,
+                    leader_last_index.min(next_idx + MAX_APPEND_ENTRIES - 1),
+                )
                 .await?
         } else {
             Vec::new()
@@ -4560,7 +4567,6 @@ mod tests {
         worker.shutdown();
     }
 }
-
 
 const MAX_APPEND_ENTRIES: u64 = 4096;
 

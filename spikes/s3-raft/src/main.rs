@@ -21,14 +21,14 @@ use vos_raft as raft;
 use vos_raft_eager as raft;
 
 use raft::worker::run_worker;
-use raft::{
-    ApplySink, Config, EntryKind, LogEntry, MemStorage, Meta, RaftMsg, Rng, Role, Storage,
-    TokioClock, Transport, Worker, WriteBatch,
-};
 #[cfg(feature = "eager")]
 use raft::{
     AppendEntriesReq, AppendEntriesResp, InstallSnapshotReq, InstallSnapshotResp, PreVoteReq,
     PreVoteResp, RequestVoteReq, RequestVoteResp,
+};
+use raft::{
+    ApplySink, Config, EntryKind, LogEntry, MemStorage, Meta, RaftMsg, Rng, Role, Storage,
+    TokioClock, Transport, Worker, WriteBatch,
 };
 
 type N = u32;
@@ -89,19 +89,26 @@ impl InProc {
 impl Transport<N> for InProc {
     type Error = String;
 
-    async fn send_append(&self, peer: N, req: AppendEntriesReq<N>) -> Result<AppendEntriesResp, String> {
+    async fn send_append(
+        &self,
+        peer: N,
+        req: AppendEntriesReq<N>,
+    ) -> Result<AppendEntriesResp, String> {
         let from = self.me;
-        self.call(peer, |reply| RaftMsg::AppendEntries { from, req, reply }).await
+        self.call(peer, |reply| RaftMsg::AppendEntries { from, req, reply })
+            .await
     }
 
     async fn send_vote(&self, peer: N, req: RequestVoteReq<N>) -> Result<RequestVoteResp, String> {
         let from = self.me;
-        self.call(peer, |reply| RaftMsg::RequestVote { from, req, reply }).await
+        self.call(peer, |reply| RaftMsg::RequestVote { from, req, reply })
+            .await
     }
 
     async fn send_prevote(&self, peer: N, req: PreVoteReq<N>) -> Result<PreVoteResp, String> {
         let from = self.me;
-        self.call(peer, |reply| RaftMsg::PreVote { from, req, reply }).await
+        self.call(peer, |reply| RaftMsg::PreVote { from, req, reply })
+            .await
     }
 
     async fn send_install(
@@ -110,7 +117,8 @@ impl Transport<N> for InProc {
         req: InstallSnapshotReq<N>,
     ) -> Result<InstallSnapshotResp, String> {
         let from = self.me;
-        self.call(peer, |reply| RaftMsg::InstallSnapshot { from, req, reply }).await
+        self.call(peer, |reply| RaftMsg::InstallSnapshot { from, req, reply })
+            .await
     }
 }
 
@@ -137,7 +145,6 @@ impl Rng for XorShift {
 }
 
 // ── redb storage ────────────────────────────────────────────
-
 
 fn encode_entry(entry: &LogEntry<N>) -> Vec<u8> {
     let mut out = Vec::new();
@@ -213,14 +220,18 @@ impl TableWrite {
     fn apply(&self, txn: &redb::WriteTransaction) -> Result<(), String> {
         let mut log = txn.open_table(LOG).map_err(|e| e.to_string())?;
         for index in &self.remove {
-            log.remove((self.group, *index)).map_err(|e| e.to_string())?;
+            log.remove((self.group, *index))
+                .map_err(|e| e.to_string())?;
         }
         for (index, bytes) in &self.insert {
-            log.insert((self.group, *index), bytes.as_slice()).map_err(|e| e.to_string())?;
+            log.insert((self.group, *index), bytes.as_slice())
+                .map_err(|e| e.to_string())?;
         }
         if let Some(meta) = &self.meta {
             let mut table = txn.open_table(META).map_err(|e| e.to_string())?;
-            table.insert(self.group, meta.as_slice()).map_err(|e| e.to_string())?;
+            table
+                .insert(self.group, meta.as_slice())
+                .map_err(|e| e.to_string())?;
         }
         Ok(())
     }
@@ -234,7 +245,10 @@ struct WriterReq {
 
 /// One writer thread per node: drains every queued write, commits them in a
 /// single transaction (one fsync if any is durable) and acknowledges all.
-fn spawn_log_writer(db: Arc<Database>, commits: Arc<AtomicU64>) -> std::sync::mpsc::Sender<WriterReq> {
+fn spawn_log_writer(
+    db: Arc<Database>,
+    commits: Arc<AtomicU64>,
+) -> std::sync::mpsc::Sender<WriterReq> {
     let (tx, rx) = std::sync::mpsc::channel::<WriterReq>();
     std::thread::spawn(move || {
         while let Ok(first) = rx.recv() {
@@ -243,7 +257,11 @@ fn spawn_log_writer(db: Arc<Database>, commits: Arc<AtomicU64>) -> std::sync::mp
             let result = (|| {
                 let mut txn = db.begin_write().map_err(|e| e.to_string())?;
                 let durable = reqs.iter().any(|r| r.durable);
-                txn.set_durability(if durable { Durability::Immediate } else { Durability::None });
+                txn.set_durability(if durable {
+                    Durability::Immediate
+                } else {
+                    Durability::None
+                });
                 for req in &reqs {
                     req.write.apply(&txn)?;
                 }
@@ -319,7 +337,11 @@ impl Storage<N> for RedbStorage {
         if start > end {
             return Ok(Vec::new());
         }
-        Ok(self.log.range(start..=end).map(|(_, e)| e.clone()).collect())
+        Ok(self
+            .log
+            .range(start..=end)
+            .map(|(_, e)| e.clone())
+            .collect())
     }
 
     async fn read_state(&self) -> Result<Vec<u8>, String> {
@@ -349,13 +371,21 @@ impl Storage<N> for RedbStorage {
         let write = TableWrite {
             group: self.group,
             remove,
-            insert: batch.appends.iter().map(|e| (e.index, encode_entry(e))).collect(),
+            insert: batch
+                .appends
+                .iter()
+                .map(|e| (e.index, encode_entry(e)))
+                .collect(),
             meta: batch.meta.as_ref().map(encode_meta),
         };
         match &self.backend {
             Backend::Inline(db) => {
                 let mut txn = db.begin_write().map_err(|e| e.to_string())?;
-                txn.set_durability(if commit_only { Durability::None } else { Durability::Immediate });
+                txn.set_durability(if commit_only {
+                    Durability::None
+                } else {
+                    Durability::Immediate
+                });
                 write.apply(&txn)?;
                 txn.commit().map_err(|e| e.to_string())?;
             }
@@ -561,7 +591,12 @@ fn throughput(storage: &str, payload: usize, concurrency: usize, heartbeat_ms: u
 
 fn cpu_seconds() -> f64 {
     let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
-    let fields: Vec<&str> = stat.rsplit(')').next().unwrap().split_whitespace().collect();
+    let fields: Vec<&str> = stat
+        .rsplit(')')
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .collect();
     // utime and stime are fields 14 and 15; after the comm field they are
     // at offsets 11 and 12.
     let ticks: f64 = fields[11].parse::<f64>().unwrap() + fields[12].parse::<f64>().unwrap();
@@ -623,7 +658,11 @@ fn groups_shared(groups: usize, heartbeat_ms: u64, worker_threads: usize) {
         &format!("shared runtime, hb {heartbeat_ms} ms"),
         groups,
         &rpcs,
-        || all.iter().filter(|nodes| leader_of(nodes).is_some()).count(),
+        || {
+            all.iter()
+                .filter(|nodes| leader_of(nodes).is_some())
+                .count()
+        },
     );
     rt.shutdown_background();
 }
@@ -685,9 +724,15 @@ fn main() {
             }
         }
         "groups" => {
-            let groups: usize = std::env::args().nth(2).and_then(|g| g.parse().ok()).unwrap_or(1000);
+            let groups: usize = std::env::args()
+                .nth(2)
+                .and_then(|g| g.parse().ok())
+                .unwrap_or(1000);
             let which = std::env::args().nth(3).unwrap_or_else(|| "shared".into());
-            let heartbeat: u64 = std::env::args().nth(4).and_then(|h| h.parse().ok()).unwrap_or(50);
+            let heartbeat: u64 = std::env::args()
+                .nth(4)
+                .and_then(|h| h.parse().ok())
+                .unwrap_or(50);
             match which.as_str() {
                 "threaded" => groups_threaded(groups, heartbeat),
                 _ => groups_shared(groups, heartbeat, 4),
@@ -706,8 +751,14 @@ fn main() {
             );
         }
         "active" => {
-            let groups: usize = std::env::args().nth(2).and_then(|g| g.parse().ok()).unwrap_or(16);
-            let concurrency: usize = std::env::args().nth(3).and_then(|c| c.parse().ok()).unwrap_or(16);
+            let groups: usize = std::env::args()
+                .nth(2)
+                .and_then(|g| g.parse().ok())
+                .unwrap_or(16);
+            let concurrency: usize = std::env::args()
+                .nth(3)
+                .and_then(|c| c.parse().ok())
+                .unwrap_or(16);
             let layout = std::env::args().nth(4).unwrap_or_else(|| "separate".into());
             active(groups, concurrency, &layout);
         }
@@ -812,7 +863,10 @@ fn active(groups: usize, concurrency: usize, layout: &str) {
         if found.iter().all(Option::is_some) {
             break found.into_iter().map(Option::unwrap).collect();
         }
-        assert!(Instant::now() < deadline, "not every group elected a leader");
+        assert!(
+            Instant::now() < deadline,
+            "not every group elected a leader"
+        );
         std::thread::sleep(Duration::from_millis(20));
     };
     std::thread::sleep(Duration::from_millis(300));
@@ -873,7 +927,10 @@ fn active(groups: usize, concurrency: usize, layout: &str) {
         percentile(&sorted, 0.50).as_secs_f64() * 1e3,
         percentile(&sorted, 0.99).as_secs_f64() * 1e3,
         if node_commits > 0.0 {
-            format!("  ({:.0} store commits/s per node)", node_commits / seconds as f64)
+            format!(
+                "  ({:.0} store commits/s per node)",
+                node_commits / seconds as f64
+            )
         } else {
             String::new()
         },

@@ -27,9 +27,9 @@ pub struct Blake2bRecord {
 /// MemoryChip insertion order keeps reads before writes at tie-break.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Blake2bMemOp {
-    /// Pointer register φ[7] — base of h and also base of the output write.
+    /// Pointer register φ\[7\] — base of h and also base of the output write.
     pub h_ptr: u32,
-    /// Pointer register φ[8] — base of m.
+    /// Pointer register φ\[8\] — base of m.
     pub m_ptr: u32,
     /// Timestamp of the ECALL step that triggered the precompile.
     pub ts: u64,
@@ -164,11 +164,11 @@ pub struct RistrettoRecord {
 /// keeps reads before writes at tie-break.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RistrettoMemOp {
-    /// Pointer register φ[7] — base of the 32-byte scalar buffer.
+    /// Pointer register φ\[7\] — base of the 32-byte scalar buffer.
     pub scalar_ptr: u32,
-    /// Pointer register φ[8] — base of the 32-byte input compressed point.
+    /// Pointer register φ\[8\] — base of the 32-byte input compressed point.
     pub point_ptr: u32,
-    /// Pointer register φ[9] — base of the 32-byte output compressed point.
+    /// Pointer register φ\[9\] — base of the 32-byte output compressed point.
     pub output_ptr: u32,
     /// Timestamp of the ECALL step that triggered the precompile.
     pub ts: u64,

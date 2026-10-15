@@ -146,7 +146,9 @@ fn transfer(input: &[u8]) -> String {
     let request = TransferRequest {
         from: text(fields.first().copied().unwrap_or(b"")),
         to: text(fields.get(1).copied().unwrap_or(b"")),
-        amount: text(fields.get(2).copied().unwrap_or(b"0")).parse().unwrap_or(0),
+        amount: text(fields.get(2).copied().unwrap_or(b"0"))
+            .parse()
+            .unwrap_or(0),
         memo: text(fields.get(3).copied().unwrap_or(b"")),
         tags: fields.iter().skip(4).map(|f| text(f)).collect(),
     };

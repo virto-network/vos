@@ -164,8 +164,8 @@ pub enum Column {
     #[size = 1]
     #[mask_next_row]
     F,
-    /// and_t_lo[i] = IV[4][i] & T[i]; and_t_hi[i] = IV[5][i] & T[8+i].
-    /// Together they let initial_v[12]/[13] be expressed via the XOR identity.
+    /// and_t_lo\[i\] = IV\[4\]\[i\] & T\[i\]; and_t_hi\[i\] = IV\[5\]\[i\] & T[8+i].
+    /// Together they let initial_v\[12\]/\[13\] be expressed via the XOR identity.
     /// Proven by byte-wide AND lookups (a=IV const, b=T byte, a&b=result), so
     /// their hi-nibble witnesses and the T hi-nibble are gone.
     #[size = 8]
@@ -231,12 +231,12 @@ pub enum Column {
     /// Claimed output = H ^ V_after[0..8] ^ V_after[8..16].  8 words × 8 bytes.
     #[size = 64]
     Output,
-    /// OutAnd1[i][j] = H[i][j] & V_after[i][j].  8 words × 8 bytes.  Proven by
+    /// OutAnd1\[i\]\[j\] = H\[i\]\[j\] & V_after\[i\]\[j\].  8 words × 8 bytes.  Proven by
     /// a byte-wide AND lookup (H byte, V_after byte, result), so the H /
     /// V_after / result hi-nibble witnesses are gone.
     #[size = 64]
     OutAnd1,
-    /// OutAnd2[i][j] = OutXor1[i][j] & V_after[i+8][j].  8 words × 8 bytes.
+    /// OutAnd2\[i\]\[j\] = OutXor1\[i\]\[j\] & V_after[i+8]\[j\].  8 words × 8 bytes.
     /// Byte-wide AND lookup with OutXor1 = H ^ V_after computed inline.
     #[size = 64]
     OutAnd2,
@@ -254,7 +254,7 @@ pub enum Column {
     #[size = 8]
     #[mask_next_row]
     CallTs,
-    /// Byte addresses for the 64 h-read lookups: HRdAddr_b*[i] holds byte
+    /// Byte addresses for the 64 h-read lookups: HRdAddr_b*\[i\] holds byte
     /// `b` of `HPtr + i` for i ∈ 0..64.  4 columns of size 64 each = 256
     /// cells, avoiding the NonZeroU8 size cap (max 255 per variant).
     #[size = 64]

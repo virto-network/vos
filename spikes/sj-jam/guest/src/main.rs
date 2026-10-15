@@ -135,14 +135,7 @@ extern "C" fn sj_accumulate(_arguments: *const u8, _len: u64) -> Output {
     if length != NONE {
         let stored = (length as usize).min(out.len());
         let key = b"last";
-        let previous = hostcall!(
-            WRITE,
-            key.as_ptr(),
-            key.len(),
-            out.as_ptr(),
-            stored,
-            0u64
-        );
+        let previous = hostcall!(WRITE, key.as_ptr(), key.len(), out.as_ptr(), stored, 0u64);
         if previous == u64::MAX - 4 {
             log(b"write refused: insufficient balance");
         } else {

@@ -582,7 +582,7 @@ pub const DEFAULT_IDLE_OUTER: usize = 64;
 /// sees: the memory spans the whole 32-bit address space, as an inner
 /// machine's does, and the pages past the layout are inaccessible rather
 /// than past the span; both fault alike. [`Self::restore`] resets a
-/// finished machine to the image, as [`MachinePool::release`] does.
+/// finished machine to the image, as `MachinePool::release` does.
 pub struct OuterMachines {
     program: Arc<PoolProgram>,
     standard: StandardProgram,

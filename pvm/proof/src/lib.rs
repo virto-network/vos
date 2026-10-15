@@ -44,10 +44,10 @@
 //! - [`core`] — PVM step / opcode / tracing types.  Mirrors
 //!   `vos_pvm`'s semantics so trace fill matches the interpreter
 //!   byte-for-byte.
-//! - [`framework`] / [`framework_access`] — Stwo integration glue
+//! - `framework` / [`framework_access`] — Stwo integration glue
 //!   (component registration, claimed-sum collection, lookup
 //!   element propagation).
-//! - [`lookups`] — relation definitions for cross-chip lookups
+//! - `lookups` — relation definitions for cross-chip lookups
 //!   (Range256, BitwiseAnd, MemoryAccess, RegisterMemory,
 //!   ProgramMemory, JumpTable, ProgramExecution, Blake2bState,
 //!   Blake2bCall).
@@ -60,7 +60,7 @@
 //!
 //! - `prover` (default) — trace generation, proof creation, blake3
 //!   commitments, rayon parallelism.  Pulls in heavy deps.
-//! - `debug-internals` — exposes [`debug_claimed_sums`] for bisecting
+//! - `debug-internals` — exposes `debug_claimed_sums` for bisecting
 //!   prover-side logup imbalances when adding a new constraint.  Off
 //!   by default; production callers don't need it.
 //! - `--no-default-features` — verifier-only, `no_std` compatible,
@@ -70,9 +70,9 @@
 //!
 //! The prover-side happy path lives at the crate root:
 //!
-//! - **Trace** — [`trace_blob`] (whole trace) or [`SideNote::new`]
-//!   from a hand-built step trace; [`trace_blob_compact`] /
-//!   [`trace_stream`] for the chain / streaming paths.
+//! - **Trace** — `trace_blob` (whole trace) or [`SideNote::new`]
+//!   from a hand-built step trace; `trace_blob_compact` /
+//!   `trace_stream` for the chain / streaming paths.
 //! - **Prove** — [`prove`] (STANDARD) or [`prove_mobile`] (low-latency
 //!   MOBILE); [`prove_with_config`] for a custom [`PcsConfig`].
 //! - **Verify** — [`verify`] / [`verify_with_pcs_policy`] (prover-side,
@@ -187,7 +187,7 @@ pub fn all_components() -> &'static [&'static dyn framework::MachineProverCompon
 // trace.  Saves ~10% prove time and ~57% proof size on workloads that don't
 // hash.  Both prover and verifier must agree on inclusion — `active_components`
 // is the single source of truth and is deterministic from `SideNote`.
-/// Indices into [`BASE_COMPONENTS`] for chips referenced by name in
+/// Indices into `BASE_COMPONENTS` for chips referenced by name in
 /// `ChipActivity::is_active`, `Proof::component_mask` bit positions,
 /// and other bit-position-sensitive sites (e.g. the boundary-binding
 /// check in `boundary_binding`, which the standalone verifier also

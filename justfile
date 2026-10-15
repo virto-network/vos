@@ -50,8 +50,16 @@ build-settle:
 # transparent huge pages off.
 export MIMALLOC_ALLOW_THP := "0"
 
+# Formatting: the workspace's, and each crate's it excludes but
+# support/lsm-tree, kept as published.
 fmt-check:
     cargo fmt --all -- --check
+    for manifest in ([agent/default agent/test-actors pvm/bench/guests pvm/proof/fuzz pvm/proof/settlement-verifier spikes] | each {|dir| glob $'($dir)/**/Cargo.toml' --exclude ['**/target/**'] } | flatten | where {|manifest| open --raw $manifest | str contains '[package]' }) { cargo fmt --manifest-path $manifest -- --check }
+
+# The docs' links: none broken, and none from a public doc to a private
+# item.
+doc-check:
+    with-env { RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links" } { cargo doc --workspace --no-deps --quiet }
 
 clippy:
     cargo clippy --workspace --all-targets --quiet -- -D warnings
@@ -101,19 +109,20 @@ check-no-std:
     cargo build -p vos-raft --target thumbv7em-none-eabihf
 
 # Checks before pushing: everything except proving.
-# The quick gate, after each change: formatting, the workspace's lints, and
-# the suites of the node, the agent, vos-raft and the crates under them.
+# The quick gate, after each change: formatting, the docs' links, the
+# workspace's lints, and the suites of the node, the agent, vos-raft and
+# the crates under them.
 # Left to `just ci`: the slow fault runs (the five-process fault suite, the
 # fault build's process tests), the PVM vectors, the bench and prover
 # library tests, lsm-tree's own, and the lints of other feature sets.
-check: fmt-check build-test-actors build-agent
+check: fmt-check doc-check build-test-actors build-agent
     cargo clippy --workspace --all-targets --quiet -- -D warnings
     cargo test -p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam
     cargo test -p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-checker -p vos-node -p vos-net -p vos-cli
 
 # Everything but the prover suites: before a merge, and at the end of each
 # planned stage of work.
-ci: fmt-check clippy jar-check test vectors test-bench test-agent check-no-faults
+ci: fmt-check doc-check clippy jar-check test vectors test-bench test-agent check-no-faults
 
 # The gate before merging: `ci` plus the prover suites, the soundness gates
 # and the bench tests that prove. Run it under a memory limit.

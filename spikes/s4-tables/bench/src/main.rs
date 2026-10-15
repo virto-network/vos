@@ -51,7 +51,11 @@ fn key(i: u64) -> u64 {
 // ── Tables ──────────────────────────────────────────────────
 
 fn durability(commit: u64, durable_every: u64) -> Durability {
-    if durable_every > 0 && commit % durable_every == 0 { Durability::Immediate } else { Durability::None }
+    if durable_every > 0 && commit % durable_every == 0 {
+        Durability::Immediate
+    } else {
+        Durability::None
+    }
 }
 
 fn table(rows: u64, durable_every: u64) {
@@ -129,7 +133,11 @@ fn table(rows: u64, durable_every: u64) {
         for _ in 0..rounds {
             let mut txn = db.begin_write().unwrap();
             commits += 1;
-            txn.set_durability(if fsync { Durability::Immediate } else { durability(commits, durable_every) });
+            txn.set_durability(if fsync {
+                Durability::Immediate
+            } else {
+                durability(commits, durable_every)
+            });
             {
                 let mut t = txn.open_table(ROWS).unwrap();
                 for _ in 0..batch {
@@ -203,7 +211,11 @@ fn dir_size(path: &std::path::Path) -> u64 {
         .map(|entry| {
             let entry = entry.unwrap();
             let meta = entry.metadata().unwrap();
-            if meta.is_dir() { dir_size(&entry.path()) } else { meta.len() }
+            if meta.is_dir() {
+                dir_size(&entry.path())
+            } else {
+                meta.len()
+            }
         })
         .sum()
 }
@@ -214,7 +226,10 @@ fn table_lsm(rows: u64) {
     use fjall::{Database, KeyspaceCreateOptions, PersistMode};
     let dir = data_dir();
     // A 1 GiB block cache, as redb's default.
-    let db = Database::builder(dir.join("lsm")).cache_size(1 << 30).open().unwrap();
+    let db = Database::builder(dir.join("lsm"))
+        .cache_size(1 << 30)
+        .open()
+        .unwrap();
     let t = db.keyspace("rows", KeyspaceCreateOptions::default).unwrap();
     let value = [0xa5u8; VALUE];
 
@@ -248,7 +263,10 @@ fn table_lsm(rows: u64) {
     let started = Instant::now();
     let mut found = 0;
     for _ in 0..ops {
-        if t.get(key(rng.next() % rows).to_be_bytes()).unwrap().is_some() {
+        if t.get(key(rng.next() % rows).to_be_bytes())
+            .unwrap()
+            .is_some()
+        {
             found += 1;
         }
     }
@@ -316,7 +334,10 @@ fn table_lsm(rows: u64) {
     );
     println!("  insert new key (batch 1000) {insert:.2} µs; scan {scan:.3} µs per row");
     db.persist(PersistMode::SyncAll).unwrap();
-    println!("  files after the runs: {:.0} MiB", dir_size(&dir) as f64 / (1 << 20) as f64);
+    println!(
+        "  files after the runs: {:.0} MiB",
+        dir_size(&dir) as f64 / (1 << 20) as f64
+    );
     drop(t);
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
@@ -340,7 +361,8 @@ fn log_appends(entries: u64) {
         {
             let mut t = txn.open_table(LOG).unwrap();
             for _ in 0..entries {
-                t.insert(((index % 16) as u32, index), payload.as_slice()).unwrap();
+                t.insert(((index % 16) as u32, index), payload.as_slice())
+                    .unwrap();
                 index += 1;
             }
         }
@@ -389,7 +411,12 @@ enum Node {
     /// Key left-aligned in a u128.
     Leaf { key: u128, value: [u8; 32] },
     /// Splits on bit `level`; `prefix` holds the key bits above it.
-    Branch { level: u16, prefix: u128, left: u32, right: u32 },
+    Branch {
+        level: u16,
+        prefix: u128,
+        left: u32,
+        right: u32,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -417,7 +444,11 @@ fn bit(key: u128, level: u32) -> bool {
 }
 
 fn top_bits(level: u32) -> u128 {
-    if level == 0 { 0 } else { !0u128 << (128 - level) }
+    if level == 0 {
+        0
+    } else {
+        !0u128 << (128 - level)
+    }
 }
 
 impl Tree {
@@ -462,7 +493,11 @@ impl Tree {
     }
 
     fn branch(&mut self, level: u32, a: u32, b: u32, key: u128) -> u32 {
-        let (left, right) = if bit(self.key_of(a), level) { (b, a) } else { (a, b) };
+        let (left, right) = if bit(self.key_of(a), level) {
+            (b, a)
+        } else {
+            (a, b)
+        };
         self.push(Node::Branch {
             level: level as u16,
             prefix: key & top_bits(level),
@@ -506,10 +541,20 @@ impl Tree {
                 }
                 if bit(key, level) {
                     let child = self.insert_at(right, key, value);
-                    self.nodes[at as usize] = Node::Branch { level: level as u16, prefix, left, right: child };
+                    self.nodes[at as usize] = Node::Branch {
+                        level: level as u16,
+                        prefix,
+                        left,
+                        right: child,
+                    };
                 } else {
                     let child = self.insert_at(left, key, value);
-                    self.nodes[at as usize] = Node::Branch { level: level as u16, prefix, left: child, right };
+                    self.nodes[at as usize] = Node::Branch {
+                        level: level as u16,
+                        prefix,
+                        left: child,
+                        right,
+                    };
                 }
                 self.dirty[at as usize] = true;
                 at
@@ -549,7 +594,9 @@ impl Tree {
                 Format::FixedDepth => self.h(LEAF_DOMAIN, &[&value]),
                 Format::Compressed => self.h(LEAF_DOMAIN, &[&key.to_be_bytes(), &value]),
             },
-            Node::Branch { level, left, right, .. } => {
+            Node::Branch {
+                level, left, right, ..
+            } => {
                 self.rewritten += 1;
                 self.rehash(left);
                 self.rehash(right);
@@ -616,14 +663,19 @@ fn tree(keys: u64, bits: u32) {
     // hashing work per update exact.
     for format in [Format::FixedDepth, Format::Compressed] {
         tree.format = format;
-        let name = if format == Format::FixedDepth { "fixed-depth" } else { "compressed" };
+        let name = if format == Format::FixedDepth {
+            "fixed-depth"
+        } else {
+            "compressed"
+        };
         for batch in [1u64, 100, 1000, 10_000] {
             let rounds = (20_000 / batch).max(3);
             let mut elapsed = Duration::ZERO;
             let mut hashes = 0;
             let mut rows = 0;
             for _ in 0..rounds {
-                let updates: Vec<u128> = (0..batch).map(|_| align(key(rng.next() % keys))).collect();
+                let updates: Vec<u128> =
+                    (0..batch).map(|_| align(key(rng.next() % keys))).collect();
                 let (before, rewritten) = (tree.hashed, tree.rewritten);
                 let started = Instant::now();
                 for k in &updates {
@@ -666,7 +718,11 @@ fn pvm_hash(elf: &str) {
     };
     println!("native BLAKE2b, 76-byte input: {:.3} µs per hash", native.0);
     for (name, backend, model) in [
-        ("interpreter", PvmBackend::ForceInterpreter, MemoryModel::Sparse),
+        (
+            "interpreter",
+            PvmBackend::ForceInterpreter,
+            MemoryModel::Sparse,
+        ),
         ("JIT", PvmBackend::ForceRecompiler, MemoryModel::Auto),
     ] {
         let prepared = PreparedProgram::new_with_backend(&spi, backend).unwrap();
@@ -674,7 +730,8 @@ fn pvm_hash(elf: &str) {
             let mut best = Duration::MAX;
             let mut output = Vec::new();
             for _ in 0..5 {
-                let mut machine = Machine::load_prepared(&prepared, &k.to_le_bytes(), 1 << 50, model).unwrap();
+                let mut machine =
+                    Machine::load_prepared(&prepared, &k.to_le_bytes(), 1 << 50, model).unwrap();
                 let started = Instant::now();
                 let exit = machine.try_resume().unwrap();
                 best = best.min(started.elapsed());
@@ -687,7 +744,10 @@ fn pvm_hash(elf: &str) {
         let (many, output) = run(n);
         assert_eq!(output, native.1, "PVM and native hashes differ");
         let per = (us(many) - us(one)) / (n - 1) as f64;
-        println!("PVM {name}: {per:.2} µs per hash ({:.0}× native)", per / native.0);
+        println!(
+            "PVM {name}: {per:.2} µs per hash ({:.0}× native)",
+            per / native.0
+        );
     }
 }
 

@@ -9,9 +9,9 @@
 
 use std::time::Instant;
 
+use vos_pvm::ExitReason;
 use vos_pvm::refine::{Machine, MachineObservation};
 use vos_pvm::refine_host::RefineContext;
-use vos_pvm::ExitReason;
 use vos_pvm_proof::refine_codec::encode_refine_proof_bundle;
 use vos_pvm_proof::{prove_refine, trace_refine_with_output, verify_refine_bundle_replayed};
 
@@ -31,7 +31,9 @@ fn peak_rss_mib() -> f64 {
 
 /// VOS: the refine host serves the precompile in place.
 fn run_vos(spi: &[u8], n: u64) -> Vec<u8> {
-    let invocation = RefineContext::load(spi, &n.to_le_bytes(), GAS).unwrap().run();
+    let invocation = RefineContext::load(spi, &n.to_le_bytes(), GAS)
+        .unwrap()
+        .run();
     assert_eq!(invocation.exit, ExitReason::Halt);
     invocation.output_bounded(32).unwrap()
 }
@@ -61,13 +63,18 @@ fn run_jam(spi: &[u8], n: u64) -> (Vec<u8>, u64) {
 fn traced_steps(spi: &[u8], n: u64) -> (usize, usize, Vec<u8>) {
     let (trace, output) = trace_refine_with_output(spi, &n.to_le_bytes(), GAS, 32).expect("trace");
     let steps = trace.slices.iter().map(|s| s.side_note.num_steps()).sum();
-    let calls = trace.slices.iter().map(|s| s.side_note.blake2b_calls.len()).sum();
+    let calls = trace
+        .slices
+        .iter()
+        .map(|s| s.side_note.blake2b_calls.len())
+        .sum();
     (steps, calls, output.expect("halted with output"))
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let link = |path: &str| vos_pvm_compiler::link_elf_spi(&std::fs::read(path).unwrap()).expect("link");
+    let link =
+        |path: &str| vos_pvm_compiler::link_elf_spi(&std::fs::read(path).unwrap()).expect("link");
     match args[1].as_str() {
         "check" => {
             let precompile = link(&args[2]);
@@ -94,7 +101,11 @@ fn main() {
             let (trace, _) = trace_refine_with_output(&spi, &arguments, GAS, 32).expect("trace");
             let traced = started.elapsed();
             let steps: usize = trace.slices.iter().map(|s| s.side_note.num_steps()).sum();
-            let calls: usize = trace.slices.iter().map(|s| s.side_note.blake2b_calls.len()).sum();
+            let calls: usize = trace
+                .slices
+                .iter()
+                .map(|s| s.side_note.blake2b_calls.len())
+                .sum();
             let started = Instant::now();
             let bundle = prove_refine(trace).expect("prove");
             let proved = started.elapsed();
@@ -119,7 +130,8 @@ fn main() {
             let n: u64 = args[3].parse().unwrap();
             let what = args[4].as_str();
             let arguments = n.to_le_bytes();
-            let (mut trace, _) = trace_refine_with_output(&spi, &arguments, GAS, 32).expect("trace");
+            let (mut trace, _) =
+                trace_refine_with_output(&spi, &arguments, GAS, 32).expect("trace");
             let note = &mut trace.slices[0].side_note;
             match what {
                 "call-input" => note.blake2b_calls[0].h[0] ^= 1,
@@ -132,7 +144,8 @@ fn main() {
                 _ => panic!("tamper call-input|memory-output|unacknowledged"),
             }
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                prove_refine(trace).map(|bundle| verify_refine_bundle_replayed(&bundle, &spi, &arguments, GAS))
+                prove_refine(trace)
+                    .map(|bundle| verify_refine_bundle_replayed(&bundle, &spi, &arguments, GAS))
             }));
             match outcome {
                 Ok(Ok(Ok(()))) => println!("{what}: ACCEPTED (unsound)"),
@@ -147,7 +160,8 @@ fn main() {
             let spi = link(&args[2]);
             let n: u64 = args[3].parse().unwrap();
             let arguments = n.to_le_bytes();
-            let (mut trace, _) = trace_refine_with_output(&spi, &arguments, GAS, 32).expect("trace");
+            let (mut trace, _) =
+                trace_refine_with_output(&spi, &arguments, GAS, 32).expect("trace");
             trace.slices[0].side_note.blake2b_calls[0].h[0] ^= 1;
             let bundle = match prove_refine(trace) {
                 Ok(bundle) => bundle,

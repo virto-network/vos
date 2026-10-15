@@ -38,7 +38,11 @@ fn compute(input: &[i64; 16]) -> i64 {
     let mut min = i64::MAX;
     let mut max = i64::MIN;
     for &x in input {
-        acc = if x < 0 { acc.wrapping_sub(x) } else { acc.wrapping_add(x) };
+        acc = if x < 0 {
+            acc.wrapping_sub(x)
+        } else {
+            acc.wrapping_add(x)
+        };
         min = min.min(x);
         max = max.max(x);
         let mut bits = 0u32;
