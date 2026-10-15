@@ -27,7 +27,7 @@ use vos_wire::ids::{ProgramHash, WorkflowId};
 use vos_wire::records::Workflow;
 use vos_wire::result::{PAGE, Page, PageSection, digest};
 
-use super::Base;
+use super::base::Base;
 use crate::host::{historical_lookup_from, lost};
 use crate::machines::{self, Machine, Unavailable};
 

@@ -11,7 +11,7 @@ use vos_wire::records::SessionMark;
 use vos_wire::result::InputRef;
 use vos_wire::{defaults, keys};
 
-use super::{Base, Corrupt};
+use super::base::{Base, Corrupt};
 
 /// A request's session as this refine sees it.
 #[derive(Clone, Copy)]

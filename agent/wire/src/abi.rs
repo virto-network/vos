@@ -40,9 +40,13 @@
 //! - Roles match exactly: a handler that names a role admits the
 //!   principals holding that role byte, and a principal holds one role.
 
+mod codes;
+
 use alloc::vec::Vec;
 
 use scale::{Decode, Encode};
+
+pub use codes::{Failure, Refusal, code};
 
 use crate::keys::Transform;
 
@@ -418,100 +422,7 @@ pub mod price {
 }
 
 /// Per-step limits.
-pub mod cap {
-    use super::price;
-    use crate::defaults::MAX_HANDLER_GAS;
-
-    pub const REQUEST: usize = 64 << 10;
-    pub const REPLY: usize = 64 << 10;
-    pub const KEY: usize = 1 << 10;
-    /// An ordered table's key: a tree path through it is then at most
-    /// about 1,040 levels deep.
-    pub const ORDERED_KEY: usize = 64;
-    pub const VALUE: usize = 64 << 10;
-    pub const STEP_WRITES: usize = 256 << 10;
-    /// One scan's output: room for a row at the key and value caps with
-    /// both length prefixes.
-    pub const SCAN: usize = KEY + VALUE + 16;
-    /// The largest row the agent stores in a table or committed map, framed
-    /// as a state scan returns it: both length prefixes, the table's prefix,
-    /// a hashed key of `KEY` zero bytes escaped and terminated, and a value
-    /// at its cap after the format byte and a committed map's version.
-    pub const STORED_ROW: usize = 8 + crate::keys::TABLE_PREFIX + 16 + 2 * KEY + 2 + 1 + 8 + VALUE;
-    pub const MESSAGES: usize = 16;
-    pub const MESSAGE: usize = 64 << 10;
-    pub const ATTESTS: usize = 16;
-    pub const WORK_RESULT: usize = 4 << 20;
-    /// The pages a workflow's program, its actor's, may write, its data,
-    /// heap and stack: a start of a workflow of a larger one fails.
-    pub const WORKFLOW_PAGES: usize = 4096;
-    /// The raw bytes of the pages one workflow step may write: past it, the
-    /// step fails.
-    ///
-    /// **The budget binds first.** A step is taken its pages from the
-    /// batch's budget, whatever host it runs on: it restores the pages its
-    /// workflow holds at [`crate::defaults::RESTORED_PAGE`] each, and
-    /// writes others at [`crate::defaults::WRITTEN_PAGE`] each, beside its
-    /// gas limit and the agent's reserves. So the pages a step restores and
-    /// writes satisfy `restored × RESTORED_PAGE + written × WRITTEN_PAGE +
-    /// limit + reserves ≤ budget`: in a refine of the default budget
-    /// (`REFINE_GAS`), a step that restores no page writes about 800, and
-    /// one that restores [`HELD_PAGES`] about 310. Effect-free code that
-    /// would pass it ends the step at the first page it cannot pay; once a
-    /// unit has made an effect, the step waits for the next batch behind a
-    /// step that ran a handler, or fails alone, out of gas.
-    pub const STEP_PAGES: usize = 8 << 20;
-    /// The pages a workflow's snapshot may hold, 2.25 MiB: a step that
-    /// would leave it more fails, so the least budget a node refines with
-    /// ([`crate::defaults::min_refine_gas`]) restores any snapshot. On JAM,
-    /// the step that ends a workflow holding them all, at the largest
-    /// limit, restores every page and drops every page's row, and a
-    /// package of that step alone, bar its own effects, fits a work
-    /// package's refine gas: an agent's builder asserts it.
-    pub const HELD_PAGES: usize = 576;
-    /// The raw bytes of the pages one work result's page section may hold:
-    /// a step that would pass it waits for the next batch.
-    pub const RESULT_PAGES: usize = 16 << 20;
-    /// A refine's whole output: the work result, then its page section, in
-    /// which a page, LZ4-compressed and framed, may outgrow its 4 KiB by a
-    /// few dozen bytes.
-    pub const OUTPUT: usize = WORK_RESULT + RESULT_PAGES + RESULT_PAGES / 64;
-
-    /// The most a step of `gas` adds to a work result: its input, a new
-    /// session's whole, its reply, writes, messages and attests at their
-    /// caps, a request's reply to its sender, with the framing of as many
-    /// writes (committed ones, with their map, the larger) and instances as
-    /// `gas` can pay for.
-    pub const fn step_result(gas: u64) -> usize {
-        128 + REPLY
-            + STEP_WRITES
-            + (gas / price::PUT) as usize * 18
-            + (1 + (gas / price::MACHINE) as usize) * 12
-            + MESSAGES * (MESSAGE + 40)
-            + (REPLY + 40)
-            + ATTESTS * (REQUEST + REPLY + 40)
-    }
-
-    /// The most a handler's step adds to a work result. An install's record
-    /// is under [`STEP_WRITES`] too.
-    pub const STEP_RESULT: usize = step_result(MAX_HANDLER_GAS);
-
-    /// What a workflow's step adds beyond its calls' effects: its record,
-    /// with its arguments, last input or result and the hash of each page
-    /// it holds, the rows beside it, and an entry for each page it stores,
-    /// at most those it holds after, and drops, at most those it held
-    /// before.
-    pub const WORKFLOW_ROWS: usize = 1024 + REQUEST + HELD_PAGES * 36 + 2 * HELD_PAGES * 48;
-
-    /// The most a workflow's step adds to a work result: its calls' effects
-    /// at the gas it may use, its limit for its effect-free code and its
-    /// limit again from a unit's first effect, and its rows.
-    pub const WORKFLOW_STEP_RESULT: usize = step_result(2 * MAX_HANDLER_GAS) + WORKFLOW_ROWS;
-
-    // Every step fits an empty result, so a batch always makes progress.
-    const _: () = assert!(STEP_RESULT + 64 <= WORK_RESULT);
-    const _: () = assert!(WORKFLOW_STEP_RESULT + 64 <= WORK_RESULT);
-}
+pub mod cap;
 
 /// The precompiles the agent serves its machines, each at the price a
 /// node's own machine pays for it, on every host.
@@ -531,117 +442,6 @@ pub mod precompile {
     }
 }
 
-/// Results in φ7: the Gray Paper's host-call results.
-pub mod code {
-    pub const OK: u64 = 0;
-    pub const NONE: u64 = u64::MAX;
-    pub const WHAT: u64 = u64::MAX - 1;
-    pub const OOB: u64 = u64::MAX - 2;
-    pub const WHO: u64 = u64::MAX - 3;
-    pub const FULL: u64 = u64::MAX - 4;
-    pub const HUH: u64 = u64::MAX - 8;
-}
-
-/// A closed set of codes, each a `u32` in registers and on the wire.
-macro_rules! codes {
-    (
-        $(#[$meta:meta])*
-        pub enum $name:ident {
-            $($(#[$variant_meta:meta])* $variant:ident = $code:literal,)*
-        }
-    ) => {
-        $(#[$meta])*
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-        #[repr(u32)]
-        pub enum $name {
-            $($(#[$variant_meta])* $variant = $code,)*
-        }
-
-        impl $name {
-            pub const fn code(self) -> u32 {
-                self as u32
-            }
-
-            pub const fn from_code(code: u32) -> Option<Self> {
-                match code {
-                    $($code => Some(Self::$variant),)*
-                    _ => None,
-                }
-            }
-        }
-
-        impl Encode for $name {
-            fn encode_to(&self, buf: &mut Vec<u8>) {
-                self.code().encode_to(buf);
-            }
-        }
-
-        impl Decode for $name {
-            fn decode(data: &[u8]) -> Result<(Self, usize), scale::DecodeError> {
-                let (code, used) = u32::decode(data)?;
-                let value = Self::from_code(code).ok_or(scale::DecodeError::InvalidCode(code))?;
-                Ok((value, used))
-            }
-        }
-    };
-}
-
-codes! {
-    /// Why a step failed, in [`crate::result::Outcome::Failed`], or why a
-    /// call returned an error, in φ8 of `CALL` and `ATTEST`. A failed step
-    /// consumes its input.
-    pub enum Failure {
-        /// The handler failed; the detail is its encoded error.
-        Handler = 1,
-        /// The invocation trapped, faulted, used an operation outside its
-        /// kind or a buffer it could not reach.
-        Trapped = 2,
-        OutOfGas = 3,
-        /// A per-step cap was exceeded.
-        Cap = 4,
-        /// The caller lacks the handler's role.
-        Forbidden = 5,
-        /// No such instance or method.
-        Unknown = 6,
-        /// The callee is already on the call stack.
-        Cycle = 7,
-        /// No inner machine was left for the callee.
-        Depth = 8,
-        /// The agent program failed on the message alone, twice, each
-        /// time on fresh state: its leader asserted the failure in the
-        /// batch, and the handler never ran.
-        InRefine = 9,
-        /// An await's deadline passed before its answer came.
-        TimedOut = 10,
-        /// The callee's program could not be loaded: the node lacks a
-        /// program the agent's state names, its fault, not the caller's.
-        Unloadable = 11,
-    }
-}
-
-codes! {
-    /// Why refine refused an input, in [`crate::result::Step::Refused`]. A
-    /// refused input is not consumed: no mark advances.
-    pub enum Refusal {
-        /// Out of its session's or pair's order.
-        Sequence = 1,
-        /// Its session expired.
-        Expired = 2,
-        /// Its session's or pair's mark is state the agent cannot read: an
-        /// operator must look, and resending cannot help.
-        Unreadable = 3,
-        /// A new session whose creation time is too far from the agent's:
-        /// start one with a time near it.
-        StaleSession = 4,
-        /// A new session, while the agent holds as many as it may: none is
-        /// created until some are collected.
-        SessionsFull = 5,
-        /// A new session, while its key holds as many as it may at the
-        /// agent.
-        KeySessionsFull = 6,
-    }
-}
-
 /// The host calls each kind of program may make, and what a JAM node does
 /// with each. CI lists every `ecalli` in the default agent and the test
 /// programs and checks them against these.
@@ -649,70 +449,4 @@ codes! {
 /// A VOS node serves every call here, with one exception: its refine host
 /// answers `fetch` with `WHAT`, so only an agent's accumulate may call it.
 /// The table cannot tell refine from accumulate, which share their code.
-pub mod surface {
-    use core::ops::RangeInclusive;
-
-    /// Precompiles: a VOS node computes an agent's in place, and the agent
-    /// its machines' ([`super::precompile`]); a JAM node answers `WHAT`,
-    /// and the shims compute in software.
-    pub const PRECOMPILES: RangeInclusive<u64> = 0x400..=0x47f;
-    /// The actor ABI, which an agent serves; ids it does not serve answer
-    /// `WHAT`.
-    pub const ACTOR_ABI: RangeInclusive<u64> = 0x500..=0x5ff;
-
-    /// A VOS node's refine extension: a machine of a program the node
-    /// holds, from its pool, at a counter. A host that answers `WHAT` leaves
-    /// the agent to build the machine from `historical_lookup`.
-    pub const INSTANTIATE: u64 = 0x480;
-    /// A VOS node's refine extension: a row of the agent's applied state.
-    pub const STATE_READ: u64 = 0x481;
-    /// A VOS node's refine extension: rows of the agent's applied state
-    /// under a prefix, after a key.
-    pub const STATE_SCAN: u64 = 0x482;
-    /// The agent's report that its state lost data it wrote, φ7/φ8 what: a
-    /// VOS node stops the refine at the call and halts, as for a blob it
-    /// lost.
-    pub const LOST: u64 = 0x483;
-
-    /// What a JAM node does with an agent program's call.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum OnJam {
-        /// A Gray Paper call, which a JAM node serves (`log` it may ignore).
-        Served,
-        /// A VOS extension, which a JAM node answers `WHAT`; the agent then
-        /// builds the machine itself from `historical_lookup`.
-        Loader,
-        /// A precompile: the software implementation.
-        Software,
-        /// Applied state, which on JAM a package's witness gives instead,
-        /// or the agent's report that its state lost data it wrote: a
-        /// refine that reaches one there traps, so no result is computed on
-        /// state that is not there.
-        NoResult,
-    }
-
-    /// An agent program's call (refine and accumulate share its code):
-    /// `None` when it is outside the surface.
-    pub fn agent(id: u64) -> Option<OnJam> {
-        match id {
-            // gas, fetch, read, write, historical_lookup, export,
-            // machine..expunge, solicit, log.
-            0 | 2 | 4 | 5 | 7..=14 | 24 | 100 => Some(OnJam::Served),
-            INSTANTIATE => Some(OnJam::Loader),
-            STATE_READ | STATE_SCAN | LOST => Some(OnJam::NoResult),
-            _ if PRECOMPILES.contains(&id) => Some(OnJam::Software),
-            _ => None,
-        }
-    }
-
-    /// An actor program's call: the actor ABI or a precompile.
-    pub fn actor(id: u64) -> bool {
-        ACTOR_ABI.contains(&id) || PRECOMPILES.contains(&id)
-    }
-
-    /// An attestable method's kernel's call: a precompile only, as the
-    /// prover needs, which its derivation checks.
-    pub fn kernel(id: u64) -> bool {
-        PRECOMPILES.contains(&id)
-    }
-}
+pub mod surface;

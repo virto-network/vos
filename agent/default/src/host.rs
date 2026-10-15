@@ -3,7 +3,8 @@
 
 use alloc::vec::Vec;
 
-use vos_wire::abi::code;
+use vos_wire::Decode;
+use vos_wire::abi::{cap, code};
 
 pub const GAS: u64 = 0;
 pub const FETCH: u64 = 2;
@@ -237,4 +238,54 @@ pub fn write(key: &[u8], value: &[u8]) {
             0
         ]
     );
+}
+
+/// Applied rows fetched per `state_scan` at first; a page grows to
+/// [`cap::STORED_ROW`], room for the largest row, when a row needs it.
+pub const SCAN_PAGE: usize = 4096;
+
+/// Rows of state, each a key and its value, in key order.
+pub type StateRows = Vec<(Vec<u8>, Vec<u8>)>;
+
+/// A page of rows under `prefix` after `after` from the node, their values
+/// as stored.
+pub fn scan_page(prefix: &[u8], after: &[u8]) -> StateRows {
+    let mut capacity = SCAN_PAGE;
+    let out = loop {
+        let mut out: Vec<u8> = Vec::with_capacity(capacity);
+        let (written, _) = ecalli!(
+            STATE_SCAN,
+            [
+                ptr(prefix),
+                prefix.len() as u64,
+                ptr(after),
+                after.len() as u64,
+                out.as_mut_ptr() as u64,
+                capacity as u64
+            ]
+        );
+        match written {
+            code::WHAT => unserved(),
+            code::FULL => {
+                assert!(capacity < cap::STORED_ROW, "a stored row past its cap");
+                capacity = cap::STORED_ROW;
+            }
+            written => {
+                // SAFETY: the host wrote `written` bytes, at most the
+                // capacity, from the start.
+                unsafe { out.set_len(written as usize) };
+                break out;
+            }
+        }
+    };
+    let mut rows = Vec::new();
+    let mut at = 0;
+    while at < out.len() {
+        // A row the node framed wrongly is the node's bug, not state the
+        // agent did not write: it traps the refine.
+        let (row, used) = <(Vec<u8>, Vec<u8>)>::decode(&out[at..]).expect("a row");
+        at += used;
+        rows.push(row);
+    }
+    rows
 }

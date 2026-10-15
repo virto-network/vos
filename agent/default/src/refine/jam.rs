@@ -20,8 +20,9 @@ use vos_wire::package::{JamOutput, Opened, Package, Range, SEGMENT, StateWitness
 use vos_wire::result::{PAGE, WorkResult, digest};
 use vos_wire::{Decode, Encode};
 
-use super::{Base, Source, StateRows, run_batch};
-use crate::host::{export, fetch_import};
+use super::base::{Base, Source};
+use super::batch::run_batch;
+use crate::host::{StateRows, export, fetch_import};
 
 /// A package's witness, verified against its root.
 pub(super) struct Witnessed {

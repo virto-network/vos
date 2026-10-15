@@ -2,8 +2,13 @@
 //! against the step's overlays, with its nested calls, and every operation
 //! of the actor ABI served.
 
+mod ended;
+mod kernel;
+mod memory;
+mod scan;
 mod units;
 
+pub(super) use ended::{Ended, Pause};
 pub(super) use units::Share;
 
 use alloc::collections::BTreeMap;
@@ -12,88 +17,22 @@ use alloc::vec::Vec;
 
 use vos_wire::abi::{self, Failure, Kind, Op, Rows, cap, code, precompile, price};
 use vos_wire::batch::{Await, Body};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, WorkflowId};
-use vos_wire::keys::Transform;
-use vos_wire::records::{Installed, WorkflowState};
+use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, WorkflowId};
+use vos_wire::records::Installed;
 use vos_wire::result::{Attest, InstanceGas, Outcome, Outgoing};
 use vos_wire::{Encode, defaults, keys};
 
-use super::{Base, Corrupt, Meter, Overlay};
-use crate::machines::{self, ARGUMENTS, Exit, Machine};
+use super::Overlay;
+use super::base::{Base, Corrupt, Meter};
+use crate::machines::{self, Exit, Machine};
+use kernel::{kernel, random, serve_precompile};
+use memory::{copy_out, read, read_key, row, window, write};
 
 /// Machines a step may hold at once: a handler and its nested callees, or
 /// a workflow's and its callees. A host's own limit is the same on VOS, so
 /// either refuses the 64th; an attest at the deepest level needs a 64th,
 /// which the host refuses, as `Depth`.
 const MAX_DEPTH: usize = 63;
-
-/// How an invocation ended, short of failing the whole step.
-pub(super) enum Ended {
-    Replied(Vec<u8>),
-    Failed(Vec<u8>),
-    Forbidden,
-    /// A workflow paused.
-    Paused(Pause),
-}
-
-/// Where a workflow's step paused: awaiting another agent's answer to
-/// await `counter` until a deadline, asleep until a time, or preempted
-/// between two awaits, before the host call `pending` when it was not
-/// served. A step preempted out of gas `idle`, having served no call and
-/// written no page since it resumed, moved only if its registers or its
-/// counter did.
-pub(super) enum Pause {
-    Await {
-        agent: AgentId,
-        counter: u64,
-        deadline: u64,
-    },
-    Sleep {
-        until: u64,
-    },
-    Preempted {
-        pending: Option<u64>,
-        idle: bool,
-    },
-}
-
-impl Pause {
-    /// The batch time its row in the due index lies at, in a batch at
-    /// `time`: a preempted workflow's is the next millisecond's, so its row
-    /// moves and the next batch continues it.
-    pub(super) fn due(&self, time: u64) -> u64 {
-        match self {
-            Pause::Await { deadline, .. } => *deadline,
-            Pause::Sleep { until } => *until,
-            Pause::Preempted { .. } => time.saturating_add(1),
-        }
-    }
-
-    /// The host call a preempted step left unserved.
-    pub(super) fn pending(&self) -> Option<u64> {
-        match self {
-            Pause::Preempted { pending, .. } => *pending,
-            _ => None,
-        }
-    }
-
-    /// The workflow's state while it pauses, `input` the step's.
-    pub(super) fn state(self, input: &[u8]) -> WorkflowState {
-        match self {
-            Pause::Await {
-                agent,
-                counter,
-                deadline,
-            } => WorkflowState::Awaiting {
-                agent,
-                counter,
-                deadline,
-            },
-            Pause::Sleep { until } => WorkflowState::Sleeping { until },
-            Pause::Preempted { .. } => WorkflowState::Preempted(input.to_vec()),
-        }
-    }
-}
 
 /// One step: its overlays, call stack and effects.
 pub(super) struct Invocation<'a> {
@@ -607,238 +546,4 @@ impl<'a> Invocation<'a> {
             deadline: self.base.time.saturating_add(within),
         })
     }
-
-    /// A value through the call frames, the refine's earlier steps and
-    /// applied state.
-    fn read_state(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Corrupt> {
-        for frame in self.frames.iter().rev() {
-            if let Some(value) = frame.get(key) {
-                return Ok(value.clone());
-            }
-        }
-        self.base.read(key)
-    }
-
-    /// The rows of the table at `prefix`, after `after` when given, merged
-    /// through every overlay and packed until `capacity`, each with the
-    /// key its `transform` was given; whether the first row alone did not
-    /// fit; and the bytes of the keys returned. The sources are walked in
-    /// key order and the walk stops
-    /// when the buffer is full, so a scan costs the rows it returns, not
-    /// the overlays' size.
-    fn scan(
-        &self,
-        prefix: &[u8],
-        mut after: Option<Vec<u8>>,
-        capacity: usize,
-        transform: Transform,
-    ) -> Result<(Vec<u8>, bool, usize), Corrupt> {
-        use core::ops::Bound;
-        let mut out = Vec::new();
-        let mut returned = 0;
-        loop {
-            // A page of applied rows bounds which overlay rows join it; an
-            // empty page means no applied rows remain, so all of them do.
-            let page = self
-                .base
-                .applied_rows(prefix, after.as_deref().unwrap_or(&[]))?;
-            let bound = page.last().map(|(key, _)| key.as_slice());
-            // A cursor below the prefix starts the scan at the prefix, as
-            // the node's applied rows do; one above it leaves no row.
-            let lower = match &after {
-                Some(after) if after.as_slice() >= prefix => Bound::Excluded(after.as_slice()),
-                _ => Bound::Included(prefix),
-            };
-            let joins =
-                |key: &[u8]| key.starts_with(prefix) && bound.is_none_or(|bound| key <= bound);
-            // Lowest precedence first: the refine's earlier steps' writes,
-            // then each frame up the stack.
-            let mut overlays: Vec<_> = core::iter::once(&self.base.earlier)
-                .chain(self.frames.iter())
-                .map(|overlay| {
-                    overlay
-                        .range::<[u8], _>((lower, Bound::Unbounded))
-                        .take_while(|(key, _)| joins(key))
-                        .peekable()
-                })
-                .collect();
-            let mut applied = page.iter().peekable();
-            loop {
-                let mut next = applied.peek().copied().map(|(key, _)| key.as_slice());
-                for overlay in &mut overlays {
-                    if let Some(&(key, _)) = overlay.peek()
-                        && next.is_none_or(|next| key.as_slice() < next)
-                    {
-                        next = Some(key.as_slice());
-                    }
-                }
-                let Some(key) = next else {
-                    break;
-                };
-                // The source the key came from holds it without a compare:
-                // keys here run to kilobytes.
-                let holds = |head: &[u8]| core::ptr::eq(head, key) || head == key;
-                // The highest source holding the key decides its value.
-                let mut value: Option<Option<&[u8]>> = None;
-                for overlay in overlays.iter_mut().rev() {
-                    if overlay.peek().is_some_and(|&(head, _)| holds(head)) {
-                        let (_, held) = overlay.next().expect("peeked");
-                        value.get_or_insert(held.as_deref());
-                    }
-                }
-                if applied.peek().is_some_and(|(head, _)| holds(head)) {
-                    let (_, held) = applied.next().expect("peeked");
-                    value.get_or_insert(Some(held));
-                }
-                let Some(Some(value)) = value else { continue };
-                let raw = transform.raw(&key[prefix.len()..]).ok_or(Corrupt)?;
-                if out.len() + 8 + raw.len() + value.len() > capacity {
-                    let full = out.is_empty();
-                    return Ok((out, full, returned));
-                }
-                returned += raw.len();
-                (raw.len() as u32).encode_to(&mut out);
-                out.extend_from_slice(&raw);
-                (value.len() as u32).encode_to(&mut out);
-                out.extend_from_slice(value);
-            }
-            match bound {
-                Some(bound) => after = Some(bound.to_vec()),
-                None => return Ok((out, false, returned)),
-            }
-        }
-    }
-}
-
-/// [`Op::Random`]'s bytes: BLAKE2b-256 of `vos/random`, the seed, the step's
-/// index and the draws before.
-fn random(seed: &[u8; 32], step: u32, draw: u64) -> [u8; 32] {
-    vos_pvm_precompiles::blake2b_hash::<32>(
-        b"vos/random",
-        &[seed, &step.to_le_bytes(), &draw.to_le_bytes()],
-    )
-}
-
-/// Serve a machine's precompile call: its price checked first, so a call
-/// the machine cannot pay takes nothing of the meter, as a failed charge
-/// leaving the machine no gas; then the agent's serving taken from the
-/// meter, and the call served.
-pub(super) fn serve_precompile(
-    meter: &Meter,
-    machine: &mut Machine,
-    id: u64,
-) -> Result<(), Failure> {
-    let price = precompile::price(id).ok_or(Failure::Trapped)?;
-    if machine.gas() < price {
-        machine.set_gas(0);
-        return Err(Failure::OutOfGas);
-    }
-    if !meter.take(defaults::PRECOMPILE_SERVING) {
-        return Err(Failure::OutOfGas);
-    }
-    machine.precompile(id)
-}
-
-/// Run an attestable method's kernel in its own machine: arguments in the
-/// standard window, output by the halt convention, and no host calls but
-/// precompiles, which the agent serves.
-fn kernel(
-    meter: &Meter,
-    program: &ProgramHash,
-    arguments: &[u8],
-    gas: u64,
-) -> Result<(Vec<u8>, u64), Failure> {
-    let mut machine = machines::pinned(&program.0, 0)?;
-    if !machine.map_read_only(ARGUMENTS, arguments.len() as u64, arguments) {
-        return Err(Failure::Trapped);
-    }
-    machine.set_gas(gas);
-    machine.set_register(7, ARGUMENTS);
-    machine.set_register(8, arguments.len() as u64);
-    loop {
-        match machine.invoke() {
-            Exit::Host(id) if precompile::price(id).is_some() => {
-                serve_precompile(meter, &mut machine, id)?;
-            }
-            Exit::Halt => {
-                let used = gas - machine.gas();
-                let len = machine.register(8) as usize;
-                if len > cap::REPLY {
-                    return Err(Failure::Cap);
-                }
-                let output = machine.peek(machine.register(7), len).ok_or(Failure::Cap)?;
-                return Ok((output, used));
-            }
-            Exit::OutOfGas => return Err(Failure::OutOfGas),
-            _ => return Err(Failure::Trapped),
-        }
-    }
-}
-
-/// The agent-relative key of the row an operation names: its rows, by the
-/// register `rows`, and the actor's key at `address`.
-fn row(
-    machine: &mut Machine,
-    instance: InstanceId,
-    rows: u64,
-    address: u64,
-    len: u64,
-) -> Result<Vec<u8>, Failure> {
-    let key = read_key(machine, address, len)?;
-    let rows = Rows::from_register(rows).ok_or(Failure::Trapped)?;
-    keys::row(instance, rows, &key)
-}
-
-/// A row operation's key: its bytes, and the price of transforming them.
-fn read_key(machine: &mut Machine, address: u64, len: u64) -> Result<Vec<u8>, Failure> {
-    let key = read(machine, address, len, cap::KEY)?;
-    if !machine.charge(key.len() as u64 * price::KEY_BYTE) {
-        return Err(Failure::OutOfGas);
-    }
-    Ok(key)
-}
-
-/// The actor's bytes, at most `limit`: a longer buffer exceeds a cap and
-/// an unreadable one traps.
-fn read(machine: &mut Machine, address: u64, len: u64, limit: usize) -> Result<Vec<u8>, Failure> {
-    let len = usize::try_from(len).map_err(|_| Failure::Cap)?;
-    if len > limit {
-        return Err(Failure::Cap);
-    }
-    if !machine.charge(len as u64 * price::PER_BYTE) {
-        return Err(Failure::OutOfGas);
-    }
-    machine.peek(address, len).ok_or(Failure::Trapped)
-}
-
-/// Write `bytes` into the actor's memory through the machine's tracked
-/// write, at their price.
-fn write(machine: &mut Machine, address: u64, bytes: &[u8]) -> Result<(), Failure> {
-    if !machine.charge(bytes.len() as u64 * price::PER_BYTE) {
-        return Err(Failure::OutOfGas);
-    }
-    machine.write(address, bytes)
-}
-
-fn copy_out(
-    machine: &mut Machine,
-    bytes: &[u8],
-    address: u64,
-    offset: u64,
-    capacity: u64,
-) -> Result<(), Failure> {
-    write(
-        machine,
-        address,
-        &bytes[window(bytes.len(), offset, capacity)],
-    )
-}
-
-/// What a copy out of `len` bytes takes, from `offset`, at most `capacity`.
-fn window(len: usize, offset: u64, capacity: u64) -> core::ops::Range<usize> {
-    let offset = usize::try_from(offset).unwrap_or(usize::MAX).min(len);
-    let taken = usize::try_from(capacity)
-        .unwrap_or(usize::MAX)
-        .min(len - offset);
-    offset..offset + taken
 }

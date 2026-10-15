@@ -25,7 +25,9 @@ use vos_wire::records::{Snapshot, Workflow, WorkflowState};
 use vos_wire::result::{InstanceGas, Outcome, Outgoing, PAGE, Page, Write, digest};
 use vos_wire::{Decode, Encode, defaults};
 
-use crate::{Ended, Run, Step, Testkit, precompile, split};
+use crate::invocation::{Ended, Run};
+use crate::memory::precompile;
+use crate::{Step, Testkit, split};
 
 /// Where a machine returns to halt, and the top of its stack.
 const HALT: u64 = (1 << 32) - (1 << 16);

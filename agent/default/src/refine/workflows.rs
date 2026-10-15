@@ -23,7 +23,10 @@ use vos_wire::{Decode, Encode, defaults};
 
 use super::invocation::{Ended, Invocation, Pause, Share};
 use super::snapshots::{Captured, capture, restore};
-use super::{Base, Batched, Overlay, Stepped, consumed, split_writes};
+use super::Overlay;
+use super::base::Base;
+use super::batch::{Batched, Stepped};
+use super::inputs::{consumed, split_writes};
 use crate::host::lost;
 use crate::machines;
 
