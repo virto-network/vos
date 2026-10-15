@@ -31,10 +31,13 @@
 //! `cargo bench -p vos-node --bench fan_in` (after `just build-agent
 //! build-test-actors`). Data goes under `target/`.
 
+mod support;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use support::{count, cpu_ticks};
 use vos_checker::calls::installed;
 use vos_checker::programs::{Programs, method};
 use vos_checker::spaces::{open_node, space};
@@ -59,12 +62,6 @@ const DRAIN: Duration = Duration::from_secs(60);
 /// A stall past `Behind`'s pace, and one of a resend round.
 const STALL: Duration = Duration::from_millis(150);
 const ROUND: Duration = Duration::from_millis(900);
-
-fn count(name: &str) -> Option<u64> {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse().ok())
-}
 
 fn list(name: &str, default: &str) -> Vec<String> {
     std::env::var(name)
@@ -184,14 +181,6 @@ fn counts(nodes: &Nodes, pairs: &[Pair]) -> Counts {
         applied,
         stats: nodes.iter().map(|node| node.stats()).collect(),
     }
-}
-
-/// The process's CPU time so far: user and system, in clock ticks.
-fn cpu_ticks() -> u64 {
-    let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
-    // The command may hold spaces: fields count from after its `)`.
-    let fields: Vec<&str> = stat[stat.rfind(')').unwrap() + 2..].split(' ').collect();
-    fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap()
 }
 
 /// A stage's count and total between two reads of a node's stats.

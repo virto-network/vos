@@ -1,4 +1,4 @@
-//! What the log, store and tree benches share; each uses a part.
+//! What the benches share; each uses a part.
 #![allow(dead_code)]
 
 use std::path::PathBuf;
@@ -18,6 +18,21 @@ pub fn data_dir(name: &str) -> PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../target")
         .join(format!("{name}-{}", std::process::id()))
+}
+
+/// The number the environment variable `name` holds, if it holds one.
+pub fn count(name: &str) -> Option<u64> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+}
+
+/// The process's CPU time so far: user and system, in clock ticks.
+pub fn cpu_ticks() -> u64 {
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+    // The command may hold spaces: fields count from after its `)`.
+    let fields: Vec<&str> = stat[stat.rfind(')').unwrap() + 2..].split(' ').collect();
+    fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap()
 }
 
 /// Microseconds each of `count` operations took, `elapsed` in all.

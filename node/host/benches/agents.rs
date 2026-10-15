@@ -22,11 +22,14 @@
 //! build-test-actors`). Data goes under `target/`: on the reference laptop
 //! `/tmp` is tmpfs.
 
+mod support;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use support::{count, cpu_ticks};
 use vos_checker::calls::install_at_leader;
 use vos_checker::percentiles;
 use vos_checker::programs::{Programs, method};
@@ -45,12 +48,6 @@ const WARM: Duration = Duration::from_secs(2);
 const MEASURE: Duration = Duration::from_secs(5);
 const IDLE_SETTLE: Duration = Duration::from_secs(5);
 const IDLE_MEASURE: Duration = Duration::from_secs(10);
-
-fn count(name: &str) -> Option<u64> {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse().ok())
-}
 
 /// Writer flushes and committed batches, across the nodes.
 #[derive(Default)]
@@ -149,14 +146,6 @@ fn create(nodes: &Nodes) -> AgentId {
             }
         }
     }
-}
-
-/// The process's CPU time so far: user and system, in clock ticks.
-fn cpu_ticks() -> u64 {
-    let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
-    // The command may hold spaces: fields count from after its `)`.
-    let fields: Vec<&str> = stat[stat.rfind(')').unwrap() + 2..].split(' ').collect();
-    fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap()
 }
 
 /// The process's CPU over `span`, as a share of one core.
