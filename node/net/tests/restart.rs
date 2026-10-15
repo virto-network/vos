@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use common::*;
 use vos_net::quic::Quic;
-use vos_net::{Class, Limits, Peer, public_key};
+use vos_net::{Class, Limits};
 
 const PEER: &str = "VOS_NET_RESTARTED_PEER";
 
@@ -25,11 +25,7 @@ fn peer(spec: &str) {
     };
     smol::block_on(async {
         let (b, arrivals) = rebind(2, own.parse().unwrap()).await;
-        b.set_peers(vec![Peer {
-            number: 1,
-            key: public_key(&secret(1)),
-            address: other.parse().unwrap(),
-        }]);
+        b.set_peers(vec![peer_at(1, other.parse().unwrap())]);
         if greet == "greet" {
             send(&b, 1, Class::Consensus, 1, b"hello".to_vec()).await;
         }
@@ -95,15 +91,8 @@ impl Drop for Run {
 /// Node 1, configured with node 2 at an address of its own.
 fn node_1() -> (Quic, vos_net::Arrivals, SocketAddr) {
     let (a, arrivals) = bind(1, any_port(), Limits::default());
-    let address = std::net::UdpSocket::bind(any_port())
-        .unwrap()
-        .local_addr()
-        .unwrap();
-    a.set_peers(vec![Peer {
-        number: 2,
-        key: public_key(&secret(2)),
-        address,
-    }]);
+    let address = vacant_address();
+    a.set_peers(vec![peer_at(2, address)]);
     (a, arrivals, address)
 }
 

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use smol::future::FutureExt;
 use vos_net::quic::{Config, Quic};
-use vos_net::{Arrivals, Class, Incoming, Limits, Network, NodeNumber, Peer, Refused};
+use vos_net::{Arrivals, Class, Incoming, Limits, Network, NodeNumber, Peer, Refused, public_key};
 
 /// Node `number`'s secret seed.
 pub fn secret(number: NodeNumber) -> [u8; 32] {
@@ -17,6 +17,14 @@ pub fn secret(number: NodeNumber) -> [u8; 32] {
 
 pub fn any_port() -> SocketAddr {
     "127.0.0.1:0".parse().unwrap()
+}
+
+/// An address nothing listens on: a port the system gave, let go again.
+pub fn vacant_address() -> SocketAddr {
+    std::net::UdpSocket::bind(any_port())
+        .unwrap()
+        .local_addr()
+        .unwrap()
 }
 
 pub fn bind(number: NodeNumber, listen: SocketAddr, limits: Limits) -> (Quic, Arrivals) {
@@ -42,6 +50,15 @@ pub async fn rebind(number: NodeNumber, address: SocketAddr) -> (Quic, Arrivals)
             }
             Err(error) => panic!("{error}"),
         }
+    }
+}
+
+/// Node `number`, by the key its secret gives, at `address`.
+pub fn peer_at(number: NodeNumber, address: SocketAddr) -> Peer {
+    Peer {
+        number,
+        key: public_key(&secret(number)),
+        address,
     }
 }
 

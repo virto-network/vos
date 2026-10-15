@@ -12,16 +12,6 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 
-/// An ed25519 key's SubjectPublicKeyInfo, before the key.
-const SPKI_PREFIX: [u8; 12] = [
-    0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
-];
-
-/// An ed25519 seed's PKCS #8 document, before the seed.
-const PKCS8_PREFIX: [u8; 16] = [
-    0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
-];
-
 const ALPN: &[u8] = b"http/1.1";
 
 fn provider() -> Arc<CryptoProvider> {
@@ -47,7 +37,7 @@ pub(crate) fn server_config(
 ) -> Result<Arc<rustls::ServerConfig>, String> {
     let (chain, key) = match tls {
         IngressTls::NodeKey { names } => {
-            let pkcs8 = PrivatePkcs8KeyDer::from([&PKCS8_PREFIX[..], secret].concat());
+            let pkcs8 = PrivatePkcs8KeyDer::from(vos_net::pkcs8(secret));
             let pair = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(&pkcs8, &rcgen::PKCS_ED25519)
                 .map_err(|error| format!("the node's key: {error}"))?;
             let names = if names.is_empty() {
@@ -157,8 +147,7 @@ impl ServerCertVerifier for PinnedKey {
         let certificate = webpki::EndEntityCert::try_from(end).map_err(|_| {
             rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
         })?;
-        let expected = [&SPKI_PREFIX[..], &self.key].concat();
-        if certificate.subject_public_key_info().as_ref() == expected.as_slice() {
+        if certificate.subject_public_key_info().as_ref() == vos_net::spki(&self.key) {
             Ok(ServerCertVerified::assertion())
         } else {
             Err(rustls::Error::InvalidCertificate(

@@ -25,7 +25,7 @@ pub mod memory;
 pub mod quic;
 mod tls;
 
-pub use tls::public_key;
+pub use tls::{pkcs8, public_key, spki};
 
 /// A node of the space: the 8-bit node part of an agent id.
 pub type NodeNumber = u8;

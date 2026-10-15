@@ -99,9 +99,8 @@ fn a_key_not_configured_is_refused_on_either_side() {
         // Node 1 believes node 2 has node 3's key, at node 2's address:
         // node 2 would take node 1, but node 1 refuses node 2.
         a.set_peers(vec![Peer {
-            number: 2,
             key: public_key(&secret(3)),
-            address: b.local_addr(),
+            ..peer_at(2, b.local_addr())
         }]);
         send(a, 2, Class::Consensus, 1, b"for node 3".to_vec()).await;
         assert!(silent(b_arrivals, Duration::from_millis(500)).await);
@@ -152,15 +151,8 @@ fn a_liveness_frame_is_not_held_for_a_later_connection() {
     smol::block_on(async {
         let (a, _) = bind(1, any_port(), Limits::default());
         // Node 2's address, nothing listening there yet.
-        let address = std::net::UdpSocket::bind(any_port())
-            .unwrap()
-            .local_addr()
-            .unwrap();
-        a.set_peers(vec![Peer {
-            number: 2,
-            key: public_key(&secret(2)),
-            address,
-        }]);
+        let address = vacant_address();
+        a.set_peers(vec![peer_at(2, address)]);
         send(&a, 2, Class::Liveness, 1, b"alive before".to_vec()).await;
         send(&a, 2, Class::Consensus, 1, b"held".to_vec()).await;
         smol::Timer::after(Duration::from_millis(200)).await;
@@ -226,11 +218,7 @@ fn a_queue_to_an_unreachable_peer_fills() {
         let (a, _) = bind(1, any_port(), Limits::default());
         // Nothing listens there.
         let silent = std::net::UdpSocket::bind(any_port()).unwrap();
-        a.set_peers(vec![Peer {
-            number: 2,
-            key: public_key(&secret(2)),
-            address: silent.local_addr().unwrap(),
-        }]);
+        a.set_peers(vec![peer_at(2, silent.local_addr().unwrap())]);
         let frame = vec![0; 64 << 10];
         let mut queued = 0;
         while a.send(2, Class::Consensus, 1, frame.clone()).is_ok() {

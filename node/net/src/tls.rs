@@ -54,8 +54,14 @@ pub fn public_key(secret: &[u8; 32]) -> NodeKey {
         .expect("an ed25519 public key is 32 bytes")
 }
 
-fn spki(key: &NodeKey) -> Vec<u8> {
+/// The SubjectPublicKeyInfo of the ed25519 key `key`, in DER.
+pub fn spki(key: &NodeKey) -> Vec<u8> {
     [&SPKI_PREFIX[..], key].concat()
+}
+
+/// The PKCS #8 document of the ed25519 seed `secret`, in DER.
+pub fn pkcs8(secret: &[u8; 32]) -> Vec<u8> {
+    [&PKCS8_PREFIX[..], secret].concat()
 }
 
 /// The key a raw public key holds, if it is exactly an ed25519 one.
@@ -95,12 +101,10 @@ impl Identity {
     pub fn new(secret: &[u8; 32]) -> Self {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let key = public_key(secret);
-        let pkcs8 = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-            [&PKCS8_PREFIX[..], secret].concat(),
-        ));
+        let der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8(secret)));
         let signer = provider
             .key_provider
-            .load_private_key(pkcs8)
+            .load_private_key(der)
             .expect("an ed25519 seed loads");
         let certified = Arc::new(CertifiedKey::new(
             vec![CertificateDer::from(spki(&key))],
@@ -252,6 +256,16 @@ fn equal(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0, |differ, (a, b)| differ | (a ^ b)) == 0
 }
 
+/// TLS 1.2, which neither side offers.
+fn tls12_refused() -> Result<HandshakeSignatureValid, rustls::Error> {
+    Err(rustls::Error::PeerIncompatible(
+        rustls::PeerIncompatible::Tls12NotOffered,
+    ))
+}
+
+/// The one signature scheme a node key signs with.
+const SCHEMES: [SignatureScheme; 1] = [SignatureScheme::ED25519];
+
 /// The keys a side takes.
 #[derive(Debug)]
 enum Expect {
@@ -320,9 +334,7 @@ impl ServerCertVerifier for Verifier {
         _: &CertificateDer,
         _: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Err(rustls::Error::PeerIncompatible(
-            rustls::PeerIncompatible::Tls12NotOffered,
-        ))
+        tls12_refused()
     }
 
     fn verify_tls13_signature(
@@ -335,7 +347,7 @@ impl ServerCertVerifier for Verifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![SignatureScheme::ED25519]
+        SCHEMES.to_vec()
     }
 
     fn requires_raw_public_keys(&self) -> bool {
@@ -364,9 +376,7 @@ impl ClientCertVerifier for Verifier {
         _: &CertificateDer,
         _: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Err(rustls::Error::PeerIncompatible(
-            rustls::PeerIncompatible::Tls12NotOffered,
-        ))
+        tls12_refused()
     }
 
     fn verify_tls13_signature(
@@ -379,7 +389,7 @@ impl ClientCertVerifier for Verifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![SignatureScheme::ED25519]
+        SCHEMES.to_vec()
     }
 
     fn requires_raw_public_keys(&self) -> bool {

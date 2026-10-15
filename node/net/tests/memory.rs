@@ -1,9 +1,11 @@
 //! Endpoints joined through an in-process hub.
 
+mod common;
+
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use smol::future::FutureExt;
+use common::{queue, within};
 use vos_net::memory::{Endpoint, Hub};
 use vos_net::{Arrivals, Class, Incoming, Limits, Network, NodeNumber, Peer, Refused};
 
@@ -30,15 +32,6 @@ fn join(hub: &Hub, numbers: &[NodeNumber]) -> Vec<(Endpoint, Arrivals)> {
         .collect()
 }
 
-async fn within<T>(limit: Duration, future: impl Future<Output = T>) -> Option<T> {
-    async { Some(future.await) }
-        .or(async {
-            smol::Timer::after(limit).await;
-            None
-        })
-        .await
-}
-
 /// Send `frame` on Consensus stream 0, which takes it.
 fn send(from: &Endpoint, to: NodeNumber, frame: &[u8]) {
     from.send(to, Class::Consensus, 0, frame.to_vec()).unwrap();
@@ -58,13 +51,7 @@ fn frames_arrive_with_their_sender_and_stream() {
         nodes[0].0.send(2, class, 5, vec![class as u8]).unwrap();
     }
     for class in Class::ALL {
-        let queue = match class {
-            Class::Liveness => &nodes[1].1.liveness,
-            Class::Consensus => &nodes[1].1.consensus,
-            Class::Requests => &nodes[1].1.requests,
-            Class::Bulk => &nodes[1].1.bulk,
-        };
-        let incoming = queue.try_recv().unwrap();
+        let incoming = queue(&nodes[1].1, class).try_recv().unwrap();
         assert_eq!(
             incoming,
             Incoming {
