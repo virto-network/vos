@@ -1,0 +1,90 @@
+//! The node's operator: commands by its admin token.
+
+use std::time::Duration;
+
+use vos_wire::Encode;
+use vos_wire::ids::{AgentId, Principal};
+use vos_wire::ingress::{Create, Grant, Install, Replace, Response};
+
+use super::{ClientError, Http, Target, answer};
+
+/// The node's operator, by its admin token.
+pub struct Operator {
+    token: String,
+    http: Http,
+}
+
+impl Operator {
+    pub fn new(target: &Target, token: &str) -> Self {
+        Self {
+            token: token.trim().to_string(),
+            http: Http::new(target),
+        }
+    }
+
+    /// One whose commands' answers are read within `answer`, each read
+    /// and write of them: for a caller that tries another node when one
+    /// is slow.
+    pub fn within(target: &Target, token: &str, answer: Duration) -> Self {
+        Self {
+            token: token.trim().to_string(),
+            http: Http::within(target, answer),
+        }
+    }
+
+    fn post(&self, path: &str, body: &[u8]) -> Result<Response, ClientError> {
+        // An operator's command may not be idempotent: never sent twice.
+        let (status, body) = self.http.post(path, Some(&self.token), body, false)?;
+        answer(status, &body)
+    }
+
+    /// Create an agent replicated on `replicas` (the node alone when
+    /// empty).
+    pub fn create_agent(&self, replicas: Vec<u8>) -> Result<Response, ClientError> {
+        if replicas.is_empty() {
+            return self.post("/agents", &[]);
+        }
+        self.post("/agents", &Create { replicas }.encode())
+    }
+
+    pub fn install(&self, agent: AgentId, install: &Install) -> Result<Response, ClientError> {
+        self.post(&format!("/agents/{}/install", agent.0), &install.encode())
+    }
+
+    pub fn grant(
+        &self,
+        agent: AgentId,
+        principal: Principal,
+        role: Option<u8>,
+    ) -> Result<Response, ClientError> {
+        let grant = Grant { principal, role };
+        self.post(&format!("/agents/{}/roles", agent.0), &grant.encode())
+    }
+
+    /// Replace `agent`'s replica `remove` by node `add`, at its leader.
+    pub fn replace(&self, agent: AgentId, remove: u8, add: u8) -> Result<Response, ClientError> {
+        let replace = Replace { remove, add };
+        self.post(&format!("/agents/{}/replicas", agent.0), &replace.encode())
+    }
+
+    /// How long the node's stages took since it started.
+    pub fn stats(&self) -> Result<Response, ClientError> {
+        let (status, body) = self
+            .http
+            .request("GET", "/stats", Some(&self.token), &[], true)?;
+        answer(status, &body)
+    }
+
+    /// The node's replica of `agent`: its term, role, commit, applied
+    /// index and log.
+    pub fn status(&self, agent: AgentId) -> Result<Response, ClientError> {
+        let (status, body) = self.http.request(
+            "GET",
+            &format!("/agents/{}/status", agent.0),
+            Some(&self.token),
+            &[],
+            true,
+        )?;
+        answer(status, &body)
+    }
+}
