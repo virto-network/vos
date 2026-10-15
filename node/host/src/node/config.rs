@@ -110,7 +110,8 @@ pub struct Config {
     pub snapshot_timeout_ms: u64,
     /// How many owners' reads of workflows may wait at once at the node's
     /// ingress, each read again at every apply: one past them answers
-    /// where its workflow stands at once.
+    /// where its workflow stands at once. A client that hung up keeps its
+    /// place until its wait ends.
     pub workflow_waits: usize,
     /// The longest a read of a workflow waits for it to end: at most
     /// [`vos_wire::ingress::MAX_WORKFLOW_WAIT_MS`].

@@ -52,6 +52,13 @@ pub(super) struct Snapshots {
     pub(super) chunks: VecDeque<(NodeNumber, SnapshotChunk)>,
 }
 
+impl Snapshots {
+    /// Whether the snapshot this replica stages arrived whole.
+    fn staged(&self) -> bool {
+        self.install.as_ref().is_some_and(|install| install.staged)
+    }
+}
+
 /// A snapshot stream this replica runs to a follower, as leader.
 pub(super) struct Shipment {
     pub(super) term: u64,
@@ -249,12 +256,7 @@ impl Driver {
             );
             self.abandon();
         }
-        if self
-            .snapshots
-            .install
-            .as_ref()
-            .is_some_and(|install| install.staged)
-        {
+        if self.snapshots.staged() {
             return self.switch().await;
         }
         true
@@ -279,12 +281,7 @@ impl Driver {
         if current != Some(name) {
             // A snapshot staged whole switches, or is dropped once idle,
             // before a newer stream takes its place.
-            if self
-                .snapshots
-                .install
-                .as_ref()
-                .is_some_and(|install| install.staged)
-            {
+            if self.snapshots.staged() {
                 return;
             }
             // A newer stream, from its first chunk: the follower wants that.

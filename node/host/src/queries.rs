@@ -45,9 +45,9 @@ pub(crate) enum Reading {
     /// Read as the applied state stands: a method its schema marks
     /// linearizable does not run, for want of a read index.
     AsItStands,
-    /// Read after a read index, or for the node's own caller: any method
-    /// runs.
-    Linearized,
+    /// Any method runs: read after a read index, or for the node's own
+    /// caller, which reads without one.
+    AnyMethod,
 }
 
 /// A query's run on a snapshot.
@@ -75,7 +75,7 @@ impl Inner {
         };
         let reading = match consistency {
             Consistency::Applied { .. } => Reading::AsItStands,
-            Consistency::Linearizable => Reading::Linearized,
+            Consistency::Linearizable => Reading::AnyMethod,
         };
         let snapshot = match self.snapshot_at(&run, agent, consistency).await {
             Ok(snapshot) => snapshot,
@@ -99,7 +99,7 @@ impl Inner {
             arguments,
         };
         answered(
-            self.query_on(snapshot, agent, asked, Reading::Linearized)
+            self.query_on(snapshot, agent, asked, Reading::AnyMethod)
                 .await,
         )
     }
@@ -279,11 +279,11 @@ impl Inner {
         }
         let snapshot = self.store.snapshot();
         match self
-            .query_on(snapshot, agent, asked, Reading::Linearized)
+            .query_on(snapshot, agent, asked, Reading::AnyMethod)
             .await?
         {
             Queried::Ran(outcome, _) => Ok(outcome),
-            Queried::Linearizable(_) => unreachable!("any method runs on a linearized reading"),
+            Queried::Linearizable(_) => unreachable!("any method runs"),
         }
     }
 

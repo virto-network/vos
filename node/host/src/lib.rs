@@ -105,7 +105,7 @@ pub(crate) fn raise<K: Eq + Hash>(map: &mut HashMap<K, u64>, key: K, value: u64)
 }
 
 /// The wait before trying again what the node failed: [`Backoff::FIRST`]
-/// at first, doubled at each try up to five seconds.
+/// at first, doubled at each try up to [`Backoff::MOST`].
 pub(crate) struct Backoff(Duration);
 
 impl Backoff {

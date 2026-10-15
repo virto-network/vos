@@ -142,7 +142,49 @@ impl Machines {
         work: &Work,
         gas: u64,
     ) -> Result<(Vec<u8>, u64), Fault> {
-        refine(self, snapshot, agent, work, gas)
+        let Machines {
+            program,
+            pool,
+            blobs,
+        } = self;
+        let arguments = RefineArgs::new(u64::from(agent.0), work.encode(), [0; 32]).encode();
+        let gas = match work.batch() {
+            Some(batch) => gas + defaults::refine_start(batch.inputs.len(), arguments.len()),
+            None => gas,
+        };
+        let programs = Arc::new(AgentPrograms::new(blobs, agent, work));
+        let invocation = RefineContext::new(program.load(REFINE_ENTRY, &arguments, gas)?)
+            .with_pool(Arc::clone(pool))
+            .with_programs(Arc::clone(&programs) as Arc<dyn ProgramSource>)
+            .with_state(Arc::new(AgentState { snapshot, agent }))
+            .try_run_with_host(|id, machine| serve(id, machine, &programs))?;
+        let used = invocation.gas_used;
+        let output = if invocation.exit == ExitReason::HostCall(LOST) {
+            let registers = invocation.registers;
+            let mut what = vec![0; (registers[8] as usize).min(LOST_WHAT)];
+            if !invocation
+                .memory()
+                .read_bytes_checked(registers[7] as u32, &mut what)
+            {
+                what.clear();
+            }
+            let what = String::from_utf8_lossy(&what);
+            Err(Fault::Storage(format!(
+                "agent {} lost state it wrote: {what}",
+                agent.0
+            )))
+        } else if invocation.exit != ExitReason::Halt {
+            Err(Fault::Agent(format!(
+                "refine stopped: {:?}",
+                invocation.exit
+            )))
+        } else {
+            invocation
+                .output_bounded(cap::OUTPUT)
+                .ok_or_else(|| Fault::Agent("refine's output is out of bounds".into()))
+        };
+        program.restore(invocation);
+        output.map(|output| (output, used))
     }
 
     /// Run the agent's accumulate on one work result: the writes to apply,
@@ -154,60 +196,33 @@ impl Machines {
         result: Vec<u8>,
         gas: u64,
     ) -> Result<Vec<Write>, Fault> {
-        accumulate(&self.program, snapshot, agent, result, gas)
-    }
-}
-
-fn refine(
-    machines: &Machines,
-    snapshot: Arc<Snapshot>,
-    agent: AgentId,
-    work: &Work,
-    gas: u64,
-) -> Result<(Vec<u8>, u64), Fault> {
-    let Machines {
-        program,
-        pool,
-        blobs,
-    } = machines;
-    let arguments = RefineArgs::new(u64::from(agent.0), work.encode(), [0; 32]).encode();
-    let gas = match work.batch() {
-        Some(batch) => gas + defaults::refine_start(batch.inputs.len(), arguments.len()),
-        None => gas,
-    };
-    let programs = Arc::new(AgentPrograms::new(blobs, agent, work));
-    let invocation = RefineContext::new(program.load(REFINE_ENTRY, &arguments, gas)?)
-        .with_pool(Arc::clone(pool))
-        .with_programs(Arc::clone(&programs) as Arc<dyn ProgramSource>)
-        .with_state(Arc::new(AgentState { snapshot, agent }))
-        .try_run_with_host(|id, machine| serve(id, machine, &programs))?;
-    let used = invocation.gas_used;
-    let output = if invocation.exit == ExitReason::HostCall(LOST) {
-        let registers = invocation.registers;
-        let mut what = vec![0; (registers[8] as usize).min(LOST_WHAT)];
-        if !invocation
-            .memory()
-            .read_bytes_checked(registers[7] as u32, &mut what)
-        {
-            what.clear();
+        let input = AccumulateInput::Operand(Operand {
+            gas_limit: gas,
+            ..Operand::new(result)
+        })
+        .encode();
+        let inputs = [input];
+        let mut storage = Overlay {
+            snapshot,
+            agent,
+            written: BTreeMap::new(),
+        };
+        let service = u64::from(agent.0);
+        let arguments = accumulate_host::arguments(0, service, inputs.len());
+        let machine = self.program.load(ACCUMULATE_ENTRY, &arguments, gas)?;
+        let invocation =
+            AccumulateContext::new(machine, service, &inputs, &mut storage).try_run()?;
+        let exit = invocation.exit.clone();
+        self.program.restore(invocation);
+        if exit != ExitReason::Halt {
+            return Err(Fault::Agent(format!("accumulate stopped: {exit:?}")));
         }
-        let what = String::from_utf8_lossy(&what);
-        Err(Fault::Storage(format!(
-            "agent {} lost state it wrote: {what}",
-            agent.0
-        )))
-    } else if invocation.exit != ExitReason::Halt {
-        Err(Fault::Agent(format!(
-            "refine stopped: {:?}",
-            invocation.exit
-        )))
-    } else {
-        invocation
-            .output_bounded(cap::OUTPUT)
-            .ok_or_else(|| Fault::Agent("refine's output is out of bounds".into()))
-    };
-    program.restore(invocation);
-    output.map(|output| (output, used))
+        Ok(storage
+            .written
+            .into_iter()
+            .map(|(key, value)| Write { key, value })
+            .collect())
+    }
 }
 
 /// The calls refine leaves to the node: `historical_lookup` from the
@@ -254,40 +269,6 @@ impl ServiceStorage for Overlay {
         self.written.insert(key.to_vec(), value.map(<[u8]>::to_vec));
         previous
     }
-}
-
-fn accumulate(
-    program: &OuterMachines,
-    snapshot: Arc<Snapshot>,
-    agent: AgentId,
-    result: Vec<u8>,
-    gas: u64,
-) -> Result<Vec<Write>, Fault> {
-    let input = AccumulateInput::Operand(Operand {
-        gas_limit: gas,
-        ..Operand::new(result)
-    })
-    .encode();
-    let inputs = [input];
-    let mut storage = Overlay {
-        snapshot,
-        agent,
-        written: BTreeMap::new(),
-    };
-    let service = u64::from(agent.0);
-    let arguments = accumulate_host::arguments(0, service, inputs.len());
-    let machine = program.load(ACCUMULATE_ENTRY, &arguments, gas)?;
-    let invocation = AccumulateContext::new(machine, service, &inputs, &mut storage).try_run()?;
-    let exit = invocation.exit.clone();
-    program.restore(invocation);
-    if exit != ExitReason::Halt {
-        return Err(Fault::Agent(format!("accumulate stopped: {exit:?}")));
-    }
-    Ok(storage
-        .written
-        .into_iter()
-        .map(|(key, value)| Write { key, value })
-        .collect())
 }
 
 /// Decode the agent program's output as `T`.

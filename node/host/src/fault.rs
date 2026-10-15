@@ -2,9 +2,8 @@
 //! state's reads that fail with it.
 
 use vos_wire::Decode;
-use vos_wire::ids::{AgentId, Session, SessionId};
-use vos_wire::keys;
-use vos_wire::records::{SessionMark, unstored};
+use vos_wire::ids::AgentId;
+use vos_wire::records::unstored;
 
 use crate::executor::Panicked;
 use crate::store::Snapshot;
@@ -63,20 +62,4 @@ pub(crate) fn read<T: Decode>(
 ) -> Result<Option<T>, Fault> {
     let bytes = snapshot.get(agent, key)?;
     Ok(bytes.and_then(|bytes| T::decode(unstored(&bytes)?).ok().map(|(value, _)| value)))
-}
-
-/// `session`'s id in `agent`'s applied state, and its mark there, if the
-/// state holds the session.
-pub(crate) fn session_mark(
-    snapshot: &Snapshot,
-    agent: AgentId,
-    session: &Session,
-) -> Result<Option<(SessionId, Option<SessionMark>)>, Fault> {
-    let Some(id) = read::<SessionId>(snapshot, agent, &keys::session_index(session))? else {
-        return Ok(None);
-    };
-    Ok(Some((
-        id,
-        read::<SessionMark>(snapshot, agent, &keys::session(id))?,
-    )))
 }

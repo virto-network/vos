@@ -97,7 +97,7 @@ impl Pending {
         }
     }
 
-    /// Answer that this node does not lead, when the input has a caller.
+    /// Answer the caller, if any, that this node does not lead.
     pub(crate) fn refuse(self, hint: &CallError) {
         self.answer(Err(hint.clone()));
     }
@@ -186,9 +186,7 @@ impl Queue {
         std::mem::take(&mut self.inputs)
     }
 
-    /// The count `pending` is in: of the inputs clients queued, or of the
-    /// messages other agents did. Acknowledgements and sweeps count in
-    /// neither.
+    /// The count `pending` is in, if any.
     fn count_of(&mut self, pending: &Pending) -> Option<&mut usize> {
         if pending.capped() {
             Some(&mut self.capped)
@@ -284,13 +282,11 @@ impl Agent {
         }
     }
 
-    /// Whether the leader loop takes inputs.
     pub(crate) fn leading(&self) -> bool {
         lock(&self.queue).leading
     }
 
-    /// Put `inputs` back at the front of the queue, in order, as queued
-    /// now, unless the agent stopped.
+    /// [`Queue::push_front`], unless the agent stopped.
     pub(crate) fn requeue(&self, inputs: Vec<Pending>) {
         let mut queue = lock(&self.queue);
         if !queue.stopped {

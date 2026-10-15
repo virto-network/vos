@@ -10,7 +10,8 @@ use vos_wire::keys;
 use vos_wire::result::{Outcome, Step, WorkResult};
 
 use super::{Leader, is_due};
-use crate::fault::{Fault, read, session_mark};
+use crate::calls::session_mark;
+use crate::fault::{Fault, read};
 use crate::node::{Answered, CallError, Pending, Reply};
 use crate::raise;
 use crate::store::Snapshot;

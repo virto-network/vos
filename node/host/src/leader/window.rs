@@ -63,6 +63,11 @@ impl Window {
         self.last = self.last.max(last);
     }
 
+    /// Whether all the outbox holds, as last read, was sent or acknowledged.
+    pub(super) fn sent_all(&self) -> bool {
+        self.through() >= self.last
+    }
+
     /// `sequence`, of `size`, sent past the acknowledgement.
     pub(super) fn push(&mut self, sequence: u64, size: usize) {
         self.sent.push_back((sequence, size));

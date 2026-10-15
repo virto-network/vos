@@ -26,7 +26,7 @@ use crate::fault::{Fault, read};
 use crate::group::{Local, Shared, State};
 use crate::node::{Agent, Inner, Pending};
 use crate::store::Snapshot;
-use crate::{Backoff, lock};
+use crate::{Backoff, lock, timeout};
 use sweep::Sweeps;
 use window::{BEHIND_EVERY, WINDOW, Window};
 
@@ -175,8 +175,8 @@ impl Leader {
 
     /// Lead until leadership ends. False when a hook stops the leader.
     async fn lead(&mut self) -> bool {
-        if let Err(fault) = self.recover().await {
-            tracing::error!(agent = self.id.0, "recovery failed: {}", fault.message());
+        if !self.recovered().await {
+            return true;
         }
         while let Some(taken) = self.take().await {
             let pending = match taken {
@@ -205,6 +205,28 @@ impl Leader {
             }
         }
         true
+    }
+
+    /// Recover the outbox before taking any input, trying again after a
+    /// failed read while this replica leads: false once it no longer does.
+    async fn recovered(&mut self) -> bool {
+        loop {
+            let Err(fault) = self.recover().await else {
+                self.backoff.reset();
+                return true;
+            };
+            let wait = self.backoff.next();
+            tracing::error!(
+                agent = self.id.0,
+                "recovery failed ({}); retrying in {wait:?}",
+                fault.message()
+            );
+            let term = self.term;
+            timeout(wait, self.shared.wait(|state| !leads(state, term))).await;
+            if !leads(&self.shared.state(), term) {
+                return false;
+            }
+        }
     }
 
     /// What the leader takes next, once there is anything; `None` once

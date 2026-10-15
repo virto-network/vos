@@ -22,16 +22,18 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use vos_wire::batch::Request;
-use vos_wire::ids::{AgentId, Principal, Session};
+use vos_wire::ids::{AgentId, Principal, Session, SessionId};
 use vos_wire::ingress::{Call, Rejection, Response};
 use vos_wire::peer::{NodeNumber, PeerMessage};
+use vos_wire::records::SessionMark;
 use vos_wire::result::Outcome;
 use vos_wire::{defaults, keys};
 
 use crate::asking::{PAUSE, REASK, Waits, pause};
-use crate::fault::{Fault, read, session_mark};
+use crate::fault::{Fault, read};
 use crate::node::{Answered, CallError, Inner, Reply, Run};
 use crate::signature::signed;
+use crate::store::Snapshot;
 use crate::{lock, timeout};
 
 /// How long a forwarded call may take: its re-forwards, and the wait for
@@ -106,6 +108,22 @@ impl Applied {
             None => Response::Rejected(Rejection::TooOld),
         })
     }
+}
+
+/// `session`'s id in `agent`'s applied state, and its mark there, if the
+/// state holds the session.
+pub(crate) fn session_mark(
+    snapshot: &Snapshot,
+    agent: AgentId,
+    session: &Session,
+) -> Result<Option<(SessionId, Option<SessionMark>)>, Fault> {
+    let Some(id) = read::<SessionId>(snapshot, agent, &keys::session_index(session))? else {
+        return Ok(None);
+    };
+    Ok(Some((
+        id,
+        read::<SessionMark>(snapshot, agent, &keys::session(id))?,
+    )))
 }
 
 enum Next {

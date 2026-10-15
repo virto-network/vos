@@ -26,8 +26,9 @@ impl Leader {
         let mut targets = BTreeSet::new();
         for row in snapshot.scan(self.id, &keys::outbox_prefix(), None) {
             let (key, _) = row?;
-            let (to, _) = keys::outbox_entry(&key).expect("an outbox key holds its target");
-            targets.insert(to);
+            if let Some((to, _)) = outbox_entry(self.id, &key) {
+                targets.insert(to);
+            }
         }
         for to in targets {
             let _ = self.inner.settled(to).await;
@@ -71,11 +72,16 @@ impl Leader {
             .or_insert_with(|| Window::new(acked, turn, round));
         window.ack(acked);
         window.holds(last);
+        if window.sent_all() {
+            return Ok(());
+        }
         let after = window.through();
         let cursor = keys::outbox(to, after);
         for row in snapshot.scan(self.id, &keys::outbox_to(to), Some(&cursor)) {
             let (key, value) = row?;
-            let (_, sequence) = keys::outbox_entry(&key).expect("an outbox key holds a sequence");
+            let Some((_, sequence)) = outbox_entry(self.id, &key) else {
+                continue;
+            };
             let Some(outgoing) = unstored(&value).and_then(|bytes| {
                 <Outgoing as vos_wire::Decode>::decode(bytes)
                     .ok()
@@ -146,4 +152,15 @@ impl Leader {
             self.inner.acknowledge(sender, self.id, sequence);
         }
     }
+}
+
+/// The target and sequence a key of `agent`'s outbox names. One that names
+/// none, which only the agent's own writes can make, is logged and passed
+/// over.
+fn outbox_entry(agent: AgentId, key: &[u8]) -> Option<(AgentId, u64)> {
+    let entry = keys::outbox_entry(key);
+    if entry.is_none() {
+        tracing::error!(agent = agent.0, ?key, "an outbox key that names no message");
+    }
+    entry
 }
