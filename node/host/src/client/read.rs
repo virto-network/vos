@@ -65,7 +65,8 @@ impl Client {
     /// the agent, waiting up to `wait` for it to end, as long as the node
     /// allows: its status, as [`Response::Workflow`]. Only the workflow's
     /// owner learns of it: to any other key it is unknown, as it is to its
-    /// owner once collected, [`defaults::WORKFLOW_KEPT_MS`] after it ended.
+    /// owner once collected, [`vos_wire::defaults::WORKFLOW_KEPT_MS`] after
+    /// it ended.
     pub fn workflow(
         &self,
         agent: AgentId,

@@ -47,7 +47,7 @@ impl Batch {
     /// Remove the agent's log entries after `after`, including any this
     /// batch appended.
     pub fn truncate(&mut self, agent: AgentId, after: u64) {
-        let Some(stored) = self.read(self.store.last_log_index(agent)) else {
+        let Some(stored) = self.checked(self.store.last_log_index(agent)) else {
             return;
         };
         let appended = self.appended.get(&agent).copied();
@@ -75,7 +75,7 @@ impl Batch {
             .log()
             .range(log_key(agent, 0)..=log_key(agent, through))
         {
-            let Some(key) = self.read(row.key()) else {
+            let Some(key) = self.checked(row.key()) else {
                 return;
             };
             self.batch.remove(self.store.log(), key);
@@ -216,7 +216,7 @@ impl Batch {
     /// the last log position it held, bounds the votes it gives then.
     pub fn retire(&mut self, agent: AgentId, epoch: u8, hard: &HardState, floor: (u64, u64)) {
         self.set(agent, NodeRow::VoteFloor, encode_position(floor.0, floor.1));
-        let Some(rows) = self.read(self.store.agent_rows(agent)) else {
+        let Some(rows) = self.checked(self.store.agent_rows(agent)) else {
             return;
         };
         self.truncate(agent, rows.log_start);
@@ -260,7 +260,7 @@ impl Batch {
 
     /// What `read` read, or `None` once it failed: the batch then commits
     /// nothing.
-    fn read<T>(&mut self, read: Result<T>) -> Option<T> {
+    fn checked<T>(&mut self, read: Result<T>) -> Option<T> {
         read.map_err(|error| {
             self.error.get_or_insert(error);
         })

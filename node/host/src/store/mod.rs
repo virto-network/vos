@@ -47,10 +47,9 @@ pub use fjall::{Error, PersistMode};
 pub use keys::{NODE_AGENT, decode_configuration, encode_configuration, next_epoch};
 pub use read::{Export, Snapshot};
 pub use tuning::Tuning;
+pub use vos_wire::peer::NodeNumber;
 
 pub type Result<T> = std::result::Result<T, Error>;
-
-pub use vos_wire::peer::NodeNumber;
 
 /// One of an agent's rows: its agent-relative key and its value.
 pub type Row = (Vec<u8>, Vec<u8>);

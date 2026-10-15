@@ -19,11 +19,11 @@ pub(super) struct Put {
     pub(super) keep: Keep,
     /// Write it again even if it is stored: collection moving it.
     pub(super) relocate: bool,
-    pub(super) done: Reply<()>,
+    pub(super) done: Done<()>,
 }
 
 /// Where the blob writer answers a request.
-pub(super) type Reply<T> = smol::channel::Sender<Result<T, String>>;
+pub(super) type Done<T> = smol::channel::Sender<Result<T, String>>;
 
 /// What the blob writer does, in order: so a collection's removal and a
 /// put or touch of the same blob never cross.
@@ -32,14 +32,14 @@ pub(super) enum Request {
     /// Refresh each stored blob's time: the ones stored.
     Touch {
         hashes: Vec<[u8; 32]>,
-        done: Reply<Vec<[u8; 32]>>,
+        done: Done<Vec<[u8; 32]>>,
     },
     /// Remove each candidate still aged out by `cutoffs` and not held,
     /// synced: how many.
     Remove {
         candidates: Vec<[u8; 32]>,
         cutoffs: Cutoffs,
-        done: Reply<usize>,
+        done: Done<usize>,
     },
 }
 
@@ -54,7 +54,7 @@ pub(super) struct Writer {
 }
 
 /// Answer `result` on `done`: whether it failed, which stops the writer.
-fn answer<T>(done: &Reply<T>, result: store::Result<T>) -> bool {
+fn answer<T>(done: &Done<T>, result: store::Result<T>) -> bool {
     let failed = result.is_err();
     let _ = done.try_send(result.map_err(|error| error.to_string()));
     failed

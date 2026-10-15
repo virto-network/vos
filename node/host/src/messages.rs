@@ -61,26 +61,20 @@ impl Inner {
 
     /// Where an arrival for `agent` from node `from` goes: into the queue
     /// here, or to the agent's leader, which a direct hop is relayed to
-    /// once; never `Nowhere`. A direct hop must come from a replica of
-    /// `origin`, the agent at its other end, and a relayed one from a
-    /// replica of `agent`; anything else, or anything a node cannot place,
-    /// is dropped and counted.
-    fn hop(
-        &self,
-        from: NodeNumber,
-        agent: AgentId,
-        origin: AgentId,
-        relayed: bool,
-    ) -> Option<Route> {
+    /// once. A direct hop must come from a replica of `origin`, the agent
+    /// at its other end, and a relayed one from a replica of `agent`;
+    /// anything else, or anything a node cannot place, is dropped and
+    /// counted: `Nowhere`.
+    fn hop(&self, from: NodeNumber, agent: AgentId, origin: AgentId, relayed: bool) -> Route {
         if !self.admit(if relayed { agent } else { origin }, from) {
-            return None;
+            return Route::Nowhere;
         }
         match self.route(agent, 0) {
-            Route::Here => Some(Route::Here),
-            Route::To(leader) if !relayed && self.run(agent).is_some() => Some(Route::To(leader)),
+            Route::Here => Route::Here,
+            Route::To(leader) if !relayed && self.run(agent).is_some() => Route::To(leader),
             _ => {
                 self.drops.count(Refusal::Unplaced);
-                None
+                Route::Nowhere
             }
         }
     }
@@ -172,12 +166,12 @@ impl Inner {
         relayed: bool,
     ) {
         match self.hop(from, to, message.from, relayed) {
-            Some(Route::Here) => match self.push(to, Pending::Message(message)) {
+            Route::Here => match self.push(to, Pending::Message(message)) {
                 Ok(()) => {}
                 Err(CallError::Busy) => self.drops.count(Refusal::Full),
                 Err(_) => self.drops.count(Refusal::Unplaced),
             },
-            Some(Route::To(leader)) => {
+            Route::To(leader) => {
                 self.counters.relayed.fetch_add(1, Ordering::Relaxed);
                 self.send(
                     leader,
@@ -188,7 +182,7 @@ impl Inner {
                     },
                 );
             }
-            Some(Route::Nowhere) | None => {}
+            Route::Nowhere => {}
         }
     }
 
@@ -203,7 +197,7 @@ impl Inner {
         relayed: bool,
     ) {
         match self.hop(from, sender, receiver, relayed) {
-            Some(Route::Here) => {
+            Route::Here => {
                 let ack = Pending::Ack {
                     to: receiver,
                     sequence,
@@ -212,7 +206,7 @@ impl Inner {
                     self.drops.count(Refusal::Unplaced);
                 }
             }
-            Some(Route::To(leader)) => self.send(
+            Route::To(leader) => self.send(
                 leader,
                 &PeerMessage::Acknowledge {
                     sender,
@@ -221,7 +215,7 @@ impl Inner {
                     relayed: true,
                 },
             ),
-            Some(Route::Nowhere) | None => {}
+            Route::Nowhere => {}
         }
     }
 
@@ -236,12 +230,12 @@ impl Inner {
         relayed: bool,
     ) {
         match self.hop(from, sender, receiver, relayed) {
-            Some(Route::Here) => {
+            Route::Here => {
                 if !self.note_behind(sender, receiver) {
                     self.drops.count(Refusal::Unplaced);
                 }
             }
-            Some(Route::To(leader)) => self.send(
+            Route::To(leader) => self.send(
                 leader,
                 &PeerMessage::Behind {
                     sender,
@@ -249,7 +243,7 @@ impl Inner {
                     relayed: true,
                 },
             ),
-            Some(Route::Nowhere) | None => {}
+            Route::Nowhere => {}
         }
     }
 }

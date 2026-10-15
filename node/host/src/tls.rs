@@ -96,7 +96,8 @@ fn certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>, String> {
     Ok(certificates)
 }
 
-/// A client's TLS configuration for `trust`: none for plain HTTP.
+/// A client's TLS configuration for `trust`: an error for plain HTTP,
+/// which has none.
 pub(crate) fn client_config(trust: &Trust) -> Result<Arc<rustls::ClientConfig>, String> {
     let provider = provider();
     let builder = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))

@@ -42,7 +42,7 @@ pub use collect::{Collected, Horizons};
 pub(crate) use index::{IndexRow, pin_key, pinned_hash};
 use index::{Location, location};
 use segment::{Current, create_segment, forget_missing_segments, recover, segment_path, sync_dir};
-use writer::{Put, Reply, Request, Writer};
+use writer::{Done, Put, Request, Writer};
 
 /// A segment closes once a record would take it past this many bytes.
 const SEGMENT_BYTES: u64 = 256 << 20;
@@ -233,28 +233,27 @@ impl Blobs {
     /// durable and indexed. A blob stored already keeps the longer of its
     /// keep and this.
     pub async fn put(&self, blob: BlobRef, bytes: Arc<Vec<u8>>, keep: Keep) -> Result<(), String> {
-        self.write(blob, bytes, keep, false).await
-    }
-
-    /// Write the stored blob again, at the current segment's end: a
-    /// collection moving it out of a sparse segment.
-    async fn relocate(&self, blob: BlobRef, bytes: Arc<Vec<u8>>, keep: Keep) -> Result<(), String> {
-        self.write(blob, bytes, keep, true).await
-    }
-
-    async fn write(
-        &self,
-        blob: BlobRef,
-        bytes: Arc<Vec<u8>>,
-        keep: Keep,
-        relocate: bool,
-    ) -> Result<(), String> {
         self.request(|done| {
             Request::Put(Put {
                 blob,
                 bytes,
                 keep,
-                relocate,
+                relocate: false,
+                done,
+            })
+        })
+        .await
+    }
+
+    /// Write the stored blob again, at the current segment's end: a
+    /// collection moving it out of a sparse segment.
+    async fn relocate(&self, blob: BlobRef, bytes: Arc<Vec<u8>>, keep: Keep) -> Result<(), String> {
+        self.request(|done| {
+            Request::Put(Put {
+                blob,
+                bytes,
+                keep,
+                relocate: true,
                 done,
             })
         })
@@ -271,7 +270,7 @@ impl Blobs {
         }
     }
 
-    async fn request<T>(&self, make: impl FnOnce(Reply<T>) -> Request) -> Result<T, String> {
+    async fn request<T>(&self, make: impl FnOnce(Done<T>) -> Request) -> Result<T, String> {
         let (done, wait) = smol::channel::bounded(1);
         self.inner
             .sender
