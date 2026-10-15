@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# The JAM milestone on a local PolkaJam testnet: the default agent deployed
-# as a service with the counter and the shop, a workflow suspended in one
-# work package and resumed in later ones, every state read witnessed
-# against the root on chain, each batch checked against a VOS node in
-# process. `vos jam milestone` runs it; this starts and stops the testnet.
+# The default agent on a local PolkaJam testnet, deployed as a service
+# with the counter and the shop: a workflow suspended in one work package
+# and resumed in later ones, every state read witnessed against the root
+# on chain, each batch checked against a VOS node in process. `vos jam
+# testnet` runs it; this starts and stops the testnet.
 #
 # It needs systemd's user manager (`systemd-run --user`, `systemctl
 # --user`), `setsid`, `curl`, and the agent and test actors built (`just
@@ -15,10 +15,10 @@ set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 POLKAJAM="${POLKAJAM:-$HOME/.cache/vos/polkajam/nightly-2026-10-13/polkajam-nightly-2026-10-13-linux-x86_64}"
-run="${JAM_RUN:-$(mktemp -d /tmp/vos-jam-milestone.XXXXXX)}"
+run="${JAM_RUN:-$(mktemp -d /tmp/vos-jam-testnet.XXXXXX)}"
 mkdir -p "$run/builder"
 rpc="localhost:19800"
-unit="vos-jam-milestone-$$"
+unit="vos-jam-testnet-$$"
 vos="${CARGO_TARGET_DIR:-$root/target}/debug/vos"
 agent="${CARGO_TARGET_DIR:-$root/agent/default/target}/riscv64em-vos/release/vos-agent.elf"
 actors="${CARGO_TARGET_DIR:-$root/agent/test-actors/target}/riscv64em-vos/release"
@@ -85,12 +85,12 @@ echo "testnet up: process groups $(tr '\n' ' ' <"$run/testnet.groups"); log $run
 } | tee "$run/build.txt"
 
 status=0
-"$vos" jam milestone \
+"$vos" jam testnet \
     --polkajam "$POLKAJAM" \
     --rpc "$rpc" \
     --agent "$agent" \
     --actors "$actors" \
-    --data "$run/builder" | tee "$run/milestone.log" || status=$?
+    --data "$run/builder" | tee "$run/vos.log" || status=$?
 
 # What the testnet said of the packages it did not take.
 {

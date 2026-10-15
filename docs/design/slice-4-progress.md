@@ -885,9 +885,10 @@ since PolkaJam reports none. That is far within the testnet's 1e9.
     where pages live, and solicits the preimages a package names;
   - the builder reads the chain at one finalized head;
   - transient RPC errors are retried, and `jamt` runs with a timeout.
-- **Run it again:** `just jam-milestone`. It needs the PolkaJam binaries
-  and systemd-run, so it stays outside `ci`. The builder's logic is in
-  `ci` against the emulated chain.
+- **Run it again:** `just jam-testnet` (`just jam-milestone` when this
+  ran). It needs the PolkaJam binaries and systemd-run, so it stays
+  outside `ci`. The builder's logic is in `ci` against the emulated
+  chain.
 
 **Probed on PolkaJam** (spikes/sj-jam-b), agreeing with our runtime on
 all 14 records:

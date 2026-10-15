@@ -1,7 +1,7 @@
 //! `vos jam`: an agent as a JAM service, built and driven by its builder.
 
-mod milestone;
 mod reference;
+mod testnet;
 
 use std::path::PathBuf;
 
@@ -22,8 +22,9 @@ pub enum JamCommand {
         #[arg(long, default_value = "vos-agent")]
         name: String,
     },
-    /// Run the JAM milestone on a running PolkaJam testnet.
-    Milestone(milestone::MilestoneArgs),
+    /// Run the agent as a service on a running PolkaJam testnet: every
+    /// package checked against the chain and a VOS node, and recorded.
+    Testnet(testnet::TestnetArgs),
 }
 
 /// The service's metadata, as PolkaJam names services by it.
@@ -52,7 +53,7 @@ impl JamCommand {
                 );
                 Ok(())
             }
-            JamCommand::Milestone(args) => milestone::run(args),
+            JamCommand::Testnet(args) => testnet::run(args),
         }
     }
 }

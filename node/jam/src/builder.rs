@@ -109,7 +109,7 @@ pub const MARGIN: u64 = 50;
 /// A bound on a package's own work beyond its batch's budget: its refine's
 /// start ([`defaults::refine_start`]) and what [`gas::own`] estimates. The
 /// builder's estimates, PolkaJam reporting no refine gas: 3.3M to 13.5M in
-/// the milestone's packages, and at most 4.9M for a workflow's package
+/// the testnet run's packages, and at most 4.9M for a workflow's package
 /// resumed across packages in the JAM-only host's comparison. So the bound
 /// holds the packages that neither witness hundreds of rows nor write
 /// them, with room; one that does lowers its budget by the excess.

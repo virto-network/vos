@@ -1,4 +1,4 @@
-//! The JAM milestone: the default agent deployed on a running PolkaJam
+//! `vos jam testnet`: the default agent deployed on a running PolkaJam
 //! testnet, with the counter's and the shop's programs, its workflows in
 //! it, as the service's preimages, and run, a package each: the programs
 //! solicited, the installs, a request that writes state, a workflow's
@@ -38,7 +38,7 @@ use super::reference::Vos;
 use crate::{at, link};
 
 #[derive(clap::Args)]
-pub struct MilestoneArgs {
+pub struct TestnetArgs {
     /// The directory of PolkaJam's binaries, `jamt` among them.
     #[arg(long, env = "POLKAJAM")]
     pub polkajam: PathBuf,
@@ -66,15 +66,15 @@ const PREIMAGE_TIMEOUT: Duration = Duration::from_secs(180);
 /// The sweeps the computation may take to end.
 const SWEEPS: u32 = 12;
 
-/// Run the milestone and write its record.
-pub fn run(args: MilestoneArgs) -> Result<(), String> {
-    let mut milestone = Milestone::new(args)?;
-    let outcome = milestone.run();
+/// Run the agent on the testnet and write the run's record.
+pub fn run(args: TestnetArgs) -> Result<(), String> {
+    let mut testnet = Testnet::new(args)?;
+    let outcome = testnet.run();
     if let Err(error) = &outcome {
-        milestone.note(format!("the milestone fails: {error}"));
+        testnet.note(format!("the run fails: {error}"));
     }
-    let file = milestone.args.data.join("record.txt");
-    std::fs::write(&file, &milestone.record).map_err(at(&file))?;
+    let file = testnet.args.data.join("record.txt");
+    std::fs::write(&file, &testnet.record).map_err(at(&file))?;
     println!("its record: {}", file.display());
     outcome
 }
@@ -118,10 +118,10 @@ struct Rig {
     vos: Vos,
 }
 
-/// The milestone's run: the testnet's node, the agent and the actors,
+/// A run on the testnet: its node, the agent and the actors,
 /// Alice's client, the attempts each package took, and the record.
-struct Milestone {
-    args: MilestoneArgs,
+struct Testnet {
+    args: TestnetArgs,
     node: Node,
     agent: Vec<u8>,
     actors: Actors,
@@ -139,8 +139,8 @@ struct Ran {
     exports: u32,
 }
 
-impl Milestone {
-    fn new(args: MilestoneArgs) -> Result<Self, String> {
+impl Testnet {
+    fn new(args: TestnetArgs) -> Result<Self, String> {
         let node = Node {
             rpc: args.rpc.clone(),
             jamt: args.polkajam.join("jamt"),

@@ -80,12 +80,12 @@ test-agent: build-test-actors build-agent
     cargo test -p vos-cli --features faults --test processes faults::
     cargo test -p vos-cli --features faults --test fault_suite
 
-# The JAM milestone on a local PolkaJam testnet, which it starts and stops:
-# the default agent deployed as a service, a workflow suspended in one work
-# package and resumed in later ones, every read witnessed. Outside `ci`: it
-# needs the PolkaJam binaries, in POLKAJAM or the 4.0 probe's directory.
-jam-milestone: build-test-actors build-agent
-    bash node/jam/milestone.sh
+# The default agent as a service on a local PolkaJam testnet, which it
+# starts and stops: a workflow suspended in one work package and resumed in
+# later ones, every read witnessed. Outside `ci`: it needs the PolkaJam
+# binaries, in POLKAJAM or the directory `testnet.sh` names by default.
+jam-testnet: build-test-actors build-agent
+    bash node/jam/testnet.sh
 
 # A plain build of `vos` carries no faults: building the fault suite's
 # `vos` with the feature must not leak into it, and no workspace member
@@ -111,7 +111,8 @@ check: fmt-check build-test-actors build-agent
     cargo test -p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam
     cargo test -p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-checker -p vos-node -p vos-net -p vos-cli
 
-# Everything but the prover suites: before a merge, and at each milestone.
+# Everything but the prover suites: before a merge, and at the end of each
+# planned stage of work.
 ci: fmt-check clippy jar-check test vectors test-bench test-agent check-no-faults
 
 # The gate before merging: `ci` plus the prover suites, the soundness gates
