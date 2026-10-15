@@ -149,15 +149,21 @@ fn quiet_groups_elect_again_when_their_leaders_node_stops() {
 
 /// A follower node restarted while its groups are quiet, nothing written
 /// meanwhile, hears its leaders at once: each probes it on hearing its
-/// new run, rather than waiting for its own deadline (a second or more
-/// here) to draw a heartbeat.
+/// new run, rather than waiting for its own deadline to draw a heartbeat.
+/// That deadline is twenty seconds or more, far from what a loaded machine
+/// adds to the probe; its leaders' are a second or more.
 #[test]
 fn a_restarted_follower_hears_its_quiet_leaders_at_once() {
-    let mut cluster = Cluster::tuned(3, |_, config| {
-        config.election_timeout_ms = (1_000, 2_000);
+    let follower = 3;
+    let elections = (20_000, 40_000);
+    let mut cluster = Cluster::tuned(3, move |number, config| {
+        config.election_timeout_ms = if number == follower {
+            elections
+        } else {
+            (1_000, 2_000)
+        };
     });
     let agents = agents(&cluster, 12);
-    let follower = 3;
     let followed: Vec<AgentId> = agents
         .iter()
         .copied()
@@ -166,8 +172,9 @@ fn a_restarted_follower_hears_its_quiet_leaders_at_once() {
     std::thread::sleep(Duration::from_millis(500));
     cluster.stop(follower);
     std::thread::sleep(Duration::from_millis(200));
-    cluster.start(follower);
+    // Timed from before the restart: its groups' deadlines start within.
     let started = Instant::now();
+    cluster.start(follower);
     for &agent in &followed {
         let reply = cluster.increment(follower, agent, 1, 1);
         assert!(
@@ -180,7 +187,7 @@ fn a_restarted_follower_hears_its_quiet_leaders_at_once() {
         "{} groups heard their leaders within {took:?}",
         followed.len()
     );
-    assert!(took < Duration::from_millis(800), "{took:?}");
+    assert!(took < Duration::from_millis(elections.0 / 2), "{took:?}");
 }
 
 /// A follower node restarted catches up its quiet groups.
