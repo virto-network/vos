@@ -15,7 +15,7 @@ use super::base::{Base, Corrupt};
 
 /// A request's session as this refine sees it.
 #[derive(Clone, Copy)]
-pub(super) enum Held {
+pub(crate) enum Held {
     /// Neither the state holds it nor has a step created it.
     Absent,
     /// An earlier step of this refine created it: it has no id yet.
@@ -33,7 +33,7 @@ impl Held {
     }
 
     /// The session once a step has run at `mark`.
-    pub(super) fn advanced(self, mark: SessionMark) -> Held {
+    pub(crate) fn advanced(self, mark: SessionMark) -> Held {
         match self {
             Held::Known(id, _) => Held::Known(id, mark),
             Held::Absent | Held::New(_) => Held::New(mark),
@@ -44,9 +44,9 @@ impl Held {
 /// A session as the in-batch map orders it: by its name as a number
 /// first, then its time, then its key, so sessions compare in a few
 /// instructions and one key's many sessions differ at once.
-pub(super) type ByName = (u128, u64, [u8; 32]);
+pub(crate) type ByName = (u128, u64, [u8; 32]);
 
-pub(super) fn by_name(session: &Session) -> ByName {
+pub(crate) fn by_name(session: &Session) -> ByName {
     (u128::from_le_bytes(session.name), session.t0, session.key)
 }
 
@@ -54,7 +54,7 @@ pub(super) fn by_name(session: &Session) -> ByName {
 /// created them so far: the applied counts, each read once, and the
 /// batch's.
 #[derive(Default)]
-pub(super) struct Counts {
+pub(crate) struct Counts {
     live: Option<u64>,
     keys: BTreeMap<[u8; 32], u64>,
 }
@@ -83,7 +83,7 @@ impl Counts {
     }
 
     /// A new session of `key`, which [`Counts::full`] let through.
-    pub(super) fn add(&mut self, key: &[u8; 32]) {
+    pub(crate) fn add(&mut self, key: &[u8; 32]) {
         *self.live.as_mut().expect("the live count") += 1;
         *self.keys.get_mut(key).expect("the key's count") += 1;
     }
@@ -106,7 +106,7 @@ fn held(base: &Base, session: &Session) -> Result<Held, Corrupt> {
 /// names the session, and the session before the step, or the code that
 /// refuses the step. A session the step would create must fit the caps;
 /// it counts toward them once the step is in the result ([`Counts::add`]).
-pub(super) fn admit(
+pub(crate) fn admit(
     base: &Base,
     sessions: &BTreeMap<ByName, Held>,
     counts: &mut Counts,

@@ -16,7 +16,7 @@ use vos_node::client::{ClientError, Operator};
 use vos_node::{ADMIN_TOKEN, Config, NODE_KEY, Node, Space};
 use vos_wire::Decode;
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal};
-use vos_wire::ingress::{Answer, Install};
+use vos_wire::ingress::{Install, Response};
 use vos_wire::records::Derivation;
 use vos_wire::result::Outcome;
 use vos_wire::schema::Schema;
@@ -180,11 +180,11 @@ impl AgentCommand {
                 .create_agent(replicas)
                 .map_err(failed)?
             {
-                Answer::Created(agent) => {
+                Response::Created(agent) => {
                     println!("{}", agent.0);
                     Ok(())
                 }
-                Answer::Unconfirmed(agent) => {
+                Response::Unconfirmed(agent) => {
                     println!("{}", agent.0);
                     eprintln!("vos: a majority of its replicas does not hold it yet");
                     Ok(())
@@ -203,12 +203,12 @@ impl AgentCommand {
                 .replace(AgentId(agent), remove, add)
                 .map_err(failed)?
             {
-                Answer::Placed(replicas) => {
+                Response::Placed(replicas) => {
                     let replicas: Vec<String> = replicas.iter().map(u8::to_string).collect();
                     println!("{}", replicas.join(","));
                     Ok(())
                 }
-                Answer::TimedOut => {
+                Response::TimedOut => {
                     Err("not committed in time: the agent's leader goes on with the change".into())
                 }
                 other => Err(format!("{other:?}")),
@@ -241,7 +241,7 @@ impl InstallArgs {
         let answer = operator_of(&self.operator)?
             .install(AgentId(self.agent), &install)
             .map_err(failed)?;
-        let Answer::Ran {
+        let Response::Ran {
             outcome: Outcome::Done(reply),
             ..
         } = &answer

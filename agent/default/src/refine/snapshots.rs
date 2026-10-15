@@ -37,7 +37,7 @@ const MAX_STORED: usize = lz4_flex::block::get_maximum_output_size(PAGE);
 
 /// How the page section, and a VOS node's page rows, hold a page.
 #[derive(Clone, Copy)]
-pub(super) enum Format {
+pub(crate) enum Format {
     /// LZ4-compressed, as a VOS node's rows keep it.
     Compressed,
     /// Whole, as JAM exports it.
@@ -47,7 +47,7 @@ pub(super) enum Format {
 impl Format {
     /// A page held in this format, read into `page`: false when it is not
     /// a whole page.
-    pub(super) fn unpack(self, held: &[u8], page: &mut [u8; PAGE]) -> bool {
+    pub(crate) fn unpack(self, held: &[u8], page: &mut [u8; PAGE]) -> bool {
         match self {
             Format::Compressed => {
                 matches!(lz4_flex::block::decompress_into(held, page), Ok(PAGE))
@@ -90,7 +90,7 @@ impl Format {
 /// page row gone or not matching its hash is data the agent lost: the
 /// refine stops ([`lost`]).
 #[inline(never)]
-pub(super) fn restore(
+pub(crate) fn restore(
     base: &Base,
     id: WorkflowId,
     workflow: &Workflow,
@@ -132,10 +132,10 @@ pub(super) fn restore(
 /// A paused step's pages: the entries its run lists, where in the section
 /// lie the LZ4 bytes of those it stores, and the pages the workflow holds
 /// now.
-pub(super) struct Captured {
-    pub(super) pages: Vec<Page>,
-    pub(super) stored: Vec<Range<usize>>,
-    pub(super) held: Vec<(u32, [u8; 32])>,
+pub(crate) struct Captured {
+    pub(crate) pages: Vec<Page>,
+    pub(crate) stored: Vec<Range<usize>>,
+    pub(crate) held: Vec<(u32, [u8; 32])>,
 }
 
 /// The pages a paused step wrote, against those the workflow held, each it
@@ -144,7 +144,7 @@ pub(super) struct Captured {
 /// step fails, its pages dropped from the section; past the section's cap,
 /// the batch cannot take the step, which waits.
 #[inline(never)]
-pub(super) fn capture(
+pub(crate) fn capture(
     base: &Base,
     machine: &Machine,
     program: &ProgramHash,

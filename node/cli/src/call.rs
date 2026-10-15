@@ -10,7 +10,7 @@ use vos_node::client::{Client, ClientError};
 use vos_wire::Encode;
 use vos_wire::abi::Refusal;
 use vos_wire::ids::{AgentId, InstanceId, WorkflowId};
-use vos_wire::ingress::{Answer, Consistency, WorkflowStatus};
+use vos_wire::ingress::{Consistency, Response, WorkflowStatus};
 use vos_wire::result::Outcome;
 
 use crate::args::{CallArgs, NodeArgs, WorkflowArgs};
@@ -93,7 +93,10 @@ pub fn invoke(call: &CallArgs, query: Option<bool>) -> Result<(), String> {
             Err(_) => true,
             Ok(answer) => matches!(
                 answer,
-                Answer::Stopped | Answer::NotLeader { .. } | Answer::Unavailable | Answer::TimedOut
+                Response::Stopped
+                    | Response::NotLeader { .. }
+                    | Response::Unavailable
+                    | Response::TimedOut
             ),
         };
         if unanswered {
@@ -117,27 +120,27 @@ pub fn invoke(call: &CallArgs, query: Option<bool>) -> Result<(), String> {
 
 /// What an answer says: a call that ran, done or failed, or the workflow
 /// it started, as printed; any other answer as an error.
-pub fn said(answer: &Answer) -> Result<String, String> {
+pub fn said(answer: &Response) -> Result<String, String> {
     match answer {
-        Answer::Ran {
+        Response::Ran {
             outcome: Outcome::Done(reply),
             ..
         } => Ok(format!("done {}", hex::encode(reply))),
-        Answer::Ran {
+        Response::Ran {
             outcome: Outcome::Failed { code, detail },
             ..
         } => Ok(format!("failed {} {}", code.code(), hex::encode(detail))),
-        Answer::Ran {
+        Response::Ran {
             outcome: Outcome::Started(workflow),
             ..
         } => Ok(format!("started {}", workflow.0)),
-        Answer::Refused(Refusal::SessionsFull) => {
+        Response::Refused(Refusal::SessionsFull) => {
             Err("refused: the agent holds as many sessions as it may; try again later".into())
         }
-        Answer::Refused(Refusal::KeySessionsFull) => {
+        Response::Refused(Refusal::KeySessionsFull) => {
             Err("refused: this key holds as many sessions at the agent as it may".into())
         }
-        Answer::Refused(code) => Err(format!("refused {}", code.code())),
+        Response::Refused(code) => Err(format!("refused {}", code.code())),
         other => Err(format!("{other:?}")),
     }
 }
@@ -159,7 +162,7 @@ pub fn read_workflow(read: &WorkflowArgs) -> Result<(), String> {
     let answer = client.workflow_with(agent, WorkflowId(read.id), wait, consistency);
     keep(&client, kept, &read.key)?;
     let status = match answer.map_err(failed)? {
-        Answer::Workflow { status, .. } => status,
+        Response::Workflow { status, .. } => status,
         other => return Err(said(&other).err().unwrap_or_else(|| format!("{other:?}"))),
     };
     let line = match status {
@@ -174,22 +177,22 @@ pub fn read_workflow(read: &WorkflowArgs) -> Result<(), String> {
             format!("awaiting {} until {deadline}", agent.0)
         }
         WorkflowStatus::Sleeping { until } => format!("sleeping until {until}"),
-        WorkflowStatus::Ended(outcome) => said(&Answer::Ran { outcome, at: 0 })?,
+        WorkflowStatus::Ended(outcome) => said(&Response::Ran { outcome, at: 0 })?,
     };
     println!("{line}");
     Ok(())
 }
 
-pub fn print_answer(answer: &Answer) -> Result<(), String> {
+pub fn print_answer(answer: &Response) -> Result<(), String> {
     println!("{}", said(answer)?);
     Ok(())
 }
 
 /// An install's or a role's answer. Each overwrites what it sets, so one
 /// that timed out is safe to send again.
-pub fn print_admin_answer(answer: &Answer) -> Result<(), String> {
+pub fn print_admin_answer(answer: &Response) -> Result<(), String> {
     match answer {
-        Answer::TimedOut => {
+        Response::TimedOut => {
             Err("no answer in time: it may have run, or may yet; sending it again is safe".into())
         }
         other => print_answer(other),

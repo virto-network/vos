@@ -19,7 +19,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use vos_node::client::post_within;
 use vos_wire::ids::{AgentId, InstanceId, MethodId, WorkflowId};
 use vos_wire::ingress::{
-    Answer, Consistency, Install, Rejection, WORKFLOW_READ_HORIZON_MS, WorkflowRead,
+    Consistency, Install, Rejection, Response, WORKFLOW_READ_HORIZON_MS, WorkflowRead,
     WorkflowStatus, workflow_message, workflow_read_horizon,
 };
 use vos_wire::peer::NodeNumber;
@@ -367,11 +367,11 @@ impl Client {
             let not_after = nodes.time() + signed_for(wait);
             let body = signed_read(&self.identity, &key, not_after, consistency, workflow, wait);
             match post_within(nodes.target(at), &path, &body, crate::ATTEMPT + READ_WAIT) {
-                Ok(Answer::Workflow {
+                Ok(Response::Workflow {
                     status: WorkflowStatus::Ended(outcome),
                     ..
                 }) => break outcome,
-                Ok(Answer::Workflow {
+                Ok(Response::Workflow {
                     status: WorkflowStatus::Unknown,
                     ..
                 }) => panic!(
@@ -380,18 +380,18 @@ impl Client {
                     workflow.0,
                     nodes.report(self.agent)
                 ),
-                Ok(Answer::Workflow { at: read_at, .. }) => {
+                Ok(Response::Workflow { at: read_at, .. }) => {
                     nodes.log().saw("tour read before its end");
                     floor = floor.max(read_at);
                 }
                 Ok(
-                    Answer::Rejected(Rejection::Behind | Rejection::StaleQuery { .. })
-                    | Answer::TimedOut
-                    | Answer::Stopped
-                    | Answer::Unavailable
-                    | Answer::Busy
-                    | Answer::NotLeader { .. }
-                    | Answer::Elsewhere { .. },
+                    Response::Rejected(Rejection::Behind | Rejection::StaleQuery { .. })
+                    | Response::TimedOut
+                    | Response::Stopped
+                    | Response::Unavailable
+                    | Response::Busy
+                    | Response::NotLeader { .. }
+                    | Response::Elsewhere { .. },
                 )
                 | Err(_) => {
                     nodes.log().saw("tour read unanswered");
@@ -417,7 +417,7 @@ impl Client {
                 workflow,
                 0,
             );
-            if let Ok(Answer::Workflow { status, .. }) =
+            if let Ok(Response::Workflow { status, .. }) =
                 post_within(nodes.target(at), &path, &body, crate::ATTEMPT)
             {
                 assert_eq!(

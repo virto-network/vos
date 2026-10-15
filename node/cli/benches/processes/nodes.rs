@@ -12,7 +12,7 @@ use vos_checker::spaces::{free_tcp_port, free_udp_port};
 use vos_node::client::{Operator, Target};
 use vos_node::tls::Trust;
 use vos_wire::ids::AgentId;
-use vos_wire::ingress::{Answer, Install};
+use vos_wire::ingress::{Install, Response};
 
 use crate::{COUNTER, NODES};
 
@@ -387,9 +387,9 @@ impl Space {
     /// An operator's command, at whichever node takes it.
     fn operate(
         &self,
-        command: impl Fn(&Operator) -> Answer,
-        taken: impl Fn(&Answer) -> bool,
-    ) -> Answer {
+        command: impl Fn(&Operator) -> Response,
+        taken: impl Fn(&Response) -> bool,
+    ) -> Response {
         let until = Instant::now() + Duration::from_secs(60);
         loop {
             for process in &self.processes {
@@ -406,13 +406,13 @@ impl Space {
     /// An agent on every node.
     pub fn create_agent(&self) -> AgentId {
         let every: Vec<u8> = (1..=NODES as u8).collect();
-        let Answer::Created(agent) = self.operate(
+        let Response::Created(agent) = self.operate(
             |operator| {
                 operator
                     .create_agent(every.clone())
-                    .unwrap_or(Answer::Unavailable)
+                    .unwrap_or(Response::Unavailable)
             },
-            |answer| matches!(answer, Answer::Created(_)),
+            |answer| matches!(answer, Response::Created(_)),
         ) else {
             unreachable!()
         };
@@ -431,9 +431,9 @@ impl Space {
             |operator| {
                 operator
                     .install(agent, &install)
-                    .unwrap_or(Answer::Unavailable)
+                    .unwrap_or(Response::Unavailable)
             },
-            |answer| matches!(answer, Answer::Ran { .. }),
+            |answer| matches!(answer, Response::Ran { .. }),
         );
         agent
     }
@@ -443,7 +443,7 @@ impl Space {
         let until = Instant::now() + Duration::from_secs(30);
         loop {
             if let Some(at) = self.processes.iter().position(|process| {
-                matches!(process.operator().status(agent), Ok(Answer::Status(status)) if status.leads)
+                matches!(process.operator().status(agent), Ok(Response::Status(status)) if status.leads)
             }) {
                 return at;
             }
@@ -484,7 +484,7 @@ impl Cpu {
         let mut stages: Vec<(String, Vec<u64>)> = Vec::new();
         let mut totals: Vec<(String, u64)> = Vec::new();
         for process in &space.processes {
-            if let Ok(Answer::Stats(stats)) = process.operator().stats() {
+            if let Ok(Response::Stats(stats)) = process.operator().stats() {
                 for stage in stats.stages {
                     match totals.iter_mut().find(|(name, _)| *name == stage.name) {
                         Some((_, total)) => *total = total.wrapping_add(stage.total),

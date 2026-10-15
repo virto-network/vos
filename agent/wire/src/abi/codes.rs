@@ -61,8 +61,8 @@ macro_rules! codes {
 
 codes! {
     /// Why a step failed, in [`crate::result::Outcome::Failed`], or why a
-    /// call returned an error, in φ8 of `CALL` and `ATTEST`. A failed step
-    /// consumes its input.
+    /// call returned an error, in φ8 of [`super::Op::Call`] and
+    /// [`super::Op::Attest`]. A failed step consumes its input.
     pub enum Failure {
         /// The handler failed; the detail is its encoded error.
         Handler = 1,

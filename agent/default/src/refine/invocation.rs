@@ -8,8 +8,8 @@ mod memory;
 mod scan;
 mod units;
 
-pub(super) use ended::{Ended, Pause};
-pub(super) use units::Share;
+pub(crate) use ended::{Ended, Pause};
+pub(crate) use units::Share;
 
 use alloc::collections::BTreeMap;
 use alloc::rc::Rc;
@@ -35,33 +35,33 @@ use memory::{copy_out, read, read_key, row, window, write};
 const MAX_DEPTH: usize = 63;
 
 /// One step: its overlays, call stack and effects.
-pub(super) struct Invocation<'a> {
+pub(crate) struct Invocation<'a> {
     base: &'a Base,
     step: u32,
     entry: Kind,
     /// A workflow's step: the workflow, and the counter its next await
     /// takes.
-    pub(super) awaits: Option<Await>,
+    pub(crate) awaits: Option<Await>,
     /// The pages of the workflow's machine the meter has taken.
     pages_paid: usize,
     /// A workflow's section on its instance's state is open.
     section: bool,
     /// The step overlay, then one per nested call.
-    pub(super) frames: Vec<Overlay>,
+    pub(crate) frames: Vec<Overlay>,
     stack: Vec<InstanceId>,
     /// Gas the callees of each invocation on the stack used.
     nested: Vec<u64>,
-    pub(super) instances: Vec<InstanceGas>,
-    pub(super) messages: Vec<Outgoing>,
-    pub(super) attests: Vec<Attest>,
+    pub(crate) instances: Vec<InstanceGas>,
+    pub(crate) messages: Vec<Outgoing>,
+    pub(crate) attests: Vec<Attest>,
     /// The bytes of state the step has written, against its cap.
     write_bytes: usize,
     draws: u64,
-    pub(super) gas_used: u64,
+    pub(crate) gas_used: u64,
 }
 
 impl<'a> Invocation<'a> {
-    pub(super) fn new(base: &'a Base, step: u32, entry: Kind) -> Self {
+    pub(crate) fn new(base: &'a Base, step: u32, entry: Kind) -> Self {
         Self {
             base,
             step,
@@ -81,7 +81,7 @@ impl<'a> Invocation<'a> {
         }
     }
 
-    pub(super) fn top(&mut self, call: Call) -> Outcome {
+    pub(crate) fn top(&mut self, call: Call) -> Outcome {
         let Call {
             instance,
             method,

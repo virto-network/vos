@@ -63,7 +63,7 @@ fn paid(base: &Base, id: WorkflowId) -> Result<Option<(Workflow, u64)>, Failure>
 /// deadline. A reply for an await that is gone or past, or from another
 /// agent, resumes none, and is consumed and dropped: the deadline's step
 /// answers the await.
-pub(super) fn resumed(
+pub(crate) fn resumed(
     base: &Base,
     from: AgentId,
     awaiting: &Await,
@@ -81,7 +81,7 @@ pub(super) fn resumed(
 /// when the step could never run in a batch of this budget: behind a
 /// sweep, its record of `bytes` read, with room for a page past what a
 /// sweep's due steps leave the batch's inputs ([`Floor`]).
-pub(super) fn kept(base: &Base, workflow: &Workflow, bytes: u64) -> Option<(u64, u64)> {
+pub(crate) fn kept(base: &Base, workflow: &Workflow, bytes: u64) -> Option<(u64, u64)> {
     let held = workflow
         .snapshot
         .as_ref()
@@ -105,14 +105,14 @@ pub(super) fn kept(base: &Base, workflow: &Workflow, bytes: u64) -> Option<(u64,
 /// past the head's own keep for the inputs, below the head's pages and
 /// every later due step. A due step that cannot run above it waits, and
 /// the sweep's rows after it with it, for the next sweep.
-pub(super) enum Floor {
+pub(crate) enum Floor {
     None,
     Head,
     At(u64),
 }
 
 impl Floor {
-    pub(super) fn new(with_inputs: bool) -> Self {
+    pub(crate) fn new(with_inputs: bool) -> Self {
         if with_inputs { Floor::Head } else { Floor::None }
     }
 
@@ -138,7 +138,7 @@ impl Floor {
 
 /// Whether `method` of `instance` is a workflow, which a request or a
 /// call starts instead of running.
-pub(super) fn is_start(base: &Base, instance: InstanceId, method: MethodId) -> bool {
+pub(crate) fn is_start(base: &Base, instance: InstanceId, method: MethodId) -> bool {
     matches!(
         base.installed(instance),
         Ok(Some(installed)) if installed
@@ -195,7 +195,7 @@ fn writable(header: &vos_pvm_program::StandardHeader) -> Option<u64> {
 /// caller, its owner: the workflow recorded, due at once, its program pinned, and the step
 /// answered `Started` with its id; or failed, as a handler's step that
 /// could not run fails.
-pub(super) fn start(base: &Base, input: InputRef, call: Call) -> (Run, Option<WorkflowId>) {
+pub(crate) fn start(base: &Base, input: InputRef, call: Call) -> (Run, Option<WorkflowId>) {
     match started(base, call) {
         Ok((id, rows)) => {
             let mut run = consumed(input, Outcome::Started(id));
@@ -268,7 +268,7 @@ fn started(base: &Base, call: Call) -> Result<(WorkflowId, Overlay), Failure> {
 /// collection. False when it waits, its row due still, for a later batch,
 /// as the sweep's rows after it do. A row whose workflow is gone, or whose
 /// record lies elsewhere, is deleted.
-pub(super) fn due(
+pub(crate) fn due(
     base: &mut Base,
     batched: &mut Batched,
     at: u64,
@@ -348,7 +348,7 @@ fn collect(input: InputRef, id: WorkflowId, workflow: &Workflow) -> Run {
 /// A wait from agent `from` for the result of workflow `id`, at its await
 /// `awaiting`: answered with the result once the workflow ends, at once if
 /// it has; only its owner may wait, any other is answered `Unknown`.
-pub(super) fn wait(
+pub(crate) fn wait(
     base: &Base,
     input: InputRef,
     from: AgentId,
@@ -404,7 +404,7 @@ enum Left {
 /// for the batch's inputs: run, or, when it could never run in a batch of
 /// this budget, failed at once with [`Failure::Cap`].
 #[allow(clippy::too_many_arguments)]
-pub(super) fn resume_step(
+pub(crate) fn resume_step(
     base: &Base,
     index: u32,
     input: InputRef,

@@ -13,10 +13,10 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
-use vos_tree::{Blake2b, Hash, Witness as PartialTree, salt, value_hash};
+use vos_tree::{Blake2b, Hash, PartialTree, salt, value_hash};
 use vos_wire::apply::{Host, State, apply};
 use vos_wire::ids::{AgentId, WorkflowId};
-use vos_wire::package::{JamOutput, Opened, Package, Range, SEGMENT, StateWitness};
+use vos_wire::package::{JamOutput, Opened, Package, ScannedRange, SEGMENT, StateWitness};
 use vos_wire::result::{PAGE, WorkResult, digest};
 use vos_wire::{Decode, Encode};
 
@@ -25,11 +25,11 @@ use super::batch::run_batch;
 use crate::host::{StateRows, export, fetch_import};
 
 /// A package's witness, verified against its root.
-pub(super) struct Witnessed {
+pub(crate) struct Witnessed {
     /// The keys it opens, in strictly increasing order.
     keys: Vec<(Vec<u8>, Opened)>,
     /// The ranges it shows complete, in key order and disjoint.
-    ranges: Vec<Range>,
+    ranges: Vec<ScannedRange>,
     /// The tree its keys' paths open, for the root after.
     tree: PartialTree,
     /// The import that holds each page, by its workflow and index.
@@ -92,7 +92,7 @@ impl Witnessed {
 
     /// A row as stored; `None` when absent. Traps when the witness does
     /// not open it to be read.
-    pub(super) fn read(&self, key: &[u8]) -> Option<&[u8]> {
+    pub(crate) fn read(&self, key: &[u8]) -> Option<&[u8]> {
         let at = self
             .keys
             .binary_search_by(|(opened, _)| opened.as_slice().cmp(key))
@@ -108,7 +108,7 @@ impl Witnessed {
     /// empty, as a node's `state_scan` packs them into `capacity`: each
     /// whole, until the next does not fit; `None` when the first alone
     /// does not. Traps past what the witness's ranges cover.
-    pub(super) fn scan(&self, prefix: &[u8], after: &[u8], capacity: usize) -> Option<StateRows> {
+    pub(crate) fn scan(&self, prefix: &[u8], after: &[u8], capacity: usize) -> Option<StateRows> {
         let mut lower = prefix.to_vec();
         if !after.is_empty() {
             let past = vos_tree::keys::after(after);
@@ -155,7 +155,7 @@ impl Witnessed {
     /// when the package does not import it, or the import is no segment.
     /// The page's hash, which restoring it checks, covers what matters of
     /// the segment; its padding is not checked.
-    pub(super) fn import(&self, id: WorkflowId, index: u32, page: &mut [u8; PAGE]) -> bool {
+    pub(crate) fn import(&self, id: WorkflowId, index: u32, page: &mut [u8; PAGE]) -> bool {
         self.imports
             .get(&(id, index))
             .is_some_and(|&import| fetch_import(import, page) == Some(SEGMENT))
@@ -192,7 +192,7 @@ impl State for Applying<'_> {
 
 /// Refine a package: its batch's work result, applied to the witness, the
 /// root after, the pages and the result exported.
-pub(super) fn run(agent: AgentId, package: Package) -> Vec<u8> {
+pub(crate) fn run(agent: AgentId, package: Package) -> Vec<u8> {
     let Package {
         batch,
         root,

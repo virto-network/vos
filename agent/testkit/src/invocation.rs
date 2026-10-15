@@ -53,11 +53,11 @@ pub(crate) enum Ended {
 }
 
 /// One step's execution: the overlays, the call stack and the effects.
-pub(crate) struct Run<'a> {
+pub(crate) struct Invocation<'a> {
     pub(crate) kit: &'a Testkit,
     step: u32,
     /// The entry's kind: queries never write.
-    kind: Kind,
+    entry: Kind,
     /// A workflow's step: the workflow and its next await's counter.
     pub(crate) awaits: Option<Await>,
     /// A workflow's section on its instance's state is open.
@@ -72,17 +72,18 @@ pub(crate) struct Run<'a> {
     pub(crate) instances: Vec<InstanceGas>,
     pub(crate) messages: Vec<Outgoing>,
     pub(crate) attests: Vec<Attest>,
-    written: usize,
+    /// The bytes of state the step has written, against its cap.
+    write_bytes: usize,
     draws: u64,
     pub(crate) gas_used: u64,
 }
 
-impl<'a> Run<'a> {
-    pub(crate) fn new(kit: &'a Testkit, step: u32, kind: Kind) -> Self {
+impl<'a> Invocation<'a> {
+    pub(crate) fn new(kit: &'a Testkit, step: u32, entry: Kind) -> Self {
         Self {
             kit,
             step,
-            kind,
+            entry,
             awaits: None,
             section: false,
             frames: vec![BTreeMap::new()],
@@ -91,7 +92,7 @@ impl<'a> Run<'a> {
             instances: Vec::new(),
             messages: Vec::new(),
             attests: Vec::new(),
-            written: 0,
+            write_bytes: 0,
             draws: 0,
             gas_used: 0,
         }
@@ -110,7 +111,7 @@ impl<'a> Run<'a> {
         }
         let installed = self.kit.instances.get(&instance).ok_or(Failure::Unknown)?;
         let schema = installed.schema.method(method).ok_or(Failure::Unknown)?;
-        if !schema.kind.is_handler() || (self.kind == Kind::Query && schema.kind != Kind::Query) {
+        if !schema.kind.is_handler() || (self.entry == Kind::Query && schema.kind != Kind::Query) {
             return Err(Failure::Unknown);
         }
         let gas = schema.gas_limit();
@@ -159,7 +160,7 @@ impl<'a> Run<'a> {
             return Err((Failure::Cycle, 0));
         }
         // A workflow's own machine is on no stack, but counts as one.
-        let depth = self.stack.len() + usize::from(self.kind == Kind::Workflow);
+        let depth = self.stack.len() + usize::from(self.entry == Kind::Workflow);
         if depth >= MAX_DEPTH {
             return Err((Failure::Depth, 0));
         }
@@ -298,8 +299,8 @@ impl<'a> Run<'a> {
                 } else {
                     None
                 };
-                self.written += key.len() + value.as_ref().map_or(0, Vec::len);
-                if self.written > cap::STEP_WRITES {
+                self.write_bytes += key.len() + value.as_ref().map_or(0, Vec::len);
+                if self.write_bytes > cap::STEP_WRITES {
                     return Err(Failure::Cap);
                 }
                 self.frames.last_mut().expect("a frame").insert(key, value);
@@ -361,7 +362,7 @@ impl<'a> Run<'a> {
                 // its frame, and its messages, attests and share of the
                 // step's write cap here. Random draws are not effects: they
                 // keep counting.
-                let effects = (self.messages.len(), self.attests.len(), self.written);
+                let effects = (self.messages.len(), self.attests.len(), self.write_bytes);
                 let gas = machine.gas_remaining();
                 let call = Call {
                     caller: Principal::Instance(instance),
@@ -391,7 +392,7 @@ impl<'a> Run<'a> {
                     let (messages, attests, written) = effects;
                     self.messages.truncate(messages);
                     self.attests.truncate(attests);
-                    self.written = written;
+                    self.write_bytes = written;
                 }
                 copy_out(machine, &bytes, r[11], 0, r[12])?;
                 machine.registers_mut()[7] = bytes.len() as u64;

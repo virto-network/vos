@@ -22,7 +22,7 @@ use vos_checker::wait_until;
 use vos_checker::workflows::{ASKED, ROUNDS, Rounds, TOLD, Tour};
 use vos_node::client::Client;
 use vos_wire::ids::{AgentId, InstanceId};
-use vos_wire::ingress::{Answer, Consistency, WorkflowStatus};
+use vos_wire::ingress::{Consistency, Response, WorkflowStatus};
 use vos_wire::records::unstored;
 use vos_wire::result::Outcome;
 use vos_wire::{Decode, Encode, keys};
@@ -140,7 +140,7 @@ fn three_processes_apply_every_call_once_through_a_kill() {
             );
             let path = format!("/agents/{}/queries", agent.0);
             let (_, body) = vos_node::client::post(space.target(number), &path, &query).ok()?;
-            let (answer, _) = Answer::decode(&body).ok()?;
+            let (answer, _) = Response::decode(&body).ok()?;
             answer.total()
         };
         wait_until("every node converges", PROCESS_WAIT, || {
@@ -196,7 +196,7 @@ fn a_workflow_mid_await_completes_once_through_a_kill_and_a_partition() {
     let started = client
         .call(touring, ROUNDS, methods.tour, &tour.arguments())
         .unwrap();
-    let Answer::Ran {
+    let Response::Ran {
         outcome: Outcome::Started(workflow),
         ..
     } = started
@@ -206,7 +206,7 @@ fn a_workflow_mid_await_completes_once_through_a_kill_and_a_partition() {
     wait_until("the tour awaits the cut off agent", PROCESS_WAIT, || {
         matches!(
             client.workflow(touring, workflow, Duration::ZERO),
-            Ok(Answer::Workflow {
+            Ok(Response::Workflow {
                 status: WorkflowStatus::Awaiting { agent, .. },
                 ..
             }) if agent == asked
@@ -221,7 +221,7 @@ fn a_workflow_mid_await_completes_once_through_a_kill_and_a_partition() {
     let mut ended = None;
     wait_until("the tour ends", PROCESS_WAIT, || {
         ended = match client.workflow(touring, workflow, Duration::from_secs(5)) {
-            Ok(Answer::Workflow {
+            Ok(Response::Workflow {
                 status: WorkflowStatus::Ended(outcome),
                 ..
             }) => Some(outcome),
@@ -249,8 +249,8 @@ fn a_workflow_mid_await_completes_once_through_a_kill_and_a_partition() {
         );
         let path = format!("/agents/{}/queries", agent.0);
         let (_, body) = vos_node::client::post(space.target(number), &path, &query).ok()?;
-        match Answer::decode(&body).ok()?.0 {
-            Answer::Ran {
+        match Response::decode(&body).ok()?.0 {
+            Response::Ran {
                 outcome: Outcome::Done(tallies),
                 ..
             } => <Vec<(u64, u64)>>::decode(&tallies)

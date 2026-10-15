@@ -3,17 +3,17 @@
 use crate::{Hash, MAX_KEY, Salt};
 
 /// The tag of a key's hash: the hashed and private transforms.
-pub const TAG_KEY: &[u8] = b"vos/tree/key";
+pub(crate) const TAG_KEY: &[u8] = b"vos/tree/key";
 /// The tag of a leaf.
-pub const TAG_LEAF: &[u8] = b"vos/tree/leaf";
+pub(crate) const TAG_LEAF: &[u8] = b"vos/tree/leaf";
 /// The tag of a branch.
-pub const TAG_BRANCH: &[u8] = b"vos/tree/branch";
+pub(crate) const TAG_BRANCH: &[u8] = b"vos/tree/branch";
 /// The tag of the empty tree's root.
-pub const TAG_EMPTY: &[u8] = b"vos/tree/empty";
+pub(crate) const TAG_EMPTY: &[u8] = b"vos/tree/empty";
 /// The tag of a salt.
-pub const TAG_SALT: &[u8] = b"vos/tree/salt";
+pub(crate) const TAG_SALT: &[u8] = b"vos/tree/salt";
 /// The tag of a value's commitment.
-pub const TAG_VALUE: &[u8] = b"vos/tree/value";
+pub(crate) const TAG_VALUE: &[u8] = b"vos/tree/value";
 
 /// BLAKE2b-256, as the host provides it.
 pub trait Hasher {

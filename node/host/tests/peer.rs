@@ -12,7 +12,7 @@ use vos_raft::core::{Action, Core, Recovered, Write};
 use vos_raft::{AppendResult, Config, LogEntry, Message, Role};
 use vos_wire::Encode;
 use vos_wire::ids::{AgentId, InstanceId, MethodId, ProgramHash, Session};
-use vos_wire::ingress::{Answer, Call};
+use vos_wire::ingress::{Call, Response};
 use vos_wire::peer::{
     Configuration, CreationRecord, Leading, Manifest, NodeNumber, PeerMessage, Placement, Raft,
     SnapshotAck, SnapshotChunk,
@@ -223,7 +223,7 @@ fn every_other_message_survives_the_wire() {
             agent: AGENT,
             token: 77,
             term: 6,
-            answer: Answer::Ran {
+            answer: Response::Ran {
                 outcome: Outcome::Done(vec![1, 2]),
                 at: 40,
             },

@@ -27,7 +27,7 @@ use vos_wire::records::versioned;
 use vos_wire::result::{Attest, CommittedWrite, InstanceGas, Outcome, Outgoing, Page, Write};
 use vos_wire::schema::{Schema, SchemaError};
 
-use invocation::{Call, Run};
+use invocation::{Call, Invocation};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InstallError {
@@ -271,18 +271,19 @@ impl Testkit {
         }
         let step = self.steps;
         self.steps += 1;
-        let mut run = Run::new(self, step, Kind::Command);
-        let result = run.top(call);
-        let gas_used = run.gas_used;
-        let instances = run.instances.clone();
+        let mut invocation = Invocation::new(self, step, Kind::Command);
+        let result = invocation.top(call);
+        let gas_used = invocation.gas_used;
+        let instances = invocation.instances.clone();
         let outcome = result.unwrap_or_else(Outcome::failed);
         let mut step = Step::consumed(outcome);
         step.instances = instances;
         step.gas_used = gas_used;
         if let Outcome::Done(_) = step.outcome {
-            step.messages = std::mem::take(&mut run.messages);
-            step.attests = std::mem::take(&mut run.attests);
-            (step.writes, step.committed) = split(run.frames.pop().expect("the step overlay"));
+            step.messages = std::mem::take(&mut invocation.messages);
+            step.attests = std::mem::take(&mut invocation.attests);
+            (step.writes, step.committed) =
+                split_writes(invocation.frames.pop().expect("the step overlay"));
             self.apply(&step, Vec::new());
         }
         step
@@ -340,15 +341,12 @@ impl Testkit {
                 awaiting,
             } => {
                 let mut step = self.command(Principal::Agent(from), *instance, *method, arguments);
-                if let Some(awaiting) = awaiting {
-                    let answer = step.outcome.clone().into();
-                    step.messages.push(Outgoing::reply(from, *awaiting, answer));
-                }
+                answer(&mut step, from, *awaiting);
                 step
             }
             Body::Reply { awaiting, answer } => match self.resume(from, awaiting, answer) {
                 Some(step) => step,
-                None => self.consumed(Outcome::Done(Vec::new()), None),
+                None => self.consumed(Outcome::Done(Vec::new())),
             },
             Body::Wait { workflow, awaiting } => self.wait(from, *workflow, *awaiting),
         }
@@ -358,22 +356,15 @@ impl Testkit {
     /// refine: consumed as failed without running, and answered when it
     /// awaits.
     pub fn failed(&mut self, from: AgentId, awaiting: Option<Await>) -> Step {
-        let outcome = Outcome::failed(Failure::InRefine);
-        self.consumed(outcome, awaiting.map(|awaiting| (from, awaiting)))
+        let mut step = self.consumed(Outcome::failed(Failure::InRefine));
+        answer(&mut step, from, awaiting);
+        step
     }
 
-    /// A step that runs nothing: `outcome`, and the reply to the request
-    /// awaiting, if any.
-    fn consumed(&mut self, outcome: Outcome, awaiting: Option<(AgentId, Await)>) -> Step {
+    /// A step that runs nothing: `outcome`.
+    fn consumed(&mut self, outcome: Outcome) -> Step {
         self.steps += 1;
-        let messages = awaiting
-            .map(|(from, awaiting)| Outgoing::reply(from, awaiting, outcome.clone().into()))
-            .into_iter()
-            .collect();
-        Step {
-            messages,
-            ..Step::consumed(outcome)
-        }
+        Step::consumed(outcome)
     }
 
     /// Run a query: a `&self` handler on applied state, outside the log.
@@ -384,20 +375,30 @@ impl Testkit {
         method: MethodId,
         arguments: &[u8],
     ) -> Outcome {
-        let mut run = Run::new(self, self.steps, Kind::Query);
-        run.top(Call {
-            caller,
-            instance,
-            method,
-            arguments,
-        })
-        .unwrap_or_else(Outcome::failed)
+        let mut invocation = Invocation::new(self, self.steps, Kind::Query);
+        invocation
+            .top(Call {
+                caller,
+                instance,
+                method,
+                arguments,
+            })
+            .unwrap_or_else(Outcome::failed)
+    }
+}
+
+/// Add the reply to agent `to`'s request awaiting at `awaiting`, if any,
+/// after `step`'s own messages: the step's outcome.
+fn answer(step: &mut Step, to: AgentId, awaiting: Option<Await>) {
+    if let Some(awaiting) = awaiting {
+        let answer = step.outcome.clone().into();
+        step.messages.push(Outgoing::reply(to, awaiting, answer));
     }
 }
 
 /// A step's writes, those to committed maps apart, by map and transformed
 /// key.
-fn split(overlay: BTreeMap<Vec<u8>, Option<Vec<u8>>>) -> (Vec<Write>, Vec<CommittedWrite>) {
+fn split_writes(overlay: BTreeMap<Vec<u8>, Option<Vec<u8>>>) -> (Vec<Write>, Vec<CommittedWrite>) {
     let mut writes = Vec::new();
     let mut committed = Vec::new();
     for (key, value) in overlay {

@@ -16,7 +16,7 @@ use vos_node::client::{Client, Operator, Target};
 use vos_node::tls::Trust;
 use vos_wire::Encode;
 use vos_wire::ids::{AgentId, InstanceId, MethodId};
-use vos_wire::ingress::{Answer, Install, ReplicaStatus};
+use vos_wire::ingress::{Install, ReplicaStatus, Response};
 use vos_wire::peer::NodeNumber;
 
 use crate::calls::Total;
@@ -544,7 +544,7 @@ impl Processes {
             return None;
         }
         match self.operator(number).status(agent) {
-            Ok(Answer::Status(status)) => Some(status),
+            Ok(Response::Status(status)) => Some(status),
             _ => None,
         }
     }
@@ -616,9 +616,9 @@ impl Processes {
     /// answer, once one is `accepted`.
     pub fn operate(
         &self,
-        command: impl Fn(&Operator) -> Answer,
-        accepted: impl Fn(&Answer) -> bool,
-    ) -> Answer {
+        command: impl Fn(&Operator) -> Response,
+        accepted: impl Fn(&Response) -> bool,
+    ) -> Response {
         let mut answer = None;
         wait_until("an operator's command is taken", PROCESS_WAIT, || {
             answer = (1..=self.count)
@@ -652,13 +652,13 @@ impl Processes {
     /// An agent created on `replicas`, with each of `installs` made, in
     /// order.
     pub fn agent_installing(&self, replicas: Vec<NodeNumber>, installs: &[Install]) -> AgentId {
-        let Answer::Created(agent) = self.operate(
+        let Response::Created(agent) = self.operate(
             |operator| {
                 operator
                     .create_agent(replicas.clone())
-                    .unwrap_or(Answer::Unavailable)
+                    .unwrap_or(Response::Unavailable)
             },
-            |answer| matches!(answer, Answer::Created(_)),
+            |answer| matches!(answer, Response::Created(_)),
         ) else {
             unreachable!()
         };
@@ -667,9 +667,9 @@ impl Processes {
                 |operator| {
                     operator
                         .install(agent, install)
-                        .unwrap_or(Answer::Unavailable)
+                        .unwrap_or(Response::Unavailable)
                 },
-                |answer| matches!(answer, Answer::Ran { .. }),
+                |answer| matches!(answer, Response::Ran { .. }),
             );
         }
         agent

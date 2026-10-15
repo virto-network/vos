@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use vos_net::Class;
 use vos_wire::Decode;
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal};
-use vos_wire::ingress::{Answer, Consistency, Rejection};
+use vos_wire::ingress::{Consistency, Rejection, Response};
 use vos_wire::keys;
 use vos_wire::peer::{NodeNumber, PeerMessage};
 use vos_wire::records::{Installed, unstored};
@@ -46,7 +46,7 @@ impl Inner {
         method: MethodId,
         arguments: Vec<u8>,
         consistency: Consistency,
-    ) -> Answer {
+    ) -> Response {
         let Some(run) = self.run(agent) else {
             return answer_of(Err(self.absent(agent)));
         };
@@ -87,14 +87,14 @@ impl Inner {
         &self,
         run: &Run,
         through: u64,
-    ) -> Result<Snapshot, Answer> {
+    ) -> Result<Snapshot, Response> {
         let applied = run
             .shared
             .wait(|state| state.stopped || state.applied >= through.max(state.recovered));
         match timeout(FLOOR, applied).await {
-            Some(state) if state.stopped => Err(Answer::Stopped),
+            Some(state) if state.stopped => Err(Response::Stopped),
             Some(_) => Ok(self.store.snapshot()),
-            None => Err(Answer::Rejected(Rejection::Behind)),
+            None => Err(Response::Rejected(Rejection::Behind)),
         }
     }
 
@@ -104,7 +104,7 @@ impl Inner {
         self: &Arc<Self>,
         run: &Arc<Run>,
         agent: AgentId,
-    ) -> Result<Snapshot, Answer> {
+    ) -> Result<Snapshot, Response> {
         let index = self.read_index_of(run, agent).await?;
         self.snapshot_through(run, index).await
     }
@@ -115,17 +115,17 @@ impl Inner {
         self: &Arc<Self>,
         run: &Arc<Run>,
         agent: AgentId,
-    ) -> Result<u64, Answer> {
+    ) -> Result<u64, Response> {
         let until = Instant::now() + READING;
         let wait = self.reads.register(agent);
         loop {
             let left = until.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                return Err(Answer::TimedOut);
+                return Err(Response::TimedOut);
             }
             let state = run.shared.state();
             if state.stopped {
-                return Err(Answer::Stopped);
+                return Err(Response::Stopped);
             }
             let (leader, term) = (state.leader, state.term);
             let changed = |state: &crate::group::State| {
@@ -136,7 +136,7 @@ impl Inner {
             if leader == Some(self.number) {
                 match self.confirm(agent).await {
                     Ok(index) => return Ok(index),
-                    Err(CallError::Stopped) => return Err(Answer::Stopped),
+                    Err(CallError::Stopped) => return Err(Response::Stopped),
                     Err(_) => {
                         pause(run, PAUSE, until, changed).await;
                         continue;
@@ -204,9 +204,9 @@ pub(crate) enum Queried {
 }
 
 /// A query's answer to its client.
-fn answered(ran: Result<Queried, CallError>) -> Answer {
+fn answered(ran: Result<Queried, CallError>) -> Response {
     match ran {
-        Ok(Queried::Ran(outcome, at)) => Answer::Ran { outcome, at },
+        Ok(Queried::Ran(outcome, at)) => Response::Ran { outcome, at },
         Ok(Queried::Linearizable(_)) => unreachable!("a query past a read index runs"),
         Err(error) => answer_of(Err(error)),
     }

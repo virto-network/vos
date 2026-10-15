@@ -37,7 +37,7 @@ pub struct BatchProof {
 
 /// A proof's tree, opened and checked against a root. Updates rehash only
 /// the paths they change.
-pub struct Witness {
+pub struct PartialTree {
     tree: Partial,
 }
 
@@ -86,9 +86,9 @@ impl BatchProof {
         hasher: &H,
         root: &Hash,
         claims: &[(K, Option<Hash>)],
-    ) -> Result<Witness, Error> {
-        let witness = Witness::open(hasher, &self.entries, root)?;
-        let tree = &witness.tree;
+    ) -> Result<PartialTree, Error> {
+        let opened = PartialTree::open(hasher, &self.entries, root)?;
+        let tree = &opened.tree;
         for (key, value) in claims {
             let key = key.as_ref();
             if !valid_key(key) {
@@ -118,7 +118,7 @@ impl BatchProof {
                 return Err(Error::Claim);
             }
         }
-        Ok(witness)
+        Ok(opened)
     }
 
     /// The root after `writes` to the proven keys, from the proof alone.
@@ -127,22 +127,22 @@ impl BatchProof {
         hasher: &H,
         writes: &[(K, Option<Hash>)],
     ) -> Result<Hash, Error> {
-        Witness::unchecked(&self.entries)?.update(hasher, writes)
+        PartialTree::unchecked(&self.entries)?.update(hasher, writes)
     }
 }
 
-impl Witness {
+impl PartialTree {
     /// Open `entries` and check them against `root`.
     pub(crate) fn open<H: Hasher>(
         hasher: &H,
         entries: &[Entry],
         root: &Hash,
     ) -> Result<Self, Error> {
-        let mut witness = Self::unchecked(entries)?;
-        if witness.tree.rehash(hasher, None) != *root {
+        let mut opened = Self::unchecked(entries)?;
+        if opened.tree.rehash(hasher, None) != *root {
             return Err(Error::Root);
         }
-        Ok(witness)
+        Ok(opened)
     }
 
     /// Open `entries` as a pruned tree of the format, unhashed.
@@ -249,7 +249,7 @@ impl Witness {
     /// A put of an absent key needs the leaf its path reaches, or, in a
     /// range proof, the leaves around it. A delete lifts its leaf's sibling,
     /// perhaps closed, into its place, so a later update may find what it
-    /// needs closed. On an error the witness is left part-way and unusable.
+    /// needs closed. On an error the tree is left part-way and unusable.
     pub fn update<H: Hasher, K: AsRef<[u8]>>(
         &mut self,
         hasher: &H,

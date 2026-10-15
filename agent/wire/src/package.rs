@@ -83,7 +83,7 @@ pub struct StateWitness {
     pub proof: BatchProof,
     /// The ranges refine scans, each shown complete, in key order and
     /// disjoint.
-    pub ranges: Vec<Range>,
+    pub ranges: Vec<ScannedRange>,
 }
 
 /// A key of the witness as refine needs it.
@@ -103,7 +103,7 @@ pub enum Opened {
 /// A range of keys refine scans, `[from, to)`, `to` `None` for the tree's
 /// right edge: every row in it, and the proof that they are all.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub struct Range {
+pub struct ScannedRange {
     pub from: Vec<u8>,
     pub to: Option<Vec<u8>>,
     pub rows: Vec<Row>,

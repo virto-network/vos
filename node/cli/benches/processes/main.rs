@@ -47,7 +47,7 @@ use vos_checker::calls::signed_query;
 use vos_checker::programs::package;
 use vos_wire::Decode;
 use vos_wire::ids::{AgentId, InstanceId};
-use vos_wire::ingress::{Answer, Consistency};
+use vos_wire::ingress::{Consistency, Response};
 use vos_wire::result::Outcome;
 
 use load::{
@@ -276,7 +276,7 @@ fn counters_hold(space: &Space, agents: &[Signed]) {
         let answer =
             vos_node::client::post_within(&leader.target, &path, &body, Duration::from_secs(5));
         let value = match answer {
-            Ok(Answer::Ran {
+            Ok(Response::Ran {
                 outcome: Outcome::Done(bytes),
                 ..
             }) => u64::decode(&bytes).unwrap().0,
@@ -402,7 +402,7 @@ fn failover(space: &Space, agents: &[AgentId]) {
         .map(|(_, process)| process)
         .collect();
     let status = |process: &Process, agent: AgentId| match process.operator().status(agent) {
-        Ok(Answer::Status(status)) => Some(status),
+        Ok(Response::Status(status)) => Some(status),
         _ => None,
     };
     // The term each agent's new leader leads at.

@@ -210,7 +210,7 @@ pub enum Rejection {
 
 /// Ingress's answer to a call, a query or an operator command.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub enum Answer {
+pub enum Response {
     /// The step ran, or the query did: its outcome, and the applied index
     /// of the state the answer reflects, which a later query may ask a
     /// replica to have reached.

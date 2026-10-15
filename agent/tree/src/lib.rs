@@ -85,7 +85,7 @@
 //!   leaves in the range, which must be the claimed rows; and an opened leaf
 //!   at or past `to`, unless nothing follows.
 //!
-//! [`Witness::update`] applies writes from a proof alone: the puts, then the
+//! [`PartialTree::update`] applies writes from a proof alone: the puts, then the
 //! deletes. A put of an absent key whose path ends in a closed subtree goes
 //! in if it differs from an opened leaf below the path's last branch above
 //! that branch's level, as every key of a range does.
@@ -114,11 +114,8 @@ mod store;
 mod update;
 
 pub use build::root;
-pub use hash::{
-    Blake2b, Hasher, TAG_BRANCH, TAG_EMPTY, TAG_KEY, TAG_LEAF, TAG_SALT, TAG_VALUE, branch_hash,
-    empty_root, leaf_hash, salt, value_hash,
-};
-pub use proof::{BatchProof, Entry, Witness};
+pub use hash::{Blake2b, Hasher, branch_hash, empty_root, leaf_hash, salt, value_hash};
+pub use proof::{BatchProof, Entry, PartialTree};
 pub use range::RangeProof;
 pub use scale::{Decode, Encode};
 pub use store::{Child, MemStore, Node, NodeStore, Rows, reachable, stored_root};

@@ -312,10 +312,10 @@ impl Inner {
 
     /// This node's replica of `agent`, if it runs one: its Raft state, or
     /// `Unavailable` if the store cannot be read.
-    pub(crate) fn replica_status(&self, agent: AgentId) -> vos_wire::ingress::Answer {
-        use vos_wire::ingress::Answer;
+    pub(crate) fn replica_status(&self, agent: AgentId) -> vos_wire::ingress::Response {
+        use vos_wire::ingress::Response;
         let Some(run) = self.run(agent) else {
-            return Answer::NoAgent;
+            return Response::NoAgent;
         };
         let state = run.shared.state();
         let snapshot = self.store.snapshot();
@@ -336,10 +336,10 @@ impl Inner {
             sessions,
             outbox,
         ) else {
-            return Answer::Unavailable;
+            return Response::Unavailable;
         };
         let last = last.unwrap_or(0);
-        Answer::Status(vos_wire::ingress::ReplicaStatus {
+        Response::Status(vos_wire::ingress::ReplicaStatus {
             term: state.term,
             leads: state.role == Role::Leader,
             leader: state.leader,
@@ -1009,7 +1009,7 @@ impl Node {
     /// reports it, if it runs one.
     pub fn replica(&self, agent: AgentId) -> Option<vos_wire::ingress::ReplicaStatus> {
         match self.inner.replica_status(agent) {
-            vos_wire::ingress::Answer::Status(status) => Some(status),
+            vos_wire::ingress::Response::Status(status) => Some(status),
             _ => None,
         }
     }

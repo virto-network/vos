@@ -12,8 +12,8 @@ use ed25519_dalek::{Signer, SigningKey};
 use vos_wire::abi::Refusal;
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session, WorkflowId};
 use vos_wire::ingress::{
-    AgentInfo, Answer, Call, Consistency, Contact, Create, Grant, Install, NodeId, QueryCall,
-    Rejection, Replace, WORKFLOW_READ_HORIZON_MS, WorkflowRead, call_message, query_message,
+    AgentInfo, Call, Consistency, Contact, Create, Grant, Install, NodeId, QueryCall, Rejection,
+    Replace, Response, WORKFLOW_READ_HORIZON_MS, WorkflowRead, call_message, query_message,
     workflow_message, workflow_read_horizon,
 };
 use vos_wire::schema::Schema;
@@ -42,8 +42,8 @@ pub enum ClientError {
     Lost,
 }
 
-fn answer(status: u16, body: &[u8]) -> Result<Answer, ClientError> {
-    Answer::decode(body)
+fn answer(status: u16, body: &[u8]) -> Result<Response, ClientError> {
+    Response::decode(body)
         .map(|(answer, _)| answer)
         .map_err(|_| ClientError::Undecodable(status))
 }
@@ -64,7 +64,7 @@ pub fn post_within(
     path: &str,
     body: &[u8],
     within: Duration,
-) -> Result<Answer, ClientError> {
+) -> Result<Response, ClientError> {
     let (status, body) = Http::within(target, within).post(path, None, body, false)?;
     answer(status, &body)
 }
@@ -319,7 +319,7 @@ impl Client {
         instance: InstanceId,
         method: MethodId,
         arguments: &[u8],
-    ) -> Result<Answer, ClientError> {
+    ) -> Result<Response, ClientError> {
         // Learn the replicas first: the node may be gone when a failover
         // needs them.
         self.ensure_replicas(agent);
@@ -345,31 +345,33 @@ impl Client {
                 }
             };
             match &answer {
-                Answer::Ran { at, .. } => {
+                Response::Ran { at, .. } => {
                     if let Some(kept) = lock(&self.sessions).get_mut(&agent) {
                         kept.next = sequence + 1;
                     }
                     self.raise_floor(agent, *at);
                     return Ok(answer);
                 }
-                Answer::NotLeader {
+                Response::NotLeader {
                     leader: Some(leader),
                 } if redirects < REDIRECTS => {
                     redirects += 1;
                     self.follow(leader)?;
                 }
-                Answer::Elsewhere { replicas } if redirects < REDIRECTS && !replicas.is_empty() => {
+                Response::Elsewhere { replicas }
+                    if redirects < REDIRECTS && !replicas.is_empty() =>
+                {
                     redirects += 1;
                     self.follow(&replicas[(redirects - 1) % replicas.len()])?;
                 }
                 // An earlier attempt may have run, or may yet.
-                Answer::Rejected(Rejection::StaleSession { now }) if inconclusive => {
+                Response::Rejected(Rejection::StaleSession { now }) if inconclusive => {
                     match self.unknown_fate(agent, *now) {
                         Fate::Lost => {
                             self.renew(agent);
                             return Err(ClientError::Lost);
                         }
-                        Fate::InTransit => return Ok(Answer::TimedOut),
+                        Fate::InTransit => return Ok(Response::TimedOut),
                         Fate::NeverRan if renewals < RENEWALS => {
                             renewals += 1;
                             inconclusive = false;
@@ -380,19 +382,19 @@ impl Client {
                     }
                 }
                 // Not consumed: the same request goes again in a new session.
-                Answer::Rejected(Rejection::StaleSession { now }) if renewals < RENEWALS => {
+                Response::Rejected(Rejection::StaleSession { now }) if renewals < RENEWALS => {
                     renewals += 1;
                     self.learn_time(*now);
                     self.renew(agent);
                 }
                 // Timed by refine, past the lane: the next attempt meets the
                 // lane's refusal, with the agent's time.
-                Answer::Refused(Refusal::StaleSession) if inconclusive => {
-                    return Ok(Answer::TimedOut);
+                Response::Refused(Refusal::StaleSession) if inconclusive => {
+                    return Ok(Response::TimedOut);
                 }
                 // An expired session's calls that ran are answered from its
                 // window: refused, this one never ran, and never will.
-                Answer::Refused(Refusal::Expired | Refusal::StaleSession)
+                Response::Refused(Refusal::Expired | Refusal::StaleSession)
                     if renewals < RENEWALS =>
                 {
                     renewals += 1;
@@ -400,15 +402,15 @@ impl Client {
                     self.renew(agent);
                 }
                 // The earlier attempt may still create the session.
-                Answer::Refused(Refusal::SessionsFull | Refusal::KeySessionsFull)
+                Response::Refused(Refusal::SessionsFull | Refusal::KeySessionsFull)
                     if inconclusive =>
                 {
-                    return Ok(Answer::TimedOut);
+                    return Ok(Response::TimedOut);
                 }
-                Answer::Stopped
-                | Answer::Unavailable
-                | Answer::TimedOut
-                | Answer::NotLeader { leader: None }
+                Response::Stopped
+                | Response::Unavailable
+                | Response::TimedOut
+                | Response::NotLeader { leader: None }
                     if failovers < FAILOVERS =>
                 {
                     inconclusive = true;
@@ -416,15 +418,15 @@ impl Client {
                     let _ = self.fail_over(agent);
                 }
                 // Every replica forwards to the same leader: wait.
-                Answer::Busy if failovers < FAILOVERS => {
+                Response::Busy if failovers < FAILOVERS => {
                     failovers += 1;
                     std::thread::sleep(busy);
                     busy = (busy * 2).min(MAX_BUSY);
                 }
                 // Busy, or a failure of this attempt, says nothing of an
                 // earlier one.
-                Answer::Busy | Answer::NotConsumed if inconclusive => {
-                    return Ok(Answer::TimedOut);
+                Response::Busy | Response::NotConsumed if inconclusive => {
+                    return Ok(Response::TimedOut);
                 }
                 _ => return Ok(answer),
             }
@@ -492,7 +494,7 @@ impl Client {
         instance: InstanceId,
         method: MethodId,
         arguments: &[u8],
-    ) -> Result<Answer, ClientError> {
+    ) -> Result<Response, ClientError> {
         let body = self.call_body(agent, sequence, instance, method, arguments)?;
         let path = format!("/agents/{}/calls", agent.0);
         let (status, body) = self.http.post(&path, None, &body, true)?;
@@ -532,7 +534,7 @@ impl Client {
         method: MethodId,
         arguments: &[u8],
         not_after: u64,
-    ) -> Result<Answer, ClientError> {
+    ) -> Result<Response, ClientError> {
         let consistency = Consistency::Applied {
             at: self.floor(agent),
         };
@@ -550,7 +552,7 @@ impl Client {
         arguments: &[u8],
         not_after: u64,
         consistency: Consistency,
-    ) -> Result<Answer, ClientError> {
+    ) -> Result<Response, ClientError> {
         let identity = self.identity(agent)?;
         let offset = || *lock(&self.offset);
         let used = offset();
@@ -561,7 +563,7 @@ impl Client {
             not_after.saturating_add_signed(used),
             consistency,
         )?;
-        let Answer::Rejected(Rejection::StaleQuery { now }) = answer else {
+        let Response::Rejected(Rejection::StaleQuery { now }) = answer else {
             return Ok(answer);
         };
         self.learn_time(now);
@@ -582,7 +584,7 @@ impl Client {
         (instance, method, arguments): (InstanceId, MethodId, &[u8]),
         not_after: u64,
         consistency: Consistency,
-    ) -> Result<Answer, ClientError> {
+    ) -> Result<Response, ClientError> {
         let key = self.key.verifying_key().to_bytes();
         let message = query_message(
             identity,
@@ -612,7 +614,7 @@ impl Client {
     /// Read workflow `workflow` of `agent`, which this client's key
     /// started, on state that holds every answer this client was given for
     /// the agent, waiting up to `wait` for it to end, as long as the node
-    /// allows: its status, as [`Answer::Workflow`]. Only the workflow's
+    /// allows: its status, as [`Response::Workflow`]. Only the workflow's
     /// owner learns of it: to any other key it is unknown, as it is to its
     /// owner once collected, about an hour after it ended
     /// ([`defaults::WORKFLOW_KEPT_MS`]).
@@ -621,7 +623,7 @@ impl Client {
         agent: AgentId,
         workflow: WorkflowId,
         wait: Duration,
-    ) -> Result<Answer, ClientError> {
+    ) -> Result<Response, ClientError> {
         let consistency = Consistency::Applied {
             at: self.floor(agent),
         };
@@ -635,7 +637,7 @@ impl Client {
         workflow: WorkflowId,
         wait: Duration,
         consistency: Consistency,
-    ) -> Result<Answer, ClientError> {
+    ) -> Result<Response, ClientError> {
         let identity = self.identity(agent)?;
         let wait_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
         let key = self.key.verifying_key().to_bytes();
@@ -661,7 +663,7 @@ impl Client {
                 .saturating_add_signed(*lock(&self.offset))
         };
         let answer = read_until(not_after())?;
-        let Answer::Rejected(Rejection::StaleQuery { now }) = answer else {
+        let Response::Rejected(Rejection::StaleQuery { now }) = answer else {
             return Ok(answer);
         };
         self.learn_time(now);
@@ -671,21 +673,21 @@ impl Client {
     /// A signed read, `body` posted to `path`: it changes nothing, so one
     /// this replica cannot answer now goes to the others in turn, the
     /// client still calling this one. An answer raises the agent's floor.
-    fn read(&self, agent: AgentId, path: &str, body: &[u8]) -> Result<Answer, ClientError> {
-        let ask = |http: &Http| -> Result<Answer, ClientError> {
+    fn read(&self, agent: AgentId, path: &str, body: &[u8]) -> Result<Response, ClientError> {
+        let ask = |http: &Http| -> Result<Response, ClientError> {
             let (status, answered) = http.post(path, None, body, true)?;
             answer(status, &answered)
         };
-        let unanswered = |answer: &Result<Answer, ClientError>| {
+        let unanswered = |answer: &Result<Response, ClientError>| {
             matches!(
                 answer,
                 Err(_)
-                    | Ok(Answer::Rejected(Rejection::Behind)
-                        | Answer::TimedOut
-                        | Answer::Unavailable
-                        | Answer::Stopped
-                        | Answer::NotLeader { .. }
-                        | Answer::Elsewhere { .. })
+                    | Ok(Response::Rejected(Rejection::Behind)
+                        | Response::TimedOut
+                        | Response::Unavailable
+                        | Response::Stopped
+                        | Response::NotLeader { .. }
+                        | Response::Elsewhere { .. })
             )
         };
         let mut answer = ask(&self.http);
@@ -701,7 +703,7 @@ impl Client {
             }
         }
         let answer = answer?;
-        if let Answer::Ran { at, .. } | Answer::Workflow { at, .. } = answer {
+        if let Response::Ran { at, .. } | Response::Workflow { at, .. } = answer {
             self.raise_floor(agent, at);
         }
         Ok(answer)
@@ -784,7 +786,7 @@ impl Operator {
         }
     }
 
-    fn post(&self, path: &str, body: &[u8]) -> Result<Answer, ClientError> {
+    fn post(&self, path: &str, body: &[u8]) -> Result<Response, ClientError> {
         // An operator's command may not be idempotent: never sent twice.
         let (status, body) = self.http.post(path, Some(&self.token), body, false)?;
         answer(status, &body)
@@ -792,14 +794,14 @@ impl Operator {
 
     /// Create an agent replicated on `replicas` (the node alone when
     /// empty).
-    pub fn create_agent(&self, replicas: Vec<u8>) -> Result<Answer, ClientError> {
+    pub fn create_agent(&self, replicas: Vec<u8>) -> Result<Response, ClientError> {
         if replicas.is_empty() {
             return self.post("/agents", &[]);
         }
         self.post("/agents", &Create { replicas }.encode())
     }
 
-    pub fn install(&self, agent: AgentId, install: &Install) -> Result<Answer, ClientError> {
+    pub fn install(&self, agent: AgentId, install: &Install) -> Result<Response, ClientError> {
         self.post(&format!("/agents/{}/install", agent.0), &install.encode())
     }
 
@@ -808,19 +810,19 @@ impl Operator {
         agent: AgentId,
         principal: Principal,
         role: Option<u8>,
-    ) -> Result<Answer, ClientError> {
+    ) -> Result<Response, ClientError> {
         let grant = Grant { principal, role };
         self.post(&format!("/agents/{}/roles", agent.0), &grant.encode())
     }
 
     /// Replace `agent`'s replica `remove` by node `add`, at its leader.
-    pub fn replace(&self, agent: AgentId, remove: u8, add: u8) -> Result<Answer, ClientError> {
+    pub fn replace(&self, agent: AgentId, remove: u8, add: u8) -> Result<Response, ClientError> {
         let replace = Replace { remove, add };
         self.post(&format!("/agents/{}/replicas", agent.0), &replace.encode())
     }
 
     /// How long the node's stages took since it started.
-    pub fn stats(&self) -> Result<Answer, ClientError> {
+    pub fn stats(&self) -> Result<Response, ClientError> {
         let (status, body) = self
             .http
             .request("GET", "/stats", Some(&self.token), &[], true)?;
@@ -829,7 +831,7 @@ impl Operator {
 
     /// The node's replica of `agent`: its term, role, commit, applied
     /// index and log.
-    pub fn status(&self, agent: AgentId) -> Result<Answer, ClientError> {
+    pub fn status(&self, agent: AgentId) -> Result<Response, ClientError> {
         let (status, body) = self.http.request(
             "GET",
             &format!("/agents/{}/status", agent.0),

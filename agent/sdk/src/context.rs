@@ -446,8 +446,8 @@ impl<A: Encode + Decode + Tables + New> Workflow<A> {
 
 /// The deadline of an await, `within`, on each of its builders.
 macro_rules! within {
-    ($($await:ident),*) => {$(
-        impl<M> $await<M> {
+    ($($builder:ident),*) => {$(
+        impl<M> $builder<M> {
             /// The deadline, after this step's batch time; the agent's default
             /// otherwise.
             pub fn within(mut self, deadline: Duration) -> Self {

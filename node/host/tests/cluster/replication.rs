@@ -14,7 +14,7 @@ use vos_wire::Encode;
 use vos_wire::abi::Refusal;
 use vos_wire::batch::{Batch, Input};
 use vos_wire::ids::AgentId;
-use vos_wire::ingress::{Answer, Call, Contact, NodeId};
+use vos_wire::ingress::{Call, Contact, NodeId, Response};
 use vos_wire::peer::{NodeNumber, PeerMessage};
 
 use crate::common::{COUNTER, Cluster, WithholdBlobs, replaced, retired, wait_until};
@@ -94,7 +94,7 @@ fn a_forward_at_another_term_is_answered_by_who_leads() {
     for (token, at) in [(1, term - 1), (2, term + 1)] {
         let (answered_at, answer) = forward(token, at);
         assert_eq!(answered_at, term);
-        let Answer::NotLeader {
+        let Response::NotLeader {
             leader: Some(named),
         } = answer
         else {
@@ -103,7 +103,7 @@ fn a_forward_at_another_term_is_answered_by_who_leads() {
         assert_eq!(named.node.0, cluster.space.node(leader).unwrap().key);
     }
     let (_, answer) = forward(3, term);
-    assert!(matches!(answer, Answer::Ran { .. }), "{answer:?}");
+    assert!(matches!(answer, Response::Ran { .. }), "{answer:?}");
     assert_eq!(cluster.value(leader, agent), 5, "it ran once");
 }
 

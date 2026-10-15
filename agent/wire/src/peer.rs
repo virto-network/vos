@@ -15,7 +15,7 @@ use scale::{Decode, Encode};
 
 use crate::batch::Message;
 use crate::ids::{AgentId, ProgramHash};
-use crate::ingress::{Answer, Call};
+use crate::ingress::{Call, Response};
 
 /// A node of the space: the 8-bit node part of an agent id.
 pub type NodeNumber = u8;
@@ -88,7 +88,7 @@ pub enum PeerMessage {
         agent: AgentId,
         token: u64,
         term: u64,
-        answer: Answer,
+        answer: Response,
     },
     /// A replica of `agent` asks its leader for a read index.
     #[codec(index = 11)]

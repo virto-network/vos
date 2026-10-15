@@ -47,7 +47,7 @@
 use super::*;
 
 /// What a workflow's step may spend, which the agent sets in its machine.
-pub(in crate::refine) struct Share {
+pub(crate) struct Share {
     /// What the meter keeps below the step: its reserve, the finish, and
     /// what a sweep's due step leaves the batch's inputs.
     floor: u64,
@@ -63,7 +63,7 @@ pub(in crate::refine) struct Share {
 }
 
 impl Share {
-    pub(in crate::refine) fn new(floor: u64, limit: u64) -> Self {
+    pub(crate) fn new(floor: u64, limit: u64) -> Self {
         Self {
             floor: floor + defaults::FINISH_RESERVE,
             limit,
@@ -84,7 +84,7 @@ impl Invocation<'_> {
     /// step's input, through its step from where its snapshot left it, the
     /// host call `pending` first: until it pauses, is preempted, ends or
     /// fails. Its own gas goes to its instance, as a handler's.
-    pub(in crate::refine) fn workflow(
+    pub(crate) fn workflow(
         &mut self,
         machine: &mut Machine,
         call: Call,

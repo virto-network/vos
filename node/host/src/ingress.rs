@@ -12,14 +12,14 @@ use vos_wire::abi::{Refusal, cap};
 use vos_wire::batch::Admin;
 use vos_wire::ids::{AgentId, InstanceId, Principal};
 use vos_wire::ingress::{
-    AgentInfo, Answer, Call, Create, Grant, Install, QueryCall, Rejection, Replace, WorkflowRead,
+    AgentInfo, Call, Create, Grant, Install, QueryCall, Rejection, Replace, Response, WorkflowRead,
     query_message, workflow_message, workflow_read_horizon,
 };
 use vos_wire::records::{Installed, unstored};
 use vos_wire::{Decode, Encode, keys};
 
 use crate::calls::{answer_of, verify};
-use crate::http::{self, Handler, Limits, Response};
+use crate::http::{self, Handler, Limits};
 use crate::node::{Inner, ReplaceError};
 
 /// How far ahead a query's `not_after` may be.
@@ -60,23 +60,23 @@ impl Drop for Waiting<'_> {
     }
 }
 
-fn status(answer: &Answer) -> u16 {
+fn status(answer: &Response) -> u16 {
     match answer {
-        Answer::Ran { .. }
-        | Answer::Created(_)
-        | Answer::Placed(_)
-        | Answer::Status(_)
-        | Answer::Stats(_)
-        | Answer::Workflow { .. } => 200,
-        Answer::Unplaced(_) => 409,
-        Answer::Unconfirmed(_) => 202,
+        Response::Ran { .. }
+        | Response::Created(_)
+        | Response::Placed(_)
+        | Response::Status(_)
+        | Response::Stats(_)
+        | Response::Workflow { .. } => 200,
+        Response::Unplaced(_) => 409,
+        Response::Unconfirmed(_) => 202,
         // The session is done with: the client starts another.
-        Answer::Refused(Refusal::Expired | Refusal::StaleSession) => 410,
+        Response::Refused(Refusal::Expired | Refusal::StaleSession) => 410,
         // No new session until some are collected.
-        Answer::Refused(Refusal::SessionsFull) => 503,
-        Answer::Refused(Refusal::KeySessionsFull) => 429,
-        Answer::Refused(_) => 409,
-        Answer::Rejected(rejection) => match rejection {
+        Response::Refused(Refusal::SessionsFull) => 503,
+        Response::Refused(Refusal::KeySessionsFull) => 429,
+        Response::Refused(_) => 409,
+        Response::Rejected(rejection) => match rejection {
             Rejection::TooOld | Rejection::StaleSession { .. } => 410,
             Rejection::BadSignature | Rejection::Unauthorized => 401,
             Rejection::Gap { .. } | Rejection::Ahead => 409,
@@ -84,23 +84,23 @@ fn status(answer: &Answer) -> u16 {
             // Another replica may be further along.
             Rejection::Behind => 503,
         },
-        Answer::NotConsumed => 500,
-        Answer::NoAgent => 404,
-        Answer::Busy | Answer::Stopped | Answer::Unavailable => 503,
-        Answer::TimedOut => 504,
+        Response::NotConsumed => 500,
+        Response::NoAgent => 404,
+        Response::Busy | Response::Stopped | Response::Unavailable => 503,
+        Response::TimedOut => 504,
         // Another node serves it: the answer says which.
-        Answer::NotLeader { .. } | Answer::Elsewhere { .. } => 421,
+        Response::NotLeader { .. } | Response::Elsewhere { .. } => 421,
     }
 }
 
-fn respond(answer: Answer) -> Response {
-    Response::new(status(&answer), answer.encode())
+fn respond(answer: Response) -> http::Response {
+    http::Response::new(status(&answer), answer.encode())
 }
 
-fn decode<T: Decode>(body: &[u8]) -> Result<T, Answer> {
+fn decode<T: Decode>(body: &[u8]) -> Result<T, Response> {
     match T::decode(body) {
         Ok((value, used)) if used == body.len() => Ok(value),
-        _ => Err(Answer::Rejected(Rejection::Malformed)),
+        _ => Err(Response::Rejected(Rejection::Malformed)),
     }
 }
 
@@ -149,7 +149,7 @@ impl Ingress {
         .await;
     }
 
-    async fn handle(&self, request: http::Request) -> Response {
+    async fn handle(&self, request: http::Request) -> http::Response {
         let path = request
             .path
             .split('?')
@@ -159,46 +159,46 @@ impl Ingress {
         let segments: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
         let agent = |text: &str| text.parse::<u32>().ok().map(AgentId);
         match (request.method.as_str(), segments.as_slice()) {
-            ("GET", []) => Response::new(200, self.inner.node_id.encode()),
+            ("GET", []) => http::Response::new(200, self.inner.node_id.encode()),
             ("GET", ["agents", id]) => match agent(id).and_then(|agent| self.agent_info(agent)) {
-                Some(info) => Response::new(200, info.encode()),
-                None => Response::new(404, Vec::new()),
+                Some(info) => http::Response::new(200, info.encode()),
+                None => http::Response::new(404, Vec::new()),
             },
             ("POST", ["agents", id, "calls"]) => match (agent(id), decode::<Call>(&request.body)) {
                 (Some(agent), Ok(call)) => respond(self.inner.client_call(agent, call).await),
-                (None, _) => respond(Answer::NoAgent),
+                (None, _) => respond(Response::NoAgent),
                 (_, Err(answer)) => respond(answer),
             },
             ("POST", ["agents", id, "queries"]) => {
                 match (agent(id), decode::<QueryCall>(&request.body)) {
                     (Some(agent), Ok(query)) => respond(self.query(agent, query).await),
-                    (None, _) => respond(Answer::NoAgent),
+                    (None, _) => respond(Response::NoAgent),
                     (_, Err(answer)) => respond(answer),
                 }
             }
             ("POST", ["agents", id, "workflows"]) => {
                 match (agent(id), decode::<WorkflowRead>(&request.body)) {
                     (Some(agent), Ok(read)) => respond(self.workflow(agent, read).await),
-                    (None, _) => respond(Answer::NoAgent),
+                    (None, _) => respond(Response::NoAgent),
                     (_, Err(answer)) => respond(answer),
                 }
             }
             ("GET", ["agents", id, "instances", instance, "schema"]) => {
                 match (agent(id), instance.parse::<u32>()) {
                     (Some(agent), Ok(instance)) => self.schema(agent, InstanceId(instance)),
-                    _ => Response::new(404, Vec::new()),
+                    _ => http::Response::new(404, Vec::new()),
                 }
             }
             ("POST", ["agents"] | ["agents", _, "install" | "roles" | "replicas"])
             | ("GET", ["agents", _, "status"] | ["stats"])
                 if !self.admitted(&request) =>
             {
-                respond(Answer::Rejected(Rejection::Unauthorized))
+                respond(Response::Rejected(Rejection::Unauthorized))
             }
-            ("GET", ["stats"]) => respond(Answer::Stats(self.inner.stats())),
+            ("GET", ["stats"]) => respond(Response::Stats(self.inner.stats())),
             ("GET", ["agents", id, "status"]) => respond(match agent(id) {
                 Some(agent) => self.inner.replica_status(agent),
-                None => Answer::NoAgent,
+                None => Response::NoAgent,
             }),
             ("POST", ["agents"]) => {
                 let create = if request.body.is_empty() {
@@ -208,7 +208,7 @@ impl Ingress {
                 };
                 match create {
                     Ok(create) => respond(match self.inner.create_agent(create.replicas).await {
-                        Ok(agent) => Answer::Created(agent),
+                        Ok(agent) => Response::Created(agent),
                         Err(error) => answer_of(Err(error)),
                     }),
                     Err(answer) => respond(answer),
@@ -216,7 +216,7 @@ impl Ingress {
             }
             ("POST", ["agents", id, "install"]) => {
                 let Some(agent) = agent(id) else {
-                    return respond(Answer::NoAgent);
+                    return respond(Response::NoAgent);
                 };
                 // A package may be large: decode it off the leaders' thread.
                 let body = request.body;
@@ -230,7 +230,7 @@ impl Ingress {
                         respond(answer_of(reply))
                     }
                     Some(Err(answer)) => respond(answer),
-                    None => respond(Answer::Unavailable),
+                    None => respond(Response::Unavailable),
                 }
             }
             ("POST", ["agents", id, "replicas"]) => {
@@ -238,13 +238,13 @@ impl Ingress {
                     (Some(agent), Ok(replace)) => {
                         let replaced = self.inner.replace(agent, replace.remove, replace.add).await;
                         respond(match replaced {
-                            Ok(replicas) => Answer::Placed(replicas),
-                            Err(ReplaceError::Unplaced(why)) => Answer::Unplaced(why),
-                            Err(ReplaceError::TimedOut) => Answer::TimedOut,
+                            Ok(replicas) => Response::Placed(replicas),
+                            Err(ReplaceError::Unplaced(why)) => Response::Unplaced(why),
+                            Err(ReplaceError::TimedOut) => Response::TimedOut,
                             Err(ReplaceError::Call(error)) => answer_of(Err(error)),
                         })
                     }
-                    (None, _) => respond(Answer::NoAgent),
+                    (None, _) => respond(Response::NoAgent),
                     (_, Err(answer)) => respond(answer),
                 }
             }
@@ -254,11 +254,11 @@ impl Ingress {
                         let admin = Admin::SetRole(grant);
                         respond(answer_of(self.inner.admin(agent, admin).await))
                     }
-                    (None, _) => respond(Answer::NoAgent),
+                    (None, _) => respond(Response::NoAgent),
                     (_, Err(answer)) => respond(answer),
                 }
             }
-            _ => Response::new(404, Vec::new()),
+            _ => http::Response::new(404, Vec::new()),
         }
     }
 
@@ -288,7 +288,7 @@ impl Ingress {
         })
     }
 
-    async fn query(&self, agent: AgentId, query: QueryCall) -> Answer {
+    async fn query(&self, agent: AgentId, query: QueryCall) -> Response {
         let Some(run) = self.inner.run(agent) else {
             return answer_of(Err(self.inner.absent(agent)));
         };
@@ -328,7 +328,7 @@ impl Ingress {
     /// An owner's read of a workflow's status, waiting for it to end, as
     /// long as it asks and the node allows, and only while fewer reads than
     /// the node allows wait: past them, it answers at once.
-    async fn workflow(&self, agent: AgentId, read: WorkflowRead) -> Answer {
+    async fn workflow(&self, agent: AgentId, read: WorkflowRead) -> Response {
         let Some(run) = self.inner.run(agent) else {
             return answer_of(Err(self.inner.absent(agent)));
         };
@@ -373,7 +373,7 @@ impl Ingress {
         signature: [u8; 64],
         not_after: u64,
         horizon: u64,
-    ) -> Result<(), Answer> {
+    ) -> Result<(), Response> {
         let signed = self
             .inner
             .offload({
@@ -388,18 +388,18 @@ impl Ingress {
             .await;
         match signed {
             Some(true) => {}
-            Some(false) => return Err(Answer::Rejected(Rejection::BadSignature)),
-            None => return Err(Answer::Unavailable),
+            Some(false) => return Err(Response::Rejected(Rejection::BadSignature)),
+            None => return Err(Response::Unavailable),
         }
         let now = (self.inner.clock)();
         if not_after < now || not_after > now.saturating_add(horizon) {
-            return Err(Answer::Rejected(Rejection::StaleQuery { now }));
+            return Err(Response::Rejected(Rejection::StaleQuery { now }));
         }
         Ok(())
     }
 
     /// An installed instance's schema, so clients call methods by name.
-    fn schema(&self, agent: AgentId, instance: InstanceId) -> Response {
+    fn schema(&self, agent: AgentId, instance: InstanceId) -> http::Response {
         let snapshot = self.inner.store.snapshot();
         let installed = snapshot
             .get(agent, &keys::installed(instance))
@@ -407,8 +407,8 @@ impl Ingress {
             .flatten()
             .and_then(|bytes| Installed::decode(unstored(&bytes)?).ok());
         match installed {
-            Some((installed, _)) => Response::new(200, installed.schema.encode()),
-            None => Response::new(404, Vec::new()),
+            Some((installed, _)) => http::Response::new(200, installed.schema.encode()),
+            None => http::Response::new(404, Vec::new()),
         }
     }
 }

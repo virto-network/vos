@@ -8,7 +8,7 @@ use ed25519_dalek::SigningKey;
 use vos_checker::calls::{Total, done, signed_query};
 use vos_checker::hooks::Gate;
 use vos_node::client::{Target, agent_info, post_within};
-use vos_wire::ingress::{Answer, Consistency};
+use vos_wire::ingress::{Consistency, Response};
 
 use crate::common::{COUNTER, Cluster};
 
@@ -58,7 +58,7 @@ fn a_linearizable_method_reads_a_write_its_follower_has_not_applied() {
             let _ = answered.send(post_within(target, path, &latest, ANSWERED));
         });
         std::thread::sleep(Duration::from_millis(300));
-        let early: Option<Answer> = read.try_recv().ok().map(Result::unwrap);
+        let early: Option<Response> = read.try_recv().ok().map(Result::unwrap);
         drop(closed);
         assert!(
             early.is_none(),

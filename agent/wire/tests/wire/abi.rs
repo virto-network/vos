@@ -330,7 +330,7 @@ fn codes_keep_their_values() {
     };
     assert_eq!(due.encode(), [&[4][..], &7u64.to_le_bytes()].concat());
     assert_eq!(
-        vos_wire::ingress::Answer::Refused(Refusal::Sequence).encode(),
+        vos_wire::ingress::Response::Refused(Refusal::Sequence).encode(),
         [1, 1, 0, 0, 0]
     );
 }

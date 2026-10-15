@@ -39,7 +39,7 @@ use vos_checker::programs::package;
 use vos_checker::{ANSWERED, COUNTER, Client, INBOX, Mode, Nodes, Random, SECOND, wait_until};
 use vos_node::store::Fjall;
 use vos_wire::ids::AgentId;
-use vos_wire::ingress::{Answer, Consistency, Unplaced};
+use vos_wire::ingress::{Consistency, Response, Unplaced};
 use vos_wire::peer::NodeNumber;
 use vos_wire::records::unstored;
 use vos_wire::{Decode, defaults, keys};
@@ -128,14 +128,14 @@ impl Run {
             |operator| {
                 operator
                     .replace(agent, remove as NodeNumber, add as NodeNumber)
-                    .unwrap_or(Answer::Unavailable)
+                    .unwrap_or(Response::Unavailable)
             },
             // Sent again after it was made: done already.
             |answer| {
                 matches!(
                     answer,
-                    Answer::Placed(_)
-                        | Answer::Unplaced(Unplaced::NotAReplica | Unplaced::AlreadyAReplica)
+                    Response::Placed(_)
+                        | Response::Unplaced(Unplaced::NotAReplica | Unplaced::AlreadyAReplica)
                 )
             },
         );

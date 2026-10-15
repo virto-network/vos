@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 
 use vos_tree::{BatchProof, RangeProof};
-use vos_wire::package::{Opened, Range, Row, StateWitness};
+use vos_wire::package::{Opened, Row, ScannedRange, StateWitness};
 
 use crate::Error;
 use crate::simulate::Simulation;
@@ -50,7 +50,7 @@ pub fn witness(view: &View, simulation: &Simulation) -> Result<StateWitness, Err
 }
 
 /// The range `[from, to)` of `view`: its rows and their proof.
-fn range(view: &View, from: Vec<u8>, to: Option<Vec<u8>>) -> Result<Range, Error> {
+fn range(view: &View, from: Vec<u8>, to: Option<Vec<u8>>) -> Result<ScannedRange, Error> {
     let mut rows = Vec::new();
     for row in view.rows_from(&from) {
         let (key, value) = row?;
@@ -61,7 +61,7 @@ fn range(view: &View, from: Vec<u8>, to: Option<Vec<u8>>) -> Result<Range, Error
         rows.push(Row { key, salt, value });
     }
     let proof = RangeProof::generate(&view.tree(), &from, to.as_deref())?;
-    Ok(Range {
+    Ok(ScannedRange {
         from,
         to,
         rows,

@@ -8,7 +8,7 @@ use scale::{Decode, Encode};
 use crate::hash::Hasher;
 use crate::keys::{Side, bit, side};
 use crate::partial::Slot;
-use crate::proof::{Entry, Witness};
+use crate::proof::{Entry, PartialTree};
 use crate::store::{Child, NodeStore, load, load_leaf};
 use crate::{Error, Hash, valid_key};
 
@@ -89,16 +89,16 @@ impl RangeProof {
         from: &[u8],
         to: Option<&[u8]>,
         rows: &[(K, Hash)],
-    ) -> Result<Witness, Error> {
+    ) -> Result<PartialTree, Error> {
         if !rows.iter().all(|(key, _)| valid_key(key.as_ref())) {
             return Err(Error::Key);
         }
-        let witness = Witness::open(hasher, &self.entries, root)?;
+        let opened = PartialTree::open(hasher, &self.entries, root)?;
         let to = to.map(|to| to.max(from));
         // The opened leaves and the closed subtrees, in order: the slots of a
         // freshly opened proof are in pre-order. Opening checked that the
         // leaves are in strictly increasing order.
-        let ends: Vec<Option<(&[u8], &Hash)>> = witness
+        let ends: Vec<Option<(&[u8], &Hash)>> = opened
             .tree()
             .slots
             .iter()
@@ -138,7 +138,7 @@ impl RangeProof {
         if !matches {
             return Err(Error::Claim);
         }
-        Ok(witness)
+        Ok(opened)
     }
 
     /// The root after `writes` to keys in the range or at its boundaries,
@@ -148,7 +148,7 @@ impl RangeProof {
         hasher: &H,
         writes: &[(K, Option<Hash>)],
     ) -> Result<Hash, Error> {
-        Witness::unchecked(&self.entries)?.update(hasher, writes)
+        PartialTree::unchecked(&self.entries)?.update(hasher, writes)
     }
 }
 

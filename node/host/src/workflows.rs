@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use vos_wire::Decode;
 use vos_wire::ids::{AgentId, Principal, WorkflowId};
-use vos_wire::ingress::{Answer, Consistency, WorkflowStatus};
+use vos_wire::ingress::{Consistency, Response, WorkflowStatus};
 use vos_wire::keys;
 use vos_wire::records::{Workflow, WorkflowHead, WorkflowState, unstored};
 
@@ -36,7 +36,7 @@ impl Inner {
         workflow: WorkflowId,
         consistency: Consistency,
         wait: Duration,
-    ) -> Answer {
+    ) -> Response {
         let Some(run) = self.run(agent) else {
             return answer_of(Err(self.absent(agent)));
         };
@@ -63,20 +63,20 @@ impl Inner {
             let (status, at) = match read {
                 Some(Ok(read)) => read,
                 Some(Err(answer)) => return answer,
-                None => return Answer::Stopped,
+                None => return Response::Stopped,
             };
             let left = until.saturating_duration_since(Instant::now());
             if matches!(status, WorkflowStatus::Ended(_) | WorkflowStatus::Unknown)
                 || left.is_zero()
             {
-                return Answer::Workflow { status, at };
+                return Response::Workflow { status, at };
             }
             let applied = run.shared.wait(|state| state.stopped || state.applied > at);
             if timeout(left, applied)
                 .await
                 .is_none_or(|state| state.stopped)
             {
-                return Answer::Workflow { status, at };
+                return Response::Workflow { status, at };
             }
         }
     }
@@ -89,14 +89,14 @@ fn status_at(
     agent: AgentId,
     owner: Principal,
     workflow: WorkflowId,
-) -> Result<(WorkflowStatus, u64), Answer> {
+) -> Result<(WorkflowStatus, u64), Response> {
     let at = snapshot
         .applied(agent)
-        .map_err(|_| Answer::Unavailable)?
+        .map_err(|_| Response::Unavailable)?
         .unwrap_or(0);
     let Some(bytes) = snapshot
         .get(agent, &keys::workflow(workflow))
-        .map_err(|_| Answer::Unavailable)?
+        .map_err(|_| Response::Unavailable)?
     else {
         return Ok((WorkflowStatus::Unknown, at));
     };
@@ -112,7 +112,7 @@ fn status_at(
                 workflow = workflow.0,
                 "a workflow's record does not read"
             );
-            Err(Answer::Unavailable)
+            Err(Response::Unavailable)
         }
     }
 }

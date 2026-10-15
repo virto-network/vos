@@ -26,7 +26,7 @@ use vos_wire::abi::Refusal;
 use vos_wire::batch::{Batch, Input};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Session, WorkflowId};
 use vos_wire::ingress::{
-    Answer, Call, Consistency, Install, MAX_WORKFLOW_WAIT_MS, Rejection, WorkflowRead,
+    Call, Consistency, Install, MAX_WORKFLOW_WAIT_MS, Rejection, Response, WorkflowRead,
     WorkflowStatus, workflow_read_horizon,
 };
 use vos_wire::result::Outcome;
@@ -72,7 +72,7 @@ impl Served {
         let target = Target::loopback(&base).unwrap();
         let token = std::fs::read_to_string(dir.path().join(ADMIN_TOKEN)).unwrap();
         let operator = Operator::new(&target, &token);
-        let Ok(Answer::Created(agent)) = operator.create_agent(Vec::new()) else {
+        let Ok(Response::Created(agent)) = operator.create_agent(Vec::new()) else {
             panic!("an agent")
         };
         let install = Install {
@@ -84,7 +84,7 @@ impl Served {
         assert!(
             matches!(
                 installed,
-                Answer::Ran {
+                Response::Ran {
                     outcome: Outcome::Done(_),
                     ..
                 }
@@ -116,13 +116,13 @@ impl Served {
     }
 
     /// An increment through the client's own sequence.
-    fn call(&self, client: &mut Client, by: u64) -> Answer {
+    fn call(&self, client: &mut Client, by: u64) -> Response {
         client
             .call(self.agent, COUNTER, self.increment, &by.encode())
             .unwrap()
     }
 
-    fn increment(&self, client: &Client, sequence: u64, by: u64) -> Answer {
+    fn increment(&self, client: &Client, sequence: u64, by: u64) -> Response {
         client
             .call_at(self.agent, sequence, COUNTER, self.increment, &by.encode())
             .unwrap()
@@ -160,9 +160,9 @@ impl Served {
         start
     }
 
-    fn post(&self, path: &str, body: &[u8]) -> Answer {
+    fn post(&self, path: &str, body: &[u8]) -> Response {
         let (_, body) = vos_node::client::post(&self.target, path, body).unwrap();
-        Answer::decode(&body).unwrap().0
+        Response::decode(&body).unwrap().0
     }
 }
 
@@ -184,22 +184,22 @@ fn calls_follow_their_session_sequence() {
     assert_eq!(served.value(&client), 5, "applied once");
     assert_eq!(
         served.increment(&client, 3, 1),
-        Answer::Rejected(Rejection::Gap { expected: 2 })
+        Response::Rejected(Rejection::Gap { expected: 2 })
     );
     assert_eq!(
         served.increment(&client, 0, 1),
-        Answer::Rejected(Rejection::Gap { expected: 2 })
+        Response::Rejected(Rejection::Gap { expected: 2 })
     );
     assert_eq!(
         served.increment(&client, 2 + defaults::REPLY_WINDOW, 1),
-        Answer::Rejected(Rejection::Ahead)
+        Response::Rejected(Rejection::Ahead)
     );
     for sequence in 2..=defaults::REPLY_WINDOW + 1 {
         done(served.increment(&client, sequence, 1));
     }
     assert_eq!(
         served.increment(&client, 1, 5),
-        Answer::Rejected(Rejection::TooOld)
+        Response::Rejected(Rejection::TooOld)
     );
     assert_eq!(
         done(served.increment(&client, 2, 1)),
@@ -225,7 +225,7 @@ fn signatures_sessions_and_staleness_are_checked() {
     call.arguments = 6u64.encode();
     assert_eq!(
         served.post(&path, &call.encode()),
-        Answer::Rejected(Rejection::BadSignature),
+        Response::Rejected(Rejection::BadSignature),
         "arguments changed after signing"
     );
     // The session is in the signed bytes, and its key signs.
@@ -233,33 +233,33 @@ fn signatures_sessions_and_staleness_are_checked() {
     call.session.name[0] ^= 1;
     assert_eq!(
         served.post(&path, &call.encode()),
-        Answer::Rejected(Rejection::BadSignature)
+        Response::Rejected(Rejection::BadSignature)
     );
     call = Call::decode(&body).unwrap().0;
     call.session.key = SigningKey::from_bytes(&[2; 32]).verifying_key().to_bytes();
     assert_eq!(
         served.post(&path, &call.encode()),
-        Answer::Rejected(Rejection::BadSignature)
+        Response::Rejected(Rejection::BadSignature)
     );
     // Signed for one agent, sent to another: the agent's identity is in
     // the signed bytes.
     let operator = Operator::new(&served.target, &served.token);
-    let Ok(Answer::Created(other)) = operator.create_agent(Vec::new()) else {
+    let Ok(Response::Created(other)) = operator.create_agent(Vec::new()) else {
         panic!("another agent")
     };
     let elsewhere = format!("/agents/{}/calls", other.0);
     assert_eq!(
         served.post(&elsewhere, &body),
-        Answer::Rejected(Rejection::BadSignature)
+        Response::Rejected(Rejection::BadSignature)
     );
     assert_eq!(
         served.post(&format!("/agents/{}/calls", other.0 + 1), &body),
-        Answer::NoAgent
+        Response::NoAgent
     );
     body.truncate(body.len() - 1);
     assert_eq!(
         served.post(&path, &body),
-        Answer::Rejected(Rejection::Malformed)
+        Response::Rejected(Rejection::Malformed)
     );
 
     // A new session must start near the agent's time, which the refusal
@@ -291,7 +291,10 @@ fn signatures_sessions_and_staleness_are_checked() {
         now - defaults::SESSION_SKEW_MS - 1,
         now + defaults::SESSION_SKEW_MS + 1,
     ] {
-        assert_eq!(stale(t0), Answer::Rejected(Rejection::StaleSession { now }));
+        assert_eq!(
+            stale(t0),
+            Response::Rejected(Rejection::StaleSession { now })
+        );
     }
     assert_eq!(done(stale(now - defaults::SESSION_SKEW_MS + 1_000)), 1);
 
@@ -306,11 +309,11 @@ fn signatures_sessions_and_staleness_are_checked() {
     let wall = vos_node::wall_clock();
     assert_eq!(
         query(wall - 3_600_000),
-        Answer::Rejected(Rejection::StaleQuery { now })
+        Response::Rejected(Rejection::StaleQuery { now })
     );
     assert_eq!(
         query(vos_node::wall_clock() + 600_000),
-        Answer::Rejected(Rejection::StaleQuery { now })
+        Response::Rejected(Rejection::StaleQuery { now })
     );
     assert_eq!(done(query(vos_node::wall_clock() + 1_000)), 1);
     // The node's clock ten minutes ahead: refused once, the query goes
@@ -333,7 +336,7 @@ fn an_expired_session_is_refused_and_the_client_starts_another() {
         .fetch_add(defaults::SESSION_EXPIRY_MS + 1, Ordering::SeqCst);
     assert_eq!(
         served.increment(&client, 2, 1),
-        Answer::Refused(Refusal::Expired)
+        Response::Refused(Refusal::Expired)
     );
     assert_eq!(done(served.call(&mut client, 1)), 6);
     let renewed = client.session(served.agent);
@@ -407,7 +410,7 @@ fn a_call_whose_answer_was_lost_is_answered_once_or_lost() {
         .store(now + 2 * defaults::SESSION_SKEW_MS, Ordering::SeqCst);
     assert_eq!(
         again(never).unwrap(),
-        Answer::TimedOut,
+        Response::TimedOut,
         "a leader could still create it"
     );
     served
@@ -509,14 +512,14 @@ fn operator_commands_need_the_token() {
     let stranger = Operator::new(&served.target, &"00".repeat(32));
     assert_eq!(
         stranger.create_agent(Vec::new()).unwrap(),
-        Answer::Rejected(Rejection::Unauthorized)
+        Response::Rejected(Rejection::Unauthorized)
     );
     let client = served.client(1);
     assert_eq!(
         stranger
             .grant(served.agent, client.principal(), Some(1))
             .unwrap(),
-        Answer::Rejected(Rejection::Unauthorized)
+        Response::Rejected(Rejection::Unauthorized)
     );
     assert_eq!(
         served.node.id(),
@@ -546,7 +549,7 @@ fn a_token_that_is_not_hex_is_refused_and_frees_its_connection() {
         );
     }
     let operator = Operator::new(&served.target, &served.token);
-    assert!(matches!(operator.stats(), Ok(Answer::Stats(_))));
+    assert!(matches!(operator.stats(), Ok(Response::Stats(_))));
 }
 
 /// The operator reads a replica's status, and a stranger cannot. A node
@@ -557,7 +560,7 @@ fn the_status_route_reports_a_replica_and_a_halt() {
     let hooks = Arc::new(FailNextSync::default());
     let served = Served::start(hooks.clone());
     let operator = Operator::new(&served.target, &served.token);
-    let Ok(Answer::Status(status)) = operator.status(served.agent) else {
+    let Ok(Response::Status(status)) = operator.status(served.agent) else {
         panic!("a status")
     };
     assert!(status.leads && !status.halted, "{status:?}");
@@ -566,9 +569,9 @@ fn the_status_route_reports_a_replica_and_a_halt() {
     let stranger = Operator::new(&served.target, &"00".repeat(32));
     assert_eq!(
         stranger.status(served.agent).unwrap(),
-        Answer::Rejected(Rejection::Unauthorized)
+        Response::Rejected(Rejection::Unauthorized)
     );
-    assert_eq!(operator.status(AgentId(0xdead)).unwrap(), Answer::NoAgent);
+    assert_eq!(operator.status(AgentId(0xdead)).unwrap(), Response::NoAgent);
     hooks.arm();
     assert!(
         served.node.create_agent().is_err(),
@@ -577,7 +580,7 @@ fn the_status_route_reports_a_replica_and_a_halt() {
     wait_until("the node halts", || {
         matches!(
             operator.status(served.agent),
-            Ok(Answer::Status(status)) if status.halted
+            Ok(Response::Status(status)) if status.halted
         )
     });
 }
@@ -681,7 +684,7 @@ fn a_request_not_consumed_is_resent_with_its_sequence() {
     let commits = gate.commits.close();
     let reached = gate.commits.reached();
     drop(refines);
-    assert_eq!(first.join().unwrap(), Answer::NotConsumed);
+    assert_eq!(first.join().unwrap(), Response::NotConsumed);
     wait_until("2 and 3 reach their commit", || {
         gate.commits.reached() > reached
     });
@@ -689,8 +692,8 @@ fn a_request_not_consumed_is_resent_with_its_sequence() {
     let resent = send(1);
     std::thread::sleep(Duration::from_millis(100));
     drop(commits);
-    assert_eq!(second.join().unwrap(), Answer::Refused(Refusal::Sequence));
-    assert_eq!(third.join().unwrap(), Answer::Refused(Refusal::Sequence));
+    assert_eq!(second.join().unwrap(), Response::Refused(Refusal::Sequence));
+    assert_eq!(third.join().unwrap(), Response::Refused(Refusal::Sequence));
     assert_eq!(done(resent.join().unwrap()), 1);
     let rest: Vec<u64> = (2..=3)
         .map(|sequence| done(served.increment(&client, sequence, sequence)))
@@ -740,7 +743,7 @@ impl Served {
     /// the rounds its tours ask and tell.
     fn tours(&self) -> Tours {
         let operator = Operator::new(&self.target, &self.token);
-        let Ok(Answer::Created(other)) = operator.create_agent(Vec::new()) else {
+        let Ok(Response::Created(other)) = operator.create_agent(Vec::new()) else {
             panic!("another agent")
         };
         let rounds = Rounds::load();
@@ -749,7 +752,7 @@ impl Served {
             assert!(
                 matches!(
                     installed,
-                    Answer::Ran {
+                    Response::Ran {
                         outcome: Outcome::Done(_),
                         ..
                     }
@@ -777,7 +780,7 @@ impl Served {
         wait_until("the tour sleeps", || {
             matches!(
                 client.workflow(self.agent, workflow, Duration::ZERO),
-                Ok(Answer::Workflow {
+                Ok(Response::Workflow {
                     status: WorkflowStatus::Sleeping { .. },
                     ..
                 })
@@ -792,7 +795,7 @@ impl Served {
             .call(self.agent, ROUNDS, tours.methods.tour, &tour.arguments())
             .unwrap();
         match answer {
-            Answer::Ran {
+            Response::Ran {
                 outcome: Outcome::Started(workflow),
                 ..
             } => workflow,
@@ -803,9 +806,9 @@ impl Served {
 
 /// The status an answer to a workflow's read carries.
 #[track_caller]
-fn status(answer: Answer) -> WorkflowStatus {
+fn status(answer: Response) -> WorkflowStatus {
     match answer {
-        Answer::Workflow { status, .. } => status,
+        Response::Workflow { status, .. } => status,
         other => panic!("{other:?}"),
     }
 }
@@ -962,12 +965,12 @@ fn a_read_waits_for_its_workflow_within_its_bound() {
     read.workflow = WorkflowId(workflow.0 + 1);
     assert_eq!(
         served.post(&path, &read.encode()),
-        Answer::Rejected(Rejection::BadSignature)
+        Response::Rejected(Rejection::BadSignature)
     );
     let stale = signed_read(&identity, &key, now - 1, consistency, workflow, 0);
     assert_eq!(
         served.post(&path, &stale),
-        Answer::Rejected(Rejection::StaleQuery { now })
+        Response::Rejected(Rejection::StaleQuery { now })
     );
     // Good no longer than the horizon past its wait: a read captured
     // replays only that long.
@@ -975,16 +978,16 @@ fn a_read_waits_for_its_workflow_within_its_bound() {
     let ahead = signed_read(&identity, &key, far, consistency, workflow, 1_000);
     assert_eq!(
         served.post(&path, &ahead),
-        Answer::Rejected(Rejection::StaleQuery { now })
+        Response::Rejected(Rejection::StaleQuery { now })
     );
     let within = signed_read(&identity, &key, far - 1, consistency, workflow, 1_000);
     assert!(matches!(
         served.post(&path, &within),
-        Answer::Workflow { .. }
+        Response::Workflow { .. }
     ));
     assert!(matches!(
         served.post(&path, &body),
-        Answer::Workflow {
+        Response::Workflow {
             status: WorkflowStatus::Ended(_),
             ..
         }
@@ -1059,7 +1062,7 @@ fn a_read_waiting_ends_when_its_node_stops() {
     assert!(
         !matches!(
             answer,
-            Ok(Answer::Workflow {
+            Ok(Response::Workflow {
                 status: WorkflowStatus::Ended(_),
                 ..
             })
@@ -1100,7 +1103,7 @@ fn a_collected_workflow_reads_unknown() {
         let read = client.workflow(served.agent, workflow, Duration::ZERO);
         matches!(
             read,
-            Ok(Answer::Workflow {
+            Ok(Response::Workflow {
                 status: WorkflowStatus::Unknown,
                 ..
             })

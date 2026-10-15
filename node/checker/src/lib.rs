@@ -37,7 +37,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use vos_node::client::{ClientError, Target, post_within};
 use vos_wire::abi::Refusal;
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Session};
-use vos_wire::ingress::{Answer, Call, Consistency, Rejection, call_message};
+use vos_wire::ingress::{Call, Consistency, Rejection, Response, call_message};
 use vos_wire::peer::NodeNumber;
 use vos_wire::result::Outcome;
 use vos_wire::{Decode, Encode};
@@ -196,7 +196,12 @@ impl Log {
 }
 
 /// POST `body` at node `at`'s `path`, answered within [`ATTEMPT`].
-fn post(nodes: &dyn Nodes, at: NodeNumber, path: &str, body: &[u8]) -> Result<Answer, ClientError> {
+fn post(
+    nodes: &dyn Nodes,
+    at: NodeNumber,
+    path: &str,
+    body: &[u8],
+) -> Result<Response, ClientError> {
     post_within(nodes.target(at), path, body, ATTEMPT)
 }
 
@@ -547,7 +552,7 @@ impl Client {
             };
             let offset = nodes.offset();
             match post(nodes, at, &path, &body) {
-                Ok(Answer::Ran {
+                Ok(Response::Ran {
                     outcome,
                     at: answered_at,
                 }) => {
@@ -588,7 +593,7 @@ impl Client {
                     });
                     return;
                 }
-                Ok(Answer::NotLeader {
+                Ok(Response::NotLeader {
                     leader: Some(leader),
                 }) => {
                     nodes.log().saw("redirect");
@@ -599,7 +604,7 @@ impl Client {
                 }
                 // A node that does not replicate the agent names those that
                 // do: one of them, a different one each try.
-                Ok(Answer::Elsewhere { replicas }) => {
+                Ok(Response::Elsewhere { replicas }) => {
                     nodes.log().saw("elsewhere");
                     let named: Vec<NodeNumber> = replicas
                         .iter()
@@ -611,19 +616,21 @@ impl Client {
                         *self.calling.lock().unwrap() = named[tries % named.len()];
                     }
                 }
-                Ok(Answer::NotLeader { leader: None } | Answer::Stopped | Answer::TimedOut)
+                Ok(
+                    Response::NotLeader { leader: None } | Response::Stopped | Response::TimedOut,
+                )
                 | Err(_) => {
                     nodes.log().saw("resend elsewhere");
                     next(self);
                     std::thread::sleep(Duration::from_millis(10));
                 }
-                Ok(Answer::Busy | Answer::Unavailable) => {
+                Ok(Response::Busy | Response::Unavailable) => {
                     nodes.log().saw("resend");
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 // Sent on its own connection, a request may pass its
                 // predecessor: it goes again once that one is in.
-                Ok(Answer::Rejected(Rejection::Gap { expected }))
+                Ok(Response::Rejected(Rejection::Gap { expected }))
                     if matches!(mode, Mode::Pipelined) && expected < sequence =>
                 {
                     nodes.log().saw("gap");
@@ -633,8 +640,8 @@ impl Client {
                 // leader can create it now, so none of its copies runs.
                 // Its first request times it again; the others follow.
                 Ok(
-                    stale @ (Answer::Rejected(Rejection::StaleSession { .. })
-                    | Answer::Refused(Refusal::StaleSession)),
+                    stale @ (Response::Rejected(Rejection::StaleSession { .. })
+                    | Response::Refused(Refusal::StaleSession)),
                 ) if timed.offset < offset => {
                     nodes.log().event(format!(
                         "client {} request {request} (sequence {sequence}) at {at}: {stale:?}",
@@ -650,8 +657,8 @@ impl Client {
                 // unchanged. Whether they move is read first: they stop
                 // moving only once the offset has moved.
                 Ok(
-                    Answer::Rejected(Rejection::StaleSession { .. })
-                    | Answer::Refused(Refusal::StaleSession),
+                    Response::Rejected(Rejection::StaleSession { .. })
+                    | Response::Refused(Refusal::StaleSession),
                 ) if nodes.clocks_moving() || nodes.offset() > offset => {
                     nodes.log().saw("stale session across the jump");
                     std::thread::sleep(Duration::from_millis(10));
@@ -721,12 +728,12 @@ impl Client {
                 Ok(read) => read,
                 // Signed before every clock jumped, a query may be stale.
                 Err(Ok(
-                    Answer::Rejected(Rejection::Behind | Rejection::StaleQuery { .. })
-                    | Answer::TimedOut
-                    | Answer::Stopped
-                    | Answer::Unavailable
-                    | Answer::NotLeader { .. }
-                    | Answer::Elsewhere { .. },
+                    Response::Rejected(Rejection::Behind | Rejection::StaleQuery { .. })
+                    | Response::TimedOut
+                    | Response::Stopped
+                    | Response::Unavailable
+                    | Response::NotLeader { .. }
+                    | Response::Elsewhere { .. },
                 ))
                 | Err(Err(_)) => {
                     nodes.log().saw("read unanswered");
@@ -788,10 +795,10 @@ impl Client {
         at: NodeNumber,
         instance: InstanceId,
         consistency: Consistency,
-    ) -> Result<(u64, u64), Result<Answer, ClientError>> {
+    ) -> Result<(u64, u64), Result<Response, ClientError>> {
         let path = format!("/agents/{}/queries", self.agent.0);
         match post(nodes, at, &path, &self.query(nodes, instance, consistency)) {
-            Ok(Answer::Ran {
+            Ok(Response::Ran {
                 outcome: Outcome::Done(bytes),
                 at,
             }) => Ok((u64::decode(&bytes).unwrap().0, at)),
@@ -878,15 +885,15 @@ impl Client {
                     assert!(Instant::now() < until, "a replay was never answered");
                     match post(nodes, number, &path, body) {
                         Ok(
-                            Answer::Rejected(Rejection::StaleSession { .. })
-                            | Answer::TimedOut
-                            | Answer::Elsewhere { .. },
+                            Response::Rejected(Rejection::StaleSession { .. })
+                            | Response::TimedOut
+                            | Response::Elsewhere { .. },
                         ) => break,
                         Ok(
-                            Answer::Stopped
-                            | Answer::Unavailable
-                            | Answer::Busy
-                            | Answer::NotLeader { .. },
+                            Response::Stopped
+                            | Response::Unavailable
+                            | Response::Busy
+                            | Response::NotLeader { .. },
                         )
                         | Err(_) => std::thread::sleep(Duration::from_millis(10)),
                         Ok(other) => panic!(

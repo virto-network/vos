@@ -6,7 +6,7 @@ use std::fmt::Debug;
 use ed25519_dalek::{Signer, SigningKey};
 use vos_node::{CallError, Reply};
 use vos_wire::ids::{InstanceId, MethodId};
-use vos_wire::ingress::{Answer, Consistency, QueryCall, query_message};
+use vos_wire::ingress::{Consistency, QueryCall, Response, query_message};
 use vos_wire::result::Outcome;
 use vos_wire::{Decode, Encode};
 
@@ -26,10 +26,10 @@ impl Total for Result<Reply, CallError> {
     }
 }
 
-impl Total for Answer {
+impl Total for Response {
     fn total(&self) -> Option<u64> {
         match self {
-            Answer::Ran {
+            Response::Ran {
                 outcome: Outcome::Done(bytes),
                 ..
             } => Some(u64::decode(bytes).unwrap().0),

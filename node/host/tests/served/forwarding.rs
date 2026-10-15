@@ -12,7 +12,7 @@ use vos_checker::programs::{actor, method, package};
 use vos_checker::{ANSWERED, ATTEMPT, COUNTER, Nodes, wait_until};
 use vos_node::client::{Client, post_within};
 use vos_wire::ids::{AgentId, MethodId, Session};
-use vos_wire::ingress::{Answer, Call, Consistency, Rejection, call_message};
+use vos_wire::ingress::{Call, Consistency, Rejection, Response, call_message};
 use vos_wire::peer::NodeNumber;
 use vos_wire::records::unstored;
 use vos_wire::result::Outcome;
@@ -126,7 +126,7 @@ fn a_follower_forwards_no_call_it_cannot_verify() {
     let path = format!("/agents/{}/calls", agent.0);
     let answer = post_within(cluster.target(follower), &path, &call.encode(), ATTEMPT);
     assert!(
-        matches!(answer, Ok(Answer::Rejected(Rejection::BadSignature))),
+        matches!(answer, Ok(Response::Rejected(Rejection::BadSignature))),
         "{answer:?}"
     );
     std::thread::sleep(Duration::from_millis(200));
@@ -298,7 +298,7 @@ fn a_follower_reads_a_write_once_it_has_applied_it() {
             let call = signed_call(&identity, &key, session, sequence, increment, 4);
             let calls = format!("/agents/{}/calls", agent.0);
             let answer = post_within(cluster.target(leader), &calls, &call, ANSWERED).unwrap();
-            let Answer::Ran { at, .. } = answer else {
+            let Response::Ran { at, .. } = answer else {
                 panic!("{answer:?}")
             };
             let consistency = consistency.unwrap_or(Consistency::Applied { at });
@@ -344,7 +344,7 @@ fn a_leader_cut_off_answers_no_linearizable_read() {
     );
     cluster.hub.heal();
     assert!(
-        !matches!(answer, Ok(Answer::Ran { .. })),
+        !matches!(answer, Ok(Response::Ran { .. })),
         "a cut-off leader answered: {answer:?}"
     );
 }
@@ -366,14 +366,14 @@ fn a_query_a_replica_is_behind_for_goes_to_another() {
         let answer = client
             .call(agent, COUNTER, increment, &6u64.encode())
             .unwrap();
-        let Answer::Ran { at, .. } = answer else {
+        let Response::Ran { at, .. } = answer else {
             panic!("{answer:?}")
         };
         let path = format!("/agents/{}/queries", agent.0);
         let query = value_query(&identity, &key, value, Consistency::Applied { at });
         let answer = post_within(cluster.target(follower), &path, &query, ANSWERED);
         assert!(
-            matches!(answer, Ok(Answer::Rejected(Rejection::Behind))),
+            matches!(answer, Ok(Response::Rejected(Rejection::Behind))),
             "{answer:?}"
         );
         let reader = Client::new(cluster.target(follower), key.clone());

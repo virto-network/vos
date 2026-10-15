@@ -25,7 +25,7 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use vos_net::Class;
 use vos_wire::batch::Request;
 use vos_wire::ids::{AgentId, Principal, Session, SessionId};
-use vos_wire::ingress::{Answer, Call, Rejection, call_message};
+use vos_wire::ingress::{Call, Rejection, Response, call_message};
 use vos_wire::peer::{NodeNumber, PeerMessage};
 use vos_wire::records::{SessionMark, unstored};
 use vos_wire::result::Outcome;
@@ -52,7 +52,7 @@ struct Lane {
     /// The highest sequence queued or applied.
     queued: u64,
     /// The calls in flight, each with the duplicates waiting on it.
-    inflight: HashMap<u64, Vec<smol::channel::Sender<Answer>>>,
+    inflight: HashMap<u64, Vec<smol::channel::Sender<Response>>>,
 }
 
 #[derive(Default)]
@@ -60,7 +60,7 @@ pub(crate) struct Calls {
     lanes: Mutex<HashMap<(AgentId, Session), Lane>>,
     /// The calls this replica forwarded, each waiting for its answer and
     /// the term it came at.
-    pub(crate) forwards: Waits<(u64, Answer)>,
+    pub(crate) forwards: Waits<(u64, Response)>,
     /// The forwarded calls running here, by the replica that forwarded
     /// them, each by its token: a call forwarded again while it runs is
     /// answered once, when it ends.
@@ -101,38 +101,38 @@ struct Applied {
 }
 
 enum Next {
-    Answer(Answer),
-    Wait(smol::channel::Receiver<Answer>),
+    Response(Response),
+    Wait(smol::channel::Receiver<Response>),
     Queue,
 }
 
 /// What a client is answered for the node's reply.
-pub(crate) fn answer_of(reply: Result<Answered, CallError>) -> Answer {
+pub(crate) fn answer_of(reply: Result<Answered, CallError>) -> Response {
     match reply {
         Ok(Answered {
             reply: Reply::Ran(outcome),
             at,
-        }) => Answer::Ran { outcome, at },
+        }) => Response::Ran { outcome, at },
         Ok(Answered {
             reply: Reply::Refused(code),
             ..
-        }) => Answer::Refused(code),
+        }) => Response::Refused(code),
         Ok(Answered {
             reply: Reply::Failed,
             ..
-        }) => Answer::NotConsumed,
+        }) => Response::NotConsumed,
         Ok(Answered {
             reply: Reply::TooOld,
             ..
-        }) => Answer::Rejected(Rejection::TooOld),
-        Err(CallError::Failed(_)) => Answer::Unavailable,
-        Err(CallError::Busy) => Answer::Busy,
-        Err(CallError::NoAgent) => Answer::NoAgent,
-        Err(CallError::Stopped) => Answer::Stopped,
-        Err(CallError::NotLeader(leader)) => Answer::NotLeader { leader },
-        Err(CallError::Elsewhere(replicas)) => Answer::Elsewhere { replicas },
-        Err(CallError::Unconfirmed(agent)) => Answer::Unconfirmed(agent),
-        Err(CallError::TimedOut) => Answer::TimedOut,
+        }) => Response::Rejected(Rejection::TooOld),
+        Err(CallError::Failed(_)) => Response::Unavailable,
+        Err(CallError::Busy) => Response::Busy,
+        Err(CallError::NoAgent) => Response::NoAgent,
+        Err(CallError::Stopped) => Response::Stopped,
+        Err(CallError::NotLeader(leader)) => Response::NotLeader { leader },
+        Err(CallError::Elsewhere(replicas)) => Response::Elsewhere { replicas },
+        Err(CallError::Unconfirmed(agent)) => Response::Unconfirmed(agent),
+        Err(CallError::TimedOut) => Response::TimedOut,
     }
 }
 
@@ -188,7 +188,7 @@ impl Inner {
     /// A client's call, as ingress takes it: its signature checked on an
     /// executor, then run here if this replica leads the agent, else
     /// forwarded to the leader.
-    pub(crate) async fn client_call(self: &Arc<Self>, agent: AgentId, call: Call) -> Answer {
+    pub(crate) async fn client_call(self: &Arc<Self>, agent: AgentId, call: Call) -> Response {
         let Some(run) = self.run(agent) else {
             return answer_of(Err(self.absent(agent)));
         };
@@ -204,8 +204,8 @@ impl Inner {
             .await;
         let call = match checked {
             Some((true, call)) => call,
-            Some((false, _)) => return Answer::Rejected(Rejection::BadSignature),
-            None => return Answer::Unavailable,
+            Some((false, _)) => return Response::Rejected(Rejection::BadSignature),
+            None => return Response::Unavailable,
         };
         if let Err(error) = self.settled(agent).await {
             return answer_of(Err(error));
@@ -219,7 +219,7 @@ impl Inner {
 
     /// Run a call whose signature was checked in its lane: this replica
     /// must lead the agent, else the answer says where the leader is.
-    pub(crate) async fn lane_call(self: &Arc<Self>, agent: AgentId, call: Call) -> Answer {
+    pub(crate) async fn lane_call(self: &Arc<Self>, agent: AgentId, call: Call) -> Response {
         if let Err(error) = self.leading(agent).await {
             return answer_of(Err(error));
         }
@@ -229,7 +229,7 @@ impl Inner {
                 // A refusal for a mark too low, or a session missing, holds
                 // only while this replica leads: a deposed leader that has
                 // not heard so reads state its successor moved past.
-                Next::Answer(Answer::Rejected(
+                Next::Response(Response::Rejected(
                     Rejection::Gap { .. } | Rejection::Ahead | Rejection::StaleSession { .. },
                 )) if !confirmed => {
                     if let Err(error) = self.read_index(agent).await {
@@ -241,10 +241,12 @@ impl Inner {
             }
         };
         match next {
-            Next::Answer(answer) => answer,
+            Next::Response(answer) => answer,
             Next::Wait(wait) => timeout(self.settings.answered, wait.recv())
                 .await
-                .map_or(Answer::TimedOut, |answer| answer.unwrap_or(Answer::Stopped)),
+                .map_or(Response::TimedOut, |answer| {
+                    answer.unwrap_or(Response::Stopped)
+                }),
             Next::Queue => {
                 let (session, sequence) = (call.session, call.sequence);
                 let request = Request {
@@ -266,7 +268,9 @@ impl Inner {
                 });
                 timeout(self.settings.answered, answer.recv())
                     .await
-                    .map_or(Answer::TimedOut, |answer| answer.unwrap_or(Answer::Stopped))
+                    .map_or(Response::TimedOut, |answer| {
+                        answer.unwrap_or(Response::Stopped)
+                    })
             }
         }
     }
@@ -279,24 +283,24 @@ impl Inner {
         session: Session,
         sequence: u64,
         running: impl Future<Output = Result<Answered, CallError>>,
-    ) -> Answer {
+    ) -> Response {
         let lane_key = (agent, session);
         let answer = match answer_of(running.await) {
             // The program failed on it alone, here: on state a
             // deposed leader may hold. Once this replica is known to
             // lead, its state says whether the call ran after all.
-            Answer::NotConsumed => match self.read_index(agent).await {
+            Response::NotConsumed => match self.read_index(agent).await {
                 Ok(_) => match self.applied_session(agent, &session, sequence) {
                     Ok(Applied {
                         mark,
                         reply: Some(outcome),
                         at,
                         ..
-                    }) if sequence <= mark => Answer::Ran { outcome, at },
+                    }) if sequence <= mark => Response::Ran { outcome, at },
                     Ok(Applied { mark, .. }) if sequence <= mark => {
-                        Answer::Rejected(Rejection::TooOld)
+                        Response::Rejected(Rejection::TooOld)
                     }
-                    Ok(_) => Answer::NotConsumed,
+                    Ok(_) => Response::NotConsumed,
                     Err(answer) => answer,
                 },
                 Err(error) => answer_of(Err(error)),
@@ -308,7 +312,7 @@ impl Inner {
             let lane = lanes.entry(lane_key).or_default();
             let waiting = lane.inflight.remove(&sequence).unwrap_or_default();
             // Not consumed, the mark stays: the client resends it.
-            if !matches!(answer, Answer::Ran { .. }) {
+            if !matches!(answer, Response::Ran { .. }) {
                 lane.queued = lane.queued.min(sequence - 1);
             }
             if lane.inflight.is_empty() {
@@ -335,7 +339,7 @@ impl Inner {
             at,
         } = match self.applied_session(agent, &call.session, sequence) {
             Ok(applied) => applied,
-            Err(answer) => return Next::Answer(answer),
+            Err(answer) => return Next::Response(answer),
         };
         let key = (agent, call.session);
         let lane = lanes.entry(key).or_default();
@@ -348,18 +352,18 @@ impl Inner {
             let now = (self.clock)().max(time);
             if call.session.t0.abs_diff(now) > defaults::SESSION_SKEW_MS {
                 lanes.remove(&key);
-                return Next::Answer(Answer::Rejected(Rejection::StaleSession { now }));
+                return Next::Response(Response::Rejected(Rejection::StaleSession { now }));
             }
         }
         let next = if sequence == 0 {
-            Next::Answer(Answer::Rejected(Rejection::Gap { expected: mark + 1 }))
+            Next::Response(Response::Rejected(Rejection::Gap { expected: mark + 1 }))
         } else if sequence <= mark {
-            Next::Answer(match reply {
-                Some(outcome) => Answer::Ran { outcome, at },
-                None => Answer::Rejected(Rejection::TooOld),
+            Next::Response(match reply {
+                Some(outcome) => Response::Ran { outcome, at },
+                None => Response::Rejected(Rejection::TooOld),
             })
         } else if sequence > mark + defaults::REPLY_WINDOW {
-            Next::Answer(Answer::Rejected(Rejection::Ahead))
+            Next::Response(Response::Rejected(Rejection::Ahead))
         } else if let Some(waiting) = lane.inflight.get_mut(&sequence) {
             // The original's answer is this one's too. When that is a
             // refusal (a gap behind a call that failed) the resend may
@@ -373,7 +377,7 @@ impl Inner {
             lane.inflight.insert(sequence, Vec::new());
             Next::Queue
         } else {
-            Next::Answer(Answer::Rejected(Rejection::Gap {
+            Next::Response(Response::Rejected(Rejection::Gap {
                 expected: lane.queued + 1,
             }))
         };
@@ -391,14 +395,16 @@ impl Inner {
         agent: AgentId,
         session: &Session,
         sequence: u64,
-    ) -> Result<Applied, Answer> {
+    ) -> Result<Applied, Response> {
         let snapshot = self.store.snapshot();
         let at = snapshot
             .applied(agent)
-            .map_err(|_| Answer::Unavailable)?
+            .map_err(|_| Response::Unavailable)?
             .unwrap_or(0);
-        let stored = |key: &[u8]| -> Result<Option<Vec<u8>>, Answer> {
-            let bytes = snapshot.get(agent, key).map_err(|_| Answer::Unavailable)?;
+        let stored = |key: &[u8]| -> Result<Option<Vec<u8>>, Response> {
+            let bytes = snapshot
+                .get(agent, key)
+                .map_err(|_| Response::Unavailable)?;
             Ok(bytes.and_then(|bytes| unstored(&bytes).map(<[u8]>::to_vec)))
         };
         let Some(id) = stored(&keys::session_index(session))?
@@ -435,7 +441,7 @@ impl Inner {
 
     /// Forward a checked call to the agent's leader until it is answered,
     /// then answer once this replica has applied it.
-    async fn forward(self: &Arc<Self>, run: &Arc<Run>, agent: AgentId, call: Call) -> Answer {
+    async fn forward(self: &Arc<Self>, run: &Arc<Run>, agent: AgentId, call: Call) -> Response {
         let until = Instant::now() + FORWARDING;
         let wait = self.calls.forwards.register(agent);
         // How many times the call went: once it went before, nothing the
@@ -447,11 +453,11 @@ impl Inner {
         loop {
             let left = until.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                return Answer::TimedOut;
+                return Response::TimedOut;
             }
             let state = run.shared.state();
             if state.stopped {
-                return Answer::Stopped;
+                return Response::Stopped;
             }
             // This replica leads now: the call runs in its own lane.
             if lock(&run.agent.queue).leading {
@@ -499,7 +505,7 @@ impl Inner {
                 // back and forth.
                 Some((
                     answered_at,
-                    Answer::NotLeader {
+                    Response::NotLeader {
                         leader: Some(contact),
                     },
                 )) if answered_at > term => {
@@ -512,7 +518,7 @@ impl Inner {
                         pause(run, PAUSE, until, changed).await;
                     }
                 }
-                Some((_, Answer::Ran { outcome, at })) => {
+                Some((_, Response::Ran { outcome, at })) => {
                     // No reply before its apply here.
                     let left = until.saturating_duration_since(Instant::now());
                     let applied = timeout(
@@ -522,9 +528,9 @@ impl Inner {
                     )
                     .await;
                     return match applied {
-                        Some(state) if state.applied >= at => Answer::Ran { outcome, at },
-                        Some(_) => Answer::Stopped,
-                        None => Answer::TimedOut,
+                        Some(state) if state.applied >= at => Response::Ran { outcome, at },
+                        Some(_) => Response::Stopped,
+                        None => Response::TimedOut,
                     };
                 }
                 // The node it went to does not lead, or could not take it
@@ -532,25 +538,25 @@ impl Inner {
                 // after a pause.
                 Some((
                     _,
-                    Answer::NotLeader { .. }
-                    | Answer::Elsewhere { .. }
-                    | Answer::Stopped
-                    | Answer::Unavailable,
+                    Response::NotLeader { .. }
+                    | Response::Elsewhere { .. }
+                    | Response::Stopped
+                    | Response::Unavailable,
                 )) => pause(run, PAUSE, until, changed).await,
                 // The leader is full: at the first send nothing ran, and
                 // the client may wait and send again. After that, an
                 // earlier send may be running elsewhere: wait here.
-                Some((_, Answer::Busy)) if sent == 1 => return Answer::Busy,
-                Some((_, Answer::Busy)) => pause(run, REFORWARD, until, changed).await,
+                Some((_, Response::Busy)) if sent == 1 => return Response::Busy,
+                Some((_, Response::Busy)) => pause(run, REFORWARD, until, changed).await,
                 // Answers that say the call did not run, about one send of
                 // several: another may still run it.
                 Some((
                     _,
-                    Answer::Rejected(Rejection::StaleSession { .. }) | Answer::NotConsumed,
+                    Response::Rejected(Rejection::StaleSession { .. }) | Response::NotConsumed,
                 )) if sent > 1 => {
-                    return Answer::TimedOut;
+                    return Response::TimedOut;
                 }
-                Some((_, Answer::TimedOut)) | None => {}
+                Some((_, Response::TimedOut)) | None => {}
                 Some((_, answer)) => return answer,
             }
         }
@@ -584,7 +590,7 @@ impl Inner {
                     agent,
                     token,
                     term: 0,
-                    answer: Answer::NotLeader { leader: None },
+                    answer: Response::NotLeader { leader: None },
                 },
             );
             return;
@@ -599,7 +605,7 @@ impl Inner {
                     agent,
                     token,
                     term: state.term,
-                    answer: Answer::NotLeader { leader },
+                    answer: Response::NotLeader { leader },
                 },
             );
             return;
@@ -621,7 +627,7 @@ impl Inner {
                     agent,
                     token,
                     term,
-                    answer: Answer::Busy,
+                    answer: Response::Busy,
                 },
             );
             return;

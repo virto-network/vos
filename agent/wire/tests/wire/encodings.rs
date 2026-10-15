@@ -293,7 +293,7 @@ fn signed_messages_keep_their_bytes() {
 /// the status's, its fields, then the applied index read at.
 #[test]
 fn workflow_reads_keep_their_bytes() {
-    use vos_wire::ingress::{Answer, WorkflowStatus};
+    use vos_wire::ingress::{Response, WorkflowStatus};
     let at = 5u64.to_le_bytes();
     let agent = 0x0a0b_0c0du32.to_le_bytes();
     let ended = Outcome::Done(vec![0xbb]);
@@ -316,7 +316,7 @@ fn workflow_reads_keep_their_bytes() {
             [&[4][..], &ended.encode()].concat(),
         ),
     ] {
-        let answer = Answer::Workflow { status, at: 5 };
+        let answer = Response::Workflow { status, at: 5 };
         assert_eq!(answer.encode(), [&[17][..], &bytes, &at].concat());
     }
 }
@@ -626,7 +626,7 @@ fn peer_messages_keep_their_bytes() {
             agent,
             token: 0,
             term: 0,
-            answer: ingress::Answer::Busy,
+            answer: ingress::Response::Busy,
         },
         PeerMessage::ReadIndex { agent, token: 0 },
         PeerMessage::ReadIndexAnswer {
@@ -682,7 +682,7 @@ fn peer_messages_keep_their_bytes() {
 fn packages_keep_their_bytes() {
     use vos_tree::{BatchProof, Entry, RangeProof};
     use vos_wire::batch::Work;
-    use vos_wire::package::{JamOutput, Opened, Package, Range, Row, StateWitness};
+    use vos_wire::package::{JamOutput, Opened, Package, Row, ScannedRange, StateWitness};
     let batch = Batch {
         version: 1,
         time: 2,
@@ -708,7 +708,7 @@ fn packages_keep_their_bytes() {
             proof: BatchProof {
                 entries: vec![Entry::Empty],
             },
-            ranges: vec![Range {
+            ranges: vec![ScannedRange {
                 from: vec![12],
                 to: None,
                 rows: vec![Row {

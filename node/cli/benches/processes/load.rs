@@ -11,7 +11,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use smol::io::{AsyncReadExt, AsyncWriteExt};
 use vos_node::client::Target;
 use vos_wire::ids::{AgentId, MethodId, Session};
-use vos_wire::ingress::{Answer, Call, call_message};
+use vos_wire::ingress::{Call, Response, call_message};
 use vos_wire::result::Outcome;
 use vos_wire::{Decode, Encode};
 
@@ -309,7 +309,7 @@ impl Http {
         })
     }
 
-    async fn post(&mut self, path: &str, body: &[u8]) -> std::io::Result<Answer> {
+    async fn post(&mut self, path: &str, body: &[u8]) -> std::io::Result<Response> {
         let head = format!(
             "POST {path} HTTP/1.1\r\nHost: {}\r\nContent-Length: {}\r\n\r\n",
             self.authority,
@@ -348,7 +348,7 @@ impl Http {
                     }
                     self.buffer.extend_from_slice(&chunk[..read]);
                 }
-                let answer = Answer::decode(&self.buffer[head..head + length])
+                let answer = Response::decode(&self.buffer[head..head + length])
                     .map(|(answer, _)| answer)
                     .map_err(|_| invalid("no answer"));
                 self.buffer.drain(..head + length);
@@ -404,7 +404,7 @@ async fn call(
     path: &str,
     body: &[u8],
     until: Instant,
-) -> Option<Answer> {
+) -> Option<Response> {
     loop {
         if Instant::now() >= until + Duration::from_secs(10) {
             return None;
@@ -417,8 +417,8 @@ async fn call(
             continue;
         };
         match connection.post(path, body).await {
-            Ok(answer @ Answer::Ran { .. }) => return Some(answer),
-            Ok(Answer::NotLeader {
+            Ok(answer @ Response::Ran { .. }) => return Some(answer),
+            Ok(Response::NotLeader {
                 leader: Some(leader),
             }) => {
                 if let Some(at) = space.by_url(&leader.address) {
@@ -427,7 +427,10 @@ async fn call(
                 *http = None;
             }
             Ok(
-                Answer::Busy | Answer::Unavailable | Answer::TimedOut | Answer::NotLeader { .. },
+                Response::Busy
+                | Response::Unavailable
+                | Response::TimedOut
+                | Response::NotLeader { .. },
             ) => {
                 smol::Timer::after(Duration::from_millis(2)).await;
             }
@@ -540,7 +543,7 @@ pub fn drive(
                         let answered = Instant::now();
                         if matches!(
                             answer,
-                            Some(Answer::Ran {
+                            Some(Response::Ran {
                                 outcome: Outcome::Done(_),
                                 ..
                             })
@@ -560,7 +563,7 @@ pub fn drive(
                             }
                             let mine = &mut mine[window];
                             match answer {
-                                Some(Answer::Ran {
+                                Some(Response::Ran {
                                     outcome: Outcome::Done(_),
                                     ..
                                 }) => {

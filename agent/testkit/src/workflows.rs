@@ -26,9 +26,9 @@ use vos_wire::records::{Snapshot, Workflow, WorkflowState};
 use vos_wire::result::{InstanceGas, Outcome, Outgoing, PAGE, Page, Write, digest};
 use vos_wire::{Decode, Encode, defaults};
 
-use crate::invocation::{Call, Ended, Run};
+use crate::invocation::{Call, Ended, Invocation};
 use crate::memory::precompile;
-use crate::{Step, Testkit, split};
+use crate::{Step, Testkit, split_writes};
 
 type Rows = BTreeMap<Vec<u8>, Option<Vec<u8>>>;
 
@@ -116,7 +116,7 @@ impl Testkit {
             Err(code) => (Outcome::failed(code), Rows::new()),
         };
         let mut step = Step::consumed(outcome);
-        step.writes = split(rows).0;
+        step.writes = split_writes(rows).0;
         self.apply(&step, Vec::new());
         step
     }
@@ -213,7 +213,7 @@ impl Testkit {
     fn quick(&mut self, rows: Rows) -> Step {
         self.steps += 1;
         let mut step = Step::consumed(Outcome::Done(Vec::new()));
-        step.writes = split(rows).0;
+        step.writes = split_writes(rows).0;
         self.apply(&step, Vec::new());
         step
     }
@@ -272,24 +272,24 @@ impl Testkit {
             let outcome = Outcome::failed(Failure::Cap);
             step.outcome = outcome.clone();
             step.pages = self.end(id, &mut workflow, outcome, &mut rows, &mut step);
-            step.writes = split(rows).0;
+            step.writes = split_writes(rows).0;
             self.apply(&step, Vec::new());
             return step;
         }
-        let mut run = Run::new(self, index, Kind::Workflow);
-        run.awaits = Some(Await {
+        let mut invocation = Invocation::new(self, index, Kind::Workflow);
+        invocation.awaits = Some(Await {
             workflow: id,
             counter: workflow.awaits,
         });
-        let left = self.run_step(&mut run, id, &workflow, &resume);
-        step.instances = run.instances.clone();
-        step.gas_used = run.gas_used;
+        let left = self.run_step(&mut invocation, id, &workflow, &resume);
+        step.instances = invocation.instances.clone();
+        step.gas_used = invocation.gas_used;
         let mut stored = Vec::new();
         // The step's effects, kept when it paused or ended with its result.
         let mut keep_effects = |rows: &mut Rows, step: &mut Step| {
-            rows.extend(run.frames.pop().expect("the step overlay"));
-            step.messages = std::mem::take(&mut run.messages);
-            step.attests = std::mem::take(&mut run.attests);
+            rows.extend(invocation.frames.pop().expect("the step overlay"));
+            step.messages = std::mem::take(&mut invocation.messages);
+            step.attests = std::mem::take(&mut invocation.attests);
         };
         match left {
             Ok(Left::Paused(state, captured)) => {
@@ -325,7 +325,7 @@ impl Testkit {
                 step.pages = self.end(id, &mut workflow, outcome, &mut rows, &mut step);
             }
         }
-        (step.writes, step.committed) = split(rows);
+        (step.writes, step.committed) = split_writes(rows);
         self.apply(&step, stored);
         step
     }
@@ -373,7 +373,7 @@ impl Testkit {
     /// `resume` as its input, and capture it if it paused.
     fn run_step(
         &self,
-        run: &mut Run,
+        invocation: &mut Invocation,
         id: WorkflowId,
         workflow: &Workflow,
         resume: &[u8],
@@ -436,7 +436,7 @@ impl Testkit {
             arguments: resume,
         };
         let resumed = *machine.registers();
-        let ended = run.workflow(&mut machine, call, workflow.gas, pending)?;
+        let ended = invocation.workflow(&mut machine, call, workflow.gas, pending)?;
         // The pages the step wrote, among those the program may write.
         let runs = [layout.rw, layout.stack]
             .map(|region| region.base / PAGE as u64..(region.base + region.size) / PAGE as u64);
@@ -601,7 +601,7 @@ fn preempt_or_fail(
     Ok(Ended::Preempted { pending, idle })
 }
 
-impl Run<'_> {
+impl Invocation<'_> {
     /// Run a workflow's machine, `call` its method by its owner on the
     /// step's input, through its step a unit at a time, the host call
     /// `pending` first: effect-free code on the share of `limit`, each

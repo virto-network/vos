@@ -12,7 +12,7 @@ use vos_checker::programs::agent;
 use vos_node::client::{Client, ClientError, Operator, Target};
 use vos_node::tls::{IngressTls, Trust};
 use vos_node::{ADMIN_TOKEN, Config, Node};
-use vos_wire::ingress::Answer;
+use vos_wire::ingress::Response;
 
 fn open(dir: &Path, tls: Option<IngressTls>) -> Node {
     let mut config = Config::new(agent());
@@ -69,7 +69,7 @@ fn a_client_pins_the_node_s_key() {
     let pinned = Target::new(&url, Trust::NodeKey(node.id().0)).unwrap();
     assert_eq!(vos_node::client::node_id(&pinned).unwrap(), node.id());
     let token = std::fs::read_to_string(dir.path().join(ADMIN_TOKEN)).unwrap();
-    let Answer::Created(agent) = Operator::new(&pinned, &token)
+    let Response::Created(agent) = Operator::new(&pinned, &token)
         .create_agent(Vec::new())
         .unwrap()
     else {
