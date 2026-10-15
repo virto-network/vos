@@ -62,7 +62,7 @@ fn the_agent_is_named_a_line_a_function() {
     let (blob, functions) = agent();
     let program = vos_pvm::spi::parse_standard_program(&blob).unwrap();
     let code = program.code;
-    perf_map::register(&code.code, functions);
+    perf_map::register(&code.code, functions.clone());
     let lines = Lines::default();
     perf_map::enable_into(Box::new(lines.clone()));
     let compiled =
@@ -70,8 +70,7 @@ fn the_agent_is_named_a_line_a_function() {
     let start = compiled.native_code.ptr as usize;
     let end = start + compiled.native_code.len;
     // Every entry maps exactly: none falls forward onto another's.
-    let registered = agent().1;
-    let unmapped: Vec<&(u32, String)> = registered
+    let unmapped: Vec<&(u32, String)> = functions
         .iter()
         .filter(|(pc, _)| compiled.dispatch_table[*pc as usize] == compiled.panic_offset)
         .collect();

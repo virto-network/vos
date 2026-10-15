@@ -16,14 +16,14 @@
 
 mod admit;
 pub mod builder;
-pub mod chain;
-pub mod da;
+mod chain;
+mod da;
 pub mod gas;
 pub mod live;
 pub mod programs;
-pub mod simulate;
-pub mod store;
-pub mod witness;
+mod simulate;
+mod store;
+mod witness;
 
 use vos_pvm::ExitReason;
 use vos_pvm::refine::RefineError;
@@ -32,103 +32,71 @@ use vos_wire::ids::WorkflowId;
 pub use admit::admit;
 pub use builder::{Attempt, Builder, Fate, Prepared, Taken};
 pub use chain::{Chain, Emulated, Fault, Landed, Refined};
-pub use da::{Da, Segments, segment_root};
-pub use simulate::{Runner, Simulation, simulate};
+pub use da::{Da, Segments};
+pub use simulate::{Runner, Simulation};
 pub use store::{Exported, Pending, Store, View};
-pub use witness::witness;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
-    /// The program could not be loaded or run.
+    #[error("the agent's program: {0:?}")]
     Load(RefineError),
-    /// Refine did not halt.
+    #[error("refine stopped: {0:?}")]
     Refine(ExitReason),
-    /// Accumulate did not halt.
+    #[error("accumulate stopped: {0:?}")]
     Accumulate(ExitReason),
-    /// Refine's output is not what it returns.
+    #[error("refine's output is not a package's")]
     Output,
-    /// The work result does not apply to the store.
+    #[error("the work result does not apply to the store")]
     Refused,
     /// The store's root is not the one the package was built on, or the
     /// chain holds another root than either.
+    #[error("the roots do not continue the store's")]
     Root,
-    /// The chain holds the root the package was built on: it refused it.
+    /// The chain holds the root the package was built on.
+    #[error("the chain refused the package")]
     Unaccumulated,
-    /// The chain holds a root the store cannot reach.
+    #[error("the chain holds a root the store cannot reach")]
     Diverged,
     /// The batch was made again as often as the builder does: every
     /// attempt, none landed.
+    #[error("the package did not land in {} attempts", .0.len())]
     Attempts(Vec<Attempt>),
-    /// The package's exports are not its pages and its work result.
+    #[error("the exports are not the result and its pages")]
     Exports,
-    /// The work result the chain holds is not the one simulated.
+    #[error("the chain's work result is not the one simulated")]
     Result,
-    /// Even a batch of one input does not fit a work package.
+    #[error("a batch of one input does not fit a work package")]
     Unfit,
     /// DA lacks a page a workflow of the batch holds.
+    #[error("DA lacks workflow {workflow}'s page {1}", workflow = .0.0)]
     Page(WorkflowId, u32),
-    /// The store failed.
+    #[error("the store: {0}")]
     Store(String),
     /// A row of the store is not what it should be.
+    #[error("the store holds {0} it should not")]
     Corrupt(&'static str),
-    /// The tree refused a proof or an update.
-    Tree(vos_tree::Error),
+    #[error("the tree: {0}")]
+    Tree(#[from] vos_tree::Error),
     /// The JAM node, or its tools, failed.
+    #[error("the JAM node: {0}")]
     Node(String),
-    /// A call not signed by its session's key.
+    #[error("a call not signed by its session's key")]
     Signature,
     /// A package's ELF derives no programs.
+    #[error("the package: {0}")]
     Package(String),
     /// A chain whose work packages' refine gas leaves a batch less than the
     /// least budget a VOS node refines with.
+    #[error(
+        "a work package's refine gas, {refine_gas}, leaves a batch less than the {least} a VOS \
+         node refines with"
+    )]
     RefineGas { refine_gas: u64, least: u64 },
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Load(error) => write!(f, "the agent's program: {error:?}"),
-            Error::Refine(exit) => write!(f, "refine stopped: {exit:?}"),
-            Error::Accumulate(exit) => write!(f, "accumulate stopped: {exit:?}"),
-            Error::Output => f.write_str("refine's output is not a package's"),
-            Error::Refused => f.write_str("the work result does not apply to the store"),
-            Error::Root => f.write_str("the roots do not continue the store's"),
-            Error::Unaccumulated => f.write_str("the chain refused the package"),
-            Error::Diverged => f.write_str("the chain holds a root the store cannot reach"),
-            Error::Attempts(attempts) => {
-                write!(f, "the package did not land in {} attempts", attempts.len())
-            }
-            Error::Exports => f.write_str("the exports are not the result and its pages"),
-            Error::Result => f.write_str("the chain's work result is not the one simulated"),
-            Error::Unfit => f.write_str("a batch of one input does not fit a work package"),
-            Error::Page(workflow, index) => {
-                write!(f, "DA lacks workflow {}'s page {index}", workflow.0)
-            }
-            Error::Store(error) => write!(f, "the store: {error}"),
-            Error::Corrupt(what) => write!(f, "the store holds {what} it should not"),
-            Error::Tree(error) => write!(f, "the tree: {error}"),
-            Error::Node(error) => write!(f, "the JAM node: {error}"),
-            Error::Signature => f.write_str("a call not signed by its session's key"),
-            Error::Package(error) => write!(f, "the package: {error}"),
-            Error::RefineGas { refine_gas, least } => write!(
-                f,
-                "a work package's refine gas, {refine_gas}, leaves a batch less than the {least} \
-                 a VOS node refines with"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
-
+/// A store's error as a string: `Store` keeps `PartialEq`.
 impl From<fjall::Error> for Error {
     fn from(error: fjall::Error) -> Self {
         Error::Store(error.to_string())
-    }
-}
-
-impl From<vos_tree::Error> for Error {
-    fn from(error: vos_tree::Error) -> Self {
-        Error::Tree(error)
     }
 }

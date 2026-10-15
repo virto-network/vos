@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 use vos_node::client::Target;
 use vos_node::tls::{IngressTls, Trust};
 
+use crate::jam::JamCommand;
 use crate::{at, failed, key_bytes};
 
 /// The version, saying so when the build injects faults.
@@ -68,7 +69,7 @@ pub enum Command {
     /// An agent as a JAM service, which its builder drives.
     Jam {
         #[command(subcommand)]
-        command: crate::jam::JamCommand,
+        command: JamCommand,
     },
 }
 

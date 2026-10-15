@@ -2503,6 +2503,7 @@ dependencies = [
  "hex",
  "lz4_flex 0.13.1",
  "serde_json",
+ "thiserror",
  "vos-pvm",
  "vos-pvm-compiler",
  "vos-tree",

@@ -43,8 +43,10 @@ fn calls_follow_their_session_sequence() {
     assert_eq!(done(served.increment(&other, 1, 1)), 70);
 }
 
+/// A call is checked against its signature, which covers its arguments,
+/// its session and the agent it is for; a body cut short is malformed.
 #[test]
-fn signatures_sessions_and_staleness_are_checked() {
+fn signatures_are_checked() {
     let served = Served::plain();
     let client = served.client(1);
     let agent = served.agent;
@@ -93,9 +95,16 @@ fn signatures_sessions_and_staleness_are_checked() {
         served.post(&path, &body),
         Response::Rejected(Rejection::Malformed)
     );
+}
 
-    // A new session must start near the agent's time, which the refusal
-    // gives.
+/// A new session must start near the agent's time, which the refusal
+/// gives.
+#[test]
+fn a_new_session_starts_near_the_agents_time() {
+    let served = Served::plain();
+    let client = served.client(1);
+    let agent = served.agent;
+    let path = format!("/agents/{}/calls", agent.0);
     let stale = |t0: u64| {
         let mut call = Call::decode(
             &client
@@ -121,9 +130,15 @@ fn signatures_sessions_and_staleness_are_checked() {
         );
     }
     assert_eq!(done(stale(now - defaults::SESSION_SKEW_MS + 1_000)), 1);
+}
 
-    // A query's `not_after` is by the client's clock, moved to the node's
-    // time as the client last learned it, and again once refused.
+/// A query's `not_after` is by the client's clock, moved to the node's
+/// time as the client last learned it, and again once refused.
+#[test]
+fn a_querys_deadline_moves_to_the_nodes_time() {
+    let served = Served::plain();
+    let client = served.client(1);
+    let agent = served.agent;
     let now = served.now();
     let query = |not_after| {
         client
@@ -139,11 +154,11 @@ fn signatures_sessions_and_staleness_are_checked() {
         query(vos_node::wall_clock() + 600_000),
         Response::Rejected(Rejection::StaleQuery { now })
     );
-    assert_eq!(done(query(vos_node::wall_clock() + 1_000)), 1);
+    assert_eq!(done(query(vos_node::wall_clock() + 1_000)), 0);
     // The node's clock ten minutes ahead: refused once, the query goes
     // again at its time.
     served.clock.store(now + 600_000, Ordering::SeqCst);
-    assert_eq!(done(query(vos_node::wall_clock() + 60_000)), 1);
+    assert_eq!(done(query(vos_node::wall_clock() + 60_000)), 0);
 }
 
 /// An expired session is refused for good: the client starts another,

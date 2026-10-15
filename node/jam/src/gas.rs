@@ -15,16 +15,16 @@ use crate::simulate::Simulation;
 
 /// A software BLAKE2b compression on JAM, its failed precompile call
 /// included, with room to spare.
-pub const COMPRESSION: u64 = 24_000;
+pub(crate) const COMPRESSION: u64 = 24_000;
 /// An export: the call and its copy.
-pub const EXPORT: u64 = 6_000;
+pub(crate) const EXPORT: u64 = 6_000;
 /// The agent's own work on one row the apply writes, beyond hashing it.
-pub const WRITE: u64 = 40_000;
+pub(crate) const WRITE: u64 = 40_000;
 /// The agent's own work on one row its witness opens, a key or a scanned
 /// range's row, beyond hashing it: decoding and serving it.
-pub const ROW: u64 = 20_000;
+pub(crate) const ROW: u64 = 20_000;
 /// The agent's start and finish on JAM: entering, verifying, exporting.
-pub const FIXED: u64 = 3_000_000;
+pub(crate) const FIXED: u64 = 3_000_000;
 
 /// The compressions hashing `len` bytes takes.
 const fn compressions(len: usize) -> u64 {
@@ -103,7 +103,7 @@ pub const PAGE_DROP: u64 =
 /// step restores it: its key and its opened row in the witness, its leaf
 /// and the branch over it in the proof, its import, and its index and hash
 /// in the workflow's record.
-pub const PAGE_PAYLOAD: usize =
+pub(crate) const PAGE_PAYLOAD: usize =
     (1 + PAGE_KEY) + (1 + 16 + 1 + PAGE_VALUE) + (2 + PAGE_KEY + 32) + 3 + 12 + RECORD_PAGE;
 
 /// The branches above each row a package's bounds allow: the depth of a
@@ -145,7 +145,7 @@ pub const ENDING: u64 = FIXED
 /// The same for its package's payload: the package's batch and framing, the
 /// record and the other rows opened, and the paths' entries, each branch
 /// and its closed sibling.
-pub const ENDING_PAYLOAD: usize = 1024
+pub(crate) const ENDING_PAYLOAD: usize = 1024
     + (1 + RECORD_KEY + 1 + 16 + 4 + RECORD)
     + SMALL_ROWS as usize * (2 * SMALL_KEY + SMALL_VALUE + 56)
     + (SMALL_ROWS as usize + 3) * PATH as usize * (3 + 33);
@@ -170,7 +170,7 @@ fn proof(entries: &[Entry]) -> u64 {
 /// - applying its work result: decoding it, then each row it writes
 ///   salted, committed and put, every branch its witness opens rehashed;
 /// - exporting its pages and its work result, and hashing the result.
-pub fn own(package: &Package, simulation: &Simulation) -> u64 {
+pub(crate) fn own(package: &Package, simulation: &Simulation) -> u64 {
     let witness = &package.witness;
     let mut hashes = proof(&witness.proof.entries);
     for (_, opened) in &witness.keys {

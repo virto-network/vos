@@ -86,7 +86,7 @@ use crate::{Error, gas};
 
 /// The largest work package input the builder makes: PolkaJam's
 /// `max_input` (`W_B`) is 13,791,360 bytes, imports and all.
-pub const MAX_INPUT: usize = 12 << 20;
+pub(crate) const MAX_INPUT: usize = 12 << 20;
 /// What a package's refine keeps past its estimate, in parts of a
 /// thousand of its gas.
 pub const MARGIN: u64 = 50;

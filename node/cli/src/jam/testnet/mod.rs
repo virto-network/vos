@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use vos_jam::live::{Live, Node};
+use vos_jam::live::{Live, PolkaJam};
 use vos_jam::programs::Installable;
 use vos_jam::{Builder, Chain, Emulated, Error, Runner, Store, Taken};
 use vos_pvm::refine::PreparedProgram;
@@ -136,7 +136,7 @@ struct Rig {
 /// attempts each package took, and the record.
 struct Testnet {
     args: TestnetArgs,
-    node: Node,
+    node: PolkaJam,
     agent: Vec<u8>,
     actors: Actors,
     alice: Alice,
@@ -153,7 +153,7 @@ struct Ran {
 
 impl Testnet {
     fn new(args: TestnetArgs) -> Result<Self, String> {
-        let node = Node {
+        let node = PolkaJam {
             rpc: args.rpc.clone(),
             jamt: args.polkajam.join("jamt"),
             files: args.data.join("files"),

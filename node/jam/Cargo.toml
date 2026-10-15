@@ -12,6 +12,7 @@ hex = "0.4"
 fjall = { workspace = true }
 lz4_flex = "0.13"
 serde_json = "1"
+thiserror = "2"
 vos-pvm = { workspace = true }
 vos-pvm-compiler = { workspace = true }
 vos-tree = { workspace = true }

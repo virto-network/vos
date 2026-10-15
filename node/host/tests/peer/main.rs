@@ -68,6 +68,24 @@ fn forward() -> PeerMessage {
 
 const SPACE: [NodeNumber; 4] = [1, 2, 3, 4];
 
+/// A placement of `replicas`, the configuration before it `before`,
+/// announced at `term` and `index`, committed or not, and not joint.
+fn placement(
+    replicas: &[NodeNumber],
+    before: &[NodeNumber],
+    (term, index): (u64, u64),
+    committed: bool,
+) -> Placement {
+    Placement {
+        replicas: replicas.to_vec(),
+        before: before.to_vec(),
+        term,
+        index,
+        joint: false,
+        committed,
+    }
+}
+
 fn raft(message: Raft) -> PeerMessage {
     PeerMessage::Raft {
         agent: AGENT,

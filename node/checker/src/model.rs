@@ -116,7 +116,11 @@ impl Log {
 
     pub fn events(&self) -> String {
         let events = self.events.lock().unwrap();
-        events.iter().cloned().collect::<Vec<_>>().join("\n")
+        events
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
 

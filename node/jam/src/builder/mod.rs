@@ -32,9 +32,8 @@ use crate::da::Segments;
 use crate::simulate::Runner;
 use crate::store::{Pending, Store, View};
 
-pub use fit::{
-    MARGIN, MAX_INPUT, MAX_INPUTS, OWN_BOUND, POLKAJAM_REFINE_GAS, Prepared, WORST_ENDING, budget,
-};
+pub(crate) use fit::MAX_INPUT;
+pub use fit::{MARGIN, MAX_INPUTS, OWN_BOUND, POLKAJAM_REFINE_GAS, Prepared, WORST_ENDING, budget};
 
 /// The times the builder makes a batch again before it stops.
 const ATTEMPTS: usize = 4;
@@ -96,7 +95,7 @@ impl Builder {
     }
 
     /// The agent's state version: the work results its store took.
-    pub fn version(&self) -> Result<u64, Error> {
+    pub(crate) fn version(&self) -> Result<u64, Error> {
         record(&self.store.view(), &keys::version()).map(|version| version.unwrap_or(0))
     }
 

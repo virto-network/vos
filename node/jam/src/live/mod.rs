@@ -35,13 +35,13 @@ use rpc::decoded;
 
 /// The slots past a preimage's arrival the finalized block must be before
 /// a package that needs it: it must be past that slot; one more is margin.
-pub const ANCHOR_MARGIN: u64 = 2;
+const ANCHOR_MARGIN: u64 = 2;
 /// The RPC errors in a row a wait takes before it stops.
 const TRANSIENT: u32 = 10;
 
 /// A PolkaJam node, by its RPC's address, and the `jamt` that reaches it.
 #[derive(Clone, Debug)]
-pub struct Node {
+pub struct PolkaJam {
     /// `host:port` of its JSON-RPC over HTTP.
     pub rpc: String,
     pub jamt: PathBuf,
@@ -85,7 +85,7 @@ fn failed(what: impl std::fmt::Display) -> Error {
     Error::Node(what.to_string())
 }
 
-impl Node {
+impl PolkaJam {
     pub fn parameters(&self) -> Result<Parameters, Error> {
         let answer = self.call("parameters", json!([]))?;
         let fields = &answer["V1"];
@@ -118,14 +118,19 @@ impl Node {
     }
 
     /// A value of `service`'s storage at block `head`.
-    pub fn value(&self, head: &str, service: u64, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+    pub(crate) fn value(
+        &self,
+        head: &str,
+        service: u64,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, Error> {
         let answer = self.call("serviceValue", json!([head, service, STANDARD.encode(key)]))?;
         decoded(&answer)
     }
 
     /// The slots at which `service`'s request for the preimage of `hash`,
     /// `len` bytes long, changed, at block `head`; `None` when it has none.
-    pub fn request(
+    pub(crate) fn request(
         &self,
         head: &str,
         service: u64,
@@ -150,7 +155,7 @@ impl Node {
     }
 
     /// Segments of the package whose exports' segment root is `root`.
-    pub fn fetch(&self, root: &Hash, indices: &[u32]) -> Result<Vec<Vec<u8>>, Error> {
+    pub(crate) fn fetch(&self, root: &Hash, indices: &[u32]) -> Result<Vec<Vec<u8>>, Error> {
         let answer = self.call("fetchSegments", json!([STANDARD.encode(root), indices]))?;
         answer
             .as_array()
@@ -162,7 +167,7 @@ impl Node {
 
     /// The agent `service` as the finalized block holds it, both its keys
     /// read there; and that block's slot.
-    pub fn landed(&self, service: u64) -> Result<(Landed, u64), Error> {
+    pub(crate) fn landed(&self, service: u64) -> Result<(Landed, u64), Error> {
         let (head, slot) = self.finalized()?;
         let landed = Landed::read(
             self.value(&head, service, ROOT)?.as_deref(),
@@ -207,7 +212,7 @@ impl Node {
 /// The slot a preimage's request history says it has been available since:
 /// `[x]`, or `[x, y, z]` once provided again; `None` when it is not, as
 /// `[]` (asked for), or `[x, y]` (provided, then forgotten).
-pub fn available(slots: &[u64]) -> Option<u64> {
+fn available(slots: &[u64]) -> Option<u64> {
     match slots {
         [since] | [_, _, since] => Some(*since),
         _ => None,
@@ -215,7 +220,7 @@ pub fn available(slots: &[u64]) -> Option<u64> {
 }
 
 /// A node's segments, fetched by RPC.
-struct Fetched(Node);
+struct Fetched(PolkaJam);
 
 impl Segments for Fetched {
     fn segment(&self, root: &Hash, index: u32) -> Option<Vec<u8>> {
@@ -225,7 +230,7 @@ impl Segments for Fetched {
 
 /// An agent's service on a PolkaJam node, as its builder's chain.
 pub struct Live {
-    pub node: Node,
+    pub node: PolkaJam,
     pub service: u64,
 }
 

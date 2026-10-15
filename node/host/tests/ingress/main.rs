@@ -15,7 +15,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
 use std::collections::HashMap;
@@ -43,7 +43,7 @@ const COUNTER: InstanceId = InstanceId(1);
 /// A node serving ingress, with one agent running the counter.
 struct Served {
     node: Node,
-    base: String,
+    address: SocketAddr,
     target: Target,
     clock: Arc<AtomicU64>,
     token: String,
@@ -78,8 +78,7 @@ impl Served {
         configure(&mut config);
         let node = Node::open(dir.path(), config).unwrap();
         let address = node.serve("127.0.0.1:0".parse().unwrap()).unwrap();
-        let base = format!("http://{address}");
-        let target = Target::loopback(&base).unwrap();
+        let target = Target::loopback(&format!("http://{address}")).unwrap();
         let token = std::fs::read_to_string(dir.path().join(ADMIN_TOKEN)).unwrap();
         let operator = Operator::new(&target, &token);
         let Ok(Response::Created(agent)) = operator.create_agent(Vec::new()) else {
@@ -92,7 +91,7 @@ impl Served {
             .expect("an installed schema");
         Self {
             node,
-            base,
+            address,
             target,
             clock,
             token,
@@ -163,8 +162,7 @@ impl Served {
 }
 
 /// The status line a raw request gets.
-fn status_line(base: &str, request: &[u8]) -> String {
-    let address: SocketAddr = base.trim_start_matches("http://").parse().unwrap();
+fn status_line(address: SocketAddr, request: &[u8]) -> String {
     let mut stream = TcpStream::connect(address).unwrap();
     stream.write_all(request).unwrap();
     let mut response = Vec::new();

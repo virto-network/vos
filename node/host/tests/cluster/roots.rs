@@ -16,6 +16,7 @@ use vos_wire::Encode;
 use vos_wire::batch::Request;
 use vos_wire::ids::{AgentId, MapId};
 use vos_wire::keys;
+use vos_wire::peer::NodeNumber;
 use vos_wire::records::{unstored, unversioned};
 use vos_wire::result::Write;
 
@@ -57,7 +58,12 @@ fn writes(cluster: &Cluster, sequence: u64) -> Request {
 }
 
 /// Each request in `sequences`, at node `at`.
-fn write(cluster: &Cluster, at: u8, agent: AgentId, sequences: std::ops::RangeInclusive<u64>) {
+fn write(
+    cluster: &Cluster,
+    at: NodeNumber,
+    agent: AgentId,
+    sequences: std::ops::RangeInclusive<u64>,
+) {
     for sequence in sequences {
         let reply = smol::block_on(cluster.node(at).call(agent, writes(cluster, sequence)));
         assert_eq!(done(reply), 25, "sequence {sequence}");
@@ -128,7 +134,7 @@ fn check(node: &Node, agent: AgentId, root: Hash) {
 
 /// Every replica's root at the agent's version, once all have built it:
 /// the same on each.
-fn same_root(cluster: &Cluster, agent: AgentId, replicas: &[u8]) -> Hash {
+fn same_root(cluster: &Cluster, agent: AgentId, replicas: &[NodeNumber]) -> Hash {
     let mut roots = Vec::new();
     wait_until(
         "every replica builds the root at the agent's version",

@@ -137,7 +137,7 @@ impl Cluster {
         self.log.saw(what);
         if what.starts_with("fault") {
             self.log.event(format!(
-                "{what}, leaders {:?}",
+                "{what}, running {:?}",
                 self.slots
                     .iter()
                     .map(|slot| slot.node.lock().unwrap().is_some())

@@ -248,28 +248,22 @@ pub struct Processes {
 const OPERATOR: Duration = Duration::from_secs(5);
 
 impl Processes {
-    pub fn data(&self, number: usize) -> PathBuf {
+    pub(crate) fn data(&self, number: usize) -> PathBuf {
         self.dir.path().join(format!("node-{number}"))
     }
 
-    pub fn log_path(&self, number: usize) -> PathBuf {
+    pub(crate) fn log_path(&self, number: usize) -> PathBuf {
         self.dir.path().join(format!("node-{number}.log"))
     }
 
     /// Node `number`'s faults file, which it reads every 50 ms.
-    pub fn faults_file(&self, number: usize) -> PathBuf {
+    pub(crate) fn faults_file(&self, number: usize) -> PathBuf {
         self.dir.path().join(format!("node-{number}.faults"))
     }
 
-    pub fn url(&self, number: usize) -> String {
+    pub(crate) fn url(&self, number: usize) -> String {
         let scheme = if self.options.tls { "https" } else { "http" };
         format!("{scheme}://127.0.0.1:{}", self.ingress[number - 1])
-    }
-
-    pub fn key(&self, number: usize) -> [u8; 32] {
-        let mut key = [0; 32];
-        hex::decode_to_slice(&self.keys[number - 1], &mut key).unwrap();
-        key
     }
 
     /// Where node `number`'s ingress is reached.
@@ -279,7 +273,7 @@ impl Processes {
 
     /// Node `number`'s operator, by the token its run wrote: the same
     /// one, and its kept connections, until the node starts again.
-    pub fn operator(&self, number: usize) -> Arc<Operator> {
+    pub(crate) fn operator(&self, number: usize) -> Arc<Operator> {
         let token = std::fs::read_to_string(self.data(number).join(vos_node::ADMIN_TOKEN)).unwrap();
         let mut kept = self.slot(number).operator.lock().unwrap();
         match &*kept {

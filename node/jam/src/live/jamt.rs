@@ -8,13 +8,13 @@ use std::time::{Duration, Instant};
 
 use vos_tree::Hash;
 
-use super::{Node, failed};
+use super::{PolkaJam, failed};
 use crate::Error;
 
 /// How long a `jamt` command may take.
 const JAMT_TIMEOUT: Duration = Duration::from_secs(300);
 
-impl Node {
+impl PolkaJam {
     /// Run `jamt` with `args`, for at most [`JAMT_TIMEOUT`]: what it
     /// printed, on its output and on its errors.
     fn jamt(&self, args: impl IntoIterator<Item: AsRef<OsStr>>) -> Result<(String, String), Error> {
@@ -80,7 +80,7 @@ impl Node {
     /// exports `exports` segments and imports `imports`, by segment root.
     /// What `jamt` said of it, its lines joined: the package's hash, cut
     /// short, and its anchor among them.
-    pub fn item(
+    pub(crate) fn item(
         &self,
         service: u64,
         payload: &[u8],

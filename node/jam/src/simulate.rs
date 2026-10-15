@@ -68,7 +68,7 @@ impl Runner {
 
     /// What a JAM node gives a refine of `payload`, which imports
     /// `imports`.
-    pub fn jam(&self, payload: Vec<u8>, imports: Vec<Vec<u8>>) -> JamRefine {
+    pub(crate) fn jam(&self, payload: Vec<u8>, imports: Vec<Vec<u8>>) -> JamRefine {
         JamRefine {
             service: self.service,
             items: vec![JamItem { payload, imports }],
@@ -84,7 +84,7 @@ impl Runner {
 }
 
 /// Where a workflow's page is, by its workflow and index: its bytes.
-pub type Pages = Arc<dyn Fn(WorkflowId, u32) -> Option<Vec<u8>> + Send + Sync>;
+pub(crate) type Pages = Arc<dyn Fn(WorkflowId, u32) -> Option<Vec<u8>> + Send + Sync>;
 
 /// A batch as the simulation found it.
 #[derive(Clone, Debug)]
@@ -108,7 +108,7 @@ pub struct Simulation {
 }
 
 /// Simulate `batch` on `view`, the pages its workflows hold from `pages`.
-pub fn simulate(
+pub(crate) fn simulate(
     runner: &Runner,
     view: &View,
     pages: Pages,
@@ -176,7 +176,7 @@ struct Log {
 }
 
 impl Log {
-    fn failed<T>(&mut self, result: Result<T, Error>) -> Option<T> {
+    fn ok<T>(&mut self, result: Result<T, Error>) -> Option<T> {
         result
             .map_err(|error| {
                 self.error.get_or_insert(error);
@@ -192,7 +192,7 @@ impl StateReader for Recorder {
     fn read(&self, key: &[u8]) -> Option<Vec<u8>> {
         let mut log = self.log.lock().expect("the log");
         log.reads.insert(key.to_vec());
-        let value = log.failed(self.view.get(key))??;
+        let value = log.ok(self.view.get(key))??;
         let Some(place) = keys::page_entry(key) else {
             return Some(value);
         };
@@ -252,7 +252,7 @@ impl Iterator for Scan<'_> {
                 Some((key, value))
             }
             Some(Err(error)) => {
-                self.log.lock().expect("the log").failed::<()>(Err(error));
+                self.log.lock().expect("the log").ok::<()>(Err(error));
                 None
             }
             _ => {

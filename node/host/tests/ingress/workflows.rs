@@ -110,7 +110,7 @@ fn a_started_workflows_owner_reads_its_result_by_its_id() {
 
     // Another key: nothing, however long it would wait.
     let stranger = served.client(2);
-    let asked = std::time::Instant::now();
+    let asked = Instant::now();
     let unknown = stranger
         .workflow(served.agent, workflow, Duration::from_secs(20))
         .unwrap();
@@ -151,7 +151,7 @@ fn a_read_waits_for_its_workflow_within_its_bound() {
     let mut client = served.client(1);
     let tour = Tour::light(tours.other, vec![7], 600_000);
     let workflow = served.start_tour(&mut client, &tours, &tour);
-    let asked = std::time::Instant::now();
+    let asked = Instant::now();
     let sleeping = loop {
         match status(
             client
@@ -178,7 +178,7 @@ fn a_read_waits_for_its_workflow_within_its_bound() {
         std::thread::spawn(move || {
             let client =
                 Client::resume(&target, SigningKey::from_bytes(&[1; 32]), kept, identities);
-            let started = std::time::Instant::now();
+            let started = Instant::now();
             let answer = client.workflow(agent, workflow, Duration::from_secs(25));
             (answer, started.elapsed())
         })
@@ -258,7 +258,7 @@ fn reads_wait_within_the_nodes_bounds() {
     let read = |wait: Duration| {
         let (served, client) = (Arc::clone(&served), Arc::clone(&client));
         std::thread::spawn(move || {
-            let started = std::time::Instant::now();
+            let started = Instant::now();
             let answer = client.workflow(served.agent, workflow, wait).unwrap();
             assert!(matches!(status(answer), WorkflowStatus::Sleeping { .. }));
             started.elapsed()
@@ -294,7 +294,7 @@ fn a_read_waiting_ends_when_its_node_stops() {
     let workflow = served.napping(&mut client, &tours);
     let agent = served.agent;
     let reading = std::thread::spawn(move || {
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         let answer = client.workflow(agent, workflow, Duration::from_secs(25));
         (answer, started.elapsed())
     });

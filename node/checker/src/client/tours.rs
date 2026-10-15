@@ -17,7 +17,7 @@ use crate::model::Nodes;
 use crate::rounds::{ROUNDS_A_TOUR, TourMethods, signed_read, tour};
 
 /// How long a tour may take to end once started, through every failure.
-pub const TOUR_ENDS: Duration = Duration::from_secs(120);
+const TOUR_ENDS: Duration = Duration::from_secs(120);
 /// How long a read of a tour waits for it to end, within an attempt.
 const READ_WAIT: Duration = Duration::from_millis(1000);
 
@@ -27,7 +27,8 @@ const READ_WAIT: Duration = Duration::from_millis(1000);
 /// of one that failed once or not at all, no other, and the total their
 /// sum. How many applied, or why not.
 pub fn check_tallies(touring: &Touring, tallies: &[(u64, u64)], total: u64) -> Result<u64, String> {
-    let ended = touring.ended.lock().unwrap();
+    let tours = touring.tours();
+    let ended = &tours.ended;
     let of_a_tour = |amount: u64| {
         (1..=ROUNDS_A_TOUR).contains(&(amount % 10)) && ended.contains_key(&(amount / 10))
     };
@@ -69,37 +70,48 @@ struct Started {
 /// which it reads to its end before its next.
 pub struct Touring {
     pub methods: TourMethods,
+    tours: Mutex<Tours>,
+}
+
+/// A touring client's tours, as far as it knows them.
+struct Tours {
     /// Each request's tour once its start was answered.
-    started: Mutex<BTreeMap<u64, Started>>,
+    started: BTreeMap<u64, Started>,
     /// The workflow in flight, for faults aimed at it.
-    current: Mutex<Option<WorkflowId>>,
+    current: Option<WorkflowId>,
     /// The asked rounds' total once every tour so far ended: unknown once
     /// one failed, whose rounds may or may not have run, or run later.
-    base: Mutex<Option<u64>>,
+    base: Option<u64>,
     /// Each tour that ended, by its request: whether done, as a straight
     /// run ends it, or failed.
-    ended: Mutex<BTreeMap<u64, bool>>,
+    ended: BTreeMap<u64, bool>,
 }
 
 impl Touring {
-    pub fn new(methods: TourMethods) -> Self {
+    pub(crate) fn new(methods: TourMethods) -> Self {
         Self {
             methods,
-            started: Mutex::new(BTreeMap::new()),
-            current: Mutex::new(None),
-            base: Mutex::new(Some(0)),
-            ended: Mutex::new(BTreeMap::new()),
+            tours: Mutex::new(Tours {
+                started: BTreeMap::new(),
+                current: None,
+                base: Some(0),
+                ended: BTreeMap::new(),
+            }),
         }
+    }
+
+    fn tours(&self) -> std::sync::MutexGuard<'_, Tours> {
+        self.tours.lock().unwrap()
     }
 
     /// The tour in flight, if one is.
     pub fn current(&self) -> Option<WorkflowId> {
-        *self.current.lock().unwrap()
+        self.tours().current
     }
 
     /// The tours ended done, and those failed.
     pub fn ended(&self) -> (u64, u64) {
-        let ended = self.ended.lock().unwrap();
+        let ended = &self.tours().ended;
         let done = ended.values().filter(|done| **done).count() as u64;
         (done, ended.len() as u64 - done)
     }
@@ -122,8 +134,8 @@ impl Client {
         timed: &super::Timed,
     ) {
         let touring = self.touring.as_ref().expect("a touring client");
-        let mut started = touring.started.lock().unwrap();
-        match started.get(&request) {
+        let mut tours = touring.tours();
+        match tours.started.get(&request) {
             Some(first) => assert_eq!(
                 first.workflow, workflow,
                 "client {}: request {request} started two workflows",
@@ -131,7 +143,7 @@ impl Client {
             ),
             None => {
                 let secret = timed.secret;
-                started.insert(
+                tours.started.insert(
                     request,
                     Started {
                         workflow,
@@ -139,7 +151,7 @@ impl Client {
                         at,
                     },
                 );
-                *touring.current.lock().unwrap() = Some(workflow);
+                tours.current = Some(workflow);
             }
         }
     }
@@ -154,7 +166,7 @@ impl Client {
             workflow,
             secret,
             at: mut floor,
-        } = touring.started.lock().unwrap()[&request];
+        } = touring.tours().started[&request];
         let key = SigningKey::from_bytes(&secret);
         let tour = tour(self.next_agent().expect("the next agent"), request);
         let path = format!("/agents/{}/workflows", self.agent.0);
@@ -217,7 +229,7 @@ impl Client {
                 ),
             }
         };
-        *touring.current.lock().unwrap() = None;
+        touring.tours().current = None;
         // Another key reads nothing of it.
         if request.is_multiple_of(4) {
             let stranger = SigningKey::from_bytes(&[0xee; 32]);
@@ -240,10 +252,10 @@ impl Client {
                 nodes.log().saw("tour unknown to another key");
             }
         }
-        let mut base = touring.base.lock().unwrap();
+        let mut tours = touring.tours();
         match outcome {
             Outcome::Done(result) => {
-                match *base {
+                match tours.base {
                     Some(total) => assert_eq!(
                         result,
                         tour.result(total),
@@ -272,8 +284,8 @@ impl Client {
                         );
                     }
                 }
-                *base = base.map(|total| total + tour.sum());
-                touring.ended.lock().unwrap().insert(request, true);
+                tours.base = tours.base.map(|total| total + tour.sum());
+                tours.ended.insert(request, true);
                 nodes.log().saw("tour ended as a straight run");
             }
             failed => {
@@ -282,8 +294,8 @@ impl Client {
                     self.number, workflow.0
                 ));
                 nodes.log().saw("tour failed");
-                *base = None;
-                touring.ended.lock().unwrap().insert(request, false);
+                tours.base = None;
+                tours.ended.insert(request, false);
             }
         }
     }
@@ -300,16 +312,11 @@ mod tests {
         let id = MethodId(0);
         let methods = TourMethods {
             tour: id,
-            rewrite: id,
             total: id,
             tallies: id,
         };
         let touring = Touring::new(methods);
-        touring
-            .ended
-            .lock()
-            .unwrap()
-            .extend([(1, true), (2, false)]);
+        touring.tours().ended.extend([(1, true), (2, false)]);
         touring
     }
 

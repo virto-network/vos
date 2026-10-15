@@ -8,17 +8,10 @@ use super::*;
 /// outranked by the next leader's, at whatever index.
 #[test]
 fn placements_are_ordered_by_term_then_index_then_commitment() {
-    let placement = |term, index, committed| Placement {
-        replicas: vec![1, 2, 3],
-        before: Vec::new(),
-        term,
-        index,
-        joint: false,
-        committed,
-    };
-    assert!(placement(5, 80, false).order() > placement(4, 100, false).order());
-    assert!(placement(4, 100, false).order() > placement(4, 90, true).order());
-    assert!(placement(4, 100, true).order() > placement(4, 100, false).order());
+    let announced = |term, index, committed| placement(&[1, 2, 3], &[], (term, index), committed);
+    assert!(announced(5, 80, false).order() > announced(4, 100, false).order());
+    assert!(announced(4, 100, false).order() > announced(4, 90, true).order());
+    assert!(announced(4, 100, true).order() > announced(4, 100, false).order());
 }
 
 /// A placement at creation comes from the agent's creator, or relayed
@@ -86,14 +79,7 @@ fn a_placement_comes_from_its_creator_then_from_its_members() {
         ),
         Err(Refusal::NotTheCreator)
     );
-    let later = Placement {
-        replicas: vec![1, 2, 4],
-        before: vec![1, 2, 3, 4],
-        term: 3,
-        index: 12,
-        joint: false,
-        committed: false,
-    };
+    let later = placement(&[1, 2, 4], &[1, 2, 3, 4], (3, 12), false);
     assert_eq!(check(3, later.clone()), Ok(()), "a leader removing itself");
     assert_eq!(check(4, later.clone()), Ok(()));
     let stranger = Placement {
@@ -108,22 +94,16 @@ fn a_placement_comes_from_its_creator_then_from_its_members() {
 /// before it learns that it committed leaves the commit held.
 #[test]
 fn no_placement_takes_back_a_commit() {
-    let placement = |term, index, committed| Placement {
-        replicas: vec![1, 2, 3],
-        before: vec![1, 2, 4],
-        term,
-        index,
-        joint: false,
-        committed,
-    };
-    let held = placement(4, 100, true);
-    assert!(!placement(5, 100, false).supersedes(&held));
-    assert!(!placement(5, 90, true).supersedes(&held));
-    assert!(!placement(4, 100, true).supersedes(&held));
-    assert!(placement(5, 100, true).supersedes(&held));
-    assert!(placement(4, 120, false).supersedes(&held));
+    let announced =
+        |term, index, committed| placement(&[1, 2, 3], &[1, 2, 4], (term, index), committed);
+    let held = announced(4, 100, true);
+    assert!(!announced(5, 100, false).supersedes(&held));
+    assert!(!announced(5, 90, true).supersedes(&held));
+    assert!(!announced(4, 100, true).supersedes(&held));
+    assert!(announced(5, 100, true).supersedes(&held));
+    assert!(announced(4, 120, false).supersedes(&held));
     assert!(
-        placement(5, 80, false).supersedes(&placement(4, 100, false)),
+        announced(5, 80, false).supersedes(&announced(4, 100, false)),
         "a phantom gives way"
     );
 }

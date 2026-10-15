@@ -40,7 +40,7 @@ fn a_token_that_is_not_hex_is_refused_and_frees_its_connection() {
     );
     for _ in 0..3 * connections {
         assert_eq!(
-            status_line(&served.base, request.as_bytes()),
+            status_line(served.address, request.as_bytes()),
             "HTTP/1.1 401 Unauthorized"
         );
     }

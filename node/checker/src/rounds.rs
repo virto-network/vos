@@ -26,13 +26,12 @@ pub const ASKED: InstanceId = InstanceId(5);
 /// The rounds instance the previous agent's tours' messages tally at.
 pub const TOLD: InstanceId = InstanceId(6);
 /// A tour's rounds.
-pub const ROUNDS_A_TOUR: u64 = 3;
+pub(crate) const ROUNDS_A_TOUR: u64 = 3;
 
 /// The rounds actor's methods a checker calls.
 #[derive(Clone, Copy, Debug)]
 pub struct TourMethods {
     pub tour: MethodId,
-    pub rewrite: MethodId,
     pub total: MethodId,
     pub tallies: MethodId,
 }
@@ -47,7 +46,6 @@ impl TourMethods {
         };
         Self {
             tour: method("tour"),
-            rewrite: method("rewrite"),
             total: method("total"),
             tallies: method("tallies"),
         }
@@ -59,7 +57,6 @@ impl TourMethods {
 pub struct Rounds {
     /// Its package, the ELF its crate built.
     pub elf: Vec<u8>,
-    pub program: Vec<u8>,
     pub methods: TourMethods,
 }
 
@@ -69,7 +66,6 @@ impl Rounds {
         Self {
             elf: crate::programs::package("rounds"),
             methods: TourMethods::of(&crate::programs::schema(&program)),
-            program,
         }
     }
 
@@ -131,7 +127,7 @@ impl Tour {
     }
 
     /// What its amounts add up to.
-    pub fn sum(&self) -> u64 {
+    pub(crate) fn sum(&self) -> u64 {
         self.amounts.iter().sum()
     }
 }
@@ -139,7 +135,7 @@ impl Tour {
 /// The rounds actor's `churn`, on the host: `passes` passes over `words`
 /// pseudo-random words drawn from `seed`, each word mixed with the next.
 /// Their digest.
-pub fn churn(seed: u64, words: u32, passes: u32) -> u64 {
+pub(crate) fn churn(seed: u64, words: u32, passes: u32) -> u64 {
     let mut data = vec![0u64; words.max(1) as usize];
     let mut state = seed | 1;
     for value in data.iter_mut() {

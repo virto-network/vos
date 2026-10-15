@@ -45,7 +45,7 @@ impl Segments for Da {
 /// segments' hashes, BLAKE2b-256 under its own tag, its odd node carried up.
 /// It names the segments here as the Gray Paper's constant-depth tree
 /// names them on JAM, but is not that root.
-pub fn segment_root(segments: &[Vec<u8>]) -> Hash {
+pub(crate) fn segment_root(segments: &[Vec<u8>]) -> Hash {
     let mut level: Vec<Hash> = segments
         .iter()
         .map(|segment| Blake2b.hash(TAG, &[&[0], segment]))

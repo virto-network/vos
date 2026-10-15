@@ -57,7 +57,7 @@ pub trait Chain {
 
 /// The most a work report's outputs take, the Gray Paper's `W_R`
 /// (48 KiB, as PolkaJam's parameters give it): what refine may return.
-pub const MAX_REFINE_OUTPUT: usize = 48 << 10;
+pub(crate) const MAX_REFINE_OUTPUT: usize = 48 << 10;
 
 /// Accumulate's gas: it swaps a root and solicits a few preimages.
 const ACCUMULATE_GAS: u64 = 10_000_000;

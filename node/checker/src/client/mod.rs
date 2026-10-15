@@ -6,7 +6,7 @@ pub(crate) mod tours;
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
@@ -104,7 +104,7 @@ pub struct Client {
     /// It stopped for a pause.
     idle: AtomicBool,
     /// The node it calls, until it fails.
-    calling: Mutex<NodeNumber>,
+    calling: AtomicU8,
     /// The next client's agent, which its forwards go to.
     next: std::sync::OnceLock<AgentId>,
     /// The highest request it has started to send.
@@ -174,7 +174,7 @@ impl Client {
             sessions: Mutex::new(Vec::new()),
             names: AtomicU64::new(0),
             idle: AtomicBool::new(false),
-            calling: Mutex::new(1),
+            calling: AtomicU8::new(1),
             next: std::sync::OnceLock::new(),
             sent: AtomicU64::new(0),
             acked: Mutex::new(Acked::default()),
@@ -208,10 +208,6 @@ impl Client {
 
     pub fn next_agent(&self) -> Option<AgentId> {
         self.next.get().copied()
-    }
-
-    pub fn forwarding(&self) -> bool {
-        self.forwarding
     }
 
     /// The highest request it has started to send.
@@ -378,7 +374,10 @@ impl Client {
         self.sent.fetch_max(request, Ordering::SeqCst);
         // Requests take turns at every node, followers forwarding to the
         // leader and other nodes naming the replicas.
-        *self.calling.lock().unwrap() = node_at(request + u64::from(self.number), count);
+        self.calling.store(
+            node_at(request + u64::from(self.number), count),
+            Ordering::SeqCst,
+        );
         let mut tries = 0usize;
         loop {
             assert!(
@@ -392,10 +391,10 @@ impl Client {
             let (timed, sequence) = self.session(nodes, request);
             let session = timed.session;
             let body = self.body(&timed, sequence, request);
-            let at = *self.calling.lock().unwrap();
+            let at = self.calling.load(Ordering::SeqCst);
             let starts = nodes.starts(at);
             let next = |client: &Self| {
-                *client.calling.lock().unwrap() = at % count + 1;
+                client.calling.store(at % count + 1, Ordering::SeqCst);
             };
             let offset = nodes.offset();
             match post(nodes, at, &path, &body) {
@@ -445,7 +444,7 @@ impl Client {
                 }) => {
                     nodes.log().saw("redirect");
                     match nodes.number_at(&leader.address) {
-                        Some(leader) => *self.calling.lock().unwrap() = leader,
+                        Some(leader) => self.calling.store(leader, Ordering::SeqCst),
                         None => panic!("a redirect to {}", leader.address),
                     }
                 }
@@ -460,7 +459,8 @@ impl Client {
                     if named.is_empty() {
                         next(self);
                     } else {
-                        *self.calling.lock().unwrap() = named[tries % named.len()];
+                        self.calling
+                            .store(named[tries % named.len()], Ordering::SeqCst);
                     }
                 }
                 Ok(

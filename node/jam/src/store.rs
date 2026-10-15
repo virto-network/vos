@@ -26,7 +26,7 @@ use crate::Error;
 pub type Writes = BTreeMap<Vec<u8>, Option<Vec<u8>>>;
 
 /// Rows as a store reads them, in key order.
-pub type RowsFrom = Box<dyn Iterator<Item = Result<(Vec<u8>, Vec<u8>), Error>>>;
+pub(crate) type RowsFrom = Box<dyn Iterator<Item = Result<(Vec<u8>, Vec<u8>), Error>>>;
 
 /// Where a page was exported: its package's segment root, and its index
 /// among the package's exports.
@@ -105,7 +105,7 @@ impl Store {
 
     /// Commit `pending`, durably, in one batch: refused, `Error::Root`,
     /// unless the store still holds the root it was staged on.
-    pub fn commit(&self, pending: Pending) -> Result<(), Error> {
+    pub(crate) fn commit(&self, pending: Pending) -> Result<(), Error> {
         if self.root()? != pending.base {
             return Err(Error::Root);
         }
@@ -155,7 +155,7 @@ impl View {
     }
 
     /// The rows from `from` on, in key order.
-    pub fn rows_from(&self, from: &[u8]) -> RowsFrom {
+    pub(crate) fn rows_from(&self, from: &[u8]) -> RowsFrom {
         let bounds = (Bound::Included(from.to_vec()), Bound::Unbounded);
         Box::new(self.snapshot.range(&self.rows, bounds).map(|guard| {
             let (key, value) = guard.into_inner()?;
@@ -169,7 +169,7 @@ impl View {
     }
 
     /// A row's leaf: its salt and its value's commitment.
-    pub fn leaf(&self, key: &[u8]) -> Result<Option<Leaf>, Error> {
+    pub(crate) fn leaf(&self, key: &[u8]) -> Result<Option<Leaf>, Error> {
         self.tree().leaf(key)
     }
 
@@ -187,7 +187,7 @@ impl View {
     }
 
     /// Where workflow `workflow`'s page `index` was exported.
-    pub fn page(&self, workflow: WorkflowId, index: u32) -> Result<Option<Exported>, Error> {
+    pub(crate) fn page(&self, workflow: WorkflowId, index: u32) -> Result<Option<Exported>, Error> {
         let Some(bytes) = self.snapshot.get(&self.pages, page_key(workflow, index))? else {
             return Ok(None);
         };
@@ -198,7 +198,7 @@ impl View {
 
     /// The rows applying `result` writes, each row it reads put in
     /// `reads`; `None` when it does not apply.
-    pub fn writes(
+    pub(crate) fn writes(
         &self,
         result: &WorkResult,
         reads: &mut BTreeSet<Vec<u8>>,
@@ -218,7 +218,7 @@ impl View {
 
     /// `writes`, made by a work result with `seed`, staged over this view:
     /// the rows, their leaves, each salted by it, and the root after.
-    pub fn stage(&self, writes: Writes, seed: &[u8; 32]) -> Result<Pending, Error> {
+    pub(crate) fn stage(&self, writes: Writes, seed: &[u8; 32]) -> Result<Pending, Error> {
         let leaves: Vec<(&[u8], Option<Leaf>)> = writes
             .iter()
             .map(|(key, value)| {

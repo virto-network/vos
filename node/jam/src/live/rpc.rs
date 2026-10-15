@@ -8,12 +8,12 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use serde_json::{Value, json};
 
-use super::{Node, failed};
+use super::{PolkaJam, failed};
 use crate::Error;
 
-impl Node {
+impl PolkaJam {
     /// One JSON-RPC call: its result.
-    pub fn call(&self, method: &str, params: Value) -> Result<Value, Error> {
+    pub(crate) fn call(&self, method: &str, params: Value) -> Result<Value, Error> {
         let body =
             json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).to_string();
         let mut stream = TcpStream::connect(&self.rpc).map_err(failed)?;
@@ -95,7 +95,7 @@ mod tests {
 
     /// A node whose RPC answers each call with the next of `answers`, as
     /// HTTP bodies: and the calls it was made, their bodies.
-    fn canned(answers: Vec<String>) -> (Node, std::thread::JoinHandle<Vec<Value>>) {
+    fn canned(answers: Vec<String>) -> (PolkaJam, std::thread::JoinHandle<Vec<Value>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let rpc = listener.local_addr().unwrap().to_string();
         let served = std::thread::spawn(move || {
@@ -122,7 +122,7 @@ mod tests {
             }
             calls
         });
-        let node = Node {
+        let node = PolkaJam {
             rpc,
             jamt: PathBuf::from("jamt"),
             files: std::env::temp_dir(),

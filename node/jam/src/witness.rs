@@ -12,7 +12,7 @@ use crate::simulate::Simulation;
 use crate::store::View;
 
 /// The witness of `simulation` against `view`'s root.
-pub fn witness(view: &View, simulation: &Simulation) -> Result<StateWitness, Error> {
+pub(crate) fn witness(view: &View, simulation: &Simulation) -> Result<StateWitness, Error> {
     let mut keys: BTreeMap<&[u8], Opened> = BTreeMap::new();
     for key in &simulation.reads {
         let opened = match (view.get(key)?, view.leaf(key)?) {

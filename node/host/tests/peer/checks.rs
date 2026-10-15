@@ -37,24 +37,18 @@ fn a_forwarded_call_comes_from_a_replica_on_its_agent_s_requests_stream() {
     // Its sender must replicate the agent: the leader trusts it to have
     // checked the call's signature. While a placement is uncommitted, the
     // nodes of the configuration before may still lead.
-    let placement = |replicas: Vec<NodeNumber>, committed| Placement {
-        replicas,
-        before: vec![1, 2, 3],
-        term: 4,
-        index: 9,
-        joint: false,
-        committed,
-    };
+    let replicas_of =
+        |replicas: Vec<NodeNumber>, committed| placement(&replicas, &[1, 2, 3], (4, 9), committed);
     assert_eq!(
-        peer::check_replica(Some(&placement(vec![1, 2, 3], true)), 2),
+        peer::check_replica(Some(&replicas_of(vec![1, 2, 3], true)), 2),
         Ok(())
     );
     assert_eq!(
-        peer::check_replica(Some(&placement(vec![1, 3, 4], true)), 2),
+        peer::check_replica(Some(&replicas_of(vec![1, 3, 4], true)), 2),
         Err(Refusal::NotAReplica)
     );
     assert_eq!(
-        peer::check_replica(Some(&placement(vec![1, 3, 4], false)), 2),
+        peer::check_replica(Some(&replicas_of(vec![1, 3, 4], false)), 2),
         Ok(())
     );
     assert_eq!(peer::check_replica(None, 2), Err(Refusal::NotAReplica));
