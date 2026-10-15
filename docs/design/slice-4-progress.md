@@ -1054,10 +1054,10 @@ with its software fallback.
   - test installs following the leader on `NotLeader`.
 - **Lines:** the steps moved about 25,000 lines into new modules. The net count barely moved: the module headers and the named helpers ate the removed duplicates.
 
-**Final gates on the cleaned code (83775f0f):**
+**Final gates on the cleaned code (44c73f6b):**
 - `just ci-full` green: 126 test binaries, 1,464 s.
 - The checker loop with workflows: 36 runs green, 878 s.
-- An earlier full run, on 7745cdab, failed once: a restarted node in the
+- An earlier full run, on 5e14d059, failed once: a restarted node in the
   served suite found its port taken while it was down, under heavy load.
   The harnesses now hold a down node's ports, and `free_port` never
   hands one out twice. The rerun is the one above.
