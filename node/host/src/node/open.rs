@@ -24,7 +24,7 @@ use crate::executor::Executors;
 use crate::pvm::Machines;
 use crate::storage::StorageThread;
 use crate::store::{Fjall, PersistMode};
-use crate::{lock, seed};
+use crate::{lock, random};
 
 /// The node's data directory: its store, and the operator's token. A
 /// stopped node's store may be opened at `STORE` in it.
@@ -271,7 +271,7 @@ fn node_secret(store: &Fjall) -> Result<[u8; 32], Error> {
     if let Some(secret) = store.node_secret()? {
         return Ok(secret);
     }
-    let secret = seed();
+    let secret = random();
     let mut batch = store.batch();
     batch.node_secret(&secret);
     batch.commit(PersistMode::SyncAll)?;

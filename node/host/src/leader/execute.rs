@@ -241,7 +241,7 @@ async fn store_result(inner: &Inner, result: Arc<Vec<u8>>) -> Result<(BlobRef, H
     let held = inner.blobs.hold(blob.hash);
     inner
         .blobs
-        .put_kept(blob, result, Keep::Named)
+        .put(blob, result, Keep::Named)
         .await
         .map_err(|error| Fault::Storage(format!("the blob store failed: {error}")))?;
     Ok((blob, held))

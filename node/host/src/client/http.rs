@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::{ClientError, Target};
+use crate::http::{MAX_HEAD, content_length};
 use crate::lock;
 
 /// A connection is used again only if it was idle less than this long,
@@ -134,7 +135,7 @@ impl Http {
     /// the node deduplicates): such a request that fails on a kept
     /// connection before any answer arrives is sent once more on a new
     /// one. The node likely restarted, so no kept connection is used.
-    pub(super) fn request(
+    fn request(
         &self,
         method: &str,
         path: &str,
@@ -168,18 +169,32 @@ impl Http {
         Ok((status, body))
     }
 
-    pub(super) fn get(&self, path: &str) -> Result<(u16, Vec<u8>), ClientError> {
-        self.request("GET", path, None, &[], true)
+    /// A read, by the operator when `token` is theirs.
+    pub(super) fn get(
+        &self,
+        path: &str,
+        token: Option<&str>,
+    ) -> Result<(u16, Vec<u8>), ClientError> {
+        self.request("GET", path, token, &[], true)
     }
 
-    pub(super) fn post(
+    /// A request the node may not take twice as once: never sent again.
+    pub(super) fn post_once(
         &self,
         path: &str,
         token: Option<&str>,
         body: &[u8],
-        repeatable: bool,
     ) -> Result<(u16, Vec<u8>), ClientError> {
-        self.request("POST", path, token, body, repeatable)
+        self.request("POST", path, token, body, false)
+    }
+
+    /// A request the node takes twice as once: a signed call or read.
+    pub(super) fn post_repeatable(
+        &self,
+        path: &str,
+        body: &[u8],
+    ) -> Result<(u16, Vec<u8>), ClientError> {
+        self.request("POST", path, None, body, true)
     }
 }
 
@@ -232,8 +247,7 @@ fn read_answer(connection: &mut Connection) -> std::io::Result<(u16, Vec<u8>, bo
                         .map(|header| header.value)
                 };
                 let length = header("content-length")
-                    .and_then(|value| std::str::from_utf8(value).ok())
-                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .and_then(content_length)
                     .ok_or_else(|| invalid("an answer without a length"))?;
                 if length > MAX_ANSWER {
                     return Err(invalid("an answer larger than any the node gives"));
@@ -252,7 +266,7 @@ fn read_answer(connection: &mut Connection) -> std::io::Result<(u16, Vec<u8>, bo
                 return Ok((status, body, close));
             }
             Ok(httparse::Status::Partial) => {
-                if connection.buffer.len() > 16 << 10 {
+                if connection.buffer.len() > MAX_HEAD {
                     return Err(invalid("an answer's head too large"));
                 }
                 let read = connection.stream.read(&mut chunk)?;

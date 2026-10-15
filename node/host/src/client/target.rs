@@ -18,8 +18,6 @@ pub struct Target {
     /// resolver could answer for.
     pub(super) loopback: Option<Vec<SocketAddr>>,
     pub(super) tls: Option<(Arc<rustls::ClientConfig>, ServerName<'static>)>,
-    /// The node's key, when pinned.
-    pub(super) key: Option<[u8; 32]>,
     /// How the client trusts it, which the nodes it is sent on to inherit.
     pub(super) trust: Trust,
 }
@@ -41,13 +39,8 @@ impl Target {
     /// loopback addresses only, and HTTPS needs a key or a CA to trust.
     pub fn new(url: &str, trust: Trust) -> Result<Self, ClientError> {
         let invalid = |why: &str| ClientError::Http(format!("{url}: {why}"));
-        let (secure, rest) = if let Some(rest) = url.strip_prefix("https://") {
-            (true, rest)
-        } else if let Some(rest) = url.strip_prefix("http://") {
-            (false, rest)
-        } else {
-            return Err(invalid("not an http:// or https:// address"));
-        };
+        let (secure, rest) =
+            scheme(url).ok_or_else(|| invalid("not an http:// or https:// address"))?;
         let (host, port) = host_and_port(rest, secure).map_err(invalid)?;
         let bare = host.trim_start_matches('[').trim_end_matches(']');
         let mut loopback = None;
@@ -74,9 +67,7 @@ impl Target {
                 return Err(invalid("https:// needs a key or a CA to trust"));
             }
             (true, trust) => {
-                let config = tls::client_config(trust)
-                    .map_err(ClientError::Http)?
-                    .expect("TLS for a key or a CA");
+                let config = tls::client_config(trust).map_err(ClientError::Http)?;
                 let name = match (ServerName::try_from(bare.to_string()), trust) {
                     (Ok(name), _) => name,
                     // A pinned key does not need the name, which only
@@ -93,10 +84,6 @@ impl Target {
             authority: format!("{host}:{port}"),
             loopback,
             tls,
-            key: match trust {
-                Trust::NodeKey(key) => Some(key),
-                _ => None,
-            },
             trust,
         })
     }
@@ -104,6 +91,14 @@ impl Target {
     /// The node at `url`, over plain HTTP on a loopback address.
     pub fn loopback(url: &str) -> Result<Self, ClientError> {
         Self::new(url, Trust::Loopback)
+    }
+}
+
+/// Whether `url` is `https://` or `http://`, and what follows its scheme.
+fn scheme(url: &str) -> Option<(bool, &str)> {
+    match url.strip_prefix("https://") {
+        Some(rest) => Some((true, rest)),
+        None => Some((false, url.strip_prefix("http://")?)),
     }
 }
 
@@ -125,11 +120,7 @@ fn host_and_port(rest: &str, secure: bool) -> Result<(&str, u16), &'static str> 
 /// `host:port` for an `http://` or `https://` address, as a target holds
 /// it.
 pub(super) fn authority(url: &str) -> Option<String> {
-    let (secure, rest) = match url.split_once("://")? {
-        ("https", rest) => (true, rest),
-        ("http", rest) => (false, rest),
-        _ => return None,
-    };
+    let (secure, rest) = scheme(url)?;
     let (host, port) = host_and_port(rest, secure).ok()?;
     Some(format!("{host}:{port}"))
 }

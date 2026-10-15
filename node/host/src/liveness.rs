@@ -8,7 +8,7 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use smol::future::FutureExt;
@@ -38,11 +38,14 @@ const RESTART_MOST: Duration = Duration::from_secs(1);
 /// failure waits `RESTART` again.
 const RECOVERED: Duration = Duration::from_secs(10);
 
+/// What this node heard of its peers: when, and which groups each leads.
+type Table = PeerTable<NodeNumber, AgentId, Instant>;
+
 pub(crate) struct Liveness {
     /// This run of the node: its start time in microseconds, past every
     /// earlier run's.
     pub(crate) incarnation: u64,
-    pub(crate) table: RwLock<PeerTable<NodeNumber, AgentId, Instant>>,
+    table: RwLock<Table>,
     started: Instant,
     /// The last round sent, kept across the heartbeat's restarts: peers
     /// ignore a round below the last they took from this run.
@@ -67,6 +70,16 @@ impl Liveness {
     /// Milliseconds since the node started.
     pub(crate) fn elapsed(&self) -> u64 {
         self.started.elapsed().as_millis() as u64
+    }
+
+    /// The peer table, as the last write left it, whole: a panic in one
+    /// leaves what it wrote.
+    pub(crate) fn table(&self) -> RwLockReadGuard<'_, Table> {
+        self.table.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn table_mut(&self) -> RwLockWriteGuard<'_, Table> {
+        self.table.write().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -103,11 +116,7 @@ pub(crate) fn supervise(
                 return;
             }
             Err(panic) => {
-                let message = panic
-                    .downcast_ref::<&str>()
-                    .map(|message| (*message).to_string())
-                    .or_else(|| panic.downcast_ref::<String>().cloned())
-                    .unwrap_or_default();
+                let message = crate::panic_message(&*panic);
                 tracing::error!("the pair heartbeat failed, and starts again: {message}");
                 // Stopped meanwhile, it does not start again.
                 if smol::block_on(timeout(pause, stopped.recv())).is_some() {
@@ -175,12 +184,7 @@ async fn beat(inner: Arc<Inner>) -> Ended {
         } else {
             inner.led()
         };
-        let peers = inner
-            .space
-            .as_ref()
-            .map(|space| space.numbers())
-            .unwrap_or_default();
-        for peer in peers.into_iter().filter(|peer| *peer != inner.number) {
+        for &peer in inner.numbers.iter().filter(|&&peer| peer != inner.number) {
             // A group whose placement this node does not hold goes to
             // every node.
             let listed: Vec<Leading> = leading
@@ -200,12 +204,7 @@ async fn beat(inner: Arc<Inner>) -> Ended {
         if round.is_multiple_of(100)
             && let Some(before) = Instant::now().checked_sub(FORGET)
         {
-            inner
-                .liveness
-                .table
-                .write()
-                .unwrap_or_else(PoisonError::into_inner)
-                .forget_before(before);
+            inner.liveness.table_mut().forget_before(before);
         }
     }
 }
@@ -276,11 +275,6 @@ impl Inner {
             stream,
             frame,
         } = incoming;
-        let space = self
-            .space
-            .as_ref()
-            .map(|space| space.numbers())
-            .unwrap_or_default();
         let message = match peer::decode(&frame) {
             Ok(message) => message,
             Err(refusal) => {
@@ -288,9 +282,13 @@ impl Inner {
                 return;
             }
         };
-        if let Err(refusal) =
-            peer::check(&space, from, (Class::Liveness, stream), &message, |_| None)
-        {
+        if let Err(refusal) = peer::check(
+            &self.numbers,
+            from,
+            (Class::Liveness, stream),
+            &message,
+            |_| None,
+        ) {
             self.drops.count(refusal);
             return;
         }
@@ -303,18 +301,13 @@ impl Inner {
             return;
         };
         let now = Instant::now();
-        let heard = self
-            .liveness
-            .table
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .heard(
-                from,
-                now,
-                incarnation,
-                round,
-                leading.into_iter().map(|led| (led.agent, led.term)),
-            );
+        let heard = self.liveness.table_mut().heard(
+            from,
+            now,
+            incarnation,
+            round,
+            leading.into_iter().map(|led| (led.agent, led.term)),
+        );
         let silence = Duration::from_millis(self.settings.election_timeout_ms.1);
         let returned = heard.is_some_and(|heard| {
             heard.new_run

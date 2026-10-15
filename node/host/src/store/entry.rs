@@ -105,24 +105,36 @@ impl LogEntry {
 
     /// The entry at `term` whose payload is `payload`.
     pub fn from_payload(term: u64, payload: &[u8]) -> Option<Self> {
-        let (&kind, rest) = payload.split_first()?;
-        let kind = EntryKind::from_u8(kind)?;
-        let (count, mut rest) = rest.split_first_chunk::<2>()?;
-        let mut blobs = Vec::with_capacity(usize::from(u16::from_be_bytes(*count)));
-        for _ in 0..u16::from_be_bytes(*count) {
-            let (hash, after) = rest.split_first_chunk::<32>()?;
-            let (len, after) = after.split_first_chunk::<8>()?;
-            blobs.push(BlobRef {
-                hash: *hash,
-                len: u64::from_be_bytes(*len),
-            });
-            rest = after;
-        }
+        let (kind, blobs, body) = split(payload)?;
         Some(Self {
             term,
             kind,
             blobs,
-            body: rest.to_vec(),
+            body: body.to_vec(),
         })
     }
+
+    /// The blobs the entry whose payload is `payload` names, read without
+    /// copying its body.
+    pub(super) fn blob_refs(payload: &[u8]) -> Option<Vec<BlobRef>> {
+        Some(split(payload)?.1)
+    }
+}
+
+/// What `payload` holds: its kind, its blobs, and the body after them.
+fn split(payload: &[u8]) -> Option<(EntryKind, Vec<BlobRef>, &[u8])> {
+    let (&kind, rest) = payload.split_first()?;
+    let kind = EntryKind::from_u8(kind)?;
+    let (count, mut rest) = rest.split_first_chunk::<2>()?;
+    let mut blobs = Vec::with_capacity(usize::from(u16::from_be_bytes(*count)));
+    for _ in 0..u16::from_be_bytes(*count) {
+        let (hash, after) = rest.split_first_chunk::<32>()?;
+        let (len, after) = after.split_first_chunk::<8>()?;
+        blobs.push(BlobRef {
+            hash: *hash,
+            len: u64::from_be_bytes(*len),
+        });
+        rest = after;
+    }
+    Some((kind, blobs, rest))
 }

@@ -102,9 +102,9 @@ fn writer(dir: &Path) {
         if index.is_multiple_of(3) {
             // The append arrives ahead of its blob.
             smol::block_on(writer.commit(vec![append])).unwrap();
-            smol::block_on(blobs.put_kept(blob, bytes, Keep::Named)).unwrap();
+            smol::block_on(blobs.put(blob, bytes, Keep::Named)).unwrap();
         } else {
-            smol::block_on(blobs.put_kept(blob, bytes, Keep::Named)).unwrap();
+            smol::block_on(blobs.put(blob, bytes, Keep::Named)).unwrap();
             smol::block_on(writer.commit(vec![append])).unwrap();
         }
         println!("appended {index}");
@@ -117,7 +117,7 @@ fn writer(dir: &Path) {
         if index.is_multiple_of(5) {
             // An orphan: a blob sent ahead of an append that never came.
             let orphan = Arc::new(blob_bytes(index | 1 << 40));
-            smol::block_on(blobs.put(blob_ref(&orphan), orphan)).unwrap();
+            smol::block_on(blobs.put(blob_ref(&orphan), orphan, Keep::Aged)).unwrap();
         }
         if index.is_multiple_of(7) {
             let durable = writer.durably_applied(AGENT);

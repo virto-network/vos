@@ -16,28 +16,22 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use vos_checker::Random;
 use vos_node::store::{Fjall, HardState, LogEntry, PersistMode, Tuning};
 use vos_wire::defaults::REPLY_WINDOW;
 use vos_wire::ids::{AgentId, InstanceId, SessionId};
 use vos_wire::keys;
 use vos_wire::result::Write;
 
+mod support;
+
+use support::us;
+
 const AGENT: AgentId = AgentId(7);
 const VALUE: usize = 64;
 const OPS: u64 = 1_000_000;
 /// Reads per snapshot, as one refine's reads share one.
 const READS_PER_SNAPSHOT: u64 = 1_000;
-
-struct XorShift(u64);
-
-impl XorShift {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-}
 
 /// Row ids spread over u64, as account ids or hashed keys would be.
 fn row(i: u64) -> Vec<u8> {
@@ -46,10 +40,6 @@ fn row(i: u64) -> Vec<u8> {
         i.wrapping_mul(0x9e37_79b9_7f4a_7c15).to_be_bytes().to_vec(),
     ]
     .concat()
-}
-
-fn us(elapsed: Duration, ops: u64) -> f64 {
-    elapsed.as_secs_f64() * 1e6 / ops as f64
 }
 
 fn tuning(variant: &str) -> Tuning {
@@ -75,16 +65,16 @@ fn tuning(variant: &str) -> Tuning {
     }
 }
 
-fn reads(store: &Fjall, rng: &mut XorShift, rows: u64, hit: bool) -> f64 {
+fn reads(store: &Fjall, rng: &mut Random, rows: u64, hit: bool) -> f64 {
     let started = Instant::now();
     let mut found = 0;
     for _ in 0..OPS / READS_PER_SNAPSHOT {
         let view = store.snapshot();
         for _ in 0..READS_PER_SNAPSHOT {
             let key = if hit {
-                row(rng.next() % rows)
+                row(rng.draw() % rows)
             } else {
-                row(rows + rng.next() % rows)
+                row(rows + rng.draw() % rows)
             };
             found += u64::from(view.get(AGENT, &key).unwrap().is_some());
         }
@@ -145,11 +135,11 @@ impl Histogram {
 
 /// `count` timed hits on the table, a snapshot every
 /// `READS_PER_SNAPSHOT`.
-fn timed_reads(store: &Fjall, rng: &mut XorShift, rows: u64, count: u64, into: &mut Histogram) {
+fn timed_reads(store: &Fjall, rng: &mut Random, rows: u64, count: u64, into: &mut Histogram) {
     for _ in 0..count / READS_PER_SNAPSHOT {
         let view = store.snapshot();
         for _ in 0..READS_PER_SNAPSHOT {
-            let key = row(rng.next() % rows);
+            let key = row(rng.draw() % rows);
             let started = Instant::now();
             let found = view.get(AGENT, &key).unwrap();
             into.record(started.elapsed());
@@ -159,9 +149,9 @@ fn timed_reads(store: &Fjall, rng: &mut XorShift, rows: u64, count: u64, into: &
 }
 
 /// Bytes from `rng`, which no block compression shrinks.
-fn random_bytes(rng: &mut XorShift, len: usize) -> Vec<u8> {
+fn random_bytes(rng: &mut Random, len: usize) -> Vec<u8> {
     (0..len.div_ceil(8))
-        .flat_map(|_| rng.next().to_le_bytes())
+        .flat_map(|_| rng.draw().to_le_bytes())
         .take(len)
         .collect()
 }
@@ -187,7 +177,7 @@ const COMPACT_TAIL: u64 = 256;
 /// batch its agent's state, batch time, last result and hard state.
 /// Counts the inputs written.
 fn write_load(store: &Fjall, rate: u64, stop: &AtomicBool, written: &AtomicU64) {
-    let mut rng = XorShift(0x9e37_79b9_7f4a_7c15);
+    let mut rng = Random(0x9e37_79b9_7f4a_7c15);
     let mut indexes = vec![0u64; WRITERS as usize];
     let mut sequences = vec![0u64; (u64::from(WRITERS) * SESSIONS) as usize];
     let mut turn = 0u32;
@@ -284,7 +274,7 @@ fn rotated(store: &Fjall, after: Instant, limit: Duration) {
 /// sealed one not yet flushed. The first minute's rotations are passed
 /// over: the table's load left rows in the memtable, and the other
 /// partitions' cycles have only begun.
-fn under_writes(store: &Fjall, rng: &mut XorShift, rows: u64) {
+fn under_writes(store: &Fjall, rng: &mut Random, rows: u64) {
     let rate: u64 = std::env::var("WRITE_RATE").map_or(40_000, |rate| rate.parse().unwrap());
     // About two cycles' time at 40k/s, longer in proportion below it.
     let limit = Duration::from_secs(1_200 * 40_000 / rate.clamp(1, 40_000));
@@ -361,9 +351,7 @@ fn under_writes(store: &Fjall, rng: &mut XorShift, rows: u64) {
 }
 
 fn run(rows: u64, variant: &str) {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target")
-        .join(format!("store-bench-{}", std::process::id()));
+    let dir = support::data_dir("store-bench");
     let store = Fjall::open_tuned(&dir, tuning(variant)).unwrap();
     let value = vec![0xa5u8; VALUE];
 
@@ -387,7 +375,7 @@ fn run(rows: u64, variant: &str) {
     store.compact().unwrap();
     let compact = started.elapsed();
 
-    let mut rng = XorShift(0x2545_f491_4f6c_dd1d);
+    let mut rng = Random(0x2545_f491_4f6c_dd1d);
     // Warm the cache with one pass of hits before measuring.
     reads(&store, &mut rng, rows, true);
     if variant == "writes" {
@@ -404,7 +392,7 @@ fn run(rows: u64, variant: &str) {
         for _ in 0..rounds {
             let writes: Vec<_> = (0..size)
                 .map(|_| Write {
-                    key: row(rng.next() % rows),
+                    key: row(rng.draw() % rows),
                     value: Some(value.clone()),
                 })
                 .collect();
@@ -425,7 +413,7 @@ fn run(rows: u64, variant: &str) {
     let table = keys::table_prefix(InstanceId(0), 1);
     for _ in 0..1_000 {
         let view = store.snapshot();
-        let from = row(rng.next() % rows);
+        let from = row(rng.draw() % rows);
         for entry in view.scan(AGENT, &table, Some(&from)).take(1_000) {
             entry.unwrap();
             scanned += 1;
@@ -447,14 +435,14 @@ fn run(rows: u64, variant: &str) {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
+    let args = support::args();
     let rows: u64 = args
-        .get(1)
+        .first()
         .expect("store-bench <rows> [variant...]")
         .parse()
         .unwrap();
-    let variants: Vec<&str> = if args.len() > 2 {
-        args[2..].iter().map(String::as_str).collect()
+    let variants: Vec<&str> = if args.len() > 1 {
+        args[1..].iter().map(String::as_str).collect()
     } else {
         vec!["default", "filters"]
     };

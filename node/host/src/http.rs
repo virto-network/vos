@@ -12,8 +12,8 @@ use smol::net::TcpListener;
 
 use crate::timeout;
 
-/// The most a request's head may hold.
-const MAX_HEAD: usize = 16 << 10;
+/// The most a request's or an answer's head may hold.
+pub(crate) const MAX_HEAD: usize = 16 << 10;
 
 /// What one connection may take.
 #[derive(Clone)]
@@ -54,6 +54,11 @@ pub struct Response {
 impl Response {
     pub fn new(status: u16, body: Vec<u8>) -> Self {
         Self { status, body }
+    }
+
+    /// 404, with no body.
+    pub fn not_found() -> Self {
+        Self::new(404, Vec::new())
     }
 }
 
@@ -178,6 +183,11 @@ async fn connection(
     }
 }
 
+/// A `Content-Length` header's value, if it is a length.
+pub(crate) fn content_length(value: &[u8]) -> Option<usize> {
+    std::str::from_utf8(value).ok()?.trim().parse().ok()
+}
+
 fn invalid(message: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, message.to_string())
 }
@@ -223,34 +233,26 @@ async fn read_request(
         let mut parsed = httparse::Request::new(&mut headers);
         match parsed.parse(buffer) {
             Ok(httparse::Status::Complete(head)) => {
-                let method = parsed.method.unwrap_or_default().to_string();
-                let path = parsed.path.unwrap_or_default().to_string();
-                let headers: Vec<(String, Vec<u8>)> = parsed
-                    .headers
-                    .iter()
-                    .map(|header| (header.name.to_string(), header.value.to_vec()))
-                    .collect();
-                let header = |name: &str| {
-                    headers
+                let mut request = Request {
+                    method: parsed.method.unwrap_or_default().to_string(),
+                    path: parsed.path.unwrap_or_default().to_string(),
+                    headers: parsed
+                        .headers
                         .iter()
-                        .find(|(header, _)| header.eq_ignore_ascii_case(name))
-                        .map(|(_, value)| value.as_slice())
+                        .map(|header| (header.name.to_string(), header.value.to_vec()))
+                        .collect(),
+                    body: Vec::new(),
                 };
                 // Bodies come with a length: chunked ones are not read.
-                if header("transfer-encoding").is_some() {
+                if request.header("transfer-encoding").is_some() {
                     return Ok(Read::Refuse(411));
                 }
-                let length = match header("content-length") {
-                    Some(value) => match std::str::from_utf8(value)
-                        .ok()
-                        .and_then(|value| value.trim().parse::<usize>().ok())
-                    {
-                        Some(length) => length,
-                        None => return Ok(Read::Refuse(400)),
-                    },
+                let length = match request.header("content-length").map(content_length) {
+                    Some(Some(length)) => length,
+                    Some(None) => return Ok(Read::Refuse(400)),
                     None => 0,
                 };
-                let limit = if method == "POST" && path.ends_with("/install") {
+                let limit = if request.method == "POST" && request.path.ends_with("/install") {
                     limits.install
                 } else {
                     limits.body
@@ -260,7 +262,8 @@ async fn read_request(
                 }
                 let pending = buffer.len() < head + length;
                 if pending
-                    && header("expect")
+                    && request
+                        .header("expect")
                         .is_some_and(|value| value.eq_ignore_ascii_case(b"100-continue"))
                 {
                     stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
@@ -273,13 +276,7 @@ async fn read_request(
                     }
                     buffer.extend_from_slice(&chunk[..read]);
                 }
-                let body = buffer[head..head + length].to_vec();
-                let request = Request {
-                    method,
-                    path,
-                    headers,
-                    body,
-                };
+                request.body = buffer[head..head + length].to_vec();
                 return Ok(Read::Request(request, head + length));
             }
             Ok(httparse::Status::Partial) => {

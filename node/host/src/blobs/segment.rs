@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 use fjall::Keyspace;
 
 use super::index::{
-    IndexRow, Location, decode_segment_row, location_key, segment_key, segment_row,
+    IndexRow, Location, decode_segment_row, location_key, location_row, segment_key, segment_of,
+    segment_row,
 };
 use super::{HEADER, Keep, MAGIC, now};
 use crate::store::Result;
@@ -104,10 +105,9 @@ pub(super) fn recover(
             at += HEADER + blob_len;
         }
         for row in index.prefix([IndexRow::Location as u8]) {
-            let (key, value) = row.into_inner()?;
-            let location = Location::decode(&value).expect("a location this store wrote");
+            let (hash, location) = location_row(row)?;
             if location.segment == segment && location.offset >= at {
-                batch.remove(index, key);
+                batch.remove(index, location_key(&hash));
             }
         }
     }
@@ -147,7 +147,7 @@ pub(super) fn forget_missing_segments(
     let mut missing = Vec::new();
     for row in index.prefix([IndexRow::Segment as u8]) {
         let key = row.key()?;
-        let segment = u64::from_be_bytes(key[1..9].try_into().expect("a segment number"));
+        let segment = segment_of(&key);
         if present.binary_search(&segment).is_err() {
             missing.push(segment);
             batch.remove(index, key);
@@ -157,10 +157,9 @@ pub(super) fn forget_missing_segments(
         return Ok(());
     }
     for row in index.prefix([IndexRow::Location as u8]) {
-        let (key, value) = row.into_inner()?;
-        let location = Location::decode(&value).expect("a location this store wrote");
+        let (hash, location) = location_row(row)?;
         if missing.contains(&location.segment) {
-            batch.remove(index, key);
+            batch.remove(index, location_key(&hash));
         }
     }
     Ok(())

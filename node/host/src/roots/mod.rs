@@ -124,10 +124,9 @@ pub(crate) fn root_row(
     let Some(bytes) = snapshot.get(agent, &keys::tree_root(map))? else {
         return Ok(None);
     };
-    match RootRow::decode(&bytes) {
-        Ok((row, used)) if used == bytes.len() => Ok(Some(row)),
-        _ => Err(Error::Corrupt("a root row")),
-    }
+    RootRow::decode_exact(&bytes)
+        .map(Some)
+        .ok_or(Error::Corrupt("a root row"))
 }
 
 /// A map's root and the state version it holds, as `snapshot` has them:
@@ -281,10 +280,9 @@ impl<'a> MapStore<'a> {
         let Some(bytes) = self.snapshot.get(self.agent, key)? else {
             return Ok(None);
         };
-        match T::decode(&bytes) {
-            Ok((value, used)) if used == bytes.len() => Ok(Some(value)),
-            _ => Err(Error::Corrupt(what)),
-        }
+        T::decode_exact(&bytes)
+            .map(Some)
+            .ok_or(Error::Corrupt(what))
     }
 }
 

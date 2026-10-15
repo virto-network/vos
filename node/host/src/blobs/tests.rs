@@ -5,7 +5,7 @@ use std::time::Duration;
 use vos_wire::ids::AgentId;
 
 use super::collect::Cutoffs;
-use super::index::segment_key;
+use super::index::{location_key, segment_key};
 use super::*;
 use crate::NoHooks;
 use crate::storage::StorageThread;
@@ -25,8 +25,16 @@ fn put(blobs: &Blobs, bytes: &Arc<Vec<u8>>) -> BlobRef {
 
 fn put_kept(blobs: &Blobs, bytes: &Arc<Vec<u8>>, keep: Keep) -> BlobRef {
     let blob = blob_ref(bytes);
-    smol::block_on(blobs.put_kept(blob, Arc::clone(bytes), keep)).unwrap();
+    smol::block_on(blobs.put(blob, Arc::clone(bytes), keep)).unwrap();
     blob
+}
+
+/// The store and the blob store in `dir`, closing segments at
+/// `segment_bytes`.
+fn open(dir: &Path, segment_bytes: u64) -> (Fjall, Blobs) {
+    let store = Fjall::open(dir.join("store")).unwrap();
+    let blobs = Blobs::open_with(dir.join("blobs"), &store, segment_bytes).unwrap();
+    (store, blobs)
 }
 
 /// One horizon for every blob.
@@ -49,11 +57,24 @@ fn age(blobs: &Blobs, store: &Fjall, blob: &BlobRef, ago: Duration) {
         .unwrap();
 }
 
+/// Ask the blob writer to remove `candidates` put or touched at or before
+/// `cutoff`, whatever their keep: how many it removed.
+fn remove(blobs: &Blobs, candidates: Vec<[u8; 32]>, cutoff: u64) -> usize {
+    smol::block_on(blobs.request(|done| Request::Remove {
+        candidates,
+        cutoffs: Cutoffs {
+            named: cutoff,
+            aged: cutoff,
+        },
+        done,
+    }))
+    .unwrap()
+}
+
 #[test]
 fn blobs_round_trip_and_survive_a_reopen() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Fjall::open(dir.path().join("store")).unwrap();
-    let blobs = Blobs::open_with(dir.path().join("blobs"), &store, 4096).unwrap();
+    let (store, blobs) = open(dir.path(), 4096);
     let written: Vec<_> = (0..6).map(|seed| bytes(seed, 1500)).collect();
     let refs: Vec<_> = written.iter().map(|bytes| put(&blobs, bytes)).collect();
     for (blob, bytes) in refs.iter().zip(&written) {
@@ -67,11 +88,9 @@ fn blobs_round_trip_and_survive_a_reopen() {
     // 4 KiB segments hold two records each.
     let segments = std::fs::read_dir(dir.path().join("blobs")).unwrap().count();
     assert_eq!(segments, 3);
-    drop(blobs);
-    drop(store);
+    drop((store, blobs));
 
-    let store = Fjall::open(dir.path().join("store")).unwrap();
-    let blobs = Blobs::open_with(dir.path().join("blobs"), &store, 4096).unwrap();
+    let (_store, blobs) = open(dir.path(), 4096);
     for (blob, bytes) in refs.iter().zip(&written) {
         assert_eq!(
             blobs.get(&blob.hash).unwrap().as_ref(),
@@ -85,8 +104,7 @@ fn open_indexes_a_segment_tail_and_cuts_a_torn_record() {
     let dir = tempfile::tempdir().unwrap();
     let blob_dir = dir.path().join("blobs");
     let (first, second) = {
-        let store = Fjall::open(dir.path().join("store")).unwrap();
-        let blobs = Blobs::open(&blob_dir, &store).unwrap();
+        let (store, blobs) = open(dir.path(), SEGMENT_BYTES);
         let first = put(&blobs, &bytes(1, 100));
         let second = put(&blobs, &bytes(2, 100));
         // The index rows are lost, as a crash may lose them.
@@ -105,8 +123,7 @@ fn open_indexes_a_segment_tail_and_cuts_a_torn_record() {
     drop(file);
     let torn_len = std::fs::metadata(&segment).unwrap().len();
 
-    let store = Fjall::open(dir.path().join("store")).unwrap();
-    let blobs = Blobs::open(&blob_dir, &store).unwrap();
+    let (_store, blobs) = open(dir.path(), SEGMENT_BYTES);
     assert!(blobs.contains(&first.hash).unwrap());
     assert!(
         blobs.contains(&second.hash).unwrap(),
@@ -128,8 +145,7 @@ fn open_drops_an_indexed_record_torn_anyway() {
     let dir = tempfile::tempdir().unwrap();
     let blob_dir = dir.path().join("blobs");
     let (first, second) = {
-        let store = Fjall::open(dir.path().join("store")).unwrap();
-        let blobs = Blobs::open(&blob_dir, &store).unwrap();
+        let (_store, blobs) = open(dir.path(), SEGMENT_BYTES);
         (put(&blobs, &bytes(1, 500)), put(&blobs, &bytes(2, 500)))
     };
     // Both are indexed; the disk loses the second's last bytes anyway.
@@ -139,8 +155,7 @@ fn open_drops_an_indexed_record_torn_anyway() {
     file.set_len(len - 10).unwrap();
     drop(file);
 
-    let store = Fjall::open(dir.path().join("store")).unwrap();
-    let blobs = Blobs::open(&blob_dir, &store).unwrap();
+    let (_store, blobs) = open(dir.path(), SEGMENT_BYTES);
     assert_eq!(blobs.get(&first.hash).unwrap().unwrap(), *bytes(1, 500));
     assert!(
         !blobs.contains(&second.hash).unwrap(),
@@ -154,9 +169,8 @@ fn open_drops_an_indexed_record_torn_anyway() {
 #[test]
 fn collection_keeps_referenced_pinned_and_young_blobs() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Fjall::open(dir.path().join("store")).unwrap();
+    let (store, blobs) = open(dir.path(), 4096);
     let writer = StorageThread::spawn(store.clone(), Arc::new(NoHooks));
-    let blobs = Blobs::open_with(dir.path().join("blobs"), &store, 4096).unwrap();
     let named = put(&blobs, &bytes(1, 1500));
     let pinned = put(&blobs, &bytes(2, 1500));
     let dead: Vec<_> = (3..7).map(|seed| put(&blobs, &bytes(seed, 1500))).collect();
@@ -186,12 +200,9 @@ fn collection_keeps_referenced_pinned_and_young_blobs() {
     assert_eq!(blobs.get(&named.hash).unwrap().unwrap(), *bytes(1, 1500));
     assert_eq!(blobs.get(&pinned.hash).unwrap().unwrap(), *bytes(2, 1500));
     assert_eq!(blobs.pinned().unwrap(), vec![pinned.hash]);
-    drop(blobs);
-    drop(writer);
-    drop(store);
+    drop((blobs, writer, store));
     // And all of it holds after a reopen.
-    let store = Fjall::open(dir.path().join("store")).unwrap();
-    let blobs = Blobs::open_with(dir.path().join("blobs"), &store, 4096).unwrap();
+    let (_store, blobs) = open(dir.path(), 4096);
     assert_eq!(blobs.get(&named.hash).unwrap().unwrap(), *bytes(1, 1500));
     assert_eq!(blobs.get(&pinned.hash).unwrap().unwrap(), *bytes(2, 1500));
     for blob in &dead {
@@ -202,35 +213,18 @@ fn collection_keeps_referenced_pinned_and_young_blobs() {
 #[test]
 fn a_touch_keeps_a_candidate_from_a_removal_after_it() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Fjall::open(dir.path().join("store")).unwrap();
-    let blobs = Blobs::open(dir.path().join("blobs"), &store).unwrap();
+    let (store, blobs) = open(dir.path(), SEGMENT_BYTES);
     let kept = put(&blobs, &bytes(1, 300));
     let dropped = put(&blobs, &bytes(2, 300));
     // Both aged out: candidates of a collection deciding now.
     for blob in [kept, dropped] {
-        let old = Location {
-            time: 0,
-            ..blobs.location(&blob.hash).unwrap().unwrap()
-        };
-        store
-            .blobs()
-            .insert(location_key(&blob.hash), old.encode())
-            .unwrap();
+        age(&blobs, &store, &blob, Duration::from_secs(60));
     }
     let cutoff = now() - 1;
     // An entry comes to rely on one: its host touches it first.
     let touched = smol::block_on(blobs.touch(vec![kept.hash, [9; 32]])).unwrap();
     assert_eq!(touched, vec![kept.hash], "only stored blobs answer");
-    let removed = smol::block_on(blobs.request(|done| Request::Remove {
-        candidates: vec![kept.hash, dropped.hash],
-        cutoffs: Cutoffs {
-            named: cutoff,
-            aged: cutoff,
-        },
-        done,
-    }))
-    .unwrap();
-    assert_eq!(removed, 1);
+    assert_eq!(remove(&blobs, vec![kept.hash, dropped.hash], cutoff), 1);
     assert!(blobs.contains(&kept.hash).unwrap());
     assert!(!blobs.contains(&dropped.hash).unwrap());
 }
@@ -238,20 +232,12 @@ fn a_touch_keeps_a_candidate_from_a_removal_after_it() {
 #[test]
 fn a_put_of_a_stored_blob_refreshes_its_age() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Fjall::open(dir.path().join("store")).unwrap();
+    let (store, blobs) = open(dir.path(), SEGMENT_BYTES);
     let writer = StorageThread::spawn(store.clone(), Arc::new(NoHooks));
-    let blobs = Blobs::open(dir.path().join("blobs"), &store).unwrap();
     let data = bytes(9, 300);
     let blob = put(&blobs, &data);
-    // Age it, as if put long ago, then put it again.
-    let old = Location {
-        time: 0,
-        ..blobs.location(&blob.hash).unwrap().unwrap()
-    };
-    store
-        .blobs()
-        .insert(location_key(&blob.hash), old.encode())
-        .unwrap();
+    // Age it past the horizon, as if put long ago, then put it again.
+    age(&blobs, &store, &blob, Duration::from_secs(7_200));
     put(&blobs, &data);
     let kept =
         smol::block_on(blobs.collect(&writer, horizons(Duration::from_secs(3_600)), &|| false))
@@ -269,9 +255,8 @@ fn a_put_of_a_stored_blob_refreshes_its_age() {
 #[test]
 fn each_keep_ages_by_its_horizon_and_a_hold_outlasts_both() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Fjall::open(dir.path().join("store")).unwrap();
+    let (store, blobs) = open(dir.path(), SEGMENT_BYTES);
     let writer = StorageThread::spawn(store.clone(), Arc::new(NoHooks));
-    let blobs = Blobs::open(dir.path().join("blobs"), &store).unwrap();
     let named = put_kept(&blobs, &bytes(1, 300), Keep::Named);
     let aged = put_kept(&blobs, &bytes(2, 300), Keep::Aged);
     let held = put_kept(&blobs, &bytes(3, 300), Keep::Named);
@@ -302,26 +287,14 @@ fn each_keep_ages_by_its_horizon_and_a_hold_outlasts_both() {
 #[test]
 fn a_hold_keeps_a_candidate_from_a_removal_after_it() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Fjall::open(dir.path().join("store")).unwrap();
-    let blobs = Blobs::open(dir.path().join("blobs"), &store).unwrap();
+    let (store, blobs) = open(dir.path(), SEGMENT_BYTES);
     let blob = put_kept(&blobs, &bytes(1, 300), Keep::Named);
     age(&blobs, &store, &blob, Duration::from_secs(60));
     let cutoff = now() - 1;
-    let remove = || {
-        smol::block_on(blobs.request(|done| Request::Remove {
-            candidates: vec![blob.hash],
-            cutoffs: Cutoffs {
-                named: cutoff,
-                aged: cutoff,
-            },
-            done,
-        }))
-        .unwrap()
-    };
     let hold = blobs.hold(blob.hash);
-    assert_eq!(remove(), 0);
+    assert_eq!(remove(&blobs, vec![blob.hash], cutoff), 0);
     drop(hold);
-    assert_eq!(remove(), 1);
+    assert_eq!(remove(&blobs, vec![blob.hash], cutoff), 1);
 }
 
 /// A blob put both ways keeps the longer, and moving it keeps that; a
@@ -330,8 +303,7 @@ fn a_hold_keeps_a_candidate_from_a_removal_after_it() {
 #[test]
 fn a_blob_keeps_the_longer_of_its_keeps() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Fjall::open(dir.path().join("store")).unwrap();
-    let blobs = Blobs::open(dir.path().join("blobs"), &store).unwrap();
+    let (_store, blobs) = open(dir.path(), SEGMENT_BYTES);
     let keep = |blob: &BlobRef| blobs.location(&blob.hash).unwrap().unwrap().keep;
     let data = bytes(1, 300);
     let blob = put_kept(&blobs, &data, Keep::Named);
@@ -340,7 +312,7 @@ fn a_blob_keeps_the_longer_of_its_keeps() {
     assert_eq!(keep(&blob), Keep::Aged);
     put_kept(&blobs, &data, Keep::Named);
     assert_eq!(keep(&blob), Keep::Aged);
-    smol::block_on(blobs.send(blob, Arc::clone(&data), Keep::Named, true)).unwrap();
+    smol::block_on(blobs.relocate(blob, Arc::clone(&data), Keep::Named)).unwrap();
     assert_eq!(keep(&blob), Keep::Aged, "moved");
     let location = blobs.location(&blob.hash).unwrap().unwrap();
     let named = Location {

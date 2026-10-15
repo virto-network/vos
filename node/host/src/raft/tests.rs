@@ -7,6 +7,7 @@ use vos_wire::result::Write as StateWrite;
 
 use super::*;
 use crate::NoHooks;
+use crate::blobs::Keep;
 use crate::storage::StorageThread;
 use crate::store::{BlobRef, Fjall};
 
@@ -166,7 +167,7 @@ fn recovery_cuts_the_log_at_its_first_missing_blob() {
     let blobs = Blobs::open(dir.path().join("blobs"), &store).unwrap();
     let held = Arc::new(vec![1u8; 100]);
     let held_ref = crate::blobs::blob_ref(&held);
-    smol::block_on(blobs.put(held_ref, held)).unwrap();
+    smol::block_on(blobs.put(held_ref, held, Keep::Aged)).unwrap();
     let naming = |blob: BlobRef| LogEntry {
         blobs: vec![blob],
         ..LogEntry::result(1, Vec::new())

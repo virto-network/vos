@@ -50,7 +50,7 @@ fn answer(status: u16, body: &[u8]) -> Result<Response, ClientError> {
 /// POST `body` to `path`: the status and body answered. For requests this
 /// client does not otherwise make, as a test of the ingress does.
 pub fn post(target: &Target, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>), ClientError> {
-    Http::new(target).post(path, None, body, false)
+    Http::new(target).post_once(path, None, body)
 }
 
 /// POST `body` to `path` on a connection of its own: the answer. Each
@@ -64,7 +64,7 @@ pub fn post_within(
     body: &[u8],
     within: Duration,
 ) -> Result<Response, ClientError> {
-    let (status, body) = Http::within(target, within).post(path, None, body, false)?;
+    let (status, body) = Http::within(target, within).post_once(path, None, body)?;
     answer(status, &body)
 }
 
@@ -75,12 +75,12 @@ pub fn node_id(target: &Target) -> Result<NodeId, ClientError> {
 }
 
 fn fetch_node_id(http: &Http) -> Result<NodeId, ClientError> {
-    let (status, body) = http.get("/")?;
+    let (status, body) = http.get("/", None)?;
     let id = NodeId::decode(&body)
         .map(|(id, _)| id)
         .map_err(|_| ClientError::Undecodable(status))?;
-    match http.target.key {
-        Some(key) if key != id.0 => Err(ClientError::NotTheNode),
+    match http.target.trust {
+        Trust::NodeKey(key) if key != id.0 => Err(ClientError::NotTheNode),
         _ => Ok(id),
     }
 }
@@ -92,7 +92,7 @@ pub fn agent_info(target: &Target, agent: AgentId) -> Result<Option<AgentInfo>, 
 }
 
 fn agent_info_from(http: &Http, agent: AgentId) -> Result<Option<AgentInfo>, ClientError> {
-    let (status, body) = http.get(&format!("/agents/{}", agent.0))?;
+    let (status, body) = http.get(&format!("/agents/{}", agent.0), None)?;
     if status == 404 {
         return Ok(None);
     }
@@ -206,8 +206,7 @@ impl Client {
     }
 
     fn start(&self) -> Kept {
-        let mut name = [0u8; 16];
-        getrandom::getrandom(&mut name).expect("the operating system's randomness");
+        let name = crate::random();
         let offset = *lock(&self.offset);
         let t0 = crate::wall_clock().saturating_add_signed(offset);
         Kept { name, t0, next: 1 }

@@ -221,7 +221,7 @@ impl Client {
     ) -> Result<Response, ClientError> {
         let body = self.call_body(agent, sequence, instance, method, arguments)?;
         let path = format!("/agents/{}/calls", agent.0);
-        let (status, body) = self.http.post(&path, None, &body, true)?;
+        let (status, body) = self.http.post_repeatable(&path, &body)?;
         answer(status, &body)
     }
 

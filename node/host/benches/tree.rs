@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use vos_checker::Random;
 use vos_node::NoHooks;
 use vos_node::roots::{self, Build};
 use vos_node::storage::{Change, StorageThread};
@@ -26,6 +27,10 @@ use vos_wire::keys::{self, Transform};
 use vos_wire::records::{stored, versioned};
 use vos_wire::result::Write;
 
+mod support;
+
+use support::us;
+
 const AGENT: AgentId = AgentId(7);
 const MAP: MapId = MapId {
     instance: InstanceId(1),
@@ -34,17 +39,6 @@ const MAP: MapId = MapId {
 };
 /// Committed writes per work result.
 const PER_RESULT: u64 = 1_000;
-
-struct XorShift(u64);
-
-impl XorShift {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-}
 
 fn seed(version: u64) -> [u8; 32] {
     Blake2b.hash(b"tree bench seed", &[&version.to_le_bytes()])
@@ -125,22 +119,16 @@ fn build(store: &Fjall, writer: &StorageThread) -> (u64, u64) {
     (build.dirty_read(), batches)
 }
 
-fn us(elapsed: Duration, count: u64) -> f64 {
-    elapsed.as_secs_f64() * 1e6 / count as f64
-}
-
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
+    let args = support::args();
     let keys: u64 = args
-        .get(1)
+        .first()
         .expect("tree-bench <keys> [rate] [seconds]")
         .parse()
         .unwrap();
-    let rate: u64 = args.get(2).map_or(20_000, |rate| rate.parse().unwrap());
-    let seconds: u64 = args.get(3).map_or(30, |seconds| seconds.parse().unwrap());
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target")
-        .join(format!("tree-bench-{}", std::process::id()));
+    let rate: u64 = args.get(1).map_or(20_000, |rate| rate.parse().unwrap());
+    let seconds: u64 = args.get(2).map_or(30, |seconds| seconds.parse().unwrap());
+    let dir = support::data_dir("tree-bench");
     let agent = Arc::new(Agent {
         store: Fjall::open(&dir).unwrap(),
         version: AtomicU64::new(0),
@@ -167,8 +155,8 @@ fn main() {
     // the store compacted, as after a long run, not behind the load's
     // compactions.
     agent.store.compact().unwrap();
-    let mut rng = XorShift(0x2545_f491_4f6c_dd1d);
-    let mut random = |count: u64| -> Vec<u64> { (0..count).map(|_| rng.next() % keys).collect() };
+    let mut rng = Random(0x2545_f491_4f6c_dd1d);
+    let mut random = |count: u64| -> Vec<u64> { (0..count).map(|_| rng.draw() % keys).collect() };
     // The rows are made first: accumulate writes keys the work result names,
     // and hashes nothing. Results of each kind alternate, so the flushes and
     // compactions each leaves fall on both alike.
@@ -203,12 +191,12 @@ fn main() {
         let writer = Arc::clone(&writer);
         let stop = Arc::clone(&stop);
         std::thread::spawn(move || {
-            let mut rng = XorShift(0x9e37_79b9_7f4a_7c15);
+            let mut rng = Random(0x9e37_79b9_7f4a_7c15);
             let every = Duration::from_secs_f64(PER_RESULT as f64 / rate as f64);
             let started = Instant::now();
             let mut results = 0u32;
             while !stop.load(Ordering::SeqCst) {
-                let keys: Vec<u64> = (0..PER_RESULT).map(|_| rng.next() % keys).collect();
+                let keys: Vec<u64> = (0..PER_RESULT).map(|_| rng.draw() % keys).collect();
                 agent.apply(&writer, &keys, true);
                 results += 1;
                 if let Some(wait) =

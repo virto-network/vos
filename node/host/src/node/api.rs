@@ -20,7 +20,7 @@ use super::open::write_token;
 use super::{ADMIN_TOKEN, CallError, Error, Inner, Node, Pending, ReplaceError, Reply};
 use crate::queries::Asked;
 use crate::store::Fjall;
-use crate::{lock, seed};
+use crate::{lock, random};
 
 impl Inner {
     /// This node's replica of `agent`, if it runs one: its Raft state, or
@@ -298,7 +298,7 @@ impl Node {
                 )));
             }
         };
-        let token = seed();
+        let token = random();
         write_token(&self.data.join(ADMIN_TOKEN), &token)
             .map_err(|error| Error::Data(error.to_string()))?;
         let listener = smol::block_on(smol::net::TcpListener::bind(address))

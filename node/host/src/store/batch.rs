@@ -9,8 +9,8 @@ use vos_wire::peer::{CreationRecord, Placement};
 use vos_wire::result::Write;
 
 use super::keys::{
-    NodeRow, agent_key, encode_entry, encode_hard, encode_membership, log_key, node_record,
-    node_row, registry_prefix,
+    NodeRow, agent_key, encode_entry, encode_hard, encode_last_result, encode_membership,
+    encode_position, log_key, node_record, node_row, registry_prefix,
 };
 use super::{Error, Fjall, HardState, LogEntry, Membership, Result, Row, Switch};
 
@@ -47,12 +47,8 @@ impl Batch {
     /// Remove the agent's log entries after `after`, including any this
     /// batch appended.
     pub fn truncate(&mut self, agent: AgentId, after: u64) {
-        let stored = match self.store.last_log_index(agent) {
-            Ok(stored) => stored,
-            Err(error) => {
-                self.error.get_or_insert(error);
-                return;
-            }
+        let Some(stored) = self.read(self.store.last_log_index(agent)) else {
+            return;
         };
         let appended = self.appended.get(&agent).copied();
         let last = stored.max(appended).unwrap_or(0);
@@ -74,47 +70,30 @@ impl Batch {
         term: u64,
         membership: Option<&Membership>,
     ) {
-        let mut stored = Vec::new();
-        for index in self.store.log_indices(agent, 0) {
-            match index {
-                Ok(index) if index <= through => stored.push(index),
-                Ok(_) => break,
-                Err(error) => {
-                    self.error.get_or_insert(error);
-                    return;
-                }
-            }
-        }
-        for index in stored {
-            self.batch.remove(self.store.log(), log_key(agent, index));
+        for row in self
+            .store
+            .log()
+            .range(log_key(agent, 0)..=log_key(agent, through))
+        {
+            let Some(key) = self.read(row.key()) else {
+                return;
+            };
+            self.batch.remove(self.store.log(), key);
         }
         let start = [
-            &through.to_be_bytes()[..],
-            &term.to_be_bytes(),
+            &encode_position(through, term)[..],
             &membership.map(encode_membership).unwrap_or_default(),
         ]
         .concat();
-        self.batch.insert(
-            self.store.system(),
-            node_row(agent, NodeRow::LogStart, &[]),
-            start,
-        );
+        self.set(agent, NodeRow::LogStart, start);
     }
 
     pub fn hard_state(&mut self, agent: AgentId, hard: &HardState) {
-        self.batch.insert(
-            self.store.system(),
-            node_row(agent, NodeRow::Hard, &[]),
-            encode_hard(hard),
-        );
+        self.set(agent, NodeRow::Hard, encode_hard(hard));
     }
 
     pub fn membership(&mut self, agent: AgentId, membership: &Membership) {
-        self.batch.insert(
-            self.store.system(),
-            node_row(agent, NodeRow::Membership, &[]),
-            encode_membership(membership),
-        );
+        self.set(agent, NodeRow::Membership, encode_membership(membership));
     }
 
     /// Apply a work result's writes, in order, to the agent's rows under
@@ -127,11 +106,7 @@ impl Batch {
         writes: impl IntoIterator<Item = &'a Write>,
     ) {
         self.rows(agent, epoch, writes);
-        self.batch.insert(
-            self.store.system(),
-            node_row(agent, NodeRow::Applied, &[]),
-            index.to_be_bytes(),
-        );
+        self.set(agent, NodeRow::Applied, index.to_be_bytes());
     }
 
     /// Write rows, in order, to the agent's rows under `epoch`: a value,
@@ -199,21 +174,13 @@ impl Batch {
         );
         self.hard_state(agent, &switch.hard);
         self.membership(agent, &switch.membership);
-        self.batch.insert(
-            self.store.system(),
-            node_row(agent, NodeRow::Applied, &[]),
-            switch.index.to_be_bytes(),
-        );
+        self.set(agent, NodeRow::Applied, switch.index.to_be_bytes());
         self.epoch(agent, switch.epoch);
     }
 
     /// Point the agent's reads at its rows under `epoch`.
     fn epoch(&mut self, agent: AgentId, epoch: u8) {
-        self.batch.insert(
-            self.store.system(),
-            node_row(agent, NodeRow::Epoch, &[]),
-            [epoch],
-        );
+        self.set(agent, NodeRow::Epoch, [epoch]);
     }
 
     /// `agent` keeps the blob `hash`: a program it runs.
@@ -248,27 +215,18 @@ impl Batch {
     /// (`hard`), so it never votes twice in a term if added again. `floor`,
     /// the last log position it held, bounds the votes it gives then.
     pub fn retire(&mut self, agent: AgentId, epoch: u8, hard: &HardState, floor: (u64, u64)) {
-        self.batch.insert(
-            self.store.system(),
-            node_row(agent, NodeRow::VoteFloor, &[]),
-            [floor.0.to_be_bytes(), floor.1.to_be_bytes()].concat(),
-        );
-        let start = match self.store.agent_rows(agent) {
-            Ok(rows) => rows.log_start,
-            Err(error) => {
-                self.error.get_or_insert(error);
-                return;
-            }
+        self.set(agent, NodeRow::VoteFloor, encode_position(floor.0, floor.1));
+        let Some(rows) = self.read(self.store.agent_rows(agent)) else {
+            return;
         };
-        self.truncate(agent, start);
+        self.truncate(agent, rows.log_start);
         for row in [
             NodeRow::Applied,
             NodeRow::LogStart,
             NodeRow::Membership,
             NodeRow::LastResult,
         ] {
-            self.batch
-                .remove(self.store.system(), node_row(agent, row, &[]));
+            self.batch.remove(self.store.system(), node_row(agent, row));
         }
         self.hard_state(agent, hard);
         self.epoch(agent, epoch);
@@ -276,11 +234,7 @@ impl Batch {
 
     /// The time and seed of the last work result applied to `agent`.
     pub fn last_result(&mut self, agent: AgentId, time: u64, seed: &[u8; 32]) {
-        self.batch.insert(
-            self.store.system(),
-            node_row(agent, NodeRow::LastResult, &[]),
-            [&time.to_be_bytes()[..], seed].concat(),
-        );
+        self.set(agent, NodeRow::LastResult, encode_last_result(time, seed));
     }
 
     /// Record the node's run, as its pair heartbeat numbers it.
@@ -298,6 +252,21 @@ impl Batch {
             .insert(self.store.system(), node_record(NodeRow::Secret, &[]), seed);
         self.batch
             .remove(self.store.system(), node_record(NodeRow::RetiredId, &[]));
+    }
+
+    /// Write the node's `row` for the agent.
+    fn set(&mut self, agent: AgentId, row: NodeRow, value: impl Into<fjall::Slice>) {
+        self.batch
+            .insert(self.store.system(), node_row(agent, row), value);
+    }
+
+    /// What `read` read, or `None` once it failed: the batch then commits
+    /// nothing.
+    fn read<T>(&mut self, read: Result<T>) -> Option<T> {
+        read.map_err(|error| {
+            self.error.get_or_insert(error);
+        })
+        .ok()
     }
 
     /// Commit the batch, returning once `mode` holds of it: handed to the

@@ -269,7 +269,7 @@ impl Inner {
             hash,
             len: bytes.len() as u64,
         };
-        match self.blobs.put_kept(blob, Arc::new(bytes), keep).await {
+        match self.blobs.put(blob, Arc::new(bytes), keep).await {
             Ok(()) => self.arrived(&hash),
             Err(error) => tracing::warn!("a blob from a peer was not stored: {error}"),
         }

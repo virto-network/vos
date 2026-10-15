@@ -14,7 +14,7 @@ use vos_wire::peer::NodeNumber;
 use crate::group::State;
 use crate::node::{Inner, Run};
 use crate::peer::Refusal;
-use crate::{lock, random_u64, timeout};
+use crate::{lock, random, timeout};
 
 /// How long an ask waits for its answer before it asks again.
 pub(crate) const REASK: Duration = Duration::from_secs(2);
@@ -47,7 +47,7 @@ impl<A> Waits<A> {
     /// Wait for answers about `agent`, under a token no other wait holds.
     pub(crate) fn register(&self, agent: AgentId) -> Wait<'_, A> {
         let (answer, answers) = smol::channel::unbounded();
-        let mut token = random_u64();
+        let mut token = u64::from_le_bytes(random());
         let mut waiting = lock(&self.waiting);
         while waiting.contains_key(&token) {
             token = token.wrapping_add(1);

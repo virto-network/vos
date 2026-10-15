@@ -31,8 +31,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
+use vos_checker::{Random, percentiles};
 use vos_node::store::{Fjall, LogEntry, PersistMode};
 use vos_wire::ids::AgentId;
+
+mod support;
 
 const RUN: Duration = Duration::from_secs(4);
 const MIB: f64 = 1024.0 * 1024.0;
@@ -178,9 +181,7 @@ struct Cluster {
 
 impl Cluster {
     fn new(nodes: usize, cap: usize) -> Self {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target")
-            .join(format!("log-bench-{}", std::process::id()));
+        let dir = support::data_dir("log-bench");
         let mut writers = Vec::new();
         let mut blobs = Vec::new();
         let mut threads = Vec::new();
@@ -264,17 +265,8 @@ fn propose(cluster: &Arc<Cluster>, proposers: &[(AgentId, usize)]) -> Vec<Vec<Du
                 // Incompressible, as encoded work results mostly are: a
                 // constant fill would compress away in the journal and the
                 // blob files.
-                let mut seed = 0x9e37_79b9_7f4a_7c15u64 ^ u64::from(agent.0);
-                let entry = Arc::new(
-                    (0..size)
-                        .map(|_| {
-                            seed ^= seed << 13;
-                            seed ^= seed >> 7;
-                            seed ^= seed << 17;
-                            seed as u8
-                        })
-                        .collect::<Vec<u8>>(),
-                );
+                let mut random = Random(0x9e37_79b9_7f4a_7c15 ^ u64::from(agent.0));
+                let entry = Arc::new((0..size).map(|_| random.draw() as u8).collect::<Vec<u8>>());
                 let mut samples = Vec::new();
                 while !stop.load(Ordering::Relaxed) {
                     let index = next[agent.0 as usize].fetch_add(1, Ordering::Relaxed);
@@ -296,11 +288,6 @@ fn propose(cluster: &Arc<Cluster>, proposers: &[(AgentId, usize)]) -> Vec<Vec<Du
     by_agent
 }
 
-fn percentile(sorted: &[Duration], fraction: f64) -> f64 {
-    let rank = (sorted.len() as f64 * fraction).ceil() as usize;
-    sorted[rank.max(1) - 1].as_secs_f64() * 1e3
-}
-
 fn sizes(nodes: usize, cap: usize) {
     let only: Option<usize> = std::env::var("ONLY")
         .ok()
@@ -318,16 +305,14 @@ fn sizes(nodes: usize, cap: usize) {
         }
         let cluster = Arc::new(Cluster::new(nodes, cap));
         let proposers: Vec<_> = (0..concurrency).map(|_| (AgentId(1), size)).collect();
-        let mut samples: Vec<Duration> = propose(&cluster, &proposers).concat();
+        let samples: Vec<Duration> = propose(&cluster, &proposers).concat();
         Arc::into_inner(cluster).unwrap().close();
-        samples.sort();
         let rate = samples.len() as f64 / RUN.as_secs_f64();
+        let (p50, p99) = percentiles(samples, Duration::from_millis(1));
         println!(
-            "{:>5} KiB × {concurrency:>2} on {nodes} node(s): {rate:>7.0} commits/s ({:>6.1} MiB/s), p50 {:>6.2} ms, p99 {:>6.2} ms",
+            "{:>5} KiB × {concurrency:>2} on {nodes} node(s): {rate:>7.0} commits/s ({:>6.1} MiB/s), p50 {p50:>6.2} ms, p99 {p99:>6.2} ms",
             size >> 10,
             rate * size as f64 / MIB,
-            percentile(&samples, 0.5),
-            percentile(&samples, 0.99),
         );
     }
 }
@@ -340,22 +325,20 @@ fn mixed(large: usize, cap: usize) {
     }
     let by_agent = propose(&cluster, &proposers);
     Arc::into_inner(cluster).unwrap().close();
-    let mut small: Vec<Duration> = by_agent[1..=15].concat();
-    small.sort();
+    let small: Vec<Duration> = by_agent[1..=15].concat();
+    let small_rate = small.len() as f64 / RUN.as_secs_f64();
+    let (p50, p99) = percentiles(small, Duration::from_millis(1));
     let large_commits = by_agent[16].len();
     println!(
-        "15 agents of 1 KiB beside one of {} KiB, cap {} KiB: small {:.0} commits/s, p50 {:.2} ms, p99 {:.2} ms; large {:.0} commits/s",
+        "15 agents of 1 KiB beside one of {} KiB, cap {} KiB: small {small_rate:.0} commits/s, p50 {p50:.2} ms, p99 {p99:.2} ms; large {:.0} commits/s",
         large >> 10,
         cap >> 10,
-        small.len() as f64 / RUN.as_secs_f64(),
-        percentile(&small, 0.5),
-        percentile(&small, 0.99),
         large_commits as f64 / RUN.as_secs_f64(),
     );
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args = support::args();
     let number = |at: usize, default: usize| {
         args.get(at)
             .map_or(default, |value| value.parse().expect("a number"))

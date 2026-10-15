@@ -33,9 +33,12 @@ use vos_wire::Decode;
 use vos_wire::ids::AgentId;
 use vos_wire::peer::{CreationRecord, Placement};
 
+use crate::blobs::{IndexRow, pinned_hash};
+
 use keys::{
-    NODE, NodeRow, SYSTEM, agent_key, be_u64, decode_entry, decode_hard, decode_membership,
-    log_index, log_key, node_record, node_row, registry_prefix,
+    NODE, NodeRow, SYSTEM, agent_key, applied, be_u64, decode_entry, decode_hard,
+    decode_membership, decode_position, entry_blobs, epoch, log_index, log_key, node_record,
+    node_row, registry_prefix,
 };
 
 pub use batch::Batch;
@@ -47,8 +50,7 @@ pub use tuning::Tuning;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// A node in an agent's replica set: the 8-bit node part of an agent id.
-pub type NodeNumber = u8;
+pub use vos_wire::peer::NodeNumber;
 
 /// One of an agent's rows: its agent-relative key and its value.
 pub type Row = (Vec<u8>, Vec<u8>);
@@ -139,19 +141,6 @@ impl Fjall {
         }
     }
 
-    /// The agent's stored log indices from `from` on, in order.
-    fn log_indices(&self, agent: AgentId, from: u64) -> impl Iterator<Item = Result<u64>> + '_ {
-        let prefix = agent.0.to_be_bytes();
-        self.log()
-            .range(log_key(agent, from)..)
-            .map(|row| row.key())
-            .take_while(move |key| match key {
-                Ok(key) => key.starts_with(&prefix),
-                Err(_) => true,
-            })
-            .map(|key| Ok(log_index(&key?).expect("an 8-byte log index")))
-    }
-
     pub(crate) fn last_log_index(&self, agent: AgentId) -> Result<Option<u64>> {
         let prefix = agent.0.to_be_bytes();
         match self.log().prefix(prefix).next_back() {
@@ -174,14 +163,10 @@ impl Fjall {
 
     /// An agent's epoch, applied index and log start, as stored.
     pub(crate) fn agent_rows(&self, agent: AgentId) -> Result<AgentRows> {
-        let row = |kind| self.system().get(node_row(agent, kind, &[]));
+        let row = |kind| self.system().get(node_row(agent, kind));
         Ok(AgentRows {
-            epoch: row(NodeRow::Epoch)?
-                .and_then(|bytes| bytes.first().copied())
-                .unwrap_or(0),
-            applied: row(NodeRow::Applied)?
-                .and_then(|bytes| be_u64(&bytes))
-                .unwrap_or(0),
+            epoch: epoch(row(NodeRow::Epoch)?),
+            applied: applied(row(NodeRow::Applied)?).unwrap_or(0),
             log_start: row(NodeRow::LogStart)?
                 .and_then(|bytes| be_u64(bytes.get(..8)?))
                 .unwrap_or(0),
@@ -213,13 +198,11 @@ impl Fjall {
     pub(crate) fn referenced_blobs(&self, snapshot: &fjall::Snapshot) -> Result<HashSet<[u8; 32]>> {
         let mut referenced = HashSet::new();
         for row in snapshot.iter(self.log()) {
-            let value = row.value()?;
-            let entry = decode_entry(&value).expect("a log entry this store wrote");
-            referenced.extend(entry.blobs.iter().map(|blob| blob.hash));
+            let blobs = entry_blobs(&row.value()?).expect("a log entry this store wrote");
+            referenced.extend(blobs.iter().map(|blob| blob.hash));
         }
-        for row in snapshot.prefix(self.blobs(), [crate::blobs::IndexRow::Pin as u8]) {
-            let key = row.key()?;
-            referenced.insert(key[1..33].try_into().expect("a pin names a hash"));
+        for row in snapshot.prefix(self.blobs(), [IndexRow::Pin as u8]) {
+            referenced.insert(pinned_hash(&row.key()?));
         }
         Ok(referenced)
     }
@@ -260,33 +243,22 @@ impl Fjall {
 
     /// The agent's Raft state, for recovery.
     pub fn raft(&self, agent: AgentId) -> Result<RaftRows> {
-        let hard = self
-            .system()
-            .get(node_row(agent, NodeRow::Hard, &[]))?
+        let row = |kind| self.system().get(node_row(agent, kind));
+        let hard = row(NodeRow::Hard)?
             .and_then(|bytes| decode_hard(&bytes))
             .unwrap_or_default();
-        let start_row = self.system().get(node_row(agent, NodeRow::LogStart, &[]))?;
+        let start_row = row(NodeRow::LogStart)?;
         let log_start = start_row
             .as_ref()
-            .and_then(|bytes| Some((be_u64(bytes.get(..8)?)?, be_u64(bytes.get(8..16)?)?)))
+            .and_then(|bytes| decode_position(bytes))
             .unwrap_or((0, 0));
         let log_start_membership = start_row
             .as_ref()
             .and_then(|bytes| decode_membership(bytes.get(16..)?));
-        let membership = self
-            .system()
-            .get(node_row(agent, NodeRow::Membership, &[]))?
-            .and_then(|bytes| decode_membership(&bytes));
-        let applied = self
-            .system()
-            .get(node_row(agent, NodeRow::Applied, &[]))?
-            .and_then(|bytes| be_u64(&bytes))
-            .unwrap_or(0);
+        let membership = row(NodeRow::Membership)?.and_then(|bytes| decode_membership(&bytes));
+        let applied = applied(row(NodeRow::Applied)?).unwrap_or(0);
         let log = self.log_range(agent, log_start.0 + 1, u64::MAX, usize::MAX)?;
-        let vote_floor = self
-            .system()
-            .get(node_row(agent, NodeRow::VoteFloor, &[]))?
-            .and_then(|bytes| Some((be_u64(bytes.get(..8)?)?, be_u64(bytes.get(8..16)?)?)));
+        let vote_floor = row(NodeRow::VoteFloor)?.and_then(|bytes| decode_position(&bytes));
         Ok(RaftRows {
             hard,
             log_start,
@@ -317,20 +289,10 @@ impl Fjall {
 
     /// Epochs other than the agent's current one that still hold rows.
     pub fn stale_epochs(&self, agent: AgentId) -> Result<Vec<u8>> {
-        let current = self
-            .system()
-            .get(node_row(agent, NodeRow::Epoch, &[]))?
-            .and_then(|bytes| bytes.first().copied())
-            .unwrap_or(0);
+        let current = epoch(self.system().get(node_row(agent, NodeRow::Epoch))?);
         let mut stale = Vec::new();
-        for epoch in 0..NODE {
-            if epoch == current {
-                continue;
-            }
-            let prefix = agent_key(agent, epoch, &[]);
-            if self.system().prefix(&prefix).next().is_some()
-                || self.state().prefix(&prefix).next().is_some()
-            {
+        for epoch in (0..NODE).filter(|&epoch| epoch != current) {
+            if self.epoch_holds_rows(agent, epoch)? {
                 stale.push(epoch);
             }
         }
@@ -343,9 +305,9 @@ impl Fjall {
         let mut records = Vec::new();
         for row in self.system().prefix(&prefix) {
             let (key, value) = row.into_inner()?;
-            match CreationRecord::decode(&value) {
-                Ok((record, used)) if used == value.len() => records.push(record),
-                _ => tracing::error!(
+            match CreationRecord::decode_exact(&value) {
+                Some(record) => records.push(record),
+                None => tracing::error!(
                     key = ?&key[prefix.len()..],
                     "an unreadable creation record; its agent is not run"
                 ),
@@ -369,11 +331,7 @@ impl Fjall {
                 tracing::error!(key = ?&key[prefix.len()..], "an unreadable placement key");
                 continue;
             };
-            let placement = match Placement::decode(&value) {
-                Ok((placement, used)) if used == value.len() => Some(placement),
-                _ => None,
-            };
-            placements.insert(agent, placement);
+            placements.insert(agent, Placement::decode_exact(&value));
         }
         Ok(placements)
     }

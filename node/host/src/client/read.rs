@@ -47,61 +47,30 @@ impl Client {
         consistency: Consistency,
     ) -> Result<Response, ClientError> {
         let identity = self.identity(agent)?;
-        let offset = || *lock(&self.offset);
-        let used = offset();
-        let answer = self.query_until(
-            agent,
-            &identity,
-            (instance, method, arguments),
-            not_after.saturating_add_signed(used),
-            consistency,
-        )?;
-        let Response::Rejected(Rejection::StaleQuery { now }) = answer else {
-            return Ok(answer);
-        };
-        self.learn_time(now);
-        self.query_until(
-            agent,
-            &identity,
-            (instance, method, arguments),
-            not_after.saturating_add_signed(offset()),
-            consistency,
-        )
-    }
-
-    /// A query good until `not_after`, by the agents' time.
-    fn query_until(
-        &self,
-        agent: AgentId,
-        identity: &[u8; 32],
-        (instance, method, arguments): (InstanceId, MethodId, &[u8]),
-        not_after: u64,
-        consistency: Consistency,
-    ) -> Result<Response, ClientError> {
         let key = self.key.verifying_key().to_bytes();
-        let message = query_message(
-            identity,
-            &key,
-            not_after,
-            consistency,
-            instance,
-            method,
-            arguments,
-        );
-        let query = QueryCall {
-            key,
-            not_after,
-            consistency,
-            instance,
-            method,
-            arguments: arguments.to_vec(),
-            signature: self.key.sign(&message).to_bytes(),
-        };
-        self.read(
-            agent,
-            &format!("/agents/{}/queries", agent.0),
-            &query.encode(),
-        )
+        let path = format!("/agents/{}/queries", agent.0);
+        self.with_learned_time(|offset| {
+            let not_after = not_after.saturating_add_signed(offset);
+            let message = query_message(
+                &identity,
+                &key,
+                not_after,
+                consistency,
+                instance,
+                method,
+                arguments,
+            );
+            let query = QueryCall {
+                key,
+                not_after,
+                consistency,
+                instance,
+                method,
+                arguments: arguments.to_vec(),
+                signature: self.key.sign(&message).to_bytes(),
+            };
+            self.read(agent, &path, &query.encode())
+        })
     }
 
     /// Read workflow `workflow` of `agent`, which this client's key
@@ -135,7 +104,13 @@ impl Client {
         let wait_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
         let key = self.key.verifying_key().to_bytes();
         let path = format!("/agents/{}/workflows", agent.0);
-        let read_until = |not_after: u64| {
+        self.with_learned_time(|offset| {
+            // Good past the wait, by the agents' time, within half the
+            // horizon a node allows: room for clocks off by as much either
+            // way.
+            let not_after = crate::wall_clock()
+                .saturating_add(workflow_read_horizon(wait_ms) - WORKFLOW_READ_HORIZON_MS / 2)
+                .saturating_add_signed(offset);
             let message =
                 workflow_message(&identity, &key, not_after, consistency, workflow, wait_ms);
             let read = WorkflowRead {
@@ -147,20 +122,24 @@ impl Client {
                 signature: self.key.sign(&message).to_bytes(),
             };
             self.read(agent, &path, &read.encode())
-        };
-        // Good past the wait, by the agents' time, within half the horizon
-        // a node allows: room for clocks off by as much either way.
-        let not_after = || {
-            crate::wall_clock()
-                .saturating_add(workflow_read_horizon(wait_ms) - WORKFLOW_READ_HORIZON_MS / 2)
-                .saturating_add_signed(*lock(&self.offset))
-        };
-        let answer = read_until(not_after())?;
+        })
+    }
+
+    /// `read` at the agents' time as this client knows it, given as its
+    /// offset from this client's clock; once more after a node says it is
+    /// stale, at the time that node reported.
+    fn with_learned_time(
+        &self,
+        read: impl Fn(i64) -> Result<Response, ClientError>,
+    ) -> Result<Response, ClientError> {
+        let offset = *lock(&self.offset);
+        let answer = read(offset)?;
         let Response::Rejected(Rejection::StaleQuery { now }) = answer else {
             return Ok(answer);
         };
         self.learn_time(now);
-        read_until(not_after())
+        let offset = *lock(&self.offset);
+        read(offset)
     }
 
     /// A signed read, `body` posted to `path`: it changes nothing, so one
@@ -168,7 +147,7 @@ impl Client {
     /// client still calling this one. An answer raises the agent's floor.
     fn read(&self, agent: AgentId, path: &str, body: &[u8]) -> Result<Response, ClientError> {
         let ask = |http: &Http| -> Result<Response, ClientError> {
-            let (status, answered) = http.post(path, None, body, true)?;
+            let (status, answered) = http.post_repeatable(path, body)?;
             answer(status, &answered)
         };
         let unanswered = |answer: &Result<Response, ClientError>| {
@@ -246,7 +225,7 @@ fn schema_from(
     instance: InstanceId,
 ) -> Result<Option<Schema>, ClientError> {
     let path = format!("/agents/{}/instances/{}/schema", agent.0, instance.0);
-    let (status, body) = http.get(&path)?;
+    let (status, body) = http.get(&path, None)?;
     if status == 404 {
         return Ok(None);
     }

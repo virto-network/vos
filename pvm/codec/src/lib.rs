@@ -48,6 +48,15 @@ pub trait Decode: Sized {
     /// Decode from `data`, returning `(value, bytes_consumed)`.
     fn decode(data: &[u8]) -> Result<(Self, usize), DecodeError>;
 
+    /// Decode all of `data` as one value: `None` when it is not one, or
+    /// has bytes left over.
+    fn decode_exact(data: &[u8]) -> Option<Self> {
+        match Self::decode(data) {
+            Ok((value, used)) if used == data.len() => Some(value),
+            _ => None,
+        }
+    }
+
     /// Decode `count` items from `data`: one by one, or in a single copy
     /// for bytes. The count only claims items: what is reserved up front
     /// is at most four times `data`'s own size (honest items are rarely

@@ -34,7 +34,12 @@ impl Operator {
 
     fn post(&self, path: &str, body: &[u8]) -> Result<Response, ClientError> {
         // An operator's command may not be idempotent: never sent twice.
-        let (status, body) = self.http.post(path, Some(&self.token), body, false)?;
+        let (status, body) = self.http.post_once(path, Some(&self.token), body)?;
+        answer(status, &body)
+    }
+
+    fn get(&self, path: &str) -> Result<Response, ClientError> {
+        let (status, body) = self.http.get(path, Some(&self.token))?;
         answer(status, &body)
     }
 
@@ -69,22 +74,12 @@ impl Operator {
 
     /// How long the node's stages took since it started.
     pub fn stats(&self) -> Result<Response, ClientError> {
-        let (status, body) = self
-            .http
-            .request("GET", "/stats", Some(&self.token), &[], true)?;
-        answer(status, &body)
+        self.get("/stats")
     }
 
     /// The node's replica of `agent`: its term, role, commit, applied
     /// index and log.
     pub fn status(&self, agent: AgentId) -> Result<Response, ClientError> {
-        let (status, body) = self.http.request(
-            "GET",
-            &format!("/agents/{}/status", agent.0),
-            Some(&self.token),
-            &[],
-            true,
-        )?;
-        answer(status, &body)
+        self.get(&format!("/agents/{}/status", agent.0))
     }
 }

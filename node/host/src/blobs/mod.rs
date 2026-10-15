@@ -31,18 +31,18 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread::JoinHandle;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use fjall::{Keyspace, PersistMode};
 
 use crate::lock;
-use crate::store::{BlobRef, Fjall, Result};
+use crate::store::{self, BlobRef, Fjall};
 
 pub use collect::{Collected, Horizons};
-pub(crate) use index::{IndexRow, pin_key};
-use index::{Location, location_key};
+pub(crate) use index::{IndexRow, pin_key, pinned_hash};
+use index::{Location, location};
 use segment::{Current, create_segment, forget_missing_segments, recover, segment_path, sync_dir};
-use writer::{Answer, Put, Request, Writer};
+use writer::{Put, Reply, Request, Writer};
 
 /// A segment closes once a record would take it past this many bytes.
 pub const SEGMENT_BYTES: u64 = 256 << 20;
@@ -52,6 +52,8 @@ const MAGIC: [u8; 4] = *b"VOSB";
 /// Segments kept open for reads at once.
 const OPEN_SEGMENTS: usize = 64;
 const HEADER: u64 = 4 + 8 + 32;
+/// What every request answers once the blob writer stopped.
+const STOPPED: &str = "the blob writer stopped";
 
 /// The blob's reference: its hash and length.
 pub fn blob_ref(bytes: &[u8]) -> BlobRef {
@@ -66,12 +68,7 @@ pub fn blob_ref(bytes: &[u8]) -> BlobRef {
 /// ages no blob past the horizon. A put's time, for the horizon only.
 fn now() -> u64 {
     static START: OnceLock<(u64, Instant)> = OnceLock::new();
-    let (wall, at) = START.get_or_init(|| {
-        let wall = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |since| since.as_millis() as u64);
-        (wall, Instant::now())
-    });
+    let (wall, at) = START.get_or_init(|| (crate::wall_clock(), Instant::now()));
     wall + at.elapsed().as_millis() as u64
 }
 
@@ -132,7 +129,6 @@ impl Drop for Held {
 struct Inner {
     dir: PathBuf,
     store: Fjall,
-    index: Keyspace,
     sender: Mutex<Option<mpsc::Sender<Request>>>,
     thread: Mutex<Option<JoinHandle<()>>>,
     /// One collection at a time.
@@ -159,16 +155,20 @@ pub struct Blobs {
 
 impl Blobs {
     /// Open the blob store in `dir`, indexing into `store`.
-    pub fn open(dir: impl AsRef<Path>, store: &Fjall) -> Result<Self> {
+    pub fn open(dir: impl AsRef<Path>, store: &Fjall) -> store::Result<Self> {
         Self::open_with(dir, store, SEGMENT_BYTES)
     }
 
     /// As [`Self::open`], closing segments at `segment_bytes`.
-    pub fn open_with(dir: impl AsRef<Path>, store: &Fjall, segment_bytes: u64) -> Result<Self> {
+    pub fn open_with(
+        dir: impl AsRef<Path>,
+        store: &Fjall,
+        segment_bytes: u64,
+    ) -> store::Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
         sync_dir(&dir)?;
-        let index = store.blobs().clone();
+        let index = store.blobs();
         let mut segments: Vec<u64> = Vec::new();
         for entry in std::fs::read_dir(&dir)? {
             let name = entry?.file_name();
@@ -180,9 +180,9 @@ impl Blobs {
         let mut batch = store.database().batch();
         let mut recovered = (0, None);
         for &segment in &segments {
-            recovered = recover(&dir, &index, &mut batch, segment)?;
+            recovered = recover(&dir, index, &mut batch, segment)?;
         }
-        forget_missing_segments(&index, &mut batch, &segments)?;
+        forget_missing_segments(index, &mut batch, &segments)?;
         batch.durability(Some(PersistMode::SyncAll)).commit()?;
         let current = match segments.last() {
             Some(&segment) => {
@@ -203,7 +203,6 @@ impl Blobs {
         let inner = Arc::new(Inner {
             dir,
             store: store.clone(),
-            index,
             sender: Mutex::new(Some(sender)),
             thread: Mutex::new(None),
             files: Mutex::new(HashMap::new()),
@@ -214,7 +213,6 @@ impl Blobs {
             let writer = Writer {
                 dir: inner.dir.clone(),
                 store: store.clone(),
-                index: inner.index.clone(),
                 holds: inner.holds.clone(),
                 segment_bytes,
                 current,
@@ -229,30 +227,26 @@ impl Blobs {
     }
 
     /// Store `bytes`, whose reference the caller computed (on an executor,
-    /// off the writer), kept by its age: answered once the blob is durable
-    /// and indexed.
-    pub async fn put(&self, blob: BlobRef, bytes: Arc<Vec<u8>>) -> std::result::Result<(), String> {
-        self.put_kept(blob, bytes, Keep::Aged).await
+    /// off the writer), kept as `keep` says: answered once the blob is
+    /// durable and indexed. A blob stored already keeps the longer of its
+    /// keep and this.
+    pub async fn put(&self, blob: BlobRef, bytes: Arc<Vec<u8>>, keep: Keep) -> Result<(), String> {
+        self.write(blob, bytes, keep, false).await
     }
 
-    /// As [`Self::put`], kept as `keep` says. A blob stored already keeps
-    /// the longer of its keep and this.
-    pub async fn put_kept(
-        &self,
-        blob: BlobRef,
-        bytes: Arc<Vec<u8>>,
-        keep: Keep,
-    ) -> std::result::Result<(), String> {
-        self.send(blob, bytes, keep, false).await
+    /// Write the stored blob again, at the current segment's end: a
+    /// collection moving it out of a sparse segment.
+    async fn relocate(&self, blob: BlobRef, bytes: Arc<Vec<u8>>, keep: Keep) -> Result<(), String> {
+        self.write(blob, bytes, keep, true).await
     }
 
-    async fn send(
+    async fn write(
         &self,
         blob: BlobRef,
         bytes: Arc<Vec<u8>>,
         keep: Keep,
         relocate: bool,
-    ) -> std::result::Result<(), String> {
+    ) -> Result<(), String> {
         self.request(|done| {
             Request::Put(Put {
                 blob,
@@ -275,43 +269,39 @@ impl Blobs {
         }
     }
 
-    async fn request<T>(
-        &self,
-        make: impl FnOnce(Answer<T>) -> Request,
-    ) -> std::result::Result<T, String> {
+    async fn request<T>(&self, make: impl FnOnce(Reply<T>) -> Request) -> Result<T, String> {
         let (done, wait) = smol::channel::bounded(1);
         lock(&self.inner.sender)
             .as_ref()
-            .ok_or("the blob writer stopped")?
+            .ok_or(STOPPED)?
             .send(make(done))
-            .map_err(|_| "the blob writer stopped".to_string())?;
-        wait.recv()
-            .await
-            .map_err(|_| "the blob writer stopped".to_string())?
+            .map_err(|_| STOPPED.to_string())?;
+        wait.recv().await.map_err(|_| STOPPED.to_string())?
     }
 
     /// Of `hashes`, the blobs stored, each now counted as just put: a host
     /// touches every blob it comes to rely on (an entry naming it) before
     /// counting on it, so a collection running meanwhile keeps it.
-    pub async fn touch(&self, hashes: Vec<[u8; 32]>) -> std::result::Result<Vec<[u8; 32]>, String> {
+    pub async fn touch(&self, hashes: Vec<[u8; 32]>) -> Result<Vec<[u8; 32]>, String> {
         self.request(|done| Request::Touch { hashes, done }).await
     }
 
-    fn location(&self, hash: &[u8; 32]) -> Result<Option<Location>> {
-        Ok(self
-            .inner
-            .index
-            .get(location_key(hash))?
-            .and_then(|bytes| Location::decode(&bytes)))
+    /// The blob store's index.
+    fn index(&self) -> &Keyspace {
+        self.inner.store.blobs()
+    }
+
+    fn location(&self, hash: &[u8; 32]) -> store::Result<Option<Location>> {
+        location(self.index(), hash)
     }
 
     /// Whether the blob is stored, durably.
-    pub fn contains(&self, hash: &[u8; 32]) -> Result<bool> {
+    pub fn contains(&self, hash: &[u8; 32]) -> store::Result<bool> {
         Ok(self.location(hash)?.is_some())
     }
 
     /// The blob's bytes, if stored.
-    pub fn get(&self, hash: &[u8; 32]) -> Result<Option<Vec<u8>>> {
+    pub fn get(&self, hash: &[u8; 32]) -> store::Result<Option<Vec<u8>>> {
         let Some(location) = self.location(hash)? else {
             return Ok(None);
         };
@@ -326,7 +316,7 @@ impl Blobs {
         }
     }
 
-    fn read(&self, location: &Location) -> Result<Vec<u8>> {
+    fn read(&self, location: &Location) -> store::Result<Vec<u8>> {
         let file = {
             let mut files = lock(&self.inner.files);
             match files.get(&location.segment) {
@@ -348,25 +338,24 @@ impl Blobs {
     }
 
     /// Whether `agent` pins the blob: a program it runs.
-    pub fn pinned_by(&self, hash: &[u8; 32], agent: u32) -> Result<bool> {
-        Ok(self.inner.index.get(pin_key(hash, agent))?.is_some())
+    pub fn pinned_by(&self, hash: &[u8; 32], agent: u32) -> store::Result<bool> {
+        Ok(self.index().get(pin_key(hash, agent))?.is_some())
     }
 
     /// Whether any agent pins the blob.
-    pub fn pinned_by_any(&self, hash: &[u8; 32]) -> Result<bool> {
+    pub fn pinned_by_any(&self, hash: &[u8; 32]) -> store::Result<bool> {
         let prefix = [&[IndexRow::Pin as u8][..], hash].concat();
-        match self.inner.index.prefix(prefix).next() {
+        match self.index().prefix(prefix).next() {
             Some(row) => row.key().map(|_| true),
             None => Ok(false),
         }
     }
 
     /// The pinned blobs, each once.
-    pub fn pinned(&self) -> Result<Vec<[u8; 32]>> {
+    pub fn pinned(&self) -> store::Result<Vec<[u8; 32]>> {
         let mut out: Vec<[u8; 32]> = Vec::new();
-        for row in self.inner.index.prefix([IndexRow::Pin as u8]) {
-            let key = row.key()?;
-            let hash: [u8; 32] = key[1..33].try_into().expect("a pin names a hash");
+        for row in self.index().prefix([IndexRow::Pin as u8]) {
+            let hash = pinned_hash(&row.key()?);
             if out.last() != Some(&hash) {
                 out.push(hash);
             }

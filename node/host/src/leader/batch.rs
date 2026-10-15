@@ -14,7 +14,7 @@ use super::{Ended, Leader};
 use crate::fault::{Fault, read};
 use crate::node::{Answered, Pending, Reply};
 use crate::store::{BlobRef, Snapshot};
-use crate::{Backoff, lock, raise, seed};
+use crate::{Backoff, lock, raise, random};
 
 /// How far this node's clock may trail the agent's time before the leader
 /// says so.
@@ -81,7 +81,7 @@ impl Leader {
         let batch = Batch {
             version,
             time,
-            seed: seed(),
+            seed: random(),
             budget: self.inner.settings.refine_gas,
             inputs: pending.iter().map(Pending::input).collect(),
         };

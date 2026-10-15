@@ -149,16 +149,18 @@ impl Faults {
             drops: Mutex::new(Vec::new()),
             random: AtomicU64::new(0x9e37_79b9_7f4a_7c15),
         });
+        let invalid = |why: String| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{}: {why}", path.display()),
+            )
+        };
         let first = read(&std::fs::read_to_string(path).unwrap_or_default());
         if !first.unreadable.is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "{}: unreadable settings {:?}",
-                    path.display(),
-                    first.unreadable
-                ),
-            ));
+            return Err(invalid(format!(
+                "unreadable settings {:?}",
+                first.unreadable
+            )));
         }
         if let Some(idle) = first.quic_idle {
             config.quic_idle = Duration::from_millis(idle);
@@ -174,15 +176,10 @@ impl Faults {
             config.compact_tail = tail;
         }
         if config.heartbeat_ms >= config.election_timeout_ms.0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "{}: a heartbeat of {} ms within elections of {:?} ms",
-                    path.display(),
-                    config.heartbeat_ms,
-                    config.election_timeout_ms
-                ),
-            ));
+            return Err(invalid(format!(
+                "a heartbeat of {} ms within elections of {:?} ms",
+                config.heartbeat_ms, config.election_timeout_ms
+            )));
         }
         let mut taken = first.generation;
         faults.take(first);

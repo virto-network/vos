@@ -8,7 +8,10 @@ use std::sync::Mutex;
 use fjall::Readable;
 use vos_wire::ids::AgentId;
 
-use super::keys::{AGENT_KEY_PREFIX, NodeRow, agent_key, be_u64, decode_entry, log_key, node_row};
+use super::keys::{
+    AGENT_KEY_PREFIX, NodeRow, agent_key, applied, decode_entry, decode_last_result,
+    decode_position, epoch, log_key, node_row,
+};
 use super::{Error, Fjall, Result, Row};
 use crate::lock;
 
@@ -26,21 +29,13 @@ impl Fjall {
     /// An export of the agent's applied state, from one store snapshot.
     pub fn export(&self, agent: AgentId) -> Result<Export> {
         let snapshot = self.database().snapshot();
-        let row = |kind| snapshot.get(self.system(), node_row(agent, kind, &[]));
-        let epoch = row(NodeRow::Epoch)?
-            .and_then(|bytes| bytes.first().copied())
-            .unwrap_or(0);
-        let applied = row(NodeRow::Applied)?
-            .and_then(|bytes| be_u64(&bytes))
-            .unwrap_or(0);
+        let row = |kind| snapshot.get(self.system(), node_row(agent, kind));
+        let epoch = epoch(row(NodeRow::Epoch)?);
+        let applied = applied(row(NodeRow::Applied)?).unwrap_or(0);
         let log_start = row(NodeRow::LogStart)?
-            .and_then(|bytes| Some((be_u64(bytes.get(..8)?)?, be_u64(bytes.get(8..16)?)?)))
+            .and_then(|bytes| decode_position(&bytes))
             .unwrap_or((0, 0));
-        let last_result = row(NodeRow::LastResult)?.and_then(|bytes| {
-            let time = be_u64(bytes.get(..8)?)?;
-            let seed = bytes.get(8..40)?.try_into().ok()?;
-            Some((time, seed))
-        });
+        let last_result = row(NodeRow::LastResult)?.and_then(|bytes| decode_last_result(&bytes));
         let term = if applied <= log_start.0 {
             log_start.1
         } else {
@@ -144,11 +139,7 @@ impl Snapshot {
         if let Some(&epoch) = lock(&self.epochs).get(&agent) {
             return Ok(epoch);
         }
-        let epoch = self
-            .snapshot
-            .get(self.store.system(), node_row(agent, NodeRow::Epoch, &[]))?
-            .and_then(|bytes| bytes.first().copied())
-            .unwrap_or(0);
+        let epoch = epoch(self.row(agent, NodeRow::Epoch)?);
         lock(&self.epochs).insert(agent, epoch);
         Ok(epoch)
     }
@@ -206,24 +197,18 @@ impl Snapshot {
 
     /// The last log index applied to the agent's state.
     pub fn applied(&self, agent: AgentId) -> Result<Option<u64>> {
-        Ok(self
-            .snapshot
-            .get(self.store.system(), node_row(agent, NodeRow::Applied, &[]))?
-            .and_then(|bytes| be_u64(&bytes)))
+        Ok(applied(self.row(agent, NodeRow::Applied)?))
     }
 
     /// The time and seed of the last work result applied to the agent.
     pub fn last_result(&self, agent: AgentId) -> Result<Option<(u64, [u8; 32])>> {
         Ok(self
-            .snapshot
-            .get(
-                self.store.system(),
-                node_row(agent, NodeRow::LastResult, &[]),
-            )?
-            .and_then(|bytes| {
-                let time = be_u64(bytes.get(..8)?)?;
-                let seed = bytes.get(8..40)?.try_into().ok()?;
-                Some((time, seed))
-            }))
+            .row(agent, NodeRow::LastResult)?
+            .and_then(|bytes| decode_last_result(&bytes)))
+    }
+
+    /// The node's `row` for the agent.
+    fn row(&self, agent: AgentId, row: NodeRow) -> Result<Option<fjall::Slice>> {
+        self.snapshot.get(self.store.system(), node_row(agent, row))
     }
 }

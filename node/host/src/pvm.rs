@@ -300,6 +300,7 @@ pub(crate) fn decode<T: Decode>(bytes: &[u8]) -> Result<T, Fault> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blobs::Keep;
     use crate::store::{Fjall, PersistMode};
     use vos_pvm::accumulate_host::SELF_SERVICE;
     use vos_pvm_program::{CodeBlob, StandardProgram, build_standard_program};
@@ -352,7 +353,7 @@ mod tests {
         let stored = |bytes: Vec<u8>| {
             let program = Arc::new(bytes);
             let blob = crate::blobs::blob_ref(&program);
-            smol::block_on(blobs.put(blob, Arc::clone(&program))).unwrap();
+            smol::block_on(blobs.put(blob, Arc::clone(&program), Keep::Aged)).unwrap();
             (blob.hash, program.to_vec())
         };
         let (pinned, pinned_bytes) = stored(vec![1, 2, 3]);

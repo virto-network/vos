@@ -1,9 +1,10 @@
 //! The store's key layout, and the codecs of the rows it keeps for each
 //! agent and for the node.
 
+use fjall::Slice;
 use vos_wire::ids::AgentId;
 
-use super::{HardState, LogEntry, Membership, NodeNumber};
+use super::{BlobRef, HardState, LogEntry, Membership, NodeNumber};
 
 /// The first byte of an agent-relative system key ([`vos_wire::keys`]).
 pub(super) const SYSTEM: u8 = 0x00;
@@ -46,17 +47,17 @@ pub(super) fn agent_key(agent: AgentId, epoch: u8, key: &[u8]) -> Vec<u8> {
 /// The bytes before an agent's relative keys.
 pub(super) const AGENT_KEY_PREFIX: usize = 5;
 
-pub(super) fn node_row(agent: AgentId, row: NodeRow, rest: &[u8]) -> Vec<u8> {
-    [&agent.0.to_be_bytes()[..], &[NODE, row as u8], rest].concat()
+pub(super) fn node_row(agent: AgentId, row: NodeRow) -> Vec<u8> {
+    [&agent.0.to_be_bytes()[..], &[NODE, row as u8]].concat()
 }
 
 pub(super) fn registry_prefix() -> Vec<u8> {
-    node_row(NODE_AGENT, NodeRow::Agent, &[])
+    node_row(NODE_AGENT, NodeRow::Agent)
 }
 
 /// A node-wide record: under the node's reserved agent id.
 pub(super) fn node_record(row: NodeRow, rest: &[u8]) -> Vec<u8> {
-    node_row(NODE_AGENT, row, rest)
+    [node_row(NODE_AGENT, row), rest.to_vec()].concat()
 }
 
 pub(super) fn be_u64(bytes: &[u8]) -> Option<u64> {
@@ -78,6 +79,46 @@ pub(super) fn encode_entry(entry: &LogEntry) -> Vec<u8> {
 pub(super) fn decode_entry(bytes: &[u8]) -> Option<LogEntry> {
     let (term, payload) = bytes.split_first_chunk::<8>()?;
     LogEntry::from_payload(u64::from_be_bytes(*term), payload)
+}
+
+/// The blobs a stored entry names, its body unread.
+pub(super) fn entry_blobs(bytes: &[u8]) -> Option<Vec<BlobRef>> {
+    let (_, payload) = bytes.split_first_chunk::<8>()?;
+    LogEntry::blob_refs(payload)
+}
+
+/// An agent's epoch, from its row: the first when it has none.
+pub(super) fn epoch(row: Option<Slice>) -> u8 {
+    row.and_then(|bytes| bytes.first().copied()).unwrap_or(0)
+}
+
+/// An agent's applied index, from its row.
+pub(super) fn applied(row: Option<Slice>) -> Option<u64> {
+    row.and_then(|bytes| be_u64(&bytes))
+}
+
+/// A log position, its index and term, as the log start's and the vote
+/// floor's rows begin.
+pub(super) fn encode_position(index: u64, term: u64) -> [u8; 16] {
+    let mut out = [0; 16];
+    out[..8].copy_from_slice(&index.to_be_bytes());
+    out[8..].copy_from_slice(&term.to_be_bytes());
+    out
+}
+
+pub(super) fn decode_position(bytes: &[u8]) -> Option<(u64, u64)> {
+    Some((be_u64(bytes.get(..8)?)?, be_u64(bytes.get(8..16)?)?))
+}
+
+/// The time and seed of an agent's last work result.
+pub(super) fn encode_last_result(time: u64, seed: &[u8; 32]) -> Vec<u8> {
+    [&time.to_be_bytes()[..], seed].concat()
+}
+
+pub(super) fn decode_last_result(bytes: &[u8]) -> Option<(u64, [u8; 32])> {
+    let time = be_u64(bytes.get(..8)?)?;
+    let seed = bytes.get(8..40)?.try_into().ok()?;
+    Some((time, seed))
 }
 
 pub(super) fn encode_hard(hard: &HardState) -> Vec<u8> {
@@ -111,24 +152,15 @@ fn decode_nodes(bytes: &[u8]) -> Option<(Vec<NodeNumber>, &[u8])> {
     Some((nodes.to_vec(), rest))
 }
 
+/// A replica set as a replica adopted it: the index that established it,
+/// when known, then its configuration.
 pub(super) fn encode_membership(membership: &Membership) -> Vec<u8> {
-    let mut out = Vec::new();
-    match membership.index {
-        Some(index) => {
-            out.push(1);
-            out.extend_from_slice(&index.to_be_bytes());
-        }
-        None => out.push(0),
-    }
-    encode_nodes(&mut out, &membership.members);
-    match &membership.joint_old {
-        Some(old) => {
-            out.push(1);
-            encode_nodes(&mut out, old);
-        }
-        None => out.push(0),
-    }
-    out
+    let index = match membership.index {
+        Some(index) => [&[1][..], &index.to_be_bytes()].concat(),
+        None => vec![0],
+    };
+    let configuration = encode_configuration(&membership.members, membership.joint_old.as_deref());
+    [index, configuration].concat()
 }
 
 pub(super) fn decode_membership(bytes: &[u8]) -> Option<Membership> {
@@ -140,13 +172,7 @@ pub(super) fn decode_membership(bytes: &[u8]) -> Option<Membership> {
     } else {
         None
     };
-    let (members, rest) = decode_nodes(rest)?;
-    let (&has_old, rest) = rest.split_first()?;
-    let joint_old = if has_old == 1 {
-        Some(decode_nodes(rest)?.0)
-    } else {
-        None
-    };
+    let (members, joint_old) = decode_configuration(rest)?;
     Some(Membership {
         index,
         members,

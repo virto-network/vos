@@ -2,8 +2,8 @@
 //! loop and the node's log writer, and the work its actions ask for.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, PoisonError};
 use std::time::{Duration, Instant};
 
 use smol::future::FutureExt;
@@ -21,7 +21,7 @@ use super::{Input, Local, MembershipChanged, Proposed, ReadIndexed, Shared};
 use crate::blobs::Held;
 use crate::node::Inner;
 use crate::raft::{self, EntryReports};
-use crate::random_u64;
+use crate::random;
 use crate::storage::Change;
 use fetch::Fetch;
 use membership::established;
@@ -178,7 +178,12 @@ impl Driver {
         // listed.
         config.idle_heartbeats = false;
         config.check_quorum = true;
-        let core = Core::new(config, raft::recovered(rows), 0, random_u64());
+        let core = Core::new(
+            config,
+            raft::recovered(rows),
+            0,
+            u64::from_le_bytes(random()),
+        );
         let established = established(&core, inner.number);
         // The core counts every recovered entry durable, which a committed
         // one is safe to be: nothing applies past a lost blob until a
@@ -235,12 +240,7 @@ impl Driver {
         let start = self.start;
         let at = |instant: Instant| instant.saturating_duration_since(start).as_millis() as u64;
         let agent = self.shared.agent;
-        let table = self
-            .inner
-            .liveness
-            .table
-            .read()
-            .unwrap_or_else(PoisonError::into_inner);
+        let table = self.inner.liveness.table();
         self.core.vouch(
             now,
             |node, term| table.listed(node, &agent, term).map(at),

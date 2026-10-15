@@ -3,7 +3,7 @@
 //! files, which clients trust through its CA. Plain HTTP serves loopback
 //! addresses only.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -61,15 +61,10 @@ pub(crate) fn server_config(
             (vec![certificate.der().clone()], PrivateKeyDer::Pkcs8(pkcs8))
         }
         IngressTls::Files { chain, key } => {
-            let certificates = CertificateDer::pem_file_iter(chain)
-                .and_then(|certificates| certificates.collect::<Result<Vec<_>, _>>())
-                .map_err(|error| format!("{}: {error}", chain.display()))?;
-            if certificates.is_empty() {
-                return Err(format!("{}: no certificate", chain.display()));
-            }
+            let chain = certificates(chain)?;
             let key = PrivateKeyDer::from_pem_file(key)
                 .map_err(|error| format!("{}: {error}", key.display()))?;
-            (certificates, key)
+            (chain, key)
         }
     };
     let mut config = rustls::ServerConfig::builder_with_provider(provider())
@@ -95,25 +90,30 @@ pub enum Trust {
 
 impl Trust {
     /// The CAs in the PEM file at `path`.
-    pub fn ca_file(path: &std::path::Path) -> Result<Self, String> {
-        let certificates = CertificateDer::pem_file_iter(path)
-            .and_then(|certificates| certificates.collect::<Result<Vec<_>, _>>())
-            .map_err(|error| format!("{}: {error}", path.display()))?;
-        if certificates.is_empty() {
-            return Err(format!("{}: no certificate", path.display()));
-        }
-        Ok(Trust::Ca(certificates))
+    pub fn ca_file(path: &Path) -> Result<Self, String> {
+        Ok(Trust::Ca(certificates(path)?))
     }
 }
 
-/// A client's TLS configuration for `trust`, or none for plain HTTP.
-pub(crate) fn client_config(trust: &Trust) -> Result<Option<Arc<rustls::ClientConfig>>, String> {
+/// The certificates in the PEM file at `path`: at least one.
+fn certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>, String> {
+    let certificates = CertificateDer::pem_file_iter(path)
+        .and_then(|certificates| certificates.collect::<Result<Vec<_>, _>>())
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    if certificates.is_empty() {
+        return Err(format!("{}: no certificate", path.display()));
+    }
+    Ok(certificates)
+}
+
+/// A client's TLS configuration for `trust`: none for plain HTTP.
+pub(crate) fn client_config(trust: &Trust) -> Result<Arc<rustls::ClientConfig>, String> {
     let provider = provider();
     let builder = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|error| error.to_string())?;
     let mut config = match trust {
-        Trust::Loopback => return Ok(None),
+        Trust::Loopback => return Err("plain HTTP has no TLS".into()),
         Trust::NodeKey(key) => builder
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(PinnedKey {
@@ -132,7 +132,7 @@ pub(crate) fn client_config(trust: &Trust) -> Result<Option<Arc<rustls::ClientCo
         }
     };
     config.alpn_protocols = vec![ALPN.to_vec()];
-    Ok(Some(Arc::new(config)))
+    Ok(Arc::new(config))
 }
 
 /// Takes a server whose certificate holds one key, whatever else it

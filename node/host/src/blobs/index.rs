@@ -1,6 +1,9 @@
 //! The blob store's index: its rows, their keys and their codecs.
 
+use fjall::{Guard, Keyspace};
+
 use super::Keep;
+use crate::store::Result;
 
 /// The index's rows, by their first byte.
 #[derive(Clone, Copy)]
@@ -23,6 +26,11 @@ pub(super) fn segment_key(segment: u64) -> Vec<u8> {
     [&[IndexRow::Segment as u8][..], &segment.to_be_bytes()].concat()
 }
 
+/// The segment a segment row's key names.
+pub(super) fn segment_of(key: &[u8]) -> u64 {
+    u64::from_be_bytes(key[1..9].try_into().expect("a segment number"))
+}
+
 /// A segment row: the end of its indexed records, and where the last one
 /// starts.
 pub(super) fn segment_row(end: u64, last: Option<u64>) -> Vec<u8> {
@@ -43,6 +51,26 @@ pub(super) fn decode_segment_row(bytes: &[u8]) -> (u64, Option<u64>) {
 
 pub(crate) fn pin_key(hash: &[u8; 32], agent: u32) -> Vec<u8> {
     [&[IndexRow::Pin as u8][..], hash, &agent.to_be_bytes()].concat()
+}
+
+/// The blob a pin's key names.
+pub(crate) fn pinned_hash(key: &[u8]) -> [u8; 32] {
+    key[1..33].try_into().expect("a pin names a hash")
+}
+
+/// Where the blob `hash` is, if `index` holds it.
+pub(super) fn location(index: &Keyspace, hash: &[u8; 32]) -> Result<Option<Location>> {
+    Ok(index
+        .get(location_key(hash))?
+        .and_then(|bytes| Location::decode(&bytes)))
+}
+
+/// A location row's blob, and where it is.
+pub(super) fn location_row(row: Guard) -> Result<([u8; 32], Location)> {
+    let (key, value) = row.into_inner()?;
+    let hash = key[1..].try_into().expect("a location names a hash");
+    let location = Location::decode(&value).expect("a location this store wrote");
+    Ok((hash, location))
 }
 
 /// Where a blob is, when it was last put or touched, and how it is kept.

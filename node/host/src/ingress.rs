@@ -12,7 +12,7 @@ use vos_wire::abi::{Refusal, cap};
 use vos_wire::batch::Admin;
 use vos_wire::ids::{AgentId, InstanceId, Principal};
 use vos_wire::ingress::{
-    AgentInfo, Call, Create, Grant, Install, QueryCall, Rejection, Replace, Response, WorkflowRead,
+    AgentInfo, Create, Install, QueryCall, Rejection, Replace, Response, WorkflowRead,
     query_message, workflow_message, workflow_read_horizon,
 };
 use vos_wire::records::{Installed, unstored};
@@ -100,10 +100,19 @@ fn respond(answer: Response) -> http::Response {
 }
 
 fn decode<T: Decode>(body: &[u8]) -> Result<T, Response> {
-    match T::decode(body) {
-        Ok((value, used)) if used == body.len() => Ok(value),
-        _ => Err(Response::Rejected(Rejection::Malformed)),
-    }
+    T::decode_exact(body).ok_or(Response::Rejected(Rejection::Malformed))
+}
+
+/// The agent a path's `id` names.
+fn agent(id: &str) -> Option<AgentId> {
+    id.parse::<u32>().ok().map(AgentId)
+}
+
+/// The agent `id` names and the request `body` holds, or the answer to a
+/// request naming no agent, else to one malformed.
+fn agent_and<T: Decode>(id: &str, body: &[u8]) -> Result<(AgentId, T), Response> {
+    let agent = agent(id).ok_or(Response::NoAgent)?;
+    Ok((agent, decode(body)?))
 }
 
 impl Ingress {
@@ -159,36 +168,28 @@ impl Ingress {
             .unwrap_or_default()
             .to_string();
         let segments: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
-        let agent = |text: &str| text.parse::<u32>().ok().map(AgentId);
         match (request.method.as_str(), segments.as_slice()) {
             ("GET", []) => http::Response::new(200, self.inner.node_id.encode()),
             ("GET", ["agents", id]) => match agent(id).and_then(|agent| self.agent_info(agent)) {
                 Some(info) => http::Response::new(200, info.encode()),
-                None => http::Response::new(404, Vec::new()),
+                None => http::Response::not_found(),
             },
-            ("POST", ["agents", id, "calls"]) => match (agent(id), decode::<Call>(&request.body)) {
-                (Some(agent), Ok(call)) => respond(self.inner.client_call(agent, call).await),
-                (None, _) => respond(Response::NoAgent),
-                (_, Err(answer)) => respond(answer),
-            },
-            ("POST", ["agents", id, "queries"]) => {
-                match (agent(id), decode::<QueryCall>(&request.body)) {
-                    (Some(agent), Ok(query)) => respond(self.query(agent, query).await),
-                    (None, _) => respond(Response::NoAgent),
-                    (_, Err(answer)) => respond(answer),
-                }
-            }
-            ("POST", ["agents", id, "workflows"]) => {
-                match (agent(id), decode::<WorkflowRead>(&request.body)) {
-                    (Some(agent), Ok(read)) => respond(self.workflow(agent, read).await),
-                    (None, _) => respond(Response::NoAgent),
-                    (_, Err(answer)) => respond(answer),
-                }
-            }
+            ("POST", ["agents", id, "calls"]) => respond(match agent_and(id, &request.body) {
+                Ok((agent, call)) => self.inner.client_call(agent, call).await,
+                Err(answer) => answer,
+            }),
+            ("POST", ["agents", id, "queries"]) => respond(match agent_and(id, &request.body) {
+                Ok((agent, query)) => self.query(agent, query).await,
+                Err(answer) => answer,
+            }),
+            ("POST", ["agents", id, "workflows"]) => respond(match agent_and(id, &request.body) {
+                Ok((agent, read)) => self.workflow(agent, read).await,
+                Err(answer) => answer,
+            }),
             ("GET", ["agents", id, "instances", instance, "schema"]) => {
                 match (agent(id), instance.parse::<u32>()) {
                     (Some(agent), Ok(instance)) => self.schema(agent, InstanceId(instance)),
-                    _ => http::Response::new(404, Vec::new()),
+                    _ => http::Response::not_found(),
                 }
             }
             ("POST", ["agents"] | ["agents", _, "install" | "roles" | "replicas"])
@@ -211,7 +212,7 @@ impl Ingress {
                 match create {
                     Ok(create) => respond(match self.inner.create_agent(create.replicas).await {
                         Ok(agent) => Response::Created(agent),
-                        Err(error) => answer_of(Err(error)),
+                        Err(error) => error.into(),
                     }),
                     Err(answer) => respond(answer),
                 }
@@ -235,32 +236,24 @@ impl Ingress {
                     None => respond(Response::Unavailable),
                 }
             }
-            ("POST", ["agents", id, "replicas"]) => {
-                match (agent(id), decode::<Replace>(&request.body)) {
-                    (Some(agent), Ok(replace)) => {
-                        let replaced = self.inner.replace(agent, replace.remove, replace.add).await;
-                        respond(match replaced {
-                            Ok(replicas) => Response::Placed(replicas),
-                            Err(ReplaceError::Unplaced(why)) => Response::Unplaced(why),
-                            Err(ReplaceError::TimedOut) => Response::TimedOut,
-                            Err(ReplaceError::Call(error)) => answer_of(Err(error)),
-                        })
+            ("POST", ["agents", id, "replicas"]) => respond(match agent_and(id, &request.body) {
+                Ok((agent, Replace { remove, add })) => {
+                    match self.inner.replace(agent, remove, add).await {
+                        Ok(replicas) => Response::Placed(replicas),
+                        Err(ReplaceError::Unplaced(why)) => Response::Unplaced(why),
+                        Err(ReplaceError::TimedOut) => Response::TimedOut,
+                        Err(ReplaceError::Call(error)) => error.into(),
                     }
-                    (None, _) => respond(Response::NoAgent),
-                    (_, Err(answer)) => respond(answer),
                 }
-            }
-            ("POST", ["agents", id, "roles"]) => {
-                match (agent(id), decode::<Grant>(&request.body)) {
-                    (Some(agent), Ok(grant)) => {
-                        let admin = Admin::SetRole(grant);
-                        respond(answer_of(self.inner.admin(agent, admin).await))
-                    }
-                    (None, _) => respond(Response::NoAgent),
-                    (_, Err(answer)) => respond(answer),
+                Err(answer) => answer,
+            }),
+            ("POST", ["agents", id, "roles"]) => respond(match agent_and(id, &request.body) {
+                Ok((agent, grant)) => {
+                    answer_of(self.inner.admin(agent, Admin::SetRole(grant)).await)
                 }
-            }
-            _ => http::Response::new(404, Vec::new()),
+                Err(answer) => answer,
+            }),
+            _ => http::Response::not_found(),
         }
     }
 
@@ -291,8 +284,9 @@ impl Ingress {
     }
 
     async fn query(&self, agent: AgentId, query: QueryCall) -> Response {
-        let Some(run) = self.inner.run(agent) else {
-            return answer_of(Err(self.inner.absent(agent)));
+        let run = match self.inner.present(agent) {
+            Ok(run) => run,
+            Err(error) => return error.into(),
         };
         let message = query_message(
             &run.shared.identity,
@@ -330,8 +324,9 @@ impl Ingress {
     /// long as it asks and the node allows, and only while fewer reads than
     /// the node allows wait: past them, it answers at once.
     async fn workflow(&self, agent: AgentId, read: WorkflowRead) -> Response {
-        let Some(run) = self.inner.run(agent) else {
-            return answer_of(Err(self.inner.absent(agent)));
+        let run = match self.inner.present(agent) {
+            Ok(run) => run,
+            Err(error) => return error.into(),
         };
         let message = workflow_message(
             &run.shared.identity,
@@ -409,7 +404,7 @@ impl Ingress {
             .and_then(|bytes| Installed::decode(unstored(&bytes)?).ok());
         match installed {
             Some((installed, _)) => http::Response::new(200, installed.schema.encode()),
-            None => http::Response::new(404, Vec::new()),
+            None => http::Response::not_found(),
         }
     }
 }

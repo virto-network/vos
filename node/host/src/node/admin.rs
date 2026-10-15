@@ -12,6 +12,7 @@ use vos_wire::peer::{CreationRecord, NodeNumber, Placement};
 use vos_wire::records::Derivation;
 
 use super::{Answered, CallError, Inner, Pending, ReplaceError};
+use crate::blobs::Keep;
 use crate::group::Local;
 use crate::storage::Change;
 use crate::store::BlobRef;
@@ -231,7 +232,7 @@ impl Inner {
         let mut references = Vec::with_capacity(stored.len());
         for (reference, blob) in stored {
             self.blobs
-                .put(reference, blob)
+                .put(reference, blob, Keep::Aged)
                 .await
                 .map_err(CallError::Failed)?;
             references.push(reference);

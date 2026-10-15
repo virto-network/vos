@@ -131,18 +131,20 @@ impl Default for Backoff {
     }
 }
 
-/// 32 random bytes, from the operating system's randomness.
-pub(crate) fn seed() -> [u8; 32] {
-    let mut seed = [0u8; 32];
-    getrandom::getrandom(&mut seed).expect("the operating system's randomness");
-    seed
+/// Random bytes, from the operating system's randomness.
+pub(crate) fn random<const N: usize>() -> [u8; N] {
+    let mut bytes = [0; N];
+    getrandom::getrandom(&mut bytes).expect("the operating system's randomness");
+    bytes
 }
 
-/// A random number, from the operating system's randomness.
-pub(crate) fn random_u64() -> u64 {
-    let mut bytes = [0u8; 8];
-    getrandom::getrandom(&mut bytes).expect("the operating system's randomness");
-    u64::from_le_bytes(bytes)
+/// What a caught panic said.
+pub(crate) fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_default()
 }
 
 /// Points where a test breaks the node as a crash or a bug would.

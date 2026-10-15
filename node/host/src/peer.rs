@@ -342,10 +342,7 @@ pub fn stream(message: &PeerMessage) -> u64 {
 
 /// A frame from a peer, whole.
 pub fn decode(frame: &[u8]) -> Result<PeerMessage, Refusal> {
-    match PeerMessage::decode(frame) {
-        Ok((message, used)) if used == frame.len() => Ok(message),
-        _ => Err(Refusal::Undecodable),
-    }
+    PeerMessage::decode_exact(frame).ok_or(Refusal::Undecodable)
 }
 
 /// Check what `from` sent on `class` and `stream` against `space`, the

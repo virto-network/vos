@@ -64,14 +64,8 @@ impl Executors {
     {
         let (done, wait) = smol::channel::bounded(1);
         let job: Job = Box::new(move || {
-            let result = catch_unwind(AssertUnwindSafe(work)).map_err(|panic| {
-                let message = panic
-                    .downcast_ref::<&str>()
-                    .map(|message| (*message).to_string())
-                    .or_else(|| panic.downcast_ref::<String>().cloned())
-                    .unwrap_or_default();
-                Panicked(message)
-            });
+            let result = catch_unwind(AssertUnwindSafe(work))
+                .map_err(|panic| Panicked(crate::panic_message(&*panic)));
             let _ = done.try_send(result);
         });
         let sent = self.jobs.try_send(job).is_ok();
