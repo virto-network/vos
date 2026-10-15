@@ -3,9 +3,9 @@
 //! when the programs are missing.
 
 use vos_testkit::programs::{actor, kernel, method, schema};
-use vos_testkit::{InstallError, Testkit, decode, program_hash};
+use vos_testkit::{InstallError, Testkit, decode};
 use vos_wire::abi::{Failure, Kind};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal};
+use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash};
 use vos_wire::result::Outcome;
 use vos_wire::{Decode, Encode};
 
@@ -22,7 +22,7 @@ fn reply<T: Decode>(outcome: Outcome) -> T {
 }
 
 /// The ledger's kernels: its attestable's, derived from its ELF. Its
-/// workflow runs in its own program.
+/// workflow runs in the ledger's program.
 fn kernels<'a>(ledger: &[u8]) -> Vec<(MethodId, &'a [u8])> {
     static CHECKSUM: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     let checksum = CHECKSUM.get_or_init(|| kernel("ledger", "checksum"));
@@ -202,7 +202,7 @@ fn an_attestable_method_runs_as_its_own_kernel() {
     assert_eq!(step.attests.len(), 1);
     assert_eq!(
         step.attests[0].program,
-        program_hash(&kernel("ledger", "checksum"))
+        ProgramHash::of(&kernel("ledger", "checksum"))
     );
     assert_eq!(step.attests[0].arguments, values.encode());
     assert_eq!(step.attests[0].output, expected.encode());

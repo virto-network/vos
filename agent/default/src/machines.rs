@@ -1,6 +1,6 @@
-//! Inner machines: an actor, attestable or workflow program, from the
-//! node's pool (`instantiate`) or built here from its blob (the loader),
-//! which a JAM node's preimages supply.
+//! Inner machines: an actor's program or a kernel, from the node's pool
+//! (`instantiate`) or built here from its blob (the loader), which a JAM
+//! node's preimages supply.
 //!
 //! A machine can track the pages written in it ([`Machine::track`]): its
 //! writable pages are armed read-only, a guest's first store to one exits

@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use scale::{Decode, Encode};
 
 use crate::abi::{Failure, Refusal, cap};
-use crate::batch::Body;
+use crate::batch::{Answer, Await, Body};
 use crate::ids::{AgentId, InstanceId, MapId, ProgramHash, SessionId, SessionRef, WorkflowId};
 
 /// What one refine produced. Steps are in dispatch order; accumulate applies
@@ -295,6 +295,16 @@ pub enum Outcome {
     Started(WorkflowId),
 }
 
+impl Outcome {
+    /// A step that failed with `code`, and no detail.
+    pub fn failed(code: Failure) -> Self {
+        Outcome::Failed {
+            code,
+            detail: Vec::new(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct InstanceGas {
     pub instance: InstanceId,
@@ -322,6 +332,16 @@ pub struct CommittedWrite {
 pub struct Outgoing {
     pub to: AgentId,
     pub body: Body,
+}
+
+impl Outgoing {
+    /// The reply to agent `to`'s request awaiting at `awaiting`: `answer`.
+    pub fn reply(to: AgentId, awaiting: Await, answer: Answer) -> Self {
+        Self {
+            to,
+            body: Body::Reply { awaiting, answer },
+        }
+    }
 }
 
 /// An attestable method run in this step, kept so the run can be proven

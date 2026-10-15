@@ -2685,7 +2685,6 @@ dependencies = [
 name = "vos-sdk-macros"
 version = "0.1.0"
 dependencies = [
- "blake2",
  "proc-macro2",
  "quote",
  "syn 2.0.118",

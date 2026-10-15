@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use vos_testkit::programs::{actor, method};
 use vos_testkit::{Step as KitStep, Testkit, decode};
-use vos_wire::abi::{Failure, cap, op, price};
+use vos_wire::abi::{Failure, Op, cap, price};
 use vos_wire::batch::{Admin, Answer, Await, Body, Input, Message};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, WorkflowId};
 use vos_wire::keys::{self, Due};
@@ -112,7 +112,7 @@ impl Flows {
     }
 
     fn program(&self, name: &str) -> ProgramHash {
-        vos_testkit::program_hash(&self.programs[name])
+        ProgramHash::of(&self.programs[name])
     }
 
     /// Alice's request starting the shop's workflow `name`.
@@ -974,7 +974,7 @@ fn scenario(node: Node) -> Vec<Ran> {
     let start = flows.start("settle", settle_rounds());
     run(&mut flows, SETTLE_LIMIT + SETTLE_LIMIT / 2, vec![start]);
     let pending = flows.record(5).snapshot.unwrap().pending;
-    assert_eq!(pending, Some(op::CALL));
+    assert_eq!(pending, Some(Op::Call.id()));
     // Some 200 pages held, restored a step, and room for 25 more.
     let start = flows.start("grind", (100_000u32, 1u32));
     let tight = defaults::WORKFLOW_RESERVE
@@ -1274,7 +1274,7 @@ fn lost_workflow_state_stops_the_refine() {
             let refined = flows.refine(1, vec![answer.clone()]);
             assert_eq!(
                 refined.exit,
-                vos_pvm::ExitReason::HostCall(crate::common::LOST),
+                vos_pvm::ExitReason::HostCall(vos_wire::abi::surface::LOST),
                 "{key:?}"
             );
             flows.node.state.insert(row.clone(), held.clone());
@@ -1414,12 +1414,10 @@ fn a_lost_pinned_program_stops_the_refine() {
     let program = flows.program("shop");
     let blob = flows.node.forget(&program);
     let refined = flows.refine(1, vec![answer.clone()]);
-    let lost = vos_pvm::ExitReason::HostCall(crate::common::LOST);
+    let lost = vos_pvm::ExitReason::HostCall(vos_wire::abi::surface::LOST);
     assert_eq!(refined.exit, lost, "a workflow's program");
     flows.node.add(&blob);
-    let counter = flows
-        .node
-        .forget(&vos_testkit::program_hash(&flows.actors.counter));
+    let counter = flows.node.forget(&ProgramHash::of(&flows.actors.counter));
     let increment = flows.actors.method(COUNTER, "increment");
     let request = flows.sessions.request(ALICE, COUNTER, increment, 1u64);
     assert_eq!(flows.refine(1, vec![request]).exit, lost, "a handler's");

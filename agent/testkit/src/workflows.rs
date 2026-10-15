@@ -15,30 +15,23 @@
 
 use std::collections::BTreeMap;
 
-use blake2::digest::consts::U32;
-use blake2::{Blake2b, Digest};
 use vos_pvm::ExitReason;
 use vos_pvm::refine::{Machine, MemoryModel, PreparedProgram};
-use vos_wire::abi::{self, Failure, Kind, cap, code, op, price};
-use vos_wire::batch::{Answer, Await, Body};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, WorkflowId};
+use vos_wire::abi::{self, Failure, Kind, Op, cap, code, price};
+use vos_wire::batch::{Answer, Await};
+use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, WorkflowId};
 use vos_wire::keys::{self, Due};
 use vos_wire::records::{Snapshot, Workflow, WorkflowState};
-use vos_wire::result::{InstanceGas, Outcome, Outgoing, PAGE, Page, Write};
+use vos_wire::result::{InstanceGas, Outcome, Outgoing, PAGE, Page, Write, digest};
 use vos_wire::{Decode, Encode, defaults};
 
-use crate::{Ended, Run, Step, Testkit, known, precompile, program_hash, split};
+use crate::{Ended, Run, Step, Testkit, precompile, split};
 
 /// Where a machine returns to halt, and the top of its stack.
 const HALT: u64 = (1 << 32) - (1 << 16);
 const STACK_TOP: u64 = (1 << 32) - 2 * (1 << 16) - (1 << 24);
 
 type Rows = BTreeMap<Vec<u8>, Option<Vec<u8>>>;
-
-/// A page's hash, as a snapshot names it: BLAKE2b-256 of its bytes.
-fn hash(page: &[u8]) -> [u8; 32] {
-    Blake2b::<U32>::digest(page).into()
-}
 
 /// How a step left its workflow: paused, with the pages it stores and their
 /// bytes, or ended.
@@ -120,13 +113,7 @@ impl Testkit {
         self.steps += 1;
         let (outcome, rows) = match self.started(owner, instance, method, arguments) {
             Ok((id, rows)) => (Outcome::Started(id), rows),
-            Err(code) => (
-                Outcome::Failed {
-                    code,
-                    detail: Vec::new(),
-                },
-                Rows::new(),
-            ),
+            Err(code) => (Outcome::failed(code), Rows::new()),
         };
         let mut step = Step::consumed(outcome);
         step.writes = split(rows).0;
@@ -155,7 +142,7 @@ impl Testkit {
             return Err(Failure::Unknown);
         }
         let blob = &installed.program;
-        let program = program_hash(blob);
+        let program = ProgramHash::of(blob);
         let parsed = vos_pvm::spi::parse_standard_program(blob).ok_or(Failure::Unloadable)?;
         let layout = parsed.layout(&[]).ok_or(Failure::Unloadable)?;
         let writable = (layout.rw.size + layout.stack.size) / PAGE as u64;
@@ -173,7 +160,7 @@ impl Testkit {
             instance,
             method,
             owner,
-            gas: schema.gas.unwrap_or(self.default_gas).min(self.max_gas),
+            gas: schema.gas_limit(),
             writable: writable as u32,
             awaits: 0,
             due: self.time,
@@ -207,11 +194,7 @@ impl Testkit {
                 return self.quick(rows);
             }
             WorkflowState::Ready(input) | WorkflowState::Preempted(input) => input.clone(),
-            WorkflowState::Awaiting { .. } => Answer::Failed {
-                code: Failure::TimedOut,
-                detail: Vec::new(),
-            }
-            .encode(),
+            WorkflowState::Awaiting { .. } => Answer::failed(Failure::TimedOut).encode(),
             WorkflowState::Sleeping { .. } => Vec::new(),
         };
         self.step(id, workflow, resume)
@@ -269,16 +252,10 @@ impl Testkit {
                     }
                 }
             }
-            _ => Some(Answer::Failed {
-                code: Failure::Unknown,
-                detail: Vec::new(),
-            }),
+            _ => Some(Answer::failed(Failure::Unknown)),
         };
         if let Some(answer) = answer {
-            step.messages.push(Outgoing {
-                to: from,
-                body: Body::Reply { awaiting, answer },
-            });
+            step.messages.push(Outgoing::reply(from, awaiting, answer));
         }
         self.apply(&step, Vec::new());
         step
@@ -292,10 +269,7 @@ impl Testkit {
         let mut step = Step::consumed(Outcome::Done(Vec::new()));
         let mut rows = Rows::new();
         if !self.fits(&workflow) {
-            let outcome = Outcome::Failed {
-                code: Failure::Cap,
-                detail: Vec::new(),
-            };
+            let outcome = Outcome::failed(Failure::Cap);
             step.outcome = outcome.clone();
             step.pages = self.end(id, &mut workflow, outcome, &mut rows, &mut step);
             step.writes = split(rows).0;
@@ -346,10 +320,7 @@ impl Testkit {
                 step.pages = self.end(id, &mut workflow, outcome, &mut rows, &mut step);
             }
             Err(code) => {
-                let outcome = Outcome::Failed {
-                    code,
-                    detail: Vec::new(),
-                };
+                let outcome = Outcome::failed(code);
                 step.outcome = outcome.clone();
                 step.pages = self.end(id, &mut workflow, outcome, &mut rows, &mut step);
             }
@@ -390,13 +361,8 @@ impl Testkit {
         Self::move_due(rows, id, workflow, collected);
         if let (Some(awaiting), Principal::Agent(owner)) = (workflow.waiter.take(), workflow.owner)
         {
-            step.messages.push(Outgoing {
-                to: owner,
-                body: Body::Reply {
-                    awaiting,
-                    answer: outcome.clone().into(),
-                },
-            });
+            step.messages
+                .push(Outgoing::reply(owner, awaiting, outcome.clone().into()));
         }
         workflow.state = WorkflowState::Ended(outcome);
         rows.insert(keys::workflow(id), Some(workflow.encode()));
@@ -433,7 +399,7 @@ impl Testkit {
             registers.copy_from_slice(&snapshot.registers);
             for (index, hash) in &snapshot.pages {
                 let bytes = &self.pages[&(id, *index)];
-                assert_eq!(self::hash(bytes), *hash, "a stored page's hash");
+                assert_eq!(digest(bytes), *hash, "a stored page's hash");
                 assert!(
                     machine
                         .memory_mut()
@@ -448,7 +414,7 @@ impl Testkit {
         match (&workflow.snapshot, &workflow.state) {
             (None, _) => {
                 registers[7] = u64::from(workflow.method.0);
-                registers[8] = Kind::Workflow.encode()[0].into();
+                registers[8] = Kind::Workflow.index().into();
                 registers[9] = resume.len() as u64;
             }
             (Some(_), WorkflowState::Preempted(_)) => {}
@@ -540,7 +506,7 @@ impl Testkit {
                 }
                 continue;
             }
-            let hash = hash(&bytes);
+            let hash = digest(&bytes);
             if now.insert(index, hash) != Some(hash) {
                 pages.push(Page {
                     workflow: id,
@@ -689,11 +655,12 @@ impl Run<'_> {
         id: u64,
         outcome: &mut Option<Ended>,
     ) -> Result<(), Failure> {
-        if known(id) && !abi::workflow_may_use(self.section, id) {
+        let op = Op::from_id(id);
+        if op.is_some_and(|op| !abi::workflow_may_use(self.section, op)) {
             return Err(Failure::Trapped);
         }
         let used = share.used(machine);
-        if abi::is_effect(id) && !share.effectful {
+        if op.is_some_and(abi::is_effect) && !share.effectful {
             if self.kit.uncovered && used > 0 {
                 *outcome = Some(preempt_or_fail(share, true, Some(id), false)?);
                 return Ok(());
@@ -704,15 +671,15 @@ impl Run<'_> {
         }
         let result = if vos_pvm::precompile::is_precompile(id) {
             precompile(machine, id)
-        } else if !known(id) {
-            if machine.charge(price::OPERATION) {
-                machine.registers_mut()[7] = code::WHAT;
-                Ok(())
+        } else if let Some(op) = op {
+            if machine.charge(price::of(op)) {
+                self.operation(machine, op, owner, instance, Kind::Workflow, input, outcome)
             } else {
                 Err(Failure::OutOfGas)
             }
-        } else if machine.charge(price::of(id)) {
-            self.operation(machine, id, owner, instance, Kind::Workflow, input, outcome)
+        } else if machine.charge(price::OPERATION) {
+            machine.registers_mut()[7] = code::WHAT;
+            Ok(())
         } else {
             Err(Failure::OutOfGas)
         };
@@ -724,7 +691,7 @@ impl Run<'_> {
             }
             Err(code) => return Err(code),
         }
-        if id == op::CALL && outcome.is_none() {
+        if op == Some(Op::Call) && outcome.is_none() {
             share.effectful = false;
             let used = share.used(machine);
             if used >= share.limit {

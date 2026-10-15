@@ -9,8 +9,6 @@
 
 use std::collections::BTreeMap;
 
-use blake2::digest::consts::U32;
-use blake2::{Blake2b, Digest};
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as Tokens};
 use quote::{format_ident, quote};
@@ -20,18 +18,8 @@ use syn::{
     Lit, LitStr, Meta, Pat, PathArguments, ReturnType, Type, parse_macro_input,
 };
 use vos_wire::abi::Kind;
-use vos_wire::ids::MethodId;
+use vos_wire::ids::{MethodId, derive_id};
 use vos_wire::schema::{MethodSchema, Schema};
-
-/// The first four bytes, big-endian, of BLAKE2b-256 over `domain` and
-/// `name`.
-fn derive_id(domain: &str, name: &str) -> u32 {
-    let hash = Blake2b::<U32>::new()
-        .chain_update(domain.as_bytes())
-        .chain_update(name.as_bytes())
-        .finalize();
-    u32::from_be_bytes(hash[..4].try_into().expect("four bytes"))
-}
 
 /// Track derived ids: 0 is reserved and two names must not share one.
 struct Ids {
@@ -264,7 +252,7 @@ fn msg_options(attribute: &Attribute) -> syn::Result<Options> {
 
 /// The kind an attribute marks a method to run as, apart from a handler:
 /// `#[attestable]` or `#[workflow]`.
-fn marked(attribute: &Attribute) -> Option<Kind> {
+fn mark(attribute: &Attribute) -> Option<Kind> {
     if attribute.path().is_ident("attestable") {
         Some(Kind::Attestable)
     } else if attribute.path().is_ident("workflow") {
@@ -277,16 +265,16 @@ fn marked(attribute: &Attribute) -> Option<Kind> {
 fn handler(
     mut method: ImplItemFn,
     attribute: &Attribute,
-    program: Option<Kind>,
+    marked: Option<Kind>,
     ids: &mut Ids,
 ) -> syn::Result<Handler> {
     let name = method.sig.ident.to_string();
-    let options = match program {
+    let options = match marked {
         Some(Kind::Attestable) => Options::default(),
         _ => msg_options(attribute)?,
     };
     let mut inputs = method.sig.inputs.iter();
-    let kind = if let Some(kind) = program {
+    let kind = if let Some(kind) = marked {
         if let Some(FnArg::Receiver(receiver)) = method.sig.inputs.first() {
             return Err(Error::new(
                 receiver.span(),
@@ -374,7 +362,7 @@ fn handler(
     let id = ids.take("vos/method/", &name, method.sig.ident.span())?;
     method
         .attrs
-        .retain(|attribute| !attribute.path().is_ident("msg") && marked(attribute).is_none());
+        .retain(|attribute| !attribute.path().is_ident("msg") && mark(attribute).is_none());
     Ok(Handler {
         method,
         name,
@@ -452,11 +440,11 @@ fn messages_impl(mut input: ItemImpl, module: Option<String>) -> syn::Result<Tok
         let marker = method
             .attrs
             .iter()
-            .find(|attribute| attribute.path().is_ident("msg") || marked(attribute).is_some())
+            .find(|attribute| attribute.path().is_ident("msg") || mark(attribute).is_some())
             .cloned();
         match marker {
             Some(attribute) => {
-                let kind = marked(&attribute);
+                let kind = mark(&attribute);
                 let handler = handler(method, &attribute, kind, &mut ids)?;
                 items.push(ImplItem::Fn(handler.method.clone()));
                 handlers.push(handler);

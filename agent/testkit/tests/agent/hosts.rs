@@ -19,8 +19,7 @@ use crate::common::{
 
 /// Every program calls only what a JAM node serves, or what has a
 /// fallback there (`abi::surface`): the default agent, the test actors and
-/// the attestable and workflow programs, every `ecalli` in them, reachable
-/// or not.
+/// the kernels, every `ecalli` in them, reachable or not.
 #[test]
 fn every_program_calls_only_its_surface() {
     let calls = |blob: &[u8]| vos_pvm::spi::inspect_standard_program_host_calls(blob).unwrap();
@@ -50,17 +49,17 @@ fn every_program_calls_only_its_surface() {
         }
     }
     for call in calls(&actors.checksum) {
-        assert!(surface::attestable(call), "checksum calls {call:#x}");
+        assert!(surface::kernel(call), "checksum calls {call:#x}");
     }
     // The shop's program holds its workflows: it pauses, reaches its state
     // in sections, and compresses.
     let shop = calls(&vos_testkit::programs::actor("shop"));
     for call in [
-        abi::op::REQUEST,
-        abi::op::RESULT,
-        abi::op::SLEEP,
-        abi::op::OPEN,
-        abi::op::CLOSE,
+        abi::Op::Request.id(),
+        abi::Op::Result.id(),
+        abi::Op::Sleep.id(),
+        abi::Op::Open.id(),
+        abi::Op::Close.id(),
         abi::precompile::BLAKE2B_COMPRESS,
     ] {
         assert!(shop.contains(&call), "the shop calls {call:#x}");

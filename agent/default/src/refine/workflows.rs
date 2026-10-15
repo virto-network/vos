@@ -14,7 +14,7 @@
 use alloc::vec::Vec;
 
 use vos_wire::abi::{Failure, Kind, cap};
-use vos_wire::batch::{Answer, Await, Body};
+use vos_wire::batch::{Answer, Await};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, WorkflowId};
 use vos_wire::keys::{self, Due};
 use vos_wire::records::{Snapshot, Workflow, WorkflowState};
@@ -108,8 +108,8 @@ pub(super) enum Floor {
 }
 
 impl Floor {
-    pub(super) fn new(beside: bool) -> Self {
-        if beside { Floor::Head } else { Floor::None }
+    pub(super) fn new(with_inputs: bool) -> Self {
+        if with_inputs { Floor::Head } else { Floor::None }
     }
 
     /// The floor now: none before the head's step.
@@ -205,13 +205,7 @@ pub(super) fn start(
             run.writes = split_writes(rows).0;
             (run, Some(id))
         }
-        Err(code) => {
-            let outcome = Outcome::Failed {
-                code,
-                detail: Vec::new(),
-            };
-            (consumed(input, outcome), None)
-        }
+        Err(code) => (consumed(input, Outcome::failed(code)), None),
     }
 }
 
@@ -254,10 +248,7 @@ fn started(
         instance,
         method,
         owner: caller,
-        gas: schema
-            .gas
-            .unwrap_or(defaults::HANDLER_GAS)
-            .min(defaults::MAX_HANDLER_GAS),
+        gas: schema.gas_limit(),
         writable: writable as u32,
         awaits: 0,
         due: base.time,
@@ -318,11 +309,7 @@ pub(super) fn due(
             state => {
                 let resume = match state {
                     WorkflowState::Ready(input) | WorkflowState::Preempted(input) => input.clone(),
-                    WorkflowState::Awaiting { .. } => Answer::Failed {
-                        code: Failure::TimedOut,
-                        detail: Vec::new(),
-                    }
-                    .encode(),
+                    WorkflowState::Awaiting { .. } => Answer::failed(Failure::TimedOut).encode(),
                     _ => Vec::new(),
                 };
                 let kept = kept(base, &workflow, bytes);
@@ -377,10 +364,6 @@ pub(super) fn wait(
     awaiting: Await,
 ) -> Run {
     let mut run = consumed(input, Outcome::Done(Vec::new()));
-    let failed = |code| Answer::Failed {
-        code,
-        detail: Vec::new(),
-    };
     let answer = match paid(base, id) {
         Ok(Some((mut workflow, _))) if workflow.owner == Principal::Agent(from) => {
             match &workflow.state {
@@ -395,22 +378,16 @@ pub(super) fn wait(
                 }
             }
         }
-        Ok(_) => Some(failed(Failure::Unknown)),
+        Ok(_) => Some(Answer::failed(Failure::Unknown)),
         // The meter could not pay the record: as an overrun, the wait
         // waits behind a step that ran a handler, or fails alone.
         Err(code) => {
-            run.outcome = Outcome::Failed {
-                code,
-                detail: Vec::new(),
-            };
-            Some(failed(code))
+            run.outcome = Outcome::failed(code);
+            Some(Answer::failed(code))
         }
     };
     if let Some(answer) = answer {
-        run.messages.push(Outgoing {
-            to: from,
-            body: Body::Reply { awaiting, answer },
-        });
+        run.messages.push(Outgoing::reply(from, awaiting, answer));
     }
     run
 }
@@ -456,10 +433,7 @@ pub(super) fn resume_step(
 
 /// Fail a workflow whose step could never run in a batch of this budget.
 fn unfit(base: &Base, input: InputRef, id: WorkflowId, mut workflow: Workflow) -> Stepped {
-    let outcome = Outcome::Failed {
-        code: Failure::Cap,
-        detail: Vec::new(),
-    };
+    let outcome = Outcome::failed(Failure::Cap);
     let mut run = consumed(input, outcome.clone());
     let mut rows = Overlay::new();
     run.pages = end(base, id, &mut workflow, outcome, &mut rows, &mut run);
@@ -488,7 +462,7 @@ fn run(
     match (&workflow.snapshot, &workflow.state) {
         (None, _) => {
             machine.set_register(7, u64::from(workflow.method.0));
-            machine.set_register(8, u64::from(Kind::Workflow.encode()[0]));
+            machine.set_register(8, u64::from(Kind::Workflow.index()));
             machine.set_register(9, resume.len() as u64);
         }
         (Some(_), WorkflowState::Preempted(_)) => {}
@@ -619,10 +593,7 @@ fn step(
             run.pages = end(base, id, &mut workflow, outcome, &mut rows, &mut run);
         }
         Left::Failed(code) => {
-            let outcome = Outcome::Failed {
-                code,
-                detail: Vec::new(),
-            };
+            let outcome = Outcome::failed(code);
             run.outcome = outcome.clone();
             run.pages = end(base, id, &mut workflow, outcome, &mut rows, &mut run);
         }
@@ -667,13 +638,7 @@ fn end(
     let collected = base.time.saturating_add(defaults::WORKFLOW_KEPT_MS);
     move_due(rows, id, workflow, collected);
     if let (Some(awaiting), Principal::Agent(owner)) = (workflow.waiter.take(), workflow.owner) {
-        run.messages.push(Outgoing {
-            to: owner,
-            body: Body::Reply {
-                awaiting,
-                answer: outcome.clone().into(),
-            },
-        });
+        run.messages.push(Outgoing::reply(owner, awaiting, outcome.clone().into()));
     }
     workflow.state = WorkflowState::Ended(outcome);
     rows.insert(keys::workflow(id), Some(workflow.encode()));

@@ -61,6 +61,21 @@ pub struct MethodId(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
 pub struct ProgramHash(pub [u8; 32]);
 
+impl ProgramHash {
+    /// The hash of program `blob`.
+    pub fn of(blob: &[u8]) -> Self {
+        Self(crate::result::digest(blob))
+    }
+}
+
+/// The id `name` derives in `domain`: the first four bytes, big-endian, of
+/// BLAKE2b-256 over `domain` and `name`. A method's in `vos/method/`, a
+/// table's or committed map's in `vos/table/`.
+pub fn derive_id(domain: &str, name: &str) -> u32 {
+    let hash = vos_pvm_precompiles::blake2b_hash::<32>(domain.as_bytes(), &[name.as_bytes()]);
+    u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]])
+}
+
 /// Who made a request: a client, authenticated at ingress by its key,
 /// another agent, or, for a nested call, the calling instance of the same
 /// agent. Each holds only the roles granted to it.

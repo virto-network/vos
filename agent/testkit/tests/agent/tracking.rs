@@ -6,6 +6,7 @@
 use vos_pvm::PvmBackend;
 use vos_pvm_program::{CodeBlob, StandardProgram, build_standard_program};
 use vos_testkit::programs::actor;
+use vos_wire::ids::ProgramHash;
 use vos_wire::{Decode, Encode, scale};
 
 use crate::common::{Actors, Node};
@@ -132,7 +133,7 @@ fn the_written_set_is_exact_for_guest_stores_and_agent_writes() {
     let program = scribbler(4, true);
     let value = 0x0123_4567_89ab_cdef_u64;
     let probe = Probe {
-        program: vos_testkit::program_hash(&program).0,
+        program: ProgramHash::of(&program).0,
         track: true,
         gas: 1_000_000,
         arguments: None,
@@ -207,7 +208,7 @@ fn a_fault_outside_the_tracked_pages_is_still_a_fault() {
     let program = scribbler(2, false);
     for address in [RO + 8, 0x50_0008] {
         let probe = |track| Probe {
-            program: vos_testkit::program_hash(&program).0,
+            program: ProgramHash::of(&program).0,
             track,
             gas: 1_000_000,
             arguments: None,
@@ -242,7 +243,7 @@ fn a_tracked_program_runs_to_its_result() {
     let checksum = Actors::load().checksum;
     let values: Vec<u64> = (1..=300).collect();
     let probe = Probe {
-        program: vos_testkit::program_hash(&checksum).0,
+        program: ProgramHash::of(&checksum).0,
         track: true,
         gas: 10_000_000,
         arguments: Some(values.encode()),

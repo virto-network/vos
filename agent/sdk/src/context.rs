@@ -28,7 +28,7 @@ pub trait Method: Encode {
 /// A `&self` handler: callable from queries too.
 pub trait QueryMethod: Method {}
 
-/// An `#[attestable]` method, run as its own program.
+/// An `#[attestable]` method, run as its kernel.
 pub trait AttestableMethod: Encode {
     type Actor;
     const ID: u32;
@@ -211,7 +211,7 @@ impl<A> Command<A> {
         host::send(agent.0, to.instance.0, M::ID, &message.encode());
     }
 
-    /// Run one of this actor's attestable methods as its own program.
+    /// Run one of this actor's attestable methods, as its kernel.
     pub async fn attest<M: AttestableMethod<Actor = A>>(
         &mut self,
         arguments: M,

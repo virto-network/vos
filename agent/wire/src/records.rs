@@ -33,12 +33,11 @@ impl Derivation {
         kernels: impl IntoIterator<Item = (MethodId, &'a [u8])>,
         transpiler: u32,
     ) -> Self {
-        let hash = |bytes: &[u8]| ProgramHash(crate::result::digest(bytes));
         Self {
-            program: hash(actor),
+            program: ProgramHash::of(actor),
             kernels: kernels
                 .into_iter()
-                .map(|(method, kernel)| (method, hash(kernel)))
+                .map(|(method, kernel)| (method, ProgramHash::of(kernel)))
                 .collect(),
             elf: crate::result::digest(elf),
             transpiler,
@@ -83,7 +82,7 @@ impl Installed {
     }
 
     /// The kernel of attestable `method`.
-    pub fn attestable(&self, method: MethodId) -> Option<ProgramHash> {
+    pub fn kernel(&self, method: MethodId) -> Option<ProgramHash> {
         self.derivation.kernel(method)
     }
 
@@ -177,7 +176,7 @@ pub enum WorkflowState {
     #[codec(index = 3)]
     Ended(Outcome),
     /// Due at once: preempted between two awaits, its last await's input
-    /// still the one `INPUT` gives it.
+    /// still the one [`crate::abi::Op::Input`] gives it.
     #[codec(index = 4)]
     Preempted(Vec<u8>),
 }

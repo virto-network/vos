@@ -131,16 +131,9 @@ impl Programs {
 }
 
 /// The tag of an actor's table or committed map named `name`, as
-/// `#[actor]` derives it: the first four bytes, big-endian, of BLAKE2b-256
-/// over `vos/table/` and the name.
+/// `#[actor]` derives it.
 pub fn table_tag(name: &str) -> u32 {
-    use blake2::digest::consts::U32;
-    use blake2::{Blake2b, Digest};
-    let hash = Blake2b::<U32>::new()
-        .chain_update(b"vos/table/")
-        .chain_update(name.as_bytes())
-        .finalize();
-    u32::from_be_bytes(hash[..4].try_into().expect("four bytes"))
+    vos_wire::ids::derive_id("vos/table/", name)
 }
 
 /// The schema `program` carries.

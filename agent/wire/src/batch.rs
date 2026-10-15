@@ -207,6 +207,16 @@ pub enum Answer {
     Started(WorkflowId),
 }
 
+impl Answer {
+    /// A request's step that failed with `code`, and no detail.
+    pub fn failed(code: Failure) -> Self {
+        Answer::Failed {
+            code,
+            detail: Vec::new(),
+        }
+    }
+}
+
 impl From<Outcome> for Answer {
     fn from(outcome: Outcome) -> Self {
         match outcome {

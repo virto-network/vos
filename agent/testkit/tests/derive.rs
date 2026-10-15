@@ -208,7 +208,7 @@ fn a_kernel_making_a_host_call_is_refused() {
     let DeriveError::HostCall { id, chain, .. } = &error else {
         panic!("{error}");
     };
-    assert_eq!(*id, vos_wire::abi::op::NOW);
+    assert_eq!(*id, vos_wire::abi::Op::Now.id());
     assert!(chain[0].ends_with("__vos_attest_stamp"), "{chain:?}");
     assert!(
         chain.iter().any(|name| name.contains("stamped")),

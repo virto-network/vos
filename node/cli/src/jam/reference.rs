@@ -11,6 +11,7 @@ use vos_pvm::accumulate_host::AccumulateContext;
 use vos_pvm::inner::gp_call::HISTORICAL_LOOKUP;
 use vos_pvm::refine::{Machine, MemoryModel};
 use vos_pvm::refine_host::{RefineContext, StateReader, serve_lookup};
+use vos_wire::abi::surface::LOST;
 use vos_wire::abi::{cap, code};
 use vos_wire::batch::{Batch, Work};
 use vos_wire::jam::{AccumulateInput, Operand};
@@ -73,10 +74,6 @@ impl Vos {
             .ok_or(Error::Output)
     }
 }
-
-/// The agent's report that its state lost data it wrote: a VOS node stops
-/// the refine at it.
-const LOST: u64 = 0x483;
 
 /// The calls a VOS node serves past the runtime: `historical_lookup` from
 /// the agent's preimages, and the agent's report of lost state, which

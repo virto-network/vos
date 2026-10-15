@@ -10,6 +10,7 @@ use vos_pvm::accumulate_host::{self, ACCUMULATE_ENTRY, AccumulateContext, Servic
 use vos_pvm::pool::{CodeHash, MachinePool, OuterMachines};
 use vos_pvm::refine::Machine;
 use vos_pvm::refine_host::{ProgramSource, RefineContext, StateReader, serve_lookup};
+use vos_wire::abi::surface::LOST;
 use vos_wire::abi::{cap, code};
 use vos_wire::batch::Work;
 use vos_wire::ids::AgentId;
@@ -26,9 +27,6 @@ const REFINE_ENTRY: u32 = 0;
 
 /// `historical_lookup`, which refine answers from the agent's programs.
 const HISTORICAL_LOOKUP: u64 = vos_pvm::inner::gp_call::HISTORICAL_LOOKUP as u64;
-/// The agent found its own state lost data it wrote: φ7/φ8 what. The
-/// refine stops at the call, and the node halts, as for a blob it lost.
-const LOST: u64 = 0x483;
 /// The most of the agent's account of what it lost that a log line keeps.
 const LOST_WHAT: usize = 256;
 

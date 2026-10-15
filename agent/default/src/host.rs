@@ -18,10 +18,7 @@ pub const PAGES: u64 = 12;
 pub const SOLICIT: u64 = 24;
 pub const INVOKE: u64 = 13;
 pub const EXPUNGE: u64 = 14;
-pub const INSTANTIATE: u64 = 0x480;
-pub const STATE_READ: u64 = 0x481;
-pub const STATE_SCAN: u64 = 0x482;
-pub const LOST: u64 = 0x483;
+pub use vos_wire::abi::surface::{INSTANTIATE, LOST, STATE_READ, STATE_SCAN};
 
 /// The calling service, for `read` and `historical_lookup`.
 pub const SELF_SERVICE: u64 = u64::MAX;

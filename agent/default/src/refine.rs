@@ -547,8 +547,8 @@ fn run_batch(base: &mut Base, batch: Batch) -> ResultWriter {
         gas() >= batch.budget,
         "the refine's gas does not cover its budget"
     );
-    // A sweep's due steps leave inputs beside it their floor.
-    let beside = batch
+    // A sweep's due steps leave the batch's other inputs their floor.
+    let with_inputs = batch
         .inputs
         .iter()
         .any(|input| !matches!(input, Input::Sweep { .. }));
@@ -633,7 +633,7 @@ fn run_batch(base: &mut Base, batch: Batch) -> ResultWriter {
             // An admin step may change installed records.
             base.installed.borrow_mut().clear();
         }
-        let mut floor = Floor::new(swept && beside);
+        let mut floor = Floor::new(swept && with_inputs);
         for (at, workflow) in due {
             if !workflows::due(base, &mut batched, at, workflow, &mut floor) {
                 break;
@@ -679,12 +679,9 @@ fn limit(base: &Base, instance: InstanceId, method: MethodId) -> Option<u64> {
         installed
             .and_then(|installed| {
                 let schema = installed.schema.method(method)?;
-                is_handler(schema.kind).then_some(schema.gas)
+                schema.kind.is_handler().then(|| schema.gas_limit())
             })
-            .map_or(0, |gas| {
-                gas.unwrap_or(defaults::HANDLER_GAS)
-                    .min(defaults::MAX_HANDLER_GAS)
-            }),
+            .unwrap_or(0),
     )
 }
 
@@ -768,11 +765,7 @@ fn failed_in_refine(
     if let Some(code) = out_of_order(base, pairs, from, sequence) {
         return Stepped::new(Step::Refused { input, code }, None);
     }
-    let outcome = Outcome::Failed {
-        code: Failure::InRefine,
-        detail: Vec::new(),
-    };
-    let mut run = consumed(input, outcome);
+    let mut run = consumed(input, Outcome::failed(Failure::InRefine));
     answer(&mut run, from, awaiting);
     Stepped::new(Step::Ran(run), Some(Mark::Pair(from, sequence)))
 }
@@ -782,10 +775,7 @@ fn failed_in_refine(
 fn answer(run: &mut Run, to: AgentId, awaiting: Option<Await>) {
     if let Some(awaiting) = awaiting {
         let answer = run.outcome.clone().into();
-        run.messages.push(Outgoing {
-            to,
-            body: Body::Reply { awaiting, answer },
-        });
+        run.messages.push(Outgoing::reply(to, awaiting, answer));
     }
 }
 
@@ -914,15 +904,7 @@ fn sweep(base: &Base, listed: &[(u64, Due)]) -> Stepped {
 /// An operator command: install a package or set a role. Its writes are
 /// under the step write cap like any step's.
 fn admin(admin: Admin) -> Step {
-    let failed = |code| {
-        Step::Ran(consumed(
-            InputRef::Admin,
-            Outcome::Failed {
-                code,
-                detail: Vec::new(),
-            },
-        ))
-    };
+    let failed = |code| Step::Ran(consumed(InputRef::Admin, Outcome::failed(code)));
     let (write, reply) = match admin {
         Admin::Install {
             instance,
@@ -957,8 +939,7 @@ fn admin(admin: Admin) -> Step {
 
 /// Read the actor program's schema from its machine and check the package:
 /// each kernel is bound to an attestable method, every attestable method
-/// has exactly one, and every role name is mapped. A workflow needs none:
-/// it runs in the actor's program.
+/// has exactly one, and every role name is mapped.
 fn install(derivation: Derivation, roles: Vec<(Vec<u8>, u8)>) -> Option<Installed> {
     // The program an install names, which its operator may never have
     // given the node, is not yet pinned: its absence fails the install.
@@ -985,7 +966,7 @@ fn install(derivation: Derivation, roles: Vec<(Vec<u8>, u8)>) -> Option<Installe
     for method in &installed.schema.methods {
         if method.kind == Kind::Attestable {
             attestables += 1;
-            installed.attestable(method.id)?;
+            installed.kernel(method.id)?;
         }
         if let Some(role) = &method.role
             && installed.role(role).is_none()
@@ -996,11 +977,4 @@ fn install(derivation: Derivation, roles: Vec<(Vec<u8>, u8)>) -> Option<Installe
     // Each kernel is bound to such a method, and each such method has one:
     // as many as there are of them, no method has two.
     (installed.derivation.kernels.len() == attestables).then_some(installed)
-}
-
-/// Whether a method of `kind` runs as a handler of the actor's: a command
-/// or a query. An attestable runs as its kernel, bound at install, and a
-/// workflow as a workflow.
-fn is_handler(kind: Kind) -> bool {
-    matches!(kind, Kind::Command | Kind::Query)
 }

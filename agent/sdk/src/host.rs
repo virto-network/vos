@@ -1,5 +1,5 @@
 //! The actor ABI client: one function per operation of
-//! [`vos_wire::abi::op`], following its register conventions.
+//! [`vos_wire::abi::Op`], following its register conventions.
 //!
 //! On the guest target an operation is an `ecalli`. Elsewhere it goes to a
 //! host function installed with [`set_host`], which receives native
@@ -7,7 +7,7 @@
 
 use alloc::vec::Vec;
 
-use vos_wire::abi::{Rows, cap, code, op};
+use vos_wire::abi::{Op, Rows, cap, code};
 
 /// An operation's results: φ7 and φ8.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -104,23 +104,30 @@ fn read_all(first: usize, mut read: impl FnMut(&mut [u8], u64) -> u64) -> Option
 /// The invocation's arguments.
 pub fn input() -> Vec<u8> {
     read_all(256, |out, offset| {
-        ecalli!(op::INPUT, [ptr_mut(out), offset, out.len() as u64, 0, 0, 0]).0
+        ecalli!(
+            Op::Input.id(),
+            [ptr_mut(out), offset, out.len() as u64, 0, 0, 0]
+        )
+        .0
     })
     .unwrap_or_default()
 }
 
 pub fn reply(bytes: &[u8]) {
-    ecalli!(op::REPLY, [ptr(bytes), bytes.len() as u64, 0, 0, 0, 0]);
+    ecalli!(Op::Reply.id(), [ptr(bytes), bytes.len() as u64, 0, 0, 0, 0]);
 }
 
 /// Fail the step with the handler's encoded error.
 pub fn fail(detail: &[u8]) {
-    ecalli!(op::FAIL, [ptr(detail), detail.len() as u64, 0, 0, 0, 0]);
+    ecalli!(
+        Op::Fail.id(),
+        [ptr(detail), detail.len() as u64, 0, 0, 0, 0]
+    );
 }
 
 pub fn log(level: u8, message: &[u8]) {
     ecalli!(
-        op::LOG,
+        Op::Log.id(),
         [
             u64::from(level),
             ptr(message),
@@ -136,7 +143,7 @@ pub fn log(level: u8, message: &[u8]) {
 pub fn caller() -> Vec<u8> {
     let mut out = [0u8; 64];
     let len = ecalli!(
-        op::CALLER,
+        Op::Caller.id(),
         [ptr_mut(&mut out), out.len() as u64, 0, 0, 0, 0]
     )
     .0;
@@ -145,18 +152,18 @@ pub fn caller() -> Vec<u8> {
 
 /// The batch time, in milliseconds since the Unix epoch.
 pub fn now() -> u64 {
-    ecalli!(op::NOW, [0; 6]).0
+    ecalli!(Op::Now.id(), [0; 6]).0
 }
 
 pub fn random() -> [u8; 32] {
     let mut out = [0u8; 32];
-    ecalli!(op::RANDOM, [ptr_mut(&mut out), 0, 0, 0, 0, 0]);
+    ecalli!(Op::Random.id(), [ptr_mut(&mut out), 0, 0, 0, 0, 0]);
     out
 }
 
 /// (instance, agent).
 pub fn self_id() -> (u32, u32) {
-    let Results(instance, agent) = ecalli!(op::SELF_ID, [0; 6]);
+    let Results(instance, agent) = ecalli!(Op::SelfId.id(), [0; 6]);
     (instance as u32, agent as u32)
 }
 
@@ -169,7 +176,7 @@ pub fn get(rows: Rows, key: &[u8]) -> Option<Vec<u8>> {
 pub fn get_raw(rows: u64, key: &[u8]) -> Option<Vec<u8>> {
     read_all(128, |out, offset| {
         ecalli!(
-            op::GET,
+            Op::Get.id(),
             [
                 rows,
                 ptr(key),
@@ -190,7 +197,7 @@ pub fn put(rows: Rows, key: &[u8], value: &[u8]) {
 /// [`put`] with `rows` as its register.
 pub fn put_raw(rows: u64, key: &[u8], value: &[u8]) {
     ecalli!(
-        op::PUT,
+        Op::Put.id(),
         [
             rows,
             ptr(key),
@@ -204,7 +211,7 @@ pub fn put_raw(rows: u64, key: &[u8], value: &[u8]) {
 
 pub fn delete(rows: Rows, key: &[u8]) {
     ecalli!(
-        op::DELETE,
+        Op::Delete.id(),
         [rows.register(), ptr(key), key.len() as u64, 0, 0, 0]
     );
 }
@@ -221,7 +228,7 @@ pub fn scan(rows: Rows, after: Option<&[u8]>, out: &mut [u8]) -> u64 {
 pub fn scan_raw(rows: u64, after: Option<&[u8]>, out: &mut [u8]) -> u64 {
     let cursor = after.unwrap_or_default();
     ecalli!(
-        op::SCAN,
+        Op::Scan.id(),
         [
             rows,
             ptr(cursor),
@@ -259,7 +266,7 @@ fn with_reply_buffer<R>(f: impl FnOnce(&mut [u8]) -> R) -> R {
 pub fn call(instance: u32, method: u32, arguments: &[u8]) -> Result<Vec<u8>, (u32, Vec<u8>)> {
     with_reply_buffer(|out| {
         let Results(len, status) = ecalli!(
-            op::CALL,
+            Op::Call.id(),
             [
                 u64::from(instance),
                 u64::from(method),
@@ -282,7 +289,7 @@ pub fn call(instance: u32, method: u32, arguments: &[u8]) -> Result<Vec<u8>, (u3
 pub fn attest(method: u32, arguments: &[u8]) -> Result<Vec<u8>, (u32, Vec<u8>)> {
     with_reply_buffer(|out| {
         let Results(len, status) = ecalli!(
-            op::ATTEST,
+            Op::Attest.id(),
             [
                 u64::from(method),
                 ptr(arguments),
@@ -309,7 +316,7 @@ fn resumed(len: u64) -> Vec<u8> {
     let mut input: Vec<u8> = Vec::with_capacity(len);
     if len > 0 {
         ecalli!(
-            op::INPUT,
+            Op::Input.id(),
             [input.as_mut_ptr() as u64, 0, len as u64, 0, 0, 0]
         );
         // SAFETY: the agent wrote all `len` bytes of the input.
@@ -324,7 +331,7 @@ fn resumed(len: u64) -> Vec<u8> {
 /// later (0 for the agent's default).
 pub fn request(agent: u32, instance: u32, method: u32, arguments: &[u8], within: u64) -> Vec<u8> {
     let Results(len, _) = ecalli!(
-        op::REQUEST,
+        Op::Request.id(),
         [
             u64::from(agent),
             u64::from(instance),
@@ -340,20 +347,23 @@ pub fn request(agent: u32, instance: u32, method: u32, arguments: &[u8], within:
 /// A workflow's wait for the result of a workflow it started at `agent`:
 /// it pauses, and returns the encoded answer, as [`request`] does.
 pub fn result(agent: u32, workflow: u64, within: u64) -> Vec<u8> {
-    let Results(len, _) = ecalli!(op::RESULT, [u64::from(agent), workflow, within, 0, 0, 0]);
+    let Results(len, _) = ecalli!(
+        Op::Result.id(),
+        [u64::from(agent), workflow, within, 0, 0, 0]
+    );
     resumed(len)
 }
 
 /// Pause a workflow until a batch at or past `time`.
 pub fn sleep(time: u64) {
-    ecalli!(op::SLEEP, [time, 0, 0, 0, 0, 0]);
+    ecalli!(Op::Sleep.id(), [time, 0, 0, 0, 0, 0]);
 }
 
 /// Queue a message for another agent's instance, sent after the step
 /// commits.
 pub fn send(agent: u32, instance: u32, method: u32, arguments: &[u8]) {
     ecalli!(
-        op::SEND,
+        Op::Send.id(),
         [
             u64::from(agent),
             u64::from(instance),
@@ -369,10 +379,10 @@ pub fn send(agent: u32, instance: u32, method: u32, arguments: &[u8]) {
 /// until [`close`], the row operations reach it, and the agent serves only
 /// them, the time and logs.
 pub fn open(instance: u32) {
-    ecalli!(op::OPEN, [u64::from(instance), 0, 0, 0, 0, 0]);
+    ecalli!(Op::Open.id(), [u64::from(instance), 0, 0, 0, 0, 0]);
 }
 
 /// Close the open section.
 pub fn close() {
-    ecalli!(op::CLOSE, [0; 6]);
+    ecalli!(Op::Close.id(), [0; 6]);
 }

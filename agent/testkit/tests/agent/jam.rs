@@ -19,7 +19,7 @@ use vos_testkit::programs::{actor, method};
 use vos_tree::{Blake2b, Hash, Hasher, empty_root};
 use vos_wire::abi::{Rows, cap};
 use vos_wire::batch::{Admin, Answer, Await, Body, Input, Message, Request, Work};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session, WorkflowId};
+use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, Session, WorkflowId};
 use vos_wire::keys::{self, Transform};
 use vos_wire::package::{EPOCH_MS, SLOT_MS};
 use vos_wire::package::{Opened, Package};
@@ -291,8 +291,8 @@ fn ran_or_refused(result: &WorkResult) {
 /// The installs of the counter, the ledger with its programs and the
 /// caller, and Alice a minter.
 fn installs(paired: &mut Paired, actors: &Actors) -> Vec<Input> {
-    let counter = vos_testkit::program_hash(&actors.counter);
-    let caller = vos_testkit::program_hash(&actors.caller);
+    let counter = ProgramHash::of(&actors.counter);
+    let caller = ProgramHash::of(&actors.caller);
     vec![
         install(COUNTER, counter),
         actors.install_ledger(&mut paired.vos),
@@ -324,7 +324,7 @@ fn with_shop(backend: PvmBackend, actors: &Actors) -> (Paired, Vec<u8>) {
     let mut first = installs(&mut paired, actors);
     first.push(Input::Admin(Admin::Install {
         instance: SHOP,
-        derivation: vos_testkit::programs::bare(vos_testkit::program_hash(&shop)),
+        derivation: vos_testkit::programs::bare(ProgramHash::of(&shop)),
         roles: vec![],
     }));
     ran_or_refused(&paired.batch(T0, first).result);
@@ -991,7 +991,7 @@ impl Driven {
     }
 
     fn installs(&mut self) -> Vec<Input> {
-        let hash = vos_testkit::program_hash;
+        let hash = ProgramHash::of;
         vec![
             install(COUNTER, hash(&self.actors.counter)),
             Input::Admin(Admin::Install {
@@ -1372,7 +1372,7 @@ fn the_builders_store_outlives_it() {
     let start = driven.request(SHOP, nap, 500u64);
     driven.run(vec![start]);
     let root = driven.builder.store.root().unwrap();
-    let program = vos_testkit::program_hash(&driven.actors.counter);
+    let program = ProgramHash::of(&driven.actors.counter);
     let len = driven.actors.counter.len() as u32;
     // The builder gone, its store reopened: the old one is dropped first,
     // which releases its lock on the directory, a temporary store standing
@@ -1430,7 +1430,7 @@ impl Drop for Scratch {
 #[test]
 fn a_workflow_resumes_on_its_program_through_an_upgrade_on_jam() {
     let mut driven = Driven::new(Store::temporary().unwrap(), POLKAJAM_REFINE_GAS);
-    let hash = vos_testkit::program_hash;
+    let hash = ProgramHash::of;
     let (shop, lean) = (hash(&driven.shop), hash(&actor("lean")));
     let nap = method(&driven.shop, "nap");
     let start = driven.request(SHOP, nap, 2_500u64);

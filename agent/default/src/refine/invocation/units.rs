@@ -164,7 +164,8 @@ impl Invocation<'_> {
         id: u64,
         outcome: &mut Option<Ended>,
     ) -> Result<(), Failure> {
-        if !serves(self.section, id) {
+        let op = Op::from_id(id);
+        if !serves(self.section, op) {
             return Err(Failure::Trapped);
         }
         let used = share.used(machine);
@@ -173,8 +174,8 @@ impl Invocation<'_> {
         let pages = match share.effectful {
             true => 0,
             false => {
-                let first = abi::is_effect(id);
-                let (pages, serving) = self.serving(machine, id, input);
+                let first = op.is_some_and(abi::is_effect);
+                let (pages, serving) = self.serving(machine, id, op, input);
                 // A first effect: the step's whole limit, beyond what it
                 // used.
                 let keep = match first {
@@ -196,10 +197,11 @@ impl Invocation<'_> {
             }
         };
         let served = match self.plain(machine, id, instance) {
-            Some(served) => served,
-            None if !machine.charge(price::of(id)) => Err(Failure::OutOfGas),
-            None if id == op::CALL => self.call(machine, instance, Kind::Workflow),
-            None => self.operation(machine, None, id, owner, instance, input, outcome),
+            Ok(None) => Ok(()),
+            Ok(Some(op)) if !machine.charge(price::of(op)) => Err(Failure::OutOfGas),
+            Ok(Some(Op::Call)) => self.call(machine, instance, Kind::Workflow),
+            Ok(Some(op)) => self.operation(machine, None, op, owner, instance, input, outcome),
+            Err(code) => Err(code),
         };
         // What the call's output was kept for, its pages take next.
         self.base.meter.kept.set(self.base.meter.kept.get() - pages);
@@ -215,7 +217,7 @@ impl Invocation<'_> {
         }
         // An await: the unit ends, and the step with it once its share is
         // spent. A workflow that has replied runs on to its end.
-        if id == op::CALL && outcome.is_none() {
+        if op == Some(Op::Call) && outcome.is_none() {
             share.effectful = false;
             let used = share.used(machine);
             if used >= share.limit {
@@ -255,17 +257,17 @@ impl Invocation<'_> {
         Ok(Ended::Paused(Pause::Preempted { pending, idle }))
     }
 
-    /// What serving the call `id` takes of the meter beside the machine's
-    /// price: the pages its output marks written, and a precompile's
-    /// serving.
-    fn serving(&self, machine: &Machine, id: u64, input: &[u8]) -> (u64, u64) {
+    /// What serving the call `id`, of operation `op` if any, takes of the
+    /// meter beside the machine's price: the pages its output marks
+    /// written, and a precompile's serving.
+    fn serving(&self, machine: &Machine, id: u64, op: Option<Op>, input: &[u8]) -> (u64, u64) {
         let r = |index| machine.register(index);
-        let (address, len, serving) = match id {
-            op::INPUT => (r(7), window(input.len(), r(8), r(9)).len(), 0),
-            op::RANDOM => (r(7), 32, 0),
+        let (address, len, serving) = match op {
+            Some(Op::Input) => (r(7), window(input.len(), r(8), r(9)).len(), 0),
+            Some(Op::Random) => (r(7), 32, 0),
             // The callee's reply, at most the cap.
-            op::CALL => (r(11), (r(12) as usize).min(cap::REPLY), 0),
-            id if precompile::price(id).is_some() => (r(7), 64, defaults::PRECOMPILE_SERVING),
+            Some(Op::Call) => (r(11), (r(12) as usize).min(cap::REPLY), 0),
+            None if precompile::price(id).is_some() => (r(7), 64, defaults::PRECOMPILE_SERVING),
             _ => return (0, 0),
         };
         let pages = machine.unwritten_in(address, len as u64);
@@ -286,11 +288,11 @@ impl Invocation<'_> {
     }
 }
 
-/// Whether a workflow's machine may make host call `id`, with a section
-/// open or not ([`abi::workflow_may_use`]). A precompile or an id the agent
-/// does not serve is served alike either way.
-fn serves(section: bool, id: u64) -> bool {
-    !known(id) || abi::workflow_may_use(section, id)
+/// Whether a workflow's machine may make a host call, of operation `op`
+/// or of none, with a section open or not ([`abi::workflow_may_use`]). A
+/// precompile or an id the agent does not serve is served alike either way.
+fn serves(section: bool, op: Option<Op>) -> bool {
+    op.is_none_or(|op| abi::workflow_may_use(section, op))
 }
 
 /// Pay a page the machine first stores to, before it is opened.

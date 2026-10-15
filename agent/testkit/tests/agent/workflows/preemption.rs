@@ -5,7 +5,7 @@
 //! cannot move fails instead.
 
 use super::*;
-use vos_wire::abi::{op, precompile};
+use vos_wire::abi::{Op, precompile};
 
 /// What a step of workflow `id` keeps of the meter, its record's read
 /// included: a batch's budget past it is the step's room.
@@ -131,7 +131,7 @@ fn a_first_effect_the_refine_cannot_cover_waits_at_its_call() {
         assert_eq!(record.gas, SETTLE_LIMIT);
         assert_eq!(record.state, WorkflowState::Preempted(rounds.encode()));
         let snapshot = record.snapshot.unwrap();
-        assert_eq!(snapshot.pending, Some(op::CALL));
+        assert_eq!(snapshot.pending, Some(Op::Call.id()));
         assert_eq!(snapshot.registers[8], u64::from(flows.method("sell").0));
         assert_eq!(flows.sales(), 0, "the call waits unserved");
 
@@ -269,9 +269,9 @@ fn an_unpaid_compression_waits_for_the_next_step() {
 }
 
 /// A large answer resumes a workflow in a batch whose meter cannot pay the
-/// pages the answer lands on: the step ends at its `INPUT`, unserved. A
+/// pages the answer lands on: the step ends at its `Input`, unserved. A
 /// batch behind a handler that still cannot pay them leaves it waiting,
-/// unmoved; once one can, the next step serves the `INPUT` first, from the
+/// unmoved; once one can, the next step serves the `Input` first, from the
 /// answer the workflow keeps, its registers as they were. A step that
 /// cannot pay its first page, behind a handler, waits too. The two
 /// backends agree on every batch.
@@ -292,10 +292,10 @@ fn an_unpaid_input_waits_for_its_pages() {
         let record = flows.record(0);
         assert_eq!(record.state, WorkflowState::Preempted(answer.encode()));
         let snapshot = record.snapshot.unwrap();
-        assert_eq!(snapshot.pending, Some(op::INPUT));
+        assert_eq!(snapshot.pending, Some(Op::Input.id()));
 
         // Behind a handler, the sweep's head with room for a few pages, half
-        // of them its floor's: the `INPUT` waits, unserved and unmoved.
+        // of them its floor's: the `Input` waits, unserved and unmoved.
         let installed = flows.node.state[&keys::installed(COUNTER)].len() as u64;
         let handler = defaults::STEP_RESERVE + defaults::RECORD_BYTE * installed;
         let unknown = flows.sessions.request(ALICE, COUNTER, MethodId(999), ());
@@ -308,7 +308,7 @@ fn an_unpaid_input_waits_for_its_pages() {
         assert_eq!(flows.record(0).snapshot.unwrap(), snapshot);
         results.push(result);
 
-        // With room, the `INPUT` is served first, from the kept answer; and
+        // With room, the `Input` is served first, from the kept answer; and
         // a sleeper starts.
         flows.budget = defaults::REFINE_GAS;
         let sweep = flows.sweeping(1);
@@ -441,14 +441,14 @@ fn a_call_whose_reply_the_meter_cannot_pay_waits_unserved() {
                 let result = split_output(&output).unwrap().0;
                 left(&result)
                     .and_then(|record| record.snapshot)
-                    .is_some_and(|snapshot| snapshot.pending == Some(op::CALL))
+                    .is_some_and(|snapshot| snapshot.pending == Some(Op::Call.id()))
             })
             .expect("a room that takes the step to its call");
         flows.budget = keep(&flows, 0) + defaults::SWEEP_RESERVE + room * defaults::WRITTEN_PAGE;
         let sweep = flows.sweeping(1);
         results.push(flows.unmodelled(1, vec![sweep]));
         let snapshot = flows.record(0).snapshot.unwrap();
-        assert_eq!(snapshot.pending, Some(op::CALL));
+        assert_eq!(snapshot.pending, Some(Op::Call.id()));
         // The sale after the echo's await, its reply's page unpaid: no sale
         // counted.
         assert_eq!(snapshot.registers[8], u64::from(flows.method("sell").0));

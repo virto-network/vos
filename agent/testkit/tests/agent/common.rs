@@ -14,7 +14,8 @@ use vos_pvm::refine_host::{
 };
 use vos_pvm::{ExitReason, PvmBackend};
 use vos_testkit::programs::{actor, agent, bare, derivation, derived, kernel, method, package};
-use vos_testkit::{Testkit, decode, program_hash};
+use vos_testkit::{Testkit, decode};
+use vos_wire::abi::surface::LOST;
 use vos_wire::abi::{Failure, Refusal, cap, code};
 use vos_wire::batch::{Admin, Batch, Input, Query, Request, Work};
 use vos_wire::ids::{
@@ -54,10 +55,6 @@ impl ProgramSource for Scoped {
             .cloned()
     }
 }
-
-/// The agent's report that its state lost data it wrote: a VOS node stops
-/// the refine at it.
-pub const LOST: u64 = 0x483;
 
 /// The agent's preimages on a JAM node: the node's programs, those in
 /// `scope` when it is given, of the agent's own service alone.
@@ -226,7 +223,7 @@ impl Node {
     }
 
     pub fn add(&mut self, blob: &[u8]) -> ProgramHash {
-        let hash = program_hash(blob);
+        let hash = ProgramHash::of(blob);
         if let Some(pool) = &self.pool {
             assert_eq!(pool.install(blob).unwrap().0, hash.0);
         }

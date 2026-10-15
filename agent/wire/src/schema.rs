@@ -5,6 +5,7 @@
 use alloc::vec::Vec;
 
 use crate::abi::Kind;
+use crate::defaults::{HANDLER_GAS, MAX_HANDLER_GAS};
 use crate::ids::MethodId;
 use crate::{Decode, Encode};
 
@@ -24,8 +25,7 @@ pub struct Schema {
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct MethodSchema {
-    /// The first four bytes, big-endian, of BLAKE2b-256 over `vos/method/`
-    /// and the method's name.
+    /// [`crate::ids::derive_id`] of the method's name in `vos/method/`.
     pub id: MethodId,
     pub name: Vec<u8>,
     pub kind: Kind,
@@ -40,6 +40,14 @@ pub struct MethodSchema {
     /// client names: a method that query calls reads the caller's snapshot,
     /// marked or not.
     pub linearizable: bool,
+}
+
+impl MethodSchema {
+    /// The gas limit a handler runs with: the one it requests, or
+    /// [`HANDLER_GAS`], capped at [`MAX_HANDLER_GAS`] by policy.
+    pub fn gas_limit(&self) -> u64 {
+        self.gas.unwrap_or(HANDLER_GAS).min(MAX_HANDLER_GAS)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

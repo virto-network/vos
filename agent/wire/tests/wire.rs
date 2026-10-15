@@ -1,5 +1,5 @@
 use proptest::prelude::*;
-use vos_wire::abi::{self, Failure, Kind, Refusal, Rows, op};
+use vos_wire::abi::{self, Failure, Kind, Op, Refusal, Rows};
 use vos_wire::batch::{Admin, Answer, Await, Batch, Body, Input, Message, Request};
 use vos_wire::ids::{
     AgentId, InstanceId, MapId, MethodId, Principal, ProgramHash, Session, SessionId, SessionRef,
@@ -507,72 +507,97 @@ fn natural_widths_follow_the_gray_paper() {
 #[test]
 fn kinds_reach_only_their_operations() {
     let handlers = [
-        op::INPUT,
-        op::REPLY,
-        op::FAIL,
-        op::LOG,
-        op::CALLER,
-        op::NOW,
-        op::RANDOM,
-        op::GET,
-        op::PUT,
-        op::DELETE,
-        op::SCAN,
-        op::CALL,
-        op::SEND,
-        op::ATTEST,
-        op::SELF_ID,
+        Op::Input,
+        Op::Reply,
+        Op::Fail,
+        Op::Log,
+        Op::Caller,
+        Op::Now,
+        Op::Random,
+        Op::Get,
+        Op::Put,
+        Op::Delete,
+        Op::Scan,
+        Op::Call,
+        Op::Send,
+        Op::Attest,
+        Op::SelfId,
     ];
-    let pauses = [op::REQUEST, op::RESULT, op::SLEEP];
-    let sections = [op::OPEN, op::CLOSE];
-    let writes = [op::PUT, op::DELETE, op::SEND, op::ATTEST];
+    let pauses = [Op::Request, Op::Result, Op::Sleep];
+    let sections = [Op::Open, Op::Close];
+    let writes = [Op::Put, Op::Delete, Op::Send, Op::Attest];
     // A workflow attests nothing, and does not ask who called.
-    let stateful = [op::CALLER, op::ATTEST];
+    let stateful = [Op::Caller, Op::Attest];
     // Its instance's rows it reaches only inside a section.
-    let rows = [op::GET, op::PUT, op::DELETE, op::SCAN];
-    for id in handlers {
-        assert!(abi::allowed(Kind::Command, id));
-        assert_eq!(abi::allowed(Kind::Query, id), !writes.contains(&id));
-        assert!(!abi::allowed(Kind::Attestable, id));
-        assert_eq!(abi::allowed(Kind::Workflow, id), !stateful.contains(&id));
+    let rows = [Op::Get, Op::Put, Op::Delete, Op::Scan];
+    for op in handlers {
+        assert!(abi::allowed(Kind::Command, op));
+        assert_eq!(abi::allowed(Kind::Query, op), !writes.contains(&op));
+        assert!(!abi::allowed(Kind::Attestable, op));
+        assert_eq!(abi::allowed(Kind::Workflow, op), !stateful.contains(&op));
         assert_eq!(
-            abi::in_section(id),
-            rows.contains(&id) || [op::NOW, op::LOG].contains(&id),
-            "{id:#x}"
+            abi::in_section(op),
+            rows.contains(&op) || [Op::Now, Op::Log].contains(&op),
+            "{op:?}"
         );
     }
-    for id in pauses.into_iter().chain(sections) {
-        assert!(abi::allowed(Kind::Workflow, id));
-        assert!(!abi::allowed(Kind::Command, id));
-        assert!(!abi::allowed(Kind::Query, id));
-        assert!(!abi::allowed(Kind::Attestable, id));
-        assert!(abi::surface::workflow(id));
-        assert_eq!(abi::in_section(id), id == op::CLOSE, "{id:#x}");
+    for op in pauses.into_iter().chain(sections) {
+        assert!(abi::allowed(Kind::Workflow, op));
+        assert!(!abi::allowed(Kind::Command, op));
+        assert!(!abi::allowed(Kind::Query, op));
+        assert!(!abi::allowed(Kind::Attestable, op));
+        assert_eq!(abi::in_section(op), op == Op::Close, "{op:?}");
     }
+    let every: Vec<Op> = handlers.into_iter().chain(pauses).chain(sections).collect();
+    assert_eq!(every, Op::ALL, "every operation is classed, in id order");
     for unknown in [0, 5, 0x480, 0x4ff, 0x507, 0x524, 0x52f, 0x533, 0x542, 0x5ff] {
-        assert!(!abi::allowed(Kind::Command, unknown));
-        assert!(!abi::allowed(Kind::Query, unknown));
-        assert!(!abi::allowed(Kind::Workflow, unknown));
-        assert!(!abi::in_section(unknown));
+        assert_eq!(Op::from_id(unknown), None, "{unknown:#x}");
     }
-    assert!(abi::surface::workflow(abi::precompile::BLAKE2B_COMPRESS));
-    assert!(abi::surface::workflow(op::GET));
-    assert!(!abi::surface::workflow(op::ATTEST));
     // A workflow's rows and a close only inside a section; inside one, its
     // rows, the time, logs and the close alone.
-    for id in handlers.into_iter().chain(pauses).chain(sections) {
-        let rows_or_close = rows.contains(&id) || id == op::CLOSE;
+    for &op in Op::ALL {
+        let rows_or_close = rows.contains(&op) || op == Op::Close;
         assert_eq!(
-            abi::workflow_may_use(false, id),
-            abi::allowed(Kind::Workflow, id) && !rows_or_close,
-            "{id:#x}"
+            abi::workflow_may_use(false, op),
+            abi::allowed(Kind::Workflow, op) && !rows_or_close,
+            "{op:?}"
         );
         assert_eq!(
-            abi::workflow_may_use(true, id),
-            abi::in_section(id),
-            "{id:#x}"
+            abi::workflow_may_use(true, op),
+            abi::in_section(op),
+            "{op:?}"
         );
     }
+}
+
+/// An operation's id names it, and no other id names one: the actor ABI's
+/// block holds them all.
+#[test]
+fn operations_are_their_ids() {
+    for &op in Op::ALL {
+        assert_eq!(Op::from_id(op.id()), Some(op));
+        assert!(abi::surface::ACTOR_ABI.contains(&op.id()), "{op:?}");
+    }
+    let ids: Vec<u64> = (0..0x1000u64)
+        .filter(|&id| Op::from_id(id).is_some())
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            0x500, 0x501, 0x502, 0x503, 0x504, 0x505, 0x506, 0x510, 0x511, 0x512, 0x513, 0x520,
+            0x521, 0x522, 0x523, 0x530, 0x531, 0x532, 0x540, 0x541
+        ]
+    );
+}
+
+/// A kind's index is its encoding's byte, which the agent passes in φ8.
+#[test]
+fn kinds_index_as_they_encode() {
+    for kind in [Kind::Command, Kind::Query, Kind::Attestable, Kind::Workflow] {
+        assert_eq!(kind.encode(), [kind.index()]);
+    }
+    assert!(Kind::Command.is_handler() && Kind::Query.is_handler());
+    assert!(!Kind::Attestable.is_handler() && !Kind::Workflow.is_handler());
 }
 
 /// Every operation a workflow may use is classed: an effect, which a unit
@@ -582,39 +607,38 @@ fn kinds_reach_only_their_operations() {
 #[test]
 fn a_workflows_operations_are_effects_or_not() {
     let effects = [
-        op::CALL,
-        op::SEND,
-        op::REQUEST,
-        op::RESULT,
-        op::REPLY,
-        op::FAIL,
-        op::OPEN,
+        Op::Call,
+        Op::Send,
+        Op::Request,
+        Op::Result,
+        Op::Reply,
+        Op::Fail,
+        Op::Open,
     ];
     // The row operations and a section's close come only after its open.
     let others = [
-        op::INPUT,
-        op::LOG,
-        op::NOW,
-        op::RANDOM,
-        op::SELF_ID,
-        op::SLEEP,
-        op::GET,
-        op::PUT,
-        op::DELETE,
-        op::SCAN,
-        op::CLOSE,
+        Op::Input,
+        Op::Log,
+        Op::Now,
+        Op::Random,
+        Op::SelfId,
+        Op::Sleep,
+        Op::Get,
+        Op::Put,
+        Op::Delete,
+        Op::Scan,
+        Op::Close,
     ];
-    for id in 0..0x1000u64 {
-        if !abi::allowed(Kind::Workflow, id) {
+    for &op in Op::ALL {
+        if !abi::allowed(Kind::Workflow, op) {
             continue;
         }
-        match (effects.contains(&id), others.contains(&id)) {
-            (true, false) => assert!(abi::is_effect(id), "{id:#x}"),
-            (false, true) => assert!(!abi::is_effect(id), "{id:#x}"),
-            _ => panic!("operation {id:#x} is not classed"),
+        match (effects.contains(&op), others.contains(&op)) {
+            (true, false) => assert!(abi::is_effect(op), "{op:?}"),
+            (false, true) => assert!(!abi::is_effect(op), "{op:?}"),
+            _ => panic!("operation {op:?} is not classed"),
         }
     }
-    assert!(!abi::is_effect(abi::precompile::BLAKE2B_COMPRESS));
 }
 
 #[test]
@@ -828,10 +852,10 @@ fn installs_keep_their_bytes() {
         "every program the agent pins"
     );
     assert_eq!(
-        installed.attestable(MethodId(0x0e0f_1011)),
+        installed.kernel(MethodId(0x0e0f_1011)),
         Some(ProgramHash([2; 32]))
     );
-    assert_eq!(installed.attestable(MethodId(1)), None);
+    assert_eq!(installed.kernel(MethodId(1)), None);
 
     let install = Install {
         instance: InstanceId(5),
