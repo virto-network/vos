@@ -259,9 +259,9 @@ fn a_follower_relays_a_message_to_its_leader() {
     );
 }
 
-/// Fails the refine of every batch holding a message that calls with the
-/// poisoned arguments, as the agent program failing on it would, and
-/// counts them.
+/// Fails the refine of every batch holding an input, a request or a
+/// message, that calls with the poisoned arguments, as the agent program
+/// failing on it would, and counts them.
 struct PoisonedMessage {
     poison: Vec<u8>,
     failed: AtomicU64,
@@ -352,7 +352,7 @@ fn a_gap_is_filled_within_a_round_trip() {
 }
 
 /// Two nodes with a resend round of `ROUND`, the second's queues capped at
-/// `queue` and its refines held while `hold` is armed.
+/// `queue` and its refines held while `hold.refines` is closed.
 fn held_receiver(queue: usize, hold: &Arc<Holds>) -> Cluster {
     let hold = Arc::clone(hold);
     Cluster::tuned(2, move |number, config| {

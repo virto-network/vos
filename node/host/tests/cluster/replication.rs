@@ -241,7 +241,8 @@ fn a_replica_with_another_agent_program_refuses_the_group() {
     );
 }
 
-/// Fails the leader's dry run of a batch holding the poisoned argument.
+/// Fails the leader's dry run of a batch holding an input, a request or a
+/// message, that calls with the poisoned arguments.
 struct PoisonDryRun(Vec<u8>);
 
 impl Hooks for PoisonDryRun {

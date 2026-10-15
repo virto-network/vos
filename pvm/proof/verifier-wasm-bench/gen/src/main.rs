@@ -36,7 +36,13 @@ fn peak_rss_kib() -> u64 {
     std::fs::read_to_string("/proc/self/status")
         .unwrap_or_default()
         .lines()
-        .find_map(|l| l.strip_prefix("VmHWM:")?.split_whitespace().next()?.parse().ok())
+        .find_map(|l| {
+            l.strip_prefix("VmHWM:")?
+                .split_whitespace()
+                .next()?
+                .parse()
+                .ok()
+        })
         .unwrap_or(0)
 }
 
@@ -100,7 +106,8 @@ fn prove_fixture(dir: &std::path::Path, log_size: u32, policy_name: &str) {
 /// decode guard) but verification fails.
 fn tamper(dir: &std::path::Path) {
     let src = dir.join("log12_standard.bin");
-    let bytes = std::fs::read(&src).expect("log12_standard.bin missing — run prove 12 standard first");
+    let bytes =
+        std::fs::read(&src).expect("log12_standard.bin missing — run prove 12 standard first");
     // Start in the middle of the buffer (deep in the STARK proof body) and
     // scan for an offset whose bit-flip survives decoding.
     let mut probe = bytes.len() / 2;
@@ -245,9 +252,10 @@ fn binding_fixture(dir: &std::path::Path, io_hash_hex: &str) {
                 s.timestamp, s.pc, s.opcode, s.reg_a, s.reg_b, s.reg_d, s.imm, s.reg_write,
             );
         }
-        for (row, e) in vos_pvm_proof::chips::register_memory::build_entries_from_side_note(&side_note)
-            .iter()
-            .enumerate()
+        for (row, e) in
+            vos_pvm_proof::chips::register_memory::build_entries_from_side_note(&side_note)
+                .iter()
+                .enumerate()
         {
             eprintln!(
                 "ledger row {row}: reg={} ts={} {} value={:#x}",
@@ -280,12 +288,15 @@ fn binding_fixture(dir: &std::path::Path, io_hash_hex: &str) {
     }
 
     let t = Instant::now();
-    let proof =
-        prove_with_config(&mut side_note, production_pcs_config()).expect("proving failed");
+    let proof = prove_with_config(&mut side_note, production_pcs_config()).expect("proving failed");
     eprintln!("prove: {:.1}s", t.elapsed().as_secs_f64());
 
     // The proof's bound io-hash window must reconstruct exactly H.
-    assert_eq!(proof.public_io_hash(), h, "φ9..φ12 do not reconstruct the requested io-hash");
+    assert_eq!(
+        proof.public_io_hash(),
+        h,
+        "φ9..φ12 do not reconstruct the requested io-hash"
+    );
 
     let commitment = program_commitment_of_proof(&proof);
     let proof_bytes = postcard::to_allocvec(&proof).expect("postcard proof");
@@ -301,12 +312,18 @@ fn binding_fixture(dir: &std::path::Path, io_hash_hex: &str) {
     // still decodes but verification rejects (same scan as `tamper`).
     let mut probe = proof_bytes.len() / 2;
     let tampered = loop {
-        assert!(probe < proof_bytes.len(), "no decodable tamper offset found");
+        assert!(
+            probe < proof_bytes.len(),
+            "no decodable tamper offset found"
+        );
         let mut t = proof_bytes.clone();
         t[probe] ^= 0x01;
         if let Ok(p) = postcard::from_bytes::<Proof>(&t) {
             if verify_standalone_with_pcs_policy(p, commitment, &PcsPolicy::STANDARD).is_err() {
-                eprintln!("tamper: flipped bit 0 of byte {probe}/{}", proof_bytes.len());
+                eprintln!(
+                    "tamper: flipped bit 0 of byte {probe}/{}",
+                    proof_bytes.len()
+                );
                 break t;
             }
         }
@@ -321,7 +338,10 @@ fn binding_fixture(dir: &std::path::Path, io_hash_hex: &str) {
     eprintln!(
         "settlement_zk_proof_valid.bin: {} bytes\ncommitment: {}",
         proof_bytes.len(),
-        commitment_bytes.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+        commitment_bytes
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>(),
     );
 }
 

@@ -1,5 +1,7 @@
-//! Calls and queries as the tests make them: a call's total, an install
-//! at the leader, and a signed query.
+//! Calls and queries as the tests make them: what an answer carries (the
+//! counter's total, whether it ran), an operator's install and one sent
+//! to the leader, a query at one node and a signed one, a method's id
+//! once its schema is served, and a call sent again until answered.
 
 use std::fmt::Debug;
 use std::ops::Deref;

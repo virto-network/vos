@@ -202,7 +202,8 @@ fn no_reply_before_its_commit_is_durable_and_a_full_queue_is_busy() {
     assert_eq!(done(smol::block_on(third)), 6);
 }
 
-/// Fails every refine whose batch holds the poisoned argument.
+/// Fails every refine whose batch holds an input, a request or a message,
+/// that calls with the poisoned arguments.
 struct Poison(Vec<u8>);
 
 impl Hooks for Poison {

@@ -13,8 +13,9 @@
 //! drives its faults its own way.
 //!
 //! Beside the model, what the node's tests and benches share:
-//! [`programs`], the guest programs; [`calls`], a call's total and signed
-//! queries; [`hooks`], what a test gives a node to hold or fail it;
+//! [`programs`], the guest programs; [`calls`], the calls, installs and
+//! queries tests make, and what their answers carry; [`hooks`], what a
+//! test gives a node to hold or fail it;
 //! [`spaces`], nodes in one process and free ports; [`crash`], the crash
 //! tests' rounds; [`processes`], node processes and the relay between
 //! them; [`rounds`], the workflows the checker starts and their reads.
@@ -63,7 +64,7 @@ impl Random {
 }
 
 /// Whether `done` holds within `within`, checking every 5 ms.
-pub fn poll(within: Duration, mut done: impl FnMut() -> bool) -> bool {
+fn poll(within: Duration, mut done: impl FnMut() -> bool) -> bool {
     let until = Instant::now() + within;
     loop {
         if done() {

@@ -23,7 +23,8 @@ enum Route {
     Here,
     /// To this node: its leader, or one of its replicas.
     To(NodeNumber),
-    /// Nowhere now: its group here knows no leader to send to.
+    /// Nowhere: this node knows no leader or replica to send it to, or,
+    /// for an arrival, drops it and counts it.
     Nowhere,
 }
 

@@ -46,46 +46,23 @@ fn keep(client: &Client, mut kept: Kept, key: &Path) -> Result<(), String> {
 }
 
 /// What a call or a query invokes: the client and what its key kept, the
-/// agent, the instance, the method by its name in the installed schema,
-/// and the arguments.
-struct Invocation {
-    client: Client,
-    kept: Kept,
-    agent: AgentId,
-    instance: InstanceId,
-    method: MethodId,
-    arguments: Vec<u8>,
-}
-
-impl Invocation {
-    fn of(call: &CallArgs) -> Result<Self, String> {
-        let (agent, instance) = (AgentId(call.agent), InstanceId(call.instance));
-        let (client, kept) = resume(&call.node, &call.key)?;
-        let schema = client
-            .schema(agent, instance)
-            .map_err(failed)?
-            .ok_or_else(|| format!("nothing is installed as instance {}", call.instance))?;
-        Ok(Self {
-            method: method_named(&schema, &call.method)?,
-            client,
-            kept,
-            agent,
-            instance,
-            arguments: call.args.0.clone(),
-        })
-    }
+/// agent, the instance, and the method by its name in the installed
+/// schema. Its arguments are the call's own.
+fn invocation(call: &CallArgs) -> Result<(Client, Kept, AgentId, InstanceId, MethodId), String> {
+    let (agent, instance) = (AgentId(call.agent), InstanceId(call.instance));
+    let (client, kept) = resume(&call.node, &call.key)?;
+    let schema = client
+        .schema(agent, instance)
+        .map_err(failed)?
+        .ok_or_else(|| format!("nothing is installed as instance {}", call.instance))?;
+    let method = method_named(&schema, &call.method)?;
+    Ok((client, kept, agent, instance, method))
 }
 
 /// A call, sent again with its sequence until it is answered once.
 pub fn call(call: &CallArgs) -> Result<(), String> {
-    let Invocation {
-        mut client,
-        mut kept,
-        agent,
-        instance,
-        method,
-        arguments,
-    } = Invocation::of(call)?;
+    let (mut client, mut kept, agent, instance, method) = invocation(call)?;
+    let arguments = &call.args.0;
     // A call that failed before its answer goes again with its sequence,
     // and is answered once. Another call leaves that session first, so the
     // earlier one's answer is never taken for its own.
@@ -105,7 +82,7 @@ pub fn call(call: &CallArgs) -> Result<(), String> {
         Some(_) => client.repeats_unknown(agent),
         None => {}
     }
-    let answer = client.call(agent, instance, method, &arguments);
+    let answer = client.call(agent, instance, method, arguments);
     // Unanswered: the call may have run, or may yet. A lost one can be
     // answered no more.
     let unanswered = match &answer {
@@ -138,17 +115,11 @@ pub fn call(call: &CallArgs) -> Result<(), String> {
 /// A query, on state that holds every answer the key was given for the
 /// agent, or (`linearizable`) every call answered anywhere before it.
 pub fn query(call: &CallArgs, linearizable: bool) -> Result<(), String> {
-    let Invocation {
-        client,
-        kept,
-        agent,
-        instance,
-        method,
-        arguments,
-    } = Invocation::of(call)?;
+    let (client, kept, agent, instance, method) = invocation(call)?;
     let not_after = vos_node::wall_clock() + 60_000;
     let consistency = consistency(&client, agent, linearizable);
-    let answer = client.query_with(agent, instance, method, &arguments, not_after, consistency);
+    let arguments = &call.args.0;
+    let answer = client.query_with(agent, instance, method, arguments, not_after, consistency);
     keep(&client, kept, &call.key)?;
     print_answer(&answer.map_err(failed)?)
 }

@@ -239,6 +239,53 @@ fn an_operator_installs_a_package() {
     assert_eq!(audited, "done 25232284e49cf2cb");
 }
 
+/// Arguments that do not parse end `vos` before it reaches any node, with
+/// code 2: a call's arguments that are not hex, an install's role that is
+/// not `NAME=BYTE` or whose byte is none, and a grant's role byte that is
+/// none.
+#[test]
+fn malformed_arguments_exit_with_code_2() {
+    let url = "http://127.0.0.1:1";
+    let client = Client {
+        url,
+        key: "client.key",
+        agent: "1",
+    };
+    let installing = |role: &str| {
+        [
+            install(url, "data", "1", "2", Path::new("actor.elf")),
+            vec!["--role".into(), role.into()],
+        ]
+        .concat()
+    };
+    let granting = [
+        "role",
+        "--node",
+        url,
+        "--data",
+        "data",
+        "--agent",
+        "1",
+        "--principal",
+        "00",
+        "--role",
+        "minter",
+    ]
+    .map(str::to_string)
+    .to_vec();
+    for args in [
+        client.invoke("call", "2", "increment", "zz"),
+        installing("minter"),
+        installing("minter=x"),
+        granting,
+    ] {
+        let (output, args) = vos_run(args);
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "vos {args:?}: {error}");
+        assert!(error.contains("invalid value"), "vos {args:?}: {error}");
+    }
+}
+
 /// A call that starts a workflow prints its id; the key that started it
 /// reads its result by the id, waiting for it to end, and another key
 /// reads nothing.

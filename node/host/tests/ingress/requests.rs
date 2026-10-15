@@ -84,8 +84,9 @@ fn a_duplicate_in_flight_waits_for_its_answer() {
     assert_eq!(served.value(&client), 5, "applied once");
 }
 
-/// Holds the refine of a batch holding the poisoned arguments at its
-/// gate, then fails it, once; and holds commits at theirs.
+/// Holds the refine of a batch holding an input, a request or a message,
+/// that calls with the poisoned arguments at its gate, then fails it,
+/// once; and holds commits at theirs.
 #[derive(Default)]
 struct GatedPoison {
     poison: Vec<u8>,

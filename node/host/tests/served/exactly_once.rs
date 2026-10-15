@@ -133,7 +133,7 @@ fn exactly_once(mode: Mode, default_seed: u64, rounds: Option<Rounds>) {
     let (sent_forwarding, sent_second, sent_touring) = (
         &sent[..at_each],
         &sent[at_each..2 * at_each],
-        &sent[(2 * at_each).min(sent.len())..],
+        &sent[2 * at_each..],
     );
     check_counters(
         &cluster,
@@ -141,7 +141,7 @@ fn exactly_once(mode: Mode, default_seed: u64, rounds: Option<Rounds>) {
         sent_second,
         methods.value,
     );
-    let touring = &clients[(2 * at_each).min(clients.len())..];
+    let touring = &clients[2 * at_each..];
     let toured = check_tours(&cluster, touring, sent_forwarding, sent_touring);
     check_forwards(
         &cluster,
@@ -209,13 +209,13 @@ fn check_counters(cluster: &Cluster, seconds: &[Client], sent: &[u64], value: Me
 /// done once, and of one that failed once or not at all; its requests and
 /// messages went once, each request answered once. Every workflow started
 /// once, and none lives on. `forwarded` are what each agent's forwarding
-/// client sent, `toured` what each touring client did: the tours'
-/// messages on each agent's pair with the next, by agent.
+/// client sent, `started` the tours each touring client started. Answers
+/// the tours' messages on each agent's pair with the next, by agent.
 fn check_tours(
     cluster: &Cluster,
     touring: &[Client],
     forwarded: &[u64],
-    toured: &[u64],
+    started: &[u64],
 ) -> Vec<u64> {
     let mut messages = vec![0; forwarded.len()];
     for (at, client) in touring.iter().enumerate() {
@@ -259,7 +259,7 @@ fn check_tours(
             messages[at] = held;
             assert_eq!(
                 mark(agent, &keys::next_workflow()),
-                toured[at],
+                started[at],
                 "every tour started once"
             );
             let pins = keys::workflow_pins_prefix();

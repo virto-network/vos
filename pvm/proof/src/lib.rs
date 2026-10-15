@@ -70,9 +70,10 @@
 //!
 //! The prover-side happy path lives at the crate root:
 //!
-//! - **Trace** — `trace_blob` (whole trace) or [`SideNote::new`]
-//!   from a hand-built step trace; `trace_blob_compact` /
-//!   `trace_stream` for the chain / streaming paths.
+//! - **Trace** — [`TracingPvm::into_side_note`][into_side_note] (a
+//!   run's whole trace) or [`SideNote::new`] from a hand-built step
+//!   trace; [`TracingPvm::into_compact`][into_compact] /
+//!   [`segment::TraceStream`] for the chain / streaming paths.
 //! - **Prove** — [`prove`] (STANDARD) or [`prove_mobile`] (low-latency
 //!   MOBILE); [`prove_with_config`] for a custom [`PcsConfig`].
 //! - **Verify** — [`verify`] / [`verify_with_pcs_policy`] (prover-side,
@@ -96,6 +97,9 @@
 //! [`trace`], [`proof`], …), are **internal — their shapes change
 //! without notice**; they are public only for the verifier crate, the
 //! `prover-extension`, and the AIR-column derives.
+//!
+//! [into_side_note]: crate::core::tracing::TracingPvm::into_side_note
+//! [into_compact]: crate::core::tracing::TracingPvm::into_compact
 
 #![cfg_attr(not(feature = "prover"), no_std)]
 // In verifier-only builds (--no-default-features), prover-only modules are

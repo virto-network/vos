@@ -11,7 +11,9 @@
 //! a trap, which we would see as an error.
 
 use std::time::Instant;
-use wasmtime::{Config, Engine, Instance, Module, OptLevel, Store, StoreLimits, StoreLimitsBuilder};
+use wasmtime::{
+    Config, Engine, Instance, Module, OptLevel, Store, StoreLimits, StoreLimitsBuilder,
+};
 
 const MEM_CAP: usize = 2 * 1024 * 1024 * 1024; // 2 GiB PVF-class ceiling
 
