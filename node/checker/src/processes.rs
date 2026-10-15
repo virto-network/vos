@@ -516,12 +516,10 @@ impl Processes {
         lines
     }
 
-    /// How long node `number`'s log is.
     pub fn log_len(&self, number: usize) -> u64 {
         std::fs::metadata(self.log_path(number)).map_or(0, |log| log.len())
     }
 
-    /// The nodes that exited before the harness killed them.
     pub fn exits(&self) -> Vec<String> {
         self.exits.lock().unwrap().clone()
     }

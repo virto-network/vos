@@ -101,7 +101,7 @@ pub struct Client {
     sessions: Mutex<Vec<Timed>>,
     /// Sessions named so far.
     names: AtomicU64,
-    /// It stopped for a pause.
+    /// It stopped for a pause, with every request answered.
     idle: AtomicBool,
     /// The node it calls, until it fails.
     calling: AtomicU8,
@@ -210,12 +210,10 @@ impl Client {
         self.next.get().copied()
     }
 
-    /// The highest request it has started to send.
     pub fn sent(&self) -> u64 {
         self.sent.load(Ordering::SeqCst)
     }
 
-    /// Whether it stopped for a pause, with every request answered.
     pub fn idle(&self) -> bool {
         self.idle.load(Ordering::SeqCst)
     }

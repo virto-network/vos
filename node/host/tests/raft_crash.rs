@@ -1,23 +1,17 @@
 //! A replica's storage killed mid-write recovers a state Raft can trust.
 //!
-//! A child process drives the node log writer as a replica does: it
-//! appends each entry with its hard state, synced; applies it without a
-//! sync; moves the commit index without a sync; changes term now and
-//! then; and compacts its log below what the writer says is durably
-//! applied. The test kills it at random moments, reopens the store and
-//! checks, over several rounds on one store, later rounds tearing the
-//! journal's tail as a power loss could:
+//! The child drives the node log writer as a replica does: it appends each
+//! entry with its hard state, synced; applies it without a sync; moves the
+//! commit index without a sync; changes term now and then; and compacts
+//! its log below what the writer says is durably applied. What reopens:
 //!
 //! - the applied index and the state are one prefix of the applies;
+//! - the log starts at or below the applied index;
 //! - the log holds every entry from its start through the applied index,
 //!   and on to its end with no gap: an apply is never durable without the
 //!   append before it;
-//! - the log starts at or below the applied index;
 //! - the term and every append the child reported synced survive, but for
 //!   a tear's reach.
-//!
-//! The store lives in a temporary directory, which may be tmpfs: the test
-//! covers recovery, not the disk's durability.
 
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -159,7 +153,7 @@ fn check(round: Round) {
     let rows = store.raft(AGENT).unwrap();
     let applied = store.snapshot().applied(AGENT).unwrap().unwrap_or(0);
     assert_eq!(rows.applied, applied);
-    // Invariant 1: one prefix.
+    // One prefix.
     let state: BTreeMap<_, _> = store
         .snapshot()
         .scan(AGENT, &keys::instance_prefix(InstanceId(0)), None)
@@ -169,13 +163,13 @@ fn check(round: Round) {
         state == expected(applied),
         "round {round}: the state is not the prefix ending at {applied}"
     );
-    // Invariant 4: the log starts at or below the applied index.
+    // The log starts at or below the applied index.
     assert!(
         rows.log_start.0 <= applied,
         "round {round}: the log starts at {} past applied {applied}",
         rows.log_start.0
     );
-    // Invariant 2: the log holds every entry from its start, through
+    // The log holds every entry from its start, through
     // the applied index, with no gap.
     let held: Vec<u64> = rows.log.iter().map(|(index, _)| *index).collect();
     let last = held.last().copied().unwrap_or(rows.log_start.0);

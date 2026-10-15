@@ -2,16 +2,16 @@
 //!
 //! The builder holds the agent's whole keyspace under one tree, on disk
 //! ([`Store`]). For each batch it simulates refine against the store,
-//! recording every row it touches ([`simulate`]), builds the package's
-//! witness from them ([`witness`]), names, as imports, the pages the
-//! batch's workflows restore, by where earlier packages exported them, and
-//! fits the package to a work package ([`builder`]). Once the chain holds
-//! the package's root after, it commits the package to its store.
+//! recording every row it touches ([`Simulation`]), builds the package's
+//! witness from them, names, as imports, the pages the batch's workflows
+//! restore, by where earlier packages exported them, and fits the package
+//! to a work package ([`builder`]). Once the chain holds the package's
+//! root after, it commits the package to its store.
 //!
 //! The agent's programs are its service's preimages, derived from each
 //! package's ELF as a VOS node derives them ([`programs`]).
 //!
-//! [`chain::Emulated`] is a JAM node in process, DA included, so the whole
+//! [`Emulated`] is a JAM node in process, DA included, so the whole
 //! loop runs without one; [`live`] reaches a PolkaJam node.
 
 mod admit;

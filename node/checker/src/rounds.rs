@@ -1,8 +1,8 @@
-//! Workflows as the checker starts them: the rounds actor's tours, each
-//! round asking the next agent's rounds to tally its amount and awaiting
-//! the total, tallying it here, sending the next agent's other rounds it to
-//! tally, a message, sleeping and computing; and their owners' signed
-//! reads.
+//! The rounds actor's tours, as the checker starts them, and their
+//! owners' signed reads. Each round asks the next agent's rounds to tally
+//! its amount and awaits their total, tallies it here, tells the next
+//! agent's other rounds to tally it, as a message, then sleeps and
+//! computes.
 //!
 //! A tour's every effect is a tally of an amount no other round has: how
 //! often each applied is read at the end, exactly, a failed tour's amounts
@@ -126,7 +126,6 @@ impl Tour {
         (totals, digest).encode()
     }
 
-    /// What its amounts add up to.
     pub(crate) fn sum(&self) -> u64 {
         self.amounts.iter().sum()
     }

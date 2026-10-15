@@ -91,12 +91,13 @@ pub(crate) const MAX_INPUT: usize = 12 << 20;
 /// thousand of its gas.
 pub const MARGIN: u64 = 50;
 /// A bound on a package's own work beyond its batch's budget: its refine's
-/// start ([`defaults::refine_start`]) and what [`gas::own`] estimates. The
-/// builder's estimates, PolkaJam reporting no refine gas: 3.3M to 13.5M in
-/// the testnet run's packages, and at most 4.9M for a workflow's package
-/// resumed across packages in the JAM-only host's comparison. So the bound
-/// holds the packages that neither witness hundreds of rows nor write
-/// them, with room; one that does lowers its budget by the excess.
+/// start ([`defaults::refine_start`]) and what the [`gas`] module
+/// estimates. The builder's estimates, PolkaJam reporting no refine gas:
+/// 3.3M to 13.5M in the testnet run's packages, and at most 4.9M for a
+/// workflow's package resumed across packages in the JAM-only host's
+/// comparison. So the bound holds the packages that neither witness
+/// hundreds of rows nor write them, with room; one that does lowers its
+/// budget by the excess.
 pub const OWN_BOUND: u64 = 50_000_000;
 /// The most inputs a batch the builder makes may hold: a VOS node's
 /// default, by which its least budget is reckoned.

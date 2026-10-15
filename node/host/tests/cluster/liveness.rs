@@ -146,7 +146,7 @@ fn quiet_groups_elect_again_when_their_leaders_node_stops() {
 /// meanwhile, hears its leaders at once: each probes it on hearing its
 /// new run, rather than waiting for its own deadline to draw a heartbeat.
 /// That deadline is twenty seconds or more, far from what a loaded machine
-/// adds to the probe; its leaders' are a second or more.
+/// adds to the probes; its leaders' are a second or more.
 #[test]
 fn a_restarted_follower_hears_its_quiet_leaders_at_once() {
     let follower = 3;

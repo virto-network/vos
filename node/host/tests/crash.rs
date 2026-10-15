@@ -1,18 +1,10 @@
 //! A node killed mid-write recovers its applied index and its state as one
-//! prefix of the work results it applied.
-//!
-//! The test runs itself as a child process that applies work results in a
-//! loop, kills it at a random moment, reopens the store and checks it, for
-//! several rounds on one store. A kill leaves the page cache intact, so
-//! every commit the child reported survives. Later rounds also tear the
-//! journal's tail as a power loss could, truncating it or zeroing its last
+//! prefix of the work results it applied, the child applying them in a
+//! loop. A tear of the journal's tail truncates it or zeroes its last
 //! bytes as unwritten sectors read, and the store must still recover a
 //! prefix, losing at most the batches the tear reached. (A flipped bit
 //! inside a complete batch is a different fault: fjall refuses to open
 //! rather than guess.)
-//!
-//! The store lives in a temporary directory, which may be tmpfs: the test
-//! covers recovery, not the disk's durability.
 
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;

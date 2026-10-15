@@ -10,8 +10,7 @@
 //! - **Never forgotten:** the agent's accumulate solicits a program when a
 //!   package names it and never forgets one, so a program stays solicited
 //!   while any live workflow names it, whatever an upgrade installed since,
-//!   and after. Forgetting the programs nothing names any more is left for
-//!   a later slice.
+//!   and after, when nothing names it any more.
 
 use vos_wire::records::Derivation;
 use vos_wire::schema::Schema;

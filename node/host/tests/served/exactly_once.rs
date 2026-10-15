@@ -1,16 +1,7 @@
-//! Exactly once, over HTTP, through failures: clients increment counters
-//! on three nodes, two at each agent, each request resent with its
-//! sequence until answered, in sessions they start every few dozen
-//! requests, while the nodes stop and start, a leader stops between its
-//! apply and its answer, a node is cut off, the network loses and delays
-//! frames, a node's clock jumps, and every clock jumps past the skew.
-//! Once a run every session expires and is collected while a leader
-//! stops, and requests captured before, run or not, are sent again.
-//!
-//! Every answer must be its client's running total: no request applied
-//! twice, none skipped. A node must hold a request applied before it
-//! answers it, a captured request never runs, and at the end every
-//! replica holds every request once.
+//! The checker's exactly-once model over HTTP, on three nodes in one
+//! process, two clients at each agent, through the failures of
+//! [`crate::faults`]. Beside the model's checks, a node must hold a
+//! request applied before it answers it.
 //!
 //! With workflows, a client at each agent also starts tours of the next
 //! agent, one at a time, each round awaiting the next agent's counter,

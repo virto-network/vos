@@ -3,6 +3,8 @@
 //! kills it at a random moment, tears a tail of what it wrote as a power
 //! loss could, and checks what reopens. A kill leaves the page cache
 //! intact, so every write the child reported survives but for a tear.
+//! The directory is a temporary one, which may be tmpfs: the tests cover
+//! recovery, not the disk's durability.
 
 use std::io::{BufRead, BufReader};
 use std::path::Path;

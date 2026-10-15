@@ -1,5 +1,7 @@
 //! The builder: an agent's batches made packages that fit a work package,
 //! submitted, and taken into its store once the chain holds their roots.
+//! How a batch is fitted, and left without the workflows whose pages DA
+//! lacks, is the `fit` module's.
 //!
 //! **Taking a package:** once the chain holds the root its writes make,
 //! the builder reads its work result back from its exports, which must be

@@ -178,7 +178,7 @@ impl PolkaJam {
 
     /// Wait until `service`'s preimage of `hash`, `len` bytes, can be
     /// looked up by a package `jamt` anchors now: available at the
-    /// finalized block, which is [`ANCHOR_MARGIN`] slots past its arrival.
+    /// finalized block, which is `ANCHOR_MARGIN` slots past its arrival.
     /// The slot it became available in.
     pub fn await_preimage(
         &self,
