@@ -279,7 +279,7 @@ agent program, which serves them. Precompiles are the one exception
 | read and write own Merge fields | yes (applied after commit) | read | yes | no |
 | `call` an instance in the same agent (nested, synchronous) | yes | queries only | no | yes |
 | `send` to any agent; `start` a workflow | yes | no | no | yes |
-| await another agent, a timer, `checkpoint` | no | no | no | yes |
+| await another agent or a timer (any `.await` may pause) | no | no | no | yes |
 | `now`, `random` (fixed per work result) | yes | yes | yes | yes |
 | call an `#[attestable]` method (section 11.1) | yes | no | no | yes |
 
@@ -485,8 +485,8 @@ Why handlers run to completion:
 
 - A workflow holds no shared state: only its own memory, which its
   snapshots preserve.
-- A step ends at an await on another agent, a timer or a `checkpoint()`, or
-  at completion. Its synchronous calls' effects, its outgoing messages and
+- A step ends where an `.await` pauses, on another agent, a timer, or a
+  preemption (section 8.3), or at completion. Its synchronous calls' effects, its outgoing messages and
   its snapshot commit together. If a step traps, nothing from it commits
   and the workflow fails. Earlier steps stay committed; multi-step
   atomicity uses reservation (saga) patterns.
@@ -496,8 +496,8 @@ Why handlers run to completion:
 - A workflow is started by a message in a session or pair sequence. Its
   result is sent to whoever started it.
 - Long computations run as workflows, preferably in their own agent so their
-  gas does not delay a latency-sensitive agent's batches. They call
-  `checkpoint()` explicitly around their effects (section 8.3).
+  gas does not delay a latency-sensitive agent's batches. There is no
+  explicit checkpoint: every `.await` may pause (section 8.3).
 
 ### 8.3 Snapshots and preemption [decided: snapshots are the only continuation mechanism]
 
@@ -519,7 +519,8 @@ Why handlers run to completion:
     effect on, the step runs to its end within that limit and is never
     preempted. Exceeding the limit fails the step.
   - No uncommitted writes are ever held across refines. A long computation
-    that must make effects calls `checkpoint()` before and after them.
+    pauses at its awaits, and its effects commit with the step that made
+    them.
 - After failover, a workflow resumes from its last committed snapshot.
 - On JAM, machines do not survive a refine, so every work package ends with
   a snapshot (the CoreVM model).
@@ -528,7 +529,7 @@ Why handlers run to completion:
   (open question 3). Later: XOR deltas against the previous version.
 - Measured cost (S1):
   - a typical suspension changes 3 pages, under 1 KiB after LZ4;
-  - a long computation's first checkpoint ships 2 MiB, and later ones about
+  - a long computation's first snapshot ships 2 MiB, and later ones about
     136 KiB, because random data does not compress.
   - Restore was measured on fresh machines: about 0.1 ms to instantiate on
     the JIT, plus about 0.5 ms on the first resume until the full-span
@@ -1077,8 +1078,23 @@ These form a prover track that runs alongside the core slices (section 16).
   - fits each package to the chain's limits and gas;
   - waits two slots past a program's availability, since an earlier
     submission refines to an error;
-  - keeps the agent's full state in a persistent store.
-- **The first milestone held on a PolkaJam testnet** (slice 4):
+  - keeps the agent's full state in a persistent store;
+  - starts a batch at the refine gas less a bound on the package's own
+    work (900M of PolkaJam's 1e9), never below the least budget a VOS
+    node refines with while the batch can shrink, and refuses a chain
+    whose refine gas gives less;
+  - finds the workflows whose pages DA no longer holds in one pass.
+- **A workflow holds at most 576 pages (2.25 MiB)** (`cap::HELD_PAGES`):
+  the builder asserts at compile time that the step ending such a
+  workflow fits a package (about 913M of 950M usable).
+- **A step's own effects** (writes, messages, attests at the agent's
+  caps) can cost up to about 1.15e9 of a package's own work on JAM. A
+  lone step whose effects pass what its keep leaves fails `Cap` on JAM
+  only, and one past the usable gas leaves no package to make. Closing
+  that needs per-step effect caps about 31 times lower for agents on JAM
+  (open).
+- **The first end-to-end run held on a PolkaJam testnet** (slice 4,
+  `just jam-testnet`):
   - the default agent and two actors ran as a service;
   - a workflow started in one package resumed across three later ones,
     its pages exported and imported by segment root;
@@ -1332,7 +1348,7 @@ knowledge and aggregation are the longest work and gate goal 8.
 2. Storage-backed CRDT type design.
 3. **Large log entries** (to settle before build step 3):
    - in S3, 64 KiB entries managed only 613 commits/s, cause unknown;
-   - snapshot pages (2 MiB on a first compute checkpoint) and witnesses
+   - snapshot pages (2 MiB on a first compute snapshot) and witnesses
      ride the log;
    - candidate: content-addressed blobs pinned at propose and replicated
      with the entry that references them.
