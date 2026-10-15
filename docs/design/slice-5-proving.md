@@ -1,53 +1,86 @@
 # Slice 5: proving
 
-Plan, draft 5. The owner chose **proving first**: slice 5 builds proving,
+Plan, draft 6. The owner chose **proving first**: slice 5 builds proving,
 and the Clerk across spaces is slice 6 (`slice-6-clerk.md`, draft 2,
 with Fable's review folded in).
 - **The approach:** this plan proves the general mechanism, any
   attestable kernel reading committed state, with two targets:
   cipher-clerk's settlement window and a solvency predicate.
-- **Draft 5 takes the owner's answers:**
+- **Draft 6 takes the spikes, the width audit and the owner's answers:**
+  - JAM verifies statements in this slice, through a **recursion layer**
+    that folds a statement's segment proofs into one final proof;
+  - **only the final proof is masked.** Segment proofs and the fold
+    proofs between them never leave the space's prover role;
+  - each kernel proves over the chips it uses (a shape per kernel);
+  - the final proof uses the Blake2s channel, and the proofs it folds use
+    Poseidon2-M31.
+- **Draft 5 took the owner's earlier answers:**
   - arguments are private by default, `#[public]` marks the public ones,
     and the return value is public;
   - attestable methods may read state through `&self`;
-  - no unmasked proof ever exists outside tests, so masking comes before
-    wiring.
-- **Draft 4 folds Fable's review of draft 3:**
-  - private arguments never in clear;
-  - kernels proved on the chain path, without replay;
-  - the root at a live attest's version;
-  - one published channel;
-  - masking gating the venue decision;
-  - the pieces that were missing.
+  - no unmasked proof outside tests, so masking comes before wiring.
+    Draft 6 narrows this with the owner: none leaves the space's prover
+    role.
 
-## What exists (the context brief)
+## What exists
 
 - **Two prover paths:**
   - **The refine path** (`prove_refine`) makes one STARK per machine
     slice, unsegmented. Its bundle carries gas, host boundaries and
-    per-slice states, and verification replays it: exactly what §11.4
-    forbids in a published proof.
+    per-slice states, and verification replays it.
   - **The chain path** (`prove_chain`, `verify_chain_standalone`) has
     canonical shapes with an allowlist, segments cut by steps and pages,
     the first segment's initial memory root anchored, and
     `final == next.initial`. It needs no replay by construction.
-- **Neither is wired into VOS,** and no derived kernel has been proved.
-- **No zero-knowledge** in the pinned Stwo; upstream's successor shows no
-  ZK mode.
-- **The on-chain verify cost is unknown:** the 10.7M-cycle figure is a
-  one-column toy.
-- **Kernels read no committed state.**
+- **Spike 3 proved a derived kernel on the chain path:**
+  - the chain path's tracer serves BLAKE2b (`0x400`) in-AIR, after a
+    49-line fix for sparse memory;
+  - `settlement::window` over vos-tree multiproofs, derived into a
+    43,687-byte kernel, runs about 21 compressions per row read at 10^6
+    rows;
+  - eight journals take 16 segments at the 32,768-step cut: 425 s,
+    6.6 GiB peak, 41.5 MB of proof;
+  - the page-Merkle boundary costs 6,585 compressions against the
+    kernel's 685;
+  - the program commitment depends on the observed profile and the
+    channel: one kernel showed eight.
+- **Spike 1 verified a real segment on the JAM-only host:** 10.65B gas
+  as built, about 2 MB of proof.
+- **The width audit:**
+  - **The AIR is 13,037 columns.** Ristretto is 42% of them, the BLAKE2b
+    chips 23% and the page-Merkle boundary 22%.
+  - **Verify gas is linear in columns.**
+  - **A shape per kernel is sound** (the prove path already drops gated
+    chips): the window kernel uses 22 of 32 chips and 7,519 columns.
+  - **Stacked, measured:** the leaf-hash fix, the kernel's shape and
+    STANDARD settings bring one segment to 1.17B gas (Blake2s) or 2.39B
+    (Poseidon2).
+  - **Projected:** every further lever leaves 0.45–0.7B. Flat
+    verification of a VM segment cannot meet 100M, and no production
+    zkVM attempts it.
+  - **A dedicated recursion AIR** verifies one segment for about 13% of
+    that segment's proving cost. Its final proof is projected at
+    60–150M gas and 100–300 KB, once per statement.
+- **Spike 2 designed masking** in our Stwo fork, with the rank check
+  built. Fable's review requires R1–R8 before it is built (5.4).
+  - **Upstream** has zero-knowledge only in its Starknet privacy
+    recursion, which blinds a circuit proof with random valid gates
+    seeded from the witness. It has no salts, no composition mask and no
+    FRI mask.
+- **The pinned Stwo has a completeness bug:** its verifier refuses valid
+  proofs whose preprocessed tree sits below the lifting height. Upstream
+  fixed it in `74951f79`.
 
 ## Goals
 
-1. A derived attestable kernel is proved and verified without replay,
-   under one program identity, in a published format that reveals only
-   what the kernel declares public.
+1. A derived attestable kernel is proved without replay under one
+   program identity, over the chips it uses.
 2. Kernels prove facts about committed state, read from witnessed rows
    at roots the proof binds.
-3. Published proofs are zero-knowledge.
-4. The verification venue (JAM or peers) and aggregation are decided,
-   on masked proofs.
+3. A statement's segment proofs fold into **one final proof** that binds
+   only what the kernel declares public.
+4. The final proof is zero-knowledge, and is verified by a public JAM
+   agent and by peers alike.
 5. The carried items, each closed or named to a slice.
 
 ## The public-input model
@@ -59,7 +92,7 @@ This is the design 5.1 builds and reviews.
     public, while its rows and paths are private;
   - the predicate's threshold is public, while its account row is
     private.
-- **The public inputs** are:
+- **The final proof's public inputs** are:
   - the program id;
   - the format version;
   - the shape class;
@@ -67,17 +100,21 @@ This is the design 5.1 builds and reviews.
   - the output bytes, opaque and structured by the kernel;
   - the list of roots read, each tagged with its kind.
 
-  At halt, the guest writes their hash into φ9..12, and nothing else.
+  At halt, the guest writes their hash into φ9..12. The recursion
+  carries it from the last segment to the final proof.
 - **Private inputs** (private arguments, witness rows and paths) are
-  bound only inside the proof.
-  - The initial memory root is a non-hiding Merkle root, so the kernel's
-    initial image includes a **random salt page** that the agent writes
-    at the live run and keeps in the `Attest` record.
-  - The published format carries segment states only as the io-hash and
-    the program id already bind them: registers out, memory roots
-    salted.
-  - Without this, masking the trace is pointless, because the initial
-    root leaks first.
+  bound only inside the proofs.
+  - **Segment states become witnesses of the recursion.** The fold
+    checks `final == next.initial` and the first segment's anchor, so
+    the final proof carries no memory roots or registers.
+  - **The anchor splits the initial image** into a public part (code
+    and data, bound by the program id) and a private part (arguments
+    and witness), so the recursion can check the first without seeing
+    the second.
+  - **The salt page:** 5.1 decides whether it is still needed. It is
+    needed if any root over private memory reaches a public input.
+    Inside the space the fold proofs are trusted, as the witness rows
+    are.
 - **Slice 6 needs no format change:** its rows commitment is part of the
   window kernel's output, its sequence cut points are public arguments,
   and its two-anchor reads are a second root.
@@ -86,54 +123,71 @@ This is the design 5.1 builds and reviews.
 
 ### 5.0 Spikes, each with its decision rule
 
-1. **Verify one real segment on JAM.**
-   - **What:** a chain-path segment on the Poseidon2 channel, verified on
-     the JAM-only host by the full-AIR verifier as a PVM guest.
-   - **Record:** gas, instructions, guest memory (the verifier must
-     stream) and proof size against `max_input`, 13.79 MB.
-   - **Rule:** about 200M gas and 4 MB or less per segment, **at twice
-     the margin** (100M and 2 MB unmasked), since masking may double the
-     shape. Otherwise peers verify.
-   - Re-run masked after 5.4 before 5.5 decides.
-2. **Masking.**
-   - **What:**
-     - a source read of `starkware-libs/proving`;
-     - a design note: salted commitments, randomized trace rows across
-       the 32 components and their lookup columns, a masked composition,
-       hidden segment states;
-     - the toolchain move it forces.
-   - **The number:** whether the degree slack fits the existing padding
-     rows, or doubles every component's height. A one-component
-     prototype gets it.
-3. **A kernel proved on the chain path.**
-   - **First:** does the chain path's tracer serve `0x400` (BLAKE2b)
-     in-AIR? If it can't cheaply, the fallback is the refine path with a
-     new published format, at a cost stated.
-   - **Then:** prove `settlement::window` over given rows, with vos-tree
-     path verification inside, hashing at the compress level.
-   - **Record:**
-     - steps, memory and proof size;
-     - **compressions per row**, which decides how many rows one segment
-       holds and is 5.5's input for aggregation.
+1–3 are done, with the width audit:
+1. **Verify one real segment on JAM.** It does not fit (above), so JAM
+   verifies only a recursion proof.
+2. **Masking.** Designed, with the rank check built, in our Stwo fork.
+   Fable: sound, with changes R1–R8.
+3. **A kernel proved on the chain path.** Done, with BLAKE2b in-AIR.
 
-### 5.1 The program identity, the format, and the prover path (design round, reviewed by Fable)
+4. **The recursion stack** (new, run before 5.3):
+   - **The circuit stack:** StarkWare's (`starkware-libs/proving`,
+     Apache 2.0). It needs a move to that monorepo's Stwo, the
+     `nightly-2026-01-15` toolchain and edition 2024. A circuit for our
+     AIR's constraints is generated by driving each chip's
+     `add_constraints` through a gate-recording `EvalAtRow`.
+   - **Our own AIR:** a Poseidon2-M31 recursion AIR, on the archived
+     PCS plumbing.
+   - **Measure:**
+     - a final-shape proof (StarkWare's circuit proof, about 319
+       columns) verified on the JAM-only host, at a high blowup with the
+       Blake2s channel: its gas and bytes. **This is the go or no-go for
+       the venue.** Rule: at most 150M gas unmasked.
+     - the port's size: vos-core's prover built against the monorepo's
+       Stwo on its toolchain, and the breakage counted and classified;
+     - one of our chips verified inside the circuit stack, through the
+       generated gates;
+     - whether the circuit stack has a Poseidon2-M31 gate, or what one
+       costs to add (in-circuit Blake2s costs about 5× the recursion);
+     - our own AIR's starting point: what the archive holds.
+   - **Rule:** the circuit stack if the port is bounded (weeks, not
+     months), one chip verifies in-circuit, and the final-shape gas meets
+     the rule. Otherwise our own AIR.
+   - **The owner decides** on these numbers: the circuit stack moves the
+     toolchain and makes upstream's churn ours.
 
-- **The prover path,** decided on spike 3: kernels on the chain path,
-  re-run by the prover from the `Attest` record (program, public and
-  private arguments, witness, salt) exactly as the live inner machine ran
-  them.
-- **One program id** over the derived kernel (per
-  `TRANSPILER_VERSION`), the preprocessed root of its shape class, and
-  `ProgramHash`, bound and written down.
+### 5.1 The program identity, the format, and the shape per kernel (design round, reviewed by Fable)
+
+- **The prover path:** kernels on the chain path, re-run by the prover
+  from the `Attest` record (program, public and private arguments,
+  witness) exactly as the live inner machine ran them.
+- **A shape per kernel:** the kernel's component set, taken from its
+  code, plus its pinned `log_sizes` per segment class. The verifier
+  accepts exactly that set and those sizes. Otherwise a full-set proof
+  of the same kernel verifies at 1.6× the gas.
+- **One program id** over:
+  - `TRANSPILER_VERSION`;
+  - `ProgramHash`;
+  - the shape (component set and classes);
+  - the channel;
+  - the preprocessed root;
+  - the public data root of the initial image.
+
+  It is kept in the install's `Derivation`.
 - **The public-input model above:** the `#[attestable]` split, the
-  guest-written io-hash, the salt page, and hidden states.
-- **One published channel:** Poseidon2-M31 (format 25), whether JAM or a
-  peer verifies, so each statement has one proof. Blake2s (format 24)
-  stays for tests inside a space.
-- **Shape classes pinned per kernel id:** each kernel has a known maximum
-  of steps and compressions. The verifier accepts exactly the pinned
-  `log_sizes` per class, replacing allowlist floors that are only
-  observed.
+  guest-written io-hash, the initial image's public and private split,
+  and the salt page's fate.
+- **The channels:**
+  - segment and fold proofs on Poseidon2-M31 (format 25), which the
+    recursion verifies cheaply;
+  - the final proof on Blake2s, which the PVM verifies 2.0–2.3× cheaper;
+  - Blake2s segment proofs (format 24) stay for tests.
+- **Taken from the spikes:**
+  - the leaf-hash fix (`2000c349`, half the Poseidon2 verify cost);
+  - the chain tracer's sparse-memory fix;
+  - `prove_canonical_with_config` and the component-mask seam
+    (`d165a7b6`);
+  - Stwo's completeness fix (`74951f79`), through the fork.
 - **The legacy tracer's fate:** retired, or kept as the chain path's
   tracer. If retired, slice 1's exception to the allow-set closes here.
 
@@ -168,53 +222,92 @@ This is the design 5.1 builds and reviews.
   through the result-blob path (4.4a), not inside the log entry.
 - **vos-tree's hasher** moves to the compress level.
 
-### 5.3 Zero-knowledge (masking), before any proof leaves a test
+### 5.3 The recursion layer
 
-- **Built to spike 2's design,** in the pinned Stwo or after a move
-  upstream.
+Built on spike 4's stack.
+- **Verify a segment proof inside the recursion:** our AIR's constraints
+  as circuit gates (or our own AIR), the Poseidon2-M31 channel, Merkle
+  paths and FRI.
+- **Fold 2 to 1:** every node padded to one shape, carrying:
+  - the program id;
+  - the io-hash from the last segment;
+  - the first segment's anchor;
+  - the boundary states matched between neighbours.
+
+  The root of the tree is one proof per statement, whatever its segment
+  count.
+- **The final layer:**
+  - switches to the Blake2s channel at a high blowup;
+  - uses a fold step above 1 if the verify gas needs it;
+  - pins its parameters in the format.
+- **Leaks to bound:** the segment count shows only as the tree's depth,
+  padded to a class.
+- **Tests:**
+  - a statement's segments folded and the final proof verified;
+  - a tampered segment, a swapped segment and a broken boundary each
+    refused;
+  - a fold over the wrong program id refused.
+- **Measured:** recursion prove time and memory per segment and per
+  statement; final proof bytes; verify instructions natively.
+
+### 5.4 Zero-knowledge for the final proof
+
+- **Masked: the final proof only** (the owner's decision). It is
+  zero-knowledge over its witness, the folded proofs, so those reveal
+  nothing outside.
+- **Built to spike 2's design** in our Stwo fork, with Fable's R1–R8
+  applied to the final layer:
+  1. the rank check;
+  2. the claimed sums blinded, and the boundary re-cut;
+  3. a rank test of the FRI mask;
+  4. hedged randomness, H(OS ‖ witness);
+  5. a degree audit (the final layer's AIR is ours or StarkWare's,
+     chosen with degree ≤2 where masking needs it);
+  6. the parameters pinned in the format;
+  7. every carrier audited (no root or state outside the proof);
+  8. the cost measured.
 - **Gates:**
-  - leakage: a simulator test where feasible, and hidden segment states
-    checked;
+  - leakage: a simulator test where feasible, and the absence of
+    segment states checked;
   - soundness: tests for every masked component.
-- **Measured:** prover time and memory with masking.
-- **Proofs made while masking is built** exist only inside tests: they
-  are never stored or sent.
+- **Proofs made before masking lands** exist only inside tests: they are
+  never stored or sent.
 
-### 5.4 Proving wired into VOS, masked
+### 5.5 Proving wired into VOS
 
 - **The prover worker:**
   - a node role inside the space's trust domain;
   - a queue, retries, and placement with its 24 GiB;
-  - proofs stored as aged, content-addressed blobs;
-  - the `Attest` record names its proof.
-- **Verification without replay** wherever a proof arrives: at ingress,
-  or by a peer.
-- **The prover emits only masked proofs.** The format has no unmasked
-  variant outside tests (the owner's decision).
+  - segment and fold proofs kept only inside the role;
+  - final proofs stored as aged, content-addressed blobs;
+  - the `Attest` record names its final proof.
+- **Only masked final proofs leave the prover role** (the owner's
+  decision). The format has no unmasked final proof outside tests.
+- **Verification without replay** wherever a final proof arrives: at
+  ingress, or by a peer.
 - **Tests:**
   - **live ≡ proved:** the prover's standalone re-run produces the live
     run's output and io-hash. This pins the kernel's memory layout, so
-    5.6's heap change lands before it or excludes kernels;
-  - an attest proved and verified;
-  - a tampered proof refused;
+    5.7's heap change lands before it or excludes kernels;
+  - an attest proved, folded and verified;
+  - a tampered final proof refused;
   - the Poseidon2 channel's soundness gates run on the proving path;
-  - the prover's memory under the 24 GiB cap.
+  - the prover's memory under the 24 GiB cap, for segments and folds.
 
-### 5.5 Verification at its venue (decided on masked proofs)
+### 5.6 The JAM verifier agent
 
-- **Spike 1 re-run masked** (5.3 is done by then), then the venue:
-  - **JAM:** a public verifier agent, with its gas per proof measured;
-    the set of accepted kernel ids is pinned as constants (the owner
-    named; redeploy to change), and the registry takes it over later;
-  - **or peers:** JAM records statement hashes, and the plan says what
-    that gives up.
-- **Aggregation,** decided from spike 3's compressions per row and the
-  masked verify cost: one segment per statement, chained segments, or a
-  recursion or wrap track in a later slice.
-- **Prover memory levers,** named with numbers: segments on the chain
-  path, and the BLAKE2b chip's ~50 MiB per compression.
+- **A public JAM agent verifies final proofs.**
+  - The accepted kernel ids are pinned as constants, set by the owner
+    and changed by redeploy. The registry takes this over later.
+  - It records each verified statement.
+- **A lean verifier:** no constraint-counting preflight, components built
+  once, and Blake2s through the precompile where the host serves it
+  (software on JAM).
+- **Measured:** gas per final proof on the JAM-only host and on PolkaJam,
+  against 100M (200M masked).
+- **Peers verify the same final proof,** natively.
 
-### 5.6 The carried items
+### 5.7 The carried items
 
 - **Per-target JAM limits (the owner's decision):**
   - a JAM profile about 31 times smaller than VOS's;
@@ -224,23 +317,33 @@ This is the design 5.1 builds and reviews.
 - **DA:** re-export a waiting workflow's pages, or fail it
   deterministically.
 - **A heap per kind of invocation:** a bump allocator. It lands before
-  5.3's live≡proved test, or excludes kernels.
+  5.5's live≡proved test, or excludes kernels.
 - **Measurements:** a workflow's resume latency on three processes, and
   a follower's catch-up beyond the kept tail.
 - **PolkaJam:** a re-probe on upgrade, and the recompiler run.
 - **Ristretto ids 110–114:** carried. Derive refuses a kernel that
   reaches them, so nothing depends on them silently.
+- **Prover levers, named to a later slice with their numbers:**
+  - narrow BLAKE2b chips: about −2,200 columns, 3–5 weeks;
+  - Poseidon2 page hashing (about −1,100 columns, 3–5 weeks), or one
+    memory argument across segments (about −2,800 columns and half the
+    prover's cells, 6–10 weeks).
 
-### 5.7 Acceptance
+  Each lowers the recursion's cost per segment, which is the inner
+  proof's columns × queries.
+
+### 5.8 Acceptance
 
 - **Gates:** `ci-full`, `test-proof`, and the checker loop.
-- **The window statement and the solvency predicate:** proved with
-  masking on the published channel, and verified without replay at the
-  decided venue.
+- **The window statement and the solvency predicate:**
+  - proved over their own shapes;
+  - folded into one masked final proof each;
+  - verified without replay by a peer and by the JAM verifier agent.
 - **Rows measured:**
-  - prove time and memory per kernel;
-  - proof size;
-  - verify gas or instructions;
+  - segment prove time and memory per kernel;
+  - recursion time and memory per segment and per statement;
+  - final proof size;
+  - verify gas on JAM, and time natively;
   - masking's cost;
   - compressions per row.
 - **Reviews:** the end review (Fable) and the code-quality review (Opus).
@@ -251,26 +354,31 @@ This is the design 5.1 builds and reviews.
 - arguments are private by default, `#[public]` marks the public ones,
   and the return value is public;
 - read-only `&self` for attestable methods, with witnessed reads;
-- no unmasked proof outside tests: masking (5.3) before wiring (5.4).
+- masking in our Stwo fork;
+- JAM verifies, through a recursion layer built in this slice;
+- only the final proof is masked, and no unmasked proof leaves the
+  space's prover role.
 
-**For the owner after the spikes:**
-1. **Masking:** in the pinned Stwo ourselves, or move upstream.
-2. **The venue:** JAM or peers, on masked proofs.
-3. **Aggregation.**
+**For the owner after spike 4:**
+1. **The recursion stack:** StarkWare's circuit stack, or our own AIR.
 
-**Decided in this draft on the review's advice, and the owner's to
-override:**
-- kernels on the chain path, if spike 3 confirms BLAKE2b in-AIR there;
-- Poseidon2-M31 as the one published channel;
+**Decided in this draft on the evidence, and the owner's to override:**
+- kernels on the chain path (spike 3);
+- a shape per kernel, pinned in the program id (the audit);
+- Poseidon2-M31 for segment and fold proofs, and Blake2s for the final
+  proof (the audit: 2.0–2.3× cheaper to verify on the PVM);
 - reads as of the latest complete root W ≤ V;
 - shape classes pinned per kernel;
+- the prover levers named to a later slice.
 
 ## Risks
 
-- **Masking is the longest pole,** and may force a Stwo move and a
-  toolchain change.
-- **A real proof's verification may not fit JAM,** even with the margin.
-- **Prover memory:** about 400 compressions per 24 GiB slice; masking
-  may double it.
-- **The chain path's tracer** may not serve BLAKE2b in-AIR (spike 3
-  first).
+- **The recursion layer is the longest pole:** about 2–3 months on the
+  circuit stack, 4–6 on our own AIR. The circuit stack also moves the
+  toolchain and the Stwo version.
+- **The final proof's verify gas is projected** (60–150M) until spike 4
+  measures a final-shape proof.
+- **Masking a recursion AIR that is not ours** (the circuit stack)
+  means changing StarkWare's circuit prover in our fork.
+- **Prover memory:** segments at the 32k cut fit (6–20 GiB by
+  settings); folds are unmeasured.
