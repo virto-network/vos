@@ -379,14 +379,31 @@ impl MerkleHasherLifted for P2MerkleHasher {
         P2Hash(hash_children_m31(&left.0, &right.0))
     }
     fn update_leaf(&mut self, column_values: &[BaseField]) {
-        self.buffer.extend_from_slice(column_values);
-        while self.buffer.len() >= RATE {
+        // Absorb whole blocks straight from the row and buffer only a partial
+        // block: draining blocks from the front of a buffered row would move
+        // the rest of it each time, quadratic in the row's width.
+        let mut values = column_values;
+        if !self.buffer.is_empty() {
+            let take = (RATE - self.buffer.len()).min(values.len());
+            self.buffer.extend_from_slice(&values[..take]);
+            values = &values[take..];
+            if self.buffer.len() < RATE {
+                return;
+            }
             for i in 0..RATE {
                 self.state[i] += self.buffer[i];
             }
             permute(&mut self.state);
-            self.buffer.drain(0..RATE);
+            self.buffer.clear();
         }
+        let mut blocks = values.chunks_exact(RATE);
+        for block in &mut blocks {
+            for i in 0..RATE {
+                self.state[i] += block[i];
+            }
+            permute(&mut self.state);
+        }
+        self.buffer.extend_from_slice(blocks.remainder());
     }
     fn finalize(mut self) -> P2Hash {
         self.buffer.push(BaseField::one());
@@ -764,4 +781,52 @@ mod simd_backend {
     }
 
     impl BackendForChannel<P2MerkleChannel> for SimdBackend {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The sponge a leaf is defined as: the whole row, a one, zeros to a
+    /// whole block, absorbed a block at a time.
+    fn leaf_hash(row: &[BaseField]) -> P2Hash {
+        let mut padded = row.to_vec();
+        padded.push(BaseField::one());
+        padded.resize(padded.len().next_multiple_of(RATE), BaseField::zero());
+        let mut state = [BaseField::zero(); N_STATE];
+        for block in padded.chunks_exact(RATE) {
+            for (lane, value) in state.iter_mut().zip(block) {
+                *lane += *value;
+            }
+            permute(&mut state);
+        }
+        P2Hash(state[..8].try_into().unwrap())
+    }
+
+    #[test]
+    fn a_leaf_hashes_the_same_however_its_row_is_split() {
+        let row: Vec<BaseField> = (0..53u32)
+            .map(|i| BaseField::from_u32_unchecked(i * 7919 + 1))
+            .collect();
+        let expected = leaf_hash(&row);
+        let splits: [&[usize]; 6] = [
+            &[53],
+            &[1; 53],
+            &[3, 0, 5, 8, 13, 24],
+            &[7, 1, 16, 29],
+            &[RATE, RATE, RATE, 29],
+            &[0, 50, 3],
+        ];
+        for split in splits {
+            let mut hasher = P2MerkleHasher::default();
+            let mut rest = row.as_slice();
+            for &len in split {
+                let (part, tail) = rest.split_at(len);
+                hasher.update_leaf(part);
+                rest = tail;
+            }
+            assert!(rest.is_empty());
+            assert_eq!(hasher.finalize(), expected, "split {split:?}");
+        }
+    }
 }
