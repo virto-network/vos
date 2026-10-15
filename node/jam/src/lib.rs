@@ -77,6 +77,9 @@ pub enum Error {
     Signature,
     /// A package's ELF derives no programs.
     Package(String),
+    /// A chain whose work packages' refine gas leaves a batch less than the
+    /// least budget a VOS node refines with.
+    RefineGas { refine_gas: u64, least: u64 },
 }
 
 impl std::fmt::Display for Error {
@@ -105,6 +108,11 @@ impl std::fmt::Display for Error {
             Error::Node(error) => write!(f, "the JAM node: {error}"),
             Error::Signature => f.write_str("a call not signed by its session's key"),
             Error::Package(error) => write!(f, "the package: {error}"),
+            Error::RefineGas { refine_gas, least } => write!(
+                f,
+                "a work package's refine gas, {refine_gas}, leaves a batch less than the {least} \
+                 a VOS node refines with"
+            ),
         }
     }
 }

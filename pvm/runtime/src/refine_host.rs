@@ -1,8 +1,10 @@
 //! Standard inner-machine host-call dispatcher for Refine programs.
 
 mod jam;
+mod lookup;
 
 pub use jam::{JamItem, JamRefine, JamRun, MAX_EXPORTS, Preimages, SEGMENT, fetch_kind, jam_gas};
+pub use lookup::{LOOKUP_GAS, serve_lookup};
 
 use alloc::vec::Vec;
 
@@ -89,6 +91,26 @@ pub trait StateReader: Send + Sync {
         prefix: &'a [u8],
         after: Option<&'a [u8]>,
     ) -> alloc::boxed::Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + 'a>;
+}
+
+/// Applied state held in memory, by key.
+impl StateReader for alloc::collections::BTreeMap<Vec<u8>, Vec<u8>> {
+    fn read(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.get(key).cloned()
+    }
+
+    fn rows<'a>(
+        &'a self,
+        prefix: &'a [u8],
+        after: Option<&'a [u8]>,
+    ) -> alloc::boxed::Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + 'a> {
+        alloc::boxed::Box::new(
+            self.range(prefix.to_vec()..)
+                .take_while(move |(key, _)| key.starts_with(prefix))
+                .filter(move |(key, _)| after.is_none_or(|after| key.as_slice() > after))
+                .map(|(key, value)| (key.clone(), value.clone())),
+        )
+    }
 }
 
 /// The programs the running agent may load, and where `instantiate` finds

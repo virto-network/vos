@@ -73,10 +73,10 @@ build-agent:
     cd agent/default; cargo build --release --target ../../pvm/guest/riscv64em-vos.json
 
 # The SDK, its macros' restrictions, the test actors on the testkit, the
-# default agent against it, the node running the agent, the network between
-# nodes, and the `vos` command.
+# default agent against it, the checker's own model, the node running the
+# agent, the network between nodes, and the `vos` command.
 test-agent: build-test-actors build-agent
-    cargo test -p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-node -p vos-net -p vos-cli
+    cargo test -p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-checker -p vos-node -p vos-net -p vos-cli
     cargo test -p vos-cli --features faults --test processes faults::
     cargo test -p vos-cli --features faults --test fault_suite
 

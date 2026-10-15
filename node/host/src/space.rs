@@ -67,7 +67,7 @@ impl Space {
             };
             nodes.push(SpaceNode {
                 number: number.parse().map_err(|_| at("a node number, 0 to 255"))?,
-                key: hex_key(key).ok_or_else(|| at("a key: 64 hex digits"))?,
+                key: crate::hex32(key).ok_or_else(|| at("a key: 64 hex digits"))?,
                 peer: peer
                     .parse()
                     .map_err(|_| at("a peer address: host and port"))?,
@@ -111,17 +111,6 @@ impl Space {
             })
             .collect()
     }
-}
-
-fn hex_key(text: &str) -> Option<[u8; 32]> {
-    if text.len() != 64 {
-        return None;
-    }
-    let mut key = [0u8; 32];
-    for (at, byte) in key.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(text.get(2 * at..2 * at + 2)?, 16).ok()?;
-    }
-    Some(key)
 }
 
 #[cfg(test)]

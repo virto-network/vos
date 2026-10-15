@@ -72,8 +72,8 @@ fn a_long_computation_spans_refines_on_its_own() {
 fn a_computation_moves_past_what_one_step_can_write() {
     for backend in Node::backends() {
         let mut flows = Flows::at_default_budget(Node::on(backend));
-        // 700 pages of words, mixed once.
-        let arguments = (358_400u32, 1u32);
+        // 540 pages of words, mixed twice.
+        let arguments = (276_480u32, 2u32);
         let start = flows.start("grind_whole", arguments);
         flows.unmodelled(1, vec![start]);
         let whole = ended(&flows.record(0)).clone();
@@ -86,11 +86,11 @@ fn a_computation_moves_past_what_one_step_can_write() {
         let mut short = 0;
         while !matches!(flows.record(1).state, WorkflowState::Ended(_)) {
             let held = flows.record(1).snapshot.unwrap().pages.len();
-            assert!((650..=cap::HELD_PAGES).contains(&held), "{held} held");
+            assert!((500..=cap::HELD_PAGES).contains(&held), "{held} held");
             // What restoring them leaves the budget for pages written.
             let room = (defaults::REFINE_GAS - defaults::SWEEP_RESERVE - keep(&flows, 1))
                 / defaults::WRITTEN_PAGE;
-            assert!(room < held as u64 / 2, "{room} pages of room");
+            assert!(room < held as u64, "{room} pages of room");
             let sweep = flows.sweeping(1);
             let result = flows.unmodelled(1, vec![sweep]);
             let run = due(&result, 1);
@@ -194,6 +194,42 @@ fn a_step_that_cannot_move_fails_rather_than_preempts() {
         assert_eq!(due(&result, 0).outcome, out_of_gas);
         assert_eq!(due(&result, 0).gas_used, flows.record(0).gas);
         assert_eq!(ended(&flows.record(0)), &out_of_gas);
+    }
+}
+
+/// The floor counts a page written as movement: a loop that writes only
+/// memory, every pass starting with the same registers, is preempted step
+/// after step at the block it resumed at, its registers as they were, so
+/// they and its counter alone would call it idle. Its count moves all the
+/// same, and it ends with it. Every step the model's.
+#[test]
+fn a_loop_that_writes_only_memory_moves() {
+    let until = 500_000u64;
+    for backend in Node::backends() {
+        let mut flows = Flows::at_default_budget(Node::on(backend));
+        let start = flows.start("tally", until);
+        flows.batch(1, vec![start]);
+        let mut last = flows.record(0).snapshot.expect("preempted");
+        let (mut steps, mut unmoved) = (1, 0);
+        while !matches!(flows.record(0).state, WorkflowState::Ended(_)) {
+            flows.sweep(1);
+            steps += 1;
+            assert!(steps < 60, "it ends");
+            let record = flows.record(0);
+            let Some(snapshot) = record.snapshot else {
+                continue;
+            };
+            assert!(matches!(record.state, WorkflowState::Preempted(_)));
+            if (snapshot.counter, &snapshot.registers) == (last.counter, &last.registers) {
+                unmoved += 1;
+            }
+            last = snapshot;
+        }
+        assert!(
+            unmoved >= 1,
+            "{unmoved} of {steps} steps where they resumed"
+        );
+        assert_eq!(ended(&flows.record(0)), &Outcome::Done(until.encode()));
     }
 }
 
@@ -318,14 +354,14 @@ fn an_unpaid_input_waits_for_its_pages() {
 }
 
 /// A sweep's due steps leave the batch's inputs their floor: beside two
-/// computations that each restore some 700 pages a step, requests in the
+/// computations that each restore some 540 pages a step, requests in the
 /// same batches all run at the default budget. The head computation runs
 /// each batch, the other waits for the next sweep, and each moves in turn.
 #[test]
 fn requests_progress_beside_large_computations() {
     let mut flows = Flows::at_default_budget(Node::new());
     for _ in 0..2 {
-        let start = flows.start("grind", (358_400u32, 3u32));
+        let start = flows.start("grind", (276_480u32, 3u32));
         flows.unmodelled(1, vec![start]);
     }
     let increment = flows.actors.method(COUNTER, "increment");

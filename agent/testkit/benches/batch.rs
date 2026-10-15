@@ -20,10 +20,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
 
-use vos_pvm::accumulate_host::{self, ACCUMULATE_ENTRY, AccumulateContext, ServiceStorage};
+use vos_pvm::accumulate_host::{self, ACCUMULATE_ENTRY, AccumulateContext};
+use vos_pvm::inner::gp_call::HISTORICAL_LOOKUP;
 use vos_pvm::pool::{MachinePool, OuterMachines};
 use vos_pvm::refine::Machine;
-use vos_pvm::refine_host::{RefineContext, StateReader};
+use vos_pvm::refine_host::{RefineContext, StateReader, serve_lookup};
 use vos_pvm::{ExitReason, PvmBackend};
 use vos_testkit::programs::{actor, agent, method};
 use vos_wire::abi::{cap, code};
@@ -46,44 +47,6 @@ const GAS: u64 = 4_000_000_000;
 const BUDGET: u64 = vos_wire::defaults::REFINE_GAS;
 const ROUNDS: usize = 9;
 
-struct Snapshot(BTreeMap<Vec<u8>, Vec<u8>>);
-
-impl StateReader for Snapshot {
-    fn read(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.0.get(key).cloned()
-    }
-
-    fn rows<'a>(
-        &'a self,
-        prefix: &'a [u8],
-        after: Option<&'a [u8]>,
-    ) -> Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + 'a> {
-        Box::new(
-            self.0
-                .range(prefix.to_vec()..)
-                .take_while(move |(key, _)| key.starts_with(prefix))
-                .filter(move |(key, _)| after.is_none_or(|after| key.as_slice() > after))
-                .map(|(key, value)| (key.clone(), value.clone())),
-        )
-    }
-}
-
-struct Storage<'a>(&'a mut BTreeMap<Vec<u8>, Vec<u8>>);
-
-impl ServiceStorage for Storage<'_> {
-    fn read(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.0.get(key).cloned()
-    }
-
-    fn write(&mut self, key: &[u8], value: Option<&[u8]>) -> Option<usize> {
-        let previous = match value {
-            Some(value) => self.0.insert(key.to_vec(), value.to_vec()),
-            None => self.0.remove(key),
-        };
-        previous.map(|value| value.len())
-    }
-}
-
 /// One agent on one backend, with the counter and the ledger installed,
 /// running on outer machines as a node does, which serves the agent its
 /// programs by hash.
@@ -99,34 +62,18 @@ struct Node {
     time: u64,
 }
 
-/// Serve the agent's `historical_lookup` (7) from `programs`, as a node
-/// does; any other call it does not serve answers `WHAT`.
-fn serve(id: u64, machine: &mut Machine, programs: &HashMap<[u8; 32], Vec<u8>>) {
-    let registers = *machine.registers();
-    if id != 7 {
+/// Serve the agent's `historical_lookup` from `programs`, as a node does
+/// ([`serve_lookup`]); any other call it does not serve answers `WHAT`.
+fn serve(
+    id: u64,
+    machine: &mut Machine,
+    programs: &HashMap<[u8; 32], Vec<u8>>,
+) -> Result<(), ExitReason> {
+    if id != u64::from(HISTORICAL_LOOKUP) {
         machine.registers_mut()[7] = code::WHAT;
-        return;
+        return Ok(());
     }
-    let mut hash = [0u8; 32];
-    assert!(
-        machine
-            .memory()
-            .read_bytes_checked(registers[8] as u32, &mut hash)
-    );
-    machine.registers_mut()[7] = match programs.get(&hash) {
-        Some(blob) => {
-            let offset = (registers[10] as usize).min(blob.len());
-            let len = (registers[11] as usize).min(blob.len() - offset);
-            let to = registers[9] as u32;
-            assert!(
-                machine
-                    .memory_mut()
-                    .write_bytes_checked(to, &blob[offset..offset + len])
-            );
-            blob.len() as u64
-        }
-        None => code::NONE,
-    };
+    serve_lookup(machine, u64::from(AGENT.0), |hash| programs.get(hash))
 }
 
 impl Node {
@@ -137,7 +84,7 @@ impl Node {
             pool,
             programs: HashMap::new(),
             state: BTreeMap::new(),
-            snapshot: Arc::new(Snapshot(BTreeMap::new())),
+            snapshot: Arc::new(BTreeMap::<Vec<u8>, Vec<u8>>::new()),
             version: 0,
             time: 1,
         };
@@ -166,21 +113,11 @@ impl Node {
             budget: BUDGET,
             inputs,
         });
-        let arguments = RefineArgs {
-            core: 0,
-            item: 0,
-            service: u64::from(AGENT.0),
-            payload: work.encode(),
-            package_hash: [0; 32],
-        }
-        .encode();
+        let arguments = RefineArgs::new(u64::from(AGENT.0), work.encode(), [0; 32]).encode();
         let invocation = RefineContext::new(self.agent.load(0, &arguments, GAS).unwrap())
             .with_pool(Arc::clone(&self.pool))
             .with_state(Arc::clone(&self.snapshot))
-            .try_run_with_host(|id, machine| {
-                serve(id, machine, &self.programs);
-                Ok(())
-            })
+            .try_run_with_host(|id, machine| serve(id, machine, &self.programs))
             .unwrap();
         assert_eq!(invocation.exit, ExitReason::Halt);
         let output = invocation.output_bounded(cap::OUTPUT).unwrap();
@@ -192,7 +129,7 @@ impl Node {
         let result = self.refine(inputs);
         let mut state = std::mem::take(&mut self.state);
         self.accumulate(&result, &mut state);
-        self.snapshot = Arc::new(Snapshot(state.clone()));
+        self.snapshot = Arc::new(state.clone());
         self.state = state;
         self.version += 1;
         self.time += 1;
@@ -201,21 +138,11 @@ impl Node {
 
     /// Accumulate `result` onto `state`.
     fn accumulate(&self, result: &[u8], state: &mut BTreeMap<Vec<u8>, Vec<u8>>) {
-        let input = AccumulateInput::Operand(Operand {
-            package_hash: [0; 32],
-            segment_root: [0; 32],
-            authorizer: [0; 32],
-            payload_hash: [0; 32],
-            gas_limit: 0,
-            result: Ok(result.to_vec()),
-            auth_trace: Vec::new(),
-        })
-        .encode();
-        let inputs = [input];
+        let inputs = [AccumulateInput::Operand(Operand::new(result.to_vec())).encode()];
         let service = u64::from(AGENT.0);
         let arguments = accumulate_host::arguments(0, service, inputs.len());
         let machine = self.agent.load(ACCUMULATE_ENTRY, &arguments, GAS).unwrap();
-        let invocation = AccumulateContext::new(machine, service, &inputs, &mut Storage(state))
+        let invocation = AccumulateContext::new(machine, service, &inputs, state)
             .try_run()
             .unwrap();
         assert_eq!(invocation.exit, ExitReason::Halt);
@@ -443,20 +370,14 @@ fn main() {
                     budget: BUDGET,
                     inputs: Vec::new(),
                 });
-                let arguments = RefineArgs {
-                    core: 0,
-                    item: 0,
-                    service: u64::from(AGENT.0),
-                    payload: work.encode(),
-                    package_hash: [0; 32],
-                }
-                .encode();
+                let arguments =
+                    RefineArgs::new(u64::from(AGENT.0), work.encode(), [0; 32]).encode();
                 let (mut load, mut total) = (Vec::new(), Vec::new());
                 for _ in 0..count.parse::<usize>().unwrap() {
                     let started = Instant::now();
                     let context = RefineContext::new(node.agent.load(0, &arguments, GAS).unwrap())
                         .with_pool(Arc::clone(&node.pool))
-                        .with_state(Arc::new(Snapshot(node.state.clone())));
+                        .with_state(Arc::new(node.state.clone()));
                     load.push(started.elapsed().as_secs_f64() * 1e6);
                     let invocation = context.try_run_with_host(|_, _| Ok(())).unwrap();
                     node.agent.restore(std::hint::black_box(invocation));

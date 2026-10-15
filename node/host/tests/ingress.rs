@@ -524,6 +524,31 @@ fn operator_commands_need_the_token() {
     );
 }
 
+/// A bearer token of 64 bytes that are not 64 hex digits, here multi-byte
+/// characters a pair of bytes would split, is refused like any wrong
+/// token, more often than the ingress holds connections: each connection's
+/// place is given back, and the ingress goes on answering.
+#[test]
+fn a_token_that_is_not_hex_is_refused_and_frees_its_connection() {
+    let connections = 4;
+    let served = Served::start_with(Arc::new(vos_node::NoHooks), |config| {
+        config.ingress_connections = connections;
+    });
+    let token = format!("a{}", "€".repeat(21));
+    assert_eq!(token.len(), 64);
+    let request = format!(
+        "GET /stats HTTP/1.1\r\nHost: node\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+    );
+    for _ in 0..3 * connections {
+        assert_eq!(
+            status_line(&served.base, request.as_bytes()),
+            "HTTP/1.1 401 Unauthorized"
+        );
+    }
+    let operator = Operator::new(&served.target, &served.token);
+    assert!(matches!(operator.stats(), Ok(Answer::Stats(_))));
+}
+
 /// The operator reads a replica's status, and a stranger cannot. A node
 /// of a space of one whose flush fails outside any log write halts, and
 /// its status says so.

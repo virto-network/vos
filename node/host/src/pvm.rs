@@ -9,7 +9,7 @@ use vos_pvm::ExitReason;
 use vos_pvm::accumulate_host::{self, ACCUMULATE_ENTRY, AccumulateContext, ServiceStorage};
 use vos_pvm::pool::{CodeHash, MachinePool, OuterMachines};
 use vos_pvm::refine::Machine;
-use vos_pvm::refine_host::{ProgramSource, RefineContext, StateReader};
+use vos_pvm::refine_host::{ProgramSource, RefineContext, StateReader, serve_lookup};
 use vos_wire::abi::{cap, code};
 use vos_wire::batch::Work;
 use vos_wire::ids::AgentId;
@@ -25,10 +25,7 @@ use crate::store::Snapshot;
 const REFINE_ENTRY: u32 = 0;
 
 /// `historical_lookup`, which refine answers from the agent's programs.
-const HISTORICAL_LOOKUP: u64 = 7;
-const LOOKUP_GAS: u64 = 10;
-/// The service a lookup names for the caller's own.
-const SELF_SERVICE: u64 = u64::MAX;
+const HISTORICAL_LOOKUP: u64 = vos_pvm::inner::gp_call::HISTORICAL_LOOKUP as u64;
 /// The agent found its own state lost data it wrote: φ7/φ8 what. The
 /// refine stops at the call, and the node halts, as for a blob it lost.
 const LOST: u64 = 0x483;
@@ -175,14 +172,7 @@ pub(crate) fn refine(
     work: &Work,
     gas: u64,
 ) -> Result<(Vec<u8>, u64), Fault> {
-    let arguments = RefineArgs {
-        core: 0,
-        item: 0,
-        service: u64::from(agent.0),
-        payload: work.encode(),
-        package_hash: [0; 32],
-    }
-    .encode();
+    let arguments = RefineArgs::new(u64::from(agent.0), work.encode(), [0; 32]).encode();
     let gas = match work.batch() {
         Some(batch) => gas + defaults::refine_start(batch.inputs.len(), arguments.len()),
         None => gas,
@@ -228,46 +218,19 @@ fn hex_prefix(hash: &[u8; 32]) -> String {
 }
 
 /// The calls refine leaves to the node: `historical_lookup` from the
-/// agent's programs, and the agent's report of lost state, which stops the
-/// refine; every other answers `WHAT`. A lookup naming another service
-/// finds none: JAM would read that service's preimages, which are not this
-/// agent's programs.
+/// agent's programs ([`serve_lookup`]), and the agent's report of lost
+/// state, which stops the refine; every other answers `WHAT`.
 fn serve(id: u64, machine: &mut Machine, programs: &AgentPrograms) -> Result<(), ExitReason> {
-    if id == LOST {
-        return Err(ExitReason::HostCall(LOST));
+    match id {
+        LOST => Err(ExitReason::HostCall(LOST)),
+        HISTORICAL_LOOKUP => serve_lookup(machine, u64::from(programs.agent.0), |hash| {
+            programs.get(hash)
+        }),
+        _ => {
+            machine.registers_mut()[7] = code::WHAT;
+            Ok(())
+        }
     }
-    if id != HISTORICAL_LOOKUP {
-        machine.registers_mut()[7] = code::WHAT;
-        return Ok(());
-    }
-    let registers = *machine.registers();
-    let mut hash = [0u8; 32];
-    if !machine
-        .memory()
-        .read_bytes_checked(registers[8] as u32, &mut hash)
-    {
-        return Err(ExitReason::Panic);
-    }
-    // Another agent's blob is absent here, as one this node lacks.
-    let service = registers[7];
-    let own = service == SELF_SERVICE || service == u64::from(programs.agent.0);
-    let Some(blob) = own.then(|| programs.get(&hash)).flatten() else {
-        machine.registers_mut()[7] = code::NONE;
-        return Ok(());
-    };
-    let offset = (registers[10] as usize).min(blob.len());
-    let len = (registers[11] as usize).min(blob.len() - offset);
-    if !machine.charge(LOOKUP_GAS + len as u64) {
-        return Err(ExitReason::OutOfGas);
-    }
-    if !machine
-        .memory_mut()
-        .write_bytes_checked(registers[9] as u32, &blob[offset..offset + len])
-    {
-        return Err(ExitReason::Panic);
-    }
-    machine.registers_mut()[7] = blob.len() as u64;
-    Ok(())
 }
 
 /// Accumulate's view of storage: the snapshot, under the writes it made,
@@ -303,13 +266,8 @@ pub(crate) fn accumulate(
     gas: u64,
 ) -> Result<Vec<Write>, Fault> {
     let input = AccumulateInput::Operand(Operand {
-        package_hash: [0; 32],
-        segment_root: [0; 32],
-        authorizer: [0; 32],
-        payload_hash: [0; 32],
         gas_limit: gas,
-        result: Ok(result),
-        auth_trace: Vec::new(),
+        ..Operand::new(result)
     })
     .encode();
     let inputs = [input];
@@ -345,6 +303,7 @@ pub(crate) fn decode<T: Decode>(bytes: &[u8]) -> Result<T, Fault> {
 mod tests {
     use super::*;
     use crate::store::{Fjall, PersistMode};
+    use vos_pvm::accumulate_host::SELF_SERVICE;
     use vos_pvm_program::{CodeBlob, StandardProgram, build_standard_program};
     use vos_wire::batch::{Admin, Batch, Input, Query};
     use vos_wire::ids::{InstanceId, MethodId, Principal, ProgramHash};

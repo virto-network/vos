@@ -23,7 +23,6 @@ use vos_jam::chain::{MAX_REFINE_OUTPUT, slot_of};
 use vos_jam::live::{Live, Node, Parameters};
 use vos_jam::{Attempt, Builder, Chain, Emulated, Error, Fate, Runner, Store, Taken};
 use vos_pvm::refine::PreparedProgram;
-use vos_pvm::refine_host::Preimages;
 use vos_pvm_compiler::service_blob;
 use vos_wire::batch::{Admin, Input};
 use vos_wire::ids::{InstanceId, MethodId, Principal, ProgramHash, Session};
@@ -110,15 +109,6 @@ impl Actors {
     }
 }
 
-/// The programs an agent may load, by hash.
-struct Programs(HashMap<[u8; 32], Vec<u8>>);
-
-impl Preimages for Programs {
-    fn preimage(&self, _: u64, hash: &[u8; 32]) -> Option<Vec<u8>> {
-        self.0.get(hash).cloned()
-    }
-}
-
 /// What each step drives: the builder, its chain, the agent as both run
 /// it, and the VOS node each batch runs again on.
 struct Rig {
@@ -199,24 +189,21 @@ impl Milestone {
 
         let store = self.args.data.join("store");
         let _ = std::fs::remove_dir_all(&store);
-        let programs = self.actors.programs();
         let prepared =
             Arc::new(PreparedProgram::new(&self.agent).map_err(|error| format!("{error:?}"))?);
+        let runner = Runner::new(prepared, service, self.actors.programs().into_values());
         let mut rig = Rig {
             builder: Builder::new(
                 Store::open(&store).map_err(said)?,
                 parameters.max_refine_gas,
-            ),
+            )
+            .map_err(said)?,
             chain: Live {
                 node: self.node.clone(),
                 service,
             },
-            runner: Runner {
-                program: Arc::clone(&prepared),
-                service,
-                preimages: Arc::new(Programs(programs.clone())),
-            },
-            vos: Vos::new(prepared, service, programs),
+            runner: runner.clone(),
+            vos: Vos::new(runner),
         };
 
         // The programs the agent runs, solicited, then provided.
@@ -447,9 +434,16 @@ impl Milestone {
             "  work result {} bytes, read back from DA: the one simulated, and the VOS node's, byte for byte",
             encoded.len()
         ));
+        let simulations = match prepared.simulations {
+            1 => "1 simulation".to_string(),
+            count => format!("{count} simulations"),
+        };
         self.note(format!(
-            "  refine {} gas, measured on our JAM-only host (PolkaJam reports none); the builder gave {}, {} of it for the package's own work",
-            refined.gas_used, prepared.gas, prepared.own
+            "  refine {} gas, measured on our JAM-only host (PolkaJam reports none); the builder gave {}: the batch's budget {}, {} for the package's own work, after {simulations}",
+            refined.gas_used,
+            prepared.gas,
+            prepared.package.batch.budget,
+            prepared.own,
         ));
         Ok(Ran {
             result,

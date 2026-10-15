@@ -7,6 +7,7 @@
 //! PolkaJam answers `WHAT` for 1,000.
 
 use vos_tree::Entry;
+use vos_wire::abi::cap;
 use vos_wire::defaults;
 use vos_wire::package::{Package, SEGMENT, result_segments};
 
@@ -26,9 +27,128 @@ pub const ROW: u64 = 20_000;
 pub const FIXED: u64 = 3_000_000;
 
 /// The compressions hashing `len` bytes takes.
-fn compressions(len: usize) -> u64 {
-    len.max(1).div_ceil(128) as u64
+const fn compressions(len: usize) -> u64 {
+    if len == 0 {
+        return 1;
+    }
+    len.div_ceil(128) as u64
 }
+
+/// The compressions of a value's commitment: its tag, salt and value.
+const fn commitment(value: usize) -> u64 {
+    compressions(30 + value)
+}
+
+/// The compressions of a leaf: its tag, its key's length and the key, and
+/// its value's commitment.
+const fn leaf(key: usize) -> u64 {
+    compressions(15 + key + 32)
+}
+
+/// The compressions a row the apply writes takes beyond its value's
+/// commitment: its salt, its leaf, and the branch over it.
+const fn rewrite(key: usize) -> u64 {
+    compressions(13 + 32 + key) + leaf(key) + 1
+}
+
+/// What `len` bytes of a package's work result take: decoded, hashed with
+/// the rest, and exported.
+const fn result_bytes(len: usize) -> u64 {
+    defaults::DECODE_BYTE * len as u64
+        + COMPRESSION * compressions(len)
+        + (EXPORT + SEGMENT as u64) * result_segments(len) as u64
+}
+
+/// A branch a witness opens: hashed to verify the witness, and again once
+/// the apply has written the rows under it.
+const BRANCH: u64 = 2 * COMPRESSION;
+
+/// A row a witness opens with a value of `value` bytes under a key of
+/// `key` bytes, beside the branches over it: served, its value's
+/// commitment and its leaf hashed.
+const fn opened(key: usize, value: usize) -> u64 {
+    ROW + COMPRESSION * (commitment(value) + leaf(key))
+}
+
+/// A row the apply writes under a key of `key` bytes, its value of `value`
+/// bytes, or (`None`) its deletion, beside the branches over it.
+const fn written(key: usize, value: Option<usize>) -> u64 {
+    let committed = match value {
+        Some(value) => commitment(value),
+        None => 0,
+    };
+    WRITE + COMPRESSION * (rewrite(key) + committed)
+}
+
+/// A page row's key: its row's two bytes, its workflow and its index.
+const PAGE_KEY: usize = 2 + 8 + 4;
+/// A page row's value on JAM: the page's hash, stored.
+const PAGE_VALUE: usize = 1 + 32;
+/// A held page in its workflow's record: its index and its hash.
+const RECORD_PAGE: usize = 4 + 32;
+
+/// What each page a workflow holds adds to the own work of a package whose
+/// step restores it: its row opened, the branch over it (a workflow's page
+/// rows lie together in key order, under as many branches as rows but
+/// one), and its index and hash in the workflow's record, whose commitment
+/// they lengthen.
+pub const PAGE_READ: u64 =
+    opened(PAGE_KEY, PAGE_VALUE) + BRANCH + (COMPRESSION * RECORD_PAGE as u64).div_ceil(128);
+/// What each page a workflow holds adds to the own work of a package whose
+/// step drops it, ending the workflow: its row deleted, and its entry in
+/// the work result, a page's workflow, index and absent hash.
+pub const PAGE_DROP: u64 =
+    written(PAGE_KEY, None) + defaults::DECODE_BYTE * 13 + (COMPRESSION * 13).div_ceil(128);
+/// What each page a workflow holds adds to the payload of a package whose
+/// step restores it: its key and its opened row in the witness, its leaf
+/// and the branch over it in the proof, its import, and its index and hash
+/// in the workflow's record.
+pub const PAGE_PAYLOAD: usize =
+    (1 + PAGE_KEY) + (1 + 16 + 1 + PAGE_VALUE) + (2 + PAGE_KEY + 32) + 3 + 12 + RECORD_PAGE;
+
+/// The branches above each row a package's bounds allow: the depth of a
+/// tree of 2^64 rows balanced. The estimate counts a witness's branches as
+/// they are, so a deeper path lowers the budget past the bound.
+const PATH: u64 = 64;
+/// The most a workflow's record holds beside its pages: its fields, and its
+/// arguments, last input or result at their cap.
+const RECORD: usize = 1024 + cap::REQUEST;
+/// A workflow's record's key.
+const RECORD_KEY: usize = 2 + 8;
+/// The reply a workflow's end sends an agent that waits for it, in its
+/// outbox: the result at its cap, framed.
+const REPLY: usize = cap::REPLY + 40;
+/// An outbox row's key.
+const OUTBOX_KEY: usize = 2 + 4 + 8;
+/// The other rows an ending step reads and writes: its rows of the due
+/// index, from and to, the counts of live workflows and of its program's
+/// pins, the sequence of the pair it replies on, and the version. Keys of
+/// at most `SMALL_KEY` bytes, values of at most `SMALL_VALUE`.
+const SMALL_ROWS: u64 = 6;
+const SMALL_KEY: usize = 40;
+const SMALL_VALUE: usize = 16;
+
+/// What the step that ends a workflow adds to its package's own work
+/// beyond its pages' ([`PAGE_READ`], [`PAGE_DROP`]): the agent's start and
+/// finish; the workflow's record, opened at the most it holds and written
+/// ended with its result at its cap; the reply to an agent waiting for it;
+/// the other rows it moves; `PATH`, 64, branches over each of these rows and
+/// over the pages; and the work result, which holds the record and the
+/// reply.
+pub const ENDING: u64 = FIXED
+    + opened(RECORD_KEY, RECORD)
+    + written(RECORD_KEY, Some(RECORD))
+    + written(OUTBOX_KEY, Some(REPLY))
+    + SMALL_ROWS * (opened(SMALL_KEY, SMALL_VALUE) + written(SMALL_KEY, Some(SMALL_VALUE)))
+    + (SMALL_ROWS + 3) * PATH * BRANCH
+    + result_bytes(1024 + RECORD + REPLY);
+/// The same for its package's payload: the package's batch and framing, the
+/// record and the other rows opened, and the paths' entries, each branch
+/// and its closed sibling.
+pub const ENDING_PAYLOAD: usize = 1024
+    + (1 + RECORD_KEY + 1 + 16 + 4 + RECORD)
+    + SMALL_ROWS as usize * (2 * SMALL_KEY + SMALL_VALUE + 56)
+    + (SMALL_ROWS as usize + 3) * PATH as usize * (3 + 33);
 
 /// What hashing a pruned tree's entries takes: each opened leaf and each
 /// branch.
@@ -37,7 +157,7 @@ fn proof(entries: &[Entry]) -> u64 {
         .iter()
         .map(|entry| match entry {
             Entry::Branch(_) => 1,
-            Entry::Leaf { key, .. } => compressions(15 + key.len() + 32),
+            Entry::Leaf { key, .. } => leaf(key.len()),
             Entry::Hash(_) | Entry::Empty => 0,
         })
         .sum()
@@ -55,7 +175,7 @@ pub fn own(package: &Package, simulation: &Simulation) -> u64 {
     let mut hashes = proof(&witness.proof.entries);
     for (_, opened) in &witness.keys {
         if let vos_wire::package::Opened::Value { value, .. } = opened {
-            hashes += compressions(30 + value.len());
+            hashes += commitment(value.len());
         }
     }
     let mut rows = witness.keys.len() as u64;
@@ -65,7 +185,7 @@ pub fn own(package: &Package, simulation: &Simulation) -> u64 {
         hashes += range
             .rows
             .iter()
-            .map(|row| compressions(30 + row.value.len()))
+            .map(|row| commitment(row.value.len()))
             .sum::<u64>();
     }
     let branches = witness
@@ -76,20 +196,18 @@ pub fn own(package: &Package, simulation: &Simulation) -> u64 {
         .count() as u64;
     let mut writes = 0;
     for (key, value) in &simulation.writes {
-        hashes += compressions(13 + 32 + key.len()) + compressions(15 + key.len() + 32) + 1;
+        hashes += rewrite(key.len());
         if let Some(value) = value {
-            hashes += compressions(30 + value.len());
+            hashes += commitment(value.len());
         }
         writes += 1;
     }
-    hashes += branches + compressions(simulation.encoded.len());
-    let exports = (simulation.pages + result_segments(simulation.encoded.len())) as u64;
-    let copied = exports * SEGMENT as u64;
+    hashes += branches;
+    let exported = (simulation.pages * SEGMENT) as u64 + EXPORT * simulation.pages as u64;
     FIXED
-        + defaults::DECODE_BYTE * simulation.encoded.len() as u64
+        + result_bytes(simulation.encoded.len())
+        + exported
         + COMPRESSION * hashes
         + ROW * rows
         + WRITE * writes
-        + EXPORT * exports
-        + copied
 }

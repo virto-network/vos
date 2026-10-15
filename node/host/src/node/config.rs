@@ -122,6 +122,9 @@ pub struct Config {
     /// The longest a read of a workflow waits for it to end: at most
     /// [`vos_wire::ingress::MAX_WORKFLOW_WAIT_MS`].
     pub workflow_wait: Duration,
+    /// The most connections the ingress holds open at once: one past them
+    /// is closed as it is accepted.
+    pub ingress_connections: usize,
 }
 
 impl Config {
@@ -160,6 +163,7 @@ impl Config {
             snapshot_timeout_ms: 60_000,
             workflow_waits: 64,
             workflow_wait: Duration::from_millis(vos_wire::ingress::MAX_WORKFLOW_WAIT_MS),
+            ingress_connections: 1024,
         }
     }
 }
@@ -189,6 +193,7 @@ pub(crate) struct Settings {
     pub(crate) snapshot_timeout_ms: u64,
     pub(crate) workflow_waits: usize,
     pub(crate) workflow_wait: Duration,
+    pub(crate) ingress_connections: usize,
 }
 
 impl Settings {
@@ -220,6 +225,7 @@ impl Settings {
             workflow_wait: config.workflow_wait.min(Duration::from_millis(
                 vos_wire::ingress::MAX_WORKFLOW_WAIT_MS,
             )),
+            ingress_connections: config.ingress_connections,
         }
     }
 }

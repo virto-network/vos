@@ -9,13 +9,15 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use vos_jam::builder::POLKAJAM_REFINE_GAS;
 use vos_jam::{
-    Builder, Chain, Emulated, Error, Fate, Fault, Landed, Refined, Runner, Store, Taken,
+    Builder, Chain, Emulated, Error, Fate, Fault, Landed, Refined, Runner, Store, Taken, builder,
+    gas,
 };
 use vos_pvm::PvmBackend;
 use vos_testkit::programs::{actor, method};
 use vos_tree::{Blake2b, Hash, Hasher, empty_root};
-use vos_wire::abi::Rows;
+use vos_wire::abi::{Rows, cap};
 use vos_wire::batch::{Admin, Answer, Await, Body, Input, Message, Request, Work};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session, WorkflowId};
 use vos_wire::keys::{self, Transform};
@@ -32,9 +34,6 @@ use crate::common::{
 /// A batch time well past JAM's common era; the sessions start at it.
 const T0: u64 = 1_760_000_000_000;
 
-/// The refine gas of a work package on the PolkaJam testnet, `G_R`.
-const G_R: u64 = 1_000_000_000;
-
 /// The agent the shop's workflows ask.
 const RISK: AgentId = AgentId(9);
 
@@ -50,6 +49,11 @@ struct Ran {
     /// The keys its witness opens, and the rows of its scanned ranges.
     witnessed: usize,
     scanned: usize,
+    /// The batch's inputs, its budget, and the package's own work as the
+    /// builder estimated it.
+    inputs: usize,
+    budget: u64,
+    own: u64,
 }
 
 /// A VOS node, and beside it the agent's builder and its chain.
@@ -80,7 +84,7 @@ impl Paired {
         Self {
             vos,
             runner,
-            builder: Builder::new(Store::temporary().unwrap(), refine_gas),
+            builder: Builder::new(Store::temporary().unwrap(), refine_gas).unwrap(),
             chain: Emulated::default(),
             sequences: BTreeMap::new(),
             pairs: BTreeMap::new(),
@@ -142,6 +146,8 @@ impl Paired {
             .prepare(&self.runner, self.chain.segments(), inputs, time, seed, &[])
             .expect("a package");
         let work = Work::Batch(prepared.package.batch.clone());
+        let batch = &prepared.package.batch;
+        let (inputs, budget, own) = (batch.inputs.len(), batch.budget, prepared.own);
         assert_eq!(prepared.package.batch.version, self.vos.version);
         let on_vos = self.vos.refine(&work);
         self.vos.accumulate(&on_vos);
@@ -155,7 +161,7 @@ impl Paired {
         );
         assert_eq!(prepared.package.root, root);
         assert!(shows(&prepared.package), "the witness verifies");
-        assert!(prepared.gas <= self.builder.refine_gas);
+        assert!(prepared.gas <= self.builder.refine_gas());
         let imports = self
             .builder
             .imports(&prepared, self.chain.segments().as_ref())
@@ -226,6 +232,9 @@ impl Paired {
             exported: pages,
             witnessed: witness.keys.len(),
             scanned: witness.ranges.iter().map(|range| range.rows.len()).sum(),
+            inputs,
+            budget,
+            own,
         }
     }
 
@@ -311,7 +320,7 @@ fn with_shop(backend: PvmBackend, actors: &Actors) -> (Paired, Vec<u8>) {
     let (shop, lean) = (actor("shop"), actor("lean"));
     let mut all = programs(actors);
     all.extend([shop.as_slice(), lean.as_slice()]);
-    let mut paired = Paired::new(backend, &all, G_R);
+    let mut paired = Paired::new(backend, &all, POLKAJAM_REFINE_GAS);
     let mut first = installs(&mut paired, actors);
     first.push(Input::Admin(Admin::Install {
         instance: SHOP,
@@ -335,7 +344,7 @@ fn packages_agree_with_vos_on_stateful_batches() {
 
 fn stateful_batches(backend: PvmBackend) {
     let actors = Actors::load();
-    let mut paired = Paired::new(backend, &programs(&actors), G_R);
+    let mut paired = Paired::new(backend, &programs(&actors), POLKAJAM_REFINE_GAS);
     let method = |instance, name| actors.method(instance, name);
     let first = installs(&mut paired, &actors);
     ran_or_refused(&paired.batch(T0, first).result);
@@ -427,7 +436,7 @@ fn packages_agree_with_vos_on_scans_and_committed_maps() {
 
 fn scans_and_committed_maps(backend: PvmBackend) {
     let actors = Actors::load();
-    let mut paired = Paired::new(backend, &programs(&actors), G_R);
+    let mut paired = Paired::new(backend, &programs(&actors), POLKAJAM_REFINE_GAS);
     let method = |instance, name| actors.method(instance, name);
     let first = installs(&mut paired, &actors);
     paired.batch(T0, first);
@@ -643,7 +652,7 @@ fn requests(result: &WorkResult) -> Vec<Await> {
 #[test]
 fn a_witnessed_reads_gas_on_jam() {
     let actors = Actors::load();
-    let mut paired = Paired::new(PvmBackend::Default, &programs(&actors), G_R);
+    let mut paired = Paired::new(PvmBackend::Default, &programs(&actors), POLKAJAM_REFINE_GAS);
     let first = installs(&mut paired, &actors);
     paired.batch(T0, first);
     let ops = actors.method(COUNTER, "ops");
@@ -710,7 +719,9 @@ fn a_package_refines_and_accumulates_only_on_what_it_shows() {
     paired.batch(T0 + 1_000, vec![fill, compute]);
 
     let refines = |paired: &mut Paired, package: &Package, imports| {
-        paired.chain.refine(&paired.runner, package, imports, G_R)
+        paired
+            .chain
+            .refine(&paired.runner, package, imports, POLKAJAM_REFINE_GAS)
     };
     let prepare = |paired: &Paired, inputs: Vec<Input>, time: u64| {
         let segments = paired.chain.segments();
@@ -967,7 +978,7 @@ impl Driven {
         let (paired, shop) = with_shop(PvmBackend::Default, &actors);
         let mut driven = Self {
             runner: paired.runner,
-            builder: Builder::new(store, refine_gas),
+            builder: Builder::new(store, refine_gas).unwrap(),
             chain: Emulated::default(),
             actors,
             shop,
@@ -1038,7 +1049,7 @@ impl Driven {
 /// of gas, is made again at a new time, and lands.
 #[test]
 fn the_builder_makes_a_refused_package_again() {
-    let mut driven = Driven::new(Store::temporary().unwrap(), G_R);
+    let mut driven = Driven::new(Store::temporary().unwrap(), POLKAJAM_REFINE_GAS);
     let increment = driven.actors.method(COUNTER, "increment");
     driven.chain.faults = vec![Fault::Late, Fault::Starved];
     let request = driven.request(COUNTER, increment, 5u64);
@@ -1061,25 +1072,192 @@ fn the_builder_makes_a_refused_package_again() {
     assert!(attempts.iter().all(|attempt| attempt.fate == Fate::Refused));
 }
 
-/// A work package's refine gas too small for the batch's budget and the
-/// package's own work lowers the budget; too small for the agent's own
-/// work alone, the builder makes no package.
+/// A batch's budget is what a work package's refine gas leaves past the
+/// margin and the bound on its own work: a package whose own work passes
+/// the bound has it lowered, the refine fitting its gas all the same. A
+/// chain whose refine gas leaves a batch less than the least a VOS node
+/// refines with is refused, and a batch holds at most as many inputs as a
+/// VOS node's.
 #[test]
 fn the_builder_fits_its_budget_to_a_packages_gas() {
-    let mut driven = Driven::new(Store::temporary().unwrap(), G_R);
+    assert_eq!(builder::budget(POLKAJAM_REFINE_GAS), 900_000_000);
+    let below = Builder::new(Store::temporary().unwrap(), 7 * POLKAJAM_REFINE_GAS / 10);
+    let least = defaults::min_refine_gas(builder::MAX_INPUTS);
+    assert!(
+        matches!(below, Err(Error::RefineGas { least: refused, .. }) if refused == least),
+        "refused below {least}"
+    );
+    let mut driven = Driven::new(Store::temporary().unwrap(), POLKAJAM_REFINE_GAS);
+    let fill = driven.actors.method(COUNTER, "fill");
+    let fills = (0..2)
+        .map(|_| driven.request(COUNTER, fill, (300u32, 8u32)))
+        .collect();
+    let taken = driven.try_run(fills).expect("it lands");
+    let prepared = &taken.prepared;
+    let budget = prepared.package.batch.budget;
+    let start = prepared.gas - budget - prepared.own;
+    assert!(
+        prepared.own + start > builder::OWN_BOUND,
+        "{} of own work",
+        prepared.own
+    );
+    assert_eq!(
+        budget,
+        POLKAJAM_REFINE_GAS - POLKAJAM_REFINE_GAS / 1000 * builder::MARGIN - prepared.own - start
+    );
+    assert!(prepared.gas <= POLKAJAM_REFINE_GAS);
+    assert_eq!(
+        prepared.simulations, 2,
+        "simulated again at the lowered budget"
+    );
+    assert!(
+        taken
+            .result
+            .steps
+            .iter()
+            .all(|step| done::<u32>(step) == 300)
+    );
+    // A batch holds at most a VOS node's inputs; the later ones wait.
+    let ack = Input::Ack {
+        to: AgentId(5),
+        sequence: 1,
+    };
+    let acks = vec![ack; builder::MAX_INPUTS + 4];
+    let segments = driven.chain.segments();
+    let time = driven.time + 1_000;
+    let prepared = driven
+        .builder
+        .prepare(&driven.runner, segments, acks, time, [1; 32], &[])
+        .expect("a package");
+    assert_eq!(prepared.package.batch.inputs.len(), builder::MAX_INPUTS);
+}
+
+/// A workflow holding nearly as many pages as a snapshot may, at the
+/// largest limit a workflow may declare, runs to its end at the builder's
+/// budget, on JAM as on VOS: its last step restores every page and drops
+/// every page's row, and its package's own work stays within the bound the
+/// builder asserts for it. Requests beside that step, each putting a
+/// thousand rows, would leave the batch less than its keep: the batch
+/// loses them rather than its budget its floor, and they wait for later
+/// packages.
+#[test]
+fn a_workflow_at_its_page_cap_runs_to_its_end_at_the_builders_budget() {
+    let actors = Actors::load();
+    let (mut paired, shop) = with_shop(PvmBackend::Default, &actors);
+    // Two chunks of whole pages, each a few bytes short of whole pages,
+    // which with the workflow's stack and vectors leave it a few pages
+    // under the cap.
+    let first = cap::HELD_PAGES / 2;
+    let second = cap::HELD_PAGES - first - 12;
+    let sizes: Vec<u32> = [first, second]
+        .map(|pages| (pages * PAGE - 256) as u32)
+        .to_vec();
+    let total: u64 = sizes.iter().map(|&size| u64::from(size)).sum();
+    let start = paired.request(ALICE, SHOP, method(&shop, "fill"), (0u32, sizes));
+    let mut time = T0 + 1_000;
+    paired.batch(time, vec![start]);
+    assert_eq!(paired.record(0).gas, defaults::MAX_HANDLER_GAS);
+    // Its steps until it holds every chunk, asleep before its last.
+    let mut held = 0;
+    while held < cap::HELD_PAGES - 16 {
+        let state = paired.record(0).state;
+        assert!(
+            matches!(
+                state,
+                WorkflowState::Sleeping { .. } | WorkflowState::Preempted(_)
+            ),
+            "{state:?}"
+        );
+        time += 1_000;
+        let sweep = paired.vos.sweep(time);
+        ran_or_refused(&paired.batch(time, vec![sweep]).result);
+        held = paired
+            .record(0)
+            .snapshot
+            .map_or(0, |snapshot| snapshot.pages.len());
+    }
+    assert!(held <= cap::HELD_PAGES, "{held} pages held");
+    // Its last step, beside two requests putting a thousand rows each.
+    let ops = actors.method(COUNTER, "ops");
+    let requests: Vec<Input> = [0u32, 1_000]
+        .map(|start| {
+            let puts = vec![(3u8, start, 1_000u32)];
+            paired.request(ALICE, COUNTER, ops, (puts, COUNTER.0, 0u32))
+        })
+        .to_vec();
+    time += 1_000;
+    let sweep = paired.vos.sweep(time);
+    let ending = paired.batch(time, [vec![sweep], requests.clone()].concat());
+    ran_or_refused(&ending.result);
+    assert_eq!(ending.inputs, 1, "the requests wait");
+    assert!(ending.budget >= defaults::min_refine_gas(builder::MAX_INPUTS));
+    assert_eq!(
+        paired.record(0).state,
+        WorkflowState::Ended(Outcome::Done(total.encode()))
+    );
+    let held = held as u64;
+    let bound = gas::ENDING + held * (gas::PAGE_READ + gas::PAGE_DROP);
+    assert!(
+        ending.own <= bound,
+        "the ending's own work {} within {bound}",
+        ending.own
+    );
+    println!(
+        "JAM: a workflow's end, {held} pages restored and dropped: own work {}, its budget {}",
+        ending.own, ending.budget
+    );
+    // Later packages take the requests, as many each as keep the floor.
+    let mut waiting = requests;
+    while !waiting.is_empty() {
+        time += 1_000;
+        let next = paired.batch(time, waiting.clone());
+        assert!(next.inputs >= 1);
+        assert!(next.result.steps.iter().all(|step| done::<u64>(step) == 0));
+        waiting.drain(..next.inputs);
+    }
+}
+
+/// Every workflow whose pages DA no longer holds is left out of the sweep
+/// before the batch is simulated: however many there are, the package
+/// takes at most two simulations, and lands with the rest of the batch,
+/// the workflows due still.
+#[test]
+fn workflows_whose_pages_da_lacks_are_left_out_at_once() {
+    let mut driven = Driven::new(Store::temporary().unwrap(), POLKAJAM_REFINE_GAS);
+    let nap = method(&driven.shop, "nap");
+    let starts = (0..3).map(|_| driven.request(SHOP, nap, 500u64)).collect();
+    driven.run(starts);
+    let naps = [WorkflowId(0), WorkflowId(1), WorkflowId(2)];
+    let asleep = |driven: &Driven, id| {
+        let workflow = driven.builder.workflow(&ALICE, id).unwrap().unwrap();
+        assert!(!workflow.snapshot.unwrap().pages.is_empty(), "its pages");
+        matches!(workflow.state, WorkflowState::Sleeping { .. })
+    };
+    assert!(naps.iter().all(|&id| asleep(&driven, id)));
+    // DA forgets every segment exported so far.
+    driven.chain.da = vos_jam::Da::default();
+    let time = driven.time + 1_000;
+    let sweep = driven
+        .builder
+        .sweep(time)
+        .unwrap()
+        .expect("the naps are due");
     let increment = driven.actors.method(COUNTER, "increment");
-    let refine_gas = 18_000_000;
-    driven.builder.refine_gas = refine_gas;
-    let request = driven.request(COUNTER, increment, 2u64);
-    let taken = driven.try_run(vec![request]).expect("it lands");
-    let usable = refine_gas - refine_gas / 1000 * 50;
-    let budget = taken.prepared.package.batch.budget;
-    assert!(budget < usable / 5 * 4, "the budget lowered to {budget}");
-    assert!(taken.prepared.gas <= usable);
-    assert_eq!(done::<u64>(&taken.result.steps[0]), 2);
-    driven.builder.refine_gas = 3_000_000;
-    let request = driven.request(COUNTER, increment, 2u64);
-    assert!(matches!(driven.try_run(vec![request]), Err(Error::Unfit)));
+    let request = driven.request(COUNTER, increment, 4u64);
+    let taken = driven.try_run(vec![sweep, request]).expect("it lands");
+    assert_eq!(taken.prepared.skipped, naps);
+    assert!(
+        taken.prepared.simulations <= 2,
+        "{} simulations",
+        taken.prepared.simulations
+    );
+    assert_eq!(
+        taken.prepared.package.batch.inputs.len(),
+        1,
+        "the sweep left out"
+    );
+    assert_eq!(done::<u64>(&taken.result.steps[0]), 4);
+    assert!(naps.iter().all(|&id| asleep(&driven, id)), "still due");
 }
 
 /// A package another builder's landed before: the builder takes that one
@@ -1087,8 +1265,8 @@ fn the_builder_fits_its_budget_to_a_packages_gas() {
 /// reached from the store stops the builder, its store left as it was.
 #[test]
 fn the_builder_takes_a_package_that_landed_first() {
-    let mut first = Driven::new(Store::temporary().unwrap(), G_R);
-    let mut second = Builder::new(Store::temporary().unwrap(), G_R);
+    let mut first = Driven::new(Store::temporary().unwrap(), POLKAJAM_REFINE_GAS);
+    let mut second = Builder::new(Store::temporary().unwrap(), POLKAJAM_REFINE_GAS).unwrap();
     let landed = first.chain.landed().unwrap();
     second
         .resync(&first.chain, &landed)
@@ -1189,7 +1367,7 @@ fn the_builders_store_outlives_it() {
         Scratch(std::env::temp_dir().join(format!("vos-jam-outlives-{}", std::process::id())));
     let path = &scratch.0;
     let _ = std::fs::remove_dir_all(path);
-    let mut driven = Driven::new(Store::open(path).unwrap(), G_R);
+    let mut driven = Driven::new(Store::open(path).unwrap(), POLKAJAM_REFINE_GAS);
     let nap = method(&driven.shop, "nap");
     let start = driven.request(SHOP, nap, 500u64);
     driven.run(vec![start]);
@@ -1199,8 +1377,8 @@ fn the_builders_store_outlives_it() {
     // The builder gone, its store reopened: the old one is dropped first,
     // which releases its lock on the directory, a temporary store standing
     // in meanwhile.
-    driven.builder = Builder::new(Store::temporary().unwrap(), G_R);
-    driven.builder = Builder::new(Store::open(path).unwrap(), G_R);
+    driven.builder = Builder::new(Store::temporary().unwrap(), POLKAJAM_REFINE_GAS).unwrap();
+    driven.builder = Builder::new(Store::open(path).unwrap(), POLKAJAM_REFINE_GAS).unwrap();
     assert_eq!(driven.builder.store.root().unwrap(), root);
     let time = driven.time + 1_000;
     let sweep = driven.builder.sweep(time).unwrap().expect("the nap is due");
@@ -1251,7 +1429,7 @@ impl Drop for Scratch {
 /// upgrade.
 #[test]
 fn a_workflow_resumes_on_its_program_through_an_upgrade_on_jam() {
-    let mut driven = Driven::new(Store::temporary().unwrap(), G_R);
+    let mut driven = Driven::new(Store::temporary().unwrap(), POLKAJAM_REFINE_GAS);
     let hash = vos_testkit::program_hash;
     let (shop, lean) = (hash(&driven.shop), hash(&actor("lean")));
     let nap = method(&driven.shop, "nap");

@@ -38,7 +38,11 @@
 //!   again, so gas used says nothing there;
 //! - out of gas, by a call served or a page paid, or else by its registers
 //!   and its counter: the gas after an out-of-gas exit is the host's own,
-//!   so the share counts as spent and is never read.
+//!   so the share counts as spent and is never read. A page paid is any
+//!   the step's meter took, the machine's first store to it or the agent's
+//!   write serving a call: a loop that writes only memory may start each
+//!   block with the very registers it resumed with, and it moves all the
+//!   same.
 
 use super::*;
 
@@ -54,8 +58,8 @@ pub(in crate::refine) struct Share {
     allotted: u64,
     /// The running unit has made an effect.
     effectful: bool,
-    /// The machine has served a call or written a page since it resumed.
-    moved: bool,
+    /// The machine has served a call since it resumed.
+    served: bool,
 }
 
 impl Share {
@@ -65,7 +69,7 @@ impl Share {
             limit,
             allotted: limit,
             effectful: false,
-            moved: false,
+            served: false,
         }
     }
 
@@ -121,9 +125,8 @@ impl Invocation<'_> {
             let exit = match next.take() {
                 Some(exit) => exit,
                 None => {
-                    let (meter, paid, moved) =
-                        (&self.base.meter, &mut self.pages_paid, &mut share.moved);
-                    machine.invoke_paying(&mut || pay_page(meter, paid, moved))
+                    let (meter, paid) = (&self.base.meter, &mut self.pages_paid);
+                    machine.invoke_paying(&mut || pay_page(meter, paid))
                 }
             };
             match exit {
@@ -132,12 +135,12 @@ impl Invocation<'_> {
                 Exit::Panic => return Err(Failure::Trapped),
                 Exit::OutOfGas => {
                     machine.set_gas(0);
-                    let idle = !share.moved;
+                    let idle = !self.moved(share);
                     return self.preempt_or_fail(share, true, None, idle);
                 }
                 // A first store the meter could not pay.
                 Exit::Fault(address) if machine.unwritten(address) => {
-                    return self.preempt_or_fail(share, share.moved, None, false);
+                    return self.preempt_or_fail(share, self.moved(share), None, false);
                 }
                 Exit::Fault(_) => return Err(Failure::Trapped),
                 Exit::Host(id) => {
@@ -201,7 +204,7 @@ impl Invocation<'_> {
         // What the call's output was kept for, its pages take next.
         self.base.meter.kept.set(self.base.meter.kept.get() - pages);
         match served {
-            Ok(()) => share.moved = true,
+            Ok(()) => share.served = true,
             // Effect-free, a call the machine's share cannot pay waits
             // unserved, having changed nothing.
             Err(Failure::OutOfGas) if !share.effectful => {
@@ -227,6 +230,12 @@ impl Invocation<'_> {
             self.base.meter.kept.set(share.floor + share.limit);
         }
         Ok(())
+    }
+
+    /// Whether the machine has moved since it resumed, by what it did
+    /// rather than where it stands: a call served, or a page paid.
+    fn moved(&self, share: &Share) -> bool {
+        share.served || self.pages_paid > 0
     }
 
     /// The step's end between two awaits, before the call `pending` when
@@ -285,11 +294,10 @@ fn serves(section: bool, id: u64) -> bool {
 }
 
 /// Pay a page the machine first stores to, before it is opened.
-fn pay_page(meter: &Meter, paid: &mut usize, moved: &mut bool) -> bool {
+fn pay_page(meter: &Meter, paid: &mut usize) -> bool {
     let taken = meter.take(defaults::WRITTEN_PAGE);
     if taken {
         *paid += 1;
-        *moved = true;
     }
     taken
 }

@@ -71,6 +71,24 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().expect("unpoisoned")
 }
 
+/// 32 bytes from 64 hex digits, `None` for anything else. The text may
+/// come off the wire, so it is sliced only where it has those bytes, and
+/// each pair must be two hex digits, which a sign is not.
+pub(crate) fn hex32(text: &str) -> Option<[u8; 32]> {
+    if text.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (at, byte) in out.iter_mut().enumerate() {
+        let pair = text.get(2 * at..2 * at + 2)?;
+        if !pair.bytes().all(|digit| digit.is_ascii_hexdigit()) {
+            return None;
+        }
+        *byte = u8::from_str_radix(pair, 16).ok()?;
+    }
+    Some(out)
+}
+
 /// 32 random bytes, from the operating system's randomness.
 pub(crate) fn seed() -> [u8; 32] {
     let mut seed = [0u8; 32];

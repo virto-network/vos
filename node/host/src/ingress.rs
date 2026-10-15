@@ -104,18 +104,6 @@ fn decode<T: Decode>(body: &[u8]) -> Result<T, Answer> {
     }
 }
 
-fn parse_hex(text: &[u8]) -> Option<[u8; 32]> {
-    let text = std::str::from_utf8(text).ok()?.trim();
-    if text.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (index, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&text[2 * index..2 * index + 2], 16).ok()?;
-    }
-    Some(out)
-}
-
 impl Ingress {
     pub(crate) fn new(inner: Arc<Inner>, token: [u8; 32]) -> Self {
         Self {
@@ -145,7 +133,7 @@ impl Ingress {
             body: cap::REQUEST + ENVELOPE,
             install: MAX_INSTALL,
             idle: Duration::from_secs(30),
-            connections: 1024,
+            connections: this.inner.settings.ingress_connections,
         };
         let stopped = async {
             let _ = stop.recv().await;
@@ -279,7 +267,8 @@ impl Ingress {
         request
             .header("authorization")
             .and_then(|value| value.strip_prefix(b"Bearer "))
-            .and_then(parse_hex)
+            .and_then(|token| std::str::from_utf8(token).ok())
+            .and_then(|token| crate::hex32(token.trim()))
             .is_some_and(|token| bool::from(token.ct_eq(&self.token)))
     }
 

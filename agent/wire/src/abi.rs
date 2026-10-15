@@ -405,15 +405,19 @@ pub mod cap {
     /// writes satisfy `restored × RESTORED_PAGE + written × WRITTEN_PAGE +
     /// limit + reserves ≤ budget`: in a refine of the default budget
     /// (`REFINE_GAS`), a step that restores no page writes about 800, and
-    /// one that restores [`HELD_PAGES`] about 140. Effect-free code that
+    /// one that restores [`HELD_PAGES`] about 310. Effect-free code that
     /// would pass it ends the step at the first page it cannot pay; once a
     /// unit has made an effect, the step waits for the next batch behind a
     /// step that ran a handler, or fails alone, out of gas.
     pub const STEP_PAGES: usize = 8 << 20;
-    /// The pages a workflow's snapshot may hold, 3 MiB: a step that would
-    /// leave it more fails, so the least budget a node refines with
-    /// ([`crate::defaults::min_refine_gas`]) restores any snapshot.
-    pub const HELD_PAGES: usize = 768;
+    /// The pages a workflow's snapshot may hold, 2.25 MiB: a step that
+    /// would leave it more fails, so the least budget a node refines with
+    /// ([`crate::defaults::min_refine_gas`]) restores any snapshot. On JAM,
+    /// the step that ends a workflow holding them all, at the largest
+    /// limit, restores every page and drops every page's row, and a
+    /// package of that step alone, bar its own effects, fits a work
+    /// package's refine gas: an agent's builder asserts it.
+    pub const HELD_PAGES: usize = 576;
     /// The raw bytes of the pages one work result's page section may hold:
     /// a step that would pass it waits for the next batch.
     pub const RESULT_PAGES: usize = 16 << 20;

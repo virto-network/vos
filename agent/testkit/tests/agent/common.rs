@@ -5,11 +5,12 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-use vos_pvm::accumulate_host::{AccumulateContext, ServiceStorage};
+use vos_pvm::accumulate_host::AccumulateContext;
+use vos_pvm::inner::gp_call::HISTORICAL_LOOKUP;
 use vos_pvm::pool::{CodeHash, MachinePool};
 use vos_pvm::refine::{Invocation, Machine, MemoryModel, PreparedProgram};
 use vos_pvm::refine_host::{
-    JamItem, JamRefine, Preimages, ProgramSource, RefineContext, StateReader,
+    JamItem, JamRefine, Preimages, ProgramSource, RefineContext, serve_lookup,
 };
 use vos_pvm::{ExitReason, PvmBackend};
 use vos_testkit::programs::{actor, agent, bare, derivation, derived, kernel, method, package};
@@ -35,28 +36,6 @@ pub const BOB: Principal = Principal::Client([2; 32]);
 pub const MINTER: u8 = 1;
 pub const OUTER_GAS: u64 = 4_000_000_000;
 
-struct Snapshot(BTreeMap<Vec<u8>, Vec<u8>>);
-
-impl StateReader for Snapshot {
-    fn read(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.0.get(key).cloned()
-    }
-
-    fn rows<'a>(
-        &'a self,
-        prefix: &'a [u8],
-        after: Option<&'a [u8]>,
-    ) -> Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + 'a> {
-        Box::new(
-            self.0
-                .range(prefix.to_vec()..)
-                .take_while(move |(key, _)| key.starts_with(prefix))
-                .filter(move |(key, _)| after.is_none_or(|after| key.as_slice() > after))
-                .map(|(key, value)| (key.clone(), value.clone())),
-        )
-    }
-}
-
 /// A VOS node's program source: the node's programs in the agent's scope.
 struct Scoped {
     programs: Arc<HashMap<[u8; 32], Vec<u8>>>,
@@ -73,22 +52,6 @@ impl ProgramSource for Scoped {
             .get(&hash.0)
             .filter(|_| self.owns(hash))
             .cloned()
-    }
-}
-
-struct Storage<'a>(&'a mut BTreeMap<Vec<u8>, Vec<u8>>);
-
-impl ServiceStorage for Storage<'_> {
-    fn read(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.0.get(key).cloned()
-    }
-
-    fn write(&mut self, key: &[u8], value: Option<&[u8]>) -> Option<usize> {
-        let previous = match value {
-            Some(value) => self.0.insert(key.to_vec(), value.to_vec()),
-            None => self.0.remove(key),
-        };
-        previous.map(|value| value.len())
     }
 }
 
@@ -113,45 +76,28 @@ impl Preimages for Scope {
 }
 
 /// `historical_lookup` from the node's programs, those in `scope` when it is
-/// given, in the agent's own preimages alone, as a node scopes them; and
-/// the agent's report of lost state, which stops the refine. Every other
-/// call the host does not serve answers `WHAT`.
+/// given, as a node serves it ([`serve_lookup`]); and the agent's report of
+/// lost state, which stops the refine. Every other call the host does not
+/// serve answers `WHAT`.
 fn serve(
     id: u64,
     machine: &mut Machine,
     programs: &HashMap<[u8; 32], Vec<u8>>,
     scope: Option<&BTreeSet<[u8; 32]>>,
 ) -> Result<(), ExitReason> {
-    let registers = *machine.registers();
-    if id == LOST {
-        return Err(ExitReason::HostCall(LOST));
-    }
-    if id != 7 {
-        machine.registers_mut()[7] = code::WHAT;
-        return Ok(());
-    }
-    let mut hash = [0u8; 32];
-    assert!(
-        machine
-            .memory()
-            .read_bytes_checked(registers[8] as u32, &mut hash)
-    );
-    let own = registers[7] == u64::MAX || registers[7] == u64::from(AGENT.0);
-    let scoped = own && scope.is_none_or(|scope| scope.contains(&hash));
-    match programs.get(&hash).filter(|_| scoped) {
-        Some(blob) => {
-            let offset = (registers[10] as usize).min(blob.len());
-            let len = (registers[11] as usize).min(blob.len() - offset);
-            assert!(
-                machine
-                    .memory_mut()
-                    .write_bytes_checked(registers[9] as u32, &blob[offset..offset + len])
-            );
-            machine.registers_mut()[7] = blob.len() as u64;
+    match id {
+        LOST => Err(ExitReason::HostCall(LOST)),
+        id if id == u64::from(HISTORICAL_LOOKUP) => {
+            serve_lookup(machine, u64::from(AGENT.0), |hash| {
+                let scoped = scope.is_none_or(|scope| scope.contains(hash));
+                programs.get(hash).filter(|_| scoped)
+            })
         }
-        None => machine.registers_mut()[7] = code::NONE,
+        _ => {
+            machine.registers_mut()[7] = code::WHAT;
+            Ok(())
+        }
     }
-    Ok(())
 }
 
 /// A node's view of one agent: its program, the pool, programs by hash and
@@ -329,14 +275,7 @@ impl Node {
 
     /// The refine's arguments for `work`, as the node passes them.
     pub fn arguments(&self, work: &Work) -> Vec<u8> {
-        RefineArgs {
-            core: 0,
-            item: 0,
-            service: u64::from(AGENT.0),
-            payload: work.encode(),
-            package_hash: [0; 32],
-        }
-        .encode()
+        RefineArgs::new(u64::from(AGENT.0), work.encode(), [0; 32]).encode()
     }
 
     /// Refine `work` with `gas` and, as a node gives it, what decoding a
@@ -362,7 +301,7 @@ impl Node {
                 }));
         }
         if self.serves_state {
-            context = context.with_state(Arc::new(Snapshot(self.state.clone())));
+            context = context.with_state(Arc::new(self.state.clone()));
         }
         if self.jam {
             let jam = self.jam_refine(work.encode(), Some(scope));
@@ -444,24 +383,14 @@ impl Node {
     }
 
     pub fn accumulate(&mut self, result: &[u8]) {
-        let input = AccumulateInput::Operand(Operand {
-            package_hash: [0; 32],
-            segment_root: [0; 32],
-            authorizer: [0; 32],
-            payload_hash: [0; 32],
-            gas_limit: 0,
-            result: Ok(result.to_vec()),
-            auth_trace: Vec::new(),
-        })
-        .encode();
-        let inputs = [input];
+        let inputs = [AccumulateInput::Operand(Operand::new(result.to_vec())).encode()];
         let invocation = AccumulateContext::load(
             &self.program,
             0,
             u64::from(AGENT.0),
             &inputs,
             OUTER_GAS,
-            &mut Storage(&mut self.state),
+            &mut self.state,
         )
         .unwrap()
         .try_run()

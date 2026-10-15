@@ -1349,11 +1349,11 @@ fn restored_and_written_pages_share_the_budget() {
         let mut flows = Flows::at_default_budget(Node::on(backend));
         let install = flows.install("big");
         flows.batch(1, vec![install]);
-        let start = flows.start("fill", (0u32, vec![700 * 4096u32, 300 * 4096]));
+        let start = flows.start("fill", (0u32, vec![500 * 4096u32, 450 * 4096]));
         let result = flows.unmodelled(1, vec![start]);
         assert_eq!(due(&result, 0).outcome, Outcome::Done(vec![]));
         let held = flows.record(0).snapshot.unwrap().pages.len();
-        assert!((700..=cap::HELD_PAGES).contains(&held), "{held} held");
+        assert!((500..=cap::HELD_PAGES).contains(&held), "{held} held");
         let sweep = flows.sweeping(1);
         let result = flows.unmodelled(1, vec![sweep]);
         let cap = Outcome::Failed {
@@ -1371,8 +1371,8 @@ fn a_result_holds_at_most_its_pages() {
     for backend in Node::backends() {
         let mut flows = Flows::new(Node::on(backend));
         flows.budget = 8_000_000_000;
-        let fill = |flows: &mut Flows| flows.start("fill", (0u32, vec![640 * 4096u32]));
-        let inputs = (0..7).map(|_| fill(&mut flows)).collect();
+        let fill = |flows: &mut Flows| flows.start("fill", (0u32, vec![560 * 4096u32]));
+        let inputs = (0..8).map(|_| fill(&mut flows)).collect();
         let result = flows.unmodelled(1, inputs);
         let stepped = |result: &WorkResult| {
             result
@@ -1389,13 +1389,13 @@ fn a_result_holds_at_most_its_pages() {
                 })
                 .count()
         };
-        assert_eq!(stepped(&result), 6, "a seventh's pages would pass the cap");
-        assert!(matches!(flows.record(6).state, WorkflowState::Ready(_)));
+        assert_eq!(stepped(&result), 7, "an eighth's pages would pass the cap");
+        assert!(matches!(flows.record(7).state, WorkflowState::Ready(_)));
         let sweep = flows.sweeping(0);
         let result = flows.unmodelled(0, vec![sweep]);
         assert_eq!(stepped(&result), 1);
         assert!(matches!(
-            flows.record(6).state,
+            flows.record(7).state,
             WorkflowState::Sleeping { .. }
         ));
     }

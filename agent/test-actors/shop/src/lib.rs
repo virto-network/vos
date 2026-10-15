@@ -71,6 +71,41 @@ static IMAGE: Page = Page(UnsafeCell::new([7; 4096]));
 /// A page `digest` keeps its hash state in, which only the agent writes,
 /// serving the compression.
 static STATE: Page = Page(UnsafeCell::new([0; 4096]));
+/// The page `tally` counts in.
+static TALLY: Page = Page(UnsafeCell::new([0; 4096]));
+
+/// Count to `until` at `count`, in memory alone: each pass loads the count,
+/// stores it one higher, and loops while it is below `until`, so every pass
+/// starts with the registers the last one did.
+///
+/// # Safety
+///
+/// `count` is valid for reads and writes, and nothing else holds it.
+unsafe fn count_to(count: *mut u64, until: u64) {
+    #[cfg(target_arch = "riscv64")]
+    // SAFETY: the caller's; the loop touches `count` alone.
+    unsafe {
+        core::arch::asm!(
+            "2:",
+            "ld {t}, 0({count})",
+            "addi {t}, {t}, 1",
+            "sd {t}, 0({count})",
+            "sltu {t}, {t}, {until}",
+            "bnez {t}, 2b",
+            count = in(reg) count,
+            until = in(reg) until,
+            t = out(reg) _,
+            options(nostack),
+        );
+    }
+    #[cfg(not(target_arch = "riscv64"))]
+    // SAFETY: the caller's.
+    unsafe {
+        while count.read_volatile() < until {
+            count.write_volatile(count.read_volatile() + 1);
+        }
+    }
+}
 
 #[messages]
 impl Shop {
@@ -389,6 +424,22 @@ impl Shop {
             vos_pvm_precompiles::blake2b_compress(h, &block, counter, round + 1 == rounds);
         }
         h[..32].to_vec()
+    }
+
+    /// Count to `until` in memory, from where the count stands: a
+    /// computation the step's share preempts at the same block, with the
+    /// same registers, step after step, which moves only by the page it
+    /// writes. The count.
+    #[workflow(gas = 1_000_000)]
+    pub async fn tally(ctx: &mut Workflow<Self>, until: u64) -> u64 {
+        let _ = ctx;
+        let count = TALLY.0.get().cast::<u64>();
+        // SAFETY: a workflow runs on one thread, and nothing else holds the
+        // page, whose start is aligned for a word.
+        unsafe {
+            count_to(count, until);
+            count.read_volatile()
+        }
     }
 
     /// Nothing, with a limit no block of a program fits: a step that

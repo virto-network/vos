@@ -124,6 +124,8 @@ impl Floor {
     /// head's fixes it.
     fn of(&mut self, left: u64, keep: u64) -> u64 {
         if let Floor::Head = self {
+            // A head that does not fit leaves `At(0)`: it waits, and the
+            // sweep's later rows with it, so no step reads that floor.
             *self = Floor::At(left.saturating_sub(keep) / 2);
         }
         self.now()

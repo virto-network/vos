@@ -282,23 +282,26 @@ impl<'a, S: ServiceStorage> AccumulateContext<'a, S> {
     }
 }
 
+/// Storage held in memory, by key, as a VOS node keeps it: a value
+/// written is kept as it is, an empty one too.
+impl ServiceStorage for alloc::collections::BTreeMap<Vec<u8>, Vec<u8>> {
+    fn read(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.get(key).cloned()
+    }
+
+    fn write(&mut self, key: &[u8], value: Option<&[u8]>) -> Option<usize> {
+        let previous = match value {
+            Some(value) => self.insert(key.to_vec(), value.to_vec()),
+            None => self.remove(key),
+        };
+        previous.map(|value| value.len())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloc::collections::BTreeMap;
-
-    impl ServiceStorage for BTreeMap<Vec<u8>, Vec<u8>> {
-        fn read(&self, key: &[u8]) -> Option<Vec<u8>> {
-            self.get(key).cloned()
-        }
-        fn write(&mut self, key: &[u8], value: Option<&[u8]>) -> Option<usize> {
-            let previous = match value {
-                Some(value) => self.insert(key.to_vec(), value.to_vec()),
-                None => self.remove(key),
-            };
-            previous.map(|value| value.len())
-        }
-    }
 
     /// A standard program whose refine entry traps and whose accumulate
     /// entry writes "abc" = "hello", fetches input 0 into 0x2_0010, makes

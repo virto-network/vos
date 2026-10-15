@@ -6,7 +6,7 @@
 //! traps, so a package whose witness covers them refines to the same work
 //! result.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use vos_pvm::ExitReason;
@@ -33,7 +33,39 @@ pub struct Runner {
     pub preimages: Arc<dyn Preimages>,
 }
 
+/// A service's own preimages, by their hashes: a lookup naming another
+/// service finds none.
+struct Own {
+    service: u64,
+    programs: BTreeMap<[u8; 32], Vec<u8>>,
+}
+
+impl Preimages for Own {
+    fn preimage(&self, service: u64, hash: &[u8; 32]) -> Option<Vec<u8>> {
+        (service == self.service)
+            .then(|| self.programs.get(hash).cloned())
+            .flatten()
+    }
+}
+
 impl Runner {
+    /// `program` as service `service`'s, its preimages `programs`.
+    pub fn new(
+        program: Arc<PreparedProgram>,
+        service: u64,
+        programs: impl IntoIterator<Item = Vec<u8>>,
+    ) -> Self {
+        let programs = programs
+            .into_iter()
+            .map(|program| (digest(&program), program))
+            .collect();
+        Self {
+            program,
+            service,
+            preimages: Arc::new(Own { service, programs }),
+        }
+    }
+
     /// What a JAM node gives a refine of `payload`, which imports
     /// `imports`.
     pub fn jam(&self, payload: Vec<u8>, imports: Vec<Vec<u8>>) -> JamRefine {
@@ -47,14 +79,7 @@ impl Runner {
 
     /// Refine arguments for `payload`, as a JAM node passes them.
     pub fn arguments(&self, payload: &[u8], package_hash: [u8; 32]) -> Vec<u8> {
-        RefineArgs {
-            core: 0,
-            item: 0,
-            service: self.service,
-            payload: payload.to_vec(),
-            package_hash,
-        }
-        .encode()
+        RefineArgs::new(self.service, payload.to_vec(), package_hash).encode()
     }
 }
 

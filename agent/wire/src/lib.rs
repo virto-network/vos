@@ -205,7 +205,7 @@ pub mod defaults {
     //   again in every step that writes it.
     // Effect-free code ends the step at the first page the meter cannot
     // pay, once its machine has moved: a step writes what the budget left
-    // past its restore pays for, some 140 pages in a default batch when it
+    // past its restore pays for, some 310 pages in a default batch when it
     // restores `cap::HELD_PAGES`, and a computation larger than a step
     // moves on, a step a batch.
 

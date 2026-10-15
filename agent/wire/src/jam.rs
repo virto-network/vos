@@ -18,6 +18,19 @@ pub struct RefineArgs {
 }
 
 impl RefineArgs {
+    /// The arguments of `service`'s refine of `payload`, in the package
+    /// whose hash is `package_hash`, as its only work item, on core 0: as
+    /// a VOS node and an agent's builder pass them.
+    pub fn new(service: u64, payload: Vec<u8>, package_hash: [u8; 32]) -> Self {
+        Self {
+            core: 0,
+            item: 0,
+            service,
+            payload,
+            package_hash,
+        }
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
         encode_nat(self.core, &mut bytes);
@@ -112,6 +125,21 @@ pub struct Operand {
 }
 
 impl Operand {
+    /// Refine's `output` as accumulate takes it, every other field zero or
+    /// empty: a VOS node names no package, segments, authorizer or payload,
+    /// and sets the gas limit itself where it gives one.
+    pub fn new(output: Vec<u8>) -> Self {
+        Self {
+            package_hash: [0; 32],
+            segment_root: [0; 32],
+            authorizer: [0; 32],
+            payload_hash: [0; 32],
+            gas_limit: 0,
+            result: Ok(output),
+            auth_trace: Vec::new(),
+        }
+    }
+
     fn encode_to(&self, bytes: &mut Vec<u8>) {
         for hash in [
             &self.package_hash,

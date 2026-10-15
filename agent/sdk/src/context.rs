@@ -282,6 +282,13 @@ fn millis(within: Option<Duration>) -> u64 {
 /// (a section, a call, a send, a request, a wait or the result) to its next
 /// await, the code has the workflow's whole gas limit, and never pauses.
 ///
+/// **Memory:** a workflow runs in its actor's program, on the heap the
+/// actor configures. The pages it has written that differ from the
+/// program's image are its snapshot, which every step restores: at most
+/// [`crate::abi::cap::HELD_PAGES`] pages, 2.25 MiB, and a step that would
+/// leave it more fails the workflow. Each page held costs every step its
+/// restore, so a workflow keeps what it carries across pauses small.
+///
 /// **Sections** ([`Workflow::read`], [`Workflow::update`]) reach the state
 /// of the instance the workflow runs for, its tables included, as the
 /// instance itself. A section is synchronous: its closure can neither await

@@ -151,11 +151,7 @@ impl Emulated {
         let input = AccumulateInput::Operand(Operand {
             package_hash: refined.package_hash,
             segment_root: refined.segment_root,
-            authorizer: [0; 32],
-            payload_hash: [0; 32],
-            gas_limit: 0,
-            result: Ok(refined.bytes.clone()),
-            auth_trace: Vec::new(),
+            ..Operand::new(refined.bytes.clone())
         })
         .encode();
         let inputs = [input];

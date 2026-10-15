@@ -478,8 +478,11 @@ impl Testkit {
         let (state, pending) = match ended {
             Ended::Paused(state) => (state, None),
             Ended::Preempted { pending, idle } => {
-                // Out of gas with nothing served or written, its registers
-                // and counter where they were: it could not move.
+                // Out of gas with no call served and no page written since
+                // it resumed, its registers and counter where they were: it
+                // could not move. A page written is a move whatever the
+                // registers say, as a loop that writes only memory may
+                // start each block with the registers it resumed with.
                 if idle
                     && written.is_empty()
                     && machine.registers()[..] == resumed[..]

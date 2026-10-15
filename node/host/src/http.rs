@@ -99,15 +99,14 @@ async fn accept(
         // acknowledges what went before it.
         let _ = stream.set_nodelay(true);
         connections.retain(|connection| !connection.is_finished());
-        if open.fetch_add(1, Ordering::SeqCst) >= limits.connections {
-            open.fetch_sub(1, Ordering::SeqCst);
+        let Some(slot) = Slot::take(&open, limits.connections) else {
             continue;
-        }
+        };
         let handler = Arc::clone(&handler);
         let limits = limits.clone();
-        let open = Arc::clone(&open);
         let acceptor = acceptor.clone();
         connections.push(spawn(Box::pin(async move {
+            let _slot = slot;
             let served = match acceptor {
                 Some(acceptor) => match timeout(HANDSHAKE, acceptor.accept(stream)).await {
                     Some(Ok(stream)) => connection(stream, handler, &limits).await,
@@ -122,8 +121,28 @@ async fn accept(
             if let Err(error) = served {
                 tracing::debug!("an ingress connection ended: {error}");
             }
-            open.fetch_sub(1, Ordering::SeqCst);
         })));
+    }
+}
+
+/// A connection's place among the open ones, given back when its task
+/// ends, however it ends: a handler's panic, or a cancel, too.
+struct Slot(Arc<AtomicUsize>);
+
+impl Slot {
+    /// A place among `open`, if fewer than `most` hold one.
+    fn take(open: &Arc<AtomicUsize>, most: usize) -> Option<Self> {
+        open.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
+            (held < most).then_some(held + 1)
+        })
+        .ok()
+        .map(|_| Slot(Arc::clone(open)))
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
