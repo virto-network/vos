@@ -6,11 +6,15 @@ use std::ops::Deref;
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::{Signer, SigningKey};
+use vos_node::client::Client;
 use vos_node::{CallError, Node, Reply};
 use vos_wire::ids::{AgentId, InstanceId, MethodId};
 use vos_wire::ingress::{Consistency, QueryCall, Response, query_message};
 use vos_wire::result::Outcome;
 use vos_wire::{Decode, Encode};
+
+use crate::processes::PROCESS_WAIT;
+use crate::wait_until;
 
 /// A call's answer, which carries the counter's total once the call ran
 /// to completion: a node's reply, or its ingress's answer.
@@ -103,4 +107,56 @@ pub fn signed_query(
         signature: key.sign(&message).to_bytes(),
     }
     .encode()
+}
+
+/// The method `name` of `agent`'s `instance`, read once its schema is
+/// served.
+pub fn served_method(
+    client: &mut Client,
+    agent: AgentId,
+    instance: InstanceId,
+    name: &str,
+) -> MethodId {
+    let mut schema = None;
+    wait_until("the schema is served", PROCESS_WAIT, || {
+        schema = client.schema(agent, instance).ok().flatten();
+        schema.is_some()
+    });
+    schema
+        .unwrap()
+        .method_id(name)
+        .unwrap_or_else(|| panic!("no method {name}"))
+}
+
+/// Call `method` of `agent`'s `instance` with `arguments` through
+/// `client`, sending again with the same sequence until it is answered:
+/// the counter's total it answers with.
+pub fn call(
+    client: &mut Client,
+    agent: AgentId,
+    instance: InstanceId,
+    method: MethodId,
+    arguments: &[u8],
+) -> u64 {
+    let mut answered = None;
+    wait_until("a call is answered", PROCESS_WAIT, || {
+        answered = client
+            .call(agent, instance, method, arguments)
+            .ok()
+            .and_then(|answer| answer.total());
+        answered.is_some()
+    });
+    answered.unwrap()
+}
+
+/// Call `method` of `agent`'s `instance` with `by` through `client`, as
+/// [`call`] does.
+pub fn increment(
+    client: &mut Client,
+    agent: AgentId,
+    instance: InstanceId,
+    method: MethodId,
+    by: u64,
+) -> u64 {
+    call(client, agent, instance, method, &by.encode())
 }

@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
+use ed25519_dalek::SigningKey;
 use vos_checker::calls::done;
 use vos_checker::hooks::Gate;
 use vos_checker::programs::Programs;
@@ -568,4 +569,49 @@ fn a_gap_is_dropped_unacknowledged_until_it_fills() {
         get::<u64>(&node, sender, &keys::acked(target)).is_some()
             || applied(&node, sender) > leading
     });
+}
+
+#[test]
+fn a_node_is_its_public_key_and_never_serves_its_secret() {
+    use std::os::unix::fs::PermissionsExt;
+    use vos_node::store::Fjall;
+    let mode =
+        |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    let programs = Programs::load();
+    let dir = tempfile::tempdir().unwrap();
+    // A new data directory is the owner's alone.
+    let data = dir.path().join("new");
+    let id = Node::open(&data, Config::new(programs.agent.clone()))
+        .unwrap()
+        .id();
+    assert_eq!(mode(&data), 0o700);
+    // A node's directory others could reach is made the owner's alone
+    // again.
+    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).unwrap();
+    drop(Node::open(&data, Config::new(programs.agent.clone())).unwrap());
+    assert_eq!(mode(&data), 0o700);
+    // So is an empty directory others could reach. Any other is refused,
+    // and left as it is.
+    let empty = dir.path().join("empty");
+    std::fs::create_dir(&empty).unwrap();
+    std::fs::set_permissions(&empty, std::fs::Permissions::from_mode(0o755)).unwrap();
+    drop(Node::open(&empty, Config::new(programs.agent.clone())).unwrap());
+    assert_eq!(mode(&empty), 0o700);
+    let shared = dir.path().join("shared");
+    std::fs::create_dir(&shared).unwrap();
+    std::fs::write(shared.join("notes"), b"someone else's").unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(Node::open(&shared, Config::new(programs.agent.clone())).is_err());
+    assert_eq!(mode(&shared), 0o755);
+    let store = Fjall::open(data.join("store")).unwrap();
+    let secret = store.node_secret().unwrap().expect("a secret seed");
+    drop(store);
+    assert_eq!(
+        id.0,
+        SigningKey::from_bytes(&secret).verifying_key().to_bytes()
+    );
+    assert_ne!(id.0, secret);
+    // The same key on every open.
+    let node = Node::open(&data, Config::new(programs.agent)).unwrap();
+    assert_eq!(node.id(), id);
 }

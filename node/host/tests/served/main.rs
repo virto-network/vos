@@ -6,5 +6,6 @@
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod exactly_once;
+mod faults;
 mod forwarding;
 mod harness;

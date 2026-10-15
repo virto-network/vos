@@ -13,13 +13,11 @@
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
-use vos_checker::calls::{Total, signed_query};
-use vos_checker::processes::{
-    Options, PROCESS_WAIT, Processes, call, converged, counter_agent, increment, served_method,
-};
+use vos_checker::calls::{Total, call, increment, served_method, signed_query};
+use vos_checker::processes::{Options, PROCESS_WAIT, Processes, converged, counter_agent};
 use vos_checker::programs::package;
+use vos_checker::rounds::{ASKED, ROUNDS, Rounds, TOLD, Tour};
 use vos_checker::wait_until;
-use vos_checker::workflows::{ASKED, ROUNDS, Rounds, TOLD, Tour};
 use vos_node::client::Client;
 use vos_wire::ids::{AgentId, InstanceId};
 use vos_wire::ingress::{Consistency, Response, WorkflowStatus};

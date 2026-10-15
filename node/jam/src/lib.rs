@@ -14,6 +14,7 @@
 //! [`chain::Emulated`] is a JAM node in process, DA included, so the whole
 //! loop runs without one; [`live`] reaches a PolkaJam node.
 
+mod admit;
 pub mod builder;
 pub mod chain;
 pub mod da;
@@ -28,6 +29,7 @@ use vos_pvm::ExitReason;
 use vos_pvm::refine::RefineError;
 use vos_wire::ids::WorkflowId;
 
+pub use admit::admit;
 pub use builder::{Attempt, Builder, Fate, Prepared, Taken};
 pub use chain::{Chain, Emulated, Fault, Landed, Refined};
 pub use da::{Da, Segments, segment_root};

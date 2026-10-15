@@ -1,0 +1,287 @@
+//! A PolkaJam node: its JSON-RPC for state and segments, and `jamt` for
+//! services, preimages and work items.
+//!
+//! A package goes as a work package of one item, so its exports are the
+//! package's from index 0. Its payload goes in a file, which `jamt item`
+//! reads; its imports are named by segment root, `sr:<root>:<index>`,
+//! which keep working as long as DA holds the segments.
+//!
+//! The builder reads the chain at its finalized block, so what it commits
+//! no reorganization undoes. `jamt` anchors a package at the finalized
+//! block too, and a refine there finds a preimage only once that block is
+//! past the slot the preimage became available in: the builder waits for
+//! that before a package that needs one.
+
+mod jamt;
+mod rpc;
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
+use serde_json::json;
+use vos_tree::Hash;
+use vos_wire::defaults::SESSION_SKEW_MS;
+use vos_wire::package::{EPOCH_MS, EXPORTS, ROOT, SLOT_MS};
+
+use crate::Error;
+use crate::builder::Prepared;
+use crate::chain::{Chain, Landed};
+use crate::da::Segments;
+use crate::simulate::Runner;
+use rpc::decoded;
+
+/// The slots past a preimage's arrival the finalized block must be before
+/// a package that needs it: it must be past that slot; one more is margin.
+pub const ANCHOR_MARGIN: u64 = 2;
+/// The RPC errors in a row a wait takes before it stops.
+const TRANSIENT: u32 = 10;
+
+/// A PolkaJam node, by its RPC's address, and the `jamt` that reaches it.
+#[derive(Clone, Debug)]
+pub struct Node {
+    /// `host:port` of its JSON-RPC over HTTP.
+    pub rpc: String,
+    pub jamt: PathBuf,
+    /// Where payloads are written for `jamt` to read.
+    pub files: PathBuf,
+}
+
+/// The protocol's parameters the builder reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Parameters {
+    pub max_refine_gas: u64,
+    pub slot_period_sec: u64,
+    pub max_imports: u64,
+    pub max_exports: u64,
+    pub max_input: u64,
+    pub max_report_elective_data: u64,
+}
+
+fn failed(what: impl std::fmt::Display) -> Error {
+    Error::Node(what.to_string())
+}
+
+impl Node {
+    pub fn parameters(&self) -> Result<Parameters, Error> {
+        let answer = self.call("parameters", json!([]))?;
+        let fields = &answer["V1"];
+        let field = |name: &str| {
+            fields[name]
+                .as_u64()
+                .ok_or_else(|| failed(format!("no parameter {name}")))
+        };
+        Ok(Parameters {
+            max_refine_gas: field("max_refine_gas")?,
+            slot_period_sec: field("slot_period_sec")?,
+            max_imports: field("max_imports")?,
+            max_exports: field("max_exports")?,
+            max_input: field("max_input")?,
+            max_report_elective_data: field("max_report_elective_data")?,
+        })
+    }
+
+    /// The best block, or the finalized one: its header hash, as the RPC
+    /// names it, and its slot.
+    pub fn head(&self, finalized: bool) -> Result<(String, u64), Error> {
+        let method = if finalized {
+            "finalizedBlock"
+        } else {
+            "bestBlock"
+        };
+        let answer = self.call(method, json!([]))?;
+        let hash = answer["header_hash"]
+            .as_str()
+            .ok_or_else(|| failed("a head without a hash"))?;
+        let slot = answer["slot"]
+            .as_u64()
+            .ok_or_else(|| failed("a head without a slot"))?;
+        Ok((hash.to_string(), slot))
+    }
+
+    /// A value of `service`'s storage at block `head`.
+    pub fn value(&self, head: &str, service: u64, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+        let answer = self.call("serviceValue", json!([head, service, STANDARD.encode(key)]))?;
+        decoded(&answer)
+    }
+
+    /// The slots at which `service`'s request for the preimage of `hash`,
+    /// `len` bytes long, changed, at the finalized block; `None` when it
+    /// has none.
+    pub fn request(&self, service: u64, hash: &Hash, len: u64) -> Result<Option<Vec<u64>>, Error> {
+        let (head, _) = self.head(true)?;
+        let answer = self.call(
+            "serviceRequest",
+            json!([head, service, STANDARD.encode(hash), len]),
+        )?;
+        if answer.is_null() {
+            return Ok(None);
+        }
+        let slots = answer
+            .as_array()
+            .ok_or_else(|| failed("a request that is not a list"))?;
+        slots
+            .iter()
+            .map(|slot| slot.as_u64().ok_or_else(|| failed("a slot")))
+            .collect::<Result<_, _>>()
+            .map(Some)
+    }
+
+    /// Segments of the package whose exports' segment root is `root`.
+    pub fn fetch(&self, root: &Hash, indices: &[u32]) -> Result<Vec<Vec<u8>>, Error> {
+        let answer = self.call("fetchSegments", json!([STANDARD.encode(root), indices]))?;
+        answer
+            .as_array()
+            .ok_or_else(|| failed("segments that are not a list"))?
+            .iter()
+            .map(|segment| decoded(segment)?.ok_or_else(|| failed("a missing segment")))
+            .collect()
+    }
+
+    /// The agent `service` as the finalized block holds it, both its keys
+    /// read there; and that block's slot.
+    pub fn landed(&self, service: u64) -> Result<(Landed, u64), Error> {
+        let (head, slot) = self.head(true)?;
+        let landed = Landed::read(
+            self.value(&head, service, ROOT)?.as_deref(),
+            self.value(&head, service, EXPORTS)?.as_deref(),
+        )?;
+        Ok((landed, slot))
+    }
+
+    /// Wait until `service`'s preimage of `hash`, `len` bytes, can be
+    /// looked up by a package `jamt` anchors now: available at the
+    /// finalized block, which is [`ANCHOR_MARGIN`] slots past its arrival.
+    /// The slot it became available in.
+    pub fn await_preimage(
+        &self,
+        service: u64,
+        hash: &Hash,
+        len: u64,
+        timeout: Duration,
+    ) -> Result<u64, Error> {
+        let until = Instant::now() + timeout;
+        loop {
+            let since = self
+                .request(service, hash, len)?
+                .and_then(|slots| available(&slots));
+            if let Some(since) = since
+                && self.head(true)?.1 >= since + ANCHOR_MARGIN
+            {
+                return Ok(since);
+            }
+            if Instant::now() > until {
+                return Err(failed(format!(
+                    "preimage {} never available",
+                    hex::encode(hash)
+                )));
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+}
+
+/// The slot a preimage's request history says it has been available since:
+/// `[x]`, or `[x, y, z]` once provided again; `None` when it is not, as
+/// `[]` (asked for), or `[x, y]` (provided, then forgotten).
+pub fn available(slots: &[u64]) -> Option<u64> {
+    match slots {
+        [since] | [_, _, since] => Some(*since),
+        _ => None,
+    }
+}
+
+/// A node's segments, fetched by RPC.
+struct Fetched(Node);
+
+impl Segments for Fetched {
+    fn segment(&self, root: &Hash, index: u32) -> Option<Vec<u8>> {
+        self.0.fetch(root, &[index]).ok()?.pop()
+    }
+}
+
+/// An agent's service on a PolkaJam node, as its builder's chain.
+pub struct Live {
+    pub node: Node,
+    pub service: u64,
+}
+
+impl Chain for Live {
+    fn segments(&self) -> Arc<dyn Segments> {
+        Arc::new(Fetched(self.node.clone()))
+    }
+
+    fn submit(&mut self, _: &Runner, prepared: &Prepared) -> Result<String, Error> {
+        self.node.item(
+            self.service,
+            &prepared.payload,
+            prepared.exports(),
+            &prepared.segments,
+        )
+    }
+
+    /// Poll the finalized block until it holds another root than the one
+    /// the package was built on, or until its slot starts past the
+    /// package's window, the batch's time and the session skew, after
+    /// which accumulate refuses it in any later block. A few RPC errors in
+    /// a row are waited out.
+    fn wait(&mut self, prepared: &Prepared) -> Result<Landed, Error> {
+        let window = prepared.package.batch.time + SESSION_SKEW_MS;
+        let mut errors = 0;
+        loop {
+            match self.node.landed(self.service) {
+                Ok((landed, slot)) => {
+                    errors = 0;
+                    let closed = EPOCH_MS + slot * SLOT_MS > window;
+                    if landed.root != prepared.package.root || closed {
+                        return Ok(landed);
+                    }
+                }
+                Err(error) if errors == TRANSIENT => return Err(error),
+                Err(_) => errors += 1,
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+
+    fn landed(&self) -> Result<Landed, Error> {
+        self.node.landed(self.service).map(|(landed, _)| landed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A preimage is available from its history's last arrival, and not
+    /// while only asked for or once forgotten.
+    #[test]
+    fn a_preimage_is_available_from_its_last_arrival() {
+        assert_eq!(available(&[5]), Some(5));
+        assert_eq!(available(&[5, 9, 12]), Some(12));
+        assert_eq!(available(&[]), None);
+        assert_eq!(available(&[5, 9]), None);
+    }
+
+    /// The service's storage read as the chain's view of the agent: the
+    /// empty tree's root before its first package, and the last exports.
+    #[test]
+    fn the_storage_reads_as_what_landed() {
+        use vos_wire::Encode;
+        use vos_wire::package::Exports;
+        let empty = Landed::read(None, None).unwrap();
+        assert_eq!(empty.root, vos_tree::empty_root(&vos_tree::Blake2b));
+        assert_eq!(empty.exports, None);
+        let exports = Exports {
+            package: [9; 32],
+            root: [1; 32],
+            pages: 2,
+            segments: 3,
+        };
+        let landed = Landed::read(Some(&[5; 32]), Some(&exports.encode())).unwrap();
+        assert_eq!((landed.root, landed.exports), ([5; 32], Some(exports)));
+        assert!(Landed::read(Some(&[5; 31]), None).is_err());
+    }
+}

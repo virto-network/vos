@@ -2,7 +2,9 @@
 //! names, with its own data directory, ports, log and faults file, joined
 //! through a relay the test controls, served in the clear or over TLS.
 
+mod faults;
 pub mod relay;
+mod space;
 
 use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
@@ -12,18 +14,18 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use vos_node::client::{Client, Operator, Target};
+use vos_node::client::{Operator, Target};
 use vos_node::tls::Trust;
-use vos_wire::Encode;
-use vos_wire::ids::{AgentId, InstanceId, MethodId};
-use vos_wire::ingress::{Install, ReplicaStatus, Response};
+use vos_wire::ids::AgentId;
+use vos_wire::ingress::{ReplicaStatus, Response};
 use vos_wire::peer::NodeNumber;
 
-use crate::calls::Total;
-use crate::programs::{agent_elf, package};
+use crate::programs::agent_elf;
 use crate::spaces::{free_tcp_port, free_udp_port};
-use crate::{Log, Methods, Nodes, wait_until};
+use crate::{Log, Nodes, wait_until};
 use relay::Relay;
+
+pub use space::{converged, counter_agent, methods};
 
 /// How long the harness waits for what it waits on: a node to listen or
 /// to take its faults, a leader, an operator's command, a call's answer.
@@ -425,24 +427,6 @@ impl Processes {
         drop(running.take());
     }
 
-    /// Pause node `number` (SIGSTOP), or let it go on (SIGCONT), once it
-    /// takes the faults written while it was paused.
-    pub fn pause(&self, number: usize, paused: bool) {
-        let running = self.slot(number).running.lock().unwrap();
-        let Some(pid) = running.as_ref().map(Running::pid) else {
-            return;
-        };
-        drop(running);
-        let signal = if paused { "-STOP" } else { "-CONT" };
-        let _ = Command::new("kill")
-            .args([signal, &pid.to_string()])
-            .status();
-        self.slot(number).paused.store(paused, Ordering::SeqCst);
-        if !paused {
-            self.taken(number, self.slot(number).written.load(Ordering::SeqCst));
-        }
-    }
-
     /// Start node `number` again, once its faults are in force.
     pub fn restart(&self, number: usize) {
         let until = Instant::now() + Duration::from_secs(20);
@@ -466,75 +450,6 @@ impl Processes {
             );
             std::thread::sleep(Duration::from_millis(100));
         }
-    }
-
-    /// Node `number`'s own faults, as lines of its faults file: in force
-    /// once this returns, if the node runs and is not paused, as it says;
-    /// else once it starts or goes on.
-    pub fn set_faults(&self, number: usize, lines: &str) {
-        *self.slot(number).faults.lock().unwrap() = lines.to_string();
-        self.write_faults(number);
-    }
-
-    /// Run node `number`'s clock `jump` milliseconds ahead of every
-    /// node's, or behind.
-    pub fn jump_clock(&self, number: usize, jump: i64) {
-        self.slot(number).jump.store(jump, Ordering::SeqCst);
-        self.write_faults(number);
-    }
-
-    /// Move every node's clock on by `by` milliseconds, one node after
-    /// another; then clients take the agents' time to have moved too.
-    pub fn jump_every_clock(&self, by: i64) {
-        self.moving.store(true, Ordering::SeqCst);
-        self.clocks.fetch_add(by, Ordering::SeqCst);
-        for number in 1..=self.count {
-            self.write_faults(number);
-        }
-        self.offset.fetch_add(by, Ordering::SeqCst);
-        self.moving.store(false, Ordering::SeqCst);
-    }
-
-    /// Write node `number`'s faults file whole, headed by a new
-    /// generation, and wait for the node to take it if it runs and is not
-    /// paused.
-    fn write_faults(&self, number: usize) {
-        let slot = self.slot(number);
-        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        let clock = self.clocks.load(Ordering::SeqCst) + slot.jump.load(Ordering::SeqCst);
-        let text = format!(
-            "generation {generation}\n{}clock {clock}\n{}",
-            self.options.settings,
-            slot.faults.lock().unwrap()
-        );
-        let file = self.faults_file(number);
-        let staged = file.with_extension("staged");
-        std::fs::write(&staged, text).unwrap();
-        std::fs::rename(&staged, &file).unwrap();
-        slot.written.store(generation, Ordering::SeqCst);
-        if self.is_running(number) && !slot.paused.load(Ordering::SeqCst) {
-            self.taken(number, generation);
-        }
-    }
-
-    /// Wait until node `number` says the faults of `generation`, or later
-    /// ones, are in force.
-    fn taken(&self, number: usize, generation: u64) {
-        let taken = self.faults_file(number).with_extension("taken");
-        wait_until("the node takes its faults", PROCESS_WAIT, || {
-            let mut running = self.slot(number).running.lock().unwrap();
-            if let Some(status) = running.as_mut().and_then(Running::exited) {
-                panic!(
-                    "node {number} exited by itself: {status}\n{}",
-                    read_log(&self.log_path(number))
-                );
-            }
-            drop(running);
-            std::fs::read_to_string(&taken)
-                .ok()
-                .and_then(|text| text.trim().parse::<u64>().ok())
-                .is_some_and(|taken| taken >= generation)
-        });
     }
 
     /// Node `number`'s replica of `agent`, if it runs, is not paused, and
@@ -610,86 +525,6 @@ impl Processes {
     /// The nodes that exited before the harness killed them.
     pub fn exits(&self) -> Vec<String> {
         self.exits.lock().unwrap().clone()
-    }
-
-    /// An operator's command, at whichever running node takes it: its
-    /// answer, once one is `accepted`.
-    pub fn operate(
-        &self,
-        command: impl Fn(&Operator) -> Response,
-        accepted: impl Fn(&Response) -> bool,
-    ) -> Response {
-        let mut answer = None;
-        wait_until("an operator's command is taken", PROCESS_WAIT, || {
-            answer = (1..=self.count)
-                .filter(|number| self.is_running(*number))
-                .map(|number| command(&self.operator(number)))
-                .find(&accepted);
-            answer.is_some()
-        });
-        answer.unwrap()
-    }
-
-    /// An agent created on `replicas`, with package `elf` installed as each
-    /// of `instances`, in order.
-    pub fn agent_with(
-        &self,
-        replicas: Vec<NodeNumber>,
-        elf: &[u8],
-        instances: &[InstanceId],
-    ) -> AgentId {
-        let installs: Vec<Install> = instances
-            .iter()
-            .map(|instance| Install {
-                instance: *instance,
-                elf: elf.to_vec(),
-                roles: Vec::new(),
-            })
-            .collect();
-        self.agent_installing(replicas, &installs)
-    }
-
-    /// An agent created on `replicas`, with each of `installs` made, in
-    /// order.
-    pub fn agent_installing(&self, replicas: Vec<NodeNumber>, installs: &[Install]) -> AgentId {
-        let Response::Created(agent) = self.operate(
-            |operator| {
-                operator
-                    .create_agent(replicas.clone())
-                    .unwrap_or(Response::Unavailable)
-            },
-            |answer| matches!(answer, Response::Created(_)),
-        ) else {
-            unreachable!()
-        };
-        for install in installs {
-            self.operate(
-                |operator| {
-                    operator
-                        .install(agent, install)
-                        .unwrap_or(Response::Unavailable)
-                },
-                |answer| matches!(answer, Response::Ran { .. }),
-            );
-        }
-        agent
-    }
-
-    /// Agent `agent`'s identity, the hash of its creation record.
-    pub fn identity(&self, agent: AgentId) -> [u8; 32] {
-        let mut identity = None;
-        wait_until("the agent's record is served", PROCESS_WAIT, || {
-            identity = (1..=self.count)
-                .filter(|number| self.is_running(*number))
-                .find_map(|number| {
-                    vos_node::client::agent_info(self.target(number), agent)
-                        .ok()
-                        .flatten()
-                })
-                .map(|info| vos_node::identity(&info.record));
-            identity.is_some()
-        });
-        identity.unwrap()
     }
 
     /// Stop every node at once (SIGSTOP), so none goes on while another
@@ -771,111 +606,4 @@ impl Nodes for Processes {
             self.troubles().join("\n")
         )
     }
-}
-
-/// The counter's methods, by its schema at `agent`'s `instance`.
-pub fn methods(processes: &Processes, agent: AgentId, instance: InstanceId) -> Methods {
-    let mut schema = None;
-    wait_until("the schema is served", PROCESS_WAIT, || {
-        schema = (1..=processes.count)
-            .filter(|number| processes.is_running(*number))
-            .find_map(|number| {
-                vos_node::client::schema(processes.target(number), agent, instance)
-                    .ok()
-                    .flatten()
-            });
-        schema.is_some()
-    });
-    let schema = schema.unwrap();
-    let method = |name: &str| {
-        schema
-            .method_id(name)
-            .unwrap_or_else(|| panic!("no method {name}"))
-    };
-    Methods {
-        increment: method("increment"),
-        value: method("value"),
-        forward: method("forward"),
-    }
-}
-
-/// An agent created on nodes 1 to 3, with the test counter installed as
-/// `instance`, through whichever node takes the operator's commands.
-pub fn counter_agent(processes: &Processes, instance: InstanceId) -> AgentId {
-    processes.agent_with(vec![1, 2, 3], &package("counter"), &[instance])
-}
-
-/// The method `name` of `agent`'s `instance`, read once its schema is
-/// served.
-pub fn served_method(
-    client: &mut Client,
-    agent: AgentId,
-    instance: InstanceId,
-    name: &str,
-) -> MethodId {
-    let mut schema = None;
-    wait_until("the schema is served", PROCESS_WAIT, || {
-        schema = client.schema(agent, instance).ok().flatten();
-        schema.is_some()
-    });
-    schema
-        .unwrap()
-        .method_id(name)
-        .unwrap_or_else(|| panic!("no method {name}"))
-}
-
-/// Call `method` of `agent`'s `instance` with `arguments` through
-/// `client`, sending again with the same sequence until it is answered:
-/// the counter's total it answers with.
-pub fn call(
-    client: &mut Client,
-    agent: AgentId,
-    instance: InstanceId,
-    method: MethodId,
-    arguments: &[u8],
-) -> u64 {
-    let mut answered = None;
-    wait_until("a call is answered", PROCESS_WAIT, || {
-        answered = client
-            .call(agent, instance, method, arguments)
-            .ok()
-            .and_then(|answer| answer.total());
-        answered.is_some()
-    });
-    answered.unwrap()
-}
-
-/// Call `method` of `agent`'s `instance` with `by` through `client`, as
-/// [`call`] does.
-pub fn increment(
-    client: &mut Client,
-    agent: AgentId,
-    instance: InstanceId,
-    method: MethodId,
-    by: u64,
-) -> u64 {
-    call(client, agent, instance, method, &by.encode())
-}
-
-/// Wait until the three replicas of `agent` applied through the commit
-/// of its leader at the highest term: their statuses, read at each node.
-pub fn converged(processes: &Processes, agent: AgentId) {
-    wait_until(
-        "every replica applies through the commit",
-        PROCESS_WAIT,
-        || {
-            let statuses: Vec<ReplicaStatus> = (1..=processes.count)
-                .filter_map(|number| processes.status(number, agent))
-                .collect();
-            let Some(commit) = statuses
-                .iter()
-                .filter(|status| status.leads)
-                .max_by_key(|status| status.term)
-                .map(|status| status.commit)
-            else {
-                return false;
-            };
-            statuses.len() == 3 && statuses.iter().all(|status| status.applied >= commit)
-        },
-    );
 }

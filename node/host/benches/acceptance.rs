@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use vos_checker::calls::done;
 use vos_checker::percentiles;
 use vos_checker::programs::{Programs, method};
-use vos_checker::workflows::{ROUNDS, Rounds, Tour};
+use vos_checker::rounds::{ROUNDS, Rounds, Tour};
 use vos_node::{Config, Hooks, Node, Reply};
 use vos_wire::batch::{Answer, Await, Batch, Body, Message, Request};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session, WorkflowId};

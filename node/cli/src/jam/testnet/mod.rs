@@ -11,23 +11,24 @@
 //! record lists every attempt each package took, and is written whatever
 //! the outcome.
 
+mod alice;
+mod record;
+
 use std::collections::HashMap;
-use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ed25519_dalek::{Signer, SigningKey};
-use vos_jam::builder::{MAX_INPUT, admit};
+use ed25519_dalek::SigningKey;
+use vos_jam::builder::MAX_INPUT;
 use vos_jam::chain::{MAX_REFINE_OUTPUT, slot_of};
 use vos_jam::live::{Live, Node, Parameters};
-use vos_jam::{Attempt, Builder, Chain, Emulated, Error, Fate, Runner, Store, Taken};
+use vos_jam::{Builder, Chain, Emulated, Error, Runner, Store, Taken};
 use vos_pvm::refine::PreparedProgram;
 use vos_pvm_compiler::service_blob;
 use vos_wire::batch::{Admin, Input};
 use vos_wire::ids::{InstanceId, MethodId, Principal, ProgramHash, Session};
-use vos_wire::ingress::{Call, call_message};
-use vos_wire::package::{MAX_SEGMENTS, SLOT_MS, identity};
+use vos_wire::package::{MAX_SEGMENTS, SLOT_MS};
 use vos_wire::records::{Workflow, WorkflowState, unstored};
 use vos_wire::result::{Outcome, Step, WorkResult, digest};
 use vos_wire::schema::Schema;
@@ -159,12 +160,6 @@ impl Testnet {
             attempts: Vec::new(),
             record: String::new(),
         })
-    }
-
-    /// A line of the record, printed as it is made.
-    fn note(&mut self, line: impl AsRef<str>) {
-        println!("{}", line.as_ref());
-        writeln!(self.record, "{}", line.as_ref()).expect("a string takes it");
     }
 
     fn run(&mut self) -> Result<(), String> {
@@ -452,55 +447,6 @@ impl Testnet {
         })
     }
 
-    /// Every attempt, with its fate and what `jamt` said of it.
-    fn note_attempts(&mut self, attempts: &[Attempt]) {
-        for (at, attempt) in attempts.iter().enumerate() {
-            let fate = match attempt.fate {
-                Fate::Landed => "landed",
-                Fate::Refused => {
-                    "refused: the chain's root did not move before its window closed (see the testnet's errors)"
-                }
-                Fate::Overtaken => "overtaken: another package landed first, and was taken",
-                Fate::Superseded => {
-                    "superseded: an earlier attempt's package landed late, and was taken"
-                }
-            };
-            self.note(format!(
-                "  attempt {} at slot {} ({}): {fate}; jamt: {}",
-                at + 1,
-                slot_of(attempt.time),
-                utc(attempt.time),
-                attempt.submitted
-            ));
-        }
-    }
-
-    /// Whether each package, the first among them, landed first time.
-    fn attempts_summary(&mut self) {
-        let first = self.attempts.first().map(|(_, tries)| *tries);
-        self.note(match first {
-            Some(1) => "the first package landed at its first attempt".to_string(),
-            Some(tries) => format!("the first package landed at attempt {tries}"),
-            None => "no package landed".to_string(),
-        });
-        let retried: Vec<String> = self
-            .attempts
-            .iter()
-            .filter(|(_, tries)| *tries > 1)
-            .map(|(name, tries)| format!("{name} ({tries})"))
-            .collect();
-        self.note(match retried.is_empty() {
-            true => format!(
-                "every one of the {} packages landed at its first attempt",
-                self.attempts.len()
-            ),
-            false => format!(
-                "packages that took more than one attempt: {}",
-                retried.join(", ")
-            ),
-        });
-    }
-
     /// The counter's install, and the shop's, each naming the programs
     /// derived from its ELF.
     fn installs(&self) -> Result<Vec<Input>, String> {
@@ -515,41 +461,6 @@ impl Testnet {
             install(COUNTER, &self.actors.counter),
             install(SHOP, &self.actors.shop),
         ])
-    }
-
-    /// Alice's next call, signed for the agent of `service`, as the
-    /// builder admits it.
-    fn call(
-        &mut self,
-        service: u64,
-        instance: InstanceId,
-        method: MethodId,
-        arguments: Vec<u8>,
-    ) -> Result<Input, String> {
-        let key = self.alice.verifying_key().to_bytes();
-        let session = *self.session.get_or_insert(Session {
-            key,
-            name: digest(&key)[..16].try_into().expect("16 bytes"),
-            t0: now(),
-        });
-        self.sequence += 1;
-        let message = call_message(
-            &identity(service),
-            &session,
-            self.sequence,
-            instance,
-            method,
-            &arguments,
-        );
-        let call = Call {
-            session,
-            sequence: self.sequence,
-            instance,
-            method,
-            arguments,
-            signature: self.alice.sign(&message).to_bytes(),
-        };
-        admit(service, call).map_err(said)
     }
 }
 
@@ -584,18 +495,6 @@ fn now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .expect("after the epoch")
         .as_millis() as u64
-}
-
-/// A time, in milliseconds since the Unix epoch, as its time of day in UTC.
-fn utc(time: u64) -> String {
-    let seconds = time / 1000 % 86_400;
-    format!(
-        "{:02}:{:02}:{:02}.{:03} UTC",
-        seconds / 3600,
-        seconds / 60 % 60,
-        seconds % 60,
-        time % 1000
-    )
 }
 
 /// An error, said.
