@@ -521,13 +521,15 @@ A design and implementation review (2026-10-15) found:
   - anonymous payments: a fee inside the proof;
   - registered spaces: a deposit plus fees.
 
-**Open:**
+**Open,** each deferred by the owner to a named point:
 1. **The identity replica's shape:** a non-voting role added to
    vos-raft, or the applied state shipped to non-members as a
    read-only follower (§6). Decided when the first build is planned.
 2. **The handover triggers' numbers** for the registry's governance.
-3. **Where the shared pool first runs,** once unpostponed: a JAM agent,
-   or a proving space run by the root space.
+   Decided with the registry slice.
+3. **Where the shared pool first runs:** a JAM agent, or a proving
+   space run by the root space. Decided when full privacy is
+   unpostponed.
 
 ## 15. Proposed staging
 
