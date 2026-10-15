@@ -6,17 +6,14 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use vos_pvm::accumulate_host::AccumulateContext;
-use vos_pvm::inner::gp_call::HISTORICAL_LOOKUP;
 use vos_pvm::pool::{CodeHash, MachinePool};
-use vos_pvm::refine::{Invocation, Machine, MemoryModel, PreparedProgram};
-use vos_pvm::refine_host::{
-    JamItem, JamRefine, Preimages, ProgramSource, RefineContext, serve_lookup,
-};
+use vos_pvm::refine::{Invocation, MemoryModel, PreparedProgram};
+use vos_pvm::refine_host::{JamItem, JamRefine, Preimages, ProgramSource, RefineContext};
 use vos_pvm::{ExitReason, PvmBackend};
+use vos_testkit::node::serve;
 use vos_testkit::programs::{actor, agent, bare, derivation, derived, kernel, method, package};
 use vos_testkit::{Testkit, decode};
-use vos_wire::abi::surface::LOST;
-use vos_wire::abi::{Failure, Refusal, cap, code};
+use vos_wire::abi::{Failure, Refusal, cap};
 use vos_wire::batch::{Admin, Batch, Input, Query, Request, Work};
 use vos_wire::ids::{
     AgentId, InstanceId, MethodId, Principal, ProgramHash, Session, SessionId, SessionRef,
@@ -69,31 +66,6 @@ impl Preimages for Scope {
         (service == u64::from(AGENT.0) && scoped)
             .then(|| self.programs.get(hash).cloned())
             .flatten()
-    }
-}
-
-/// `historical_lookup` from the node's programs, those in `scope` when it is
-/// given, as a node serves it ([`serve_lookup`]); and the agent's report of
-/// lost state, which stops the refine. Every other call the host does not
-/// serve answers `WHAT`.
-fn serve(
-    id: u64,
-    machine: &mut Machine,
-    programs: &HashMap<[u8; 32], Vec<u8>>,
-    scope: Option<&BTreeSet<[u8; 32]>>,
-) -> Result<(), ExitReason> {
-    match id {
-        LOST => Err(ExitReason::HostCall(LOST)),
-        id if id == u64::from(HISTORICAL_LOOKUP) => {
-            serve_lookup(machine, u64::from(AGENT.0), |hash| {
-                let scoped = scope.is_none_or(|scope| scope.contains(hash));
-                programs.get(hash).filter(|_| scoped)
-            })
-        }
-        _ => {
-            machine.registers_mut()[7] = code::WHAT;
-            Ok(())
-        }
     }
 }
 
@@ -308,7 +280,11 @@ impl Node {
             context = context.without_precompiles();
         }
         context
-            .try_run_with_host(|id, machine| serve(id, machine, &self.programs, Some(&scope)))
+            .try_run_with_host(|id, machine| {
+                serve(id, machine, AGENT, |hash| {
+                    self.programs.get(hash).filter(|_| scope.contains(hash))
+                })
+            })
             .unwrap()
     }
 
@@ -358,7 +334,9 @@ impl Node {
             context = context.without_precompiles();
         }
         context
-            .try_run_with_host(|id, machine| serve(id, machine, &self.programs, None))
+            .try_run_with_host(|id, machine| {
+                serve(id, machine, AGENT, |hash| self.programs.get(hash))
+            })
             .unwrap()
     }
 

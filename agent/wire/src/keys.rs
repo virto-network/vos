@@ -234,9 +234,10 @@ pub fn rows_prefix(instance: InstanceId, rows: Rows) -> Option<(Vec<u8>, Transfo
 /// past [`cap::ORDERED_KEY`] exceeds a cap ([`Failure::Cap`]).
 pub fn row(instance: InstanceId, rows: Rows, key: &[u8]) -> Result<Vec<u8>, Failure> {
     let Some((part, tag, transform)) = table_of(rows) else {
-        return match key.is_empty() {
-            true => Ok(instance_struct(instance)),
-            false => Err(Failure::Trapped),
+        return if key.is_empty() {
+            Ok(instance_struct(instance))
+        } else {
+            Err(Failure::Trapped)
         };
     };
     if transform == Transform::Ordered && key.len() > cap::ORDERED_KEY {

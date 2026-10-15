@@ -21,7 +21,7 @@ use alloc::vec::Vec;
 use core::cell::RefCell;
 use core::ops::Range;
 
-use vos_pvm_program::StandardHeader;
+use vos_pvm_program::{REGISTER_COUNT, StandardHeader};
 use vos_wire::abi::{Failure, cap};
 use vos_wire::ids::{ProgramHash, WorkflowId};
 use vos_wire::records::Workflow;
@@ -99,7 +99,7 @@ pub(super) fn restore(
     let mut machine = match &workflow.snapshot {
         None => machines::pinned(program, 0)?,
         Some(snapshot) => {
-            if snapshot.registers.len() != 13 {
+            if snapshot.registers.len() != REGISTER_COUNT {
                 lost("a workflow's registers");
             }
             let mut machine = match machines::pinned(program, snapshot.counter) {
@@ -139,9 +139,10 @@ pub(super) struct Captured {
 }
 
 /// The pages a paused step wrote, against those the workflow held, each it
-/// stores put into `base`'s section in its format as the running step's. Past [`cap::STEP_PAGES`] written, or [`cap::HELD_PAGES`] held
-/// after, the step fails, its pages dropped from the section; past the
-/// section's cap, the batch cannot take the step, which waits.
+/// stores put into `base`'s section in its format as the running step's.
+/// Past [`cap::STEP_PAGES`] written, or [`cap::HELD_PAGES`] held after, the
+/// step fails, its pages dropped from the section; past the section's cap,
+/// the batch cannot take the step, which waits.
 #[inline(never)]
 pub(super) fn capture(
     base: &Base,

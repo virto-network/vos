@@ -13,9 +13,10 @@ use vos_wire::records::unversioned;
 /// The value applied state holds under `key`: in a committed map's value
 /// row, without the version that wrote it.
 pub(crate) fn held(key: &[u8], value: &[u8]) -> Result<Vec<u8>, Failure> {
-    match keys::is_committed(key) {
-        true => Ok(unversioned(value).ok_or(Failure::Trapped)?.1.to_vec()),
-        false => Ok(value.to_vec()),
+    if keys::is_committed(key) {
+        Ok(unversioned(value).ok_or(Failure::Trapped)?.1.to_vec())
+    } else {
+        Ok(value.to_vec())
     }
 }
 

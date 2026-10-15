@@ -16,42 +16,16 @@ pub const MACHINE: u64 = 9;
 pub const PEEK: u64 = 10;
 pub const POKE: u64 = 11;
 pub const PAGES: u64 = 12;
-pub const SOLICIT: u64 = 24;
 pub const INVOKE: u64 = 13;
 pub const EXPUNGE: u64 = 14;
+pub const SOLICIT: u64 = 24;
 pub use vos_wire::abi::surface::{INSTANTIATE, LOST, STATE_READ, STATE_SCAN};
 
 /// The calling service, for `read` and `historical_lookup`.
 pub const SELF_SERVICE: u64 = u64::MAX;
 
 #[cfg(target_arch = "riscv64")]
-#[macro_export]
-macro_rules! ecalli {
-    ($id:expr, $a:expr) => {{
-        let [a0, a1, a2, a3, a4, a5]: [u64; 6] = $a;
-        let (r0, r1): (u64, u64);
-        // SAFETY: the ecalli convention passes φ7..φ12 in a0..a5 and returns
-        // in a0 and a1; pointer arguments name live buffers the host may
-        // write.
-        unsafe {
-            core::arch::asm!(
-                "li t0, {id}",
-                "csrw 0x801, zero",
-                "ecall",
-                id = const $id,
-                lateout("t0") _,
-                inlateout("a0") a0 => r0,
-                inlateout("a1") a1 => r1,
-                inlateout("a2") a2 => _,
-                inlateout("a3") a3 => _,
-                inlateout("a4") a4 => _,
-                inlateout("a5") a5 => _,
-                options(nostack),
-            );
-        }
-        (r0, r1)
-    }};
-}
+pub use vos_sdk::ecalli;
 
 #[cfg(not(target_arch = "riscv64"))]
 #[macro_export]
@@ -62,6 +36,7 @@ macro_rules! ecalli {
     }};
 }
 
+#[cfg(not(target_arch = "riscv64"))]
 pub use crate::ecalli;
 
 pub fn ptr(bytes: &[u8]) -> u64 {
@@ -165,13 +140,8 @@ pub fn historical_lookup(hash: &[u8; 32]) -> Option<Vec<u8>> {
     whole(|out, offset, capacity| historical_lookup_at(hash, out, offset, capacity))
 }
 
-/// The start of a preimage of this service, read into `buffer`, with no
+/// A preimage of this service from `offset`, read into `buffer`, with no
 /// allocation: the preimage's whole length; `None` when absent.
-pub fn historical_lookup_into(hash: &[u8; 32], buffer: &mut [u8]) -> Option<usize> {
-    historical_lookup_from(hash, 0, buffer)
-}
-
-/// [`historical_lookup_into`] from `offset` into the preimage.
 pub fn historical_lookup_from(hash: &[u8; 32], offset: u64, buffer: &mut [u8]) -> Option<usize> {
     let len = historical_lookup_at(hash, buffer.as_mut_ptr(), offset, buffer.len() as u64);
     (len != code::NONE && len != code::WHAT).then_some(len as usize)
@@ -249,7 +219,7 @@ pub type StateRows = Vec<(Vec<u8>, Vec<u8>)>;
 
 /// A page of rows under `prefix` after `after` from the node, their values
 /// as stored.
-pub fn scan_page(prefix: &[u8], after: &[u8]) -> StateRows {
+pub fn state_scan(prefix: &[u8], after: &[u8]) -> StateRows {
     let mut capacity = SCAN_PAGE;
     let out = loop {
         let mut out: Vec<u8> = Vec::with_capacity(capacity);

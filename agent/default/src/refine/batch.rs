@@ -9,7 +9,7 @@ use vos_wire::abi::Failure;
 use vos_wire::batch::{Batch, Body, Input, Message};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Session, WorkflowId};
 use vos_wire::records::{SessionMark, Workflow};
-use vos_wire::result::{ResultWriter, Step};
+use vos_wire::result::{ResultWriter, Run, Step};
 use vos_wire::{defaults, keys};
 
 use super::admin::admin;
@@ -45,6 +45,11 @@ impl Stepped {
             due: Vec::new(),
         }
     }
+
+    /// A step that ran, advancing no mark.
+    pub(crate) fn ran(run: Run) -> Self {
+        Self::new(Step::Ran(run), None)
+    }
 }
 
 /// What a batch has taken so far: the marks, sessions and counts its
@@ -78,7 +83,7 @@ impl Batched {
         reserve: u64,
         handler: bool,
     ) -> Option<Vec<(u64, WorkflowId)>> {
-        let overrun = base.meter.overrun.replace(false);
+        let overrun = base.meter.overran();
         let section = base.section.get_mut();
         if (overrun && self.handled) || !section.fits() || !self.result.push(&stepped.step) {
             section.drop_running();
@@ -86,13 +91,11 @@ impl Batched {
         }
         section.take();
         let Step::Ran(run) = &stepped.step else {
-            base.meter.left.set(base.meter.left.get() - reserve);
+            base.meter.spend(reserve);
             return Some(stepped.due);
         };
         self.handled |= handler;
-        base.meter
-            .left
-            .set(base.meter.left.get() - reserve - run.gas_used);
+        base.meter.spend(reserve + run.gas_used);
         for write in &run.writes {
             base.earlier.insert(write.key.clone(), write.value.clone());
         }
@@ -142,8 +145,7 @@ fn plan(base: &Base, pairs: &BTreeMap<AgentId, u64>, input: &Input, handler: boo
         Input::Sweep { .. } => defaults::SWEEP_RESERVE,
         _ => defaults::INPUT_RESERVE,
     };
-    base.meter.kept.set(reserve + defaults::FINISH_RESERVE);
-    if base.meter.left.get() < base.meter.kept.get() {
+    if !base.meter.keeps(reserve + defaults::FINISH_RESERVE) {
         return None;
     }
     let plain = |limit| {
@@ -227,10 +229,9 @@ pub(crate) fn run_batch(base: &mut Base, batch: Batch) -> ResultWriter {
             break;
         };
         let kept = plan.reserve + plan.limit + defaults::FINISH_RESERVE;
-        if base.meter.left.get() < kept {
+        if !base.meter.keeps(kept) {
             break;
         }
-        base.meter.kept.set(kept);
         let index = batched.result.count();
         let admin = matches!(input, Input::Admin(_));
         let swept = matches!(input, Input::Sweep { .. });

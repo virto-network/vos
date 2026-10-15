@@ -13,12 +13,13 @@
 
 use alloc::vec::Vec;
 
+use vos_pvm_program::REGISTER_COUNT;
 use vos_wire::abi::{Failure, Kind, cap};
 use vos_wire::batch::{Answer, Await};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, WorkflowId};
 use vos_wire::keys::{self, Due};
 use vos_wire::records::{Snapshot, Workflow, WorkflowState};
-use vos_wire::result::{InputRef, Outcome, Outgoing, Page, Run, Step};
+use vos_wire::result::{InputRef, Outcome, Outgoing, Page, Run};
 use vos_wire::{Decode, Encode, defaults};
 
 use super::invocation::{Ended, Invocation, Pause, Share};
@@ -282,24 +283,19 @@ pub(super) fn due(
     floor: &mut Floor,
 ) -> bool {
     let quick = defaults::INPUT_RESERVE + defaults::FINISH_RESERVE;
-    base.meter.kept.set(quick + floor.now());
-    if base.meter.left.get() < base.meter.kept.get() {
+    if !base.meter.keeps(quick + floor.now()) {
         return false;
     }
     let Ok(read) = paid(base, id) else {
-        base.meter.overrun.set(false);
+        base.meter.clear_overrun();
         return false;
     };
     // Keep `keep` above the floor, or wait.
     let keeps = |base: &Base, floor: &mut Floor, keep: u64| {
-        let floor = floor.of(base.meter.left.get(), keep);
-        (base.meter.left.get() >= keep + floor).then(|| {
-            base.meter.kept.set(keep + floor);
-            floor
-        })
+        let floor = floor.of(base.meter.left(), keep);
+        base.meter.keeps(keep + floor).then_some(floor)
     };
     let input = InputRef::Due { workflow: id };
-    let quick_step = |run| Stepped::new(Step::Ran(run), None);
     let (stepped, reserve, handler) = match read {
         Some((workflow, bytes)) if workflow.due == at => match &workflow.state {
             WorkflowState::Ended(_) => {
@@ -307,7 +303,7 @@ pub(super) fn due(
                     return false;
                 }
                 let run = collect(input, id, &workflow);
-                (quick_step(run), defaults::INPUT_RESERVE, false)
+                (Stepped::ran(run), defaults::INPUT_RESERVE, false)
             }
             state => {
                 let resume = match state {
@@ -339,7 +335,7 @@ pub(super) fn due(
             let mut rows = Overlay::new();
             unfile_due(&mut rows, id, at);
             run.writes = split_writes(rows).0;
-            (quick_step(run), defaults::INPUT_RESERVE, false)
+            (Stepped::ran(run), defaults::INPUT_RESERVE, false)
         }
     };
     batched.take(base, stepped, reserve, handler).is_some()
@@ -402,7 +398,7 @@ enum Left {
         pause: Pause,
         captured: Captured,
         counter: u32,
-        registers: Vec<u64>,
+        registers: [u64; REGISTER_COUNT],
     },
     /// Ended with its result, or its own error.
     Ended(Outcome),
@@ -441,7 +437,7 @@ fn unfit(base: &Base, input: InputRef, id: WorkflowId, mut workflow: Workflow) -
     let mut rows = Overlay::new();
     run.pages = end(base, id, &mut workflow, outcome, &mut rows, &mut run);
     run.writes = split_writes(rows).0;
-    Stepped::new(Step::Ran(run), None)
+    Stepped::ran(run)
 }
 
 /// Restore workflow `id`'s machine, run it through its step with `resume`
@@ -478,7 +474,7 @@ fn run(
     let pending = snapshot.and_then(|snapshot| snapshot.pending);
     // Where the machine resumed, against which an idle preemption is
     // judged.
-    let resumed: Vec<u64> = (0..13).map(|index| machine.register(index)).collect();
+    let resumed = machine.registers();
     let resumed_at = snapshot.map_or(0, |snapshot| snapshot.counter);
     let (owner, instance) = (workflow.owner, workflow.instance);
     let ended = invocation.workflow(&mut machine, owner, instance, resume, share, pending);
@@ -487,8 +483,7 @@ fn run(
             let held = snapshot.map_or(&[][..], |snapshot| &snapshot.pages);
             match capture(base, &machine, &workflow.program, &header, id, held) {
                 Ok(captured) => {
-                    let registers: Vec<u64> =
-                        (0..13).map(|index| machine.register(index)).collect();
+                    let registers = machine.registers();
                     let counter = machine.expunge() as u32;
                     // Out of gas with nothing served or written, and its
                     // registers and counter where they were: it could not
@@ -579,7 +574,7 @@ fn step(
             workflow.state = pause.state(&resume);
             workflow.snapshot = Some(Snapshot {
                 counter,
-                registers,
+                registers: registers.to_vec(),
                 pages: captured.held,
                 pending,
             });
@@ -604,7 +599,7 @@ fn step(
     let (writes, committed) = split_writes(rows);
     run.writes = writes;
     run.committed = committed;
-    let mut stepped = Stepped::new(Step::Ran(run), None);
+    let mut stepped = Stepped::ran(run);
     stepped.pages = stored;
     stepped
 }

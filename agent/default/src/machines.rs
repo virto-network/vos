@@ -13,21 +13,21 @@
 use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 
-use vos_pvm_program::{Region, StandardHeader};
+use vos_pvm_program::{
+    HALT_ADDRESS, INPUT_SIZE, PAGE_SIZE, REGISTER_COUNT, Region, StandardHeader, ZONE_SIZE,
+};
 use vos_wire::abi::{Failure, code, precompile};
 
 use crate::host::{
     EXPUNGE, INSTANTIATE, INVOKE, MACHINE, PAGES, PEEK, POKE, ecalli, historical_lookup,
-    historical_lookup_into, lost, ptr, ptr_mut,
+    historical_lookup_from, lost, ptr, ptr_mut,
 };
 
-const ZONE: u64 = 1 << 16;
-const PAGE: u64 = 4096;
-const INPUT: u64 = 1 << 24;
-/// Where a machine returns to halt.
-pub const HALT: u64 = (1 << 32) - ZONE;
+const ZONE: u64 = ZONE_SIZE as u64;
+const PAGE: u64 = PAGE_SIZE as u64;
+const INPUT: u64 = INPUT_SIZE as u64;
 /// The top of the standard stack.
-pub const STACK_TOP: u64 = (1 << 32) - 2 * ZONE - INPUT;
+const STACK_TOP: u64 = (1 << 32) - 2 * ZONE - INPUT;
 /// The standard argument window.
 pub const ARGUMENTS: u64 = (1 << 32) - ZONE - INPUT;
 
@@ -95,7 +95,7 @@ pub enum Exit {
 /// The header of `program`'s blob, which places its regions, read alone.
 pub fn header(program: &[u8; 32]) -> Option<StandardHeader> {
     let mut header = [0u8; StandardHeader::LEN];
-    let len = historical_lookup_into(program, &mut header)?;
+    let len = historical_lookup_from(program, 0, &mut header)?;
     (len >= StandardHeader::LEN)
         .then(|| StandardHeader::read(&header))
         .flatten()
@@ -118,8 +118,8 @@ impl Tracking {
 /// An inner machine: gas and registers between invocations, as `invoke`
 /// reads and writes them.
 pub struct Machine {
-    pub id: u64,
-    pub frame: [u64; 14],
+    id: u64,
+    frame: [u64; 14],
     /// Boxed: a step's nested machines sit on the agent's stack, a frame a
     /// level, sixty-three levels deep.
     tracking: Option<alloc::boxed::Box<Tracking>>,
@@ -153,7 +153,7 @@ impl Machine {
             id => id,
         };
         let mut frame = [0u64; 14];
-        frame[1] = HALT;
+        frame[1] = HALT_ADDRESS;
         frame[2] = STACK_TOP;
         Ok(Self {
             id,
@@ -225,6 +225,12 @@ impl Machine {
     #[inline]
     pub fn register(&self, index: usize) -> u64 {
         self.frame[1 + index]
+    }
+
+    /// Its registers, φ0 to φ12.
+    #[inline]
+    pub fn registers(&self) -> [u64; REGISTER_COUNT] {
+        core::array::from_fn(|index| self.register(index))
     }
 
     #[inline]
@@ -383,23 +389,22 @@ impl Machine {
     #[inline]
     pub fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), Failure> {
         if self.tracking.is_some() {
-            return self.write_tracked(address, bytes);
+            self.open_written(address, bytes.len() as u64);
         }
         self.poke(address, bytes)
             .then_some(())
             .ok_or(Failure::Trapped)
     }
 
+    /// Mark and open the tracked pages a write of `len` bytes at `address`
+    /// reaches.
     #[cold]
     #[inline(never)]
-    fn write_tracked(&mut self, address: u64, bytes: &[u8]) -> Result<(), Failure> {
-        if !bytes.is_empty() {
-            let end = address.saturating_add(bytes.len() as u64);
+    fn open_written(&mut self, address: u64, len: u64) {
+        if len > 0 {
+            let end = address.saturating_add(len);
             self.open(address / PAGE, end.div_ceil(PAGE));
         }
-        self.poke(address, bytes)
-            .then_some(())
-            .ok_or(Failure::Trapped)
     }
 
     #[inline]
@@ -474,13 +479,6 @@ fn as_bytes(frame: &mut [u64; 14]) -> &mut [u8] {
     unsafe { core::slice::from_raw_parts_mut(frame.as_mut_ptr().cast::<u8>(), 14 * 8) }
 }
 
-fn le(bytes: &[u8]) -> u64 {
-    bytes
-        .iter()
-        .rev()
-        .fold(0, |value, byte| value << 8 | u64::from(*byte))
-}
-
 /// Build a machine from a standard program: its code through `machine` at
 /// `counter`, then each region through `pages` and `poke`, at the Gray
 /// Paper's standard layout with no arguments.
@@ -494,7 +492,11 @@ fn load(blob: &[u8], counter: u32) -> Result<u64, Unavailable> {
         .get(at + ro_len..at + ro_len + rw_len)
         .ok_or(Unavailable::Missing)?;
     let at = at + ro_len + rw_len;
-    let code_len = blob.get(at..at + 4).map(le).ok_or(Unavailable::Missing)? as usize;
+    let code_len = blob
+        .get(at..at + 4)
+        .and_then(|len| len.try_into().ok())
+        .map(u32::from_le_bytes)
+        .ok_or(Unavailable::Missing)? as usize;
     let code = blob
         .get(at + 4..at + 4 + code_len)
         .ok_or(Unavailable::Missing)?;
@@ -514,9 +516,12 @@ fn load(blob: &[u8], counter: u32) -> Result<u64, Unavailable> {
         frame: [0; 14],
         tracking: None,
     };
-    let laid_out = |region: Region, bytes: &[u8]| match region.writable {
-        true => machine.map(region.base, region.size, bytes),
-        false => machine.map_read_only(region.base, region.size, bytes),
+    let laid_out = |region: Region, bytes: &[u8]| {
+        if region.writable {
+            machine.map(region.base, region.size, bytes)
+        } else {
+            machine.map_read_only(region.base, region.size, bytes)
+        }
     };
     if !laid_out(ro, ro_data) || !laid_out(rw, rw_data) || !laid_out(stack, &[]) {
         return Err(Unavailable::Missing);

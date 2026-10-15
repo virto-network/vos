@@ -58,25 +58,29 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
 
 // ===== #[messages] =====
 
-/// The handlers of an actor. Each `#[msg]` method becomes a message type in
-/// a module named after the actor in snake case, or as
-/// `#[messages(module = "...")]` names it, with the handler's arguments as
-/// fields; `#[attestable]` and `#[workflow]` methods likewise. A workflow
-/// is routed in the actor's program as a handler is; an attestable method
-/// runs as its own kernel, derived at install from the entry generated for
-/// it, `__vos_attest_<name>`.
-/// A handler's options are `#[msg(role = "...", gas = N)]`, the role a
-/// caller needs and its gas limit, and on a query `linearizable`: it always
-/// reads after a read index, whatever consistency its client asks. That
-/// governs the query a client names: a method it calls reads its snapshot.
-/// A `#[workflow]` takes no `self`: `ctx: &mut Workflow<Self>` if it uses
-/// one, then its arguments, and `#[workflow(role = "...", gas = N)]` as a
-/// handler's options, the role checked when it starts and the gas each
-/// step's. The module imports its parent's names, so argument types
-/// resolve as they do beside the impl; a message type shadows a parent type
-/// of the same name, so a handler must not be named after an argument type
-/// (a `balance` handler beside a `Balance` argument). The impl block must
-/// define `fn new() -> Self`, the state of a new instance.
+/// The handlers of an actor.
+///
+/// - **Messages:** each `#[msg]` method becomes a message type, with the
+///   handler's arguments as fields, in a module named after the actor in
+///   snake case, or as `#[messages(module = "...")]` names it;
+///   `#[attestable]` and `#[workflow]` methods likewise.
+/// - **The module** imports its parent's names, so argument types resolve
+///   as they do beside the impl. A message type shadows a parent type of
+///   the same name, so a handler must not be named after an argument type
+///   (a `balance` handler beside a `Balance` argument).
+/// - **Workflows** are routed in the actor's program as handlers are. A
+///   `#[workflow]` takes no `self`: `ctx: &mut Workflow<Self>` if it uses
+///   one, then its arguments.
+/// - **Attestable methods** each run as their own kernel, derived at
+///   install from the entry generated for them, `__vos_attest_<name>`.
+/// - **Options:** `#[msg(role = "...", gas = N)]`, the role a caller needs
+///   and the handler's gas limit; `#[workflow(role = "...", gas = N)]`
+///   alike, the role checked when it starts and the gas each step's.
+/// - **Linearizable:** on a query, `#[msg(linearizable)]` always reads
+///   after a read index, whatever consistency its client asks. That governs
+///   the query a client names: a method it calls reads its snapshot.
+/// - **A new instance's state:** the impl block must define
+///   `fn new() -> Self`.
 #[proc_macro_attribute]
 pub fn messages(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut module = None;

@@ -141,26 +141,12 @@ pub const WORKFLOW_KEPT_MS: u64 = SESSION_EXPIRY_MS;
 // A node's default batch restores any workflow's snapshot.
 const _: () = assert!(min_refine_gas(256) <= REFINE_GAS);
 
-// What a workflow's step takes of its batch's budget:
-// - kept before it runs: `WORKFLOW_RESERVE`, `ARM_PAGE` for each page
-//   its program may write and `RESTORED_PAGE` for each its snapshot
-//   holds, every step, and its gas limit;
-// - its machine's gas: its effect-free code's share, the limit, and the
-//   limit again for each unit from its first effect, when the refine
-//   has it beyond what the step used, or the step ends at that effect;
-// - `WRITTEN_PAGE` for each page it writes, before the page opens,
-//   again in every step that writes it.
-// Effect-free code ends the step at the first page the meter cannot
-// pay, once its machine has moved: a step writes what the budget left
-// past its restore pays for, some 310 pages in a default batch when it
-// restores `cap::HELD_PAGES`, and a computation larger than a step
-// moves on, a step a batch.
-
 /// The agent's own work on a workflow's step beyond its handler's
 /// gas and its pages: reading its record and its program's header,
 /// acquiring its machine at its counter, and writing its record and
 /// rows back. Measured by the testkit's
-/// `the_workflow_reserves_cover_the_agents_own_work`.
+/// `the_workflow_reserves_cover_the_agents_own_work`. What a step takes
+/// of its batch's budget in all: [`crate::abi::cap::STEP_PAGES`].
 pub const WORKFLOW_RESERVE: u64 = 400_000;
 /// The same per page its program may write, which every step arms
 /// read-only and a pool prices a machine by.
@@ -169,9 +155,8 @@ pub const ARM_PAGE: u64 = 200;
 /// and repair of its first store, then its capture, compared with its
 /// base, hashed, in software on JAM, and compressed. About 340,000 on
 /// a VOS node and 830,000 on JAM for a page of random bytes, which
-/// compress the slowest; so a step beside the largest limit, restoring
-/// none, writes about 800 pages in a refine of the default budget,
-/// whatever its host ([`crate::abi::cap::STEP_PAGES`]).
+/// compress the slowest. How many a step writes:
+/// [`crate::abi::cap::STEP_PAGES`].
 pub const WRITTEN_PAGE: u64 = 1_100_000;
 /// The same per page a step restores: read, decompressed, hashed, in
 /// software on JAM, and written back. About 230,000 on a VOS node and

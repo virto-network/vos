@@ -23,7 +23,7 @@ use vos_wire::result::{Attest, InstanceGas, Outcome, Outgoing};
 use vos_wire::{Encode, defaults, keys};
 
 use super::Overlay;
-use super::base::{Base, Corrupt, Meter};
+use super::base::{Base, Corrupt, Meter, role_byte};
 use crate::machines::{self, Exit, Machine};
 use kernel::{kernel, random, serve_precompile};
 use memory::{copy_out, read, read_key, row, window, write};
@@ -198,9 +198,7 @@ impl<'a> Invocation<'a> {
     }
 
     fn role(&self, principal: &Principal) -> Result<Option<u8>, Corrupt> {
-        Ok(self
-            .read_state(&keys::member(principal))?
-            .and_then(|bytes| bytes.first().copied()))
+        Ok(role_byte(self.read_state(&keys::member(principal))?))
     }
 
     /// Serve a handler's machine's exits until it halts or fails. Inlined,
@@ -293,7 +291,7 @@ impl<'a> Invocation<'a> {
         instance: InstanceId,
         kind: Kind,
     ) -> Result<(), Failure> {
-        let r: [u64; 13] = core::array::from_fn(|index| machine.register(index));
+        let r = machine.registers();
         let callee = InstanceId(r[7] as u32);
         let method = MethodId(r[8] as u32);
         let call_arguments = read(machine, r[9], r[10], cap::REQUEST)?;
@@ -357,7 +355,7 @@ impl<'a> Invocation<'a> {
         arguments: &[u8],
         outcome: &mut Option<Ended>,
     ) -> Result<(), Failure> {
-        let r: [u64; 13] = core::array::from_fn(|index| machine.register(index));
+        let r = machine.registers();
         match op {
             Op::Input => {
                 copy_out(machine, arguments, r[7], r[8], r[9])?;
@@ -464,14 +462,14 @@ impl<'a> Invocation<'a> {
                 if !machine.charge(used) {
                     return Err(Failure::OutOfGas);
                 }
-                self.attests.push(Attest {
-                    program,
-                    arguments: call_arguments,
-                    output: output.clone(),
-                });
                 copy_out(machine, &output, r[10], 0, r[11])?;
                 machine.set_register(7, output.len() as u64);
                 machine.set_register(8, 0);
+                self.attests.push(Attest {
+                    program,
+                    arguments: call_arguments,
+                    output,
+                });
             }
             Op::Request | Op::Result | Op::Sleep => {
                 if outcome.is_some() {
@@ -506,7 +504,7 @@ impl<'a> Invocation<'a> {
     #[cold]
     #[inline(never)]
     fn pause(&mut self, machine: &mut Machine, op: Op) -> Result<Pause, Failure> {
-        let r: [u64; 13] = core::array::from_fn(|index| machine.register(index));
+        let r = machine.registers();
         if op == Op::Sleep {
             let until = r[7].max(self.base.time.saturating_add(1));
             return Ok(Pause::Sleep { until });

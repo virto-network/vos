@@ -115,6 +115,27 @@ fn outcome<R: Decode, E: Decode>(
     }
 }
 
+/// What a handler's and a workflow's contexts read alike: the batch's time
+/// and random bytes, and logs.
+macro_rules! batch_reads {
+    () => {
+        /// The time of the batch, or for a query of the last applied one, in
+        /// milliseconds since the Unix epoch.
+        pub fn now(&self) -> u64 {
+            host::now()
+        }
+
+        /// 32 bytes derived from the batch seed: the same on every replica.
+        pub fn random(&self) -> [u8; 32] {
+            host::random()
+        }
+
+        pub fn log(&self, level: Level, message: &str) {
+            host::log(level as u8, message.as_bytes());
+        }
+    };
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Level {
     Error = 0,
@@ -148,20 +169,7 @@ impl<A> Query<A> {
         (AgentId(agent), InstanceId(instance))
     }
 
-    /// The time of the batch, or for a query of the last applied one, in
-    /// milliseconds since the Unix epoch.
-    pub fn now(&self) -> u64 {
-        host::now()
-    }
-
-    /// 32 bytes derived from the batch seed: the same on every replica.
-    pub fn random(&self) -> [u8; 32] {
-        host::random()
-    }
-
-    pub fn log(&self, level: Level, message: &str) {
-        host::log(level as u8, message.as_bytes());
-    }
+    batch_reads!();
 
     /// Call a query of another instance of this agent.
     pub async fn call<M: QueryMethod>(
@@ -335,20 +343,7 @@ impl<A> Workflow<A> {
         me
     }
 
-    /// The time of the batch running this step, in milliseconds since the
-    /// Unix epoch.
-    pub fn now(&self) -> u64 {
-        host::now()
-    }
-
-    /// 32 bytes derived from the batch seed: the same on every replica.
-    pub fn random(&self) -> [u8; 32] {
-        host::random()
-    }
-
-    pub fn log(&self, level: Level, message: &str) {
-        host::log(level as u8, message.as_bytes());
-    }
+    batch_reads!();
 
     /// Call any handler of an instance of this agent, as the workflow's
     /// instance. The callee runs nested and completes before this returns;
@@ -449,6 +444,22 @@ impl<A: Encode + Decode + Tables + New> Workflow<A> {
     }
 }
 
+/// The deadline of an await, `within`, on each of its builders.
+macro_rules! within {
+    ($($await:ident),*) => {$(
+        impl<M> $await<M> {
+            /// The deadline, after this step's batch time; the agent's default
+            /// otherwise.
+            pub fn within(mut self, deadline: Duration) -> Self {
+                self.within = Some(deadline);
+                self
+            }
+        }
+    )*};
+}
+
+within!(Request, Start, Pending);
+
 /// A request of another agent, awaited.
 #[must_use = "a request is sent when awaited"]
 pub struct Request<M> {
@@ -456,15 +467,6 @@ pub struct Request<M> {
     instance: InstanceId,
     message: M,
     within: Option<Duration>,
-}
-
-impl<M> Request<M> {
-    /// The deadline, after this step's batch time; the agent's default
-    /// otherwise.
-    pub fn within(mut self, deadline: Duration) -> Self {
-        self.within = Some(deadline);
-        self
-    }
 }
 
 impl<M: Method> IntoFuture for Request<M> {
@@ -490,15 +492,6 @@ pub struct Start<M> {
     instance: InstanceId,
     arguments: M,
     within: Option<Duration>,
-}
-
-impl<M> Start<M> {
-    /// The deadline, after this step's batch time; the agent's default
-    /// otherwise.
-    pub fn within(mut self, deadline: Duration) -> Self {
-        self.within = Some(deadline);
-        self
-    }
 }
 
 impl<M: WorkflowMethod> IntoFuture for Start<M> {
@@ -528,15 +521,6 @@ pub struct Pending<M> {
     workflow: WorkflowId,
     within: Option<Duration>,
     _method: PhantomData<fn() -> M>,
-}
-
-impl<M> Pending<M> {
-    /// The deadline, after this step's batch time; the agent's default
-    /// otherwise.
-    pub fn within(mut self, deadline: Duration) -> Self {
-        self.within = Some(deadline);
-        self
-    }
 }
 
 impl<M: WorkflowMethod> IntoFuture for Pending<M> {

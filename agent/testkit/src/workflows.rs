@@ -1,10 +1,10 @@
 //! The model's workflows: started by a request or a call, run in their
 //! instance's actor program, stepped by the input that resumes each, a unit
 //! at a time, reaching their instance's state in sections, and snapshotted
-//! between steps
-//! as the default agent snapshots them: the counter after the pausing call,
-//! or where the step was preempted, the registers, each page the step wrote
-//! that differs from its base, and the call it left unserved.
+//! between steps as the default agent snapshots them: the counter after the
+//! pausing call, or where the step was preempted, the registers, each page
+//! the step wrote that differs from its base, and the call it left
+//! unserved.
 //!
 //! It shares nothing with the agent's capture and restore: the written
 //! pages are the interpreter's dirty pages, and a page's base is read from
@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 
 use vos_pvm::ExitReason;
 use vos_pvm::refine::{Machine, MemoryModel, PreparedProgram};
+use vos_pvm::spi::StandardLayout;
 use vos_wire::abi::{self, Failure, Kind, Op, cap, code, price};
 use vos_wire::batch::{Answer, Await};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, WorkflowId};
@@ -29,17 +30,20 @@ use crate::invocation::{Ended, Run};
 use crate::memory::precompile;
 use crate::{Step, Testkit, split};
 
-/// Where a machine returns to halt, and the top of its stack.
-const HALT: u64 = (1 << 32) - (1 << 16);
-const STACK_TOP: u64 = (1 << 32) - 2 * (1 << 16) - (1 << 24);
-
 type Rows = BTreeMap<Vec<u8>, Option<Vec<u8>>>;
 
-/// How a step left its workflow: paused, with the pages it stores and their
-/// bytes, or ended.
+/// How a step left its workflow: paused and captured, or ended.
 enum Left {
-    Paused(WorkflowState, Vec<Page>, Vec<Vec<u8>>, Snapshot),
+    Paused(WorkflowState, Captured),
     Ended(Outcome),
+}
+
+/// A paused step's pages and snapshot: the entries its run lists, the bytes
+/// of those it stores, in order, and the machine's snapshot.
+struct Captured {
+    pages: Vec<Page>,
+    stored: Vec<Vec<u8>>,
+    snapshot: Snapshot,
 }
 
 impl Testkit {
@@ -294,7 +298,7 @@ impl Testkit {
             step.attests = std::mem::take(&mut run.attests);
         };
         match left {
-            Ok(Left::Paused(state, pages, bytes, snapshot)) => {
+            Ok(Left::Paused(state, captured)) => {
                 keep_effects(&mut rows, &mut step);
                 let at = match state {
                     WorkflowState::Awaiting { deadline, .. } => deadline,
@@ -308,10 +312,10 @@ impl Testkit {
                 }
                 Self::move_due(&mut rows, id, &mut workflow, at);
                 workflow.state = state;
-                workflow.snapshot = Some(snapshot);
+                workflow.snapshot = Some(captured.snapshot);
                 rows.insert(keys::workflow(id), Some(workflow.encode()));
-                step.pages = pages;
-                stored = bytes;
+                step.pages = captured.pages;
+                stored = captured.stored;
             }
             Ok(Left::Ended(outcome)) => {
                 if let Outcome::Done(_) = outcome {
@@ -394,9 +398,10 @@ impl Testkit {
         let mut machine =
             Machine::load_prepared_at(&prepared, counter, &[], workflow.gas, MemoryModel::Auto)
                 .map_err(|_| Failure::Trapped)?;
+        // The halt address and the stack's top, as a new machine's.
         let registers = machine.registers_mut();
-        *registers = [0; 13];
-        (registers[0], registers[1]) = (HALT, STACK_TOP);
+        registers.fill(0);
+        registers[..2].copy_from_slice(&layout.registers[..2]);
         if let Some(snapshot) = &workflow.snapshot {
             registers.copy_from_slice(&snapshot.registers);
             for (index, hash) in &snapshot.pages {
@@ -469,72 +474,94 @@ impl Testkit {
             }
             Ended::Forbidden => unreachable!("a workflow is never refused"),
         };
-        if written.len() * PAGE > cap::STEP_PAGES {
-            return Err(Failure::Cap);
-        }
-        let mut now: BTreeMap<u32, [u8; 32]> = workflow
+        let held = workflow
             .snapshot
             .as_ref()
-            .map(|snapshot| snapshot.pages.iter().copied().collect())
-            .unwrap_or_default();
-        let mut pages = Vec::new();
-        let mut stored = Vec::new();
-        for page in written {
-            let index = page as u32;
-            let mut bytes = vec![0; PAGE];
-            assert!(
-                machine
-                    .memory()
-                    .read_bytes_checked(index * PAGE as u32, &mut bytes)
-            );
-            // The page's base: the read-write data where it lies, zeros
-            // elsewhere.
-            let mut base = vec![0; PAGE];
-            let address = page * PAGE as u64;
-            if address >= layout.rw.base {
-                let start = (address - layout.rw.base) as usize;
-                if start < parsed.rw_data.len() {
-                    let end = (start + PAGE).min(parsed.rw_data.len());
-                    base[..end - start].copy_from_slice(&parsed.rw_data[start..end]);
-                }
+            .map_or(&[][..], |snapshot| &snapshot.pages);
+        let captured = capture(&machine, &layout, id, held, written, pending)?;
+        Ok(Left::Paused(state, captured))
+    }
+}
+
+/// A paused step captured: each page it wrote, of `written`, stored by its
+/// hash when it differs from its base, the read-write data where it lies
+/// and zeros elsewhere, and from what the workflow `held`, or dropped when
+/// back at its base; and the machine's snapshot, with the call it left
+/// unserved, `pending`. Past [`cap::STEP_PAGES`] written, or
+/// [`cap::HELD_PAGES`] held after, the step fails.
+fn capture(
+    machine: &Machine,
+    layout: &StandardLayout,
+    id: WorkflowId,
+    held: &[(u32, [u8; 32])],
+    written: Vec<u64>,
+    pending: Option<u64>,
+) -> Result<Captured, Failure> {
+    if written.len() * PAGE > cap::STEP_PAGES {
+        return Err(Failure::Cap);
+    }
+    let mut now: BTreeMap<u32, [u8; 32]> = held.iter().copied().collect();
+    let mut pages = Vec::new();
+    let mut stored = Vec::new();
+    for page in written {
+        let index = page as u32;
+        let mut bytes = vec![0; PAGE];
+        assert!(
+            machine
+                .memory()
+                .read_bytes_checked(index * PAGE as u32, &mut bytes)
+        );
+        // The page's base: the read-write data where it lies, zeros
+        // elsewhere.
+        let mut base = vec![0; PAGE];
+        let address = page * PAGE as u64;
+        if address >= layout.rw.base {
+            let start = (address - layout.rw.base) as usize;
+            if start < layout.rw_data.len() {
+                let end = (start + PAGE).min(layout.rw_data.len());
+                base[..end - start].copy_from_slice(&layout.rw_data[start..end]);
             }
-            if bytes == base {
-                if now.remove(&index).is_some() {
-                    pages.push(Page {
-                        workflow: id,
-                        index,
-                        hash: None,
-                    });
-                }
-                continue;
-            }
-            let hash = digest(&bytes);
-            if now.insert(index, hash) != Some(hash) {
+        }
+        if bytes == base {
+            if now.remove(&index).is_some() {
                 pages.push(Page {
                     workflow: id,
                     index,
-                    hash: Some(hash),
+                    hash: None,
                 });
-                stored.push(bytes);
             }
+            continue;
         }
-        if now.len() > cap::HELD_PAGES {
-            return Err(Failure::Cap);
+        let hash = digest(&bytes);
+        if now.insert(index, hash) != Some(hash) {
+            pages.push(Page {
+                workflow: id,
+                index,
+                hash: Some(hash),
+            });
+            stored.push(bytes);
         }
-        // Past the call it stopped at, or where it ran out of gas, or where
-        // it was restored when it stopped before running.
-        let interpreter = machine.interpreter();
-        let counter = interpreter
-            .pending_host_call()
-            .map_or(interpreter.pc, |call| call.resume_pc);
-        let snapshot = Snapshot {
-            counter,
-            registers: machine.registers().to_vec(),
-            pages: now.into_iter().collect(),
-            pending,
-        };
-        Ok(Left::Paused(state, pages, stored, snapshot))
     }
+    if now.len() > cap::HELD_PAGES {
+        return Err(Failure::Cap);
+    }
+    // Past the call it stopped at, or where it ran out of gas, or where
+    // it was restored when it stopped before running.
+    let interpreter = machine.interpreter();
+    let counter = interpreter
+        .pending_host_call()
+        .map_or(interpreter.pc, |call| call.resume_pc);
+    let snapshot = Snapshot {
+        counter,
+        registers: machine.registers().to_vec(),
+        pages: now.into_iter().collect(),
+        pending,
+    };
+    Ok(Captured {
+        pages,
+        stored,
+        snapshot,
+    })
 }
 
 /// What a workflow's step may spend: its limit, the effect-free code's

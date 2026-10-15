@@ -10,11 +10,11 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use core::mem::ManuallyDrop;
 
 use vos_agent::machines::{ARGUMENTS, Exit, Machine, header};
 use vos_sdk::abi::precompile;
 use vos_sdk::prelude::*;
+use vos_sdk::runtime::Output;
 
 vos_sdk::program_runtime!(16 << 20);
 
@@ -58,12 +58,6 @@ struct Report {
     reads: Vec<Vec<u8>>,
 }
 
-#[repr(C)]
-pub struct Output {
-    address: u64,
-    len: u64,
-}
-
 /// # Safety
 ///
 /// The host maps the argument window at (`arguments`, `len`).
@@ -72,11 +66,7 @@ unsafe extern "C" fn tracker_refine(arguments: *const u8, len: u64) -> Output {
     // SAFETY: see the function's contract.
     let arguments = unsafe { core::slice::from_raw_parts(arguments, len as usize) };
     let (probe, _) = Probe::decode(arguments).expect("a probe");
-    let bytes = ManuallyDrop::new(run(probe).encode());
-    Output {
-        address: bytes.as_ptr() as u64,
-        len: bytes.len() as u64,
-    }
+    Output::leak(run(probe).encode())
 }
 
 fn run(probe: Probe) -> Report {
@@ -130,7 +120,7 @@ fn run(probe: Probe) -> Report {
         status,
         detail,
         gas: machine.gas(),
-        registers: (0..13).map(|index| machine.register(index)).collect(),
+        registers: machine.registers().to_vec(),
         served,
         written: machine
             .written()

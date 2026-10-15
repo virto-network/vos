@@ -6,11 +6,13 @@
 //! shares no overlay, dispatch or enforcement code with the agent: only
 //! the wire definitions in `vos_wire`.
 //!
-//! Beside it, [`programs`]: the guest programs, linked, for tests and
-//! benches.
+//! Beside it, for tests and benches: [`programs`], the guest programs,
+//! linked; and [`node`], what a VOS node serves the agent beyond the
+//! runtime's host.
 
 mod invocation;
 mod memory;
+pub mod node;
 pub mod programs;
 mod workflows;
 

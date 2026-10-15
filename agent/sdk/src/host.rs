@@ -13,16 +13,20 @@ use vos_wire::abi::{Op, Rows, cap, code};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Results(pub u64, pub u64);
 
+/// An `ecalli` of host call `$id`, a constant, with φ7 to φ12 from `$a`,
+/// an array of six: φ7 and φ8 after it. The default agent makes its own
+/// host calls with it.
 #[cfg(target_arch = "riscv64")]
+#[macro_export]
 macro_rules! ecalli {
     ($id:expr, $a:expr) => {{
         let [a0, a1, a2, a3, a4, a5]: [u64; 6] = $a;
         let (r0, r1): (u64, u64);
         // SAFETY: the ecalli convention passes φ7..φ12 in a0..a5 and returns
-        // in a0 and a1. Pointer arguments name live buffers the agent may
+        // in a0 and a1. Pointer arguments name live buffers the host may
         // write, so memory is not marked read-only.
         unsafe {
-            core::arch::asm!(
+            ::core::arch::asm!(
                 "li t0, {id}",
                 "csrw 0x801, zero",
                 "ecall",
@@ -37,7 +41,7 @@ macro_rules! ecalli {
                 options(nostack),
             );
         }
-        Results(r0, r1)
+        (r0, r1)
     }};
 }
 
@@ -70,9 +74,10 @@ pub use native::{Host, set_host};
 
 #[cfg(not(target_arch = "riscv64"))]
 macro_rules! ecalli {
-    ($id:expr, $a:expr) => {
-        native::call($id, $a)
-    };
+    ($id:expr, $a:expr) => {{
+        let Results(r0, r1) = native::call($id, $a);
+        (r0, r1)
+    }};
 }
 
 fn ptr(bytes: &[u8]) -> u64 {
@@ -163,7 +168,7 @@ pub fn random() -> [u8; 32] {
 
 /// (instance, agent).
 pub fn self_id() -> (u32, u32) {
-    let Results(instance, agent) = ecalli!(Op::SelfId.id(), [0; 6]);
+    let (instance, agent) = ecalli!(Op::SelfId.id(), [0; 6]);
     (instance as u32, agent as u32)
 }
 
@@ -264,8 +269,8 @@ fn with_reply_buffer<R>(f: impl FnOnce(&mut [u8]) -> R) -> R {
 /// [`vos_wire::abi::Failure`], with its detail. The callee runs once, so
 /// the output holds [`cap::REPLY`] bytes.
 pub fn call(instance: u32, method: u32, arguments: &[u8]) -> Result<Vec<u8>, (u32, Vec<u8>)> {
-    with_reply_buffer(|out| {
-        let Results(len, status) = ecalli!(
+    returned(|out| {
+        ecalli!(
             Op::Call.id(),
             [
                 u64::from(instance),
@@ -275,20 +280,15 @@ pub fn call(instance: u32, method: u32, arguments: &[u8]) -> Result<Vec<u8>, (u3
                 ptr_mut(out),
                 out.len() as u64
             ]
-        );
-        let reply = out[..(len as usize).min(out.len())].to_vec();
-        match status {
-            0 => Ok(reply),
-            code => Err((code as u32, reply)),
-        }
+        )
     })
 }
 
 /// Run one of this instance's attestable methods; its output, or an
 /// error code with its detail, as [`call`].
 pub fn attest(method: u32, arguments: &[u8]) -> Result<Vec<u8>, (u32, Vec<u8>)> {
-    with_reply_buffer(|out| {
-        let Results(len, status) = ecalli!(
+    returned(|out| {
+        ecalli!(
             Op::Attest.id(),
             [
                 u64::from(method),
@@ -298,11 +298,20 @@ pub fn attest(method: u32, arguments: &[u8]) -> Result<Vec<u8>, (u32, Vec<u8>)> 
                 out.len() as u64,
                 0
             ]
-        );
-        let output = out[..(len as usize).min(out.len())].to_vec();
+        )
+    })
+}
+
+/// The result of `operation`, a call or an attest made with a reply buffer
+/// as its output: the bytes it wrote there, or, with a non-zero status in
+/// φ8, its code and those bytes as the detail.
+fn returned(operation: impl FnOnce(&mut [u8]) -> (u64, u64)) -> Result<Vec<u8>, (u32, Vec<u8>)> {
+    with_reply_buffer(|out| {
+        let (len, status) = operation(out);
+        let bytes = out[..(len as usize).min(out.len())].to_vec();
         match status {
-            0 => Ok(output),
-            code => Err((code as u32, output)),
+            0 => Ok(bytes),
+            code => Err((code as u32, bytes)),
         }
     })
 }
@@ -330,7 +339,7 @@ fn resumed(len: u64) -> Vec<u8> {
 /// agent resumes it, at the latest `within` milliseconds of batch time
 /// later (0 for the agent's default).
 pub fn request(agent: u32, instance: u32, method: u32, arguments: &[u8], within: u64) -> Vec<u8> {
-    let Results(len, _) = ecalli!(
+    let (len, _) = ecalli!(
         Op::Request.id(),
         [
             u64::from(agent),
@@ -347,7 +356,7 @@ pub fn request(agent: u32, instance: u32, method: u32, arguments: &[u8], within:
 /// A workflow's wait for the result of a workflow it started at `agent`:
 /// it pauses, and returns the encoded answer, as [`request`] does.
 pub fn result(agent: u32, workflow: u64, within: u64) -> Vec<u8> {
-    let Results(len, _) = ecalli!(
+    let (len, _) = ecalli!(
         Op::Result.id(),
         [u64::from(agent), workflow, within, 0, 0, 0]
     );

@@ -14,11 +14,10 @@ mod accumulate;
 mod refine;
 
 use vos_agent::{host, machines};
+use vos_sdk::runtime::Output;
 
-use alloc::vec::Vec;
-use core::mem::ManuallyDrop;
-
-// The heap holds a batch's overlays and its work result, up to 4 MiB.
+// The heap holds a batch's overlays and its output, up to
+// `vos_wire::abi::cap::OUTPUT`.
 vos_sdk::program_runtime!(64 << 20);
 
 core::arch::global_asm!(
@@ -38,21 +37,6 @@ core::arch::global_asm!(
     "ret",
 );
 
-/// The halt convention's output: address in φ7, length in φ8.
-#[repr(C)]
-pub struct Output {
-    address: u64,
-    len: u64,
-}
-
-fn output(bytes: Vec<u8>) -> Output {
-    let bytes = ManuallyDrop::new(bytes);
-    Output {
-        address: bytes.as_ptr() as u64,
-        len: bytes.len() as u64,
-    }
-}
-
 /// # Safety
 ///
 /// The host maps the argument window at (`arguments`, `len`).
@@ -60,7 +44,7 @@ fn output(bytes: Vec<u8>) -> Output {
 unsafe extern "C" fn vos_refine(arguments: *const u8, len: u64) -> Output {
     // SAFETY: see the function's contract.
     let arguments = unsafe { core::slice::from_raw_parts(arguments, len as usize) };
-    output(refine::run(arguments))
+    Output::leak(refine::run(arguments))
 }
 
 /// # Safety

@@ -2,18 +2,11 @@
 //! an `async` one and, as macros a program crate invokes, the entry point,
 //! the allocator and the panic handler.
 
+use alloc::vec::Vec;
 use core::future::Future;
+use core::mem::ManuallyDrop;
 use core::pin::pin;
-use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-
-fn noop_raw() -> RawWaker {
-    fn clone(_: *const ()) -> RawWaker {
-        noop_raw()
-    }
-    fn noop(_: *const ()) {}
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
-    RawWaker::new(core::ptr::null(), &VTABLE)
-}
+use core::task::{Context, Poll, Waker};
 
 /// The invocation's arguments, decoded as `T`. Arguments that do not
 /// decode trap, which fails the step.
@@ -65,12 +58,25 @@ macro_rules! program_runtime {
 /// largest workflow needs.
 pub const PROGRAM_HEAP: usize = 512 << 10;
 
-/// An attestable method's output, by the halt convention: its address in
-/// φ7 and its length in φ8.
+/// A program's output, by the halt convention: its address in φ7 and its
+/// length in φ8. An attestable method's entry returns it, and so do the
+/// agent's refine and accumulate.
 #[repr(C)]
 pub struct Output {
     pub address: u64,
     pub len: u64,
+}
+
+impl Output {
+    /// `bytes` as the output, leaked: the host reads them once the program
+    /// halts.
+    pub fn leak(bytes: Vec<u8>) -> Self {
+        let bytes = ManuallyDrop::new(bytes);
+        Self {
+            address: bytes.as_ptr() as u64,
+            len: bytes.len() as u64,
+        }
+    }
 }
 
 /// An attestable method's entry: its arguments' address and length, in the
@@ -144,9 +150,7 @@ macro_rules! actor_program {
 /// the agent resumes its machine, in a later step. A future still pending
 /// awaited something else, and traps.
 pub fn block_on<F: Future>(future: F) -> F::Output {
-    // SAFETY: the vtable's functions ignore the data pointer.
-    let waker = unsafe { Waker::from_raw(noop_raw()) };
-    let mut context = Context::from_waker(&waker);
+    let mut context = Context::from_waker(Waker::noop());
     match pin!(future).poll(&mut context) {
         Poll::Ready(output) => output,
         Poll::Pending => panic!("awaited something that is not ready"),

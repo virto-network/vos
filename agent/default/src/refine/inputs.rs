@@ -31,14 +31,14 @@ pub(crate) fn called(
 ) -> Stepped {
     if workflows::is_start(base, instance, method) {
         let (run, started) = workflows::start(base, input, caller, instance, method, arguments);
-        let mut stepped = Stepped::new(Step::Ran(run), None);
+        let mut stepped = Stepped::ran(run);
         stepped
             .due
             .extend(started.map(|workflow| (base.time, workflow)));
         return stepped;
     }
     let run = command(base, index, input, caller, instance, method, arguments);
-    Stepped::new(Step::Ran(run), None)
+    Stepped::ran(run)
 }
 
 /// Why a message from `from` at `sequence` is out of its pair's order, if
@@ -97,11 +97,11 @@ pub(crate) fn message(
                 let resume = answer.encode();
                 workflows::resume_step(base, index, input, id, workflow, resume, kept, 0)
             }
-            None => Stepped::new(Step::Ran(consumed(input, Outcome::Done(Vec::new()))), None),
+            None => Stepped::ran(consumed(input, Outcome::Done(Vec::new()))),
         },
         Body::Wait { workflow, awaiting } => {
             let run = workflows::wait(base, input, from, workflow, awaiting);
-            Stepped::new(Step::Ran(run), None)
+            Stepped::ran(run)
         }
     };
     stepped.mark = Some(Mark::Pair(from, sequence));

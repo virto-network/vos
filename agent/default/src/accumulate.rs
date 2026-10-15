@@ -61,12 +61,8 @@ fn swap(slot: u64, bytes: &[u8], package: &[u8; 32], segments: &[u8; 32]) {
     let Ok((output, used)) = JamOutput::decode(bytes) else {
         return;
     };
-    let root: Hash = match read(ROOT) {
-        Some(bytes) => match bytes.try_into() {
-            Ok(root) => root,
-            Err(_) => return,
-        },
-        None => empty_root(&Blake2b),
+    let Ok(root) = read(ROOT).map_or_else(|| Ok(empty_root(&Blake2b)), Hash::try_from) else {
+        return;
     };
     if used == bytes.len() && output.root_before == root && timely(output.time, slot) {
         write(ROOT, &output.root_after);

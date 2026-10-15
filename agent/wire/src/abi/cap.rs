@@ -27,18 +27,27 @@ pub const WORKFLOW_PAGES: usize = 4096;
 /// The raw bytes of the pages one workflow step may write: past it, the
 /// step fails.
 ///
-/// **The budget binds first.** A step is taken its pages from the
-/// batch's budget, whatever host it runs on: it restores the pages its
-/// workflow holds at [`crate::defaults::RESTORED_PAGE`] each, and
-/// writes others at [`crate::defaults::WRITTEN_PAGE`] each, beside its
-/// gas limit and the agent's reserves. So the pages a step restores and
-/// writes satisfy `restored × RESTORED_PAGE + written × WRITTEN_PAGE +
-/// limit + reserves ≤ budget`: in a refine of the default budget
-/// (`REFINE_GAS`), a step that restores no page writes about 800, and
-/// one that restores [`HELD_PAGES`] about 310. Effect-free code that
-/// would pass it ends the step at the first page it cannot pay; once a
-/// unit has made an effect, the step waits for the next batch behind a
-/// step that ran a handler, or fails alone, out of gas.
+/// **The budget binds first.** A step takes from its batch's budget,
+/// whatever host it runs on:
+/// - before it runs, and every step: [`crate::defaults::WORKFLOW_RESERVE`],
+///   [`crate::defaults::ARM_PAGE`] for each page its program may write,
+///   [`crate::defaults::RESTORED_PAGE`] for each page its workflow holds,
+///   and its gas limit;
+/// - its machine's gas: its effect-free code's share, the limit, and the
+///   limit again for each unit from its first effect, when the refine has
+///   it beyond what the step used, or the step ends at that effect;
+/// - [`crate::defaults::WRITTEN_PAGE`] for each page it writes, before the
+///   page opens, again in every step that writes it.
+///
+/// So the pages a step restores and writes satisfy `restored ×
+/// RESTORED_PAGE + written × WRITTEN_PAGE + limit + reserves ≤ budget`:
+/// in a refine of the default budget (`REFINE_GAS`), a step that restores
+/// no page writes about 800, whatever its host, and one that restores
+/// [`HELD_PAGES`] about 310. Effect-free code that would pass it ends the
+/// step at the first page it cannot pay, once its machine has moved, so a
+/// computation larger than a step moves on, a step a batch; once a unit
+/// has made an effect, the step waits for the next batch behind a step
+/// that ran a handler, or fails alone, out of gas.
 pub const STEP_PAGES: usize = 8 << 20;
 /// The pages a workflow's snapshot may hold, 2.25 MiB: a step that
 /// would leave it more fails, so the least budget a node refines with

@@ -47,20 +47,25 @@ impl RefineArgs {
         let (item, used) = read_nat(bytes, at)?;
         let at = at + used;
         let (service, used) = read_nat(bytes, at)?;
-        let at = at + used;
-        let (len, used) = read_nat(bytes, at)?;
-        let at = at + used;
-        let end = at.checked_add(usize::try_from(len).ok()?)?;
-        let payload = bytes.get(at..end)?.to_vec();
+        let (payload, end) = read_bytes(bytes, at + used)?;
         let package_hash = bytes.get(end..end + 32)?.try_into().ok()?;
         (bytes.len() == end + 32).then_some(Self {
             core,
             item,
             service,
-            payload,
+            payload: payload.to_vec(),
             package_hash,
         })
     }
+}
+
+/// A natural length at `at`, then that many bytes: the bytes, and where
+/// they end.
+fn read_bytes(bytes: &[u8], at: usize) -> Option<(&[u8], usize)> {
+    let (len, used) = read_nat(bytes, at)?;
+    let at = at + used;
+    let end = at.checked_add(usize::try_from(len).ok()?)?;
+    Some((bytes.get(at..end)?, end))
 }
 
 /// Why a work item produced no output. `OutOfGas` (1) was captured from
@@ -73,6 +78,21 @@ pub enum WorkError {
     Oversize = 4,
     Bad = 5,
     Big = 6,
+}
+
+impl WorkError {
+    /// The error a work item's result names by `code`, if any.
+    pub const fn from_code(code: u8) -> Option<Self> {
+        Some(match code {
+            1 => WorkError::OutOfGas,
+            2 => WorkError::Panic,
+            3 => WorkError::BadExports,
+            4 => WorkError::Oversize,
+            5 => WorkError::Bad,
+            6 => WorkError::Big,
+            _ => return None,
+        })
+    }
 }
 
 /// One accumulate input, fetched with its kind byte: a work item's operand
@@ -174,25 +194,13 @@ impl Operand {
         at += 1;
         let result = match tag {
             0 => {
-                let (len, used) = read_nat(bytes, at)?;
-                at += used;
-                let end = at.checked_add(usize::try_from(len).ok()?)?;
-                let output = bytes.get(at..end)?.to_vec();
+                let (output, end) = read_bytes(bytes, at)?;
                 at = end;
-                Ok(output)
+                Ok(output.to_vec())
             }
-            1 => Err(WorkError::OutOfGas),
-            2 => Err(WorkError::Panic),
-            3 => Err(WorkError::BadExports),
-            4 => Err(WorkError::Oversize),
-            5 => Err(WorkError::Bad),
-            6 => Err(WorkError::Big),
-            _ => return None,
+            code => Err(WorkError::from_code(code)?),
         };
-        let (len, used) = read_nat(bytes, at)?;
-        at += used;
-        let end = at.checked_add(usize::try_from(len).ok()?)?;
-        let auth_trace = bytes.get(at..end)?.to_vec();
+        let (auth_trace, end) = read_bytes(bytes, at)?;
         (bytes.len() == end).then_some(Self {
             package_hash,
             segment_root,
@@ -200,7 +208,7 @@ impl Operand {
             payload_hash,
             gas_limit,
             result,
-            auth_trace,
+            auth_trace: auth_trace.to_vec(),
         })
     }
 }

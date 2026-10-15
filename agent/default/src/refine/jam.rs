@@ -202,7 +202,7 @@ pub(super) fn run(agent: AgentId, package: Package) -> Vec<u8> {
     } = package;
     let witnessed = Witnessed::verify(witness, &root, imports);
     let (time, seed) = (batch.time, batch.seed);
-    let mut base = Base::new(agent, &batch, Source::Witness(witnessed));
+    let mut base = Base::new(agent, Source::Witness(witnessed), time, seed, batch.budget);
     let result = run_batch(&mut base, batch).result();
     let section = base.section.into_inner();
     let Source::Witness(witnessed) = base.source else {

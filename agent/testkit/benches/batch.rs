@@ -21,13 +21,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use vos_pvm::accumulate_host::{self, ACCUMULATE_ENTRY, AccumulateContext};
-use vos_pvm::inner::gp_call::HISTORICAL_LOOKUP;
 use vos_pvm::pool::{MachinePool, OuterMachines};
-use vos_pvm::refine::Machine;
-use vos_pvm::refine_host::{RefineContext, StateReader, serve_lookup};
+use vos_pvm::refine_host::{RefineContext, StateReader};
 use vos_pvm::{ExitReason, PvmBackend};
+use vos_testkit::node::serve;
 use vos_testkit::programs::{actor, agent, method};
-use vos_wire::abi::{cap, code};
+use vos_wire::abi::cap;
 use vos_wire::batch::{Admin, Batch, Input, Request, Work};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, Session, WorkflowId};
 use vos_wire::jam::{AccumulateInput, Operand, RefineArgs};
@@ -60,20 +59,6 @@ struct Node {
     version: u64,
     /// The next batch's time.
     time: u64,
-}
-
-/// Serve the agent's `historical_lookup` from `programs`, as a node does
-/// ([`serve_lookup`]); any other call it does not serve answers `WHAT`.
-fn serve(
-    id: u64,
-    machine: &mut Machine,
-    programs: &HashMap<[u8; 32], Vec<u8>>,
-) -> Result<(), ExitReason> {
-    if id != u64::from(HISTORICAL_LOOKUP) {
-        machine.registers_mut()[7] = code::WHAT;
-        return Ok(());
-    }
-    serve_lookup(machine, u64::from(AGENT.0), |hash| programs.get(hash))
 }
 
 impl Node {
@@ -117,7 +102,9 @@ impl Node {
         let invocation = RefineContext::new(self.agent.load(0, &arguments, GAS).unwrap())
             .with_pool(Arc::clone(&self.pool))
             .with_state(Arc::clone(&self.snapshot))
-            .try_run_with_host(|id, machine| serve(id, machine, &self.programs))
+            .try_run_with_host(|id, machine| {
+                serve(id, machine, AGENT, |hash| self.programs.get(hash))
+            })
             .unwrap();
         assert_eq!(invocation.exit, ExitReason::Halt);
         let output = invocation.output_bounded(cap::OUTPUT).unwrap();

@@ -261,8 +261,9 @@ impl<'a> Run<'a> {
                 machine.registers_mut()[7] = code::OK;
             }
             Op::Caller => {
-                copy_out(machine, &caller.encode(), r[7], 0, r[8])?;
-                machine.registers_mut()[7] = caller.encode().len() as u64;
+                let encoded = caller.encode();
+                copy_out(machine, &encoded, r[7], 0, r[8])?;
+                machine.registers_mut()[7] = encoded.len() as u64;
             }
             Op::Now => machine.registers_mut()[7] = self.kit.time,
             Op::Random => {
@@ -426,14 +427,14 @@ impl<'a> Run<'a> {
                 if !machine.charge(used) {
                     return Err(Failure::OutOfGas);
                 }
-                self.attests.push(Attest {
-                    program: ProgramHash::of(program),
-                    arguments: call_arguments,
-                    output: output.clone(),
-                });
                 copy_out(machine, &output, r[10], 0, r[11])?;
                 machine.registers_mut()[7] = output.len() as u64;
                 machine.registers_mut()[8] = 0;
+                self.attests.push(Attest {
+                    program: ProgramHash::of(program),
+                    arguments: call_arguments,
+                    output,
+                });
             }
             Op::Request | Op::Result | Op::Sleep => {
                 if outcome.is_some() {

@@ -171,30 +171,29 @@ impl Invocation<'_> {
         let used = share.used(machine);
         // Before a unit's first effect, what serving the call takes of the
         // meter is kept first, so a call it cannot pay waits unserved.
-        let pages = match share.effectful {
-            true => 0,
-            false => {
-                let first = op.is_some_and(abi::is_effect);
-                let (pages, serving) = self.serving(machine, id, op, input);
-                // A first effect: the step's whole limit, beyond what it
-                // used.
-                let keep = match first {
-                    true => share.floor + used + share.limit,
-                    false => self.base.meter.kept.get(),
-                };
-                if self.base.meter.left.get() < keep + pages + serving {
-                    self.base.meter.overrun.set(true);
-                    *outcome = Some(self.preempt_or_fail(share, used > 0, Some(id), false)?);
-                    return Ok(());
-                }
-                if first {
-                    share.allotted = used + share.limit;
-                    machine.set_gas(share.limit);
-                    share.effectful = true;
-                }
-                self.base.meter.kept.set(keep + pages);
-                pages
+        let pages = if share.effectful {
+            0
+        } else {
+            let first = op.is_some_and(abi::is_effect);
+            let (pages, serving) = self.serving(machine, id, op, input);
+            // A first effect: the step's whole limit, beyond what it used.
+            let keep = if first {
+                share.floor + used + share.limit
+            } else {
+                self.base.meter.kept()
+            };
+            if self.base.meter.left() < keep + pages + serving {
+                self.base.meter.overrun();
+                *outcome = Some(self.preempt_or_fail(share, used > 0, Some(id), false)?);
+                return Ok(());
             }
+            if first {
+                share.allotted = used + share.limit;
+                machine.set_gas(share.limit);
+                share.effectful = true;
+            }
+            self.base.meter.keep(keep + pages);
+            pages
         };
         let served = match self.plain(machine, id, instance) {
             Ok(None) => Ok(()),
@@ -204,7 +203,7 @@ impl Invocation<'_> {
             Err(code) => Err(code),
         };
         // What the call's output was kept for, its pages take next.
-        self.base.meter.kept.set(self.base.meter.kept.get() - pages);
+        self.base.meter.keep(self.base.meter.kept() - pages);
         match served {
             Ok(()) => share.served = true,
             // Effect-free, a call the machine's share cannot pay waits
@@ -229,7 +228,7 @@ impl Invocation<'_> {
             }
             machine.set_gas(share.limit - used);
             share.allotted = share.limit;
-            self.base.meter.kept.set(share.floor + share.limit);
+            self.base.meter.keep(share.floor + share.limit);
         }
         Ok(())
     }
@@ -253,7 +252,7 @@ impl Invocation<'_> {
         if share.effectful || !moved {
             return Err(Failure::OutOfGas);
         }
-        self.base.meter.overrun.set(false);
+        self.base.meter.clear_overrun();
         Ok(Ended::Paused(Pause::Preempted { pending, idle }))
     }
 

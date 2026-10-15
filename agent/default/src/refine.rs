@@ -15,16 +15,15 @@ mod workflows;
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
-use core::cell::RefCell;
 
 use vos_wire::abi::Kind;
 use vos_wire::batch::{Query, Work};
 use vos_wire::ids::AgentId;
 use vos_wire::jam::RefineArgs;
-use vos_wire::result::{Outcome, PageSection};
+use vos_wire::result::Outcome;
 use vos_wire::{Decode, Encode};
 
-use base::{Base, Meter, Source};
+use base::{Base, Source};
 use batch::run_batch;
 use invocation::Invocation;
 
@@ -36,7 +35,7 @@ pub fn run(arguments: &[u8]) -> Vec<u8> {
     let agent = AgentId(arguments.service as u32);
     match work {
         Work::Batch(batch) => {
-            let mut base = Base::new(agent, &batch, Source::Node);
+            let mut base = Base::new(agent, Source::Node, batch.time, batch.seed, batch.budget);
             let result = run_batch(&mut base, batch);
             result.finish(base.section.into_inner())
         }
@@ -46,19 +45,8 @@ pub fn run(arguments: &[u8]) -> Vec<u8> {
 }
 
 fn run_query(agent: AgentId, query: Query) -> Outcome {
-    let base = Base {
-        agent,
-        source: Source::Node,
-        time: query.time,
-        seed: query.seed,
-        // One invocation, within its handler's limit: nothing to dispatch.
-        budget: u64::MAX,
-        meter: Meter::new(u64::MAX),
-        earlier: BTreeMap::new(),
-        installed: RefCell::new(BTreeMap::new()),
-        section: RefCell::new(PageSection::new()),
-        pages: BTreeMap::new(),
-    };
+    // One invocation, within its handler's limit: nothing to dispatch.
+    let base = Base::new(agent, Source::Node, query.time, query.seed, u64::MAX);
     let mut invocation = Invocation::new(&base, 0, Kind::Query);
     invocation.top(query.caller, query.instance, query.method, &query.arguments)
 }

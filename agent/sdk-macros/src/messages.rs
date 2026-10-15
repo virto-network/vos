@@ -5,7 +5,7 @@ use proc_macro2::{Span, TokenStream as Tokens};
 use quote::{format_ident, quote};
 use syn::spanned::Spanned;
 use syn::{
-    Attribute, Error, Expr, ExprLit, FnArg, ImplItem, ImplItemFn, ItemImpl, Lit, Meta, Pat,
+    Attribute, Error, Expr, ExprLit, FnArg, Ident, ImplItem, ImplItemFn, ItemImpl, Lit, Meta, Pat,
     PathArguments, ReturnType, Type,
 };
 use vos_wire::abi::Kind;
@@ -22,9 +22,16 @@ struct Handler {
     kind: Kind,
     options: Options,
     has_context: bool,
-    arguments: Vec<(syn::Ident, Type)>,
+    arguments: Vec<(Ident, Type)>,
     reply: Type,
     error: Option<Type>,
+}
+
+impl Handler {
+    /// Its arguments' names.
+    fn names(&self) -> Vec<&Ident> {
+        self.arguments.iter().map(|(name, _)| name).collect()
+    }
 }
 
 /// `T` and `Some(E)` for `Result<T, E>`, else the type and `None`.
@@ -262,14 +269,12 @@ pub(crate) fn messages_impl(mut input: ItemImpl, module: Option<String>) -> syn:
     };
     for handler in &handlers {
         let message = format_ident!("{}", upper_camel(&handler.name));
-        let method = &handler.method.sig.ident;
         let id = handler.id;
         let reply = &handler.reply;
         let fields = handler
             .arguments
             .iter()
             .map(|(name, ty)| quote!(pub #name: #ty));
-        let names: Vec<_> = handler.arguments.iter().map(|(name, _)| name).collect();
         schema.methods.push(MethodSchema {
             id: MethodId(id),
             name: handler.name.clone().into_bytes(),
@@ -288,155 +293,47 @@ pub(crate) fn messages_impl(mut input: ItemImpl, module: Option<String>) -> syn:
             .error
             .clone()
             .unwrap_or_else(|| syn::parse_quote!(::vos_sdk::context::Never));
-        if handler.kind == Kind::Attestable {
-            types.push(quote! {
-                impl ::vos_sdk::context::AttestableMethod for #message {
-                    type Actor = super::#actor;
-                    const ID: u32 = #id;
-                    type Output = #reply;
-                }
-            });
-            let entry = format_ident!("__vos_attest_{}", handler.name);
-            entries.push(quote! {
-                /// Run this method on its encoded arguments, `len` bytes at
-                /// `arguments`, leaving its encoded output where the result
-                /// says: the root of its kernel, the program derived from
-                /// what this entry reaches.
-                ///
-                /// # Safety
-                ///
-                /// `arguments` must point at `len` readable bytes.
-                #[doc(hidden)]
-                #[inline(never)]
-                pub unsafe extern "C" fn #entry(
-                    arguments: *const u8,
-                    len: u64,
-                ) -> ::vos_sdk::runtime::Output {
-                    // SAFETY: the caller's contract.
-                    let input = unsafe { ::core::slice::from_raw_parts(arguments, len as usize) };
-                    let ::core::result::Result::Ok((#module::#message { #(#names),* }, _)) =
-                        <#module::#message as ::vos_sdk::Decode>::decode(input)
-                    else {
-                        ::core::panic!("undecodable arguments")
-                    };
-                    let output = ::core::mem::ManuallyDrop::new(
-                        ::vos_sdk::Encode::encode(&Self::#method(#(#names),*)),
-                    );
-                    ::vos_sdk::runtime::Output {
-                        address: output.as_ptr() as u64,
-                        len: output.len() as u64,
+        match handler.kind {
+            Kind::Attestable => {
+                types.push(quote! {
+                    impl ::vos_sdk::context::AttestableMethod for #message {
+                        type Actor = super::#actor;
+                        const ID: u32 = #id;
+                        type Output = #reply;
                     }
-                }
-            });
-            attestables.push(quote! {
-                ::vos_sdk::runtime::Attestable {
-                    method: #id as u64,
-                    entry: super::#actor::#entry,
-                }
-            });
-            continue;
-        }
-        if handler.kind == Kind::Workflow {
-            types.push(quote! {
-                impl ::vos_sdk::context::WorkflowMethod for #message {
-                    type Actor = super::#actor;
-                    const ID: u32 = #id;
-                    type Output = #reply;
-                    type Error = #error;
-                }
-            });
-            let (context, argument) = match handler.has_context {
-                true => (
-                    quote!(let mut context = ::vos_sdk::context::Workflow::<super::#actor>::new();),
-                    quote!(&mut context,),
-                ),
-                false => (quote!(), quote!()),
-            };
-            let call = quote!(super::#actor::#method(#argument #(#names),*));
-            let call = if handler.method.sig.asyncness.is_some() {
-                quote!(::vos_sdk::runtime::block_on(#call))
-            } else {
-                call
-            };
-            let outcome = if handler.error.is_some() {
-                call
-            } else {
-                quote!(::core::result::Result::<_, ::vos_sdk::context::Never>::Ok(#call))
-            };
-            arms.push(quote! {
-                #id => {
-                    let #message { #(#names),* } = ::vos_sdk::runtime::arguments::<#message>();
-                    #context
-                    match #outcome {
-                        ::core::result::Result::Ok(result) => {
-                            ::vos_sdk::host::reply(&::vos_sdk::Encode::encode(&result));
-                        }
-                        ::core::result::Result::Err(error) => {
-                            ::vos_sdk::host::fail(&::vos_sdk::Encode::encode(&error));
-                        }
-                    }
-                }
-            });
-            continue;
-        }
-        types.push(quote! {
-            impl ::vos_sdk::context::Method for #message {
-                type Actor = super::#actor;
-                const ID: u32 = #id;
-                type Reply = #reply;
-                type Error = #error;
+                });
+                let (entry, attestable) = attestable_entry(handler, &actor, &module, &message);
+                entries.push(entry);
+                attestables.push(attestable);
             }
-        });
-        if handler.kind == Kind::Query {
-            types.push(quote! {
-                impl ::vos_sdk::context::QueryMethod for #message {}
-            });
-        }
-        let context = match (handler.kind, handler.has_context) {
-            (Kind::Query, true) => quote!(&::vos_sdk::context::Query::new(),),
-            (Kind::Command, true) => quote!(&mut ::vos_sdk::context::Command::new(),),
-            _ => quote!(),
-        };
-        let call = quote!(state.#method(#context #(message.#names),*));
-        let call = if handler.method.sig.asyncness.is_some() {
-            quote!(::vos_sdk::runtime::block_on(#call))
-        } else {
-            call
-        };
-        let outcome = if handler.error.is_some() {
-            quote!(#call)
-        } else {
-            quote!(::core::result::Result::<_, ::vos_sdk::context::Never>::Ok(#call))
-        };
-        let state = if handler.kind == Kind::Command {
-            quote!(let mut state = ::vos_sdk::state::load::<super::#actor>();)
-        } else {
-            quote!(let state = ::vos_sdk::state::load::<super::#actor>();)
-        };
-        let (before, save) = if handler.kind == Kind::Command {
-            (
-                quote!(let before = ::vos_sdk::Encode::encode(&state);),
-                quote!(::vos_sdk::state::save(&state, &before);),
-            )
-        } else {
-            (quote!(), quote!())
-        };
-        arms.push(quote! {
-            #id => {
-                let message = ::vos_sdk::runtime::arguments::<#message>();
-                #state
-                #before
-                match #outcome {
-                    ::core::result::Result::Ok(reply) => {
-                        #save
-                        ::vos_sdk::host::reply(&::vos_sdk::Encode::encode(&reply));
+            Kind::Workflow => {
+                types.push(quote! {
+                    impl ::vos_sdk::context::WorkflowMethod for #message {
+                        type Actor = super::#actor;
+                        const ID: u32 = #id;
+                        type Output = #reply;
+                        type Error = #error;
                     }
-                    ::core::result::Result::Err(error) => {
-                        ::vos_sdk::host::fail(&::vos_sdk::Encode::encode(&error));
-                    }
-                }
+                });
+                arms.push(workflow_arm(handler, &actor, &message));
             }
-        });
+            Kind::Command | Kind::Query => {
+                types.push(quote! {
+                    impl ::vos_sdk::context::Method for #message {
+                        type Actor = super::#actor;
+                        const ID: u32 = #id;
+                        type Reply = #reply;
+                        type Error = #error;
+                    }
+                });
+                if handler.kind == Kind::Query {
+                    types.push(quote! {
+                        impl ::vos_sdk::context::QueryMethod for #message {}
+                    });
+                }
+                arms.push(handler_arm(handler, &actor, &message));
+            }
+        }
     }
 
     let schema = schema.section();
@@ -482,4 +379,147 @@ pub(crate) fn messages_impl(mut input: ItemImpl, module: Option<String>) -> syn:
                 [#(#attestables),*];
         }
     })
+}
+
+/// An attestable method's entry, `__vos_attest_<name>`, the root its
+/// kernel is derived from, and the entry's row in the program's table.
+fn attestable_entry(
+    handler: &Handler,
+    actor: &Ident,
+    module: &Ident,
+    message: &Ident,
+) -> (Tokens, Tokens) {
+    let method = &handler.method.sig.ident;
+    let id = handler.id;
+    let names = handler.names();
+    let entry = format_ident!("__vos_attest_{}", handler.name);
+    let function = quote! {
+        /// Run this method on its encoded arguments, `len` bytes at
+        /// `arguments`, leaving its encoded output where the result
+        /// says: the root of its kernel, the program derived from
+        /// what this entry reaches.
+        ///
+        /// # Safety
+        ///
+        /// `arguments` must point at `len` readable bytes.
+        #[doc(hidden)]
+        #[inline(never)]
+        pub unsafe extern "C" fn #entry(
+            arguments: *const u8,
+            len: u64,
+        ) -> ::vos_sdk::runtime::Output {
+            // SAFETY: the caller's contract.
+            let input = unsafe { ::core::slice::from_raw_parts(arguments, len as usize) };
+            let ::core::result::Result::Ok((#module::#message { #(#names),* }, _)) =
+                <#module::#message as ::vos_sdk::Decode>::decode(input)
+            else {
+                ::core::panic!("undecodable arguments")
+            };
+            ::vos_sdk::runtime::Output::leak(::vos_sdk::Encode::encode(&Self::#method(
+                #(#names),*
+            )))
+        }
+    };
+    let row = quote! {
+        ::vos_sdk::runtime::Attestable {
+            method: #id as u64,
+            entry: super::#actor::#entry,
+        }
+    };
+    (function, row)
+}
+
+/// A workflow's arm of the dispatcher: its arguments decoded, its context
+/// made when it takes one, and its outcome passed to the agent.
+fn workflow_arm(handler: &Handler, actor: &Ident, message: &Ident) -> Tokens {
+    let method = &handler.method.sig.ident;
+    let id = handler.id;
+    let names = handler.names();
+    let (context, argument) = if handler.has_context {
+        (
+            quote!(let mut context = ::vos_sdk::context::Workflow::<super::#actor>::new();),
+            quote!(&mut context,),
+        )
+    } else {
+        (quote!(), quote!())
+    };
+    let outcome = outcome(
+        handler,
+        quote!(super::#actor::#method(#argument #(#names),*)),
+        quote!(),
+    );
+    quote! {
+        #id => {
+            let #message { #(#names),* } = ::vos_sdk::runtime::arguments::<#message>();
+            #context
+            #outcome
+        }
+    }
+}
+
+/// A handler's arm of the dispatcher: its message decoded, its instance's
+/// state loaded, its outcome passed to the agent, and a command's state
+/// saved when it replies.
+fn handler_arm(handler: &Handler, actor: &Ident, message: &Ident) -> Tokens {
+    let method = &handler.method.sig.ident;
+    let id = handler.id;
+    let names = handler.names();
+    let context = match (handler.kind, handler.has_context) {
+        (Kind::Query, true) => quote!(&::vos_sdk::context::Query::new(),),
+        (Kind::Command, true) => quote!(&mut ::vos_sdk::context::Command::new(),),
+        _ => quote!(),
+    };
+    let (state, save) = if handler.kind == Kind::Command {
+        (
+            quote! {
+                let mut state = ::vos_sdk::state::load::<super::#actor>();
+                let before = ::vos_sdk::Encode::encode(&state);
+            },
+            quote!(::vos_sdk::state::save(&state, &before);),
+        )
+    } else {
+        (
+            quote!(let state = ::vos_sdk::state::load::<super::#actor>();),
+            quote!(),
+        )
+    };
+    let outcome = outcome(
+        handler,
+        quote!(state.#method(#context #(message.#names),*)),
+        save,
+    );
+    quote! {
+        #id => {
+            let message = ::vos_sdk::runtime::arguments::<#message>();
+            #state
+            #outcome
+        }
+    }
+}
+
+/// The method's `call`, run to completion when it is `async`: its reply,
+/// after `save`, or its error, passed to the agent. A method that cannot
+/// fail always replies.
+fn outcome(handler: &Handler, call: Tokens, save: Tokens) -> Tokens {
+    let call = if handler.method.sig.asyncness.is_some() {
+        quote!(::vos_sdk::runtime::block_on(#call))
+    } else {
+        call
+    };
+    let result = if handler.error.is_some() {
+        call
+    } else {
+        quote!(::core::result::Result::<_, ::vos_sdk::context::Never>::Ok(#call))
+    };
+    quote! {
+        match #result {
+            ::core::result::Result::Ok(reply) => {
+                #save
+                ::vos_sdk::host::reply(&::vos_sdk::Encode::encode(&reply));
+            }
+            ::core::result::Result::Err(error) => {
+                ::vos_sdk::host::fail(&::vos_sdk::Encode::encode(&error));
+            }
+        }
+    }
 }

@@ -18,10 +18,10 @@ use crate::host;
 
 /// A key transform a table chooses.
 pub trait KeyTransform {
-    const KIND: keys::Transform;
+    const TRANSFORM: keys::Transform;
 }
 
-/// Rows keyed `H128(key) ‖ key`: they iterate in hash order, and a
+/// Rows keyed `H128(key) ‖ escape(key)`: they iterate in hash order, and a
 /// committed map's paths stay about log₂ n deep whatever keys clients
 /// choose.
 pub struct Hashed;
@@ -32,11 +32,11 @@ pub struct Hashed;
 pub struct Ordered;
 
 impl KeyTransform for Hashed {
-    const KIND: keys::Transform = keys::Transform::Hashed;
+    const TRANSFORM: keys::Transform = keys::Transform::Hashed;
 }
 
 impl KeyTransform for Ordered {
-    const KIND: keys::Transform = keys::Transform::Ordered;
+    const TRANSFORM: keys::Transform = keys::Transform::Ordered;
 }
 
 /// The transform of a table or committed map that names none.
@@ -171,7 +171,7 @@ macro_rules! rows_handle {
             pub const fn rows(&self) -> Rows {
                 Rows::$rows {
                     tag: self.tag.0,
-                    transform: T::KIND,
+                    transform: T::TRANSFORM,
                 }
             }
         }

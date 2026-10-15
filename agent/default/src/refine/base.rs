@@ -8,7 +8,6 @@ use core::cell::{Cell, RefCell};
 use core::ops::Range;
 
 use vos_wire::abi::{Failure, cap};
-use vos_wire::batch::Batch;
 use vos_wire::ids::{AgentId, InstanceId, Principal, WorkflowId};
 use vos_wire::records::{Installed, unstored, unversioned};
 use vos_wire::result::{PAGE, PageSection};
@@ -17,29 +16,54 @@ use vos_wire::{Decode, defaults, keys};
 use super::Overlay;
 use super::jam::Witnessed;
 use super::snapshots::Format;
-use crate::host::{SCAN_PAGE, StateRows, scan_page, state_read, state_read_into};
+use crate::host::{SCAN_PAGE, StateRows, state_read, state_read_into, state_scan};
 
 /// The refine's gas as the agent accounts for it, from the batch and state
 /// alone, never from `gas`, whose readings differ between hosts: what the
 /// batch's budget leaves once the dispatched steps are taken. So every host
 /// dispatches the same steps.
 pub(crate) struct Meter {
-    pub(crate) left: Cell<u64>,
+    left: Cell<u64>,
     /// What the running step keeps of `left`: its reserve, its handler's
     /// limit and the finish. The installed records it reads first and its
     /// served precompiles take from above it.
-    pub(crate) kept: Cell<u64>,
+    kept: Cell<u64>,
     /// A charge found nothing above `kept`.
-    pub(crate) overrun: Cell<bool>,
+    overrun: Cell<bool>,
 }
 
 impl Meter {
-    pub(crate) fn new(left: u64) -> Self {
+    fn new(left: u64) -> Self {
         Self {
             left: Cell::new(left),
             kept: Cell::new(0),
             overrun: Cell::new(false),
         }
+    }
+
+    /// What the batch's budget leaves.
+    pub(crate) fn left(&self) -> u64 {
+        self.left.get()
+    }
+
+    /// What the running step keeps of what is left.
+    pub(crate) fn kept(&self) -> u64 {
+        self.kept.get()
+    }
+
+    /// Keep `gas` for the running step, if what is left covers it: whether
+    /// it does.
+    pub(crate) fn keeps(&self, gas: u64) -> bool {
+        let covered = self.left.get() >= gas;
+        if covered {
+            self.kept.set(gas);
+        }
+        covered
+    }
+
+    /// Keep `gas` for the running step, which what is left covers.
+    pub(crate) fn keep(&self, gas: u64) {
+        self.kept.set(gas);
     }
 
     /// Take `gas` before the agent spends it; false, the step overrun, when
@@ -55,6 +79,28 @@ impl Meter {
                 false
             }
         }
+    }
+
+    /// Spend `gas` of what is left: what a step taken into the result kept
+    /// and used.
+    pub(crate) fn spend(&self, gas: u64) {
+        self.left.set(self.left.get() - gas);
+    }
+
+    /// Mark the running step overrun: what it would take lies past what is
+    /// left.
+    pub(crate) fn overrun(&self) {
+        self.overrun.set(true);
+    }
+
+    /// Whether the running step overran, the mark cleared.
+    pub(crate) fn overran(&self) -> bool {
+        self.overrun.replace(false)
+    }
+
+    /// Clear the running step's overrun: it ends where it stands, or waits.
+    pub(crate) fn clear_overrun(&self) {
+        self.overrun.set(false);
     }
 }
 
@@ -111,14 +157,14 @@ pub(crate) struct Base {
 }
 
 impl Base {
-    pub(crate) fn new(agent: AgentId, batch: &Batch, source: Source) -> Self {
+    pub(crate) fn new(agent: AgentId, source: Source, time: u64, seed: [u8; 32], budget: u64) -> Self {
         Self {
             agent,
             source,
-            time: batch.time,
-            seed: batch.seed,
-            budget: batch.budget,
-            meter: Meter::new(batch.budget),
+            time,
+            seed,
+            budget,
+            meter: Meter::new(budget),
             earlier: BTreeMap::new(),
             installed: RefCell::new(BTreeMap::new()),
             section: RefCell::new(PageSection::new()),
@@ -202,7 +248,7 @@ impl Base {
                 .or_else(|| witnessed.scan(prefix, after, cap::STORED_ROW))
                 .expect("a stored row past its cap");
         }
-        scan_page(prefix, after)
+        state_scan(prefix, after)
     }
 
     /// A value through this refine's earlier steps and applied state.
@@ -277,8 +323,11 @@ impl Base {
 
     /// A principal's role byte, through this refine's earlier steps.
     pub(crate) fn role(&self, principal: &Principal) -> Result<Option<u8>, Corrupt> {
-        Ok(self
-            .read(&keys::member(principal))?
-            .and_then(|bytes| bytes.first().copied()))
+        Ok(role_byte(self.read(&keys::member(principal))?))
     }
+}
+
+/// The role byte a principal's member row holds, if any.
+pub(crate) fn role_byte(member: Option<Vec<u8>>) -> Option<u8> {
+    member.and_then(|bytes| bytes.first().copied())
 }
