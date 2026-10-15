@@ -113,7 +113,6 @@ struct Dialing {
     endpoint: quinn::Endpoint,
     client: quinn::ClientConfig,
     address: SocketAddr,
-    /// The name this run dials with: its incarnation.
     name: String,
     quiet: Duration,
     spawner: Spawner,
