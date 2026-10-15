@@ -80,24 +80,24 @@ impl Share {
 }
 
 impl Invocation<'_> {
-    /// Run a workflow's machine, of `instance`'s workflow method, through
-    /// its step from where its snapshot left it, the call `pending` first:
-    /// until it pauses, is preempted, ends or fails. Its own gas goes to its
-    /// instance, as a handler's.
-    #[allow(clippy::too_many_arguments)]
+    /// Run a workflow's machine, `call` its method by its owner on the
+    /// step's input, through its step from where its snapshot left it, the
+    /// host call `pending` first: until it pauses, is preempted, ends or
+    /// fails. Its own gas goes to its instance, as a handler's.
     pub(in crate::refine) fn workflow(
         &mut self,
         machine: &mut Machine,
-        owner: Principal,
-        instance: InstanceId,
-        input: &[u8],
+        call: Call,
         share: &mut Share,
         pending: Option<u64>,
     ) -> Result<Ended, Failure> {
         machine.set_gas(share.limit);
-        self.instances.push(InstanceGas { instance, gas: 0 });
+        self.instances.push(InstanceGas {
+            instance: call.instance,
+            gas: 0,
+        });
         self.nested.push(0);
-        let ended = self.units(machine, owner, instance, input, share, pending);
+        let ended = self.units(machine, call, share, pending);
         let nested = self.nested.pop().expect("the workflow's entry");
         self.gas_used = share.used(machine);
         self.instances[0].gas += self.gas_used - nested;
@@ -107,9 +107,7 @@ impl Invocation<'_> {
     fn units(
         &mut self,
         machine: &mut Machine,
-        owner: Principal,
-        instance: InstanceId,
-        input: &[u8],
+        call: Call,
         share: &mut Share,
         pending: Option<u64>,
     ) -> Result<Ended, Failure> {
@@ -144,7 +142,7 @@ impl Invocation<'_> {
                 }
                 Exit::Fault(_) => return Err(Failure::Trapped),
                 Exit::Host(id) => {
-                    self.unit_call(machine, owner, instance, input, share, id, &mut outcome)?;
+                    self.unit_call(machine, call, share, id, &mut outcome)?;
                 }
             }
         }
@@ -152,14 +150,11 @@ impl Invocation<'_> {
 
     /// Serve the machine's host call `id` in its unit, or end the step at
     /// it unserved, or at the await it is, setting `outcome`.
-    #[allow(clippy::too_many_arguments)]
     #[inline(always)]
     fn unit_call(
         &mut self,
         machine: &mut Machine,
-        owner: Principal,
-        instance: InstanceId,
-        input: &[u8],
+        call: Call,
         share: &mut Share,
         id: u64,
         outcome: &mut Option<Ended>,
@@ -175,7 +170,7 @@ impl Invocation<'_> {
             0
         } else {
             let first = op.is_some_and(abi::is_effect);
-            let (pages, serving) = self.serving(machine, id, op, input);
+            let (pages, serving) = self.serving(machine, id, op, call.arguments);
             // A first effect: the step's whole limit, beyond what it used.
             let keep = if first {
                 share.floor + used + share.limit
@@ -195,11 +190,11 @@ impl Invocation<'_> {
             self.base.meter.keep(keep + pages);
             pages
         };
-        let served = match self.plain(machine, id, instance) {
+        let served = match self.plain(machine, id, call.instance) {
             Ok(None) => Ok(()),
             Ok(Some(op)) if !machine.charge(price::of(op)) => Err(Failure::OutOfGas),
-            Ok(Some(Op::Call)) => self.call(machine, instance, Kind::Workflow),
-            Ok(Some(op)) => self.operation(machine, None, op, owner, instance, input, outcome),
+            Ok(Some(Op::Call)) => self.call(machine, call.instance, Kind::Workflow),
+            Ok(Some(op)) => self.operation(machine, None, op, call, outcome),
             Err(code) => Err(code),
         };
         // What the call's output was kept for, its pages take next.

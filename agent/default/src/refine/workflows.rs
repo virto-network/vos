@@ -24,7 +24,7 @@ use vos_wire::{Decode, Encode, defaults};
 
 use super::invocation::{Ended, Invocation, Pause, Share};
 use super::snapshots::{Captured, capture, restore};
-use super::Overlay;
+use super::{Call, Overlay};
 use super::base::Base;
 use super::batch::{Batched, Stepped};
 use super::inputs::{consumed, split_writes};
@@ -191,19 +191,12 @@ fn writable(header: &vos_pvm_program::StandardHeader) -> Option<u64> {
     Some((rw.size + stack.size) / vos_wire::result::PAGE as u64)
 }
 
-/// A request's or a call's start of a workflow by `caller`, its owner: the
-/// workflow recorded, due at once, its program pinned, and the step
+/// A request's or a call's start of a workflow, `call`'s method by its
+/// caller, its owner: the workflow recorded, due at once, its program pinned, and the step
 /// answered `Started` with its id; or failed, as a handler's step that
 /// could not run fails.
-pub(super) fn start(
-    base: &Base,
-    input: InputRef,
-    caller: Principal,
-    instance: InstanceId,
-    method: MethodId,
-    arguments: &[u8],
-) -> (Run, Option<WorkflowId>) {
-    match started(base, caller, instance, method, arguments) {
+pub(super) fn start(base: &Base, input: InputRef, call: Call) -> (Run, Option<WorkflowId>) {
+    match started(base, call) {
         Ok((id, rows)) => {
             let mut run = consumed(input, Outcome::Started(id));
             run.writes = split_writes(rows).0;
@@ -213,13 +206,13 @@ pub(super) fn start(
     }
 }
 
-fn started(
-    base: &Base,
-    caller: Principal,
-    instance: InstanceId,
-    method: MethodId,
-    arguments: &[u8],
-) -> Result<(WorkflowId, Overlay), Failure> {
+fn started(base: &Base, call: Call) -> Result<(WorkflowId, Overlay), Failure> {
+    let Call {
+        caller,
+        instance,
+        method,
+        arguments,
+    } = call;
     if arguments.len() > cap::REQUEST {
         return Err(Failure::Cap);
     }
@@ -476,8 +469,13 @@ fn run(
     // judged.
     let resumed = machine.registers();
     let resumed_at = snapshot.map_or(0, |snapshot| snapshot.counter);
-    let (owner, instance) = (workflow.owner, workflow.instance);
-    let ended = invocation.workflow(&mut machine, owner, instance, resume, share, pending);
+    let call = Call {
+        caller: workflow.owner,
+        instance: workflow.instance,
+        method: workflow.method,
+        arguments: resume,
+    };
+    let ended = invocation.workflow(&mut machine, call, share, pending);
     match ended {
         Ok(Ended::Paused(pause)) => {
             let held = snapshot.map_or(&[][..], |snapshot| &snapshot.pages);

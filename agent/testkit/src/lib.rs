@@ -27,7 +27,7 @@ use vos_wire::records::versioned;
 use vos_wire::result::{Attest, CommittedWrite, InstanceGas, Outcome, Outgoing, Page, Write};
 use vos_wire::schema::{Schema, SchemaError};
 
-use invocation::Run;
+use invocation::{Call, Run};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InstallError {
@@ -260,13 +260,19 @@ impl Testkit {
         method: MethodId,
         arguments: &[u8],
     ) -> Step {
+        let call = Call {
+            caller,
+            instance,
+            method,
+            arguments,
+        };
         if self.is_workflow(instance, method) {
-            return self.start(caller, instance, method, arguments);
+            return self.start(call);
         }
         let step = self.steps;
         self.steps += 1;
         let mut run = Run::new(self, step, Kind::Command);
-        let result = run.top(caller, instance, method, arguments);
+        let result = run.top(call);
         let gas_used = run.gas_used;
         let instances = run.instances.clone();
         let outcome = result.unwrap_or_else(Outcome::failed);
@@ -379,8 +385,13 @@ impl Testkit {
         arguments: &[u8],
     ) -> Outcome {
         let mut run = Run::new(self, self.steps, Kind::Query);
-        run.top(caller, instance, method, arguments)
-            .unwrap_or_else(Outcome::failed)
+        run.top(Call {
+            caller,
+            instance,
+            method,
+            arguments,
+        })
+        .unwrap_or_else(Outcome::failed)
     }
 }
 

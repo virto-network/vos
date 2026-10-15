@@ -6,13 +6,13 @@ use alloc::vec::Vec;
 
 use vos_wire::abi::{Failure, Kind, Refusal};
 use vos_wire::batch::{Await, Body, Message};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal};
+use vos_wire::ids::{AgentId, Principal};
 use vos_wire::keys::Due;
 use vos_wire::records::Workflow;
 use vos_wire::result::{CommittedWrite, InputRef, Outcome, Outgoing, Run, Step, Write};
 use vos_wire::{Encode, defaults, keys};
 
-use super::Overlay;
+use super::{Call, Overlay};
 use super::base::{Base, Corrupt};
 use super::batch::{Mark, Stepped};
 use super::invocation::Invocation;
@@ -20,24 +20,16 @@ use super::workflows;
 
 /// A request's or a call's step: a handler's command, or a workflow's
 /// start, which its first step follows when the budget allows.
-pub(crate) fn called(
-    base: &Base,
-    index: u32,
-    input: InputRef,
-    caller: Principal,
-    instance: InstanceId,
-    method: MethodId,
-    arguments: &[u8],
-) -> Stepped {
-    if workflows::is_start(base, instance, method) {
-        let (run, started) = workflows::start(base, input, caller, instance, method, arguments);
+pub(crate) fn called(base: &Base, index: u32, input: InputRef, call: Call) -> Stepped {
+    if workflows::is_start(base, call.instance, call.method) {
+        let (run, started) = workflows::start(base, input, call);
         let mut stepped = Stepped::ran(run);
         stepped
             .due
             .extend(started.map(|workflow| (base.time, workflow)));
         return stepped;
     }
-    let run = command(base, index, input, caller, instance, method, arguments);
+    let run = command(base, index, input, call);
     Stepped::ran(run)
 }
 
@@ -84,8 +76,13 @@ pub(crate) fn message(
             arguments,
             awaiting,
         } => {
-            let caller = Principal::Agent(from);
-            let mut stepped = called(base, index, input, caller, instance, method, &arguments);
+            let call = Call {
+                caller: Principal::Agent(from),
+                instance,
+                method,
+                arguments: &arguments,
+            };
+            let mut stepped = called(base, index, input, call);
             if let Step::Ran(run) = &mut stepped.step {
                 answer(run, from, awaiting);
             }
@@ -150,18 +147,9 @@ pub(crate) fn consumed(input: InputRef, outcome: Outcome) -> Run {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn command(
-    base: &Base,
-    index: u32,
-    input: InputRef,
-    caller: Principal,
-    instance: InstanceId,
-    method: MethodId,
-    arguments: &[u8],
-) -> Run {
+fn command(base: &Base, index: u32, input: InputRef, call: Call) -> Run {
     let mut invocation = Invocation::new(base, index, Kind::Command);
-    let outcome = invocation.top(caller, instance, method, arguments);
+    let outcome = invocation.top(call);
     let Invocation {
         mut frames,
         instances,

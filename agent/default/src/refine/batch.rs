@@ -13,6 +13,7 @@ use vos_wire::result::{ResultWriter, Run, Step};
 use vos_wire::{defaults, keys};
 
 use super::admin::admin;
+use super::Call;
 use super::base::Base;
 use super::inputs::{acknowledge, called, failed_in_refine, message, out_of_order, sweep};
 use super::sessions::{ByName, Counts, Held, admit, by_name};
@@ -250,15 +251,13 @@ pub(crate) fn run_batch(base: &mut Base, batch: Batch) -> ResultWriter {
                             time: base.time,
                         };
                         let mark = Mark::Session(request.session, held.advanced(mark));
-                        let mut stepped = called(
-                            base,
-                            index,
-                            input,
-                            request.caller,
-                            request.instance,
-                            request.method,
-                            &request.arguments,
-                        );
+                        let call = Call {
+                            caller: request.caller,
+                            instance: request.instance,
+                            method: request.method,
+                            arguments: &request.arguments,
+                        };
+                        let mut stepped = called(base, index, input, call);
                         stepped.mark = Some(mark);
                         stepped
                     }

@@ -26,7 +26,7 @@ use vos_wire::records::{Snapshot, Workflow, WorkflowState};
 use vos_wire::result::{InstanceGas, Outcome, Outgoing, PAGE, Page, Write, digest};
 use vos_wire::{Decode, Encode, defaults};
 
-use crate::invocation::{Ended, Run};
+use crate::invocation::{Call, Ended, Run};
 use crate::memory::precompile;
 use crate::{Step, Testkit, split};
 
@@ -106,18 +106,12 @@ impl Testkit {
             <= self.budget
     }
 
-    /// Start `instance`'s workflow `method` for `owner`: `Started` with its
-    /// id, the workflow due at once; or failed, as a step that could not
-    /// run.
-    pub(crate) fn start(
-        &mut self,
-        owner: Principal,
-        instance: InstanceId,
-        method: MethodId,
-        arguments: &[u8],
-    ) -> Step {
+    /// Start a workflow, `call`'s method for its caller, its owner:
+    /// `Started` with its id, the workflow due at once; or failed, as a step
+    /// that could not run.
+    pub(crate) fn start(&mut self, call: Call) -> Step {
         self.steps += 1;
-        let (outcome, rows) = match self.started(owner, instance, method, arguments) {
+        let (outcome, rows) = match self.started(call) {
             Ok((id, rows)) => (Outcome::Started(id), rows),
             Err(code) => (Outcome::failed(code), Rows::new()),
         };
@@ -127,13 +121,13 @@ impl Testkit {
         step
     }
 
-    fn started(
-        &self,
-        owner: Principal,
-        instance: InstanceId,
-        method: MethodId,
-        arguments: &[u8],
-    ) -> Result<(WorkflowId, Rows), Failure> {
+    fn started(&self, call: Call) -> Result<(WorkflowId, Rows), Failure> {
+        let Call {
+            caller: owner,
+            instance,
+            method,
+            arguments,
+        } = call;
         if arguments.len() > cap::REQUEST {
             return Err(Failure::Cap);
         }
@@ -435,9 +429,14 @@ impl Testkit {
             .snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.pending);
-        let (owner, instance) = (workflow.owner, workflow.instance);
+        let call = Call {
+            caller: workflow.owner,
+            instance: workflow.instance,
+            method: workflow.method,
+            arguments: resume,
+        };
         let resumed = *machine.registers();
-        let ended = run.workflow(&mut machine, owner, instance, resume, workflow.gas, pending)?;
+        let ended = run.workflow(&mut machine, call, workflow.gas, pending)?;
         // The pages the step wrote, among those the program may write.
         let runs = [layout.rw, layout.stack]
             .map(|region| region.base / PAGE as u64..(region.base + region.size) / PAGE as u64);
@@ -603,18 +602,16 @@ fn preempt_or_fail(
 }
 
 impl Run<'_> {
-    /// Run a workflow's machine, of `instance`'s workflow method, through
-    /// its step a unit at a time, the call `pending` first: effect-free
-    /// code on the share of `limit`, each effectful unit from its first
-    /// effect with the whole limit, a call of this agent's an await. Its own
-    /// gas goes to its instance, as a handler's.
-    #[allow(clippy::too_many_arguments)]
+    /// Run a workflow's machine, `call` its method by its owner on the
+    /// step's input, through its step a unit at a time, the host call
+    /// `pending` first: effect-free code on the share of `limit`, each
+    /// effectful unit from its first effect with the whole limit, a call of
+    /// this agent's an await. Its own gas goes to its instance, as a
+    /// handler's.
     pub(crate) fn workflow(
         &mut self,
         machine: &mut Machine,
-        owner: Principal,
-        instance: InstanceId,
-        input: &[u8],
+        call: Call,
         limit: u64,
         pending: Option<u64>,
     ) -> Result<Ended, Failure> {
@@ -625,9 +622,12 @@ impl Run<'_> {
             effectful: false,
             served: false,
         };
-        self.instances.push(InstanceGas { instance, gas: 0 });
+        self.instances.push(InstanceGas {
+            instance: call.instance,
+            gas: 0,
+        });
         self.nested.push(0);
-        let ended = self.units(machine, owner, instance, input, &mut share, pending);
+        let ended = self.units(machine, call, &mut share, pending);
         let nested = self.nested.pop().expect("the workflow's entry");
         self.gas_used = share.used(machine);
         self.instances[0].gas += self.gas_used - nested;
@@ -637,9 +637,7 @@ impl Run<'_> {
     fn units(
         &mut self,
         machine: &mut Machine,
-        owner: Principal,
-        instance: InstanceId,
-        input: &[u8],
+        call: Call,
         share: &mut Share,
         pending: Option<u64>,
     ) -> Result<Ended, Failure> {
@@ -664,7 +662,7 @@ impl Run<'_> {
                     return preempt_or_fail(share, true, None, !share.served);
                 }
                 ExitReason::HostCall(id) => {
-                    self.unit_call(machine, owner, instance, input, share, id, &mut outcome)?;
+                    self.unit_call(machine, call, share, id, &mut outcome)?;
                 }
                 _ => return Err(Failure::Trapped),
             }
@@ -673,13 +671,10 @@ impl Run<'_> {
 
     /// Serve host call `id` in its unit, or end the step at it unserved,
     /// or at the await it is, setting `outcome`.
-    #[allow(clippy::too_many_arguments)]
     fn unit_call(
         &mut self,
         machine: &mut Machine,
-        owner: Principal,
-        instance: InstanceId,
-        input: &[u8],
+        call: Call,
         share: &mut Share,
         id: u64,
         outcome: &mut Option<Ended>,
@@ -702,7 +697,7 @@ impl Run<'_> {
             precompile(machine, id)
         } else if let Some(op) = op {
             if machine.charge(price::of(op)) {
-                self.operation(machine, op, owner, instance, Kind::Workflow, input, outcome)
+                self.operation(machine, op, call, Kind::Workflow, outcome)
             } else {
                 Err(Failure::OutOfGas)
             }

@@ -22,6 +22,18 @@ const MAX_DEPTH: usize = 63;
 /// Rows of state, each a key and its value, in key order.
 type StateRows = Vec<(Vec<u8>, Vec<u8>)>;
 
+/// A call of an instance's method: a request's, a message's, a query's, a
+/// nested call's, or a workflow's, of its method by its owner. Its
+/// arguments are what [`Op::Input`] copies out: for a workflow's step, the
+/// step's input.
+#[derive(Clone, Copy)]
+pub(crate) struct Call<'a> {
+    pub(crate) caller: Principal,
+    pub(crate) instance: InstanceId,
+    pub(crate) method: MethodId,
+    pub(crate) arguments: &'a [u8],
+}
+
 /// How an invocation ended, short of failing the whole step.
 pub(crate) enum Ended {
     Replied(Vec<u8>),
@@ -86,13 +98,13 @@ impl<'a> Run<'a> {
     }
 
     /// The entry invocation. `Err` is a failure code that fails the step.
-    pub(crate) fn top(
-        &mut self,
-        caller: Principal,
-        instance: InstanceId,
-        method: MethodId,
-        arguments: &[u8],
-    ) -> Result<Outcome, Failure> {
+    pub(crate) fn top(&mut self, call: Call) -> Result<Outcome, Failure> {
+        let Call {
+            instance,
+            method,
+            arguments,
+            ..
+        } = call;
         if arguments.len() > cap::REQUEST {
             return Err(Failure::Cap);
         }
@@ -102,13 +114,11 @@ impl<'a> Run<'a> {
             return Err(Failure::Unknown);
         }
         let gas = schema.gas_limit();
-        let (ended, used) = self
-            .invoke(caller, instance, method, arguments, gas)
-            .map_err(|(code, used)| {
-                // A failed step still used its gas.
-                self.gas_used = used;
-                code
-            })?;
+        let (ended, used) = self.invoke(call, gas).map_err(|(code, used)| {
+            // A failed step still used its gas.
+            self.gas_used = used;
+            code
+        })?;
         self.gas_used = used;
         Ok(match ended {
             Ended::Replied(reply) => Outcome::Done(reply),
@@ -123,14 +133,13 @@ impl<'a> Run<'a> {
 
     /// Run one invocation with `gas`: how it ended and the gas it used, or
     /// a code that fails the step with the gas used.
-    fn invoke(
-        &mut self,
-        caller: Principal,
-        instance: InstanceId,
-        method: MethodId,
-        arguments: &[u8],
-        gas: u64,
-    ) -> Result<(Ended, u64), (Failure, u64)> {
+    fn invoke(&mut self, call: Call, gas: u64) -> Result<(Ended, u64), (Failure, u64)> {
+        let Call {
+            caller,
+            instance,
+            method,
+            arguments,
+        } = call;
         let installed = self
             .kit
             .instances
@@ -170,7 +179,7 @@ impl<'a> Run<'a> {
         }
         self.stack.push(instance);
         self.nested.push(0);
-        let ended = self.serve(&mut machine, caller, instance, kind, arguments);
+        let ended = self.serve(&mut machine, call, kind);
         self.stack.pop();
         let nested = self.nested.pop().expect("this invocation's entry");
         let used = gas - machine.gas_remaining();
@@ -186,14 +195,7 @@ impl<'a> Run<'a> {
         }
     }
 
-    fn serve(
-        &mut self,
-        machine: &mut Machine,
-        caller: Principal,
-        instance: InstanceId,
-        kind: Kind,
-        arguments: &[u8],
-    ) -> Result<Ended, Failure> {
+    fn serve(&mut self, machine: &mut Machine, call: Call, kind: Kind) -> Result<Ended, Failure> {
         let mut outcome: Option<Ended> = None;
         loop {
             match machine.try_resume().map_err(|_| Failure::Trapped)? {
@@ -220,24 +222,27 @@ impl<'a> Run<'a> {
                     if !machine.charge(price::of(op)) {
                         return Err(Failure::OutOfGas);
                     }
-                    self.operation(machine, op, caller, instance, kind, arguments, &mut outcome)?;
+                    self.operation(machine, op, call, kind, &mut outcome)?;
                 }
                 _ => return Err(Failure::Trapped),
             }
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn operation(
         &mut self,
         machine: &mut Machine,
         op: Op,
-        caller: Principal,
-        instance: InstanceId,
+        call: Call,
         kind: Kind,
-        arguments: &[u8],
         outcome: &mut Option<Ended>,
     ) -> Result<(), Failure> {
+        let Call {
+            caller,
+            instance,
+            arguments,
+            ..
+        } = call;
         let r = *machine.registers();
         match op {
             Op::Input => {
@@ -358,15 +363,13 @@ impl<'a> Run<'a> {
                 // keep counting.
                 let effects = (self.messages.len(), self.attests.len(), self.written);
                 let gas = machine.gas_remaining();
-                let (ended, used) = self
-                    .invoke(
-                        Principal::Instance(instance),
-                        callee,
-                        method,
-                        &call_arguments,
-                        gas,
-                    )
-                    .map_err(|(code, _)| code)?;
+                let call = Call {
+                    caller: Principal::Instance(instance),
+                    instance: callee,
+                    method,
+                    arguments: &call_arguments,
+                };
+                let (ended, used) = self.invoke(call, gas).map_err(|(code, _)| code)?;
                 let frame = self.frames.pop().expect("the call's frame");
                 *self.nested.last_mut().expect("the caller's entry") += used;
                 if !machine.charge(used) {

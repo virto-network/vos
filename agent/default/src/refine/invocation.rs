@@ -22,7 +22,7 @@ use vos_wire::records::Installed;
 use vos_wire::result::{Attest, InstanceGas, Outcome, Outgoing};
 use vos_wire::{Encode, defaults, keys};
 
-use super::Overlay;
+use super::{Call, Overlay};
 use super::base::{Base, Corrupt, Meter, role_byte};
 use crate::machines::{self, Exit, Machine};
 use kernel::{kernel, random, serve_precompile};
@@ -81,13 +81,13 @@ impl<'a> Invocation<'a> {
         }
     }
 
-    pub(super) fn top(
-        &mut self,
-        caller: Principal,
-        instance: InstanceId,
-        method: MethodId,
-        arguments: &[u8],
-    ) -> Outcome {
+    pub(super) fn top(&mut self, call: Call) -> Outcome {
+        let Call {
+            instance,
+            method,
+            arguments,
+            ..
+        } = call;
         if arguments.len() > cap::REQUEST {
             return Outcome::failed(Failure::Cap);
         }
@@ -103,7 +103,7 @@ impl<'a> Invocation<'a> {
             return Outcome::failed(Failure::Unknown);
         }
         let gas = schema.gas_limit();
-        match self.invoke(caller, instance, method, arguments, gas) {
+        match self.invoke(call, gas) {
             Ok((ended, used)) => {
                 self.gas_used = used;
                 match ended {
@@ -125,14 +125,13 @@ impl<'a> Invocation<'a> {
 
     /// Run one invocation with `gas`: how it ended and the gas it used,
     /// or a failure of the whole step with the gas used.
-    fn invoke(
-        &mut self,
-        caller: Principal,
-        instance: InstanceId,
-        method: MethodId,
-        arguments: &[u8],
-        gas: u64,
-    ) -> Result<(Ended, u64), (Failure, u64)> {
+    fn invoke(&mut self, call: Call, gas: u64) -> Result<(Ended, u64), (Failure, u64)> {
+        let Call {
+            caller,
+            instance,
+            method,
+            arguments,
+        } = call;
         let installed = self.installed(instance).map_err(|code| (code, 0))?;
         let schema = installed
             .schema
@@ -168,14 +167,7 @@ impl<'a> Invocation<'a> {
         }
         self.stack.push(instance);
         self.nested.push(0);
-        let ended = self.serve(
-            &mut machine,
-            Some(&installed),
-            caller,
-            instance,
-            kind,
-            arguments,
-        );
+        let ended = self.serve(&mut machine, Some(&installed), call, kind);
         self.stack.pop();
         let nested = self.nested.pop().expect("this invocation's entry");
         let used = gas - machine.gas();
@@ -209,10 +201,8 @@ impl<'a> Invocation<'a> {
         &mut self,
         machine: &mut Machine,
         installed: Option<&Installed>,
-        caller: Principal,
-        instance: InstanceId,
+        call: Call,
         kind: Kind,
-        arguments: &[u8],
     ) -> Result<Ended, Failure> {
         let mut outcome: Option<Ended> = None;
         loop {
@@ -221,7 +211,7 @@ impl<'a> Invocation<'a> {
                 Exit::OutOfGas => return Err(Failure::OutOfGas),
                 Exit::Panic | Exit::Fault(_) => return Err(Failure::Trapped),
                 Exit::Host(id) => {
-                    let Some(op) = self.plain(machine, id, instance)? else {
+                    let Some(op) = self.plain(machine, id, call.instance)? else {
                         continue;
                     };
                     if !abi::allowed(kind, op) {
@@ -231,18 +221,10 @@ impl<'a> Invocation<'a> {
                         return Err(Failure::OutOfGas);
                     }
                     if op == Op::Call {
-                        self.call(machine, instance, kind)?;
+                        self.call(machine, call.instance, kind)?;
                         continue;
                     }
-                    self.operation(
-                        machine,
-                        installed,
-                        op,
-                        caller,
-                        instance,
-                        arguments,
-                        &mut outcome,
-                    )?;
+                    self.operation(machine, installed, op, call, &mut outcome)?;
                 }
             }
         }
@@ -307,15 +289,13 @@ impl<'a> Invocation<'a> {
         self.frames.push(BTreeMap::new());
         let effects = (self.messages.len(), self.attests.len(), self.write_bytes);
         let gas = machine.gas();
-        let (ended, used) = self
-            .invoke(
-                Principal::Instance(instance),
-                callee,
-                method,
-                &call_arguments,
-                gas,
-            )
-            .map_err(|(code, _)| code)?;
+        let call = Call {
+            caller: Principal::Instance(instance),
+            instance: callee,
+            method,
+            arguments: &call_arguments,
+        };
+        let (ended, used) = self.invoke(call, gas).map_err(|(code, _)| code)?;
         let frame = self.frames.pop().expect("the call's frame");
         *self.nested.last_mut().expect("the caller's entry") += used;
         if !machine.charge(used) {
@@ -343,18 +323,21 @@ impl<'a> Invocation<'a> {
     }
 
     /// Every other served operation.
-    #[allow(clippy::too_many_arguments)]
     #[inline(always)]
     fn operation(
         &mut self,
         machine: &mut Machine,
         installed: Option<&Installed>,
         op: Op,
-        caller: Principal,
-        instance: InstanceId,
-        arguments: &[u8],
+        call: Call,
         outcome: &mut Option<Ended>,
     ) -> Result<(), Failure> {
+        let Call {
+            caller,
+            instance,
+            arguments,
+            ..
+        } = call;
         let r = machine.registers();
         match op {
             Op::Input => {
