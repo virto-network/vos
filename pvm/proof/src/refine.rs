@@ -39,7 +39,6 @@ pub const REFINE_BUNDLE_FORMAT_VERSION: u32 = 4;
 /// An inner machine's precompile call ends its slice at a host exit, and its
 /// agent serves it in a slice of its own, so each served call costs two: a
 /// proven refine holds about 500 BLAKE2b compressions of its machines.
-/// Proving attestable methods (slice 5) inherits that bound.
 pub const MAX_REFINE_PROOF_SLICES: usize = 1_024;
 /// A handled outer host call can contribute at most one boundary per slice.
 pub const MAX_REFINE_HOST_BOUNDARIES: usize = MAX_REFINE_PROOF_SLICES;

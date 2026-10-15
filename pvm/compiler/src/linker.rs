@@ -1,15 +1,13 @@
-//! Linker-based RISC-V ELF to PVM transpilation.
+//! An ELF linked into a standard program, its relocations followed, so
+//! its code finds the data it references (`.rodata` constants, tables) and
+//! its data the code it points at.
 //!
-//! Unlike the basic `transpile_elf`, this module processes ELF relocations
-//! to correctly handle data references in code. This is required for
-//! real-world programs (like k256 crypto) that reference .rodata constants.
-//!
-//! Approach:
-//! 1. Parse ELF sections and relocations
-//! 2. Compute PVM memory layout (stack, ro_data, rw_data addresses)
-//! 3. Build a relocation map: code_offset → resolved_address
-//! 4. Translate RISC-V instructions, using relocation info to replace
-//!    AUIPC+LO12 pairs with direct load_imm of the final PVM address
+//! The parse reads the ELF's sections and symbols ([`elf`]), lays its data
+//! out ([`layout`]), reads its relocations ([`relocs`]) and finds where
+//! control may enter its code ([`targets`]). Translation then turns each
+//! instruction into PVM code, an AUIPC and the instruction completing its
+//! address into one load of the final address, and rewrites the code
+//! pointers in the data ([`translate`]).
 
 mod elf;
 mod layout;
@@ -186,7 +184,7 @@ pub(crate) struct TranspiledElf {
 /// Header-field derivation:
 ///
 /// - **`s` (stack size, `E₃`)** = the page-floored lowest ro section vaddr,
-///   minimum 16 KiB. `StandardProgram::layout` maps `page_round(s)` bytes
+///   or 16 KiB without one. `StandardProgram::layout` maps `page_round(s)` bytes
 ///   just below the argument zone with `φ1 = 0xFEFE_0000`; guest code is
 ///   SP-relative, so placement needs no linker cooperation.
 /// - **`z` (heap pages, `E₂`)** includes every trailing all-zero read-write
@@ -255,10 +253,9 @@ pub(crate) fn transpile_with(elf: &LinkedElf, link: Link) -> Result<TranspiledEl
     // and a plain jump (opcode 40 + imm32) is exactly 5 bytes, so the two
     // jumps land at IC 0 and IC 5 respectively — the entry points a GP host
     // selects by starting the instruction counter at 0 (refine / is-authorized)
-    // or 5 (accumulate). SP is no longer initialized here: the host owns it
-    // (kernel installs φ[1]=stack_top from the blob's container metadata). Each
-    // jump ends its basic block, so IC 5 begins a fresh block. Both fixups are
-    // resolved after translation in apply_fixups() (RISC-V vaddr → PVM PC).
+    // or 5 (accumulate). SP is the host's (φ1 = stack top). Each jump ends
+    // its basic block, so IC 5 begins a fresh block. Both fixups are resolved
+    // after translation in apply_fixups() (RISC-V vaddr → PVM PC).
     //
     // IC 0 → refine body = the ELF entry point (e_entry / _start).
     ctx.emit_jump(elf.entry_vaddr);

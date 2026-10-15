@@ -56,7 +56,9 @@ pub fn charge(id: u64, gas: &mut crate::Gas) -> bool {
     }
 }
 
-/// BLAKE2b-256 of `data`, unkeyed: the hash JAM names code by.
+/// BLAKE2b-256 of `data`, unkeyed: the hash JAM names code by. A guest
+/// computes the same with `vos_pvm_precompiles::blake2b_256`, through the
+/// BLAKE2b precompile.
 pub fn blake2b_256(data: &[u8]) -> [u8; 32] {
     let mut h = IV;
     // Parameter block: 32-byte digest, no key, fanout and depth 1.

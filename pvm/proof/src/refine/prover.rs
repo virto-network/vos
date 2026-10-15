@@ -510,7 +510,7 @@ impl Collector {
                 }
                 // The cause is the slice's last row: an ECALLI recorded as a
                 // host exit. The proof runtime acknowledges it and the row
-                // continues at the successor, as the legacy tracer does.
+                // continues at the successor, as `TracingPvm` does.
                 let Some(step) = active.steps.last_mut() else {
                     self.fail("precompile without a cause instruction");
                     return;

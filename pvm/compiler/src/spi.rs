@@ -1,8 +1,7 @@
-//! GP standard-program (SPI) blob emitter.
-//!
-//! Serializes the standard PVM program format — the blob
-//! `vos_pvm::spi::parse_standard_program` consumes. This is the byte-for-byte
-//! inverse of that parser and its `deblob_compact` code decoder:
+//! The blobs the compiler emits. A standard program (SPI), which the
+//! linker's `spi_blob` lays out and `vos_pvm_program` encodes, the
+//! byte-for-byte inverse of `vos_pvm::spi::parse_standard_program` and its
+//! `deblob_compact` code decoder:
 //!
 //! ```text
 //!   program:  E₃(|o|) ‖ E₃(|w|) ‖ E₂(z) ‖ E₃(s) ‖ o ‖ w ‖ E₄(|c|) ‖ c
@@ -14,6 +13,9 @@
 //! in bytes, `Eₙ(·)` is a fixed-width little-endian integer, and `E(·)` is
 //! the standard natural encoding. No metadata prefix is emitted or accepted:
 //! the result is one canonical bare program blob.
+//!
+//! And a JAM service's code blob, which carries such a program after the
+//! service's metadata.
 
 /// A JAM service's metadata, which its code blob carries before its
 /// program, as PolkaJam's own services do: a version (0), then its name,
@@ -56,8 +58,7 @@ fn encode_bytes(bytes: &[u8], out: &mut Vec<u8>) {
 
 #[cfg(test)]
 mod tests {
-    /// A service blob is its metadata, length-prefixed, then the program,
-    /// as the probe service PolkaJam ran was built.
+    /// A service blob is its metadata, length-prefixed, then the program.
     #[test]
     fn a_service_blob_carries_its_metadata_first() {
         let metadata = super::ServiceMetadata {

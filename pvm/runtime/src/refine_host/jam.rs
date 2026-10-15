@@ -8,8 +8,7 @@ use crate::refine::{Invocation, Machine, RefineError};
 use crate::{ExitReason, Gas};
 
 /// What the JAM-only host charges where PolkaJam's prices differ from the
-/// Gray Paper's base, as the probe in `spikes/sj-jam-b` measured them on
-/// PolkaJam 0.1.29, Gray Paper 0.8.0.
+/// Gray Paper's base, measured on PolkaJam 0.1.29 (Gray Paper 0.8.0).
 pub mod jam_gas {
     use crate::Gas;
 
@@ -19,8 +18,8 @@ pub mod jam_gas {
     pub const LOG: Gas = 1_000;
     /// A call PolkaJam does not serve, which answers `WHAT`.
     pub const UNSERVED: Gas = 1_000;
-    /// `fetch`, by the length asked for, fitted to the one length the probe
-    /// asked, a segment's 4,104 bytes: 171, served or answering `NONE`.
+    /// `fetch`, by the length asked for, fitted to the one length measured,
+    /// a segment's 4,104 bytes: 171, served or answering `NONE`.
     /// Other lengths are unmeasured.
     pub const FETCH_BASE: Gas = 10;
     pub const FETCH_PER_KIB: Gas = 40;

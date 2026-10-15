@@ -63,7 +63,8 @@ pub(crate) struct TranslationContext {
     /// Enables fusion with a subsequent ADD/AND/OR/XOR/load/store into the
     /// immediate form, eliminating the load_imm instruction entirely.
     pub(crate) pending_load_imm: Option<(u8, i64, usize)>,
-    /// Last immediate loaded into t0 (x5) — used for ecalli cap slot.
+    /// Last immediate loaded into t0 (x5): the id of the `ecalli` a marked
+    /// ecall becomes.
     last_t0_imm: Option<i32>,
     /// Set by the CSR marker 0x801: the next ecall becomes a PVM `ecalli`
     /// whose id was loaded into t0.
@@ -317,10 +318,6 @@ impl TranslationContext {
         }
     }
 
-    /// Emit a signed immediate using the minimum byte width.
-    /// PVM instruction categories OneRegOneImm and TwoRegOneImm derive
-    /// immediate length from the instruction skip distance, so shorter
-    /// encodings are automatically decoded correctly via sign extension.
     /// Compute the number of bytes needed for a variable-length immediate.
     fn var_imm_byte_count(imm: i32) -> usize {
         if imm == 0 {
@@ -334,6 +331,10 @@ impl TranslationContext {
         }
     }
 
+    /// Emit a signed immediate using the minimum byte width.
+    /// PVM instruction categories OneRegOneImm and TwoRegOneImm derive
+    /// immediate length from the instruction skip distance, so shorter
+    /// encodings are automatically decoded correctly via sign extension.
     pub(crate) fn emit_var_imm(&mut self, imm: i32) {
         if imm == 0 {
             // Zero bytes — decoder gets lx=0, sign_extend(0, 0) = 0
@@ -398,15 +399,15 @@ impl TranslationContext {
         Ok(())
     }
 
-    /// Build a mapping from RISC-V code addresses to PVM jump table addresses.
-    ///
-    /// Only creates jump table entries for the given `targets` — the set of
-    /// RISC-V addresses actually referenced as function pointers (e.g. from
     /// Check whether an address falls within any RISC-V code section.
     pub(crate) fn is_code_addr(&self, addr: u64) -> bool {
         crate::linker::in_ranges(&self.code_ranges, addr)
     }
 
+    /// Build a mapping from RISC-V code addresses to PVM jump table addresses.
+    ///
+    /// Only creates jump table entries for the given `targets` — the set of
+    /// RISC-V addresses actually referenced as function pointers (e.g. from
     /// absolute relocations in data sections like vtables). Returns a map of
     /// RISC-V address → jump table address (= (index+1)*2).
     ///

@@ -129,9 +129,9 @@ pub(super) fn layout(
     ro_sections: &[(u64, usize, Vec<u8>)],
     rw_sections: &[(u64, usize, Option<Vec<u8>>)],
 ) -> Result<Layout, TranspileError> {
-    // Compute PVM memory layout
-    // PVM linear memory: [stack: 0..s) [ro: s..s+|o|) [rw: s+P(|o|)..] [heap...]
-    // We set stack_size = minimum power-of-2 page boundary that contains all ro section addrs.
+    // The read-only data is linked from its lowest section's page, which is
+    // also the stack's size; without read-only data the stack is four pages
+    // (16 KiB). `link_elf_spi` re-bases both blobs to the GP layout.
     let ro_min = ro_sections.iter().map(|(a, _, _)| *a).min().unwrap_or(0);
     let ro_max = ro_sections
         .iter()
@@ -139,8 +139,6 @@ pub(super) fn layout(
         .max()
         .unwrap_or(0);
 
-    // Round ro_min down to page boundary for stack_size.
-    // Minimum 4 pages (16KB) so the stack is usable even without rodata.
     let page_size = u64::from(vos_pvm::PVM_PAGE_SIZE);
     let stack_size = if ro_min > 0 {
         (ro_min / page_size) * page_size

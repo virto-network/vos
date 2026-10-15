@@ -147,8 +147,7 @@ impl RefineContext {
     }
 
     /// Compute no precompile, as a JAM node does: the outer machine's
-    /// reach the embedder. An inner machine's return to the outer machine
-    /// as host calls on every host, for its agent to serve.
+    /// precompile calls reach the embedder.
     pub fn without_precompiles(mut self) -> Self {
         self.host = Host::Node { precompiles: false };
         self

@@ -2,6 +2,12 @@
 //! programs are pinned: a change to the bytes the derivation gives fails
 //! here until [`TRANSPILER_VERSION`] moves and the pins with it, since an
 //! installed kernel's hash is pinned on chain per version.
+//!
+//! The fixture is rebuilt with `just build-test-actors`, from
+//! `agent/test-actors/target/riscv64em-vos/release/kernels.elf`. A rebuild
+//! derives the same programs while the actor's source stands, but not the
+//! same file: its symbols' names carry crate hashes that follow where it
+//! was built and the SDK's dependencies.
 
 use vos_pvm_compiler::{TRANSPILER_VERSION, derive};
 
