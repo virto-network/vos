@@ -174,7 +174,9 @@ not on `vos-core`), 5 segments, `RAYON_NUM_THREADS=8`, under
   agent runs on one host, so every instance installed into it takes its
   target. Its first install records it (`keys::target`); a later install
   naming another is refused, `Failure::Target` (13), and a JAM builder
-  takes installs for JAM alone (`Error::Target`). `Admin::Install` and the
+  takes installs for JAM alone (`Error::Target`), as the agent refined
+  from a witness does itself, its first install included, its refusal's
+  detail JAM. `Admin::Install` and the
   `Installed` record name it; a workflow keeps it in its record (format
   5). The agent and the model hold every instance to the target's
   `cap::Limits` on every host, so a builder's simulation, the JAM refine

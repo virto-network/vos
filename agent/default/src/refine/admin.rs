@@ -10,7 +10,7 @@ use vos_wire::result::{InputRef, Outcome, Step, Write};
 use vos_wire::schema::Schema;
 use vos_wire::{Decode, Encode, keys};
 
-use super::base::{Base, Corrupt};
+use super::base::{Base, Corrupt, Source};
 use super::inputs::consumed;
 use crate::machines::{self, Machine};
 
@@ -32,7 +32,7 @@ pub(crate) fn admin(base: &Base, admin: Admin) -> Step {
             let Ok(agent) = agent_target(base) else {
                 return failed(Outcome::failed(Failure::Trapped));
             };
-            let installed = match install(agent, derivation, roles, target) {
+            let installed = match install(agent, host_target(base), derivation, roles, target) {
                 Ok(installed) => installed,
                 Err(outcome) => return failed(outcome),
             };
@@ -76,8 +76,18 @@ fn agent_target(base: &Base) -> Result<Option<Target>, Corrupt> {
         .map_err(|_| Corrupt)
 }
 
+/// The target the host running the refine serves, if it serves one alone:
+/// a refine from a witness is a JAM service's.
+fn host_target(base: &Base) -> Option<Target> {
+    match base.source {
+        Source::Node => None,
+        Source::Witness(_) => Some(Target::Jam),
+    }
+}
+
 /// Check an install for an agent of target `agent`, none before its first
-/// install: its target is the agent's, or it fails `Target`; each kernel is
+/// install, on a host serving `host` alone, or any: its target is the
+/// agent's and the host's, or it fails `Target`; each kernel is
 /// bound to an attestable method, every attestable method has exactly one,
 /// and every role name is mapped, read from the actor program's schema, or
 /// it fails `Unknown`; its statics are within its target's limits
@@ -85,6 +95,7 @@ fn agent_target(base: &Base) -> Result<Option<Target>, Corrupt> {
 /// in its detail ([`Refused`]).
 fn install(
     agent: Option<Target>,
+    host: Option<Target>,
     derivation: Derivation,
     roles: Vec<(Vec<u8>, u8)>,
     target: Target,
@@ -93,7 +104,11 @@ fn install(
         code: refused.failure(),
         detail: refused.encode(),
     };
-    if let Some(agent) = agent.filter(|&agent| agent != target) {
+    if let Some(agent) = [agent, host]
+        .into_iter()
+        .flatten()
+        .find(|&bound| bound != target)
+    {
         return Err(refused(Refused::Target { agent }));
     }
     let installed = package(derivation, roles, target).ok_or(Outcome::failed(Failure::Unknown))?;

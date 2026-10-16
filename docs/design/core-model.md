@@ -1104,8 +1104,8 @@ These form a prover track that runs alongside the core slices (section 16).
 - **Limits per target** [decided by the owner]. An agent runs on one
   host, so its target, VOS or JAM, is the agent's: its first install
   records it (`keys::target`), a later install naming another is refused
-  (`Failure::Target`), and a JAM builder takes installs for JAM alone.
-  The agent holds every instance to its target's limits (`cap::Limits`)
+  (`Failure::Target`), and a JAM builder takes installs for JAM alone,
+  as the agent refined from a witness does itself. The agent holds every instance to its target's limits (`cap::Limits`)
   on every host, so a builder's simulation, the JAM refine and a VOS
   node replaying the batch agree. A refused install's detail says why
   (`cap::Refused`), and the operator's CLI prints it:

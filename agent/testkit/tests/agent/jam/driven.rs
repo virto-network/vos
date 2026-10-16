@@ -106,6 +106,61 @@ fn the_builder_refuses_an_install_for_vos() {
     assert_eq!(driven.builder.store.root().unwrap(), root);
 }
 
+/// The agent refined from a witness, a JAM service's, refuses an install
+/// for VOS itself, its first included: a package naming one past the
+/// builder fails it `Target`, its detail JAM, and installs nothing.
+#[test]
+fn the_refine_refuses_an_install_for_vos() {
+    use vos_wire::abi::Failure;
+    use vos_wire::abi::cap::Refused;
+
+    let actors = Actors::load();
+    let mut paired = Paired::new(PvmBackend::Default, &programs(&actors), POLKAJAM_REFINE_GAS);
+    let counter = ProgramHash::of(&actors.counter);
+    let seed = Blake2b.hash(b"seed", &[&T0.to_le_bytes()]);
+    let install = install_for(Target::Jam, COUNTER, counter);
+    let mut prepared = paired
+        .builder
+        .prepare(
+            &paired.runner,
+            paired.chain.segments(),
+            vec![install],
+            T0,
+            seed,
+            &[],
+        )
+        .expect("a package");
+    let Input::Admin(Admin::Install { target, .. }) = &mut prepared.package.batch.inputs[0] else {
+        panic!("the install");
+    };
+    *target = Target::Vos;
+    let payload = Work::encode_package(&prepared.package);
+    let refined = paired
+        .chain
+        .refine(&paired.runner, &payload, Vec::new(), prepared.gas)
+        .expect("the package refines");
+    let exports = paired
+        .chain
+        .da
+        .exports(&refined.segment_root)
+        .expect("the exports");
+    let encoded = exports[refined.output.pages as usize..].concat();
+    let (result, _) = WorkResult::decode(&encoded).expect("a work result");
+    let Step::Ran(run) = &result.steps[0] else {
+        panic!("the install runs");
+    };
+    let refused = Refused::Target { agent: Target::Jam };
+    assert_eq!(
+        run.outcome,
+        Outcome::Failed {
+            code: Failure::Target,
+            detail: refused.encode(),
+        }
+    );
+    assert!(run.writes.is_empty());
+    assert_ne!(refined.output.root_after, prepared.pending.root);
+}
+
 /// A package the chain refused, accumulated past its time or refined out
 /// of gas, is made again at a new time, and lands.
 #[test]

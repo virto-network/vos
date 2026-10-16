@@ -109,7 +109,8 @@ const _: () = assert!(WORKFLOW_STEP_RESULT + 64 <= WORK_RESULT);
 /// [`Limits`] its instances run within. An agent runs on one host, so its
 /// first install records its target ([`crate::keys::target`]) and every
 /// later one names the same, or is refused, [`super::Failure::Target`]; a
-/// JAM builder takes no install for VOS. Each install record names it too.
+/// JAM builder takes no install for VOS, and the agent refined from a
+/// witness refuses one. Each install record names it too.
 /// The agent holds its instances to their target's limits on every host,
 /// so a JAM builder's simulation, the JAM refine and a VOS node running the
 /// same batch agree.
@@ -314,7 +315,8 @@ const _: () = assert!(VOS.attest <= REQUEST && VOS.attest <= REPLY);
 /// static past its target's limits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum Refused {
-    /// The agent's target, which the install did not name.
+    /// The agent's target, recorded or its host's, which the install did
+    /// not name.
     #[codec(index = 0)]
     Target { agent: Target },
     /// The kernels it binds.
