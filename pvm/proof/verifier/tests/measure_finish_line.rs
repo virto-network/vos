@@ -12,8 +12,8 @@
 //! segment).
 //!
 //! Feature-agnostic: build WITHOUT `poseidon2-channel` for the production
-//! Blake2s/SimdBackend CEILING, WITH it for the Poseidon2-M31 CpuBackend+to_cpu
-//! path (Track A's real stack). The harness prints which path it ran.
+//! Blake2s-M31 channel, WITH it for the Poseidon2-M31 one; both prove on
+//! `SimdBackend`. The harness prints which path it ran.
 //!
 //! Run (one measurement per process so `VmHWM` is clean):
 //!   STEPS=7    cargo test -p vos-pvm-proof-verifier --release --test measure_finish_line \

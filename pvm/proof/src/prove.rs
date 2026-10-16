@@ -1249,9 +1249,8 @@ fn prove_impl_with_components_overridden(
     let t = Instant::now();
     let mut tree_builder = commitment_scheme.tree_builder();
     for component_trace in &traces {
-        // `for_commit` transplants the SimdBackend-generated columns into the
-        // commitment scheme's backend (identity on SimdBackend; `to_cpu` under
-        // `poseidon2-channel`, whose Poseidon2-M31 commit ops are CpuBackend-only).
+        // `for_commit` hands the SimdBackend-generated columns to the
+        // commitment scheme, which commits on SimdBackend under either PCS.
         tree_builder.extend_evals(for_commit(
             component_trace.to_circle_evaluation(PREPROCESSED_TRACE_IDX),
         ));

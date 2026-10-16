@@ -1,21 +1,14 @@
 #![cfg(feature = "poseidon2-channel")]
 
-//! D1 backend spike (P5.0 / native-recursion Stage-0).
+//! One full canonical segment (`prove_canonical`, every component) proves
+//! and verifies under the Poseidon2-M31 PCS: the Merkle commitments and the
+//! Fiat-Shamir transcript are both Poseidon2-M31, with no Blake2s, and
+//! `program_commitment_of_proof` returns a `P2Hash`.
 //!
-//! GATE: ONE real full-component **canonical** segment (the `prove_canonical`
-//! path) proves+verifies end-to-end under the Poseidon2-M31 PCS — the
-//! M31-algebraic Merkle commitment AND the M31-algebraic Fiat-Shamir transcript
-//! (no Blake2s on commit or transcript). `program_commitment_of_proof` returns
-//! a `P2Hash`.
-//!
-//! MECHANISM (D1-A2, RECORDED): the production framework generates the main /
-//! preprocessed / logup-interaction traces on `SimdBackend` unchanged; the
-//! committed columns are transplanted to `CpuBackend` (`recursion_pcs::for_commit`
-//! = `to_cpu`) at the commit boundary, and the proof is driven through
-//! `prove::<CpuBackend, P2MerkleChannel>` over `FrameworkComponent`s rewrapped as
-//! `ComponentProver<CpuBackend>` (the `to_component_prover` return type flips to
-//! the `ProverBackend` alias). No framework genericization (A1) and no
-//! SimdBackend Poseidon2 commit op (A3) were needed — the transplant suffices.
+//! The proof is generated and committed on `SimdBackend`, as the Blake2s
+//! stack's is. The verifier accepts the honest proof under the MOBILE policy,
+//! rejects a main-trace root with one limb changed, and refuses a
+//! non-canonical M31 root without panicking.
 //!
 //! Run: `cargo test -p vos-pvm-proof-verifier --features poseidon2-channel \
 //!         --test poseidon2_canonical_segment -- --nocapture`
