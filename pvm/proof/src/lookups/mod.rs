@@ -12,6 +12,7 @@ mod relations;
 #[cfg(feature = "prover")]
 pub use self::logup_trace_builder::LogupTraceBuilder;
 pub use self::relations::boundary_relation_challenges;
+pub use self::relations::{PROG_MEMORY_N_FLAG_BYTES, PROG_MEMORY_N_FLAGS};
 pub use self::{
     range_check::Range256LookupElements,
     relations::{

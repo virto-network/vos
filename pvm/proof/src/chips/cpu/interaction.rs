@@ -559,7 +559,7 @@ pub(super) fn generate_interaction_trace(
         );
     }
 
-    // ── ProgramMemory consumer (prover-side, 2 paired, 33 limbs) ──
+    // ── ProgramMemory consumer (prover-side, 2 paired, 36 limbs) ──
     {
         let prog_mem: &ProgramMemoryLookupElements = lookup_elements.as_ref();
         let pc = crate::trace::original_base_column!(component_trace, Column::Pc);
@@ -598,6 +598,14 @@ pub(super) fn generate_interaction_trace(
         tuple.push(fb3[0].clone());
         tuple.push(fb4[0].clone());
         tuple.push(fb5[0].clone());
+        for byte in [
+            Column::FlagByte6,
+            Column::FlagByte7,
+            Column::FlagByte8,
+            Column::FlagByte9,
+        ] {
+            tuple.push(component_trace.original_base_column::<1, _>(byte)[0].clone());
+        }
         tuple.extend_from_slice(&imm_y_for_lookup);
         tuple.extend_from_slice(&branch_target_for_lookup);
         tuple.push(host_call_precompile_dispatch[0].clone());

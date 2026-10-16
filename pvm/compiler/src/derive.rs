@@ -125,6 +125,8 @@ pub enum DeriveError {
          read-write data at {end:#x} from a page: build with the guest's linker script"
     )]
     Heap { start: u64, size: u64, end: u64 },
+    #[error("a kernel's instruction at {0:#x} jumps statically to the halt address")]
+    HaltTarget(u64),
     #[error("a kernel reaches code from {0:#x} to {1:#x}, which no code section holds whole")]
     Unreadable(u64, u64),
     #[error(
@@ -702,6 +704,9 @@ fn kernel(graph: &Graph, method: u32, entry: u64) -> Result<Vec<u8>, DeriveError
             id: u64::from(id),
             chain: reached.chain(graph, address),
         });
+    }
+    if let Some(pc) = transpiled.static_halt_target() {
+        return Err(DeriveError::HaltTarget(pc));
     }
     let blob = spi_blob(transpiled)?;
     // The argument pages are where the prologue reads into: the first of

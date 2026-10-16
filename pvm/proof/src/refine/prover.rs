@@ -985,12 +985,13 @@ fn observed_step(
     );
     let (reg_a, reg_b, reg_d) = decode_reg_indices(opcode, &decoded);
     let regs_after = machine.registers;
-    let changed: Vec<usize> = (0..PVM_REGISTER_COUNT)
-        .filter(|&index| observation.registers_before[index] != regs_after[index])
-        .collect();
-    if changed.len() > 1 {
-        return Err("one instruction changed more than one register".to_string());
-    }
+    let reg_write = crate::core::tracing::recorded_write(
+        opcode,
+        (reg_a, reg_b, reg_d),
+        &observation.registers_before,
+        &regs_after,
+        observation.exit,
+    )?;
     let gas_charged = if observation.need_gas_charge_before {
         observation
             .gas_before
@@ -1013,7 +1014,7 @@ fn observed_step(
         skip_len,
         regs_before: observation.registers_before,
         regs_after,
-        reg_write: changed.first().copied(),
+        reg_write,
         reg_a,
         reg_b,
         reg_d,

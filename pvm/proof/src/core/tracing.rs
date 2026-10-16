@@ -325,21 +325,14 @@ impl TracingPvm {
             self.pvm.pc
         };
 
-        let reg_write = (0..PVM_REGISTER_COUNT).find(|&i| regs_before[i] != regs_after[i]);
-        // One interpreter step writes at most one register (every opcode
-        // arm is a single assignment) — the invariant that
-        // makes `RegWrite` the whole register-file delta. Verify rather
-        // than assume: a second changed index would be silently lost.
-        if let Some(i) = reg_write
-            && let Some(j) =
-                ((i + 1)..PVM_REGISTER_COUNT).find(|&j| regs_before[j] != regs_after[j])
-        {
-            panic!(
-                "step at ts {} changed registers {i} and {j}: a compact \
-                     step records exactly one register write",
-                self.timestamp,
-            );
-        }
+        let reg_write = recorded_write(
+            opcode,
+            (reg_a, reg_b, reg_d),
+            &regs_before,
+            &regs_after,
+            result.as_ref(),
+        )
+        .unwrap_or_else(|error| panic!("step at ts {}: {error}", self.timestamp));
         self.last_regs = regs_after;
 
         let gas_charged = if need_gas_charge {
@@ -1705,6 +1698,36 @@ mod tests {
 }
 
 /// Decode register indices from decoded instruction arguments.
+/// The register write a step records: the register its opcode writes when
+/// it executed, even if it wrote the value the register held (the proof
+/// fixes each instruction's write), and otherwise what it changed, if
+/// anything. A dynamic jump to the halt address executes, writing before it
+/// jumps; a step the machine stopped (out of gas, a fault, a trap, a host
+/// call) does not. An error when the step changed a register other than
+/// that one, or more than one.
+pub(crate) fn recorded_write(
+    opcode: Opcode,
+    (reg_a, reg_b, reg_d): (usize, usize, usize),
+    regs_before: &[u64; PVM_REGISTER_COUNT],
+    regs_after: &[u64; PVM_REGISTER_COUNT],
+    exit: Option<&ExitReason>,
+) -> Result<Option<usize>, &'static str> {
+    let mut changed = (0..PVM_REGISTER_COUNT).filter(|&i| regs_before[i] != regs_after[i]);
+    let first = changed.next();
+    if changed.next().is_some() {
+        return Err("one instruction changed more than one register");
+    }
+    if exit.is_some() && exit != Some(&ExitReason::Halt) {
+        return Ok(first);
+    }
+    let destination =
+        crate::chips::cpu::static_destination(opcode, reg_a, reg_b, reg_d, regs_before);
+    if first.is_some() && first != destination {
+        return Err("an instruction changed a register other than its destination");
+    }
+    Ok(destination)
+}
+
 pub(crate) fn decode_reg_indices(
     _opcode: Opcode,
     decoded_args: &args::Args,

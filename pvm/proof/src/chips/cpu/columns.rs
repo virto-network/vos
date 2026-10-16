@@ -177,17 +177,18 @@ pub enum Column {
     /// to that product via a validity constraint below.
     #[size = 1]
     IsTruncated,
-    /// Raw u64 of `regs_before[reg_b]` whenever ValDIsReg=1.
-    /// For non-shift non-32-bit ops ValD == RegValD (constrained below); for
+    /// ValD's source: `regs_before[reg_b]` when ValDIsReg=1, the
+    /// instruction's immediate otherwise (pinned to ImmBytes).  For
+    /// non-shift non-32-bit ops ValD == RegValD (constrained below); for
     /// shifts ValD gets rewritten to `2^shift_amount` but RegValD keeps the
-    /// raw register value so the ledger producer can authenticate it.  Zero
-    /// when ValDIsReg=0.
+    /// raw shift operand so the identity below binds the amount to it.
     #[size = 8]
     RegValD,
-    /// Quotient in `RegValD = ShiftAmount + modulus · q` for
-    /// shift ops.  modulus = 32 for 32-bit shifts, 64 otherwise.  Ties
-    /// the prover-chosen ShiftAmount to the authenticated RegValD.
-    #[size = 8]
+    /// The bits of `k` in `RegValD[0] = ShiftAmount + 32·k` on shift rows:
+    /// as `modulus` divides 256, the amount is the low byte's residue, and
+    /// every term is small, so the identity holds over the integers.  On a
+    /// 64-bit shift `k` is even, making the modulus 64.
+    #[size = 3]
     ShiftQuotient,
     // ── Control flow ──
     // IsBranch is the 10-sub-flag sum (IsBrEq + IsBrNe + IsBrLtU + IsBrGeU
@@ -372,22 +373,34 @@ pub enum Column {
     /// register-memory producer emission.
     #[size = 1]
     ValBIsReg,
-    /// Register index that ValB was read from when ValBIsReg=1.
+    /// Register index ValB reads when ValBIsReg=1: RegA when ValBFromA,
+    /// otherwise RegB, on every row.
     #[size = 1]
     ValBRegIdx,
+    /// 1 iff ValB's register is RegA rather than RegB, as the instruction
+    /// fixes it (flag byte 6).
+    #[size = 1]
+    ValBFromA,
     /// 1 iff ValD was sourced from a register read.
     #[size = 1]
     ValDIsReg,
-    /// Register index that ValD was read from when ValDIsReg=1.
+    /// Register index ValD reads when ValDIsReg=1: RegB on every row.
     #[size = 1]
     ValDRegIdx,
-    /// 1 iff Result was written to a register at this step (tracer's
-    /// step.reg_write is Some).  Gates the Result register-memory producer.
+    /// 1 iff Result is written to a register at this step: whenever the
+    /// instruction writes one (flag byte 6), except a conditional move that
+    /// does not move, and a witness-input call's count.  Gates the Result
+    /// register-memory producer.
     #[size = 1]
     ResultIsReg,
-    /// Register index that Result was written to when ResultIsReg=1.
+    /// Register index Result is written to when ResultIsReg=1: RegD when
+    /// ResultToD, otherwise RegA, or 7 on a witness-input call.
     #[size = 1]
     ResultRegIdx,
+    /// 1 iff the result's register is RegD rather than RegA, as the
+    /// instruction fixes it (flag byte 6).
+    #[size = 1]
+    ResultToD,
     // ── BitManip permutation/zero-extend ──
     /// 1 iff this step is `ReverseBytes` (result\[i\] = val_d[7-i]).
     #[size = 1]
@@ -781,12 +794,11 @@ pub enum Column {
     /// Range-bounded to [0, 63] by the lookup table size.
     #[size = 1]
     ShiftAmountCompl,
-    /// Integer quotient in
-    /// `reg_val_d + ShiftAmountCompl = 64·ShiftQuotientCompl`.  Range-
-    /// bounded by the 8-byte decomposition + Range256 byte checks.
-    /// For the modulus-32 variant (RotR32) the constraint reads
-    /// `reg_val_d + ShiftAmountCompl = 32·ShiftQuotientCompl`.
-    #[size = 8]
+    /// The bits of `k` in `RegValD[0] + ShiftAmountCompl = 32·k` on
+    /// rotate-right rows, `k` even on a 64-bit rotate: the complement is
+    /// the negated low byte's residue, over the integers as for
+    /// `ShiftQuotient`.
+    #[size = 4]
     ShiftQuotientCompl,
     // ── 32-bit rotate flags ────────────────────────────────────
     /// 1 iff this opcode is `RotL32`.  Pinned by ProgramMemoryChip's
@@ -810,16 +822,15 @@ pub enum Column {
     /// inactive when val_b_is_reg=0).
     #[size = 1]
     IsRotateRImmAlt,
-    /// 6 packed flag bytes mirroring the canonical
-    /// classify_opcode flag bag.  Each byte holds 8 of the 48
-    /// individual flag bits (bit i = flag[8*k + i]).  The byte-to-bits
+    /// The first 6 packed flag bytes of the canonical classify_opcode
+    /// flag bag.  Each byte holds 8 individual flag bits
+    /// (bit i = flag[8*k + i]).  The byte-to-bits
     /// lookup per row pins these bits to the matching CpuChip flag
     /// columns (or sum-of-sub-flags expressions for the 5 folded
     /// category slots: is_mul_upper, is_bitwise, is_compare,
     /// is_branch, is_store).  ProgramMemoryChip's preprocessed
     /// FlagByte0..5 columns hold the canonical values; the prog_mem
     /// lookup balance pins each FlagByteI on CpuChip to canonical.
-    /// Together these collapse the 48-flag prog_mem region to 6 bytes.
     /// Layout per byte is documented in `lookups/relations.rs` next
     /// to `PROG_MEMORY_N_FLAG_BYTES`.
     #[size = 1]
@@ -834,6 +845,19 @@ pub enum Column {
     FlagByte4,
     #[size = 1]
     FlagByte5,
+    /// The four flag bytes CpuChip recomposes from its own columns, bound
+    /// to ProgramMemory's canonical bytes by the instruction tuple: the
+    /// register accesses and operand modifiers (6), the compare
+    /// sub-operations (7), the branch conditions (8, 9) and the bitwise
+    /// sub-operations (9).  Layout in `lookups/relations.rs`.
+    #[size = 1]
+    FlagByte6,
+    #[size = 1]
+    FlagByte7,
+    #[size = 1]
+    FlagByte8,
+    #[size = 1]
+    FlagByte9,
 
     // ── Stwo-v2.x degree-flatten helpers ──
     //
@@ -1018,11 +1042,12 @@ pub enum Column {
     /// `ValBIsRegH · IsTruncated` — truncated ValB upper-byte gate.
     #[size = 1]
     ValBIsRegTruncH,
-    /// `(1 - IsPadding) · ValDIsReg` — gate root for ValD cross-constraints.
+    /// `(1 - IsPadding) · (1 - ValDIsReg)` — the gate pinning RegValD to
+    /// the immediate.
     #[size = 1]
-    ValDIsRegH,
-    /// `ValDIsRegH · (1 - IsShiftConstrained)` — non-shift ValD gate
-    /// (the `non_shift_gate`).
+    ValDIsImmH,
+    /// `(1 - IsPadding) · (1 - IsShiftConstrained)` — non-shift ValD gate
+    /// (the `non_shift_gate`); every real row's ValD has a source.
     #[size = 1]
     NonShiftGateH,
     /// `NonShiftGateH · (1 - IsTruncated)` — non-shift, non-truncated.
@@ -1031,9 +1056,9 @@ pub enum Column {
     /// `NonShiftGateH · IsTruncated` — non-shift, truncated.
     #[size = 1]
     NonShiftGateTruncH,
-    /// `ValDIsRegH · IsShiftConstrained` — shift-amount identity gate.
+    /// `(1 - IsPadding) · IsShiftConstrained` — shift-amount identity gate.
     #[size = 1]
-    ValDIsRegShiftCH,
+    RealShiftCH,
     /// `(1 - IsPadding) · (IsRotateR64 + IsRotateR32)` — rotate-R identity gate.
     #[size = 1]
     IsRotateRGateH,

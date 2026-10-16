@@ -95,9 +95,10 @@ pub struct MemAccess {
 /// The one register write a step performed: file index + written value.
 /// A PVM instruction writes at most one register (every interpreter opcode
 /// arm is a single `registers[x] = …` assignment), so this pair is the
-/// entire register-file delta of a step — `None` when the step left the
-/// file unchanged (including a write of the value already held, which is
-/// unobservable and recorded as no write, matching [`PvmStep::reg_write`]).
+/// entire register-file delta of a step — `None` when the step wrote no
+/// register. An executed instruction that writes one records the write even
+/// when it wrote the value already held (the proof fixes each instruction's
+/// write); a conditional move that does not move records none.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RegWrite {
     pub index: u8,

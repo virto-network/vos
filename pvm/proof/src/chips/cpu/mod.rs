@@ -61,7 +61,7 @@ pub(crate) use classify::classify_opcode_for_program_memory;
 pub use columns::Column;
 use columns::PreprocessedColumn;
 #[cfg(feature = "prover")]
-pub(crate) use reg_access::step_reg_accesses;
+pub(crate) use reg_access::{static_destination, step_reg_accesses};
 
 pub struct CpuChip;
 
@@ -1338,14 +1338,13 @@ impl BuiltInComponent for CpuChip {
         let val_b_is_reg_not_trunc_h =
             crate::trace::trace_eval!(trace_eval, Column::ValBIsRegNotTruncH);
         let val_b_is_reg_trunc_h = crate::trace::trace_eval!(trace_eval, Column::ValBIsRegTruncH);
-        let val_d_is_reg_h = crate::trace::trace_eval!(trace_eval, Column::ValDIsRegH);
+        let val_d_is_imm_h = crate::trace::trace_eval!(trace_eval, Column::ValDIsImmH);
         let non_shift_gate_h = crate::trace::trace_eval!(trace_eval, Column::NonShiftGateH);
         let non_shift_gate_not_trunc_h =
             crate::trace::trace_eval!(trace_eval, Column::NonShiftGateNotTruncH);
         let non_shift_gate_trunc_h =
             crate::trace::trace_eval!(trace_eval, Column::NonShiftGateTruncH);
-        let val_d_is_reg_shift_c_h =
-            crate::trace::trace_eval!(trace_eval, Column::ValDIsRegShiftCH);
+        let real_shift_c_h = crate::trace::trace_eval!(trace_eval, Column::RealShiftCH);
         let is_rotate_r_gate_h = crate::trace::trace_eval!(trace_eval, Column::IsRotateRGateH);
         {
             let is_truncated_top = crate::trace::trace_eval!(trace_eval, Column::IsTruncated);
@@ -1394,12 +1393,15 @@ impl BuiltInComponent for CpuChip {
                 val_b_is_reg_trunc_h[0].clone()
                     - val_b_is_reg_h[0].clone() * is_truncated_top[0].clone(),
             );
+            // Every real row's ValD has a source, its register or the
+            // immediate, so the ValD gates are the row's realness.
             eval.add_constraint(
-                val_d_is_reg_h[0].clone() - is_real.clone() * val_d_is_reg_top[0].clone(),
+                val_d_is_imm_h[0].clone()
+                    - is_real.clone() * (E::F::one() - val_d_is_reg_top[0].clone()),
             );
             eval.add_constraint(
                 non_shift_gate_h[0].clone()
-                    - val_d_is_reg_h[0].clone() * (E::F::one() - is_shift_c_top[0].clone()),
+                    - is_real.clone() * (E::F::one() - is_shift_c_top[0].clone()),
             );
             eval.add_constraint(
                 non_shift_gate_not_trunc_h[0].clone()
@@ -1410,8 +1412,7 @@ impl BuiltInComponent for CpuChip {
                     - non_shift_gate_h[0].clone() * is_truncated_top[0].clone(),
             );
             eval.add_constraint(
-                val_d_is_reg_shift_c_h[0].clone()
-                    - val_d_is_reg_h[0].clone() * is_shift_c_top[0].clone(),
+                real_shift_c_h[0].clone() - is_real.clone() * is_shift_c_top[0].clone(),
             );
             eval.add_constraint(
                 is_rotate_r_gate_h[0].clone()
@@ -2127,47 +2128,85 @@ impl BuiltInComponent for CpuChip {
                 eval.add_constraint(non_shift_gate_trunc_h[0].clone() * val_d[i].clone());
             }
 
-            // Shift-amount identity: RegValD = ShiftAmount + modulus · ShiftQuotient.
-            // Combine bytes into field elements, pick modulus from Is32Bit
-            // (32 if 32-bit shift, 64 otherwise — expressible as 32 · (2 - is_32bit)).
+            // An immediate operand is the instruction's: RegValD, which the
+            // cross-constraints above tie to ValD, is ImmBytes whenever ValD
+            // reads no register.
+            let imm_bytes = crate::trace::trace_eval!(trace_eval, Column::ImmBytes);
+            for i in 0..WORD_SIZE {
+                eval.add_constraint(
+                    val_d_is_imm_h[0].clone() * (reg_val_d[i].clone() - imm_bytes[i].clone()),
+                );
+            }
+
+            // Shift-amount identity, on the low byte alone (a modulus of 32
+            // or 64 divides 256): RegValD[0] = ShiftAmount + 32·k with k's
+            // three bits, k even on a 64-bit shift. Every term is below 2^10,
+            // so it holds over the integers: ShiftAmount, in [0, 63] by the
+            // PowerOfTwo lookup and in [0, 31] on a 32-bit shift by ValD's
+            // zero high bytes, is RegValD's residue.
             let shift_q = crate::trace::trace_eval!(trace_eval, Column::ShiftQuotient);
             let is_32b = crate::trace::trace_eval!(trace_eval, Column::Is32Bit);
-            let reg_val_d_field = crate::framework::eval::combine_le_u64::<E>(&reg_val_d);
-            let shift_q_field = crate::framework::eval::combine_le_u64::<E>(&shift_q);
             let shift_amount_e = crate::trace::trace_eval!(trace_eval, Column::ShiftAmount);
-            let two = E::F::from(BaseField::from(2u32));
             let thirty_two = E::F::from(BaseField::from(32u32));
-            let modulus = thirty_two * (two - is_32b[0].clone());
-            // Gated on ValDIsReg too (via ValDIsRegShiftCH).
+            let bits_value = |bits: &[E::F]| -> E::F {
+                bits.iter()
+                    .rev()
+                    .fold(E::F::zero(), |acc, bit| acc.clone() + acc + bit.clone())
+            };
+            for bit in shift_q.iter() {
+                eval.add_constraint(bit.clone() * (E::F::one() - bit.clone()));
+            }
+            eval.add_constraint((E::F::one() - is_32b[0].clone()) * shift_q[0].clone());
             eval.add_constraint(
-                val_d_is_reg_shift_c_h[0].clone()
-                    * (reg_val_d_field.clone()
+                real_shift_c_h[0].clone()
+                    * (reg_val_d[0].clone()
                         - shift_amount_e[0].clone()
-                        - modulus * shift_q_field),
+                        - thirty_two.clone() * bits_value(&shift_q)),
             );
 
-            // Complementary shift-amount identity for RotR64 / RotR32 rows.
-            //   reg_val_d + ShiftAmountCompl = modulus · ShiftQuotientCompl.
-            // modulus = 32 if Is32Bit else 64.  Combined with the
-            // ShiftAmountCompl ∈ [0, 31 or 0, 63] bound (pow2 table
-            // size + the val_d-high-bytes-zero constraint for 32-bit),
-            // this uniquely determines ShiftAmountCompl = (modulus −
-            // n_real) mod modulus.
+            // Complementary identity on RotR64 / RotR32 rows:
+            //   RegValD[0] + ShiftAmountCompl = 32·k, k's four bits, k even
+            // on a 64-bit rotate. Combined with the ShiftAmountCompl ∈
+            // [0, 31 or 0, 63] bound (pow2 table size + the
+            // val_d-high-bytes-zero constraint for 32-bit), this uniquely
+            // determines ShiftAmountCompl = (modulus − n_real) mod modulus.
             let shift_q_compl = crate::trace::trace_eval!(trace_eval, Column::ShiftQuotientCompl);
             let shift_amount_compl =
                 crate::trace::trace_eval!(trace_eval, Column::ShiftAmountCompl);
-            let is_rotate_r64_p35_id = crate::trace::trace_eval!(trace_eval, Column::IsRotateR64);
-            let is_rotate_r32_p36_id = crate::trace::trace_eval!(trace_eval, Column::IsRotateR32);
-            let shift_q_compl_field = crate::framework::eval::combine_le_u64::<E>(&shift_q_compl);
-            // Same modulus expression as the classic shift identity.
-            let two_compl = E::F::from(BaseField::from(2u32));
-            let thirty_two_compl = E::F::from(BaseField::from(32u32));
-            let modulus_compl = thirty_two_compl * (two_compl - is_32b[0].clone());
-            let _ = (&is_rotate_r64_p35_id, &is_rotate_r32_p36_id); // routed via IsRotateRGateH
+            for bit in shift_q_compl.iter() {
+                eval.add_constraint(bit.clone() * (E::F::one() - bit.clone()));
+            }
+            eval.add_constraint((E::F::one() - is_32b[0].clone()) * shift_q_compl[0].clone());
             eval.add_constraint(
                 is_rotate_r_gate_h[0].clone()
-                    * (reg_val_d_field + shift_amount_compl[0].clone()
-                        - modulus_compl * shift_q_compl_field),
+                    * (reg_val_d[0].clone() + shift_amount_compl[0].clone()
+                        - thirty_two * bits_value(&shift_q_compl)),
+            );
+            // Every shift and rotate row binds its amount: the flag gating
+            // the identities is the instruction's shift flag.
+            eval.add_constraint(is_shift_c[0].clone() - is_shift[0].clone());
+
+            // The registers each access names, as the instruction fixes
+            // them: ValB reads RegA or RegB, ValD reads RegB, and Result
+            // writes RegA or RegD, or φ7 on a witness-input call (whose
+            // RegA, an ECALLI's, is 0).
+            let reg_a = crate::trace::trace_eval!(trace_eval, Column::RegA);
+            let reg_b = crate::trace::trace_eval!(trace_eval, Column::RegB);
+            let reg_d = crate::trace::trace_eval!(trace_eval, Column::RegD);
+            let val_b_from_a = crate::trace::trace_eval!(trace_eval, Column::ValBFromA);
+            let result_to_d = crate::trace::trace_eval!(trace_eval, Column::ResultToD);
+            let is_witness = crate::trace::trace_eval!(trace_eval, Column::IsWitnessEcall);
+            eval.add_constraint(
+                val_b_reg_idx[0].clone()
+                    - reg_b[0].clone()
+                    - val_b_from_a[0].clone() * (reg_a[0].clone() - reg_b[0].clone()),
+            );
+            eval.add_constraint(val_d_reg_idx[0].clone() - reg_b[0].clone());
+            eval.add_constraint(
+                result_reg_idx[0].clone()
+                    - reg_a[0].clone()
+                    - result_to_d[0].clone() * (reg_d[0].clone() - reg_a[0].clone())
+                    - E::F::from(BaseField::from(7u32)) * is_witness[0].clone(),
             );
 
             let mut tuple: Vec<E::F> = vec![result_reg_idx[0].clone()];
@@ -2424,18 +2463,17 @@ impl BuiltInComponent for CpuChip {
 
         // ════════════════════════════════════════════════════════════════════
         // Program-memory consumer (pc + opcode + regs + imm
-        //                          + 6 packed flag bytes
+        //                          + 10 packed flag bytes
         //                          + imm_y + branch_target)
         //
         // Per real CpuChip step, demand the full instruction tuple from
         // ProgramMemoryChip's preprocessed table.  The tuple binds
-        // (pc, opcode, skip_len, regs, imm) plus the 48 category/
-        // sub-category flags so a prover can't clear flags to skip per-op
-        // constraints.  The 48 flag bits are packed into 6 bytes on both
-        // sides — the prog_mem tuple sends 6 bytes instead of 48 bits, and
-        // 6 byte-to-bits lookups (next block) bind individual flag columns /
-        // sum-of-sub-flags expressions to the matching bit slot in each
-        // FlagByteI.
+        // (pc, opcode, skip_len, regs, imm) plus the 80 flags so a prover
+        // can't clear or swap flags to skip or change per-op constraints.
+        // The flag bits are packed into 10 bytes on both sides; 6
+        // byte-to-bits lookups (next block) bind individual flag columns /
+        // sum-of-sub-flags expressions to the matching bit slot in bytes
+        // 0..5, and CpuChip's own constraints recompose bytes 6..9.
         //
         // Pair-parity (CONSTRAINTS.md rule 1): two paired emissions with
         // identical multiplicity and tuple.  ProgramMemoryChip doubles its
@@ -2473,6 +2511,14 @@ impl BuiltInComponent for CpuChip {
             tuple.push(fb3[0].clone());
             tuple.push(fb4[0].clone());
             tuple.push(fb5[0].clone());
+            for byte in [
+                Column::FlagByte6,
+                Column::FlagByte7,
+                Column::FlagByte8,
+                Column::FlagByte9,
+            ] {
+                tuple.push(trace_eval.column_eval::<1>(byte)[0].clone());
+            }
             // Bind ImmYBytes to canonical imm_y (low 4 bytes) for
             // LoadImmJumpInd; 0 for ops without a second immediate.  Tracer
             // writes 0 to imm_y for those, so balanced.
@@ -2670,6 +2716,86 @@ impl BuiltInComponent for CpuChip {
                     t,
                 ));
             }
+
+            // Flag bytes 6..9, recomposed here from their bits, each bit a
+            // boolean column or expression: the register accesses (whose
+            // result bit discounts a conditional move that does not move and
+            // a witness-input call's count), the division's remainder bit
+            // (DivRemOp = 2·is_rem + IsDivS), the operand swaps, and the
+            // compare, branch and bitwise sub-operations.
+            let col = |column: Column| trace_eval.column_eval::<1>(column)[0].clone();
+            let result_bit = col(Column::ResultIsReg) + col(Column::IsCmovIz)
+                - col(Column::IsCmovIzVdzH)
+                + col(Column::IsCmovNz)
+                - col(Column::IsCmovNzNotVdzH)
+                - col(Column::IsWitnessEcall);
+            let rem_bit = (col(Column::DivRemOp) - col(Column::IsDivS))
+                * E::F::from(BaseField::from(2u32).inverse());
+            let bytes: [(Column, [E::F; 8]); 4] = [
+                (
+                    Column::FlagByte6,
+                    [
+                        col(Column::ValBIsReg),
+                        col(Column::ValBFromA),
+                        col(Column::ValDIsReg),
+                        result_bit,
+                        col(Column::ResultToD),
+                        rem_bit,
+                        col(Column::IsSetGt),
+                        col(Column::IsCmovImm),
+                    ],
+                ),
+                (
+                    Column::FlagByte7,
+                    [
+                        Column::IsSetLtU,
+                        Column::IsSetLtS,
+                        Column::IsCmovIz,
+                        Column::IsCmovNz,
+                        Column::IsMinS,
+                        Column::IsMinU,
+                        Column::IsMaxS,
+                        Column::IsMaxU,
+                    ]
+                    .map(col),
+                ),
+                (
+                    Column::FlagByte8,
+                    [
+                        Column::IsBrEq,
+                        Column::IsBrNe,
+                        Column::IsBrLtU,
+                        Column::IsBrGeU,
+                        Column::IsBrLeU,
+                        Column::IsBrGtU,
+                        Column::IsBrLtS,
+                        Column::IsBrGeS,
+                    ]
+                    .map(col),
+                ),
+                (
+                    Column::FlagByte9,
+                    [
+                        Column::IsBrLeS,
+                        Column::IsBrGtS,
+                        Column::IsAnd,
+                        Column::IsOr,
+                        Column::IsXor,
+                        Column::IsAndInv,
+                        Column::IsOrInv,
+                        Column::IsXnor,
+                    ]
+                    .map(col),
+                ),
+            ];
+            for (byte, bits) in bytes {
+                let mut packed = E::F::zero();
+                for bit in bits.iter().rev() {
+                    eval.add_constraint(bit.clone() * (E::F::one() - bit.clone()));
+                    packed = packed.clone() + packed + bit.clone();
+                }
+                eval.add_constraint(col(byte) - packed);
+            }
         }
 
         // ════════════════════════════════════════════════════════════════════
@@ -2800,9 +2926,8 @@ impl BuiltInComponent for CpuChip {
         // Carry chain: pin LoadImmJumpIndAddr to (val_d + imm_y) low 32.
         // Lookup: (LoadImmJumpIndAddr, NextPc) ∈ jump_table.
         //
-        // Note: the load-side `regs[ra] = imm_x` is NOT bound — that's a
-        // separate concern that needs the existing `is_move` family
-        // extended.
+        // The load side writes `regs[ra] = imm_x`: the row's Result is its
+        // ImmBytes.
         {
             let is_lij_col = crate::trace::trace_eval!(trace_eval, Column::IsLoadImmJumpInd);
             let is_halt_lij = crate::trace::trace_eval!(trace_eval, Column::IsHaltLoadImmJumpInd);
@@ -2810,6 +2935,12 @@ impl BuiltInComponent for CpuChip {
             let lij_carry = crate::trace::trace_eval!(trace_eval, Column::LoadImmJumpIndCarry);
             let imm_y_bytes = crate::trace::trace_eval!(trace_eval, Column::ImmYBytes);
             let is_padding_next = crate::trace::trace_eval_next_row!(trace_eval, Column::IsPadding);
+            let imm_x_bytes = crate::trace::trace_eval!(trace_eval, Column::ImmBytes);
+            for (result_byte, imm_byte) in result.iter().zip(&imm_x_bytes) {
+                eval.add_constraint(
+                    is_lij_col[0].clone() * (result_byte.clone() - imm_byte.clone()),
+                );
+            }
             // Boolean witnesses and the same terminal-halt binding as
             // JumpInd above.
             eval.add_constraint(is_lij_col[0].clone() * (E::F::one() - is_lij_col[0].clone()));
@@ -3466,7 +3597,8 @@ impl BuiltInComponent for CpuChip {
         // An acknowledged witness-input row reads φ7, the destination, and
         // φ8, the capacity (the register reads above); writes its count to
         // φ7 and nothing else: the generic Result write, pinned here to
-        // register 7, a count below 2^24, and the destination below 2^32.
+        // register 7, a count below 2^24, and, when it writes bytes, the
+        // destination below 2^32.
         // Its count is at most φ8, as CompareChip proves of the tuple
         // (φ8, count, lt = 0). A non-zero count hands (ts, destination,
         // count) to WitnessInputChip, which writes exactly the bytes
@@ -3488,7 +3620,7 @@ impl BuiltInComponent for CpuChip {
                 + result[2].clone() * f256.clone() * f256;
 
             // The count is φ7's write, and below 2^24, so it is its own
-            // field value; the destination is below 2^32.
+            // field value.
             eval.add_constraint(is_witness[0].clone() * (E::F::one() - result_is_reg[0].clone()));
             eval.add_constraint(
                 is_witness[0].clone()
@@ -3497,8 +3629,10 @@ impl BuiltInComponent for CpuChip {
             for byte in &result[3..WORD_SIZE] {
                 eval.add_constraint(is_witness[0].clone() * byte.clone());
             }
+            // A call that writes bytes writes them below 2^32; one that
+            // writes none may name any destination, as the live call does.
             for byte in &destination[4..WORD_SIZE] {
-                eval.add_constraint(is_witness[0].clone() * byte.clone());
+                eval.add_constraint(non_empty[0].clone() * byte.clone());
             }
             // WitnessNonEmpty: a witness row's count is non-zero exactly
             // when it is set.

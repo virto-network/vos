@@ -27,7 +27,7 @@ use crate::trace::builder::{FinalizedTrace, TraceBuilder};
 
 use super::classify::{classify_opcode, dest_reg, uses_immediate};
 use super::columns::Column;
-use super::reg_access::step_reg_accesses;
+use super::reg_access::{access_shape, step_reg_accesses};
 
 /// Carry chain for `NextTimestamp = Timestamp + 1`: carry i is 1 iff
 /// limbs 0..=i of `ts` are all 0xff (the increment overflows through
@@ -168,8 +168,8 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                 // val_d = 2^((modulus − n_real) mod modulus).
                 let compl = if shift == 0 { 0 } else { modulus - shift };
                 saved_shift_amount_compl = compl as u8;
-                // reg_val_d + compl = modulus · ShiftQuotientCompl.
-                saved_shift_quotient_compl = (val_d + compl) / modulus;
+                // RegValD[0] + compl = 32·k, k's bits in ShiftQuotientCompl.
+                saved_shift_quotient_compl = ((val_d & 0xff) + compl) / 32;
                 val_d = 1u64 << compl;
                 side_note.power_of_two_counts[compl as usize] += 1;
             } else {
@@ -522,7 +522,11 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         trace.fill_columns(row, flags.is_rotate_r32, Column::IsRotateR32);
         trace.fill_columns(row, flags.is_rotate_r_imm_alt, Column::IsRotateRImmAlt);
         trace.fill_columns(row, saved_shift_amount_compl, Column::ShiftAmountCompl);
-        trace.fill_columns(row, saved_shift_quotient_compl, Column::ShiftQuotientCompl);
+        trace.fill_columns_bytes(
+            row,
+            &bits::<4>(saved_shift_quotient_compl),
+            Column::ShiftQuotientCompl,
+        );
 
         // ── Flags ──
         trace.fill_columns(row, false, Column::IsPadding);
@@ -1424,24 +1428,29 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
 
         // ── Register-memory producer descriptors ──
         let accesses = step_reg_accesses(step);
+        // The indices are the instruction's on every row, whether or not
+        // the access is made.
+        let shape = access_shape(step.opcode);
         trace.fill_columns(row, accesses.val_b_read.is_some(), Column::ValBIsReg);
-        trace.fill_columns(
-            row,
-            accesses.val_b_read.map(|(a, _)| a).unwrap_or(0),
-            Column::ValBRegIdx,
-        );
+        trace.fill_columns(row, shape.val_b_from_a, Column::ValBFromA);
+        let val_b_reg = if shape.val_b_from_a {
+            step.reg_a
+        } else {
+            step.reg_b
+        };
+        trace.fill_columns(row, val_b_reg as u8, Column::ValBRegIdx);
         trace.fill_columns(row, accesses.val_d_read.is_some(), Column::ValDIsReg);
-        trace.fill_columns(
-            row,
-            accesses.val_d_read.map(|(a, _)| a).unwrap_or(0),
-            Column::ValDRegIdx,
-        );
+        trace.fill_columns(row, step.reg_b as u8, Column::ValDRegIdx);
         trace.fill_columns(row, accesses.result_write.is_some(), Column::ResultIsReg);
-        trace.fill_columns(
-            row,
-            accesses.result_write.map(|(a, _)| a).unwrap_or(0),
-            Column::ResultRegIdx,
-        );
+        trace.fill_columns(row, shape.result_to_d, Column::ResultToD);
+        let result_reg = if is_witness {
+            7
+        } else if shape.result_to_d {
+            step.reg_d
+        } else {
+            step.reg_a
+        };
+        trace.fill_columns(row, result_reg as u8, Column::ResultRegIdx);
 
         // ── Deferred helper-column fills ──
         // All inputs (val_b, val_d, sign_bit_b, sign_bit_d, cmp_lt_flag,
@@ -1704,21 +1713,16 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         };
         trace.fill_columns(row, is_truncated, Column::IsTruncated);
 
-        // Raw register value behind ValD + the shift quotient.
-        let reg_val_d_u64 = accesses.val_d_read.map(|(_, v)| v).unwrap_or(0);
+        // ValD's source, its register or the immediate, and the shift
+        // amount's quotient: RegValD[0] = ShiftAmount + 32·k.
+        let reg_val_d_u64 = accesses.val_d_read.map_or(step.imm, |(_, v)| v);
         trace.fill_columns(row, reg_val_d_u64, Column::RegValD);
-        let shift_q: u64 = if (flags.is_shift && flags.shift_op <= 2)
-            || flags.is_rotate_l64
-            || flags.is_rotate_r64
-            || flags.is_rotate_l32
-            || flags.is_rotate_r32
-        {
-            let modulus = if flags.is_32bit { 32u64 } else { 64 };
-            reg_val_d_u64 / modulus
+        let shift_q = if is_shift_constrained {
+            ((reg_val_d_u64 & 0xff) - u64::from(shift_amount)) / 32
         } else {
             0
         };
-        trace.fill_columns(row, shift_q, Column::ShiftQuotient);
+        trace.fill_columns_bytes(row, &bits::<3>(shift_q), Column::ShiftQuotient);
 
         for &b in &result_bytes {
             range_bytes.push(b);
@@ -1746,8 +1750,12 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         trace.fill_columns(row, flag_bytes[3], Column::FlagByte3);
         trace.fill_columns(row, flag_bytes[4], Column::FlagByte4);
         trace.fill_columns(row, flag_bytes[5], Column::FlagByte5);
-        // 6 byte-to-bits emissions per real row, one per packed byte.
-        for &fb in &flag_bytes {
+        trace.fill_columns(row, flag_bytes[6], Column::FlagByte6);
+        trace.fill_columns(row, flag_bytes[7], Column::FlagByte7);
+        trace.fill_columns(row, flag_bytes[8], Column::FlagByte8);
+        trace.fill_columns(row, flag_bytes[9], Column::FlagByte9);
+        // 6 byte-to-bits emissions per real row, one per byte 0..5.
+        for &fb in &flag_bytes[..6] {
             side_note.byte_to_bits_counts[fb as usize] += 1;
         }
 
@@ -1783,23 +1791,19 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             val_b_is_reg_b && is_truncated_b,
             Column::ValBIsRegTruncH,
         );
-        trace.fill_columns(row, val_d_is_reg_b, Column::ValDIsRegH);
-        trace.fill_columns(row, val_d_is_reg_b && !is_shift_c_b, Column::NonShiftGateH);
+        trace.fill_columns(row, !val_d_is_reg_b, Column::ValDIsImmH);
+        trace.fill_columns(row, !is_shift_c_b, Column::NonShiftGateH);
         trace.fill_columns(
             row,
-            val_d_is_reg_b && !is_shift_c_b && !is_truncated_b,
+            !is_shift_c_b && !is_truncated_b,
             Column::NonShiftGateNotTruncH,
         );
         trace.fill_columns(
             row,
-            val_d_is_reg_b && !is_shift_c_b && is_truncated_b,
+            !is_shift_c_b && is_truncated_b,
             Column::NonShiftGateTruncH,
         );
-        trace.fill_columns(
-            row,
-            val_d_is_reg_b && is_shift_c_b,
-            Column::ValDIsRegShiftCH,
-        );
+        trace.fill_columns(row, is_shift_c_b, Column::RealShiftCH);
         trace.fill_columns(row, real_b && is_rot_r_either_b, Column::IsRotateRGateH);
         // Phi7 helpers.
         trace.fill_columns(row, real_b && !phi7_bool_b, Column::RealNotPhi7BoolH);
@@ -1929,7 +1933,7 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             ("Real32bitH", Column::Real32bitH),
             ("ValBIsRegH", Column::ValBIsRegH),
             ("ValBIsRegNotTruncH", Column::ValBIsRegNotTruncH),
-            ("ValDIsRegH", Column::ValDIsRegH),
+            ("ValDIsImmH", Column::ValDIsImmH),
             ("NonShiftGateH", Column::NonShiftGateH),
             ("NonShiftGateNotTruncH", Column::NonShiftGateNotTruncH),
             ("RealNotPhi7BoolH", Column::RealNotPhi7BoolH),
@@ -2049,4 +2053,10 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
     }
 
     trace.finalize_bit_reversed()
+}
+
+/// The low `N` bits of `value`, least significant first.
+fn bits<const N: usize>(value: u64) -> [u8; N] {
+    debug_assert!(value >> N == 0, "{value} exceeds {N} bits");
+    core::array::from_fn(|i| ((value >> i) & 1) as u8)
 }

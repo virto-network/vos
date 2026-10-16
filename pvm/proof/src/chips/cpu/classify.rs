@@ -41,16 +41,10 @@ pub(crate) struct OpcodeFlags {
     /// `ValDIsZero` gates), but the imm variants move the IMMEDIATE guarded
     /// by `regs[rb]`. `is_cmov_imm` swaps the source so `val_b = imm`,
     /// `val_d = regs[rb]`. The swap mechanism mirrors `is_set_gt` /
-    /// `is_rotate_r_imm_alt`, BUT — unlike `is_rotate_r_imm_alt`, which is
-    /// packed into the 48-flag program-memory bag (opcode-bound) — neither
-    /// `is_cmov_imm` nor `is_set_gt` is in that bag, so they are free
-    /// witness columns bound only transitively via the register-pinned
-    /// `result` (the same model as the other unpacked compare sub-flags
-    /// `is_set_lt_s/u`, `is_cmov_iz/nz`). Sound because each flag only
-    /// ADDS a pin (`flag·(val_b−ImmBytes)=0`) and gates nothing else:
-    /// asserting it spuriously can only over-constrain, and omitting it on
-    /// a real swapped row reduces to the pre-existing compare-operand model.
-    /// NOT a compare-partition sub-flag; co-occurs with `is_cmov_iz/nz`.
+    /// `is_rotate_r_imm_alt`; like every compare sub-flag it is committed
+    /// per pc in ProgramMemory's flag bytes (byte 6), so a row cannot drop
+    /// the swap and leave its moved value free. NOT a compare-partition
+    /// sub-flag; co-occurs with `is_cmov_iz/nz`.
     pub is_cmov_imm: bool,
     pub is_min_s: bool,
     pub is_min_u: bool,
@@ -754,8 +748,13 @@ pub(crate) fn classify_opcode(op: Opcode) -> OpcodeFlags {
             f.is_store_imm_direct = true;
         }
         // Jumps (unconditional, non-sequential target)
-        Opcode::Jump | Opcode::LoadImmJump => {
+        Opcode::Jump => {
             f.is_jump = true;
+        }
+        // LoadImmJump also moves its immediate, ValD, into φA.
+        Opcode::LoadImmJump => {
+            f.is_jump = true;
+            f.is_move = true;
         }
         // Fallthrough/Unlikely: pure sequential terminators (basic-block hints
         // with no semantic effect).  All flags stay 0 so the default
@@ -834,12 +833,15 @@ pub(super) fn dest_reg(step: &crate::core::step::PvmStep) -> usize {
     }
 }
 
-/// Extract the 48 category/sub-category flags in the order matching
-/// ProgramMemoryChip's preprocessed columns.  Used by ProgramMemoryChip's
+/// Extract the 80 flags — category, sub-operation and register-access —
+/// in the order matching ProgramMemoryChip's preprocessed columns.  Used by ProgramMemoryChip's
 /// preprocessed-trace fill to pin flag values to the canonical
 /// classify_opcode result.
-pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 48] {
+pub(crate) fn classify_opcode_for_program_memory(
+    op: Opcode,
+) -> [u8; crate::lookups::PROG_MEMORY_N_FLAGS] {
     let f = classify_opcode(op);
+    let shape = super::reg_access::access_shape(op);
     [
         f.is_add as u8,
         f.is_sub as u8,
@@ -889,5 +891,41 @@ pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 48] {
         f.is_rotate_l32 as u8,
         f.is_rotate_r32 as u8,
         f.is_rotate_r_imm_alt as u8,
+        // byte 6: the register accesses and the remaining operand modifiers.
+        shape.val_b_is_reg as u8,
+        shape.val_b_from_a as u8,
+        shape.val_d_is_reg as u8,
+        shape.result_is_reg as u8,
+        shape.result_to_d as u8,
+        (f.is_div_rem && f.div_rem_op >= 2) as u8,
+        f.is_set_gt as u8,
+        f.is_cmov_imm as u8,
+        // byte 7: the compare sub-operations.
+        f.is_set_lt_u as u8,
+        f.is_set_lt_s as u8,
+        f.is_cmov_iz as u8,
+        f.is_cmov_nz as u8,
+        f.is_min_s as u8,
+        f.is_min_u as u8,
+        f.is_max_s as u8,
+        f.is_max_u as u8,
+        // bytes 8 and 9: the branch conditions, then the bitwise
+        // sub-operations.
+        f.is_br_eq as u8,
+        f.is_br_ne as u8,
+        f.is_br_lt_u as u8,
+        f.is_br_ge_u as u8,
+        f.is_br_le_u as u8,
+        f.is_br_gt_u as u8,
+        f.is_br_lt_s as u8,
+        f.is_br_ge_s as u8,
+        f.is_br_le_s as u8,
+        f.is_br_gt_s as u8,
+        f.is_and as u8,
+        f.is_or as u8,
+        f.is_xor as u8,
+        f.is_and_inv as u8,
+        f.is_or_inv as u8,
+        f.is_xnor as u8,
     ]
 }

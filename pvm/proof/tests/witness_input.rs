@@ -164,6 +164,22 @@ fn the_tracer_reads_as_the_agent_does_and_the_run_proves() {
     proved(whole(&trace));
 }
 
+/// A call that writes no bytes, of no capacity or at the end of the input,
+/// names any destination, even one past 2^32, as the live call does: it
+/// returns 0 and the run proves.
+#[test]
+fn a_call_without_bytes_may_name_any_destination() {
+    let calls = [(u64::MAX, 0), (RW + 0x100, 16), (u64::MAX, 4)];
+    let trace = trace_kernel(&reader(&calls), &READER_INPUT, GAS).expect("the reader halts");
+    let reads: Vec<(u64, usize)> = trace
+        .reads
+        .iter()
+        .map(|read| (read.destination, read.count))
+        .collect();
+    assert_eq!(reads, [(u64::MAX, 0), (RW + 0x100, 10), (u64::MAX, 0)]);
+    proved(whole(&trace));
+}
+
 /// A run that reads less than its input, or past it, is not the run the
 /// input was recorded from; an input past the cap is refused before any
 /// call.
