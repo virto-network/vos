@@ -36,14 +36,18 @@ vectors:
 # `debug-internals`. Memory-heavy: two threads fit under a 24 GiB limit, e.g.
 # `systemd-run --user --scope -p MemoryMax=24G -p MemorySwapMax=0 just test-proof`.
 # Then the Poseidon2-M31 channel's proofs (format 25), on the tests whose code
-# differs under `poseidon2-channel`: the proof format, its wire codec and
-# transcript replay, and a canonical segment proved and verified, which runs
-# only under it. The other proving tests check the same AIR under either
-# channel, and prove about twenty times slower under this one: the library's
-# refine proof alone takes five minutes.
+# differs under `poseidon2-channel`, each named by its path or its module's:
+# the proof format's generation, its wire codec, the transcript replay, and a
+# canonical segment proved and verified, which runs only under it. A test
+# joins only by name: the other proving tests check the same AIR under either
+# channel, and prove about twenty times slower under this one, the library's
+# refine proof alone in five minutes.
 test-proof: build-guests
     cargo test -p vos-pvm-proof --features debug-internals --tests -- --test-threads=2
-    cargo test -p vos-pvm-proof --features poseidon2-channel --lib -- refine proof:: poseidon2 --skip a_refine_serving_an_inner_precompile_proves
+    cargo test -p vos-pvm-proof --features poseidon2-channel --lib -- \
+        refine::tests::proof_generation_numbers_reject_previous_formats \
+        refine_codec::tests:: \
+        proof::query_replay_tests::
     cargo test -p vos-pvm-proof-verifier --features poseidon2-channel --test poseidon2_canonical_segment
 
 # Guest programs the prover suites run.
@@ -72,6 +76,7 @@ clippy:
     cargo clippy -p vos-pvm-bench --features prove --all-targets --quiet -- -D warnings
     cargo clippy -p vos-cli --features faults --all-targets --quiet -- -D warnings
     cargo clippy -p vos-cli --no-default-features --all-targets --quiet -- -D warnings
+    cargo clippy -p vos-pvm-proof --features debug-internals --all-targets --quiet -- -D warnings
     cargo clippy -p vos-pvm-proof -p vos-pvm-proof-verifier --features vos-pvm-proof/debug-internals,vos-pvm-proof-verifier/poseidon2-channel --all-targets --quiet -- -D warnings
 
 # Fails on any JAR remnant in the PVM crates: its ISA and gas modes, opcodes,
