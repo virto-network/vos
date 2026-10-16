@@ -2,3 +2,5 @@
 channel = "nightly-2025-07-14"
 # The settlement verifier builds the standard library for its PVM target.
 components = ["rust-src"]
+# `just check-no-std` builds the proof verifier for wasm32.
+targets = ["wasm32-unknown-unknown"]

@@ -115,8 +115,8 @@ check-no-faults:
 # channel, with the proof crate's verifier path under it: both are `no_std`
 # crates, so a `std` path in either fails the build. Their target is wasm32,
 # which still has std for their dependencies: the pinned Stwo's verifier path
-# depends on dashmap, which needs std. Needs `rustup target add
-# wasm32-unknown-unknown`.
+# depends on dashmap, which needs std; the workspace's toolchain file
+# installs the target.
 check-no-std:
     cargo build -p vos-raft --target thumbv7em-none-eabihf -Zbuild-std=core,alloc
     cargo build -p vos-pvm-proof-verifier --target wasm32-unknown-unknown
