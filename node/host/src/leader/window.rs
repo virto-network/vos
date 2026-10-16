@@ -34,9 +34,13 @@ pub(super) struct Window {
     turn: u64,
     /// When a receiver's `Behind` last sent it again.
     behind: Option<Instant>,
-    /// A `Behind` came too soon after that: it sends again once
-    /// [`BEHIND_EVERY`] has passed.
-    deferred: bool,
+    /// A `Behind` came too soon after that, when the window had sent
+    /// through this sequence: it rewinds once [`BEHIND_EVERY`] has passed,
+    /// unless an acknowledgement reaches the sequence first. A receiver can
+    /// only have dropped or refused what it was sent before its `Behind`;
+    /// what the window sends past the sequence goes on from each
+    /// acknowledgement, and its drops bring a `Behind` of their own.
+    deferred: Option<u64>,
 }
 
 impl Window {
@@ -54,7 +58,7 @@ impl Window {
             round,
             turn,
             behind: None,
-            deferred: false,
+            deferred: None,
         }
     }
 
@@ -104,12 +108,12 @@ impl Window {
             self.sent.pop_front();
             self.bytes -= size;
         }
-        // A deferred `Behind` stays while anything sent is past the
-        // acknowledgement: the receiver may have dropped it, and tells a
-        // sender of drops at a full queue once. The acknowledgement may also
-        // be older than the `Behind`, taken in a batch after it arrived.
-        if self.sent.is_empty() {
-            self.deferred = false;
+        // An acknowledgement short of what was sent when a deferred
+        // `Behind` came keeps it: the receiver tells a sender of drops at a
+        // full queue once, and the acknowledgement may be older than the
+        // `Behind`, taken in a batch after it arrived.
+        if self.deferred.is_some_and(|through| sequence >= through) {
+            self.deferred = None;
         }
         self.since = Instant::now();
         self.wait = self.round;
@@ -131,7 +135,7 @@ impl Window {
         self.sent.clear();
         self.bytes = 0;
         self.since = Instant::now();
-        self.deferred = false;
+        self.deferred = None;
     }
 
     /// A round: rewind, through the next replica, and wait longer before
@@ -149,14 +153,14 @@ impl Window {
     /// its mark.
     pub(super) fn behind(&mut self, now: Instant) -> bool {
         if self.last <= self.acked {
-            self.deferred = false;
+            self.deferred = None;
             return false;
         }
         if self
             .behind
             .is_some_and(|at| now.saturating_duration_since(at) < BEHIND_EVERY)
         {
-            self.deferred = true;
+            self.deferred = Some(self.through());
             return false;
         }
         self.behind = Some(now);
@@ -166,9 +170,7 @@ impl Window {
 
     /// When a deferred `Behind` rewinds it.
     pub(super) fn deferred(&self) -> Option<Instant> {
-        self.behind
-            .filter(|_| self.deferred)
-            .map(|at| at + BEHIND_EVERY)
+        self.deferred.and(self.behind).map(|at| at + BEHIND_EVERY)
     }
 
     /// When it goes again next: at its round, or at a deferred `Behind`.
@@ -217,7 +219,7 @@ mod tests {
     /// A deferred `Behind` is dropped once the acknowledgement covers all
     /// that was sent: the receiver holds it.
     #[test]
-    fn an_acknowledgement_cancels_a_deferred_behind() {
+    fn a_full_acknowledgement_cancels_a_deferred_behind() {
         let mut window = window(&[3, 4, 5]);
         let now = Instant::now();
         assert!(window.behind(now));
@@ -246,6 +248,32 @@ mod tests {
         assert_eq!(window.next(), Some(now + BEHIND_EVERY), "before its round");
         assert!(window.behind(now + BEHIND_EVERY));
         assert_eq!(window.through(), 3, "back to the acknowledgement");
+    }
+
+    /// An acknowledgement through what was sent when a `Behind` came drops
+    /// it, though more was sent since: the receiver holds all the `Behind`
+    /// could ask for, and what followed stays sent, the window going on
+    /// from it.
+    #[test]
+    fn an_acknowledgement_through_a_deferred_behind_drops_it_as_sends_go_on() {
+        let mut window = window(&[3, 4, 5]);
+        window.holds(8);
+        let now = Instant::now();
+        assert!(window.behind(now));
+        for sequence in [3, 4] {
+            window.push(sequence, 10);
+        }
+        assert!(!window.behind(now + BEHIND_EVERY / 2));
+        window.push(5, 10);
+        window.ack(3);
+        assert!(window.deferred().is_some(), "short of what was sent then");
+        window.ack(4);
+        assert_eq!(window.deferred(), None);
+        assert_eq!(window.next(), window.due(), "only its round");
+        assert_eq!(window.through(), 5, "what followed stays sent");
+        assert!(!window.full(10));
+        window.push(6, 10);
+        assert_eq!(window.through(), 6);
     }
 
     /// A `Behind` with nothing past the acknowledgement does nothing, now
