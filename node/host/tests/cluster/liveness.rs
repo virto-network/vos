@@ -14,12 +14,6 @@ use vos_wire::peer::NodeNumber;
 
 use crate::common::{COUNTER, Cluster, wait_until};
 
-/// Elections of 300–600 ms: slow enough that a loaded machine does not
-/// let the pair heartbeat lapse.
-fn slow_elections(_: NodeNumber, config: &mut vos_node::Config) {
-    config.election_timeout_ms = (300, 600);
-}
-
 /// `count` agents on nodes 1 to 3, each with a leader.
 fn agents(cluster: &Cluster, count: usize) -> Vec<AgentId> {
     let agents: Vec<AgentId> = (0..count)
@@ -73,7 +67,7 @@ fn a_flush_failing_outside_any_log_halts_the_node() {
 /// their leaders. A call to one goes through at once.
 #[test]
 fn idle_groups_send_nothing_but_the_pair_heartbeat() {
-    let cluster = Cluster::tuned(3, slow_elections);
+    let cluster = Cluster::new(3);
     let agents = agents(&cluster, 100);
     cluster.install(agents[0]);
     let at = |cluster: &Cluster| {
@@ -106,7 +100,7 @@ fn idle_groups_send_nothing_but_the_pair_heartbeat() {
 /// allows.
 #[test]
 fn quiet_groups_elect_again_when_their_leaders_node_stops() {
-    let mut cluster = Cluster::tuned(3, slow_elections);
+    let mut cluster = Cluster::new(3);
     let agents = agents(&cluster, 60);
     let mut led = [0usize; 4];
     for &agent in &agents {
@@ -224,7 +218,7 @@ fn a_restarted_follower_catches_up_its_quiet_groups() {
 /// which the pair heartbeat still vouches to.
 #[test]
 fn a_flaky_then_cut_link_moves_no_term() {
-    let cluster = Cluster::tuned(3, slow_elections);
+    let cluster = Cluster::new(3);
     let agents = agents(&cluster, 40);
     cluster.install(agents[0]);
     std::thread::sleep(Duration::from_millis(1_000));

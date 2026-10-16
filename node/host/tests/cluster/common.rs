@@ -52,9 +52,10 @@ impl Cluster {
     }
 
     /// Nodes 1..=count on the hub, each config tuned by `tuning` past the
-    /// harness's own: elections of 40–80 ms, a heartbeat every 10 ms, two
-    /// executors, and each node's clock a few milliseconds from the
-    /// others'.
+    /// harness's own: elections of 300–600 ms, slow enough that a loaded
+    /// host does not let a heartbeat lapse and move a leader a test calls,
+    /// a heartbeat every 10 ms, two executors, and each node's clock a few
+    /// milliseconds from the others'.
     pub fn tuned(
         count: u8,
         tuning: impl Fn(NodeNumber, &mut Config) + Send + Sync + 'static,
@@ -115,7 +116,7 @@ impl Cluster {
         } else {
             Peers::Hub(self.hub.clone())
         };
-        config.election_timeout_ms = (40, 80);
+        config.election_timeout_ms = (300, 600);
         config.heartbeat_ms = 10;
         // Each node's own clock, a few milliseconds apart.
         let skew = u64::from(number) * 7;
