@@ -250,6 +250,7 @@ fn started(base: &Base, call: Call) -> Result<(WorkflowId, Overlay), Failure> {
         state: WorkflowState::Ready(arguments.to_vec()),
         snapshot: None,
         target: installed.target,
+        stored: base.time,
     };
     let mut rows = Overlay::new();
     set_count(&mut rows, keys::next_workflow(), id.0 + 1);
@@ -445,6 +446,13 @@ fn run(
     resume: &[u8],
     share: &mut Share,
 ) -> Left {
+    // Past what its target keeps of its pages, it ends without them.
+    if workflow
+        .pages_expire()
+        .is_some_and(|expire| base.time >= expire)
+    {
+        return Left::Failed(Failure::Expired);
+    }
     let (mut machine, header) = match restore(base, id, workflow) {
         Ok(restored) => restored,
         Err(code) => return Left::Failed(code),
@@ -570,6 +578,9 @@ fn step(
             move_due(&mut rows, id, &mut workflow, pause.due(base.time));
             let pending = pause.pending();
             workflow.state = pause.state(&resume);
+            if stored_whole(&captured) {
+                workflow.stored = base.time;
+            }
             workflow.snapshot = Some(Snapshot {
                 counter,
                 registers: registers.to_vec(),
@@ -600,6 +611,22 @@ fn step(
     let mut stepped = Stepped::ran(run);
     stepped.pages = stored;
     stepped
+}
+
+/// Whether a paused step stored every page its workflow holds after it, so
+/// none dates from an earlier step.
+fn stored_whole(captured: &Captured) -> bool {
+    let mut stored: Vec<u32> = captured
+        .pages
+        .iter()
+        .filter(|page| page.hash.is_some())
+        .map(|page| page.index)
+        .collect();
+    stored.sort_unstable();
+    captured
+        .held
+        .iter()
+        .all(|(index, _)| stored.binary_search(index).is_ok())
 }
 
 /// End `workflow` with `outcome`: its pages dropped, its pin and its place

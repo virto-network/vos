@@ -590,6 +590,45 @@ fn a_workflow_installed_for_jam_holds_its_pages_to_jam_limits() {
     }
 }
 
+/// A workflow of an instance installed for JAM whose step comes past what
+/// its target keeps of its pages ends at that step, `Expired`, without
+/// restoring them, and drops them: on every host, as in the model. Within
+/// it, as for VOS, it resumes.
+#[test]
+fn a_jam_workflow_past_its_pages_keep_expires() {
+    use vos_wire::abi::cap::JAM;
+    let kept = JAM.pages_kept.expect("JAM keeps pages for a time");
+    for target in [Target::Vos, Target::Jam] {
+        for node in [Node::new(), Node::jam(true)] {
+            let mut flows = Flows::new(node);
+            let install = flows.install_for("lean", target);
+            flows.batch(1, vec![install]);
+            let inputs = vec![flows.start("nap", kept - 10), flows.start("nap", kept + 10)];
+            flows.batch(1, inputs);
+            let held = |flows: &Flows, id| flows.record(id).snapshot.unwrap().pages.len();
+            assert!(
+                held(&flows, 0) > 0 && held(&flows, 1) > 0,
+                "they hold pages"
+            );
+            let result = flows.sweep(kept - 5);
+            assert_eq!(due(&result, 0).outcome, Outcome::Done(vec![]), "within");
+            let woke = ended(&flows.record(0)).clone();
+            assert!(matches!(woke, Outcome::Done(_)), "{woke:?}");
+            let result = flows.sweep(20);
+            let late = &due(&result, 1);
+            if target == Target::Jam {
+                let expired = Outcome::failed(Failure::Expired);
+                assert_eq!(late.outcome, expired);
+                assert!(late.pages.iter().all(|page| page.hash.is_none()));
+                assert_eq!(ended(&flows.record(1)), &expired);
+            } else {
+                assert_eq!(late.outcome, Outcome::Done(vec![]));
+                assert!(matches!(ended(&flows.record(1)), Outcome::Done(_)));
+            }
+        }
+    }
+}
+
 /// A workflow's machine counts toward the machines a step may hold, though
 /// it is on no call stack: its chain of nested calls fails one call shorter
 /// than a handler's, on the depth rule, never on the host's machines.

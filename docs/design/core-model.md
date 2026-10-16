@@ -1062,9 +1062,13 @@ These form a prover track that runs alongside the core slices (section 16).
       page's hash;
     - a resumed workflow's package imports its pages by segment root,
       and refine checks them;
-    - DA retention is finite, and a workflow that waits longer cannot
-      resume until pages are re-exported or failed (carried to slice
-      5).
+    - DA retention is finite, so a workflow of an instance installed
+      for JAM keeps its pages a day past storing the oldest it holds
+      (`Limits::pages_kept`): a step due later ends it `Expired`,
+      deterministically and without importing them, its pages dropped.
+      Its record keeps the batch time from which every page it holds
+      has been stored. One installed for VOS that waits past DA's
+      retention stays due, and the builder leaves it out.
   - **Programs are derived from the actor's ELF** (section 6.4) and
     provided as preimages, solicited by the agent.
   - **Messages between agents on JAM,** as transfers with small memos

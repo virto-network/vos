@@ -63,10 +63,11 @@
 //! have stopped before them, so the rows after them may step where they
 //! would have waited. A page is fetched once a prepare, whichever check or
 //! simulation asks, and a place the store cannot read counts as one DA
-//! lacks, for both. Nothing exports a workflow's pages again: one that
-//! sleeps or awaits past DA's retention stays due and never resumes. Open:
-//! pages exported again before retention ends, or a deterministic failure
-//! for pages lost.
+//! lacks, for both. Nothing exports a workflow's pages again: a workflow of
+//! an instance installed for JAM whose step comes past what its target
+//! keeps of its pages (`cap::Limits::pages_kept`, a day) ends at that step,
+//! `Expired`, without them, so it is never left out; one installed for VOS
+//! that sleeps or awaits past DA's retention stays due and never resumes.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -474,7 +475,11 @@ fn lacking(view: &View, fetched: &Fetched, inputs: &[Input], time: u64) -> Vec<W
             let Ok(Some(workflow)) = record::<Workflow>(view, &keys::workflow(id)) else {
                 continue;
             };
-            let resumes = workflow.due == at && !matches!(workflow.state, WorkflowState::Ended(_));
+            // Past what its target keeps of its pages, its step ends it
+            // without them.
+            let resumes = workflow.due == at
+                && !matches!(workflow.state, WorkflowState::Ended(_))
+                && workflow.pages_expire().is_none_or(|expire| time < expire);
             let Some(snapshot) = workflow.snapshot.filter(|_| resumes) else {
                 continue;
             };

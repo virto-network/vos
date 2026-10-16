@@ -288,6 +288,7 @@ fn codes_keep_their_values() {
         (Failure::InRefine, 9),
         (Failure::TimedOut, 10),
         (Failure::Unloadable, 11),
+        (Failure::Expired, 12),
     ];
     for (failure, code) in failures {
         assert_eq!(failure.code(), code);
@@ -307,7 +308,7 @@ fn codes_keep_their_values() {
         assert_eq!(Refusal::from_code(code), Some(refusal));
         assert_eq!(refusal.encode(), code.to_le_bytes());
     }
-    for outside in [0u32, 12, u32::MAX] {
+    for outside in [0u32, 13, u32::MAX] {
         assert!(Failure::decode(&outside.to_le_bytes()).is_err());
     }
     for outside in [0u32, 7, u32::MAX] {

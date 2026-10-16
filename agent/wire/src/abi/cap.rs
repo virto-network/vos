@@ -158,6 +158,12 @@ pub struct Limits {
     pub step_pages: usize,
     /// The pages a workflow's snapshot may hold.
     pub held_pages: usize,
+    /// How long, in milliseconds of batch time, a workflow's stored page
+    /// stays where its next step finds it: a step due later, its snapshot
+    /// holding a page stored that long before, fails
+    /// [`super::Failure::Expired`] instead of restoring it. `None`: kept
+    /// until the workflow ends.
+    pub pages_kept: Option<u64>,
     /// The pages an actor's program may write, checked at install; `None`
     /// where only a workflow's start checks them.
     pub program_pages: Option<usize>,
@@ -184,6 +190,7 @@ pub const VOS: Limits = Limits {
     workflow_pages: WORKFLOW_PAGES,
     step_pages: STEP_PAGES,
     held_pages: HELD_PAGES,
+    pages_kept: None,
     program_pages: None,
     program: 64 << 20,
     kernels: 1024,
@@ -199,7 +206,11 @@ pub const VOS: Limits = Limits {
 /// the bytes, half as many; its writes a 16th of the bytes, in at most 128
 /// rows. A workflow holds a ninth of the pages, and writes a 32nd of them
 /// in a step; an actor's program writes at most a 16th of them, and loads
-/// within a step's reserve. A kernel hashes about a 40th of what the most
+/// within a step's reserve. A workflow's pages travel as exported segments,
+/// which JAM's data availability keeps for a limited time, so a workflow
+/// that waits a day past storing a page it holds ends: well within that
+/// time, and deterministically, rather than waiting for good on pages
+/// gone. A kernel hashes about a 40th of what the most
 /// gas a handler may request pays for.
 pub const JAM: Limits = Limits {
     step_writes: 16 << 10,
@@ -211,6 +222,7 @@ pub const JAM: Limits = Limits {
     workflow_pages: 256,
     step_pages: 256 << 10,
     held_pages: 64,
+    pages_kept: Some(24 * 60 * 60 * 1000),
     program_pages: Some(256),
     program: 512 << 10,
     kernels: 32,
@@ -231,6 +243,11 @@ impl Limits {
             (Some(mine), Some(theirs)) => mine <= theirs,
             (None, Some(_)) => false,
         };
+        let kept = match (self.pages_kept, other.pages_kept) {
+            (_, None) => true,
+            (Some(mine), Some(theirs)) => mine <= theirs,
+            (None, Some(_)) => false,
+        };
         self.step_writes <= other.step_writes
             && self.step_rows <= other.step_rows
             && self.messages <= other.messages
@@ -244,6 +261,7 @@ impl Limits {
             && self.kernels <= other.kernels
             && pages
             && compressions
+            && kept
     }
 }
 

@@ -307,6 +307,53 @@ fn workflows_whose_pages_da_lacks_are_left_out_at_once() {
     assert!(naps.iter().all(|&id| asleep(&driven, id)), "still due");
 }
 
+/// A workflow of an instance installed for JAM whose pages DA no longer
+/// holds is left out of the sweep while its target keeps them; past that,
+/// its step ends it, `Expired`, in a package that imports none of them.
+#[test]
+fn a_jam_workflow_past_its_pages_keep_ends_without_them() {
+    const LEAN: InstanceId = InstanceId(5);
+    let mut driven = Driven::new(Store::temporary().unwrap(), POLKAJAM_REFINE_GAS);
+    let lean = actor("lean");
+    driven.run(vec![Input::Admin(Admin::Install {
+        instance: LEAN,
+        derivation: vos_testkit::programs::bare(ProgramHash::of(&lean)),
+        roles: vec![],
+        target: Target::Jam,
+    })]);
+    let nap = method(&lean, "nap");
+    let start = driven.request(LEAN, nap, 500u64);
+    driven.run(vec![start]);
+    let workflow = WorkflowId(0);
+    driven.chain.da = vos_jam::Da::default();
+    let increment = driven.actors.method(COUNTER, "increment");
+    let sweep = driven
+        .builder
+        .sweep(driven.time + 1_000)
+        .unwrap()
+        .expect("due");
+    let request = driven.request(COUNTER, increment, 1u64);
+    let taken = driven.try_run(vec![sweep, request]).expect("it lands");
+    assert_eq!(taken.prepared.skipped, [workflow], "kept, so left out");
+    let kept = cap::JAM.pages_kept.expect("JAM keeps pages for a time");
+    driven.time += kept;
+    let sweep = driven
+        .builder
+        .sweep(driven.time + 1_000)
+        .unwrap()
+        .expect("due");
+    let taken = driven.try_run(vec![sweep]).expect("it lands");
+    assert!(taken.prepared.skipped.is_empty());
+    assert!(
+        taken.prepared.package.imports.is_empty(),
+        "no page imported"
+    );
+    let expired = Outcome::failed(vos_wire::abi::Failure::Expired);
+    let record = driven.builder.workflow(&ALICE, workflow).unwrap().unwrap();
+    assert_eq!(record.state, WorkflowState::Ended(expired));
+    assert!(record.snapshot.is_none(), "its pages dropped");
+}
+
 /// A package another builder's landed before: the builder takes that one
 /// from its exports, then makes its own again on it. One that cannot be
 /// reached from the store stops the builder, its store left as it was.

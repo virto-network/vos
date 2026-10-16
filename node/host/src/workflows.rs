@@ -155,6 +155,7 @@ mod tests {
             state,
             snapshot: None,
             target: vos_wire::abi::cap::Target::Vos,
+            stored: 0,
         };
         WorkflowHead::decode(&record.encode()).unwrap().0
     }

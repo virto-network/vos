@@ -537,6 +537,7 @@ fn workflows_keep_their_bytes() {
             pending: Some(11),
         }),
         target: vos_wire::abi::cap::Target::Jam,
+        stored: 14,
     };
     let bytes = [
         &[Workflow::FORMAT][..],
@@ -562,6 +563,7 @@ fn workflows_keep_their_bytes() {
         &[1],
         &11u64.to_le_bytes(),
         &[1],
+        &14u64.to_le_bytes(),
     ]
     .concat();
     assert_eq!(record.encode(), bytes);
@@ -578,7 +580,12 @@ fn workflows_keep_their_bytes() {
     );
     assert_eq!(
         &bytes[used..],
-        &[record.snapshot.encode(), record.target.encode()].concat()[..]
+        &[
+            record.snapshot.encode(),
+            record.target.encode(),
+            record.stored.encode()
+        ]
+        .concat()[..]
     );
     let ended = WorkflowState::Ended(Outcome::Started(WorkflowId(1)));
     round_trip(&ended);

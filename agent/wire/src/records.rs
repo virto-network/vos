@@ -128,6 +128,10 @@ pub struct Workflow {
     /// Its instance's target when it started, whose limits its steps run
     /// within.
     pub target: Target,
+    /// The batch time from which every page its snapshot holds has been
+    /// stored: its start's, then that of the last step after which it
+    /// holds no page an earlier step stored.
+    pub stored: u64,
 }
 
 impl Workflow {
@@ -136,7 +140,18 @@ impl Workflow {
     /// new format needs the records migrated before any replica runs it.
     /// The node reads the record too, as its [`WorkflowHead`], to answer
     /// its owner: a new format changes that reader with the agent.
-    pub const FORMAT: u8 = 4;
+    pub const FORMAT: u8 = 5;
+
+    /// The batch time from which its next step finds its pages no longer
+    /// kept, on a target that keeps them for a time and while it holds
+    /// any ([`crate::abi::cap::Limits::pages_kept`]).
+    pub fn pages_expire(&self) -> Option<u64> {
+        let kept = self.target.limits().pages_kept?;
+        self.snapshot
+            .as_ref()
+            .filter(|snapshot| !snapshot.pages.is_empty())
+            .map(|_| self.stored.saturating_add(kept))
+    }
 }
 
 /// A [`Workflow`] record's fields before its snapshot, in its order:

@@ -89,6 +89,9 @@ codes! {
         /// The callee's program could not be loaded: the node lacks a
         /// program the agent's state names, its fault, not the caller's.
         Unloadable = 11,
+        /// A workflow's step came past what its target keeps of its pages
+        /// ([`super::cap::Limits::pages_kept`]): it ends without them.
+        Expired = 12,
     }
 }
 

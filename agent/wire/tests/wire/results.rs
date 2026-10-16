@@ -202,6 +202,7 @@ fn the_largest_step_fits_its_bound() {
             pending: Some(u64::MAX),
         }),
         target: vos_wire::abi::cap::Target::Jam,
+        stored: u64::MAX,
     };
     let rows = [
         keys::workflow(workflow),

@@ -169,6 +169,7 @@ impl Testkit {
             state: WorkflowState::Ready(arguments.to_vec()),
             snapshot: None,
             target: installed.target,
+            stored: self.time,
         };
         let mut rows = Rows::new();
         Self::set_count(&mut rows, keys::next_workflow(), id.0 + 1);
@@ -309,6 +310,21 @@ impl Testkit {
                 }
                 Self::move_due(&mut rows, id, &mut workflow, at);
                 workflow.state = state;
+                // Every page it holds stored now: none is older.
+                let restored = |index: &u32| {
+                    captured
+                        .pages
+                        .iter()
+                        .any(|page| page.index == *index && page.hash.is_some())
+                };
+                if captured
+                    .snapshot
+                    .pages
+                    .iter()
+                    .all(|(index, _)| restored(index))
+                {
+                    workflow.stored = self.time;
+                }
                 workflow.snapshot = Some(captured.snapshot);
                 rows.insert(keys::workflow(id), Some(workflow.encode()));
                 step.pages = captured.pages;
@@ -381,6 +397,17 @@ impl Testkit {
         workflow: &Workflow,
         resume: &[u8],
     ) -> Result<Left, Failure> {
+        // Its target keeps its pages for a time: past it, it ends.
+        let holds = workflow
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| !snapshot.pages.is_empty());
+        if let Some(kept) = workflow.target.limits().pages_kept
+            && holds
+            && self.time >= workflow.stored + kept
+        {
+            return Err(Failure::Expired);
+        }
         let blob = self
             .programs
             .get(&workflow.program)
