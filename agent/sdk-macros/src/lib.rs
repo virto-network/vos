@@ -73,6 +73,9 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///   one, then its arguments.
 /// - **Attestable methods** each run as their own kernel, derived at
 ///   install from the entry generated for them, `__vos_attest_<name>`.
+///   `#[attestable(gas = N)]` sets the gas limit its kernel runs within on
+///   a target that bounds kernels' BLAKE2b compressions, which its install
+///   checks; it takes no role.
 /// - **Options:** `#[msg(role = "...", gas = N)]`, the role a caller needs
 ///   and the handler's gas limit; `#[workflow(role = "...", gas = N)]`
 ///   alike, the role checked when it starts and the gas each step's.

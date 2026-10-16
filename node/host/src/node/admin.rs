@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use vos_raft::Role;
+use vos_wire::abi::cap::Target;
 use vos_wire::batch::Admin;
 use vos_wire::ids::{AgentId, InstanceId, ProgramHash};
 use vos_wire::ingress::Unplaced;
@@ -238,6 +239,7 @@ impl Inner {
             instance,
             derivation,
             roles,
+            target: Target::Vos,
         };
         let (answer, reply) = smol::channel::bounded(1);
         self.push(

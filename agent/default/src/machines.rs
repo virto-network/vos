@@ -94,11 +94,24 @@ pub enum Exit {
 
 /// The header of `program`'s blob, which places its regions, read alone.
 pub fn header(program: &[u8; 32]) -> Option<StandardHeader> {
+    header_and_len(program).map(|(header, _)| header)
+}
+
+/// [`header`], and the blob's length.
+pub fn header_and_len(program: &[u8; 32]) -> Option<(StandardHeader, usize)> {
     let mut header = [0u8; StandardHeader::LEN];
     let len = historical_lookup_from(program, 0, &mut header)?;
     (len >= StandardHeader::LEN)
         .then(|| StandardHeader::read(&header))
         .flatten()
+        .map(|header| (header, len))
+}
+
+/// The pages a program may write: its read-write data and heap, and its
+/// stack.
+pub fn writable_pages(header: &StandardHeader) -> Option<u64> {
+    let [_, rw, stack] = header.regions()?;
+    Some((rw.size + stack.size) / PAGE)
 }
 
 /// A tracked machine's writable pages and those written since it was armed.

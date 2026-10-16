@@ -26,7 +26,7 @@ actors="${CARGO_TARGET_DIR:-$root/agent/test-actors/target}/riscv64em-vos/releas
 for binary in polkajam-testnet polkajam jamt; do
     [ -x "$POLKAJAM/$binary" ] || { echo "no $binary in $POLKAJAM" >&2; exit 1; }
 done
-[ -f "$agent" ] && [ -f "$actors/shop.elf" ] || {
+[ -f "$agent" ] && [ -f "$actors/lean.elf" ] || {
     echo "build the agent and the test actors first: just build-agent build-test-actors" >&2
     exit 1
 }

@@ -41,9 +41,12 @@
 //!   - **(c)** a request's or a call's step never fails `Cap`: below its
 //!     keep the batch leaves it undispatched, and it waits.
 //!
-//!   Open: closing (a) and (b) would take the per-step effect caps down,
-//!   for an agent on JAM, about 31-fold, until their own work fits what
-//!   the keep leaves.
+//!
+//!   An instance installed for JAM runs within [`cap::JAM`]'s limits,
+//!   about 35 times below VOS's for a step's effects, and with fewer pages
+//!   held: [`WORST_JAM_STEP`] bounds its worst step, effects and all, and
+//!   fits a package, asserted, so (a) and (b) are for instances installed
+//!   for VOS alone.
 //! - **Its exports and imports** are at most a package's segments, and its
 //!   payload at most a package's input. A batch that does not fit loses its
 //!   later inputs, and a sweep its later rows, which wait for the next; a
@@ -141,6 +144,24 @@ pub const WORST_ENDING: u64 = defaults::min_refine_gas(MAX_INPUTS)
 // workflow a VOS node runs to its end, a package runs to its end, but for
 // its last step's own effects.
 const _: () = assert!(WORST_ENDING <= usable(POLKAJAM_REFINE_GAS));
+
+/// The refine gas of a package holding only the worst step of an instance
+/// installed for JAM ([`cap::JAM`]): at the largest limit, restoring every
+/// page its workflow may hold, storing or dropping each, ending it, and its
+/// effects at their limits ([`gas::effects`]). Its batch keeps what a VOS
+/// node refines with at the least, as [`WORST_ENDING`]'s does.
+pub const WORST_JAM_STEP: u64 = defaults::min_refine_gas(MAX_INPUTS)
+    + defaults::refine_start(
+        MAX_INPUTS,
+        gas::ENDING_PAYLOAD + cap::JAM.held_pages * gas::PAGE_PAYLOAD,
+    )
+    + gas::ENDING
+    + cap::JAM.held_pages as u64 * (gas::PAGE_READ + gas::PAGE_DROP + gas::PAGE_STORE)
+    + gas::effects(&cap::JAM);
+
+// On PolkaJam it fits: a step of an instance installed for JAM never fails
+// `Cap` on JAM alone, nor leaves no package to make.
+const _: () = assert!(WORST_JAM_STEP <= usable(POLKAJAM_REFINE_GAS));
 
 /// A batch made a package: its simulation, the package and its encoding,
 /// where each of its imports was exported, in its order, the refine gas it
@@ -557,6 +578,24 @@ mod tests {
         let mut fitting = Fitting::new(POLKAJAM_REFINE_GAS);
         assert_eq!(fitting.budget, start);
         assert_eq!(fitting.next(false, OWN_BOUND, false), Next::Unfit);
+    }
+
+    /// A step's effects at JAM's limits take about a thirty-first of their
+    /// own work at VOS's, and its worst step fits a package where VOS's,
+    /// at its caps, would not.
+    #[test]
+    fn the_jam_limits_fit_a_package() {
+        let (vos, jam) = (gas::effects(&cap::VOS), gas::effects(&cap::JAM));
+        let usable = usable(POLKAJAM_REFINE_GAS);
+        println!(
+            "effects at most: VOS {vos}, JAM {jam}, {:.1} times fewer; the worst JAM step \
+             {WORST_JAM_STEP} of {usable} usable; the worst VOS ending with its effects {}",
+            vos as f64 / jam as f64,
+            WORST_ENDING + vos,
+        );
+        assert!(vos / jam >= 31, "{vos} against {jam}");
+        assert!(WORST_ENDING + vos > usable);
+        assert!(WORST_JAM_STEP <= usable);
     }
 
     /// A workflow whose pages are gone leaves the sweeps, which drop

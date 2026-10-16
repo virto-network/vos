@@ -35,7 +35,10 @@ use crate::simulate::Runner;
 use crate::store::{Pending, Store, View};
 
 pub(crate) use fit::MAX_INPUT;
-pub use fit::{MARGIN, MAX_INPUTS, OWN_BOUND, POLKAJAM_REFINE_GAS, Prepared, WORST_ENDING, budget};
+pub use fit::{
+    MARGIN, MAX_INPUTS, OWN_BOUND, POLKAJAM_REFINE_GAS, Prepared, WORST_ENDING, WORST_JAM_STEP,
+    budget,
+};
 
 /// The times the builder makes a batch again before it stops.
 const ATTEMPTS: usize = 4;

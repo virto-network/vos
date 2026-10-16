@@ -17,6 +17,7 @@ use vos_jam::{
 use vos_pvm::PvmBackend;
 use vos_testkit::programs::{actor, method};
 use vos_tree::{Blake2b, Hash, Hasher, empty_root};
+use vos_wire::abi::cap::Target;
 use vos_wire::abi::{Rows, cap};
 use vos_wire::batch::{Admin, Answer, Await, Body, Input, Message, Request, Work};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, Session, WorkflowId};
@@ -328,6 +329,7 @@ fn with_shop(backend: PvmBackend, actors: &Actors) -> (Paired, Vec<u8>) {
         instance: SHOP,
         derivation: vos_testkit::programs::bare(ProgramHash::of(&shop)),
         roles: vec![],
+        target: Target::Vos,
     }));
     ran_or_refused(&paired.batch(T0, first).result);
     (paired, shop)

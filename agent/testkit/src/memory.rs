@@ -64,6 +64,7 @@ pub(crate) fn kernel(
     program: &[u8],
     arguments: &[u8],
     gas: u64,
+    output: usize,
 ) -> Result<(Vec<u8>, u64), Failure> {
     let mut machine = Machine::load(program, arguments, gas).map_err(|_| Failure::Trapped)?;
     loop {
@@ -73,7 +74,7 @@ pub(crate) fn kernel(
             }
             ExitReason::Halt => {
                 let invocation = machine.finish(ExitReason::Halt);
-                let output = invocation.output_bounded(cap::REPLY).ok_or(Failure::Cap)?;
+                let output = invocation.output_bounded(output).ok_or(Failure::Cap)?;
                 return Ok((output, invocation.gas_used));
             }
             ExitReason::OutOfGas => return Err(Failure::OutOfGas),

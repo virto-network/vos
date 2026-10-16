@@ -115,8 +115,10 @@ impl Kernels {
         (digest, named, areas)
     }
 
-    /// BLAKE2b-256 of the values, by the precompile.
-    #[attestable]
+    /// BLAKE2b-256 of the values, by the precompile. Its gas limit, and
+    /// its siblings', bound its compressions where a target bounds a
+    /// kernel's.
+    #[attestable(gas = 1_000_000)]
     pub fn digest(values: Vec<u64>) -> Vec<u8> {
         let bytes: Vec<u8> = values
             .iter()
@@ -126,7 +128,7 @@ impl Kernels {
     }
 
     /// A word a match of calls computes, which a jump table lowers.
-    #[attestable]
+    #[attestable(gas = 100_000)]
     pub fn named(index: u32) -> u64 {
         let x = u64::from(index);
         match core::hint::black_box(index) % 12 {
@@ -146,7 +148,7 @@ impl Kernels {
     }
 
     /// The areas of a shape per side, each through its vtable, added up.
-    #[attestable]
+    #[attestable(gas = 1_000_000)]
     pub fn areas(sides: Vec<u64>) -> u64 {
         sides
             .iter()

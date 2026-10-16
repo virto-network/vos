@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 
 use vos_testkit::programs::{actor, method};
 use vos_testkit::{Step as KitStep, Testkit, decode};
+use vos_wire::abi::cap::Target;
 use vos_wire::abi::{Failure, Op, cap, price};
 use vos_wire::batch::{Admin, Answer, Await, Body, Input, Message};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, WorkflowId};
@@ -101,12 +102,18 @@ impl Flows {
     /// The shop's install as its program `program`, in the node, which
     /// stores it, and in the model.
     fn install(&mut self, program: &str) -> Input {
+        self.install_for(program, Target::Vos)
+    }
+
+    /// [`Flows::install`] for `target`.
+    fn install_for(&mut self, program: &str, target: Target) -> Input {
         let shop = &self.programs[program];
-        self.kit.install(SHOP, shop, &[], &[]).unwrap();
+        self.kit.install_for(target, SHOP, shop, &[], &[]).unwrap();
         Input::Admin(Admin::Install {
             instance: SHOP,
             derivation: vos_testkit::programs::bare(self.node.add(shop)),
             roles: vec![],
+            target,
         })
     }
 

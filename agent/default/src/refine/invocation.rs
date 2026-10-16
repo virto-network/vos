@@ -15,7 +15,8 @@ use alloc::collections::BTreeMap;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
 
-use vos_wire::abi::{self, Failure, Kind, Op, Rows, cap, code, precompile, price};
+use vos_wire::abi::cap::{self, Limits};
+use vos_wire::abi::{self, Failure, Kind, Op, Rows, code, precompile, price};
 use vos_wire::batch::{Await, Body};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, WorkflowId};
 use vos_wire::records::Installed;
@@ -34,11 +35,13 @@ use memory::{copy_out, read, read_key, row, window, write};
 /// which the host refuses, as `Depth`.
 const MAX_DEPTH: usize = 63;
 
-/// One step: its overlays, call stack and effects.
+/// One step: its overlays, call stack and effects, within the limits of
+/// the target of the instance it enters, its nested calls' too.
 pub(crate) struct Invocation<'a> {
     base: &'a Base,
     step: u32,
     entry: Kind,
+    pub(crate) limits: &'static Limits,
     /// A workflow's step: the workflow, and the counter its next await
     /// takes.
     pub(crate) awaits: Option<Await>,
@@ -54,8 +57,10 @@ pub(crate) struct Invocation<'a> {
     pub(crate) instances: Vec<InstanceGas>,
     pub(crate) messages: Vec<Outgoing>,
     pub(crate) attests: Vec<Attest>,
-    /// The bytes of state the step has written, against its cap.
+    /// The bytes of state the step has written, and the rows, against
+    /// its limits.
     write_bytes: usize,
+    rows_written: usize,
     draws: u64,
     pub(crate) gas_used: u64,
 }
@@ -66,6 +71,7 @@ impl<'a> Invocation<'a> {
             base,
             step,
             entry,
+            limits: &cap::VOS,
             awaits: None,
             pages_paid: 0,
             section: false,
@@ -76,6 +82,7 @@ impl<'a> Invocation<'a> {
             messages: Vec::new(),
             attests: Vec::new(),
             write_bytes: 0,
+            rows_written: 0,
             draws: 0,
             gas_used: 0,
         }
@@ -95,6 +102,7 @@ impl<'a> Invocation<'a> {
             Ok(installed) => installed,
             Err(code) => return Outcome::failed(code),
         };
+        self.limits = installed.target.limits();
         let Some(schema) = installed.schema.method(method) else {
             return Outcome::failed(Failure::Unknown);
         };
@@ -286,7 +294,12 @@ impl<'a> Invocation<'a> {
             return Err(Failure::Trapped);
         }
         self.frames.push(BTreeMap::new());
-        let effects = (self.messages.len(), self.attests.len(), self.write_bytes);
+        let effects = (
+            self.messages.len(),
+            self.attests.len(),
+            self.write_bytes,
+            self.rows_written,
+        );
         let gas = machine.gas();
         let call = Call {
             caller: Principal::Instance(instance),
@@ -310,10 +323,11 @@ impl<'a> Invocation<'a> {
             Ended::Paused(_) => unreachable!("only a workflow pauses"),
         };
         if failed.is_some() {
-            let (messages, attests, written) = effects;
+            let (messages, attests, written, rows) = effects;
             self.messages.truncate(messages);
             self.attests.truncate(attests);
             self.write_bytes = written;
+            self.rows_written = rows;
         }
         copy_out(machine, &bytes, r[11], 0, r[12])?;
         machine.set_register(7, bytes.len() as u64);
@@ -388,7 +402,10 @@ impl<'a> Invocation<'a> {
                     None
                 };
                 self.write_bytes += key.len() + value.as_ref().map_or(0, Vec::len);
-                if self.write_bytes > cap::STEP_WRITES {
+                self.rows_written += 1;
+                if self.write_bytes > self.limits.step_writes
+                    || self.rows_written > self.limits.step_rows
+                {
                     return Err(Failure::Cap);
                 }
                 self.frames.last_mut().expect("a frame").insert(key, value);
@@ -415,8 +432,8 @@ impl<'a> Invocation<'a> {
                 machine.set_register(7, if full { code::FULL } else { out.len() as u64 });
             }
             Op::Send => {
-                let call_arguments = read(machine, r[10], r[11], cap::MESSAGE)?;
-                if self.messages.len() == cap::MESSAGES {
+                let call_arguments = read(machine, r[10], r[11], self.limits.message)?;
+                if self.messages.len() == self.limits.messages {
                     return Err(Failure::Cap);
                 }
                 self.messages.push(Outgoing {
@@ -432,15 +449,29 @@ impl<'a> Invocation<'a> {
             }
             Op::Attest => {
                 let method = MethodId(r[7] as u32);
-                let call_arguments = read(machine, r[8], r[9], cap::REQUEST)?;
-                if self.attests.len() == cap::ATTESTS {
+                let call_arguments = read(machine, r[8], r[9], self.limits.attest)?;
+                if self.attests.len() == self.limits.attests {
                     return Err(Failure::Cap);
                 }
-                let program = installed
-                    .and_then(|installed| installed.kernel(method))
-                    .ok_or(Failure::Unknown)?;
-                let gas = machine.gas();
-                let (output, used) = kernel(&self.base.meter, &program, &call_arguments, gas)?;
+                let installed = installed.ok_or(Failure::Unknown)?;
+                let program = installed.kernel(method).ok_or(Failure::Unknown)?;
+                // Where kernels' compressions are bounded, a kernel runs
+                // within its method's gas limit, which bounds them.
+                let gas = match self.limits.kernel_compressions {
+                    Some(_) => installed
+                        .schema
+                        .method(method)
+                        .map_or(0, |schema| schema.gas_limit())
+                        .min(machine.gas()),
+                    None => machine.gas(),
+                };
+                let (output, used) = kernel(
+                    &self.base.meter,
+                    &program,
+                    &call_arguments,
+                    gas,
+                    self.limits.attest,
+                )?;
                 if !machine.charge(used) {
                     return Err(Failure::OutOfGas);
                 }
@@ -498,7 +529,7 @@ impl<'a> Invocation<'a> {
         }
         let (body, within) = match op {
             Op::Request => {
-                let arguments = read(machine, r[10], r[11], cap::MESSAGE)?;
+                let arguments = read(machine, r[10], r[11], self.limits.message)?;
                 let body = Body::Call {
                     instance: InstanceId(r[8] as u32),
                     method: MethodId(r[9] as u32),
@@ -512,7 +543,7 @@ impl<'a> Invocation<'a> {
                 (Body::Wait { workflow, awaiting }, r[9])
             }
         };
-        if self.messages.len() == cap::MESSAGES {
+        if self.messages.len() == self.limits.messages {
             return Err(Failure::Cap);
         }
         self.messages.push(Outgoing { to: agent, body });

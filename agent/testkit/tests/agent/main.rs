@@ -5,6 +5,7 @@
 mod common;
 mod hosts;
 mod jam;
+mod limits;
 mod messages;
 mod pricing;
 mod sessions;

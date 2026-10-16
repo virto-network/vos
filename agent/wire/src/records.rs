@@ -2,6 +2,7 @@
 
 use alloc::vec::Vec;
 
+use crate::abi::cap::Target;
 use crate::batch::Await;
 use crate::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash};
 use crate::result::Outcome;
@@ -55,13 +56,15 @@ impl Derivation {
 }
 
 /// An installed instance, under [`crate::keys::installed`]: the programs
-/// derived from its package, the agent's role byte for each role name, and
-/// the actor program's schema, read once at install.
+/// derived from its package, the agent's role byte for each role name, the
+/// actor program's schema, read once at install, and the target whose
+/// limits its program was checked against and its steps run within.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Installed {
     pub derivation: Derivation,
     pub roles: Vec<(Vec<u8>, u8)>,
     pub schema: Schema,
+    pub target: Target,
 }
 
 impl Installed {
@@ -122,6 +125,9 @@ pub struct Workflow {
     pub state: WorkflowState,
     /// Its machine as its last step left it; none before its first.
     pub snapshot: Option<Snapshot>,
+    /// Its instance's target when it started, whose limits its steps run
+    /// within.
+    pub target: Target,
 }
 
 impl Workflow {
@@ -130,7 +136,7 @@ impl Workflow {
     /// new format needs the records migrated before any replica runs it.
     /// The node reads the record too, as its [`WorkflowHead`], to answer
     /// its owner: a new format changes that reader with the agent.
-    pub const FORMAT: u8 = 3;
+    pub const FORMAT: u8 = 4;
 }
 
 /// A [`Workflow`] record's fields before its snapshot, in its order:

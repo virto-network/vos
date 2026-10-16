@@ -22,7 +22,8 @@ use core::cell::RefCell;
 use core::ops::Range;
 
 use vos_pvm_program::{REGISTER_COUNT, StandardHeader};
-use vos_wire::abi::{Failure, cap};
+use vos_wire::abi::Failure;
+use vos_wire::abi::cap::Limits;
 use vos_wire::ids::{ProgramHash, WorkflowId};
 use vos_wire::records::Workflow;
 use vos_wire::result::{PAGE, Page, PageSection, digest};
@@ -140,13 +141,14 @@ pub(crate) struct Captured {
 
 /// The pages a paused step wrote, against those the workflow held, each it
 /// stores put into `base`'s section in its format as the running step's.
-/// Past [`cap::STEP_PAGES`] written, or [`cap::HELD_PAGES`] held after, the
+/// Past `limits`' step pages written, or its held pages held after, the
 /// step fails, its pages dropped from the section; past the section's cap,
 /// the batch cannot take the step, which waits.
 #[inline(never)]
 pub(crate) fn capture(
     base: &Base,
     machine: &Machine,
+    limits: &Limits,
     program: &ProgramHash,
     header: &StandardHeader,
     id: WorkflowId,
@@ -155,6 +157,7 @@ pub(crate) fn capture(
     let captured = pages(
         base.format(),
         machine,
+        limits,
         program,
         header,
         id,
@@ -167,9 +170,11 @@ pub(crate) fn capture(
     captured
 }
 
+#[allow(clippy::too_many_arguments)]
 fn pages(
     format: Format,
     machine: &Machine,
+    limits: &Limits,
     program: &ProgramHash,
     header: &StandardHeader,
     id: WorkflowId,
@@ -177,7 +182,7 @@ fn pages(
     section: &RefCell<PageSection>,
 ) -> Result<Captured, Failure> {
     let written = machine.written().expect("a workflow's machine is tracked");
-    if written.len() * PAGE > cap::STEP_PAGES {
+    if written.len() * PAGE > limits.step_pages {
         return Err(Failure::Cap);
     }
     let image = Image::of(header).ok_or(Failure::Trapped)?;
@@ -223,7 +228,7 @@ fn pages(
         }
     }
     now.extend(before);
-    if now.len() > cap::HELD_PAGES {
+    if now.len() > limits.held_pages {
         return Err(Failure::Cap);
     }
     Ok(Captured {

@@ -1,6 +1,7 @@
 //! Strategies for the wire types, and a round trip through their encoding.
 
 use proptest::prelude::*;
+use vos_wire::abi::cap::Target;
 use vos_wire::abi::{Failure, Refusal};
 use vos_wire::batch::{Admin, Answer, Await, Body, Input, Message, Request};
 use vos_wire::ids::{
@@ -135,22 +136,26 @@ pub(crate) fn input() -> impl Strategy<Value = Input> {
                 any::<u32>(),
             ),
             prop::collection::vec((bytes(), any::<u8>()), 0..3),
+            prop_oneof![Just(Target::Vos), Just(Target::Jam)],
         )
-            .prop_map(|(instance, (program, kernels, elf, transpiler), roles)| {
-                Input::Admin(Admin::Install {
-                    instance: InstanceId(instance),
-                    derivation: Derivation {
-                        program: ProgramHash(program),
-                        kernels: kernels
-                            .into_iter()
-                            .map(|(method, kernel)| (MethodId(method), ProgramHash(kernel)))
-                            .collect(),
-                        elf,
-                        transpiler,
-                    },
-                    roles,
-                })
-            }),
+            .prop_map(
+                |(instance, (program, kernels, elf, transpiler), roles, target)| {
+                    Input::Admin(Admin::Install {
+                        instance: InstanceId(instance),
+                        derivation: Derivation {
+                            program: ProgramHash(program),
+                            kernels: kernels
+                                .into_iter()
+                                .map(|(method, kernel)| (MethodId(method), ProgramHash(kernel)))
+                                .collect(),
+                            elf,
+                            transpiler,
+                        },
+                        roles,
+                        target,
+                    })
+                }
+            ),
         (principal(), any::<Option<u8>>())
             .prop_map(|(principal, role)| Input::Admin(Admin::SetRole(Grant { principal, role }))),
         prop::collection::vec((any::<u64>(), due()), 0..4).prop_map(|due| Input::Sweep { due }),

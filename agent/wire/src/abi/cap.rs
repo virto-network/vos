@@ -1,3 +1,7 @@
+use alloc::vec::Vec;
+
+use scale::{Decode, Encode};
+
 use super::price;
 use crate::defaults::MAX_HANDLER_GAS;
 
@@ -99,3 +103,151 @@ pub const WORKFLOW_STEP_RESULT: usize = step_result(2 * MAX_HANDLER_GAS) + WORKF
 // Every step fits an empty result, so a batch always makes progress.
 const _: () = assert!(STEP_RESULT + 64 <= WORK_RESULT);
 const _: () = assert!(WORKFLOW_STEP_RESULT + 64 <= WORK_RESULT);
+
+/// Where an instance is installed to run, which sets the [`Limits`] it runs
+/// within: its install record names it. The agent holds an instance to its
+/// target's limits on every host, so a JAM builder's simulation, the JAM
+/// refine and a VOS node running the same batch agree.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode)]
+#[repr(u8)]
+pub enum Target {
+    /// A VOS node.
+    #[default]
+    #[codec(index = 0)]
+    Vos = 0,
+    /// A JAM service, whose work package pays, in software and beyond its
+    /// batch's budget, for hashing, applying and exporting what each step
+    /// leaves in the work result.
+    #[codec(index = 1)]
+    Jam = 1,
+}
+
+impl Target {
+    pub const fn limits(self) -> &'static Limits {
+        match self {
+            Target::Vos => &VOS,
+            Target::Jam => &JAM,
+        }
+    }
+}
+
+/// What an instance may do and be on its [`Target`]. A step past an effect
+/// or memory limit fails, [`super::Failure::Cap`]; a program past a static
+/// one is refused at install, likewise. Every target pays the same prices,
+/// a page's included ([`crate::defaults::WRITTEN_PAGE`] and its kin): the
+/// limits cap what a step does, and never price it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    /// The bytes of state a step writes, keys and values, its nested
+    /// calls' included.
+    pub step_writes: usize,
+    /// The rows a step writes or deletes.
+    pub step_rows: usize,
+    /// The messages a step sends, a workflow's request or wait included.
+    pub messages: usize,
+    /// A message's arguments.
+    pub message: usize,
+    /// The attests a step makes.
+    pub attests: usize,
+    /// An attest's arguments, and its output.
+    pub attest: usize,
+    /// The pages a workflow's program may write, its data, heap and stack:
+    /// a start of a workflow of a larger one fails.
+    pub workflow_pages: usize,
+    /// The bytes of the pages one workflow step may write.
+    pub step_pages: usize,
+    /// The pages a workflow's snapshot may hold.
+    pub held_pages: usize,
+    /// The pages an actor's program may write, checked at install; `None`
+    /// where only a workflow's start checks them.
+    pub program_pages: Option<usize>,
+    /// The bytes of an actor's program, checked at install.
+    pub program: usize,
+    /// The kernels an install binds.
+    pub kernels: usize,
+    /// The BLAKE2b compressions one kernel's run may make, each served by
+    /// the agent ([`crate::defaults::PRECOMPILE_SERVING`]): its method's
+    /// gas limit over the precompile's price bounds them, checked at
+    /// install, and a kernel runs within that limit. `None`: the calling
+    /// handler's gas alone bounds a kernel.
+    pub kernel_compressions: Option<u64>,
+}
+
+/// A VOS node's limits: the caps above.
+pub const VOS: Limits = Limits {
+    step_writes: STEP_WRITES,
+    step_rows: usize::MAX,
+    messages: MESSAGES,
+    message: MESSAGE,
+    attests: ATTESTS,
+    attest: REQUEST,
+    workflow_pages: WORKFLOW_PAGES,
+    step_pages: STEP_PAGES,
+    held_pages: HELD_PAGES,
+    program_pages: None,
+    program: 64 << 20,
+    kernels: 1024,
+    kernel_compressions: None,
+};
+
+/// A JAM service's limits. What a step leaves in its work result its
+/// package pays for beyond its batch's budget, in software: at VOS's caps a
+/// step's effects take up to about 1.4e9 gas of that own work, past a work
+/// package's refine gas; at these about 39M, a 35th, which an agent's
+/// builder asserts leaves its worst step a package, every page it may hold
+/// restored, stored and dropped. Its messages and attests carry a 32nd of
+/// the bytes, half as many; its writes a 16th of the bytes, in at most 128
+/// rows. A workflow holds a ninth of the pages, and writes a 32nd of them
+/// in a step; an actor's program writes at most a 16th of them, and loads
+/// within a step's reserve. A kernel hashes about a 40th of what the most
+/// gas a handler may request pays for.
+pub const JAM: Limits = Limits {
+    step_writes: 16 << 10,
+    step_rows: 128,
+    messages: 8,
+    message: 2 << 10,
+    attests: 8,
+    attest: 2 << 10,
+    workflow_pages: 256,
+    step_pages: 256 << 10,
+    held_pages: 64,
+    program_pages: Some(256),
+    program: 512 << 10,
+    kernels: 32,
+    kernel_compressions: Some(4096),
+};
+
+impl Limits {
+    /// Whether each of its limits is at most `other`'s, so what `other`
+    /// sizes holds it too.
+    pub const fn within(&self, other: &Limits) -> bool {
+        let pages = match (self.program_pages, other.program_pages) {
+            (_, None) => true,
+            (Some(mine), Some(theirs)) => mine <= theirs,
+            (None, Some(_)) => false,
+        };
+        let compressions = match (self.kernel_compressions, other.kernel_compressions) {
+            (_, None) => true,
+            (Some(mine), Some(theirs)) => mine <= theirs,
+            (None, Some(_)) => false,
+        };
+        self.step_writes <= other.step_writes
+            && self.step_rows <= other.step_rows
+            && self.messages <= other.messages
+            && self.message <= other.message
+            && self.attests <= other.attests
+            && self.attest <= other.attest
+            && self.workflow_pages <= other.workflow_pages
+            && self.step_pages <= other.step_pages
+            && self.held_pages <= other.held_pages
+            && self.program <= other.program
+            && self.kernels <= other.kernels
+            && pages
+            && compressions
+    }
+}
+
+// The caps above size every step's result and every batch's floor, so each
+// target's limits stay within them.
+const _: () = assert!(JAM.within(&VOS));
+const _: () = assert!(VOS.attest <= REQUEST && VOS.attest <= REPLY);

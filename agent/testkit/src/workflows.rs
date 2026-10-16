@@ -18,7 +18,8 @@ use std::collections::BTreeMap;
 use vos_pvm::ExitReason;
 use vos_pvm::refine::{Machine, MemoryModel, PreparedProgram};
 use vos_pvm::spi::StandardLayout;
-use vos_wire::abi::{self, Failure, Kind, Op, cap, code, price};
+use vos_wire::abi::cap::{self, Limits};
+use vos_wire::abi::{self, Failure, Kind, Op, code, price};
 use vos_wire::batch::{Answer, Await};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, WorkflowId};
 use vos_wire::keys::{self, Due};
@@ -146,7 +147,7 @@ impl Testkit {
         let parsed = vos_pvm::spi::parse_standard_program(blob).ok_or(Failure::Unloadable)?;
         let layout = parsed.layout(&[]).ok_or(Failure::Unloadable)?;
         let writable = (layout.rw.size + layout.stack.size) / PAGE as u64;
-        if writable > cap::WORKFLOW_PAGES as u64 {
+        if writable > installed.target.limits().workflow_pages as u64 {
             return Err(Failure::Cap);
         }
         let live = self.count(&keys::live_workflows());
@@ -167,6 +168,7 @@ impl Testkit {
             waiter: None,
             state: WorkflowState::Ready(arguments.to_vec()),
             snapshot: None,
+            target: installed.target,
         };
         let mut rows = Rows::new();
         Self::set_count(&mut rows, keys::next_workflow(), id.0 + 1);
@@ -277,6 +279,7 @@ impl Testkit {
             return step;
         }
         let mut invocation = Invocation::new(self, index, Kind::Workflow);
+        invocation.limits = workflow.target.limits();
         invocation.awaits = Some(Await {
             workflow: id,
             counter: workflow.awaits,
@@ -477,7 +480,8 @@ impl Testkit {
             .snapshot
             .as_ref()
             .map_or(&[][..], |snapshot| &snapshot.pages);
-        let captured = capture(&machine, &layout, id, held, written, pending)?;
+        let limits = workflow.target.limits();
+        let captured = capture(&machine, &layout, limits, id, held, written, pending)?;
         Ok(Left::Paused(state, captured))
     }
 }
@@ -486,17 +490,18 @@ impl Testkit {
 /// hash when it differs from its base, the read-write data where it lies
 /// and zeros elsewhere, and from what the workflow `held`, or dropped when
 /// back at its base; and the machine's snapshot, with the call it left
-/// unserved, `pending`. Past [`cap::STEP_PAGES`] written, or
-/// [`cap::HELD_PAGES`] held after, the step fails.
+/// unserved, `pending`. Past `limits`' step pages written, or its held
+/// pages held after, the step fails.
 fn capture(
     machine: &Machine,
     layout: &StandardLayout,
+    limits: &Limits,
     id: WorkflowId,
     held: &[(u32, [u8; 32])],
     written: Vec<u64>,
     pending: Option<u64>,
 ) -> Result<Captured, Failure> {
-    if written.len() * PAGE > cap::STEP_PAGES {
+    if written.len() * PAGE > limits.step_pages {
         return Err(Failure::Cap);
     }
     let mut now: BTreeMap<u32, [u8; 32]> = held.iter().copied().collect();
@@ -541,7 +546,7 @@ fn capture(
             stored.push(bytes);
         }
     }
-    if now.len() > cap::HELD_PAGES {
+    if now.len() > limits.held_pages {
         return Err(Failure::Cap);
     }
     // Past the call it stopped at, or where it ran out of gas, or where

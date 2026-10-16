@@ -7,7 +7,8 @@
 //! PolkaJam answers `WHAT` for 1,000.
 
 use vos_tree::Entry;
-use vos_wire::abi::cap;
+use vos_wire::abi::cap::{self, Limits};
+use vos_wire::abi::price;
 use vos_wire::defaults;
 use vos_wire::package::{Package, SEGMENT, result_segments};
 
@@ -142,6 +143,42 @@ pub const ENDING: u64 = FIXED
     + SMALL_ROWS * (opened(SMALL_KEY, SMALL_VALUE) + written(SMALL_KEY, Some(SMALL_VALUE)))
     + (SMALL_ROWS + 3) * PATH * BRANCH
     + result_bytes(1024 + RECORD + REPLY);
+/// What each page a step stores adds to its package's own work: its row
+/// written, holding its hash, and its export.
+pub const PAGE_STORE: u64 =
+    written(PAGE_KEY, Some(PAGE_VALUE)) + EXPORT + SEGMENT as u64 + defaults::DECODE_BYTE * 45;
+
+/// A row a step writes beside its key and value: the work result's framing
+/// of a write, and an agent's key prefix.
+const ROW_FRAMING: usize = 18;
+/// An outbox row's value beside its message's arguments: its body's
+/// framing.
+const MESSAGE_FRAMING: usize = 40;
+
+/// What a step's effects at `limits` add to its package's own work, at
+/// most: its writes in the work result and applied, each row salted,
+/// committed and put; each message in the result and in its outbox row; and
+/// each attest, its arguments and output, in the result. The rows a step
+/// writes are as many as its limit, or as its gas pays for at the most a
+/// workflow's step may use, twice a handler's largest limit, whichever is
+/// fewer.
+pub const fn effects(limits: &Limits) -> u64 {
+    let by_gas = (2 * defaults::MAX_HANDLER_GAS / price::PUT) as usize;
+    let rows = if limits.step_rows < by_gas {
+        limits.step_rows
+    } else {
+        by_gas
+    };
+    let writes = result_bytes(limits.step_writes + rows * ROW_FRAMING)
+        + rows as u64 * (WRITE + COMPRESSION * 4)
+        + COMPRESSION * compressions(limits.step_writes);
+    let message = limits.message + MESSAGE_FRAMING;
+    let messages =
+        limits.messages as u64 * (result_bytes(message) + written(OUTBOX_KEY, Some(message)));
+    let attests = limits.attests as u64 * result_bytes(2 * limits.attest + MESSAGE_FRAMING);
+    writes + messages + attests
+}
+
 /// The same for its package's payload: the package's batch and framing, the
 /// record and the other rows opened, and the paths' entries, each branch
 /// and its closed sibling.

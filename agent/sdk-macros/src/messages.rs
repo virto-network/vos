@@ -106,10 +106,15 @@ fn handler(
     ids: &mut Ids,
 ) -> syn::Result<Handler> {
     let name = method.sig.ident.to_string();
-    let options = match marked {
-        Some(Kind::Attestable) => Options::default(),
-        _ => msg_options(attribute)?,
-    };
+    let options = msg_options(attribute)?;
+    if marked == Some(Kind::Attestable)
+        && (options.role.is_some() || options.linearizable.is_some())
+    {
+        return Err(Error::new(
+            attribute.span(),
+            "an #[attestable] method takes `gas = N` alone: it has no caller and reads no state",
+        ));
+    }
     let mut inputs = method.sig.inputs.iter();
     let kind = if let Some(kind) = marked {
         if let Some(FnArg::Receiver(receiver)) = method.sig.inputs.first() {

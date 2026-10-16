@@ -3,7 +3,7 @@
 
 use alloc::vec::Vec;
 
-use vos_wire::abi::{Failure, cap, precompile};
+use vos_wire::abi::{Failure, precompile};
 use vos_wire::defaults;
 use vos_wire::ids::ProgramHash;
 
@@ -30,14 +30,16 @@ pub(crate) fn serve_precompile(
     machine.precompile(id)
 }
 
-/// Run an attestable method's kernel in its own machine: arguments in the
-/// standard window, output by the halt convention, and no host calls but
-/// precompiles, which the agent serves.
+/// Run an attestable method's kernel in its own machine with `gas`:
+/// arguments in the standard window, output by the halt convention, at most
+/// `output` bytes, and no host calls but precompiles, which the agent
+/// serves.
 pub(crate) fn kernel(
     meter: &Meter,
     program: &ProgramHash,
     arguments: &[u8],
     gas: u64,
+    output: usize,
 ) -> Result<(Vec<u8>, u64), Failure> {
     let mut machine = machines::pinned(&program.0, 0)?;
     if !machine.map_read_only(ARGUMENTS, arguments.len() as u64, arguments) {
@@ -54,7 +56,7 @@ pub(crate) fn kernel(
             Exit::Halt => {
                 let used = gas - machine.gas();
                 let len = machine.register(8) as usize;
-                if len > cap::REPLY {
+                if len > output {
                     return Err(Failure::Cap);
                 }
                 let output = machine.peek(machine.register(7), len).ok_or(Failure::Cap)?;

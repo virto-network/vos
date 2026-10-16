@@ -1,0 +1,5 @@
+error: an #[attestable] method takes `gas = N` alone: it has no caller and reads no state
+  --> tests/compile_fail/attestable_with_role.rs:14:5
+   |
+14 |     #[attestable(role = "minter")]
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

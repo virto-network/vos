@@ -13,6 +13,7 @@ use vos_pvm::{ExitReason, PvmBackend};
 use vos_testkit::node::serve;
 use vos_testkit::programs::{actor, agent, bare, derivation, derived, kernel, method, package};
 use vos_testkit::{Testkit, decode};
+use vos_wire::abi::cap::Target;
 use vos_wire::abi::{Failure, Refusal, cap};
 use vos_wire::batch::{Admin, Batch, Input, Query, Request, Work};
 use vos_wire::ids::{
@@ -465,6 +466,7 @@ impl Actors {
             instance: LEDGER,
             derivation: derivation(&package("ledger"), &derived("ledger")),
             roles: vec![(b"minter".to_vec(), MINTER)],
+            target: Target::Vos,
         })
     }
 
@@ -597,6 +599,7 @@ pub fn install(instance: InstanceId, program: ProgramHash) -> Input {
         instance,
         derivation: bare(program),
         roles: vec![],
+        target: Target::Vos,
     })
 }
 

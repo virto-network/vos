@@ -550,6 +550,46 @@ fn the_caps_hold() {
     }
 }
 
+/// A workflow of an instance installed for JAM holds its memory to JAM's
+/// limits, on every host: a step writing past its pages fails `Cap`, and so
+/// does one leaving its snapshot more pages than it may hold, where one
+/// installed for VOS pauses.
+#[test]
+fn a_workflow_installed_for_jam_holds_its_pages_to_jam_limits() {
+    use vos_wire::abi::cap::JAM;
+    use vos_wire::result::PAGE;
+    let cap = Outcome::failed(Failure::Cap);
+    let paused = Outcome::Done(vec![]);
+    let half = (JAM.held_pages * PAGE * 3 / 4) as u32;
+    for target in [Target::Vos, Target::Jam] {
+        for node in [Node::new(), Node::jam(true)] {
+            let mut flows = Flows::new(node);
+            let install = flows.install_for("lean", target);
+            flows.batch(1, vec![install]);
+            let past = (JAM.step_pages + PAGE) as u32;
+            let inputs = vec![
+                flows.start("hog", past),
+                flows.start("fill", (0u32, vec![half; 2])),
+            ];
+            let result = flows.batch(1, inputs);
+            let jam = target == Target::Jam;
+            let expected = |capped: bool| if capped { &cap } else { &paused };
+            assert_eq!(
+                &due(&result, 0).outcome,
+                expected(jam),
+                "{target:?}: past its step's pages"
+            );
+            assert_eq!(&due(&result, 1).outcome, &paused, "{target:?}: within them");
+            let result = flows.sweep(1);
+            assert_eq!(
+                &due(&result, 1).outcome,
+                expected(jam),
+                "{target:?}: past its held pages"
+            );
+        }
+    }
+}
+
 /// A workflow's machine counts toward the machines a step may hold, though
 /// it is on no call stack: its chain of nested calls fails one call shorter
 /// than a handler's, on the depth rule, never on the host's machines.

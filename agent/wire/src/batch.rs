@@ -249,13 +249,15 @@ impl From<Outcome> for Answer {
 pub enum Admin {
     /// Install a package as an instance: the programs the node derived
     /// from its ELF, which it stored as blobs before proposing the install,
-    /// and the agent's role byte for each role name the schema uses. The
+    /// the agent's role byte for each role name the schema uses, and the
+    /// target whose limits it is checked against and runs within. The
     /// install's outcome is the derivation, encoded.
     #[codec(index = 0)]
     Install {
         instance: InstanceId,
         derivation: Derivation,
         roles: Vec<(Vec<u8>, u8)>,
+        target: crate::abi::cap::Target,
     },
     /// Grant a principal a role in this agent, or (`None`) revoke it, as
     /// the operator posted it. A role is a byte; a package's schema names

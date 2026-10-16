@@ -97,6 +97,7 @@ fn captured_inputs_decode_and_reencode() {
 /// ELF.
 #[test]
 fn installs_keep_their_bytes() {
+    use vos_wire::abi::cap::Target;
     use vos_wire::ingress::Install;
     use vos_wire::records::Installed;
     use vos_wire::schema::Schema;
@@ -125,16 +126,18 @@ fn installs_keep_their_bytes() {
         instance: InstanceId(5),
         derivation: derivation.clone(),
         roles: vec![(b"m".to_vec(), 7)],
+        target: Target::Jam,
     };
-    let fields = [&5u32.to_le_bytes()[..], &derived, &roles].concat();
+    let fields = [&5u32.to_le_bytes()[..], &derived, &roles, &[1]].concat();
     assert_eq!(admin.encode(), [&[0][..], &fields].concat());
 
     let installed = Installed {
         derivation,
         roles: vec![(b"m".to_vec(), 7)],
         schema: Schema { methods: vec![] },
+        target: Target::Jam,
     };
-    let record = [&derived[..], &roles, &0u32.to_le_bytes()].concat();
+    let record = [&derived[..], &roles, &0u32.to_le_bytes(), &[1]].concat();
     assert_eq!(installed.encode(), record);
     assert_eq!(
         installed.programs().collect::<Vec<_>>(),
@@ -533,6 +536,7 @@ fn workflows_keep_their_bytes() {
             pages: vec![(12, [13; 32])],
             pending: Some(11),
         }),
+        target: vos_wire::abi::cap::Target::Jam,
     };
     let bytes = [
         &[Workflow::FORMAT][..],
@@ -557,6 +561,7 @@ fn workflows_keep_their_bytes() {
         &[13; 32],
         &[1],
         &11u64.to_le_bytes(),
+        &[1],
     ]
     .concat();
     assert_eq!(record.encode(), bytes);
@@ -571,7 +576,10 @@ fn workflows_keep_their_bytes() {
         (head.format, head.awaits, head.due),
         (Workflow::FORMAT, 6, 7)
     );
-    assert_eq!(&bytes[used..], &record.snapshot.encode()[..]);
+    assert_eq!(
+        &bytes[used..],
+        &[record.snapshot.encode(), record.target.encode()].concat()[..]
+    );
     let ended = WorkflowState::Ended(Outcome::Started(WorkflowId(1)));
     round_trip(&ended);
     assert_eq!(

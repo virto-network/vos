@@ -285,6 +285,7 @@ mod tests {
     use crate::store::{Fjall, PersistMode};
     use vos_pvm::accumulate_host::SELF_SERVICE;
     use vos_pvm_program::{CodeBlob, StandardProgram, build_standard_program};
+    use vos_wire::abi::cap::Target;
     use vos_wire::batch::{Admin, Batch, Input, Query};
     use vos_wire::ids::{InstanceId, MethodId, Principal, ProgramHash};
 
@@ -365,6 +366,7 @@ mod tests {
                     transpiler: 0,
                 },
                 roles: Vec::new(),
+                target: Target::Vos,
             })],
         });
         let programs = |agent, work| AgentPrograms::new(&blobs, AgentId(agent), work);

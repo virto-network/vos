@@ -23,6 +23,7 @@ use vos_jam::live::{Live, PolkaJam};
 use vos_jam::programs::Installable;
 use vos_jam::{Builder, Chain, Emulated, Error, Runner, Store, Taken};
 use vos_pvm::refine::PreparedProgram;
+use vos_wire::abi::cap::Target;
 use vos_wire::batch::{Admin, Input};
 use vos_wire::ids::{InstanceId, MethodId, ProgramHash};
 use vos_wire::package::slot_of;
@@ -81,7 +82,8 @@ pub fn run(args: TestnetArgs) -> Result<(), String> {
 }
 
 /// The test actors the agent runs, each derived once from its ELF, as a VOS
-/// node derives it: the counter and the shop, its workflows in its program.
+/// node derives it: the counter and the shop, its workflows in its program,
+/// built with the default heap, which a JAM service's limits admit.
 struct Actors {
     counter: Installable,
     shop: Installable,
@@ -96,7 +98,7 @@ impl Actors {
         };
         Ok(Self {
             counter: actor("counter")?,
-            shop: actor("shop")?,
+            shop: actor("lean")?,
         })
     }
 
@@ -110,13 +112,14 @@ impl Actors {
     }
 
     /// The counter's install, and the shop's, each naming the programs
-    /// derived from its ELF.
+    /// derived from its ELF, for a JAM service.
     fn installs(&self) -> Vec<Input> {
         let install = |instance, package: &Installable| {
             Input::Admin(Admin::Install {
                 instance,
                 derivation: package.derivation.clone(),
                 roles: vec![],
+                target: Target::Jam,
             })
         };
         vec![install(COUNTER, &self.counter), install(SHOP, &self.shop)]

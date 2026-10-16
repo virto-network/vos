@@ -2,6 +2,7 @@
 //! actor's ELF, and run apart from its arguments.
 
 use super::*;
+use vos_wire::abi::cap::Target;
 
 #[test]
 fn an_attestable_may_not_write_its_arguments() {
@@ -27,6 +28,7 @@ fn an_attestable_may_not_write_its_arguments() {
         instance,
         mut derivation,
         roles,
+        target,
     }) = actors.install_ledger(&mut node)
     else {
         unreachable!("an install")
@@ -38,6 +40,7 @@ fn an_attestable_may_not_write_its_arguments() {
             instance,
             derivation,
             roles,
+            target,
         })],
     );
     let checksum = method(&actors.ledger, "checksum");
@@ -69,6 +72,7 @@ fn an_install_binds_each_kernel_to_an_attestable_method() {
         instance,
         derivation,
         roles,
+        target,
     }) = actors.install_ledger(&mut node)
     else {
         unreachable!("an install")
@@ -81,6 +85,7 @@ fn an_install_binds_each_kernel_to_an_attestable_method() {
                 ..derivation.clone()
             },
             roles: roles.clone(),
+            target,
         })
     };
     let checksum = derivation.kernels[0];
@@ -111,32 +116,39 @@ fn an_install_binds_each_kernel_to_an_attestable_method() {
 }
 
 /// Kernels derived from an actor's ELF run in the agent as in the model,
-/// on every host: a precompile and its fallback's constants, a switch table
-/// and calls through a vtable, each its own kernel.
+/// on every host and for every target: a precompile and its fallback's
+/// constants, a switch table and calls through a vtable, each its own
+/// kernel, within its method's gas limit for JAM.
 #[test]
 fn derived_kernels_run_in_the_agent() {
     use vos_testkit::programs::{derivation, derived, package};
     let derived = derived("kernels");
     let instance = InstanceId(9);
-    let install = Input::Admin(Admin::Install {
-        instance,
-        derivation: derivation(&package("kernels"), &derived),
-        roles: vec![],
-    });
     let kernels: Vec<(MethodId, &[u8])> = derived
         .kernels
         .iter()
         .map(|(method, kernel)| (MethodId(*method), kernel.as_slice()))
         .collect();
     let check = method(&derived.actor, "check");
-    for mut node in [Node::new(), Node::jam(true)] {
+    let hosts = || [Node::new(), Node::jam(true)];
+    for (target, mut node) in hosts()
+        .map(|node| (Target::Vos, node))
+        .into_iter()
+        .chain(hosts().map(|node| (Target::Jam, node)))
+    {
+        let install = Input::Admin(Admin::Install {
+            instance,
+            derivation: derivation(&package("kernels"), &derived),
+            roles: vec![],
+            target,
+        });
         node.add(&derived.actor);
         for (_, kernel) in &kernels {
             node.add(kernel);
         }
-        ran_done(&node.batch(0, vec![install.clone()]).steps[0]);
+        ran_done(&node.batch(0, vec![install]).steps[0]);
         let mut kit = Testkit::new(AGENT);
-        kit.install(instance, &derived.actor, &kernels, &[])
+        kit.install_for(target, instance, &derived.actor, &kernels, &[])
             .unwrap();
         let mut sessions = Sessions::new();
         let values = vec![1u64, 2, 3, 40];

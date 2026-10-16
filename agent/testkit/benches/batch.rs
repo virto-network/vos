@@ -27,6 +27,7 @@ use vos_pvm::{ExitReason, PvmBackend};
 use vos_testkit::node::serve;
 use vos_testkit::programs::{actor, agent, method};
 use vos_wire::abi::cap;
+use vos_wire::abi::cap::Target;
 use vos_wire::batch::{Admin, Batch, Input, Request, Work};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, Session, WorkflowId};
 use vos_wire::jam::{AccumulateInput, Operand, RefineArgs};
@@ -87,6 +88,7 @@ impl Node {
             instance,
             derivation: vos_testkit::programs::bare(program),
             roles: vec![],
+            target: Target::Vos,
         })
     }
 

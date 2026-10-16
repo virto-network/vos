@@ -44,6 +44,7 @@ impl Driven {
                 instance: SHOP,
                 derivation: vos_testkit::programs::bare(hash(&self.shop)),
                 roles: vec![],
+                target: Target::Vos,
             }),
         ]
     }
@@ -488,6 +489,7 @@ fn a_workflow_resumes_on_its_program_through_an_upgrade_on_jam() {
         instance: SHOP,
         derivation: vos_testkit::programs::bare(lean),
         roles: vec![],
+        target: Target::Vos,
     })]);
     let record = |driven: &Driven, id: u64| {
         let row = driven

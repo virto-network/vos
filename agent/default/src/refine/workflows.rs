@@ -188,13 +188,6 @@ fn move_due(rows: &mut Overlay, id: WorkflowId, workflow: &mut Workflow, at: u64
     }
 }
 
-/// The pages a program may write: its read-write data and heap, and its
-/// stack.
-fn writable(header: &vos_pvm_program::StandardHeader) -> Option<u64> {
-    let [_, rw, stack] = header.regions()?;
-    Some((rw.size + stack.size) / vos_wire::result::PAGE as u64)
-}
-
 /// A request's or a call's start of a workflow, `call`'s method by its
 /// caller, its owner: the workflow recorded, due at once, its program
 /// pinned, and the step answered `Started` with its id; or failed, as a
@@ -233,8 +226,8 @@ fn started(base: &Base, call: Call) -> Result<(WorkflowId, Overlay), Failure> {
     }
     let program = installed.program();
     let header = machines::pinned_header(&program.0).ok_or(Failure::Unloadable)?;
-    let writable = writable(&header).ok_or(Failure::Unloadable)?;
-    if writable > cap::WORKFLOW_PAGES as u64 {
+    let writable = machines::writable_pages(&header).ok_or(Failure::Unloadable)?;
+    if writable > installed.target.limits().workflow_pages as u64 {
         return Err(Failure::Cap);
     }
     let live = count(base, &keys::live_workflows());
@@ -256,6 +249,7 @@ fn started(base: &Base, call: Call) -> Result<(WorkflowId, Overlay), Failure> {
         waiter: None,
         state: WorkflowState::Ready(arguments.to_vec()),
         snapshot: None,
+        target: installed.target,
     };
     let mut rows = Overlay::new();
     set_count(&mut rows, keys::next_workflow(), id.0 + 1);
@@ -483,7 +477,8 @@ fn run(
     match ended {
         Ok(Ended::Paused(pause)) => {
             let held = snapshot.map_or(&[][..], |snapshot| &snapshot.pages);
-            match capture(base, &machine, &workflow.program, &header, id, held) {
+            let limits = workflow.target.limits();
+            match capture(base, &machine, limits, &workflow.program, &header, id, held) {
                 Ok(captured) => {
                     let registers = machine.registers();
                     let counter = machine.expunge() as u32;
@@ -538,6 +533,7 @@ fn step(
     mut share: Share,
 ) -> Stepped {
     let mut invocation = Invocation::new(base, index, Kind::Workflow);
+    invocation.limits = workflow.target.limits();
     invocation.awaits = Some(Await {
         workflow: id,
         counter: workflow.awaits,

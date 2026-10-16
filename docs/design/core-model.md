@@ -252,7 +252,9 @@ impl Ledger {
   program and kernel hashes, the schema, the transpiler's version and the
   ELF's hash. Derived hashes are per transpiler version, so two spaces
   agree on a kernel's hash only when they derive with the same version.
-  An installed program is never transpiled again.
+  It also names its target, VOS or JAM, whose limits its statics were
+  checked against and its steps run within (section 12). An installed
+  program is never transpiled again.
 - Installing creates an actor instance with an id, the package hash and a
   state namespace.
 - Upgrade drain rule: new invocations use the new program immediately.
@@ -1087,12 +1089,27 @@ These form a prover track that runs alongside the core slices (section 16).
 - **A workflow holds at most 576 pages (2.25 MiB)** (`cap::HELD_PAGES`):
   the builder asserts at compile time that the step ending such a
   workflow fits a package (about 913M of 950M usable).
-- **A step's own effects** (writes, messages, attests at the agent's
-  caps) can cost up to about 1.15e9 of a package's own work on JAM. A
-  lone step whose effects pass what its keep leaves fails `Cap` on JAM
-  only, and one past the usable gas leaves no package to make. Closing
-  that needs per-step effect caps about 31 times lower for agents on JAM
-  (open).
+- **Limits per target** [decided by the owner]. An install names its
+  target, VOS or JAM, and the agent holds the instance to that target's
+  limits (`cap::Limits`) on every host, so a builder's simulation, the
+  JAM refine and a VOS node replaying the batch agree:
+  - **a step's effects:** a step's writes, messages and attests at VOS's
+    caps cost up to about 1.4e9 of a package's own work on JAM, past its
+    refine gas. JAM's limits take that about 35-fold lower (16 KiB of
+    writes in at most 128 rows, 8 messages and 8 attests of 2 KiB each),
+    and the builder asserts that the worst step of an instance installed
+    for JAM, holding every page, fits a package. An instance installed
+    for VOS keeps VOS's caps, where a lone step past its keep fails `Cap`
+    on JAM only;
+  - **a workflow's memory:** 256 pages its program may write, 64 held,
+    256 KiB written a step;
+  - **checked at install** (`Cap` past them): the pages the program may
+    write, its bytes (512 KiB), its kernels (32), and each attestable
+    method's gas limit, which bounds its kernel's BLAKE2b compressions,
+    each served in software on JAM, to 4,096; a kernel runs within that
+    limit.
+  - **One page price everywhere:** the limits cap a step and never price
+    it; VOS pays JAM's page prices.
 - **The first end-to-end run held on a PolkaJam testnet** (slice 4,
   `just jam-testnet`):
   - the default agent and two actors ran as a service;
