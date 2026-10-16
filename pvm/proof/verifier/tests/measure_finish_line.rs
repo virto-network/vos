@@ -126,10 +126,7 @@ fn measure() {
     let bytes = bincode::serialize(&proof).expect("bincode serialize").len();
     // The grinds return the least nonce that passes, so a nonce is the
     // number of candidates each tried.
-    let pow_nonce = match &proof.stark_proof {
-        vos_pvm_proof::StarkProofAny::Blake2s(stark) => stark.proof_of_work,
-        vos_pvm_proof::StarkProofAny::Poseidon2M31(stark) => stark.proof_of_work,
-    };
+    let pow_nonce = proof.stark_proof.proof_of_work();
 
     let commitment = program_commitment_of_proof(&proof);
     let mut verify_ms = f64::INFINITY;

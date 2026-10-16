@@ -185,9 +185,10 @@ A proof verified against `hash = H(P)` for program `P` proves that:
 ## Proof shape (`pcs_config`)
 
 The registry's formats (`src/format.rs`) fix their parameters: format 26,
-the Poseidon2-M31 segment format, proves at blowup 4, 39 queries, 26 PoW
-bits and 24 interaction PoW bits, and is refused below 100 conjectured or
-60 proven bits. What follows is format 24's, the legacy Blake2s format,
+the Poseidon2-M31 segment format, proves at blowup 4, 44 queries, 20 PoW
+bits and 8 interaction PoW bits, and is refused below 100 conjectured or
+60 proven bits. A `PcsPolicy` passed to a `*_with_pcs_policy` path pins
+every format's shape, 26's included. What follows is format 24's, the legacy Blake2s format,
 whose proofs carry their own parameters.
 
 `production_pcs_config()` (used by the no-arg `prove`) sets:

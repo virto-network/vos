@@ -2,7 +2,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 
-use stwo::prover::ProvingError;
+use crate::prove::ProvingError;
 use vos_pvm::args;
 use vos_pvm::inner::InnerMachineIdentity;
 use vos_pvm::instruction::Opcode;
@@ -824,14 +824,14 @@ pub fn prove_refine(trace: RefineTraceBundle) -> Result<RefineProofBundle, Refin
         if proof.log_sizes.len() > MAX_REFINE_CHILD_COMPONENTS
             || proof.claimed_sums.len() > MAX_REFINE_CHILD_COMPONENTS
             || proof.num_components > MAX_REFINE_CHILD_COMPONENTS
-            || proof.stark_proof.commitments().len() != REFINE_CHILD_COMMITMENT_COUNT
+            || proof.stark_proof.commitment_count() != REFINE_CHILD_COMMITMENT_COUNT
         {
             return Err(RefineTraceError::Observation(format!(
                 "Refine child proof cardinality is noncanonical: logs={}, sums={}, components={}, commitments={}",
                 proof.log_sizes.len(),
                 proof.claimed_sums.len(),
                 proof.num_components,
-                proof.stark_proof.commitments().len(),
+                proof.stark_proof.commitment_count(),
             )));
         }
         let proof_bytes = crate::proof::proof_owned_bytes(&proof).ok_or_else(|| {
@@ -935,22 +935,20 @@ pub fn verify_refine_bundle_replayed(
     }
     for (mut observed, proven) in trace.slices.into_iter().zip(&bundle.slices) {
         let mut child = proven.proof.clone();
-        crate::proof::preflight_proof_structure(&mut child, crate::DEFAULT_MAX_LOG_SIZE)
-            .map_err(|_| RefineTraceError::ReplayMismatch("child proof structure"))?;
-        let format = crate::proof::proof_format(&child)
-            .map_err(|_| RefineTraceError::ReplayMismatch("child proof format"))?;
+        let format =
+            crate::proof::preflight_proof_structure(&mut child, crate::DEFAULT_MAX_LOG_SIZE)
+                .map_err(|_| RefineTraceError::ReplayMismatch("child proof structure"))?;
         let target = crate::prove::Target {
             format,
             config: child.pcs_config,
         };
         let binding = crate::prove::replay_trace_binding(&mut observed.side_note, target)
             .map_err(RefineTraceError::Prove)?;
-        let commitments = child.stark_proof.commitments();
         if child.component_mask != binding.component_mask
             || child.num_components != binding.log_sizes.len()
             || child.log_sizes != binding.log_sizes
-            || commitments.first().copied() != Some(binding.preprocessed_commitment)
-            || commitments.get(1).copied() != Some(binding.main_commitment)
+            || child.stark_proof.commitment(0) != Some(binding.preprocessed_commitment)
+            || child.stark_proof.commitment(1) != Some(binding.main_commitment)
             || child.initial_state != binding.initial_state
             || child.final_state != binding.final_state
         {

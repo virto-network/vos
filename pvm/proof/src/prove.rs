@@ -8,7 +8,7 @@ use stwo::{
         poly::circle::CanonicCoset,
     },
     prover::{
-        CommitmentSchemeProver, ComponentProver, ProvingError,
+        CommitmentSchemeProver, ComponentProver,
         backend::simd::SimdBackend,
         poly::{
             BitReversedOrder,
@@ -34,78 +34,57 @@ use crate::{lookups::AllLookupElements, side_note::SideNote};
 
 pub use crate::proof::{Proof, SegmentState};
 
-/// Timing breakdown of the proving pipeline.
-#[derive(Clone, Debug)]
-pub struct ProveProfile {
-    pub trace_gen: std::time::Duration,
-    pub preprocess_commit: std::time::Duration,
-    pub main_commit: std::time::Duration,
-    pub interaction_gen: std::time::Duration,
-    pub interaction_commit: std::time::Duration,
-    pub stark_prove: std::time::Duration,
-    pub log_sizes: Vec<u32>,
-    pub total_main_columns: usize,
-    pub total_interaction_columns: usize,
+mod canonical;
+#[cfg(feature = "debug-internals")]
+mod debug;
+mod profile;
+
+pub use canonical::{
+    NaturalFloors, canonical_profile_for, canonical_profile_for_bounds,
+    canonical_profile_for_bounds_compact, natural_log_sizes_for, program_commitment_for_profile,
+    program_commitment_for_profile_format, prove_canonical, prove_canonical_format, prove_chain,
+    prove_chain_format,
+};
+#[cfg(feature = "debug-internals")]
+pub use debug::{
+    debug_assert_constraints_explicit, debug_assert_constraints_streaming, debug_claimed_sums,
+    debug_claimed_sums_streaming,
+};
+pub use profile::ProveProfile;
+
+/// Why a proof was not produced.
+#[derive(Debug)]
+pub enum ProvingError {
+    /// Stwo's refusal, or a trace whose constraints cannot hold.
+    Stwo(stwo::prover::ProvingError),
+    /// The registry does not admit the format, or no stack implements its
+    /// channel: the prover produces only what a verifier accepts.
+    FormatNotAdmitted(u32),
 }
 
-impl std::fmt::Display for ProveProfile {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let total = self.trace_gen
-            + self.preprocess_commit
-            + self.main_commit
-            + self.interaction_gen
-            + self.interaction_commit
-            + self.stark_prove;
-        writeln!(
-            f,
-            "  trace_gen:          {:>10.2?}  ({:.0}%)",
-            self.trace_gen,
-            pct(self.trace_gen, total)
-        )?;
-        writeln!(
-            f,
-            "  preprocess_commit:  {:>10.2?}  ({:.0}%)",
-            self.preprocess_commit,
-            pct(self.preprocess_commit, total)
-        )?;
-        writeln!(
-            f,
-            "  main_commit:        {:>10.2?}  ({:.0}%)",
-            self.main_commit,
-            pct(self.main_commit, total)
-        )?;
-        writeln!(
-            f,
-            "  interaction_gen:    {:>10.2?}  ({:.0}%)",
-            self.interaction_gen,
-            pct(self.interaction_gen, total)
-        )?;
-        writeln!(
-            f,
-            "  interaction_commit: {:>10.2?}  ({:.0}%)",
-            self.interaction_commit,
-            pct(self.interaction_commit, total)
-        )?;
-        writeln!(
-            f,
-            "  stark_prove (FRI):  {:>10.2?}  ({:.0}%)",
-            self.stark_prove,
-            pct(self.stark_prove, total)
-        )?;
-        writeln!(f, "  total:              {total:>10.2?}")?;
-        writeln!(f, "  log_sizes: {:?}", self.log_sizes)?;
-        writeln!(
-            f,
-            "  main_cols: {}, interaction_cols: {}",
-            self.total_main_columns, self.total_interaction_columns
-        )?;
-        Ok(())
+impl ProvingError {
+    /// A trace whose constraints cannot hold.
+    const NOT_SATISFIED: Self = Self::Stwo(stwo::prover::ProvingError::ConstraintsNotSatisfied);
+}
+
+impl From<stwo::prover::ProvingError> for ProvingError {
+    fn from(error: stwo::prover::ProvingError) -> Self {
+        Self::Stwo(error)
     }
 }
 
-fn pct(part: std::time::Duration, total: std::time::Duration) -> f64 {
-    100.0 * part.as_secs_f64() / total.as_secs_f64()
+impl core::fmt::Display for ProvingError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Stwo(error) => error.fmt(formatter),
+            Self::FormatNotAdmitted(number) => {
+                write!(formatter, "the prover does not produce format {number}")
+            }
+        }
+    }
 }
+
+impl std::error::Error for ProvingError {}
 
 /// 96-bit security: blowup=16, 19 FRI queries, 20-bit PoW.
 ///
@@ -195,23 +174,16 @@ impl Target {
         }
     }
 
-    /// An admitted format, at its parameters.
-    ///
-    /// # Panics
-    ///
-    /// On a format the registry does not admit: the prover is told only
+    /// An admitted format, at its parameters; the prover is told only
     /// formats a verifier accepts.
-    pub fn of(format: &'static Format) -> Self {
-        assert!(
-            format.status == Status::Admitted,
-            "the prover produces admitted formats only; format {} is {:?}",
-            format.number,
-            format.status
-        );
-        Self {
+    pub fn of(format: &'static Format) -> Result<Self, ProvingError> {
+        if format.status != Status::Admitted {
+            return Err(ProvingError::FormatNotAdmitted(format.number));
+        }
+        Ok(Self {
             format,
             config: format.pcs_config(),
-        }
+        })
     }
 }
 
@@ -221,17 +193,15 @@ pub fn prove(side_note: &mut SideNote) -> Result<Proof, ProvingError> {
     Ok(proof)
 }
 
-/// Prove under `format`, at its parameters, over the trace's natural shape.
-///
-/// # Panics
-///
-/// On a format the registry does not admit.
+/// Prove under `format`, at its parameters, over the trace's natural shape;
+/// [`ProvingError::FormatNotAdmitted`] on a format the registry does not
+/// admit.
 pub fn prove_format(
     side_note: &mut SideNote,
     format: &'static Format,
 ) -> Result<Proof, ProvingError> {
     install_thread_pool();
-    let (proof, _) = prove_impl(side_note, Target::of(format), false)?;
+    let (proof, _) = prove_impl(side_note, Target::of(format)?, false)?;
     Ok(proof)
 }
 
@@ -280,238 +250,6 @@ pub fn prove_profiled_with_config(
     prove_impl(side_note, Target::legacy(config), true)
 }
 
-/// Debug: print per-component claimed sums (logup) and check if they balance.
-///
-/// Gated behind the `debug-internals` feature — production builds
-/// don't expose this.  Useful when adding a new constraint and the
-/// regression sweep fails: per-component sums help distinguish
-/// "ConstraintsNotSatisfied" (some chip writes a wrong column value)
-/// from "claimed logup sum is not zero" (lookup imbalance — usually
-/// a missing emission or wrong multiplicity).
-///
-/// Returns `true` iff the total logup sum is zero (the trace would pass the
-/// verifier's "claimed logup sum is not zero" check). Callers that only want
-/// the printout can ignore the result.
-#[cfg(feature = "debug-internals")]
-pub fn debug_claimed_sums(side_note: &mut SideNote) -> bool {
-    use num_traits::Zero;
-    let components = crate::BASE_COMPONENTS;
-    // Aligned 1:1 with `BASE_COMPONENTS` (lib.rs). The previous list stopped
-    // at 14 names AND skipped `RegMemClosing`, so every label from index 6 on
-    // was wrong — fixed here so the per-component breakdown is trustworthy.
-    let component_names = [
-        "CpuChip",
-        "Blake2b",
-        "Blake2bBoundary",
-        "MemoryChip",
-        "MemoryPage",
-        "MemoryMerkle",
-        "MemoryRootBoundary",
-        "RegMemory",
-        "RegMemBoundary",
-        "RegMemClosing",
-        "ProgBoundary",
-        "ProgMemory",
-        "JumpTable",
-        "Range256",
-        "BitwiseLookup",
-        "PowerOfTwo",
-        "Popcount",
-        "Bitcount",
-        "ByteToBits",
-        "Mul",
-        "Bitwise",
-        "Compare",
-        "DivRem",
-        "Ristretto",
-        "RistrettoEcall",
-        "RistCombTable",
-        "RistFixedBaseConsumer",
-        "RistCombAnchor",
-        "RistCombScalarBoundary",
-        "RistCombCompress",
-        "RistCombCompressOutput",
-    ];
-
-    let traces: Vec<ComponentTrace> = components
-        .iter()
-        .map(|c| c.generate_component_trace(side_note))
-        .collect();
-
-    let mut lookup_elements = AllLookupElements::default();
-    let channel = &mut stwo::core::channel::Blake2sChannel::default();
-    for c in components {
-        c.draw_lookup_elements(&mut lookup_elements, channel.as_ref_channel());
-    }
-
-    let mut total = SecureField::zero();
-    for (i, (c, trace)) in components.iter().zip(traces).enumerate() {
-        let (_, claimed_sum) = c.generate_interaction_trace(trace, side_note, &lookup_elements);
-        let name = component_names.get(i).unwrap_or(&"?");
-        eprintln!("  {name:>15}: {claimed_sum:?}");
-        total += claimed_sum;
-    }
-    eprintln!("  {:>15}: {total:?}", "total");
-    let balances = total.is_zero();
-    if balances {
-        eprintln!("  Logup sums BALANCE (zero)");
-    } else {
-        eprintln!("  Logup sums DO NOT BALANCE");
-    }
-    balances
-}
-
-/// Debug: pinpoint the failing constraint when prove fails with
-/// `ConstraintsNotSatisfied`.  Generates the same main + interaction trace
-/// that `prove_with_explicit_components` would, then runs Stwo's
-/// `AssertEvaluator` row-by-row and panics with `row #X, constraint #Y`
-/// at the first mismatch.
-#[cfg(feature = "debug-internals")]
-pub fn debug_assert_constraints_explicit(
-    side_note: &mut SideNote,
-    components: &[&dyn crate::framework::MachineProverComponent],
-) {
-    let traces: Vec<ComponentTrace> = components
-        .iter()
-        .map(|c| c.generate_component_trace(side_note))
-        .collect();
-
-    let mut lookup_elements = AllLookupElements::default();
-    let channel = &mut stwo::core::channel::Blake2sChannel::default();
-    for c in components {
-        c.draw_lookup_elements(&mut lookup_elements, channel.as_ref_channel());
-    }
-
-    for (i, (c, trace)) in components.iter().zip(traces.iter()).enumerate() {
-        let (interaction_trace, claimed_sum) =
-            c.generate_interaction_trace(trace.clone(), side_note, &lookup_elements);
-        eprintln!("  [{i}] asserting constraints (claimed_sum={claimed_sum:?})…");
-        c.debug_assert_constraints(trace, &interaction_trace, &lookup_elements, claimed_sum);
-        eprintln!("  [{i}] all constraints OK");
-    }
-}
-
-/// Memory-frugal variant of [`debug_assert_constraints_explicit`] for traces
-/// too large to materialise every component trace at once (the explicit
-/// version's `traces: Vec<ComponentTrace>` holds them all and OOMs on
-/// multi-million-step actor traces).
-///
-/// Builds + asserts **one component at a time**, dropping each trace before
-/// the next, so peak memory is the single largest chip's trace rather than
-/// the sum across all chips. Mirrors `prove_impl_with_components`'s
-/// producer/consumer split: the `is_producer()` chips run first
-/// (sequentially — they mutate `side_note`'s lookup-multiplicity counts),
-/// then the consumer chips read the now-complete counts via the immutable
-/// trace-gen path. Per-chip `debug_assert_constraints` is self-contained (it
-/// checks each chip's own constraints + logup against that chip's own
-/// `claimed_sum`), so the cross-chip lookup balance isn't needed here — only
-/// the per-chip constraint satisfaction, which is exactly what catches a
-/// `ConstraintsNotSatisfied`.
-#[cfg(feature = "debug-internals")]
-pub fn debug_assert_constraints_streaming(
-    side_note: &mut SideNote,
-    components: &[&dyn crate::framework::MachineProverComponent],
-) {
-    let mut lookup_elements = AllLookupElements::default();
-    let channel = &mut stwo::core::channel::Blake2sChannel::default();
-    for c in components {
-        c.draw_lookup_elements(&mut lookup_elements, channel.as_ref_channel());
-    }
-
-    // Pass 1 — PRODUCERS (sequential, mutate counts → must complete before
-    // any consumer trace is built).
-    for (i, c) in components.iter().enumerate() {
-        if !c.is_producer() {
-            continue;
-        }
-        let trace = c.generate_component_trace(side_note);
-        let (interaction_trace, claimed_sum) =
-            c.generate_interaction_trace(trace.clone(), side_note, &lookup_elements);
-        eprintln!("  [{i}] producer: asserting (claimed_sum={claimed_sum:?})…");
-        c.debug_assert_constraints(&trace, &interaction_trace, &lookup_elements, claimed_sum);
-        eprintln!("  [{i}] producer: OK");
-    }
-
-    // Pass 2 — CONSUMERS (read complete counts; no mutation).
-    for (i, c) in components.iter().enumerate() {
-        if c.is_producer() {
-            continue;
-        }
-        let trace = c.generate_component_trace_immut(side_note);
-        let (interaction_trace, claimed_sum) =
-            c.generate_interaction_trace(trace.clone(), side_note, &lookup_elements);
-        eprintln!("  [{i}] consumer: asserting (claimed_sum={claimed_sum:?})…");
-        c.debug_assert_constraints(&trace, &interaction_trace, &lookup_elements, claimed_sum);
-        eprintln!("  [{i}] consumer: OK");
-    }
-}
-
-/// Memory-frugal variant of [`debug_claimed_sums`]: accumulate the GLOBAL
-/// logup claimed-sum one component at a time (dropping each trace before the
-/// next), so a multi-million-step trace whose component traces can't all be
-/// materialised at once still gets a balance verdict. Mirrors
-/// [`debug_assert_constraints_streaming`]'s producer-then-consumer ordering
-/// (producers mutate the lookup-multiplicity counts the consumers read).
-///
-/// Returns `true` iff the total is zero — i.e. the trace would pass the
-/// verifier's "claimed logup sum is not zero" check. Lets us answer "does the
-/// FULL trace balance?" (→ a segment imbalance is a boundary artifact) vs.
-/// "does it not?" (→ a real per-chip bug in some region) without OOM.
-#[cfg(feature = "debug-internals")]
-pub fn debug_claimed_sums_streaming(
-    side_note: &mut SideNote,
-    components: &[&dyn crate::framework::MachineProverComponent],
-) -> bool {
-    use num_traits::Zero;
-    let mut lookup_elements = AllLookupElements::default();
-    let channel = &mut stwo::core::channel::Blake2sChannel::default();
-    for c in components {
-        c.draw_lookup_elements(&mut lookup_elements, channel.as_ref_channel());
-    }
-
-    let mut total = SecureField::zero();
-    // Pass 1 — PRODUCERS (sequential, mutate counts → must complete before
-    // any consumer trace is built).
-    for (i, c) in components.iter().enumerate() {
-        if !c.is_producer() {
-            continue;
-        }
-        let trace = c.generate_component_trace(side_note);
-        let (_it, claimed_sum) = c.generate_interaction_trace(trace, side_note, &lookup_elements);
-        eprintln!("  [{i}] producer: claimed_sum={claimed_sum:?}");
-        total += claimed_sum;
-    }
-    // Pass 2 — CONSUMERS (read complete counts; no mutation).
-    for (i, c) in components.iter().enumerate() {
-        if c.is_producer() {
-            continue;
-        }
-        let trace = c.generate_component_trace_immut(side_note);
-        let (_it, claimed_sum) = c.generate_interaction_trace(trace, side_note, &lookup_elements);
-        eprintln!("  [{i}] consumer: claimed_sum={claimed_sum:?}");
-        total += claimed_sum;
-    }
-    eprintln!("  total: {total:?}");
-    let balances = total.is_zero();
-    eprintln!(
-        "  full-trace logup {}",
-        if balances {
-            "BALANCES (zero)"
-        } else {
-            "DOES NOT BALANCE"
-        }
-    );
-    balances
-}
-
-/// Compute blake3 hash of final memory state by applying all writes to
-/// initial memory.
-///
-/// Cost: O(initial_memory.len() + Σ writes).  Allocates a full clone
-/// of `initial_memory`, so for actor binaries with multi-MB memory
-/// regions this dominates `prove`'s memory footprint.  Future work
-/// could swap this for an in-place Merkle commitment over the byte-
-/// level memory ledger (which we already build for the MemoryChip).
 /// The entering / exit RAM page-Merkle roots for this segment, from
 /// the ingested page payload.  Falls back to the all-zero root only on the
 /// never-proved empty path (no payload).
@@ -522,6 +260,9 @@ fn segment_memory_roots(side_note: &SideNote) -> ([u8; 32], [u8; 32]) {
     }
 }
 
+/// The blake3 hash of the final memory state: every write applied to the
+/// initial memory. O(initial_memory.len() + Σ writes), with a full clone of
+/// a dense `initial_memory`.
 fn compute_final_memory_commitment(side_note: &SideNote) -> [u8; 32] {
     // Replay ALL of this (segment's) writes — regular stores AND precompile
     // output writes (blake2b / ristretto / scalar-*, which live in
@@ -640,15 +381,15 @@ fn validate_memory_witnesses(side_note: &SideNote) -> Result<(), ProvingError> {
             (true, false) if step.mem_write.is_none() => step.mem_read.as_ref(),
             (false, true) if step.mem_read.is_none() => step.mem_write.as_ref(),
             (false, false) if step.mem_read.is_none() && step.mem_write.is_none() => continue,
-            _ => return Err(ProvingError::ConstraintsNotSatisfied),
+            _ => return Err(ProvingError::NOT_SATISFIED),
         };
         let (Some(access), Some(expected_size)) = (access, expected_size) else {
-            return Err(ProvingError::ConstraintsNotSatisfied);
+            return Err(ProvingError::NOT_SATISFIED);
         };
         if access.size != expected_size
             || u64::from(access.address) + u64::from(access.size) > ADDRESS_SPACE_SIZE
         {
-            return Err(ProvingError::ConstraintsNotSatisfied);
+            return Err(ProvingError::NOT_SATISFIED);
         }
     }
     Ok(())
@@ -684,307 +425,6 @@ pub fn prove_with_explicit_components(
     let (proof, _) =
         prove_impl_with_components(side_note, Target::legacy(config), false, components, 0, &[])?;
     Ok(proof)
-}
-
-/// Canonical-shape proving (federation wire-through W0).
-///
-/// Proves with the FULL `BASE_COMPONENTS` set present (constant
-/// `component_mask`, all [`chip_idx::COUNT`](crate::chip_idx::COUNT) bits) and
-/// every forcing-set chip's main trace
-/// padded up to the per-chip floor in `min_log_sizes` (indexed by
-/// [`chip_idx`](crate::chip_idx)), so the preprocessed-trace commitment —
-/// the program identity — is identical for every segment of a program
-/// regardless of the witness.  That is what lets ONE published program
-/// commitment pin a whole *heterogeneous* segment chain via
-/// `verify_chain_standalone`: the per-segment active set is constant (full
-/// mask) and the preprocessed-bearing chips' `log_size`s are pinned.
-///
-/// Uses the MOBILE PCS config (the federation policy — verifiers must use
-/// `PcsPolicy::MOBILE`).  `min_log_sizes` shorter than the component count
-/// is zero-padded; a 0 floor means "natural size" (the fixed-table chips,
-/// already uniform, need no floor).  Forced sizes MUST stay `<=
-/// DEFAULT_MAX_LOG_SIZE` (24) or the verifier rejects.
-pub fn prove_canonical(
-    side_note: &mut SideNote,
-    min_log_sizes: &[u32],
-) -> Result<Proof, ProvingError> {
-    prove_canonical_format(side_note, min_log_sizes, &crate::format::LEGACY_SEGMENT)
-}
-
-/// [`prove_canonical`] under `format`, at its parameters (format 24's are
-/// MOBILE's).
-///
-/// # Panics
-///
-/// On a format the registry does not admit.
-pub fn prove_canonical_format(
-    side_note: &mut SideNote,
-    min_log_sizes: &[u32],
-    format: &'static Format,
-) -> Result<Proof, ProvingError> {
-    install_thread_pool();
-    prepare_side_note_for_verification(side_note);
-    let components = super::all_components();
-    // Full set present ⇒ constant mask = all component bits set.  Built via
-    // a widening shift so COUNT == 32 (all u32 bits) doesn't overflow.
-    let component_mask = ((1u64 << super::chip_idx::COUNT) - 1) as u32;
-    let (proof, _) = prove_impl_with_components_overridden(
-        side_note,
-        Target::of(format),
-        false,
-        components,
-        component_mask,
-        None,
-        min_log_sizes,
-        ProofTranscriptGeneration::Current,
-    )?;
-    Ok(proof)
-}
-
-/// Measure the public program commitment for an already-pinned canonical
-/// component profile without materializing main/interaction traces or a FRI
-/// proof.
-///
-/// The preprocessed tree is witness-independent by protocol: it contains the
-/// authenticated program tables, fixed lookup tables, and their exact
-/// per-component heights. Catalog maintenance can therefore re-pin an AIR
-/// change without allocating the (potentially multi-gigabyte) canonical main
-/// trace. `log_sizes` must be the complete component profile emitted by a
-/// canonical measurement; partial profiles are rejected.
-pub fn program_commitment_for_profile(
-    side_note: &SideNote,
-    log_sizes: &[u32],
-) -> Option<crate::program_id::ProgramCommitment> {
-    program_commitment_for_profile_format(side_note, log_sizes, &crate::format::LEGACY_SEGMENT)
-}
-
-/// [`program_commitment_for_profile`] under `format`.
-///
-/// # Panics
-///
-/// On a format the registry does not admit.
-pub fn program_commitment_for_profile_format(
-    side_note: &SideNote,
-    log_sizes: &[u32],
-    format: &'static Format,
-) -> Option<crate::program_id::ProgramCommitment> {
-    install_thread_pool();
-    let target = Target::of(format);
-    crate::with_stack!(format.channel, Stack => {
-        program_commitment_on::<Stack>(side_note, log_sizes, target)
-    }, unbuilt => None)
-}
-
-fn program_commitment_on<MC: PcsStack>(
-    side_note: &SideNote,
-    log_sizes: &[u32],
-    target: Target,
-) -> Option<crate::program_id::ProgramCommitment>
-where
-    SimdBackend: BackendForChannel<MC>,
-{
-    use crate::pcs::ProofHash;
-    let components = super::all_components();
-    if log_sizes.len() != components.len() || log_sizes.contains(&0) {
-        return None;
-    }
-
-    let config = target.config;
-    let max_constraint_log_degree_bound = components
-        .iter()
-        .zip(log_sizes)
-        .map(|(component, &log_size)| component.max_constraint_log_degree_bound(log_size))
-        .max()?;
-    let twiddles = SimdBackend::precompute_twiddles(
-        CanonicCoset::new(max_constraint_log_degree_bound + config.fri_config.log_blowup_factor)
-            .circle_domain()
-            .half_coset,
-    );
-    let channel = &mut MC::C::default();
-    crate::proof::mix_statement_header(channel, target.format.number, &config, log_sizes);
-    let mut scheme = CommitmentSchemeProver::<SimdBackend, MC>::new(config, &twiddles);
-    let mut tree_builder = scheme.tree_builder();
-    for (component, &log_size) in components.iter().zip(log_sizes) {
-        tree_builder.extend_evals(component.generate_preprocessed_trace(log_size, side_note));
-    }
-    tree_builder.commit(channel);
-    scheme.roots().first().map(|root| root.into_commitment())
-}
-
-/// Prove a segment chain in memory: derive the canonical forcing profile over
-/// `bounds` (so every window shares ONE program commitment) and prove each
-/// window to that shape. Returns `(profile, per-segment proofs in order)`.
-/// `None` if profile derivation or any segment prove fails. `bounds` must be
-/// ascending, gapless, and cover the trace (e.g. from `segment::segment_bounds`
-/// or `segment::segment_bounds_budgeted`). For streaming / CAS deployment use
-/// the `prover-extension` crate instead.
-pub fn prove_chain(full: &SideNote, bounds: &[(usize, usize)]) -> Option<(Vec<u32>, Vec<Proof>)> {
-    prove_chain_format(full, bounds, &crate::format::LEGACY_SEGMENT)
-}
-
-/// [`prove_chain`] under `format`.
-///
-/// # Panics
-///
-/// On a format the registry does not admit.
-pub fn prove_chain_format(
-    full: &SideNote,
-    bounds: &[(usize, usize)],
-    format: &'static Format,
-) -> Option<(Vec<u32>, Vec<Proof>)> {
-    // ONE profile over every window ⇒ one forced shape ⇒ one program
-    // commitment for the whole chain (what `verify_chain_standalone` pins).
-    let profile = canonical_profile_for_bounds(full, bounds)?;
-    let mut proofs = Vec::with_capacity(bounds.len());
-    // A second forward cursor is required for the proving pass. Re-slicing
-    // each window from the initial image would replay every prior sparse
-    // write again and retain/copy progressively larger page snapshots.
-    let mut cursor = crate::segment::SegmentCursor::new(full);
-    for &(a, b) in bounds {
-        let mut sn = cursor.side_note(a, b);
-        proofs.push(prove_canonical_format(&mut sn, &profile, format).ok()?);
-    }
-    Some((profile, proofs))
-}
-
-/// Canonical-shape profiling (federation wire-through W0): the NATURAL
-/// (unforced) main-trace `log_size` each of the given components would use for
-/// `side_note`. The per-segment max of these over a full trace is the
-/// `min_log_size` profile `prove_canonical` pads to (so every segment's forced
-/// chips share one `log_size`). Mirrors `prove`'s trace-gen prep (`prepare` +
-/// `ingest_memory_pages`, so page/merkle-bearing chips report their real size)
-/// but stops at `log_size` — no commit, no FRI. `indices` are positions in
-/// [`all_components`](crate::all_components) / [`chip_idx`](crate::chip_idx).
-pub fn natural_log_sizes_for(side_note: &mut SideNote, indices: &[usize]) -> Vec<u32> {
-    prepare_side_note_for_verification(side_note);
-    side_note.ingest_memory_pages();
-    let comps = super::all_components();
-    indices
-        .iter()
-        .map(|&i| {
-            let c = comps[i];
-            let trace = if c.is_producer() {
-                c.generate_component_trace(side_note)
-            } else {
-                c.generate_component_trace_immut(side_note)
-            };
-            trace.log_size()
-        })
-        .collect()
-}
-
-/// The canonical forcing profile for `seg_steps`-step windows of `full`: the
-/// per-chip elementwise MAX of every window's natural main-trace `log_size`
-/// (via [`natural_log_sizes_for`]) — the `min_log_sizes` under which
-/// [`prove_canonical`] gives all of a chain's windows an identical shape.
-/// Chips whose size is already uniform get their own size back (forcing is a
-/// no-op); varying chips get the chain-wide max, so the windows collapse onto
-/// the minimal canonical-shape set (distinct shapes remain only where content
-/// differs beyond size, e.g. fixed-base-comb call count). The floors are the
-/// observed per-window maxima for THIS trace's op pattern, not a proven
-/// bound — a deployment's drift guard + allowlist-coverage gate catch a
-/// reshaped transition. `None` when the trace is empty, `seg_steps` is zero,
-/// or any floor exceeds [`DEFAULT_MAX_LOG_SIZE`](crate::DEFAULT_MAX_LOG_SIZE)
-/// (such a profile could only ever produce verifier-rejected proofs).
-pub fn canonical_profile_for(full: &SideNote, seg_steps: usize) -> Option<Vec<u32>> {
-    if seg_steps == 0 {
-        return None;
-    }
-    canonical_profile_for_bounds(
-        full,
-        &crate::segment::segment_bounds(full.steps.len(), seg_steps),
-    )
-}
-
-/// [`canonical_profile_for`] over explicit window bounds — the floors for a
-/// content-budgeted cut ([`crate::segment::segment_bounds_budgeted`]), or
-/// any other deterministic segmentation. Same guarantees and refusals.
-/// `bounds` must be in ascending step order (every segmentation here
-/// produces them so): the windows are sliced by one forward
-/// [`crate::segment::SegmentCursor`] pass, O(N) in the trace length
-/// instead of the per-window prefix replay's O(N²).
-pub fn canonical_profile_for_bounds(
-    full: &SideNote,
-    bounds: &[(usize, usize)],
-) -> Option<Vec<u32>> {
-    let mut cursor = crate::segment::SegmentCursor::new(full);
-    canonical_profile_over(bounds, move |a, b| cursor.side_note(a, b))
-}
-
-/// [`canonical_profile_for_bounds`] over a [`crate::CompactTrace`] — the
-/// chain-holder form the streaming drivers keep resident. The windows come
-/// from one forward [`crate::segment::CompactSegmentCursor`] pass, which
-/// yields `SideNote`s field-identical to slicing the expanded full trace,
-/// so the derived floors are the same numbers.
-pub fn canonical_profile_for_bounds_compact(
-    full: &crate::CompactTrace,
-    bounds: &[(usize, usize)],
-) -> Option<Vec<u32>> {
-    let mut cursor = crate::segment::CompactSegmentCursor::new(full);
-    canonical_profile_over(bounds, move |a, b| cursor.side_note(a, b))
-}
-
-/// The per-chip elementwise-max walk shared by the two holder forms:
-/// `window` materializes the `SideNote` for each `[a, b)` in `bounds`
-/// (ascending — both callers hand a forward cursor).
-fn canonical_profile_over(
-    bounds: &[(usize, usize)],
-    mut window: impl FnMut(usize, usize) -> SideNote,
-) -> Option<Vec<u32>> {
-    let mut floors = NaturalFloors::new();
-    for &(a, b) in bounds {
-        floors.observe(&mut window(a, b));
-    }
-    floors.finish()
-}
-
-/// The canonical-floors accumulator behind [`canonical_profile_for_bounds`]
-/// and the streaming derivations: feed every window's `SideNote` in any
-/// order via [`Self::observe`], then [`Self::finish`] yields the per-chip
-/// elementwise MAX of the observed natural `log_size`s — the canonical
-/// forcing profile. `finish` refuses (`None`) when nothing was observed
-/// (an empty chain has no floors) or any floor exceeds
-/// [`DEFAULT_MAX_LOG_SIZE`](crate::DEFAULT_MAX_LOG_SIZE) (such a profile
-/// could only ever produce verifier-rejected proofs) — the same contract
-/// [`canonical_profile_for`] documents. Exists so a
-/// [`crate::segment::TraceStream`] pass can derive floors without ever
-/// holding the chain's trace.
-pub struct NaturalFloors {
-    indices: Vec<usize>,
-    floors: Vec<u32>,
-    observed: bool,
-}
-
-impl NaturalFloors {
-    pub fn new() -> Self {
-        let indices: Vec<usize> = (0..super::chip_idx::COUNT).collect();
-        Self {
-            floors: vec![0u32; indices.len()],
-            indices,
-            observed: false,
-        }
-    }
-
-    /// Fold one window's natural sizes into the floors.
-    pub fn observe(&mut self, sn: &mut SideNote) {
-        self.observed = true;
-        for (floor, natural) in self
-            .floors
-            .iter_mut()
-            .zip(natural_log_sizes_for(sn, &self.indices))
-        {
-            *floor = (*floor).max(natural);
-        }
-    }
-
-    pub fn finish(self) -> Option<Vec<u32>> {
-        (self.observed
-            && self
-                .floors
-                .iter()
-                .all(|&f| f <= crate::DEFAULT_MAX_LOG_SIZE))
-        .then_some(self.floors)
-    }
 }
 
 fn prove_impl_with_components(
@@ -1125,7 +565,7 @@ pub(crate) fn replay_trace_binding(
 ) -> Result<ReplayTraceBinding, ProvingError> {
     crate::with_stack!(target.format.channel, Stack => {
         replay_trace_binding_on::<Stack>(side_note, target)
-    }, unbuilt => Err(ProvingError::ConstraintsNotSatisfied))
+    }, unbuilt => Err(ProvingError::FormatNotAdmitted(target.format.number)))
 }
 
 fn replay_trace_binding_on<MC: PcsStack>(
@@ -1138,7 +578,7 @@ where
     use crate::pcs::ProofHash;
     let config = target.config;
     if config.fri_config.log_blowup_factor > crate::proof::MAX_RECOMMIT_LOG_BLOWUP {
-        return Err(ProvingError::ConstraintsNotSatisfied);
+        return Err(ProvingError::NOT_SATISFIED);
     }
     prepare_side_note_for_verification(side_note);
     validate_memory_witnesses(side_note)?;
@@ -1153,33 +593,33 @@ where
         .zip(&log_sizes)
         .map(|(component, &log_size)| component.max_constraint_log_degree_bound(log_size))
         .max()
-        .ok_or(ProvingError::ConstraintsNotSatisfied)?;
+        .ok_or(ProvingError::NOT_SATISFIED)?;
     if crate::proof::derive_protocol_degree_shape(&config, max_constraint_log_degree_bound).is_err()
     {
-        return Err(ProvingError::ConstraintsNotSatisfied);
+        return Err(ProvingError::NOT_SATISFIED);
     }
     for &log_size in &log_sizes {
         if log_size < crate::proof::MIN_PROOF_LOG_SIZE {
-            return Err(ProvingError::ConstraintsNotSatisfied);
+            return Err(ProvingError::NOT_SATISFIED);
         }
         let Some(extended) = log_size.checked_add(config.fri_config.log_blowup_factor) else {
-            return Err(ProvingError::ConstraintsNotSatisfied);
+            return Err(ProvingError::NOT_SATISFIED);
         };
         if extended > crate::proof::MAX_EXTENDED_LOG_SIZE
             || config
                 .lifting_log_size
                 .is_some_and(|lifting| lifting < extended)
         {
-            return Err(ProvingError::ConstraintsNotSatisfied);
+            return Err(ProvingError::NOT_SATISFIED);
         }
     }
     let Some(domain_log_size) =
         max_constraint_log_degree_bound.checked_add(config.fri_config.log_blowup_factor)
     else {
-        return Err(ProvingError::ConstraintsNotSatisfied);
+        return Err(ProvingError::NOT_SATISFIED);
     };
     if domain_log_size > crate::proof::MAX_EXTENDED_LOG_SIZE {
-        return Err(ProvingError::ConstraintsNotSatisfied);
+        return Err(ProvingError::NOT_SATISFIED);
     }
     let twiddles = SimdBackend::precompute_twiddles(
         CanonicCoset::new(domain_log_size)
@@ -1292,7 +732,7 @@ fn prove_impl_with_components_overridden(
         boundary_override,
         min_log_sizes,
         transcript_generation,
-    ), unbuilt => panic!("format {}'s channel is not built", target.format.number))
+    ), unbuilt => Err(ProvingError::FormatNotAdmitted(target.format.number)))
 }
 
 #[allow(clippy::too_many_arguments)]

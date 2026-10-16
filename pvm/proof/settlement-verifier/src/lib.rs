@@ -778,6 +778,68 @@ mod pvm_atomic_shim {
 mod tests {
     use super::*;
 
+    /// The channel copy draws what the prover's channel draws, after the same
+    /// u64s, u32s, felts, roots and PoW nonces: values that collide under a
+    /// reduction mod p, and nonces whose limbs exceed 16 bits' worth of one
+    /// word.
+    #[test]
+    fn the_channel_copy_draws_as_the_provers() {
+        use vos_pvm_proof::poseidon2 as prover;
+        let p = u64::from(stwo::core::fields::m31::P);
+        let mut copy = Poseidon2M31Channel::default();
+        let mut theirs = prover::Poseidon2M31Channel::default();
+        macro_rules! both {
+            ($method:ident($($argument:expr),*)) => {
+                copy.$method($($argument),*);
+                theirs.$method($($argument),*);
+                assert_eq!(copy.clone().draw_secure_felt(), theirs.clone().draw_secure_felt());
+            };
+        }
+        for value in [
+            0,
+            1,
+            0xffff,
+            0x1_0000,
+            p,
+            p + 5,
+            5 << 32,
+            (5 + p) << 32,
+            u64::MAX,
+        ] {
+            both!(mix_u64(value));
+        }
+        both!(mix_u32s(&[0, 1, 0xffff, 0x1_0000, p as u32, u32::MAX]));
+        both!(mix_u32s(&[]));
+        both!(mix_felts(&[
+            SecureField::from_u32_unchecked(1, 2, 3, 4),
+            SecureField::from_u32_unchecked(p as u32 - 1, 0, 7, 9),
+        ]));
+        let limbs: [BaseField; 8] =
+            core::array::from_fn(|i| BaseField::from_u32_unchecked(i as u32 * 77));
+        P2MerkleChannel::mix_root(&mut copy, P2Hash(limbs));
+        prover::P2MerkleChannel::mix_root(&mut theirs, prover::P2Hash(limbs));
+
+        for nonce in [0, 1, 0xffff, 0x1_0000, 0xdead_beef_cafe_f00d, u64::MAX] {
+            for bits in [0, 1, 4, 8, 20] {
+                assert_eq!(
+                    copy.verify_pow_nonce(bits, nonce),
+                    theirs.verify_pow_nonce(bits, nonce),
+                    "{bits} bits, nonce {nonce:#x}"
+                );
+            }
+        }
+        let nonce = (1u64 << 40..)
+            .find(|&nonce| copy.verify_pow_nonce(8, nonce))
+            .unwrap();
+        assert!(theirs.verify_pow_nonce(8, nonce));
+        copy.mix_u64(nonce);
+        theirs.mix_u64(nonce);
+
+        assert_eq!(copy.draw_secure_felts(3), theirs.draw_secure_felts(3));
+        assert_eq!(copy.draw_u32s(), theirs.draw_u32s());
+        assert_eq!(copy.draw_secure_felt(), theirs.draw_secure_felt());
+    }
+
     /// Plonky3's `test_default_mersenne31_poseidon2_width_16`
     /// (`mersenne-31/src/poseidon2.rs` at `f983316`): the input 0..15 under the
     /// reference constants.

@@ -191,11 +191,11 @@ pub fn refine_bundle_cardinality_is_valid(bundle: &RefineProofBundle) -> bool {
         if slice.proof.log_sizes.len() > MAX_REFINE_CHILD_COMPONENTS
             || slice.proof.claimed_sums.len() > MAX_REFINE_CHILD_COMPONENTS
             || slice.proof.num_components > MAX_REFINE_CHILD_COMPONENTS
-            || slice.proof.stark_proof.commitments().len() != REFINE_CHILD_COMMITMENT_COUNT
+            || slice.proof.stark_proof.commitment_count() != REFINE_CHILD_COMMITMENT_COUNT
         {
             return false;
         }
-        let Ok(bytes) = crate::proof::preflight_proof_structure_readonly(
+        let Ok((_, bytes)) = crate::proof::preflight_proof_structure_readonly(
             &slice.proof,
             crate::proof::MAX_PROOF_LOG_SIZE,
         ) else {

@@ -1,4 +1,7 @@
+use stwo::core::proof::StarkProof;
+use stwo::core::vcs_lifted::blake2_merkle::{Blake2sMerkleChannel, Blake2sMerkleHasher};
 use vos_pvm_proof::Proof;
+use vos_pvm_proof::pcs::PcsStack;
 use vos_pvm_proof::{
     MAX_REFINE_CHILD_COMPONENTS, MAX_REFINE_HOST_BOUNDARIES, PcsConfig,
     REFINE_BUNDLE_FORMAT_VERSION, RefineHostBoundary, RefineMachineId, RefineProgramId,
@@ -13,24 +16,13 @@ use vos_pvm_proof_verifier::{
 };
 
 /// The Blake2s Stark proof of a format-24 proof.
-fn stark(
-    proof: &mut Proof,
-) -> &mut stwo::core::proof::StarkProof<stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleHasher>
-{
-    match &mut proof.stark_proof {
-        vos_pvm_proof::StarkProofAny::Blake2s(stark) => stark,
-        other => panic!("a Blake2s proof, not {:?}", other.channel()),
-    }
+fn stark(proof: &mut Proof) -> &mut StarkProof<Blake2sMerkleHasher> {
+    Blake2sMerkleChannel::stark_mut(&mut proof.stark_proof).expect("a Blake2s proof")
 }
 
 /// [`stark`], read only.
-fn stark_ref(
-    proof: &Proof,
-) -> &stwo::core::proof::StarkProof<stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleHasher> {
-    match &proof.stark_proof {
-        vos_pvm_proof::StarkProofAny::Blake2s(stark) => stark,
-        other => panic!("a Blake2s proof, not {:?}", other.channel()),
-    }
+fn stark_ref(proof: &Proof) -> &StarkProof<Blake2sMerkleHasher> {
+    Blake2sMerkleChannel::stark(&proof.stark_proof).expect("a Blake2s proof")
 }
 
 struct TrustedPrograms(

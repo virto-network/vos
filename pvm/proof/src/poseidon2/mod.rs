@@ -689,9 +689,7 @@ pub fn u32_limbs(value: u32) -> [BaseField; 2] {
 }
 
 /// The Merkle channel pairing the Poseidon2-M31 hasher with the Poseidon2-M31
-/// transcript — the full algebraic stack (no Blake2s anywhere on commit OR
-/// Fiat-Shamir). Contrast the commitment-only `P2MerkleChannel`, whose `C` is
-/// still `Blake2sM31Channel` (it only swapped the commitment hash).
+/// transcript: no Blake2s on the commitments or the Fiat–Shamir path.
 #[derive(Default)]
 pub struct P2MerkleChannel;
 impl MerkleChannel for P2MerkleChannel {

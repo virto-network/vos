@@ -89,8 +89,6 @@ pub trait ProofHash: Hash {
     fn is_canonical(&self) -> bool;
 
     fn into_commitment(self) -> Commitment;
-
-    fn from_commitment(commitment: &Commitment) -> Option<Self>;
 }
 
 impl ProofHash for Blake2sHash {
@@ -108,13 +106,6 @@ impl ProofHash for Blake2sHash {
 
     fn into_commitment(self) -> Commitment {
         Commitment::Blake2s(self)
-    }
-
-    fn from_commitment(commitment: &Commitment) -> Option<Self> {
-        match commitment {
-            Commitment::Blake2s(hash) => Some(*hash),
-            Commitment::Poseidon2M31(_) => None,
-        }
     }
 }
 
@@ -141,13 +132,6 @@ impl ProofHash for P2Hash {
 
     fn into_commitment(self) -> Commitment {
         Commitment::Poseidon2M31(self)
-    }
-
-    fn from_commitment(commitment: &Commitment) -> Option<Self> {
-        match commitment {
-            Commitment::Poseidon2M31(hash) => Some(*hash),
-            Commitment::Blake2s(_) => None,
-        }
     }
 }
 
@@ -225,6 +209,14 @@ impl StarkProofAny {
         }
     }
 
+    /// The number of trees.
+    pub fn commitment_count(&self) -> usize {
+        match self {
+            Self::Blake2s(proof) => proof.commitments.len(),
+            Self::Poseidon2M31(proof) => proof.commitments.len(),
+        }
+    }
+
     /// The root of tree `index`.
     pub fn commitment(&self, index: usize) -> Option<Commitment> {
         match self {
@@ -236,6 +228,14 @@ impl StarkProofAny {
                 .commitments
                 .get(index)
                 .map(|root| root.into_commitment()),
+        }
+    }
+
+    /// The FRI proof-of-work nonce.
+    pub fn proof_of_work(&self) -> u64 {
+        match self {
+            Self::Blake2s(proof) => proof.proof_of_work,
+            Self::Poseidon2M31(proof) => proof.proof_of_work,
         }
     }
 

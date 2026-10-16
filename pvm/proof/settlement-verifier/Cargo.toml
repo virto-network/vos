@@ -41,6 +41,11 @@ postcard = { version = "1", default-features = false, features = ["alloc"] }
 # serialize); serde+derive is no_std-friendly, so it is not a wasm/PVM blocker.
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 
+[dev-dependencies]
+# The prover's Poseidon2-M31 channel, which the channel copy here must draw
+# alike; verifier-only, so stwo stays without std, prover or parallel.
+vos-pvm-proof = { path = "..", default-features = false }
+
 [profile.dev]
 panic = "abort"
 

@@ -8,28 +8,40 @@
 //! | number | proofs | channel | log blowup, queries, PoW, fold step, last layer, interaction PoW | floors | at its reference shape |
 //! |---|---|---|---|---|---|
 //! | 24 | segments, legacy | Blake2s | the proof's own, 96 conjectured bits or more | 96 / — | MOBILE: 96 / 57 |
-//! | 26 | segments | Poseidon2-M31 | 2, 39, 26, 1, 0, 24 | 100 / 60 | 104 / 63 |
-//! | 27 | leaves and folds | Poseidon2-M31 | 2, 39, 26, 1, 0, 24 | 100 / 60 | 104 / 64 |
-//! | 28 | the final wrap, masked | Blake2b-256 | 6, 18, 26, 3, 6, 24 | 100 / 80 | 134 / 74 |
-//! | 29 | device proofs, masked | Blake2s-M31 | 1, 84, 20, 1, 0, 24 | 100 / 60 | 104 / 61 |
-//! | 30 | credential proofs, masked | Blake2s-M31 | 1, 84, 20, 1, 0, 24 | 100 / 60 | 104 / 61 |
+//! | 26 | segments | Poseidon2-M31 | 2, 44, 20, 1, 0, 8 | 100 / 60 | 108 / 62 |
+//! | 27 | leaves and folds | Poseidon2-M31 | 2, 44, 20, 1, 0, 8 | 100 / 60 | 108 / 63 |
+//! | 28 | the final wrap, masked | Blake2b-256 | 6, 20, 26, 3, 6, 8 | 100 / 80 | 146 / 74, short without affine batching |
+//! | 29 | device proofs, masked | Blake2s-M31 | 1, 86, 20, 1, 0, 8 | 100 / 60 | 106 / 62 |
+//! | 30 | credential proofs, masked | Blake2s-M31 | 1, 86, 20, 1, 0, 8 | 100 / 60 | 106 / 62 |
 //!
-//! - **24** is the Blake2s segment format the prover produced before this
-//!   registry, kept while the refine bundles, the chain proofs and their
-//!   tests use it. Its transcript is the old one (no interaction PoW, the
-//!   boundary states mixed a word at a time) and its parameters are the
-//!   proof's own under the 96-bit conjectured floor. **25**, its
-//!   Poseidon2-M31 variant behind a cargo feature, is retired: 26 replaces it.
+//! - **24** is the Blake2s segment format the default entry points produce,
+//!   kept while the refine bundles, the chain proofs and their tests use it.
+//!   Its transcript has no interaction PoW and mixes the boundary states a
+//!   word at a time, and its parameters are the proof's own under the 96-bit
+//!   conjectured floor. 25 is not registered.
 //! - **26 to 30** use the lossless encodings ([`Encoding::Lossless`]) and
-//!   exactly their parameters. 27 to 30 are registered and refused: their
-//!   AIRs come in M1 (27, 28) and with the phone work (29, 30), and the wrap's
-//!   fold step 3 is refused until it is reviewed.
+//!   exactly their parameters. 27 to 30 are registered and refused until
+//!   their AIRs and channels exist; the wrap's fold step 3 is refused until
+//!   it is reviewed.
+//! - **The inner formats** (26, 27) grind 20 bits of PoW and 8 of interaction
+//!   PoW and take 44 queries: 62.7 proven bits for segments, the query term
+//!   binding.
+//! - **The device and credential formats** (29, 30) take the least query
+//!   count, 86, whose proven count clears the floor of 60 by 2 bits.
+//! - **The wrap** (28) needs DEEP batching with an independent coefficient a
+//!   sampled value ([`DeepBatching::Affine`]) for its proven 80. Stwo batches
+//!   by powers of one coefficient, whose error is the batched values' count
+//!   times a proximity-gap error that grows with the blowup: at blowup 64 that
+//!   term caps the count at 74.7 however many queries are taken, 18 or 20.
+//!   The ways to 80 are affine batching at blowup 64 and 19–20 queries (about
+//!   1.06× the verifier's cost, a change to the fork for this format only), a
+//!   6-bit PoW in the batching phase at blowup 64 and 20 queries (about
+//!   1.11×), or blowup 8 with 41 queries (about 1.97×). The entry carries the
+//!   affine plan's parameters; [`crate::security`] counts what is built and
+//!   finds 74.
 //! - **The bit counts** are [`crate::security`]'s, at each entry's reference
 //!   shape; the verifier counts again at the proof's own shape and refuses a
-//!   proof below either floor. The wrap as decided counts 74 proven bits
-//!   against its floor of 80: the DEEP batching of its sampled values over a
-//!   2^22-point domain at rate 1/64 binds, however many queries it takes;
-//!   `slice-5-progress.md` records it.
+//!   proof below either floor.
 
 use stwo::core::fri::FriConfig;
 use stwo::core::pcs::PcsConfig;
@@ -65,6 +77,18 @@ pub enum Encoding {
     /// one run; every other u64 as four 16-bit limbs (a u32 two); and the
     /// interaction PoW before the relation challenges.
     Lossless,
+}
+
+/// How a format's DEEP quotient batches its sampled values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeepBatching {
+    /// By powers of one coefficient: Stwo's, what [`crate::security`]
+    /// counts.
+    Powers,
+    /// An independent coefficient a sampled value, whose error loses the
+    /// factor of the values' count. Not built: a format that names it needs
+    /// it for its proven floor.
+    Affine,
 }
 
 /// Whether a verifier accepts a format.
@@ -132,6 +156,8 @@ pub struct Format {
     /// takes the proof's own and records MOBILE's here.
     pub params: FormatParams,
     pub masked: bool,
+    /// The DEEP batching the format's proven floor assumes.
+    pub batching: DeepBatching,
     pub floor: SecurityFloor,
     pub status: Status,
     /// The shape [`Format::bits`] is counted at.
@@ -154,6 +180,11 @@ impl Format {
     /// The interaction PoW a proof under this format grinds, 0 for none.
     pub const fn interaction_pow_bits(&self) -> u32 {
         self.params.interaction_pow_bits
+    }
+
+    /// Whether [`Format::bits`] clears both floors.
+    pub const fn meets_floors(&self) -> bool {
+        self.bits.conjectured >= self.floor.conjectured && self.bits.proven >= self.floor.proven
     }
 }
 
@@ -228,20 +259,20 @@ pub const CREDENTIAL_REFERENCE: SecurityShape = SecurityShape {
 
 const INNER: FormatParams = FormatParams {
     log_blowup: 2,
-    n_queries: 39,
-    pow_bits: 26,
+    n_queries: 44,
+    pow_bits: 20,
     fold_step: 1,
     log_last_layer: 0,
-    interaction_pow_bits: 24,
+    interaction_pow_bits: 8,
 };
 
 const DEVICE: FormatParams = FormatParams {
     log_blowup: 1,
-    n_queries: 84,
+    n_queries: 86,
     pow_bits: 20,
     fold_step: 1,
     log_last_layer: 0,
-    interaction_pow_bits: 24,
+    interaction_pow_bits: 8,
 };
 
 const INNER_FLOOR: SecurityFloor = SecurityFloor {
@@ -263,6 +294,7 @@ pub const LEGACY_SEGMENT: Format = Format {
         interaction_pow_bits: 0,
     },
     masked: false,
+    batching: DeepBatching::Powers,
     floor: SecurityFloor {
         conjectured: crate::proof::MIN_CONJECTURED_SECURITY_BITS,
         proven: 0,
@@ -282,12 +314,13 @@ pub const SEGMENT: Format = Format {
     encoding: Encoding::Lossless,
     params: INNER,
     masked: false,
+    batching: DeepBatching::Powers,
     floor: INNER_FLOOR,
     status: Status::Admitted,
     reference: SEGMENT_REFERENCE,
     bits: SecurityBits {
-        conjectured: 104,
-        proven: 63,
+        conjectured: 108,
+        proven: 62,
     },
 };
 
@@ -298,12 +331,13 @@ pub const LEAF_FOLD: Format = Format {
     encoding: Encoding::Lossless,
     params: INNER,
     masked: false,
+    batching: DeepBatching::Powers,
     floor: INNER_FLOOR,
     status: Status::Reserved,
     reference: LEAF_FOLD_REFERENCE,
     bits: SecurityBits {
-        conjectured: 104,
-        proven: 64,
+        conjectured: 108,
+        proven: 63,
     },
 };
 
@@ -314,13 +348,14 @@ pub const WRAP: Format = Format {
     encoding: Encoding::Lossless,
     params: FormatParams {
         log_blowup: 6,
-        n_queries: 18,
+        n_queries: 20,
         pow_bits: 26,
         fold_step: 3,
         log_last_layer: 6,
-        interaction_pow_bits: 24,
+        interaction_pow_bits: 8,
     },
     masked: true,
+    batching: DeepBatching::Affine,
     floor: SecurityFloor {
         conjectured: 100,
         proven: 80,
@@ -328,7 +363,7 @@ pub const WRAP: Format = Format {
     status: Status::Reserved,
     reference: WRAP_REFERENCE,
     bits: SecurityBits {
-        conjectured: 134,
+        conjectured: 146,
         proven: 74,
     },
 };
@@ -340,12 +375,13 @@ pub const DEVICE_PROOF: Format = Format {
     encoding: Encoding::Lossless,
     params: DEVICE,
     masked: true,
+    batching: DeepBatching::Powers,
     floor: INNER_FLOOR,
     status: Status::Reserved,
     reference: DEVICE_REFERENCE,
     bits: SecurityBits {
-        conjectured: 104,
-        proven: 61,
+        conjectured: 106,
+        proven: 62,
     },
 };
 
@@ -356,12 +392,13 @@ pub const CREDENTIAL_PROOF: Format = Format {
     encoding: Encoding::Lossless,
     params: DEVICE,
     masked: true,
+    batching: DeepBatching::Powers,
     floor: INNER_FLOOR,
     status: Status::Reserved,
     reference: CREDENTIAL_REFERENCE,
     bits: SecurityBits {
-        conjectured: 104,
-        proven: 61,
+        conjectured: 106,
+        proven: 62,
     },
 };
 
@@ -445,7 +482,9 @@ mod tests {
         );
     }
 
-    /// The tool's two counts, pinned per format at its reference shape.
+    /// The tool's two counts, pinned per format at its reference shape:
+    /// every format clears its floors but the wrap, which needs affine
+    /// batching for its proven count.
     #[test]
     fn the_bit_counts_are_pinned_per_format() {
         let pinned: Vec<(u32, u32, u32)> = REGISTRY
@@ -461,38 +500,70 @@ mod tests {
             pinned,
             [
                 (24, 96, 57),
-                (26, 104, 63),
-                (27, 104, 64),
-                (28, 134, 74),
-                (29, 104, 61),
-                (30, 104, 61),
+                (26, 108, 62),
+                (27, 108, 63),
+                (28, 146, 74),
+                (29, 106, 62),
+                (30, 106, 62),
             ]
         );
-        for format in REGISTRY.iter().filter(|format| format.number != 28) {
-            assert!(format.bits.conjectured >= format.floor.conjectured);
-            assert!(format.bits.proven >= format.floor.proven);
+        for format in REGISTRY {
+            assert_eq!(
+                format.meets_floors(),
+                format.batching == DeepBatching::Powers,
+                "format {}",
+                format.number
+            );
         }
     }
 
-    /// The wrap as decided (blowup 64, 18 queries) stays below its proven
-    /// floor however many queries it takes, as at blowup 16; at blowup 8 it
-    /// reaches it with 41 queries, at blowup 4 with 62.
+    /// The unrounded counts the parameters were chosen by: the inner formats'
+    /// 62.7, and the device formats' least query count whose count clears 62.
     #[test]
-    fn the_wrap_as_decided_falls_short_of_its_proven_floor() {
+    fn the_parameters_are_the_least_that_clear_their_margins() {
+        let count = |params: &FormatParams, shape: &SecurityShape| {
+            crate::security::proven_count(params, shape).unwrap()
+        };
+        let segment = count(&SEGMENT.params, &SEGMENT_REFERENCE);
+        assert!((62.69..62.70).contains(&segment), "{segment}");
+        for format in [DEVICE_PROOF, CREDENTIAL_PROOF] {
+            let fewer = FormatParams {
+                n_queries: format.params.n_queries - 1,
+                ..format.params
+            };
+            assert!(count(&format.params, &format.reference) >= 62.0);
+            if format.number == DEVICE_PROOF.number {
+                assert!(count(&fewer, &format.reference) < 62.0);
+            }
+        }
+    }
+
+    /// The wrap counts 74.7 proven bits at blowup 64 with 18 queries or 20,
+    /// and as many queries as the analysis takes: the batching term of
+    /// powers-of-one-coefficient DEEP binds, and it grows with the blowup. At
+    /// blowup 8 it reaches 80 with 41 queries. The verifier's check says so.
+    #[test]
+    fn the_wrap_falls_short_without_affine_batching() {
         let proven = |log_blowup, n_queries| {
             let params = FormatParams {
                 log_blowup,
                 n_queries,
                 ..WRAP.params
             };
-            crate::security::proven_bits(&params, &WRAP_REFERENCE).unwrap()
+            crate::security::proven_count(&params, &WRAP_REFERENCE).unwrap()
         };
-        assert_eq!((WRAP.bits.proven, WRAP.floor.proven), (74, 80));
-        assert!(proven(6, 256) < WRAP.floor.proven);
-        let least = |log_blowup| (1..=256).find(|&q| proven(log_blowup, q) >= 80);
-        assert_eq!(
-            [least(6), least(4), least(3), least(2)],
-            [None, None, Some(41), Some(62)]
+        assert_eq!(WRAP.batching, DeepBatching::Affine);
+        for queries in [18, 20, 256] {
+            let bits = proven(6, queries);
+            assert!((74.71..74.72).contains(&bits), "{queries} queries: {bits}");
+        }
+        let least = |log_blowup| (1..=256).find(|&q| proven(log_blowup, q) >= 80.0);
+        assert_eq!([least(6), least(4), least(3)], [None, None, Some(41)]);
+        let error = crate::proof::check_format_security(&WRAP, &WRAP.pcs_config(), &WRAP_REFERENCE)
+            .unwrap_err();
+        assert!(
+            error.contains("74 proven bits, below format 28's floor of 80"),
+            "{error}"
         );
     }
 
@@ -512,12 +583,12 @@ mod tests {
             assert!(admitted(number).is_err());
         }
         assert_eq!(LEGACY_SEGMENT.number, crate::proof::PROOF_FORMAT_VERSION);
-        assert_eq!(WRAP.params.fold_step, 3);
     }
 
     /// A proof below either floor is refused: fewer queries than the
-    /// conjectured floor allows, a shape whose proven count falls short, and
-    /// parameters other than the format's.
+    /// conjectured floor allows, less PoW than the proven floor allows, a
+    /// shape whose proven count falls short, and parameters other than the
+    /// format's.
     #[test]
     fn a_proof_below_a_floor_is_refused() {
         let check = crate::proof::check_format_security;
@@ -528,9 +599,19 @@ mod tests {
         );
 
         let mut fewer = config;
-        fewer.fri_config.n_queries = 36;
+        fewer.fri_config.n_queries = 39;
         let error = check(&SEGMENT, &fewer, &SEGMENT_REFERENCE).unwrap_err();
         assert!(error.contains("98 conjectured bits"), "{error}");
+
+        // 15 + 44 · 2 = 103 conjectured, but the query term tends to
+        // 15 + 44 = 59 proven bits.
+        let mut less_pow = config;
+        less_pow.pow_bits = 15;
+        let error = check(&SEGMENT, &less_pow, &SEGMENT_REFERENCE).unwrap_err();
+        assert!(
+            error.contains("proven bits, below format 26's floor of 60"),
+            "{error}"
+        );
 
         // 2^30 sampled values over a 2^28-row trace: the batching term binds.
         let wide = SecurityShape {
@@ -544,7 +625,7 @@ mod tests {
         assert!(error.contains("proven bits"), "{error}");
 
         let mut stronger = config;
-        stronger.fri_config.n_queries = 40;
+        stronger.fri_config.n_queries = 45;
         let error = check(&SEGMENT, &stronger, &SEGMENT_REFERENCE).unwrap_err();
         assert!(error.contains("differ from format 26"), "{error}");
 

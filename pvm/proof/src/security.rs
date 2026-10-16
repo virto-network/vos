@@ -22,8 +22,15 @@
 //!   `2^fold_step` a round, to the last layer;
 //! - **ALI** (`circuits/deep_ali.py`, Theorem 8 of eprint 2022/1216):
 //!   `L · C / |F|`, `C` the constraints combined by powers of one coefficient;
-//! - **DEEP**: `L · (d·(k + c - 1) + (k - 1)) / (|F| - k - D)`, `d` the
-//!   constraint degree, `c` the most samples of one column, `D = k / ρ`;
+//! - **DEEP**: `L · (d·(k + c - 1) + (k - 1)) / (|F| - k - D)`, `k` the
+//!   tallest trace column's length, `c` the most samples of one column,
+//!   `D` the evaluation domain's size, and `d` the constraint degree, taken
+//!   as `2^(l_C - l_k) + 1` with `l_C` the composition polynomial's log degree
+//!   bound and `l_k = log2 k`. Stwo bounds a component of `2^l` rows whose
+//!   constraints have degree `d_i` by `2^l · 2^⌈log2(d_i - 1)⌉ ≤ 2^l_C`, so
+//!   `d_i · 2^l ≤ 2^l_C + k = d · k`: the term is counted at a degree at least
+//!   every component's, exact for degree 2 and 3 when the tallest component
+//!   sets `l_C`, and larger otherwise, which only lowers the count;
 //! - **logup** (`lookups/logup.py`, univariate): `N · S / |F|`, `N` the
 //!   fractions over all rows and `S` the widest relation, times
 //!   `2^-interaction_pow_bits`, the grind drawn before the relation
@@ -43,6 +50,12 @@
 //! analysis's to choose: a larger `m` narrows the gap, so the query term rises
 //! while every other term falls, and the count is taken at the `m` that
 //! maximizes the least term.
+//!
+//! The analysis refuses a shape outside soundcalc's multi-point precondition
+//! (`circuits/deep_ali.py`), `k + c < (1 - θ)·n` with `k` the dimension FRI
+//! tests, `n = k / ρ` and `θ` the proximity parameter `γ`. It is checked at
+//! `γ`'s limit, `1 - γ > √ρ` for every `m`, so it holds at whatever `m` the
+//! count is taken.
 //!
 //! The arithmetic is IEEE-754 double precision with only the basic operations,
 //! so every verifier computes the same counts.
@@ -88,7 +101,8 @@ pub fn conjectured_bits(params: &FormatParams) -> Option<u32> {
 }
 
 /// Both counts, `None` for parameters outside the analysis (a blowup of 0
-/// or above 30, a degree bound outside the M31 circle, no queries).
+/// or above 30, a degree bound outside the M31 circle, no queries, a shape
+/// outside the multi-point precondition).
 pub fn security_bits(params: &FormatParams, shape: &SecurityShape) -> Option<SecurityBits> {
     Some(SecurityBits {
         conjectured: conjectured_bits(params)?,
@@ -96,8 +110,14 @@ pub fn security_bits(params: &FormatParams, shape: &SecurityShape) -> Option<Sec
     })
 }
 
-/// The proven count, the floor of the least term at the best `m`.
+/// The proven count, the floor of [`proven_count`].
 pub fn proven_bits(params: &FormatParams, shape: &SecurityShape) -> Option<u32> {
+    proven_count(params, shape).map(|bits| bits as u32)
+}
+
+/// The proven count unrounded: the least term at the best `m`, `None` for a
+/// shape outside the analysis or a count below 0.
+pub fn proven_count(params: &FormatParams, shape: &SecurityShape) -> Option<f64> {
     let analysis = Analysis::new(params, shape)?;
     // `query(m)` rises with `m` and `rest(m)` falls, so their least is
     // unimodal: find the first `m` where the query term reaches the rest.
@@ -114,7 +134,7 @@ pub fn proven_bits(params: &FormatParams, shape: &SecurityShape) -> Option<u32> 
         .into_iter()
         .map(|m| analysis.bits_at(m))
         .fold(f64::NEG_INFINITY, f64::max);
-    (best.is_finite() && best >= 0.0).then_some(best as u32)
+    (best.is_finite() && best >= 0.0).then_some(best)
 }
 
 /// BCHKS25 Theorem 4.2 takes `m ≥ 3`.
@@ -152,6 +172,17 @@ impl Analysis {
         {
             return None;
         }
+        let sqrt_rho = if params.log_blowup.is_multiple_of(2) {
+            pow2(-(params.log_blowup as i32 / 2))
+        } else {
+            pow2(-(params.log_blowup as i32 / 2)) * core::f64::consts::FRAC_1_SQRT_2
+        };
+        // The multi-point precondition, `k + c < (1 - θ)·n`, at `θ`'s limit.
+        let dimension = pow2(shape.log_degree_bound as i32);
+        let domain = pow2((shape.log_degree_bound + params.log_blowup) as i32);
+        if dimension + shape.max_samples_per_column as f64 >= sqrt_rho * domain {
+            return None;
+        }
         let mut folds = alloc::vec![1];
         let mut remaining = shape.log_degree_bound - 1 - params.log_last_layer;
         while remaining > 0 {
@@ -159,11 +190,6 @@ impl Analysis {
             folds.push(step);
             remaining -= step;
         }
-        let sqrt_rho = if params.log_blowup.is_multiple_of(2) {
-            pow2(-(params.log_blowup as i32 / 2))
-        } else {
-            pow2(-(params.log_blowup as i32 / 2)) * core::f64::consts::FRAC_1_SQRT_2
-        };
         Some(Self {
             rho: pow2(-(params.log_blowup as i32)),
             sqrt_rho,
@@ -226,7 +252,8 @@ impl Analysis {
         let list = self.list_size(m);
         let ali = list * shape.constraints.max(1) as f64 / field;
         let k = pow2(shape.log_trace_length as i32);
-        let degree = pow2((shape.log_composition_degree_bound - shape.log_trace_length) as i32);
+        let degree =
+            pow2((shape.log_composition_degree_bound - shape.log_trace_length) as i32) + 1.0;
         let domain = pow2((shape.log_degree_bound + self.log_blowup) as i32);
         let deep = list
             * (degree * (k + shape.max_samples_per_column.max(1) as f64 - 1.0) + (k - 1.0))
@@ -290,17 +317,44 @@ mod tests {
         );
     }
 
+    /// A column sampled at more points than the precondition allows is
+    /// outside the analysis.
+    #[test]
+    fn the_multi_point_precondition_refuses() {
+        let params = FormatParams {
+            log_blowup: 1,
+            n_queries: 84,
+            pow_bits: 20,
+            fold_step: 1,
+            log_last_layer: 0,
+            interaction_pow_bits: 8,
+        };
+        let shape = |max_samples_per_column| SecurityShape {
+            log_degree_bound: 4,
+            log_trace_length: 4,
+            log_composition_degree_bound: 5,
+            sampled_values: 8,
+            max_samples_per_column,
+            constraints: 1,
+            logup_fractions: 1,
+            relation_width: 1,
+        };
+        // k = 16, n = 32, √ρ·n ≈ 22.6: c = 6 passes, c = 7 does not.
+        assert!(proven_count(&params, &shape(6)).is_some());
+        assert!(proven_count(&params, &shape(7)).is_none());
+    }
+
     /// The query term alone, against the closed form: at a large `m` the gap
     /// vanishes and each query gives `log_blowup / 2` bits.
     #[test]
     fn the_query_term_tends_to_half_the_blowup_bits_a_query() {
         let params = FormatParams {
             log_blowup: 2,
-            n_queries: 39,
-            pow_bits: 26,
+            n_queries: 44,
+            pow_bits: 20,
             fold_step: 1,
             log_last_layer: 0,
-            interaction_pow_bits: 24,
+            interaction_pow_bits: 8,
         };
         let shape = SecurityShape {
             log_degree_bound: 20,
@@ -314,7 +368,7 @@ mod tests {
         };
         let analysis = Analysis::new(&params, &shape).unwrap();
         let at = |m| analysis.query_bits(m);
-        assert!(at(M_MAX) < 65.0 && at(M_MAX) > 64.99);
+        assert!(at(M_MAX) < 64.0 && at(M_MAX) > 63.99);
         assert!(at(3) < at(30) && at(30) < at(300));
     }
 }

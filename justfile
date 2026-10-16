@@ -36,9 +36,11 @@ vectors:
 # `debug-internals`. Memory-heavy: two threads fit under a 24 GiB limit, e.g.
 # `systemd-run --user --scope -p MemoryMax=24G -p MemorySwapMax=0 just test-proof`.
 # They cover every admitted format, the Poseidon2-M31 segment format among
-# them; the verifier's suite runs in `test`.
+# them; the verifier's suite runs in `test`. The settlement verifier's own
+# tests check its channel copy against the prover's.
 test-proof: build-guests
     cargo test -p vos-pvm-proof --features debug-internals --tests -- --test-threads=2
+    cd pvm/proof/settlement-verifier; cargo test
 
 # Guest programs the prover suites run.
 build-guests: build-settle

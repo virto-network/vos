@@ -579,9 +579,10 @@ pub use prove::{prove_pre_config_relabel_for_test, prove_with_boundary_override}
 // forcing profile, `prove_canonical` proves each window to one shape.
 #[cfg(feature = "prover")]
 pub use prove::{
-    canonical_profile_for, canonical_profile_for_bounds, program_commitment_for_profile,
-    program_commitment_for_profile_format, prove, prove_canonical, prove_canonical_format,
-    prove_chain, prove_chain_format, prove_format, prove_mobile, prove_with_config,
+    ProvingError, canonical_profile_for, canonical_profile_for_bounds,
+    program_commitment_for_profile, program_commitment_for_profile_format, prove, prove_canonical,
+    prove_canonical_format, prove_chain, prove_chain_format, prove_format, prove_mobile,
+    prove_with_config,
 };
 // Advanced / internal prove surface: the compact-trace floor variant, the
 // profiling variants, the thread-pool installer, and the explicit-component
@@ -610,18 +611,13 @@ pub use stwo::core::pcs::PcsConfig;
 #[cfg(feature = "prover")]
 pub use verify::{DEFAULT_MAX_LOG_SIZE, verify, verify_chain, verify_with_pcs_policy};
 // Advanced verify surface (max-log-size / options / explicit components)
-// and the OODS reconstruction the recursion path consumes.
+// and the recursion seams the in-AIR verifier is checked against.
 #[doc(hidden)]
 #[cfg(feature = "prover")]
 pub use verify::{
-    ComponentOodsMask, OodsReconstruction, reconstruct_oods_for_recursion,
+    ComponentOodsMask, DeepBatch, OodsReconstruction, RecursionData, RecursionTranscript,
+    extract_recursion_data, reconstruct_oods_for_recursion, record_canonical_transcript,
     verify_with_explicit_components, verify_with_max_log_size, verify_with_options,
-};
-#[doc(hidden)]
-#[cfg(feature = "prover")]
-pub use verify::{
-    DeepBatch, RecursionData, RecursionTranscript, extract_recursion_data,
-    record_canonical_transcript,
 };
 
 /// Chip-isolated harness surface — re-exports the trait

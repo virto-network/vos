@@ -13,9 +13,10 @@ use vos_pvm::instruction::Opcode;
 use vos_pvm::interpreter::Interpreter;
 use vos_pvm_proof::core::tracing::TracingPvm;
 use vos_pvm_proof::format::{self, Format};
-use vos_pvm_proof::poseidon2::{P2MerkleHasher, Poseidon2M31Channel};
+use vos_pvm_proof::pcs::PcsStack;
+use vos_pvm_proof::poseidon2::{P2MerkleChannel, P2MerkleHasher, Poseidon2M31Channel};
 use vos_pvm_proof::security::SecurityBits;
-use vos_pvm_proof::{Proof, SideNote, StarkProofAny, program_commitment_of_proof};
+use vos_pvm_proof::{Proof, SideNote, program_commitment_of_proof};
 use vos_pvm_proof_verifier::{proof_security_bits, verify_standalone};
 
 /// Six chained Add64s and a trap: seven steps over 4 MiB of memory.
@@ -80,10 +81,7 @@ fn refused_both(proof: Proof, side_note: &SideNote, expected: &str) {
 }
 
 fn poseidon2_stark(proof: &mut Proof) -> &mut StarkProof<P2MerkleHasher> {
-    match &mut proof.stark_proof {
-        StarkProofAny::Poseidon2M31(stark) => stark,
-        other => panic!("a Poseidon2-M31 proof, not {:?}", other.channel()),
-    }
+    P2MerkleChannel::stark_mut(&mut proof.stark_proof).expect("a Poseidon2-M31 proof")
 }
 
 /// Every admitted format proves, round-trips through bincode and postcard,
@@ -189,7 +187,7 @@ fn transcript_before_interaction_pow(proof: &Proof) -> Poseidon2M31Channel {
     let mut proof = proof.clone();
     let stark = poseidon2_stark(&mut proof).clone();
     for root in &stark.commitments[..2] {
-        vos_pvm_proof::poseidon2::P2MerkleChannel::mix_root(&mut channel, *root);
+        P2MerkleChannel::mix_root(&mut channel, *root);
     }
     vos_pvm_proof::proof::mix_boundary_states(
         &mut channel,
@@ -201,26 +199,66 @@ fn transcript_before_interaction_pow(proof: &Proof) -> Poseidon2M31Channel {
 }
 
 /// A proof below a floor is refused: less PoW than format 26's conjectured
-/// floor allows; and, at its floors, parameters other than the format's.
+/// floor allows, or than its proven floor allows; and, at its floors,
+/// parameters other than the format's.
 #[test]
 fn a_proof_below_a_floor_is_refused() {
     let (proof, side_note) = proved(&format::SEGMENT);
-    let with_config = |mutate: fn(&mut stwo::core::pcs::PcsConfig)| {
+    let with_pow = |pow_bits| {
         let mut changed = proof.clone();
-        mutate(&mut changed.pcs_config);
+        changed.pcs_config.pow_bits = pow_bits;
         poseidon2_stark(&mut changed).0.config = changed.pcs_config;
         changed
     };
     refused_both(
-        with_config(|config| config.pow_bits = 21),
+        with_pow(11),
         side_note,
         "99 conjectured bits, below format 26's floor of 100",
     );
     refused_both(
-        with_config(|config| config.pow_bits = 27),
+        with_pow(15),
         side_note,
-        "differ from format 26",
+        "proven bits, below format 26's floor of 60",
     );
+    refused_both(with_pow(21), side_note, "differ from format 26");
+}
+
+/// A policy pins every format's shape: a format-26 proof, at blowup 4, is
+/// refused under STANDARD's floor of blowup 16, with and without the side
+/// note, and verifies under MOBILE's.
+#[test]
+fn a_policy_pins_every_formats_shape() {
+    use vos_pvm_proof::proof::PcsPolicy;
+    let (proof, side_note) = proved(&format::SEGMENT);
+    let commitment = program_commitment_of_proof(proof);
+    let standalone = vos_pvm_proof_verifier::verify_standalone_with_pcs_policy(
+        proof.clone(),
+        commitment,
+        &PcsPolicy::STANDARD,
+    )
+    .expect_err("refused");
+    assert!(
+        standalone
+            .to_string()
+            .contains("log_blowup_factor 2 < policy minimum 4")
+    );
+    let prover_side =
+        vos_pvm_proof::verify_with_pcs_policy(proof.clone(), side_note, &PcsPolicy::STANDARD)
+            .expect_err("refused");
+    assert!(
+        prover_side
+            .to_string()
+            .contains("log_blowup_factor 2 < policy minimum 4")
+    );
+
+    vos_pvm_proof_verifier::verify_standalone_with_pcs_policy(
+        proof.clone(),
+        commitment,
+        &PcsPolicy::MOBILE,
+    )
+    .expect("verifies");
+    vos_pvm_proof::verify_with_pcs_policy(proof.clone(), side_note, &PcsPolicy::MOBILE)
+        .expect("verifies");
 }
 
 /// The counts of a real proof, at its own shape, clear format 26's floors;
@@ -233,8 +271,8 @@ fn the_bit_counts_are_counted_at_the_proofs_shape() {
         (segment, legacy),
         (
             SecurityBits {
-                conjectured: 104,
-                proven: 64,
+                conjectured: 108,
+                proven: 63,
             },
             SecurityBits {
                 conjectured: 96,
