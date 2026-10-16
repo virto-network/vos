@@ -164,3 +164,189 @@ not on `vos-core`), 5 segments, `RAYON_NUM_THREADS=8`, under
   run included.
 - Clippy with `-D warnings` for AVX-512F, the scalar fallback and
   aarch64 as well as the host.
+
+## Step 5.7: the items carried from slice 4
+
+### Per-target limits (the owner's decision)
+
+**Built:**
+- **An install names its target,** VOS or JAM (`cap::Target`), in
+  `Admin::Install` and the `Installed` record; a workflow keeps its
+  instance's in its record (format 5). The agent and the model hold an
+  instance to its target's `cap::Limits` on every host, so a builder's
+  simulation, the JAM refine and a VOS node replaying the batch agree.
+  A step runs within the limits of the instance it enters, its nested
+  calls too.
+- **JAM's limits** (`cap::JAM`), each within VOS's (asserted):
+
+  | | VOS | JAM |
+  |---|---|---|
+  | A step's writes | 256 KiB, rows by gas (about 3,125) | 16 KiB in at most 128 rows |
+  | Messages, each's arguments | 16, 64 KiB | 8, 2 KiB |
+  | Attests, each's arguments and output | 16, 64 KiB | 8, 2 KiB |
+  | Pages a workflow's program may write | 4,096 | 256 |
+  | Pages a step writes, pages held | 8 MiB, 576 | 256 KiB, 64 |
+  | Checked at install: pages, program, kernels | — , 64 MiB, 1,024 | 256 (the whole heap), 512 KiB, 32 |
+  | A kernel's BLAKE2b compressions | the caller's gas | 4,096: its method's gas limit over 600 |
+
+- **Derived from slice 4's budgets** (model, `vos_jam::gas::effects`): at
+  VOS's caps a step's effects take up to about 1.40e9 gas of a package's
+  own work, past PolkaJam's 1e9; at JAM's, 39.4M, 35.6 times fewer.
+  `WORST_JAM_STEP`, a step restoring, storing and dropping every page a
+  JAM workflow holds and ending it, with its effects at their limits, is
+  839M of the 950M usable, asserted at compile time. The worst VOS
+  ending with its effects is about 2.31e9.
+- **`#[attestable(gas = N)]`** declares a kernel's limit. On JAM a
+  kernel runs within it, so its compressions, each served in software
+  (`PRECOMPILE_SERVING`), are bounded at install.
+- **One page price everywhere,** unchanged: the limits cap a step and
+  never price it.
+- **The JAM testnet** installs its actors for JAM, the shop built with
+  the default heap (`lean`).
+
+**Tests:**
+- at the edge of each JAM effect limit and one past it (messages, rows,
+  bytes): `Cap` for JAM alone, on a VOS node and on the JAM-only host,
+  as the model;
+- an install past JAM's page limit (the shop's 4 MiB heap) and one whose
+  attestable's default gas limit pays for 16,666 compressions are
+  refused, `Cap`, with no record written; the default-heap shop installs;
+- a JAM workflow past its step's pages, and past its held pages, fails
+  `Cap`; the same for VOS pauses;
+- derived kernels run for both targets on both hosts, as the model;
+- a compile-fail case: `#[attestable]` takes no role;
+- `the_jam_limits_fit_a_package` prints and checks the figures above.
+
+### DA: a waiting workflow's pages
+
+**Chosen: the deterministic failure.** The core model (§12) and slice
+4's F2 left re-export or failure open. Failing is a rule the agent
+keeps, the same on every host and checkable on chain, where re-export
+is a duty of the builder's, and a workflow whose builder was away past
+retention would wait for good.
+
+**Built:**
+- JAM keeps a workflow's pages a day (`Limits::pages_kept`), well
+  within JAM's imports DA. A workflow's record keeps the batch time
+  from which every page it holds has been stored (`Workflow::stored`):
+  its start's, then that of a step after which it holds no page an
+  earlier step stored. A conservative bound, by one time per record,
+  never a page's own.
+- A step due at or past `stored` plus the keep, while the workflow
+  holds pages, ends it `Failure::Expired` (12) without restoring or
+  importing them, its pages dropped and its owner told.
+- The builder no longer leaves such a workflow out of a sweep; one whose
+  pages DA lacks earlier still waits, as one installed for VOS does.
+
+**Tests:** a JAM workflow resumed just within the keep and one just past
+it, on both hosts, as the model; the builder over the emulated chain,
+DA emptied: the workflow left out within the keep, then ended
+`Expired` past it in a package that imports nothing.
+
+### A heap per kind of invocation
+
+**Built:**
+- The SDK's arena is a section of its own, `.vos_heap`, which the
+  guest's linker script places last in the read-write data, its state
+  apart. The allocator bumps fresh memory from the arena's start.
+- **The derivation** (transpiler version 2) holds the arena's first 512
+  KiB (`INVOCATION_HEAP`) in the actor's program and in each kernel, all
+  a handler or a kernel maps, and records the pages past them,
+  `Derivation::heap`. A handler past 512 KiB faults and traps.
+- **A workflow's machine** maps those pages itself past its program's
+  read-write data, zeroed, and arms them with its writable pages: its
+  record's `writable` counts them, so `ARM_PAGE` pays for them.
+- **A kernel's layout** is its program's alone, the same whatever heap
+  its actor declares. The pinned fixture is now the kernels actor built
+  with a 4 MiB heap (`roomy`): 896 pages left out.
+- On JAM a handler of the 4 MiB shop now maps 512 KiB, not 4 MiB (model:
+  about 15,000 gas of loading a call, not about 124,000).
+
+**Tests:**
+- a kernel's layout and its handlers' program equal across the kernels
+  actor built with the default heap and with 4 MiB;
+- the actor's program is `link_elf_spi`'s but for the heap pages it
+  leaves out, which are exactly the arena's past 512 KiB;
+- a workflow computing over 1 MiB on the derived shop runs to its end
+  beside a handler, on both hosts, as the model maps the same pages;
+- the derivation the same in every process; the pins.
+
+### Measurements
+
+Measured with the processes bench (`ROWS=resume` and `ROWS=catch-up`),
+on the reference laptop's pinning, on the slice's base (b7c4fd69): the
+paths measured run on VOS and are unchanged since. Quiet runs only,
+load 1.7–5.2; runs under other agents' builds (load 8–24) gave medians
+of 2–21 ms and were discarded. The leader runs in the bench's process,
+so it can deliver replies itself as the one-node bench does; its
+followers are `vos node run` processes over QUIC.
+
+| A workflow's resume, a reply in to its step applied | Median | p99 |
+|---|---|---|
+| Three nodes, synced commits on NVMe (4 runs) | 1.77–1.92 ms | 2.48–2.77 ms |
+| Node 1 alone, the same runs | 1.25–1.30 ms | 1.96–3.43 ms |
+| Three nodes, stores on tmpfs (2 runs) | 0.92–0.97 ms | 1.77–1.81 ms |
+| Node 1 alone, tmpfs | 0.69–0.72 ms | 1.13–1.29 ms |
+
+- 603 resumes a row. Replication adds about 0.45 ms to the commit on
+  disk (920–980 µs against 500–550 µs): the QUIC round trip and the
+  follower's synced flush beside the leader's own. The step's refine,
+  restoring the workflow, takes 0.5–0.65 ms; queueing, proposing and
+  applying about 0.15 ms.
+
+| A follower's catch-up (4 runs) | Within the kept tail | Beyond it |
+|---|---|---|
+| Missed while down | 40 fills, 9.6 MB of results in 5 entries | 224–232 fills, 54–56 MB in 28–29 entries |
+| Names its leader | 0.24–0.27 s | 0.49–0.59 s |
+| Has applied the leader's commit | 0.95–0.96 s, from the log | 2.24–2.55 s, from a snapshot |
+
+- **The settings** (`vos_node::Config`): compaction once 1,024 entries
+  or 64 MiB, a large result counted by its blob, are applied durably; a
+  kept tail of at most 256 entries and 16 MiB; snapshot chunks of 1
+  MiB; a result of 64 KiB or more stored as a blob.
+- The kept tail held 9–10 results of about 1.9 MB (measured), so 4.4c's
+  "4 to 8" was for results of 2–4 MB.
+- The snapshot carried 401–409 rows, 0.25 MB: the agent's state, not
+  the log missed. About 1.7–2.0 s of the catch-up passes between naming
+  the leader and installing it, which fits a stream begun while the
+  follower was down, resent every 2 s (`CHUNK_RESEND`) (model, from the
+  code).
+
+### Ristretto ids 110–114
+
+Already so: `derive` refuses a kernel reaching any host call but a
+precompile, and these are none. A test now pins it for each of the five
+ids, beside BLAKE2b's precompile, which derives.
+
+### PolkaJam
+
+- **The re-probe** (`nightly-2026-10-13`, still the installed version:
+  polkajam and jamt 0.1.29, Gray Paper 0.8.0, the same sha256): on the
+  interpreter every record PolkaJam produces is unchanged, gas included
+  (fault tracking, counters, segments by `wp:` and `sr:`, the 14
+  starved and re-entry records, `solicit` and `historical_lookup`); the
+  availability race and late `wp:` imports dropping recur. Our JAM-only
+  host now agrees on 34 of the 36 fault records; `fetch` kind 0 still
+  differs. Results in `spikes/sj-jam-b/results/2026-10-16-*`; `probe.sh`
+  takes the backend from `POLKAVM_BACKEND`.
+- **The recompiler run still waits.** `vm.unprivileged_userfaultfd` is
+  1 now, but PolkaVM's sandbox reads every CPU's L3 cache entry, and
+  this machine's two low-power cores have none: every node fails at
+  start, and neither core pinning off nor CPU affinity helps. It needs a
+  PolkaJam build that tolerates them, or another machine. Kernel
+  settings were not touched.
+- **The testnet on the interpreter, with this step's code** (`just
+  jam-testnet`): the agent and its actors installed for JAM, the
+  workflow across three later packages (70 pages exported, 104
+  imported), every package landed at its first attempt, each work result
+  read back from DA equal to the simulation's and the VOS node's, the
+  testnet logging no error. Refines 0.26M–41.9M gas each (measured, on
+  our JAM-only host).
+
+### Also
+
+- **A cluster test's flake, fixed:** under load the compaction test's
+  leader moved while it sent its fifty increments; each is now sent
+  again at its sequence to whichever node leads.
+
+**Gates:** `just check` on each commit, 990 tests at the last; the node suites at the end: cluster and processes in it, the faults process tests and the five-process fault suite.
