@@ -1,6 +1,6 @@
 # Proving: layers, formats and verifiers
 
-Design, draft 4. It is the architecture behind slices 5, 6 and 7
+Design, draft 5. It is the architecture behind slices 5, 6 and 7
 (`slice-5-proving.md`). The recursion AIR's own design is
 `recursion-air.md`.
 - **Status:** [decided] marks the owner's decisions; [proposed] marks
@@ -12,7 +12,11 @@ Design, draft 4. It is the architecture behind slices 5, 6 and 7
     R1–R13);
   - draft 3 took the owner's decisions (§12) and Fable's check of draft 2
     (D1–D4);
-  - draft 4 takes `recursion-air.md`'s measurements and corrections.
+  - draft 4 takes `recursion-air.md`'s measurements and corrections;
+  - draft 5 folds in Fable's review of the planning set
+    (`research/slice-5/plan7-review.md`, R1–R11): the fold's carry of
+    the circuit hash, lossless encodings, the witness-input record, the
+    crates' homes, the budgets per node and the estimates.
 
 ## 1. What the owner requires [decided]
 
@@ -154,8 +158,8 @@ attribution). Its full design is `recursion-air.md`.
   vos's permutation follows the round order of Stwo's example, not the
   reference: each linear layer precedes its S-box layer, and there is no
   final external layer. Before a format pins it, it adopts the reference
-  arrangement with Plonky3's width-16 M31 parameters, checked against
-  their test vectors.
+  arrangement with Plonky3's width-16 M31 parameters (pinned at
+  `f983316`), checked against their test vectors.
 - **A SIMD hasher on the prover** (M0). Today's scalar permutation takes
   0.8–2.4 µs [measured]. A segment on Poseidon2 proves in 23 s against
   5 s on Blake2s, and a leaf's commitment needs about 25M permutations.
@@ -167,19 +171,22 @@ attribution). Its full design is `recursion-air.md`.
 - **The initial image is public** [decided]:
   - the kernel's arguments and witness rows enter through a
     **witness-input precompile**, not through the initial memory;
-  - the tracer serves the call with free witness, and the agent serves
-    it live;
+  - the agent serves the call live and records the bytes in the
+    `Attest` (A.5); the tracer replays them, as free witness;
   - the first segment's initial memory root is the image root of code,
     data and zeroed regions. It is computable at install and is a field
     of the program id;
   - no root over private memory reaches a public input, so there is no
     salt page.
-- **The precompile's AIR binding:**
-  - its dispatch id is committed in PROGRAM_MEMORY, like `0x400`;
-  - it writes only to the range its registers name, with a size cap;
-  - it has no other effect;
-  - `derive` admits the new id;
-  - a live≡traced test gates it in M0.
+- **The precompile, `0x401`** (free in VOS's `0x400..=0x47f`):
+  - **its registers:** φ7 the destination, φ8 the capacity. It writes
+    `min(capacity, remaining)` bytes and returns the count in φ7; 0
+    means the end of input. Reads are deterministic;
+  - **its AIR binding:** the dispatch id is committed in PROGRAM_MEMORY,
+    like `0x400`'s; it writes only `[φ7, φ7 + count)`, with the count at
+    most φ8, and has no other effect;
+  - the whole input is capped at 4 MiB, a work result's cap;
+  - `derive` admits the new id, and a live≡traced test gates it in M0.
 - **Unmasked.** Segments never leave the prover role.
 
 ### 3.3 Leaf circuits
@@ -190,21 +197,30 @@ attribution). Its full design is `recursion-air.md`.
   The leaf circuit's hash therefore pins the kernel's code and shape.
 - **A leaf verifies one segment proof** and outputs a digest whose
   preimage is in A.3. The preimage holds:
-  - the program id;
+  - the program id, a witness the fold binds (§3.4);
   - the position range `(p, p)`;
   - the entry and exit state digests;
   - an entry flag;
   - a halt flag;
-  - the io-hash, when halted.
-- **A state digest** is the Poseidon2-M31 hash of the 13 registers, pc,
-  ts and the memory root.
-- **The entry flag holds** when:
+  - the io-hash, when halted;
+  - the fold-circuit word W (§3.4).
+- **A state digest** is the Poseidon2-M31 hash of, in order, the 13
+  registers, pc, ts and the memory root, as bytes (A.3).
+- **The entry flag holds** when the entry state equals leaf-circuit
+  constants:
   - pc is the kernel's entry;
-  - ts is 0;
-  - the registers are the loader's image;
-  - the memory root equals the program id's image root.
-- **The halt flag holds** when the exit is `Halt`. The io-hash is read
-  from φ9..12.
+  - ts is 1, the first step's (0 is reserved for the initial memory);
+  - the registers are the loader's image (φ0 the halt address, φ1 the
+    stack top, φ7 the argument base), with φ8, the argument size, at 0,
+    since arguments arrive through the precompile;
+  - the memory root is the image root.
+- **The halt flag holds** when `pc_out` equals a leaf-circuit constant,
+  `PVM_HALT_ADDR` (2^32 − 2^16, `pvm/runtime/src/lib.rs:88`): the return
+  address the loader puts in φ0.
+  - Today a halting step keeps `next_pc = pc` (CpuChip's halt
+    selectors), so the new segment format sets it to that address. No
+    code offset reaches it, so only a halt ends a segment there.
+  - The io-hash is φ9..12's 32 bytes, as 16 limbs of 16 bits.
 - **A leaf's size is the kernel's width times the queries, not the
   segment's length** [model]. Four times longer segments add 4% of rows,
   so longer segments make recursion cheaper per step.
@@ -220,18 +236,24 @@ attribution). Its full design is `recursion-air.md`.
 - **2 to 1.** A fold takes each child's output preimage as witness,
   hashes it in-circuit, and checks the result against the child's
   committed digest. Then it checks:
-  - **the circuit:** each child's circuit hash is one of the program
-    id's leaf circuits, or the fold circuit's hash. The fold circuit's
-    hash is a witness word, copied into the fold's output, because a
-    circuit cannot hold its own hash as a constant. The program id's
-    preimage is a fold witness, and the id is recomputed in-circuit;
-  - **the program:** both children carry the same program id;
+  - **the circuit:** every node's preimage carries one word W, the fold
+    circuit's hash, because a circuit cannot hold its own hash as a
+    constant. A leaf copies W from its witness. For each child, the
+    fold requires that the child's recomputed circuit hash is one of
+    the program id's leaf-circuit hashes or W, **and** that the child
+    carries W. It copies W to its output;
+  - **the program:** the program id's preimage is a fold witness, and
+    the id is recomputed in-circuit; the leaf-circuit hashes above are
+    that preimage's. Both children carry that id. A leaf's program id
+    is a witness, so this is what binds it;
   - **adjacency:** `left.last + 1 == right.first`;
   - **continuity:** `left.exit_digest == right.entry_digest`;
   - **the ends:** the entry flag comes from the left, and the halt flag
     and io-hash from the right.
-- **The wrap** pins the true fold-circuit hash as a constant. It refuses
-  a root without `first = 0`, the entry flag and the halt flag, so a
+- **The wrap** checks the root's W against the true fold-circuit hash,
+  its constant. Every fold below then carries that hash, so every fold
+  child is a leaf of the program or a true fold. The wrap refuses a
+  root without `first = 0`, the entry flag and the halt flag, so a
   prefix of a run, or a run started mid-way, cannot fold into a
   statement.
 - **One padded shape for leaves and folds,** a format constant: 2^16 /
@@ -263,7 +285,8 @@ attribution). Its full design is `recursion-air.md`.
 - **Fold step above 1:** the pinned Stwo implements it; the format admits
   it only after a review plus tamper tests.
 - **Its public inputs** are the program id (8 M31) and the io-hash (its
-  32 bytes as 16 limbs of 16 bits).
+  32 bytes as 16 limbs of 16 bits): 24 words, at the wrap's reserved
+  addresses 0–23 (A.3).
 
 ### 3.6 The statement, one format for every kernel
 
@@ -317,11 +340,19 @@ pub struct Statement {
 - **Formats are chosen at run time,** so a verifier accepts two during a
   transition. Today the format is fixed by a cargo feature
   (`pvm/proof/src/proof.rs:180-187`).
-- **One crate set for every venue:**
-  - `vos-statement`: the types, the encoding and the id;
-  - `vos-final-verifier`: no_std, on stable Rust, for x86, wasm32 and
-    riscv64em-javm;
-  - golden fixtures (A.6).
+- **The crates,** under `pvm/proof/`:
+  - `recair` (`vos-recair`): the recursion prover and its `Context`;
+  - `recair-air` (`vos-recair-air`): the components' constraint bodies,
+    no_std, with no prover dependency;
+  - `final-verifier` (`vos-final-verifier`): no_std, for x86, wasm32
+    and riscv64em-javm;
+  - `statement` (`vos-statement`): the types, the encoding and the id,
+    with no vos dependency, so Kreivo can depend on it;
+  - the golden fixtures, under `fixtures` (A.6).
+
+  Every venue uses the last three. The source uses no nightly feature:
+  it builds on stable for x86 and wasm32, and the JAM build runs on the
+  pinned nightly with build-std.
 
 ## 4. Security levels [proposed]
 
@@ -345,7 +376,7 @@ last for decades.**
 
 | proof | target | example | conjectured / proven |
 |---|---|---|---|
-| segment and fold proofs | ≥ 100 / ≥ 60 | blowup 4 (log 2), 39 queries, PoW 26, plus interaction PoW 24 | 104 / 65 |
+| segment and fold proofs | ≥ 100 / ≥ 60 | blowup 4 (log 2), 39 queries, PoW 26, plus interaction PoW 24; FRI fold step 1, log last-layer degree bound 0 | 104 / 65 |
 | device proofs (verified at ingress, never folded) | ≥ 100 / ≥ 60 | blowup 2 (log 1), 84 queries, PoW 20 | 104 / 62 |
 | the final wrap | ≥ 100 / ≥ 80 | blowup 64 (log 6), 18 queries, PoW 26 | 134 / 80 |
 
@@ -530,9 +561,9 @@ that narrows the inner proof makes folds cheaper too.
 | the Poseidon2 segment channel is too slow to prove | the SIMD hasher's gate (§3.2) | slice 5, M0 |
 | our permutation is not the reference Poseidon2 | the reference arrangement and Plonky3's parameters adopted, checked on their vectors | slice 5, M0 |
 | the recursion AIR does not converge | sized in `recursion-air.md` (it converges at once [model]); then measured: a fold verifies two folds within the constant shape | slice 5, M1 |
-| signed multiplicities in the wiring are new soundness surface | the compiler's static checks; the audit of the wiring argument | slice 5, M1 |
+| signed multiplicities in the wiring are new soundness surface | the `Context`'s static checks; the audit of the wiring argument (`recursion-air.md` §1.1) | slice 5, M1 |
 | the gate compiler is wrong | equivalence tests (constraint ≡ gate) on every chip; tamper tests | slice 5, M1 |
-| the window kernel's leaf is too big | its leaf proved: ≤ 24 GiB, and its time within the budget in A.7; otherwise a smaller segment class | slice 5, M1 |
+| the window kernel's leaf is too big | its topology counted early (5.11), then its leaf proved within A.7; otherwise `p2` at 2^17 (+70% cells), narrower chips, or FRI fold step 3 in inner proofs (`p2` 55.3k → 49.2k rows) | slice 5, M1 |
 | the final wrap misses its gas or size | the real wrap verified on the JAM-only host (≤ 150M unmasked) and in the Wasm harness | slice 5, M1 |
 | the multi-step FRI path, or the new Blake2b channel, is unsound | a review plus tamper tests before the format admits them | slice 5, M1 |
 | masking the wrap costs more than (c)'s factor | one masked wrap: ≤ 24 GiB, ≤ 200M gas; leakage and soundness tests | slice 6 |
@@ -543,7 +574,7 @@ that narrows the inner proof makes folds cheaper too.
 
 | slice | milestone | content | estimate |
 |---|---|---|---|
-| **5** | **M0 Foundation** | our Stwo fork pinned, with the completeness fix and no_std gating; a shape per kernel; formats chosen at run time; the inner parameters, interaction PoW and both bit counts; the witness-input precompile and the io-hash with roots; a SIMD Poseidon2 hasher and the channel gate; the phone run | 5–7 weeks |
+| **5** | **M0 Foundation** | our Stwo fork pinned, with the completeness fix and no_std gating; a shape per kernel; formats chosen at run time, with lossless encodings; the inner parameters, interaction PoW and both bit counts; the witness-input precompile, the halt pc and the io-hash with roots; the reference Poseidon2, a SIMD hasher and the channel gate; the phone run | 6–9 weeks |
 | **5** | **M1 The recursion, unmasked, in tests** | `recursion-air.md` §10's eight steps: the gate VM; the gate compiler; the in-AIR verifier's pieces; COMPARE's leaf; the window kernel's and the solvency predicate's leaves; the fold and the fixed point; the final wrap with the Blake2b channel and `vos-final-verifier`; end to end with `vos-statement` and the golden fixtures | 17–24 weeks, plus reviews |
 | **6** | **M2 Masking** | R1–R8 on the wrap and on device proofs; 248-bit salts; leakage and soundness gates | 6–8 weeks |
 | **6** | **M3 Statements on chain** | the public-input model; `&self` witnessed reads to the space root at anchored cuts; the prover worker; the Kreivo pallet (P0 and P1); the JAM verifier agent | 8–12 weeks |
@@ -551,8 +582,13 @@ that narrows the inner proof makes folds cheaper too.
 | **7** | **M5 Device profile** | the device shape; lean kernels; narrow BLAKE2b | 6–10 weeks |
 | **7** | **M6 Signature chips** | SHA-256, SHA-512, the bignum chip, the P-256 and Edwards drivers | 8–14 weeks |
 
+- M0 runs on two tracks. Its critical path is 5.1 → 5.2 → 5.4, and
+  5.5 → 5.12 (`slice-5-proving.md`); 5.7 runs beside it.
+- M1's 17–24 weeks sit below spike 4b §8's 20–28 to a working tree for
+  our own AIR: the design and its counts are now measured, and
+  production hardening (the audit, masking) is slice 6.
 - The Clerk across spaces follows slice 6.
-- The total is about 56–85 engineer-weeks.
+- The total is about 57–87 engineer-weeks.
 
 ## 12. Decisions
 
@@ -575,7 +611,7 @@ that narrows the inner proof makes folds cheaper too.
 - the segment channel is chosen by the M0 gate (Poseidon2-M31 by
   default);
 - reads at the last anchored cut, to the space root;
-- runtime format selection;
+- runtime format selection, with lossless encodings;
 - interaction PoW;
 - 248-bit salts;
 - one padded fold shape as a format constant;
@@ -594,8 +630,8 @@ verifier's (`pvm/proof/verifier/src/lib.rs:561-675`, then Stwo's
 1. the domain, format and PCS configuration, then each chip's log size.
    These are constants of a leaf circuit;
 2. the preprocessed root (also a constant), then the main trace root;
-3. the boundary states: 13 registers in and out, pc and ts in and out,
-   and the two memory roots;
+3. the boundary states: the 13 registers in, the 13 out, pc and ts in,
+   pc and ts out, and the memory roots in and out, as one run of bytes;
 4. the interaction PoW nonce (new in M0), which comes before any logup
    challenge is drawn;
 5. the relation challenges: each active chip in `BASE_COMPONENTS` order
@@ -605,7 +641,9 @@ verifier's (`pvm/proof/verifier/src/lib.rs:561-675`, then Stwo's
    values in one mix, the DEEP coefficient, each FRI layer's root and
    coefficient, the last layer, the PoW nonce, and the queries.
 
-The boundary chips' claimed sums are recomputed from the boundary states
+The boundary states are mixed as bytes, every other value in 16-bit
+limbs (A.3). The boundary chips' claimed sums
+are recomputed from the boundary states
 (`pvm/proof/src/boundary_binding.rs:116-168`) as public logup terms. A
 transcript-equality test checks that the native and in-AIR channels draw
 alike.
@@ -619,17 +657,54 @@ alike.
   popcount, power_of_two, program_memory, range_multiplicity,
   register_memory_boundary, register_memory_closing, ristretto_comb.
 
-**A.3 The node output (M1).** A node outputs one 8-word Poseidon2-M31
-digest. Its preimage holds:
-- the program id (8);
-- `first` and `last` (1 each);
-- the entry and exit digests (8 each);
-- the entry and halt flags (1 each);
-- the io-hash (16 limbs);
-- the circuit hash (8).
+**A.3 Encodings and the node output (M0 for the encodings, M1 for the
+output).**
+- **Lossless encodings,** in every new format (A.4).
+  - **The boundary states** enter the transcript and the state digest
+    in the boundary chips' own byte-limb form (`boundary_binding.rs`),
+    one M31 a byte: a register or ts is 8 little-endian bytes, pc 4, a
+    memory root its 32. The transcript absorbs the 296 bytes in A.1's
+    order as one run. It then binds the exact tuples the public logup
+    terms use before any challenge is drawn, so the binding argument of
+    `boundary_binding.rs` carries over.
+  - **Range checks, kept local.** The leaf range-checks exactly the 32
+    bytes it combines: φ9..12, whose bytes become the io-hash's 16-bit
+    limbs by linear gates, the only lossy combination of boundary bytes.
+    Every other use is exact on M31 values: the transcript, the
+    148-word state digest, digest equality between neighbours, and the
+    entry and halt flags compared with constant bytes. A value ≥ 256
+    there cannot alias another state. That keeps the argument local to
+    the leaf, rather than resting on which chips range-check which
+    registers across the whole chain.
+  - **Every other u64** that enters a hash or a transcript is four
+    16-bit limbs, little-endian; a u32 is two; a 32-byte hash is 16.
+    The Poseidon2 channel's `mix_u64` (log sizes) and the PoW nonces
+    take the four limbs. Today they are `reduce(lo32), reduce(hi32)`
+    (`pvm/proof/src/poseidon2/mod.rs`), which folds a word ≥ p onto a
+    smaller one; that retires with the old formats. Stwo's Blake2s
+    channel hashes the eight bytes, so it is lossless already.
+  - The io-hash's 16 limbs come from φ9..12's bound bytes by linear
+    gates, `b0 + 256·b1`.
+- **A state digest** hashes 148 words, in order: the 13 registers (8
+  bytes each), pc (4), ts (8), the memory root (32).
+- **A node outputs** one 8-word Poseidon2-M31 digest. Its preimage
+  holds:
+  - the program id (8);
+  - `first` and `last` (1 each);
+  - the entry and exit digests (8 each);
+  - the entry and halt flags (1 each);
+  - the io-hash (16 limbs, φ9..12's);
+  - the fold-circuit word W (8).
 
-A parent takes the preimage as witness and re-hashes it to the child's
-digest.
+  A parent takes the preimage as witness and re-hashes it to the
+  child's digest. A leaf copies its program id and W from its witness;
+  the fold binds both (§3.4).
+- **Positions:** a leaf's `(p, p)` is a free witness. Continuity through
+  the ts-bearing digests is what orders segments, and `first = 0` is
+  checked only for the wrap's refusal.
+- **The wrap's public words:** the program id (8 M31) and the io-hash
+  (16 limbs), 24 words at the wrap's reserved addresses 0–23, one word
+  a wire. Its zero, one and `u` follow them.
 
 **A.4 The format registry (M0).** New numbers, not 24 or 25:
 - segment proofs (Poseidon2-M31, or Blake2s-M31 if the M0 gate says so);
@@ -638,16 +713,23 @@ digest.
 - the final wrap (Blake2b-256, masked);
 - credential proofs.
 
-Each entry holds its channel, its parameters and both bit counts.
+Each entry holds its channel, its parameters and both bit counts. Every
+one uses A.3's encodings.
 
 **A.5 What may leave the prover role (slice 6):**
 - the `Statement`;
 - the final proof.
 
-`Attest` records keep the program, the arguments, the witness, the window
-and the final proof's hash. Segment, leaf and fold proofs appear in no
-log entry, blob or message that leaves the role. The carrier audit
-checks every one of those carriers.
+`Attest` (`agent/wire/src/result.rs:351`) holds `{ program, arguments,
+output }` today.
+- M0 adds `witness_input: Vec<u8>`: the exact byte stream the kernel
+  read, in call order, at most 4 MiB. A large result travels as a blob
+  (slice 4's 4.4a).
+- Slice 6 adds the window, then the final proof's hash.
+
+Segment, leaf and fold proofs appear in no log entry, blob or message
+that leaves the role. The carrier audit checks every one of those
+carriers.
 
 **A.6 The golden fixtures (M1, extended in slice 6):**
 - a valid statement and proof;
@@ -660,13 +742,19 @@ checks every one of those carriers.
 - an unaccepted format;
 - a wrong io-hash.
 
-Every venue judges them alike.
+Every venue judges them alike. A generator in the M0 pipeline makes
+them, regenerated at each format bump, and stores them under
+`pvm/proof/fixtures` (about 1.2 MB).
 
-**A.7 Budgets per node (M1: measured, then pinned):**
+**A.7 Budgets per node (M1: measured, then pinned).** Heavy tests run
+under `systemd-run` with these caps as `MemoryMax`.
 
 | node | rows | memory | time |
 |---|---|---|---|
-| segment | its class | ≤ 24 GiB | — |
-| leaf | ≤ the padded shape | ≤ 24 GiB | ≤ 1× the segment's proving (target 0.13–0.5×) |
-| fold | the padded shape | ≤ 24 GiB | ≤ the leaf's |
-| wrap | ≤ 2^17 | ≤ 24 GiB masked | — |
+| segment (the window kernel's) | its class | ≤ 24 GiB | ≤ 8 s, once the SIMD hasher lands |
+| leaf | ≤ the padded shape | ≤ 4 GiB | 1.2–2.6 s [projected]; ≤ 1× the segment's proving (target 0.13–0.5×) |
+| fold | the padded shape | ≤ 4 GiB | 1.2–2.6 s [projected]; ≤ the leaf's |
+| wrap | ≤ 2^17 | ≤ 8 GiB unmasked | 4.4–9.5 s [projected] |
+
+A window of 16 segments proves end to end in about 3–5 minutes
+[projected].

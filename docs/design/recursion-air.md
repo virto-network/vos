@@ -1,9 +1,9 @@
 # The recursion AIR
 
-The narrow, gate-based recursion AIR behind `proving.md` §3.1: its
-components, its circuit model, the gate compiler, the in-AIR verifier, the
-leaf, the fold and its fixed point, the final wrap and its native verifier,
-and the build of slice 5's M1.
+Design, draft 2. The narrow, gate-based recursion AIR behind `proving.md`
+§3.1: its components, its circuit model, the gate compiler, the in-AIR
+verifier, the leaf, the fold and its fixed point, the final wrap and its
+native verifier, and the build of slice 5's M1.
 
 - **Status.** [decided] marks the owner's decisions (`proving.md` §12);
   everything else is [proposed].
@@ -23,6 +23,13 @@ and the build of slice 5's M1.
     the counting crate `count/` and its logs `logs/count.log`,
     `logs/permute-bench.log`;
   - `R/` = `research/slice-5/`.
+- **History:**
+  - draft 1 sized the AIR from the spike's counts;
+  - draft 2 folds in Fable's review of the planning set
+    (`R/plan7-review.md`): every fold child carries the fold's
+    circuit-hash word (§6), the encodings are lossless (§4.1, §4.2), the
+    transcript has the interaction PoW (§4.1), the wiring argument is
+    written (§1.1), and in-AIR FRI fold step 3 stays a lever (§4.4).
 
 ## 0. Summary
 
@@ -56,11 +63,10 @@ and the build of slice 5's M1.
    (tallest 2^15 ≤ 2^17) [model]: 2.2–4.9 GiB at blowup 64 [projected], about
    85M JAM gas with Blake2b-256 in software, 64M through `0x400`, 117–119M
    masked, about 122 KB unmasked [model].
-8. **Corrections to `proving.md`:** a smaller segment class does not shrink a
-   leaf (§5); the native transcript mixes the boundary states after the trace
-   root and draws relation challenges in chip order (§4.1); one permutation a
-   row at degree 3 is 300 columns, not 160 (§1.3); vos's permutation is not the
-   reference Poseidon2 arrangement (§11, R2).
+8. **Every node carries the fold's circuit-hash word** (§6): a fold requires
+   each child to carry its own word, and the wrap pins the root's, so every
+   fold in the tree is the true fold circuit and every other node a leaf of
+   the program.
 
 ## 1. The components
 
@@ -77,10 +83,19 @@ and the build of slice 5's M1.
     guessed value consumed here first) and k other operands use it;
   - **0**: a free witness that touches no other gate (a Merkle sibling).
 - **Each address is yielded exactly once,** with the multiplicity of its uses;
-  the compiler asserts this and that each relation's total multiplicity stays
+  the `Context` asserts this and that each relation's total multiplicity stays
   below p. Both are static, so the in-AIR check StarkWare needs for dynamic
   component sizes (`UP/stark_verifier/src/verify.rs:238-311`) has no
   counterpart here.
+- **Why it is sound** (the text §11's R12 audits). The address is a tuple limb
+  and preprocessed, as every multiplicity is. By the logup lemma the
+  relation's sum vanishes, but for the Schwartz–Zippel error, only if each
+  distinct tuple's multiplicities cancel, and with the total below p that is
+  an integer cancellation. An address has one yield of −k and k uses of +1,
+  so every use carries the yielded value: a use with another value is a tuple
+  of its own, with nothing to cancel it. Tuples at different addresses never
+  cancel. The single yield per address is static, and the circuit hash pins
+  the wiring, as StarkWare's does.
 - **Equality is a use.** A computed value that must equal another is produced
   by a gate whose output lookup uses the other's address. So there is no
   equality component, and no guess costs a row of its own: StarkWare
@@ -89,7 +104,7 @@ and the build of slice 5's M1.
   QM31 component has 587,275 rows (spike 4b's `fold-b2.log`).
 - **Reserved addresses** follow StarkWare (`UP/circuits/src/context.rs:19-22`,
   `UP/circuit_common` `N_RESERVED`): 0 zero, 1 one, 2 `u`, 3–4 the node's
-  output digest (two packed wires).
+  output digest (two packed wires). The wrap's differ (§7).
 
 ### 1.2 The components, measured
 
@@ -109,17 +124,18 @@ masking variant (c) applies unchanged (`R/spike2-masking.md` §3b).
 
 ### 1.3 `p2`: Poseidon2-M31, one permutation a row
 
-- **The permutation** is vos's exactly: width 16, R_F = 8, R_P = 14, rate 8,
-  its Grain constants, and its round order: add constants, the linear layer,
-  then the S-box (`P/src/poseidon2/mod.rs:40-44`, `:283-307`).
+- **The permutation** is measured as vos's: width 16, R_F = 8, R_P = 14,
+  rate 8, its Grain constants, and its round order: add constants, the linear
+  layer, then the S-box (`P/src/poseidon2/mod.rs:40-44`, `:283-307`). M0
+  replaces it with the reference arrangement and Plonky3's constants (§11,
+  R2). The shape survives: the final `M_E` is linear, there are 142 S-boxes
+  either way, and `p2_check` is re-run.
 - **The S-box at degree 3:** `a = y²` and `out = a²·y`, two columns per S-box.
   The 15 untouched words of a partial round stay linear expressions. That is
   16 input columns plus 142 × 2 = **300 columns, the floor at degree 3**: y⁵
   cannot be reached from a linear y without one committed intermediate. The
   archive's 442 used three columns per S-box at degree 2
   (`AR:zkpvm/tests/recursion_common/mod.rs:62-65`, `:427-435`).
-  `proving.md` §8's "about 160 columns" for a permutation a row does not hold
-  at degree 3; two rows a permutation would.
 - **Modes chain rows instead of wiring them.** The last round's 16 outputs are
   also read at offset −1, so a row's input can be the previous row's output.
   One preprocessed selector a row picks the input
@@ -207,7 +223,9 @@ masking variant (c) applies unchanged (`R/spike2-masking.md` §3b).
   does. A child whose digest differs from the parent's witness fails its own
   logup sum.
 - **Padding** appends inert rows (selectors and multiplicities zero) up to the
-  component sizes, as `UP/circuit_common/src/finalize.rs:58-78`.
+  component sizes, as `UP/circuit_common/src/finalize.rs:58-78`. A `p2`
+  padding row still meets the round constraints, so trace generation fills it
+  with the permutation of its zero input.
 
 ## 3. The gate compiler
 
@@ -284,30 +302,51 @@ pin, and a transcript-equality test compares the in-AIR channel with
 1. the FS domain, format and PCS config (`P/src/proof.rs:238-252`), then each
    chip's log size;
 2. the preprocessed root, then the main trace root;
-3. **the boundary states**: 13 registers in, 13 out, pc and ts in and out, the
-   two memory roots (`P/verifier/src/lib.rs:592-615`);
-4. **the relation challenges**: each active chip in `BASE_COMPONENTS` order
+3. **the boundary states**: 13 registers in, 13 out, pc and ts in, pc and ts
+   out, the two memory roots (`P/verifier/src/lib.rs:592-615`);
+4. **the interaction PoW nonce**, before any logup challenge is drawn (new in
+   M0; the model counts it);
+5. **the relation challenges**: each active chip in `BASE_COMPONENTS` order
    draws its relations, each relation once, at first use
    (`P/src/lookups/mod.rs:117-125`, `P/src/framework_access.rs:78-87`);
-5. the claimed sums, the interaction root; then the composition coefficient,
+6. the claimed sums, the interaction root; then the composition coefficient,
    the composition root, the OODS point, all sampled values in one mix, the
    DEEP coefficient, each FRI layer's root and folding coefficient, the last
    layer, the PoW nonce, the queries (`P/src/proof.rs:883-920`).
 
 Item 1 and the preprocessed root are constants of a leaf circuit, so the
-in-AIR channel starts from their digest as a constant. **`proving.md` A.1
-lists the boundary states before the trace root and A.2 orders challenges by
-`relations.rs`; the code does neither.** The leaf follows the code, or M0
-changes the code and the format together. The boundary chips' claimed sums are recomputed from the
-boundary states (`P/src/boundary_binding.rs:116-168`) as public logup terms:
-about 800 QM31 rows [model].
+in-AIR channel starts from their digest as a constant. `proving.md` A.1
+follows the code.
+
+**The boundary states are mixed as bytes** (`proving.md` A.3): each byte of
+the boundary chips' tuples (`P/src/boundary_binding.rs:262-268`) is one M31,
+and item 3 absorbs the 296 as one run, 37 permutations against today's 38
+per-value absorbs. The transcript so binds the exact tuples the public logup
+terms use before any challenge is drawn. The leaf range-checks only the 32
+bytes of φ9..12, which it combines into the io-hash's limbs; every other
+use of the bytes is an exact M31 comparison or hash (`proving.md` A.3).
+Other u64 values (log sizes, nonces) are four 16-bit limbs. The boundary
+chips' claimed sums are recomputed from the tuples
+(`P/src/boundary_binding.rs:116-168`) as public logup terms: about 800 QM31
+rows [model].
+
+**The leaf's own work** [model]:
+- the entry and exit digests over 148 bytes each, 19 permutations apiece, and
+  the output preimage, 7: about 45 permutation rows, some 25 beyond
+  `SP/logs/count.log`'s allowance;
+- the io-hash's 16 limbs from φ9..12's bytes, `b0 + 256·b1`;
+- the flags checked against leaf-circuit constants (`proving.md` §3.3).
 
 ### 4.2 The channel
 
 Exactly `Poseidon2M31Channel` (`P/src/poseidon2/mod.rs:489-619`): absorb into
 `[8, 16)` over the digest in `[0, 8)` (channel modes), squeeze
 `digest ‖ n_draws ‖ 3` (wired mode), PoW as two permutations with
-`trailing_zeros(s2[0]) ≥ n` checked by decomposing its high bits. The absorb
+`trailing_zeros(s2[0]) ≥ n` checked by decomposing its high bits. In the new
+formats the boundary states are absorbed as bytes (§4.1), `mix_u64` absorbs
+four 16-bit limbs, and the PoW nonce enters as four; today the last two are
+`reduce(lo32), reduce(hi32)` (`P/src/poseidon2/mod.rs:576-577`, `:592-597`),
+which folds a word ≥ p onto a smaller one. The absorb
 carries no length or tag (`absorb([a]) = absorb([a, 0])`,
 `P/src/poseidon2/mod.rs:531-547`); that is sound only because the transcript's
 shape is fixed, and a circuit pins it.
@@ -321,7 +360,13 @@ shape is fixed, and a circuit pins it.
   and query on it, `R/spike4b-stack.md` §2.3).
 - **Per query and tree:** `⌈(n+1)/8⌉` leaf rows chained, then one node row a
   level to the lifting height, the last using the root's address. Paths are
-  not deduplicated across queries: the structure stays fixed.
+  not deduplicated across queries: the structure stays fixed, and a repeated
+  query position is verified twice, harmlessly.
+- **The witness builder** expands Stwo's decommitment, whose `hash_witness`
+  sends each sibling once across queries
+  (`ST/stwo/src/core/vcs_lifted/verifier.rs:155-185`): `vos-recair`'s
+  `expand_decommitment` replays that walk and records each query's full path,
+  and the FRI layers' siblings likewise.
 - **Query bits** come from the drawn word: limb extraction, a 31-bit
   decomposition (63 rows a query), and the query's circle point from its bits
   (4 rows a bit) [model].
@@ -331,9 +376,10 @@ shape is fixed, and a circuit pins it.
 - Layer heights and folds follow `ST/stwo/src/core/fri.rs:107-200`: the first
   layer at the lifting height, then line layers down to the last layer.
 - **Fold step 1:** the query's and its sibling's leaves (one permutation each),
-  then the path. **Fold step above 1:** packed leaves of four QM31 (three
-  permutations), the coset's subtree, then the path
-  (`ST/stwo/src/core/vcs_lifted/verifier.rs:11-16`).
+  then the path. **Fold step above 1,** a lever for inner proofs that M1 does
+  not build (§5): packed leaves of four QM31 (three permutations), the coset's
+  subtree, then the path (`ST/stwo/src/core/vcs_lifted/verifier.rs:11-16`).
+  No inner proof uses it, and the wrap's is verified natively.
 - **The fold** is `(own + sib) + α·(own − sib)·t`, with `t` the inverse of the
   query point's x (or y in the first layer); the sign of an odd query cancels.
   About 7 rows a pair [model]. The folded value is used by the next layer's
@@ -382,10 +428,10 @@ permutations; 1,091 `h8`; 1,139 QM31 [model].
 ## 5. Sizing the leaves
 
 Inner parameters: blowup 4, 39 queries, PoW 26, interaction PoW 24, FRI fold
-step 1, last layer 1 (`proving.md` §4). Rows [model]; memory and time
-[projected] at 5.0–10.9 B per extended cell and 51–110M extended cells per
-second, the range of spike 4b's circuit-prover runs and spike 4a's proxy on
-our pinned Stwo (`SP/logs/count.log`, "prover throughput").
+step 1, log last-layer degree bound 0 (`proving.md` §4). Rows [model]; memory
+and time [projected] at 5.0–10.9 B per extended cell and 51–110M extended
+cells per second, the range of spike 4b's circuit-prover runs and spike 4a's
+proxy on our pinned Stwo (`SP/logs/count.log`, "prover throughput").
 
 Every leaf has the recursion AIR's 458 columns; what varies is the rows.
 
@@ -405,13 +451,16 @@ Every leaf has the recursion AIR's 458 columns; what varies is the rows.
   on Blake2s at 32k (`R/audit.md` §2.3).
 - **A leaf's size is the inner proof's width times its queries, not its
   length.** Four times longer segments add 4% of permutation rows (deeper
-  paths, two more FRI layers). So `proving.md` §3.3's fallback, a smaller
-  segment class for a kernel whose leaf does not fit, does not work: the
-  levers are width (the shape per kernel, narrower chips), or a larger padded
-  shape. Larger segments make recursion cheaper per step.
+  paths, two more FRI layers), so a smaller segment class does not shrink a
+  leaf. For a kernel whose leaf does not fit, the levers are width (the shape
+  per kernel, narrower chips), `p2` at 2^17 (+70% cells, tallest unchanged),
+  or FRI fold step 3 in inner proofs (`p2` 55.3k → 49.2k rows, the table's
+  fourth row). Larger segments make recursion cheaper per step.
 - **Headroom:** a kernel-like shape fits up to about 9,300 columns (+24%)
   [model]; Poseidon2 rows bind first. Without the shape per kernel (13,037
   columns) every node would double.
+- **The byte-form digests** (§4.1) add about 25 `p2` rows to each kernel leaf
+  [model]; every padded shape above holds, and the headroom is unchanged.
 - **Poseidon2 hashing on the prover.** A leaf proof commits about 25M
   permutations (one per eight extended cells, the lifted leaf's prefix reuse,
   `P/src/poseidon2/mod.rs:716-760`, plus nodes and FRI) [model]. vos's scalar
@@ -428,12 +477,20 @@ Every leaf has the recursion AIR's 458 columns; what varies is the rows.
 **The fold node** (`proving.md` §3.4) is a VOS node over StarkWare's
 multiverifier structure (`UP/circuit_multiverifier/src/verify.rs:52-90`):
 - for each child: its preprocessed root as a witness, its circuit hash
-  recomputed and selected from the program's leaf-circuit hashes or the fold
-  circuit's hash (a witness word, copied to the output); the STARK verified
-  (§4) with the child's outputs as public terms; its preimage re-hashed to the
-  digest;
-- the program id recomputed from its preimage, both children's equal;
-  `left.last + 1 = right.first`, `left.exit = right.entry`; entry flag from the
+  recomputed; the STARK verified (§4) with the child's outputs as public
+  terms; its preimage re-hashed to the digest;
+- **the circuit set:** every node's preimage carries one word W; a leaf copies
+  it from its witness. For each child the fold requires the recomputed hash ∈
+  L ∪ {W}, with L the program id's leaf-circuit hashes, **and**
+  `child.W == W`, and it copies W to its output. The wrap checks
+  `root.W == H_fold` (§7), so by induction every fold in the tree carries
+  `H_fold`, and every fold child is a leaf of the program or a true fold.
+  Without `child.W == W`, a true fold could carry a foreign `W'` and accept
+  a child of any circuit hashing to `W'`;
+- **the program:** the id recomputed from its preimage (a witness), both
+  children's carried ids equal to it, and L taken from that preimage. A
+  leaf's id is a witness, so this is what binds it;
+- `left.last + 1 = right.first`, `left.exit = right.entry`; entry flag from the
   left, halt flag and io-hash from the right; the output preimage hashed to
   addresses 3–4. About 37 permutation and 110 QM31 rows beyond the two
   verifications [model].
@@ -450,9 +507,9 @@ multiverifier structure (`UP/circuit_multiverifier/src/verify.rs:52-90`):
 - **The padded shape** (a format constant, `proving.md` A.4): `p2` 2^16,
   `qm31` 2^17, `h8` 2^16; 458 columns in the order of §1.2 and their
   preprocessed ids; the `Gate` relation; reserved addresses 0–4; blowup 4, 39
-  queries, PoW 26, interaction PoW 24, fold step 1, last layer 1, the
-  Poseidon2-M31 channel. 33.2M cells, tallest 2^17: every leaf and fold proves
-  this many.
+  queries, PoW 26, interaction PoW 24, fold step 1, log last-layer degree
+  bound 0, the Poseidon2-M31 channel. 33.2M cells, tallest 2^17: every leaf
+  and fold proves this many.
 - **It converges at once:** iterating "shape → what a fold of two such
   children needs" from the kernel's leaf returns the same shape on the first
   step [model]. A fold alone reaches its own fixed point, 2^15 / 2^16 / 2^12
@@ -486,9 +543,12 @@ the width divergence" (`:765`) read the first level's cost, Θ(queries ×
 ## 7. The final wrap
 
 A 1-to-1 node over the root fold (`proving.md` §3.5): it verifies the root in
-circuit, pins the fold circuit's true hash as a constant, refuses a root
+circuit, checks `root.W == H_fold` against its constant, refuses a root
 without `first = 0`, the entry flag and the halt flag, and outputs the program
-id and the io-hash as its public logup terms.
+id (8 M31) and the io-hash (16 limbs of 16 bits, as the root's preimage
+carries them) as its public logup terms. Those 24 words sit at its reserved
+addresses 0–23, one word a wire, with zero, one and `u` after them; the leaf
+and fold layout of §1.1 is unchanged.
 
 | | value | tag |
 |---|---|---|
@@ -502,8 +562,9 @@ id and the io-hash as its public logup terms.
 
 - The gas uses spike 4a's fit within 5.8%
   (`gas ≈ −4.2M + 59.3k·C + 2,171·q·C + 17,183·P + 9,376·F`) at 458 columns,
-  18 queries and 4 FRI layers. `proving.md` §3.5's 65–70M assumed about 320
-  columns; its 6–13 GiB assumed log 17.
+  18 queries and 4 FRI layers. The fit is on a proxy of at most 400 columns
+  and a trivial AIR; 458 columns and 313 degree-3 constraints are a mild
+  extrapolation, well under the 150M gate.
 - **A narrower wrap**, if gas must fall further: the wrap's own AIR need not be
   the fold's. A `p2` at two rows a permutation (about 180 columns) would bring
   the wrap to about 280 columns and about 67M gas [model], at the price of a
@@ -511,9 +572,14 @@ id and the io-hash as its public logup terms.
 
 ## 8. `vos-final-verifier`
 
-No_std, stable Rust, for x86, wasm32 and riscv64em-javm (`proving.md` §3.6):
-- **`vos-recair-air`**, the three components' constraint bodies, shared with
-  the prover (the bodies `SP/count/src/rec.rs` states);
+At `pvm/proof/final-verifier`, no_std, for x86, wasm32 and riscv64em-javm
+(`proving.md` §3.6). The source uses no nightly feature: it builds on stable
+for x86 and wasm32, and the JAM build runs on the pinned nightly with
+build-std. It holds:
+- **`vos-recair-air`** (`pvm/proof/recair-air`), the three components'
+  constraint bodies, no_std, with no prover dependency, shared with the
+  prover `vos-recair` (`pvm/proof/recair`; the bodies `SP/count/src/rec.rs`
+  states);
 - the wrap's constants: its preprocessed root, component log sizes, column
   ids, the parameters of §7, the format number;
 - Stwo's core verifier at the pin, FRI fold step 3 and a 2^6 last layer
@@ -521,7 +587,8 @@ No_std, stable Rust, for x86, wasm32 and riscv64em-javm (`proving.md` §3.6):
 - the Blake2b-256 Merkle hasher and channel, through the host where one exists
   (VOS `0x400`, Kreivo's `blake2_256`), in software otherwise;
 - the public logup sum from the program id, the io-hash, `u` and `one`;
-- `vos-statement`'s decode and the io-hash recomputation;
+- `vos-statement`'s decode (`pvm/proof/statement`) and the io-hash
+  recomputation;
 - lean as spike 4a's: no preflight, components built once, a fixed-layout
   decode (`R/spike4a-final-gas.md` §4).
 
@@ -541,7 +608,7 @@ about 0.4 MB PVM, 0.25–0.3 MB Wasm [projected].
 | `circuits/src/{simd,extract_bits}.rs` | packed bit extraction | per query, unpacked for Merkle bits |
 | `circuit_common/src/{preprocessed,finalize}.rs` | preprocessed address columns, padding to targets, `elementwise_max` | our components' columns |
 | `stark_verifier/src/verify.rs` | the verification flow | our transcript order (§4.1), interaction PoW, no dynamic sizes |
-| `stark_verifier/src/{merkle,fri,select_queries,circle}.rs` | per-query paths, layer walk, query points | Poseidon2 chained rows; fold step above 1; lifted leaf order at compile time |
+| `stark_verifier/src/{merkle,fri,select_queries,circle}.rs` | per-query paths, layer walk, query points | Poseidon2 chained rows; lifted leaf order at compile time |
 | `stark_verifier/src/{oods,logup,constraint_eval}.rs` | periodicity points, line coefficients, logup terms | DEEP through `h8`; constraints from the compiler |
 | `circuit_verifier/src/{statement,circuit_hash,verify}.rs` | public logup terms of outputs and `u`; circuit hash; the build pattern | Poseidon2 |
 | `circuit_multiverifier/src/verify.rs`, `circuit_params/src/lib.rs:201-215` | the k-to-1 node; the fixpoint loop | the VOS fold checks |
@@ -577,35 +644,39 @@ Ordered so feasibility is retired first. Weeks are engineer-weeks
 
 | # | deliverable | tests | gate | weeks |
 |---|---|---|---|---|
-| 1 | **The gate VM:** `vos-recair` with `Context`, the three components and their trace generation, the `Gate` relation with signed multiplicities, constants, padding, preprocessing, the circuit hash; the bodies of §1 | random circuits proved and verified natively on the Poseidon2 channel; yields exactly once; tamper per component and mode; the permutation against `poseidon2::permute` | a 10k-gate circuit proves and verifies; degree ≤ 3 audited; a three-component multi-fraction logup at three log sizes proves (§11, R5); `vos-final-verifier`'s skeleton builds on stable no_std | 3–4 |
-| 2 | **The gate compiler** | §3's four tests on all 32 chips | 32/32 equivalent; counts within 1% of `SP/logs/count.log` | 1–2 |
-| 3 | **The in-AIR verifier's pieces:** channel, lifted Merkle, FRI (fold step 1 and 3), DEEP with `h8`, OODS, logup sums | each against the native code on recorded data; transcript equality with `Poseidon2M31Channel`'s recorder | every piece accepts real data and refuses each tamper | 3–4 |
-| 4 | **COMPARE's leaf** (first gate) | a COMPARE proof verified in circuit, the circuit proved and verified natively; tampered OODS sample, queried value, sibling, FRI value and nonce refused | accepted; rows within 15% of 8,488 / 10,869 / 273; ≤ 1 s | 1–2 |
-| 5 | **The window kernel's leaf**, and the solvency predicate's: boundary states, entry and exit digests, the A.3 output | spike 3's real segment on the Poseidon2 channel; in-circuit and native transcripts equal | rows within the padded shape; ≤ 24 GiB; ≤ 1× the segment's proving (target 0.13–0.5×) | 2–3 |
-| 6 | **The fold and the fixed point** | a fold of two leaves, a fold of two folds within the constant shape; a tree over four segments; refusals: wrong program, gap, broken continuity, prefix, mid-start, wrong child circuit | the fold verifies two folds in the shape; memory and time of a leaf | 2–3 |
-| 7 | **The final wrap:** Blake2b-256 Merkle and channel in our Stwo fork, fold step 3 admitted, the wrap circuit, `vos-final-verifier` | the fork's review; tamper tests on fold step 3 and Blake2b; Wasm and JAM-only host verification | ≤ 150M gas unmasked on the JAM-only host; ≤ 2^17 rows; ≤ 24 GiB | 3–4 |
+| 1 | **The gate VM:** `vos-recair` (`pvm/proof/recair`) with `Context` and its static checks (§1.1), the three components and their trace generation, padding rows filled, the `Gate` relation with signed multiplicities, constants, padding, preprocessing, the circuit hash; the bodies of §1 in `vos-recair-air` | random circuits proved and verified natively on the Poseidon2 channel; yields exactly once; tamper per component and mode; the permutation against `poseidon2::permute` | a 10k-gate circuit proves and verifies; degree ≤ 3 audited; a three-component multi-fraction logup at three log sizes proves (§11, R5); `vos-final-verifier`'s skeleton builds no_std (stable for x86 and wasm32, the pinned nightly for JAM) | 3–4 |
+| 2 | **The gate compiler**, beside step 1 | §3's four tests on all 32 chips | 32/32 equivalent; counts within 1% of `SP/logs/count.log` | 1–2 |
+| 3 | **The in-AIR verifier's pieces:** channel, lifted Merkle with `expand_decommitment`, FRI (fold step 1), DEEP with `h8`, OODS, logup sums | each against the native code on recorded data; transcript equality with `Poseidon2M31Channel`'s recorder | every piece accepts real data and refuses each tamper | 3–4 |
+| 4 | **COMPARE's leaf** (first gate), and **the window kernel leaf's topology** (`Context<NoValue>`, no proof) | a COMPARE proof verified in circuit, the circuit proved and verified natively; tampered OODS sample, queried value, sibling, FRI value and nonce refused; the topology's rows pinned per term of `SP/logs/count.log`, not only in total | accepted; rows within 15% of 8,488 / 10,869 / 273; ≤ 1 s; the topology within 2^16 / 2^17 / 2^16 | 1–2 |
+| 5 | **The window kernel's leaf**, and the solvency predicate's: boundary states mixed as bytes, entry and exit digests, the flags, the A.3 output | spike 3's real segment on the Poseidon2 channel; in-circuit and native transcripts equal; a tampered boundary byte refused | rows within the padded shape; ≤ 4 GiB; ≤ 1× the segment's proving (target 0.13–0.5×) | 2–3 |
+| 6 | **The fold and the fixed point** | a fold of two leaves, a fold of two folds within the constant shape; a tree over four segments; refusals: wrong program, gap, broken continuity, prefix, mid-start, wrong child circuit, a child carrying a foreign word, a leaf carrying a wrong program id | the fold verifies two folds in the shape; memory and time of a leaf | 2–3 |
+| 7 | **The final wrap:** Blake2b-256 Merkle and channel in our Stwo fork, fold step 3 admitted, the wrap circuit, `vos-final-verifier` | the fork's Fable review, then its push to olanod/stwo; tamper tests on fold step 3 and Blake2b; Wasm and JAM-only host verification | ≤ 150M gas unmasked on the JAM-only host; ≤ 2^17 rows; ≤ 8 GiB unmasked | 3–4 |
 | 8 | **End to end:** `vos-statement`, the window statement and the solvency predicate, golden fixtures (A.6) | every venue judges the fixtures alike | both statements verified natively, in Wasm and on JAM | 2 |
 | | **total** | | | **17–24** |
 
-Within M1's 20–28 weeks (`proving.md` §11), with review time on top. Step 1
-depends on M0's SIMD Poseidon2 hasher for speed, not for correctness.
+These are M1's 17–24 weeks (`proving.md` §11), with review time on top. They
+sit below spike 4b §8's 20–28 to a working tree for our own AIR: the design
+and its counts are now measured, and production hardening (the audit,
+masking) is slice 6. Step 1 depends on M0's SIMD Poseidon2 hasher for speed,
+not for correctness, and on the fork's completeness fix: the recursion AIR's
+preprocessed tree (2^17) sits below its lifting height (2^20).
 
 ## 11. Risks, and the measurement that retires each
 
 | # | risk | measurement |
 |---|---|---|
 | R1 | **The recursion prover's Poseidon2 hashing**: about 25M permutations a leaf proof, 2.5–7.5 s on eight threads at today's scalar 0.8–2.4 µs [measured, model], one to six times the rest of the leaf | M0's SIMD hasher: a leaf proof's commitment ≤ 0.5 s; otherwise every node takes ×2–4 |
-| R2 | **vos's permutation is not the reference Poseidon2:** each linear layer precedes its S-box layer, so there is no final `M_E`, and the full-to-partial and partial-to-full boundaries swap `M_E` and `M_I` (`P/src/poseidon2/mod.rs:283-307` against Plonky3's `poseidon2/src/lib.rs:139-143`, `external.rs:288-336`). It is Stwo's example, whose TODOs flag the order and the internal diagonal (`ST/examples/src/poseidon/mod.rs:125-126`, `:156`) | a cryptographic review of the variant, or the reference order adopted in M0, before the format and the recursion AIR pin it; every commitment changes once |
+| R2 | **vos's permutation is not the reference Poseidon2:** each linear layer precedes its S-box layer, so there is no final `M_E`, and the full-to-partial and partial-to-full boundaries swap `M_E` and `M_I` (`P/src/poseidon2/mod.rs:283-307` against Plonky3's `poseidon2/src/lib.rs:139-143`, `external.rs:288-336`). It is Stwo's example, whose TODOs flag the order and the internal diagonal (`ST/examples/src/poseidon/mod.rs:125-126`, `:156`) | the reference arrangement adopted in M0 (Plonky3 pinned at `f983316`, checked on its vectors) before the format and the recursion AIR pin it; every commitment changes once |
 | R3 | **The gate compiler is wrong** | §3's tests on all 32 chips, gate ≡ verifier on real proofs |
 | R4 | **The in-AIR verifier departs from the native one** (periodicity points, lifted leaf order, transcript order, PoW) | piecewise differential tests on recorded transcripts; tamper tests; the external audit (`proving.md` §4) |
 | R5 | **The archive's failure with two multi-fraction components** (`AR:zkpvm/tests/merkle_decommit.rs:772-777`, never root-caused) | step 1's three-component test; vos-core's 22-chip Poseidon2 segment proofs already prove (`R/audit.md` §2.3), so it is likely the archive's own |
 | R6 | **A wider kernel outgrows the shape** (about 9,300 columns) | each kernel's leaf rows computed at derive time from its shape; a kernel over the limit is refused or takes a larger shape (`p2` 2^17, +70% cells, tallest unchanged) |
-| R7 | **The model misses rows** (query points, twiddles, DEEP per point are estimates) | steps 4–5 count real rows; the leaf has 16% headroom in `p2`, 26% in `qm31` |
+| R7 | **The model misses rows** (query points, twiddles, DEEP per point are estimates) | step 4 counts the kernel leaf's topology, term by term, and step 5 proves it; the leaf has 16% headroom in `p2`, 26% in `qm31` |
 | R8 | **Time and memory** come from other provers' rates | steps 4–6 measure |
 | R9 | **Fold step 3 or the Blake2b channel is unsound** | the fork's review and tamper tests before the format admits them (step 7) |
 | R10 | **The wrap's gas**: the fit is on a one-component proxy | step 7 verifies the real wrap on the JAM-only host |
-| R11 | **The final verifier needs nightly** (the pin's `portable_simd` is prover-only) | step 1 builds the skeleton on stable for wasm32 and riscv64em-javm |
-| R12 | **Signed multiplicities**: a yield by a first consumer is new soundness surface | the compiler's static checks; the audit of the wiring argument |
+| R11 | **The final verifier needs nightly** (the pin's `portable_simd` is prover-only; riscv64em-javm needs build-std) | step 1 builds the skeleton with no nightly feature in the source: on stable for x86 and wasm32, on the pinned nightly with build-std for JAM |
+| R12 | **Signed multiplicities**: a yield by a first consumer is new soundness surface | §1.1's argument; the `Context`'s static checks; the audit of that argument |
 | R13 | **Masking the wrap** (slice 6) costs more than (c)'s ×1.6 | one masked wrap: ≤ 24 GiB, ≤ 200M gas (`proving.md` §10) |
 
 ## Appendix: reproduce
