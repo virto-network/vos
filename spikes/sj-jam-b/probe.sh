@@ -1,19 +1,21 @@
 #!/usr/bin/env bash
 # The probe on a local PolkaJam testnet. Commands:
 #   probe.sh build                    build the guest and the tool, link the blob
-#   probe.sh testnet <run-dir>        start polkajam-testnet (interpreter) there
+#   probe.sh testnet <run-dir>        start polkajam-testnet there
 #   probe.sh create                   create the service (prints its id)
 #   probe.sh item <service> <payload> [jamt item options...]
 #   probe.sh get <service> <key>      a storage value, in full, as hex (RPC)
 #   probe.sh provide <service>        provide the preimage `S` solicits
 #   probe.sh compare <service> <key>  PolkaJam's records beside VOS's
 #   probe.sh local <payload>          refine on VOS's JAM-only host
-# POLKAJAM names the directory holding the PolkaJam binaries.
+# POLKAJAM names the directory holding the PolkaJam binaries. POLKAVM_BACKEND
+# picks the testnet's PVM backend, `interpreter` (the default) or `compiler`.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
 POLKAJAM="${POLKAJAM:-$HOME/.cache/vos/polkajam/nightly-2026-10-13/polkajam-nightly-2026-10-13-linux-x86_64}"
 RPC="${RPC:-http://localhost:19800}"
+backend="${POLKAVM_BACKEND:-interpreter}"
 tool="$here/tool/target/release/sj-probe-tool"
 blob="$here/sj-probe.jam"
 
@@ -44,11 +46,11 @@ build)
     ;;
 testnet)
     mkdir -p "$2" && cd "$2"
-    PATH="$POLKAJAM:$PATH" POLKAVM_BACKEND=interpreter setsid \
+    PATH="$POLKAJAM:$PATH" POLKAVM_BACKEND="$backend" setsid \
         systemd-run --user --scope -q -p MemoryMax=24G -p MemorySwapMax=0 \
         "$POLKAJAM/polkajam-testnet" >testnet.log 2>&1 &
     echo "$!" >testnet.pid
-    echo "testnet process group $(cat testnet.pid); stop with: kill -TERM -$(cat testnet.pid)"
+    echo "testnet ($backend) process group $(cat testnet.pid); stop with: kill -TERM -$(cat testnet.pid)"
     ;;
 create) "$POLKAJAM/jamt" create-service --raw "$blob" 1000000000 ;;
 item)
@@ -63,5 +65,5 @@ provide)
     ;;
 compare) "$tool" compare "$blob" "$(get "$2" "$3")" ;;
 local) "$tool" local "$blob" "$2" ;;
-*) sed -n '2,11p' "$0"; exit 1 ;;
+*) sed -n '2,12p' "$0"; exit 1 ;;
 esac
