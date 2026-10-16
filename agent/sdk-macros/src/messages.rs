@@ -401,17 +401,19 @@ fn attestable_entry(
     let function = quote! {
         /// Run this method on its encoded arguments, `len` bytes at
         /// `arguments`, leaving its encoded output where the result
-        /// says: the root of its kernel, the program derived from
-        /// what this entry reaches.
+        /// says and its io-hash at `io_hash`: the root of its kernel,
+        /// the program derived from what this entry reaches.
         ///
         /// # Safety
         ///
-        /// `arguments` must point at `len` readable bytes.
+        /// `arguments` must point at `len` readable bytes, and `io_hash`
+        /// at 32 writable ones.
         #[doc(hidden)]
         #[inline(never)]
         pub unsafe extern "C" fn #entry(
             arguments: *const u8,
             len: u64,
+            io_hash: *mut [u8; 32],
         ) -> ::vos_sdk::runtime::Output {
             // SAFETY: the caller's contract.
             let input = unsafe { ::core::slice::from_raw_parts(arguments, len as usize) };
@@ -420,9 +422,9 @@ fn attestable_entry(
             else {
                 ::core::panic!("undecodable arguments")
             };
-            ::vos_sdk::runtime::Output::leak(::vos_sdk::Encode::encode(&Self::#method(
-                #(#names),*
-            )))
+            let output = ::vos_sdk::Encode::encode(&Self::#method(#(#names),*));
+            // SAFETY: the caller's contract.
+            unsafe { ::vos_sdk::runtime::attested(output, io_hash) }
         }
     };
     let row = quote! {

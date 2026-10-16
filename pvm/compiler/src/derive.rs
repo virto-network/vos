@@ -7,9 +7,15 @@
 //! - **A kernel** is the ELF linked from one attestable method's entry
 //!   alone: the code its relocations reach from the entry (calls, PC-relative
 //!   pairs, absolute data relocations, switch tables) and direct branches,
-//!   and the data they reach, with an instruction-0 prologue that calls the
-//!   entry and returns to the halt address. The entries are the ELF's table
-//!   `VOS_ATTEST`, each an attestable method's id and its entry.
+//!   and the data they reach, with an instruction-0 prologue: it reads the
+//!   method's arguments through the witness input into pages of its own,
+//!   calls the entry on them, and returns to the halt address with the
+//!   output in φ7 and φ8 and the io-hash in φ9 to φ12. The entries are the
+//!   ELF's table `VOS_ATTEST`, each an attestable method's id and its entry.
+//!
+//! **A kernel's memory starts the same for every run:** its arguments are
+//! read, not laid out, so the loader maps none and leaves φ8 at 0, and the
+//! root of its initial memory is a constant of the kernel.
 //!
 //! **Reachability follows relocations,** so an ELF without them, or with a
 //! relocation type the linker does not follow, is refused, as is one whose
@@ -30,9 +36,9 @@
 //! past its program's. So a kernel's memory, laid out by its program
 //! alone, is the same whatever heap its actor declares.
 //!
-//! **A kernel makes no host call but the precompiles:** one whose reachable
-//! code does is refused, naming the chain of functions from the entry to
-//! the call.
+//! **A kernel makes no host call but the precompiles and its witness
+//! input:** one whose reachable code does is refused, naming the chain of
+//! functions from the entry to the call.
 //!
 //! **Bounded work:** every lookup is logarithmic, and a kernel is built
 //! from what its entry reaches alone, so a derivation's work grows with the
@@ -54,7 +60,7 @@ use crate::riscv::{self, decode_b_imm, decode_j_imm, op};
 
 /// The derivation's version: it changes whenever the bytes it derives from
 /// the same ELF may, so a derived program's hash is pinned per version.
-pub const TRANSPILER_VERSION: u32 = 2;
+pub const TRANSPILER_VERSION: u32 = 3;
 
 /// The bytes of its actor's heap arena a handler's or a kernel's program
 /// holds, [`vos_wire::abi::INVOCATION_HEAP`], the most the SDK's allocator
@@ -63,6 +69,15 @@ pub const INVOCATION_HEAP: u64 = vos_wire::abi::INVOCATION_HEAP as u64;
 
 /// A page of the PVM's memory.
 const PAGE: u64 = vos_pvm::PVM_PAGE_SIZE as u64;
+
+/// The most bytes a kernel's arguments hold: an attest's, at most a
+/// request's.
+const ARGUMENTS: u64 = vos_wire::abi::cap::REQUEST as u64;
+
+/// The pages a kernel's prologue reads its arguments into, past its
+/// read-write data: room for one byte more than [`ARGUMENTS`], so an input
+/// that fills them is too long, and the prologue traps.
+const ARGUMENT_PAGES: u64 = (ARGUMENTS + 1).div_ceil(PAGE);
 
 /// The largest ELF a derivation reads: an install's body.
 pub const MAX_ELF: usize = 64 << 20;
@@ -583,7 +598,8 @@ fn kernel(graph: &Graph, method: u32, entry: u64) -> Result<Vec<u8>, DeriveError
         .max()
         .unwrap_or(0)
         .next_multiple_of(16);
-    code_sections.push((0, prologue, prologue_code()));
+    let arguments = argument_pages(elf)?;
+    code_sections.push((0, prologue, prologue_code(arguments)));
 
     // The data reached, the rest zeros: the read-only data as long as its
     // last object, in as many zones as the actor's, so the read-write data
@@ -656,7 +672,6 @@ fn kernel(graph: &Graph, method: u32, entry: u64) -> Result<Vec<u8>, DeriveError
         rw_base: elf.rw_base,
         rw_min: elf.rw_min,
         rw_len: elf.rw_len,
-        heap_pages: elf.heap_pages,
         relocations: elf.relocations,
         hi20_targets: pairs(&elf.hi20_targets),
         lo12_sites: spans
@@ -670,6 +685,9 @@ fn kernel(graph: &Graph, method: u32, entry: u64) -> Result<Vec<u8>, DeriveError
         code_ranges: elf.code_ranges.clone(),
         control_flow_targets,
         entry_vaddr: prologue,
+        // The argument pages, zeros past the read-write data, then the
+        // linked program's own zero pages.
+        heap_pages: elf.heap_pages + ARGUMENT_PAGES as u32,
         ..LinkedElf::default()
     };
 
@@ -677,7 +695,7 @@ fn kernel(graph: &Graph, method: u32, entry: u64) -> Result<Vec<u8>, DeriveError
     if let Some(&(address, id)) = transpiled
         .host_calls
         .iter()
-        .find(|&&(_, id)| !vos_pvm::precompile::is_precompile(u64::from(id)))
+        .find(|&&(_, id)| !vos_pvm::precompile::is_kernel_call(u64::from(id)))
     {
         return Err(DeriveError::HostCall {
             method,
@@ -685,31 +703,143 @@ fn kernel(graph: &Graph, method: u32, entry: u64) -> Result<Vec<u8>, DeriveError
             chain: reached.chain(graph, address),
         });
     }
-    Ok(spi_blob(transpiled)?)
+    let blob = spi_blob(transpiled)?;
+    // The argument pages are where the prologue reads into: the first of
+    // the read-write region's trailing zero pages.
+    let [_, rw, _] = vos_pvm_program::StandardHeader::read(&blob)
+        .and_then(|header| header.regions())
+        .ok_or_else(|| TranspileError::InvalidSection("a kernel's layout".into()))?;
+    let pages = u64::from(elf.heap_pages) + ARGUMENT_PAGES;
+    if rw.base + rw.size != arguments + pages * PAGE {
+        return Err(TranspileError::InvalidSection(format!(
+            "a kernel's argument pages at {arguments:#x} are not its read-write data's last"
+        ))
+        .into());
+    }
+    Ok(blob)
+}
+
+/// Where a kernel derived from `elf` reads its arguments: the page past its
+/// read-write data, where the standard layout places it, as
+/// [`crate::linker::spi_blob`] lays the data out. Below 2^31, so the
+/// prologue loads it with `lui` and `addi`.
+fn argument_pages(elf: &LinkedElf) -> Result<u64, DeriveError> {
+    let ro_len = match elf.ro_data.len() as u64 {
+        0 => 0,
+        len => elf.ro_base.saturating_sub(Z_Z) + len,
+    };
+    let rw_base = 2 * Z_Z + zone_round(ro_len);
+    let rw_end = match elf.rw_len {
+        0 => rw_base,
+        len => elf.rw_base + len,
+    };
+    let arguments = rw_end.next_multiple_of(PAGE);
+    if arguments + ARGUMENT_PAGES * PAGE > 1 << 31 {
+        return Err(TranspileError::InvalidSection(format!(
+            "a kernel's argument pages at {arguments:#x} lie past 2^31"
+        ))
+        .into());
+    }
+    Ok(arguments)
 }
 
 /// Where [`prologue_code`]'s call to the entry lies, and where the entry
 /// returns to.
-const CALL_AT: u64 = 4;
-const RETURN_AT: u64 = 12;
+const CALL_AT: u64 = 76;
+const RETURN_AT: u64 = 84;
 
 /// The prologue at a kernel's instruction 0, as an attestable program's
-/// `_start`: keep the halt address, call the entry, and return to it.
-fn prologue_code() -> Vec<u8> {
+/// `_start`. It keeps the halt address; reads the input through the
+/// witness input into the argument pages at `arguments` until a call
+/// returns 0, and traps if it filled them; calls the entry on the bytes
+/// read, with 32 bytes of its stack for the io-hash; then returns to the
+/// halt address with the entry's output in φ7 and φ8 and the io-hash in φ9
+/// to φ12, eight little-endian bytes a register.
+fn prologue_code(arguments: u64) -> Vec<u8> {
     const RA: u32 = 1;
+    const SP: u32 = 2;
+    const T0: u32 = 5;
+    const T1: u32 = 6;
+    const T2: u32 = 7;
     const S0: u32 = 8;
-    let addi = |rd: u32, rs1: u32| (rs1 << 15) | (rd << 7) | op::OP_IMM;
-    let jalr = |rd: u32, rs1: u32| (rs1 << 15) | (rd << 7) | op::JALR;
-    [
-        addi(S0, RA),
-        (RA << 7) | op::AUIPC, // auipc ra, 0: the call to the entry, at CALL_AT
+    const S1: u32 = 9;
+    const A0: u32 = 10;
+    const A1: u32 = 11;
+    const A2: u32 = 12;
+    let i_type = |opcode: u32, funct3: u32, rd: u32, rs1: u32, imm: i32| {
+        ((imm as u32) << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | opcode
+    };
+    let addi = |rd, rs1, imm| i_type(op::OP_IMM, 0, rd, rs1, imm);
+    let ld = |rd, rs1, imm| i_type(op::LOAD, 3, rd, rs1, imm);
+    let jalr = |rd, rs1| i_type(op::JALR, 0, rd, rs1, 0);
+    let r_type = |funct7: u32, rd: u32, rs1: u32, rs2: u32| {
+        (funct7 << 25) | (rs2 << 20) | (rs1 << 15) | (rd << 7) | op::OP
+    };
+    let add = |rd, rs1, rs2| r_type(0, rd, rs1, rs2);
+    let sub = |rd, rs1, rs2| r_type(0x20, rd, rs1, rs2);
+    let branch = |funct3: u32, rs1: u32, rs2: u32, offset: i32| {
+        let imm = offset as u32;
+        ((imm >> 12 & 1) << 31)
+            | ((imm >> 5 & 0x3f) << 25)
+            | (rs2 << 20)
+            | (rs1 << 15)
+            | (funct3 << 12)
+            | ((imm >> 1 & 0xf) << 8)
+            | ((imm >> 11 & 1) << 7)
+            | op::BRANCH
+    };
+    let jal = |rd: u32, offset: i32| {
+        let imm = offset as u32;
+        ((imm >> 20 & 1) << 31)
+            | ((imm >> 1 & 0x3ff) << 21)
+            | ((imm >> 11 & 1) << 20)
+            | ((imm >> 12 & 0xff) << 12)
+            | (rd << 7)
+            | op::JAL
+    };
+    // `lui` and `addi`: a value below 2^31, its low twelve bits signed.
+    let load = |rd: u32, value: u64| {
+        let upper = ((value + 0x800) >> 12) as u32;
+        let lower = (value as i32) - ((upper << 12) as i32);
+        [(upper << 12) | (rd << 7) | op::LUI, addi(rd, rd, lower)]
+    };
+    const MARK: u32 = 0x801 << 20 | 1 << 12 | op::SYSTEM;
+    const ECALL: u32 = op::SYSTEM;
+    const UNIMP: u32 = 0xc000_1073;
+    let [buffer_hi, buffer_lo] = load(S1, arguments);
+    let [room_hi, room_lo] = load(T2, ARGUMENTS + 1);
+    let code = [
+        addi(S0, RA, 0), // 0: the halt address
+        buffer_hi,       // 4: the argument pages
+        buffer_lo,
+        addi(T1, 0, 0), // 12: the bytes read
+        room_hi,        // 16: their room
+        room_lo,
+        add(A0, S1, T1), // 24: the next read's destination
+        sub(A1, T2, T1), // its capacity
+        addi(T0, 0, vos_pvm::precompile::WITNESS_INPUT as i32),
+        MARK,
+        ECALL,                 // 40: the witness input
+        branch(0, A0, 0, 12),  // 44: 0, the end of input: to 56
+        add(T1, T1, A0),       // 48
+        jal(0, -28),           // 52: to 24
+        branch(7, T1, T2, 56), // 56: room filled, too long: to 112
+        addi(A0, S1, 0),       // 60: the arguments
+        addi(A1, T1, 0),       // their length
+        addi(SP, SP, -32),     // 68: the io-hash's place
+        addi(A2, SP, 0),
+        (RA << 7) | op::AUIPC, // 76, CALL_AT: auipc ra, 0, the call to the entry
         jalr(RA, RA),
-        addi(RA, S0), // RETURN_AT
-        jalr(0, RA),
-    ]
-    .into_iter()
-    .flat_map(u32::to_le_bytes)
-    .collect()
+        ld(A2, SP, 0), // 84, RETURN_AT: the io-hash, φ9 to φ12
+        ld(A2 + 1, SP, 8),
+        ld(A2 + 2, SP, 16),
+        ld(A2 + 3, SP, 24),
+        addi(SP, SP, 32), // 100
+        addi(RA, S0, 0),
+        jalr(0, RA), // 108: to the halt address
+        UNIMP,       // 112
+    ];
+    code.into_iter().flat_map(u32::to_le_bytes).collect()
 }
 
 #[cfg(test)]
@@ -731,7 +861,8 @@ mod tests {
 
     /// The Ristretto and scalar ids, 110 to 114, are no precompile: a kernel
     /// that reaches one is refused, naming it, as one reaching any host call
-    /// but a precompile is; one reaching BLAKE2b's derives.
+    /// but a precompile is; one reaching BLAKE2b's, or its witness input,
+    /// derives.
     #[test]
     fn a_kernel_reaching_a_ristretto_id_is_refused() {
         const ENTRY: u64 = 0x10_0000;
@@ -749,7 +880,15 @@ mod tests {
                 other => panic!("host call {id}: {:?}", other.map(|kernel| kernel.len())),
             }
         }
-        let precompile = vos_pvm::precompile::BLAKE2B_COMPRESS as i32;
-        assert!(derived(precompile).is_ok());
+        for admitted in [
+            vos_pvm::precompile::BLAKE2B_COMPRESS,
+            vos_pvm::precompile::WITNESS_INPUT,
+        ] {
+            assert!(derived(admitted as i32).is_ok(), "{admitted:#x}");
+        }
+        assert!(matches!(
+            derived(0x402),
+            Err(DeriveError::HostCall { id: 0x402, .. })
+        ));
     }
 }

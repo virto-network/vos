@@ -439,8 +439,24 @@ pub mod precompile {
     /// block.
     pub const BLAKE2B_COMPRESS: u64 = 0x400;
 
+    /// A kernel's witness input: φ7 the destination, φ8 the capacity. The
+    /// agent writes the next `min(capacity, remaining)` bytes of the input
+    /// the attest supplies and returns their count in φ7, 0 at its end, and
+    /// records what the kernel read in the attest. It serves it to kernels
+    /// alone: a handler's call of it is an id the agent does not serve.
+    pub const WITNESS_INPUT: u64 = 0x401;
+
+    /// A witness-input call's price to its kernel, before its bytes: the
+    /// copy into the kernel, as an actor's input costs.
+    pub const WITNESS_INPUT_CALL: u64 = super::price::INPUT;
+
+    /// A witness-input call's price for each byte it writes.
+    pub const WITNESS_INPUT_BYTE: u64 = super::price::PER_BYTE;
+
     /// The gas a call to precompile `id` costs its caller, beside its
-    /// `ecalli`'s block, or `None` if the agent serves no precompile `id`.
+    /// `ecalli`'s block, or `None` if the agent serves no precompile `id`
+    /// to every machine: the witness input, which only a kernel has, is
+    /// priced by its bytes.
     pub const fn price(id: u64) -> Option<u64> {
         match id {
             BLAKE2B_COMPRESS => Some(600),

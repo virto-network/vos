@@ -137,8 +137,8 @@ fn package(derivation: Derivation, roles: Vec<(Vec<u8>, u8)>, target: Target) ->
         schema,
         target,
     };
-    for &(method, _) in &installed.derivation.kernels {
-        let schema = installed.schema.method(method)?;
+    for kernel in &installed.derivation.kernels {
+        let schema = installed.schema.method(kernel.method)?;
         if schema.kind != Kind::Attestable {
             return None;
         }

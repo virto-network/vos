@@ -16,21 +16,21 @@ use vos_pvm_compiler::{TRANSPILER_VERSION, derive};
 /// leaves out, and each kernel's hash by method: `areas`, `digest` and
 /// `named`.
 const PINNED: (u32, &str, u32, [(u32, &str); 3]) = (
-    2,
-    "77e6fd9e4f59f94340f6bcd470c11299c8f4eda4ef5d973a0b3c68cac32c17f3",
+    3,
+    "58b2f60263b31316b68f143cf0533dddb87bbf97322dbad282b327d0eab5fb96",
     896,
     [
         (
             0x94bb_3e83,
-            "78959c01cb94450a9877040618de7084bca5e752bd31770309515fbd0316ac58",
+            "1965796dd7f4a906f08fe61ead896acee9cfffe4820c26fa2693651f429ead88",
         ),
         (
             0xcf46_1499,
-            "3a44754e6a473da601432680cb1673f8110bffa20ebc9042e09f155d0fa0618b",
+            "5b38a5b674631ff8941e6e2c2817612ee69913384bf2f74c65d50292f0114e40",
         ),
         (
             0xe389_a21d,
-            "f980ee92cdabfd38dd6621e689ea4734ae8772e62b9c2435ab27227fd70bc50c",
+            "d413a5ab4eed05679fbbbdc77106cfab6b33c59570792edf74380641686f996a",
         ),
     ],
 );

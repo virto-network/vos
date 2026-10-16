@@ -110,11 +110,15 @@ version = "0.1.0"
 [[package]]
 name = "vos-pvm-program"
 version = "0.1.0"
+dependencies = [
+ "vos-pvm-precompiles",
+]
 
 [[package]]
 name = "vos-sdk"
 version = "0.1.0"
 dependencies = [
+ "vos-pvm-precompiles",
  "vos-sdk-macros",
  "vos-wire",
 ]

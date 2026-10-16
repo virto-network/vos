@@ -30,7 +30,8 @@
 //!   `curve25519-dalek`.
 //! - `blake2b` (default) — `blake2b_compress` (one compression per
 //!   call) plus the streaming `blake2b_hash::<N>(domain, parts)`
-//!   high-level helper.  Self-contained — no extra runtime deps.
+//!   high-level helper, and a kernel's io-hash (`compute_io_hash`).
+//!   Self-contained — no extra runtime deps.
 //!
 //! Default = `["ristretto", "blake2b"]`.  Guests that only need
 //! hashing can opt out of dalek with `default-features = false,
@@ -56,7 +57,12 @@ pub use ecalls::{
 #[cfg(feature = "blake2b")]
 pub mod blake2b;
 #[cfg(feature = "blake2b")]
-pub use blake2b::{blake2b_256, blake2b_compress, blake2b_hash};
+pub use blake2b::{Blake2b256, blake2b_256, blake2b_compress, blake2b_hash};
+
+#[cfg(feature = "blake2b")]
+pub mod io;
+#[cfg(feature = "blake2b")]
+pub use io::{RootRead, compute_io_hash};
 
 #[cfg(feature = "ristretto")]
 pub mod scalar;

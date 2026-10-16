@@ -179,6 +179,67 @@ pub fn blake2b_hash<const OUT_LEN: usize>(domain: &[u8], parts: &[&[u8]]) -> [u8
     out
 }
 
+/// A streaming BLAKE2b-256: [`Blake2b256::update`] as often as the message
+/// needs, then [`Blake2b256::finalize`]. The same digest as [`blake2b_256`]
+/// of the concatenation, a compression a full block.
+pub struct Blake2b256 {
+    h: [u8; 64],
+    block: [u8; 128],
+    filled: usize,
+    counter: u128,
+}
+
+impl Default for Blake2b256 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Blake2b256 {
+    pub fn new() -> Self {
+        let mut h = [0u8; 64];
+        for (word, iv) in h.chunks_exact_mut(8).zip(BLAKE2B_IV) {
+            word.copy_from_slice(&iv.to_le_bytes());
+        }
+        // The parameter block: a 32-byte digest, fanout 1, depth 1.
+        h[0] ^= 32;
+        h[2] ^= 1;
+        h[3] ^= 1;
+        Self {
+            h,
+            block: [0; 128],
+            filled: 0,
+            counter: 0,
+        }
+    }
+
+    /// Absorb `bytes`. A full block is compressed only once more follows,
+    /// as the last one is compressed apart.
+    pub fn update(&mut self, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            if self.filled == 128 {
+                self.counter += 128;
+                blake2b_compress(&mut self.h, &self.block, self.counter, false);
+                self.filled = 0;
+            }
+            let take = (128 - self.filled).min(bytes.len());
+            self.block[self.filled..self.filled + take].copy_from_slice(&bytes[..take]);
+            self.filled += take;
+            bytes = &bytes[take..];
+        }
+    }
+
+    /// The digest: the last block, padded with zeros, compressed as the last.
+    pub fn finalize(mut self) -> [u8; 32] {
+        self.block[self.filled..].fill(0);
+        self.counter += self.filled as u128;
+        blake2b_compress(&mut self.h, &self.block, self.counter, true);
+        let mut digest = [0u8; 32];
+        digest.copy_from_slice(&self.h[..32]);
+        digest
+    }
+}
+
 /// BLAKE2b-256 of `data`, as the `blake2` crate's `Blake2b<U32>`
 /// computes it: every block but the last compressed where it lies, and the
 /// last copied, padded with zeros.
@@ -217,6 +278,25 @@ mod tests {
             let data: alloc::vec::Vec<u8> = (0..len).map(|byte| (byte * 7 + 3) as u8).collect();
             let theirs: [u8; 32] = blake2::Blake2b::<U32>::digest(&data).into();
             assert_eq!(blake2b_256(&data), theirs, "{len} bytes");
+        }
+    }
+
+    #[test]
+    fn the_streaming_hash_matches_the_buffers() {
+        let data: alloc::vec::Vec<u8> = (0..700u32).map(|byte| (byte * 13 + 1) as u8).collect();
+        for len in [0, 1, 127, 128, 129, 256, 257, 700] {
+            for cut in [0, 1, 64, 128, len / 2, len] {
+                let cut = cut.min(len);
+                let mut hasher = Blake2b256::new();
+                hasher.update(&data[..cut]);
+                hasher.update(&[]);
+                hasher.update(&data[cut..len]);
+                assert_eq!(
+                    hasher.finalize(),
+                    blake2b_256(&data[..len]),
+                    "{len} cut {cut}"
+                );
+            }
         }
     }
 

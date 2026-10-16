@@ -480,6 +480,20 @@ impl Machine {
         self.blake2b_compress()
     }
 
+    /// Serve the machine's witness-input call from `rest`, the input it has
+    /// not read: [`witness_read`]'s bytes written at φ7 through
+    /// [`Machine::write`], at their price, and their count in φ7, which it
+    /// returns. A call it cannot pay leaves it no gas.
+    pub fn witness_input(&mut self, rest: &[u8]) -> Result<usize, Failure> {
+        let (count, price) = witness_read(self.register(8), rest.len());
+        if !self.charge(price) {
+            return Err(Failure::OutOfGas);
+        }
+        self.write(self.register(7), &rest[..count])?;
+        self.set_register(7, count as u64);
+        Ok(count)
+    }
+
     fn blake2b_compress(&mut self) -> Result<(), Failure> {
         let (address, block) = (self.register(7), self.register(8));
         let mut h = [0u8; 64];
@@ -502,6 +516,15 @@ impl Drop for Machine {
 fn as_bytes(frame: &mut [u64; 14]) -> &mut [u8] {
     // SAFETY: fourteen little-endian words, the layout `invoke` reads.
     unsafe { core::slice::from_raw_parts_mut(frame.as_mut_ptr().cast::<u8>(), 14 * 8) }
+}
+
+/// The bytes a witness-input call of capacity `capacity` writes of an
+/// input with `rest` left, `min(capacity, rest)`, and its price: a call's,
+/// then each byte's.
+pub fn witness_read(capacity: u64, rest: usize) -> (usize, u64) {
+    let count = usize::try_from(capacity).map_or(rest, |capacity| capacity.min(rest));
+    let price = precompile::WITNESS_INPUT_CALL + precompile::WITNESS_INPUT_BYTE * count as u64;
+    (count, price)
 }
 
 /// Build a machine from a standard program: its code through `machine` at

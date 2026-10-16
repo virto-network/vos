@@ -42,6 +42,129 @@ pub const fn price(id: u64) -> Option<crate::Gas> {
     }
 }
 
+/// A kernel's witness input: φ\[7\] the destination, φ\[8\] the capacity. It
+/// writes the next `min(capacity, remaining)` bytes of the run's input at
+/// the destination and returns their count in φ\[7\]; 0 means the end of
+/// input. Only the agent serves it, to the kernels it runs, from the input
+/// it records with their attest; a node's refine host serves it to no
+/// machine of its own.
+pub const WITNESS_INPUT: u64 = 0x401;
+
+/// Gas for one witness-input call, before its bytes: the agent's copy into
+/// the kernel, the work of an actor's `input` (`vos_wire::abi::price::INPUT`).
+pub const WITNESS_INPUT_GAS: crate::Gas = 2_500;
+
+/// Gas for each byte a witness-input call writes, an actor's per-byte price
+/// (`vos_wire::abi::price::PER_BYTE`).
+pub const WITNESS_INPUT_BYTE_GAS: crate::Gas = 24;
+
+/// The most bytes a kernel's whole witness input holds, a work result's cap
+/// (`vos_wire::abi::cap::WORK_RESULT`): the attest that records it fits one.
+pub const WITNESS_INPUT_MAX: usize = 4 << 20;
+
+/// Whether `id` names a call a kernel may make: a precompile, or its
+/// witness input.
+pub const fn is_kernel_call(id: u64) -> bool {
+    is_precompile(id) || id == WITNESS_INPUT
+}
+
+/// A kernel's witness input as one run reads it, call by call: its bytes,
+/// borrowed or held, and how many the calls have read.
+#[derive(Clone, Debug)]
+pub struct WitnessInput<B> {
+    bytes: B,
+    cursor: usize,
+}
+
+/// One served witness-input call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WitnessRead {
+    /// φ\[7\] as the call found it.
+    pub destination: u64,
+    /// φ\[8\] as the call found it.
+    pub capacity: u64,
+    /// The input's bytes read before the call.
+    pub cursor: usize,
+    /// The bytes it wrote, now in φ\[7\].
+    pub count: usize,
+}
+
+/// Why a witness-input call was not served.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WitnessFault {
+    /// The machine could not pay: its gas is now empty.
+    OutOfGas,
+    /// The destination is not writable for the count.
+    Unwritable,
+}
+
+impl<B: AsRef<[u8]>> WitnessInput<B> {
+    /// The input `bytes`, or `None` past [`WITNESS_INPUT_MAX`].
+    pub fn new(bytes: B) -> Option<Self> {
+        (bytes.as_ref().len() <= WITNESS_INPUT_MAX).then_some(Self { bytes, cursor: 0 })
+    }
+
+    /// The bytes read so far.
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// The bytes read so far, in call order.
+    pub fn read(&self) -> &[u8] {
+        &self.bytes.as_ref()[..self.cursor]
+    }
+
+    /// The bytes left to read.
+    pub fn remaining(&self) -> usize {
+        self.bytes.as_ref().len() - self.cursor
+    }
+
+    /// The bytes the next call with capacity `capacity` writes.
+    pub fn count(&self, capacity: u64) -> usize {
+        let remaining = self.remaining();
+        usize::try_from(capacity).map_or(remaining, |capacity| capacity.min(remaining))
+    }
+
+    /// Serve a call: its price from `gas`, [`WITNESS_INPUT_GAS`] then
+    /// [`WITNESS_INPUT_BYTE_GAS`] for each byte it writes, then the bytes
+    /// at φ\[7\] and their count in φ\[7\]. A refused call writes nothing,
+    /// leaves the registers and the cursor as they were, and an unpaid one
+    /// empties `gas`.
+    pub fn serve(
+        &mut self,
+        registers: &mut [u64; crate::PVM_REGISTER_COUNT],
+        memory: &mut crate::interpreter::Memory,
+        gas: &mut crate::Gas,
+    ) -> Result<WitnessRead, WitnessFault> {
+        let (destination, capacity) = (registers[7], registers[8]);
+        let count = self.count(capacity);
+        let price = WITNESS_INPUT_GAS.saturating_add(WITNESS_INPUT_BYTE_GAS * count as u64);
+        if *gas < price {
+            *gas = 0;
+            return Err(WitnessFault::OutOfGas);
+        }
+        *gas -= price;
+        let bytes = &self.bytes.as_ref()[self.cursor..self.cursor + count];
+        if count > 0 {
+            let fits = destination
+                .checked_add(count as u64)
+                .is_some_and(|end| end <= 1 << 32);
+            if !fits || !memory.write_bytes_checked(destination as u32, bytes) {
+                return Err(WitnessFault::Unwritable);
+            }
+        }
+        let read = WitnessRead {
+            destination,
+            capacity,
+            cursor: self.cursor,
+            count,
+        };
+        self.cursor += count;
+        registers[7] = count as u64;
+        Ok(read)
+    }
+}
+
 /// Charge precompile `id`'s price from `gas` before serving it. When the
 /// price cannot be paid, `gas` is emptied and the call is not served: the
 /// machine stops out of gas on the call's own counter, as for any host call.
@@ -246,5 +369,113 @@ mod hash_tests {
         );
         // Exactly one block, and one block plus one byte.
         assert_ne!(super::blake2b_256(&[7; 128]), super::blake2b_256(&[7; 129]));
+    }
+}
+
+#[cfg(test)]
+mod witness_tests {
+    use super::*;
+    use crate::interpreter::{Memory, PERM_NONE, PERM_RO, PERM_RW};
+
+    /// Pages 1 and 2 writable, page 3 read-only.
+    fn memory() -> Memory {
+        let mut memory = Memory::sparse(1 << 32);
+        let pages = memory.pages();
+        assert!(memory.set_page_range(0, pages, PERM_NONE));
+        assert!(memory.set_page_range(1, 2, PERM_RW));
+        assert!(memory.set_page_range(3, 1, PERM_RO));
+        memory
+    }
+
+    fn call(
+        input: &mut WitnessInput<&[u8]>,
+        memory: &mut Memory,
+        gas: &mut crate::Gas,
+        destination: u64,
+        capacity: u64,
+    ) -> (Result<WitnessRead, WitnessFault>, u64) {
+        let mut registers = [0; crate::PVM_REGISTER_COUNT];
+        registers[7] = destination;
+        registers[8] = capacity;
+        let served = input.serve(&mut registers, memory, gas);
+        (served, registers[7])
+    }
+
+    /// Each call writes the next `min(capacity, remaining)` bytes and
+    /// returns their count; a short read returns the rest, a read at the
+    /// end 0, and a call of no capacity 0 anywhere. Each pays a call's
+    /// price and its bytes'.
+    #[test]
+    fn reads_return_their_count_short_at_the_tail_and_zero_at_the_end() {
+        let bytes: Vec<u8> = (1..=10).collect();
+        let mut input = WitnessInput::new(&bytes[..]).unwrap();
+        let mut memory = memory();
+        let mut gas = 1_000_000;
+        let mut calls = Vec::new();
+        for (destination, capacity) in [
+            (0x1000, 3),
+            (0x1100, 0),
+            (0x1ffe, 4),
+            (0x1200, 8),
+            (0x1300, 5),
+        ] {
+            let before = gas;
+            let (served, returned) = call(&mut input, &mut memory, &mut gas, destination, capacity);
+            let read = served.unwrap();
+            assert_eq!(returned, read.count as u64);
+            assert_eq!(
+                before - gas,
+                WITNESS_INPUT_GAS + WITNESS_INPUT_BYTE_GAS * read.count as u64
+            );
+            calls.push((read.cursor, read.count));
+        }
+        assert_eq!(calls, [(0, 3), (3, 0), (3, 4), (7, 3), (10, 0)]);
+        assert_eq!((input.cursor(), input.read()), (10, &bytes[..]));
+        let mut written = [0u8; 4];
+        assert!(memory.read_bytes_checked(0x1ffe, &mut written));
+        assert_eq!(written, [4, 5, 6, 7], "across a page");
+        let mut tail = [0u8; 4];
+        assert!(memory.read_bytes_checked(0x1200, &mut tail));
+        assert_eq!(tail, [8, 9, 10, 0]);
+    }
+
+    /// A call that cannot write its bytes, into read-only or unmapped
+    /// memory or past the address space, or cannot pay for them, is
+    /// refused: nothing written, the cursor and φ7 as they were, and an
+    /// unpaid call empties the gas.
+    #[test]
+    fn a_refused_call_writes_nothing_and_reads_nothing() {
+        let bytes = [7u8; 8];
+        let mut input = WitnessInput::new(&bytes[..]).unwrap();
+        let mut memory = memory();
+        for destination in [0x3000, 0x2ffe, 0x8000, (1 << 32) - 2, u64::MAX] {
+            let mut gas = 1_000_000;
+            let (served, returned) = call(&mut input, &mut memory, &mut gas, destination, 4);
+            assert_eq!(served, Err(WitnessFault::Unwritable), "{destination:#x}");
+            assert_eq!((returned, input.cursor()), (destination, 0));
+        }
+        let mut gas = WITNESS_INPUT_GAS + WITNESS_INPUT_BYTE_GAS * 4 - 1;
+        let (served, _) = call(&mut input, &mut memory, &mut gas, 0x1000, 4);
+        assert_eq!(
+            (served, gas, input.cursor()),
+            (Err(WitnessFault::OutOfGas), 0, 0)
+        );
+        let mut first = [0u8; 4];
+        assert!(memory.read_bytes_checked(0x1000, &mut first));
+        assert_eq!(first, [0; 4]);
+        // A call that writes nothing touches no memory, wherever it points.
+        let mut gas = 1_000_000;
+        let (served, returned) = call(&mut input, &mut memory, &mut gas, u64::MAX, 0);
+        assert_eq!((served.map(|read| read.count), returned), (Ok(0), 0));
+    }
+
+    /// An input past a work result's cap is refused before any call.
+    #[test]
+    fn an_oversize_input_is_refused() {
+        let bytes = vec![0u8; WITNESS_INPUT_MAX + 1];
+        assert!(WitnessInput::new(&bytes[..WITNESS_INPUT_MAX]).is_some());
+        assert!(WitnessInput::new(&bytes[..]).is_none());
+        assert!(is_kernel_call(WITNESS_INPUT) && is_kernel_call(BLAKE2B_COMPRESS));
+        assert!(!is_precompile(WITNESS_INPUT) && price(WITNESS_INPUT).is_none());
     }
 }

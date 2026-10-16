@@ -8,6 +8,8 @@
 
 extern crate alloc;
 
+pub mod image;
+
 use alloc::vec;
 use alloc::vec::Vec;
 

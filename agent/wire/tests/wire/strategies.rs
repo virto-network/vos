@@ -11,7 +11,7 @@ use vos_wire::ids::{
 use vos_wire::ingress::Grant;
 use vos_wire::jam::WorkError;
 use vos_wire::keys::{Due, Transform};
-use vos_wire::records::Derivation;
+use vos_wire::records::{Derivation, Kernel};
 use vos_wire::result::{
     Attest, CommittedWrite, InputRef, InstanceGas, Outcome, Outgoing, Page, Run, Step, Write,
 };
@@ -131,7 +131,7 @@ pub(crate) fn input() -> impl Strategy<Value = Input> {
             any::<u32>(),
             (
                 any::<[u8; 32]>(),
-                prop::collection::vec((any::<u32>(), any::<[u8; 32]>()), 0..3),
+                prop::collection::vec((any::<u32>(), any::<[u8; 32]>(), any::<[u8; 32]>()), 0..3,),
                 any::<[u8; 32]>(),
                 any::<u32>(),
                 any::<u32>(),
@@ -147,7 +147,11 @@ pub(crate) fn input() -> impl Strategy<Value = Input> {
                             program: ProgramHash(program),
                             kernels: kernels
                                 .into_iter()
-                                .map(|(method, kernel)| (MethodId(method), ProgramHash(kernel)))
+                                .map(|(method, program, image_root)| Kernel {
+                                    method: MethodId(method),
+                                    program: ProgramHash(program),
+                                    image_root,
+                                })
                                 .collect(),
                             elf,
                             transpiler,
@@ -214,9 +218,9 @@ pub(crate) fn step() -> impl Strategy<Value = Step> {
         body,
     });
     let attest =
-        (any::<[u8; 32]>(), bytes(), bytes()).prop_map(|(program, arguments, output)| Attest {
+        (any::<[u8; 32]>(), bytes(), bytes()).prop_map(|(program, witness_input, output)| Attest {
             program: ProgramHash(program),
-            arguments,
+            witness_input,
             output,
         });
     let ran = (

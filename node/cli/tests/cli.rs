@@ -223,7 +223,7 @@ fn an_operator_installs_a_package() {
         format!(
             "done\nprogram {}\nkernel checksum {}\nelf {}\ntranspiler {}",
             hex::encode(jam.program.0),
-            hex::encode(jam.kernels[0].1.0),
+            hex::encode(jam.kernels[0].program.0),
             hex::encode(jam.elf),
             vos_pvm_compiler::TRANSPILER_VERSION,
         )
