@@ -17,6 +17,15 @@
 //! Plonky3's `Poseidon2Mersenne31<16>` on packed fields, written once over a
 //! `Vector` each instruction set implements.
 
+// Without vector instructions only the scalar fallback runs.
+#![cfg_attr(
+    not(any(
+        all(target_arch = "x86_64", target_feature = "avx2"),
+        all(target_arch = "aarch64", target_feature = "neon"),
+    )),
+    allow(dead_code)
+)]
+
 use super::{
     EXTERNAL_ROUND_CONSTS, FULL_ROUNDS, INTERNAL_DIAG_SHIFTS, INTERNAL_ROUND_CONSTS,
     N_HALF_FULL_ROUNDS, N_PARTIAL_ROUNDS, N_STATE,
