@@ -283,6 +283,24 @@ impl Cluster {
         smol::block_on(self.node(at).call(agent, self.request(sequence, by)))
     }
 
+    /// [`Cluster::increment`] at `agent`'s leader, followed when it moves:
+    /// a call sent again at its sequence runs once, and is answered from
+    /// the reply window when it already has.
+    pub fn increment_at_leader(
+        &self,
+        agent: AgentId,
+        sequence: u64,
+        by: u64,
+    ) -> Result<Reply, CallError> {
+        for _ in 0..10 {
+            match self.increment(self.leader(agent), agent, sequence, by) {
+                Err(CallError::NotLeader(_)) => continue,
+                reply => return reply,
+            }
+        }
+        Err(CallError::TimedOut)
+    }
+
     /// Each of `sequences` added to `agent`'s counter at node `at`, in
     /// order, each at that sequence of the session whose every earlier
     /// call added its own: each is answered with the sum of the sequences

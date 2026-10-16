@@ -205,7 +205,7 @@ fn a_large_results_blob_goes_once_the_log_is_compacted_past_it() {
     let last = *indices.last().unwrap();
     for sequence in 12..=60 {
         assert_eq!(
-            done(cluster.increment(leader, agent, sequence, 1)),
+            done(cluster.increment_at_leader(agent, sequence, 1)),
             sequence - 11
         );
     }
