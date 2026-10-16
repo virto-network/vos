@@ -360,6 +360,15 @@ impl From<&[u8]> for P2Hash {
     }
 }
 
+/// Add a leaf's `RATE`-wide block into the first lanes of `state`, then
+/// permute it.
+fn absorb(state: &mut [BaseField; N_STATE], block: &[BaseField]) {
+    for (lane, value) in state.iter_mut().zip(block) {
+        *lane += *value;
+    }
+    permute(state);
+}
+
 #[derive(Clone, Debug)]
 pub struct P2MerkleHasher {
     state: [BaseField; N_STATE],
@@ -390,33 +399,21 @@ impl MerkleHasherLifted for P2MerkleHasher {
             if self.buffer.len() < RATE {
                 return;
             }
-            for i in 0..RATE {
-                self.state[i] += self.buffer[i];
-            }
-            permute(&mut self.state);
+            absorb(&mut self.state, &self.buffer);
             self.buffer.clear();
         }
         let mut blocks = values.chunks_exact(RATE);
         for block in &mut blocks {
-            for i in 0..RATE {
-                self.state[i] += block[i];
-            }
-            permute(&mut self.state);
+            absorb(&mut self.state, block);
         }
         self.buffer.extend_from_slice(blocks.remainder());
     }
     fn finalize(mut self) -> P2Hash {
         self.buffer.push(BaseField::one());
-        while !self.buffer.len().is_multiple_of(RATE) {
-            self.buffer.push(BaseField::zero());
-        }
-        let mut i = 0;
-        while i < self.buffer.len() {
-            for j in 0..RATE {
-                self.state[j] += self.buffer[i + j];
-            }
-            permute(&mut self.state);
-            i += RATE;
+        self.buffer
+            .resize(self.buffer.len().next_multiple_of(RATE), BaseField::zero());
+        for block in self.buffer.chunks_exact(RATE) {
+            absorb(&mut self.state, block);
         }
         let mut out = [BaseField::zero(); 8];
         out.copy_from_slice(&self.state[..8]);
