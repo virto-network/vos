@@ -177,6 +177,10 @@ impl BuiltInComponent for RegisterMemoryChip {
         let is_write = crate::trace::trace_eval!(trace_eval, Column::IsWrite);
         let prev_value = crate::trace::trace_eval!(trace_eval, Column::PrevValue);
 
+        // IsPadding ∈ {0, 1}: a padding flag of 2 would make a row's
+        // multiplicity `1 − IsPadding` a producer and BothRealH negative.
+        eval.add_constraint(is_pad[0].clone() * (is_pad[0].clone() - E::F::one()));
+
         // ── Slot-real flag invariants ────────────────────────────────
         // Each SlotReal_i ∈ {0, 1}: bool · (bool − 1) = 0.
         eval.add_constraint(slot1[0].clone() * (slot1[0].clone() - E::F::one()));

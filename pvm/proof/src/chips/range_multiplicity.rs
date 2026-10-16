@@ -33,11 +33,10 @@ pub struct RangeMultiplicity256;
 
 const RANGE_LOG_SIZE: u32 = 8; // 256 rows, one per byte value
 
+/// The table's entries are its preprocessed column, which the verifier
+/// commits; the main trace holds only their multiplicities.
 #[derive(Debug, Copy, Clone, AirColumn)]
 pub enum Column {
-    /// The byte value (0-255).
-    #[size = 1]
-    Value,
     /// Multiplicity count for this value.
     #[size = 1]
     Multiplicity,
@@ -62,7 +61,7 @@ impl BuiltInComponent for RangeMultiplicity256 {
         trace_eval: TraceEval<PreprocessedColumn, Column, E>,
         lookup_elements: &Range256LookupElements,
     ) {
-        let value = crate::trace::trace_eval!(trace_eval, Column::Value);
+        let value = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::Value);
         let mult = crate::trace::trace_eval!(trace_eval, Column::Multiplicity);
 
         // Negative multiplicity (receiver side)
@@ -99,9 +98,6 @@ impl BuiltInProverComponent for RangeMultiplicity256 {
         let num_rows = trace.num_rows();
 
         for row in 0..num_rows {
-            let value = if row < 256 { row as u8 } else { 0 };
-            trace.fill_columns(row, value, Column::Value);
-
             let mult = if row < 256 {
                 side_note.range256_counts[row]
             } else {
@@ -126,7 +122,8 @@ impl BuiltInProverComponent for RangeMultiplicity256 {
         let mut logup = LogupTraceBuilder::new(log_size);
 
         let range256: &Range256LookupElements = lookup_elements.as_ref();
-        let value = crate::trace::original_base_column!(component_trace, Column::Value);
+        let value =
+            crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::Value);
         let mult = crate::trace::original_base_column!(component_trace, Column::Multiplicity);
 
         // Negative contribution: this is the "receiver" side

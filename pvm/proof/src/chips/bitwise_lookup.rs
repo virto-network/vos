@@ -36,17 +36,10 @@ pub struct BitwiseLookupChip;
 
 const BITWISE_LOG_SIZE: u32 = 8; // 2^8 = 256 rows = 16×16
 
+/// The table's entries are its preprocessed columns, which the verifier
+/// commits; the main trace holds only their multiplicities.
 #[derive(Debug, Copy, Clone, AirColumn)]
 pub enum Column {
-    /// Nibble value a (0-15)
-    #[size = 1]
-    A,
-    /// Nibble value b (0-15)
-    #[size = 1]
-    B,
-    /// a AND b
-    #[size = 1]
-    AndResult,
     /// Multiplicity: how many times this (a, b) pair was used
     #[size = 1]
     Multiplicity,
@@ -77,9 +70,10 @@ impl BuiltInComponent for BitwiseLookupChip {
         trace_eval: TraceEval<PreprocessedColumn, Column, E>,
         lookup_elements: &BitwiseAndLookupElements,
     ) {
-        let a = crate::trace::trace_eval!(trace_eval, Column::A);
-        let b = crate::trace::trace_eval!(trace_eval, Column::B);
-        let and_result = crate::trace::trace_eval!(trace_eval, Column::AndResult);
+        let a = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::A);
+        let b = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::B);
+        let and_result =
+            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::AndResult);
         let mult = crate::trace::trace_eval!(trace_eval, Column::Multiplicity);
 
         // Consumer: negative multiplicity
@@ -124,10 +118,6 @@ impl BuiltInProverComponent for BitwiseLookupChip {
             if row < 256 {
                 let a = (row / 16) as u8;
                 let b = (row % 16) as u8;
-                trace.fill_columns(row, a, Column::A);
-                trace.fill_columns(row, b, Column::B);
-                trace.fill_columns(row, a & b, Column::AndResult);
-
                 let mult = side_note
                     .bitwise_and_counts
                     .get(&(a, b))
@@ -153,9 +143,10 @@ impl BuiltInProverComponent for BitwiseLookupChip {
         let mut logup = LogupTraceBuilder::new(log_size);
 
         let bitwise_lookup: &BitwiseAndLookupElements = lookup_elements.as_ref();
-        let a = crate::trace::original_base_column!(component_trace, Column::A);
-        let b = crate::trace::original_base_column!(component_trace, Column::B);
-        let and_result = crate::trace::original_base_column!(component_trace, Column::AndResult);
+        let a = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::A);
+        let b = crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::B);
+        let and_result =
+            crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::AndResult);
         let mult = crate::trace::original_base_column!(component_trace, Column::Multiplicity);
 
         // Consumer side (negative multiplicity)
