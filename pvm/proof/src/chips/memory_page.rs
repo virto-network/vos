@@ -92,8 +92,11 @@ pub enum Column {
     #[size = 20]
     #[mask_next_row]
     IdxBits,
-    /// 1 on real rows, 0 on padding.
+    /// 1 on real rows, 0 on padding; constant across a page's 32 rows
+    /// (`#[mask_next_row]` replication), so every real page produces its
+    /// leaf from block 0's `h_in` on.
     #[size = 1]
+    #[mask_next_row]
     IsReal,
     /// BOUND helper `(1 − IsLastBlock) · IsReal`: gates the leaf chain
     /// continuity + page-index replication (degree-1 so they stay degree 2).
@@ -166,6 +169,7 @@ impl BuiltInComponent for MemoryPageChip {
         let idx_bits = crate::trace::trace_eval!(trace_eval, Column::IdxBits);
         let idx_bits_next = crate::trace::trace_eval_next_row!(trace_eval, Column::IdxBits);
         let is_real = crate::trace::trace_eval!(trace_eval, Column::IsReal);
+        let is_real_next = crate::trace::trace_eval_next_row!(trace_eval, Column::IsReal);
         let chain_gate = crate::trace::trace_eval!(trace_eval, Column::ChainGateH);
         let block0_gate = crate::trace::trace_eval!(trace_eval, Column::Block0GateH);
         let last_gate = crate::trace::trace_eval!(trace_eval, Column::LastBlockGateH);
@@ -201,6 +205,12 @@ impl BuiltInComponent for MemoryPageChip {
         );
         eval.add_constraint(block0_gate[0].clone() - is_block0[0].clone() * is_real[0].clone());
         eval.add_constraint(last_gate[0].clone() - is_last_block[0].clone() * is_real[0].clone());
+
+        // ── Realness replication within a page (degree 2) ─────────
+        eval.add_constraint(
+            (one.clone() - is_last_block[0].clone())
+                * (is_real_next[0].clone() - is_real[0].clone()),
+        );
 
         // ── Page-index replication within a page (degree 2) ───────
         for k in 0..20 {

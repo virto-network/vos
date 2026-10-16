@@ -32,8 +32,9 @@ use crate::{framework::BuiltInComponent, lookups::MemoryAccessLookupElements};
 /// MemoryChip: proves read/write consistency of RAM accesses.
 ///
 /// Each row is one memory access (Load or Store). The trace is sorted by
-/// (address, timestamp). For consecutive accesses to the same address,
-/// reads must return the value from the last write.
+/// (address, 2·timestamp + is_write): at one timestamp an address's reads
+/// precede its writes. For consecutive accesses to the same address, reads
+/// must return the value from the last write.
 pub struct MemoryChip;
 
 /// Ordering deltas must fit below this bit width. Twenty-eight bits cover the
@@ -89,11 +90,11 @@ pub enum Column {
     #[size = 1]
     AdvHiH,
     /// 28-bit little-endian decomposition of the per-transition ordering delta
-    /// `OrderDelta = IsSameAddrNext·ts_diff + AdvLoH·(lo_diff−1) +
+    /// `OrderDelta = IsSameAddrNext·key_diff + AdvLoH·(lo_diff−1) +
     /// AdvHiH·(hi_diff−1)`, a SELF-CONTAINED non-negativity range-check (no
     /// Range256 lookup — the consumer pass runs with an immutable `&SideNote`).
-    /// 28 bits covers every timestamp admitted by the canonical 100M-gas
-    /// actor-proof budget plus the 16-bit half diffs. `2^28 < p/4`, so a
+    /// 28 bits covers twice every timestamp admitted by the canonical
+    /// 100M-gas actor-proof budget plus the 16-bit half diffs. `2^28 < p/4`, so a
     /// field-wrapped negative cannot alias a valid small positive.
     #[size = 28]
     OrderBits,
@@ -197,8 +198,11 @@ impl BuiltInComponent for MemoryChip {
         let is_closing = crate::trace::trace_eval!(trace_eval, Column::IsClosing);
         let prev_value = crate::trace::trace_eval!(trace_eval, Column::PrevValue);
 
-        // IsClosing is a bound boolean (only MemoryPageChip ever sets it).
-        eval.add_constraint(is_closing[0].clone() * (is_closing[0].clone() - E::F::one()));
+        // IsClosing is a bound boolean (only MemoryPageChip ever sets it);
+        // IsWrite and IsPadding are booleans too.
+        for flag in [&is_closing, &is_write, &is_pad] {
+            eval.add_constraint(flag[0].clone() * (flag[0].clone() - E::F::one()));
+        }
 
         // Read consistency is unconditional: `(1 - is_write) · (value -
         // prev_value) = 0`.  On padding rows value=prev_value=0 so 1·0=0
@@ -249,10 +253,14 @@ impl BuiltInComponent for MemoryChip {
             is_same_addr[0].clone() + adv_lo[0].clone() + adv_hi[0].clone() - both_real,
         );
 
-        // OrderDelta = same·ts_diff + lo·(lo_diff−1) + hi·(hi_diff−1), 28-bit
-        // range-checked ≥ 0.  same=1 ⇒ ts non-decreasing; lo=1 ⇒ lo strictly
-        // increases (hi equal) ⇒ addr↑; hi=1 ⇒ hi strictly increases ⇒ addr↑.
-        // 0 on every non-real→real transition (all three coeffs are 0 there).
+        // OrderDelta = same·key_diff + lo·(lo_diff−1) + hi·(hi_diff−1),
+        // 28-bit range-checked ≥ 0, with key = 2·ts + is_write.  same=1 ⇒
+        // the key is non-decreasing: ts is, and at one ts an address's reads
+        // come before its writes, so a step that reads and writes one byte
+        // (a precompile whose output overlaps its input) reads the value
+        // from before it; lo=1 ⇒ lo strictly increases (hi equal) ⇒ addr↑;
+        // hi=1 ⇒ hi strictly increases ⇒ addr↑.  0 on every non-real→real
+        // transition (all three coeffs are 0 there).
         let combine_ts = |bytes: &[E::F; 8]| -> E::F {
             let mut acc = E::F::zero();
             let mut pow = E::F::one();
@@ -262,11 +270,14 @@ impl BuiltInComponent for MemoryChip {
             }
             acc
         };
-        let ts_diff = combine_ts(&timestamp_next) - combine_ts(&timestamp);
-        let order_delta = is_same_addr[0].clone() * ts_diff
+        let is_write_next = crate::trace::trace_eval_next_row!(trace_eval, Column::IsWrite);
+        let two = E::F::from(BaseField::from(2u32));
+        let key_diff = two.clone() * (combine_ts(&timestamp_next) - combine_ts(&timestamp))
+            + is_write_next[0].clone()
+            - is_write[0].clone();
+        let order_delta = is_same_addr[0].clone() * key_diff
             + adv_lo[0].clone() * (lo_diff - E::F::one())
             + adv_hi[0].clone() * (hi_diff - E::F::one());
-        let two = E::F::from(BaseField::from(2u32));
         let mut recomposed = E::F::zero();
         let mut pow2 = E::F::one();
         for bit in &order_bits {
@@ -292,7 +303,6 @@ impl BuiltInComponent for MemoryChip {
         // boundary by omitting a touched page: every accessed address must be
         // a listed page (else its group lacks the ts=0 write / closing read
         // producer → group-start violation or logup imbalance).
-        let is_write_next = crate::trace::trace_eval_next_row!(trace_eval, Column::IsWrite);
         let is_group_start = crate::trace::trace_eval!(trace_eval, Column::IsGroupStart);
         let is_group_end = crate::trace::trace_eval!(trace_eval, Column::IsGroupEnd);
         let is_real_next = E::F::one() - is_pad_next[0].clone();
@@ -571,7 +581,7 @@ pub fn analyze_dedup(side_note: &crate::side_note::SideNote) -> MemoryDedupRepor
         return MemoryDedupReport::default();
     }
 
-    entries.sort_by_key(|e| (e.address, e.timestamp));
+    entries.sort_by_key(|e| (e.address, e.timestamp, e.is_write));
 
     // A "flood group" = run of consecutive entries (in sort order) where
     //   addr[i+1] == addr[i] + 1, ts[i+1] == ts[i], is_write[i+1] == is_write[i].
@@ -717,9 +727,8 @@ impl BuiltInProverComponent for MemoryChip {
 
         // Blake2b precompile memory ops: 64 byte reads at h_ptr + 128 byte
         // reads at m_ptr + 64 byte writes back at h_ptr, all at the ECALL
-        // step's ts.  Reads are pushed before writes so the stable
-        // `sort_by_key(|e| (e.address, e.timestamp))` at the end keeps the
-        // (read, then write) order at the same (addr, ts) pair.
+        // step's ts.  The ledger's order puts the reads before the writes
+        // at the same (addr, ts) pair, as the AIR requires.
         for op in &side_note.blake2b_mem_ops {
             for (i, &b) in op.h_bytes.iter().enumerate() {
                 entries.push(MemEntry {
@@ -897,8 +906,9 @@ impl BuiltInProverComponent for MemoryChip {
             return trace.finalize_bit_reversed();
         }
 
-        // Sort by (address, timestamp) — initial writes at ts=0 come first per address
-        entries.sort_by_key(|e| (e.address, e.timestamp));
+        // Sort by (address, timestamp, is_write): initial writes at ts=0
+        // come first per address, and at one ts its reads precede its writes.
+        entries.sort_by_key(|e| (e.address, e.timestamp, e.is_write));
 
         let num_entries = entries.len();
         let mut log_size = crate::trace::utils::ceil_log2_at_least_lanes(num_entries);
@@ -913,7 +923,7 @@ impl BuiltInProverComponent for MemoryChip {
         // Pass 1: base columns; track (addr, ts, is_same_addr) per row so the
         // ordering helpers (pass 2) can read the cyclic next row.
         let mut addrs = vec![0u32; num_rows];
-        let mut tss = vec![0u64; num_rows];
+        let mut keys = vec![0u64; num_rows];
         let mut same_addr = vec![false; num_rows];
         for (row, entry) in entries.iter().enumerate() {
             trace.fill_columns_bytes(row, &entry.address.to_le_bytes(), Column::Address);
@@ -941,7 +951,7 @@ impl BuiltInProverComponent for MemoryChip {
             trace.fill_columns(row, is_closing, Column::IsClosing);
 
             addrs[row] = entry.address;
-            tss[row] = entry.timestamp;
+            keys[row] = 2 * entry.timestamp + u64::from(entry.is_write);
             same_addr[row] = same_addr_next;
         }
         for row in num_entries..num_rows {
@@ -950,7 +960,7 @@ impl BuiltInProverComponent for MemoryChip {
 
         // Pass 2: ordering helpers, reading the cyclic next = (row+1) % num_rows.
         //   AdvLoH / AdvHiH: which 16-bit half advances (when not same address).
-        //   OrderBits: 28-bit decomposition of OrderDelta = same·ts_diff +
+        //   OrderBits: 28-bit decomposition of OrderDelta = same·key_diff +
         //   lo·(lo_diff−1) + hi·(hi_diff−1), all ≥ 0.
         for row in 0..num_rows {
             let next = (row + 1) % num_rows;
@@ -972,7 +982,7 @@ impl BuiltInProverComponent for MemoryChip {
             trace.fill_columns(row, is_group_end, Column::IsGroupEnd);
 
             let order_delta: u64 = if same_addr[row] {
-                tss[next] - tss[row]
+                keys[next] - keys[row]
             } else if adv_lo {
                 ((addrs[next] & 0xFFFF) - (addrs[row] & 0xFFFF)) as u64 - 1
             } else if adv_hi {
