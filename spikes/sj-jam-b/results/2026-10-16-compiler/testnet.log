@@ -1,0 +1,28 @@
+testnet: Working directory: /tmp/testnet-mvgq8l
+node0: 2026-10-16 18:05:29.019295 ThreadId(1) INFO jam_node::node  Chain ID: dev
+node0: 2026-10-16 18:05:29.019426 ThreadId(1) INFO jam_node::node  Config dir: /tmp/testnet-mvgq8l/node0/conf/dev
+node0: 2026-10-16 18:05:29.019439 ThreadId(1) INFO jam_node::node  Data dir: /tmp/testnet-mvgq8l/node0/data/dev
+node2: 2026-10-16 18:05:29.022191 ThreadId(1) INFO jam_node::node  Chain ID: dev
+node2: 2026-10-16 18:05:29.022327 ThreadId(1) INFO jam_node::node  Config dir: /tmp/testnet-mvgq8l/node2/conf/dev
+node2: 2026-10-16 18:05:29.022338 ThreadId(1) INFO jam_node::node  Data dir: /tmp/testnet-mvgq8l/node2/data/dev
+node3: 2026-10-16 18:05:29.023902 ThreadId(1) INFO jam_node::node  Chain ID: dev
+node3: 2026-10-16 18:05:29.024006 ThreadId(1) INFO jam_node::node  Config dir: /tmp/testnet-mvgq8l/node3/conf/dev
+node3: 2026-10-16 18:05:29.024016 ThreadId(1) INFO jam_node::node  Data dir: /tmp/testnet-mvgq8l/node3/data/dev
+node4: 2026-10-16 18:05:29.025633 ThreadId(1) INFO jam_node::node  Chain ID: dev
+node4: 2026-10-16 18:05:29.025784 ThreadId(1) INFO jam_node::node  Config dir: /tmp/testnet-mvgq8l/node4/conf/dev
+node4: 2026-10-16 18:05:29.025795 ThreadId(1) INFO jam_node::node  Data dir: /tmp/testnet-mvgq8l/node4/data/dev
+node1: 2026-10-16 18:05:29.044634 ThreadId(1) INFO jam_node::node  Chain ID: dev
+node1: 2026-10-16 18:05:29.044831 ThreadId(1) INFO jam_node::node  Config dir: /tmp/testnet-mvgq8l/node1/conf/dev
+node1: 2026-10-16 18:05:29.044843 ThreadId(1) INFO jam_node::node  Data dir: /tmp/testnet-mvgq8l/node1/data/dev
+node5: 2026-10-16 18:05:29.044725 ThreadId(1) INFO jam_node::node  Chain ID: dev
+node5: 2026-10-16 18:05:29.044952 ThreadId(1) INFO jam_node::node  Config dir: /tmp/testnet-mvgq8l/node5/conf/dev
+node5: 2026-10-16 18:05:29.044969 ThreadId(1) INFO jam_node::node  Data dir: /tmp/testnet-mvgq8l/node5/data/dev
+node6: 2026-10-16 18:05:29.055742 ThreadId(1) INFO jam_node::node  Chain ID: dev
+node6: 2026-10-16 18:05:29.055884 ThreadId(1) INFO jam_node::node  Config dir: /tmp/testnet-mvgq8l/node6/conf/dev
+node6: 2026-10-16 18:05:29.055895 ThreadId(1) INFO jam_node::node  Data dir: /tmp/testnet-mvgq8l/node6/data/dev
+node6: 2026-10-16 18:05:29.094637 ThreadId(1) INFO jam_node::chain  Reading state...
+node6: Error: Chain error: VmEngine(EngineInitializationFailed(Error(Owned("failed to initialize Linux sandbox: failed to fetch CPU topology: failed to read /sys/devices/system/cpu/cpu21/cache/index3/shared_cpu_list: No such file or directory (os error 2)"))))
+node6: 
+node6: Caused by:
+node6:     vm engine error: EngineInitializationFailed(Error(Owned("failed to initialize Linux sandbox: failed to fetch CPU topology: failed to read /sys/devices/system/cpu/cpu21/cache/index3/shared_cpu_list: No such file or directory (os error 2)")))
+Error: node6 exited abnormally: exit code 1

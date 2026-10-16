@@ -1,0 +1,24 @@
+PolkaJam nightly-2026-10-13 (polkajam and jamt 0.1.29, GP 0.8.0; tarball sha256
+10c7c5b3cab366c37a015b82ab437db175c77c4e2dd968d207facda92c170ecd), interpreter,
+the probe blob byte-identical to the committed sj-probe.jam (26,241 bytes).
+One service (1) carried every payload, in this order:
+  create; FAPUX -e 2 at once; FAPUX -e 2; I (wp:<FAPUX>:0,1); Is (sr:<root>:0,1);
+  OR; L; S; provide; L (anchored before the provide); L; Iv (wp:<FAPUX>:0,1, late).
+
+PolkaJam's side, against the slice-4 records in ../:
+- FAPUX, I, Is, OR (14 records), L after the provide: every record identical,
+  gas figures included; only package hashes differ. FAPUX's segment root is
+  again 863cf3f7..., and the race package's zero-segment root db4b9be6....
+- the code-availability race: the first FAPUX after create-service failed on
+  the export count (refine error 3, "produced 0 exports; expected 2").
+- solicit (id 24) answered 0; serviceRequest [] then [slot] after provide.
+- L anchored before the provide's slot answers NONE (all three lookups);
+  anchored after it, 300 bytes at 1,203 / 1,125 / 2,181 gas, as in slice 4.
+- a wp: import sent after the exporter left recent history was dropped by the
+  guarantors ("Not enough signatures from secondary guarantors").
+
+VOS's JAM-only host, on the interpreter and the recompiler alike:
+- OR 14 of 14, L 6 of 6 (3 of 6 once PolkaJam has the preimage: same charges,
+  NONE locally); FAPUX 34 of 36 (the step-4.0 gas/unserved/log/export
+  differences are gone; fetch kind 0 still answers 0 bytes); I and Is 2 of 9
+  (fetch now charged 171 like PolkaJam, answering NONE without imports).

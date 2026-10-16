@@ -1,0 +1,14 @@
+PolkaJam nightly-2026-10-13, POLKAVM_BACKEND=compiler, with
+vm.unprivileged_userfaultfd=1. The recompiler does not start on this machine
+(Intel Core Ultra 7 155H): PolkaVM's Linux sandbox reads the L3 cache topology
+of every CPU, and the two low-power E-cores (cpu20, cpu21) have no index3
+cache. Every node fails at engine initialisation (testnet.log):
+  failed to initialize Linux sandbox: failed to fetch CPU topology: failed to
+  read /sys/devices/system/cpu/cpu21/cache/index3/shared_cpu_list
+Tried without effect:
+- POLKAVM_CORE_PINNING=disabled (accepted values: pin_to_core, pin_to_ccx,
+  disabled): the topology is still read, same error;
+- taskset -c 0-19: the topology covers all CPUs, not the affinity mask;
+- POLKAVM_SANDBOX=generic: "the 'generic' backend is not supported on this
+  platform".
+No records exist for the recompiler.

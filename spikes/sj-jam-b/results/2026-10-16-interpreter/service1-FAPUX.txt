@@ -1,0 +1,51 @@
+== PolkaJam
+package hash  d7d7c788f0cf3aaee636fccba4093e39c6bc461072e4b949b7e530be6c6b5cf9
+segment root  863cf3f7c90bff910e6e545f670d9a4a975a01021e5b61ced1b046eb57735c4b
+gas limit     10000000
+payload       "FAPUX"
+  start (gas left)       999997729
+  calibrate (gas)        diff=96 (gas call=48)
+  machine                φ7=0 arg=0 extra=0 diff=1915 charge=1867
+  pages alloc rw         φ7=0 arg=16 extra=2 diff=565 charge=517
+  pages set ro           φ7=0 arg=16 extra=2 diff=236 charge=188
+  invoke                 exit=FAULT(2) φ8=0x10000 diff=1117 inner-used=101 invoke-charge=968
+  pages set rw           φ7=0 arg=16 extra=1 diff=207 charge=159
+  invoke                 exit=FAULT(2) φ8=0x11000 diff=1016 inner-used=0 invoke-charge=968
+  pages set rw           φ7=0 arg=17 extra=1 diff=207 charge=159
+  invoke                 exit=HOST(3) φ8=7 diff=1016 inner-used=0 invoke-charge=968
+  peek 4 KiB             φ7=0 arg=0x10000 extra=0x1000 diff=1769 charge=1721
+  peek 4 KiB             φ7=0 arg=0x11000 extra=0x1000 diff=1769 charge=1721
+  expunge                φ7=20 arg=0 extra=20 diff=383 charge=335
+  machine                φ7=0 arg=20 extra=0 diff=1915 charge=1867
+  pages alloc rw         φ7=0 arg=16 extra=2 diff=565 charge=517
+  poke 4 KiB             φ7=0 arg=0x10000 extra=0x1000 diff=1241 charge=1193
+  poke 4 KiB             φ7=0 arg=0x11000 extra=0x1000 diff=1241 charge=1193
+  pages set ro           φ7=0 arg=16 extra=2 diff=236 charge=188
+  poke read-only page    φ7=OOB arg=0x10000 extra=4 diff=346 charge=298
+  invoke                 exit=FAULT(2) φ8=0x10000 diff=1117 inner-used=101 invoke-charge=968
+  pages set rw           φ7=0 arg=16 extra=1 diff=207 charge=159
+  invoke                 exit=HALT(0) φ8=0x36000 diff=1016 inner-used=0 invoke-charge=968
+  check                  a=0x55667788aabbccdd b=0x11223344 c=0 ok=1
+  expunge                φ7=0 arg=0 extra=0 diff=383 charge=335
+  machine                φ7=0 arg=0 extra=0 diff=1915 charge=1867
+  pages alloc rw arena   φ7=0 arg=32 extra=2048 diff=248131 charge=248083
+  pages set ro arena     φ7=0 arg=32 extra=2048 diff=59570 charge=59522
+  pages set rw arena     φ7=0 arg=32 extra=2048 diff=59570 charge=59522
+  expunge                φ7=0 arg=0 extra=0 diff=383 charge=335
+  parameters             G_A=0x989680 G_I=0x2faf080 (fetch kind 0: 122 bytes)
+  parameters             G_R=0x3b9aca00 G_T=0x1312d00
+  unserved 0x480         φ7=WHAT arg=0 extra=0 diff=1048 charge=1000
+  log                    φ7=WHAT arg=0 extra=0 diff=1048 charge=1000
+  export 4 KiB           φ7=0 arg=0 extra=0x51860886e594f82a diff=3569 charge=3521
+  export 4 KiB           φ7=1 arg=1 extra=0xc98f136eb9aad8f5 diff=3569 charge=3521
+  done
+== VOS JAM-only host, interpreter (gas used 1062025): 34 of 36 records agree in results and own charge; the others:
+  #29 PolkaJam: parameters             G_A=0x989680 G_I=0x2faf080 (fetch kind 0: 122 bytes)
+      VOS:      parameters             G_A=0 G_I=0 (fetch kind 0: 0 bytes)
+  #30 PolkaJam: parameters             G_R=0x3b9aca00 G_T=0x1312d00
+      VOS:      parameters             G_R=0 G_T=0
+== VOS JAM-only host, recompiler (gas used 1062025): 34 of 36 records agree in results and own charge; the others:
+  #29 PolkaJam: parameters             G_A=0x989680 G_I=0x2faf080 (fetch kind 0: 122 bytes)
+      VOS:      parameters             G_A=0 G_I=0 (fetch kind 0: 0 bytes)
+  #30 PolkaJam: parameters             G_R=0x3b9aca00 G_T=0x1312d00
+      VOS:      parameters             G_R=0 G_T=0

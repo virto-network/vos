@@ -1,0 +1,102 @@
+== VOS JAM-only host, interpreter: exit Halt, gas used 1107173
+  start (gas left)       4999997579
+  calibrate (gas)        diff=96 (gas call=48)
+  machine                φ7=0 arg=0 extra=0 diff=1915 charge=1867
+  pages alloc rw         φ7=0 arg=16 extra=2 diff=565 charge=517
+  pages set ro           φ7=0 arg=16 extra=2 diff=236 charge=188
+  invoke                 exit=FAULT(2) φ8=0x10000 diff=1117 inner-used=101 invoke-charge=968
+  pages set rw           φ7=0 arg=16 extra=1 diff=207 charge=159
+  invoke                 exit=FAULT(2) φ8=0x11000 diff=1016 inner-used=0 invoke-charge=968
+  pages set rw           φ7=0 arg=17 extra=1 diff=207 charge=159
+  invoke                 exit=HOST(3) φ8=7 diff=1016 inner-used=0 invoke-charge=968
+  peek 4 KiB             φ7=0 arg=0x10000 extra=0x1000 diff=1769 charge=1721
+  peek 4 KiB             φ7=0 arg=0x11000 extra=0x1000 diff=1769 charge=1721
+  expunge                φ7=20 arg=0 extra=20 diff=383 charge=335
+  machine                φ7=0 arg=20 extra=0 diff=1915 charge=1867
+  pages alloc rw         φ7=0 arg=16 extra=2 diff=565 charge=517
+  poke 4 KiB             φ7=0 arg=0x10000 extra=0x1000 diff=1241 charge=1193
+  poke 4 KiB             φ7=0 arg=0x11000 extra=0x1000 diff=1241 charge=1193
+  pages set ro           φ7=0 arg=16 extra=2 diff=236 charge=188
+  poke read-only page    φ7=OOB arg=0x10000 extra=4 diff=346 charge=298
+  invoke                 exit=FAULT(2) φ8=0x10000 diff=1117 inner-used=101 invoke-charge=968
+  pages set rw           φ7=0 arg=16 extra=1 diff=207 charge=159
+  invoke                 exit=HALT(0) φ8=0x36000 diff=1016 inner-used=0 invoke-charge=968
+  check                  a=0x55667788aabbccdd b=0x11223344 c=0 ok=1
+  expunge                φ7=0 arg=0 extra=0 diff=383 charge=335
+  machine                φ7=0 arg=0 extra=0 diff=1915 charge=1867
+  pages alloc rw arena   φ7=0 arg=32 extra=2048 diff=248131 charge=248083
+  pages set ro arena     φ7=0 arg=32 extra=2048 diff=59570 charge=59522
+  pages set rw arena     φ7=0 arg=32 extra=2048 diff=59570 charge=59522
+  expunge                φ7=0 arg=0 extra=0 diff=383 charge=335
+  parameters             G_A=0 G_I=0 (fetch kind 0: 0 bytes)
+  parameters             G_R=0 G_T=0
+  unserved 0x480         φ7=WHAT arg=0 extra=0 diff=1048 charge=1000
+  log                    φ7=WHAT arg=0 extra=0 diff=1048 charge=1000
+  export 4 KiB           φ7=0 arg=0 extra=0x51860886e594f82a diff=3569 charge=3521
+  export 4 KiB           φ7=1 arg=1 extra=0xc98f136eb9aad8f5 diff=3569 charge=3521
+  inner run straight     exit=HALT(0) φ8=0x36000 gas-left=999975 inner-used=25
+  inner run starved      exit=OOG(4) φ8=0x36000 gas-left=1 inner-used=0
+  inner run resumed      exit=HALT(0) φ8=0x36000 gas-left=999975 inner-used=25
+  inner run starved      exit=OOG(4) φ8=0x36000 gas-left=22 inner-used=2
+  inner run resumed      exit=HALT(0) φ8=0x36000 gas-left=999977 inner-used=23
+  inner run starved      exit=OOG(4) φ8=0x36000 gas-left=22 inner-used=2
+  expunge                φ7=7 arg=0 extra=7 diff=383 charge=335
+  inner run starved      exit=FAULT(2) φ8=0x11000 gas-left=999899 inner-used=101
+  expunge                φ7=9 arg=0 extra=9 diff=383 charge=335
+  inner run resumed      exit=HOST(3) φ8=7 gas-left=999899 inner-used=101
+  inner run resumed      exit=HOST(3) φ8=7 gas-left=999899 inner-used=101
+  historical_lookup      φ7=NONE arg=0 extra=0 diff=1251 charge=1203
+  historical_lookup      φ7=NONE arg=0 extra=0 diff=1173 charge=1125
+  historical_lookup      φ7=NONE arg=0x1000 extra=0 diff=2229 charge=2181
+  done
+== VOS JAM-only host, recompiler: exit Halt, gas used 1107173
+  start (gas left)       4999997579
+  calibrate (gas)        diff=96 (gas call=48)
+  machine                φ7=0 arg=0 extra=0 diff=1915 charge=1867
+  pages alloc rw         φ7=0 arg=16 extra=2 diff=565 charge=517
+  pages set ro           φ7=0 arg=16 extra=2 diff=236 charge=188
+  invoke                 exit=FAULT(2) φ8=0x10000 diff=1117 inner-used=101 invoke-charge=968
+  pages set rw           φ7=0 arg=16 extra=1 diff=207 charge=159
+  invoke                 exit=FAULT(2) φ8=0x11000 diff=1016 inner-used=0 invoke-charge=968
+  pages set rw           φ7=0 arg=17 extra=1 diff=207 charge=159
+  invoke                 exit=HOST(3) φ8=7 diff=1016 inner-used=0 invoke-charge=968
+  peek 4 KiB             φ7=0 arg=0x10000 extra=0x1000 diff=1769 charge=1721
+  peek 4 KiB             φ7=0 arg=0x11000 extra=0x1000 diff=1769 charge=1721
+  expunge                φ7=20 arg=0 extra=20 diff=383 charge=335
+  machine                φ7=0 arg=20 extra=0 diff=1915 charge=1867
+  pages alloc rw         φ7=0 arg=16 extra=2 diff=565 charge=517
+  poke 4 KiB             φ7=0 arg=0x10000 extra=0x1000 diff=1241 charge=1193
+  poke 4 KiB             φ7=0 arg=0x11000 extra=0x1000 diff=1241 charge=1193
+  pages set ro           φ7=0 arg=16 extra=2 diff=236 charge=188
+  poke read-only page    φ7=OOB arg=0x10000 extra=4 diff=346 charge=298
+  invoke                 exit=FAULT(2) φ8=0x10000 diff=1117 inner-used=101 invoke-charge=968
+  pages set rw           φ7=0 arg=16 extra=1 diff=207 charge=159
+  invoke                 exit=HALT(0) φ8=0x36000 diff=1016 inner-used=0 invoke-charge=968
+  check                  a=0x55667788aabbccdd b=0x11223344 c=0 ok=1
+  expunge                φ7=0 arg=0 extra=0 diff=383 charge=335
+  machine                φ7=0 arg=0 extra=0 diff=1915 charge=1867
+  pages alloc rw arena   φ7=0 arg=32 extra=2048 diff=248131 charge=248083
+  pages set ro arena     φ7=0 arg=32 extra=2048 diff=59570 charge=59522
+  pages set rw arena     φ7=0 arg=32 extra=2048 diff=59570 charge=59522
+  expunge                φ7=0 arg=0 extra=0 diff=383 charge=335
+  parameters             G_A=0 G_I=0 (fetch kind 0: 0 bytes)
+  parameters             G_R=0 G_T=0
+  unserved 0x480         φ7=WHAT arg=0 extra=0 diff=1048 charge=1000
+  log                    φ7=WHAT arg=0 extra=0 diff=1048 charge=1000
+  export 4 KiB           φ7=0 arg=0 extra=0x51860886e594f82a diff=3569 charge=3521
+  export 4 KiB           φ7=1 arg=1 extra=0xc98f136eb9aad8f5 diff=3569 charge=3521
+  inner run straight     exit=HALT(0) φ8=0x36000 gas-left=999975 inner-used=25
+  inner run starved      exit=OOG(4) φ8=0x36000 gas-left=1 inner-used=0
+  inner run resumed      exit=HALT(0) φ8=0x36000 gas-left=999975 inner-used=25
+  inner run starved      exit=OOG(4) φ8=0x36000 gas-left=22 inner-used=2
+  inner run resumed      exit=HALT(0) φ8=0x36000 gas-left=999977 inner-used=23
+  inner run starved      exit=OOG(4) φ8=0x36000 gas-left=22 inner-used=2
+  expunge                φ7=7 arg=0 extra=7 diff=383 charge=335
+  inner run starved      exit=FAULT(2) φ8=0x11000 gas-left=999899 inner-used=101
+  expunge                φ7=9 arg=0 extra=9 diff=383 charge=335
+  inner run resumed      exit=HOST(3) φ8=7 gas-left=999899 inner-used=101
+  inner run resumed      exit=HOST(3) φ8=7 gas-left=999899 inner-used=101
+  historical_lookup      φ7=NONE arg=0 extra=0 diff=1251 charge=1203
+  historical_lookup      φ7=NONE arg=0 extra=0 diff=1173 charge=1125
+  historical_lookup      φ7=NONE arg=0x1000 extra=0 diff=2229 charge=2181
+  done

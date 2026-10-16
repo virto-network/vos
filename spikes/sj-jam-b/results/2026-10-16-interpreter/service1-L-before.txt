@@ -1,0 +1,13 @@
+== PolkaJam
+package hash  6fe82359bc8ad372cb2db963875a0dc24b38dd8bc8cd386f303e4b75ca4639f1
+segment root  0000000000000000000000000000000000000000000000000000000000000000
+gas limit     10000000
+payload       "L"
+  start (gas left)       999997929
+  calibrate (gas)        diff=96 (gas call=48)
+  historical_lookup      φ7=NONE arg=0 extra=0 diff=1251 charge=1203
+  historical_lookup      φ7=NONE arg=0 extra=0 diff=1173 charge=1125
+  historical_lookup      φ7=NONE arg=0x1000 extra=0 diff=2229 charge=2181
+  done
+== VOS JAM-only host, interpreter (gas used 11663): 6 of 6 records agree in results and own charge; the others:
+== VOS JAM-only host, recompiler (gas used 11663): 6 of 6 records agree in results and own charge; the others:

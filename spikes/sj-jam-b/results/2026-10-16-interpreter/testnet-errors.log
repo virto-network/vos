@@ -1,0 +1,13 @@
+804:node4: 2026-10-16 17:56:00.037015 ThreadId(35) ERROR jam_node::chain::exec::in_core  Work package produced 0 exports; expected export count = 2
+805:node2: 2026-10-16 17:56:00.037286 ThreadId(35) ERROR jam_node::chain::exec::in_core  Work package produced 0 exports; expected export count = 2
+806:node0: 2026-10-16 17:56:00.037325 ThreadId(35) ERROR jam_node::chain::exec::in_core  Work package produced 0 exports; expected export count = 2
+916:node0: 2026-10-16 17:56:12.009072 ThreadId(36) ERROR jam_node::chain::exec::in_core  Work package produced 0 exports; expected export count = 2
+937:node4: 2026-10-16 17:56:12.016523 ThreadId(36) ERROR jam_node::chain::exec::in_core  Work package produced 0 exports; expected export count = 2
+945:node5: 2026-10-16 17:56:12.018748 ThreadId(36) ERROR jam_node::chain::exec::in_core  Work package produced 0 exports; expected export count = 2
+946:node1: 2026-10-16 17:56:12.019011 ThreadId(36) ERROR jam_node::chain::exec::in_core  Work package produced 0 exports; expected export count = 2
+948:node2: 2026-10-16 17:56:12.019237 ThreadId(36) ERROR jam_node::chain::exec::in_core  Work package produced 0 exports; expected export count = 2
+956:node3: 2026-10-16 17:56:12.026520 ThreadId(36) ERROR jam_node::chain::exec::in_core  Work package produced 0 exports; expected export count = 2
+3056:node2: 2026-10-16 17:58:56.611843 ThreadId(18) ERROR jam_node::chain::guarantors::signatures_merger  Failed to merge work reports for work package 0x423f1b8e5f6acec3...: Not enough signatures from secondary guarantors
+node6: 2026-10-16 17:55:03.928914 ThreadId(1) INFO jam_node::node  PVM backend: interpreter
+node0: 2026-10-16 17:55:03.972167 ThreadId(1) INFO jam_node::node  PVM backend: interpreter
+node2: 2026-10-16 17:55:03.978651 ThreadId(1) INFO jam_node::node  PVM backend: interpreter

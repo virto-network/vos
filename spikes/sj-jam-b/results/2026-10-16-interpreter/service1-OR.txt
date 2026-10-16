@@ -1,0 +1,21 @@
+== PolkaJam
+package hash  ea01aed1b2b8e716f22c433026c7b1b9ec0b788e9cdbd07a822f6b5ec90ae785
+segment root  0000000000000000000000000000000000000000000000000000000000000000
+gas limit     10000000
+payload       "OR"
+  start (gas left)       999997879
+  calibrate (gas)        diff=96 (gas call=48)
+  inner run straight     exit=HALT(0) φ8=0x36000 gas-left=999975 inner-used=25
+  inner run starved      exit=OOG(4) φ8=0x36000 gas-left=1 inner-used=0
+  inner run resumed      exit=HALT(0) φ8=0x36000 gas-left=999975 inner-used=25
+  inner run starved      exit=OOG(4) φ8=0x36000 gas-left=22 inner-used=2
+  inner run resumed      exit=HALT(0) φ8=0x36000 gas-left=999977 inner-used=23
+  inner run starved      exit=OOG(4) φ8=0x36000 gas-left=22 inner-used=2
+  expunge                φ7=7 arg=0 extra=7 diff=383 charge=335
+  inner run starved      exit=FAULT(2) φ8=0x11000 gas-left=999899 inner-used=101
+  expunge                φ7=9 arg=0 extra=9 diff=383 charge=335
+  inner run resumed      exit=HOST(3) φ8=7 gas-left=999899 inner-used=101
+  inner run resumed      exit=HOST(3) φ8=7 gas-left=999899 inner-used=101
+  done
+== VOS JAM-only host, interpreter (gas used 42966): 14 of 14 records agree in results and own charge; the others:
+== VOS JAM-only host, recompiler (gas used 42966): 14 of 14 records agree in results and own charge; the others:

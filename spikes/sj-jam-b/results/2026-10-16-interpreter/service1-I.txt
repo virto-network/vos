@@ -1,0 +1,44 @@
+== PolkaJam
+package hash  e788f166739b9bcce50d75a8d914e2020b69ae2dfb73c73b84fbda3644ab8ccd
+segment root  0000000000000000000000000000000000000000000000000000000000000000
+gas limit     10000000
+payload       "I"
+  start (gas left)       999997929
+  calibrate (gas)        diff=96 (gas call=48)
+  fetch our import       φ7=0x1008 arg=0xe0c1a28330474553 extra=1 diff=219 charge=171
+  imported page hash     fnv=0x51860886e594f82a index=0
+  fetch our import       φ7=0x1008 arg=0xba9bf8d931474553 extra=1 diff=219 charge=171
+  imported page hash     fnv=0xc98f136eb9aad8f5 index=1
+  fetch our import       φ7=NONE arg=0xeeeeeeeeeeeeeeee extra=0 diff=219 charge=171
+  fetch any import       φ7=0x1008 arg=0xba9bf8d931474553 extra=0xc98f136eb9aad8f5 diff=219 charge=171
+  done
+== VOS JAM-only host, interpreter (gas used 167450): 2 of 9 records agree in results and own charge; the others:
+  #2  PolkaJam: fetch our import       φ7=0x1008 arg=0xe0c1a28330474553 extra=1 diff=219 charge=171
+      VOS:      fetch our import       φ7=NONE arg=0xeeeeeeeeeeeeeeee extra=0 diff=219 charge=171
+  #3  PolkaJam: imported page hash     fnv=0x51860886e594f82a index=0
+      VOS:      fetch our import       φ7=NONE arg=0xeeeeeeeeeeeeeeee extra=0 diff=219 charge=171
+  #4  PolkaJam: fetch our import       φ7=0x1008 arg=0xba9bf8d931474553 extra=1 diff=219 charge=171
+      VOS:      fetch our import       φ7=NONE arg=0xeeeeeeeeeeeeeeee extra=0 diff=219 charge=171
+  #5  PolkaJam: imported page hash     fnv=0xc98f136eb9aad8f5 index=1
+      VOS:      fetch any import       φ7=NONE arg=0xeeeeeeeeeeeeeeee extra=0x4791325bcc2a6325 diff=219 charge=171
+  #6  PolkaJam: fetch our import       φ7=NONE arg=0xeeeeeeeeeeeeeeee extra=0 diff=219 charge=171
+      VOS:      done
+  #7  PolkaJam: fetch any import       φ7=0x1008 arg=0xba9bf8d931474553 extra=0xc98f136eb9aad8f5 diff=219 charge=171
+      VOS:      -
+  #8  PolkaJam: done
+      VOS:      -
+== VOS JAM-only host, recompiler (gas used 167450): 2 of 9 records agree in results and own charge; the others:
+  #2  PolkaJam: fetch our import       φ7=0x1008 arg=0xe0c1a28330474553 extra=1 diff=219 charge=171
+      VOS:      fetch our import       φ7=NONE arg=0xeeeeeeeeeeeeeeee extra=0 diff=219 charge=171
+  #3  PolkaJam: imported page hash     fnv=0x51860886e594f82a index=0
+      VOS:      fetch our import       φ7=NONE arg=0xeeeeeeeeeeeeeeee extra=0 diff=219 charge=171
+  #4  PolkaJam: fetch our import       φ7=0x1008 arg=0xba9bf8d931474553 extra=1 diff=219 charge=171
+      VOS:      fetch our import       φ7=NONE arg=0xeeeeeeeeeeeeeeee extra=0 diff=219 charge=171
+  #5  PolkaJam: imported page hash     fnv=0xc98f136eb9aad8f5 index=1
+      VOS:      fetch any import       φ7=NONE arg=0xeeeeeeeeeeeeeeee extra=0x4791325bcc2a6325 diff=219 charge=171
+  #6  PolkaJam: fetch our import       φ7=NONE arg=0xeeeeeeeeeeeeeeee extra=0 diff=219 charge=171
+      VOS:      done
+  #7  PolkaJam: fetch any import       φ7=0x1008 arg=0xba9bf8d931474553 extra=0xc98f136eb9aad8f5 diff=219 charge=171
+      VOS:      -
+  #8  PolkaJam: done
+      VOS:      -
