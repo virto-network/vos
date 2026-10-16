@@ -458,6 +458,9 @@ pub fn touched_pages(side_note: &crate::side_note::SideNote) -> BTreeSet<u32> {
         if let Some(ref w) = step.mem_write {
             add_range(&mut pages, w.address, w.size as u32);
         }
+        if let Some(ref w) = step.witness {
+            add_range(&mut pages, w.address, w.bytes.len() as u32);
+        }
     }
     for op in &side_note.blake2b_mem_ops {
         add_range(&mut pages, op.h_ptr, op.h_bytes.len() as u32);

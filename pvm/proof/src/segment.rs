@@ -55,7 +55,9 @@ pub fn segment_bounds(total: usize, max_steps: usize) -> alloc::vec::Vec<(usize,
 #[cfg(feature = "prover")]
 mod prover {
     use crate::chips::blake2b::Blake2bCall;
-    use crate::core::step::{CompactStep, MemAccess, NUM_REGS, PvmStep, expand_steps};
+    use crate::core::step::{
+        CompactStep, MemAccess, NUM_REGS, PvmStep, WitnessWrite, expand_steps,
+    };
     use crate::core::tracing::{
         Blake2bMemOp, RistrettoMemOp, RistrettoPointAddMemOp, RistrettoPointAddRecord,
         RistrettoRecord, ScalarBinopMemOp, ScalarBinopRecord, ScalarMultKind,
@@ -74,6 +76,7 @@ mod prover {
         fn ts(&self) -> u64;
         fn read_access(&self) -> Option<&MemAccess>;
         fn write_access(&self) -> Option<&MemAccess>;
+        fn witness_write(&self) -> Option<&WitnessWrite>;
     }
 
     impl StepView for PvmStep {
@@ -86,6 +89,9 @@ mod prover {
         fn write_access(&self) -> Option<&MemAccess> {
             self.mem_write.as_ref()
         }
+        fn witness_write(&self) -> Option<&WitnessWrite> {
+            self.witness.as_deref()
+        }
     }
 
     impl StepView for CompactStep {
@@ -97,6 +103,9 @@ mod prover {
         }
         fn write_access(&self) -> Option<&MemAccess> {
             self.mem_write.as_ref()
+        }
+        fn witness_write(&self) -> Option<&WitnessWrite> {
+            self.witness.as_deref()
         }
     }
 
@@ -287,6 +296,9 @@ mod prover {
         }
         if let Some(w) = s.write_access() {
             out.push((w.address, w.size as u32));
+        }
+        if let Some(w) = s.witness_write() {
+            out.push((w.address, w.bytes.len() as u32));
         }
     }
 
@@ -591,10 +603,8 @@ mod prover {
         let keep = |ts: u64| ts_upper.is_none_or(|t| ts < t);
         let mut writes = Vec::new();
         for step in &side_note.steps {
-            if keep(step.timestamp)
-                && let Some(write) = write_of_step(step)
-            {
-                writes.push(write);
+            if keep(step.timestamp) {
+                writes_of_step(step, &mut writes);
             }
         }
         for op in &side_note.blake2b_mem_ops {
@@ -630,16 +640,23 @@ mod prover {
     /// output, the widest write.
     type PendingWrite = (u64, u32, [u8; 64], u8);
 
-    /// The step's regular store as a pending write, if it made one.
-    /// Generic over the step form ([`StepView`]) so the full and compact
-    /// replay paths enumerate identical writes.
-    fn write_of_step<S: StepView>(s: &S) -> Option<PendingWrite> {
-        s.write_access().map(|w| {
+    /// The step's regular store, and the bytes a witness-input call
+    /// wrote, a buffer's worth a write, as pending writes. Generic over the
+    /// step form ([`StepView`]) so the full and compact replay paths
+    /// enumerate identical writes.
+    fn writes_of_step<S: StepView>(s: &S, out: &mut Vec<PendingWrite>) {
+        if let Some(w) = s.write_access() {
             let sz = w.size as usize;
             let mut buf = [0u8; 64];
             buf[..sz].copy_from_slice(&w.value.to_le_bytes()[..sz]);
-            (s.ts(), w.address, buf, sz as u8)
-        })
+            out.push((s.ts(), w.address, buf, sz as u8));
+        }
+        if let Some(w) = s.witness_write() {
+            for (index, chunk) in w.bytes.chunks(64).enumerate() {
+                let address = w.address + 64 * index as u32;
+                out.push(write_of_bytes(s.ts(), address, chunk));
+            }
+        }
     }
 
     /// A precompile output write (blake2b's 64 bytes at `h_ptr`; the
@@ -651,10 +668,11 @@ mod prover {
     }
 
     /// Sort pending writes by timestamp and apply them over `mem`, growing
-    /// it when a write lands past the current end. Each timestamp has at
-    /// most one write (a step is either a regular store or exactly one
-    /// ECALL precompile), so sorting by ts yields a well-defined replay
-    /// order with later writes overwriting earlier.
+    /// it when a write lands past the current end. Each timestamp has one
+    /// write (a step is either a regular store or exactly one ECALL
+    /// precompile), or a witness input's disjoint pieces, so sorting by ts
+    /// yields a well-defined replay order with later writes overwriting
+    /// earlier.
     fn apply_writes(mem: &mut Vec<u8>, mut writes: Vec<PendingWrite>) {
         writes.sort_by_key(|w| w.0);
         for (_ts, addr, buf, len) in &writes {
@@ -770,9 +788,7 @@ mod prover {
                 if s.timestamp >= ts_lo {
                     break;
                 }
-                if let Some(w) = write_of_step(s) {
-                    writes.push(w);
-                }
+                writes_of_step(s, &mut writes);
                 self.steps_at += 1;
             }
             self.streams
@@ -945,9 +961,7 @@ mod prover {
                 if s.timestamp >= ts_lo {
                     break;
                 }
-                if let Some(w) = write_of_step(s) {
-                    writes.push(w);
-                }
+                writes_of_step(s, &mut writes);
                 if let Some(rw) = s.reg_write {
                     self.regs[rw.index as usize] = rw.value;
                 }
@@ -1456,9 +1470,7 @@ mod prover {
         fn retire(&mut self, w: ClosedWindow) {
             let mut writes: Vec<PendingWrite> = Vec::new();
             for s in &w.buf.steps {
-                if let Some(pw) = write_of_step(s) {
-                    writes.push(pw);
-                }
+                writes_of_step(s, &mut writes);
                 if let Some(rw) = s.reg_write {
                     self.regs[rw.index as usize] = rw.value;
                 }
@@ -1538,6 +1550,7 @@ mod tests {
             gas_charged: 0,
             next_pc: 0,
             host_call_acknowledged: false,
+            witness: None,
             exit: false,
         }
     }

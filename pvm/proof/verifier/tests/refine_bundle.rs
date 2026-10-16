@@ -15,7 +15,7 @@ struct TrustedPrograms(
     Vec<(
         RefineMachineId,
         u32,
-        u32,
+        u64,
         Vec<u32>,
         PcsConfig,
         CommitmentHash,
@@ -48,7 +48,7 @@ impl RefineProgramCommitmentResolver for TrustedPrograms {
         &self,
         identity: RefineMachineId,
         proof_format_version: u32,
-        component_mask: u32,
+        component_mask: u64,
         log_sizes: &[u32],
         pcs_config: &PcsConfig,
     ) -> Option<CommitmentHash> {
@@ -72,7 +72,7 @@ impl RefineProgramCommitmentResolver for ResolverMustNotRun {
         &self,
         _identity: RefineMachineId,
         _proof_format_version: u32,
-        _component_mask: u32,
+        _component_mask: u64,
         _log_sizes: &[u32],
         _pcs_config: &PcsConfig,
     ) -> Option<CommitmentHash> {

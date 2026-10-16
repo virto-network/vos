@@ -2628,8 +2628,12 @@ dependencies = [
  "stwo-constraint-framework",
  "vos-pvm",
  "vos-pvm-compiler",
+ "vos-pvm-precompiles",
+ "vos-pvm-program",
  "vos-pvm-proof-derive",
  "vos-pvm-proof-verifier",
+ "vos-testkit",
+ "vos-wire",
 ]
 
 [[package]]

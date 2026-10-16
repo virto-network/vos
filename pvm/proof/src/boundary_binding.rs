@@ -95,9 +95,9 @@ pub struct BoundaryChipPositions {
 /// is missing — such a proof cannot bind its boundary states and must be
 /// rejected by verifiers that read them. All three chips are
 /// unconditionally active in the production prove path.
-pub fn boundary_positions_in_mask(mask: u32) -> Option<BoundaryChipPositions> {
+pub fn boundary_positions_in_mask(mask: u64) -> Option<BoundaryChipPositions> {
     let pos = |idx: usize| -> Option<usize> {
-        (mask & (1u32 << idx) != 0).then(|| (mask & ((1u32 << idx) - 1)).count_ones() as usize)
+        (mask & (1u64 << idx) != 0).then(|| (mask & ((1u64 << idx) - 1)).count_ones() as usize)
     };
     Some(BoundaryChipPositions {
         register_boundary: pos(crate::chip_idx::REGISTER_MEMORY_BOUNDARY)?,

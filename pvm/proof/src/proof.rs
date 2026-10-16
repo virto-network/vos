@@ -177,21 +177,30 @@ use crate::recursion_pcs::ProverMerkleHasher;
 ///        column (the program-memory tuple drops from 33 to 32 limbs), so
 ///        program commitments change. Older proofs reject.
 ///   25 — Poseidon2-M31 PCS variant of format 24.
+///   26 — A run's ends and its witness input. A halting step continues at
+///        the halt address, so a segment's final pc is the halt address
+///        exactly when it ends at a halt. A kernel's witness-input call
+///        (0x401, dispatch 101) writes its count to φ7, at most φ8, and
+///        `WitnessInputChip` (index 13, shifting every later chip by one;
+///        `COUNT` 32 → 33, the component mask a `u64`) writes exactly its
+///        bytes. The register ledger sorts a register's reads before its
+///        writes within a timestamp. Older proofs reject.
+///   27 — Poseidon2-M31 PCS variant of format 26.
 #[cfg(not(feature = "poseidon2-channel"))]
-pub const PROOF_FORMAT_VERSION: u32 = 24;
+pub const PROOF_FORMAT_VERSION: u32 = 26;
 /// Native recursion: the PCS commit hash + Fiat-Shamir
 /// transcript move from Blake2s to Poseidon2-M31, so `stark_proof.commitments`
 /// become `P2Hash` digests — a different wire format. A Blake2s verifier
-/// (v24) and a Poseidon2-M31 verifier (v25) therefore reject each other's proofs.
+/// (v26) and a Poseidon2-M31 verifier (v27) therefore reject each other's proofs.
 #[cfg(feature = "poseidon2-channel")]
-pub const PROOF_FORMAT_VERSION: u32 = 25;
+pub const PROOF_FORMAT_VERSION: u32 = 27;
 
 /// Exact number of commitment trees in this generation of the Stwo proof:
 /// preprocessed, main, interaction, and split composition.
 pub const PROOF_COMMITMENT_TREE_COUNT: usize = 4;
 /// The component mask is a `u32`; accepting more components would make its
 /// shape ambiguous before any cryptographic check.
-pub const MAX_PROOF_COMPONENTS: usize = u32::BITS as usize;
+pub const MAX_PROOF_COMPONENTS: usize = u64::BITS as usize;
 /// SIMD trace builders use 16 lanes and index rows with
 /// `log_size - LOG_N_LANES`; smaller claimed components are structurally
 /// impossible and can otherwise reach an unchecked subtraction.
@@ -300,7 +309,7 @@ pub struct Proof {
     /// then falls back to count-based inference: full set if count =
     /// BASE_COMPONENTS.len(), Blake2b-skipped if count = len-1).
     #[serde(default)]
-    pub component_mask: u32,
+    pub component_mask: u64,
     pub pcs_config: PcsConfig,
     /// State at segment start. pc/timestamp, registers, and `memory_root`
     /// are bound to the committed boundary columns (boundary-binding check):

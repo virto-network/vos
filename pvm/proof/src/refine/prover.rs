@@ -1025,8 +1025,15 @@ fn observed_step(
         mem_write,
         gas_after: machine.gas,
         gas_charged,
-        next_pc: machine.pc,
+        // A halting step continues at the halt address, as the tracer
+        // records it.
+        next_pc: if observation.exit == Some(&ExitReason::Halt) {
+            vos_pvm::PVM_HALT_ADDR as u32
+        } else {
+            machine.pc
+        },
         host_call_acknowledged: false,
+        witness: None,
         exit: exited,
     })
 }

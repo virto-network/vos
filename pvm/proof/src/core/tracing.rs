@@ -4,7 +4,9 @@ use vos_pvm::args;
 use vos_pvm::instruction::Opcode;
 use vos_pvm::interpreter::Interpreter;
 
-use crate::core::step::{CompactStep, MemAccess, PvmStep, RegWrite, expand_steps};
+use vos_pvm::precompile::{WITNESS_INPUT, WitnessFault, WitnessInput, WitnessRead};
+
+use crate::core::step::{CompactStep, MemAccess, PvmStep, RegWrite, WitnessWrite, expand_steps};
 
 pub use crate::core::ecall::{
     ECALL_BLAKE2B_COMPRESS, ECALL_RISTRETTO_POINT_ADD, ECALL_RISTRETTO_SCALAR_MULT,
@@ -216,6 +218,11 @@ pub struct TracingPvm {
     pub scalar_reduce_wide_mem_ops: Vec<ScalarReduceWideMemOp>,
     pub scalar_binop_records: Vec<ScalarBinopRecord>,
     pub scalar_binop_mem_ops: Vec<ScalarBinopMemOp>,
+    /// The input a kernel's witness-input calls read, when the run has one;
+    /// without it a witness-input call is an unhandled host call.
+    witness_input: Option<WitnessInput<Vec<u8>>>,
+    /// Each witness-input call served, in order.
+    pub witness_reads: Vec<WitnessRead>,
     timestamp: u64,
 }
 
@@ -237,8 +244,25 @@ impl TracingPvm {
             scalar_reduce_wide_mem_ops: Vec::new(),
             scalar_binop_records: Vec::new(),
             scalar_binop_mem_ops: Vec::new(),
+            witness_input: None,
+            witness_reads: Vec::new(),
             timestamp: 1, // 0 is reserved for initial memory entries
         }
+    }
+
+    /// Serve the run's witness-input calls from `input`, as the agent
+    /// served the kernel's live run from the bytes its attest recorded.
+    /// `None` past an input's cap ([`vos_pvm::precompile::WITNESS_INPUT_MAX`]).
+    pub fn with_witness_input(mut self, input: Vec<u8>) -> Option<Self> {
+        self.witness_input = Some(WitnessInput::new(input)?);
+        Some(self)
+    }
+
+    /// The witness input's bytes read so far, and how many remain.
+    pub fn witness_cursor(&self) -> Option<(usize, usize)> {
+        self.witness_input
+            .as_ref()
+            .map(|input| (input.cursor(), input.remaining()))
     }
 
     /// Execute a single step, recording the witness.
@@ -293,7 +317,13 @@ impl TracingPvm {
 
         let regs_after = self.pvm.registers;
         let gas_after = self.pvm.gas;
-        let next_pc = self.pvm.pc;
+        // A halting step continues at the halt address, outside a derived
+        // program's code: its segment ends there only at a halt.
+        let next_pc = if result == Some(ExitReason::Halt) {
+            vos_pvm::PVM_HALT_ADDR as u32
+        } else {
+            self.pvm.pc
+        };
 
         let reg_write = (0..PVM_REGISTER_COUNT).find(|&i| regs_before[i] != regs_after[i]);
         // One interpreter step writes at most one register (every opcode
@@ -353,6 +383,7 @@ impl TracingPvm {
             gas_charged,
             next_pc,
             host_call_acknowledged: false,
+            witness: None,
             exit,
         });
 
@@ -397,8 +428,17 @@ impl TracingPvm {
             return Some(ExitReason::OutOfGas);
         }
         match exit {
+            ExitReason::HostCall(WITNESS_INPUT) if self.witness_input.is_some() => {
+                if let Some(stop) = self.handle_witness_input() {
+                    return Some(stop);
+                }
+            }
             ExitReason::HostCall(id) if id == u64::from(ECALL_BLAKE2B_COMPRESS) => {
-                self.handle_blake2b_ecall();
+                // An argument range the machine cannot read or write
+                // panics it, as the refine host's serving does.
+                if !self.handle_blake2b_ecall() {
+                    return Some(ExitReason::Panic);
+                }
             }
             ExitReason::HostCall(id) if id == u64::from(ECALL_RISTRETTO_SCALAR_MULT) => {
                 self.handle_ristretto_scalar_mult_ecall();
@@ -464,7 +504,50 @@ impl TracingPvm {
         }
     }
 
-    fn handle_blake2b_ecall(&mut self) {
+    /// Serve a witness-input call from the run's input, as the agent serves
+    /// it: its bytes written at φ7, its count in φ7, which the step records
+    /// as its register write, and its bytes as its witness write. A call
+    /// that cannot pay stops the run out of gas, and one whose bytes cannot
+    /// land panics it, neither acknowledged.
+    fn handle_witness_input(&mut self) -> Option<ExitReason> {
+        let input = self.witness_input.as_mut().expect("a witness input");
+        let mut registers = self.pvm.registers;
+        let mut gas = self.pvm.gas;
+        let served = input.serve(&mut registers, self.pvm.memory_mut(), &mut gas);
+        self.pvm.gas = gas;
+        let read = match served {
+            Ok(read) => read,
+            Err(WitnessFault::OutOfGas) => return Some(ExitReason::OutOfGas),
+            Err(WitnessFault::Unwritable) => return Some(ExitReason::Panic),
+        };
+        let bytes = input.read()[read.cursor..read.cursor + read.count].to_vec();
+        self.pvm.registers = registers;
+        self.last_regs = registers;
+        let step = self
+            .steps
+            .last_mut()
+            .expect("a served call has its recorded instruction");
+        // The count is the call's register write, even when φ7 held it.
+        step.reg_write = Some(RegWrite {
+            index: 7,
+            value: registers[7],
+        });
+        step.witness = (read.count > 0).then(|| {
+            Box::new(WitnessWrite {
+                address: read.destination as u32,
+                bytes,
+            })
+        });
+        self.witness_reads.push(read);
+        None
+    }
+
+    /// Serve one compression and record it for the BLAKE2b chip: false when
+    /// an argument range is out of the machine's accessible memory.
+    fn handle_blake2b_ecall(&mut self) -> bool {
+        if self.pvm.memory().is_sparse() {
+            return self.handle_blake2b_ecall_sparse();
+        }
         // Read h (64 bytes) from memory at address in φ[7] (a0).
         //
         // Register convention: vos-pvm-precompiles shim emits a0/a1/a2/a3
@@ -532,6 +615,44 @@ impl TracingPvm {
             m_bytes,
             out_bytes,
         });
+        true
+    }
+
+    /// The compression over a sparse memory, a standard program's layout
+    /// across the whole address space: served by the runtime's own
+    /// [`vos_pvm::precompile::execute`], the refine host's serving, through
+    /// the memory's permission-checked accessors.
+    fn handle_blake2b_ecall_sparse(&mut self) -> bool {
+        let registers = self.pvm.registers;
+        let Some(vos_pvm::precompile::PrecompileCall::Blake2bCompress {
+            h_ptr,
+            m_ptr,
+            h,
+            m,
+            t,
+            f,
+            h_bytes,
+            m_bytes,
+            out_bytes,
+        }) = vos_pvm::precompile::execute(
+            u64::from(ECALL_BLAKE2B_COMPRESS),
+            &registers,
+            self.pvm.memory_mut(),
+        )
+        else {
+            return false;
+        };
+        let ts = self.timestamp - 1;
+        self.blake2b_records.push(Blake2bRecord { h, m, t, f });
+        self.blake2b_mem_ops.push(Blake2bMemOp {
+            h_ptr,
+            m_ptr,
+            ts,
+            h_bytes,
+            m_bytes,
+            out_bytes,
+        });
+        true
     }
 
     /// Read 32 scalar bytes + 32 compressed-point bytes from flat_mem,

@@ -18,6 +18,17 @@ pub const ECALL_BLAKE2B_COMPRESS: u32 = 0x400;
 /// CPU-chip dispatch code for the BLAKE2b relation.
 pub(crate) const DISPATCH_BLAKE2B_COMPRESS: u8 = 100;
 
+/// Hostcall ID for a kernel's witness input (`vos_pvm::precompile::WITNESS_INPUT`):
+/// φ\[7\] the destination, φ\[8\] the capacity. It writes the next
+/// `min(capacity, remaining)` bytes of the run's input at the destination
+/// and returns their count in φ\[7\]. The bytes are free witness; the
+/// CPU chip selects the call by `DISPATCH_WITNESS_INPUT` and binds its
+/// registers, its count and the range it writes
+/// (`chips::WitnessInputChip`).
+pub const ECALL_WITNESS_INPUT: u32 = 0x401;
+/// CPU-chip dispatch code for the witness input.
+pub(crate) const DISPATCH_WITNESS_INPUT: u8 = 101;
+
 /// Hostcall ID for Ristretto255 scalar multiplication precompile.
 ///
 /// Convention:
@@ -106,13 +117,14 @@ pub(crate) fn is_one_of(id: u64, ids: &[u32]) -> bool {
 }
 
 /// Whether the proof runtime has a deterministic handler for this `ecalli`
-/// identifier: exactly the cryptographic precompiles handled by
-/// [`crate::core::tracing::TracingPvm`].
+/// identifier: exactly the calls [`crate::core::tracing::TracingPvm`]
+/// serves.
 ///
-/// This is the runtime's precompile set plus the Ristretto and scalar ids
-/// 110–114, which only this tracer serves: the refine host answers them with
-/// `WHAT`, and the guest computes in software. A program using them
-/// therefore traces differently here than it runs on VOS.
+/// This is a kernel's calls, the runtime's precompile set and the witness
+/// input, plus the Ristretto and scalar ids 110–114, which only this tracer
+/// serves: the refine host answers them with `WHAT`, and the guest computes
+/// in software. A program using them therefore traces differently here than
+/// it runs on VOS.
 ///
 /// ProgramMemory commits the dispatch identifier, which is non-zero exactly
 /// for these calls, so an untrusted prover cannot mark an unknown call as
@@ -121,13 +133,15 @@ pub(crate) const fn is_proof_host_call_allowed(id: u64) -> bool {
     proof_precompile_dispatch_id(id) != 0
 }
 
-/// Exact proof-chip dispatch identifier for a cryptographic precompile, or
+/// Exact proof-chip dispatch identifier for a precompile or the witness
+/// input, or
 /// zero for any other identifier. A non-zero value is committed by
 /// ProgramMemory and binds a continued host-call row to the matching CPU
 /// selector (and therefore to that selector's call relation).
 pub const fn proof_precompile_dispatch_id(id: u64) -> u8 {
     match id {
         id if id == ECALL_BLAKE2B_COMPRESS as u64 => DISPATCH_BLAKE2B_COMPRESS,
+        id if id == ECALL_WITNESS_INPUT as u64 => DISPATCH_WITNESS_INPUT,
         id if id == ECALL_RISTRETTO_SCALAR_MULT as u64 => ECALL_RISTRETTO_SCALAR_MULT as u8,
         id if id == ECALL_RISTRETTO_POINT_ADD as u64 => ECALL_RISTRETTO_POINT_ADD as u8,
         id if id == ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE as u64 => {
@@ -143,15 +157,20 @@ pub const fn proof_precompile_dispatch_id(id: u64) -> u8 {
 mod tests {
     use super::*;
 
-    /// The tracer serves exactly the refine host's precompiles plus the
-    /// Ristretto and scalar ids 110–114.
+    /// The tracer serves exactly the calls a kernel may make, the refine
+    /// host's precompiles and the witness input, plus the Ristretto and
+    /// scalar ids 110–114.
     #[test]
-    fn tracer_serves_the_runtime_precompiles_plus_the_ristretto_ids() {
+    fn tracer_serves_the_kernel_calls_plus_the_ristretto_ids() {
+        assert_eq!(
+            u64::from(ECALL_WITNESS_INPUT),
+            vos_pvm::precompile::WITNESS_INPUT
+        );
         for id in 0..0x1000u64 {
             let ristretto = (110..=114).contains(&id);
             assert_eq!(
                 is_proof_host_call_allowed(id),
-                vos_pvm::precompile::is_precompile(id) || ristretto,
+                vos_pvm::precompile::is_kernel_call(id) || ristretto,
                 "id {id:#x}"
             );
         }

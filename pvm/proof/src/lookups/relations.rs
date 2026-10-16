@@ -202,6 +202,15 @@ stwo_constraint_framework::relation!(ByteToBitsLookupElements, REL_BYTE_TO_BITS_
 const REL_BLAKE2B_CALL_LOOKUP_SIZE: usize = 4 + 4 + WORD_SIZE + 1 + TS_SIZE;
 stwo_constraint_framework::relation!(Blake2bCallLookupElements, REL_BLAKE2B_CALL_LOOKUP_SIZE);
 
+// (ts[8], destination[4], count[1]) — one tuple per witness-input call that
+// wrote bytes.  CpuChip produces it twice from the call's row (its timestamp,
+// φ[7]'s low four bytes, and the count it writes to φ[7], below 2^24);
+// WitnessInputChip consumes it twice at the call's first byte row, which
+// starts the chain of `count` rows writing consecutive addresses from the
+// destination at that timestamp.
+const REL_WITNESS_CALL_LOOKUP_SIZE: usize = TS_SIZE + 4 + 1;
+stwo_constraint_framework::relation!(WitnessCallLookupElements, REL_WITNESS_CALL_LOOKUP_SIZE);
+
 // (h_in[64], m[128], t[8], f[1], h_out[64]) — one tuple per blake2b
 // compression of the in-AIR memory-page Merkle boundary multiproof, bound
 // WITHOUT a memory-ledger / CPU-call binding.  Blake2bBoundaryChip PRODUCES

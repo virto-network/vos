@@ -88,7 +88,7 @@ pub trait RefineProgramCommitmentResolver {
         &self,
         identity: RefineMachineId,
         proof_format_version: u32,
-        component_mask: u32,
+        component_mask: u64,
         log_sizes: &[u32],
         pcs_config: &stwo::core::pcs::PcsConfig,
     ) -> Option<CommitmentHash>;
@@ -96,13 +96,13 @@ pub trait RefineProgramCommitmentResolver {
 
 impl<F> RefineProgramCommitmentResolver for F
 where
-    F: Fn(RefineMachineId, u32, u32, &[u32], &stwo::core::pcs::PcsConfig) -> Option<CommitmentHash>,
+    F: Fn(RefineMachineId, u32, u64, &[u32], &stwo::core::pcs::PcsConfig) -> Option<CommitmentHash>,
 {
     fn resolve_preprocessed_commitment(
         &self,
         identity: RefineMachineId,
         proof_format_version: u32,
-        component_mask: u32,
+        component_mask: u64,
         log_sizes: &[u32],
         pcs_config: &stwo::core::pcs::PcsConfig,
     ) -> Option<CommitmentHash> {
@@ -449,9 +449,9 @@ fn verify_standalone_shaped(
                 .to_string(),
         ));
     }
-    let supported_mask = 1u32
+    let supported_mask = 1u64
         .checked_shl(vos_pvm_proof::chip_idx::COUNT as u32)
-        .map_or(u32::MAX, |end| end - 1);
+        .map_or(u64::MAX, |end| end - 1);
     if proof.component_mask & !supported_mask != 0 {
         return Err(VerificationError::InvalidStructure(
             "component_mask selects a component outside this AIR generation".to_string(),

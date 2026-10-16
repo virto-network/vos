@@ -319,10 +319,10 @@ fn prove_preflights_slice_cardinality_without_proving() {
 #[test]
 fn proof_generation_numbers_reject_previous_formats() {
     #[cfg(not(feature = "poseidon2-channel"))]
-    assert_eq!(crate::PROOF_FORMAT_VERSION, 24);
+    assert_eq!(crate::PROOF_FORMAT_VERSION, 26);
     #[cfg(feature = "poseidon2-channel")]
-    assert_eq!(crate::PROOF_FORMAT_VERSION, 25);
-    for previous in 16..=23 {
+    assert_eq!(crate::PROOF_FORMAT_VERSION, 27);
+    for previous in 16..=25 {
         assert_ne!(crate::PROOF_FORMAT_VERSION, previous);
     }
 }

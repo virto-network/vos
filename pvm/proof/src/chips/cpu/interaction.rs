@@ -29,7 +29,7 @@ use crate::lookups::{
     DivRemLookupElements, JumpTableLookupElements, LogupTraceBuilder, MemoryAccessLookupElements,
     MultiplicationLookupElements, PopcountLookupElements, PowerOfTwoLookupElements,
     ProgramExecutionLookupElements, ProgramMemoryLookupElements, Range256LookupElements,
-    RegisterMemoryLookupElements, RistrettoCallLookupElements,
+    RegisterMemoryLookupElements, RistrettoCallLookupElements, WitnessCallLookupElements,
 };
 use crate::trace::component::ComponentTrace;
 
@@ -434,9 +434,12 @@ pub(super) fn generate_interaction_trace(
         let is_112 = crate::trace::original_base_column!(component_trace, Column::Is112Ecall);
         let is_113 = crate::trace::original_base_column!(component_trace, Column::Is113Ecall);
         let is_114 = crate::trace::original_base_column!(component_trace, Column::Is114Ecall);
+        let is_witness =
+            crate::trace::original_base_column!(component_trace, Column::IsWitnessEcall);
 
         // Register-read producers: (reg_idx, value[8], ts[8], is_write=0).
-        // φ[7] and φ[8] for all five ids; φ[9] for all except 112.
+        // φ[7] and φ[8] for all five ids and the witness input; φ[9] for
+        // all five ids except 112.
         for (reg_idx, value, not_112) in [
             (7u32, phi10.clone(), false),
             (8u32, phi11.clone(), false),
@@ -451,15 +454,16 @@ pub(super) fn generate_interaction_trace(
                 is_112[0].clone(),
                 is_113[0].clone(),
                 is_114[0].clone(),
+                is_witness[0].clone(),
             ];
             logup.add_to_relation_computed(
                 reg_lookup,
                 mult_cols,
-                move |[a, b, c, d, e]| {
+                move |[a, b, c, d, e, w]| {
                     if not_112 {
                         (a + b + d + e).into()
                     } else {
-                        (a + b + c + d + e).into()
+                        (a + b + c + d + e + w).into()
                     }
                 },
                 18,
@@ -1439,6 +1443,60 @@ pub(super) fn generate_interaction_trace(
                 ],
                 |[a, b, c, d, e, f]| (a + b + c + d + e + f).into(),
                 &tuple_p54e,
+            );
+        }
+    }
+
+    // ── Witness input (prover-side mirror) ──
+    // Two CompareLookup tuples (φ8, count, 0), then two WitnessCall tuples
+    // (ts, φ7's low four bytes, count), the count combined from Result's
+    // three low bytes.
+    {
+        use stwo::prover::backend::simd::m31::PackedBaseField;
+        let compare: &CompareLookupElements = lookup_elements.as_ref();
+        let witness_call: &WitnessCallLookupElements = lookup_elements.as_ref();
+        let is_witness =
+            crate::trace::original_base_column!(component_trace, Column::IsWitnessEcall);
+        let non_empty =
+            crate::trace::original_base_column!(component_trace, Column::WitnessNonEmpty);
+        let result = crate::trace::original_base_column!(component_trace, Column::Result);
+        let mut compare_tuple: Vec<_> = phi11.to_vec();
+        compare_tuple.extend_from_slice(&result);
+        compare_tuple.push(crate::trace::component::FinalizedColumn::Constant(
+            BaseField::from(0u32),
+        ));
+        for _ in 0..2 {
+            logup.add_to_relation_with(
+                compare,
+                [is_witness[0].clone()],
+                |[active]| active.into(),
+                &compare_tuple,
+            );
+        }
+        for _ in 0..2 {
+            let (ts_c, destination_c, result_c) =
+                (timestamp.clone(), phi10.clone(), result.clone());
+            logup.add_to_relation_computed(
+                witness_call,
+                [non_empty[0].clone()],
+                |[active]| active.into(),
+                13,
+                move |v| {
+                    let mut t = Vec::with_capacity(13);
+                    for c in &ts_c {
+                        t.push(c.at(v));
+                    }
+                    for c in &destination_c[..4] {
+                        t.push(c.at(v));
+                    }
+                    let byte = |i: usize| result_c[i].at(v);
+                    t.push(
+                        byte(0)
+                            + byte(1) * PackedBaseField::broadcast(BaseField::from(1u32 << 8))
+                            + byte(2) * PackedBaseField::broadcast(BaseField::from(1u32 << 16)),
+                    );
+                    t
+                },
             );
         }
     }

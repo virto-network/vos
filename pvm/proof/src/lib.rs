@@ -163,6 +163,8 @@ pub mod side_note;
 #[cfg(feature = "prover")]
 pub mod bench_helpers;
 #[cfg(feature = "prover")]
+pub mod kernel;
+#[cfg(feature = "prover")]
 mod program_id;
 #[cfg(feature = "prover")]
 mod prove;
@@ -219,29 +221,32 @@ pub mod chip_idx {
     pub const PROGRAM_BOUNDARY: usize = 10;
     pub const PROGRAM_MEMORY: usize = 11;
     pub const JUMP_TABLE: usize = 12;
-    pub const RANGE_MULTIPLICITY_256: usize = 13;
-    pub const BITWISE_LOOKUP: usize = 14;
-    pub const POWER_OF_TWO: usize = 15;
-    pub const POPCOUNT: usize = 16;
-    pub const BITCOUNT: usize = 17;
-    pub const BYTE_TO_BITS: usize = 18;
-    pub const MUL: usize = 19;
-    pub const BITWISE: usize = 20;
-    pub const COMPARE: usize = 21;
-    pub const DIVREM: usize = 22;
-    pub const RISTRETTO: usize = 23;
-    pub const RISTRETTO_ECALL: usize = 24;
-    pub const RISTRETTO_COMB_TABLE: usize = 25;
-    pub const RISTRETTO_FIXED_BASE_CONSUMER: usize = 26;
-    pub const RISTRETTO_COMB_ANCHOR: usize = 27;
-    pub const RISTRETTO_COMB_SCALAR_BOUNDARY: usize = 28;
-    pub const RISTRETTO_COMB_COMPRESS: usize = 29;
-    pub const RISTRETTO_COMB_COMPRESS_OUTPUT: usize = 30;
+    /// The witness input's bytes.  Before the range table: its trace-gen
+    /// counts the bytes and addresses it range-checks.
+    pub const WITNESS_INPUT: usize = 13;
+    pub const RANGE_MULTIPLICITY_256: usize = 14;
+    pub const BITWISE_LOOKUP: usize = 15;
+    pub const POWER_OF_TWO: usize = 16;
+    pub const POPCOUNT: usize = 17;
+    pub const BITCOUNT: usize = 18;
+    pub const BYTE_TO_BITS: usize = 19;
+    pub const MUL: usize = 20;
+    pub const BITWISE: usize = 21;
+    pub const COMPARE: usize = 22;
+    pub const DIVREM: usize = 23;
+    pub const RISTRETTO: usize = 24;
+    pub const RISTRETTO_ECALL: usize = 25;
+    pub const RISTRETTO_COMB_TABLE: usize = 26;
+    pub const RISTRETTO_FIXED_BASE_CONSUMER: usize = 27;
+    pub const RISTRETTO_COMB_ANCHOR: usize = 28;
+    pub const RISTRETTO_COMB_SCALAR_BOUNDARY: usize = 29;
+    pub const RISTRETTO_COMB_COMPRESS: usize = 30;
+    pub const RISTRETTO_COMB_COMPRESS_OUTPUT: usize = 31;
     /// 2^16-row byte-wide AND table.  Placed last: it is a receiver whose
     /// multiplicity counts are accumulated by the two blake2b chips during
     /// their trace-gen (idx 1/2), so it must be generated after all its
     /// consumers (BASE_COMPONENTS ordering rule).
-    pub const BITWISE_AND_BYTE: usize = 31;
+    pub const BITWISE_AND_BYTE: usize = 32;
     /// Total entries expected in `BASE_COMPONENTS`. Trailing const-time
     /// assertion in `lib.rs` checks this against the actual array length.
     pub const COUNT: usize = BITWISE_AND_BYTE + 1;
@@ -262,6 +267,7 @@ const BASE_COMPONENTS: &[&dyn framework::MachineProverComponent] = &[
     &chips::ProgramBoundaryChip,
     &chips::ProgramMemoryChip, // producer-only until the CpuChip consumer is added
     &chips::JumpTableChip,     // producer of jump_table[] lookups
+    &chips::WitnessInputChip,  // OPTIONAL — a witness input's bytes, gated by their calls
     &chips::RangeMultiplicity256,
     &chips::BitwiseLookupChip,
     &chips::PowerOfTwoChip,
@@ -307,6 +313,7 @@ const BASE_COMPONENTS: &[&dyn framework::MachineComponent] = &[
     &chips::ProgramBoundaryChip,
     &chips::ProgramMemoryChip,
     &chips::JumpTableChip,
+    &chips::WitnessInputChip,
     &chips::RangeMultiplicity256,
     &chips::BitwiseLookupChip,
     &chips::PowerOfTwoChip,
@@ -375,7 +382,9 @@ pub fn active_components(
 #[cfg(feature = "prover")]
 fn activity_from_steps(side_note: &side_note::SideNote) -> ChipActivity {
     use crate::chips::cpu::classify::classify_opcode as classify;
-    use crate::core::ecall::{ECALL_BLAKE2B_COMPRESS, ECALL_RISTRETTO, is_one_of};
+    use crate::core::ecall::{
+        ECALL_BLAKE2B_COMPRESS, ECALL_RISTRETTO, ECALL_WITNESS_INPUT, is_one_of,
+    };
     let mut a = ChipActivity::default();
     for step in &side_note.steps {
         // A precompile call counts only when served
@@ -396,6 +405,14 @@ fn activity_from_steps(side_note: &side_note::SideNote) -> ChipActivity {
         // every scalar mult in the trace was FixedBase.
         if ecall.is_some_and(|id| is_one_of(id, &ECALL_RISTRETTO)) {
             a.ristretto_ecall = true;
+        }
+        // A witness-input call compares its count with its capacity; one
+        // that wrote bytes hands them to WitnessInputChip.
+        if ecall == Some(u64::from(ECALL_WITNESS_INPUT)) {
+            a.compare = true;
+        }
+        if step.witness.is_some() {
+            a.witness_input = true;
         }
         let f = classify(step.opcode);
         if f.is_jump_ind || f.is_load_imm_jump_ind {
@@ -468,6 +485,7 @@ struct ChipActivity {
     ristretto: bool,
     ristretto_ecall: bool,
     ristretto_comb: bool,
+    witness_input: bool,
 }
 
 #[cfg(feature = "prover")]
@@ -480,6 +498,7 @@ impl ChipActivity {
         match idx {
             chip_idx::BLAKE2B => self.blake2b,
             chip_idx::JUMP_TABLE => self.jump_table,
+            chip_idx::WITNESS_INPUT => self.witness_input,
             chip_idx::POPCOUNT => self.popcount,
             chip_idx::BITCOUNT => self.bitcount,
             chip_idx::MUL => self.mul,
@@ -503,12 +522,12 @@ impl ChipActivity {
 /// included).  Embedded in `Proof::component_mask` so the standalone
 /// verifier can reconstruct the active set without a SideNote.
 #[cfg(feature = "prover")]
-pub(crate) fn active_component_mask(side_note: &side_note::SideNote) -> u32 {
+pub(crate) fn active_component_mask(side_note: &side_note::SideNote) -> u64 {
     let a = activity_from_steps(side_note);
-    let mut mask = 0u32;
+    let mut mask = 0u64;
     for i in 0..BASE_COMPONENTS.len() {
         if a.is_active(i) {
-            mask |= 1 << i;
+            mask |= 1u64 << i;
         }
     }
     mask

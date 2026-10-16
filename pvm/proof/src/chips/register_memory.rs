@@ -34,14 +34,18 @@ use crate::{framework::BuiltInComponent, lookups::RegisterMemoryLookupElements};
 ///
 /// The initial-state writes (ts=0, from SideNote.initial_regs) and the CpuChip
 /// register-access emissions populate the ledger.  The ledger entries are
-/// sorted by (reg_addr, timestamp) and the read-consistency constraint fires
-/// when a read is preceded by a same-register entry (forcing read value =
-/// previous value).
+/// sorted by (reg_addr, timestamp, is_write) and the read-consistency
+/// constraint fires when a read is preceded by a same-register entry (forcing
+/// read value = previous value).  A step that reads and writes one register
+/// reads it first: within a timestamp, reads sort before writes, so a read
+/// returns the value before its step.
 pub struct RegisterMemoryChip;
 
-/// Ordering deltas must fit below this bit width. Twenty-eight bits cover the
-/// canonical actor-proof budget (<100M steps) while staying far enough below
-/// the M31 modulus to reject a field-wrapped negative as an alleged positive.
+/// Ordering deltas must fit below this bit width. A same-register delta is
+/// `2·ts_diff + is_write_diff`, so twenty-eight bits cover a register left
+/// untouched for 2^27 steps, past the canonical actor-proof budget (<100M
+/// steps), while staying far enough below the M31 modulus to reject a
+/// field-wrapped negative as an alleged positive.
 const ORDER_DELTA_BITS: usize = 28;
 
 #[derive(Debug, Copy, Clone, AirColumn)]
@@ -82,8 +86,10 @@ pub enum Column {
     SlotReal2,
     #[size = 1]
     SlotReal3,
-    /// 1 = write, 0 = read.
+    /// 1 = write, 0 = read.  `#[mask_next_row]`: within a timestamp, the
+    /// ordering gadget sorts a register's reads before its writes.
     #[size = 1]
+    #[mask_next_row]
     IsWrite,
     /// Previous value at same register (u64, 8 bytes).  0 on the first entry
     /// per register.  `#[mask_next_row]` so a row can bind the *next* row's
@@ -104,8 +110,8 @@ pub enum Column {
     #[mask_next_row]
     IsPadding,
     /// 28-bit little-endian decomposition of the per-transition ordering delta
-    /// `OrderDelta = both_real · (IsSameRegNext·ts_diff + (1−IsSameRegNext)·
-    /// (reg_diff−1))`.  Each bit is constrained boolean and recomposed; this is
+    /// `OrderDelta = both_real · (IsSameRegNext·(2·ts_diff + is_write_diff) +
+    /// (1−IsSameRegNext)·(reg_diff−1))`.  Each bit is constrained boolean and recomposed; this is
     /// a SELF-CONTAINED non-negativity range-check (no Range256 lookup — the
     /// consumer pass runs with an immutable `&SideNote` and cannot bump
     /// multiplicities).  28 bits covers every timestamp admitted by the
@@ -120,9 +126,10 @@ pub enum Column {
     /// boundaries and the cyclic last→row-0 wraparound.
     #[size = 1]
     BothRealH,
-    /// Helper (degree flattening): `OrderValH = IsSameRegNext·ts_diff +
-    /// (1−IsSameRegNext)·(reg_diff−1)`, the un-gated ordering value.  The
-    /// range-checked OrderDelta is `BothRealH · OrderValH`.
+    /// Helper (degree flattening): `OrderValH = IsSameRegNext·(2·ts_diff +
+    /// is_write_diff) + (1−IsSameRegNext)·(reg_diff−1)`, the un-gated
+    /// ordering value.  The range-checked OrderDelta is `BothRealH ·
+    /// OrderValH`.
     #[size = 1]
     OrderValH,
     // Read-consistency uses an unconditional
@@ -239,10 +246,17 @@ impl BuiltInComponent for RegisterMemoryChip {
             }
             acc
         };
+        // Within one register the key is `2·ts + is_write`: timestamps
+        // non-decreasing, and at one timestamp no read after a write. A step
+        // that reads and writes a register (an ALU op whose destination is
+        // a source, a witness input's φ7) then reads the value from before
+        // it, never the one it writes.
+        let is_write_next = crate::trace::trace_eval_next_row!(trace_eval, Column::IsWrite);
         let ts_diff = combine_ts(&ts0_next) - combine_ts(&ts0);
+        let key_diff = ts_diff.clone() + ts_diff + is_write_next[0].clone() - is_write[0].clone();
         eval.add_constraint(
             order_val_h[0].clone()
-                - (is_same_reg[0].clone() * ts_diff
+                - (is_same_reg[0].clone() * key_diff
                     + (E::F::one() - is_same_reg[0].clone()) * (reg_diff - E::F::one())),
         );
 
@@ -250,7 +264,8 @@ impl BuiltInComponent for RegisterMemoryChip {
         // decomposition (self-contained — no Range256 lookup, the consumer pass
         // runs with an immutable `&SideNote`; 28 bits < p/4 so a field-wrapped
         // negative cannot alias a valid small positive).  Then:
-        //   key_same=1 ⇒ ts non-decreasing (ts_diff ≥ 0).
+        //   key_same=1 ⇒ (ts, is_write) non-decreasing (2·ts_diff +
+        //     is_write_diff ≥ 0), so a write never precedes a read at its ts.
         //   key_same=0, both real ⇒ reg strictly increases (reg_diff ≥ 1) ⇒
         //     registers are contiguous (no value-chain bleed) AND key_same is
         //     forced truthful (claiming 0 on equal regs yields −1, which has no
@@ -371,6 +386,7 @@ impl BuiltInProverComponent for RegisterMemoryChip {
         // ordering helpers (pass 2) can read the cyclic next row.
         let mut regs = vec![0u8; num_rows];
         let mut tss = vec![0u64; num_rows];
+        let mut writes = vec![false; num_rows];
         let mut key_same = vec![false; num_rows];
         for (row, e) in entries.iter().enumerate() {
             trace.fill_columns(row, e.reg_addr, Column::RegAddr);
@@ -396,6 +412,7 @@ impl BuiltInProverComponent for RegisterMemoryChip {
 
             regs[row] = e.reg_addr;
             tss[row] = e.timestamp;
+            writes[row] = e.is_write;
             key_same[row] = same_reg_next;
         }
         for row in num_rows_real..num_rows {
@@ -405,9 +422,10 @@ impl BuiltInProverComponent for RegisterMemoryChip {
 
         // Pass 2: ordering helpers, reading the cyclic next = (row+1) % num_rows.
         //   BothRealH = both rows real.
-        //   OrderValH = key_same·ts_diff + (1−key_same)·(reg_diff−1)  [in field;
-        //               may be negative on padding/wraparound rows, where
-        //               BothRealH = 0 gates OrderDelta to 0].
+        //   OrderValH = key_same·(2·ts_diff + is_write_diff)
+        //               + (1−key_same)·(reg_diff−1)  [in field; may be negative
+        //               on padding/wraparound rows, where BothRealH = 0 gates
+        //               OrderDelta to 0].
         //   OrderDelta = BothRealH·OrderValH, 28-bit range-checked ≥ 0.
         let one = BaseField::from(1u32);
         for row in 0..num_rows {
@@ -415,8 +433,10 @@ impl BuiltInProverComponent for RegisterMemoryChip {
             let both_real = row < num_rows_real && next < num_rows_real;
             trace.fill_columns(row, both_real, Column::BothRealH);
 
+            // Within a register, the key `2·ts + is_write`.
+            let key = |row: usize| 2 * tss[row] + u64::from(writes[row]);
             let order_val_h: BaseField = if key_same[row] {
-                BaseField::from((tss[next] - tss[row]) as u32)
+                BaseField::from((key(next) - key(row)) as u32)
             } else {
                 BaseField::from(regs[next] as u32) - BaseField::from(regs[row] as u32) - one
             };
@@ -425,7 +445,7 @@ impl BuiltInProverComponent for RegisterMemoryChip {
             let order_delta: u64 = if !both_real {
                 0
             } else if key_same[row] {
-                tss[next] - tss[row]
+                key(next) - key(row)
             } else {
                 (regs[next] as u64) - (regs[row] as u64) - 1
             };
@@ -600,20 +620,20 @@ pub fn build_entries_from_side_note(side_note: &crate::side_note::SideNote) -> V
                 is_write: false,
             });
         }
-        if let Some((reg_idx, val)) = acc.result_write {
-            entries.push(RegEntry {
-                reg_addr: reg_idx,
-                value: val,
-                timestamp: step.timestamp,
-                is_write: true,
-            });
-        }
         for &(reg_idx, val) in &acc.ecall_reads {
             entries.push(RegEntry {
                 reg_addr: reg_idx,
                 value: val,
                 timestamp: step.timestamp,
                 is_write: false,
+            });
+        }
+        if let Some((reg_idx, val)) = acc.result_write {
+            entries.push(RegEntry {
+                reg_addr: reg_idx,
+                value: val,
+                timestamp: step.timestamp,
+                is_write: true,
             });
         }
     }
@@ -644,7 +664,7 @@ pub fn build_entries_from_side_note(side_note: &crate::side_note::SideNote) -> V
         }
     }
 
-    entries.sort_by_key(|e| (e.reg_addr, e.timestamp));
+    entries.sort_by_key(|e| (e.reg_addr, e.timestamp, e.is_write));
     entries
 }
 

@@ -255,6 +255,7 @@ pub fn debug_claimed_sums(side_note: &mut SideNote) -> bool {
         "ProgBoundary",
         "ProgMemory",
         "JumpTable",
+        "WitnessInput",
         "Range256",
         "BitwiseLookup",
         "PowerOfTwo",
@@ -273,6 +274,7 @@ pub fn debug_claimed_sums(side_note: &mut SideNote) -> bool {
         "RistCombScalarBoundary",
         "RistCombCompress",
         "RistCombCompressOutput",
+        "BitwiseAndByte",
     ];
 
     let traces: Vec<ComponentTrace> = components
@@ -652,9 +654,8 @@ pub fn prove_canonical(
     install_thread_pool();
     prepare_side_note_for_verification(side_note);
     let components = super::all_components();
-    // Full set present ⇒ constant mask = all component bits set.  Built via
-    // a widening shift so COUNT == 32 (all u32 bits) doesn't overflow.
-    let component_mask = ((1u64 << super::chip_idx::COUNT) - 1) as u32;
+    // Full set present ⇒ constant mask = all component bits set.
+    let component_mask = (1u64 << super::chip_idx::COUNT) - 1;
     let (proof, _) = prove_impl_with_components_overridden(
         side_note,
         production_pcs_config_mobile(),
@@ -884,7 +885,7 @@ fn prove_impl_with_components(
     config: PcsConfig,
     profile: bool,
     components: &[&dyn crate::framework::MachineProverComponent],
-    component_mask: u32,
+    component_mask: u64,
     min_log_sizes: &[u32],
 ) -> Result<(Proof, ProveProfile), ProvingError> {
     prove_impl_with_components_overridden(
@@ -1000,7 +1001,7 @@ fn derive_segment_states(side_note: &SideNote) -> (SegmentState, SegmentState) {
 /// binds every generated witness column; ordinary STARK verification then
 /// proves the interaction/composition/FRI suffix against that exact root.
 pub(crate) struct ReplayTraceBinding {
-    pub component_mask: u32,
+    pub component_mask: u64,
     pub log_sizes: Vec<u32>,
     pub preprocessed_commitment: crate::recursion_pcs::ProverMerkleHash,
     pub main_commitment: crate::recursion_pcs::ProverMerkleHash,
@@ -1162,7 +1163,7 @@ fn prove_impl_with_components_overridden(
     config: PcsConfig,
     profile: bool,
     components: &[&dyn crate::framework::MachineProverComponent],
-    component_mask: u32,
+    component_mask: u64,
     boundary_override: Option<(SegmentState, SegmentState)>,
     min_log_sizes: &[u32],
     transcript_generation: ProofTranscriptGeneration,

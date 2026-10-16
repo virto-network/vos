@@ -294,7 +294,8 @@ const READER_INPUT: [u8; 10] = [0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 
 
 /// A standard program that makes [`READER_CALLS`]'s witness-input calls,
 /// storing each count it returns at [`RW`] plus eight bytes a call, and
-/// halts; a page of zeros at [`RW`] and four heap pages.
+/// halts with an empty output; a page of read-only data and five heap
+/// pages at [`RW`]. The prover's tests build the same program.
 fn reader(calls: &[(u64, u64)]) -> Vec<u8> {
     let mut code = Vec::new();
     let mut starts = Vec::new();
@@ -311,6 +312,7 @@ fn reader(calls: &[(u64, u64)]) -> Vec<u8> {
         let store = RW as u32 + 8 * index as u32;
         emit(&[&[62, 7][..], &store.to_le_bytes()].concat());
     }
+    emit(&load_imm(8, 0));
     emit(&[50, 0]);
     let mut bitmask = vec![0; code.len()];
     for start in starts {

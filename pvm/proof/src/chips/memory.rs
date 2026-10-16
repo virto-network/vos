@@ -157,6 +157,25 @@ fn decompose_access(
         .collect()
 }
 
+/// The ledger's write entries for a witness-input call's bytes, one a byte
+/// from its address on, at `timestamp`.
+#[cfg(feature = "prover")]
+fn witness_entries(
+    write: &crate::core::step::WitnessWrite,
+    timestamp: u64,
+) -> impl Iterator<Item = MemEntry> + '_ {
+    write
+        .bytes
+        .iter()
+        .enumerate()
+        .map(move |(offset, &value)| MemEntry {
+            address: write.address.wrapping_add(offset as u32),
+            value,
+            timestamp,
+            is_write: true,
+        })
+}
+
 impl BuiltInComponent for MemoryChip {
     type PreprocessedColumn = PreprocessedColumn;
     type MainColumn = Column;
@@ -400,6 +419,9 @@ pub fn analyze_dedup(side_note: &crate::side_note::SideNote) -> MemoryDedupRepor
                 true,
                 w.size,
             ));
+        }
+        if let Some(ref w) = step.witness {
+            entries.extend(witness_entries(w, step.timestamp));
         }
     }
     for op in &side_note.blake2b_mem_ops {
@@ -685,6 +707,11 @@ impl BuiltInProverComponent for MemoryChip {
                     true,
                     w.size,
                 ));
+            }
+            // A witness-input call's bytes, written at its step's ts; it
+            // reads no memory. `WitnessInputChip` produces their tuples.
+            if let Some(ref w) = step.witness {
+                entries.extend(witness_entries(w, step.timestamp));
             }
         }
 

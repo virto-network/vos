@@ -19,6 +19,7 @@ use stwo::prover::backend::simd::m31::LOG_N_LANES;
 use crate::core::ecall::{
     ECALL_BLAKE2B_COMPRESS, ECALL_RISTRETTO_POINT_ADD, ECALL_RISTRETTO_SCALAR_MULT,
     ECALL_SCALAR_ADD_MOD_L, ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE, ECALL_SCALAR_MUL_MOD_L,
+    ECALL_WITNESS_INPUT,
 };
 use crate::core::step::WORD_SIZE;
 use crate::side_note::SideNote;
@@ -186,7 +187,9 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         trace.fill_columns(row, val_b, Column::ValB);
         trace.fill_columns(row, val_d, Column::ValD);
 
-        let dr = dest_reg(step);
+        // A witness-input call's result is the count it writes to φ7.
+        let is_witness = step.served_ecall() == Some(u64::from(ECALL_WITNESS_INPUT));
+        let dr = if is_witness { 7 } else { dest_reg(step) };
         let result = step.regs_after[dr];
         trace.fill_columns(row, result, Column::Result);
 
@@ -1327,6 +1330,46 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             (ECALL_SCALAR_ADD_MOD_L, Column::Is114Ecall),
         ] {
             trace.fill_columns(row, ecall == Some(u64::from(id)), column);
+        }
+        // Witness input: its selector, whether its count is non-zero with
+        // the count's inverse, and the comparison count ≤ φ8 CompareChip
+        // proves.
+        trace.fill_columns(row, is_witness, Column::IsWitnessEcall);
+        if is_witness {
+            use stwo::core::fields::m31::BaseField;
+            let count = step.regs_after[7];
+            trace.fill_columns(row, count != 0, Column::WitnessNonEmpty);
+            if count != 0 {
+                let inverse = BaseField::from(count as u32).inverse();
+                trace.fill_columns_base_field(row, &[inverse], Column::WitnessCountInv);
+                trace.fill_columns_base_field(
+                    row,
+                    &[BaseField::from(1u32)],
+                    Column::WitnessCountTimesInvH,
+                );
+            }
+            let capacity = step.regs_before[8];
+            let (capacity_bytes, count_bytes) = (capacity.to_le_bytes(), count.to_le_bytes());
+            let mut cmp_sub_result = [0u8; WORD_SIZE];
+            let mut cmp_carry = [0u8; WORD_SIZE];
+            let mut carry: u16 = 1;
+            for i in 0..WORD_SIZE {
+                let sum = capacity_bytes[i] as u16 + (count_bytes[i] ^ 0xFF) as u16 + carry;
+                cmp_sub_result[i] = (sum & 0xFF) as u8;
+                cmp_carry[i] = (sum >> 8) as u8;
+                carry = cmp_carry[i] as u16;
+            }
+            // CompareChip range-checks its subtraction's bytes.
+            range_bytes.extend_from_slice(&cmp_sub_result);
+            side_note
+                .compare_entries
+                .push(crate::side_note::CompareEntry {
+                    val_b: capacity,
+                    val_d: count,
+                    cmp_lt_flag: 1 - cmp_carry[WORD_SIZE - 1],
+                    cmp_sub_result,
+                    cmp_carry,
+                });
         }
         // Phi10 slot ← h_ptr (a0 = x10 = PVM φ[7]).
         trace.fill_columns(row, step.regs_before[7], Column::Phi10);

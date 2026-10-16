@@ -1119,12 +1119,32 @@ pub enum Column {
     #[size = 1]
     MemRangeTimesInvH,
 
-    /// ProgramMemory-authenticated exact cryptographic precompile dispatch
-    /// identifier (100 or 110..=114), or zero for any other instruction. A
+    /// ProgramMemory-authenticated exact precompile dispatch identifier
+    /// (100, 101 or 110..=114), or zero for any other instruction. A
     /// continued host-call row must select exactly the matching precompile
     /// call relation.
     #[size = 1]
     HostCallPrecompileDispatch,
+
+    // ── Witness-input binding ──
+    /// 1 iff an acknowledged `Ecalli` of the witness input (dispatch 101).
+    /// Its row reads φ7, the destination (`Phi10`), and φ8, the capacity
+    /// (`Phi11`); writes the count to φ7 (`Result`, `ResultRegIdx` 7), a
+    /// value below 2^24 at most φ8 (a CompareLookup tuple); and, when the
+    /// count is not zero, hands `(ts, destination, count)` to
+    /// `WitnessInputChip`, which writes exactly that range.
+    #[size = 1]
+    IsWitnessEcall,
+    /// 1 iff the witness-input call wrote bytes: its count is not zero.
+    #[size = 1]
+    WitnessNonEmpty,
+    /// M31 inverse of the witness-input count when it is not zero.
+    #[size = 1]
+    WitnessCountInv,
+    /// `count · WitnessCountInv`, lifted so the non-zero test stays within
+    /// CpuChip's degree-two bound.
+    #[size = 1]
+    WitnessCountTimesInvH,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]

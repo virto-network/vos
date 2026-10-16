@@ -79,10 +79,10 @@ fn poseidon2_canonical_segment_round_trip() {
 
     // The full canonical AIR: every component is present.
     assert!(
-        (1..=u32::BITS as usize).contains(&vos_pvm_proof::chip_idx::COUNT),
-        "component_mask must represent between 1 and 32 components"
+        (1..=u64::BITS as usize).contains(&vos_pvm_proof::chip_idx::COUNT),
+        "component_mask must represent between 1 and 64 components"
     );
-    let expected_component_mask = u32::MAX >> (u32::BITS as usize - vos_pvm_proof::chip_idx::COUNT);
+    let expected_component_mask = u64::MAX >> (u64::BITS as usize - vos_pvm_proof::chip_idx::COUNT);
     assert_eq!(
         proof.num_components,
         vos_pvm_proof::chip_idx::COUNT,

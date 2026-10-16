@@ -9,7 +9,7 @@
 use super::classify::{classify_opcode, uses_immediate};
 use crate::core::ecall::{
     ECALL_BLAKE2B_COMPRESS, ECALL_RISTRETTO_THREE_OPERANDS, ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE,
-    is_one_of,
+    ECALL_WITNESS_INPUT, is_one_of,
 };
 #[allow(unused_imports)]
 use alloc::{boxed::Box, vec, vec::Vec};
@@ -32,11 +32,10 @@ pub(crate) struct StepRegAccesses {
     pub val_a_read: Option<(u8, u64)>,
     /// (reg_idx, value) if the step wrote a register.
     pub result_write: Option<(u8, u64)>,
-    /// ECALL-specific register reads.  Blake2b hostcall reads φ[7],
-    /// φ[10], φ[11], φ[12] at the ECALL step's timestamp; these entries land
-    /// in the ledger alongside the regular ValB/ValD reads and match the
-    /// producers CpuChip emits gated by IsBlakeEcall.  Empty for non-blake2b
-    /// steps.
+    /// ECALL-specific register reads at the ECALL step's timestamp: they
+    /// land in the ledger alongside the regular ValB/ValD reads and match
+    /// the producers CpuChip emits gated by the call's selector.  Empty for
+    /// every other step.
     pub ecall_reads: Vec<(u8, u64)>,
 }
 
@@ -108,11 +107,14 @@ pub(crate) fn step_reg_accesses(step: &crate::core::step::PvmStep) -> StepRegAcc
     //   blake2b: φ[7,8,9,10] (h_ptr/m_ptr/t_low/f_flag).
     //   ristretto scalar_mult/point_add/scalar_binop: φ[7,8,9].
     //   ristretto reduce_wide (112): φ[7,8] only.
+    //   witness input: φ[7,8] (destination/capacity), before the step's
+    //   write of its count to φ[7].
     // Only a served call reads them (`PvmStep::served_ecall`): for any
     // other the CpuChip emits no producer.
     let ecall = step.served_ecall();
     let is_blake_ecall = ecall == Some(ECALL_BLAKE2B_COMPRESS as u64);
-    let is_ristretto_reduce = ecall == Some(ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE as u64);
+    let reads_two = ecall == Some(ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE as u64)
+        || ecall == Some(ECALL_WITNESS_INPUT as u64);
     let is_ristretto_three = ecall.is_some_and(|id| is_one_of(id, &ECALL_RISTRETTO_THREE_OPERANDS));
     let ecall_reads = if is_blake_ecall {
         vec![
@@ -127,7 +129,7 @@ pub(crate) fn step_reg_accesses(step: &crate::core::step::PvmStep) -> StepRegAcc
             (8u8, step.regs_before[8]),
             (9u8, step.regs_before[9]),
         ]
-    } else if is_ristretto_reduce {
+    } else if reads_two {
         vec![(7u8, step.regs_before[7]), (8u8, step.regs_before[8])]
     } else {
         Vec::new()

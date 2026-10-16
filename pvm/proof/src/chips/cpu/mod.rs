@@ -31,7 +31,7 @@ use crate::{
         DivRemLookupElements, JumpTableLookupElements, MemoryAccessLookupElements,
         MultiplicationLookupElements, PopcountLookupElements, PowerOfTwoLookupElements,
         ProgramExecutionLookupElements, ProgramMemoryLookupElements, Range256LookupElements,
-        RegisterMemoryLookupElements, RistrettoCallLookupElements,
+        RegisterMemoryLookupElements, RistrettoCallLookupElements, WitnessCallLookupElements,
     },
 };
 
@@ -96,7 +96,7 @@ impl BuiltInComponent for CpuChip {
             CompareLookupElements,
             DivRemLookupElements,
             ByteToBitsLookupElements,
-            RistrettoCallLookupElements,
+            (RistrettoCallLookupElements, WitnessCallLookupElements),
         ),
     );
 
@@ -122,7 +122,7 @@ impl BuiltInComponent for CpuChip {
                 CompareLookupElements,
                 DivRemLookupElements,
                 ByteToBitsLookupElements,
-                RistrettoCallLookupElements,
+                (RistrettoCallLookupElements, WitnessCallLookupElements),
             ),
         ),
     ) {
@@ -144,7 +144,7 @@ impl BuiltInComponent for CpuChip {
                 compare_lookup,
                 divrem_lookup,
                 byte_to_bits_lookup,
-                ristretto_call_lookup,
+                (ristretto_call_lookup, witness_call_lookup),
             ),
         ) = lookup_elements;
         // bitwise_and_lookup is not emitted by CpuChip; nibble emissions
@@ -1362,6 +1362,7 @@ impl BuiltInComponent for CpuChip {
             let is_112_top = crate::trace::trace_eval!(trace_eval, Column::Is112Ecall);
             let is_113_top = crate::trace::trace_eval!(trace_eval, Column::Is113Ecall);
             let is_114_top = crate::trace::trace_eval!(trace_eval, Column::Is114Ecall);
+            let is_witness_top = crate::trace::trace_eval!(trace_eval, Column::IsWitnessEcall);
             // Boolean flags enforced unconditionally — a gated
             // `is_real · bool_h = 0` pattern would be redundant.
             for flag in [
@@ -1376,6 +1377,7 @@ impl BuiltInComponent for CpuChip {
                 &is_112_top,
                 &is_113_top,
                 &is_114_top,
+                &is_witness_top,
             ] {
                 eval.add_constraint(flag[0].clone() * (E::F::one() - flag[0].clone()));
             }
@@ -1719,6 +1721,7 @@ impl BuiltInComponent for CpuChip {
             let is_112 = crate::trace::trace_eval!(trace_eval, Column::Is112Ecall);
             let is_113 = crate::trace::trace_eval!(trace_eval, Column::Is113Ecall);
             let is_114 = crate::trace::trace_eval!(trace_eval, Column::Is114Ecall);
+            let is_witness = crate::trace::trace_eval!(trace_eval, Column::IsWitnessEcall);
             let pc = crate::trace::trace_eval!(trace_eval, Column::Pc);
             let next_pc = crate::trace::trace_eval!(trace_eval, Column::NextPc);
             let skip_len = crate::trace::trace_eval!(trace_eval, Column::SkipLen);
@@ -1739,6 +1742,7 @@ impl BuiltInComponent for CpuChip {
             // authenticated ID, so only a supported call can be acknowledged.
             // A call that is not acknowledged selects no relation.
             let precompile_selector_sum = is_blake[0].clone()
+                + is_witness[0].clone()
                 + is_110[0].clone()
                 + is_111[0].clone()
                 + is_112[0].clone()
@@ -1746,6 +1750,7 @@ impl BuiltInComponent for CpuChip {
                 + is_114[0].clone();
             eval.add_constraint(precompile_selector_sum - acknowledged[0].clone());
             let selected_dispatch = is_blake[0].clone() * E::F::from(BaseField::from(100u32))
+                + is_witness[0].clone() * E::F::from(BaseField::from(101u32))
                 + is_110[0].clone() * E::F::from(BaseField::from(110u32))
                 + is_111[0].clone() * E::F::from(BaseField::from(111u32))
                 + is_112[0].clone() * E::F::from(BaseField::from(112u32))
@@ -2302,11 +2307,15 @@ impl BuiltInComponent for CpuChip {
                 + is_114[0].clone();
             let any_not_112 =
                 is_110[0].clone() + is_111[0].clone() + is_113[0].clone() + is_114[0].clone();
+            // The witness input reads φ[7] and φ[8] too, its destination
+            // and capacity.
+            let is_witness = crate::trace::trace_eval!(trace_eval, Column::IsWitnessEcall);
+            let reads_7_and_8 = any.clone() + is_witness[0].clone();
 
             // Register-read producers (reg_idx, value[8], ts[8], is_write=0).
             for (reg_idx, value, mult) in [
-                (7u32, &phi10, any.clone()),
-                (8u32, &phi11, any.clone()),
+                (7u32, &phi10, reads_7_and_8.clone()),
+                (8u32, &phi11, reads_7_and_8),
                 (9u32, &phi12, any_not_112),
             ] {
                 let mut tuple: Vec<E::F> = Vec::with_capacity(18);
@@ -2710,12 +2719,13 @@ impl BuiltInComponent for CpuChip {
             let jump_ind_addr = crate::trace::trace_eval!(trace_eval, Column::JumpIndAddr);
             let jump_ind_carry = crate::trace::trace_eval!(trace_eval, Column::JumpIndCarry);
             let imm_bytes_col = crate::trace::trace_eval!(trace_eval, Column::ImmBytes);
-            let pc_col = crate::trace::trace_eval!(trace_eval, Column::Pc);
             let is_padding_next = crate::trace::trace_eval_next_row!(trace_eval, Column::IsPadding);
             // Boolean witnesses. A halt selector is only valid on JumpInd,
             // pins the computed address to the distinguished halt target,
-            // preserves the interpreter's terminal PC, and forbids a
-            // successor row.
+            // continues at that target, outside a derived program's code,
+            // whose static targets and jump-table entries all lie in it (so
+            // its segment's `pc_out` is the halt address exactly when it
+            // ends at a halt), and forbids a successor row.
             eval.add_constraint(
                 is_jump_ind_col[0].clone() * (E::F::one() - is_jump_ind_col[0].clone()),
             );
@@ -2752,7 +2762,9 @@ impl BuiltInComponent for CpuChip {
                             - E::F::from(BaseField::from(PVM_HALT_ADDR_BYTES[i] as u32))),
                 );
                 eval.add_constraint(
-                    is_halt_jump_ind[0].clone() * (next_pc[i].clone() - pc_col[i].clone()),
+                    is_halt_jump_ind[0].clone()
+                        * (next_pc[i].clone()
+                            - E::F::from(BaseField::from(PVM_HALT_ADDR_BYTES[i] as u32))),
                 );
             }
             eval.add_constraint(
@@ -2797,7 +2809,6 @@ impl BuiltInComponent for CpuChip {
             let lij_addr = crate::trace::trace_eval!(trace_eval, Column::LoadImmJumpIndAddr);
             let lij_carry = crate::trace::trace_eval!(trace_eval, Column::LoadImmJumpIndCarry);
             let imm_y_bytes = crate::trace::trace_eval!(trace_eval, Column::ImmYBytes);
-            let pc_col = crate::trace::trace_eval!(trace_eval, Column::Pc);
             let is_padding_next = crate::trace::trace_eval_next_row!(trace_eval, Column::IsPadding);
             // Boolean witnesses and the same terminal-halt binding as
             // JumpInd above.
@@ -2825,7 +2836,9 @@ impl BuiltInComponent for CpuChip {
                             - E::F::from(BaseField::from(PVM_HALT_ADDR_BYTES[i] as u32))),
                 );
                 eval.add_constraint(
-                    is_halt_lij[0].clone() * (next_pc[i].clone() - pc_col[i].clone()),
+                    is_halt_lij[0].clone()
+                        * (next_pc[i].clone()
+                            - E::F::from(BaseField::from(PVM_HALT_ADDR_BYTES[i] as u32))),
                 );
             }
             eval.add_constraint(
@@ -3445,6 +3458,78 @@ impl BuiltInComponent for CpuChip {
                     bitwise_lookup,
                     is_bitwise_p54e.clone().into(),
                     &tuple_p54e,
+                ));
+            }
+        }
+
+        // ── Witness input ──
+        // An acknowledged witness-input row reads φ7, the destination, and
+        // φ8, the capacity (the register reads above); writes its count to
+        // φ7 and nothing else: the generic Result write, pinned here to
+        // register 7, a count below 2^24, and the destination below 2^32.
+        // Its count is at most φ8, as CompareChip proves of the tuple
+        // (φ8, count, lt = 0). A non-zero count hands (ts, destination,
+        // count) to WitnessInputChip, which writes exactly the bytes
+        // [destination, destination + count) at ts, and nothing else.
+        // Four emissions, two paired blocks, kept last (CONSTRAINTS.md 2).
+        {
+            let is_witness = crate::trace::trace_eval!(trace_eval, Column::IsWitnessEcall);
+            let non_empty = crate::trace::trace_eval!(trace_eval, Column::WitnessNonEmpty);
+            let count_inv = crate::trace::trace_eval!(trace_eval, Column::WitnessCountInv);
+            let count_times_inv =
+                crate::trace::trace_eval!(trace_eval, Column::WitnessCountTimesInvH);
+            let result_is_reg = crate::trace::trace_eval!(trace_eval, Column::ResultIsReg);
+            let result_reg_idx = crate::trace::trace_eval!(trace_eval, Column::ResultRegIdx);
+            let destination = crate::trace::trace_eval!(trace_eval, Column::Phi10);
+            let capacity = crate::trace::trace_eval!(trace_eval, Column::Phi11);
+            let f256 = E::F::from(BaseField::from(256u32));
+            let count = result[0].clone()
+                + result[1].clone() * f256.clone()
+                + result[2].clone() * f256.clone() * f256;
+
+            // The count is φ7's write, and below 2^24, so it is its own
+            // field value; the destination is below 2^32.
+            eval.add_constraint(is_witness[0].clone() * (E::F::one() - result_is_reg[0].clone()));
+            eval.add_constraint(
+                is_witness[0].clone()
+                    * (result_reg_idx[0].clone() - E::F::from(BaseField::from(7u32))),
+            );
+            for byte in &result[3..WORD_SIZE] {
+                eval.add_constraint(is_witness[0].clone() * byte.clone());
+            }
+            for byte in &destination[4..WORD_SIZE] {
+                eval.add_constraint(is_witness[0].clone() * byte.clone());
+            }
+            // WitnessNonEmpty: a witness row's count is non-zero exactly
+            // when it is set.
+            eval.add_constraint(non_empty[0].clone() * (E::F::one() - non_empty[0].clone()));
+            eval.add_constraint(non_empty[0].clone() * (E::F::one() - is_witness[0].clone()));
+            eval.add_constraint((is_witness[0].clone() - non_empty[0].clone()) * count.clone());
+            eval.add_constraint(count_times_inv[0].clone() - count.clone() * count_inv[0].clone());
+            eval.add_constraint(non_empty[0].clone() * (count_times_inv[0].clone() - E::F::one()));
+
+            // count ≤ capacity: CompareChip proves capacity < count false.
+            let mut compare: Vec<E::F> = Vec::with_capacity(17);
+            compare.extend_from_slice(&capacity);
+            compare.extend_from_slice(&result);
+            compare.push(E::F::zero());
+            for _ in 0..2 {
+                eval.add_to_relation(RelationEntry::new(
+                    compare_lookup,
+                    is_witness[0].clone().into(),
+                    &compare,
+                ));
+            }
+            // The call WitnessInputChip writes: (ts, destination, count).
+            let mut call: Vec<E::F> = Vec::with_capacity(13);
+            call.extend_from_slice(&timestamp);
+            call.extend_from_slice(&destination[..4]);
+            call.push(count);
+            for _ in 0..2 {
+                eval.add_to_relation(RelationEntry::new(
+                    witness_call_lookup,
+                    non_empty[0].clone().into(),
+                    &call,
                 ));
             }
         }

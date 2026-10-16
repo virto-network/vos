@@ -29,6 +29,7 @@ pub mod ristretto_comb_compress_output;
 pub mod ristretto_comb_scalar_boundary;
 pub mod ristretto_ecall;
 pub mod ristretto_fixed_base_consumer;
+pub mod witness_input;
 
 pub use bitcount::BitcountChip;
 pub use bitwise::BitwiseChip;
@@ -61,3 +62,4 @@ pub use ristretto_comb_compress_output::RistrettoCombCompressOutputChip;
 pub use ristretto_comb_scalar_boundary::RistrettoCombScalarBoundaryChip;
 pub use ristretto_ecall::RistrettoEcallChip;
 pub use ristretto_fixed_base_consumer::RistrettoFixedBaseConsumerChip;
+pub use witness_input::WitnessInputChip;
