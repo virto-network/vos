@@ -85,6 +85,6 @@ pub extern "C" fn _start() -> ! {
     // (FRI + Merkle decommit + OODS) on the PVM.
     match vos_pvm_settlement_verifier::verify_settlement_proof(FIXTURE) {
         Ok(()) => halt(0xACCE), // accepted
-        Err(()) => halt(0x5E5), // rejected
+        Err(_) => halt(0x5E5),  // rejected
     }
 }

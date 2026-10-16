@@ -73,6 +73,7 @@ doc-check:
 
 clippy:
     cargo clippy --workspace --all-targets --quiet -- -D warnings
+    cd pvm/proof/settlement-verifier; cargo clippy --all-targets --quiet -- -D warnings
     cargo clippy -p vos-pvm-bench --features prove --all-targets --quiet -- -D warnings
     cargo clippy -p vos-cli --features faults --all-targets --quiet -- -D warnings
     cargo clippy -p vos-cli --no-default-features --all-targets --quiet -- -D warnings
@@ -131,13 +132,14 @@ check-no-std:
 
 # Checks before pushing: everything except proving.
 # The quick gate, after each change: formatting, the docs' links, the
-# builds without std, the workspace's lints, and the suites of the node, the
-# agent, vos-raft and the crates under them.
+# builds without std, the workspace's lints and the settlement verifier's,
+# and the suites of the node, the agent, vos-raft and the crates under them.
 # Left to `just ci`: the slow fault runs (the five-process fault suite, the
 # fault build's process tests), the PVM vectors, the bench and prover
 # library tests, and the lints of other feature sets.
 check: fmt-check doc-check check-no-std build-test-actors build-agent
     cargo clippy --workspace --all-targets --quiet -- -D warnings
+    cd pvm/proof/settlement-verifier; cargo clippy --all-targets --quiet -- -D warnings
     cargo test -p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam
     cargo test -p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-checker -p vos-node -p vos-net -p vos-cli
 

@@ -614,12 +614,38 @@ impl FrameworkEval for BoolEval {
     }
 }
 
+/// Why a settlement proof was not accepted.
+#[derive(Debug)]
+pub enum SettlementError {
+    /// The bytes are not a postcard-encoded proof.
+    Decode(postcard::Error),
+    /// The proof does not verify.
+    Rejected(VerificationError),
+}
+
+impl core::fmt::Display for SettlementError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            SettlementError::Decode(error) => write!(f, "not a settlement proof: {error}"),
+            SettlementError::Rejected(error) => write!(f, "the proof does not verify: {error}"),
+        }
+    }
+}
+
+impl core::error::Error for SettlementError {}
+
 /// Deserialize a postcard-encoded settlement proof and verify it against the
-/// embedded AIR + MOBILE config. `Ok(())` iff valid; `Err(())` on a decode
-/// failure or a verification rejection (the settlement bin maps this to its
-/// halt code). This is the full M31-algebraic verify the PVM run measures.
-pub fn verify_settlement_proof(bytes: &[u8]) -> Result<(), ()> {
-    let proof: StarkProof<P2MerkleHasher> = postcard::from_bytes(bytes).map_err(|_| ())?;
+/// embedded AIR + MOBILE config: `Ok(())` iff it is valid (the settlement bin
+/// maps the outcome to its halt code). This is the full M31-algebraic verify
+/// the PVM run measures.
+pub fn verify_settlement_proof(bytes: &[u8]) -> Result<(), SettlementError> {
+    let proof: StarkProof<P2MerkleHasher> =
+        postcard::from_bytes(bytes).map_err(SettlementError::Decode)?;
+    if proof.commitments.len() < 2 {
+        return Err(SettlementError::Rejected(
+            VerificationError::InvalidStructure("fewer than two commitments".into()),
+        ));
+    }
     let config = mobile_config();
     let component = FrameworkComponent::new(
         &mut TraceLocationAllocator::default(),
@@ -633,7 +659,8 @@ pub fn verify_settlement_proof(bytes: &[u8]) -> Result<(), ()> {
     let sizes = component.trace_log_degree_bounds();
     cs.commit(proof.commitments[0], &sizes[0], channel);
     cs.commit(proof.commitments[1], &sizes[1], channel);
-    verify_segment(&[&component as &dyn Component], channel, &mut cs, proof).map_err(|_| ())
+    verify_segment(&[&component as &dyn Component], channel, &mut cs, proof)
+        .map_err(SettlementError::Rejected)
 }
 
 // ── Single-core atomic libcall shims for the JAM PVM (riscv64em-vos) ──────
