@@ -3,6 +3,20 @@
 version = 4
 
 [[package]]
+name = "bounds"
+version = "0.1.0"
+dependencies = [
+ "vos-sdk",
+]
+
+[[package]]
+name = "bulky"
+version = "0.1.0"
+dependencies = [
+ "vos-sdk",
+]
+
+[[package]]
 name = "caller"
 version = "0.1.0"
 dependencies = [
@@ -15,6 +29,13 @@ name = "counter"
 version = "0.1.0"
 dependencies = [
  "vos-pvm-precompiles",
+ "vos-sdk",
+]
+
+[[package]]
+name = "greedy"
+version = "0.1.0"
+dependencies = [
  "vos-sdk",
 ]
 
@@ -209,4 +230,11 @@ dependencies = [
  "vos-pvm-precompiles",
  "vos-pvm-program",
  "vos-tree",
+]
+
+[[package]]
+name = "wide"
+version = "0.1.0"
+dependencies = [
+ "vos-sdk",
 ]

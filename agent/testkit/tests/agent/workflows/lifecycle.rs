@@ -550,12 +550,12 @@ fn the_caps_hold() {
     }
 }
 
-/// A workflow of an instance installed for JAM holds its memory to JAM's
-/// limits, on every host: a step writing past its pages fails `Cap`, and so
-/// does one leaving its snapshot more pages than it may hold, where one
-/// installed for VOS pauses.
+/// A workflow of an agent on JAM holds its memory to JAM's limits, on
+/// every host: a step writing past its pages fails `Cap`, and so does one
+/// leaving its snapshot more pages than it may hold, where one on VOS
+/// pauses.
 #[test]
-fn a_workflow_installed_for_jam_holds_its_pages_to_jam_limits() {
+fn a_workflow_on_jam_holds_its_pages_to_jam_limits() {
     use vos_wire::abi::cap::JAM;
     use vos_wire::result::PAGE;
     let cap = Outcome::failed(Failure::Cap);
@@ -563,7 +563,7 @@ fn a_workflow_installed_for_jam_holds_its_pages_to_jam_limits() {
     let half = (JAM.held_pages * PAGE * 3 / 4) as u32;
     for target in [Target::Vos, Target::Jam] {
         for node in [Node::new(), Node::jam(true)] {
-            let mut flows = Flows::new(node);
+            let mut flows = Flows::for_target(node, target);
             let install = flows.install_for("lean", target);
             flows.batch(1, vec![install]);
             let past = (JAM.step_pages + PAGE) as u32;
@@ -590,17 +590,17 @@ fn a_workflow_installed_for_jam_holds_its_pages_to_jam_limits() {
     }
 }
 
-/// A workflow of an instance installed for JAM whose step comes past what
-/// its target keeps of its pages ends at that step, `Expired`, without
-/// restoring them, and drops them: on every host, as in the model. Within
-/// it, as for VOS, it resumes.
+/// A workflow of an agent on JAM whose step comes past what its target
+/// keeps of its pages ends at that step, `Expired`, without restoring them,
+/// and drops them: on every host, as in the model. Within it, as on VOS, it
+/// resumes.
 #[test]
 fn a_jam_workflow_past_its_pages_keep_expires() {
     use vos_wire::abi::cap::JAM;
     let kept = JAM.pages_kept.expect("JAM keeps pages for a time");
     for target in [Target::Vos, Target::Jam] {
         for node in [Node::new(), Node::jam(true)] {
-            let mut flows = Flows::new(node);
+            let mut flows = Flows::for_target(node, target);
             let install = flows.install_for("lean", target);
             flows.batch(1, vec![install]);
             let inputs = vec![flows.start("nap", kept - 10), flows.start("nap", kept + 10)];

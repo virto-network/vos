@@ -12,7 +12,6 @@ use std::sync::Arc;
 use vos_jam::builder::POLKAJAM_REFINE_GAS;
 use vos_jam::{
     Builder, Chain, Emulated, Error, Fate, Fault, Landed, Refined, Runner, Store, Taken, builder,
-    gas,
 };
 use vos_pvm::PvmBackend;
 use vos_testkit::programs::{actor, method};
@@ -32,7 +31,7 @@ mod agreement;
 mod driven;
 
 use crate::common::{
-    AGENT, ALICE, Actors, BOB, CALLER, COUNTER, LEDGER, MINTER, Node, SHOP, done, install,
+    AGENT, ALICE, Actors, BOB, CALLER, COUNTER, LEDGER, MINTER, Node, SHOP, done, install_for,
 };
 
 /// A batch time well past JAM's common era; the sessions start at it.
@@ -292,14 +291,14 @@ fn ran_or_refused(result: &WorkResult) {
 }
 
 /// The installs of the counter, the ledger with its programs and the
-/// caller, and Alice a minter.
+/// caller, for JAM, and Alice a minter.
 fn installs(paired: &mut Paired, actors: &Actors) -> Vec<Input> {
     let counter = ProgramHash::of(&actors.counter);
     let caller = ProgramHash::of(&actors.caller);
     vec![
-        install(COUNTER, counter),
-        actors.install_ledger(&mut paired.vos),
-        install(CALLER, caller),
+        install_for(Target::Jam, COUNTER, counter),
+        actors.install_ledger_for(Target::Jam, &mut paired.vos),
+        install_for(Target::Jam, CALLER, caller),
         Input::Admin(Admin::SetRole(vos_wire::ingress::Grant {
             principal: ALICE,
             role: Some(MINTER),
@@ -317,20 +316,15 @@ fn programs(actors: &Actors) -> Vec<&[u8]> {
 }
 
 /// A pair with the test actors and the shop, its workflows in its
-/// program, installed, and the shop's upgrade among its preimages: and the
-/// shop's program.
+/// program, installed for JAM with the default heap, and the shop's
+/// upgrade among its preimages: and the shop's program.
 fn with_shop(backend: PvmBackend, actors: &Actors) -> (Paired, Vec<u8>) {
-    let (shop, lean) = (actor("shop"), actor("lean"));
+    let (shop, compact) = (actor("lean"), actor("compact"));
     let mut all = programs(actors);
-    all.extend([shop.as_slice(), lean.as_slice()]);
+    all.extend([shop.as_slice(), compact.as_slice()]);
     let mut paired = Paired::new(backend, &all, POLKAJAM_REFINE_GAS);
     let mut first = installs(&mut paired, actors);
-    first.push(Input::Admin(Admin::Install {
-        instance: SHOP,
-        derivation: vos_testkit::programs::bare(ProgramHash::of(&shop)),
-        roles: vec![],
-        target: Target::Vos,
-    }));
+    first.push(install_for(Target::Jam, SHOP, ProgramHash::of(&shop)));
     ran_or_refused(&paired.batch(T0, first).result);
     (paired, shop)
 }

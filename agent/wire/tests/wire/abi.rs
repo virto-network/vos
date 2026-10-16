@@ -289,6 +289,7 @@ fn codes_keep_their_values() {
         (Failure::TimedOut, 10),
         (Failure::Unloadable, 11),
         (Failure::Expired, 12),
+        (Failure::Target, 13),
     ];
     for (failure, code) in failures {
         assert_eq!(failure.code(), code);
@@ -308,9 +309,29 @@ fn codes_keep_their_values() {
         assert_eq!(Refusal::from_code(code), Some(refusal));
         assert_eq!(refusal.encode(), code.to_le_bytes());
     }
-    for outside in [0u32, 13, u32::MAX] {
+    for outside in [0u32, 14, u32::MAX] {
         assert!(Failure::decode(&outside.to_le_bytes()).is_err());
     }
+    // An install's refusal, its failure's detail.
+    use vos_wire::abi::cap::{Refused, Target};
+    let target = Refused::Target { agent: Target::Jam };
+    assert_eq!(target.encode(), [0, 1]);
+    assert_eq!(target.failure(), Failure::Target);
+    let gas = Refused::KernelGas {
+        method: vos_wire::ids::MethodId(3),
+        gas: 5,
+        most: 4,
+    };
+    assert_eq!(
+        gas.encode(),
+        [
+            &[4u8, 3, 0, 0, 0][..],
+            &5u64.to_le_bytes(),
+            &4u64.to_le_bytes()
+        ]
+        .concat()
+    );
+    assert_eq!(gas.failure(), Failure::Cap);
     for outside in [0u32, 7, u32::MAX] {
         assert!(Refusal::decode(&outside.to_le_bytes()).is_err());
     }

@@ -7,11 +7,12 @@ use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use vos_node::client::{Client, ClientError};
-use vos_wire::Encode;
-use vos_wire::abi::Refusal;
+use vos_wire::abi::cap::Refused;
+use vos_wire::abi::{Failure, Refusal};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, WorkflowId};
 use vos_wire::ingress::{Consistency, Response, WorkflowStatus};
 use vos_wire::result::Outcome;
+use vos_wire::{Decode, Encode};
 
 use crate::args::{CallArgs, NodeArgs, WorkflowArgs};
 use crate::kept::Kept;
@@ -203,11 +204,27 @@ pub fn print_answer(answer: &Response) -> Result<(), String> {
 
 /// An install's or a role's answer. Each overwrites what it sets, so one
 /// that timed out is safe to send again.
+/// An admin command's answer, printed: an install refused against its
+/// target also says why.
 pub fn print_admin_answer(answer: &Response) -> Result<(), String> {
     match answer {
         Response::TimedOut => {
             Err("no answer in time: it may have run, or may yet; sending it again is safe".into())
         }
+        Response::Ran {
+            outcome:
+                Outcome::Failed {
+                    code: Failure::Cap | Failure::Target,
+                    detail,
+                },
+            ..
+        } => match Refused::decode(detail) {
+            Ok((refused, used)) if used == detail.len() => {
+                println!("{}", said(answer)?);
+                Err(format!("the install was refused: {refused}"))
+            }
+            _ => print_answer(answer),
+        },
         other => print_answer(other),
     }
 }

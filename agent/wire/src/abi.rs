@@ -50,6 +50,13 @@ pub use codes::{Failure, Refusal, code};
 
 use crate::keys::Transform;
 
+/// The bytes from the start of an actor's heap arena that a handler's or a
+/// kernel's program holds: an install's derivation leaves the arena's rest
+/// out of its programs, and a workflow's machine maps it. The SDK's
+/// allocator gives a handler or a kernel no more, and its default arena is
+/// this large.
+pub const INVOCATION_HEAP: usize = 512 << 10;
+
 /// The kind of an invocation, which decides the operations it may use.
 /// Its index is the kind the agent passes in φ8.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]

@@ -455,6 +455,7 @@ fn workflow_arm(handler: &Handler, actor: &Ident, message: &Ident) -> Tokens {
     );
     quote! {
         #id => {
+            ::vos_sdk::heap::whole_arena();
             let #message { #(#names),* } = ::vos_sdk::runtime::arguments::<#message>();
             #context
             #outcome

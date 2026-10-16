@@ -32,6 +32,12 @@ path = "src/bin/lean.rs"
 test = false
 bench = false
 
+[[bin]]
+name = "compact"
+path = "src/bin/compact.rs"
+test = false
+bench = false
+
 [dependencies]
 caller = { path = "../caller" }
 counter = { path = "../counter" }

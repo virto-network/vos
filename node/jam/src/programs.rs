@@ -12,6 +12,7 @@
 //!   while any live workflow names it, whatever an upgrade installed since,
 //!   and after, when nothing names it any more.
 
+use vos_wire::abi::{Kind, cap};
 use vos_wire::records::Derivation;
 use vos_wire::schema::Schema;
 
@@ -27,12 +28,27 @@ pub struct Installable {
     pub schema: Schema,
 }
 
-/// Derive package `elf`'s programs, as a VOS node derives them.
+/// Derive package `elf`'s programs, as a VOS node derives them. One with an
+/// attestable method declaring more gas than a kernel runs with on JAM
+/// (`cap::JAM.kernel_gas()`) is refused, naming it, as its install would
+/// be.
 pub fn derive(elf: &[u8]) -> Result<Installable, Error> {
     let derived =
         vos_pvm_compiler::derive(elf).map_err(|error| Error::Package(error.to_string()))?;
     let schema = Schema::read(&derived.schema)
         .map_err(|error| Error::Package(format!("its schema: {error:?}")))?;
+    let most = cap::JAM.kernel_gas().expect("JAM bounds a kernel");
+    if let Some(method) = schema
+        .methods
+        .iter()
+        .find(|method| method.kind == Kind::Attestable && method.gas.is_some_and(|gas| gas > most))
+    {
+        return Err(Error::Package(format!(
+            "attestable method `{}` declares gas {}, past the {most} a kernel runs with on JAM",
+            String::from_utf8_lossy(&method.name),
+            method.gas.unwrap_or_default(),
+        )));
+    }
     let derivation = Derivation::new(
         elf,
         &derived.actor,

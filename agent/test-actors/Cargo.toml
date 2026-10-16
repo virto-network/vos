@@ -3,7 +3,10 @@
 # workflows and message types, which other actors use) and a program
 # (`actor_program!`).
 [workspace]
-members = ["counter", "ledger", "caller", "tracker", "shop", "rounds", "kernels", "tainted"]
+members = [
+    "counter", "ledger", "caller", "tracker", "shop", "rounds", "kernels", "tainted", "bounds", "wide",
+    "bulky", "greedy",
+]
 resolver = "3"
 
 [workspace.package]

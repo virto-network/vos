@@ -13,8 +13,8 @@ use vos_wire::result::WorkResult;
 use vos_wire::{Decode, Encode};
 
 use crate::common::{
-    ALICE, Actors, BOB, CALLER, COUNTER, LEDGER, MINTER, Node, OUTER_GAS, Sessions, counter_only,
-    done, install, ran_done,
+    ALICE, Actors, BOB, CALLER, COUNTER, LEDGER, MINTER, Node, OUTER_GAS, Sessions, done, install,
+    ran_done,
 };
 
 /// Every program calls only what a JAM node serves, or what has a
@@ -109,28 +109,19 @@ fn the_agent_serves_the_precompiles_a_node_does_at_its_price() {
 }
 
 /// Batches that read no state refine on a VOS host (the pool, applied
-/// state) and on a JAM host (no pool, no state, no precompiles, actors
-/// from preimages) to the same work result, which both accumulate to the
-/// same storage. No request or message appears: their session and pair
-/// marks are applied state, which this host cannot read.
+/// state) and on a JAM host (no pool, no state, no precompiles) to the
+/// same work result, which both accumulate to the same storage. No
+/// request, message or install appears: their session and pair marks, and
+/// the agent's target, are applied state, which this host cannot read.
 #[test]
 fn vos_and_jam_hosts_agree_on_batches_that_read_no_state() {
-    let actors = Actors::load();
     let mut vos = Node::new();
     let mut jam = Node::jam(false);
-    let counter = vos.add(&actors.counter);
-    for program in [&actors.counter, &actors.ledger, &actors.checksum] {
-        jam.add(program);
-    }
     let batches = vec![
-        vec![
-            install(COUNTER, counter),
-            actors.install_ledger(&mut vos),
-            Input::Admin(Admin::SetRole(Grant {
-                principal: ALICE,
-                role: Some(MINTER),
-            })),
-        ],
+        vec![Input::Admin(Admin::SetRole(Grant {
+            principal: ALICE,
+            role: Some(MINTER),
+        }))],
         vec![
             Input::Ack {
                 to: AgentId(5),
@@ -295,17 +286,22 @@ fn without_a_pool_the_loader_builds_the_machines() {
     );
 }
 
+/// A refine on a host that serves no applied state traps at its first
+/// read: a request's, of its session's mark, and an install's, of its
+/// agent's target.
 #[test]
 fn a_refine_that_cannot_read_state_produces_no_result() {
-    // Admin inputs read no state: the install applies.
-    let (actors, node) = counter_only(Node::jam(false));
+    let actors = Actors::load();
+    let mut node = Node::jam(false);
+    let counter = node.add(&actors.counter);
     let increment = actors.method(COUNTER, "increment");
     let mut sessions = Sessions::new();
-    for time in [2, 3] {
-        let work = node.work(
-            time,
-            vec![sessions.request(ALICE, COUNTER, increment, 5u64)],
-        );
+    let inputs = [
+        vec![sessions.request(ALICE, COUNTER, increment, 5u64)],
+        vec![install(COUNTER, counter)],
+    ];
+    for (time, inputs) in inputs.into_iter().enumerate() {
+        let work = node.work(time as u64 + 2, inputs);
         assert_eq!(
             node.run_refine(&work, OUTER_GAS).exit,
             ExitReason::Panic,

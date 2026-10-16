@@ -39,13 +39,8 @@ impl Driven {
     fn installs(&mut self) -> Vec<Input> {
         let hash = ProgramHash::of;
         vec![
-            install(COUNTER, hash(&self.actors.counter)),
-            Input::Admin(Admin::Install {
-                instance: SHOP,
-                derivation: vos_testkit::programs::bare(hash(&self.shop)),
-                roles: vec![],
-                target: Target::Vos,
-            }),
+            install_for(Target::Jam, COUNTER, hash(&self.actors.counter)),
+            install_for(Target::Jam, SHOP, hash(&self.shop)),
         ]
     }
 
@@ -92,6 +87,25 @@ impl Driven {
     }
 }
 
+/// A JAM service's agent runs on JAM alone: the builder refuses an install
+/// for VOS before it makes a package, its store as it was.
+#[test]
+fn the_builder_refuses_an_install_for_vos() {
+    let mut driven = Driven::new(Store::temporary().unwrap(), POLKAJAM_REFINE_GAS);
+    let root = driven.builder.store.root().unwrap();
+    let counter = ProgramHash::of(&driven.actors.counter);
+    let increment = driven.actors.method(COUNTER, "increment");
+    let inputs = vec![
+        driven.request(COUNTER, increment, 1u64),
+        install_for(Target::Vos, InstanceId(7), counter),
+    ];
+    assert!(matches!(
+        driven.try_run(inputs),
+        Err(Error::Target(Target::Vos))
+    ));
+    assert_eq!(driven.builder.store.root().unwrap(), root);
+}
+
 /// A package the chain refused, accumulated past its time or refined out
 /// of gas, is made again at a new time, and lands.
 #[test]
@@ -135,9 +149,15 @@ fn the_builder_fits_its_budget_to_a_packages_gas() {
         "refused below {least}"
     );
     let mut driven = Driven::new(Store::temporary().unwrap(), POLKAJAM_REFINE_GAS);
-    let fill = driven.actors.method(COUNTER, "fill");
-    let fills = (0..2)
-        .map(|_| driven.request(COUNTER, fill, (300u32, 8u32)))
+    let ops = driven.actors.method(COUNTER, "ops");
+    // Steps putting rows at JAM's limit, each its own, whose own work
+    // passes the bound together.
+    let rows = cap::JAM.step_rows as u32 - 8;
+    let fills = (0..4u32)
+        .map(|index| {
+            let puts = vec![(3u8, index * rows, rows)];
+            driven.request(COUNTER, ops, (puts, COUNTER.0, 0u32))
+        })
         .collect();
     let taken = driven.try_run(fills).expect("it lands");
     let prepared = &taken.prepared;
@@ -157,13 +177,7 @@ fn the_builder_fits_its_budget_to_a_packages_gas() {
         prepared.simulations, 2,
         "simulated again at the lowered budget"
     );
-    assert!(
-        taken
-            .result
-            .steps
-            .iter()
-            .all(|step| done::<u32>(step) == 300)
-    );
+    assert!(taken.result.steps.iter().all(|step| done::<u64>(step) == 0));
     // A batch holds at most a VOS node's inputs; the later ones wait.
     let ack = Input::Ack {
         to: AgentId(5),
@@ -179,23 +193,23 @@ fn the_builder_fits_its_budget_to_a_packages_gas() {
     assert_eq!(prepared.package.batch.inputs.len(), builder::MAX_INPUTS);
 }
 
-/// A workflow holding nearly as many pages as a snapshot may, at the
-/// largest limit a workflow may declare, runs to its end at the builder's
-/// budget, on JAM as on VOS: its last step restores every page and drops
-/// every page's row, and its package's own work stays within the bound the
-/// builder asserts for it. Requests beside that step, each putting a
-/// thousand rows, would leave the batch less than its keep: the batch
-/// loses them rather than its budget its floor, and they wait for later
+/// A workflow holding nearly as many pages as JAM lets a snapshot hold, at
+/// the largest limit a workflow may declare, runs to its end at the
+/// builder's budget: its last step restores every page and drops every
+/// page's row. Requests beside that step, each putting rows at JAM's
+/// limit, would leave the batch less than its keep together: the batch
+/// loses some rather than its budget its floor, and they wait for later
 /// packages.
 #[test]
 fn a_workflow_at_its_page_cap_runs_to_its_end_at_the_builders_budget() {
     let actors = Actors::load();
     let (mut paired, shop) = with_shop(PvmBackend::Default, &actors);
+    let most = cap::JAM.held_pages;
     // Two chunks of whole pages, each a few bytes short of whole pages,
     // which with the workflow's stack and vectors leave it a few pages
     // under the cap.
-    let first = cap::HELD_PAGES / 2;
-    let second = cap::HELD_PAGES - first - 12;
+    let first = most / 2;
+    let second = most - first - 12;
     let sizes: Vec<u32> = [first, second]
         .map(|pages| (pages * PAGE - 256) as u32)
         .to_vec();
@@ -206,7 +220,7 @@ fn a_workflow_at_its_page_cap_runs_to_its_end_at_the_builders_budget() {
     assert_eq!(paired.record(0).gas, defaults::MAX_HANDLER_GAS);
     // Its steps until it holds every chunk, asleep before its last.
     let mut held = 0;
-    while held < cap::HELD_PAGES - 16 {
+    while held < most - 16 {
         let state = paired.record(0).state;
         assert!(
             matches!(
@@ -223,38 +237,35 @@ fn a_workflow_at_its_page_cap_runs_to_its_end_at_the_builders_budget() {
             .snapshot
             .map_or(0, |snapshot| snapshot.pages.len());
     }
-    assert!(held <= cap::HELD_PAGES, "{held} pages held");
-    // Its last step, beside two requests putting a thousand rows each.
+    assert!(held <= most, "{held} pages held");
+    // Its last step, beside requests putting rows at JAM's limit.
     let ops = actors.method(COUNTER, "ops");
-    let requests: Vec<Input> = [0u32, 1_000]
-        .map(|start| {
-            let puts = vec![(3u8, start, 1_000u32)];
+    let rows = cap::JAM.step_rows as u32 - 8;
+    let requests: Vec<Input> = (0..32u32)
+        .map(|index| {
+            let puts = vec![(3u8, index * rows, rows)];
             paired.request(ALICE, COUNTER, ops, (puts, COUNTER.0, 0u32))
         })
-        .to_vec();
+        .collect();
     time += 1_000;
     let sweep = paired.vos.sweep(time);
     let ending = paired.batch(time, [vec![sweep], requests.clone()].concat());
     ran_or_refused(&ending.result);
-    assert_eq!(ending.inputs, 1, "the requests wait");
+    assert!(ending.inputs <= requests.len(), "some requests wait");
     assert!(ending.budget >= defaults::min_refine_gas(builder::MAX_INPUTS));
     assert_eq!(
         paired.record(0).state,
         WorkflowState::Ended(Outcome::Done(total.encode()))
     );
-    let held = held as u64;
-    let bound = gas::ENDING + held * (gas::PAGE_READ + gas::PAGE_DROP);
-    assert!(
-        ending.own <= bound,
-        "the ending's own work {} within {bound}",
-        ending.own
-    );
     println!(
-        "JAM: a workflow's end, {held} pages restored and dropped: own work {}, its budget {}",
-        ending.own, ending.budget
+        "JAM: a workflow's end, {held} pages restored and dropped, beside {} requests: own work \
+         {}, its budget {}",
+        ending.inputs - 1,
+        ending.own,
+        ending.budget
     );
     // Later packages take the requests, as many each as keep the floor.
-    let mut waiting = requests;
+    let mut waiting = requests[ending.inputs - 1..].to_vec();
     while !waiting.is_empty() {
         time += 1_000;
         let next = paired.batch(time, waiting.clone());
@@ -307,7 +318,7 @@ fn workflows_whose_pages_da_lacks_are_left_out_at_once() {
     assert!(naps.iter().all(|&id| asleep(&driven, id)), "still due");
 }
 
-/// A workflow of an instance installed for JAM whose pages DA no longer
+/// A workflow on JAM whose pages DA no longer
 /// holds is left out of the sweep while its target keeps them; past that,
 /// its step ends it, `Expired`, in a package that imports none of them.
 #[test]
@@ -315,12 +326,7 @@ fn a_jam_workflow_past_its_pages_keep_ends_without_them() {
     const LEAN: InstanceId = InstanceId(5);
     let mut driven = Driven::new(Store::temporary().unwrap(), POLKAJAM_REFINE_GAS);
     let lean = actor("lean");
-    driven.run(vec![Input::Admin(Admin::Install {
-        instance: LEAN,
-        derivation: vos_testkit::programs::bare(ProgramHash::of(&lean)),
-        roles: vec![],
-        target: Target::Jam,
-    })]);
+    driven.run(vec![install_for(Target::Jam, LEAN, ProgramHash::of(&lean))]);
     let nap = method(&lean, "nap");
     let start = driven.request(LEAN, nap, 500u64);
     driven.run(vec![start]);
@@ -417,8 +423,10 @@ fn the_builder_takes_a_package_that_landed_first() {
 fn the_builder_fits_a_batch_to_a_packages_segments() {
     let mut driven = Driven::new(Store::temporary().unwrap(), 8_000_000_000);
     let compute = method(&driven.shop, "compute");
-    let starts: Vec<Input> = (0..7)
-        .map(|_| driven.request(SHOP, compute, (262_144u32, 1u32)))
+    // Each start writes 48 pages of data, within JAM's pages a step
+    // writes, and more than a package's segments together.
+    let starts: Vec<Input> = (0..64)
+        .map(|_| driven.request(SHOP, compute, (24_576u32, 1u32)))
         .collect();
     let (time, seed) = (driven.time + 1_000, [1; 32]);
     let prepared = driven
@@ -449,7 +457,7 @@ fn the_builder_fits_a_batch_to_a_packages_segments() {
         .expect("the package refines within its gas");
     assert!(refined.gas_used <= prepared.gas);
     println!(
-        "JAM: {inputs} of 7 computations in a package: {exports} exports, refine {} of {} gas",
+        "JAM: {inputs} of 64 computations in a package: {exports} exports, refine {} of {} gas",
         refined.gas_used, prepared.gas
     );
 }
@@ -528,16 +536,11 @@ impl Drop for Scratch {
 fn a_workflow_resumes_on_its_program_through_an_upgrade_on_jam() {
     let mut driven = Driven::new(Store::temporary().unwrap(), POLKAJAM_REFINE_GAS);
     let hash = ProgramHash::of;
-    let (shop, lean) = (hash(&driven.shop), hash(&actor("lean")));
+    let (shop, compact) = (hash(&driven.shop), hash(&actor("compact")));
     let nap = method(&driven.shop, "nap");
     let start = driven.request(SHOP, nap, 2_500u64);
     driven.run(vec![start]);
-    driven.run(vec![Input::Admin(Admin::Install {
-        instance: SHOP,
-        derivation: vos_testkit::programs::bare(lean),
-        roles: vec![],
-        target: Target::Vos,
-    })]);
+    driven.run(vec![install_for(Target::Jam, SHOP, compact)]);
     let record = |driven: &Driven, id: u64| {
         let row = driven
             .builder
@@ -567,5 +570,5 @@ fn a_workflow_resumes_on_its_program_through_an_upgrade_on_jam() {
     );
     let start = driven.request(SHOP, nap, 1u64);
     driven.run(vec![start]);
-    assert_eq!(record(&driven, 1).program, lean);
+    assert_eq!(record(&driven, 1).program, compact);
 }

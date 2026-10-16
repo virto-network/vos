@@ -21,8 +21,9 @@ use vos_wire::result::Outcome;
 use vos_wire::schema::Schema;
 
 /// Every test actor's package, by name: those an install takes.
-const PACKAGES: [&str; 10] = [
-    "counter", "ledger", "caller", "shop", "big", "huge", "lean", "rounds", "kernels", "roomy",
+const PACKAGES: [&str; 16] = [
+    "counter", "ledger", "caller", "shop", "big", "huge", "lean", "compact", "rounds", "kernels",
+    "roomy", "bounds", "ample", "wide", "bulky", "greedy",
 ];
 
 /// Where a child process writes what it derived.
@@ -107,7 +108,10 @@ fn the_actors_program_is_the_elf_linked() {
             },
             "{name}"
         );
-        let roomy = matches!(name, "shop" | "big" | "huge" | "roomy");
+        let roomy = matches!(
+            name,
+            "shop" | "big" | "huge" | "roomy" | "compact" | "ample"
+        );
         assert_eq!(derived.heap > 0, roomy, "{name}: its heap's pages left out");
         assert_eq!(
             Schema::read(&parsed.ro_data).unwrap(),
@@ -277,6 +281,38 @@ fn what_is_no_package_is_refused() {
         derive(&vec![0; vos_pvm_compiler::MAX_ELF + 1]),
         Err(DeriveError::TooLarge(_))
     ));
+}
+
+/// A heap arena that does not end the read-write data from a page is
+/// refused: one moved off its page, and another writable section named
+/// `.vos_heap` in its stead.
+#[test]
+fn a_misplaced_heap_is_refused() {
+    let elf = package("shop");
+    let heap = section_named(&elf, b".vos_heap").expect("a heap");
+    let mut unaligned = elf.clone();
+    let address = field(&elf, heap + 16, 8) + 8;
+    unaligned[heap + 16..heap + 24].copy_from_slice(&(address as u64).to_le_bytes());
+    assert!(matches!(derive(&unaligned), Err(DeriveError::Heap { .. })));
+    let data = sections(&elf)
+        .into_iter()
+        .map(|(header, ..)| header)
+        .find(|&header| header != heap && field(&elf, header + 8, 8) & 3 == 3)
+        .expect("other writable data");
+    let mut swapped = elf.clone();
+    swapped[data..data + 4].copy_from_slice(&elf[heap..heap + 4]);
+    swapped[heap..heap + 4].copy_from_slice(&elf[data..data + 4]);
+    assert!(matches!(derive(&swapped), Err(DeriveError::Heap { .. })));
+}
+
+/// The header of the section named `name`.
+fn section_named(elf: &[u8], name: &[u8]) -> Option<usize> {
+    let all = sections(elf);
+    let (_, _, names, _) = *all.get(field(elf, 62, 2))?;
+    all.into_iter().map(|(header, ..)| header).find(|&header| {
+        let at = names + field(elf, header, 4);
+        elf.get(at..at + name.len()) == Some(name) && elf.get(at + name.len()) == Some(&0)
+    })
 }
 
 /// A little-endian field of `len` bytes at `at`.

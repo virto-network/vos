@@ -271,7 +271,7 @@ pub(crate) fn run_batch(base: &mut Base, batch: Batch) -> ResultWriter {
                 sequence,
                 awaiting,
             } => failed_in_refine(base, &batched.pairs, from, sequence, awaiting),
-            Input::Admin(admin) => Stepped::new(self::admin(admin), None),
+            Input::Admin(admin) => Stepped::new(self::admin(base, admin), None),
             Input::Ack { to, sequence } => Stepped::new(acknowledge(to, sequence), None),
             Input::Sweep { due } => sweep(base, &due),
         };

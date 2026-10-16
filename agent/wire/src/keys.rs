@@ -134,6 +134,7 @@ enum Row {
     NextWorkflow = 0x15,
     LiveWorkflows = 0x16,
     WorkflowPins = 0x17,
+    Target = 0x18,
 }
 
 /// The root builder's rows, each tagged after [`Owner::Tree`]: a committed
@@ -414,6 +415,12 @@ pub fn installed(instance: InstanceId) -> Vec<u8> {
 /// The prefix of every instance's [`installed`] row.
 pub fn installed_prefix() -> Vec<u8> {
     Row::Installed.prefix().to_vec()
+}
+
+/// The agent's target, which its first install names and every later one
+/// must ([`crate::abi::cap::Target`]).
+pub fn target() -> Vec<u8> {
+    Row::Target.prefix().to_vec()
 }
 
 /// A principal's role byte in this agent.

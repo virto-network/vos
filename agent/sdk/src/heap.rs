@@ -1,11 +1,14 @@
 //! A program's heap: power-of-two size classes over an arena, each with a
 //! free list, so short-lived allocations cost a few instructions and freed
 //! memory is reused. Blocks past the largest class go on one first-fit
-//! list. Fresh memory is bumped from the arena's start, so a machine that
-//! maps only the arena's first pages runs on them: past them, its store
-//! faults and the invocation traps. Pages a program never touches cost
-//! nothing to run, but the pool prices a machine by its mapped pages, so
-//! the arena is sized per program: [`crate::program_runtime!`] takes it.
+//! list. Fresh memory is bumped from the arena's start. In an actor's
+//! program (`ACTOR`) a handler or a kernel, whose program holds
+//! only the arena's first [`vos_wire::abi::INVOCATION_HEAP`] bytes, is
+//! given none past them: its allocation fails there, and the invocation
+//! traps. A workflow, whose machine maps the whole arena, marks itself so
+//! ([`whole_arena`]) before it allocates. Pages a program never touches cost nothing to run, but
+//! the pool prices a machine by its mapped pages, so the arena is sized per
+//! program: [`crate::program_runtime!`] takes it.
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
@@ -15,6 +18,30 @@ const SMALLEST: u32 = 4;
 const CLASSES: usize = 14;
 const LARGEST: usize = 1 << (SMALLEST as usize + CLASSES - 1);
 const PAGE: usize = 4096;
+
+/// Whether the running invocation maps its actor's whole arena: a
+/// workflow's does, a handler's and a kernel's hold its first
+/// [`vos_wire::abi::INVOCATION_HEAP`] bytes.
+struct Whole(UnsafeCell<bool>);
+
+// SAFETY: a program runs on one thread.
+unsafe impl Sync for Whole {}
+
+static WHOLE: Whole = Whole(UnsafeCell::new(false));
+
+/// Mark the running invocation a workflow's, whose machine maps its actor's
+/// whole arena: the heap gives it all of it. A workflow's entry calls it
+/// before it allocates; its snapshot keeps the mark.
+pub fn whole_arena() {
+    // SAFETY: single-threaded.
+    unsafe { *WHOLE.0.get() = true };
+}
+
+/// Whether the running invocation was marked a workflow's.
+fn whole() -> bool {
+    // SAFETY: single-threaded.
+    unsafe { *WHOLE.0.get() }
+}
 
 struct State {
     /// The next untouched byte of the arena.
@@ -45,14 +72,17 @@ impl<const ARENA: usize> Arena<ARENA> {
     }
 }
 
-/// A heap over an arena of `ARENA` bytes, its state apart from it.
-pub struct Heap<const ARENA: usize> {
+/// A heap over an arena of `ARENA` bytes, its state apart from it. An
+/// actor program's (`ACTOR`) gives a handler or a kernel the arena's first
+/// [`vos_wire::abi::INVOCATION_HEAP`] bytes alone, a workflow marked
+/// ([`whole_arena`]) all of it; any other program's, all of it.
+pub struct Heap<const ARENA: usize, const ACTOR: bool = false> {
     arena: &'static Arena<ARENA>,
     state: UnsafeCell<State>,
 }
 
 // SAFETY: a program runs on one thread.
-unsafe impl<const ARENA: usize> Sync for Heap<ARENA> {}
+unsafe impl<const ARENA: usize, const ACTOR: bool> Sync for Heap<ARENA, ACTOR> {}
 
 /// A block's class, from its size and alignment; `None` past the largest.
 fn class(layout: &Layout) -> Option<usize> {
@@ -60,7 +90,7 @@ fn class(layout: &Layout) -> Option<usize> {
     (size <= LARGEST).then(|| (size.next_power_of_two().trailing_zeros() - SMALLEST) as usize)
 }
 
-impl<const ARENA: usize> Heap<ARENA> {
+impl<const ARENA: usize, const ACTOR: bool> Heap<ARENA, ACTOR> {
     pub const fn new(arena: &'static Arena<ARENA>) -> Self {
         Self {
             arena,
@@ -72,14 +102,24 @@ impl<const ARENA: usize> Heap<ARENA> {
         }
     }
 
-    /// Fresh arena bytes, aligned as asked; null when exhausted.
+    /// The arena bytes the running invocation may allocate.
+    fn usable(&self) -> usize {
+        if ACTOR && !whole() {
+            ARENA.min(vos_wire::abi::INVOCATION_HEAP)
+        } else {
+            ARENA
+        }
+    }
+
+    /// Fresh arena bytes, aligned as asked; null past what the invocation
+    /// maps of the arena.
     fn bump(&self, size: usize, align: usize) -> *mut u8 {
         // SAFETY: single-threaded.
         let state = unsafe { &mut *self.state.get() };
         let base = self.arena.0.get() as usize;
         let start = (base + state.next).next_multiple_of(align) - base;
         match start.checked_add(size) {
-            Some(end) if end <= ARENA => {
+            Some(end) if end <= self.usable() => {
                 state.next = end;
                 (base + start) as *mut u8
             }
@@ -88,7 +128,7 @@ impl<const ARENA: usize> Heap<ARENA> {
     }
 }
 
-unsafe impl<const ARENA: usize> GlobalAlloc for Heap<ARENA> {
+unsafe impl<const ARENA: usize, const ACTOR: bool> GlobalAlloc for Heap<ARENA, ACTOR> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // SAFETY: single-threaded.
         let state = unsafe { &mut *self.state.get() };
@@ -172,7 +212,7 @@ mod tests {
     static HEAP: Heap<{ 1 << 20 }> = Heap::new(&ARENA);
 
     #[test]
-    fn freed_blocks_are_reused_by_class_and_large_blocks_by_fit() {
+    fn freed_blocks_are_reused_and_a_handler_holds_the_invocation_heap() {
         let heap = &HEAP;
         let small = Layout::from_size_align(24, 8).unwrap();
         // SAFETY: allocations of nonzero size, freed with their layouts.
@@ -197,6 +237,27 @@ mod tests {
 
             let huge = Layout::from_size_align(2 << 20, 8).unwrap();
             assert!(heap.alloc(huge).is_null(), "past the arena");
+        }
+        // One test alone marks the invocation, which every heap reads.
+        only_a_workflow_allocates_past_the_invocation_heap();
+    }
+
+    /// A handler or a kernel is given the arena's first 512 KiB alone; a
+    /// workflow, marked, the whole arena.
+    fn only_a_workflow_allocates_past_the_invocation_heap() {
+        static ARENA: Arena<{ 2 << 20 }> = Arena::new();
+        static HEAP: Heap<{ 2 << 20 }, true> = Heap::new(&ARENA);
+        static PROGRAM_ARENA: Arena<{ 2 << 20 }> = Arena::new();
+        static PROGRAM: Heap<{ 2 << 20 }> = Heap::new(&PROGRAM_ARENA);
+        let past = Layout::from_size_align(vos_wire::abi::INVOCATION_HEAP + 1, 8).unwrap();
+        let within = Layout::from_size_align(vos_wire::abi::INVOCATION_HEAP, 8).unwrap();
+        // SAFETY: allocations of nonzero size.
+        unsafe {
+            assert!(!PROGRAM.alloc(past).is_null(), "a program's heap is whole");
+            assert!(HEAP.alloc(past).is_null(), "a handler's heap ends there");
+            assert!(!HEAP.alloc(within).is_null());
+            whole_arena();
+            assert!(!HEAP.alloc(past).is_null(), "a workflow's does not");
         }
     }
 }

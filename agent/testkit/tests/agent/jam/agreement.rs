@@ -135,20 +135,26 @@ fn scans_and_committed_maps(backend: PvmBackend) {
     }
     ran_or_refused(&paired.batch(T0 + 1_000, inputs).result);
 
-    // A hashed table, a committed map and an ordered table, filled.
+    // A hashed table, a committed map and an ordered table, filled, each
+    // step within JAM's rows a step writes, and each iterated across more
+    // than a scan's page.
     let count = 300u64;
     let entries: Vec<(u64, Option<u64>)> = (0..count).map(|key| (key * 7, Some(key))).collect();
     let accounts: Vec<(u64, u64)> = (0..count).map(|id| (id * 11, id + 1)).collect();
-    let inputs = vec![
-        paired.request(
-            ALICE,
-            COUNTER,
-            method(COUNTER, "fill"),
-            (count as u32, 8u32),
-        ),
-        paired.request(ALICE, COUNTER, method(COUNTER, "set_entries"), entries),
-        paired.request(ALICE, LEDGER, method(LEDGER, "mint_all"), accounts),
-    ];
+    let mut inputs = vec![paired.request(
+        ALICE,
+        COUNTER,
+        method(COUNTER, "fill"),
+        (cap::JAM.step_rows as u32 - 8, 8u32),
+    )];
+    for chunk in entries.chunks(100) {
+        let set = method(COUNTER, "set_entries");
+        inputs.push(paired.request(ALICE, COUNTER, set, chunk.to_vec()));
+    }
+    for chunk in accounts.chunks(100) {
+        let mint = method(LEDGER, "mint_all");
+        inputs.push(paired.request(ALICE, LEDGER, mint, chunk.to_vec()));
+    }
     ran_or_refused(&paired.batch(T0 + 2_000, inputs).result);
 
     // Each iterated across its scan's refills; some entries deleted, and
@@ -329,8 +335,11 @@ fn a_witnessed_reads_gas_on_jam() {
     paired.batch(T0, first);
     let ops = actors.method(COUNTER, "ops");
     let phases = |phases: Vec<(u8, u32, u32)>| (phases, COUNTER.0, ops.0);
-    let fill = paired.request(ALICE, COUNTER, ops, phases(vec![(3, 0, 1_000)]));
-    paired.batch(T0 + 1_000, vec![fill]);
+    // A thousand rows, in steps within JAM's rows a step writes.
+    let fills = (0..8)
+        .map(|step| paired.request(ALICE, COUNTER, ops, phases(vec![(3, step * 125, 125)])))
+        .collect();
+    ran_or_refused(&paired.batch(T0 + 1_000, fills).result);
     let mut time = T0 + 1_000;
     // A request's package: its JAM refine's gas beyond the simulation's,
     // the keys its witness opens and the rows its ranges hold.

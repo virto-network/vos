@@ -92,6 +92,10 @@ codes! {
         /// A workflow's step came past what its target keeps of its pages
         /// ([`super::cap::Limits::pages_kept`]): it ends without them.
         Expired = 12,
+        /// An install named another target than its agent's: an agent runs
+        /// on one host, and every instance installed into it takes its
+        /// target ([`super::cap::Target`]).
+        Target = 13,
     }
 }
 

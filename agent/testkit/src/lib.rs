@@ -19,8 +19,8 @@ mod workflows;
 use std::collections::BTreeMap;
 
 use vos_wire::Decode;
-use vos_wire::abi::cap::{Limits, Target};
-use vos_wire::abi::{Failure, Kind, precompile};
+use vos_wire::abi::cap::{Limits, Refused, Target};
+use vos_wire::abi::{Failure, Kind};
 use vos_wire::batch::{Await, Body};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, WorkflowId};
 use vos_wire::keys;
@@ -42,10 +42,10 @@ pub enum InstallError {
     Duplicate(MethodId),
     /// A role name the schema uses has no role byte.
     UnmappedRole(Vec<u8>),
-    /// The program's statics pass its target's limits: its kernels, its
-    /// bytes, the pages it may write, or the compressions an attestable
-    /// method's gas limit pays for.
-    Cap,
+    /// The install's target is not its agent's, or its program's statics
+    /// pass its target's limits: its kernels, its bytes, the pages it may
+    /// write, or the gas an attestable method declares for its kernel.
+    Refused(Refused),
 }
 
 struct Installed {
@@ -118,6 +118,8 @@ pub struct Testkit {
     /// it is set, then ends its step, unserved. A test sets it for the
     /// batch it builds so, and clears it after.
     pub uncovered: bool,
+    /// The target its first install named, which every later one must.
+    target: Option<Target>,
     instances: BTreeMap<InstanceId, Installed>,
     members: BTreeMap<Principal, u8>,
     state: BTreeMap<Vec<u8>, Vec<u8>>,
@@ -138,6 +140,7 @@ impl Testkit {
             version: 0,
             budget: u64::MAX,
             uncovered: false,
+            target: None,
             instances: BTreeMap::new(),
             members: BTreeMap::new(),
             state: BTreeMap::new(),
@@ -160,8 +163,9 @@ impl Testkit {
 
     /// Install an actor program, which holds its handlers and workflows,
     /// for `target`, binding its attestable methods to their kernels and
-    /// its role names to role bytes; refused, `Cap`, past the target's
-    /// limits on its statics.
+    /// its role names to role bytes. Refused for another target than the
+    /// agent's, which its first install names, and past the target's limits
+    /// on its statics.
     pub fn install_for(
         &mut self,
         target: Target,
@@ -207,6 +211,9 @@ impl Testkit {
         kernels: &[(MethodId, &[u8])],
         roles: &[(&str, u8)],
     ) -> Result<(), InstallError> {
+        if let Some(agent) = self.target.filter(|&agent| agent != target) {
+            return Err(InstallError::Refused(Refused::Target { agent }));
+        }
         let parsed =
             vos_pvm::spi::parse_standard_program(program).ok_or(InstallError::NotAProgram)?;
         let schema = Schema::read(&parsed.ro_data).map_err(InstallError::Schema)?;
@@ -234,16 +241,12 @@ impl Testkit {
                 return Err(InstallError::UnmappedRole(role.clone()));
             }
         }
-        if !statics_within(
-            program,
-            &parsed,
-            heap,
-            &schema,
-            kernels.len(),
-            target.limits(),
-        ) {
-            return Err(InstallError::Cap);
-        }
+        let layout = parsed.layout(&[]).ok_or(InstallError::NotAProgram)?;
+        let pages =
+            (layout.rw.size + layout.stack.size) / vos_wire::result::PAGE as u64 + u64::from(heap);
+        statics_within(program, pages, &schema, kernels.len(), target.limits())
+            .map_err(InstallError::Refused)?;
+        self.target = Some(target);
         let installed = Installed {
             program: program.to_vec(),
             schema,
@@ -459,30 +462,50 @@ impl Testkit {
 }
 
 /// Whether a program's statics are within `limits`: the kernels bound to
-/// it, its bytes, the pages it may write, `heap` more past them included,
-/// and each attestable method's gas limit over a compression's price.
+/// it, its bytes, the `pages` it may write, its whole heap's included, and
+/// the gas each attestable method declares for its kernel.
 fn statics_within(
     program: &[u8],
-    parsed: &vos_pvm::spi::StandardProgram,
-    heap: u32,
+    pages: u64,
     schema: &Schema,
     kernels: usize,
     limits: &Limits,
-) -> bool {
-    let pages = parsed.layout(&[]).map(|layout| {
-        (layout.rw.size + layout.stack.size) / vos_wire::result::PAGE as u64 + u64::from(heap)
-    });
-    let price = precompile::price(precompile::BLAKE2B_COMPRESS).expect("BLAKE2b's price");
-    kernels <= limits.kernels
-        && program.len() <= limits.program
-        && pages.is_some_and(|pages| limits.program_pages.is_none_or(|most| pages <= most as u64))
-        && limits.kernel_compressions.is_none_or(|most| {
-            schema
-                .methods
-                .iter()
-                .filter(|method| method.kind == Kind::Attestable)
-                .all(|method| method.gas_limit() / price <= most)
-        })
+) -> Result<(), Refused> {
+    if kernels > limits.kernels {
+        return Err(Refused::Kernels {
+            kernels: kernels as u64,
+            most: limits.kernels as u64,
+        });
+    }
+    if program.len() > limits.program {
+        return Err(Refused::Program {
+            bytes: program.len() as u64,
+            most: limits.program as u64,
+        });
+    }
+    if let Some(most) = limits.program_pages
+        && pages > most as u64
+    {
+        return Err(Refused::Pages {
+            pages,
+            most: most as u64,
+        });
+    }
+    let Some(most) = limits.kernel_gas() else {
+        return Ok(());
+    };
+    for method in &schema.methods {
+        if method.kind == Kind::Attestable
+            && let Some(gas) = method.gas.filter(|&gas| gas > most)
+        {
+            return Err(Refused::KernelGas {
+                method: method.id,
+                gas,
+                most,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Add the reply to agent `to`'s request awaiting at `awaiting`, if any,

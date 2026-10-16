@@ -54,7 +54,8 @@ pub(crate) enum Ended {
 }
 
 /// One step's execution: the overlays, the call stack and the effects,
-/// within the limits of the target its entry instance was installed for.
+/// within the limits of its agent's target, which its entry instance's
+/// install names.
 pub(crate) struct Invocation<'a> {
     pub(crate) kit: &'a Testkit,
     step: u32,
@@ -442,13 +443,19 @@ impl<'a> Invocation<'a> {
                     .and_then(|installed| installed.kernel(method))
                     .ok_or(Failure::Unknown)?;
                 // Bounded compressions: the kernel runs within its method's
-                // gas limit.
+                // gas and the bound's, for both the step's target and the
+                // attesting instance's.
                 let mut gas = machine.gas_remaining();
-                if self.limits.kernel_compressions.is_some() {
-                    let limit = installed
-                        .and_then(|installed| installed.schema.method(method))
-                        .map_or(0, |schema| schema.gas_limit());
-                    gas = gas.min(limit);
+                if let Some(installed) = installed {
+                    let declared = installed
+                        .schema
+                        .method(method)
+                        .and_then(|schema| schema.gas);
+                    for limits in [self.limits, installed.target.limits()] {
+                        if let Some(limit) = limits.kernel_limit(declared) {
+                            gas = gas.min(limit);
+                        }
+                    }
                 }
                 let (output, used) = kernel(program, &call_arguments, gas, self.limits.attest)?;
                 if !machine.charge(used) {

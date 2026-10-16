@@ -110,6 +110,7 @@ fn keys_keep_their_bytes() {
         Some(ProgramHash([0xcc; 32]))
     );
     assert_eq!(keys::workflow_pins_entry(&keys::workflow(workflow)), None);
+    assert_eq!(keys::target(), [0x00, 0x18]);
 }
 
 /// A sweep's rows: those due by its time, earliest first, as many as it

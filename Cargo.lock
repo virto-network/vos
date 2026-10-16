@@ -2593,6 +2593,7 @@ dependencies = [
  "tracing",
  "vos-pvm",
  "vos-pvm-program",
+ "vos-wire",
 ]
 
 [[package]]

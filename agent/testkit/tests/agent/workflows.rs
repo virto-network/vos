@@ -82,6 +82,13 @@ fn programs() -> BTreeMap<&'static str, Vec<u8>> {
 
 impl Flows {
     pub fn new(node: Node) -> Self {
+        Self::for_target(node, Target::Vos)
+    }
+
+    /// The node and the model with the actors installed for `target`, the
+    /// shop as its own program on VOS, and on JAM, whose limits hold a
+    /// smaller heap, with the default one.
+    pub fn for_target(node: Node, target: Target) -> Self {
         let mut flows = Self {
             actors: Actors::load(),
             programs: programs(),
@@ -92,8 +99,14 @@ impl Flows {
             time: 0,
             budget: crate::common::OUTER_GAS,
         };
-        flows.actors.install(&mut flows.node, &mut flows.kit);
-        let install = flows.install("shop");
+        flows
+            .actors
+            .install_for(target, &mut flows.node, &mut flows.kit);
+        let shop = match target {
+            Target::Vos => "shop",
+            Target::Jam => "lean",
+        };
+        let install = flows.install_for(shop, target);
         flows.node.batch(0, vec![install]);
         flows.kit.version = flows.node.version;
         flows

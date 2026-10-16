@@ -460,20 +460,26 @@ impl Actors {
     /// The ledger's install in `node`, which stores its programs: its own,
     /// which holds its workflow, and its attestable's kernel.
     pub fn install_ledger(&self, node: &mut Node) -> Input {
+        self.install_ledger_for(Target::Vos, node)
+    }
+
+    /// [`Actors::install_ledger`] for `target`.
+    pub fn install_ledger_for(&self, target: Target, node: &mut Node) -> Input {
         node.add(&self.ledger);
         node.add(&self.checksum);
         Input::Admin(Admin::Install {
             instance: LEDGER,
             derivation: derivation(&package("ledger"), &derived("ledger")),
             roles: vec![(b"minter".to_vec(), MINTER)],
-            target: Target::Vos,
+            target,
         })
     }
 
-    /// The ledger's install in a testkit.
-    pub fn install_ledger_in(&self, kit: &mut Testkit) {
+    /// The ledger's install in a testkit, for `target`.
+    pub fn install_ledger_in_for(&self, target: Target, kit: &mut Testkit) {
         let checksum = method(&self.ledger, "checksum");
-        kit.install(
+        kit.install_for(
+            target,
             LEDGER,
             &self.ledger,
             &[(checksum, &self.checksum)],
@@ -494,15 +500,20 @@ impl Actors {
     /// Install the actors and make Alice a minter, in the node through a
     /// batch of admin inputs and in the testkit directly.
     pub fn install(&self, node: &mut Node, kit: &mut Testkit) {
+        self.install_for(Target::Vos, node, kit);
+    }
+
+    /// [`Actors::install`] for `target`.
+    pub fn install_for(&self, target: Target, node: &mut Node, kit: &mut Testkit) {
         let counter = node.add(&self.counter);
         let caller = node.add(&self.caller);
-        let ledger = self.install_ledger(node);
+        let ledger = self.install_ledger_for(target, node);
         let result = node.batch(
             0,
             vec![
-                install(COUNTER, counter),
+                install_for(target, COUNTER, counter),
                 ledger,
-                install(CALLER, caller),
+                install_for(target, CALLER, caller),
                 Input::Admin(Admin::SetRole(Grant {
                     principal: ALICE,
                     role: Some(MINTER),
@@ -512,9 +523,11 @@ impl Actors {
         for step in &result.steps {
             ran_done(step);
         }
-        kit.install(COUNTER, &self.counter, &[], &[]).unwrap();
-        self.install_ledger_in(kit);
-        kit.install(CALLER, &self.caller, &[], &[]).unwrap();
+        kit.install_for(target, COUNTER, &self.counter, &[], &[])
+            .unwrap();
+        self.install_ledger_in_for(target, kit);
+        kit.install_for(target, CALLER, &self.caller, &[], &[])
+            .unwrap();
         kit.set_role(ALICE, Some(MINTER));
     }
 }
@@ -595,11 +608,16 @@ pub fn increment_in(actors: &Actors, session: Session, sequence: u64) -> Input {
 
 /// An install of `program` at `instance`, with no attestable and no role.
 pub fn install(instance: InstanceId, program: ProgramHash) -> Input {
+    install_for(Target::Vos, instance, program)
+}
+
+/// [`install`] for `target`.
+pub fn install_for(target: Target, instance: InstanceId, program: ProgramHash) -> Input {
     Input::Admin(Admin::Install {
         instance,
         derivation: bare(program),
         roles: vec![],
-        target: Target::Vos,
+        target,
     })
 }
 

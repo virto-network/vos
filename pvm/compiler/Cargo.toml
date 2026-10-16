@@ -8,6 +8,9 @@ description = "RISC-V ELF to VOS PVM compiler"
 [dependencies]
 vos-pvm = { path = "../runtime" }
 vos-pvm-program = { path = "../program" }
+# The heap a handler's or a kernel's program holds, which the SDK's
+# allocator gives it.
+vos-wire = { workspace = true }
 thiserror = "2"
 tracing = "0.1"
 # Function names for a profiler, as source spells them.

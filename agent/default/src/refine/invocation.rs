@@ -36,7 +36,8 @@ use memory::{copy_out, read, read_key, row, window, write};
 const MAX_DEPTH: usize = 63;
 
 /// One step: its overlays, call stack and effects, within the limits of
-/// the target of the instance it enters, its nested calls' too.
+/// its agent's target, which the install of the instance it enters names,
+/// its nested calls' too.
 pub(crate) struct Invocation<'a> {
     base: &'a Base,
     step: u32,
@@ -447,43 +448,7 @@ impl<'a> Invocation<'a> {
                 });
                 machine.set_register(7, code::OK);
             }
-            Op::Attest => {
-                let method = MethodId(r[7] as u32);
-                let call_arguments = read(machine, r[8], r[9], self.limits.attest)?;
-                if self.attests.len() == self.limits.attests {
-                    return Err(Failure::Cap);
-                }
-                let installed = installed.ok_or(Failure::Unknown)?;
-                let program = installed.kernel(method).ok_or(Failure::Unknown)?;
-                // Where kernels' compressions are bounded, a kernel runs
-                // within its method's gas limit, which bounds them.
-                let gas = match self.limits.kernel_compressions {
-                    Some(_) => installed
-                        .schema
-                        .method(method)
-                        .map_or(0, |schema| schema.gas_limit())
-                        .min(machine.gas()),
-                    None => machine.gas(),
-                };
-                let (output, used) = kernel(
-                    &self.base.meter,
-                    &program,
-                    &call_arguments,
-                    gas,
-                    self.limits.attest,
-                )?;
-                if !machine.charge(used) {
-                    return Err(Failure::OutOfGas);
-                }
-                copy_out(machine, &output, r[10], 0, r[11])?;
-                machine.set_register(7, output.len() as u64);
-                machine.set_register(8, 0);
-                self.attests.push(Attest {
-                    program,
-                    arguments: call_arguments,
-                    output,
-                });
-            }
+            Op::Attest => self.attest(machine, installed)?,
             Op::Request | Op::Result | Op::Sleep => {
                 if outcome.is_some() {
                     return Err(Failure::Trapped);
@@ -507,6 +472,54 @@ impl<'a> Invocation<'a> {
             }
             Op::Now | Op::SelfId | Op::Call => unreachable!("served apart"),
         }
+        Ok(())
+    }
+
+    /// [`Op::Attest`]: the method's kernel run on the arguments, within the
+    /// attest limits of the step's target. Where kernels' compressions are
+    /// bounded, a kernel runs within its method's gas and the bound's, on
+    /// the attesting instance's target and on the step's. Apart, so a nested
+    /// call's frame holds none of it.
+    #[inline(never)]
+    fn attest(
+        &mut self,
+        machine: &mut Machine,
+        installed: Option<&Installed>,
+    ) -> Result<(), Failure> {
+        let r = machine.registers();
+        let method = MethodId(r[7] as u32);
+        let call_arguments = read(machine, r[8], r[9], self.limits.attest)?;
+        if self.attests.len() == self.limits.attests {
+            return Err(Failure::Cap);
+        }
+        let installed = installed.ok_or(Failure::Unknown)?;
+        let program = installed.kernel(method).ok_or(Failure::Unknown)?;
+        let declared = installed
+            .schema
+            .method(method)
+            .and_then(|schema| schema.gas);
+        let gas = [self.limits, installed.target.limits()]
+            .iter()
+            .filter_map(|limits| limits.kernel_limit(declared))
+            .fold(machine.gas(), u64::min);
+        let (output, used) = kernel(
+            &self.base.meter,
+            &program,
+            &call_arguments,
+            gas,
+            self.limits.attest,
+        )?;
+        if !machine.charge(used) {
+            return Err(Failure::OutOfGas);
+        }
+        copy_out(machine, &output, r[10], 0, r[11])?;
+        machine.set_register(7, output.len() as u64);
+        machine.set_register(8, 0);
+        self.attests.push(Attest {
+            program,
+            arguments: call_arguments,
+            output,
+        });
         Ok(())
     }
 

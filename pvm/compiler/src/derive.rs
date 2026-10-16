@@ -57,8 +57,9 @@ use crate::riscv::{self, decode_b_imm, decode_j_imm, op};
 pub const TRANSPILER_VERSION: u32 = 2;
 
 /// The bytes of its actor's heap arena a handler's or a kernel's program
-/// holds: a workflow's machine maps the rest.
-pub const INVOCATION_HEAP: u64 = 512 << 10;
+/// holds, [`vos_wire::abi::INVOCATION_HEAP`], the most the SDK's allocator
+/// gives one: a workflow's machine maps the rest.
+pub const INVOCATION_HEAP: u64 = vos_wire::abi::INVOCATION_HEAP as u64;
 
 /// A page of the PVM's memory.
 const PAGE: u64 = vos_pvm::PVM_PAGE_SIZE as u64;
@@ -104,6 +105,11 @@ pub enum DeriveError {
     NoSchema,
     #[error("the attestable methods' table: {0}")]
     Table(String),
+    #[error(
+        "the heap's arena, `.vos_heap`, at {start:#x} for {size:#x} bytes, does not end the \
+         read-write data at {end:#x} from a page: build with the guest's linker script"
+    )]
+    Heap { start: u64, size: u64, end: u64 },
     #[error("a kernel reaches code from {0:#x} to {1:#x}, which no code section holds whole")]
     Unreadable(u64, u64),
     #[error(
@@ -133,7 +139,7 @@ pub fn derive(elf: &[u8]) -> Result<Derived, DeriveError> {
         return Err(DeriveError::CodeSections(linked.code_sections.len()));
     }
     let schema = linked.schema.take().ok_or(DeriveError::NoSchema)?;
-    let heap = invocation_heap(&mut linked);
+    let heap = invocation_heap(&mut linked)?;
     let actor = spi_blob(transpile_with(&linked, Link::Whole)?)?;
     let graph = Graph::new(&linked);
     let kernels = attestables(&linked)?
@@ -150,19 +156,23 @@ pub fn derive(elf: &[u8]) -> Result<Derived, DeriveError> {
 }
 
 /// Leave the heap's arena past [`INVOCATION_HEAP`] out of the read-write
-/// data the ELF's programs hold, where the arena ends that data at a page:
-/// the pages left out, which a workflow's machine maps.
-fn invocation_heap(elf: &mut LinkedElf) -> u32 {
+/// data the ELF's programs hold: the pages left out, which a workflow's
+/// machine maps. An arena that does not end that data, from a page, is
+/// refused: its programs would not hold its first bytes alone.
+fn invocation_heap(elf: &mut LinkedElf) -> Result<u32, DeriveError> {
     let Some((start, size)) = elf.heap else {
-        return 0;
+        return Ok(0);
     };
     let end = elf.rw_base + elf.rw_len;
-    if start.saturating_add(size) != end || !start.is_multiple_of(PAGE) || size <= INVOCATION_HEAP {
-        return 0;
+    if start.saturating_add(size) != end || !start.is_multiple_of(PAGE) {
+        return Err(DeriveError::Heap { start, size, end });
+    }
+    if size <= INVOCATION_HEAP {
+        return Ok(0);
     }
     let kept = start + INVOCATION_HEAP;
     elf.rw_len = kept - elf.rw_base;
-    ((end.next_multiple_of(PAGE) - kept) / PAGE) as u32
+    Ok(((end.next_multiple_of(PAGE) - kept) / PAGE) as u32)
 }
 
 /// The ELF's attestable methods and their entries, from its `VOS_ATTEST`

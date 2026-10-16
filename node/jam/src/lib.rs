@@ -92,6 +92,10 @@ pub enum Error {
          node refines with"
     )]
     RefineGas { refine_gas: u64, least: u64 },
+    /// An install for another target than JAM, which a JAM service's
+    /// agent runs on.
+    #[error("an install for {0:?}: a JAM service takes installs for JAM alone")]
+    Target(vos_wire::abi::cap::Target),
 }
 
 /// A store's error as a string: `Store` keeps `PartialEq`.

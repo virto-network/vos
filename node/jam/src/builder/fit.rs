@@ -18,35 +18,24 @@
 //!   below the floor; one whose own work passes the usable gas is tried
 //!   once more at the floor, or at the lowest budget the floor refused it
 //!   while larger, where its step may fail `Cap` with fewer effects.
-//! - **[`WORST_ENDING`] bounds the step that ends a workflow** in a package
-//!   of its own, at the largest limit, restoring and dropping all of
-//!   `cap::HELD_PAGES`, 576: its keep, its decoding, and the own work of
-//!   its bookkeeping, the ending's ([`gas::ENDING`]) and each page's
-//!   ([`gas::PAGE_READ`], about 123k, and [`gas::PAGE_DROP`], about 115k).
-//!   That is about 913M of PolkaJam's 950M usable, asserted. It leaves out
-//!   the step's own effects, which at the agent's caps take far more own
-//!   work: `cap::STEP_WRITES` of writes about 105M in rows of 64 KiB, and up
-//!   to about 450M as the 3,125 puts of a step's 200M; each of
-//!   `cap::MESSAGES` messages about 26M; each of `cap::ATTESTS` attests
-//!   about 28M. A step's gas trades puts against messages and attests, so
-//!   its effects take about 1.15e9 at most, and the worst step with them
-//!   about 2.06e9. So, for a step alone in its package:
-//!   - **(a)** a workflow's step whose own effects fit the usable gas but
-//!     pass what its keep leaves of it, about 37M at the page cap, fails
-//!     `Cap` on JAM only, where a VOS node runs it;
-//!   - **(b)** an input whose own work passes the usable gas even at the
-//!     floor, its step's effects about 0.7e9 at the page cap or about 0.85e9
-//!     with no page held, leaves no package to make: `prepare` answers
-//!     `Error::Unfit`, and the builder stalls on it;
-//!   - **(c)** a request's or a call's step never fails `Cap`: below its
-//!     keep the batch leaves it undispatched, and it waits.
-//!
-//!
-//!   An instance installed for JAM runs within [`cap::JAM`]'s limits,
-//!   about 35 times below VOS's for a step's effects, and with fewer pages
-//!   held: [`WORST_JAM_STEP`] bounds its worst step, effects and all, and
-//!   fits a package, asserted, so (a) and (b) are for instances installed
-//!   for VOS alone.
+//! - **[`WORST_JAM_STEP`] bounds a step** in a package of its own. A JAM
+//!   service's agent takes installs for JAM alone (`prepare` refuses any
+//!   other, `Error::Target`), so its instances run within [`cap::JAM`]'s
+//!   limits: the worst step, at the largest limit, restores, stores and
+//!   drops every page a workflow may hold, ends it, and makes its effects at
+//!   their limits ([`gas::effects`]), about 839M of PolkaJam's 950M usable,
+//!   asserted. So no step fails `Cap` on JAM alone, and no input leaves no
+//!   package to make; a request's or a call's step below its keep is left
+//!   undispatched, and waits.
+//! - **At VOS's caps it would not hold.** [`WORST_ENDING`], the ending
+//!   that restores and drops all of `cap::HELD_PAGES`, 576, is about 913M
+//!   bar its effects ([`gas::ENDING`], [`gas::PAGE_READ`], about 123k a
+//!   page, [`gas::PAGE_DROP`], about 115k); its effects at those caps take
+//!   up to about 1.15e9 more (`cap::STEP_WRITES` of writes about 105M in
+//!   rows of 64 KiB, up to about 450M as the 3,125 puts of a step's 200M,
+//!   each of `cap::MESSAGES` messages about 26M, each of `cap::ATTESTS`
+//!   attests about 28M, traded against each other by the step's gas).
+//!   [`cap::JAM`]'s are about 35 times fewer.
 //! - **Its exports and imports** are at most a package's segments, and its
 //!   payload at most a package's input. A batch that does not fit loses its
 //!   later inputs, and a sweep its later rows, which wait for the next; a
@@ -63,17 +52,17 @@
 //! have stopped before them, so the rows after them may step where they
 //! would have waited. A page is fetched once a prepare, whichever check or
 //! simulation asks, and a place the store cannot read counts as one DA
-//! lacks, for both. Nothing exports a workflow's pages again: a workflow of
-//! an instance installed for JAM whose step comes past what its target
-//! keeps of its pages (`cap::Limits::pages_kept`, a day) ends at that step,
-//! `Expired`, without them, so it is never left out; one installed for VOS
-//! that sleeps or awaits past DA's retention stays due and never resumes.
+//! lacks, for both. Nothing exports a workflow's pages again: a workflow
+//! whose step comes past what JAM keeps of its pages
+//! (`cap::Limits::pages_kept`, 27 days, a day within the imports DA's
+//! retention) ends at that step, `Expired`, without them, so it is never
+//! left out for good.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use vos_wire::abi::cap;
-use vos_wire::batch::{Batch, Input, Work};
+use vos_wire::abi::cap::{self, Target};
+use vos_wire::batch::{Admin, Batch, Input, Work};
 use vos_wire::ids::{ProgramHash, WorkflowId};
 use vos_wire::keys::Due;
 use vos_wire::package::{MAX_SEGMENTS, Package, SEGMENT, result_segments};
@@ -131,8 +120,9 @@ const _: () = assert!(defaults::min_refine_gas(MAX_INPUTS) <= budget(POLKAJAM_RE
 /// one's row. Its batch keeps what a VOS node refines with at the least,
 /// which holds that step's keep; then its decoding, at the most inputs a
 /// batch holds, and its own work, the ending's bookkeeping and each
-/// page's. The step's own effects, and other inputs', are not in it (the
-/// module's doc says what they leave).
+/// page's. The step's own effects, and other inputs', are not in it: at
+/// VOS's caps they would pass what is left, which [`WORST_JAM_STEP`] does
+/// not at JAM's.
 pub const WORST_ENDING: u64 = defaults::min_refine_gas(MAX_INPUTS)
     + defaults::refine_start(
         MAX_INPUTS,
@@ -146,8 +136,9 @@ pub const WORST_ENDING: u64 = defaults::min_refine_gas(MAX_INPUTS)
 // its last step's own effects.
 const _: () = assert!(WORST_ENDING <= usable(POLKAJAM_REFINE_GAS));
 
-/// The refine gas of a package holding only the worst step of an instance
-/// installed for JAM ([`cap::JAM`]): at the largest limit, restoring every
+/// The refine gas of a package holding only the worst step of a JAM
+/// service's agent, whose instances run within [`cap::JAM`]: at the largest
+/// limit, restoring every
 /// page its workflow may hold, storing or dropping each, ending it, and its
 /// effects at their limits ([`gas::effects`]). Its batch keeps what a VOS
 /// node refines with at the least, as [`WORST_ENDING`]'s does.
@@ -160,8 +151,8 @@ pub const WORST_JAM_STEP: u64 = defaults::min_refine_gas(MAX_INPUTS)
     + cap::JAM.held_pages as u64 * (gas::PAGE_READ + gas::PAGE_DROP + gas::PAGE_STORE)
     + gas::effects(&cap::JAM);
 
-// On PolkaJam it fits: a step of an instance installed for JAM never fails
-// `Cap` on JAM alone, nor leaves no package to make.
+// On PolkaJam it fits: a step of a JAM service's agent never fails `Cap` on
+// JAM alone, nor leaves no package to make.
 const _: () = assert!(WORST_JAM_STEP <= usable(POLKAJAM_REFINE_GAS));
 
 /// A batch made a package: its simulation, the package and its encoding,
@@ -208,7 +199,8 @@ impl Builder {
     /// store as it stands, its pages read from `segments`. Inputs past
     /// [`MAX_INPUTS`], and later inputs and a sweep's later rows that do not
     /// fit, are left out to wait for a later package, as are the rows of
-    /// workflows whose pages DA lacks.
+    /// workflows whose pages DA lacks. An install for another target than
+    /// JAM is refused, `Error::Target`.
     pub fn prepare(
         &self,
         runner: &Runner,
@@ -218,6 +210,13 @@ impl Builder {
         seed: [u8; 32],
         solicit: &[(ProgramHash, u32)],
     ) -> Result<Prepared, Error> {
+        for input in &inputs {
+            if let Input::Admin(Admin::Install { target, .. }) = input
+                && *target != Target::Jam
+            {
+                return Err(Error::Target(*target));
+            }
+        }
         let view = self.store.view();
         let version = self.version()?;
         let mut fitting = Fitting::new(self.refine_gas);

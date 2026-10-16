@@ -20,17 +20,20 @@ pub fn arguments<T: crate::Decode>() -> T {
 /// A program's global allocator, an [`crate::heap::Heap`] over an arena
 /// of `$arena` bytes in its own section, `.vos_heap`, which the guest's
 /// linker script places last in the read-write data; and its panic
-/// handler, a trap. The entry macros include it.
+/// handler, a trap. The entry macros include it. With `actor`, an actor
+/// program's: a handler or a kernel is given the arena's first
+/// [`vos_wire::abi::INVOCATION_HEAP`] bytes alone.
 #[macro_export]
 macro_rules! program_runtime {
-    ($arena:expr) => {
+    (@heap $arena:expr, $actor:literal) => {
         #[cfg(target_arch = "riscv64")]
         #[unsafe(link_section = ".vos_heap")]
         static VOS_ARENA: $crate::heap::Arena<{ $arena }> = $crate::heap::Arena::new();
 
         #[cfg(target_arch = "riscv64")]
         #[global_allocator]
-        static VOS_HEAP: $crate::heap::Heap<{ $arena }> = $crate::heap::Heap::new(&VOS_ARENA);
+        static VOS_HEAP: $crate::heap::Heap<{ $arena }, $actor> =
+            $crate::heap::Heap::new(&VOS_ARENA);
 
         #[cfg(target_arch = "riscv64")]
         #[panic_handler]
@@ -54,16 +57,22 @@ macro_rules! program_runtime {
             unsafe { $crate::mem::compare(a, b, len) }
         }
     };
+    ($arena:expr) => {
+        $crate::program_runtime!(@heap $arena, false);
+    };
+    ($arena:expr, actor) => {
+        $crate::program_runtime!(@heap $arena, true);
+    };
 }
 
-/// An actor program's heap by default. An install derives programs that
-/// hold at most its first 512 KiB, all a handler or a kernel maps; a
-/// workflow, which runs in its actor's program, maps the rest past it, and
-/// arms each page it may write at every step (`defaults::ARM_PAGE`). So an
-/// actor configures the least heap its largest workflow needs, and its
-/// handlers run within the first 512 KiB of it: past them, a store faults
-/// and the invocation traps.
-pub const PROGRAM_HEAP: usize = 512 << 10;
+/// An actor program's heap by default, [`vos_wire::abi::INVOCATION_HEAP`].
+/// An install derives programs that hold at most its first 512 KiB, all a
+/// handler or a kernel maps; a workflow, which runs in its actor's program,
+/// maps the rest past it, and arms each page it may write at every step
+/// (`defaults::ARM_PAGE`). So an actor configures the least heap its
+/// largest workflow needs, and its handlers run within the first 512 KiB of
+/// it: past them, an allocation fails and the invocation traps.
+pub const PROGRAM_HEAP: usize = vos_wire::abi::INVOCATION_HEAP;
 
 /// A program's output, by the halt convention: its address in φ7 and its
 /// length in φ8. An attestable method's entry returns it, and so do the
@@ -120,7 +129,7 @@ macro_rules! actor_program {
         $crate::actor_program!($($module)::+, heap = $crate::runtime::PROGRAM_HEAP);
     };
     ($($module:ident)::+, heap = $heap:expr) => {
-        $crate::program_runtime!($heap);
+        $crate::program_runtime!($heap, actor);
 
         #[used]
         #[unsafe(link_section = ".vos_schema")]

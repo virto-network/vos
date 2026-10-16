@@ -4,6 +4,7 @@ use scale::{Decode, Encode};
 
 use super::price;
 use crate::defaults::MAX_HANDLER_GAS;
+use crate::ids::MethodId;
 
 pub const REQUEST: usize = 64 << 10;
 pub const REPLY: usize = 64 << 10;
@@ -104,10 +105,14 @@ pub const WORKFLOW_STEP_RESULT: usize = step_result(2 * MAX_HANDLER_GAS) + WORKF
 const _: () = assert!(STEP_RESULT + 64 <= WORK_RESULT);
 const _: () = assert!(WORKFLOW_STEP_RESULT + 64 <= WORK_RESULT);
 
-/// Where an instance is installed to run, which sets the [`Limits`] it runs
-/// within: its install record names it. The agent holds an instance to its
-/// target's limits on every host, so a JAM builder's simulation, the JAM
-/// refine and a VOS node running the same batch agree.
+/// Where an agent runs, a VOS node or a JAM service, which sets the
+/// [`Limits`] its instances run within. An agent runs on one host, so its
+/// first install records its target ([`crate::keys::target`]) and every
+/// later one names the same, or is refused, [`super::Failure::Target`]; a
+/// JAM builder takes no install for VOS. Each install record names it too.
+/// The agent holds its instances to their target's limits on every host,
+/// so a JAM builder's simulation, the JAM refine and a VOS node running the
+/// same batch agree.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode)]
 #[repr(u8)]
 pub enum Target {
@@ -172,10 +177,11 @@ pub struct Limits {
     /// The kernels an install binds.
     pub kernels: usize,
     /// The BLAKE2b compressions one kernel's run may make, each served by
-    /// the agent ([`crate::defaults::PRECOMPILE_SERVING`]): its method's
-    /// gas limit over the precompile's price bounds them, checked at
-    /// install, and a kernel runs within that limit. `None`: the calling
-    /// handler's gas alone bounds a kernel.
+    /// the agent ([`crate::defaults::PRECOMPILE_SERVING`]): a kernel runs
+    /// within the gas they pay for ([`Limits::kernel_gas`]), and within the
+    /// gas its method declares (`#[attestable(gas = N)]`), which its
+    /// install checks is no more. `None`: the calling handler's gas alone
+    /// bounds a kernel.
     pub kernel_compressions: Option<u64>,
 }
 
@@ -197,6 +203,11 @@ pub const VOS: Limits = Limits {
     kernel_compressions: None,
 };
 
+/// How long JAM's limits keep a workflow's pages, in milliseconds: the 28
+/// days the imports DA keeps an exported segment, less a day's margin
+/// ([`JAM`]).
+pub const JAM_PAGES_KEPT: u64 = (28 - 1) * 24 * 60 * 60 * 1000;
+
 /// A JAM service's limits. What a step leaves in its work result its
 /// package pays for beyond its batch's budget, in software: at VOS's caps a
 /// step's effects take up to about 1.4e9 gas of that own work, past a work
@@ -206,12 +217,19 @@ pub const VOS: Limits = Limits {
 /// the bytes, half as many; its writes a 16th of the bytes, in at most 128
 /// rows. A workflow holds a ninth of the pages, and writes a 32nd of them
 /// in a step; an actor's program writes at most a 16th of them, and loads
-/// within a step's reserve. A workflow's pages travel as exported segments,
-/// which JAM's data availability keeps for a limited time, so a workflow
-/// that waits a day past storing a page it holds ends: well within that
-/// time, and deterministically, rather than waiting for good on pages
-/// gone. A kernel hashes about a 40th of what the most
+/// within a step's reserve. A kernel hashes about a 40th of what the most
 /// gas a handler may request pays for.
+///
+/// **A workflow's pages** travel as exported segments, which JAM's imports
+/// DA, the D³L, keeps for at least 28 days (672 epochs) after the report of
+/// the package that exported them (Gray Paper 0.8.0, §14.3.1, and §16 for
+/// assurers). A workflow keeps them 27 days past the batch time from which
+/// it holds them, then ends at its next step, deterministically, rather
+/// than waiting for good on pages gone. The day's margin covers, many
+/// times over, the package's report coming before its batch time (by at
+/// most the session skew, a minute, and the five slots a report waits to
+/// become available) and the resuming package's refine coming after its
+/// batch time (by at most the skew and a slot).
 pub const JAM: Limits = Limits {
     step_writes: 16 << 10,
     step_rows: 128,
@@ -222,7 +240,7 @@ pub const JAM: Limits = Limits {
     workflow_pages: 256,
     step_pages: 256 << 10,
     held_pages: 64,
-    pages_kept: Some(24 * 60 * 60 * 1000),
+    pages_kept: Some(JAM_PAGES_KEPT),
     program_pages: Some(256),
     program: 512 << 10,
     kernels: 32,
@@ -230,6 +248,27 @@ pub const JAM: Limits = Limits {
 };
 
 impl Limits {
+    /// The most gas a kernel runs with where its compressions are bounded:
+    /// what the bound pays for at BLAKE2b's price. `None` where they are not.
+    pub const fn kernel_gas(&self) -> Option<u64> {
+        match (
+            self.kernel_compressions,
+            super::precompile::price(super::precompile::BLAKE2B_COMPRESS),
+        ) {
+            (Some(most), Some(price)) => Some(most * price),
+            _ => None,
+        }
+    }
+
+    /// The gas a kernel of a method declaring `declared` runs with where
+    /// kernels are bounded: what it declares, or [`Limits::kernel_gas`] if
+    /// it declares none, at most that. `None` where only the calling
+    /// handler's gas bounds a kernel.
+    pub fn kernel_limit(&self, declared: Option<u64>) -> Option<u64> {
+        self.kernel_gas()
+            .map(|most| declared.map_or(most, |gas| gas.min(most)))
+    }
+
     /// Whether each of its limits is at most `other`'s, so what `other`
     /// sizes holds it too.
     pub const fn within(&self, other: &Limits) -> bool {
@@ -269,3 +308,65 @@ impl Limits {
 // target's limits stay within them.
 const _: () = assert!(JAM.within(&VOS));
 const _: () = assert!(VOS.attest <= REQUEST && VOS.attest <= REPLY);
+
+/// Why an install was refused, its failure's detail: under
+/// [`super::Failure::Target`] its target, under [`super::Failure::Cap`] the
+/// static past its target's limits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum Refused {
+    /// The agent's target, which the install did not name.
+    #[codec(index = 0)]
+    Target { agent: Target },
+    /// The kernels it binds.
+    #[codec(index = 1)]
+    Kernels { kernels: u64, most: u64 },
+    /// The bytes of its actor's program.
+    #[codec(index = 2)]
+    Program { bytes: u64, most: u64 },
+    /// The pages its actor's program may write, its whole heap's included.
+    #[codec(index = 3)]
+    Pages { pages: u64, most: u64 },
+    /// The gas an attestable method declares for its kernel.
+    #[codec(index = 4)]
+    KernelGas {
+        method: MethodId,
+        gas: u64,
+        most: u64,
+    },
+}
+
+impl Refused {
+    /// The failure an install so refused ends with, this its detail.
+    pub const fn failure(&self) -> super::Failure {
+        match self {
+            Refused::Target { .. } => super::Failure::Target,
+            _ => super::Failure::Cap,
+        }
+    }
+}
+
+impl core::fmt::Display for Refused {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Refused::Target { agent } => write!(
+                f,
+                "the agent runs on {agent:?}, and every instance installed into it takes that target"
+            ),
+            Refused::Kernels { kernels, most } => {
+                write!(f, "{kernels} kernels, past the {most} its target binds")
+            }
+            Refused::Program { bytes, most } => {
+                write!(f, "a program of {bytes} bytes, past its target's {most}")
+            }
+            Refused::Pages { pages, most } => write!(
+                f,
+                "a program that may write {pages} pages, its whole heap's included, past its target's {most}"
+            ),
+            Refused::KernelGas { method, gas, most } => write!(
+                f,
+                "attestable method {:#010x} declares gas {gas}, past the {most} a kernel runs with on its target",
+                method.0
+            ),
+        }
+    }
+}

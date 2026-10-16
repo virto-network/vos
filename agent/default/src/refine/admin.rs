@@ -2,14 +2,15 @@
 
 use alloc::vec::Vec;
 
-use vos_wire::abi::cap::{Limits, Target};
-use vos_wire::abi::{Failure, Kind, cap, precompile};
+use vos_wire::abi::cap::{Limits, Refused, Target};
+use vos_wire::abi::{Failure, Kind, cap};
 use vos_wire::batch::Admin;
 use vos_wire::records::{Derivation, Installed};
 use vos_wire::result::{InputRef, Outcome, Step, Write};
 use vos_wire::schema::Schema;
-use vos_wire::{Encode, keys};
+use vos_wire::{Decode, Encode, keys};
 
+use super::base::Base;
 use super::inputs::consumed;
 use crate::machines::{self, Machine};
 
@@ -18,9 +19,10 @@ const SCHEMA_AT: u64 = 1 << 16;
 
 /// An operator command: install a package or set a role. Its writes are
 /// under the step write cap like any step's.
-pub(crate) fn admin(admin: Admin) -> Step {
-    let failed = |code| Step::Ran(consumed(InputRef::Admin, Outcome::failed(code)));
-    let (write, reply) = match admin {
+pub(crate) fn admin(base: &Base, admin: Admin) -> Step {
+    let failed =
+        |code, detail| Step::Ran(consumed(InputRef::Admin, Outcome::Failed { code, detail }));
+    let (writes, reply) = match admin {
         Admin::Install {
             instance,
             derivation,
@@ -28,48 +30,73 @@ pub(crate) fn admin(admin: Admin) -> Step {
             target,
         } => {
             let reply = derivation.encode();
-            let installed = match install(derivation, roles, target) {
-                Ok(installed) => installed,
-                Err(code) => return failed(code),
+            let agent = match base.read(&keys::target()).map(|row| {
+                row.map(|bytes| Target::decode(&bytes).map(|(target, _)| target))
+                    .transpose()
+            }) {
+                Ok(Ok(agent)) => agent,
+                _ => return failed(Failure::Trapped, Vec::new()),
             };
-            let write = Write {
+            let installed = match install(agent, derivation, roles, target) {
+                Ok(installed) => installed,
+                Err(Err(code)) => return failed(code, Vec::new()),
+                Err(Ok(refused)) => return failed(refused.failure(), refused.encode()),
+            };
+            let mut writes = alloc::vec![Write {
                 key: keys::installed(instance),
                 value: Some(installed.encode()),
-            };
-            (write, reply)
+            }];
+            if agent.is_none() {
+                writes.push(Write {
+                    key: keys::target(),
+                    value: Some(target.encode()),
+                });
+            }
+            (writes, reply)
         }
         Admin::SetRole(grant) => {
             let write = Write {
                 key: keys::member(&grant.principal),
                 value: grant.role.map(|role| alloc::vec![role]),
             };
-            (write, Vec::new())
+            (alloc::vec![write], Vec::new())
         }
     };
-    if write.key.len() + write.value.as_ref().map_or(0, Vec::len) > cap::STEP_WRITES {
-        return failed(Failure::Cap);
+    let written: usize = writes
+        .iter()
+        .map(|write| write.key.len() + write.value.as_ref().map_or(0, Vec::len))
+        .sum();
+    if written > cap::STEP_WRITES {
+        return failed(Failure::Cap, Vec::new());
     }
     let mut run = consumed(InputRef::Admin, Outcome::Done(reply));
-    run.writes.push(write);
+    run.writes.extend(writes);
     Step::Ran(run)
 }
 
-/// Read the actor program's schema from its machine and check the package:
-/// each kernel is bound to an attestable method, every attestable method
-/// has exactly one, and every role name is mapped, or it fails `Unknown`;
-/// then its statics against its target's limits ([`within`]), or it fails
-/// `Cap`.
+/// Check an install for an agent of target `agent`, none before its first
+/// install: its target is the agent's, or it fails `Target`; each kernel is
+/// bound to an attestable method, every attestable method has exactly one,
+/// and every role name is mapped, read from the actor program's schema, or
+/// it fails `Unknown`; its statics are within its target's limits
+/// ([`within`]), or it fails `Cap`. A refusal against the target is
+/// `Ok`, its detail.
 fn install(
+    agent: Option<Target>,
     derivation: Derivation,
     roles: Vec<(Vec<u8>, u8)>,
     target: Target,
-) -> Result<Installed, Failure> {
-    let installed = package(derivation, roles, target).ok_or(Failure::Unknown)?;
-    within(&installed, target.limits())
-        .then_some(installed)
-        .ok_or(Failure::Cap)
+) -> Result<Installed, Result<Refused, Failure>> {
+    if let Some(agent) = agent.filter(|&agent| agent != target) {
+        return Err(Ok(Refused::Target { agent }));
+    }
+    let installed = package(derivation, roles, target).ok_or(Err(Failure::Unknown))?;
+    match within(&installed, target.limits()) {
+        Some(Ok(())) => Ok(installed),
+        Some(Err(refused)) => Err(Ok(refused)),
+        None => Err(Err(Failure::Cap)),
+    }
 }
-
 /// The package an install names, read and checked.
 fn package(derivation: Derivation, roles: Vec<(Vec<u8>, u8)>, target: Target) -> Option<Installed> {
     // The program an install names, which its operator may never have
@@ -111,31 +138,45 @@ fn package(derivation: Derivation, roles: Vec<(Vec<u8>, u8)>, target: Target) ->
     (installed.derivation.kernels.len() == attestables).then_some(installed)
 }
 
-/// Whether an installed package's statics are within `limits`: its kernels'
-/// count, its program's bytes and the pages it may write, its whole heap
-/// included, and the BLAKE2b
-/// compressions each attestable method's gas limit pays for.
-fn within(installed: &Installed, limits: &Limits) -> bool {
-    if installed.derivation.kernels.len() > limits.kernels {
-        return false;
+/// Whether an installed package's statics are within `limits`: the
+/// kernels it binds, its program's bytes and the pages it may write, its
+/// whole heap included, and the gas each attestable method declares for
+/// its kernel. `None` when its program has no header to read them from.
+fn within(installed: &Installed, limits: &Limits) -> Option<Result<(), Refused>> {
+    let kernels = installed.derivation.kernels.len();
+    if kernels > limits.kernels {
+        return Some(Err(Refused::Kernels {
+            kernels: kernels as u64,
+            most: limits.kernels as u64,
+        }));
     }
-    let Some((header, len)) = machines::header_and_len(&installed.program().0) else {
-        return false;
-    };
-    let pages =
-        machines::writable_pages(&header).map(|pages| pages + u64::from(installed.derivation.heap));
-    if len > limits.program
-        || pages.is_none_or(|pages| limits.program_pages.is_some_and(|most| pages > most as u64))
+    let (header, len) = machines::header_and_len(&installed.program().0)?;
+    if len > limits.program {
+        return Some(Err(Refused::Program {
+            bytes: len as u64,
+            most: limits.program as u64,
+        }));
+    }
+    let pages = machines::writable_pages(&header)? + u64::from(installed.derivation.heap);
+    if let Some(most) = limits.program_pages
+        && pages > most as u64
     {
-        return false;
+        return Some(Err(Refused::Pages {
+            pages,
+            most: most as u64,
+        }));
     }
-    let price = precompile::price(precompile::BLAKE2B_COMPRESS).expect("BLAKE2b's price");
-    limits.kernel_compressions.is_none_or(|most| {
-        installed
-            .schema
-            .methods
-            .iter()
-            .filter(|method| method.kind == Kind::Attestable)
-            .all(|method| method.gas_limit() / price <= most)
+    let Some(most) = limits.kernel_gas() else {
+        return Some(Ok(()));
+    };
+    let declared = installed
+        .schema
+        .methods
+        .iter()
+        .filter(|method| method.kind == Kind::Attestable)
+        .find_map(|method| Some((method.id, method.gas.filter(|&gas| gas > most)?)));
+    Some(match declared {
+        Some((method, gas)) => Err(Refused::KernelGas { method, gas, most }),
+        None => Ok(()),
     })
 }
