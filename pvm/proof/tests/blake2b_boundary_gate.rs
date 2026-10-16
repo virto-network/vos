@@ -27,9 +27,9 @@ use vos_pvm_proof::chips::Blake2bCall;
 use vos_pvm_proof::chips::blake2b::BoundaryColumn;
 use vos_pvm_proof::framework_access::AllLookupElements;
 use vos_pvm_proof::harness::MachineProverComponent;
+use vos_pvm_proof::recursion_pcs::ProverChannel;
 use vos_pvm_proof::trace::component::ComponentTrace;
 
-use stwo::core::channel::Blake2sChannel;
 use stwo::core::fields::m31::BaseField;
 
 /// Regenerate a self-consistent interaction trace + claimed sum from the
@@ -42,7 +42,7 @@ fn assert_chip<C: MachineProverComponent>(
     side_note: &SideNote,
 ) -> Result<(), String> {
     let mut lookup_elements = AllLookupElements::default();
-    let channel = &mut Blake2sChannel::default();
+    let channel = &mut ProverChannel::default();
     chip.draw_lookup_elements(&mut lookup_elements, channel);
     let (interaction_trace, claimed_sum) =
         chip.generate_interaction_trace(trace.clone(), side_note, &lookup_elements);
