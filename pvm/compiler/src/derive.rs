@@ -701,3 +701,45 @@ fn prologue_code() -> Vec<u8> {
     .flat_map(u32::to_le_bytes)
     .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An entry that marks its next `ecall` and makes host call `id`, then
+    /// returns.
+    fn calling(id: i32) -> Vec<u8> {
+        const CSRRW_MARK: u32 = 0x801 << 20 | 1 << 12 | 0x73;
+        let li_t0 = ((id as u32) << 20) | 5 << 7 | op::OP_IMM;
+        const ECALL: u32 = 0x73;
+        const RET: u32 = 1 << 15 | op::JALR;
+        [CSRRW_MARK, li_t0, ECALL, RET]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect()
+    }
+
+    /// The Ristretto and scalar ids, 110 to 114, are no precompile: a kernel
+    /// that reaches one is refused, naming it, as one reaching any host call
+    /// but a precompile is; one reaching BLAKE2b's derives.
+    #[test]
+    fn a_kernel_reaching_a_ristretto_id_is_refused() {
+        const ENTRY: u64 = 0x10_0000;
+        let derived = |id| {
+            let elf = LinkedElf::text(ENTRY, calling(id));
+            kernel(&Graph::new(&elf), 7, ENTRY)
+        };
+        for id in 110..=114 {
+            match derived(id) {
+                Err(DeriveError::HostCall {
+                    method, id: called, ..
+                }) => {
+                    assert_eq!((method, called), (7, id as u64));
+                }
+                other => panic!("host call {id}: {:?}", other.map(|kernel| kernel.len())),
+            }
+        }
+        let precompile = vos_pvm::precompile::BLAKE2B_COMPRESS as i32;
+        assert!(derived(precompile).is_ok());
+    }
+}
