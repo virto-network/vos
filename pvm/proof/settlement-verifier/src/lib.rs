@@ -739,3 +739,25 @@ mod pvm_atomic_shim {
         old
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Plonky3's `test_default_mersenne31_poseidon2_width_16`
+    /// (`mersenne-31/src/poseidon2.rs` at `f983316`): the input 0..15 under the
+    /// reference constants.
+    #[test]
+    fn the_permutation_matches_plonky3s_default_vector() {
+        let mut state: [BaseField; N_STATE] =
+            core::array::from_fn(|i| BaseField::from_u32_unchecked(i as u32));
+        permute(&mut state);
+        let expected = [
+            0x0b2c803a, 0x5b1ee4d1, 0x49c6b1e3, 0x2cdc280c, 0x310a60c8, 0x530a729e, 0x4e61bcb4,
+            0x2e84d3c3, 0x58709c08, 0x7e82ac42, 0x2162bcef, 0x6d153ab6, 0x742cf0e3, 0x2f21632d,
+            0x61adce1e, 0x1973d6f1,
+        ]
+        .map(BaseField::from_u32_unchecked);
+        assert_eq!(state, expected);
+    }
+}
