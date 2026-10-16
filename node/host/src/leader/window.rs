@@ -231,9 +231,9 @@ mod tests {
         assert_eq!(window.next(), window.due(), "only its round");
     }
 
-    /// An acknowledgement short of what was sent keeps a deferred `Behind`:
-    /// what was sent past it may be what the receiver dropped, and the
-    /// round may be far off.
+    /// An acknowledgement short of what was sent when the `Behind` came
+    /// keeps it deferred: what was sent through then may be what the
+    /// receiver dropped, and the round may be far off.
     #[test]
     fn a_partial_acknowledgement_keeps_a_deferred_behind() {
         let mut window = window(&[3, 4, 5]);
