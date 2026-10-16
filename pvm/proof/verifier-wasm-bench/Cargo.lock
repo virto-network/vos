@@ -132,18 +132,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
-name = "bigdecimal"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6773ddc0eafc0e509fb60e48dff7f450f8e674a0686ae8605e8d9901bd5eefa"
-dependencies = [
- "num-bigint",
- "num-integer",
- "num-traits",
- "serde",
-]
-
-[[package]]
 name = "bitflags"
 version = "2.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -720,12 +708,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
-name = "foldhash"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
-
-[[package]]
 name = "futures-core"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -829,7 +811,9 @@ version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
- "foldhash 0.1.5",
+ "allocator-api2",
+ "equivalent",
+ "foldhash",
  "serde",
 ]
 
@@ -838,13 +822,6 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
-dependencies = [
- "allocator-api2",
- "equivalent",
- "foldhash 0.2.0",
- "serde",
- "serde_core",
-]
 
 [[package]]
 name = "heapless"
@@ -1542,17 +1519,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7abf1b44ec5b18d87c1ae5f54590ca9d0699ef4dd5b2ffa66fc97f24613ec585"
 dependencies = [
  "ark-ff",
- "bigdecimal",
  "crypto-bigint",
  "getrandom 0.2.17",
  "hex",
- "serde",
 ]
 
 [[package]]
 name = "stwo"
 version = "2.2.0"
-source = "git+https://github.com/starkware-libs/stwo?rev=e1286720#e1286720e5a6352cae79cc1201c322d5e02ab52f"
+source = "git+https://github.com/olanod/stwo?rev=bbfa8bc3ae8ce958ee70d4bc59b8436bb453b3ef#bbfa8bc3ae8ce958ee70d4bc59b8436bb453b3ef"
 dependencies = [
  "blake2",
  "blake3",
@@ -1561,7 +1536,7 @@ dependencies = [
  "dashmap",
  "educe",
  "fnv",
- "hashbrown 0.17.1",
+ "hashbrown 0.15.5",
  "hex",
  "indexmap",
  "itertools 0.12.1",
@@ -1571,7 +1546,6 @@ dependencies = [
  "serde",
  "sha3",
  "starknet-crypto",
- "starknet-ff",
  "stwo-std-shims",
  "thiserror 2.0.20",
  "tracing",
@@ -1581,9 +1555,9 @@ dependencies = [
 [[package]]
 name = "stwo-constraint-framework"
 version = "2.2.0"
-source = "git+https://github.com/starkware-libs/stwo?rev=e1286720#e1286720e5a6352cae79cc1201c322d5e02ab52f"
+source = "git+https://github.com/olanod/stwo?rev=bbfa8bc3ae8ce958ee70d4bc59b8436bb453b3ef#bbfa8bc3ae8ce958ee70d4bc59b8436bb453b3ef"
 dependencies = [
- "hashbrown 0.17.1",
+ "hashbrown 0.15.5",
  "itertools 0.12.1",
  "num-traits",
  "rand",
@@ -1863,30 +1837,15 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 name = "vos-pvm"
 version = "0.1.0"
 dependencies = [
- "blake2",
  "libc",
  "memoffset",
- "thiserror 2.0.20",
  "tracing",
- "vos-pvm-codec",
+ "vos-pvm-program",
 ]
 
 [[package]]
-name = "vos-pvm-codec"
+name = "vos-pvm-program"
 version = "0.1.0"
-dependencies = [
- "thiserror 2.0.20",
- "vos-pvm-codec-derive",
-]
-
-[[package]]
-name = "vos-pvm-codec-derive"
-version = "0.1.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
 
 [[package]]
 name = "vos-pvm-proof"

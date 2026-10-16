@@ -929,16 +929,23 @@ fn replay_query_positions(
     Ok(positions)
 }
 
+/// Every preprocessed position read more than once must carry the same
+/// values each time; Stwo's Merkle verifier asserts it. Positions folded
+/// onto a preprocessed tree below the lifting height can repeat anywhere in
+/// the list, so the reads are compared in position order.
 fn validate_preprocessed_query_values(
     remapped_positions: &[usize],
     columns: &[alloc::vec::Vec<stwo::core::fields::m31::BaseField>],
 ) -> Result<(), alloc::string::String> {
-    for (index, mapped) in remapped_positions.windows(2).enumerate() {
-        if mapped[0] == mapped[1]
+    let mut reads: alloc::vec::Vec<usize> = (0..remapped_positions.len()).collect();
+    reads.sort_by_key(|&read| remapped_positions[read]);
+    for pair in reads.windows(2) {
+        let (first, second) = (pair[0], pair[1]);
+        if remapped_positions[first] == remapped_positions[second]
             && columns.iter().any(|column| {
                 column
-                    .get(index)
-                    .zip(column.get(index + 1))
+                    .get(first)
+                    .zip(column.get(second))
                     .is_none_or(|(left, right)| left != right)
             })
         {
@@ -969,6 +976,28 @@ mod hostile_query_tests {
         assert!(hostile.is_ok());
         assert!(hostile.unwrap().is_err());
 
+        let apart = std::panic::catch_unwind(|| {
+            validate_preprocessed_query_values(
+                &[2, 0, 2],
+                &[alloc::vec![
+                    BaseField::from_u32_unchecked(1),
+                    BaseField::from_u32_unchecked(5),
+                    BaseField::from_u32_unchecked(2),
+                ]],
+            )
+        });
+        assert!(apart.is_ok());
+        assert!(apart.unwrap().is_err());
+
+        validate_preprocessed_query_values(
+            &[2, 0, 2],
+            &[alloc::vec![
+                BaseField::from_u32_unchecked(1),
+                BaseField::from_u32_unchecked(5),
+                BaseField::from_u32_unchecked(1),
+            ]],
+        )
+        .unwrap();
         validate_preprocessed_query_values(
             &[2, 2],
             &[alloc::vec![

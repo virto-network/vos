@@ -287,18 +287,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
-name = "bigdecimal"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6773ddc0eafc0e509fb60e48dff7f450f8e674a0686ae8605e8d9901bd5eefa"
-dependencies = [
- "num-bigint",
- "num-integer",
- "num-traits",
- "serde",
-]
-
-[[package]]
 name = "bincode"
 version = "1.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2102,11 +2090,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7abf1b44ec5b18d87c1ae5f54590ca9d0699ef4dd5b2ffa66fc97f24613ec585"
 dependencies = [
  "ark-ff",
- "bigdecimal",
  "crypto-bigint",
  "getrandom 0.2.17",
  "hex",
- "serde",
 ]
 
 [[package]]
@@ -2118,7 +2104,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 [[package]]
 name = "stwo"
 version = "2.2.0"
-source = "git+https://github.com/starkware-libs/stwo?rev=e1286720#e1286720e5a6352cae79cc1201c322d5e02ab52f"
+source = "git+https://github.com/olanod/stwo?rev=bbfa8bc3ae8ce958ee70d4bc59b8436bb453b3ef#bbfa8bc3ae8ce958ee70d4bc59b8436bb453b3ef"
 dependencies = [
  "blake2",
  "blake3",
@@ -2137,7 +2123,6 @@ dependencies = [
  "serde",
  "sha3",
  "starknet-crypto",
- "starknet-ff",
  "stwo-std-shims",
  "thiserror",
  "tracing",
@@ -2147,7 +2132,7 @@ dependencies = [
 [[package]]
 name = "stwo-constraint-framework"
 version = "2.2.0"
-source = "git+https://github.com/starkware-libs/stwo?rev=e1286720#e1286720e5a6352cae79cc1201c322d5e02ab52f"
+source = "git+https://github.com/olanod/stwo?rev=bbfa8bc3ae8ce958ee70d4bc59b8436bb453b3ef#bbfa8bc3ae8ce958ee70d4bc59b8436bb453b3ef"
 dependencies = [
  "hashbrown 0.17.1",
  "itertools 0.12.1",

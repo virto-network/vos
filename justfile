@@ -118,12 +118,14 @@ check-no-faults:
 # The builds without std. vos-raft for an embedded target, on core and alloc
 # alone, built from the toolchain's source. The proof verifier on each
 # channel, with the proof crate's verifier path under it: both are `no_std`
-# crates, so a `std` path in either fails the build. Their target is wasm32,
-# which still has std for their dependencies: the pinned Stwo's verifier path
-# depends on dashmap, which needs std; the workspace's toolchain file
-# installs the target.
+# crates, so a `std` path in either fails the build. The verifier builds for
+# the same embedded target, where no dependency has std either, and for
+# wasm32, the target of an on-chain verifier; the workspace's toolchain file
+# installs wasm32.
 check-no-std:
     cargo build -p vos-raft --target thumbv7em-none-eabihf -Zbuild-std=core,alloc
+    cargo build -p vos-pvm-proof-verifier --target thumbv7em-none-eabihf -Zbuild-std=core,alloc
+    cargo build -p vos-pvm-proof-verifier --features poseidon2-channel --target thumbv7em-none-eabihf -Zbuild-std=core,alloc
     cargo build -p vos-pvm-proof-verifier --target wasm32-unknown-unknown
     cargo build -p vos-pvm-proof-verifier --features poseidon2-channel --target wasm32-unknown-unknown
 

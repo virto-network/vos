@@ -116,12 +116,14 @@ vos-raft = { path = "support/vos-raft" }
 vos-sdk = { path = "agent/sdk" }
 vos-sdk-macros = { path = "agent/sdk-macros" }
 
-# Stwo pinned to upstream rev `e1286720`. Declared without features:
-# workspace features are additive, and the verifier-only build must stay
-# free of std and rayon. The prover adds `std,prover,parallel` through
-# vos-pvm-proof's `prover` feature.
-stwo = { git = "https://github.com/starkware-libs/stwo", rev = "e1286720", default-features = false }
-stwo-constraint-framework = { git = "https://github.com/starkware-libs/stwo", rev = "e1286720", default-features = false }
+# Stwo from the fork's `vos/base` branch: upstream `e1286720` with dashmap
+# optional, Poseidon252 behind a feature, and upstream's `74951f79`, which
+# lets the verifier accept a preprocessed tree below the lifting height.
+# Declared without features: workspace features are additive, and the
+# verifier-only build must stay free of std and rayon. The prover adds
+# `std,prover,parallel` through vos-pvm-proof's `prover` feature.
+stwo = { git = "https://github.com/olanod/stwo", rev = "bbfa8bc3ae8ce958ee70d4bc59b8436bb453b3ef", default-features = false }
+stwo-constraint-framework = { git = "https://github.com/olanod/stwo", rev = "bbfa8bc3ae8ce958ee70d4bc59b8436bb453b3ef", default-features = false }
 
 num-traits = "0.2"
 serde = { version = "1", features = ["derive"] }

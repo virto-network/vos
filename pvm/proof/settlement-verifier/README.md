@@ -16,11 +16,11 @@ its Cargo feature resolution never co-resolves with `javm`/prover-stwo. The vos
 workspace pins stwo with `std,prover,parallel` (which drag rayon, and javm drags
 blst); here stwo is pinned at the same code but `default-features = false`.
 
-The stwo dependency points at the `olanod/stwo` fork (see `Cargo.toml`), whose
-only change from the upstream rev is making `dashmap` (std-only, prover-only)
+The stwo dependency points at the `olanod/stwo` fork at the vos workspace's
+rev (see `Cargo.toml`). The fork makes `dashmap` (std-only, prover-only)
 optional + prover-gated, so this no_std / no-atomics verifier build does not drag
-`crossbeam-utils` + `lock_api`. No verifier logic is modified; when bumping the
-stwo rev, carry only that one build-config change forward.
+`crossbeam-utils` + `lock_api`, and puts the Poseidon252 PCS behind a feature
+this build leaves off. Bump this rev with the workspace's.
 
 ## Building the PVM settlement ELF
 
