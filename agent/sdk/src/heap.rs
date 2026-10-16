@@ -2,13 +2,13 @@
 //! free list, so short-lived allocations cost a few instructions and freed
 //! memory is reused. Blocks past the largest class go on one first-fit
 //! list. Fresh memory is bumped from the arena's start. In an actor's
-//! program (`ACTOR`) a handler or a kernel, whose program holds
-//! only the arena's first [`vos_wire::abi::INVOCATION_HEAP`] bytes, is
-//! given none past them: its allocation fails there, and the invocation
-//! traps. A workflow, whose machine maps the whole arena, marks itself so
-//! ([`whole_arena`]) before it allocates. Pages a program never touches cost nothing to run, but
-//! the pool prices a machine by its mapped pages, so the arena is sized per
-//! program: [`crate::program_runtime!`] takes it.
+//! program (`ACTOR`) a handler or a kernel, whose program holds only the
+//! arena's first [`vos_wire::abi::INVOCATION_HEAP`] bytes, is given none
+//! past them: its allocation fails there, and the invocation traps. A
+//! workflow, whose machine maps the whole arena, marks itself so
+//! ([`whole_arena`]) before it allocates. Pages a program never touches
+//! cost nothing to run, but the pool prices a machine by its mapped pages,
+//! so the arena is sized per program: [`crate::program_runtime!`] takes it.
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;

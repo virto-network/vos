@@ -202,10 +202,9 @@ pub fn print_answer(answer: &Response) -> Result<(), String> {
     Ok(())
 }
 
-/// An install's or a role's answer. Each overwrites what it sets, so one
-/// that timed out is safe to send again.
-/// An admin command's answer, printed: an install refused against its
-/// target also says why.
+/// An admin command's answer, an install's or a role's, printed. Each
+/// overwrites what it sets, so one that timed out is safe to send again;
+/// an install refused against its target also says why.
 pub fn print_admin_answer(answer: &Response) -> Result<(), String> {
     match answer {
         Response::TimedOut => {

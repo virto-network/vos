@@ -289,7 +289,7 @@ DA emptied: the workflow left out within the keep, then ended
   compiler's `INVOCATION_HEAP` and the SDK's default heap,
   `PROGRAM_HEAP`, both are.
 - **The allocator knows the invocation:** in an actor's program
-  (`Heap::actor`) it gives a handler or a kernel the arena's first 512
+  (`Heap`'s const parameter `ACTOR`) it gives a handler or a kernel the arena's first 512
   KiB alone, so an allocation past them fails at once, Rust's
   allocation-failure path, and the step traps, `Trapped`, whether or not
   the memory would be touched; before, it bumped into pages the program
