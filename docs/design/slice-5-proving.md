@@ -1,384 +1,428 @@
-# Slice 5: proving
+# Slice 5: proving, the foundation and the recursion
 
-Plan, draft 6. The owner chose **proving first**: slice 5 builds proving,
-and the Clerk across spaces is slice 6 (`slice-6-clerk.md`, draft 2,
-with Fable's review folded in).
-- **The approach:** this plan proves the general mechanism, any
-  attestable kernel reading committed state, with two targets:
-  cipher-clerk's settlement window and a solvency predicate.
-- **Draft 6 takes the spikes, the width audit and the owner's answers:**
-  - JAM verifies statements in this slice, through a **recursion layer**
-    that folds a statement's segment proofs into one final proof;
-  - **only the final proof is masked.** Segment proofs and the fold
-    proofs between them never leave the space's prover role;
-  - each kernel proves over the chips it uses (a shape per kernel);
-  - the final proof uses the Blake2s channel, and the proofs it folds use
-    Poseidon2-M31.
-- **Draft 5 took the owner's earlier answers:**
-  - arguments are private by default, `#[public]` marks the public ones,
-    and the return value is public;
-  - attestable methods may read state through `&self`;
-  - no unmasked proof outside tests, so masking comes before wiring.
-    Draft 6 narrows this with the owner: none leaves the space's prover
-    role.
-
-## What exists
-
-- **Two prover paths:**
-  - **The refine path** (`prove_refine`) makes one STARK per machine
-    slice, unsegmented. Its bundle carries gas, host boundaries and
-    per-slice states, and verification replays it.
-  - **The chain path** (`prove_chain`, `verify_chain_standalone`) has
-    canonical shapes with an allowlist, segments cut by steps and pages,
-    the first segment's initial memory root anchored, and
-    `final == next.initial`. It needs no replay by construction.
-- **Spike 3 proved a derived kernel on the chain path:**
-  - the chain path's tracer serves BLAKE2b (`0x400`) in-AIR, after a
-    49-line fix for sparse memory;
-  - `settlement::window` over vos-tree multiproofs, derived into a
-    43,687-byte kernel, runs about 21 compressions per row read at 10^6
-    rows;
-  - eight journals take 16 segments at the 32,768-step cut: 425 s,
-    6.6 GiB peak, 41.5 MB of proof;
-  - the page-Merkle boundary costs 6,585 compressions against the
-    kernel's 685;
-  - the program commitment depends on the observed profile and the
-    channel: one kernel showed eight.
-- **Spike 1 verified a real segment on the JAM-only host:** 10.65B gas
-  as built, about 2 MB of proof.
-- **The width audit:**
-  - **The AIR is 13,037 columns.** Ristretto is 42% of them, the BLAKE2b
-    chips 23% and the page-Merkle boundary 22%.
-  - **Verify gas is linear in columns.**
-  - **A shape per kernel is sound** (the prove path already drops gated
-    chips): the window kernel uses 22 of 32 chips and 7,519 columns.
-  - **Stacked, measured:** the leaf-hash fix, the kernel's shape and
-    STANDARD settings bring one segment to 1.17B gas (Blake2s) or 2.39B
-    (Poseidon2).
-  - **Projected:** every further lever leaves 0.45–0.7B. Flat
-    verification of a VM segment cannot meet 100M, and no production
-    zkVM attempts it.
-  - **A dedicated recursion AIR** verifies one segment for about 13% of
-    that segment's proving cost. Its final proof is projected at
-    60–150M gas and 100–300 KB, once per statement.
-- **Spike 2 designed masking** in our Stwo fork, with the rank check
-  built. Fable's review requires R1–R8 before it is built (5.4).
-  - **Upstream** has zero-knowledge only in its Starknet privacy
-    recursion, which blinds a circuit proof with random valid gates
-    seeded from the witness. It has no salts, no composition mask and no
-    FRI mask.
-- **The pinned Stwo has a completeness bug:** its verifier refuses valid
-  proofs whose preprocessed tree sits below the lifting height. Upstream
-  fixed it in `74951f79`.
+Plan, draft 7.
+- **The architecture** is `proving.md` (draft 4), and the recursion AIR's
+  design is `recursion-air.md`. The research behind both is in
+  `research/slice-5/`.
+- **This slice builds `proving.md`'s M0 and M1:** the foundation, then
+  our own recursion AIR, proved end to end in tests.
+  - Slice 6 masks the final proof and puts statements on chain (Kreivo,
+    JAM, `&self` reads).
+  - Slice 7 is mobile.
+  - The Clerk across spaces (`slice-6-clerk.md`, to be renumbered)
+    follows slice 6.
+- **Draft 7 replaces draft 6** with the owner's decisions of 2026-10-16
+  (`proving.md` §12).
 
 ## Goals
 
-1. A derived attestable kernel is proved without replay under one
-   program identity, over the chips it uses.
-2. Kernels prove facts about committed state, read from witnessed rows
-   at roots the proof binds.
-3. A statement's segment proofs fold into **one final proof** that binds
-   only what the kernel declares public.
-4. The final proof is zero-knowledge, and is verified by a public JAM
-   agent and by peers alike.
-5. The carried items, each closed or named to a slice.
+1. A derived kernel proves on the Poseidon2-M31 segment channel, over its
+   own shape, with its arguments delivered as witness.
+2. Our recursion AIR verifies those segment proofs in leaves, folds them
+   to one root, and wraps the root in a final proof on the Blake2b-256
+   channel.
+3. That final proof verifies natively, in a Wasm runtime and on the
+   JAM-only host. The final proof costs at most 150M gas unmasked, against
+   about 85M modelled.
+4. The window statement and the solvency predicate pass end to end, with
+   golden fixtures every venue judges alike.
 
-## The public-input model
+No proof leaves a test in this slice: masking is slice 6.
 
-This is the design 5.1 builds and reviews.
-- **Arguments are private unless marked `#[public]`; the return value
-  is public, as the claim** (the owner's decision). In `#[attestable]`:
-  - the window kernel's window, spaces, currency and cut points are
-    public, while its rows and paths are private;
-  - the predicate's threshold is public, while its account row is
-    private.
-- **The final proof's public inputs** are:
-  - the program id;
-  - the format version;
-  - the shape class;
-  - the public arguments, in clear;
-  - the output bytes, opaque and structured by the kernel;
-  - the list of roots read, each tagged with its kind.
+## What exists at the start
 
-  At halt, the guest writes their hash into φ9..12. The recursion
-  carries it from the last segment to the final proof.
-- **Private inputs** (private arguments, witness rows and paths) are
-  bound only inside the proofs.
-  - **Segment states become witnesses of the recursion.** The fold
-    checks `final == next.initial` and the first segment's anchor, so
-    the final proof carries no memory roots or registers.
-  - **The anchor splits the initial image** into a public part (code
-    and data, bound by the program id) and a private part (arguments
-    and witness), so the recursion can check the first without seeing
-    the second.
-  - **The salt page:** 5.1 decides whether it is still needed. It is
-    needed if any root over private memory reaches a public input.
-    Inside the space the fold proofs are trusted, as the witness rows
-    are.
-- **Slice 6 needs no format change:** its rows commitment is part of the
-  window kernel's output, its sequence cut points are public arguments,
-  and its two-anchor reads are a second root.
+- **vos-core** at `b5d42dc2` plus the hang fix, with three verifier fixes
+  from the spikes:
+  - the verifier path builds without std (now gated on wasm32);
+  - the Poseidon2 leaf hasher absorbs in place;
+  - the query-count preflight replays Stwo's transcript exactly.
+- **Spike branches** (local, not pushed), whose code steps may take:
+  - `spike/s5-guest-verify`: the guest verifier, the component-mask seam
+    `d165a7b6`, the lean verify seam `a465c10b`, and the final-gas proxy;
+  - `spike/s5-kernel-proof`: the derived window kernel and the chain
+    tracer's sparse-memory fix;
+  - `spike/s5-recair`: the gate-count crate, and `6acdc7df`
+    (`drive_chip_oods` reaches BITWISE_AND_BYTE);
+  - `spike/s5-mobile`: the device statements and the memory-ledger
+    measurement seam.
+- **The Stwo fork** (~/src/virto/stwo, branch `no-std-pvf-gating`): the
+  pinned `e1286720` plus no_std gating, and spike 2's masking prototype on
+  `zk-masking-spike`.
 
-## Steps
+## How every step runs
 
-### 5.0 Spikes, each with its decision rule
-
-1–3 are done, with the width audit:
-1. **Verify one real segment on JAM.** It does not fit (above), so JAM
-   verifies only a recursion proof.
-2. **Masking.** Designed, with the rank check built, in our Stwo fork.
-   Fable: sound, with changes R1–R8.
-3. **A kernel proved on the chain path.** Done, with BLAKE2b in-AIR.
-
-4. **The recursion stack** (new, run before 5.3):
-   - **The circuit stack:** StarkWare's (`starkware-libs/proving`,
-     Apache 2.0). It needs a move to that monorepo's Stwo, the
-     `nightly-2026-01-15` toolchain and edition 2024. A circuit for our
-     AIR's constraints is generated by driving each chip's
-     `add_constraints` through a gate-recording `EvalAtRow`.
-   - **Our own AIR:** a Poseidon2-M31 recursion AIR, on the archived
-     PCS plumbing.
-   - **Measure:**
-     - a final-shape proof (StarkWare's circuit proof, about 319
-       columns) verified on the JAM-only host, at a high blowup with the
-       Blake2s channel: its gas and bytes. **This is the go or no-go for
-       the venue.** Rule: at most 150M gas unmasked.
-     - the port's size: vos-core's prover built against the monorepo's
-       Stwo on its toolchain, and the breakage counted and classified;
-     - one of our chips verified inside the circuit stack, through the
-       generated gates;
-     - whether the circuit stack has a Poseidon2-M31 gate, or what one
-       costs to add (in-circuit Blake2s costs about 5× the recursion);
-     - our own AIR's starting point: what the archive holds.
-   - **Rule:** the circuit stack if the port is bounded (weeks, not
-     months), one chip verifies in-circuit, and the final-shape gas meets
-     the rule. Otherwise our own AIR.
-   - **The owner decides** on these numbers: the circuit stack moves the
-     toolchain and makes upstream's churn ours.
-
-### 5.1 The program identity, the format, and the shape per kernel (design round, reviewed by Fable)
-
-- **The prover path:** kernels on the chain path, re-run by the prover
-  from the `Attest` record (program, public and private arguments,
-  witness) exactly as the live inner machine ran them.
-- **A shape per kernel:** the kernel's component set, taken from its
-  code, plus its pinned `log_sizes` per segment class. The verifier
-  accepts exactly that set and those sizes. Otherwise a full-set proof
-  of the same kernel verifies at 1.6× the gas.
-- **One program id** over:
-  - `TRANSPILER_VERSION`;
-  - `ProgramHash`;
-  - the shape (component set and classes);
-  - the channel;
-  - the preprocessed root;
-  - the public data root of the initial image.
-
-  It is kept in the install's `Derivation`.
-- **The public-input model above:** the `#[attestable]` split, the
-  guest-written io-hash, the initial image's public and private split,
-  and the salt page's fate.
-- **The channels:**
-  - segment and fold proofs on Poseidon2-M31 (format 25), which the
-    recursion verifies cheaply;
-  - the final proof on Blake2s, which the PVM verifies 2.0–2.3× cheaper;
-  - Blake2s segment proofs (format 24) stay for tests.
-- **Taken from the spikes:**
-  - the leaf-hash fix (`2000c349`, half the Poseidon2 verify cost);
-  - the chain tracer's sparse-memory fix;
-  - `prove_canonical_with_config` and the component-mask seam
-    (`d165a7b6`);
-  - Stwo's completeness fix (`74951f79`), through the fork.
-- **The legacy tracer's fate:** retired, or kept as the chain path's
-  tracer. If retired, slice 1's exception to the allow-set closes here.
-
-### 5.2 Kernels read committed state, through `&self`
-
-- **Read-only `&self`** (the owner's decision): an attestable method may
-  take `&self`, and its table and field reads become witnessed reads
-  automatically.
-  - The live run records the rows it read and their paths.
-  - The prover re-runs with them as the witness.
-  - The root they are checked against is published.
-  - `&mut self` is refused at compile time: a proof states a fact about a
-    state, and the handler that receives the output makes any change.
-- **Witnesses:**
-  - a list of `(root kind, root, BatchProof)`, absence shown by boundary
-    leaves, from the start rather than a single root;
-  - rows and paths are verified inside the kernel, at the compress
-    level.
-- **The root at a live attest's version:**
-  - the kernel reads against the latest complete root W ≤ V and its
-    version, which the `Attest` records;
-  - the statement is "as of W", deterministic across replicas, since the
-    complete root at W is replicated state;
-  - the batch is not held for the root builder.
-- **Serving the prover's paths:** an LSM snapshot pinned at W per
-  pending attest, bounded in count, until its proof is made. No tree
-  versions are needed.
-- **Root kinds by host:** a JAM-deployed agent's map rows are a subtree
-  of one whole-keyspace tree, so the roots differ by host. VOS≡JAM holds
-  for the output, not the roots, and the agreement test excludes roots.
-- **Large witnesses** (rows and paths for up to 16 attests a step) go
-  through the result-blob path (4.4a), not inside the log entry.
-- **vos-tree's hasher** moves to the compress level.
-
-### 5.3 The recursion layer
-
-Built on spike 4's stack.
-- **Verify a segment proof inside the recursion:** our AIR's constraints
-  as circuit gates (or our own AIR), the Poseidon2-M31 channel, Merkle
-  paths and FRI.
-- **Fold 2 to 1:** every node padded to one shape, carrying:
-  - the program id;
-  - the io-hash from the last segment;
-  - the first segment's anchor;
-  - the boundary states matched between neighbours.
-
-  The root of the tree is one proof per statement, whatever its segment
-  count.
-- **The final layer:**
-  - switches to the Blake2s channel at a high blowup;
-  - uses a fold step above 1 if the verify gas needs it;
-  - pins its parameters in the format.
-- **Leaks to bound:** the segment count shows only as the tree's depth,
-  padded to a class.
-- **Tests:**
-  - a statement's segments folded and the final proof verified;
-  - a tampered segment, a swapped segment and a broken boundary each
-    refused;
-  - a fold over the wrong program id refused.
-- **Measured:** recursion prove time and memory per segment and per
-  statement; final proof bytes; verify instructions natively.
-
-### 5.4 Zero-knowledge for the final proof
-
-- **Masked: the final proof only** (the owner's decision). It is
-  zero-knowledge over its witness, the folded proofs, so those reveal
-  nothing outside.
-- **Built to spike 2's design** in our Stwo fork, with Fable's R1–R8
-  applied to the final layer:
-  1. the rank check;
-  2. the claimed sums blinded, and the boundary re-cut;
-  3. a rank test of the FRI mask;
-  4. hedged randomness, H(OS ‖ witness);
-  5. a degree audit (the final layer's AIR is ours or StarkWare's,
-     chosen with degree ≤2 where masking needs it);
-  6. the parameters pinned in the format;
-  7. every carrier audited (no root or state outside the proof);
-  8. the cost measured.
+- **A brief per step,** written when the step starts from this plan and
+  the two design docs. An implementing agent works from it alone.
+- **Reviews:**
+  - an Opus review of every step's diff;
+  - Fable as well for soundness-critical steps (marked **F** below): the
+    fork's channel and FRI changes, Poseidon2, the security accounting,
+    the witness-input binding, the gate VM, the compiler, the in-AIR
+    verifier, the leaf binding, the fold, and the wrap.
 - **Gates:**
-  - leakage: a simulator test where feasible, and the absence of
-    segment states checked;
-  - soundness: tests for every masked component.
-- **Proofs made before masking lands** exist only inside tests: they are
-  never stored or sent.
+  - `just check` per step;
+  - `ci-full`, `test-proof` and the checker loop at each milestone's end.
+- **Rules:**
+  - commit on `vos-core` and never rewrite what is on origin;
+  - push after reviewed milestones;
+  - comments are timeless;
+  - no `#[ignore]`, and no Co-Authored-By;
+  - heavy runs under `systemd-run --user --scope -q -p MemoryMax=… -p MemorySwapMax=0`;
+  - kill processes only by PID;
+  - fix pre-existing failures that are hit;
+  - the Stwo fork is pushed only with the owner's word.
+- **Every measured number** in a step's log is tagged measured, model or
+  projected, and lands in `slice-5-progress.md`.
 
-### 5.5 Proving wired into VOS
+## M0: the foundation
 
-- **The prover worker:**
-  - a node role inside the space's trust domain;
-  - a queue, retries, and placement with its 24 GiB;
-  - segment and fold proofs kept only inside the role;
-  - final proofs stored as aged, content-addressed blobs;
-  - the `Attest` record names its final proof.
-- **Only masked final proofs leave the prover role** (the owner's
-  decision). The format has no unmasked final proof outside tests.
-- **Verification without replay** wherever a final proof arrives: at
-  ingress, or by a peer.
+### 5.1 The Stwo fork as vos-core's base (F)
+
+- **Pin vos-core to the owner's fork** (olanod/stwo) at a revision that
+  carries:
+  - `no-std-pvf-gating` (dashmap optional, Poseidon252 gated);
+  - **upstream's completeness fix `74951f79`, backported.** Today a valid
+    proof is refused when the preprocessed tree sits below the lifting
+    height.
 - **Tests:**
-  - **live ≡ proved:** the prover's standalone re-run produces the live
-    run's output and io-hash. This pins the kernel's memory layout, so
-    5.7's heap change lands before it or excludes kernels;
-  - an attest proved, folded and verified;
-  - a tampered final proof refused;
-  - the Poseidon2 channel's soundness gates run on the proving path;
-  - the prover's memory under the 24 GiB cap, for segments and folds.
+  - the completeness case, which fails on `e1286720` and passes on the
+    fork;
+  - the verifier crate built for `thumbv7em-none-eabihf` (true no_std)
+    as well as wasm32.
+- **Gate:** every suite green, and proof bytes unchanged on the existing
+  fixtures, except where the completeness fix changes them (it should
+  not).
+- **Estimate:** 2–4 days.
 
-### 5.6 The JAM verifier agent
+### 5.2 The reference Poseidon2 and a SIMD hasher (F)
 
-- **A public JAM agent verifies final proofs.**
-  - The accepted kernel ids are pinned as constants, set by the owner
-    and changed by redeploy. The registry takes this over later.
-  - It records each verified statement.
-- **A lean verifier:** no constraint-counting preflight, components built
-  once, and Blake2s through the precompile where the host serves it
-  (software on JAM).
-- **Measured:** gas per final proof on the JAM-only host and on PolkaJam,
-  against 100M (200M masked).
-- **Peers verify the same final proof,** natively.
+- **The permutation:**
+  - It becomes the reference Poseidon2 arrangement, with Plonky3's
+    width-16 M31 parameters: round counts, round constants, the internal
+    diagonal, and the external matrix.
+  - Plonky3's test vectors pass bit for bit.
+  - The sponge and Merkle modes stay as `proving.md` and
+    `recursion-air.md` §1.3 define them.
+- **The prover's hasher and channel:**
+  - Packed SIMD for AVX2, AVX-512 and NEON, from Plonky3's `mersenne-31`
+    packed Poseidon2 (MIT or Apache-2.0), adapted or depended on.
+  - It has a scalar fallback for the no_std verifier.
+- **Tests:**
+  - the vectors;
+  - scalar equals SIMD on random inputs;
+  - Merkle roots and proofs on the Poseidon2 channel round-trip.
+- **Gate (`proving.md` §3.2):**
+  - a window-kernel segment proves on Poseidon2 within 1.5× of Blake2s
+    (today 23 s against 5 s);
+  - permutations a second support a leaf commitment (about 25M) in at
+    most 0.5 s on 8 threads.
+  - **If it fails,** the step stops and records the numbers. The plan
+    then adds a Blake2s gate to the recursion AIR, and segments stay on
+    Blake2s-M31.
+- **Estimate:** 2–3 weeks.
 
-### 5.7 The carried items
+### 5.3 The format registry, run-time selection and the security accounting (F)
 
-- **Per-target JAM limits (the owner's decision):**
-  - a JAM profile about 31 times smaller than VOS's;
+- **The registry** (`proving.md` A.4): new format numbers for
+  - segment proofs on Poseidon2-M31;
+  - leaf and fold;
+  - the final wrap;
+  - two reserved numbers: device proofs and credential proofs.
+- **Run-time selection:** a proof's format selects its channel and
+  parameters at run time; the cargo feature that fixes them today
+  (`pvm/proof/src/proof.rs:180-187`) goes. One verifier build accepts
+  every registered format.
+- **Inner parameters:** blowup 4, 39 queries, PoW 26.
+- **Interaction PoW of 24 bits,** mixed before any logup challenge is
+  drawn (A.1 item 4), in the prover, the native verifier and the
+  preflight.
+- **One tool for both bit counts.** It computes conjectured and proven
+  (Johnson, with the DEEP, ALI and logup terms) bits per format and
+  shape. The format tests pin its output, and the verifier refuses a
+  proof below either floor.
+- **Fold step > 1 stays refused** until 5.14 admits it for the wrap.
+- **Tests:**
+  - every format round-trips;
+  - a proof under one format is refused under another;
+  - interaction PoW is checked;
+  - the bit counts are pinned per format.
+- **Estimate:** 1–2 weeks.
+
+### 5.4 A shape per kernel
+
+- **The shape:**
+  - a kernel's component set comes from its code (the component-mask
+    seam, `d165a7b6`), with pinned log sizes per segment class;
+  - the verifier accepts exactly that set and those sizes for the
+    kernel;
+  - the shape is recorded in the install's `Derivation`.
+- **The program id:** its v2 fields (`proving.md` §3.6) are assembled
+  here. The leaf-circuit hashes are added in 5.12, when they exist.
+- **Tests:**
+  - the window kernel and the solvency predicate prove and verify over
+    their shapes;
+  - a full-set proof of the same kernel is refused;
+  - a missing chip is refused.
+- **Gate:** the window kernel's verify gas falls by at least 30% on the
+  JAM-only host (the audit measured 38%).
+- **Estimate:** about 1 week.
+
+### 5.5 The witness-input precompile and the io-hash (F)
+
+- **A new precompile id** in the VOS range delivers a kernel's arguments
+  and witness rows:
+  - the tracer serves it with free witness;
+  - the agent serves it live, from the `Attest` record;
+  - `derive`'s prologue reads arguments through it, instead of from the
+    initial image.
+- **Its AIR binding:**
+  - the dispatch id is committed in PROGRAM_MEMORY;
+  - writes go only to the range its registers name, with a size cap;
+  - it has no other effect;
+  - `derive` admits the id.
+- **The initial image:** the first segment's initial memory root is the
+  image root of code, data and zeroed regions, computed at install and
+  stored in the `Derivation`.
+- **The io-hash** is `compute_io_hash(public_args, output, roots)`:
+  BLAKE2b-256 through `0x400`, in the canonical encoding (`proving.md`
+  §3.6).
+- **Tests:**
+  - live ≡ traced: the agent's live run and the prover's re-run produce
+    the same output and io-hash;
+  - writes outside the named range are refused;
+  - an oversize input is refused;
+  - the initial root equals the install's.
+- **Estimate:** 1–2 weeks.
+
+### 5.6 The phone run (with the owner's team)
+
+- **The authentication statement on a real Android flagship:**
+  - two shapes: as built, and the no-boundary proxy;
+  - one segment, 4 threads, MOBILE settings;
+  - built as a static `aarch64-unknown-linux-musl` binary run over
+    `adb`.
+- **I prepare the binary and a one-page runbook;** the owner's team runs
+  it. Recorded: the time and memory per shape against the x86 4-P-core
+  figures.
+- **Gate:** the phone factor is measured, replacing the projected 1.0–2.6.
+  An iPhone run, through a test app, is optional.
+- **Estimate:** 2 days of preparation.
+
+### 5.7 Carried from slice 4
+
+- **Per-target JAM limits** (the owner's decision):
+  - a JAM profile about 31× smaller than VOS's;
   - enforced at run time and named in the install record;
   - statics checked at install;
   - one page price everywhere.
 - **DA:** re-export a waiting workflow's pages, or fail it
   deterministically.
-- **A heap per kind of invocation:** a bump allocator. It lands before
-  5.5's live≡proved test, or excludes kernels.
-- **Measurements:** a workflow's resume latency on three processes, and
-  a follower's catch-up beyond the kept tail.
-- **PolkaJam:** a re-probe on upgrade, and the recompiler run.
+- **A heap per kind of invocation** (a bump allocator). It lands before
+  5.5's live≡traced test, or kernels are excluded from it.
+- **Measurements:**
+  - a workflow's resume latency on three processes;
+  - a follower's catch-up beyond the kept tail.
+- **PolkaJam:** a re-probe on upgrade, and the recompiler run once the
+  owner sets `vm.unprivileged_userfaultfd`.
 - **Ristretto ids 110–114:** carried. Derive refuses a kernel that
-  reaches them, so nothing depends on them silently.
-- **Prover levers, named to a later slice with their numbers:**
-  - narrow BLAKE2b chips: about −2,200 columns, 3–5 weeks;
-  - Poseidon2 page hashing (about −1,100 columns, 3–5 weeks), or one
-    memory argument across segments (about −2,800 columns and half the
-    prover's cells, 6–10 weeks).
+  reaches them.
+- **Estimate:** 2–3 weeks, beside 5.1–5.6.
 
-  Each lowers the recursion's cost per segment, which is the inner
-  proof's columns × queries.
+### M0 acceptance
 
-### 5.8 Acceptance
+- **Gates:** `ci-full`, `test-proof` (format-25 tests included) and the
+  checker loop.
+- **Recorded:**
+  - segment proving time and memory on Poseidon2 against Blake2s;
+  - the phone factor;
+  - the window kernel's verify gas over its shape.
+- **Reviews:** an Opus milestone review, then a push.
 
-- **Gates:** `ci-full`, `test-proof`, and the checker loop.
-- **The window statement and the solvency predicate:**
-  - proved over their own shapes;
-  - folded into one masked final proof each;
-  - verified without replay by a peer and by the JAM verifier agent.
+## M1: the recursion, unmasked, in tests
+
+Steps 5.8–5.15 are `recursion-air.md` §10's, in its order.
+
+### 5.8 The gate VM (F)
+
+- **A new crate, `vos-recair`.** It holds:
+  - a `Context` that builds circuits;
+  - the three components (`p2`, `qm31`, `h8`, `recursion-air.md` §1) and
+    their trace generation;
+  - the `Gate` relation with signed multiplicities;
+  - constants, padding, and preprocessing;
+  - the circuit hash.
+- It **proves and verifies natively** on the Poseidon2 channel.
+- **The `vos-final-verifier` skeleton** builds on stable no_std for
+  wasm32 and riscv64em-javm.
+- **Tests:**
+  - random circuits prove and verify;
+  - each value is yielded exactly once;
+  - a tamper per component and per mode is refused;
+  - `p2` equals the reference permutation of 5.2.
+- **Gate:**
+  - a 10k-gate circuit proves and verifies;
+  - the degree ≤ 3 audit passes;
+  - a three-component multi-fraction logup proves at three log sizes (a
+    failure the archive never root-caused).
+- **Estimate:** 3–4 weeks.
+
+### 5.9 The gate compiler (F)
+
+- **What it does:** the recording evaluator plus a hash-consed DAG turn
+  each chip's `add_constraints` into gates (`recursion-air.md` §3). It
+  handles per-relation challenges, next-row masks, paired and unpaired
+  logup, and intermediates. It also runs static checks on the wiring's
+  signed multiplicities.
+- **Tests:** §3's four equivalence tests (constraint ≡ gate on random
+  points), on all 32 chips.
+- **Gate:** 32 of 32 chips are equivalent, with counts within 1% of the
+  spike's log.
+- **Estimate:** 1–2 weeks.
+
+### 5.10 The in-AIR verifier's pieces (F)
+
+- **The pieces:**
+  - the Poseidon2-M31 channel;
+  - lifted Merkle paths;
+  - FRI at fold step 1 and 3;
+  - DEEP through `h8`;
+  - OODS through compiled gates;
+  - the logup sums, including the boundary chips' public terms
+    (`boundary_binding.rs:116-168`).
+- **The transcript** follows `proving.md` A.1.
+- **Tests:**
+  - each piece against the native code, on recorded data;
+  - transcript equality with the native channel's recorder.
+- **Gate:** every piece accepts real data and refuses each tamper.
+- **Estimate:** 3–4 weeks.
+
+### 5.11 COMPARE's leaf: the first feasibility gate
+
+- **What:** a COMPARE proof verified in a circuit, and that circuit's
+  proof verified natively.
+- **Tests:** a tampered OODS sample, queried value, sibling, FRI value
+  and nonce are each refused.
+- **Gate:** rows within 15% of 8,488 / 10,869 / 273, and at most 1 s.
+- **Estimate:** 1–2 weeks.
+
+### 5.12 The kernel leaves (F)
+
+- **The leaves for the window kernel and the solvency predicate,** each
+  carrying:
+  - the entry and exit state digests;
+  - the entry and halt flags;
+  - the io-hash;
+  - the A.3 output digest.
+- **The program id is finalized** with its leaf-circuit hashes, in the
+  `Derivation`.
+- **Derive computes every kernel's leaf rows** from its shape, and
+  refuses a kernel over the padded shape.
+- **Tests:**
+  - spike 3's real segment on the Poseidon2 channel;
+  - native and in-circuit transcripts equal;
+  - each flag's conditions, negated, are refused.
+- **Gate:**
+  - rows within the padded shape (2^16 / 2^17 / 2^16);
+  - at most 24 GiB;
+  - time at most 1× the segment's proving, against a target of
+    0.13–0.5×.
+- **Estimate:** 2–3 weeks.
+
+### 5.13 The fold and the fixed point (F)
+
+- **The fold node** (`proving.md` §3.4, A.3):
+  - it re-hashes each child's preimage;
+  - it checks the circuit set, with the fold's own hash self-carried;
+  - it checks the program id, adjacency, continuity, and the ends.
+- **Tests:**
+  - a fold of two leaves;
+  - a fold of two folds within the constant shape;
+  - a tree over four segments;
+  - refusals: a wrong program, a gap, broken continuity, a prefix, a
+    mid-run start, a wrong child circuit.
+- **Gate:** a fold verifies two folds within the shape, at the memory and
+  time of a leaf.
+- **Estimate:** 2–3 weeks.
+
+### 5.14 The final wrap (F)
+
+- **In our Stwo fork:**
+  - a Blake2b-256 Merkle hasher and Fiat–Shamir channel;
+  - FRI fold step 3 admitted after a review and tamper tests.
+- **The wrap circuit:**
+  - a 1-to-1 node over the root;
+  - blowup 64, 18 queries, PoW 26, fold step 3, a 2^6 last layer;
+  - 134 conjectured and 80 proven bits;
+  - the wrap pins the fold circuit's hash.
+- **`vos-final-verifier`, complete,** for x86, wasm32 and riscv64em-javm.
+- **Tests:**
+  - tampers on fold step 3 and on the Blake2b channel;
+  - verification in the Wasm harness (from spike 4a) and on the JAM-only
+    host.
+- **Gate:**
+  - at most 150M gas unmasked on the JAM-only host (target about 85M,
+    64M through `0x400`);
+  - at most 2^17 rows;
+  - at most 24 GiB.
+- **Estimate:** 3–4 weeks.
+
+### 5.15 End to end
+
+- **`vos-statement`:** the types, the canonical encoding, the statement
+  id, and the venue's recomputation of the io-hash (`proving.md` §3.6).
+- **The golden fixtures** of A.6.
+- **The window statement and the solvency predicate,** each:
+  - segments, leaves, folds and the wrap;
+  - verified natively, in Wasm and on the JAM-only host.
+- **Gate:** every venue judges every fixture alike.
+- **Estimate:** about 2 weeks.
+
+### 5.16 Acceptance
+
+- **Gates:** `ci-full`, `test-proof` and the checker loop.
 - **Rows measured:**
-  - segment prove time and memory per kernel;
-  - recursion time and memory per segment and per statement;
-  - final proof size;
-  - verify gas on JAM, and time natively;
-  - masking's cost;
-  - compressions per row.
-- **Reviews:** the end review (Fable) and the code-quality review (Opus).
+  - segment proving time and memory per kernel, on Poseidon2;
+  - leaf, fold and wrap time and memory;
+  - the final proof's size;
+  - verify gas on the JAM-only host and through `0x400`;
+  - Wasm instructions;
+  - recursion as a share of segment proving, per statement.
+- **Reviews:**
+  - the end review (Fable);
+  - the code-quality review (Opus);
+  - a cleanup step.
+
+## Estimates
+
+| | weeks |
+|---|---|
+| M0 (5.1–5.7) | 5–7 |
+| M1 (5.8–5.15) | 17–24 |
+| reviews and acceptance | 2–3 |
+| **slice 5** | **24–34** |
 
 ## Decisions
 
-**Taken by the owner:**
-- arguments are private by default, `#[public]` marks the public ones,
-  and the return value is public;
-- read-only `&self` for attestable methods, with witnessed reads;
-- masking in our Stwo fork;
-- JAM verifies, through a recursion layer built in this slice;
-- only the final proof is masked, and no unmasked proof leaves the
-  space's prover role.
+**Taken by the owner** (`proving.md` §12): all eight, including the three
+that shape this slice:
+- our own recursion AIR on StarkWare's design;
+- Blake2b-256 for the final proof;
+- arguments through a witness-input precompile.
 
-**For the owner after spike 4:**
-1. **The recursion stack:** StarkWare's circuit stack, or our own AIR.
-
-**Decided in this draft on the evidence, and the owner's to override:**
-- kernels on the chain path (spike 3);
-- a shape per kernel, pinned in the program id (the audit);
-- Poseidon2-M31 for segment and fold proofs, and Blake2s for the final
-  proof (the audit: 2.0–2.3× cheaper to verify on the PVM);
-- reads as of the latest complete root W ≤ V;
-- shape classes pinned per kernel;
-- the prover levers named to a later slice.
+**Decided on the evidence, and the owner's to override:**
+- the reference Poseidon2 with Plonky3's parameters;
+- the segment channel set by 5.2's gate;
+- the inner parameters and interaction PoW;
+- the padded shape as a format constant;
+- 5.6's phone run on Android first.
 
 ## Risks
 
-- **The recursion layer is the longest pole:** about 2–3 months on the
-  circuit stack, 4–6 on our own AIR. The circuit stack also moves the
-  toolchain and the Stwo version.
-- **The final proof's verify gas is projected** (60–150M) until spike 4
-  measures a final-shape proof.
-- **Masking a recursion AIR that is not ours** (the circuit stack)
-  means changing StarkWare's circuit prover in our fork.
-- **Prover memory:** segments at the 32k cut fit (6–20 GiB by
-  settings); folds are unmeasured.
+`proving.md` §10 and `recursion-air.md` §11 hold the full list, each with
+its gate. This slice's sharpest:
+- **5.2's hasher gate.** If Poseidon2 commits stay slow, the recursion
+  AIR gains a Blake2s gate, and segments stay on Blake2s-M31.
+- **The gate compiler and the in-AIR verifier.** They are new
+  soundness-critical code: differential tests, Fable reviews, and the
+  external audit before value.
+- **The model's rows:** 5.11 and 5.12 count real rows early.
