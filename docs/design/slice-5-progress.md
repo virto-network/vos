@@ -165,6 +165,158 @@ not on `vos-core`), 5 segments, `RAYON_NUM_THREADS=8`, under
 - Clippy with `-D warnings` for AVX-512F, the scalar fallback and
   aarch64 as well as the host.
 
+## Step 5.3: the format registry, run-time selection and the security accounting
+
+### The registry (`pvm/proof/src/format.rs`)
+
+A proof's `format_version` names an entry; the entry fixes, at run time,
+its channel, its parameters, its encodings and its floors.
+
+| number | proofs | channel | log blowup, queries, PoW, fold step, last layer, interaction PoW | status | floors (conj. / proven) | counts at its reference shape [model] |
+|---|---|---|---|---|---|---|
+| 24 | segments, legacy | Blake2s | the proof's own (96 conjectured or more); MOBILE recorded | admitted | 96 / — | 96 / 57 |
+| 26 | segments | Poseidon2-M31 | 2, 39, 26, 1, 0, 24 | admitted | 100 / 60 | 104 / 63 |
+| 27 | leaves and folds | Poseidon2-M31 | 2, 39, 26, 1, 0, 24 | reserved | 100 / 60 | 104 / 64 |
+| 28 | the final wrap, masked | Blake2b-256 | 6, 18, 26, 3, 6, 24 | reserved | 100 / 80 | 134 / **74** |
+| 29 | device proofs, masked | Blake2s-M31 | 1, 84, 20, 1, 0, 24 | reserved | 100 / 60 | 104 / 61 |
+| 30 | credential proofs, masked | Blake2s-M31 | 1, 84, 20, 1, 0, 24 | reserved | 100 / 60 | 104 / 61 |
+
+- **24 stays** while the refine bundles, the chain proofs, the canonical
+  allowlists and their tests use it: the existing entry points (`prove`,
+  `prove_mobile`, `prove_canonical`, `prove_chain`, …) still produce it, with
+  its old transcript and its parameters under the 96-bit conjectured floor.
+  **25 is retired** (unregistered, refused): 26 replaces it, and its tests
+  (the canonical segment, the query replay, the codec) run on 26 or on both
+  channels.
+- **27 to 30 are entries only**, refused as "registered but not admitted":
+  their AIRs come in M1 (27, 28) and with the phone work (29, 30), and no
+  Blake2b-256 or Blake2s-M31 stack is built. Fold step 3 stays refused by the
+  preflight.
+- **Reference shapes:** 24 and 26, every chip of the segment AIR at 2^20 rows
+  (14,102 sampled values, 6,650 constraints, at most 2.4·10^9 logup
+  fractions, relations up to 265 limbs); 29, the same at 2^16; 27, the
+  recursion AIR's padded shape (2^16 / 2^17 / 2^16, 458 columns counted at
+  two samples, 313 constraints of degree 3); 28, the wrap's 2^14 / 2^15 /
+  2^11; 30, `p2` alone at 2^14. A test recomputes 24's, 26's and 29's from
+  the AIR.
+
+### Run-time selection (`pvm/proof/src/pcs.rs`)
+
+- The `poseidon2-channel` cargo feature and `recursion_pcs.rs` are gone.
+  Prover, verifier, preflight replay, refine replay and codec are generic over
+  `PcsStack` (implemented for `Blake2sMerkleChannel` and `P2MerkleChannel`);
+  `with_stack!` picks the stack from the format's channel.
+- `Proof.stark_proof` is a `StarkProofAny` (one variant a channel) and a
+  commitment a `Commitment`; the verifier refuses a Stark proof on another
+  channel than its format's before any other work.
+- The lookup draws go through object-safe component methods, so they take a
+  `ChannelRef` naming the concrete channel.
+- **The prover is told the format:** `prove_format`,
+  `prove_canonical_format`, `prove_chain_format`,
+  `program_commitment_for_profile_format`. It panics on a format the
+  registry does not admit.
+- **One no_std verifier build reads both admitted formats**
+  (`thumbv7em-none-eabihf`, wasm32); the packed Poseidon2 stays prover-only.
+- The refine codec is version 2: it carries each child's interaction PoW
+  nonce and decodes a child's hashes by its format's channel.
+
+### The lossless encodings and the interaction PoW (formats 26–30)
+
+- **The boundary states** enter the transcript as the boundary chips' bytes
+  (`boundary_binding::boundary_state_bytes`), one M31 a byte, 296 in one
+  absorb, in A.1's order (registers in, out, pc and ts in, out, roots in,
+  out).
+- **The Poseidon2-M31 channel is lossless for every format:** `mix_u64` and
+  the PoW nonces take four 16-bit limbs, `mix_u32s` two a word; the
+  `reduce(lo32), reduce(hi32)` encoding is gone, from the settlement
+  verifier's copy of the channel too. Stwo's Blake2s channel hashes bytes and
+  needed no change.
+- **The interaction PoW** (A.1 item 4) is ground on `SimdBackend` after the
+  boundary states and mixed before any relation challenge; the verifier, the
+  prover-side verifier and the recursion seams check it
+  (`proof::check_interaction_pow`), and the preflight replay starts from the
+  channel after it. Format 24 has none and takes only the nonce 0.
+
+### The bit counts (`pvm/proof/src/security.rs`)
+
+- **Conjectured** = PoW + queries · log blowup.
+- **Proven** = soundcalc's Johnson-bound count (`ethereum/soundcalc`
+  `2af5e7df`): the least of the query phase (PoW + q · −log2(√ρ + η)), the
+  DEEP batching ((B − 1) · ε_lin), each FRI fold ((f − 1) · ε_lin), ALI
+  (L·C/|F|), DEEP (L·(d(k + c − 1) + k − 1)/(|F| − k − D)) and logup
+  (N·S/|F| · 2^−interaction PoW), with ε_lin BCHKS25's Theorem 4.2 (eprint
+  2025/2055) over QM31, maximized over the multiplicity m ≥ 3. Basic f64
+  operations only, so every verifier counts alike.
+- **The verifier counts at each proof's own parameters and shape** and
+  refuses one below either floor, then one whose parameters are not its
+  format's. A 7-step program under 26 counts **104 / 64** [model], under 24
+  **96 / 57**.
+- **Finding: the wrap as decided cannot reach 80 proven bits.** At its
+  reference shape it counts 74, and no number of queries at blowup 64 (or
+  16) reaches 80: the DEEP batching of its sampled values over a
+  2^22-point domain at rate 1/64 binds, whatever m. At blowup 8 it reaches
+  80 with 41 queries (149 conjectured), at blowup 4 with 62 [model]. 5.14
+  decides the wrap's parameters; the entry stays as `proving.md` §3.5 has it.
+- §4's 65 (segments) and 62 (devices) are the m → ∞ limit of the query term
+  alone; with the batching and fold terms the segment counts 63–64 and the
+  device 61 [model].
+
+### Tests
+
+- `format::tests`: the bit counts pinned per format; the reference shapes
+  recomputed from the AIR; the wrap's shortfall; every number round-trips,
+  only 24 and 26 admitted; a proof below a floor is refused.
+- `security::tests`: the logarithm; the query term's limit.
+- `proof::transcript_tests`: two boundary states apart by p in a 32-bit
+  word, low or high, initial or final, draw different relation challenges
+  (they collide under the retired encoding); the boundary run is the chips'
+  bytes; the interaction PoW is checked.
+- `verifier/tests/formats.rs` (on proofs): every admitted format proves,
+  round-trips through bincode and postcard and verifies with and without the
+  side note; a proof is refused under every other registered number and two
+  unregistered ones; a wrong interaction nonce is refused, as a nonce on a
+  format-24 proof; a format-26 proof below its conjectured floor, or with
+  other parameters, is refused; the counts of a real proof; a canonical
+  segment under 26 verifies and refuses a changed or non-canonical root.
+- `refine_codec::tests`: a format-26 child round-trips with its nonce, and a
+  child under a reserved number or on another channel is refused.
+- `query_replay_tests` run on both channels.
+
+### Measured
+
+- **A 7-step program, natural shape (16 chips, tallest 2^16), 8 threads**
+  [measured, load average 5–17 from another worktree's run]:
+
+  | format | prove | proof (bincode) | verify | PoW nonce, interaction PoW nonce |
+  |---|---|---|---|---|
+  | 24 | 0.41–0.87 s | 882,506 B | 10–23 ms | — |
+  | 26 | 3.5–11.5 s | 900,990 B | 27–74 ms | 96,584,631; 24,631,542 |
+
+  The grinds return the least passing nonce, so this proof's two grinds
+  tried 121M Poseidon2 permutations. **Expected per proof** [model]:
+  2^26 + 2^24 = 84M permutations, about 2.1 s on 8 threads at 5.2's 39.45M/s,
+  to add to a window segment's 4.4–7.4 s.
+- **The settlement verifier on the PVM** accepts the regenerated fixture in
+  **10,951,979 instructions** (27,306,959 gas) [measured], against
+  11,427,015 before.
+
+### Regenerated fixtures
+
+- `pvm/proof/settlement-verifier/fixtures/bool_proof.postcard`, by
+  `settle_fixture`: the PoW nonce now enters the channel as four limbs.
+- No other fixture or pinned constant changed: the format-24 transcript is
+  unchanged, and no format-26 commitment is pinned yet.
+
+### Gates
+
+- `just check`: green, 1,002 tests.
+- `just test-proof`'s suites, under `systemd-run` at 16 GiB with
+  `nice -n 10` and one test thread: green, 33 test binaries, the settlement
+  verifier's PVM run included (the verifier's suite, formats included, runs
+  in `just check`).
+- Clippy with `-D warnings` on the workspace and on the proof crates with
+  `debug-internals`; the settlement verifier's own tests.
+
 ## Step 5.7: the items carried from slice 4
 
 ### Per-target limits (the owner's decision)
