@@ -10,7 +10,7 @@ use vos_wire::result::{InputRef, Outcome, Step, Write};
 use vos_wire::schema::Schema;
 use vos_wire::{Decode, Encode, keys};
 
-use super::base::Base;
+use super::base::{Base, Corrupt};
 use super::inputs::consumed;
 use crate::machines::{self, Machine};
 
@@ -20,8 +20,7 @@ const SCHEMA_AT: u64 = 1 << 16;
 /// An operator command: install a package or set a role. Its writes are
 /// under the step write cap like any step's.
 pub(crate) fn admin(base: &Base, admin: Admin) -> Step {
-    let failed =
-        |code, detail| Step::Ran(consumed(InputRef::Admin, Outcome::Failed { code, detail }));
+    let failed = |outcome| Step::Ran(consumed(InputRef::Admin, outcome));
     let (writes, reply) = match admin {
         Admin::Install {
             instance,
@@ -30,17 +29,12 @@ pub(crate) fn admin(base: &Base, admin: Admin) -> Step {
             target,
         } => {
             let reply = derivation.encode();
-            let agent = match base.read(&keys::target()).map(|row| {
-                row.map(|bytes| Target::decode(&bytes).map(|(target, _)| target))
-                    .transpose()
-            }) {
-                Ok(Ok(agent)) => agent,
-                _ => return failed(Failure::Trapped, Vec::new()),
+            let Ok(agent) = agent_target(base) else {
+                return failed(Outcome::failed(Failure::Trapped));
             };
             let installed = match install(agent, derivation, roles, target) {
                 Ok(installed) => installed,
-                Err(Err(code)) => return failed(code, Vec::new()),
-                Err(Ok(refused)) => return failed(refused.failure(), refused.encode()),
+                Err(outcome) => return failed(outcome),
             };
             let mut writes = alloc::vec![Write {
                 key: keys::installed(instance),
@@ -67,11 +61,19 @@ pub(crate) fn admin(base: &Base, admin: Admin) -> Step {
         .map(|write| write.key.len() + write.value.as_ref().map_or(0, Vec::len))
         .sum();
     if written > cap::STEP_WRITES {
-        return failed(Failure::Cap, Vec::new());
+        return failed(Outcome::failed(Failure::Cap));
     }
     let mut run = consumed(InputRef::Admin, Outcome::Done(reply));
     run.writes.extend(writes);
     Step::Ran(run)
+}
+
+/// The agent's target, which its first install recorded; none before it.
+fn agent_target(base: &Base) -> Result<Option<Target>, Corrupt> {
+    base.read(&keys::target())?
+        .map(|bytes| Target::decode(&bytes).map(|(target, _)| target))
+        .transpose()
+        .map_err(|_| Corrupt)
 }
 
 /// Check an install for an agent of target `agent`, none before its first
@@ -79,24 +81,29 @@ pub(crate) fn admin(base: &Base, admin: Admin) -> Step {
 /// bound to an attestable method, every attestable method has exactly one,
 /// and every role name is mapped, read from the actor program's schema, or
 /// it fails `Unknown`; its statics are within its target's limits
-/// ([`within`]), or it fails `Cap`. A refusal against the target is
-/// `Ok`, its detail.
+/// ([`within`]), or it fails `Cap`. A refusal against the target says why
+/// in its detail ([`Refused`]).
 fn install(
     agent: Option<Target>,
     derivation: Derivation,
     roles: Vec<(Vec<u8>, u8)>,
     target: Target,
-) -> Result<Installed, Result<Refused, Failure>> {
+) -> Result<Installed, Outcome> {
+    let refused = |refused: Refused| Outcome::Failed {
+        code: refused.failure(),
+        detail: refused.encode(),
+    };
     if let Some(agent) = agent.filter(|&agent| agent != target) {
-        return Err(Ok(Refused::Target { agent }));
+        return Err(refused(Refused::Target { agent }));
     }
-    let installed = package(derivation, roles, target).ok_or(Err(Failure::Unknown))?;
+    let installed = package(derivation, roles, target).ok_or(Outcome::failed(Failure::Unknown))?;
     match within(&installed, target.limits()) {
         Some(Ok(())) => Ok(installed),
-        Some(Err(refused)) => Err(Ok(refused)),
-        None => Err(Err(Failure::Cap)),
+        Some(Err(past)) => Err(refused(past)),
+        None => Err(Outcome::failed(Failure::Cap)),
     }
 }
+
 /// The package an install names, read and checked.
 fn package(derivation: Derivation, roles: Vec<(Vec<u8>, u8)>, target: Target) -> Option<Installed> {
     // The program an install names, which its operator may never have
