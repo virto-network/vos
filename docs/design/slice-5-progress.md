@@ -175,23 +175,23 @@ its channel, its parameters, its encodings and its floors.
 | number | proofs | channel | log blowup, queries, PoW, fold step, last layer, interaction PoW | status | floors (conj. / proven) | counts at its reference shape [model] |
 |---|---|---|---|---|---|---|
 | 24 | segments, legacy | Blake2s | the proof's own (96 conjectured or more); MOBILE recorded | admitted | 96 / — | 96 / 57 |
-| 26 | segments | Poseidon2-M31 | 2, 39, 26, 1, 0, 24 | admitted | 100 / 60 | 104 / 63 |
-| 27 | leaves and folds | Poseidon2-M31 | 2, 39, 26, 1, 0, 24 | reserved | 100 / 60 | 104 / 64 |
-| 28 | the final wrap, masked | Blake2b-256 | 6, 18, 26, 3, 6, 24 | reserved | 100 / 80 | 134 / **74** |
-| 29 | device proofs, masked | Blake2s-M31 | 1, 84, 20, 1, 0, 24 | reserved | 100 / 60 | 104 / 61 |
-| 30 | credential proofs, masked | Blake2s-M31 | 1, 84, 20, 1, 0, 24 | reserved | 100 / 60 | 104 / 61 |
+| 26 | segments | Poseidon2-M31 | 2, 44, 20, 1, 0, 8 | admitted | 100 / 60 | 108 / 62 (62.69) |
+| 27 | leaves and folds | Poseidon2-M31 | 2, 44, 20, 1, 0, 8 | reserved | 100 / 60 | 108 / 63 (63.37) |
+| 28 | the final wrap, masked | Blake2b-256 | 6, 20, 26, 3, 6, 8; affine DEEP batching | reserved | 100 / 80 | 146 / **74** (74.71) as built |
+| 29 | device proofs, masked | Blake2s-M31 | 1, 86, 20, 1, 0, 8 | reserved | 100 / 60 | 106 / 62 (62.05) |
+| 30 | credential proofs, masked | Blake2s-M31 | 1, 86, 20, 1, 0, 8 | reserved | 100 / 60 | 106 / 62 (62.52) |
 
 - **24 stays** while the refine bundles, the chain proofs, the canonical
   allowlists and their tests use it: the existing entry points (`prove`,
   `prove_mobile`, `prove_canonical`, `prove_chain`, …) still produce it, with
   its old transcript and its parameters under the 96-bit conjectured floor.
-  **25 is retired** (unregistered, refused): 26 replaces it, and its tests
+  **25 is not registered** (refused): 26 replaces it, and its tests
   (the canonical segment, the query replay, the codec) run on 26 or on both
   channels.
 - **27 to 30 are entries only**, refused as "registered but not admitted":
   their AIRs come in M1 (27, 28) and with the phone work (29, 30), and no
   Blake2b-256 or Blake2s-M31 stack is built. Fold step 3 stays refused by the
-  preflight.
+  preflight, and 28 needs affine DEEP batching, which is not built.
 - **Reference shapes:** 24 and 26, every chip of the segment AIR at 2^20 rows
   (14,102 sampled values, 6,650 constraints, at most 2.4·10^9 logup
   fractions, relations up to 265 limbs); 29, the same at 2^16; 27, the
@@ -213,8 +213,10 @@ its channel, its parameters, its encodings and its floors.
   `ChannelRef` naming the concrete channel.
 - **The prover is told the format:** `prove_format`,
   `prove_canonical_format`, `prove_chain_format`,
-  `program_commitment_for_profile_format`. It panics on a format the
-  registry does not admit.
+  `program_commitment_for_profile_format`. On a format the registry does not
+  admit, or whose channel no stack implements, it returns
+  `ProvingError::FormatNotAdmitted` (the crate's own `ProvingError`, which
+  wraps Stwo's), or `None` from the two `Option` entry points.
 - **One no_std verifier build reads both admitted formats**
   (`thumbv7em-none-eabihf`, wasm32); the packed Poseidon2 stays prover-only.
 - The refine codec is version 2: it carries each child's interaction PoW
@@ -231,7 +233,7 @@ its channel, its parameters, its encodings and its floors.
   `reduce(lo32), reduce(hi32)` encoding is gone, from the settlement
   verifier's copy of the channel too. Stwo's Blake2s channel hashes bytes and
   needed no change.
-- **The interaction PoW** (A.1 item 4) is ground on `SimdBackend` after the
+- **The interaction PoW** (A.1 item 4), 8 bits, is ground on `SimdBackend` after the
   boundary states and mixed before any relation challenge; the verifier, the
   prover-side verifier and the recursion seams check it
   (`proof::check_interaction_pow`), and the preflight replay starts from the
@@ -247,55 +249,119 @@ its channel, its parameters, its encodings and its floors.
   (N·S/|F| · 2^−interaction PoW), with ε_lin BCHKS25's Theorem 4.2 (eprint
   2025/2055) over QM31, maximized over the multiplicity m ≥ 3. Basic f64
   operations only, so every verifier counts alike.
+- **The DEEP term's d** is the constraint degree, taken as
+  2^(log composition bound − log k) + 1: Stwo's composition bound is
+  2^l · 2^⌈log2(dᵢ − 1)⌉ for a component of 2^l rows, so every component's
+  dᵢ · 2^l ≤ d · k. Exact for degree 2 and 3, larger otherwise, which only
+  lowers the count. (The step's first cut took Stwo's d − 1.)
+- **soundcalc's multi-point precondition,** k + c < (1 − θ)·n, is checked at
+  θ's limit (1 − θ > √ρ for every m); a shape outside it is outside the
+  analysis, and its proof is refused.
 - **The verifier counts at each proof's own parameters and shape** and
   refuses one below either floor, then one whose parameters are not its
-  format's. A 7-step program under 26 counts **104 / 64** [model], under 24
+  format's. A 7-step program under 26 counts **108 / 63** [model], under 24
   **96 / 57**.
-- **Finding: the wrap as decided cannot reach 80 proven bits.** At its
-  reference shape it counts 74, and no number of queries at blowup 64 (or
-  16) reaches 80: the DEEP batching of its sampled values over a
-  2^22-point domain at rate 1/64 binds, whatever m. At blowup 8 it reaches
-  80 with 41 queries (149 conjectured), at blowup 4 with 62 [model]. 5.14
-  decides the wrap's parameters; the entry stays as `proving.md` §3.5 has it.
-- §4's 65 (segments) and 62 (devices) are the m → ∞ limit of the query term
-  alone; with the batching and fold terms the segment counts 63–64 and the
-  device 61 [model].
+- **The inner count is set by the query term:** with PoW 20 its limit is
+  20 + 44 = 64, and the count, 62.69, is where it meets the least other term
+  at the best m. Less PoW moves that m, so it costs less than a bit a bit:
+  at PoW 17 a segment still counts at least 60, at PoW 15 it does not.
+- **The wrap:** blowup 64 with 18 queries or 20 counts 74.71 proven bits,
+  however many queries: the batching term of powers-of-one DEEP batching,
+  the batched values' count times ε_lin, grows with the blowup and binds.
+  The entry carries the affine-batching plan's parameters (blowup 64, 20
+  queries, PoW 26, fold step 3, last layer 6, interaction PoW 8) and is
+  marked `DeepBatching::Affine`; the tool counts what is built, 74, and
+  `check_format_security` reports it below its floor of 80. The ways to 80,
+  for 5.14 [model, Fable's]: affine batching at blowup 64 and 19–20 queries
+  (about 1.06× verify, a fork change for format 28 only, recommended); a
+  6-bit batching-phase PoW at blowup 64 and 20 queries (1.11×); blowup 8
+  with 41 queries (1.97×; the tool agrees on 41).
 
 ### Tests
 
-- `format::tests`: the bit counts pinned per format; the reference shapes
-  recomputed from the AIR; the wrap's shortfall; every number round-trips,
-  only 24 and 26 admitted; a proof below a floor is refused.
-- `security::tests`: the logarithm; the query term's limit.
-- `proof::transcript_tests`: two boundary states apart by p in a 32-bit
-  word, low or high, initial or final, draw different relation challenges
-  (they collide under the retired encoding); the boundary run is the chips'
-  bytes; the interaction PoW is checked.
+- `format::tests`: the bit counts pinned per format, every format but the
+  wrap clearing its floors; the unrounded counts the parameters were chosen
+  by (62.69 for segments; 86 the least device query count clearing 62); the
+  reference shapes recomputed from the AIR; the wrap's 74.71 at 18, 20 and
+  256 queries, 41 at blowup 8, and the verifier's check saying it falls
+  short; every number round-trips, only 24 and 26 admitted; a proof below
+  either floor is refused.
+- `security::tests`: the logarithm; the query term's limit; the multi-point
+  precondition refuses a column sampled past it.
+- `proof::transcript_tests` (`src/proof/transcript_tests.rs`): two boundary
+  states apart by p in a 32-bit word, low or high, initial or final, draw
+  different relation challenges (they collide under the retired encoding);
+  the boundary run is the chips' bytes; the interaction PoW is checked.
 - `verifier/tests/formats.rs` (on proofs): every admitted format proves,
   round-trips through bincode and postcard and verifies with and without the
   side note; a proof is refused under every other registered number and two
   unregistered ones; a wrong interaction nonce is refused, as a nonce on a
-  format-24 proof; a format-26 proof below its conjectured floor, or with
-  other parameters, is refused; the counts of a real proof; a canonical
-  segment under 26 verifies and refuses a changed or non-canonical root.
-- `refine_codec::tests`: a format-26 child round-trips with its nonce, and a
-  child under a reserved number or on another channel is refused.
+  format-24 proof; a format-26 proof below its conjectured floor (PoW 11),
+  below its proven floor (PoW 15), or with other parameters, is refused; a
+  `PcsPolicy` pins a format-26 proof (STANDARD refuses its blowup 4, MOBILE
+  admits it), with and without the side note; the counts of a real proof; a
+  canonical segment under 26 verifies and refuses a changed or
+  non-canonical root.
+- `refine_codec::tests` (`src/refine_codec/tests.rs`): a format-26 child
+  round-trips with its nonce; the encoder refuses a child under a reserved
+  number or on another channel; the decoder, on patched bytes, refuses a
+  reserved or unregistered number, a 26 relabelled 24 (the transcript
+  commitment binds the number), and a 24 relabelled 26 whose hashes are no
+  M31 digests.
+- `tests/recursion_seams.rs`: on a format-26 proof, the recorded transcript,
+  the step-by-step extraction and the OODS reconstruction replay one
+  transcript.
+- The settlement verifier's `the_channel_copy_draws_as_the_provers`: its
+  channel copy and `poseidon2::Poseidon2M31Channel` draw alike after the
+  same u64s (values p apart included), u32s, felts, a root and PoW nonces,
+  and accept the same nonces; `just test-proof` now runs its tests.
 - `query_replay_tests` run on both channels.
+
+### Folded from the reviews (code)
+
+- **A policy pins every format:** `proof::check_shape_policy` runs on both
+  verifiers' `*_with_pcs_policy` paths for every format; without a policy,
+  format 24 keeps its 96-bit conjectured floor and the others their own
+  floors. Before, a format-26 proof skipped a caller's policy.
+- **The recursion seams are kept,** in `verify/recursion.rs`: 5.10's
+  transcript-equality test and the leaf's per-piece tests ("on recorded
+  data") are their M1 use. A smoke test on a format-26 proof covers them.
+- **Module splits:** `proof/transcript.rs` (the FS domain, the statement
+  header, the boundary mix, the interaction-PoW check, the format's security
+  check) and `proof/transcript_tests.rs`; `refine_codec/tests.rs`;
+  `prove.rs` 1,548 → 945 lines, with `prove/canonical.rs` (canonical shapes,
+  profiles, program commitments, chain proving), `prove/debug.rs` (the
+  `debug-internals` diagnostics) and `prove/profile.rs`.
+- **`PcsStack`:** `stark_mut` replaces the tests' hand-rolled matches;
+  `ProofHash::from_commitment` had no use and is gone;
+  `StarkProofAny::proof_of_work` and `commitment_count` (no allocation).
+- **`ProvingError::FormatNotAdmitted`** replaces `Target::of`'s assert, the
+  prover's panic on an unbuilt channel and the replay binding's
+  `ConstraintsNotSatisfied`.
+- **One check each:** the preflight returns the format, so `proof_format`
+  runs once a verify; the standalone verifier takes the Stark proof out once
+  (`from_any`); `proof_security_bits` shares the standalone preflight and
+  `proof::format_security_bits` with the verify path; the verifiers' second
+  log-size cap, the preflight's own, is gone.
+- **Stale comments** fixed in `format.rs`, `proof.rs`, the verifier's
+  re-exports and `poseidon2/mod.rs`.
 
 ### Measured
 
-- **A 7-step program, natural shape (16 chips, tallest 2^16), 8 threads**
-  [measured, load average 5–17 from another worktree's run]:
+- **A 7-step program, natural shape (16 chips, tallest 2^16), 8 threads**,
+  three runs each [measured, load average 2–5]:
 
-  | format | prove | proof (bincode) | verify | PoW nonce, interaction PoW nonce |
-  |---|---|---|---|---|
-  | 24 | 0.41–0.87 s | 882,506 B | 10–23 ms | — |
-  | 26 | 3.5–11.5 s | 900,990 B | 27–74 ms | 96,584,631; 24,631,542 |
+  | format | prove | proof (bincode) | verify | peak RSS | PoW nonce, interaction PoW nonce |
+  |---|---|---|---|---|---|
+  | 24 | 0.33–0.34 s | 882,506 B | 11.2–11.4 ms | 431–433 MiB | — |
+  | 26 | 0.53–0.57 s | 994,850 B | 38.3–41.0 ms | 457–458 MiB | 776,923; 194 |
 
-  The grinds return the least passing nonce, so this proof's two grinds
-  tried 121M Poseidon2 permutations. **Expected per proof** [model]:
-  2^26 + 2^24 = 84M permutations, about 2.1 s on 8 threads at 5.2's 39.45M/s,
-  to add to a window segment's 4.4–7.4 s.
+  At the first cut's parameters (39 queries, PoW 26, interaction PoW 24)
+  format 26 proved in 3.5–11.5 s into 900,990 B and verified in 27–74 ms
+  [measured, load average 5–17]. **Expected grind per proof** [model]:
+  2^20 + 2^8 permutations, about 27 ms on 8 threads at 5.2's 39.45M/s,
+  against 2^26 + 2^24 (84M, about 2.1 s) before; the five more queries add
+  about 12% to the proof's bytes.
 - **The settlement verifier on the PVM** accepts the regenerated fixture in
   **10,951,979 instructions** (27,306,959 gas) [measured], against
   11,427,015 before.
@@ -305,17 +371,24 @@ its channel, its parameters, its encodings and its floors.
 - `pvm/proof/settlement-verifier/fixtures/bool_proof.postcard`, by
   `settle_fixture`: the PoW nonce now enters the channel as four limbs.
 - No other fixture or pinned constant changed: the format-24 transcript is
-  unchanged, and no format-26 commitment is pinned yet.
+  unchanged, and no format-26 commitment is pinned yet. **The wire layout of
+  every `Proof` changed**, format 24's included: serde writes the
+  `StarkProofAny` variant tag before the Stark proof and the
+  `interaction_pow` field after it, so a bincode or postcard proof written
+  before this step does not decode (the refine codec, version 2, likewise).
+- The review fold changed no fixture: the settlement fixture's AIR and
+  channel are untouched, and the new parameters reach only format 26, whose
+  proofs the tests make fresh.
 
 ### Gates
 
-- `just check`: green, 1,002 tests.
+- `just check`: green, 1,003 tests.
 - `just test-proof`'s suites, under `systemd-run` at 16 GiB with
-  `nice -n 10` and one test thread: green, 33 test binaries, the settlement
-  verifier's PVM run included (the verifier's suite, formats included, runs
-  in `just check`).
+  `nice -n 10` and two test threads: green, 37 test binaries, the
+  settlement verifier's PVM run and its own tests included (the verifier's
+  suite, formats included, runs in `just check`).
 - Clippy with `-D warnings` on the workspace and on the proof crates with
-  `debug-internals`; the settlement verifier's own tests.
+  `debug-internals`.
 
 ## Step 5.7: the items carried from slice 4
 

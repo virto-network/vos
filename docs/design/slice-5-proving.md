@@ -176,16 +176,25 @@ No proof leaves a test in this slice: masking is slice 6.
     limbs, little-endian, a u32 two, a 32-byte hash 16. The Poseidon2
     channel's `mix_u64` and PoW nonces move to four limbs; today's
     `reduce(lo32), reduce(hi32)` retires with the old formats.
-- **Inner parameters:** blowup 4, 39 queries, PoW 26, FRI fold step 1,
-  log last-layer degree bound 0.
-- **Interaction PoW of 24 bits,** mixed before any logup challenge is
+- **Inner parameters** (formats 26, 27): blowup 4, 44 queries, PoW 20,
+  FRI fold step 1, log last-layer degree bound 0: 108 conjectured and
+  62.7 proven bits for segments [model], a grind of about 30 ms.
+- **Interaction PoW of 8 bits,** mixed before any logup challenge is
   drawn (A.1 item 4), in the prover, the native verifier and the
-  preflight.
+  preflight; its slot in the transcript stays for every format with
+  logup.
+- **Device and credential formats** (29, 30): blowup 2, 86 queries, PoW
+  20, interaction PoW 8: 62 proven bits, 2 over the floor.
+- **The wrap** (28): blowup 64, 20 queries, PoW 26, interaction PoW 8,
+  fold step 3, last layer 2^6, needing affine DEEP batching for its 80
+  proven bits; as built it counts 74 (`proving.md` §3.5). 5.14 decides
+  between affine batching, a batching-phase PoW and blowup 8.
 - **One tool for both bit counts.** It computes conjectured and proven
   (Johnson, with the DEEP, ALI and logup terms) bits per format and
   shape. The format tests pin its output, and the verifier refuses a
   proof below either floor.
-- **Fold step > 1 stays refused** until 5.14 admits it for the wrap.
+- **Fold step > 1 stays refused** until 5.14 admits it for the wrap, with
+  the wrap's DEEP batching.
 - **Tests:**
   - every format round-trips;
   - a proof under one format is refused under another;
@@ -463,12 +472,17 @@ beside 5.8.
 - **In our Stwo fork:**
   - a Blake2b-256 Merkle hasher and Fiat–Shamir channel;
   - FRI fold step 3 admitted after a review and tamper tests;
+  - the way to the wrap's 80 proven bits, decided here (`proving.md`
+    §3.5): affine DEEP batching for format 28 only (recommended, about
+    1.06× verify), a 6-bit batching-phase PoW (1.11×), or blowup 8 with
+    41 queries (1.97×);
   - `MerkleVerifierLifted::verify`'s `assert_eq!` on the values at
     duplicate query positions, a panic on prover data, becomes an error.
 - **The wrap circuit:**
   - a 1-to-1 node over the root;
-  - blowup 64, 18 queries, PoW 26, fold step 3, a 2^6 last layer;
-  - 134 conjectured and 80 proven bits;
+  - blowup 64, 20 queries, PoW 26, interaction PoW 8, fold step 3, a
+    2^6 last layer, with affine DEEP batching;
+  - 146 conjectured and 80 proven bits [model];
   - it checks the root's W against the fold circuit's hash, its
     constant;
   - its public words, the program id and the io-hash, sit at reserved

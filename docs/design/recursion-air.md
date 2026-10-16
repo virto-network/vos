@@ -427,8 +427,11 @@ permutations; 1,091 `h8`; 1,139 QM31 [model].
 
 ## 5. Sizing the leaves
 
-Inner parameters: blowup 4, 39 queries, PoW 26, interaction PoW 24, FRI fold
-step 1, log last-layer degree bound 0 (`proving.md` §4). Rows [model]; memory
+Inner parameters: blowup 4, 44 queries, PoW 20, interaction PoW 8, FRI fold
+step 1, log last-layer degree bound 0 (`proving.md` §4, format 27). The rows
+below were counted at 39 queries; the five more add 6,465 `p2`, 5,695 QM31 and
+5,455 `h8` rows to a leaf (about 61.8k, 102.0k and 48.0k), still within the
+padded shape, and make a fold about 13% dearer [model]. Rows [model]; memory
 and time [projected] at 5.0–10.9 B per extended cell and 51–110M extended
 cells per second, the range of spike 4b's circuit-prover runs and spike 4a's
 proxy on our pinned Stwo (`SP/logs/count.log`, "prover throughput").
@@ -506,8 +509,8 @@ multiverifier structure (`UP/circuit_multiverifier/src/verify.rs:52-90`):
 
 - **The padded shape** (a format constant, `proving.md` A.4): `p2` 2^16,
   `qm31` 2^17, `h8` 2^16; 458 columns in the order of §1.2 and their
-  preprocessed ids; the `Gate` relation; reserved addresses 0–4; blowup 4, 39
-  queries, PoW 26, interaction PoW 24, fold step 1, log last-layer degree
+  preprocessed ids; the `Gate` relation; reserved addresses 0–4; blowup 4, 44
+  queries, PoW 20, interaction PoW 8, fold step 1, log last-layer degree
   bound 0, the Poseidon2-M31 channel. 33.2M cells, tallest 2^17: every leaf
   and fold proves this many.
 - **It converges at once:** iterating "shape → what a fold of two such

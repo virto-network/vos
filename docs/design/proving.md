@@ -275,8 +275,24 @@ attribution). Its full design is `recursion-air.md`.
 
 - **One wrap per statement,** a 1-to-1 node over the root. Its tallest
   component is 2^15 rows [model].
-- **Parameters:** blowup 64, 18 queries, PoW 26, fold step 3, a 2^6 last
-  layer. That is 134 conjectured and 80 proven bits.
+- **Parameters** (format 28): blowup 64, 20 queries, PoW 26, interaction
+  PoW 8, fold step 3, a 2^6 last layer, and **affine DEEP batching** (an
+  independent coefficient a sampled value). That is 146 conjectured and 80
+  proven bits [model].
+- **Why affine batching:** Stwo batches the sampled values by powers of one
+  coefficient, and that term's error is the values' count times a
+  proximity-gap error that grows with the blowup. At blowup 64 it caps the
+  proven count at 74.7 bits however many queries are taken, 18 or 20
+  [model]. The ways to 80, decided at 5.14 [model]:
+  - **affine DEEP batching** at blowup 64 and 19–20 queries, about 1.06×
+    the verifier's cost, a change to our fork for the wrap's format only
+    (recommended);
+  - **a 6-bit PoW in the batching phase** at blowup 64 and 20 queries, about
+    1.11×;
+  - **blowup 8 with 41 queries,** about 1.97×.
+
+  Until affine batching exists, the security tool counts format 28 as
+  built, 74 proven bits, and reports it below its floor.
 - **Masked,** with variant (c).
 - **The final channel** [decided]: Blake2b-256 Merkle trees and a
   Blake2b Fiat–Shamir transcript. This is new code in our Stwo fork.
@@ -381,9 +397,18 @@ last for decades.**
 
 | proof | target | example | conjectured / proven |
 |---|---|---|---|
-| segment and fold proofs | ≥ 100 / ≥ 60 | blowup 4 (log 2), 39 queries, PoW 26, plus interaction PoW 24; FRI fold step 1, log last-layer degree bound 0 | 104 / 65 |
-| device proofs (verified at ingress, never folded) | ≥ 100 / ≥ 60 | blowup 2 (log 1), 84 queries, PoW 20 | 104 / 62 |
-| the final wrap | ≥ 100 / ≥ 80 | blowup 64 (log 6), 18 queries, PoW 26 | 134 / 80 |
+| segment and fold proofs (formats 26, 27) | ≥ 100 / ≥ 60 | blowup 4 (log 2), 44 queries, PoW 20, plus interaction PoW 8; FRI fold step 1, log last-layer degree bound 0 | 108 / 62 (62.7 for segments, 63 for folds) |
+| device and credential proofs (29, 30; verified at ingress, never folded) | ≥ 100 / ≥ 60, with 2 bits of margin | blowup 2 (log 1), 86 queries, PoW 20, plus interaction PoW 8 | 106 / 62 |
+| the final wrap (28) | ≥ 100 / ≥ 80 | blowup 64 (log 6), 20 queries, PoW 26, plus interaction PoW 8; fold step 3, last layer 2^6; affine DEEP batching (§3.5) | 146 / 80, 74 as built |
+
+- **The counts** are the security tool's (`pvm/proof/src/security.rs`) at
+  each format's reference shape [model], pinned by the format tests.
+- **The inner grind:** PoW 20 and interaction PoW 8 cost about 30 ms a
+  proof on 8 threads, against about 2.1 s at 26 and 24 [model]; the five
+  more queries make a fold about 13% dearer [model]. The inner proven count
+  is set by the query term.
+- **Devices:** 86 is the least query count whose proven count clears 60 by
+  2 bits; 84 gave 61.2.
 
 - **Inner soundness carries through:** forging a fold's input forges the
   final proof.
@@ -571,6 +596,7 @@ that narrows the inner proof makes folds cheaper too.
 | the window kernel's leaf is too big | its topology counted early (5.11), then its leaf proved within A.7; otherwise `p2` at 2^17 (+70% cells), narrower chips, or FRI fold step 3 in inner proofs (`p2` 55.3k → 49.2k rows) | slice 5, M1 |
 | the final wrap misses its gas or size | the real wrap verified on the JAM-only host (≤ 150M unmasked) and in the Wasm harness | slice 5, M1 |
 | the multi-step FRI path, or the new Blake2b channel, is unsound | a review plus tamper tests before the format admits them | slice 5, M1 |
+| the wrap misses its 80 proven bits | 74.7 at blowup 64 with powers-of-one DEEP batching [model]; affine batching in the fork for format 28 (about 1.06× verify), or a 6-bit batching PoW (1.11×), or blowup 8 with 41 queries (1.97×), decided at 5.14 | slice 5, M1 |
 | masking the wrap costs more than (c)'s factor | one masked wrap: ≤ 24 GiB, ≤ 200M gas; leakage and soundness tests | slice 6 |
 | the credential AIR misses sub-second | masked auth and payment proofs on a real flagship | slice 7 |
 | the signature chips' cost or soundness | a gate ladder per chip; a phone run | slice 7 |
@@ -711,15 +737,23 @@ output).**
   (16 limbs), 24 words at the wrap's reserved addresses 0–23, one word
   a wire. Its zero, one and `u` follow them.
 
-**A.4 The format registry (M0).** New numbers, not 24 or 25:
-- segment proofs (Poseidon2-M31);
-- device proofs (masked);
-- leaf and fold (one padded shape);
-- the final wrap (Blake2b-256, masked);
-- credential proofs.
+**A.4 The format registry (M0),** `pvm/proof/src/format.rs`. New numbers,
+not 24 or 25. Parameters as log blowup, queries, PoW, fold step, log last
+layer, interaction PoW; counts as conjectured / proven at the reference
+shape [model]:
 
-Each entry holds its channel, its parameters and both bit counts. Every
-one uses A.3's encodings.
+| number | proofs | channel | parameters | floors | counts |
+|---|---|---|---|---|---|
+| 26 | segments | Poseidon2-M31 | 2, 44, 20, 1, 0, 8 | 100 / 60 | 108 / 62 |
+| 27 | leaf and fold (one padded shape) | Poseidon2-M31 | 2, 44, 20, 1, 0, 8 | 100 / 60 | 108 / 63 |
+| 28 | the final wrap, masked | Blake2b-256 | 6, 20, 26, 3, 6, 8, affine DEEP batching | 100 / 80 | 146 / 74 as built |
+| 29 | device proofs, masked | Blake2s-M31 | 1, 86, 20, 1, 0, 8 | 100 / 60 | 106 / 62 |
+| 30 | credential proofs, masked | Blake2s-M31 | 1, 86, 20, 1, 0, 8 | 100 / 60 | 106 / 62 |
+
+Each entry holds its channel, its parameters, the DEEP batching its proven
+floor assumes and both bit counts. Every one uses A.3's encodings. 26 is
+admitted; 27 to 30 are refused until their AIRs and channels exist, and 28
+until affine batching does.
 
 **A.5 What may leave the prover role (slice 6):**
 - the `Statement`;
