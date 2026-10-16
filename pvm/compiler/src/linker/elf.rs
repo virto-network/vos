@@ -116,6 +116,8 @@ pub(super) struct Sections {
     pub(super) relas: Vec<usize>,
     /// The `.vos_schema` section's bytes.
     pub(super) schema: Option<Vec<u8>>,
+    /// The `.vos_heap` section, the heap's arena: its address and size.
+    pub(super) heap: Option<(u64, u64)>,
     /// Each symbol's value, by its index.
     pub(super) values: Vec<u64>,
     /// The defined symbols, in the table's order, and their names' table.
@@ -198,6 +200,7 @@ pub(super) fn sections(data: &[u8]) -> Result<Sections, TranspileError> {
     let mut rela_section_indices = Vec::new();
     let mut symtab_idx = None;
     let mut schema = None;
+    let mut heap = None;
 
     for (i, s) in sections.iter().enumerate() {
         let name = get_name(s.name_off);
@@ -242,6 +245,9 @@ pub(super) fn sections(data: &[u8]) -> Result<Sections, TranspileError> {
                 ro_sections.push((s.addr, size, bytes.to_vec()));
             }
         } else if is_write {
+            if name == ".vos_heap" {
+                heap = Some((s.addr, s.size));
+            }
             if s.sh_type == SHT_NOBITS {
                 rw_sections.push((s.addr, size, None));
             } else if let Some(bytes) = bytes {
@@ -304,6 +310,7 @@ pub(super) fn sections(data: &[u8]) -> Result<Sections, TranspileError> {
         rw: rw_sections,
         relas: rela_section_indices,
         schema,
+        heap,
         values,
         symbols,
         names,

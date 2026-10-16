@@ -83,6 +83,8 @@ pub(crate) struct LinkedElf {
     pub(crate) unknown_relocation: Option<u32>,
     /// The `.vos_schema` section's bytes, an actor program's schema.
     pub(crate) schema: Option<Vec<u8>>,
+    /// The `.vos_heap` section, the heap's arena: its address and size.
+    pub(crate) heap: Option<(u64, u64)>,
     /// PCREL_HI20: AUIPC instruction vaddr → resolved data address.
     /// The AUIPC itself should emit load_imm with this address.
     pub(crate) hi20_targets: BTreeMap<u64, u64>,
@@ -360,6 +362,7 @@ pub(crate) fn parse_linked_elf(data: &[u8]) -> Result<LinkedElf, TranspileError>
         relocations: relocations.count,
         unknown_relocation: relocations.unknown,
         schema: elf.schema,
+        heap: elf.heap,
         hi20_targets: relocations.hi20_targets,
         lo12_sites: relocations.lo12_sites,
         call_targets: relocations.call_targets,

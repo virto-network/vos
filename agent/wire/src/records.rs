@@ -12,24 +12,35 @@ use crate::{Decode, Encode};
 /// The programs a node derived from a package's ELF at its install, by
 /// their hashes: the actor's program, which holds its handlers and its
 /// workflows, and a kernel for each attestable method, by method in
-/// ascending order; and their provenance, the ELF's hash and the version of
-/// the transpiler that derived them. The same ELF and version derive the
-/// same bytes on any machine.
+/// ascending order; their provenance, the ELF's hash and the version of
+/// the transpiler that derived them; and the pages of the actor's heap its
+/// program leaves out. The same ELF and version derive the same bytes on
+/// any machine.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Derivation {
     pub program: ProgramHash,
     pub kernels: Vec<(MethodId, ProgramHash)>,
     pub elf: [u8; 32],
     pub transpiler: u32,
+    /// The pages of the actor's heap past its program's read-write data,
+    /// which a workflow's machine maps there: a handler and a kernel run
+    /// on the heap their programs hold, a workflow on the whole.
+    pub heap: u32,
 }
 
 impl Derivation {
     /// The derivation of package `elf`: its actor's program and each
     /// attestable method's kernel, by the method's id, as version
-    /// `transpiler` derived them, each named by its hash. The one
-    /// constructor of a VOS node's install and of a JAM builder's, so the
-    /// two agree.
-    pub fn new(elf: &[u8], actor: &[u8], kernels: &[(u32, Vec<u8>)], transpiler: u32) -> Self {
+    /// `transpiler` derived them, each named by its hash, and the `heap`
+    /// pages its program leaves out. The one constructor of a VOS node's
+    /// install and of a JAM builder's, so the two agree.
+    pub fn new(
+        elf: &[u8],
+        actor: &[u8],
+        kernels: &[(u32, Vec<u8>)],
+        transpiler: u32,
+        heap: u32,
+    ) -> Self {
         Self {
             program: ProgramHash::of(actor),
             kernels: kernels
@@ -38,6 +49,7 @@ impl Derivation {
                 .collect(),
             elf: crate::result::digest(elf),
             transpiler,
+            heap,
         }
     }
 

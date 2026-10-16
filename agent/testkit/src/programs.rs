@@ -68,6 +68,7 @@ pub fn derivation(elf: &[u8], derived: &Derived) -> Derivation {
         &derived.actor,
         &derived.kernels,
         derived.transpiler_version,
+        derived.heap,
     )
 }
 
@@ -79,6 +80,7 @@ pub fn bare(program: ProgramHash) -> Derivation {
         kernels: Vec::new(),
         elf: [0; 32],
         transpiler: vos_pvm_compiler::TRANSPILER_VERSION,
+        heap: 0,
     }
 }
 

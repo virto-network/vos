@@ -146,7 +146,8 @@ impl Testkit {
         let program = ProgramHash::of(blob);
         let parsed = vos_pvm::spi::parse_standard_program(blob).ok_or(Failure::Unloadable)?;
         let layout = parsed.layout(&[]).ok_or(Failure::Unloadable)?;
-        let writable = (layout.rw.size + layout.stack.size) / PAGE as u64;
+        let writable =
+            (layout.rw.size + layout.stack.size) / PAGE as u64 + u64::from(installed.heap);
         if writable > installed.target.limits().workflow_pages as u64 {
             return Err(Failure::Cap);
         }
@@ -422,6 +423,15 @@ impl Testkit {
         let mut machine =
             Machine::load_prepared_at(&prepared, counter, &[], workflow.gas, MemoryModel::Auto)
                 .map_err(|_| Failure::Trapped)?;
+        // The rest of its heap, past its program's read-write data.
+        let own = (layout.rw.size + layout.stack.size) / PAGE as u64;
+        let heap = u64::from(workflow.writable) - own;
+        let first = ((layout.rw.base + layout.rw.size) / PAGE as u64) as usize;
+        assert!(machine.memory_mut().set_page_range(
+            first,
+            heap as usize,
+            vos_pvm::interpreter::PERM_RW
+        ));
         // The halt address and the stack's top, as a new machine's.
         let registers = machine.registers_mut();
         registers.fill(0);
@@ -467,9 +477,11 @@ impl Testkit {
         };
         let resumed = *machine.registers();
         let ended = invocation.workflow(&mut machine, call, workflow.gas, pending)?;
-        // The pages the step wrote, among those the program may write.
-        let runs = [layout.rw, layout.stack]
-            .map(|region| region.base / PAGE as u64..(region.base + region.size) / PAGE as u64);
+        // The pages the step wrote, among those the program may write, the
+        // rest of its heap among them.
+        let runs = [(layout.rw, heap), (layout.stack, 0)].map(|(region, more)| {
+            region.base / PAGE as u64..(region.base + region.size) / PAGE as u64 + more
+        });
         let written: Vec<u64> = machine
             .memory_mut()
             .take_dirty_pages()

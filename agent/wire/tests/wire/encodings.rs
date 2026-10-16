@@ -109,6 +109,7 @@ fn installs_keep_their_bytes() {
         ],
         elf: [4; 32],
         transpiler: 5,
+        heap: 6,
     };
     let kernel = |method: u32, program: &[u8]| [&method.to_le_bytes()[..], program].concat();
     let derived = [
@@ -118,6 +119,7 @@ fn installs_keep_their_bytes() {
         &kernel(0x0e0f_1011, &[2; 32]),
         &[4; 32],
         &5u32.to_le_bytes(),
+        &6u32.to_le_bytes(),
     ]
     .concat();
     assert_eq!(derivation.encode(), derived);

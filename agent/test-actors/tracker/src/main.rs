@@ -78,7 +78,7 @@ fn run(probe: Probe) -> Report {
     }
     if probe.track {
         let header = header(&probe.program).expect("a header");
-        assert!(machine.track(&header), "armed");
+        assert!(machine.track(&header, 0), "armed");
     }
     for (address, bytes) in &probe.writes {
         assert!(

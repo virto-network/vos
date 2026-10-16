@@ -112,7 +112,8 @@ fn package(derivation: Derivation, roles: Vec<(Vec<u8>, u8)>, target: Target) ->
 }
 
 /// Whether an installed package's statics are within `limits`: its kernels'
-/// count, its program's bytes and the pages it may write, and the BLAKE2b
+/// count, its program's bytes and the pages it may write, its whole heap
+/// included, and the BLAKE2b
 /// compressions each attestable method's gas limit pays for.
 fn within(installed: &Installed, limits: &Limits) -> bool {
     if installed.derivation.kernels.len() > limits.kernels {
@@ -121,7 +122,8 @@ fn within(installed: &Installed, limits: &Limits) -> bool {
     let Some((header, len)) = machines::header_and_len(&installed.program().0) else {
         return false;
     };
-    let pages = machines::writable_pages(&header);
+    let pages =
+        machines::writable_pages(&header).map(|pages| pages + u64::from(installed.derivation.heap));
     if len > limits.program
         || pages.is_none_or(|pages| limits.program_pages.is_some_and(|most| pages > most as u64))
     {

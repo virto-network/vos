@@ -1173,14 +1173,16 @@ These form a prover track that runs alongside the core slices (section 16).
   17–20 µs in one process, so a machine of its own may move the
   replicated rows. The slice 3 progress log has every run.
 - No hot path may grow with history length.
-- **An actor's heap is paid per invocation of any kind:** its workflows
-  run in its program (section 6.4), so it configures one heap for them
-  and its handlers alike, and each handler's machine maps all of it, on
-  JAM through the loader's calls (about 372,000 gas a call for 12 MiB,
-  about 15,000 at the SDK's default) and on VOS in the pool's price by
-  pages. A bump allocator over the header's heap region, mapping a small
-  heap for handlers and a larger one for workflow steps, is carried to a
-  later slice.
+- **A heap per kind of invocation:** an actor configures one heap, its
+  arena the last section of its read-write data (`.vos_heap`), from whose
+  start the SDK's allocator bumps fresh memory. Its install's derivation
+  holds the arena's first 512 KiB in the actor's program and in each
+  kernel, all a handler or a kernel maps (on JAM through the loader's
+  calls, about 372,000 gas a call for 12 MiB, about 15,000 for 512 KiB;
+  on VOS in the pool's price by pages); a workflow's machine maps the
+  rest past them (`Derivation::heap`), armed with its writable pages. So
+  a kernel's memory is laid out by its program alone, the same whatever
+  heap its actor declares, and a handler past 512 KiB traps.
 
 ## 15. Worked examples
 

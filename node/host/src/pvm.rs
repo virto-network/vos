@@ -364,6 +364,7 @@ mod tests {
                     kernels: Vec::new(),
                     elf: [0; 32],
                     transpiler: 0,
+                    heap: 0,
                 },
                 roles: Vec::new(),
                 target: Target::Vos,

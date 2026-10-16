@@ -175,16 +175,28 @@ impl Machine {
         })
     }
 
+    /// Map `pages` zeroed read-write pages past the read-write data
+    /// `header` places, before any tracking: the rest of a workflow's
+    /// heap, which its program leaves out. False when `pages` refuses them.
+    pub fn map_heap(&self, header: &StandardHeader, pages: u64) -> bool {
+        let Some([_, rw, _]) = header.regions() else {
+            return false;
+        };
+        self.map(rw.base + rw.size, pages * PAGE, &[])
+    }
+
     /// Track the pages written in the machine from here on: arm its
-    /// writable pages, as `header` places them, read-only. False when
+    /// writable pages, as `header` places them with `heap` more past its
+    /// read-write data ([`Machine::map_heap`]), read-only. False when
     /// `pages` refuses them. A workflow's step takes the arming and each
     /// page's repair from the batch's budget, by the pages
     /// (`defaults::ARM_PAGE`, `defaults::WRITTEN_PAGE`).
-    pub fn track(&mut self, header: &StandardHeader) -> bool {
+    pub fn track(&mut self, header: &StandardHeader, heap: u64) -> bool {
         let Some([_, rw, stack]) = header.regions() else {
             return false;
         };
-        let runs = [rw, stack].map(|region| (region.base / PAGE, region.size / PAGE));
+        let runs = [(rw, heap), (stack, 0)]
+            .map(|(region, more)| (region.base / PAGE, region.size / PAGE + more));
         for (first, count) in runs {
             if count > 0 && !self.pages(first, count, SET_READ_ONLY) {
                 return false;

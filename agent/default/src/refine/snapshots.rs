@@ -97,13 +97,25 @@ pub(crate) fn restore(
     workflow: &Workflow,
 ) -> Result<(Machine, StandardHeader), Failure> {
     let program = &workflow.program.0;
+    let header = machines::pinned_header(program).ok_or(Failure::Unloadable)?;
+    // The pages of its heap past its program's, which it maps itself.
+    let heap = machines::writable_pages(&header)
+        .and_then(|pages| u64::from(workflow.writable).checked_sub(pages))
+        .ok_or(Failure::Unloadable)?;
+    let acquired = |counter| {
+        let machine = machines::pinned(program, counter)?;
+        machine
+            .map_heap(&header, heap)
+            .then_some(machine)
+            .ok_or(Unavailable::Missing)
+    };
     let mut machine = match &workflow.snapshot {
-        None => machines::pinned(program, 0)?,
+        None => acquired(0)?,
         Some(snapshot) => {
             if snapshot.registers.len() != REGISTER_COUNT {
                 lost("a workflow's registers");
             }
-            let mut machine = match machines::pinned(program, snapshot.counter) {
+            let mut machine = match acquired(snapshot.counter) {
                 Err(Unavailable::Counter) => lost("a workflow's counter"),
                 acquired => acquired?,
             };
@@ -123,8 +135,7 @@ pub(crate) fn restore(
             machine
         }
     };
-    let header = machines::header(program).ok_or(Failure::Unloadable)?;
-    if !machine.track(&header) {
+    if !machine.track(&header, heap) {
         return Err(Failure::Trapped);
     }
     Ok((machine, header))

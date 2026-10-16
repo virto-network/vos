@@ -134,12 +134,13 @@ pub(crate) fn input() -> impl Strategy<Value = Input> {
                 prop::collection::vec((any::<u32>(), any::<[u8; 32]>()), 0..3),
                 any::<[u8; 32]>(),
                 any::<u32>(),
+                any::<u32>(),
             ),
             prop::collection::vec((bytes(), any::<u8>()), 0..3),
             prop_oneof![Just(Target::Vos), Just(Target::Jam)],
         )
             .prop_map(
-                |(instance, (program, kernels, elf, transpiler), roles, target)| {
+                |(instance, (program, kernels, elf, transpiler, heap), roles, target)| {
                     Input::Admin(Admin::Install {
                         instance: InstanceId(instance),
                         derivation: Derivation {
@@ -150,6 +151,7 @@ pub(crate) fn input() -> impl Strategy<Value = Input> {
                                 .collect(),
                             elf,
                             transpiler,
+                            heap,
                         },
                         roles,
                         target,

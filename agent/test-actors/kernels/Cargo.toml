@@ -17,3 +17,9 @@ bench = false
 [dependencies]
 vos-pvm-precompiles = { path = "../../../pvm/proof/precompiles", default-features = false, features = ["blake2b"] }
 vos-sdk = { workspace = true }
+
+[[bin]]
+name = "roomy"
+path = "src/bin/roomy.rs"
+test = false
+bench = false

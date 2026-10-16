@@ -213,6 +213,7 @@ impl Inner {
                     &derived.actor,
                     &derived.kernels,
                     derived.transpiler_version,
+                    derived.heap,
                 );
                 pooled(derived.actor)?;
                 for (_, kernel) in derived.kernels {

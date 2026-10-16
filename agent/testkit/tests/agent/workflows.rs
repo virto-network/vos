@@ -117,6 +117,27 @@ impl Flows {
         })
     }
 
+    /// The shop's install as derived from its ELF built as `package`, in
+    /// the node, which stores its programs, and in the model: its program
+    /// holds the heap a handler maps, and its workflows map the rest.
+    fn install_derived(&mut self, package: &str) -> Input {
+        use vos_testkit::programs::{derivation, derived};
+        let derived = derived(package);
+        self.kit
+            .install_derived(Target::Vos, SHOP, &derived, &[])
+            .unwrap();
+        self.node.add(&derived.actor);
+        for (_, kernel) in &derived.kernels {
+            self.node.add(kernel);
+        }
+        Input::Admin(Admin::Install {
+            instance: SHOP,
+            derivation: derivation(&vos_testkit::programs::package(package), &derived),
+            roles: vec![],
+            target: Target::Vos,
+        })
+    }
+
     fn method(&self, name: &str) -> MethodId {
         method(&self.programs["shop"], name)
     }

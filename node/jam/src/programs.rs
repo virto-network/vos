@@ -38,6 +38,7 @@ pub fn derive(elf: &[u8]) -> Result<Installable, Error> {
         &derived.actor,
         &derived.kernels,
         derived.transpiler_version,
+        derived.heap,
     );
     let programs = core::iter::once(derived.actor)
         .chain(derived.kernels.into_iter().map(|(_, kernel)| kernel))

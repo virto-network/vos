@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use vos_checker::calls::{Ran, installed};
 use vos_checker::hooks::Holds;
-use vos_checker::programs::{actor, method, package};
+use vos_checker::programs::{derived, method, package};
 use vos_node::store::{EntryKind, PersistMode};
 use vos_node::{Node, Reply};
 use vos_pvm::pool::CodeHash;
@@ -22,8 +22,8 @@ use crate::common::{ALICE, Cluster, compacting, log_start, replaced, retired, wa
 
 const SHOP: InstanceId = InstanceId(4);
 
-/// The shop's programs, its workflows in each, and their packages: its
-/// own, and the one an upgrade installs.
+/// The shop's programs, as its packages' installs derive them, its
+/// workflows in each: its own, and the one an upgrade installs.
 struct Shop {
     shop: Vec<u8>,
     lean: Vec<u8>,
@@ -32,8 +32,8 @@ struct Shop {
 impl Shop {
     fn load() -> Self {
         Self {
-            shop: actor("shop"),
-            lean: actor("lean"),
+            shop: derived("shop").actor,
+            lean: derived("lean").actor,
         }
     }
 

@@ -23,6 +23,13 @@
 //! its addend points elsewhere; data no reachable code names is zeros in
 //! the kernel, its addresses unchanged.
 //!
+//! **A heap per kind of invocation:** an ELF's heap arena, its `.vos_heap`
+//! section, ends its read-write data. The actor's program and each kernel
+//! hold its first [`INVOCATION_HEAP`] bytes, all a handler or a kernel
+//! maps; the pages past them, [`Derived::heap`], a workflow's machine maps
+//! past its program's. So a kernel's memory, laid out by its program
+//! alone, is the same whatever heap its actor declares.
+//!
 //! **A kernel makes no host call but the precompiles:** one whose reachable
 //! code does is refused, naming the chain of functions from the entry to
 //! the call.
@@ -47,7 +54,14 @@ use crate::riscv::{self, decode_b_imm, decode_j_imm, op};
 
 /// The derivation's version: it changes whenever the bytes it derives from
 /// the same ELF may, so a derived program's hash is pinned per version.
-pub const TRANSPILER_VERSION: u32 = 1;
+pub const TRANSPILER_VERSION: u32 = 2;
+
+/// The bytes of its actor's heap arena a handler's or a kernel's program
+/// holds: a workflow's machine maps the rest.
+pub const INVOCATION_HEAP: u64 = 512 << 10;
+
+/// A page of the PVM's memory.
+const PAGE: u64 = vos_pvm::PVM_PAGE_SIZE as u64;
 
 /// The largest ELF a derivation reads: an install's body.
 pub const MAX_ELF: usize = 64 << 20;
@@ -61,12 +75,16 @@ const ATTEST_ENTRY: u64 = 16;
 
 /// What an ELF derives: its actor's program, a kernel per attestable
 /// method by its id in ascending order, the schema's section as the ELF's
-/// `.vos_schema` holds it, and the version that derived them.
+/// `.vos_schema` holds it, the pages of its heap the programs leave out,
+/// and the version that derived them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Derived {
     pub actor: Vec<u8>,
     pub kernels: Vec<(u32, Vec<u8>)>,
     pub schema: Vec<u8>,
+    /// The pages of the actor's heap past its program's read-write data,
+    /// which a workflow's machine maps there.
+    pub heap: u32,
     pub transpiler_version: u32,
 }
 
@@ -115,6 +133,7 @@ pub fn derive(elf: &[u8]) -> Result<Derived, DeriveError> {
         return Err(DeriveError::CodeSections(linked.code_sections.len()));
     }
     let schema = linked.schema.take().ok_or(DeriveError::NoSchema)?;
+    let heap = invocation_heap(&mut linked);
     let actor = spi_blob(transpile_with(&linked, Link::Whole)?)?;
     let graph = Graph::new(&linked);
     let kernels = attestables(&linked)?
@@ -125,8 +144,25 @@ pub fn derive(elf: &[u8]) -> Result<Derived, DeriveError> {
         actor,
         kernels,
         schema,
+        heap,
         transpiler_version: TRANSPILER_VERSION,
     })
+}
+
+/// Leave the heap's arena past [`INVOCATION_HEAP`] out of the read-write
+/// data the ELF's programs hold, where the arena ends that data at a page:
+/// the pages left out, which a workflow's machine maps.
+fn invocation_heap(elf: &mut LinkedElf) -> u32 {
+    let Some((start, size)) = elf.heap else {
+        return 0;
+    };
+    let end = elf.rw_base + elf.rw_len;
+    if start.saturating_add(size) != end || !start.is_multiple_of(PAGE) || size <= INVOCATION_HEAP {
+        return 0;
+    }
+    let kept = start + INVOCATION_HEAP;
+    elf.rw_len = kept - elf.rw_base;
+    ((end.next_multiple_of(PAGE) - kept) / PAGE) as u32
 }
 
 /// The ELF's attestable methods and their entries, from its `VOS_ATTEST`

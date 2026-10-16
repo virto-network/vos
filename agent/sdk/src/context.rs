@@ -290,8 +290,8 @@ fn millis(within: Option<Duration>) -> u64 {
 /// (a section, a call, a send, a request, a wait or the result) to its next
 /// await, the code has the workflow's whole gas limit, and never pauses.
 ///
-/// **Memory:** a workflow runs in its actor's program, on the heap the
-/// actor configures. The pages it has written that differ from the
+/// **Memory:** a workflow runs in its actor's program, on the whole heap
+/// the actor configures, of which its handlers map the start. The pages it has written that differ from the
 /// program's image are its snapshot, which every step restores: at most
 /// [`crate::abi::cap::HELD_PAGES`] pages, 2.25 MiB, and a step that would
 /// leave it more fails the workflow. Each page held costs every step its

@@ -71,6 +71,7 @@ impl InstallArgs {
             &derived.actor,
             &derived.kernels,
             derived.transpiler_version,
+            derived.heap,
         );
         let install = Install {
             instance: InstanceId(self.instance),

@@ -55,6 +55,9 @@ struct Installed {
     /// Each attestable method's kernel.
     kernels: Vec<(MethodId, Vec<u8>)>,
     target: Target,
+    /// The pages of its heap past its program's read-write data, which a
+    /// workflow's machine maps there.
+    heap: u32,
 }
 
 impl Installed {
@@ -167,6 +170,43 @@ impl Testkit {
         kernels: &[(MethodId, &[u8])],
         roles: &[(&str, u8)],
     ) -> Result<(), InstallError> {
+        self.install_with_heap(target, instance, program, 0, kernels, roles)
+    }
+
+    /// Install what an ELF derived ([`programs::derived`]) for `target`:
+    /// its actor's program, its kernels, and the pages of its heap its
+    /// program leaves out, which its workflows map.
+    pub fn install_derived(
+        &mut self,
+        target: Target,
+        instance: InstanceId,
+        derived: &vos_pvm_compiler::Derived,
+        roles: &[(&str, u8)],
+    ) -> Result<(), InstallError> {
+        let kernels: Vec<(MethodId, &[u8])> = derived
+            .kernels
+            .iter()
+            .map(|(method, kernel)| (MethodId(*method), kernel.as_slice()))
+            .collect();
+        self.install_with_heap(
+            target,
+            instance,
+            &derived.actor,
+            derived.heap,
+            &kernels,
+            roles,
+        )
+    }
+
+    fn install_with_heap(
+        &mut self,
+        target: Target,
+        instance: InstanceId,
+        program: &[u8],
+        heap: u32,
+        kernels: &[(MethodId, &[u8])],
+        roles: &[(&str, u8)],
+    ) -> Result<(), InstallError> {
         let parsed =
             vos_pvm::spi::parse_standard_program(program).ok_or(InstallError::NotAProgram)?;
         let schema = Schema::read(&parsed.ro_data).map_err(InstallError::Schema)?;
@@ -194,7 +234,14 @@ impl Testkit {
                 return Err(InstallError::UnmappedRole(role.clone()));
             }
         }
-        if !statics_within(program, &parsed, &schema, kernels.len(), target.limits()) {
+        if !statics_within(
+            program,
+            &parsed,
+            heap,
+            &schema,
+            kernels.len(),
+            target.limits(),
+        ) {
             return Err(InstallError::Cap);
         }
         let installed = Installed {
@@ -206,6 +253,7 @@ impl Testkit {
                 .map(|(method, kernel)| (*method, kernel.to_vec()))
                 .collect(),
             target,
+            heap,
         };
         for program in core::iter::once(&installed.program)
             .chain(installed.kernels.iter().map(|(_, kernel)| kernel))
@@ -411,18 +459,19 @@ impl Testkit {
 }
 
 /// Whether a program's statics are within `limits`: the kernels bound to
-/// it, its bytes, the pages it may write, and each attestable method's
-/// gas limit over a compression's price.
+/// it, its bytes, the pages it may write, `heap` more past them included,
+/// and each attestable method's gas limit over a compression's price.
 fn statics_within(
     program: &[u8],
     parsed: &vos_pvm::spi::StandardProgram,
+    heap: u32,
     schema: &Schema,
     kernels: usize,
     limits: &Limits,
 ) -> bool {
-    let pages = parsed
-        .layout(&[])
-        .map(|layout| (layout.rw.size + layout.stack.size) / vos_wire::result::PAGE as u64);
+    let pages = parsed.layout(&[]).map(|layout| {
+        (layout.rw.size + layout.stack.size) / vos_wire::result::PAGE as u64 + u64::from(heap)
+    });
     let price = precompile::price(precompile::BLAKE2B_COMPRESS).expect("BLAKE2b's price");
     kernels <= limits.kernels
         && program.len() <= limits.program

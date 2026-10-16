@@ -629,6 +629,39 @@ fn a_jam_workflow_past_its_pages_keep_expires() {
     }
 }
 
+/// A derived program holds the heap a handler maps, and a workflow's
+/// machine maps the rest of its actor's heap past it: a computation larger
+/// than a handler's heap runs to its end, beside handlers, on every host
+/// and as the model runs it.
+#[test]
+fn a_workflow_maps_the_heap_its_program_leaves_out() {
+    use vos_pvm_compiler::INVOCATION_HEAP;
+    let words = (2 * INVOCATION_HEAP / 8) as u32;
+    for node in [Node::new(), Node::jam(true)] {
+        let mut flows = Flows::new(node);
+        let install = flows.install_derived("shop");
+        flows.batch(1, vec![install]);
+        let sell = flows.method("sell");
+        let sold = flows.sessions.request(ALICE, SHOP, sell, 5u64);
+        let start = flows.start("compute", (words, 2u32));
+        let result = flows.batch(1, vec![sold, start]);
+        assert_eq!(ran(&result.steps[0]).outcome, Outcome::Done(5u64.encode()));
+        assert_eq!(due(&result, 0).outcome, Outcome::Done(vec![]));
+        let held = flows.record(0).snapshot.unwrap().pages.len();
+        assert!(
+            held as u64 * PAGE_U64 > INVOCATION_HEAP,
+            "{held} pages held"
+        );
+        for _ in 0..3 {
+            flows.sweep(1);
+        }
+        assert!(matches!(ended(&flows.record(0)), Outcome::Done(_)));
+    }
+}
+
+/// The bytes of a page.
+const PAGE_U64: u64 = vos_wire::result::PAGE as u64;
+
 /// A workflow's machine counts toward the machines a step may hold, though
 /// it is on no call stack: its chain of nested calls fails one call shorter
 /// than a handler's, on the depth rule, never on the host's machines.

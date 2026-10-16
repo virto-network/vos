@@ -226,7 +226,8 @@ fn started(base: &Base, call: Call) -> Result<(WorkflowId, Overlay), Failure> {
     }
     let program = installed.program();
     let header = machines::pinned_header(&program.0).ok_or(Failure::Unloadable)?;
-    let writable = machines::writable_pages(&header).ok_or(Failure::Unloadable)?;
+    let writable = machines::writable_pages(&header).ok_or(Failure::Unloadable)?
+        + u64::from(installed.derivation.heap);
     if writable > installed.target.limits().workflow_pages as u64 {
         return Err(Failure::Cap);
     }

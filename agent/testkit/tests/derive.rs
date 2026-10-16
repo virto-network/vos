@@ -1,8 +1,10 @@
 //! One ELF in, programs out: the derivation an install runs over every test
 //! actor's package. It gives the bytes `link_elf_spi` gives for the actor's
-//! program, the same bytes in any process, kernels that run their methods
-//! as the actor's code does, and it refuses a kernel that makes a host call
-//! other than a precompile. Fed mutated packages, it never panics.
+//! program but for the heap it holds, the same bytes in any process,
+//! kernels laid out alike whatever heap their actor declares, which run
+//! their methods as the actor's code does, and it refuses a kernel that
+//! makes a host call other than a precompile. Fed mutated packages, it
+//! never panics.
 
 use std::collections::BTreeMap;
 use std::process::{Command, Stdio};
@@ -10,7 +12,7 @@ use std::process::{Command, Stdio};
 use blake2::digest::consts::U32;
 use blake2::{Blake2b, Digest};
 use proptest::prelude::*;
-use vos_pvm_compiler::{DeriveError, derive, link_elf_spi};
+use vos_pvm_compiler::{DeriveError, INVOCATION_HEAP, derive, link_elf_spi};
 use vos_testkit::programs::{actor_elf, derived, method, package};
 use vos_testkit::{Testkit, decode};
 use vos_wire::Encode;
@@ -19,8 +21,8 @@ use vos_wire::result::Outcome;
 use vos_wire::schema::Schema;
 
 /// Every test actor's package, by name: those an install takes.
-const PACKAGES: [&str; 9] = [
-    "counter", "ledger", "caller", "shop", "big", "huge", "lean", "rounds", "kernels",
+const PACKAGES: [&str; 10] = [
+    "counter", "ledger", "caller", "shop", "big", "huge", "lean", "rounds", "kernels", "roomy",
 ];
 
 /// Where a child process writes what it derived.
@@ -40,9 +42,10 @@ fn derivations() -> String {
     for name in PACKAGES {
         let derived = derive(&package(name)).expect("derives");
         lines += &format!(
-            "{name} {} {} {}",
+            "{name} {} {} {} {}",
             digest(&derived.actor),
             digest(&derived.schema),
+            derived.heap,
             derived.transpiler_version
         );
         for (method, kernel) in &derived.kernels {
@@ -82,15 +85,30 @@ fn a_derivation_is_the_same_in_every_process() {
     println!("{derived}");
 }
 
-/// The actor's program is what `link_elf_spi` links from the ELF, byte for
-/// byte, and the schema is the program's.
+/// The actor's program is what `link_elf_spi` links from the ELF, but for
+/// its heap: it holds at most the first [`INVOCATION_HEAP`] bytes of the
+/// ELF's heap arena, and leaves the pages past them, [`Derived::heap`], to
+/// a workflow's machine. The schema is the program's.
+///
+/// [`Derived::heap`]: vos_pvm_compiler::Derived::heap
 #[test]
 fn the_actors_program_is_the_elf_linked() {
+    let parse = |blob: &[u8]| vos_pvm::spi::parse_standard_program(blob).unwrap();
     for name in PACKAGES {
         let elf = package(name);
         let derived = derive(&elf).unwrap();
-        assert_eq!(derived.actor, link_elf_spi(&elf).unwrap(), "{name}");
-        let parsed = vos_pvm::spi::parse_standard_program(&derived.actor).unwrap();
+        let linked = parse(&link_elf_spi(&elf).unwrap());
+        let parsed = parse(&derived.actor);
+        assert_eq!(
+            parsed,
+            vos_pvm::spi::StandardProgram {
+                heap_pages: linked.heap_pages - derived.heap,
+                ..linked.clone()
+            },
+            "{name}"
+        );
+        let roomy = matches!(name, "shop" | "big" | "huge" | "roomy");
+        assert_eq!(derived.heap > 0, roomy, "{name}: its heap's pages left out");
         assert_eq!(
             Schema::read(&parsed.ro_data).unwrap(),
             Schema::read(&derived.schema).unwrap(),
@@ -196,6 +214,35 @@ fn kernels_run_their_methods() {
     assert_eq!(hashes.len(), 3);
     for (_, kernel) in &derived.kernels {
         assert!(kernel.len() < program.len(), "a kernel is pruned");
+    }
+}
+
+/// A kernel's memory is laid out by the ELF's code and data and the heap a
+/// kernel holds, whatever heap its actor declares: the kernels of an actor
+/// built with a heap past [`INVOCATION_HEAP`] map what those of its build
+/// with the default heap map, and so do its programs for handlers; a
+/// workflow's machine maps the rest of its heap.
+#[test]
+fn a_kernels_layout_is_its_actors_whatever_its_heap() {
+    let layout = |blob: &[u8]| {
+        let program = vos_pvm::spi::parse_standard_program(blob).unwrap();
+        let layout = program.layout(&[]).unwrap();
+        (layout.ro, layout.rw, layout.stack)
+    };
+    let (small, roomy) = (derived("kernels"), derived("roomy"));
+    assert_eq!(small.heap, 0);
+    let page = vos_pvm::PVM_PAGE_SIZE as u64;
+    let arena = |heap: u64| heap.div_ceil(page);
+    assert_eq!(
+        u64::from(roomy.heap),
+        arena(4 << 20) - INVOCATION_HEAP / page,
+        "the pages past what a kernel holds"
+    );
+    assert_eq!(layout(&small.actor), layout(&roomy.actor));
+    assert_eq!(small.kernels.len(), roomy.kernels.len());
+    for ((method, kernel), (other, wide)) in small.kernels.iter().zip(&roomy.kernels) {
+        assert_eq!(method, other);
+        assert_eq!(layout(kernel), layout(wide), "{method:#010x}");
     }
 }
 

@@ -1,9 +1,11 @@
-//! A program's heap: power-of-two size classes over an arena in `.bss`,
-//! each with a free list, so short-lived allocations cost a few
-//! instructions and freed memory is reused. Blocks past the largest class
-//! go on one first-fit list. Pages a program never touches cost nothing to
-//! run, but the pool prices a machine by its mapped pages, so the arena is
-//! sized per program: [`crate::program_runtime!`] takes it.
+//! A program's heap: power-of-two size classes over an arena, each with a
+//! free list, so short-lived allocations cost a few instructions and freed
+//! memory is reused. Blocks past the largest class go on one first-fit
+//! list. Fresh memory is bumped from the arena's start, so a machine that
+//! maps only the arena's first pages runs on them: past them, its store
+//! faults and the invocation traps. Pages a program never touches cost
+//! nothing to run, but the pool prices a machine by its mapped pages, so
+//! the arena is sized per program: [`crate::program_runtime!`] takes it.
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
@@ -24,21 +26,33 @@ struct State {
     large: usize,
 }
 
-/// A heap of `ARENA` bytes.
+/// `ARENA` bytes a heap allocates from, page-aligned.
 #[repr(C, align(4096))]
+pub struct Arena<const ARENA: usize>(UnsafeCell<[u8; ARENA]>);
+
+// SAFETY: a program runs on one thread.
+unsafe impl<const ARENA: usize> Sync for Arena<ARENA> {}
+
+impl<const ARENA: usize> Default for Arena<ARENA> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const ARENA: usize> Arena<ARENA> {
+    pub const fn new() -> Self {
+        Self(UnsafeCell::new([0; ARENA]))
+    }
+}
+
+/// A heap over an arena of `ARENA` bytes, its state apart from it.
 pub struct Heap<const ARENA: usize> {
-    arena: UnsafeCell<[u8; ARENA]>,
+    arena: &'static Arena<ARENA>,
     state: UnsafeCell<State>,
 }
 
 // SAFETY: a program runs on one thread.
 unsafe impl<const ARENA: usize> Sync for Heap<ARENA> {}
-
-impl<const ARENA: usize> Default for Heap<ARENA> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 /// A block's class, from its size and alignment; `None` past the largest.
 fn class(layout: &Layout) -> Option<usize> {
@@ -47,9 +61,9 @@ fn class(layout: &Layout) -> Option<usize> {
 }
 
 impl<const ARENA: usize> Heap<ARENA> {
-    pub const fn new() -> Self {
+    pub const fn new(arena: &'static Arena<ARENA>) -> Self {
         Self {
-            arena: UnsafeCell::new([0; ARENA]),
+            arena,
             state: UnsafeCell::new(State {
                 next: 0,
                 free: [0; CLASSES],
@@ -62,7 +76,7 @@ impl<const ARENA: usize> Heap<ARENA> {
     fn bump(&self, size: usize, align: usize) -> *mut u8 {
         // SAFETY: single-threaded.
         let state = unsafe { &mut *self.state.get() };
-        let base = self.arena.get() as usize;
+        let base = self.arena.0.get() as usize;
         let start = (base + state.next).next_multiple_of(align) - base;
         match start.checked_add(size) {
             Some(end) if end <= ARENA => {
@@ -154,7 +168,8 @@ unsafe impl<const ARENA: usize> GlobalAlloc for Heap<ARENA> {
 mod tests {
     use super::*;
 
-    static HEAP: Heap<{ 1 << 20 }> = Heap::new();
+    static ARENA: Arena<{ 1 << 20 }> = Arena::new();
+    static HEAP: Heap<{ 1 << 20 }> = Heap::new(&ARENA);
 
     #[test]
     fn freed_blocks_are_reused_by_class_and_large_blocks_by_fit() {
