@@ -347,10 +347,14 @@ impl Cluster {
     }
 
     /// Every running node the newest placement of `agent` names runs it,
-    /// has applied as far as the others, and holds the same rows. A
-    /// replica still learning of the agent is waited for, not skipped.
+    /// and each holds the same rows at the same applied index, both read
+    /// from one store snapshot of its own: an applied index read apart
+    /// from the rows may match while a committed entry is still applying
+    /// on one replica, its rows read after it a later entry's. A replica
+    /// still learning of the agent, or behind the others, is waited for;
+    /// replicas at one applied index whose rows differ have diverged.
     pub fn converged(&self, agent: AgentId) {
-        let mut replicas = Vec::new();
+        let mut views = Vec::new();
         wait_until("every replica applies the same", || {
             let Some(placement) = self
                 .running()
@@ -359,25 +363,26 @@ impl Cluster {
             else {
                 return false;
             };
-            replicas = self
+            let replicas: Vec<&Node> = self
                 .running()
                 .filter(|(number, _)| placement.replicas.contains(number))
-                .map(|(number, _)| number)
+                .map(|(_, node)| node)
                 .collect();
-            let applied: Vec<Option<u64>> = replicas
+            if replicas.iter().any(|node| node.applied(agent).is_none()) {
+                return false;
+            }
+            views = replicas
                 .iter()
-                .map(|number| self.node(*number).applied(agent))
+                .map(|node| applied_rows(node, agent))
                 .collect();
-            applied.iter().all(Option::is_some) && applied.windows(2).all(|pair| pair[0] == pair[1])
+            views.iter().all(|(applied, _)| applied.is_some())
+                && views.windows(2).all(|pair| pair[0].0 == pair[1].0)
         });
-        let rows: Vec<Vec<(Vec<u8>, Vec<u8>)>> = replicas
-            .iter()
-            .map(|number| rows(self.node(*number), agent))
-            .collect();
-        assert!(rows.len() > 1, "fewer than two replicas to compare");
+        assert!(views.len() > 1, "fewer than two replicas to compare");
         assert!(
-            rows.windows(2).all(|pair| pair[0] == pair[1]),
-            "the replicas' rows differ"
+            views.windows(2).all(|pair| pair[0].1 == pair[1].1),
+            "the replicas' rows differ at applied index {:?}",
+            views[0].0
         );
     }
 
@@ -478,10 +483,20 @@ impl Hooks for WithholdBlobs {
     }
 }
 
+/// An agent's rows: each key and value.
+pub type Rows = Vec<(Vec<u8>, Vec<u8>)>;
+
 /// Every row of `agent`'s applied state on `node`.
-pub fn rows(node: &Node, agent: AgentId) -> Vec<(Vec<u8>, Vec<u8>)> {
+pub fn rows(node: &Node, agent: AgentId) -> Rows {
+    applied_rows(node, agent).1
+}
+
+/// `agent`'s applied index on `node` and its rows, from one store
+/// snapshot.
+pub fn applied_rows(node: &Node, agent: AgentId) -> (Option<u64>, Rows) {
     let snapshot = node.store().snapshot();
-    [[0x00u8], [0x01]]
+    let applied = snapshot.applied(agent).unwrap();
+    let rows = [[0x00u8], [0x01]]
         .iter()
         .flat_map(|prefix| {
             snapshot
@@ -489,7 +504,8 @@ pub fn rows(node: &Node, agent: AgentId) -> Vec<(Vec<u8>, Vec<u8>)> {
                 .map(Result::unwrap)
                 .collect::<Vec<_>>()
         })
-        .collect()
+        .collect();
+    (applied, rows)
 }
 
 /// Where `agent`'s log on `node` starts: the index it was compacted
