@@ -367,6 +367,17 @@ fn held_receiver(queue: usize, hold: &Arc<Holds>) -> Cluster {
 /// A resend round no test waits for.
 const ROUND: Duration = Duration::from_secs(20);
 
+/// Raises its flag when dropped, so a thread looping until the flag ends
+/// however the test does: a failed wait fails the test rather than leaving
+/// its scope waiting on the loop.
+struct Stopping<'a>(&'a AtomicBool);
+
+impl Drop for Stopping<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
 /// `sender`'s forwards of 1 to `target` at `sequences` of the cluster's
 /// session, called at node 1 together and answered.
 fn forwarded(cluster: &Cluster, sender: AgentId, target: AgentId, sequences: RangeInclusive<u64>) {
@@ -439,6 +450,7 @@ fn a_full_queues_drops_go_again_beside_a_steady_sender() {
     });
     let stop = AtomicBool::new(false);
     std::thread::scope(|scope| {
+        let stopping = Stopping(&stop);
         scope.spawn(|| {
             let mut sequence = 2;
             while !stop.load(Ordering::SeqCst) {
@@ -452,7 +464,7 @@ fn a_full_queues_drops_go_again_beside_a_steady_sender() {
             bulk.iter()
                 .all(|sender| cluster.read::<u64>(2, target, &keys::pair_in(*sender)) == Some(LAST))
         });
-        stop.store(true, Ordering::SeqCst);
+        drop(stopping);
         let took = released.elapsed();
         assert!(
             took < Duration::from_secs(5),
