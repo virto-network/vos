@@ -556,7 +556,7 @@ and fold layout of §1.1 is unchanged.
 | | value | tag |
 |---|---|---|
 | rows p2 / qm31 / h8 | 15,311 / 20,766 / 1,794 → 2^14 / 2^15 / 2^11, tallest **2^15** (≤ 2^17) | model |
-| own parameters | blowup 64, 18 queries, PoW 26, fold step 3, last layer 2^6, Blake2b-256 Merkle and channel | decided |
+| own parameters | blowup 64, 20 queries, PoW 26, interaction PoW 8, fold step 3, last layer 2^6, Blake2b-256 Merkle and channel, affine DEEP batching for 80 proven bits (`proving.md` §3.5) | decided (format 28) |
 | cells, extended cells | 7.5M, 481M | model |
 | memory, time | 2.2–4.9 GiB, 4.4–9.5 s unmasked; ×1.56–1.6 masked (c): 3.5–7.8 GiB | projected |
 | JAM gas, unmasked | 81.1M with the model's Blake2s; **85.2M Blake2b-256 in software (×1.05); 64.1M through `0x400` (×0.79)** | model (`R/spike4a-final-gas.md` §5, §7) |
