@@ -285,16 +285,21 @@ impl Cluster {
 
     /// [`Cluster::increment`] at `agent`'s leader, followed when it moves:
     /// a call sent again at its sequence runs once, and is answered from
-    /// the reply window when it already has.
+    /// the reply window when it already has. Each retry waits twice as long
+    /// as the last, from 10 ms, so an election has time to end.
     pub fn increment_at_leader(
         &self,
         agent: AgentId,
         sequence: u64,
         by: u64,
     ) -> Result<Reply, CallError> {
+        let mut backoff = Duration::from_millis(10);
         for _ in 0..10 {
             match self.increment(self.leader(agent), agent, sequence, by) {
-                Err(CallError::NotLeader(_)) => continue,
+                Err(CallError::NotLeader(_)) => {
+                    std::thread::sleep(backoff);
+                    backoff = (backoff * 2).min(Duration::from_millis(500));
+                }
                 reply => return reply,
             }
         }
