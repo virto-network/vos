@@ -837,55 +837,14 @@ pub fn expected_fiat_shamir_query_count(
     shape: ProofProtocolShape,
     expected_log_sizes: &[alloc::vec::Vec<u32>],
 ) -> Result<usize, alloc::string::String> {
-    use stwo::core::{
-        channel::MerkleChannel, circle::CirclePoint,
-        pcs::utils::prepare_preprocessed_query_positions, queries::draw_queries,
-    };
+    use stwo::core::pcs::utils::prepare_preprocessed_query_positions;
 
-    let mut channel = transcript_after_interaction.clone();
-    // Stwo verifier head: composition coefficient/root, then OODS point.
-    let _ = channel.draw_secure_felt();
-    let composition = stark_proof
-        .commitments
-        .get(PROOF_COMMITMENT_TREE_COUNT - 1)
-        .copied()
-        .ok_or_else(|| alloc::string::String::from("missing composition commitment"))?;
-    <crate::recursion_pcs::ProverMerkleChannel as MerkleChannel>::mix_root(
-        &mut channel,
-        composition,
-    );
-    let _ = CirclePoint::<SecureField>::get_random_point(&mut channel);
-
-    // CommitmentSchemeVerifier::verify_values prefix.
-    for tree in stark_proof.sampled_values.iter() {
-        for column in tree {
-            channel.mix_felts(column);
-        }
-    }
-    let _ = channel.draw_secure_felt();
-
-    let fri = &stark_proof.fri_proof;
-    <crate::recursion_pcs::ProverMerkleChannel as MerkleChannel>::mix_root(
-        &mut channel,
-        fri.first_layer.commitment,
-    );
-    let _ = channel.draw_secure_felt();
-    for layer in &fri.inner_layers {
-        <crate::recursion_pcs::ProverMerkleChannel as MerkleChannel>::mix_root(
-            &mut channel,
-            layer.commitment,
-        );
-        let _ = channel.draw_secure_felt();
-    }
-    channel.mix_felts(&fri.last_layer_poly);
-    channel.mix_u64(stark_proof.proof_of_work);
-    let mut positions = draw_queries(
-        &mut channel,
+    let positions = replay_query_positions(
+        &mut transcript_after_interaction.clone(),
+        stark_proof,
+        config,
         shape.lifting_log_size,
-        config.fri_config.n_queries,
-    );
-    positions.sort_unstable();
-    positions.dedup();
+    )?;
     if positions.len() != shape.query_count {
         return Err(alloc::string::String::from(
             "queried-value rows differ from Fiat-Shamir query positions",
@@ -911,6 +870,56 @@ pub fn expected_fiat_shamir_query_count(
     );
     validate_preprocessed_query_values(&remapped, &stark_proof.queried_values[0])?;
     Ok(positions.len())
+}
+
+/// Replay the pinned Stwo verifier's transcript on `channel`, from just after
+/// the interaction-tree commitment through the FRI query draw, in its order:
+/// `verify_ex`'s head, then `CommitmentSchemeVerifier::verify_values` and
+/// `FriVerifier::commit`. Returns the sorted, deduplicated query positions and
+/// leaves `channel` where the verifier's stands after its draw. The
+/// proof-of-work check reads the channel without changing it, so only the
+/// nonce's mix is replayed.
+fn replay_query_positions(
+    channel: &mut crate::recursion_pcs::ProverChannel,
+    stark_proof: &StarkProof<ProverMerkleHasher>,
+    config: &PcsConfig,
+    lifting_log_size: u32,
+) -> Result<Vec<usize>, alloc::string::String> {
+    use crate::recursion_pcs::ProverMerkleChannel;
+    use stwo::core::{channel::MerkleChannel, circle::CirclePoint, queries::draw_queries};
+
+    // `verify_ex`: the composition coefficient, the composition root, then the
+    // OODS point.
+    let _ = channel.draw_secure_felt();
+    let composition = stark_proof
+        .commitments
+        .get(PROOF_COMMITMENT_TREE_COUNT - 1)
+        .copied()
+        .ok_or_else(|| alloc::string::String::from("missing composition commitment"))?;
+    ProverMerkleChannel::mix_root(channel, composition);
+    let _ = CirclePoint::<SecureField>::get_random_point(channel);
+
+    // `verify_values`: every sampled value in one mix, flattened across trees
+    // and columns, then the DEEP coefficient.
+    channel.mix_felts(&stark_proof.sampled_values.clone().flatten_cols());
+    let _ = channel.draw_secure_felt();
+
+    // `FriVerifier::commit`: each layer's root and folding coefficient, then
+    // the last layer.
+    let fri = &stark_proof.fri_proof;
+    for commitment in core::iter::once(fri.first_layer.commitment)
+        .chain(fri.inner_layers.iter().map(|layer| layer.commitment))
+    {
+        ProverMerkleChannel::mix_root(channel, commitment);
+        let _ = channel.draw_secure_felt();
+    }
+    channel.mix_felts(&fri.last_layer_poly);
+
+    channel.mix_u64(stark_proof.proof_of_work);
+    let mut positions = draw_queries(channel, lifting_log_size, config.fri_config.n_queries);
+    positions.sort_unstable();
+    positions.dedup();
+    Ok(positions)
 }
 
 fn validate_preprocessed_query_values(
@@ -961,6 +970,165 @@ mod hostile_query_tests {
             ]],
         )
         .unwrap();
+    }
+}
+
+/// The preflight's replay against the pinned Stwo verifier itself, on a toy
+/// AIR whose proof samples many columns across the main, interaction and
+/// composition trees.
+#[cfg(all(test, feature = "prover"))]
+mod query_replay_tests {
+    use super::{
+        ProofProtocolShape, derive_protocol_degree_shape, expected_fiat_shamir_query_count,
+        replay_query_positions,
+    };
+    use crate::recursion_pcs::{ProverBackend, ProverChannel, ProverMerkleChannel};
+    use crate::trace::eval::INTERACTION_TRACE_IDX;
+    use num_traits::{One, Zero};
+    use stwo::core::air::Component;
+    use stwo::core::channel::Channel;
+    use stwo::core::fields::{m31::BaseField, qm31::SecureField};
+    use stwo::core::fri::FriConfig;
+    use stwo::core::pcs::{CommitmentSchemeVerifier, PcsConfig};
+    use stwo::core::poly::circle::CanonicCoset;
+    use stwo::core::verifier::verify;
+    use stwo::prover::poly::{
+        BitReversedOrder,
+        circle::{CircleEvaluation, PolyOps},
+    };
+    use stwo::prover::{CommitmentSchemeProver, prove};
+    use stwo_constraint_framework::{
+        EvalAtRow, FrameworkComponent, FrameworkEval, TraceLocationAllocator,
+    };
+
+    const LOG_N_ROWS: u32 = 5;
+    const MAIN_COLUMNS: usize = 12;
+
+    /// Each main column is the sum of the two before it; the one interaction
+    /// column repeats the last main column.
+    #[derive(Clone)]
+    struct SumEval;
+
+    impl FrameworkEval for SumEval {
+        fn log_size(&self) -> u32 {
+            LOG_N_ROWS
+        }
+        fn max_constraint_log_degree_bound(&self) -> u32 {
+            LOG_N_ROWS + 1
+        }
+        fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
+            let mut a = eval.next_trace_mask();
+            let mut b = eval.next_trace_mask();
+            for _ in 2..MAIN_COLUMNS {
+                let c = eval.next_trace_mask();
+                eval.add_constraint(c.clone() - (a + b.clone()));
+                a = b;
+                b = c;
+            }
+            let [copy] = eval.next_interaction_mask(INTERACTION_TRACE_IDX, [0]);
+            eval.add_constraint(copy - b);
+            eval
+        }
+    }
+
+    fn evaluations(
+        columns: Vec<Vec<BaseField>>,
+    ) -> Vec<CircleEvaluation<ProverBackend, BaseField, BitReversedOrder>> {
+        let domain = CanonicCoset::new(LOG_N_ROWS).circle_domain();
+        columns
+            .into_iter()
+            .map(|values| CircleEvaluation::new(domain, values.into_iter().collect()))
+            .collect()
+    }
+
+    /// The replay leaves its channel where Stwo's verifier leaves its own after
+    /// drawing the queries, so both drew the same positions. Mixing the
+    /// sampled values one column at a time, rather than in Stwo's one
+    /// flattened mix, fails here on any proof with more than one sampled
+    /// column. Forty queries on a 64-point domain also repeat positions, so
+    /// the deduplicated count is checked against the queried rows.
+    #[test]
+    fn the_replay_draws_the_verifiers_query_positions() {
+        let config = PcsConfig {
+            pow_bits: 4,
+            fri_config: FriConfig::new(0, 1, 40, 1),
+            lifting_log_size: None,
+        };
+        let twiddles = ProverBackend::precompute_twiddles(
+            CanonicCoset::new(LOG_N_ROWS + 1 + config.fri_config.log_blowup_factor)
+                .circle_domain()
+                .half_coset,
+        );
+        let rows: Vec<[BaseField; MAIN_COLUMNS]> = (0..1u32 << LOG_N_ROWS)
+            .map(|row| {
+                let mut values = [BaseField::one(); MAIN_COLUMNS];
+                values[1] = BaseField::from(row);
+                for column in 2..MAIN_COLUMNS {
+                    values[column] = values[column - 2] + values[column - 1];
+                }
+                values
+            })
+            .collect();
+        let main = (0..MAIN_COLUMNS)
+            .map(|column| rows.iter().map(|row| row[column]).collect())
+            .collect();
+        let interaction = alloc::vec![rows.iter().map(|row| row[MAIN_COLUMNS - 1]).collect()];
+
+        let prover_channel = &mut ProverChannel::default();
+        let mut prover =
+            CommitmentSchemeProver::<ProverBackend, ProverMerkleChannel>::new(config, &twiddles);
+        for tree in [Vec::new(), evaluations(main), evaluations(interaction)] {
+            let mut builder = prover.tree_builder();
+            builder.extend_evals(tree);
+            builder.commit(prover_channel);
+        }
+        let component = FrameworkComponent::new(
+            &mut TraceLocationAllocator::default(),
+            SumEval,
+            SecureField::zero(),
+        );
+        let proof =
+            prove::<ProverBackend, ProverMerkleChannel>(&[&component], prover_channel, prover)
+                .expect("the toy AIR proves");
+
+        let log_sizes = component.trace_log_degree_bounds();
+        let channel = &mut ProverChannel::default();
+        let mut verifier = CommitmentSchemeVerifier::<ProverMerkleChannel>::new(config);
+        for (commitment, tree_log_sizes) in proof.commitments.iter().zip(log_sizes.iter()) {
+            verifier.commit(*commitment, tree_log_sizes, channel);
+        }
+        let after_interaction = channel.clone();
+        verify(&[&component], channel, &mut verifier, proof.clone()).expect("Stwo verifies");
+
+        let (lifting_log_size, max_log_degree_bound) =
+            derive_protocol_degree_shape(&config, LOG_N_ROWS + 1).unwrap();
+        let replayed = &mut after_interaction.clone();
+        let positions =
+            replay_query_positions(replayed, &proof, &config, lifting_log_size).unwrap();
+        assert_eq!(
+            replayed.draw_u32s(),
+            channel.draw_u32s(),
+            "the replay's transcript differs from Stwo's verifier's after the query draw"
+        );
+
+        let query_count = proof.queried_values[1][0].len();
+        assert!(query_count < config.fri_config.n_queries);
+        assert_eq!(positions.len(), query_count);
+        let shape = ProofProtocolShape {
+            lifting_log_size,
+            max_log_degree_bound,
+            query_count,
+        };
+        assert_eq!(
+            expected_fiat_shamir_query_count(
+                &after_interaction,
+                &proof,
+                &config,
+                shape,
+                &log_sizes
+            ),
+            Ok(query_count)
+        );
     }
 }
 
