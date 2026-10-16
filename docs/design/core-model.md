@@ -253,8 +253,9 @@ impl Ledger {
   ELF's hash. Derived hashes are per transpiler version, so two spaces
   agree on a kernel's hash only when they derive with the same version.
   It also names its target, VOS or JAM, whose limits its statics were
-  checked against and its steps run within (section 12). An installed
-  program is never transpiled again.
+  checked against and its steps run within (section 12): the agent's,
+  which its first install records, and every later install must name. An
+  installed program is never transpiled again.
 - Installing creates an actor instance with an id, the package hash and a
   state namespace.
 - Upgrade drain rule: new invocations use the new program immediately.
@@ -1062,13 +1063,18 @@ These form a prover track that runs alongside the core slices (section 16).
       page's hash;
     - a resumed workflow's package imports its pages by segment root,
       and refine checks them;
-    - DA retention is finite, so a workflow of an instance installed
-      for JAM keeps its pages a day past storing the oldest it holds
-      (`Limits::pages_kept`): a step due later ends it `Expired`,
-      deterministically and without importing them, its pages dropped.
-      Its record keeps the batch time from which every page it holds
-      has been stored. One installed for VOS that waits past DA's
-      retention stays due, and the builder leaves it out.
+    - DA retention is finite: the imports DA (the D³L) keeps an exported
+      segment at least 28 days (672 epochs) after the report of the
+      package that exported it (Gray Paper 0.8.0, §14.3.1; §16 for
+      assurers). So a workflow on JAM keeps its pages 27 days past
+      storing the oldest it holds (`cap::JAM_PAGES_KEPT`), a day's margin
+      for a report coming before its batch time and a resuming refine
+      after it, each by at most the session skew and a few slots: a step
+      due later ends it `Expired`, deterministically and without
+      importing them, its pages dropped. Its record keeps the batch time
+      from which every page it holds has been stored. A workflow whose
+      pages DA lacks within that keep stays due, and the builder leaves
+      it out.
   - **Programs are derived from the actor's ELF** (section 6.4) and
     provided as preimages, solicited by the agent.
   - **Messages between agents on JAM,** as transfers with small memos
@@ -1090,28 +1096,33 @@ These form a prover track that runs alongside the core slices (section 16).
     node refines with while the batch can shrink, and refuses a chain
     whose refine gas gives less;
   - finds the workflows whose pages DA no longer holds in one pass.
-- **A workflow holds at most 576 pages (2.25 MiB)** (`cap::HELD_PAGES`):
-  the builder asserts at compile time that the step ending such a
-  workflow fits a package (about 913M of 950M usable).
-- **Limits per target** [decided by the owner]. An install names its
-  target, VOS or JAM, and the agent holds the instance to that target's
-  limits (`cap::Limits`) on every host, so a builder's simulation, the
-  JAM refine and a VOS node replaying the batch agree:
+- **A workflow holds at most 576 pages (2.25 MiB)** on VOS
+  (`cap::HELD_PAGES`), and 64 on JAM: the builder asserts at compile time
+  that the worst step on JAM, ending a workflow that holds them all with
+  its effects at their limits, fits a package (about 839M of 950M
+  usable); at VOS's caps the ending alone takes about 913M.
+- **Limits per target** [decided by the owner]. An agent runs on one
+  host, so its target, VOS or JAM, is the agent's: its first install
+  records it (`keys::target`), a later install naming another is refused
+  (`Failure::Target`), and a JAM builder takes installs for JAM alone.
+  The agent holds every instance to its target's limits (`cap::Limits`)
+  on every host, so a builder's simulation, the JAM refine and a VOS
+  node replaying the batch agree. A refused install's detail says why
+  (`cap::Refused`), and the operator's CLI prints it:
   - **a step's effects:** a step's writes, messages and attests at VOS's
     caps cost up to about 1.4e9 of a package's own work on JAM, past its
     refine gas. JAM's limits take that about 35-fold lower (16 KiB of
     writes in at most 128 rows, 8 messages and 8 attests of 2 KiB each),
-    and the builder asserts that the worst step of an instance installed
-    for JAM, holding every page, fits a package. An instance installed
-    for VOS keeps VOS's caps, where a lone step past its keep fails `Cap`
-    on JAM only;
+    and the builder asserts that the worst step on JAM, holding every
+    page, fits a package;
   - **a workflow's memory:** 256 pages its program may write, 64 held,
     256 KiB written a step;
   - **checked at install** (`Cap` past them): the pages the program may
-    write, its bytes (512 KiB), its kernels (32), and each attestable
-    method's gas limit, which bounds its kernel's BLAKE2b compressions,
-    each served in software on JAM, to 4,096; a kernel runs within that
-    limit.
+    write, its bytes (512 KiB), its kernels (32), and the gas each
+    attestable method declares (`#[attestable(gas = N)]`), at most what
+    4,096 BLAKE2b compressions, each served in software on JAM, pay for:
+    2,457,600. One declaring none takes that most. A kernel on JAM runs
+    within the least of its caller's gas, its method's and that most.
   - **One page price everywhere:** the limits cap a step and never price
     it; VOS pays JAM's page prices.
 - **The first end-to-end run held on a PolkaJam testnet** (slice 4,
@@ -1184,7 +1195,13 @@ These form a prover track that runs alongside the core slices (section 16).
   on VOS in the pool's price by pages); a workflow's machine maps the
   rest past them (`Derivation::heap`), armed with its writable pages. So
   a kernel's memory is laid out by its program alone, the same whatever
-  heap its actor declares, and a handler past 512 KiB traps.
+  heap its actor declares. The allocator gives a handler or a kernel the
+  arena's first 512 KiB alone (`abi::INVOCATION_HEAP`, the SDK's default
+  heap): past them its allocation fails and the step traps, `Trapped`,
+  at the allocation, whether or not it would touch the memory. A
+  workflow's entry marks it, and it allocates from the whole arena. A
+  derivation refuses an ELF whose arena does not end its read-write data
+  from a page.
 
 ## 15. Worked examples
 
@@ -1389,7 +1406,8 @@ knowledge and aggregation are the longest work and gate goal 8.
 9. Licensing model, metering, bytecode visibility.
 10. Agent placement and rebalancing.
 11. Upgrades: state migration for actors.
-12. JAM witness format; DA retention for long-waiting workflows.
+12. JAM witness format. (DA retention for long-waiting workflows:
+    decided, section 12, from the Gray Paper's 28 days.)
 13. Devices running merge handlers locally (local-first) versus thin
     clients.
 14. Workflow deadline defaults and timer precision; session expiry and the

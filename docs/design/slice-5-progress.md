@@ -170,13 +170,18 @@ not on `vos-core`), 5 segments, `RAYON_NUM_THREADS=8`, under
 ### Per-target limits (the owner's decision)
 
 **Built:**
-- **An install names its target,** VOS or JAM (`cap::Target`), in
-  `Admin::Install` and the `Installed` record; a workflow keeps its
-  instance's in its record (format 5). The agent and the model hold an
-  instance to its target's `cap::Limits` on every host, so a builder's
-  simulation, the JAM refine and a VOS node replaying the batch agree.
-  A step runs within the limits of the instance it enters, its nested
-  calls too.
+- **An agent runs on one target,** VOS or JAM (`cap::Target`): an
+  agent runs on one host, so every instance installed into it takes its
+  target. Its first install records it (`keys::target`); a later install
+  naming another is refused, `Failure::Target` (13), and a JAM builder
+  takes installs for JAM alone (`Error::Target`). `Admin::Install` and the
+  `Installed` record name it; a workflow keeps it in its record (format
+  5). The agent and the model hold every instance to the target's
+  `cap::Limits` on every host, so a builder's simulation, the JAM refine
+  and a VOS node replaying the batch agree. A refused install's detail
+  is a `cap::Refused`, naming the limit and the figure, which the
+  operator's CLI prints. An install now reads applied state, the
+  agent's target: a host serving none traps on it, as on a request.
 - **JAM's limits** (`cap::JAM`), each within VOS's (asserted):
 
   | | VOS | JAM |
@@ -187,7 +192,7 @@ not on `vos-core`), 5 segments, `RAYON_NUM_THREADS=8`, under
   | Pages a workflow's program may write | 4,096 | 256 |
   | Pages a step writes, pages held | 8 MiB, 576 | 256 KiB, 64 |
   | Checked at install: pages, program, kernels | — , 64 MiB, 1,024 | 256 (the whole heap), 512 KiB, 32 |
-  | A kernel's BLAKE2b compressions | the caller's gas | 4,096: its method's gas limit over 600 |
+  | A kernel's gas | the caller's | the least of the caller's, its method's and 2,457,600 (4,096 compressions at 600) |
 
 - **Derived from slice 4's budgets** (model, `vos_jam::gas::effects`): at
   VOS's caps a step's effects take up to about 1.40e9 gas of a package's
@@ -196,21 +201,43 @@ not on `vos-core`), 5 segments, `RAYON_NUM_THREADS=8`, under
   JAM workflow holds and ending it, with its effects at their limits, is
   839M of the 950M usable, asserted at compile time. The worst VOS
   ending with its effects is about 2.31e9.
-- **`#[attestable(gas = N)]`** declares a kernel's limit. On JAM a
-  kernel runs within it, so its compressions, each served in software
-  (`PRECOMPILE_SERVING`), are bounded at install.
+- **`#[attestable(gas = N)]`** declares a kernel's gas. On JAM a kernel
+  runs within the least of the caller's gas, the declared gas and
+  2,457,600 (`Limits::kernel_gas`), what 4,096 compressions, each served
+  in software (`PRECOMPILE_SERVING`), pay for; one declaring none takes
+  2,457,600, and one declaring more is refused at install, by the agent
+  (`Refused::KernelGas`) and, naming the method, by `vos_jam`'s
+  derivation. The least holds even were an attesting instance's target
+  another than the step's.
+- **An attest is served apart** from the inlined frame a nested call
+  takes a level (`Invocation::attest`, `#[inline(never)]`): computing its
+  kernel's gas inline grew that frame past what 63 levels of the agent's
+  stack hold.
 - **One page price everywhere,** unchanged: the limits cap a step and
   never price it.
 - **The JAM testnet** installs its actors for JAM, the shop built with
-  the default heap (`lean`).
+  the default heap (`lean`). So do the paired JAM tests, now for JAM
+  throughout; those that drove VOS's caps on JAM drive JAM's: the
+  budget lowered by four steps of 120 distinct puts, the ending at 56 of
+  JAM's 64 pages beside 32 such steps (7 fit), the segments by 64
+  computations of 48 pages, and an upgrade to the shop with a 640 KiB
+  heap (`compact`).
 
 **Tests:**
 - at the edge of each JAM effect limit and one past it (messages, rows,
-  bytes): `Cap` for JAM alone, on a VOS node and on the JAM-only host,
-  as the model;
-- an install past JAM's page limit (the shop's 4 MiB heap) and one whose
-  attestable's default gas limit pays for 16,666 compressions are
-  refused, `Cap`, with no record written; the default-heap shop installs;
+  bytes written; attests, 8 against 9, their arguments and their output,
+  2 KiB against 2 KiB and a byte): `Cap` for JAM alone, on a VOS node and
+  on the JAM-only host, as the model;
+- a kernel past its declared 50,000 gas fails the step `OutOfGas` on JAM,
+  and runs on VOS;
+- installs past JAM's static limits are refused, `Cap`, each with its
+  `Refused` detail and no record written: the pages (the shop's 4 MiB
+  heap), the kernels (33), the program's bytes (640 KiB of data), and an
+  attestable declaring 3,000,000 gas; the ledger, its attestable
+  declaring none, and the default-heap shop install;
+- an install for another target than its agent's is refused, `Target`;
+  a refused first install records none;
+- the builder refuses an install for VOS, its store untouched;
 - a JAM workflow past its step's pages, and past its held pages, fails
   `Cap`; the same for VOS pauses;
 - derived kernels run for both targets on both hosts, as the model;
@@ -226,17 +253,21 @@ is a duty of the builder's, and a workflow whose builder was away past
 retention would wait for good.
 
 **Built:**
-- JAM keeps a workflow's pages a day (`Limits::pages_kept`), well
-  within JAM's imports DA. A workflow's record keeps the batch time
-  from which every page it holds has been stored (`Workflow::stored`):
-  its start's, then that of a step after which it holds no page an
-  earlier step stored. A conservative bound, by one time per record,
+- JAM keeps a workflow's pages 27 days (`cap::JAM_PAGES_KEPT`): the
+  imports DA, the D³L, keeps an exported segment at least 28 days (672
+  epochs) after the report of the package that exported it (Gray Paper
+  0.8.0, §14.3.1, and §16 for assurers), less a day's margin for a report
+  before its batch time and a resuming refine after it, each by at most
+  the session skew and a few slots. A workflow's record keeps the batch
+  time from which every page it holds has been stored
+  (`Workflow::stored`): its start's, then that of a step after which it
+  holds no page an earlier step stored. A conservative bound, by one time per record,
   never a page's own.
 - A step due at or past `stored` plus the keep, while the workflow
   holds pages, ends it `Failure::Expired` (12) without restoring or
   importing them, its pages dropped and its owner told.
 - The builder no longer leaves such a workflow out of a sweep; one whose
-  pages DA lacks earlier still waits, as one installed for VOS does.
+  pages DA lacks within the keep still waits.
 
 **Tests:** a JAM workflow resumed just within the keep and one just past
 it, on both hosts, as the model; the builder over the emulated chain,
@@ -252,7 +283,20 @@ DA emptied: the workflow left out within the keep, then ended
 - **The derivation** (transpiler version 2) holds the arena's first 512
   KiB (`INVOCATION_HEAP`) in the actor's program and in each kernel, all
   a handler or a kernel maps, and records the pages past them,
-  `Derivation::heap`. A handler past 512 KiB faults and traps.
+  `Derivation::heap`. An ELF whose arena does not end its read-write data
+  from a page is refused (`DeriveError::Heap`), no longer derived whole.
+- **One constant:** `vos_wire::abi::INVOCATION_HEAP`, which the
+  compiler's `INVOCATION_HEAP` and the SDK's default heap,
+  `PROGRAM_HEAP`, both are.
+- **The allocator knows the invocation:** in an actor's program
+  (`Heap::actor`) it gives a handler or a kernel the arena's first 512
+  KiB alone, so an allocation past them fails at once, Rust's
+  allocation-failure path, and the step traps, `Trapped`, whether or not
+  the memory would be touched; before, it bumped into pages the program
+  does not map, and only a store there faulted. A workflow's dispatch
+  arm marks the invocation first (`heap::whole_arena`), its snapshot
+  keeping the mark, and it allocates from the whole arena. The agent's
+  own heap and other programs' (`program_runtime!` alone) are whole.
 - **A workflow's machine** maps those pages itself past its program's
   read-write data, zeroed, and arms them with its writable pages: its
   record's `writable` counts them, so `ARM_PAGE` pays for them.
@@ -269,36 +313,45 @@ DA emptied: the workflow left out within the keep, then ended
   leaves out, which are exactly the arena's past 512 KiB;
 - a workflow computing over 1 MiB on the derived shop runs to its end
   beside a handler, on both hosts, as the model maps the same pages;
+- a handler of an actor with a 2 MiB heap (`ample`) reserving 1 MiB it
+  never touches traps, and reserving 256 KiB runs, as the model; a
+  workflow reserving 1 MiB runs to its end; the allocator's own test, an
+  actor's heap against a program's;
+- an arena moved off its page, and another writable section named
+  `.vos_heap`, are refused;
 - the derivation the same in every process; the pins.
 
 ### Measurements
 
 Measured with the processes bench (`ROWS=resume` and `ROWS=catch-up`),
-on the reference laptop's pinning, on the slice's base (b7c4fd69): the
-paths measured run on VOS and are unchanged since. Quiet runs only,
-load 1.7–5.2; runs under other agents' builds (load 8–24) gave medians
-of 2–21 ms and were discarded. The leader runs in the bench's process,
-so it can deliver replies itself as the one-node bench does; its
-followers are `vos node run` processes over QUIC.
+on the reference laptop's pinning, on this step's code (92337a67), so
+after 5373e6cf changed how a workflow is restored: its machine maps the
+heap its program leaves out. Under `nice -n 10` and a 16 GiB scope, on a
+quiet machine, load 0.4–2.9. The leader runs in the bench's process, so
+it can deliver replies itself as the one-node bench does; its followers
+are `vos node run` processes over QUIC. A first pass, on the slice's
+base (b7c4fd69) and so before 5373e6cf, gave the same figures within
+their spread (medians 1.77–1.92 ms on three nodes, 1.25–1.30 ms alone;
+catch-up past the tail 2.24–2.55 s).
 
 | A workflow's resume, a reply in to its step applied | Median | p99 |
 |---|---|---|
-| Three nodes, synced commits on NVMe (4 runs) | 1.77–1.92 ms | 2.48–2.77 ms |
-| Node 1 alone, the same runs | 1.25–1.30 ms | 1.96–3.43 ms |
-| Three nodes, stores on tmpfs (2 runs) | 0.92–0.97 ms | 1.77–1.81 ms |
-| Node 1 alone, tmpfs | 0.69–0.72 ms | 1.13–1.29 ms |
+| Three nodes, synced commits on NVMe (4 runs) | 1.73–1.79 ms | 2.55–3.34 ms |
+| Node 1 alone, the same runs | 1.18–1.22 ms | 1.95–2.80 ms |
+| Three nodes, stores on tmpfs (2 runs) | 0.91–0.98 ms | 1.80–1.88 ms |
+| Node 1 alone, tmpfs | 0.70–0.71 ms | 1.02–1.27 ms |
 
 - 603 resumes a row. Replication adds about 0.45 ms to the commit on
-  disk (920–980 µs against 500–550 µs): the QUIC round trip and the
+  disk (925–966 µs against 481–514 µs): the QUIC round trip and the
   follower's synced flush beside the leader's own. The step's refine,
-  restoring the workflow, takes 0.5–0.65 ms; queueing, proposing and
+  restoring the workflow, takes 0.47–0.59 ms; queueing, proposing and
   applying about 0.15 ms.
 
 | A follower's catch-up (4 runs) | Within the kept tail | Beyond it |
 |---|---|---|
 | Missed while down | 40 fills, 9.6 MB of results in 5 entries | 224–232 fills, 54–56 MB in 28–29 entries |
-| Names its leader | 0.24–0.27 s | 0.49–0.59 s |
-| Has applied the leader's commit | 0.95–0.96 s, from the log | 2.24–2.55 s, from a snapshot |
+| Names its leader | 0.22–0.27 s | 0.58–0.61 s |
+| Has applied the leader's commit | 0.92–0.96 s, from the log | 2.32–2.35 s, from a snapshot |
 
 - **The settings** (`vos_node::Config`): compaction once 1,024 entries
   or 64 MiB, a large result counted by its blob, are applied durably; a
@@ -306,11 +359,10 @@ followers are `vos node run` processes over QUIC.
   MiB; a result of 64 KiB or more stored as a blob.
 - The kept tail held 9–10 results of about 1.9 MB (measured), so 4.4c's
   "4 to 8" was for results of 2–4 MB.
-- The snapshot carried 401–409 rows, 0.25 MB: the agent's state, not
-  the log missed. About 1.7–2.0 s of the catch-up passes between naming
-  the leader and installing it, which fits a stream begun while the
-  follower was down, resent every 2 s (`CHUNK_RESEND`) (model, from the
-  code).
+- The snapshot carried 402–410 rows, 0.25 MB: the agent's state, not
+  the log missed. About 1.7 s of the catch-up passes between naming the
+  leader and installing it, which fits a stream begun while the follower
+  was down, resent every 2 s (`CHUNK_RESEND`) (model, from the code).
 
 ### Ristretto ids 110–114
 
@@ -347,6 +399,8 @@ ids, beside BLAKE2b's precompile, which derives.
 
 - **A cluster test's flake, fixed:** under load the compaction test's
   leader moved while it sent its fifty increments; each is now sent
-  again at its sequence to whichever node leads.
+  again at its sequence to whichever node leads, waiting 10 ms before the
+  first retry and twice as long before each next, to 500 ms, so an
+  election has time to end.
 
-**Gates:** `just check` on each commit, 990 tests at the last; the node suites at the end: cluster and processes in it, the faults process tests and the five-process fault suite.
+**Gates:** `just check` on each commit, 995 tests at the last; the node suites at the end: cluster and processes in it, the faults process tests and the five-process fault suite.
