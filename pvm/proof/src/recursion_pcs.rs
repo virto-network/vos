@@ -13,12 +13,9 @@
 //!
 //! Backend note: both stacks prove on `SimdBackend`. The Poseidon2-M31 PCS
 //! satisfies `BackendForChannel<P2MerkleChannel>` on `SimdBackend` via the
-//! orphan-legal impls in [`crate::poseidon2`] (their `MerkleOpsLifted` /
-//! `GrindOps` bodies move columns to `CpuBackend` only for the scalar merkle
-//! hash), so the whole prove — FRI, quotients, twiddles — stays vectorized
-//! under either PCS. Retargeting the entire commit+prove to `CpuBackend`
-//! instead forfeits SIMD across the board and proves an order of magnitude
-//! slower, so only the leaf hash, which has no SIMD form here, runs on CPU.
+//! orphan-legal impls in [`crate::poseidon2`], whose `MerkleOpsLifted` /
+//! `GrindOps` bodies hash sixteen permutations at once, so the whole prove —
+//! commitments, FRI, quotients, twiddles — stays vectorized under either PCS.
 
 // ── Production stack: Blake2s commit + Blake2s Fiat-Shamir on SimdBackend ──
 #[cfg(not(feature = "poseidon2-channel"))]
@@ -65,10 +62,8 @@ pub fn commitment_bytes(h: &ProverMerkleHash) -> [u8; 32] {
 //
 // Trace + interaction generation always ride `SimdBackend` (the framework's
 // `ComponentTrace` / `LogupTraceGenerator` are SimdBackend-typed), and both
-// stacks now commit on `SimdBackend`, so the committed columns already match
-// the commitment scheme's backend: `for_commit` is identity under either PCS.
-// (It is retained as the seam where a future SIMD Poseidon2-M31 column packing
-// would live, should the merkle hash itself need vectorizing.)
+// stacks commit on `SimdBackend`, so the committed columns already match the
+// commitment scheme's backend: `for_commit` is identity under either PCS.
 #[cfg(feature = "prover")]
 mod transplant {
     use alloc::vec::Vec;

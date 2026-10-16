@@ -10,15 +10,13 @@
 //! A toy AIR proves+verifies with the Poseidon2-M31 channel as the Fiat-Shamir
 //! transcript AND a Poseidon2-M31 Merkle commitment — no Blake2s on either path
 //! — plus channel-determinism checks (a fresh channel draws reproducibly; mixing
-//! changes subsequent draws). The permutation here uses placeholder round
-//! constants `1234`: this test exercises only the transcript PLUMBING, so prover
-//! and verifier run the same channel and agree by construction regardless of
-//! constant quality. The vetted width-16 M31 constants are pinned separately in
-//! `poseidon2_round_constants.rs`.
+//! changes subsequent draws). The permutation here is the library's arrangement
+//! under placeholder round constants `1234`: this test exercises only the
+//! transcript PLUMBING, so prover and verifier run the same channel and agree by
+//! construction regardless of constant quality. The vetted width-16 M31
+//! constants are pinned separately in `poseidon2_round_constants.rs`.
 //!
 //! Run: `cargo test -p vos-pvm-proof --test poseidon2_m31_channel -- --nocapture`
-
-use std::ops::{Add, AddAssign, Mul, Sub};
 
 use num_traits::{One, Zero};
 use serde::{Deserialize, Serialize};
@@ -38,94 +36,21 @@ use stwo::prover::{CommitmentSchemeProver, prove};
 use stwo_constraint_framework::{
     EvalAtRow, FrameworkComponent, FrameworkEval, TraceLocationAllocator,
 };
+use vos_pvm_proof::poseidon2::{self, FULL_ROUNDS, N_PARTIAL_ROUNDS};
 
 // ── Poseidon2-over-M31 permutation (width 16) ─────────────────────────────
 
 const N_STATE: usize = 16;
-const N_PARTIAL_ROUNDS: usize = 14;
-const N_HALF_FULL_ROUNDS: usize = 4;
 const RATE: usize = 8;
 
-const EXTERNAL_ROUND_CONSTS: [[BaseField; N_STATE]; 2 * N_HALF_FULL_ROUNDS] =
-    [[BaseField::from_u32_unchecked(1234); N_STATE]; 2 * N_HALF_FULL_ROUNDS];
+const EXTERNAL_ROUND_CONSTS: [[BaseField; N_STATE]; FULL_ROUNDS] =
+    [[BaseField::from_u32_unchecked(1234); N_STATE]; FULL_ROUNDS];
 const INTERNAL_ROUND_CONSTS: [BaseField; N_PARTIAL_ROUNDS] =
     [BaseField::from_u32_unchecked(1234); N_PARTIAL_ROUNDS];
 
-fn apply_m4<F>(x: [F; 4]) -> [F; 4]
-where
-    F: Clone + AddAssign<F> + Add<F, Output = F> + Sub<F, Output = F> + Mul<BaseField, Output = F>,
-{
-    let t0 = x[0].clone() + x[1].clone();
-    let t02 = t0.clone() + t0.clone();
-    let t1 = x[2].clone() + x[3].clone();
-    let t12 = t1.clone() + t1.clone();
-    let t2 = x[1].clone() + x[1].clone() + t1.clone();
-    let t3 = x[3].clone() + x[3].clone() + t0.clone();
-    let t4 = t12.clone() + t12.clone() + t3.clone();
-    let t5 = t02.clone() + t02.clone() + t2.clone();
-    let t6 = t3.clone() + t5.clone();
-    let t7 = t2.clone() + t4.clone();
-    [t6, t5, t7, t4]
-}
-
-fn apply_external_round_matrix(state: &mut [BaseField; 16]) {
-    for i in 0..4 {
-        [
-            state[4 * i],
-            state[4 * i + 1],
-            state[4 * i + 2],
-            state[4 * i + 3],
-        ] = apply_m4([
-            state[4 * i],
-            state[4 * i + 1],
-            state[4 * i + 2],
-            state[4 * i + 3],
-        ]);
-    }
-    for j in 0..4 {
-        let s = state[j] + state[j + 4] + state[j + 8] + state[j + 12];
-        for i in 0..4 {
-            state[4 * i + j] += s;
-        }
-    }
-}
-
-fn apply_internal_round_matrix(state: &mut [BaseField; 16]) {
-    let sum = state[1..].iter().copied().fold(state[0], |acc, s| acc + s);
-    state.iter_mut().enumerate().for_each(|(i, s)| {
-        *s = *s * BaseField::from_u32_unchecked(1 << (i + 1)) + sum;
-    });
-}
-
-fn pow5(x: BaseField) -> BaseField {
-    let x2 = x * x;
-    x2 * x2 * x
-}
-
+/// The library's arrangement under the placeholder constants.
 fn permute(state: &mut [BaseField; N_STATE]) {
-    for round in 0..N_HALF_FULL_ROUNDS {
-        for i in 0..N_STATE {
-            state[i] += EXTERNAL_ROUND_CONSTS[round][i];
-        }
-        apply_external_round_matrix(state);
-        for s in state.iter_mut() {
-            *s = pow5(*s);
-        }
-    }
-    for round in 0..N_PARTIAL_ROUNDS {
-        state[0] += INTERNAL_ROUND_CONSTS[round];
-        apply_internal_round_matrix(state);
-        state[0] = pow5(state[0]);
-    }
-    for round in 0..N_HALF_FULL_ROUNDS {
-        for i in 0..N_STATE {
-            state[i] += EXTERNAL_ROUND_CONSTS[round + N_HALF_FULL_ROUNDS][i];
-        }
-        apply_external_round_matrix(state);
-        for s in state.iter_mut() {
-            *s = pow5(*s);
-        }
-    }
+    poseidon2::permute_with(state, &EXTERNAL_ROUND_CONSTS, &INTERNAL_ROUND_CONSTS);
 }
 
 // ── Poseidon2-M31 Merkle hasher (the PCS commitment) ──────────────────────

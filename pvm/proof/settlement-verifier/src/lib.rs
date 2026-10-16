@@ -12,19 +12,18 @@
 //!   * the width-16 Poseidon2-M31 permutation + the `MerkleHasherLifted`
 //!     (`P2MerkleHasher`) the inner proofs are committed under,
 //!   * the Poseidon2-M31 Fiat-Shamir `Channel` (`Poseidon2M31Channel`) + its
-//!     `MerkleChannel` (`P2MerkleChannel`),
-//!   * the degree-2 flattened permutation AIR fragment (`eval_permutation`) the
-//!     verifier re-evaluates at OODS — generic over `EvalAtRow`, so it is the
-//!     same code path a join-AIR `FrameworkEval` runs under `verify()`.
+//!     `MerkleChannel` (`P2MerkleChannel`).
 //!
 //! It DROPS everything prover-side: the `BackendForChannel`/`CpuBackend`
 //! commitment ops, the SIMD→CPU transplant, the host trace recorder, and any
 //! `std`/`rayon`/`blst` dependency (the latter only ever entered transitively
 //! via `vos_pvm`, which this crate does not depend on).
 //!
-//! Round constants are SYNCED from the prover's canonical Grain-LFSR arrays
-//! (`pvm/proof/src/poseidon2/mod.rs`), so this verifier accepts REAL proofs — they
-//! must stay byte-identical to the prover's or every honest proof is rejected.
+//! The permutation (the reference Poseidon2 arrangement with Plonky3's width-16
+//! M31 parameters), its round constants and its linear layers are SYNCED from
+//! the prover's source of truth (`pvm/proof/src/poseidon2/mod.rs`), so this
+//! verifier accepts REAL proofs — they must stay byte-identical to the
+//! prover's or every honest proof is rejected.
 #![no_std]
 // AIR fill + the permutation are byte-position-indexed throughout (state[i],
 // round-const tables); the index loops are the natural shape (same rationale as
@@ -35,7 +34,6 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use core::array::from_fn;
 use core::ops::{Add, AddAssign, Mul, Sub};
 
 use num_traits::{One, Zero};
@@ -60,10 +58,6 @@ pub const N_PARTIAL_ROUNDS: usize = 14;
 pub const N_HALF_FULL_ROUNDS: usize = 4;
 pub const FULL_ROUNDS: usize = 2 * N_HALF_FULL_ROUNDS;
 pub const RATE: usize = 8;
-
-/// Trace columns per permutation instance (16 initial-state cols + 3 S-box
-/// helper cols per S-box).  Kept in sync with [`eval_permutation`].
-pub const N_PERM_COLS: usize = N_STATE + FULL_ROUNDS * (N_STATE * 3) + N_PARTIAL_ROUNDS * 3;
 
 // Width-16 M31 Poseidon2 round constants — SYNCED from the prover's source of
 // truth, `pvm/proof/src/poseidon2/mod.rs` (the canonical Grain-LFSR arrays pinned by
@@ -234,25 +228,49 @@ pub const INTERNAL_ROUND_CONSTS: [BaseField; N_PARTIAL_ROUNDS] = [
 
 const DRAW_DOMAIN: u32 = 3;
 
-// ── Linear layers (generic: BaseField for the host, E::F for constraints) ──
+// ── Linear layers (generic over the host field / a constraint expr) ────────
 
+/// The shifts of the internal diagonal past its first entry:
+/// `INTERNAL_DIAGONAL[i] = 2^INTERNAL_DIAG_SHIFTS[i - 1]` for `i ≥ 1`
+/// (Plonky3's `POSEIDON2_INTERNAL_MATRIX_DIAG_16_SHIFTS`).
+pub const INTERNAL_DIAG_SHIFTS: [u8; N_STATE - 1] =
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 13, 14, 15, 16];
+
+/// The internal matrix is `1 + diag(INTERNAL_DIAGONAL)`, with `1` the all-ones
+/// matrix: `[-2, 2^0, 2^1, …, 2^8, 2^10, 2^12, 2^13, 2^14, 2^15, 2^16]`.
+pub const INTERNAL_DIAGONAL: [BaseField; N_STATE] = {
+    let mut diagonal = [BaseField::from_u32_unchecked(P - 2); N_STATE];
+    let mut i = 1;
+    while i < N_STATE {
+        diagonal[i] = BaseField::from_u32_unchecked(1 << INTERNAL_DIAG_SHIFTS[i - 1]);
+        i += 1;
+    }
+    diagonal
+};
+
+const P: u32 = (1 << 31) - 1;
+
+/// `M4 = [[2, 3, 1, 1], [1, 2, 3, 1], [1, 1, 2, 3], [3, 1, 1, 2]]`, the 4×4
+/// block of the external matrix (Plonky3's `MDSMat4`).
 pub fn apply_m4<F>(x: [F; 4]) -> [F; 4]
 where
     F: Clone + AddAssign<F> + Add<F, Output = F> + Sub<F, Output = F> + Mul<BaseField, Output = F>,
 {
-    let t0 = x[0].clone() + x[1].clone();
-    let t02 = t0.clone() + t0.clone();
-    let t1 = x[2].clone() + x[3].clone();
-    let t12 = t1.clone() + t1.clone();
-    let t2 = x[1].clone() + x[1].clone() + t1.clone();
-    let t3 = x[3].clone() + x[3].clone() + t0.clone();
-    let t4 = t12.clone() + t12.clone() + t3.clone();
-    let t5 = t02.clone() + t02.clone() + t2.clone();
-    let t6 = t3.clone() + t5.clone();
-    let t7 = t2.clone() + t4.clone();
-    [t6, t5, t7, t4]
+    let t01 = x[0].clone() + x[1].clone();
+    let t23 = x[2].clone() + x[3].clone();
+    let t0123 = t01.clone() + t23.clone();
+    let t01123 = t0123.clone() + x[1].clone();
+    let t01233 = t0123 + x[3].clone();
+    [
+        t01123.clone() + t01,
+        t01123 + x[2].clone() + x[2].clone(),
+        t01233.clone() + t23,
+        t01233 + x[0].clone() + x[0].clone(),
+    ]
 }
 
+/// The external matrix `circ(2·M4, M4, M4, M4)`: `M4` on each block of four
+/// words, then every word gains the sum of the words in its position mod 4.
 pub fn apply_external_round_matrix<F>(state: &mut [F; 16])
 where
     F: Clone + AddAssign<F> + Add<F, Output = F> + Sub<F, Output = F> + Mul<BaseField, Output = F>,
@@ -279,6 +297,8 @@ where
     }
 }
 
+/// The internal matrix `1 + diag(INTERNAL_DIAGONAL)`: each word becomes its
+/// diagonal multiple plus the sum of all words.
 pub fn apply_internal_round_matrix<F>(state: &mut [F; 16])
 where
     F: Clone + AddAssign<F> + Add<F, Output = F> + Sub<F, Output = F> + Mul<BaseField, Output = F>,
@@ -287,8 +307,8 @@ where
         .iter()
         .cloned()
         .fold(state[0].clone(), |acc, s| acc + s);
-    state.iter_mut().enumerate().for_each(|(i, s)| {
-        *s = s.clone() * BaseField::from_u32_unchecked(1 << (i + 1)) + sum.clone();
+    state.iter_mut().zip(INTERNAL_DIAGONAL).for_each(|(s, d)| {
+        *s = s.clone() * d + sum.clone();
     });
 }
 
@@ -299,34 +319,45 @@ fn pow5(x: BaseField) -> BaseField {
     x2 * x2 * x
 }
 
-/// The Poseidon2-over-M31 permutation: 4 full → 14 partial → 4 full rounds.
+/// The Poseidon2-over-M31 permutation under the reference round constants.
 pub fn permute(state: &mut [BaseField; N_STATE]) {
-    for round in 0..N_HALF_FULL_ROUNDS {
-        for i in 0..N_STATE {
-            state[i] += EXTERNAL_ROUND_CONSTS[round][i];
-        }
-        apply_external_round_matrix(state);
-        for s in state.iter_mut() {
-            *s = pow5(*s);
-        }
+    permute_with(state, &EXTERNAL_ROUND_CONSTS, &INTERNAL_ROUND_CONSTS);
+}
+
+/// The Poseidon2 permutation under given round constants: the external
+/// matrix, 4 full rounds, 14 partial rounds, 4 full rounds.
+///
+/// A full round adds its constants to every word, applies the S-box to every
+/// word, then the external matrix. A partial round adds its constant to word
+/// 0, applies the S-box to word 0, then the internal matrix. `external[..4]`
+/// are the first full rounds' constants and `external[4..]` the last's.
+pub fn permute_with(
+    state: &mut [BaseField; N_STATE],
+    external: &[[BaseField; N_STATE]; FULL_ROUNDS],
+    internal: &[BaseField; N_PARTIAL_ROUNDS],
+) {
+    apply_external_round_matrix(state);
+    for constants in &external[..N_HALF_FULL_ROUNDS] {
+        full_round(state, constants);
     }
-    for round in 0..N_PARTIAL_ROUNDS {
-        state[0] += INTERNAL_ROUND_CONSTS[round];
+    for &constant in internal {
+        state[0] = pow5(state[0] + constant);
         apply_internal_round_matrix(state);
-        state[0] = pow5(state[0]);
     }
-    for round in 0..N_HALF_FULL_ROUNDS {
-        for i in 0..N_STATE {
-            state[i] += EXTERNAL_ROUND_CONSTS[round + N_HALF_FULL_ROUNDS][i];
-        }
-        apply_external_round_matrix(state);
-        for s in state.iter_mut() {
-            *s = pow5(*s);
-        }
+    for constants in &external[N_HALF_FULL_ROUNDS..] {
+        full_round(state, constants);
     }
 }
 
-/// 2-to-1 node compression (the `hash_children` core).
+fn full_round(state: &mut [BaseField; N_STATE], constants: &[BaseField; N_STATE]) {
+    for (word, &constant) in state.iter_mut().zip(constants) {
+        *word = pow5(*word + constant);
+    }
+    apply_external_round_matrix(state);
+}
+
+/// 2-to-1 node compression (the `hash_children` core): `parent[8] =
+/// first8(permute(left[8] ‖ right[8]))`.
 pub fn hash_children_m31(left: &[BaseField; 8], right: &[BaseField; 8]) -> [BaseField; 8] {
     let mut state = [BaseField::zero(); N_STATE];
     state[..8].copy_from_slice(left);
@@ -529,57 +560,6 @@ impl MerkleChannel for P2MerkleChannel {
     fn mix_root(channel: &mut Self::C, root: <Self::H as MerkleHasherLifted>::Hash) {
         channel.mix_root(root);
     }
-}
-
-// ── Degree-2 permutation AIR fragment (re-evaluated by verify() at OODS) ───
-
-/// Flatten x^5 to three degree-2 constraints with witnessed intermediates.
-pub fn sbox_flatten<E: EvalAtRow>(eval: &mut E, y: E::F) -> E::F {
-    let y2 = eval.next_trace_mask();
-    eval.add_constraint(y2.clone() - y.clone() * y.clone());
-    let y4 = eval.next_trace_mask();
-    eval.add_constraint(y4.clone() - y2.clone() * y2.clone());
-    let out = eval.next_trace_mask();
-    eval.add_constraint(out.clone() - y4 * y);
-    out
-}
-
-fn full_round<E: EvalAtRow>(
-    eval: &mut E,
-    state: &mut [E::F; N_STATE],
-    consts: &[BaseField; N_STATE],
-) {
-    for i in 0..N_STATE {
-        state[i] += consts[i];
-    }
-    apply_external_round_matrix(state);
-    for i in 0..N_STATE {
-        state[i] = sbox_flatten(eval, state[i].clone());
-    }
-}
-
-/// Constrain one full width-16 Poseidon2 permutation.  Returns
-/// `(input[16], output[16])`.  This is the verifier-AIR's row driver — the
-/// verifier re-runs it at the OODS point inside `verify()`.
-pub fn eval_permutation<E: EvalAtRow>(eval: &mut E) -> ([E::F; N_STATE], [E::F; N_STATE]) {
-    let init: [E::F; N_STATE] = from_fn(|_| eval.next_trace_mask());
-    let mut state = init.clone();
-    for round in 0..N_HALF_FULL_ROUNDS {
-        full_round(eval, &mut state, &EXTERNAL_ROUND_CONSTS[round]);
-    }
-    for round in 0..N_PARTIAL_ROUNDS {
-        state[0] += INTERNAL_ROUND_CONSTS[round];
-        apply_internal_round_matrix(&mut state);
-        state[0] = sbox_flatten(eval, state[0].clone());
-    }
-    for round in 0..N_HALF_FULL_ROUNDS {
-        full_round(
-            eval,
-            &mut state,
-            &EXTERNAL_ROUND_CONSTS[round + N_HALF_FULL_ROUNDS],
-        );
-    }
-    (init, state)
 }
 
 // ── Configs + the verify entry (forces monomorphization of the verify path) ─

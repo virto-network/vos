@@ -40,11 +40,10 @@ prover = [
 # "ConstraintsNotSatisfied" vs. "claimed logup sum is not zero" failure
 # modes when adding constraints.
 debug-internals = ["prover"]
-# Native-recursion Stage-0 (P5.0): swap the segment PCS commit + Fiat-Shamir
-# transcript from production Blake2s to the M31-algebraic Poseidon2-M31 stack
-# (`src/poseidon2`), retargeting the commit/prove backend to CpuBackend. Selects
-# the `recursion_pcs` aliases; bumps the proof wire format. Off by default — the
-# production mobile prover stays on Blake2s/SimdBackend.
+# Swap the segment PCS commit + Fiat-Shamir transcript from production Blake2s
+# to the M31-algebraic Poseidon2-M31 stack (`src/poseidon2`), still proving on
+# SimdBackend. Selects the `recursion_pcs` aliases; bumps the proof wire
+# format. Off by default — the production mobile prover stays on Blake2s.
 poseidon2-channel = []
 
 [dependencies]
@@ -109,6 +108,12 @@ required-features = ["prover"]
 #   cargo bench --bench prove -- log16        # a specific heavy one
 [[bench]]
 name = "prove"
+harness = false
+required-features = ["prover"]
+
+# Poseidon2-M31 hashing throughput (see benches/poseidon2.rs).
+[[bench]]
+name = "poseidon2"
 harness = false
 required-features = ["prover"]
 
