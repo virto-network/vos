@@ -153,21 +153,26 @@ attribution). Its full design is `recursion-air.md`.
 - **A shape per kernel:** the component set from its code, and pinned
   log sizes per segment class.
 - **The segment channel:** Poseidon2-M31, so the recursion verifies
-  cheaply.
-- **The permutation becomes the reference Poseidon2 arrangement** (M0).
-  vos's permutation follows the round order of Stwo's example, not the
-  reference: each linear layer precedes its S-box layer, and there is no
-  final external layer. Before a format pins it, it adopts the reference
-  arrangement with Plonky3's width-16 M31 parameters (pinned at
-  `f983316`), checked against their test vectors.
-- **A SIMD hasher on the prover** (M0). Today's scalar permutation takes
-  0.8–2.4 µs [measured]. A segment on Poseidon2 proves in 23 s against
-  5 s on Blake2s, and a leaf's commitment needs about 25M permutations.
-  - Plonky3's packed M31 Poseidon2 (AVX2, AVX-512 and NEON; MIT or
-    Apache-2.0) is the candidate, adapted or depended on.
-  - Gate: a segment proves on Poseidon2 within 1.5× of Blake2s, and a
-    leaf's commitment in ≤ 0.5 s. Otherwise the recursion AIR gains a
-    Blake2s gate and segments stay on Blake2s-M31.
+  cheaply [decided, owner].
+- **The permutation is the reference Poseidon2 arrangement,** with
+  Plonky3's width-16 M31 parameters (pinned at `f983316`), checked
+  against their test vectors.
+- **A SIMD hasher on the prover:** sixteen permutations a call, adapted
+  from Plonky3's packed M31 Poseidon2 (AVX2, AVX-512 and NEON; MIT or
+  Apache-2.0). The verifier keeps the scalar permutation.
+  - 39.5M permutations a second on 8 threads (AVX2), against 7.05M
+    scalar [measured].
+- **Gate:** a segment's total cost, its proving plus its leaf, against
+  the Blake2s route's projection. Per segment at the 32k cut:
+  - Poseidon2: about 5.6 s to prove [measured] plus a leaf of about
+    1.5–3 s [projected];
+  - Blake2s: about 3.1 s to prove [measured] plus a leaf with in-circuit
+    Blake2s of about 4.5–6 s [projected]; the recursion AIR's shape and
+    fixed point would also be re-derived.
+  - The proving alone runs at 1.75–1.85× Blake2s, and a leaf's
+    commitment (25M permutations) at 0.63 s [measured]. The first gate's
+    bounds (1.5×, 0.5 s) priced the prove alone; the owner kept
+    Poseidon2-M31 on the total.
 - **The initial image is public** [decided]:
   - the kernel's arguments and witness rows enter through a
     **witness-input precompile**, not through the initial memory;
@@ -544,7 +549,7 @@ foundation. It replaces the projected ARM factor with a measurement.
 | lever | effect | effort | when |
 |---|---|---|---|
 | a shape per kernel | −38% verify, −14% bytes, −10% RSS [measured] | about 1 week | slice 5 |
-| the reference Poseidon2 and a SIMD hasher | segments on Poseidon2 within 1.5× of Blake2s; a leaf's commitment ≤ 0.5 s | 2–3 weeks | slice 5 |
+| the reference Poseidon2 and a SIMD hasher | segments on Poseidon2 at 1.75–1.85× Blake2s, against 6.4–6.9× before; a leaf's commitment 0.63 s [measured] | 2–3 weeks | slice 5 |
 | narrow BLAKE2b chips | −2,200 columns; −30–45% of BLAKE2b's cells [model] | 3–5 weeks | slice 7 (mobile needs it; folds gain) |
 | a lighter page boundary (Poseidon2 page hashing), or one memory argument across segments | about −1,100 / −2,800 columns; up to −49% of prover cells | 3–5 / 6–10 weeks | later |
 | word-level memory | MEMORY 4–8× fewer rows | 4–6 weeks | later |
@@ -558,7 +563,7 @@ that narrows the inner proof makes folds cheaper too.
 | risk | gate | when |
 |---|---|---|
 | the ARM factor is wrong | the auth statement, as built and without the boundary, on a real flagship | slice 5, M0 |
-| the Poseidon2 segment channel is too slow to prove | the SIMD hasher's gate (§3.2) | slice 5, M0 |
+| the Poseidon2 segment channel is too slow to prove | retired: a segment's proving plus its leaf beats the Blake2s route's projection (§3.2) [measured, projected]; Poseidon2-M31 kept by the owner | slice 5, M0 |
 | our permutation is not the reference Poseidon2 | the reference arrangement and Plonky3's parameters adopted, checked on their vectors | slice 5, M0 |
 | the recursion AIR does not converge | sized in `recursion-air.md` (it converges at once [model]); then measured: a fold verifies two folds within the constant shape | slice 5, M1 |
 | signed multiplicities in the wiring are new soundness surface | the `Context`'s static checks; the audit of the wiring argument (`recursion-air.md` §1.1) | slice 5, M1 |
@@ -606,10 +611,10 @@ that narrows the inner proof makes folds cheaper too.
 7. **The Kreivo pallet** comes after the recursion, with P0 and P1
    together in slice 6.
 8. **Slicing:** three slices, as in §11.
+9. **The segment channel:** Poseidon2-M31, on a segment's total cost
+   (§3.2).
 
 **Decided on the evidence, and the owner's to override:**
-- the segment channel is chosen by the M0 gate (Poseidon2-M31 by
-  default);
 - reads at the last anchored cut, to the space root;
 - runtime format selection, with lossless encodings;
 - interaction PoW;
@@ -707,7 +712,7 @@ output).**
   a wire. Its zero, one and `u` follow them.
 
 **A.4 The format registry (M0).** New numbers, not 24 or 25:
-- segment proofs (Poseidon2-M31, or Blake2s-M31 if the M0 gate says so);
+- segment proofs (Poseidon2-M31);
 - device proofs (masked);
 - leaf and fold (one padded shape);
 - the final wrap (Blake2b-256, masked);

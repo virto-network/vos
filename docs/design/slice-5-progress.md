@@ -5,8 +5,8 @@ tagged measured, model or projected.
 
 ## Step 5.2: the reference Poseidon2 and a SIMD hasher
 
-**Gate: failed** on both counts (`proving.md` §3.2), on the 8 threads of an
-Intel Core Ultra 7 155H (AVX2, no AVX-512):
+**Gate: failed as first written** (`proving.md` §3.2), on the 8 threads
+of an Intel Core Ultra 7 155H (AVX2, no AVX-512):
 - a window-kernel segment proves on Poseidon2 in **1.75–1.85×** Blake2s's
   time, against 1.5× [measured];
 - a leaf's commitment of 25M permutations takes **0.63 s**, against 0.5 s
@@ -14,9 +14,21 @@ Intel Core Ultra 7 155H (AVX2, no AVX-512):
 
 What dominates is the permutation itself: about 112M a segment, 95% in
 leaves, take 58% of the Poseidon2 prove's cycles, and the packed
-permutation runs at Plonky3's own speed on this machine. The step stops
-here, as the plan says; the permutation, its vectors and the SIMD hasher
-are committed.
+permutation runs at Plonky3's own speed on this machine.
+
+### The decision: Poseidon2-M31 stays the segment channel
+
+**The owner's, on 2026-10-16.** The gate becomes a segment's total cost,
+its proving plus its leaf, against the Blake2s route's projection. Per
+segment at the 32k cut:
+- **Poseidon2:** about 5.6 s to prove [measured] plus a leaf of about
+  1.5–3 s [projected]: about 7.1–8.6 s.
+- **Blake2s:** about 3.1 s to prove [measured] plus a leaf with
+  in-circuit Blake2s of about 4.5–6 s [projected]: about 7.6–9.1 s.
+- **The Blake2s route would also** add a Blake2s gate to the recursion
+  AIR and re-derive its padded shape and fixed point.
+- **The fallback is dropped:** no Blake2s gate in the recursion AIR, and
+  segments prove on Poseidon2-M31.
 
 ### The permutation
 

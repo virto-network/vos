@@ -140,17 +140,19 @@ No proof leaves a test in this slice: masking is slice 6.
   - the vectors;
   - scalar equals SIMD on random inputs;
   - Merkle roots and proofs on the Poseidon2 channel round-trip.
-- **Gate (`proving.md` §3.2):**
-  - a window-kernel segment proves on Poseidon2 within 1.5× of Blake2s
-    (today 23 s against 5 s);
-  - permutations a second support a leaf commitment (about 25M) in at
-    most 0.5 s on 8 threads.
-  - **If it fails,** the step stops and records the numbers. The plan
-    then adds a Blake2s gate to the recursion AIR, and segments stay on
-    Blake2s-M31. That gate is sized before 5.8 starts: a compression is
-    about a 1,000-column row or about 80 narrow rows, and leaf hashing
-    grows about 17× (spike 4b §2.3), so the padded shape and 5.12's gate
-    are re-derived.
+- **Gate (`proving.md` §3.2):** a segment's total cost, its proving
+  plus its leaf, against the Blake2s route's projection. Per segment at
+  the 32k cut, on 8 threads:
+  - Poseidon2: about 5.6 s to prove [measured] plus a leaf of about
+    1.5–3 s [projected];
+  - Blake2s: about 3.1 s to prove [measured] plus a leaf with in-circuit
+    Blake2s of about 4.5–6 s [projected].
+  - **Measured:** the proving alone at 1.75–1.85× Blake2s, and a leaf's
+    commitment (25M permutations) in 0.63 s; the first bounds were 1.5×
+    and 0.5 s.
+  - **Decided by the owner:** Poseidon2-M31 stays the segment channel.
+    The Blake2s route also re-derives the recursion AIR's shape and fixed
+    point.
 - **Closing gate,** if the fork changes: Fable's review of the change,
   then its push to olanod/stwo.
 - **Estimate:** 2–3 weeks.
@@ -538,13 +540,13 @@ that shape this slice:
 - Blake2b-256 for the final proof;
 - arguments through a witness-input precompile.
 
-Also the owner's, on 2026-10-16: the fork's pushes (Rules).
+Also the owner's, on 2026-10-16: the fork's pushes (Rules), and
+Poseidon2-M31 as the segment channel, on 5.2's total cost a segment.
 
 **Decided on the evidence, and the owner's to override:**
 - the reference Poseidon2 with Plonky3's parameters;
 - lossless encodings in the new formats: the boundary states as bytes,
   other words as 16-bit limbs;
-- the segment channel set by 5.2's gate;
 - the inner parameters and interaction PoW;
 - the padded shape as a format constant;
 - 5.6's phone run on Android first.
@@ -553,9 +555,9 @@ Also the owner's, on 2026-10-16: the fork's pushes (Rules).
 
 `proving.md` §10 and `recursion-air.md` §11 hold the full list, each with
 its gate. This slice's sharpest:
-- **5.2's hasher gate.** If Poseidon2 commits stay slow, the recursion
-  AIR gains a Blake2s gate, sized before 5.8, and segments stay on
-  Blake2s-M31.
+- **The leaf's Poseidon2 hashing.** A leaf's commitment takes 0.63 s
+  [measured]; 5.12 measures the whole leaf against its 1.5–3 s
+  projection.
 - **The gate compiler and the in-AIR verifier.** They are new
   soundness-critical code: differential tests, Fable reviews, and the
   external audit before value.
