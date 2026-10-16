@@ -75,7 +75,9 @@
 //!   trace; [`TracingPvm::into_compact`][into_compact] /
 //!   [`segment::TraceStream`] for the chain / streaming paths.
 //! - **Prove** — [`prove`] (STANDARD) or [`prove_mobile`] (low-latency
-//!   MOBILE); [`prove_with_config`] for a custom [`PcsConfig`].
+//!   MOBILE); [`prove_with_config`] for a custom [`PcsConfig`]; all three
+//!   under the legacy format 24. [`prove_format`] proves under any admitted
+//!   format of the [`format`](mod@format) registry, at its parameters.
 //! - **Verify** — [`verify`] / [`verify_with_pcs_policy`] (prover-side,
 //!   with the SideNote); [`verify_chain`] for a segment chain. The
 //!   side-note-free deployer verifier is `verify_standalone` in the
@@ -91,8 +93,9 @@
 //! Core types: [`Proof`], [`SegmentState`], [`SideNote`],
 //! [`CompactTrace`], [`PcsPolicy`], [`PcsConfig`], [`FriConfig`].
 //!
-//! Proofs are versioned by [`PROOF_FORMAT_VERSION`]: a verifier
-//! compiled against version N rejects proofs from any other N. Items
+//! Proofs name their format, an entry of the [`format`](mod@format) registry, which
+//! selects their channel, parameters and encodings at run time; a verifier
+//! rejects a number the registry does not admit. Items
 //! marked `#[doc(hidden)]`, and the sub-modules ([`chips`], [`core`],
 //! [`trace`], [`proof`], …), are **internal — their shapes change
 //! without notice**; they are public only for the verifier crate, the
@@ -146,11 +149,14 @@ pub mod segment;
 pub mod sparse_memory;
 pub mod trace;
 
-// Native-recursion Stage-0: the Poseidon2-M31 PCS primitives + the per-build
-// PCS selection. Both are `no_std`-clean (verifier path uses them too); their
-// prover-only pieces are `#[cfg(feature = "prover")]` within.
+// The format registry, the PCS stacks it selects at run time, the
+// Poseidon2-M31 primitives and the security counts. All are `no_std`-clean
+// (the verifier path uses them); their prover-only pieces are
+// `#[cfg(feature = "prover")]` within.
+pub mod format;
+pub mod pcs;
 pub mod poseidon2;
-pub mod recursion_pcs;
+pub mod security;
 
 // The page-hash spec constants + tag chaining states are needed by the new
 // memory-Merkle chips' `add_constraints` (verifier-side, `no_std`); the
@@ -534,6 +540,8 @@ pub(crate) fn active_components_verifier(
         .collect()
 }
 
+pub use format::Format;
+pub use pcs::{Commitment, StarkProofAny};
 pub use proof::{PROOF_FORMAT_VERSION, PcsPolicy, Proof, SegmentState};
 pub use refine::{
     MAX_REFINE_CHILD_COMPONENTS, MAX_REFINE_HOST_BOUNDARIES, MAX_REFINE_PROOF_SLICES,
@@ -571,8 +579,9 @@ pub use prove::{prove_pre_config_relabel_for_test, prove_with_boundary_override}
 // forcing profile, `prove_canonical` proves each window to one shape.
 #[cfg(feature = "prover")]
 pub use prove::{
-    canonical_profile_for, canonical_profile_for_bounds, program_commitment_for_profile, prove,
-    prove_canonical, prove_chain, prove_mobile, prove_with_config,
+    canonical_profile_for, canonical_profile_for_bounds, program_commitment_for_profile,
+    program_commitment_for_profile_format, prove, prove_canonical, prove_canonical_format,
+    prove_chain, prove_chain_format, prove_format, prove_mobile, prove_with_config,
 };
 // Advanced / internal prove surface: the compact-trace floor variant, the
 // profiling variants, the thread-pool installer, and the explicit-component
@@ -609,7 +618,7 @@ pub use verify::{
     verify_with_explicit_components, verify_with_max_log_size, verify_with_options,
 };
 #[doc(hidden)]
-#[cfg(all(feature = "prover", feature = "poseidon2-channel"))]
+#[cfg(feature = "prover")]
 pub use verify::{
     DeepBatch, RecursionData, RecursionTranscript, extract_recursion_data,
     record_canonical_transcript,

@@ -23,9 +23,11 @@ use stwo::core::vcs_lifted::verifier::MerkleDecommitmentLifted;
 use crate::proof::{
     MAX_EXTENDED_LOG_SIZE, MAX_FRI_QUERIES, MAX_MERKLE_WITNESS_HASHES, MAX_PROOF_COLUMNS_PER_TREE,
     MAX_PROOF_COMPONENTS, MAX_PROOF_LOG_SIZE, MAX_PROOF_SAMPLES_PER_COLUMN, MIN_PROOF_LOG_SIZE,
-    PROOF_COMMITMENT_TREE_COUNT, PROOF_FORMAT_VERSION,
+    PROOF_COMMITMENT_TREE_COUNT,
 };
-use crate::recursion_pcs::{ProverMerkleHash, ProverMerkleHasher};
+use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
+
+use crate::pcs::{ProofHash, StarkProofAny};
 use crate::{
     Proof, REFINE_BUNDLE_FORMAT_VERSION, RefineHostBoundary, RefineMachineId, RefineProgramId,
     RefineProofBundle, RefineProofSlice, RefineSliceExit, SegmentState,
@@ -35,7 +37,7 @@ use crate::{
 const REFINE_PROOF_BUNDLE_MAGIC: &[u8; 8] = b"VOSRPB01";
 
 /// Version of the explicit production proof-bundle wire representation.
-pub const REFINE_PROOF_BUNDLE_CODEC_VERSION: u32 = 1;
+pub const REFINE_PROOF_BUNDLE_CODEC_VERSION: u32 = 2;
 
 /// Generation hard maximum for canonical proof-bundle material.
 ///
@@ -67,6 +69,7 @@ const HOST_BOUNDARY_WIRE_BYTES: usize = 1 + 4 + 4 + 32 + 32 + 13 * 8 + 13 * 8;
 // includes one component/sum/log, two segment states, four empty trees in
 // every TreeVec, and the one-coefficient FRI polynomial required by config.
 const MIN_PROOF_SLICE_WIRE_BYTES: usize = 4
+    + 8
     + (1 + 32)
     + 32
     + 32
@@ -386,6 +389,7 @@ fn decode_host_boundary(
 
 fn encode_proof(encoder: &mut Encoder, proof: &Proof) -> Result<(), RefineProofCodecError> {
     encoder.u32(proof.format_version)?;
+    encoder.u64(proof.interaction_pow)?;
     encoder.u32(
         u32::try_from(proof.num_components)
             .map_err(|_| RefineProofCodecError::InvalidCardinality)?,
@@ -402,14 +406,26 @@ fn encode_proof(encoder: &mut Encoder, proof: &Proof) -> Result<(), RefineProofC
     }
     encode_segment_state(encoder, &proof.initial_state)?;
     encode_segment_state(encoder, &proof.final_state)?;
-    encode_stark_proof(encoder, &proof.stark_proof)
+    let format = crate::format::admitted(proof.format_version)
+        .map_err(|_| RefineProofCodecError::InvalidStructure)?;
+    match &proof.stark_proof {
+        StarkProofAny::Blake2s(stark) if format.channel == crate::format::ChannelKind::Blake2s => {
+            encode_stark_proof(encoder, stark)
+        }
+        StarkProofAny::Poseidon2M31(stark)
+            if format.channel == crate::format::ChannelKind::Poseidon2M31 =>
+        {
+            encode_stark_proof(encoder, stark)
+        }
+        _ => Err(RefineProofCodecError::InvalidStructure),
+    }
 }
 
 fn decode_proof(decoder: &mut Decoder<'_>) -> Result<Proof, RefineProofCodecError> {
     let format_version = decoder.u32()?;
-    if format_version != PROOF_FORMAT_VERSION {
-        return Err(RefineProofCodecError::InvalidStructure);
-    }
+    let format = crate::format::admitted(format_version)
+        .map_err(|_| RefineProofCodecError::InvalidStructure)?;
+    let interaction_pow = decoder.u64()?;
     let num_components = decoder.u32()? as usize;
     if num_components == 0 || num_components > MAX_PROOF_COMPONENTS {
         return Err(RefineProofCodecError::InvalidCardinality);
@@ -423,10 +439,15 @@ fn decode_proof(decoder: &mut Decoder<'_>) -> Result<Proof, RefineProofCodecErro
     validate_log_sizes_and_config(&log_sizes, pcs_config)?;
     let initial_state = decode_segment_state(decoder)?;
     let final_state = decode_segment_state(decoder)?;
-    let stark_proof = decode_stark_proof(decoder, pcs_config)?;
+    let stark_proof = crate::with_stack!(format.channel, Stack => {
+        <Stack as crate::pcs::PcsStack>::into_any(decode_stark_proof::<
+            <Stack as stwo::core::channel::MerkleChannel>::H,
+        >(decoder, pcs_config)?)
+    }, unbuilt => return Err(RefineProofCodecError::InvalidStructure));
     Ok(Proof {
         format_version,
         stark_proof,
+        interaction_pow,
         claimed_sums,
         log_sizes,
         num_components,
@@ -545,10 +566,13 @@ fn decode_registers(decoder: &mut Decoder<'_>) -> Result<[u64; 13], RefineProofC
     Ok(registers)
 }
 
-fn encode_stark_proof(
+fn encode_stark_proof<H: MerkleHasherLifted>(
     encoder: &mut Encoder,
-    proof: &StarkProof<ProverMerkleHasher>,
-) -> Result<(), RefineProofCodecError> {
+    proof: &StarkProof<H>,
+) -> Result<(), RefineProofCodecError>
+where
+    H::Hash: ProofHash,
+{
     // The embedded Stwo config is structurally required to equal the public
     // Proof config. Encoding it once removes a second spelling of the same
     // authenticated value; decode installs the exact value in both fields.
@@ -584,14 +608,17 @@ fn encode_stark_proof(
     encode_fri_proof(encoder, &proof.fri_proof)
 }
 
-fn decode_stark_proof(
+fn decode_stark_proof<H: MerkleHasherLifted>(
     decoder: &mut Decoder<'_>,
     config: PcsConfig,
-) -> Result<StarkProof<ProverMerkleHasher>, RefineProofCodecError> {
+) -> Result<StarkProof<H>, RefineProofCodecError>
+where
+    H::Hash: ProofHash,
+{
     let commitments = TreeVec::new(decoder.exact_vector(
         PROOF_COMMITMENT_TREE_COUNT,
         MERKLE_HASH_WIRE_BYTES,
-        decode_merkle_hash,
+        decode_merkle_hash::<H::Hash>,
     )?);
     let sampled_values = TreeVec::new(decoder.exact_vector(
         PROOF_COMMITMENT_TREE_COUNT,
@@ -609,7 +636,7 @@ fn decode_stark_proof(
     let decommitments = TreeVec::new(decoder.exact_vector(
         PROOF_COMMITMENT_TREE_COUNT,
         U32_WIRE_BYTES,
-        |decoder| decode_decommitment(decoder, MAX_MERKLE_WITNESS_HASHES),
+        |decoder| decode_decommitment::<H>(decoder, MAX_MERKLE_WITNESS_HASHES),
     )?);
     let queried_values = TreeVec::new(decoder.exact_vector(
         PROOF_COMMITMENT_TREE_COUNT,
@@ -625,7 +652,7 @@ fn decode_stark_proof(
         },
     )?);
     let proof_of_work = decoder.u64()?;
-    let fri_proof = decode_fri_proof(decoder, config)?;
+    let fri_proof = decode_fri_proof::<H>(decoder, config)?;
     Ok(StarkProof(CommitmentSchemeProof {
         config,
         commitments,
@@ -637,10 +664,13 @@ fn decode_stark_proof(
     }))
 }
 
-fn encode_decommitment(
+fn encode_decommitment<H: MerkleHasherLifted>(
     encoder: &mut Encoder,
-    decommitment: &MerkleDecommitmentLifted<ProverMerkleHasher>,
-) -> Result<(), RefineProofCodecError> {
+    decommitment: &MerkleDecommitmentLifted<H>,
+) -> Result<(), RefineProofCodecError>
+where
+    H::Hash: ProofHash,
+{
     encoder.length(decommitment.hash_witness.len())?;
     for hash in &decommitment.hash_witness {
         encode_merkle_hash(encoder, hash)?;
@@ -648,19 +678,29 @@ fn encode_decommitment(
     Ok(())
 }
 
-fn decode_decommitment(
+fn decode_decommitment<H: MerkleHasherLifted>(
     decoder: &mut Decoder<'_>,
     maximum_hashes: usize,
-) -> Result<MerkleDecommitmentLifted<ProverMerkleHasher>, RefineProofCodecError> {
+) -> Result<MerkleDecommitmentLifted<H>, RefineProofCodecError>
+where
+    H::Hash: ProofHash,
+{
     Ok(MerkleDecommitmentLifted {
-        hash_witness: decoder.vector(maximum_hashes, MERKLE_HASH_WIRE_BYTES, decode_merkle_hash)?,
+        hash_witness: decoder.vector(
+            maximum_hashes,
+            MERKLE_HASH_WIRE_BYTES,
+            decode_merkle_hash::<H::Hash>,
+        )?,
     })
 }
 
-fn encode_fri_proof(
+fn encode_fri_proof<H: MerkleHasherLifted>(
     encoder: &mut Encoder,
-    proof: &FriProof<ProverMerkleHasher>,
-) -> Result<(), RefineProofCodecError> {
+    proof: &FriProof<H>,
+) -> Result<(), RefineProofCodecError>
+where
+    H::Hash: ProofHash,
+{
     encode_fri_layer(encoder, &proof.first_layer)?;
     encoder.length(proof.inner_layers.len())?;
     for layer in &proof.inner_layers {
@@ -673,15 +713,18 @@ fn encode_fri_proof(
     Ok(())
 }
 
-fn decode_fri_proof(
+fn decode_fri_proof<H: MerkleHasherLifted>(
     decoder: &mut Decoder<'_>,
     config: PcsConfig,
-) -> Result<FriProof<ProverMerkleHasher>, RefineProofCodecError> {
-    let first_layer = decode_fri_layer(decoder, config.fri_config.n_queries)?;
+) -> Result<FriProof<H>, RefineProofCodecError>
+where
+    H::Hash: ProofHash,
+{
+    let first_layer = decode_fri_layer::<H>(decoder, config.fri_config.n_queries)?;
     let inner_layers = decoder.vector(
         MAX_EXTENDED_LOG_SIZE as usize,
         MIN_FRI_LAYER_WIRE_BYTES,
-        |decoder| decode_fri_layer(decoder, config.fri_config.n_queries),
+        |decoder| decode_fri_layer::<H>(decoder, config.fri_config.n_queries),
     )?;
     let coefficient_count = 1usize
         .checked_shl(config.fri_config.log_last_layer_degree_bound)
@@ -702,10 +745,13 @@ fn decode_fri_proof(
     })
 }
 
-fn encode_fri_layer(
+fn encode_fri_layer<H: MerkleHasherLifted>(
     encoder: &mut Encoder,
-    layer: &FriLayerProof<ProverMerkleHasher>,
-) -> Result<(), RefineProofCodecError> {
+    layer: &FriLayerProof<H>,
+) -> Result<(), RefineProofCodecError>
+where
+    H::Hash: ProofHash,
+{
     encoder.length(layer.fri_witness.len())?;
     for value in &layer.fri_witness {
         encode_secure_field(encoder, *value)?;
@@ -714,18 +760,21 @@ fn encode_fri_layer(
     encode_merkle_hash(encoder, &layer.commitment)
 }
 
-fn decode_fri_layer(
+fn decode_fri_layer<H: MerkleHasherLifted>(
     decoder: &mut Decoder<'_>,
     maximum_queries: usize,
-) -> Result<FriLayerProof<ProverMerkleHasher>, RefineProofCodecError> {
+) -> Result<FriLayerProof<H>, RefineProofCodecError>
+where
+    H::Hash: ProofHash,
+{
     Ok(FriLayerProof {
         fri_witness: decoder.vector(
             maximum_queries,
             SECURE_FIELD_WIRE_BYTES,
             decode_secure_field,
         )?,
-        decommitment: decode_decommitment(decoder, MAX_MERKLE_WITNESS_HASHES)?,
-        commitment: decode_merkle_hash(decoder)?,
+        decommitment: decode_decommitment::<H>(decoder, MAX_MERKLE_WITNESS_HASHES)?,
+        commitment: decode_merkle_hash::<H::Hash>(decoder)?,
     })
 }
 
@@ -765,27 +814,15 @@ fn decode_base_field(decoder: &mut Decoder<'_>) -> Result<BaseField, RefineProof
 
 fn encode_merkle_hash(
     encoder: &mut Encoder,
-    hash: &ProverMerkleHash,
+    hash: &impl ProofHash,
 ) -> Result<(), RefineProofCodecError> {
-    encoder.fixed(&crate::recursion_pcs::commitment_bytes(hash))
+    encoder.fixed(&hash.to_bytes())
 }
 
-#[cfg(not(feature = "poseidon2-channel"))]
-fn decode_merkle_hash(
+fn decode_merkle_hash<Hash: ProofHash>(
     decoder: &mut Decoder<'_>,
-) -> Result<ProverMerkleHash, RefineProofCodecError> {
-    Ok(stwo::core::vcs::blake2_hash::Blake2sHash(decoder.array()?))
-}
-
-#[cfg(feature = "poseidon2-channel")]
-fn decode_merkle_hash(
-    decoder: &mut Decoder<'_>,
-) -> Result<ProverMerkleHash, RefineProofCodecError> {
-    let mut limbs = [BaseField::from_u32_unchecked(0); 8];
-    for limb in &mut limbs {
-        *limb = decode_base_field(decoder)?;
-    }
-    Ok(crate::poseidon2::P2Hash(limbs))
+) -> Result<Hash, RefineProofCodecError> {
+    Hash::from_bytes(&decoder.array()?).ok_or(RefineProofCodecError::NonCanonical)
 }
 
 struct Encoder {
@@ -993,8 +1030,18 @@ mod tests {
     use super::*;
 
     const SLICE_COUNT_OFFSET: usize = 8 + 4 + 4 + 32 + 32 + 8;
-    const FIRST_CLAIMED_SUM_COUNT_OFFSET: usize =
-        SLICE_COUNT_OFFSET + 4 + 4 + (1 + 32) + 32 + 32 + 1 + 4 + 4 + 4 + (4 + 4 + 4 + 4 + 4 + 1);
+    const FIRST_CLAIMED_SUM_COUNT_OFFSET: usize = SLICE_COUNT_OFFSET
+        + 4
+        + 4
+        + (1 + 32)
+        + 32
+        + 32
+        + 1
+        + 4
+        + 8
+        + 4
+        + 4
+        + (4 + 4 + 4 + 4 + 4 + 1);
     const FIRST_CLAIMED_SUM_LIMB_OFFSET: usize = FIRST_CLAIMED_SUM_COUNT_OFFSET + 4;
     const FIRST_COMMITMENT_OFFSET: usize = FIRST_CLAIMED_SUM_COUNT_OFFSET
         + 4
@@ -1017,17 +1064,66 @@ mod tests {
         SecureField::from_u32_unchecked(0, 0, 0, 0)
     }
 
-    #[cfg(not(feature = "poseidon2-channel"))]
-    fn hash(byte: u8) -> ProverMerkleHash {
+    fn blake2s_hash(byte: u8) -> stwo::core::vcs::blake2_hash::Blake2sHash {
         stwo::core::vcs::blake2_hash::Blake2sHash([byte; 32])
     }
 
-    #[cfg(feature = "poseidon2-channel")]
-    fn hash(byte: u8) -> ProverMerkleHash {
+    fn poseidon2_hash(byte: u8) -> crate::poseidon2::P2Hash {
         crate::poseidon2::P2Hash([BaseField::from_u32_unchecked(byte as u32); 8])
     }
 
+    /// A format-24 proof, on the Blake2s channel.
     fn proof() -> Proof {
+        let (config, stark) = stark_proof(blake2s_hash);
+        proof_of(
+            crate::format::LEGACY_SEGMENT.number,
+            config,
+            StarkProofAny::Blake2s(stark),
+            0,
+        )
+    }
+
+    /// A format-26 proof, on the Poseidon2-M31 channel.
+    fn poseidon2_proof() -> Proof {
+        let (config, stark) = stark_proof(poseidon2_hash);
+        proof_of(
+            crate::format::SEGMENT.number,
+            config,
+            StarkProofAny::Poseidon2M31(stark),
+            0x0123_4567_89ab_cdef,
+        )
+    }
+
+    fn proof_of(
+        format_version: u32,
+        config: PcsConfig,
+        stark_proof: StarkProofAny,
+        interaction_pow: u64,
+    ) -> Proof {
+        let state = SegmentState {
+            pc: 7,
+            timestamp: 11,
+            registers: [13; 13],
+            memory_commitment: [17; 32],
+            memory_root: [19; 32],
+        };
+        Proof {
+            format_version,
+            stark_proof,
+            interaction_pow,
+            claimed_sums: vec![zero_secure()],
+            log_sizes: vec![4],
+            num_components: 1,
+            component_mask: 1,
+            pcs_config: config,
+            initial_state: state.clone(),
+            final_state: state,
+        }
+    }
+
+    fn stark_proof<H: MerkleHasherLifted>(
+        hash: impl Fn(u8) -> H::Hash,
+    ) -> (PcsConfig, StarkProof<H>) {
         let config = PcsConfig {
             pow_bits: 0,
             fri_config: FriConfig {
@@ -1038,7 +1134,7 @@ mod tests {
             },
             lifting_log_size: None,
         };
-        let commitments = TreeVec::new((1..=4).map(hash).collect());
+        let commitments = TreeVec::new((1..=4).map(&hash).collect());
         let sampled_values = TreeVec::new(vec![
             vec![vec![SecureField::from_u32_unchecked(1, 2, 3, 4)]],
             vec![vec![SecureField::from_u32_unchecked(5, 6, 7, 8)]],
@@ -1075,16 +1171,9 @@ mod tests {
             }],
             last_layer_poly: LinePoly::new(vec![zero_secure()]),
         };
-        let state = SegmentState {
-            pc: 7,
-            timestamp: 11,
-            registers: [13; 13],
-            memory_commitment: [17; 32],
-            memory_root: [19; 32],
-        };
-        Proof {
-            format_version: PROOF_FORMAT_VERSION,
-            stark_proof: StarkProof(CommitmentSchemeProof {
+        (
+            config,
+            StarkProof(CommitmentSchemeProof {
                 config,
                 commitments,
                 sampled_values,
@@ -1093,17 +1182,14 @@ mod tests {
                 proof_of_work: 23,
                 fri_proof,
             }),
-            claimed_sums: vec![zero_secure()],
-            log_sizes: vec![4],
-            num_components: 1,
-            component_mask: 1,
-            pcs_config: config,
-            initial_state: state.clone(),
-            final_state: state,
-        }
+        )
     }
 
     fn bundle() -> RefineProofBundle {
+        bundle_of(proof())
+    }
+
+    fn bundle_of(proof: Proof) -> RefineProofBundle {
         let outer_program = RefineProgramId([29; 32]);
         let mut bundle = RefineProofBundle {
             format_version: REFINE_BUNDLE_FORMAT_VERSION,
@@ -1118,7 +1204,7 @@ mod tests {
                 entry_state: [41; 32],
                 observed_exit_state: [43; 32],
                 exit: RefineSliceExit::Halt,
-                proof: proof(),
+                proof,
             }],
             host_boundaries: Vec::new(),
             result: RefineSliceExit::Halt,
@@ -1139,10 +1225,49 @@ mod tests {
         let decoded = decode_refine_proof_bundle(&encoded, encoded.len() as u64).unwrap();
         assert_eq!(encode_refine_proof_bundle(&decoded).unwrap(), encoded);
         assert_eq!(decoded.transcript_commitment, bundle.transcript_commitment);
-        assert_eq!(decoded.slices[0].proof.format_version, PROOF_FORMAT_VERSION);
         assert_eq!(
-            decoded.slices[0].proof.stark_proof.config,
+            decoded.slices[0].proof.format_version,
+            crate::PROOF_FORMAT_VERSION
+        );
+        assert_eq!(
+            decoded.slices[0].proof.stark_proof.config(),
             decoded.slices[0].proof.pcs_config
+        );
+    }
+
+    /// A child under the Poseidon2-M31 segment format round-trips, its
+    /// interaction PoW nonce with it; under a number the registry does not
+    /// admit, or with its Stark proof on another channel than its format's,
+    /// it is refused.
+    #[test]
+    fn every_admitted_format_roundtrips_and_others_are_refused() {
+        let bundle = bundle_of(poseidon2_proof());
+        let encoded = encode_refine_proof_bundle(&bundle).unwrap();
+        let decoded = decode_refine_proof_bundle(&encoded, encoded.len() as u64).unwrap();
+        assert_eq!(encode_refine_proof_bundle(&decoded).unwrap(), encoded);
+        let child = &decoded.slices[0].proof;
+        assert_eq!(child.format_version, crate::format::SEGMENT.number);
+        assert_eq!(child.interaction_pow, 0x0123_4567_89ab_cdef);
+        assert!(matches!(child.stark_proof, StarkProofAny::Poseidon2M31(_)));
+
+        for format in crate::format::REGISTRY
+            .iter()
+            .filter(|format| format.status != crate::format::Status::Admitted)
+        {
+            let mut reserved = poseidon2_proof();
+            reserved.format_version = format.number;
+            assert_eq!(
+                encode_refine_proof_bundle(&bundle_of(reserved)).unwrap_err(),
+                RefineProofCodecError::InvalidStructure,
+                "format {}",
+                format.number
+            );
+        }
+        let mut crossed = poseidon2_proof();
+        crossed.format_version = crate::format::LEGACY_SEGMENT.number;
+        assert_eq!(
+            encode_refine_proof_bundle(&bundle_of(crossed)).unwrap_err(),
+            RefineProofCodecError::InvalidStructure
         );
     }
 

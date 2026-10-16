@@ -11,7 +11,7 @@ mod relations;
 
 #[cfg(feature = "prover")]
 pub use self::logup_trace_builder::LogupTraceBuilder;
-pub use self::relations::boundary_relation_challenges;
+pub use self::relations::{MAX_RELATION_WIDTH, boundary_relation_challenges};
 pub use self::{
     range_check::Range256LookupElements,
     relations::{

@@ -24,8 +24,7 @@ use crate::Proof;
 mod encode;
 
 use encode::{
-    commitment_bytes, put_exit, put_machine_id, put_refine_host_boundary, put_segment_state,
-    put_u32, put_u64,
+    put_exit, put_machine_id, put_refine_host_boundary, put_segment_state, put_u32, put_u64,
 };
 
 /// Wire shape of the boundary bundle itself and the encoding of the machine
@@ -192,7 +191,7 @@ pub fn refine_bundle_cardinality_is_valid(bundle: &RefineProofBundle) -> bool {
         if slice.proof.log_sizes.len() > MAX_REFINE_CHILD_COMPONENTS
             || slice.proof.claimed_sums.len() > MAX_REFINE_CHILD_COMPONENTS
             || slice.proof.num_components > MAX_REFINE_CHILD_COMPONENTS
-            || slice.proof.stark_proof.commitments.len() != REFINE_CHILD_COMMITMENT_COUNT
+            || slice.proof.stark_proof.commitments().len() != REFINE_CHILD_COMMITMENT_COUNT
         {
             return false;
         }
@@ -267,9 +266,10 @@ pub fn refine_bundle_commitment(bundle: &RefineProofBundle) -> [u8; 32] {
         }
         put_segment_state(&mut bytes, &proof.initial_state);
         put_segment_state(&mut bytes, &proof.final_state);
-        put_u32(&mut bytes, proof.stark_proof.commitments.len() as u32);
-        for commitment in proof.stark_proof.commitments.iter() {
-            bytes.extend_from_slice(&commitment_bytes(commitment));
+        let commitments = proof.stark_proof.commitments();
+        put_u32(&mut bytes, commitments.len() as u32);
+        for commitment in &commitments {
+            bytes.extend_from_slice(&commitment.to_bytes());
         }
     }
     put_u32(&mut bytes, bundle.host_boundaries.len() as u32);

@@ -507,14 +507,13 @@ impl Channel for Poseidon2M31Channel {
         permute(&mut s);
         let mut s2 = [BaseField::zero(); N_STATE];
         s2[..8].copy_from_slice(&s[..8]);
-        s2[8] = BaseField::reduce(nonce & 0xFFFF_FFFF);
-        s2[9] = BaseField::reduce(nonce >> 32);
+        s2[8..12].copy_from_slice(&u64_limbs(nonce));
         permute(&mut s2);
         s2[0].0.trailing_zeros() >= n_bits
     }
 
     fn mix_u32s(&mut self, data: &[u32]) {
-        let m: Vec<BaseField> = data.iter().map(|&x| BaseField::reduce(x as u64)).collect();
+        let m: Vec<BaseField> = data.iter().flat_map(|&x| u32_limbs(x)).collect();
         self.absorb(&m);
     }
 
@@ -524,10 +523,7 @@ impl Channel for Poseidon2M31Channel {
     }
 
     fn mix_u64(&mut self, value: u64) {
-        self.absorb(&[
-            BaseField::reduce(value & 0xFFFF_FFFF),
-            BaseField::reduce(value >> 32),
-        ]);
+        self.absorb(&u64_limbs(value));
     }
 
     fn draw_secure_felt(&mut self) -> SecureField {
@@ -550,6 +546,17 @@ impl Channel for Poseidon2M31Channel {
     fn draw_u32s(&mut self) -> Vec<u32> {
         self.squeeze8().iter().map(|m| m.0).collect()
     }
+}
+
+/// A u64's four 16-bit limbs, little-endian, as the prover's channel takes
+/// it (`vos_pvm_proof::poseidon2::u64_limbs`).
+fn u64_limbs(value: u64) -> [BaseField; 4] {
+    core::array::from_fn(|i| BaseField::from_u32_unchecked(((value >> (16 * i)) & 0xffff) as u32))
+}
+
+/// A u32's two 16-bit limbs, little-endian.
+fn u32_limbs(value: u32) -> [BaseField; 2] {
+    core::array::from_fn(|i| BaseField::from_u32_unchecked((value >> (16 * i)) & 0xffff))
 }
 
 #[derive(Default)]

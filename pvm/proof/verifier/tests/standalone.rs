@@ -7,6 +7,27 @@ use vos_pvm_proof::core::tracing::TracingPvm;
 use vos_pvm_proof::{Proof, SideNote, prove};
 use vos_pvm_proof_verifier::{CommitmentHash, verify_standalone};
 
+/// The Blake2s Stark proof of a format-24 proof.
+fn stark(
+    proof: &mut Proof,
+) -> &mut stwo::core::proof::StarkProof<stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleHasher>
+{
+    match &mut proof.stark_proof {
+        vos_pvm_proof::StarkProofAny::Blake2s(stark) => stark,
+        other => panic!("a Blake2s proof, not {:?}", other.channel()),
+    }
+}
+
+/// [`stark`], read only.
+fn stark_ref(
+    proof: &Proof,
+) -> &stwo::core::proof::StarkProof<stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleHasher> {
+    match &proof.stark_proof {
+        vos_pvm_proof::StarkProofAny::Blake2s(stark) => stark,
+        other => panic!("a Blake2s proof, not {:?}", other.channel()),
+    }
+}
+
 fn assert_hostile_proof_rejected_without_panic(
     label: &str,
     proof: Proof,
@@ -40,7 +61,7 @@ fn mutate_pcs_config(
     mutate: impl FnOnce(&mut stwo::core::pcs::PcsConfig),
 ) -> Proof {
     mutate(&mut proof.pcs_config);
-    proof.stark_proof.0.config = proof.pcs_config;
+    stark(&mut proof).0.config = proof.pcs_config;
     proof
 }
 
@@ -71,7 +92,7 @@ fn standalone_verify_add64() {
 
     // Extract the preprocessed commitment from the proof itself
     // (In production, this would be pre-computed from the program bytecode)
-    let preprocessed_commitment = proof.stark_proof.commitments[0];
+    let preprocessed_commitment = proof.preprocessed_commitment().unwrap();
 
     // Verify using standalone verifier (no SideNote needed!)
     verify_standalone(proof.clone(), preprocessed_commitment)
@@ -93,8 +114,8 @@ fn standalone_verify_add64() {
 
     // Nested hostile shapes are rejected before either verifier enters Stwo.
     let mut hostile = proof.clone();
-    let sample = hostile.stark_proof.sampled_values[0][0][0];
-    hostile.stark_proof.0.sampled_values[0][0].resize(
+    let sample = stark_ref(&hostile).sampled_values[0][0][0];
+    stark(&mut hostile).0.sampled_values[0][0].resize(
         vos_pvm_proof::proof::MAX_PROOF_SAMPLES_PER_COLUMN + 1,
         sample,
     );
@@ -116,7 +137,7 @@ fn standalone_verify_add64() {
     );
 
     let mut hostile = proof.clone();
-    hostile.stark_proof.0.sampled_values[0][0][0] =
+    stark(&mut hostile).0.sampled_values[0][0][0] =
         stwo::core::fields::qm31::SecureField::from_u32_unchecked(u32::MAX, 0, 0, 0);
     assert_hostile_proof_rejected_without_panic(
         "noncanonical OODS-sample limb",
@@ -126,7 +147,7 @@ fn standalone_verify_add64() {
     );
 
     let mut hostile = proof.clone();
-    hostile.stark_proof.0.queried_values[0][0][0] =
+    stark(&mut hostile).0.queried_values[0][0][0] =
         stwo::core::fields::m31::BaseField::from_u32_unchecked(u32::MAX);
     assert_hostile_proof_rejected_without_panic(
         "noncanonical queried-value limb",
@@ -136,7 +157,7 @@ fn standalone_verify_add64() {
     );
 
     let mut hostile = proof.clone();
-    hostile.stark_proof.0.commitments.clear();
+    stark(&mut hostile).0.commitments.clear();
     assert_hostile_proof_rejected_without_panic(
         "missing commitment trees",
         hostile,
@@ -145,7 +166,7 @@ fn standalone_verify_add64() {
     );
 
     let mut hostile = proof.clone();
-    hostile.stark_proof.0.queried_values[0].pop();
+    stark(&mut hostile).0.queried_values[0].pop();
     assert_hostile_proof_rejected_without_panic(
         "missing queried-value column",
         hostile,
@@ -154,7 +175,7 @@ fn standalone_verify_add64() {
     );
 
     let mut hostile = proof.clone();
-    hostile.stark_proof.0.fri_proof.inner_layers.pop();
+    stark(&mut hostile).0.fri_proof.inner_layers.pop();
     assert_hostile_proof_rejected_without_panic(
         "missing FRI layer",
         hostile,
@@ -163,7 +184,7 @@ fn standalone_verify_add64() {
     );
 
     let mut hostile = proof.clone();
-    hostile.stark_proof.0.config.pow_bits ^= 1;
+    stark(&mut hostile).0.config.pow_bits ^= 1;
     assert_hostile_proof_rejected_without_panic(
         "outer/embedded PCS mismatch",
         hostile,
@@ -245,7 +266,7 @@ fn standalone_verify_add64() {
     // `None` and `Some(derived)` can describe the same effective tree height
     // for some AIR layouts, but are distinct signed protocol configurations.
     // Relabelling both outer and embedded config must fail cryptographically.
-    let required_lifting = u32::try_from(proof.stark_proof.fri_proof.inner_layers.len()).unwrap()
+    let required_lifting = u32::try_from(stark_ref(&proof).fri_proof.inner_layers.len()).unwrap()
         + 1
         + proof.pcs_config.fri_config.log_last_layer_degree_bound
         + proof.pcs_config.fri_config.log_blowup_factor;
@@ -275,24 +296,24 @@ fn standalone_verify_add64() {
     // funnel separately runs the same check before cloning children.
     let mut aggregate = proof;
     aggregate.pcs_config.fri_config.n_queries = vos_pvm_proof::proof::MAX_FRI_QUERIES;
-    aggregate.stark_proof.0.config = aggregate.pcs_config;
-    let secure = aggregate.stark_proof.sampled_values[0][0][0];
-    let base = aggregate.stark_proof.queried_values[0][0][0];
-    for tree in aggregate.stark_proof.0.sampled_values.iter_mut() {
+    stark(&mut aggregate).0.config = aggregate.pcs_config;
+    let secure = stark_ref(&aggregate).sampled_values[0][0][0];
+    let base = stark_ref(&aggregate).queried_values[0][0][0];
+    for tree in stark(&mut aggregate).0.sampled_values.iter_mut() {
         for column in tree {
             column.resize(vos_pvm_proof::proof::MAX_PROOF_SAMPLES_PER_COLUMN, secure);
         }
     }
-    for tree in aggregate.stark_proof.0.queried_values.iter_mut() {
+    for tree in stark(&mut aggregate).0.queried_values.iter_mut() {
         for column in tree {
             column.resize(vos_pvm_proof::proof::MAX_FRI_QUERIES, base);
         }
     }
-    aggregate.stark_proof.0.sampled_values[0].resize(
+    stark(&mut aggregate).0.sampled_values[0].resize(
         vos_pvm_proof::proof::MAX_PROOF_COLUMNS_PER_TREE,
         vec![secure; vos_pvm_proof::proof::MAX_PROOF_SAMPLES_PER_COLUMN],
     );
-    aggregate.stark_proof.0.queried_values[0].resize(
+    stark(&mut aggregate).0.queried_values[0].resize(
         vos_pvm_proof::proof::MAX_PROOF_COLUMNS_PER_TREE,
         vec![base; vos_pvm_proof::proof::MAX_FRI_QUERIES],
     );
@@ -331,7 +352,7 @@ fn standalone_verify_rejects_wrong_commitment() {
     let proof = prove(&mut side_note).expect("proving failed");
 
     // Use a wrong commitment
-    let wrong_commitment = vos_pvm_proof_verifier::CommitmentHash::default();
+    let wrong_commitment = vos_pvm_proof_verifier::CommitmentHash::Blake2s(Default::default());
 
     let result = verify_standalone(proof, wrong_commitment);
     assert!(
@@ -364,13 +385,13 @@ fn standalone_verify_rejects_format_version_mismatch() {
 
     let mut side_note = SideNote::new(steps, code, bitmask);
     let mut proof = prove(&mut side_note).expect("proving failed");
-    let preprocessed_commitment = proof.stark_proof.commitments[0];
+    let preprocessed_commitment = proof.preprocessed_commitment().unwrap();
 
     let mut explicitly_old = proof.clone();
     explicitly_old.format_version = 18;
     let old_error = verify_standalone(explicitly_old, preprocessed_commitment)
-        .expect_err("format-18 proof must be rejected by format 20");
-    assert!(format!("{old_error:?}").contains("format version"));
+        .expect_err("format-18 proof must be rejected");
+    assert!(format!("{old_error:?}").contains("proof format 18 is not registered"));
 
     // Stronger regression: construct all Stwo commitments/openings under the
     // actual pre-config-binding v18 transcript, then relabel only the outer
@@ -382,7 +403,7 @@ fn standalone_verify_rejects_format_version_mismatch() {
         relabelled.format_version,
         vos_pvm_proof::PROOF_FORMAT_VERSION
     );
-    let relabelled_commitment = relabelled.stark_proof.commitments[0];
+    let relabelled_commitment = relabelled.preprocessed_commitment().unwrap();
     assert!(
         verify_standalone(relabelled.clone(), relabelled_commitment).is_err(),
         "pre-config-binding transcript was accepted after relabelling"
@@ -392,14 +413,15 @@ fn standalone_verify_rejects_format_version_mismatch() {
         "prover-side verifier accepted a relabelled v18 transcript"
     );
 
-    // Forge: simulate a proof from a future AIR shape.
-    proof.format_version = vos_pvm_proof::PROOF_FORMAT_VERSION + 1;
+    // Forge: a number the registry does not hold, as a proof of a future
+    // AIR would carry.
+    proof.format_version = 31;
 
     let err = verify_standalone(proof, preprocessed_commitment)
         .expect_err("should reject mismatched format_version");
     let msg = format!("{err:?}");
     assert!(
-        msg.contains("format version"),
+        msg.contains("proof format 31 is not registered"),
         "expected format-version error, got: {msg}"
     );
 }
@@ -438,7 +460,7 @@ fn standalone_verify_rejects_weak_pcs_config() {
     };
     let mut side_note = SideNote::new(steps, code, bitmask);
     let proof = prove_with_config(&mut side_note, weak_config).expect("proving failed");
-    let preprocessed_commitment = proof.stark_proof.commitments[0];
+    let preprocessed_commitment = proof.preprocessed_commitment().unwrap();
 
     let err = vos_pvm_proof_verifier::verify_standalone(proof, preprocessed_commitment)
         .expect_err("default verify_standalone must reject weak pcs_config");
@@ -477,7 +499,7 @@ fn standalone_verify_accepts_weak_pcs_config_with_relaxed_policy() {
     };
     let mut side_note = SideNote::new(steps, code, bitmask);
     let proof = prove_with_config(&mut side_note, weak_config).expect("proving failed");
-    let preprocessed_commitment = proof.stark_proof.commitments[0];
+    let preprocessed_commitment = proof.preprocessed_commitment().unwrap();
 
     // Relaxed policy that allows weaker configs (e.g. for test
     // harnesses).  The proof must verify under this policy.
@@ -517,7 +539,7 @@ fn standalone_verify_rejects_oversized_log_size() {
 
     let mut side_note = SideNote::new(steps, code, bitmask);
     let proof = prove(&mut side_note).expect("proving failed");
-    let preprocessed_commitment = proof.stark_proof.commitments[0];
+    let preprocessed_commitment = proof.preprocessed_commitment().unwrap();
 
     // Cap = 0: even the smallest legitimate proof has log_sizes >= LOG_N_LANES.
     let err = vos_pvm_proof_verifier::verify_standalone_with_max_log_size(
@@ -553,12 +575,15 @@ fn standalone_verify_rejects_zero_format_version() {
 
     let mut side_note = SideNote::new(steps, code, bitmask);
     let mut proof = prove(&mut side_note).expect("proving failed");
-    let preprocessed_commitment = proof.stark_proof.commitments[0];
+    let preprocessed_commitment = proof.preprocessed_commitment().unwrap();
 
     proof.format_version = 0;
 
     let err = verify_standalone(proof, preprocessed_commitment)
         .expect_err("should reject format_version=0");
     let msg = format!("{err:?}");
-    assert!(msg.contains("format version"), "got: {msg}");
+    assert!(
+        msg.contains("proof format 0 is not registered"),
+        "got: {msg}"
+    );
 }

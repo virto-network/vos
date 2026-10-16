@@ -12,9 +12,10 @@ use stwo::{
 };
 use stwo_constraint_framework::TraceLocationAllocator;
 
-use crate::recursion_pcs::{
-    ProverBackend, ProverChannel, ProverMerkleChannel, ProverMerkleHasher, for_commit,
-};
+use stwo::prover::backend::{BackendForChannel, simd::SimdBackend};
+
+use crate::format::{Encoding, Format};
+use crate::pcs::{FsChannel, PcsStack};
 
 use crate::trace::eval::{INTERACTION_TRACE_IDX, ORIGINAL_TRACE_IDX, PREPROCESSED_TRACE_IDX};
 
@@ -201,19 +202,11 @@ fn verify_with_options_explicit_components(
     prover_components: &[&dyn crate::framework::MachineProverComponent],
     boundary_positions: Option<crate::boundary_binding::BoundaryChipPositions>,
 ) -> Result<(), VerificationError> {
+    // The format the proof names, admitted and with its Stark proof on the
+    // format's channel, before any cryptographic work.
     crate::proof::preflight_proof_structure(&mut proof, max_log_size)
         .map_err(VerificationError::InvalidStructure)?;
-    // Reject proofs from a different AIR shape early, before
-    // any cryptographic work.  `format_version` is bumped whenever the
-    // chip list / column counts / lookup-tuple shape changes in a way
-    // that would make an older verifier silently accept the wrong thing.
-    if proof.format_version != crate::proof::PROOF_FORMAT_VERSION {
-        return Err(VerificationError::InvalidStructure(format!(
-            "proof format version mismatch: verifier expects {}, proof has {}",
-            crate::proof::PROOF_FORMAT_VERSION,
-            proof.format_version,
-        )));
-    }
+    let format = crate::proof::proof_format(&proof).map_err(VerificationError::InvalidStructure)?;
     // Cap log_sizes so a malicious prover can't force a
     // giant Merkle commitment phase.
     if let Some(&offending) = proof.log_sizes.iter().find(|&&ls| ls > max_log_size) {
@@ -221,16 +214,16 @@ fn verify_with_options_explicit_components(
             "proof log_size {offending} exceeds cap {max_log_size}"
         )));
     }
-    // Enforce the FRI-shape floor — reject under-spec'd pcs_configs before any
-    // cryptographic work. `None` = the default conjectured-security floor
-    // (accepts any 96-bit-secure shape, STANDARD and MOBILE both); `Some(p)` =
-    // an exact `PcsPolicy` pin (the strict `*_with_pcs_policy` path).
-    let shape_check = match policy {
-        Some(p) => crate::proof::check_pcs_policy(&proof.pcs_config, p),
-        None => crate::proof::check_min_security(&proof.pcs_config),
-    };
-    if let Err(msg) = shape_check {
-        return Err(VerificationError::InvalidStructure(msg));
+    // Format 24 takes the proof's own parameters under a policy: `None` =
+    // the default conjectured-security floor (STANDARD and MOBILE both);
+    // `Some(p)` = an exact `PcsPolicy` pin. Every other format fixes its
+    // parameters, checked with its floors once the shape is known.
+    if format.encoding == Encoding::Legacy {
+        let shape_check = match policy {
+            Some(p) => crate::proof::check_pcs_policy(&proof.pcs_config, p),
+            None => crate::proof::check_min_security(&proof.pcs_config),
+        };
+        shape_check.map_err(VerificationError::InvalidStructure)?;
     }
     if proof.pcs_config.fri_config.log_blowup_factor > crate::proof::MAX_RECOMMIT_LOG_BLOWUP {
         return Err(VerificationError::InvalidStructure(format!(
@@ -243,6 +236,30 @@ fn verify_with_options_explicit_components(
             "proof component dimensions differ from selected AIR components".to_string(),
         ));
     }
+    crate::with_stack!(format.channel, Stack => verify_on::<Stack>(
+        proof,
+        format,
+        side_note,
+        components,
+        prover_components,
+        boundary_positions,
+    ), unbuilt => Err(VerificationError::InvalidStructure(format!(
+        "format {}'s channel is not built",
+        format.number
+    ))))
+}
+
+fn verify_on<MC: PcsStack>(
+    proof: Proof,
+    format: &'static Format,
+    side_note: &SideNote,
+    components: &[&dyn crate::framework::MachineComponent],
+    prover_components: &[&dyn crate::framework::MachineProverComponent],
+    boundary_positions: Option<crate::boundary_binding::BoundaryChipPositions>,
+) -> Result<(), VerificationError>
+where
+    SimdBackend: BackendForChannel<MC>,
+{
     let sizes: Vec<TreeVec<Vec<u32>>> = components
         .iter()
         .zip(&proof.log_sizes)
@@ -255,9 +272,9 @@ fn verify_with_options_explicit_components(
         .flat_map(|(component, &log_size)| component.preprocessed_trace_sizes(log_size))
         .collect();
     let mut dummy_lookup = AllLookupElements::default();
-    let mut dummy_channel = ProverChannel::default();
+    let mut dummy_channel = MC::C::default();
     components.iter().for_each(|component| {
-        component.draw_lookup_elements(&mut dummy_lookup, &mut dummy_channel)
+        component.draw_lookup_elements(&mut dummy_lookup, dummy_channel.as_ref_channel())
     });
     let dummy_allocator = &mut TraceLocationAllocator::default();
     let shape_components: Vec<Box<dyn Component>> = components
@@ -272,14 +289,9 @@ fn verify_with_options_explicit_components(
         .iter()
         .map(|component| &**component)
         .collect();
-    let protocol_shape = crate::framework_access::preflight_component_dimensions(
-        &proof,
-        &shape_component_refs,
-        &expected_log_sizes,
-    )
-    .map_err(VerificationError::InvalidStructure)?;
     let Proof {
-        stark_proof: proof,
+        stark_proof,
+        interaction_pow,
         claimed_sums,
         log_sizes: claimed_log_sizes,
         pcs_config: config,
@@ -287,19 +299,31 @@ fn verify_with_options_explicit_components(
         final_state,
         ..
     } = proof;
-
-    let verifier_channel = &mut ProverChannel::default();
-    crate::proof::mix_proof_fs_domain(
-        verifier_channel,
-        crate::proof::PROOF_FORMAT_VERSION,
+    let proof = MC::from_any(stark_proof).ok_or_else(|| {
+        VerificationError::InvalidStructure("Stark proof channel differs".to_string())
+    })?;
+    let (protocol_shape, security_shape) = crate::framework_access::preflight_component_dimensions(
         &config,
+        &proof,
+        &shape_component_refs,
+        &expected_log_sizes,
+    )
+    .map_err(VerificationError::InvalidStructure)?;
+    if format.encoding == Encoding::Lossless {
+        crate::proof::check_format_security(format, &config, &security_shape)
+            .map_err(VerificationError::InvalidStructure)?;
+    }
+
+    let verifier_channel = &mut MC::C::default();
+    crate::proof::mix_statement_header(
+        verifier_channel,
+        format.number,
+        &config,
+        &claimed_log_sizes,
     );
-    claimed_log_sizes.iter().for_each(|log_size| {
-        verifier_channel.mix_u64(*log_size as u64);
-    });
 
     // Verify preprocessed trace commitment
-    verify_preprocessed_trace(
+    verify_preprocessed_trace::<MC>(
         &proof,
         side_note,
         verifier_channel,
@@ -308,47 +332,38 @@ fn verify_with_options_explicit_components(
         prover_components,
     )?;
 
-    let commitment_scheme = &mut CommitmentSchemeVerifier::<ProverMerkleChannel>::new(config);
+    let commitment_scheme = &mut CommitmentSchemeVerifier::<MC>::new(config);
     let log_sizes = expected_log_sizes;
 
     for idx in [PREPROCESSED_TRACE_IDX, ORIGINAL_TRACE_IDX] {
         commitment_scheme.commit(proof.commitments[idx], &log_sizes[idx], verifier_channel);
     }
 
-    // Mix `proof.{initial,final}_state` (registers, pc,
-    // timestamp) into the FS transcript. Mirrors the prover-side mix in
-    // `prove.rs` immediately after the main-trace commit, so the lookup
-    // elements drawn next depend on the claimed boundary states. Gated
-    // on `side_note.closing_chip_active` — the default `verify` path
-    // sees the flag via the prover-mutated side_note, and chip-isolated
-    // `verify_with_explicit_components` only flips it when the caller's
-    // slice includes the boundary + closing chip pair. Order MUST match
-    // the prover (initial first, then final). `memory_commitment` stays
-    // unmixed (computed outside the circuit).
+    // A.1's third and fourth items, as the prover ran them: the boundary
+    // states and the interaction PoW, before the relation challenges. Gated
+    // on `side_note.closing_chip_active`, as the prover's mix is: the
+    // default `verify` path sees the flag via the prover-mutated side_note,
+    // and chip-isolated `verify_with_explicit_components` only flips it when
+    // the caller's slice includes the boundary + closing chip pair.
     if side_note.closing_chip_active {
-        for r in &initial_state.registers {
-            verifier_channel.mix_u64(*r);
-        }
-        for r in &final_state.registers {
-            verifier_channel.mix_u64(*r);
-        }
-        verifier_channel.mix_u64(initial_state.pc as u64);
-        verifier_channel.mix_u64(initial_state.timestamp);
-        verifier_channel.mix_u64(final_state.pc as u64);
-        verifier_channel.mix_u64(final_state.timestamp);
-        // Format v7: entering then exit RAM Merkle root, 4 LE u64 each.
-        for chunk in initial_state.memory_root.chunks_exact(8) {
-            verifier_channel.mix_u64(u64::from_le_bytes(chunk.try_into().unwrap()));
-        }
-        for chunk in final_state.memory_root.chunks_exact(8) {
-            verifier_channel.mix_u64(u64::from_le_bytes(chunk.try_into().unwrap()));
-        }
+        crate::proof::mix_boundary_states(
+            verifier_channel,
+            format.encoding,
+            &initial_state,
+            &final_state,
+        );
+        crate::proof::check_interaction_pow(verifier_channel, format, interaction_pow)
+            .map_err(VerificationError::InvalidStructure)?;
+    } else if interaction_pow != 0 {
+        return Err(VerificationError::InvalidStructure(
+            "a proof without the boundary chips carries no interaction PoW".to_string(),
+        ));
     }
 
     let mut lookup_elements = AllLookupElements::default();
-    components
-        .iter()
-        .for_each(|c| c.draw_lookup_elements(&mut lookup_elements, verifier_channel));
+    components.iter().for_each(|c| {
+        c.draw_lookup_elements(&mut lookup_elements, verifier_channel.as_ref_channel())
+    });
 
     // Verify logup sum = 0
     if claimed_sums.iter().sum::<SecureField>() != SecureField::zero() {
@@ -399,7 +414,7 @@ fn verify_with_options_explicit_components(
         verifier_channel,
     );
 
-    let sampled_queries = crate::proof::expected_fiat_shamir_query_count(
+    let sampled_queries = crate::proof::expected_fiat_shamir_query_count::<MC>(
         verifier_channel,
         &proof,
         &config,
@@ -416,14 +431,17 @@ fn verify_with_options_explicit_components(
     stwo::core::verifier::verify(&components_ref, verifier_channel, commitment_scheme, proof)
 }
 
-fn verify_preprocessed_trace(
-    proof: &stwo::core::proof::StarkProof<ProverMerkleHasher>,
+fn verify_preprocessed_trace<MC: PcsStack>(
+    proof: &stwo::core::proof::StarkProof<MC::H>,
     side_note: &SideNote,
-    verifier_channel: &ProverChannel,
+    verifier_channel: &MC::C,
     log_sizes: &[u32],
     config: &PcsConfig,
     components: &[&dyn crate::framework::MachineProverComponent],
-) -> Result<(), VerificationError> {
+) -> Result<(), VerificationError>
+where
+    SimdBackend: BackendForChannel<MC>,
+{
     // The caller passes the same prover-trait component set the
     // prover used (either `active_components(side_note)` for the default
     // path, or an explicit slice for the chip-isolated harness).  This
@@ -437,19 +455,16 @@ fn verify_preprocessed_trace(
         .max()
         .unwrap_or(0);
     let verifier_channel = &mut verifier_channel.clone();
-    let twiddles = ProverBackend::precompute_twiddles(
+    let twiddles = SimdBackend::precompute_twiddles(
         CanonicCoset::new(max_constraint_log_degree_bound + config.fri_config.log_blowup_factor)
             .circle_domain()
             .half_coset,
     );
-    let commitment_scheme =
-        &mut CommitmentSchemeProver::<ProverBackend, ProverMerkleChannel>::new(*config, &twiddles);
+    let commitment_scheme = &mut CommitmentSchemeProver::<SimdBackend, MC>::new(*config, &twiddles);
 
     let mut tree_builder = commitment_scheme.tree_builder();
     for (c, log_size) in components.iter().zip(log_sizes) {
-        tree_builder.extend_evals(for_commit(
-            c.generate_preprocessed_trace(*log_size, side_note),
-        ));
+        tree_builder.extend_evals(c.generate_preprocessed_trace(*log_size, side_note));
     }
     tree_builder.commit(verifier_channel);
 
@@ -515,6 +530,12 @@ pub struct OodsReconstruction {
 /// trust boundary: it assumes a well-formed proof (its `component_mask` popcount
 /// equals `log_sizes`/`claimed_sums` length, and an 8-column composition tree).
 pub fn reconstruct_oods_for_recursion(proof: &Proof, side_note: &SideNote) -> OodsReconstruction {
+    let format = crate::proof::proof_format(proof).expect("an admitted proof format");
+    crate::with_stack!(format.channel, Stack => reconstruct_oods_on::<Stack>(proof, side_note),
+        unbuilt => panic!("format {}'s channel is not built", format.number))
+}
+
+fn reconstruct_oods_on<MC: PcsStack>(proof: &Proof, side_note: &SideNote) -> OodsReconstruction {
     use stwo::core::air::Components;
     use stwo::core::circle::CirclePoint;
     use stwo::core::constraints::coset_vanishing;
@@ -523,102 +544,17 @@ pub fn reconstruct_oods_for_recursion(proof: &Proof, side_note: &SideNote) -> Oo
     use stwo::core::verifier::COMPOSITION_LOG_SPLIT;
 
     let config = proof.pcs_config;
-    let sp = &proof.stark_proof;
+    let sp = MC::stark(&proof.stark_proof).expect("the proof's channel");
     let claimed_log_sizes = &proof.log_sizes;
     let claimed_sums = &proof.claimed_sums;
-
-    // The positional zips below (sizes / verifier_components / per-component
-    // slices / comps) assume `component_mask` popcount == log_sizes ==
-    // claimed_sums; the production verifier enforces this (verify.rs:221-230),
-    // so assert it here too rather than silently truncate on a malformed proof.
-    let n_active = (proof.component_mask).count_ones() as usize;
-    assert_eq!(
-        n_active,
-        claimed_log_sizes.len(),
-        "component_mask popcount must equal log_sizes length"
-    );
-    assert_eq!(
-        n_active,
-        claimed_sums.len(),
-        "component_mask popcount must equal claimed_sums length"
-    );
-
-    // Select components by the PROOF's component_mask, not the side note's
-    // natural-active set: a canonical proof forces ALL 31 (padding inactive
-    // chips), so `active_components_verifier(side_note)` (which drops e.g.
-    // Blake2b/Ristretto for a program that never uses them) would not match the
-    // proof's trace layout.
-    let active_indices: alloc::vec::Vec<usize> = (0..super::chip_idx::COUNT)
-        .filter(|&i| proof.component_mask & (1 << i) != 0)
-        .collect();
-    let components_owned: alloc::vec::Vec<&dyn crate::framework::MachineComponent> = active_indices
-        .iter()
-        .map(|&i| super::BASE_COMPONENTS[i] as &dyn crate::framework::MachineComponent)
-        .collect();
-    let components: &[&dyn crate::framework::MachineComponent] = &components_owned;
-
-    // ── Replay the FS transcript (channel-affecting steps only) ─────────────
-    let verifier_channel = &mut ProverChannel::default();
-    crate::proof::mix_proof_fs_domain(verifier_channel, proof.format_version, &config);
-    claimed_log_sizes
-        .iter()
-        .for_each(|ls| verifier_channel.mix_u64(*ls as u64));
-
-    let commitment_scheme = &mut CommitmentSchemeVerifier::<ProverMerkleChannel>::new(config);
-    let sizes: alloc::vec::Vec<TreeVec<alloc::vec::Vec<u32>>> = components
-        .iter()
-        .zip(claimed_log_sizes)
-        .map(|(c, &ls)| c.trace_sizes(ls))
-        .collect();
-    let mut log_sizes = TreeVec::concat_cols(sizes.into_iter());
-    log_sizes[PREPROCESSED_TRACE_IDX] = components
-        .iter()
-        .zip(claimed_log_sizes)
-        .flat_map(|(c, &ls)| c.preprocessed_trace_sizes(ls))
-        .collect();
-
-    for idx in [PREPROCESSED_TRACE_IDX, ORIGINAL_TRACE_IDX] {
-        commitment_scheme.commit(sp.commitments[idx], &log_sizes[idx], verifier_channel);
-    }
-
-    if side_note.closing_chip_active {
-        for r in &proof.initial_state.registers {
-            verifier_channel.mix_u64(*r);
-        }
-        for r in &proof.final_state.registers {
-            verifier_channel.mix_u64(*r);
-        }
-        verifier_channel.mix_u64(proof.initial_state.pc as u64);
-        verifier_channel.mix_u64(proof.initial_state.timestamp);
-        verifier_channel.mix_u64(proof.final_state.pc as u64);
-        verifier_channel.mix_u64(proof.final_state.timestamp);
-        for chunk in proof.initial_state.memory_root.chunks_exact(8) {
-            verifier_channel.mix_u64(u64::from_le_bytes(chunk.try_into().unwrap()));
-        }
-        for chunk in proof.final_state.memory_root.chunks_exact(8) {
-            verifier_channel.mix_u64(u64::from_le_bytes(chunk.try_into().unwrap()));
-        }
-    }
-
-    let mut lookup_elements = AllLookupElements::default();
-    components
-        .iter()
-        .for_each(|c| c.draw_lookup_elements(&mut lookup_elements, verifier_channel));
-
-    let tree_span_provider = &mut TraceLocationAllocator::default();
-    let verifier_components: alloc::vec::Vec<alloc::boxed::Box<dyn Component>> = components
-        .iter()
-        .zip(claimed_sums)
-        .zip(claimed_log_sizes)
-        .map(|((c, cs), &ls)| c.to_component(tree_span_provider, &lookup_elements, ls, *cs))
-        .collect();
-
-    verifier_channel.mix_felts(claimed_sums);
-    commitment_scheme.commit(
-        sp.commitments[INTERACTION_TRACE_IDX],
-        &log_sizes[INTERACTION_TRACE_IDX],
-        verifier_channel,
-    );
+    let verifier_channel = &mut MC::C::default();
+    let commitment_scheme = &mut CommitmentSchemeVerifier::<MC>::new(config);
+    let ctx = recursion_verify_prefix::<MC>(proof, side_note, verifier_channel, commitment_scheme);
+    let components = &ctx.components;
+    let log_sizes = &ctx.log_sizes;
+    let verifier_components = &ctx.verifier_components;
+    let lookup_elements = ctx.lookup_elements.clone();
+    let active_indices = &ctx.active_indices;
 
     // ── stwo verifier head: random_coeff, composition commit, oods_point ────
     let components_ref: alloc::vec::Vec<&dyn Component> =
@@ -669,7 +605,7 @@ pub fn reconstruct_oods_for_recursion(proof: &Proof, side_note: &SideNote) -> Oo
     for ((c, &ls), vc) in components
         .iter()
         .zip(claimed_log_sizes)
-        .zip(&verifier_components)
+        .zip(verifier_components)
     {
         let ts = c.trace_sizes(ls);
         let n_main = ts[ORIGINAL_TRACE_IDX].len();
@@ -707,42 +643,30 @@ pub fn reconstruct_oods_for_recursion(proof: &Proof, side_note: &SideNote) -> Oo
 /// The verifier-side state the native-recursion data extraction builds by
 /// replaying the vos-pvm-proof-specific FS-mix prefix of `verify` (the single source of
 /// truth for that load-bearing mix order — see [`recursion_verify_prefix`]).
-#[cfg(feature = "poseidon2-channel")]
-struct RecursionVerifyContext {
-    /// The relation elements drawn after the boundary-state mix (the `z`/`alpha`
-    /// the boundary-binding + OODS-embed consumers combine over).
+struct RecursionVerifyContext<'a> {
+    components: alloc::vec::Vec<&'a dyn crate::framework::MachineComponent>,
+    active_indices: alloc::vec::Vec<usize>,
+    log_sizes: TreeVec<alloc::vec::Vec<u32>>,
     lookup_elements: AllLookupElements,
-    /// The stwo verifier components, in active order.
-    verifier_components: alloc::vec::Vec<alloc::boxed::Box<dyn Component>>,
+    verifier_components: alloc::vec::Vec<alloc::boxed::Box<dyn Component + 'a>>,
 }
 
-/// Replay the vos-pvm-proof-specific Fiat-Shamir prefix `verify` drives on `channel` and
-/// `commitment_scheme`, up to and including the interaction-tree commit: mix the
-/// per-component log sizes, commit the preprocessed + main trees, mix the boundary
-/// state (gated on `closing_chip_active`), draw the lookup elements, then mix the
-/// claimed sums and commit the interaction tree. This is the single definition of
-/// that mix order (the order is load-bearing for soundness — a divergence silently
-/// corrupts every downstream challenge), shared by [`record_canonical_transcript`]
-/// and [`extract_recursion_data`]. After it returns, the caller drives the stwo
-/// verifier head (random_coeff / composition commit / OODS) on the same channel.
-///
-/// Components are selected by the proof's `component_mask` (canonical forces all
-/// 31), matching [`reconstruct_oods_for_recursion`]'s trace layout. The
-/// preprocessed-root check (`verify_preprocessed_trace`) clones the channel, so it
-/// has no transcript effect and is skipped.
-#[cfg(feature = "poseidon2-channel")]
-fn recursion_verify_prefix(
+/// The verifier's transcript through the interaction tree's root, on a
+/// well-formed proof: A.1's items 1 to 5 and the interaction commit.
+fn recursion_verify_prefix<MC: PcsStack>(
     proof: &Proof,
     side_note: &SideNote,
-    channel: &mut ProverChannel,
-    commitment_scheme: &mut CommitmentSchemeVerifier<ProverMerkleChannel>,
-) -> RecursionVerifyContext {
-    let sp = &proof.stark_proof;
+    channel: &mut MC::C,
+    commitment_scheme: &mut CommitmentSchemeVerifier<MC>,
+) -> RecursionVerifyContext<'static> {
+    let format = crate::proof::proof_format(proof).expect("an admitted proof format");
+    let sp = MC::stark(&proof.stark_proof).expect("the proof's channel");
     let claimed_log_sizes = &proof.log_sizes;
     let claimed_sums = &proof.claimed_sums;
 
-    crate::proof::mix_proof_fs_domain(channel, proof.format_version, &proof.pcs_config);
-
+    // The positional zips below assume `component_mask` popcount ==
+    // log_sizes == claimed_sums; the production verifier enforces this, so
+    // assert it here too rather than silently truncate on a malformed proof.
     let n_active = (proof.component_mask).count_ones() as usize;
     assert_eq!(
         n_active,
@@ -755,16 +679,24 @@ fn recursion_verify_prefix(
         "component_mask popcount must equal claimed_sums length"
     );
 
-    let components_owned: alloc::vec::Vec<&dyn crate::framework::MachineComponent> = (0
-        ..super::chip_idx::COUNT)
+    // Select components by the PROOF's component_mask, not the side note's
+    // natural-active set: a canonical proof forces every chip (padding
+    // inactive ones), so `active_components_verifier(side_note)` would not
+    // match the proof's trace layout.
+    let active_indices: alloc::vec::Vec<usize> = (0..super::chip_idx::COUNT)
         .filter(|&i| proof.component_mask & (1 << i) != 0)
-        .map(|i| super::BASE_COMPONENTS[i] as &dyn crate::framework::MachineComponent)
         .collect();
-    let components: &[&dyn crate::framework::MachineComponent] = &components_owned;
-
-    claimed_log_sizes
+    let components: alloc::vec::Vec<&dyn crate::framework::MachineComponent> = active_indices
         .iter()
-        .for_each(|ls| channel.mix_u64(*ls as u64));
+        .map(|&i| super::BASE_COMPONENTS[i] as &dyn crate::framework::MachineComponent)
+        .collect();
+
+    crate::proof::mix_statement_header(
+        channel,
+        format.number,
+        &proof.pcs_config,
+        claimed_log_sizes,
+    );
 
     let sizes: alloc::vec::Vec<TreeVec<alloc::vec::Vec<u32>>> = components
         .iter()
@@ -783,28 +715,20 @@ fn recursion_verify_prefix(
     }
 
     if side_note.closing_chip_active {
-        for r in &proof.initial_state.registers {
-            channel.mix_u64(*r);
-        }
-        for r in &proof.final_state.registers {
-            channel.mix_u64(*r);
-        }
-        channel.mix_u64(proof.initial_state.pc as u64);
-        channel.mix_u64(proof.initial_state.timestamp);
-        channel.mix_u64(proof.final_state.pc as u64);
-        channel.mix_u64(proof.final_state.timestamp);
-        for chunk in proof.initial_state.memory_root.chunks_exact(8) {
-            channel.mix_u64(u64::from_le_bytes(chunk.try_into().unwrap()));
-        }
-        for chunk in proof.final_state.memory_root.chunks_exact(8) {
-            channel.mix_u64(u64::from_le_bytes(chunk.try_into().unwrap()));
-        }
+        crate::proof::mix_boundary_states(
+            channel,
+            format.encoding,
+            &proof.initial_state,
+            &proof.final_state,
+        );
+        crate::proof::check_interaction_pow(channel, format, proof.interaction_pow)
+            .expect("the interaction PoW (recursion harness precondition)");
     }
 
     let mut lookup_elements = AllLookupElements::default();
     components
         .iter()
-        .for_each(|c| c.draw_lookup_elements(&mut lookup_elements, channel));
+        .for_each(|c| c.draw_lookup_elements(&mut lookup_elements, channel.as_ref_channel()));
 
     let tree_span_provider = &mut TraceLocationAllocator::default();
     let verifier_components: alloc::vec::Vec<alloc::boxed::Box<dyn Component>> = components
@@ -822,6 +746,9 @@ fn recursion_verify_prefix(
     );
 
     RecursionVerifyContext {
+        components,
+        active_indices,
+        log_sizes,
         lookup_elements,
         verifier_components,
     }
@@ -833,7 +760,6 @@ fn recursion_verify_prefix(
 /// reproduces row-for-row, and the source of every channel-derived challenge
 /// (composition `random_coeff`, OODS point, DEEP `random_coeff`, per-FRI-layer
 /// fold alphas, query positions) the downstream consumers latch.
-#[cfg(feature = "poseidon2-channel")]
 pub struct RecursionTranscript {
     /// Every permutation the verifier transcript performed, in caller order.
     pub records: alloc::vec::Vec<crate::poseidon2::PermRecord>,
@@ -849,7 +775,7 @@ pub struct RecursionTranscript {
 /// Record a real canonical segment proof's full verifier transcript by handing a
 /// recording [`Poseidon2M31Channel`](crate::poseidon2::Poseidon2M31Channel)
 /// through the SAME Fiat-Shamir sequence [`verify`] drives — the vos-pvm-proof prefix
-/// ([`recursion_verify_prefix`]) followed by stwo's `verify` head + FRI commit +
+/// (`recursion_verify_prefix`) followed by stwo's `verify` head + FRI commit +
 /// PoW + query sampling + Merkle decommit. Every absorb/squeeze/pow permutation
 /// lands in [`RecursionTranscript::records`] in caller order. This calls the REAL
 /// stwo `verify`, so its records are the ground truth [`extract_recursion_data`]'s
@@ -858,7 +784,6 @@ pub struct RecursionTranscript {
 /// Pairs with [`reconstruct_oods_for_recursion`] (same prefix, returns the OODS
 /// masks + scalars). PRECONDITION: `side_note` prover-left. Panics if the proof
 /// fails to verify (recursion harness assumes a valid proof).
-#[cfg(feature = "poseidon2-channel")]
 pub fn record_canonical_transcript(proof: &Proof, side_note: &SideNote) -> RecursionTranscript {
     use alloc::rc::Rc;
     use core::cell::RefCell;
@@ -866,7 +791,7 @@ pub fn record_canonical_transcript(proof: &Proof, side_note: &SideNote) -> Recur
     let recorder = Rc::new(RefCell::new(alloc::vec::Vec::new()));
     let channel = &mut crate::poseidon2::Poseidon2M31Channel::recording(recorder.clone());
     let commitment_scheme =
-        &mut CommitmentSchemeVerifier::<ProverMerkleChannel>::new(proof.pcs_config);
+        &mut CommitmentSchemeVerifier::<crate::poseidon2::P2MerkleChannel>::new(proof.pcs_config);
     let ctx = recursion_verify_prefix(proof, side_note, channel, commitment_scheme);
     let components_ref: alloc::vec::Vec<&dyn Component> =
         ctx.verifier_components.iter().map(|c| &**c).collect();
@@ -879,7 +804,7 @@ pub fn record_canonical_transcript(proof: &Proof, side_note: &SideNote) -> Recur
         &components_ref,
         channel,
         commitment_scheme,
-        proof.stark_proof.clone(),
+        poseidon2_stark(proof).clone(),
     )
     .expect("record_canonical_transcript: proof must verify (recursion harness precondition)");
 
@@ -898,7 +823,6 @@ pub fn record_canonical_transcript(proof: &Proof, side_note: &SideNote) -> Recur
 /// decommit data (roots, `queried_values`, `hash_witness`, `fri_witness`,
 /// `last_layer_poly`) is read directly from `proof.stark_proof` using these query
 /// positions — it is not duplicated here.
-#[cfg(feature = "poseidon2-channel")]
 pub struct RecursionData {
     /// The recorded transcript (records + prefix_len), identical to
     /// [`record_canonical_transcript`]'s — cross-checked equal in the gate test.
@@ -952,7 +876,6 @@ pub struct RecursionData {
 /// One DEEP-quotient sample batch: a sample point and the columns sampled there,
 /// each with its flattened column index + line coefficients. See
 /// [`RecursionData::deep_batches`].
-#[cfg(feature = "poseidon2-channel")]
 pub struct DeepBatch {
     pub point: stwo::core::circle::CirclePoint<SecureField>,
     /// `(flattened column index, a, b, c)` per column in this batch.
@@ -980,7 +903,6 @@ pub struct DeepBatch {
 ///
 /// PRECONDITION: `side_note` prover-left. Panics if any validation fails (the
 /// recursion harness assumes a well-formed, valid proof).
-#[cfg(feature = "poseidon2-channel")]
 pub fn extract_recursion_data(proof: &Proof, side_note: &SideNote) -> RecursionData {
     use alloc::rc::Rc;
     use core::cell::RefCell;
@@ -994,11 +916,12 @@ pub fn extract_recursion_data(proof: &Proof, side_note: &SideNote) -> RecursionD
     use stwo::core::verifier::COMPOSITION_LOG_SPLIT;
 
     let config = proof.pcs_config;
-    let sp = proof.stark_proof.clone();
+    let sp = poseidon2_stark(proof).clone();
 
     let recorder = Rc::new(RefCell::new(alloc::vec::Vec::new()));
     let channel = &mut crate::poseidon2::Poseidon2M31Channel::recording(recorder.clone());
-    let commitment_scheme = &mut CommitmentSchemeVerifier::<ProverMerkleChannel>::new(config);
+    let commitment_scheme =
+        &mut CommitmentSchemeVerifier::<crate::poseidon2::P2MerkleChannel>::new(config);
     let ctx = recursion_verify_prefix(proof, side_note, channel, commitment_scheme);
     let prefix_len = recorder.borrow().len();
 
@@ -1043,7 +966,7 @@ pub fn extract_recursion_data(proof: &Proof, side_note: &SideNote) -> RecursionD
     // Capture the per-layer fold alphas by bracketing the FRI commit: the squeezes
     // it performs (interleaved with the per-layer root absorbs) ARE the alphas.
     let fri_before = recorder.borrow().len();
-    let mut fri_verifier = FriVerifier::<ProverMerkleChannel>::commit(
+    let mut fri_verifier = FriVerifier::<crate::poseidon2::P2MerkleChannel>::commit(
         channel,
         config.fri_config,
         sp.fri_proof.clone(),
@@ -1191,4 +1114,12 @@ pub fn extract_recursion_data(proof: &Proof, side_note: &SideNote) -> RecursionD
             .collect(),
         deep_batches,
     }
+}
+
+/// The Poseidon2-M31 Stark proof of a proof the recursion seams take.
+fn poseidon2_stark(
+    proof: &Proof,
+) -> &stwo::core::proof::StarkProof<crate::poseidon2::P2MerkleHasher> {
+    <crate::poseidon2::P2MerkleChannel as PcsStack>::stark(&proof.stark_proof)
+        .expect("the recursion seams take proofs on the Poseidon2-M31 channel")
 }

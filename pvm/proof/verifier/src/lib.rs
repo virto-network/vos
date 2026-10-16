@@ -27,14 +27,16 @@ use stwo::core::{
 };
 use stwo_constraint_framework::TraceLocationAllocator;
 
-// Per-build PCS selection (Blake2s by default; Poseidon2-M31 under
-// `poseidon2-channel`) — must match the vos-pvm-proof prover the proof came from.
-use vos_pvm_proof::recursion_pcs::{ProverChannel, ProverMerkleChannel};
+// A proof's format selects its channel at run time; one build reads every
+// admitted format.
+use vos_pvm_proof::format::{Encoding, Format};
+use vos_pvm_proof::pcs::{PcsStack, ProofHash};
 
 // Re-export the Proof type + the format-version constant the verifier
 // was compiled against.  Callers can compare against
 // `proof.format_version` themselves for early rejection at the network
 // boundary, or just rely on `verify_standalone`'s built-in check.
+pub use vos_pvm_proof::format;
 pub use vos_pvm_proof::refine::{
     MAX_REFINE_CHILD_COMPONENTS, MAX_REFINE_HOST_BOUNDARIES, MAX_REFINE_PROOF_SLICES,
     REFINE_BUNDLE_FORMAT_VERSION, REFINE_CHILD_COMMITMENT_COUNT, RefineBundleVerification,
@@ -58,9 +60,9 @@ use vos_pvm_proof::framework_access::{
     AllLookupElements, create_verifier_components, draw_all_lookup_elements,
 };
 
-/// Verification hash type — the preprocessed-trace Merkle root in the per-build
-/// PCS hash (Blake2s by default; `P2Hash` under `poseidon2-channel`).
-pub use vos_pvm_proof::recursion_pcs::ProverMerkleHash as CommitmentHash;
+/// Verification hash type — the preprocessed-trace Merkle root, in the hash
+/// of the proof's format.
+pub use vos_pvm_proof::pcs::Commitment as CommitmentHash;
 
 /// Default per-component log_size cap used by `verify_standalone`.
 ///
@@ -190,8 +192,7 @@ pub fn verify_refine_bundle_authenticated<R: RefineProgramCommitmentResolver + ?
                 }
             }
         }
-        let Some(actual_program_commitment) = slice.proof.stark_proof.commitments.first().copied()
-        else {
+        let Some(actual_program_commitment) = slice.proof.preprocessed_commitment() else {
             return Err(VerificationError::InvalidStructure(
                 "Refine child proof has no preprocessed commitment".to_string(),
             ));
@@ -324,7 +325,7 @@ pub fn verify_refine_bundle_authenticated<R: RefineProgramCommitmentResolver + ?
     // structural checks. The checked access above makes an empty commitment
     // vector a normal hostile-input error rather than a panic.
     for slice in &bundle.slices {
-        let Some(program_commitment) = slice.proof.stark_proof.commitments.first().copied() else {
+        let Some(program_commitment) = slice.proof.preprocessed_commitment() else {
             return Err(VerificationError::InvalidStructure(
                 "Refine child proof has no preprocessed commitment".to_string(),
             ));
@@ -418,18 +419,13 @@ fn verify_standalone_shaped(
     max_log_size: u32,
     policy: Option<&PcsPolicy>,
 ) -> Result<(), VerificationError> {
+    // The format the proof names, admitted and with its Stark proof on the
+    // format's channel, and the proof's structure, before any cryptographic
+    // work: every later length check assumes them.
     vos_pvm_proof::proof::preflight_proof_structure(&mut proof, max_log_size)
         .map_err(VerificationError::InvalidStructure)?;
-    // Reject proofs from a different AIR shape early, before
-    // any cryptographic work.  Done first because every subsequent
-    // length check assumes the AIR shape this verifier was compiled
-    // against.
-    if proof.format_version != PROOF_FORMAT_VERSION {
-        return Err(VerificationError::InvalidStructure(format!(
-            "proof format version mismatch: verifier expects {}, proof has {}",
-            PROOF_FORMAT_VERSION, proof.format_version,
-        )));
-    }
+    let format =
+        vos_pvm_proof::proof::proof_format(&proof).map_err(VerificationError::InvalidStructure)?;
     // `component_mask = 0` is a back-compat sentinel meaning "fall back
     // to count-based inference over the full BASE_COMPONENTS", predating
     // dynamic chip selection. With `format_version` bumped past those
@@ -469,23 +465,44 @@ fn verify_standalone_shaped(
              (set max_log_size higher or reject this proof)"
         )));
     }
-    // Enforce the FRI-shape floor — reject under-spec'd pcs_configs (low
-    // pow_bits, low n_queries, low log_blowup_factor) before any cryptographic
-    // work. `None` = the default conjectured-security floor (accepts any
-    // 96-bit-secure shape, STANDARD and MOBILE both); `Some(p)` = an exact
-    // `PcsPolicy` pin (the strict `*_with_pcs_policy` path).
-    let shape_check = match policy {
-        Some(p) => check_pcs_policy(&proof.pcs_config, p),
-        None => check_min_security(&proof.pcs_config),
-    };
-    if let Err(msg) = shape_check {
-        return Err(VerificationError::InvalidStructure(msg));
+    // Format 24 takes the proof's own parameters under a FRI-shape floor:
+    // `None` = the default conjectured-security floor (any 96-bit-secure
+    // shape, STANDARD and MOBILE both); `Some(p)` = an exact `PcsPolicy` pin.
+    // Every other format fixes its parameters, checked with its floors once
+    // the shape is known.
+    if format.encoding == Encoding::Legacy {
+        let shape_check = match policy {
+            Some(p) => check_pcs_policy(&proof.pcs_config, p),
+            None => check_min_security(&proof.pcs_config),
+        };
+        shape_check.map_err(VerificationError::InvalidStructure)?;
     }
     if proof.component_mask.count_ones() as usize != proof.num_components {
         return Err(VerificationError::InvalidStructure(
             "component_mask popcount does not match num_components".to_string(),
         ));
     }
+    vos_pvm_proof::with_stack!(format.channel, Stack => {
+        verify_standalone_on::<Stack>(proof, format, preprocessed_commitment)
+    }, unbuilt => Err(VerificationError::InvalidStructure(format!(
+        "format {}'s channel is not built",
+        format.number
+    ))))
+}
+
+/// The AIR's trace log sizes for `proof`, its protocol shape, and the shape
+/// its security counts are taken at.
+fn standalone_shape<MC: PcsStack>(
+    proof: &Proof,
+    stark: &stwo::core::proof::StarkProof<MC::H>,
+) -> Result<
+    (
+        TreeVec<Vec<u32>>,
+        vos_pvm_proof::proof::ProofProtocolShape,
+        vos_pvm_proof::security::SecurityShape,
+    ),
+    VerificationError,
+> {
     let (trace_sizes, preprocessed_sizes) =
         create_verifier_components::trace_and_preprocessed_sizes(
             &proof.log_sizes,
@@ -499,7 +516,7 @@ fn verify_standalone_shaped(
     }
     expected_log_sizes[0] = preprocessed_sizes;
     let mut dummy_lookup = AllLookupElements::default();
-    let mut dummy_channel = ProverChannel::default();
+    let mut dummy_channel = MC::C::default();
     draw_all_lookup_elements(&mut dummy_lookup, &mut dummy_channel, proof.component_mask);
     let dummy_allocator = &mut TraceLocationAllocator::default();
     let shape_components = create_verifier_components::components(
@@ -513,14 +530,62 @@ fn verify_standalone_shaped(
         .iter()
         .map(|component| &**component)
         .collect();
-    let protocol_shape = vos_pvm_proof::framework_access::preflight_component_dimensions(
-        &proof,
-        &shape_component_refs,
-        &expected_log_sizes,
-    )
-    .map_err(VerificationError::InvalidStructure)?;
+    let (protocol_shape, security_shape) =
+        vos_pvm_proof::framework_access::preflight_component_dimensions(
+            &proof.pcs_config,
+            stark,
+            &shape_component_refs,
+            &expected_log_sizes,
+        )
+        .map_err(VerificationError::InvalidStructure)?;
+    Ok((expected_log_sizes, protocol_shape, security_shape))
+}
+
+/// A proof's two security counts ([`vos_pvm_proof::security`]), at its own
+/// parameters and shape, after the structural checks `verify_standalone`
+/// runs first. No cryptographic check is made.
+pub fn proof_security_bits(
+    proof: &Proof,
+) -> Result<vos_pvm_proof::security::SecurityBits, VerificationError> {
+    let mut proof = proof.clone();
+    vos_pvm_proof::proof::preflight_proof_structure(&mut proof, DEFAULT_MAX_LOG_SIZE)
+        .map_err(VerificationError::InvalidStructure)?;
+    let format =
+        vos_pvm_proof::proof::proof_format(&proof).map_err(VerificationError::InvalidStructure)?;
+    if proof.component_mask.count_ones() as usize != proof.num_components {
+        return Err(VerificationError::InvalidStructure(
+            "component_mask popcount does not match num_components".to_string(),
+        ));
+    }
+    let shape = vos_pvm_proof::with_stack!(format.channel, Stack => {
+        let stark = Stack::stark(&proof.stark_proof).ok_or_else(|| {
+            VerificationError::InvalidStructure("Stark proof channel differs".to_string())
+        })?;
+        standalone_shape::<Stack>(&proof, stark)?.2
+    }, unbuilt => return Err(VerificationError::InvalidStructure(format!(
+        "format {}'s channel is not built",
+        format.number
+    ))));
+    let params =
+        vos_pvm_proof::format::FormatParams::of(&proof.pcs_config, format.interaction_pow_bits());
+    vos_pvm_proof::security::security_bits(&params, &shape).ok_or_else(|| {
+        VerificationError::InvalidStructure("parameters outside the security analysis".to_string())
+    })
+}
+
+fn verify_standalone_on<MC: PcsStack>(
+    proof: Proof,
+    format: &'static Format,
+    preprocessed_commitment: CommitmentHash,
+) -> Result<(), VerificationError> {
+    let stark = MC::stark(&proof.stark_proof).ok_or_else(|| {
+        VerificationError::InvalidStructure("Stark proof channel differs".to_string())
+    })?;
+    let (expected_log_sizes, protocol_shape, security_shape) =
+        standalone_shape::<MC>(&proof, stark)?;
     let Proof {
         stark_proof,
+        interaction_pow,
         claimed_sums,
         log_sizes: claimed_log_sizes,
         num_components,
@@ -530,6 +595,15 @@ fn verify_standalone_shaped(
         final_state,
         ..
     } = proof;
+    let stark_proof = MC::from_any(stark_proof).ok_or_else(|| {
+        VerificationError::InvalidStructure("Stark proof channel differs".to_string())
+    })?;
+    // The format's floors, counted at this proof's own parameters and
+    // shape, and its exact parameters.
+    if format.encoding == Encoding::Lossless {
+        vos_pvm_proof::proof::check_format_security(format, &pcs_config, &security_shape)
+            .map_err(VerificationError::InvalidStructure)?;
+    }
 
     if claimed_sums.len() != num_components {
         return Err(VerificationError::InvalidStructure(
@@ -553,26 +627,26 @@ fn verify_standalone_shaped(
         ));
     }
 
-    // Use the proof's own PCS config — `prove()` uses production_pcs_config
-    // by default (blowup=16, 19 queries, 20-bit PoW), not PcsConfig::default(),
-    // so blindly using default here makes Merkle witness sizes mismatch
-    // (Merkle::WitnessTooLong).  The proof carries its config; trust it.
+    // Use the proof's own PCS config: a legacy proof carries its own, and
+    // every other format's equals the format's, checked above.
     let config = pcs_config;
-    let verifier_channel = &mut ProverChannel::default();
-    vos_pvm_proof::proof::mix_proof_fs_domain(verifier_channel, PROOF_FORMAT_VERSION, &config);
-    claimed_log_sizes.iter().for_each(|log_size| {
-        verifier_channel.mix_u64(*log_size as u64);
-    });
+    let verifier_channel = &mut MC::C::default();
+    vos_pvm_proof::proof::mix_statement_header(
+        verifier_channel,
+        format.number,
+        &config,
+        &claimed_log_sizes,
+    );
 
     // Check preprocessed trace commitment matches expected
-    let actual_preprocessed = stark_proof.commitments[0]; // PREPROCESSED_TRACE_IDX = 0
+    let actual_preprocessed = stark_proof.commitments[0].into_commitment(); // PREPROCESSED_TRACE_IDX = 0
     if actual_preprocessed != preprocessed_commitment {
         return Err(VerificationError::InvalidStructure(format!(
             "preprocessed commitment mismatch: expected {preprocessed_commitment}, got {actual_preprocessed}"
         )));
     }
 
-    let commitment_scheme = &mut CommitmentSchemeVerifier::<ProverMerkleChannel>::new(config);
+    let commitment_scheme = &mut CommitmentSchemeVerifier::<MC>::new(config);
 
     // Commit preprocessed and original traces
     let log_sizes = expected_log_sizes;
@@ -586,33 +660,20 @@ fn verify_standalone_shaped(
         );
     }
 
-    // Mix `proof.{initial,final}_state` (registers, pc,
-    // timestamp) into the FS transcript. The `component_mask = 0`
-    // reject at the top of this function guarantees we only reach here
-    // for production proofs that included the boundary + closing chip
-    // pair, so the mix is unconditional. The lookup elements drawn next
-    // therefore depend on the claimed boundary states. Order MUST match
-    // the prover (see `prove.rs`): initial first, then final.
+    // A.1's third and fourth items, as the prover ran them: the boundary
+    // states (the `component_mask = 0` reject above guarantees a proof with
+    // the boundary and closing chips, so the mix is unconditional), then the
+    // interaction PoW, before any relation challenge. The challenges drawn
+    // next therefore depend on the claimed boundary states.
     // `memory_commitment` stays unmixed (computed outside the circuit).
-    for r in &initial_state.registers {
-        verifier_channel.mix_u64(*r);
-    }
-    for r in &final_state.registers {
-        verifier_channel.mix_u64(*r);
-    }
-    verifier_channel.mix_u64(initial_state.pc as u64);
-    verifier_channel.mix_u64(initial_state.timestamp);
-    verifier_channel.mix_u64(final_state.pc as u64);
-    verifier_channel.mix_u64(final_state.timestamp);
-    // v7: entering then exit RAM Merkle root, 4 LE u64 each.
-    // Unconditional — the component_mask=0 reject above guarantees a
-    // production proof with the memory-page Merkle chips.
-    for chunk in initial_state.memory_root.chunks_exact(8) {
-        verifier_channel.mix_u64(u64::from_le_bytes(chunk.try_into().unwrap()));
-    }
-    for chunk in final_state.memory_root.chunks_exact(8) {
-        verifier_channel.mix_u64(u64::from_le_bytes(chunk.try_into().unwrap()));
-    }
+    vos_pvm_proof::proof::mix_boundary_states(
+        verifier_channel,
+        format.encoding,
+        &initial_state,
+        &final_state,
+    );
+    vos_pvm_proof::proof::check_interaction_pow(verifier_channel, format, interaction_pow)
+        .map_err(VerificationError::InvalidStructure)?;
 
     let mut lookup_elements = AllLookupElements::default();
     draw_all_lookup_elements(&mut lookup_elements, verifier_channel, component_mask);
@@ -678,7 +739,7 @@ fn verify_standalone_shaped(
         verifier_channel,
     );
 
-    let sampled_queries = vos_pvm_proof::proof::expected_fiat_shamir_query_count(
+    let sampled_queries = vos_pvm_proof::proof::expected_fiat_shamir_query_count::<MC>(
         verifier_channel,
         &stark_proof,
         &pcs_config,
@@ -888,7 +949,12 @@ pub fn verify_chain_standalone_allowlist(
     // Each segment's program commitment must be in the published allowlist,
     // then it verifies standalone against that (its own) commitment.
     for proof in proofs {
-        let actual = proof.stark_proof.commitments[0];
+        let Some(actual) = proof.preprocessed_commitment() else {
+            return Err(VerificationError::InvalidStructure(
+                "verify_chain_standalone_allowlist: a segment has no program commitment"
+                    .to_string(),
+            ));
+        };
         if !allowed_commitments.contains(&actual) {
             return Err(VerificationError::InvalidStructure(
                 "verify_chain_standalone_allowlist: a segment's program commitment \

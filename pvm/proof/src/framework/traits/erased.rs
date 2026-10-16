@@ -2,7 +2,7 @@ use alloc::{boxed::Box, vec, vec::Vec};
 use stwo::core::{air::Component, fields::qm31::SecureField, pcs::TreeVec};
 use stwo_constraint_framework::{FrameworkEval, InfoEvaluator, TraceLocationAllocator};
 
-use crate::recursion_pcs::ProverChannel;
+use crate::pcs::ChannelRef;
 
 use crate::air_column::AirColumn;
 
@@ -14,8 +14,6 @@ use crate::{
 
 #[cfg(feature = "prover")]
 use super::builtin::BuiltInProverComponent;
-#[cfg(feature = "prover")]
-use crate::recursion_pcs::ProverBackend;
 #[cfg(feature = "prover")]
 use crate::side_note::SideNote;
 #[cfg(feature = "prover")]
@@ -48,7 +46,7 @@ pub trait MachineComponent: Sync {
     fn draw_lookup_elements(
         &self,
         lookup_elements: &mut AllLookupElements,
-        channel: &mut ProverChannel,
+        channel: ChannelRef<'_>,
     );
 
     fn to_component<'a>(
@@ -120,7 +118,7 @@ pub trait MachineProverComponent: MachineComponent {
         lookup_elements: &AllLookupElements,
         log_size: u32,
         claimed_sum: SecureField,
-    ) -> Box<dyn ComponentProver<ProverBackend> + 'a>;
+    ) -> Box<dyn ComponentProver<SimdBackend> + 'a>;
 
     /// Debug: pinpoint failing constraint by row + constraint #.
     /// Drives Stwo's `AssertEvaluator` over this chip's main + interaction
@@ -166,9 +164,12 @@ where
     fn draw_lookup_elements(
         &self,
         lookup_elements: &mut AllLookupElements,
-        channel: &mut ProverChannel,
+        channel: ChannelRef<'_>,
     ) {
-        C::LookupElements::draw(lookup_elements, channel);
+        match channel {
+            ChannelRef::Blake2s(channel) => C::LookupElements::draw(lookup_elements, channel),
+            ChannelRef::Poseidon2M31(channel) => C::LookupElements::draw(lookup_elements, channel),
+        }
     }
 
     fn to_component<'a>(
@@ -303,7 +304,7 @@ where
         lookup_elements: &AllLookupElements,
         log_size: u32,
         claimed_sum: SecureField,
-    ) -> Box<dyn ComponentProver<ProverBackend> + 'a> {
+    ) -> Box<dyn ComponentProver<SimdBackend> + 'a> {
         let lookup_elements = C::LookupElements::get(lookup_elements);
         Box::new(FrameworkComponent::new(
             tree_span_provider,

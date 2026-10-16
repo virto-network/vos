@@ -1,8 +1,4 @@
-// Not under `poseidon2-channel`: a Blake2s commitment is `[u8; 32]`, so
-// `program_commitment_of_proof` / the standalone verifier's byte-level shapes
-// line up with this test's assertions; under the Poseidon2-M31 PCS the
-// canonical-chain coverage lives in `verifier/tests/poseidon2_canonical_segment.rs`.
-#![cfg(all(feature = "prover", not(feature = "poseidon2-channel")))]
+#![cfg(feature = "prover")]
 
 //! Focused test for the in-memory `vos_pvm_proof::prove_chain` convenience.
 //!

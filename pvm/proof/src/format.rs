@@ -1,0 +1,559 @@
+//! The proof format registry.
+//!
+//! A proof's `format_version` names an entry here, and the entry decides, at
+//! run time, the proof's channel, its parameters and its encodings: one
+//! verifier build reads every admitted format, and a prover is told which
+//! format to produce.
+//!
+//! | number | proofs | channel | log blowup, queries, PoW, fold step, last layer, interaction PoW | floors | at its reference shape |
+//! |---|---|---|---|---|---|
+//! | 24 | segments, legacy | Blake2s | the proof's own, 96 conjectured bits or more | 96 / — | MOBILE: 96 / 57 |
+//! | 26 | segments | Poseidon2-M31 | 2, 39, 26, 1, 0, 24 | 100 / 60 | 104 / 63 |
+//! | 27 | leaves and folds | Poseidon2-M31 | 2, 39, 26, 1, 0, 24 | 100 / 60 | 104 / 64 |
+//! | 28 | the final wrap, masked | Blake2b-256 | 6, 18, 26, 3, 6, 24 | 100 / 80 | 134 / 74 |
+//! | 29 | device proofs, masked | Blake2s-M31 | 1, 84, 20, 1, 0, 24 | 100 / 60 | 104 / 61 |
+//! | 30 | credential proofs, masked | Blake2s-M31 | 1, 84, 20, 1, 0, 24 | 100 / 60 | 104 / 61 |
+//!
+//! - **24** is the Blake2s segment format the prover produced before this
+//!   registry, kept while the refine bundles, the chain proofs and their
+//!   tests use it. Its transcript is the old one (no interaction PoW, the
+//!   boundary states mixed a word at a time) and its parameters are the
+//!   proof's own under the 96-bit conjectured floor. **25**, its
+//!   Poseidon2-M31 variant behind a cargo feature, is retired: 26 replaces it.
+//! - **26 to 30** use the lossless encodings ([`Encoding::Lossless`]) and
+//!   exactly their parameters. 27 to 30 are registered and refused: their
+//!   AIRs come in M1 (27, 28) and with the phone work (29, 30), and the wrap's
+//!   fold step 3 is refused until it is reviewed.
+//! - **The bit counts** are [`crate::security`]'s, at each entry's reference
+//!   shape; the verifier counts again at the proof's own shape and refuses a
+//!   proof below either floor. The wrap as decided counts 74 proven bits
+//!   against its floor of 80: the DEEP batching of its sampled values over a
+//!   2^22-point domain at rate 1/64 binds, however many queries it takes;
+//!   `slice-5-progress.md` records it.
+
+use stwo::core::fri::FriConfig;
+use stwo::core::pcs::PcsConfig;
+
+use crate::security::{SecurityBits, SecurityShape};
+
+/// What a format proves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProofKind {
+    Segment,
+    LeafFold,
+    Wrap,
+    Device,
+    Credential,
+}
+
+/// The Merkle hash and Fiat–Shamir channel of a format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChannelKind {
+    Blake2s,
+    Poseidon2M31,
+    Blake2sM31,
+    Blake2b256,
+}
+
+/// How values enter a format's hashes and transcript.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Encoding {
+    /// Format 24's: the boundary states mixed a word at a time, and no
+    /// interaction PoW.
+    Legacy,
+    /// The boundary states as the boundary chips' bytes, one M31 a byte, in
+    /// one run; every other u64 as four 16-bit limbs (a u32 two); and the
+    /// interaction PoW before the relation challenges.
+    Lossless,
+}
+
+/// Whether a verifier accepts a format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Status {
+    Admitted,
+    /// Registered, with its parameters and counts, and refused until its AIR
+    /// and channel exist.
+    Reserved,
+}
+
+/// A format's PCS parameters, and its interaction PoW.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FormatParams {
+    pub log_blowup: u32,
+    pub n_queries: usize,
+    pub pow_bits: u32,
+    pub fold_step: u32,
+    pub log_last_layer: u32,
+    pub interaction_pow_bits: u32,
+}
+
+impl FormatParams {
+    pub const fn pcs_config(&self) -> PcsConfig {
+        PcsConfig {
+            pow_bits: self.pow_bits,
+            fri_config: FriConfig {
+                log_last_layer_degree_bound: self.log_last_layer,
+                log_blowup_factor: self.log_blowup,
+                n_queries: self.n_queries,
+                fold_step: self.fold_step,
+            },
+            lifting_log_size: None,
+        }
+    }
+
+    /// The parameters of a proof's own config, with `interaction_pow_bits`.
+    pub fn of(config: &PcsConfig, interaction_pow_bits: u32) -> Self {
+        Self {
+            log_blowup: config.fri_config.log_blowup_factor,
+            n_queries: config.fri_config.n_queries,
+            pow_bits: config.pow_bits,
+            fold_step: config.fri_config.fold_step,
+            log_last_layer: config.fri_config.log_last_layer_degree_bound,
+            interaction_pow_bits,
+        }
+    }
+}
+
+/// The least counts a verifier accepts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SecurityFloor {
+    pub conjectured: u32,
+    pub proven: u32,
+}
+
+/// One registry entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Format {
+    pub number: u32,
+    pub kind: ProofKind,
+    pub channel: ChannelKind,
+    pub encoding: Encoding,
+    /// The parameters a proof must carry exactly, but for format 24, which
+    /// takes the proof's own and records MOBILE's here.
+    pub params: FormatParams,
+    pub masked: bool,
+    pub floor: SecurityFloor,
+    pub status: Status,
+    /// The shape [`Format::bits`] is counted at.
+    pub reference: SecurityShape,
+    /// [`crate::security::security_bits`] at `reference`, pinned by the
+    /// format tests.
+    pub bits: SecurityBits,
+}
+
+impl Format {
+    /// Whether a proof's parameters must equal [`Format::params`].
+    pub const fn exact_params(&self) -> bool {
+        matches!(self.encoding, Encoding::Lossless)
+    }
+
+    pub const fn pcs_config(&self) -> PcsConfig {
+        self.params.pcs_config()
+    }
+
+    /// The interaction PoW a proof under this format grinds, 0 for none.
+    pub const fn interaction_pow_bits(&self) -> u32 {
+        self.params.interaction_pow_bits
+    }
+}
+
+/// The number the default prover produces: the legacy Blake2s segment
+/// format.
+pub const LEGACY_SEGMENT_NUMBER: u32 = 24;
+
+/// Every segment AIR's widest relation (`Blake2bCompression`, 265 limbs),
+/// rounded up.
+const SEGMENT_RELATION_WIDTH: u64 = 265;
+/// The recursion AIR's one relation, `Gate`: an address and four limbs.
+const RECURSION_RELATION_WIDTH: u64 = 5;
+
+/// Every chip of the segment AIR at 2^20 rows (`framework_access`'s
+/// `security_shape` of the full component set; a test recomputes it).
+pub const SEGMENT_REFERENCE: SecurityShape = SecurityShape {
+    log_degree_bound: 20,
+    log_trace_length: 20,
+    log_composition_degree_bound: 21,
+    sampled_values: 14_102,
+    max_samples_per_column: 2,
+    constraints: 6_650,
+    logup_fractions: 2_445_279_232,
+    relation_width: SEGMENT_RELATION_WIDTH,
+};
+
+/// Every chip of the segment AIR at 2^16 rows, a phone's segment.
+pub const DEVICE_REFERENCE: SecurityShape = SecurityShape {
+    log_degree_bound: 16,
+    log_trace_length: 16,
+    log_composition_degree_bound: 17,
+    logup_fractions: 152_829_952,
+    ..SEGMENT_REFERENCE
+};
+
+/// The recursion AIR's padded shape (`recursion-air.md` §0, §1.2): `p2`,
+/// `qm31` and `h8` at 2^16, 2^17 and 2^16 rows; 458 columns, each counted at
+/// two samples; 313 constraints of degree 3; 5, 4 and 6 fractions a row.
+pub const LEAF_FOLD_REFERENCE: SecurityShape = SecurityShape {
+    log_degree_bound: 18,
+    log_trace_length: 17,
+    log_composition_degree_bound: 19,
+    sampled_values: 2 * 458,
+    max_samples_per_column: 2,
+    constraints: 313,
+    logup_fractions: (5 << 16) + (4 << 17) + (6 << 16),
+    relation_width: RECURSION_RELATION_WIDTH,
+};
+
+/// The wrap (`recursion-air.md` §7): the same AIR at 2^14, 2^15 and 2^11
+/// rows.
+pub const WRAP_REFERENCE: SecurityShape = SecurityShape {
+    log_degree_bound: 16,
+    log_trace_length: 15,
+    log_composition_degree_bound: 17,
+    logup_fractions: (5 << 14) + (4 << 15) + (6 << 11),
+    ..LEAF_FOLD_REFERENCE
+};
+
+/// The credential AIR (`proving.md` §8): the recursion AIR's `p2`, 354
+/// columns and 303 constraints, at 2^14 rows.
+pub const CREDENTIAL_REFERENCE: SecurityShape = SecurityShape {
+    log_degree_bound: 15,
+    log_trace_length: 14,
+    log_composition_degree_bound: 16,
+    sampled_values: 2 * 354,
+    max_samples_per_column: 2,
+    constraints: 303,
+    logup_fractions: 5 << 14,
+    relation_width: RECURSION_RELATION_WIDTH,
+};
+
+const INNER: FormatParams = FormatParams {
+    log_blowup: 2,
+    n_queries: 39,
+    pow_bits: 26,
+    fold_step: 1,
+    log_last_layer: 0,
+    interaction_pow_bits: 24,
+};
+
+const DEVICE: FormatParams = FormatParams {
+    log_blowup: 1,
+    n_queries: 84,
+    pow_bits: 20,
+    fold_step: 1,
+    log_last_layer: 0,
+    interaction_pow_bits: 24,
+};
+
+const INNER_FLOOR: SecurityFloor = SecurityFloor {
+    conjectured: 100,
+    proven: 60,
+};
+
+pub const LEGACY_SEGMENT: Format = Format {
+    number: LEGACY_SEGMENT_NUMBER,
+    kind: ProofKind::Segment,
+    channel: ChannelKind::Blake2s,
+    encoding: Encoding::Legacy,
+    params: FormatParams {
+        log_blowup: 2,
+        n_queries: 38,
+        pow_bits: 20,
+        fold_step: 1,
+        log_last_layer: 0,
+        interaction_pow_bits: 0,
+    },
+    masked: false,
+    floor: SecurityFloor {
+        conjectured: crate::proof::MIN_CONJECTURED_SECURITY_BITS,
+        proven: 0,
+    },
+    status: Status::Admitted,
+    reference: SEGMENT_REFERENCE,
+    bits: SecurityBits {
+        conjectured: 96,
+        proven: 57,
+    },
+};
+
+pub const SEGMENT: Format = Format {
+    number: 26,
+    kind: ProofKind::Segment,
+    channel: ChannelKind::Poseidon2M31,
+    encoding: Encoding::Lossless,
+    params: INNER,
+    masked: false,
+    floor: INNER_FLOOR,
+    status: Status::Admitted,
+    reference: SEGMENT_REFERENCE,
+    bits: SecurityBits {
+        conjectured: 104,
+        proven: 63,
+    },
+};
+
+pub const LEAF_FOLD: Format = Format {
+    number: 27,
+    kind: ProofKind::LeafFold,
+    channel: ChannelKind::Poseidon2M31,
+    encoding: Encoding::Lossless,
+    params: INNER,
+    masked: false,
+    floor: INNER_FLOOR,
+    status: Status::Reserved,
+    reference: LEAF_FOLD_REFERENCE,
+    bits: SecurityBits {
+        conjectured: 104,
+        proven: 64,
+    },
+};
+
+pub const WRAP: Format = Format {
+    number: 28,
+    kind: ProofKind::Wrap,
+    channel: ChannelKind::Blake2b256,
+    encoding: Encoding::Lossless,
+    params: FormatParams {
+        log_blowup: 6,
+        n_queries: 18,
+        pow_bits: 26,
+        fold_step: 3,
+        log_last_layer: 6,
+        interaction_pow_bits: 24,
+    },
+    masked: true,
+    floor: SecurityFloor {
+        conjectured: 100,
+        proven: 80,
+    },
+    status: Status::Reserved,
+    reference: WRAP_REFERENCE,
+    bits: SecurityBits {
+        conjectured: 134,
+        proven: 74,
+    },
+};
+
+pub const DEVICE_PROOF: Format = Format {
+    number: 29,
+    kind: ProofKind::Device,
+    channel: ChannelKind::Blake2sM31,
+    encoding: Encoding::Lossless,
+    params: DEVICE,
+    masked: true,
+    floor: INNER_FLOOR,
+    status: Status::Reserved,
+    reference: DEVICE_REFERENCE,
+    bits: SecurityBits {
+        conjectured: 104,
+        proven: 61,
+    },
+};
+
+pub const CREDENTIAL_PROOF: Format = Format {
+    number: 30,
+    kind: ProofKind::Credential,
+    channel: ChannelKind::Blake2sM31,
+    encoding: Encoding::Lossless,
+    params: DEVICE,
+    masked: true,
+    floor: INNER_FLOOR,
+    status: Status::Reserved,
+    reference: CREDENTIAL_REFERENCE,
+    bits: SecurityBits {
+        conjectured: 104,
+        proven: 61,
+    },
+};
+
+/// Every registered format, by number.
+pub const REGISTRY: [Format; 6] = [
+    LEGACY_SEGMENT,
+    SEGMENT,
+    LEAF_FOLD,
+    WRAP,
+    DEVICE_PROOF,
+    CREDENTIAL_PROOF,
+];
+
+/// The entry for `number`, admitted or not.
+pub fn lookup(number: u32) -> Option<&'static Format> {
+    REGISTRY.iter().find(|format| format.number == number)
+}
+
+/// The entry for `number`, if a verifier accepts proofs under it.
+pub fn admitted(number: u32) -> Result<&'static Format, alloc::string::String> {
+    match lookup(number) {
+        Some(format) if format.status == Status::Admitted => Ok(format),
+        Some(format) => Err(alloc::format!(
+            "proof format {number} ({:?}) is registered but not admitted",
+            format.kind
+        )),
+        None => Err(alloc::format!("proof format {number} is not registered")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::framework_access::{
+        AllLookupElements, air_layout, create_verifier_components, draw_all_lookup_elements,
+    };
+    use alloc::vec::Vec;
+    use num_traits::Zero;
+    use stwo::core::air::Component;
+    use stwo::core::fields::qm31::SecureField;
+    use stwo::core::pcs::TreeVec;
+    use stwo_constraint_framework::TraceLocationAllocator;
+
+    /// The segment AIR's shape with every chip at `2^log_size` rows.
+    fn segment_air_shape(log_size: u32, format: &Format) -> SecurityShape {
+        let count = crate::chip_idx::COUNT;
+        let mask = ((1u64 << count) - 1) as u32;
+        let log_sizes = alloc::vec![log_size; count];
+        let (trace_sizes, preprocessed) =
+            create_verifier_components::trace_and_preprocessed_sizes(&log_sizes, mask);
+        let mut trees = TreeVec::concat_cols(trace_sizes.into_iter());
+        trees[0] = preprocessed;
+        let mut lookups = AllLookupElements::default();
+        draw_all_lookup_elements(
+            &mut lookups,
+            &mut stwo::core::channel::Blake2sChannel::default(),
+            mask,
+        );
+        let components = create_verifier_components::components(
+            &mut TraceLocationAllocator::default(),
+            &lookups,
+            &log_sizes,
+            &alloc::vec![SecureField::zero(); count],
+            mask,
+        );
+        let refs: Vec<&dyn Component> = components.iter().map(|c| &**c).collect();
+        air_layout(&format.pcs_config(), &refs, &trees)
+            .unwrap()
+            .security_shape(&refs)
+    }
+
+    /// The registry's segment and device reference shapes are the segment
+    /// AIR's, every chip at 2^20 and 2^16 rows.
+    #[test]
+    fn the_reference_shapes_are_the_segment_airs() {
+        assert_eq!(segment_air_shape(20, &SEGMENT), SEGMENT_REFERENCE);
+        assert_eq!(segment_air_shape(16, &DEVICE_PROOF), DEVICE_REFERENCE);
+        assert_eq!(
+            crate::lookups::MAX_RELATION_WIDTH as u64,
+            SEGMENT_RELATION_WIDTH
+        );
+    }
+
+    /// The tool's two counts, pinned per format at its reference shape.
+    #[test]
+    fn the_bit_counts_are_pinned_per_format() {
+        let pinned: Vec<(u32, u32, u32)> = REGISTRY
+            .iter()
+            .map(|format| {
+                let bits =
+                    crate::security::security_bits(&format.params, &format.reference).unwrap();
+                assert_eq!(bits, format.bits, "format {}", format.number);
+                (format.number, bits.conjectured, bits.proven)
+            })
+            .collect();
+        assert_eq!(
+            pinned,
+            [
+                (24, 96, 57),
+                (26, 104, 63),
+                (27, 104, 64),
+                (28, 134, 74),
+                (29, 104, 61),
+                (30, 104, 61),
+            ]
+        );
+        for format in REGISTRY.iter().filter(|format| format.number != 28) {
+            assert!(format.bits.conjectured >= format.floor.conjectured);
+            assert!(format.bits.proven >= format.floor.proven);
+        }
+    }
+
+    /// The wrap as decided (blowup 64, 18 queries) stays below its proven
+    /// floor however many queries it takes, as at blowup 16; at blowup 8 it
+    /// reaches it with 41 queries, at blowup 4 with 62.
+    #[test]
+    fn the_wrap_as_decided_falls_short_of_its_proven_floor() {
+        let proven = |log_blowup, n_queries| {
+            let params = FormatParams {
+                log_blowup,
+                n_queries,
+                ..WRAP.params
+            };
+            crate::security::proven_bits(&params, &WRAP_REFERENCE).unwrap()
+        };
+        assert_eq!((WRAP.bits.proven, WRAP.floor.proven), (74, 80));
+        assert!(proven(6, 256) < WRAP.floor.proven);
+        let least = |log_blowup| (1..=256).find(|&q| proven(log_blowup, q) >= 80);
+        assert_eq!(
+            [least(6), least(4), least(3), least(2)],
+            [None, None, Some(41), Some(62)]
+        );
+    }
+
+    /// Every number names one entry; only 24 and 26 are admitted, and every
+    /// other number is refused.
+    #[test]
+    fn the_registry_numbers_round_trip() {
+        for format in REGISTRY {
+            assert_eq!(lookup(format.number), Some(&format));
+            assert_eq!(
+                admitted(format.number).is_ok(),
+                [24, 26].contains(&format.number)
+            );
+        }
+        for number in (0..24).chain([25, 31, u32::MAX]) {
+            assert!(lookup(number).is_none());
+            assert!(admitted(number).is_err());
+        }
+        assert_eq!(LEGACY_SEGMENT.number, crate::proof::PROOF_FORMAT_VERSION);
+        assert_eq!(WRAP.params.fold_step, 3);
+    }
+
+    /// A proof below either floor is refused: fewer queries than the
+    /// conjectured floor allows, a shape whose proven count falls short, and
+    /// parameters other than the format's.
+    #[test]
+    fn a_proof_below_a_floor_is_refused() {
+        let check = crate::proof::check_format_security;
+        let config = SEGMENT.pcs_config();
+        assert_eq!(
+            check(&SEGMENT, &config, &SEGMENT_REFERENCE).unwrap(),
+            SEGMENT.bits
+        );
+
+        let mut fewer = config;
+        fewer.fri_config.n_queries = 36;
+        let error = check(&SEGMENT, &fewer, &SEGMENT_REFERENCE).unwrap_err();
+        assert!(error.contains("98 conjectured bits"), "{error}");
+
+        // 2^30 sampled values over a 2^28-row trace: the batching term binds.
+        let wide = SecurityShape {
+            log_degree_bound: 28,
+            log_trace_length: 28,
+            log_composition_degree_bound: 29,
+            sampled_values: 1 << 30,
+            ..SEGMENT_REFERENCE
+        };
+        let error = check(&SEGMENT, &config, &wide).unwrap_err();
+        assert!(error.contains("proven bits"), "{error}");
+
+        let mut stronger = config;
+        stronger.fri_config.n_queries = 40;
+        let error = check(&SEGMENT, &stronger, &SEGMENT_REFERENCE).unwrap_err();
+        assert!(error.contains("differ from format 26"), "{error}");
+
+        // Format 24 takes its own parameters at its conjectured floor.
+        let standard = PcsConfig {
+            pow_bits: 20,
+            fri_config: FriConfig::new(0, 4, 19, 1),
+            lifting_log_size: None,
+        };
+        assert!(check(&LEGACY_SEGMENT, &standard, &SEGMENT_REFERENCE).is_ok());
+    }
+}

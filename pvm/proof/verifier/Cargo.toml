@@ -4,13 +4,6 @@ edition.workspace = true
 version.workspace = true
 license = "Apache-2.0"
 
-[features]
-# Native-recursion Stage-0 (P5.0): verify proofs committed under the
-# Poseidon2-M31 PCS (M31-algebraic commit + Fiat-Shamir). Forwards to vos-pvm-proof's
-# `poseidon2-channel`; the `CommitmentHash` / channel types flip to the
-# `recursion_pcs` aliases. Off by default — production verifies Blake2s proofs.
-poseidon2-channel = ["vos-pvm-proof/poseidon2-channel"]
-
 [dependencies]
 vos-pvm-proof = { path = "..", default-features = false }
 stwo = { workspace = true }
@@ -24,3 +17,4 @@ num-traits = { version = "0.2", default-features = false }
 vos-pvm = { workspace = true }
 vos-pvm-proof = { path = ".." } # tests use the prover too
 bincode = "1"          # on-wire proof serialization (size measurement)
+postcard = { version = "1", features = ["alloc"] } # the settlement verifier's wire format

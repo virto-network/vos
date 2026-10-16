@@ -23,6 +23,7 @@
 //! Run with: `cargo test -p vos-pvm-proof --features debug-internals --test
 //! ristretto_ts_gate`.
 
+use stwo::core::channel::Blake2sChannel;
 use vos_pvm_proof::AirColumn;
 use vos_pvm_proof::SideNote;
 use vos_pvm_proof::chips::{
@@ -31,7 +32,6 @@ use vos_pvm_proof::chips::{
 use vos_pvm_proof::core::tracing::{RistrettoMemOp, ScalarMultKind};
 use vos_pvm_proof::framework_access::AllLookupElements;
 use vos_pvm_proof::harness::MachineProverComponent;
-use vos_pvm_proof::recursion_pcs::ProverChannel;
 use vos_pvm_proof::side_note::RistrettoCombCall;
 use vos_pvm_proof::trace::component::ComponentTrace;
 
@@ -43,8 +43,8 @@ fn assert_chip<C: MachineProverComponent>(
     side_note: &SideNote,
 ) -> Result<(), String> {
     let mut lookup_elements = AllLookupElements::default();
-    let channel = &mut ProverChannel::default();
-    chip.draw_lookup_elements(&mut lookup_elements, channel);
+    let channel = &mut Blake2sChannel::default();
+    chip.draw_lookup_elements(&mut lookup_elements, channel.into());
     let (interaction_trace, claimed_sum) =
         chip.generate_interaction_trace(trace.clone(), side_note, &lookup_elements);
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

@@ -455,3 +455,50 @@ stwo_constraint_framework::relation!(
     RistrettoFixedOutTsLookupElements,
     REL_RISTRETTO_FIXED_OUT_TS_SIZE
 );
+
+/// The widest relation's tuple, which the logup term of the security counts
+/// takes (`crate::security`).
+pub const MAX_RELATION_WIDTH: usize = {
+    let widths = [
+        REL_PROG_EXEC_LOOKUP_SIZE,
+        REL_REG_MEMORY_LOOKUP_SIZE,
+        REL_PROG_MEMORY_LOOKUP_SIZE,
+        REL_JUMP_TABLE_LOOKUP_SIZE,
+        REL_MEMORY_ACCESS_LOOKUP_SIZE,
+        REL_POWER_OF_TWO_LOOKUP_SIZE,
+        REL_BITWISE_AND_LOOKUP_SIZE,
+        REL_BITWISE_AND_BYTE_LOOKUP_SIZE,
+        REL_POPCOUNT_LOOKUP_SIZE,
+        REL_BITCOUNT_LOOKUP_SIZE,
+        REL_BLAKE2B_STATE_LOOKUP_SIZE,
+        REL_DIVREM_LOOKUP_SIZE,
+        REL_COMPARE_LOOKUP_SIZE,
+        REL_BITWISE_LOOKUP_SIZE,
+        REL_MULTIPLICATION_LOOKUP_SIZE,
+        REL_BYTE_TO_BITS_LOOKUP_SIZE,
+        REL_BLAKE2B_CALL_LOOKUP_SIZE,
+        REL_BLAKE2B_COMPRESSION_LOOKUP_SIZE,
+        REL_MERKLE_NODE_LOOKUP_SIZE,
+        REL_RISTRETTO_REGISTER_FILE_LOOKUP_SIZE,
+        REL_RISTRETTO_COMB_LOOKUP_SIZE,
+        REL_RISTRETTO_COMB_SCALAR_BOUNDARY_SIZE,
+        REL_RISTRETTO_COMB_COORD_BOUNDARY_SIZE,
+        REL_RISTRETTO_COMB_CONSUMER_REGFILE_SIZE,
+        REL_RISTRETTO_COMB_COMPRESS_REGFILE_SIZE,
+        REL_RISTRETTO_COMB_COMPRESS_OUTPUT_SIZE,
+        REL_RISTRETTO_COMB_FINAL_ACC_SIZE,
+        REL_RISTRETTO_CALL_LOOKUP_SIZE,
+        REL_RISTRETTO_FIXED_SCALAR_TS_SIZE,
+        REL_RISTRETTO_FIXED_OUT_TS_SIZE,
+        super::range_check::RANGE_CHECK_LOOKUP_SIZE,
+    ];
+    let mut widest = 0;
+    let mut i = 0;
+    while i < widths.len() {
+        if widths[i] > widest {
+            widest = widths[i];
+        }
+        i += 1;
+    }
+    widest
+};

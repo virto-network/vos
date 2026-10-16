@@ -18,7 +18,10 @@ use stwo::{
 };
 use stwo_constraint_framework::TraceLocationAllocator;
 
-use crate::recursion_pcs::{ProverBackend, ProverChannel, ProverMerkleChannel, for_commit};
+use stwo::prover::backend::BackendForChannel;
+
+use crate::format::{Format, Status};
+use crate::pcs::{FsChannel, PcsStack};
 
 use crate::trace::{
     component::ComponentTrace,
@@ -29,7 +32,7 @@ use crate::trace::{
 // of the static BASE_COMPONENTS list to skip dormant chips.
 use crate::{lookups::AllLookupElements, side_note::SideNote};
 
-pub use crate::proof::{PROOF_FORMAT_VERSION, Proof, SegmentState};
+pub use crate::proof::{Proof, SegmentState};
 
 /// Timing breakdown of the proving pipeline.
 #[derive(Clone, Debug)]
@@ -175,9 +178,60 @@ pub fn production_pcs_config_mobile() -> PcsConfig {
     }
 }
 
+/// What the prover produces: a format, and the configuration its proof
+/// carries.
+#[derive(Clone, Copy)]
+pub(crate) struct Target {
+    pub format: &'static Format,
+    pub config: PcsConfig,
+}
+
+impl Target {
+    /// Format 24 at a configuration of the caller's.
+    pub fn legacy(config: PcsConfig) -> Self {
+        Self {
+            format: &crate::format::LEGACY_SEGMENT,
+            config,
+        }
+    }
+
+    /// An admitted format, at its parameters.
+    ///
+    /// # Panics
+    ///
+    /// On a format the registry does not admit: the prover is told only
+    /// formats a verifier accepts.
+    pub fn of(format: &'static Format) -> Self {
+        assert!(
+            format.status == Status::Admitted,
+            "the prover produces admitted formats only; format {} is {:?}",
+            format.number,
+            format.status
+        );
+        Self {
+            format,
+            config: format.pcs_config(),
+        }
+    }
+}
+
 pub fn prove(side_note: &mut SideNote) -> Result<Proof, ProvingError> {
     install_thread_pool();
-    let (proof, _) = prove_impl(side_note, production_pcs_config(), false)?;
+    let (proof, _) = prove_impl(side_note, Target::legacy(production_pcs_config()), false)?;
+    Ok(proof)
+}
+
+/// Prove under `format`, at its parameters, over the trace's natural shape.
+///
+/// # Panics
+///
+/// On a format the registry does not admit.
+pub fn prove_format(
+    side_note: &mut SideNote,
+    format: &'static Format,
+) -> Result<Proof, ProvingError> {
+    install_thread_pool();
+    let (proof, _) = prove_impl(side_note, Target::of(format), false)?;
     Ok(proof)
 }
 
@@ -196,7 +250,11 @@ pub fn prove(side_note: &mut SideNote) -> Result<Proof, ProvingError> {
 /// proofs.
 pub fn prove_mobile(side_note: &mut SideNote) -> Result<Proof, ProvingError> {
     install_thread_pool();
-    let (proof, _) = prove_impl(side_note, production_pcs_config_mobile(), false)?;
+    let (proof, _) = prove_impl(
+        side_note,
+        Target::legacy(production_pcs_config_mobile()),
+        false,
+    )?;
     Ok(proof)
 }
 
@@ -205,13 +263,13 @@ pub fn prove_with_config(
     config: PcsConfig,
 ) -> Result<Proof, ProvingError> {
     install_thread_pool();
-    let (proof, _) = prove_impl(side_note, config, false)?;
+    let (proof, _) = prove_impl(side_note, Target::legacy(config), false)?;
     Ok(proof)
 }
 
 pub fn prove_profiled(side_note: &mut SideNote) -> Result<(Proof, ProveProfile), ProvingError> {
     install_thread_pool();
-    prove_impl(side_note, production_pcs_config(), true)
+    prove_impl(side_note, Target::legacy(production_pcs_config()), true)
 }
 
 pub fn prove_profiled_with_config(
@@ -219,7 +277,7 @@ pub fn prove_profiled_with_config(
     config: PcsConfig,
 ) -> Result<(Proof, ProveProfile), ProvingError> {
     install_thread_pool();
-    prove_impl(side_note, config, true)
+    prove_impl(side_note, Target::legacy(config), true)
 }
 
 /// Debug: print per-component claimed sums (logup) and check if they balance.
@@ -281,9 +339,9 @@ pub fn debug_claimed_sums(side_note: &mut SideNote) -> bool {
         .collect();
 
     let mut lookup_elements = AllLookupElements::default();
-    let channel = &mut ProverChannel::default();
+    let channel = &mut stwo::core::channel::Blake2sChannel::default();
     for c in components {
-        c.draw_lookup_elements(&mut lookup_elements, channel);
+        c.draw_lookup_elements(&mut lookup_elements, channel.as_ref_channel());
     }
 
     let mut total = SecureField::zero();
@@ -319,9 +377,9 @@ pub fn debug_assert_constraints_explicit(
         .collect();
 
     let mut lookup_elements = AllLookupElements::default();
-    let channel = &mut ProverChannel::default();
+    let channel = &mut stwo::core::channel::Blake2sChannel::default();
     for c in components {
-        c.draw_lookup_elements(&mut lookup_elements, channel);
+        c.draw_lookup_elements(&mut lookup_elements, channel.as_ref_channel());
     }
 
     for (i, (c, trace)) in components.iter().zip(traces.iter()).enumerate() {
@@ -355,9 +413,9 @@ pub fn debug_assert_constraints_streaming(
     components: &[&dyn crate::framework::MachineProverComponent],
 ) {
     let mut lookup_elements = AllLookupElements::default();
-    let channel = &mut ProverChannel::default();
+    let channel = &mut stwo::core::channel::Blake2sChannel::default();
     for c in components {
-        c.draw_lookup_elements(&mut lookup_elements, channel);
+        c.draw_lookup_elements(&mut lookup_elements, channel.as_ref_channel());
     }
 
     // Pass 1 — PRODUCERS (sequential, mutate counts → must complete before
@@ -406,9 +464,9 @@ pub fn debug_claimed_sums_streaming(
 ) -> bool {
     use num_traits::Zero;
     let mut lookup_elements = AllLookupElements::default();
-    let channel = &mut ProverChannel::default();
+    let channel = &mut stwo::core::channel::Blake2sChannel::default();
     for c in components {
-        c.draw_lookup_elements(&mut lookup_elements, channel);
+        c.draw_lookup_elements(&mut lookup_elements, channel.as_ref_channel());
     }
 
     let mut total = SecureField::zero();
@@ -598,7 +656,7 @@ fn validate_memory_witnesses(side_note: &SideNote) -> Result<(), ProvingError> {
 
 fn prove_impl(
     side_note: &mut SideNote,
-    config: PcsConfig,
+    target: Target,
     profile: bool,
 ) -> Result<(Proof, ProveProfile), ProvingError> {
     prepare_side_note_for_verification(side_note);
@@ -607,7 +665,7 @@ fn prove_impl(
     let components_owned = super::active_components(side_note);
     let components: &[&dyn crate::framework::MachineProverComponent] = &components_owned;
     let component_mask = super::active_component_mask(side_note);
-    prove_impl_with_components(side_note, config, profile, components, component_mask, &[])
+    prove_impl_with_components(side_note, target, profile, components, component_mask, &[])
 }
 
 /// Chip-isolated prove path.  Bypasses `active_components` so
@@ -623,7 +681,8 @@ pub fn prove_with_explicit_components(
     components: &[&'static dyn crate::framework::MachineProverComponent],
 ) -> Result<Proof, ProvingError> {
     install_thread_pool();
-    let (proof, _) = prove_impl_with_components(side_note, config, false, components, 0, &[])?;
+    let (proof, _) =
+        prove_impl_with_components(side_note, Target::legacy(config), false, components, 0, &[])?;
     Ok(proof)
 }
 
@@ -649,6 +708,20 @@ pub fn prove_canonical(
     side_note: &mut SideNote,
     min_log_sizes: &[u32],
 ) -> Result<Proof, ProvingError> {
+    prove_canonical_format(side_note, min_log_sizes, &crate::format::LEGACY_SEGMENT)
+}
+
+/// [`prove_canonical`] under `format`, at its parameters (format 24's are
+/// MOBILE's).
+///
+/// # Panics
+///
+/// On a format the registry does not admit.
+pub fn prove_canonical_format(
+    side_note: &mut SideNote,
+    min_log_sizes: &[u32],
+    format: &'static Format,
+) -> Result<Proof, ProvingError> {
     install_thread_pool();
     prepare_side_note_for_verification(side_note);
     let components = super::all_components();
@@ -657,7 +730,7 @@ pub fn prove_canonical(
     let component_mask = ((1u64 << super::chip_idx::COUNT) - 1) as u32;
     let (proof, _) = prove_impl_with_components_overridden(
         side_note,
-        production_pcs_config_mobile(),
+        Target::of(format),
         false,
         components,
         component_mask,
@@ -682,38 +755,60 @@ pub fn program_commitment_for_profile(
     side_note: &SideNote,
     log_sizes: &[u32],
 ) -> Option<crate::program_id::ProgramCommitment> {
+    program_commitment_for_profile_format(side_note, log_sizes, &crate::format::LEGACY_SEGMENT)
+}
+
+/// [`program_commitment_for_profile`] under `format`.
+///
+/// # Panics
+///
+/// On a format the registry does not admit.
+pub fn program_commitment_for_profile_format(
+    side_note: &SideNote,
+    log_sizes: &[u32],
+    format: &'static Format,
+) -> Option<crate::program_id::ProgramCommitment> {
     install_thread_pool();
+    let target = Target::of(format);
+    crate::with_stack!(format.channel, Stack => {
+        program_commitment_on::<Stack>(side_note, log_sizes, target)
+    }, unbuilt => None)
+}
+
+fn program_commitment_on<MC: PcsStack>(
+    side_note: &SideNote,
+    log_sizes: &[u32],
+    target: Target,
+) -> Option<crate::program_id::ProgramCommitment>
+where
+    SimdBackend: BackendForChannel<MC>,
+{
+    use crate::pcs::ProofHash;
     let components = super::all_components();
     if log_sizes.len() != components.len() || log_sizes.contains(&0) {
         return None;
     }
 
-    let config = production_pcs_config_mobile();
+    let config = target.config;
     let max_constraint_log_degree_bound = components
         .iter()
         .zip(log_sizes)
         .map(|(component, &log_size)| component.max_constraint_log_degree_bound(log_size))
         .max()?;
-    let twiddles = ProverBackend::precompute_twiddles(
+    let twiddles = SimdBackend::precompute_twiddles(
         CanonicCoset::new(max_constraint_log_degree_bound + config.fri_config.log_blowup_factor)
             .circle_domain()
             .half_coset,
     );
-    let channel = &mut ProverChannel::default();
-    crate::proof::mix_proof_fs_domain(channel, PROOF_FORMAT_VERSION, &config);
-    let mut scheme =
-        CommitmentSchemeProver::<ProverBackend, ProverMerkleChannel>::new(config, &twiddles);
-    for &log_size in log_sizes {
-        channel.mix_u64(u64::from(log_size));
-    }
+    let channel = &mut MC::C::default();
+    crate::proof::mix_statement_header(channel, target.format.number, &config, log_sizes);
+    let mut scheme = CommitmentSchemeProver::<SimdBackend, MC>::new(config, &twiddles);
     let mut tree_builder = scheme.tree_builder();
     for (component, &log_size) in components.iter().zip(log_sizes) {
-        tree_builder.extend_evals(for_commit(
-            component.generate_preprocessed_trace(log_size, side_note),
-        ));
+        tree_builder.extend_evals(component.generate_preprocessed_trace(log_size, side_note));
     }
     tree_builder.commit(channel);
-    scheme.roots().first().copied()
+    scheme.roots().first().map(|root| root.into_commitment())
 }
 
 /// Prove a segment chain in memory: derive the canonical forcing profile over
@@ -724,6 +819,19 @@ pub fn program_commitment_for_profile(
 /// or `segment::segment_bounds_budgeted`). For streaming / CAS deployment use
 /// the `prover-extension` crate instead.
 pub fn prove_chain(full: &SideNote, bounds: &[(usize, usize)]) -> Option<(Vec<u32>, Vec<Proof>)> {
+    prove_chain_format(full, bounds, &crate::format::LEGACY_SEGMENT)
+}
+
+/// [`prove_chain`] under `format`.
+///
+/// # Panics
+///
+/// On a format the registry does not admit.
+pub fn prove_chain_format(
+    full: &SideNote,
+    bounds: &[(usize, usize)],
+    format: &'static Format,
+) -> Option<(Vec<u32>, Vec<Proof>)> {
     // ONE profile over every window ⇒ one forced shape ⇒ one program
     // commitment for the whole chain (what `verify_chain_standalone` pins).
     let profile = canonical_profile_for_bounds(full, bounds)?;
@@ -734,7 +842,7 @@ pub fn prove_chain(full: &SideNote, bounds: &[(usize, usize)]) -> Option<(Vec<u3
     let mut cursor = crate::segment::SegmentCursor::new(full);
     for &(a, b) in bounds {
         let mut sn = cursor.side_note(a, b);
-        proofs.push(prove_canonical(&mut sn, &profile).ok()?);
+        proofs.push(prove_canonical_format(&mut sn, &profile, format).ok()?);
     }
     Some((profile, proofs))
 }
@@ -881,7 +989,7 @@ impl NaturalFloors {
 
 fn prove_impl_with_components(
     side_note: &mut SideNote,
-    config: PcsConfig,
+    target: Target,
     profile: bool,
     components: &[&dyn crate::framework::MachineProverComponent],
     component_mask: u32,
@@ -889,7 +997,7 @@ fn prove_impl_with_components(
 ) -> Result<(Proof, ProveProfile), ProvingError> {
     prove_impl_with_components_overridden(
         side_note,
-        config,
+        target,
         profile,
         components,
         component_mask,
@@ -1002,8 +1110,8 @@ fn derive_segment_states(side_note: &SideNote) -> (SegmentState, SegmentState) {
 pub(crate) struct ReplayTraceBinding {
     pub component_mask: u32,
     pub log_sizes: Vec<u32>,
-    pub preprocessed_commitment: crate::recursion_pcs::ProverMerkleHash,
-    pub main_commitment: crate::recursion_pcs::ProverMerkleHash,
+    pub preprocessed_commitment: crate::pcs::Commitment,
+    pub main_commitment: crate::pcs::Commitment,
     pub initial_state: SegmentState,
     pub final_state: SegmentState,
 }
@@ -1013,8 +1121,22 @@ pub(crate) struct ReplayTraceBinding {
 /// proof. Used only to bind Refine child proofs to deterministic native replay.
 pub(crate) fn replay_trace_binding(
     side_note: &mut SideNote,
-    config: PcsConfig,
+    target: Target,
 ) -> Result<ReplayTraceBinding, ProvingError> {
+    crate::with_stack!(target.format.channel, Stack => {
+        replay_trace_binding_on::<Stack>(side_note, target)
+    }, unbuilt => Err(ProvingError::ConstraintsNotSatisfied))
+}
+
+fn replay_trace_binding_on<MC: PcsStack>(
+    side_note: &mut SideNote,
+    target: Target,
+) -> Result<ReplayTraceBinding, ProvingError>
+where
+    SimdBackend: BackendForChannel<MC>,
+{
+    use crate::pcs::ProofHash;
+    let config = target.config;
     if config.fri_config.log_blowup_factor > crate::proof::MAX_RECOMMIT_LOG_BLOWUP {
         return Err(ProvingError::ConstraintsNotSatisfied);
     }
@@ -1059,28 +1181,22 @@ pub(crate) fn replay_trace_binding(
     if domain_log_size > crate::proof::MAX_EXTENDED_LOG_SIZE {
         return Err(ProvingError::ConstraintsNotSatisfied);
     }
-    let twiddles = ProverBackend::precompute_twiddles(
+    let twiddles = SimdBackend::precompute_twiddles(
         CanonicCoset::new(domain_log_size)
             .circle_domain()
             .half_coset,
     );
-    let channel = &mut ProverChannel::default();
-    crate::proof::mix_proof_fs_domain(channel, PROOF_FORMAT_VERSION, &config);
-    for &log_size in &log_sizes {
-        channel.mix_u64(u64::from(log_size));
-    }
-    let mut scheme =
-        CommitmentSchemeProver::<ProverBackend, ProverMerkleChannel>::new(config, &twiddles);
+    let channel = &mut MC::C::default();
+    crate::proof::mix_statement_header(channel, target.format.number, &config, &log_sizes);
+    let mut scheme = CommitmentSchemeProver::<SimdBackend, MC>::new(config, &twiddles);
     let mut tree_builder = scheme.tree_builder();
     for trace in &traces {
-        tree_builder.extend_evals(for_commit(
-            trace.to_circle_evaluation(PREPROCESSED_TRACE_IDX),
-        ));
+        tree_builder.extend_evals(trace.to_circle_evaluation(PREPROCESSED_TRACE_IDX));
     }
     tree_builder.commit(channel);
     let mut tree_builder = scheme.tree_builder();
     for trace in &traces {
-        tree_builder.extend_evals(for_commit(trace.to_circle_evaluation(ORIGINAL_TRACE_IDX)));
+        tree_builder.extend_evals(trace.to_circle_evaluation(ORIGINAL_TRACE_IDX));
     }
     tree_builder.commit(channel);
     let roots = scheme.roots();
@@ -1088,8 +1204,8 @@ pub(crate) fn replay_trace_binding(
     Ok(ReplayTraceBinding {
         component_mask,
         log_sizes,
-        preprocessed_commitment: roots[PREPROCESSED_TRACE_IDX],
-        main_commitment: roots[ORIGINAL_TRACE_IDX],
+        preprocessed_commitment: roots[PREPROCESSED_TRACE_IDX].into_commitment(),
+        main_commitment: roots[ORIGINAL_TRACE_IDX].into_commitment(),
         initial_state,
         final_state,
     })
@@ -1120,7 +1236,7 @@ pub fn prove_with_boundary_override(
     let component_mask = super::active_component_mask(side_note);
     let (proof, _) = prove_impl_with_components_overridden(
         side_note,
-        production_pcs_config(),
+        Target::legacy(production_pcs_config()),
         false,
         components,
         component_mask,
@@ -1145,7 +1261,7 @@ pub fn prove_pre_config_relabel_for_test(side_note: &mut SideNote) -> Result<Pro
     let component_mask = super::active_component_mask(side_note);
     let (proof, _) = prove_impl_with_components_overridden(
         side_note,
-        production_pcs_config(),
+        Target::legacy(production_pcs_config()),
         false,
         components,
         component_mask,
@@ -1159,7 +1275,7 @@ pub fn prove_pre_config_relabel_for_test(side_note: &mut SideNote) -> Result<Pro
 #[allow(clippy::too_many_arguments)]
 fn prove_impl_with_components_overridden(
     side_note: &mut SideNote,
-    config: PcsConfig,
+    target: Target,
     profile: bool,
     components: &[&dyn crate::framework::MachineProverComponent],
     component_mask: u32,
@@ -1167,7 +1283,37 @@ fn prove_impl_with_components_overridden(
     min_log_sizes: &[u32],
     transcript_generation: ProofTranscriptGeneration,
 ) -> Result<(Proof, ProveProfile), ProvingError> {
+    crate::with_stack!(target.format.channel, Stack => prove_on::<Stack>(
+        side_note,
+        target,
+        profile,
+        components,
+        component_mask,
+        boundary_override,
+        min_log_sizes,
+        transcript_generation,
+    ), unbuilt => panic!("format {}'s channel is not built", target.format.number))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_on<MC: PcsStack>(
+    side_note: &mut SideNote,
+    target: Target,
+    profile: bool,
+    components: &[&dyn crate::framework::MachineProverComponent],
+    component_mask: u32,
+    boundary_override: Option<(SegmentState, SegmentState)>,
+    min_log_sizes: &[u32],
+    transcript_generation: ProofTranscriptGeneration,
+) -> Result<(Proof, ProveProfile), ProvingError>
+where
+    SimdBackend: BackendForChannel<MC>,
+{
     use std::time::Instant;
+    use stwo::core::proof_of_work::GrindOps;
+
+    let config = target.config;
+    let format = target.format;
 
     // This must precede memory-page ingestion and every component trace
     // allocation: malformed/fault traces are a caller-boundary error, not an
@@ -1218,24 +1364,23 @@ fn prove_impl_with_components_overridden(
         .max()
         .unwrap_or(0);
 
-    let twiddles = ProverBackend::precompute_twiddles(
+    let twiddles = SimdBackend::precompute_twiddles(
         CanonicCoset::new(max_constraint_log_degree_bound + config.fri_config.log_blowup_factor)
             .circle_domain()
             .half_coset,
     );
 
-    let prover_channel = &mut ProverChannel::default();
+    let prover_channel = &mut MC::C::default();
     match transcript_generation {
         ProofTranscriptGeneration::Current => {
-            crate::proof::mix_proof_fs_domain(prover_channel, PROOF_FORMAT_VERSION, &config);
+            crate::proof::mix_proof_fs_domain(prover_channel, format.number, &config);
         }
         ProofTranscriptGeneration::PreConfigRelabel => {
             crate::proof::mix_pre_config_proof_fs_domain(prover_channel);
         }
     }
 
-    let mut commitment_scheme =
-        CommitmentSchemeProver::<ProverBackend, ProverMerkleChannel>::new(config, &twiddles);
+    let mut commitment_scheme = CommitmentSchemeProver::<SimdBackend, MC>::new(config, &twiddles);
     // Stwo v2.x requires polynomial coefficients to be stored — without
     // this, ComponentProver::get_evaluation_on_domain panics with "The
     // polynomial's coefficients are not stored".  The toggle costs some
@@ -1249,11 +1394,7 @@ fn prove_impl_with_components_overridden(
     let t = Instant::now();
     let mut tree_builder = commitment_scheme.tree_builder();
     for component_trace in &traces {
-        // `for_commit` hands the SimdBackend-generated columns to the
-        // commitment scheme, which commits on SimdBackend under either PCS.
-        tree_builder.extend_evals(for_commit(
-            component_trace.to_circle_evaluation(PREPROCESSED_TRACE_IDX),
-        ));
+        tree_builder.extend_evals(component_trace.to_circle_evaluation(PREPROCESSED_TRACE_IDX));
     }
     tree_builder.commit(prover_channel);
     let preprocess_commit = t.elapsed();
@@ -1263,82 +1404,48 @@ fn prove_impl_with_components_overridden(
     let mut tree_builder = commitment_scheme.tree_builder();
     let mut total_main_columns = 0;
     for component_trace in &traces {
-        let evals = for_commit(component_trace.to_circle_evaluation(ORIGINAL_TRACE_IDX));
+        let evals = component_trace.to_circle_evaluation(ORIGINAL_TRACE_IDX);
         total_main_columns += evals.len();
         tree_builder.extend_evals(evals);
     }
     tree_builder.commit(prover_channel);
     let main_commit = t.elapsed();
 
-    // Mix the boundary `SegmentState` fields into the FS transcript.
-    // Two effects: a FINISHED proof is tamper-evident (editing
-    // initial/final registers, pc or timestamp post-prove shifts the
-    // challenges the verifier draws, so the committed interaction trace
-    // no longer satisfies the constraint system), and the lookup
-    // elements drawn next depend on the claimed boundary states — the
-    // precondition for the verifier-side boundary-binding check, which
-    // recomputes each boundary chip's claimed sum from
-    // `proof.{initial,final}_state` and rejects from-scratch provers
-    // that ship metadata diverging from the committed boundary columns
-    // (see `boundary_binding`). Gated on `closing_chip_active` because
-    // production always ships the boundary + closing chips together
-    // (BASE_COMPONENTS, set by `prove_impl`); chip-isolated harnesses
-    // that opted out leave the mix off, matching their
-    // `component_mask = 0` proof shape.
-    //
-    // Order (initial regs, final regs, initial pc, initial ts, final
-    // pc, final ts) is deterministic and stable; the verifier MUST mix
-    // identically. `memory_commitment` is NOT mixed (it is a hash
-    // computed outside the circuit) and stays OUTSIDE the binding.
-    if side_note.closing_chip_active {
-        let (initial_regs, final_regs) = match &boundary_override {
-            Some((ini, fin)) => (ini.registers, fin.registers),
-            None => (side_note.initial_regs, side_note.final_regs),
-        };
-        for r in &initial_regs {
-            prover_channel.mix_u64(*r);
-        }
-        for r in &final_regs {
-            prover_channel.mix_u64(*r);
-        }
-        let (initial_pc, initial_ts, final_pc, final_ts) = match &boundary_override {
-            Some((ini, fin)) => (ini.pc as u64, ini.timestamp, fin.pc as u64, fin.timestamp),
-            None => match (side_note.steps.first(), side_note.steps.last()) {
-                (Some(first), Some(last)) => (
-                    first.pc as u64,
-                    first.timestamp,
-                    last.next_pc as u64,
-                    last.timestamp + 1,
-                ),
-                _ => (0, 0, 0, 0),
-            },
-        };
-        prover_channel.mix_u64(initial_pc);
-        prover_channel.mix_u64(initial_ts);
-        prover_channel.mix_u64(final_pc);
-        prover_channel.mix_u64(final_ts);
+    // The shipped boundary states: the trace's, or the forgery seam's.
+    // `initial_state.registers` is `side_note.initial_regs`, the field the
+    // boundary chip's main trace emits from, so the proof field and the
+    // chip's committed values are equal by construction; the memory roots
+    // are the entering and exit page-Merkle roots `MemoryRootBoundaryChip`
+    // binds.
+    let (initial_state, final_state) =
+        boundary_override.unwrap_or_else(|| derive_segment_states(side_note));
 
-        // Format v7: mix the entering / exit RAM Merkle roots right
-        // after final_ts and before the lookup-element draw, so the verifier's
-        // MemoryRootBoundary claimed-sum recomputation is sound (the roots are
-        // public inputs the lookup elements are drawn against).  Order: entering
-        // root, then exit root, each as 4 LE u64 words.
-        let (initial_root, final_root) = match &boundary_override {
-            Some((ini, fin)) => (ini.memory_root, fin.memory_root),
-            None => segment_memory_roots(side_note),
-        };
-        for chunk in initial_root.chunks_exact(8) {
-            prover_channel.mix_u64(u64::from_le_bytes(chunk.try_into().unwrap()));
-        }
-        for chunk in final_root.chunks_exact(8) {
-            prover_channel.mix_u64(u64::from_le_bytes(chunk.try_into().unwrap()));
+    // A.1's third and fourth items: the boundary states, then the
+    // interaction PoW, before any relation challenge is drawn. A finished
+    // proof is so tamper-evident, and the verifier's boundary binding, which
+    // recomputes the boundary chips' claimed sums from the shipped states
+    // with the drawn challenges, binds them against a from-scratch prover
+    // (see `boundary_binding`). Chip-isolated harnesses without the closing
+    // chip mix nothing, matching their `component_mask = 0` proofs.
+    let mut interaction_pow = 0;
+    if side_note.closing_chip_active {
+        crate::proof::mix_boundary_states(
+            prover_channel,
+            format.encoding,
+            &initial_state,
+            &final_state,
+        );
+        let bits = format.interaction_pow_bits();
+        if bits > 0 {
+            interaction_pow = <SimdBackend as GrindOps<MC::C>>::grind(prover_channel, bits);
+            prover_channel.mix_u64(interaction_pow);
         }
     }
 
     let mut lookup_elements = AllLookupElements::default();
-    components
-        .iter()
-        .for_each(|c| c.draw_lookup_elements(&mut lookup_elements, prover_channel));
+    components.iter().for_each(|c| {
+        c.draw_lookup_elements(&mut lookup_elements, prover_channel.as_ref_channel())
+    });
 
     // Interaction trace — parallelize per-chip generation across rayon
     // threads.  Each `generate_interaction_trace` call only borrows
@@ -1370,7 +1477,7 @@ fn prove_impl_with_components_overridden(
     let mut claimed_sums: Vec<SecureField> = Vec::with_capacity(interaction_results.len());
     for (interaction_trace, claimed_sum) in interaction_results {
         total_interaction_columns += interaction_trace.len();
-        tree_builder.extend_evals(for_commit(interaction_trace));
+        tree_builder.extend_evals(interaction_trace);
         claimed_sums.push(claimed_sum);
     }
     let interaction_gen = t.elapsed();
@@ -1381,7 +1488,7 @@ fn prove_impl_with_components_overridden(
     let interaction_commit = t.elapsed();
 
     let tree_span_provider = &mut TraceLocationAllocator::default();
-    let components: Vec<Box<dyn ComponentProver<ProverBackend>>> = components
+    let components: Vec<Box<dyn ComponentProver<SimdBackend>>> = components
         .iter()
         .zip(&log_sizes)
         .zip(&claimed_sums)
@@ -1394,15 +1501,12 @@ fn prove_impl_with_components_overridden(
             )
         })
         .collect();
-    let components_ref: Vec<&dyn ComponentProver<ProverBackend>> =
+    let components_ref: Vec<&dyn ComponentProver<SimdBackend>> =
         components.iter().map(|c| &**c).collect();
 
     let t = Instant::now();
-    let proof = stwo::prover::prove::<ProverBackend, ProverMerkleChannel>(
-        &components_ref,
-        prover_channel,
-        commitment_scheme,
-    )?;
+    let proof =
+        stwo::prover::prove::<SimdBackend, MC>(&components_ref, prover_channel, commitment_scheme)?;
     let stark_prove = t.elapsed();
 
     let num_components = components.len();
@@ -1425,36 +1529,12 @@ fn prove_impl_with_components_overridden(
         eprintln!("{prof}");
     }
 
-    // Compute segment boundary states. `initial_state.registers` is
-    // sourced from `side_note.initial_regs` (the same field the
-    // boundary chip's main trace emits from), not `first.regs_before`,
-    // so the proof field and the chip's committed values are equal
-    // by construction. The closing-chip FS-transcript mix relies on this
-    // invariant — if the proof field could diverge from what the chip
-    // committed, the verifier would mix bytes that don't match what
-    // the prover mixed and honest proofs would fail to verify.
-    //
-    // For non-empty traces this is equivalent to `first.regs_before`
-    // because the constraint system already requires
-    // `initial_regs == first.regs_before` (boundary chip producers
-    // balance CpuChip first-step read consumers via the ledger).
-    // Memory-page Merkle roots: entering root on initial_state, exit root on final_state —
-    // the same values mixed into the FS transcript above and bound by
-    // MemoryRootBoundaryChip, so the proof fields equal the committed columns.
-    let (initial_state, final_state) = derive_segment_states(side_note);
-
-    // The forgery seam ships the caller's states verbatim — the same
-    // values the mix above committed to the transcript.
-    let (initial_state, final_state) = match boundary_override {
-        Some((ini, fin)) => (ini, fin),
-        None => (initial_state, final_state),
-    };
-
     // Caller supplies the bitmask (empty for chip-isolated harness).
     Ok((
         Proof {
-            format_version: PROOF_FORMAT_VERSION,
-            stark_proof: proof,
+            format_version: format.number,
+            stark_proof: MC::into_any(proof),
+            interaction_pow,
             claimed_sums,
             num_components,
             log_sizes,

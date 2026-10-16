@@ -1,8 +1,4 @@
-// Not under `poseidon2-channel`: builds a "wrong" commitment via
-// `ProgramCommitment::from(&[u8])` — `Blake2sHash` has that conversion but
-// `P2Hash` (the Poseidon2-M31 commitment) does not. Program-identity under P2
-// is covered by `verifier/tests/poseidon2_canonical_segment.rs`.
-#![cfg(all(feature = "prover", not(feature = "poseidon2-channel")))]
+#![cfg(feature = "prover")]
 
 //! Program-identity public API.
 //!
@@ -86,7 +82,9 @@ fn verify_standalone_rejects_wrong_program_hash() {
     let (code, bitmask, steps) = trace_reverse_bytes_program();
     let proof = prove_program(&code, &bitmask, steps);
 
-    let wrong = ProgramCommitment::from(&[0xFFu8; 32][..]);
+    let wrong =
+        ProgramCommitment::from_bytes(vos_pvm_proof::format::ChannelKind::Blake2s, &[0xFFu8; 32])
+            .unwrap();
     let res = verify_standalone(proof, wrong);
     assert!(res.is_err(), "verifier must reject a wrong program hash");
 }

@@ -1135,7 +1135,7 @@ mod tests {
         use crate::chips::Blake2bBoundaryChip;
         use crate::harness::MachineComponent;
         use crate::lookups::{AllLookupElements, Blake2bCompressionLookupElements};
-        use crate::recursion_pcs::ProverChannel;
+        use stwo::core::channel::Blake2sChannel;
         use stwo::core::fields::FieldExpOps;
         use stwo::core::fields::m31::BaseField;
         use stwo::core::fields::qm31::SecureField;
@@ -1161,8 +1161,8 @@ mod tests {
         assert!(calls.len() < raw.len(), "the fixture must actually dedup");
 
         let mut all = AllLookupElements::default();
-        let channel = &mut ProverChannel::default();
-        Blake2bBoundaryChip.draw_lookup_elements(&mut all, channel);
+        let channel = &mut Blake2sChannel::default();
+        Blake2bBoundaryChip.draw_lookup_elements(&mut all, channel.into());
         let el: &Blake2bCompressionLookupElements = all.as_ref();
         // (h_in[64] ‖ m[128] ‖ t[8] ‖ f[1] ‖ h_out[64]) as byte limbs — the
         // tuple shape both producer and consumers emit.

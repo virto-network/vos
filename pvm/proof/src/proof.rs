@@ -6,20 +6,22 @@
 use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
 use stwo::core::{
-    channel::Channel, fields::qm31::SecureField, pcs::PcsConfig, poly::line::LinePoly,
+    channel::{Channel, MerkleChannel},
+    fields::qm31::SecureField,
+    pcs::PcsConfig,
+    poly::line::LinePoly,
     proof::StarkProof,
+    vcs_lifted::merkle_hasher::MerkleHasherLifted,
 };
 
-use crate::recursion_pcs::ProverMerkleHasher;
+use crate::format::{Encoding, Format};
+use crate::pcs::{FsChannel, PcsStack, ProofHash, StarkProofAny};
 
-/// Current proof format version.  Bumped whenever the AIR shape (number
-/// of components, column counts, lookup-tuple shapes, flag layouts) or
-/// the proof struct layout changes in a way that would make an older
-/// verifier silently accept the wrong thing.
+/// The format the default prover produces: the legacy Blake2s segment
+/// format of [`crate::format`]. A proof's `format_version` names its entry
+/// there, and verifiers refuse a number the registry does not admit.
 ///
-/// Verifiers MUST reject proofs whose `format_version` does not match
-/// the constant they were compiled against — see the bounds check in
-/// `vos_pvm_proof::verify` and `vos_pvm_proof_verifier::verify_standalone`.
+/// History (before the registry, one number per build):
 ///
 /// History:
 ///   1 — Rotate / BitManip / 32-bit-shift / Sbrk all bound;
@@ -177,14 +179,12 @@ use crate::recursion_pcs::ProverMerkleHasher;
 ///        column (the program-memory tuple drops from 33 to 32 limbs), so
 ///        program commitments change. Older proofs reject.
 ///   25 — Poseidon2-M31 PCS variant of format 24.
-#[cfg(not(feature = "poseidon2-channel"))]
-pub const PROOF_FORMAT_VERSION: u32 = 24;
-/// Native recursion: the PCS commit hash + Fiat-Shamir
-/// transcript move from Blake2s to Poseidon2-M31, so `stark_proof.commitments`
-/// become `P2Hash` digests — a different wire format. A Blake2s verifier
-/// (v24) and a Poseidon2-M31 verifier (v25) therefore reject each other's proofs.
-#[cfg(feature = "poseidon2-channel")]
-pub const PROOF_FORMAT_VERSION: u32 = 25;
+///   26–30 — the registry's ([`crate::format`]): segment proofs on the
+///        Poseidon2-M31 channel (26), leaves and folds (27), the final wrap
+///        (28), device proofs (29) and credential proofs (30), each with its
+///        channel and parameters chosen at run time, the lossless encodings
+///        and the interaction PoW. 25 is retired.
+pub const PROOF_FORMAT_VERSION: u32 = crate::format::LEGACY_SEGMENT_NUMBER;
 
 /// Exact number of commitment trees in this generation of the Stwo proof:
 /// preprocessed, main, interaction, and split composition.
@@ -226,10 +226,8 @@ pub const MAX_PROOF_OWNED_BYTES: usize = 16 * 1024 * 1024;
 const PROOF_FS_DOMAIN_WORD_0: u64 = u64::from_le_bytes(*b"VOS/PVM/");
 const PROOF_FS_DOMAIN_WORD_1: u64 = u64::from_le_bytes(*b"STARK/FS");
 
-#[cfg(all(feature = "prover", not(feature = "poseidon2-channel")))]
+#[cfg(feature = "prover")]
 const PRE_CONFIG_FS_FORMAT_VERSION: u32 = 18;
-#[cfg(all(feature = "prover", feature = "poseidon2-channel"))]
-const PRE_CONFIG_FS_FORMAT_VERSION: u32 = 19;
 
 /// Bind the proof protocol domain and exact format generation into a Fiat–
 /// Shamir channel. This prefix authenticates the STARK statement transcript;
@@ -251,6 +249,86 @@ pub fn mix_proof_fs_domain(channel: &mut impl Channel, format_version: u32, conf
             channel.mix_u64(u64::from(lifting));
         }
     }
+}
+
+/// A.1's first item: the domain, the format and the PCS configuration, then
+/// each component's log size.
+pub fn mix_statement_header(
+    channel: &mut impl Channel,
+    format_version: u32,
+    config: &PcsConfig,
+    log_sizes: &[u32],
+) {
+    mix_proof_fs_domain(channel, format_version, config);
+    for &log_size in log_sizes {
+        channel.mix_u64(u64::from(log_size));
+    }
+}
+
+/// A.1's third item: the boundary states, after the main trace's root and
+/// before any relation challenge, so the challenges depend on them and the
+/// boundary binding's public logup terms are bound.
+///
+/// - [`Encoding::Lossless`]: the boundary chips' own bytes
+///   ([`crate::boundary_binding::boundary_state_bytes`]), one M31 a byte, as
+///   one run of 296.
+/// - [`Encoding::Legacy`]: format 24's, a u64 at a time: the registers in
+///   and out, pc and ts in, pc and ts out, then each memory root as four
+///   little-endian u64s.
+pub fn mix_boundary_states(
+    channel: &mut impl FsChannel,
+    encoding: Encoding,
+    initial: &SegmentState,
+    final_state: &SegmentState,
+) {
+    match encoding {
+        Encoding::Lossless => {
+            channel.mix_bytes(&crate::boundary_binding::boundary_state_bytes(
+                initial,
+                final_state,
+            ));
+        }
+        Encoding::Legacy => {
+            for register in initial.registers.iter().chain(&final_state.registers) {
+                channel.mix_u64(*register);
+            }
+            channel.mix_u64(u64::from(initial.pc));
+            channel.mix_u64(initial.timestamp);
+            channel.mix_u64(u64::from(final_state.pc));
+            channel.mix_u64(final_state.timestamp);
+            for root in [&initial.memory_root, &final_state.memory_root] {
+                for chunk in root.chunks_exact(8) {
+                    channel.mix_u64(u64::from_le_bytes(chunk.try_into().unwrap()));
+                }
+            }
+        }
+    }
+}
+
+/// A.1's fourth item, on the verifier's side: the interaction PoW nonce must
+/// meet the format's bits on the channel as it stands after the boundary
+/// states, and is then mixed. A format without an interaction PoW takes the
+/// nonce 0 and mixes nothing.
+pub fn check_interaction_pow(
+    channel: &mut impl Channel,
+    format: &Format,
+    nonce: u64,
+) -> Result<(), alloc::string::String> {
+    let bits = format.interaction_pow_bits();
+    if bits == 0 {
+        return if nonce == 0 {
+            Ok(())
+        } else {
+            Err("format carries no interaction PoW, but the proof has a nonce".into())
+        };
+    }
+    if !channel.verify_pow_nonce(bits, nonce) {
+        return Err(alloc::format!(
+            "interaction PoW nonce does not meet {bits} bits"
+        ));
+    }
+    channel.mix_u64(nonce);
+    Ok(())
 }
 
 /// Adversarial-test seam for constructing a proof under the immediately
@@ -283,13 +361,17 @@ pub struct SegmentState {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Proof {
-    /// Format-shape version — must equal `PROOF_FORMAT_VERSION` of the
-    /// verifier crate this proof is presented to.  Mismatches are
-    /// rejected with `VerificationError::InvalidStructure` before any
-    /// cryptographic work happens.
+    /// The proof's format, an entry of [`crate::format`]'s registry: it
+    /// decides the channel `stark_proof` must be in, the parameters and the
+    /// encodings. A number the registry does not admit is rejected with
+    /// `VerificationError::InvalidStructure` before any cryptographic work.
     #[serde(default = "proof_format_version_default")]
     pub format_version: u32,
-    pub stark_proof: StarkProof<ProverMerkleHasher>,
+    pub stark_proof: StarkProofAny,
+    /// The interaction PoW nonce (A.1's fourth item); 0 under a format
+    /// without one.
+    #[serde(default)]
+    pub interaction_pow: u64,
     pub claimed_sums: Vec<SecureField>,
     pub log_sizes: Vec<u32>,
     pub num_components: usize,
@@ -352,6 +434,11 @@ impl Proof {
     pub fn public_io_hash(&self) -> [u8; 32] {
         public_io_hash_from_registers(&self.final_state.registers)
     }
+
+    /// The program commitment: the preprocessed tree's root.
+    pub fn preprocessed_commitment(&self) -> Option<crate::pcs::Commitment> {
+        self.stark_proof.commitment(0)
+    }
 }
 
 /// Exact inverse of the standard guest a2..a5 public-I/O register encoding.
@@ -365,6 +452,21 @@ pub(crate) fn public_io_hash_from_registers(registers: &[u64; 13]) -> [u8; 32] {
         out[index * 8..index * 8 + 8].copy_from_slice(&word.to_le_bytes());
     }
     out
+}
+
+/// The admitted format a proof names, with its Stwo proof in that format's
+/// channel.
+pub fn proof_format(proof: &Proof) -> Result<&'static Format, alloc::string::String> {
+    let format = crate::format::admitted(proof.format_version)?;
+    if proof.stark_proof.channel() != format.channel {
+        return Err(alloc::format!(
+            "proof format {} runs on the {:?} channel, but its Stark proof is on {:?}",
+            format.number,
+            format.channel,
+            proof.stark_proof.channel()
+        ));
+    }
+    Ok(format)
 }
 
 /// Transport-independent hostile-proof preflight shared by the prover-enabled
@@ -381,14 +483,24 @@ pub fn preflight_proof_structure_readonly(
     proof: &Proof,
     max_log_size: u32,
 ) -> Result<usize, alloc::string::String> {
+    let format = proof_format(proof)?;
+    crate::with_stack!(format.channel, Stack => {
+        let stark = Stack::stark(&proof.stark_proof)
+            .ok_or_else(|| alloc::string::String::from("Stark proof channel differs"))?;
+        preflight_structure::<<Stack as MerkleChannel>::H>(proof, stark, max_log_size)
+    }, unbuilt => Err(alloc::format!("the {:?} channel is not built", format.channel)))
+}
+
+fn preflight_structure<H: MerkleHasherLifted>(
+    proof: &Proof,
+    stark: &StarkProof<H>,
+    max_log_size: u32,
+) -> Result<usize, alloc::string::String>
+where
+    H::Hash: ProofHash,
+{
     use alloc::{format, string::ToString};
 
-    if proof.format_version != PROOF_FORMAT_VERSION {
-        return Err(format!(
-            "proof format version mismatch: verifier expects {PROOF_FORMAT_VERSION}, proof has {}",
-            proof.format_version
-        ));
-    }
     if proof.num_components == 0 || proof.num_components > MAX_PROOF_COMPONENTS {
         return Err("proof component cardinality is outside protocol bounds".into());
     }
@@ -408,7 +520,7 @@ pub fn preflight_proof_structure_readonly(
     }
 
     let config = proof.pcs_config;
-    if proof.stark_proof.config != config {
+    if stark.config != config {
         return Err("outer and embedded pcs_config differ".into());
     }
     let fri = config.fri_config;
@@ -447,7 +559,6 @@ pub fn preflight_proof_structure_readonly(
         ));
     }
 
-    let stark = &proof.stark_proof;
     if stark.commitments.len() != PROOF_COMMITMENT_TREE_COUNT
         || stark.sampled_values.len() != PROOF_COMMITMENT_TREE_COUNT
         || stark.decommitments.len() != PROOF_COMMITMENT_TREE_COUNT
@@ -495,7 +606,7 @@ pub fn preflight_proof_structure_readonly(
     if fri_proof.inner_layers.len() > MAX_EXTENDED_LOG_SIZE as usize {
         return Err("FRI inner-layer count exceeds protocol bound".into());
     }
-    let layer_is_bounded = |layer: &stwo::core::fri::FriLayerProof<ProverMerkleHasher>| {
+    let layer_is_bounded = |layer: &stwo::core::fri::FriLayerProof<H>| {
         layer.fri_witness.len() <= MAX_FRI_QUERIES
             && layer.decommitment.hash_witness.len() <= MAX_MERKLE_WITNESS_HASHES
     };
@@ -507,7 +618,7 @@ pub fn preflight_proof_structure_readonly(
     {
         return Err("FRI layer witness exceeds protocol bound".into());
     }
-    let owned_bytes = proof_owned_bytes(proof).ok_or_else(|| {
+    let owned_bytes = proof_owned_bytes_of(proof, stark).ok_or_else(|| {
         alloc::format!("proof nested payload exceeds {MAX_PROOF_OWNED_BYTES} bytes")
     })?;
 
@@ -521,7 +632,7 @@ pub fn preflight_proof_structure_readonly(
             coefficients_len
         ));
     }
-    if !proof_fields_are_canonical(proof) {
+    if !proof_fields_are_canonical(proof, stark) {
         return Err("proof contains a noncanonical M31 field limb".into());
     }
     Ok(owned_bytes)
@@ -535,20 +646,12 @@ fn secure_field_is_canonical(value: &SecureField) -> bool {
     value.to_m31_array().iter().all(base_field_is_canonical)
 }
 
-#[cfg(not(feature = "poseidon2-channel"))]
-fn merkle_hash_is_canonical(_: &crate::recursion_pcs::ProverMerkleHash) -> bool {
-    true
-}
-
-#[cfg(feature = "poseidon2-channel")]
-fn merkle_hash_is_canonical(hash: &crate::recursion_pcs::ProverMerkleHash) -> bool {
-    hash.0.iter().all(base_field_is_canonical)
-}
-
-fn proof_fields_are_canonical(proof: &Proof) -> bool {
-    let stark = &proof.stark_proof;
+fn proof_fields_are_canonical<H: MerkleHasherLifted>(proof: &Proof, stark: &StarkProof<H>) -> bool
+where
+    H::Hash: ProofHash,
+{
     proof.claimed_sums.iter().all(secure_field_is_canonical)
-        && stark.commitments.iter().all(merkle_hash_is_canonical)
+        && stark.commitments.iter().all(ProofHash::is_canonical)
         && stark
             .sampled_values
             .iter()
@@ -565,17 +668,17 @@ fn proof_fields_are_canonical(proof: &Proof) -> bool {
             .decommitments
             .iter()
             .flat_map(|decommitment| &decommitment.hash_witness)
-            .all(merkle_hash_is_canonical)
+            .all(ProofHash::is_canonical)
         && core::iter::once(&stark.fri_proof.first_layer)
             .chain(&stark.fri_proof.inner_layers)
             .all(|layer| {
-                merkle_hash_is_canonical(&layer.commitment)
+                layer.commitment.is_canonical()
                     && layer.fri_witness.iter().all(secure_field_is_canonical)
                     && layer
                         .decommitment
                         .hash_witness
                         .iter()
-                        .all(merkle_hash_is_canonical)
+                        .all(ProofHash::is_canonical)
             })
         && stark
             .fri_proof
@@ -587,10 +690,21 @@ fn proof_fields_are_canonical(proof: &Proof) -> bool {
 /// Checked aggregate size of all proof-owned nested vector elements.
 ///
 /// This is a post-decode heap-payload bound (transport must still cap bytes
-/// before Serde). Returning `None` means arithmetic overflow or a payload over
-/// [`MAX_PROOF_OWNED_BYTES`]. Vec headers are included so thousands of empty
-/// attacker-controlled columns are not free in the accounting.
+/// before Serde). Returning `None` means arithmetic overflow, a payload over
+/// [`MAX_PROOF_OWNED_BYTES`], or a channel no stack implements. Vec headers
+/// are included so thousands of empty attacker-controlled columns are not
+/// free in the accounting.
 pub fn proof_owned_bytes(proof: &Proof) -> Option<usize> {
+    match &proof.stark_proof {
+        StarkProofAny::Blake2s(stark) => proof_owned_bytes_of(proof, stark),
+        StarkProofAny::Poseidon2M31(stark) => proof_owned_bytes_of(proof, stark),
+    }
+}
+
+fn proof_owned_bytes_of<H: MerkleHasherLifted>(
+    proof: &Proof,
+    stark: &StarkProof<H>,
+) -> Option<usize> {
     use core::mem::size_of;
 
     fn add<T>(total: &mut usize, len: usize) -> Option<()> {
@@ -601,40 +715,34 @@ pub fn proof_owned_bytes(proof: &Proof) -> Option<usize> {
     let mut total = size_of::<Proof>();
     add::<SecureField>(&mut total, proof.claimed_sums.len())?;
     add::<u32>(&mut total, proof.log_sizes.len())?;
-    add::<crate::recursion_pcs::ProverMerkleHash>(&mut total, proof.stark_proof.commitments.len())?;
-    add::<Vec<Vec<SecureField>>>(&mut total, proof.stark_proof.sampled_values.len())?;
-    for tree in proof.stark_proof.sampled_values.iter() {
+    add::<H::Hash>(&mut total, stark.commitments.len())?;
+    add::<Vec<Vec<SecureField>>>(&mut total, stark.sampled_values.len())?;
+    for tree in stark.sampled_values.iter() {
         add::<Vec<SecureField>>(&mut total, tree.len())?;
         for column in tree {
             add::<SecureField>(&mut total, column.len())?;
         }
     }
-    add::<Vec<Vec<stwo::core::fields::m31::BaseField>>>(
-        &mut total,
-        proof.stark_proof.queried_values.len(),
-    )?;
-    for tree in proof.stark_proof.queried_values.iter() {
+    add::<Vec<Vec<stwo::core::fields::m31::BaseField>>>(&mut total, stark.queried_values.len())?;
+    for tree in stark.queried_values.iter() {
         add::<Vec<stwo::core::fields::m31::BaseField>>(&mut total, tree.len())?;
         for column in tree {
             add::<stwo::core::fields::m31::BaseField>(&mut total, column.len())?;
         }
     }
-    add::<stwo::core::vcs_lifted::verifier::MerkleDecommitmentLifted<ProverMerkleHasher>>(
+    add::<stwo::core::vcs_lifted::verifier::MerkleDecommitmentLifted<H>>(
         &mut total,
-        proof.stark_proof.decommitments.len(),
+        stark.decommitments.len(),
     )?;
-    for decommitment in proof.stark_proof.decommitments.iter() {
-        add::<crate::recursion_pcs::ProverMerkleHash>(&mut total, decommitment.hash_witness.len())?;
+    for decommitment in stark.decommitments.iter() {
+        add::<H::Hash>(&mut total, decommitment.hash_witness.len())?;
     }
-    let fri = &proof.stark_proof.fri_proof;
+    let fri = &stark.fri_proof;
     add::<SecureField>(&mut total, fri.last_layer_poly.iter().count())?;
-    add::<stwo::core::fri::FriLayerProof<ProverMerkleHasher>>(&mut total, fri.inner_layers.len())?;
+    add::<stwo::core::fri::FriLayerProof<H>>(&mut total, fri.inner_layers.len())?;
     for layer in core::iter::once(&fri.first_layer).chain(&fri.inner_layers) {
         add::<SecureField>(&mut total, layer.fri_witness.len())?;
-        add::<crate::recursion_pcs::ProverMerkleHash>(
-            &mut total,
-            layer.decommitment.hash_witness.len(),
-        )?;
+        add::<H::Hash>(&mut total, layer.decommitment.hash_witness.len())?;
     }
     Some(total)
 }
@@ -647,18 +755,54 @@ pub fn preflight_proof_structure(
     proof: &mut Proof,
     max_log_size: u32,
 ) -> Result<(), alloc::string::String> {
-    use alloc::vec::Vec;
-
     let _bounded_bytes = preflight_proof_structure_readonly(proof, max_log_size)?;
-    let coefficients: Vec<SecureField> = proof
-        .stark_proof
-        .fri_proof
-        .last_layer_poly
-        .iter()
-        .copied()
-        .collect();
-    proof.stark_proof.0.fri_proof.last_layer_poly = LinePoly::new(coefficients);
+    match &mut proof.stark_proof {
+        StarkProofAny::Blake2s(stark) => normalize_last_layer(stark),
+        StarkProofAny::Poseidon2M31(stark) => normalize_last_layer(stark),
+    }
     Ok(())
+}
+
+fn normalize_last_layer<H: MerkleHasherLifted>(stark: &mut StarkProof<H>) {
+    let coefficients: Vec<SecureField> = stark.fri_proof.last_layer_poly.iter().copied().collect();
+    stark.0.fri_proof.last_layer_poly = LinePoly::new(coefficients);
+}
+
+/// Refuse a proof whose counts, at its own parameters and shape, fall below
+/// its format's floors; and, under a format with exact parameters, one whose
+/// parameters are not the format's. Counts first, so a weakened proof is
+/// refused for its security whatever else differs.
+pub fn check_format_security(
+    format: &Format,
+    config: &PcsConfig,
+    shape: &crate::security::SecurityShape,
+) -> Result<crate::security::SecurityBits, alloc::string::String> {
+    let params = crate::format::FormatParams::of(config, format.interaction_pow_bits());
+    let bits = crate::security::security_bits(&params, shape)
+        .ok_or_else(|| alloc::string::String::from("parameters outside the security analysis"))?;
+    if bits.conjectured < format.floor.conjectured {
+        return Err(alloc::format!(
+            "proof counts {} conjectured bits, below format {}'s floor of {}",
+            bits.conjectured,
+            format.number,
+            format.floor.conjectured
+        ));
+    }
+    if bits.proven < format.floor.proven {
+        return Err(alloc::format!(
+            "proof counts {} proven bits, below format {}'s floor of {}",
+            bits.proven,
+            format.number,
+            format.floor.proven
+        ));
+    }
+    if format.exact_params() && *config != format.pcs_config() {
+        return Err(alloc::format!(
+            "proof parameters differ from format {}'s",
+            format.number
+        ));
+    }
+    Ok(bits)
 }
 
 /// Derived safe dimensions of a structurally valid Stwo statement.
@@ -715,8 +859,9 @@ pub fn derive_protocol_degree_shape(
 /// Validate all nested Stwo vector dimensions against the exact AIR-derived
 /// tree layout. `expected_log_sizes` and `expected_sample_counts` include all
 /// four trees, including the eight split-composition columns.
-pub fn preflight_proof_dimensions(
-    proof: &Proof,
+pub fn preflight_proof_dimensions<H: MerkleHasherLifted>(
+    config: &PcsConfig,
+    stark: &StarkProof<H>,
     expected_log_sizes: &[alloc::vec::Vec<u32>],
     expected_sample_counts: &[alloc::vec::Vec<usize>],
     composition_log_degree_bound: u32,
@@ -728,9 +873,9 @@ pub fn preflight_proof_dimensions(
     {
         return Err("AIR-derived proof layout must contain exactly four trees".into());
     }
-    let fri = proof.pcs_config.fri_config;
+    let fri = config.fri_config;
     let (lifting_log_size, max_log_degree_bound) =
-        derive_protocol_degree_shape(&proof.pcs_config, composition_log_degree_bound)?;
+        derive_protocol_degree_shape(config, composition_log_degree_bound)?;
 
     for (tree_index, logs) in expected_log_sizes.iter().enumerate() {
         if logs.len() > MAX_PROOF_COLUMNS_PER_TREE {
@@ -768,24 +913,21 @@ pub fn preflight_proof_dimensions(
         let logs = &expected_log_sizes[tree_index];
         let samples = &expected_sample_counts[tree_index];
         if samples.len() != logs.len()
-            || proof.stark_proof.sampled_values[tree_index].len() != logs.len()
-            || proof.stark_proof.queried_values[tree_index].len() != logs.len()
+            || stark.sampled_values[tree_index].len() != logs.len()
+            || stark.queried_values[tree_index].len() != logs.len()
         {
             return Err(format!(
                 "tree {tree_index} column dimensions differ from the AIR-derived layout"
             ));
         }
-        for (column, &expected_samples) in proof.stark_proof.sampled_values[tree_index]
-            .iter()
-            .zip(samples)
-        {
+        for (column, &expected_samples) in stark.sampled_values[tree_index].iter().zip(samples) {
             if column.len() != expected_samples {
                 return Err(format!(
                     "tree {tree_index} OODS sample dimensions differ from the AIR mask"
                 ));
             }
         }
-        for column in &proof.stark_proof.queried_values[tree_index] {
+        for column in &stark.queried_values[tree_index] {
             let query_count = column.len();
             if let Some(expected) = common_query_count {
                 if query_count != expected {
@@ -809,10 +951,10 @@ pub fn preflight_proof_dimensions(
         })
         .ok_or_else(|| "FRI last layer exceeds the folded composition bound".to_string())?
         as usize;
-    if proof.stark_proof.fri_proof.inner_layers.len() != expected_inner_layers {
+    if stark.fri_proof.inner_layers.len() != expected_inner_layers {
         return Err(format!(
             "FRI inner-layer count {}, expected {expected_inner_layers}",
-            proof.stark_proof.fri_proof.inner_layers.len()
+            stark.fri_proof.inner_layers.len()
         ));
     }
 
@@ -830,16 +972,16 @@ pub fn preflight_proof_dimensions(
 /// [`preflight_proof_dimensions`]. This closes the remaining upstream
 /// `MerkleVerifierLifted` assumption that every queried-value column has
 /// exactly one value per deduplicated query.
-pub fn expected_fiat_shamir_query_count(
-    transcript_after_interaction: &crate::recursion_pcs::ProverChannel,
-    stark_proof: &StarkProof<ProverMerkleHasher>,
+pub fn expected_fiat_shamir_query_count<MC: MerkleChannel>(
+    transcript_after_interaction: &MC::C,
+    stark_proof: &StarkProof<MC::H>,
     config: &PcsConfig,
     shape: ProofProtocolShape,
     expected_log_sizes: &[alloc::vec::Vec<u32>],
 ) -> Result<usize, alloc::string::String> {
     use stwo::core::pcs::utils::prepare_preprocessed_query_positions;
 
-    let positions = replay_query_positions(
+    let positions = replay_query_positions::<MC>(
         &mut transcript_after_interaction.clone(),
         stark_proof,
         config,
@@ -879,14 +1021,13 @@ pub fn expected_fiat_shamir_query_count(
 /// leaves `channel` where the verifier's stands after its draw. The
 /// proof-of-work check reads the channel without changing it, so only the
 /// nonce's mix is replayed.
-fn replay_query_positions(
-    channel: &mut crate::recursion_pcs::ProverChannel,
-    stark_proof: &StarkProof<ProverMerkleHasher>,
+fn replay_query_positions<MC: MerkleChannel>(
+    channel: &mut MC::C,
+    stark_proof: &StarkProof<MC::H>,
     config: &PcsConfig,
     lifting_log_size: u32,
 ) -> Result<Vec<usize>, alloc::string::String> {
-    use crate::recursion_pcs::ProverMerkleChannel;
-    use stwo::core::{channel::MerkleChannel, circle::CirclePoint, queries::draw_queries};
+    use stwo::core::{circle::CirclePoint, queries::draw_queries};
 
     // `verify_ex`: the composition coefficient, the composition root, then the
     // OODS point.
@@ -896,7 +1037,7 @@ fn replay_query_positions(
         .get(PROOF_COMMITMENT_TREE_COUNT - 1)
         .copied()
         .ok_or_else(|| alloc::string::String::from("missing composition commitment"))?;
-    ProverMerkleChannel::mix_root(channel, composition);
+    MC::mix_root(channel, composition);
     let _ = CirclePoint::<SecureField>::get_random_point(channel);
 
     // `verify_values`: every sampled value in one mix, flattened across trees
@@ -917,7 +1058,7 @@ fn replay_query_positions(
     for commitment in core::iter::once(fri.first_layer.commitment)
         .chain(fri.inner_layers.iter().map(|layer| layer.commitment))
     {
-        ProverMerkleChannel::mix_root(channel, commitment);
+        MC::mix_root(channel, commitment);
         let _ = channel.draw_secure_felt();
     }
     channel.mix_felts(&fri.last_layer_poly);
@@ -1011,6 +1152,123 @@ mod hostile_query_tests {
 
 #[cfg(all(test, feature = "prover"))]
 mod query_replay_tests;
+
+#[cfg(test)]
+mod transcript_tests {
+    use super::*;
+    use crate::format::{LEGACY_SEGMENT, SEGMENT};
+    use crate::framework_access::{
+        AllLookupElements, boundary_relation_challenges, draw_all_lookup_elements,
+    };
+    use crate::poseidon2::Poseidon2M31Channel;
+    use stwo::core::fields::m31::{BaseField, P};
+
+    fn state(register: u64) -> SegmentState {
+        let mut registers = [7u64; 13];
+        registers[3] = register;
+        SegmentState {
+            pc: 0x1000,
+            timestamp: 1,
+            registers,
+            memory_commitment: [0; 32],
+            memory_root: [9; 32],
+        }
+    }
+
+    /// The boundary relations' challenges, drawn after `initial` and
+    /// `final_state` are mixed as format 26 mixes them.
+    fn challenges(
+        initial: &SegmentState,
+        final_state: &SegmentState,
+    ) -> [(SecureField, SecureField); 3] {
+        let channel = &mut Poseidon2M31Channel::default();
+        mix_boundary_states(channel, SEGMENT.encoding, initial, final_state);
+        let mut lookups = AllLookupElements::default();
+        draw_all_lookup_elements(&mut lookups, channel, u32::MAX);
+        boundary_relation_challenges(&lookups)
+    }
+
+    /// Two boundary states apart only by p in one 32-bit word of a register
+    /// draw different challenges. The retired encoding, `reduce(lo32),
+    /// reduce(hi32)`, absorbed them alike.
+    #[test]
+    fn boundary_states_apart_by_p_in_a_word_draw_different_challenges() {
+        let p = u64::from(P);
+        let retired = |value: u64| {
+            [
+                BaseField::reduce(value & 0xffff_ffff),
+                BaseField::reduce(value >> 32),
+            ]
+        };
+        let end = state(0);
+        for (low, high) in [(5, 5 + p), (5 << 32, (5 + p) << 32)] {
+            assert_eq!(retired(low), retired(high), "the retired encoding collides");
+            assert_ne!(
+                challenges(&state(low), &end),
+                challenges(&state(high), &end)
+            );
+            assert_ne!(
+                challenges(&end, &state(low)),
+                challenges(&end, &state(high))
+            );
+            let mixed = |value| {
+                let mut channel = Poseidon2M31Channel::default();
+                channel.mix_u64(value);
+                channel.draw_secure_felt()
+            };
+            assert_ne!(mixed(low), mixed(high), "the channel's u64 mix");
+        }
+    }
+
+    /// The lossless run absorbs the boundary chips' bytes: 296 of them, the
+    /// registers first, every one below 256.
+    #[test]
+    fn the_boundary_run_is_the_chips_bytes() {
+        let bytes = crate::boundary_binding::boundary_state_bytes(&state(0x0102), &state(3));
+        assert_eq!(bytes.len(), 296);
+        assert_eq!(&bytes[24..32], &0x0102u64.to_le_bytes());
+        assert_eq!(&bytes[208..212], &0x1000u32.to_le_bytes());
+        assert_eq!(&bytes[264..296], &[9; 32]);
+    }
+
+    /// The interaction PoW: a ground nonce passes and is mixed, another
+    /// nonce is refused; a format without one takes only the nonce 0. At 8
+    /// bits, to grind fast on the scalar permutation.
+    #[test]
+    fn the_interaction_pow_is_checked() {
+        let segment = Format {
+            params: crate::format::FormatParams {
+                interaction_pow_bits: 8,
+                ..SEGMENT.params
+            },
+            ..SEGMENT
+        };
+        let mut channel = Poseidon2M31Channel::default();
+        channel.mix_u64(1);
+        let bits = segment.interaction_pow_bits();
+        let nonce = (0u64..)
+            .find(|&nonce| channel.verify_pow_nonce(bits, nonce))
+            .unwrap();
+        let wrong = (0u64..)
+            .find(|&nonce| !channel.verify_pow_nonce(bits, nonce))
+            .unwrap();
+        assert!(check_interaction_pow(&mut channel.clone(), &segment, wrong).is_err());
+        let mut mixed = channel.clone();
+        check_interaction_pow(&mut mixed, &segment, nonce).unwrap();
+        assert_ne!(
+            mixed.clone().draw_secure_felt(),
+            channel.clone().draw_secure_felt()
+        );
+
+        let mut legacy = channel.clone();
+        check_interaction_pow(&mut legacy, &LEGACY_SEGMENT, 0).unwrap();
+        assert_eq!(
+            legacy.draw_secure_felt(),
+            channel.clone().draw_secure_felt()
+        );
+        assert!(check_interaction_pow(&mut channel, &LEGACY_SEGMENT, nonce.max(1)).is_err());
+    }
+}
 
 /// Minimum FRI proof-of-work bits the production verifier requires.
 ///

@@ -35,20 +35,10 @@ vectors:
 # Prover integration suites, including the soundness gates behind
 # `debug-internals`. Memory-heavy: two threads fit under a 24 GiB limit, e.g.
 # `systemd-run --user --scope -p MemoryMax=24G -p MemorySwapMax=0 just test-proof`.
-# Then the Poseidon2-M31 channel's proofs (format 25), on the tests whose code
-# differs under `poseidon2-channel`, each named by its path or its module's:
-# the proof format's generation, its wire codec, the transcript replay, and a
-# canonical segment proved and verified, which runs only under it. A test
-# joins only by name: the other proving tests check the same AIR under either
-# channel, and prove about twenty times slower under this one, the library's
-# refine proof alone in five minutes.
+# They cover every admitted format, the Poseidon2-M31 segment format among
+# them; the verifier's suite runs in `test`.
 test-proof: build-guests
     cargo test -p vos-pvm-proof --features debug-internals --tests -- --test-threads=2
-    cargo test -p vos-pvm-proof --features poseidon2-channel --lib -- \
-        refine::tests::proof_generation_numbers_reject_previous_formats \
-        refine_codec::tests:: \
-        proof::query_replay_tests::
-    cargo test -p vos-pvm-proof-verifier --features poseidon2-channel --test poseidon2_canonical_segment
 
 # Guest programs the prover suites run.
 build-guests: build-settle
@@ -78,7 +68,6 @@ clippy:
     cargo clippy -p vos-cli --features faults --all-targets --quiet -- -D warnings
     cargo clippy -p vos-cli --no-default-features --all-targets --quiet -- -D warnings
     cargo clippy -p vos-pvm-proof --features debug-internals --all-targets --quiet -- -D warnings
-    cargo clippy -p vos-pvm-proof -p vos-pvm-proof-verifier --features vos-pvm-proof/debug-internals,vos-pvm-proof-verifier/poseidon2-channel --all-targets --quiet -- -D warnings
 
 # Fails on any JAR remnant in the PVM crates: its ISA and gas modes, opcodes,
 # exits, capability surface, linker entry points and fixtures.
@@ -117,8 +106,8 @@ check-no-faults:
     if ((^target/debug/vos --version) | str contains "faults") { error make { msg: "a plain build of vos injects faults" } } else { print "no faults in a plain build of vos" }
 
 # The builds without std. vos-raft for an embedded target, on core and alloc
-# alone, built from the toolchain's source. The proof verifier on each
-# channel, with the proof crate's verifier path under it: both are `no_std`
+# alone, built from the toolchain's source. The proof verifier, which reads
+# every admitted format, with the proof crate's verifier path under it: both are `no_std`
 # crates, so a `std` path in either fails the build. The verifier builds for
 # the same embedded target, where no dependency has std either, and for
 # wasm32, the target of an on-chain verifier; the workspace's toolchain file
@@ -126,9 +115,7 @@ check-no-faults:
 check-no-std:
     cargo build -p vos-raft --target thumbv7em-none-eabihf -Zbuild-std=core,alloc
     cargo build -p vos-pvm-proof-verifier --target thumbv7em-none-eabihf -Zbuild-std=core,alloc
-    cargo build -p vos-pvm-proof-verifier --features poseidon2-channel --target thumbv7em-none-eabihf -Zbuild-std=core,alloc
     cargo build -p vos-pvm-proof-verifier --target wasm32-unknown-unknown
-    cargo build -p vos-pvm-proof-verifier --features poseidon2-channel --target wasm32-unknown-unknown
 
 # Checks before pushing: everything except proving.
 # The quick gate, after each change: formatting, the docs' links, the

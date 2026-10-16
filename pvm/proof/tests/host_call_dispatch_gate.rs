@@ -8,6 +8,7 @@
 //! selector, and omit the handler-chip row while retaining the sequential
 //! continuation.
 
+use stwo::core::channel::Blake2sChannel;
 use stwo::core::fields::m31::BaseField;
 use vos_pvm::instruction::Opcode;
 use vos_pvm::interpreter::Interpreter;
@@ -22,7 +23,6 @@ use vos_pvm_proof::core::tracing::{
 };
 use vos_pvm_proof::framework_access::AllLookupElements;
 use vos_pvm_proof::harness::{MachineComponent, MachineProverComponent};
-use vos_pvm_proof::recursion_pcs::ProverChannel;
 use vos_pvm_proof::trace::component::ComponentTrace;
 use vos_pvm_proof::{AirColumn, SideNote};
 
@@ -85,8 +85,8 @@ fn blake_side_note() -> SideNote {
 
 fn assert_cpu(chip: &CpuChip, trace: &ComponentTrace, side_note: &SideNote) -> Result<(), String> {
     let mut lookup_elements = AllLookupElements::default();
-    let channel = &mut ProverChannel::default();
-    chip.draw_lookup_elements(&mut lookup_elements, channel);
+    let channel = &mut Blake2sChannel::default();
+    chip.draw_lookup_elements(&mut lookup_elements, channel.into());
     let (interaction_trace, claimed_sum) =
         chip.generate_interaction_trace(trace.clone(), side_note, &lookup_elements);
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

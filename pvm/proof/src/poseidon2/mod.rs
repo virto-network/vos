@@ -6,9 +6,12 @@
 //! and replays an M31-algebraic Fiat-Shamir transcript so no Blake2s appears on
 //! the commit/transcript path. This module holds those primitives — the
 //! permutation, the [`MerkleHasherLifted`] commitment hash, and the [`Channel`]
-//! transcript — so `prove`/`verify`/`program_id` (and the standalone verifier
-//! crate) can select them via the [`crate::recursion_pcs`] aliases under
-//! `--features poseidon2-channel`.
+//! transcript — which the formats on the Poseidon2-M31 channel
+//! ([`crate::format`]) select at run time.
+//!
+//! **The channel's encodings are lossless:** a u64 it mixes, and a PoW nonce,
+//! enter as four 16-bit limbs and a u32 as two, so no value ≥ p folds onto a
+//! smaller one.
 //!
 //! **The permutation** is the reference Poseidon2 arrangement (eprint 2023/323)
 //! with Plonky3's width-16 M31 parameters, as Plonky3 defines them at revision
@@ -606,6 +609,11 @@ impl Poseidon2M31Channel {
         self.absorb(&root.0);
     }
 
+    /// Absorb M31 values as one run.
+    pub fn mix_m31s(&mut self, values: &[BaseField]) {
+        self.absorb(values);
+    }
+
     /// The rate words of `verify_pow_nonce`'s first permutation, which a
     /// nonce does not enter.
     #[cfg(feature = "prover")]
@@ -628,14 +636,13 @@ impl Channel for Poseidon2M31Channel {
         self.rec_permute(PermKind::Pow, true, &mut s);
         let mut s2 = [BaseField::zero(); N_STATE];
         s2[..8].copy_from_slice(&s[..8]);
-        s2[8] = BaseField::reduce(nonce & 0xFFFF_FFFF);
-        s2[9] = BaseField::reduce(nonce >> 32);
+        s2[8..12].copy_from_slice(&u64_limbs(nonce));
         self.rec_permute(PermKind::Pow, true, &mut s2);
         s2[0].0.trailing_zeros() >= n_bits
     }
 
     fn mix_u32s(&mut self, data: &[u32]) {
-        let m: Vec<BaseField> = data.iter().map(|&x| BaseField::reduce(x as u64)).collect();
+        let m: Vec<BaseField> = data.iter().flat_map(|&x| u32_limbs(x)).collect();
         self.absorb(&m);
     }
 
@@ -645,10 +652,7 @@ impl Channel for Poseidon2M31Channel {
     }
 
     fn mix_u64(&mut self, value: u64) {
-        self.absorb(&[
-            BaseField::reduce(value & 0xFFFF_FFFF),
-            BaseField::reduce(value >> 32),
-        ]);
+        self.absorb(&u64_limbs(value));
     }
 
     fn draw_secure_felt(&mut self) -> SecureField {
@@ -671,6 +675,17 @@ impl Channel for Poseidon2M31Channel {
     fn draw_u32s(&mut self) -> Vec<u32> {
         self.squeeze8().iter().map(|m| m.0).collect()
     }
+}
+
+/// A u64's four 16-bit limbs, little-endian: every value its own M31s, so no
+/// two values absorb alike.
+pub fn u64_limbs(value: u64) -> [BaseField; 4] {
+    core::array::from_fn(|i| BaseField::from_u32_unchecked(((value >> (16 * i)) & 0xffff) as u32))
+}
+
+/// A u32's two 16-bit limbs, little-endian.
+pub fn u32_limbs(value: u32) -> [BaseField; 2] {
+    core::array::from_fn(|i| BaseField::from_u32_unchecked((value >> (16 * i)) & 0xffff))
 }
 
 /// The Merkle channel pairing the Poseidon2-M31 hasher with the Poseidon2-M31

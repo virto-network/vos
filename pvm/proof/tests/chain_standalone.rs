@@ -1,8 +1,4 @@
-// Not under `poseidon2-channel`: this test tampers commitments by byte-XOR
-// (`Blake2sHash` is `[u8; 32]`); under the Poseidon2-M31 PCS a commitment is
-// `P2Hash` (`[M31; 8]`), so the byte-level tamper does not typecheck. The P2
-// chain/tamper coverage lives in `verifier/tests/poseidon2_canonical_segment.rs`.
-#![cfg(all(feature = "prover", not(feature = "poseidon2-channel")))]
+#![cfg(feature = "prover")]
 
 //! End-to-end test for the side-note-free `verify_chain_standalone`
 //! (the trustless counterpart to `vos_pvm_proof::verify_chain`).
@@ -118,8 +114,9 @@ fn chain_standalone_accepts_honest_chain_and_rejects_forgeries() {
 
     // A WRONG program commitment is rejected (program identity is pinned across
     // every segment — a from-scratch prover can't splice in a foreign program).
-    let mut wrong = commit1;
-    wrong.0[0] ^= 0xFF;
+    let mut wrong_bytes = commit1.to_bytes();
+    wrong_bytes[0] ^= 0xFF;
+    let wrong = vos_pvm_proof::Commitment::from_bytes(commit1.channel(), &wrong_bytes).unwrap();
     verify_chain_standalone(&[proof1.clone(), proof2.clone()], wrong, expected_root)
         .expect_err("a wrong program commitment must be rejected");
 

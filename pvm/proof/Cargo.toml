@@ -40,11 +40,6 @@ prover = [
 # "ConstraintsNotSatisfied" vs. "claimed logup sum is not zero" failure
 # modes when adding constraints.
 debug-internals = ["prover"]
-# Swap the segment PCS commit + Fiat-Shamir transcript from production Blake2s
-# to the M31-algebraic Poseidon2-M31 stack (`src/poseidon2`), still proving on
-# SimdBackend. Selects the `recursion_pcs` aliases; bumps the proof wire
-# format. Off by default — the production mobile prover stays on Blake2s.
-poseidon2-channel = []
 
 [dependencies]
 vos-pvm-proof-derive = { workspace = true }

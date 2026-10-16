@@ -1,3 +1,4 @@
+use vos_pvm_proof::Proof;
 use vos_pvm_proof::{
     MAX_REFINE_CHILD_COMPONENTS, MAX_REFINE_HOST_BOUNDARIES, PcsConfig,
     REFINE_BUNDLE_FORMAT_VERSION, RefineHostBoundary, RefineMachineId, RefineProgramId,
@@ -10,6 +11,27 @@ use vos_pvm_proof_verifier::{
     CommitmentHash, RefineBundleVerification, RefineProgramCommitmentResolver,
     verify_refine_bundle_authenticated,
 };
+
+/// The Blake2s Stark proof of a format-24 proof.
+fn stark(
+    proof: &mut Proof,
+) -> &mut stwo::core::proof::StarkProof<stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleHasher>
+{
+    match &mut proof.stark_proof {
+        vos_pvm_proof::StarkProofAny::Blake2s(stark) => stark,
+        other => panic!("a Blake2s proof, not {:?}", other.channel()),
+    }
+}
+
+/// [`stark`], read only.
+fn stark_ref(
+    proof: &Proof,
+) -> &stwo::core::proof::StarkProof<stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleHasher> {
+    match &proof.stark_proof {
+        vos_pvm_proof::StarkProofAny::Blake2s(stark) => stark,
+        other => panic!("a Blake2s proof, not {:?}", other.channel()),
+    }
+}
 
 struct TrustedPrograms(
     Vec<(
@@ -35,7 +57,7 @@ impl TrustedPrograms {
                         slice.proof.component_mask,
                         slice.proof.log_sizes.clone(),
                         slice.proof.pcs_config,
-                        slice.proof.stark_proof.commitments[0],
+                        slice.proof.preprocessed_commitment().unwrap(),
                     )
                 })
                 .collect(),
@@ -241,8 +263,12 @@ fn nested_bundle_verifies_only_with_replay_and_rejects_hostile_edits() {
         alternate_bundle.slices[0].proof.log_sizes
     );
     assert_ne!(
-        bundle.slices[0].proof.stark_proof.commitments[1],
-        alternate_bundle.slices[0].proof.stark_proof.commitments[1],
+        bundle.slices[0].proof.stark_proof.commitment(1).unwrap(),
+        alternate_bundle.slices[0]
+            .proof
+            .stark_proof
+            .commitment(1)
+            .unwrap(),
         "different gas witnesses must produce different main-trace commitments"
     );
     let mut substituted_execution = bundle.clone();
@@ -260,7 +286,7 @@ fn nested_bundle_verifies_only_with_replay_and_rejects_hostile_edits() {
     // and explicit lifting profiles cannot alias the same catalog entry.
     let mut wrong_mobile = bundle.clone();
     wrong_mobile.slices[0].proof.pcs_config = production_pcs_config_mobile();
-    wrong_mobile.slices[0].proof.stark_proof.0.config = production_pcs_config_mobile();
+    stark(&mut wrong_mobile.slices[0].proof).0.config = production_pcs_config_mobile();
     reseal(&mut wrong_mobile);
     assert!(
         verify_refine_bundle_authenticated(
@@ -274,9 +300,7 @@ fn nested_bundle_verifies_only_with_replay_and_rejects_hostile_edits() {
     );
     let mut wrong_lifting = bundle.clone();
     wrong_lifting.slices[0].proof.pcs_config.lifting_log_size = Some(30);
-    wrong_lifting.slices[0]
-        .proof
-        .stark_proof
+    stark(&mut wrong_lifting.slices[0].proof)
         .0
         .config
         .lifting_log_size = Some(30);
@@ -311,10 +335,8 @@ fn nested_bundle_verifies_only_with_replay_and_rejects_hostile_edits() {
     );
 
     let mut oversized_nested = bundle.clone();
-    let sample = oversized_nested.slices[0].proof.stark_proof.sampled_values[0][0][0];
-    oversized_nested.slices[0]
-        .proof
-        .stark_proof
+    let sample = stark_ref(&oversized_nested.slices[0].proof).sampled_values[0][0][0];
+    stark(&mut oversized_nested.slices[0].proof)
         .0
         .sampled_values[0][0]
         .resize(
@@ -343,9 +365,7 @@ fn nested_bundle_verifies_only_with_replay_and_rejects_hostile_edits() {
         .proof
         .pcs_config
         .lifting_log_size = Some(8);
-    undersized_replay_lifting.slices[0]
-        .proof
-        .stark_proof
+    stark(&mut undersized_replay_lifting.slices[0].proof)
         .0
         .config
         .lifting_log_size = Some(8);
@@ -563,9 +583,7 @@ fn nested_bundle_verifies_only_with_replay_and_rejects_hostile_edits() {
     }
 
     let mut no_commitment = bundle.clone();
-    no_commitment.slices[0]
-        .proof
-        .stark_proof
+    stark(&mut no_commitment.slices[0].proof)
         .0
         .commitments
         .clear();

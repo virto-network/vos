@@ -157,7 +157,7 @@ fn tamper(dir: &std::path::Path) {
 /// commitment travels separately, it is chain state):
 ///   settlement_zk_proof_valid.bin      the proof
 ///   settlement_zk_proof_tampered.bin   bit-flipped: still postcard-decodes, verify rejects
-///   settlement_zk_commitment.bin       32 raw bytes: proof.stark_proof.commitments[0]
+///   settlement_zk_commitment.bin       32 raw bytes: the proof's preprocessed commitment
 fn binding_fixture(dir: &std::path::Path, io_hash_hex: &str) {
     let hex = io_hash_hex.strip_prefix("0x").unwrap_or(io_hash_hex);
     assert_eq!(hex.len(), 64, "io-hash must be 32 bytes of hex");
@@ -330,7 +330,7 @@ fn binding_fixture(dir: &std::path::Path, io_hash_hex: &str) {
         probe += 1;
     };
 
-    let commitment_bytes: [u8; 32] = commitment.into();
+    let commitment_bytes: [u8; 32] = commitment.to_bytes();
     std::fs::write(dir.join("settlement_zk_proof_valid.bin"), &proof_bytes).expect("write proof");
     std::fs::write(dir.join("settlement_zk_proof_tampered.bin"), &tampered).expect("write tamper");
     std::fs::write(dir.join("settlement_zk_commitment.bin"), commitment_bytes)

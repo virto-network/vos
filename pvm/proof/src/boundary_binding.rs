@@ -77,6 +77,37 @@ use crate::lookups::{
 };
 use crate::proof::SegmentState;
 
+/// The bytes of the boundary states the lossless formats absorb, one M31 a
+/// byte (`proving.md` A.3): the 13 registers in, the 13 out, pc and ts in, pc
+/// and ts out, the memory roots in and out. A register or ts is its 8
+/// little-endian bytes and pc its 4, the byte limbs the boundary chips'
+/// tuples carry, so the transcript binds exactly the tuples the public logup
+/// terms below recompute.
+pub const BOUNDARY_STATE_BYTES: usize = 13 * 8 * 2 + (4 + 8) * 2 + 32 * 2;
+
+/// The boundary states as [`BOUNDARY_STATE_BYTES`] bytes, in that order.
+pub fn boundary_state_bytes(
+    initial: &SegmentState,
+    final_state: &SegmentState,
+) -> [u8; BOUNDARY_STATE_BYTES] {
+    let mut bytes = [0u8; BOUNDARY_STATE_BYTES];
+    let mut at = 0;
+    let mut put = |part: &[u8]| {
+        bytes[at..at + part.len()].copy_from_slice(part);
+        at += part.len();
+    };
+    for register in initial.registers.iter().chain(&final_state.registers) {
+        put(&register.to_le_bytes());
+    }
+    for state in [initial, final_state] {
+        put(&state.pc.to_le_bytes());
+        put(&state.timestamp.to_le_bytes());
+    }
+    put(&initial.memory_root);
+    put(&final_state.memory_root);
+    bytes
+}
+
 /// Positions of the three boundary-binding chips within a proof's
 /// ACTIVE component order (the order `claimed_sums` is indexed by).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -6,7 +6,8 @@ use super::{
     ProofProtocolShape, derive_protocol_degree_shape, expected_fiat_shamir_query_count,
     replay_query_positions,
 };
-use crate::recursion_pcs::{ProverBackend, ProverChannel, ProverMerkleChannel};
+use crate::pcs::PcsStack;
+use crate::poseidon2::P2MerkleChannel;
 use crate::trace::eval::INTERACTION_TRACE_IDX;
 use num_traits::{One, Zero};
 use stwo::core::air::Component;
@@ -16,7 +17,9 @@ use stwo::core::fri::FriConfig;
 use stwo::core::pcs::utils::prepare_preprocessed_query_positions;
 use stwo::core::pcs::{CommitmentSchemeVerifier, PcsConfig, TreeVec};
 use stwo::core::poly::circle::CanonicCoset;
+use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
 use stwo::core::verifier::verify;
+use stwo::prover::backend::{BackendForChannel, simd::SimdBackend};
 use stwo::prover::poly::{
     BitReversedOrder,
     circle::{CircleEvaluation, PolyOps},
@@ -111,7 +114,7 @@ impl FrameworkEval for SquareEval {
 fn evaluations(
     log_size: u32,
     columns: Vec<Vec<BaseField>>,
-) -> Vec<CircleEvaluation<ProverBackend, BaseField, BitReversedOrder>> {
+) -> Vec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>> {
     let domain = CanonicCoset::new(log_size).circle_domain();
     columns
         .into_iter()
@@ -128,12 +131,20 @@ fn evaluations(
 /// preprocessed values against the positions they were read at.
 #[test]
 fn the_replay_draws_the_verifiers_query_positions() {
+    replay_draws_the_verifiers_query_positions::<Blake2sMerkleChannel>();
+    replay_draws_the_verifiers_query_positions::<P2MerkleChannel>();
+}
+
+fn replay_draws_the_verifiers_query_positions<MC: PcsStack>()
+where
+    SimdBackend: BackendForChannel<MC>,
+{
     let config = PcsConfig {
         pow_bits: 4,
         fri_config: FriConfig::new(0, 1, 40, 1),
         lifting_log_size: None,
     };
-    let twiddles = ProverBackend::precompute_twiddles(
+    let twiddles = SimdBackend::precompute_twiddles(
         CanonicCoset::new(LOG_N_ROWS + 1 + config.fri_config.log_blowup_factor)
             .circle_domain()
             .half_coset,
@@ -153,9 +164,8 @@ fn the_replay_draws_the_verifiers_query_positions() {
     let main = (0..MAIN_COLUMNS).map(column).collect();
     let interaction = alloc::vec![column(MAIN_COLUMNS - 1)];
 
-    let prover_channel = &mut ProverChannel::default();
-    let mut prover =
-        CommitmentSchemeProver::<ProverBackend, ProverMerkleChannel>::new(config, &twiddles);
+    let prover_channel = &mut MC::C::default();
+    let mut prover = CommitmentSchemeProver::<SimdBackend, MC>::new(config, &twiddles);
     for tree in [preprocessed, main, interaction] {
         let mut builder = prover.tree_builder();
         builder.extend_evals(evaluations(LOG_N_ROWS, tree));
@@ -166,12 +176,12 @@ fn the_replay_draws_the_verifiers_query_positions() {
         SumEval,
         SecureField::zero(),
     );
-    let proof = prove::<ProverBackend, ProverMerkleChannel>(&[&component], prover_channel, prover)
+    let proof = prove::<SimdBackend, MC>(&[&component], prover_channel, prover)
         .expect("the toy AIR proves");
 
     let log_sizes = component.trace_log_degree_bounds();
-    let channel = &mut ProverChannel::default();
-    let mut verifier = CommitmentSchemeVerifier::<ProverMerkleChannel>::new(config);
+    let channel = &mut MC::C::default();
+    let mut verifier = CommitmentSchemeVerifier::<MC>::new(config);
     for (commitment, tree_log_sizes) in proof.commitments.iter().zip(log_sizes.iter()) {
         verifier.commit(*commitment, tree_log_sizes, channel);
     }
@@ -181,7 +191,8 @@ fn the_replay_draws_the_verifiers_query_positions() {
     let (lifting_log_size, max_log_degree_bound) =
         derive_protocol_degree_shape(&config, LOG_N_ROWS + 1).unwrap();
     let replayed = &mut after_interaction.clone();
-    let positions = replay_query_positions(replayed, &proof, &config, lifting_log_size).unwrap();
+    let positions =
+        replay_query_positions::<MC>(replayed, &proof, &config, lifting_log_size).unwrap();
     assert_eq!(
         replayed.draw_u32s(),
         channel.draw_u32s(),
@@ -207,7 +218,13 @@ fn the_replay_draws_the_verifiers_query_positions() {
         query_count,
     };
     assert_eq!(
-        expected_fiat_shamir_query_count(&after_interaction, &proof, &config, shape, &log_sizes),
+        expected_fiat_shamir_query_count::<MC>(
+            &after_interaction,
+            &proof,
+            &config,
+            shape,
+            &log_sizes
+        ),
         Ok(query_count)
     );
 }
@@ -218,12 +235,20 @@ fn the_replay_draws_the_verifiers_query_positions() {
 /// counts its queries.
 #[test]
 fn a_preprocessed_tree_below_the_lifting_height_verifies() {
+    preprocessed_tree_below_the_lifting_height_verifies::<Blake2sMerkleChannel>();
+    preprocessed_tree_below_the_lifting_height_verifies::<P2MerkleChannel>();
+}
+
+fn preprocessed_tree_below_the_lifting_height_verifies<MC: PcsStack>()
+where
+    SimdBackend: BackendForChannel<MC>,
+{
     let config = PcsConfig {
         pow_bits: 4,
         fri_config: FriConfig::new(0, 1, 40, 1),
         lifting_log_size: None,
     };
-    let twiddles = ProverBackend::precompute_twiddles(
+    let twiddles = SimdBackend::precompute_twiddles(
         CanonicCoset::new(SQUARE_LOG_N_ROWS + 1 + config.fri_config.log_blowup_factor)
             .circle_domain()
             .half_coset,
@@ -234,9 +259,8 @@ fn a_preprocessed_tree_below_the_lifting_height_verifies() {
         .collect();
     let square: Vec<BaseField> = x.iter().map(|x| *x * *x).collect();
 
-    let prover_channel = &mut ProverChannel::default();
-    let mut prover =
-        CommitmentSchemeProver::<ProverBackend, ProverMerkleChannel>::new(config, &twiddles);
+    let prover_channel = &mut MC::C::default();
+    let mut prover = CommitmentSchemeProver::<SimdBackend, MC>::new(config, &twiddles);
     let mut builder = prover.tree_builder();
     builder.extend_evals(evaluations(LOG_N_ROWS, alloc::vec![index.clone()]));
     builder.commit(prover_channel);
@@ -254,7 +278,7 @@ fn a_preprocessed_tree_below_the_lifting_height_verifies() {
     let index_component = FrameworkComponent::new(allocator, IndexEval, SecureField::zero());
     let square_component = FrameworkComponent::new(allocator, SquareEval, SecureField::zero());
     let components: [&dyn Component; 2] = [&index_component, &square_component];
-    let proof = prove::<ProverBackend, ProverMerkleChannel>(
+    let proof = prove::<SimdBackend, MC>(
         &[&index_component, &square_component],
         prover_channel,
         prover,
@@ -266,8 +290,8 @@ fn a_preprocessed_tree_below_the_lifting_height_verifies() {
             .iter()
             .map(|component| component.trace_log_degree_bounds()),
     );
-    let channel = &mut ProverChannel::default();
-    let mut verifier = CommitmentSchemeVerifier::<ProverMerkleChannel>::new(config);
+    let channel = &mut MC::C::default();
+    let mut verifier = CommitmentSchemeVerifier::<MC>::new(config);
     for (commitment, tree_log_sizes) in proof.commitments.iter().zip(log_sizes.iter()) {
         verifier.commit(*commitment, tree_log_sizes, channel);
     }
@@ -282,7 +306,7 @@ fn a_preprocessed_tree_below_the_lifting_height_verifies() {
         lifting_log_size,
         "the preprocessed tree sits two levels below the lifting height"
     );
-    let positions = replay_query_positions(
+    let positions = replay_query_positions::<MC>(
         &mut after_interaction.clone(),
         &proof,
         &config,
@@ -310,7 +334,13 @@ fn a_preprocessed_tree_below_the_lifting_height_verifies() {
         query_count,
     };
     assert_eq!(
-        expected_fiat_shamir_query_count(&after_interaction, &proof, &config, shape, &log_sizes),
+        expected_fiat_shamir_query_count::<MC>(
+            &after_interaction,
+            &proof,
+            &config,
+            shape,
+            &log_sizes
+        ),
         Ok(query_count)
     );
 }

@@ -824,14 +824,14 @@ pub fn prove_refine(trace: RefineTraceBundle) -> Result<RefineProofBundle, Refin
         if proof.log_sizes.len() > MAX_REFINE_CHILD_COMPONENTS
             || proof.claimed_sums.len() > MAX_REFINE_CHILD_COMPONENTS
             || proof.num_components > MAX_REFINE_CHILD_COMPONENTS
-            || proof.stark_proof.commitments.len() != REFINE_CHILD_COMMITMENT_COUNT
+            || proof.stark_proof.commitments().len() != REFINE_CHILD_COMMITMENT_COUNT
         {
             return Err(RefineTraceError::Observation(format!(
                 "Refine child proof cardinality is noncanonical: logs={}, sums={}, components={}, commitments={}",
                 proof.log_sizes.len(),
                 proof.claimed_sums.len(),
                 proof.num_components,
-                proof.stark_proof.commitments.len(),
+                proof.stark_proof.commitments().len(),
             )));
         }
         let proof_bytes = crate::proof::proof_owned_bytes(&proof).ok_or_else(|| {
@@ -937,9 +937,15 @@ pub fn verify_refine_bundle_replayed(
         let mut child = proven.proof.clone();
         crate::proof::preflight_proof_structure(&mut child, crate::DEFAULT_MAX_LOG_SIZE)
             .map_err(|_| RefineTraceError::ReplayMismatch("child proof structure"))?;
-        let binding = crate::prove::replay_trace_binding(&mut observed.side_note, child.pcs_config)
+        let format = crate::proof::proof_format(&child)
+            .map_err(|_| RefineTraceError::ReplayMismatch("child proof format"))?;
+        let target = crate::prove::Target {
+            format,
+            config: child.pcs_config,
+        };
+        let binding = crate::prove::replay_trace_binding(&mut observed.side_note, target)
             .map_err(RefineTraceError::Prove)?;
-        let commitments = &child.stark_proof.commitments;
+        let commitments = child.stark_proof.commitments();
         if child.component_mask != binding.component_mask
             || child.num_components != binding.log_sizes.len()
             || child.log_sizes != binding.log_sizes

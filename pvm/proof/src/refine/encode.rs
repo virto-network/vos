@@ -70,13 +70,3 @@ pub(super) fn put_segment_state(bytes: &mut Vec<u8>, state: &crate::SegmentState
     bytes.extend_from_slice(&state.memory_commitment);
     bytes.extend_from_slice(&state.memory_root);
 }
-
-#[cfg(not(feature = "poseidon2-channel"))]
-pub(super) fn commitment_bytes(commitment: &crate::recursion_pcs::ProverMerkleHash) -> [u8; 32] {
-    commitment.0
-}
-
-#[cfg(feature = "poseidon2-channel")]
-pub(super) fn commitment_bytes(commitment: &crate::recursion_pcs::ProverMerkleHash) -> [u8; 32] {
-    commitment.to_bytes()
-}

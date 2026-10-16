@@ -305,9 +305,12 @@ fn grind_chunk(prefix: &[BaseField; 8], pow_bits: u32, start: u64) -> Option<u64
                 *word = [value.0; LANES];
             }
             for lane in 0..LANES {
-                let nonce = first + lane as u64;
-                state[8][lane] = BaseField::reduce(nonce & 0xFFFF_FFFF).0;
-                state[9][lane] = BaseField::reduce(nonce >> 32).0;
+                for (word, limb) in state[8..12]
+                    .iter_mut()
+                    .zip(super::u64_limbs(first + lane as u64))
+                {
+                    word[lane] = limb.0;
+                }
             }
             permute_x16(&mut state);
             (0..LANES)

@@ -10,7 +10,7 @@
 //!      `let proof = prove(&mut side_note)?`
 //!   2. Extract the program hash:
 //!      `let hash = program_commitment_of_proof(&proof)`
-//!      (also accessible as `proof.stark_proof.commitments[0]`)
+//!      (also accessible as `proof.preprocessed_commitment()`)
 //!   3. Publish (hash, proof.log_sizes) as the program identity record.
 //!   4. For every later proof of the same program, verify with:
 //!      `verify_standalone(later_proof, hash)`
@@ -36,13 +36,17 @@
 use crate::Proof;
 
 /// Program-identity hash type — the preprocessed-trace Merkle root, in the
-/// per-build PCS hash (Blake2s by default; `P2Hash` under `poseidon2-channel`).
-pub type ProgramCommitment = crate::recursion_pcs::ProverMerkleHash;
+/// hash of the proof's format.
+pub type ProgramCommitment = crate::pcs::Commitment;
 
 /// Extract the program-commitment Merkle root from a proof.
 ///
-/// Equivalent to `proof.stark_proof.commitments[0]`, but expressed as a
-/// named API so callers don't reach into the StarkProof internals.
+/// Equivalent to `proof.preprocessed_commitment()` on a proof the prover
+/// made.
+///
+/// # Panics
+///
+/// On a proof without a preprocessed tree, which the prover never makes.
 ///
 /// Use this once at program-deploy time:
 ///   ```no_run
@@ -54,7 +58,9 @@ pub type ProgramCommitment = crate::recursion_pcs::ProverMerkleHash;
 ///   # }
 ///   ```
 pub fn program_commitment_of_proof(proof: &Proof) -> ProgramCommitment {
-    proof.stark_proof.commitments[0]
+    proof
+        .preprocessed_commitment()
+        .expect("a proof the prover made has a preprocessed tree")
 }
 
 /// Convenience: hex-encoded program commitment.
