@@ -217,6 +217,12 @@ impl Process {
         *self.held.lock().unwrap() = vec![HeldPort::tcp(ingress), HeldPort::udp(peer)];
     }
 
+    /// Its store, opened while it is killed.
+    pub fn store(&self) -> vos_node::store::Fjall {
+        vos_node::store::Fjall::open(self.data.join(vos_node::STORE))
+            .unwrap_or_else(|error| panic!("node {}'s store: {error}", self.number))
+    }
+
     /// Start it again: how long until it listens.
     pub fn restart(&self) -> Duration {
         self.held.lock().unwrap().clear();
@@ -277,7 +283,7 @@ impl Process {
 }
 
 /// The `vos` that runs the nodes: `VOS_BIN`, or this build's.
-fn vos() -> PathBuf {
+pub fn vos() -> PathBuf {
     std::env::var("VOS_BIN")
         .unwrap_or_else(|_| env!("CARGO_BIN_EXE_vos").into())
         .into()
@@ -286,10 +292,21 @@ fn vos() -> PathBuf {
 /// Run `vos node run` with `args`, pinned to `cpus` if any, its log
 /// appended to `log`: the process, once it printed its address, and its
 /// key.
-fn launch(args: &[&str], cpus: Option<&str>, log: &Path) -> (Running, String) {
+pub fn launch(args: &[&str], cpus: Option<&str>, log: &Path) -> (Running, String) {
     let started = processes::run(&vos(), args, log, None, cpus)
         .unwrap_or_else(|| panic!("{}", read_log(log)));
     (started.running, started.key)
+}
+
+/// A new directory for a run's stores: under `target/` by default (on the
+/// reference laptop `/tmp` is tmpfs); `DATA` puts it elsewhere, `/tmp` to
+/// take the disk out of a run.
+pub fn data_dir() -> tempfile::TempDir {
+    let base = std::env::var("DATA").unwrap_or_else(|_| env!("CARGO_TARGET_TMPDIR").into());
+    tempfile::Builder::new()
+        .prefix("processes-")
+        .tempdir_in(base)
+        .unwrap()
 }
 
 /// The nodes, each pinned to its share of the machine.
@@ -302,14 +319,7 @@ pub struct Space {
 
 impl Space {
     pub fn start(pinned: bool, cpus: &[String]) -> Self {
-        // Under `target/` by default (on the reference laptop `/tmp` is
-        // tmpfs); `DATA` puts the stores elsewhere, `/tmp` to take the
-        // disk out of a run.
-        let base = std::env::var("DATA").unwrap_or_else(|_| env!("CARGO_TARGET_TMPDIR").into());
-        let dir = tempfile::Builder::new()
-            .prefix("processes-")
-            .tempdir_in(base)
-            .unwrap();
+        let dir = data_dir();
         let keys: Vec<String> = (1..=NODES)
             .map(|number| {
                 first_run(

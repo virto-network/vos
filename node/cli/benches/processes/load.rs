@@ -28,6 +28,7 @@ pub struct Signed {
     pub identity: [u8; 32],
     increment: MethodId,
     pub value: MethodId,
+    pub fill: MethodId,
 }
 
 pub fn signed(space: &Space, agent: AgentId) -> Signed {
@@ -54,6 +55,7 @@ pub fn signed(space: &Space, agent: AgentId) -> Signed {
         identity: vos_node::identity(&info.record),
         increment: schema.method_id("increment").unwrap(),
         value: schema.method_id("value").unwrap(),
+        fill: schema.method_id("fill").unwrap(),
     }
 }
 

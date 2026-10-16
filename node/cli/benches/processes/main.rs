@@ -14,6 +14,10 @@
 //! - **failover** and **failover-idle:** see `failover`, on the 64 agents
 //!   or on the idle row's, with or without their rows.
 //! - **soak:** see `soak`, on the 64 agents after any failover.
+//! - **resume:** a workflow's resume, see `resume`: its leader in this
+//!   process, on node 1's cores, and two node processes.
+//! - **catch-up:** a follower's catch-up, see `catch_up`, on an agent of
+//!   its own, last.
 //!
 //! Every open-loop latency is timed from when its call was scheduled to
 //! go, so a slow call never hides the queue behind it; each such run gives
@@ -23,7 +27,8 @@
 //! `cargo bench -p vos-cli --bench processes` (after `just build-agent
 //! build-test-actors`). Its settings:
 //! - `ROWS` picks rows (`agent,agents,quiet,query,linearizable,idle,
-//!   failover,failover-idle,soak`; all but the last three by default);
+//!   failover,failover-idle,soak,resume,catch-up`; all but the last five
+//!   by default);
 //! - `CPUS` overrides the pinning, as `taskset -c` lists for each node and
 //!   the driver, separated by `/`;
 //! - `DATA` where the stores go;
@@ -35,9 +40,11 @@
 //! `machine.sh`, beside this bench's directory, runs the rows on a machine
 //! of its own, each node on cores of its own.
 
+mod catch_up;
 mod load;
 mod nodes;
 mod report;
+mod resume;
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -97,6 +104,12 @@ fn main() {
         );
     } else {
         println!("taskset is missing: the nodes and the driver share every core");
+    }
+    if wanted("resume") {
+        resume::measure(&cpus, pinned);
+    }
+    if rows.iter().all(|row| row == "resume") {
+        return;
     }
     let counter = package("counter");
     let space = Space::start(pinned, &cpus);
@@ -226,6 +239,10 @@ fn main() {
         if wanted("failover-idle") {
             failover(&space, &idle);
         }
+    }
+
+    if wanted("catch-up") {
+        catch_up::catch_up(&space, &signed(&space, space.counter_agent(&counter)));
     }
 }
 
