@@ -901,7 +901,14 @@ fn replay_query_positions(
 
     // `verify_values`: every sampled value in one mix, flattened across trees
     // and columns, then the DEEP coefficient.
-    channel.mix_felts(&stark_proof.sampled_values.clone().flatten_cols());
+    let sampled_values: Vec<SecureField> = stark_proof
+        .sampled_values
+        .iter()
+        .flatten()
+        .flatten()
+        .copied()
+        .collect();
+    channel.mix_felts(&sampled_values);
     let _ = channel.draw_secure_felt();
 
     // `FriVerifier::commit`: each layer's root and folding coefficient, then
