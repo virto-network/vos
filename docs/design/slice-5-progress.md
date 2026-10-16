@@ -165,6 +165,138 @@ not on `vos-core`), 5 segments, `RAYON_NUM_THREADS=8`, under
 - Clippy with `-D warnings` for AVX-512F, the scalar fallback and
   aarch64 as well as the host.
 
+## Step 5.5: the witness-input precompile, the run's ends and the io-hash
+
+### The witness input, `0x401`
+
+- **Served alike everywhere:** `vos_pvm::precompile::WitnessInput` serves a
+  call: φ7 the destination, φ8 the capacity, `min(capacity, remaining)`
+  bytes written there and their count in φ7, 0 at the end. The testkit's
+  model and the tracer serve through it; the agent serves through its own
+  `Machine::witness_input`, on VOS and JAM alike (the agent serves its
+  kernels on both). A call that cannot pay stops the kernel out of gas, one
+  whose bytes cannot land traps it, and a handler's call of `0x401` is an
+  id the agent does not serve (`WHAT`).
+- **Its price** (decided here): 2,500 a call, an actor's `input`, plus 24 a
+  byte, an actor's per-byte price, charged before the bytes are written;
+  the agent takes `PRECOMPILE_SERVING` (27,000) from the batch's meter a
+  call, as for every precompile. A kernel's 64 KiB of arguments cost
+  1,575,364 gas [model].
+- **The record:** `Attest { program, witness_input, output }`: the bytes the
+  kernel read, in call order, at most 4 MiB. **Deviation from the plan:**
+  it replaces `arguments` rather than joining it. The kernel now reads its
+  arguments through the input, so the two would hold the same bytes, and a
+  step's sixteen attests at both caps would pass the work result's 4 MiB
+  (`cap::step_result` sizes an attest at its arguments and output: about
+  3.42 MiB of 4 MiB today, 4.42 MiB with both) [model].
+- **`derive`'s prologue** (`TRANSPILER_VERSION` 3, 29 instructions): it
+  reads the input into 17 zero pages past the kernel's read-write data
+  (room for a request's 64 KiB and a byte), calls until a call returns 0,
+  traps if it filled them, calls the entry on the bytes, and returns to
+  the halt address with the output in φ7/φ8 and the io-hash in φ9..φ12.
+  The loader maps no arguments and leaves φ8 at 0. `derive` admits
+  `0x401` (`is_kernel_call`).
+- **The image root:** each `Derivation` kernel (`records::Kernel`) names
+  `image_root`, the page tree's root over its initial memory with no
+  arguments (`vos_pvm_program::image`), computed in `Derivation::new` at
+  install, the VOS node's and the JAM builder's alike.
+
+### The io-hash
+
+`compute_io_hash(public_args, output, roots)` (`vos_pvm_precompiles::io`):
+BLAKE2b-256 of `vos/io/v1`, then the three fields SCALE-encoded (a compact
+length and the bytes; a compact count and each `RootRead` as kind, space,
+LE window and root, 73 bytes). On the PVM it hashes through `0x400`. The
+SDK's attestable entry computes it on its encoded output, with no public
+arguments and no roots, and the prologue leaves it in φ9..φ12.
+
+### The AIR binding (format 26, Poseidon2 27)
+
+- **CpuChip:** `IsWitnessEcall` selects dispatch 101, committed in
+  PROGRAM_MEMORY like `0x400`'s. Its row reads φ7 and φ8 at its timestamp
+  (the register reads Ristretto's ids share), writes the count to φ7 alone
+  (`ResultIsReg`, `ResultRegIdx` 7), a count below 2^24 at a destination
+  below 2^32; `WitnessNonEmpty` (with an inverse) is set exactly when the
+  count is not zero. Four new emissions: `(φ8, count, lt = 0)` twice to
+  CompareChip, so the count is at most φ8, and `(ts, destination, count)`
+  twice to the new relation `WitnessCall` when non-empty. Four columns.
+- **`WitnessInputChip`** (index 13; `chip_idx::COUNT` 32 → 33, so the
+  component mask is a `u64`): one row a byte, 22 columns, 8 lookups. A
+  call's first row consumes its tuple; while bytes are left a row is
+  followed by the call's next byte, at its timestamp, the next address (a
+  carry chain with every byte range-checked, no wrap past 2^32) and one
+  fewer left; the last has one left; a row that does not start a call
+  follows one that goes on. Each row writes its byte to the memory ledger.
+- **The register ledger sorts reads before writes** within a timestamp
+  (key `2·ts + is_write`). Without it a prover could order the witness
+  call's φ7 read after its write and read the count as the destination;
+  the same freedom let a step reading and writing one register (an ALU op
+  whose destination is a source) read its own result. A same-register gap
+  of 2^27 steps is now the limit, past the 100M-step budget.
+- **The halt:** a halting step's `next_pc` is `PVM_HALT_ADDR`, in the
+  tracer, the Refine prover's observation and CpuChip's two halt
+  selectors, so a segment's `pc_out` is the halt address exactly when it
+  ends at a halt.
+
+### Tests
+
+- live ≡ traced (`pvm/proof/tests/witness_input.rs`): each of the
+  `kernels` actor's three kernels, attested on the agent's model on 0, 4
+  and 200 values, re-runs from its attest (`kernel::trace_kernel`) to the
+  same output and to `compute_io_hash(&[], output, &[])`, reading its
+  recorded input whole; the agent's own tests hold its attests equal to
+  the model's on VOS and JAM;
+- the cursors at every call: one reader program, pinned on both sides
+  (`tracking.rs` for the agent, `witness_input.rs` for the tracer): three
+  bytes, none, four, a short read of three, a read at the end, cursors
+  0, 3, 3, 7, 10;
+- a short read returns its count and a read at the end 0: there, and
+  `vos_pvm`'s unit tests;
+- writes outside the named range refused: a write moved one byte past or
+  before its destination, a byte past or short of the count, and a count
+  past its capacity each fail verification (the last passes once the
+  compare emission is removed); the column-level gates
+  (`witness_input_gate.rs`) for every CpuChip and WitnessInputChip
+  constraint, and the ledger's read-after-write;
+- an oversize input refused: past 4 MiB by `WitnessInput`, the tracer and
+  the agent; past a request's bytes by the prologue, on every host;
+- the initial root equals the install's, the derivation's and the first
+  segment's proven `memory_root`;
+- a halting run's last segment ends at the halt address, and a segment
+  cut just before the halting step ends at that step's pc; the chain
+  verifies.
+
+### Numbers
+
+- **The `kernels` actor's kernels, re-traced** [measured]: `named` 891
+  steps whatever its input; `digest` 1,797, 2,537 and 20,394 steps on 0,
+  4 and 200 values; `areas` 925, 1,697 and 31,094. Each reads its input
+  in two calls, the second at the end; the prologue, the entry's decoding
+  and the io-hash's one compression are in every count.
+- **The witness input's AIR cost** [model]: a row of 22 columns a byte
+  in WitnessInputChip, and four columns on the CPU; a kernel's 64 KiB of
+  arguments is a 2^16-row chip.
+- **The gates** [measured, on this machine]: `just check` green, 1,006
+  tests; `just test-proof` under `systemd-run` at 16 GiB with `nice -n
+  10` and two threads green, 527 tests in its first suite, 1,002 s in all.
+
+### Findings, not fixed here
+
+- **CpuChip binds no register index to the instruction.** `ValBRegIdx`,
+  `ValDRegIdx`, `ResultRegIdx` and their `IsReg` flags are free witness
+  columns, constrained only to be boolean or to feed the register ledger:
+  a prover can read or write any register on any row (the witness row's
+  write is pinned here). They should be bound to `RegA`/`RegB`/`RegD` by
+  the instruction's category.
+- **MemoryChip does not order a byte's reads before its writes** within a
+  timestamp either; a precompile whose output buffer aliases an input is
+  exposed to the same reordering the register ledger had. The witness
+  input reads no memory.
+- **Only a halt reaches the halt address in a derived kernel:** derive
+  lays every static target and jump-table entry in its code. A crafted
+  program with a branch to `0xffff_0000` would end a segment there without
+  halting; refusing such a target in ProgramMemory would make it general.
+
 ## Step 5.7: the items carried from slice 4
 
 ### Per-target limits (the owner's decision)

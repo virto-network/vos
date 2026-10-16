@@ -307,9 +307,11 @@ pub struct Statement {
 ```
 
 - **The io-hash** is `BLAKE2b-256(public_args ‖ output ‖ roots)`, in the
-  canonical encoding. The kernel computes it through the `0x400`
-  precompile and writes it to φ9..12 at halt. Today's
-  `compute_io_hash(public, return)` gains the roots.
+  canonical encoding: the domain `vos/io/v1`, then each field's SCALE
+  encoding (a compact length and the bytes; a compact count and each
+  `RootRead` as its kind byte, its space, its window as eight LE bytes and
+  its root). The kernel computes it through the `0x400` precompile and
+  writes it to φ9..12 at halt (`vos_pvm_precompiles::compute_io_hash`).
 - **The venue recomputes the io-hash** from the statement's fields and
   compares it with the proof's public input. It never trusts a submitted
   hash.
