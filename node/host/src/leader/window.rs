@@ -97,15 +97,19 @@ impl Window {
             return;
         }
         self.acked = sequence;
-        // The receiver moves on: a deferred `Behind` would send again what
-        // it may hold, which its round sends if it does not.
-        self.deferred = false;
         while let Some((sent, size)) = self.sent.front().copied() {
             if sent > sequence {
                 break;
             }
             self.sent.pop_front();
             self.bytes -= size;
+        }
+        // A deferred `Behind` stays while anything sent is past the
+        // acknowledgement: the receiver may have dropped it, and tells a
+        // sender of drops at a full queue once. The acknowledgement may also
+        // be older than the `Behind`, taken in a batch after it arrived.
+        if self.sent.is_empty() {
+            self.deferred = false;
         }
         self.since = Instant::now();
         self.wait = self.round;
@@ -210,8 +214,8 @@ mod tests {
         assert_eq!(window.deferred(), None);
     }
 
-    /// A deferred `Behind` is dropped once the acknowledgement moves: the
-    /// receiver took more, and what it may hold would go again.
+    /// A deferred `Behind` is dropped once the acknowledgement covers all
+    /// that was sent: the receiver holds it.
     #[test]
     fn an_acknowledgement_cancels_a_deferred_behind() {
         let mut window = window(&[3, 4, 5]);
@@ -223,6 +227,25 @@ mod tests {
         window.ack(3);
         assert_eq!(window.deferred(), None);
         assert_eq!(window.next(), window.due(), "only its round");
+    }
+
+    /// An acknowledgement short of what was sent keeps a deferred `Behind`:
+    /// what was sent past it may be what the receiver dropped, and the
+    /// round may be far off.
+    #[test]
+    fn a_partial_acknowledgement_keeps_a_deferred_behind() {
+        let mut window = window(&[3, 4, 5]);
+        let now = Instant::now();
+        assert!(window.behind(now));
+        for sequence in [3, 4, 5] {
+            window.push(sequence, 10);
+        }
+        assert!(!window.behind(now + BEHIND_EVERY / 2));
+        window.ack(3);
+        assert_eq!(window.deferred(), Some(now + BEHIND_EVERY));
+        assert_eq!(window.next(), Some(now + BEHIND_EVERY), "before its round");
+        assert!(window.behind(now + BEHIND_EVERY));
+        assert_eq!(window.through(), 3, "back to the acknowledgement");
     }
 
     /// A `Behind` with nothing past the acknowledgement does nothing, now
