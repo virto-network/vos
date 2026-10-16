@@ -280,22 +280,74 @@ arguments and no roots, and the prologue leaves it in φ9..φ12.
   tests; `just test-proof` under `systemd-run` at 16 GiB with `nice -n
   10` and two threads green, 527 tests in its first suite, 1,002 s in all.
 
+### The operand binding (format 26, Poseidon2 27)
+
+Fable's review of 5.5 found CpuChip bound no register index or
+register-source flag to the instruction: a ThreeReg row could drop its
+ValB read, take any ValB, and write the sum to φ9, an arbitrary io-hash.
+The fix, and the holes of the same class it turned up:
+
+- **The flag bag is 80 bits in 10 bytes** (`PROG_MEMORY_N_FLAGS`; the
+  instruction tuple 32 → 36 limbs). Byte 6 is the instruction's register
+  accesses (`reg_access::access_shape`: ValB from φA or φB or none, ValD
+  from φB or the immediate, the result to φA or φD or none) with the
+  remainder bit of a division and the two operand swaps; bytes 7–9 the
+  compare, branch and bitwise sub-operations, which were bound only as
+  sums (an `And` could be applied as an `Or`, a `MinU` as a `CmovIz`
+  writing anything). CpuChip recomposes bytes 6–9 from their bits, each
+  boolean, in its own constraints (no new lookups); the indices are
+  `ValBRegIdx = RegB + ValBFromA·(RegA − RegB)`, `ValDRegIdx = RegB`,
+  `ResultRegIdx = RegA + ResultToD·(RegD − RegA) + 7·IsWitnessEcall`. A
+  conditional move's result bit is its move, a witness call's its count.
+- **Every instruction's write is recorded** (`tracing::recorded_write`,
+  shared with the Refine prover's observation), even of the value the
+  register held, so `ResultIsReg` is fixed by the instruction.
+- **An immediate operand is the instruction's:** `RegValD` is ValD's
+  source, its register or the immediate, pinned to `ImmBytes`; ValD was
+  free on every immediate instruction (`LoadImm φ4 = 42` could load
+  anything). `LoadImmJump` moves its immediate and `LoadImmJumpInd`'s
+  result is its `imm_x`; both results were free.
+- **Shift amounts:** the identity `RegValD = ShiftAmount + modulus·q` was
+  over M31 with an unchecked 8-byte q, so any amount satisfied it, and it
+  was ungated on immediate shifts. It is now on the low byte, with q's
+  bits (3 and 4 columns), over the integers; `IsShiftConstrained = IsShift`.
+- **MemoryChip** sorts by `2·ts + is_write`, as the register ledger does,
+  and its `IsWrite` and `IsPadding` are boolean.
+- **Lookup tables keyed by main columns:** Range256, BitwiseAnd and
+  PowerOfTwo read their entries from main columns a prover fills, not
+  their committed preprocessed ones; any Range256 check was void. They now
+  read the preprocessed columns; their main traces are multiplicities.
+- **Smaller ones:** the register ledger's `IsPadding` is boolean; the
+  jump table's padding rows (tuple `(0, 0)`) take no multiplicity
+  (`IsEntry`); a MemoryPage page is real on all its 32 rows, so it always
+  produces its leaf; derive and ProgramMemory refuse a static jump to the
+  halt address; a witness call that writes no bytes may name any
+  destination, as the live call does.
+
+Each forgery is a gate that the old code accepted and the new refuses:
+`operand_binding_gate.rs` (12), `memory_ledger_gate.rs` (2),
+`jump_table_gate.rs` (1), and `witness_input.rs`'s zero-count call
+(which failed to prove before).
+
 ### Findings, not fixed here
 
-- **CpuChip binds no register index to the instruction.** `ValBRegIdx`,
-  `ValDRegIdx`, `ResultRegIdx` and their `IsReg` flags are free witness
-  columns, constrained only to be boolean or to feed the register ledger:
-  a prover can read or write any register on any row (the witness row's
-  write is pinned here). They should be bound to `RegA`/`RegB`/`RegD` by
-  the instruction's category.
-- **MemoryChip does not order a byte's reads before its writes** within a
-  timestamp either; a precompile whose output buffer aliases an input is
-  exposed to the same reordering the register ledger had. The witness
-  input reads no memory.
-- **Only a halt reaches the halt address in a derived kernel:** derive
-  lays every static target and jump-table entry in its code. A crafted
-  program with a branch to `0xffff_0000` would end a segment there without
-  halting; refusing such a target in ProgramMemory would make it general.
+An audit of the other chips for the same class reported these; they are
+the next fixes:
+
+- **The register ledger's merged read slots** (`Ts1..Ts3`) are not
+  ordered: a read can take a stale value by riding an earlier row.
+- **Mul and DivRem carries** are not range-checked, nor the top carry
+  pinned: a product or quotient can be wrong; DivRem's `|r| < |d|` chain
+  uses unchecked carries.
+- **BLAKE2b:** the write addresses are pinned on row 0 only, and the
+  main chip's `IsReal` is not held across its 96 rows.
+- **Ristretto:** ids 110–114 compute nothing tied to memory, row roles
+  and source rows in the comb chips are free, `IsFixedBase` is not
+  checked against the base point.
+- **Shifts right:** nothing distinguishes `ShloR` from `SharR` in the
+  AIR (both prove either quotient).
+- `ShloL/ShloR/SharRImmAlt` take their operands unswapped and do not
+  prove (completeness only).
 
 ## Step 5.7: the items carried from slice 4
 
