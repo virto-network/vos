@@ -2,13 +2,19 @@
 //! the PCS configuration, the log sizes, the boundary states and the
 //! interaction PoW; and the format's security check on a proof's parameters.
 
-use alloc::{format, string::String};
-use stwo::core::{channel::Channel, pcs::PcsConfig};
+use alloc::{format, string::String, vec::Vec};
+use stwo::core::{
+    channel::Channel,
+    pcs::{CommitmentSchemeVerifier, PcsConfig, TreeVec},
+    proof::StarkProof,
+};
 
-use super::SegmentState;
+use super::{Proof, SegmentState};
 use crate::format::{Encoding, Format, FormatParams};
-use crate::pcs::FsChannel;
+use crate::lookups::AllLookupElements;
+use crate::pcs::{FsChannel, PcsStack};
 use crate::security::{SecurityBits, SecurityShape};
+use crate::trace::eval::{INTERACTION_TRACE_IDX, ORIGINAL_TRACE_IDX, PREPROCESSED_TRACE_IDX};
 
 // Two fixed little-endian words spelling "VOS/PVM/" and "STARK/FS". The
 // format version follows as its own word. This is deliberately mixed before
@@ -118,6 +124,48 @@ pub fn check_interaction_pow(
     }
     channel.mix_u64(nonce);
     Ok(())
+}
+
+/// The verifier's transcript through the interaction tree's root, as the
+/// prover ran it, on `channel` and `commitment_scheme`:
+/// - A.1's first five items: the statement header; the preprocessed and main
+///   roots at `log_sizes`; the boundary states and the interaction PoW, which
+///   it checks; and the relation elements, which `draw` draws from the
+///   channel as it then stands;
+/// - the claimed sums, then the interaction root.
+///
+/// Every verifier replays this one prefix, and A.1's in-AIR transcript
+/// follows it. Every proof mixes its boundary states, as every proof's
+/// prover did. It returns the relation elements, for the caller to build
+/// its components with.
+pub fn replay_prefix<MC: PcsStack>(
+    proof: &Proof,
+    stark: &StarkProof<MC::H>,
+    format: &Format,
+    log_sizes: &TreeVec<Vec<u32>>,
+    channel: &mut MC::C,
+    commitment_scheme: &mut CommitmentSchemeVerifier<MC>,
+    draw: impl FnOnce(&mut MC::C) -> AllLookupElements,
+) -> Result<AllLookupElements, String> {
+    mix_statement_header(channel, format.number, &proof.pcs_config, &proof.log_sizes);
+    for idx in [PREPROCESSED_TRACE_IDX, ORIGINAL_TRACE_IDX] {
+        commitment_scheme.commit(stark.commitments[idx], &log_sizes[idx], channel);
+    }
+    mix_boundary_states(
+        channel,
+        format.encoding,
+        &proof.initial_state,
+        &proof.final_state,
+    );
+    check_interaction_pow(channel, format, proof.interaction_pow)?;
+    let lookup_elements = draw(channel);
+    channel.mix_felts(&proof.claimed_sums);
+    commitment_scheme.commit(
+        stark.commitments[INTERACTION_TRACE_IDX],
+        &log_sizes[INTERACTION_TRACE_IDX],
+        channel,
+    );
+    Ok(lookup_elements)
 }
 
 /// Adversarial-test seam for constructing a proof under the immediately

@@ -2,7 +2,6 @@ use num_traits::Zero;
 use stwo::{
     core::{
         air::Component,
-        channel::Channel,
         fields::qm31::SecureField,
         pcs::{CommitmentSchemeVerifier, PcsConfig, TreeVec},
         poly::circle::CanonicCoset,
@@ -17,7 +16,7 @@ use stwo::prover::backend::{BackendForChannel, simd::SimdBackend};
 use crate::format::{Encoding, Format};
 use crate::pcs::{FsChannel, PcsStack};
 
-use crate::trace::eval::{INTERACTION_TRACE_IDX, ORIGINAL_TRACE_IDX, PREPROCESSED_TRACE_IDX};
+use crate::trace::eval::PREPROCESSED_TRACE_IDX;
 
 use super::Proof;
 use crate::{lookups::AllLookupElements, side_note::SideNote};
@@ -386,16 +385,9 @@ struct TranscriptPrefix<'a> {
     verifier_components: Vec<Box<dyn Component + 'a>>,
 }
 
-/// The verifier's transcript through the interaction tree's root, as the
-/// prover ran it, on `channel` and `commitment_scheme`:
-/// - A.1's first five items: the statement header; the preprocessed and main
-///   roots; the boundary states and the interaction PoW, which it checks; and
-///   the relation elements;
-/// - the claimed sums, then the interaction root.
-///
-/// The verifier and the recursion seams replay this one prefix, and A.1's
-/// in-AIR transcript follows it. Every proof mixes its boundary states, as
-/// every proof's prover did.
+/// [`crate::proof::replay_prefix`] with `components` drawing the relation
+/// elements, then the components bound to them at the proof's log sizes and
+/// claimed sums.
 fn transcript_prefix<'a, MC: PcsStack>(
     proof: &Proof,
     stark: &stwo::core::proof::StarkProof<MC::H>,
@@ -405,25 +397,22 @@ fn transcript_prefix<'a, MC: PcsStack>(
     channel: &mut MC::C,
     commitment_scheme: &mut CommitmentSchemeVerifier<MC>,
 ) -> Result<TranscriptPrefix<'a>, VerificationError> {
-    crate::proof::mix_statement_header(channel, format.number, &proof.pcs_config, &proof.log_sizes);
-    for idx in [PREPROCESSED_TRACE_IDX, ORIGINAL_TRACE_IDX] {
-        commitment_scheme.commit(stark.commitments[idx], &log_sizes[idx], channel);
-    }
-
-    crate::proof::mix_boundary_states(
+    let lookup_elements = crate::proof::replay_prefix::<MC>(
+        proof,
+        stark,
+        format,
+        log_sizes,
         channel,
-        format.encoding,
-        &proof.initial_state,
-        &proof.final_state,
-    );
-    crate::proof::check_interaction_pow(channel, format, proof.interaction_pow)
-        .map_err(VerificationError::InvalidStructure)?;
-
-    let mut lookup_elements = AllLookupElements::default();
-    components
-        .iter()
-        .for_each(|c| c.draw_lookup_elements(&mut lookup_elements, channel.as_ref_channel()));
-
+        commitment_scheme,
+        |channel| {
+            let mut lookup_elements = AllLookupElements::default();
+            for component in components {
+                component.draw_lookup_elements(&mut lookup_elements, channel.as_ref_channel());
+            }
+            lookup_elements
+        },
+    )
+    .map_err(VerificationError::InvalidStructure)?;
     let tree_span_provider = &mut TraceLocationAllocator::default();
     let verifier_components = components
         .iter()
@@ -433,13 +422,6 @@ fn transcript_prefix<'a, MC: PcsStack>(
             c.to_component(tree_span_provider, &lookup_elements, log_size, *claimed_sum)
         })
         .collect();
-
-    channel.mix_felts(&proof.claimed_sums);
-    commitment_scheme.commit(
-        stark.commitments[INTERACTION_TRACE_IDX],
-        &log_sizes[INTERACTION_TRACE_IDX],
-        channel,
-    );
     Ok(TranscriptPrefix {
         lookup_elements,
         verifier_components,

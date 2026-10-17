@@ -20,12 +20,11 @@ use alloc::{boxed::Box, collections::BTreeMap, format, string::ToString, vec::Ve
 use num_traits::Zero;
 use stwo::core::{
     air::Component,
-    channel::Channel,
     fields::qm31::SecureField,
     pcs::{CommitmentSchemeVerifier, TreeVec},
     verifier::VerificationError,
 };
-use stwo_constraint_framework::TraceLocationAllocator;
+use stwo_constraint_framework::{PREPROCESSED_TRACE_IDX, TraceLocationAllocator};
 
 // A proof's format selects its channel at run time; one build reads every
 // admitted format.
@@ -561,41 +560,29 @@ fn verify_standalone_on<MC: PcsStack>(
     format: &'static Format,
     preprocessed_commitment: CommitmentHash,
 ) -> Result<(), VerificationError> {
-    let Proof {
-        stark_proof,
-        interaction_pow,
-        claimed_sums,
-        log_sizes: claimed_log_sizes,
-        num_components,
-        component_mask,
-        pcs_config,
-        initial_state,
-        final_state,
-        ..
-    } = proof;
-    let stark_proof = MC::from_any(stark_proof).ok_or_else(|| {
+    let stark = MC::stark(&proof.stark_proof).ok_or_else(|| {
         VerificationError::InvalidStructure("Stark proof channel differs".to_string())
     })?;
-    let (expected_log_sizes, protocol_shape, security_shape) = standalone_shape::<MC>(
-        &claimed_log_sizes,
-        component_mask,
-        &claimed_sums,
-        &pcs_config,
-        &stark_proof,
+    let (log_sizes, protocol_shape, security_shape) = standalone_shape::<MC>(
+        &proof.log_sizes,
+        proof.component_mask,
+        &proof.claimed_sums,
+        &proof.pcs_config,
+        stark,
     )?;
     // The format's floors, counted at this proof's own parameters and
     // shape, and its exact parameters.
     if format.encoding == Encoding::Lossless {
-        vos_pvm_proof::proof::check_format_security(format, &pcs_config, &security_shape)
+        vos_pvm_proof::proof::check_format_security(format, &proof.pcs_config, &security_shape)
             .map_err(VerificationError::InvalidStructure)?;
     }
 
-    if claimed_sums.len() != num_components {
+    if proof.claimed_sums.len() != proof.num_components {
         return Err(VerificationError::InvalidStructure(
             "claimed sums len mismatch".to_string(),
         ));
     }
-    if claimed_log_sizes.len() != num_components {
+    if proof.log_sizes.len() != proof.num_components {
         return Err(VerificationError::InvalidStructure(
             "log sizes len mismatch".to_string(),
         ));
@@ -605,66 +592,46 @@ fn verify_standalone_on<MC: PcsStack>(
     // wrapper).  Step timestamps start at 1, so `initial_ts ≥ 1` excludes the
     // ts=0 per-page boundary writes from being forged as real steps, and (with
     // the CpuChip ts-chain) lands every step ts in [initial_ts, final_ts).
-    if initial_state.timestamp < 1 {
+    if proof.initial_state.timestamp < 1 {
         return Err(VerificationError::InvalidStructure(
             "initial_state.timestamp must be >= 1 (memory-boundary anchoring, format v7)"
                 .to_string(),
         ));
     }
 
-    // Use the proof's own PCS config: a legacy proof carries its own, and
-    // every other format's equals the format's, checked above.
-    let config = pcs_config;
-    let verifier_channel = &mut MC::C::default();
-    vos_pvm_proof::proof::mix_statement_header(
-        verifier_channel,
-        format.number,
-        &config,
-        &claimed_log_sizes,
-    );
-
-    // Check preprocessed trace commitment matches expected
-    let actual_preprocessed = stark_proof.commitments[0].into_commitment(); // PREPROCESSED_TRACE_IDX = 0
+    let actual_preprocessed = stark.commitments[PREPROCESSED_TRACE_IDX].into_commitment();
     if actual_preprocessed != preprocessed_commitment {
         return Err(VerificationError::InvalidStructure(format!(
             "preprocessed commitment mismatch: expected {preprocessed_commitment}, got {actual_preprocessed}"
         )));
     }
 
-    let commitment_scheme = &mut CommitmentSchemeVerifier::<MC>::new(config);
-
-    // Commit preprocessed and original traces
-    let log_sizes = expected_log_sizes;
-
-    for idx in [0, 1] {
-        // PREPROCESSED_TRACE_IDX, ORIGINAL_TRACE_IDX
-        commitment_scheme.commit(
-            stark_proof.commitments[idx],
-            &log_sizes[idx],
-            verifier_channel,
-        );
-    }
-
-    // A.1's third and fourth items, as the prover ran them: the boundary
-    // states (the `component_mask = 0` reject above guarantees a proof with
-    // the boundary and closing chips, so the mix is unconditional), then the
-    // interaction PoW, before any relation challenge. The challenges drawn
-    // next therefore depend on the claimed boundary states.
-    // `memory_commitment` stays unmixed (computed outside the circuit).
-    vos_pvm_proof::proof::mix_boundary_states(
+    // The transcript through the interaction root, as the prover ran it: the
+    // boundary states (the `component_mask = 0` reject above guarantees a
+    // proof with the boundary and closing chips) and the interaction PoW
+    // precede the relation elements, which therefore depend on the claimed
+    // boundary states. `memory_commitment` stays unmixed (computed outside
+    // the circuit). The proof's own PCS config: a legacy proof carries its
+    // own, and every other format's equals the format's, checked above.
+    let verifier_channel = &mut MC::C::default();
+    let commitment_scheme = &mut CommitmentSchemeVerifier::<MC>::new(proof.pcs_config);
+    let lookup_elements = vos_pvm_proof::proof::replay_prefix::<MC>(
+        &proof,
+        stark,
+        format,
+        &log_sizes,
         verifier_channel,
-        format.encoding,
-        &initial_state,
-        &final_state,
-    );
-    vos_pvm_proof::proof::check_interaction_pow(verifier_channel, format, interaction_pow)
-        .map_err(VerificationError::InvalidStructure)?;
-
-    let mut lookup_elements = AllLookupElements::default();
-    draw_all_lookup_elements(&mut lookup_elements, verifier_channel, component_mask);
+        commitment_scheme,
+        |channel| {
+            let mut lookup_elements = AllLookupElements::default();
+            draw_all_lookup_elements(&mut lookup_elements, channel, proof.component_mask);
+            lookup_elements
+        },
+    )
+    .map_err(VerificationError::InvalidStructure)?;
 
     // Verify logup sum = 0
-    if claimed_sums.iter().sum::<SecureField>() != SecureField::zero() {
+    if proof.claimed_sums.iter().sum::<SecureField>() != SecureField::zero() {
         return Err(VerificationError::InvalidStructure(
             "claimed logup sum is not zero".to_string(),
         ));
@@ -672,9 +639,9 @@ fn verify_standalone_on<MC: PcsStack>(
 
     // Boundary public-input binding (format v5): each boundary chip's
     // claimed sum must equal the value recomputed from the proof's
-    // public boundary states with the just-drawn lookup elements. This
+    // public boundary states with the drawn lookup elements. This
     // BINDS `proof.{initial,final}_state` to the committed boundary
-    // COLUMNS; the mix above alone is only tamper-evidence against
+    // COLUMNS; the transcript's mix alone is only tamper-evidence against
     // post-prove edits, not against a from-scratch prover. pc/timestamp
     // columns are pinned to the trace by CpuChip program-execution
     // chaining; the register columns (and the voucher io-hash read from
@@ -690,7 +657,7 @@ fn verify_standalone_on<MC: PcsStack>(
     // chip cannot bind its boundary states and is rejected outright (all
     // three are unconditionally active in the production prove path).
     let Some(boundary_positions) =
-        vos_pvm_proof::boundary_binding::boundary_positions_in_mask(component_mask)
+        vos_pvm_proof::boundary_binding::boundary_positions_in_mask(proof.component_mask)
     else {
         return Err(VerificationError::InvalidStructure(
             "component_mask lacks a boundary-binding chip \
@@ -699,10 +666,10 @@ fn verify_standalone_on<MC: PcsStack>(
         ));
     };
     vos_pvm_proof::boundary_binding::check_boundary_claimed_sums(
-        &initial_state,
-        &final_state,
+        &proof.initial_state,
+        &proof.final_state,
         &lookup_elements,
-        &claimed_sums,
+        &proof.claimed_sums,
         &boundary_positions,
     )
     .map_err(|msg| VerificationError::InvalidStructure(msg.to_string()))?;
@@ -711,23 +678,16 @@ fn verify_standalone_on<MC: PcsStack>(
     let verifier_components: Vec<Box<dyn Component>> = create_verifier_components::components(
         tree_span_provider,
         &lookup_elements,
-        &claimed_log_sizes,
-        &claimed_sums,
-        component_mask,
+        &proof.log_sizes,
+        &proof.claimed_sums,
+        proof.component_mask,
     );
     let components_ref: Vec<&dyn Component> = verifier_components.iter().map(|c| &**c).collect();
 
-    verifier_channel.mix_felts(&claimed_sums);
-    commitment_scheme.commit(
-        stark_proof.commitments[2], // INTERACTION_TRACE_IDX
-        &log_sizes[2],
-        verifier_channel,
-    );
-
     let sampled_queries = vos_pvm_proof::proof::expected_fiat_shamir_query_count::<MC>(
         verifier_channel,
-        &stark_proof,
-        &pcs_config,
+        stark,
+        &proof.pcs_config,
         protocol_shape,
         &log_sizes,
     )
@@ -738,6 +698,7 @@ fn verify_standalone_on<MC: PcsStack>(
         ));
     }
 
+    let stark_proof = MC::from_any(proof.stark_proof).expect("the channel checked above");
     stwo::core::verifier::verify(
         &components_ref,
         verifier_channel,

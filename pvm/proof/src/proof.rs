@@ -22,7 +22,7 @@ mod transcript;
 pub(crate) use transcript::mix_pre_config_proof_fs_domain;
 pub use transcript::{
     check_format_security, check_interaction_pow, format_security_bits, mix_boundary_states,
-    mix_proof_fs_domain, mix_statement_header,
+    mix_proof_fs_domain, mix_statement_header, replay_prefix,
 };
 
 /// The format the default prover produces: the legacy Blake2s segment
