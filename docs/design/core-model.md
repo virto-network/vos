@@ -605,6 +605,16 @@ Why handlers run to completion:
 - **Gas.** Each refine has a gas budget split across invocations, and gas
   per instance is recorded for metering. Gas outcomes may differ between
   VOS and JAM (section 11.2).
+- **The start reserve is a consensus constant** [decided]. Every node, the
+  JAM builder's fit and simulation, and the reference runner give a refine
+  its batch's budget and `defaults::batch_start` beyond it, for decoding
+  the batch: a start, a share for each input, each byte of the arguments
+  and each kernel the batch's installs name (`DECODE_KERNEL`, 8,000 gas,
+  which covers a kernel's record of up to `records::MAX_CLASSES` classes).
+  The agent traps a refine whose gas does not cover its budget once the
+  batch is decoded, so nodes that reserve differently refine a batch
+  differently. Slice 5 changed it, adding the per-kernel share when
+  kernels' records gained their shapes.
 
 ## 9. State
 

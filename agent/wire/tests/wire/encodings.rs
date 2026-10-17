@@ -111,6 +111,7 @@ fn installs_keep_their_bytes() {
                 program: ProgramHash([1; 32]),
                 image_root: [7; 32],
                 shape: Shape {
+                    policy: 0x1213_1415,
                     chips: 0x0102_0304,
                     classes: vec![SegmentClass {
                         log_steps: 15,
@@ -124,6 +125,7 @@ fn installs_keep_their_bytes() {
                 program: ProgramHash([2; 32]),
                 image_root: [8; 32],
                 shape: Shape {
+                    policy: 9,
                     chips: 5,
                     classes: vec![],
                 },
@@ -137,14 +139,20 @@ fn installs_keep_their_bytes() {
         [&method.to_le_bytes()[..], program, root, shape].concat()
     };
     let shape = [
-        &0x0102_0304u32.to_le_bytes()[..],
+        &0x1213_1415u32.to_le_bytes()[..],
+        &0x0102_0304u32.to_le_bytes(),
         &1u32.to_le_bytes(),
         &[15],
         &0x0809u16.to_le_bytes(),
         &(0..25).collect::<Vec<u8>>(),
     ]
     .concat();
-    let empty = [&5u32.to_le_bytes()[..], &0u32.to_le_bytes()].concat();
+    let empty = [
+        &9u32.to_le_bytes()[..],
+        &5u32.to_le_bytes(),
+        &0u32.to_le_bytes(),
+    ]
+    .concat();
     let derived = [
         &[3; 32][..],
         &2u32.to_le_bytes(),

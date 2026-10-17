@@ -448,7 +448,8 @@ fn serving_a_precompile_costs_the_agent_its_bounce() {
 /// beyond its budget (`batch_start`): the start, a share for each input,
 /// one for each byte of its arguments and one for each kernel its installs
 /// name. Measured with a budget of nothing, on batches of many small
-/// inputs, of large arguments and of installs of the most kernels.
+/// inputs, of large arguments and of installs of the most kernels, their
+/// shapes at derive's classes and at the most classes a shape has.
 #[test]
 fn the_start_reserves_cover_decoding_a_batch() {
     use vos_testkit::programs::{derivation, derived, package};
@@ -479,12 +480,20 @@ fn the_start_reserves_cover_decoding_a_batch() {
             .collect()
     };
     let wide = derivation(&package("wide"), &derived("wide"));
-    let installs = |count: u32| -> Vec<Input> {
+    let mut widest = wide.clone();
+    for kernel in &mut widest.kernels {
+        let class = kernel.shape.classes[0];
+        kernel
+            .shape
+            .classes
+            .resize(vos_wire::records::MAX_CLASSES, class);
+    }
+    let installs = |count: u32, derivation: &vos_wire::records::Derivation| -> Vec<Input> {
         (1..=count)
             .map(|instance| {
                 Input::Admin(Admin::Install {
                     instance: InstanceId(100 + instance),
-                    derivation: wide.clone(),
+                    derivation: derivation.clone(),
                     roles: vec![],
                     target: Target::Vos,
                 })
@@ -498,7 +507,11 @@ fn the_start_reserves_cover_decoding_a_batch() {
         ("256 messages", messages(256, 8)),
         ("a request of 60 KB", requests(1, 60_000)),
         ("16 requests of 60 KB", requests(16, 60_000)),
-        ("6 installs of 33 kernels", installs(6)),
+        ("6 installs of 33 kernels", installs(6, &wide)),
+        (
+            "6 installs of 33 kernels at the most classes",
+            installs(6, &widest),
+        ),
     ] {
         let work = node.budgeted_work(1, [0; 32], 0, inputs);
         let arguments = node.arguments(&work).len() as u64;

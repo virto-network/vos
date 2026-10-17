@@ -47,9 +47,13 @@ pub struct Kernel {
 /// a segment over exactly these chips at exactly one class's sizes.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Shape {
+    /// The version of the policy that chose the classes and sized them
+    /// (`vos_pvm_compiler::shape::POLICY`): a new policy derives other
+    /// shapes from the same code, so a record names the one it holds.
+    pub policy: u32,
     /// Bit i: chip i of the segment AIR, in its order.
     pub chips: u32,
-    /// Smallest first.
+    /// Cheapest first, at most [`MAX_CLASSES`].
     pub classes: Vec<SegmentClass>,
 }
 
@@ -68,6 +72,10 @@ pub struct SegmentClass {
 
 /// The segment AIR's chips (`vos_pvm_proof::chip_idx::COUNT`).
 pub const SEGMENT_CHIPS: usize = 25;
+
+/// The most classes a kernel's shape has: what decoding a kernel's record
+/// within [`DECODE_KERNEL`](crate::defaults::DECODE_KERNEL) covers.
+pub const MAX_CLASSES: usize = 4;
 
 impl Derivation {
     /// The derivation of package `elf`: its actor's program and each

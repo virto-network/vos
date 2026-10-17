@@ -152,6 +152,7 @@ pub(crate) fn input() -> impl Strategy<Value = Input> {
                                     program: ProgramHash(program),
                                     image_root,
                                     shape: Shape {
+                                        policy: u32::from(program[1]),
                                         chips: method,
                                         classes: vec![SegmentClass {
                                             log_steps: image_root[0],

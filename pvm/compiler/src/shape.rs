@@ -69,12 +69,20 @@ const SELECTED: u32 = 1 << chip::BLAKE2B
 /// program's memory, the page Merkle chips and the fixed tables.
 pub const ALWAYS: u32 = ((1 << chip::COUNT) - 1) & !SELECTED;
 
+/// The version of the policy below, the classes and each chip's capacity
+/// in them, that a shape's record names (`Shape::policy`): a change to
+/// either derives other shapes from the same code, so it takes a new
+/// version.
+pub const POLICY: u32 = 1;
+
 /// The classes a kernel's segments prove at, cheapest first, as
 /// `(log_steps, pages)`: a short segment's; the 32k cut's; and a short
 /// segment's with room for a whole argument written at once, as a kernel's
 /// prologue reads it (at most a request's 64 KiB, 17 pages), with the pages
 /// around it.
 pub const CLASSES: [(u8, u16); 3] = [(12, 8), (15, 8), (12, 24)];
+
+const _: () = assert!(CLASSES.len() <= vos_wire::records::MAX_CLASSES);
 
 /// The rows of a SIMD lane, the least a chip has: 2^4.
 const LOG_LANES: u8 = 4;
@@ -209,5 +217,9 @@ pub fn kernel_shape(blob: &[u8]) -> Option<Shape> {
             }),
         })
         .collect();
-    Some(Shape { chips, classes })
+    Some(Shape {
+        policy: POLICY,
+        chips,
+        classes,
+    })
 }

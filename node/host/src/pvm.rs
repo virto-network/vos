@@ -133,7 +133,7 @@ pub(crate) struct Machines {
 
 impl Machines {
     /// Run the agent's refine on `work` for `agent` with `gas`, and a
-    /// batch's decoding beyond it (`defaults::refine_start`): its output,
+    /// batch's decoding beyond it (`defaults::batch_start`): its output,
     /// if it halts, and the gas the run used.
     pub(crate) fn refine(
         &self,

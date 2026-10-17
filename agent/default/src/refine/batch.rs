@@ -195,7 +195,7 @@ fn plan(base: &Base, pairs: &BTreeMap<AgentId, u64>, input: &Input, handler: boo
 /// the work result, its pages left in `base`'s section.
 pub(crate) fn run_batch(base: &mut Base, batch: Batch) -> ResultWriter {
     // The one reading of `gas`. A node gives a refine its batch's budget and
-    // what decoding the batch may take (`defaults::refine_start`), so the
+    // what decoding the batch may take (`defaults::batch_start`), so the
     // budget is left now; a refine given less traps rather than run out
     // partway, and nothing else depends on the reading.
     assert!(

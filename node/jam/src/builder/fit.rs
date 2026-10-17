@@ -84,7 +84,7 @@ pub(crate) const MAX_INPUT: usize = 12 << 20;
 /// thousand of its gas.
 pub const MARGIN: u64 = 50;
 /// A bound on a package's own work beyond its batch's budget: its refine's
-/// start ([`defaults::refine_start`]) and what the [`gas`] module
+/// start ([`defaults::batch_start`]) and what the [`gas`] module
 /// estimates. The builder's estimates, PolkaJam reporting no refine gas:
 /// 3.3M to 13.5M in the testnet run's packages, and at most 4.9M for a
 /// workflow's package resumed across packages in the JAM-only host's
