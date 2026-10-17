@@ -22,6 +22,7 @@ mod derive;
 mod linker;
 mod peephole;
 mod riscv;
+pub mod shape;
 mod spi;
 
 use thiserror::Error;

@@ -10,7 +10,9 @@ use vos_wire::ids::{
 use vos_wire::ingress::Grant;
 use vos_wire::jam::{AccumulateInput, RefineArgs, WorkError};
 use vos_wire::keys::{Due, Transform};
-use vos_wire::records::{Derivation, Kernel, Snapshot, Workflow, WorkflowState};
+use vos_wire::records::{
+    Derivation, Kernel, SegmentClass, Shape, Snapshot, Workflow, WorkflowState,
+};
 use vos_wire::result::{CommittedWrite, InputRef, Outcome, Outgoing, Page, Run, Write};
 use vos_wire::{Decode, Encode};
 
@@ -108,25 +110,46 @@ fn installs_keep_their_bytes() {
                 method: MethodId(0x0a0b_0c0d),
                 program: ProgramHash([1; 32]),
                 image_root: [7; 32],
+                shape: Shape {
+                    chips: 0x0102_0304,
+                    classes: vec![SegmentClass {
+                        log_steps: 15,
+                        pages: 0x0809,
+                        log_sizes: core::array::from_fn(|chip| chip as u8),
+                    }],
+                },
             },
             Kernel {
                 method: MethodId(0x0e0f_1011),
                 program: ProgramHash([2; 32]),
                 image_root: [8; 32],
+                shape: Shape {
+                    chips: 5,
+                    classes: vec![],
+                },
             },
         ],
         elf: [4; 32],
         transpiler: 5,
         heap: 6,
     };
-    let kernel = |method: u32, program: &[u8], root: &[u8]| {
-        [&method.to_le_bytes()[..], program, root].concat()
+    let kernel = |method: u32, program: &[u8], root: &[u8], shape: &[u8]| {
+        [&method.to_le_bytes()[..], program, root, shape].concat()
     };
+    let shape = [
+        &0x0102_0304u32.to_le_bytes()[..],
+        &1u32.to_le_bytes(),
+        &[15],
+        &0x0809u16.to_le_bytes(),
+        &(0..25).collect::<Vec<u8>>(),
+    ]
+    .concat();
+    let empty = [&5u32.to_le_bytes()[..], &0u32.to_le_bytes()].concat();
     let derived = [
         &[3; 32][..],
         &2u32.to_le_bytes(),
-        &kernel(0x0a0b_0c0d, &[1; 32], &[7; 32]),
-        &kernel(0x0e0f_1011, &[2; 32], &[8; 32]),
+        &kernel(0x0a0b_0c0d, &[1; 32], &[7; 32], &shape),
+        &kernel(0x0e0f_1011, &[2; 32], &[8; 32], &empty),
         &[4; 32],
         &5u32.to_le_bytes(),
         &6u32.to_le_bytes(),

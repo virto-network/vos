@@ -28,46 +28,80 @@ pub struct Derivation {
     pub heap: u32,
 }
 
-/// An attestable method's kernel: its program, and the root of the page
-/// tree over its initial memory, laid out with no arguments, from which a
-/// proof of a run of it starts ([`vos_pvm_program::image`]). Its arguments
-/// reach it through its witness input, so the root is the same for every
-/// run.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+/// An attestable method's kernel: its program; the root of the page tree
+/// over its initial memory, laid out with no arguments, from which a proof
+/// of a run of it starts ([`vos_pvm_program::image`]), the same for every
+/// run, as its arguments reach it through its witness input; and the shape
+/// its proofs take.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Kernel {
     pub method: MethodId,
     pub program: ProgramHash,
     pub image_root: [u8; 32],
+    pub shape: Shape,
 }
+
+/// The shape of a kernel's segment proofs: the chips of the segment AIR its
+/// code can reach, its instructions' and its precompiles', and for each
+/// class of segment the log size of each. A verifier of the kernel accepts
+/// a segment over exactly these chips at exactly one class's sizes.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct Shape {
+    /// Bit i: chip i of the segment AIR, in its order.
+    pub chips: u32,
+    /// Smallest first.
+    pub classes: Vec<SegmentClass>,
+}
+
+/// A class of segment: the cut it holds its segments to, and the log size
+/// each chip of its shape is padded to. Fixed-size, so a kernel's record
+/// decodes with one allocation, its classes'.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct SegmentClass {
+    /// At most 2^`log_steps` steps a segment.
+    pub log_steps: u8,
+    /// At most this many pages touched a segment.
+    pub pages: u16,
+    /// Chip i's log size, 0 for a chip outside the shape.
+    pub log_sizes: [u8; SEGMENT_CHIPS],
+}
+
+/// The segment AIR's chips (`vos_pvm_proof::chip_idx::COUNT`).
+pub const SEGMENT_CHIPS: usize = 25;
 
 impl Derivation {
     /// The derivation of package `elf`: its actor's program and each
-    /// attestable method's kernel, by the method's id, as version
-    /// `transpiler` derived them, each named by its hash, and the `heap`
-    /// pages its program leaves out. The one constructor of a VOS node's
-    /// install and of a JAM builder's, so the two agree.
+    /// attestable method's kernel, by the method's id, with its shape, by
+    /// the kernel's position, as version `transpiler` derived them, each
+    /// named by its hash, and the `heap` pages its program leaves out. The
+    /// one constructor of a VOS node's install and of a JAM builder's, so
+    /// the two agree.
     ///
     /// # Panics
     ///
-    /// If a kernel is not a standard program, which a derivation never
-    /// makes.
+    /// If a kernel is not a standard program, or the shapes are not one a
+    /// kernel, which a derivation never makes.
     pub fn new(
         elf: &[u8],
         actor: &[u8],
         kernels: &[(u32, Vec<u8>)],
+        shapes: &[Shape],
         transpiler: u32,
         heap: u32,
     ) -> Self {
+        assert_eq!(kernels.len(), shapes.len(), "a shape a kernel");
         Self {
             program: ProgramHash::of(actor),
             kernels: kernels
                 .iter()
-                .map(|(method, kernel)| Kernel {
+                .zip(shapes)
+                .map(|((method, kernel), shape)| Kernel {
                     method: MethodId(*method),
                     program: ProgramHash::of(kernel),
                     image_root: vos_pvm_program::parse_standard_program(kernel)
                         .and_then(|program| program.image_root())
                         .expect("a derived kernel is a standard program"),
+                    shape: shape.clone(),
                 })
                 .collect(),
             elf: crate::result::digest(elf),

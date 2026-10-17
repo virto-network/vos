@@ -92,7 +92,7 @@ fn an_install_binds_each_kernel_to_an_attestable_method() {
             target,
         })
     };
-    let checksum = derivation.kernels[0];
+    let checksum = derivation.kernels[0].clone();
     let (mint, tally) = (
         actors.method(LEDGER, "mint"),
         actors.method(LEDGER, "tally"),
@@ -102,20 +102,20 @@ fn an_install_binds_each_kernel_to_an_attestable_method() {
         vec![
             with(vec![]),
             with(vec![
-                checksum,
+                checksum.clone(),
                 Kernel {
                     method: mint,
-                    ..checksum
+                    ..checksum.clone()
                 },
             ]),
             with(vec![
-                checksum,
+                checksum.clone(),
                 Kernel {
                     method: tally,
-                    ..checksum
+                    ..checksum.clone()
                 },
             ]),
-            with(vec![checksum, checksum]),
+            with(vec![checksum.clone(), checksum]),
             with(derivation.kernels.clone()),
         ],
     );

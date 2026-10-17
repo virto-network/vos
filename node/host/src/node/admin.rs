@@ -212,6 +212,7 @@ impl Inner {
                     &elf,
                     &derived.actor,
                     &derived.kernels,
+                    &derived.shapes,
                     derived.transpiler_version,
                     derived.heap,
                 );

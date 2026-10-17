@@ -53,6 +53,7 @@ pub fn derive(elf: &[u8]) -> Result<Installable, Error> {
         elf,
         &derived.actor,
         &derived.kernels,
+        &derived.shapes,
         derived.transpiler_version,
         derived.heap,
     );

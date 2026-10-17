@@ -67,6 +67,7 @@ pub fn derivation(elf: &[u8], derived: &Derived) -> Derivation {
         elf,
         &derived.actor,
         &derived.kernels,
+        &derived.shapes,
         derived.transpiler_version,
         derived.heap,
     )

@@ -11,7 +11,7 @@ use vos_wire::ids::{
 use vos_wire::ingress::Grant;
 use vos_wire::jam::WorkError;
 use vos_wire::keys::{Due, Transform};
-use vos_wire::records::{Derivation, Kernel};
+use vos_wire::records::{Derivation, Kernel, SegmentClass, Shape};
 use vos_wire::result::{
     Attest, CommittedWrite, InputRef, InstanceGas, Outcome, Outgoing, Page, Run, Step, Write,
 };
@@ -151,6 +151,14 @@ pub(crate) fn input() -> impl Strategy<Value = Input> {
                                     method: MethodId(method),
                                     program: ProgramHash(program),
                                     image_root,
+                                    shape: Shape {
+                                        chips: method,
+                                        classes: vec![SegmentClass {
+                                            log_steps: image_root[0],
+                                            pages: u16::from(program[0]),
+                                            log_sizes: core::array::from_fn(|chip| program[chip]),
+                                        }],
+                                    },
                                 })
                                 .collect(),
                             elf,

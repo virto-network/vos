@@ -97,6 +97,8 @@ const ATTEST_ENTRY: u64 = 16;
 pub struct Derived {
     pub actor: Vec<u8>,
     pub kernels: Vec<(u32, Vec<u8>)>,
+    /// Each kernel's shape, by its position in `kernels`.
+    pub shapes: Vec<vos_wire::records::Shape>,
     pub schema: Vec<u8>,
     /// The pages of the actor's heap past its program's read-write data,
     /// which a workflow's machine maps there.
@@ -159,13 +161,20 @@ pub fn derive(elf: &[u8]) -> Result<Derived, DeriveError> {
     let heap = invocation_heap(&mut linked)?;
     let actor = spi_blob(transpile_with(&linked, Link::Whole)?)?;
     let graph = Graph::new(&linked);
-    let kernels = attestables(&linked)?
+    let kernels: Vec<(u32, Vec<u8>)> = attestables(&linked)?
         .into_iter()
         .map(|(method, entry)| Ok((method, kernel(&graph, method, entry)?)))
         .collect::<Result<_, DeriveError>>()?;
+    let shapes = kernels
+        .iter()
+        .map(|(_, kernel)| {
+            crate::shape::kernel_shape(kernel).expect("a kernel is a standard program")
+        })
+        .collect();
     Ok(Derived {
         actor,
         kernels,
+        shapes,
         schema,
         heap,
         transpiler_version: TRANSPILER_VERSION,
