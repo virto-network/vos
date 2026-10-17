@@ -56,8 +56,8 @@ pub struct OodsReconstruction {
 /// per-component `claimed_sum`/`log_size`) plus the proof's own composition value.
 ///
 /// This is the read-only reconstruction the recursion harness drives its
-/// auto-witnessing evaluator against: the verifier's transcript prefix
-/// ([`super::transcript_prefix`]) followed by the stwo verifier head (draw
+/// auto-witnessing evaluator against: the verifier's transcript prefix,
+/// `verify`'s own, followed by the stwo verifier head (draw
 /// `random_coeff`, commit the composition tree, draw `oods_point`).
 ///
 /// This is a recursion-harness reconstruction, NOT a trust boundary: it
