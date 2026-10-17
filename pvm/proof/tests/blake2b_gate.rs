@@ -421,6 +421,21 @@ fn the_write_address_is_pinned_on_the_writing_row() {
     assert_chip(&trace, &sn);
 }
 
+/// G4-2. The writing row's `CallTs` one past the call's: the digest
+/// lands at another timestamp than the call that read `h` and `m`. The
+/// call's columns are chained across the block.
+#[test]
+fn the_write_timestamp_is_the_call_s() {
+    let mut sn = side_note(1);
+    let mut trace = honest(&mut sn);
+    if !in_child("the_write_timestamp_is_the_call_s") {
+        return;
+    }
+    let ts = get(&trace, Column::CallTs.offset(), 95);
+    set(&mut trace, Column::CallTs.offset(), 95, ts + 1);
+    assert_chip(&trace, &sn);
+}
+
 // ── G4-3: addresses are u32, not field elements ──────────────────────────
 
 /// G4-3. `h_ptr + p` decomposes into four bytes whose base-256 sum equals
@@ -436,5 +451,29 @@ fn an_address_aliased_by_p_is_refused() {
     assert_eq!(aliased, 0x8000_0FFF);
     forge_h_addr(&mut trace, 0, 0, aliased);
     forge_h_addr(&mut trace, 95, 0, aliased);
+    assert_chip(&trace, &sn);
+}
+
+/// G4-3. The pointer `0x10F0` carries out of limb 0 for `h` bytes 16..64,
+/// whose upper limbs are those of `(ptr >> 8) + 1 = 0x11`. On the writing
+/// row the increment's limb 0 is forged to `0x12` and the carried bytes'
+/// limb 1 moved with it, so 48 digest bytes land 256 bytes up. Every limb
+/// is a byte and every limb identity `limb = p + c·(inc − p)` holds: only
+/// the increment's own identity `inc0 + 256·e0 = p1 + 1`, held on every
+/// real row, refuses it.
+#[test]
+fn the_increment_is_pinned_on_the_writing_row() {
+    let mut sn = side_note_at(1, 0x0000_10F0, M_PTR);
+    let mut trace = honest(&mut sn);
+    if !in_child("the_increment_is_pinned_on_the_writing_row") {
+        return;
+    }
+    assert_eq!(get(&trace, Column::HPtrInc.offset(), 95), 0x11);
+    set(&mut trace, Column::HPtrInc.offset(), 95, 0x12);
+    for i in 16..64 {
+        assert_eq!(get(&trace, Column::HAddrCarry.offset() + i, 95), 1);
+        assert_eq!(get(&trace, Column::HAddrB1.offset() + i, 95), 0x11);
+        set(&mut trace, Column::HAddrB1.offset() + i, 95, 0x12);
+    }
     assert_chip(&trace, &sn);
 }

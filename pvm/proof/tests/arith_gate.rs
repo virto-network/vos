@@ -268,29 +268,41 @@ fn assert_refused(result: Result<(), String>) {
     }
 }
 
-/// A ThreeReg program `op rd, ra, rb; trap`, traced, with `rd`'s value
-/// after the operation replaced by `forged` in every step from it on.
+/// The register a ThreeReg gate program writes.
+const RD: usize = 2;
+
+/// A ThreeReg program `op rd, ra, rb; trap` with `ra = a`, `rb = b`,
+/// traced.
+fn traced_steps(
+    op: Opcode,
+    a: u64,
+    b: u64,
+) -> (Vec<vos_pvm_proof::core::step::PvmStep>, Vec<u8>, Vec<u8>) {
+    let (ra, rb) = (0u8, 1u8);
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[ra as usize] = a;
+    regs[rb as usize] = b;
+    let (code, bitmask) = three_reg_program(op, RD as u8, ra, rb);
+    let steps = trace_until_opcode_zero(code.clone(), bitmask.clone(), regs);
+    assert_eq!(steps[0].opcode, op);
+    (steps, code, bitmask)
+}
+
+/// [`traced_steps`] with `rd`'s value after the operation replaced by
+/// `forged` in every step from it on.
 fn forged_steps(
     op: Opcode,
     a: u64,
     b: u64,
     forged: u64,
 ) -> (Vec<vos_pvm_proof::core::step::PvmStep>, Vec<u8>, Vec<u8>) {
-    let (rd, ra, rb) = (2u8, 0u8, 1u8);
-    let mut regs = [0u64; PVM_REGISTER_COUNT];
-    regs[ra as usize] = a;
-    regs[rb as usize] = b;
-    let (code, bitmask) = three_reg_program(op, rd, ra, rb);
-    let mut steps = trace_until_opcode_zero(code.clone(), bitmask.clone(), regs);
-    assert_eq!(steps[0].opcode, op);
-    assert_ne!(
-        steps[0].regs_after[rd as usize], forged,
-        "the forgery must differ"
-    );
-    steps[0].regs_after[rd as usize] = forged;
+    let rd = RD;
+    let (mut steps, code, bitmask) = traced_steps(op, a, b);
+    assert_ne!(steps[0].regs_after[rd], forged, "the forgery must differ");
+    steps[0].regs_after[rd] = forged;
     for step in steps.iter_mut().skip(1) {
-        step.regs_before[rd as usize] = forged;
-        step.regs_after[rd as usize] = forged;
+        step.regs_before[rd] = forged;
+        step.regs_after[rd] = forged;
     }
     (steps, code, bitmask)
 }
@@ -725,6 +737,89 @@ fn divu64_remainder_not_below_divisor_refused() {
     ));
 }
 
+// ── 32-bit chains and the flag byte ──────────────────────────────────────
+
+/// `-100 / 7` in 32 bits (-14 rem -2) with the remainder's low word honest
+/// and its high word zeroed: the 32-bit schoolbook and sign chain read the
+/// low word alone, so the remainder must be read as a sign-extended word
+/// somewhere else, or a register of the run could hold either word.
+#[test]
+fn divs32_remainder_high_word_zeroed_refused() {
+    let (steps, code, bitmask) = traced_steps(Opcode::DivS32, (-100i32) as u32 as u64, 7);
+    let q = steps[0].regs_after[RD];
+    assert_eq!(q, -14i64 as u64);
+    let r = 0x0000_0000_FFFF_FFFEu64;
+    assert_refused(prove_forged(
+        steps,
+        &code,
+        &bitmask,
+        vec![(
+            CPU,
+            producer(move |trace, side_note| {
+                forge_cpu_quotient(trace, side_note, q, r);
+                rewitness_entry(side_note, (q, r), None, None);
+            }),
+        )],
+    ));
+}
+
+/// `-1024 >> 3` in 32 bits (arithmetic, -128) proven as the logical shift
+/// `0x1FFF_FF80`: `q·8 = b` modulo 2^32 with `r = 0`, every chain over the
+/// integers, so only the 32-bit sign chain's high half refuses it.
+#[test]
+fn shar_r32_sign_dropped_refused() {
+    let logical = u64::from((-1024i32) as u32 >> 3);
+    assert_eq!(logical, 0x1FFF_FF80);
+    let (steps, code, bitmask) =
+        forged_steps(Opcode::SharR32, (-1024i32) as u32 as u64, 3, logical);
+    assert_refused(prove_forged(
+        steps,
+        &code,
+        &bitmask,
+        vec![(
+            CPU,
+            producer(move |trace, side_note| {
+                forge_cpu_quotient(trace, side_note, logical, 0);
+                rewitness_entry(side_note, (logical, 0), None, None);
+            }),
+        )],
+    ));
+}
+
+/// `-1024 >> 3` (arithmetic) proven as the logical shift with `is_shar_r`
+/// cleared on the CpuChip row and in DivRemChip's: both chips then agree
+/// on a logical shift, and only the flag's place in the instruction's
+/// committed flag byte (byte 0, bit 3, through the byte-to-bits table)
+/// refuses it.
+#[test]
+fn shar_r64_flag_cleared_refused() {
+    let logical = (-1024i64 as u64) >> 3;
+    let (steps, code, bitmask) = forged_steps(Opcode::SharR64, -1024i64 as u64, 3, logical);
+    assert_refused(prove_forged(
+        steps,
+        &code,
+        &bitmask,
+        vec![(
+            CPU,
+            producer(move |trace, side_note| {
+                assert_eq!(get(trace, Cpu::IsSharR, 0), f(1));
+                set(trace, Cpu::IsSharR, 0, f(0));
+                forge_cpu_quotient(trace, side_note, logical, 0);
+                let e = &side_note.divrem_entries[0];
+                let before: Vec<u8> = divrem::range_checked_bytes(e).collect();
+                let e = divrem::witness(e.val_b, e.val_d, logical, 0, false, false, false, false);
+                for b in before {
+                    side_note.range256_counts[b as usize] -= 1;
+                }
+                for b in divrem::range_checked_bytes(&e) {
+                    side_note.range256_counts[b as usize] += 1;
+                }
+                side_note.divrem_entries[0] = e;
+            }),
+        )],
+    ));
+}
+
 // ── Controls: the same forgeries with honest witnesses ───────────────────
 
 /// 6·7 as 41 with the low product and carries the honest filler writes.
@@ -751,6 +846,28 @@ fn shlo_r64_quotient_low_bits_refused() {
             }),
         )],
     ));
+}
+
+/// `-100 / 7` in 32 bits with the honest, sign-extended remainder
+/// rewitnessed through the harness proves.
+#[test]
+fn divs32_honest_remainder_through_the_harness_proves() {
+    let (steps, code, bitmask) = traced_steps(Opcode::DivS32, (-100i32) as u32 as u64, 7);
+    let q = steps[0].regs_after[RD];
+    let r = -2i64 as u64;
+    prove_forged(
+        steps,
+        &code,
+        &bitmask,
+        vec![(
+            CPU,
+            producer(move |trace, side_note| {
+                forge_cpu_quotient(trace, side_note, q, r);
+                rewitness_entry(side_note, (q, r), None, None);
+            }),
+        )],
+    )
+    .expect("the honest remainder proves");
 }
 
 /// The harness itself: an honest execution through the forging chips

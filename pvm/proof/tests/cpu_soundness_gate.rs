@@ -271,6 +271,44 @@ fn padding_is_a_bit() {
     });
 }
 
+/// `IsPadding = 2` on a padding row, whose flag bytes are zero, so no
+/// flag-zeroing constraint can refuse it: its realness is −1 and every
+/// helper the realness multiplies is negated. Its `(ts, pc)` consumption
+/// becomes a production, its instruction fetch a production of the zero
+/// tuple at its pc. Only the booleanity of `IsPadding` refuses it.
+#[test]
+fn padding_is_a_bit_on_a_padding_row() {
+    forge_with("padding_is_a_bit_on_a_padding_row", side_note(), |trace| {
+        // The last row: its predecessor is padding too, so no Trap's
+        // terminal check sees it; its realness −1 revives the val_d
+        // zero-test, which it satisfies with ValDIsZero = 1 (val_d is 0).
+        let row = (1usize << trace.log_size) - 1;
+        assert_eq!(
+            get(trace, Cpu::IsPadding.offset(), row),
+            BaseField::from(1u32)
+        );
+        assert_eq!(
+            get(trace, Cpu::IsPadding.offset(), row - 1),
+            BaseField::from(1u32)
+        );
+        set(trace, Cpu::IsPadding.offset(), row, 2);
+        set(trace, Cpu::ValDIsZero.offset(), row, 1);
+        // Its realness −1 revives the sequential-pc chain: pc 0 continues at 1.
+        set(trace, Cpu::NextPc.offset(), row, 1);
+        // The helpers the realness multiplies, as their definitions give
+        // them at realness −1 on a row whose every flag is 0.
+        let minus_one = -BaseField::from(1u32);
+        for column in [
+            Cpu::ValDIsImmH,
+            Cpu::NonShiftGateH,
+            Cpu::NonShiftGateNotTruncH,
+            Cpu::RealNotPhi7BoolH,
+        ] {
+            set_field(trace, column.offset(), row, minus_one);
+        }
+    });
+}
+
 // ── H-BREQ ─────────────────────────────────────────────────────────────
 
 /// `BranchEq φ3 = φ4` on equal operands falling through to 12.

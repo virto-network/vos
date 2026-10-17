@@ -278,3 +278,85 @@ fn a_page_lies_in_the_region_it_claims() {
     }
     assert_chip(&MemoryPageChip, &trace, &side_note);
 }
+
+/// A load alone from an unmapped page: no store, so only the unreadable
+/// rule (a group's start followed by anything but its closing read)
+/// refuses it.
+#[test]
+fn a_load_from_an_unmapped_page_is_refused() {
+    let code = vec![
+        Opcode::LoadIndU8 as u8,
+        0x12,
+        0,
+        0,
+        0,
+        0,
+        Opcode::Trap as u8,
+    ];
+    let bitmask = vec![1, 0, 0, 0, 0, 0, 1];
+    let mut registers = [0u64; PVM_REGISTER_COUNT];
+    registers[1] = u64::from(A);
+    let memory = vec![0u8; 4 * 1024 * 1024];
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        registers,
+        memory.clone(),
+        10_000,
+    );
+    let mut tracer = TracingPvm::new(pvm);
+    assert_eq!(tracer.run(), ExitReason::Panic);
+    let side_note = SideNote::new(tracer.into_trace(), code, bitmask)
+        .with_memory(memory)
+        .with_memory_layout(layout(false));
+    assert!(
+        refused(side_note),
+        "SOUNDNESS GAP: a load from an unmapped page proved"
+    );
+}
+
+/// A BLAKE2b compression whose output lands on a read-only page: the write
+/// is Blake2bChip's, not CpuChip's, and the ledger refuses it all the same.
+#[test]
+fn a_blake2b_write_to_a_read_only_page_is_refused() {
+    use vos_pvm_proof::core::tracing::ECALL_BLAKE2B_COMPRESS;
+    const H: u64 = 0x2_0000;
+    let memory = vec![0u8; 0x3_0000];
+    let mut code = vec![Opcode::Ecalli as u8];
+    code.extend_from_slice(&ECALL_BLAKE2B_COMPRESS.to_le_bytes());
+    code.push(Opcode::Trap as u8);
+    let mut bitmask = vec![0; code.len()];
+    bitmask[0] = 1;
+    bitmask[code.len() - 1] = 1;
+    let mut registers = [0u64; PVM_REGISTER_COUNT];
+    registers[7] = H;
+    registers[8] = H + 64;
+    registers[10] = 1;
+    let pvm = Interpreter::new(code, bitmask, vec![], registers, memory.clone(), 10_000);
+    let mut tracer = TracingPvm::new(pvm);
+    assert_eq!(
+        tracer.run_with_precompiles(),
+        ExitReason::Panic,
+        "the compression is served and the trap ends the run"
+    );
+    let h_page = (H >> 12) as u32;
+    let page = |first, end| PageRange { first, end };
+    let read_only_h = MemoryLayout {
+        regions: [
+            page(h_page, h_page + 1),
+            page(0, 0),
+            page(0, h_page),
+            page(h_page + 1, 1 << 20),
+        ],
+    };
+    let side_note = tracer
+        .into_side_note()
+        .with_initial_regs(registers)
+        .with_memory(memory.clone())
+        .with_memory_layout(read_only_h);
+    assert!(
+        refused(side_note),
+        "SOUNDNESS GAP: a BLAKE2b write to a read-only page proved"
+    );
+}
