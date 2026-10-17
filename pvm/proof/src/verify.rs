@@ -251,17 +251,7 @@ fn verify_on<MC: PcsStack>(
 where
     SimdBackend: BackendForChannel<MC>,
 {
-    let sizes: Vec<TreeVec<Vec<u32>>> = components
-        .iter()
-        .zip(&proof.log_sizes)
-        .map(|(component, &log_size)| component.trace_sizes(log_size))
-        .collect();
-    let mut expected_log_sizes = TreeVec::concat_cols(sizes.into_iter());
-    expected_log_sizes[PREPROCESSED_TRACE_IDX] = components
-        .iter()
-        .zip(&proof.log_sizes)
-        .flat_map(|(component, &log_size)| component.preprocessed_trace_sizes(log_size))
-        .collect();
+    let expected_log_sizes = committed_log_sizes(components, &proof.log_sizes);
     let mut dummy_lookup = AllLookupElements::default();
     let mut dummy_channel = MC::C::default();
     components.iter().for_each(|component| {
@@ -280,22 +270,13 @@ where
         .iter()
         .map(|component| &**component)
         .collect();
-    let Proof {
-        stark_proof,
-        interaction_pow,
-        claimed_sums,
-        log_sizes: claimed_log_sizes,
-        pcs_config: config,
-        initial_state,
-        final_state,
-        ..
-    } = proof;
-    let proof = MC::from_any(stark_proof).ok_or_else(|| {
+    let config = proof.pcs_config;
+    let stark = MC::stark(&proof.stark_proof).ok_or_else(|| {
         VerificationError::InvalidStructure("Stark proof channel differs".to_string())
     })?;
     let (protocol_shape, security_shape) = crate::framework_access::preflight_component_dimensions(
         &config,
-        &proof,
+        stark,
         &shape_component_refs,
         &expected_log_sizes,
     )
@@ -305,65 +286,36 @@ where
             .map_err(VerificationError::InvalidStructure)?;
     }
 
-    let verifier_channel = &mut MC::C::default();
-    crate::proof::mix_statement_header(
-        verifier_channel,
-        format.number,
-        &config,
-        &claimed_log_sizes,
-    );
-
-    // Verify preprocessed trace commitment
     verify_preprocessed_trace::<MC>(
-        &proof,
+        stark,
         side_note,
-        verifier_channel,
-        &claimed_log_sizes,
+        &proof.log_sizes,
         &config,
         prover_components,
     )?;
-
-    let commitment_scheme = &mut CommitmentSchemeVerifier::<MC>::new(config);
-    let log_sizes = expected_log_sizes;
-
-    for idx in [PREPROCESSED_TRACE_IDX, ORIGINAL_TRACE_IDX] {
-        commitment_scheme.commit(proof.commitments[idx], &log_sizes[idx], verifier_channel);
-    }
-
-    // A.1's third and fourth items, as the prover ran them: the boundary
-    // states and the interaction PoW, before the relation challenges. The
-    // production path (`boundary_positions` known) always mixes and binds
-    // them: the side note is the prover's, so its `closing_chip_active`
-    // cannot switch the binding off. Chip-isolated
-    // `verify_with_explicit_components` mixes only when the caller's slice
-    // includes the boundary + closing chip pair and flipped the flag.
-    if boundary_positions.is_some() && initial_state.timestamp < 1 {
+    if boundary_positions.is_some() && proof.initial_state.timestamp < 1 {
         return Err(VerificationError::InvalidStructure(
             "initial_state.timestamp must be >= 1 (memory-boundary anchoring)".to_string(),
         ));
     }
-    if boundary_positions.is_some() || side_note.closing_chip_active {
-        crate::proof::mix_boundary_states(
-            verifier_channel,
-            format.encoding,
-            &initial_state,
-            &final_state,
-        );
-        crate::proof::check_interaction_pow(verifier_channel, format, interaction_pow)
-            .map_err(VerificationError::InvalidStructure)?;
-    } else if interaction_pow != 0 {
-        return Err(VerificationError::InvalidStructure(
-            "a proof without the boundary chips carries no interaction PoW".to_string(),
-        ));
-    }
 
-    let mut lookup_elements = AllLookupElements::default();
-    components.iter().for_each(|c| {
-        c.draw_lookup_elements(&mut lookup_elements, verifier_channel.as_ref_channel())
-    });
+    let verifier_channel = &mut MC::C::default();
+    let commitment_scheme = &mut CommitmentSchemeVerifier::<MC>::new(config);
+    let TranscriptPrefix {
+        lookup_elements,
+        verifier_components,
+    } = transcript_prefix::<MC>(
+        &proof,
+        stark,
+        format,
+        components,
+        &expected_log_sizes,
+        verifier_channel,
+        commitment_scheme,
+    )?;
 
     // Verify logup sum = 0
-    if claimed_sums.iter().sum::<SecureField>() != SecureField::zero() {
+    if proof.claimed_sums.iter().sum::<SecureField>() != SecureField::zero() {
         return Err(VerificationError::InvalidStructure(
             "claimed logup sum is not zero".to_string(),
         ));
@@ -371,50 +323,32 @@ where
 
     // Boundary public-input binding (format v5): each boundary chip's
     // claimed sum must equal the value recomputed from the proof's
-    // public boundary states with the just-drawn lookup elements. This
+    // public boundary states with the drawn lookup elements. This
     // is what BINDS `proof.{initial,final}_state` to the committed
-    // boundary columns — the mix above alone is only tamper-evidence
-    // against post-prove edits, not against a from-scratch prover. See
-    // `boundary_binding` for the soundness argument and
+    // boundary columns — the mix in the transcript alone is only
+    // tamper-evidence against post-prove edits, not against a from-scratch
+    // prover. See `boundary_binding` for the soundness argument and
     // `tests/boundary_binding.rs` for the forgery gate. `None`
     // positions = the chip-isolated explicit-components path, which has
     // no stable component order and is not a trust boundary; the
     // production path always supplies `Some`.
     if let Some(positions) = &boundary_positions {
         crate::boundary_binding::check_boundary_claimed_sums(
-            &initial_state,
-            &final_state,
+            &proof.initial_state,
+            &proof.final_state,
             &lookup_elements,
-            &claimed_sums,
+            &proof.claimed_sums,
             positions,
         )
         .map_err(|msg| VerificationError::InvalidStructure(msg.to_string()))?;
     }
 
-    let tree_span_provider = &mut TraceLocationAllocator::default();
-    let verifier_components: Vec<Box<dyn Component>> = components
-        .iter()
-        .zip(&claimed_sums)
-        .zip(claimed_log_sizes)
-        .map(|((comp, claimed_sum), log_size)| {
-            comp.to_component(tree_span_provider, &lookup_elements, log_size, *claimed_sum)
-        })
-        .collect();
-    let components_ref: Vec<&dyn Component> = verifier_components.iter().map(|c| &**c).collect();
-
-    verifier_channel.mix_felts(&claimed_sums);
-    commitment_scheme.commit(
-        proof.commitments[INTERACTION_TRACE_IDX],
-        &log_sizes[INTERACTION_TRACE_IDX],
-        verifier_channel,
-    );
-
     let sampled_queries = crate::proof::expected_fiat_shamir_query_count::<MC>(
         verifier_channel,
-        &proof,
+        stark,
         &config,
         protocol_shape,
-        &log_sizes,
+        &expected_log_sizes,
     )
     .map_err(VerificationError::InvalidStructure)?;
     if sampled_queries != protocol_shape.query_count {
@@ -423,13 +357,101 @@ where
         ));
     }
 
-    stwo::core::verifier::verify(&components_ref, verifier_channel, commitment_scheme, proof)
+    let components_ref: Vec<&dyn Component> = verifier_components.iter().map(|c| &**c).collect();
+    let stark = MC::from_any(proof.stark_proof).expect("the channel checked above");
+    stwo::core::verifier::verify(&components_ref, verifier_channel, commitment_scheme, stark)
+}
+
+/// Each tree's column log sizes, as `components` commit them at the proof's
+/// `log_sizes`.
+fn committed_log_sizes(
+    components: &[&dyn crate::framework::MachineComponent],
+    log_sizes: &[u32],
+) -> TreeVec<Vec<u32>> {
+    let sizes: Vec<TreeVec<Vec<u32>>> = components
+        .iter()
+        .zip(log_sizes)
+        .map(|(component, &log_size)| component.trace_sizes(log_size))
+        .collect();
+    let mut committed = TreeVec::concat_cols(sizes.into_iter());
+    committed[PREPROCESSED_TRACE_IDX] = components
+        .iter()
+        .zip(log_sizes)
+        .flat_map(|(component, &log_size)| component.preprocessed_trace_sizes(log_size))
+        .collect();
+    committed
+}
+
+/// What the transcript prefix draws: the relation elements and the
+/// components bound to them.
+struct TranscriptPrefix<'a> {
+    lookup_elements: AllLookupElements,
+    verifier_components: Vec<Box<dyn Component + 'a>>,
+}
+
+/// The verifier's transcript through the interaction tree's root, as the
+/// prover ran it, on `channel` and `commitment_scheme`:
+/// - A.1's first five items: the statement header; the preprocessed and main
+///   roots; the boundary states and the interaction PoW, which it checks; and
+///   the relation elements;
+/// - the claimed sums, then the interaction root.
+///
+/// The verifier and the recursion seams replay this one prefix, and A.1's
+/// in-AIR transcript follows it. Every proof mixes its boundary states, as
+/// every proof's prover did.
+fn transcript_prefix<'a, MC: PcsStack>(
+    proof: &Proof,
+    stark: &stwo::core::proof::StarkProof<MC::H>,
+    format: &Format,
+    components: &[&'a dyn crate::framework::MachineComponent],
+    log_sizes: &TreeVec<Vec<u32>>,
+    channel: &mut MC::C,
+    commitment_scheme: &mut CommitmentSchemeVerifier<MC>,
+) -> Result<TranscriptPrefix<'a>, VerificationError> {
+    crate::proof::mix_statement_header(channel, format.number, &proof.pcs_config, &proof.log_sizes);
+    for idx in [PREPROCESSED_TRACE_IDX, ORIGINAL_TRACE_IDX] {
+        commitment_scheme.commit(stark.commitments[idx], &log_sizes[idx], channel);
+    }
+
+    crate::proof::mix_boundary_states(
+        channel,
+        format.encoding,
+        &proof.initial_state,
+        &proof.final_state,
+    );
+    crate::proof::check_interaction_pow(channel, format, proof.interaction_pow)
+        .map_err(VerificationError::InvalidStructure)?;
+
+    let mut lookup_elements = AllLookupElements::default();
+    components
+        .iter()
+        .for_each(|c| c.draw_lookup_elements(&mut lookup_elements, channel.as_ref_channel()));
+
+    let tree_span_provider = &mut TraceLocationAllocator::default();
+    let verifier_components = components
+        .iter()
+        .zip(&proof.claimed_sums)
+        .zip(&proof.log_sizes)
+        .map(|((c, claimed_sum), &log_size)| {
+            c.to_component(tree_span_provider, &lookup_elements, log_size, *claimed_sum)
+        })
+        .collect();
+
+    channel.mix_felts(&proof.claimed_sums);
+    commitment_scheme.commit(
+        stark.commitments[INTERACTION_TRACE_IDX],
+        &log_sizes[INTERACTION_TRACE_IDX],
+        channel,
+    );
+    Ok(TranscriptPrefix {
+        lookup_elements,
+        verifier_components,
+    })
 }
 
 fn verify_preprocessed_trace<MC: PcsStack>(
     proof: &stwo::core::proof::StarkProof<MC::H>,
     side_note: &SideNote,
-    verifier_channel: &MC::C,
     log_sizes: &[u32],
     config: &PcsConfig,
     components: &[&dyn crate::framework::MachineProverComponent],
@@ -454,7 +476,8 @@ where
         .map(|(c, &log_size)| c.max_constraint_log_degree_bound(log_size))
         .max()
         .unwrap_or(0);
-    let verifier_channel = &mut verifier_channel.clone();
+    // The root does not depend on the channel it is mixed into.
+    let verifier_channel = &mut MC::C::default();
     let twiddles = SimdBackend::precompute_twiddles(
         CanonicCoset::new(max_constraint_log_degree_bound + config.fri_config.log_blowup_factor)
             .circle_domain()

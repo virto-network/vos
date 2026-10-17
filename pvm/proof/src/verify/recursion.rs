@@ -11,12 +11,11 @@ use stwo::core::{
     pcs::{CommitmentSchemeVerifier, TreeVec},
     poly::circle::CanonicCoset,
 };
-use stwo_constraint_framework::TraceLocationAllocator;
 
 use super::Proof;
-use crate::pcs::{FsChannel, PcsStack};
+use crate::lookups::AllLookupElements;
+use crate::pcs::PcsStack;
 use crate::trace::eval::{INTERACTION_TRACE_IDX, ORIGINAL_TRACE_IDX, PREPROCESSED_TRACE_IDX};
-use crate::{lookups::AllLookupElements, side_note::SideNote};
 
 /// One active component's OODS mask, sliced from a real proof's `sampled_values`
 /// for the recursion verifier-AIR — the chip's columns in read order, ready
@@ -57,24 +56,20 @@ pub struct OodsReconstruction {
 /// per-component `claimed_sum`/`log_size`) plus the proof's own composition value.
 ///
 /// This is the read-only reconstruction the recursion harness drives its
-/// auto-witnessing evaluator against; it mirrors the channel-affecting steps of
-/// `verify_with_options_explicit_components` (the preprocessed-root *check*
-/// clones the channel, so it is skipped) followed by the stwo verifier head
-/// (draw `random_coeff`, commit the composition tree, draw `oods_point`).
+/// auto-witnessing evaluator against: the verifier's transcript prefix
+/// ([`super::transcript_prefix`]) followed by the stwo verifier head (draw
+/// `random_coeff`, commit the composition tree, draw `oods_point`).
 ///
-/// PRECONDITION (same as [`verify`](super::verify)): `side_note` must be in the prover-left
-/// state (`closing_chip_active` set), so the boundary-state mix matches the
-/// prover's transcript — else the drawn challenges diverge and the returned OODS
-/// data is silently wrong. This is a recursion-harness reconstruction, NOT a
-/// trust boundary: it assumes a well-formed proof (its `component_mask` popcount
-/// equals `log_sizes`/`claimed_sums` length, and an 8-column composition tree).
-pub fn reconstruct_oods_for_recursion(proof: &Proof, side_note: &SideNote) -> OodsReconstruction {
+/// This is a recursion-harness reconstruction, NOT a trust boundary: it
+/// assumes a well-formed proof (its `component_mask` popcount equals
+/// `log_sizes`/`claimed_sums` length, and an 8-column composition tree).
+pub fn reconstruct_oods_for_recursion(proof: &Proof) -> OodsReconstruction {
     let format = crate::proof::proof_format(proof).expect("an admitted proof format");
-    crate::with_stack!(format.channel, Stack => reconstruct_oods_on::<Stack>(proof, side_note),
+    crate::with_stack!(format.channel, Stack => reconstruct_oods_on::<Stack>(proof),
         unbuilt => panic!("format {}'s channel is not built", format.number))
 }
 
-fn reconstruct_oods_on<MC: PcsStack>(proof: &Proof, side_note: &SideNote) -> OodsReconstruction {
+fn reconstruct_oods_on<MC: PcsStack>(proof: &Proof) -> OodsReconstruction {
     use stwo::core::air::Components;
     use stwo::core::circle::CirclePoint;
     use stwo::core::constraints::coset_vanishing;
@@ -88,7 +83,7 @@ fn reconstruct_oods_on<MC: PcsStack>(proof: &Proof, side_note: &SideNote) -> Ood
     let claimed_sums = &proof.claimed_sums;
     let verifier_channel = &mut MC::C::default();
     let commitment_scheme = &mut CommitmentSchemeVerifier::<MC>::new(config);
-    let ctx = recursion_verify_prefix::<MC>(proof, side_note, verifier_channel, commitment_scheme);
+    let ctx = recursion_verify_prefix::<MC>(proof, verifier_channel, commitment_scheme);
     let components = &ctx.components;
     let log_sizes = &ctx.log_sizes;
     let verifier_components = &ctx.verifier_components;
@@ -179,117 +174,70 @@ fn reconstruct_oods_on<MC: PcsStack>(proof: &Proof, side_note: &SideNote) -> Ood
     }
 }
 
-/// The verifier-side state the native-recursion data extraction builds by
-/// replaying the vos-pvm-proof-specific FS-mix prefix of `verify` (the single source of
-/// truth for that load-bearing mix order — see [`recursion_verify_prefix`]).
-struct RecursionVerifyContext<'a> {
-    components: alloc::vec::Vec<&'a dyn crate::framework::MachineComponent>,
+/// The verifier-side state the recursion seams build through the transcript
+/// prefix ([`super::transcript_prefix`]).
+struct RecursionVerifyContext {
+    components: alloc::vec::Vec<&'static dyn crate::framework::MachineComponent>,
     active_indices: alloc::vec::Vec<usize>,
     log_sizes: TreeVec<alloc::vec::Vec<u32>>,
     lookup_elements: AllLookupElements,
-    verifier_components: alloc::vec::Vec<alloc::boxed::Box<dyn Component + 'a>>,
+    verifier_components: alloc::vec::Vec<alloc::boxed::Box<dyn Component>>,
 }
 
 /// The verifier's transcript through the interaction tree's root, on a
-/// well-formed proof: A.1's items 1 to 5 and the interaction commit.
+/// well-formed proof, with the components the proof's mask selects.
 fn recursion_verify_prefix<MC: PcsStack>(
     proof: &Proof,
-    side_note: &SideNote,
     channel: &mut MC::C,
     commitment_scheme: &mut CommitmentSchemeVerifier<MC>,
-) -> RecursionVerifyContext<'static> {
+) -> RecursionVerifyContext {
     let format = crate::proof::proof_format(proof).expect("an admitted proof format");
     let sp = MC::stark(&proof.stark_proof).expect("the proof's channel");
-    let claimed_log_sizes = &proof.log_sizes;
-    let claimed_sums = &proof.claimed_sums;
 
-    // The positional zips below assume `component_mask` popcount ==
-    // log_sizes == claimed_sums; the production verifier enforces this, so
-    // assert it here too rather than silently truncate on a malformed proof.
+    // The positional zips assume `component_mask` popcount == log_sizes ==
+    // claimed_sums; the production verifier enforces this, so assert it here
+    // too rather than silently truncate on a malformed proof.
     let n_active = (proof.component_mask).count_ones() as usize;
     assert_eq!(
         n_active,
-        claimed_log_sizes.len(),
+        proof.log_sizes.len(),
         "component_mask popcount must equal log_sizes length"
     );
     assert_eq!(
         n_active,
-        claimed_sums.len(),
+        proof.claimed_sums.len(),
         "component_mask popcount must equal claimed_sums length"
     );
 
-    // Select components by the PROOF's component_mask, not the side note's
-    // natural-active set: a canonical proof forces every chip (padding
-    // inactive ones), so `active_components_verifier(side_note)` would not
-    // match the proof's trace layout.
+    // Select components by the PROOF's component_mask: a canonical proof
+    // forces every chip (padding inactive ones), so a side note's natural
+    // active set would not match the proof's trace layout.
     let active_indices: alloc::vec::Vec<usize> = (0..crate::chip_idx::COUNT)
         .filter(|&i| proof.component_mask & (1 << i) != 0)
         .collect();
-    let components: alloc::vec::Vec<&dyn crate::framework::MachineComponent> = active_indices
-        .iter()
-        .map(|&i| crate::BASE_COMPONENTS[i] as &dyn crate::framework::MachineComponent)
-        .collect();
-
-    crate::proof::mix_statement_header(
+    let components: alloc::vec::Vec<&'static dyn crate::framework::MachineComponent> =
+        active_indices
+            .iter()
+            .map(|&i| crate::BASE_COMPONENTS[i] as &dyn crate::framework::MachineComponent)
+            .collect();
+    let log_sizes = super::committed_log_sizes(&components, &proof.log_sizes);
+    let prefix = super::transcript_prefix::<MC>(
+        proof,
+        sp,
+        format,
+        &components,
+        &log_sizes,
         channel,
-        format.number,
-        &proof.pcs_config,
-        claimed_log_sizes,
-    );
-
-    let sizes: alloc::vec::Vec<TreeVec<alloc::vec::Vec<u32>>> = components
-        .iter()
-        .zip(claimed_log_sizes)
-        .map(|(c, &ls)| c.trace_sizes(ls))
-        .collect();
-    let mut log_sizes = TreeVec::concat_cols(sizes.into_iter());
-    log_sizes[PREPROCESSED_TRACE_IDX] = components
-        .iter()
-        .zip(claimed_log_sizes)
-        .flat_map(|(c, &ls)| c.preprocessed_trace_sizes(ls))
-        .collect();
-
-    for idx in [PREPROCESSED_TRACE_IDX, ORIGINAL_TRACE_IDX] {
-        commitment_scheme.commit(sp.commitments[idx], &log_sizes[idx], channel);
-    }
-
-    if side_note.closing_chip_active {
-        crate::proof::mix_boundary_states(
-            channel,
-            format.encoding,
-            &proof.initial_state,
-            &proof.final_state,
-        );
-        crate::proof::check_interaction_pow(channel, format, proof.interaction_pow)
-            .expect("the interaction PoW (recursion harness precondition)");
-    }
-
-    let mut lookup_elements = AllLookupElements::default();
-    components
-        .iter()
-        .for_each(|c| c.draw_lookup_elements(&mut lookup_elements, channel.as_ref_channel()));
-
-    let tree_span_provider = &mut TraceLocationAllocator::default();
-    let verifier_components: alloc::vec::Vec<alloc::boxed::Box<dyn Component>> = components
-        .iter()
-        .zip(claimed_sums)
-        .zip(claimed_log_sizes)
-        .map(|((c, cs), &ls)| c.to_component(tree_span_provider, &lookup_elements, ls, *cs))
-        .collect();
-
-    channel.mix_felts(claimed_sums);
-    commitment_scheme.commit(
-        sp.commitments[INTERACTION_TRACE_IDX],
-        &log_sizes[INTERACTION_TRACE_IDX],
-        channel,
-    );
+        commitment_scheme,
+    )
+    .expect("the transcript prefix (recursion harness precondition)");
 
     RecursionVerifyContext {
         components,
         active_indices,
         log_sizes,
-        lookup_elements,
-        verifier_components,
+        lookup_elements: prefix.lookup_elements,
+        verifier_components: prefix.verifier_components,
     }
 }
 
@@ -321,9 +269,8 @@ pub struct RecursionTranscript {
 /// step-by-step replay is cross-checked against.
 ///
 /// Pairs with [`reconstruct_oods_for_recursion`] (same prefix, returns the OODS
-/// masks + scalars). PRECONDITION: `side_note` prover-left. Panics if the proof
-/// fails to verify (recursion harness assumes a valid proof).
-pub fn record_canonical_transcript(proof: &Proof, side_note: &SideNote) -> RecursionTranscript {
+/// masks + scalars). Panics if the proof fails to verify (recursion harness assumes a valid proof).
+pub fn record_canonical_transcript(proof: &Proof) -> RecursionTranscript {
     use alloc::rc::Rc;
     use core::cell::RefCell;
 
@@ -331,7 +278,7 @@ pub fn record_canonical_transcript(proof: &Proof, side_note: &SideNote) -> Recur
     let channel = &mut crate::poseidon2::Poseidon2M31Channel::recording(recorder.clone());
     let commitment_scheme =
         &mut CommitmentSchemeVerifier::<crate::poseidon2::P2MerkleChannel>::new(proof.pcs_config);
-    let ctx = recursion_verify_prefix(proof, side_note, channel, commitment_scheme);
+    let ctx = recursion_verify_prefix(proof, channel, commitment_scheme);
     let components_ref: alloc::vec::Vec<&dyn Component> =
         ctx.verifier_components.iter().map(|c| &**c).collect();
 
@@ -440,9 +387,9 @@ pub struct DeepBatch {
 /// captures from the real stwo `verify` (cross-checked equal in the gate test), so
 /// the captured challenges are exactly what the proof was produced under.
 ///
-/// PRECONDITION: `side_note` prover-left. Panics if any validation fails (the
-/// recursion harness assumes a well-formed, valid proof).
-pub fn extract_recursion_data(proof: &Proof, side_note: &SideNote) -> RecursionData {
+/// Panics if any validation fails (the recursion harness assumes a
+/// well-formed, valid proof).
+pub fn extract_recursion_data(proof: &Proof) -> RecursionData {
     use alloc::rc::Rc;
     use core::cell::RefCell;
     use core::iter::zip;
@@ -461,7 +408,7 @@ pub fn extract_recursion_data(proof: &Proof, side_note: &SideNote) -> RecursionD
     let channel = &mut crate::poseidon2::Poseidon2M31Channel::recording(recorder.clone());
     let commitment_scheme =
         &mut CommitmentSchemeVerifier::<crate::poseidon2::P2MerkleChannel>::new(config);
-    let ctx = recursion_verify_prefix(proof, side_note, channel, commitment_scheme);
+    let ctx = recursion_verify_prefix(proof, channel, commitment_scheme);
     let prefix_len = recorder.borrow().len();
 
     // ── stwo verifier head (verifier.rs `verify_ex`), replicated via pub calls ─

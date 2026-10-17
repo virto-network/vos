@@ -933,21 +933,19 @@ where
     // proof is so tamper-evident, and the verifier's boundary binding, which
     // recomputes the boundary chips' claimed sums from the shipped states
     // with the drawn challenges, binds them against a from-scratch prover
-    // (see `boundary_binding`). Chip-isolated harnesses without the closing
-    // chip mix nothing, matching their `component_mask = 0` proofs.
+    // (see `boundary_binding`). Every proof mixes them, chip-isolated
+    // harnesses' too, so the verifier replays one transcript prefix.
+    crate::proof::mix_boundary_states(
+        prover_channel,
+        format.encoding,
+        &initial_state,
+        &final_state,
+    );
     let mut interaction_pow = 0;
-    if side_note.closing_chip_active {
-        crate::proof::mix_boundary_states(
-            prover_channel,
-            format.encoding,
-            &initial_state,
-            &final_state,
-        );
-        let bits = format.interaction_pow_bits();
-        if bits > 0 {
-            interaction_pow = <SimdBackend as GrindOps<MC::C>>::grind(prover_channel, bits);
-            prover_channel.mix_u64(interaction_pow);
-        }
+    let bits = format.interaction_pow_bits();
+    if bits > 0 {
+        interaction_pow = <SimdBackend as GrindOps<MC::C>>::grind(prover_channel, bits);
+        prover_channel.mix_u64(interaction_pow);
     }
 
     let mut lookup_elements = AllLookupElements::default();
