@@ -101,8 +101,11 @@ pub enum Column {
     /// 1 iff this is a per-page closing read (the §2 boundary injection),
     /// produced only by MemoryPageChip; 0 for every step / precompile /
     /// ts=0-write entry.  Part of the logup tuple (so producers and consumer
-    /// agree) and gates the group-end constraint.
+    /// agree) and gates the group-end constraint.  `#[mask_next_row]`: an
+    /// unreadable page's group goes from its start straight to its closing
+    /// read.
     #[size = 1]
+    #[mask_next_row]
     IsClosing,
     /// BOUND helper: `IsGroupStart = is_real_next · (1 − IsSameAddrNext)` — 1
     /// iff the NEXT ledger row begins a new address group (next row real and a
@@ -116,6 +119,26 @@ pub enum Column {
     /// read, so every accessed address lands in a listed page (design §2).
     #[size = 1]
     IsGroupEnd,
+    /// 1 iff this real row starts its address group: the previous row's
+    /// `IsGroupStart`.  `#[mask_next_row]` so that row can set it.
+    #[size = 1]
+    #[mask_next_row]
+    IsStart,
+    /// The address's page is readable (its permission 1 or 2), constant
+    /// along the group.
+    #[size = 1]
+    #[mask_next_row]
+    Readable,
+    /// The address's page is writable (its permission 2), constant along
+    /// the group.
+    #[size = 1]
+    #[mask_next_row]
+    Writable,
+    /// BOUND helper `IsStart · (Readable + Writable)`: the page's
+    /// permission on its group's start, the ts=0 write MemoryPageChip
+    /// produces with it, and 0 on every other row.
+    #[size = 1]
+    PermissionH,
     // Read-consistency uses an unconditional
     // `(1 - is_write) · (value - prev_value) = 0` constraint (no gating
     // helper column): padding rows have value=0 and prev_value=0, so the
@@ -329,13 +352,56 @@ impl BuiltInComponent for MemoryChip {
         // Group end: the last real row of every address group is a closing read.
         eval.add_constraint(is_group_end[0].clone() * (E::F::one() - is_closing[0].clone()));
 
+        // ── Page permissions ──────────────────────────────────────────────
+        // Every address group starts with its page's ts=0 write, which
+        // MemoryPageChip produces carrying the page's proven permission
+        // (`2·permission` in the tuple's last field; no other producer
+        // emits ts = 0). The group holds it, and every row after the start
+        // obeys it: a write needs a writable page; an unreadable page's
+        // start is followed by its closing read, so no step, BLAKE2b or
+        // witness-input access lands in it.
+        let is_start = crate::trace::trace_eval!(trace_eval, Column::IsStart);
+        let is_start_next = crate::trace::trace_eval_next_row!(trace_eval, Column::IsStart);
+        let readable = crate::trace::trace_eval!(trace_eval, Column::Readable);
+        let readable_next = crate::trace::trace_eval_next_row!(trace_eval, Column::Readable);
+        let writable = crate::trace::trace_eval!(trace_eval, Column::Writable);
+        let writable_next = crate::trace::trace_eval_next_row!(trace_eval, Column::Writable);
+        let is_closing_next = crate::trace::trace_eval_next_row!(trace_eval, Column::IsClosing);
+        let permission = crate::trace::trace_eval!(trace_eval, Column::PermissionH);
+        for flag in [&is_start, &readable, &writable] {
+            eval.add_constraint(flag[0].clone() * (flag[0].clone() - E::F::one()));
+        }
+        eval.add_constraint(writable[0].clone() * (E::F::one() - readable[0].clone()));
+        eval.add_constraint(is_start_next[0].clone() - is_group_start[0].clone());
+        eval.add_constraint(
+            permission[0].clone()
+                - is_start[0].clone() * (readable[0].clone() + writable[0].clone()),
+        );
+        eval.add_constraint(
+            is_same_addr[0].clone() * (readable_next[0].clone() - readable[0].clone()),
+        );
+        eval.add_constraint(
+            is_same_addr[0].clone() * (writable_next[0].clone() - writable[0].clone()),
+        );
+        eval.add_constraint(
+            is_same_addr[0].clone()
+                * (E::F::one() - readable[0].clone())
+                * (E::F::one() - is_closing_next[0].clone()),
+        );
+        eval.add_constraint(
+            is_write[0].clone()
+                * (E::F::one() - is_start[0].clone())
+                * (E::F::one() - writable[0].clone()),
+        );
+
         // Consumer lookup (negative multiplicity)
-        // Byte-level tuple: (addr[4], value[1], timestamp[8], is_write[1], is_closing[1])
+        // Byte-level tuple: (addr[4], value[1], timestamp[8], is_write[1],
+        // is_closing + 2·permission[1])
         let mut tuple: Vec<E::F> = address.to_vec();
         tuple.push(value[0].clone());
         tuple.extend_from_slice(&timestamp);
         tuple.push(is_write[0].clone());
-        tuple.push(is_closing[0].clone());
+        tuple.push(is_closing[0].clone() + permission[0].clone() + permission[0].clone());
 
         eval.add_to_relation(RelationEntry::new(
             lookup_elements,
@@ -744,6 +810,21 @@ impl BuiltInProverComponent for MemoryChip {
             let is_closing = closing_ts != 0 && entry.timestamp == closing_ts;
             trace.fill_columns(row, is_closing, Column::IsClosing);
 
+            // The page's permission, as MemoryPageChip proves it, held
+            // along the address's group; on its start, also the tuple's.
+            let permission = side_note
+                .memory_layout
+                .permission(entry.address / crate::page_merkle::PAGE_SIZE as u32);
+            trace.fill_columns(row, permission >= 1, Column::Readable);
+            trace.fill_columns(row, permission == 2, Column::Writable);
+            let is_start = row == 0 || entries[row - 1].address != entry.address;
+            trace.fill_columns(row, is_start, Column::IsStart);
+            trace.fill_columns(
+                row,
+                if is_start { permission } else { 0 },
+                Column::PermissionH,
+            );
+
             addrs[row] = entry.address;
             keys[row] = 2 * entry.timestamp + u64::from(entry.is_write);
             same_addr[row] = same_addr_next;
@@ -815,23 +896,41 @@ impl BuiltInProverComponent for MemoryChip {
         let timestamp = crate::trace::original_base_column!(component_trace, Column::Timestamp);
         let is_write = crate::trace::original_base_column!(component_trace, Column::IsWrite);
         let is_closing = crate::trace::original_base_column!(component_trace, Column::IsClosing);
+        let permission = crate::trace::original_base_column!(component_trace, Column::PermissionH);
 
-        // Byte-level tuple: (addr[4], value[1], timestamp[8], is_write[1], is_closing[1])
-        let mut tuple: Vec<_> = address.to_vec();
-        tuple.push(value[0].clone());
-        tuple.extend_from_slice(&timestamp);
-        tuple.push(is_write[0].clone());
-        tuple.push(is_closing[0].clone());
+        // Byte-level tuple: (addr[4], value[1], timestamp[8], is_write[1],
+        // is_closing + 2·permission[1])
+        let (address, value, timestamp, is_write, is_closing, permission) = (
+            address.clone(),
+            value.clone(),
+            timestamp.clone(),
+            is_write.clone(),
+            is_closing.clone(),
+            permission.clone(),
+        );
 
         // Consumer side (negative multiplicity)
-        logup.add_to_relation_with(
+        logup.add_to_relation_computed(
             mem_lookup,
             [is_pad[0].clone()],
             |[pad]| {
                 use stwo::prover::backend::simd::m31::PackedBaseField;
                 (-(PackedBaseField::one() - pad)).into()
             },
-            &tuple,
+            15,
+            move |v| {
+                let mut tuple = Vec::with_capacity(15);
+                for limb in &address {
+                    tuple.push(limb.at(v));
+                }
+                tuple.push(value[0].at(v));
+                for limb in &timestamp {
+                    tuple.push(limb.at(v));
+                }
+                tuple.push(is_write[0].at(v));
+                tuple.push(is_closing[0].at(v) + permission[0].at(v) + permission[0].at(v));
+                tuple
+            },
         );
 
         logup.finalize()

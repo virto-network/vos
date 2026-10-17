@@ -683,3 +683,106 @@ lands in a group whose page proved the permission it needs, with no new
 lookup, no new relation, and no change to the image root. Cost: on
 MemoryPageChip 8 preprocessed and 46 main columns (4 selectors, the two
 bounds, 40 bits), on MemoryChip 4 main columns, no interaction columns.
+
+Out of this binding: refine machine slices, whose inner machines change
+their pages' permissions at run time (the `pages` host call); their side
+notes keep the all-writable layout. A layout per slice, or a permission
+that a page's history carries, would be their binding.
+
+### The holes, each before and after (format 30, Poseidon2 31)
+
+Every gate ran first on the unfixed AIR at 0dc9ba45: each forgery
+ACCEPTED (the gate failed with `SOUNDNESS GAP`); after the fix, REFUSED.
+A gate's forgery edits the honest trace as a forger would, consistent with
+every constraint that does not bind the column it changes; a lookup's
+refusal is checked against every chip's constraints and the whole trace's
+logup balance (`harness::base_components`, debug-internals).
+
+- **H-CARRY** (critical): Add/Sub carries were free field elements, so
+  any result solved its byte equations. Now bits on every row.
+  `cpu_soundness_gate::an_add_s_carries_are_bits` (Add64 100 + 7 → 999).
+- **H-REGSLOT** (critical): the merged read slots `Ts1..Ts3` consumed any
+  read, unordered. Gone: each ledger row consumes one access (27 columns
+  and three emissions fewer). `register_ledger_gate::a_read_is_not_merged_into_another`
+  ACCEPTED before; after, the forgery has no column to stand in.
+- **H-REGPAD** (critical): padding switched the sortedness gadget off,
+  and a run after it took a free `PrevValue`. A chain of same-register rows
+  now starts at its register's ts = 0 write (`ChainStartH`), one per
+  register; the auditor's suffix-padding rule plus write-first rule needs a
+  preprocessed first-row column, this needs none and is MemoryChip's rule.
+  `a_read_follows_its_register_s_writes` (a stale read of φ2 after a
+  padding row).
+- **H-PADEMIT** (critical): a padding row's flags were free, so it could
+  emit register, memory, BLAKE2b and witness tuples; `IsPadding` was not a
+  bit. Now `IsPadding` is a bit and a padding row's ten flag bytes are
+  zero; the byte-to-bits lookups run on every row (multiplicity 1, the
+  zero tuple counted per padding row), so every flag is pinned there, and
+  the memory-width shape is ungated, zeroing the active bytes; the
+  precompile selectors and the result write follow. Cheaper than gating
+  each of the ~20 emission multiplicities, and it covers any later gate.
+  `a_padding_row_emits_nothing` (φ2 := 100 at ts 1 from a padding row),
+  `padding_is_a_bit` (Add64 with `IsPadding = 2`, its realness −1).
+- **H-BREQ** (critical): equality was bound one way. `EqFlag` is now the
+  operands' equality both ways on compare and branch rows: the sum of
+  squared byte differences, below 2^20, and its inverse; BranchEq/BranchNe
+  take it as their condition. A branch whose target is its fallthrough
+  records `BranchTaken` as its condition, which the fill now honours
+  (before, the step's "pc moved" bit stood there, which the strict
+  Lt/Ge/Le/Gt constraints refused for a true condition).
+  `an_equal_branch_eq_is_taken`, `an_equal_branch_ne_falls_through`,
+  `equal_operands_are_equal` (BranchLeUImm 42 ≤ 42 not taken);
+  `control_flow_negative` gains the auditor's end-to-end forgeries.
+- **H-MINMAX** (high): MinS/MaxS results were free. One column,
+  `MinMaxLtFlag` (the signed less-than on their rows, the unsigned
+  otherwise), feeds the MinU/MaxU helpers, whose result constraints now
+  cover the signed rows; the auditor's 16 helper columns are not needed.
+  `a_signed_min_is_its_lesser_operand`, `a_signed_max_is_its_greater_operand`.
+- **H-STIMM64** (high): an 8-byte immediate store's high word was free.
+  `ImmYBytes` and ProgramMemory's `ImmYCanon` carry imm_y's fifth byte, its
+  sign byte (the program-memory tuple 37 limbs), and MemValue[4..8] equals
+  it. `a_store_immediate_s_high_word_is_the_instruction_s`.
+- **H-TRAPPC** (high): a Trap's NextPc, a segment's final pc, was free.
+  It stays at its pc. `a_trap_stays_at_its_pc` (a panic presented at the
+  halt address).
+- **H-NOOP** (medium): ProgramMemory served its zero tuple at non-start
+  pcs. A preprocessed `IsInstruction` refuses them any multiplicity.
+  `only_an_instruction_start_is_fetched`.
+- **L-TSLIMB** (low): NextTimestamp's limbs are Range256-checked (8
+  lookups per row, kept last). `a_timestamp_s_limbs_are_bytes` (the limb
+  256, a withheld carry; checked against every chip and the logup balance).
+- **L-PCCARRY** (low): PcCarry bits. `a_pc_carry_is_a_bit`.
+- **L-PHI7, G4-5** (low): `Phi7Bool` tests the sum of φ10's bytes (zero
+  exactly when the register is), not its field reduction; `Phi7Inv` one
+  column. `cpu_completeness::a_compression_flag_of_the_modulus_proves`
+  (φ10 = 2^31 − 1, unprovable before).
+- **L-ISWRITE** (low): the register ledger's `IsWrite` is a bit.
+- **G4-4** (medium): a BLAKE2b call's φ7/φ8 high bytes are zero.
+  `a_compression_s_pointers_are_32_bit`.
+- **G2-1** (high): the design above. `page_permission_gate::a_store_to_a_read_only_page_is_refused`
+  (the auditor's: a store to a read-only and to an unmapped page, run on a
+  writable one; ACCEPTED before, both REFUSED after, and the writable
+  layout proves under another program identity),
+  `a_page_lies_in_the_region_it_claims`, `a_read_of_a_read_only_page_proves`.
+
+**Completeness:**
+
+- **C-IMMALT**, fixed: the ImmAlt shifts swap their operands as RotR's
+  does (`IsRotateRImmAlt` is now `IsImmAlt`, set on all eight).
+  `cpu_completeness::imm_alt_{left,right}_shifts_prove` (the auditor's
+  `5 << 3` refused before).
+- Branches to their fallthrough, fixed (above):
+  `branches_to_their_fallthrough_prove`.
+- **C-DJUMP**, recorded: an invalid dynamic jump (odd, zero or past the
+  table) panics on the machine but has no `(addr, target)` entry, so its
+  step cannot be proven. A kernel ends at a halt (`trace_kernel` refuses
+  any other exit), so no kernel proof needs it; proving it would need a
+  terminal selector whose address provably lies outside the table (odd,
+  or above `2·len`), a comparison against the table's length.
+- The register ledger's 28-bit order delta still caps a register idle for
+  2^27 steps (G1), as the memory ledger's does (G2-5).
+
+**Vacuous negatives replaced:** `forge_two_reg_result` (bitmanip's
+negatives) now carries the forged result through the run, so the ledger
+accepts it and only the operation's constraints can refuse it; all 14 are
+still refused. `forge_three_reg_result` (alu_negative) is track ARITH's.
+The `padding_is_a_bit`, carry and branch gates edit exactly their column.

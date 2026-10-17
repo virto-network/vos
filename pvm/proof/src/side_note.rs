@@ -134,6 +134,11 @@ pub struct SideNote {
     /// unconditionally active and their preprocessed traces are row-index pure).
     #[cfg(feature = "prover")]
     pub memory_pages: Option<MemoryPagePayload>,
+    /// The pages the program may touch, and how: `MemoryPageChip`'s
+    /// preprocessed regions, so part of its proof's program identity.
+    /// Every page writable unless a layout is attached
+    /// ([`Self::with_memory_layout`]), as a kernel's is.
+    pub memory_layout: crate::chips::memory_page::MemoryLayout,
 }
 
 /// The chain-side trace holder: everything a chain pass needs from a traced
@@ -166,6 +171,8 @@ pub struct CompactTrace {
     /// `SideNote` carries them (parallel 1:1, ts-ascending).
     pub blake2b_calls: Vec<crate::chips::blake2b::Blake2bCall>,
     pub blake2b_mem_ops: Vec<crate::core::tracing::Blake2bMemOp>,
+    /// The pages the program may touch (program-static).
+    pub memory_layout: crate::chips::memory_page::MemoryLayout,
 }
 
 impl CompactTrace {
@@ -183,7 +190,8 @@ impl CompactTrace {
         let steps = expand_steps(&self.steps, self.initial_regs);
         let mut sn = SideNote::new(steps, self.code, self.bitmask)
             .with_memory(self.initial_memory)
-            .with_jump_table(self.jump_table);
+            .with_jump_table(self.jump_table)
+            .with_memory_layout(self.memory_layout);
         sn.blake2b_calls = self.blake2b_calls;
         sn.blake2b_mem_ops = self.blake2b_mem_ops;
         sn
@@ -369,6 +377,7 @@ impl SideNote {
             divrem_entries: Vec::new(),
             #[cfg(feature = "prover")]
             memory_pages: None,
+            memory_layout: Default::default(),
         }
     }
 
@@ -453,6 +462,12 @@ impl SideNote {
     pub(crate) fn with_shared_jump_table(mut self, jump_table: Arc<[u32]>) -> Self {
         self.jump_table_counts = vec![0u32; jump_table.len()];
         self.jump_table = jump_table;
+        self
+    }
+
+    /// Attach the program's layout: the pages it may touch, and how.
+    pub fn with_memory_layout(mut self, layout: crate::chips::memory_page::MemoryLayout) -> Self {
+        self.memory_layout = layout;
         self
     }
 

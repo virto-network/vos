@@ -1,19 +1,29 @@
 #![cfg(feature = "debug-internals")]
 
 //! Negative AIR gates for page permissions: a proof's run is the run on
-//! its program's pages, whose permissions it carries. A store to a
-//! read-only page, or any access to an unmapped page, faults on the
-//! machine; its run continued on a machine with that page writable is
-//! refused.
+//! its program's pages, whose permissions its program identity carries
+//! (MemoryPageChip's preprocessed regions). A store to a read-only page, or
+//! any access to an unmapped page, faults on the machine; its run continued
+//! on a machine with that page writable is refused, and so is a page
+//! claiming a region it does not lie in.
 
+use stwo::core::fields::m31::BaseField;
 use vos_pvm::instruction::Opcode;
 use vos_pvm::interpreter::{Interpreter, PERM_NONE, PERM_RO, PERM_RW};
 use vos_pvm::{ExitReason, PVM_REGISTER_COUNT, PVM_ZONE_SIZE};
+use vos_pvm_proof::AirColumn;
 use vos_pvm_proof::SideNote;
+use vos_pvm_proof::chips::MemoryPageChip;
+use vos_pvm_proof::chips::memory_page::{Column as Page, MemoryLayout, PageRange};
 use vos_pvm_proof::core::tracing::TracingPvm;
+use vos_pvm_proof::framework_access::AllLookupElements;
+use vos_pvm_proof::harness::MachineProverComponent;
+use vos_pvm_proof::recursion_pcs::ProverChannel;
+use vos_pvm_proof::trace::component::ComponentTrace;
 
 /// A byte in the middle of page 17, above the protected low zone.
 const A: u32 = PVM_ZONE_SIZE + 0x1000 + 0x800;
+const PAGE: u32 = A >> 12;
 const V: u8 = 0x42;
 
 /// `StoreIndU8 φ0 → [φ1]`, `LoadIndU8 [φ1 + 8] → φ2`, a trap, with φ0 = V
@@ -49,13 +59,50 @@ fn machine(permission: u8) -> (Interpreter, Vec<u8>, Vec<u8>, Vec<u8>) {
     );
     assert!(
         pvm.memory_mut()
-            .set_page_range((A / 4096) as usize, 1, permission)
+            .set_page_range(PAGE as usize, 1, permission)
     );
     (pvm, code, bitmask, memory)
 }
 
+/// Every page writable but A's, which is read-only (`readable`) or
+/// unmapped.
+fn layout(readable: bool) -> MemoryLayout {
+    let page = |first, end| PageRange { first, end };
+    MemoryLayout {
+        regions: [
+            if readable {
+                page(PAGE, PAGE + 1)
+            } else {
+                page(0, 0)
+            },
+            page(0, 0),
+            page(0, PAGE),
+            page(PAGE + 1, 1 << 20),
+        ],
+    }
+}
+
+/// The run on a machine with A's page writable, its trace with `layout`.
+fn writable_run(layout: MemoryLayout) -> SideNote {
+    let (pvm, code, bitmask, memory) = machine(PERM_RW);
+    let mut tracer = TracingPvm::new(pvm);
+    assert_eq!(tracer.run(), ExitReason::Panic);
+    SideNote::new(tracer.into_trace(), code, bitmask)
+        .with_memory(memory)
+        .with_memory_layout(layout)
+}
+
+fn refused(mut side_note: SideNote) -> bool {
+    match vos_pvm_proof::prove(&mut side_note) {
+        Err(_) => true,
+        Ok(proof) => vos_pvm_proof::verify(proof, &side_note).is_err(),
+    }
+}
+
 /// The store faults on a read-only or unmapped page; the run on a machine
-/// with the page writable, proven, is refused.
+/// with the page writable, proven under the program's layout, is refused.
+/// Under a layout with the page writable it proves, with another program
+/// identity.
 #[test]
 fn a_store_to_a_read_only_page_is_refused() {
     for permission in [PERM_RO, PERM_NONE] {
@@ -63,13 +110,171 @@ fn a_store_to_a_read_only_page_is_refused() {
         let mut tracer = TracingPvm::new(pvm);
         assert_eq!(tracer.run(), ExitReason::PageFault(A & !0xfff));
     }
-    let (pvm, code, bitmask, memory) = machine(PERM_RW);
+    for readable in [true, false] {
+        assert!(
+            refused(writable_run(layout(readable))),
+            "SOUNDNESS GAP: the run on a writable page proved (readable: {readable})"
+        );
+    }
+    let mut side_note = writable_run(MemoryLayout::writable());
+    let proof = vos_pvm_proof::prove(&mut side_note).expect("proving failed");
+    vos_pvm_proof::verify(proof, &side_note).expect("verification failed");
+    let regions = |layout: MemoryLayout| -> Vec<Vec<BaseField>> {
+        let mut side_note = writable_run(layout);
+        vos_pvm_proof::prepare_side_note_for_verification(&mut side_note);
+        side_note.ingest_memory_pages();
+        MemoryPageChip
+            .generate_component_trace(&mut side_note)
+            .preprocessed_trace
+            .iter()
+            .map(|column| column.as_slice().to_vec())
+            .collect()
+    };
+    assert_ne!(
+        regions(MemoryLayout::writable()),
+        regions(layout(true)),
+        "a layout is part of the program identity"
+    );
+}
+
+/// A read of a read-only page proves: `LoadIndU8 [φ1] → φ2`.
+#[test]
+fn a_read_of_a_read_only_page_proves() {
+    let code = vec![
+        Opcode::LoadIndU8 as u8,
+        0x12,
+        0,
+        0,
+        0,
+        0,
+        Opcode::Trap as u8,
+    ];
+    let bitmask = vec![1, 0, 0, 0, 0, 0, 1];
+    let mut registers = [0u64; PVM_REGISTER_COUNT];
+    registers[1] = u64::from(A);
+    let mut memory = vec![0u8; 4 * 1024 * 1024];
+    memory[A as usize] = V;
+    let mut pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        registers,
+        memory.clone(),
+        10_000,
+    );
+    assert!(pvm.memory_mut().set_page_range(PAGE as usize, 1, PERM_RO));
     let mut tracer = TracingPvm::new(pvm);
     assert_eq!(tracer.run(), ExitReason::Panic);
-    let mut side_note = SideNote::new(tracer.into_trace(), code, bitmask).with_memory(memory);
-    let refused = match vos_pvm_proof::prove(&mut side_note) {
-        Err(_) => true,
-        Ok(proof) => vos_pvm_proof::verify(proof, &side_note).is_err(),
+    let steps = tracer.into_trace();
+    assert_eq!(steps[0].regs_after[2], u64::from(V));
+    let mut side_note = SideNote::new(steps, code, bitmask)
+        .with_memory(memory)
+        .with_memory_layout(layout(true));
+    let proof = vos_pvm_proof::prove(&mut side_note).expect("proving failed");
+    vos_pvm_proof::verify(proof, &side_note).expect("verification failed");
+}
+
+fn assert_chip<C: MachineProverComponent>(chip: &C, trace: &ComponentTrace, side_note: &SideNote) {
+    let mut lookup_elements = AllLookupElements::default();
+    let channel = &mut ProverChannel::default();
+    chip.draw_lookup_elements(&mut lookup_elements, channel);
+    let (interaction_trace, claimed_sum) =
+        chip.generate_interaction_trace(trace.clone(), side_note, &lookup_elements);
+    chip.debug_assert_constraints(trace, &interaction_trace, &lookup_elements, claimed_sum);
+}
+
+/// Stwo's assertion evaluator aborts on a failed constraint: the forged
+/// trace runs in a child process, and refusal is its failure. `true` in the
+/// child, which goes on to the forgery.
+fn in_child(test_name: &str) -> bool {
+    const CHILD: &str = "VOS_PAGE_PERMISSION_GATE_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        return true;
+    }
+    let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .arg("--exact")
+        .arg(test_name)
+        .env(CHILD, "1")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("run the forged trace in a child process");
+    assert!(
+        !status.success(),
+        "SOUNDNESS GAP: the forged trace was accepted"
+    );
+    false
+}
+
+fn stored(log_size: u32, row: usize) -> usize {
+    let rows: Vec<BaseField> = (0..1u32 << log_size).map(BaseField::from).collect();
+    let order = vos_pvm_proof::trace::utils::finalize_columns(vec![rows]);
+    order[0]
+        .as_slice()
+        .iter()
+        .position(|&at| at == BaseField::from(row as u32))
+        .expect("a row of the trace")
+}
+
+fn get(trace: &ComponentTrace, offset: usize, row: usize) -> BaseField {
+    trace.original_trace[offset].as_slice()[stored(trace.log_size, row)]
+}
+
+fn set(trace: &mut ComponentTrace, offset: usize, row: usize, value: u32) {
+    let at = stored(trace.log_size, row);
+    trace.original_trace[offset].as_mut_slice()[at] = BaseField::from(value);
+}
+
+/// A's read-only page claiming the writable region below it, `[0, 17)`:
+/// its distance to that region's end, `16 − 17`, is negative, and so are
+/// the bits standing for it.
+#[test]
+fn a_page_lies_in_the_region_it_claims() {
+    let mut side_note = writable_run(layout(true));
+    vos_pvm_proof::prepare_side_note_for_verification(&mut side_note);
+    side_note.ingest_memory_pages();
+    let mut trace = MemoryPageChip.generate_component_trace(&mut side_note);
+    assert_chip(&MemoryPageChip, &trace, &side_note);
+    if !in_child("a_page_lies_in_the_region_it_claims") {
+        return;
+    }
+    let index = |trace: &ComponentTrace, row: usize| -> u32 {
+        (0..20)
+            .map(|bit| get(trace, Page::IdxBits.offset() + bit, row).0 << bit)
+            .sum()
     };
-    assert!(refused, "SOUNDNESS GAP: the run on a writable page proved");
+    let rows: Vec<usize> = (0..1usize << trace.log_size)
+        .filter(|&row| {
+            index(&trace, row) == PAGE
+                && get(&trace, Page::IsReal.offset(), row) == BaseField::from(1u32)
+        })
+        .collect();
+    assert_eq!(rows.len(), 32, "the page's 32 blocks");
+    for row in rows {
+        assert_eq!(
+            get(&trace, Page::RegionSelect.offset(), row),
+            BaseField::from(1u32)
+        );
+        set(&mut trace, Page::RegionSelect.offset(), row, 0);
+        set(&mut trace, Page::RegionSelect.offset() + 2, row, 1);
+        set(&mut trace, Page::RegionFirstH.offset(), row, 0);
+        set(&mut trace, Page::RegionEndH.offset(), row, PAGE);
+        let from_first = PAGE;
+        let to_end = PAGE.wrapping_sub(1).wrapping_sub(PAGE);
+        for bit in 0..20 {
+            set(
+                &mut trace,
+                Page::FromFirstBits.offset() + bit,
+                row,
+                (from_first >> bit) & 1,
+            );
+            set(
+                &mut trace,
+                Page::ToEndBits.offset() + bit,
+                row,
+                (to_end >> bit) & 1,
+            );
+        }
+    }
+    assert_chip(&MemoryPageChip, &trace, &side_note);
 }
