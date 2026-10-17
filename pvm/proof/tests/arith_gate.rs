@@ -741,8 +741,8 @@ fn divu64_remainder_not_below_divisor_refused() {
 
 /// `-100 / 7` in 32 bits (-14 rem -2) with the remainder's low word honest
 /// and its high word zeroed: the 32-bit schoolbook and sign chain read the
-/// low word alone, so the remainder must be read as a sign-extended word
-/// somewhere else, or a register of the run could hold either word.
+/// low word alone. Both the `|r| < |d|` chain, which reads the remainder as
+/// a sign-extended word, and the high word's binding to its sign refuse it.
 #[test]
 fn divs32_remainder_high_word_zeroed_refused() {
     let (steps, code, bitmask) = traced_steps(Opcode::DivS32, (-100i32) as u32 as u64, 7);
@@ -815,6 +815,50 @@ fn shar_r64_flag_cleared_refused() {
                     side_note.range256_counts[b as usize] += 1;
                 }
                 side_note.divrem_entries[0] = e;
+            }),
+        )],
+    ));
+}
+
+/// `0x9000_0005 rem 0x10` in 32 bits (5) with the quotient's high word,
+/// which no chain of an unsigned 32-bit row reads, forged to all ones:
+/// only its binding to the low word's sign refuses it.
+#[test]
+fn remu32_quotient_high_word_is_its_sign_extension() {
+    let (steps, code, bitmask) = traced_steps(Opcode::RemU32, 0x9000_0005, 0x10);
+    assert_eq!(steps[0].regs_after[RD], 5);
+    let q = 0xFFFF_FFFF_0900_0000u64;
+    assert_refused(prove_forged(
+        steps,
+        &code,
+        &bitmask,
+        vec![(
+            CPU,
+            producer(move |trace, side_note| {
+                forge_cpu_quotient(trace, side_note, q, 5);
+                rewitness_entry(side_note, (q, 5), None, None);
+            }),
+        )],
+    ));
+}
+
+/// `100 / 7` in 32 bits (14 rem 2) with the remainder's high word forged
+/// to all ones: only its binding to the low word's sign refuses it.
+#[test]
+fn divu32_remainder_high_word_is_its_sign_extension() {
+    let (steps, code, bitmask) = traced_steps(Opcode::DivU32, 100, 7);
+    let q = steps[0].regs_after[RD];
+    assert_eq!(q, 14);
+    let r = 0xFFFF_FFFF_0000_0002u64;
+    assert_refused(prove_forged(
+        steps,
+        &code,
+        &bitmask,
+        vec![(
+            CPU,
+            producer(move |trace, side_note| {
+                forge_cpu_quotient(trace, side_note, q, r);
+                rewitness_entry(side_note, (q, r), None, None);
             }),
         )],
     ));

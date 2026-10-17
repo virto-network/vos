@@ -21,6 +21,8 @@
 //!      signed division, through two's-complement magnitude chains with
 //!      boolean carries over Range256-checked bytes (a 32-bit divisor
 //!      sign-extended). CpuChip pins `sign(r) = sign(b)` when `r ≠ 0`.
+//!   4. On a 32-bit row, the quotient's and remainder's high words are
+//!      their low words' sign extension.
 //!
 //! Lookup tuple (41 limbs): val_b\[8\] + val_d\[8\] + div_quotient\[8\] +
 //! div_remainder\[8\] + sign_bit_b + sign_bit_d + sign_bit_q +
@@ -434,6 +436,23 @@ impl BuiltInComponent for DivRemChip {
                             - carry_in),
                 );
             }
+        }
+
+        // ── A 32-bit row's quotient and remainder ──
+        // The 32-bit chains read the low words alone; the high words, the
+        // result's and the other's, are their low words' sign extension,
+        // so the tuple carries no free byte. (The internal witness's high
+        // positions on such a row, `H[4..8]`, their carries and the
+        // schoolbook carries past 8, enter no chain and no tuple.)
+        for i in 4..WORD_SIZE {
+            eval.add_constraint(
+                is_32bit[0].clone()
+                    * (div_quotient[i].clone() - f255.clone() * sign_bit_q[0].clone()),
+            );
+            eval.add_constraint(
+                is_32bit[0].clone()
+                    * (div_remainder[i].clone() - f255.clone() * sign_bit_r[0].clone()),
+            );
         }
 
         // ── The high half ──

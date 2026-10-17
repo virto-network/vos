@@ -212,7 +212,7 @@ pub const SEGMENT_REFERENCE: SecurityShape = SecurityShape {
     log_composition_degree_bound: 21,
     sampled_values: 9_047,
     max_samples_per_column: 2,
-    constraints: 5_169,
+    constraints: 5_177,
     logup_fractions: 1_553_989_632,
     relation_width: SEGMENT_RELATION_WIDTH,
 };
