@@ -253,9 +253,7 @@ impl Node {
     pub fn run_refine(&self, work: &Work, gas: u64) -> Invocation {
         let arguments = self.arguments(work);
         let gas = match work.batch() {
-            Some(batch) => {
-                gas + vos_wire::defaults::refine_start(batch.inputs.len(), arguments.len())
-            }
+            Some(batch) => gas + vos_wire::defaults::batch_start(batch, arguments.len()),
             None => gas,
         };
         let mut context =

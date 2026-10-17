@@ -73,12 +73,36 @@ pub const DECODE_INPUT: u64 = 6_000;
 /// Gas a refine keeps per byte of its arguments, for decoding them.
 pub const DECODE_BYTE: u64 = 20;
 
+/// Gas a refine keeps per kernel an install of its batch names, for
+/// decoding the kernel's record, its shape among it, past its bytes'
+/// [`DECODE_BYTE`]. Measured by the testkit's
+/// `the_start_reserves_cover_decoding_a_batch`.
+pub const DECODE_KERNEL: u64 = 8_000;
+
 /// What decoding a batch of `inputs` may take, from refine arguments of
-/// `len` bytes: the gas a node gives a refine beyond its batch's
-/// budget, which its steps alone take from. The agent checks that the
-/// budget is left once it has decoded the batch, and traps otherwise.
+/// `len` bytes, when its installs name no kernel, and so a bound for a
+/// batch without installs: the gas a node gives a refine beyond its
+/// batch's budget, which its steps alone take from, is [`batch_start`].
 pub const fn refine_start(inputs: usize, len: usize) -> u64 {
     START_RESERVE + DECODE_INPUT * inputs as u64 + DECODE_BYTE * len as u64
+}
+
+/// What decoding `batch` may take, from refine arguments of `len` bytes:
+/// [`refine_start`], and [`DECODE_KERNEL`] for each kernel its installs
+/// name. The gas a node gives a refine beyond its batch's budget, which
+/// its steps alone take from. The agent checks that the budget is left
+/// once it has decoded the batch, and traps otherwise.
+pub fn batch_start(batch: &crate::batch::Batch, len: usize) -> u64 {
+    use crate::batch::{Admin, Input};
+    let kernels: usize = batch
+        .inputs
+        .iter()
+        .map(|input| match input {
+            Input::Admin(Admin::Install { derivation, .. }) => derivation.kernels.len(),
+            _ => 0,
+        })
+        .sum();
+    refine_start(batch.inputs.len(), len) + DECODE_KERNEL * kernels as u64
 }
 
 /// The least budget of a batch of at most `max_inputs` that dispatches

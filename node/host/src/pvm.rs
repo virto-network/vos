@@ -149,7 +149,7 @@ impl Machines {
         } = self;
         let arguments = RefineArgs::new(u64::from(agent.0), work.encode(), [0; 32]).encode();
         let gas = match work.batch() {
-            Some(batch) => gas + defaults::refine_start(batch.inputs.len(), arguments.len()),
+            Some(batch) => gas + defaults::batch_start(batch, arguments.len()),
             None => gas,
         };
         let programs = Arc::new(AgentPrograms::new(blobs, agent, work));

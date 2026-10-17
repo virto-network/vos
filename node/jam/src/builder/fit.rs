@@ -303,7 +303,7 @@ impl Builder {
             solicit: solicit.to_vec(),
         };
         let payload = Work::encode_package(&package);
-        let start = defaults::refine_start(package.batch.inputs.len(), payload.len() + 64);
+        let start = defaults::batch_start(&package.batch, payload.len() + 64);
         let own = gas::own(&package, &simulation);
         Ok(Prepared {
             gas: package.batch.budget + start + own,

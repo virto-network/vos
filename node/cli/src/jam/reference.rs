@@ -40,7 +40,7 @@ impl Vos {
     pub fn batch(&mut self, batch: &Batch) -> Result<WorkResult, Error> {
         let runner = &self.runner;
         let arguments = runner.arguments(&Work::encode_batch(batch), [0; 32]);
-        let gas = batch.budget + defaults::refine_start(batch.inputs.len(), arguments.len());
+        let gas = batch.budget + defaults::batch_start(batch, arguments.len());
         let reader: Arc<dyn StateReader> = Arc::new(self.state.clone());
         let invocation =
             RefineContext::load_prepared(&runner.program, &arguments, gas, MemoryModel::Auto)

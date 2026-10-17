@@ -445,13 +445,16 @@ fn serving_a_precompile_costs_the_agent_its_bounce() {
 
 /// What a refine spends before its first step, decoding its batch, and on
 /// finishing it, leaves a fifth spare of what a node gives it for them
-/// beyond its budget (`refine_start`): the start, a share for each input and
-/// one for each byte of its arguments. Measured with a budget of nothing, on
-/// batches of many small inputs and of large arguments.
+/// beyond its budget (`batch_start`): the start, a share for each input,
+/// one for each byte of its arguments and one for each kernel its installs
+/// name. Measured with a budget of nothing, on batches of many small
+/// inputs, of large arguments and of installs of the most kernels.
 #[test]
 fn the_start_reserves_cover_decoding_a_batch() {
-    use vos_wire::batch::{Body, Input, Message};
-    use vos_wire::ids::AgentId;
+    use vos_testkit::programs::{derivation, derived, package};
+    use vos_wire::abi::cap::Target;
+    use vos_wire::batch::{Admin, Body, Input, Message};
+    use vos_wire::ids::{AgentId, InstanceId};
     let (actors, node, _, _) = setup();
     let increment = actors.method(COUNTER, "increment");
     let requests = |count: u64, len: usize| -> Vec<Input> {
@@ -475,6 +478,19 @@ fn the_start_reserves_cover_decoding_a_batch() {
             })
             .collect()
     };
+    let wide = derivation(&package("wide"), &derived("wide"));
+    let installs = |count: u32| -> Vec<Input> {
+        (1..=count)
+            .map(|instance| {
+                Input::Admin(Admin::Install {
+                    instance: InstanceId(100 + instance),
+                    derivation: wide.clone(),
+                    roles: vec![],
+                    target: Target::Vos,
+                })
+            })
+            .collect()
+    };
     for (name, inputs) in [
         ("no input", vec![]),
         ("a request", requests(1, 8)),
@@ -482,15 +498,15 @@ fn the_start_reserves_cover_decoding_a_batch() {
         ("256 messages", messages(256, 8)),
         ("a request of 60 KB", requests(1, 60_000)),
         ("16 requests of 60 KB", requests(16, 60_000)),
+        ("6 installs of 33 kernels", installs(6)),
     ] {
-        let count = inputs.len() as u64;
         let work = node.budgeted_work(1, [0; 32], 0, inputs);
         let arguments = node.arguments(&work).len() as u64;
         let invocation = node.run_refine(&work, OUTER_GAS);
         let (result, _) =
             WorkResult::decode(&invocation.output_bounded(cap::OUTPUT).unwrap()).unwrap();
         assert!(result.steps.is_empty(), "{name}: nothing dispatched");
-        let kept = defaults::refine_start(count as usize, arguments as usize);
+        let kept = defaults::batch_start(work.batch().unwrap(), arguments as usize);
         println!("{name}: {} of {kept}", invocation.gas_used);
         assert!(invocation.gas_used <= kept * 4 / 5, "{name}");
     }

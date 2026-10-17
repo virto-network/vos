@@ -116,7 +116,7 @@ pub(crate) fn simulate(
 ) -> Result<Simulation, Error> {
     let payload = Work::encode_batch(batch);
     let arguments = runner.arguments(&payload, [0; 32]);
-    let gas = batch.budget + defaults::refine_start(batch.inputs.len(), arguments.len());
+    let gas = batch.budget + defaults::batch_start(batch, arguments.len());
     let recorder = Arc::new(Recorder {
         view: view.clone(),
         pages,
