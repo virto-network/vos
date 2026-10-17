@@ -2075,8 +2075,15 @@ refactors, a commit each; none changes a constraint.
   - `gadgets`: the leaf sponge, the Merkle node and the transcript, each
     the `vos-pvm-poseidon2` mode it mirrors.
   - Adapted from starkware-libs/proving at `916aefb5` (Apache-2.0): the
-    `Context` (with `finalize_constants` and `circuit_common`'s padding)
-    and the value trait; each file says so, and `NOTICE` lists them.
+    `Context` (`context/mod.rs`, from `circuits`' `context.rs` and
+    `ops.rs`), its idioms (`context/arith.rs`, from `ops.rs`), its
+    finalizing (`context/finalize.rs`, from `context.rs`,
+    `finalize_constants.rs` and `circuit_common`'s `finalize.rs`) and the
+    value trait (`value.rs`, from `ivalue.rs`); each file names its
+    sources and says it was modified (Apache-2.0 §4(b)), and `NOTICE`
+    lists them. `circuit.rs`, `trace.rs`, `prove.rs`, `gadgets.rs` and
+    `vos-recair-air` share upstream's ideas (yields once, public logup
+    terms, a circuit hash over the preprocessed root), not its code.
 - **`vos-final-verifier`** (`pvm/proof/final-verifier`): a skeleton that
   builds the recursion AIR's components, so the dependency graph is
   checked on every target.
@@ -2135,7 +2142,8 @@ refactors, a commit each; none changes a constraint.
   (also with the yields' counts summing right), a yield removed, a
   miscounted yield, multiplicities totalling `p` and a chained row 0;
   `finalize` yields the guesses only `h8` reads and pads with permutations
-  of zero.
+  of zero; a circuit whose wiring fails the check is neither committed
+  nor proved; a multiplicity of magnitude `p` is refused.
 - `modes`: `p2` equals `vos-pvm-poseidon2` in every mode (leaves of 0–21
   values against `LeafSponge`, nodes of either bit against `compress`, a
   path into a guessed root, a transcript's absorptions, draws and PoW
@@ -2145,9 +2153,11 @@ refactors, a commit each; none changes a constraint.
   constraints; an unread message lane on a used wire, a `qm31` operand
   moved with its output, an `h8` accumulator moved with its output, by the
   logup alone (the constraints hold); a `qm31` output and an `h8` sample by
-  the constraints; and a finished proof's claimed sum, claimed sums moved
-  between components, output, interaction PoW, sampled value, log size
-  and format.
+  the constraints; and a finished proof's claimed sum, output,
+  interaction PoW, queried value, log size and format, each for its
+  reason, and its sampled values (per component, main and interaction)
+  and claimed sums moved between components, by the verifier's OODS
+  check.
 - `gates`: the three below.
 - `vos-recair-air`'s unit tests: the designed widths and counts, and
   `p2`'s columns against the permutation.
@@ -2178,6 +2188,51 @@ refactors, a commit each; none changes a constraint.
 - **`just check`** green under `systemd-run` at 14 GiB, `nice -n 10`,
   `CARGO_INCREMENTAL=0`, 8 jobs: 1,037 tests (1,019 at 5.8.0 (B)), the new
   crates' 13 among them; clippy clean on the three crates' targets.
+
+### The review folded
+
+- **Attribution:** `NOTICE` named `src/context.rs`, split since into
+  `context/{mod,arith,finalize}.rs`; `arith.rs` (from `ops.rs`) and
+  `finalize.rs` (from `context.rs`, `finalize_constants.rs` and
+  `circuit_common`'s `finalize.rs`) had no header naming their sources
+  and their modification. Each now has one, `mod.rs` names only what it
+  keeps, and `NOTICE` lists the three files.
+- **No path commits an unchecked circuit:** `circuit_commitment` returns
+  the `WiringError` of `check_wiring` before committing, and `prove`
+  (and `prove_with`) refuses with `ProveError::Wiring`; a Stwo refusal is
+  `ProveError::Stwo`. `circuit::signed` refuses a multiplicity of
+  magnitude `p` or more instead of reducing it.
+- **The refusal tests name their reasons.** Stwo's prover samples the
+  composition polynomial and the trace at the OODS point and refuses a
+  mismatch, so every trace tamper is the prover's refusal
+  (`ConstraintsNotSatisfied`), and `refused` now asserts exactly that. A
+  finished proof's tampers each assert theirs: a claimed sum, the public
+  terms' sum; an output or the interaction PoW, the PoW (the outputs are
+  mixed before it is ground); a queried value, the Merkle root; a log
+  size, another circuit's hash; the format, the format.
+- **The verifier's constraint check is exercised:** an honest proof whose
+  sampled value of one column is edited, in each component's main and
+  interaction trees, and claimed sums moved between components, are
+  refused by Stwo's OODS comparison (DEEP-ALI). An edit moves the
+  transcript, so the redrawn queries' deduplicated count usually differs
+  from the proof's rows and the query-count preflight refuses first; the
+  test raises the edit by 1, 2, … until one passes the preflight
+  [measured: the first try did not, on this small circuit].
+- **`just check`** green after the fold: 1,040 tests (three new).
+
+### Carried to later steps
+
+- **5.10: a `Bit` type for `node`'s direction.** `gadgets::node` takes
+  `bit: Var` and trusts its producer to constrain it: a `p2` row reads
+  the bit as a use, and the `Node` mode's input is linear in `b`, so a
+  non-bit picks a blend of the two orders. A `Bit` newtype only
+  `Context::assert_bit` or a bit decomposition produces would move that
+  trust into the types.
+- **5.9 on: a message wire's unread lanes are not zero.** A `p2` row's
+  message lanes with `act = 0` are yielded (or used) with the wire, but
+  not absorbed: nothing constrains them. A consumer of such a wire reads
+  the prover's choice there and must not assume zero; a partial block's
+  padding comes from `c`, not from the wire.
 
 ### A pre-existing failure, fixed
 

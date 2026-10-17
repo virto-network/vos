@@ -6,8 +6,8 @@ mod common;
 
 use stwo::core::fields::m31::P;
 use stwo::core::fields::qm31::SecureField;
-use vos_recair::circuit::{Entry, WiringError};
-use vos_recair::{Context, NoValue, P2Mode, circuit_commitment, prove, verify};
+use vos_recair::circuit::{Entry, WiringError, signed};
+use vos_recair::{Context, NoValue, P2Mode, ProveError, circuit_commitment, prove, verify};
 
 use common::random_circuit;
 
@@ -27,7 +27,7 @@ fn random_circuits_prove_and_verify() {
             .filter_map(|row| row.mode)
             .collect();
         assert!(seed < 2 || modes.len() >= 5, "seed {seed}: modes {modes:?}");
-        let (_, hash) = circuit_commitment(&finalized.circuit);
+        let (_, hash) = circuit_commitment(&finalized.circuit).expect("the wiring checks");
         let proof = prove(&finalized.circuit, &finalized.witness).expect("proves");
         if let Some(other) = hashes.last() {
             assert!(
@@ -200,4 +200,34 @@ fn the_context_runs_the_check() {
     let last = finalized.witness.p2.last().unwrap();
     assert_eq!(last.input, [SecureField::from(0); 4]);
     assert!(finalized.circuit.p2.last().unwrap().mode.is_none());
+}
+
+/// No path commits a circuit whose wiring fails the check: its commitment
+/// and its proof are refused.
+#[test]
+fn an_unchecked_circuit_is_neither_committed_nor_proved() {
+    let finalized = random_circuit::<SecureField>(3, 300).finalize().unwrap();
+    let mut circuit = finalized.circuit.clone();
+    let (row, operand, address) = a_use(&circuit, 2);
+    circuit.qm31[row].operands[operand] = Entry::FREE;
+    let refusal = WiringError::Unbalanced { address, total: -1 };
+    assert_eq!(circuit_commitment(&circuit).err(), Some(refusal.clone()));
+    match prove(&circuit, &finalized.witness) {
+        Err(ProveError::Wiring(error)) => assert_eq!(error, refusal),
+        other => panic!("proved an unchecked circuit: {:?}", other.map(|_| ())),
+    }
+}
+
+/// A multiplicity's magnitude below `p` is a field element; at `p` it is
+/// refused.
+#[test]
+fn a_multiplicity_is_below_p() {
+    let below = i64::from(P) - 1;
+    assert_eq!(signed(below), -signed(-below));
+    for multiplicity in [i64::from(P), -i64::from(P), i64::from(u32::MAX)] {
+        assert!(
+            std::panic::catch_unwind(|| signed(multiplicity)).is_err(),
+            "{multiplicity}"
+        );
+    }
 }

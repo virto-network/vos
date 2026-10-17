@@ -254,11 +254,15 @@ impl Circuit {
     }
 }
 
-/// A signed multiplicity as a field element.
+/// A signed multiplicity as a field element. Its magnitude is below `p`,
+/// which [`Circuit::check_wiring`] ensures of every entry.
 pub fn signed(multiplicity: i64) -> BaseField {
-    let magnitude = BaseField::from_u32_unchecked(
-        u32::try_from(multiplicity.unsigned_abs()).expect("a multiplicity is below p"),
+    let magnitude = multiplicity.unsigned_abs();
+    assert!(
+        magnitude < u64::from(P),
+        "the multiplicity {multiplicity} is not below p in magnitude"
     );
+    let magnitude = BaseField::from_u32_unchecked(magnitude as u32);
     if multiplicity < 0 {
         -magnitude
     } else {

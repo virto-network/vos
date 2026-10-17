@@ -42,7 +42,7 @@ use vos_recair_air::{
     Components, GateRelation, LOG_CONSTRAINT_EXPANSION, LogSizes, preprocessed_log_sizes,
 };
 
-use crate::circuit::Circuit;
+use crate::circuit::{Circuit, WiringError};
 use crate::context::Witness;
 use crate::trace::{self, Evaluations, MainTrace};
 
@@ -80,6 +80,26 @@ impl From<String> for VerifyError {
     }
 }
 
+/// Why a circuit is not proved.
+#[derive(Clone, Debug)]
+pub enum ProveError {
+    /// The circuit's wiring fails the static check.
+    Wiring(WiringError),
+    /// Stwo refused, as it does a witness that breaks a constraint.
+    Stwo(ProvingError),
+}
+
+impl core::fmt::Display for ProveError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Wiring(error) => write!(f, "the wiring: {error}"),
+            Self::Stwo(error) => write!(f, "Stwo proving: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ProveError {}
+
 /// The format's parameters as the circuit hash takes them.
 fn hashed_params(format: &Format) -> [u32; 6] {
     let params = format.params;
@@ -113,8 +133,10 @@ fn twiddle_log_size(log_sizes: &LogSizes, config: &PcsConfig) -> u32 {
         + config.fri_config.log_blowup_factor
 }
 
-/// The preprocessed tree's root, and the circuit's hash.
-pub fn circuit_commitment(circuit: &Circuit) -> (P2Hash, Digest) {
+/// The preprocessed tree's root, and the circuit's hash, of a circuit whose
+/// wiring checks.
+pub fn circuit_commitment(circuit: &Circuit) -> Result<(P2Hash, Digest), WiringError> {
+    circuit.check_wiring()?;
     let log_sizes = circuit.log_sizes();
     let config = FORMAT.pcs_config();
     let twiddles = SimdBackend::precompute_twiddles(
@@ -127,7 +149,7 @@ pub fn circuit_commitment(circuit: &Circuit) -> (P2Hash, Digest) {
     builder.extend_evals(preprocessed_evaluations(circuit));
     builder.commit(&mut Poseidon2M31Channel::default());
     let root = scheme.roots()[0];
-    (root, circuit_hash_of(&log_sizes, &root))
+    Ok((root, circuit_hash_of(&log_sizes, &root)))
 }
 
 fn preprocessed_evaluations(circuit: &Circuit) -> Evaluations {
@@ -139,11 +161,8 @@ fn preprocessed_evaluations(circuit: &Circuit) -> Evaluations {
         .collect()
 }
 
-/// Proves `witness` over `circuit`.
-pub fn prove(
-    circuit: &Circuit,
-    witness: &Witness<SecureField>,
-) -> Result<RecairProof, ProvingError> {
+/// Proves `witness` over `circuit`, whose wiring must check.
+pub fn prove(circuit: &Circuit, witness: &Witness<SecureField>) -> Result<RecairProof, ProveError> {
     prove_with(circuit, witness, |_| {})
 }
 
@@ -153,7 +172,8 @@ pub fn prove_with(
     circuit: &Circuit,
     witness: &Witness<SecureField>,
     tamper: impl FnOnce(&mut MainTrace),
-) -> Result<RecairProof, ProvingError> {
+) -> Result<RecairProof, ProveError> {
+    circuit.check_wiring().map_err(ProveError::Wiring)?;
     let log_sizes = circuit.log_sizes();
     let config = FORMAT.pcs_config();
     let twiddles = SimdBackend::precompute_twiddles(
@@ -200,7 +220,8 @@ pub fn prove_with(
     let provers: [&dyn ComponentProver<SimdBackend>; 3] =
         [&components.p2, &components.qm31, &components.h8];
     let stark_proof =
-        stwo::prover::prove::<SimdBackend, P2MerkleChannel>(&provers, channel, scheme)?;
+        stwo::prover::prove::<SimdBackend, P2MerkleChannel>(&provers, channel, scheme)
+            .map_err(ProveError::Stwo)?;
     Ok(RecairProof {
         format_version: FORMAT.number,
         log_sizes,

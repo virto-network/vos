@@ -163,7 +163,7 @@ fn a_three_component_multi_fraction_logup_proves_at_three_log_sizes() {
             .finalize_to(Some(log_sizes.map(|log_size| 1usize << log_size)))
             .expect("the wiring checks");
         assert_eq!(finalized.circuit.log_sizes(), log_sizes);
-        let (_, hash) = circuit_commitment(&finalized.circuit);
+        let (_, hash) = circuit_commitment(&finalized.circuit).expect("the wiring checks");
         let proof = prove(&finalized.circuit, &finalized.witness).expect("proves");
         assert!(
             proof
@@ -225,7 +225,7 @@ fn a_10k_gate_circuit_proves_and_verifies() {
     let rows = built.rows();
     let finalized = built.finalize().expect("the wiring checks");
     let build = started.elapsed();
-    let (_, hash) = circuit_commitment(&finalized.circuit);
+    let (_, hash) = circuit_commitment(&finalized.circuit).expect("the wiring checks");
     let started = Instant::now();
     let proof = prove(&finalized.circuit, &finalized.witness).expect("proves");
     let proving = started.elapsed();

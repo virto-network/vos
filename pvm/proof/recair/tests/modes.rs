@@ -11,7 +11,7 @@ use vos_pvm_poseidon2::{
 use vos_recair::gadgets::{TranscriptGadget, leaf_hash, node};
 use vos_recair::trace::MainTrace;
 use vos_recair::{Context, Finalized, Message, P2Mode, circuit_commitment, prove, verify};
-use vos_recair_air::p2;
+use vos_recair_air::{p2, qm31};
 
 use common::{Rng, digest_wires, pack, words};
 
@@ -147,7 +147,7 @@ fn modes_circuit() -> Finalized<SecureField> {
 #[test]
 fn p2_equals_the_reference_permutation_in_every_mode() {
     let finalized = modes_circuit();
-    let (_, hash) = circuit_commitment(&finalized.circuit);
+    let (_, hash) = circuit_commitment(&finalized.circuit).expect("the wiring checks");
     let proof = prove(&finalized.circuit, &finalized.witness).expect("proves");
     verify(proof, &hash).expect("verifies");
 }
@@ -158,19 +158,23 @@ fn refusal(
     finalized: &Finalized<SecureField>,
     tamper: impl FnOnce(&mut MainTrace),
 ) -> Option<String> {
-    let (_, hash) = circuit_commitment(&finalized.circuit);
+    let (_, hash) = circuit_commitment(&finalized.circuit).expect("the wiring checks");
     match vos_recair::prove::prove_with(&finalized.circuit, &finalized.witness, tamper) {
         Err(error) => Some(format!("prover: {error:?}")),
         Ok(proof) => verify(proof, &hash).err().map(|error| error.to_string()),
     }
 }
 
-/// Whether the tamper is refused because the constraints fail.
+/// Whether the tamper is refused because the constraints fail. Stwo's
+/// prover samples the composition polynomial and the trace at the OODS point
+/// and refuses a mismatch, so a trace that breaks a constraint never becomes
+/// a proof: the refusal is the prover's. The verifier's own constraint check
+/// is [`an_edited_sample_fails_the_verifiers_constraint_check`]'s.
 fn refused(finalized: &Finalized<SecureField>, tamper: impl FnOnce(&mut MainTrace)) -> bool {
     match refusal(finalized, tamper) {
         Some(reason) => {
             assert!(
-                reason.contains("ConstraintsNotSatisfied") || reason.contains("OodsNotMatching"),
+                reason.contains("prover: Stwo(ConstraintsNotSatisfied)"),
                 "{reason}"
             );
             true
@@ -357,39 +361,140 @@ fn finalized_column(finalized: &Finalized<SecureField>, column: usize, row: usiz
 
 type Tamper = Box<dyn Fn(&mut vos_recair::RecairProof)>;
 
-/// Tampers with a finished proof are refused: a claimed sum, an output, the
-/// interaction PoW, a sampled value, the log sizes.
-#[test]
-fn a_tampered_proof_is_refused() {
+/// A small circuit over every component, its hash, and an honest proof.
+fn honest_proof() -> (vos_pvm_poseidon2::Digest, vos_recair::RecairProof) {
     let mut context = Context::<SecureField>::with_outputs(1);
     let a = context.guess(SecureField::from_u32_unchecked(5, 6, 7, 8));
     let b = context.mul(a, a);
     let leaf = leaf_hash(&mut context, &[a, b], 8);
     let c = context.add(leaf.digest[0], b);
-    context.set_outputs(&[c]);
+    let d = context.h8(c, a, b, [a, b]);
+    let e = context.add(d, c);
+    context.set_outputs(&[e]);
     let finalized = context.finalize().unwrap();
-    let (_, hash) = circuit_commitment(&finalized.circuit);
+    let (_, hash) = circuit_commitment(&finalized.circuit).expect("the wiring checks");
     let proof = prove(&finalized.circuit, &finalized.witness).unwrap();
     verify(proof.clone(), &hash).unwrap();
+    (hash, proof)
+}
 
+/// Stwo's refusal when the constraints, evaluated at the OODS point over the
+/// sampled values, do not match the composition polynomial's sample.
+const OODS_MISMATCH: &str = "OODS value does not match the trace OODS values";
+
+/// The first refusal of `edit(proof, k)`, for `k` from 1, that passes the
+/// query-count preflight. An edited sample or claimed sum moves the
+/// transcript, so the queries are redrawn; when their deduplicated count
+/// differs from the proof's rows the preflight refuses first, and when it is
+/// the same the edit reaches Stwo's own checks.
+fn past_the_query_count(
+    hash: &vos_pvm_poseidon2::Digest,
+    proof: &vos_recair::RecairProof,
+    edit: impl Fn(&mut vos_recair::RecairProof, SecureField),
+) -> String {
+    for k in 1..=256 {
+        let mut tampered = proof.clone();
+        edit(&mut tampered, SecureField::from_u32_unchecked(k, 0, 0, 0));
+        let refusal = verify(tampered, hash)
+            .expect_err("an edited proof")
+            .to_string();
+        if !refusal.contains("queried-value rows differ") {
+            return refusal;
+        }
+    }
+    panic!("no edit kept the query count");
+}
+
+/// Tampers with a finished proof are refused, each for its reason: a
+/// claimed sum, an output, the interaction PoW, a queried value, the log
+/// sizes, the format, and claimed sums moved between components.
+#[test]
+fn a_tampered_proof_is_refused() {
+    let (hash, proof) = honest_proof();
     let one = SecureField::from_u32_unchecked(1, 0, 0, 0);
-    let mut tampers: Vec<Tamper> = vec![
-        Box::new(move |proof| proof.claimed_sums[1] += one),
-        Box::new(move |proof| proof.outputs[0] += one),
-        Box::new(|proof| proof.interaction_pow ^= 1),
-        Box::new(move |proof| proof.stark_proof.0.sampled_values[1][0][0] += one),
-        Box::new(|proof| proof.log_sizes[2] += 1),
-        Box::new(|proof| proof.format_version = 31),
+    let tampers: Vec<(&str, Tamper, &str)> = vec![
+        (
+            "a claimed sum",
+            Box::new(move |proof| proof.claimed_sums[1] += one),
+            "do not add to zero",
+        ),
+        // The outputs are mixed before the interaction PoW is ground: an
+        // output changed moves the transcript under the nonce.
+        (
+            "an output",
+            Box::new(move |proof| proof.outputs[0] += one),
+            "interaction PoW nonce",
+        ),
+        (
+            "the interaction PoW",
+            Box::new(|proof| proof.interaction_pow ^= 1),
+            "interaction PoW nonce",
+        ),
+        (
+            "a queried value",
+            Box::new(|proof| {
+                proof.stark_proof.0.queried_values[1][0][0] += BaseField::from(1);
+            }),
+            "Root mismatch",
+        ),
+        (
+            "the log sizes",
+            Box::new(|proof| proof.log_sizes[2] += 1),
+            "another circuit",
+        ),
+        (
+            "the format",
+            Box::new(|proof| proof.format_version = 31),
+            "not the recursion AIR's",
+        ),
     ];
-    // The claimed sums moved between components keep their total: the
-    // components' constraints refuse it.
-    tampers.push(Box::new(move |proof| {
-        proof.claimed_sums[0] += one;
-        proof.claimed_sums[2] -= one;
-    }));
-    for (i, tamper) in tampers.iter().enumerate() {
+    for (what, tamper, reason) in &tampers {
         let mut tampered = proof.clone();
         tamper(&mut tampered);
-        assert!(verify(tampered, &hash).is_err(), "tamper {i}");
+        let refusal = verify(tampered, &hash).expect_err(what).to_string();
+        assert!(refusal.contains(reason), "{what}: {refusal}");
+    }
+
+    // Claimed sums moved between components keep their total: the
+    // components' constraints refuse them.
+    let refusal = past_the_query_count(&hash, &proof, |proof, k| {
+        proof.claimed_sums[0] += k;
+        proof.claimed_sums[2] -= k;
+    });
+    assert!(
+        refusal.contains(OODS_MISMATCH),
+        "claimed sums moved: {refusal}"
+    );
+}
+
+/// The verifier's own constraint check: an honest proof whose sampled value
+/// of one column is then edited, in each component's main and interaction
+/// trees, is refused because the constraints, evaluated at the OODS point
+/// over the sampled values, no longer match the composition polynomial's
+/// sample. The prover's sanity check refuses a dishonest trace before a
+/// proof exists, so only an edited proof reaches this check, and only an
+/// edit past the query-count preflight ([`past_the_query_count`]).
+#[test]
+fn an_edited_sample_fails_the_verifiers_constraint_check() {
+    let (hash, proof) = honest_proof();
+    let main = [0, p2::N_MAIN, p2::N_MAIN + qm31::N_MAIN];
+    let interaction = [
+        0,
+        p2::N_INTERACTION,
+        p2::N_INTERACTION + qm31::N_INTERACTION,
+    ];
+    for (component, (main, interaction)) in ["p2", "qm31", "h8"]
+        .iter()
+        .zip(main.into_iter().zip(interaction))
+    {
+        for (tree, column) in [(1, main), (2, interaction)] {
+            let refusal = past_the_query_count(&hash, &proof, |proof, k| {
+                proof.stark_proof.0.sampled_values[tree][column][0] += k;
+            });
+            assert!(
+                refusal.contains(OODS_MISMATCH),
+                "{component}, tree {tree}, column {column}: {refusal}"
+            );
+        }
     }
 }
