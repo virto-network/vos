@@ -450,11 +450,9 @@ fn preflight_standalone(
     // `prove_with_explicit_components` path, whose proofs are documented
     // as "not verifiable via verify_standalone".
     //
-    // Reject early. Without this gate, a malicious prover could ship a
-    // chip-isolated proof (no FS-transcript mix on the prover side) to
-    // verify_standalone, slipping `proof.final_state.registers` past the
-    // register-boundary binding — the standalone verifier would also skip the mix and
-    // tampered registers would verify cleanly.
+    // Reject early, before any cryptographic work: such a proof names no
+    // positions for the boundary chips, through which the standalone
+    // verifier binds `proof.{initial,final}_state`.
     if proof.component_mask == 0 {
         return Err(VerificationError::InvalidStructure(
             "component_mask = 0 is invalid at format_version >= 2 \

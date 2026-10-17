@@ -71,15 +71,12 @@ pub const DEFAULT_MAX_LOG_SIZE: u32 = 24;
 /// Verify a proof against a `side_note` describing the SAME program +
 /// segment the prover ran.
 ///
-/// PRECONDITION: `side_note` must be in the state `prove` left it in —
-/// `closing_chip_active` set and the register images backfilled. `prove`
-/// applies this via [`crate::prepare_side_note_for_verification`]; a
-/// caller that RE-DERIVES a side note (e.g. re-slicing a segment of a
-/// traced run to check a chain) MUST call that helper first, or the
-/// verifier's Fiat-Shamir transcript diverges from the prover's and an
-/// honest proof fails with `OodsNotMatching`. (This is a host-side
-/// re-derivation path only; `vos_pvm_proof_verifier::verify_standalone` needs no
-/// side note at all.)
+/// The side note supplies the program (its preprocessed trace is re-committed
+/// and compared) and the component set its steps select; the boundary states
+/// come from the proof, which every verifier mixes and binds whatever the
+/// side note's `closing_chip_active` says. (`vos_pvm_proof_verifier::
+/// verify_standalone` needs no side note at all, only the program's
+/// preprocessed commitment.)
 pub fn verify(proof: Proof, side_note: &SideNote) -> Result<(), VerificationError> {
     // Default: the conjectured-security floor, which accepts any 96-bit-secure
     // shape (STANDARD and MOBILE both). `None` selects that floor; the strict
