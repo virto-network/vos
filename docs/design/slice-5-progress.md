@@ -1507,3 +1507,194 @@ ids (step 5.5's last section).
   election has time to end.
 
 **Gates:** `just check` on each commit, 995 tests at the last; the node suites at the end: cluster and processes in it, the faults process tests and the five-process fault suite.
+
+## M0 acceptance
+
+**On the M0 code (30e78b53, plus the jar-check fix 36eac7cf).** The
+measurements ran on an Intel Core Ultra 7 155H, load average 2–3, each
+under `systemd-run` at 16 GiB with `nice -n 10` and `CARGO_INCREMENTAL=0`.
+
+### What M0 delivered
+
+| step | what | commits |
+|---|---|---|
+| 5.1 | Stwo from the owner's fork, olanod/stwo `vos/base` at `bbfa8bc3`, pushed: upstream `e1286720`, dashmap optional, Poseidon252 gated, and `74951f79` backported, so a preprocessed tree below the lifting height verifies. The verifier builds for `thumbv7em-none-eabihf` and wasm32 | 219894f1; the spikes' verifier fixes before it, ce72c226, 824a5f8a, b5d42dc2 |
+| 5.2 | The reference Poseidon2 with Plonky3's parameters, and a packed hasher (AVX2, AVX-512F, NEON, scalar fallback) | cc10f755..37749667 (gate log e1c58e38, decision 19af5408) |
+| 5.3 | The format registry, run-time selection, lossless encodings, the interaction PoW and both bit counts | 91f832df, 857bc752; reviews 1ab715cc..dbf6da1d |
+| 5.5 | The witness input `0x401`, the run's ends, the io-hash; the operand binding; the Ristretto chips and ids removed | d543de94, bd4a4818, dce17dd3; 505af543..3fae02d0; ee6a1235..0dc9ba45 |
+| 5.5b | The AIR audit's holes closed on three tracks (ARITH, BLAKE, CPU with page permissions), merged; the re-audit's fixes | 3f39145c..80c77822; fa2f2c43..02ae6255 |
+| 5.4 | A shape per kernel: derive's shape in the install's record, shaped proving, the exact-set verifier, the kernel chain, the program id | 82abccbe..30e78b53 (the spike moved to `spike/s5-shape` by 0179ccca) |
+| 5.7 | Targets per agent with JAM's limits, DA's 27 days, a heap per kind of invocation, resume and catch-up measured, PolkaJam re-probed, Ristretto ids refused | 09bbafc0..a49f1bfc |
+
+5.6, the phone run, waits on the owner's team.
+
+### Gates
+
+- **`just ci-full` green, 1,860 s:** 139 test binaries, 1,720 tests.
+  - `ci`: 87 binaries, 1,141 tests, 922 s.
+  - `test-proof`: 50 binaries, 577 tests, 913 s. It covers formats 31
+    and 33, the soundness gates and the settlement verifier on the PVM.
+  - `test-bench-proof`: 2 tests, 25 s.
+- **The checker loop with workflows:** seeds 601–612 across the three
+  exactly-once tests. All 36 runs green, 919 s. 2,892 tours, none
+  failed, across 24 leader stops mid-await and 23 mid-computation.
+- **Failed first, and fixed:** `jar-check` (in `ci`) failed on the first
+  run. Its patterns `kernel::` and `\b0x800\b` were meant for JAR's
+  `vos_pvm::kernel` and its CSR 0x800 marker. They also matched the proof
+  crate's `kernel` module (5.5) and derive's `(value + 0x800) >> 12`
+  rounding. So the gate had failed on every tree since 5.5: real, not a
+  flake. The patterns now name `vos_pvm::kernel::`, `InvocationKernel` and
+  the CSR forms of 0x800, and still match every remnant in the pre-port
+  tree (36eac7cf). The rerun above is on that fix.
+
+### Measured
+
+**Segment proving, format 31 against 33, at the 32k cut.** The window
+kernel (`n1000000-j8`, 404,091 steps) was proved over its shape, 23 chips,
+cut at class 1 into 17 segments: 15 at class 1, 2 at class 0. Each
+segment was then proved alone on 31 and on 33 in turn, on 8 threads, two
+rounds [measured]:
+
+| | format 31, Poseidon2-M31 (2/44/20, interaction PoW 8) | format 33, Blake2s (MOBILE: 2/38/20) | 31 against 33 |
+|---|---|---|---|
+| a class-1 segment (2^15 steps), 30 proofs each | 6.59–7.17 s, median 6.79 s | 3.63–3.90 s, median 3.76 s | 1.68–1.91×, median 1.80× |
+| a class-0 segment (2^12 steps), 4 proofs each | 3.47–3.67 s | 2.07–2.12 s | 1.7× |
+| the 17 segments, one by one | 108.4 s | 60.4 s | 1.80× |
+| prover memory, a class-1 segment | 5.6 GiB over a 0.35 GiB base (peak RSS 6.0 GiB) | 5.6 GiB (peak 6.0 GiB) | 1.0× |
+| prover memory, a class-0 segment | 3.1–3.2 GiB | 3.1–3.2 GiB | 1.0× |
+| proof, class 1 (postcard) | 1.47–2.01 MB | 1.25–1.73 MB | 1.17× |
+
+- `prove_kernel` on 31 proved all 17 segments in 104–106 s, peak RSS
+  6.4 GiB. The chain verifies natively against the kernel's program in
+  1.08 s; on 33 it verifies in 0.43 s.
+- **The memory column comes from a second, one-round run.** It trims the
+  allocator and reads RSS before each prove. That run's times were 4–7%
+  slower: 31 at 7.0–7.5 s, 33 at 4.1–4.2 s, a median of 1.74×.
+- **The ratio holds 5.2's 1.75–1.85×** on the hardened AIR and the
+  shape. Memory does not follow the channel: the traces and their
+  extension dominate.
+- Format 33 also takes six fewer queries than 31, so the comparison is
+  of the two formats as registered, not of the channels at equal
+  parameters.
+
+**Verify gas over the shape on the JAM-only host.** This is spike 1's
+guest and harness on the current verifier (`spike/s5-shape`'s
+`guest-verify`): vos-pvm's GP 0.8.0 instruction gas, with PolkaJam's
+host-call prices [measured].
+
+| proof | gas | of which decode | instructions | native verify |
+|---|---|---|---|---|
+| 31, segment 4 (32k, class 1) | 3.3573B | 0.2019B | 1.215B | 55 ms |
+| 31, segment 7 (32k, class 1) | 3.3594B | 0.2017B | 1.216B | 55 ms |
+| 31, segment 16 (class 0) | 3.3300B | 0.2009B | 1.204B | 54 ms |
+| 33, segment 4 (32k, class 1) | 1.4414B | 0.1812B | 0.352B | 15 ms |
+
+- The guest's peak live heap is 6.3 MiB, and it writes 2,886 pages.
+- These are 5.4's figures (3.3465–3.3510B) within 0.3%.
+- Segments are recursed, not verified on chain (proving.md), so this is
+  a bound and not a cost. The final proof's gate is 5.14's.
+
+**The phone factor: not measured.** 5.6's run is with the owner's team.
+The projected 1.0–2.6 stands until then.
+
+**The AIR** [measured, from the AIR]:
+- **25 chips, 8,039 columns in full:** 185 preprocessed, 4,882 main,
+  2,964 interaction, 8 composition.
+- **At 2^20 rows a chip** (the registry's segment reference shape): 5,177
+  constraints, 9,047 sampled values, 1,553,989,632 logup fractions, and
+  relations up to 265 limbs.
+- **A derived kernel's shape** is 23 chips, every one but POPCOUNT and
+  BITCOUNT, at 8,024 columns (180, 4,880, 2,956, 8) in each of its three
+  classes.
+- **Against the audit's 32-chip AIR:** it was 13,037 columns and 6,650
+  constraints. The Ristretto removal took it to 7,556 columns; the
+  hardening added 483.
+
+**Security counts per format** [model, the registry's tool at each
+format's reference shape; conjectured / proven, the unrounded proven
+count, then the floors]:
+
+| format | proofs | status | parameters (log blowup, queries, PoW, fold step, last layer, interaction PoW) | bits | floors |
+|---|---|---|---|---|---|
+| 31 | segments, Poseidon2-M31 | admitted | 2, 44, 20, 1, 0, 8 | 108 / 62 (62.79) | 100 / 60 |
+| 32 | leaves and folds | reserved | 2, 44, 20, 1, 0, 8 | 108 / 63 (63.37) | 100 / 60 |
+| 33 | segments, Blake2s, legacy | admitted | MOBILE: 2, 38, 20, 1, 0, — | 96 / 57 (57.49) | 96 / — |
+| 34 | device proofs | reserved | 1, 86, 20, 1, 0, 8 | 106 / 62 (62.13) | 100 / 60 |
+| 30 | credential proofs | reserved | 1, 86, 20, 1, 0, 8 | 106 / 62 (62.52) | 100 / 60 |
+| 28 | the final wrap | reserved | 6, 20, 26, 3, 6, 8, affine DEEP batching | 146 / **74** (74.71) as built | 100 / 80 |
+
+24, 25, 26, 27 and 29 are retired.
+
+### Deviations from the plan, and their decisions
+
+- **Poseidon2-M31 kept despite 5.2's gate.** The gate failed as written:
+  proving was 1.75–1.85× Blake2s against 1.5×, and a leaf's commitment
+  took 0.63 s against 0.5 s. The owner kept Poseidon2-M31 (2026-10-16),
+  gated on a segment's total cost, its proof plus its leaf: about
+  7.1–8.6 s against Blake2s's 7.6–9.1 s [measured plus projected]. M0
+  measures 1.80× on the hardened AIR. The Blake2s fallback is dropped.
+- **Ristretto removed** (the owner's decision). Its chips were unsound,
+  and slice 7's bignum chip replaces them. All eight chips, eleven
+  relations and ids 110–114 are gone, and derive refuses a kernel that
+  reaches one. The AIR went from 32 chips to 25, and from 13,037 columns
+  to 7,556.
+- **The AIR audit and its hardening (5.5b), not in the plan.** Fable's
+  review of 5.5 found the operand binding open. The audit that followed
+  closed the G1–G4 holes and the page permissions (G2-1), each with a
+  forgery gate run first on the unfixed AIR. A re-audit added more fixes
+  and gates.
+  The cost was 483 columns, to 8,039.
+- **The inner parameters changed** in 5.3's reviews: from 39 queries,
+  PoW 26 and interaction PoW 24 to 44 queries, PoW 20 and interaction
+  PoW 8, for 62.79 proven bits. The grind fell from about 2.1 s to 27 ms
+  [model], for about 12% more proof bytes. Devices take 86 queries.
+- **The formats were renumbered.** Every number naming the pre-hardening
+  AIR is retired, so that a number names one AIR: segments 26 → 31,
+  leaves and folds 27 → 32, legacy 24 → 33, devices 29 → 34. 28 and 30
+  are unchanged.
+- **A shape per kernel saves 0.2%, not 30%.** 5.4's gate counted the
+  Ristretto chips, which made up the audit's 38%. A kernel's code leaves
+  out two tables, 15 columns, which saves 0.18–0.39% of verify gas. The
+  shape stays for identity and the leaf: it pins every log size, which
+  the program id binds and the leaf takes as constants.
+- **`Attest.arguments` replaced** by `witness_input`, which carries the
+  bytes the kernel read. Keeping both would have held the same bytes
+  twice, and a step's attests at both caps would pass the 4 MiB result.
+- **A target per agent.** The plan named the target in the install
+  record. As built, an agent runs on one target, VOS or JAM, which its
+  first install records; every instance takes it, and an install for
+  another target is refused. JAM's limits are about 31× below VOS's, and
+  a kernel's gas on JAM is capped at 2,457,600.
+- **DA: a deterministic failure after 27 days.** Re-exporting a waiting
+  workflow's pages was the other option. JAM keeps its pages 27 days, the
+  Gray Paper's 28 less a day's margin; a step due past that ends the
+  workflow `Expired`. It is a rule the agent keeps alike on every host,
+  where re-export would be a builder's duty.
+
+### Carried into M1
+
+- **The leaf's rows are tight.** At 44 queries over the hardened
+  shape's 8,024 columns, the kernel leaf's `p2` comes to about 64.8k of
+  2^16 [model]. The ~9,300-column headroom, counted at 39 queries, is
+  about 8,100 at 44. 5.11 counts it on the hardened AIR first. The plan
+  carries it.
+- **The wrap's 80 proven bits:** 74.71 as built. 5.14 chooses between
+  affine DEEP batching (recommended), a batching-phase PoW, and blowup 8.
+- **The program id's leaf-circuit hashes** (5.12). The id enters the
+  `Derivation` once an install can compute the class roots, which today
+  need the prover.
+- **Pinning costs prover time.** The ALU chips pad to the class's steps,
+  and WITNESS_INPUT pads to 2^16 in every segment. Narrower capacities,
+  or WITNESS_INPUT in the entry class alone, are open.
+- **Recorded, unfixed:**
+  - C-DJUMP, an invalid dynamic jump that cannot be proved; no kernel
+    needs it.
+  - The ledgers' 2^27-step idle limit.
+  - A BLAKE2b pointer within 256 bytes of 2^32 that cannot be proved.
+  - Refine slices' page permissions, bound by replay and not in the AIR.
+- **AVX-512F** is compiled but not run on this machine.
+- **For the owner:**
+  - 5.6, the phone run;
+  - PolkaJam's recompiler run, which needs a build that tolerates cores
+    without L3, or another machine.
+- **M0's closing:** the Opus milestone review, then a push.
