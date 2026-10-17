@@ -14,6 +14,8 @@ Plan, draft 8.
 - **Draft 8 replaces draft 7.** It folds in Fable's review of draft 7
   (`research/slice-5/plan7-review.md`, R1–R11) and the owner's word on
   pushing the Stwo fork (2026-10-16).
+- **M0 is done** (`slice-5-progress.md`, "M0 acceptance"). Where its outcome
+  changed M1's premises, M1's opening and its steps say so.
 
 ## Goals
 
@@ -219,8 +221,13 @@ No proof leaves a test in this slice: masking is slice 6.
     their shapes;
   - a full-set proof of the same kernel is refused;
   - a missing chip is refused.
-- **Gate:** the window kernel's verify gas falls by at least 30% on the
-  JAM-only host (the audit measured 38%).
+- **Gate, as built:** the exact set and sizes accepted, every other
+  refused. The verify-gas gate (at least 30%, from the audit's 38%) counted
+  the Ristretto chips, which M0 removed (5.7): on the hardened AIR a kernel's code
+  leaves out two small tables, and the shape saves 0.2–0.4% of verify gas
+  [measured]. **The shape is the kernel's identity and its leaf's
+  constants:** it pins every log size, which the program id binds and the
+  leaf circuit takes as constants.
 - **Estimate:** about 1 week.
 
 ### 5.5 The witness-input precompile, the run's ends and the io-hash (F)
@@ -313,8 +320,8 @@ No proof leaves a test in this slice: masking is slice 6.
 
 ### M0 acceptance
 
-- **Gates:** `ci-full`, `test-proof` (format-25 tests included) and the
-  checker loop.
+- **Gates:** `ci-full`, `test-proof` (formats 31 and 33) and the checker
+  loop.
 - **Recorded:**
   - segment proving time and memory on Poseidon2 against Blake2s;
   - the phone factor;
@@ -325,6 +332,24 @@ No proof leaves a test in this slice: masking is slice 6.
 
 Steps 5.8–5.15 are `recursion-air.md` §10's, in its order; 5.9 runs
 beside 5.8.
+
+**What M0 changed under M1:**
+- **Formats:** segments are 31 (Poseidon2-M31), leaves and folds 32, the
+  wrap 28; 33 is the legacy Blake2s segment format, 34 and 30 the device
+  and credential formats. 24–27 and 29 are retired.
+- **The segment AIR** is 25 chips, **8,039 columns** in full (185
+  preprocessed, 4,882 main, 2,964 interaction, 8 composition) and 5,177
+  constraints. A derived kernel's shape is 23 of them, 8,024 columns
+  [measured]. `count.log` counted the pre-hardening window shape, 7,519
+  columns and 4,223 constraints.
+- **The shape** is identity and the leaf's constants, not a gas lever
+  (5.4).
+- **Inner proofs take 44 queries** (5.3's reviews), where `count.log`
+  counted 39. A leaf's rows grow with width times queries, so the kernel
+  leaf's `p2` comes to about 64.8k of 2^16 (below). The ~9,300-column
+  headroom (`recursion-air.md` §5) was counted at 39 queries; at 44 it is
+  about 8,100 columns [model]. The full 8,039 still fits, with about 1% of
+  `p2`'s rows to spare.
 
 ### 5.8 The gate VM (F)
 
@@ -411,9 +436,15 @@ beside 5.8.
     `count.log`, not only its totals.
 - **Gate:**
   - COMPARE's rows within 15% of 8,488 / 10,869 / 273, and at most 1 s;
-  - the kernel leaf's topology within 2^16 / 2^17 / 2^16 (`count.log`:
-    55,307 / 96,324 / 42,549, plus about 25 `p2` rows for the byte-form
-    digests).
+  - the kernel leaf's topology within 2^16 / 2^17 / 2^16. `count.log`
+    counted 55,307 / 96,324 / 42,549 at 39 queries over 7,519 columns. At
+    44 queries over the hardened shape's 8,024 columns and about 5,160
+    constraints: about **64.8k / 111k / 51k** [model, `count.log`'s terms
+    scaled by the measured columns, samples and constraints], plus about
+    25 `p2` rows for the byte-form digests. `p2` sits within about 1% of
+    2^16, so this count comes first. If it passes 2^16, the levers are
+    FRI fold step 3 in inner proofs (about −7k `p2` rows) or `p2` at
+    2^17.
 - **Estimate:** 1–2 weeks.
 
 ### 5.12 The kernel leaves (F)
@@ -577,4 +608,5 @@ its gate. This slice's sharpest:
   soundness-critical code: differential tests, Fable reviews, and the
   external audit before value.
 - **The model's rows:** 5.11 counts the kernel leaf's topology term by
-  term, weeks before 5.12 proves it.
+  term, weeks before 5.12 proves it. At 44 queries over the hardened
+  shape, its `p2` sits within about 1% of 2^16 [model].
