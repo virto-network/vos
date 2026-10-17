@@ -3,8 +3,7 @@
 
 use super::{
     ProofTranscriptGeneration, ProvingError, Sizes, Target, install_thread_pool,
-    natural_log_sizes_for, prepare_side_note_for_verification,
-    prove_impl_with_components_overridden,
+    prepare_side_note_for_verification, prove_impl_with_components_overridden,
 };
 use crate::format::Format;
 use crate::framework::MachineProverComponent;
@@ -20,13 +19,6 @@ fn selected(components: u32) -> Vec<&'static dyn MachineProverComponent> {
         .enumerate()
         .filter(|(index, _)| components & 1 << index != 0)
         .map(|(_, &component)| component)
-        .collect()
-}
-
-/// The chips' indices `components` selects, in chip order.
-fn indices(components: u32) -> Vec<usize> {
-    (0..crate::chip_idx::COUNT)
-        .filter(|index| components & 1 << index != 0)
         .collect()
 }
 
@@ -99,39 +91,15 @@ pub struct KernelSegment {
     pub proof: Proof,
 }
 
-/// The first class of `shape` whose sizes hold `window`'s rows, or the
-/// overflow of the largest class: its first chip whose rows need more.
-fn class_for(window: &mut SideNote, shape: &KernelShape) -> Result<usize, ProvingError> {
-    let chips = indices(shape.components);
-    let natural = natural_log_sizes_for(window, &chips);
-    let overflow = |class: &crate::shape::SegmentClass| {
-        chips
-            .iter()
-            .zip(&class.log_sizes)
-            .zip(&natural)
-            .find(|((_, pinned), size)| **size > u32::from(**pinned))
-            .map(|((&chip, &pinned), &log_size)| ProvingError::Shape {
-                chip,
-                log_size,
-                pinned: u32::from(pinned),
-            })
-    };
-    let mut refusal = ProvingError::MalformedShape;
-    for (index, class) in shape.classes.iter().enumerate() {
-        match overflow(class) {
-            None => return Ok(index),
-            Some(error) => refusal = error,
-        }
-    }
-    Err(refusal)
-}
-
 /// A kernel's run, traced whole in `full`, proved under `format` over
 /// `shape`: cut by class `cut`'s budgets, its steps and its pages
 /// ([`crate::segment::segment_bounds_budgeted`]), and each window proved at
-/// the first class whose sizes hold its rows. A window none holds is cut in
-/// half, down to one step; a step no class holds is refused with
-/// [`ProvingError::Shape`].
+/// the first class whose sizes hold its rows. A class is tried by proving
+/// at it: its traces are generated once, at its sizes, and a chip whose
+/// rows need more refuses it before any commitment; a class of fewer steps
+/// than the window's is skipped, as its CPU holds a row a step. A window
+/// none holds is cut in half, down to one step; a step no class holds is
+/// refused with [`ProvingError::Shape`].
 pub fn prove_kernel(
     full: &SideNote,
     shape: &KernelShape,
@@ -150,24 +118,55 @@ pub fn prove_kernel(
     for (a, b) in bounds {
         let mut pending = vec![(a, b)];
         while let Some((a, b)) = pending.pop() {
-            match class_for(&mut cursor.side_note(a, b), shape) {
-                Ok(class) => {
-                    let segment = shape.segment(class).ok_or(ProvingError::MalformedShape)?;
-                    let proof = prove_shaped(&mut cursor.side_note(a, b), &segment, format)?;
-                    segments.push(KernelSegment {
-                        steps: (a, b),
-                        class,
-                        proof,
-                    });
-                }
-                Err(_) if b - a > 1 => {
+            match prove_at_first_class(&mut cursor, (a, b), shape, format) {
+                Ok((class, proof)) => segments.push(KernelSegment {
+                    steps: (a, b),
+                    class,
+                    proof,
+                }),
+                Err(ProvingError::Shape {
+                    log_size, pinned, ..
+                }) if log_size > pinned && b - a > 1 => {
                     let middle = a + (b - a) / 2;
                     pending.push((middle, b));
                     pending.push((a, middle));
                 }
-                Err(refusal) => return Err(refusal),
+                Err(error) => return Err(error),
             }
         }
     }
     Ok(segments)
+}
+
+/// Window `[a, b)` proved at the first class of `shape` that holds its
+/// rows, and the class; or the overflow of the last class tried, a
+/// [`ProvingError::Shape`] whose size is past its pin.
+fn prove_at_first_class(
+    cursor: &mut crate::segment::SegmentCursor<'_>,
+    (a, b): (usize, usize),
+    shape: &KernelShape,
+    format: &'static Format,
+) -> Result<(usize, Proof), ProvingError> {
+    let steps = (b - a).next_power_of_two().trailing_zeros();
+    let mut overflow = ProvingError::Shape {
+        chip: crate::chip_idx::CPU,
+        log_size: steps,
+        pinned: 0,
+    };
+    for (index, class) in shape.classes.iter().enumerate() {
+        if steps > u32::from(class.log_steps) {
+            continue;
+        }
+        let segment = shape.segment(index).ok_or(ProvingError::MalformedShape)?;
+        match prove_shaped(&mut cursor.side_note(a, b), &segment, format) {
+            Ok(proof) => return Ok((index, proof)),
+            Err(
+                error @ ProvingError::Shape {
+                    log_size, pinned, ..
+                },
+            ) if log_size > pinned => overflow = error,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(overflow)
 }

@@ -49,7 +49,7 @@ pub struct SegmentClass {
 pub struct KernelShape {
     /// Bit i: chip i ([`chip_idx`]).
     pub components: u32,
-    /// Smallest first.
+    /// Cheapest first, at most [`MAX_CLASSES`].
     pub classes: Vec<SegmentClass>,
 }
 
@@ -64,11 +64,21 @@ pub struct SegmentShape {
 /// The most a pinned log size may be: a verifier's default cap.
 pub const MAX_LOG_SIZE: u8 = 24;
 
+/// The most classes a shape has: a kernel's record's cap
+/// (`vos_wire::records::MAX_CLASSES`).
+pub const MAX_CLASSES: usize = 4;
+
+#[cfg(feature = "wire")]
+const _: () = assert!(
+    MAX_CLASSES == vos_wire::records::MAX_CLASSES
+        && chip_idx::COUNT == vos_wire::records::SEGMENT_CHIPS
+);
+
 impl KernelShape {
     /// Whether it is a shape a verifier accepts: within the segment AIR,
-    /// holding every chip of [`chip_idx::ALWAYS`], with at least one class,
-    /// each giving every chip a log size from a lane's 2^4 rows to
-    /// [`MAX_LOG_SIZE`].
+    /// holding every chip of [`chip_idx::ALWAYS`], with one to
+    /// [`MAX_CLASSES`] classes, each giving every chip a log size from a
+    /// lane's 2^4 rows to [`MAX_LOG_SIZE`].
     pub fn check(&self) -> Result<(), String> {
         if self.components & !chip_idx::ALL != 0 {
             return Err("the shape names a chip outside the segment AIR".into());
@@ -81,6 +91,12 @@ impl KernelShape {
         }
         if self.classes.is_empty() {
             return Err("the shape has no class".into());
+        }
+        if self.classes.len() > MAX_CLASSES {
+            return Err(alloc::format!(
+                "the shape has {} classes, more than {MAX_CLASSES}",
+                self.classes.len()
+            ));
         }
         let chips = self.components.count_ones() as usize;
         for (index, class) in self.classes.iter().enumerate() {
@@ -135,6 +151,62 @@ impl KernelShape {
                         .all(|(&pinned, &size)| u32::from(pinned) == size)
             })
             .ok_or_else(|| "the proof's log sizes are no class of its kernel's shape".into())
+    }
+}
+
+/// The shape a kernel's install records: its chips, and each class's log
+/// sizes of those chips in chip order. Refused when the record names a chip
+/// past the segment AIR, sizes a chip outside its chips, leaves out a chip
+/// every proof holds, or has more than [`MAX_CLASSES`] classes, or the
+/// shape is otherwise not one [`KernelShape::check`] accepts; so a record a
+/// verifier takes is of exactly one shape.
+#[cfg(feature = "wire")]
+impl TryFrom<&vos_wire::records::Shape> for KernelShape {
+    type Error = String;
+
+    fn try_from(record: &vos_wire::records::Shape) -> Result<Self, String> {
+        if record.chips & !chip_idx::ALL != 0 {
+            return Err(alloc::format!(
+                "the record names chips past the segment AIR: {:#x}",
+                record.chips & !chip_idx::ALL
+            ));
+        }
+        if record.classes.len() > MAX_CLASSES {
+            return Err(alloc::format!(
+                "the record has {} classes, more than {MAX_CLASSES}",
+                record.classes.len()
+            ));
+        }
+        let outside = |size: (usize, &u8)| record.chips & 1 << size.0 == 0 && *size.1 != 0;
+        if let Some(index) = record
+            .classes
+            .iter()
+            .position(|class| class.log_sizes.iter().enumerate().any(outside))
+        {
+            return Err(alloc::format!(
+                "class {index} sizes a chip outside the record's chips"
+            ));
+        }
+        let shape = KernelShape {
+            components: record.chips,
+            classes: record
+                .classes
+                .iter()
+                .map(|class| SegmentClass {
+                    log_steps: class.log_steps,
+                    pages: class.pages,
+                    log_sizes: class
+                        .log_sizes
+                        .iter()
+                        .enumerate()
+                        .filter(|(chip, _)| record.chips & 1 << chip != 0)
+                        .map(|(_, &size)| size)
+                        .collect(),
+                })
+                .collect(),
+        };
+        shape.check()?;
+        Ok(shape)
     }
 }
 
@@ -217,5 +289,82 @@ mod tests {
         let mut huge = shape();
         huge.classes[1].log_sizes[0] = MAX_LOG_SIZE + 1;
         assert!(huge.check().is_err());
+        let mut many = shape();
+        many.classes = vec![many.classes[0].clone(); MAX_CLASSES + 1];
+        assert!(many.check().unwrap_err().contains("classes"));
+    }
+
+    /// A record of [`shape`]'s chips, each class sized as its.
+    #[cfg(feature = "wire")]
+    fn record() -> vos_wire::records::Shape {
+        let shape = shape();
+        vos_wire::records::Shape {
+            policy: 1,
+            chips: shape.components,
+            classes: shape
+                .classes
+                .iter()
+                .map(|class| {
+                    let mut sizes = class.log_sizes.iter();
+                    vos_wire::records::SegmentClass {
+                        log_steps: class.log_steps,
+                        pages: class.pages,
+                        log_sizes: core::array::from_fn(|chip| {
+                            if shape.components & 1 << chip == 0 {
+                                0
+                            } else {
+                                *sizes.next().unwrap()
+                            }
+                        }),
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    /// A record converts to the shape of its chips, each class's sizes
+    /// those of its chips in chip order.
+    #[cfg(feature = "wire")]
+    #[test]
+    fn a_record_is_of_one_shape() {
+        assert_eq!(KernelShape::try_from(&record()), Ok(shape()));
+        let mut sized = record();
+        sized.classes[0].log_sizes[chip_idx::MUL] = 9;
+        let shape = KernelShape::try_from(&sized).unwrap();
+        let position = (0..chip_idx::MUL)
+            .filter(|chip| sized.chips & 1 << chip != 0)
+            .count();
+        assert_eq!(shape.classes[0].log_sizes[position], 9);
+    }
+
+    /// A record naming a chip past the AIR, sizing a chip outside its
+    /// chips, without a chip every proof holds, or with more classes than
+    /// the cap is refused.
+    #[cfg(feature = "wire")]
+    #[test]
+    fn a_malformed_record_is_refused() {
+        let refusal = |change: fn(&mut vos_wire::records::Shape)| {
+            let mut record = record();
+            change(&mut record);
+            KernelShape::try_from(&record).unwrap_err()
+        };
+        assert!(refusal(|r| r.chips |= 1 << chip_idx::COUNT).contains("past"));
+        assert!(refusal(|r| r.chips |= 1 << 31).contains("past"));
+        assert!(refusal(|r| r.classes[1].log_sizes[chip_idx::DIVREM] = 12).contains("outside"));
+        assert!(
+            refusal(|r| {
+                r.chips &= !(1 << chip_idx::MEMORY);
+                for class in &mut r.classes {
+                    class.log_sizes[chip_idx::MEMORY] = 0;
+                }
+            })
+            .contains("leaves out")
+        );
+        assert!(refusal(|r| r.classes = vec![r.classes[0]; MAX_CLASSES + 1]).contains("classes"));
+        assert!(refusal(|r| r.classes.clear()).contains("no class"));
+        assert!(refusal(|r| r.classes[0].log_sizes[chip_idx::CPU] = 0).contains("range"));
+        let mut most = record();
+        most.classes = vec![most.classes[0]; MAX_CLASSES];
+        assert!(KernelShape::try_from(&most).is_ok());
     }
 }

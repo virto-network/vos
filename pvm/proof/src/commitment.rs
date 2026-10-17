@@ -25,13 +25,11 @@
 //! tables (BitwiseLookupChip, RangeMultiplicity256, PowerOfTwoChip,
 //! Blake2bChip schedule) contribute fixed-per-log_size constants.
 //!
-//! Limitation we accept: the commitment depends on `proof.log_sizes` and
-//! thus on the execution shape (number of steps, ECALLs, memory ops).
-//! Two proofs of the same program at different log_sizes produce
-//! different commitments.  A chain operator sets canonical log_sizes
-//! by running the prover at sufficient capacity, then refuses smaller
-//! proofs.  Future work could fix log_sizes to per-chip maxima at
-//! compile time so the commitment is purely program-derived.
+//! The commitment depends on `proof.log_sizes`: two proofs of the same
+//! program at different log sizes commit differently.  A kernel's shape
+//! ([`crate::shape`]) fixes every log size per class of segment from its
+//! code, so each class's commitment is the program's alone,
+//! computed before any run (`program_commitment_for_shape`).
 
 use crate::Proof;
 

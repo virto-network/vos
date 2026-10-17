@@ -79,6 +79,47 @@ pub struct KernelProgram {
     pub leaf_circuits: LeafCircuits,
 }
 
+/// Where a run of a kernel starts, as the loader lays the kernel out with no
+/// arguments: its first step's pc and timestamp, and its registers. A chain
+/// of the kernel's segments starts there, and ends at [`HALT_PC`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KernelEntry {
+    /// A standard program starts at its code's first byte.
+    pub pc: u32,
+    /// φ0 the halt address, φ1 the stack's top, φ7 the argument window,
+    /// the rest 0.
+    pub registers: [u64; vos_pvm_program::REGISTER_COUNT],
+}
+
+/// A run's first step's timestamp.
+pub const ENTRY_TIMESTAMP: u64 = 1;
+
+/// The pc a run ends at when it halts: the halt address.
+pub const HALT_PC: u32 = vos_pvm_program::HALT_ADDRESS as u32;
+
+impl KernelEntry {
+    /// The entry of `blob`, the kernel `program` pins: refused when `blob`
+    /// is not the program it names, by its hash and its image root, or not
+    /// a standard program.
+    pub fn of(program: &KernelProgram, blob: &[u8]) -> Result<Self, String> {
+        if vos_pvm_precompiles::blake2b_256(blob) != program.program {
+            return Err("the blob is not the kernel's program".into());
+        }
+        let standard = vos_pvm_program::parse_standard_program(blob)
+            .ok_or_else(|| String::from("the kernel is not a standard program"))?;
+        if standard.image_root() != Some(program.image_root) {
+            return Err("the blob's image root is not the kernel's".into());
+        }
+        let layout = standard
+            .layout(&[])
+            .ok_or_else(|| String::from("the kernel's layout does not fit"))?;
+        Ok(Self {
+            pc: 0,
+            registers: layout.registers,
+        })
+    }
+}
+
 /// A byte string's 16-bit limbs, little-endian, the last zero-extended.
 fn byte_limbs(bytes: &[u8]) -> impl Iterator<Item = BaseField> + '_ {
     bytes.chunks(2).map(|pair| {

@@ -17,14 +17,16 @@ use vos_pvm_compiler::shape::{self as derived_shape, chip};
 use vos_pvm_proof::chip_idx;
 use vos_pvm_proof::format::SEGMENT;
 use vos_pvm_proof::kernel::{KernelTrace, kernel_side_note, trace_kernel};
-use vos_pvm_proof::program_id::{KernelProgram, LeafCircuits};
+use vos_pvm_proof::program_id::{KernelEntry, KernelProgram, LeafCircuits};
 use vos_pvm_proof::segment::SegmentCursor;
-use vos_pvm_proof::shape::{KernelShape, SegmentClass, SegmentShape};
+use vos_pvm_proof::shape::{KernelShape, SegmentShape};
 use vos_pvm_proof::{
     Proof, ProvingError, program_commitment_for_shape, program_commitment_of_proof,
     prove_canonical_format, prove_kernel, prove_shaped,
 };
-use vos_pvm_proof_verifier::{verify_kernel_chain, verify_kernel_segment, verify_standalone};
+use vos_pvm_proof_verifier::{
+    ENTRY_TIMESTAMP, HALT_PC, verify_kernel_chain, verify_kernel_segment, verify_standalone,
+};
 use vos_testkit::Testkit;
 use vos_testkit::programs::{derivation, derived, method, package};
 use vos_wire::Encode;
@@ -33,25 +35,6 @@ use vos_wire::ids::{AgentId, InstanceId, Principal, ProgramHash};
 use vos_wire::result::Attest;
 
 const GAS: u64 = 100_000_000;
-
-/// The proof crate's form of a shape an install records.
-fn shape_of(record: &vos_wire::records::Shape) -> KernelShape {
-    KernelShape {
-        components: record.chips,
-        classes: record
-            .classes
-            .iter()
-            .map(|class| SegmentClass {
-                log_steps: class.log_steps,
-                pages: class.pages,
-                log_sizes: (0..chip_idx::COUNT)
-                    .filter(|chip| record.chips & 1 << chip != 0)
-                    .map(|chip| class.log_sizes[chip])
-                    .collect(),
-            })
-            .collect(),
-    }
-}
 
 /// A kernel of the `kernels` actor, as its install records it, and a run of
 /// it.
@@ -63,7 +46,12 @@ struct Kernel {
 
 impl Kernel {
     fn shape(&self) -> KernelShape {
-        shape_of(&self.record.shape)
+        KernelShape::try_from(&self.record.shape).expect("an install's shape")
+    }
+
+    /// Its entry, from its blob.
+    fn entry(&self) -> KernelEntry {
+        KernelEntry::of(&self.program(), &self.blob).expect("the program's blob")
     }
 
     /// Its program, each class's preprocessed root computed from its code.
@@ -254,9 +242,12 @@ fn kernels_prove_and_verify_over_their_shapes() {
             );
         }
         let proofs: Vec<Proof> = segments.into_iter().map(|segment| segment.proof).collect();
-        let root = verify_kernel_chain(&proofs, &program).unwrap();
-        assert_eq!(root, proofs.last().unwrap().final_state.memory_root);
-        assert!(proofs.last().unwrap().final_state.pc == vos_pvm::PVM_HALT_ADDR as u32);
+        let registers = verify_kernel_chain(proofs, &program, &kernel.entry()).unwrap();
+        let io_hash: Vec<u8> = registers[9..13]
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect();
+        assert_eq!(io_hash, kernel.trace.io_hash, "{name}");
         eprintln!("{name}: program id {:02x?}", &program.id().to_bytes()[..8]);
     }
 }
@@ -402,4 +393,64 @@ fn a_segment_past_its_class_is_refused() {
         }) => assert_eq!(chip, chip_idx::CPU),
         other => panic!("{:?}", other.map(|proof| proof.log_sizes)),
     }
+}
+
+/// A kernel's entry is its loader's: its first step's pc, and the registers
+/// its blob's layout gives; a halt ends a run at the halt pc. A blob other
+/// than the program's is refused.
+#[test]
+fn a_kernels_entry_is_its_loaders() {
+    let (kernel, program, _) = areas();
+    let entry = kernel.entry();
+    let first = &kernel.trace.side_note.steps[0];
+    assert_eq!((first.pc, first.timestamp), (entry.pc, ENTRY_TIMESTAMP));
+    assert_eq!(entry.registers[0], u64::from(HALT_PC));
+    assert_eq!(HALT_PC, vos_pvm::PVM_HALT_ADDR as u32);
+    let mut other = kernel.blob.clone();
+    *other.last_mut().unwrap() ^= 1;
+    assert!(KernelEntry::of(&program, &other).is_err());
+}
+
+/// A chain that does not start where the loader starts the kernel is
+/// refused before any cryptographic check: one proved from mid-run, and
+/// one whose first state names another timestamp, pc or registers.
+#[test]
+fn a_chain_not_from_the_entry_is_refused() {
+    let (kernel, program, shape) = areas();
+    let entry = kernel.entry();
+    let steps = kernel.trace.side_note.steps.len();
+    let mut tail = SegmentCursor::new(&kernel.trace.side_note).side_note(2, steps);
+    let proof = prove_shaped(&mut tail, &shape, &SEGMENT).unwrap();
+    assert_eq!(verify_kernel_segment(proof.clone(), &program).unwrap(), 0);
+    let error = verify_kernel_chain(vec![proof], &program, &entry).unwrap_err();
+    assert!(error.to_string().contains("first timestamp"), "{error}");
+
+    let proof = prove_shaped(&mut kernel.whole(), &shape, &SEGMENT).unwrap();
+    type Change = (fn(&mut Proof), &'static str);
+    let changes: [Change; 3] = [
+        (|p| p.initial_state.timestamp += 1, "first timestamp"),
+        (|p| p.initial_state.pc += 1, "entry"),
+        (|p| p.initial_state.registers[1] -= 8, "registers"),
+    ];
+    for (change, reason) in changes {
+        let mut changed = proof.clone();
+        change(&mut changed);
+        let error = verify_kernel_chain(vec![changed], &program, &entry).unwrap_err();
+        assert!(error.to_string().contains(reason), "{error}");
+    }
+    verify_kernel_chain(vec![proof], &program, &entry).unwrap();
+}
+
+/// A chain that does not end at the halt is refused: a run proved up to
+/// its last step verifies as a segment of the kernel, but not as its run.
+#[test]
+fn a_chain_not_ending_at_the_halt_is_refused() {
+    let (kernel, program, shape) = areas();
+    let steps = kernel.trace.side_note.steps.len();
+    let mut head = SegmentCursor::new(&kernel.trace.side_note).side_note(0, steps - 1);
+    let proof = prove_shaped(&mut head, &shape, &SEGMENT).unwrap();
+    assert_ne!(proof.final_state.pc, HALT_PC);
+    assert_eq!(verify_kernel_segment(proof.clone(), &program).unwrap(), 0);
+    let error = verify_kernel_chain(vec![proof], &program, &kernel.entry()).unwrap_err();
+    assert!(error.to_string().contains("halt"), "{error}");
 }

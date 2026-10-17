@@ -5,7 +5,7 @@ version.workspace = true
 license = "Apache-2.0"
 
 [features]
-default = ["prover"]
+default = ["prover", "wire"]
 # Prover-side: trace generation, proof creation, the tracer, blake3 commitments,
 # and parallel iteration.  Disable for a verifier-only build (smaller dep tree,
 # no_std-friendly, builds for wasm32-unknown-unknown).
@@ -33,6 +33,8 @@ prover = [
     "serde/std",
     "num-traits/std",
 ]
+# A kernel's shape read from its install's record (`vos_wire::records::Shape`).
+wire = ["dep:vos-wire"]
 # Diagnostic helpers (`debug_claimed_sums`) for prover-side debugging of
 # logup imbalances.  Off by default so the production prover surface
 # stays clean; turn on with `--features debug-internals` to bisect
@@ -55,18 +57,19 @@ stwo-constraint-framework = { workspace = true }
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 num-traits = { version = "0.2", default-features = false }
 impl-trait-for-tuples = { workspace = true }
+# A kernel's entry, its registers as the loader lays it out, and its hash.
+vos-pvm-program = { workspace = true }
+vos-pvm-precompiles = { path = "precompiles", default-features = false, features = ["blake2b"] }
+vos-wire = { workspace = true, optional = true }
 rayon = { workspace = true, optional = true }
 blake3 = { version = "1", optional = true }
 
 [dev-dependencies]
 vos-pvm-compiler = { workspace = true }
-vos-pvm-precompiles = { path = "precompiles", default-features = false, features = ["blake2b"] }
-vos-pvm-program = { workspace = true }
 # The agent's reference model and the test actors it runs (`just
 # build-test-actors`): a kernel's live run, which the prover's re-run of
 # it must match.
 vos-testkit = { path = "../../agent/testkit" }
-vos-wire = { workspace = true }
 bincode = "1"
 # no_std + serde wire format shared with the PVM settlement verifier
 # (settlement-verifier): the fixture this crate serializes is deserialized there.
