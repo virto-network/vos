@@ -390,6 +390,221 @@ its channel, its parameters, its encodings and its floors.
 - Clippy with `-D warnings` on the workspace and on the proof crates with
   `debug-internals`.
 
+## Step 5.4: a shape per kernel
+
+### The shape
+
+- **Its chips come from the kernel's code** (`pvm/compiler/src/shape.rs`,
+  computed by derive): each instruction's opcode selects the chips it uses,
+  as the AIR's CPU classifies it (MUL for multiplies, left shifts and
+  rotates; DIVREM for divisions, remainders and right shifts; BITWISE;
+  COMPARE for set-less-than, cmov, min, max and branches; POPCOUNT;
+  BITCOUNT; JUMP_TABLE for indirect jumps), and an `ecalli` those of the
+  precompile it names (BLAKE2B for `0x400`, WITNESS_INPUT and COMPARE for
+  `0x401`). The other 16 chips are in every shape (`chip_idx::ALWAYS`): the
+  CPU, the ledgers and their boundaries, the program's memory and boundary,
+  the page Merkle chips and the fixed tables. The seam `d165a7b6` counted
+  every `ecalli` as BLAKE2b; derive now decodes the id. The prover's tests
+  hold derive to the AIR opcode by opcode (`chip_idx::OPTIONAL` names the
+  nine chips a trace may leave out).
+- **Every derived kernel holds BLAKE2B, WITNESS_INPUT and COMPARE:** its
+  prologue reads its arguments through `0x401`, and it hashes its io-hash
+  through `0x400`. Its SDK code (decoding, the allocator) reaches MUL,
+  DIVREM, BITWISE and JUMP_TABLE too. So the window kernel, the `kernels`
+  actor's three kernels and any kernel the SDK derives have the same
+  shape, **23 of 25 chips: every chip but POPCOUNT and BITCOUNT**. The
+  audit's solvency predicate without BLAKE2B (4,538 columns) no longer
+  exists.
+- **Every log size is pinned per class.** A class is a cut, at most
+  2^`log_steps` steps and `pages` touched pages a segment, and gives each
+  chip of the shape a log size: the fixed tables' and boundaries' sizes,
+  the program memory's and jump table's from the code, and for the chips a
+  run fills a size the cut bounds or provisions (`capacity`). A segment
+  lists the pages it touches and page 0, so the page chips are sized for
+  `pages + 1`. Derive's classes, cheapest first:
+
+  | class | steps | pages | CPU | BLAKE2B | BLAKE2B_BOUNDARY | MEMORY | MEMORY_PAGE | MEMORY_MERKLE | REGISTER_MEMORY | WITNESS_INPUT | ALU (4) | cells, window kernel [measured from its shape] |
+  |---|---|---|---|---|---|---|---|---|---|---|---|---|
+  | 0 | 2^12 | 8 | 12 | 11 | 16 | 17 | 9 | 8 | 14 | 16 | 12 | 122.0M |
+  | 1 | 2^15 | 8 | 15 | 14 | 16 | 18 | 9 | 8 | 17 | 16 | 15 | 228.8M |
+  | 2 | 2^12 | 24 | 12 | 11 | 18 | 18 | 10 | 9 | 14 | 16 | 12 | 411.4M |
+
+  Class 2 holds a whole argument written in one step, a request's 64 KiB
+  being 17 pages: the budgeted cut makes that step a segment of its own.
+- **Every chip now pads.** CPU, MEMORY, MEMORY_MERKLE, REGISTER_MEMORY,
+  WITNESS_INPUT, MUL, BITWISE, COMPARE and DIVREM took their natural size
+  whatever the floor; each pads its main trace to a floor now, as the three
+  canonical forcing chips did. Canonical proving passes its floors to the
+  forcing set alone (`chip_idx::FORCING`), so its proofs are unchanged.
+- **The prover** (`pvm/proof/src/prove/shaped.rs`): `prove_shaped` proves a
+  segment over exactly a segment shape, and refuses (`ProvingError::Shape`)
+  when a chip's rows need more than its size or a fixed chip's size is not
+  the shape's. `prove_kernel` cuts a run by a class's budgets
+  (`segment_bounds_budgeted`) and proves each window at the first class
+  whose sizes hold its natural sizes, halving a window none holds.
+  `program_commitment_for_shape` computes a class's preprocessed root from
+  the code alone (`kernel::kernel_side_note`): it is the root every segment
+  of the class commits.
+- **The verifier** (`vos-pvm-proof-verifier`): `verify_kernel_segment`
+  checks a proof against its kernel's program (below): the format, the
+  chips exactly the shape's (more or fewer refused, by name), the sizes
+  exactly one class's, then `verify_standalone` against that class's root.
+  The shape check is structural and comes before any cryptographic work.
+  `verify_kernel_chain` adds the image root and continuity. A shape must
+  hold `chip_idx::ALWAYS` and size every chip from 2^4 to 2^24, or the
+  program is refused.
+
+### Dropping a chip, under the hardened AIR
+
+Re-checked on the 25-chip AIR (`pvm/proof/src/shape.rs`):
+- **A proof over a subset is a proof of the full AIR** in which each
+  dropped chip's trace is its padding. Padding rows satisfy the chip's
+  constraints and add nothing to any relation: every full-set canonical
+  proof of a run that leaves a chip idle relies on it, and
+  `a_full_set_proof_is_refused` proves one. So a witness of the subset's
+  constraints and relations extends to the full set's, and a subset proves
+  no statement the full set cannot.
+- **Each optional chip answers requests whose multiplicities the committed
+  code fixes:** the CPU's opcode flags and its host-call dispatch, which
+  `ProgramMemory` binds per pc (the hardening's operand binding and the
+  dispatch id), zero on padding rows. Without the chip a relation balances
+  only if no row makes such a request; `a_run_needing_a_dropped_chip_does_not_verify`
+  drops MUL from a run that multiplies, and the verifier refuses the logup
+  sum. The tables' and the ALU chips' own requests to the always-present
+  tables vanish with them.
+- **The binding chips are never dropped:** `chip_idx::ALWAYS` holds the
+  three boundary-binding chips, the memory root boundary, both ledgers, the
+  program memory and boundary; a shape without one is refused, and the
+  verifier's boundary binding still requires its own three.
+
+### The `Derivation`
+
+`Kernel` (`agent/wire/src/records.rs`) gains `shape: Shape { chips,
+classes: [SegmentClass { log_steps, pages, log_sizes }] }`, computed by
+derive (`Derived::shapes`, one a kernel) and taken by `Derivation::new`,
+so a node's install and a JAM builder's agree. A class's sizes are a
+fixed `[u8; 25]` by chip (0 outside the shape), so a kernel's record
+decodes with one allocation. The wire test pins the encoding: the mask as
+a u32, the classes' count, each class's byte, u16 and 25 bytes; 92 bytes a
+kernel for derive's three classes. A kernel's record is no longer `Copy`.
+
+**Found by the gate, and fixed:** a refine's start reserve
+(`defaults::refine_start`, 20 gas a byte) did not cover decoding a batch
+of installs: a kernel's record decodes at about 2.9k gas before the shape
+and 8.2k with it [measured], 40–60 gas a byte, so a batch of six installs
+of the `wide` actor's 33 kernels trapped already before this step
+(measured with the shapes emptied: 0.57M spent of 0.45M kept), and `an_install_past_the_jam_limits_is_refused`
+trapped with the shapes. `defaults::batch_start` adds `DECODE_KERNEL`
+(8,000 gas) for each kernel a batch's installs name; every node, the JAM
+builder's fit, its simulation and the reference runner give a refine
+`batch_start`. `the_start_reserves_cover_decoding_a_batch` measures the
+six installs: 1.63M of 2.37M kept.
+
+### The program id (`pvm/proof/src/program_id.rs`)
+
+- **Its preimage,** M31 words, every value in A.3's limbs (a u32 two
+  16-bit limbs, a 32-byte hash 16, a byte or a log size one, a
+  Poseidon2-M31 root its eight words): the domain `vos/program-id` and the
+  version 2; `TRANSPILER_VERSION`; the `ProgramHash`; the shape (the mask,
+  the classes' count, each class's steps, pages and log sizes); the segment
+  format (31), which names the channel; each class's preprocessed root; the
+  image root; the leaf-circuit slot, its version 0 and a count of 0, which
+  5.12 fills.
+- **The id** is the recursion AIR's `p2` leaf mode over the preimage (eight
+  words a permutation into the rate, then a 1 and zeros), so a fold
+  recomputes it with the rows it already has. A test recomputes it from the
+  raw permutation; a golden vector pins it; a test moves each field and
+  sees the id move.
+- It is assembled from the install's record and the classes' roots
+  (`program_commitment_for_shape`, 0.7–1.3 s for the window kernel's three
+  classes [measured]). It is not yet in the `Derivation`: the roots need the
+  prover, which an install does not run.
+
+### Tests
+
+- `pvm/proof/tests/kernel_shape.rs` (`just test-proof`), on the `kernels`
+  actor's `digest`, which hashes its input as the window kernel does, and
+  `areas`, which hashes only its io-hash, as a solvency predicate:
+  - derive reads the AIR's chips, opcode by opcode, and the same order and
+    always-present set;
+  - each kernel's runs stay within the shape its install recorded;
+  - both prove over their shapes, every segment at its first class, and
+    their chains verify against their programs, each root its class's;
+  - a full-set proof of the same run verifies alone and is refused as the
+    kernel's (0x60000 more chips);
+  - a proof missing a chip is refused (a kernel that jumps over a count of
+    set bits: proved without POPCOUNT, it verifies alone; as the kernel's it
+    is refused, 0x20000 fewer; over its shape it verifies);
+  - a proof at another log size (CPU one larger) is refused;
+  - a run needing a dropped chip does not verify;
+  - a segment past its class is refused by the prover, naming the chip.
+- Unit tests: a proof is of exactly one class; a malformed shape is
+  refused; the program id's layout and golden vector, the leaf mode, every
+  field moving it, and a malformed program refused.
+- **The window kernel** (spike 3's settlement-window actor rebuilt on
+  vos-core, `spikes/s5-shape/window`, its cipher-clerk Ristretto calls
+  served in software by its shim; derive prunes them from the kernel) runs
+  live on the agent's reference model on the 8-journal window, re-traces
+  from its attest to the same output, proves over its shape and verifies as
+  a chain against its program; its full-set proofs are refused as the
+  kernel's.
+
+### Measured
+
+The window kernel, 8 journals (`n1000000-j8`), format 31, 8 threads of an
+Intel Core Ultra 7 155H shared with other agents' runs (load average
+12–18) [measured]:
+- **The run:** 404,091 steps, 687 kernel compressions, a 26,130-byte
+  witness input; cut at class 1's budgets into 17 segments: the witness
+  step's 151-step window and the last at class 0, the other 15 at class 1
+  (the page budget closes four early: 10.6k–17.1k steps).
+- **Proving:** 17 segments in 184–317 s; per 32k segment alone 7.1–18.6 s
+  (the faster runs 7.1–9.3 s), class 0 segments 4.1–6.9 s; peak RSS
+  6.4–7.0 GiB, under 14 GiB. Proofs 1.41–2.02 MB (postcard).
+- **Columns:** the shape 8,024 (180 preprocessed, 4,880 main, 2,956
+  interaction, 8 composition), the full set 8,039: **15 fewer (0.19%)**,
+  POPCOUNT's and BITCOUNT's.
+- **Verify gas on the JAM-only host** (`spikes/s5-shape/guest-verify`, spike
+  1's guest and harness on the current verifier: vos-pvm's GP 0.8.0
+  instruction gas with PolkaJam's host-call prices):
+
+  | segment | shape (23 chips, class sizes) | full set (25) | natural (22, unpinned) |
+  |---|---|---|---|
+  | 4 (32k, class 1) | 3.3465B | 3.3596B | 3.3439B |
+  | 7 (32k, class 1) | 3.3510B | 3.3569B | 3.3375B |
+
+  **The shape saves 0.18–0.39% against the full set.** Against an unpinned
+  proof over the chips the segment uses, pinning costs 0.08–0.40% (padded
+  ALU chips, WITNESS_INPUT present in every segment). A class 0 segment
+  verifies in 3.28–3.33B: verify gas hardly follows rows. Native verify
+  62–546 ms by load; the guest's peak live heap 6.3 MiB.
+- **The gate:** exact-set acceptance holds (the refusals above, natively
+  and in the tests). The saving is recorded: 0.2–0.4% of verify gas, not
+  the 30% the plan's gate assumed. The audit's 38% was the Ristretto chips'
+  (42% of the columns), which 5.5b removed; what a kernel's code leaves out
+  of the hardened AIR is two small tables.
+
+### Findings
+
+- **The shape is now about identity and the leaf, not gas.** It pins every
+  log size, which the leaf circuit needs as constants and the program id
+  binds; its column saving is two tables'.
+- **Pinning costs prover time:** each class pads the ALU chips to its step
+  count (2^15 against 2^9–2^13 natural at the 32k cut) and WITNESS_INPUT
+  to 2^16 in every segment. A narrower ALU capacity, or WITNESS_INPUT
+  in the entry segment's class alone, would cut it; a window that
+  overflows a narrower class is cut in half and proved twice, so the
+  capacities here hold a step's worst case where it is cheap.
+- **A segment lists one page past its cut:** the page Merkle boundary
+  always lists page 0, so the page chips are sized for `pages + 1`.
+
+### Gates
+
+[measured, on this machine, each under `systemd-run` at 14 GiB with
+`nice -n 10` and `CARGO_INCREMENTAL=0`]: `just check` green, 1,005 tests;
+`just test-proof` green, 555 tests (`kernel_shape` 8, and 6 new unit
+tests); `just clippy` clean.
+
 ## Step 5.5: the witness-input precompile, the run's ends and the io-hash
 
 ### The witness input, `0x401`
