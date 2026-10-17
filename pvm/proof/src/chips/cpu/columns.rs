@@ -807,7 +807,8 @@ pub enum Column {
     /// (bit i = flag[8*k + i]).  The byte-to-bits
     /// lookup per row pins these bits to the matching CpuChip flag
     /// columns (or sum-of-sub-flags expressions for the 4 folded
-    /// category slots: is_bitwise, is_compare, is_branch, is_store).  ProgramMemoryChip's preprocessed
+    /// category slots: is_bitwise, is_compare, is_branch, is_store).
+    /// ProgramMemoryChip's preprocessed
     /// FlagByte0..5 columns hold the canonical values; the prog_mem
     /// lookup balance pins each FlagByteI on CpuChip to canonical.
     /// Layout per byte is documented in `lookups/relations.rs` next

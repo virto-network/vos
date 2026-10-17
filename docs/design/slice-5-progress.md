@@ -628,3 +628,92 @@ ids (step 5.5's last section).
   election has time to end.
 
 **Gates:** `just check` on each commit, 995 tests at the last; the node suites at the end: cluster and processes in it, the faults process tests and the five-process fault suite.
+
+## 5.5b hardening: ARITH
+
+The arithmetic holes of the AIR audit (G3, and G1's X-DIVHI), closed on
+`s5-hard-arith` (format 30, Poseidon2 31). Each forgery is a permanent
+gate in `pvm/proof/tests/arith_gate.rs`: an execution whose destination
+register holds the forged value in every step from the forged one on, so
+the register ledger and the closing state agree with it, proved by forged
+chips that rewrite MulChip's, DivRemChip's and the CpuChip's division
+columns (and move the lookup multiplicities with them) between trace
+generation and commitment, then verified with the real chips. Before the
+fix all eight proved and verified [measured]; after it each is refused.
+
+| hole | forgery (arith_gate.rs) | before | after |
+|---|---|---|---|
+| G3-1 MulChip carries free | `mul64_carries_solved_in_m31_refused` (6·7 as 41), `shlo_l64_…` (1 << 3 as 0xDEAD_BEEF) | accepted | refused: logup sum not zero (non-byte carries) |
+| G3-2 DivRem schoolbook free | `divu64_carries_solved_in_m31_refused` (100/7 as 13) | accepted | refused: logup sum not zero |
+| G3-3 magnitude chains | `rems64_magnitude_carries_solved_in_m31_refused` (−100 rem 7 as −9, \|r\| claimed 0) | accepted | refused: constraints (boolean AbsR carries) |
+| G3-3 signed correction carries free | `divs64_correction_carries_solved_in_m31_refused` (−100/7 as 0xDB6D…DB60 rem −4) | accepted | refused: logup sum not zero |
+| G3-4 / X-DIVHI high half free | `shlo_r64_quotient_top_bits_refused` (0x1000 >> 12 as 1 + 2^52, all carries bytes) | accepted | refused: constraints (H = 0) |
+| G3-4 SharR = ShloR | `shar_r64_sign_dropped_refused` (−1024 >> 3 as the logical shift) | accepted | refused: constraints (floor-division H) |
+| new: 32-bit divisor magnitude | `divs32_negative_divisor_magnitude_refused` (100 / −7 as −13 rem 9, every chain over the integers) | accepted | refused: constraints (\|d\| of the sign-extended word) |
+
+Controls, refused before and after: the honest filler's witness for a
+forged product, the low bits of a shift quotient, and `13·7 + 9 = 100`
+with `r ≥ d`; the harness proves an honest execution.
+
+- **The fixes** (`chips/mul.rs`, `chips/divrem.rs`): Range256 on every
+  byte and carry the chains read — MulChip 64 emissions a row (low and
+  high products, `MulHigh`, the 32 schoolbook and 8 correction carries),
+  DivRemChip 96 (quotient, remainder, high half, the 32 schoolbook and 8
+  correction carries, `AbsD`, `AbsR`, the two compare chains' bytes) —
+  and boolean `AbsDCarry`/`AbsRCarry`/`AbsCmpCarry`/`DivCmpCarry`. Every
+  chain equation then stays below 2^25 and holds over the integers; the
+  schoolbook's final carry is 0 because `q·d + r < 2^(2W)`. DivRemChip
+  pins the schoolbook's high half `H`: `H = 0` on unsigned division and
+  ShloR; `H ≡ sq·d + sd·q + sr − sb + k (mod 2^W)` on DivS/RemS, written
+  with `−sb` as `sb·(2^W − 1)` so the carries stay in {0, 1, 2}; and
+  `H ≡ sq·d − sb` on SharR (the same chain with `sd·q` dropped — a shift's
+  `2^63` is unsigned — and `sr = 0` by `r < d`), which with `0 ≤ r < d`
+  is floor division. These are the auditors' minimal fixes; the SharR
+  high half, their `sb·(d − 1)`, is `sq·d − sb` through the signed chain
+  (equal, as floor division gives `q` the sign of `b`), which reuses its
+  columns.
+- **The flag** (CPU, kept minimal): the DivRem tuple gains `is_shar_r`
+  (41 limbs). It must be committed per opcode, and the 80 flag bits were
+  all in use, so flag byte 0's bit 3 now commits `is_shar_r` in place of
+  `is_mul_upper`, which its three variants (bytes 2–3, bound bit by bit)
+  already imply. CpuChip gains the `IsSharR` column; the byte-0
+  byte-to-bits tuple and the DivRem emission carry it. Program
+  commitments of code with an arithmetic shift or a MulUpper change.
+- **Completeness** (G3-5), each now a positive test in `phase2_alu.rs`:
+  DivS/RemS `MIN / −1` at both widths — a boolean `DivOverflow` adds 1 to
+  the correction, allowed only on a signed division by −1 (all-ones
+  divisor word), where `|r| < 1` and the identity force `b = q = MIN`;
+  `−256 / 256` (the offset chain); DivU32/RemU32/ShloR32 results with bit
+  31 set (a 32-bit row's quotient and remainder are sign-extended words,
+  the `r < d` decision read at byte 3); SharR32 of negative values
+  (`r` taken mod 2^32); SharR by the top bit at both widths. Also found
+  and fixed: a 32-bit remainder by zero of a value with bit 31 set
+  (CpuChip bound the result's high word to the truncated dividend's
+  zeros; `DbzActiveRem64H` now binds it on 64-bit rows only, the 32-bit
+  sign extension covering the rest).
+- **Found here, fixed** (beyond G3): a 32-bit signed division by a
+  negative divisor took `|d|` over the 8 bytes of the zero-extended word,
+  about 2^64, so `|r| < |d|` held for any remainder — a forgery surviving
+  every G3 fix. The magnitude chain now reads the sign-extended word.
+- **G3-6** (and G1's T-WEAK): `forge_two_reg_result`,
+  `forge_three_reg_result` and alu_negative's direct forgeries carry the
+  forged value through every later step (`forge_first_result`), so only
+  the op's own constraints can refuse them; the chips' internal-witness
+  forgeries are arith_gate's. All still refused.
+- **Restructured:** DivRemChip computes its own row (`divrem::entry`,
+  `witness`, `range_checked_bytes`); the CpuChip fill calls it instead of
+  carrying ~300 lines of the chip's chains, and both chips' Range256
+  multiplicities come from the chip's own list.
+- **Width** [measured]: the full shape commits 7,846 columns (173
+  preprocessed, 5,109 main, 2,556 interaction, 8 composition), from 7,556.
+- **Gates** [measured, on this machine]: `just check` green, 998 tests;
+  `just test-proof` under
+  `systemd-run` at 14 GiB with `nice -n 10` green, 493 tests; `just
+  test-bench-proof` green; `just clippy` clean.
+- **Files outside the track's own**, each change isolated: `cpu/classify.rs`
+  (`is_shar_r`, the byte-0 slot), `cpu/columns.rs` (`IsSharR`,
+  `DbzActiveRem64H`), `cpu/mod.rs` and `cpu/interaction.rs` (the byte-0
+  tuple's slot, the DivRem tuple's field, the remainder-by-zero binding),
+  `cpu/trace_fill.rs` (the DivRem block replaced by `divrem::entry`, the
+  multiplicity charges), `side_note.rs` (`DivRemEntry`), `proof.rs` and
+  `refine/tests.rs` (the format), `tests/common/mod.rs`.
