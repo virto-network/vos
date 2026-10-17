@@ -16,6 +16,8 @@ Plan, draft 8.
   pushing the Stwo fork (2026-10-16).
 - **M0 is done** (`slice-5-progress.md`, "M0 acceptance"). Where its outcome
   changed M1's premises, M1's opening and its steps say so.
+- **M0's milestone review is folded in.** Its stale docs are fixed, and
+  its preparation items open M1 as 5.8.0.
 
 ## Goals
 
@@ -71,9 +73,8 @@ No proof leaves a test in this slice: masking is slice 6.
   - the window kernel runs only in `test-proof`, under `systemd-run`
     at `proving.md` A.7's memory caps. A.7 also gives each heavy
     test's expected wall time.
-- **Fixtures** come from a generator in the M0 pipeline, regenerated at
-  each format bump and stored under `pvm/proof/fixtures` (about 1.2 MB
-  for A.6).
+- **Fixtures** come from a generator (5.8.0), regenerated at each format
+  bump and stored under `pvm/proof/fixtures` (about 1.2 MB for A.6).
 - **Rules:**
   - commit on `vos-core` and never rewrite what is on origin;
   - push after reviewed milestones;
@@ -330,8 +331,8 @@ No proof leaves a test in this slice: masking is slice 6.
 
 ## M1: the recursion, unmasked, in tests
 
-Steps 5.8–5.15 are `recursion-air.md` §10's, in its order; 5.9 runs
-beside 5.8.
+5.8.0 prepares the line. Steps 5.8–5.15 are then `recursion-air.md` §10's,
+in its order; 5.9 runs beside 5.8.
 
 **What M0 changed under M1:**
 - **Formats:** segments are 31 (Poseidon2-M31), leaves and folds 32, the
@@ -349,7 +350,89 @@ beside 5.8.
   leaf's `p2` comes to about 64.8k of 2^16 (below). The ~9,300-column
   headroom (`recursion-air.md` §5) was counted at 39 queries; at 44 it is
   about 8,100 columns [model]. The full 8,039 still fits, with about 1% of
-  `p2`'s rows to spare.
+  `p2`'s rows to spare. 5.8.0 holds the rule that recounts it and picks a
+  lever.
+- **`count.log` predates the hardening:** 4,223 constraints and 7,519
+  columns, against 5,177 and 8,039 now. 5.9 re-baselines it before any
+  gate compares against it.
+
+### 5.8.0 Preparation
+
+M0's milestone review left these before the recursion builds on them.
+
+- **The window kernel on the line.** Today it lives only on
+  `spike/s5-shape`, built on cipher-clerk through a software Ristretto
+  shim. 5.11, 5.12 and 5.15 need it in `test-proof`.
+  - **The route:** a test actor, `window`, under `agent/test-actors`, on
+    cipher-clerk v0.3.0 with `settlement` and without `pvm-precompile`.
+    That feature is what names the shim, so none is needed. The kernel is
+    written on the line; the spike's kernel is a reference only, and its
+    shim, harness and patched workspace stay on the spike.
+  - **The curve code:** cipher-clerk depends on curve25519-dalek
+    unconditionally, so dalek compiles in, but the settlement window
+    reaches none of it [read, not built]. Derive refuses only a kernel
+    that reaches ids 110–114.
+  - **The cost:** without the precompile feature, `PseudoAccount::of`
+    hashes with the `blake2` crate in software, so the kernel's steps and
+    classes move from the spike's 404,091 steps. The step measures them
+    again.
+  - **The fallback:** if the actor does not build for the guest target,
+    or derive refuses it, the kernel is a window-like kernel in the
+    `kernels` actor: a vos-tree multiproof over the BLAKE2b compress
+    precompile and a netting of its rows, without cipher-clerk. The step's
+    log says which route it took.
+- **The A.6 fixture generator** (`pvm/proof/fixtures`). M0 promised it
+  and did not build it, a deviation (`slice-5-progress.md`). It is built
+  here: a generator for each admitted format, and a test that refuses a
+  stale fixture. The segment fixtures land now; 5.15 adds A.6's statement
+  fixtures once the wrap exists.
+- **One no_std Poseidon2 crate,** with no Stwo dependency: the
+  permutation, its parameters, and the sponge and Merkle modes.
+  - Its users: the prover, the settlement verifier, and later
+    `recair-air` and `vos-final-verifier`.
+  - Today there are two copies (`pvm/proof/src/poseidon2/mod.rs`,
+    `pvm/proof/settlement-verifier/src/lib.rs`), held together by a test
+    (`tests/poseidon2_round_constants.rs`).
+- **One transcript prefix.**
+  - `verify/recursion.rs:195-290` copies `verify.rs:308-410`, and mixes
+    the boundary states only `if side_note.closing_chip_active`.
+  - One function serves both, and A.1's in-AIR transcript follows it.
+  - `tests/recursion_seams.rs:45`'s `..._format_26_...` is renamed for
+    format 31.
+- **One page tree.** `page_merkle.rs:74-140` re-implements
+  `vos_pvm_program::image`'s tree; it reuses it, and the stale comment at
+  `:75` (formats 12 to 21) goes.
+- **`chips/cpu/mod.rs`'s `add_constraints` split by instruction class.**
+  It is 3,560 lines, and 5.9 pins gate mismatches chip by chip. The same
+  constraints in the same order, so proofs stay byte-identical.
+- **The inner parameters, recounted: the decision rule.**
+  - **When:** at 5.10's start, on 5.9's re-baselined count, the kernel
+    leaf is recounted over the hardened 8,024-column shape at the inner
+    parameters.
+  - **The rule:** if `p2`'s headroom is under 10% of 2^16, a new segment
+    format is registered with fewer queries and more PoW. The milestone
+    review's count [model]:
+    - PoW 24 with 40 queries: 62.86 proven and 104 conjectured bits,
+      about 6k fewer `p2` rows;
+    - PoW 22 with 42 queries: about 3k fewer.
+  - **The trade:** PoW 24 grinds about 0.4 s more a segment.
+  - **Only the segment format moves.** Leaves and folds (32) keep 44
+    queries, since a fold uses under half the shape. A new format takes a
+    new number; 31 is never re-registered with other parameters.
+  - **FRI fold step 3 stays the wrap's only.** In-AIR fold step 3 is not
+    built (5.10).
+- **Later, at the slice's code-quality pass** (5.16), recorded here:
+  - the `*_gate.rs` and `*_negative.rs` tests grouped under
+    `tests/gates/`;
+  - `phase2_alu.rs` renamed;
+  - `divrem.rs` (1,059 lines) split;
+  - `proof.rs:90-245`'s changelog moved to `docs/status.md`.
+- **Tests:** `just check` green; the shared Poseidon2, prefix and page
+  tree, and the CPU split, leave proof bytes and the fixtures unchanged;
+  the window kernel proves and verifies over its shape in `test-proof`.
+- **Reviews:** Opus on each item; Fable on a new segment format, if the
+  rule registers one.
+- **Estimate:** 1–2 weeks.
 
 ### 5.8 The gate VM (F)
 
@@ -394,8 +477,12 @@ beside 5.8.
 - **Beside 5.8:** it needs the gate set's definition, not the VM.
 - **Tests:** §3's four equivalence tests (constraint ≡ gate on random
   points), on all 25 chips.
+- **The baseline first.** `count.log` predates the hardening (4,223
+  constraints and 7,519 columns, against 5,177 and 8,039 now). At 5.9's
+  start, the gate-count crate from `spike/s5-recair` re-runs on the
+  hardened AIR, and its log is the baseline for 5.9 and 5.11.
 - **Gate:** 25 of 25 chips are equivalent, with counts within 1% of the
-  spike's log.
+  re-baselined log.
 - **Estimate:** 1–2 weeks.
 
 ### 5.10 The in-AIR verifier's pieces (F)
@@ -409,10 +496,12 @@ beside 5.8.
   - DEEP through `h8`;
   - OODS through compiled gates;
   - the logup sums, including the boundary chips' public terms
-    (`boundary_binding.rs:116-168`).
+    (`boundary_binding.rs:147-205`).
+- **At its start,** 5.8.0's rule recounts the inner parameters, and the
+  pieces take the segment format it leaves.
 - **In-AIR FRI fold step 3 is not built:** no inner proof uses it, and
-  the wrap's is verified natively. It stays a lever for inner proofs
-  (`p2` 55.3k → 49.2k rows).
+  the wrap's is verified natively. Fewer queries with more PoW comes
+  first (5.8.0).
 - **The transcript** follows `proving.md` A.1.
 - **Tests:**
   - each piece against the native code, on recorded data;
@@ -432,8 +521,8 @@ beside 5.8.
 - **Tests:**
   - a tampered OODS sample, queried value, sibling, FRI value and nonce
     are each refused;
-  - a regression test pins the topology's rows per term of
-    `count.log`, not only its totals.
+  - a regression test pins the topology's rows per term of the
+    re-baselined log (5.9), not only its totals.
 - **Gate:**
   - COMPARE's rows within 15% of 8,488 / 10,869 / 273, and at most 1 s;
   - the kernel leaf's topology within 2^16 / 2^17 / 2^16. `count.log`
@@ -443,8 +532,9 @@ beside 5.8.
     scaled by the measured columns, samples and constraints], plus about
     25 `p2` rows for the byte-form digests. `p2` sits within about 1% of
     2^16, so this count comes first. If it passes 2^16, the levers are
-    FRI fold step 3 in inner proofs (about −7k `p2` rows) or `p2` at
-    2^17.
+    fewer queries with more PoW (5.8.0's rule: PoW 24 and 40 queries,
+    about −6k `p2` rows), FRI fold step 3 in inner proofs (about −7k),
+    or `p2` at 2^17.
 - **Estimate:** 1–2 weeks.
 
 ### 5.12 The kernel leaves (F)
@@ -568,15 +658,17 @@ beside 5.8.
 | | weeks |
 |---|---|
 | M0 (5.1–5.7) | 6–9 |
+| M1's preparation (5.8.0) | 1–2 |
 | M1 (5.8–5.15) | 17–24 |
 | reviews and acceptance | 2–3 |
-| **slice 5** | **25–36** |
+| **slice 5** | **26–38** |
 
 - **M0 runs on two tracks.** Its critical path is 5.1 → 5.2 → 5.4, and
   5.5 → 5.12 across the milestones. 5.7 (2–3 weeks) runs beside it.
-- **M1's 17–24** sit below spike 4b §8's 20–28 to a working tree for our
-  own AIR: the design and its counts are now measured, and production
-  hardening (the audit, masking) is slice 6.
+- **M1 is 18–26 in all:** 5.8.0's 1–2, then 17–24 for 5.8–5.15. Those
+  sit below spike 4b §8's 20–28 to a working tree for our own AIR: the
+  design and its counts are now measured, and production hardening (the
+  audit, masking) is slice 6.
 
 ## Decisions
 
@@ -609,4 +701,5 @@ its gate. This slice's sharpest:
   external audit before value.
 - **The model's rows:** 5.11 counts the kernel leaf's topology term by
   term, weeks before 5.12 proves it. At 44 queries over the hardened
-  shape, its `p2` sits within about 1% of 2^16 [model].
+  shape, its `p2` sits within about 1% of 2^16 [model], so 5.8.0's rule
+  recounts it at 5.10's start and moves the segment format if it must.
