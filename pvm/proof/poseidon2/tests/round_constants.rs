@@ -1,7 +1,7 @@
 //! Vetted width-16 M31 Poseidon2 round constants.
 //!
 //! Generates the round constants for the Poseidon2-M31 permutation
-//! (`vos_pvm_proof::poseidon2`) via the **canonical Grain LFSR** specified in the
+//! (`vos_poseidon2`) via the **canonical Grain LFSR** specified in the
 //! POSEIDON paper (eprint 2019/458 §4.1) and reused by Poseidon2 (eprint
 //! 2023/323), seeded with our exact parameters. Two upstream references pin the
 //! algorithm and the Poseidon2-specific layout:
@@ -13,15 +13,14 @@
 //!     plus ONE per internal round.
 //!
 //! This is the reference the baked `EXTERNAL_ROUND_CONSTS` /
-//! `INTERNAL_ROUND_CONSTS` in `src/poseidon2/mod.rs` are pinned to. Run with
+//! `INTERNAL_ROUND_CONSTS` in `src/permutation.rs` are pinned to. Run with
 //! `--nocapture` to dump the constants for (re-)baking; the
 //! `round_constants_match_baked` test then asserts the module's baked arrays
 //! equal the freshly-generated ones (the constants-vector test).
 //!
-//! Run: `cargo test -p vos-pvm-proof --test poseidon2_round_constants -- --nocapture`
+//! Run: `cargo test -p vos-poseidon2 --test round_constants -- --nocapture`
 
-use stwo::core::fields::m31::BaseField;
-use vos_pvm_proof::poseidon2::{FULL_ROUNDS, N_HALF_FULL_ROUNDS, N_PARTIAL_ROUNDS, N_STATE};
+use vos_poseidon2::{FULL_ROUNDS, M31, N_HALF_FULL_ROUNDS, N_PARTIAL_ROUNDS, N_STATE};
 
 const M31_PRIME: u32 = (1 << 31) - 1; // 2^31 - 1 = 2147483647
 const FIELD_SIZE_BITS: usize = 31; // ceil(log2(p)) for M31
@@ -110,22 +109,22 @@ fn grain_round_constants() -> ([[u32; N_STATE]; FULL_ROUNDS], [u32; N_PARTIAL_RO
 fn dump_round_constants() {
     let (external, internal) = grain_round_constants();
     println!("// === width-16 M31 Poseidon2 round constants (Grain LFSR) ===");
-    println!("pub const EXTERNAL_ROUND_CONSTS: [[BaseField; N_STATE]; FULL_ROUNDS] = [");
+    println!("pub const EXTERNAL_ROUND_CONSTS: [[M31; N_STATE]; FULL_ROUNDS] = [");
     for round in &external {
         print!("    [");
         for (i, c) in round.iter().enumerate() {
             if i > 0 {
                 print!(", ");
             }
-            print!("BaseField::from_u32_unchecked({c})");
+            print!("M31::new({c})");
         }
         println!("],");
     }
     println!("];");
-    println!("pub const INTERNAL_ROUND_CONSTS: [BaseField; N_PARTIAL_ROUNDS] = [");
+    println!("pub const INTERNAL_ROUND_CONSTS: [M31; N_PARTIAL_ROUNDS] = [");
     print!("    ");
     for c in &internal {
-        print!("BaseField::from_u32_unchecked({c}), ");
+        print!("M31::new({c}), ");
     }
     println!();
     println!("];");
@@ -169,13 +168,13 @@ fn round_constants_match_baked() {
     // changed — re-run `dump_round_constants` and re-bake (and remember the
     // {C_0,C_1} allowlist is a function of these, so a change forces a re-bake).
     let (external, internal) = grain_round_constants();
-    let baked_external = vos_pvm_proof::poseidon2::EXTERNAL_ROUND_CONSTS;
-    let baked_internal = vos_pvm_proof::poseidon2::INTERNAL_ROUND_CONSTS;
+    let baked_external = vos_poseidon2::EXTERNAL_ROUND_CONSTS;
+    let baked_internal = vos_poseidon2::INTERNAL_ROUND_CONSTS;
     for (r, round) in external.iter().enumerate() {
         for (i, &c) in round.iter().enumerate() {
             assert_eq!(
                 baked_external[r][i],
-                BaseField::from_u32_unchecked(c),
+                M31::new(c),
                 "EXTERNAL_ROUND_CONSTS[{r}][{i}] drifted from the Grain reference"
             );
         }
@@ -183,7 +182,7 @@ fn round_constants_match_baked() {
     for (r, &c) in internal.iter().enumerate() {
         assert_eq!(
             baked_internal[r],
-            BaseField::from_u32_unchecked(c),
+            M31::new(c),
             "INTERNAL_ROUND_CONSTS[{r}] drifted from the Grain reference"
         );
     }

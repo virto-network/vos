@@ -3,7 +3,7 @@
 //! [`permute_x16`] takes the states of sixteen permutations side by side:
 //! `state[i][l]` is word `i` of permutation `l`. Every word must lie in
 //! `[0, P]`, and every output word is canonical, in `[0, P)`. Each lane equals
-//! [`super::permute`] on that lane's state.
+//! [`crate::permute`] on that lane's state.
 //!
 //! The instruction set is chosen at compile time, as Stwo's `SimdBackend`
 //! chooses its own: AVX-512F, else AVX2, else NEON, else the scalar
@@ -26,16 +26,15 @@
     allow(dead_code)
 )]
 
-use super::{
-    EXTERNAL_ROUND_CONSTS, FULL_ROUNDS, INTERNAL_DIAG_SHIFTS, INTERNAL_ROUND_CONSTS,
+use crate::{
+    EXTERNAL_ROUND_CONSTS, FULL_ROUNDS, INTERNAL_DIAG_SHIFTS, INTERNAL_ROUND_CONSTS, M31,
     N_HALF_FULL_ROUNDS, N_PARTIAL_ROUNDS, N_STATE,
 };
 
 /// The permutations [`permute_x16`] runs at once.
 pub const LANES: usize = 16;
 
-/// The modulus `2^31 - 1`.
-const P: u32 = (1 << 31) - 1;
+use crate::P;
 
 /// Sixteen permutation states, word-major: `state[word][lane]`.
 pub type States = [[u32; LANES]; N_STATE];
@@ -101,13 +100,11 @@ pub fn permute_x16(state: &mut States) {
     allow(dead_code)
 )]
 pub(crate) fn permute_x16_scalar(state: &mut States) {
-    use stwo::core::fields::m31::BaseField;
     for lane in 0..LANES {
-        let mut words: [BaseField; N_STATE] =
-            core::array::from_fn(|i| BaseField::reduce(state[i][lane] as u64));
-        super::permute(&mut words);
+        let mut words: [M31; N_STATE] = core::array::from_fn(|i| M31::from(state[i][lane]));
+        crate::permute(&mut words);
         for (word, value) in state.iter_mut().zip(words) {
-            word[lane] = value.0;
+            word[lane] = value.value();
         }
     }
 }
@@ -141,7 +138,7 @@ pub(crate) trait Vector: Copy {
 
 /// The reference Poseidon2 arrangement on sixteen lanes: the external
 /// matrix, 4 full rounds, 14 partial rounds, 4 full rounds (as
-/// [`super::permute_with`] under the reference constants).
+/// [`crate::permute_with`] under the reference constants).
 #[inline(always)]
 pub(crate) fn permute_vectors<V: Vector>(state: &mut [V; N_STATE]) {
     external_matrix(state);
@@ -149,7 +146,7 @@ pub(crate) fn permute_vectors<V: Vector>(state: &mut [V; N_STATE]) {
         full_round(state, constants);
     }
     for constant in &INTERNAL_ROUND_CONSTS[..N_PARTIAL_ROUNDS] {
-        partial_round(state, constant.0);
+        partial_round(state, constant.value());
     }
     for constants in &EXTERNAL_ROUND_CONSTS[N_HALF_FULL_ROUNDS..FULL_ROUNDS] {
         full_round(state, constants);
@@ -157,12 +154,9 @@ pub(crate) fn permute_vectors<V: Vector>(state: &mut [V; N_STATE]) {
 }
 
 #[inline(always)]
-fn full_round<V: Vector>(
-    state: &mut [V; N_STATE],
-    constants: &[stwo::core::fields::m31::BaseField; N_STATE],
-) {
+fn full_round<V: Vector>(state: &mut [V; N_STATE], constants: &[M31; N_STATE]) {
     for (word, constant) in state.iter_mut().zip(constants) {
-        *word = word.add_constant_and_sbox(constant.0);
+        *word = word.add_constant_and_sbox(constant.value());
     }
     external_matrix(state);
 }
@@ -217,7 +211,7 @@ fn sum_15<V: Vector>(state: &[V; N_STATE]) -> V {
     eight.add(seven)
 }
 
-/// `circ(2·M4, M4, M4, M4)`, as `super::apply_external_round_matrix`.
+/// `circ(2·M4, M4, M4, M4)`, as [`crate::apply_external_round_matrix`].
 #[inline(always)]
 fn external_matrix<V: Vector>(state: &mut [V; N_STATE]) {
     for block in state.chunks_exact_mut(4) {
@@ -245,7 +239,6 @@ fn external_matrix<V: Vector>(state: &mut [V; N_STATE]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stwo::core::fields::m31::BaseField;
 
     /// A deterministic stream of words in `[0, P]`, P included.
     fn words(seed: u64) -> impl Iterator<Item = u32> {
@@ -264,10 +257,9 @@ mod tests {
     }
 
     fn reference(state: &States, lane: usize) -> [u32; N_STATE] {
-        let mut words: [BaseField; N_STATE] =
-            core::array::from_fn(|i| BaseField::reduce(state[i][lane] as u64));
-        super::super::permute(&mut words);
-        words.map(|word| word.0)
+        let mut words: [M31; N_STATE] = core::array::from_fn(|i| M31::from(state[i][lane]));
+        crate::permute(&mut words);
+        words.map(M31::value)
     }
 
     #[test]

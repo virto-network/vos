@@ -34,6 +34,8 @@ required-features = ["pvm-settle"]
 stwo = { git = "https://github.com/olanod/stwo", rev = "bbfa8bc3ae8ce958ee70d4bc59b8436bb453b3ef", default-features = false }
 stwo-constraint-framework = { git = "https://github.com/olanod/stwo", rev = "bbfa8bc3ae8ce958ee70d4bc59b8436bb453b3ef", default-features = false }
 num-traits = { version = "0.2", default-features = false }
+# The Poseidon2-M31 permutation and its modes, shared with the prover.
+vos-poseidon2 = { path = "../poseidon2" }
 # no_std + alloc wire format for the embedded settlement proof fixture (the same
 # format vos-pvm-proof's `settle_fixture` test serializes).
 postcard = { version = "1", default-features = false, features = ["alloc"] }
