@@ -472,6 +472,11 @@ pub enum Column {
     /// RemS32 / RemS64.  Drives DivRemChip's signed-correction chain.
     #[size = 1]
     IsDivS,
+    /// 1 iff this step's opcode is an arithmetic right shift (SharR32 /
+    /// SharR64 and their immediate forms).  Committed as flag byte 0's
+    /// bit 3; flows in the DivRem tuple, where it selects floor division.
+    #[size = 1]
+    IsSharR,
     /// Bit 7 of `div_quotient[7]` (sign of quotient on 64-bit
     /// signed div/rem).  Prover-witnessed.  Pinned via a nibble lookup;
     /// flowed to DivRemChip via the lookup tuple.
@@ -801,9 +806,8 @@ pub enum Column {
     /// flag bag.  Each byte holds 8 individual flag bits
     /// (bit i = flag[8*k + i]).  The byte-to-bits
     /// lookup per row pins these bits to the matching CpuChip flag
-    /// columns (or sum-of-sub-flags expressions for the 5 folded
-    /// category slots: is_mul_upper, is_bitwise, is_compare,
-    /// is_branch, is_store).  ProgramMemoryChip's preprocessed
+    /// columns (or sum-of-sub-flags expressions for the 4 folded
+    /// category slots: is_bitwise, is_compare, is_branch, is_store).  ProgramMemoryChip's preprocessed
     /// FlagByte0..5 columns hold the canonical values; the prog_mem
     /// lookup balance pins each FlagByteI on CpuChip to canonical.
     /// Layout per byte is documented in `lookups/relations.rs` next
@@ -943,6 +947,11 @@ pub enum Column {
     DbzActiveQuotH,
     #[size = 1]
     DbzActiveRemH,
+    /// `DbzActiveRemH · (1 - Is32Bit)` — a 64-bit remainder by zero, whose
+    /// result's high word is the dividend's (a 32-bit one's is the
+    /// sign extension of its low word).
+    #[size = 1]
+    DbzActiveRem64H,
 
     // BitManip MSB recurrences.  (sign_ext_bit is enforced boolean
     // unconditionally, so no separate helper is needed.)

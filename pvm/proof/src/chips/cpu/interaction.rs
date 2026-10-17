@@ -588,6 +588,7 @@ pub(super) fn generate_interaction_trace(
         let f_is_add = crate::trace::original_base_column!(component_trace, Column::IsAdd);
         let f_is_sub = crate::trace::original_base_column!(component_trace, Column::IsSub);
         let f_is_mul = crate::trace::original_base_column!(component_trace, Column::IsMul);
+        let f_is_shar_r = crate::trace::original_base_column!(component_trace, Column::IsSharR);
         let f_is_and = crate::trace::original_base_column!(component_trace, Column::IsAnd);
         let f_is_or = crate::trace::original_base_column!(component_trace, Column::IsOr);
         let f_is_xor = crate::trace::original_base_column!(component_trace, Column::IsXor);
@@ -662,7 +663,7 @@ pub(super) fn generate_interaction_trace(
         let one_pkg =
             || stwo::prover::backend::simd::m31::PackedBaseField::broadcast(BaseField::from(1));
 
-        // byte 0: (FlagByte0, is_add, is_sub, is_mul, MU_SUM, BW_SUM,
+        // byte 0: (FlagByte0, is_add, is_sub, is_mul, is_shar_r, BW_SUM,
         //          is_shift, CMP_SUM, is_move)
         {
             let pad = is_pad_col[0].clone();
@@ -670,9 +671,7 @@ pub(super) fn generate_interaction_trace(
             let a = f_is_add[0].clone();
             let s = f_is_sub[0].clone();
             let m = f_is_mul[0].clone();
-            let mu_uu = f_is_mul_upper_uu[0].clone();
-            let mu_su = f_is_mul_upper_su[0].clone();
-            let mu_ss = f_is_mul_upper_ss[0].clone();
+            let shar = f_is_shar_r[0].clone();
             let bw_and = f_is_and[0].clone();
             let bw_or = f_is_or[0].clone();
             let bw_xor = f_is_xor[0].clone();
@@ -700,7 +699,7 @@ pub(super) fn generate_interaction_trace(
                         a.at(i),
                         s.at(i),
                         m.at(i),
-                        mu_uu.at(i) + mu_su.at(i) + mu_ss.at(i),
+                        shar.at(i),
                         bw_and.at(i)
                             + bw_or.at(i)
                             + bw_xor.at(i)
@@ -1226,7 +1225,7 @@ pub(super) fn generate_interaction_trace(
     }
 
     // ── DivRemLookup producer (prover-side mirror) ──
-    // 40-limb tuple (includes 4 sign bits).
+    // 41-limb tuple (4 sign bits, is_div_s, is_shar_r).
     {
         let divrem_p54g: &DivRemLookupElements = lookup_elements.as_ref();
         let val_b_p54g = crate::trace::original_base_column!(component_trace, Column::ValB);
@@ -1253,6 +1252,8 @@ pub(super) fn generate_interaction_trace(
         tuple_p54g.push(dbz_p54g[0].clone());
         tuple_p54g.push(is_32_p54g[0].clone());
         tuple_p54g.push(is_ds_p54g[0].clone());
+        let is_shar_r = crate::trace::original_base_column!(component_trace, Column::IsSharR);
+        tuple_p54g.push(is_shar_r[0].clone());
         for _ in 0..2 {
             logup.add_to_relation_with(
                 divrem_p54g,

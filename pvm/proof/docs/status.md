@@ -14,19 +14,23 @@ commit.
   `0xFF · SignBitResult` `[19]`.
 - **NegAdd** — sub with flipped sign, same carry chain `[2]`.
 - **Mul** — schoolbook over 16 byte positions, 16-bit carry per
-  position (`MulCarry` + `MulCarryHi`) `[12c, 15-mul-debug]`.
+  position (`MulCarry` + `MulCarryHi`) `[12c, 15-mul-debug]`; every
+  product byte and carry Range256-checked, so the chain is the exact
+  integer product.
 - **MulUpper UU / SU / SS** — high 64 of full product, with
   sign-correction columns `MulCorrTermA` / `TermB` /
   `MulCorrCarry` distinguishing the three signedness variants
   `[12c]`.
-- **DivU / RemU 32 / 64** — schoolbook `q · d + r = b` mod 2^128,
-  with `r < d` uniqueness via a separate carry chain
-  (`DivCmpDiff` / `DivCmpCarry` + Range256 byte-checks) `[7a, 21]`.
+- **DivU / RemU 32 / 64** — schoolbook `q · d + r = b + 2^W·H` over
+  the integers (quotient, remainder, `H` and every carry Range256-checked),
+  `H = 0`, with `r < d` uniqueness via a separate carry chain
+  (`DivCmpDiff` / `DivCmpCarry`) `[7a, 21]`.
 - **DivS / RemS 64-bit** — sign-correction at the schoolbook's
   high bytes via `DivCorrHi` / `DivCorrCarry`:
-  `high(q_u·d_u + r_u) ≡ sq·d_u + sd·q_u + sr − sa  (mod 2^64)`
-  `[16]`.
-- **DivS / RemS 32-bit** — analogous 4-byte chain `[18]`.
+  `H ≡ sq·d_u + sd·q_u + sr − sa + k  (mod 2^64)`, `k` the `MIN / −1`
+  overflow, and `|r| < |d|` through magnitude chains `[16]`.
+- **DivS / RemS 32-bit** — analogous 4-byte chain, the divisor's magnitude
+  taken of its sign-extended low word `[18]`.
 
 ### Bitwise
 - **And / Or / Xor / AndInv / OrInv / Xnor** — algebraic identity
@@ -37,7 +41,9 @@ commit.
 - **ShloL** (left) — encoded via `is_mul=true`; uses
   `PowerOfTwoChip` to bind `val_d = 2^shift_amount` `[6]`.
 - **ShloR** (logical right) / **SharR** (arithmetic right) —
-  encoded via `is_div_rem=true`; same power-of-two lookup `[6]`.
+  encoded via `is_div_rem=true`; same power-of-two lookup `[6]`. ShloR
+  is unsigned division (`H = 0`); SharR, flagged `is_shar_r` in the
+  DivRem tuple, floor division (`H ≡ sq·d − sa`).
 - **32-bit shift ShiftAmount uniqueness** — closed by an
   additional `val_d[4..8] = 0` constraint on `is_32bit ·
   is_shift_c` rows.  Without this, the [0, 63] PowerOfTwo table

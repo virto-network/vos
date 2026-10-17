@@ -213,44 +213,38 @@ pub struct MemoryPagePayload {
     pub multiproof: crate::page_merkle::MerkleMultiproof,
 }
 
-/// Single divrem-row witness for the DivRemLookup
-/// balance.  div_corr_hi / div_corr_carry are DivRemChip-internal;
-/// the 4 sign bits flow from CpuChip via the lookup
-/// tuple so DivRemChip can run the sign-correction chains.
+/// Single divrem-row witness for DivRemChip: the DivRemLookup tuple's
+/// fields and the chip's internal chains (see `chips::divrem::witness`).
 #[derive(Clone, Debug)]
 pub struct DivRemEntry {
     pub val_b: u64,
     pub val_d: u64,
     pub div_quotient: u64,
     pub div_remainder: u64,
-    /// High 8 bytes of the schoolbook output.  Internal to
-    /// DivRemChip — pinned by the schoolbook chain on DivU rows and
-    /// additionally by the sign-correction chain on DivS rows.
+    /// High half of the schoolbook `q·d + r = b + 2^W·H`.
     pub div_corr_hi: [u8; 8],
-    /// Per-byte carry of the sign-correction chain.  Internal
-    /// witness on DivRemChip.
+    /// Per-byte carry of the signed correction chain.
     pub div_corr_carry: [u8; 8],
     pub div_mul_carry: [u8; 16],
     pub div_mul_carry_hi: [u8; 16],
     pub div_by_zero: bool,
     pub is_32bit: bool,
     pub is_div_s: bool,
-    /// `val_d - 1 - div_remainder` chain (val_d + ~div_remainder + 1 in
-    /// two's complement); fired only on unsigned div rows.  Filled
-    /// uniformly so the per-byte Range256 emission balances on every
-    /// real DivRemChip row.
+    /// Arithmetic right shift: floor division by `2^n`.
+    pub is_shar_r: bool,
+    /// The signed division `MIN / −1`, whose true quotient overflows.
+    pub div_overflow: bool,
+    /// `val_d + ~div_remainder` chain (`r < d` on unsigned rows), filled
+    /// on every row.
     pub div_cmp_diff: [u8; 8],
     pub div_cmp_carry: [u8; 8],
-    /// 4 sign bits flowed from CpuChip.  Bound on CpuChip
-    /// via nibble lookups; consumed here for the DivS
-    /// sign-correction chain.
+    /// The 4 sign bits CpuChip pins and flows through the tuple.
     pub sign_bit_b: u8,
     pub sign_bit_d: u8,
     pub sign_bit_q: u8,
     pub sign_bit_r: u8,
-    /// |val_d| / |div_remainder| via two's-complement
-    /// conditional negation + comparison chain.  All six arrays are
-    /// DivRemChip-internal; gated on sign_bit_d/sign_bit_r.
+    /// |val_d| / |div_remainder| via two's-complement conditional
+    /// negation, and their comparison chain.
     pub abs_d: [u8; 8],
     pub abs_d_carry: [u8; 8],
     pub abs_r: [u8; 8],

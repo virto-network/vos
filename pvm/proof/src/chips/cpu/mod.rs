@@ -514,6 +514,11 @@ impl BuiltInComponent for CpuChip {
         eval.add_constraint(
             dbz_active_rem_h[0].clone() - dbz_active_h[0].clone() * gate_rem_h[0].clone(),
         );
+        let dbz_active_rem_64_h = crate::trace::trace_eval!(trace_eval, Column::DbzActiveRem64H);
+        eval.add_constraint(
+            dbz_active_rem_64_h[0].clone()
+                - dbz_active_rem_h[0].clone() * (E::F::one() - is_32bit[0].clone()),
+        );
 
         // ── BitManip MSB + SignExtBit helpers ──
         let part_nz_msb_times_ind_h =
@@ -870,7 +875,7 @@ impl BuiltInComponent for CpuChip {
         // The divrem chains live in DivRemChip: the schoolbook q·d+r=b
         // chain, the r<d uniqueness chain, and the DivS sign-correction
         // chain.  CpuChip flows val_b/val_d/q/r + 4 sign bits + flags via
-        // the 40-limb DivRemLookup tuple; DivCorrHi/DivCorrCarry are
+        // the 41-limb DivRemLookup tuple; DivCorrHi/DivCorrCarry are
         // DivRemChip-internal columns.
         let is_div_s = crate::trace::trace_eval!(trace_eval, Column::IsDivS);
 
@@ -981,9 +986,12 @@ impl BuiltInComponent for CpuChip {
                 eval.add_constraint(
                     dbz_active_quot_h[0].clone() * (result[i].clone() - f_ff_p29.clone()),
                 );
-                eval.add_constraint(
-                    dbz_active_rem_h[0].clone() * (result[i].clone() - val_b[i].clone()),
-                );
+                let gate = if i < 4 {
+                    &dbz_active_rem_h
+                } else {
+                    &dbz_active_rem_64_h
+                };
+                eval.add_constraint(gate[0].clone() * (result[i].clone() - val_b[i].clone()));
             }
         }
 
@@ -2465,8 +2473,8 @@ impl BuiltInComponent for CpuChip {
         // Per real CpuChip step, emit 6 lookups against ByteToBitsChip's
         // 256-row table.  Each tuple is `(FlagByteI, bit0, bit1, ..., bit7)`
         // where bit_j is either an individual flag column or a sum-of-
-        // sub-flags expression for the 5 folded category slots
-        // (is_mul_upper / is_bitwise / is_compare / is_branch / is_store).
+        // sub-flags expression for the 4 folded category slots
+        // (is_bitwise / is_compare / is_branch / is_store).
         // Composed with the prog_mem balance (which pins each FlagByteI to
         // canonical), this constrains every individual flag column /
         // sum expression to its canonical value at every real step.
@@ -2527,10 +2535,7 @@ impl BuiltInComponent for CpuChip {
             let f_is_rotate_r_imm_alt_p55 =
                 crate::trace::trace_eval!(trace_eval, Column::IsRotateRImmAlt);
 
-            // Sum expressions for the 5 folded category slots.
-            let mu_sum_e = f_is_mul_upper_uu_p55[0].clone()
-                + f_is_mul_upper_su_p55[0].clone()
-                + f_is_mul_upper_ss_p55[0].clone();
+            // Sum expressions for the 4 folded category slots.
             let bw_sum_e = is_and_flag[0].clone()
                 + is_or_flag[0].clone()
                 + is_xor_flag[0].clone()
@@ -2541,14 +2546,14 @@ impl BuiltInComponent for CpuChip {
             let br_sum_e = is_branch_e();
             let st_sum_e = is_store_e();
 
-            // byte 0: (FlagByte0, is_add, is_sub, is_mul, MU_SUM, BW_SUM,
+            // byte 0: (FlagByte0, is_add, is_sub, is_mul, is_shar_r, BW_SUM,
             //          is_shift, CMP_SUM, is_move)
             let tuple0: Vec<E::F> = vec![
                 fb0[0].clone(),
                 is_add[0].clone(),
                 is_sub[0].clone(),
                 is_mul[0].clone(),
-                mu_sum_e.clone(),
+                trace_eval.column_eval::<1>(Column::IsSharR)[0].clone(),
                 bw_sum_e.clone(),
                 is_shift[0].clone(),
                 cmp_sum_e.clone(),
@@ -3408,9 +3413,10 @@ impl BuiltInComponent for CpuChip {
         }
 
         // ── DivRemLookup producer ──
-        // Tuple (40 limbs): val_b[8] + val_d[8] + div_quotient[8] +
+        // Tuple (41 limbs): val_b[8] + val_d[8] + div_quotient[8] +
         //   div_remainder[8] + sign_bit_b + sign_bit_d + sign_bit_q +
-        //   sign_bit_r + is_div_rem + div_by_zero + is_32bit + is_div_s.
+        //   sign_bit_r + is_div_rem + div_by_zero + is_32bit + is_div_s +
+        //   is_shar_r.
         // Multiplicity = is_div_rem.
         // The 4 sign bits let DivRemChip's sign-correction chain run;
         // div_corr_hi[8] is DivRemChip-internal (not in this tuple).
@@ -3427,7 +3433,7 @@ impl BuiltInComponent for CpuChip {
             let is_dr_p54g = crate::trace::trace_eval!(trace_eval, Column::IsDivRem);
             let is_32_p54g = crate::trace::trace_eval!(trace_eval, Column::Is32Bit);
             let is_ds_p54g = crate::trace::trace_eval!(trace_eval, Column::IsDivS);
-            let mut tuple_p54g: Vec<E::F> = Vec::with_capacity(40);
+            let mut tuple_p54g: Vec<E::F> = Vec::with_capacity(41);
             tuple_p54g.extend_from_slice(&val_b_p54g);
             tuple_p54g.extend_from_slice(&val_d_p54g);
             tuple_p54g.extend_from_slice(&dq_p54g);
@@ -3440,6 +3446,7 @@ impl BuiltInComponent for CpuChip {
             tuple_p54g.push(dbz_p54g[0].clone());
             tuple_p54g.push(is_32_p54g[0].clone());
             tuple_p54g.push(is_ds_p54g[0].clone());
+            tuple_p54g.push(trace_eval.column_eval::<1>(Column::IsSharR)[0].clone());
             for _ in 0..2 {
                 eval.add_to_relation(RelationEntry::new(
                     divrem_lookup,

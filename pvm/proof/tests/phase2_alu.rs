@@ -458,6 +458,103 @@ fn prove_div_u64_large() {
     test_three_reg_op(Opcode::DivU64, u64::MAX, 2, u64::MAX / 2);
 }
 
+// ── Division edge cases ──
+// The quotients that do not fit (`MIN / −1`), signed results whose
+// correction carries borrow, 32-bit results with bit 31 set (sign-extended
+// into the register), and arithmetic shifts of negative values, by up to
+// the width's top bit.
+
+#[test]
+fn prove_div_s64_min_by_minus_one() {
+    test_three_reg_op(Opcode::DivS64, i64::MIN as u64, u64::MAX, i64::MIN as u64);
+}
+
+#[test]
+fn prove_rem_s64_min_by_minus_one() {
+    test_three_reg_op(Opcode::RemS64, i64::MIN as u64, u64::MAX, 0);
+}
+
+#[test]
+fn prove_div_s32_min_by_minus_one() {
+    test_three_reg_op(
+        Opcode::DivS32,
+        0x8000_0000,
+        0xFFFF_FFFF,
+        i32::MIN as i64 as u64,
+    );
+}
+
+#[test]
+fn prove_rem_s32_min_by_minus_one() {
+    test_three_reg_op(Opcode::RemS32, 0x8000_0000, 0xFFFF_FFFF, 0);
+}
+
+#[test]
+fn prove_div_s64_negative_exact() {
+    test_three_reg_op(Opcode::DivS64, -256i64 as u64, 256, -1i64 as u64);
+}
+
+#[test]
+fn prove_div_s32_negative_divisor() {
+    test_three_reg_op(Opcode::DivS32, 100, -7i64 as u64, -14i64 as u64);
+}
+
+#[test]
+fn prove_rem_s32_negative_divisor() {
+    test_three_reg_op(Opcode::RemS32, 100, -7i64 as u64, 2);
+}
+
+#[test]
+fn prove_div_u32_bit31_quotient() {
+    test_three_reg_op(Opcode::DivU32, 0x8000_0000, 1, 0xFFFF_FFFF_8000_0000);
+}
+
+#[test]
+fn prove_rem_u32_bit31_remainder() {
+    test_three_reg_op(
+        Opcode::RemU32,
+        0x9000_0000,
+        0xA000_0000,
+        0xFFFF_FFFF_9000_0000,
+    );
+}
+
+#[test]
+fn prove_shlo_r32_bit31_unshifted() {
+    test_three_reg_op(Opcode::ShloR32, 0x8000_0000, 0, 0xFFFF_FFFF_8000_0000);
+}
+
+#[test]
+fn prove_shar_r32_negative() {
+    test_three_reg_op(Opcode::SharR32, -1024i64 as u64, 3, -128i64 as u64);
+}
+
+#[test]
+fn prove_shar_r32_by_31() {
+    test_three_reg_op(Opcode::SharR32, 0x8000_0000, 31, u64::MAX);
+}
+
+#[test]
+fn prove_shar_r64_negative() {
+    test_three_reg_op(Opcode::SharR64, -1024i64 as u64, 3, -128i64 as u64);
+}
+
+#[test]
+fn prove_shar_r64_by_63() {
+    test_three_reg_op(Opcode::SharR64, -5i64 as u64, 63, u64::MAX);
+    test_three_reg_op(Opcode::SharR64, 5, 63, 0);
+}
+
+#[test]
+fn prove_shlo_r64_by_63() {
+    test_three_reg_op(Opcode::ShloR64, u64::MAX, 63, 1);
+}
+
+#[test]
+fn prove_rem_u32_bit31_by_zero() {
+    test_three_reg_op(Opcode::RemU32, 0x8000_0000, 0, 0xFFFF_FFFF_8000_0000);
+}
+
 // ── BitManip tests ──
 
 #[test]

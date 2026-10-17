@@ -438,7 +438,7 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             let mul_high_u64 = u64::from_le_bytes(mul_high);
             let unsigned_product_low_u64 = u64::from_le_bytes(unsigned_product_low_bytes);
             let unsigned_product_hi_u64 = u64::from_le_bytes(unsigned_product_hi_bytes);
-            side_note.mul_entries.push(crate::side_note::MulEntry {
+            let entry = crate::side_note::MulEntry {
                 val_b,
                 val_d,
                 result,
@@ -461,7 +461,9 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                 is_mul_upper_su: flags.is_mul_upper_su,
                 is_mul_upper_ss: flags.is_mul_upper_ss,
                 is_32bit: flags.is_32bit,
-            });
+            };
+            range_bytes.extend(crate::chips::mul::range_checked_bytes(&entry));
+            side_note.mul_entries.push(entry);
         }
         // Signed lt: if signs differ, negative is smaller. If same, use unsigned compare.
         let cmp_lt_s_flag: u8 = if sign_bit_b != sign_bit_d {
@@ -558,12 +560,12 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         // Some helpers depend on val_b/val_d/cmp_lt_flag/sign_bit_b/d/
         // div_by_zero, which are computed later in this iteration.  See
         // the deferred helper-column fills near the end of the loop body.
-        // IsMulUpper is folded into the (mu_uu+mu_su+mu_ss) sum
-        // expression — no CpuChip column to fill.
+        // IsMulUpper is the (mu_uu+mu_su+mu_ss) sum — no column to fill.
         trace.fill_columns(row, flags.is_mul_upper_uu, Column::IsMulUpperUU);
         trace.fill_columns(row, flags.is_mul_upper_su, Column::IsMulUpperSU);
         trace.fill_columns(row, flags.is_mul_upper_ss, Column::IsMulUpperSS);
         trace.fill_columns(row, flags.is_div_s, Column::IsDivS);
+        trace.fill_columns(row, flags.is_shar_r, Column::IsSharR);
         // IsBitwise is folded — no column to fill.
         trace.fill_columns(row, flags.is_shift, Column::IsShift);
         // IsCompare is folded — no column to fill.
@@ -689,244 +691,28 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         }
 
         // ── DivRem auxiliary ──
-        let mut div_quotient = [0u8; WORD_SIZE];
-        let mut div_remainder = [0u8; WORD_SIZE];
-        let mut div_mul_carry = [0u8; 16];
-        let mut div_mul_carry_hi = [0u8; 16];
-        let mut div_by_zero: u8 = 0;
-        let mut div_corr_hi = [0u8; WORD_SIZE];
-        let mut div_corr_carry = [0u8; WORD_SIZE];
-        if flags.is_div_rem {
-            let dividend = val_b;
-            let divisor = val_d;
-            if divisor == 0 {
-                div_by_zero = 1;
-                // For div-by-zero: result is special (u64::MAX for div, dividend for rem)
-                // quotient/remainder don't matter, constraint is bypassed
-            } else {
-                // Compute the canonical (q, r) the interpreter wrote.
-                // For DivS / RemS we need *signed* round-toward-zero
-                // division so the byte-level decomposition matches
-                // two's complement (e.g. -100/7 → q = -14 →
-                // q.to_le_bytes() = 0xF2,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF).
-                let (q_bytes, r_bytes): ([u8; 8], [u8; 8]) = if flags.is_div_s {
-                    if flags.is_32bit {
-                        let b32 = dividend as i32;
-                        let d32 = divisor as i32;
-                        // i32 div / rem with the standard PVM
-                        // overflow guard (INT_MIN / -1 = INT_MIN, rem = 0).
-                        let (q32, r32) = if b32 == i32::MIN && d32 == -1 {
-                            (i32::MIN, 0i32)
-                        } else {
-                            (b32 / d32, b32 % d32)
-                        };
-                        // Sign-extend div_quotient / div_remainder
-                        // to match the result column (which is the
-                        // interpreter's `q as i64 as u64`).  The 32-bit
-                        // schoolbook + sign-correction chain only
-                        // reference [0..4]; the result-quotient binding
-                        // requires [4..8] to track sign-extension too.
-                        (
-                            (q32 as i64 as u64).to_le_bytes(),
-                            (r32 as i64 as u64).to_le_bytes(),
-                        )
-                    } else {
-                        let bs = dividend as i64;
-                        let ds = divisor as i64;
-                        let (qs, rs) = if bs == i64::MIN && ds == -1 {
-                            (i64::MIN, 0i64)
-                        } else {
-                            (bs / ds, bs % ds)
-                        };
-                        ((qs as u64).to_le_bytes(), (rs as u64).to_le_bytes())
-                    }
-                } else if flags.is_shift && flags.shift_op == 2 {
-                    // Arithmetic right shift (SharR): divisor = 2^shift_k
-                    // and the PVM result is `(val_b as iN) >> shift_k`,
-                    // which sign-fills the top bits.  Unsigned division
-                    // (the else branch) zero-fills, so for negative
-                    // val_b the result and quotient diverge — breaking
-                    // the `result[i] = div_quotient[i]` binding.  Override
-                    // q here so div_quotient matches the PVM result;
-                    // schoolbook still holds because q·d + r = b mod 2^64
-                    // for r = b − q·d (and 0 ≤ r < d since d divides the
-                    // low bits exactly the same way).
-                    let shift_k = saved_shift_amount as u32;
-                    let q_arith: u64 = if flags.is_32bit {
-                        (dividend as u32 as i32).wrapping_shr(shift_k) as i64 as u64
-                    } else {
-                        (dividend as i64).wrapping_shr(shift_k) as u64
-                    };
-                    let r_arith = dividend.wrapping_sub(q_arith.wrapping_mul(divisor));
-                    (q_arith.to_le_bytes(), r_arith.to_le_bytes())
-                } else {
-                    // DivU / RemU: unsigned division.
-                    (
-                        (dividend / divisor).to_le_bytes(),
-                        (dividend % divisor).to_le_bytes(),
-                    )
-                };
-                div_quotient = q_bytes;
-                div_remainder = r_bytes;
-
-                // Carry chain for q * divisor + remainder = dividend (schoolbook)
-                let divisor_bytes = divisor.to_le_bytes();
-                let input_limbs = if flags.is_32bit { 4 } else { WORD_SIZE };
-                let out_limbs = input_limbs * 2;
-                let mut accum = [0u32; 16];
-                for i in 0..input_limbs {
-                    for j in 0..input_limbs {
-                        accum[i + j] += div_quotient[i] as u32 * divisor_bytes[j] as u32;
-                    }
-                }
-                // Add remainder to low limbs
-                for i in 0..input_limbs {
-                    accum[i] += div_remainder[i] as u32;
-                }
-                for k in 0..out_limbs.min(16).saturating_sub(1) {
-                    let carry = accum[k] >> 8;
-                    div_mul_carry[k] = carry as u8;
-                    div_mul_carry_hi[k] = (carry >> 8) as u8;
-                    accum[k + 1] += carry;
-                }
-                if out_limbs > 0 && out_limbs <= 16 {
-                    let carry = accum[out_limbs - 1] >> 8;
-                    div_mul_carry[out_limbs - 1] = carry as u8;
-                    div_mul_carry_hi[out_limbs - 1] = (carry >> 8) as u8;
-                }
-
-                // DivS sign-correction for the 64-bit schoolbook's
-                // high bytes.  See the "DivS sign correction"
-                // constraint block in add_constraints.
-                //
-                //   div_corr_hi[i] + carry_out·256 + (i==0 ? sa : 0)
-                //     = sq·d_u[i] + sd·q_u[i] + carry_in + (i==0 ? sr : 0)
-                if flags.is_div_s && !flags.is_32bit {
-                    let sa = (val_b >> 63) & 1;
-                    let sd = (val_d >> 63) & 1;
-                    let term_d = if (div_quotient[7] >> 7) & 1 == 1 {
-                        val_d
-                    } else {
-                        0
-                    };
-                    let term_q = if sd == 1 {
-                        u64::from_le_bytes(div_quotient)
-                    } else {
-                        0
-                    };
-                    let term_d_bytes = term_d.to_le_bytes();
-                    let term_q_bytes = term_q.to_le_bytes();
-                    let sr_bit = (div_remainder[7] >> 7) & 1;
-                    let mut carry: i32 = 0;
-                    for i in 0..WORD_SIZE {
-                        let extra_lhs = if i == 0 { sa as i32 } else { 0 };
-                        let extra_rhs = if i == 0 { sr_bit as i32 } else { 0 };
-                        // s = sq·d_u[i] + sd·q_u[i] + carry_in + (i==0 ? sr : 0)
-                        //     − (i==0 ? sa : 0)
-                        let s = term_d_bytes[i] as i32 + term_q_bytes[i] as i32 + carry + extra_rhs
-                            - extra_lhs;
-                        // Want: div_corr_hi[i] + carry_out·256 = s.
-                        // s ∈ [−1, 511 + carry_in]; with carry_in ≤ 2
-                        // and per-byte cap, take low byte and carry out.
-                        let s_mod = s.rem_euclid(256);
-                        div_corr_hi[i] = s_mod as u8;
-                        carry = (s - s_mod) / 256;
-                        div_corr_carry[i] = carry as u8;
-                    }
-                } else if flags.is_div_s && flags.is_32bit {
-                    // 32-bit DivS sign-correction.
-                    // Same equation as the 64-bit case but over 4
-                    // bytes; sa/sd/sq/sr derive from byte 3 (32-bit
-                    // sign), not byte 7.  DivCorrHi[4..8] and
-                    // DivCorrCarry[4..8] left at 0 — unused by both
-                    // the 32-bit schoolbook and the 32-bit chain.
-                    let sa = (val_b_bytes[3] >> 7) & 1;
-                    let sd = (val_d_bytes[3] >> 7) & 1;
-                    let sq = (div_quotient[3] >> 7) & 1;
-                    let sr = (div_remainder[3] >> 7) & 1;
-                    // val_d / div_quotient as 32-bit unsigned.
-                    let d_u32 = u32::from_le_bytes([
-                        val_d_bytes[0],
-                        val_d_bytes[1],
-                        val_d_bytes[2],
-                        val_d_bytes[3],
-                    ]);
-                    let q_u32 = u32::from_le_bytes([
-                        div_quotient[0],
-                        div_quotient[1],
-                        div_quotient[2],
-                        div_quotient[3],
-                    ]);
-                    let term_d = if sq == 1 { d_u32 } else { 0 };
-                    let term_q = if sd == 1 { q_u32 } else { 0 };
-                    let term_d_bytes = term_d.to_le_bytes();
-                    let term_q_bytes = term_q.to_le_bytes();
-                    let mut carry: i32 = 0;
-                    for i in 0..4 {
-                        let extra_lhs = if i == 0 { sa as i32 } else { 0 };
-                        let extra_rhs = if i == 0 { sr as i32 } else { 0 };
-                        let s = term_d_bytes[i] as i32 + term_q_bytes[i] as i32 + carry + extra_rhs
-                            - extra_lhs;
-                        let s_mod = s.rem_euclid(256);
-                        div_corr_hi[i] = s_mod as u8;
-                        carry = (s - s_mod) / 256;
-                        div_corr_carry[i] = carry as u8;
-                    }
-                } else if flags.is_shift && flags.shift_op == 2 {
-                    // SharR: arith-right-shift override (above) put a
-                    // sign-extended quotient into `div_quotient`.  For
-                    // negative inputs that means q ≥ 2^63 (64-bit) or
-                    // q ≥ 2^31 (32-bit), so the schoolbook `q·d + r`
-                    // overflows into the high 8 bytes (64-bit) or high
-                    // 4 bytes (32-bit).  DivRemChip's schoolbook chain
-                    // pins those overflow bytes to `div_corr_hi[i]`,
-                    // so we have to witness them — DivS's sign-
-                    // correction formula doesn't apply here (is_div_s
-                    // is 0 for SharR), so we extract the bytes
-                    // directly from the carry-propagated schoolbook
-                    // accumulator above.  `div_corr_carry` stays at
-                    // its default 0 — DivRemChip's DivS sign-
-                    // correction chain (which is the only consumer of
-                    // `div_corr_carry`) is gated on is_div_s and
-                    // doesn't fire on SharR rows.
-                    let n = if flags.is_32bit { 4 } else { WORD_SIZE };
-                    for i in 0..n {
-                        div_corr_hi[i] = (accum[i + n] & 0xFF) as u8;
-                    }
-                }
-            }
-        }
+        // DivRemChip's row: the quotient and remainder the AIR proves, and
+        // the chip's internal witness.
+        let divrem_entry = flags.is_div_rem.then(|| {
+            crate::chips::divrem::entry(
+                val_b,
+                val_d,
+                flags.is_32bit,
+                flags.is_div_s,
+                flags.is_shar_r,
+            )
+        });
+        let (div_quotient, div_remainder, div_by_zero) = match &divrem_entry {
+            Some(e) => (
+                e.div_quotient.to_le_bytes(),
+                e.div_remainder.to_le_bytes(),
+                e.div_by_zero as u8,
+            ),
+            None => ([0u8; WORD_SIZE], [0u8; WORD_SIZE], 0),
+        };
         trace.fill_columns_bytes(row, &div_quotient, Column::DivQuotient);
         trace.fill_columns_bytes(row, &div_remainder, Column::DivRemainder);
-        // DivMulCarry/DivMulCarryHi are witnessed on DivRemChip.
         trace.fill_columns(row, div_by_zero, Column::DivByZero);
-        // DivCorrHi[8] + DivCorrCarry[8] are not CpuChip columns;
-        // div_corr_hi / div_corr_carry are captured in DivRemEntry
-        // below and witnessed on DivRemChip.
-
-        // DivCmpDiff / DivCmpCarry chain witnesses live on DivRemChip.
-        // Compute them here only on divrem rows so they can flow into
-        // the DivRemEntry below; non-divrem rows skip the work entirely.
-        let mut div_cmp_diff = [0u8; WORD_SIZE];
-        let mut div_cmp_carry = [0u8; WORD_SIZE];
-        if flags.is_div_rem {
-            let mut c: u16 = 0;
-            for i in 0..WORD_SIZE {
-                let s = val_d_bytes[i] as u16 + (255u16 - div_remainder[i] as u16) + c;
-                div_cmp_diff[i] = (s & 0xFF) as u8;
-                c = s >> 8;
-                div_cmp_carry[i] = c as u8;
-            }
-            // 8 Range256 charges per divrem row (matches DivRemChip's
-            // 8 emissions on each real row of its narrower trace).
-            for &b in &div_cmp_diff {
-                range_bytes.push(b);
-            }
-        }
-
-        // DivRemEntry push is deferred until after sign_bit_q/r are
-        // computed (the sign-bit block below) so they can flow into
-        // DivRemChip via the entry.
 
         // Byte-wise zero-check for div_remainder (mirrors the val_d
         // pattern above).  Drives the sign-of-r uniqueness constraint.
@@ -944,62 +730,6 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         trace.fill_columns_base_field(row, &val_r_byte_inv, Column::ValRByteInv);
         trace.fill_columns_bytes(row, &val_r_partial_nz, Column::ValRPartialNZ);
 
-        // |val_d| / |div_remainder| chains and the AbsCmp comparison
-        // chain live on DivRemChip.  Compute the bytes here so the
-        // DivRemEntry can ship them; only divrem rows allocate, and on
-        // those rows the AbsCmpDiff bytes feed the Range256 multiplicity.
-        let mut abs_d = [0u8; WORD_SIZE];
-        let mut abs_d_carry = [0u8; WORD_SIZE];
-        let mut abs_r = [0u8; WORD_SIZE];
-        let mut abs_r_carry = [0u8; WORD_SIZE];
-        let mut abs_cmp_diff = [0u8; WORD_SIZE];
-        let mut abs_cmp_carry = [0u8; WORD_SIZE];
-        if flags.is_div_rem {
-            let sign_d_p30: u8 = if flags.is_32bit {
-                (val_d_bytes[3] >> 7) & 1
-            } else {
-                (val_d_bytes[7] >> 7) & 1
-            };
-            let sign_r_p30: u8 = if flags.is_32bit {
-                (div_remainder[3] >> 7) & 1
-            } else {
-                (div_remainder[7] >> 7) & 1
-            };
-            if sign_d_p30 == 0 {
-                abs_d.copy_from_slice(&val_d_bytes);
-            } else {
-                let mut c: u16 = 1; // +1 of two's complement
-                for i in 0..WORD_SIZE {
-                    let s = (255u16 - val_d_bytes[i] as u16) + c;
-                    abs_d[i] = (s & 0xFF) as u8;
-                    c = s >> 8;
-                    abs_d_carry[i] = c as u8;
-                }
-            }
-            if sign_r_p30 == 0 {
-                abs_r.copy_from_slice(&div_remainder);
-            } else {
-                let mut c: u16 = 1;
-                for i in 0..WORD_SIZE {
-                    let s = (255u16 - div_remainder[i] as u16) + c;
-                    abs_r[i] = (s & 0xFF) as u8;
-                    c = s >> 8;
-                    abs_r_carry[i] = c as u8;
-                }
-            }
-            let mut c: u16 = 0;
-            for i in 0..WORD_SIZE {
-                let s = abs_d[i] as u16 + (255u16 - abs_r[i] as u16) + c;
-                abs_cmp_diff[i] = (s & 0xFF) as u8;
-                c = s >> 8;
-                abs_cmp_carry[i] = c as u8;
-            }
-            // 8 Range256 charges per divrem row (matches DivRemChip's
-            // 8 emissions on each real row of its narrower trace).
-            for &b in &abs_cmp_diff {
-                range_bytes.push(b);
-            }
-        }
         // SignBitQ / SignBitR are pinned to bit 7 of the multiplexed
         // source byte (div_quotient[7] in 64-bit, div_quotient[3] in
         // 32-bit; same for remainder).
@@ -1023,40 +753,9 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         trace.fill_columns(row, sign_src_q, Column::SignSrcQ);
         trace.fill_columns(row, sign_src_r, Column::SignSrcR);
 
-        // Capture this row for DivRemChip's main trace.  Pushed here
-        // (rather than just after div_quotient/div_remainder are
-        // filled) so all 4 sign bits are available — DivRemChip's
-        // sign-correction chain reads them via the lookup tuple.
-        if flags.is_div_rem {
-            let div_quotient_u64 = u64::from_le_bytes(div_quotient);
-            let div_remainder_u64 = u64::from_le_bytes(div_remainder);
-            side_note
-                .divrem_entries
-                .push(crate::side_note::DivRemEntry {
-                    val_b,
-                    val_d,
-                    div_quotient: div_quotient_u64,
-                    div_remainder: div_remainder_u64,
-                    div_corr_hi,
-                    div_corr_carry,
-                    div_mul_carry,
-                    div_mul_carry_hi,
-                    div_by_zero: div_by_zero != 0,
-                    is_32bit: flags.is_32bit,
-                    is_div_s: flags.is_div_s,
-                    div_cmp_diff,
-                    div_cmp_carry,
-                    sign_bit_b,
-                    sign_bit_d,
-                    sign_bit_q,
-                    sign_bit_r,
-                    abs_d,
-                    abs_d_carry,
-                    abs_r,
-                    abs_r_carry,
-                    abs_cmp_diff,
-                    abs_cmp_carry,
-                });
+        if let Some(entry) = divrem_entry {
+            range_bytes.extend(crate::chips::divrem::range_checked_bytes(&entry));
+            side_note.divrem_entries.push(entry);
         }
 
         // Hi nibbles + BitwiseLookupChip charges for the 8 sign-bit
@@ -1545,6 +1244,14 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                 )],
                 Column::DbzActiveRemH,
             );
+            let width_64_v = !flags.is_32bit as u32;
+            trace.fill_columns_base_field(
+                row,
+                &[BaseField::from(
+                    (dbz_active_v * gate_rem_v * width_64_v).rem_euclid(stwo::core::fields::m31::P),
+                )],
+                Column::DbzActiveRem64H,
+            );
 
             // ── Partial-NZ (MSB direction) times-indicator helpers ──
             // PartNZMsbTimesIndH[i] = PartialNZMsb[i+1] · ByteIndicator[i] for i ∈ 0..7.
@@ -1954,6 +1661,7 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             ("DbzActiveH", Column::DbzActiveH),
             ("DbzActiveQuotH", Column::DbzActiveQuotH),
             ("DbzActiveRemH", Column::DbzActiveRemH),
+            ("DbzActiveRem64H", Column::DbzActiveRem64H),
             ("CmpLtValBH", Column::CmpLtValBH),
             ("CmpLtValDH", Column::CmpLtValDH),
             ("IsBranchTakenH", Column::IsBranchTakenH),

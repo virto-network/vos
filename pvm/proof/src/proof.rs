@@ -192,14 +192,25 @@ use crate::recursion_pcs::ProverMerkleHasher;
 ///        `BITWISE_AND_BYTE` at index 24, the component mask a `u32` again)
 ///        and ids 110–114 are no precompile. Older proofs reject.
 ///   29 — Poseidon2-M31 PCS variant of format 28.
+///   30 — Exact multiplication and division. MulChip and DivRemChip
+///        Range256-check every product byte, quotient and remainder byte,
+///        high half and carry their chains read, and booleanize the
+///        magnitude chains' carries, so each chain holds over the integers.
+///        DivRemChip pins the schoolbook's high half per operation (zero,
+///        signed correction with the `MIN / −1` overflow, or floor division
+///        for an arithmetic shift, flagged by the DivRem tuple's new
+///        `is_shar_r`, which flag byte 0's bit 3 commits in place of the
+///        implied `is_mul_upper`). Program commitments of code with an
+///        arithmetic shift or a MulUpper change. Older proofs reject.
+///   31 — Poseidon2-M31 PCS variant of format 30.
 #[cfg(not(feature = "poseidon2-channel"))]
-pub const PROOF_FORMAT_VERSION: u32 = 28;
+pub const PROOF_FORMAT_VERSION: u32 = 30;
 /// Native recursion: the PCS commit hash + Fiat-Shamir
 /// transcript move from Blake2s to Poseidon2-M31, so `stark_proof.commitments`
 /// become `P2Hash` digests — a different wire format. A Blake2s verifier
-/// (v28) and a Poseidon2-M31 verifier (v29) therefore reject each other's proofs.
+/// (v30) and a Poseidon2-M31 verifier (v31) therefore reject each other's proofs.
 #[cfg(feature = "poseidon2-channel")]
-pub const PROOF_FORMAT_VERSION: u32 = 29;
+pub const PROOF_FORMAT_VERSION: u32 = 31;
 
 /// Exact number of commitment trees in this generation of the Stwo proof:
 /// preprocessed, main, interaction, and split composition.

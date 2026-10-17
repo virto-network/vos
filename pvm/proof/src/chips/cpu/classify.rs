@@ -108,6 +108,10 @@ pub(crate) struct OpcodeFlags {
     /// fails proving — the schoolbook's high bytes aren't zero in
     /// two's-complement.
     pub is_div_s: bool,
+    /// Arithmetic right shifts (SharR32/SharR64 and their immediate forms):
+    /// floor division by `2^n`, which DivRemChip tells from a logical
+    /// shift's unsigned division by this flag in the DivRem tuple.
+    pub is_shar_r: bool,
     /// Per-size signed-load flags (covers direct + indirect
     /// variants: LoadI8 / LoadIndI8 → is_load_i8, etc.).  Drive the
     /// inactive-byte sign-extension binding for `result[i]` on
@@ -329,19 +333,21 @@ pub(crate) fn classify_opcode(op: Opcode) -> OpcodeFlags {
             f.div_rem_op = 0;
             f.is_32bit = true;
         }
-        // Arithmetic right shifts: same as logical right but with sign extension
-        // Uses divrem + power-of-two (like ShloR). Sign extension handled separately.
+        // Arithmetic right shifts: floor division by val_d = 2^shift_amount
+        // (divrem + power-of-two, like ShloR), told apart by is_shar_r.
         Opcode::SharR64 | Opcode::SharRImm64 | Opcode::SharRImmAlt64 => {
             f.is_shift = true;
             f.shift_op = 2;
             f.is_div_rem = true;
             f.div_rem_op = 0;
+            f.is_shar_r = true;
         }
         Opcode::SharR32 | Opcode::SharRImm32 | Opcode::SharRImmAlt32 => {
             f.is_shift = true;
             f.shift_op = 2;
             f.is_div_rem = true;
             f.div_rem_op = 0;
+            f.is_shar_r = true;
             f.is_32bit = true;
         }
         // RotL64 reuses the mul-schoolbook (val_d = 2^n)
@@ -846,7 +852,9 @@ pub(crate) fn classify_opcode_for_program_memory(
         f.is_add as u8,
         f.is_sub as u8,
         f.is_mul as u8,
-        f.is_mul_upper as u8,
+        // Byte 0 bit 3: is_mul_upper is implied by its three variants
+        // (bytes 2 and 3), so the slot commits is_shar_r.
+        f.is_shar_r as u8,
         f.is_bitwise as u8,
         f.is_shift as u8,
         f.is_compare as u8,

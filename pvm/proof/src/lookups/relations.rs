@@ -50,13 +50,15 @@ stwo_constraint_framework::relation!(RegisterMemoryLookupElements, REL_REG_MEMOR
 // (`flag_bytes[i] = sum_{j=0..8} 2^j * flag[8*i+j]`) on both sides of
 // the lookup.  CpuChip emits 6 byte-to-bits lookups per row to bind
 // each individual flag column (or its sum-of-sub-flags expression for
-// the 5 folded category slots) of bytes 0..5 back to its packed byte,
+// the 4 folded category slots) of bytes 0..5 back to its packed byte,
 // and recomposes bytes 6..9 from their bits in its own constraints.
 // The prog_mem tuple is 36 limbs.
 //
 // Flag layout per byte (0-indexed within byte; little-endian bits):
-//   byte 0: is_add, is_sub, is_mul, is_mul_upper, is_bitwise, is_shift,
+//   byte 0: is_add, is_sub, is_mul, is_shar_r, is_bitwise, is_shift,
 //           is_compare, is_move
+//           (is_mul_upper is the sum of its three variants, in bytes 2
+//           and 3, so it needs no bit of its own)
 //   byte 1: is_32bit, is_branch, is_jump, is_div_rem, is_load, is_store,
 //           is_exit, is_neg_add
 //   byte 2: is_reverse_bytes, is_zero_ext_16, is_sign_ext_8,
@@ -145,13 +147,14 @@ stwo_constraint_framework::relation!(Blake2bStateLookupElements, REL_BLAKE2B_STA
 //
 // Tuple: (val_b[8], val_d[8], div_quotient[8], div_remainder[8],
 //   sign_bit_b, sign_bit_d, sign_bit_q, sign_bit_r,
-//   is_div_rem, div_by_zero, is_32bit, is_div_s) — 40 limbs.
+//   is_div_rem, div_by_zero, is_32bit, is_div_s, is_shar_r) — 41 limbs.
 //
 // The tuple omits div_corr_hi[8]: DivCorrHi is DivRemChip-internal,
-// pinned by both schoolbook and sign correction.  SignBitB/D/Q/R and
-// is_div_s let DivRemChip run the sign-correction chains and the
-// unsigned r<d gate internally.
-const REL_DIVREM_LOOKUP_SIZE: usize = WORD_SIZE * 4 + 8;
+// pinned by the schoolbook and by the operation (zero, or the signed
+// correction).  SignBitB/D/Q/R, is_div_s and is_shar_r select the
+// operation: unsigned division and logical shift, signed division, or
+// an arithmetic shift's floor division.
+const REL_DIVREM_LOOKUP_SIZE: usize = WORD_SIZE * 4 + 9;
 stwo_constraint_framework::relation!(DivRemLookupElements, REL_DIVREM_LOOKUP_SIZE);
 
 // Compare lookup.  CpuChip emits one producer per

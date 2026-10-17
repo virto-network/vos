@@ -9,7 +9,7 @@
 //! other than the instruction's.  The 80 individual flag bits are packed
 //! into 10 bytes on BOTH the prog_mem preprocessed table and CpuChip's main
 //! trace.  CpuChip binds each individual flag column (or its
-//! sum-of-sub-flags expression for the 5 folded category slots) to its
+//! sum-of-sub-flags expression for the 4 folded category slots) to its
 //! packed byte: by 6 byte-to-bits lookups per row for bytes 0..5, by its
 //! own recomposition constraints for bytes 6..9.  The prog_mem tuple is 36
 //! limbs.
