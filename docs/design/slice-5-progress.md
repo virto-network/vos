@@ -998,7 +998,19 @@ preprocessed, 4,882 main, 2,964 interaction, 8 composition; arith +290,
 blake +151 and cpu +42 over 5.5's 7,556. It still fits a kernel leaf's
 ~9,300-column headroom [model].
 
-@GATES@
+### Gates
+
+[measured, on this machine, each under `systemd-run` at 16 GiB with
+`nice -n 10` and `CARGO_INCREMENTAL=0`]: `just check` green, 1,005 tests
+(`tree_crash` among them, green); `just test-proof` green, 541 tests;
+`just test-bench-proof` green; `just clippy` clean. Every gate test of 5.5
+and the three tracks green on the merged tip: `arith_gate` 12,
+`phase2_alu` 115, `blake2b_gate` 9, `memory_root_boundary_gate` 1,
+`host_verify_boundary_gate` 1, `memory_ledger_padding_gate` 2,
+`cpu_soundness_gate` 14, `register_ledger_gate` 3, `page_permission_gate`
+3, `cpu_completeness` 6, `control_flow_negative` 25,
+`operand_binding_gate` 12, `memory_ledger_gate` 2, `jump_table_gate` 1,
+`witness_input` 13, `witness_input_gate` 11.
 
 ## Step 5.7: the items carried from slice 4
 
