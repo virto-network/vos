@@ -33,8 +33,10 @@ vectors:
     cargo test -p vos-pvm --test pvm_vectors
 
 # Prover integration suites, including the soundness gates behind
-# `debug-internals`, and the re-runs of the test actors' kernels from their
-# attests on the agent's model. Memory-heavy: two threads fit under a 24 GiB limit, e.g.
+# `debug-internals`, the re-runs of the test actors' kernels from their
+# attests on the agent's model, the settlement window's kernel proved over
+# its shape, and the fixtures checked against their generator.
+# Memory-heavy: two threads fit under a 24 GiB limit, e.g.
 # `systemd-run --user --scope -p MemoryMax=24G -p MemorySwapMax=0 just test-proof`.
 # They cover every admitted format, the Poseidon2-M31 segment format among
 # them; the verifier's suite runs in `test`. The settlement verifier's own
@@ -42,6 +44,13 @@ vectors:
 test-proof: build-guests build-test-actors
     cargo test -p vos-pvm-proof --features debug-internals --tests -- --test-threads=2
     cd pvm/proof/settlement-verifier; cargo test
+
+# The proof fixtures under `pvm/proof/fixtures` (`proving.md` A.6), written
+# anew by their generator, `pvm/proof/tests/fixtures.rs`: at a format bump,
+# or a change of the AIR or a kernel's shape. `test-proof` refuses fixtures
+# the generator no longer makes.
+fixtures:
+    with-env { VOS_FIXTURES: "write" } { cargo test -p vos-pvm-proof --test fixtures the_fixtures_are_the_generators }
 
 # Guest programs the prover suites run.
 build-guests: build-settle
