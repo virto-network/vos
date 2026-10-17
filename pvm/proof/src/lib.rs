@@ -49,8 +49,8 @@
 //!   element propagation).
 //! - `lookups` — relation definitions for cross-chip lookups
 //!   (Range256, BitwiseAnd, MemoryAccess, RegisterMemory,
-//!   ProgramMemory, JumpTable, ProgramExecution, Blake2bState,
-//!   Blake2bCall).
+//!   ProgramMemory, JumpTable, ProgramExecution, Blake2bCall,
+//!   Blake2bCompression, MerkleNode, …).
 //! - [`trace`] — column-fill helpers + interaction-trace builder.
 //! - [`proof`] — public proof type (serializable).
 //! - `prove` / `verify` / `program_id` — top-level prover / verifier

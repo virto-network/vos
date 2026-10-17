@@ -356,81 +356,13 @@ impl TracingPvm {
 
     /// Serve one compression and record it for the BLAKE2b chip: false when
     /// an argument range is out of the machine's accessible memory.
+    ///
+    /// Served by the runtime's own [`vos_pvm::precompile::execute`], the
+    /// refine host's serving, through the memory's permission-checked
+    /// accessors, over a flat or a sparse memory alike: a range the runtime
+    /// refuses (a 64-bit pointer, an inaccessible or wrapping range) is a
+    /// panic here too, never a read of zeros.
     fn handle_blake2b_ecall(&mut self) -> bool {
-        if self.pvm.memory().is_sparse() {
-            return self.handle_blake2b_ecall_sparse();
-        }
-        // Read h (64 bytes) from memory at address in φ[7] (a0).
-        //
-        // Register convention: vos-pvm-precompiles shim emits a0/a1/a2/a3
-        // → h_ptr/m_ptr/t_low/f_flag, which the transpiler maps to PVM
-        // φ[7/8/9/10]. The `Blake2bCallLookupElements` tuple's
-        // slot-to-register-index mapping lives in
-        // `chips/cpu/{trace_fill,mod,interaction}.rs`.
-        let h_ptr_u = self.pvm.registers[7] as usize;
-        let m_ptr_u = self.pvm.registers[8] as usize;
-        let h_ptr = self.pvm.registers[7] as u32;
-        let m_ptr = self.pvm.registers[8] as u32;
-        let t_low = self.pvm.registers[9];
-        let f = self.pvm.registers[10] != 0; // a3 (= x13 = φ[10]) holds f_flag
-
-        let mut h = [0u64; 8];
-        let mut m = [0u64; 16];
-        let mut h_bytes = [0u8; 64];
-        let mut m_bytes = [0u8; 128];
-
-        for i in 0..8 {
-            let off = h_ptr_u + i * 8;
-            if off + 8 <= self.pvm.flat_mem().len() {
-                h[i] = u64::from_le_bytes(self.pvm.flat_mem()[off..off + 8].try_into().unwrap());
-                h_bytes[i * 8..(i + 1) * 8].copy_from_slice(&self.pvm.flat_mem()[off..off + 8]);
-            }
-        }
-        for i in 0..16 {
-            let off = m_ptr_u + i * 8;
-            if off + 8 <= self.pvm.flat_mem().len() {
-                m[i] = u64::from_le_bytes(self.pvm.flat_mem()[off..off + 8].try_into().unwrap());
-                m_bytes[i * 8..(i + 1) * 8].copy_from_slice(&self.pvm.flat_mem()[off..off + 8]);
-            }
-        }
-
-        let t = t_low as u128;
-
-        // Execute blake2b compression
-        let result = blake2b_compress_sw(&h, &m, t, f);
-
-        // Write result back to h_ptr and capture the exact bytes that hit memory
-        let mut out_bytes = [0u8; 64];
-        for i in 0..8 {
-            let off = h_ptr_u + i * 8;
-            let bytes = result[i].to_le_bytes();
-            out_bytes[i * 8..(i + 1) * 8].copy_from_slice(&bytes);
-            if off + 8 <= self.pvm.flat_mem().len() {
-                self.write_flat_bytes(off, &bytes);
-            }
-        }
-
-        // The ECALL step's timestamp was already assigned and incremented by
-        // the preceding self.step() call; its value is self.timestamp - 1.
-        let ts = self.timestamp - 1;
-
-        self.blake2b_records.push(Blake2bRecord { h, m, t, f });
-        self.blake2b_mem_ops.push(Blake2bMemOp {
-            h_ptr,
-            m_ptr,
-            ts,
-            h_bytes,
-            m_bytes,
-            out_bytes,
-        });
-        true
-    }
-
-    /// The compression over a sparse memory, a standard program's layout
-    /// across the whole address space: served by the runtime's own
-    /// [`vos_pvm::precompile::execute`], the refine host's serving, through
-    /// the memory's permission-checked accessors.
-    fn handle_blake2b_ecall_sparse(&mut self) -> bool {
         let registers = self.pvm.registers;
         let Some(vos_pvm::precompile::PrecompileCall::Blake2bCompress {
             h_ptr,
@@ -461,17 +393,6 @@ impl TracingPvm {
             out_bytes,
         });
         true
-    }
-
-    fn write_flat_bytes(&mut self, address: usize, bytes: &[u8]) {
-        debug_assert!(address.saturating_add(bytes.len()) <= self.pvm.flat_mem().len());
-        for (offset, byte) in bytes.iter().copied().enumerate() {
-            let address = u32::try_from(address + offset)
-                .expect("in-bounds PVM flat-memory address must fit u32");
-            self.pvm
-                .write_u8(address, byte)
-                .expect("tracing flat memory is writable");
-        }
     }
 
     /// Number of steps recorded so far.
@@ -557,74 +478,6 @@ impl TracingPvm {
     pub fn blake2b_calls(&self) -> &[Blake2bRecord] {
         &self.blake2b_records
     }
-}
-
-// ── Software blake2b for the precompile ──────────────────────
-
-const BLAKE2B_IV: [u64; 8] = [
-    0x6A09E667F3BCC908,
-    0xBB67AE8584CAA73B,
-    0x3C6EF372FE94F82B,
-    0xA54FF53A5F1D36F1,
-    0x510E527FADE682D1,
-    0x9B05688C2B3E6C1F,
-    0x1F83D9ABFB41BD6B,
-    0x5BE0CD19137E2179,
-];
-
-const BLAKE2B_SIGMA: [[usize; 16]; 12] = [
-    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
-    [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3],
-    [11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4],
-    [7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8],
-    [9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13],
-    [2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9],
-    [12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11],
-    [13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10],
-    [6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5],
-    [10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0],
-    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
-    [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3],
-];
-
-fn blake2b_compress_sw(h: &[u64; 8], m: &[u64; 16], t: u128, f: bool) -> [u64; 8] {
-    let mut v = [0u64; 16];
-    v[..8].copy_from_slice(h);
-    v[8..].copy_from_slice(&BLAKE2B_IV);
-    v[12] ^= t as u64;
-    v[13] ^= (t >> 64) as u64;
-    if f {
-        v[14] = !v[14];
-    }
-
-    for round in 0..12 {
-        let s = &BLAKE2B_SIGMA[round];
-        g_sw(&mut v, 0, 4, 8, 12, m[s[0]], m[s[1]]);
-        g_sw(&mut v, 1, 5, 9, 13, m[s[2]], m[s[3]]);
-        g_sw(&mut v, 2, 6, 10, 14, m[s[4]], m[s[5]]);
-        g_sw(&mut v, 3, 7, 11, 15, m[s[6]], m[s[7]]);
-        g_sw(&mut v, 0, 5, 10, 15, m[s[8]], m[s[9]]);
-        g_sw(&mut v, 1, 6, 11, 12, m[s[10]], m[s[11]]);
-        g_sw(&mut v, 2, 7, 8, 13, m[s[12]], m[s[13]]);
-        g_sw(&mut v, 3, 4, 9, 14, m[s[14]], m[s[15]]);
-    }
-
-    let mut result = [0u64; 8];
-    for i in 0..8 {
-        result[i] = h[i] ^ v[i] ^ v[i + 8];
-    }
-    result
-}
-
-fn g_sw(v: &mut [u64; 16], a: usize, b: usize, c: usize, d: usize, mx: u64, my: u64) {
-    v[a] = v[a].wrapping_add(v[b]).wrapping_add(mx);
-    v[d] = (v[d] ^ v[a]).rotate_right(32);
-    v[c] = v[c].wrapping_add(v[d]);
-    v[b] = (v[b] ^ v[c]).rotate_right(24);
-    v[a] = v[a].wrapping_add(v[b]).wrapping_add(my);
-    v[d] = (v[d] ^ v[a]).rotate_right(16);
-    v[c] = v[c].wrapping_add(v[d]);
-    v[b] = (v[b] ^ v[c]).rotate_right(63);
 }
 
 /// Compute skip(i) — distance to next instruction minus 1.

@@ -133,11 +133,6 @@ stwo_constraint_framework::relation!(PopcountLookupElements, REL_POPCOUNT_LOOKUP
 const REL_BITCOUNT_LOOKUP_SIZE: usize = 3;
 stwo_constraint_framework::relation!(BitcountLookupElements, REL_BITCOUNT_LOOKUP_SIZE);
 
-// (cid[4], slot[1], value[8]) — Blake2b state lookup between boundary chip
-// and main Blake2b chip for initial-state + final-state authentication.
-const REL_BLAKE2B_STATE_LOOKUP_SIZE: usize = 4 + 1 + WORD_SIZE;
-stwo_constraint_framework::relation!(Blake2bStateLookupElements, REL_BLAKE2B_STATE_LOOKUP_SIZE);
-
 // DivRem lookup.  CpuChip emits one producer
 // per `is_div_rem` row; DivRemChip consumes once per real (non-
 // padding) row.  Tuple binds the per-row inputs to DivRemChip's

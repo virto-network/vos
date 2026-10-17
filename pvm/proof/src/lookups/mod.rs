@@ -18,11 +18,11 @@ pub use self::{
     relations::{
         BitcountLookupElements, BitwiseAndByteLookupElements, BitwiseAndLookupElements,
         BitwiseLookupElements, Blake2bCallLookupElements, Blake2bCompressionLookupElements,
-        Blake2bStateLookupElements, ByteToBitsLookupElements, CompareLookupElements,
-        DivRemLookupElements, JumpTableLookupElements, MemoryAccessLookupElements,
-        MerkleNodeLookupElements, MultiplicationLookupElements, PopcountLookupElements,
-        PowerOfTwoLookupElements, ProgramExecutionLookupElements, ProgramMemoryLookupElements,
-        RegisterMemoryLookupElements, WitnessCallLookupElements,
+        ByteToBitsLookupElements, CompareLookupElements, DivRemLookupElements,
+        JumpTableLookupElements, MemoryAccessLookupElements, MerkleNodeLookupElements,
+        MultiplicationLookupElements, PopcountLookupElements, PowerOfTwoLookupElements,
+        ProgramExecutionLookupElements, ProgramMemoryLookupElements, RegisterMemoryLookupElements,
+        WitnessCallLookupElements,
     },
 };
 
@@ -39,7 +39,6 @@ macros::register_relation! {
         PowerOfTwoLookupElements,
         PopcountLookupElements,
         BitcountLookupElements,
-        Blake2bStateLookupElements,
         Blake2bCallLookupElements,
         Blake2bCompressionLookupElements,
         MerkleNodeLookupElements,
