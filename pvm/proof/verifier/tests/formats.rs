@@ -115,7 +115,7 @@ fn every_admitted_format_round_trips() {
 
 /// A proof is refused under every other number: a registered format the
 /// registry does not admit, the other admitted format (whose channel its
-/// Stark proof is not on), and an unregistered number.
+/// Stark proof is not on), a retired number, and an unregistered one.
 #[test]
 fn a_proof_under_one_format_is_refused_under_another() {
     for format in admitted() {
@@ -133,7 +133,12 @@ fn a_proof_under_one_format_is_refused_under_another() {
             };
             refused_both(relabelled, side_note, expected);
         }
-        for number in [25, 31] {
+        for number in format::RETIRED {
+            let mut relabelled = proof.clone();
+            relabelled.format_version = number;
+            refused_both(relabelled, side_note, "retired");
+        }
+        for number in [23, 35] {
             let mut relabelled = proof.clone();
             relabelled.format_version = number;
             refused_both(relabelled, side_note, "not registered");

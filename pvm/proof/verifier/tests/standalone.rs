@@ -407,13 +407,13 @@ fn standalone_verify_rejects_format_version_mismatch() {
 
     // Forge: a number the registry does not hold, as a proof of a future
     // AIR would carry.
-    proof.format_version = 31;
+    proof.format_version = 35;
 
     let err = verify_standalone(proof, preprocessed_commitment)
         .expect_err("should reject mismatched format_version");
     let msg = format!("{err:?}");
     assert!(
-        msg.contains("proof format 31 is not registered"),
+        msg.contains("proof format 35 is not registered"),
         "expected format-version error, got: {msg}"
     );
 }

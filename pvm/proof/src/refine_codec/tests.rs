@@ -253,7 +253,8 @@ fn the_decoder_refuses_reserved_formats_and_channel_mismatches() {
         .iter()
         .filter(|format| format.status != crate::format::Status::Admitted)
         .map(|format| format.number)
-        .chain([25, 31])
+        .chain(crate::format::RETIRED)
+        .chain([35])
     {
         let mut reserved = encoded.clone();
         patch_u32(&mut reserved, FIRST_FORMAT_OFFSET, number);
