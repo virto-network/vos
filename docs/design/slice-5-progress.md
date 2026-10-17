@@ -1670,6 +1670,9 @@ count, then the floors]:
   Gray Paper's 28 less a day's margin; a step due past that ends the
   workflow `Expired`. It is a rule the agent keeps alike on every host,
   where re-export would be a builder's duty.
+- **The A.6 fixture generator was not built.** The plan put it in M0's
+  pipeline, to make `pvm/proof/fixtures` and regenerate them at each
+  format bump; no step built it. It moves to M1's preparation, 5.8.0.
 
 ### Carried into M1
 
@@ -1697,4 +1700,34 @@ count, then the floors]:
   - 5.6, the phone run;
   - PolkaJam's recompiler run, which needs a build that tolerates cores
     without L3, or another machine.
-- **M0's closing:** the Opus milestone review, then a push.
+- **M0's closing:** the Opus milestone review, folded below; then a
+  push.
+
+### The milestone review
+
+Opus's review of M0, on `e021f40c`, found nine items: four stale docs,
+fixed, and five pieces of preparation, which open M1.
+
+- **Fixed in the docs** (items 1–3 and 8):
+  - `proving.md` A.4, rewritten from the registry: 31 segments, 32
+    leaves and folds, 33 legacy Blake2s, 34 devices, 28 the wrap, 30
+    credentials; 24–27 and 29 retired. A.5's `Attest` is
+    `{program, witness_input, output}`;
+  - the leaf headroom, in `proving.md` and `recursion-air.md`: about
+    8,100 columns at 44 queries, not 9,300 at 39; the kernel leaf's `p2`
+    about 64.8k of 2^16, about 1% spare [model]; the levers, fewer
+    queries with more PoW, FRI fold step 3 in inner proofs, or `p2` at
+    2^17;
+  - 5.9's gate and 5.11's per-term pin: `count.log` predates the
+    hardening, so 5.9 re-runs the gate-count crate on the hardened AIR
+    first;
+  - `pvm/proof/SECURITY.md` (the memory roots bound; the refine bundle
+    v4, its children format 33), `memory-merkle-binding.md` (Ristretto's
+    removal), `proving.md` §3.2 (page permissions preprocessed, part of
+    the program's identity), and 5.10's citation
+    (`boundary_binding.rs:147-205`).
+- **Moved to 5.8.0** (items 4–7 and 9): the window kernel on the line,
+  the fixture generator, one no_std Poseidon2 crate, one transcript
+  prefix, one page tree, `add_constraints` split by instruction class,
+  and the inner parameters' recount with its decision rule. The review's
+  smaller code-quality items wait for 5.16.

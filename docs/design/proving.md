@@ -195,6 +195,14 @@ attribution). Its full design is `recursion-air.md`.
     most φ8, and has no other effect;
   - the whole input is capped at 4 MiB, a work result's cap;
   - `derive` admits the new id, and a live≡traced test gates it in M0.
+- **Page permissions are preprocessed.** The program's layout is four
+  regions of pages: two readable (the read-only data, the argument
+  window) and two writable (the read-write data with its heap, the
+  stack). Their bounds are MEMORY_PAGE's preprocessed columns
+  (`pvm/proof/src/chips/memory_page.rs`), so the preprocessed root, and
+  through it the program id, pins them: they are part of the program's
+  identity. A write to a readable page, or a touch of an unmapped one,
+  cannot be proved.
 - **Unmasked.** Segments never leave the prover role.
 
 ### 3.3 Leaf circuits
@@ -232,10 +240,11 @@ attribution). Its full design is `recursion-air.md`.
 - **A leaf's size is the kernel's width times the queries, not the
   segment's length** [model]. Four times longer segments add 4% of rows,
   so longer segments make recursion cheaper per step.
-  - **The shape per kernel is load-bearing.** A kernel-like shape fits
-    the padded shape up to about 9,300 columns. The full 32-chip set
-    (13,037) would have doubled every node; without the Ristretto chips
-    and hardened, the full set is 8,039 columns, inside it [model].
+  - **The shape per kernel is load-bearing.** At the inner formats' 44
+    queries, a kernel-like shape fits the padded shape up to about 8,100
+    columns [model]. The full 32-chip set (13,037) would have doubled
+    every node; without the Ristretto chips and hardened, the full set is
+    8,039 columns, just inside it [model].
   - At derive time, each kernel's leaf rows are computed from its shape.
     A kernel over the limit is refused, or waits for a format with a
     larger shape.
@@ -267,7 +276,12 @@ attribution). Its full design is `recursion-air.md`.
   statement.
 - **One padded shape for leaves and folds,** a format constant: 2^16 /
   2^17 / 2^16 rows.
-  - The leaf has 16% headroom in `p2` rows and 26% in `qm31` [model].
+  - **The kernel leaf is tight.** At 44 queries over the 8,024-column
+    shape, its `p2` is about 64.8k rows of 2^16, about 1% spare, and its
+    `qm31` about 111k of 2^17 [model].
+  - **The levers,** if a count passes 2^16: fewer queries with more PoW
+    (a new segment format), FRI fold step 3 in inner proofs, or `p2` at
+    2^17 (+70% cells). Slice 5's 5.8.0 holds the rule that picks one.
   - A fold uses under half of the shape, so a child could grow by about
     3,200 columns before the fold outgrows it.
   - A kernel that does not fit is refused (§3.3).
@@ -365,8 +379,8 @@ pub struct Statement {
   It is kept in the install's `Derivation`. Venues store and compare it;
   they never compute it.
 - **Formats are chosen at run time,** so a verifier accepts two during a
-  transition. Today the format is fixed by a cargo feature
-  (`pvm/proof/src/proof.rs:180-187`).
+  transition: a proof's format number selects its channel and parameters
+  from the registry (A.4).
 - **The crates,** under `pvm/proof/`:
   - `recair` (`vos-recair`): the recursion prover and its `Context`;
   - `recair-air` (`vos-recair-air`): the components' constraint bodies,
@@ -603,7 +617,7 @@ that narrows the inner proof makes folds cheaper too.
 | the recursion AIR does not converge | sized in `recursion-air.md` (it converges at once [model]); then measured: a fold verifies two folds within the constant shape | slice 5, M1 |
 | signed multiplicities in the wiring are new soundness surface | the `Context`'s static checks; the audit of the wiring argument (`recursion-air.md` §1.1) | slice 5, M1 |
 | the gate compiler is wrong | equivalence tests (constraint ≡ gate) on every chip; tamper tests | slice 5, M1 |
-| the window kernel's leaf is too big | its topology counted early (5.11), then its leaf proved within A.7; otherwise `p2` at 2^17 (+70% cells), narrower chips, or FRI fold step 3 in inner proofs (`p2` 55.3k → 49.2k rows) | slice 5, M1 |
+| the window kernel's leaf is too big (`p2` about 64.8k of 2^16 at 44 queries [model]) | recounted on the hardened shape (5.8.0, 5.10), its topology counted (5.11), then its leaf proved within A.7; otherwise fewer queries with more PoW (PoW 24 and 40 queries, about −6k `p2` rows), FRI fold step 3 in inner proofs, `p2` at 2^17 (+70% cells), or narrower chips | slice 5, M1 |
 | the final wrap misses its gas or size | the real wrap verified on the JAM-only host (≤ 150M unmasked) and in the Wasm harness | slice 5, M1 |
 | the multi-step FRI path, or the new Blake2b channel, is unsound | a review plus tamper tests before the format admits them | slice 5, M1 |
 | the wrap misses its 80 proven bits | 74.7 at blowup 64 with powers-of-one DEEP batching [model]; affine batching in the fork for format 28 (about 1.06× verify), or a 6-bit batching PoW (1.11×), or blowup 8 with 41 queries (1.97×), decided at 5.14 | slice 5, M1 |
@@ -616,7 +630,7 @@ that narrows the inner proof makes folds cheaper too.
 | slice | milestone | content | estimate |
 |---|---|---|---|
 | **5** | **M0 Foundation** | our Stwo fork pinned, with the completeness fix and no_std gating; a shape per kernel; formats chosen at run time, with lossless encodings; the inner parameters, interaction PoW and both bit counts; the witness-input precompile, the halt pc and the io-hash with roots; the reference Poseidon2, a SIMD hasher and the channel gate; the phone run | 6–9 weeks |
-| **5** | **M1 The recursion, unmasked, in tests** | `recursion-air.md` §10's eight steps: the gate VM; the gate compiler; the in-AIR verifier's pieces; COMPARE's leaf; the window kernel's and the solvency predicate's leaves; the fold and the fixed point; the final wrap with the Blake2b channel and `vos-final-verifier`; end to end with `vos-statement` and the golden fixtures | 17–24 weeks, plus reviews |
+| **5** | **M1 The recursion, unmasked, in tests** | a preparation step (slice 5's 5.8.0: the window kernel on the line, the fixture generator, shared code, the inner parameters recounted); then `recursion-air.md` §10's eight steps: the gate VM; the gate compiler; the in-AIR verifier's pieces; COMPARE's leaf; the window kernel's and the solvency predicate's leaves; the fold and the fixed point; the final wrap with the Blake2b channel and `vos-final-verifier`; end to end with `vos-statement` and the golden fixtures | 18–26 weeks, plus reviews |
 | **6** | **M2 Masking** | R1–R8 on the wrap and on device proofs; 248-bit salts; leakage and soundness gates | 6–8 weeks |
 | **6** | **M3 Statements on chain** | the public-input model; `&self` witnessed reads to the space root at anchored cuts; the prover worker; the Kreivo pallet (P0 and P1); the JAM verifier agent | 8–12 weeks |
 | **7** | **M4 Credential AIR** | the Poseidon2 root kind; the zkPVM Poseidon2 chip; the credential AIR with PRF passkeys; a phone gate | 6–10 weeks |
@@ -625,11 +639,12 @@ that narrows the inner proof makes folds cheaper too.
 
 - M0 runs on two tracks. Its critical path is 5.1 → 5.2 → 5.4, and
   5.5 → 5.12 (`slice-5-proving.md`); 5.7 runs beside it.
-- M1's 17–24 weeks sit below spike 4b §8's 20–28 to a working tree for
-  our own AIR: the design and its counts are now measured, and
-  production hardening (the audit, masking) is slice 6.
+- M1's 18–26 weeks are 1–2 for its preparation and 17–24 for §10's
+  steps, which sit below spike 4b §8's 20–28 to a working tree for our
+  own AIR: the design and its counts are now measured, and production
+  hardening (the audit, masking) is slice 6.
 - The Clerk across spaces follows slice 6.
-- The total is about 57–87 engineer-weeks.
+- The total is about 58–89 engineer-weeks.
 
 ## 12. Decisions
 
@@ -685,7 +700,7 @@ verifier's (`pvm/proof/verifier/src/lib.rs:561-675`, then Stwo's
 The boundary states are mixed as bytes, every other value in 16-bit
 limbs (A.3). The boundary chips' claimed sums
 are recomputed from the boundary states
-(`pvm/proof/src/boundary_binding.rs:116-168`) as public logup terms. A
+(`pvm/proof/src/boundary_binding.rs:147-205`) as public logup terms. A
 transcript-equality test checks that the native and in-AIR channels draw
 alike.
 
@@ -747,33 +762,44 @@ output).**
   (16 limbs), 24 words at the wrap's reserved addresses 0–23, one word
   a wire. Its zero, one and `u` follow them.
 
-**A.4 The format registry (M0),** `pvm/proof/src/format.rs`. New numbers,
-not 24 or 25. Parameters as log blowup, queries, PoW, fold step, log last
-layer, interaction PoW; counts as conjectured / proven at the reference
-shape [model]:
+**A.4 The format registry (M0),** `pvm/proof/src/format.rs`. Parameters
+as log blowup, queries, PoW, fold step, log last layer, interaction PoW;
+counts as conjectured / proven at the reference shape [model]:
 
-| number | proofs | channel | parameters | floors | counts |
-|---|---|---|---|---|---|
-| 26 | segments | Poseidon2-M31 | 2, 44, 20, 1, 0, 8 | 100 / 60 | 108 / 62 |
-| 27 | leaf and fold (one padded shape) | Poseidon2-M31 | 2, 44, 20, 1, 0, 8 | 100 / 60 | 108 / 63 |
-| 28 | the final wrap, masked | Blake2b-256 | 6, 20, 26, 3, 6, 8, affine DEEP batching | 100 / 80 | 146 / 74 as built |
-| 29 | device proofs, masked | Blake2s-M31 | 1, 86, 20, 1, 0, 8 | 100 / 60 | 106 / 62 |
-| 30 | credential proofs, masked | Blake2s-M31 | 1, 86, 20, 1, 0, 8 | 100 / 60 | 106 / 62 |
+| number | proofs | channel | parameters | floors | counts | status |
+|---|---|---|---|---|---|---|
+| 31 | segments | Poseidon2-M31 | 2, 44, 20, 1, 0, 8 | 100 / 60 | 108 / 62 | admitted |
+| 32 | leaf and fold (one padded shape) | Poseidon2-M31 | 2, 44, 20, 1, 0, 8 | 100 / 60 | 108 / 63 | reserved |
+| 33 | segments, legacy encodings | Blake2s | the proof's own, at least 96 conjectured bits (MOBILE: 2, 38, 20, 1, 0, none) | 96 / — | 96 / 57 | admitted |
+| 34 | device proofs, masked | Blake2s-M31 | 1, 86, 20, 1, 0, 8 | 100 / 60 | 106 / 62 | reserved |
+| 28 | the final wrap, masked | Blake2b-256 | 6, 20, 26, 3, 6, 8, affine DEEP batching | 100 / 80 | 146 / 74 as built | reserved |
+| 30 | credential proofs, masked | Blake2s-M31 | 1, 86, 20, 1, 0, 8 | 100 / 60 | 106 / 62 | reserved |
 
-Each entry holds its channel, its parameters, the DEEP batching its proven
-floor assumes and both bit counts. Every one uses A.3's encodings. 26 is
-admitted; 27 to 30 are refused until their AIRs and channels exist, and 28
-until affine batching does.
+- **Each entry** holds its channel, its encodings, its parameters, the DEEP
+  batching its proven floor assumes and both bit counts.
+- **31, 32 and 34 use A.3's encodings** and exactly their parameters, as
+  do 28 and 30.
+- **33 is the legacy segment format** the default prover produces, kept
+  while the refine bundles and chain proofs use it: no interaction PoW,
+  the boundary states mixed a word at a time, and the proof's own
+  parameters under the 96-bit conjectured floor.
+- **31 to 34 name the hardened segment AIR;** 28 and 30 prove the
+  recursion AIR. A reserved entry is refused until its AIR and channel
+  exist, and 28 until affine batching does.
+- **24 to 27 and 29 are retired.** They named the segment AIR before its
+  hardening, so they are refused and never registered again: a number
+  names one AIR.
 
 **A.5 What may leave the prover role (slice 6):**
 - the `Statement`;
 - the final proof.
 
-`Attest` (`agent/wire/src/result.rs:351`) holds `{ program, arguments,
-output }` today.
-- M0 adds `witness_input: Vec<u8>`: the exact byte stream the kernel
-  read, in call order, at most 4 MiB. A large result travels as a blob
-  (slice 4's 4.4a).
+`Attest` (`agent/wire/src/result.rs:351`) is `{ program, witness_input,
+output }`.
+- **`witness_input`** replaced `arguments` in M0: the exact byte stream
+  the kernel read, in call order, at most 4 MiB. Keeping both would have
+  held the same bytes twice. A large result travels as a blob (slice 4's
+  4.4a).
 - Slice 6 adds the window, then the final proof's hash.
 
 Segment, leaf and fold proofs appear in no log entry, blob or message
@@ -791,9 +817,9 @@ carriers.
 - an unaccepted format;
 - a wrong io-hash.
 
-Every venue judges them alike. A generator in the M0 pipeline makes
-them, regenerated at each format bump, and stores them under
-`pvm/proof/fixtures` (about 1.2 MB).
+Every venue judges them alike. A generator makes them, regenerated at
+each format bump, and stores them under `pvm/proof/fixtures` (about
+1.2 MB). M0 promised it and did not build it; slice 5's 5.8.0 does.
 
 **A.7 Budgets per node (M1: measured, then pinned).** Heavy tests run
 under `systemd-run` with these caps as `MemoryMax`.

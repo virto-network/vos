@@ -20,7 +20,7 @@ soundness reasoning.
 | `proof.stark_proof`                              | NO       | Cryptographically verified by stwo.           |
 | `proof.claimed_sums`                             | NO       | Constrained: per-component logup must sum to 0. |
 | `proof.log_sizes`                                | NO       | Capped by `DEFAULT_MAX_LOG_SIZE` (overridable). |
-| `proof.initial_state` / `proof.final_state`      | partial  | registers/pc/timestamp bound to the committed boundary columns (boundary-binding check, v5) AND to the trace (pc/timestamp via CpuChip chaining; registers via the v6 register-ledger read-consistency); `memory_commitment` UNBOUND. Deployer must publish what *should* match. |
+| `proof.initial_state` / `proof.final_state`      | partial  | registers/pc/timestamp bound to the committed boundary columns (boundary-binding check) AND to the trace (pc/timestamp via CpuChip chaining; registers via the register-ledger read-consistency); `memory_root` bound through `MemoryRootBoundaryChip` to the in-AIR page-Merkle trie of the entering and exit images. `memory_commitment` is vestigial metadata, unbound. Deployer must publish what *should* match. |
 | `proof.pcs_config`                               | NO       | Structurally/policy checked and fully Fiat–Shamir-bound, including the lifting `Option` discriminant. See "Proof shape" below. |
 | `hash` (preprocessed commitment)                 | YES      | Caller-supplied: this IS the program identity. |
 
@@ -43,10 +43,10 @@ The verifier accepts the proof iff:
    from `proof.{initial,final}_state` with the FS-drawn lookup
    elements (boundary-binding check) — binds the boundary metadata to
    the committed columns; empty-trace proofs are rejected.
-8. (v5, standalone) `component_mask` contains the three boundary-binding
+8. (v5, standalone) `component_mask` contains the four boundary-binding
    chips and its popcount equals `num_components`.
 
-### Nested Refine bundles (formats 20/21, bundle v2)
+### Nested Refine bundles (bundle v4, children under format 33)
 
 `RefineProofBundle` is an ordered closure of single-program child STARKs.
 Its transcript binds the exact outer artifact hash and invocation
