@@ -2,6 +2,7 @@
 //! keeps, proofs and the updates made from them.
 
 mod common;
+mod encoded;
 mod keys;
 mod proofs;
 mod ranges;

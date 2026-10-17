@@ -19,6 +19,12 @@ pub(crate) const TAG_VALUE: &[u8] = b"vos/tree/value";
 pub trait Hasher {
     /// The digest of `tag ‖ parts[0] ‖ parts[1] ‖ …`.
     fn hash(&self, tag: &[u8], parts: &[&[u8]]) -> Hash;
+
+    /// A branch's hash at `level` over its children's: [`branch_hash`]. The
+    /// most frequent hash, so a hasher may compute it its own way.
+    fn branch(&self, level: u16, left: &Hash, right: &Hash) -> Hash {
+        self.hash(TAG_BRANCH, &[&level.to_be_bytes(), left, right])
+    }
 }
 
 /// BLAKE2b-256 in software, or through the compression precompile in a PVM
@@ -32,6 +38,54 @@ impl Hasher for Blake2b {
     #[inline(always)]
     fn hash(&self, tag: &[u8], parts: &[&[u8]]) -> Hash {
         vos_pvm_precompiles::blake2b_hash::<32>(tag, parts)
+    }
+
+    /// One block of words: the tag's 15 bytes, the level's 2, big-endian,
+    /// then the children's 32 each from byte 17 on, 81 bytes in all.
+    /// Inlined where it is called, so children held in aligned words are
+    /// read as words.
+    #[inline(always)]
+    fn branch(&self, level: u16, left: &Hash, right: &Hash) -> Hash {
+        const VOS_TREE: u64 = u64::from_le_bytes(*b"vos/tree");
+        const SLASH_BRANCH: u64 = u64::from_le_bytes(*b"/branch\0");
+        let word =
+            |hash: &Hash, k: usize| u64::from_le_bytes(hash[k * 8..k * 8 + 8].try_into().unwrap());
+        let left = [word(left, 0), word(left, 1), word(left, 2), word(left, 3)];
+        let right = [
+            word(right, 0),
+            word(right, 1),
+            word(right, 2),
+            word(right, 3),
+        ];
+        let [high, low] = level.to_be_bytes();
+        let block: [u64; 16] = [
+            VOS_TREE,
+            SLASH_BRANCH | u64::from(high) << 56,
+            u64::from(low) | left[0] << 8,
+            left[0] >> 56 | left[1] << 8,
+            left[1] >> 56 | left[2] << 8,
+            left[2] >> 56 | left[3] << 8,
+            left[3] >> 56 | right[0] << 8,
+            right[0] >> 56 | right[1] << 8,
+            right[1] >> 56 | right[2] << 8,
+            right[2] >> 56 | right[3] << 8,
+            right[3] >> 56,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        // An unkeyed 32-byte digest's parameter block: its length, fanout 1
+        // and depth 1.
+        let mut h = vos_pvm_precompiles::BLAKE2B_IV;
+        h[0] ^= 0x0101_0020;
+        vos_pvm_precompiles::blake2b_compress_words(&mut h, &block, 81, true);
+        let mut digest = [0; 32];
+        for (bytes, word) in digest.chunks_exact_mut(8).zip(h) {
+            bytes.copy_from_slice(&word.to_le_bytes());
+        }
+        digest
     }
 }
 
@@ -50,7 +104,7 @@ pub fn leaf_hash<H: Hasher>(hasher: &H, key: &[u8], value_hash: &Hash) -> Hash {
 
 /// The hash of a branch at `level` over its children's hashes.
 pub fn branch_hash<H: Hasher>(hasher: &H, level: u16, left: &Hash, right: &Hash) -> Hash {
-    hasher.hash(TAG_BRANCH, &[&level.to_be_bytes(), left, right])
+    hasher.branch(level, left, right)
 }
 
 /// The empty tree's root.

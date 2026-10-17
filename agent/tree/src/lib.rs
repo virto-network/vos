@@ -79,7 +79,9 @@
 //! opened leaves are in strictly increasing order. Then:
 //! - for a batch proof, each claimed key's path ends in the proof: at its
 //!   own leaf with the claimed `vh`, or, claimed absent, at the empty tree or
-//!   at another leaf, which the key neither prefixes nor extends;
+//!   at another leaf, which the key neither prefixes nor extends.
+//!   [`verify_encoded`] makes the same check from the proof's encoding as
+//!   it reads it, holding only the branches still open;
 //! - for a range proof, the opened leaves and closed subtrees in order are:
 //!   any, the last of them an opened leaf below `from`, unless none; the
 //!   leaves in the range, which must be the claimed rows; and an opened leaf
@@ -105,6 +107,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 mod build;
+mod encoded;
 mod hash;
 pub mod keys;
 mod partial;
@@ -114,6 +117,7 @@ mod store;
 mod update;
 
 pub use build::root;
+pub use encoded::verify_encoded;
 pub use hash::{Blake2b, Hasher, branch_hash, empty_root, leaf_hash, salt, value_hash};
 pub use proof::{BatchProof, Entry, PartialTree};
 pub use range::RangeProof;
