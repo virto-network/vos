@@ -1731,3 +1731,159 @@ fixed, and five pieces of preparation, which open M1.
   prefix, one page tree, `add_constraints` split by instruction class,
   and the inner parameters' recount with its decision rule. The review's
   smaller code-quality items wait for 5.16.
+
+## 5.8.0 (A): the window kernel on the line, and the fixture generator
+
+### The window kernel
+
+- **The route: the plan's, not the fallback.** `agent/test-actors/window`
+  builds for the guest target on cipher-clerk v0.3.0 (codeberg, tag
+  `v0.3.0`) with `settlement` and without `pvm-precompile`, and derive
+  takes its kernel: dalek compiles in, and the kernel reaches no id
+  110–114. No shim, harness or patched workspace from the spike.
+- **The kernel** (`settle`): each row's account decoded, its key
+  `keys::hashed(id)`, its commitments `value_hash(salt, value)` at both
+  anchors; the rows in key order; each anchor's `vos_tree::BatchProof`
+  checked against its root; then `cipher_clerk::settlement::window`. A row
+  absent at the first anchor is claimed absent there and counts from zero.
+  The output is a status byte, then the `NetFlow`'s encoding.
+- **The multiproof check is streamed** (`vos_tree::verify_encoded`,
+  `agent/tree/src/encoded.rs`): the proof's encoding read once, nodes
+  hashed bottom-up on a stack of open branches, the claims split at each
+  branch by their bit at its level, as `BatchProof::generate` splits the
+  keys it proves, and each claim judged where its path ends. It gives
+  `BatchProof::verify`'s judgment and error on the decoded bytes, in
+  either direction. A branch's hash is `Hasher::branch`, whose default is
+  the tagged hash and which `Blake2b` computes as one block of words
+  handed to the compression precompile (`blake2b_compress_words`, the
+  precompile crate's IV). `vos_tree::BatchProof::verify` was the first
+  try, and the kernel took 1,335,487 steps and 126 segments [measured]:
+  decoding the proofs into entries (173k steps) and building the pruned
+  tree (869k) touch so many heap pages that the page budget closed 61
+  segments at class 0, and proving took 1,222 s. Streaming with
+  vos-tree's byte-oriented hashes: 938,177 steps; with the branch hash
+  on words: 654,338; in vos-tree, with the claims split: 632,800.
+- **The arguments** (`pvm/proof/tests/window_kernel.rs`): spike 3's
+  instance rebuilt in the test, a map of 1,000,000 rows at two versions
+  with eight journals' pseudo-account pairs, journal 0's incoming account
+  opened inside the window, so absent at the first anchor. The rows are
+  `Vec<Row>`, the proofs each `BatchProof`'s encoding as bytes. Building
+  the map takes about 3 s with vos-tree and the BLAKE2b fallback at
+  `opt-level = 3` in the dev and test profiles (root `Cargo.toml`).
+- **Tests** (`test-proof`): the window runs live on the agent's
+  reference model to the statement `window` gives natively, re-runs from
+  its attest to the same output, proves over its shape cut at class 1,
+  and verifies as a chain against its program, its io-hash the run's
+  (`the_window_proves_and_verifies_over_its_shape`); a value the second
+  root does not commit, and a row claimed absent at the first anchor that
+  is present there, are refused (`rows_off_the_roots_are_refused`); a
+  tampered or truncated proof at either anchor, rows out of key order, a
+  value that does not decode and a window `window` refuses
+  (`WINDOW + SameSpace`) are refused (`bad_proofs_and_rows_are_refused`);
+  and claims whose paths end out of their keys' order are accepted
+  (`claims_ending_out_of_key_order_are_accepted`). The proving test also
+  checks the io-hash against `compute_io_hash(&[], output, &[])`.
+
+### Measured
+
+The window, eight journals, format 31, on the shared Intel Core Ultra 7
+155H (load average 10–14) [measured]:
+- **The run:** 632,800 steps (spike: 404,091), 651 compressions, a
+  25,989-byte witness input, a 69,101-byte kernel. Without the
+  precompile feature, `window`'s `PseudoAccount::of` hashes in software:
+  about 176k steps of the run, measured on the first try's kernel
+  without the `window` call.
+- **The shape:** 23 of 25 chips (`0x1f9ffff`, every chip but POPCOUNT
+  and BITCOUNT), the classes derive's: class 0 (2^12 steps, 8 pages),
+  1 (2^15, 8), 2 (2^12, 24).
+- **The segments:** 26, cut at class 1: the entry's 165-step segment and
+  the last two at class 0, the other 23 at class 1; 16 of those are full
+  32,768-step windows, and the page budget closes seven early (6.1k–24.2k
+  steps), all in the run's first 167k steps.
+- **Proving:** 26 segments in 394 s, peak RSS 7.1 GiB, under A.7's
+  24 GiB; the chain verifies natively in 3.7 s. (Before the review: 27
+  segments in 291 s and 7.0 s, the machine less loaded.)
+
+### The review
+
+- **A completeness bug in the kernel's own check, fixed.** It matched
+  claims in key order, but a proof's leaves come in the order its paths
+  end: an absent key that differs from a subtree at a bit no branch
+  splits on ends on the side its later bits pick, so a smaller key can
+  end to the right. A tree of 0x80 and 0x81 with 0x01 and 0x40 claimed
+  absent: vos-tree accepted, the kernel refused. The review's
+  differential over 200k cases found about 1% wrong refusals and no
+  wrong acceptances. `verify_encoded` splits the claims at each branch
+  instead, and the kernel's copy (`window/src/batch.rs`) is gone: one
+  implementation, in vos-tree.
+- **Agreement, both ways:** `the_streamed_check_is_the_decoded_one`
+  (`agent/tree/tests/tree/encoded.rs`, 4,096 cases) compares
+  `verify_encoded` with decoding and `BatchProof::verify` over random
+  trees of row keys and of one- and two-byte keys, claims present,
+  absent, repeated, in any order and about bad keys, and tamperings of
+  the entries, the bytes (a bit, a cut, a byte more), the claims, the
+  root and the keys proved: equal results, errors included. With the
+  split removed it fails at once. The inversion case is a unit test
+  there, and a kernel test on a three-row map.
+- **Errors:** a refused claim's error is reported only once the proof is
+  well formed and rebuilds the root, and it is the first refused claim's
+  in the claims' order, as `BatchProof::verify` reports it. The split is
+  unstable within each side: the claim's index, not its place, picks the
+  error.
+- **The window statement is rootless at the io-hash level.** Its kernel
+  has no public arguments and reads no root through the SDK, so its
+  io-hash is `compute_io_hash(&[], output, &[])`: the anchors' roots are
+  bound only through `NetFlow`'s fields in the output (`anchor_i`,
+  `anchor_j`), which the kernel checked the proofs against. Public
+  arguments and roots in the io-hash wait for the SDK's support, 5.15.
+
+### The fixture generator (A.6)
+
+- **`pvm/proof/tests/fixtures.rs`** generates, for each admitted segment
+  format, 31 and 33, a fixed small kernel's run (two constants, their
+  product and sum, a halt) proved as one class 0 segment of its program,
+  into `pvm/proof/fixtures`:
+  - `segment-<n>.proof`, which verifies against `segment-<n>.root` and
+    as the kernel's segment;
+  - `segment-<n>-tampered.patch`, one out-of-domain sample of the main
+    trace changed, refused;
+  - `segment-<n>-wrong-format.patch`, the proof under the other format's
+    number, refused before any cryptographic check (its channel is not
+    the number's).
+- **The refused proofs are patches** of the valid proof's bytes (offset,
+  bytes removed, bytes inserted): the full files came to 5.6 MB, the
+  valid proofs alone to 1.87 MB (1,012,413 bytes at 31, 856,513 at 33).
+  A venue applies the patch and judges the bytes.
+- **Staleness:** `the_fixtures_are_the_generators` makes every fixture
+  again and compares bytes; a difference fails, naming the files and
+  `just fixtures`, which writes them anew (`VOS_FIXTURES=write`). Proving
+  is deterministic: two runs wrote the same bytes.
+  `the_fixtures_are_judged` reads the files and judges them as a venue
+  does.
+- 5.15 adds A.6's statement fixtures once the wrap exists.
+
+### Gates
+
+[measured, each under `systemd-run` with `nice -n 10` and
+`CARGO_INCREMENTAL=0`]: `just check` green at 14 GiB, 1,005 tests; `just
+test-proof` green at 24 GiB, 581 tests (`window_kernel` 2, `fixtures` 2),
+27 minutes; `just clippy` clean.
+
+After the review [measured, the same way, at 14 GiB]: `just check`
+green, 1,010 tests; `test-proof`'s suites with one test thread green,
+583 tests (`window_kernel` 4), 29 minutes; clippy clean on vos-tree, the
+precompile crate and vos-pvm-proof with `debug-internals`; the vos-tree
+proptest, 4,096 cases, green.
+
+### Outside the track's files
+
+- Root `Cargo.toml`: `cipher-clerk` in the workspace's dependencies, and
+  `opt-level = 3` for vos-tree and vos-pvm-precompiles in the dev and test
+  profiles.
+- `pvm/proof/tests/common/mod.rs`: `kernel_program`, a kernel's program
+  from its blob and its install's record.
+- `agent/tree`: `verify_encoded` (`src/encoded.rs`), `Hasher::branch`
+  with `Blake2b`'s word form (`src/hash.rs`), and their tests
+  (`tests/tree/encoded.rs`).
+- `pvm/proof/precompiles`: `BLAKE2B_IV` public, and
+  `blake2b_compress_words`, the compression on words.

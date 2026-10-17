@@ -17,7 +17,9 @@
 #[cfg(target_arch = "riscv64")]
 use crate::ecalls::ECALL_BLAKE2B_COMPRESS;
 
-const BLAKE2B_IV: [u64; 8] = [
+/// BLAKE2b's initialization vector: the state before the parameter block
+/// is folded into its first word.
+pub const BLAKE2B_IV: [u64; 8] = [
     0x6A09E667F3BCC908,
     0xBB67AE8584CAA73B,
     0x3C6EF372FE94F82B,
@@ -47,6 +49,26 @@ pub fn blake2b_compress(h: &mut [u8; 64], m: &[u8; 128], t: u128, f: bool) {
         return;
     }
     compress_software(h, m, t, f);
+}
+
+/// [`blake2b_compress`] on words: the state's eight and the block's
+/// sixteen, each little-endian as BLAKE2b reads it. A caller that builds
+/// its block from words moves no byte: the guest target has no misaligned
+/// access, so a byte array moves byte by byte.
+pub fn blake2b_compress_words(h: &mut [u64; 8], m: &[u64; 16], t: u128, f: bool) {
+    // The guest is little-endian: the words' bytes are the block's.
+    #[cfg(target_arch = "riscv64")]
+    if t >> 64 == 0
+        && crate::ecalls::call::<ECALL_BLAKE2B_COMPRESS>(
+            h.as_mut_ptr() as u64,
+            m.as_ptr() as u64,
+            t as u64,
+            f as u64,
+        )
+    {
+        return;
+    }
+    *h = compress_inner(h, m, t, f);
 }
 
 fn compress_software(h: &mut [u8; 64], m: &[u8; 128], t: u128, f: bool) {
@@ -277,6 +299,24 @@ mod tests {
             let theirs: [u8; 32] = blake2::Blake2b::<U32>::digest(&data).into();
             assert_eq!(blake2b_256(&data), theirs, "{len} bytes");
         }
+    }
+
+    #[test]
+    fn the_word_compression_is_the_bytes() {
+        let mut words: [u64; 8] = core::array::from_fn(|at| BLAKE2B_IV[at] ^ at as u64);
+        let block: [u64; 16] = core::array::from_fn(|at| (at as u64 + 1) * 0x0123_4567_89AB_CDEF);
+        let mut bytes = [0u8; 64];
+        for (chunk, word) in bytes.chunks_exact_mut(8).zip(words) {
+            chunk.copy_from_slice(&word.to_le_bytes());
+        }
+        let mut block_bytes = [0u8; 128];
+        for (chunk, word) in block_bytes.chunks_exact_mut(8).zip(block) {
+            chunk.copy_from_slice(&word.to_le_bytes());
+        }
+        blake2b_compress_words(&mut words, &block, 81, true);
+        blake2b_compress(&mut bytes, &block_bytes, 81, true);
+        let words: alloc::vec::Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        assert_eq!(words, bytes);
     }
 
     #[test]

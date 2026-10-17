@@ -29,7 +29,9 @@ pub use ecalls::ECALL_BLAKE2B_COMPRESS;
 #[cfg(feature = "blake2b")]
 pub mod blake2b;
 #[cfg(feature = "blake2b")]
-pub use blake2b::{Blake2b256, blake2b_256, blake2b_compress, blake2b_hash};
+pub use blake2b::{
+    BLAKE2B_IV, Blake2b256, blake2b_256, blake2b_compress, blake2b_compress_words, blake2b_hash,
+};
 
 #[cfg(feature = "blake2b")]
 pub mod io;
