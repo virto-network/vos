@@ -109,8 +109,21 @@ pub fn prove_two_reg(op: Opcode, rd: u8, ra: u8, input: u64, expected: u64) {
     prove_and_verify(steps, &code, &bitmask);
 }
 
-/// Convenience for negative tests: trace a TwoReg program, mutate
-/// `steps[0].regs_after[rd]` to `forged`, then attempt prove + verify.
+/// Make register `reg` hold `forged` after the first step, in that step
+/// and every later one, as a prover forging the step's result does: the
+/// register ledger and the closing state then agree with the forgery, so
+/// only the step's own constraints can refuse it.
+pub fn forge_first_result(steps: &mut [PvmStep], reg: usize, forged: u64) {
+    assert_ne!(steps[0].regs_after[reg], forged, "the forgery must differ");
+    steps[0].regs_after[reg] = forged;
+    for step in steps.iter_mut().skip(1) {
+        step.regs_before[reg] = forged;
+        step.regs_after[reg] = forged;
+    }
+}
+
+/// Convenience for negative tests: trace a TwoReg program, forge `rd`'s
+/// result (`forge_first_result`), then attempt prove + verify.
 /// Caller wraps in `#[should_panic(expected = "ConstraintsNotSatisfied")]`.
 pub fn forge_two_reg_result(op: Opcode, rd: u8, ra: u8, input: u64, forged: u64) {
     let mut regs = [0u64; PVM_REGISTER_COUNT];
@@ -118,7 +131,7 @@ pub fn forge_two_reg_result(op: Opcode, rd: u8, ra: u8, input: u64, forged: u64)
     let (code, bitmask) = two_reg_program(op, rd, ra);
     let mut steps = trace_until_opcode_zero(code.clone(), bitmask.clone(), regs);
     assert_eq!(steps[0].opcode, op);
-    steps[0].regs_after[rd as usize] = forged;
+    forge_first_result(&mut steps, rd as usize, forged);
     prove_and_verify(steps, &code, &bitmask);
 }
 
@@ -181,7 +194,8 @@ pub fn prove_three_reg(
     prove_and_verify(steps, &code, &bitmask);
 }
 
-/// Negative test for ThreeReg ops: trace, mutate `regs_after[rd]`, prove+verify.
+/// Negative test for ThreeReg ops: trace, forge `rd`'s result
+/// (`forge_first_result`), prove+verify.
 pub fn forge_three_reg_result(
     op: Opcode,
     rd: u8,
@@ -197,6 +211,6 @@ pub fn forge_three_reg_result(
     let (code, bitmask) = three_reg_program(op, rd, ra, rb);
     let mut steps = trace_until_opcode_zero(code.clone(), bitmask.clone(), regs);
     assert_eq!(steps[0].opcode, op);
-    steps[0].regs_after[rd as usize] = forged;
+    forge_first_result(&mut steps, rd as usize, forged);
     prove_and_verify(steps, &code, &bitmask);
 }

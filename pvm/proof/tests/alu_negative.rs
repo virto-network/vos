@@ -2,10 +2,13 @@
 
 //! Negative-test corpus for CpuChip's ALU constraints.
 //!
-//! Each test crafts an honest trace of a ThreeReg ALU op, mutates
-//! `regs_after[rd]` to a wrong value, and asserts prove+verify fails.
-//! Together they pin down which CpuChip constraints fire on result
-//! forgery — a regression in any of these would mean a soundness gap.
+//! Each test crafts an honest trace of an ALU op, forges its result —
+//! `regs_after[rd]`, carried through every later step so the register
+//! ledger and the closing state agree with it — and asserts prove+verify
+//! fails. The op's own constraints, over the honest filler's witness for
+//! the forged result, are all that can refuse it, so each test pins the
+//! result binding it names. Forgeries that also rewrite the chips'
+//! internal witness, as an adversary would, are `arith_gate.rs`'s.
 //!
 //! Categories covered: Add64/Add32, Sub64, Mul64, And, Or, Xor, ShloL64,
 //! SetLtU, SetLtS, BranchEq.  Each has 1 negative test per common
@@ -57,7 +60,7 @@ fn cmov_nz_imm_forged_result_rejected() {
     // Taken move: the destination must hold the canonical immediate.
     let (mut steps, code, bitmask) = trace_cmov_imm(Opcode::CmovNzImm, 5, 42);
     assert_eq!(steps[0].regs_after[0], 42);
-    steps[0].regs_after[0] = 1337;
+    forge_first_result(&mut steps, 0, 1337);
     prove_and_verify(steps, &code, &bitmask);
 }
 
@@ -67,7 +70,7 @@ fn cmov_nz_imm_forged_skip_rejected() {
     // Nonzero condition but the prover claims the move didn't happen
     // (keeps the old destination value).
     let (mut steps, code, bitmask) = trace_cmov_imm(Opcode::CmovNzImm, 5, 42);
-    steps[0].regs_after[0] = 99;
+    forge_first_result(&mut steps, 0, 99);
     prove_and_verify(steps, &code, &bitmask);
 }
 
@@ -370,17 +373,9 @@ fn rem_u64_forged_result_rejected() {
 // prover could write the wrong quotient.  A per-byte carry chain forces
 // `val_d > div_remainder` on DivU rows to pin uniqueness.
 //
-// Coverage caveat — the `forge_three_reg_result` helper only mutates
-// `regs_after[rd]` (the result column = quotient on a div op).  A
-// direct "forge q' = q − 1, r' = r + d" attack needs to also rewrite
-// div_quotient and div_remainder in the trace, which the test
-// harness doesn't expose (no column-level mutator).  div_u64_forged_result_rejected
-// (forge q to 13) catches a trivial off-by-one through the
-// result-quotient binding.  The `r < d` constraint additionally rules
-// out the deeper attack where the prover synchronises q / r to satisfy
-// schoolbook-without-uniqueness; indirect coverage: the constraint fires
-// on every honest DivU row (any DivU test would fail proving if pinning
-// broke).
+// The deeper attack, a quotient and remainder rewritten together
+// (`q − 1`, `r + d`) with the chip's carries re-witnessed, is
+// `arith_gate.rs`'s: the `r < d` chain refuses it.
 
 // DivS64 with negative operands proves cleanly via the divrem
 // schoolbook's high-byte sign-correction (DivCorrHi / DivCorrCarry).
@@ -765,7 +760,7 @@ fn load_imm_forged_result_rejected() {
     let _ = tr.run();
     let mut steps = tr.into_trace();
     assert_eq!(steps[0].regs_after[2], 12345);
-    steps[0].regs_after[2] = 99; // forge — `result = val_d = imm` should reject
+    forge_first_result(&mut steps, 2, 99); // `result = val_d = imm` should reject
     prove_and_verify(steps, &code, &bitmask);
 }
 
