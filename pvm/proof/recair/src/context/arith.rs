@@ -1,4 +1,9 @@
 //! The QM31 gate's idioms, each one row.
+//!
+//! Adapted from starkware-libs/proving, crates/circuits/src/ops.rs, at
+//! 916aefb5 (Apache-2.0), modified: each operation one row of the QM31 gate,
+//! the inverse's guess yielded by its own row, and the bit and equality
+//! assertions.
 
 use num_traits::{One, Zero};
 use stwo::core::fields::m31::BaseField;

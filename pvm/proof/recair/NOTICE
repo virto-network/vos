@@ -7,7 +7,10 @@ Copyright StarkWare Industries Ltd., licensed under the Apache License,
 Version 2.0. Each adapted file names its sources at its top and states that
 it was modified (Apache-2.0 §4(b)):
 
-- src/context.rs, from crates/circuits/src/context.rs,
+- src/context/mod.rs, from crates/circuits/src/context.rs and
+  crates/circuits/src/ops.rs;
+- src/context/arith.rs, from crates/circuits/src/ops.rs;
+- src/context/finalize.rs, from crates/circuits/src/context.rs,
   crates/circuits/src/finalize_constants.rs and
   crates/circuit_common/src/finalize.rs;
 - src/value.rs, from crates/circuits/src/ivalue.rs.

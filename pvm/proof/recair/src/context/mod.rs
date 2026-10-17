@@ -1,12 +1,9 @@
 //! The `Context` that builds circuits (`recursion-air.md` §2).
 //!
-//! Adapted from starkware-libs/proving, crates/circuits/src/context.rs,
-//! crates/circuits/src/finalize_constants.rs and
-//! crates/circuit_common/src/finalize.rs, at 916aefb5 (Apache-2.0),
-//! modified: our gate set, signed multiplicities with a guess yielded by its
-//! first consumer, M31 coefficients that make a constant one row, chained
-//! Poseidon2 rows, padding to the components' sizes, and the static wiring
-//! check.
+//! Adapted from starkware-libs/proving, crates/circuits/src/context.rs and
+//! crates/circuits/src/ops.rs, at 916aefb5 (Apache-2.0), modified: our gate
+//! set, signed multiplicities with a guess yielded by its first consumer, the
+//! reserved wires fixed by two rows, and chained Poseidon2 rows.
 //!
 //! - **Witness values flow through yields.** A gate's computed output is
 //!   yielded by that gate. A guessed value ([`Context::guess`]) is yielded by

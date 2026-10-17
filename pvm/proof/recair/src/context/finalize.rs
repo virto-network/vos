@@ -1,5 +1,12 @@
 //! Finalizing a circuit: its constants fixed, its pending guesses yielded,
 //! its components padded, its multiplicities counted and its wiring checked.
+//!
+//! Adapted from starkware-libs/proving, crates/circuits/src/context.rs,
+//! crates/circuits/src/finalize_constants.rs and
+//! crates/circuit_common/src/finalize.rs, at 916aefb5 (Apache-2.0),
+//! modified: M31 coefficients that make an M31 constant one row, a guess
+//! yielded by an identity row, padding rows that touch no wire, the
+//! multiplicities counted per address, and the static wiring check.
 
 use num_traits::{One, Zero};
 use stwo::core::fields::m31::BaseField;
