@@ -279,8 +279,10 @@ masking variant (c) applies unchanged (`R/spike2-masking.md` §3b).
   other fifteen under 400 each.
 - The solvency predicate's shape (no BLAKE2B): 4,538 columns, 15,722 rows; the
   full 32-chip shape: 13,037 columns, 43,980 rows; COMPARE alone: 141 rows.
+  The eight Ristretto chips have since been removed: the full shape is 25
+  chips, 7,556 columns (173 + 5,107 + 2,268 + 8) [measured].
 
-**Equivalence tests, for every chip of the 32:**
+**Equivalence tests, for every chip of the 25:**
 1. **constraint ≡ gate:** at random assignments to samples, preprocessed
    values, challenges and claimed sums, each recorded constraint
    (`ExtExpr::assign`) equals the compiled gates' value;
@@ -457,8 +459,9 @@ Every leaf has the recursion AIR's 458 columns; what varies is the rows.
   or FRI fold step 3 in inner proofs (`p2` 55.3k → 49.2k rows, the table's
   fourth row). Larger segments make recursion cheaper per step.
 - **Headroom:** a kernel-like shape fits up to about 9,300 columns (+24%)
-  [model]; Poseidon2 rows bind first. Without the shape per kernel (13,037
-  columns) every node would double.
+  [model]; Poseidon2 rows bind first. Without the shape per kernel, the
+  32-chip full shape (13,037 columns) would have doubled every node; the
+  full shape without the Ristretto chips (7,556) fits [model].
 - **The byte-form digests** (§4.1) add about 25 `p2` rows to each kernel leaf
   [model]; every padded shape above holds, and the headroom is unchanged.
 - **Poseidon2 hashing on the prover.** A leaf proof commits about 25M
@@ -645,7 +648,7 @@ Ordered so feasibility is retired first. Weeks are engineer-weeks
 | # | deliverable | tests | gate | weeks |
 |---|---|---|---|---|
 | 1 | **The gate VM:** `vos-recair` (`pvm/proof/recair`) with `Context` and its static checks (§1.1), the three components and their trace generation, padding rows filled, the `Gate` relation with signed multiplicities, constants, padding, preprocessing, the circuit hash; the bodies of §1 in `vos-recair-air` | random circuits proved and verified natively on the Poseidon2 channel; yields exactly once; tamper per component and mode; the permutation against `poseidon2::permute` | a 10k-gate circuit proves and verifies; degree ≤ 3 audited; a three-component multi-fraction logup at three log sizes proves (§11, R5); `vos-final-verifier`'s skeleton builds no_std (stable for x86 and wasm32, the pinned nightly for JAM) | 3–4 |
-| 2 | **The gate compiler**, beside step 1 | §3's four tests on all 32 chips | 32/32 equivalent; counts within 1% of `SP/logs/count.log` | 1–2 |
+| 2 | **The gate compiler**, beside step 1 | §3's four tests on all 25 chips | 25/25 equivalent; counts within 1% of `SP/logs/count.log` | 1–2 |
 | 3 | **The in-AIR verifier's pieces:** channel, lifted Merkle with `expand_decommitment`, FRI (fold step 1), DEEP with `h8`, OODS, logup sums | each against the native code on recorded data; transcript equality with `Poseidon2M31Channel`'s recorder | every piece accepts real data and refuses each tamper | 3–4 |
 | 4 | **COMPARE's leaf** (first gate), and **the window kernel leaf's topology** (`Context<NoValue>`, no proof) | a COMPARE proof verified in circuit, the circuit proved and verified natively; tampered OODS sample, queried value, sibling, FRI value and nonce refused; the topology's rows pinned per term of `SP/logs/count.log`, not only in total | accepted; rows within 15% of 8,488 / 10,869 / 273; ≤ 1 s; the topology within 2^16 / 2^17 / 2^16 | 1–2 |
 | 5 | **The window kernel's leaf**, and the solvency predicate's: boundary states mixed as bytes, entry and exit digests, the flags, the A.3 output | spike 3's real segment on the Poseidon2 channel; in-circuit and native transcripts equal; a tampered boundary byte refused | rows within the padded shape; ≤ 4 GiB; ≤ 1× the segment's proving (target 0.13–0.5×) | 2–3 |
@@ -667,7 +670,7 @@ preprocessed tree (2^17) sits below its lifting height (2^20).
 |---|---|---|
 | R1 | **The recursion prover's Poseidon2 hashing**: about 25M permutations a leaf proof, 2.5–7.5 s on eight threads at today's scalar 0.8–2.4 µs [measured, model], one to six times the rest of the leaf | M0's SIMD hasher, gated on a segment's total cost, its proving plus its leaf, against the Blake2s route's projection (`proving.md` §3.2): step 5.2 measured a leaf's commitment at 0.63 s [measured], and 5.12 measures the whole leaf against its 1.5–3 s [projected] |
 | R2 | **vos's permutation is not the reference Poseidon2:** each linear layer precedes its S-box layer, so there is no final `M_E`, and the full-to-partial and partial-to-full boundaries swap `M_E` and `M_I` (`P/src/poseidon2/mod.rs:283-307` against Plonky3's `poseidon2/src/lib.rs:139-143`, `external.rs:288-336`). It is Stwo's example, whose TODOs flag the order and the internal diagonal (`ST/examples/src/poseidon/mod.rs:125-126`, `:156`) | the reference arrangement adopted in M0 (Plonky3 pinned at `f983316`, checked on its vectors) before the format and the recursion AIR pin it; every commitment changes once |
-| R3 | **The gate compiler is wrong** | §3's tests on all 32 chips, gate ≡ verifier on real proofs |
+| R3 | **The gate compiler is wrong** | §3's tests on all 25 chips, gate ≡ verifier on real proofs |
 | R4 | **The in-AIR verifier departs from the native one** (periodicity points, lifted leaf order, transcript order, PoW) | piecewise differential tests on recorded transcripts; tamper tests; the external audit (`proving.md` §4) |
 | R5 | **The archive's failure with two multi-fraction components** (`AR:zkpvm/tests/merkle_decommit.rs:772-777`, never root-caused) | step 1's three-component test; vos-core's 22-chip Poseidon2 segment proofs already prove (`R/audit.md` §2.3), so it is likely the archive's own |
 | R6 | **A wider kernel outgrows the shape** (about 9,300 columns) | each kernel's leaf rows computed at derive time from its shape; a kernel over the limit is refused or takes a larger shape (`p2` 2^17, +70% cells, tallest unchanged) |

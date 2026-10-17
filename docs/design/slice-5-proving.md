@@ -297,8 +297,9 @@ No proof leaves a test in this slice: masking is slice 6.
   - a follower's catch-up beyond the kept tail.
 - **PolkaJam:** a re-probe on upgrade, and the recompiler run once the
   owner sets `vm.unprivileged_userfaultfd`.
-- **Ristretto ids 110–114:** carried. Derive refuses a kernel that
-  reaches them.
+- **Ristretto ids 110–114:** removed, chips and ids (the owner's
+  decision): they were unsound, and slice 7's generic bignum chip
+  replaces them. Derive refuses a kernel that reaches them.
 - **Estimate:** 2–3 weeks, beside 5.1–5.6.
 
 ### M0 acceptance
@@ -358,8 +359,8 @@ beside 5.8.
   logup, and intermediates.
 - **Beside 5.8:** it needs the gate set's definition, not the VM.
 - **Tests:** §3's four equivalence tests (constraint ≡ gate on random
-  points), on all 32 chips.
-- **Gate:** 32 of 32 chips are equivalent, with counts within 1% of the
+  points), on all 25 chips.
+- **Gate:** 25 of 25 chips are equivalent, with counts within 1% of the
   spike's log.
 - **Estimate:** 1–2 weeks.
 

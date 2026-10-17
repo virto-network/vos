@@ -341,13 +341,45 @@ the next fixes:
   uses unchecked carries.
 - **BLAKE2b:** the write addresses are pinned on row 0 only, and the
   main chip's `IsReal` is not held across its 96 rows.
-- **Ristretto:** ids 110–114 compute nothing tied to memory, row roles
+- ~~**Ristretto:** ids 110–114 compute nothing tied to memory, row roles
   and source rows in the comb chips are free, `IsFixedBase` is not
-  checked against the base point.
+  checked against the base point.~~ Resolved by removal: the chips and
+  the ids are gone (below).
 - **Shifts right:** nothing distinguishes `ShloR` from `SharR` in the
   AIR (both prove either quotient).
 - `ShloL/ShloR/SharRImmAlt` take their operands unswapped and do not
   prove (completeness only).
+
+### The Ristretto chips removed (format 28, Poseidon2 29)
+
+The owner's decision: the Ristretto and scalar chips were unsound (the
+finding above), derive already refused a kernel using them, and slice 7's
+generic bignum chip replaces them.
+
+- **Gone:** the eight chips (`RistrettoChip`, `RistrettoEcallChip`, the
+  comb table, its anchor, scalar boundary, fixed-base consumer, compress
+  and compress-output chips), their eleven relations, CpuChip's five
+  `Is{110..114}Ecall` selectors and their emissions, the tracer's handlers
+  and records, the side note's streams, the segment cutter's and cursors'
+  streams, the shim's `ristretto` feature (`Scalar`, `RistrettoPoint`) and
+  `curve25519-dalek` from the prover and the shim.
+- **The ids:** 110–114 are no precompile anywhere: the tracer does not
+  serve them (`proof_precompile_dispatch_id` is 0), the runtime neither
+  serves nor prices them, and derive refuses a kernel reaching one; a test
+  pins each.
+- **The AIR:** `chip_idx::COUNT` 33 → 25, `BITWISE_AND_BYTE` at 24, so the
+  component mask is a `u32` again. A witness-input call keeps its φ7 and
+  φ8 register reads, now in a block of their own.
+- **The full width** [measured]: a full canonical segment (every chip,
+  mask `0x1ffffff`) commits **7,556 columns**: 173 preprocessed, 5,107
+  main, 2,268 interaction, 8 composition. It was 13,037 with the
+  Ristretto chips, at 32 chips. The full shape now fits under a kernel
+  leaf's ~9,300-column headroom [model].
+- **Tests:** the Ristretto suites are deleted (`comb_value_sweep`,
+  `ristretto_ts_gate`, the Ristretto parts of `precompiles` and
+  `chip_isolated`); the dispatch gates and the host-call pc gates now run
+  on BLAKE2b and the witness input; the segment fixture threads three
+  BLAKE2b compressions across its windows.
 
 ## Step 5.7: the items carried from slice 4
 
@@ -554,7 +586,8 @@ catch-up past the tail 2.24–2.55 s).
 
 Already so: `derive` refuses a kernel reaching any host call but a
 precompile, and these are none. A test now pins it for each of the five
-ids, beside BLAKE2b's precompile, which derives.
+ids, beside BLAKE2b's precompile, which derives. Since removed, chips and
+ids (step 5.5's last section).
 
 ### PolkaJam
 

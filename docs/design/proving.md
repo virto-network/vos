@@ -45,8 +45,11 @@ Design, draft 5. It is the architecture behind slices 5, 6 and 7
 ## 2. What the research found
 
 - **Verifying a raw segment on JAM is not viable.**
-  - The base AIR is 13,037 columns. Ristretto is 42% of them, BLAKE2b
-    23% and the page-Merkle boundary 22%; the CPU is 6%.
+  - The base AIR was 13,037 columns: Ristretto 42% of them, BLAKE2b
+    23% and the page-Merkle boundary 22%, the CPU 6%. The Ristretto
+    chips have since been removed (unsound; slice 7's generic bignum chip
+    replaces them): the full shape is now 25 chips and 7,556 columns
+    [measured].
   - Verify gas is linear in columns. The best measured segment verify
     is 1.17B gas, and every projected lever stacked still leaves
     0.45–0.7B.
@@ -231,7 +234,8 @@ attribution). Its full design is `recursion-air.md`.
   so longer segments make recursion cheaper per step.
   - **The shape per kernel is load-bearing.** A kernel-like shape fits
     the padded shape up to about 9,300 columns. The full 32-chip set
-    (13,037) would double every node.
+    (13,037) would have doubled every node; without the Ristretto chips
+    the full set is 7,556 columns, inside it [model].
   - At derive time, each kernel's leaf rows are computed from its shape.
     A kernel over the limit is refused, or waits for a format with a
     larger shape.
@@ -658,11 +662,11 @@ alike.
 **A.2 What the in-AIR verifier must handle (M1),** from our chips:
 - **a challenge pair per relation,** drawn as A.1 item 5 says;
 - **chips reading the next row:** CPU, BLAKE2B, BLAKE2B_BOUNDARY, MEMORY,
-  MEMORY_PAGE, REGISTER_MEMORY, and three Ristretto chips;
+  MEMORY_PAGE, REGISTER_MEMORY;
 - **chips finalizing one fraction a column:** bitcount, bitwise_and_byte,
   bitwise_lookup, byte_to_bits, jump_table, memory_root_boundary, memory,
   popcount, power_of_two, program_memory, range_multiplicity,
-  register_memory_boundary, register_memory_closing, ristretto_comb.
+  register_memory_boundary, register_memory_closing.
 
 **A.3 Encodings and the node output (M0 for the encodings, M1 for the
 output).**
