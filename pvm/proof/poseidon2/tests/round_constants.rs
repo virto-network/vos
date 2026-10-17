@@ -1,7 +1,7 @@
 //! Vetted width-16 M31 Poseidon2 round constants.
 //!
 //! Generates the round constants for the Poseidon2-M31 permutation
-//! (`vos_poseidon2`) via the **canonical Grain LFSR** specified in the
+//! (`vos_pvm_poseidon2`) via the **canonical Grain LFSR** specified in the
 //! POSEIDON paper (eprint 2019/458 §4.1) and reused by Poseidon2 (eprint
 //! 2023/323), seeded with our exact parameters. Two upstream references pin the
 //! algorithm and the Poseidon2-specific layout:
@@ -18,9 +18,9 @@
 //! `round_constants_match_baked` test then asserts the module's baked arrays
 //! equal the freshly-generated ones (the constants-vector test).
 //!
-//! Run: `cargo test -p vos-poseidon2 --test round_constants -- --nocapture`
+//! Run: `cargo test -p vos-pvm-poseidon2 --test round_constants -- --nocapture`
 
-use vos_poseidon2::{FULL_ROUNDS, M31, N_HALF_FULL_ROUNDS, N_PARTIAL_ROUNDS, N_STATE};
+use vos_pvm_poseidon2::{FULL_ROUNDS, M31, N_HALF_FULL_ROUNDS, N_PARTIAL_ROUNDS, N_STATE};
 
 const M31_PRIME: u32 = (1 << 31) - 1; // 2^31 - 1 = 2147483647
 const FIELD_SIZE_BITS: usize = 31; // ceil(log2(p)) for M31
@@ -168,8 +168,8 @@ fn round_constants_match_baked() {
     // changed — re-run `dump_round_constants` and re-bake (and remember the
     // {C_0,C_1} allowlist is a function of these, so a change forces a re-bake).
     let (external, internal) = grain_round_constants();
-    let baked_external = vos_poseidon2::EXTERNAL_ROUND_CONSTS;
-    let baked_internal = vos_poseidon2::INTERNAL_ROUND_CONSTS;
+    let baked_external = vos_pvm_poseidon2::EXTERNAL_ROUND_CONSTS;
+    let baked_internal = vos_pvm_poseidon2::INTERNAL_ROUND_CONSTS;
     for (r, round) in external.iter().enumerate() {
         for (i, &c) in round.iter().enumerate() {
             assert_eq!(

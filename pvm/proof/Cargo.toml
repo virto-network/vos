@@ -22,7 +22,7 @@ default = ["prover", "wire"]
 # in stwo's always-compiled core, so the verifier path needs no stwo features.
 prover = [
     "dep:vos-pvm",
-    "vos-poseidon2/packed",
+    "vos-pvm-poseidon2/packed",
     "dep:rayon",
     "dep:blake3",
     "stwo/std",
@@ -63,7 +63,7 @@ vos-pvm-program = { workspace = true }
 vos-pvm-precompiles = { path = "precompiles", default-features = false, features = ["blake2b"] }
 # The Poseidon2-M31 permutation and its modes, which the Poseidon2-M31
 # channel's hasher and transcript adapt.
-vos-poseidon2 = { workspace = true }
+vos-pvm-poseidon2 = { workspace = true }
 vos-wire = { workspace = true, optional = true }
 rayon = { workspace = true, optional = true }
 blake3 = { version = "1", optional = true }

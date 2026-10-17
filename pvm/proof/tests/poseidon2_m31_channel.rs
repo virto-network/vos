@@ -14,7 +14,7 @@
 //! under placeholder round constants `1234`: this test exercises only the
 //! transcript PLUMBING, so prover and verifier run the same channel and agree by
 //! construction regardless of constant quality. The vetted width-16 M31
-//! constants are pinned separately, in `vos-poseidon2`'s `round_constants.rs`.
+//! constants are pinned separately, in `vos-pvm-poseidon2`'s `round_constants.rs`.
 //!
 //! Run: `cargo test -p vos-pvm-proof --test poseidon2_m31_channel -- --nocapture`
 
@@ -36,7 +36,7 @@ use stwo::prover::{CommitmentSchemeProver, prove};
 use stwo_constraint_framework::{
     EvalAtRow, FrameworkComponent, FrameworkEval, TraceLocationAllocator,
 };
-use vos_poseidon2::{FULL_ROUNDS, M31, N_PARTIAL_ROUNDS};
+use vos_pvm_poseidon2::{FULL_ROUNDS, M31, N_PARTIAL_ROUNDS};
 
 // ── Poseidon2-over-M31 permutation (width 16) ─────────────────────────────
 
@@ -50,7 +50,7 @@ const INTERNAL_ROUND_CONSTS: [M31; N_PARTIAL_ROUNDS] = [M31::new(1234); N_PARTIA
 /// The library's arrangement under the placeholder constants.
 fn permute(state: &mut [BaseField; N_STATE]) {
     let mut words = state.map(|word| M31::new(word.0));
-    vos_poseidon2::permute_with(&mut words, &EXTERNAL_ROUND_CONSTS, &INTERNAL_ROUND_CONSTS);
+    vos_pvm_poseidon2::permute_with(&mut words, &EXTERNAL_ROUND_CONSTS, &INTERNAL_ROUND_CONSTS);
     *state = words.map(|word| BaseField::from_u32_unchecked(word.value()));
 }
 

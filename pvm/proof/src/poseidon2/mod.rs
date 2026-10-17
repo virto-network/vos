@@ -4,7 +4,7 @@
 //! The recursion verifier-AIR commits inner proofs under an **M31-algebraic**
 //! hash so the Merkle-decommit paths are cheap to re-express as constraints,
 //! and replays an M31-algebraic Fiat-Shamir transcript so no Blake2s appears on
-//! the commit/transcript path. This module adapts `vos_poseidon2`'s
+//! the commit/transcript path. This module adapts `vos_pvm_poseidon2`'s
 //! permutation and modes to Stwo — the [`MerkleHasherLifted`] commitment hash
 //! and the [`Channel`] transcript — which the formats on the Poseidon2-M31
 //! channel ([`crate::format`]) select at run time.
@@ -23,13 +23,13 @@ use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::vcs::hash::Hash;
 use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
-use vos_poseidon2::{LeafSponge, M31, Observer, Transcript};
+use vos_pvm_poseidon2::{LeafSponge, M31, Observer, Transcript};
 
 use core::cell::RefCell;
 
 #[cfg(feature = "prover")]
-pub use vos_poseidon2::packed;
-pub use vos_poseidon2::{
+pub use vos_pvm_poseidon2::packed;
+pub use vos_pvm_poseidon2::{
     FULL_ROUNDS, N_HALF_FULL_ROUNDS, N_PARTIAL_ROUNDS, N_STATE, PermKind, RATE,
 };
 
@@ -46,18 +46,18 @@ fn base(value: M31) -> BaseField {
 /// The Poseidon2-over-M31 permutation under the reference round constants.
 pub fn permute(state: &mut [BaseField; N_STATE]) {
     let mut words = state.map(word);
-    vos_poseidon2::permute(&mut words);
+    vos_pvm_poseidon2::permute(&mut words);
     *state = words.map(base);
 }
 
 /// A u32's two 16-bit limbs, little-endian.
 pub fn u32_limbs(value: u32) -> [BaseField; 2] {
-    vos_poseidon2::u32_limbs(value).map(base)
+    vos_pvm_poseidon2::u32_limbs(value).map(base)
 }
 
 /// A u64's four 16-bit limbs, little-endian.
 pub fn u64_limbs(value: u64) -> [BaseField; 4] {
-    vos_poseidon2::u64_limbs(value).map(base)
+    vos_pvm_poseidon2::u64_limbs(value).map(base)
 }
 
 // ── M31-algebraic Merkle hasher (the de-risked PCS commitment) ────────────
@@ -125,7 +125,7 @@ impl P2MerkleHasher {
 impl MerkleHasherLifted for P2MerkleHasher {
     type Hash = P2Hash;
     fn hash_children((left, right): (P2Hash, P2Hash)) -> P2Hash {
-        P2Hash(vos_poseidon2::compress(&left.0.map(word), &right.0.map(word)).map(base))
+        P2Hash(vos_pvm_poseidon2::compress(&left.0.map(word), &right.0.map(word)).map(base))
     }
     fn update_leaf(&mut self, column_values: &[BaseField]) {
         self.sponge
@@ -198,7 +198,7 @@ impl Observer for Recorder<'_> {
     }
 }
 
-/// `vos_poseidon2`'s transcript as Stwo's channel: absorptions for the
+/// `vos_pvm_poseidon2`'s transcript as Stwo's channel: absorptions for the
 /// mixes, draws for the felts and words, and its PoW check.
 ///
 /// When a `recorder` is attached (via [`Poseidon2M31Channel::recording`]) every
@@ -260,7 +260,7 @@ impl Channel for Poseidon2M31Channel {
     fn mix_u32s(&mut self, data: &[u32]) {
         let words: Vec<M31> = data
             .iter()
-            .flat_map(|&value| vos_poseidon2::u32_limbs(value))
+            .flat_map(|&value| vos_pvm_poseidon2::u32_limbs(value))
             .collect();
         self.absorb(&words);
     }
@@ -274,7 +274,7 @@ impl Channel for Poseidon2M31Channel {
     }
 
     fn mix_u64(&mut self, value: u64) {
-        self.absorb(&vos_poseidon2::u64_limbs(value));
+        self.absorb(&vos_pvm_poseidon2::u64_limbs(value));
     }
 
     fn draw_secure_felt(&mut self) -> SecureField {

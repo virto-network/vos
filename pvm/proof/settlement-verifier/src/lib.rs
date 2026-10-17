@@ -19,7 +19,7 @@
 //! `std`/`rayon`/`blst` dependency (the latter only ever entered transitively
 //! via `vos_pvm`, which this crate does not depend on).
 //!
-//! The permutation and its modes come from `vos-poseidon2`, as the prover's
+//! The permutation and its modes come from `vos-pvm-poseidon2`, as the prover's
 //! do; this crate adapts them to Stwo's hasher and channel traits.
 #![no_std]
 
@@ -41,7 +41,7 @@ use stwo::core::verifier::{verify, VerificationError};
 use stwo_constraint_framework::{
     EvalAtRow, FrameworkComponent, FrameworkEval, TraceLocationAllocator,
 };
-use vos_poseidon2::{LeafSponge, Transcript, M31};
+use vos_pvm_poseidon2::{LeafSponge, Transcript, M31};
 
 fn word(value: BaseField) -> M31 {
     M31::from(value.0)
@@ -87,7 +87,7 @@ impl<'de> serde::Deserialize<'de> for P2MerkleHasher {
 impl MerkleHasherLifted for P2MerkleHasher {
     type Hash = P2Hash;
     fn hash_children((left, right): (P2Hash, P2Hash)) -> P2Hash {
-        P2Hash(vos_poseidon2::compress(&left.0.map(word), &right.0.map(word)).map(base))
+        P2Hash(vos_pvm_poseidon2::compress(&left.0.map(word), &right.0.map(word)).map(base))
     }
     fn update_leaf(&mut self, column_values: &[BaseField]) {
         self.sponge
@@ -98,7 +98,7 @@ impl MerkleHasherLifted for P2MerkleHasher {
     }
 }
 
-/// `vos_poseidon2`'s transcript as Stwo's channel. Verify-side only — no
+/// `vos_pvm_poseidon2`'s transcript as Stwo's channel. Verify-side only — no
 /// recorder (that is prover/test instrumentation).
 #[derive(Clone, Debug, Default)]
 pub struct Poseidon2M31Channel {
@@ -125,7 +125,7 @@ impl Channel for Poseidon2M31Channel {
     fn mix_u32s(&mut self, data: &[u32]) {
         let words: Vec<M31> = data
             .iter()
-            .flat_map(|&value| vos_poseidon2::u32_limbs(value))
+            .flat_map(|&value| vos_pvm_poseidon2::u32_limbs(value))
             .collect();
         self.absorb(&words);
     }
@@ -139,7 +139,7 @@ impl Channel for Poseidon2M31Channel {
     }
 
     fn mix_u64(&mut self, value: u64) {
-        self.absorb(&vos_poseidon2::u64_limbs(value));
+        self.absorb(&vos_pvm_poseidon2::u64_limbs(value));
     }
 
     fn draw_secure_felt(&mut self) -> SecureField {

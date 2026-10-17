@@ -95,9 +95,9 @@ opt-level = 3
 opt-level = 3
 [profile.test.package.vos-pvm-proof-verifier]
 opt-level = 3
-[profile.dev.package.vos-poseidon2]
+[profile.dev.package.vos-pvm-poseidon2]
 opt-level = 3
-[profile.test.package.vos-poseidon2]
+[profile.test.package.vos-pvm-poseidon2]
 opt-level = 3
 
 [workspace.dependencies]
@@ -108,7 +108,7 @@ vos-pvm-proof = { path = "pvm/proof" }
 vos-pvm-proof-derive = { path = "pvm/proof/derive" }
 vos-pvm-proof-verifier = { path = "pvm/proof/verifier" }
 vos-pvm-precompiles = { path = "pvm/proof/precompiles" }
-vos-poseidon2 = { path = "pvm/proof/poseidon2" }
+vos-pvm-poseidon2 = { path = "pvm/proof/poseidon2" }
 vos-pvm = { path = "pvm/runtime" }
 vos-pvm-compiler = { path = "pvm/compiler" }
 vos-pvm-program = { path = "pvm/program" }

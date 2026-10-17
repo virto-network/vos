@@ -1,5 +1,5 @@
 [package]
-name = "vos-poseidon2"
+name = "vos-pvm-poseidon2"
 edition.workspace = true
 version.workspace = true
 license = "Apache-2.0"

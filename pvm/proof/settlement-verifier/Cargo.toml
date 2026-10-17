@@ -35,7 +35,7 @@ stwo = { git = "https://github.com/olanod/stwo", rev = "bbfa8bc3ae8ce958ee70d4bc
 stwo-constraint-framework = { git = "https://github.com/olanod/stwo", rev = "bbfa8bc3ae8ce958ee70d4bc59b8436bb453b3ef", default-features = false }
 num-traits = { version = "0.2", default-features = false }
 # The Poseidon2-M31 permutation and its modes, shared with the prover.
-vos-poseidon2 = { path = "../poseidon2" }
+vos-pvm-poseidon2 = { path = "../poseidon2" }
 # The segment verifier's check that a proof's limbs are canonical, and, in the
 # tests, the prover's Poseidon2-M31 channel, which the channel copy here must
 # draw alike; verifier-only, so stwo stays without std, prover or parallel.

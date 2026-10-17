@@ -7,7 +7,7 @@ default:
 # precompile shim, Poseidon2, verifier, prover library, wire types. The node runs the
 # agent, so it is tested with it.
 test:
-    cargo test -p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-poseidon2 -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam
+    cargo test -p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam
     cargo test -p vos-pvm-proof --lib
 
 # Bench guests, built with the guest toolchain in `pvm/guest`.
@@ -132,7 +132,7 @@ check-no-std:
 check: fmt-check doc-check check-no-std build-test-actors build-agent
     cargo clippy --workspace --all-targets --quiet -- -D warnings
     cd pvm/proof/settlement-verifier; cargo clippy --all-targets --quiet -- -D warnings
-    cargo test -p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-poseidon2 -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam
+    cargo test -p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam
     cargo test -p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-checker -p vos-node -p vos-net -p vos-cli
 
 # Everything but the prover suites: before a merge, and at the end of each

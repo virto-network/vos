@@ -1749,7 +1749,7 @@ refactors, a commit each; none changes a constraint.
 
 ### One Poseidon2 crate
 
-- **`vos-poseidon2`** (`pvm/proof/poseidon2`), beside `precompiles` and
+- **`vos-pvm-poseidon2`** (`pvm/proof/poseidon2`), beside `precompiles` and
   `verifier`, where `recair-air` and `final-verifier` will sit. no_std,
   no dependencies, no allocation, stable Rust:
   - its own M31, the permutation and its parameters, the linear layers
@@ -1824,5 +1824,5 @@ refactors, a commit each; none changes a constraint.
 - `just test-proof`: green, 566 tests, the settlement verifier's among
   them.
 - `just clippy`: green.
-- `vos-poseidon2` on stable (1.96), with and without `packed`: builds and
+- `vos-pvm-poseidon2` on stable (1.96), with and without `packed`: builds and
   its 14 tests pass.
