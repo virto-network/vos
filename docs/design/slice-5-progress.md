@@ -1789,10 +1789,9 @@ refactors, a commit each; none changes a constraint.
 - The preprocessed-root check, the logup sum and the boundary binding
   run around the prefix; none touches the transcript.
 - `recursion_seams`' test names format 31.
-- **Left:** the standalone verifier (`pvm/proof/verifier/src/lib.rs`,
-  `verify_standalone_on`) keeps its own copy of the prefix, outside
-  track B's files; it differs only in drawing the relation elements by
-  mask. A.1's in-AIR transcript should follow `transcript_prefix`.
+- The prefix now lives in `vos_pvm_proof::proof::transcript` as
+  `replay_prefix` (no_std), which the standalone verifier replays too;
+  see the review below. A.1's in-AIR transcript should follow it.
 
 ### One page tree
 
@@ -1818,11 +1817,52 @@ refactors, a commit each; none changes a constraint.
   failed with `ConstraintsNotSatisfied`: the interaction trace pairs the
   relation entries in the body's order.
 
+### The review folded
+
+- **The closing flag's docs:** `closing_chip_active` gates the closing
+  chip's rows, the register ledger's closing reads and the `final_regs`
+  backfill, not the boundary mix, which every proof has. `verify` reads
+  only the side note's program and the component set its steps select;
+  its precondition that a re-derived side note be normalized goes
+  [measured: an honest proof verifies against a side note with the flag
+  cleared].
+- **`host_verify_boundary_gate` kept, rewritten:** a forger can no
+  longer prove "without the mix". It now checks the flag has no say in
+  verification: an honest proof verifies under a cleared flag; final
+  registers edited after proving are refused; a proof made with the
+  flag cleared, its closing chip empty, is refused against either side
+  note, edited or not. Not redundant: `boundary_binding.rs` keeps the
+  columns honest and lies in the metadata, and nothing else proves an
+  empty closing chip under the production mask. Every refusal is the
+  boundary binding's [measured]: an edit after proving changes the
+  drawn relation elements, so the recomputed claimed sums miss.
+- **One prefix, really:** `replay_prefix<MC>(proof, stark, format,
+  log_sizes, channel, commitment_scheme, draw)` runs the header, the two
+  roots, the boundary states, the interaction PoW, `draw` for the
+  relation elements, the claimed sums and the interaction root, and
+  returns the elements. `verify.rs` draws through its components,
+  `verify_standalone_on` through `draw_all_lookup_elements(mask)`; both
+  build their components after it. The standalone verifier's checks
+  keep their order. The 17 proof hashes match; the verifier's suite
+  passes.
+- **The settlement verifier refuses a noncanonical limb:**
+  `proof_fields_are_canonical`'s walk over a Stark proof becomes the
+  public `proof::stark_fields_are_canonical(stark, hash_is_canonical)`,
+  and `verify_settlement_proof` calls it after decoding, so
+  `vos-pvm-proof` (no default features) moves from its dev- to its
+  dependencies. Before, the fixture with one queried value raised by
+  the modulus verified [measured]: a second encoding of the same proof.
+  The test raises a queried value, a sampled value, a FRI witness and a
+  Merkle witness hash. `settle_run` [measured]: 11,028,468 instructions
+  and 27,500,314 gas, against 11,011,239 and 27,347,708 (+0.16%,
+  +0.56%); the ELF grows from 487,864 to 497,856 bytes.
+- **`vos-poseidon2` is `vos-pvm-poseidon2`,** as its siblings.
+
 ### Gates
 
-- `just check`: green, 1,019 tests.
+- `just check`: green, 1,019 tests, after the review as before.
 - `just test-proof`: green, 566 tests, the settlement verifier's among
-  them.
+  them; 567 after the review, with the noncanonical-limb test.
 - `just clippy`: green.
 - `vos-pvm-poseidon2` on stable (1.96), with and without `packed`: builds and
   its 14 tests pass.
