@@ -2607,6 +2607,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "vos-pvm-poseidon2"
+version = "0.1.0"
+
+[[package]]
 name = "vos-pvm-precompiles"
 version = "0.1.0"
 dependencies = [
@@ -2637,6 +2641,7 @@ dependencies = [
  "stwo-constraint-framework",
  "vos-pvm",
  "vos-pvm-compiler",
+ "vos-pvm-poseidon2",
  "vos-pvm-precompiles",
  "vos-pvm-program",
  "vos-pvm-proof-derive",

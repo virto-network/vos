@@ -1,0 +1,16 @@
+[package]
+name = "vos-pvm-poseidon2"
+edition.workspace = true
+version.workspace = true
+license = "Apache-2.0"
+description = "Poseidon2 over M31, width 16: the permutation, its parameters, and its sponge, Merkle and transcript modes. no_std, without Stwo."
+
+[features]
+default = []
+# Sixteen permutations at once on the widest SIMD the build targets, for the
+# prover's hashing. A verifier needs only the scalar permutation.
+packed = []
+
+[lints.clippy]
+# The permutation and its tables are indexed by word and round.
+needless_range_loop = { level = "allow", priority = 0 }

@@ -425,7 +425,7 @@ impl Collector {
                 None => bytes.push(0),
             }
         }
-        Some(crate::page_merkle::blake2b256(&bytes))
+        Some(vos_pvm_precompiles::blake2b_256(&bytes))
     }
 
     fn observe(&mut self, event: RefineObservation<'_>) {
@@ -1057,7 +1057,7 @@ fn sparse_value_commitment(image: &crate::SparseMemoryImage) -> [u8; 32] {
         put_u32(&mut bytes, page.page_index);
         bytes.extend_from_slice(&page.bytes);
     }
-    crate::page_merkle::blake2b256(&bytes)
+    vos_pvm_precompiles::blake2b_256(&bytes)
 }
 
 /// Commits the permission map through its canonical maximal runs, so the
@@ -1072,7 +1072,7 @@ fn permission_commitment(memory: &vos_pvm::interpreter::Memory) -> [u8; 32] {
         put_u64(&mut bytes, count as u64);
         bytes.push(permission);
     }
-    crate::page_merkle::blake2b256(&bytes)
+    vos_pvm_precompiles::blake2b_256(&bytes)
 }
 
 fn architectural_state_commitment(
@@ -1106,7 +1106,7 @@ fn architectural_state_commitment(
     }
     bytes.extend_from_slice(&value_commitment);
     bytes.extend_from_slice(&permission_commitment);
-    crate::page_merkle::blake2b256(&bytes)
+    vos_pvm_precompiles::blake2b_256(&bytes)
 }
 
 fn exit_kind(exit: &ExitReason) -> RefineSliceExit {

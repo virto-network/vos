@@ -22,7 +22,7 @@ mod transcript;
 pub(crate) use transcript::mix_pre_config_proof_fs_domain;
 pub use transcript::{
     check_format_security, check_interaction_pow, format_security_bits, mix_boundary_states,
-    mix_proof_fs_domain, mix_statement_header,
+    mix_proof_fs_domain, mix_statement_header, replay_prefix,
 };
 
 /// The format the default prover produces: the legacy Blake2s segment
@@ -572,7 +572,19 @@ where
     H::Hash: ProofHash,
 {
     proof.claimed_sums.iter().all(secure_field_is_canonical)
-        && stark.commitments.iter().all(ProofHash::is_canonical)
+        && stark_fields_are_canonical(stark, ProofHash::is_canonical)
+}
+
+/// Whether every M31 limb a Stark proof carries is canonical, below the
+/// modulus: its sampled and queried values, its FRI witnesses and last
+/// layer, and its hashes as `hash_is_canonical` judges them. A limb at or
+/// above the modulus decodes, and a reducing verifier may treat it as its
+/// residue, so refusing one keeps a proof's bytes its only encoding.
+pub fn stark_fields_are_canonical<H: MerkleHasherLifted>(
+    stark: &StarkProof<H>,
+    hash_is_canonical: impl Fn(&H::Hash) -> bool,
+) -> bool {
+    stark.commitments.iter().all(&hash_is_canonical)
         && stark
             .sampled_values
             .iter()
@@ -589,17 +601,17 @@ where
             .decommitments
             .iter()
             .flat_map(|decommitment| &decommitment.hash_witness)
-            .all(ProofHash::is_canonical)
+            .all(&hash_is_canonical)
         && core::iter::once(&stark.fri_proof.first_layer)
             .chain(&stark.fri_proof.inner_layers)
             .all(|layer| {
-                layer.commitment.is_canonical()
+                hash_is_canonical(&layer.commitment)
                     && layer.fri_witness.iter().all(secure_field_is_canonical)
                     && layer
                         .decommitment
                         .hash_witness
                         .iter()
-                        .all(ProofHash::is_canonical)
+                        .all(&hash_is_canonical)
             })
         && stark
             .fri_proof

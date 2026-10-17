@@ -65,7 +65,7 @@ themselves and never reshuffle pre-existing pair shapes.
 This is what the SignExtend constraints require: the 4 nibble-AND lookups
 sit in a final block right before `finalize_logup_in_pairs` rather than
 inline near the related ground constraints.  See the "Sign-extend nibble
-lookups" block near the end of `add_constraints` in `mod.rs` for the
+lookups" block, `constraints::bitmanip::sign_extend_nibbles`, for the
 canonical example.
 
 ## 3. Verifier-side and prover-side emissions must match exactly

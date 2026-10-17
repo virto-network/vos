@@ -1,6 +1,6 @@
 //! CpuChip interaction-trace generation.
 //!
-//! Mirror of `cpu/mod.rs::add_constraints` on the prover side: every
+//! Mirror of `CpuChip::add_constraints` (`cpu/constraints/`) on the prover side: every
 //! lookup the verifier's `add_constraints` consumes/produces gets a
 //! corresponding `logup.add_to_relation_with` here.  Multiplicities
 //! and tuple shapes must match the constraint side byte-for-byte —
@@ -8,7 +8,7 @@
 //! verification fails with "claimed logup sum is not zero".
 //!
 //! Adding a new lookup means: add the verifier-side emission in
-//! cpu/mod.rs, then add the prover-side emission here, then run
+//! cpu/constraints/, then add the prover-side emission here, then run
 //! the minimum sweep (CONSTRAINTS.md rule 6).
 
 #![cfg(feature = "prover")]
@@ -572,7 +572,7 @@ pub(super) fn generate_interaction_trace(
 
     // ── ByteToBits decomposition consumer (prover-side, 6 emissions) ──
     //
-    // Mirrors the 6 verifier-side emissions in cpu/mod.rs.  Each tuple
+    // Mirrors the 6 verifier-side emissions in `constraints::program::flag_bits`.  Each tuple
     // is `(FlagByteI, bit0, ..., bit7)` with bit_j either an
     // individual flag column or a sum-of-sub-flags expression.
     // Multiplicity 1 on every row: a padding row's zero bytes pin its flags

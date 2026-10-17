@@ -137,7 +137,7 @@ struct Block {
 impl Layer {
     fn buffered(&self) -> usize {
         match self {
-            Layer::Scalar(hashers) => hashers[0].buffer.len(),
+            Layer::Scalar(hashers) => hashers[0].buffered().len(),
             Layer::Packed { buffered, .. } => *buffered,
         }
     }
@@ -148,10 +148,10 @@ impl Layer {
             Layer::Scalar(hashers) => {
                 let hasher = &hashers[idx];
                 let mut buffer = [0; RATE];
-                for (word, value) in buffer.iter_mut().zip(&hasher.buffer) {
-                    *word = value.0;
+                for (word, value) in buffer.iter_mut().zip(hasher.buffered()) {
+                    *word = value.value();
                 }
-                (hasher.state.map(|word| word.0), buffer)
+                (hasher.state(), buffer)
             }
             Layer::Packed { blocks, .. } => {
                 let block = &blocks[idx >> LOG_LANES];

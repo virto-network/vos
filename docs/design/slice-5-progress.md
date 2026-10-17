@@ -1887,3 +1887,138 @@ proptest, 4,096 cases, green.
   (`tests/tree/encoded.rs`).
 - `pvm/proof/precompiles`: `BLAKE2B_IV` public, and
   `blake2b_compress_words`, the compression on words.
+
+## Step 5.8.0 (B): the refactors
+
+Track B of M1's preparation, on `s5-prep-b` from `5e29355d`. Four
+refactors, a commit each; none changes a constraint.
+
+### The check
+
+- **Proof bytes** [measured]: a scratch harness proves 17 proofs and
+  hashes each (SHA-256 of its bincode): a hand-built seven-step program
+  and the bench guests `diverse`, `hash-software` and `hash-precompile`,
+  each under format 31 and format 33, natural and canonical shapes, and
+  the hand-built program under `prove`'s standard config. Proving is
+  deterministic (two baseline runs match). After each refactor the 17
+  hashes match the baseline's.
+
+### One Poseidon2 crate
+
+- **`vos-pvm-poseidon2`** (`pvm/proof/poseidon2`), beside `precompiles` and
+  `verifier`, where `recair-air` and `final-verifier` will sit. no_std,
+  no dependencies, no allocation, stable Rust:
+  - its own M31, the permutation and its parameters, the linear layers
+    generic over the word (for `recair-air`'s bodies), the leaf sponge,
+    the node compression, and the transcript duplex with an `Observer`
+    for the prover's recorder;
+  - the packed SIMD permutation behind the `packed` feature, which the
+    prover turns on: the verifier path never compiles it, and the crate
+    builds and tests on stable with and without it;
+  - the round-constant generator test is the crate's
+    (`tests/round_constants.rs`).
+- **The prover and the settlement verifier** keep only the Stwo
+  adapters: `P2Hash`, the hasher, the channel and the Merkle channel,
+  since Stwo's traits cannot be implemented in a crate without Stwo. The settlement verifier's copy of the permutation,
+  constants, sponge and channel goes.
+- **The PVM settlement verify** [measured], `settle_run`: 11,011,239
+  instructions and 27,347,708 gas, against 10,951,979 and 27,306,959
+  before (+0.5%, +0.15%). The crate's field matches Stwo's reductions
+  form for form; a first version with branches and a reducing internal
+  diagonal cost +26% gas.
+- **A Stwo word enters reduced:** the adapters map a word through
+  `M31::from(u32)`, so a non-canonical limb in a proof cannot panic the
+  verifier.
+
+### One transcript prefix
+
+- `verify.rs`'s `transcript_prefix` replays the statement header, the
+  preprocessed and main roots, the boundary states and the interaction
+  PoW, the relation elements, the claimed sums and the interaction root.
+  `verify_on` and the recursion seams call it; the seams' copy goes.
+- **Every proof mixes its boundary states,** as production does: the
+  seams no longer gate the mix on a side note's `closing_chip_active`,
+  and chip-isolated harnesses (`prove_with_explicit_components`) mix
+  them and grind the interaction PoW too. So the seams take the proof
+  alone. Production proofs are unchanged; chip-isolated proofs, which no
+  verifier accepts across a trust boundary, change.
+- The preprocessed-root check, the logup sum and the boundary binding
+  run around the prefix; none touches the transcript.
+- `recursion_seams`' test names format 31.
+- The prefix now lives in `vos_pvm_proof::proof::transcript` as
+  `replay_prefix` (no_std), which the standalone verifier replays too;
+  see the review below. A.1's in-AIR transcript should follow it.
+
+### One page tree
+
+- `page_merkle` takes its tags, leaf and node from
+  `vos_pvm_program::image` (whose tags are now public) and asserts the
+  two depths equal; its own copies and the comment on formats 10 to 21
+  go. Refine's commitments hash with `vos_pvm_precompiles::blake2b_256`,
+  the function the image tree uses, in place of `page_merkle`'s
+  BLAKE2b-256.
+
+### The CPU split
+
+- `add_constraints`' 3,560 lines become 56 functions in 12 modules under
+  `chips/cpu/constraints`, by instruction class; `add_constraints` calls
+  them in the body's order. Each function reads the columns it uses
+  (`trace_eval!` is a pure read); IsBranch, IsStore and IsCompare are
+  functions of the row; the relation elements travel in a `Lookups`
+  struct. `cpu/mod.rs` falls to 246 lines; the split totals about 4,100,
+  the column reads each function repeats.
+- The split was generated from the body's top-level statements, each
+  function's reads drawn from the definitions it uses, then checked by
+  proof bytes. A first version called the functions in module order and
+  failed with `ConstraintsNotSatisfied`: the interaction trace pairs the
+  relation entries in the body's order.
+
+### The review folded
+
+- **The closing flag's docs:** `closing_chip_active` gates the closing
+  chip's rows, the register ledger's closing reads and the `final_regs`
+  backfill, not the boundary mix, which every proof has. `verify` reads
+  only the side note's program and the component set its steps select;
+  its precondition that a re-derived side note be normalized goes
+  [measured: an honest proof verifies against a side note with the flag
+  cleared].
+- **`host_verify_boundary_gate` kept, rewritten:** a forger can no
+  longer prove "without the mix". It now checks the flag has no say in
+  verification: an honest proof verifies under a cleared flag; final
+  registers edited after proving are refused; a proof made with the
+  flag cleared, its closing chip empty, is refused against either side
+  note, edited or not. Not redundant: `boundary_binding.rs` keeps the
+  columns honest and lies in the metadata, and nothing else proves an
+  empty closing chip under the production mask. Every refusal is the
+  boundary binding's [measured]: an edit after proving changes the
+  drawn relation elements, so the recomputed claimed sums miss.
+- **One prefix, really:** `replay_prefix<MC>(proof, stark, format,
+  log_sizes, channel, commitment_scheme, draw)` runs the header, the two
+  roots, the boundary states, the interaction PoW, `draw` for the
+  relation elements, the claimed sums and the interaction root, and
+  returns the elements. `verify.rs` draws through its components,
+  `verify_standalone_on` through `draw_all_lookup_elements(mask)`; both
+  build their components after it. The standalone verifier's checks
+  keep their order. The 17 proof hashes match; the verifier's suite
+  passes.
+- **The settlement verifier refuses a noncanonical limb:**
+  `proof_fields_are_canonical`'s walk over a Stark proof becomes the
+  public `proof::stark_fields_are_canonical(stark, hash_is_canonical)`,
+  and `verify_settlement_proof` calls it after decoding, so
+  `vos-pvm-proof` (no default features) moves from its dev- to its
+  dependencies. Before, the fixture with one queried value raised by
+  the modulus verified [measured]: a second encoding of the same proof.
+  The test raises a queried value, a sampled value, a FRI witness and a
+  Merkle witness hash. `settle_run` [measured]: 11,028,468 instructions
+  and 27,500,314 gas, against 11,011,239 and 27,347,708 (+0.16%,
+  +0.56%); the ELF grows from 487,864 to 497,856 bytes.
+- **`vos-poseidon2` is `vos-pvm-poseidon2`,** as its siblings.
+
+### Gates
+
+- `just check`: green, 1,019 tests, after the review as before.
+- `just test-proof`: green, 566 tests, the settlement verifier's among
+  them; 567 after the review, with the noncanonical-limb test.
+- `just clippy`: green.
+- `vos-pvm-poseidon2` on stable (1.96), with and without `packed`: builds and
+  its 14 tests pass.

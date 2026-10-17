@@ -328,20 +328,18 @@ fn sparse_memory_commitment(image: &crate::SparseMemoryImage) -> [u8; 32] {
 }
 
 /// Normalize a `SideNote` the way the production prove path does before
-/// trace generation: activate the closing chip (ledger augmentation +
-/// FS-transcript mix + component selection all key off it) and backfill
-/// the initial/final register images from the trace.
+/// trace generation: activate the closing chip (its rows, the ledger's
+/// closing reads and component selection key off it) and backfill the
+/// initial/final register images from the trace.
 ///
-/// Verification paths that RE-DERIVE a side note — e.g. re-slicing a
-/// segment of a fully-traced run to check a proof chain — MUST apply the
-/// same normalization before calling `verify`/`verify_with_pcs_policy`,
-/// or the verifier's Fiat-Shamir transcript diverges from the prover's
-/// and honest proofs fail with `OodsNotMatching`. `prove` applies it
-/// itself; calling this twice is idempotent.
+/// `prove` applies it itself; calling this twice is idempotent. Verifying
+/// needs none of it: `verify` reads only the side note's program and the
+/// component set its steps select, and takes the boundary states from the
+/// proof, whatever the flag says.
 pub fn prepare_side_note_for_verification(side_note: &mut SideNote) {
     // The default path always uses BASE_COMPONENTS which
     // includes `RegisterMemoryClosingChip`. Mark the side_note so the
-    // ledger augmentation + FS-transcript mix engage and
+    // closing chip's rows and the ledger's closing reads engage and
     // `proof.final_state.registers` becomes a load-bearing public
     // output. Chip-isolated callers (`prove_with_explicit_components`)
     // opt-in themselves only if their slice contains the closing chip.
@@ -933,21 +931,19 @@ where
     // proof is so tamper-evident, and the verifier's boundary binding, which
     // recomputes the boundary chips' claimed sums from the shipped states
     // with the drawn challenges, binds them against a from-scratch prover
-    // (see `boundary_binding`). Chip-isolated harnesses without the closing
-    // chip mix nothing, matching their `component_mask = 0` proofs.
+    // (see `boundary_binding`). Every proof mixes them, chip-isolated
+    // harnesses' too, so the verifier replays one transcript prefix.
+    crate::proof::mix_boundary_states(
+        prover_channel,
+        format.encoding,
+        &initial_state,
+        &final_state,
+    );
     let mut interaction_pow = 0;
-    if side_note.closing_chip_active {
-        crate::proof::mix_boundary_states(
-            prover_channel,
-            format.encoding,
-            &initial_state,
-            &final_state,
-        );
-        let bits = format.interaction_pow_bits();
-        if bits > 0 {
-            interaction_pow = <SimdBackend as GrindOps<MC::C>>::grind(prover_channel, bits);
-            prover_channel.mix_u64(interaction_pow);
-        }
+    let bits = format.interaction_pow_bits();
+    if bits > 0 {
+        interaction_pow = <SimdBackend as GrindOps<MC::C>>::grind(prover_channel, bits);
+        prover_channel.mix_u64(interaction_pow);
     }
 
     let mut lookup_elements = AllLookupElements::default();

@@ -80,8 +80,10 @@ pub struct SideNote {
     /// register-memory ledger's read-consistency constraint will
     /// reject any non-zero final value.
     pub final_regs: [u64; NUM_REGS],
-    /// Gate for the closing-chip ledger augmentation and the
-    /// `final_state.registers` FS-transcript mix.  Set to `true` by the
+    /// Gate for the closing chip's rows, the register-memory ledger's
+    /// synthetic closing reads and the `final_regs` backfill; the
+    /// boundary states join the transcript on every proof whatever it
+    /// says.  Set to `true` by the
     /// default `prove()` path because `BASE_COMPONENTS` includes
     /// `RegisterMemoryClosingChip`; left `false` by chip-isolated
     /// harnesses that pass an explicit component slice without the

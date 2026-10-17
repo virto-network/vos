@@ -61,7 +61,7 @@ pub fn refine_program_id(program: &[u8]) -> RefineProgramId {
     bytes.extend_from_slice(b"vos/pvm/refine-program/v1\0");
     bytes.extend_from_slice(&(program.len() as u64).to_le_bytes());
     bytes.extend_from_slice(program);
-    RefineProgramId(crate::page_merkle::blake2b256(&bytes))
+    RefineProgramId(vos_pvm_precompiles::blake2b_256(&bytes))
 }
 
 /// Commitment to the exact Refine invocation argument bytes.
@@ -70,7 +70,7 @@ pub fn refine_arguments_commitment(arguments: &[u8]) -> [u8; 32] {
     bytes.extend_from_slice(b"vos/pvm/refine-arguments/v1\0");
     bytes.extend_from_slice(&(arguments.len() as u64).to_le_bytes());
     bytes.extend_from_slice(arguments);
-    crate::page_merkle::blake2b256(&bytes)
+    vos_pvm_precompiles::blake2b_256(&bytes)
 }
 
 /// Exact machine identity within one Refine invocation.
@@ -286,7 +286,7 @@ pub fn refine_bundle_commitment(bundle: &RefineProofBundle) -> [u8; 32] {
             put_u64(&mut bytes, register);
         }
     }
-    crate::page_merkle::blake2b256(&bytes)
+    vos_pvm_precompiles::blake2b_256(&bytes)
 }
 
 #[derive(Clone, Copy)]
@@ -370,7 +370,7 @@ fn refine_execution_commitment(
     for boundary in host_boundaries {
         put_refine_host_boundary(&mut bytes, boundary);
     }
-    crate::page_merkle::blake2b256(&bytes)
+    vos_pvm_precompiles::blake2b_256(&bytes)
 }
 
 #[cfg(feature = "prover")]

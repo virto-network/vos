@@ -42,7 +42,7 @@ fn side_note() -> SideNote {
 }
 
 #[test]
-fn the_seams_replay_one_transcript_on_a_format_26_proof() {
+fn the_seams_replay_one_transcript_on_a_format_31_proof() {
     let mut side_note = side_note();
     let proof = prove_format(&mut side_note, &SEGMENT).expect("proves");
     let stark = proof.stark_proof.clone();
@@ -50,9 +50,9 @@ fn the_seams_replay_one_transcript_on_a_format_26_proof() {
         panic!("format 31 proves on the Poseidon2-M31 channel");
     };
 
-    let recorded = record_canonical_transcript(&proof, &side_note);
-    let data = extract_recursion_data(&proof, &side_note);
-    let oods = reconstruct_oods_for_recursion(&proof, &side_note);
+    let recorded = record_canonical_transcript(&proof);
+    let data = extract_recursion_data(&proof);
+    let oods = reconstruct_oods_for_recursion(&proof);
 
     let key = |records: &[vos_pvm_proof::poseidon2::PermRecord]| {
         records
