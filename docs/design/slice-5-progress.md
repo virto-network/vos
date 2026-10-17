@@ -2014,6 +2014,17 @@ refactors, a commit each; none changes a constraint.
   +0.56%); the ELF grows from 487,864 to 497,856 bytes.
 - **`vos-poseidon2` is `vos-pvm-poseidon2`,** as its siblings.
 
+### Left for 5.16
+
+- **A typed row:** an `AirColumn` derive that generates a `Row<E>` view,
+  each column a field read once, would replace the column reads each
+  split function repeats, about 600 lines of the split's 4,100.
+- **The split's carried names and comments:** the `_p19` and `_p54`
+  suffixes on its locals (`f_ff_p19`, `sign_bit_result_p19`,
+  `tuple_p54`, `f_is_mul_p54` and their kin), and the comments that say
+  "now" or "for now" (`compare.rs`, `control.rs`, `divrem.rs`), come
+  from the body before the split and need renaming and rewording.
+
 ### Gates
 
 - `just check`: green, 1,019 tests, after the review as before.
