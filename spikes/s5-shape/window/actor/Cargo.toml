@@ -1,0 +1,42 @@
+# A test actor whose attestable method is the settlement window over
+# witnessed rows, built for the PVM with the guest toolchain:
+#
+#     cargo build --release --target riscv64em-vos.json
+#     cargo build --release --target riscv64em-vos.json --no-default-features \
+#         --target-dir target-software
+#
+# The second build leaves cipher-clerk hashing in software.
+[workspace]
+
+[package]
+name = "settle-window"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+test = false
+bench = false
+
+[[bin]]
+name = "settle-window"
+path = "src/main.rs"
+test = false
+bench = false
+
+[features]
+default = ["precompile"]
+precompile = ["window-kernel/precompile"]
+
+[dependencies]
+vos-sdk = { path = "../../../../agent/sdk" }
+window-kernel = { path = "../kernel" }
+
+[patch."https://codeberg.org/Virto/VOS.git"]
+zkpvm-precompiles = { path = "../shim" }
+
+[profile.release]
+opt-level = 3
+lto = true
+panic = "abort"
+codegen-units = 1

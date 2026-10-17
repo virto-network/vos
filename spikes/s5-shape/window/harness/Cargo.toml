@@ -1,0 +1,25 @@
+[workspace]
+
+# The settlement-window kernel, derived from `../actor`'s ELF, run live on
+# the agent's reference model, re-traced from its attest and proved over its
+# shape: each segment's columns, prover time and memory, its proof beside
+# its class's preprocessed root for the guest verifier
+# (`../../guest-verify`), and the same segments over the full set of chips.
+[package]
+name = "s5-shape-window"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+vos-pvm = { path = "../../../../pvm/runtime" }
+vos-pvm-compiler = { path = "../../../../pvm/compiler" }
+vos-pvm-proof = { path = "../../../../pvm/proof" }
+vos-pvm-proof-verifier = { path = "../../../../pvm/proof/verifier" }
+vos-testkit = { path = "../../../../agent/testkit" }
+vos-wire = { path = "../../../../agent/wire" }
+vos-pvm-program = { path = "../../../../pvm/program" }
+postcard = { version = "1", features = ["alloc"] }
+
+[profile.release]
+debug = 1

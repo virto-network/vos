@@ -1,0 +1,24 @@
+# Cargo configuration for PVM guests. Copy to a guest crate's
+# `.cargo/config.toml`, next to `riscv64em-vos.json` and `pvm.ld`, and build
+# with the guest toolchain (`rust-toolchain.toml` in this directory):
+#
+#     cargo build --release --target riscv64em-vos.json
+#
+# Link the resulting ELF into a standard program with
+# `vos_pvm_compiler::link_elf_spi`.
+
+[target.riscv64em-vos]
+rustflags = [
+    "-Zunstable-options",
+    "-Clink-arg=-Tpvm.ld",
+]
+
+# One codegen unit: a kernel's code then moves less with unrelated changes
+# to its actor, so its hash does too.
+[profile.release]
+codegen-units = 1
+
+[unstable]
+json-target-spec = true
+build-std = ["core", "alloc", "compiler_builtins"]
+build-std-features = ["compiler-builtins-mem"]

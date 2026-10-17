@@ -1,0 +1,23 @@
+# cipher-clerk's `pvm-precompile` feature names a shim crate with BLAKE2b
+# and the Ristretto types. This crate stands in for it under `[patch]`:
+# vos-core's shim for BLAKE2b, at `0x400`, and the Ristretto types in
+# software, as no precompile serves them; a kernel reaching them runs dalek.
+[workspace]
+
+[package]
+name = "zkpvm-precompiles"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+test = false
+
+[features]
+default = ["ristretto", "blake2b"]
+ristretto = []
+blake2b = []
+
+[dependencies]
+vos-pvm-precompiles = { path = "../../../../pvm/proof/precompiles", default-features = false, features = ["blake2b"] }
+curve25519-dalek = { version = "4.1", default-features = false, features = ["alloc", "precomputed-tables"] }

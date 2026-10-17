@@ -1,0 +1,30 @@
+[workspace]
+
+# Runs the guest verifier (`../guest`) on vos-core's JAM-only refine host
+# (`RefineContext::try_run_jam`, the interpreter) against segment proofs,
+# and verifies the same proofs natively for comparison. `make-proofs`
+# writes small format-31 and format-33 proofs to check the tool with.
+[package]
+name = "s5-shape-guest-verify-harness"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "harness"
+path = "src/main.rs"
+
+[[bin]]
+name = "make-proofs"
+path = "src/make_proofs.rs"
+
+[dependencies]
+vos-pvm = { path = "../../../../pvm/runtime" }
+vos-pvm-compiler = { path = "../../../../pvm/compiler" }
+vos-pvm-proof = { path = "../../../../pvm/proof" }
+vos-pvm-proof-verifier = { path = "../../../../pvm/proof/verifier" }
+postcard = { version = "1", features = ["alloc"] }
+blake2 = "0.10"
+
+[profile.release]
+debug = 1
