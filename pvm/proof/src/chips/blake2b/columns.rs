@@ -3,12 +3,13 @@
 //! `Column` carries the per-row main-trace witness for a single G-function
 //! invocation (96 rows per compression), including nibble AND witnesses, the
 //! v[0..16] state snapshot, compression-level inputs (h, t, f, m), ECALL
-//! memory-binding pointers and per-byte addresses, and the final-row Output
+//! memory-binding pointers and address limbs, and the final-row Output
 //! witnesses.
 //!
 //! `PreprocessedColumn` carries the row-index-derived selectors: 8 G-index
 //! selectors (one per column/diagonal slot), the first/last-of-compression
-//! flags, and the 32 SIGMA-derived message-slot selectors for Mx/My.
+//! flags, the 32 SIGMA-derived message-slot selectors for Mx/My, and the
+//! IsReal anchor's `ContinuityGate` and `IsTail`.
 
 use crate::air_column::{AirColumn, PreprocessedAirColumn};
 
@@ -243,8 +244,8 @@ pub enum Column {
     // ── ECALL memory binding ──────────────────────────
     // HPtr / MPtr are the register values φ[7]/φ[8] at the ECALL step,
     // CallTs is its timestamp.  Inter-row equality keeps them constant
-    // within a compression so the 256 byte-level memory lookups emitted
-    // at IsFirstOfCompression reference well-defined values.
+    // within a compression, so the 192 reads emitted on its first row and
+    // the 64 writes on its last see the same pointers and timestamp.
     #[size = 4]
     #[mask_next_row]
     HPtr,
@@ -254,38 +255,44 @@ pub enum Column {
     #[size = 8]
     #[mask_next_row]
     CallTs,
-    /// Byte addresses for the 64 h-read lookups: HRdAddr_b*\[i\] holds byte
-    /// `b` of `HPtr + i` for i ∈ 0..64.  4 columns of size 64 each = 256
-    /// cells, avoiding the NonZeroU8 size cap (max 255 per variant).
+    /// `c_i`, the carry out of the low byte of `HPtr + i` for i ∈ 0..64;
+    /// limb 0 of that address is `HPtr[0] + i − 256·c_i`, not a column.
+    /// See `address.rs`.
     #[size = 64]
-    HRdAddrB0,
+    HAddrCarry,
+    /// Limbs 1, 2 and 3 of `HPtr + i`: `HPtr`'s own when `c_i = 0`, those of
+    /// `HPtrInc` when `c_i = 1`.  The `h` reads use them on the first row,
+    /// the digest's writes on the last.
     #[size = 64]
-    HRdAddrB1,
+    HAddrB1,
     #[size = 64]
-    HRdAddrB2,
+    HAddrB2,
     #[size = 64]
-    HRdAddrB3,
-    /// Byte addresses for the 128 m-read lookups.
+    HAddrB3,
+    /// `c_k`, the carry out of the low byte of `MPtr + k` for k ∈ 0..128.
     #[size = 128]
-    MRdAddrB0,
+    MAddrCarry,
+    /// Limbs 1, 2 and 3 of `MPtr + k`.
     #[size = 128]
-    MRdAddrB1,
+    MAddrB1,
     #[size = 128]
-    MRdAddrB2,
+    MAddrB2,
     #[size = 128]
-    MRdAddrB3,
-    /// Byte addresses for the 64 output-write lookups.
-    #[size = 64]
-    HWrAddrB0,
-    #[size = 64]
-    HWrAddrB1,
-    #[size = 64]
-    HWrAddrB2,
-    #[size = 64]
-    HWrAddrB3,
-    // Row type.  mask_next_row mirrors `BoundaryColumn::IsReal` (whose
-    // IsReal-continuity anchor reads the next row); Blake2bChip leaves the
-    // next value unused.
+    MAddrB3,
+    /// Limbs 0..3 of `(HPtr >> 8) + 1`, and the carries out of its limbs 0
+    /// and 1 (no carry out of limb 2: a range wrapping 2^32 is unprovable).
+    #[size = 3]
+    HPtrInc,
+    #[size = 2]
+    HPtrIncCarry,
+    /// Limbs 0..3 of `(MPtr >> 8) + 1`, and its carries.
+    #[size = 3]
+    MPtrInc,
+    #[size = 2]
+    MPtrIncCarry,
+    // Row type: boolean, constant across a compression's 96 rows (the
+    // `ContinuityGate` anchor reads the next row) and 0 in the trailing
+    // partial block.
     #[size = 1]
     #[mask_next_row]
     IsReal,
@@ -303,13 +310,6 @@ pub enum Column {
     InitGateH,
     #[size = 1]
     OutputGateH,
-    // Logup multiplicity of the row-95 compression production.  Live only
-    // in `BoundaryColumn::EmitMult` (see boundary.rs for the gating and the
-    // RangeMultiplicity256-style value-freedom argument); dead (all-zero)
-    // here — Blake2bChip's producer gate stays OutputGateH — and retained
-    // solely to keep the main chip's committed layout unchanged.
-    #[size = 1]
-    EmitMult,
     // Carry-bound helpers — flatten the degree-3 / -4
     // carry-domain constraints to degree 2.
     //
@@ -451,8 +451,8 @@ pub enum PreprocessedColumn {
     /// next (independently-initialised) compression.
     #[size = 1]
     IsLastOfCompression,
-    /// 1 iff (r % 96) == 0 — first G-call of a compression.  Reserved for
-    /// the initial-state derivation constraint; currently unused.
+    /// 1 iff (r % 96) == 0 — first G-call of a compression: the initial-state
+    /// derivation, the call consumer and the `h`/`m` reads.
     #[size = 1]
     IsFirstOfCompression,
     /// IsMxSlot[k] = 1 iff SIGMA[round(r)][2·g_idx(r)] == k (ie this row's
@@ -523,15 +523,25 @@ pub enum PreprocessedColumn {
     IsMySlot14,
     #[size = 1]
     IsMySlot15,
+    /// 1 iff the IsReal-continuity constraint applies from this row to the
+    /// next: `r % 96 != 95` (not a compression boundary) and `r` is not the
+    /// last trace row (whose next row wraps to row 0).
+    #[size = 1]
+    ContinuityGate,
+    /// 1 on the rows of the trailing partial block, `r ≥ 96·⌊N/96⌋`: a block
+    /// with no row 95, which would consume a call and never write, so it
+    /// holds no real row.
+    #[size = 1]
+    IsTail,
 }
 
 /// The main-column handles the shared blake2b compression core reads and
 /// writes (`add_compression_core`, `add_compression_interaction_core`,
 /// `fill_compression_trace`).  `Column` implements it over the full
 /// ECALL-binding layout; the boundary chip's `BoundaryColumn` implements it
-/// without the 1040 ECALL-binding limbs (`HPtr`/`MPtr`/`CallTs` and the
-/// per-byte address columns) that only `Blake2bChip`'s memory-ledger /
-/// CPU-call bindings reference.
+/// without the ECALL-binding columns (`HPtr`/`MPtr`/`CallTs` and the
+/// address columns) that only `Blake2bChip`'s memory-ledger / CPU-call
+/// bindings reference.
 ///
 /// Limb counts are fixed by the core's constraint shapes and must match the
 /// sizes documented on `Column`'s variants (the `column_eval` /

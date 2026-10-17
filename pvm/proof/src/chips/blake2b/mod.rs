@@ -31,7 +31,7 @@ use crate::trace::eval::TraceEval;
 #[cfg(feature = "prover")]
 use crate::trace::{
     builder::{FinalizedTrace, TraceBuilder},
-    component::ComponentTrace,
+    component::{ComponentTrace, FinalizedColumn},
 };
 
 #[cfg(feature = "prover")]
@@ -48,6 +48,7 @@ use crate::{
     },
 };
 
+mod address;
 mod boundary;
 mod call;
 mod columns;
@@ -845,6 +846,45 @@ impl BuiltInComponent for Blake2bChip {
         ),
     ) {
         let (range256_lookup, bitwise_lookup, mem_lookup, blake2b_call_lookup) = lookup_elements;
+        let one = E::F::one();
+
+        // ── IsReal anchor ──────────────────────────────────────────────
+        // A compression's first row consumes the CPU's call and reads `h`
+        // and `m`; its last row writes the digest. Nothing outside this
+        // chip relates the two rows, so IsReal is boolean, constant across
+        // the 96 rows (ContinuityGate is 0 at the row-95 block boundary and
+        // on the last trace row, whose next row wraps to row 0), and 0 in
+        // the trailing partial block, which has no row 95. A real first row
+        // therefore implies a real last row, chained to it by GateH.
+        //
+        // These and the address relations are emitted before the first
+        // lookup, so a violation unwinds before the evaluator holds pending
+        // logup state.
+        let is_real = crate::trace::trace_eval!(trace_eval, Column::IsReal);
+        let is_real_next = crate::trace::trace_eval_next_row!(trace_eval, Column::IsReal);
+        let continuity_gate =
+            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::ContinuityGate);
+        let is_tail =
+            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsTail);
+        eval.add_constraint(is_real[0].clone() * (is_real[0].clone() - one.clone()));
+        eval.add_constraint(
+            continuity_gate[0].clone() * (is_real_next[0].clone() - is_real[0].clone()),
+        );
+        eval.add_constraint(is_tail[0].clone() * is_real[0].clone());
+
+        // ── Addresses: `h_ptr + i`, `m_ptr + k` as u32 byte limbs ─────
+        let h_addr = address::Addresses::<E, 64>::read(&trace_eval, address::H);
+        let m_addr = address::Addresses::<E, 128>::read(&trace_eval, address::M);
+        h_addr.constrain(eval, &is_real[0]);
+        m_addr.constrain(eval, &is_real[0]);
+
+        // T[8..16] = 0 — the ECALL handler only uses the low 8 bytes of t,
+        // so the upper half must be zero for the binding to CpuChip Phi12
+        // to be unambiguous.  Gated by is_real so padding rows are inert.
+        let t_e = crate::trace::trace_eval!(trace_eval, Column::T);
+        for i in 8..16 {
+            eval.add_constraint(is_real[0].clone() * t_e[i].clone());
+        }
 
         // Arithmetic compression core (G-function, V-chain, output
         // derivation, BitwiseAnd / Range256 lookups, the GateH / InitGateH /
@@ -852,69 +892,22 @@ impl BuiltInComponent for Blake2bChip {
         let sched = read_schedule(&trace_eval);
         add_compression_core(eval, &trace_eval, &sched, range256_lookup, bitwise_lookup);
 
-        // Re-read the core-local columns the memory-ledger / CPU-call
-        // bindings below consume.
-        let is_real = crate::trace::trace_eval!(trace_eval, Column::IsReal);
-        let init_gate_h = crate::trace::trace_eval!(trace_eval, Column::InitGateH);
-        let output_gate_h = crate::trace::trace_eval!(trace_eval, Column::OutputGateH);
-        let gate_h = crate::trace::trace_eval!(trace_eval, Column::GateH);
-        let gate = gate_h[0].clone();
+        let init_gate = crate::trace::trace_eval!(trace_eval, Column::InitGateH)[0].clone();
+        let output_gate = crate::trace::trace_eval!(trace_eval, Column::OutputGateH)[0].clone();
+        let gate = crate::trace::trace_eval!(trace_eval, Column::GateH)[0].clone();
         let output_e = crate::trace::trace_eval!(trace_eval, Column::Output);
-        let t_e = crate::trace::trace_eval!(trace_eval, Column::T);
-        let f1 = E::F::one();
-        let h_cols: [_; 8] = [
-            crate::trace::trace_eval!(trace_eval, Column::H0),
-            crate::trace::trace_eval!(trace_eval, Column::H1),
-            crate::trace::trace_eval!(trace_eval, Column::H2),
-            crate::trace::trace_eval!(trace_eval, Column::H3),
-            crate::trace::trace_eval!(trace_eval, Column::H4),
-            crate::trace::trace_eval!(trace_eval, Column::H5),
-            crate::trace::trace_eval!(trace_eval, Column::H6),
-            crate::trace::trace_eval!(trace_eval, Column::H7),
-        ];
-        let m_cols: [_; 16] = [
-            crate::trace::trace_eval!(trace_eval, Column::M0),
-            crate::trace::trace_eval!(trace_eval, Column::M1),
-            crate::trace::trace_eval!(trace_eval, Column::M2),
-            crate::trace::trace_eval!(trace_eval, Column::M3),
-            crate::trace::trace_eval!(trace_eval, Column::M4),
-            crate::trace::trace_eval!(trace_eval, Column::M5),
-            crate::trace::trace_eval!(trace_eval, Column::M6),
-            crate::trace::trace_eval!(trace_eval, Column::M7),
-            crate::trace::trace_eval!(trace_eval, Column::M8),
-            crate::trace::trace_eval!(trace_eval, Column::M9),
-            crate::trace::trace_eval!(trace_eval, Column::M10),
-            crate::trace::trace_eval!(trace_eval, Column::M11),
-            crate::trace::trace_eval!(trace_eval, Column::M12),
-            crate::trace::trace_eval!(trace_eval, Column::M13),
-            crate::trace::trace_eval!(trace_eval, Column::M14),
-            crate::trace::trace_eval!(trace_eval, Column::M15),
-        ];
+        let h_cols: [_; 8] = Column::H.map(|col| trace_eval.column_eval::<8>(col));
+        let m_cols: [_; 16] = Column::M.map(|col| trace_eval.column_eval::<8>(col));
 
         // ── ECALL memory binding ──────────────────────
-        // HPtr / MPtr / CallTs are witnessed per row (inter-row equality)
-        // and 192 address columns HRdAddr/MRdAddr/HWrAddr decompose
-        // HPtr+i / MPtr+k / HPtr+i as u32 LE bytes.
+        // HPtr / MPtr / CallTs are witnessed per row and constant within a
+        // compression.
         let h_ptr_e = crate::trace::trace_eval!(trace_eval, Column::HPtr);
         let m_ptr_e = crate::trace::trace_eval!(trace_eval, Column::MPtr);
         let call_ts_e = crate::trace::trace_eval!(trace_eval, Column::CallTs);
-        let h_rd_b0 = crate::trace::trace_eval!(trace_eval, Column::HRdAddrB0);
-        let h_rd_b1 = crate::trace::trace_eval!(trace_eval, Column::HRdAddrB1);
-        let h_rd_b2 = crate::trace::trace_eval!(trace_eval, Column::HRdAddrB2);
-        let h_rd_b3 = crate::trace::trace_eval!(trace_eval, Column::HRdAddrB3);
-        let m_rd_b0 = crate::trace::trace_eval!(trace_eval, Column::MRdAddrB0);
-        let m_rd_b1 = crate::trace::trace_eval!(trace_eval, Column::MRdAddrB1);
-        let m_rd_b2 = crate::trace::trace_eval!(trace_eval, Column::MRdAddrB2);
-        let m_rd_b3 = crate::trace::trace_eval!(trace_eval, Column::MRdAddrB3);
-        let h_wr_b0 = crate::trace::trace_eval!(trace_eval, Column::HWrAddrB0);
-        let h_wr_b1 = crate::trace::trace_eval!(trace_eval, Column::HWrAddrB1);
-        let h_wr_b2 = crate::trace::trace_eval!(trace_eval, Column::HWrAddrB2);
-        let h_wr_b3 = crate::trace::trace_eval!(trace_eval, Column::HWrAddrB3);
         let h_ptr_next = crate::trace::trace_eval_next_row!(trace_eval, Column::HPtr);
         let m_ptr_next = crate::trace::trace_eval_next_row!(trace_eval, Column::MPtr);
         let call_ts_next = crate::trace::trace_eval_next_row!(trace_eval, Column::CallTs);
-
-        // Inter-row equality within a compression.
         for i in 0..4 {
             eval.add_constraint(gate.clone() * (h_ptr_next[i].clone() - h_ptr_e[i].clone()));
             eval.add_constraint(gate.clone() * (m_ptr_next[i].clone() - m_ptr_e[i].clone()));
@@ -923,168 +916,70 @@ impl BuiltInComponent for Blake2bChip {
             eval.add_constraint(gate.clone() * (call_ts_next[i].clone() - call_ts_e[i].clone()));
         }
 
-        // Address derivation: HRdAddr[i] = HPtr + i as a u32 combo.
-        // Single linear identity per offset, gated by is_real·is_first.
-        // Gate substitution: init_gate_8b ← InitGateH (alias).
-        let init_gate_8b = init_gate_h[0].clone();
-        let combine = crate::framework::eval::combine_le_u64::<E>;
-        let h_ptr_u32 = combine(&[
-            h_ptr_e[0].clone(),
-            h_ptr_e[1].clone(),
-            h_ptr_e[2].clone(),
-            h_ptr_e[3].clone(),
-        ]);
-        let m_ptr_u32 = combine(&[
-            m_ptr_e[0].clone(),
-            m_ptr_e[1].clone(),
-            m_ptr_e[2].clone(),
-            m_ptr_e[3].clone(),
-        ]);
-        for i in 0..64usize {
-            let addr_u32 = combine(&[
-                h_rd_b0[i].clone(),
-                h_rd_b1[i].clone(),
-                h_rd_b2[i].clone(),
-                h_rd_b3[i].clone(),
-            ]);
-            let offset = E::F::from(BaseField::from(i as u32));
-            eval.add_constraint(init_gate_8b.clone() * (addr_u32 - h_ptr_u32.clone() - offset));
-        }
-        for k in 0..128usize {
-            let addr_u32 = combine(&[
-                m_rd_b0[k].clone(),
-                m_rd_b1[k].clone(),
-                m_rd_b2[k].clone(),
-                m_rd_b3[k].clone(),
-            ]);
-            let offset = E::F::from(BaseField::from(k as u32));
-            eval.add_constraint(init_gate_8b.clone() * (addr_u32 - m_ptr_u32.clone() - offset));
-        }
-        for i in 0..64usize {
-            let addr_u32 = combine(&[
-                h_wr_b0[i].clone(),
-                h_wr_b1[i].clone(),
-                h_wr_b2[i].clone(),
-                h_wr_b3[i].clone(),
-            ]);
-            let offset = E::F::from(BaseField::from(i as u32));
-            eval.add_constraint(init_gate_8b.clone() * (addr_u32 - h_ptr_u32.clone() - offset));
-        }
+        // Limb 0 of every address and the increments are bytes on the rows
+        // that emit them: `h` on the first and last rows, `m` on the first.
+        h_addr.add_range_lookups(
+            eval,
+            range256_lookup,
+            &(init_gate.clone() + output_gate.clone()),
+        );
+        m_addr.add_range_lookups(eval, range256_lookup, &init_gate);
 
-        // ── 256 memory-access consumer RelationEntry matching the prover side ──
-        let f_one = f1.clone();
+        // ── Memory-access tuples (addr[4], value, ts[8], is_write, is_closing) ──
         let f_zero = E::F::zero();
-        let output_words: [_; 8] = [
-            output_e[0..8].to_vec(),
-            output_e[8..16].to_vec(),
-            output_e[16..24].to_vec(),
-            output_e[24..32].to_vec(),
-            output_e[32..40].to_vec(),
-            output_e[40..48].to_vec(),
-            output_e[48..56].to_vec(),
-            output_e[56..64].to_vec(),
-        ];
-        let _ = &output_words; // referenced indirectly below via output_e
-
-        // 64 h reads
-        for i in 0..64usize {
-            let word = i / 8;
-            let byte = i % 8;
+        let mut access = |addr: [E::F; 4], value: E::F, is_write: E::F, mult: &E::F| {
             let mut tuple: Vec<E::F> = Vec::with_capacity(15);
-            tuple.push(h_rd_b0[i].clone());
-            tuple.push(h_rd_b1[i].clone());
-            tuple.push(h_rd_b2[i].clone());
-            tuple.push(h_rd_b3[i].clone());
-            tuple.push(h_cols[word][byte].clone());
-            for tb in 0..8 {
-                tuple.push(call_ts_e[tb].clone());
-            }
-            tuple.push(f_zero.clone());
+            tuple.extend(addr);
+            tuple.push(value);
+            tuple.extend(call_ts_e.iter().cloned());
+            tuple.push(is_write);
             tuple.push(f_zero.clone()); // is_closing = 0
-            eval.add_to_relation(RelationEntry::new(
-                mem_lookup,
-                init_gate_8b.clone().into(),
-                &tuple,
-            ));
+            eval.add_to_relation(RelationEntry::new(mem_lookup, mult.clone().into(), &tuple));
+        };
+        // 64 h reads and 128 m reads on the first row.
+        for i in 0..64usize {
+            access(
+                h_addr.address(i),
+                h_cols[i / 8][i % 8].clone(),
+                f_zero.clone(),
+                &init_gate,
+            );
         }
-        // 128 m reads
         for k in 0..128usize {
-            let word = k / 8;
-            let byte = k % 8;
-            let mut tuple: Vec<E::F> = Vec::with_capacity(15);
-            tuple.push(m_rd_b0[k].clone());
-            tuple.push(m_rd_b1[k].clone());
-            tuple.push(m_rd_b2[k].clone());
-            tuple.push(m_rd_b3[k].clone());
-            tuple.push(m_cols[word][byte].clone());
-            for tb in 0..8 {
-                tuple.push(call_ts_e[tb].clone());
-            }
-            tuple.push(f_zero.clone());
-            tuple.push(f_zero.clone()); // is_closing = 0
-            eval.add_to_relation(RelationEntry::new(
-                mem_lookup,
-                init_gate_8b.clone().into(),
-                &tuple,
-            ));
+            access(
+                m_addr.address(k),
+                m_cols[k / 8][k % 8].clone(),
+                f_zero.clone(),
+                &init_gate,
+            );
         }
-        // 64 output writes — gated by is_real · IsLastOfCompression since
-        // Output column is only populated at the last row of each
-        // compression (output-derivation witness); HWrAddr/CallTs stay constant.
-        // Gate substitution: write_gate_8b ← OutputGateH (alias).
-        let write_gate_8b = output_gate_h[0].clone();
+        // 64 digest writes on the last row, at that row's `h` addresses
+        // (Output is populated on the last row only).
         for i in 0..64usize {
-            let mut tuple: Vec<E::F> = Vec::with_capacity(15);
-            tuple.push(h_wr_b0[i].clone());
-            tuple.push(h_wr_b1[i].clone());
-            tuple.push(h_wr_b2[i].clone());
-            tuple.push(h_wr_b3[i].clone());
-            tuple.push(output_e[i].clone());
-            for tb in 0..8 {
-                tuple.push(call_ts_e[tb].clone());
-            }
-            tuple.push(f_one.clone());
-            tuple.push(f_zero.clone()); // is_closing = 0
-            eval.add_to_relation(RelationEntry::new(
-                mem_lookup,
-                write_gate_8b.clone().into(),
-                &tuple,
-            ));
+            access(
+                h_addr.address(i),
+                output_e[i].clone(),
+                one.clone(),
+                &output_gate,
+            );
         }
 
         // ── Consumer linking to CpuChip ECALL step ──
-        // Tuple (h_ptr[0..4], m_ptr[0..4], T[0..8], F, CallTs[0..8]) = 25 limbs.
-        // Fires at IsFirstOfCompression · IsReal, mult = -init_gate_8b so
-        // CpuChip's producer (+is_blake_ecall) balances.
+        // Tuple (h_ptr[0..4], m_ptr[0..4], T[0..8], F, CallTs[0..8]) = 25 limbs,
+        // multiplicity −InitGateH so CpuChip's producer (+is_blake_ecall)
+        // balances.
         let f_col_e = crate::trace::trace_eval!(trace_eval, Column::F);
-        {
-            let mut tuple: Vec<E::F> = Vec::with_capacity(25);
-            for i in 0..4 {
-                tuple.push(h_ptr_e[i].clone());
-            }
-            for i in 0..4 {
-                tuple.push(m_ptr_e[i].clone());
-            }
-            for i in 0..8 {
-                tuple.push(t_e[i].clone());
-            }
-            tuple.push(f_col_e[0].clone());
-            for i in 0..8 {
-                tuple.push(call_ts_e[i].clone());
-            }
-            eval.add_to_relation(RelationEntry::new(
-                blake2b_call_lookup,
-                (-init_gate_8b.clone()).into(),
-                &tuple,
-            ));
-        }
-
-        // T[8..16] = 0 — the ECALL handler only uses the low 8 bytes of t,
-        // so the upper half must be zero for the binding to CpuChip Phi12
-        // to be unambiguous.  Gated by is_real so padding rows are inert.
-        for i in 8..16 {
-            eval.add_constraint(is_real[0].clone() * t_e[i].clone());
-        }
+        let mut tuple: Vec<E::F> = Vec::with_capacity(25);
+        tuple.extend(h_ptr_e.iter().cloned());
+        tuple.extend(m_ptr_e.iter().cloned());
+        tuple.extend(t_e[..8].iter().cloned());
+        tuple.push(f_col_e[0].clone());
+        tuple.extend(call_ts_e.iter().cloned());
+        eval.add_to_relation(RelationEntry::new(
+            blake2b_call_lookup,
+            (-init_gate).into(),
+            &tuple,
+        ));
 
         eval.finalize_logup_in_pairs();
     }
@@ -1368,23 +1263,6 @@ pub(in crate::chips::blake2b) fn build_compression_rows(
         let m_ptr = mem_op.map(|o| o.m_ptr).unwrap_or(0).to_le_bytes();
         let call_ts_u = mem_op.map(|o| o.ts).unwrap_or(0);
         let call_ts = call_ts_u.to_le_bytes();
-        let h_ptr_u32 = u32::from_le_bytes(h_ptr);
-        let m_ptr_u32 = u32::from_le_bytes(m_ptr);
-        let mut h_rd_addr = [0u8; 256];
-        for i in 0..64 {
-            let addr = h_ptr_u32.wrapping_add(i as u32).to_le_bytes();
-            h_rd_addr[i * 4..i * 4 + 4].copy_from_slice(&addr);
-        }
-        let mut m_rd_addr = [0u8; 512];
-        for k in 0..128 {
-            let addr = m_ptr_u32.wrapping_add(k as u32).to_le_bytes();
-            m_rd_addr[k * 4..k * 4 + 4].copy_from_slice(&addr);
-        }
-        let mut h_wr_addr = [0u8; 256];
-        for i in 0..64 {
-            let addr = h_ptr_u32.wrapping_add(i as u32).to_le_bytes();
-            h_wr_addr[i * 4..i * 4 + 4].copy_from_slice(&addr);
-        }
 
         for round in 0..12 {
             let s = &SIGMA[round];
@@ -1412,9 +1290,6 @@ pub(in crate::chips::blake2b) fn build_compression_rows(
                 row.h_ptr = h_ptr;
                 row.m_ptr = m_ptr;
                 row.call_ts = call_ts;
-                row.h_rd_addr = h_rd_addr;
-                row.m_rd_addr = m_rd_addr;
-                row.h_wr_addr = h_wr_addr;
 
                 rows.push(row);
             }
@@ -1616,64 +1491,27 @@ pub(in crate::chips::blake2b) fn fill_compression_trace<C: CompressionColumns>(
 }
 
 /// Fill the ECALL memory-binding columns — `Blake2bChip`'s exclusive width
-/// (`HPtr`/`MPtr`/`CallTs` + the per-byte read/write address columns).
-/// Split from `fill_compression_trace` because the boundary chip's
-/// `BoundaryColumn` layout omits these columns entirely.
+/// (`HPtr`/`MPtr`/`CallTs` and the address columns of `address.rs`) — on
+/// every real row, and count the address range lookups once per compression
+/// row that emits them (`h`'s first and last rows, `m`'s first).  Split from
+/// `fill_compression_trace` because the boundary chip's `BoundaryColumn`
+/// layout omits these columns entirely.
 #[cfg(feature = "prover")]
-fn fill_ecall_binding_trace(trace: &mut TraceBuilder<Column>, rows: &[GRow]) {
+fn fill_ecall_binding_trace(
+    trace: &mut TraceBuilder<Column>,
+    side_note: &mut SideNote,
+    rows: &[GRow],
+) {
     for (row_idx, r) in rows.iter().enumerate() {
-        // ECALL-binding witnesses.
         trace.fill_columns_bytes(row_idx, &r.h_ptr, Column::HPtr);
         trace.fill_columns_bytes(row_idx, &r.m_ptr, Column::MPtr);
         trace.fill_columns_bytes(row_idx, &r.call_ts, Column::CallTs);
-        // Split 4-byte-wide address arrays into per-byte slices.
-        {
-            let mut b0 = [0u8; 64];
-            let mut b1 = [0u8; 64];
-            let mut b2 = [0u8; 64];
-            let mut b3 = [0u8; 64];
-            for i in 0..64 {
-                b0[i] = r.h_rd_addr[i * 4];
-                b1[i] = r.h_rd_addr[i * 4 + 1];
-                b2[i] = r.h_rd_addr[i * 4 + 2];
-                b3[i] = r.h_rd_addr[i * 4 + 3];
-            }
-            trace.fill_columns_bytes(row_idx, &b0, Column::HRdAddrB0);
-            trace.fill_columns_bytes(row_idx, &b1, Column::HRdAddrB1);
-            trace.fill_columns_bytes(row_idx, &b2, Column::HRdAddrB2);
-            trace.fill_columns_bytes(row_idx, &b3, Column::HRdAddrB3);
-        }
-        {
-            let mut b0 = [0u8; 128];
-            let mut b1 = [0u8; 128];
-            let mut b2 = [0u8; 128];
-            let mut b3 = [0u8; 128];
-            for k in 0..128 {
-                b0[k] = r.m_rd_addr[k * 4];
-                b1[k] = r.m_rd_addr[k * 4 + 1];
-                b2[k] = r.m_rd_addr[k * 4 + 2];
-                b3[k] = r.m_rd_addr[k * 4 + 3];
-            }
-            trace.fill_columns_bytes(row_idx, &b0, Column::MRdAddrB0);
-            trace.fill_columns_bytes(row_idx, &b1, Column::MRdAddrB1);
-            trace.fill_columns_bytes(row_idx, &b2, Column::MRdAddrB2);
-            trace.fill_columns_bytes(row_idx, &b3, Column::MRdAddrB3);
-        }
-        {
-            let mut b0 = [0u8; 64];
-            let mut b1 = [0u8; 64];
-            let mut b2 = [0u8; 64];
-            let mut b3 = [0u8; 64];
-            for i in 0..64 {
-                b0[i] = r.h_wr_addr[i * 4];
-                b1[i] = r.h_wr_addr[i * 4 + 1];
-                b2[i] = r.h_wr_addr[i * 4 + 2];
-                b3[i] = r.h_wr_addr[i * 4 + 3];
-            }
-            trace.fill_columns_bytes(row_idx, &b0, Column::HWrAddrB0);
-            trace.fill_columns_bytes(row_idx, &b1, Column::HWrAddrB1);
-            trace.fill_columns_bytes(row_idx, &b2, Column::HWrAddrB2);
-            trace.fill_columns_bytes(row_idx, &b3, Column::HWrAddrB3);
+        let (h_ptr, m_ptr) = (u32::from_le_bytes(r.h_ptr), u32::from_le_bytes(r.m_ptr));
+        address::fill::<64>(trace, row_idx, h_ptr, address::H);
+        address::fill::<128>(trace, row_idx, m_ptr, address::M);
+        if row_idx.is_multiple_of(96) {
+            address::count_range_lookups::<64>(side_note, h_ptr, 2);
+            address::count_range_lookups::<128>(side_note, m_ptr, 1);
         }
     }
 }
@@ -1683,6 +1521,13 @@ impl BuiltInProverComponent for Blake2bChip {
     fn generate_preprocessed_trace(&self, log_size: u32, _side_note: &SideNote) -> FinalizedTrace {
         let mut trace = TraceBuilder::<PreprocessedColumn>::new(log_size);
         fill_schedule_preprocessed(&mut trace);
+        let num_rows = trace.num_rows();
+        let tail = num_rows / 96 * 96;
+        for row in 0..num_rows {
+            let continuity = row % 96 != 95 && row != num_rows - 1;
+            trace.fill_columns(row, continuity, PreprocessedColumn::ContinuityGate);
+            trace.fill_columns(row, row >= tail, PreprocessedColumn::IsTail);
+        }
         trace.finalize_bit_reversed()
     }
 
@@ -1706,7 +1551,7 @@ impl BuiltInProverComponent for Blake2bChip {
         let log_size = crate::trace::utils::ceil_log2_at_least_lanes(num_rows).max(min_log_size);
         let mut trace = TraceBuilder::<Column>::new(log_size);
         fill_compression_trace(&mut trace, side_note, &rows);
-        fill_ecall_binding_trace(&mut trace, &rows);
+        fill_ecall_binding_trace(&mut trace, side_note, &rows);
         trace.finalize_bit_reversed()
     }
 
@@ -1733,201 +1578,92 @@ impl BuiltInProverComponent for Blake2bChip {
             bitwise,
         );
 
-        // Re-read the columns the ECALL-binding lookups consume from the core region.
-        let is_real = crate::trace::original_base_column!(component_trace, Column::IsReal);
-        let is_last_pp = crate::trace::preprocessed_base_column!(
-            component_trace,
-            PreprocessedColumn::IsLastOfCompression
+        let init_gate = crate::trace::original_base_column!(component_trace, Column::InitGateH);
+        let output_gate = crate::trace::original_base_column!(component_trace, Column::OutputGateH);
+        let h_addr = address::AddressTrace::<64>::read(&component_trace, address::H);
+        let m_addr = address::AddressTrace::<128>::read(&component_trace, address::M);
+        h_addr.add_range_lookups(
+            &mut logup,
+            range256,
+            [init_gate[0].clone(), output_gate[0].clone()],
         );
+        m_addr.add_range_lookups(&mut logup, range256, [init_gate[0].clone()]);
 
-        // ── Per-byte memory-access consumer lookups ──
-        // Tuple (addr[4], value[1], ts[8], is_write[1]) mirroring the
-        // MemoryChip ledger entries for h reads, m reads, output writes.
-        // Fire only at IsFirstOfCompression · IsReal (once per compression).
+        // ── Memory-access tuples (addr[4], value, ts[8], is_write, is_closing) ──
         let mem_lookup: &MemoryAccessLookupElements = lookup_elements.as_ref();
-        let is_first_pp = crate::trace::preprocessed_base_column!(
-            component_trace,
-            PreprocessedColumn::IsFirstOfCompression
-        );
-        let h_rd_addr_b0 = crate::trace::original_base_column!(component_trace, Column::HRdAddrB0);
-        let h_rd_addr_b1 = crate::trace::original_base_column!(component_trace, Column::HRdAddrB1);
-        let h_rd_addr_b2 = crate::trace::original_base_column!(component_trace, Column::HRdAddrB2);
-        let h_rd_addr_b3 = crate::trace::original_base_column!(component_trace, Column::HRdAddrB3);
-        let m_rd_addr_b0 = crate::trace::original_base_column!(component_trace, Column::MRdAddrB0);
-        let m_rd_addr_b1 = crate::trace::original_base_column!(component_trace, Column::MRdAddrB1);
-        let m_rd_addr_b2 = crate::trace::original_base_column!(component_trace, Column::MRdAddrB2);
-        let m_rd_addr_b3 = crate::trace::original_base_column!(component_trace, Column::MRdAddrB3);
-        let h_wr_addr_b0 = crate::trace::original_base_column!(component_trace, Column::HWrAddrB0);
-        let h_wr_addr_b1 = crate::trace::original_base_column!(component_trace, Column::HWrAddrB1);
-        let h_wr_addr_b2 = crate::trace::original_base_column!(component_trace, Column::HWrAddrB2);
-        let h_wr_addr_b3 = crate::trace::original_base_column!(component_trace, Column::HWrAddrB3);
         let call_ts_cols = crate::trace::original_base_column!(component_trace, Column::CallTs);
-        let h_word_cols: [_; 8] = [
-            crate::trace::original_base_column!(component_trace, Column::H0),
-            crate::trace::original_base_column!(component_trace, Column::H1),
-            crate::trace::original_base_column!(component_trace, Column::H2),
-            crate::trace::original_base_column!(component_trace, Column::H3),
-            crate::trace::original_base_column!(component_trace, Column::H4),
-            crate::trace::original_base_column!(component_trace, Column::H5),
-            crate::trace::original_base_column!(component_trace, Column::H6),
-            crate::trace::original_base_column!(component_trace, Column::H7),
-        ];
-        let m_word_cols: [_; 16] = [
-            crate::trace::original_base_column!(component_trace, Column::M0),
-            crate::trace::original_base_column!(component_trace, Column::M1),
-            crate::trace::original_base_column!(component_trace, Column::M2),
-            crate::trace::original_base_column!(component_trace, Column::M3),
-            crate::trace::original_base_column!(component_trace, Column::M4),
-            crate::trace::original_base_column!(component_trace, Column::M5),
-            crate::trace::original_base_column!(component_trace, Column::M6),
-            crate::trace::original_base_column!(component_trace, Column::M7),
-            crate::trace::original_base_column!(component_trace, Column::M8),
-            crate::trace::original_base_column!(component_trace, Column::M9),
-            crate::trace::original_base_column!(component_trace, Column::M10),
-            crate::trace::original_base_column!(component_trace, Column::M11),
-            crate::trace::original_base_column!(component_trace, Column::M12),
-            crate::trace::original_base_column!(component_trace, Column::M13),
-            crate::trace::original_base_column!(component_trace, Column::M14),
-            crate::trace::original_base_column!(component_trace, Column::M15),
-        ];
+        let h_words = Column::H.map(|col| component_trace.original_base_column::<8, _>(col));
+        let m_words = Column::M.map(|col| component_trace.original_base_column::<8, _>(col));
         let output_cols = crate::trace::original_base_column!(component_trace, Column::Output);
-
-        // 64 h reads: (HRdAddr[i], H[i/8][i%8], CallTs, 0)
-        for i in 0..64usize {
-            let word = i / 8;
-            let byte = i % 8;
-            let addr0 = h_rd_addr_b0[i].clone();
-            let addr1 = h_rd_addr_b1[i].clone();
-            let addr2 = h_rd_addr_b2[i].clone();
-            let addr3 = h_rd_addr_b3[i].clone();
-            let h_b = h_word_cols[word][byte].clone();
-            let ts_c = call_ts_cols.clone();
-            let zero_val = PackedBaseField::broadcast(BaseField::from(0u32));
+        let zero = PackedBaseField::broadcast(BaseField::from(0u32));
+        let one = PackedBaseField::broadcast(BaseField::from(1u32));
+        let mut access = |addr: &dyn Fn(usize) -> [PackedBaseField; 4],
+                          value: FinalizedColumn<'_>,
+                          is_write: PackedBaseField,
+                          gate: FinalizedColumn<'_>| {
+            let ts = call_ts_cols.clone();
             logup.add_to_relation_computed(
                 mem_lookup,
-                [is_real[0].clone(), is_first_pp[0].clone()],
-                |[r, f]| (r * f).into(),
+                [gate],
+                |[g]| g.into(),
                 15,
                 move |v| {
                     let mut t = Vec::with_capacity(15);
-                    t.push(addr0.at(v));
-                    t.push(addr1.at(v));
-                    t.push(addr2.at(v));
-                    t.push(addr3.at(v));
-                    t.push(h_b.at(v));
-                    for ts_col in &ts_c {
-                        t.push(ts_col.at(v));
-                    }
-                    t.push(zero_val); // is_write = 0
-                    t.push(zero_val); // is_closing = 0
+                    t.extend(addr(v));
+                    t.push(value.at(v));
+                    t.extend(ts.iter().map(|col| col.at(v)));
+                    t.push(is_write);
+                    t.push(zero); // is_closing = 0
                     t
                 },
             );
+        };
+        // 64 h reads and 128 m reads on the first row.
+        for i in 0..64usize {
+            let addr = h_addr.address(i);
+            access(
+                &addr,
+                h_words[i / 8][i % 8].clone(),
+                zero,
+                init_gate[0].clone(),
+            );
         }
-        // 128 m reads
         for k in 0..128usize {
-            let word = k / 8;
-            let byte = k % 8;
-            let addr0 = m_rd_addr_b0[k].clone();
-            let addr1 = m_rd_addr_b1[k].clone();
-            let addr2 = m_rd_addr_b2[k].clone();
-            let addr3 = m_rd_addr_b3[k].clone();
-            let m_b = m_word_cols[word][byte].clone();
-            let ts_c = call_ts_cols.clone();
-            let zero_val = PackedBaseField::broadcast(BaseField::from(0u32));
-            logup.add_to_relation_computed(
-                mem_lookup,
-                [is_real[0].clone(), is_first_pp[0].clone()],
-                |[r, f]| (r * f).into(),
-                15,
-                move |v| {
-                    let mut t = Vec::with_capacity(15);
-                    t.push(addr0.at(v));
-                    t.push(addr1.at(v));
-                    t.push(addr2.at(v));
-                    t.push(addr3.at(v));
-                    t.push(m_b.at(v));
-                    for ts_col in &ts_c {
-                        t.push(ts_col.at(v));
-                    }
-                    t.push(zero_val); // is_write = 0
-                    t.push(zero_val); // is_closing = 0
-                    t
-                },
+            let addr = m_addr.address(k);
+            access(
+                &addr,
+                m_words[k / 8][k % 8].clone(),
+                zero,
+                init_gate[0].clone(),
             );
         }
-        // 64 output writes — gated by IsLastOfCompression, since the Output
-        // column is only populated on the last row of each compression
-        // (output-derivation witness).  HWrAddr/CallTs are inter-row-constant so they
-        // have the correct values on that row too.
+        // 64 digest writes on the last row.
         for i in 0..64usize {
-            let addr0 = h_wr_addr_b0[i].clone();
-            let addr1 = h_wr_addr_b1[i].clone();
-            let addr2 = h_wr_addr_b2[i].clone();
-            let addr3 = h_wr_addr_b3[i].clone();
-            let out_b = output_cols[i].clone();
-            let ts_c = call_ts_cols.clone();
-            let one_val = PackedBaseField::broadcast(BaseField::from(1u32));
-            logup.add_to_relation_computed(
-                mem_lookup,
-                [is_real[0].clone(), is_last_pp[0].clone()],
-                |[r, l]| (r * l).into(),
-                15,
-                move |v| {
-                    let mut t = Vec::with_capacity(15);
-                    t.push(addr0.at(v));
-                    t.push(addr1.at(v));
-                    t.push(addr2.at(v));
-                    t.push(addr3.at(v));
-                    t.push(out_b.at(v));
-                    for ts_col in &ts_c {
-                        t.push(ts_col.at(v));
-                    }
-                    t.push(one_val); // is_write = 1
-                    t.push(PackedBaseField::broadcast(BaseField::from(0u32))); // is_closing = 0
-                    t
-                },
-            );
+            let addr = h_addr.address(i);
+            access(&addr, output_cols[i].clone(), one, output_gate[0].clone());
         }
 
         // ── Blake2b-call consumer linking to CpuChip ECALL step ──
-        // Tuple (h_ptr[0..4], m_ptr[0..4], t[0..8], F[1], CallTs[0..8]) = 25 limbs.
-        // Fires at IsFirstOfCompression · IsReal (once per compression),
-        // with multiplicity -1 so CpuChip's matching producer balances.
+        // Tuple (h_ptr[0..4], m_ptr[0..4], t[0..8], F[1], CallTs[0..8]) = 25 limbs,
+        // multiplicity −InitGateH so CpuChip's matching producer balances.
         let blake2b_call: &Blake2bCallLookupElements = lookup_elements.as_ref();
         let h_ptr_cols = crate::trace::original_base_column!(component_trace, Column::HPtr);
         let m_ptr_cols = crate::trace::original_base_column!(component_trace, Column::MPtr);
         let t_cols = crate::trace::original_base_column!(component_trace, Column::T);
         let f_col = crate::trace::original_base_column!(component_trace, Column::F);
+        let call_cols: Vec<FinalizedColumn<'_>> = h_ptr_cols
+            .into_iter()
+            .chain(m_ptr_cols)
+            .chain(t_cols.into_iter().take(8))
+            .chain(f_col)
+            .chain(call_ts_cols)
+            .collect();
         logup.add_to_relation_computed(
             blake2b_call,
-            [is_real[0].clone(), is_first_pp[0].clone()],
-            |[r, f]| (-(r * f)).into(),
+            [init_gate[0].clone()],
+            |[g]| (-g).into(),
             25,
-            {
-                let h_ptr_c = h_ptr_cols.clone();
-                let m_ptr_c = m_ptr_cols.clone();
-                let t_c = t_cols.clone();
-                let f_c = f_col[0].clone();
-                let ts_c = call_ts_cols.clone();
-                move |v| {
-                    let mut t = Vec::with_capacity(25);
-                    for i in 0..4 {
-                        t.push(h_ptr_c[i].at(v));
-                    }
-                    for i in 0..4 {
-                        t.push(m_ptr_c[i].at(v));
-                    }
-                    for i in 0..8 {
-                        t.push(t_c[i].at(v));
-                    }
-                    t.push(f_c.at(v));
-                    for i in 0..8 {
-                        t.push(ts_c[i].at(v));
-                    }
-                    t
-                }
-            },
+            move |v| call_cols.iter().map(|col| col.at(v)).collect(),
         );
 
         logup.finalize()
