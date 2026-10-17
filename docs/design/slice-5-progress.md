@@ -786,3 +786,14 @@ negatives) now carries the forged result through the run, so the ledger
 accepts it and only the operation's constraints can refuse it; all 14 are
 still refused. `forge_three_reg_result` (alu_negative) is track ARITH's.
 The `padding_is_a_bit`, carry and branch gates edit exactly their column.
+
+**Gates** [measured, on this machine, under `systemd-run` at 14 GiB with
+`nice -n 10` and 6 jobs]: `just check` green, 998 tests; `just
+test-proof` green, 493 tests; `just test-bench-proof` green; clippy clean
+on the prover's feature sets of `just clippy`.
+
+**Merge notes:** format 30/31 is also track ARITH's; the merged AIR takes
+one bump. No new flag bit: `IsImmAlt` is the old `IsRotateRImmAlt` bit.
+The byte-to-bits emissions' multiplicity (now 1) sits next to ARITH's
+byte-0 slot; the DivRem emission block and trace_fill's DivRem section are
+untouched.
