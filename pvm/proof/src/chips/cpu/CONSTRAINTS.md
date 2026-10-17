@@ -13,8 +13,12 @@ constraint of degree
 (roughly: degree shoots up because the two fractions share a denominator
 product).
 
-CpuChip declares `LOG_CONSTRAINT_DEGREE_BOUND = 2` — so paired-batch
-constraints must stay ≤ degree 4.
+CpuChip declares `LOG_CONSTRAINT_DEGREE_BOUND = 1`: its constraints are
+evaluated on a domain twice the trace's, and a constraint of degree `d` has a
+quotient of degree about `(d − 1)·N` over a trace of `N` rows, which fits for
+`d ≤ 3`. So paired-batch constraints must stay ≤ degree 3, which a pair of
+degree-1 tuples with degree-1 multiplicities meets exactly. (MemoryChip's
+permission rules, of degree 3 in its body, use the same headroom.)
 
 **Rule.** Tuples passed to `add_to_relation` should be **degree ≤ 1** in the
 fundamental columns.  Multiplicities should be **degree ≤ 1** too.  A tuple

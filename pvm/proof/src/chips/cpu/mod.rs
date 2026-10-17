@@ -68,12 +68,11 @@ pub struct CpuChip;
 // ── Trace generation ───────────────────────────────────────────────────────
 
 impl BuiltInComponent for CpuChip {
-    /// Bound = 1 means actual algebraic degree ≤ 2.  All multi-flag
-    /// selector chains and quadratic bodies are routed through the helper
-    /// columns declared at the end of `Column`, keeping every constraint
-    /// within this bound (Stwo v2.x's lifted protocol enforces the declared
-    /// bound).  The same flattening applies to the Blake2b/Mul/DivRem
-    /// chips.
+    /// Bound 1 admits algebraic degree ≤ 3, which the paired logup
+    /// constraints use (see `CONSTRAINTS.md`). The body constraints stay
+    /// at degree ≤ 2: multi-flag selector chains and quadratic bodies are
+    /// routed through the helper columns declared at the end of `Column`,
+    /// as on the Blake2b, Mul and DivRem chips.
     const LOG_CONSTRAINT_DEGREE_BOUND: u32 = 1;
 
     type PreprocessedColumn = PreprocessedColumn;

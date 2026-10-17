@@ -128,10 +128,11 @@ pub enum Column {
 
     // ── Stwo-v2.x degree-flatten helpers ──
     //
-    // Stwo's lifted protocol enforces algebraic constraint degree ≤ 2.
-    // Several MulChip constraints sit at degree 3-5 in their natural
-    // form — chiefly the schoolbook chain (`gate · partial_sum`) and the
-    // multi-flag selectors `is_real · is_64bit · is_mul_lo · …`.
+    // The chip's degree bound admits degree ≤ 3, which the paired logup
+    // constraints use; the body stays at degree ≤ 2. Several MulChip
+    // constraints sit at degree 3-5 in their natural form — chiefly the
+    // schoolbook chain (`gate · partial_sum`) and the multi-flag
+    // selectors `is_real · is_64bit · is_mul_lo · …`.
     // These helpers materialise the high-degree intermediates so every
     // gated constraint factors into (deg 1 column ref) × (deg 1 body).
     /// `(1 - IsPadding) · (1 - Is32Bit)` — deg-1 helper standing in for
@@ -184,10 +185,7 @@ pub enum Column {
 pub enum PreprocessedColumn {}
 
 impl BuiltInComponent for MulChip {
-    // Schoolbook constraint is degree 4 (`is_real * is_64bit *
-    // is_mul_lo * (val_b*val_d - ...)`).  Sign-correction term
-    // pinning is `(mu_su + mu_ss) * (term_a - sign_bit_b * val_d[i])`
-    // = degree 3.  Both fit log_size + 2.
+    // Degree ≤ 3; the helpers above keep the body at degree ≤ 2.
     const LOG_CONSTRAINT_DEGREE_BOUND: u32 = 1;
 
     type PreprocessedColumn = PreprocessedColumn;

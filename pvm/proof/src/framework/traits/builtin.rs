@@ -26,7 +26,10 @@ use stwo::{
 /// and verifier-side; in a no_std verifier build this is the only chip
 /// trait that gets included.
 pub trait BuiltInComponent {
-    /// Logarithmic bound for the maximum constraint degree.
+    /// The constraints are evaluated on a domain `2^bound` times the
+    /// trace's; their quotient by the trace domain's vanishing polynomial,
+    /// of degree about `(d − 1)·N` for a constraint of degree `d`, must fit
+    /// it. Bound 1 admits degree ≤ 3.
     const LOG_CONSTRAINT_DEGREE_BOUND: u32 = 1;
 
     type PreprocessedColumn: PreprocessedAirColumn;
