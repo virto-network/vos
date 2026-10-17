@@ -393,7 +393,6 @@ name = "window"
 version = "0.1.0"
 dependencies = [
  "cipher-clerk",
- "vos-pvm-precompiles",
  "vos-sdk",
  "vos-tree",
 ]

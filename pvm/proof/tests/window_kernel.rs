@@ -20,7 +20,7 @@ use cipher_clerk::codec;
 use cipher_clerk::conventions::PseudoAccount;
 use cipher_clerk::ids::JournalId;
 use cipher_clerk::kernel::Value;
-use cipher_clerk::settlement::{Anchor, Reads, window};
+use cipher_clerk::settlement::{Anchor, Reads, WindowError, window};
 use cipher_clerk::types::{Account, Layer};
 use vos_pvm_proof::format::SEGMENT;
 use vos_pvm_proof::kernel::{KernelTrace, trace_kernel};
@@ -29,7 +29,7 @@ use vos_pvm_proof::{Proof, program_commitment_of_proof, prove_kernel};
 use vos_pvm_proof_verifier::{verify_kernel_chain, verify_kernel_segment};
 use vos_testkit::Testkit;
 use vos_testkit::programs::{derivation, derived, method, package};
-use vos_tree::{BatchProof, Blake2b, Leaf, MemStore, keys};
+use vos_tree::{BatchProof, Blake2b, Decode, Leaf, MemStore, keys};
 use vos_wire::Encode;
 use vos_wire::abi::cap::Target;
 use vos_wire::ids::{AgentId, InstanceId, Principal, ProgramHash};
@@ -117,31 +117,43 @@ fn put(store: &mut MemStore, seed: &[u8; 32], writes: &[(Vec<u8>, Vec<u8>)]) -> 
 /// second, each its leaf's salt and its value.
 type Row = (Option<([u8; 16], Vec<u8>)>, ([u8; 16], Vec<u8>));
 
-/// The kernel's statuses for rows the first and the second anchor's proofs
-/// refuse (`window::REFUSED_I`, `window::REFUSED_J`).
+/// The kernel's statuses (`window`'s constants): a value that does not
+/// decode, rows out of key order, rows the first or the second anchor's
+/// proof refuses, and `WINDOW` plus the index of `window`'s error.
+const MALFORMED: u8 = 1;
+const UNORDERED: u8 = 2;
 const REFUSED_I: u8 = 3;
 const REFUSED_J: u8 = 4;
+const WINDOW: u8 = 16;
 
-/// A window's arguments, and the output its kernel gives.
-struct Instance {
+/// `state`'s arguments, the proofs each a `BatchProof`'s encoding.
+#[derive(Clone)]
+struct Arguments {
+    space: [u8; 32],
+    window_i: u64,
     root_i: [u8; 32],
+    window_j: u64,
     root_j: [u8; 32],
     rows: Vec<Row>,
-    proof_i: BatchProof,
-    proof_j: BatchProof,
-    expected: Vec<u8>,
+    proof_i: Vec<u8>,
+    proof_j: Vec<u8>,
 }
 
-impl Instance {
-    /// The arguments as `state` takes them.
-    fn arguments(&self, rows: &[Row]) -> Vec<u8> {
+impl Arguments {
+    fn encode(&self) -> Vec<u8> {
         (
-            (SPACE, WINDOW_I, self.root_i),
-            (WINDOW_J, self.root_j, rows.to_vec()),
-            (self.proof_i.encode(), self.proof_j.encode()),
+            (self.space, self.window_i, self.root_i),
+            (self.window_j, self.root_j, self.rows.clone()),
+            (self.proof_i.clone(), self.proof_j.clone()),
         )
             .encode()
     }
+}
+
+/// A window's arguments, and the output its kernel gives.
+struct Instance {
+    arguments: Arguments,
+    expected: Vec<u8>,
 }
 
 /// The window over the eight journals' rows in a map of [`ROWS`] rows,
@@ -151,12 +163,14 @@ fn instance() -> &'static Instance {
     INSTANCE.get_or_init(build)
 }
 
+/// A row's key: its account's id under the hashed transform.
+fn key(account: &Account<Value>) -> Vec<u8> {
+    keys::hashed(&Blake2b, &account.id.0)
+}
+
 fn build() -> Instance {
     let accounts: Vec<(Option<Account<Value>>, Account<Value>)> =
         (0..JOURNALS).flat_map(pair).collect();
-    let key = |account: &Account<Value>| keys::hashed(&Blake2b, &account.id.0);
-    let (seed_i, seed_j) = ([1u8; 32], [2u8; 32]);
-
     let mut rng = Rng(0x5eed_0000 + ROWS as u64);
     let width = codec::to_bytes(&accounts[0].1).len();
     let others: Vec<(Vec<u8>, Vec<u8>)> = (accounts.len()..ROWS)
@@ -167,7 +181,18 @@ fn build() -> Instance {
             (keys::hashed(&Blake2b, &id), value)
         })
         .collect();
+    build_over(accounts, others, 1_000)
+}
 
+/// The window over `accounts`' rows in a map that also holds `others`, at
+/// two versions: the first holds the accounts present at the first anchor;
+/// at the second the accounts grew and the first `changed` others changed.
+fn build_over(
+    accounts: Vec<(Option<Account<Value>>, Account<Value>)>,
+    others: Vec<(Vec<u8>, Vec<u8>)>,
+    changed: usize,
+) -> Instance {
+    let (seed_i, seed_j) = ([1u8; 32], [2u8; 32]);
     let mut store = MemStore::default();
     let mut writes = others.clone();
     writes.extend(
@@ -182,11 +207,9 @@ fn build() -> Instance {
     let keys: Vec<Vec<u8>> = accounts.iter().map(|(_, at_j)| key(at_j)).collect();
     let proof_i = BatchProof::generate(&store, &keys).expect("proves");
 
-    // The second version: the pseudo-accounts grew, and a thousand other
-    // rows changed.
     let mut writes: Vec<(Vec<u8>, Vec<u8>)> = others
         .into_iter()
-        .take(1_000)
+        .take(changed)
         .map(|(key, mut value)| {
             value[0] ^= 0xff;
             (key, value)
@@ -241,13 +264,59 @@ fn build() -> Instance {
     let mut expected = vec![0u8];
     expected.extend_from_slice(&codec::to_bytes(&flow));
     Instance {
-        root_i,
-        root_j,
-        rows,
-        proof_i,
-        proof_j,
+        arguments: Arguments {
+            space: SPACE,
+            window_i: WINDOW_I,
+            root_i,
+            window_j: WINDOW_J,
+            root_j,
+            rows,
+            proof_i: proof_i.encode(),
+            proof_j: proof_j.encode(),
+        },
         expected,
     }
+}
+
+/// A key's bit at `level`, most significant first, a bit past its end
+/// reading 0.
+fn bit(key: &[u8], level: usize) -> u8 {
+    key.get(level / 8)
+        .map_or(0, |byte| (byte >> (7 - level % 8)) & 1)
+}
+
+/// Journal 0's window over a map of three rows, where the first anchor's
+/// proof ends the paths of its two claims, one present and one absent, in
+/// the opposite of their keys' order.
+///
+/// The outgoing account's key `p` is present at both anchors, the incoming
+/// account's `a` only at the second; they first differ at bit `d`. The map
+/// also holds `p` with a later bit `l` flipped, where `a`'s bit differs
+/// from `p`'s and from its own at `d`: at the first anchor the tree is one
+/// branch at `l`, and `a`, parting from both leaves at `d`, where no branch
+/// splits, ends on the side of `l` opposite to the one its order puts it.
+fn inversion() -> Instance {
+    let accounts = pair(0);
+    let present = key(&accounts[0].1);
+    let absent = key(&accounts[1].1);
+    let parted = (0..present.len() * 8)
+        .find(|&level| bit(&present, level) != bit(&absent, level))
+        .expect("distinct keys");
+    let flipped = (parted + 1..128)
+        .find(|&level| {
+            bit(&absent, level) != bit(&present, level)
+                && bit(&absent, level) != bit(&absent, parted)
+        })
+        .expect("a bit past the first difference");
+    let mut other = present.clone();
+    other[flipped / 8] ^= 0x80 >> (flipped % 8);
+    assert_ne!(
+        absent < present,
+        bit(&absent, flipped) < bit(&present, flipped),
+        "the keys' order is not the paths'"
+    );
+    let value = codec::to_bytes(&accounts[0].1);
+    build_over(accounts.to_vec(), vec![(other, value)], 0)
 }
 
 /// The process's peak resident memory, for the log: A.7 caps a segment's.
@@ -319,17 +388,86 @@ fn traced(kernel: &Kernel) -> KernelTrace {
 #[test]
 fn rows_off_the_roots_are_refused() {
     let instance = instance();
-    let mut rows = instance.rows.clone();
-    rows[0].1.0[0] ^= 1;
-    let refused = run(&instance.arguments(&rows));
+    let mut arguments = instance.arguments.clone();
+    arguments.rows[0].1.0[0] ^= 1;
+    let refused = run(&arguments.encode());
     assert_eq!(refused.attest.output, vec![REFUSED_J].encode());
     traced(&refused);
 
-    let mut rows = instance.rows.clone();
-    let present = rows.iter().position(|row| row.0.is_some()).unwrap();
-    rows[present].0 = None;
-    let refused = run(&instance.arguments(&rows));
+    let mut arguments = instance.arguments.clone();
+    let present = arguments
+        .rows
+        .iter()
+        .position(|row| row.0.is_some())
+        .unwrap();
+    arguments.rows[present].0 = None;
+    let refused = run(&arguments.encode());
     assert_eq!(refused.attest.output, vec![REFUSED_I].encode());
+}
+
+/// A proof tampered with or cut short is refused, and so are rows out of
+/// key order, a value that does not decode, and rows `window` refuses.
+#[test]
+fn bad_proofs_and_rows_are_refused() {
+    let instance = instance();
+    let refused = |change: &dyn Fn(&mut Arguments)| {
+        let mut arguments = instance.arguments.clone();
+        change(&mut arguments);
+        let kernel = run(&arguments.encode());
+        traced(&kernel);
+        kernel.attest.output
+    };
+    let status = |status: u8| vec![status].encode();
+    // The last byte: of the last entry's hash or value commitment.
+    let tampered = |proof: &mut Vec<u8>| {
+        let last = proof.len() - 1;
+        proof[last] ^= 1;
+    };
+    assert_eq!(refused(&|a| tampered(&mut a.proof_i)), status(REFUSED_I));
+    assert_eq!(refused(&|a| tampered(&mut a.proof_j)), status(REFUSED_J));
+    assert_eq!(
+        refused(&|a| {
+            a.proof_i.pop();
+        }),
+        status(REFUSED_I)
+    );
+    assert_eq!(
+        refused(&|a| a.proof_j.truncate(a.proof_j.len() / 2)),
+        status(REFUSED_J)
+    );
+    assert_eq!(refused(&|a| a.rows.swap(0, 1)), status(UNORDERED));
+    assert_eq!(refused(&|a| a.rows[3].1.1.truncate(5)), status(MALFORMED));
+    assert_eq!(
+        refused(&|a| a.space = PEER),
+        status(WINDOW + WindowError::SameSpace as u8)
+    );
+}
+
+/// Claims whose paths end in the proof in the opposite of their keys'
+/// order are accepted, as `vos_tree` accepts them: an absent key parting
+/// from a subtree at a bit no branch splits on.
+#[test]
+fn claims_ending_out_of_key_order_are_accepted() {
+    let instance = inversion();
+    let arguments = &instance.arguments;
+    let claims: Vec<(Vec<u8>, Option<[u8; 32]>)> = arguments
+        .rows
+        .iter()
+        .map(|(at_i, at_j)| {
+            let account: Account<Value> = codec::from_bytes(&at_j.1).expect("an account");
+            let commitment = at_i
+                .as_ref()
+                .map(|(salt, value)| vos_tree::value_hash(&Blake2b, salt, value));
+            (key(&account), commitment)
+        })
+        .collect();
+    let proof = BatchProof::decode_exact(&arguments.proof_i).expect("a proof");
+    proof
+        .verify(&Blake2b, &arguments.root_i, &claims)
+        .expect("vos_tree accepts");
+    let kernel = run(&arguments.encode());
+    assert_eq!(kernel.attest.output, instance.expected.encode());
+    traced(&kernel);
 }
 
 /// The window's kernel re-runs from its attest to the window's statement,
@@ -339,7 +477,7 @@ fn rows_off_the_roots_are_refused() {
 fn the_window_proves_and_verifies_over_its_shape() {
     let started = Instant::now();
     let instance = instance();
-    let kernel = run(&instance.arguments(&instance.rows));
+    let kernel = run(&instance.arguments.encode());
     assert_eq!(kernel.attest.output, instance.expected.encode());
     let trace = traced(&kernel);
     let program = common::kernel_program(&kernel.blob, &kernel.record, &SEGMENT);
@@ -398,4 +536,10 @@ fn the_window_proves_and_verifies_over_its_shape() {
         .flat_map(|word| word.to_le_bytes())
         .collect();
     assert_eq!(io_hash, trace.io_hash);
+    // No public arguments and no roots: the window's statement is bound
+    // only through its output, the `NetFlow`'s fields.
+    assert_eq!(
+        io_hash,
+        vos_pvm_precompiles::compute_io_hash(&[], &instance.expected.encode(), &[])
+    );
 }

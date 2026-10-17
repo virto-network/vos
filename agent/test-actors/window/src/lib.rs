@@ -1,6 +1,7 @@
 //! An actor that states settlement windows: its attestable method checks a
 //! space's pseudo-account rows against the committed-map roots of a window's
-//! two anchors, by a vos-tree multiproof each ([`batch`]), then runs
+//! two anchors, by a vos-tree multiproof each, checked from its encoding as
+//! it is read (`vos_tree::verify_encoded`), then runs
 //! `cipher_clerk::settlement::window` over them. The kernel derived from it
 //! is what a proof of a window proves.
 //!
@@ -22,8 +23,6 @@ use cipher_clerk::settlement::{Anchor, NetFlow, Reads};
 use cipher_clerk::types::Account;
 use vos_sdk::prelude::*;
 use vos_tree::{Blake2b, Hash, Salt, keys};
-
-pub mod batch;
 
 /// A value does not decode.
 pub const MALFORMED: u8 = 1;
@@ -174,12 +173,20 @@ fn statement(
             .map(|(key, commitment)| (key.as_slice(), at(commitment)))
             .collect()
     };
-    if !batch::verify(proof_i, &anchor_i.root, &claims(|(at_i, _)| *at_i)) {
-        return Err(REFUSED_I);
-    }
-    if !batch::verify(proof_j, &anchor_j.root, &claims(|(_, at_j)| Some(*at_j))) {
-        return Err(REFUSED_J);
-    }
+    vos_tree::verify_encoded(
+        &Blake2b,
+        proof_i,
+        &anchor_i.root,
+        &claims(|(at_i, _)| *at_i),
+    )
+    .map_err(|_| REFUSED_I)?;
+    vos_tree::verify_encoded(
+        &Blake2b,
+        proof_j,
+        &anchor_j.root,
+        &claims(|(_, at_j)| Some(*at_j)),
+    )
+    .map_err(|_| REFUSED_J)?;
     cipher_clerk::settlement::window(space, anchor_i, anchor_j, &reads)
         .map_err(|error| WINDOW + error as u8)
 }
