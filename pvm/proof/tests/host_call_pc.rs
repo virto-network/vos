@@ -130,3 +130,47 @@ fn unhandled_blake2b_call_segment_proves_at_cause_pc() {
     assert_eq!((steps[0].pc, steps[0].next_pc), (0, 0));
     prove_and_verify(steps, &code, &bitmask);
 }
+
+/// A BLAKE2b call the machine cannot serve, its `h` pointer past 32 bits:
+/// the machine panics at the call. Its proof says what a call left to the
+/// embedder's says, that the segment ends at the cause PC with nothing
+/// after it; a host that serves its precompiles in place reads that end as
+/// the panic, an embedder that serves them itself as a pending call.
+fn failed_blake2b_call() -> (Vec<u8>, Vec<u8>, Vec<vos_pvm_proof::core::step::PvmStep>) {
+    let (code, bitmask, mut tracing) = tracer(ECALL_BLAKE2B_COMPRESS);
+    tracing.pvm.registers[7] = 1 << 32;
+    assert_eq!(tracing.run_with_precompiles(), ExitReason::Panic);
+    let steps = tracing.into_trace();
+    assert_eq!(steps.len(), 1);
+    assert!(!steps[0].host_call_acknowledged);
+    assert_eq!((steps[0].pc, steps[0].next_pc), (0, 0));
+    (code, bitmask, steps)
+}
+
+#[test]
+fn a_failed_blake2b_call_ends_its_segment_at_the_cause_pc() {
+    let (code, bitmask, steps) = failed_blake2b_call();
+    let mut side_note = SideNote::new(steps, code, bitmask);
+    let proof = vos_pvm_proof::prove(&mut side_note).expect("proving failed");
+    assert_eq!(proof.final_state.pc, 0);
+    vos_pvm_proof::verify(proof, &side_note).expect("verification failed");
+}
+
+/// The failed call continued at its successor without an acknowledgment.
+#[test]
+#[should_panic(expected = "failed")]
+fn a_failed_blake2b_call_cannot_continue() {
+    let (code, bitmask, mut steps) = failed_blake2b_call();
+    steps[0].next_pc = 3;
+    prove_and_verify(steps, &code, &bitmask);
+}
+
+/// The failed call acknowledged: no compression serves it.
+#[test]
+#[should_panic(expected = "failed")]
+fn a_failed_blake2b_call_cannot_be_acknowledged() {
+    let (code, bitmask, mut steps) = failed_blake2b_call();
+    steps[0].host_call_acknowledged = true;
+    steps[0].next_pc = 3;
+    prove_and_verify(steps, &code, &bitmask);
+}

@@ -1797,6 +1797,14 @@ impl BuiltInComponent for CpuChip {
             // A Standard host call not acknowledged by the committed proof
             // runtime is a real exit, so it cannot be followed by another
             // real row. Acknowledged rows may end a segment at resume_pc.
+            //
+            // A precompile call may stay unacknowledged: an inner machine's
+            // is left to its agent, and a host without precompiles answers
+            // it. A call the machine fails to serve (a pointer past 32 bits,
+            // an inaccessible range) ends its run the same way, at its cause
+            // PC, so a proof states only that the run stopped there; the
+            // host's policy tells a pending call from the panic, and a
+            // kernel's proof is read only to its halt.
             let is_padding_next = crate::trace::trace_eval_next_row!(trace_eval, Column::IsPadding);
             eval.add_constraint(
                 (soft_host - acknowledged[0].clone()) * (E::F::one() - is_padding_next[0].clone()),
