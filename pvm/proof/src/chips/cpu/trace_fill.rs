@@ -39,10 +39,10 @@ fn fill_ts_carry(trace: &mut TraceBuilder<Column>, row: usize, ts: u64) {
     trace.fill_columns_bytes(row, &carry, Column::TsCarry);
 }
 
-pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
+pub(super) fn generate_main_trace(side_note: &mut SideNote, min_log_size: u32) -> FinalizedTrace {
     let num_steps = side_note.num_steps();
     let log_size = (num_steps as f64).log2().ceil().max(LOG_N_LANES as f64) as u32;
-    let log_size = log_size.max(LOG_N_LANES);
+    let log_size = log_size.max(LOG_N_LANES).max(min_log_size);
 
     let mut trace = TraceBuilder::<Column>::new(log_size);
     let num_rows = trace.num_rows();

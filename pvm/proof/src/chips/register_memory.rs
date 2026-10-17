@@ -302,13 +302,21 @@ impl BuiltInProverComponent for RegisterMemoryChip {
     const IS_PRODUCER: bool = false;
 
     fn generate_main_trace_immut(&self, side_note: &SideNote) -> FinalizedTrace {
+        self.generate_main_trace_immut_min(side_note, 0)
+    }
+
+    fn generate_main_trace_immut_min(
+        &self,
+        side_note: &SideNote,
+        min_log_size: u32,
+    ) -> FinalizedTrace {
         // Build (reg, ts)-sorted single-entry ledger via the shared helper
         // that the analyzer and property tests also use — keeps the three
         // call sites byte-for-byte aligned.
         let entries = build_entries_from_side_note(side_note);
 
         if entries.is_empty() {
-            let log_size = LOG_N_LANES;
+            let log_size = LOG_N_LANES.max(min_log_size);
             let mut trace = TraceBuilder::<Column>::new(log_size);
             for row in 0..trace.num_rows() {
                 trace.fill_columns(row, true, Column::IsPadding);
@@ -331,6 +339,7 @@ impl BuiltInProverComponent for RegisterMemoryChip {
         if (1usize << log_size) == num_rows_real {
             log_size += 1;
         }
+        let log_size = log_size.max(min_log_size);
         let mut trace = TraceBuilder::<Column>::new(log_size);
         let num_rows = trace.num_rows();
 

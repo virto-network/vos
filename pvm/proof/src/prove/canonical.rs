@@ -7,7 +7,7 @@ use stwo::prover::backend::{BackendForChannel, simd::SimdBackend};
 use stwo::prover::{CommitmentSchemeProver, poly::circle::PolyOps};
 
 use super::{
-    ProofTranscriptGeneration, ProvingError, Target, install_thread_pool,
+    ProofTranscriptGeneration, ProvingError, Sizes, Target, install_thread_pool,
     prepare_side_note_for_verification, prove_impl_with_components_overridden,
 };
 use crate::format::Format;
@@ -51,9 +51,21 @@ pub fn prove_canonical_format(
     install_thread_pool();
     prepare_side_note_for_verification(side_note);
     let components = crate::all_components();
-    // Full set present ⇒ constant mask = all component bits set.  Built via
-    // a widening shift so a COUNT of 32 (all u32 bits) doesn't overflow.
-    let component_mask = ((1u64 << crate::chip_idx::COUNT) - 1) as u32;
+    // Full set present ⇒ constant mask = all component bits set.
+    let component_mask = crate::chip_idx::ALL;
+    // The floors reach the forcing set alone: the other chips keep their
+    // natural sizes, which the commitment does not depend on.
+    let floors: Vec<u32> = min_log_sizes
+        .iter()
+        .enumerate()
+        .map(|(index, &floor)| {
+            if crate::chip_idx::FORCING & 1 << index != 0 {
+                floor
+            } else {
+                0
+            }
+        })
+        .collect();
     let (proof, _) = prove_impl_with_components_overridden(
         side_note,
         Target::of(format)?,
@@ -61,7 +73,7 @@ pub fn prove_canonical_format(
         components,
         component_mask,
         None,
-        min_log_sizes,
+        Sizes::Floors(&floors),
         ProofTranscriptGeneration::Current,
     )?;
     Ok(proof)
@@ -80,7 +92,7 @@ pub fn prove_canonical_format(
 pub fn program_commitment_for_profile(
     side_note: &SideNote,
     log_sizes: &[u32],
-) -> Option<crate::program_id::ProgramCommitment> {
+) -> Option<crate::commitment::ProgramCommitment> {
     program_commitment_for_profile_format(side_note, log_sizes, &crate::format::LEGACY_SEGMENT)
 }
 
@@ -90,24 +102,26 @@ pub fn program_commitment_for_profile_format(
     side_note: &SideNote,
     log_sizes: &[u32],
     format: &'static Format,
-) -> Option<crate::program_id::ProgramCommitment> {
+) -> Option<crate::commitment::ProgramCommitment> {
     install_thread_pool();
     let target = Target::of(format).ok()?;
     crate::with_stack!(format.channel, Stack => {
-        program_commitment_on::<Stack>(side_note, log_sizes, target)
+        program_commitment_on::<Stack>(side_note, crate::all_components(), log_sizes, target)
     }, unbuilt => None)
 }
 
-fn program_commitment_on<MC: PcsStack>(
+/// The preprocessed root of `components` at `log_sizes` for the program
+/// `side_note` holds, as a proof under `target` commits it.
+pub(super) fn program_commitment_on<MC: PcsStack>(
     side_note: &SideNote,
+    components: &[&dyn crate::framework::MachineProverComponent],
     log_sizes: &[u32],
     target: Target,
-) -> Option<crate::program_id::ProgramCommitment>
+) -> Option<crate::commitment::ProgramCommitment>
 where
     SimdBackend: BackendForChannel<MC>,
 {
     use crate::pcs::ProofHash;
-    let components = crate::all_components();
     if log_sizes.len() != components.len() || log_sizes.contains(&0) {
         return None;
     }

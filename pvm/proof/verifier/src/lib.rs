@@ -35,6 +35,7 @@ use vos_pvm_proof::pcs::{PcsStack, ProofHash};
 // The proof type, the format registry `verify_standalone` admits a proof's
 // number from, and the number the default prover produces.
 pub use vos_pvm_proof::format;
+pub use vos_pvm_proof::program_id::{KernelProgram, LeafCircuits, ProgramId};
 pub use vos_pvm_proof::refine::{
     MAX_REFINE_CHILD_COMPONENTS, MAX_REFINE_HOST_BOUNDARIES, MAX_REFINE_PROOF_SLICES,
     REFINE_BUNDLE_FORMAT_VERSION, REFINE_CHILD_COMMITMENT_COUNT, RefineBundleVerification,
@@ -42,6 +43,7 @@ pub use vos_pvm_proof::refine::{
     refine_arguments_commitment, refine_bundle_cardinality_is_valid, refine_bundle_commitment,
     refine_bundle_execution_commitment, refine_bundle_terminal_public_io, refine_program_id,
 };
+pub use vos_pvm_proof::shape::{KernelShape, SegmentClass};
 pub use vos_pvm_proof::{PROOF_FORMAT_VERSION, Proof};
 // PcsPolicy floor — see SECURITY.md "Proof shape". `check_min_security` /
 // `conjectured_security_bits` / `MIN_CONJECTURED_SECURITY_BITS` are the
@@ -944,4 +946,64 @@ pub fn verify_chain_standalone_allowlist(
         verify_standalone_with_options(proof.clone(), actual, max_log_size, policy)?;
     }
     Ok(proofs[proofs.len() - 1].final_state.memory_root)
+}
+
+/// Verify a segment of a kernel's run against its program, the preimage of
+/// its program id ([`vos_pvm_proof::program_id`]): its format, its chips
+/// exactly the shape's, more or fewer refused, its log sizes exactly one
+/// class's, then [`verify_standalone`] against that class's preprocessed
+/// root. The shape is checked before any cryptographic work, so a proof of
+/// another shape costs its structure alone. Returns the segment's class.
+pub fn verify_kernel_segment(
+    proof: Proof,
+    program: &KernelProgram,
+) -> Result<usize, VerificationError> {
+    program
+        .check()
+        .map_err(VerificationError::InvalidStructure)?;
+    if proof.format_version != program.format {
+        return Err(VerificationError::InvalidStructure(format!(
+            "the proof's format {} is not its kernel's, {}",
+            proof.format_version, program.format
+        )));
+    }
+    let class = program
+        .shape
+        .class_of(proof.component_mask, &proof.log_sizes)
+        .map_err(VerificationError::InvalidStructure)?;
+    verify_standalone(proof, program.preprocessed_roots[class])?;
+    Ok(class)
+}
+
+/// Verify a chain of a kernel's segments against its program: the first
+/// starts from its image root, each continues the one before, and each
+/// verifies with [`verify_kernel_segment`]. Returns the chain's final
+/// memory root.
+pub fn verify_kernel_chain(
+    proofs: &[Proof],
+    program: &KernelProgram,
+) -> Result<[u8; 32], VerificationError> {
+    let (Some(first), Some(last)) = (proofs.first(), proofs.last()) else {
+        return Err(VerificationError::InvalidStructure(
+            "verify_kernel_chain: empty proof chain".to_string(),
+        ));
+    };
+    if first.initial_state.memory_root != program.image_root {
+        return Err(VerificationError::InvalidStructure(
+            "verify_kernel_chain: the first segment does not start at the kernel's image root"
+                .to_string(),
+        ));
+    }
+    for window in proofs.windows(2) {
+        if window[0].final_state != window[1].initial_state {
+            return Err(VerificationError::InvalidStructure(format!(
+                "segment chain broken: final state at ts={} does not match next initial at ts={}",
+                window[0].final_state.timestamp, window[1].initial_state.timestamp,
+            )));
+        }
+    }
+    for proof in proofs {
+        verify_kernel_segment(proof.clone(), program)?;
+    }
+    Ok(last.final_state.memory_root)
 }

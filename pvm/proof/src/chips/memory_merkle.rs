@@ -279,6 +279,14 @@ impl BuiltInProverComponent for MemoryMerkleChip {
     const IS_PRODUCER: bool = false;
 
     fn generate_main_trace_immut(&self, side_note: &SideNote) -> FinalizedTrace {
+        self.generate_main_trace_immut_min(side_note, 0)
+    }
+
+    fn generate_main_trace_immut_min(
+        &self,
+        side_note: &SideNote,
+        min_log_size: u32,
+    ) -> FinalizedTrace {
         use crate::page_merkle::{Child, node_full_output};
 
         let empty = Vec::new();
@@ -286,7 +294,8 @@ impl BuiltInProverComponent for MemoryMerkleChip {
             Some(p) => &p.multiproof.merges,
             None => &empty,
         };
-        let log_size = crate::trace::utils::ceil_log2_at_least_lanes(merges.len().max(1));
+        let log_size =
+            crate::trace::utils::ceil_log2_at_least_lanes(merges.len().max(1)).max(min_log_size);
         let mut trace = TraceBuilder::<Column>::new(log_size);
 
         for (row, node) in merges.iter().enumerate() {

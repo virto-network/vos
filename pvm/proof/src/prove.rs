@@ -38,6 +38,7 @@ mod canonical;
 #[cfg(feature = "debug-internals")]
 mod debug;
 mod profile;
+mod shaped;
 
 pub use canonical::{
     NaturalFloors, canonical_profile_for, canonical_profile_for_bounds,
@@ -51,6 +52,7 @@ pub use debug::{
     debug_claimed_sums_streaming,
 };
 pub use profile::ProveProfile;
+pub use shaped::{KernelSegment, program_commitment_for_shape, prove_kernel, prove_shaped};
 
 /// Why a proof was not produced.
 #[derive(Debug)]
@@ -63,6 +65,17 @@ pub enum ProvingError {
     /// A sparse memory image without its program's layout: its proof would
     /// carry an identity with every page writable.
     NoMemoryLayout,
+    /// Chip `chip` (a [`chip_idx`](crate::chip_idx)) takes log size
+    /// `log_size`, not the `pinned` one its shape gives it: its rows need
+    /// more, or it is a fixed size other than the shape's.
+    Shape {
+        chip: usize,
+        log_size: u32,
+        pinned: u32,
+    },
+    /// The shape names a chip outside the segment AIR, has a log size more
+    /// or fewer than its chips, or lacks the class named.
+    MalformedShape,
 }
 
 impl ProvingError {
@@ -86,6 +99,15 @@ impl core::fmt::Display for ProvingError {
             Self::NoMemoryLayout => {
                 formatter.write_str("a sparse memory image without its program's layout")
             }
+            Self::Shape {
+                chip,
+                log_size,
+                pinned,
+            } => write!(
+                formatter,
+                "chip {chip} takes log size {log_size}, its shape {pinned}"
+            ),
+            Self::MalformedShape => formatter.write_str("the shape is not one of the segment AIR"),
         }
     }
 }
@@ -453,9 +475,27 @@ fn prove_impl_with_components(
         components,
         component_mask,
         None,
-        min_log_sizes,
+        Sizes::Floors(min_log_sizes),
         ProofTranscriptGeneration::Current,
     )
+}
+
+/// The log sizes a proof's chips take: at least floors (none: natural
+/// sizes), or exactly a shape's.
+#[derive(Clone, Copy)]
+pub(crate) enum Sizes<'a> {
+    Floors(&'a [u32]),
+    Pinned(&'a [u32]),
+}
+
+impl<'a> Sizes<'a> {
+    pub(crate) const NATURAL: Sizes<'static> = Sizes::Floors(&[]);
+
+    fn floors(self) -> &'a [u32] {
+        match self {
+            Self::Floors(sizes) | Self::Pinned(sizes) => sizes,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -692,7 +732,7 @@ pub fn prove_with_boundary_override(
         components,
         component_mask,
         Some((initial_state, final_state)),
-        &[],
+        Sizes::NATURAL,
         ProofTranscriptGeneration::Current,
     )?;
     Ok(proof)
@@ -717,7 +757,7 @@ pub fn prove_pre_config_relabel_for_test(side_note: &mut SideNote) -> Result<Pro
         components,
         component_mask,
         None,
-        &[],
+        Sizes::NATURAL,
         ProofTranscriptGeneration::PreConfigRelabel,
     )?;
     Ok(proof)
@@ -731,7 +771,7 @@ fn prove_impl_with_components_overridden(
     components: &[&dyn crate::framework::MachineProverComponent],
     component_mask: u32,
     boundary_override: Option<(SegmentState, SegmentState)>,
-    min_log_sizes: &[u32],
+    sizes: Sizes<'_>,
     transcript_generation: ProofTranscriptGeneration,
 ) -> Result<(Proof, ProveProfile), ProvingError> {
     crate::with_stack!(target.format.channel, Stack => prove_on::<Stack>(
@@ -741,7 +781,7 @@ fn prove_impl_with_components_overridden(
         components,
         component_mask,
         boundary_override,
-        min_log_sizes,
+        sizes,
         transcript_generation,
     ), unbuilt => Err(ProvingError::FormatNotAdmitted(target.format.number)))
 }
@@ -754,7 +794,7 @@ fn prove_on<MC: PcsStack>(
     components: &[&dyn crate::framework::MachineProverComponent],
     component_mask: u32,
     boundary_override: Option<(SegmentState, SegmentState)>,
-    min_log_sizes: &[u32],
+    sizes: Sizes<'_>,
     transcript_generation: ProofTranscriptGeneration,
 ) -> Result<(Proof, ProveProfile), ProvingError>
 where
@@ -804,8 +844,25 @@ where
     // below.  Measured saving on a log17 curve-arithmetic workload (MOBILE):
     // ~130 ms → ~70 ms of trace_gen.
     let t = Instant::now();
-    let traces = generate_component_traces(side_note, components, min_log_sizes);
+    let traces = generate_component_traces(side_note, components, sizes.floors());
     let log_sizes: Vec<u32> = traces.iter().map(ComponentTrace::log_size).collect();
+    if let Sizes::Pinned(pinned) = sizes
+        && let Some((position, (&log_size, &pinned))) = log_sizes
+            .iter()
+            .zip(pinned)
+            .enumerate()
+            .find(|(_, (log_size, pinned))| log_size != pinned)
+    {
+        let chip = (0..crate::chip_idx::COUNT)
+            .filter(|chip| component_mask & 1 << chip != 0)
+            .nth(position)
+            .unwrap_or(position);
+        return Err(ProvingError::Shape {
+            chip,
+            log_size,
+            pinned,
+        });
+    }
     let trace_gen = t.elapsed();
 
     let max_constraint_log_degree_bound = components

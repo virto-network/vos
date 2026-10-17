@@ -53,10 +53,19 @@ pub enum KernelTraceError {
     Unread { read: usize, input: usize },
 }
 
-/// Run kernel `blob` with `gas` on `input`, its witness input, as the
-/// agent runs it: the standard layout with no arguments, φ0 the halt
-/// address, φ1 the stack's top, φ7 the argument window and φ8 0.
-pub fn trace_kernel(blob: &[u8], input: &[u8], gas: u64) -> Result<KernelTrace, KernelTraceError> {
+/// Kernel `blob` loaded as the agent loads it, with `gas`: its machine at
+/// its first step, its initial memory, and its layout's permissions.
+fn load(
+    blob: &[u8],
+    gas: u64,
+) -> Result<
+    (
+        Interpreter,
+        SparseMemoryImage,
+        crate::chips::memory_page::MemoryLayout,
+    ),
+    KernelTraceError,
+> {
     let program = vos_pvm::spi::parse_standard_program(blob).ok_or(KernelTraceError::Program)?;
     let layout = program.layout(&[]).ok_or(KernelTraceError::Program)?;
     let mut memory = Memory::sparse(1 << 32);
@@ -97,6 +106,25 @@ pub fn trace_kernel(blob: &[u8], input: &[u8], gas: u64) -> Result<KernelTrace, 
         memory,
         gas,
     );
+    Ok((machine, image, permissions))
+}
+
+/// Kernel `blob`'s program as a proof sees it before any run: its code,
+/// jump table, initial memory and layout, and no step. What its
+/// preprocessed roots are computed from.
+pub fn kernel_side_note(blob: &[u8]) -> Result<SideNote, KernelTraceError> {
+    let (machine, image, permissions) = load(blob, 0)?;
+    Ok(TracingPvm::new(machine)
+        .into_side_note()
+        .with_sparse_memory(image)
+        .with_memory_layout(permissions))
+}
+
+/// Run kernel `blob` with `gas` on `input`, its witness input, as the
+/// agent runs it: the standard layout with no arguments, φ0 the halt
+/// address, φ1 the stack's top, φ7 the argument window and φ8 0.
+pub fn trace_kernel(blob: &[u8], input: &[u8], gas: u64) -> Result<KernelTrace, KernelTraceError> {
+    let (machine, image, permissions) = load(blob, gas)?;
     let mut tracer = TracingPvm::new(machine)
         .with_witness_input(input.to_vec())
         .ok_or(KernelTraceError::Input)?;

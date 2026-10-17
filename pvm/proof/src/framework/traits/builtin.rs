@@ -84,20 +84,20 @@ pub trait BuiltInProverComponent: BuiltInComponent {
         unimplemented!("non-producer chip must override generate_main_trace_immut")
     }
 
-    /// Canonical-shape proving (federation wire-through): like
-    /// `generate_main_trace`, but pads the main trace to at least
-    /// `min_log_size` rows (`TraceBuilder::new(natural.max(min_log_size))`)
-    /// so the program commitment is witness-independent.  The default
-    /// ignores the floor (natural size); only the canonical *forcing set* —
-    /// the variable preprocessed-bearing chips whose `log_size` must be
-    /// pinned for ONE stable commitment across a heterogeneous segment
-    /// chain — override it.  Padding rows are `is_real = 0` and inert, so a
-    /// forced larger trace proves the identical statement; a forcing-set
-    /// chip whose `generate_preprocessed_trace` re-derives its own
-    /// `log_size` from `side_note` must switch to the passed (forced)
-    /// `log_size` param so its preprocessed trace tracks the forced main
-    /// height.  Producers override this; consumers override
-    /// `generate_main_trace_immut_min`.
+    /// Like `generate_main_trace`, but pads the main trace to at least
+    /// `min_log_size` rows (`TraceBuilder::new(natural.max(min_log_size))`).
+    /// The default ignores the floor (natural size): it is the size of a
+    /// fixed table, or of the program's code. Every chip whose rows a run
+    /// fills overrides it, so a kernel's shape pins every log size; among
+    /// them the canonical *forcing set*
+    /// ([`chip_idx::FORCING`](crate::chip_idx::FORCING)), the variable
+    /// preprocessed-bearing chips whose `log_size` the program commitment
+    /// depends on.  Padding rows are `is_real = 0` and inert, so a forced
+    /// larger trace proves the identical statement; a forcing-set chip whose
+    /// `generate_preprocessed_trace` re-derives its own `log_size` from
+    /// `side_note` must switch to the passed (forced) `log_size` param so
+    /// its preprocessed trace tracks the forced main height.  Producers
+    /// override this; consumers override `generate_main_trace_immut_min`.
     fn generate_main_trace_min(
         &self,
         side_note: &mut SideNote,

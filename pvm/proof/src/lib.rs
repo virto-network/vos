@@ -156,7 +156,9 @@ pub mod trace;
 pub mod format;
 pub mod pcs;
 pub mod poseidon2;
+pub mod program_id;
 pub mod security;
+pub mod shape;
 
 // The page-hash spec constants + tag chaining states are needed by the new
 // memory-Merkle chips' `add_constraints` (verifier-side, `no_std`); the
@@ -169,9 +171,9 @@ pub mod side_note;
 #[cfg(feature = "prover")]
 pub mod bench_helpers;
 #[cfg(feature = "prover")]
-pub mod kernel;
+mod commitment;
 #[cfg(feature = "prover")]
-mod program_id;
+pub mod kernel;
 #[cfg(feature = "prover")]
 mod prove;
 #[cfg(feature = "prover")]
@@ -248,6 +250,35 @@ pub mod chip_idx {
     /// Total entries expected in `BASE_COMPONENTS`. Trailing const-time
     /// assertion in `lib.rs` checks this against the actual array length.
     pub const COUNT: usize = BITWISE_AND_BYTE + 1;
+
+    /// Every chip, as a component mask.
+    pub const ALL: u32 = ((1u64 << COUNT) - 1) as u32;
+
+    /// The chips a trace may leave out: each is active only when its
+    /// opcodes or its precompile occur. A row needing one makes a request
+    /// that only the chip answers, its multiplicity a flag the program's
+    /// committed code fixes, so a proof without the chip balances only if
+    /// no row needs it.
+    pub const OPTIONAL: u32 = 1 << BLAKE2B
+        | 1 << JUMP_TABLE
+        | 1 << WITNESS_INPUT
+        | 1 << POPCOUNT
+        | 1 << BITCOUNT
+        | 1 << MUL
+        | 1 << BITWISE
+        | 1 << COMPARE
+        | 1 << DIVREM;
+
+    /// The chips every proof holds: the CPU, the memory and register
+    /// ledgers and their boundaries, the program's memory and boundary, the
+    /// page Merkle chips and the fixed tables. A kernel's shape without one
+    /// is refused.
+    pub const ALWAYS: u32 = ALL & !OPTIONAL;
+
+    /// The canonical forcing set: the chips whose log size the program
+    /// commitment depends on and a run's rows vary, padded to a profile's
+    /// floors by canonical proving.
+    pub const FORCING: u32 = 1 << BLAKE2B | 1 << BLAKE2B_BOUNDARY | 1 << MEMORY_PAGE;
 }
 
 #[cfg(feature = "prover")]
@@ -363,7 +394,6 @@ pub fn active_components(
 /// direct `(opcode, imm)` matching for the blake2b ECALL.
 #[cfg(feature = "prover")]
 fn activity_from_steps(side_note: &side_note::SideNote) -> ChipActivity {
-    use crate::chips::cpu::classify::classify_opcode as classify;
     use crate::core::ecall::{ECALL_BLAKE2B_COMPRESS, ECALL_WITNESS_INPUT};
     let mut a = ChipActivity::default();
     for step in &side_note.steps {
@@ -381,46 +411,7 @@ fn activity_from_steps(side_note: &side_note::SideNote) -> ChipActivity {
         if step.witness.is_some() {
             a.witness_input = true;
         }
-        let f = classify(step.opcode);
-        if f.is_jump_ind || f.is_load_imm_jump_ind {
-            a.jump_table = true;
-        }
-        if f.is_count_set_bits {
-            a.popcount = true;
-        }
-        if f.is_lzb || f.is_tzb {
-            a.bitcount = true;
-        }
-        if f.is_mul
-            || f.is_mul_upper_uu
-            || f.is_mul_upper_su
-            || f.is_mul_upper_ss
-            || f.is_rotate_l64
-            || f.is_rotate_r64
-            || f.is_rotate_l32
-            || f.is_rotate_r32
-        {
-            a.mul = true;
-        }
-        if f.is_and || f.is_or || f.is_xor || f.is_and_inv || f.is_or_inv || f.is_xnor {
-            a.bitwise = true;
-        }
-        // Compare = SetLt*/Cmov*/Min/Max + branches.
-        if f.is_set_lt_u
-            || f.is_set_lt_s
-            || f.is_cmov_iz
-            || f.is_cmov_nz
-            || f.is_min_s
-            || f.is_min_u
-            || f.is_max_s
-            || f.is_max_u
-            || f.is_branch
-        {
-            a.compare = true;
-        }
-        if f.is_div_rem {
-            a.divrem = true;
-        }
+        a.opcode(step.opcode);
     }
     a
 }
@@ -441,11 +432,45 @@ struct ChipActivity {
 
 #[cfg(feature = "prover")]
 impl ChipActivity {
+    /// Mark the chips a step of opcode `op` uses.
+    fn opcode(&mut self, op: crate::core::opcode::Opcode) {
+        let f = crate::chips::cpu::classify::classify_opcode(op);
+        self.jump_table |= f.is_jump_ind || f.is_load_imm_jump_ind;
+        self.popcount |= f.is_count_set_bits;
+        self.bitcount |= f.is_lzb || f.is_tzb;
+        self.mul |= f.is_mul
+            || f.is_mul_upper_uu
+            || f.is_mul_upper_su
+            || f.is_mul_upper_ss
+            || f.is_rotate_l64
+            || f.is_rotate_r64
+            || f.is_rotate_l32
+            || f.is_rotate_r32;
+        self.bitwise |= f.is_and || f.is_or || f.is_xor || f.is_and_inv || f.is_or_inv || f.is_xnor;
+        // Compare = SetLt*/Cmov*/Min/Max + branches.
+        self.compare |= f.is_set_lt_u
+            || f.is_set_lt_s
+            || f.is_cmov_iz
+            || f.is_cmov_nz
+            || f.is_min_s
+            || f.is_min_u
+            || f.is_max_s
+            || f.is_max_u
+            || f.is_branch;
+        self.divrem |= f.is_div_rem;
+    }
+
+    /// The component mask of the active chips.
+    fn mask(&self) -> u32 {
+        (0..chip_idx::COUNT)
+            .filter(|&index| self.is_active(index))
+            .fold(0, |mask, index| mask | 1 << index)
+    }
+
     fn is_active(&self, idx: usize) -> bool {
         // Indices are pinned by `chip_idx` (see lib.rs `mod chip_idx`).
-        // Always-active chips fall through to the default arm — only
-        // gated chips (= those that depend on side-note evidence to
-        // contribute a non-zero claimed_sum) need an explicit arm.
+        // Always-active chips fall through to the default arm — only the
+        // optional chips (`chip_idx::OPTIONAL`) need an explicit arm.
         match idx {
             chip_idx::BLAKE2B => self.blake2b,
             chip_idx::JUMP_TABLE => self.jump_table,
@@ -464,16 +489,23 @@ impl ChipActivity {
 /// Bitmask of active chips (bit i ⇔ BASE_COMPONENTS[i] is
 /// included).  Embedded in `Proof::component_mask` so the standalone
 /// verifier can reconstruct the active set without a SideNote.
+/// The chips every proof holds are among them: the least set a segment of
+/// the trace proves over.
+#[doc(hidden)]
 #[cfg(feature = "prover")]
-pub(crate) fn active_component_mask(side_note: &side_note::SideNote) -> u32 {
-    let a = activity_from_steps(side_note);
-    let mut mask = 0u32;
-    for i in 0..BASE_COMPONENTS.len() {
-        if a.is_active(i) {
-            mask |= 1 << i;
-        }
-    }
-    mask
+pub fn active_component_mask(side_note: &side_note::SideNote) -> u32 {
+    activity_from_steps(side_note).mask()
+}
+
+/// The chips a step of opcode `op` activates, the chips every proof holds
+/// among them: what a kernel's shape takes from each instruction of its
+/// code.
+#[doc(hidden)]
+#[cfg(feature = "prover")]
+pub fn opcode_component_mask(op: core::opcode::Opcode) -> u32 {
+    let mut a = ChipActivity::default();
+    a.opcode(op);
+    a.mask()
 }
 
 /// Verifier-side mirror of `active_components`, returning the
@@ -535,10 +567,10 @@ pub use prove::{prove_pre_config_relabel_for_test, prove_with_boundary_override}
 // forcing profile, `prove_canonical` proves each window to one shape.
 #[cfg(feature = "prover")]
 pub use prove::{
-    ProvingError, canonical_profile_for, canonical_profile_for_bounds,
-    program_commitment_for_profile, program_commitment_for_profile_format, prove, prove_canonical,
-    prove_canonical_format, prove_chain, prove_chain_format, prove_format, prove_mobile,
-    prove_with_config,
+    KernelSegment, ProvingError, canonical_profile_for, canonical_profile_for_bounds,
+    program_commitment_for_profile, program_commitment_for_profile_format,
+    program_commitment_for_shape, prove, prove_canonical, prove_canonical_format, prove_chain,
+    prove_chain_format, prove_format, prove_kernel, prove_mobile, prove_shaped, prove_with_config,
 };
 // Advanced / internal prove surface: the compact-trace floor variant, the
 // profiling variants, the thread-pool installer, and the explicit-component
@@ -596,4 +628,4 @@ pub mod harness {
     }
 }
 #[cfg(feature = "prover")]
-pub use program_id::{ProgramCommitment, program_commitment_hex, program_commitment_of_proof};
+pub use commitment::{ProgramCommitment, program_commitment_hex, program_commitment_of_proof};

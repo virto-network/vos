@@ -159,11 +159,19 @@ impl BuiltInProverComponent for CompareChip {
     const IS_PRODUCER: bool = false;
 
     fn generate_main_trace_immut(&self, side_note: &SideNote) -> FinalizedTrace {
+        self.generate_main_trace_immut_min(side_note, 0)
+    }
+
+    fn generate_main_trace_immut_min(
+        &self,
+        side_note: &SideNote,
+        min_log_size: u32,
+    ) -> FinalizedTrace {
         let entries = &side_note.compare_entries;
         const MIN_LOG_SIZE: u32 = 5;
 
         if entries.is_empty() {
-            let log_size = LOG_N_LANES.max(MIN_LOG_SIZE);
+            let log_size = LOG_N_LANES.max(MIN_LOG_SIZE).max(min_log_size);
             let mut trace = TraceBuilder::<Column>::new(log_size);
             for row in 0..trace.num_rows() {
                 trace.fill_columns(row, true, Column::IsPadding);
@@ -171,8 +179,9 @@ impl BuiltInProverComponent for CompareChip {
             return trace.finalize_bit_reversed();
         }
 
-        let log_size =
-            crate::trace::utils::ceil_log2_at_least_lanes(entries.len()).max(MIN_LOG_SIZE);
+        let log_size = crate::trace::utils::ceil_log2_at_least_lanes(entries.len())
+            .max(MIN_LOG_SIZE)
+            .max(min_log_size);
         let mut trace = TraceBuilder::<Column>::new(log_size);
         let num_rows = trace.num_rows();
 

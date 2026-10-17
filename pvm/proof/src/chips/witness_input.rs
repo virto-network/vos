@@ -262,9 +262,18 @@ fn byte_rows(side_note: &SideNote) -> Vec<ByteRow> {
 #[cfg(feature = "prover")]
 impl BuiltInProverComponent for WitnessInputChip {
     fn generate_main_trace(&self, side_note: &mut SideNote) -> FinalizedTrace {
+        self.generate_main_trace_min(side_note, 0)
+    }
+
+    fn generate_main_trace_min(
+        &self,
+        side_note: &mut SideNote,
+        min_log_size: u32,
+    ) -> FinalizedTrace {
         let rows = byte_rows(side_note);
-        let log_size =
-            crate::trace::utils::ceil_log2_at_least_lanes(rows.len().max(1)).max(LOG_N_LANES);
+        let log_size = crate::trace::utils::ceil_log2_at_least_lanes(rows.len().max(1))
+            .max(LOG_N_LANES)
+            .max(min_log_size);
         let mut trace = TraceBuilder::<Column>::new(log_size);
         for (row, byte) in rows.iter().enumerate() {
             let last = byte.left == 1;
