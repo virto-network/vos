@@ -258,6 +258,15 @@ pub fn verify_settlement_proof(bytes: &[u8]) -> Result<(), SettlementError> {
             VerificationError::InvalidStructure("fewer than two commitments".into()),
         ));
     }
+    if !vos_pvm_proof::proof::stark_fields_are_canonical(&proof, |hash: &P2Hash| {
+        hash.0
+            .iter()
+            .all(|limb| limb.0 < stwo::core::fields::m31::P)
+    }) {
+        return Err(SettlementError::Rejected(
+            VerificationError::InvalidStructure("a noncanonical M31 limb".into()),
+        ));
+    }
     let config = mobile_config();
     let component = FrameworkComponent::new(
         &mut TraceLocationAllocator::default(),
@@ -382,6 +391,7 @@ mod pvm_atomic_shim {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use stwo::core::pcs::quotients::CommitmentSchemeProof;
 
     /// The channel copy draws what the prover's channel draws, after the same
     /// u64s, u32s, felts, roots and PoW nonces: values that collide under a
@@ -443,5 +453,63 @@ mod tests {
         assert_eq!(copy.draw_secure_felts(3), theirs.draw_secure_felts(3));
         assert_eq!(copy.draw_u32s(), theirs.draw_u32s());
         assert_eq!(copy.draw_secure_felt(), theirs.draw_secure_felt());
+    }
+
+    /// `limb` raised by the modulus: the same residue, no longer canonical.
+    fn raised(limb: BaseField) -> BaseField {
+        BaseField::from_u32_unchecked(limb.0 + stwo::core::fields::m31::P)
+    }
+
+    fn raised_secure(value: SecureField) -> SecureField {
+        let mut limbs = value.to_m31_array();
+        limbs[0] = raised(limbs[0]);
+        SecureField::from_m31_array(limbs)
+    }
+
+    /// The honest fixture re-encoded with one limb raised by the modulus, its
+    /// residue unchanged: a queried value, a sampled value, a FRI witness and
+    /// a Merkle witness hash. Each is refused.
+    #[test]
+    fn a_noncanonical_limb_is_refused() {
+        const FIXTURE: &[u8] = include_bytes!("../fixtures/bool_proof.postcard");
+        verify_settlement_proof(FIXTURE).expect("the honest fixture verifies");
+        type Edit = fn(&mut CommitmentSchemeProof<P2MerkleHasher>);
+        let edits: [(&str, Edit); 4] = [
+            ("queried value", |proof| {
+                let limb = proof.queried_values.iter_mut().flatten().flatten().next();
+                let limb = limb.expect("a queried value");
+                *limb = raised(*limb);
+            }),
+            ("sampled value", |proof| {
+                let value = proof.sampled_values.iter_mut().flatten().flatten().next();
+                let value = value.expect("a sampled value");
+                *value = raised_secure(*value);
+            }),
+            ("FRI witness", |proof| {
+                let value = proof.fri_proof.first_layer.fri_witness.first_mut();
+                let value = value.expect("a FRI witness");
+                *value = raised_secure(*value);
+            }),
+            ("Merkle witness hash", |proof| {
+                let mut hashes = proof.decommitments.iter_mut();
+                let hash = hashes
+                    .find_map(|decommitment| decommitment.hash_witness.first_mut())
+                    .expect("a Merkle witness hash");
+                hash.0[0] = raised(hash.0[0]);
+            }),
+        ];
+        for (site, edit) in edits {
+            let mut proof: StarkProof<P2MerkleHasher> = postcard::from_bytes(FIXTURE).unwrap();
+            edit(&mut proof.0);
+            let bytes = postcard::to_allocvec(&proof).unwrap();
+            assert!(
+                matches!(
+                    verify_settlement_proof(&bytes),
+                    Err(SettlementError::Rejected(VerificationError::InvalidStructure(message)))
+                        if message.contains("noncanonical")
+                ),
+                "a noncanonical {site} limb was not refused"
+            );
+        }
     }
 }

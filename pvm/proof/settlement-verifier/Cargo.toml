@@ -36,17 +36,16 @@ stwo-constraint-framework = { git = "https://github.com/olanod/stwo", rev = "bbf
 num-traits = { version = "0.2", default-features = false }
 # The Poseidon2-M31 permutation and its modes, shared with the prover.
 vos-poseidon2 = { path = "../poseidon2" }
+# The segment verifier's check that a proof's limbs are canonical, and, in the
+# tests, the prover's Poseidon2-M31 channel, which the channel copy here must
+# draw alike; verifier-only, so stwo stays without std, prover or parallel.
+vos-pvm-proof = { path = "..", default-features = false }
 # no_std + alloc wire format for the embedded settlement proof fixture (the same
 # format vos-pvm-proof's `settle_fixture` test serializes).
 postcard = { version = "1", default-features = false, features = ["alloc"] }
 # stwo's `vcs::hash::Hash` supertrait requires Serialize + Deserialize (proofs
 # serialize); serde+derive is no_std-friendly, so it is not a wasm/PVM blocker.
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
-
-[dev-dependencies]
-# The prover's Poseidon2-M31 channel, which the channel copy here must draw
-# alike; verifier-only, so stwo stays without std, prover or parallel.
-vos-pvm-proof = { path = "..", default-features = false }
 
 [profile.dev]
 panic = "abort"
