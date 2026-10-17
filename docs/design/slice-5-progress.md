@@ -628,3 +628,58 @@ ids (step 5.5's last section).
   election has time to end.
 
 **Gates:** `just check` on each commit, 995 tests at the last; the node suites at the end: cluster and processes in it, the faults process tests and the five-process fault suite.
+
+## 5.5b hardening: CPU
+
+The CPU, register and memory-permission holes of the AIR audit (G1, G2-1,
+G4-4, G4-5), each ported as a permanent gate, run first on the unfixed
+AIR (ACCEPTED), then fixed (REFUSED).
+
+### Page permissions: the design (G2-1)
+
+Today the AIR proves a run on an all-RW machine: a store to a read-only
+page, or any access to an unmapped page, faults on the PVM but proves.
+A kernel's permissions are static (no host call changes them) and fixed by
+its layout, which `derive` gives it: the read-only data, the read-write
+data with its heap, and the stack, each a whole number of pages, the
+argument window (empty for a kernel), and nothing else mapped.
+
+The two candidates:
+
+- **(a) A permission in the page leaf**, and a `(page, perm)` relation
+  CpuChip consumes per memory row. It changes what an image root is (the
+  program crate's `image_root`, `page_merkle`, every recorded root), adds
+  per-row lookups to the widest chip, and leaves the BLAKE2b and witness
+  writes, which are not CpuChip's, unchecked.
+- **(b) The layout's regions as preprocessed constants**, each memory
+  access proving its address lies in a permitted region. Per CPU row that
+  is two 32-bit range comparisons, and the precompiles' accesses again.
+
+Chosen: **(b), checked per page and enforced per ledger row**, which is
+cheaper than either as stated and covers every producer:
+
+1. **The regions are preprocessed.** MemoryPageChip carries four regions
+   as constant preprocessed columns, in pages: read-only data and the
+   argument window (readable), read-write data with its heap and the
+   stack (writable). They enter the preprocessed commitment, which is the
+   program's identity, so a proof's permissions are its program id's. A
+   kernel's come from its layout (`trace_kernel`); a side note with no
+   layout (the test machines) has one writable region over all pages.
+2. **A listed page claims its permission and proves it.** Each page row
+   selects at most one region and proves `lo ≤ page < hi` by two 20-bit
+   decompositions. Claiming none (unmapped) needs no proof: it only
+   forbids. A page claimed readable lies in a readable or writable region,
+   one claimed writable in a writable region.
+3. **The ledger carries the permission through each address.** The page's
+   ts=0 write, which starts every address group of the ledger, carries its
+   permission in the tuple's last field (`is_closing + 2·perm`; every other
+   producer emits 0 there, and no other producer emits ts = 0). MemoryChip
+   holds `Readable`/`Writable` constant along the group and enforces on
+   every row after its start: a write needs `Writable`; on an unreadable
+   page the start is followed directly by the closing read.
+
+So every CPU load or store, BLAKE2b read or write and witness-input write
+lands in a group whose page proved the permission it needs, with no new
+lookup, no new relation, and no change to the image root. Cost: on
+MemoryPageChip 8 preprocessed and 46 main columns (4 selectors, the two
+bounds, 40 bits), on MemoryChip 4 main columns, no interaction columns.
