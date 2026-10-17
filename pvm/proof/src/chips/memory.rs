@@ -437,7 +437,7 @@ pub fn analyze_dedup(side_note: &crate::side_note::SideNote) -> MemoryDedupRepor
     for op in &side_note.blake2b_mem_ops {
         for (i, &b) in op.h_bytes.iter().enumerate() {
             entries.push(MemEntry {
-                address: op.h_ptr + i as u32,
+                address: op.h_ptr.wrapping_add(i as u32),
                 value: b,
                 timestamp: op.ts,
                 is_write: false,
@@ -445,7 +445,7 @@ pub fn analyze_dedup(side_note: &crate::side_note::SideNote) -> MemoryDedupRepor
         }
         for (i, &b) in op.m_bytes.iter().enumerate() {
             entries.push(MemEntry {
-                address: op.m_ptr + i as u32,
+                address: op.m_ptr.wrapping_add(i as u32),
                 value: b,
                 timestamp: op.ts,
                 is_write: false,
@@ -453,7 +453,7 @@ pub fn analyze_dedup(side_note: &crate::side_note::SideNote) -> MemoryDedupRepor
         }
         for (i, &b) in op.out_bytes.iter().enumerate() {
             entries.push(MemEntry {
-                address: op.h_ptr + i as u32,
+                address: op.h_ptr.wrapping_add(i as u32),
                 value: b,
                 timestamp: op.ts,
                 is_write: true,
@@ -636,7 +636,7 @@ impl BuiltInProverComponent for MemoryChip {
         for op in &side_note.blake2b_mem_ops {
             for (i, &b) in op.h_bytes.iter().enumerate() {
                 entries.push(MemEntry {
-                    address: op.h_ptr + i as u32,
+                    address: op.h_ptr.wrapping_add(i as u32),
                     value: b,
                     timestamp: op.ts,
                     is_write: false,
@@ -644,7 +644,7 @@ impl BuiltInProverComponent for MemoryChip {
             }
             for (i, &b) in op.m_bytes.iter().enumerate() {
                 entries.push(MemEntry {
-                    address: op.m_ptr + i as u32,
+                    address: op.m_ptr.wrapping_add(i as u32),
                     value: b,
                     timestamp: op.ts,
                     is_write: false,
@@ -652,7 +652,7 @@ impl BuiltInProverComponent for MemoryChip {
             }
             for (i, &b) in op.out_bytes.iter().enumerate() {
                 entries.push(MemEntry {
-                    address: op.h_ptr + i as u32,
+                    address: op.h_ptr.wrapping_add(i as u32),
                     value: b,
                     timestamp: op.ts,
                     is_write: true,

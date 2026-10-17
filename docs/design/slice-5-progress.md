@@ -386,6 +386,53 @@ generic bignum chip replaces them.
   test-bench-proof` green; clippy clean on every feature set of `just
   clippy` that touches the prover.
 
+## 5.5b hardening: BLAKE
+
+The AIR audit's BLAKE2b group (G4) and the memory group's items on the
+BLAKE2b chip, the root boundary and the host verifier (G2). Each hole's
+forgery is a permanent gate test; each was run on the unfixed tree first.
+
+| hole | before | fix | gate test | after |
+|---|---|---|---|---|
+| G4-1 `IsReal` not held across a compression | ACCEPTED: a lone real row 95 writes a forged digest at a forged address and ts; a lone real row 0 consumes the call and drops the write | `IsReal` boolean, `ContinuityGate·(IsReal_next − IsReal) = 0` (`blake2b/mod.rs`, the IsReal anchor) | `blake2b_gate`: `a_lone_last_row_cannot_write`, `a_lone_first_row_cannot_drop_the_write` | REFUSED (continuity) |
+| G4-1, found here: the trailing partial block | ACCEPTED: block 0 padding, call 0 placed in the 64-row tail, which has no row 95; the wrap to row 0 kept satisfied | `IsTail·IsReal = 0`, `IsTail` preprocessed (`r ≥ 96·⌊N/96⌋`) | `a_tail_block_cannot_consume_a_call` | REFUSED (`IsTail`) |
+| G4-6 `IsReal = 2` | ACCEPTED | the booleanity above | `is_real_two_is_refused` | REFUSED |
+| G4-2 / G2-3 write address pinned on row 0 only | ACCEPTED: row 95's `HWrAddrB2` moved 64 KiB | `HWrAddr` dropped; the writes use the `h` addresses, whose limb relations hold on every row (`blake2b/address.rs`) | `the_write_address_is_pinned_on_the_writing_row` | REFUSED (limb relation) |
+| G4-3 addresses mod p | ACCEPTED: `h_ptr + p` read and written | byte-carry addresses (`address.rs`): limb 0 `ptr0 + i − 256·c_i`, `c_i` boolean, Range256; limbs 1..3 the pointer's or `(ptr >> 8) + 1`'s, chosen by `c_i`; the increment's limbs Range256, carries boolean, no carry out of limb 3 | `an_address_aliased_by_p_is_refused`, `a_range_wrapping_2_32_is_unprovable`, `ranges_carrying_across_limbs_are_accepted` | REFUSED (carry booleanity) |
+| G4-8 dead code | — | `Blake2bStateLookupElements` and the main chip's `EmitMult` deleted | — | — |
+| G4-7 tracer | the flat path read zeros out of range and recorded the access | `handle_blake2b_ecall` serves through `vos_pvm::precompile::execute` on flat and sparse memory alike (refused ⇒ Panic); the ledger builder uses `wrapping_add` | — | — |
+| G2-4 root boundary `IsReal` | ACCEPTED (`IsReal = 2`) | `IsReal·(IsReal − 1) = 0` (`memory_root_boundary.rs`) | `memory_root_boundary_gate` | REFUSED |
+| G2-7 host verify gated on a side-note flag | ACCEPTED end to end: a proof made without the boundary mix, its final φ9 forged, verified against a side note with `closing_chip_active` cleared | the production path (`boundary_positions` known) always mixes the boundary states and checks the claimed sums, and refuses `initial_state.timestamp < 1` (`verify.rs`) | `host_verify_boundary_gate` | REFUSED |
+| G2-2 `IsPadding = 2` mints a write | closed by d418e727, untested; ACCEPTED with the booleanity removed (mutation run) | — | `memory_ledger_padding_gate` | REFUSED |
+
+- **Deviation from the auditor's G4-3 fix.** A full carry chain with
+  Range256 on all four limbs of 192 addresses is 768 lookups a row. Only
+  limb 0 needs its own carry; limbs 1..3 take one of two values, the
+  pointer's own limbs or those of `(ptr >> 8) + 1`, so one range-checked
+  increment per pointer covers them: 198 lookups. Every limb is still a
+  range-checked byte (or a pointer limb, which the CPU's call tuple
+  supplies), every identity is over small integers, so each address is
+  `ptr + i` exactly. G4-2's fix falls out: the write tuples read the `h`
+  addresses on row 95, where their relations hold.
+- **The width** [measured]: `Blake2bChip` is 44 preprocessed (+2), 1,744
+  main (−247) and 1,344 interaction (+396) columns, so the full shape is
+  7,707 columns (+151).
+- **Completeness:** a pointer within 256 bytes of 2^32 (`ptr ≥
+  0xFFFF_FF00`) has no satisfying increment even when its range does not
+  wrap; the standard layout maps nothing above `0xFFFF_0000`.
+- **Dependencies:** the addresses are canonical given canonical `HPtr`
+  and `MPtr` bytes, which the CPU call tuple carries (the CPU group's
+  register limbs).
+- **Not here:** G4-4 and G4-5 (the CPU's 0x400 path) and G2-1 (page
+  permissions) are track CPU's. The AIR changed, so the proof format
+  needs a bump; that is left to the merge of the three tracks.
+- **Gates** [measured, on this machine, under `systemd-run` at 14 GiB with
+  `nice -n 10`, three tracks in parallel]: `just test-proof` green, 478
+  tests (465 + the 13 new gates); `just test-bench-proof` green; `just
+  check` green (`tree_crash` failed once under the parallel load and passed
+  on rerun); clippy clean on every feature set of `just clippy` that
+  touches the prover.
+
 ## Step 5.7: the items carried from slice 4
 
 ### Per-target limits (the owner's decision)

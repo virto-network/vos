@@ -48,13 +48,10 @@ pub(super) struct GRow {
     pub out_and1: [u8; 64],
     pub out_and2: [u8; 64],
     // ── ECALL memory-binding witnesses, constant across the 96 rows of a
-    // compression; address columns only referenced at IsFirstOfCompression.
+    // compression.
     pub h_ptr: [u8; 4],
     pub m_ptr: [u8; 4],
     pub call_ts: [u8; 8],
-    pub h_rd_addr: [u8; 256],
-    pub m_rd_addr: [u8; 512],
-    pub h_wr_addr: [u8; 256],
 }
 
 /// Execute one G-function and capture all intermediate values.  `v_snapshot`
@@ -190,9 +187,6 @@ pub(super) fn g_traced(
         h_ptr: [0u8; 4],
         m_ptr: [0u8; 4],
         call_ts: [0u8; 8],
-        h_rd_addr: [0u8; 256],
-        m_rd_addr: [0u8; 512],
-        h_wr_addr: [0u8; 256],
     }
 }
 
