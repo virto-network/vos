@@ -17,7 +17,7 @@ use stwo::core::{
 use crate::security::SecurityShape;
 use stwo_constraint_framework::TraceLocationAllocator;
 
-pub use crate::lookups::{AllLookupElements, boundary_relation_challenges};
+pub use crate::lookups::{AllLookupElements, RelationChallenges, boundary_relation_challenges};
 use crate::pcs::FsChannel;
 
 use crate::BASE_COMPONENTS;
@@ -213,6 +213,7 @@ pub fn drive_chip_oods<E: stwo_constraint_framework::EvalAtRow>(
         cx::BITWISE => run(&BitwiseChip, log_size, lookup, eval),
         cx::COMPARE => run(&CompareChip, log_size, lookup, eval),
         cx::DIVREM => run(&DivRemChip, log_size, lookup, eval),
+        cx::BITWISE_AND_BYTE => run(&BitwiseAndByteChip, log_size, lookup, eval),
         _ => panic!("drive_chip_oods: invalid chip_idx {chip_idx}"),
     }
 }

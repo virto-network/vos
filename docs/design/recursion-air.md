@@ -47,7 +47,10 @@ native verifier, and the build of slice 5's M1.
 3. **The gate compiler is the recording evaluator plus a hash-consed DAG.**
    The window kernel's 22 chips, 4,223 constraints and 1,109 fractions compile
    to 26,812 QM31 gate rows [measured]; per-relation challenges, next-row masks,
-   paired and unpaired logup and intermediates need no special case.
+   paired and unpaired logup and intermediates need no special case. On the
+   hardened AIR (25 chips, 5,177 constraints) the built compiler (`vos-recair`'s
+   `compile`, slice 5's 5.9) emits 29,443 rows and 573 `α`-power rows, the
+   re-baselined count exactly (`R/count-hardened.log`) [measured].
 4. **A leaf verifying the window kernel's segment** (7,519 columns, blowup 4,
    39 queries) needs 55,307 Poseidon2, 96,324 QM31 and 42,549 DEEP rows
    [model]: the padded shape 2^16 / 2^17 / 2^16, **33.2M cells, 0.16× the
@@ -283,6 +286,25 @@ masking variant (c) applies unchanged (`R/spike2-masking.md` §3b).
   hardening added range checks and permission columns: the full shape is 25
   chips, 8,039 columns (185 + 4,882 + 2,964 + 8) [measured].
 
+**Measured, the hardened AIR** (`R/count-hardened.log`, the crate above re-run
+on vos-core for slice 5's 5.9): 25 chips, 8,039 columns, 9,047 samples, 5,177
+constraints, 1,464 fractions, 20 relations; **29,443 gate rows** (41,927
+unfused), 218 distinct constants. By chip: BLAKE2B 12,307, BLAKE2B_BOUNDARY
+5,341, MEMORY_PAGE 4,876, CPU 2,850, DIVREM 1,199, MUL 830, MEMORY_MERKLE 709,
+the other eighteen under 400 each. The window kernel's 23-chip shape: 8,024
+columns, 5,175 constraints, 29,420 rows.
+
+**Built** (`pvm/proof/recair/src/compile`, slice 5's 5.9): the pipeline above,
+emitting into the gate VM's `Context`. Its rows match the count chip by chip.
+Two things the count did not see:
+- **Stwo's `InfoEvaluator` cannot invert** (its counter's `inverse` is
+  unimplemented at the pin), so no component can invert a trace expression
+  today; the compiler does it in one row, tested on a synthetic component.
+- **Sixteen CPU columns and twelve next-row masks no constraint reads**
+  [measured]: `Gas` (8), `RegAWritten`, `ShiftOp`, one limb each of five
+  8-limb product-chain helpers, and the next row of `Timestamp` and `Pc`.
+  They cost the leaf their samples and nothing else; a test pins the list.
+
 **Equivalence tests, for every chip of the 25:**
 1. **constraint ≡ gate:** at random assignments to samples, preprocessed
    values, challenges and claimed sums, each recorded constraint
@@ -434,10 +456,9 @@ Inner parameters: blowup 4, 44 queries, PoW 20, interaction PoW 8, FRI fold
 step 1, log last-layer degree bound 0 (`proving.md` §4, format 32). The rows
 below were counted at 39 queries over the pre-hardening shape (7,519 columns,
 4,223 constraints). At 44 queries over the hardened shape (8,024 columns,
-about 5,160 constraints), the kernel leaf comes to about **64.8k / 111k /
-51k** rows [model, `count.log`'s terms scaled by the measured columns, samples
-and constraints]: still within the padded shape, with about 1% of `p2`'s rows
-to spare. The five more queries make a fold about 13% dearer [model]. Rows
+5,175 constraints), the kernel leaf comes to **64,824 / 105,417 / 51,172**
+rows [model, `R/count-hardened.log`, at the window kernel's class 1]: still
+within the padded shape, with 712 of `p2`'s rows (1.1%) to spare. The five more queries make a fold about 13% dearer [model]. Rows
 [model]; memory
 and time [projected] at 5.0–10.9 B per extended cell and 51–110M extended
 cells per second, the range of spike 4b's circuit-prover runs and spike 4a's

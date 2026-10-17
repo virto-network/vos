@@ -2253,3 +2253,177 @@ refactors, a commit each; none changes a constraint.
 - `pvm/proof/src/format.rs` and `proving.md` A.4: format 32's AIR, as
   above.
 - `node/host/tests/tree_crash.rs`: the fix above.
+
+## Step 5.9: the gate compiler
+
+`recursion-air.md` §10's step 2, on `vos-core` from `15f98b6e`.
+
+### The baseline first
+
+The spike's gate-count crate (`spikes/s5-recair/count`, `a2784b49`) re-run
+on the hardened AIR, ported in a scratch worktree and not committed: the 25
+chips in `chip_idx` order, the window kernel's class sizes from 5.8.0's
+run, format 31's parameters (44 queries, PoW 20, interaction PoW 8), and
+the recursion components from `vos-recair-air`. Its log is
+`research/slice-5/count-hardened.log`, the baseline for 5.9 and 5.11.
+[measured, the counts; model, the rows]
+- **The full shape:** 25 chips, 8,039 columns (185 + 4,882 + 2,964 + 8),
+  9,047 samples, 5,177 constraints, 1,464 fractions, 20 relations (tuple
+  sizes 612 in all); **29,443 gate rows** (41,927 unfused: 24,319 adds,
+  17,584 muls, 24 negations, no inverse), 218 constants, 573 `α`-power
+  rows. `count.log` had 26,812 rows over 7,519 columns and 4,223
+  constraints.
+- **By chip** (rows): BLAKE2B 12,307, BLAKE2B_BOUNDARY 5,341, MEMORY_PAGE
+  4,876, CPU 2,850, DIVREM 1,199, MUL 830, MEMORY_MERKLE 709, BITWISE 353,
+  MEMORY 202, REGISTER_MEMORY 191, COMPARE 141, WITNESS_INPUT 126,
+  MEMORY_ROOT_BOUNDARY 76, PROGRAM_MEMORY 48, PROGRAM_BOUNDARY 37,
+  REGISTER_MEMORY_CLOSING 26, REGISTER_MEMORY_BOUNDARY 19, JUMP_TABLE 19,
+  POWER_OF_TWO 18, BYTE_TO_BITS 18, BITWISE_LOOKUP 12, BITCOUNT 12,
+  BITWISE_AND_BYTE 12, POPCOUNT 11, RANGE_MULTIPLICITY_256 10.
+- **The window kernel's shape** (23 chips, class 1): 8,024 columns, 5,175
+  constraints, 29,420 rows.
+- **The kernel leaf, per term** (class 1, 44 queries; per query × 44, then
+  once): `p2` leaf hashes 1,006 (44,264), paths 84 (3,696), FRI 266
+  (11,704), channel 5,102; `qm31` query limb and bits 63, query point 84,
+  DEEP per point 108, DEEP off the `h8` runs 720, FRI folds 133 (2,772,
+  3,696, 4,752, 31,680, 5,852), then OODS 29,420, composition 5,175,
+  powers 573, logup 25, OODS point and check 54, DEEP sums 20,546, PoW 72;
+  `h8` 1,163 (51,172). **Total 64,824 / 105,417 / 51,172**: 2^16 / 2^17 /
+  2^16, `p2` 712 rows (1.1%) under 2^16. The plan's estimate was about
+  64.8k / 111k / 51k.
+- **The rest, re-counted:** the full 25-chip leaf 64,929 / 106,556 /
+  51,216; class 0's 63,634 / 107,747 / 50,820; with segment FRI fold step 3
+  57,936 / 112,809 / 51,172. A fold of two padded children 34,461 / 46,038
+  / 4,048 (53% / 35% / 6% of the shape), the fixed point at once; the wrap
+  17,232 / 23,045 / 2,024 (2^15 / 2^15 / 2^11), 85.2M gas with Blake2b-256
+  in software [model]. `p2` grew by 40 OODS rows (1,932) with 5.2's
+  reference arrangement.
+- **For 5.10's start:** `p2`'s headroom is 1.1%, under 5.8.0's 10%, so the
+  rule registers a segment format with fewer queries and more PoW.
+
+### The compiler (`pvm/proof/recair/src/compile`)
+
+- **`Recording`** drives a component's own `evaluate` through
+  `ExprEvaluator` (its constraints) and `InfoEvaluator` (its columns and
+  offsets, its preprocessed ids); `Recording::chip` goes through
+  `drive_chip_oods`.
+- **`compile`** lowers a shape's recordings into one hash-consed DAG
+  (`dag.rs`, from the spike's), resolving each name the recording uses:
+  - a column to the component's sample at that offset (`Input::Sample`),
+    so a next-row mask is one input an offset;
+  - a preprocessed id to the shape's column (`Input::Preprocessed`);
+  - `claimed_sum` to the component's (`Input::ClaimedSum`), `column_size` to
+    the constant `2^log_size`;
+  - `<R>_z` and `<R>_alpha1` to the relation's inputs, `_alpha0` to one,
+    `_alpha<i>` to a row `α^(i−1)·α`;
+  - an intermediate to its own lowering, once.
+  A name it cannot resolve, an ambiguous one, a power past the relation's
+  size, a column outside the mask and an inverse of zero are refused.
+- **The column numbering is checked, not assumed.** The recording numbers
+  the columns a component reads in one sequence; the compiler maps the
+  main columns first. It refuses a recorded column outside that map and an
+  interaction column no constraint reads, and with every interaction column
+  read the first one's number is in the map only if every main column came
+  before it (`Recording::column_key`'s docs).
+- **Rows** (`program.rs`): the spike's fusion, now emitted. Each reachable
+  operation is one `qm31` row, but an add or sub takes in a single-use
+  product (one at most), negation or M31 scaling of its operands, within
+  the gate's three operands; an M31 constant is a coefficient on `one`,
+  any other a `Context` constant; an inverse is `Context::inverse`'s row.
+  The relations' powers come first (`power_rows`).
+- **The output:** each constraint's value, as a wire (`Compiled::emit`
+  into a `Context`) or a value (`Compiled::evaluate`). `compose` folds them
+  as `PointEvaluationAccumulator` does: one `mul_add` a constraint, a
+  component's numerator alone or the shape's in order; times the vanishing
+  inverse it is the composition. A component's logup contribution is its
+  claimed sum, an input. 5.10 supplies the inputs, computes the vanishing
+  inverse and compares with the composition halves.
+- **No `h8`.** §1.5 and §4.6 use it for DEEP only: an OODS constraint is a
+  QM31 expression of QM31 samples, and `h8` reads M31 limbs of packed
+  wires.
+- **`vos-pvm-proof`:** `AllLookupElements::relation_challenges` gives each
+  drawn relation's name, `z` and `α` powers, read through its own `combine`
+  (`RelationChallenges`); `drive_chip_oods` reaches BITWISE_AND_BYTE, which
+  it missed (the spike's `6acdc7df`).
+
+### Tests (`pvm/proof/recair/tests/compiler.rs`, `just check`)
+
+§3's four, on all 25 chips at the class-1 sizes:
+1. **constraint ≡ gate:** at two random M31 points (through
+   `ExtExpr::assign`) and two random QM31 points (the recording evaluated as
+   `PointEvaluator` evaluates it), every constraint of every chip compiled
+   alone equals the recording's, evaluated and emitted into a `Context`.
+2. **gate ≡ verifier:**
+   - at random points, each chip's combination equals what Stwo's
+     `PointEvaluator` accumulates from the chip's own `add_constraints`;
+   - on real proofs, the format-31 fixture (18 chips) and a run proved over
+     all 25 (`prove_canonical_format`, 0.8–1.3 s): the compiled composition
+     equals the proof's (`reconstruct_oods_for_recursion`), in values and in
+     a `Context`; each chip's combination equals `PointEvaluator`'s on the
+     proof's samples; the claimed sums add to zero.
+3. **tamper:**
+   - at random points every input of every chip, a sample, a preprocessed
+     sample, a claimed sum or a challenge, moves its combination;
+   - on the real proofs every sampled input tampered keeps the compiled
+     combination the verifier's (checked natively on up to 64 a chip), and
+     each chip's running-sum sample tampered fails the shape's composition
+     check.
+4. **counts:** each chip's rows pinned, and the full shape's 29,443 and 573.
+
+Also:
+- **A mis-compiled gate is caught:** in six rows of every chip (every row
+  of the smaller ones), a coefficient flipped and a term dropped each fail
+  tests 1 and 2, the first through a `Context`. Test 4 pins sizes, not
+  coefficients, and test 3 moves samples, not gates.
+- **The compiled shape proves:** the full shape at a random point, with the
+  composition and the logup sum, is 35,219 `qm31` rows (29,443 + 573 powers
+  + 5,176 accumulation + the vanishing product + 24 sums + the reserved
+  two); its wiring built without values is the filled one's, and it proves
+  and verifies (0.36 s).
+- **A synthetic component** covers what the chips do not: an inverse of a
+  trace expression, a next-row mask, a preprocessed column, an
+  intermediate, a three-limb relation (`α²` a row), three fractions in
+  pairs and one a column.
+
+### Gates
+
+[measured, Intel Core Ultra 7 155H, load average 3–5]
+- **25 of 25 chips are equivalent** (tests 1–3 above).
+- **`just check`** green under `systemd-run` at 14 GiB, `nice -n 10`,
+  `CARGO_INCREMENTAL=0`, 8 jobs: 1,049 tests (1,040 at 5.8), the
+  compiler's 9 among them, 2.4–3.7 s on their own.
+- **The counts are the re-baselined log's exactly:** every chip 0% off,
+  29,443 in all. The compiler is the count's DAG and fusion, emitted. One
+  quirk of the spike's fusion, an M31 scaling after a product not taken in,
+  never occurs in our chips: allowing it changes no count.
+
+### Found
+
+- **Unread columns** (pinned by `every_sample_a_chip_reads_moves_its_combination`):
+  sixteen CPU main columns no constraint reads, `Gas` (8), `RegAWritten`,
+  `ShiftOp`, and one limb each of `PartNZTimesIndH`, `PartNZMsbTimesIndH`,
+  `PartNZMsbLoTimesIndH`, `MemByteActiveMonoH` and `ValRPartNZTimesIndH`;
+  and the next row of `Timestamp` and `Pc` (12 masks), which no constraint
+  reads. Trace generation fills them; nothing in the AIR depends on them,
+  so they are not a soundness gap, but each costs every leaf its samples
+  (28 of the shape's 9,047, plus 12 periodicity samples). `Gas` unproved
+  is the AIR's statement, not a bug of the compiler; whether to drop the
+  columns, or to constrain `Gas`, is the AIR's owners' call, at a format
+  bump.
+- **Samples a trace's selectors make inert:** on the full-shape run, 1,601
+  of about 9,000 sampled inputs are read only under selectors zero on the
+  whole trace (BLAKE2B 1,034 of 3,491 on a run without a compression), so
+  tampering them moves neither the compiled nor the native composition.
+  The random-point tamper is the test that every read sample reaches the
+  composition.
+- **Stwo's `InfoEvaluator` cannot invert:** `ArithmeticCounter::inverse` is
+  `todo!()` at the pin, so no component can invert a trace expression;
+  the synthetic test takes its reads from a twin without the inverse.
+
+### Outside the step's files
+
+- `pvm/proof/src/lookups/{mod,macros}.rs`, `framework_access.rs`: the
+  challenges accessor and BITWISE_AND_BYTE's arm.
+- `pvm/proof/recair/Cargo.toml`: postcard and vos-pvm for the tests.
+- `docs/design/recursion-air.md` §0, §3 and §5: the hardened counts and
+  what the compiler found.

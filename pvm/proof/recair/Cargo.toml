@@ -18,3 +18,7 @@ serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 bincode = "1"
+# The compiler's tests: a segment proof's OODS data, from the fixture and
+# from a run proved over every chip.
+postcard = { version = "1", features = ["alloc"] }
+vos-pvm = { workspace = true }

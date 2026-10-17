@@ -12,8 +12,11 @@
 //!   under format 32; a circuit is pinned by its hash.
 //! - [`gadgets`] are the Poseidon2 modes as the circuit uses them: the leaf
 //!   sponge, the Merkle node and the transcript.
+//! - [`compile`] turns a component's constraints into `qm31` rows that
+//!   evaluate them at the OODS point, as the native verifier does.
 
 pub mod circuit;
+pub mod compile;
 pub mod context;
 pub mod gadgets;
 pub mod prove;

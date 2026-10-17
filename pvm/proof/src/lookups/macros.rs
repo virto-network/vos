@@ -88,6 +88,13 @@ macro_rules! register_relation {
                     )*
                 ]
             }
+
+            /// The relation's name and challenges.
+            fn challenges(&self) -> $crate::lookups::RelationChallenges {
+                match self {
+                    $(Self::$name(inner) => $crate::lookups::RelationChallenges::of(&**inner),)*
+                }
+            }
         }
     };
 }

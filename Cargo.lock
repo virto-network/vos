@@ -2696,9 +2696,11 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "num-traits",
+ "postcard",
  "serde",
  "stwo",
  "stwo-constraint-framework",
+ "vos-pvm",
  "vos-pvm-poseidon2",
  "vos-pvm-proof",
  "vos-recair-air",

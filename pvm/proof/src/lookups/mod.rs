@@ -1,6 +1,10 @@
 use alloc::collections::BTreeMap;
 use core::any::TypeId;
 
+use num_traits::{One, Zero};
+use stwo::core::fields::m31::BaseField;
+use stwo::core::fields::qm31::SecureField;
+
 use impl_trait_for_tuples::impl_for_tuples;
 
 #[cfg(feature = "prover")]
@@ -63,6 +67,45 @@ impl<T: RegisteredLookupBound> AsRef<T> for AllLookupElements {
             .get(&TypeId::of::<T>())
             .expect("lookup elements weren't initialized");
         T::unwrap_ref(variant)
+    }
+}
+
+/// A drawn relation's name and challenges: `z` and the powers
+/// `1, α, α², …` its tuples combine with, one per limb. A tuple `v`
+/// enters the logup as `Σ_i α^i·v_i − z`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RelationChallenges {
+    pub name: alloc::string::String,
+    pub z: SecureField,
+    pub alpha_powers: alloc::vec::Vec<SecureField>,
+}
+
+impl RelationChallenges {
+    /// Read through the relation's own `combine`: `combine([]) = −z`, and
+    /// the tuple with a one at limb `i` combines to `α^i − z`.
+    pub fn of<R: stwo_constraint_framework::Relation<BaseField, SecureField>>(
+        relation: &R,
+    ) -> Self {
+        let z = -relation.combine(&[]);
+        let alpha_powers = (0..relation.get_size())
+            .map(|i| {
+                let mut unit = alloc::vec![BaseField::zero(); i + 1];
+                unit[i] = BaseField::one();
+                relation.combine(&unit) + z
+            })
+            .collect();
+        Self {
+            name: relation.get_name().into(),
+            z,
+            alpha_powers,
+        }
+    }
+}
+
+impl AllLookupElements {
+    /// Every drawn relation's challenges.
+    pub fn relation_challenges(&self) -> alloc::vec::Vec<RelationChallenges> {
+        self.0.values().map(RelationVariant::challenges).collect()
     }
 }
 
