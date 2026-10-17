@@ -37,7 +37,7 @@ const REL_REG_MEMORY_LOOKUP_SIZE: usize = 1 + WORD_SIZE + TS_SIZE + 1;
 stwo_constraint_framework::relation!(RegisterMemoryLookupElements, REL_REG_MEMORY_LOOKUP_SIZE);
 
 // (pc[4], opcode, skip_len, reg_a, reg_b, reg_d, imm[8],
-//  flag_bytes[N_FLAG_BYTES], imm_y_canon[4], branch_target_canon[4],
+//  flag_bytes[N_FLAG_BYTES], imm_y_canon[5], branch_target_canon[4],
 //  host_call_precompile_dispatch)
 //
 // Authenticates instruction-fetch tuples: every CpuChip step emits this
@@ -52,7 +52,7 @@ stwo_constraint_framework::relation!(RegisterMemoryLookupElements, REL_REG_MEMOR
 // each individual flag column (or its sum-of-sub-flags expression for
 // the 4 folded category slots) of bytes 0..5 back to its packed byte,
 // and recomposes bytes 6..9 from their bits in its own constraints.
-// The prog_mem tuple is 36 limbs.
+// The prog_mem tuple is 37 limbs.
 //
 // Flag layout per byte (0-indexed within byte; little-endian bits):
 //   byte 0: is_add, is_sub, is_mul, is_shar_r, is_bitwise, is_shift,
@@ -71,7 +71,7 @@ stwo_constraint_framework::relation!(RegisterMemoryLookupElements, REL_REG_MEMOR
 //           is_store_ind
 //   byte 5: is_rotate_l64, is_count_set_bits, is_lzb, is_tzb,
 //           is_rotate_r64, is_rotate_l32, is_rotate_r32,
-//           is_rotate_r_imm_alt
+//           is_imm_alt
 //   byte 6: val_b_is_reg, val_b_from_a, val_d_is_reg, result_is_reg,
 //           result_to_d, is_rem, is_set_gt, is_cmov_imm
 //   byte 7: is_set_lt_u, is_set_lt_s, is_cmov_iz, is_cmov_nz, is_min_s,
@@ -87,10 +87,10 @@ stwo_constraint_framework::relation!(RegisterMemoryLookupElements, REL_REG_MEMOR
 pub const PROG_MEMORY_N_FLAGS: usize = 80;
 pub const PROG_MEMORY_N_FLAG_BYTES: usize = PROG_MEMORY_N_FLAGS / 8;
 // Tuple shape: pc[4] + opcode + skip_len + reg_a + reg_b + reg_d + imm[8]
-//   + 10 packed flag bytes + imm_y_canon[4] + branch_target_canon[4]
-//   + host_call_precompile_dispatch = 36 limbs.
+//   + 10 packed flag bytes + imm_y_canon[5] + branch_target_canon[4]
+//   + host_call_precompile_dispatch = 37 limbs.
 const REL_PROG_MEMORY_LOOKUP_SIZE: usize =
-    PC_SIZE + 1 + 1 + 1 + 1 + 1 + WORD_SIZE + PROG_MEMORY_N_FLAG_BYTES + PC_SIZE + PC_SIZE + 1;
+    PC_SIZE + 1 + 1 + 1 + 1 + 1 + WORD_SIZE + PROG_MEMORY_N_FLAG_BYTES + 5 + PC_SIZE + 1;
 stwo_constraint_framework::relation!(ProgramMemoryLookupElements, REL_PROG_MEMORY_LOOKUP_SIZE);
 
 // JumpTableChip lookup. Tuple: (addr[4], target[4]) — 8 limbs.

@@ -116,6 +116,7 @@ mod prover {
         jump_table: &'a [u32],
         blake2b_calls: &'a [crate::chips::blake2b::Blake2bCall],
         blake2b_mem_ops: &'a [crate::core::tracing::Blake2bMemOp],
+        memory_layout: crate::chips::memory_page::MemoryLayout,
     }
 
     impl<'a> From<&'a SideNote> for ChainParts<'a> {
@@ -126,6 +127,7 @@ mod prover {
                 jump_table: &full.jump_table,
                 blake2b_calls: &full.blake2b_calls,
                 blake2b_mem_ops: &full.blake2b_mem_ops,
+                memory_layout: full.memory_layout,
             }
         }
     }
@@ -138,6 +140,7 @@ mod prover {
                 jump_table: &full.jump_table,
                 blake2b_calls: &full.blake2b_calls,
                 blake2b_mem_ops: &full.blake2b_mem_ops,
+                memory_layout: full.memory_layout,
             }
         }
     }
@@ -436,6 +439,7 @@ mod prover {
 
         let sn = SideNote::new(steps, parts.code.to_vec(), parts.bitmask.to_vec())
             .with_jump_table(parts.jump_table.to_vec())
+            .with_memory_layout(parts.memory_layout)
             .with_initial_regs(initial_regs);
         let mut sn = match mem {
             SegmentMemory::Dense(memory) => sn.with_memory(memory),
@@ -966,6 +970,9 @@ mod prover {
                 jump_table,
                 blake2b_calls: &self.blake2b_calls,
                 blake2b_mem_ops: &self.blake2b_mem_ops,
+                // A streamed trace runs on a flat memory: every page
+                // writable.
+                memory_layout: Default::default(),
             }
         }
 
@@ -1547,6 +1554,7 @@ mod tests {
             jump_table: full.jump_table.to_vec(),
             blake2b_calls: full.blake2b_calls.clone(),
             blake2b_mem_ops: full.blake2b_mem_ops.clone(),
+            memory_layout: full.memory_layout,
         }
     }
 
@@ -1835,6 +1843,7 @@ mod tests {
             jump_table: vec![],
             blake2b_calls,
             blake2b_mem_ops,
+            memory_layout: Default::default(),
         };
 
         for (seg_steps, page_budget) in [(2usize, 0usize), (6, 2), (4, 2)] {

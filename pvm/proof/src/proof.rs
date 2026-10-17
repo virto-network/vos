@@ -192,16 +192,30 @@ use crate::recursion_pcs::ProverMerkleHasher;
 ///        `BITWISE_AND_BYTE` at index 24, the component mask a `u32` again)
 ///        and ids 110–114 are no precompile. Older proofs reject.
 ///   29 — Poseidon2-M31 PCS variant of format 28.
-///   30 — Exact multiplication and division. MulChip and DivRemChip
-///        Range256-check every product byte, quotient and remainder byte,
-///        high half and carry their chains read, and booleanize the
-///        magnitude chains' carries, so each chain holds over the integers.
-///        DivRemChip pins the schoolbook's high half per operation (zero,
-///        signed correction with the `MIN / −1` overflow, or floor division
-///        for an arithmetic shift, flagged by the DivRem tuple's new
-///        `is_shar_r`, which flag byte 0's bit 3 commits in place of the
-///        implied `is_mul_upper`). Program commitments of code with an
-///        arithmetic shift or a MulUpper change. Older proofs reject.
+///   30 — The AIR audit's hardening. MulChip and DivRemChip Range256-check
+///        every product byte, quotient and remainder byte, high half and
+///        carry their chains read, and booleanize the magnitude chains'
+///        carries, so each chain holds over the integers; DivRemChip pins
+///        the schoolbook's high half per operation (zero, signed correction
+///        with the `MIN / −1` overflow, or floor division for an arithmetic
+///        shift, flagged by the DivRem tuple's new `is_shar_r`, which flag
+///        byte 0's bit 3 commits in place of the implied `is_mul_upper`).
+///        Blake2bChip holds `IsReal` across a compression, refuses the
+///        trailing partial block, and derives its addresses by byte carries
+///        on every row. CpuChip: boolean add/sub and pc carries; a padding
+///        row's flag bytes zero, its flags and emission gates with them;
+///        equality bound both ways; signed min/max results; an 8-byte
+///        immediate store's high word (ImmYBytes and ProgramMemory's
+///        ImmYCanon carry 5 bytes, the program-memory tuple 37 limbs); a
+///        trap stays at its pc; ProgramMemory serves only instruction
+///        starts (a preprocessed IsInstruction); NextTimestamp
+///        range-checked; φ10's non-zeroness by its bytes' sum; 32-bit
+///        BLAKE2b pointers; the ImmAlt shifts' operand swap. The register
+///        ledger drops its merged read slots and starts each register's
+///        chain at its ts = 0 write. MemoryPageChip carries the program's
+///        layout as preprocessed regions and proves each page's permission,
+///        which MemoryChip enforces on every access. Program commitments
+///        change. Older proofs reject.
 ///   31 — Poseidon2-M31 PCS variant of format 30.
 #[cfg(not(feature = "poseidon2-channel"))]
 pub const PROOF_FORMAT_VERSION: u32 = 30;

@@ -4,7 +4,9 @@
 //! through its witness input (`vos_wire::result::Attest::witness_input`).
 //! The prover lays the kernel out as the agent does, with no arguments,
 //! serves its witness-input calls from those bytes and its BLAKE2b calls
-//! natively, and runs it to its halt. A kernel's reads are deterministic,
+//! natively, and runs it to its halt. The layout's pages and their
+//! permissions go with the trace: they are its proof's, part of its program
+//! identity. A kernel's reads are deterministic,
 //! so the re-run reads what the live run read, call by call, and ends with
 //! the same output and io-hash; one that reads less than the record, or
 //! does not halt, is refused.
@@ -84,6 +86,7 @@ pub fn trace_kernel(blob: &[u8], input: &[u8], gas: u64) -> Result<KernelTrace, 
         }
     }
     let image: SparseMemoryImage = memory.nonzero_page_image().into();
+    let permissions = crate::chips::memory_page::MemoryLayout::standard(&layout);
     let registers = layout.registers;
     let code = program.code;
     let machine = Interpreter::with_memory(
@@ -121,7 +124,10 @@ pub fn trace_kernel(blob: &[u8], input: &[u8], gas: u64) -> Result<KernelTrace, 
         bytes.copy_from_slice(&word.to_le_bytes());
     }
     let reads = core::mem::take(&mut tracer.witness_reads);
-    let side_note = tracer.into_side_note().with_sparse_memory(image.clone());
+    let side_note = tracer
+        .into_side_note()
+        .with_sparse_memory(image.clone())
+        .with_memory_layout(permissions);
     Ok(KernelTrace {
         side_note,
         image,

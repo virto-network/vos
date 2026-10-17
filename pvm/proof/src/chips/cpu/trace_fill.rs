@@ -14,6 +14,7 @@
 
 #![cfg(feature = "prover")]
 
+use stwo::core::fields::m31::BaseField;
 use stwo::prover::backend::simd::m31::LOG_N_LANES;
 
 use crate::core::ecall::{ECALL_BLAKE2B_COMPRESS, ECALL_WITNESS_INPUT};
@@ -97,24 +98,22 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         let flags = classify_opcode(step.opcode);
 
         // Source operands.  Default convention (used by all but
-        // the rotate-imm-alt swap):
+        // the ImmAlt, SetGt and Cmov-immediate swaps):
         //   ThreeReg     → (regs[ra], regs[rb])
         //   TwoRegOneImm → (regs[rb], imm)
         //   TwoReg       → (0, regs[rb])
         //   OneRegImmOffset → (regs[ra], imm)  [imm-compare branches]
         //   Other immediate-source ops → (0, imm)
         //
-        // RotR64ImmAlt / RotR32ImmAlt swap the source convention —
-        // the immediate is the rotated value, the register is the
+        // The ImmAlt shifts and rotates swap the source convention —
+        // the immediate is the shifted value, the register is the
         // shift amount.  In AIR terms: val_b ← imm, val_d ← regs[rb].
         let (mut val_b, mut val_d) = match step.opcode.category() {
             vos_pvm::instruction::InstructionCategory::ThreeReg => {
                 (step.regs_before[step.reg_a], step.regs_before[step.reg_b])
             }
-            vos_pvm::instruction::InstructionCategory::TwoRegOneImm
-                if flags.is_rotate_r_imm_alt =>
-            {
-                // Rotate-imm-alt swap.
+            vos_pvm::instruction::InstructionCategory::TwoRegOneImm if flags.is_imm_alt => {
+                // ImmAlt swap.
                 (step.imm, step.regs_before[step.reg_b])
             }
             vos_pvm::instruction::InstructionCategory::TwoRegOneImm if flags.is_set_gt => {
@@ -474,8 +473,26 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         trace.fill_columns(row, cmp_lt_s_flag, Column::CmpLtSFlag);
         let eq_flag: u8 = if val_b == val_d { 1 } else { 0 };
         trace.fill_columns(row, eq_flag, Column::EqFlag);
-        // Branch constraints read `val_b[i] - val_d[i]` directly, so
-        // there are no ByteEq / ByteDiffInv columns to fill.
+        // EqFlag's converse: the sum of squared byte differences and its
+        // inverse.
+        let squares: u64 = val_b_bytes
+            .iter()
+            .zip(&val_d_bytes)
+            .map(|(&b, &d)| (i64::from(b) - i64::from(d)).pow(2) as u64)
+            .sum();
+        let squares = BaseField::from(squares as u32);
+        let squares_inv = if eq_flag == 1 {
+            BaseField::from(0u32)
+        } else {
+            squares.inverse()
+        };
+        trace.fill_columns_base_field(row, &[squares], Column::EqDiffSquaresH);
+        trace.fill_columns_base_field(row, &[squares_inv], Column::EqDiffSquaresInv);
+        trace.fill_columns_base_field(
+            row,
+            &[squares * squares_inv],
+            Column::EqDiffSquaresTimesInvH,
+        );
         trace.fill_columns(row, flags.is_set_lt_u, Column::IsSetLtU);
         trace.fill_columns(row, flags.is_set_lt_s, Column::IsSetLtS);
         trace.fill_columns(row, flags.is_set_gt, Column::IsSetGt);
@@ -518,7 +535,7 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         trace.fill_columns(row, flags.is_rotate_r64, Column::IsRotateR64);
         trace.fill_columns(row, flags.is_rotate_l32, Column::IsRotateL32);
         trace.fill_columns(row, flags.is_rotate_r32, Column::IsRotateR32);
-        trace.fill_columns(row, flags.is_rotate_r_imm_alt, Column::IsRotateRImmAlt);
+        trace.fill_columns(row, flags.is_imm_alt, Column::IsImmAlt);
         trace.fill_columns(row, saved_shift_amount_compl, Column::ShiftAmountCompl);
         trace.fill_columns_bytes(
             row,
@@ -590,7 +607,36 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         trace.fill_columns(row, flags.is_br_le_s, Column::IsBrLeS);
         trace.fill_columns(row, flags.is_br_gt_s, Column::IsBrGtS);
         trace.fill_columns(row, flags.is_jump, Column::IsJump);
-        trace.fill_columns(row, step.branch_taken, Column::BranchTaken);
+        // A branch's BranchTaken is its condition, which the AIR binds. The
+        // step records whether its pc took the target, which cannot tell
+        // when the target is its fallthrough: there the condition decides.
+        let lt_or_eq = |lt: u8| lt == 1 || eq_flag == 1;
+        let condition = if flags.is_br_eq {
+            eq_flag == 1
+        } else if flags.is_br_ne {
+            eq_flag == 0
+        } else if flags.is_br_lt_u {
+            cmp_lt_flag == 1
+        } else if flags.is_br_ge_u {
+            cmp_lt_flag == 0
+        } else if flags.is_br_le_u {
+            lt_or_eq(cmp_lt_flag)
+        } else if flags.is_br_gt_u {
+            !lt_or_eq(cmp_lt_flag)
+        } else if flags.is_br_lt_s {
+            cmp_lt_s_flag == 1
+        } else if flags.is_br_ge_s {
+            cmp_lt_s_flag == 0
+        } else if flags.is_br_le_s {
+            lt_or_eq(cmp_lt_s_flag)
+        } else if flags.is_br_gt_s {
+            !lt_or_eq(cmp_lt_s_flag)
+        } else {
+            false
+        };
+        let fallthrough = step.pc + 1 + step.skip_len;
+        let branch_taken = step.branch_taken || (condition && step.branch_target == fallthrough);
+        trace.fill_columns(row, branch_taken, Column::BranchTaken);
         trace.fill_columns_bytes(row, &step.branch_target.to_le_bytes(), Column::BranchTarget);
         trace.fill_columns(row, flags.is_div_rem, Column::IsDivRem);
         trace.fill_columns(row, flags.div_rem_op, Column::DivRemOp);
@@ -609,10 +655,10 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             && step.exit
             && (val_d.wrapping_add(step.imm_y) as u32 == vos_pvm::PVM_HALT_ADDR as u32);
         trace.fill_columns(row, is_halt_load_imm_jump_ind, Column::IsHaltLoadImmJumpInd);
-        // ImmYBytes always carries low 4 bytes of step.imm_y so the
-        // prog_mem lookup balances on every row (canonical = 0 for
-        // non-LoadImmJumpInd ops).
-        trace.fill_columns_bytes(row, &(step.imm_y as u32).to_le_bytes(), Column::ImmYBytes);
+        // ImmYBytes always carries the low 5 bytes of step.imm_y so the
+        // prog_mem lookup balances on every row (canonical = 0 for ops
+        // without a second immediate).
+        trace.fill_columns_bytes(row, &step.imm_y.to_le_bytes()[..5], Column::ImmYBytes);
         // Per-byte add-with-carry chain for JumpIndAddr =
         // (val_b + step.imm) mod 2^32.  The constraint is gated by
         // IsJumpInd, so on non-JumpInd rows the columns are left at
@@ -1067,47 +1113,23 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         // Phi7 slot ← f_flag (a3 = x13 = PVM φ[10]).
         let phi7_u64 = step.regs_before[10];
         trace.fill_columns(row, phi7_u64, Column::Phi7);
-        // The `Phi7` column holds the M31 field-reduction of this u64, and the
-        // boolean-identity constraints — `(1 − Phi7Bool) · Phi7 = 0` and
-        // `Phi7Bool · (Phi7 · Phi7Inv − 1) = 0` (mod.rs) — operate
-        // on that *field* value. So `Phi7Bool` / `Phi7Inv` MUST be derived
-        // from the reduced field element, NOT the raw u64: a nonzero u64 that
-        // is ≡ 0 mod M31 (a nonzero multiple of 2³¹−1, e.g. 0x7FFF_FFFF in
-        // x13 on a non-ECALL row) reduces to the zero field element, so a
-        // u64-based `Phi7Bool = 1` leaves `Phi7·Phi7Inv = 0 ≠ 1` and makes
-        // the gadget unsatisfiable. (The sole real consumer, blake2b's
-        // `f_flag`, is 0/1, where field == u64 — this only corrects the
-        // otherwise-unconstrained x13 values on non-blake2b rows.)
-        const M31_P: u64 = (1u64 << 31) - 1;
-        let phi7_field: u64 = {
-            let mut combined: u64 = 0;
-            let mut pow: u64 = 1;
-            for b in phi7_u64.to_le_bytes() {
-                combined = (combined + (b as u64) * pow) % M31_P;
-                pow = (pow * 256) % M31_P;
-            }
-            combined
-        };
-        let phi7_bool: u8 = if phi7_field != 0 { 1 } else { 0 };
+        // Phi7 is non-zero exactly when its bytes' sum is: at most 2040,
+        // it is its own field value, so its inverse witnesses it.
+        let phi7_sum = BaseField::from(
+            phi7_u64
+                .to_le_bytes()
+                .iter()
+                .map(|&b| u32::from(b))
+                .sum::<u32>(),
+        );
+        let phi7_bool: u8 = (phi7_u64 != 0).into();
         trace.fill_columns(row, phi7_bool, Column::Phi7Bool);
-        // Phi7Inv = field inverse of the reduced value (0 when it is 0).
-        // Fermat's little theorem: inverse = v^(p-2) mod p.
-        let phi7_inv_u64: u64 = if phi7_field != 0 {
-            let mut result: u64 = 1;
-            let mut base = phi7_field;
-            let mut exp = M31_P - 2;
-            while exp > 0 {
-                if exp & 1 == 1 {
-                    result = (result * base) % M31_P;
-                }
-                base = (base * base) % M31_P;
-                exp >>= 1;
-            }
-            result
+        let phi7_inv = if phi7_u64 != 0 {
+            phi7_sum.inverse()
         } else {
-            0
+            BaseField::from(0u32)
         };
-        trace.fill_columns(row, phi7_inv_u64, Column::Phi7Inv);
+        trace.fill_columns_base_field(row, &[phi7_inv], Column::Phi7Inv);
 
         // ── Register-memory producer descriptors ──
         let accesses = step_reg_accesses(step);
@@ -1154,8 +1176,14 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             trace.fill_columns(row, is_compare_b && vd_zero_b, Column::IsCmpVdzH);
             trace.fill_columns(row, flags.is_cmov_iz && vd_zero_b, Column::IsCmovIzVdzH);
             trace.fill_columns(row, flags.is_cmov_nz && !vd_zero_b, Column::IsCmovNzNotVdzH);
-            // CmpLtValB/D body helpers — byte-wise products.
-            let cmp_lt_u8: u8 = if cmp_lt_flag != 0 { 1 } else { 0 };
+            // CmpLtValB/D body helpers — byte-wise products with the
+            // min/max's less-than: signed on MinS/MaxS rows.
+            let cmp_lt_u8: u8 = if flags.is_min_s || flags.is_max_s {
+                cmp_lt_s_flag
+            } else {
+                cmp_lt_flag
+            };
+            trace.fill_columns(row, cmp_lt_u8, Column::MinMaxLtFlag);
             let mut cmp_lt_vb = [0u8; 8];
             let mut cmp_lt_vd = [0u8; 8];
             for i in 0..8 {
@@ -1366,7 +1394,7 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             trace.fill_columns(row, flags.is_lzb && flags.is_32bit, Column::IsLzb32H);
 
             // ── Branch / sequential PC selectors ──
-            let bt = step.branch_taken;
+            let bt = branch_taken;
             let eq_b = eq_flag != 0;
             let is_branch_b = flags.is_br_eq
                 || flags.is_br_ne
@@ -1378,8 +1406,6 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                 || flags.is_br_ge_s
                 || flags.is_br_le_s
                 || flags.is_br_gt_s;
-            trace.fill_columns(row, flags.is_br_eq && bt, Column::IsBrEqTakenH);
-            trace.fill_columns(row, flags.is_br_ne && !bt, Column::IsBrNeNotTakenH);
             trace.fill_columns(
                 row,
                 is_compare_b && eq_b || is_branch_b && eq_b,
@@ -1418,6 +1444,8 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         for &b in &result_bytes {
             range_bytes.push(b);
         }
+        // The next timestamp's limbs, bytes.
+        range_bytes.extend_from_slice(&(step.timestamp + 1).to_le_bytes());
         // Range-check cmp_sub_result bytes for carry chain soundness
         if flags.is_compare || flags.is_branch {
             for &b in &cmp_sub_result {
@@ -1499,27 +1527,20 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         // Phi7 helpers.
         trace.fill_columns(row, real_b && !phi7_bool_b, Column::RealNotPhi7BoolH);
         trace.fill_columns(row, real_b && phi7_bool_b, Column::RealPhi7BoolH);
-        // Phi7TimesInvH = Phi7 (u64) · Phi7Inv (u64) reduced mod P.
-        // For Phi7 = 0 → both 0 → 0.  For Phi7 ≠ 0 → product = 1 (mod P).
-        // Compute via u128 to dodge overflow.
-        let phi7_field_u32 = (phi7_u64 % stwo::core::fields::m31::P as u64) as u32;
-        let phi7_inv_field_u32 = phi7_inv_u64 as u32;
-        let prod =
-            (phi7_field_u32 as u64 * phi7_inv_field_u32 as u64) % stwo::core::fields::m31::P as u64;
-        use stwo::core::fields::m31::BaseField;
-        trace.fill_columns_base_field(row, &[BaseField::from(prod as u32)], Column::Phi7TimesInvH);
+        // Phi7TimesInvH = (Σ Phi7 bytes) · Phi7Inv: 0 or 1.
+        trace.fill_columns_base_field(row, &[phi7_sum * phi7_inv], Column::Phi7TimesInvH);
         let _ = (val_b_is_reg_b, val_d_is_reg_b, result_is_reg_b);
 
         // Additional degree-3 selector patterns in CpuChip.
         trace.fill_columns(
             row,
-            flags.is_rotate_r_imm_alt && !is_truncated_b,
-            Column::IsRotRImmAltNotTruncH,
+            flags.is_imm_alt && !is_truncated_b,
+            Column::IsImmAltNotTruncH,
         );
         trace.fill_columns(
             row,
-            flags.is_rotate_r_imm_alt && is_truncated_b,
-            Column::IsRotRImmAltTruncH,
+            flags.is_imm_alt && is_truncated_b,
+            Column::IsImmAltTruncH,
         );
         trace.fill_columns(
             row,
@@ -1672,8 +1693,8 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             ("MemByteActiveMonoH", Column::MemByteActiveMonoH),
             ("MemAddrCarry", Column::MemAddrCarry),
             ("IsLoadLocalNotActiveH", Column::IsLoadLocalNotActiveH),
-            ("IsRotRImmAltNotTruncH", Column::IsRotRImmAltNotTruncH),
-            ("IsRotRImmAltTruncH", Column::IsRotRImmAltTruncH),
+            ("IsImmAltNotTruncH", Column::IsImmAltNotTruncH),
+            ("IsImmAltTruncH", Column::IsImmAltTruncH),
             ("Is32ShiftCH", Column::Is32ShiftCH),
             ("ValDPartialNZMsb", Column::ValDPartialNZMsb),
             ("ValDPartialNZMsbLo", Column::ValDPartialNZMsbLo),
@@ -1732,6 +1753,8 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         trace.fill_columns(row, ts, Column::Timestamp);
         trace.fill_columns(row, ts + 1, Column::NextTimestamp);
         fill_ts_carry(&mut trace, row, ts);
+        // Its six zero flag bytes, looked up as every row's are.
+        side_note.byte_to_bits_counts[0] += 6;
         // GateDivH = (DivRemOp - 2)·(DivRemOp - 3).  Constraint is
         // unconditional (no is_real gate); on padding rows DivRemOp = 0,
         // so GateDivH must be filled with (0 - 2)·(0 - 3) = 6.  Other

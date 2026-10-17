@@ -58,36 +58,16 @@ pub enum Column {
     /// u64 value as 8 LE bytes.
     #[size = 8]
     Value,
-    /// Slot 0 timestamp (u64, 8 LE bytes).  Sort anchor — the row's
-    /// position in the ledger is determined by `(RegAddr, Ts0)`.  Slot 0
-    /// is gated on `is_real = 1 - IsPadding`; on real rows, this slot
-    /// always emits one consumer fraction.  `#[mask_next_row]` so the
-    /// sortedness gadget can read the next row's timestamp.
+    /// Timestamp (u64, 8 LE bytes).  Sort anchor — the row's position in
+    /// the ledger is determined by `(RegAddr, Ts0)`, and each real row
+    /// consumes one access.  `#[mask_next_row]` so the sortedness gadget can
+    /// read the next row's timestamp.
     #[size = 8]
     #[mask_next_row]
     Ts0,
-    /// Slot 1 timestamp.  Emits a consumer fraction iff `SlotReal1 = 1`.
-    /// On unmerged rows (or writes), zero-fill.
-    #[size = 8]
-    Ts1,
-    /// Slot 2 timestamp.  Emits iff `SlotReal2 = 1`.
-    #[size = 8]
-    Ts2,
-    /// Slot 3 timestamp.  Emits iff `SlotReal3 = 1`.
-    #[size = 8]
-    Ts3,
-    /// Booleans gating slots 1..=3 emissions.  Together with `is_real`
-    /// (= slot-0 gate), the per-row multiplicity is
-    /// `mult = is_real + SlotReal1 + SlotReal2 + SlotReal3 ∈ 0..=4`.
-    /// Constraints enforce range + write-only-uses-slot-0 + padding-zero.
-    #[size = 1]
-    SlotReal1,
-    #[size = 1]
-    SlotReal2,
-    #[size = 1]
-    SlotReal3,
-    /// 1 = write, 0 = read.  `#[mask_next_row]`: within a timestamp, the
-    /// ordering gadget sorts a register's reads before its writes.
+    /// 1 = write, 0 = read, a bit.  `#[mask_next_row]`: within a
+    /// timestamp, the ordering gadget sorts a register's reads before its
+    /// writes, and a register's first row is a write.
     #[size = 1]
     #[mask_next_row]
     IsWrite,
@@ -132,6 +112,14 @@ pub enum Column {
     /// OrderValH`.
     #[size = 1]
     OrderValH,
+    /// BOUND helper `ChainStartH = (1 − IsPadding_next)·(1 − IsSameRegNext)`:
+    /// 1 iff the next row is real and starts its register's chain of
+    /// same-register rows, which must be that register's `ts = 0` write.
+    /// A register has one such write, so one chain: wherever padding
+    /// interrupts the sortedness gadget, the rows after it start a chain
+    /// with no write to start it.
+    #[size = 1]
+    ChainStartH,
     // Read-consistency uses an unconditional
     // `(1 - is_write) · (value[i] - prev_value[i]) = 0` per byte (no
     // gating helper column).  Padding rows have value=prev_value=0 so
@@ -168,12 +156,6 @@ impl BuiltInComponent for RegisterMemoryChip {
         let reg_addr = crate::trace::trace_eval!(trace_eval, Column::RegAddr);
         let value = crate::trace::trace_eval!(trace_eval, Column::Value);
         let ts0 = crate::trace::trace_eval!(trace_eval, Column::Ts0);
-        let ts1 = crate::trace::trace_eval!(trace_eval, Column::Ts1);
-        let ts2 = crate::trace::trace_eval!(trace_eval, Column::Ts2);
-        let ts3 = crate::trace::trace_eval!(trace_eval, Column::Ts3);
-        let slot1 = crate::trace::trace_eval!(trace_eval, Column::SlotReal1);
-        let slot2 = crate::trace::trace_eval!(trace_eval, Column::SlotReal2);
-        let slot3 = crate::trace::trace_eval!(trace_eval, Column::SlotReal3);
         let is_write = crate::trace::trace_eval!(trace_eval, Column::IsWrite);
         let prev_value = crate::trace::trace_eval!(trace_eval, Column::PrevValue);
 
@@ -181,28 +163,10 @@ impl BuiltInComponent for RegisterMemoryChip {
         // multiplicity `1 − IsPadding` a producer and BothRealH negative.
         eval.add_constraint(is_pad[0].clone() * (is_pad[0].clone() - E::F::one()));
 
-        // ── Slot-real flag invariants ────────────────────────────────
-        // Each SlotReal_i ∈ {0, 1}: bool · (bool − 1) = 0.
-        eval.add_constraint(slot1[0].clone() * (slot1[0].clone() - E::F::one()));
-        eval.add_constraint(slot2[0].clone() * (slot2[0].clone() - E::F::one()));
-        eval.add_constraint(slot3[0].clone() * (slot3[0].clone() - E::F::one()));
-        // Padding rows have all extra slots inactive — otherwise a padding
-        // row could spuriously emit consumer fractions and skew balance.
-        eval.add_constraint(is_pad[0].clone() * slot1[0].clone());
-        eval.add_constraint(is_pad[0].clone() * slot2[0].clone());
-        eval.add_constraint(is_pad[0].clone() * slot3[0].clone());
-        // Writes use only slot 0 (mult = 1 always — writes change the
-        // value, breaking any merge run).  Combined with `is_real`
-        // gating slot 0, this forces writes to multiplicity 1.
-        eval.add_constraint(is_write[0].clone() * slot1[0].clone());
-        eval.add_constraint(is_write[0].clone() * slot2[0].clone());
-        eval.add_constraint(is_write[0].clone() * slot3[0].clone());
+        // IsWrite ∈ {0, 1}: the key `2·ts + is_write` takes it as a bit.
+        eval.add_constraint(is_write[0].clone() * (is_write[0].clone() - E::F::one()));
 
-        // Read consistency: for a read (is_write=0) that follows a same-reg
-        // entry, the byte-wise value must equal prev_value.  The merge
-        // collapses only same-VALUE read runs, so a merged read row's value
-        // matches the run's first slot's value and the prev-value lookup
-        // against the previous ledger row works unchanged.  Enforced
+        // Read consistency: a read's value is its prev_value, enforced
         // unconditionally per byte.
         let is_read = E::F::one() - is_write[0].clone();
         for i in 0..8 {
@@ -294,57 +258,42 @@ impl BuiltInComponent for RegisterMemoryChip {
             );
         }
 
-        // ── Per-slot consumer emissions ─────────────────────────────────
-        // 4 fractions per row, paired by `finalize_logup_in_pairs`.
-        // Slot 0 gate = is_real; slots 1..=3 gate = SlotReal_i.
-        // Tuple shape unchanged: (reg_addr[1], value[8], ts[8]).
-        // EMISSION ORDER MUST MATCH `generate_interaction_trace` exactly.
-        let push_tuple = |dst: &mut Vec<E::F>, ts: &[E::F; 8]| {
-            dst.push(reg_addr[0].clone());
-            for col in &value {
-                dst.push(col.clone());
-            }
-            for col in ts {
-                dst.push(col.clone());
-            }
-            // is_write is part of the tuple (binds read/write so a read can't
-            // masquerade as a write to skip read-consistency).
-            dst.push(is_write[0].clone());
-        };
-        // Slot 0.
-        let mut tuple0: Vec<E::F> = Vec::with_capacity(17);
-        push_tuple(&mut tuple0, &ts0);
+        // ── Chains ──────────────────────────────────────────────────────
+        // A register's rows form one chain, started by its ts = 0 write: a
+        // row whose predecessor is not a same-register real row is a write
+        // at ts 0, and the boundary chip produces one per register. So no
+        // padding row can split a register's accesses into a second chain,
+        // unordered against the first, whose reads take a previous value
+        // nothing binds; the cyclic wrap from the trailing padding row makes
+        // row 0 a chain's start too.
+        let chain_start = crate::trace::trace_eval!(trace_eval, Column::ChainStartH);
+        eval.add_constraint(
+            chain_start[0].clone()
+                - (E::F::one() - is_pad_next[0].clone()) * (E::F::one() - is_same_reg[0].clone()),
+        );
+        for limb in &ts0_next {
+            eval.add_constraint(chain_start[0].clone() * limb.clone());
+        }
+        eval.add_constraint(chain_start[0].clone() * (E::F::one() - is_write_next[0].clone()));
+
+        // ── Consumer emission ───────────────────────────────────────────
+        // One access per real row: (reg_addr[1], value[8], ts[8],
+        // is_write[1]). EMISSION ORDER MUST MATCH
+        // `generate_interaction_trace` exactly.
+        let mut tuple: Vec<E::F> = Vec::with_capacity(18);
+        tuple.push(reg_addr[0].clone());
+        tuple.extend_from_slice(&value);
+        tuple.extend_from_slice(&ts0);
+        // is_write is part of the tuple (binds read/write so a read can't
+        // masquerade as a write to skip read-consistency).
+        tuple.push(is_write[0].clone());
         eval.add_to_relation(RelationEntry::new(
             lookup_elements,
             (-is_real.clone()).into(),
-            &tuple0,
-        ));
-        // Slot 1.
-        let mut tuple1: Vec<E::F> = Vec::with_capacity(17);
-        push_tuple(&mut tuple1, &ts1);
-        eval.add_to_relation(RelationEntry::new(
-            lookup_elements,
-            (-slot1[0].clone()).into(),
-            &tuple1,
-        ));
-        // Slot 2.
-        let mut tuple2: Vec<E::F> = Vec::with_capacity(17);
-        push_tuple(&mut tuple2, &ts2);
-        eval.add_to_relation(RelationEntry::new(
-            lookup_elements,
-            (-slot2[0].clone()).into(),
-            &tuple2,
-        ));
-        // Slot 3.
-        let mut tuple3: Vec<E::F> = Vec::with_capacity(17);
-        push_tuple(&mut tuple3, &ts3);
-        eval.add_to_relation(RelationEntry::new(
-            lookup_elements,
-            (-slot3[0].clone()).into(),
-            &tuple3,
+            &tuple,
         ));
 
-        eval.finalize_logup_in_pairs();
+        eval.finalize_logup();
     }
 }
 
@@ -367,13 +316,12 @@ impl BuiltInProverComponent for RegisterMemoryChip {
             return trace.finalize_bit_reversed();
         }
 
-        // The read-run merge is DISABLED: the ledger carries one entry per
-        // row, sorted by (reg, ts).  This keeps the sortedness argument that
-        // pins read-consistency (below) auditable — a merged row spanning
-        // multiple timestamps would need per-slot monotonicity + an
-        // overlap-forbidding constraint.  `merge_entries` and its property
-        // tests stay (uncalled) as documentation of the merge optimisation.
-        // See docs/design/ledger-read-consistency.md.
+        // One entry per row, sorted by (reg, ts): each row consumes one
+        // access, which its place in its register's chain orders. A merged
+        // row spanning several timestamps would need per-slot ordering and
+        // a link to the next row; the AIR has none, so `merge_entries` and
+        // its property tests stay uncalled, documentation of the merge
+        // optimisation. See docs/design/ledger-read-consistency.md.
         let num_rows_real = entries.len();
         let mut log_size = crate::trace::utils::ceil_log2_at_least_lanes(num_rows_real);
         // Guarantee ≥ 1 padding row so the cyclic last→row-0 wraparound is always
@@ -396,7 +344,6 @@ impl BuiltInProverComponent for RegisterMemoryChip {
             trace.fill_columns(row, e.reg_addr, Column::RegAddr);
             trace.fill_columns(row, e.value, Column::Value);
             trace.fill_columns(row, e.timestamp, Column::Ts0);
-            // Ts1..3 / SlotReal1..3 stay zero (merge disabled — one entry/row).
             trace.fill_columns(row, e.is_write, Column::IsWrite);
 
             // prev_value = previous ledger row's value when same register; the
@@ -436,6 +383,11 @@ impl BuiltInProverComponent for RegisterMemoryChip {
             let next = (row + 1) % num_rows;
             let both_real = row < num_rows_real && next < num_rows_real;
             trace.fill_columns(row, both_real, Column::BothRealH);
+            trace.fill_columns(
+                row,
+                next < num_rows_real && !key_same[row],
+                Column::ChainStartH,
+            );
 
             // Within a register, the key `2·ts + is_write`.
             let key = |row: usize| 2 * tss[row] + u64::from(writes[row]);
@@ -483,52 +435,21 @@ impl BuiltInProverComponent for RegisterMemoryChip {
         let reg_addr = crate::trace::original_base_column!(component_trace, Column::RegAddr);
         let value = crate::trace::original_base_column!(component_trace, Column::Value);
         let ts0 = crate::trace::original_base_column!(component_trace, Column::Ts0);
-        let ts1 = crate::trace::original_base_column!(component_trace, Column::Ts1);
-        let ts2 = crate::trace::original_base_column!(component_trace, Column::Ts2);
-        let ts3 = crate::trace::original_base_column!(component_trace, Column::Ts3);
-        let slot1 = crate::trace::original_base_column!(component_trace, Column::SlotReal1);
-        let slot2 = crate::trace::original_base_column!(component_trace, Column::SlotReal2);
-        let slot3 = crate::trace::original_base_column!(component_trace, Column::SlotReal3);
         let is_write = crate::trace::original_base_column!(component_trace, Column::IsWrite);
 
-        // 4 emissions per row (one per slot), paired by `add_constraints`'s
-        // `finalize_logup_in_pairs`.  Tuple shape:
-        //   (reg_addr[1], value[8], ts[8], is_write[1]) = 18 limbs.
-        // Slot 0 gate = is_real = 1 - is_pad.
-        // Slot i (i=1,2,3) gate = SlotReal_i.
-        // EMISSION ORDER MUST MATCH the AIR side exactly.
-        let mut tuple0: Vec<_> = Vec::with_capacity(18);
-        tuple0.push(reg_addr[0].clone());
-        tuple0.extend_from_slice(&value);
-        tuple0.extend_from_slice(&ts0);
-        tuple0.push(is_write[0].clone());
+        // One emission per real row: (reg_addr[1], value[8], ts[8],
+        // is_write[1]) = 18 limbs. EMISSION ORDER MUST MATCH the AIR side.
+        let mut tuple: Vec<_> = Vec::with_capacity(18);
+        tuple.push(reg_addr[0].clone());
+        tuple.extend_from_slice(&value);
+        tuple.extend_from_slice(&ts0);
+        tuple.push(is_write[0].clone());
         logup.add_to_relation_with(
             reg_lookup,
             [is_pad[0].clone()],
             |[pad]| (-(PackedBaseField::one() - pad)).into(),
-            &tuple0,
+            &tuple,
         );
-
-        let mut tuple1: Vec<_> = Vec::with_capacity(18);
-        tuple1.push(reg_addr[0].clone());
-        tuple1.extend_from_slice(&value);
-        tuple1.extend_from_slice(&ts1);
-        tuple1.push(is_write[0].clone());
-        logup.add_to_relation_with(reg_lookup, [slot1[0].clone()], |[s]| (-s).into(), &tuple1);
-
-        let mut tuple2: Vec<_> = Vec::with_capacity(18);
-        tuple2.push(reg_addr[0].clone());
-        tuple2.extend_from_slice(&value);
-        tuple2.extend_from_slice(&ts2);
-        tuple2.push(is_write[0].clone());
-        logup.add_to_relation_with(reg_lookup, [slot2[0].clone()], |[s]| (-s).into(), &tuple2);
-
-        let mut tuple3: Vec<_> = Vec::with_capacity(18);
-        tuple3.push(reg_addr[0].clone());
-        tuple3.extend_from_slice(&value);
-        tuple3.extend_from_slice(&ts3);
-        tuple3.push(is_write[0].clone());
-        logup.add_to_relation_with(reg_lookup, [slot3[0].clone()], |[s]| (-s).into(), &tuple3);
 
         logup.finalize()
     }

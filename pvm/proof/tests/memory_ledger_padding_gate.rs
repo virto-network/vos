@@ -13,7 +13,9 @@
 //!
 //! The ledger is refilled from explicit rows, every helper column derived as
 //! the chip's own trace generation does, generalized to `IsPadding = 2`; a
-//! control checks that the honest rows, refilled, satisfy the chip.
+//! control checks that the honest rows, refilled, satisfy the chip. The
+//! minting row's `IsStart`, the previous padding row's `IsGroupStart`, is
+//! then `−1`, so the booleanity of `IsStart` refuses it as well.
 
 use stwo::core::fields::m31::BaseField;
 use stwo::prover::backend::simd::column::BaseColumn;
@@ -26,6 +28,7 @@ use vos_pvm_proof::chips::MemoryChip;
 use vos_pvm_proof::chips::memory::Column as Ledger;
 use vos_pvm_proof::core::tracing::TracingPvm;
 use vos_pvm_proof::framework_access::AllLookupElements;
+use vos_pvm_proof::page_merkle::PAGE_SIZE;
 use vos_pvm_proof::harness::{MachineComponent, MachineProverComponent};
 use vos_pvm_proof::recursion_pcs::ProverChannel;
 use vos_pvm_proof::trace::builder::TraceBuilder;
@@ -170,7 +173,7 @@ fn field(v: i64) -> BaseField {
 
 /// A MemoryChip main trace from explicit rows, each helper column derived as
 /// the chip's trace generation does, for `pad ∈ {0, 1, 2}`.
-fn fill_ledger(rows: &[Row], log_size: u32) -> Vec<BaseColumn> {
+fn fill_ledger(rows: &[Row], log_size: u32, sn: &SideNote) -> Vec<BaseColumn> {
     let n = rows.len();
     assert_eq!(n, 1usize << log_size);
     let mut trace = TraceBuilder::<Ledger>::new(log_size);
@@ -224,15 +227,30 @@ fn fill_ledger(rows: &[Row], log_size: u32) -> Vec<BaseColumn> {
         let group_end = (1 - r.pad as i64) * (1 - same as i64);
         trace.fill_columns_base_field(i, &[field(group_start)], Ledger::IsGroupStart);
         trace.fill_columns_base_field(i, &[field(group_end)], Ledger::IsGroupEnd);
+        // The page's permission, held along the group, as the chip fills it;
+        // `IsStart` is the previous row's `IsGroupStart`.
+        let prev_same = prev.pad == 0 && r.pad == 0 && prev.addr == r.addr;
+        let is_start = (1 - r.pad as i64) * (1 - prev_same as i64);
+        let permission = if r.pad == 1 {
+            0
+        } else {
+            sn.memory_layout.permission(r.addr / PAGE_SIZE as u32) as i64
+        };
+        let (readable, writable) = (permission >= 1, permission == 2);
+        trace.fill_columns_base_field(i, &[field(is_start)], Ledger::IsStart);
+        trace.fill_columns(i, readable, Ledger::Readable);
+        trace.fill_columns(i, writable, Ledger::Writable);
+        let permission_h = is_start * (readable as i64 + writable as i64);
+        trace.fill_columns_base_field(i, &[field(permission_h)], Ledger::PermissionH);
     }
     trace.finalize_bit_reversed().cols
 }
 
-fn refilled(honest: &ComponentTrace, rows: &[Row]) -> ComponentTrace {
+fn refilled(honest: &ComponentTrace, rows: &[Row], sn: &SideNote) -> ComponentTrace {
     ComponentTrace {
         log_size: honest.log_size,
         preprocessed_trace: honest.preprocessed_trace.clone(),
-        original_trace: fill_ledger(rows, honest.log_size),
+        original_trace: fill_ledger(rows, honest.log_size, sn),
     }
 }
 
@@ -242,7 +260,7 @@ fn the_refilled_honest_ledger_passes() {
     let mut sn = side_note();
     let honest = MemoryChip.generate_component_trace(&mut sn);
     assert_chip(&honest, &sn);
-    assert_chip(&refilled(&honest, &read_rows(&honest)), &sn);
+    assert_chip(&refilled(&honest, &read_rows(&honest), &sn), &sn);
 }
 
 /// G2-2. A row with `IsPadding = 2`, between two padding rows, mints a ts=0
@@ -294,5 +312,5 @@ fn a_padding_flag_of_two_cannot_mint_a_write() {
             ..Row::default()
         });
     }
-    assert_chip(&refilled(&honest, &rows), &sn);
+    assert_chip(&refilled(&honest, &rows, &sn), &sn);
 }

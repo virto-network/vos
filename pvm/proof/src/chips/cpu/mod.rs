@@ -153,6 +153,29 @@ impl BuiltInComponent for CpuChip {
         let is_pad = crate::trace::trace_eval!(trace_eval, Column::IsPadding);
         let is_real = E::F::one() - is_pad[0].clone();
 
+        // ── A padding row is no instruction ──
+        // Its flag bytes are zero, and with them every flag and every
+        // emission gate: the byte-to-bits lookups, ungated, and the bytes'
+        // recompositions pin each flag to its bit on every row, and the
+        // remaining gates (the memory bytes, the precompile selectors, the
+        // result write) follow from the flags below. So a padding row
+        // emits nothing, wherever it sits.
+        eval.add_constraint(is_pad[0].clone() * (is_pad[0].clone() - E::F::one()));
+        for byte in [
+            Column::FlagByte0,
+            Column::FlagByte1,
+            Column::FlagByte2,
+            Column::FlagByte3,
+            Column::FlagByte4,
+            Column::FlagByte5,
+            Column::FlagByte6,
+            Column::FlagByte7,
+            Column::FlagByte8,
+            Column::FlagByte9,
+        ] {
+            eval.add_constraint(is_pad[0].clone() * trace_eval.column_eval::<1>(byte)[0].clone());
+        }
+
         // ── Step-timestamp chaining: NextTimestamp = Timestamp + 1 ──
         // Limb-canonical via a boolean carry chain.  The program-execution
         // lookup (further down) sequences steps as a multiset permutation
@@ -429,12 +452,20 @@ impl BuiltInComponent for CpuChip {
             is_cmov_nz_not_vdz_h[0].clone()
                 - is_cmov_nz_flag[0].clone() * (E::F::one() - val_d_is_zero_for_h[0].clone()),
         );
+        // A min or max selects by its less-than, signed on MinS/MaxS rows.
+        let min_max_lt = crate::trace::trace_eval!(trace_eval, Column::MinMaxLtFlag);
+        eval.add_constraint(
+            min_max_lt[0].clone()
+                - cmp_lt_flag[0].clone()
+                - (is_min_s_flag[0].clone() + is_max_s_flag[0].clone())
+                    * (cmp_lt_s_flag[0].clone() - cmp_lt_flag[0].clone()),
+        );
         for i in 0..WORD_SIZE {
             eval.add_constraint(
-                cmp_lt_val_b_h[i].clone() - cmp_lt_flag[0].clone() * val_b[i].clone(),
+                cmp_lt_val_b_h[i].clone() - min_max_lt[0].clone() * val_b[i].clone(),
             );
             eval.add_constraint(
-                cmp_lt_val_d_h[i].clone() - cmp_lt_flag[0].clone() * val_d[i].clone(),
+                cmp_lt_val_d_h[i].clone() - min_max_lt[0].clone() * val_d[i].clone(),
             );
         }
         // DivRem helpers.
@@ -558,6 +589,11 @@ impl BuiltInComponent for CpuChip {
         // ════════════════════════════════════════════════════════════════════
         // ADD: result[i] + carry[i]*256 = val_b[i] + val_d[i] + carry[i-1]
         // ════════════════════════════════════════════════════════════════════
+        // The carries are bits on every row: a field-valued carry solves any
+        // byte equation, for any result.
+        for c in carry.iter() {
+            eval.add_constraint(c.clone() * (E::F::one() - c.clone()));
+        }
         for i in 0..WORD_SIZE {
             let carry_in = if i == 0 {
                 E::F::zero()
@@ -643,8 +679,8 @@ impl BuiltInComponent for CpuChip {
         let _ = (is_mul_low, &is_64bit);
 
         {
-            // Pin val_b ↔ ImmBytes on RotR64ImmAlt / RotR32ImmAlt rows.
-            // These swap the operand convention (immediate is the rotated
+            // Pin val_b ↔ ImmBytes on the ImmAlt shift and rotate rows.
+            // These swap the operand convention (immediate is the shifted
             // value, register is the shift amount), so val_b is not a
             // register read — the standard val_b ↔ reg_val_b
             // cross-constraint is inactive (val_b_is_reg=0).  Without this
@@ -654,39 +690,35 @@ impl BuiltInComponent for CpuChip {
             //   - low 4 bytes: val_b[i] = ImmBytes[i] always.
             //   - high 4 bytes: match ImmBytes when not truncated;
             //     zero when truncated (32-bit ImmAlt has IsTruncated
-            //     = is_32bit · is_mul = 1, which masks val_b high
+            //     = is_32bit · (is_mul + is_div_rem) = 1, which masks val_b high
             //     bytes to 0 in trace fill, while ImmBytes carries
             //     the sign-extended bytes from step.imm.to_le_bytes()).
-            let f_is_rotate_r_imm_alt_p40 =
-                crate::trace::trace_eval!(trace_eval, Column::IsRotateRImmAlt);
+            let f_is_imm_alt_p40 = crate::trace::trace_eval!(trace_eval, Column::IsImmAlt);
             let imm_bytes_p40 = crate::trace::trace_eval!(trace_eval, Column::ImmBytes);
             let is_truncated_p40 = crate::trace::trace_eval!(trace_eval, Column::IsTruncated);
             // Helpers for the 3-factor selectors below.
-            let is_rot_r_imm_alt_not_trunc_h =
-                crate::trace::trace_eval!(trace_eval, Column::IsRotRImmAltNotTruncH);
-            let is_rot_r_imm_alt_trunc_h =
-                crate::trace::trace_eval!(trace_eval, Column::IsRotRImmAltTruncH);
+            let is_imm_alt_not_trunc_h =
+                crate::trace::trace_eval!(trace_eval, Column::IsImmAltNotTruncH);
+            let is_imm_alt_trunc_h = crate::trace::trace_eval!(trace_eval, Column::IsImmAltTruncH);
             eval.add_constraint(
-                is_rot_r_imm_alt_not_trunc_h[0].clone()
-                    - f_is_rotate_r_imm_alt_p40[0].clone()
-                        * (E::F::one() - is_truncated_p40[0].clone()),
+                is_imm_alt_not_trunc_h[0].clone()
+                    - f_is_imm_alt_p40[0].clone() * (E::F::one() - is_truncated_p40[0].clone()),
             );
             eval.add_constraint(
-                is_rot_r_imm_alt_trunc_h[0].clone()
-                    - f_is_rotate_r_imm_alt_p40[0].clone() * is_truncated_p40[0].clone(),
+                is_imm_alt_trunc_h[0].clone()
+                    - f_is_imm_alt_p40[0].clone() * is_truncated_p40[0].clone(),
             );
             for i in 0..4 {
                 eval.add_constraint(
-                    f_is_rotate_r_imm_alt_p40[0].clone()
-                        * (val_b[i].clone() - imm_bytes_p40[i].clone()),
+                    f_is_imm_alt_p40[0].clone() * (val_b[i].clone() - imm_bytes_p40[i].clone()),
                 );
             }
             for i in 4..WORD_SIZE {
                 eval.add_constraint(
-                    is_rot_r_imm_alt_not_trunc_h[0].clone()
+                    is_imm_alt_not_trunc_h[0].clone()
                         * (val_b[i].clone() - imm_bytes_p40[i].clone()),
                 );
-                eval.add_constraint(is_rot_r_imm_alt_trunc_h[0].clone() * val_b[i].clone());
+                eval.add_constraint(is_imm_alt_trunc_h[0].clone() * val_b[i].clone());
             }
 
             // Pin val_d high 4 bytes = 0 on ALL 32-bit shift-constrained
@@ -839,15 +871,18 @@ impl BuiltInComponent for CpuChip {
                 );
             }
 
-            // MinU/MaxU — body lifted into CmpLtValBH / CmpLtValDH so
-            // the result-binding constraint becomes deg 2 (selector × linear).
+            // Min/Max, unsigned and signed — body lifted into CmpLtValBH /
+            // CmpLtValDH so the result-binding constraint becomes deg 2
+            // (selector × linear).
+            let is_min = is_min_u_flag[0].clone() + is_min_s_flag[0].clone();
+            let is_max = is_max_u_flag[0].clone() + is_max_s_flag[0].clone();
             for i in 0..WORD_SIZE {
                 let expected_min =
                     cmp_lt_val_b_h[i].clone() + val_d[i].clone() - cmp_lt_val_d_h[i].clone();
-                eval.add_constraint(is_min_u_flag[0].clone() * (result[i].clone() - expected_min));
+                eval.add_constraint(is_min.clone() * (result[i].clone() - expected_min));
                 let expected_max =
                     cmp_lt_val_d_h[i].clone() + val_b[i].clone() - cmp_lt_val_b_h[i].clone();
-                eval.add_constraint(is_max_u_flag[0].clone() * (result[i].clone() - expected_max));
+                eval.add_constraint(is_max.clone() * (result[i].clone() - expected_max));
             }
         }
 
@@ -1287,19 +1322,35 @@ impl BuiltInComponent for CpuChip {
         }
 
         // ── Branch condition + sequential-PC helpers ──
-        let is_br_eq_taken_h = crate::trace::trace_eval!(trace_eval, Column::IsBrEqTakenH);
-        let is_br_ne_not_taken_h = crate::trace::trace_eval!(trace_eval, Column::IsBrNeNotTakenH);
         let is_cmp_or_branch_eq_h = crate::trace::trace_eval!(trace_eval, Column::IsCmpOrBranchEqH);
         let is_branch_taken_h = crate::trace::trace_eval!(trace_eval, Column::IsBranchTakenH);
         {
             let branch_taken_top = crate::trace::trace_eval!(trace_eval, Column::BranchTaken);
             let eq_flag_top = crate::trace::trace_eval!(trace_eval, Column::EqFlag);
+            // EqFlag is the operands' equality, both ways, on every compare
+            // and branch row: equal operands have a zero sum of squared byte
+            // differences, so a zero product with its inverse; different
+            // ones a product of 1. Over the integers the sum is zero only
+            // when every difference is (each square is non-negative and
+            // their sum below 2^20); in the field, the byte-wise pinning
+            // below refuses EqFlag = 1 for different operands whatever the
+            // sum.
+            let squares = crate::trace::trace_eval!(trace_eval, Column::EqDiffSquaresH);
+            let squares_inv = crate::trace::trace_eval!(trace_eval, Column::EqDiffSquaresInv);
+            let squares_times_inv =
+                crate::trace::trace_eval!(trace_eval, Column::EqDiffSquaresTimesInvH);
+            let mut sum = E::F::zero();
+            for i in 0..WORD_SIZE {
+                let diff = val_b[i].clone() - val_d[i].clone();
+                sum += diff.clone() * diff;
+            }
+            eval.add_constraint(squares[0].clone() - sum);
             eval.add_constraint(
-                is_br_eq_taken_h[0].clone() - is_br_eq[0].clone() * branch_taken_top[0].clone(),
+                squares_times_inv[0].clone() - squares[0].clone() * squares_inv[0].clone(),
             );
             eval.add_constraint(
-                is_br_ne_not_taken_h[0].clone()
-                    - is_br_ne[0].clone() * (E::F::one() - branch_taken_top[0].clone()),
+                is_cmp_or_branch.clone()
+                    * (E::F::one() - eq_flag_top[0].clone() - squares_times_inv[0].clone()),
             );
             // EqFlag boolean enforced unconditionally.
             eval.add_constraint(eq_flag_top[0].clone() * (E::F::one() - eq_flag_top[0].clone()));
@@ -1432,11 +1483,13 @@ impl BuiltInComponent for CpuChip {
             eval.add_constraint(
                 real_phi7_bool_h[0].clone() - is_real.clone() * phi7_bool_top[0].clone(),
             );
-            let phi7_field_local = crate::framework::eval::combine_le_u64::<E>(&phi7_top);
-            let phi7_inv_field_local = crate::framework::eval::combine_le_u64::<E>(&phi7_inv_top);
-            eval.add_constraint(
-                phi7_times_inv_h[0].clone() - phi7_field_local * phi7_inv_field_local,
-            );
+            // Its bytes' sum, at most 2040, is zero exactly when the
+            // register is: φ10 non-zero but ≡ 0 mod p, as a base-256
+            // combination would see it, is non-zero here.
+            let phi7_sum = phi7_top
+                .iter()
+                .fold(E::F::zero(), |sum, byte| sum + byte.clone());
+            eval.add_constraint(phi7_times_inv_h[0].clone() - phi7_sum * phi7_inv_top[0].clone());
         }
 
         // ── Residual helpers ──
@@ -1571,25 +1624,13 @@ impl BuiltInComponent for CpuChip {
         // control-flow helper block above.
 
         // ── Branch condition constraints ──
-        // Branch eq/ne constraints read `(val_b[i] - val_d[i])` directly.
-        // The constraint shape:
-        //   is_br_eq · branch_taken · (val_b[i] - val_d[i]) = 0
-        //     ⇒ if BranchEq is taken, val_b[i] = val_d[i] for every byte.
-        //   is_br_ne · (1 - branch_taken) · (val_b[i] - val_d[i]) = 0
-        //     ⇒ if BranchNe is NOT taken, val_b[i] = val_d[i] for every byte.
-        // The converse (val_b == val_d ⇒ branch_taken_eq = 1) is benign in
-        // PVM semantics: branch_taken is the prover's witness for "PC took
-        // the offset path", not "the comparison succeeded".  When target ==
-        // sequential_next_pc the two coincide regardless, so a flipped
-        // branch_taken witness produces the same next_pc and the rest of
-        // the trace is unaffected.  See the loose-corner test in
-        // tests/control_flow_negative.rs.
-        // Gate via IsBrEqTakenH / IsBrNeNotTakenH.
-        for i in 0..WORD_SIZE {
-            let diff = val_b[i].clone() - val_d[i].clone();
-            eval.add_constraint(is_br_eq_taken_h[0].clone() * diff.clone());
-            eval.add_constraint(is_br_ne_not_taken_h[0].clone() * diff);
-        }
+        // Equal: taken exactly when the operands are equal; not equal:
+        // exactly when they differ. EqFlag is their equality both ways.
+        let eq_flag = crate::trace::trace_eval!(trace_eval, Column::EqFlag);
+        eval.add_constraint(is_br_eq[0].clone() * (branch_taken[0].clone() - eq_flag[0].clone()));
+        eval.add_constraint(
+            is_br_ne[0].clone() * (branch_taken[0].clone() + eq_flag[0].clone() - E::F::one()),
+        );
 
         // Unsigned Lt: branch_taken = cmp_lt_flag
         eval.add_constraint(
@@ -1609,21 +1650,14 @@ impl BuiltInComponent for CpuChip {
             is_br_ge_s[0].clone()
                 * (branch_taken[0].clone() - (E::F::one() - cmp_lt_s_flag[0].clone())),
         );
-        // EqFlag: constrain val_b == val_d flag.
-        let eq_flag = crate::trace::trace_eval!(trace_eval, Column::EqFlag);
-        // eq_flag boolean is enforced unconditionally in the branch-helper
-        // block above.
-        // eq_flag=1 ⇒ val_b[i] = val_d[i] (byte-wise) — gate via IsCmpOrBranchEqH.
-        let _ = eq_flag; // routed through helpers above
+        // EqFlag = 1 ⇒ val_b[i] = val_d[i] (byte-wise) — gate via
+        // IsCmpOrBranchEqH; its converse is the squares' inverse above.
         for i in 0..WORD_SIZE {
             eval.add_constraint(
                 is_cmp_or_branch_eq_h[0].clone() * (val_b[i].clone() - val_d[i].clone()),
             );
         }
-        // eq_flag=0 ⇒ cmp_lt_flag or NOT equal. Constrain: eq_flag + cmp_lt_flag <= 1 wouldn't work.
-        // Use: (1 - eq_flag) means at least one sub_result byte is non-zero.
-        // Sufficient for Le/Gt: branch_taken = cmp_lt_flag + eq_flag for LeU (≤ = < OR ==)
-        // This is sound because eq_flag=1 forces all sub_result=0 (proven above).
+        // Le/Gt: (≤) = (<) or (=), the two exclusive, so taken = lt + eq.
 
         // Unsigned Le: branch_taken = cmp_lt_flag + eq_flag - cmp_lt_flag*eq_flag (OR)
         // Simpler since cmp_lt_flag and eq_flag can't both be 1 (if lt, not equal):
@@ -1675,6 +1709,9 @@ impl BuiltInComponent for CpuChip {
                 - is_jump[0].clone()
                 - is_branch_taken_h[0].clone()
                 - is_exit[0].clone();
+            for c in pc_carry.iter() {
+                eval.add_constraint(c.clone() * (E::F::one() - c.clone()));
+            }
 
             // Byte 0: next_pc[0] + carry[0]*256 = pc[0] + 1 + skip_len
             eval.add_constraint(
@@ -1851,21 +1888,23 @@ impl BuiltInComponent for CpuChip {
         //   3. MemSize equals the number of active bytes,
         //   4. MemSize ∈ {0, 1, 2, 4, 8}  (the valid PVM access widths).
         //
-        // Combined, these uniquely determine MemByteActive from MemSize.
+        // Combined, these uniquely determine MemByteActive from MemSize. They
+        // hold on every row: a padding row's flags are zero, so its MemSize
+        // and its active bytes are too.
         {
             let mem_size = crate::trace::trace_eval!(trace_eval, Column::MemSize);
             // Per-byte MemByteActive boolean is enforced unconditionally in
             // the control-flow helper block above.
             // Monotonicity.
             for i in 0..WORD_SIZE - 1 {
-                eval.add_constraint(is_real.clone() * mem_byte_active_mono_h[i].clone());
+                eval.add_constraint(mem_byte_active_mono_h[i].clone());
             }
             // MemSize equals the count of active bytes.
             let mut active_sum = E::F::zero();
             for i in 0..WORD_SIZE {
                 active_sum += mem_byte_active[i].clone();
             }
-            eval.add_constraint(is_real.clone() * (mem_size[0].clone() - active_sum));
+            eval.add_constraint(mem_size[0].clone() - active_sum);
             // Pin MemSize to opcode-canonical width via per-size flags
             // pinned by ProgramMemoryChip.  A flag-based formulation keeps
             // the degree at 1 (a direct degree-6 valid-size polynomial
@@ -1881,7 +1920,7 @@ impl BuiltInComponent for CpuChip {
                 + f_is_mem_size_2_l[0].clone() * E::F::from(BaseField::from(2u32))
                 + f_is_mem_size_4_l[0].clone() * E::F::from(BaseField::from(4u32))
                 + f_is_mem_size_8_l[0].clone() * E::F::from(BaseField::from(8u32));
-            eval.add_constraint(is_real.clone() * (mem_size[0].clone() - canonical_size));
+            eval.add_constraint(mem_size[0].clone() - canonical_size);
         }
 
         // ════════════════════════════════════════════════════════════════════
@@ -2246,20 +2285,16 @@ impl BuiltInComponent for CpuChip {
                 ));
             }
 
-            // Phi7Bool ↔ Phi7 (the u64-combined field value) tie, gated only
-            // by is_real (at non-ECALL rows the Phi7Bool is still consistent
-            // with Phi7 because trace gen derives both from regs_before[7]).
-            let phi7_field = crate::framework::eval::combine_le_u64::<E>(&phi7);
-            let phi7_inv_field = crate::framework::eval::combine_le_u64::<E>(&phi7_inv);
+            // Phi7Bool ↔ Phi7 (its bytes' sum, zero exactly when the
+            // register is) tie, gated only by is_real.
             // Phi7Bool boolean enforced unconditionally in the helper block
             // above.
-            // If Phi7Bool = 0, then Phi7 (as field) = 0.
-            let _ = phi7_field;
-            let _ = phi7_inv_field;
-            eval.add_constraint(
-                real_not_phi7_bool_h[0].clone()
-                    * crate::framework::eval::combine_le_u64::<E>(&phi7),
-            );
+            // If Phi7Bool = 0, then Phi7's bytes are 0.
+            let _ = phi7_inv;
+            let phi7_sum = phi7
+                .iter()
+                .fold(E::F::zero(), |sum, byte| sum + byte.clone());
+            eval.add_constraint(real_not_phi7_bool_h[0].clone() * phi7_sum);
             // If Phi7Bool = 1, then Phi7 · Phi7Inv = 1 — body lifted into
             // Phi7TimesInvH so the gate × body is deg 2.
             eval.add_constraint(
@@ -2294,9 +2329,16 @@ impl BuiltInComponent for CpuChip {
                 &tuple,
             ));
 
+            // The pointers are 32-bit: the machine refuses a call whose
+            // φ7 or φ8 is past 2^32, and the call tuple carries their low
+            // four bytes only.
+            for i in 4..WORD_SIZE {
+                eval.add_constraint(is_blake_ecall[0].clone() * phi10[i].clone());
+                eval.add_constraint(is_blake_ecall[0].clone() * phi11[i].clone());
+            }
+
             // Phi7Bool / IsBlakeEcall booleans enforced unconditionally in
             // the helper block above.
-            let _ = is_blake_ecall;
         }
 
         // ── Witness-input register reads ──
@@ -2480,7 +2522,8 @@ impl BuiltInComponent for CpuChip {
         // sum expression to its canonical value at every real step.
         //
         // 6 emissions per row keep `finalize_logup_in_pairs`'s parity
-        // even.  Multiplicity = is_real on every emission.
+        // even.  Multiplicity 1 on every row, padding included, so a padding
+        // row's zero flag bytes pin its flags.
         //
         // Bit layout per byte (matches `pack_flags` in
         // chips/program_memory.rs and the canonical 48-flag layout in
@@ -2532,8 +2575,7 @@ impl BuiltInComponent for CpuChip {
             let f_is_rotate_r64_p55 = crate::trace::trace_eval!(trace_eval, Column::IsRotateR64);
             let f_is_rotate_l32_p55 = crate::trace::trace_eval!(trace_eval, Column::IsRotateL32);
             let f_is_rotate_r32_p55 = crate::trace::trace_eval!(trace_eval, Column::IsRotateR32);
-            let f_is_rotate_r_imm_alt_p55 =
-                crate::trace::trace_eval!(trace_eval, Column::IsRotateRImmAlt);
+            let f_is_imm_alt_p55 = crate::trace::trace_eval!(trace_eval, Column::IsImmAlt);
 
             // Sum expressions for the 4 folded category slots.
             let bw_sum_e = is_and_flag[0].clone()
@@ -2616,7 +2658,7 @@ impl BuiltInComponent for CpuChip {
             ];
             // byte 5: (FlagByte5, is_rotate_l64, is_count_set_bits,
             //          is_lzb, is_tzb, is_rotate_r64, is_rotate_l32,
-            //          is_rotate_r32, is_rotate_r_imm_alt)
+            //          is_rotate_r32, is_imm_alt)
             let tuple5: Vec<E::F> = vec![
                 fb5[0].clone(),
                 f_is_rotate_l64_p55[0].clone(),
@@ -2626,15 +2668,11 @@ impl BuiltInComponent for CpuChip {
                 f_is_rotate_r64_p55[0].clone(),
                 f_is_rotate_l32_p55[0].clone(),
                 f_is_rotate_r32_p55[0].clone(),
-                f_is_rotate_r_imm_alt_p55[0].clone(),
+                f_is_imm_alt_p55[0].clone(),
             ];
 
             for t in [&tuple0, &tuple1, &tuple2, &tuple3, &tuple4, &tuple5] {
-                eval.add_to_relation(RelationEntry::new(
-                    byte_to_bits_lookup,
-                    is_real.clone().into(),
-                    t,
-                ));
+                eval.add_to_relation(RelationEntry::new(byte_to_bits_lookup, E::EF::one(), t));
             }
 
             // Flag bytes 6..9, recomposed here from their bits, each bit a
@@ -2739,6 +2777,13 @@ impl BuiltInComponent for CpuChip {
             eval.add_constraint(
                 is_real_trap_h[0].clone() * (E::F::one() - is_padding_next[0].clone()),
             );
+            // A trap stays at its pc: no other constraint binds a Trap's
+            // next pc, which a segment ending at it publishes as its final
+            // pc, and only a halt continues at the halt address.
+            let pc = crate::trace::trace_eval!(trace_eval, Column::Pc);
+            for (next, pc) in next_pc.iter().zip(&pc) {
+                eval.add_constraint(is_trap_col[0].clone() * (next.clone() - pc.clone()));
+            }
         }
 
         // ════════════════════════════════════════════════════════════════════
@@ -3039,21 +3084,18 @@ impl BuiltInComponent for CpuChip {
         //                                          imm_y_bytes[i]) = 0
         // for `i ∈ 0..4`.
         //
-        // Out of scope: MemSize=8 stores' imm_y high 4 bytes — would
-        // need an ImmYBytesHi[4] column pinned in prog_mem analogous
-        // to ImmYCanon.  StoreImmU64 and
-        // StoreImmIndU64 with imm_y > 2^32 are therefore still
-        // partially prover-trusted (high 4 bytes of value
-        // unbound).  The low 4 bytes of MemValue ARE bound.
+        // An 8-byte store's high 4 bytes are imm_y's sign extension,
+        // each its byte 4, `ImmYBytes[4]`, which the prog_mem tuple
+        // carries too.
         {
             let is_store_imm_any_local =
                 crate::trace::trace_eval!(trace_eval, Column::IsStoreImmAny);
             let imm_y_bytes_local = crate::trace::trace_eval!(trace_eval, Column::ImmYBytes);
-            for i in 0..4 {
+            for i in 0..WORD_SIZE {
                 eval.add_constraint(
                     is_store_imm_any_local[0].clone()
                         * mem_byte_active[i].clone()
-                        * (mem_value[i].clone() - imm_y_bytes_local[i].clone()),
+                        * (mem_value[i].clone() - imm_y_bytes_local[i.min(4)].clone()),
                 );
             }
         }
@@ -3586,6 +3628,21 @@ impl BuiltInComponent for CpuChip {
                     witness_call_lookup,
                     non_empty[0].clone().into(),
                     &call,
+                ));
+            }
+        }
+
+        // ── The next timestamp's limbs are bytes ──
+        // The carry chain fixes the timestamp's field value, not its limbs:
+        // a withheld carry leaves a limb of 256 that a successor carries on.
+        // Eight emissions, kept last (CONSTRAINTS.md 2).
+        {
+            let next_ts = crate::trace::trace_eval!(trace_eval, Column::NextTimestamp);
+            for limb in &next_ts {
+                eval.add_to_relation(RelationEntry::new(
+                    range256_lookup,
+                    is_real.clone().into(),
+                    core::slice::from_ref(limb),
                 ));
             }
         }

@@ -1,6 +1,6 @@
 //! ProgramMemoryChip — a preprocessed table mapping each basic-block-starting
 //! PC of `code` to its decoded instruction tuple `(opcode, skip_len, reg_a,
-//! reg_b, reg_d, imm, flag_bytes[10], imm_y_canon, branch_target_canon,
+//! reg_b, reg_d, imm, flag_bytes[10], imm_y_canon[5], branch_target_canon,
 //! host_call_precompile_dispatch)`.
 //!
 //! The tuple's flag bag carries per-opcode category/sub-category flags and
@@ -11,7 +11,7 @@
 //! trace.  CpuChip binds each individual flag column (or its
 //! sum-of-sub-flags expression for the 4 folded category slots) to its
 //! packed byte: by 6 byte-to-bits lookups per row for bytes 0..5, by its
-//! own recomposition constraints for bytes 6..9.  The prog_mem tuple is 36
+//! own recomposition constraints for bytes 6..9.  The prog_mem tuple is 37
 //! limbs.
 //!
 //! Soundness chain:
@@ -22,10 +22,11 @@
 //!   - The lookup tuple in `add_constraints` reads from preprocessed columns
 //!     (not main), so the prover cannot smuggle a different tuple even if
 //!     they tampered with main columns — main only contributes Multiplicity.
-//!   - On non-basic-block-starting PCs all preprocessed fields are zero;
-//!     CpuChip steps never have a fully-zero `(pc, opcode, …)` tuple at a
-//!     non-zero pc, so consumer demand at those rows yields zero matches.
-//!     Padding rows past `code.len()` similarly hold zero.
+//!   - On non-basic-block-starting PCs, and on padding rows past
+//!     `code.len()`, all preprocessed fields but the pc are zero, and the
+//!     preprocessed `IsInstruction` refuses them any multiplicity: a step
+//!     of opcode 0 and no flags would otherwise fetch the zero tuple, a
+//!     no-op that only advances its pc.
 //!   - Each FlagByte_i on CpuChip is bound to the canonical
 //!     packed byte via the prog_mem lookup balance; the byte-to-bits
 //!     lookup or the recomposition binds each individual flag column to
@@ -127,11 +128,12 @@ pub enum PreprocessedColumn {
     FlagByte8,
     #[size = 1]
     FlagByte9,
-    /// Low 4 bytes of canonical `imm_y` for
-    /// LoadImmJumpInd (the jump offset).  0 for ops without a second
+    /// Low 5 bytes of canonical `imm_y`, sign-extended from at most 4
+    /// bytes, so byte 4 is each of its high bytes: LoadImmJumpInd's jump
+    /// offset and an immediate store's value.  0 for ops without a second
     /// immediate.  Bound to CpuChip's ImmYBytes column via the prog_mem
     /// tuple lookup.
-    #[size = 4]
+    #[size = 5]
     ImmYCanon,
     /// Canonical absolute target for static
     /// jumps/branches at this PC, as 4 little-endian bytes.  Computed
@@ -148,6 +150,11 @@ pub enum PreprocessedColumn {
     /// so it also commits the host-dispatch policy.
     #[size = 1]
     HostCallPrecompileDispatch,
+    /// 1 iff an instruction starts at this PC. Only such a row is
+    /// fetched: every other holds the zero tuple, which a step of opcode 0
+    /// and no flags would match, a no-op that only advances its pc.
+    #[size = 1]
+    IsInstruction,
 }
 
 /// The packed flag bytes, in tuple order.
@@ -196,10 +203,15 @@ impl BuiltInComponent for ProgramMemoryChip {
             PreprocessedColumn::HostCallPrecompileDispatch
         );
         let mult = crate::trace::trace_eval!(trace_eval, Column::Multiplicity);
+        let is_instruction =
+            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsInstruction);
+        eval.add_constraint(
+            (E::F::from(BaseField::from(1u32)) - is_instruction[0].clone()) * mult[0].clone(),
+        );
 
         // Tuple: pc[4] + opcode + skip_len + reg_a + reg_b + reg_d + imm[8]
-        //        + 10 packed flag bytes + imm_y_canon[4] + branch_target_canon[4]
-        //        + host_call_precompile_dispatch = 36 limbs.
+        //        + 10 packed flag bytes + imm_y_canon[5] + branch_target_canon[4]
+        //        + host_call_precompile_dispatch = 37 limbs.
         let mut tuple: Vec<E::F> = pc.to_vec();
         tuple.push(opcode[0].clone());
         tuple.push(skip_len[0].clone());
@@ -242,6 +254,7 @@ impl BuiltInProverComponent for ProgramMemoryChip {
             let bbs = (row < side_note.code.len())
                 && side_note.bitmask.get(row).copied().unwrap_or(0) == 1;
             if bbs {
+                trace.fill_columns(row, true, PreprocessedColumn::IsInstruction);
                 let d = decode_at(&side_note.code, &side_note.bitmask, row);
                 trace.fill_columns(row, d.opcode, PreprocessedColumn::Opcode);
                 trace.fill_columns(row, d.skip_len, PreprocessedColumn::SkipLen);
@@ -256,7 +269,7 @@ impl BuiltInProverComponent for ProgramMemoryChip {
                 );
                 trace.fill_columns_bytes(
                     row,
-                    &d.imm_y_canon.to_le_bytes(),
+                    &d.imm_y_canon.to_le_bytes()[..5],
                     PreprocessedColumn::ImmYCanon,
                 );
                 trace.fill_columns(
@@ -333,7 +346,7 @@ impl BuiltInProverComponent for ProgramMemoryChip {
         );
         let mult = crate::trace::original_base_column!(component_trace, Column::Multiplicity);
 
-        // Build the 36-limb tuple from preprocessed columns.
+        // Build the 37-limb tuple from preprocessed columns.
         let mut tuple: Vec<_> = pc.to_vec();
         tuple.push(opcode[0].clone());
         tuple.push(skip_len[0].clone());
@@ -375,7 +388,7 @@ struct Decoded {
     host_call_precompile_dispatch: u8,
     flags: [u8; crate::lookups::PROG_MEMORY_N_FLAGS],
     branch_target_canon: u32,
-    imm_y_canon: u32,
+    imm_y_canon: u64,
 }
 
 /// Pack the individual flag bits into little-endian bytes: `bytes[k]` has
@@ -435,6 +448,6 @@ fn decode_at(code: &[u8], bitmask: &[u8], pc: usize) -> Decoded {
         host_call_precompile_dispatch,
         flags: f,
         branch_target_canon,
-        imm_y_canon: imm_y as u32,
+        imm_y_canon: imm_y,
     }
 }
