@@ -1,0 +1,13 @@
+vos-recair
+Licensed under the Apache License, Version 2.0.
+
+This crate adapts code from starkware-libs/proving
+(https://github.com/starkware-libs/proving), at revision 916aefb5,
+Copyright StarkWare Industries Ltd., licensed under the Apache License,
+Version 2.0. Each adapted file names its sources at its top and states that
+it was modified (Apache-2.0 §4(b)):
+
+- src/context.rs, from crates/circuits/src/context.rs,
+  crates/circuits/src/finalize_constants.rs and
+  crates/circuit_common/src/finalize.rs;
+- src/value.rs, from crates/circuits/src/ivalue.rs.

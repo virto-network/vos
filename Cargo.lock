@@ -2490,6 +2490,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "vos-final-verifier"
+version = "0.1.0"
+dependencies = [
+ "stwo",
+ "vos-recair-air",
+]
+
+[[package]]
 name = "vos-jam"
 version = "0.1.0"
 dependencies = [
@@ -2680,6 +2688,30 @@ name = "vos-raft"
 version = "0.1.0"
 dependencies = [
  "proptest",
+]
+
+[[package]]
+name = "vos-recair"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "num-traits",
+ "serde",
+ "stwo",
+ "stwo-constraint-framework",
+ "vos-pvm-poseidon2",
+ "vos-pvm-proof",
+ "vos-recair-air",
+]
+
+[[package]]
+name = "vos-recair-air"
+version = "0.1.0"
+dependencies = [
+ "num-traits",
+ "stwo",
+ "stwo-constraint-framework",
+ "vos-pvm-poseidon2",
 ]
 
 [[package]]

@@ -18,8 +18,9 @@
 //!   names: 31, 32, 33 and 34 name its hardened form (the witness input, the
 //!   Ristretto chips removed, the AIR audit's fixes), and the numbers that
 //!   named its earlier form, 24 to 27 and 29, are [`RETIRED`]: refused, and
-//!   never registered again. 28 and 30 prove the recursion AIR and keep
-//!   their numbers.
+//!   never registered again. 28, 30 and 32 prove the recursion AIR
+//!   (`vos-recair-air`), whose leaves verify the segment AIR, and keep their
+//!   numbers.
 //! - **33** is the Blake2s segment format the default entry points produce,
 //!   kept while the refine bundles, the chain proofs and their tests use it.
 //!   Its transcript has no interaction PoW and mixes the boundary states a
@@ -28,7 +29,10 @@
 //! - **28 and 30 to 32, and 34** use the lossless encodings
 //!   ([`Encoding::Lossless`]) and exactly their parameters. 28, 30, 32 and 34
 //!   are registered and refused until their AIRs and channels exist; the
-//!   wrap's fold step 3 is refused until it is reviewed.
+//!   wrap's fold step 3 is refused until it is reviewed. 32's AIR and channel
+//!   exist: `vos-recair` proves and verifies its proofs natively, pinning
+//!   each circuit by its hash. This registry, which the segment verifiers
+//!   read, refuses it until the leaf pins its padded shape.
 //! - **The inner formats** (31, 32) grind 20 bits of PoW and 8 of interaction
 //!   PoW and take 44 queries: 62.8 proven bits for segments, the query
 //!   term binding.

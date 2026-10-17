@@ -1,0 +1,20 @@
+[package]
+name = "vos-recair"
+edition.workspace = true
+version.workspace = true
+license = "Apache-2.0"
+description = "The recursion AIR's prover: circuits built by a Context, their wiring checked, traced, proved and verified on the Poseidon2-M31 channel."
+
+[dependencies]
+vos-recair-air = { workspace = true }
+vos-pvm-poseidon2 = { workspace = true }
+# The Poseidon2-M31 channel and its SIMD backend, the format registry, the
+# transcript's header and the security accounting.
+vos-pvm-proof = { workspace = true }
+stwo = { workspace = true, features = ["std", "prover", "parallel"] }
+stwo-constraint-framework = { workspace = true, features = ["std", "prover", "parallel"] }
+num-traits = "0.2"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+bincode = "1"

@@ -783,9 +783,12 @@ counts as conjectured / proven at the reference shape [model]:
   while the refine bundles and chain proofs use it: no interaction PoW,
   the boundary states mixed a word at a time, and the proof's own
   parameters under the 96-bit conjectured floor.
-- **31 to 34 name the hardened segment AIR;** 28 and 30 prove the
-  recursion AIR. A reserved entry is refused until its AIR and channel
-  exist, and 28 until affine batching does.
+- **31 to 34 name the hardened segment AIR;** 28, 30 and 32 prove the
+  recursion AIR, 32's leaves verifying the segment AIR. A reserved entry is
+  refused until its AIR and channel exist, and 28 until affine batching
+  does. 32's exist from slice 5's 5.8: `vos-recair` proves and verifies its
+  proofs natively, and the registry the segment verifiers read refuses it
+  until the leaf pins its padded shape.
 - **24 to 27 and 29 are retired.** They named the segment AIR before its
   hardening, so they are refused and never registered again: a number
   names one AIR.

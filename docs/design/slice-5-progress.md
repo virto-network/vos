@@ -2033,3 +2033,168 @@ refactors, a commit each; none changes a constraint.
 - `just clippy`: green.
 - `vos-pvm-poseidon2` on stable (1.96), with and without `packed`: builds and
   its 14 tests pass.
+
+## Step 5.8: the gate VM
+
+`recursion-air.md` §10's step 1, on `vos-core` from `4ae3cee6`.
+
+### The crates
+
+- **`vos-recair-air`** (`pvm/proof/recair-air`), no_std, on Stwo's
+  verifier path and `vos-pvm-poseidon2`, with no prover dependency:
+  - `p2`: one Poseidon2-M31 permutation a row, in `vos-pvm-poseidon2`'s
+    reference arrangement (the external matrix first, 4 + 14 + 4 rounds),
+    the S-box as `a = y²`, `out = a²·y`; the seven modes of §1.3, the last
+    round's S-box outputs read at offset −1, the previous row's output the
+    external matrix over them. 33 preprocessed, 309 main and 12
+    interaction columns, 303 constraints, as §1.2 counted;
+  - `qm31` (17, 16, 8; 3 constraints) and `h8` (7, 36, 12; 7), as §1.4 and
+    §1.5 state them;
+  - `gate`: the `Gate` relation `(address, l0..l3)`, the reserved
+    addresses, the public terms, and §1.1's soundness argument written out
+    in the module's docs;
+  - the circuit hash: one Poseidon2-M31 absorption, from the zero digest,
+    of a domain, the format's number and six parameters, the components'
+    log sizes and the preprocessed root, each integer as 16-bit limbs.
+- **`vos-recair`** (`pvm/proof/recair`), the prover:
+  - `Context<V>`: one code path builds the wiring (`NoValue`) and the
+    witness (`SecureField`); a test builds random circuits both ways and
+    finds the same wiring;
+  - the static check (`Circuit::check_wiring`): components a power of two
+    of at least 16 rows, no chained row 0, every address below `p`, each
+    used address yielded exactly once with the count of its uses, the
+    absolute multiplicities below `p`. `finalize` runs it;
+  - trace generation: preprocessed columns from the wiring, main columns
+    from the witness, the interaction from the main columns (so a tampered
+    trace gets an honest-looking interaction); a `p2` padding row holds the
+    permutation of zero;
+  - `prove` and `verify` on the Poseidon2-M31 channel under format 32,
+    with the structural preflight, the exact-parameter and security checks
+    (the relation width 5), the canonical-limb check and the Fiat-Shamir
+    query-count check the segment verifiers run;
+  - `gadgets`: the leaf sponge, the Merkle node and the transcript, each
+    the `vos-pvm-poseidon2` mode it mirrors.
+  - Adapted from starkware-libs/proving at `916aefb5` (Apache-2.0): the
+    `Context` (with `finalize_constants` and `circuit_common`'s padding)
+    and the value trait; each file says so, and `NOTICE` lists them.
+- **`vos-final-verifier`** (`pvm/proof/final-verifier`): a skeleton that
+  builds the recursion AIR's components, so the dependency graph is
+  checked on every target.
+
+### Decisions
+
+- **Format 32's entry, not a new number.** A recursion-AIR proof carries
+  32 at its exact parameters. The registry keeps 32 reserved: it is the
+  table the segment verifiers read, and they check a proof's channel, not
+  its kind, so admitting 32 there would let a segment proof carry it.
+  `vos_recair::verify` takes 32 by its kind and channel. Admission waits
+  for the leaf to pin the padded shape (5.12). `format.rs` and `proving.md`
+  A.4 said 31 to 34 name the segment AIR and only 28 and 30 the recursion
+  AIR; they now say 32 proves the recursion AIR, its leaves verifying the
+  segment AIR.
+- **The transcript** of a recursion-AIR proof: the header (domain,
+  format, PCS configuration, log sizes), the preprocessed root, the main
+  root, the outputs' values (where a segment mixes its boundary states:
+  the public terms read them), the interaction PoW, the `Gate`
+  challenges, the claimed sums, the interaction root, then Stwo's.
+- **Only guesses are yielded by a consumer.** A constant is yielded only by
+  the gate that fixes it: a consumer's yield would let the prover choose
+  the constant's value.
+- **An `h8` input cannot yield:** its five inputs are fixed uses (§1.5's
+  seven preprocessed columns). A guess read only by `h8` rows, or by a
+  node's bit, is yielded at `finalize` by an identity row. Padding `h8`
+  rows read the zero wire five times; its yield counts them.
+- **`p2` rows are laid out chain by chain.** A transcript's absorptions
+  chain from one another while its draws are wired rows between them, so
+  rows cannot follow the transcript's order. Each chained row names its
+  predecessor, which may have one successor, and `finalize` places each
+  chain contiguously. §1.3's modes cover the new transcript: an
+  absorption after a draw chains from the last absorption, and the PoW's
+  second permutation chains from its first (channel first).
+- **The number of outputs** is bound by the logup, not the hash: an
+  output claimed fewer leaves its yield unbalanced, one claimed more a
+  public term nothing cancels.
+- **The degree audit** uses the recording evaluator's expressions with a
+  memoized walk: constraint-framework's `degree_bound` recomputes an
+  intermediate at every reference, exponential over `p2`'s partial rounds,
+  and counts a preprocessed column, which `ExprEvaluator` names by its id,
+  as a constant. The walk counts preprocessed columns at degree 1; with
+  them as constants it agrees with the framework's count on `qm31` and
+  `h8`.
+- **R5, the archive's failure, does not occur here.** The three
+  components, each finalizing several fractions in pairs, prove together
+  on the SIMD backend at every size assignment tried; a scratch run on the
+  CPU backend, the archive's, proved four assignments too [measured, not
+  kept]. The failure was the archive's own code, not the pinned Stwo.
+
+### Tests (`just check`)
+
+- `gate_vm`: random circuits over every gate and mode prove and verify,
+  each refused under another circuit's hash; the wiring built without
+  values is the filled wiring's; the static check refuses a second yield
+  (also with the yields' counts summing right), a yield removed, a
+  miscounted yield, multiplicities totalling `p` and a chained row 0;
+  `finalize` yields the guesses only `h8` reads and pads with permutations
+  of zero.
+- `modes`: `p2` equals `vos-pvm-poseidon2` in every mode (leaves of 0–21
+  values against `LeafSponge`, nodes of either bit against `compress`, a
+  path into a guessed root, a transcript's absorptions, draws and PoW
+  against `Transcript`), and the circuit proves and verifies. Tampers
+  refused: in each of the seven modes an S-box column and the low and high
+  input (the permutation recomputed), a padding row's input, by the
+  constraints; an unread message lane on a used wire, a `qm31` operand
+  moved with its output, an `h8` accumulator moved with its output, by the
+  logup alone (the constraints hold); a `qm31` output and an `h8` sample by
+  the constraints; and a finished proof's claimed sum, claimed sums moved
+  between components, output, interaction PoW, sampled value, log size
+  and format.
+- `gates`: the three below.
+- `vos-recair-air`'s unit tests: the designed widths and counts, and
+  `p2`'s columns against the permutation.
+
+### Gates
+
+[measured, on the Intel Core Ultra 7 155H, 22 threads, load average 2–3]
+- **A 10k-gate circuit proves and verifies:** a random circuit of 10,002
+  rows (3,362 `p2`, 5,762 `qm31`, 878 `h8`; log sizes 12, 13, 10) proves
+  in 125 ms and verifies in 13 ms, a 196,957-byte proof; the test
+  process's peak resident memory is 69 MB.
+- **The padded shape** (a scratch run, not kept): a random circuit of
+  150k rows padded to 2^16 / 2^17 / 2^16 proves in 1.5–1.8 s with a peak of
+  1.04 GB, and verifies in 17–19 ms; §5 projected 0.6–1.4 GiB and
+  1.2–2.6 s for the leaf.
+- **The degree ≤ 3 audit passes:** `p2`'s 303 constraints, 143 of degree
+  2 and 160 of degree 3; `qm31`'s 3 of degree 3; `h8`'s 7, one of degree
+  2 and six of degree 3.
+- **A three-component multi-fraction logup proves at three log sizes:**
+  one circuit (20 / 12 / 10 rows) padded to `p2`, `qm31`, `h8` at 2^5,
+  2^6, 2^7, then 2^7, 2^5, 2^6 and 2^6, 2^7, 2^5, then 2^10, 2^12, 2^14,
+  every claimed sum nonzero.
+- **`vos-final-verifier` builds without std:** on stable (1.94.1) for x86
+  and wasm32; on the pinned nightly for wasm32 with every nightly feature
+  refused (`-Zallow-features=`), for thumbv7em with build-std, and for the
+  PVM with the settlement verifier's target spec and build-std, in
+  release. `just check-no-std` runs the three nightly builds.
+- **`just check`** green under `systemd-run` at 14 GiB, `nice -n 10`,
+  `CARGO_INCREMENTAL=0`, 8 jobs: 1,037 tests (1,019 at 5.8.0 (B)), the new
+  crates' 13 among them; clippy clean on the three crates' targets.
+
+### A pre-existing failure, fixed
+
+- `node/host/tests/tree_crash.rs` panicked (`no entry found for key`)
+  when a round's writer was killed before its first apply committed, which
+  the machine's load made likely: at version 0 neither map has values, and
+  the check indexed them. It now takes a missing map as empty, whose root is
+  the empty tree's, as `roots::root` reports it.
+
+### Outside the step's files
+
+- Root `Cargo.toml`: the three crates as members and workspace
+  dependencies, `opt-level = 3` for the two recursion crates in the dev
+  and test profiles.
+- `justfile`: the three crates in `test` and `check`; `check-no-std`
+  builds the final verifier for thumbv7em, for wasm32 with no nightly
+  feature, and for the PVM.
+- `pvm/proof/src/format.rs` and `proving.md` A.4: format 32's AIR, as
+  above.
+- `node/host/tests/tree_crash.rs`: the fix above.

@@ -21,6 +21,9 @@ members = [
     "pvm/proof",
     "pvm/proof/precompiles",
     "pvm/proof/poseidon2",
+    "pvm/proof/recair-air",
+    "pvm/proof/recair",
+    "pvm/proof/final-verifier",
     "pvm/proof/derive",
     "pvm/proof/verifier",
     "pvm/bench",
@@ -109,6 +112,15 @@ opt-level = 3
 opt-level = 3
 [profile.test.package.vos-pvm-poseidon2]
 opt-level = 3
+# The recursion AIR's prover: its tests prove.
+[profile.dev.package.vos-recair-air]
+opt-level = 3
+[profile.test.package.vos-recair-air]
+opt-level = 3
+[profile.dev.package.vos-recair]
+opt-level = 3
+[profile.test.package.vos-recair]
+opt-level = 3
 
 [workspace.dependencies]
 # Exact: the workspace nightly is a 1.90 pre-release, which a later fjall
@@ -119,6 +131,8 @@ vos-pvm-proof-derive = { path = "pvm/proof/derive" }
 vos-pvm-proof-verifier = { path = "pvm/proof/verifier" }
 vos-pvm-precompiles = { path = "pvm/proof/precompiles" }
 vos-pvm-poseidon2 = { path = "pvm/proof/poseidon2" }
+vos-recair-air = { path = "pvm/proof/recair-air" }
+vos-recair = { path = "pvm/proof/recair" }
 vos-pvm = { path = "pvm/runtime" }
 vos-pvm-compiler = { path = "pvm/compiler" }
 vos-pvm-program = { path = "pvm/program" }

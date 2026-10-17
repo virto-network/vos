@@ -1,0 +1,18 @@
+[package]
+name = "vos-recair-air"
+edition.workspace = true
+version.workspace = true
+license = "Apache-2.0"
+description = "The recursion AIR's constraint bodies: the Poseidon2-M31 permutation, the QM31 gate and the DEEP accumulator, wired by one Gate relation. no_std, without the prover."
+
+[dependencies]
+# Without features: the verifier path stays free of std, and of the prover's
+# nightly SIMD.
+stwo = { workspace = true }
+stwo-constraint-framework = { workspace = true }
+num-traits = { version = "0.2", default-features = false }
+vos-pvm-poseidon2 = { workspace = true }
+
+[lints.clippy]
+# The bodies are indexed by limb, word and round.
+needless_range_loop = { level = "allow", priority = 0 }

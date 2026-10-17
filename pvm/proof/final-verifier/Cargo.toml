@@ -1,0 +1,11 @@
+[package]
+name = "vos-final-verifier"
+edition.workspace = true
+version.workspace = true
+license = "Apache-2.0"
+description = "The final wrap's verifier: no_std, for x86, wasm32 and the PVM. A skeleton until the wrap exists."
+
+[dependencies]
+# Without features: no std, and none of the prover's nightly SIMD.
+stwo = { workspace = true }
+vos-recair-air = { workspace = true }
