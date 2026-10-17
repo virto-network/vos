@@ -318,14 +318,21 @@ fn verify_with_options_explicit_components(
     // Mix `proof.{initial,final}_state` (registers, pc,
     // timestamp) into the FS transcript. Mirrors the prover-side mix in
     // `prove.rs` immediately after the main-trace commit, so the lookup
-    // elements drawn next depend on the claimed boundary states. Gated
-    // on `side_note.closing_chip_active` — the default `verify` path
-    // sees the flag via the prover-mutated side_note, and chip-isolated
-    // `verify_with_explicit_components` only flips it when the caller's
-    // slice includes the boundary + closing chip pair. Order MUST match
-    // the prover (initial first, then final). `memory_commitment` stays
-    // unmixed (computed outside the circuit).
-    if side_note.closing_chip_active {
+    // elements drawn next depend on the claimed boundary states. The
+    // production path (`boundary_positions` known) always mixes and binds:
+    // the side note is the prover's, so its `closing_chip_active` cannot
+    // switch the binding off. Chip-isolated `verify_with_explicit_components`
+    // mixes only when the caller's slice includes the boundary + closing
+    // chip pair and flipped the flag. Order MUST match the prover (initial
+    // first, then final). `memory_commitment` stays unmixed (computed
+    // outside the circuit).
+    let binds_boundary = boundary_positions.is_some() || side_note.closing_chip_active;
+    if boundary_positions.is_some() && initial_state.timestamp < 1 {
+        return Err(VerificationError::InvalidStructure(
+            "initial_state.timestamp must be >= 1 (memory-boundary anchoring)".to_string(),
+        ));
+    }
+    if binds_boundary {
         for r in &initial_state.registers {
             verifier_channel.mix_u64(*r);
         }
@@ -368,9 +375,7 @@ fn verify_with_options_explicit_components(
     // positions = the chip-isolated explicit-components path, which has
     // no stable component order and is not a trust boundary; the
     // production path always supplies `Some`.
-    if side_note.closing_chip_active
-        && let Some(positions) = &boundary_positions
-    {
+    if let Some(positions) = &boundary_positions {
         crate::boundary_binding::check_boundary_claimed_sums(
             &initial_state,
             &final_state,
