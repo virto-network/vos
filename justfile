@@ -73,9 +73,11 @@ clippy:
     cargo clippy -p vos-pvm-proof --features debug-internals --all-targets --quiet -- -D warnings
 
 # Fails on any JAR remnant in the PVM crates: its ISA and gas modes, opcodes,
-# exits, capability surface, linker entry points and fixtures.
+# exits, capability surface, linker entry points, invocation kernel, CSR
+# 0x800 marker and fixtures. The proof crate's own `kernel` module and a
+# 0x800 rounding constant are not remnants.
 jar-check:
-    let hits = (rg -n --glob '!**/target/**' 'IsaMode|CapabilityManifest|\blink_elf\b|link_elf_with_argument_pages|run_with_vos_stubs|ECALL_VOS_|VOS_OBJECT_CAP|Opcode::Ecall\b|ExitReason::Ecall|ExitReason::Trap\b|kernel::|vm_pool|JAR\\x02|\.gp072\.json|\bGasModel\b|\bPerInstruction\b|\bmem_cycles\b|Opcode::Sbrk|\bsbrk\(|\b0x800\b' pvm | complete); if ($hits.exit_code == 0) { print $hits.stdout; error make { msg: "JAR remnants found" } } else { print "no JAR remnants" }
+    let hits = (rg -n --glob '!**/target/**' 'IsaMode|CapabilityManifest|\blink_elf\b|link_elf_with_argument_pages|run_with_vos_stubs|ECALL_VOS_|VOS_OBJECT_CAP|Opcode::Ecall\b|ExitReason::Ecall|ExitReason::Trap\b|vos_pvm::kernel::|InvocationKernel|vm_pool|JAR\\x02|\.gp072\.json|\bGasModel\b|\bPerInstruction\b|\bmem_cycles\b|Opcode::Sbrk|\bsbrk\(|(?i:csr\w*,? 0x800)\b|\(\d, 0x800\)|Some\(0x800\)' pvm | complete); if ($hits.exit_code == 0) { print $hits.stdout; error make { msg: "JAR remnants found" } } else { print "no JAR remnants" }
 
 # The SDK's test actors, built with the guest toolchain in `pvm/guest`.
 build-test-actors:
