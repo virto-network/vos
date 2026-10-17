@@ -380,6 +380,11 @@ generic bignum chip replaces them.
   `chip_isolated`); the dispatch gates and the host-call pc gates now run
   on BLAKE2b and the witness input; the segment fixture threads three
   BLAKE2b compressions across its windows.
+- **Gates** [measured, on this machine]: `just check` green, 998 tests;
+  `just test-proof` under `systemd-run` at 16 GiB with `nice -n 10` green,
+  465 tests (the prover's library 132 → 91 unit tests); `just
+  test-bench-proof` green; clippy clean on every feature set of `just
+  clippy` that touches the prover.
 
 ## Step 5.7: the items carried from slice 4
 
