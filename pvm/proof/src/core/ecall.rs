@@ -29,102 +29,13 @@ pub const ECALL_WITNESS_INPUT: u32 = 0x401;
 /// CPU-chip dispatch code for the witness input.
 pub(crate) const DISPATCH_WITNESS_INPUT: u8 = 101;
 
-/// Hostcall ID for Ristretto255 scalar multiplication precompile.
-///
-/// Convention:
-///   φ\[7\] = scalar_ptr  (32 canonical bytes, scalar mod ℓ)
-///   φ\[8\] = point_ptr   (32 bytes, compressed Ristretto encoding)
-///   φ\[9\] = output_ptr  (32 bytes, compressed Ristretto, written by the call)
-///
-/// scalar_ptr (32B read) and point_ptr (32B read) are inputs;
-/// output_ptr (32B write) receives the compressed encoding of `k * P`.
-/// All three buffers must lie in flat_mem; they may alias subject to
-/// the read-before-write ordering the MemoryChip ledger enforces (the
-/// 64 reads at the call's timestamp are inserted before the 32 writes).
-///
-/// On non-canonical scalar bytes or an invalid point encoding the
-/// precompile writes the empty-result sentinel `[0u8; 32]` (which is
-/// the canonical compressed Ristretto identity, so callers must
-/// validate against expected output rather than treating zeros as
-/// "ok").  The chip's constraints will accept this output as the
-/// canonical "input was malformed" branch.
-pub const ECALL_RISTRETTO_SCALAR_MULT: u32 = 110;
-
-/// Hostcall ID for Ristretto255 compressed-point addition precompile.
-///
-/// Convention:
-///   φ\[7\] = p_ptr      (32 bytes, compressed Ristretto)
-///   φ\[8\] = q_ptr      (32 bytes, compressed Ristretto)
-///   φ\[9\] = output_ptr (32 bytes, compressed Ristretto, written by call)
-///
-/// Decompresses both operands, adds them as Ristretto group elements,
-/// recompresses, and writes the result.  On non-canonical or invalid
-/// input encodings, writes the canonical compressed identity
-/// (`[0u8; 32]`).  Used by callers to compose Pedersen commits like
-/// `v·G + b·H` as one scalar-mult ECALL + one scalar-mult ECALL +
-/// one add ECALL — all the curve arithmetic happens host-side
-/// (chip-side under R1f-bis), no PVM-level field ops.
-pub const ECALL_RISTRETTO_POINT_ADD: u32 = 111;
-
-/// Hostcall ID for the Ristretto255 wide-scalar reduction precompile.
-///
-/// Convention:
-///   φ\[7\] = wide_ptr   (64 bytes input — the uniform-random source)
-///   φ\[8\] = output_ptr (32 bytes — canonical scalar mod ℓ, written)
-///
-/// Replaces dalek's `Scalar::from_bytes_mod_order_wide` (which on
-/// PVM expands into ~60% of an `Amount::commit` trace via the
-/// u64-backend's `montgomery_mul / sub / pack` chain).  Output is
-/// always a canonical 32-byte scalar in [0, ℓ); the host-side
-/// reference goes through `curve25519-dalek` so the result agrees
-/// bit-for-bit with the dalek reference values.
-pub const ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE: u32 = 112;
-
-/// Hostcall ID for scalar multiplication mod ℓ (Schnorr/Ristretto
-/// scalar field).  Mirrors dalek's `Scalar * Scalar` public API.
-///
-/// Convention:
-///   φ\[7\] = a_ptr      (32 canonical bytes — Scalar mod ℓ)
-///   φ\[8\] = b_ptr      (32 canonical bytes)
-///   φ\[9\] = output_ptr (32 bytes — `(a * b) mod ℓ`, written)
-pub const ECALL_SCALAR_MUL_MOD_L: u32 = 113;
-
-/// Hostcall ID for scalar addition mod ℓ.  Mirrors dalek's
-/// `Scalar + Scalar` public API.  Same convention as MUL above.
-pub const ECALL_SCALAR_ADD_MOD_L: u32 = 114;
-
-/// The Ristretto and scalar calls, which the RistrettoEcallChip serves.
-pub(crate) const ECALL_RISTRETTO: [u32; 5] = [
-    ECALL_RISTRETTO_SCALAR_MULT,
-    ECALL_RISTRETTO_POINT_ADD,
-    ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE,
-    ECALL_SCALAR_MUL_MOD_L,
-    ECALL_SCALAR_ADD_MOD_L,
-];
-
-/// The Ristretto and scalar calls that read three operands, φ7 to φ9: all
-/// but the wide reduction, which reads two.
-pub(crate) const ECALL_RISTRETTO_THREE_OPERANDS: [u32; 4] = [
-    ECALL_RISTRETTO_SCALAR_MULT,
-    ECALL_RISTRETTO_POINT_ADD,
-    ECALL_SCALAR_MUL_MOD_L,
-    ECALL_SCALAR_ADD_MOD_L,
-];
-
-/// Whether host call `id` is one of `ids`.
-pub(crate) fn is_one_of(id: u64, ids: &[u32]) -> bool {
-    ids.iter().any(|&listed| u64::from(listed) == id)
-}
-
 /// Whether the proof runtime has a deterministic handler for this `ecalli`
 /// identifier: exactly the calls [`crate::core::tracing::TracingPvm`]
 /// serves.
 ///
 /// This is a kernel's calls, the runtime's precompile set and the witness
-/// input, plus the Ristretto and scalar ids 110–114, which only this tracer
-/// serves: the refine host answers them with `WHAT`, and the guest computes
-/// in software. A program using them therefore traces differently here than
-/// it runs on VOS.
+/// input. Any other id, 110 to 114 included, has no handler: a program
+/// reaching one does not trace.
 ///
 /// ProgramMemory commits the dispatch identifier, which is non-zero exactly
 /// for these calls, so an untrusted prover cannot mark an unknown call as
@@ -142,13 +53,6 @@ pub const fn proof_precompile_dispatch_id(id: u64) -> u8 {
     match id {
         id if id == ECALL_BLAKE2B_COMPRESS as u64 => DISPATCH_BLAKE2B_COMPRESS,
         id if id == ECALL_WITNESS_INPUT as u64 => DISPATCH_WITNESS_INPUT,
-        id if id == ECALL_RISTRETTO_SCALAR_MULT as u64 => ECALL_RISTRETTO_SCALAR_MULT as u8,
-        id if id == ECALL_RISTRETTO_POINT_ADD as u64 => ECALL_RISTRETTO_POINT_ADD as u8,
-        id if id == ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE as u64 => {
-            ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE as u8
-        }
-        id if id == ECALL_SCALAR_MUL_MOD_L as u64 => ECALL_SCALAR_MUL_MOD_L as u8,
-        id if id == ECALL_SCALAR_ADD_MOD_L as u64 => ECALL_SCALAR_ADD_MOD_L as u8,
         _ => 0,
     }
 }
@@ -158,21 +62,22 @@ mod tests {
     use super::*;
 
     /// The tracer serves exactly the calls a kernel may make, the refine
-    /// host's precompiles and the witness input, plus the Ristretto and
-    /// scalar ids 110–114.
+    /// host's precompiles and the witness input; 110 to 114 are none.
     #[test]
-    fn tracer_serves_the_kernel_calls_plus_the_ristretto_ids() {
+    fn tracer_serves_exactly_the_kernel_calls() {
         assert_eq!(
             u64::from(ECALL_WITNESS_INPUT),
             vos_pvm::precompile::WITNESS_INPUT
         );
         for id in 0..0x1000u64 {
-            let ristretto = (110..=114).contains(&id);
             assert_eq!(
                 is_proof_host_call_allowed(id),
-                vos_pvm::precompile::is_kernel_call(id) || ristretto,
+                vos_pvm::precompile::is_kernel_call(id),
                 "id {id:#x}"
             );
+        }
+        for id in 110..=114 {
+            assert_eq!(proof_precompile_dispatch_id(id), 0, "id {id}");
         }
     }
 }

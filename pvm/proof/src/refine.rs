@@ -42,8 +42,8 @@ pub const REFINE_BUNDLE_FORMAT_VERSION: u32 = 4;
 pub const MAX_REFINE_PROOF_SLICES: usize = 1_024;
 /// A handled outer host call can contribute at most one boundary per slice.
 pub const MAX_REFINE_HOST_BOUNDARIES: usize = MAX_REFINE_PROOF_SLICES;
-/// The component mask is `u64`, so no proof shape can name more components.
-pub const MAX_REFINE_CHILD_COMPONENTS: usize = u64::BITS as usize;
+/// The component mask is `u32`, so no proof shape can name more components.
+pub const MAX_REFINE_CHILD_COMPONENTS: usize = u32::BITS as usize;
 /// Stwo's canonical tree count: preprocessed, main, interaction, composition.
 pub const REFINE_CHILD_COMMITMENT_COUNT: usize = crate::proof::PROOF_COMMITMENT_TREE_COUNT;
 /// Aggregate post-decode heap payload accepted across all child proofs.
@@ -238,7 +238,7 @@ pub fn refine_bundle_commitment(bundle: &RefineProofBundle) -> [u8; 32] {
 
         let proof = &slice.proof;
         put_u32(&mut bytes, proof.format_version);
-        put_u64(&mut bytes, proof.component_mask);
+        put_u32(&mut bytes, proof.component_mask);
         put_u64(&mut bytes, proof.num_components as u64);
         put_u32(&mut bytes, proof.log_sizes.len() as u32);
         for &size in &proof.log_sizes {

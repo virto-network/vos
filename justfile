@@ -36,7 +36,7 @@ vectors:
 # `debug-internals`, and the re-runs of the test actors' kernels from their
 # attests on the agent's model. Memory-heavy: two threads fit under a 24 GiB limit, e.g.
 # `systemd-run --user --scope -p MemoryMax=24G -p MemorySwapMax=0 just test-proof`.
-# Then the Poseidon2-M31 channel's proofs (format 27), on the tests whose code
+# Then the Poseidon2-M31 channel's proofs (format 29), on the tests whose code
 # differs under `poseidon2-channel`, each named by its path or its module's:
 # the proof format's generation, its wire codec, the transcript replay, and a
 # canonical segment proved and verified, which runs only under it. A test

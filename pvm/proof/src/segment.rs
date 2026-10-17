@@ -58,11 +58,7 @@ mod prover {
     use crate::core::step::{
         CompactStep, MemAccess, NUM_REGS, PvmStep, WitnessWrite, expand_steps,
     };
-    use crate::core::tracing::{
-        Blake2bMemOp, RistrettoMemOp, RistrettoPointAddMemOp, RistrettoPointAddRecord,
-        RistrettoRecord, ScalarBinopMemOp, ScalarBinopRecord, ScalarMultKind,
-        ScalarReduceWideMemOp, ScalarReduceWideRecord, TracingPvm,
-    };
+    use crate::core::tracing::{Blake2bMemOp, TracingPvm};
     use crate::side_note::{CompactTrace, SideNote};
     use alloc::collections::BTreeSet;
     use alloc::vec::Vec;
@@ -111,7 +107,7 @@ mod prover {
 
     /// Borrowed chain-wide fields common to the two chain holders
     /// ([`SideNote`] and [`CompactTrace`]): the program-static parts and
-    /// the five precompile call/mem-op stream pairs. Both cursors, both
+    /// the BLAKE2b precompile's call/mem-op streams. Both cursors, both
     /// budgeted cutters, and the segment assembly take this view, so a
     /// window built from either holder flows through identical code.
     struct ChainParts<'a> {
@@ -120,14 +116,6 @@ mod prover {
         jump_table: &'a [u32],
         blake2b_calls: &'a [crate::chips::blake2b::Blake2bCall],
         blake2b_mem_ops: &'a [crate::core::tracing::Blake2bMemOp],
-        ristretto_calls: &'a [crate::core::tracing::RistrettoRecord],
-        ristretto_mem_ops: &'a [crate::core::tracing::RistrettoMemOp],
-        ristretto_add_calls: &'a [crate::core::tracing::RistrettoPointAddRecord],
-        ristretto_add_mem_ops: &'a [crate::core::tracing::RistrettoPointAddMemOp],
-        scalar_reduce_wide_calls: &'a [crate::core::tracing::ScalarReduceWideRecord],
-        scalar_reduce_wide_mem_ops: &'a [crate::core::tracing::ScalarReduceWideMemOp],
-        scalar_binop_calls: &'a [crate::core::tracing::ScalarBinopRecord],
-        scalar_binop_mem_ops: &'a [crate::core::tracing::ScalarBinopMemOp],
     }
 
     impl<'a> From<&'a SideNote> for ChainParts<'a> {
@@ -138,14 +126,6 @@ mod prover {
                 jump_table: &full.jump_table,
                 blake2b_calls: &full.blake2b_calls,
                 blake2b_mem_ops: &full.blake2b_mem_ops,
-                ristretto_calls: &full.ristretto_calls,
-                ristretto_mem_ops: &full.ristretto_mem_ops,
-                ristretto_add_calls: &full.ristretto_add_calls,
-                ristretto_add_mem_ops: &full.ristretto_add_mem_ops,
-                scalar_reduce_wide_calls: &full.scalar_reduce_wide_calls,
-                scalar_reduce_wide_mem_ops: &full.scalar_reduce_wide_mem_ops,
-                scalar_binop_calls: &full.scalar_binop_calls,
-                scalar_binop_mem_ops: &full.scalar_binop_mem_ops,
             }
         }
     }
@@ -158,14 +138,6 @@ mod prover {
                 jump_table: &full.jump_table,
                 blake2b_calls: &full.blake2b_calls,
                 blake2b_mem_ops: &full.blake2b_mem_ops,
-                ristretto_calls: &full.ristretto_calls,
-                ristretto_mem_ops: &full.ristretto_mem_ops,
-                ristretto_add_calls: &full.ristretto_add_calls,
-                ristretto_add_mem_ops: &full.ristretto_add_mem_ops,
-                scalar_reduce_wide_calls: &full.scalar_reduce_wide_calls,
-                scalar_reduce_wide_mem_ops: &full.scalar_reduce_wide_mem_ops,
-                scalar_binop_calls: &full.scalar_binop_calls,
-                scalar_binop_mem_ops: &full.scalar_binop_mem_ops,
             }
         }
     }
@@ -239,7 +211,7 @@ mod prover {
 
         let mut cutter = BudgetedCutter::new(max_steps, max_pages);
         let mut bounds = Vec::new();
-        let (mut cb, mut cr, mut ca, mut cw, mut cs) = (0, 0, 0, 0, 0);
+        let mut cb = 0;
         let mut ranges: Vec<(u32, u32)> = Vec::new();
         for step in steps {
             let ts = step.ts();
@@ -251,34 +223,6 @@ mod prover {
                 ts,
                 |o| o.ts,
                 |o| blake2b_op_ranges(o, &mut ranges),
-            );
-            take_at(
-                parts.ristretto_mem_ops,
-                &mut cr,
-                ts,
-                |o| o.ts,
-                |o| ristretto_op_ranges(o, &mut ranges),
-            );
-            take_at(
-                parts.ristretto_add_mem_ops,
-                &mut ca,
-                ts,
-                |o| o.ts,
-                |o| ristretto_add_op_ranges(o, &mut ranges),
-            );
-            take_at(
-                parts.scalar_reduce_wide_mem_ops,
-                &mut cw,
-                ts,
-                |o| o.ts,
-                |o| scalar_reduce_wide_op_ranges(o, &mut ranges),
-            );
-            take_at(
-                parts.scalar_binop_mem_ops,
-                &mut cs,
-                ts,
-                |o| o.ts,
-                |o| scalar_binop_op_ranges(o, &mut ranges),
             );
 
             let (before, after) = cutter.feed(&ranges);
@@ -309,25 +253,6 @@ mod prover {
     fn blake2b_op_ranges(o: &Blake2bMemOp, out: &mut Vec<(u32, u32)>) {
         out.push((o.h_ptr, o.h_bytes.len() as u32));
         out.push((o.m_ptr, o.m_bytes.len() as u32));
-    }
-    fn ristretto_op_ranges(o: &RistrettoMemOp, out: &mut Vec<(u32, u32)>) {
-        out.push((o.scalar_ptr, o.scalar_bytes.len() as u32));
-        out.push((o.point_ptr, o.point_bytes.len() as u32));
-        out.push((o.output_ptr, o.out_bytes.len() as u32));
-    }
-    fn ristretto_add_op_ranges(o: &RistrettoPointAddMemOp, out: &mut Vec<(u32, u32)>) {
-        out.push((o.p_ptr, o.p_bytes.len() as u32));
-        out.push((o.q_ptr, o.q_bytes.len() as u32));
-        out.push((o.output_ptr, o.out_bytes.len() as u32));
-    }
-    fn scalar_reduce_wide_op_ranges(o: &ScalarReduceWideMemOp, out: &mut Vec<(u32, u32)>) {
-        out.push((o.wide_ptr, o.wide_bytes.len() as u32));
-        out.push((o.output_ptr, o.out_bytes.len() as u32));
-    }
-    fn scalar_binop_op_ranges(o: &ScalarBinopMemOp, out: &mut Vec<(u32, u32)>) {
-        out.push((o.a_ptr, o.a_bytes.len() as u32));
-        out.push((o.b_ptr, o.b_bytes.len() as u32));
-        out.push((o.output_ptr, o.out_bytes.len() as u32));
     }
 
     /// The incremental budgeted-cut decision — ONE code path behind the
@@ -418,16 +343,13 @@ mod prover {
     ///   segment, so the boundary memory commitment chains and in-segment
     ///   precompile reads of values written earlier bottom out at the right
     ///   bytes;
-    /// - the captured precompile records (blake2b / ristretto scalar-mult /
-    ///   point-add / scalar-reduce-wide / scalar-binop), each a parallel
+    /// - the captured BLAKE2b precompile records, a parallel
     ///   `call ↔ mem_op` pair, filtered to those whose `mem_op.ts` lies in
     ///   the segment's timestamp window `[steps[a].ts, steps[b].ts)`;
     /// - `jump_table` (program-static, shared by all segments).
     ///
     /// Lookup-multiplicity counts are NOT carried: the chips re-derive them
-    /// from the segment's steps during `prove`. `ingest_ristretto_boundary`
-    /// re-derives the comb / variable-base routing + comb counts from the
-    /// sliced scalar-mult records.
+    /// from the segment's steps during `prove`.
     ///
     /// Note: each call reconstructs the entering memory by replaying all
     /// writes with `ts < steps[a].ts` (step stores + precompile outputs), so
@@ -445,8 +367,8 @@ mod prover {
         );
         // Memory state entering the segment: replay EVERY write with
         // `ts < ts_lo` in timestamp order — both regular stores
-        // (`step.mem_write`) AND precompile output writes (blake2b /
-        // ristretto / scalar-* `*_mem_ops`), which are NOT recorded in
+        // (`step.mem_write`) AND precompile output writes (blake2b's
+        // `blake2b_mem_ops`), which are NOT recorded in
         // `step.mem_write`. Missing the precompile writes leaves stale bytes
         // at their output addresses, so a later segment's read of an
         // earlier-segment precompile result fails the memory-ledger
@@ -526,37 +448,6 @@ mod prover {
         sn.blake2b_calls = bc;
         sn.blake2b_mem_ops = bm;
 
-        let (rc, rm) = filter_pair(parts.ristretto_calls, parts.ristretto_mem_ops, |m| {
-            in_window(m.ts)
-        });
-        sn.ristretto_calls = rc;
-        sn.ristretto_mem_ops = rm;
-
-        let (ac, am) = filter_pair(
-            parts.ristretto_add_calls,
-            parts.ristretto_add_mem_ops,
-            |m| in_window(m.ts),
-        );
-        sn.ristretto_add_calls = ac;
-        sn.ristretto_add_mem_ops = am;
-
-        let (sc, sm) = filter_pair(
-            parts.scalar_reduce_wide_calls,
-            parts.scalar_reduce_wide_mem_ops,
-            |m| in_window(m.ts),
-        );
-        sn.scalar_reduce_wide_calls = sc;
-        sn.scalar_reduce_wide_mem_ops = sm;
-
-        let (bc2, bm2) = filter_pair(parts.scalar_binop_calls, parts.scalar_binop_mem_ops, |m| {
-            in_window(m.ts)
-        });
-        sn.scalar_binop_calls = bc2;
-        sn.scalar_binop_mem_ops = bm2;
-
-        // Re-derive comb / variable-base routing + comb counts from the
-        // sliced scalar-mult records.
-        sn.ingest_ristretto_boundary();
         sn
     }
 
@@ -566,8 +457,7 @@ mod prover {
     /// ENTERING step `t`); `None` applies all writes (the FINAL memory).
     ///
     /// Crucially this includes **precompile output writes** (blake2b's
-    /// 64-byte hash at `h_ptr`; ristretto / point-add / scalar-reduce /
-    /// scalar-binop's 32-byte result at `output_ptr`), which the per-step
+    /// 64-byte hash at `h_ptr`), which the per-step
     /// `mem_write` does NOT capture — they live in the `*_mem_ops` records.
     /// Used both for a segment's threaded initial memory (`segment_side_note`)
     /// and its final memory commitment (`prove`'s boundary state); the two
@@ -612,26 +502,6 @@ mod prover {
                 writes.push(write_of_bytes(op.ts, op.h_ptr, &op.out_bytes));
             }
         }
-        for op in &side_note.ristretto_mem_ops {
-            if keep(op.ts) {
-                writes.push(write_of_bytes(op.ts, op.output_ptr, &op.out_bytes));
-            }
-        }
-        for op in &side_note.ristretto_add_mem_ops {
-            if keep(op.ts) {
-                writes.push(write_of_bytes(op.ts, op.output_ptr, &op.out_bytes));
-            }
-        }
-        for op in &side_note.scalar_reduce_wide_mem_ops {
-            if keep(op.ts) {
-                writes.push(write_of_bytes(op.ts, op.output_ptr, &op.out_bytes));
-            }
-        }
-        for op in &side_note.scalar_binop_mem_ops {
-            if keep(op.ts) {
-                writes.push(write_of_bytes(op.ts, op.output_ptr, &op.out_bytes));
-            }
-        }
         writes
     }
 
@@ -659,8 +529,8 @@ mod prover {
         }
     }
 
-    /// A precompile output write (blake2b's 64 bytes at `h_ptr`; the
-    /// ristretto / scalar-* 32 bytes at `output_ptr`) as a pending write.
+    /// A precompile output write (blake2b's 64 bytes at `h_ptr`) or a
+    /// witness input's piece as a pending write.
     fn write_of_bytes(ts: u64, addr: u32, out: &[u8]) -> PendingWrite {
         let mut buf = [0u8; 64];
         buf[..out.len()].copy_from_slice(out);
@@ -779,8 +649,8 @@ mod prover {
 
         /// Apply every not-yet-applied write with `ts < ts_lo` to the
         /// carried image. Stream enumeration order mirrors
-        /// [`replay_writes`] (steps, then the five precompile output
-        /// streams); [`apply_writes`] then applies the batch in ts order.
+        /// [`replay_writes`] (steps, then the precompile output
+        /// stream); [`apply_writes`] then applies the batch in ts order.
         fn advance_to(&mut self, ts_lo: u64) {
             let full = self.full;
             let mut writes: Vec<PendingWrite> = Vec::new();
@@ -808,55 +678,17 @@ mod prover {
     #[derive(Default)]
     struct StreamCursors {
         blake2b: usize,
-        ristretto: usize,
-        ristretto_add: usize,
-        scalar_reduce_wide: usize,
-        scalar_binop: usize,
     }
 
     impl StreamCursors {
         /// Push every not-yet-applied precompile output write with
-        /// `ts < ts_lo`. Enumeration order mirrors [`replay_writes`]'s
-        /// stream order (blake2b, ristretto, point-add, wide-reduce,
-        /// scalar-binop); [`apply_writes`] sorts the batch by ts anyway.
+        /// `ts < ts_lo`; [`apply_writes`] sorts the batch by ts.
         fn drain_below(&mut self, parts: &ChainParts<'_>, ts_lo: u64, out: &mut Vec<PendingWrite>) {
             drain_stream(
                 parts.blake2b_mem_ops,
                 &mut self.blake2b,
                 ts_lo,
                 |m| write_of_bytes(m.ts, m.h_ptr, &m.out_bytes),
-                |m| m.ts,
-                out,
-            );
-            drain_stream(
-                parts.ristretto_mem_ops,
-                &mut self.ristretto,
-                ts_lo,
-                |m| write_of_bytes(m.ts, m.output_ptr, &m.out_bytes),
-                |m| m.ts,
-                out,
-            );
-            drain_stream(
-                parts.ristretto_add_mem_ops,
-                &mut self.ristretto_add,
-                ts_lo,
-                |m| write_of_bytes(m.ts, m.output_ptr, &m.out_bytes),
-                |m| m.ts,
-                out,
-            );
-            drain_stream(
-                parts.scalar_reduce_wide_mem_ops,
-                &mut self.scalar_reduce_wide,
-                ts_lo,
-                |m| write_of_bytes(m.ts, m.output_ptr, &m.out_bytes),
-                |m| m.ts,
-                out,
-            );
-            drain_stream(
-                parts.scalar_binop_mem_ops,
-                &mut self.scalar_binop,
-                ts_lo,
-                |m| write_of_bytes(m.ts, m.output_ptr, &m.out_bytes),
                 |m| m.ts,
                 out,
             );
@@ -998,10 +830,6 @@ mod prover {
     pub struct StepArrival {
         pub(crate) step: CompactStep,
         pub(crate) blake2b: Option<(Blake2bCall, Blake2bMemOp)>,
-        pub(crate) ristretto: Option<(RistrettoRecord, RistrettoMemOp)>,
-        pub(crate) ristretto_add: Option<(RistrettoPointAddRecord, RistrettoPointAddMemOp)>,
-        pub(crate) scalar_reduce_wide: Option<(ScalarReduceWideRecord, ScalarReduceWideMemOp)>,
-        pub(crate) scalar_binop: Option<(ScalarBinopRecord, ScalarBinopMemOp)>,
     }
 
     impl StepArrival {
@@ -1015,18 +843,6 @@ mod prover {
             if let Some((_, o)) = &self.blake2b {
                 blake2b_op_ranges(o, out);
             }
-            if let Some((_, o)) = &self.ristretto {
-                ristretto_op_ranges(o, out);
-            }
-            if let Some((_, o)) = &self.ristretto_add {
-                ristretto_add_op_ranges(o, out);
-            }
-            if let Some((_, o)) = &self.scalar_reduce_wide {
-                scalar_reduce_wide_op_ranges(o, out);
-            }
-            if let Some((_, o)) = &self.scalar_binop {
-                scalar_binop_op_ranges(o, out);
-            }
         }
 
         /// Every attached op must carry the step's own timestamp — the
@@ -1035,14 +851,6 @@ mod prover {
         fn assert_ts_consistent(&self) {
             let ts = self.step.timestamp;
             debug_assert!(self.blake2b.as_ref().is_none_or(|(_, o)| o.ts == ts));
-            debug_assert!(self.ristretto.as_ref().is_none_or(|(_, o)| o.ts == ts));
-            debug_assert!(self.ristretto_add.as_ref().is_none_or(|(_, o)| o.ts == ts));
-            debug_assert!(
-                self.scalar_reduce_wide
-                    .as_ref()
-                    .is_none_or(|(_, o)| o.ts == ts)
-            );
-            debug_assert!(self.scalar_binop.as_ref().is_none_or(|(_, o)| o.ts == ts));
         }
     }
 
@@ -1114,13 +922,6 @@ mod prover {
                         m,
                     )
                 }),
-                ristretto: pop_pair(&mut t.ristretto_records, &mut t.ristretto_mem_ops),
-                ristretto_add: pop_pair(&mut t.ristretto_add_records, &mut t.ristretto_add_mem_ops),
-                scalar_reduce_wide: pop_pair(
-                    &mut t.scalar_reduce_wide_records,
-                    &mut t.scalar_reduce_wide_mem_ops,
-                ),
-                scalar_binop: pop_pair(&mut t.scalar_binop_records, &mut t.scalar_binop_mem_ops),
             })
         }
 
@@ -1137,14 +938,6 @@ mod prover {
         steps: Vec<CompactStep>,
         blake2b_calls: Vec<Blake2bCall>,
         blake2b_mem_ops: Vec<Blake2bMemOp>,
-        ristretto_calls: Vec<RistrettoRecord>,
-        ristretto_mem_ops: Vec<RistrettoMemOp>,
-        ristretto_add_calls: Vec<RistrettoPointAddRecord>,
-        ristretto_add_mem_ops: Vec<RistrettoPointAddMemOp>,
-        scalar_reduce_wide_calls: Vec<ScalarReduceWideRecord>,
-        scalar_reduce_wide_mem_ops: Vec<ScalarReduceWideMemOp>,
-        scalar_binop_calls: Vec<ScalarBinopRecord>,
-        scalar_binop_mem_ops: Vec<ScalarBinopMemOp>,
     }
 
     impl WindowBuf {
@@ -1153,22 +946,6 @@ mod prover {
             if let Some((c, m)) = arr.blake2b {
                 self.blake2b_calls.push(c);
                 self.blake2b_mem_ops.push(m);
-            }
-            if let Some((c, m)) = arr.ristretto {
-                self.ristretto_calls.push(c);
-                self.ristretto_mem_ops.push(m);
-            }
-            if let Some((c, m)) = arr.ristretto_add {
-                self.ristretto_add_calls.push(c);
-                self.ristretto_add_mem_ops.push(m);
-            }
-            if let Some((c, m)) = arr.scalar_reduce_wide {
-                self.scalar_reduce_wide_calls.push(c);
-                self.scalar_reduce_wide_mem_ops.push(m);
-            }
-            if let Some((c, m)) = arr.scalar_binop {
-                self.scalar_binop_calls.push(c);
-                self.scalar_binop_mem_ops.push(m);
             }
         }
 
@@ -1189,14 +966,6 @@ mod prover {
                 jump_table,
                 blake2b_calls: &self.blake2b_calls,
                 blake2b_mem_ops: &self.blake2b_mem_ops,
-                ristretto_calls: &self.ristretto_calls,
-                ristretto_mem_ops: &self.ristretto_mem_ops,
-                ristretto_add_calls: &self.ristretto_add_calls,
-                ristretto_add_mem_ops: &self.ristretto_add_mem_ops,
-                scalar_reduce_wide_calls: &self.scalar_reduce_wide_calls,
-                scalar_reduce_wide_mem_ops: &self.scalar_reduce_wide_mem_ops,
-                scalar_binop_calls: &self.scalar_binop_calls,
-                scalar_binop_mem_ops: &self.scalar_binop_mem_ops,
             }
         }
 
@@ -1206,18 +975,6 @@ mod prover {
         fn pending_writes(&self, out: &mut Vec<PendingWrite>) {
             for m in &self.blake2b_mem_ops {
                 out.push(write_of_bytes(m.ts, m.h_ptr, &m.out_bytes));
-            }
-            for m in &self.ristretto_mem_ops {
-                out.push(write_of_bytes(m.ts, m.output_ptr, &m.out_bytes));
-            }
-            for m in &self.ristretto_add_mem_ops {
-                out.push(write_of_bytes(m.ts, m.output_ptr, &m.out_bytes));
-            }
-            for m in &self.scalar_reduce_wide_mem_ops {
-                out.push(write_of_bytes(m.ts, m.output_ptr, &m.out_bytes));
-            }
-            for m in &self.scalar_binop_mem_ops {
-                out.push(write_of_bytes(m.ts, m.output_ptr, &m.out_bytes));
             }
         }
     }
@@ -1252,8 +1009,7 @@ mod prover {
     /// run (unit-pinned by the `trace_stream_*` equivalence tests).
     ///
     /// Contract: call [`Self::next_window`] repeatedly; after each
-    /// `Some(bounds)`, optionally call [`Self::side_note`] (or
-    /// [`Self::fixed_base_calls`] for the metadata passes) before the next
+    /// `Some(bounds)`, optionally call [`Self::side_note`] before the next
     /// `next_window` call retires the window — skipped windows advance the
     /// carried state without expansion, the cursor pattern's sparse-probe
     /// economy.
@@ -1394,22 +1150,6 @@ mod prover {
                 SegmentMemory::Dense(self.mem.clone()),
                 w.ts_hi.expect("a current window's ts bound is resolved"),
             )
-        }
-
-        /// The current window's fixed-base scalar-mult (comb) call count —
-        /// what `ristretto_comb_calls.len()` would be on its assembled
-        /// `SideNote` (`ingest_ristretto_boundary` routes exactly the
-        /// `FixedBasepoint`-kind records onto the comb path), without
-        /// assembling it. The metadata passes' probe-selection key.
-        pub fn fixed_base_calls(&self) -> usize {
-            self.current
-                .as_ref()
-                .expect("no current window: call next_window first")
-                .buf
-                .ristretto_calls
-                .iter()
-                .filter(|r| r.kind == ScalarMultKind::FixedBasepoint)
-                .count()
         }
 
         /// Steps consumed so far; the trace's total length once
@@ -1605,16 +1345,15 @@ mod tests {
         );
     }
 
-    /// 12 steps (ts 1..=12) + one record on EVERY precompile stream, laid
+    /// 12 steps (ts 1..=12) + a BLAKE2b compression in each window, laid
     /// out so a 4-step cut ([0,4) [4,8) [8,12)) threads precompile output
     /// writes across both window boundaries:
-    ///   - window 0: blake2b at ts 2 (output at 4090 — PAST the 4096-byte
-    ///     image, so the entering images of windows 1 and 2 must carry
-    ///     `replay_writes`' resize growth) + a Variable scalar mult at ts 3;
-    ///   - window 1: a FixedBasepoint scalar mult at ts 5 (exercises the
-    ///     comb routing), a point-add at ts 6, a wide reduce at ts 7;
-    ///   - window 2: a scalar binop at ts 9 (slice-only — no later window
-    ///     observes its write).
+    ///   - window 0: at ts 2 (output at 4090 — PAST the 4096-byte image, so
+    ///     the entering images of windows 1 and 2 must carry
+    ///     `replay_writes`' resize growth);
+    ///   - window 1: at ts 5, output at 0x180;
+    ///   - window 2: at ts 9 (slice-only — no later window observes its
+    ///     write).
     /// Regular stores carry distinct non-zero values, so a missed or
     /// misplaced write/slice can't vanish into an all-zero image. The
     /// register history is CONSISTENT (a non-zero seeded file threaded
@@ -1624,11 +1363,7 @@ mod tests {
     /// equivalence tests reuse this fixture.
     fn threaded_trace() -> SideNote {
         use crate::chips::blake2b::Blake2bCall;
-        use crate::core::tracing::{
-            Blake2bMemOp, RistrettoMemOp, RistrettoPointAddMemOp, RistrettoPointAddRecord,
-            RistrettoRecord, ScalarBinopMemOp, ScalarBinopRecord, ScalarMultKind,
-            ScalarReduceWideMemOp, ScalarReduceWideRecord,
-        };
+        use crate::core::tracing::Blake2bMemOp;
 
         let mut steps = Vec::new();
         let mut regs = [0u64; NUM_REGS];
@@ -1668,97 +1403,23 @@ mod tests {
             .with_memory(vec![0u8; 4096])
             .with_jump_table(vec![2, 4]);
 
-        sn.blake2b_calls.push(Blake2bCall {
-            h: [1; 8],
-            m: [2; 16],
-            t: 3,
-            f: true,
-        });
-        sn.blake2b_mem_ops.push(Blake2bMemOp {
-            h_ptr: 4090,
-            m_ptr: 0x300,
-            ts: 2,
-            h_bytes: [5; 64],
-            m_bytes: [6; 128],
-            out_bytes: core::array::from_fn(|i| 0xA0 ^ i as u8),
-        });
-
-        sn.ristretto_calls.push(RistrettoRecord {
-            scalar: [7; 32],
-            point: [8; 32],
-            output: [9; 32],
-            kind: ScalarMultKind::Variable,
-        });
-        sn.ristretto_mem_ops.push(RistrettoMemOp {
-            scalar_ptr: 0x100,
-            point_ptr: 0x140,
-            output_ptr: 0x180,
-            ts: 3,
-            scalar_bytes: [7; 32],
-            point_bytes: [8; 32],
-            out_bytes: [9; 32],
-            kind: ScalarMultKind::Variable,
-        });
-        sn.ristretto_calls.push(RistrettoRecord {
-            scalar: [0x21; 32],
-            point: [0x22; 32],
-            output: [0x23; 32],
-            kind: ScalarMultKind::FixedBasepoint,
-        });
-        sn.ristretto_mem_ops.push(RistrettoMemOp {
-            scalar_ptr: 0x100,
-            point_ptr: 0x140,
-            output_ptr: 0x1C0,
-            ts: 5,
-            scalar_bytes: [0x21; 32],
-            point_bytes: [0x22; 32],
-            out_bytes: [0x23; 32],
-            kind: ScalarMultKind::FixedBasepoint,
-        });
-
-        sn.ristretto_add_calls.push(RistrettoPointAddRecord {
-            p: [10; 32],
-            q: [11; 32],
-            output: [12; 32],
-        });
-        sn.ristretto_add_mem_ops.push(RistrettoPointAddMemOp {
-            p_ptr: 0x200,
-            q_ptr: 0x220,
-            output_ptr: 0x240,
-            ts: 6,
-            p_bytes: [10; 32],
-            q_bytes: [11; 32],
-            out_bytes: [12; 32],
-        });
-
-        sn.scalar_reduce_wide_calls.push(ScalarReduceWideRecord {
-            wide: [13; 64],
-            output: [14; 32],
-        });
-        sn.scalar_reduce_wide_mem_ops.push(ScalarReduceWideMemOp {
-            wide_ptr: 0x260,
-            output_ptr: 0x2A0,
-            ts: 7,
-            wide_bytes: [13; 64],
-            out_bytes: [14; 32],
-        });
-
-        sn.scalar_binop_calls.push(ScalarBinopRecord {
-            op_id: 113,
-            a: [15; 32],
-            b: [16; 32],
-            output: [17; 32],
-        });
-        sn.scalar_binop_mem_ops.push(ScalarBinopMemOp {
-            op_id: 113,
-            a_ptr: 0x2C0,
-            b_ptr: 0x2E0,
-            output_ptr: 0x320,
-            ts: 9,
-            a_bytes: [15; 32],
-            b_bytes: [16; 32],
-            out_bytes: [17; 32],
-        });
+        // One compression in each window: ts 2, 5 and 9.
+        for (ts, h_ptr, seed) in [(2, 4090, 0xA0u8), (5, 0x180, 0x30), (9, 0x2C0, 0x60)] {
+            sn.blake2b_calls.push(Blake2bCall {
+                h: [1; 8],
+                m: [2; 16],
+                t: 3,
+                f: true,
+            });
+            sn.blake2b_mem_ops.push(Blake2bMemOp {
+                h_ptr,
+                m_ptr: 0x300,
+                ts,
+                h_bytes: [5; 64],
+                m_bytes: [6; 128],
+                out_bytes: core::array::from_fn(|i| seed ^ i as u8),
+            });
+        }
         sn
     }
 
@@ -1766,10 +1427,9 @@ mod tests {
     /// `segment_side_note` populates: the sliced steps, the entering image
     /// (raw bytes — both paths apply the identical write set, so even
     /// `replay_writes`' resize growth must agree byte-for-byte, no
-    /// root-level indirection needed), the entering registers, the five
-    /// filtered call/mem-op stream pairs, the program-static fields, and
-    /// everything `ingest_ristretto_boundary` derives (comb calls + counts,
-    /// plus the Variable path's range256 bumps).
+    /// root-level indirection needed), the entering registers, the
+    /// filtered call/mem-op streams, the program-static fields and the
+    /// range-check counts.
     fn assert_windows_equal(via_cursor: &SideNote, via_slice: &SideNote) {
         assert_eq!(via_cursor.steps, via_slice.steps);
         assert_eq!(via_cursor.code, via_slice.code);
@@ -1784,37 +1444,6 @@ mod tests {
         assert_eq!(via_cursor.jump_table_counts, via_slice.jump_table_counts);
         assert_eq!(via_cursor.blake2b_calls, via_slice.blake2b_calls);
         assert_eq!(via_cursor.blake2b_mem_ops, via_slice.blake2b_mem_ops);
-        assert_eq!(via_cursor.ristretto_calls, via_slice.ristretto_calls);
-        assert_eq!(via_cursor.ristretto_mem_ops, via_slice.ristretto_mem_ops);
-        assert_eq!(
-            via_cursor.ristretto_add_calls,
-            via_slice.ristretto_add_calls
-        );
-        assert_eq!(
-            via_cursor.ristretto_add_mem_ops,
-            via_slice.ristretto_add_mem_ops
-        );
-        assert_eq!(
-            via_cursor.scalar_reduce_wide_calls,
-            via_slice.scalar_reduce_wide_calls
-        );
-        assert_eq!(
-            via_cursor.scalar_reduce_wide_mem_ops,
-            via_slice.scalar_reduce_wide_mem_ops
-        );
-        assert_eq!(via_cursor.scalar_binop_calls, via_slice.scalar_binop_calls);
-        assert_eq!(
-            via_cursor.scalar_binop_mem_ops,
-            via_slice.scalar_binop_mem_ops
-        );
-        assert_eq!(
-            via_cursor.ristretto_comb_calls,
-            via_slice.ristretto_comb_calls
-        );
-        assert_eq!(
-            via_cursor.ristretto_comb_counts,
-            via_slice.ristretto_comb_counts
-        );
         assert_eq!(via_cursor.range256_counts, via_slice.range256_counts);
     }
 
@@ -1835,15 +1464,12 @@ mod tests {
         assert_eq!(w1.initial_memory.len(), 4090 + 64);
         let blake_out: [u8; 64] = core::array::from_fn(|i| 0xA0 ^ i as u8);
         assert_eq!(w1.initial_memory[4090..4154], blake_out);
-        // ...window 1 routes its FixedBasepoint record onto the comb path...
-        assert_eq!(w1.ristretto_comb_calls.len(), 1);
-        // ...and window 2's entering image sees every earlier precompile
-        // output write (variable mult, comb mult, point add, wide reduce).
+        // ...and window 2's entering image sees window 1's output too,
+        // but not its own.
         let w2 = segment_side_note(&full, 8, 12);
-        assert_eq!(w2.initial_memory[0x180..0x1A0], [9u8; 32]);
-        assert_eq!(w2.initial_memory[0x1C0..0x1E0], [0x23u8; 32]);
-        assert_eq!(w2.initial_memory[0x240..0x260], [12u8; 32]);
-        assert_eq!(w2.initial_memory[0x2A0..0x2C0], [14u8; 32]);
+        let second_out: [u8; 64] = core::array::from_fn(|i| 0x30 ^ i as u8);
+        assert_eq!(w2.initial_memory[0x180..0x1C0], second_out);
+        assert_eq!(w2.initial_memory[0x2C0..0x300], [0u8; 64]);
     }
 
     #[test]
@@ -1921,14 +1547,6 @@ mod tests {
             jump_table: full.jump_table.to_vec(),
             blake2b_calls: full.blake2b_calls.clone(),
             blake2b_mem_ops: full.blake2b_mem_ops.clone(),
-            ristretto_calls: full.ristretto_calls.clone(),
-            ristretto_mem_ops: full.ristretto_mem_ops.clone(),
-            ristretto_add_calls: full.ristretto_add_calls.clone(),
-            ristretto_add_mem_ops: full.ristretto_add_mem_ops.clone(),
-            scalar_reduce_wide_calls: full.scalar_reduce_wide_calls.clone(),
-            scalar_reduce_wide_mem_ops: full.scalar_reduce_wide_mem_ops.clone(),
-            scalar_binop_calls: full.scalar_binop_calls.clone(),
-            scalar_binop_mem_ops: full.scalar_binop_mem_ops.clone(),
         }
     }
 
@@ -1937,9 +1555,8 @@ mod tests {
     /// every `PvmStep` field (snapshots rebuilt from the threaded register
     /// file; `assert_windows_equal`'s steps equality is `PvmStep`'s derived
     /// `PartialEq`), the entering image (with `replay_writes`' resize
-    /// growth), the entering registers, and everything
-    /// `ingest_ristretto_boundary` derives. The fixture crosses register
-    /// writes, a branch, and all five precompile streams over the window
+    /// growth) and the entering registers. The fixture crosses register
+    /// writes, a branch, and precompile records over the window
     /// boundaries.
     #[test]
     fn compact_cursor_matches_segment_side_note() {
@@ -2010,8 +1627,8 @@ mod tests {
     /// Test-only [`StepSource`]: replays a hand-built full-trace fixture
     /// as arrivals — each step with the precompile pair recorded at its
     /// ts — so the ONLINE windower can be driven over the same synthetic
-    /// fixtures the offline paths are pinned on (all five streams,
-    /// records crossing window boundaries, resize growth).
+    /// fixtures the offline paths are pinned on (records crossing window
+    /// boundaries, resize growth).
     struct ReplaySource {
         arrivals: std::collections::VecDeque<crate::segment::StepArrival>,
         initial_regs: [u64; NUM_REGS],
@@ -2037,30 +1654,6 @@ mod tests {
                     crate::segment::StepArrival {
                         step: s.to_compact(),
                         blake2b: pair_at(&full.blake2b_calls, &full.blake2b_mem_ops, ts, |m| m.ts),
-                        ristretto: pair_at(
-                            &full.ristretto_calls,
-                            &full.ristretto_mem_ops,
-                            ts,
-                            |m| m.ts,
-                        ),
-                        ristretto_add: pair_at(
-                            &full.ristretto_add_calls,
-                            &full.ristretto_add_mem_ops,
-                            ts,
-                            |m| m.ts,
-                        ),
-                        scalar_reduce_wide: pair_at(
-                            &full.scalar_reduce_wide_calls,
-                            &full.scalar_reduce_wide_mem_ops,
-                            ts,
-                            |m| m.ts,
-                        ),
-                        scalar_binop: pair_at(
-                            &full.scalar_binop_calls,
-                            &full.scalar_binop_mem_ops,
-                            ts,
-                            |m| m.ts,
-                        ),
                     }
                 })
                 .collect();
@@ -2097,9 +1690,9 @@ mod tests {
         )
     }
 
-    /// The W2(a) equivalence bar, synthetic side: over the all-streams
+    /// The W2(a) equivalence bar, synthetic side: over the threaded
     /// fixture (precompile records crossing both boundaries, resize
-    /// growth past the image, comb routing) the ONLINE windower's cut
+    /// growth past the image) the ONLINE windower's cut
     /// and windows must equal the offline path — the uniform cut
     /// (`page_budget = 0`) checked window-by-window against
     /// `segment_side_note`, field for field.
@@ -2159,25 +1752,6 @@ mod tests {
             }
         }
         panic!("stream never reached the probe window");
-    }
-
-    /// The comb-count metadata a probe pass keys on must equal what the
-    /// assembled window derives — `fixed_base_calls()` is the no-assembly
-    /// count of `ristretto_comb_calls` (the fixture routes one
-    /// FixedBasepoint and one Variable record through window 1's slice
-    /// group, so the count discriminates kinds, not records).
-    #[test]
-    fn trace_stream_fixed_base_calls_match_assembled_comb_calls() {
-        let full = threaded_trace();
-        let mut stream = stream_of(&full, 4, 0);
-        let mut saw_comb_window = false;
-        while stream.next_window().is_some() {
-            let counted = stream.fixed_base_calls();
-            let assembled = stream.side_note().ristretto_comb_calls.len();
-            assert_eq!(counted, assembled);
-            saw_comb_window |= counted > 0;
-        }
-        assert!(saw_comb_window, "fixture must contain a comb window");
     }
 
     /// The W2(a) equivalence bar, LIVE side: a real multi-window program
@@ -2261,14 +1835,6 @@ mod tests {
             jump_table: vec![],
             blake2b_calls,
             blake2b_mem_ops,
-            ristretto_calls: vec![],
-            ristretto_mem_ops: vec![],
-            ristretto_add_calls: vec![],
-            ristretto_add_mem_ops: vec![],
-            scalar_reduce_wide_calls: vec![],
-            scalar_reduce_wide_mem_ops: vec![],
-            scalar_binop_calls: vec![],
-            scalar_binop_mem_ops: vec![],
         };
 
         for (seg_steps, page_budget) in [(2usize, 0usize), (6, 2), (4, 2)] {

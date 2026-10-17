@@ -68,8 +68,7 @@ fn canonical_segment_proof() -> vos_pvm_proof::Proof {
     let mut sn = SideNote::new(steps, code, bitmask).with_memory(initial_memory);
     // Canonical proving = the full component mask. The empty profile proves
     // each chip at its natural size — sufficient for a single self-consistent
-    // segment (the multi-segment `{C_0,C_1}` re-bake that needs a uniform
-    // profile is P5.1).
+    // segment (a multi-segment chain needs a uniform profile).
     prove_canonical(&mut sn, &[]).expect("prove_canonical under Poseidon2-M31")
 }
 
@@ -79,10 +78,10 @@ fn poseidon2_canonical_segment_round_trip() {
 
     // The full canonical AIR: every component is present.
     assert!(
-        (1..=u64::BITS as usize).contains(&vos_pvm_proof::chip_idx::COUNT),
-        "component_mask must represent between 1 and 64 components"
+        (1..=u32::BITS as usize).contains(&vos_pvm_proof::chip_idx::COUNT),
+        "component_mask must represent between 1 and 32 components"
     );
-    let expected_component_mask = u64::MAX >> (u64::BITS as usize - vos_pvm_proof::chip_idx::COUNT);
+    let expected_component_mask = u32::MAX >> (u32::BITS as usize - vos_pvm_proof::chip_idx::COUNT);
     assert_eq!(
         proof.num_components,
         vos_pvm_proof::chip_idx::COUNT,

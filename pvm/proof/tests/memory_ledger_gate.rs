@@ -3,9 +3,8 @@
 //! Negative AIR gates for the memory ledger.
 //!
 //! Its order within a timestamp: a step that reads and writes one byte — a
-//! precompile whose output overlaps its input, as BLAKE2b's state does, or
-//! a Ristretto call whose output is its point — reads the byte's value from
-//! before the step. A ledger that puts the write first, so that the read
+//! precompile whose output overlaps its input, as BLAKE2b's state does —
+//! reads the byte's value from before the step. A ledger that puts the write first, so that the read
 //! returns the written value, is refused by MemoryChip's own constraints:
 //! at one timestamp an address's reads come before its writes.
 //!

@@ -143,7 +143,7 @@ pub enum PreprocessedColumn {
     #[size = 4]
     BranchTargetCanon,
     /// Exact precompile dispatch identifier for an ECALLI instruction
-    /// (100, 101 or 110..=114), or zero for any other instruction or
+    /// (100 or 101), or zero for any other instruction or
     /// identifier. Non-zero exactly for the calls the proof runtime handles,
     /// so it also commits the host-dispatch policy.
     #[size = 1]

@@ -479,3 +479,24 @@ mod witness_tests {
         assert!(!is_precompile(WITNESS_INPUT) && price(WITNESS_INPUT).is_none());
     }
 }
+
+#[cfg(test)]
+mod id_tests {
+    use super::*;
+    use crate::interpreter::Memory;
+
+    /// Ids 110 to 114 name no precompile and no kernel call: the refine
+    /// host serves none of them, charges nothing for them, and answers
+    /// them as any id it does not assign.
+    #[test]
+    fn ids_110_to_114_are_no_precompile() {
+        let mut memory = Memory::sparse(1 << 32);
+        for id in 110..=114 {
+            assert!(!is_precompile(id) && !is_kernel_call(id), "{id}");
+            assert_eq!(price(id), None, "{id}");
+            let mut gas = 10;
+            assert!(charge(id, &mut gas) && gas == 10, "{id}");
+            assert!(execute(id, &[0; crate::PVM_REGISTER_COUNT], &mut memory).is_none());
+        }
+    }
+}

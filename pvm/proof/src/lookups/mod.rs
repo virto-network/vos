@@ -22,13 +22,7 @@ pub use self::{
         DivRemLookupElements, JumpTableLookupElements, MemoryAccessLookupElements,
         MerkleNodeLookupElements, MultiplicationLookupElements, PopcountLookupElements,
         PowerOfTwoLookupElements, ProgramExecutionLookupElements, ProgramMemoryLookupElements,
-        RegisterMemoryLookupElements, RistrettoCallLookupElements,
-        RistrettoCombCompressOutputLookupElements, RistrettoCombCompressRegFileLookupElements,
-        RistrettoCombConsumerRegisterFileLookupElements, RistrettoCombCoordBoundaryLookupElements,
-        RistrettoCombFinalAccLookupElements, RistrettoCombLookupElements,
-        RistrettoCombScalarBoundaryLookupElements, RistrettoFixedOutTsLookupElements,
-        RistrettoFixedScalarTsLookupElements, RistrettoRegisterFileLookupElements,
-        WitnessCallLookupElements,
+        RegisterMemoryLookupElements, WitnessCallLookupElements,
     },
 };
 
@@ -54,17 +48,6 @@ macros::register_relation! {
         CompareLookupElements,
         DivRemLookupElements,
         ByteToBitsLookupElements,
-        RistrettoRegisterFileLookupElements,
-        RistrettoCombLookupElements,
-        RistrettoCombConsumerRegisterFileLookupElements,
-        RistrettoCombCoordBoundaryLookupElements,
-        RistrettoCombScalarBoundaryLookupElements,
-        RistrettoCombCompressRegFileLookupElements,
-        RistrettoCombCompressOutputLookupElements,
-        RistrettoCombFinalAccLookupElements,
-        RistrettoCallLookupElements,
-        RistrettoFixedScalarTsLookupElements,
-        RistrettoFixedOutTsLookupElements,
         WitnessCallLookupElements,
     };
     pub(crate) trait RegisteredLookupBound {}

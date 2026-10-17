@@ -65,12 +65,12 @@ pub fn preflight_component_dimensions(
 ///
 /// Back-compat: `mask == 0` (default for older proofs) falls back to
 /// "all chips active" — older proofs predate dynamic selection.
-fn active_indices_from_mask(mask: u64) -> alloc::vec::Vec<usize> {
+fn active_indices_from_mask(mask: u32) -> alloc::vec::Vec<usize> {
     let n = BASE_COMPONENTS.len();
     if mask == 0 {
         (0..n).collect()
     } else {
-        (0..n).filter(|&i| mask & (1u64 << i) != 0).collect()
+        (0..n).filter(|&i| mask & (1 << i) != 0).collect()
     }
 }
 
@@ -78,7 +78,7 @@ fn active_indices_from_mask(mask: u64) -> alloc::vec::Vec<usize> {
 pub fn draw_all_lookup_elements(
     lookup_elements: &mut AllLookupElements,
     channel: &mut ProverChannel,
-    component_mask: u64,
+    component_mask: u32,
 ) {
     let indices = active_indices_from_mask(component_mask);
     for &i in &indices {
@@ -149,20 +149,6 @@ pub fn drive_chip_oods<E: stwo_constraint_framework::EvalAtRow>(
         cx::BITWISE => run(&BitwiseChip, log_size, lookup, eval),
         cx::COMPARE => run(&CompareChip, log_size, lookup, eval),
         cx::DIVREM => run(&DivRemChip, log_size, lookup, eval),
-        cx::RISTRETTO => run(&RistrettoChip, log_size, lookup, eval),
-        cx::RISTRETTO_ECALL => run(&RistrettoEcallChip, log_size, lookup, eval),
-        cx::RISTRETTO_COMB_TABLE => run(&RistrettoCombTableChip, log_size, lookup, eval),
-        cx::RISTRETTO_FIXED_BASE_CONSUMER => {
-            run(&RistrettoFixedBaseConsumerChip, log_size, lookup, eval)
-        }
-        cx::RISTRETTO_COMB_ANCHOR => run(&RistrettoCombAnchorChip, log_size, lookup, eval),
-        cx::RISTRETTO_COMB_SCALAR_BOUNDARY => {
-            run(&RistrettoCombScalarBoundaryChip, log_size, lookup, eval)
-        }
-        cx::RISTRETTO_COMB_COMPRESS => run(&RistrettoCombCompressChip, log_size, lookup, eval),
-        cx::RISTRETTO_COMB_COMPRESS_OUTPUT => {
-            run(&RistrettoCombCompressOutputChip, log_size, lookup, eval)
-        }
         _ => panic!("drive_chip_oods: invalid chip_idx {chip_idx}"),
     }
 }
@@ -183,7 +169,7 @@ pub mod create_verifier_components {
     /// Get trace sizes and preprocessed sizes for active components.
     pub fn trace_and_preprocessed_sizes(
         log_sizes: &[u32],
-        component_mask: u64,
+        component_mask: u32,
     ) -> (Vec<TreeVec<Vec<u32>>>, Vec<u32>) {
         let indices = active_indices_from_mask(component_mask);
         let trace_sizes: Vec<TreeVec<Vec<u32>>> = indices
@@ -205,7 +191,7 @@ pub mod create_verifier_components {
         lookup_elements: &AllLookupElements,
         log_sizes: &[u32],
         claimed_sums: &[SecureField],
-        component_mask: u64,
+        component_mask: u32,
     ) -> Vec<Box<dyn Component + 'a>> {
         let indices = active_indices_from_mask(component_mask);
         indices

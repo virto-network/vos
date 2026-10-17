@@ -31,7 +31,7 @@ use crate::{
         DivRemLookupElements, JumpTableLookupElements, MemoryAccessLookupElements,
         MultiplicationLookupElements, PopcountLookupElements, PowerOfTwoLookupElements,
         ProgramExecutionLookupElements, ProgramMemoryLookupElements, Range256LookupElements,
-        RegisterMemoryLookupElements, RistrettoCallLookupElements, WitnessCallLookupElements,
+        RegisterMemoryLookupElements, WitnessCallLookupElements,
     },
 };
 
@@ -72,8 +72,8 @@ impl BuiltInComponent for CpuChip {
     /// selector chains and quadratic bodies are routed through the helper
     /// columns declared at the end of `Column`, keeping every constraint
     /// within this bound (Stwo v2.x's lifted protocol enforces the declared
-    /// bound).  The same flattening applies to the Blake2b/Mul/DivRem/
-    /// Ristretto chips.
+    /// bound).  The same flattening applies to the Blake2b/Mul/DivRem
+    /// chips.
     const LOG_CONSTRAINT_DEGREE_BOUND: u32 = 1;
 
     type PreprocessedColumn = PreprocessedColumn;
@@ -96,7 +96,7 @@ impl BuiltInComponent for CpuChip {
             CompareLookupElements,
             DivRemLookupElements,
             ByteToBitsLookupElements,
-            (RistrettoCallLookupElements, WitnessCallLookupElements),
+            WitnessCallLookupElements,
         ),
     );
 
@@ -122,7 +122,7 @@ impl BuiltInComponent for CpuChip {
                 CompareLookupElements,
                 DivRemLookupElements,
                 ByteToBitsLookupElements,
-                (RistrettoCallLookupElements, WitnessCallLookupElements),
+                WitnessCallLookupElements,
             ),
         ),
     ) {
@@ -144,7 +144,7 @@ impl BuiltInComponent for CpuChip {
                 compare_lookup,
                 divrem_lookup,
                 byte_to_bits_lookup,
-                (ristretto_call_lookup, witness_call_lookup),
+                witness_call_lookup,
             ),
         ) = lookup_elements;
         // bitwise_and_lookup is not emitted by CpuChip; nibble emissions
@@ -1356,11 +1356,6 @@ impl BuiltInComponent for CpuChip {
             let is_shift_c_top = crate::trace::trace_eval!(trace_eval, Column::IsShiftConstrained);
             let is_rot_r64_top = crate::trace::trace_eval!(trace_eval, Column::IsRotateR64);
             let is_rot_r32_top = crate::trace::trace_eval!(trace_eval, Column::IsRotateR32);
-            let is_110_top = crate::trace::trace_eval!(trace_eval, Column::Is110Ecall);
-            let is_111_top = crate::trace::trace_eval!(trace_eval, Column::Is111Ecall);
-            let is_112_top = crate::trace::trace_eval!(trace_eval, Column::Is112Ecall);
-            let is_113_top = crate::trace::trace_eval!(trace_eval, Column::Is113Ecall);
-            let is_114_top = crate::trace::trace_eval!(trace_eval, Column::Is114Ecall);
             let is_witness_top = crate::trace::trace_eval!(trace_eval, Column::IsWitnessEcall);
             // Boolean flags enforced unconditionally — a gated
             // `is_real · bool_h = 0` pattern would be redundant.
@@ -1371,11 +1366,6 @@ impl BuiltInComponent for CpuChip {
                 &result_is_reg_top,
                 &phi7_bool_top,
                 &is_blake_ecall_top,
-                &is_110_top,
-                &is_111_top,
-                &is_112_top,
-                &is_113_top,
-                &is_114_top,
                 &is_witness_top,
             ] {
                 eval.add_constraint(flag[0].clone() * (E::F::one() - flag[0].clone()));
@@ -1717,11 +1707,6 @@ impl BuiltInComponent for CpuChip {
             let precompile_dispatch =
                 crate::trace::trace_eval!(trace_eval, Column::HostCallPrecompileDispatch);
             let is_blake = crate::trace::trace_eval!(trace_eval, Column::IsBlakeEcall);
-            let is_110 = crate::trace::trace_eval!(trace_eval, Column::Is110Ecall);
-            let is_111 = crate::trace::trace_eval!(trace_eval, Column::Is111Ecall);
-            let is_112 = crate::trace::trace_eval!(trace_eval, Column::Is112Ecall);
-            let is_113 = crate::trace::trace_eval!(trace_eval, Column::Is113Ecall);
-            let is_114 = crate::trace::trace_eval!(trace_eval, Column::Is114Ecall);
             let is_witness = crate::trace::trace_eval!(trace_eval, Column::IsWitnessEcall);
             let pc = crate::trace::trace_eval!(trace_eval, Column::Pc);
             let next_pc = crate::trace::trace_eval!(trace_eval, Column::NextPc);
@@ -1742,21 +1727,10 @@ impl BuiltInComponent for CpuChip {
             // relation, and its weighted selector must equal that
             // authenticated ID, so only a supported call can be acknowledged.
             // A call that is not acknowledged selects no relation.
-            let precompile_selector_sum = is_blake[0].clone()
-                + is_witness[0].clone()
-                + is_110[0].clone()
-                + is_111[0].clone()
-                + is_112[0].clone()
-                + is_113[0].clone()
-                + is_114[0].clone();
+            let precompile_selector_sum = is_blake[0].clone() + is_witness[0].clone();
             eval.add_constraint(precompile_selector_sum - acknowledged[0].clone());
             let selected_dispatch = is_blake[0].clone() * E::F::from(BaseField::from(100u32))
-                + is_witness[0].clone() * E::F::from(BaseField::from(101u32))
-                + is_110[0].clone() * E::F::from(BaseField::from(110u32))
-                + is_111[0].clone() * E::F::from(BaseField::from(111u32))
-                + is_112[0].clone() * E::F::from(BaseField::from(112u32))
-                + is_113[0].clone() * E::F::from(BaseField::from(113u32))
-                + is_114[0].clone() * E::F::from(BaseField::from(114u32));
+                + is_witness[0].clone() * E::F::from(BaseField::from(101u32));
             eval.add_constraint(
                 selected_dispatch - acknowledged[0].clone() * precompile_dispatch[0].clone(),
             );
@@ -2317,46 +2291,19 @@ impl BuiltInComponent for CpuChip {
             let _ = is_blake_ecall;
         }
 
-        // ── Ristretto ECALL register-read producers + RELATION-A ──
-        // The φ[7,8,9] operand-pointer snapshots live in the Phi10/Phi11/Phi12
-        // slots (= regs_before[7,8,9], filled every row).  Register-read
-        // producers bind those snapshots to the real register file at the
-        // step ts; RELATION A ties the call to the RistrettoEcallChip 96-row
-        // block that emits its memory tuples, anchoring that block's `ts`.
-        // Eight emissions (3 reg-reads + 5 per-id RELATION-A) keep
-        // finalize_logup_in_pairs balanced.  All five ids read φ[7,8] (slots
-        // Phi10/Phi11); 110/111/113/114 also read φ[9] (Phi12); 112
-        // (reduce_wide) reads only φ[7,8].  The RELATION-A ptr slots are in
-        // RistrettoEcallChip trace-layout order (sub-block 0/1/2 base
-        // pointers), so the chip's per-byte Addr authentication stays
-        // id-agnostic.
+        // ── Witness-input register reads ──
+        // The call reads φ[7] and φ[8], its destination and capacity, from
+        // the Phi10/Phi11 slots (= regs_before[7,8], filled every row); the
+        // register-read producers bind those snapshots to the register file
+        // at the step ts. Two emissions keep finalize_logup_in_pairs
+        // balanced.
         {
-            let is_110 = crate::trace::trace_eval!(trace_eval, Column::Is110Ecall);
-            let is_111 = crate::trace::trace_eval!(trace_eval, Column::Is111Ecall);
-            let is_112 = crate::trace::trace_eval!(trace_eval, Column::Is112Ecall);
-            let is_113 = crate::trace::trace_eval!(trace_eval, Column::Is113Ecall);
-            let is_114 = crate::trace::trace_eval!(trace_eval, Column::Is114Ecall);
+            let is_witness = crate::trace::trace_eval!(trace_eval, Column::IsWitnessEcall);
             let phi10 = crate::trace::trace_eval!(trace_eval, Column::Phi10); // φ[7]
             let phi11 = crate::trace::trace_eval!(trace_eval, Column::Phi11); // φ[8]
-            let phi12 = crate::trace::trace_eval!(trace_eval, Column::Phi12); // φ[9]
-            let any = is_110[0].clone()
-                + is_111[0].clone()
-                + is_112[0].clone()
-                + is_113[0].clone()
-                + is_114[0].clone();
-            let any_not_112 =
-                is_110[0].clone() + is_111[0].clone() + is_113[0].clone() + is_114[0].clone();
-            // The witness input reads φ[7] and φ[8] too, its destination
-            // and capacity.
-            let is_witness = crate::trace::trace_eval!(trace_eval, Column::IsWitnessEcall);
-            let reads_7_and_8 = any.clone() + is_witness[0].clone();
 
             // Register-read producers (reg_idx, value[8], ts[8], is_write=0).
-            for (reg_idx, value, mult) in [
-                (7u32, &phi10, reads_7_and_8.clone()),
-                (8u32, &phi11, reads_7_and_8),
-                (9u32, &phi12, any_not_112),
-            ] {
+            for (reg_idx, value) in [(7u32, &phi10), (8u32, &phi11)] {
                 let mut tuple: Vec<E::F> = Vec::with_capacity(18);
                 tuple.push(E::F::from(BaseField::from(reg_idx)));
                 for c in value.iter() {
@@ -2366,41 +2313,9 @@ impl BuiltInComponent for CpuChip {
                     tuple.push(c.clone());
                 }
                 tuple.push(E::F::from(BaseField::from(0u32))); // is_write = 0 (read)
-                eval.add_to_relation(RelationEntry::new(reg_lookup, mult.into(), &tuple));
-            }
-
-            // RELATION-A producers (id, ptr0[4], ptr1[4], ptr2[4], ts[8]).
-            // ptr slot order is RistrettoEcallChip trace-layout (sub-block
-            // 0/1/2 base ptr); each ptr is the low 4 bytes of a Phi slot:
-            //   110: sub0=point(φ8), sub1=scalar(φ7), sub2=output(φ9)
-            //   111: sub0=p(φ7),     sub1=q(φ8),      sub2=output(φ9)
-            //   112: sub0=wide(φ7),  sub1=wide(φ7),   sub2=output(φ8)
-            //   113: sub0=a(φ7),     sub1=b(φ8),      sub2=output(φ9)
-            //   114: sub0=a(φ7),     sub1=b(φ8),      sub2=output(φ9)
-            for (id, p0, p1, p2, mult) in [
-                (110u32, &phi11, &phi10, &phi12, is_110[0].clone()),
-                (111u32, &phi10, &phi11, &phi12, is_111[0].clone()),
-                (112u32, &phi10, &phi10, &phi11, is_112[0].clone()),
-                (113u32, &phi10, &phi11, &phi12, is_113[0].clone()),
-                (114u32, &phi10, &phi11, &phi12, is_114[0].clone()),
-            ] {
-                let mut tuple: Vec<E::F> = Vec::with_capacity(21);
-                tuple.push(E::F::from(BaseField::from(id)));
-                for c in p0[0..4].iter() {
-                    tuple.push(c.clone());
-                }
-                for c in p1[0..4].iter() {
-                    tuple.push(c.clone());
-                }
-                for c in p2[0..4].iter() {
-                    tuple.push(c.clone());
-                }
-                for c in &timestamp {
-                    tuple.push(c.clone());
-                }
                 eval.add_to_relation(RelationEntry::new(
-                    ristretto_call_lookup,
-                    mult.into(),
+                    reg_lookup,
+                    is_witness[0].clone().into(),
                     &tuple,
                 ));
             }

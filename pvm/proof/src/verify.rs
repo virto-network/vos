@@ -544,12 +544,12 @@ pub fn reconstruct_oods_for_recursion(proof: &Proof, side_note: &SideNote) -> Oo
     );
 
     // Select components by the PROOF's component_mask, not the side note's
-    // natural-active set: a canonical proof forces ALL 31 (padding inactive
-    // chips), so `active_components_verifier(side_note)` (which drops e.g.
-    // Blake2b/Ristretto for a program that never uses them) would not match the
+    // natural-active set: a canonical proof forces every chip (padding
+    // inactive ones), so `active_components_verifier(side_note)` (which drops
+    // e.g. Blake2b for a program that never uses it) would not match the
     // proof's trace layout.
     let active_indices: alloc::vec::Vec<usize> = (0..super::chip_idx::COUNT)
-        .filter(|&i| proof.component_mask & (1u64 << i) != 0)
+        .filter(|&i| proof.component_mask & (1 << i) != 0)
         .collect();
     let components_owned: alloc::vec::Vec<&dyn crate::framework::MachineComponent> = active_indices
         .iter()
@@ -757,7 +757,7 @@ fn recursion_verify_prefix(
 
     let components_owned: alloc::vec::Vec<&dyn crate::framework::MachineComponent> = (0
         ..super::chip_idx::COUNT)
-        .filter(|&i| proof.component_mask & (1u64 << i) != 0)
+        .filter(|&i| proof.component_mask & (1 << i) != 0)
         .map(|i| super::BASE_COMPONENTS[i] as &dyn crate::framework::MachineComponent)
         .collect();
     let components: &[&dyn crate::framework::MachineComponent] = &components_owned;

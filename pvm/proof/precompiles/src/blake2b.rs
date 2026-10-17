@@ -12,9 +12,7 @@
 //! `blake2b_256(data)`: BLAKE2b-256 of one buffer, its full blocks
 //! compressed where they lie, with no copy: for hashing pages.
 //!
-//! Self-contained — no curve25519-dalek dep — so a guest that only
-//! needs hashing can build with `default-features = false, features
-//! = ["blake2b"]`.
+//! Self-contained: no runtime dependency.
 
 #[cfg(target_arch = "riscv64")]
 use crate::ecalls::ECALL_BLAKE2B_COMPRESS;

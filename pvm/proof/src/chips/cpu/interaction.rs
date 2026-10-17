@@ -29,7 +29,7 @@ use crate::lookups::{
     DivRemLookupElements, JumpTableLookupElements, LogupTraceBuilder, MemoryAccessLookupElements,
     MultiplicationLookupElements, PopcountLookupElements, PowerOfTwoLookupElements,
     ProgramExecutionLookupElements, ProgramMemoryLookupElements, Range256LookupElements,
-    RegisterMemoryLookupElements, RistrettoCallLookupElements, WitnessCallLookupElements,
+    RegisterMemoryLookupElements, WitnessCallLookupElements,
 };
 use crate::trace::component::ComponentTrace;
 
@@ -421,86 +421,29 @@ pub(super) fn generate_interaction_trace(
         );
     }
 
-    // ── Ristretto ECALL register reads + RELATION-A ──
-    // Prover-side mirror of the mod.rs producers, in the same order: three
-    // register-read producers (φ[7], φ[8], φ[9]-except-112), then five per-id
-    // RELATION-A producers.  Operand pointers reuse the Phi10/Phi11/Phi12
-    // slots (= φ[7,8,9]); the RELATION-A ptr slots are in RistrettoEcallChip
-    // trace-layout order.
+    // ── Witness-input register reads ──
+    // Prover-side mirror of the mod.rs producers, in the same order: φ[7]
+    // and φ[8], the call's destination and capacity, from the Phi10/Phi11
+    // slots.
     {
-        let ristretto_call: &RistrettoCallLookupElements = lookup_elements.as_ref();
-        let is_110 = crate::trace::original_base_column!(component_trace, Column::Is110Ecall);
-        let is_111 = crate::trace::original_base_column!(component_trace, Column::Is111Ecall);
-        let is_112 = crate::trace::original_base_column!(component_trace, Column::Is112Ecall);
-        let is_113 = crate::trace::original_base_column!(component_trace, Column::Is113Ecall);
-        let is_114 = crate::trace::original_base_column!(component_trace, Column::Is114Ecall);
         let is_witness =
             crate::trace::original_base_column!(component_trace, Column::IsWitnessEcall);
 
         // Register-read producers: (reg_idx, value[8], ts[8], is_write=0).
-        // φ[7] and φ[8] for all five ids and the witness input; φ[9] for
-        // all five ids except 112.
-        for (reg_idx, value, not_112) in [
-            (7u32, phi10.clone(), false),
-            (8u32, phi11.clone(), false),
-            (9u32, phi12.clone(), true),
-        ] {
-            let idx_const = PackedBaseField::broadcast(BaseField::from(reg_idx));
-            let val_c = value;
-            let ts_c = timestamp.clone();
-            let mult_cols = [
-                is_110[0].clone(),
-                is_111[0].clone(),
-                is_112[0].clone(),
-                is_113[0].clone(),
-                is_114[0].clone(),
-                is_witness[0].clone(),
-            ];
-            logup.add_to_relation_computed(
-                reg_lookup,
-                mult_cols,
-                move |[a, b, c, d, e, w]| {
-                    if not_112 {
-                        (a + b + d + e).into()
-                    } else {
-                        (a + b + c + d + e + w).into()
-                    }
-                },
-                18,
-                move |v| {
-                    let mut t = Vec::with_capacity(18);
-                    t.push(idx_const);
-                    for c in &val_c {
-                        t.push(c.at(v));
-                    }
-                    for c in &ts_c {
-                        t.push(c.at(v));
-                    }
-                    t.push(PackedBaseField::broadcast(BaseField::from(0u32)));
-                    t
-                },
-            );
-        }
-
-        // RELATION-A producers: (id, ptr0[4], ptr1[4], ptr2[4], ts[8]).
-        // ptr slots in RistrettoEcallChip trace-layout order (sub-block
-        // 0/1/2 base ptr); each is the low 4 bytes of a Phi slot.
-        for (id, p0, p1, p2, mult) in [
-            (110u32, &phi11, &phi10, &phi12, is_110[0].clone()),
-            (111u32, &phi10, &phi11, &phi12, is_111[0].clone()),
-            (112u32, &phi10, &phi10, &phi11, is_112[0].clone()),
-            (113u32, &phi10, &phi11, &phi12, is_113[0].clone()),
-            (114u32, &phi10, &phi11, &phi12, is_114[0].clone()),
-        ] {
-            let mut tuple: Vec<_> = Vec::with_capacity(21);
+        for (reg_idx, value) in [(7u32, &phi10), (8u32, &phi11)] {
+            let mut tuple: Vec<_> = Vec::with_capacity(18);
             tuple.push(crate::trace::component::FinalizedColumn::Constant(
-                BaseField::from(id),
+                BaseField::from(reg_idx),
             ));
-            tuple.extend_from_slice(&p0[0..4]);
-            tuple.extend_from_slice(&p1[0..4]);
-            tuple.extend_from_slice(&p2[0..4]);
+            tuple.extend_from_slice(value);
             tuple.extend_from_slice(&timestamp);
-            logup.add_to_relation_with(ristretto_call, [mult], |[active]| active.into(), &tuple);
+            tuple.push(is_write_read.clone());
+            logup.add_to_relation_with(
+                reg_lookup,
+                [is_witness[0].clone()],
+                |[active]| active.into(),
+                &tuple,
+            );
         }
     }
 

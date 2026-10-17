@@ -864,12 +864,11 @@ mod tests {
             .collect()
     }
 
-    /// The Ristretto and scalar ids, 110 to 114, are no precompile: a kernel
-    /// that reaches one is refused, naming it, as one reaching any host call
-    /// but a precompile is; one reaching BLAKE2b's, or its witness input,
-    /// derives.
+    /// Ids 110 to 114 are no precompile: a kernel that reaches one is
+    /// refused, naming it, as one reaching any host call but a precompile
+    /// is; one reaching BLAKE2b's, or its witness input, derives.
     #[test]
-    fn a_kernel_reaching_a_ristretto_id_is_refused() {
+    fn a_kernel_reaching_an_unknown_id_is_refused() {
         const ENTRY: u64 = 0x10_0000;
         let derived = |id| {
             let elf = LinkedElf::text(ENTRY, calling(id));

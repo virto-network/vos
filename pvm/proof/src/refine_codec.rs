@@ -390,7 +390,7 @@ fn encode_proof(encoder: &mut Encoder, proof: &Proof) -> Result<(), RefineProofC
         u32::try_from(proof.num_components)
             .map_err(|_| RefineProofCodecError::InvalidCardinality)?,
     )?;
-    encoder.u64(proof.component_mask)?;
+    encoder.u32(proof.component_mask)?;
     encode_pcs_config(encoder, proof.pcs_config)?;
     encoder.length(proof.claimed_sums.len())?;
     for value in &proof.claimed_sums {
@@ -414,7 +414,7 @@ fn decode_proof(decoder: &mut Decoder<'_>) -> Result<Proof, RefineProofCodecErro
     if num_components == 0 || num_components > MAX_PROOF_COMPONENTS {
         return Err(RefineProofCodecError::InvalidCardinality);
     }
-    let component_mask = decoder.u64()?;
+    let component_mask = decoder.u32()?;
     let pcs_config = decode_pcs_config(decoder)?;
     let claimed_sums =
         decoder.exact_vector(num_components, SECURE_FIELD_WIRE_BYTES, decode_secure_field)?;
@@ -994,7 +994,7 @@ mod tests {
 
     const SLICE_COUNT_OFFSET: usize = 8 + 4 + 4 + 32 + 32 + 8;
     const FIRST_CLAIMED_SUM_COUNT_OFFSET: usize =
-        SLICE_COUNT_OFFSET + 4 + 4 + (1 + 32) + 32 + 32 + 1 + 4 + 4 + 8 + (4 + 4 + 4 + 4 + 4 + 1);
+        SLICE_COUNT_OFFSET + 4 + 4 + (1 + 32) + 32 + 32 + 1 + 4 + 4 + 4 + (4 + 4 + 4 + 4 + 4 + 1);
     const FIRST_CLAIMED_SUM_LIMB_OFFSET: usize = FIRST_CLAIMED_SUM_COUNT_OFFSET + 4;
     const FIRST_COMMITMENT_OFFSET: usize = FIRST_CLAIMED_SUM_COUNT_OFFSET
         + 4

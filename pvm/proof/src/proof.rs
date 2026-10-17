@@ -186,21 +186,27 @@ use crate::recursion_pcs::ProverMerkleHasher;
 ///        bytes. The register ledger sorts a register's reads before its
 ///        writes within a timestamp. Older proofs reject.
 ///   27 — Poseidon2-M31 PCS variant of format 26.
+///   28 — The Ristretto and scalar chips removed: CpuChip drops its five
+///        `Is{110..114}Ecall` selectors, the eight chips
+///        and their eleven relations leave the AIR (`COUNT` 33 → 25,
+///        `BITWISE_AND_BYTE` at index 24, the component mask a `u32` again)
+///        and ids 110–114 are no precompile. Older proofs reject.
+///   29 — Poseidon2-M31 PCS variant of format 28.
 #[cfg(not(feature = "poseidon2-channel"))]
-pub const PROOF_FORMAT_VERSION: u32 = 26;
+pub const PROOF_FORMAT_VERSION: u32 = 28;
 /// Native recursion: the PCS commit hash + Fiat-Shamir
 /// transcript move from Blake2s to Poseidon2-M31, so `stark_proof.commitments`
 /// become `P2Hash` digests — a different wire format. A Blake2s verifier
-/// (v26) and a Poseidon2-M31 verifier (v27) therefore reject each other's proofs.
+/// (v28) and a Poseidon2-M31 verifier (v29) therefore reject each other's proofs.
 #[cfg(feature = "poseidon2-channel")]
-pub const PROOF_FORMAT_VERSION: u32 = 27;
+pub const PROOF_FORMAT_VERSION: u32 = 29;
 
 /// Exact number of commitment trees in this generation of the Stwo proof:
 /// preprocessed, main, interaction, and split composition.
 pub const PROOF_COMMITMENT_TREE_COUNT: usize = 4;
 /// The component mask is a `u32`; accepting more components would make its
 /// shape ambiguous before any cryptographic check.
-pub const MAX_PROOF_COMPONENTS: usize = u64::BITS as usize;
+pub const MAX_PROOF_COMPONENTS: usize = u32::BITS as usize;
 /// SIMD trace builders use 16 lanes and index rows with
 /// `log_size - LOG_N_LANES`; smaller claimed components are structurally
 /// impossible and can otherwise reach an unchecked subtraction.
@@ -309,7 +315,7 @@ pub struct Proof {
     /// then falls back to count-based inference: full set if count =
     /// BASE_COMPONENTS.len(), Blake2b-skipped if count = len-1).
     #[serde(default)]
-    pub component_mask: u64,
+    pub component_mask: u32,
     pub pcs_config: PcsConfig,
     /// State at segment start. pc/timestamp, registers, and `memory_root`
     /// are bound to the committed boundary columns (boundary-binding check):

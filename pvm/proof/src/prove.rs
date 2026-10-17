@@ -185,7 +185,7 @@ pub fn prove(side_note: &mut SideNote) -> Result<Proof, ProvingError> {
 /// latency-sensitive flows like *private tap-to-pay*.
 ///
 /// Same 96-bit conjectured security as `prove()` but ~2× faster on
-/// real PVM workloads (a ristretto-heavy workload: ~0.7 s vs ~1.4 s on
+/// real PVM workloads (a curve-arithmetic workload: ~0.7 s vs ~1.4 s on
 /// the reference Intel Core Ultra 7 155H).  Cost: proof size ~1.6×
 /// larger.  Acceptable trade for tap-to-pay where prove time
 /// dominates user experience.
@@ -266,14 +266,6 @@ pub fn debug_claimed_sums(side_note: &mut SideNote) -> bool {
         "Bitwise",
         "Compare",
         "DivRem",
-        "Ristretto",
-        "RistrettoEcall",
-        "RistCombTable",
-        "RistFixedBaseConsumer",
-        "RistCombAnchor",
-        "RistCombScalarBoundary",
-        "RistCombCompress",
-        "RistCombCompressOutput",
         "BitwiseAndByte",
     ];
 
@@ -468,8 +460,8 @@ fn segment_memory_roots(side_note: &SideNote) -> ([u8; 32], [u8; 32]) {
 
 fn compute_final_memory_commitment(side_note: &SideNote) -> [u8; 32] {
     // Replay ALL of this (segment's) writes — regular stores AND precompile
-    // output writes (blake2b / ristretto / scalar-*, which live in
-    // `*_mem_ops`, not `step.mem_write`) — over the initial memory. Using
+    // output writes (blake2b's, which live in
+    // `blake2b_mem_ops`, not `step.mem_write`) — over the initial memory. Using
     // step writes alone leaves precompile-output bytes stale, so a downstream
     // segment's initial-memory commitment (which DOES reflect those writes,
     // via `segment::replay_writes`) would mismatch and `verify_chain`'s
@@ -654,8 +646,9 @@ pub fn prove_canonical(
     install_thread_pool();
     prepare_side_note_for_verification(side_note);
     let components = super::all_components();
-    // Full set present ⇒ constant mask = all component bits set.
-    let component_mask = (1u64 << super::chip_idx::COUNT) - 1;
+    // Full set present ⇒ constant mask = all component bits set.  Built via
+    // a widening shift so a COUNT of 32 (all u32 bits) doesn't overflow.
+    let component_mask = ((1u64 << super::chip_idx::COUNT) - 1) as u32;
     let (proof, _) = prove_impl_with_components_overridden(
         side_note,
         production_pcs_config_mobile(),
@@ -772,8 +765,7 @@ pub fn natural_log_sizes_for(side_note: &mut SideNote, indices: &[usize]) -> Vec
 /// [`prove_canonical`] gives all of a chain's windows an identical shape.
 /// Chips whose size is already uniform get their own size back (forcing is a
 /// no-op); varying chips get the chain-wide max, so the windows collapse onto
-/// the minimal canonical-shape set (distinct shapes remain only where content
-/// differs beyond size, e.g. fixed-base-comb call count). The floors are the
+/// one canonical shape. The floors are the
 /// observed per-window maxima for THIS trace's op pattern, not a proven
 /// bound — a deployment's drift guard + allowlist-coverage gate catch a
 /// reshaped transition. `None` when the trace is empty, `seg_steps` is zero,
@@ -885,7 +877,7 @@ fn prove_impl_with_components(
     config: PcsConfig,
     profile: bool,
     components: &[&dyn crate::framework::MachineProverComponent],
-    component_mask: u64,
+    component_mask: u32,
     min_log_sizes: &[u32],
 ) -> Result<(Proof, ProveProfile), ProvingError> {
     prove_impl_with_components_overridden(
@@ -1001,7 +993,7 @@ fn derive_segment_states(side_note: &SideNote) -> (SegmentState, SegmentState) {
 /// binds every generated witness column; ordinary STARK verification then
 /// proves the interaction/composition/FRI suffix against that exact root.
 pub(crate) struct ReplayTraceBinding {
-    pub component_mask: u64,
+    pub component_mask: u32,
     pub log_sizes: Vec<u32>,
     pub preprocessed_commitment: crate::recursion_pcs::ProverMerkleHash,
     pub main_commitment: crate::recursion_pcs::ProverMerkleHash,
@@ -1163,7 +1155,7 @@ fn prove_impl_with_components_overridden(
     config: PcsConfig,
     profile: bool,
     components: &[&dyn crate::framework::MachineProverComponent],
-    component_mask: u64,
+    component_mask: u32,
     boundary_override: Option<(SegmentState, SegmentState)>,
     min_log_sizes: &[u32],
     transcript_generation: ProofTranscriptGeneration,
@@ -1202,10 +1194,10 @@ fn prove_impl_with_components_overridden(
     // *consumer* pass.  Producers (CpuChip, Blake2bChip) write per-row
     // multiplicities + entries into `side_note` while filling their main
     // trace; consumer chips (ALU/range/lookup tables, boundary chips,
-    // memory ledgers, RistrettoChip, …) only read those, so they run on
+    // memory ledgers, …) only read those, so they run on
     // rayon with shared `&SideNote`.  Mirrors the producer/consumer
     // split already used by interaction-trace generation a few stages
-    // below.  Measured saving on log17 a ristretto-heavy workload (MOBILE):
+    // below.  Measured saving on a log17 curve-arithmetic workload (MOBILE):
     // ~130 ms → ~70 ms of trace_gen.
     let t = Instant::now();
     let traces = generate_component_traces(side_note, components, min_log_sizes);
@@ -1348,7 +1340,7 @@ fn prove_impl_with_components_overridden(
     // `tree_builder.extend_evals` is mutating, so we do that
     // sequentially after the parallel pass.
     //
-    // Measured win at log17 a ristretto-heavy workload (MOBILE config):
+    // Measured win on a log17 curve-arithmetic workload (MOBILE config):
     // ~140 ms → ~50–70 ms with the default thread pool cap (10
     // threads); brings total prove time from 0.71 s to ~0.62 s.
     let t = Instant::now();

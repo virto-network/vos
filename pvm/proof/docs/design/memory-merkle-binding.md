@@ -8,6 +8,9 @@ regardless of aggregation. Design decisions (not re-litigated here): approach
 A (Merkle memory), tree keyed by **page address** (not hashed keys),
 **4096-byte pages**, **blake2b** (the existing compression AIR), no PCS change.
 
+The Ristretto chips this design names were since removed (proof format
+28); their mentions here are the design's record, not the current AIR.
+
 This is v2, after a five-lens adversarial review of v1. The review's breaks
 and the resulting changes are folded in throughout; §7 lists the negative
 tests each one demands.

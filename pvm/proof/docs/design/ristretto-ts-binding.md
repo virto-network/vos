@@ -1,7 +1,9 @@
 # Phase A prereq 0.2 — ristretto mem-op `ts` binding (design v4)
 
-Status: **design converged + adversarially validated (2 rounds), implementation-ready.**
-No code yet. Supersedes Appendix A of `memory-merkle-binding.md`.
+Status: **removed.** The Ristretto and scalar chips this binds, and their ids
+110–114, are gone from the AIR (proof format 28): they were unsound, and a
+generic bignum chip (slice 7) replaces them. Kept as the design's record.
+It superseded Appendix A of `memory-merkle-binding.md`.
 
 ## 1. The gap (money-path soundness)
 

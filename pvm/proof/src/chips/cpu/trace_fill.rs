@@ -16,11 +16,7 @@
 
 use stwo::prover::backend::simd::m31::LOG_N_LANES;
 
-use crate::core::ecall::{
-    ECALL_BLAKE2B_COMPRESS, ECALL_RISTRETTO_POINT_ADD, ECALL_RISTRETTO_SCALAR_MULT,
-    ECALL_SCALAR_ADD_MOD_L, ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE, ECALL_SCALAR_MUL_MOD_L,
-    ECALL_WITNESS_INPUT,
-};
+use crate::core::ecall::{ECALL_BLAKE2B_COMPRESS, ECALL_WITNESS_INPUT};
 use crate::core::step::WORD_SIZE;
 use crate::side_note::SideNote;
 use crate::trace::builder::{FinalizedTrace, TraceBuilder};
@@ -1323,18 +1319,6 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         let ecall = step.served_ecall();
         let is_blake_ecall = ecall == Some(ECALL_BLAKE2B_COMPRESS as u64);
         trace.fill_columns(row, is_blake_ecall, Column::IsBlakeEcall);
-        // Ristretto ECALL gates: one boolean per id.
-        // Same imm-match shape as IsBlakeEcall; the operand pointers reuse the
-        // Phi10/Phi11/Phi12 slots (= regs_before[7,8,9]) filled below.
-        for (id, column) in [
-            (ECALL_RISTRETTO_SCALAR_MULT, Column::Is110Ecall),
-            (ECALL_RISTRETTO_POINT_ADD, Column::Is111Ecall),
-            (ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE, Column::Is112Ecall),
-            (ECALL_SCALAR_MUL_MOD_L, Column::Is113Ecall),
-            (ECALL_SCALAR_ADD_MOD_L, Column::Is114Ecall),
-        ] {
-            trace.fill_columns(row, ecall == Some(u64::from(id)), column);
-        }
         // Witness input: its selector, whether its count is non-zero with
         // the count's inverse, and the comparison count ≤ φ8 CompareChip
         // proves.
