@@ -804,8 +804,9 @@ bounds, 40 bits), on MemoryChip 4 main columns, no interaction columns.
 
 Out of this binding: refine machine slices, whose inner machines change
 their pages' permissions at run time (the `pages` host call); their side
-notes keep the all-writable layout. A layout per slice, or a permission
-that a page's history carries, would be their binding.
+notes ask for `MemoryLayout::writable()` explicitly, and refine's replay
+binds their permissions. A layout per slice, or a permission that a page's
+history carries, would be their in-AIR binding.
 
 ### The holes, each before and after
 
