@@ -123,29 +123,36 @@ fn branch_eq_forged_taken_when_not_equal_rejected() {
     prove_and_verify(steps, &code, &bitmask);
 }
 
-// Documented (intentional, not a gap): when a BranchEq's target equals
-// sequential_next_pc, branch_taken=0 and branch_taken=1 are
-// observationally identical — both produce the same next_pc and the
-// rest of the trace is unaffected.  PVM's branch_taken witness reflects
-// "PC took the offset path", not "the comparison succeeded"; tightening
-// it to `branch_taken = eq_flag` would conflict with the tracer's
-// convention without changing what the proof attests to.  Test pins
-// the current behaviour.
+// When a BranchEq's target equals its fallthrough the pc cannot tell
+// whether it was taken: the AIR's BranchTaken is its condition, equality,
+// which the trace fill takes from the operands there. A step recording it
+// taken on equal operands proves.
 #[test]
-fn branch_eq_target_equals_fallthrough_branch_taken_unconstrained() {
+fn branch_eq_taken_to_its_fallthrough_proves() {
     let (code, bitmask, mut steps) = trace_branch_eq(42, 42);
     steps[0].branch_taken = true;
     prove_and_verify(steps, &code, &bitmask);
 }
 
+#[test]
+#[should_panic(expected = "failed")]
+fn branch_eq_forged_not_taken_when_equal_rejected() {
+    // 42 = 42: the machine takes the branch to pc 6; the forged run falls
+    // through to pc 5 and continues there.
+    let (code, bitmask, mut steps) = trace_branch(Opcode::BranchEq, 42, 42);
+    assert!(steps[0].branch_taken);
+    assert_eq!(steps[0].next_pc, 6);
+    steps[0].branch_taken = false;
+    steps[0].next_pc = 5;
+    steps[1].pc = 5;
+    prove_and_verify(steps, &code, &bitmask);
+}
+
 // ── BranchNe ─────────────────────────────────────────────────────────────
 //
-// BranchNe constraint (asymmetric):
-//     is_br_ne · (1 - branch_taken) · (1 - byte_eq[i]) = 0
-// Reads: IF branch_taken=0, THEN val_b == val_d.  Contrapositive: val_b
-// ≠ val_d ⇒ branch_taken=1.  Strict direction caught (claim "not taken"
-// when values differ).  Loose direction (claim "taken" when values
-// equal) intentionally unconstrained — same rationale as BranchEq.
+// BranchNe constraint: branch_taken = 1 − EqFlag, EqFlag the operands'
+// equality both ways. Both directions are caught: "not taken" when the
+// values differ, and "taken" when they are equal.
 
 #[test]
 fn branch_ne_unequal_smoke() {
@@ -162,6 +169,18 @@ fn branch_ne_equal_smoke() {
     let (code, bitmask, steps) = trace_branch(Opcode::BranchNe, 42, 42);
     assert!(!steps[0].branch_taken);
     assert_eq!(steps[0].next_pc, 5);
+    prove_and_verify(steps, &code, &bitmask);
+}
+
+#[test]
+#[should_panic(expected = "failed")]
+fn branch_ne_forged_taken_when_equal_rejected() {
+    // 42 = 42: the machine falls through to pc 5; the forged run jumps to 6.
+    let (code, bitmask, mut steps) = trace_branch(Opcode::BranchNe, 42, 42);
+    assert!(!steps[0].branch_taken);
+    steps[0].branch_taken = true;
+    steps[0].next_pc = 6;
+    steps[1].pc = 6;
     prove_and_verify(steps, &code, &bitmask);
 }
 

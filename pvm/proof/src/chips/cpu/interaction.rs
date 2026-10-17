@@ -502,7 +502,7 @@ pub(super) fn generate_interaction_trace(
         );
     }
 
-    // ── ProgramMemory consumer (prover-side, 2 paired, 36 limbs) ──
+    // ── ProgramMemory consumer (prover-side, 2 paired, 37 limbs) ──
     {
         let prog_mem: &ProgramMemoryLookupElements = lookup_elements.as_ref();
         let pc = crate::trace::original_base_column!(component_trace, Column::Pc);
@@ -575,7 +575,8 @@ pub(super) fn generate_interaction_trace(
     // Mirrors the 6 verifier-side emissions in cpu/mod.rs.  Each tuple
     // is `(FlagByteI, bit0, ..., bit7)` with bit_j either an
     // individual flag column or a sum-of-sub-flags expression.
-    // Multiplicity = is_real on every emission.
+    // Multiplicity 1 on every row: a padding row's zero bytes pin its flags
+    // to zero.
     {
         let bt: &ByteToBitsLookupElements = lookup_elements.as_ref();
         let is_pad_col = crate::trace::original_base_column!(component_trace, Column::IsPadding);
@@ -656,8 +657,7 @@ pub(super) fn generate_interaction_trace(
             crate::trace::original_base_column!(component_trace, Column::IsRotateL32);
         let f_is_rotate_r32 =
             crate::trace::original_base_column!(component_trace, Column::IsRotateR32);
-        let f_is_rotate_r_imm_alt =
-            crate::trace::original_base_column!(component_trace, Column::IsRotateRImmAlt);
+        let f_is_imm_alt = crate::trace::original_base_column!(component_trace, Column::IsImmAlt);
 
         let one_pkg =
             || stwo::prover::backend::simd::m31::PackedBaseField::broadcast(BaseField::from(1));
@@ -692,7 +692,7 @@ pub(super) fn generate_interaction_trace(
             logup.add_to_relation_computed(
                 bt,
                 [pad],
-                move |[p]| (one_pkg() - p).into(),
+                move |[_]| one_pkg().into(),
                 9,
                 move |i| {
                     vec![
@@ -749,7 +749,7 @@ pub(super) fn generate_interaction_trace(
             logup.add_to_relation_computed(
                 bt,
                 [pad],
-                move |[p]| (one_pkg() - p).into(),
+                move |[_]| one_pkg().into(),
                 9,
                 move |i| {
                     vec![
@@ -793,7 +793,7 @@ pub(super) fn generate_interaction_trace(
             logup.add_to_relation_computed(
                 bt,
                 [pad],
-                move |[p]| (one_pkg() - p).into(),
+                move |[_]| one_pkg().into(),
                 9,
                 move |i| {
                     vec![
@@ -828,7 +828,7 @@ pub(super) fn generate_interaction_trace(
             logup.add_to_relation_computed(
                 bt,
                 [pad],
-                move |[p]| (one_pkg() - p).into(),
+                move |[_]| one_pkg().into(),
                 9,
                 move |i| {
                     vec![
@@ -863,7 +863,7 @@ pub(super) fn generate_interaction_trace(
             logup.add_to_relation_computed(
                 bt,
                 [pad],
-                move |[p]| (one_pkg() - p).into(),
+                move |[_]| one_pkg().into(),
                 9,
                 move |i| {
                     vec![
@@ -883,7 +883,7 @@ pub(super) fn generate_interaction_trace(
 
         // byte 5: (FlagByte5, is_rotate_l64, is_count_set_bits,
         //          is_lzb, is_tzb, is_rotate_r64, is_rotate_l32,
-        //          is_rotate_r32, is_rotate_r_imm_alt)
+        //          is_rotate_r32, is_imm_alt)
         {
             let pad = is_pad_col[0].clone();
             let fbc = fb5[0].clone();
@@ -894,11 +894,11 @@ pub(super) fn generate_interaction_trace(
             let rr64 = f_is_rotate_r64[0].clone();
             let rl32 = f_is_rotate_l32[0].clone();
             let rr32 = f_is_rotate_r32[0].clone();
-            let rria = f_is_rotate_r_imm_alt[0].clone();
+            let rria = f_is_imm_alt[0].clone();
             logup.add_to_relation_computed(
                 bt,
                 [pad],
-                move |[p]| (one_pkg() - p).into(),
+                move |[_]| one_pkg().into(),
                 9,
                 move |i| {
                     vec![
@@ -1448,6 +1448,22 @@ pub(super) fn generate_interaction_trace(
                     );
                     t
                 },
+            );
+        }
+    }
+
+    // ── NextTimestamp Range256 lookups (8, kept last) ──
+    {
+        let next_ts = crate::trace::original_base_column!(component_trace, Column::NextTimestamp);
+        for col in &next_ts {
+            logup.add_to_relation_with(
+                range256,
+                [is_pad[0].clone()],
+                |[pad]| {
+                    use stwo::prover::backend::simd::m31::PackedBaseField;
+                    (PackedBaseField::one() - pad).into()
+                },
+                std::slice::from_ref(col),
             );
         }
     }

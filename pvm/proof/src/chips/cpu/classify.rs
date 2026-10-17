@@ -41,7 +41,7 @@ pub(crate) struct OpcodeFlags {
     /// `ValDIsZero` gates), but the imm variants move the IMMEDIATE guarded
     /// by `regs[rb]`. `is_cmov_imm` swaps the source so `val_b = imm`,
     /// `val_d = regs[rb]`. The swap mechanism mirrors `is_set_gt` /
-    /// `is_rotate_r_imm_alt`; like every compare sub-flag it is committed
+    /// `is_imm_alt`; like every compare sub-flag it is committed
     /// per pc in ProgramMemory's flag bytes (byte 6), so a row cannot drop
     /// the swap and leave its moved value free. NOT a compare-partition
     /// sub-flag; co-occurs with `is_cmov_iz/nz`.
@@ -154,8 +154,8 @@ pub(crate) struct OpcodeFlags {
     /// (OneRegTwoImm category).  In both cases the *value* written
     /// to memory is `imm_y` (already pinned to canonical via
     /// `ImmYCanon` in ProgramMemoryChip).  Drives the per-byte
-    /// MemValue ↔ ImmYBytes binding for the low 4 bytes.  MemSize=8
-    /// imm_y values are out of scope (would need ImmYBytesHi[4]).
+    /// MemValue ↔ ImmYBytes binding: the low 4 bytes, and on an 8-byte
+    /// store the high 4, each `ImmYBytes[4]`.
     pub is_store_imm_any: bool,
     /// 1 iff this opcode is one of `StoreImm[U][8/16/32/64]`
     /// (TwoImm only — the *direct*-addressing immediate-source
@@ -219,15 +219,14 @@ pub(crate) struct OpcodeFlags {
     /// 2^((32 − n) mod 32); result low 4 bytes = UnsignedProductLow
     /// + mul_high; high 4 bytes = sign-extension.
     pub is_rotate_r32: bool,
-    /// 1 iff this opcode is `RotR64ImmAlt` or
-    /// `RotR32ImmAlt` — the swapped-source variants where the
-    /// immediate is the rotated value and `regs[rb]` is the shift
-    /// amount (vs. RotR64Imm / RotR32Imm where the convention is
-    /// reversed).  Drives a swapped trace fill (val_b ← imm,
-    /// val_d ← regs[rb]) plus a `val_b = ImmBytes` constraint
-    /// pinning the new source.  Set alongside is_rotate_r64 /
-    /// is_rotate_r32 so the existing rotate-r constraints fire.
-    pub is_rotate_r_imm_alt: bool,
+    /// 1 iff this opcode is an `ImmAlt` shift or rotate — the
+    /// swapped-source variants where the immediate is the shifted value
+    /// and `regs[rb]` is the shift amount (vs. the `Imm` variants where
+    /// the convention is reversed).  Drives a swapped trace fill (val_b ←
+    /// imm, val_d ← regs[rb]) plus a `val_b = ImmBytes` constraint
+    /// pinning the new source.  Set alongside the shift's or rotate's own
+    /// flags so their constraints fire.
+    pub is_imm_alt: bool,
 }
 
 pub(crate) fn classify_opcode(op: Opcode) -> OpcodeFlags {
@@ -305,11 +304,13 @@ pub(crate) fn classify_opcode(op: Opcode) -> OpcodeFlags {
         }
         // Left shifts: constrained via mul (val_d = 2^shift_amount)
         Opcode::ShloL64 | Opcode::ShloLImm64 | Opcode::ShloLImmAlt64 => {
+            f.is_imm_alt = op == Opcode::ShloLImmAlt64;
             f.is_shift = true;
             f.shift_op = 0;
             f.is_mul = true;
         }
         Opcode::ShloL32 | Opcode::ShloLImm32 | Opcode::ShloLImmAlt32 => {
+            f.is_imm_alt = op == Opcode::ShloLImmAlt32;
             f.is_shift = true;
             f.shift_op = 0;
             f.is_mul = true;
@@ -317,12 +318,14 @@ pub(crate) fn classify_opcode(op: Opcode) -> OpcodeFlags {
         }
         // Logical right shifts: constrained via divrem (val_d = 2^shift_amount, result = quotient)
         Opcode::ShloR64 | Opcode::ShloRImm64 | Opcode::ShloRImmAlt64 => {
+            f.is_imm_alt = op == Opcode::ShloRImmAlt64;
             f.is_shift = true;
             f.shift_op = 1;
             f.is_div_rem = true;
             f.div_rem_op = 0;
         }
         Opcode::ShloR32 | Opcode::ShloRImm32 | Opcode::ShloRImmAlt32 => {
+            f.is_imm_alt = op == Opcode::ShloRImmAlt32;
             f.is_shift = true;
             f.shift_op = 1;
             f.is_div_rem = true;
@@ -332,12 +335,14 @@ pub(crate) fn classify_opcode(op: Opcode) -> OpcodeFlags {
         // Arithmetic right shifts: same as logical right but with sign extension
         // Uses divrem + power-of-two (like ShloR). Sign extension handled separately.
         Opcode::SharR64 | Opcode::SharRImm64 | Opcode::SharRImmAlt64 => {
+            f.is_imm_alt = op == Opcode::SharRImmAlt64;
             f.is_shift = true;
             f.shift_op = 2;
             f.is_div_rem = true;
             f.div_rem_op = 0;
         }
         Opcode::SharR32 | Opcode::SharRImm32 | Opcode::SharRImmAlt32 => {
+            f.is_imm_alt = op == Opcode::SharRImmAlt32;
             f.is_shift = true;
             f.shift_op = 2;
             f.is_div_rem = true;
@@ -372,13 +377,13 @@ pub(crate) fn classify_opcode(op: Opcode) -> OpcodeFlags {
         }
         // RotR64ImmAlt — value = imm, shift = regs[rb].
         // Set is_rotate_r64 so the existing rotate-r logic fires;
-        // is_rotate_r_imm_alt drives the swapped trace fill.
+        // is_imm_alt drives the swapped trace fill.
         Opcode::RotR64ImmAlt => {
             f.is_shift = true;
             f.shift_op = 4;
             f.is_mul = true;
             f.is_rotate_r64 = true;
-            f.is_rotate_r_imm_alt = true;
+            f.is_imm_alt = true;
         }
         // RotR32 + RotR32Imm — value in val_b, shift in val_d.
         // Same shape as RotR64 but with modulus 32.
@@ -396,7 +401,7 @@ pub(crate) fn classify_opcode(op: Opcode) -> OpcodeFlags {
             f.is_32bit = true;
             f.is_mul = true;
             f.is_rotate_r32 = true;
-            f.is_rotate_r_imm_alt = true;
+            f.is_imm_alt = true;
         }
         // Compare
         Opcode::SetLtU | Opcode::SetLtUImm => {
@@ -890,7 +895,7 @@ pub(crate) fn classify_opcode_for_program_memory(
         f.is_rotate_r64 as u8,
         f.is_rotate_l32 as u8,
         f.is_rotate_r32 as u8,
-        f.is_rotate_r_imm_alt as u8,
+        f.is_imm_alt as u8,
         // byte 6: the register accesses and the remaining operand modifiers.
         shape.val_b_is_reg as u8,
         shape.val_b_from_a as u8,

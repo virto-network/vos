@@ -109,9 +109,12 @@ pub fn prove_two_reg(op: Opcode, rd: u8, ra: u8, input: u64, expected: u64) {
     prove_and_verify(steps, &code, &bitmask);
 }
 
-/// Convenience for negative tests: trace a TwoReg program, mutate
-/// `steps[0].regs_after[rd]` to `forged`, then attempt prove + verify.
-/// Caller wraps in `#[should_panic(expected = "ConstraintsNotSatisfied")]`.
+/// Convenience for negative tests: trace a TwoReg program, forge its
+/// result to `forged` in `steps[0].regs_after[rd]` and in every later
+/// step's register file, then attempt prove + verify. The rest of the run
+/// agrees with the forged write, so the register ledger accepts it and only
+/// the operation's own constraints can refuse it. Caller wraps in
+/// `#[should_panic(expected = "ConstraintsNotSatisfied")]`.
 pub fn forge_two_reg_result(op: Opcode, rd: u8, ra: u8, input: u64, forged: u64) {
     let mut regs = [0u64; PVM_REGISTER_COUNT];
     regs[ra as usize] = input;
@@ -119,6 +122,10 @@ pub fn forge_two_reg_result(op: Opcode, rd: u8, ra: u8, input: u64, forged: u64)
     let mut steps = trace_until_opcode_zero(code.clone(), bitmask.clone(), regs);
     assert_eq!(steps[0].opcode, op);
     steps[0].regs_after[rd as usize] = forged;
+    for step in steps.iter_mut().skip(1) {
+        step.regs_before[rd as usize] = forged;
+        step.regs_after[rd as usize] = forged;
+    }
     prove_and_verify(steps, &code, &bitmask);
 }
 

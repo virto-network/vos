@@ -25,7 +25,8 @@ pub enum Column {
     Opcode,
     #[size = 1]
     SkipLen,
-    /// Carry chain for sequential PC addition: next_pc = pc + 1 + skip_len
+    /// Carry chain for sequential PC addition: next_pc = pc + 1 + skip_len,
+    /// bits on every row, so the sequential next pc's limbs are canonical.
     #[size = 3]
     PcCarry,
     #[size = 1]
@@ -43,7 +44,7 @@ pub enum Column {
     /// Result value (8 limbs).
     #[size = 8]
     Result,
-    /// Auxiliary carry/borrow (8 limbs). Used by add/sub.
+    /// Auxiliary carry/borrow (8 limbs), bits on every row. Used by add/sub.
     #[size = 8]
     Carry,
     /// `mask_next_row` so the terminal-row constraint can read the *next*
@@ -147,11 +148,11 @@ pub enum Column {
     /// Signed less-than flag: 1 if val_b < val_d (signed).
     #[size = 1]
     CmpLtSFlag,
-    /// 1 iff val_b == val_d (all bytes equal). Used for Le/Gt branches.
-    /// Constrained one-directionally: `eq_flag=1 ⇒ val_b[i] = val_d[i]` for
-    /// every byte i, gated on `is_cmp_or_branch`.  The converse is benign in
-    /// PVM semantics — the prover would have to produce the wrong next_pc to
-    /// undermark eq_flag, which is bound by ProgramMemoryChip.
+    /// 1 iff val_b == val_d (all bytes equal), on every compare and branch
+    /// row: `eq_flag=1 ⇒ val_b[i] = val_d[i]` byte by byte, and
+    /// `eq_flag = 1 − EqDiffSquaresTimesInvH`, 1 when they are equal. The
+    /// equality branches take it as their condition, the Le/Gt ones add it
+    /// to their less-than.
     #[size = 1]
     EqFlag,
     // BranchEq / BranchNe constraints read `val_b[i] - val_d[i]` directly:
@@ -332,10 +333,12 @@ pub enum Column {
     /// which is what flows into the Blake2bCall tuple as F.
     #[size = 8]
     Phi7,
-    /// Inversion witness for the f_flag slot: if Phi7 (as field
-    /// element) != 0, Phi7Inv = 1 / Phi7_combined; else 0.  Used to
-    /// constrain Phi7Bool = (Phi7 != 0) in-circuit.
-    #[size = 8]
+    /// Inversion witness for the f_flag slot: the inverse of the sum of
+    /// Phi7's bytes, or 0 when it is 0. The sum, at most 2040, is zero
+    /// exactly when the register is, so it constrains Phi7Bool =
+    /// (Phi7 != 0) in-circuit as the register's value, not its field
+    /// reduction.
+    #[size = 1]
     Phi7Inv,
     /// Boolean form of the f_flag slot: 1 if regs_before\[10\] != 0.
     /// The prover fills this and the lookup balance keeps it tied to
@@ -428,10 +431,12 @@ pub enum Column {
     /// address. See [`Self::IsHaltJumpInd`].
     #[size = 1]
     IsHaltLoadImmJumpInd,
-    /// 4 little-endian bytes of `step.imm_y`
-    /// (the second immediate, used for LoadImmJumpInd's jump offset).
-    /// Bound to canonical bytecode decoding via the prog_mem tuple.
-    #[size = 4]
+    /// The low 5 little-endian bytes of `step.imm_y`, the second
+    /// immediate, sign-extended from at most 4 bytes, so byte 4 is each of
+    /// its high bytes: LoadImmJumpInd's jump offset and an immediate
+    /// store's value. Bound to canonical bytecode decoding via the prog_mem
+    /// tuple.
+    #[size = 5]
     ImmYBytes,
     /// Virtual jump address for LoadImmJumpInd
     /// (low 32 bits of `val_d + imm_y`), 4 little-endian bytes.  Pinned
@@ -787,16 +792,16 @@ pub enum Column {
     /// complementary shift identity and PowerOfTwo lookup.
     #[size = 1]
     IsRotateR32,
-    /// 1 iff this opcode is `RotR64ImmAlt` or
-    /// `RotR32ImmAlt`.  These are the swapped-source variants
-    /// where the immediate is the rotated value and `regs[rb]`
-    /// is the shift amount.  Drives the `val_b = ImmBytes`
+    /// 1 iff this opcode is an `ImmAlt` shift or rotate (`ShloL`,
+    /// `ShloR`, `SharR` and `RotR`, 32- and 64-bit).  These are the
+    /// swapped-source variants where the immediate is the shifted value
+    /// and `regs[rb]` is the shift amount.  Drives the `val_b = ImmBytes`
     /// constraint pinning val_b to the canonical immediate
     /// (since val_b is not a register read for these rows
     /// — the standard val_b ↔ reg_val_b cross-constraint is
     /// inactive when val_b_is_reg=0).
     #[size = 1]
-    IsRotateRImmAlt,
+    IsImmAlt,
     /// The first 6 packed flag bytes of the canonical classify_opcode
     /// flag bag.  Each byte holds 8 individual flag bits
     /// (bit i = flag[8*k + i]).  The byte-to-bits
@@ -888,8 +893,12 @@ pub enum Column {
     /// `IsCmovNz · (1 - ValDIsZero)` — the if-not-zero CMOV path.
     #[size = 1]
     IsCmovNzNotVdzH,
-    /// MinU/MaxU result-binding body helpers: `CmpLtFlag · ValB[i]` and
-    /// `CmpLtFlag · ValD[i]`.  Per-byte (size 8 each).
+    /// The less-than a min or max selects by: `CmpLtSFlag` on MinS/MaxS
+    /// rows, `CmpLtFlag` on every other.
+    #[size = 1]
+    MinMaxLtFlag,
+    /// Min/Max result-binding body helpers: `MinMaxLtFlag · ValB[i]` and
+    /// `MinMaxLtFlag · ValD[i]`.  Per-byte (size 8 each).
     #[size = 8]
     CmpLtValBH,
     #[size = 8]
@@ -978,12 +987,17 @@ pub enum Column {
     IsLzb32H,
 
     // Branch conditions + sequential PC.
-    /// `IsBrEq · BranchTaken` — `val_b == val_d` constraint gate.
+    /// `Σ (ValB[i] − ValD[i])²`, below 2^20 for byte operands, so zero
+    /// exactly when they are equal.
     #[size = 1]
-    IsBrEqTakenH,
-    /// `IsBrNe · (1 - BranchTaken)` — `val_b == val_d` (when not taken) gate.
+    EqDiffSquaresH,
+    /// The inverse of `EqDiffSquaresH`, or 0 when it is 0.
     #[size = 1]
-    IsBrNeNotTakenH,
+    EqDiffSquaresInv,
+    /// `EqDiffSquaresH · EqDiffSquaresInv`: 1 exactly when the operands
+    /// differ, which pins `EqFlag` to 0 then and to 1 when they are equal.
+    #[size = 1]
+    EqDiffSquaresTimesInvH,
     /// `IsCmpOrBranch · EqFlag` — gate for the val_b/val_d byte-equal pinning.
     #[size = 1]
     IsCmpOrBranchEqH,
@@ -1043,18 +1057,18 @@ pub enum Column {
     /// `(1 - IsPadding) · Phi7Bool` — gate for `Phi7·Phi7Inv=1` constraint.
     #[size = 1]
     RealPhi7BoolH,
-    /// `Phi7Field · Phi7InvField` — body helper for the Phi7-nonzero proof.
+    /// `(Σ Phi7 bytes) · Phi7Inv` — body helper for the Phi7-nonzero proof.
     #[size = 1]
     Phi7TimesInvH,
 
     // Deg-3 selector helpers for RotR ImmAlt val_b pinning and 32-bit
     // shift val_d-high-bytes-zero.
-    /// `IsRotateRImmAlt · (1 - IsTruncated)` — non-truncated ImmAlt gate.
+    /// `IsImmAlt · (1 - IsTruncated)` — non-truncated ImmAlt gate.
     #[size = 1]
-    IsRotRImmAltNotTruncH,
-    /// `IsRotateRImmAlt · IsTruncated` — truncated ImmAlt gate.
+    IsImmAltNotTruncH,
+    /// `IsImmAlt · IsTruncated` — truncated ImmAlt gate.
     #[size = 1]
-    IsRotRImmAltTruncH,
+    IsImmAltTruncH,
     /// `Is32Bit · IsShiftConstrained` — 32-bit shift gate.
     #[size = 1]
     Is32ShiftCH,

@@ -61,9 +61,9 @@ pub(crate) struct AccessShape {
 pub(crate) fn access_shape(opcode: Opcode) -> AccessShape {
     use vos_pvm::instruction::InstructionCategory::*;
     let flags = classify_opcode(opcode);
-    // RotR*ImmAlt, SetGt*Imm and Cmov*Imm swap their sources: ValB is the
-    // immediate and ValD reads φB.
-    let swapped = flags.is_rotate_r_imm_alt || flags.is_set_gt || flags.is_cmov_imm;
+    // The ImmAlt shifts and rotates, SetGt*Imm and Cmov*Imm swap their
+    // sources: ValB is the immediate and ValD reads φB.
+    let swapped = flags.is_imm_alt || flags.is_set_gt || flags.is_cmov_imm;
     let category = opcode.category();
     let (val_b_is_reg, val_b_from_a) = match category {
         ThreeReg | OneRegImmOffset => (true, true),

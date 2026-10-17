@@ -582,6 +582,13 @@ pub use verify::{
 #[cfg(feature = "prover")]
 pub mod harness {
     pub use crate::framework::{MachineComponent, MachineProverComponent};
+
+    /// Every chip, in proving order: what a gate checks a forged trace
+    /// against when its refusal is a lookup's, not one chip's constraint.
+    #[cfg(feature = "debug-internals")]
+    pub fn base_components() -> &'static [&'static dyn MachineProverComponent] {
+        crate::BASE_COMPONENTS
+    }
 }
 #[cfg(feature = "prover")]
 pub use program_id::{ProgramCommitment, program_commitment_hex, program_commitment_of_proof};
