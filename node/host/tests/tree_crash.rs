@@ -195,8 +195,12 @@ fn check(round: Round, last: &mut u64) -> bool {
     let snapshot = store.snapshot();
     let expected = values(version);
     for map in MAPS {
-        let leaves: Vec<(Vec<u8>, Hash)> = expected[&map]
-            .iter()
+        // A round killed before its first apply recovers at version 0, with
+        // no values in either map.
+        let leaves: Vec<(Vec<u8>, Hash)> = expected
+            .get(&map)
+            .into_iter()
+            .flatten()
             .map(|(key, (at, value))| {
                 let leaf = Leaf::salted(&Blake2b, &seed(*at), key, value);
                 (key.clone(), leaf.value_hash)
